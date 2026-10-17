@@ -1,0 +1,12 @@
+version: 2
+updates:
+  # The Dockerfile's runtime base is pinned by digest: each new distroless
+  # image (Debian security fixes land there) comes in as a PR.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    ignore:
+      # The builder follows rust-toolchain.toml, and it ships nothing: only
+      # the binary leaves that stage.
+      - dependency-name: rust

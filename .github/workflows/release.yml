@@ -317,6 +317,23 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.variant.name }}-amd64
           cache-to: type=gha,mode=max,scope=${{ matrix.variant.name }}-amd64
 
+      # A critical or high CVE with a fix released stops the release here,
+      # before docker-manifest gives the image its public tags. CVEs with no
+      # fix are listed but do not fail: there is nothing to rebuild with.
+      - name: Scan image (${{ matrix.variant.name }}, amd64)
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}:${{ env.RELEASE_TAG }}-${{ matrix.variant.arch_tag }}
+        run: |
+          set -euo pipefail
+          docker pull --platform linux/amd64 "$IMAGE"
+          trivy() {
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$HOME/.cache/trivy:/root/.cache/trivy" \
+              aquasec/trivy:0.58.1 image --quiet --image-src docker --scanners vuln "$@" "$IMAGE"
+          }
+          trivy --format table
+          trivy --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 --format table
+
   docker-arm64:
     needs: [linux-arm64]
     runs-on: ubuntu-24.04-arm
@@ -357,6 +374,23 @@ jobs:
             ghcr.io/${{ github.repository }}:${{ env.RELEASE_TAG }}-${{ matrix.variant.arch_tag }}
           cache-from: type=gha,scope=${{ matrix.variant.name }}-arm64
           cache-to: type=gha,mode=max,scope=${{ matrix.variant.name }}-arm64
+
+      # A critical or high CVE with a fix released stops the release here,
+      # before docker-manifest gives the image its public tags. CVEs with no
+      # fix are listed but do not fail: there is nothing to rebuild with.
+      - name: Scan image (${{ matrix.variant.name }}, arm64)
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}:${{ env.RELEASE_TAG }}-${{ matrix.variant.arch_tag }}
+        run: |
+          set -euo pipefail
+          docker pull --platform linux/arm64 "$IMAGE"
+          trivy() {
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$HOME/.cache/trivy:/root/.cache/trivy" \
+              aquasec/trivy:0.58.1 image --quiet --image-src docker --scanners vuln "$@" "$IMAGE"
+          }
+          trivy --format table
+          trivy --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 --format table
 
   docker-manifest:
     # Waits for ALL matrix instances of both docker-amd64 and docker-arm64.

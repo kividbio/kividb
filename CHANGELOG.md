@@ -5,6 +5,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- **The Docker image is distroless.** Its runtime base is
+  `gcr.io/distroless/cc-debian12` (glibc, libgcc, CA certificates, time
+  zones) instead of `debian:bookworm-slim`. Scanners reported 4 critical and
+  62 high CVEs on the 1.1.0 image, all in Debian packages kividb does not use
+  (perl, util-linux, zlib's minizip); the new image has none critical and
+  one high, with no fix released. The server still runs as UID and GID 1000
+  in `/home/kividb`, so existing volumes keep working. **The image no longer
+  has a shell or `redis-cli`**: connect from another container
+  (`docker run --rm -it --network container:<name> redis redis-cli -p 6380`)
+  or with `kubectl debug`.
+- rustls 0.23.45 (GHSA-2mjx-qc3c-rqvc: TLS 1.3 handshake messages accepted
+  across encryption levels) and rand 0.8.6 (GHSA-cq8v-f236-94qc).
+- Every release image is scanned with Trivy before it is published: a
+  critical or high CVE that has a fix stops the release. The published images
+  and `Cargo.lock` are scanned again every week, and the results go to the
+  repository's code scanning alerts. Dependabot proposes new base images.
+
 ## [1.1.0]
 
 - **KiviDB is open source, under the GNU Affero General Public License,

@@ -1,0 +1,106 @@
+name: Security scan
+
+# Scans what users actually run -- the published images of the latest stable
+# release, every variant -- and Cargo.lock, with Trivy. A published image does
+# not change, but the CVEs known against it do: this is what says a patch
+# release is due. Results go to the repository's code scanning alerts
+# (Security tab); a critical or high CVE with a fix released also fails the
+# run, so it shows up as a failed workflow.
+#
+# Only CVEs with a fix are reported: the rest have nothing to rebuild with.
+# The release workflow runs the same image scan before it publishes.
+
+on:
+  schedule:
+    - cron: "17 4 * * 1"   # Mondays, 04:17 UTC
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - Dockerfile
+      - .github/workflows/security-scan.yml
+
+permissions:
+  contents: read
+
+env:
+  TRIVY: aquasec/trivy:0.58.1
+
+jobs:
+  dependencies:
+    name: Rust dependencies (Cargo.lock)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan Cargo.lock
+        run: |
+          set -euo pipefail
+          trivy() {
+            docker run --rm -v "$PWD:/src" -w /src "$TRIVY" fs --quiet --scanners vuln "$@" Cargo.lock
+          }
+          trivy --format table | tee -a "$GITHUB_STEP_SUMMARY"
+          trivy --ignore-unfixed --format sarif --output trivy-cargo.sarif
+
+      - name: Upload to code scanning
+        if: github.event_name != 'pull_request'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-cargo.sarif
+          category: cargo
+
+      - name: Fail on a critical or high advisory with a fix
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$TRIVY" fs --quiet --scanners vuln \
+            --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 Cargo.lock
+
+  images:
+    name: Image (${{ matrix.variant }})
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [default, lua, tls, full]
+    steps:
+      - name: Latest stable release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh api "repos/${{ github.repository }}/releases/latest" --jq .tag_name)
+          suffix=""
+          [ "${{ matrix.variant }}" = default ] || suffix="-${{ matrix.variant }}"
+          echo "image=docker.io/kividb/kividb:${tag}${suffix}" >> "$GITHUB_OUTPUT"
+
+      - name: Scan ${{ steps.release.outputs.image }}
+        env:
+          IMAGE: ${{ steps.release.outputs.image }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          trivy() {
+            docker run --rm -v "$PWD/out:/out" "$TRIVY" image --quiet --scanners vuln "$@" "$IMAGE"
+          }
+          { echo "### $IMAGE"; echo '```'; trivy --format table; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          trivy --ignore-unfixed --format sarif --output /out/trivy-image.sarif
+
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: out/trivy-image.sarif
+          category: image-${{ matrix.variant }}
+
+      - name: Fail on a critical or high CVE with a fix
+        env:
+          IMAGE: ${{ steps.release.outputs.image }}
+        run: |
+          docker run --rm "$TRIVY" image --quiet --scanners vuln \
+            --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 "$IMAGE"

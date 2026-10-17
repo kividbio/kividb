@@ -39,27 +39,29 @@ COPY src ./src
 RUN if [ "$(uname -m)" = aarch64 ]; then export RUSTFLAGS="-C target-feature=+lse"; fi \
     && cargo build --release ${KIVIDB_FEATURES:+--features "${KIVIDB_FEATURES}"}
 
+# The runtime image has no shell to make the home directory with.
+RUN mkdir -p /rootfs/home/kividb
+
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
-FROM debian:bookworm-slim
-
-# `redis-tools` ships redis-cli (plus redis-benchmark and the redis-check-*
-# utilities). It is here for debugging: `kubectl exec` into a kividb pod and
-# talk to the server without needing a sidecar, a port-forward, or a
-# throwaway client pod -- which is how Dragonfly ships its image too.
+# Distroless: glibc, libgcc, CA certificates and time zones -- what the binary
+# links against (libc, libm, libgcc_s) and the update check's HTTPS needs --
+# and nothing else: no shell, no package manager, no perl or util-linux. Up to
+# 1.1.0 the runtime was debian:bookworm-slim, whose ~90 packages carried every
+# CVE a scanner reported on the image (4 critical and 60 high, none of them in
+# code kividb runs). Same Debian release as the builder, so the same glibc.
 #
-# bookworm's redis-tools is 7.0.15 exactly, matching the `redis_version` this
-# server advertises in INFO, so redis-cli's own feature detection lines up
-# with what the engine actually implements.
+# It has no redis-cli either. To debug a container, connect from another one
+# (`docker run --rm -it --network container:<name> redis redis-cli -p 6380`,
+# or `kubectl debug` in Kubernetes).
 #
-# Costs ~6.8 MB in the final image (measured on bookworm-slim, with
-# ca-certificates already installed).
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates redis-tools \
-    && rm -rf /var/lib/apt/lists/*
+# Pinned by digest; Dependabot proposes each new one (.github/dependabot.yml).
+FROM gcr.io/distroless/cc-debian12@sha256:e5d81ddde149641e2a9ba55be4545bc125c67de07508b03ba4c22e6eb0ded5aa
 
-# Non-root user — good practice for containers
-RUN useradd -ms /bin/bash kividb
-USER kividb
+# The same non-root user as before 1.1.1, UID and GID 1000, so data written by
+# an older image (a bind mount, a named volume) stays writable.
+COPY --from=builder --chown=1000:1000 /rootfs/home/kividb /home/kividb
+ENV HOME=/home/kividb
+USER 1000:1000
 WORKDIR /home/kividb
 
 COPY --from=builder /build/target/release/kividb /usr/local/bin/kividb

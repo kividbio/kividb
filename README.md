@@ -213,8 +213,8 @@ docker run -p 6380:6380 ghcr.io/kividbio/kividb \
   --loglevel debug
 ```
 
-**With AOF persistence** (mount a volume so data survives restarts; the server runs as user
-`kividb` in `/home/kividb`):
+**With AOF persistence** (mount a volume so data survives restarts; the server runs as UID
+1000 in `/home/kividb`):
 
 ```bash
 docker run -p 6380:6380 \
@@ -226,6 +226,9 @@ With `--aof`, every write is appended to `appendonly.aof` and the file is replay
 startup, so a crash loses at most about the last second of writes (the fsync interval)
 rather than everything since the last snapshot. When an AOF is present it is the source of
 truth and the snapshot is not loaded; see [docs/PERSISTENCE.md](docs/PERSISTENCE.md) for why.
+
+The image is distroless: it has no shell and no `redis-cli`. Connect from another container
+instead, for example `docker run --rm -it --network container:<name> redis redis-cli -p 6380`.
 
 **io_uring in containers:** Docker's default seccomp profile blocks io_uring on recent
 versions, and KiviDB then falls back to Tokio. To allow it on a Linux host, run with
