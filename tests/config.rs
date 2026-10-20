@@ -307,8 +307,8 @@ fn test_config_rewrite_with_configfile() {
     let _ = std::fs::remove_file(&tmp);
 }
 
-/// `maxmemory` is the process's, not a server's: the tests that set it take
-/// turns.
+/// `maxmemory` and the remembered settings are the process's, not a
+/// server's: the tests that set them take turns.
 fn maxmemory_turn() -> std::sync::MutexGuard<'static, ()> {
     static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
     TURN.lock().unwrap_or_else(|e| e.into_inner())
@@ -401,6 +401,7 @@ fn config_set_port_moves_the_listener_or_changes_nothing() {
     let taken = std::net::TcpListener::bind(("127.0.0.1", free_port())).unwrap();
     let taken_port = taken.local_addr().unwrap().port().to_string();
     let maxmemory = get(&mut c, "maxmemory");
+    let buffer = get(&mut c, "client-query-buffer-limit");
     let reply = c.cmds(&[
         "CONFIG",
         "SET",
@@ -417,7 +418,7 @@ fn config_set_port_moves_the_listener_or_changes_nothing() {
         "{reply:?}"
     );
     assert_eq!(get(&mut c, "maxmemory"), maxmemory);
-    assert_eq!(get(&mut c, "client-query-buffer-limit"), "1073741824");
+    assert_eq!(get(&mut c, "client-query-buffer-limit"), buffer);
     assert_eq!(get(&mut c, "port"), port.to_string());
     assert!(Conn::connect(port).cmds(&["PING"]).as_str() == "PONG");
     drop(taken);
