@@ -306,3 +306,150 @@ fn test_config_rewrite_with_configfile() {
     let _ = server.wait();
     let _ = std::fs::remove_file(&tmp);
 }
+
+/// `CONFIG SET` with several settings sets all or none: one bad value, and
+/// the ones before it are put back (#24, the Redis suite's "CONFIG SET
+/// rollback on set error"). `maxmemory-clients` and
+/// `client-query-buffer-limit` took any value.
+#[test]
+fn config_set_with_a_bad_value_changes_nothing() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let get = |c: &mut Conn, name: &str| {
+        c.cmds(&["CONFIG", "GET", name]).as_array()[1]
+            .as_str()
+            .to_string()
+    };
+
+    assert!(c.cmds(&["CONFIG", "SET", "maxmemory", "10000002"]).is_ok());
+    let clients = get(&mut c, "maxmemory-clients");
+    let buffer = get(&mut c, "client-query-buffer-limit");
+    let reply = c.cmds(&[
+        "CONFIG",
+        "SET",
+        "maxmemory",
+        "10000001",
+        "maxmemory-clients",
+        "200%",
+        "client-query-buffer-limit",
+        "invalid",
+    ]);
+    assert!(
+        matches!(&reply, RespValue::Error(e) if e == "ERR CONFIG SET failed (possibly related to \
+            argument 'maxmemory-clients') - percentage argument must be less or equal to 100"),
+        "{reply:?}"
+    );
+    assert_eq!(get(&mut c, "maxmemory"), "10000002");
+    assert_eq!(get(&mut c, "maxmemory-clients"), clients);
+    assert_eq!(get(&mut c, "client-query-buffer-limit"), buffer);
+
+    for (name, bad) in [
+        ("maxmemory-clients", "lots"),
+        ("maxmemory-clients", "x%"),
+        ("client-query-buffer-limit", "invalid"),
+        ("client-query-buffer-limit", "1000"),
+    ] {
+        let reply = c.cmds(&["CONFIG", "SET", name, bad]);
+        assert!(reply.is_error(), "{name} {bad}: {reply:?}");
+    }
+
+    // Good values, as Redis reports them.
+    assert!(
+        c.cmds(&["CONFIG", "SET", "maxmemory-clients", "10%"])
+            .is_ok()
+    );
+    assert_eq!(get(&mut c, "maxmemory-clients"), "10%");
+    assert!(
+        c.cmds(&["CONFIG", "SET", "maxmemory-clients", "1mb"])
+            .is_ok()
+    );
+    assert_eq!(get(&mut c, "maxmemory-clients"), "1048576");
+    assert!(
+        c.cmds(&["CONFIG", "SET", "client-query-buffer-limit", "10mb"])
+            .is_ok()
+    );
+    assert_eq!(get(&mut c, "client-query-buffer-limit"), "10485760");
+    assert!(c.cmds(&["CONFIG", "SET", "maxmemory", "0"]).is_ok());
+}
+
+/// `CONFIG SET port` moves the listener (#24): new connections are taken on
+/// the new port, and not on the old one; open connections stay. A port that
+/// is taken is refused with Redis's error, and with it every setting of the
+/// same `CONFIG SET` (the Redis suite's "CONFIG SET rollback on apply error").
+#[test]
+fn config_set_port_moves_the_listener_or_changes_nothing() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let get = |c: &mut Conn, name: &str| {
+        c.cmds(&["CONFIG", "GET", name]).as_array()[1]
+            .as_str()
+            .to_string()
+    };
+
+    // Taken: refused, and nothing changes.
+    let taken = std::net::TcpListener::bind(("127.0.0.1", free_port())).unwrap();
+    let taken_port = taken.local_addr().unwrap().port().to_string();
+    let maxmemory = get(&mut c, "maxmemory");
+    let reply = c.cmds(&[
+        "CONFIG",
+        "SET",
+        "maxmemory",
+        "10000001",
+        "port",
+        &taken_port,
+        "client-query-buffer-limit",
+        "10mb",
+    ]);
+    assert!(
+        matches!(&reply, RespValue::Error(e) if e.starts_with("ERR CONFIG SET failed (possibly \
+            related to argument 'port') - Unable to listen on this port")),
+        "{reply:?}"
+    );
+    assert_eq!(get(&mut c, "maxmemory"), maxmemory);
+    assert_eq!(get(&mut c, "client-query-buffer-limit"), "1073741824");
+    assert_eq!(get(&mut c, "port"), port.to_string());
+    assert!(Conn::connect(port).cmds(&["PING"]).as_str() == "PONG");
+    drop(taken);
+
+    // Free: moved.
+    let moved = free_port();
+    assert!(
+        c.cmds(&["CONFIG", "SET", "port", &moved.to_string()])
+            .is_ok()
+    );
+    assert_eq!(get(&mut c, "port"), moved.to_string());
+    let mut there = Conn::connect(moved);
+    assert_eq!(there.cmds(&["PING"]).as_str(), "PONG");
+    assert_eq!(
+        c.cmds(&["PING"]).as_str(),
+        "PONG",
+        "the open connection stays"
+    );
+    let info = there.cmds(&["INFO", "server"]);
+    assert!(info.as_str().contains(&format!("tcp_port:{moved}\r\n")));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the old port still takes connections"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // The same port again, and back to the first.
+    assert!(
+        there
+            .cmds(&["CONFIG", "SET", "port", &moved.to_string()])
+            .is_ok()
+    );
+    assert!(
+        there
+            .cmds(&["CONFIG", "SET", "port", &port.to_string()])
+            .is_ok()
+    );
+    assert_eq!(Conn::connect(port).cmds(&["PING"]).as_str(), "PONG");
+    assert!(there.cmds(&["CONFIG", "SET", "port", "0"]).is_error());
+    assert!(there.cmds(&["CONFIG", "SET", "port", "x"]).is_error());
+}

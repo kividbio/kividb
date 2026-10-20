@@ -21,6 +21,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`CONFIG SET port` moves the listener, and `CONFIG SET` with several
+  settings is refused whole for a bad value** (#24). `CONFIG SET port`
+  replied `OK` and changed nothing: the server kept listening where it was.
+  Now it binds the new port before it replies (every io_uring worker gets a
+  socket of its own), then stops taking connections on the old one;
+  connections already open stay open. A port that is taken is refused with
+  Redis's `Unable to listen on this port`, and with it the whole `CONFIG
+  SET`: the settings before it are put back. `CONFIG GET port` and `INFO`'s
+  `tcp_port` report the port in use. Port 0 (no TCP at all, in Redis) is
+  refused. `maxmemory-clients` and `client-query-buffer-limit` took any
+  value; now they take what Redis takes (a size, or a percentage up to 100,
+  and a size of at least 1 MB), so `CONFIG SET maxmemory 10000001
+  maxmemory-clients 200%` fails and leaves `maxmemory` alone.
+
 - **Data from Redis loads: `RESTORE` of a Redis payload, `MIGRATE` from a
   Redis server, a Redis `dump.rdb`, and a full sync from a Redis primary**
   (#39). `RESTORE` refused every payload Redis produces, whatever the type,

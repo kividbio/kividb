@@ -162,6 +162,8 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
     ]
 }
 
+const NOT_MEMORY_OR_PERCENT: &str = "ERR argument must be a memory or percent value";
+
 /// `CONFIG SET` of one setting.
 fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
     let param = param.to_string();
@@ -562,6 +564,55 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                 }
                 Err(_) => Some(resp_error("ERR value is not an integer or out of range")),
             },
+            // Remembered, as below, but only a value Redis would take: a
+            // `CONFIG SET` with several settings is refused whole for one
+            // bad value (#24).
+            // Listen there instead (`listen`): refused, with nothing
+            // changed, if the port cannot be had.
+            "port" => match value.parse::<u16>() {
+                Ok(port) if port > 0 => match crate::listen::move_to(ctx.config.port, port) {
+                    Ok(()) => Some(resp_simple("OK")),
+                    Err(e) => Some(resp_error(&format!(
+                        "ERR Unable to listen on this port: {e}"
+                    ))),
+                },
+                // Redis takes 0, for no TCP at all, with a Unix socket to be
+                // reached on; there is none here.
+                _ => Some(resp_error(
+                    "ERR argument must be between 1 and 65535 inclusive",
+                )),
+            },
+            "maxmemory-clients" => {
+                let value = match value.strip_suffix('%') {
+                    Some(percent) => match percent.parse::<u64>() {
+                        Ok(n) if n <= 100 => value.to_string(),
+                        Ok(_) => {
+                            return Some(resp_error(
+                                "ERR percentage argument must be less or equal to 100",
+                            ));
+                        }
+                        Err(_) => return Some(resp_error(NOT_MEMORY_OR_PERCENT)),
+                    },
+                    None => match memory_size(value) {
+                        Some(bytes) => bytes.to_string(),
+                        None => return Some(resp_error(NOT_MEMORY_OR_PERCENT)),
+                    },
+                };
+                REMEMBERED_CONFIG.lock().insert(param.clone(), value);
+                Some(resp_simple("OK"))
+            }
+            "client-query-buffer-limit" => match memory_size(value) {
+                Some(bytes) if (1 << 20..=i64::MAX as usize).contains(&bytes) => {
+                    REMEMBERED_CONFIG
+                        .lock()
+                        .insert(param.clone(), bytes.to_string());
+                    Some(resp_simple("OK"))
+                }
+                Some(_) => Some(resp_error(
+                    "ERR argument must be between 1048576 and 9223372036854775807 inclusive",
+                )),
+                None => Some(resp_error("ERR argument must be a memory value")),
+            },
             // What a running Redis cannot be told either.
             "daemonize" | "databases" | "pidfile" | "logfile" | "log-format" | "unixsocket"
             | "supervised" | "io-threads" | "tcp-backlog" | "set-proc-title" | "appendfilename"
@@ -669,7 +720,10 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
     let lua_time_limit = "5000".to_string();
     let in_effect: Vec<(&str, String)> = vec![
         ("bind", ctx.config.bind.clone()),
-        ("port", ctx.config.port.to_string()),
+        (
+            "port",
+            crate::listen::current_port(ctx.config.port).to_string(),
+        ),
         ("logfile", ctx.config.logfile.clone()),
         ("log-format", ctx.config.log_format.clone()),
         ("databases", ctx.config.databases.to_string()),
@@ -2632,7 +2686,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     std::env::consts::OS,
                     std::env::consts::ARCH
                 ));
-                out.push_str(&format!("tcp_port:{}\r\n", ctx.config.port));
+                out.push_str(&format!(
+                    "tcp_port:{}\r\n",
+                    crate::listen::current_port(ctx.config.port)
+                ));
                 out.push_str(&format!("process_id:{}\r\n", std::process::id()));
                 out.push_str(&format!("run_id:{}\r\n", crate::stats::RUN_ID.as_str()));
                 let uptime = ctx.started_at.elapsed().as_secs();
@@ -3255,7 +3312,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             "ERR wrong number of arguments for 'config|set' command",
                         ));
                     }
-                    let settings: Vec<(String, String)> = cmd[2..]
+                    let mut settings: Vec<(String, String)> = cmd[2..]
                         .chunks(2)
                         .map(|pair| {
                             (
@@ -3264,6 +3321,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             )
                         })
                         .collect();
+                    // The port last: moving it is what can fail after the
+                    // values are found good (the port is taken), and it is
+                    // not to be moved back, so it is moved only once the
+                    // others are set.
+                    settings.sort_by_key(|(name, _)| name == "port");
                     if let Some((_, (twice, _))) = settings
                         .iter()
                         .enumerate()
