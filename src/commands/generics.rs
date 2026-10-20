@@ -5,7 +5,7 @@ use crate::commands::helpers::{
     expire_modifier_allows_set, expire_on_read, expiry_at_after, expiry_unix_millis,
     expiry_unix_secs, get_expiry_shard, glob_match, is_expired, lazy_expire_on_read,
     parse_bytes_as_i128, parse_expire_modifier_flags, parse_utf8, set_expiry,
-    system_time_from_unix_millis_i128, ttl_remaining_secs_ceil,
+    system_time_from_unix_millis_i128, take_key, ttl_remaining_secs_ceil,
 };
 use crate::keyspace_events::{KS_GENERIC, notify};
 use crate::resp::write::*;
@@ -919,6 +919,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
 
             let mut removed = 0i64;
+            // `UNLINK` frees a large value in the background (`lazyfree`);
+            // `DEL` frees it here, as Redis does with `lazyfree-lazy-user-del no`.
+            let unlink = cmd[0].eq_ignore_ascii_case(b"UNLINK");
 
             for k in cmd.iter().skip(1) {
                 let key = match parse_utf8(k) {
@@ -938,7 +941,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     }
                     continue;
                 }
-                if delete_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key) {
+                let deleted = if unlink {
+                    take_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key)
+                        .map(crate::lazyfree::release)
+                        .is_some()
+                } else {
+                    delete_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key)
+                };
+                if deleted {
                     crate::vector::maybe_unindex(ctx.index_store, key);
                     crate::vector::maybe_request_compaction(
                         ctx.index_store,

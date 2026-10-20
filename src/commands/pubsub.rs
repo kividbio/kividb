@@ -20,10 +20,13 @@ fn publish(ctx: &mut Ctx, shard: bool) -> Vec<u8> {
         Err(_) => return resp_error("ERR channel must be valid UTF-8"),
     };
     let payload: Arc<[u8]> = Arc::from(ctx.cmd[2]);
+    // By this connection: whether it is a client's command, one in a
+    // transaction, or a script's redis.call.
+    let from = Some(ctx.client_id);
     let count = if shard {
-        ctx.pubsub.spublish(channel, payload)
+        ctx.pubsub.spublish_from(channel, payload, from)
     } else {
-        ctx.pubsub.publish(channel, payload)
+        ctx.pubsub.publish_from(channel, payload, from)
     };
     // In a cluster a subscriber may be connected to any node, so the message
     // goes to all of them (to the slot's shard only, for a shard channel).

@@ -78,7 +78,9 @@ struct Subscriber {
     /// follows the reply to its UNSUBSCRIBE.
     live: Mutex<[AHashSet<Arc<str>>; 3]>,
     /// Set from a SUBSCRIBE until its reply has been written: the forwarder
-    /// waits, so that no message comes before the reply either.
+    /// waits, so that no message comes before the reply either. Set too by a
+    /// message this connection publishes to itself, for the same reason: it
+    /// comes after the reply to the command that published it (#23).
     hold: AtomicBool,
     released: Notify,
 }
@@ -92,7 +94,8 @@ enum Offer {
 }
 
 impl Subscriber {
-    fn offer(&self, delivery: Delivery) -> Offer {
+    /// `from`: the connection that published it, if it was one.
+    fn offer(&self, delivery: Delivery, from: Option<u64>) -> Offer {
         if self.closed.load(Ordering::Relaxed) {
             return Offer::Refused;
         }
@@ -105,6 +108,14 @@ impl Subscriber {
             }
         } else if self.over_soft_since.load(Ordering::Relaxed) != 0 {
             self.over_soft_since.store(0, Ordering::Relaxed);
+        }
+        // To itself: held until this connection's reply is written, as Redis
+        // holds such a push until after the command (`pending_push_messages`).
+        // Its forwarder would otherwise write it first, inside a script or a
+        // transaction as for a plain PUBLISH. Set before it is queued, so the
+        // forwarder sees the hold whenever it sees the message.
+        if from == Some(self.client_id) {
+            self.hold.store(true, Ordering::Release);
         }
         match self.queue.send(delivery) {
             Ok(()) => Offer::Queued,
@@ -199,6 +210,12 @@ impl PubSubHub {
     /// Returns how many subscriptions it was delivered to — a client that has
     /// both the channel and a matching pattern counts twice, as in Redis.
     pub fn publish(&self, channel: &str, payload: Arc<[u8]>) -> usize {
+        self.publish_from(channel, payload, None)
+    }
+
+    /// [`publish`](Self::publish), by the connection `from`: what it sends
+    /// itself waits for its reply (see `Subscriber::hold`).
+    pub fn publish_from(&self, channel: &str, payload: Arc<[u8]>, from: Option<u64>) -> usize {
         if self.inner.subscriptions.load(Ordering::Relaxed) == 0 {
             return 0;
         }
@@ -216,7 +233,7 @@ impl PubSubHub {
                         channel: Arc::clone(key),
                         payload: Arc::clone(&payload),
                     };
-                    delivered += hand_over(subscriber, delivery, &mut overflowed);
+                    delivered += hand_over(subscriber, delivery, from, &mut overflowed);
                 }
             }
             for (pattern, subscribers) in &tables[PATTERN] {
@@ -231,7 +248,7 @@ impl PubSubHub {
                         channel: Arc::clone(&channel),
                         payload: Arc::clone(&payload),
                     };
-                    delivered += hand_over(subscriber, delivery, &mut overflowed);
+                    delivered += hand_over(subscriber, delivery, from, &mut overflowed);
                 }
             }
         }
@@ -244,6 +261,11 @@ impl PubSubHub {
     }
 
     pub fn spublish(&self, shard: &str, payload: Arc<[u8]>) -> usize {
+        self.spublish_from(shard, payload, None)
+    }
+
+    /// [`spublish`](Self::spublish), by the connection `from`.
+    pub fn spublish_from(&self, shard: &str, payload: Arc<[u8]>, from: Option<u64>) -> usize {
         if self.inner.subscriptions.load(Ordering::Relaxed) == 0 {
             return 0;
         }
@@ -259,7 +281,7 @@ impl PubSubHub {
                         channel: Arc::clone(key),
                         payload: Arc::clone(&payload),
                     };
-                    delivered += hand_over(subscriber, delivery, &mut overflowed);
+                    delivered += hand_over(subscriber, delivery, from, &mut overflowed);
                 }
             }
         }
@@ -321,9 +343,10 @@ impl PubSubHub {
 fn hand_over(
     subscriber: &Arc<Subscriber>,
     delivery: Delivery,
+    from: Option<u64>,
     overflowed: &mut Vec<Arc<Subscriber>>,
 ) -> usize {
-    match subscriber.offer(delivery) {
+    match subscriber.offer(delivery, from) {
         Offer::Queued => 1,
         Offer::Refused => 0,
         Offer::Overflow => {

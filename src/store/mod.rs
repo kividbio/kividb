@@ -188,8 +188,10 @@ macro_rules! mem_swap_rwlock_maps {
 /// asking the allocator to return pages to the OS.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Flushed {
-    /// Keys removed.
+    /// Entries removed: keys, and the TTLs of those that had one.
     pub entries: usize,
+    /// Keys removed.
+    pub keys: usize,
     /// Bucket slots whose backing allocation was freed. Zero when every shard
     /// took the keep-capacity path.
     pub slots_released: usize,
@@ -198,6 +200,7 @@ pub struct Flushed {
 impl std::ops::AddAssign for Flushed {
     fn add_assign(&mut self, rhs: Self) {
         self.entries += rhs.entries;
+        self.keys += rhs.keys;
         self.slots_released += rhs.slots_released;
     }
 }
@@ -243,12 +246,13 @@ fn clear_shard_map<K, V>(map: &mut AHashMap<K, V>) -> Flushed {
         Flushed {
             entries,
             slots_released: capacity,
+            ..Flushed::default()
         }
     } else {
         map.clear();
         Flushed {
             entries,
-            slots_released: 0,
+            ..Flushed::default()
         }
     }
 }
@@ -259,7 +263,29 @@ pub fn clear_db(db: &Db) -> Flushed {
     for shard in db.iter() {
         total += clear_shard_map(&mut *shard.write());
     }
+    total.keys = total.entries;
     total
+}
+
+/// The values of one database, taken out of it to be freed elsewhere: what
+/// `FLUSHDB ASYNC` and `FLUSHALL ASYNC` hand to the lazyfree thread. A shard
+/// keeps a small table, as [`clear_shard_map`] does.
+pub fn take_db(db: &Db) -> (Vec<AHashMap<Key, KiviDBValue>>, Flushed) {
+    let mut taken = Vec::with_capacity(db.len());
+    let mut total = Flushed::default();
+    for shard in db.iter() {
+        let mut map = shard.write();
+        let capacity = map.capacity();
+        total.entries += map.len();
+        taken.push(if capacity >= SHARD_RELEASE_MIN_CAPACITY {
+            total.slots_released += capacity;
+            std::mem::take(&mut *map)
+        } else {
+            std::mem::replace(&mut *map, AHashMap::with_capacity(capacity))
+        });
+    }
+    total.keys = total.entries;
+    (taken, total)
 }
 
 /// Empty every expiry shard of one database.
@@ -465,21 +491,24 @@ mod flush_tests {
         assert!(
             !Flushed {
                 entries: TRIM_MIN_ENTRIES - 1,
-                slots_released: 0
+                slots_released: 0,
+                ..Flushed::default()
             }
             .should_trim()
         );
         assert!(
             Flushed {
                 entries: TRIM_MIN_ENTRIES,
-                slots_released: 0
+                slots_released: 0,
+                ..Flushed::default()
             }
             .should_trim()
         );
         assert!(
             Flushed {
                 entries: 1,
-                slots_released: 1
+                slots_released: 1,
+                ..Flushed::default()
             }
             .should_trim()
         );

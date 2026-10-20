@@ -139,6 +139,8 @@ pub(crate) fn execute_command_from_script(
     if parts.is_empty() {
         return resp_error("ERR wrong number of arguments for redis.call()");
     }
+    // A plain FLUSHALL here is not counted as lazily freed.
+    let _queued = crate::lazyfree::running_queued();
 
     // Compute name early (before cmd swap) so we can short-circuit blocking commands cleanly.
     // On the stack, for a name of ordinary length: a script calls this ten

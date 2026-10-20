@@ -25,6 +25,7 @@ pub mod field_expiry;
 pub mod keyspace_events;
 pub mod keyspec;
 pub mod latency;
+pub mod lazyfree;
 pub mod listen;
 #[cfg(feature = "lua")]
 mod lua_vm_blocking;

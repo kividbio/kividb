@@ -466,6 +466,20 @@ pub fn delete_key(store: &Store, expiry_store: &ExpiryStore, db: usize, key: &st
     removed
 }
 
+/// [`delete_key`], handing back the value, for `UNLINK` to free: after the
+/// shard lock is released, and in the background if it is large.
+pub fn take_key(
+    store: &Store,
+    expiry_store: &ExpiryStore,
+    db: usize,
+    key: &str,
+) -> Option<KiviDBValue> {
+    let value_shard = store::get_shard(&store[db], key);
+    let removed = write_lock!(value_shard).remove(key);
+    clear_expiry(expiry_store, db, key);
+    removed
+}
+
 /// [`delete_key`] plus `expired_keys` stat — use only after an `is_expired` check (lazy TTL).
 #[inline]
 pub fn delete_key_if_expired(

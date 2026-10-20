@@ -472,6 +472,40 @@ const READ_BUFFER: usize = 32 * 1024;
 /// first, so a read never lands in a sliver of free space.
 const READ_MIN: usize = 8 * 1024;
 
+/// A connection's subscriptions, made at its first SUBSCRIBE, with the task
+/// that writes its messages. On this thread: the stream is not `Send`. It
+/// shares the fd with the connection loop and the push task, hence the guard.
+fn open_subscriptions(
+    pubsub: &PubSubHub,
+    client_registry: &crate::client_registry::ClientRegistry,
+    client_id: u64,
+    stream: &Rc<TcpStream>,
+    write_guard: &Rc<tokio::sync::Mutex<()>>,
+) -> crate::pubsub::Subscriptions {
+    let (mut subs, mut outbox) =
+        crate::pubsub::connect(pubsub, std::sync::Arc::clone(client_registry), client_id);
+    let stream = Rc::clone(stream);
+    let write_guard = Rc::clone(write_guard);
+    let registry = std::sync::Arc::clone(client_registry);
+    subs.forwarded_by(tokio_uring::spawn(async move {
+        while let Some(batch) = outbox.next().await {
+            let _w = write_guard.lock().await;
+            // With the guard held: see `Batch::encode`.
+            let frames = batch.encode(registry.get_resp(client_id));
+            if frames.is_empty() {
+                continue;
+            }
+            crate::stats::TOTAL_NET_OUTPUT_BYTES
+                .fetch_add(frames.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            let (res, _) = stream.write_all(frames).await;
+            if res.is_err() {
+                break;
+            }
+        }
+    }));
+    subs
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_client(
     stream: TcpStream,
@@ -1196,38 +1230,11 @@ pub async fn handle_client(
             // A subscribed connection stays in this loop, with a task of its
             // own writing its messages. Under RESP3 that is all there is to
             // it; under RESP2 it may run nothing but the commands below while
-            // it has subscriptions. Mirrors the tokio loop in server.rs.
-            if crate::pubsub::is_subscription_command(cmd_name.as_str()) {
+            // it has subscriptions. Mirrors the tokio loop in server.rs: inside
+            // MULTI they are queued, and EXEC runs them (#23).
+            if crate::pubsub::is_subscription_command(cmd_name.as_str()) && !tx.active {
                 let subs = subscriptions.get_or_insert_with(|| {
-                    let (mut subs, mut outbox) = crate::pubsub::connect(
-                        &pubsub,
-                        std::sync::Arc::clone(&client_registry),
-                        client_id,
-                    );
-                    // On this thread: the stream is not `Send`. It shares the
-                    // fd with this loop and the push task, hence the guard.
-                    let stream = Rc::clone(&stream);
-                    let write_guard = Rc::clone(&write_guard);
-                    let registry = std::sync::Arc::clone(&client_registry);
-                    subs.forwarded_by(tokio_uring::spawn(async move {
-                        while let Some(batch) = outbox.next().await {
-                            let _w = write_guard.lock().await;
-                            // With the guard held: see `Batch::encode`.
-                            let frames = batch.encode(registry.get_resp(client_id));
-                            if frames.is_empty() {
-                                continue;
-                            }
-                            crate::stats::TOTAL_NET_OUTPUT_BYTES.fetch_add(
-                                frames.len() as u64,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                            let (res, _) = stream.write_all(frames).await;
-                            if res.is_err() {
-                                break;
-                            }
-                        }
-                    }));
-                    subs
+                    open_subscriptions(&pubsub, &client_registry, client_id, &stream, &write_guard)
                 });
                 out_buf.extend_from_slice(&subs.handle(&cmd, resp_version));
                 if subs.total() == 0 {
@@ -1683,7 +1690,32 @@ pub async fn handle_client(
                                 .map(|info| info.name.clone())
                                 .unwrap_or_default();
 
+                            // A plain FLUSHALL here is not counted as lazily freed.
+                            let _queued = crate::lazyfree::running_queued();
                             for queued_cmd in queued {
+                                // SUBSCRIBE and its kind, queued: see the tokio loop (#23).
+                                if queued_cmd.first().is_some_and(|name| {
+                                    crate::pubsub::is_subscription_command(
+                                        &String::from_utf8_lossy(name).to_ascii_uppercase(),
+                                    )
+                                }) {
+                                    let args: Vec<&[u8]> =
+                                        queued_cmd.iter().map(|b| b.as_slice()).collect();
+                                    let subs = subscriptions.get_or_insert_with(|| {
+                                        open_subscriptions(
+                                            &pubsub,
+                                            &client_registry,
+                                            client_id,
+                                            &stream,
+                                            &write_guard,
+                                        )
+                                    });
+                                    exec_out.extend_from_slice(&subs.handle(&args, resp_version));
+                                    if subs.total() == 0 {
+                                        subscriptions = None;
+                                    }
+                                    continue;
+                                }
                                 let raw_cmd = queued_cmd.clone();
                                 let _exec_slices: Vec<&[u8]> =
                                     queued_cmd.iter().map(|b| b.as_slice()).collect();

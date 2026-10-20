@@ -126,6 +126,14 @@ static LUA_HOLD_DEPTH: AtomicUsize = AtomicUsize::new(0);
 static LUA_SCRIPT_BUSY_OTHERS: AtomicBool = AtomicBool::new(false);
 /// Unix ms at which the script now holding the VM took it.
 static LUA_SCRIPT_STARTED_MS: AtomicU64 = AtomicU64::new(0);
+/// Bytes the shared VM held when it was last let go: `INFO`'s
+/// `used_memory_vm_functions`, read without waiting for a running script.
+static SHARED_VM_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// `used_memory_vm_functions`: the VM the functions are loaded into.
+pub(crate) fn functions_vm_bytes() -> u64 {
+    SHARED_VM_BYTES.load(Ordering::Relaxed)
+}
 
 /// Whether the script that holds the VM has been running for longer than
 /// `lua-time-limit`: the point at which waiting for it stops and `BUSY`
@@ -680,6 +688,7 @@ where
     let out = f(lua);
     VM_RUN_STARTED.with(|c| c.set(None));
     LAST_VM_RUN_US.with(|c| c.set(started.elapsed().as_micros() as u64));
+    SHARED_VM_BYTES.store(lua.used_memory() as u64, Ordering::Relaxed);
     Ok(out)
 }
 
@@ -4003,24 +4012,39 @@ fn function_flush(ctx: &Ctx) -> Vec<u8> {
             );
         }
     }
-    function_store().write().clear();
-    fn_name_to_library().write().clear();
-    match lua_vm_reset_for_admin() {
-        Ok(()) => resp_simple("OK"),
-        Err(LuaVmBusy) => resp_error(
-            "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
-        ),
+    let libraries = std::mem::take(&mut *function_store().write());
+    let names = std::mem::take(&mut *fn_name_to_library().write());
+    let vm = match lua_vm_take_for_admin() {
+        Ok(vm) => vm,
+        Err(LuaVmBusy) => {
+            return resp_error(
+                "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
+            );
+        }
+    };
+    // `ASYNC`: the VM and the libraries are freed in the background, and
+    // counted as Redis counts them, a function each and one for the VM.
+    if ctx.cmd.len() == 3 && ctx.cmd[2].eq_ignore_ascii_case(b"ASYNC") {
+        let functions: u64 = libraries.values().map(|l| l.functions.len() as u64).sum();
+        crate::lazyfree::free_later((vm, libraries, names), functions + 1);
     }
+    resp_simple("OK")
 }
 
 /// Replace the VM only when no script holds it (`LUA_HOLD_DEPTH == 0`).
 fn lua_vm_reset_for_admin() -> Result<(), LuaVmBusy> {
+    lua_vm_take_for_admin().map(drop)
+}
+
+/// Take the VM out, for the next script to make a new one, only when no
+/// script holds it (`LUA_HOLD_DEPTH == 0`).
+fn lua_vm_take_for_admin() -> Result<Option<Lua>, LuaVmBusy> {
     let mut guard = LUA_VM.try_lock().ok_or(LuaVmBusy)?;
     if LUA_HOLD_DEPTH.load(Ordering::SeqCst) != 0 {
         return Err(LuaVmBusy);
     }
-    *guard = None;
-    Ok(())
+    SHARED_VM_BYTES.store(0, Ordering::Relaxed);
+    Ok(guard.take())
 }
 
 fn function_stats() -> Vec<u8> {

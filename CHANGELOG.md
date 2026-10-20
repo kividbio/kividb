@@ -35,6 +35,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and a size of at least 1 MB), so `CONFIG SET maxmemory 10000001
   maxmemory-clients 200%` fails and leaves `maxmemory` alone.
 
+- **`UNLINK`, `FLUSHALL ASYNC`, `FLUSHDB ASYNC` and `FUNCTION FLUSH ASYNC`
+  free in the background, and `INFO` counts it** (#19). Everything was freed
+  in place, under the shard lock, and `INFO` reported nothing:
+  `lazyfree_pending_objects` was always `0`, and `lazyfreed_objects` and
+  `used_memory_vm_functions` were missing. Now a value `UNLINK` removes that
+  takes more than 64 units of work to free (Redis's measure: a collection's
+  elements, a stream's nodes and pending entries) is freed on a background
+  thread, as are the keys of an `ASYNC` flush and the libraries and Lua VM of
+  `FUNCTION FLUSH ASYNC`. `lazyfreed_objects` counts what was freed,
+  `lazyfree_pending_objects` what is still waiting, and `CONFIG RESETSTAT`
+  resets the first. As in Redis, a plain `FLUSHALL` or `FLUSHDB` counts its
+  keys too, except in a transaction or a script. `DEL` still frees in place.
+  `used_memory_vm_functions` is the size of the Lua VM the functions are
+  loaded into; EVAL scripts that run alone share that VM. `MEMORY STATS`
+  reports the same counts.
+
+- **A message a subscribed connection publishes to itself comes after the
+  reply** to the command that published it, as in Redis (#23). With RESP3, a
+  `PUBLISH` to one of the connection's own channels, inside a Lua script or a
+  `MULTI`/`EXEC` as on its own, could have its `message` push written before
+  the reply, which confuses clients that match replies to requests in order.
+  Such a push now waits until the reply is written. And `SUBSCRIBE`,
+  `UNSUBSCRIBE` and their pattern and shard forms sent inside `MULTI` are
+  queued like any other command, with their replies as elements of `EXEC`'s
+  reply, as in Redis; they used to run at once, outside the transaction.
+
 - **Data from Redis loads: `RESTORE` of a Redis payload, `MIGRATE` from a
   Redis server, a Redis `dump.rdb`, and a full sync from a Redis primary**
   (#39). `RESTORE` refused every payload Redis produces, whatever the type,

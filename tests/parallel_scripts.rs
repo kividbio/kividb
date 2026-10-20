@@ -345,14 +345,31 @@ fn scripts_on_two_tags_run_at_once_and_a_command_waits_for_its_own() {
         );
     }
 
+    // How many steps make the slow script last about a second here. A fixed
+    // count did on some machines and not others: a fast CI runner finished
+    // 60 million in 325 ms, too soon to tell waiting from not waiting, and
+    // the guard below failed the test (#50). It is measured with a copy of
+    // the script under another digest, on a tag of its own: a script the
+    // server has seen to be slow runs alone from then on, and the one timed
+    // here must not be the one the test needs run beside others.
+    let steps = {
+        const MEASURE: u64 = 5_000_000;
+        let copy = format!("{COUNTS} -- timed once to size the slow run");
+        let timed = Instant::now();
+        let reply = c.cmd(&["EVAL", &copy, "1", "{c}:k", &MEASURE.to_string(), "x"]);
+        assert_eq!(reply, V::Int(MEASURE as i64));
+        let per_step = timed.elapsed().as_secs_f64() / MEASURE as f64;
+        // Never fewer than the 60 million this used to run.
+        ((1.0 / per_step) as u64).clamp(60_000_000, 2_000_000_000)
+    };
+
     let port = server.port;
     let started = Instant::now();
     let slow_sha = sha.clone();
-    // Long enough to be told from the rest on any machine: tens of millions
-    // of steps of the interpreter.
+    let slow_steps = steps.to_string();
     let slow = std::thread::spawn(move || {
         let mut c = Conn::connect(port);
-        let reply = c.cmd(&["EVALSHA", &slow_sha, "1", "{a}:k", "60000000", "after"]);
+        let reply = c.cmd(&["EVALSHA", &slow_sha, "1", "{a}:k", &slow_steps, "after"]);
         (reply, started.elapsed())
     });
     std::thread::sleep(Duration::from_millis(100));
@@ -383,10 +400,11 @@ fn scripts_on_two_tags_run_at_once_and_a_command_waits_for_its_own() {
     };
 
     let (slow_reply, slow_done) = slow.join().unwrap();
-    assert_eq!(slow_reply, V::Int(60_000_000));
+    assert_eq!(slow_reply, V::Int(steps as i64));
     assert!(
         slow_done > Duration::from_millis(400),
-        "the slow script took only {slow_done:?}: the test proves nothing on this machine"
+        "the slow script took only {slow_done:?} for {steps} steps, sized to take about a \
+         second: the test proves nothing on this machine"
     );
 
     let margin = Duration::from_millis(100);

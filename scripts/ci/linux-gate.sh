@@ -104,8 +104,7 @@ for stage in "${STAGES[@]}"; do
       if [ ! -d /cache/redis-tests ]; then
         git clone -q --depth 1 --branch 8.0.0 https://github.com/redis/redis.git /cache/redis-tests
       fi
-      (cd /cache/redis-tests && git checkout -q . && for p in /work/patches/redis-tests-compat*.patch; do
-        [ -f "$p" ] && git apply "$p" 2>/dev/null; done; true)
+      (cd /cache/redis-tests && git checkout -q .)
       bash scripts/redis_compat.sh "$CARGO_TARGET_DIR/release/kividb" /cache/redis-tests "$LOGDIR/redis-compat"
       ORDER+=("redis compat")
       RESULT["redis compat"]="measured: $LOGDIR/redis-compat/summary.md (not a gate)"
