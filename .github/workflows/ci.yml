@@ -164,13 +164,6 @@ jobs:
           git clone --depth 1 --branch 8.0.0 \
             https://github.com/redis/redis.git /tmp/redis-tests
 
-      - name: Apply compat patches
-        run: |
-          cd /tmp/redis-tests
-          for patch in "$GITHUB_WORKSPACE"/patches/redis-tests-compat*.patch; do
-            [[ -f "$patch" ]] && git apply "$patch" 2>/dev/null || true
-          done
-
       - name: Download KiviDB binary
         uses: actions/download-artifact@v4
         with:
