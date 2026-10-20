@@ -12,6 +12,7 @@ pub mod config;
 pub mod eviction;
 pub mod field_expiry;
 pub mod latency;
+pub mod lazyfree;
 #[cfg(feature = "lua")]
 mod lua_vm_blocking;
 pub mod member_set;

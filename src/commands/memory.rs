@@ -314,8 +314,14 @@ fn memory_stats() -> Vec<u8> {
     kv!("rss_overhead_ratio", "1.0");
     kv!("rss_overhead_bytes", "0");
     kv!("active_defrag_running", "0");
-    kv!("lazyfree_pending_objects", "0");
-    kv!("lazyfreed_objects", "0");
+    kv!(
+        "lazyfree_pending_objects",
+        crate::lazyfree::pending_objects().to_string()
+    );
+    kv!(
+        "lazyfreed_objects",
+        crate::lazyfree::freed_objects().to_string()
+    );
 
     resp_array(pairs)
 }

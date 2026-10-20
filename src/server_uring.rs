@@ -1683,6 +1683,8 @@ pub async fn handle_client(
                                 .map(|info| info.name.clone())
                                 .unwrap_or_default();
 
+                            // A plain FLUSHALL here is not counted as lazily freed.
+                            let _queued = crate::lazyfree::running_queued();
                             for queued_cmd in queued {
                                 let raw_cmd = queued_cmd.clone();
                                 let _exec_slices: Vec<&[u8]> =
