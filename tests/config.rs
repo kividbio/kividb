@@ -307,12 +307,20 @@ fn test_config_rewrite_with_configfile() {
     let _ = std::fs::remove_file(&tmp);
 }
 
+/// `maxmemory` is the process's, not a server's: the tests that set it take
+/// turns.
+fn maxmemory_turn() -> std::sync::MutexGuard<'static, ()> {
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    TURN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// `CONFIG SET` with several settings sets all or none: one bad value, and
 /// the ones before it are put back (#24, the Redis suite's "CONFIG SET
 /// rollback on set error"). `maxmemory-clients` and
 /// `client-query-buffer-limit` took any value.
 #[test]
 fn config_set_with_a_bad_value_changes_nothing() {
+    let _turn = maxmemory_turn();
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
@@ -379,6 +387,7 @@ fn config_set_with_a_bad_value_changes_nothing() {
 /// same `CONFIG SET` (the Redis suite's "CONFIG SET rollback on apply error").
 #[test]
 fn config_set_port_moves_the_listener_or_changes_nothing() {
+    let _turn = maxmemory_turn();
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
