@@ -114,6 +114,8 @@ impl Policy {
 
 static POLICY: AtomicU8 = AtomicU8::new(Policy::NoEviction as u8);
 static RECORDING: AtomicBool = AtomicBool::new(false);
+/// `key-access-tracking`: record use whatever the policy.
+static TRACK_ALWAYS: AtomicBool = AtomicBool::new(false);
 static SAMPLES: AtomicUsize = AtomicUsize::new(5);
 static LFU_LOG_FACTOR: AtomicU32 = AtomicU32::new(10);
 static LFU_DECAY_MINUTES: AtomicU32 = AtomicU32::new(1);
@@ -125,13 +127,29 @@ pub fn policy() -> Policy {
 pub fn set_policy(policy: Policy) {
     let before = self::policy();
     POLICY.store(policy as u8, Ordering::Relaxed);
-    RECORDING.store(policy.records_use(), Ordering::Relaxed);
-    if !policy.records_use() || policy.is_lfu() != before.is_lfu() {
+    let recording = policy.records_use() || key_access_tracking();
+    RECORDING.store(recording, Ordering::Relaxed);
+    if !recording || policy.is_lfu() != before.is_lfu() {
         // What was recorded is of no use to the new policy.
         for stripe in RECORDS.iter() {
             *stripe.lock() = AHashMap::new();
         }
     }
+}
+
+/// `key-access-tracking`: whether a key's use is recorded under every
+/// policy, so that `OBJECT IDLETIME` and `FREQ` report it under
+/// `noeviction` too, as Redis does (#21). Off by default: recording costs
+/// every command about 500 instructions (11-13% of a GET or SET) and a key
+/// about 53 bytes (195 -> 248 at 100 B), measured on 2026-10-20. Under an
+/// LRU or LFU policy it is recorded either way.
+pub fn key_access_tracking() -> bool {
+    TRACK_ALWAYS.load(Ordering::Relaxed)
+}
+
+pub fn set_key_access_tracking(on: bool) {
+    TRACK_ALWAYS.store(on, Ordering::Relaxed);
+    set_policy(policy());
 }
 
 /// How many keys are looked at to choose one (`maxmemory-samples`).
@@ -161,6 +179,7 @@ pub fn set_lfu_decay_time(minutes: u32) {
 
 /// The settings a server starts with.
 pub fn configure(config: &crate::config::Config) {
+    TRACK_ALWAYS.store(config.key_access_tracking, Ordering::Relaxed);
     set_policy(Policy::parse(&config.maxmemory_policy).unwrap_or(Policy::NoEviction));
     set_samples(config.maxmemory_samples);
     set_lfu_log_factor(config.lfu_log_factor);
@@ -197,10 +216,15 @@ static RECORDS: LazyLock<Vec<Mutex<AHashMap<u64, Use>>>> = LazyLock::new(|| {
 /// How large a stripe may be before the older half of it is dropped.
 static STRIPE_LIMIT: AtomicUsize = AtomicUsize::new(STRIPE_FLOOR);
 
-/// Seconds since the first call.
+/// Where [`clock`] starts: far enough above 0 that a key can be older than
+/// the server, as `RESTORE ... IDLETIME` makes one (Redis's LRU clock,
+/// 24 bits of seconds, holds 194 days).
+const CLOCK_BASE: u32 = 1 << 24;
+
+/// Seconds since the first call, plus [`CLOCK_BASE`].
 fn clock() -> u32 {
     static START: LazyLock<Instant> = LazyLock::new(Instant::now);
-    START.elapsed().as_secs() as u32
+    CLOCK_BASE + START.elapsed().as_secs() as u32
 }
 
 fn record_id(db: usize, key: &[u8]) -> u64 {
@@ -298,7 +322,27 @@ fn record_of(db: usize, key: &[u8]) -> Option<Use> {
 pub fn idle_seconds(db: usize, key: &[u8]) -> u64 {
     match record_of(db, key) {
         Some(record) => clock().saturating_sub(record.used) as u64,
-        None => clock() as u64,
+        None => (clock() - CLOCK_BASE) as u64,
+    }
+}
+
+/// `RESTORE ... IDLETIME` / `FREQ`: the restored key keeps the standing it
+/// had where it was dumped. As in Redis, the frequency is set under an LFU
+/// policy and the idle time under any other.
+pub fn restored(store: &Store, db: usize, key: &[u8], idle: Option<u64>, freq: Option<u8>) {
+    used(store, db, key, true);
+    let id = record_id(db, key);
+    let mut stripe = RECORDS[id as usize % RECORD_STRIPES].lock();
+    let Some(record) = stripe.get_mut(&id) else {
+        return;
+    };
+    if policy().is_lfu() {
+        if let Some(freq) = freq {
+            record.frequency = freq;
+        }
+    } else if let Some(idle) = idle {
+        let idle = idle.min(u64::from(CLOCK_BASE)) as u32;
+        record.used = clock().saturating_sub(idle);
     }
 }
 

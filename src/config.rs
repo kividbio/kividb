@@ -106,6 +106,12 @@ pub struct Config {
     #[arg(long, default_value_t = 10)]
     pub lfu_log_factor: u32,
 
+    /// Record every key's use whatever the eviction policy, so that `OBJECT
+    /// IDLETIME` and `OBJECT FREQ` report it under `noeviction` too. Costs
+    /// every command and every key: see `eviction::key_access_tracking`.
+    #[arg(long, default_value = "no", value_parser = parse_yes_no, num_args = 1)]
+    pub key_access_tracking: bool,
+
     /// Minutes for a key's use count to fall by one, for the LFU policies
     /// (Redis `lfu-decay-time`). 0 = it never falls.
     #[arg(long, default_value_t = 1)]
@@ -439,6 +445,7 @@ impl Default for Config {
             maxmemory_policy: "noeviction".into(),
             maxmemory_samples: 5,
             lfu_log_factor: 10,
+            key_access_tracking: false,
             lfu_decay_time: 1,
             dir: String::new(),
             loglevel: "info".into(),
@@ -548,6 +555,7 @@ impl Config {
             maxmemory_policy: "noeviction".into(),
             maxmemory_samples: 5,
             lfu_log_factor: 10,
+            key_access_tracking: false,
             lfu_decay_time: 1,
             dir: String::new(),
             loglevel: "warn".into(),
@@ -837,6 +845,14 @@ impl Config {
         out.push_str(&format!("maxmemory-samples {}\n", self.maxmemory_samples));
         out.push_str(&format!("lfu-log-factor {}\n", self.lfu_log_factor));
         out.push_str(&format!("lfu-decay-time {}\n", self.lfu_decay_time));
+        out.push_str(&format!(
+            "key-access-tracking {}\n",
+            if self.key_access_tracking {
+                "yes"
+            } else {
+                "no"
+            }
+        ));
         out.push_str(&format!("loglevel {}\n", self.loglevel));
         if !self.logfile.is_empty() {
             out.push_str(&format!("logfile {}\n", quote(&self.logfile)));
@@ -1393,6 +1409,7 @@ impl Config {
             }
             "lfu-log-factor" => set!(lfu_log_factor, number(key, one()?)?),
             "lfu-decay-time" => set!(lfu_decay_time, number(key, one()?)?),
+            "key-access-tracking" => set!(key_access_tracking, yes_no(key, one()?)?),
             // Tuning knobs for machinery KiviDB does not have, or does not
             // expose. They change nothing a client could observe.
             "activerehashing"

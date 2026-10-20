@@ -1200,17 +1200,42 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // Parse options
             let mut replace = false;
             let mut absttl = false;
+            let mut idle: Option<u64> = None;
+            let mut freq: Option<u8> = None;
             let mut i = 4usize;
             while i < cmd.len() {
-                match parse_utf8(cmd[i])
-                    .map(|s| s.to_ascii_uppercase())
-                    .as_deref()
-                {
+                let option = parse_utf8(cmd[i]).map(|s| s.to_ascii_uppercase());
+                let value = cmd.get(i + 1).and_then(|v| parse_utf8(v));
+                match option.as_deref() {
                     Some("REPLACE") => replace = true,
                     Some("ABSTTL") => absttl = true,
-                    Some("IDLETIME") | Some("FREQ") => {
+                    Some("IDLETIME") if value.is_some() && freq.is_none() => {
+                        match value.and_then(|v| v.parse::<i64>().ok()) {
+                            Some(seconds) if seconds >= 0 => idle = Some(seconds as u64),
+                            _ => {
+                                return Some(resp_error(
+                                    "ERR Invalid IDLETIME value, must be >= 0",
+                                ));
+                            }
+                        }
                         i += 1;
-                    } // consume arg, ignore value
+                    }
+                    Some("FREQ") if value.is_some() && idle.is_none() => {
+                        match value.and_then(|v| v.parse::<i64>().ok()) {
+                            Some(count @ 0..=255) => freq = Some(count as u8),
+                            _ => {
+                                return Some(resp_error(
+                                    "ERR Invalid FREQ value, must be >= 0 and <= 255",
+                                ));
+                            }
+                        }
+                        i += 1;
+                    }
+                    Some("IDLETIME") | Some("FREQ") if value.is_some() => {
+                        return Some(resp_error(
+                            "ERR IDLETIME and FREQ cannot be set at the same time.",
+                        ));
+                    }
                     _ => return Some(resp_error("ERR syntax error")),
                 }
                 i += 1;
@@ -1266,6 +1291,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     expiry_at_after(Duration::from_millis(ttl_ms))
                 };
                 crate::commands::helpers::set_expiry(ctx.expiry_store, db_idx, &key, expires_at);
+            }
+
+            if crate::eviction::recording() {
+                crate::eviction::restored(ctx.store, db_idx, key.as_bytes(), idle, freq);
             }
 
             Some(resp_simple("OK"))

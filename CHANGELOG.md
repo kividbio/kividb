@@ -21,6 +21,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`RESTORE` applies `IDLETIME` and `FREQ`, and `key-access-tracking yes`
+  keeps `OBJECT IDLETIME` and `FREQ` under every policy** (#21). `RESTORE
+  ... IDLETIME n` and `FREQ n` were read and ignored; now the restored key
+  has that idle time (under an LRU policy) or that frequency (under LFU), as
+  in Redis, and invalid values get Redis's errors. The idle time may be
+  longer than the server has been up. A key's use is still recorded only
+  while an LRU or LFU policy is selected, so under the default `noeviction`
+  `OBJECT IDLETIME` is 0: recording it on every command costs about 500
+  instructions a command (11-13% of a GET or SET) and 53 bytes a key. The
+  new setting `key-access-tracking` (default `no`; config file, command line
+  and `CONFIG SET`) records it whatever the policy, at that cost. `TTL`,
+  `PTTL`, `TYPE`, `EXISTS` and `OBJECT` do not count as a use either way.
+
 - **`CONFIG SET port` moves the listener, and `CONFIG SET` with several
   settings is refused whole for a bad value** (#24). `CONFIG SET port`
   replied `OK` and changed nothing: the server kept listening where it was.

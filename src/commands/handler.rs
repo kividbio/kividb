@@ -891,6 +891,8 @@ fn run_command(ctx: &mut Ctx, name: &str) -> Vec<u8> {
         && !matches!(
             name,
             "OBJECT" | "TYPE" | "TTL" | "PTTL" | "EXPIRETIME" | "PEXPIRETIME" | "EXISTS" | "DEBUG"
+            // Records its own use, with what IDLETIME or FREQ said.
+            | "RESTORE"
         )
     {
         let wrote = writes_operation && !result.starts_with(b"-");
