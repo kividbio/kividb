@@ -21,6 +21,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A message a subscribed connection publishes to itself comes after the
+  reply** to the command that published it, as in Redis (#23). With RESP3, a
+  `PUBLISH` to one of the connection's own channels, inside a Lua script or a
+  `MULTI`/`EXEC` as on its own, could have its `message` push written before
+  the reply, which confuses clients that match replies to requests in order.
+  Such a push now waits until the reply is written. And `SUBSCRIBE`,
+  `UNSUBSCRIBE` and their pattern and shard forms sent inside `MULTI` are
+  queued like any other command, with their replies as elements of `EXEC`'s
+  reply, as in Redis; they used to run at once, outside the transaction.
+
 - **Data from Redis loads: `RESTORE` of a Redis payload, `MIGRATE` from a
   Redis server, a Redis `dump.rdb`, and a full sync from a Redis primary**
   (#39). `RESTORE` refused every payload Redis produces, whatever the type,

@@ -981,3 +981,159 @@ fn hello_reports_the_built_in_modules() {
         "HELLO must end with the module list:\n  hello: {hello}\n  list:  {list}"
     );
 }
+
+// ── Publishing to oneself (#23) ──────────────────────────────────────────────
+
+/// Read exactly `expected.len()` bytes, or fail if they do not arrive.
+fn read_exactly(c: &mut RawConn, expected: &[u8]) -> Vec<u8> {
+    c.stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    let mut out = vec![0u8; expected.len()];
+    c.stream.read_exact(&mut out).unwrap_or_else(|e| {
+        panic!("{e}: wanted {:?}", s(expected));
+    });
+    out
+}
+
+/// A RESP3 `message` push for `channel`.
+fn message_push(channel: &str, payload: &str) -> Vec<u8> {
+    format!(
+        ">3\r\n$7\r\nmessage\r\n${}\r\n{channel}\r\n${}\r\n{payload}\r\n",
+        channel.len(),
+        payload.len()
+    )
+    .into_bytes()
+}
+
+/// RESP for a command.
+fn command(args: &[&str]) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", args.len()).into_bytes();
+    for a in args {
+        out.extend_from_slice(format!("${}\r\n{a}\r\n", a.len()).as_bytes());
+    }
+    out
+}
+
+/// A message a subscribed connection publishes to itself comes after the
+/// reply to the PUBLISH, as in Redis. Its own forwarder used to write it as
+/// soon as it was queued, so the two raced; many rounds give the race room.
+#[test]
+fn a_message_published_to_oneself_comes_after_the_publish_reply() {
+    let port = free_port();
+    start_server(port);
+    let mut c = RawConn::connect(port);
+    c.hello3();
+    assert_wire!(
+        c.raw(&["SUBSCRIBE", "foo"]),
+        b">3\r\n$9\r\nsubscribe\r\n$3\r\nfoo\r\n:1\r\n",
+        "subscribe"
+    );
+    for i in 0..200 {
+        let payload = format!("m{i}");
+        c.stream
+            .write_all(&command(&["PUBLISH", "foo", &payload]))
+            .unwrap();
+        let mut want = b":1\r\n".to_vec();
+        want.extend_from_slice(&message_push("foo", &payload));
+        let got = read_exactly(&mut c, &want);
+        assert_wire!(got, &want[..], "round {i}");
+    }
+}
+
+/// The Redis suite's "publish to self inside multi".
+#[test]
+fn messages_published_to_oneself_in_a_transaction_come_after_exec() {
+    let port = free_port();
+    start_server(port);
+    let mut c = RawConn::connect(port);
+    c.hello3();
+    c.raw(&["SUBSCRIBE", "foo"]);
+    assert_wire!(c.raw(&["MULTI"]), b"+OK\r\n", "multi");
+    for args in [
+        &["PING", "abc"][..],
+        &["PUBLISH", "foo", "bar"],
+        &["PUBLISH", "foo", "vaz"],
+        &["PING", "def"],
+    ] {
+        assert_wire!(c.raw(args), b"+QUEUED\r\n", "queued");
+    }
+    c.stream.write_all(&command(&["EXEC"])).unwrap();
+    let mut want = b"*4\r\n$3\r\nabc\r\n:1\r\n:1\r\n$3\r\ndef\r\n".to_vec();
+    want.extend_from_slice(&message_push("foo", "bar"));
+    want.extend_from_slice(&message_push("foo", "vaz"));
+    assert_wire!(
+        read_exactly(&mut c, &want),
+        &want[..],
+        "EXEC, then the messages"
+    );
+}
+
+/// The Redis suite's "unsubscribe inside multi, and publish to self":
+/// UNSUBSCRIBE in a transaction is queued, and EXEC's reply carries its
+/// replies. It used to run at once, outside the transaction.
+#[test]
+fn unsubscribe_in_a_transaction_is_queued_and_answered_in_exec() {
+    let port = free_port();
+    start_server(port);
+    let mut c = RawConn::connect(port);
+    c.hello3();
+    c.stream
+        .write_all(&command(&["SUBSCRIBE", "foo", "bar", "baz"]))
+        .unwrap();
+    let mut want = b">3\r\n$9\r\nsubscribe\r\n$3\r\nfoo\r\n:1\r\n".to_vec();
+    want.extend_from_slice(b">3\r\n$9\r\nsubscribe\r\n$3\r\nbar\r\n:2\r\n");
+    want.extend_from_slice(b">3\r\n$9\r\nsubscribe\r\n$3\r\nbaz\r\n:3\r\n");
+    assert_wire!(read_exactly(&mut c, &want), &want[..], "subscribe");
+
+    assert_wire!(c.raw(&["MULTI"]), b"+OK\r\n", "multi");
+    for args in [
+        &["PING", "abc"][..],
+        &["UNSUBSCRIBE", "bar"],
+        &["UNSUBSCRIBE", "baz"],
+        &["PING", "def"],
+    ] {
+        assert_wire!(c.raw(args), b"+QUEUED\r\n", "queued");
+    }
+    c.stream.write_all(&command(&["EXEC"])).unwrap();
+    let want = b"*4\r\n$3\r\nabc\r\n\
+                 >3\r\n$11\r\nunsubscribe\r\n$3\r\nbar\r\n:2\r\n\
+                 >3\r\n$11\r\nunsubscribe\r\n$3\r\nbaz\r\n:1\r\n\
+                 $3\r\ndef\r\n";
+    assert_wire!(read_exactly(&mut c, want), &want[..], "exec");
+
+    c.stream
+        .write_all(&command(&["PUBLISH", "foo", "vaz"]))
+        .unwrap();
+    let mut want = b":1\r\n".to_vec();
+    want.extend_from_slice(&message_push("foo", "vaz"));
+    assert_wire!(
+        read_exactly(&mut c, &want),
+        &want[..],
+        "publish, then the message"
+    );
+}
+
+/// The Redis suite's "publish to self inside script".
+#[cfg(feature = "lua")]
+#[test]
+fn messages_a_script_publishes_to_its_own_connection_come_after_its_reply() {
+    let port = free_port();
+    start_server(port);
+    let mut c = RawConn::connect(port);
+    c.hello3();
+    c.raw(&["SUBSCRIBE", "foo"]);
+    let script = "redis.call('ping','abc') redis.call('publish','foo','bar') \
+                  redis.call('publish','foo','vaz') redis.call('ping','def') return 'bla'";
+    c.stream
+        .write_all(&command(&["EVAL", script, "0"]))
+        .unwrap();
+    let mut want = b"$3\r\nbla\r\n".to_vec();
+    want.extend_from_slice(&message_push("foo", "bar"));
+    want.extend_from_slice(&message_push("foo", "vaz"));
+    assert_wire!(
+        read_exactly(&mut c, &want),
+        &want[..],
+        "the script's reply, then the messages"
+    );
+}

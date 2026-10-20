@@ -234,6 +234,27 @@ where
     })
 }
 
+/// A connection's subscriptions, made at its first SUBSCRIBE, with the task
+/// that writes its messages.
+fn open_subscriptions<S>(
+    pubsub: &crate::pubsub::PubSubHub,
+    client_registry: &crate::client_registry::ClientRegistry,
+    client_id: u64,
+    writer: &Arc<Mutex<tokio::io::WriteHalf<S>>>,
+) -> crate::pubsub::Subscriptions
+where
+    S: AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut subs, outbox) = crate::pubsub::connect(pubsub, Arc::clone(client_registry), client_id);
+    subs.forwarded_by(spawn_pubsub_forwarder(
+        Arc::clone(writer),
+        outbox,
+        Arc::clone(client_registry),
+        client_id,
+    ));
+    subs
+}
+
 /// Replica / monitor: channel-fed writer multiplexes onto `writer`.
 fn spawn_mux_to_socket<S>(
     writer: Arc<Mutex<tokio::io::WriteHalf<S>>>,
@@ -984,21 +1005,11 @@ where
             // A subscribed connection stays in this loop, with a task of its
             // own writing its messages. Under RESP3 that is all there is to
             // it; under RESP2 it may run nothing but the commands below while
-            // it has subscriptions.
-            if crate::pubsub::is_subscription_command(cmd_name.as_str()) {
+            // it has subscriptions. Inside MULTI they are queued like any other
+            // command, and EXEC runs them (#23).
+            if crate::pubsub::is_subscription_command(cmd_name.as_str()) && !tx.active {
                 let subs = subscriptions.get_or_insert_with(|| {
-                    let (mut subs, outbox) = crate::pubsub::connect(
-                        &pubsub,
-                        std::sync::Arc::clone(&client_registry),
-                        client_id,
-                    );
-                    subs.forwarded_by(spawn_pubsub_forwarder(
-                        Arc::clone(&writer),
-                        outbox,
-                        std::sync::Arc::clone(&client_registry),
-                        client_id,
-                    ));
-                    subs
+                    open_subscriptions(&pubsub, &client_registry, client_id, &writer)
                 });
                 combined.extend_from_slice(&subs.handle(&cmd, resp_version));
                 if subs.total() == 0 {
@@ -1454,6 +1465,30 @@ where
                                 .unwrap_or_default();
 
                             for queued_cmd in queued {
+                                // SUBSCRIBE and its kind, queued: run as they run
+                                // outside a transaction, their reply this command's
+                                // place in EXEC's, as in Redis (#23).
+                                if queued_cmd.first().is_some_and(|name| {
+                                    crate::pubsub::is_subscription_command(
+                                        &String::from_utf8_lossy(name).to_ascii_uppercase(),
+                                    )
+                                }) {
+                                    let args: Vec<&[u8]> =
+                                        queued_cmd.iter().map(|b| b.as_slice()).collect();
+                                    let subs = subscriptions.get_or_insert_with(|| {
+                                        open_subscriptions(
+                                            &pubsub,
+                                            &client_registry,
+                                            client_id,
+                                            &writer,
+                                        )
+                                    });
+                                    exec_out.extend_from_slice(&subs.handle(&args, resp_version));
+                                    if subs.total() == 0 {
+                                        subscriptions = None;
+                                    }
+                                    continue;
+                                }
                                 let raw_cmd = queued_cmd.clone();
                                 #[cfg(feature = "lua")]
                                 let exec_slices: Vec<&[u8]> =
