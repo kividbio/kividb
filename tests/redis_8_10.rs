@@ -3360,3 +3360,56 @@ fn hsetex_and_hgetex_take_options_after_fields() {
     );
     assert_eq!(c.cmd(&["HTTL", "hx", "FIELDS", "1", "f1"]).arr()[0].i(), -1);
 }
+
+/// XIDMPRECORD (Redis 8.10): an entry already in the stream recorded as what
+/// a producer's idempotent ID produced, so `XADD … IDMP` with that ID returns
+/// it instead of adding another.
+#[test]
+fn xidmprecord_records_an_entry_for_idempotent_production() {
+    let mut c = conn();
+    let id = c.cmd(&["XADD", "xi", "*", "f", "v"]).s().to_string();
+    for (args, error) in [
+        (
+            &["xi", "p1", "i1"][..],
+            "ERR wrong number of arguments for 'xidmprecord' command",
+        ),
+        (&["nosuch", "p1", "i1", "1-1"], "ERR no such key"),
+        (
+            &["xi", "p1", "i1", "bad"],
+            "ERR Invalid stream ID specified as stream command argument",
+        ),
+        (
+            &["xi", "", "i1", "1-1"],
+            "ERR producer ID must be non-empty",
+        ),
+        (
+            &["xi", "p1", "", "1-1"],
+            "ERR idempotent ID must be non-empty",
+        ),
+        (
+            &["xi", "p1", "i1", "999-999"],
+            "ERR No such message in stream",
+        ),
+    ] {
+        let mut cmd = vec!["XIDMPRECORD"];
+        cmd.extend_from_slice(args);
+        assert_eq!(c.cmd(&cmd), V::Err(error.into()), "{args:?}");
+    }
+    assert!(c.cmd(&["XIDMPRECORD", "xi", "p1", "req-1", &id]).ok());
+    assert!(
+        c.cmd(&["XIDMPRECORD", "xi", "p1", "req-1", &id]).ok(),
+        "the same record again"
+    );
+    // A retry of the request returns the recorded entry; nothing is added.
+    assert_eq!(
+        c.cmd(&["XADD", "xi", "IDMP", "p1", "req-1", "*", "f", "again"])
+            .s(),
+        id
+    );
+    assert_eq!(c.cmd(&["XLEN", "xi"]).i(), 1);
+    let other = c.cmd(&["XADD", "xi", "*", "f", "w"]).s().to_string();
+    assert_eq!(
+        c.cmd(&["XIDMPRECORD", "xi", "p1", "req-1", &other]),
+        V::Err("ERR IID already exists for this producer with a different stream ID".into())
+    );
+}

@@ -544,6 +544,9 @@ pub(super) const TABLE: &[(&str, bool, &[Spec])] = &[
     ("XSETID", false, &[
         Spec { flags: "RW update", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
     ]),
+    ("XIDMPRECORD", false, &[
+        Spec { flags: "RW update", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
+    ]),
     ("XTRIM", false, &[
         Spec { flags: "RW delete", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
     ]),

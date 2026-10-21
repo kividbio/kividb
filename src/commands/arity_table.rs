@@ -372,6 +372,7 @@ pub(super) const TABLE: &[(&str, i16)] = &[
     ("XREADGROUP", -7),
     ("XREVRANGE", -4),
     ("XSETID", -3),
+    ("XIDMPRECORD", 5),
     ("XTRIM", -4),
     ("ZADD", -4),
     ("ZCARD", 2),

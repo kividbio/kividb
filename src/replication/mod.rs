@@ -2105,6 +2105,7 @@ pub fn is_write_command(name: &str) -> bool {
                 | "JSON.TOGGLE"
                 | "SINTERSTORE"
                 | "SUNIONSTORE"
+                | "XIDMPRECORD"
                 | "ZINTERSTORE"
                 | "ZRANGESTORE"
                 | "ZUNIONSTORE"
@@ -2274,6 +2275,7 @@ pub(crate) const WRITE_COMMANDS_FOR_TEST: &[&str] = &[
     "XADD",
     "XAUTOCLAIM",
     "XCFGSET",
+    "XIDMPRECORD",
     "XCLAIM",
     "XDEL",
     "XDELEX",
@@ -2332,7 +2334,7 @@ fn is_write_command_reference(name: &str) -> bool {
         // entries between consumers' pending lists — state a promoted replica
         // has to have, or a failover silently reassigns or redelivers work.
         "XADD" | "XDEL" | "XTRIM" | "XSETID" | "XGROUP" | "XACK" | "XDELEX" |
-        "XNACK" | "XACKDEL" | "XCFGSET" | "XCLAIM" | "XAUTOCLAIM" | "XREADGROUP" |
+        "XNACK" | "XACKDEL" | "XCFGSET" | "XIDMPRECORD" | "XCLAIM" | "XAUTOCLAIM" | "XREADGROUP" |
         // JSON
         "JSON.SET" | "JSON.DEL" | "JSON.MSET" | "JSON.NUMINCRBY" |
         "JSON.NUMMULTBY" | "JSON.STRAPPEND" | "JSON.ARRAPPEND" | "JSON.ARRINSERT" |
@@ -2816,6 +2818,7 @@ mod replication_invariants_tests {
             "FT.DICTDEL",
             "XACKDEL",
             "XCFGSET",
+            "XIDMPRECORD",
             "XCLAIM",
             "XAUTOCLAIM",
             "XREADGROUP",

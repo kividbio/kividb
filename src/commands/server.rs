@@ -1432,6 +1432,7 @@ const ALL_COMMANDS: &[&str] = &[
     "TS.READ",
     "XACKDEL",
     "XCFGSET",
+    "XIDMPRECORD",
     "FT.ALIASLIST",
     "FT.HYBRID",
     "FT.TAGVALS",
@@ -1984,6 +1985,7 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
             "XTRIM",
             "XACKDEL",
             "XCFGSET",
+            "XIDMPRECORD",
         ],
         "generic" => vec![
             "COPY",

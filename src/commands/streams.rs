@@ -112,6 +112,7 @@ fn run(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         "XDEL" => Some(xdel(ctx)),
         "XTRIM" => Some(xtrim(ctx)),
         "XSETID" => Some(xsetid(ctx)),
+        "XIDMPRECORD" => Some(xidmprecord(ctx)),
         "XGROUP" => Some(xgroup(ctx)),
         "XREADGROUP" => Some(xreadgroup(ctx)),
         "XACK" => Some(xack(ctx)),
@@ -128,6 +129,63 @@ fn run(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+/// `XIDMPRECORD key pid iid id` (Redis 8.10): remember that producer `pid`'s
+/// idempotent ID `iid` produced the entry `id` already in the stream, as an
+/// `XADD … IDMP` would have. The same record again is OK; the iid recorded
+/// for another entry is an error.
+fn xidmprecord(ctx: &mut Ctx) -> Vec<u8> {
+    let cmd = &ctx.cmd;
+    if cmd.len() != 5 {
+        return resp_error("ERR wrong number of arguments for 'xidmprecord' command");
+    }
+    let Some(id) = parse_utf8(cmd[4]).and_then(StreamId::parse) else {
+        return resp_error("ERR Invalid stream ID specified as stream command argument");
+    };
+    if cmd[2].is_empty() {
+        return resp_error("ERR producer ID must be non-empty");
+    }
+    if cmd[3].is_empty() {
+        return resp_error("ERR idempotent ID must be non-empty");
+    }
+    let Some(key) = parse_utf8(cmd[1]) else {
+        return resp_error("ERR key must be valid UTF-8");
+    };
+    let (producer, iid) = (cmd[2], cmd[3]);
+    let defaults = (
+        ctx.config.stream_idmp_duration,
+        ctx.config.stream_idmp_maxsize,
+    );
+    let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
+    let stream = match read_lock!(shard).get(key) {
+        Some(KiviDBValue::Stream(s)) => Arc::clone(s),
+        Some(_) => {
+            return resp_error("WRONGTYPE Operation against a key holding the wrong kind of value");
+        }
+        None => return resp_error("ERR no such key"),
+    };
+    let mut inner = stream.write();
+    if !inner.entries.contains_key(&id) {
+        return resp_error("ERR No such message in stream");
+    }
+    let recorded = inner
+        .idmp
+        .producers
+        .get(producer)
+        .and_then(|p| p.by_iid.get(iid))
+        .cloned();
+    match recorded {
+        Some(same) if same == id => return resp_simple("OK"),
+        Some(_) => {
+            return resp_error(
+                "ERR IID already exists for this producer with a different stream ID",
+            );
+        }
+        None => {}
+    }
+    stream_extra::idmp_record(&mut inner, producer, Arc::from(iid), id, now_ms(), defaults);
+    resp_simple("OK")
+}
 
 fn now_ms() -> u64 {
     SystemTime::now()

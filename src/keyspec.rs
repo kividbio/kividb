@@ -278,7 +278,7 @@ pub fn key_positions(name: &str, cmd: &[&[u8]]) -> Keys {
         | "ZPOPMIN" | "ZPOPMAX" | "ZREMRANGEBYLEX" | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE"
         // Streams
         | "XLEN" | "XRANGE" | "XREVRANGE" | "XPENDING" | "XADD" | "XDEL" | "XDELEX" | "XTRIM"
-        | "XSETID" | "XACK" | "XACKDEL" | "XNACK" | "XAUTOCLAIM" | "XCLAIM" | "XCFGSET"
+        | "XSETID" | "XACK" | "XACKDEL" | "XNACK" | "XAUTOCLAIM" | "XCLAIM" | "XCFGSET" | "XIDMPRECORD"
         // Geo
         | "GEOADD" | "GEODIST" | "GEOPOS" | "GEOHASH" | "GEOSEARCH" | "GEORADIUS_RO"
         | "GEORADIUSBYMEMBER_RO" | "GEODELBYMEMBER"
