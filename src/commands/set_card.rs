@@ -24,12 +24,11 @@ struct CardArgs<'a> {
 /// Parse `numkeys key [key ...] [APPROX] [LIMIT limit]`. `APPROX` is only
 /// recognised when `allow_approx` is set (`SUNIONCARD`).
 fn parse_args<'a>(cmd: &'a [&'a [u8]], allow_approx: bool) -> Result<CardArgs<'a>, Vec<u8>> {
+    // Not a number is the same error as not a positive one, as in Redis.
     let numkeys: i64 = parse_utf8(cmd[1])
         .and_then(|s| s.parse().ok())
-        .ok_or_else(|| resp_error("ERR value is not an integer or out of range"))?;
-    if numkeys <= 0 {
-        return Err(resp_error("ERR numkeys should be greater than 0"));
-    }
+        .filter(|n| *n > 0)
+        .ok_or_else(|| resp_error("ERR numkeys should be greater than 0"))?;
     let keys_end = 2 + numkeys as usize;
     if cmd.len() < keys_end {
         return Err(resp_error(
@@ -43,10 +42,8 @@ fn parse_args<'a>(cmd: &'a [&'a [u8]], allow_approx: bool) -> Result<CardArgs<'a
         if cmd[i].eq_ignore_ascii_case(b"LIMIT") && i + 1 < cmd.len() {
             let n: i64 = parse_utf8(cmd[i + 1])
                 .and_then(|s| s.parse().ok())
-                .ok_or_else(|| resp_error("ERR value is not an integer or out of range"))?;
-            if n < 0 {
-                return Err(resp_error("ERR LIMIT can't be negative"));
-            }
+                .filter(|n| *n >= 0)
+                .ok_or_else(|| resp_error("ERR LIMIT can't be negative"))?;
             limit = n as usize;
             i += 2;
         } else if allow_approx && cmd[i].eq_ignore_ascii_case(b"APPROX") {

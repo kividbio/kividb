@@ -3159,3 +3159,171 @@ fn increx_options_and_errors_follow_redis_8_10() {
     c.cmd(&["INCREX", "ix", "BYINT", "1", "PERSIST"]);
     assert_eq!(c.cmd(&["TTL", "ix"]).i(), -1);
 }
+
+/// Argument checks Redis 8.10 tightened: LMOVEM's trailer, SDIFFCARD's
+/// numbers, a negative LIMIT offset, XREADGROUP's options and IDs.
+#[test]
+fn argument_checks_follow_redis_8_10() {
+    let mut c = conn();
+    c.cmd(&["RPUSH", "lm:{t}src", "a", "b", "c"]);
+    for (args, error) in [
+        (
+            &["LMOVEM", "lm:{t}src", "lm:{t}dst", "LEFT"][..],
+            "ERR wrong number of arguments for 'lmovem' command",
+        ),
+        (
+            &[
+                "LMOVEM",
+                "lm:{t}src",
+                "lm:{t}dst",
+                "LEFT",
+                "RIGHT",
+                "COUNT",
+                "2",
+            ],
+            "ERR syntax error",
+        ),
+        (
+            &[
+                "LMOVEM",
+                "lm:{t}src",
+                "lm:{t}dst",
+                "LEFT",
+                "RIGHT",
+                "COUNT",
+                "2",
+                "OBO",
+                "x",
+            ],
+            "ERR syntax error",
+        ),
+        (
+            &[
+                "LMOVEM",
+                "lm:{t}src",
+                "lm:{t}dst",
+                "LEFT",
+                "RIGHT",
+                "COUNT",
+                "0",
+                "BULK",
+            ],
+            "ERR count should be greater than 0",
+        ),
+        (
+            &[
+                "LMOVEM",
+                "lm:{t}src",
+                "lm:{t}dst",
+                "LEFT",
+                "RIGHT",
+                "COUNT",
+                "a",
+                "BULK",
+            ],
+            "ERR count should be greater than 0",
+        ),
+        (
+            &["SDIFFCARD", "a", "s:{t}1"],
+            "ERR numkeys should be greater than 0",
+        ),
+        (
+            &["SDIFFCARD", "1", "s:{t}1", "LIMIT", "a"],
+            "ERR LIMIT can't be negative",
+        ),
+        (
+            &["ZRANGEBYSCORE", "z", "0", "10", "LIMIT", "x", "2"],
+            "ERR value is not an integer or out of range",
+        ),
+    ] {
+        assert_eq!(c.cmd(args), V::Err(error.into()), "{args:?}");
+    }
+    assert_eq!(
+        c.cmd(&[
+            "LMOVEM",
+            "lm:{t}src",
+            "lm:{t}dst",
+            "LEFT",
+            "RIGHT",
+            "COUNT",
+            "2",
+            "OBO"
+        ])
+        .arr()
+        .len(),
+        2
+    );
+
+    c.cmd(&["ZADD", "z", "1", "a", "2", "b", "3", "c"]);
+    assert!(
+        c.cmd(&["ZRANGEBYSCORE", "z", "0", "10", "LIMIT", "-1", "2"])
+            .arr()
+            .is_empty()
+    );
+    assert!(
+        c.cmd(&["ZRANGEBYLEX", "z", "-", "+", "LIMIT", "-1", "2"])
+            .arr()
+            .is_empty()
+    );
+    assert_eq!(
+        c.cmd(&["ZRANGEBYSCORE", "z", "0", "10", "LIMIT", "1", "-1"])
+            .arr()
+            .len(),
+        2
+    );
+
+    c.cmd(&["XADD", "xs", "1-0", "f", "v"]);
+    assert!(c.cmd(&["XGROUP", "CREATE", "xs", "g", "0"]).ok());
+    for (args, error) in [
+        (
+            &["BLOCK", "abc"][..],
+            "ERR timeout is not an integer or out of range",
+        ),
+        (&["BLOCK", "-1"], "ERR timeout is negative"),
+        (
+            &["COUNT", "abc"],
+            "ERR value is not an integer or out of range",
+        ),
+        (
+            &["MAXCOUNT", "foo"],
+            "ERR value is not an integer or out of range",
+        ),
+        (
+            &["MAXCOUNT", "0"],
+            "ERR MAXCOUNT must be a positive integer",
+        ),
+        (&["INVALID", "x"], "ERR syntax error"),
+    ] {
+        let mut cmd = vec!["XREADGROUP", "GROUP", "g", "c"];
+        cmd.extend_from_slice(args);
+        cmd.extend_from_slice(&["STREAMS", "xs", ">"]);
+        assert_eq!(c.cmd(&cmd), V::Err(error.into()), "{args:?}");
+    }
+    for id in ["invalid-id", "123-", "-123", "abc-def", "--"] {
+        assert_eq!(
+            c.cmd(&["XREADGROUP", "GROUP", "g", "c", "STREAMS", "xs", id]),
+            V::Err("ERR Invalid stream ID specified as stream command argument".into()),
+            "{id}"
+        );
+    }
+    assert_eq!(
+        c.cmd(&["XREADGROUP", "GROUP", "g", "c", "STREAM", "xs", ">"]),
+        V::Err("ERR syntax error".into())
+    );
+    assert_eq!(
+        c.cmd(&[
+            "XREADGROUP",
+            "GROUP",
+            "g",
+            "c",
+            "COUNT",
+            "1",
+            "STREAMS",
+            "xs",
+            ">"
+        ])
+        .arr()
+        .len(),
+        1
+    );
+}

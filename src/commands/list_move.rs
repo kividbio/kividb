@@ -73,43 +73,30 @@ fn parse_spec(wherefrom: &[u8], whereto: &[u8], how_many: &[&[u8]]) -> Result<Mo
         return Ok(spec);
     }
 
-    let mut selector = false;
-    let mut ordering = false;
-    let mut i = 0;
-    while i < how_many.len() {
-        let arg = how_many[i];
-        if arg.eq_ignore_ascii_case(b"COUNT") || arg.eq_ignore_ascii_case(b"EXACTLY") {
-            if selector {
-                return Err(syntax());
-            }
-            let n: i64 = how_many
-                .get(i + 1)
-                .and_then(|b| parse_utf8(b))
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(|| resp_error("ERR value is not an integer or out of range"))?;
-            if n <= 0 {
-                return Err(resp_error("ERR count must be positive"));
-            }
-            spec.count = n as usize;
-            spec.exactly = arg.eq_ignore_ascii_case(b"EXACTLY");
-            selector = true;
-            i += 2;
-        } else if arg.eq_ignore_ascii_case(b"OBO") || arg.eq_ignore_ascii_case(b"BULK") {
-            if ordering {
-                return Err(syntax());
-            }
-            spec.one_by_one = arg.eq_ignore_ascii_case(b"OBO");
-            ordering = true;
-            i += 1;
-        } else {
-            return Err(syntax());
-        }
-    }
-    if selector && ordering {
-        Ok(spec)
+    // As Redis 8.10's `lmovemParseOptions`: when present, exactly three
+    // words, in this order, <COUNT|EXACTLY> <count> <OBO|BULK>.
+    let [selector, count, ordering] = how_many else {
+        return Err(syntax());
+    };
+    spec.exactly = if selector.eq_ignore_ascii_case(b"COUNT") {
+        false
+    } else if selector.eq_ignore_ascii_case(b"EXACTLY") {
+        true
     } else {
-        Err(syntax())
-    }
+        return Err(syntax());
+    };
+    spec.count = parse_utf8(count)
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|n| *n >= 1)
+        .ok_or_else(|| resp_error("ERR count should be greater than 0"))? as usize;
+    spec.one_by_one = if ordering.eq_ignore_ascii_case(b"OBO") {
+        true
+    } else if ordering.eq_ignore_ascii_case(b"BULK") {
+        false
+    } else {
+        return Err(syntax());
+    };
+    Ok(spec)
 }
 
 /// The moved elements in the order they end up at the destination, left to
@@ -313,7 +300,7 @@ pub(super) fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         "LMOVEM" => {
             // LMOVEM source destination <LEFT|RIGHT> <LEFT|RIGHT>
             //        [<COUNT count | EXACTLY exactly> <OBO | BULK>]
-            if ctx.cmd.len() != 5 && ctx.cmd.len() != 8 {
+            if ctx.cmd.len() < 5 {
                 return Some(resp_error(
                     "ERR wrong number of arguments for 'lmovem' command",
                 ));
@@ -343,7 +330,7 @@ pub(super) fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         "BLMOVEM" => {
             // BLMOVEM source destination <LEFT|RIGHT> <LEFT|RIGHT> timeout
             //         [<COUNT count | EXACTLY exactly> <OBO | BULK>]
-            if ctx.cmd.len() != 6 && ctx.cmd.len() != 9 {
+            if ctx.cmd.len() < 6 {
                 return Some(resp_error(
                     "ERR wrong number of arguments for 'blmovem' command",
                 ));
@@ -472,6 +459,9 @@ mod tests {
         assert!(!ok(&[b"COUNT", b"0", b"OBO"]));
         assert!(!ok(&[b"COUNT", b"x", b"OBO"]));
         assert!(!ok(&[b"COUNT", b"2", b"SIDEWAYS"]));
+        // In Redis's order only.
+        assert!(!ok(&[b"OBO", b"COUNT", b"2"]));
+        assert!(!ok(&[b"COUNT", b"2", b"OBO", b"extra"]));
         assert!(parse_spec(b"UP", b"LEFT", &[]).is_err());
 
         let s = parse_spec(b"right", b"LEFT", &[b"EXACTLY", b"3", b"BULK"]).unwrap();

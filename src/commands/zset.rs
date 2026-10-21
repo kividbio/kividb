@@ -264,6 +264,23 @@ struct RangeOptions {
     limit_count: usize,
 }
 
+/// `LIMIT offset count` of the ZRANGEBYSCORE / ZRANGEBYLEX family, as ZRANGE
+/// takes it: integers, a negative offset past every element (an empty reply,
+/// as in Redis 8.10), a negative count all of them.
+fn parse_limit(offset: &[u8], count: &[u8]) -> Result<(usize, usize), Vec<u8>> {
+    let number = |raw: &[u8]| {
+        std::str::from_utf8(raw)
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .ok_or_else(|| resp_error("ERR value is not an integer or out of range"))
+    };
+    let (offset, count) = (number(offset)?, number(count)?);
+    Ok((
+        usize::try_from(offset).unwrap_or(usize::MAX),
+        usize::try_from(count).unwrap_or(usize::MAX),
+    ))
+}
+
 /// `[BYSCORE | BYLEX] [REV] [LIMIT offset count] [WITHSCORES]` from
 /// `cmd[from]` on. `storing`: the command stores its result, and has no
 /// scores to return.
@@ -2433,15 +2450,10 @@ fn zrangebyscore(ctx: &mut Ctx) -> Vec<u8> {
                 i += 1;
             }
             "LIMIT" if i + 2 < cmd.len() => {
-                limit_offset = std::str::from_utf8(cmd[i + 1])
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-                limit_count = std::str::from_utf8(cmd[i + 2])
-                    .ok()
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .map(|n| if n < 0 { usize::MAX } else { n as usize })
-                    .unwrap_or(usize::MAX);
+                (limit_offset, limit_count) = match parse_limit(cmd[i + 1], cmd[i + 2]) {
+                    Ok(limit) => limit,
+                    Err(e) => return e,
+                };
                 i += 3;
             }
             _ => return resp_error("ERR syntax error"),
@@ -2488,15 +2500,10 @@ fn zrevrangebyscore(ctx: &mut Ctx) -> Vec<u8> {
                 i += 1;
             }
             "LIMIT" if i + 2 < cmd.len() => {
-                limit_offset = std::str::from_utf8(cmd[i + 1])
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-                limit_count = std::str::from_utf8(cmd[i + 2])
-                    .ok()
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .map(|n| if n < 0 { usize::MAX } else { n as usize })
-                    .unwrap_or(usize::MAX);
+                (limit_offset, limit_count) = match parse_limit(cmd[i + 1], cmd[i + 2]) {
+                    Ok(limit) => limit,
+                    Err(e) => return e,
+                };
                 i += 3;
             }
             _ => return resp_error("ERR syntax error"),
@@ -2566,15 +2573,10 @@ fn zrangebylex(ctx: &mut Ctx) -> Vec<u8> {
             .as_str()
         {
             "LIMIT" if i + 2 < cmd.len() => {
-                limit_offset = std::str::from_utf8(cmd[i + 1])
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-                limit_count = std::str::from_utf8(cmd[i + 2])
-                    .ok()
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .map(|n| if n < 0 { usize::MAX } else { n as usize })
-                    .unwrap_or(usize::MAX);
+                (limit_offset, limit_count) = match parse_limit(cmd[i + 1], cmd[i + 2]) {
+                    Ok(limit) => limit,
+                    Err(e) => return e,
+                };
                 i += 3;
             }
             _ => return resp_error("ERR syntax error"),
@@ -2617,15 +2619,10 @@ fn zrevrangebylex(ctx: &mut Ctx) -> Vec<u8> {
             .as_str()
         {
             "LIMIT" if i + 2 < cmd.len() => {
-                limit_offset = std::str::from_utf8(cmd[i + 1])
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-                limit_count = std::str::from_utf8(cmd[i + 2])
-                    .ok()
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .map(|n| if n < 0 { usize::MAX } else { n as usize })
-                    .unwrap_or(usize::MAX);
+                (limit_offset, limit_count) = match parse_limit(cmd[i + 1], cmd[i + 2]) {
+                    Ok(limit) => limit,
+                    Err(e) => return e,
+                };
                 i += 3;
             }
             _ => return resp_error("ERR syntax error"),
