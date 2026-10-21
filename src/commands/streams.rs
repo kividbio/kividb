@@ -1576,16 +1576,22 @@ pub fn xreadgroup(ctx: &mut Ctx) -> Vec<u8> {
     let mut i = 4usize;
     let mut block_ms: Option<u64> = None;
 
+    // Each option takes its argument, as in Redis; one that is not an option
+    // is a syntax error (it used to be skipped).
+    let mut saw_streams = false;
     while i < cmd.len() {
         let tok = std::str::from_utf8(cmd[i])
             .unwrap_or("")
             .to_ascii_uppercase();
+        let has_arg = i + 1 < cmd.len();
         match tok.as_str() {
-            "COUNT" => {
-                count = cmd
-                    .get(i + 1)
-                    .and_then(|b| std::str::from_utf8(b).ok())
-                    .and_then(|s| s.parse().ok());
+            "COUNT" if has_arg => {
+                // 0, or less, is no limit, as in Redis.
+                count = match parse_utf8(cmd[i + 1]).and_then(|s| s.parse::<i64>().ok()) {
+                    Some(n) if n > 0 => Some(n as usize),
+                    Some(_) => None,
+                    None => return resp_error("ERR value is not an integer or out of range"),
+                };
                 i += 2;
             }
             "MAXCOUNT" => {
@@ -1602,11 +1608,12 @@ pub fn xreadgroup(ctx: &mut Ctx) -> Vec<u8> {
                 }
                 i += 2;
             }
-            "BLOCK" => {
-                block_ms = cmd
-                    .get(i + 1)
-                    .and_then(|b| std::str::from_utf8(b).ok())
-                    .and_then(|s| s.parse().ok());
+            "BLOCK" if has_arg => {
+                block_ms = match parse_utf8(cmd[i + 1]).and_then(|s| s.parse::<i64>().ok()) {
+                    Some(ms) if ms < 0 => return resp_error("ERR timeout is negative"),
+                    Some(ms) => Some(ms as u64),
+                    None => return resp_error("ERR timeout is not an integer or out of range"),
+                };
                 i += 2;
             }
             "CLAIM" => {
@@ -1628,12 +1635,14 @@ pub fn xreadgroup(ctx: &mut Ctx) -> Vec<u8> {
             }
             "STREAMS" => {
                 i += 1;
+                saw_streams = true;
                 break;
             }
-            _ => {
-                i += 1;
-            }
+            _ => return resp_error("ERR syntax error"),
         }
+    }
+    if !saw_streams {
+        return resp_error("ERR syntax error");
     }
     if let Err(e) = caps.check_against_count(count) {
         return resp_error(&e);
@@ -1644,6 +1653,18 @@ pub fn xreadgroup(ctx: &mut Ctx) -> Vec<u8> {
         return resp_error(
             "ERR Unbalanced 'xreadgroup' list of streams: for each stream key an ID or '>' must be specified.",
         );
+    }
+    // Every ID is `>` or one, checked before anything is read.
+    for id in &cmd[i + remaining / 2..] {
+        if *id == b">" {
+            continue;
+        }
+        if *id == b"$" {
+            return resp_error("ERR The $ ID is meaningless in the context of XREADGROUP");
+        }
+        if parse_utf8(id).and_then(StreamId::parse).is_none() {
+            return resp_error("ERR Invalid stream ID specified as stream command argument");
+        }
     }
     let half = remaining / 2;
     let keys: Vec<String> = cmd[i..i + half]

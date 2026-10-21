@@ -746,15 +746,91 @@ fn delex_without_a_condition_deletes_any_type() {
     assert_eq!(c.cmd(&["DELEX", "dx:s", "IFNE", "other"]).i(), 1);
     assert_eq!(c.cmd(&["DELEX", "dx:missing", "IFEQ", "v"]).i(), 0);
 
-    // A condition needs a string.
+    // A condition needs a string, and the errors are Redis 8.10's.
     c.cmd(&["RPUSH", "dx:list", "a"]);
-    assert!(
-        c.cmd(&["DELEX", "dx:list", "IFEQ", "a"])
-            .s()
-            .starts_with("WRONGTYPE")
+    assert_eq!(
+        c.cmd(&["DELEX", "dx:list", "IFEQ", "a"]),
+        V::Err("ERR Key should be of string type if conditions are specified".into())
     );
-    assert!(c.cmd(&["DELEX", "dx:list", "IFEQ"]).is_err());
-    assert!(c.cmd(&["DELEX", "dx:list", "MAYBE", "a"]).is_err());
+    assert_eq!(
+        c.cmd(&["DELEX", "dx:list", "IFEQ"]),
+        V::Err("ERR wrong number of arguments for 'delex' command".into())
+    );
+    assert_eq!(
+        c.cmd(&["DELEX", "dx:s2", "IFEQ", "a", "extra"]),
+        V::Err("ERR wrong number of arguments for 'delex' command".into())
+    );
+    c.cmd(&["SET", "dx:s2", "v"]);
+    assert_eq!(
+        c.cmd(&["DELEX", "dx:s2", "MAYBE", "a"]),
+        V::Err("ERR Invalid condition. Use IFEQ, IFNE, IFDEQ, or IFDNE".into())
+    );
+    for digest in ["", "abc", "0123456789abcdef0"] {
+        assert_eq!(
+            c.cmd(&["DELEX", "dx:s2", "IFDEQ", digest]),
+            V::Err("ERR must be exactly 16 hexadecimal characters".into())
+        );
+        assert_eq!(
+            c.cmd(&["SET", "dx:s2", "w", "IFDNE", digest]),
+            V::Err("ERR must be exactly 16 hexadecimal characters".into())
+        );
+    }
+}
+
+/// MSETEX's replies and errors as Redis 8.10 has them, and GETRANGE's empty
+/// range when both ends count from the end.
+#[test]
+fn msetex_and_getrange_follow_redis_8_10() {
+    let mut c = conn();
+    assert_eq!(
+        c.cmd(&[
+            "MSETEX", "2", "mx:{t}1", "a", "mx:{t}2", "b", "NX", "EX", "10"
+        ])
+        .i(),
+        1
+    );
+    assert_eq!(
+        c.cmd(&["MSETEX", "1", "mx:{t}1", "c", "NX", "EX", "10"])
+            .i(),
+        0
+    );
+    assert_eq!(
+        c.cmd(&["MSETEX", "1", "mx:{t}none", "c", "XX", "EX", "10"])
+            .i(),
+        0
+    );
+    assert_eq!(c.cmd(&["GET", "mx:{t}1"]).s(), "a");
+    for (args, error) in [
+        (
+            &["MSETEX", "k", "v", "EX", "10"][..],
+            "ERR invalid numkeys value",
+        ),
+        (
+            &["MSETEX", "2147483648", "k", "v"],
+            "ERR invalid numkeys value",
+        ),
+        (
+            &["MSETEX", "2", "k1", "v1", "k2"],
+            "ERR wrong number of key-value pairs",
+        ),
+        (&["MSETEX", "1", "k", "v", "NX", "XX"], "ERR syntax error"),
+        (
+            &["MSETEX", "1", "k", "v", "EX", "10", "PX", "10"],
+            "ERR syntax error",
+        ),
+        (
+            &["MSETEX", "1", "k", "v", "KEEPTTL", "EX", "10"],
+            "ERR syntax error",
+        ),
+        (&["MSETEX", "1", "k", "v", "BOGUS"], "ERR syntax error"),
+    ] {
+        assert_eq!(c.cmd(args), V::Err(error.into()), "{args:?}");
+    }
+
+    c.cmd(&["SET", "gr", "Hello World"]);
+    assert_eq!(c.cmd(&["GETRANGE", "gr", "-100", "-101"]).s(), "");
+    assert_eq!(c.cmd(&["GETRANGE", "gr", "-100", "-100"]).s(), "H");
+    assert_eq!(c.cmd(&["GETRANGE", "gr", "-4", "-1"]).s(), "orld");
 }
 
 #[test]

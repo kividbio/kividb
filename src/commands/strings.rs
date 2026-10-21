@@ -339,6 +339,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => None,
             };
 
+            if matches!(condition, Condition::IfdeqDigest | Condition::IfdneDigest)
+                && current_bytes.is_some()
+                && cond_arg.is_some_and(|digest| digest.len() != 16)
+            {
+                return Some(resp_error("ERR must be exactly 16 hexadecimal characters"));
+            }
+
             let should_write = match &condition {
                 Condition::None => true,
 
@@ -1216,6 +1223,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let map = read_lock!(shard);
             match map.get(key) {
                 None => Some(resp_bulk(b"")),
+                Some(KiviDBValue::String(_)) if start < 0 && end < 0 && start > end => {
+                    Some(resp_bulk(b""))
+                }
                 Some(KiviDBValue::String(v)) => {
                     let len = v.len() as i64;
                     // Convert negative indices: -1 = last byte
@@ -1743,11 +1753,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // `DELEX key` alone is valid: with no condition it deletes the key
             // whatever its type. It used to be an arity error.
             if cmd.len() != 2 && cmd.len() != 4 {
-                return Some(if cmd.len() < 2 {
-                    resp_error("ERR wrong number of arguments for 'delex' command")
-                } else {
-                    resp_error("ERR syntax error")
-                });
+                return Some(resp_error(
+                    "ERR wrong number of arguments for 'delex' command",
+                ));
             }
             let key = match parse_utf8(cmd[1]) {
                 Some(k) => k,
@@ -1773,6 +1781,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(_) if cmd.len() == 2 => true,
                 Some(KiviDBValue::String(stored)) => {
                     let arg = cmd[3];
+                    let digest = cmd[2].eq_ignore_ascii_case(b"IFDEQ")
+                        || cmd[2].eq_ignore_ascii_case(b"IFDNE");
+                    if digest && arg.len() != 16 {
+                        return Some(resp_error("ERR must be exactly 16 hexadecimal characters"));
+                    }
                     if cmd[2].eq_ignore_ascii_case(b"IFEQ") {
                         stored.as_ref() == arg
                     } else if cmd[2].eq_ignore_ascii_case(b"IFNE") {
@@ -1782,12 +1795,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     } else if cmd[2].eq_ignore_ascii_case(b"IFDNE") {
                         !digest_matches(stored, arg)
                     } else {
-                        return Some(resp_error("ERR syntax error"));
+                        return Some(resp_error(
+                            "ERR Invalid condition. Use IFEQ, IFNE, IFDEQ, or IFDNE",
+                        ));
                     }
                 }
                 Some(_) => {
                     return Some(resp_error(
-                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        "ERR Key should be of string type if conditions are specified",
                     ));
                 }
             };
@@ -1811,14 +1826,33 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'msetex' command",
                 ));
             }
-            let numkeys: usize = match parse_utf8(cmd[1]).and_then(|s| s.parse().ok()) {
-                Some(n) if n > 0 => n,
-                _ => return Some(resp_error("ERR numkeys must be a positive integer")),
+            let numkeys: usize = match parse_utf8(cmd[1]).and_then(|s| s.parse::<i64>().ok()) {
+                Some(n) if (1..=i32::MAX as i64).contains(&n) => n as usize,
+                _ => return Some(resp_error("ERR invalid numkeys value")),
             };
             // pairs occupy cmd[2..2+numkeys*2]
             let pairs_end = numkeys.saturating_mul(2).saturating_add(2);
             if cmd.len() < pairs_end {
-                return Some(resp_error("ERR not enough key-value pairs"));
+                return Some(resp_error("ERR wrong number of key-value pairs"));
+            }
+            // NX or XX, and one of EX, PX, EXAT, PXAT and KEEPTTL: each once,
+            // anything else a syntax error, as Redis parses them.
+            {
+                let (mut condition, mut ttl) = (false, false);
+                let mut j = pairs_end;
+                while j < cmd.len() {
+                    let opt = String::from_utf8_lossy(cmd[j]).to_ascii_uppercase();
+                    match opt.as_str() {
+                        "NX" | "XX" if !condition => condition = true,
+                        "KEEPTTL" if !ttl => ttl = true,
+                        "EX" | "PX" | "EXAT" | "PXAT" if !ttl && j + 1 < cmd.len() => {
+                            ttl = true;
+                            j += 1;
+                        }
+                        _ => return Some(resp_error("ERR syntax error")),
+                    }
+                    j += 1;
+                }
             }
 
             // Parse options after the pairs
@@ -1919,10 +1953,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         read_lock!(shard).contains_key(key)
                     };
                     if nx && exists {
-                        return Some(resp_null_bulk());
+                        return Some(resp_integer(0));
                     }
                     if xx && !exists {
-                        return Some(resp_null_bulk());
+                        return Some(resp_integer(0));
                     }
                 }
             }
@@ -1948,7 +1982,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     }
                 }
             }
-            Some(resp_simple("OK"))
+            Some(resp_integer(1))
         }
 
         _ => None, // ← tells the router this module doesn't handle it

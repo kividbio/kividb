@@ -1008,10 +1008,12 @@ fn test_previously_unpropagated_writes_reach_the_replica() {
         master.cmds(&["ZREMRANGEBYLEX", "z", "[c", "[c"]).as_int(),
         1
     );
-    assert!(
+    // 1: every key set (Redis 8.10's reply).
+    assert_eq!(
         master
             .cmds(&["MSETEX", "1", "msetex", "v", "EX", "100"])
-            .is_ok()
+            .as_int(),
+        1
     );
     assert_eq!(
         master.cmds(&["BRPOPLPUSH", "src", "dst", "1"]).as_str(),

@@ -226,8 +226,14 @@ impl ReadCaps {
 
     /// Parse the value of `MAXCOUNT` or `MAXSIZE`: a positive integer.
     pub fn parse_positive(option: &str, arg: Option<&&[u8]>) -> Result<usize, String> {
-        arg.and_then(|b| std::str::from_utf8(b).ok())
-            .and_then(|s| s.parse::<usize>().ok())
+        // Not a number at all is Redis's integer error; a number that is not
+        // positive is this one.
+        let n = arg
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .and_then(|s| s.parse::<i64>().ok())
+            .ok_or_else(|| "ERR value is not an integer or out of range".to_string())?;
+        usize::try_from(n)
+            .ok()
             .filter(|n| *n > 0)
             .ok_or_else(|| format!("ERR {option} must be a positive integer"))
     }
