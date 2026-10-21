@@ -111,6 +111,10 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
             yes_no(ctx.config.cluster_bus_port_protected_mode),
         ),
         ("protected-mode", yes_no(crate::protected_mode::is_on())),
+        (
+            "key-access-tracking",
+            yes_no(crate::eviction::key_access_tracking()),
+        ),
         ("tls-cluster", yes_no(ctx.config.tls_cluster)),
         ("tls-replication", yes_no(ctx.config.tls_replication)),
         (
@@ -336,6 +340,17 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                 }
                 "no" => {
                     crate::tag_locks::set_enabled(false);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error("ERR argument must be 'yes' or 'no'")),
+            },
+            "key-access-tracking" => match value.to_ascii_lowercase().as_str() {
+                "yes" => {
+                    crate::eviction::set_key_access_tracking(true);
+                    Some(resp_simple("OK"))
+                }
+                "no" => {
+                    crate::eviction::set_key_access_tracking(false);
                     Some(resp_simple("OK"))
                 }
                 _ => Some(resp_error("ERR argument must be 'yes' or 'no'")),
