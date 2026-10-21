@@ -1799,6 +1799,9 @@ enum HgetexAction {
 }
 
 fn run_hgetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
+    if let Some(moved) = options_before_fields(&ctx.cmd, 1) {
+        ctx.cmd = moved;
+    }
     // Per-field nils are nested inside the reply array — see HMGET.
     let resp = effective_resp_for_reply(ctx);
     let cmd = &ctx.cmd;
@@ -2077,7 +2080,30 @@ enum HsetexTtl {
     KeepOrSet(Instant),
 }
 
+/// Redis 8.10 takes the options of HSETEX and HGETEX on either side of the
+/// `FIELDS numfields ...` block (`HSETEX h FIELDS 1 f v EX 60`). The
+/// parsers here read them before it: so the ones after it are moved there.
+/// The block is skipped by its count, as Redis skips it, so a field or a
+/// value that reads like an option is not taken for one. `None` when there
+/// is nothing to move, or no block to find.
+fn options_before_fields<'a>(cmd: &[&'a [u8]], per_field: usize) -> Option<Vec<&'a [u8]>> {
+    let at = (2..cmd.len()).find(|&i| cmd[i].eq_ignore_ascii_case(b"FIELDS"))?;
+    let count: usize = parse_utf8(cmd.get(at + 1)?)?.parse().ok()?;
+    let end = count.checked_mul(per_field)?.checked_add(at + 2)?;
+    if end >= cmd.len() {
+        return None;
+    }
+    let mut moved = Vec::with_capacity(cmd.len());
+    moved.extend_from_slice(&cmd[..at]);
+    moved.extend_from_slice(&cmd[end..]);
+    moved.extend_from_slice(&cmd[at..end]);
+    Some(moved)
+}
+
 fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
+    if let Some(moved) = options_before_fields(&ctx.cmd, 2) {
+        ctx.cmd = moved;
+    }
     let cmd = &ctx.cmd;
     if cmd.len() < 6 {
         return Some(resp_error(

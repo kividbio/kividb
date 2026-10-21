@@ -117,11 +117,13 @@ async fn server_tokio(
         config.repl_replica_max_backlog_bytes,
     );
     crate::stats::spawn_instantaneous_ops_sampler();
+    let latency = crate::latency::new_latency_tracker();
     crate::commands::helpers::spawn_active_expire_task(
         Arc::clone(&store),
         Arc::clone(&expiry_store),
         Arc::clone(&index_store),
         pubsub.clone(),
+        Arc::clone(&latency),
     );
     let watch_registry = crate::watch::new_watch_registry();
     crate::watch::register_for(&store, &watch_registry);
@@ -129,7 +131,6 @@ async fn server_tokio(
     let acl_store = acl::new_acl_store(&config.requirepass);
     let acl_log = acl::new_acl_log();
     let slowlog = crate::slowlog::new_slowlog_from_config(&config);
-    let latency = crate::latency::new_latency_tracker();
     let cluster_state = std::sync::Arc::new(
         crate::cluster::ClusterState::from_config(&config).expect("cluster config file"),
     );

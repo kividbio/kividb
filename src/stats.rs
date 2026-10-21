@@ -19,6 +19,9 @@ pub static KEYSPACE_MISSES: AtomicU64 = AtomicU64::new(0);
 pub static EXPIRED_KEYS: AtomicU64 = AtomicU64::new(0);
 /// Hash fields removed because their TTL ran out — `expired_subkeys`.
 pub static EXPIRED_SUBKEYS: AtomicU64 = AtomicU64::new(0);
+/// Of `expired_keys`, those the background cycle took (Redis 8.10's
+/// `expired_keys_active`), not a read that found them past their time.
+pub static EXPIRED_KEYS_ACTIVE: AtomicU64 = AtomicU64::new(0);
 /// Keys deleted to get under `maxmemory` — `evicted_keys`.
 pub static EVICTED_KEYS: AtomicU64 = AtomicU64::new(0);
 pub static TOTAL_NET_INPUT_BYTES: AtomicU64 = AtomicU64::new(0);

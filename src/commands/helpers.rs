@@ -275,6 +275,8 @@ pub fn active_expire_cycle(
             if is_expired(expiry_store, db_idx, &key)
                 && delete_key_if_expired(store, expiry_store, db_idx, &key)
             {
+                crate::stats::EXPIRED_KEYS_ACTIVE
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 crate::vector::maybe_unindex(index_store, &key);
             }
         }
@@ -337,6 +339,7 @@ pub fn spawn_active_expire_task(
     expiry_store: ExpiryStore,
     index_store: IndexStore,
     pubsub: crate::pubsub::PubSubHub,
+    latency: crate::latency::SharedLatencyTracker,
 ) {
     crate::keyspace_events::register_hub(&store, &pubsub);
     // Whatever was loaded at startup that has field TTLs.
@@ -350,7 +353,17 @@ pub fn spawn_active_expire_task(
             if crate::pause::expiry_deferred() {
                 continue;
             }
+            let started = std::time::Instant::now();
             active_expire_cycle(&store, &expiry_store, &index_store, &mut cursor);
+            // Redis's `expire-cycle` latency event: a cycle that took at
+            // least `latency-monitor-threshold` ms (0, the default, is off).
+            let threshold = crate::commands::server::remembered_config("latency-monitor-threshold")
+                .and_then(|ms| ms.parse::<u64>().ok())
+                .unwrap_or(0);
+            let took = started.elapsed().as_millis() as u64;
+            if threshold > 0 && took >= threshold {
+                latency.record("expire-cycle", took.min(u32::MAX as u64) as u32);
+            }
             crate::field_expiry::sweep(&store, &expiry_store, &index_store);
         }
     });

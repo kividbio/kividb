@@ -3327,3 +3327,36 @@ fn argument_checks_follow_redis_8_10() {
         1
     );
 }
+
+/// HSETEX and HGETEX take their options after the FIELDS block as well as
+/// before it (Redis 8.10), and a field named like an option is still a field.
+#[test]
+fn hsetex_and_hgetex_take_options_after_fields() {
+    let mut c = conn();
+    assert_eq!(
+        c.cmd(&[
+            "HSETEX", "hx", "FIELDS", "2", "f1", "v1", "EX", "v2", "EX", "60"
+        ])
+        .i(),
+        1
+    );
+    assert_eq!(c.cmd(&["HGET", "hx", "EX"]).s(), "v2", "a field named EX");
+    let ttl = c.cmd(&["HTTL", "hx", "FIELDS", "1", "f1"]).arr()[0].i();
+    assert!((1..=60).contains(&ttl), "{ttl}");
+    assert_eq!(
+        c.cmd(&["HSETEX", "hx", "FIELDS", "1", "f1", "w", "FXX", "KEEPTTL"])
+            .i(),
+        1
+    );
+    assert!(
+        c.cmd(&["HTTL", "hx", "FIELDS", "1", "f1"]).arr()[0].i() > 0,
+        "KEEPTTL after FIELDS"
+    );
+    assert_eq!(
+        c.cmd(&["HGETEX", "hx", "FIELDS", "1", "f1", "PERSIST"])
+            .arr()[0]
+            .s(),
+        "w"
+    );
+    assert_eq!(c.cmd(&["HTTL", "hx", "FIELDS", "1", "f1"]).arr()[0].i(), -1);
+}
