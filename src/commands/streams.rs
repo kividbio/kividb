@@ -2942,7 +2942,7 @@ fn xinfo_stream_full(
                             resp_integer(g.active.get(name).map_or(-1, |at| *at as i64)),
                             resp_bulk_str("pel-count"),
                             resp_integer(own().count() as i64),
-                            resp_bulk_str("pel"),
+                            resp_bulk_str("pending"),
                             resp_array(pel),
                         ],
                     )
@@ -2961,7 +2961,12 @@ fn xinfo_stream_full(
                     lag,
                     resp_bulk_str("pel-count"),
                     resp_integer(g.pel.len() as i64),
-                    resp_bulk_str("pel"),
+                    // Entries `XNACK` released: pending, and no one's.
+                    resp_bulk_str("nacked-count"),
+                    resp_integer(g.pel.values().filter(|p| p.consumer.is_empty()).count() as i64),
+                    // Redis 8.10's name for the pending entries, here and
+                    // for each consumer (it was `pel`).
+                    resp_bulk_str("pending"),
                     resp_array(pel),
                     resp_bulk_str("consumers"),
                     resp_array(consumers),

@@ -43,7 +43,19 @@ pub struct Activity {
     /// The connection has killed itself (`CLIENT KILL … SKIPME no`): it is
     /// to be closed, but not before the reply to that command is written.
     closing_after_reply: std::sync::atomic::AtomicBool,
+    /// Redis 8.10's per-client counters for `CLIENT LIST`: bytes read and
+    /// written, commands run, reads, and commands per read (sum and count).
+    /// Written only by the connection's own loop, so each is a load and a
+    /// store, no locked instruction.
+    io: [AtomicU64; 6],
 }
+
+const IO_NET_IN: usize = 0;
+const IO_NET_OUT: usize = 1;
+const IO_CMDS: usize = 2;
+const IO_READS: usize = 3;
+const IO_PIPE_SUM: usize = 4;
+const IO_PIPE_CNT: usize = 5;
 
 /// A connection's current RESP query buffer, published without taking the
 /// registry lock. `free` is the spare capacity at the end of the backing Vec.
@@ -309,7 +321,46 @@ impl Activity {
     }
 
     #[inline]
+    fn bump(&self, which: usize, by: u64) {
+        let counter = &self.io[which];
+        counter.store(
+            counter.load(Ordering::Relaxed).wrapping_add(by),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// `n` bytes read from the connection: one read event.
+    #[inline]
+    pub fn note_read(&self, n: usize) {
+        self.bump(IO_NET_IN, n as u64);
+        self.bump(IO_READS, 1);
+    }
+
+    /// Commands run so far: taken before a read's commands are parsed, for
+    /// [`note_flush`](Self::note_flush) to see how many that read held.
+    #[inline]
+    pub fn commands_run(&self) -> u64 {
+        self.io[IO_CMDS].load(Ordering::Relaxed)
+    }
+
+    /// The replies to one read's commands written, `out` bytes of them.
+    #[inline]
+    pub fn note_flush(&self, out: usize, commands_before: u64) {
+        self.bump(IO_NET_OUT, out as u64);
+        let ran = self.commands_run().wrapping_sub(commands_before);
+        if ran > 0 {
+            self.bump(IO_PIPE_SUM, ran);
+            self.bump(IO_PIPE_CNT, 1);
+        }
+    }
+
+    fn io(&self, which: usize) -> u64 {
+        self.io[which].load(Ordering::Relaxed)
+    }
+
+    #[inline]
     pub fn record(&self, cmd: &[&[u8]], db: usize) {
+        self.bump(IO_CMDS, 1);
         self.db.store(db, Ordering::Relaxed);
         let name = pack(cmd[0], &self.name);
         // An argument too long to be the name of a subcommand is a key, or
@@ -472,8 +523,10 @@ impl ClientInfo {
         format!(
             "id={} addr={} laddr={} fd=0 name={} age={} idle=0 flags={} db={} sub={} psub={} \
             ssub={} multi=-1 watch=0 qbuf={} qbuf-free={} argv-mem=0 multi-mem=0 \
-            rbs=0 rbp=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd={} \
-            user={} redir={} resp={} lib-name={} lib-ver={} io-thread=0\n",
+            rbs=0 rbp=0 obl=0 oll=0 omem=0 omem-shared=0 omem-unshared=0 tot-mem=0 events=r cmd={} \
+            user={} redir={} resp={} lib-name={} lib-ver={} io-thread=0 tot-net-in={} \
+            tot-net-out={} tot-cmds={} read-events={} avg-pipeline-len-sum={} \
+            avg-pipeline-len-cnt={}\n",
             self.id,
             self.addr,
             self.laddr,
@@ -492,6 +545,12 @@ impl ClientInfo {
             self.resp,
             self.lib_name,
             self.lib_ver,
+            self.activity.io(IO_NET_IN),
+            self.activity.io(IO_NET_OUT),
+            self.activity.io(IO_CMDS),
+            self.activity.io(IO_READS),
+            self.activity.io(IO_PIPE_SUM),
+            self.activity.io(IO_PIPE_CNT),
         )
     }
 }

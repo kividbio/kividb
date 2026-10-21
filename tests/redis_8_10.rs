@@ -3413,3 +3413,37 @@ fn xidmprecord_records_an_entry_for_idempotent_production() {
         V::Err("ERR IID already exists for this producer with a different stream ID".into())
     );
 }
+
+/// CLIENT INFO's per-client counters (Redis 8.10): bytes in and out,
+/// commands, reads, and commands per read.
+#[test]
+fn client_info_counts_a_connections_traffic() {
+    let mut c = conn();
+    let field = |info: &str, name: &str| -> i64 {
+        info.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("{name} in {info}"))
+            .parse()
+            .unwrap()
+    };
+    let before = c.cmd(&["CLIENT", "INFO"]).s().to_string();
+    assert!(
+        before.contains(" omem-shared=0 omem-unshared=0 "),
+        "{before}"
+    );
+    for _ in 0..3 {
+        c.cmd(&["PING"]);
+    }
+    let after = c.cmd(&["CLIENT", "INFO"]).s().to_string();
+    assert_eq!(field(&after, "tot-cmds") - field(&before, "tot-cmds"), 4);
+    assert!(field(&after, "read-events") - field(&before, "read-events") >= 4);
+    let sum = field(&after, "avg-pipeline-len-sum") - field(&before, "avg-pipeline-len-sum");
+    let cnt = field(&after, "avg-pipeline-len-cnt") - field(&before, "avg-pipeline-len-cnt");
+    assert!(sum > 0 && sum == cnt, "one command a read: {sum} / {cnt}");
+    // Three PINGs (14 bytes each) and this CLIENT INFO (26).
+    assert_eq!(
+        field(&after, "tot-net-in") - field(&before, "tot-net-in"),
+        3 * 14 + 26
+    );
+    assert!(field(&after, "tot-net-out") - field(&before, "tot-net-out") > 300);
+}

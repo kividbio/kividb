@@ -810,6 +810,7 @@ pub async fn handle_client(
         }
         crate::stats::TOTAL_NET_INPUT_BYTES
             .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        activity.note_read(n);
 
         query_buffer_peak = query_buffer_peak.max(parse_buf.len().saturating_sub(parse_start));
         debug_assert_eq!(parse_buf.len(), unparsed + n);
@@ -820,6 +821,7 @@ pub async fn handle_client(
         );
 
         let mut parse_offset = parse_start;
+        let commands_before = activity.commands_run();
         let mut connection_handoff: Option<ConnectionHandoff> = None;
         let mut quit_requested = false;
         // Outside the parse loop: a park in one turn hands its delivery to
@@ -2447,6 +2449,7 @@ pub async fn handle_client(
         // Pushes are no longer drained here; the forwarder task owns them, so
         // they reach the client immediately instead of waiting for the next
         // command. The guard keeps the two writers from interleaving.
+        activity.note_flush(out_buf.len(), commands_before);
         if !out_buf.is_empty() {
             std::mem::swap(&mut out_buf, &mut spare_buf);
             crate::stats::TOTAL_NET_OUTPUT_BYTES

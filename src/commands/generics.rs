@@ -1297,6 +1297,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 crate::eviction::restored(ctx.store, db_idx, key.as_bytes(), idle, freq);
             }
 
+            crate::keyspace_events::notify(
+                ctx.pubsub,
+                db_idx,
+                crate::keyspace_events::KS_GENERIC,
+                "restore",
+                &key,
+            );
             Some(resp_simple("OK"))
         }
 

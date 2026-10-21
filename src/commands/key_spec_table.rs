@@ -388,6 +388,9 @@ pub(super) const TABLE: &[(&str, bool, &[Spec])] = &[
         Spec { flags: "OW update", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
         Spec { flags: "RO access", begin: Begin::Index(2), find: Find::Range(-1, 1, 0) },
     ]),
+    ("MSETEX", false, &[
+        Spec { flags: "OW update", begin: Begin::Index(1), find: Find::KeyNum(0, 1, 2) },
+    ]),
     ("SET", false, &[
         Spec { flags: "RW access update variable_flags", begin: Begin::Index(1), find: Find::Range(0, 1, 0) },
     ]),

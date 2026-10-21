@@ -196,10 +196,16 @@ fn by_the_arguments(
             .any(|arg| arg.eq_ignore_ascii_case(word))
     };
     match name {
-        // The old value is read only if it is asked for.
+        // The old value is read only if it is asked for, and compared,
+        // not returned, under a condition (Redis 8.10's `setGetKeys`).
         "SET" => {
+            let compares = [&b"IFEQ"[..], b"IFNE", b"IFDEQ", b"IFDNE"]
+                .iter()
+                .any(|word| has(3, word));
             let flags = if has(3, b"GET") {
                 "RW access update"
+            } else if compares {
+                "RW update"
             } else {
                 "OW update"
             };

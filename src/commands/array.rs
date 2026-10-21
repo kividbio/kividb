@@ -6,9 +6,9 @@
 //!
 //! Two spec ambiguities resolved here, both documented in `docs/REDIS_8_8_COMMANDS.md`:
 //!
-//!   - `ARSCAN` / `ARGREP WITHVALUES` replies are **flat** (`[idx, val, idx,
-//!     val, …]`). Both pages' normative "Return information" sections say flat;
-//!     their rendered `redis>` examples show nested pairs. The normative text wins.
+//!   - `ARSCAN` / `ARGREP WITHVALUES` reply with `[idx, val]` pairs, as Redis
+//!     8.10 does (and the pages' examples show). They used to be flat, as the
+//!     pages' "Return information" sections said before 8.10.
 //!   - `ARGETRANGE` is the one range command that materialises empty slots as
 //!     nils, so its reply size is the numeric span, not the element count. A
 //!     span guard ([`MAX_MATERIALISED_RANGE`]) rejects requests that would
@@ -39,6 +39,10 @@ const ERR_CURSOR_EXHAUSTED: &str = "ERR array insert cursor is exhausted";
 /// Redis's own limit here isn't documented; 1M keeps the worst-case reply in the
 /// tens of MB rather than the exabytes a full-span request would need.
 const MAX_MATERIALISED_RANGE: u64 = 1_000_000;
+
+/// Redis's `ARGREP_MAX_PREDICATES` and `ARGREP_MAX_RE_LEN`.
+const ARGREP_MAX_PREDICATES: usize = 250;
+const ARGREP_MAX_RE_LEN: usize = 2048;
 
 pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
     let reply = run(ctx, name)?;
@@ -118,13 +122,14 @@ fn run(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 /// An index: what is not a whole number from 0 is `invalid array index`, as
 /// in Redis 8.10 (which said `value is not an integer` before).
 fn parse_index(raw: &[u8]) -> Result<u64, Vec<u8>> {
-    let invalid = || resp_error("ERR invalid array index");
-    let s = parse_utf8(raw).ok_or_else(invalid)?;
-    let v: i64 = s.parse().map_err(|_| invalid())?;
-    if v < 0 {
-        return Err(invalid());
-    }
-    Ok(v as u64)
+    parse_index_up_to(raw, u64::MAX - 1)
+}
+
+fn parse_index_up_to(raw: &[u8], max: u64) -> Result<u64, Vec<u8>> {
+    parse_utf8(raw)
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|v| *v <= max)
+        .ok_or_else(|| resp_error("ERR invalid array index"))
 }
 
 fn parse_count(raw: &[u8]) -> Result<i64, Vec<u8>> {
@@ -431,8 +436,7 @@ fn cmd_argetrange(ctx: &mut Ctx) -> Vec<u8> {
     let span = hi - lo + 1;
     if span > MAX_MATERIALISED_RANGE {
         return resp_error(&format!(
-            "ERR range spans {span} indices, which exceeds the {MAX_MATERIALISED_RANGE} \
-             limit for ARGETRANGE; use ARSCAN to iterate existing elements instead"
+            "ERR range exceeds maximum of {MAX_MATERIALISED_RANGE} items"
         ));
     }
 
@@ -678,7 +682,9 @@ fn cmd_arseek(ctx: &mut Ctx) -> Vec<u8> {
         Some(k) => k.to_string(),
         None => return resp_error("ERR key must be valid UTF-8"),
     };
-    let idx = match parse_index(ctx.cmd[2]) {
+    // 2^64 - 1 too, as in Redis: where the cursor is left after the last
+    // index (the next ARINSERT then fails).
+    let idx = match parse_index_up_to(ctx.cmd[2], u64::MAX) {
         Ok(i) => i,
         Err(e) => return e,
     };
@@ -737,8 +743,7 @@ fn cmd_arscan(ctx: &mut Ctx) -> Vec<u8> {
             .into_iter()
             .take(cap)
         {
-            out.push(resp_integer(idx as i64));
-            out.push(resp_bulk(&val));
+            out.push(resp_array(vec![resp_integer(idx as i64), resp_bulk(&val)]));
         }
         out
     }) {
@@ -830,7 +835,6 @@ fn cmd_argrep(ctx: &mut Ctx) -> Vec<u8> {
     // pass that accepts either at each position.
     let mut predicates: Vec<Predicate> = Vec::new();
     let mut require_all = false;
-    let mut explicit_combiner = false;
     let mut with_values = false;
     let mut nocase = false;
     let mut limit: Option<u64> = None;
@@ -865,6 +869,11 @@ fn cmd_argrep(ctx: &mut Ctx) -> Vec<u8> {
             if !needs_arg(i) {
                 return resp_error("ERR syntax error");
             }
+            if ctx.cmd[i + 1].len() > ARGREP_MAX_RE_LEN {
+                return resp_error(&format!(
+                    "ERR regular expression is too long, maximum is {ARGREP_MAX_RE_LEN} bytes"
+                ));
+            }
             match parse_utf8(ctx.cmd[i + 1]) {
                 // NOCASE may appear after the pattern, so regexes are compiled
                 // once the whole argument list is known.
@@ -874,14 +883,10 @@ fn cmd_argrep(ctx: &mut Ctx) -> Vec<u8> {
             i += 2;
         } else if tok.eq_ignore_ascii_case(b"AND") {
             require_all = true;
-            explicit_combiner = true;
             i += 1;
         } else if tok.eq_ignore_ascii_case(b"OR") {
-            if explicit_combiner && require_all {
-                return resp_error("ERR AND and OR options are mutually exclusive");
-            }
+            // The last of AND and OR wins, as in Redis.
             require_all = false;
-            explicit_combiner = true;
             i += 1;
         } else if tok.eq_ignore_ascii_case(b"WITHVALUES") {
             with_values = true;
@@ -895,16 +900,41 @@ fn cmd_argrep(ctx: &mut Ctx) -> Vec<u8> {
             }
             match parse_count(ctx.cmd[i + 1]) {
                 Ok(n) if n > 0 => limit = Some(n as u64),
-                Ok(_) => return resp_error("ERR LIMIT must be a positive integer"),
+                Ok(_) => return resp_error("ERR LIMIT must be positive"),
                 Err(e) => return e,
             }
             i += 2;
         } else {
             return resp_error("ERR syntax error");
         }
+        if predicates.len() + pending_regex.len() > ARGREP_MAX_PREDICATES {
+            return resp_error(&format!(
+                "ERR too many predicates, maximum is {ARGREP_MAX_PREDICATES}"
+            ));
+        }
     }
 
     for pattern in pending_regex {
+        if pattern.is_empty() {
+            return resp_error("ERR regular expression is empty");
+        }
+        // `\1` … `\9`: backreferences, which Redis's engine does not do either.
+        let bytes = pattern.as_bytes();
+        let backreference = bytes.windows(2).enumerate().any(|(at, w)| {
+            w[0] == b'\\'
+                && w[1].is_ascii_digit()
+                && w[1] != b'0'
+                && bytes[..at]
+                    .iter()
+                    .rev()
+                    .take_while(|b| **b == b'\\')
+                    .count()
+                    % 2
+                    == 0
+        });
+        if backreference {
+            return resp_error("ERR regular expression backreferences are not supported");
+        }
         // `(?i)` is the engine's own case-insensitive flag — safer than
         // lowercasing the pattern, which would corrupt character classes.
         let source = if nocase {
@@ -914,12 +944,12 @@ fn cmd_argrep(ctx: &mut Ctx) -> Vec<u8> {
         };
         match regex_lite::Regex::new(&source) {
             Ok(re) => predicates.push(Predicate::Regex(re)),
-            Err(e) => return resp_error(&format!("ERR invalid RE pattern: {e}")),
+            Err(e) => return resp_error(&format!("ERR invalid regular expression: {e}")),
         }
     }
 
     if predicates.is_empty() {
-        return resp_error("ERR at least one of EXACT, MATCH, GLOB or RE is required");
+        return resp_error("ERR syntax error");
     }
 
     // Resolve `-`/`+` against the array's own bounds and run the scan in a
@@ -958,10 +988,11 @@ fn cmd_argrep(ctx: &mut Ctx) -> Vec<u8> {
             if !hit {
                 continue;
             }
-            out.push(resp_integer(idx as i64));
-            if with_values {
-                out.push(resp_bulk(&val));
-            }
+            out.push(if with_values {
+                resp_array(vec![resp_integer(idx as i64), resp_bulk(&val)])
+            } else {
+                resp_integer(idx as i64)
+            });
             taken += 1;
         }
         Ok(out)

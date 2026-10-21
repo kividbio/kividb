@@ -577,6 +577,7 @@ where
             }
             crate::stats::TOTAL_NET_INPUT_BYTES
                 .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            activity.note_read(n);
             buffer.extend_from_slice(&temp[..n]);
         } else {
             buffer.append(&mut carried);
@@ -589,6 +590,7 @@ where
         );
 
         let mut parse_offset = read_start;
+        let commands_before = activity.commands_run();
         let mut connection_handoff: Option<ConnectionHandoff> = None;
         let mut quit_requested = false;
         // Outside the parse loop: a park in one turn hands its delivery to the
@@ -2225,6 +2227,7 @@ where
         );
 
         // One TCP write per read syscall batch (pipelining).
+        activity.note_flush(combined.len(), commands_before);
         if write_tcp_batch(&writer, &mut combined).await.is_err() {
             break;
         }

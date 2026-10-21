@@ -68,7 +68,7 @@ example, since the former is the specification and the latter is illustrative.
 
 ### 1. `ARSCAN` and `ARGREP WITHVALUES` reply shape
 
-Both pages' "Return information" sections state the reply is a **flat** array:
+Both pages' "Return information" sections stated the reply is a **flat** array:
 `[idx1, val1, idx2, val2, ...]`. Both pages' examples render *nested* pairs:
 
 ```
@@ -77,7 +77,8 @@ redis> ARSCAN myarray 0 10
    2) "a"
 ```
 
-**KiviDB returns flat.** If you are writing a client, do not assume nesting.
+**KiviDB returns nested pairs, as Redis 8.10 does** (its test suite checks
+`{0 a} {5 b} {9 c}`). Before 1.1.1 KiviDB returned the flat form.
 
 ### 2. `ARGETRANGE` on an unbounded span
 

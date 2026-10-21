@@ -131,9 +131,15 @@ impl RespValue {
             .collect()
     }
     /// Flatten an array reply to plain strings, rendering integers too.
+    /// The elements, with the `[index, value]` pairs of ARSCAN and ARGREP
+    /// WITHVALUES laid end to end.
     fn flat(&self) -> Vec<String> {
         self.as_array()
             .iter()
+            .flat_map(|v| match v {
+                RespValue::Array(pair) => pair.iter().collect::<Vec<_>>(),
+                single => vec![single],
+            })
             .map(|v| match v {
                 RespValue::Nil => "<nil>".to_string(),
                 RespValue::Int(n) => n.to_string(),
@@ -486,6 +492,14 @@ fn spec_example_arscan() {
     assert_eq!(
         c.cmds(&["ARSCAN", k, "0", "10"]).flat(),
         vec!["0", "a", "5", "b", "9", "c"]
+    );
+    // As pairs, as Redis 8.10 replies.
+    assert_eq!(
+        c.cmds(&["ARSCAN", k, "0", "0"]),
+        RespValue::Array(vec![RespValue::Array(vec![
+            RespValue::Int(0),
+            RespValue::Bulk(b"a".to_vec())
+        ])])
     );
     // LIMIT caps *existing* elements, not slots visited.
     assert_eq!(

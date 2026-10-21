@@ -426,6 +426,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
 
             notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "set", key);
+            if !keepttl && expiry.is_some() {
+                notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "expire", key);
+            }
             // Return: GET → old value (or nil); no GET → +OK
             Some(if want_get {
                 match old_val {
@@ -572,7 +575,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             store_value(ctx.store, ctx.expiry_store, *ctx.selected_db, key, value);
             set_expiry(ctx.expiry_store, *ctx.selected_db, key, expires_at);
-            notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "setex", key);
+            notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "set", key);
+            notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "expire", key);
             Some(resp_simple("OK"))
         }
 
@@ -862,7 +866,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let expires_at = expiry_at_after(Duration::from_millis(millis));
             store_value(ctx.store, ctx.expiry_store, *ctx.selected_db, key, value);
             set_expiry(ctx.expiry_store, *ctx.selected_db, key, expires_at);
-            notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "psetex", key);
+            notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "set", key);
+            notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "expire", key);
             Some(resp_simple("OK"))
         }
 

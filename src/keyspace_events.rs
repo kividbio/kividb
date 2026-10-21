@@ -150,7 +150,7 @@ pub fn whole_value_targets(name: &str, cmd: &[&[u8]]) -> Vec<(Option<usize>, usi
     match name {
         "SET" | "SETEX" | "PSETEX" | "SETNX" | "GETSET" | "SINTERSTORE" | "SUNIONSTORE"
         | "SDIFFSTORE" | "ZUNIONSTORE" | "ZINTERSTORE" | "ZDIFFSTORE" | "ZRANGESTORE"
-        | "GEOSEARCHSTORE"
+        | "GEOSEARCHSTORE" | "RESTORE"
             if cmd.len() > 1 =>
         {
             here(vec![1])
