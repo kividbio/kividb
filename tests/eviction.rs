@@ -106,6 +106,35 @@ impl Conn {
         }
     }
 
+    /// `DUMP key`, as bytes: a payload is not text.
+    fn dump(&mut self, key: &str) -> Vec<u8> {
+        self.writer
+            .write_all(format!("*2\r\n$4\r\nDUMP\r\n${}\r\n{key}\r\n", key.len()).as_bytes())
+            .unwrap();
+        let mut line = String::new();
+        self.reader.read_line(&mut line).expect("reply");
+        let len: usize = line.trim_end().strip_prefix('$').unwrap().parse().unwrap();
+        let mut data = vec![0u8; len + 2];
+        self.reader.read_exact(&mut data).unwrap();
+        data.truncate(len);
+        data
+    }
+
+    /// `RESTORE key 0 payload` and then `extra`.
+    fn restore(&mut self, key: &str, payload: &[u8], extra: &[&str]) -> V {
+        let mut buf = format!("*{}\r\n", 4 + extra.len()).into_bytes();
+        for arg in [&b"RESTORE"[..], key.as_bytes(), b"0", payload]
+            .into_iter()
+            .chain(extra.iter().map(|a| a.as_bytes()))
+        {
+            buf.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+            buf.extend_from_slice(arg);
+            buf.extend_from_slice(b"\r\n");
+        }
+        self.writer.write_all(&buf).unwrap();
+        self.read()
+    }
+
     /// One field of `INFO <section>`.
     fn info(&mut self, section: &str, field: &str) -> String {
         let reply = self.cmd(&["INFO", section]);
@@ -606,4 +635,104 @@ fn what_is_on_disk_is_loaded_whatever_the_limit() {
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `RESTORE ... IDLETIME` and `FREQ` give the restored key the standing it
+/// had where it was dumped (#21). They were read and thrown away.
+#[test]
+fn restore_keeps_a_keys_idle_time_or_frequency() {
+    let server = Server::start(&["--maxmemory-policy", "allkeys-lru"]);
+    let mut c = server.conn();
+    assert!(c.cmd(&["SET", "foo", "bar"]).ok());
+    let payload = c.dump("foo");
+    c.cmd(&["DEL", "foo"]);
+    // Older than the server: a key can have been idle for longer than this
+    // one has been up.
+    assert!(c.restore("foo", &payload, &["IDLETIME", "1000"]).ok());
+    let idle = c.cmd(&["OBJECT", "IDLETIME", "foo"]).i();
+    assert!((1000..=1010).contains(&idle), "idle {idle}");
+    assert_eq!(c.cmd(&["GET", "foo"]).s(), "bar");
+    assert!(
+        c.cmd(&["OBJECT", "IDLETIME", "foo"]).i() < 2,
+        "a read uses it"
+    );
+
+    assert!(
+        c.cmd(&["CONFIG", "SET", "maxmemory-policy", "allkeys-lfu"])
+            .ok()
+    );
+    c.cmd(&["DEL", "foo"]);
+    assert!(c.restore("foo", &payload, &["FREQ", "100"]).ok());
+    let freq = c.cmd(&["OBJECT", "FREQ", "foo"]).i();
+    // 99 if a minute turned between the two: the count decays by one a minute.
+    assert!((99..=100).contains(&freq), "freq {freq}");
+
+    for (extra, error) in [
+        (
+            &["IDLETIME", "-1"][..],
+            "ERR Invalid IDLETIME value, must be >= 0",
+        ),
+        (
+            &["FREQ", "256"],
+            "ERR Invalid FREQ value, must be >= 0 and <= 255",
+        ),
+        (
+            &["IDLETIME", "1", "FREQ", "1"],
+            "ERR IDLETIME and FREQ cannot be set at the same time.",
+        ),
+        (&["IDLETIME"], "ERR syntax error"),
+    ] {
+        let mut args = vec!["REPLACE"];
+        args.extend_from_slice(extra);
+        assert_eq!(
+            c.restore("foo", &payload, &args),
+            V::Err(error.into()),
+            "{extra:?}"
+        );
+    }
+}
+
+/// With `key-access-tracking yes`, a key's idle time is kept under
+/// `noeviction` too, and only a use of the key resets it: not `TTL`, `TYPE`,
+/// `EXISTS` or `OBJECT` (#21). Off, the default, it is not kept: 0.
+#[test]
+fn key_access_tracking_keeps_idle_time_under_noeviction() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    let get = |c: &mut Conn, name: &str| match c.cmd(&["CONFIG", "GET", name]) {
+        V::Arr(row) => row[1].s().to_string(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(get(&mut c, "maxmemory-policy"), "noeviction");
+    assert_eq!(get(&mut c, "key-access-tracking"), "no");
+    assert!(c.cmd(&["SET", "untracked", "bar"]).ok());
+    std::thread::sleep(Duration::from_millis(1100));
+    assert_eq!(c.cmd(&["OBJECT", "IDLETIME", "untracked"]).i(), 0);
+    assert!(
+        c.cmd(&["CONFIG", "SET", "key-access-tracking", "maybe"])
+            .is_err()
+    );
+
+    assert!(c.cmd(&["CONFIG", "SET", "key-access-tracking", "yes"]).ok());
+    assert_eq!(get(&mut c, "key-access-tracking"), "yes");
+    assert!(c.cmd(&["SET", "foo", "bar"]).ok());
+    assert!(c.cmd(&["SET", "other", "bar"]).ok());
+    std::thread::sleep(Duration::from_millis(2100));
+    for command in ["TTL", "PTTL", "TYPE", "EXISTS", "EXPIRETIME"] {
+        assert!(!c.cmd(&[command, "foo"]).is_err(), "{command}");
+    }
+    c.cmd(&["OBJECT", "ENCODING", "foo"]);
+    let idle = c.cmd(&["OBJECT", "IDLETIME", "foo"]).i();
+    assert!(idle >= 2, "idle {idle} after TTL, TYPE, EXISTS and OBJECT");
+
+    assert_eq!(c.cmd(&["TOUCH", "foo"]).i(), 1);
+    assert!(
+        c.cmd(&["OBJECT", "IDLETIME", "foo"]).i() < 2,
+        "TOUCH uses it"
+    );
+    c.cmd(&["GET", "other"]);
+    assert!(
+        c.cmd(&["OBJECT", "IDLETIME", "other"]).i() < 2,
+        "GET uses it"
+    );
 }

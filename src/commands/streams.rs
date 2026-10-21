@@ -8,7 +8,7 @@ use crate::commands::stream_extra::{
     trim_stream_approx,
 };
 use crate::keyspace_events::{KS_STREAM, notify};
-use crate::replication::script_feed::{effect, effects_begin};
+use crate::replication::script_feed::{effect, effect_of_metadata, effects_begin};
 use crate::resp::write::*;
 use crate::store;
 use crate::store::Key;
@@ -2029,7 +2029,8 @@ fn run_xreadgroup_delivery(
                 if let Some(pending) = g.pel.get_mut(&id) {
                     pending.delivered_at = now;
                     pending.delivery_count = pending.delivery_count.saturating_add(1);
-                    effect(claim_effect(
+                    // Not a change of the dataset, to Redis (#27).
+                    effect_of_metadata(claim_effect(
                         key,
                         spec.group,
                         spec.consumer,

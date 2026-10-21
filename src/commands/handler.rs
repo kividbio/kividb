@@ -891,6 +891,8 @@ fn run_command(ctx: &mut Ctx, name: &str) -> Vec<u8> {
         && !matches!(
             name,
             "OBJECT" | "TYPE" | "TTL" | "PTTL" | "EXPIRETIME" | "PEXPIRETIME" | "EXISTS" | "DEBUG"
+            // Records its own use, with what IDLETIME or FREQ said.
+            | "RESTORE"
         )
     {
         let wrote = writes_operation && !result.starts_with(b"-");
@@ -1189,7 +1191,11 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
 
         notify_watchers(ctx, name);
 
-        crate::stats::record_rdb_change();
+        // An XREADGROUP that only re-read pending entries, or found nothing
+        // new, changed nothing Redis counts (#27).
+        if name != "XREADGROUP" || replication::script_feed::effects_changed_data() {
+            crate::stats::record_rdb_change();
+        }
     }
 
     // ── PUBLISH reaches replicas' subscribers too ───────────────────────────
