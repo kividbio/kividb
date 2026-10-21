@@ -21,6 +21,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A HyperLogLog keeps its cached count where Redis keeps it** (#28). The
+  count was never cached: every `PFCOUNT` counted all 16,384 registers again,
+  and bytes 8-15 of the value did not say what Redis's say. Now `PFCOUNT`
+  writes the count into bytes 8-15 (little-endian) and the next `PFCOUNT`
+  reads it from there; a `PFADD` that changes a register, a `PFMERGE` and
+  `PFDEBUG RESET` mark it stale with the top bit of byte 15, as Redis does.
+  A HyperLogLog saved by an earlier release is counted again the first time,
+  then cached. The registers themselves are still not Redis's (another hash,
+  no sparse encoding), so HyperLogLogs do not move between Redis and KiviDB.
+
 - **`CONFIG SET port` moves the listener, and `CONFIG SET` with several
   settings is refused whole for a bad value** (#24). `CONFIG SET port`
   replied `OK` and changed nothing: the server kept listening where it was.

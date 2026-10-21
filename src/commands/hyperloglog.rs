@@ -105,9 +105,28 @@ fn set_register(registers: &mut [u8], i: usize, val: u8) {
 //   bytes 0-3:  magic "HYLL"
 //   byte  4:    encoding (1 = dense)
 //   bytes 5-7:  unused (zero)
-//   bytes 8-11: cached cardinality (little-endian u32, 0 = invalid/dirty)
-//   bytes 12-15: unused (zero)
+//   bytes 8-15: cached cardinality, as Redis keeps it: little-endian u64,
+//               the top bit of byte 15 set when it is stale (#28)
 // Then 12288 bytes of packed 6-bit registers.
+//
+// The registers are not Redis's: the hash and the way a register and a run
+// are taken from it differ, there is no sparse encoding, and byte 4 is 1
+// where Redis's dense encoding is 0.
+
+/// Mark the cached cardinality stale, as Redis's `HLL_INVALIDATE_CACHE`.
+fn invalidate_cache(blob: &mut [u8]) {
+    blob[15] |= 0x80;
+}
+
+/// The cached cardinality, if it is not stale.
+///
+/// Zero is taken as not known: a HyperLogLog saved before 1.1.1 has zeros
+/// there, whatever it holds, since nothing filled the cache in then. Only an
+/// empty one is counted again for it, which costs nothing that matters.
+fn cached_count(blob: &[u8]) -> Option<u64> {
+    let count = u64::from_le_bytes(blob[8..16].try_into().unwrap());
+    (count != 0 && blob[15] & 0x80 == 0).then_some(count)
+}
 
 fn make_empty_hll() -> Vec<u8> {
     let mut blob = vec![0u8; HLL_TOTAL_SIZE];
@@ -308,8 +327,7 @@ fn cmd_pfadd(ctx: &mut Ctx) -> Vec<u8> {
     }
 
     if modified {
-        // Invalidate cached cardinality in header (bytes 8-11 → set to 0)
-        blob[8..12].fill(0);
+        invalidate_cache(&mut blob);
         save_hll(ctx, &key, blob);
         resp_integer(1)
     } else {
@@ -343,14 +361,35 @@ fn cmd_pfcount(ctx: &mut Ctx) -> Vec<u8> {
         let shard = store::get_shard(db, key);
         let map = read_lock!(shard);
 
-        return match map.get(key) {
-            None => resp_integer(0),
-            Some(KiviDBValue::String(b)) if is_hll(b) => {
-                resp_integer(hll_count(&b[HLL_HEADER_SIZE..]) as i64)
+        let counted = match map.get(key) {
+            None => return resp_integer(0),
+            Some(KiviDBValue::String(b)) if is_hll(b) => match cached_count(b) {
+                Some(count) => return resp_integer(count as i64),
+                None => (b.clone(), hll_count(&b[HLL_HEADER_SIZE..])),
+            },
+            Some(KiviDBValue::String(b)) => return not_hll(b),
+            _ => {
+                return resp_error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                );
             }
-            Some(KiviDBValue::String(b)) => not_hll(b),
-            _ => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
         };
+        drop(map);
+        // Keep the count in the value, as Redis does, for the next PFCOUNT
+        // and for whoever reads the bytes: unless the value has changed
+        // since it was counted. The bytes of a string are not changed in
+        // place, so a counted copy replaces it. Not a write: replicas keep
+        // their own cache, and the dataset digest leaves it out.
+        let (counted_bytes, count) = counted;
+        let mut map = write_lock!(shard);
+        if let Some(KiviDBValue::String(now)) = map.get_mut(key)
+            && SharedBytes::ptr_eq(now, &counted_bytes)
+        {
+            let mut blob = counted_bytes.to_vec();
+            blob[8..16].copy_from_slice(&count.to_le_bytes());
+            *now = SharedBytes::from(blob.as_slice());
+        }
+        return resp_integer(count as i64);
     }
 
     // Multi-key: merge all into a temp HLL
@@ -439,8 +478,7 @@ fn cmd_pfmerge(ctx: &mut Ctx) -> Vec<u8> {
         // Missing keys contribute empty HLL (no-op)
     }
 
-    // Invalidate cached cardinality
-    merged_blob[8..12].fill(0);
+    invalidate_cache(&mut merged_blob);
     save_hll(ctx, &dest_key, merged_blob);
 
     resp_simple("OK")
@@ -573,8 +611,7 @@ fn cmd_pfdebug(ctx: &mut Ctx) -> Vec<u8> {
             };
             // Zero all register bytes
             blob[HLL_HEADER_SIZE..].fill(0);
-            // Invalidate cached cardinality
-            blob[8..12].fill(0);
+            invalidate_cache(&mut blob);
             save_hll(ctx, &key, blob);
             resp_simple("OK")
         }

@@ -1643,3 +1643,47 @@ fn test_geo_delivery_radius() {
     assert!(names.contains(&"Customer_A"), "Customer_A within 10km");
     assert!(!names.contains(&"Customer_B"), "Customer_B outside 10km");
 }
+
+/// The cached cardinality is kept in bytes 8-15 as Redis keeps it (#28):
+/// PFCOUNT fills it in, a PFADD that changes the registers marks it stale
+/// with the top bit of byte 15. The Redis suite's "PFADD / PFCOUNT cache
+/// invalidation works".
+#[test]
+fn pfcount_caches_the_count_in_the_value_and_pfadd_marks_it_stale() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let byte = |c: &mut Conn, at: &str| match c.cmds(&["GETRANGE", "hll", at, at]) {
+        RespValue::Bulk(b) => b,
+        other => panic!("{other:?}"),
+    };
+
+    c.cmds(&["PFADD", "hll", "a", "b", "c"]);
+    assert_eq!(c.cmds(&["PFCOUNT", "hll"]).as_int(), 3);
+    assert_eq!(byte(&mut c, "15"), b"\x00");
+    assert_eq!(byte(&mut c, "8"), b"\x03", "the count, little-endian");
+    assert_eq!(c.cmds(&["PFADD", "hll", "a", "b", "c"]).as_int(), 0);
+    assert_eq!(byte(&mut c, "15"), b"\x00", "nothing changed");
+    assert_eq!(c.cmds(&["PFADD", "hll", "1", "2", "3"]).as_int(), 1);
+    assert_eq!(byte(&mut c, "15"), b"\x80", "stale");
+    assert_eq!(c.cmds(&["PFCOUNT", "hll"]).as_int(), 6);
+    assert_eq!(byte(&mut c, "15"), b"\x00");
+
+    // PFMERGE leaves the destination's cache stale, and its count right.
+    c.cmds(&["PFADD", "other", "x", "y"]);
+    c.cmds(&["PFMERGE", "hll", "other"]);
+    assert_eq!(byte(&mut c, "15"), b"\x80");
+    assert_eq!(c.cmds(&["PFCOUNT", "hll"]).as_int(), 8);
+
+    // A TTL is kept when PFCOUNT writes the count in.
+    c.cmds(&["PFADD", "hll", "z"]);
+    c.cmds(&["EXPIRE", "hll", "1000"]);
+    assert_eq!(c.cmds(&["PFCOUNT", "hll"]).as_int(), 9);
+    assert!(c.cmds(&["TTL", "hll"]).as_int() > 900);
+
+    // One saved before 1.1.1 has zeros there, whatever it holds: counted
+    // again, not taken as a count of 0.
+    c.cmds(&["PFADD", "old", "a", "b", "c", "d"]);
+    c.cmd(&[b"SETRANGE", b"old", b"8", &[0u8; 8]]);
+    assert_eq!(c.cmds(&["PFCOUNT", "old"]).as_int(), 4);
+}

@@ -20,11 +20,24 @@
 use crate::types::KiviDBValue;
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
+/// Where a HyperLogLog keeps its cached cardinality, if `bytes` is one.
+fn hll_cache(bytes: &[u8]) -> Option<std::ops::Range<usize>> {
+    (bytes.len() == 16 + 12288 && bytes.starts_with(b"HYLL")).then_some(8..16)
+}
+
 fn value_digest(h: &mut Xxh3, value: &KiviDBValue) {
     match value {
         KiviDBValue::String(bytes) => {
             h.update(b"s");
-            h.update(bytes);
+            match hll_cache(bytes) {
+                // A HyperLogLog's cached count is not part of its value:
+                // each node fills it in when it counts (#28).
+                Some(cache) => {
+                    h.update(&bytes[..cache.start]);
+                    h.update(&bytes[cache.end..]);
+                }
+                None => h.update(bytes),
+            }
         }
         KiviDBValue::List(list) => {
             h.update(b"l");
@@ -170,6 +183,34 @@ mod tests {
         }
         assert_eq!(dataset_digest(&a, &ea), dataset_digest(&b, &eb));
         set(&b, "k7", "w");
+        assert_ne!(dataset_digest(&a, &ea), dataset_digest(&b, &eb));
+    }
+
+    /// A HyperLogLog's cached count is each node's own: two that differ only
+    /// there are the same data (#28). Its registers are not.
+    #[test]
+    fn a_hyperloglogs_cached_count_is_not_part_of_the_fingerprint() {
+        let (a, b) = (crate::store::new_store(1), crate::store::new_store(1));
+        let (ea, eb) = (
+            crate::store::new_expiry_store(1),
+            crate::store::new_expiry_store(1),
+        );
+        let hll = |cache: u8, register: u8| {
+            let mut blob = vec![0u8; 16 + 12288];
+            blob[..4].copy_from_slice(b"HYLL");
+            blob[4] = 1;
+            blob[8] = cache;
+            blob[15] = if cache == 0 { 0x80 } else { 0 };
+            blob[100] = register;
+            KiviDBValue::String(crate::types::SharedBytes::from(blob.as_slice()))
+        };
+        let put = |store: &crate::store::Store, v: KiviDBValue| {
+            crate::write_lock!(crate::store::get_shard(&store[0], "h")).insert("h".into(), v);
+        };
+        put(&a, hll(0, 1));
+        put(&b, hll(7, 1));
+        assert_eq!(dataset_digest(&a, &ea), dataset_digest(&b, &eb));
+        put(&b, hll(7, 2));
         assert_ne!(dataset_digest(&a, &ea), dataset_digest(&b, &eb));
     }
 }
