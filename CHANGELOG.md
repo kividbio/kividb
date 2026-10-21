@@ -21,6 +21,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **An `XREADGROUP` that changes nothing is not counted as a change** (#27).
+  Reading a consumer's own pending entries again (an ID other than `>`),
+  and a `>` read that found nothing new, added one to
+  `rdb_changes_since_last_save`, which Redis does not: only new entries
+  delivered and a consumer created count. The delivery count and time of a
+  re-read entry are still sent to replicas and the AOF.
+
 - **`CONFIG SET port` moves the listener, and `CONFIG SET` with several
   settings is refused whole for a bad value** (#24). `CONFIG SET port`
   replied `OK` and changed nothing: the server kept listening where it was.

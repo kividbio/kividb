@@ -1189,7 +1189,11 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
 
         notify_watchers(ctx, name);
 
-        crate::stats::record_rdb_change();
+        // An XREADGROUP that only re-read pending entries, or found nothing
+        // new, changed nothing Redis counts (#27).
+        if name != "XREADGROUP" || replication::script_feed::effects_changed_data() {
+            crate::stats::record_rdb_change();
+        }
     }
 
     // ── PUBLISH reaches replicas' subscribers too ───────────────────────────

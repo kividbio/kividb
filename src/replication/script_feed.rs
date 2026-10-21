@@ -28,6 +28,9 @@ thread_local! {
     /// handler itself in a form that can be replayed. See [`effects_begin`].
     static EFFECTS: std::cell::RefCell<Option<Vec<Vec<Vec<u8>>>>> =
         const { std::cell::RefCell::new(None) };
+    /// Whether one of those effects changed the dataset, rather than only
+    /// metadata. See [`effect_of_metadata`].
+    static CHANGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Start recording the running command's effects.
@@ -45,15 +48,31 @@ thread_local! {
 /// write nobody was listening to is never mistaken for a later command's.
 pub(crate) fn effects_begin() {
     EFFECTS.with_borrow_mut(|e| *e = Some(Vec::new()));
+    CHANGED.set(false);
 }
 
 /// Record one replayable command as an effect of the running command.
 pub(crate) fn effect(parts: Vec<Vec<u8>>) {
+    CHANGED.set(true);
+    effect_of_metadata(parts);
+}
+
+/// [`effect`], for a change Redis does not count as one: replicas and the
+/// AOF get it, but `rdb_changes_since_last_save` does not grow. The delivery
+/// count and time an `XREADGROUP` of a consumer's own pending entries bumps
+/// are such a change (#27): Redis does not even propagate them.
+pub(crate) fn effect_of_metadata(parts: Vec<Vec<u8>>) {
     EFFECTS.with_borrow_mut(|e| {
         if let Some(recorded) = e {
             recorded.push(parts);
         }
     });
+}
+
+/// Whether the running command's effects changed the dataset (see
+/// [`effect_of_metadata`]). Not cleared when the effects are taken.
+pub(crate) fn effects_changed_data() -> bool {
+    CHANGED.get()
 }
 
 fn effects_take() -> Vec<Vec<Vec<u8>>> {
