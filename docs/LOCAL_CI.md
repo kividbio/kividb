@@ -46,7 +46,7 @@ bash scripts/ci-local.sh test matrix    # chosen stages
 | `test` | ci.yml `rust`, linux-verification `test-linux` | `cargo test`, without features and with `lua,tls` |
 | `build` | ci.yml `rust` | release build with `lua,tls` |
 | `matrix` | linux-verification `io-model-matrix`, ci.yml `e2e` | for tokio and io_uring: pub/sub and blocking matrices, replication determinism, three AOF durability tests, and the e2e suite under RESP2 and RESP3 |
-| `compat` | ci.yml `redis-compat` | Redis 8.0.0's Tcl suite, one unit at a time. A measurement, not a gate |
+| `compat` | ci.yml `redis-compat` | Redis 8.10.2's Tcl suite, one unit at a time. A measurement, not a gate |
 
 Every stage runs even after a failure. A summary at the end lists each
 result, and the exit status is 1 if any failed.

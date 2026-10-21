@@ -101,11 +101,13 @@ for stage in "${STAGES[@]}"; do
       ;;
     compat)
       [ -x "$CARGO_TARGET_DIR/release/kividb" ] || run "release build lua,tls" cargo build --release --features lua,tls
-      if [ ! -d /cache/redis-tests ]; then
-        git clone -q --depth 1 --branch 8.0.0 https://github.com/redis/redis.git /cache/redis-tests
+      # As ci.yml's redis-compat job. Cached by tag, so a new tag is cloned.
+      suite=/cache/redis-tests-8.10.2
+      if [ ! -d "$suite" ]; then
+        git clone -q --depth 1 --branch 8.10.2 https://github.com/redis/redis.git "$suite"
       fi
-      (cd /cache/redis-tests && git checkout -q .)
-      bash scripts/redis_compat.sh "$CARGO_TARGET_DIR/release/kividb" /cache/redis-tests "$LOGDIR/redis-compat"
+      (cd "$suite" && git checkout -q .)
+      bash scripts/redis_compat.sh "$CARGO_TARGET_DIR/release/kividb" "$suite" "$LOGDIR/redis-compat"
       ORDER+=("redis compat")
       RESULT["redis compat"]="measured: $LOGDIR/redis-compat/summary.md (not a gate)"
       ;;

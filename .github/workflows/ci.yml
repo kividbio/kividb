@@ -159,9 +159,12 @@ jobs:
       - name: Install Tcl
         run: sudo apt-get install -y tcl tcllib
 
+      # The release KiviDB reports itself as (`redis_version` in INFO): an
+      # older suite fails it for what that release added, such as the
+      # fields Redis 8.6 put in XINFO STREAM FULL.
       - name: Clone Redis test suite
         run: |
-          git clone --depth 1 --branch 8.0.0 \
+          git clone --depth 1 --branch 8.10.2 \
             https://github.com/redis/redis.git /tmp/redis-tests
 
       - name: Download KiviDB binary

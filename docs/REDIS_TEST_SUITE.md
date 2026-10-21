@@ -42,6 +42,10 @@ tests of that kind and contribute nothing either way.
 
 ## Where it stands
 
+CI runs Redis 8.10.2's suite since 1.1.1, the release KiviDB reports itself
+as. The figures below are from Redis 8.0.0's suite, which it ran before; the
+CI job's summary has the current ones.
+
 Redis 8.0.0's suite, on Linux, io_uring loop:
 
 | | passed | failed | units ended early |
@@ -252,7 +256,7 @@ system calls and a hundred times this.
 On Linux, with the server and `runtest` on the same machine:
 
 ```
-git clone --depth 1 --branch 8.0.0 https://github.com/redis/redis.git /tmp/redis-tests
+git clone --depth 1 --branch 8.10.2 https://github.com/redis/redis.git /tmp/redis-tests
 cargo build --release --features lua,tls
 scripts/redis_compat.sh target/release/kividb /tmp/redis-tests /tmp/redis-compat
 UNITS="unit/type/stream unit/geo" scripts/redis_compat.sh …   # some units only
