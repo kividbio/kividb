@@ -996,6 +996,28 @@ impl Config {
         }
 
         let tmp = path.with_extension("tmp");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+            // Passwords may be present; don't let a temporary file expose them.
+            let mode = match std::fs::metadata(path) {
+                Ok(meta) => meta.permissions().mode() & 0o7777,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0o600,
+                Err(err) => return Err(RewriteError::Io(err)),
+            };
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+                .map_err(RewriteError::Io)?;
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
+                .map_err(RewriteError::Io)?;
+            std::io::Write::write_all(&mut file, out.as_bytes()).map_err(RewriteError::Io)?;
+        }
+        #[cfg(not(unix))]
         std::fs::write(&tmp, &out).map_err(RewriteError::Io)?;
         std::fs::rename(&tmp, path).map_err(RewriteError::Io)?;
 
@@ -1735,6 +1757,36 @@ mod config_file_tests {
             })
             .unwrap();
         assert_eq!(asked.get(), everything.lines().count());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod rewrite_permission_tests {
+    use super::Config;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn rewrite_preserves_config_permissions() {
+        let dir = std::env::temp_dir().join(format!(
+            "kividb-permissions-{}-{:?}", std::process::id(), std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kividb.conf");
+        let cfg = Config {
+            configfile: path.to_string_lossy().into_owned(),
+            requirepass: "test-secret".to_string(),
+            ..Config::default()
+        };
+        for mode in [0o600, 0o640] {
+            std::fs::write(&path, "port 6380\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            cfg.rewrite_to_disk().unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, mode);
+        }
+        std::fs::remove_file(&path).unwrap();
+        cfg.rewrite_to_disk().unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
 
