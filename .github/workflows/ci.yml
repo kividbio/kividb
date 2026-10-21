@@ -97,6 +97,9 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     needs: rust
+    # As `rust`: on a manual run detect-changes is skipped, and a job that
+    # needs a job that needs it is skipped too unless it says otherwise.
+    if: always() && needs.rust.result == 'success'
     steps:
       - uses: actions/checkout@v4
 
@@ -151,6 +154,9 @@ jobs:
   redis-compat:
     runs-on: ubuntu-latest
     needs: rust
+    # As `rust`: on a manual run detect-changes is skipped, and a job that
+    # needs a job that needs it is skipped too unless it says otherwise.
+    if: always() && needs.rust.result == 'success'
     # Never marks the PR as failed — it's a signal, not a gate
     continue-on-error: true
     steps:
