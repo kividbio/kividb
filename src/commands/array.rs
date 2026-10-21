@@ -41,6 +41,49 @@ const ERR_CURSOR_EXHAUSTED: &str = "ERR array insert cursor is exhausted";
 const MAX_MATERIALISED_RANGE: u64 = 1_000_000;
 
 pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
+    let reply = run(ctx, name)?;
+    notify_array_event(ctx, name, &reply);
+    Some(reply)
+}
+
+/// `notify-keyspace-events a` (Redis 8.10): the array commands that change
+/// an array say so, by name; one that leaves it empty, and so deletes it,
+/// says `del` after.
+fn notify_array_event(ctx: &Ctx, name: &str, reply: &[u8]) {
+    use crate::keyspace_events::{KS_ARRAY, KS_FLAGS, KS_GENERIC, notify};
+    if KS_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0 || reply.starts_with(b"-") {
+        return;
+    }
+    let Some(key) = ctx.cmd.get(1).and_then(|k| parse_utf8(k)) else {
+        return;
+    };
+    let event = match name {
+        "ARSET" => "arset",
+        "ARMSET" => "armset",
+        "ARINSERT" => "arinsert",
+        "ARRING" => "arring",
+        "ARSEEK" if reply == b":1\r\n" => "arseek",
+        // Only when something was deleted.
+        "ARDEL" | "ARDELRANGE" if !reply.starts_with(b":0\r") => {
+            let event = if name == "ARDEL" {
+                "ardel"
+            } else {
+                "ardelrange"
+            };
+            notify(ctx.pubsub, *ctx.selected_db, KS_ARRAY, event, key);
+            let gone =
+                !read_lock!(store::get_shard(&ctx.store[*ctx.selected_db], key)).contains_key(key);
+            if gone {
+                notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "del", key);
+            }
+            return;
+        }
+        _ => return,
+    };
+    notify(ctx.pubsub, *ctx.selected_db, KS_ARRAY, event, key);
+}
+
+fn run(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
     match name {
         "ARSET" => Some(cmd_arset(ctx)),
         "ARMSET" => Some(cmd_armset(ctx)),
@@ -72,11 +115,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 /// rejected rather than interpreted end-relative the way list/string commands
 /// do — an array's `len` is "max index + 1" over a sparse space, so there is no
 /// meaningful element for `-1` to name.
+/// An index: what is not a whole number from 0 is `invalid array index`, as
+/// in Redis 8.10 (which said `value is not an integer` before).
 fn parse_index(raw: &[u8]) -> Result<u64, Vec<u8>> {
-    let s = parse_utf8(raw).ok_or_else(|| resp_error(ERR_VALUE_NOT_INTEGER))?;
-    let v: i64 = s.parse().map_err(|_| resp_error(ERR_VALUE_NOT_INTEGER))?;
+    let invalid = || resp_error("ERR invalid array index");
+    let s = parse_utf8(raw).ok_or_else(invalid)?;
+    let v: i64 = s.parse().map_err(|_| invalid())?;
     if v < 0 {
-        return Err(resp_error(ERR_INDEX_RANGE));
+        return Err(invalid());
     }
     Ok(v as u64)
 }

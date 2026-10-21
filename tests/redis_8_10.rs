@@ -3005,3 +3005,81 @@ fn concurrent_writes_to_different_databases_stay_in_their_databases() {
         assert!(c.cmd(&["SELECT", "0"]).ok());
     }
 }
+
+/// INCREX's options and errors as Redis 8.10 has them: each option at most
+/// once, anything else a syntax error, and Redis's wording for the rest.
+#[test]
+fn increx_options_and_errors_follow_redis_8_10() {
+    let mut c = conn();
+    for (args, error) in [
+        (&["BYINT", "1", "BYFLOAT", "1"][..], "ERR syntax error"),
+        (&["BYINT", "1", "BYINT", "2"], "ERR syntax error"),
+        (&["PERSIST", "ENX"], "ERR syntax error"),
+        (&["ENX", "PERSIST"], "ERR syntax error"),
+        (&["EX", "10", "PX", "10"], "ERR syntax error"),
+        (&["SATURATE", "SATURATE"], "ERR syntax error"),
+        (
+            &["BYINT", "x"],
+            "ERR Increment is not an integer or out of range",
+        ),
+        (&["BYFLOAT", "x"], "ERR Increment is not a valid float"),
+        (
+            &["BYFLOAT", "inf"],
+            "ERR BYFLOAT increment cannot be Infinity",
+        ),
+        (
+            &["LBOUND", "x"],
+            "ERR LBOUND is not an integer or out of range",
+        ),
+        (
+            &["BYFLOAT", "1", "UBOUND", "x"],
+            "ERR UBOUND is not a valid float",
+        ),
+        (
+            &["LBOUND", "5", "UBOUND", "1"],
+            "ERR LBOUND can't be greater than UBOUND",
+        ),
+        (&["ENX"], "ERR ENX flag requires an expiration"),
+        (&["EX", "0"], "ERR invalid expire time in 'increx' command"),
+    ] {
+        let mut cmd = vec!["INCREX", "ix"];
+        cmd.extend_from_slice(args);
+        assert_eq!(c.cmd(&cmd), V::Err(error.into()), "{args:?}");
+    }
+
+    // Out of bounds: left alone, with the value as it is and 0; SATURATE
+    // clamps to the bound.
+    assert!(c.cmd(&["SET", "ix", "9223372036854775806"]).ok());
+    let reply = c.cmd(&["INCREX", "ix", "BYINT", "5"]);
+    assert_eq!(reply.arr()[0].i(), 9223372036854775806);
+    assert_eq!(reply.arr()[1].i(), 0);
+    assert!(c.cmd(&["SET", "ix", "-9223372036854775808"]).ok());
+    assert_eq!(
+        c.cmd(&[
+            "INCREX",
+            "ix",
+            "BYINT",
+            "1",
+            "UBOUND",
+            "9223372036854775807",
+            "SATURATE",
+            "LBOUND",
+            "9223372036854775807"
+        ]),
+        V::Err("ERR applied increment would overflow".into())
+    );
+    assert!(c.cmd(&["SET", "ix", "inf"]).ok());
+    assert_eq!(
+        c.cmd(&["INCREX", "ix", "BYFLOAT", "1"]),
+        V::Err("ERR value cannot be Infinity".into())
+    );
+
+    // A TTL already past: the key goes at once.
+    assert!(c.cmd(&["SET", "ix", "10"]).ok());
+    let reply = c.cmd(&["INCREX", "ix", "BYINT", "1", "EXAT", "1"]);
+    assert_eq!(reply.arr()[0].i(), 11);
+    assert_eq!(c.cmd(&["EXISTS", "ix"]).i(), 0);
+    assert!(c.cmd(&["SET", "ix", "10", "EX", "500"]).ok());
+    c.cmd(&["INCREX", "ix", "BYINT", "1", "PERSIST"]);
+    assert_eq!(c.cmd(&["TTL", "ix"]).i(), -1);
+}

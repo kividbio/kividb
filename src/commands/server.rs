@@ -671,6 +671,11 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
     reply
 }
 
+/// What a remembered setting is now (see [`REMEMBERED_CONFIG`]).
+pub(crate) fn remembered_config(name: &str) -> Option<String> {
+    REMEMBERED_CONFIG.lock().get(name).cloned()
+}
+
 /// Settings of Redis's that have no meaning here, with Redis's defaults and
 /// whatever `CONFIG SET` has since given them. See `CONFIG SET`.
 static REMEMBERED_CONFIG: std::sync::LazyLock<

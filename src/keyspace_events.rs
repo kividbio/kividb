@@ -13,8 +13,16 @@ pub const KS_EVICTED: u32 = 1 << 8;
 pub const KS_HASH: u32 = 1 << 9;
 pub const KS_STREAM: u32 = 1 << 10;
 pub const KS_KEY_MISS: u32 = 1 << 11;
+/// `a` (Redis 8.10): array commands. One of `A`'s.
+pub const KS_ARRAY: u32 = 1 << 19;
 /// `n`: a key that was not there has been created. (Not one of `A`'s.)
 pub const KS_NEW: u32 = 1 << 16;
+/// `o` (Redis 8.2): a key's value has been replaced whole, by `SET`, a
+/// `*STORE`, `COPY`, `RENAME` and the like. (Not one of `A`'s.)
+pub const KS_OVERWRITTEN: u32 = 1 << 17;
+/// `c` (Redis 8.2): it was replaced by a value of another type. (Not one of
+/// `A`'s.)
+pub const KS_TYPE_CHANGED: u32 = 1 << 18;
 // Subkey notifications (Redis 8.8): which fields of a hash a command touched.
 // Four channel shapes, each enabled by its own flag, independent of the
 // key-level flags above.
@@ -46,7 +54,10 @@ pub fn parse_ks_flags(s: &str) -> u32 {
             'h' => flags |= KS_HASH,
             't' => flags |= KS_STREAM,
             'm' => flags |= KS_KEY_MISS,
+            'a' => flags |= KS_ARRAY,
             'n' => flags |= KS_NEW,
+            'o' => flags |= KS_OVERWRITTEN,
+            'c' => flags |= KS_TYPE_CHANGED,
             'S' => flags |= KS_SUBKEYSPACE,
             'T' => flags |= KS_SUBKEYEVENT,
             'I' => flags |= KS_SUBKEYSPACEITEM,
@@ -60,7 +71,8 @@ pub fn parse_ks_flags(s: &str) -> u32 {
                     | KS_EXPIRED
                     | KS_EVICTED
                     | KS_HASH
-                    | KS_STREAM;
+                    | KS_STREAM
+                    | KS_ARRAY;
             }
             _ => {}
         }
@@ -77,7 +89,8 @@ const KS_ALL: u32 = KS_GENERIC
     | KS_EXPIRED
     | KS_EVICTED
     | KS_HASH
-    | KS_STREAM;
+    | KS_STREAM
+    | KS_ARRAY;
 
 /// The flags as `CONFIG GET notify-keyspace-events` writes them — in
 /// Redis's order, whatever order they were given in: the classes of event
@@ -97,6 +110,7 @@ pub fn flags_to_string(flags: u32) -> String {
             (KS_EXPIRED, 'x'),
             (KS_EVICTED, 'e'),
             (KS_STREAM, 't'),
+            (KS_ARRAY, 'a'),
         ] {
             if flags & flag != 0 {
                 s.push(c);
@@ -108,6 +122,8 @@ pub fn flags_to_string(flags: u32) -> String {
         (KS_KEYEVENT, 'E'),
         (KS_KEY_MISS, 'm'),
         (KS_NEW, 'n'),
+        (KS_OVERWRITTEN, 'o'),
+        (KS_TYPE_CHANGED, 'c'),
         (KS_SUBKEYSPACE, 'S'),
         (KS_SUBKEYEVENT, 'T'),
         (KS_SUBKEYSPACEITEM, 'I'),
@@ -118,6 +134,57 @@ pub fn flags_to_string(flags: u32) -> String {
         }
     }
     s
+}
+
+/// Where a command replaces a key's value whole, as Redis's `setKey` does:
+/// the keys `overwritten` and `type_changed` are about. `(db, position)`,
+/// `db` given only when it is not the selected one (`COPY ... DB n`).
+pub fn whole_value_targets(name: &str, cmd: &[&[u8]]) -> Vec<(Option<usize>, usize)> {
+    let after = |word: &[u8]| {
+        cmd.iter()
+            .position(|arg| arg.eq_ignore_ascii_case(word))
+            .map(|at| at + 1)
+            .filter(|at| *at < cmd.len())
+    };
+    let here = |positions: Vec<usize>| positions.into_iter().map(|at| (None, at)).collect();
+    match name {
+        "SET" | "SETEX" | "PSETEX" | "SETNX" | "GETSET" | "SINTERSTORE" | "SUNIONSTORE"
+        | "SDIFFSTORE" | "ZUNIONSTORE" | "ZINTERSTORE" | "ZDIFFSTORE" | "ZRANGESTORE"
+        | "GEOSEARCHSTORE"
+            if cmd.len() > 1 =>
+        {
+            here(vec![1])
+        }
+        "BITOP" | "RENAME" | "RENAMENX" if cmd.len() > 2 => here(vec![2]),
+        "MSET" | "MSETNX" => here((1..cmd.len()).step_by(2).collect()),
+        // MSETEX numkeys key value [key value ...] [options]
+        "MSETEX" => {
+            let n = cmd
+                .get(1)
+                .and_then(|n| std::str::from_utf8(n).ok()?.parse::<usize>().ok())
+                .unwrap_or(0);
+            here(
+                (0..n)
+                    .map(|i| 2 + 2 * i)
+                    .filter(|at| *at < cmd.len())
+                    .collect(),
+            )
+        }
+        "SORT" => here(after(b"STORE").into_iter().collect()),
+        "GEORADIUS" | "GEORADIUSBYMEMBER" => here(
+            after(b"STORE")
+                .or_else(|| after(b"STOREDIST"))
+                .into_iter()
+                .collect(),
+        ),
+        "HIMPORT" if cmd.len() > 2 && cmd[1].eq_ignore_ascii_case(b"SET") => here(vec![2]),
+        "COPY" if cmd.len() > 2 => {
+            let db = after(b"DB")
+                .and_then(|at| std::str::from_utf8(cmd[at]).ok()?.parse::<usize>().ok());
+            vec![(db, 2)]
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// The pub/sub hub of each server in this process, by its store. Expiry

@@ -117,7 +117,8 @@ pub fn commands_for_propagation(
         )],
         "HEXPIRE" | "HPEXPIRE" => hexpire_feed(name, cmd),
         "HSETEX" | "HGETEX" => hash_ttl_feed(cmd),
-        "INCREX" => increx_feed(ctx, cmd, resp),
+        // A SET of the result, or DEL/UNLINK; see `cmd_increx`.
+        "INCREX" => effects_take(),
         "RESTORE" => restore_feed(cmd),
         "INCRBYFLOAT" => incrbyfloat_feed(cmd, resp),
         "XADD" => xadd_feed(cmd, resp),
@@ -525,52 +526,6 @@ fn hash_ttl_feed(cmd: &[&[u8]]) -> Vec<Vec<Vec<u8>>> {
 
 /// `INCREX` can refuse to move (a bound), can round (BYFLOAT), and can set a
 /// TTL only when there is none (ENX): what is sent is where it left the key.
-fn increx_feed(ctx: &Ctx<'_>, cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
-    let lines: Vec<&[u8]> = resp.split(|b| *b == b'\n').collect();
-    // `*2 :value :delta` in integer mode, `*2 $n value $n delta` in float mode.
-    let field = |line: Option<&&[u8]>| line.map(|l| l.strip_suffix(b"\r").unwrap_or(l).to_vec());
-    let (value, delta) = match lines.get(1).and_then(|l| l.first()) {
-        Some(b':') => (
-            field(lines.get(1)).map(|l| l[1..].to_vec()),
-            field(lines.get(2)).map(|l| l[1..].to_vec()),
-        ),
-        Some(b'$') => (field(lines.get(2)), field(lines.get(4))),
-        _ => (None, None),
-    };
-    let (Some(value), Some(delta), Some(key)) = (value, delta, cmd.get(1)) else {
-        return vec![owned(cmd)];
-    };
-    // A zero delta is the "skipped" reply: the key and its TTL were left alone.
-    if delta == b"0" {
-        return Vec::new();
-    }
-    let mut feed = vec![vec![
-        b"SET".to_vec(),
-        key.to_vec(),
-        value,
-        b"KEEPTTL".to_vec(),
-    ]];
-    let has_option = |name: &str| {
-        cmd[2..]
-            .iter()
-            .any(|arg| arg.eq_ignore_ascii_case(name.as_bytes()))
-    };
-    if has_option("PERSIST") {
-        feed.push(vec![b"PERSIST".to_vec(), key.to_vec()]);
-    } else if ["EX", "PX", "EXAT", "PXAT"]
-        .iter()
-        .any(|name| has_option(name))
-        && let Some(at) = parse_utf8(key).and_then(|key| expiry_ms(ctx, key))
-    {
-        feed.push(vec![
-            b"PEXPIREAT".to_vec(),
-            key.to_vec(),
-            at.to_string().into_bytes(),
-        ]);
-    }
-    feed
-}
-
 /// `RESTORE key ttl payload …` with a relative TTL → the same with `ABSTTL`.
 fn restore_feed(cmd: &[&[u8]]) -> Vec<Vec<Vec<u8>>> {
     let mut out = owned(cmd);

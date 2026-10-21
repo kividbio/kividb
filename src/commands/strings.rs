@@ -2008,6 +2008,7 @@ enum IncrexExpiry {
 /// `INCREX key [BYFLOAT n | BYINT n] [LBOUND l] [UBOUND u] [SATURATE]
 ///            [EX s | PX ms | EXAT s | PXAT ms | PERSIST] [ENX]`
 fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
+    use crate::replication::script_feed::{effect, effects_begin};
     let cmd = &ctx.cmd;
     if cmd.len() < 2 {
         return resp_error("ERR wrong number of arguments for 'increx' command");
@@ -2017,145 +2018,118 @@ fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
         None => return resp_error("ERR key must be valid UTF-8"),
     };
 
+    // The options as Redis 8.10's `parseIncrExArgumentsOrReply` takes them:
+    // each at most once, BYINT or BYFLOAT, one expiration or PERSIST, ENX
+    // not with PERSIST; anything else is a syntax error. The bounds are read
+    // after, in the type BYINT or BYFLOAT chose.
     let mut mode = IncrexMode::Int;
     let mut mode_set = false;
-    // Default increment is 1 in integer mode when neither BYINT nor BYFLOAT is given.
     let mut incr_int: i64 = 1;
-    let mut incr_float: f64 = 1.0;
-    let mut lbound_raw: Option<String> = None;
-    let mut ubound_raw: Option<String> = None;
+    let mut incr_float: f64 = 0.0;
+    let mut lbound_raw: Option<&[u8]> = None;
+    let mut ubound_raw: Option<&[u8]> = None;
     let mut saturate = false;
-    let mut expiry = IncrexExpiry::Keep;
-    let mut expiry_set = false;
-    let mut persist_set = false;
+    let mut expire: Option<(&str, &[u8])> = None;
+    let mut persist = false;
     let mut enx = false;
+    let syntax = || resp_error("ERR syntax error");
 
     let mut i = 2usize;
     while i < cmd.len() {
-        let tok = match parse_utf8(cmd[i]) {
-            Some(s) => s.to_ascii_uppercase(),
-            None => return resp_error("ERR syntax error"),
-        };
-        let needs_arg = i + 1 < cmd.len();
-        match tok.as_str() {
-            "BYINT" | "BYFLOAT" => {
-                if mode_set {
-                    return resp_error("ERR BYINT and BYFLOAT are mutually exclusive");
-                }
-                if !needs_arg {
-                    return resp_error("ERR syntax error");
-                }
-                let raw = match parse_utf8(cmd[i + 1]) {
-                    Some(s) => s,
-                    None => return resp_error("ERR syntax error"),
+        let tok = String::from_utf8_lossy(cmd[i]).to_ascii_uppercase();
+        let next = cmd.get(i + 1).copied();
+        match (tok.as_str(), next) {
+            ("BYINT", Some(raw)) if !mode_set => {
+                incr_int = match parse_utf8(raw).and_then(|s| s.parse().ok()) {
+                    Some(v) => v,
+                    None => return resp_error("ERR Increment is not an integer or out of range"),
                 };
-                if tok == "BYINT" {
-                    mode = IncrexMode::Int;
-                    incr_int = match raw.parse() {
-                        Ok(v) => v,
-                        Err(_) => return resp_error(ERR_VALUE_NOT_INTEGER),
-                    };
-                } else {
-                    mode = IncrexMode::Float;
-                    incr_float = match raw.parse::<f64>() {
-                        Ok(v) if v.is_finite() => v,
-                        _ => return resp_error("ERR value is not a valid float"),
-                    };
-                }
                 mode_set = true;
                 i += 2;
             }
-            "LBOUND" | "UBOUND" => {
-                if !needs_arg {
-                    return resp_error("ERR syntax error");
-                }
-                let raw = match parse_utf8(cmd[i + 1]) {
-                    Some(s) => s.to_string(),
-                    None => return resp_error("ERR syntax error"),
+            ("BYFLOAT", Some(raw)) if !mode_set => {
+                incr_float = match parse_utf8(raw).and_then(|s| s.parse::<f64>().ok()) {
+                    Some(v) if !v.is_nan() => v,
+                    _ => return resp_error("ERR Increment is not a valid float"),
                 };
-                if tok == "LBOUND" {
-                    lbound_raw = Some(raw);
-                } else {
-                    ubound_raw = Some(raw);
+                if incr_float.is_infinite() {
+                    return resp_error("ERR BYFLOAT increment cannot be Infinity");
                 }
+                mode = IncrexMode::Float;
+                mode_set = true;
                 i += 2;
             }
-            "SATURATE" => {
+            ("LBOUND", Some(raw)) if lbound_raw.is_none() => {
+                lbound_raw = Some(raw);
+                i += 2;
+            }
+            ("UBOUND", Some(raw)) if ubound_raw.is_none() => {
+                ubound_raw = Some(raw);
+                i += 2;
+            }
+            ("SATURATE", _) if !saturate => {
                 saturate = true;
                 i += 1;
             }
-            "EX" | "PX" | "EXAT" | "PXAT" => {
-                if expiry_set || persist_set {
-                    return resp_error("ERR syntax error");
-                }
-                if !needs_arg {
-                    return resp_error("ERR syntax error");
-                }
-                let n: i64 = match parse_utf8(cmd[i + 1]).and_then(|s| s.parse().ok()) {
-                    Some(v) => v,
-                    None => return resp_error(ERR_VALUE_NOT_INTEGER),
-                };
-                if n <= 0 && (tok == "EX" || tok == "PX") {
-                    return resp_error("ERR invalid expire time in 'increx' command");
-                }
-                let at = match tok.as_str() {
-                    "EX" => expiry_at_after(Duration::from_secs(n as u64)),
-                    "PX" => expiry_at_after(Duration::from_millis(n as u64)),
-                    "EXAT" => UNIX_EPOCH + Duration::from_secs(n.max(0) as u64),
-                    _ => UNIX_EPOCH + Duration::from_millis(n.max(0) as u64),
-                };
-                expiry = IncrexExpiry::Set(at);
-                expiry_set = true;
-                i += 2;
-            }
-            "PERSIST" => {
-                if expiry_set || persist_set {
-                    return resp_error("ERR syntax error");
-                }
-                expiry = IncrexExpiry::Persist;
-                persist_set = true;
-                i += 1;
-            }
-            "ENX" => {
+            ("ENX", _) if !enx && !persist => {
                 enx = true;
                 i += 1;
             }
-            _ => return resp_error("ERR syntax error"),
+            ("PERSIST", _) if expire.is_none() && !persist && !enx => {
+                persist = true;
+                i += 1;
+            }
+            ("EX" | "PX" | "EXAT" | "PXAT", Some(raw)) if expire.is_none() && !persist => {
+                expire = Some((
+                    match tok.as_str() {
+                        "EX" => "EX",
+                        "PX" => "PX",
+                        "EXAT" => "EXAT",
+                        _ => "PXAT",
+                    },
+                    raw,
+                ));
+                i += 2;
+            }
+            _ => return syntax(),
         }
     }
 
-    // ENX only means anything alongside an actual expiry to conditionally set.
-    if enx && !expiry_set {
-        return resp_error(
-            "ERR ENX requires one of EX, PX, EXAT or PXAT and is incompatible with PERSIST",
-        );
-    }
-
-    // Bounds are parsed in the active numeric domain.
     let (lbound_i, ubound_i, lbound_f, ubound_f) = match mode {
         IncrexMode::Int => {
-            let l = match lbound_raw.as_deref().map(|s| s.parse::<i64>()) {
-                Some(Ok(v)) => v,
-                Some(Err(_)) => return resp_error(ERR_VALUE_NOT_INTEGER),
-                None => i64::MIN,
+            let bound = |raw: Option<&[u8]>, default: i64, what: &str| match raw {
+                None => Ok(default),
+                Some(raw) => parse_utf8(raw)
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .ok_or_else(|| {
+                        resp_error(&format!("ERR {what} is not an integer or out of range"))
+                    }),
             };
-            let u = match ubound_raw.as_deref().map(|s| s.parse::<i64>()) {
-                Some(Ok(v)) => v,
-                Some(Err(_)) => return resp_error(ERR_VALUE_NOT_INTEGER),
-                None => i64::MAX,
+            let l = match bound(lbound_raw, i64::MIN, "LBOUND") {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let u = match bound(ubound_raw, i64::MAX, "UBOUND") {
+                Ok(v) => v,
+                Err(e) => return e,
             };
             (l, u, 0.0, 0.0)
         }
         IncrexMode::Float => {
-            let l = match lbound_raw.as_deref().map(|s| s.parse::<f64>()) {
-                Some(Ok(v)) => v,
-                Some(Err(_)) => return resp_error("ERR value is not a valid float"),
-                None => f64::MIN,
+            let bound = |raw: Option<&[u8]>, default: f64, what: &str| match raw {
+                None => Ok(default),
+                Some(raw) => parse_utf8(raw)
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .filter(|v| !v.is_nan())
+                    .ok_or_else(|| resp_error(&format!("ERR {what} is not a valid float"))),
             };
-            let u = match ubound_raw.as_deref().map(|s| s.parse::<f64>()) {
-                Some(Ok(v)) => v,
-                Some(Err(_)) => return resp_error("ERR value is not a valid float"),
-                None => f64::MAX,
+            let l = match bound(lbound_raw, f64::MIN, "LBOUND") {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let u = match bound(ubound_raw, f64::MAX, "UBOUND") {
+                Ok(v) => v,
+                Err(e) => return e,
             };
             (0, 0, l, u)
         }
@@ -2165,8 +2139,33 @@ fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
         IncrexMode::Float => lbound_f > ubound_f,
     };
     if bounds_inverted {
-        return resp_error("ERR LBOUND must be less than or equal to UBOUND");
+        return resp_error("ERR LBOUND can't be greater than UBOUND");
     }
+    if enx && expire.is_none() {
+        return resp_error("ERR ENX flag requires an expiration");
+    }
+    let expiry = match expire {
+        None if persist => IncrexExpiry::Persist,
+        None => IncrexExpiry::Keep,
+        Some((unit, raw)) => {
+            let n: i64 = match parse_utf8(raw).and_then(|s| s.parse().ok()) {
+                Some(v) => v,
+                None => return resp_error(ERR_VALUE_NOT_INTEGER),
+            };
+            if n <= 0 || (matches!(unit, "EX" | "EXAT") && n > i64::MAX / 1000) {
+                return resp_error("ERR invalid expire time in 'increx' command");
+            }
+            IncrexExpiry::Set(match unit {
+                "EX" => expiry_at_after(Duration::from_secs(n as u64)),
+                "PX" => expiry_at_after(Duration::from_millis(n as u64)),
+                "EXAT" => UNIX_EPOCH + Duration::from_secs(n as u64),
+                _ => UNIX_EPOCH + Duration::from_millis(n as u64),
+            })
+        }
+    };
+
+    // What is propagated is what this did, not the command: see below.
+    effects_begin();
 
     // A key that has already expired behaves exactly like an absent one.
     lazy_expire_key(ctx.store, ctx.expiry_store, *ctx.selected_db, &key);
@@ -2182,8 +2181,11 @@ fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
             return resp_error("WRONGTYPE Operation against a key holding the wrong kind of value");
         }
     };
+    let existed = existing.is_some();
 
-    // Compute the new value and the increment actually applied.
+    // Compute the new value and the increment actually applied. Out of
+    // [LBOUND, UBOUND], or past what the type holds: left alone, with the
+    // current value and 0, or with SATURATE clamped to the bound.
     let (new_repr, applied_repr) = match mode {
         IncrexMode::Int => {
             let current: i64 = match existing {
@@ -2193,87 +2195,68 @@ fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
                     None => return resp_error(ERR_VALUE_NOT_INTEGER),
                 },
             };
-            // i128 so overflow is detectable rather than wrapping. Overflow
-            // counts as a bound violation per "a bound violation includes ...
-            // overflowing the type limits when no explicit bound is given".
-            let raw = (current as i128) + (incr_int as i128);
-            let clamped = raw.clamp(lbound_i as i128, ubound_i as i128);
-            if raw != clamped {
+            let (sum, overflow) = current.overflowing_add(incr_int);
+            let value = if overflow || sum > ubound_i || sum < lbound_i {
                 if !saturate {
-                    // Skip: reply the unchanged current value with a zero delta,
-                    // leaving the key *and its TTL* untouched.
                     return resp_array(vec![resp_integer(current), resp_integer(0)]);
                 }
-                let capped = clamped as i64;
-                let delta = clamped - current as i128;
-                if !(i64::MIN as i128..=i64::MAX as i128).contains(&delta) {
-                    return resp_error(
-                        "ERR saturated increment cannot be represented as a 64-bit integer",
-                    );
+                if overflow {
+                    if incr_int >= 0 { ubound_i } else { lbound_i }
+                } else if sum > ubound_i {
+                    ubound_i
+                } else {
+                    lbound_i
                 }
-                (capped.to_string(), (delta as i64).to_string())
             } else {
-                ((raw as i64).to_string(), incr_int.to_string())
-            }
+                sum
+            };
+            let Some(delta) = value.checked_sub(current) else {
+                return resp_error("ERR applied increment would overflow");
+            };
+            (value.to_string(), delta.to_string())
         }
         IncrexMode::Float => {
             let current: f64 = match existing {
                 None => 0.0,
                 Some(v) => match std::str::from_utf8(v).ok().and_then(|s| s.parse().ok()) {
-                    Some(n) => n,
-                    None => return resp_error("ERR value is not a valid float"),
+                    Some(n) if !f64::is_nan(n) => n,
+                    _ => return resp_error("ERR value is not a valid float"),
                 },
             };
-            let raw = current + incr_float;
-            if !raw.is_finite() {
-                return resp_error("ERR increment would produce NaN or Infinity");
+            if current.is_infinite() {
+                return resp_error("ERR value cannot be Infinity");
             }
-            let clamped = raw.clamp(lbound_f, ubound_f);
-            if raw != clamped {
+            let sum = current + incr_float;
+            let overflow = sum.is_infinite();
+            let value = if overflow || sum > ubound_f || sum < lbound_f {
                 if !saturate {
                     return resp_array(vec![
                         resp_bulk_str(&format_increx_float(current)),
                         resp_bulk_str("0"),
                     ]);
                 }
-                (
-                    format_increx_float(clamped),
-                    format_increx_float(clamped - current),
-                )
+                if overflow {
+                    if incr_float >= 0.0 {
+                        ubound_f
+                    } else {
+                        lbound_f
+                    }
+                } else if sum > ubound_f {
+                    ubound_f
+                } else {
+                    lbound_f
+                }
             } else {
-                (format_increx_float(raw), format_increx_float(incr_float))
+                sum
+            };
+            let delta = value - current;
+            if delta.is_infinite() {
+                return resp_error("ERR applied increment would be Infinity");
             }
+            (format_increx_float(value), format_increx_float(delta))
         }
     };
-
-    map.insert(
-        Key::from(&*key),
-        KiviDBValue::String(SharedBytes::from(new_repr.as_bytes())),
-    );
-    drop(map); // release the value lock before touching expiry_store
-
-    // Expiry is applied only when the increment actually landed — the skip
-    // paths above returned early precisely so the TTL stays untouched.
-    match expiry {
-        IncrexExpiry::Keep => {}
-        IncrexExpiry::Persist => clear_expiry(ctx.expiry_store, *ctx.selected_db, &key),
-        IncrexExpiry::Set(at) => {
-            // ENX: only set a TTL when the key has none, so a window rate
-            // limiter creates a new window without extending a live one.
-            let has_ttl = {
-                let shard = get_expiry_shard(ctx.expiry_store, *ctx.selected_db, &key);
-                let m = read_lock!(shard);
-                m.contains_key(key.as_str())
-            };
-            if !(enx && has_ttl) {
-                set_expiry(ctx.expiry_store, *ctx.selected_db, &key, at);
-            }
-        }
-    }
-
-    notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "increx", &key);
-
-    match mode {
+    let reply = match mode {
         // Integer mode replies with RESP integers in both slots.
         IncrexMode::Int => resp_array(vec![
             resp_integer(new_repr.parse().unwrap_or(0)),
@@ -2284,7 +2267,75 @@ fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
         IncrexMode::Float => {
             resp_array(vec![resp_bulk_str(&new_repr), resp_bulk_str(&applied_repr)])
         }
+    };
+
+    // ENX: only set a TTL when the key has none, so a window rate limiter
+    // creates a new window without extending a live one.
+    let has_ttl = existed && {
+        let shard = get_expiry_shard(ctx.expiry_store, *ctx.selected_db, &key);
+        read_lock!(shard).contains_key(key.as_str())
+    };
+    let new_expiry = match expiry {
+        IncrexExpiry::Set(at) if !(enx && has_ttl) => Some(at),
+        _ => None,
+    };
+    let as_bytes = |s: &str| s.as_bytes().to_vec();
+
+    // A TTL already past: the key goes, and is propagated as DEL, or UNLINK
+    // with `lazyfree-lazy-expire` (Redis 8.10).
+    if let Some(at) = new_expiry
+        && at <= SystemTime::now()
+    {
+        if existed {
+            map.remove(key.as_str());
+            drop(map);
+            clear_expiry(ctx.expiry_store, *ctx.selected_db, &key);
+            let lazy = crate::commands::server::remembered_config("lazyfree-lazy-expire")
+                .is_some_and(|v| v.eq_ignore_ascii_case("yes"));
+            effect(vec![
+                as_bytes(if lazy { "UNLINK" } else { "DEL" }),
+                as_bytes(&key),
+            ]);
+            notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "del", &key);
+        }
+        crate::stats::record_expired();
+        return reply;
     }
+
+    map.insert(
+        Key::from(&*key),
+        KiviDBValue::String(SharedBytes::from(new_repr.as_bytes())),
+    );
+    drop(map); // release the value lock before touching expiry_store
+
+    // Propagated as a SET of the result, so float formatting cannot drift on
+    // replicas or an AOF replay, with the TTL as it now is (Redis 8.10).
+    let mut set = vec![as_bytes("SET"), as_bytes(&key), as_bytes(&new_repr)];
+    let mut persisted = false;
+    if persist {
+        persisted = has_ttl;
+        clear_expiry(ctx.expiry_store, *ctx.selected_db, &key);
+    } else if let Some(at) = new_expiry {
+        set_expiry(ctx.expiry_store, *ctx.selected_db, &key, at);
+        let ms = at.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
+        set.extend([as_bytes("PXAT"), as_bytes(&ms.to_string())]);
+    } else {
+        set.push(as_bytes("KEEPTTL"));
+    }
+    effect(set);
+
+    let event = match mode {
+        IncrexMode::Int => "incrby",
+        IncrexMode::Float => "incrbyfloat",
+    };
+    notify(ctx.pubsub, *ctx.selected_db, KS_STRING, event, &key);
+    if persisted {
+        notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "persist", &key);
+    }
+    if new_expiry.is_some() {
+        notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "expire", &key);
+    }
+    reply
 }
 
 /// Format a float the way Redis formats `INCRBYFLOAT` results: shortest

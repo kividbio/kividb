@@ -920,6 +920,26 @@ impl KiviDBValue {
         }
     }
 
+    /// Whether `self` and `other` are the very same value, not equal ones:
+    /// a value replaced whole is another value, one changed in place is not.
+    pub fn same_value(&self, other: &Self) -> bool {
+        use KiviDBValue::*;
+        match (self, other) {
+            (String(a), String(b)) => SharedBytes::ptr_eq(a, b),
+            (List(a), List(b)) => Arc::ptr_eq(a, b),
+            (Hash(a), Hash(b)) => Arc::ptr_eq(a, b),
+            (Json(a), Json(b)) => Arc::ptr_eq(a, b),
+            (Set(a), Set(b)) => Arc::ptr_eq(a, b),
+            (VectorSet(a), VectorSet(b)) => Arc::ptr_eq(a, b),
+            (SortedSet(a), SortedSet(b)) => Arc::ptr_eq(a, b),
+            (Stream(a), Stream(b)) => Arc::ptr_eq(a, b),
+            (TimeSeries(a), TimeSeries(b)) => Arc::ptr_eq(a, b),
+            (HashEx(a), HashEx(b)) => Arc::ptr_eq(a, b),
+            (Array(a), Array(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
     pub fn type_name(&self) -> &'static str {
         match self {
             KiviDBValue::String(_) => "string",
