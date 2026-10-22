@@ -88,6 +88,15 @@ written against an earlier KiviDB may notice them.
 
 ### Fixed
 
+- **Packages: the service is enabled and started whenever the package
+  brings the unit.** An upgrade from the 1.1.0 `.deb`/`.rpm`, which had no
+  unit, installed it but left it disabled and stopped (the upgrade branch
+  only restarts a running service). On Debian, an install after
+  `apt remove` (without purge) did the same. The package now looks before
+  unpacking: if its unit is not on disk yet it is enabled and started;
+  otherwise an upgrade restarts it, and a unit the administrator disabled
+  stays disabled.
+
 - **`error()` given a table is reported by its `err`.**
   `error({err = 'ERR ...'})` and `error(redis.error_reply(...))` replied
   `ERR user_script:1: table: 0x... script:`; they reply with the message,
