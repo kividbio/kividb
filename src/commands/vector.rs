@@ -412,6 +412,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // `cluster::search`.
     let cluster = ctx.cluster.enabled.then_some(ctx.cluster);
     let mut timed_out = false;
+    let mut seen = 0u32;
 
     'shards: for shard in db_ref.iter() {
         #[cfg(target_os = "linux")]
@@ -420,7 +421,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
         let map = shard.read();
 
         for (key, value) in map.iter() {
-            if crate::commands::search::past_deadline(deadline) {
+            if crate::commands::search::deadline_due(deadline, &mut seen) {
                 timed_out = true;
                 break 'shards;
             }
@@ -485,26 +486,29 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     if crate::commands::search::past_deadline(deadline) {
         timed_out = true;
     }
-    if timed_out && crate::commands::search::on_timeout_fails() {
-        return Some(resp_error("Timeout limit was reached"));
-    }
 
     // ── The rest of the cluster ──────────────────────────────────────────────
-    // Asked by a coordinator: the rows as they are, every column. A
-    // coordinator: the rows of every other master too, before any step.
+    // Asked by a coordinator: the rows as they are, every column, and
+    // whether this scan ran out of time. A coordinator: the rows of every
+    // other master too, before any step, then `ON_TIMEOUT`.
     if crate::cluster::search::is_forwarded(ctx) {
-        return Some(crate::cluster::search::encode_rows(&rows));
+        return Some(crate::cluster::search::encode_rows(&rows, timed_out));
     }
     if crate::cluster::search::coordinates(ctx) {
         let owned: Vec<Vec<u8>> = cmd.iter().map(|a| a.to_vec()).collect();
         match crate::cluster::search::fan_out(ctx, &owned) {
             Ok(replies) => {
                 for reply in replies {
-                    rows.extend(crate::cluster::search::decode_rows(reply));
+                    let (more, shard_timed_out) = crate::cluster::search::decode_rows(reply);
+                    rows.extend(more);
+                    timed_out |= shard_timed_out;
                 }
             }
             Err(e) => return Some(resp_error(&e)),
         }
+    }
+    if timed_out && crate::commands::search::on_timeout_fails() {
+        return Some(resp_error("Timeout limit was reached"));
     }
 
     // ── Parse and execute pipeline clauses ────────────────────────────────────

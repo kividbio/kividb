@@ -651,6 +651,24 @@ pub(crate) fn past_deadline(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|d| Instant::now() >= d)
 }
 
+/// Documents between clock reads during a scan. A million-document query
+/// then pays a thousand reads, not a million.
+pub(crate) const DEADLINE_EVERY: u32 = 1024;
+
+/// True when `deadline` has passed, reading the clock every [`DEADLINE_EVERY`]
+/// documents. `seen` is how many have been looked at since the last read.
+pub(crate) fn deadline_due(deadline: Option<Instant>, seen: &mut u32) -> bool {
+    if deadline.is_none() {
+        return false;
+    }
+    *seen += 1;
+    if *seen < DEADLINE_EVERY {
+        return false;
+    }
+    *seen = 0;
+    past_deadline(deadline)
+}
+
 /// `ON_TIMEOUT fail` and `return_strict` error instead of returning what
 /// was found.
 pub(crate) fn on_timeout_fails() -> bool {
@@ -812,6 +830,7 @@ pub(crate) fn filter_search(
     let range = filter.vector_range();
     let mut out: Vec<Match> = Vec::new();
     let mut timed_out = false;
+    let mut seen = 0u32;
 
     let mut consider = |key: &str, fields: &Fields| {
         if !filter::eval(filter, fields) {
@@ -834,7 +853,7 @@ pub(crate) fn filter_search(
     match known {
         Some(keys) => {
             for key in &keys {
-                if past_deadline(deadline) {
+                if deadline_due(deadline, &mut seen) {
                     timed_out = true;
                     break;
                 }
@@ -848,7 +867,7 @@ pub(crate) fn filter_search(
             'shards: for shard in db.iter() {
                 let map = shard.read();
                 for (key, value) in map.iter() {
-                    if past_deadline(deadline) {
+                    if deadline_due(deadline, &mut seen) {
                         timed_out = true;
                         break 'shards;
                     }
@@ -1369,7 +1388,9 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 .collect()
         }
     };
-    if timed_out && on_timeout_fails() {
+    // A shard answers with what it found and whether it timed out; the
+    // coordinator applies `ON_TIMEOUT`.
+    if timed_out && !shard && on_timeout_fails() {
         return Err("Timeout limit was reached".into());
     }
 
@@ -1512,9 +1533,12 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
             },
         })
         .collect();
-    Ok(encode_page(
-        ctx.resp, &page, total, &args, nocontent, timed_out,
-    ))
+    let page = encode_page(ctx.resp, &page, total, &args, nocontent, timed_out);
+    if shard {
+        Ok(crate::cluster::search::encode_search(page, timed_out))
+    } else {
+        Ok(page)
+    }
 }
 
 /// A hit of the page, with what is shown of it.
@@ -1683,7 +1707,10 @@ fn coordinate(
     use crate::cluster::search::Reply;
     let mut total = 0usize;
     let mut hits: Vec<PageHit> = Vec::new();
+    let mut timed_out = false;
     for reply in replies {
+        let (reply, shard_timed_out) = crate::cluster::search::decode_search(reply)?;
+        timed_out |= shard_timed_out;
         let Reply::Array(items) = reply else {
             return Err("ERR a master answered the search with something else".into());
         };
@@ -1770,7 +1797,12 @@ fn coordinate(
         .skip(args.offset)
         .take(args.count)
         .collect();
-    Ok(encode_page(ctx.resp, &page, total, args, nocontent, false))
+    if timed_out && on_timeout_fails() {
+        return Err("Timeout limit was reached".into());
+    }
+    Ok(encode_page(
+        ctx.resp, &page, total, args, nocontent, timed_out,
+    ))
 }
 
 #[cfg(test)]
@@ -2020,5 +2052,16 @@ mod tests {
         assert!(!past_deadline(None));
         assert!(search_deadline(Some(0)).is_none());
         assert!(search_deadline(Some(50)).is_some());
+    }
+
+    #[test]
+    fn the_clock_is_read_every_1024_documents() {
+        let deadline = Some(Instant::now() - Duration::from_secs(1));
+        let mut seen = 0u32;
+        for _ in 0..DEADLINE_EVERY - 1 {
+            assert!(!deadline_due(deadline, &mut seen));
+        }
+        assert!(deadline_due(deadline, &mut seen));
+        assert!(!deadline_due(None, &mut 0u32));
     }
 }

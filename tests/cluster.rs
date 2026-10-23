@@ -26,6 +26,7 @@ enum Resp {
     Int(i64),
     Bulk(Vec<u8>),
     Array(Vec<Resp>),
+    Map(Vec<(Resp, Resp)>),
     Nil,
 }
 
@@ -48,6 +49,12 @@ impl Resp {
         match self {
             Resp::Array(v) => v,
             other => panic!("not an array: {other:?}"),
+        }
+    }
+    fn map(&self) -> &[(Resp, Resp)] {
+        match self {
+            Resp::Map(v) => v,
+            other => panic!("not a map: {other:?}"),
         }
     }
     fn is_ok(&self) -> bool {
@@ -118,6 +125,25 @@ impl Conn {
             .unwrap_or_else(|e| panic!("{args:?} failed: {e}"))
     }
 
+    /// Several commands in one write, so a timeout test can fill an index
+    /// without a round trip per document.
+    fn pipeline(&mut self, commands: &[Vec<&str>]) -> Vec<Resp> {
+        let mut buf = Vec::new();
+        for args in commands {
+            buf.extend(format!("*{}\r\n", args.len()).into_bytes());
+            for a in args {
+                buf.extend(format!("${}\r\n", a.len()).as_bytes());
+                buf.extend(a.as_bytes());
+                buf.extend(b"\r\n");
+            }
+        }
+        self.stream.write_all(&buf).unwrap();
+        commands
+            .iter()
+            .map(|_| self.read().unwrap_or_else(|e| panic!("pipeline: {e}")))
+            .collect()
+    }
+
     fn read(&mut self) -> std::io::Result<Resp> {
         let mut line = String::new();
         if self.reader.read_line(&mut line)? == 0 {
@@ -152,6 +178,16 @@ impl Conn {
                     Resp::Array(items)
                 }
             }
+            "%" => {
+                let n: i64 = rest.parse().unwrap();
+                let mut pairs = Vec::with_capacity(n.max(0) as usize);
+                for _ in 0..n.max(0) {
+                    pairs.push((self.read()?, self.read()?));
+                }
+                Resp::Map(pairs)
+            }
+            "," => Resp::Simple(rest.to_string()),
+            "_" => Resp::Nil,
             other => panic!("unexpected RESP type {other:?} in {line:?}"),
         })
     }
@@ -2597,4 +2633,111 @@ fn nodes_talk_to_each_other_as_masteruser_with_default_limited() {
     );
     let found = admin(&nodes[3]).cmd(&["FT.SEARCH", "docs", "hello", "NOCONTENT"]);
     assert_eq!(found.array()[0].int(), 3, "{found:?}");
+}
+
+/// A shard that runs out of time tells the coordinator, which applies
+/// `ON_TIMEOUT`: `fail` is an error, `return` a partial reply. RESP3 puts
+/// the warning on the coordinator's reply; over RESP2 there is none.
+#[test]
+fn a_timed_out_search_is_reported_across_the_cluster() {
+    let (nodes, ranges) = form_cluster(3);
+    let owner = |key: &str| {
+        let slot = slot_of(key);
+        ranges
+            .iter()
+            .position(|(a, b)| (*a..=*b).contains(&slot))
+            .unwrap()
+    };
+    let r = nodes[0].conn().cmd(&[
+        "FT.CREATE",
+        "to",
+        "PREFIX",
+        "1",
+        "to:",
+        "SCHEMA",
+        "t",
+        "TEXT",
+    ]);
+    assert!(r.is_ok(), "{r:?}");
+
+    let insert = |start: usize, n: usize| {
+        let mut buckets: Vec<Vec<String>> = vec![Vec::new(); nodes.len()];
+        for i in start..start + n {
+            let key = format!("to:{i}");
+            let node = owner(&key);
+            buckets[node].push(key);
+        }
+        for (i, keys) in buckets.iter().enumerate() {
+            if keys.is_empty() {
+                continue;
+            }
+            let mut c = nodes[i].conn();
+            for chunk in keys.chunks(250) {
+                let cmds: Vec<Vec<&str>> = chunk
+                    .iter()
+                    .map(|k| vec!["HSET", k.as_str(), "t", "x"])
+                    .collect();
+                for r in c.pipeline(&cmds) {
+                    assert!(matches!(r, Resp::Int(_)), "{r:?}");
+                }
+            }
+        }
+    };
+
+    let warned = |reply: &Resp| {
+        reply.map().iter().any(|(k, v)| {
+            k.text() == "warning"
+                && v.array()
+                    .iter()
+                    .any(|w| w.text().contains("Timeout limit was reached"))
+        })
+    };
+
+    let mut n = 0usize;
+    let mut timed_out = false;
+    while n < 80_000 {
+        insert(n, 8_000);
+        n += 8_000;
+        let mut c = nodes[0].conn();
+        let hello = c.cmd(&["HELLO", "3"]);
+        assert!(matches!(hello, Resp::Map(_)), "{hello:?}");
+        let reply = c.cmd(&["FT.SEARCH", "to", "*", "NOCONTENT", "TIMEOUT", "1"]);
+        if warned(&reply) {
+            timed_out = true;
+            break;
+        }
+    }
+    assert!(
+        timed_out,
+        "TIMEOUT 1 still finished after {n} documents across the cluster"
+    );
+
+    let mut c = nodes[1].conn();
+    assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "fail"]).is_ok());
+    let failed = c.cmd(&["FT.SEARCH", "to", "*", "TIMEOUT", "1"]);
+    assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "return"]).is_ok());
+    assert!(
+        failed
+            .err()
+            .is_some_and(|e| e.contains("Timeout limit was reached")),
+        "{failed:?}"
+    );
+
+    assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "fail"]).is_ok());
+    let failed = c.cmd(&["FT.AGGREGATE", "to", "*", "TIMEOUT", "1"]);
+    assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "return"]).is_ok());
+    assert!(
+        failed
+            .err()
+            .is_some_and(|e| e.contains("Timeout limit was reached")),
+        "{failed:?}"
+    );
+
+    let mut c = nodes[2].conn();
+    let hello = c.cmd(&["HELLO", "3"]);
+    assert!(matches!(hello, Resp::Map(_)), "{hello:?}");
+    let reply = c.cmd(&["FT.SEARCH", "to", "*", "NOCONTENT", "TIMEOUT", "1"]);
+    assert!(warned(&reply), "{reply:?}");
+    let reply = c.cmd(&["FT.AGGREGATE", "to", "*", "TIMEOUT", "1"]);
+    assert!(warned(&reply), "{reply:?}");
 }

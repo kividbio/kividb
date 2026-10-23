@@ -2561,4 +2561,10 @@ fn a_query_is_cut_short_when_it_runs_out_of_time() {
 
     let reply = c.cmd(&["FT.AGGREGATE", "to", "*", "TIMEOUT", "1"]);
     assert!(warned(&reply), "{reply:?}");
+
+    // Over RESP2 the same timeout is silent: a partial array, no error.
+    let _ = c.cmd(&["HELLO", "2"]);
+    let reply = c.cmd(&["FT.SEARCH", "to", "*", "NOCONTENT", "TIMEOUT", "1"]);
+    assert!(!matches!(reply, V::Err(_)), "{reply:?}");
+    assert!(matches!(reply, V::Arr(_)), "{reply:?}");
 }

@@ -12,12 +12,14 @@
 //   FT.SEARCH     each master is asked for the first offset+count matches,
 //                 with their scores and sort keys; the coordinator orders
 //                 them all as one node would, and takes the page asked for.
-//                 The total is the sum of the masters' totals.
+//                 The total is the sum of the masters' totals. A master's
+//                 reply says whether its scan ran out of time; the
+//                 coordinator ORs those flags and applies ON_TIMEOUT.
 //   FT.AGGREGATE  each master sends the rows that match the query, before
-//                 any step; the coordinator runs the steps (GROUPBY, REDUCE,
-//                 APPLY, FILTER, SORTBY, LIMIT) over all of them, so every
-//                 reducer is exact. WITHCURSOR keeps the cursor on the
-//                 coordinator.
+//                 any step, and whether it timed out; the coordinator runs
+//                 the steps (GROUPBY, REDUCE, APPLY, FILTER, SORTBY, LIMIT)
+//                 over all of them, so every reducer is exact, then applies
+//                 ON_TIMEOUT. WITHCURSOR keeps the cursor on the coordinator.
 //
 // Relevance (BM25) is computed by each master over its own documents, as in
 // RediSearch's coordinator. A node answers only for the slots it serves, so
@@ -294,11 +296,35 @@ pub fn fan_out(ctx: &crate::commands::ctx::Ctx, cmd: &[Vec<u8>]) -> Result<Vec<R
     }
 }
 
+/// A master's FT.SEARCH reply to its coordinator: the RESP2 page, then
+/// whether that master's scan ran out of time.
+pub fn encode_search(page: Vec<u8>, timed_out: bool) -> Vec<u8> {
+    use crate::resp::write::{resp_array, resp_integer};
+    resp_array(vec![page, resp_integer(i64::from(timed_out))])
+}
+
+/// The page and timeout flag in a master's reply to [`encode_search`].
+pub fn decode_search(reply: Reply) -> Result<(Reply, bool), String> {
+    match reply {
+        Reply::Array(mut items) if items.len() == 2 => {
+            let timed_out = match items.get(1) {
+                Some(Reply::Int(n)) => *n != 0,
+                _ => {
+                    return Err("ERR a master answered the search with something else".into());
+                }
+            };
+            Ok((items.remove(0), timed_out))
+        }
+        _ => Err("ERR a master answered the search with something else".into()),
+    }
+}
+
 /// The rows of an aggregation, as a master sends them to its coordinator:
-/// every column of every row.
-pub fn encode_rows(rows: &[ahash::AHashMap<String, String>]) -> Vec<u8> {
-    use crate::resp::write::{resp_array, resp_bulk_str};
-    resp_array(
+/// every column of every row, then whether that master's scan ran out of
+/// time.
+pub fn encode_rows(rows: &[ahash::AHashMap<String, String>], timed_out: bool) -> Vec<u8> {
+    use crate::resp::write::{resp_array, resp_bulk_str, resp_integer};
+    let body = resp_array(
         rows.iter()
             .map(|row| {
                 resp_array(
@@ -308,25 +334,35 @@ pub fn encode_rows(rows: &[ahash::AHashMap<String, String>]) -> Vec<u8> {
                 )
             })
             .collect(),
-    )
+    );
+    resp_array(vec![body, resp_integer(i64::from(timed_out))])
 }
 
-/// The rows in a master's reply to [`encode_rows`].
-pub fn decode_rows(reply: Reply) -> Vec<ahash::AHashMap<String, String>> {
-    let Reply::Array(rows) = reply else {
-        return Vec::new();
+/// The rows and timeout flag in a master's reply to [`encode_rows`].
+pub fn decode_rows(reply: Reply) -> (Vec<ahash::AHashMap<String, String>>, bool) {
+    let Reply::Array(mut wrap) = reply else {
+        return (Vec::new(), false);
     };
-    rows.into_iter()
-        .filter_map(|row| match row {
-            Reply::Array(cells) => Some(
-                cells
-                    .chunks(2)
-                    .filter_map(|pair| Some((pair.first()?.text()?, pair.get(1)?.text()?)))
-                    .collect(),
-            ),
-            _ => None,
-        })
-        .collect()
+    let timed_out = match wrap.as_slice() {
+        [_, Reply::Int(n)] => *n != 0,
+        _ => return (Vec::new(), false),
+    };
+    let rows = match wrap.remove(0) {
+        Reply::Array(rows) => rows
+            .into_iter()
+            .filter_map(|row| match row {
+                Reply::Array(cells) => Some(
+                    cells
+                        .chunks(2)
+                        .filter_map(|pair| Some((pair.first()?.text()?, pair.get(1)?.text()?)))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    (rows, timed_out)
 }
 
 #[cfg(test)]
@@ -343,7 +379,20 @@ mod tests {
         let mut row = ahash::AHashMap::new();
         row.insert("__key".to_string(), "doc:1".to_string());
         row.insert("price".to_string(), "10".to_string());
-        let back = decode_rows(parse_reply(&encode_rows(&[row.clone()])).unwrap());
-        assert_eq!(back, vec![row]);
+        let (back, timed_out) =
+            decode_rows(parse_reply(&encode_rows(&[row.clone()], false)).unwrap());
+        assert_eq!(back, vec![row.clone()]);
+        assert!(!timed_out);
+
+        let (empty, timed_out) = decode_rows(parse_reply(&encode_rows(&[], true)).unwrap());
+        assert!(empty.is_empty());
+        assert!(timed_out);
+
+        let page = crate::resp::write::resp_array(vec![crate::resp::write::resp_integer(2)]);
+        let (inner, timed_out) =
+            decode_search(parse_reply(&encode_search(page, true)).unwrap()).unwrap();
+        assert!(timed_out);
+        let Reply::Array(items) = inner else { panic!() };
+        assert!(matches!(items[0], Reply::Int(2)));
     }
 }
