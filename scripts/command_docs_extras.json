@@ -1,0 +1,90 @@
+{
+    "GEODELBYMEMBER": {
+        "summary": "Remove geospatial members",
+        "complexity": "O(N) where N is the number of members to remove.",
+        "group": "geo",
+        "since": "1.0.0",
+        "arity": -3,
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "member",
+                "type": "string",
+                "multiple": true
+            }
+        ]
+    },
+    "TS.QUERYLABELS": {
+        "summary": "The label names in use, or the values of one label, across the series matching the filters",
+        "complexity": "O(N) where N is the number of time series that match the filters.",
+        "group": "timeseries",
+        "since": "8.10.0",
+        "arity": -2,
+        "arguments": [
+            {
+                "name": "query",
+                "type": "oneof",
+                "arguments": [
+                    {
+                        "name": "labels",
+                        "type": "pure-token",
+                        "token": "LABELS"
+                    },
+                    {
+                        "name": "values",
+                        "type": "block",
+                        "token": "VALUES",
+                        "arguments": [
+                            {
+                                "name": "label",
+                                "type": "string"
+                            }
+                        ]
+                    }
+                ]
+            },
+            {
+                "name": "filter",
+                "type": "block",
+                "optional": true,
+                "token": "FILTER",
+                "arguments": [
+                    {
+                        "name": "filter-expr",
+                        "type": "string",
+                        "multiple": true
+                    }
+                ]
+            }
+        ]
+    },
+    "FT.DEBUG": {
+        "summary": "A container for search-engine debug commands.",
+        "complexity": "Depends on subcommand.",
+        "group": "search",
+        "since": "2.0.0",
+        "arity": -2
+    },
+    "COMPACT": {
+        "container": "FT.DEBUG",
+        "summary": "Force HNSW compaction for a vector field",
+        "complexity": "O(N) where N is the number of vectors in the field.",
+        "group": "search",
+        "since": "2.0.0",
+        "arity": 4,
+        "arguments": [
+            {
+                "name": "index",
+                "type": "string"
+            },
+            {
+                "name": "field",
+                "type": "string"
+            }
+        ]
+    }
+}

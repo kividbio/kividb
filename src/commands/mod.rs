@@ -6,6 +6,8 @@ pub(crate) mod backup;
 mod bitmap;
 pub mod blocking;
 mod cluster;
+mod command_docs;
+mod command_docs_table;
 mod connection;
 pub mod ctx;
 mod debug_cmd;
