@@ -3740,9 +3740,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     }
                     "DOCS" => {
                         // redis-cli sends COMMAND DOCS on connect and uses
-                        // the summaries for HELP. An empty array used to be
-                        // enough for the client to start; the fields it
-                        // reads are filled in now.
+                        // the summaries for HELP and the arguments for the
+                        // typing hint. An empty array used to be enough for
+                        // the client to start; the fields it reads are
+                        // filled in now.
                         let resp = crate::commands::handler::effective_resp_for_reply(ctx);
                         return Some(super::command_docs::reply(resp, &cmd[2..], ALL_COMMANDS));
                     }

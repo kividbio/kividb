@@ -868,7 +868,7 @@ Shard channel message (SSUBSCRIBE / SPUBLISH):
 | `COMMAND LIST` | `COMMAND LIST [FILTERBY MODULE module \| ACLCAT category \| PATTERN pattern]` | Return all command names; optionally filter by module (always empty), ACL category, or glob pattern |
 | `COMMAND GETKEYS` | `COMMAND GETKEYS command [arg ...]` | Return the key names from a command invocation |
 | `COMMAND GETKEYSANDFLAGS` | `COMMAND GETKEYSANDFLAGS command [arg ...]` | Return key names with read/write flags per key |
-| `COMMAND DOCS` | `COMMAND DOCS [command ...]` | Documentation for the named commands, or for every command when none are named: each entry is a map of `summary`, `since`, `group` and `complexity`. A name that is not a command is omitted. RESP2 uses a flat array of those pairs; RESP3 a map. `COMMAND` / `COMMAND INFO` still carry arity and key positions |
+| `COMMAND DOCS` | `COMMAND DOCS [command ...]` | Documentation for the named commands, or for every command when none are named: each entry is a map of `summary`, `since`, `group`, `complexity`, `history`, `doc_flags` and `arguments` (plus `deprecated_since` / `replaced_by` when Redis has them). A name that is not a command is omitted. RESP2 uses a flat array of those pairs; RESP3 a map. `COMMAND` / `COMMAND INFO` still carry arity and key positions |
 | `COMMAND INFO` | `COMMAND INFO [command ...]` | The same entries for the named commands (nil for a name that is not a command), or for all of them |
 
 ---
