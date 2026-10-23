@@ -5,6 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`COMMAND DOCS` returns documentation.** It used to answer with an empty
+  array so redis-cli could still connect. It now replies, for each named
+  command (or every command when none are named), with `summary`, `since`,
+  `group`, `complexity`, `history`, `doc_flags` and `arguments`, taken from
+  Redis 8.10.2's command JSON. A name that is not a command is omitted, as
+  Redis omits it. Arity and key positions stay on `COMMAND` / `COMMAND INFO`.
+
 ## [1.1.2]
 
 A patch release of 1.1.0. It replaces 1.1.1, which was withdrawn.

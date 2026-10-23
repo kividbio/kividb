@@ -977,6 +977,86 @@ fn test_command_list_filterby_aclcat() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// COMMAND DOCS
+// ═════════════════════════════════════════════════════════════════════════════
+
+fn docs_field<'a>(docs: &'a RespValue, name: &str) -> &'a str {
+    let arr = docs.as_array();
+    for pair in arr.chunks(2) {
+        if pair[0].as_str() == name {
+            return pair[1].as_str();
+        }
+    }
+    panic!("COMMAND DOCS entry has no {name}: {docs:?}");
+}
+
+// COMMAND DOCS GET names the command and gives summary, group, complexity, since.
+#[test]
+fn test_command_docs_get() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "DOCS", "GET"]);
+    let arr = result.as_array();
+    assert_eq!(arr.len(), 2, "{result:?}");
+    assert_eq!(arr[0].as_str(), "get");
+    assert_eq!(docs_field(&arr[1], "summary"), "Get the value of a key");
+    assert_eq!(docs_field(&arr[1], "group"), "string");
+    assert_eq!(docs_field(&arr[1], "complexity"), "O(1)");
+    assert!(!docs_field(&arr[1], "since").is_empty());
+}
+
+// Names are case-insensitive, and several names come back in the order asked.
+#[test]
+fn test_command_docs_several_names() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "DOCS", "ft.search", "SET"]);
+    let arr = result.as_array();
+    assert_eq!(arr.len(), 4, "{result:?}");
+    assert_eq!(arr[0].as_str(), "ft.search");
+    assert_eq!(docs_field(&arr[1], "group"), "search");
+    assert_eq!(arr[2].as_str(), "set");
+    assert_eq!(docs_field(&arr[3], "group"), "string");
+}
+
+// A name that is not a command is omitted, not nil.
+#[test]
+fn test_command_docs_unknown_name_is_omitted() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "DOCS", "nosuch", "PING"]);
+    let arr = result.as_array();
+    assert_eq!(arr.len(), 2, "{result:?}");
+    assert_eq!(arr[0].as_str(), "ping");
+    assert_eq!(docs_field(&arr[1], "group"), "connection");
+}
+
+// With no names, every command is documented, including GET.
+#[test]
+fn test_command_docs_all_includes_get() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "DOCS"]);
+    let arr = result.as_array();
+    assert!(
+        arr.len() >= 2 && arr.len().is_multiple_of(2),
+        "len {}",
+        arr.len()
+    );
+    let names: Vec<&str> = arr.iter().step_by(2).map(|v| v.as_str()).collect();
+    assert!(names.contains(&"get"), "{names:?}");
+    assert!(names.contains(&"ft.search"), "{names:?}");
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // COMMAND GETKEYS
 // ═════════════════════════════════════════════════════════════════════════════
 
