@@ -136,3 +136,4 @@ Client libraries raise them as exceptions; the first word is the code.
 | `IOERR …` | `MIGRATE` could not reach, write to or read from the target. | Check the target's address and that it is up. |
 | `ERR DUMP payload version or checksum are wrong` | `RESTORE` of a payload that is damaged, or from a version whose format this one does not read. | Re-export the key. |
 | `INVALIDOBJ Corrupted HLL object detected` | A HyperLogLog key holds bytes that are not a valid HLL. | Delete it and rebuild it. |
+| `Timeout limit was reached` | `FT.SEARCH` or `FT.AGGREGATE` ran longer than `TIMEOUT` (the command's, or `FT.CONFIG TIMEOUT`, 500 ms) and `ON_TIMEOUT` is `fail` or `return_strict`. With `return` (the default), the reply is what was found instead — RESP3 puts this text in `warning`; over RESP2 the client gets no signal. | Raise `TIMEOUT`, pass `TIMEOUT 0` for no limit, or set `ON_TIMEOUT return`. |

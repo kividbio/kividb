@@ -5,6 +5,7 @@
 
 use ahash::{AHashMap, AHashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::commands::ctx::Ctx;
 use crate::resp::write::*;
@@ -626,6 +627,54 @@ pub(crate) struct Match {
     pub distance: Option<f32>,
 }
 
+/// Documents a filter accepted, and whether the scan stopped because the
+/// query's timeout ran out.
+pub(crate) struct FilterHits {
+    pub matches: Vec<Match>,
+    pub timed_out: bool,
+}
+
+/// When the query must stop. `timeout_ms` is the command's `TIMEOUT`, or
+/// the engine's `FT.CONFIG TIMEOUT` when the command did not name one. `0`
+/// is no limit.
+pub(crate) fn search_deadline(timeout_ms: Option<u64>) -> Option<Instant> {
+    let ms =
+        timeout_ms.unwrap_or_else(|| crate::commands::search_tools::config_number("TIMEOUT", 500));
+    if ms == 0 {
+        None
+    } else {
+        Some(Instant::now() + Duration::from_millis(ms))
+    }
+}
+
+pub(crate) fn past_deadline(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|d| Instant::now() >= d)
+}
+
+/// Documents between clock reads during a scan. A million-document query
+/// then pays a thousand reads, not a million.
+pub(crate) const DEADLINE_EVERY: u32 = 1024;
+
+/// True when `deadline` has passed, reading the clock every [`DEADLINE_EVERY`]
+/// documents. `seen` is how many have been looked at since the last read.
+pub(crate) fn deadline_due(deadline: Option<Instant>, seen: &mut u32) -> bool {
+    if deadline.is_none() {
+        return false;
+    }
+    *seen += 1;
+    if *seen < DEADLINE_EVERY {
+        return false;
+    }
+    *seen = 0;
+    past_deadline(deadline)
+}
+
+/// `ON_TIMEOUT fail` and `return_strict` error instead of returning what
+/// was found.
+pub(crate) fn on_timeout_fails() -> bool {
+    crate::commands::search_tools::on_timeout_fails()
+}
+
 /// The exact words a query looks for: what relevance is scored on, and what
 /// `HIGHLIGHT` marks.
 pub(crate) fn query_terms(filter: &Filter, out: &mut AHashSet<String>) {
@@ -767,18 +816,21 @@ pub(crate) fn relevance(def: &IndexDef, fields: &Fields, terms: &AHashSet<String
 }
 
 /// Every document of the index that the filter accepts. In no particular
-/// order.
+/// order. Stops when `deadline` has passed, and then `timed_out` is true.
 pub(crate) fn filter_search(
     ctx: &Ctx,
     def: &IndexDef,
     filter: &Filter,
     only: Option<&AHashSet<String>>,
-) -> Vec<Match> {
+    deadline: Option<Instant>,
+) -> FilterHits {
     let db = &ctx.store[*ctx.selected_db];
     let mut terms = AHashSet::new();
     query_terms(filter, &mut terms);
     let range = filter.vector_range();
     let mut out: Vec<Match> = Vec::new();
+    let mut timed_out = false;
+    let mut seen = 0u32;
 
     let mut consider = |key: &str, fields: &Fields| {
         if !filter::eval(filter, fields) {
@@ -801,6 +853,10 @@ pub(crate) fn filter_search(
     match known {
         Some(keys) => {
             for key in &keys {
+                if deadline_due(deadline, &mut seen) {
+                    timed_out = true;
+                    break;
+                }
                 if !covers(def, key) {
                     continue;
                 }
@@ -808,9 +864,13 @@ pub(crate) fn filter_search(
             }
         }
         None => {
-            for shard in db.iter() {
+            'shards: for shard in db.iter() {
                 let map = shard.read();
                 for (key, value) in map.iter() {
+                    if deadline_due(deadline, &mut seen) {
+                        timed_out = true;
+                        break 'shards;
+                    }
                     if !covers(def, key) {
                         continue;
                     }
@@ -821,7 +881,13 @@ pub(crate) fn filter_search(
             }
         }
     }
-    out
+    if !timed_out && past_deadline(deadline) {
+        timed_out = true;
+    }
+    FilterHits {
+        matches: out,
+        timed_out,
+    }
 }
 
 /// Run `f` on the document at `key`, if there is one of the kind the index
@@ -868,6 +934,8 @@ struct SearchArgs {
     inkeys: Option<AHashSet<String>>,
     /// `HIGHLIGHT`: the fields (empty: every TEXT field) and the two tags.
     highlight: Option<(Vec<String>, String, String)>,
+    /// Command `TIMEOUT` in milliseconds. `None` uses `FT.CONFIG TIMEOUT`.
+    timeout_ms: Option<u64>,
 }
 
 fn parse_search_args(cmd: &[&[u8]], start: usize) -> Result<SearchArgs, String> {
@@ -908,7 +976,14 @@ fn parse_search_args(cmd: &[&[u8]], start: usize) -> Result<SearchArgs, String> 
             // How words are expanded, and how phrases are held together:
             // none of it applies to an index without stemming or slop.
             "VERBATIM" | "NOSTOPWORDS" | "INORDER" => i += 1,
-            "SLOP" | "TIMEOUT" | "LANGUAGE" | "EXPANDER" | "PAYLOAD" => {
+            "TIMEOUT" => {
+                let raw = arg(i + 1, "TIMEOUT")?;
+                args.timeout_ms = Some(raw.parse::<u64>().map_err(|_| {
+                    "Bad arguments for TIMEOUT: expected a non-negative integer".to_string()
+                })?);
+                i += 2;
+            }
+            "SLOP" | "LANGUAGE" | "EXPANDER" | "PAYLOAD" => {
                 arg(i + 1, &word)?;
                 i += 2;
             }
@@ -1160,6 +1235,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
     let query_text =
         std::str::from_utf8(cmd[2]).map_err(|_| "The query must be valid UTF-8".to_string())?;
     let args = parse_search_args(cmd, 3)?;
+    let deadline = search_deadline(args.timeout_ms);
 
     let def = ctx
         .index_store
@@ -1218,6 +1294,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
     query_terms(&filter, &mut terms);
 
     // ── The matches, in the query's own order ────────────────────────────────
+    let mut timed_out = false;
     let mut hits: Vec<Hit> = match &query.knn {
         Some(knn) => {
             let field = def
@@ -1251,13 +1328,15 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
             } else {
                 // The filter first, then the nearest among what it left:
                 // exact, whatever the index type.
+                let found = filter_search(ctx, &def, &filter, args.inkeys.as_ref(), deadline);
+                timed_out = found.timed_out;
                 let allowed: std::collections::HashSet<String> =
-                    filter_search(ctx, &def, &filter, args.inkeys.as_ref())
-                        .into_iter()
-                        .map(|m| m.key)
-                        .collect();
+                    found.matches.into_iter().map(|m| m.key).collect();
                 crate::commands::vector::knn_filtered(live, &knn.vector, knn.k, metric, &allowed)
             };
+            if past_deadline(deadline) {
+                timed_out = true;
+            }
             nearest
                 .into_iter()
                 .map(|found| Hit {
@@ -1274,7 +1353,9 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 _ => None,
             };
             let by_distance = filter.vector_range().is_some() && !filter.has_text();
-            let mut matches = filter_search(ctx, &def, &filter, args.inkeys.as_ref());
+            let found = filter_search(ctx, &def, &filter, args.inkeys.as_ref(), deadline);
+            timed_out = found.timed_out;
+            let mut matches = found.matches;
             if by_distance {
                 // Nearest first.
                 matches.sort_by(|a, b| {
@@ -1290,7 +1371,6 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
             matches
                 .into_iter()
                 .map(|found| Hit {
-                    key: found.key,
                     // For a coordinator, what this node's order is by.
                     score: match found.distance {
                         Some(distance) if shard && by_distance => f64::from(distance),
@@ -1302,11 +1382,17 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                         }
                         _ => Vec::new(),
                     },
+                    key: found.key,
                     sort_key: None,
                 })
                 .collect()
         }
     };
+    // A shard answers with what it found and whether it timed out; the
+    // coordinator applies `ON_TIMEOUT`.
+    if timed_out && !shard && on_timeout_fails() {
+        return Err("Timeout limit was reached".into());
+    }
 
     // In a cluster, only the keys of the slots this node serves: a key part
     // of the way through a migration is not counted twice.
@@ -1447,7 +1533,12 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
             },
         })
         .collect();
-    Ok(encode_page(ctx.resp, &page, total, &args, nocontent))
+    let page = encode_page(ctx.resp, &page, total, &args, nocontent, timed_out);
+    if shard {
+        Ok(crate::cluster::search::encode_search(page, timed_out))
+    } else {
+        Ok(page)
+    }
 }
 
 /// A hit of the page, with what is shown of it.
@@ -1465,6 +1556,7 @@ fn encode_page(
     total: usize,
     args: &SearchArgs,
     nocontent: bool,
+    timed_out: bool,
 ) -> Vec<u8> {
     let fields_of = |hit: &PageHit| hit.fields.clone();
     let sort_key_reply = |hit: &PageHit| match &hit.sort_key {
@@ -1514,7 +1606,11 @@ fn encode_page(
                 resp_bulk_str("total_results"),
                 resp_integer(total as i64),
                 resp_bulk_str("warning"),
-                resp_array(vec![]),
+                resp_array(if timed_out {
+                    vec![resp_bulk_str("Timeout limit was reached")]
+                } else {
+                    vec![]
+                }),
             ],
         );
     }
@@ -1611,7 +1707,10 @@ fn coordinate(
     use crate::cluster::search::Reply;
     let mut total = 0usize;
     let mut hits: Vec<PageHit> = Vec::new();
+    let mut timed_out = false;
     for reply in replies {
+        let (reply, shard_timed_out) = crate::cluster::search::decode_search(reply)?;
+        timed_out |= shard_timed_out;
         let Reply::Array(items) = reply else {
             return Err("ERR a master answered the search with something else".into());
         };
@@ -1698,7 +1797,12 @@ fn coordinate(
         .skip(args.offset)
         .take(args.count)
         .collect();
-    Ok(encode_page(ctx.resp, &page, total, args, nocontent))
+    if timed_out && on_timeout_fails() {
+        return Err("Timeout limit was reached".into());
+    }
+    Ok(encode_page(
+        ctx.resp, &page, total, args, nocontent, timed_out,
+    ))
 }
 
 #[cfg(test)]
@@ -1919,6 +2023,9 @@ mod tests {
         assert_eq!((args.offset, args.count), (5, 20));
         assert_eq!(args.params["p"], b"v");
         assert!(args.withscores && args.nocontent);
+        assert_eq!(parse(&["TIMEOUT", "50"]).unwrap().timeout_ms, Some(50));
+        assert_eq!(parse(&["TIMEOUT", "0"]).unwrap().timeout_ms, Some(0));
+        assert!(parse(&["TIMEOUT", "soon"]).is_err());
 
         for bad in [
             &["BOGUS"][..],
@@ -1937,5 +2044,24 @@ mod tests {
                 .unwrap_err()
                 .contains("Unknown argument `BOGUS`")
         );
+    }
+
+    #[test]
+    fn a_deadline_already_passed_is_past() {
+        assert!(past_deadline(Some(Instant::now() - Duration::from_secs(1))));
+        assert!(!past_deadline(None));
+        assert!(search_deadline(Some(0)).is_none());
+        assert!(search_deadline(Some(50)).is_some());
+    }
+
+    #[test]
+    fn the_clock_is_read_every_1024_documents() {
+        let deadline = Some(Instant::now() - Duration::from_secs(1));
+        let mut seen = 0u32;
+        for _ in 0..DEADLINE_EVERY - 1 {
+            assert!(!deadline_due(deadline, &mut seen));
+        }
+        assert!(deadline_due(deadline, &mut seen));
+        assert!(!deadline_due(None, &mut 0u32));
     }
 }

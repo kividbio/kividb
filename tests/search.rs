@@ -209,6 +209,63 @@ fn conn() -> Conn {
     Conn::connect(port())
 }
 
+/// A server of its own, so `FT.CONFIG SET ON_TIMEOUT` and a large insert do
+/// not share the process-wide index names of the other tests. `FT.CONFIG`
+/// itself is still process-wide; fail tests restore `ON_TIMEOUT` at once.
+fn own_conn() -> Conn {
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    thread::spawn(move || {
+        kividb::run_for_test(kividb::config::Config {
+            port,
+            bind: "127.0.0.1".to_string(),
+            threads: 2,
+            loglevel: "error".to_string(),
+            io_model: kividb::config::IoModel::Tokio,
+            configfile: "./kividb.conf".to_string(),
+            ..Default::default()
+        });
+    });
+    for _ in 0..200 {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return Conn::connect(port);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!("server on port {port} did not start");
+}
+
+/// `n` hashes `{prefix}{start}` …, pipelined so a timeout test can fill the
+/// index without a round trip per document.
+fn hset_many(c: &mut Conn, prefix: &str, start: usize, n: usize) {
+    const BATCH: usize = 250;
+    let mut i = 0;
+    while i < n {
+        let end = (i + BATCH).min(n);
+        let keys: Vec<String> = (start + i..start + end)
+            .map(|j| format!("{prefix}{j}"))
+            .collect();
+        let mut buf = Vec::new();
+        for key in &keys {
+            let args = ["HSET", key.as_str(), "t", "hello"];
+            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            for a in args {
+                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                buf.extend_from_slice(a.as_bytes());
+                buf.extend_from_slice(b"\r\n");
+            }
+        }
+        c.writer.write_all(&buf).unwrap();
+        for _ in 0..keys.len() {
+            assert!(matches!(c.read(), V::Int(_)), "HSET");
+        }
+        i = end;
+    }
+}
+
 fn vector(floats: &[f32]) -> Vec<u8> {
     floats.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
@@ -2404,4 +2461,110 @@ fn a_hash_with_a_field_ttl_is_still_a_document() {
     ]);
     assert_eq!(reply.i(), 1);
     assert_eq!(hose(&mut c), ["x1:4", "x1:6"]);
+}
+
+/// `TIMEOUT` was accepted as a skip-word; a value that is not a number is
+/// refused now that the argument is acted on.
+#[test]
+fn search_timeout_must_be_a_non_negative_integer() {
+    let mut c = conn();
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "tb1",
+            "PREFIX",
+            "1",
+            "tb1:",
+            "SCHEMA",
+            "t",
+            "TEXT",
+        ])
+        .ok()
+    );
+    assert!(
+        c.cmd(&["FT.SEARCH", "tb1", "*", "TIMEOUT", "soon"])
+            .err()
+            .contains("TIMEOUT")
+    );
+    assert!(
+        c.cmd(&["FT.AGGREGATE", "tb1", "*", "TIMEOUT", "soon"])
+            .err()
+            .contains("TIMEOUT")
+    );
+    assert!(c.cmd(&["FT.SEARCH", "tb1", "*", "TIMEOUT"]).is_err_reply());
+}
+
+/// `TIMEOUT` / `ON_TIMEOUT` cut a query short. Documents are loaded until a
+/// 1 ms RESP3 search reports the timeout warning: finishing every document
+/// just after the deadline still warns, so a count check alone is not enough.
+#[test]
+fn a_query_is_cut_short_when_it_runs_out_of_time() {
+    let mut c = own_conn();
+    assert!(matches!(c.cmd(&["HELLO", "3"]), V::Map(_)));
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "to",
+            "PREFIX",
+            "1",
+            "to:",
+            "SCHEMA",
+            "t",
+            "TEXT",
+        ])
+        .ok()
+    );
+
+    let warned = |reply: &V| {
+        reply
+            .get("warning")
+            .arr()
+            .iter()
+            .any(|w| w.s().contains("Timeout limit was reached"))
+    };
+
+    let mut n = 0usize;
+    let mut timed_out = false;
+    while n < 80_000 {
+        hset_many(&mut c, "to:", n, 8_000);
+        n += 8_000;
+        let reply = c.cmd(&["FT.SEARCH", "to", "*", "NOCONTENT", "TIMEOUT", "1"]);
+        if warned(&reply) {
+            timed_out = true;
+            break;
+        }
+    }
+    assert!(timed_out, "TIMEOUT 1 still finished after {n} documents");
+
+    let all = c.cmd(&["FT.SEARCH", "to", "*", "NOCONTENT", "TIMEOUT", "0"]);
+    assert_eq!(all.get("total_results").i(), n as i64, "{all:?}");
+    assert!(all.get("warning").arr().is_empty(), "{all:?}");
+
+    assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "fail"]).ok());
+    let failed = c.cmd(&["FT.SEARCH", "to", "*", "TIMEOUT", "1"]);
+    assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "return"]).ok());
+    assert!(
+        failed.err().contains("Timeout limit was reached"),
+        "{failed:?}"
+    );
+
+    assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "fail"]).ok());
+    let failed = c.cmd(&["FT.AGGREGATE", "to", "*", "TIMEOUT", "1"]);
+    assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "return"]).ok());
+    assert!(
+        failed.err().contains("Timeout limit was reached"),
+        "{failed:?}"
+    );
+
+    let reply = c.cmd(&["FT.SEARCH", "to", "*", "NOCONTENT", "TIMEOUT", "1"]);
+    assert!(warned(&reply), "{reply:?}");
+
+    let reply = c.cmd(&["FT.AGGREGATE", "to", "*", "TIMEOUT", "1"]);
+    assert!(warned(&reply), "{reply:?}");
+
+    // Over RESP2 the same timeout is silent: a partial array, no error.
+    let _ = c.cmd(&["HELLO", "2"]);
+    let reply = c.cmd(&["FT.SEARCH", "to", "*", "NOCONTENT", "TIMEOUT", "1"]);
+    assert!(!matches!(reply, V::Err(_)), "{reply:?}");
+    assert!(matches!(reply, V::Arr(_)), "{reply:?}");
 }
