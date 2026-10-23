@@ -333,7 +333,7 @@ Beyond the report:
 | Compact hash encoding | 8.10 | An internal memory optimisation with nothing a client can observe. `HIMPORT` works; hashes are stored as before. |
 | Stemming, including the Malay and Tagalog stemmers; phonetic matching | 8.10 / — | TEXT matches whole words, prefixes, suffixes, infixes and fuzzily. `NOSTEM` and `PHONETIC` are accepted in a schema and change nothing. A query for `running` does not find `run`. |
 | `GEO` and `GEOSHAPE` fields; `GEOFILTER`, `INFIELDS`, `EXPLAINSCORE` | — | Refused with an error rather than ignored. |
-| Query `TIMEOUT` / `ON_TIMEOUT`; `search-global-timeout` | 8.10 | The settings exist in `FT.CONFIG`; no query is cut short by them. |
+| `search-global-timeout` | 8.10 | Not implemented. Query `TIMEOUT` and `ON_TIMEOUT` cut a query short. |
 | `FT.HYBRID` shard ratio, `EXPLAINSCORE` | 8.10 | |
 | Per-iterator timings in `FT.PROFILE` | — | The times reported are the query's as a whole. |
 | Parse-batch metrics in `INFO` and `CLIENT LIST` | 8.8 | Not reported. |

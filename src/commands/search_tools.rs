@@ -29,12 +29,18 @@ fn is(arg: &[u8], word: &str) -> bool {
 /// One row of an aggregation, as it is shown: names and values, in order.
 pub(crate) type ShownRow = Vec<(String, String)>;
 
-/// The reply of an aggregation: `total`, then the rows.
-pub(crate) fn rows_reply(resp: u8, total: usize, rows: &[ShownRow]) -> Vec<u8> {
+/// The reply of an aggregation: `total`, then the rows. `timed_out` is
+/// whether the scan stopped because `TIMEOUT` ran out (`ON_TIMEOUT return`).
+pub(crate) fn rows_reply(resp: u8, total: usize, rows: &[ShownRow], timed_out: bool) -> Vec<u8> {
     let fields = |row: &ShownRow| -> Vec<Vec<u8>> {
         row.iter()
             .flat_map(|(name, value)| [resp_bulk_str(name), value_reply(value, resp)])
             .collect()
+    };
+    let warning = if timed_out {
+        vec![resp_bulk_str("Timeout limit was reached")]
+    } else {
+        vec![]
     };
     if resp == 3 {
         return resp_map_for(
@@ -63,7 +69,7 @@ pub(crate) fn rows_reply(resp: u8, total: usize, rows: &[ShownRow]) -> Vec<u8> {
                 resp_bulk_str("total_results"),
                 resp_integer(total as i64),
                 resp_bulk_str("warning"),
-                resp_array(vec![]),
+                resp_array(warning),
             ],
         );
     }
@@ -101,9 +107,9 @@ const MAX_CURSORS: usize = 1024;
 const DEFAULT_COUNT: usize = 1000;
 
 /// `[rows, cursor]`.
-fn cursor_reply(resp: u8, rows: &[ShownRow], cursor: u64) -> Vec<u8> {
+fn cursor_reply(resp: u8, rows: &[ShownRow], cursor: u64, timed_out: bool) -> Vec<u8> {
     resp_array(vec![
-        rows_reply(resp, rows.len(), rows),
+        rows_reply(resp, rows.len(), rows, timed_out),
         resp_integer(cursor as i64),
     ])
 }
@@ -151,11 +157,12 @@ pub(crate) fn open_cursor(
     rows: Vec<ShownRow>,
     count: usize,
     max_idle: Duration,
+    timed_out: bool,
 ) -> Vec<u8> {
     let mut rows: VecDeque<ShownRow> = rows.into();
     let first: Vec<ShownRow> = rows.drain(..count.min(rows.len())).collect();
     if rows.is_empty() {
-        return cursor_reply(resp, &first, 0);
+        return cursor_reply(resp, &first, 0, timed_out);
     }
     let mut cursors = CURSORS.lock();
     forget_idle(&mut cursors);
@@ -179,7 +186,7 @@ pub(crate) fn open_cursor(
             used: Instant::now(),
         },
     );
-    cursor_reply(resp, &first, id)
+    cursor_reply(resp, &first, id, timed_out)
 }
 
 /// `FT.CURSOR READ index cursor [COUNT n]` / `FT.CURSOR DEL index cursor`.
@@ -255,7 +262,12 @@ pub(crate) fn ft_cursor(ctx: &mut Ctx) -> Option<Vec<u8>> {
     if !left {
         cursors.remove(&id);
     }
-    Some(cursor_reply(ctx.resp, &rows, if left { id } else { 0 }))
+    Some(cursor_reply(
+        ctx.resp,
+        &rows,
+        if left { id } else { 0 },
+        false,
+    ))
 }
 
 // ── FT.CONFIG ─────────────────────────────────────────────────────────────────
@@ -269,12 +281,15 @@ static CONFIG: LazyLock<Mutex<Vec<(&'static str, String)>>> = LazyLock::new(|| {
         [
             // Acted on: the longest a cursor may sit unread.
             ("CURSOR_MAX_IDLE", "300000"),
+            // Acted on: a query longer than this many milliseconds is cut
+            // short (`ON_TIMEOUT` says whether that is an error or a
+            // partial reply). `0` is no limit.
+            ("TIMEOUT", "500"),
+            ("ON_TIMEOUT", "return"),
             // Acted on: the most results one FT.SEARCH may be asked for.
             ("MAXSEARCHRESULTS", "1000000"),
             ("MAXAGGREGATERESULTS", "unlimited"),
             ("DEFAULT_DIALECT", "1"),
-            ("TIMEOUT", "500"),
-            ("ON_TIMEOUT", "return"),
             ("MINPREFIX", "2"),
             ("MINSTEMLEN", "4"),
             ("MAXPREFIXEXPANSIONS", "200"),
@@ -307,6 +322,21 @@ pub(crate) fn config_number(name: &str, default: u64) -> u64 {
         .find(|(n, _)| *n == name)
         .and_then(|(_, value)| value.parse().ok())
         .unwrap_or(default)
+}
+
+/// `ON_TIMEOUT fail` and `return_strict` error when a query runs out of
+/// time, instead of returning what was found.
+pub(crate) fn on_timeout_fails() -> bool {
+    CONFIG
+        .lock()
+        .iter()
+        .find(|(n, _)| *n == "ON_TIMEOUT")
+        .is_some_and(|(_, value)| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "fail" | "return_strict"
+            )
+        })
 }
 
 /// Settings that hold something other than a non-negative number.
@@ -920,13 +950,21 @@ mod tests {
             rows.clone(),
             2,
             Duration::from_secs(60),
+            false,
         );
         // [[2, row, row], cursor]
         assert!(first.starts_with(b"*2\r\n*3\r\n:2\r\n"), "{first:?}");
         assert!(!first.ends_with(b":0\r\n"));
 
         // Everything in one go: no cursor is left open.
-        let all = open_cursor(2, "cursor-test-index", rows, 10, Duration::from_secs(60));
+        let all = open_cursor(
+            2,
+            "cursor-test-index",
+            rows,
+            10,
+            Duration::from_secs(60),
+            false,
+        );
         assert!(all.starts_with(b"*2\r\n*6\r\n:5\r\n"), "{all:?}");
         assert!(all.ends_with(b":0\r\n"));
     }

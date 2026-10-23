@@ -610,7 +610,8 @@ pub(crate) fn text_search(
 ) -> Result<Vec<(String, f64)>, String> {
     let parsed = crate::vector::filter::parse_query(query, params, def)?;
     let mut out: Vec<(String, f64)> =
-        crate::commands::search::filter_search(ctx, def, &parsed.filter, None)
+        crate::commands::search::filter_search(ctx, def, &parsed.filter, None, None)
+            .matches
             .into_iter()
             .map(|found| (found.key, found.score))
             .collect();

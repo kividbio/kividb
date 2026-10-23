@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0]
+
+### Added
+
+- **`FT.SEARCH` and `FT.AGGREGATE` honour `TIMEOUT`.** The command's
+  `TIMEOUT`, or `FT.CONFIG TIMEOUT` (500 ms) when none is given, cuts a
+  query short. `ON_TIMEOUT return` (the default) replies with what was
+  found; `total_results` is that partial count. Over RESP2 the client
+  gets no signal of the timeout; RESP3 puts `Timeout limit was reached`
+  in `warning`. `fail` and `return_strict` reply with that as an error.
+  `TIMEOUT 0` is no limit. `search-global-timeout` is still not
+  implemented.
+
 ## [1.1.2]
 
 A patch release of 1.1.0. It replaces 1.1.1, which was withdrawn.

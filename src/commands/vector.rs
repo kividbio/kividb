@@ -381,6 +381,26 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
         Ok(cursor) => cursor,
         Err(e) => return Some(resp_error(&e)),
     };
+    let mut timeout_ms = None;
+    let mut i = 3;
+    while i + 1 < cmd.len() {
+        if cmd[i].eq_ignore_ascii_case(b"TIMEOUT") {
+            match std::str::from_utf8(cmd[i + 1])
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                Some(ms) => timeout_ms = Some(ms),
+                None => {
+                    return Some(resp_error(
+                        "Bad arguments for TIMEOUT: expected a non-negative integer",
+                    ));
+                }
+            }
+            break;
+        }
+        i += 1;
+    }
+    let deadline = crate::commands::search::search_deadline(timeout_ms);
 
     // ── Stage 0: Collect all matching rows ────────────────────────────────────
     //
@@ -391,14 +411,19 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // In a cluster, only the keys of the slots this node serves: see
     // `cluster::search`.
     let cluster = ctx.cluster.enabled.then_some(ctx.cluster);
+    let mut timed_out = false;
 
-    for shard in db_ref.iter() {
+    'shards: for shard in db_ref.iter() {
         #[cfg(target_os = "linux")]
         let map = shard.read();
         #[cfg(not(target_os = "linux"))]
         let map = shard.read();
 
         for (key, value) in map.iter() {
+            if crate::commands::search::past_deadline(deadline) {
+                timed_out = true;
+                break 'shards;
+            }
             // ── Prefix check ─────────────────────────────────────────────
             let matches =
                 def.prefixes.is_empty() || def.prefixes.iter().any(|p| key.starts_with(p.as_str()));
@@ -456,6 +481,12 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
             rows.push(row);
         }
+    }
+    if crate::commands::search::past_deadline(deadline) {
+        timed_out = true;
+    }
+    if timed_out && crate::commands::search::on_timeout_fails() {
+        return Some(resp_error("Timeout limit was reached"));
     }
 
     // ── The rest of the cluster ──────────────────────────────────────────────
@@ -590,12 +621,14 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             rows_out,
             count,
             max_idle,
+            timed_out,
         ));
     }
     Some(crate::commands::search_tools::rows_reply(
         ctx.resp,
         rows_out.len(),
         &rows_out,
+        timed_out,
     ))
 }
 // ── format_f64 ────────────────────────────────────────────────────────────────
