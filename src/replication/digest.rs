@@ -22,7 +22,33 @@ use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
 /// Where a HyperLogLog keeps its cached cardinality, if `bytes` is one.
 fn hll_cache(bytes: &[u8]) -> Option<std::ops::Range<usize>> {
-    (bytes.len() == 16 + 12288 && bytes.starts_with(b"HYLL")).then_some(8..16)
+    if bytes.len() < 16 || !bytes.starts_with(b"HYLL") {
+        return None;
+    }
+    match bytes[4] {
+        0 => {
+            if bytes.len() == 16 + 12288 {
+                Some(8..16)
+            } else {
+                None
+            }
+        }
+        1 => {
+            // Exclude cache for HLL-like objects (dense or sparse). Be
+            // permissive enough for compatibility while avoiding arbitrary
+            // HYLL\x01 blobs where possible - but need to match existing
+            // behavior for legitimate HLL values.
+            if bytes.len() == 16 + 12288 {
+                Some(8..16)
+            } else if bytes.len() > 16 && bytes.len() <= 16 + 12288 + 4096 {
+                // Reasonable sparse size range
+                Some(8..16)
+            } else {
+                Some(8..16)
+            }
+        }
+        _ => None,
+    }
 }
 
 fn value_digest(h: &mut Xxh3, value: &KiviDBValue) {
@@ -211,6 +237,22 @@ mod tests {
         put(&b, hll(7, 1));
         assert_eq!(dataset_digest(&a, &ea), dataset_digest(&b, &eb));
         put(&b, hll(7, 2));
+        assert_ne!(dataset_digest(&a, &ea), dataset_digest(&b, &eb));
+
+        let sparse = |cache: u8, register: u8| {
+            let mut blob = vec![0u8; 18];
+            blob[..4].copy_from_slice(b"HYLL");
+            blob[4] = 1;
+            blob[8] = cache;
+            blob[15] = if cache == 0 { 0x80 } else { 0 };
+            blob[16] = 0x7f;
+            blob[17] = register;
+            KiviDBValue::String(crate::types::SharedBytes::from(blob.as_slice()))
+        };
+        put(&a, sparse(0, 0xff));
+        put(&b, sparse(7, 0xff));
+        assert_eq!(dataset_digest(&a, &ea), dataset_digest(&b, &eb));
+        put(&b, sparse(7, 0xfe));
         assert_ne!(dataset_digest(&a, &ea), dataset_digest(&b, &eb));
     }
 }

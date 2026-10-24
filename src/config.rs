@@ -424,6 +424,9 @@ pub struct Config {
     /// `cluster-slot-migration-write-pause-timeout`).
     #[arg(long, default_value_t = 10_000)]
     pub cluster_slot_migration_write_pause_timeout: u64,
+    /// HLL write format during rolling upgrade: "legacy" or "redis".
+    #[arg(long, default_value = "legacy")]
+    pub hll_write_format: String,
 }
 
 impl Default for Config {
@@ -505,6 +508,7 @@ impl Default for Config {
             preload_file: String::new(),
             cluster_slot_migration_handoff_max_lag_bytes: 1024 * 1024,
             cluster_slot_migration_write_pause_timeout: 10_000,
+            hll_write_format: "legacy".into(),
         }
     }
 }
@@ -615,6 +619,7 @@ impl Config {
             preload_file: String::new(),
             cluster_slot_migration_handoff_max_lag_bytes: 1024 * 1024,
             cluster_slot_migration_write_pause_timeout: 10_000,
+            hll_write_format: "legacy".into(),
         }
     }
 

@@ -784,6 +784,19 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                 )),
                 None => Some(resp_error("ERR argument must be a memory value")),
             },
+            "hll-write-format" => {
+                let v = value.to_ascii_lowercase();
+                if v != "legacy" && v != "redis" {
+                    return Some(resp_error(
+                        "ERR CONFIG SET failed (possibly related to argument 'hll-write-format') - argument(s) must be one of the following: legacy redis",
+                    ));
+                }
+                // store in remembered config for visibility
+                REMEMBERED_CONFIG.lock().insert(param.clone(), v.clone());
+                // also reflect in a process global? easier to just track via remembered and have ctx/config read? but Config is Arc; easier to put in a static
+                crate::commands::hyperloglog::set_hll_write_format(&v);
+                Some(resp_simple("OK"))
+            }
             // What a running Redis cannot be told either.
             "daemonize" | "databases" | "pidfile" | "logfile" | "log-format" | "unixsocket"
             | "supervised" | "io-threads" | "tcp-backlog" | "set-proc-title" | "appendfilename"
@@ -1008,6 +1021,10 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
         (
             "tracking-table-max-keys",
             ctx.tracking_table.max_keys().to_string(),
+        ),
+        (
+            "hll-write-format",
+            crate::commands::hyperloglog::get_hll_write_format(),
         ),
     ];
     for (name, value) in in_effect {
