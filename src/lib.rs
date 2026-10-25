@@ -8,6 +8,7 @@ pub mod cluster;
 pub mod cmdstats;
 pub mod command_gate;
 pub mod commands;
+pub mod compaction;
 pub mod config;
 pub mod eviction;
 pub mod field_expiry;
@@ -37,6 +38,7 @@ pub mod tag_locks;
 pub mod tracking;
 pub mod types;
 pub mod update_check;
+pub mod value_slab;
 pub mod vector;
 pub mod wait_table;
 pub mod watch;
@@ -70,6 +72,7 @@ pub fn run_for_test(config: config::Config) {
         crate::tag_locks::set_enabled(true);
     }
     crate::eviction::configure(&cfg);
+    crate::compaction::configure(&cfg);
     if let Err(e) = crate::node_tls::init(&cfg) {
         panic!("TLS between nodes: {e}");
     }
@@ -125,6 +128,7 @@ async fn server_tokio(
         pubsub.clone(),
         Arc::clone(&latency),
     );
+    crate::compaction::spawn(Arc::clone(&store));
     let watch_registry = crate::watch::new_watch_registry();
     crate::watch::register_for(&store, &watch_registry);
     let client_registry = crate::client_registry::new_client_registry();

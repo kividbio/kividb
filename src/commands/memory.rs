@@ -330,7 +330,10 @@ fn memory_stats() -> Vec<u8> {
     kv!("allocator_rss_bytes", "0");
     kv!("rss_overhead_ratio", "1.0");
     kv!("rss_overhead_bytes", "0");
-    kv!("active_defrag_running", "0");
+    kv!(
+        "active_defrag_running",
+        u8::from(crate::compaction::running()).to_string()
+    );
     kv!(
         "lazyfree_pending_objects",
         crate::lazyfree::pending_objects().to_string()

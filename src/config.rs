@@ -117,6 +117,27 @@ pub struct Config {
     #[arg(long, default_value_t = 1)]
     pub lfu_decay_time: u32,
 
+    /// Move string values off the slabs deletes have left sparse, so that
+    /// their memory goes back to the system (Redis `activedefrag`; see
+    /// `src/compaction.rs`). On unless switched off.
+    #[arg(long, default_value = "yes", value_parser = parse_yes_no, num_args = 1)]
+    pub activedefrag: bool,
+
+    /// Waste in the slabs under which active defrag does not start (Redis
+    /// `active-defrag-ignore-bytes`).
+    #[arg(long, default_value_t = 64 << 20)]
+    pub active_defrag_ignore_bytes: u64,
+
+    /// Waste, as a percentage of what is in the slabs, over which active
+    /// defrag starts (Redis `active-defrag-threshold-lower`).
+    #[arg(long, default_value_t = 20)]
+    pub active_defrag_threshold_lower: u32,
+
+    /// The most of one core active defrag uses, a percentage (Redis
+    /// `active-defrag-cycle-max`).
+    #[arg(long, default_value_t = 10)]
+    pub active_defrag_cycle_max: u32,
+
     /// Working directory: where `dump.kdb`, `appendonly.aof`, backups and
     /// `nodes.conf` live (Redis `dir`). Empty = the directory the server was
     /// started in.
@@ -461,6 +482,10 @@ impl Default for Config {
             lfu_log_factor: 10,
             key_access_tracking: false,
             lfu_decay_time: 1,
+            activedefrag: true,
+            active_defrag_ignore_bytes: 64 << 20,
+            active_defrag_threshold_lower: 20,
+            active_defrag_cycle_max: 10,
             dir: String::new(),
             loglevel: "info".into(),
             logfile: String::new(),
@@ -573,6 +598,10 @@ impl Config {
             lfu_log_factor: 10,
             key_access_tracking: false,
             lfu_decay_time: 1,
+            activedefrag: true,
+            active_defrag_ignore_bytes: 64 << 20,
+            active_defrag_threshold_lower: 20,
+            active_defrag_cycle_max: 10,
             dir: String::new(),
             loglevel: "warn".into(),
             logfile: String::new(),
@@ -863,6 +892,22 @@ impl Config {
         out.push_str(&format!("maxmemory-samples {}\n", self.maxmemory_samples));
         out.push_str(&format!("lfu-log-factor {}\n", self.lfu_log_factor));
         out.push_str(&format!("lfu-decay-time {}\n", self.lfu_decay_time));
+        out.push_str(&format!(
+            "activedefrag {}\n",
+            if self.activedefrag { "yes" } else { "no" }
+        ));
+        out.push_str(&format!(
+            "active-defrag-ignore-bytes {}\n",
+            self.active_defrag_ignore_bytes
+        ));
+        out.push_str(&format!(
+            "active-defrag-threshold-lower {}\n",
+            self.active_defrag_threshold_lower
+        ));
+        out.push_str(&format!(
+            "active-defrag-cycle-max {}\n",
+            self.active_defrag_cycle_max
+        ));
         out.push_str(&format!(
             "key-access-tracking {}\n",
             if self.key_access_tracking {
@@ -1485,6 +1530,14 @@ impl Config {
             }
             "lfu-log-factor" => set!(lfu_log_factor, number(key, one()?)?),
             "lfu-decay-time" => set!(lfu_decay_time, number(key, one()?)?),
+            "activedefrag" => set!(activedefrag, yes_no(key, one()?)?),
+            "active-defrag-ignore-bytes" => {
+                set!(active_defrag_ignore_bytes, parse_memory(key, one()?)?)
+            }
+            "active-defrag-threshold-lower" => {
+                set!(active_defrag_threshold_lower, number(key, one()?)?)
+            }
+            "active-defrag-cycle-max" => set!(active_defrag_cycle_max, number(key, one()?)?),
             "key-access-tracking" => set!(key_access_tracking, yes_no(key, one()?)?),
             // Tuning knobs for machinery KiviDB does not have, or does not
             // expose. They change nothing a client could observe.
