@@ -19,6 +19,7 @@ pub mod cluster;
 pub mod cmdstats;
 pub mod command_gate;
 mod commands;
+mod compaction;
 mod config;
 pub mod eviction;
 pub mod field_expiry;
@@ -50,6 +51,7 @@ pub mod tag_locks;
 pub mod tracking;
 pub mod types;
 mod update_check;
+mod value_slab;
 mod vector;
 pub mod wait_table;
 pub mod watch;
@@ -329,6 +331,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // commands are spared looking for a tag to wait on.
     tag_locks::set_enabled(cfg!(feature = "lua") && config.lua_parallel_scripts);
     eviction::configure(&config);
+    compaction::configure(&config);
     keyspace_events::KS_FLAGS.store(
         keyspace_events::parse_ks_flags(&config.notify_keyspace_events),
         std::sync::atomic::Ordering::Relaxed,
@@ -679,6 +682,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
         pubsub.clone(),
         Arc::clone(&latency),
     );
+    crate::compaction::spawn(Arc::clone(&store));
     if config.cluster_enabled {
         log_info!(
             "Cluster: Node ID        : {}",
@@ -1412,6 +1416,7 @@ async fn async_main_tokio(
         pubsub.clone(),
         Arc::clone(&latency),
     );
+    crate::compaction::spawn(Arc::clone(&store));
     let watch_registry = crate::watch::new_watch_registry();
     crate::watch::register_for(&store, &watch_registry);
     let client_registry = crate::client_registry::new_client_registry();

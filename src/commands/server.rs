@@ -393,6 +393,43 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                 }
                 Err(_) => Some(resp_error("ERR value is not an integer or out of range")),
             },
+            // Active defrag (#113): see src/compaction.rs.
+            "activedefrag" => match value.to_ascii_lowercase().as_str() {
+                "yes" | "no" => {
+                    crate::compaction::set_enabled(value.eq_ignore_ascii_case("yes"));
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument 'activedefrag') - argument must be 'yes' or 'no'",
+                )),
+            },
+            "active-defrag-ignore-bytes" => match memory_size(value) {
+                Some(bytes) => {
+                    crate::compaction::set_ignore_bytes(bytes as u64);
+                    Some(resp_simple("OK"))
+                }
+                None => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument 'active-defrag-ignore-bytes') - argument must be a memory value",
+                )),
+            },
+            "active-defrag-threshold-lower" => match value.parse::<u32>() {
+                Ok(percent) if percent <= 1000 => {
+                    crate::compaction::set_threshold_lower(percent);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument 'active-defrag-threshold-lower') - argument must be between 0 and 1000 inclusive",
+                )),
+            },
+            "active-defrag-cycle-max" => match value.parse::<u32>() {
+                Ok(percent) if (1..=99).contains(&percent) => {
+                    crate::compaction::set_cycle_max(percent);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument 'active-defrag-cycle-max') - argument must be between 1 and 99 inclusive",
+                )),
+            },
             "requirepass" => {
                 // Update the default user's password in acl_store — this is the
                 // authoritative source for authentication, not config.requirepass.
@@ -940,7 +977,6 @@ static REMEMBERED_CONFIG: std::sync::LazyLock<
             ("lazyfree-lazy-user-flush", "no"),
             ("lazyfree-lazy-expire", "yes"),
             ("lazyfree-lazy-server-del", "yes"),
-            ("activedefrag", "no"),
             ("close-on-replica-write", "yes"),
         ]
         .into_iter()
@@ -993,6 +1029,27 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
         (
             "lfu-decay-time",
             crate::eviction::lfu_decay_time().to_string(),
+        ),
+        (
+            "activedefrag",
+            if crate::compaction::enabled() {
+                "yes"
+            } else {
+                "no"
+            }
+            .to_string(),
+        ),
+        (
+            "active-defrag-ignore-bytes",
+            crate::compaction::ignore_bytes().to_string(),
+        ),
+        (
+            "active-defrag-threshold-lower",
+            crate::compaction::threshold_lower().to_string(),
+        ),
+        (
+            "active-defrag-cycle-max",
+            crate::compaction::cycle_max().to_string(),
         ),
         ("requirepass", requirepass),
         (
@@ -3405,6 +3462,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     crate::commands::memory::human_bytes_pub(used)
                 ));
                 out.push_str(&format!("used_memory_rss:{rss}\r\n"));
+                // KiviDB's slabs of small string values that hold something
+                // (#113): `used_memory` counts the blocks in them.
+                let fill = crate::value_slab::fill();
+                out.push_str(&format!("value_slab_bytes:{}\r\n", fill.slab_bytes));
+                out.push_str(&format!("value_slab_live_bytes:{}\r\n", fill.live_bytes));
                 out.push_str(&format!(
                     "used_memory_rss_human:{}\r\n",
                     crate::commands::memory::human_bytes_pub(rss)
@@ -3482,7 +3544,18 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 out.push_str("mem_clients_slaves:0\r\n");
                 out.push_str("mem_clients_normal:0\r\n");
                 out.push_str("mem_aof_buffer:0\r\n");
-                out.push_str("active_defrag_running:0\r\n");
+                out.push_str(&format!(
+                    "active_defrag_running:{}\r\n",
+                    u8::from(crate::compaction::running())
+                ));
+                out.push_str(&format!(
+                    "active_defrag_hits:{}\r\n",
+                    crate::compaction::hits()
+                ));
+                out.push_str(&format!(
+                    "active_defrag_misses:{}\r\n",
+                    crate::compaction::misses()
+                ));
                 out.push_str(&format!(
                     "lazyfree_pending_objects:{}\r\n",
                     crate::lazyfree::pending_objects()

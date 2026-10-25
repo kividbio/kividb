@@ -14,6 +14,26 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Added
 
+- **Active defrag (#113): memory freed by deletes goes back to the system.**
+  After a reshard or a big delete at random, nearly every page still held
+  a key that stayed, and the process kept its memory: 10 million keys of
+  100 bytes with a random half deleted used 845 MB and held 1569 MB, until
+  a restart. String values of up to 504 bytes now live in slabs of
+  KiviDB's own, and a background thread moves the values of half-empty
+  slabs into fuller ones, so that the half-empty ones empty and go back to
+  the kernel: in the same test, 1426 MB came down to 986 MB within 70
+  seconds. The values move a batch at a time, on a thread of their own,
+  held to a share of one core, and nothing waits for it: under 9 million
+  requests a second, throughput and p99 / p99.9 latency were the same with
+  it running as with it off. A value something besides its key holds (a
+  snapshot being written, a command running) is left where it is. On by
+  default; Redis's settings, in the config file, on the command line and
+  with `CONFIG SET`: `activedefrag` (`yes`), `active-defrag-ignore-bytes`
+  (`64mb`), `active-defrag-threshold-lower` (`20`, per cent) and
+  `active-defrag-cycle-max` (`10`, per cent of one core). `INFO memory`
+  reports `active_defrag_running`, `active_defrag_hits`,
+  `active_defrag_misses`, `value_slab_bytes` and `value_slab_live_bytes`.
+
 - **`cluster-announce-client-port` (#110):** the port clients are told to
   reach a node on, in redirects (`MOVED`, `ASK`) and in `CLUSTER SLOTS`,
   `SHARDS`, `NODES` and `REPLICAS`, where it is not the port the nodes use
@@ -25,6 +45,14 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   skip it. Config file, command line, and `CONFIG SET` at runtime.
 
 ### Changed
+
+- **String values take less memory (#113).** A value's block no longer
+  carries the system allocator's header and rounding: 10 million keys of
+  100 bytes take 1753 MB instead of 1898 MB (184 bytes a key instead of
+  199). `used_memory` now counts each value's block at the size of its
+  slab's class, a multiple of 16 bytes, which is what it takes: about 4
+  bytes a key more than before for values of 100 bytes, so a `maxmemory`
+  is reached that much sooner.
 
 - **`pcall` hands back the error's message, and `assert` takes only a
   string, as in Redis (#90).** A table raised with an `err` that is a string
