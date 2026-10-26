@@ -18,6 +18,12 @@ the master stops waiting, after 30 seconds, it syncs and drops its data, as
 
 ### Changed
 
+- **The Docker image has no OpenSSL.** Its base is now distroless's
+  `base-nossl` with `libgcc_s` copied in, rather than `cc`, which ships
+  `libssl3`. KiviDB never loaded it (TLS is rustls, built into the binary),
+  but image scanners reported its CVEs all the same. Same image as the 1.2.0
+  release candidates.
+
 - **`maxclients` is enforced.** `CONFIG SET` took it and `CONFIG GET` gave
   it back, but nothing checked it, and a config file that set it did not
   start (`unknown directive 'maxclients'`). Plaintext and TLS clients now
