@@ -226,6 +226,42 @@ const ACTIVE_EXPIRE_STALE_PERCENT: usize = 10;
 pub struct ExpireCursor {
     db: usize,
     shard: usize,
+    /// This cycle's share of the shards: those whose number is `part` modulo
+    /// `parts` (one thread of several, each with its own). `parts` 0 is 1.
+    part: usize,
+    parts: usize,
+}
+
+impl ExpireCursor {
+    /// The cursor of expiry thread `part` of `parts`.
+    pub fn part(part: usize, parts: usize) -> Self {
+        Self {
+            part,
+            parts,
+            ..Self::default()
+        }
+    }
+
+    fn parts(&self) -> usize {
+        self.parts.max(1)
+    }
+
+    fn owns(&self, shard: usize) -> bool {
+        shard % self.parts() == self.part
+    }
+}
+
+/// Threads that expire keys, each going through its own share of the
+/// shards: a quarter of the cores, at least one. One thread deleted at most
+/// about 700,000 keys a second, and a pipelined load of `SET ... EX` on 8
+/// vCPUs wrote about 650,000 a second: it fell behind, and memory grew until
+/// the server was killed. Each rests 100 ms between cycles when it is not
+/// behind, so the threads cost next to nothing when there is little to do.
+fn expiry_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get() / 4)
+        .unwrap_or(1)
+        .max(1)
 }
 
 /// Active expiration (Redis `activeExpireCycle`): remove the keys whose time
@@ -237,10 +273,10 @@ pub struct ExpireCursor {
 /// ([`ACTIVE_EXPIRE_STALE_PERCENT`]), so the caller should come back at once
 /// rather than in 100 ms. Running out of time with few expired keys found is
 /// not being behind: the next cycle takes up where this one stopped. In a
-/// shard it finds every key
-/// past its time in one pass over the shard's expiry times, and deletes them
-/// in batches of [`ACTIVE_EXPIRE_BATCH`], each under one lock of the expiry
-/// shard and one of the value shard.
+/// shard it finds the keys past their time [`ACTIVE_EXPIRE_BATCH`] at a time,
+/// each pass over the shard's expiry times stopping at its batch's last key,
+/// and deletes each batch under one lock of the expiry shard and one of the
+/// value shard.
 ///
 /// It used to take twenty keys at a time, each time searching the shard from
 /// its start: every twenty passed over the same live keys again, so the more
@@ -259,7 +295,11 @@ pub fn active_expire_cycle(
     index_store: &IndexStore,
     cursor: &mut ExpireCursor,
 ) -> bool {
-    let shards: usize = expiry_store.iter().map(|db| db.len()).sum();
+    // The shards this cycle's part owns.
+    let shards: usize = expiry_store
+        .iter()
+        .map(|db| (0..db.len()).filter(|&s| cursor.owns(s)).count())
+        .sum();
     if shards == 0 {
         return false;
     }
@@ -278,26 +318,30 @@ pub fn active_expire_cycle(
             cursor.shard = 0;
             continue;
         }
+        if !cursor.owns(cursor.shard) {
+            cursor.shard += 1;
+            continue;
+        }
         let (db, shard) = (cursor.db, cursor.shard);
         let cell = &db_exp[shard];
         if !cell.holds_nothing() {
             let now = crate::script_clock::wall_system_time_now();
-            let due: Vec<Key> = {
-                let times = read_lock!(cell);
-                seen += times.len();
-                times
-                    .iter()
-                    .filter(|(_, exp)| **exp < now)
-                    .map(|(k, _)| k.clone())
-                    .collect()
-            };
-            due_total += due.len();
-            for batch in due.chunks(ACTIVE_EXPIRE_BATCH) {
-                expire_batch(store, expiry_store, index_store, db, shard, batch, now);
+            // A batch at a time: a pass stops at the batch's last key, so it
+            // copies no more keys than it deletes. Collecting every due key
+            // of the shard first copied all of them, again each cycle, when
+            // the budget ran out after the first batch: with 49 million keys
+            // the thread spent its time copying and deleted 5,000 a second.
+            loop {
+                let (looked, due) = expire_pass(store, expiry_store, index_store, db, shard, now);
+                seen += looked;
+                due_total += due;
                 if started.elapsed() >= ACTIVE_EXPIRE_BUDGET {
                     // This shard is gone through again next time: what is
                     // left of it, and what has come due since.
                     return behind(seen, due_total);
+                }
+                if due < ACTIVE_EXPIRE_BATCH {
+                    break;
                 }
             }
         }
@@ -308,6 +352,32 @@ pub fn active_expire_cycle(
         }
     }
     false
+}
+
+/// One pass over shard `shard` of database `db`: up to
+/// [`ACTIVE_EXPIRE_BATCH`] keys past their time at `now`, the pass stopping
+/// at the last of them, deleted. Returns how many keys it looked at and how
+/// many were due.
+fn expire_pass(
+    store: &Store,
+    expiry_store: &ExpiryStore,
+    index_store: &IndexStore,
+    db: usize,
+    shard: usize,
+    now: SystemTime,
+) -> (usize, usize) {
+    let mut looked = 0usize;
+    let due: Vec<Key> = read_lock!(expiry_store[db][shard])
+        .iter()
+        .inspect(|_| looked += 1)
+        .filter(|(_, exp)| **exp < now)
+        .take(ACTIVE_EXPIRE_BATCH)
+        .map(|(k, _)| k.clone())
+        .collect();
+    if !due.is_empty() {
+        expire_batch(store, expiry_store, index_store, db, shard, &due, now);
+    }
+    (looked, due.len())
 }
 
 /// Whether more than [`ACTIVE_EXPIRE_STALE_PERCENT`] of the `seen` keys
@@ -377,6 +447,28 @@ fn expire_batch(
     }
 }
 
+/// How often each expiry thread looks for tables to shrink.
+const SHRINK_PERIOD: Duration = Duration::from_secs(1);
+
+/// Shrink the tables, of values and of expiry times, of `cursor`'s shards
+/// that keys have mostly left ([`store::shrink_if_sparse`], #113).
+fn shrink_sparse_tables(store: &Store, expiry_store: &ExpiryStore, cursor: &ExpireCursor) {
+    for db in store.iter() {
+        for (s, shard) in db.iter().enumerate() {
+            if cursor.owns(s) {
+                store::shrink_if_sparse(shard);
+            }
+        }
+    }
+    for db in expiry_store.iter() {
+        for (s, cell) in db.iter().enumerate() {
+            if cursor.owns(s) {
+                cell.shrink_if_sparse();
+            }
+        }
+    }
+}
+
 /// Lazy TTL: delete an expired key before a read and return true if it was removed.
 #[inline]
 pub fn lazy_expire_key(store: &Store, expiry_store: &ExpiryStore, db: usize, key: &str) -> bool {
@@ -427,40 +519,62 @@ pub fn spawn_active_expire_task(
     crate::keyspace_events::register_hub(&store, &pubsub);
     // Whatever was loaded at startup that has field TTLs.
     crate::field_expiry::rescan(&store);
-    std::thread::spawn(move || {
-        let mut cursor = ExpireCursor::default();
-        // Every 100 ms, as Redis's `hz 10`; straight after a cycle that is
-        // behind (its time ran out while more than a tenth of what it looked
-        // at was expired), as Redis goes on while it keeps finding them.
-        let mut wait = Duration::from_millis(100);
-        loop {
-            std::thread::sleep(wait);
-            // Nothing expires while writes are paused, as in Redis: the keys
-            // and fields that come due meanwhile go once the pause is over.
-            if crate::pause::expiry_deferred() {
-                continue;
+    let parts = expiry_threads();
+    for part in 0..parts {
+        let (store, expiry_store, index_store) =
+            (store.clone(), expiry_store.clone(), index_store.clone());
+        // The first thread also reports the latency event and sweeps the
+        // hash fields' times.
+        let latency = (part == 0).then(|| latency.clone());
+        std::thread::spawn(move || {
+            let mut cursor = ExpireCursor::part(part, parts);
+            // Every 100 ms, as Redis's `hz 10`; straight after a cycle that
+            // is behind (its time ran out while more than a tenth of what it
+            // looked at was expired), as Redis goes on while it keeps finding
+            // them.
+            let mut wait = Duration::from_millis(100);
+            let mut shrunk_at = std::time::Instant::now();
+            loop {
+                std::thread::sleep(wait);
+                // Nothing expires while writes are paused, as in Redis: the
+                // keys and fields that come due meanwhile go once the pause
+                // is over.
+                if crate::pause::expiry_deferred() {
+                    continue;
+                }
+                let started = std::time::Instant::now();
+                let behind = active_expire_cycle(&store, &expiry_store, &index_store, &mut cursor);
+                wait = Duration::from_millis(if behind { 1 } else { 100 });
+                if shrunk_at.elapsed() >= SHRINK_PERIOD {
+                    shrink_sparse_tables(&store, &expiry_store, &cursor);
+                    shrunk_at = std::time::Instant::now();
+                }
+                let Some(latency) = &latency else {
+                    continue;
+                };
+                // Redis's `expire-cycle` latency event: a cycle that took at
+                // least `latency-monitor-threshold` ms (0, the default, is
+                // off).
+                let threshold = crate::latency::threshold_ms();
+                let took = started.elapsed().as_millis() as u64;
+                if threshold > 0 && took >= threshold {
+                    latency.record("expire-cycle", took.min(u32::MAX as u64) as u32);
+                }
+                crate::field_expiry::sweep(&store, &expiry_store, &index_store);
             }
-            let started = std::time::Instant::now();
-            let behind = active_expire_cycle(&store, &expiry_store, &index_store, &mut cursor);
-            wait = Duration::from_millis(if behind { 1 } else { 100 });
-            // Redis's `expire-cycle` latency event: a cycle that took at
-            // least `latency-monitor-threshold` ms (0, the default, is off).
-            let threshold = crate::commands::server::remembered_config("latency-monitor-threshold")
-                .and_then(|ms| ms.parse::<u64>().ok())
-                .unwrap_or(0);
-            let took = started.elapsed().as_millis() as u64;
-            if threshold > 0 && took >= threshold {
-                latency.record("expire-cycle", took.min(u32::MAX as u64) as u32);
-            }
-            crate::field_expiry::sweep(&store, &expiry_store, &index_store);
-        }
-    });
+        });
+    }
 }
 
 /// Glob-style match (Redis KEYS / PSUBSCRIBE). Fast path avoids `glob::Pattern` stack use on
 /// huge `*?…` patterns; bracket / escape syntax defers to `glob`.
 pub fn glob_match(pattern: &str, text: &str) -> bool {
     super::glob_redis::matches(pattern.as_bytes(), text.as_bytes())
+}
+
+/// [`glob_match`] of bytes: a channel's name need not be UTF-8.
+pub fn glob_match_bytes(pattern: &[u8], text: &[u8]) -> bool {
+    super::glob_redis::matches(pattern, text)
 }
 
 pub fn get_expiry_shard<'a>(
@@ -1235,5 +1349,73 @@ mod active_expiry_tests {
         let mut cursor = ExpireCursor::default();
         assert!(!active_expire_cycle(&store, &expiry, &index, &mut cursor));
         assert_eq!(keys(&store), 2_000);
+    }
+
+    /// A shard with three batches' worth due: a pass takes one batch and
+    /// stops there, so it copies no more keys than it deletes (it used to copy
+    /// every due key of the shard, then run out of time after one batch).
+    #[test]
+    fn a_pass_takes_one_batch_and_stops() {
+        let store = store::new_store(1);
+        let expiry = store::new_expiry_store(1);
+        let index: IndexStore = Default::default();
+        let past = SystemTime::now() - Duration::from_secs(5);
+        let shards = expiry[0].len();
+        // Long keys, as UUIDs are: past CompactString's inline length.
+        let mut n = 0;
+        let mut i = 0;
+        while n < 3 * ACTIVE_EXPIRE_BATCH {
+            let key = format!("gone:{i:0>40}");
+            i += 1;
+            if store::shard_index(shards, &key) == 0 {
+                put(&store, &expiry, &key, past);
+                n += 1;
+            }
+        }
+        let (looked, due) = expire_pass(&store, &expiry, &index, 0, 0, SystemTime::now());
+        assert_eq!(due, ACTIVE_EXPIRE_BATCH);
+        assert_eq!(
+            looked, ACTIVE_EXPIRE_BATCH,
+            "it went past the batch's last key"
+        );
+        assert_eq!(keys(&store), n - ACTIVE_EXPIRE_BATCH);
+
+        let mut cursor = ExpireCursor::default();
+        let mut cycles = 0;
+        while keys(&store) > 0 {
+            active_expire_cycle(&store, &expiry, &index, &mut cursor);
+            cycles += 1;
+            assert!(cycles < 1000, "never emptied");
+        }
+    }
+
+    /// Two parts between them go through every shard, each only its own.
+    #[test]
+    fn parts_share_the_shards() {
+        let store = store::new_store(1);
+        let expiry = store::new_expiry_store(1);
+        let index: IndexStore = Default::default();
+        let past = SystemTime::now() - Duration::from_secs(5);
+        for i in 0..5_000 {
+            put(&store, &expiry, &format!("gone:{i}"), past);
+        }
+        let mut even = ExpireCursor::part(0, 2);
+        while active_expire_cycle(&store, &expiry, &index, &mut even) {}
+        let shards = expiry[0].len();
+        for (s, cell) in expiry[0].iter().enumerate() {
+            let left = cell.read().len();
+            if s % 2 == 0 {
+                assert_eq!(left, 0, "shard {s} is part 0's");
+            }
+        }
+        let odd_left: usize = (1..shards)
+            .step_by(2)
+            .map(|s| expiry[0][s].read().len())
+            .sum();
+        assert!(odd_left > 0, "part 0 went through part 1's shards");
+        let mut odd = ExpireCursor::part(1, 2);
+        while active_expire_cycle(&store, &expiry, &index, &mut odd) {}
+        assert_eq!(times(&expiry), 0);
+        assert_eq!(keys(&store), 0);
     }
 }

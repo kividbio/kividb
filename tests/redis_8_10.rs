@@ -1846,22 +1846,27 @@ fn ts_compaction_rules_aggregate_whole_buckets() {
     c.cmd(&["TS.ADD", "cp:src", "1000", "10"]);
     c.cmd(&["TS.ADD", "cp:src", "1100", "20"]);
     c.cmd(&["TS.MADD", "cp:src", "1200", "60", "cp:src", "1300", "NaN"]);
+    // The bucket is still open: reported with LATEST (#128).
     assert_eq!(
-        rows(&c.cmd(&["TS.RANGE", "cp:avg", "-", "+"])),
+        rows(&c.cmd(&["TS.RANGE", "cp:avg", "-", "+", "LATEST"])),
         [row(1000, &["30"])]
     );
     assert_eq!(
-        rows(&c.cmd(&["TS.RANGE", "cp:count", "-", "+"])),
+        rows(&c.cmd(&["TS.RANGE", "cp:count", "-", "+", "LATEST"])),
         [row(1000, &["3"])]
     );
     assert_eq!(
-        rows(&c.cmd(&["TS.RANGE", "cp:nan", "-", "+"])),
+        rows(&c.cmd(&["TS.RANGE", "cp:nan", "-", "+", "LATEST"])),
         [row(1000, &["1"])]
     );
 
     c.cmd(&["TS.ADD", "cp:src", "2500", "7"]);
     assert_eq!(
         rows(&c.cmd(&["TS.RANGE", "cp:avg", "-", "+"])),
+        [row(1000, &["30"])]
+    );
+    assert_eq!(
+        rows(&c.cmd(&["TS.RANGE", "cp:avg", "-", "+", "LATEST"])),
         [row(1000, &["30"]), row(2000, &["7"])]
     );
 

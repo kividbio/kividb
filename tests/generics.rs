@@ -840,14 +840,15 @@ fn test_flushdb_only_current() {
 // AUTH COMMANDS
 // ═════════════════════════════════════════════════════════════════════════════
 
-// AUTH on a server with no password always succeeds
+// AUTH <password> on a server with no password is Redis's error (#135);
+// nothing else is held up by it
 #[test]
 fn test_auth_no_password_configured() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
 
-    assert!(c.cmds(&["AUTH", "anything"]).is_ok());
+    assert!(c.cmds(&["AUTH", "anything"]).is_error());
     // Normal commands still work
     assert!(c.cmds(&["SET", "auth:k", "v"]).is_ok());
 }
@@ -1797,6 +1798,50 @@ fn try_read_with_timeout(c: &mut Conn, timeout: Duration) -> Option<Vec<u8>> {
 fn resp3(c: &mut Conn) {
     let hello = c.cmds(&["HELLO", "3"]);
     assert!(matches!(hello, RespValue::Array(_)), "{hello:?}");
+}
+
+/// A tracking client that does not read its invalidations is closed once
+/// too many wait for it, rather than having them dropped: one dropped would
+/// leave it serving a key that changed, with nothing to tell it so (#161).
+#[test]
+fn test_a_tracking_client_that_does_not_read_is_closed_not_left_stale() {
+    let port = free_port();
+    start_server(port);
+    let mut tracker = Conn::connect(port);
+    resp3(&mut tracker);
+    let id = tracker.cmds(&["CLIENT", "ID"]).as_int();
+    assert!(tracker.cmds(&["CLIENT", "TRACKING", "ON", "BCAST"]).is_ok());
+
+    // Every write is an invalidation for the tracker, which reads none of
+    // them: its socket fills, then its queue.
+    let mut writer = Conn::connect(port);
+    let batch = 1000;
+    for round in 0..200 {
+        let mut buf = Vec::new();
+        for i in 0..batch {
+            let key = format!("k{}", round * batch + i);
+            buf.extend_from_slice(
+                format!("*3\r\n$3\r\nSET\r\n${}\r\n{key}\r\n$1\r\nv\r\n", key.len()).as_bytes(),
+            );
+        }
+        writer.stream.write_all(&buf).unwrap();
+        for _ in 0..batch {
+            assert!(writer.read_value().is_ok());
+        }
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let list = writer.cmds(&["CLIENT", "LIST"]);
+        if !list.as_str().contains(&format!("id={id} ")) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the tracker that reads nothing is still connected"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 // CLIENT TRACKING ON → returns OK
@@ -2846,4 +2891,67 @@ fn test_bcast_pending_is_told_before_acl_setuser_changes_the_user() {
     let parts = push.as_array();
     assert_eq!(parts[0].as_str(), "invalidate", "{push:?}");
     assert_eq!(parts[1].as_array()[0].as_str(), "p:x");
+}
+
+/// `CLIENT LIST` reports a client's transaction (`multi`, the commands it
+/// has queued, -1 outside one) and the keys it watches (`watch`), and `INFO clients` the clients blocked with a
+/// timeout. They were fixed (#158).
+#[test]
+fn test_client_list_reports_transactions_and_blocked_clients() {
+    let field = |line: &str, name: &str| -> i64 {
+        client_list_field(line, name)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("no {name} in {line:?}"))
+    };
+    let port = free_port();
+    start_server(port);
+    let mut observer = Conn::connect(port);
+    let mut client = Conn::connect(port);
+    client.cmds(&["CLIENT", "SETNAME", "in-tx"]);
+    let line = |observer: &mut Conn| -> String {
+        observer
+            .cmds(&["CLIENT", "LIST"])
+            .as_str()
+            .lines()
+            .find(|line| line.contains("name=in-tx"))
+            .expect("the client")
+            .to_string()
+    };
+    let now = line(&mut observer);
+    assert_eq!((field(&now, "multi="), field(&now, "watch=")), (-1, 0));
+    // An idle client has given its query buffer back: nothing to count.
+    assert_eq!(field(&now, "tot-mem="), 0, "{now}");
+
+    client.cmds(&["WATCH", "w1", "w2"]);
+    client.cmds(&["MULTI"]);
+    client.cmds(&["SET", "w1", "1"]);
+    client.cmds(&["INCR", "w2"]);
+    let now = line(&mut observer);
+    assert_eq!((field(&now, "multi="), field(&now, "watch=")), (2, 2));
+    client.cmds(&["EXEC"]);
+    let now = line(&mut observer);
+    assert_eq!((field(&now, "multi="), field(&now, "watch=")), (-1, 0));
+
+    // Blocked with a timeout: in the table while it waits.
+    let in_table = |observer: &mut Conn| -> i64 {
+        observer
+            .cmds(&["INFO", "clients"])
+            .as_str()
+            .lines()
+            .find_map(|line| line.strip_prefix("clients_in_timeout_table:"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    let before = in_table(&mut observer);
+    let mut waiter = Conn::connect(port);
+    let blocked = std::thread::spawn(move || waiter.cmds(&["BLPOP", "never-pushed", "3"]));
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while in_table(&mut observer) <= before {
+        assert!(std::time::Instant::now() < deadline, "never counted");
+        thread::sleep(Duration::from_millis(20));
+    }
+    observer.cmds(&["LPUSH", "never-pushed", "x"]);
+    blocked.join().unwrap();
 }

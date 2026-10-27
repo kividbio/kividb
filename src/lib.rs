@@ -8,6 +8,7 @@ pub mod cluster;
 pub mod cmdstats;
 pub mod command_gate;
 pub mod commands;
+pub mod compaction;
 pub mod config;
 pub mod eviction;
 pub mod field_expiry;
@@ -23,6 +24,7 @@ pub mod node_tls;
 pub mod pause;
 pub mod protected_mode;
 pub mod pubsub;
+pub mod redis_settings;
 pub mod replication;
 pub mod resp;
 pub mod script_clock;
@@ -37,6 +39,7 @@ pub mod tag_locks;
 pub mod tracking;
 pub mod types;
 pub mod update_check;
+pub mod value_slab;
 pub mod vector;
 pub mod wait_table;
 pub mod watch;
@@ -70,10 +73,13 @@ pub fn run_for_test(config: config::Config) {
         crate::tag_locks::set_enabled(true);
     }
     crate::eviction::configure(&cfg);
+    crate::compaction::configure(&cfg);
     if let Err(e) = crate::node_tls::init(&cfg) {
         panic!("TLS between nodes: {e}");
     }
     crate::protected_mode::set(cfg.protected_mode);
+    crate::stats::record_save();
+    crate::commands::memory::note_startup();
     let started_at = std::time::Instant::now();
 
     tokio::runtime::Builder::new_multi_thread()
@@ -125,6 +131,7 @@ async fn server_tokio(
         pubsub.clone(),
         Arc::clone(&latency),
     );
+    crate::compaction::spawn(Arc::clone(&store));
     let watch_registry = crate::watch::new_watch_registry();
     crate::watch::register_for(&store, &watch_registry);
     let client_registry = crate::client_registry::new_client_registry();
@@ -230,12 +237,7 @@ async fn server_tokio(
     if config.tls_enabled() {
         use crate::tls::acceptor;
 
-        let tls_acceptor = match acceptor::build(
-            &config.tls_cert_file,
-            &config.tls_key_file,
-            &config.tls_ca_cert_file,
-            &config.tls_auth_clients,
-        ) {
+        let tls_acceptor = match acceptor::install(config.tls_port, &acceptor::Files::of(&config)) {
             Ok(a) => a,
             Err(e) => {
                 log_fatal!("TLS: {e}");
@@ -275,6 +277,7 @@ async fn server_tokio(
         let tls_tracking_table = Arc::clone(&tracking_table);
 
         let listen_acceptor = tls_acceptor.clone();
+        let tls_port = config.tls_port;
         tokio::spawn(async move {
             loop {
                 let (tcp_stream, peer_addr) = match tls_listener.accept().await {
@@ -285,7 +288,11 @@ async fn server_tokio(
                     }
                 };
 
-                let tls_stream = match listen_acceptor.accept(tcp_stream).await {
+                let tls_stream = match acceptor::current(tls_port)
+                    .unwrap_or_else(|| listen_acceptor.clone())
+                    .accept(tcp_stream)
+                    .await
+                {
                     Ok(s) => s,
                     Err(e) => {
                         log_verbose!("TLS: handshake failed from {peer_addr}: {e} ({e:?})");

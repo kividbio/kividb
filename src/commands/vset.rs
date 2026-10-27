@@ -129,15 +129,19 @@ fn vadd(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let mut i = 2usize;
     let mut attrs: Option<String> = None;
 
-    // Optional REDUCE dim — we parse it but don't implement PCA reduction.
-    // Accepting it means client libraries don't break.
+    // REDUCE projects the vectors to fewer dimensions, at random, with a
+    // projection kept with the set for every query after. It was taken and
+    // ignored, and the set kept the dimension given (#132): refused.
     if cmd
         .get(i)
         .and_then(|b| std::str::from_utf8(b).ok())
         .map(|s| s.eq_ignore_ascii_case("REDUCE"))
         .unwrap_or(false)
     {
-        i += 2; // skip REDUCE + dim
+        return Some(resp_error(
+            "ERR REDUCE is not supported by KiviDB: vectors are kept at the dimension they are \
+             given",
+        ));
     }
 
     let mut parsed_metric = crate::vector::DistanceMetric::Cosine;
@@ -209,6 +213,8 @@ fn vadd(ctx: &mut Ctx) -> Option<Vec<u8>> {
             }
         };
         match tok.as_str() {
+            // Kept at full precision whichever is asked for: `VINFO` says
+            // so (`f32`).
             "NOQUANT" | "Q8" | "BIN" | "CAS" => {
                 i += 1;
             }
@@ -577,8 +583,9 @@ fn vinfo(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 resp_integer(dim as i64),
                 resp_bulk_str("vector-count"),
                 resp_integer(count as i64),
+                // Redis's name for vectors kept unquantized.
                 resp_bulk_str("quant-type"),
-                resp_bulk_str("NOQUANT"),
+                resp_bulk_str("f32"),
                 resp_bulk_str("index-type"),
                 resp_bulk_str("FLAT"),
                 resp_bulk_str("max-level"),
@@ -932,6 +939,7 @@ fn vsim(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let mut with_scores = false;
     let mut with_attribs = false;
     let mut count = 10usize;
+    let mut filter: Option<super::vset_filter::Filter> = None;
 
     while i < cmd.len() {
         let tok = match std::str::from_utf8(cmd[i]) {
@@ -960,13 +968,21 @@ fn vsim(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 }
                 i += 2;
             }
-            // EF, FILTER, TRUTH, NOTHREAD — accept and ignore for compatibility
+            // The search is exact: how far it looks is not a choice.
             "EF" | "FILTER-EF" => {
                 i += 2;
             }
+            // Only the elements whose attributes pass are scored (#132).
             "FILTER" => {
+                let Some(expr) = cmd.get(i + 1).and_then(|b| std::str::from_utf8(b).ok()) else {
+                    return Some(resp_error(super::vset_filter::SYNTAX_ERROR));
+                };
+                match super::vset_filter::Filter::compile(expr) {
+                    Some(compiled) => filter = Some(compiled),
+                    None => return Some(resp_error(super::vset_filter::SYNTAX_ERROR)),
+                }
                 i += 2;
-            } // We don't evaluate filter expressions yet
+            }
             "TRUTH" | "NOTHREAD" => {
                 i += 1;
             }
@@ -1009,6 +1025,11 @@ fn vsim(ctx: &mut Ctx) -> Option<Vec<u8>> {
         .entries
         .iter()
         .filter(|(_, entry)| entry.vector.len() == query_vec.len())
+        .filter(|(_, entry)| {
+            filter
+                .as_ref()
+                .is_none_or(|filter| filter.matches(entry.attrs.as_deref()))
+        })
         .map(|(name, entry)| {
             (
                 crate::vector::distance(&inner.metric, &query_vec, &entry.vector),

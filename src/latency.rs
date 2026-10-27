@@ -8,9 +8,51 @@ pub struct LatencySample {
     pub latency_ms: u32,
 }
 
+/// One event's samples, and the most it has taken since it was reset:
+/// `LATENCY LATEST`'s fourth field.
+#[derive(Default)]
+struct Event {
+    samples: VecDeque<LatencySample>,
+    max_ms: u32,
+}
+
 pub struct LatencyTracker {
-    events: RwLock<AHashMap<String, VecDeque<LatencySample>>>,
+    events: RwLock<AHashMap<String, Event>>,
     max_samples: usize,
+}
+
+/// `latency-monitor-threshold`, in milliseconds; 0, the default, is off.
+/// What a command or an expire cycle has to take to be recorded (#158).
+static THRESHOLD_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn threshold_ms() -> u64 {
+    THRESHOLD_MS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_threshold_ms(ms: u64) {
+    THRESHOLD_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// After a command has run: a `fast-command` or `command` event, as Redis
+/// records it, if it took at least `latency-monitor-threshold` (#158). It
+/// was recorded when the command was slower than `slowlog-log-slower-than`,
+/// and a `fast-command` was one that took under a millisecond.
+#[inline]
+pub fn note_command(tracker: &LatencyTracker, name: &str, elapsed: std::time::Duration) {
+    let threshold = threshold_ms();
+    if threshold == 0 {
+        return;
+    }
+    let ms = elapsed.as_millis() as u64;
+    if ms < threshold {
+        return;
+    }
+    let event = if crate::commands::server::is_fast_command(name) {
+        "fast-command"
+    } else {
+        "command"
+    };
+    tracker.record(event, ms.min(u32::MAX as u64) as u32);
 }
 
 pub type SharedLatencyTracker = Arc<LatencyTracker>;
@@ -32,25 +74,28 @@ fn unix_secs() -> u64 {
 impl LatencyTracker {
     pub fn record(&self, event: &str, latency_ms: u32) {
         let mut map = self.events.write();
-        let deque = map.entry(event.to_string()).or_default();
-        if deque.len() >= self.max_samples {
-            deque.pop_front();
+        let event = map.entry(event.to_string()).or_default();
+        if event.samples.len() >= self.max_samples {
+            event.samples.pop_front();
         }
-        deque.push_back(LatencySample {
+        event.samples.push_back(LatencySample {
             timestamp: unix_secs(),
             latency_ms,
         });
+        event.max_ms = event.max_ms.max(latency_ms);
     }
 
-    /// Returns (event_name, latest_timestamp, latest_latency_ms) for each event
-    pub fn latest(&self) -> Vec<(String, u64, u32)> {
+    /// `(event, latest time, latest ms, most ms)` of each event, as
+    /// `LATENCY LATEST` gives them.
+    pub fn latest(&self) -> Vec<(String, u64, u32, u32)> {
         self.events
             .read()
             .iter()
-            .filter_map(|(name, samples)| {
-                samples
+            .filter_map(|(name, event)| {
+                event
+                    .samples
                     .back()
-                    .map(|s| (name.clone(), s.timestamp, s.latency_ms))
+                    .map(|s| (name.clone(), s.timestamp, s.latency_ms, event.max_ms))
             })
             .collect()
     }
@@ -59,8 +104,9 @@ impl LatencyTracker {
         self.events
             .read()
             .get(event)
-            .map(|deque| {
-                deque
+            .map(|event| {
+                event
+                    .samples
                     .iter()
                     .map(|s| LatencySample {
                         timestamp: s.timestamp,

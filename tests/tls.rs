@@ -232,7 +232,120 @@ fn start_server_with_tls(plain_port: u16, tls_port: u16, certs: &TempCerts) {
     }
 }
 
+/// Whether a client that trusts only `cert_der` completes a handshake.
+fn handshake_ok(port: u16, cert_der: &[u8]) -> bool {
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(cert_der.to_vec()))
+        .unwrap();
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async move {
+            let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let name = rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
+            let Ok(mut tls) = connector.connect(name, stream).await else {
+                return false;
+            };
+            // TLS 1.3: a refused certificate shows at the first read.
+            tls.write_all(b"*1\r\n$4\r\nPING\r\n").await.is_ok() && {
+                let mut reply = [0u8; 7];
+                tls.read_exact(&mut reply).await.is_ok() && &reply == b"+PONG\r\n"
+            }
+        })
+}
+
+fn plain_cmd(port: u16, args: &[&str]) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    send_cmd(&mut stream, args);
+    let line = read_resp(&mut stream);
+    match line.strip_prefix('*') {
+        Some(n) => (0..n.parse::<usize>().unwrap())
+            .map(|_| read_resp(&mut stream))
+            .collect::<Vec<_>>()
+            .join(" "),
+        None => line,
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// `CONFIG SET` of the certificate and key loads them, for every handshake
+/// from then on, also when the path is the same and the file was renewed in
+/// place; files that cannot be loaded change nothing (#156).
+#[test]
+fn config_set_loads_a_new_certificate() {
+    let first = generate_certs();
+    let plain = free_port();
+    let tls = free_port();
+    start_server_with_tls(plain, tls, &first);
+    assert!(handshake_ok(tls, &first.cert_der));
+
+    let second = generate_certs();
+    let reply = plain_cmd(
+        plain,
+        &[
+            "CONFIG",
+            "SET",
+            "tls-cert-file",
+            second.cert_path.to_str().unwrap(),
+            "tls-key-file",
+            second.key_path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(reply, "OK");
+    assert!(handshake_ok(tls, &second.cert_der));
+    assert!(!handshake_ok(tls, &first.cert_der));
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "GET", "tls-cert-file"]),
+        format!("tls-cert-file {}", second.cert_path.to_str().unwrap())
+    );
+
+    // Renewed in place: the same paths, new files.
+    let renewed = generate_certs();
+    std::fs::copy(&renewed.cert_path, &second.cert_path).unwrap();
+    std::fs::copy(&renewed.key_path, &second.key_path).unwrap();
+    assert!(handshake_ok(tls, &second.cert_der));
+    let reply = plain_cmd(
+        plain,
+        &[
+            "CONFIG",
+            "SET",
+            "tls-cert-file",
+            second.cert_path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(reply, "OK");
+    assert!(handshake_ok(tls, &renewed.cert_der));
+
+    // A certificate without its key: refused, and nothing changes.
+    let reply = plain_cmd(
+        plain,
+        &[
+            "CONFIG",
+            "SET",
+            "tls-cert-file",
+            first.cert_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        reply.contains("Unable to update TLS configuration"),
+        "{reply}"
+    );
+    let reply = plain_cmd(plain, &["CONFIG", "SET", "tls-cert-file", "/no/such/file"]);
+    assert!(reply.starts_with("ERR CONFIG SET failed"), "{reply}");
+    assert!(handshake_ok(tls, &renewed.cert_der));
+}
 
 /// Basic TLS: PING over TLS returns PONG.
 #[test]

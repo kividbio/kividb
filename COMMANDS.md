@@ -79,7 +79,7 @@ checks respect lazy expiry — an expired key is treated as absent.
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `EXPIRE` | `EXPIRE key seconds [NX \| XX \| GT \| LT]` | Set a TTL in seconds; returns 1 if set, 0 if key missing or condition not met; `NX`=only if no TTL exists, `XX`=only if TTL exists, `GT`=only if new TTL is greater than current, `LT`=only if new TTL is less than current; GT/LT on a key with no expiry always sets it |
+| `EXPIRE` | `EXPIRE key seconds [NX \| XX \| GT \| LT]` | Set a TTL in seconds; returns 1 if set, 0 if key missing or condition not met; `NX`=only if no TTL exists, `XX`=only if TTL exists, `GT`=only if new TTL is greater than current, `LT`=only if new TTL is less than current; a key with no expiry counts as never expiring, as in Redis: `GT` does not set it, `LT` does |
 | `PEXPIRE` | `PEXPIRE key milliseconds [NX \| XX \| GT \| LT]` | Set a TTL in milliseconds; same NX/XX/GT/LT conditions as `EXPIRE` |
 | `EXPIREAT` | `EXPIREAT key unix-time-seconds [NX \| XX \| GT \| LT]` | Set expiry as an absolute Unix timestamp in seconds; a past timestamp expires the key immediately; same NX/XX/GT/LT conditions |
 | `PEXPIREAT` | `PEXPIREAT key unix-time-milliseconds [NX \| XX \| GT \| LT]` | Set expiry as an absolute Unix timestamp in milliseconds; same NX/XX/GT/LT conditions |
@@ -176,11 +176,11 @@ Sparse, index-addressed collections of string values with an insert cursor. Repo
 | `ARRING` | `ARRING key size value [value ...]` | Insert into a ring buffer of `size`, wrapping at `size` so newer values overwrite older ones; shrinking `size` truncates. Returns the last index written |
 | `ARNEXT` | `ARNEXT key` | The index the next `ARINSERT` would use; 0 for a missing key, nil when the cursor is exhausted |
 | `ARSEEK` | `ARSEEK key index` | Move the insert cursor; returns 1 if set, 0 if the key does not exist. Does **not** create the key |
-| `ARSCAN` | `ARSCAN key start end [LIMIT limit]` | Iterate existing elements in a range, skipping empty slots. Returns a **flat** `[idx, val, idx, val, ...]` array; `start > end` iterates in reverse |
-| `ARGREP` | `ARGREP key start end <EXACT string \| MATCH string \| GLOB pattern \| RE pattern [...]> [AND \| OR \| LIMIT limit \| WITHVALUES \| NOCASE ...]` | Search elements by textual predicate. `start`/`end` accept `-` (first index) and `+` (last). Multiple predicates combine with OR by default. `WITHVALUES` returns a **flat** `[idx, val, ...]` array |
+| `ARSCAN` | `ARSCAN key start end [LIMIT limit]` | Iterate existing elements in a range, skipping empty slots. Returns an array of `[idx, val]` pairs, as Redis 8.8 does; `start > end` iterates in reverse |
+| `ARGREP` | `ARGREP key start end <EXACT string \| MATCH string \| GLOB pattern \| RE pattern [...]> [AND \| OR \| LIMIT limit \| WITHVALUES \| NOCASE ...]` | Search elements by textual predicate. `start`/`end` accept `-` (first index) and `+` (last). Multiple predicates combine with OR by default. `WITHVALUES` returns an array of `[idx, val]` pairs, as Redis 8.8 does, and without it an array of indices |
 | `AROP` | `AROP key start end <SUM \| MIN \| MAX \| AND \| OR \| XOR \| MATCH value \| USED>` | Aggregate over non-empty elements in a range. SUM/MIN/MAX return bulk strings and reply nil when the range holds no numeric elements; AND/OR/XOR/MATCH/USED return integers |
 | `ARLASTITEMS` | `ARLASTITEMS key count [REV]` | The most recently inserted elements, oldest-first by default, newest-first with `REV`. Wraps within the window for ring buffers |
-| `ARINFO` | `ARINFO key [FULL]` | Array metadata: `count`, `len`, `next-insert-index`, `slices`, `directory-size`, `super-dir-entries`, `slice-size` (plus `ring-size` for rings). `FULL` adds per-slice statistics. RESP2 returns a flat array, RESP3 a map |
+| `ARINFO` | `ARINFO key [FULL]` | Array metadata: `count`, `len`, `next-insert-index`, `slices`, `directory-size`, `super-dir-entries`, `slice-size`, as in Redis 8.8. `FULL` adds per-slice statistics. RESP2 returns a flat array, RESP3 a map |
 
 Notes:
 
@@ -257,7 +257,7 @@ Set values are unordered collections of unique byte strings, reported as type `s
 Notes:
 
 - `HIMPORT` is the bulk-insertion command of Redis 8.10's compact hashes. KiviDB implements the command; the hash it creates is an ordinary hash (there is no separate compact encoding), and it is replicated and logged as `DEL` + `HSET`.
-- Hash commands can also publish which **fields** they touched (Redis 8.8 subkey notifications), on four channel shapes, each switched on by its own `notify-keyspace-events` flag: `S` — `__subkeyspace@<db>__:<key>` carrying `<event>|<len>:<field>,…`; `T` — `__subkeyevent@<db>__:<event>` carrying `<len>:<key>|<len>:<field>,…`; `I` — `__subkeyspaceitem@<db>__:<key>\n<field>` carrying `<event>`, one message per field; `V` — `__subkeyspaceevent@<db>__:<event>|<key>` carrying the fields. Fields removed by lazy or active expiry are not reported yet.
+- Hash commands can also publish which **fields** they touched (Redis 8.8 subkey notifications), on four channel shapes, each switched on by its own `notify-keyspace-events` flag: `S` — `__subkeyspace@<db>__:<key>` carrying `<event>|<len>:<field>,…`; `T` — `__subkeyevent@<db>__:<event>` carrying `<len>:<key>|<len>:<field>,…`; `I` — `__subkeyspaceitem@<db>__:<key>\n<field>` carrying `<event>`, one message per field; `V` — `__subkeyspaceevent@<db>__:<event>|<key>` carrying the fields. Fields removed by the background expiry cycle are reported (`hexpired`); fields found expired by a read are not reported yet.
 
 ---
 
@@ -390,7 +390,7 @@ Pre-filters run before KNN (in `FT.SEARCH`) or before aggregation (in `FT.AGGREG
 | TAG match | `@category:{electronics}` | Exact match, case-insensitive |
 | TAG union | `@category:{electronics\|furniture}` | Match any of the listed values |
 | NUMERIC range | `@price:[0 200]` | Inclusive range; use `-inf` and `+inf` for open bounds |
-| TEXT contains | `@name:cable` | Case-insensitive substring match |
+| TEXT word | `@name:cable` | A whole word of the field, case-insensitive, as RediSearch matches it: `@name:cab` does not find `cable`; `cab*` (prefix), `*ble` (suffix), `*abl*` (infix) and `%cabel%` (fuzzy) do |
 | AND | `(@category:{electronics} @price:[0 100])` | Both conditions must pass |
 | OR | `(@category:{electronics} \| @category:{furniture})` | Either condition passes |
 | Match all | `*` | No filter — equivalent to pure KNN |
@@ -419,7 +419,7 @@ A schema may declare multiple VECTOR fields. KNN queries reference the field via
 |---------|--------|-------------|
 | `FT.TAGVALS` | `FT.TAGVALS index field` | Return all distinct values stored in a TAG field across indexed keys; sorted alphabetically; splits on `\|` and `,` |
 | `FT.SPELLCHECK` | `FT.SPELLCHECK index query [DISTANCE n] [TERMS INCLUDE\|EXCLUDE dict ...]` | Return spelling suggestions for unrecognised query terms. Vocabulary is maintained incrementally on every indexed HSET, so query latency is independent of dataset size. Tokens are not removed from the vocabulary on document delete — full rebuild is via index drop and recreate |
-| `FT.SYNUPDATE` | `FT.SYNUPDATE index group_id [SKIPINITIALSCAN] term [term ...]` | Create or update a synonym group; terms in a group are treated as equivalent; AOF-logged |
+| `FT.SYNUPDATE` | `FT.SYNUPDATE index group_id [SKIPINITIALSCAN] term [term ...]` | Create or update a synonym group; a query term matches every term of the groups it is in, in documents indexed before the group was made too (a quoted phrase is matched as written); AOF-logged |
 | `FT.SYNDUMP` | `FT.SYNDUMP index` | Return all synonym groups as a flat term → [group_id] mapping |
 
 ### Dictionary commands
@@ -471,13 +471,13 @@ Vector Sets are a standalone data structure (Redis 8+) — vectors stored direct
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `VSIM` | `VSIM key (ELE \| FP32 \| VALUES num) vector [WITHSCORES] [WITHATTRIBS] [COUNT num] [EF n] [NOTHREAD] [TRUTH]` | Return elements ordered by cosine similarity to the query vector; `ELE` queries by an existing element's vector; scores are similarities computed using the set's stored distance metric (1.0 = identical for cosine/IP, bounded 0–1 for L2) |
+| `VSIM` | `VSIM key (ELE \| FP32 \| VALUES num) vector [WITHSCORES] [WITHATTRIBS] [COUNT num] [EF n] [FILTER expr] [FILTER-EF n] [NOTHREAD] [TRUTH]` | Return elements ordered by cosine similarity to the query vector; `FILTER` keeps the elements whose JSON attributes pass Redis's expression (`.color == "red" and .size > 3`, `"a" in .tags`, `.year in [2024, 2025]`, arithmetic, `not`, `**`); an element without a field it asks for does not pass. The search is exact, so `EF` and `FILTER-EF` change nothing; `ELE` queries by an existing element's vector; scores are similarities computed using the set's stored distance metric (1.0 = identical for cosine/IP, bounded 0–1 for L2) |
 
 ### Inspection and traversal
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `VINFO` | `VINFO key` | Return metadata: `vector-dim`, `vector-count`, `quant-type`, `index-type`, `max-level` |
+| `VINFO` | `VINFO key` | Return metadata: `vector-dim`, `vector-count`, `quant-type` (always `f32`: vectors are kept at full precision, whatever `VADD` asked for), `index-type`, `max-level` |
 | `VLINKS` | `VLINKS key element [WITHSCORES]` | Return nearest neighbours of an element (up to 16) as a single-layer array; approximated via brute-force cosine similarity |
 | `VRANDMEMBER` | `VRANDMEMBER key [count]` | Return random elements; positive count returns distinct elements up to set size; negative count returns `\|count\|` elements with repetition allowed |
 | `VRANGE` | `VRANGE key start end [count]` | Return elements in lexicographical range of element names; bounds follow ZRANGEBYLEX syntax: `[inclusive`, `(exclusive`, `-` for start, `+` for end |
@@ -658,7 +658,7 @@ KiviDB implements the RedisTimeSeries command surface. Time series are stored na
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `TS.CREATE` | `TS.CREATE key [RETENTION ms] [ENCODING COMPRESSED\|UNCOMPRESSED] [CHUNK SIZE size] [DUPLICATE_POLICY BLOCK\|FIRST\|LAST\|MIN\|MAX\|SUM] [LABELS label value ...]` | Create a new time series. ENCODING is accepted but ignored — storage is always BTreeMap |
+| `TS.CREATE` | `TS.CREATE key [RETENTION ms] [ENCODING COMPRESSED\|UNCOMPRESSED] [CHUNK SIZE size] [DUPLICATE_POLICY BLOCK\|FIRST\|LAST\|MIN\|MAX\|SUM] [LABELS label value ...]` | Create a new time series. ENCODING is accepted but ignored — storage is always BTreeMap. Without `DUPLICATE_POLICY`, a series (made here or by `TS.ADD`) takes `ts-duplicate-policy`: `last` unless set; RedisTimeSeries's default is `block` |
 | `TS.ALTER` | `TS.ALTER key [RETENTION ms] [CHUNK SIZE size] [DUPLICATE_POLICY policy] [LABELS label value ...]` | Update retention, chunk size, duplicate policy, or labels. Updating labels atomically rebuilds the label index |
 | `TS.DEL` | `TS.DEL key fromTimestamp toTimestamp` | Delete all samples in the inclusive timestamp range. Returns the count of deleted samples |
 
@@ -681,7 +681,7 @@ KiviDB implements the RedisTimeSeries command surface. Time series are stored na
 | `TS.REVRANGE` | `TS.REVRANGE key fromTimestamp toTimestamp [...]` | Query a range in reverse (descending) order. Accepts the same options as `TS.RANGE` |
 | `TS.MRANGE` | `TS.MRANGE fromTimestamp toTimestamp [LATEST] [FILTER_BY_TS ts ...] [FILTER_BY_VALUE min max] [WITHLABELS \| SELECTED_LABELS label ...] [COUNT count] [[ALIGN value] AGGREGATION agg[,agg ...] bucketDuration] [EXCLUDEEMPTY] FILTER <filters> [GROUPBY label REDUCE reducer]` | Query a range across multiple series matching label filters, in forward order. `EXCLUDEEMPTY` (Redis 8.10) leaves out series with no samples in the range |
 | `TS.MREVRANGE` | `TS.MREVRANGE fromTimestamp toTimestamp [...]` | Query a range across multiple series in reverse order. Accepts the same options as `TS.MRANGE` |
-| `TS.INFO` | `TS.INFO key [DEBUG]` | Return metadata for a series: totalSamples, firstTimestamp, lastTimestamp, retentionTime, chunkSize, duplicatePolicy, labels, rules |
+| `TS.INFO` | `TS.INFO key [DEBUG]` | Return metadata for a series: totalSamples, firstTimestamp, lastTimestamp, retentionTime, chunkSize, duplicatePolicy, labels, sourceKey (the series it is a compaction of, or nil), rules |
 | `TS.QUERYINDEX` | `TS.QUERYINDEX <filters>` | Return all time series keys matching the given label filters. Results are sorted |
 | `TS.NRANGE` | `TS.NRANGE numkeys key [key ...] fromTimestamp toTimestamp [same options as TS.RANGE]` | Query the same range over several named series and join the results by timestamp (Redis 8.10): one row per timestamp any of them reports, with a value — or `NaN` — for each key, in the order given |
 | `TS.NREVRANGE` | `TS.NREVRANGE numkeys key [key ...] fromTimestamp toTimestamp [...]` | `TS.NRANGE` in reverse order |
@@ -692,7 +692,7 @@ KiviDB implements the RedisTimeSeries command surface. Time series are stored na
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `TS.CREATERULE` | `TS.CREATERULE sourceKey destKey AGGREGATION agg bucketDuration [alignTimestamp]` | Create a compaction rule from source to destination. On each `TS.ADD` to the source, the sample is bucketed and aggregated into the destination |
+| `TS.CREATERULE` | `TS.CREATERULE sourceKey destKey AGGREGATION agg bucketDuration [alignTimestamp]` | Create a compaction rule from source to destination. A bucket is written to the destination once it has closed (when the first sample of a later bucket arrives), and again if a sample is added to it after; the bucket still open is reported only with `LATEST`, as in RedisTimeSeries. A destination has one source |
 | `TS.DELETERULE` | `TS.DELETERULE sourceKey destKey` | Delete a compaction rule |
 
 ### Supported aggregation functions
@@ -808,9 +808,9 @@ Shard channel message (SSUBSCRIBE / SPUBLISH):
 | `TIME` | `TIME` | Return `[unix_seconds, microseconds_within_second]` as two bulk strings; uses real wall clock |
 | `HELLO` | `HELLO [protover [AUTH username password] [SETNAME clientname]]` | Switch the connection to RESP2 or RESP3 and return the server's details (`server`, `version`, `proto`, `id`, `mode`, `role`, `modules`) — a map under RESP3. `AUTH` and `SETNAME` apply before the reply. Unauthenticated, when a password is required, it is `NOAUTH` |
 | `LOLWUT` | `LOLWUT [VERSION version]` | Return ASCII art and the server version |
-| `INFO` | `INFO [section [section ...]]` | Return server info; sections include `server`, `keyspace`, `replication`, `errorstats` (per-error reply counters), `all`, etc. `INFO commandstats` has, for each command that has been called, `calls`, `usec`, `usec_per_call`, `rejected_calls` and `failed_calls`, and the Redis 8.8 slowlog fields `slowlog_count`, `slowlog_time_ms_sum` and `slowlog_time_ms_max`. `INFO memory` reports `used_memory` (allocated bytes — what `maxmemory` is compared with), `used_memory_rss` and `maxmemory_policy`; `INFO stats` reports `evicted_keys` |
+| `INFO` | `INFO [section [section ...]]` | Return server info; sections include `server`, `keyspace`, `replication`, `errorstats` (per-error reply counters), `all`, etc. `INFO commandstats` has, for each command that has been called, `calls`, `usec`, `usec_per_call`, `rejected_calls` and `failed_calls`, and the Redis 8.8 slowlog fields `slowlog_count`, `slowlog_time_ms_sum` and `slowlog_time_ms_max`. `INFO memory` reports `used_memory` (allocated bytes — what `maxmemory` is compared with), `used_memory_rss`, `maxmemory_policy`, the slabs of string values (`value_slab_bytes`, and `value_slab_live_bytes` in them) and active defrag's `active_defrag_running`, `active_defrag_hits` (values moved) and `active_defrag_misses` (left, being held); `INFO stats` reports `evicted_keys` |
 | `CONFIG GET` | `CONFIG GET parameter [parameter ...]` | Get a configuration parameter; supports `*` for all |
-| `CONFIG SET` | `CONFIG SET param value [param value ...]` | All or nothing: an unknown parameter, a value out of range, a parameter that cannot change at run time or one named twice is an error naming it, and none of the pairs is applied. `requirepass`, `slowlog-log-slower-than`, `slowlog-max-len`, `maxmemory`, `maxmemory-policy`, `maxmemory-samples`, `lfu-log-factor`, `lfu-decay-time`, `appendonly`, `loglevel`, `repl-backlog-size`, `repl-backlog-ttl`, `repl-diskless-load` all apply immediately at runtime without restart |
+| `CONFIG SET` | `CONFIG SET param value [param value ...]` | All or nothing: an unknown parameter, a value out of range, a parameter that cannot change at run time or one named twice is an error naming it, and none of the pairs is applied. `requirepass`, `slowlog-log-slower-than`, `slowlog-max-len`, `maxmemory`, `maxmemory-policy`, `maxmemory-samples`, `lfu-log-factor`, `lfu-decay-time`, `activedefrag`, `active-defrag-ignore-bytes`, `active-defrag-threshold-lower`, `active-defrag-cycle-max`, `appendonly`, `loglevel`, `repl-backlog-size`, `repl-backlog-ttl`, `repl-diskless-load` all apply immediately at runtime without restart |
 | `CONFIG REWRITE` | `CONFIG REWRITE` | Persist the current runtime config to the file the server was started with (default `/etc/kividb/kividb.conf`). Creates the file and parent directories if they don't exist. Atomic write via tmpfile-rename. Keeps the file's mode, and its owner when run as root; a new file is `0600`. Redis resets the mode to `0644` less the umask instead |
 | `CONFIG RESETSTAT` | `CONFIG RESETSTAT` | Returns OK |
 | `OBJECT ENCODING` | `OBJECT ENCODING key` | The encoding Redis would use for the value, from its size and the `*-max-listpack-*` / `set-max-intset-entries` settings: `int`, `embstr` or `raw` for strings; `listpack` or `quicklist` for lists; `listpack`, `intset` or `hashtable` for sets; `listpack` or `hashtable` for hashes; `listpack` or `skiplist` for sorted sets; `stream`. KiviDB stores each type one way internally; the name is for clients and tests that look at it |
@@ -832,7 +832,7 @@ Shard channel message (SSUBSCRIBE / SPUBLISH):
 | `PSYNC` | `PSYNC repl_id offset` | Internal replication sync command |
 | `SYNC` | `SYNC` | Old-style full synchronisation for a replica: the snapshot, then the command stream |
 | `WAIT` | `WAIT numreplicas timeout` | Block until `numreplicas` replicas have acknowledged all preceding writes, or `timeout` milliseconds elapse; returns the number of replicas that acked |
-| `WAITAOF` | `WAITAOF numlocal numreplicas timeout` | Block until the local AOF has fsynced all preceding writes, or `timeout` milliseconds elapse; returns `[local_fsynced, replica_fsynced]` |
+| `WAITAOF` | `WAITAOF numlocal numreplicas timeout` | Block until the local AOF has fsynced all preceding writes, or `timeout` milliseconds elapse; returns `[local_fsynced, replica_fsynced]`, the first 1 once the write is fsynced. With the AOF off, a `numlocal` above 0 is an error and `WAITAOF 0 ...` replies `[0, 0]`, as in Redis |
 | `SWAPDB` | `SWAPDB db1 db2` | Atomically swap the contents of two databases |
 | `SHUTDOWN` | `SHUTDOWN [NOSAVE \| SAVE \| NOW \| FORCE \| ABORT]` | Gracefully stop the server. `NOSAVE` skips the final snapshot. `NOW` skips the AOF flush wait. `FORCE` ignores replica/AOF state. `ABORT` cancels a pending shutdown. Default (no modifier) writes a snapshot then exits |
 | `MONITOR` | `MONITOR` | Stream every command executed on the server to this connection in real time. Format: `+<unix-ts.us> [<db> <addr>] "CMD" "arg1"`. Commands a script calls are shown with `lua` as the address, and a transaction as `MULTI`, its commands, `EXEC`. Administrative commands (`AUTH`, `CONFIG`, …) are not shown, as in Redis. `RESET` or `QUIT` leaves the mode. Zero cost when no monitors are connected (one atomic load per command) |
@@ -875,7 +875,7 @@ Shard channel message (SSUBSCRIBE / SPUBLISH):
 
 ## ACL commands
 
-KiviDB implements a single-user ACL subsystem with full Redis 6 ACL command compatibility. The `default` user always exists and cannot be deleted. Additional users can be created, stored, and queried. Command permission rules are enforced on every connection.
+KiviDB implements Redis 6's ACLs, with several users. The `default` user always exists and cannot be deleted. Additional users can be created, stored, and queried. Command permission rules are enforced on every connection.
 
 ### Authentication
 
@@ -906,7 +906,7 @@ KiviDB implements a single-user ACL subsystem with full Redis 6 ACL command comp
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `ACL GENPASS` | `ACL GENPASS [bits]` | Generate a cryptographically random hex password; `bits` defaults to 256, must be between 4 and 4096 and divisible by 4 |
+| `ACL GENPASS` | `ACL GENPASS [bits]` | Generate a cryptographically random hex password, a digit per 4 bits; `bits` defaults to 256 and may be 1 to 4096 (rounded up to a multiple of 4: `ACL GENPASS 5` gives two digits) |
 | `ACL SAVE` | `ACL SAVE` | Save all users to the configured ACL file (`--aclfile`); returns `ERR` if no ACL file is configured |
 | `ACL LOAD` | `ACL LOAD` | Reload users from the configured ACL file; returns `ERR` if no ACL file is configured |
 
@@ -1046,7 +1046,7 @@ A cluster node has one keyspace: `SELECT` of any database but 0 is refused.
 | `CLUSTER MEET` | `CLUSTER MEET ip port [cluster-bus-port]` | Initiate handshake with a peer. Bus port defaults to `port + 10000`. A peer that cannot be reached leaves no entry behind. |
 | `CLUSTER FORGET` | `CLUSTER FORGET node-id` | Remove a node from the routing table. Slots owned by the forgotten node become unassigned. The node is refused re-admission for 60 seconds, so gossip from a node that has not been told yet does not bring it back. |
 | `CLUSTER LINKS` | `CLUSTER LINKS` | Report active bus links to peers. |
-| `CLUSTER REPLICAS` / `CLUSTER SLAVES` | `CLUSTER REPLICAS master-id` | List replicas of a given master. Aliases. |
+| `CLUSTER REPLICAS` / `CLUSTER SLAVES` | `CLUSTER REPLICAS master-id` | The replicas of a master: an array with one `CLUSTER NODES` line per replica (empty for a master without any). Aliases. |
 | `CLUSTER COUNT-FAILURE-REPORTS` | `CLUSTER COUNT-FAILURE-REPORTS node-id` | Number of distinct nodes currently flagging this node as failing. Excludes the local node's own opinion. |
 
 ### Replication and failover
@@ -1067,6 +1067,15 @@ detection algorithm: `node-timeout` (default 15000ms, configurable via
 `--cluster-node-timeout`) without a PONG marks a peer `PFAIL` (local opinion);
 when a quorum of masters concur via gossip, the flag escalates to `FAIL`
 (cluster opinion).
+
+When a master fails, its replicas do not race blindly: each asks the others
+how far it has read, and waits an extra second for every one that has read
+further, so the most up-to-date replica normally stands first and wins, as in
+Redis. A replica whose link to its master has been down for longer than
+`cluster-node-timeout × cluster-replica-validity-factor` plus
+`repl-ping-replica-period` does not stand at all: its data is too old to take
+over with (`cluster-replica-validity-factor 0` lets it stand anyway).
+`CLUSTER FAILOVER` is not subject to either.
 
 A master that comes back after it has been replaced finds its slots claimed at
 a higher epoch and becomes a replica of the node that took them. While a slot
@@ -1097,6 +1106,16 @@ now are — and no acknowledged write is lost or applied twice. The pause is
 bounded by `--cluster-slot-migration-write-pause-timeout` (default 10000 ms),
 after which the attempt is abandoned and retried. During the pause all client
 writes to the source wait, not only those for the moving slots.
+
+Until the takeover, what the destination has received is a copy: the source
+still owns and serves the slots. If the destination goes down before taking
+them over, the import is over (tasks are kept in memory), and when it starts
+again it deletes the keys it had received in slots it does not own. It knows
+which imports were under way from `<cluster-config-file>.imports`, which it
+keeps next to its cluster config. The takeover itself is saved to the cluster
+config before the source is told, and if that save fails the slots stay with
+the source. Keys moved here with `MIGRATE`, key by key, are left alone: the
+source deleted them as it sent them.
 
 **The classical workflow**, which `redis-cli --cluster reshard` and
 `rebalance` drive:
@@ -1140,7 +1159,7 @@ deletes the keys it holds for that slot, as Redis does.
 
 | Command | Syntax | Notes |
 |---|---|---|
-| `CLUSTER SLOT-STATS` | `CLUSTER SLOT-STATS SLOTSRANGE start end` or `CLUSTER SLOT-STATS ORDERBY metric [LIMIT n] [ASC \| DESC]` | Per-slot stats. Only `key-count` carries real data; `cpu-usec` / `network-bytes-in` / `network-bytes-out` are reported as 0 (no per-slot instrumentation yet). `ORDERBY` only accepts `key-count`. |
+| `CLUSTER SLOT-STATS` | `CLUSTER SLOT-STATS SLOTSRANGE start end` or `CLUSTER SLOT-STATS ORDERBY metric [LIMIT n] [ASC \| DESC]` | Per-slot stats. Only `key-count` carries real data; `cpu-usec` / `network-bytes-in` / `network-bytes-out` are reported as 0 (no per-slot instrumentation yet). `ORDERBY` only accepts `key-count`, and sorts descending (the busiest slots first) unless `ASC` is given, as in Redis. |
 
 ### Configuration flags
 
@@ -1150,8 +1169,10 @@ deletes the keys it holds for that slot, as Redis does.
 | `--cluster-node-timeout <ms>` | `15000` | PFAIL threshold. Lower values detect faster, increase false positives under jitter. |
 | `--cluster-config-file <path>` | `nodes.conf` | Where the topology is persisted. |
 | `--cluster-require-full-coverage yes\|no` | `yes` | Stop serving keyed commands while any slot is unassigned or its owner has failed. |
+| `--cluster-replica-validity-factor <n>` | `10` | A replica out of touch with its master for longer than this many node timeouts (plus `repl-ping-replica-period`) does not stand for election when the master fails. `0`: always stand. Settable at runtime. |
 | `--cluster-announce-ip <addr>` | (observed) | The address this node tells the cluster to reach it on — for NAT, containers and Kubernetes. |
 | `--cluster-announce-port <port>` / `--cluster-announce-bus-port <port>` | client port / +10000 | The ports announced with it. |
+| `--cluster-announce-client-port <port>` | `0` (the client port) | The port *clients* are told: in `MOVED`/`ASK` and `CLUSTER SLOTS`, `SHARDS` and `NODES`. Nodes keep reaching each other at the client port. For a NodePort, or a load balancer that maps ports. Settable at runtime. |
 | `--cluster-bus-port-protected-mode yes\|no` | `no` | Refuse to start as a cluster node while the bus is unauthenticated. |
 | `--cluster-slot-migration-handoff-max-lag-bytes <n>` | `1048576` | Atomic slot migration: how close the destination must be before writes are paused for the handoff. |
 | `--cluster-slot-migration-write-pause-timeout <ms>` | `10000` | Atomic slot migration: the longest writes stay paused for a handoff. |
@@ -1299,7 +1320,7 @@ When enabled, behaviour aims for **Redis compatibility**: sandboxed Lua 5.4 (`ml
 | `SCRIPT EXISTS` | `SCRIPT EXISTS sha1 [sha1 ...]` | Test whether SHA1 digests are loaded |
 | `SCRIPT FLUSH` | `SCRIPT FLUSH [ASYNC \| SYNC]` | Clear the script cache |
 | `SCRIPT LOAD` | `SCRIPT LOAD script` | Load script body; returns SHA1 |
-| `SCRIPT KILL` | `SCRIPT KILL` | Kill a long-running script (subject to Redis rules) |
+| `SCRIPT KILL` | `SCRIPT KILL` | Stop the running script, if it has not written; one that has is answered `UNKILLABLE`, as in Redis, and runs on (`SHUTDOWN NOSAVE` is the way out) |
 | `SCRIPT DEBUG` | `SCRIPT DEBUG YES \| SYNC \| NO` | Accepted; there is no Lua debugger, and scripts run as usual |
 | `FUNCTION LOAD` | `FUNCTION LOAD [REPLACE] library-code` | Load a function library (first line `#!lua name=<library>`). The code runs with only `redis.register_function`, `redis.log` and the version constants in reach — no `redis.call`, no `math` — and cannot set globals; it is stopped after 500 ms. A load is all of a library or none of it: an error leaves the library it was to replace as it was. A function's name belongs to one library. Library names are case-sensitive. Refused at the memory limit |
 | `FUNCTION DELETE` | `FUNCTION DELETE library-name` | Delete a library and its functions |
@@ -1323,7 +1344,7 @@ Tracks commands that exceed a configurable execution-time threshold. Stored in a
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--slowlog-log-slower-than` | `10000` | Threshold in microseconds. `0` logs every command. Commands faster than this are not recorded |
+| `--slowlog-log-slower-than` | off (`-1`) | Threshold in microseconds. `0` logs every command, a negative value none. Commands faster than this are not recorded |
 | `--slowlog-max-len` | `128` | Maximum number of entries to keep. Oldest entries are evicted when full |
 | `--slowlog-entry-max-argc` | `32` | Arguments kept per entry (Redis 8.8); the rest are summarised as `... (N more arguments)` |
 | `--slowlog-entry-max-string-len` | `128` | Bytes kept per argument (Redis 8.8); the rest are summarised as `... (N more bytes)` |
@@ -1332,7 +1353,7 @@ Tracks commands that exceed a configurable execution-time threshold. Stored in a
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `SLOWLOG GET` | `SLOWLOG GET [count]` | Return the last `count` entries (default 128), newest first. Returns an empty array if no entries exist |
+| `SLOWLOG GET` | `SLOWLOG GET [count]` | Return the last `count` entries (default 10, as in Redis; `slowlog-max-len`, 128, is how many are kept), newest first. Returns an empty array if no entries exist |
 | `SLOWLOG LEN` | `SLOWLOG LEN` | Return the current number of entries in the log |
 | `SLOWLOG RESET` | `SLOWLOG RESET` | Clear all entries. Returns `OK` |
 
@@ -1363,22 +1384,21 @@ $<len> <client-name>      ← CLIENT SETNAME value, or empty string if unnamed
 
 ### LATENCY
 
-Tracks per-event latency histograms in memory. Two events are recorded automatically for every command: `command` (commands that took ≥ 1ms) and `fast-command` (commands that took < 1ms). Up to 180 samples per event are retained (matching Redis), oldest evicted first.
+Tracks per-event latency samples in memory, as Redis's latency monitor does. With `latency-monitor-threshold` set (milliseconds; `0`, the default, is off), a command that takes at least that long is recorded as `fast-command` if Redis flags it fast (`GET`, `SET`, ...) and as `command` otherwise, and an expire cycle as `expire-cycle`. Up to 180 samples per event are retained (matching Redis), oldest evicted first.
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `LATENCY LATEST` | `LATENCY LATEST` | Return the most recent sample for each tracked event as `[[event, timestamp_secs, latency_ms], ...]` |
+| `LATENCY LATEST` | `LATENCY LATEST` | Return the most recent sample for each tracked event as `[[event, timestamp_secs, latest_ms, max_ms], ...]`, as Redis does |
 | `LATENCY HISTORY` | `LATENCY HISTORY event` | Return all stored samples for `event` in chronological order as `[[timestamp_secs, latency_ms], ...]`. Returns an empty array for unknown events |
 | `LATENCY RESET` | `LATENCY RESET [event ...]` | Clear all events (no args) or the named ones. Returns the number of events that had samples to clear |
-| `LATENCY GRAPH` | `LATENCY GRAPH event` | Return a UTF-8 sparkline string (up to 80 chars, using `▁▂▃▄▅▆▇█`) visualising the history of `event`. Returns an error if the event has no samples |
+| `LATENCY GRAPH` | `LATENCY GRAPH event` | Return Redis's ASCII graph of the history of `event`: a header with the high and the low, a rule, and a sparkline of `_`, `o`, `#` and `|`. Returns an error if the event has no samples |
 | `LATENCY HISTOGRAM` | `LATENCY HISTOGRAM [command ...]` | Per command, its number of calls and how many took less than each power of two of microseconds (`calls`, `histogram_usec`) — a map under RESP3. With no arguments, every command that has been called |
 | `LATENCY DOCTOR` | `LATENCY DOCTOR` | Return a human-readable diagnostic report. Flags events whose latest sample exceeds warning (≥100ms) or critical (≥500ms) thresholds. Returns Redis's exact clean-bill-of-health message when no issues are detected |
 
 **Design notes:**
 
-- The two built-in events (`command`, `fast-command`) are classified at timing time in `server.rs` and `server_uring.rs`, not inside `execute_command` itself
-- `LATENCY RESET` and `LATENCY HISTORY` are themselves timed commands — after a `RESET`, up to 2–3 new samples may immediately appear from the reset and subsequent read calls
-- The underlying `LatencyTracker` uses `parking_lot::RwLock<AHashMap<String, VecDeque<LatencySample>>>` — the same lock guards all events, kept intentionally simple since latency recording is not on the sub-microsecond hot path
+- `command` and `fast-command` are recorded where `execute_command` times the command, by `latency-monitor-threshold`, not by `slowlog-log-slower-than`; `INFO latencystats` gives each command's percentiles (`latency-tracking-info-percentiles`) from the same histogram as `LATENCY HISTOGRAM`
+- One lock guards all events: a sample is recorded only for a command over the threshold, never on the fast path
 - `SLOWLOG` and `LATENCY` are independent subsystems — resetting one does not affect the other
 
 ### HOTKEYS
@@ -1445,7 +1465,7 @@ Scripting (`EVAL`, `SCRIPT`, `FUNCTION`, `FCALL`, …) is **supported when built
 | `OBJECT REFCOUNT` | Always returns 1; does not reflect actual Arc strong_count |
 | `CONFIG SET` | All documented parameters apply immediately at runtime. `loglevel` updates the global level but does not suppress existing log call sites — log filtering is best-effort |
 | `OBJECT IDLETIME` under `noeviction` | `0`: when and how often keys are used is recorded only while a `maxmemory-policy` that goes by it is selected, so that the default costs a command nothing |
-| RDB import from `dump.rdb` | All Redis types and LZF-compressed strings supported; Stream, TimeSeries, and VectorSet keys cannot be imported from Redis RDB format |
+| RDB import from `dump.rdb` | Every core Redis type, streams and hash fields with their own TTLs included, LZF-compressed strings, RedisJSON documents and function libraries. Search index definitions and dictionaries are left out (run `FT.CREATE` again); a file with other module data (TimeSeries, VectorSet, Bloom) is refused. HyperLogLogs are not in Redis's layout yet ([#62](https://github.com/kividbio/kividb/issues/62)). See [docs/MIGRATING_FROM_REDIS.md](docs/MIGRATING_FROM_REDIS.md) |
 | `WAIT` | Blocks using async polling with 1ms sleep intervals via `tokio::time::sleep`; does not use kernel wakeup. Accuracy is sufficient for production but not sub-millisecond |
 | `WAITAOF` | Local AOF fsync is triggered immediately on `WAITAOF` via a flush request channel; fsync granularity depends on how fast the AOF writer task is scheduled. Replica AOF ack tracking is not implemented — `replica_fsynced` always returns 0 |
 | `maxmemory` enforcement | Measured against allocated memory, and checked on every write (the figure a thread compares with is refreshed every 32 commands). Every Redis policy is implemented, including the 8.6 `allkeys-lrm` / `volatile-lrm`. A replica does not enforce it on what its master sends, and `EXEC` and scripts are checked once, when they start |

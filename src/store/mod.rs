@@ -12,14 +12,17 @@ use crate::types::KiviDBValue;
 /// Which shard `key` is in, of `shards` (a power of two). The keyspace and
 /// the expiry store have the same number, so one index serves both: a
 /// command that looks in both hashes its key once.
+///
+/// 64-bit FNV-1a on every target (a 32-bit `usize` can't hold its
+/// constants); the shard is taken from its low bits.
 #[inline]
 pub fn shard_index(shards: usize, key: &str) -> usize {
-    let mut hash: usize = 0xcbf29ce484222325;
+    let mut hash: u64 = 0xcbf29ce484222325;
     for byte in key.bytes() {
-        hash ^= byte as usize;
+        hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    hash & (shards - 1)
+    (hash as usize) & (shards - 1)
 }
 
 pub fn get_shard<'a>(db: &'a Db, key: &str) -> &'a Shard {
@@ -114,6 +117,48 @@ impl ExpiryCell {
     pub fn holds_nothing(&self) -> bool {
         self.len.load(Ordering::Acquire) == 0
     }
+
+    /// [`shrink_if_sparse`] for this shard's times. The count is left as it
+    /// is: shrinking takes no key out.
+    pub fn shrink_if_sparse(&self) -> bool {
+        shrink_if_sparse(&self.map)
+    }
+}
+
+/// Tables with room for fewer keys than this are left as they are: what
+/// shrinking one would give back is not worth a rehash.
+const SHRINK_MIN_CAPACITY: usize = 256;
+
+/// Give a table back the room of keys that have gone (#113).
+///
+/// A hash table grows as keys come and does not shrink as they go: after a
+/// reshard moved half the keys away, or a big delete, each shard's table
+/// kept the size it had at its largest, and the memory of every empty slot.
+/// Called on each shard about once a second (see
+/// `commands::helpers::shrink_sparse_tables`), as Redis resizes its tables
+/// from its cron.
+///
+/// A table holding no more than 4/9 of what it has room for is shrunk to
+/// its keys and an eighth more. Tables grow by doubling, so the smallest one
+/// with that room has room for less than twice it: a table just shrunk, and
+/// one just grown, are never sparse enough to shrink, and a shard does not
+/// go back and forth unless its keys do, by more than an eighth. The rehash
+/// holds the shard's lock no longer than the growth it undoes did. Returns
+/// whether it shrank.
+pub fn shrink_if_sparse<V>(map: &RwLock<AHashMap<Key, V>>) -> bool {
+    let sparse = |m: &AHashMap<Key, V>| {
+        m.capacity() >= SHRINK_MIN_CAPACITY && m.len() * 9 <= m.capacity() * 4
+    };
+    if !sparse(&map.read()) {
+        return false;
+    }
+    let mut m = map.write();
+    if !sparse(&m) {
+        return false;
+    }
+    let keep = m.len() + m.len() / 8;
+    m.shrink_to(keep);
+    true
 }
 
 impl Default for ExpiryCell {
@@ -566,6 +611,54 @@ mod staging_swap_tests {
         assert!(get_expiry_shard(&live[0], k).read().get(k).is_none());
         swap_expiry_with_staging(&live, &staging);
         assert_eq!(get_expiry_shard(&live[0], k).read().get(k), Some(&t));
+    }
+}
+
+#[cfg(test)]
+mod shrink_tests {
+    use super::*;
+
+    fn table(keys: usize) -> RwLock<AHashMap<Key, u64>> {
+        let map: AHashMap<Key, u64> = (0..keys as u64)
+            .map(|i| (Key::from(format!("key-{i}")), i))
+            .collect();
+        RwLock::new(map)
+    }
+
+    #[test]
+    fn a_table_keys_have_mostly_left_shrinks_once() {
+        let map = table(100_000);
+        let grown = map.read().capacity();
+        map.write().retain(|_, i| *i % 10 == 0);
+        assert!(shrink_if_sparse(&map));
+        let shrunk = map.read().capacity();
+        assert!(shrunk * 4 < grown, "{grown} -> {shrunk}");
+        assert!(shrunk >= 10_000 + 10_000 / 8, "no room left: {shrunk}");
+        assert_eq!(map.read().len(), 10_000);
+        assert_eq!(map.read().get("key-990"), Some(&990));
+        // Not again until more keys go.
+        assert!(!shrink_if_sparse(&map));
+    }
+
+    #[test]
+    fn full_small_and_just_grown_tables_are_left_alone() {
+        let map = table(100_000);
+        assert!(!shrink_if_sparse(&map));
+        let small = table(100);
+        small.write().clear();
+        assert!(!shrink_if_sparse(&small));
+        // Grown by one key past its room: half empty, but not sparse.
+        let map = table(0);
+        let mut i = 0u64;
+        loop {
+            let before = map.read().capacity();
+            map.write().insert(Key::from(format!("key-{i}")), i);
+            i += 1;
+            if before >= 4096 && map.read().capacity() > before {
+                break;
+            }
+        }
+        assert!(!shrink_if_sparse(&map));
     }
 }
 

@@ -19,7 +19,7 @@ mod imp {
     use rustls_pemfile::{certs, private_key};
     use std::fs::File;
     use std::io::BufReader;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::Arc;
     use tokio_rustls::rustls;
     use tokio_rustls::rustls::client::danger::{
         HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
@@ -34,9 +34,15 @@ mod imp {
         replication: bool,
         client: Arc<ClientConfig>,
         bus: tokio_rustls::TlsAcceptor,
+        files: crate::tls::acceptor::Files,
     }
 
-    static SETTINGS: OnceLock<Settings> = OnceLock::new();
+    /// Set at startup; replaced by `CONFIG SET` of a TLS file (#156).
+    static SETTINGS: parking_lot::RwLock<Option<Arc<Settings>>> = parking_lot::const_rwlock(None);
+
+    fn settings() -> Option<Arc<Settings>> {
+        SETTINGS.read().clone()
+    }
 
     /// Checks the chain against the CA, and not the name: see the module.
     #[derive(Debug)]
@@ -98,16 +104,47 @@ mod imp {
         if !config.tls_cluster && !config.tls_replication {
             return Ok(());
         }
+        let built = build(
+            crate::tls::acceptor::Files::of(config),
+            config.tls_cluster,
+            config.tls_replication || config.tls_cluster,
+        )?;
+        // The first server of the process sets it up.
+        SETTINGS.write().get_or_insert(Arc::new(built));
+        Ok(())
+    }
+
+    /// The files TLS between nodes is set up from now, if it is on.
+    pub fn files() -> Option<crate::tls::acceptor::Files> {
+        settings().map(|s| s.files.clone())
+    }
+
+    /// Set TLS between nodes up again from `files`: connections from now on
+    /// use them (#156). Nothing changes if they cannot be loaded.
+    pub fn reload(files: crate::tls::acceptor::Files) -> Result<(), String> {
+        let Some(now) = settings() else {
+            return Ok(());
+        };
+        let built = build(files, now.cluster, now.replication)?;
+        *SETTINGS.write() = Some(Arc::new(built));
+        Ok(())
+    }
+
+    fn build(
+        files: crate::tls::acceptor::Files,
+        cluster: bool,
+        replication: bool,
+    ) -> Result<Settings, String> {
         let mut roots = RootCertStore::empty();
-        for cert in read_certs(&config.tls_ca_cert_file)? {
+        for cert in read_certs(&files.ca)? {
             roots
                 .add(cert)
                 .map_err(|e| format!("invalid CA certificate: {e}"))?;
         }
-        let (cert_path, key_path) = if config.tls_client_cert_file.is_empty() {
-            (&config.tls_cert_file, &config.tls_key_file)
+        let (cert_path, key_path) = if files.client_cert.is_empty() {
+            (&files.cert, &files.key)
         } else {
-            (&config.tls_client_cert_file, &config.tls_client_key_file)
+            (&files.client_cert, &files.client_key)
         };
         let chain = read_certs(cert_path)?;
         let key_file =
@@ -124,27 +161,22 @@ mod imp {
             .with_client_auth_cert(chain, key)
             .map_err(|e| format!("client certificate: {e}"))?;
         // The bus asks every node for its certificate.
-        let bus = crate::tls::acceptor::build(
-            &config.tls_cert_file,
-            &config.tls_key_file,
-            &config.tls_ca_cert_file,
-            "yes",
-        )?;
-        let _ = SETTINGS.set(Settings {
-            cluster: config.tls_cluster,
-            replication: config.tls_replication || config.tls_cluster,
+        let bus = crate::tls::acceptor::build(&files.cert, &files.key, &files.ca, "yes")?;
+        Ok(Settings {
+            cluster,
+            replication,
             client: Arc::new(client),
             bus,
-        });
-        Ok(())
+            files,
+        })
     }
 
     pub fn cluster() -> bool {
-        SETTINGS.get().is_some_and(|s| s.cluster)
+        settings().is_some_and(|s| s.cluster)
     }
 
     pub fn replication() -> bool {
-        SETTINGS.get().is_some_and(|s| s.replication)
+        settings().is_some_and(|s| s.replication)
     }
 
     fn name_for(host: &str) -> ServerName<'static> {
@@ -156,9 +188,8 @@ mod imp {
         host: &str,
         tcp: tokio::net::TcpStream,
     ) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
-        let settings = SETTINGS
-            .get()
-            .ok_or_else(|| std::io::Error::other("TLS between nodes is not set up"))?;
+        let settings =
+            settings().ok_or_else(|| std::io::Error::other("TLS between nodes is not set up"))?;
         tokio_rustls::TlsConnector::from(Arc::clone(&settings.client))
             .connect(name_for(host), tcp)
             .await
@@ -167,18 +198,16 @@ mod imp {
     pub async fn accept_bus(
         tcp: tokio::net::TcpStream,
     ) -> std::io::Result<tokio_rustls::server::TlsStream<tokio::net::TcpStream>> {
-        let settings = SETTINGS
-            .get()
-            .ok_or_else(|| std::io::Error::other("TLS between nodes is not set up"))?;
+        let settings =
+            settings().ok_or_else(|| std::io::Error::other("TLS between nodes is not set up"))?;
         settings.bus.accept(tcp).await
     }
 
     pub type SyncTls = rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>;
 
     pub fn connect_sync(host: &str, tcp: std::net::TcpStream) -> std::io::Result<SyncTls> {
-        let settings = SETTINGS
-            .get()
-            .ok_or_else(|| std::io::Error::other("TLS between nodes is not set up"))?;
+        let settings =
+            settings().ok_or_else(|| std::io::Error::other("TLS between nodes is not set up"))?;
         let conn = rustls::ClientConnection::new(Arc::clone(&settings.client), name_for(host))
             .map_err(std::io::Error::other)?;
         let mut stream = rustls::StreamOwned::new(conn, tcp);
@@ -192,7 +221,7 @@ mod imp {
 }
 
 #[cfg(feature = "tls")]
-pub use imp::{accept_bus, cluster, connect_async, connect_sync, init, replication};
+pub use imp::{accept_bus, cluster, connect_async, connect_sync, files, init, reload, replication};
 
 #[cfg(not(feature = "tls"))]
 pub fn init(config: &crate::config::Config) -> Result<(), String> {

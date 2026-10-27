@@ -122,7 +122,7 @@ where
     let (unblock_tx, mut unblock_rx) = tokio::sync::oneshot::channel();
     waiter
         .client_registry
-        .set_blocked(waiter.client_id, Some(unblock_tx));
+        .set_blocked(waiter.client_id, Some(unblock_tx), wait.has_timeout());
     let delivery = {
         let waiting = wait.wait();
         tokio::pin!(waiting);
@@ -138,6 +138,7 @@ where
                 read = waiter.reader.read(&mut temp) => match read {
                     Ok(n) if n > 0 => {
                         crate::stats::TOTAL_NET_INPUT_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+                        crate::stats::record_read();
                         waiter.carried.extend_from_slice(&temp[..n]);
                         // The client sent something while it was parked, so it
                         // is not idle: restart its idle clock.
@@ -163,7 +164,9 @@ where
             }
         }
     };
-    waiter.client_registry.set_blocked(waiter.client_id, None);
+    waiter
+        .client_registry
+        .set_blocked(waiter.client_id, None, false);
     // However it ended, the command is dispatched again: with what it was
     // waiting for, or as if its time had run out — which is also how it
     // leaves the line it was standing in.
@@ -203,6 +206,7 @@ where
         return Ok(());
     }
     crate::stats::TOTAL_NET_OUTPUT_BYTES.fetch_add(combined.len() as u64, Ordering::Relaxed);
+    crate::stats::record_write();
     let mut g = w.lock().await;
     g.write_all(combined).await?;
     combined.clear();
@@ -233,6 +237,7 @@ where
                 continue;
             }
             crate::stats::TOTAL_NET_OUTPUT_BYTES.fetch_add(frames.len() as u64, Ordering::Relaxed);
+            crate::stats::record_write();
             if g.write_all(&frames).await.is_err() {
                 break;
             }
@@ -277,6 +282,7 @@ where
                 out_buf.extend_from_slice(&r2);
             }
             crate::stats::TOTAL_NET_OUTPUT_BYTES.fetch_add(out_buf.len() as u64, Ordering::Relaxed);
+            crate::stats::record_write();
             let mut g = writer.lock().await;
             if g.write_all(&out_buf).await.is_err() {
                 break;
@@ -406,13 +412,15 @@ where
     // Push notifications (CLIENT TRACKING invalidations, etc.) need a dedicated
     // forwarder task so they are delivered immediately — not held until the next
     // client command arrives.
-    let (push_tx, mut push_rx) = mpsc::channel::<Vec<u8>>(512);
+    let (push_tx, mut push_rx) =
+        mpsc::channel::<Vec<u8>>(crate::client_registry::PUSH_QUEUE_FRAMES);
     client_registry.register_push_tx(client_id, push_tx.clone());
     let writer_for_push = Arc::clone(&writer);
     let push_forwarder = tokio::spawn(async move {
         while let Some(msg) = push_rx.recv().await {
             let mut g = writer_for_push.lock().await;
             crate::stats::TOTAL_NET_OUTPUT_BYTES.fetch_add(msg.len() as u64, Ordering::Relaxed);
+            crate::stats::record_write();
             if g.write_all(&msg).await.is_err() {
                 break;
             }
@@ -467,6 +475,9 @@ where
 
     use crate::commands::transaction::TxState;
     let mut tx = TxState::new();
+    // A command of the batch being answered may have queued an AOF
+    // record: its reply waits for it (see `aof::written`).
+    let mut aof_wait = false;
     let dirty_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut combined = Vec::with_capacity(8192);
     // Negotiated RESP protocol version, updated by HELLO. Kept as local connection
@@ -588,6 +599,7 @@ where
             }
             crate::stats::TOTAL_NET_INPUT_BYTES
                 .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::stats::record_read();
             activity.note_read(n);
             buffer.extend_from_slice(&temp[..n]);
         } else {
@@ -666,6 +678,9 @@ where
             // for: it is one command.
             if !blocking_slot.resuming() {
                 activity.record(&cmd, selected_db);
+            }
+            if !aof_wait && crate::aof::acks_wait() && crate::aof::may_log(cmd[0]) {
+                aof_wait = true;
             }
             // The command before this one is over: its reply is settled, and
             // what it left to tell tracking clients follows it.
@@ -770,15 +785,6 @@ where
                     )
                     .await;
                     if slowlog_enabled && elapsed_us >= slowlog.threshold_us() {
-                        let elapsed_ms = (elapsed_us / 1000) as u32;
-                        latency.record(
-                            if elapsed_ms < 1 {
-                                "fast-command"
-                            } else {
-                                "command"
-                            },
-                            elapsed_ms,
-                        );
                         let client_name = client_registry
                             .get(client_id)
                             .map(|info| info.name.clone())
@@ -829,6 +835,9 @@ where
                         blocking: Some(blocking_slot.prime()),
                     });
                     if let Some(wait) = blocking_slot.take_parked() {
+                        if std::mem::take(&mut aof_wait) {
+                            crate::aof::written(&aof_tx).await;
+                        }
                         match park_blocking(
                             wait,
                             &mut blocking_slot,
@@ -906,6 +915,9 @@ where
                 });
                 if let Some(wait) = blocking_slot.take_parked() {
                     waited_from = Some(now_us());
+                    if std::mem::take(&mut aof_wait) {
+                        crate::aof::written(&aof_tx).await;
+                    }
                     match park_blocking(
                         wait,
                         &mut blocking_slot,
@@ -946,15 +958,6 @@ where
                     + waited_from.map_or(0, |from| now_us().saturating_sub(from));
 
                 if elapsed_us >= slowlog.threshold_us() {
-                    let elapsed_ms = (elapsed_us / 1000) as u32;
-                    latency.record(
-                        if elapsed_ms < 1 {
-                            "fast-command"
-                        } else {
-                            "command"
-                        },
-                        elapsed_ms,
-                    );
                     let client_name = client_registry
                         .get(client_id)
                         .map(|info| info.name.clone())
@@ -1011,6 +1014,11 @@ where
                     .and_then(|user| crate::acl::check_permission(user, &cmd_name, &cmd).err());
                 if let Some(denied) = denied {
                     acl_log.record(denied.reason(), denied.object(), username, &peer_addr);
+                    // Refused inside MULTI, it is not queued, and EXEC runs nothing, as
+                    // for a command refused for any other reason (#159).
+                    if tx.active {
+                        tx.aborted = true;
+                    }
                     combined
                         .extend_from_slice(format!("-{}\r\n", denied.message(username)).as_bytes());
                     parse_offset += consumed;
@@ -1025,6 +1033,13 @@ where
             // it has subscriptions. Inside MULTI they are queued like any other
             // command, and EXEC runs them (#23).
             if crate::pubsub::is_subscription_command(cmd_name.as_str()) && !tx.active {
+                if let Some(refusal) =
+                    crate::pubsub::shard_subscribe_refusal(cmd_name.as_str(), &cmd, &cluster_state)
+                {
+                    combined.extend_from_slice(&refusal);
+                    parse_offset += consumed;
+                    continue;
+                }
                 let subs = subscriptions.get_or_insert_with(|| {
                     open_subscriptions(&pubsub, &client_registry, client_id, &writer)
                 });
@@ -1048,6 +1063,14 @@ where
             // A replica whose dataset may already be this master's is first
             // offered the fingerprint (see `replication::digest`), and the
             // connection stays a client until it asks again.
+            // A replica does not take replicas of its own (#144).
+            if (cmd_name == "PSYNC" || cmd_name == "SYNC") && repl_state.is_slave() {
+                combined.extend_from_slice(&crate::resp::write::resp_error(
+                    crate::replication::NOT_A_MASTER,
+                ));
+                parse_offset += consumed;
+                continue;
+            }
             if cmd_name == "PSYNC"
                 && let Some(offer) = repl_state.digest_offer(&client_registry, client_id, &cmd)
             {
@@ -1265,6 +1288,10 @@ where
                         // command, the transaction is alone: no other command —
                         // read or write — runs in between. See `command_gate`.
                         let _alone = crate::command_gate::enter_alone();
+                        // And as one write: a snapshot, a backup or a full sync cuts
+                        // before it or after it, never between two of its commands
+                        // (#148). The writes it runs are inside this one.
+                        let _whole = crate::write_gate::enter();
                         if dirty_flag.load(std::sync::atomic::Ordering::Acquire) {
                             watch_registry.as_ref().unwatch_all(
                                 &tx.watched_keys
@@ -1604,15 +1631,6 @@ where
                                 };
 
                                 if elapsed_us >= slowlog.threshold_us() {
-                                    let elapsed_ms = (elapsed_us / 1000) as u32;
-                                    latency.record(
-                                        if elapsed_ms < 1 {
-                                            "fast-command"
-                                        } else {
-                                            "command"
-                                        },
-                                        elapsed_ms,
-                                    );
                                     slowlog.record(
                                         &raw_cmd,
                                         elapsed_us,
@@ -1646,6 +1664,10 @@ where
                     // nopass users authenticate with any password.
                     if cmd.len() < 2 {
                         b"-ERR wrong number of arguments for 'auth' command\r\n".to_vec()
+                    } else if cmd.len() == 2 && crate::acl::default_user_is_open(&acl_store) {
+                        // As Redis: how a client learns that the password it
+                        // was given is not in use. It was answered OK (#135).
+                        crate::acl::AUTH_WITHOUT_PASSWORD.as_bytes().to_vec()
                     } else {
                         let (provided_username, provided_password) = if cmd.len() >= 3 {
                             // AUTH username password
@@ -1869,14 +1891,23 @@ where
                 "WAITAOF" => {
                     if cmd.len() < 4 {
                         b"-ERR wrong number of arguments for 'waitaof' command\r\n".to_vec()
-                    } else if !aof_enabled {
-                        b"*2\r\n:1\r\n:0\r\n".to_vec()
+                    } else if !aof_enabled
+                        && !crate::aof::AOF_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        // Nothing goes to an AOF, so nothing is on disk by
+                        // one: it answered that the write was (#137). On at
+                        // the start, or turned on since by `CONFIG SET`.
+                        let num_local = std::str::from_utf8(cmd[1])
+                            .ok()
+                            .and_then(|s| s.parse::<i64>().ok())
+                            .unwrap_or(0);
+                        if num_local != 0 {
+                            b"-ERR WAITAOF cannot be used when numlocal is set but appendonly is disabled.\r\n"
+                                .to_vec()
+                        } else {
+                            b"*2\r\n:0\r\n:0\r\n".to_vec()
+                        }
                     } else {
-                        let num_local: i64 =
-                            std::str::from_utf8(cmd.get(1).copied().unwrap_or(b"0"))
-                                .ok()
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(0);
                         let timeout_ms: u64 =
                             std::str::from_utf8(cmd.get(3).copied().unwrap_or(b"0"))
                                 .ok()
@@ -1898,12 +1929,10 @@ where
                         loop {
                             let fsynced =
                                 crate::aof::AOF_FSYNCED.load(std::sync::atomic::Ordering::Relaxed);
+                            // As Redis: 1 once the write is on disk here,
+                            // whatever `numlocal` asked for.
                             if fsynced >= target {
-                                if num_local > 0 {
-                                    break b"*2\r\n:1\r\n:0\r\n".to_vec();
-                                } else {
-                                    break b"*2\r\n:0\r\n:0\r\n".to_vec();
-                                }
+                                break b"*2\r\n:1\r\n:0\r\n".to_vec();
                             }
                             if tokio::time::Instant::now() >= deadline {
                                 break b"*2\r\n:0\r\n:0\r\n".to_vec();
@@ -2148,15 +2177,6 @@ where
                     };
 
                     if elapsed_us >= slowlog.threshold_us() {
-                        let elapsed_ms = (elapsed_us / 1000) as u32;
-                        latency.record(
-                            if elapsed_ms < 1 {
-                                "fast-command"
-                            } else {
-                                "command"
-                            },
-                            elapsed_ms,
-                        );
                         let client_name = client_registry
                             .get(client_id)
                             .map(|info| info.name.clone())
@@ -2243,6 +2263,11 @@ where
 
         // One TCP write per read syscall batch (pipelining).
         activity.note_flush(combined.len(), commands_before);
+        activity.note_tx(tx.active.then_some(tx.queue.len()), tx.watched_keys.len());
+        // Replies to writes go out once their records are in the AOF (#147).
+        if std::mem::take(&mut aof_wait) {
+            crate::aof::written(&aof_tx).await;
+        }
         if write_tcp_batch(&writer, &mut combined).await.is_err() {
             break;
         }

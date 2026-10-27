@@ -65,6 +65,10 @@ impl Default for TrackingTableInner {
 /// A key the table has let go of, and the clients that were tracking it.
 pub type Dropped = (String, AHashSet<u64>);
 
+/// `tracking-table-max-keys` of a table made from now on: the configuration
+/// file's, else Redis's default (#142). `CONFIG SET` changes the table's own.
+pub static DEFAULT_MAX_KEYS: AtomicUsize = AtomicUsize::new(1_000_000);
+
 impl TrackingTableInner {
     pub fn new() -> Self {
         Self {
@@ -73,7 +77,7 @@ impl TrackingTableInner {
             broadcasting: AtomicUsize::new(0),
             pending: parking_lot::Mutex::new(Vec::new()),
             has_pending: std::sync::atomic::AtomicBool::new(false),
-            max_keys: AtomicUsize::new(1_000_000),
+            max_keys: AtomicUsize::new(DEFAULT_MAX_KEYS.load(Ordering::Relaxed)),
             acl: std::sync::OnceLock::new(),
         }
     }
@@ -273,8 +277,25 @@ pub fn tell(
             if !before {
                 target.activity.push_after_reply(&frame);
             }
-        } else if let Some(tx) = &target.push_tx {
-            let _ = tx.try_send(frame);
+        } else if let Some(tx) = &target.push_tx
+            && let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx.try_send(frame)
+        {
+            // Dropped, the message would leave the client serving a key that
+            // has changed, with nothing to tell it so (#161). Closing the
+            // connection makes it drop what it cached, as a client does when
+            // it loses its connection; Redis closes one whose output buffer
+            // passed its limit the same way.
+            // Throttled: until the connection is gone, every write it is told
+            // of finds the queue full again.
+            log_throttled!(
+                10,
+                crate::loglevel::WARN,
+                "Client id={} closed: it uses client-side caching and did not read its \
+                 invalidation messages, over {} waiting",
+                target.id,
+                tx.max_capacity()
+            );
+            registry.kill(target.id);
         }
     };
     let (target, redirected) = match info.tracking_redirect {

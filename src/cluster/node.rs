@@ -57,6 +57,11 @@ pub struct ClusterNode {
     pub fail_since_ms: u64,
     /// The node's `cluster-announce-hostname`; empty if it announces none.
     pub hostname: String,
+    /// The node's `cluster-announce-client-port`: the port clients are told
+    /// to reach it on, where that is not `client_port` (a NodePort, a load
+    /// balancer that maps ports); 0 if it announces none. Nodes reach each
+    /// other at `client_port` regardless (#110).
+    pub announced_client_port: u16,
 }
 
 impl ClusterNode {
@@ -74,6 +79,17 @@ impl ClusterNode {
             pong_received_ms: 0,
             fail_since_ms: 0,
             hostname: String::new(),
+            announced_client_port: 0,
+        }
+    }
+
+    /// The port clients are told, in redirects and in `CLUSTER SLOTS`,
+    /// `SHARDS` and `NODES`.
+    pub fn client_facing_port(&self) -> u16 {
+        if self.announced_client_port != 0 {
+            self.announced_client_port
+        } else {
+            self.client_port
         }
     }
 

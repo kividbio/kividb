@@ -12,6 +12,8 @@ on:
 
 permissions:
   contents: write
+  # A stable release opens an Announcements discussion (Publish GitHub Release).
+  discussions: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -557,6 +559,12 @@ jobs:
           git commit -m "chore: update kividb to ${{ steps.extract.outputs.version }}"
           git push
 
+  # Stable releases only. A release candidate (a tag with a `-`, v1.2.0-rc1)
+  # gets no GitHub Release, no assets and no announcement: it is built, its
+  # images are pushed to GHCR, and the smoke test runs against them; the
+  # Releases page lists only what was released. Its binaries stay as this
+  # run's artifacts.
+  #
   # `darwin` is skipped for a release candidate, and a job that needs a
   # skipped job is skipped too unless it says otherwise: so this says what it
   # does need — every build that ran to have succeeded.
@@ -564,10 +572,11 @@ jobs:
     needs: [linux-amd64, linux-arm64, darwin, docker-manifest]
     if: >-
       ${{ !cancelled()
+          && !contains(github.event.inputs.tag || github.ref_name, '-')
           && needs.linux-amd64.result == 'success'
           && needs.linux-arm64.result == 'success'
           && needs.docker-manifest.result == 'success'
-          && (needs.darwin.result == 'success' || needs.darwin.result == 'skipped') }}
+          && needs.darwin.result == 'success' }}
     runs-on: ubuntu-latest
     # pull-requests: read for the list of merged PRs on the release page.
     permissions:
@@ -638,12 +647,12 @@ jobs:
 
       # What GitHub would append on its own is the PRs since the newest tag
       # before this one, and for a stable release that is its last release
-      # candidate: v1.1.0's page listed one PR. A stable release lists what
-      # was merged since the previous *stable* release; a candidate, since
-      # the tag before it. With no earlier stable release, everything. A
-      # release withdrawn after it was published (.github/withdrawn-releases)
-      # is passed over: its successor lists everything since the release
-      # before it.
+      # candidate: v1.1.0's page listed one PR. A release lists what was
+      # merged since the previous *stable* release, candidates' tags passed
+      # over. With no earlier stable release, everything. A release
+      # withdrawn after it was published (.github/withdrawn-releases) is
+      # passed over: its successor lists everything since the release before
+      # it.
       - name: List the merged pull requests
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -655,12 +664,9 @@ jobs:
           # v1.1.0-rc2 sorts before v1.1.0, not after.
           older=$(git -c versionsort.suffix=- tag --list 'v*' --sort=v:refname \
             | awk -v t="${RELEASE_TAG}" '$0 == t { exit } { print }')
-          case "${RELEASE_TAG}" in
-            *-*) previous=$(printf '%s\n' "$older" | tail -n 1) ;;
-            *)   withdrawn=$(grep -v -e '^#' -e '^[[:space:]]*$' .github/withdrawn-releases 2>/dev/null || true)
-                 previous=$(printf '%s\n' "$older" | grep -v -- - \
-                   | grep -vxF -f <(printf '%s\n' "${withdrawn:-//none//}") | tail -n 1 || true) ;;
-          esac
+          withdrawn=$(grep -v -e '^#' -e '^[[:space:]]*$' .github/withdrawn-releases 2>/dev/null || true)
+          previous=$(printf '%s\n' "$older" | grep -v -- - \
+            | grep -vxF -f <(printf '%s\n' "${withdrawn:-//none//}") | tail -n 1 || true)
           {
             echo
             if [ -n "$previous" ]; then
@@ -683,9 +689,12 @@ jobs:
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           draft: false
-          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
+          prerelease: false
           generate_release_notes: false
           body_path: release-body.md
+          # Announced in Discussions (Announcements), with the release notes
+          # as the post and a link both ways.
+          discussion_category_name: Announcements
           files: |
             release-assets/*
         env:
@@ -693,28 +702,28 @@ jobs:
 
   # ── Smoke test — release candidates only ────────────────────────────────
   #
-  # Runs after images/binaries/the GitHub Release are all fully published, so
-  # smoke-test.yml pulls the exact artifacts a user would get, not a
-  # source-tree build. Only fires for `-rc` tags (e.g. v1.0.4-rc1); a stable
+  # Runs after the images are published, so smoke-test.yml pulls the exact
+  # images a user would get, not a source-tree build. (It used to wait for
+  # the GitHub Release as well; a candidate no longer gets one, and the test
+  # only pulls images.) Only fires for `-rc` tags (e.g. v1.0.4-rc1); a stable
   # tag skips this job entirely — the intent is to catch regressions on a
   # release candidate before it's promoted to a stable tag, not to gate every
   # stable release behind a ~15-20 minute workflow. `smoke-test.yml` stays
   # independently callable (workflow_dispatch) for ad-hoc runs against a
   # stable tag too, e.g. to bisect a regression.
   smoke-test:
-    needs: [docker-manifest, publish]
+    needs: [docker-manifest]
     # `uses:`-type (reusable-workflow-call) jobs only expose a restricted
     # context set here — no `env`, despite RELEASE_TAG being defined at
     # workflow level — so this repeats the same expression RELEASE_TAG
     # itself is assigned from at the top of this file, rather than
     # referencing it.
     #
-    # `!cancelled()` and the two results, spelled out: a candidate skips
-    # `darwin`, and a job with a skipped job anywhere before it is skipped
-    # itself unless its condition says what it depends on.
+    # `!cancelled()` and the result, spelled out: a candidate skips `darwin`
+    # and `publish`, and a job with a skipped job anywhere before it is
+    # skipped itself unless its condition says what it depends on.
     if: >-
       ${{ !cancelled()
-          && needs.publish.result == 'success'
           && needs.docker-manifest.result == 'success'
           && contains(github.event.inputs.tag || github.ref_name, '-rc') }}
     # A called workflow can only request permissions the calling job already

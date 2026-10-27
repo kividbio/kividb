@@ -29,6 +29,11 @@ const SOFT_SECONDS: u64 = 60;
 /// How much the forwarder takes from the queue for one write.
 const BATCH_BYTES: usize = 256 << 10;
 
+/// A channel's or a pattern's name: bytes, as Redis keeps them. They were
+/// strings, a name that was not UTF-8 changed into another one, and
+/// `PUBLISH` refused it (#161).
+type Name = Arc<[u8]>;
+
 const CHANNEL: usize = 0;
 const PATTERN: usize = 1;
 const SHARD: usize = 2;
@@ -37,9 +42,9 @@ const SHARD: usize = 2;
 struct Delivery {
     kind: usize,
     /// What the subscriber subscribed to: the channel, or the pattern.
-    subscription: Arc<str>,
+    subscription: Name,
     /// The channel the message was published on.
-    channel: Arc<str>,
+    channel: Name,
     payload: Arc<[u8]>,
 }
 
@@ -76,7 +81,7 @@ struct Subscriber {
     /// What it is subscribed to right now, by kind. The forwarder checks a
     /// message against this as it writes, so that nothing for a channel
     /// follows the reply to its UNSUBSCRIBE.
-    live: Mutex<[AHashSet<Arc<str>>; 3]>,
+    live: Mutex<[AHashSet<Name>; 3]>,
     /// Set from a SUBSCRIBE until its reply has been written: the forwarder
     /// waits, so that no message comes before the reply either. Set too by a
     /// message this connection publishes to itself, for the same reason: it
@@ -148,7 +153,7 @@ impl Subscriber {
 
 // ── Hub ───────────────────────────────────────────────────────────────────────
 
-type Table = AHashMap<Arc<str>, Vec<Arc<Subscriber>>>;
+type Table = AHashMap<Name, Vec<Arc<Subscriber>>>;
 
 struct Shared {
     /// By kind: channels, patterns, shard channels. A name is in a table
@@ -172,15 +177,15 @@ impl Default for PubSubHub {
 
 impl PubSubHub {
     pub fn new() -> Self {
-        Self {
-            inner: Arc::new(Shared {
-                tables: RwLock::new([Table::new(), Table::new(), Table::new()]),
-                subscriptions: AtomicUsize::new(0),
-            }),
-        }
+        let inner = Arc::new(Shared {
+            tables: RwLock::new([Table::new(), Table::new(), Table::new()]),
+            subscriptions: AtomicUsize::new(0),
+        });
+        watch_soft_limit(Arc::downgrade(&inner));
+        Self { inner }
     }
 
-    fn add(&self, kind: usize, name: &Arc<str>, subscriber: &Arc<Subscriber>) {
+    fn add(&self, kind: usize, name: &Name, subscriber: &Arc<Subscriber>) {
         let mut tables = self.inner.tables.write();
         tables[kind]
             .entry(Arc::clone(name))
@@ -189,7 +194,7 @@ impl PubSubHub {
         self.inner.subscriptions.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn remove(&self, kind: usize, name: &str, subscriber: &Arc<Subscriber>) {
+    fn remove(&self, kind: usize, name: &[u8], subscriber: &Arc<Subscriber>) {
         let mut tables = self.inner.tables.write();
         let Some(subscribers) = tables[kind].get_mut(name) else {
             return;
@@ -209,21 +214,27 @@ impl PubSubHub {
     /// To the channel's subscribers and to those of every pattern it matches.
     /// Returns how many subscriptions it was delivered to — a client that has
     /// both the channel and a matching pattern counts twice, as in Redis.
-    pub fn publish(&self, channel: &str, payload: Arc<[u8]>) -> usize {
+    pub fn publish(&self, channel: &(impl AsRef<[u8]> + ?Sized), payload: Arc<[u8]>) -> usize {
         self.publish_from(channel, payload, None)
     }
 
     /// [`publish`](Self::publish), by the connection `from`: what it sends
     /// itself waits for its reply (see `Subscriber::hold`).
-    pub fn publish_from(&self, channel: &str, payload: Arc<[u8]>, from: Option<u64>) -> usize {
+    pub fn publish_from(
+        &self,
+        channel: &(impl AsRef<[u8]> + ?Sized),
+        payload: Arc<[u8]>,
+        from: Option<u64>,
+    ) -> usize {
         if self.inner.subscriptions.load(Ordering::Relaxed) == 0 {
             return 0;
         }
+        let channel = channel.as_ref();
         let mut delivered = 0;
         let mut overflowed: Vec<Arc<Subscriber>> = Vec::new();
         {
             let tables = self.inner.tables.read();
-            let mut name: Option<Arc<str>> = None;
+            let mut name: Option<Name> = None;
             if let Some((key, subscribers)) = tables[CHANNEL].get_key_value(channel) {
                 name = Some(Arc::clone(key));
                 for subscriber in subscribers {
@@ -260,15 +271,21 @@ impl PubSubHub {
         delivered
     }
 
-    pub fn spublish(&self, shard: &str, payload: Arc<[u8]>) -> usize {
+    pub fn spublish(&self, shard: &(impl AsRef<[u8]> + ?Sized), payload: Arc<[u8]>) -> usize {
         self.spublish_from(shard, payload, None)
     }
 
     /// [`spublish`](Self::spublish), by the connection `from`.
-    pub fn spublish_from(&self, shard: &str, payload: Arc<[u8]>, from: Option<u64>) -> usize {
+    pub fn spublish_from(
+        &self,
+        shard: &(impl AsRef<[u8]> + ?Sized),
+        payload: Arc<[u8]>,
+        from: Option<u64>,
+    ) -> usize {
         if self.inner.subscriptions.load(Ordering::Relaxed) == 0 {
             return 0;
         }
+        let shard = shard.as_ref();
         let mut delivered = 0;
         let mut overflowed: Vec<Arc<Subscriber>> = Vec::new();
         {
@@ -293,35 +310,35 @@ impl PubSubHub {
 
     // ── PUBSUB introspection ──────────────────────────────────────────────
 
-    fn names(&self, kind: usize, pattern: Option<&str>) -> Vec<String> {
+    fn names(&self, kind: usize, pattern: Option<&[u8]>) -> Vec<Name> {
         let tables = self.inner.tables.read();
-        let mut names: Vec<String> = tables[kind]
+        let mut names: Vec<Name> = tables[kind]
             .keys()
             .filter(|name| pattern.map(|p| glob_matches(p, name)).unwrap_or(true))
-            .map(|name| name.to_string())
+            .cloned()
             .collect();
         names.sort();
         names
     }
 
-    fn counts(&self, kind: usize, names: &[&str]) -> Vec<(String, usize)> {
+    fn counts(&self, kind: usize, names: &[&[u8]]) -> Vec<(Name, usize)> {
         let tables = self.inner.tables.read();
         names
             .iter()
             .map(|name| {
                 (
-                    name.to_string(),
+                    Name::from(*name),
                     tables[kind].get(*name).map(Vec::len).unwrap_or(0),
                 )
             })
             .collect()
     }
 
-    pub fn channels(&self, pattern: Option<&str>) -> Vec<String> {
+    pub fn channels(&self, pattern: Option<&[u8]>) -> Vec<Name> {
         self.names(CHANNEL, pattern)
     }
 
-    pub fn numsub(&self, names: &[&str]) -> Vec<(String, usize)> {
+    pub fn numsub(&self, names: &[&[u8]]) -> Vec<(Name, usize)> {
         self.counts(CHANNEL, names)
     }
 
@@ -330,13 +347,58 @@ impl PubSubHub {
         self.inner.tables.read()[PATTERN].len()
     }
 
-    pub fn shard_channels(&self, pattern: Option<&str>) -> Vec<String> {
+    pub fn shard_channels(&self, pattern: Option<&[u8]>) -> Vec<Name> {
         self.names(SHARD, pattern)
     }
 
-    pub fn shardnumsub(&self, names: &[&str]) -> Vec<(String, usize)> {
+    pub fn shardnumsub(&self, names: &[&[u8]]) -> Vec<(Name, usize)> {
         self.counts(SHARD, names)
     }
+}
+
+/// Every second: a subscriber that has stayed over the soft limit for
+/// `SOFT_SECONDS` is disconnected. It was found out only when another message
+/// was published to it, so one left behind by a burst stayed connected, and
+/// holding its memory, for as long as nothing more came (#161). Ends with the
+/// hub.
+fn watch_soft_limit(shared: std::sync::Weak<Shared>) {
+    let _ = std::thread::Builder::new()
+        .name("kividb-pubsub-limit".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let Some(shared) = shared.upgrade() else {
+                    return;
+                };
+                if shared.subscriptions.load(Ordering::Relaxed) == 0 {
+                    continue;
+                }
+                // With the tables unlocked, as `publish` does.
+                for subscriber in cut_off_late(&shared, uptime_secs()) {
+                    subscriber.disconnect();
+                }
+            }
+        });
+}
+
+/// The subscribers over the soft limit for `SOFT_SECONDS` at `now`, marked
+/// closed, for the caller to disconnect.
+fn cut_off_late(shared: &Shared, now: u64) -> Vec<Arc<Subscriber>> {
+    let mut late: Vec<Arc<Subscriber>> = Vec::new();
+    for table in shared.tables.read().iter() {
+        for subscriber in table.values().flatten() {
+            let since = subscriber.over_soft_since.load(Ordering::Relaxed);
+            if since != 0
+                && now.saturating_sub(since) >= SOFT_SECONDS
+                && subscriber.pending.load(Ordering::Relaxed) > SOFT_LIMIT
+                && !late.iter().any(|seen| Arc::ptr_eq(seen, subscriber))
+                && !subscriber.closed.swap(true, Ordering::Relaxed)
+            {
+                late.push(Arc::clone(subscriber));
+            }
+        }
+    }
+    late
 }
 
 /// 1 if the subscriber took the message.
@@ -356,8 +418,8 @@ fn hand_over(
     }
 }
 
-fn glob_matches(pattern: &str, text: &str) -> bool {
-    crate::commands::helpers::glob_match(pattern, text)
+fn glob_matches(pattern: &[u8], text: &[u8]) -> bool {
+    crate::commands::helpers::glob_match_bytes(pattern, text)
 }
 
 // ── Framing ───────────────────────────────────────────────────────────────────
@@ -388,7 +450,7 @@ fn write_delivery(out: &mut Vec<u8>, resp: u8, delivery: &Delivery) {
         PATTERN => {
             write_header(out, resp, 4);
             write_bulk(out, b"pmessage");
-            write_bulk(out, delivery.subscription.as_bytes());
+            write_bulk(out, &delivery.subscription);
         }
         kind => {
             write_header(out, resp, 3);
@@ -400,17 +462,17 @@ fn write_delivery(out: &mut Vec<u8>, resp: u8, delivery: &Delivery) {
             write_bulk(out, word);
         }
     }
-    write_bulk(out, delivery.channel.as_bytes());
+    write_bulk(out, &delivery.channel);
     write_bulk(out, &delivery.payload);
 }
 
 /// The reply to one name of a (un)subscribe command. `name` is `None` for an
 /// unsubscribe-from-everything that found nothing to unsubscribe from.
-fn write_ack(out: &mut Vec<u8>, resp: u8, word: &str, name: Option<&str>, count: usize) {
+fn write_ack(out: &mut Vec<u8>, resp: u8, word: &str, name: Option<&[u8]>, count: usize) {
     write_header(out, resp, 3);
     write_bulk(out, word.as_bytes());
     match name {
-        Some(name) => write_bulk(out, name.as_bytes()),
+        Some(name) => write_bulk(out, name),
         None if resp >= 3 => out.extend_from_slice(b"_\r\n"),
         None => out.extend_from_slice(b"$-1\r\n"),
     }
@@ -460,7 +522,7 @@ pub struct Subscriptions {
     hub: PubSubHub,
     me: Arc<Subscriber>,
     /// In the order they were subscribed to, by kind.
-    names: [Vec<Arc<str>>; 3],
+    names: [Vec<Name>; 3],
     forwarder: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -515,7 +577,8 @@ impl Subscriptions {
     }
 
     /// Run one subscription command; the replies go out with the
-    /// connection's other replies, in order.
+    /// connection's other replies, in order. (In a cluster, see
+    /// [`shard_subscribe_refusal`] first.)
     pub fn handle(&mut self, cmd: &[&[u8]], resp: u8) -> Vec<u8> {
         let mut out = Vec::new();
         let Some(first) = cmd.first() else {
@@ -550,7 +613,7 @@ impl Subscriptions {
             // for these replies to be written.
             self.me.hold.store(true, Ordering::Release);
             for raw in &cmd[1..] {
-                let target: Arc<str> = Arc::from(String::from_utf8_lossy(raw).as_ref());
+                let target: Name = Name::from(*raw);
                 let new = self.me.live.lock()[kind].insert(Arc::clone(&target));
                 if new {
                     self.names[kind].push(Arc::clone(&target));
@@ -576,12 +639,11 @@ impl Subscriptions {
             }
         } else {
             for raw in &cmd[1..] {
-                let target = String::from_utf8_lossy(raw);
-                if let Some(at) = self.names[kind].iter().position(|n| **n == *target) {
+                if let Some(at) = self.names[kind].iter().position(|n| **n == **raw) {
                     let target = self.names[kind].remove(at);
                     self.forget(kind, &target);
                 }
-                write_ack(&mut out, resp, word, Some(target.as_ref()), self.total());
+                write_ack(&mut out, resp, word, Some(raw), self.total());
             }
         }
 
@@ -597,7 +659,7 @@ impl Subscriptions {
     }
 
     /// End one subscription, already taken out of `names`.
-    fn forget(&self, kind: usize, target: &str) {
+    fn forget(&self, kind: usize, target: &[u8]) {
         // First, so that what is still queued for it is not written.
         self.me.live.lock()[kind].remove(target);
         self.hub.remove(kind, target, &self.me);
@@ -685,6 +747,41 @@ impl Batch {
     }
 }
 
+/// In a cluster, `SSUBSCRIBE` is routed as a command for its channels' slot
+/// is: `MOVED` to the node that has it, `CROSSSLOT` for channels of more than
+/// one slot. A replica of the slot's master takes it, as in Redis. It
+/// succeeded on any node, which only had the slot's messages if it was the
+/// slot's (#161).
+pub fn shard_subscribe_refusal(
+    name: &str,
+    cmd: &[&[u8]],
+    cluster: &crate::cluster::ClusterState,
+) -> Option<Vec<u8>> {
+    if name != "SSUBSCRIBE" || !cluster.enabled {
+        return None;
+    }
+    // Channels are not keys to the key specs: their slots are taken here,
+    // and the first is routed as a read of it would be.
+    let channels = cmd.get(1..)?;
+    let first = *channels.first()?;
+    let slot = crate::cluster::key_hash_slot(first);
+    if channels
+        .iter()
+        .any(|channel| crate::cluster::key_hash_slot(channel) != slot)
+    {
+        return Some(crate::cluster::routing::crossslot_error());
+    }
+    crate::cluster::routing::route_named(
+        "GET",
+        &[b"GET", first],
+        cluster,
+        false,
+        || true,
+        |_| false,
+    )
+    .refusal()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -725,7 +822,10 @@ mod tests {
              *4\r\n$8\r\npmessage\r\n$2\r\nn*\r\n$7\r\nnothing\r\n$1\r\n3\r\n"
         );
 
-        assert_eq!(hub.channels(None), ["news", "sport"]);
+        assert_eq!(
+            hub.channels(None),
+            [Name::from(&b"news"[..]), Name::from(&b"sport"[..])]
+        );
         assert_eq!(hub.numpat(), 1);
         drop(subs);
         assert!(hub.channels(None).is_empty());
@@ -748,7 +848,7 @@ mod tests {
             frames(&mut outbox, 3).await,
             ">3\r\n$8\r\nsmessage\r\n$1\r\ns\r\n$1\r\ny\r\n"
         );
-        assert_eq!(hub.shardnumsub(&["s"]), [("s".to_string(), 1)]);
+        assert_eq!(hub.shardnumsub(&[b"s"]), [(Name::from(&b"s"[..]), 1)]);
         assert!(hub.channels(None).is_empty());
     }
 
@@ -819,6 +919,25 @@ mod tests {
         let taken: usize = (0..40).map(|_| hub.publish("a", Arc::clone(&big))).sum();
         assert_eq!(taken, HARD_LIMIT / ((1 << 20) + 65));
         assert_eq!(hub.publish("a", Arc::from(&b"small"[..])), 0);
+    }
+
+    /// Over the soft limit for `SOFT_SECONDS`, a subscriber is disconnected
+    /// by the timer, with nothing more published to it (#161).
+    #[test]
+    fn a_subscriber_over_the_soft_limit_too_long_is_cut_off_by_the_timer() {
+        let hub = PubSubHub::new();
+        let (mut subs, _outbox) = subscriber(&hub, 1);
+        subs.handle(&[b"SUBSCRIBE", b"a"], 2);
+        let me = Arc::clone(&subs.me);
+        me.pending.store(SOFT_LIMIT + 1, Ordering::Relaxed);
+        me.over_soft_since.store(100, Ordering::Relaxed);
+        // Not yet: one second short.
+        assert!(cut_off_late(&hub.inner, 100 + SOFT_SECONDS - 1).is_empty());
+        let late = cut_off_late(&hub.inner, 100 + SOFT_SECONDS);
+        assert!(late.len() == 1 && Arc::ptr_eq(&late[0], &me));
+        assert!(me.closed.load(Ordering::Relaxed));
+        // Once: it is closed now.
+        assert!(cut_off_late(&hub.inner, 100 + SOFT_SECONDS).is_empty());
     }
 
     #[test]

@@ -60,6 +60,11 @@ pub(crate) async fn send_one_round(state: &Arc<ClusterState>) {
             .collect()
     };
 
+    let pinged: Vec<String> = peers
+        .iter()
+        .map(|(_, ip, port)| format!("{ip}:{port}"))
+        .collect();
+    dialer::prune_ping_links(state, &pinged);
     for (peer_id, ip, bus_port) in peers {
         let state = Arc::clone(state);
         tokio::spawn(async move {
@@ -224,6 +229,18 @@ async fn check_election(
 
         // Master FAIL'd, no election yet — start one (after delay).
         (true, None) => {
+            // A replica whose data is too old does not stand: it would win
+            // the slots and lose whatever it never received (#107).
+            if let Some(why) = too_stale_to_stand(state, repl_state) {
+                let now = now_ms_local();
+                if now.saturating_sub(LAST_STALE_LOG_MS.swap(now, Ordering::Relaxed)) >= 10_000 {
+                    log_warn!(
+                        "Cluster: Not standing for election for failed master {}: {why}",
+                        node_id_str(&master_id)
+                    );
+                }
+                return;
+            }
             // Make sure we don't kick off concurrent election attempts.
             if state
                 .election_pending
@@ -233,33 +250,52 @@ async fn check_election(
                 return; // Another tick is already in the delay phase.
             }
 
-            let delay_ms = 500 + (rand_u32() % 500) as u64;
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            // The delay is spent in a task of its own: this loop also detects
+            // failures and keeps replication pointed right, every 100 ms, and
+            // a ranked delay can be seconds.
+            let state = Arc::clone(state);
+            let repl_state = Arc::clone(repl_state);
+            tokio::spawn(async move {
+                // The replicas that have read further go first, a second
+                // apart, as in Redis: so the most up-to-date one normally
+                // wins, and the others' writes are not lost to it (#107).
+                let rank = replica_rank(&state, &repl_state, master_id).await;
+                let delay_ms = 500 + (rand_u32() % 500) as u64 + 1000 * rank;
+                if rank > 0 {
+                    log_info!(
+                        "Cluster: {rank} replica(s) of failed master {} have read further; \
+                         standing for election in {delay_ms} ms",
+                        node_id_str(&master_id)
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 
-            // Re-check: still a replica of that master, and it is still FAIL.
-            let still_failed = {
-                let nodes = state.nodes.read();
-                let still_its_replica = nodes
-                    .get(&state.myself())
-                    .is_some_and(|me| me.master_id == Some(master_id));
-                still_its_replica
-                    && nodes
-                        .get(&master_id)
-                        .map(|m| m.flags.contains(NodeFlags::FAIL))
-                        .unwrap_or(false)
-            };
-            if !still_failed {
+                // Re-check: still a replica of that master, it is still FAIL,
+                // and no other replica has taken over meanwhile.
+                let still_failed = {
+                    let nodes = state.nodes.read();
+                    let still_its_replica = nodes
+                        .get(&state.myself())
+                        .is_some_and(|me| me.master_id == Some(master_id));
+                    still_its_replica
+                        && nodes
+                            .get(&master_id)
+                            .map(|m| m.flags.contains(NodeFlags::FAIL))
+                            .unwrap_or(false)
+                };
+                if !still_failed {
+                    state.election_pending.store(false, Ordering::SeqCst);
+                    return;
+                }
+
+                let epoch = state.start_election(master_id, false);
                 state.election_pending.store(false, Ordering::SeqCst);
-                return;
-            }
-
-            let epoch = state.start_election(master_id, false);
-            state.election_pending.store(false, Ordering::SeqCst);
-            log_warn!(
-                "Cluster: Starting election for epoch {epoch} (failed master: {})",
-                node_id_str(&master_id)
-            );
-            broadcast_auth_request(state, master_id, epoch, false).await;
+                log_warn!(
+                    "Cluster: Starting election for epoch {epoch} (failed master: {})",
+                    node_id_str(&master_id)
+                );
+                broadcast_auth_request(&state, master_id, epoch, false).await;
+            });
         }
 
         // Election running — check progress.
@@ -292,6 +328,103 @@ async fn check_election(
             }
         }
     }
+}
+
+/// When a too-stale replica last said it would not stand (logged at most
+/// every 10 s; the check runs every 100 ms).
+static LAST_STALE_LOG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Why this replica's data is too old for it to stand for election, if it
+/// is: its link to the master has been down longer than
+/// `node timeout × cluster-replica-validity-factor + repl-ping-replica-period`,
+/// counting from when the master stopped answering (Redis's rule). A factor
+/// of 0 means always stand.
+fn too_stale_to_stand(
+    state: &ClusterState,
+    repl_state: &crate::replication::ReplState,
+) -> Option<String> {
+    let factor = state.replica_validity_factor();
+    if factor == 0 || repl_state.slave_link_up.load(Ordering::Acquire) {
+        return None;
+    }
+    let down_since = repl_state.master_link_down_since_ms.load(Ordering::Relaxed);
+    if down_since == 0 {
+        return None;
+    }
+    let ping_period_ms = repl_state.repl_ping_period_secs.load(Ordering::Relaxed) * 1000;
+    let down_for = now_ms_local().saturating_sub(down_since);
+    data_too_old(down_for, state.node_timeout_ms, ping_period_ms, factor).map(|(age, limit)| {
+        format!(
+            "its data is {} s old, more than the {} s cluster-replica-validity-factor {factor} allows",
+            age / 1000,
+            limit / 1000
+        )
+    })
+}
+
+/// Redis's rule, in milliseconds: with the link to the master down for
+/// `down_for`, the data's age and the limit it is over, if it is. The link
+/// was down for at least the node timeout before the master could be marked
+/// FAIL; that much does not count against the data.
+fn data_too_old(
+    down_for: u64,
+    node_timeout: u64,
+    ping_period: u64,
+    factor: u64,
+) -> Option<(u64, u64)> {
+    let age = if down_for > node_timeout {
+        down_for - node_timeout
+    } else {
+        down_for
+    };
+    let limit = node_timeout
+        .saturating_mul(factor)
+        .saturating_add(ping_period);
+    (factor != 0 && age > limit).then_some((age, limit))
+}
+
+/// How many other replicas of `master_id` have read further than we have.
+/// Each is asked (`OFFSET`); one that does not answer, an older version
+/// among them, is not counted, so it never holds us back.
+async fn replica_rank(
+    state: &Arc<ClusterState>,
+    repl_state: &crate::replication::ReplState,
+    master_id: NodeId,
+) -> u64 {
+    let mine = repl_state.repl_offset.load(Ordering::Relaxed);
+    let me = state.myself();
+    let siblings: Vec<String> = {
+        let nodes = state.nodes.read();
+        nodes
+            .values()
+            .filter(|n| {
+                n.id != me
+                    && n.master_id == Some(master_id)
+                    && !n.flags.contains(NodeFlags::FAIL)
+                    && !n.flags.contains(NodeFlags::HANDSHAKE)
+                    && !n.ip.is_empty()
+                    && n.cluster_port != 0
+            })
+            .map(|n| format!("{}:{}", n.ip, n.cluster_port))
+            .collect()
+    };
+    let mut asked = tokio::task::JoinSet::new();
+    for addr in siblings {
+        let state = Arc::clone(state);
+        asked.spawn(async move {
+            let ask = BusMessage::OffsetQuery { sender_id: me };
+            dialer::exchange(&state, &addr, &ask, Duration::from_millis(500)).await
+        });
+    }
+    let mut ahead = 0;
+    while let Some(answer) = asked.join_next().await {
+        if let Ok(Ok(Some(BusMessage::OffsetAck { offset, .. }))) = answer
+            && offset > mine
+        {
+            ahead += 1;
+        }
+    }
+    ahead
 }
 
 /// Take over from `old_master` at `epoch`: claim its slots, switch role in
@@ -546,4 +679,30 @@ fn now_ms_local() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::data_too_old;
+
+    #[test]
+    fn a_replica_too_long_without_its_master_does_not_stand() {
+        // Node timeout 5 s, ping period 10 s, factor 10: 60 s of data age.
+        let (timeout, ping) = (5_000, 10_000);
+        // Just failed: down for about the node timeout.
+        assert_eq!(data_too_old(6_000, timeout, ping, 10), None);
+        // The node timeout itself does not count.
+        assert_eq!(data_too_old(65_000, timeout, ping, 10), None);
+        assert_eq!(
+            data_too_old(65_001, timeout, ping, 10),
+            Some((60_001, 60_000))
+        );
+        // Factor 0: always stand.
+        assert_eq!(data_too_old(10_000_000, timeout, ping, 0), None);
+        // Factor 1: 15 s.
+        assert_eq!(
+            data_too_old(21_000, timeout, ping, 1),
+            Some((16_000, 15_000))
+        );
+    }
 }

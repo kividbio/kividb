@@ -637,7 +637,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     };
 
                     match s.parse::<i64>() {
-                        Ok(n) => n + 1,
+                        // At i64::MAX it wrapped to i64::MIN, or panicked in a
+                        // debug build (#124).
+                        Ok(n) => match n.checked_add(1) {
+                            Some(n) => n,
+                            None => {
+                                return Some(resp_error(
+                                    "ERR increment or decrement would overflow",
+                                ));
+                            }
+                        },
                         Err(_) => {
                             return Some(resp_error("ERR value is not an integer or out of range"));
                         }
@@ -655,7 +664,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let new_val = KiviDBValue::String(SharedBytes::from(next.to_string().as_bytes()));
             map.insert(Key::from(&*key), new_val);
             drop(map); // explicitly drop lock before AOF
-            notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "incr", &key);
+            notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "incrby", &key);
             Some(resp_integer(next))
         }
 
@@ -757,7 +766,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let expiry_shard = get_expiry_shard(ctx.expiry_store, *ctx.selected_db, key);
                     write_lock!(expiry_shard).remove(key);
                     crate::stats::record_hit();
-                    notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "getdel", key);
+                    notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "del", key);
                     Some(resp_bulk(&v))
                 }
                 Some(other) => {
@@ -796,7 +805,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // clear any existing TTL — GETSET always persists the key
             let expiry_shard = get_expiry_shard(ctx.expiry_store, *ctx.selected_db, key);
             write_lock!(expiry_shard).remove(key);
-            notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "getset", key);
+            notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "set", key);
             match old {
                 Some(KiviDBValue::String(v)) => {
                     crate::stats::record_hit();
@@ -842,7 +851,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 KiviDBValue::String(SharedBytes::from(cmd[2])),
             );
             drop(map);
-            notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "setnx", key);
+            notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "set", key);
             Some(resp_integer(1))
         }
 
@@ -1088,7 +1097,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 KiviDBValue::String(SharedBytes::from(next.to_string().as_bytes())),
             );
             drop(map);
-            notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "decr", &key);
+            notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "incrby", &key);
             Some(resp_integer(next))
         }
 
@@ -1134,7 +1143,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 KiviDBValue::String(SharedBytes::from(next.to_string().as_bytes())),
             );
             drop(map);
-            notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "decrby", &key);
+            notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "incrby", &key);
             Some(resp_integer(next))
         }
 
@@ -1455,8 +1464,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
             }
 
+            // What it did to the expiry, as Redis says it.
             if val.is_some() && cmd.len() >= 3 {
-                notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "getex", key);
+                let persisted = cmd[2..]
+                    .iter()
+                    .any(|arg| arg.eq_ignore_ascii_case(b"PERSIST"));
+                let event = if persisted { "persist" } else { "expire" };
+                notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, event, key);
             }
             match val {
                 Some(v) => Some(resp_bulk(&v)),

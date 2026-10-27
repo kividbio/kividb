@@ -289,8 +289,21 @@ pub(super) fn move_one(
     let element = moved.and_then(|mut v| v.pop());
     if element.is_some() {
         let db = *ctx.selected_db;
-        notify(ctx.pubsub, db, KS_LIST, "lmove", src);
-        notify(ctx.pubsub, db, KS_LIST, "lmove", dst);
+        // As Redis: the pop from the source, the push to the destination.
+        notify(
+            ctx.pubsub,
+            db,
+            KS_LIST,
+            if from_left { "lpop" } else { "rpop" },
+            src,
+        );
+        notify(
+            ctx.pubsub,
+            db,
+            KS_LIST,
+            if to_left { "lpush" } else { "rpush" },
+            dst,
+        );
     }
     Ok(element)
 }

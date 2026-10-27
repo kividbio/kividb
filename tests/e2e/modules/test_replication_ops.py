@@ -406,23 +406,20 @@ class TestClientPause:
 
 class TestWaitAof:
     def test_waitaof_aof_disabled_returns_immediately(self):
-        """When AOF is disabled, WAITAOF returns [1, 0] without blocking."""
+        """When AOF is disabled, WAITAOF 0 returns [0, 0] without blocking,
+        and WAITAOF with numlocal > 0 is an error, as in Redis 7.4+."""
         port = free_port()
         # No --aof flag = AOF disabled
         proc = start_server(port)
         try:
             r = make_client(port)
+            with pytest.raises(redis.ResponseError, match="appendonly is disabled"):
+                r.execute_command("WAITAOF", 1, 0, 0)
             t0 = time.monotonic()
-            # Redis 7.4 rejects numlocal=1 when AOF is disabled; use 0 in that case
-            numlocal = 0 if _IS_REDIS else 1
-            try:
-                result = r.execute_command("WAITAOF", numlocal, 0, 0)
-            except redis.ResponseError:
-                # Redis 7.4+: WAITAOF with numlocal>0 and AOF disabled raises error
-                pytest.skip("WAITAOF rejects numlocal>0 when appendonly is off")
+            result = r.execute_command("WAITAOF", 0, 0, 0)
             elapsed = time.monotonic() - t0
             assert len(result) == 2
-            assert result[0] in (0, numlocal)  # local ack depends on numlocal
+            assert result[0] == 0  # nothing is fsynced to an AOF
             assert result[1] == 0  # replica AOF not tracked
             assert elapsed < 0.5, f"WAITAOF blocked unexpectedly: {elapsed:.3f}s"
         finally:

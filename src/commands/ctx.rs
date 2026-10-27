@@ -38,6 +38,8 @@ impl AofSender for tokio::sync::mpsc::UnboundedSender<Vec<u8>> {
     fn send_aof(&self, data: Vec<u8>) {
         if self.send(data).is_err() {
             crate::aof::record_lost_aof_record();
+        } else {
+            crate::aof::records_queued();
         }
     }
 }
@@ -46,6 +48,8 @@ impl AofSender for std::sync::mpsc::SyncSender<Vec<u8>> {
     fn send_aof(&self, data: Vec<u8>) {
         if self.send(data).is_err() {
             crate::aof::record_lost_aof_record();
+        } else {
+            crate::aof::records_queued();
         }
     }
 }
@@ -83,6 +87,8 @@ pub struct Ctx<'a> {
     pub cmd: Vec<&'a [u8]>,
     pub store: &'a Store,
     pub expiry_store: &'a ExpiryStore,
+    /// Not read: `LASTSAVE` is `stats::last_save()`, which every save
+    /// moves (#149). Still passed around by the connection loops.
     pub lastsave: &'a Arc<RwLock<i64>>,
     pub selected_db: &'a mut usize,
     pub aof_tx: &'a dyn AofSender,

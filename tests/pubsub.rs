@@ -1209,3 +1209,46 @@ fn test_subscribe_while_in_subscriber_mode() {
     sub_handle.join().unwrap();
     pub_handle.join().unwrap();
 }
+
+/// Channel names are bytes, as in Redis: `PUBLISH` refused one that was not
+/// UTF-8, and `SUBSCRIBE` changed it into another (#161).
+#[test]
+fn test_channel_names_are_binary_safe() {
+    let port = free_port();
+    start_server(port);
+    let mut sub = Conn::connect(port);
+    let mut publisher = Conn::connect(port);
+    let name: &[u8] = b"bin\xff\xfe:chan";
+    let ack = sub.cmd(&[b"SUBSCRIBE", name]);
+    assert_eq!(
+        ack,
+        RespValue::Array(vec![
+            RespValue::Bulk(b"subscribe".to_vec()),
+            RespValue::Bulk(name.to_vec()),
+            RespValue::Int(1),
+        ])
+    );
+    assert_eq!(
+        publisher.cmd(&[b"PUBLISH", name, b"hello"]),
+        RespValue::Int(1)
+    );
+    assert_eq!(
+        sub.read_value(),
+        RespValue::Array(vec![
+            RespValue::Bulk(b"message".to_vec()),
+            RespValue::Bulk(name.to_vec()),
+            RespValue::Bulk(b"hello".to_vec()),
+        ])
+    );
+    // Another name that would read the same, decoded lossily, is another
+    // channel.
+    assert_eq!(
+        publisher.cmd(&[b"PUBLISH", b"bin\xef\xbf\xbd\xef\xbf\xbd:chan", b"x"]),
+        RespValue::Int(0)
+    );
+    let channels = publisher.cmd(&[b"PUBSUB", b"CHANNELS", b"bin*"]);
+    assert_eq!(
+        channels,
+        RespValue::Array(vec![RespValue::Bulk(name.to_vec())])
+    );
+}

@@ -14,6 +14,97 @@ pub mod acceptor {
     use tokio_rustls::rustls::server::danger::ClientCertVerifier;
     use tokio_rustls::rustls::{RootCertStore, ServerConfig};
 
+    /// The files a server's TLS is set up from. `CONFIG SET` changes them
+    /// while it runs (#156).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Files {
+        pub cert: String,
+        pub key: String,
+        pub ca: String,
+        pub auth_clients: String,
+        pub client_cert: String,
+        pub client_key: String,
+    }
+
+    /// The settings that make up [`Files`].
+    pub const SETTINGS: [&str; 6] = [
+        "tls-cert-file",
+        "tls-key-file",
+        "tls-ca-cert-file",
+        "tls-auth-clients",
+        "tls-client-cert-file",
+        "tls-client-key-file",
+    ];
+
+    impl Files {
+        pub fn of(config: &crate::config::Config) -> Self {
+            Files {
+                cert: config.tls_cert_file.clone(),
+                key: config.tls_key_file.clone(),
+                ca: config.tls_ca_cert_file.clone(),
+                auth_clients: config.tls_auth_clients.clone(),
+                client_cert: config.tls_client_cert_file.clone(),
+                client_key: config.tls_client_key_file.clone(),
+            }
+        }
+
+        fn slot(&mut self, name: &str) -> Option<&mut String> {
+            Some(match name {
+                "tls-cert-file" => &mut self.cert,
+                "tls-key-file" => &mut self.key,
+                "tls-ca-cert-file" => &mut self.ca,
+                "tls-auth-clients" => &mut self.auth_clients,
+                "tls-client-cert-file" => &mut self.client_cert,
+                "tls-client-key-file" => &mut self.client_key,
+                _ => return None,
+            })
+        }
+
+        /// One of [`SETTINGS`] by its name.
+        pub fn get(&self, name: &str) -> Option<String> {
+            self.clone().slot(name).map(|value| value.clone())
+        }
+
+        /// Set one of [`SETTINGS`] by its name.
+        pub fn set(&mut self, name: &str, value: &str) {
+            if let Some(slot) = self.slot(name) {
+                *slot = value.to_string();
+            }
+        }
+    }
+
+    /// The acceptor of each TLS port of this process, with the files it was
+    /// built from. A handshake takes the one there now, so that a new one
+    /// serves every connection from then on; a test process runs several
+    /// servers, hence one per port.
+    #[allow(clippy::type_complexity)]
+    static LISTENERS: std::sync::LazyLock<
+        parking_lot::Mutex<std::collections::HashMap<u16, (Files, TlsAcceptor)>>,
+    > = std::sync::LazyLock::new(Default::default);
+
+    /// Build the acceptor of TLS port `port` from `files`, and serve every
+    /// handshake from now on with it. Nothing changes if it cannot be built.
+    pub fn install(port: u16, files: &Files) -> Result<TlsAcceptor, String> {
+        let acceptor = build(&files.cert, &files.key, &files.ca, &files.auth_clients)?;
+        LISTENERS
+            .lock()
+            .insert(port, (files.clone(), acceptor.clone()));
+        Ok(acceptor)
+    }
+
+    /// The acceptor TLS port `port` serves handshakes with now.
+    pub fn current(port: u16) -> Option<TlsAcceptor> {
+        LISTENERS
+            .lock()
+            .get(&port)
+            .map(|(_, acceptor)| acceptor.clone())
+    }
+
+    /// The files TLS port `port` is set up from now.
+    pub fn files(port: u16) -> Option<Files> {
+        LISTENERS.lock().get(&port).map(|(files, _)| files.clone())
+    }
+
     /// Build a `TlsAcceptor` from PEM cert + key files.
     ///
     /// When `ca_path` is set, client certificates are verified against it as

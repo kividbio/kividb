@@ -1171,7 +1171,7 @@ pub(crate) fn number_text(value: f64) -> String {
     }
 }
 
-fn distance_text(distance: f32) -> String {
+pub(crate) fn distance_text(distance: f32) -> String {
     if distance == 0.0 {
         "0".to_string()
     } else {

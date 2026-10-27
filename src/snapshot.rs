@@ -1,5 +1,5 @@
+use crate::store;
 use crate::store::Key;
-use crate::store::{self, Db};
 use crate::types::SharedBytes;
 use crate::types::{
     ConsumerGroup, KiviDBValue, PelEntry, SortedSetInner, StreamEntry, StreamId, StreamInner,
@@ -100,6 +100,9 @@ const TAG_STREAM_V3: u8 = 13;
 /// rules. Written only for a series that has a non-default policy or any
 /// rules, so dumps without them stay readable by older builds.
 const TAG_TIMESERIES_V2: u8 = 14;
+/// `TAG_TIMESERIES_V2` followed by the series it is a compaction of. Written
+/// only for a compaction, so other series stay readable by older builds.
+const TAG_TIMESERIES_V3: u8 = 15;
 
 fn write_bytes(w: &mut impl Write, data: &[u8]) -> io::Result<()> {
     w.write_all(&(data.len() as u32).to_le_bytes())?;
@@ -365,25 +368,15 @@ macro_rules! read_lock {
     };
 }
 
-pub fn collect_snapshot(db: &Db) -> HashMap<String, KiviDBValue> {
-    let mut merged = HashMap::new();
-    for shard in db.iter() {
-        let map = read_lock!(shard);
-        merged.extend(map.iter().map(|(k, v)| (k.to_string(), v.clone())));
-    }
-    merged
-}
-
 /// Leading bytes of every KDB image, snapshot file or AOF preamble alike.
 pub const KDB_MAGIC: &[u8; 8] = b"KIVIDB01";
 
 // ── Streaming KDB writer ─────────────────────────────────────────────────────
 //
 // Split out of `write_snapshot` so the AOF rewrite can emit the same image
-// without going through `collect_snapshot` first. That matters: a snapshot
-// taken for the AOF preamble would otherwise clone the entire dataset into
-// intermediate `HashMap`s before a byte reaches the file, doubling peak memory
-// during a rewrite. Driving the writer shard by shard costs nothing extra.
+// without cloning the dataset into intermediate `HashMap`s first, which
+// would double peak memory during a rewrite. Driving the writer shard by
+// shard costs nothing extra.
 //
 // The pieces must be called in this order — header, then per db (entries, db
 // end), then the index sections — because that is the order `load_snapshot`
@@ -470,8 +463,11 @@ pub fn write_kdb_entry(w: &mut impl Write, key: &str, value: &KiviDBValue) -> io
             // series was back on the default policy and no longer fed its
             // compactions — silently.
             let extended = !inner.rules.is_empty()
-                || inner.duplicate_policy != crate::types::DuplicatePolicy::Last;
-            w.write_all(&[if extended {
+                || inner.duplicate_policy != crate::types::DuplicatePolicy::Last
+                || inner.source.is_some();
+            w.write_all(&[if inner.source.is_some() {
+                TAG_TIMESERIES_V3
+            } else if extended {
                 TAG_TIMESERIES_V2
             } else {
                 TAG_TIMESERIES
@@ -483,7 +479,9 @@ pub fn write_kdb_entry(w: &mut impl Write, key: &str, value: &KiviDBValue) -> io
             }
             // Persist metadata
             w.write_all(&inner.retention.to_le_bytes())?;
-            w.write_all(&inner.chunk_size.to_le_bytes())?; // usize — careful on 32-bit
+            // A u64 on every target, so a 32-bit build reads a 64-bit one's
+            // snapshot (and compiles: usize is 4 bytes there).
+            w.write_all(&(inner.chunk_size as u64).to_le_bytes())?;
             // Labels: write as count + (key, value) pairs
             w.write_all(&(inner.labels.len() as u32).to_le_bytes())?;
             for (lk, lv) in inner.labels.iter() {
@@ -499,6 +497,9 @@ pub fn write_kdb_entry(w: &mut impl Write, key: &str, value: &KiviDBValue) -> io
                     w.write_all(&rule.bucket_duration.to_le_bytes())?;
                     w.write_all(&rule.align_timestamp.to_le_bytes())?;
                 }
+            }
+            if let Some(source) = &inner.source {
+                write_bytes(w, source.as_bytes())?;
             }
         }
 
@@ -1417,7 +1418,7 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
                         serde_json::from_slice(&json_bytes).unwrap_or(serde_json::Value::Null);
                     KiviDBValue::Json(Arc::new(parking_lot::RwLock::new(val)))
                 }
-                TAG_TIMESERIES | TAG_TIMESERIES_V2 => {
+                TAG_TIMESERIES | TAG_TIMESERIES_V2 | TAG_TIMESERIES_V3 => {
                     let mut count_buf = [0u8; 4];
                     r.read_exact(&mut count_buf)?;
                     let count = u32::from_le_bytes(count_buf) as usize;
@@ -1437,7 +1438,8 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
                     ts.retention = u64::from_le_bytes(ret_buf);
                     let mut cs_buf = [0u8; 8];
                     r.read_exact(&mut cs_buf)?;
-                    ts.chunk_size = usize::from_le_bytes(cs_buf);
+                    ts.chunk_size =
+                        usize::try_from(u64::from_le_bytes(cs_buf)).unwrap_or(usize::MAX);
                     let mut lcount_buf = [0u8; 4];
                     r.read_exact(&mut lcount_buf)?;
                     let lcount = u32::from_le_bytes(lcount_buf) as usize;
@@ -1449,7 +1451,7 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
                             String::from_utf8_lossy(&lv).into_owned(),
                         );
                     }
-                    if tag[0] == TAG_TIMESERIES_V2 {
+                    if tag[0] != TAG_TIMESERIES {
                         let bad = |what: &str| {
                             io::Error::new(io::ErrorKind::InvalidData, format!("bad series {what}"))
                         };
@@ -1476,6 +1478,12 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
                                 bucket_duration,
                                 align_timestamp,
                             });
+                        }
+                        if tag[0] == TAG_TIMESERIES_V3 {
+                            ts.source = Some(
+                                String::from_utf8(read_bytes(&mut r)?)
+                                    .map_err(|_| bad("source"))?,
+                            );
                         }
                     }
                     KiviDBValue::TimeSeries(Arc::new(parking_lot::RwLock::new(ts)))
@@ -3119,6 +3127,108 @@ fn cbor_to_json(data: &[u8]) -> io::Result<serde_json::Value> {
     Ok(value)
 }
 
+/// The byte string (major type 2, of a definite length) at `at`, if that is
+/// what is there.
+fn cbor_value_bytes<'a>(data: &'a [u8], at: &mut usize) -> io::Result<Option<&'a [u8]>> {
+    let bad = || rdb_invalid("malformed CBOR");
+    let head = *data.get(*at).ok_or_else(bad)?;
+    if head >> 5 != 2 {
+        return Ok(None);
+    }
+    let info = head & 31;
+    let (len, skip) = match info {
+        0..=23 => (u64::from(info), 1),
+        24 => (u64::from(*data.get(*at + 1).ok_or_else(bad)?), 2),
+        25 => (
+            u64::from(u16::from_be_bytes(
+                data.get(*at + 1..*at + 3)
+                    .ok_or_else(bad)?
+                    .try_into()
+                    .unwrap(),
+            )),
+            3,
+        ),
+        26 => (
+            u64::from(u32::from_be_bytes(
+                data.get(*at + 1..*at + 5)
+                    .ok_or_else(bad)?
+                    .try_into()
+                    .unwrap(),
+            )),
+            5,
+        ),
+        27 => (
+            u64::from_be_bytes(
+                data.get(*at + 1..*at + 9)
+                    .ok_or_else(bad)?
+                    .try_into()
+                    .unwrap(),
+            ),
+            9,
+        ),
+        _ => return Ok(None),
+    };
+    let start = *at + skip;
+    let end = start
+        .checked_add(usize::try_from(len).map_err(|_| bad())?)
+        .ok_or_else(bad)?;
+    let bytes = data.get(start..end).ok_or_else(bad)?;
+    *at = end;
+    Ok(Some(bytes))
+}
+
+/// The JSON array an RFC 8746 typed array stands for: tag `64 + 16f + 8s +
+/// 4e + ll`, `f` a float, `s` signed, `e` little-endian (for one-byte
+/// unsigned, clamped), elements of 2^ll bytes (2^(ll+1) for a float).
+/// `None` for one it does not describe, or bytes that do not divide into it.
+fn typed_array(tag: u64, bytes: &[u8]) -> Option<serde_json::Value> {
+    use serde_json::Value;
+    let bits = tag - 64;
+    let (float, signed, little, ll) = (bits & 16 != 0, bits & 8 != 0, bits & 4 != 0, bits & 3);
+    let size = if float { 2usize << ll } else { 1usize << ll };
+    if !bytes.len().is_multiple_of(size) {
+        return None;
+    }
+    let word = |chunk: &[u8]| -> u128 {
+        let mut n = 0u128;
+        if little && size > 1 {
+            for &b in chunk.iter().rev() {
+                n = (n << 8) | u128::from(b);
+            }
+        } else {
+            for &b in chunk {
+                n = (n << 8) | u128::from(b);
+            }
+        }
+        n
+    };
+    let mut items = Vec::with_capacity(bytes.len() / size);
+    for chunk in bytes.chunks_exact(size) {
+        let n = word(chunk);
+        let value = match (float, size) {
+            (false, _) if signed => {
+                let shift = 128 - 8 * size as u32;
+                Value::from(((n << shift) as i128 >> shift) as i64)
+            }
+            (false, _) => Value::from(n as u64),
+            (true, 2) => Value::from(f64::from(crate::commands::json_fpha::f16_bits_to_f32(
+                n as u16,
+            ))),
+            (true, 4) => Value::from(f64::from(f32::from_bits(n as u32))),
+            (true, 8) => Value::from(f64::from_bits(n as u64)),
+            // 128-bit floats: nothing JSON has.
+            _ => return None,
+        };
+        // `Value::from(f64)` is null for a NaN or an infinity, which no
+        // JSON document holds.
+        if value.is_null() {
+            return None;
+        }
+        items.push(value);
+    }
+    Some(Value::Array(items))
+}
+
 fn cbor_value(data: &[u8], at: &mut usize, depth: usize) -> io::Result<serde_json::Value> {
     use serde_json::Value;
     let bad = || rdb_invalid("malformed CBOR");
@@ -3217,9 +3327,19 @@ fn cbor_value(data: &[u8], at: &mut usize, depth: usize) -> io::Result<serde_jso
             }
             Ok(Value::Object(map))
         }
-        // A tag, such as a date or a big number: the value it tags.
         6 => {
-            argument(at)?.ok_or_else(bad)?;
+            let tag = argument(at)?.ok_or_else(bad)?;
+            // A typed array (RFC 8746): how RedisJSON 8 saves an array of
+            // numbers all of one kind, `[1, 2]` as 8-bit integers, `[1.5]`
+            // as half floats. It made the whole snapshot unreadable (#157).
+            if (64..=87).contains(&tag) {
+                let bytes = match cbor_value_bytes(data, at)? {
+                    Some(bytes) => bytes,
+                    None => return Err(bad()),
+                };
+                return typed_array(tag, bytes).ok_or_else(bad);
+            }
+            // Any other tag, such as a date or a big number: the value it tags.
             cbor_value(data, at, depth + 1)
         }
         7 => match info {
@@ -4831,7 +4951,11 @@ mod function_section_tests {
     /// as the reader reads them.
     #[test]
     fn rdb_lengths_round_trip_at_each_forms_edges() {
-        for len in [0, 0x3F, 0x40, 0x3FFF, 0x4000, 0xFFFF_FFFF, 0x1_0000_0000] {
+        for len in [0u64, 0x3F, 0x40, 0x3FFF, 0x4000, 0xFFFF_FFFF, 0x1_0000_0000] {
+            // The 64-bit form's edge is past a 32-bit usize.
+            let Ok(len) = usize::try_from(len) else {
+                continue;
+            };
             let mut out = Vec::new();
             rdb_write_length(&mut out, len);
             let (read, encoded) = rdb_read_length(&mut &out[..]).unwrap();
@@ -4844,5 +4968,52 @@ mod function_section_tests {
     #[test]
     fn a_build_without_lua_loads_an_image_with_libraries() {
         assert!(restore_functions(Some(b"KVFN payload".to_vec())).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod redisjson_cbor_tests {
+    use super::cbor_to_json;
+    use serde_json::json;
+
+    /// What Redis 8.10 saves for `{"a":1,"b":[1,2]}` and `[1.5,2.5]`: the
+    /// arrays as typed arrays (RFC 8746), 8-bit integers and half floats.
+    /// They made the whole snapshot unreadable (#157).
+    #[test]
+    fn typed_arrays_redis_writes_are_read() {
+        let object = [
+            0xa2, 0x61, 0x61, 0x01, 0x61, 0x62, 0xd8, 0x48, 0x42, 0x01, 0x02,
+        ];
+        assert_eq!(cbor_to_json(&object).unwrap(), json!({"a": 1, "b": [1, 2]}));
+        let halves = [0xd8, 0x54, 0x44, 0x00, 0x3e, 0x00, 0x41];
+        assert_eq!(cbor_to_json(&halves).unwrap(), json!([1.5, 2.5]));
+    }
+
+    #[test]
+    fn every_width_and_order_of_typed_array() {
+        // uint32, little-endian: tag 70.
+        let u32le = [0xd8, 70, 0x48, 1, 0, 0, 0, 0x2c, 1, 0, 0];
+        assert_eq!(cbor_to_json(&u32le).unwrap(), json!([1, 300]));
+        // sint64, big-endian: tag 75.
+        let mut s64be = vec![0xd8, 75, 0x48];
+        s64be.extend_from_slice(&(-1i64).to_be_bytes());
+        assert_eq!(cbor_to_json(&s64be).unwrap(), json!([-1]));
+        // sint16, little-endian: tag 77.
+        let s16le = [0xd8, 77, 0x42, 0xfe, 0xff];
+        assert_eq!(cbor_to_json(&s16le).unwrap(), json!([-2]));
+        // float32, little-endian: tag 85.
+        let mut f32le = vec![0xd8, 85, 0x44];
+        f32le.extend_from_slice(&0.5f32.to_le_bytes());
+        assert_eq!(cbor_to_json(&f32le).unwrap(), json!([0.5]));
+        // float64, big-endian: tag 82.
+        let mut f64be = vec![0xd8, 82, 0x48];
+        f64be.extend_from_slice(&(-2.25f64).to_be_bytes());
+        assert_eq!(cbor_to_json(&f64be).unwrap(), json!([-2.25]));
+        // Bytes that do not divide into the elements, and 128-bit floats.
+        assert!(cbor_to_json(&[0xd8, 70, 0x43, 1, 2, 3]).is_err());
+        assert!(cbor_to_json(&[0xd8, 83, 0x40]).is_ok_and(|v| v == json!([])));
+        let mut f128 = vec![0xd8, 83, 0x50];
+        f128.extend_from_slice(&[0; 16]);
+        assert!(cbor_to_json(&f128).is_err());
     }
 }

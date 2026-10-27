@@ -64,6 +64,8 @@ pub(super) struct RangeOptions {
     pub bucket: u64,
     pub bucket_ts: BucketTimestamp,
     pub empty: bool,
+    /// `LATEST`: a compaction's bucket still open is reported too.
+    pub latest: bool,
 }
 
 fn text(arg: &[u8]) -> &str {
@@ -100,8 +102,7 @@ impl RangeOptions {
         let syntax = || resp_error("ERR syntax error");
 
         if is(tok, "LATEST") {
-            // Only meaningful for a compaction's open bucket, which here is
-            // always kept current — see `ts::propagate_compaction`.
+            self.latest = true;
             return Ok(Some(i + 1));
         }
         if is(tok, "EMPTY") {
@@ -402,15 +403,64 @@ pub(super) fn aggregate_bucket(
     reduce_values(agg, &values, false)
 }
 
+/// The first and last timestamps of the bucket starting at `start`.
+pub(super) fn bucket_bounds(start: i128, duration: u64) -> (u64, u64) {
+    let end = start + duration as i128;
+    (
+        start.max(0) as u64,
+        (end - 1).clamp(0, u64::MAX as i128) as u64,
+    )
+}
+
+/// The bucket of `rule` starting at `start`, aggregated from `source`: its
+/// first timestamp, and its value.
+pub(super) fn bucket_value(
+    source: &TsInner,
+    rule: &crate::types::CompactionRule,
+    start: i128,
+) -> (u64, f64) {
+    let (first, last) = bucket_bounds(start, rule.bucket_duration);
+    let samples: Vec<(u64, f64)> = source
+        .samples
+        .range(first..=last)
+        .map(|(t, v)| (*t, *v))
+        .collect();
+    let end = start + rule.bucket_duration as i128;
+    (
+        first,
+        aggregate_bucket(&rule.aggregation, &samples, source, start, end),
+    )
+}
+
+/// A compaction's bucket still open, from its source: what `LATEST` adds
+/// (#128). `None` for a series that is no compaction, or whose source is
+/// gone or empty. Taken before the compaction is read, so that no series is
+/// held while the source's shard is.
+pub(super) fn open_bucket(
+    ctx: &Ctx,
+    dest: &Arc<RwLock<TsInner>>,
+    dest_key: &str,
+) -> Option<(u64, f64)> {
+    let source_key = dest.read().source.clone()?;
+    let source = series_at(ctx, &source_key).ok()??;
+    let source = source.read();
+    let rule = source.rules.iter().find(|r| r.dest_key == dest_key)?;
+    let &newest = source.samples.keys().next_back()?;
+    let start = bucket_start(newest, rule.align_timestamp, rule.bucket_duration);
+    Some(bucket_value(&source, rule, start))
+}
+
 /// Run one series through the query: the samples in `[from, to]` that pass
 /// the filters, raw or bucketed. Rows come back in ascending time order with
-/// `COUNT` not yet applied — the caller reverses and truncates.
+/// `COUNT` not yet applied — the caller reverses and truncates. `open` is a
+/// compaction's open bucket, for `LATEST` ([`open_bucket`]).
 pub(super) fn query_series(
     series: &TsInner,
     opts: &RangeOptions,
     aggregators: Option<&[TsAggregation]>,
     from: Option<u64>,
     to: Option<u64>,
+    open: Option<(u64, f64)>,
 ) -> Result<Vec<Row>, Vec<u8>> {
     let lo = from.unwrap_or(0);
     let hi = to.unwrap_or(u64::MAX);
@@ -425,10 +475,15 @@ pub(super) fn query_series(
                 .filter_value
                 .is_none_or(|(min, max)| value >= min && value <= max)
     };
+    // The open bucket comes after every closed one; a value an older build
+    // wrote for it is left out.
+    let open = open.filter(|(ts, _)| (lo..=hi).contains(ts));
     let samples = series
         .samples
         .range(lo..=hi)
         .map(|(ts, v)| (*ts, *v))
+        .filter(|(ts, _)| open.is_none_or(|(at, _)| *ts != at))
+        .chain(open)
         .filter(|(ts, v)| passes(*ts, *v));
 
     let Some(aggregators) = aggregators else {
@@ -534,7 +589,8 @@ fn reply_resp(ctx: &Ctx) -> u8 {
     crate::commands::handler::effective_resp_for_reply(ctx)
 }
 
-fn series_at(ctx: &Ctx, key: &str) -> Result<Option<Arc<RwLock<TsInner>>>, Vec<u8>> {
+/// The series at `key`, with no lock held.
+pub(super) fn series_at(ctx: &Ctx, key: &str) -> Result<Option<Arc<RwLock<TsInner>>>, Vec<u8>> {
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     match read_lock!(shard).get(key) {
         None => Ok(None),
@@ -578,12 +634,18 @@ pub(super) fn ts_range(ctx: &mut Ctx, reverse: bool) -> Option<Vec<u8>> {
         Ok(None) => return Some(resp_error(NO_KEY)),
         Err(e) => return Some(e),
     };
+    let open = if opts.latest {
+        open_bucket(ctx, &series, key)
+    } else {
+        None
+    };
     let rows = query_series(
         &series.read(),
         &opts,
         opts.aggregators.first().map(Vec::as_slice),
         from,
         to,
+        open,
     );
     Some(match rows {
         Ok(rows) => rows_reply(reply_resp(ctx), &finish_rows(rows, reverse, opts.count)),
@@ -774,8 +836,13 @@ pub(super) fn ts_mrange(ctx: &mut Ctx, reverse: bool) -> Option<Vec<u8>> {
         let Ok(Some(series)) = series_at(ctx, &key) else {
             continue;
         };
+        let open = if opts.latest {
+            open_bucket(ctx, &series, &key)
+        } else {
+            None
+        };
         let series = series.read();
-        match query_series(&series, &opts, aggregators, from, to) {
+        match query_series(&series, &opts, aggregators, from, to, open) {
             Ok(rows) => results.push((key, series.labels.clone(), rows)),
             Err(e) => return Some(e),
         }
@@ -984,7 +1051,7 @@ pub(super) fn ts_nrange(ctx: &mut Ctx, reverse: bool) -> Option<Vec<u8>> {
     let mut column = 0usize;
     for (k, series) in series.iter().enumerate() {
         let aggregators = opts.aggregators.get(k).map(Vec::as_slice);
-        let rows = match query_series(&series.read(), &opts, aggregators, from, to) {
+        let rows = match query_series(&series.read(), &opts, aggregators, from, to, None) {
             Ok(rows) => rows,
             Err(e) => return Some(e),
         };
@@ -1287,7 +1354,15 @@ mod tests {
 
     fn run(s: &TsInner, tokens: &[&str], from: Option<u64>, to: Option<u64>) -> Vec<Row> {
         let o = opts(tokens, 1);
-        query_series(s, &o, o.aggregators.first().map(Vec::as_slice), from, to).unwrap()
+        query_series(
+            s,
+            &o,
+            o.aggregators.first().map(Vec::as_slice),
+            from,
+            to,
+            None,
+        )
+        .unwrap()
     }
 
     fn stock() -> TsInner {
@@ -1331,7 +1406,7 @@ mod tests {
 
         // `ALIGN start` needs an explicit start.
         let o = opts(&["ALIGN", "start", "AGGREGATION", "min", "20"], 1);
-        assert!(query_series(&s, &o, Some(&o.aggregators[0]), None, None).is_err());
+        assert!(query_series(&s, &o, Some(&o.aggregators[0]), None, None, None).is_err());
     }
 
     /// The multi-aggregator example on the Redis `TS.RANGE` page.
@@ -1421,7 +1496,7 @@ mod tests {
     fn empty_refuses_an_absurd_number_of_buckets() {
         let s = series(&[(0, 1.0), (10_000_000, 2.0)]);
         let o = opts(&["AGGREGATION", "sum", "1", "EMPTY"], 1);
-        assert!(query_series(&s, &o, Some(&o.aggregators[0]), None, None).is_err());
+        assert!(query_series(&s, &o, Some(&o.aggregators[0]), None, None, None).is_err());
     }
 
     #[test]

@@ -11,6 +11,10 @@
 //! the bytes, beside the count, in four bytes each: a value is at most 512 MB
 //! ([`MAX_LEN`] is what fits), and a value held four thousand million times
 //! over has not been met.
+//!
+//! A block of up to [`crate::value_slab::MAX_BLOCK`] bytes, header and all,
+//! is in KiviDB's own slabs, not the system allocator's (#113): see
+//! `value_slab`.
 
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::ptr::NonNull;
@@ -59,11 +63,18 @@ impl SharedBytes {
     #[inline]
     unsafe fn make(len: usize, fill: impl FnOnce(*mut u8)) -> Self {
         let layout = Self::layout(len);
-        // SAFETY: the layout is never of size zero, for the header.
-        let block = unsafe { alloc(layout) } as *mut Header;
-        let Some(to) = NonNull::new(block) else {
-            handle_alloc_error(layout)
+        let to = match crate::value_slab::class_of(layout.size()) {
+            Some(class) => crate::value_slab::alloc(class).cast::<Header>(),
+            None => {
+                // SAFETY: the layout is never of size zero, for the header.
+                let block = unsafe { alloc(layout) } as *mut Header;
+                let Some(to) = NonNull::new(block) else {
+                    handle_alloc_error(layout)
+                };
+                to
+            }
         };
+        let block = to.as_ptr();
         // SAFETY: `block` is `HEADER + len` bytes, aligned for a `Header`,
         // and nothing else has it yet.
         unsafe {
@@ -110,6 +121,41 @@ impl SharedBytes {
         a.to == b.to
     }
 
+    /// Where the block is: for compaction to ask whether its slab is being
+    /// emptied (`value_slab::is_evacuating`).
+    #[inline]
+    pub fn block(&self) -> *const u8 {
+        self.to.as_ptr() as *const u8
+    }
+
+    /// Move the bytes to a new block if theirs is in a slab compaction is
+    /// emptying (#113) and this is their only holder; `regions` is
+    /// `value_slab::regions_snapshot`. Returns the old block,
+    /// to be let go of once whatever lock the caller holds is: freeing it can
+    /// give a slab back to the kernel.
+    ///
+    /// With `&mut self` and one holder, nothing else can be reading the
+    /// bytes, or get to them but through `self`.
+    pub fn relocate(&mut self, regions: &[usize]) -> Option<SharedBytes> {
+        let size = HEADER + self.len();
+        let class = crate::value_slab::class_of(size)?;
+        if !crate::value_slab::is_evacuating(self.block(), regions) {
+            return None;
+        }
+        // Acquire: what a holder that let go just now did with the bytes
+        // comes before they are copied and the block freed.
+        if self.header().holders.load(Ordering::Acquire) != 1 {
+            return None;
+        }
+        let to = crate::value_slab::alloc(class).cast::<Header>();
+        // SAFETY: both blocks are `size` bytes of this class, and the new one
+        // is nobody else's.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.block(), to.as_ptr() as *mut u8, size);
+        }
+        Some(std::mem::replace(self, SharedBytes { to }))
+    }
+
     /// The bytes this takes on the heap, header and all.
     #[inline]
     pub fn heap_size(&self) -> usize {
@@ -140,9 +186,14 @@ impl Drop for SharedBytes {
         // go must be seen here before the block is freed.
         fence(Ordering::Acquire);
         let layout = Self::layout(self.header().len as usize);
-        // SAFETY: this was the last holder, and the block was allocated with
-        // this layout.
-        unsafe { dealloc(self.to.as_ptr() as *mut u8, layout) };
+        match crate::value_slab::class_of(layout.size()) {
+            // SAFETY: this was the last holder, and a block of this size
+            // came from this class.
+            Some(class) => unsafe { crate::value_slab::free(self.to.cast(), class) },
+            // SAFETY: this was the last holder, and the block was allocated
+            // with this layout.
+            None => unsafe { dealloc(self.to.as_ptr() as *mut u8, layout) },
+        }
     }
 }
 

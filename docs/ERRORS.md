@@ -109,6 +109,7 @@ Client libraries raise them as exceptions; the first word is the code.
 
 | Reply | Meaning | What to do |
 |---|---|---|
+| `ERR this build of KiviDB has no Lua…` | `EVAL`, `EVALSHA`, `SCRIPT`, `FUNCTION` or `FCALL` on the default or `tls` build, which have no Lua. Job queues such as BullMQ and Sidekiq run scripts, so they hit this first. | Run the `lua` or `full` variant: Docker image `kividb/kividb:<version>-lua` or `-full`, or the `kividb-lua-…` / `kividb-full-…` release file. |
 | `ERR unknown command '{name}'…` | The command does not exist, or is not supported. [COMMANDS.md](../COMMANDS.md) lists what is. | Check the spelling. Of Redis's module commands, JSON, search (`FT.*`), time series (`TS.*`) and vector sets are available. |
 | `ERR wrong number of arguments for '{cmd}' command` | As it says. | Check the command's syntax. |
 | `ERR syntax error`, `ERR value is not an integer or out of range`, `ERR value is not a valid float` | An argument is malformed. | Check the arguments. |

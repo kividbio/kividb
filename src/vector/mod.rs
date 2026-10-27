@@ -676,9 +676,123 @@ pub struct IndexDef {
     pub inverted: Arc<RwLock<AHashMap<String, AHashSet<String>>>>,
     //                                     ^^^^^^  ^^^^^^^^^^^^^^^^^^
     //                                     token   set of doc keys containing it
+    /// What each document's TEXT fields put into the inverted index and the
+    /// statistics above, by key and field, stopwords left out: what is taken
+    /// back out when a field is written again or the document goes. Without
+    /// it nothing was: an update added a document's words again, a delete
+    /// left them counted, and BM25 scores drifted until a restart (#162).
+    pub forward: Arc<RwLock<ForwardIndex>>,
 }
 
+/// By document key, by TEXT field: the words it put in (see
+/// [`IndexDef::forward`]).
+pub type ForwardIndex = AHashMap<String, AHashMap<String, Vec<String>>>;
+
 impl IndexDef {
+    /// Make `tokens` — stopwords already left out — what TEXT field `field`
+    /// of the document at `key` holds: the inverted index, the vocabulary
+    /// and the BM25 statistics become what they would be had the document
+    /// always held them.
+    pub fn set_text(&self, key: &str, field: &str, tokens: Vec<String>) {
+        self.change_text(key, |fields| {
+            if tokens.is_empty() {
+                fields.remove(field);
+            } else {
+                fields.insert(field.to_string(), tokens);
+            }
+        });
+    }
+
+    /// The document at `key` is gone: take out everything its TEXT fields
+    /// put in.
+    pub fn remove_text(&self, key: &str) {
+        self.change_text(key, |fields| fields.clear());
+    }
+
+    fn change_text(&self, key: &str, change: impl FnOnce(&mut AHashMap<String, Vec<String>>)) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut forward = self.forward.write();
+        let old = forward.remove(key).unwrap_or_default();
+        let mut new = old.clone();
+        change(&mut new);
+        if old.is_empty() && new.is_empty() {
+            return;
+        }
+        let words = |fields: &AHashMap<String, Vec<String>>| -> (usize, AHashSet<String>) {
+            let total = fields.values().map(Vec::len).sum();
+            let unique = fields.values().flatten().cloned().collect();
+            (total, unique)
+        };
+        let postings = |fields: &AHashMap<String, Vec<String>>| -> AHashSet<String> {
+            fields
+                .iter()
+                .flat_map(|(field, tokens)| tokens.iter().map(move |t| format!("{field}\x00{t}")))
+                .collect()
+        };
+        let (old_total, old_unique) = words(&old);
+        let (new_total, new_unique) = words(&new);
+        let (old_postings, new_postings) = (postings(&old), postings(&new));
+        {
+            let mut inverted = self.inverted.write();
+            for gone in old_postings.difference(&new_postings) {
+                if let Some(set) = inverted.get_mut(gone) {
+                    set.remove(key);
+                    if set.is_empty() {
+                        inverted.remove(gone);
+                    }
+                }
+            }
+            for came in new_postings.difference(&old_postings) {
+                inverted
+                    .entry(came.clone())
+                    .or_default()
+                    .insert(key.to_string());
+            }
+        }
+        {
+            let mut doc_freq = self.doc_freq.write();
+            for gone in old_unique.difference(&new_unique) {
+                if let Some(n) = doc_freq.get_mut(gone) {
+                    *n = n.saturating_sub(1);
+                    if *n == 0 {
+                        doc_freq.remove(gone);
+                    }
+                }
+            }
+            for came in new_unique.difference(&old_unique) {
+                *doc_freq.entry(came.clone()).or_insert(0) += 1;
+            }
+        }
+        if !new_unique.is_empty() {
+            let mut vocab = self.vocab.write();
+            for word in &new_unique {
+                if !vocab.contains(word) {
+                    vocab.insert(word.clone());
+                }
+            }
+        }
+        // Only changed here, under the forward index's lock: a load and a
+        // store do not race.
+        match (old_total > 0, new_total > 0) {
+            (false, true) => {
+                self.doc_count.fetch_add(1, Relaxed);
+            }
+            (true, false) => {
+                let n = self.doc_count.load(Relaxed);
+                self.doc_count.store(n.saturating_sub(1), Relaxed);
+            }
+            _ => {}
+        }
+        let tokens = self.total_tokens.load(Relaxed);
+        self.total_tokens.store(
+            tokens.saturating_sub(old_total).saturating_add(new_total),
+            Relaxed,
+        );
+        if !new.is_empty() {
+            forward.insert(key.to_string(), new);
+        }
+    }
+
     /// Whether `token` is one of this index's stopwords.
     pub fn is_stopword(&self, token: &str) -> bool {
         match &self.stopwords {
@@ -865,6 +979,7 @@ impl IndexSchema {
             total_tokens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             doc_freq: Arc::new(RwLock::new(AHashMap::new())),
             inverted: Arc::new(RwLock::new(AHashMap::new())),
+            forward: Arc::new(RwLock::new(AHashMap::new())),
         }
     }
 }
@@ -889,23 +1004,10 @@ pub fn backfill_text_fields(db: &crate::store::Db, def: &IndexDef, fields: &[Str
                 let Some(text) = inner.get(field).and_then(|b| std::str::from_utf8(b).ok()) else {
                     continue;
                 };
-                let tokens: AHashSet<String> = tokenize_for_vocab(text)
+                let tokens: Vec<String> = tokenize_for_vocab(text)
                     .filter(|tok| !def.is_stopword(tok))
                     .collect();
-                if tokens.is_empty() {
-                    continue;
-                }
-                let mut vocab = def.vocab.write();
-                let mut inverted = def.inverted.write();
-                let mut doc_freq = def.doc_freq.write();
-                for token in tokens {
-                    inverted
-                        .entry(format!("{field}\x00{token}"))
-                        .or_default()
-                        .insert(key.to_string());
-                    *doc_freq.entry(token.clone()).or_insert(0) += 1;
-                    vocab.insert(token);
-                }
+                def.set_text(key, field, tokens);
             }
         }
     }
@@ -1016,43 +1118,14 @@ pub fn backfill_from_db_progress(
                 }
             }
 
-            if !text_field_names.is_empty() {
-                let mut field_tokens: Vec<(String, String)> = Vec::new();
-                for fname in &text_field_names {
-                    if let Some(raw) = inner.get(fname)
-                        && let Ok(s) = std::str::from_utf8(raw)
-                    {
-                        for tok in tokenize_for_vocab(s) {
-                            field_tokens.push((fname.clone(), tok));
-                        }
-                    }
-                }
-                field_tokens.retain(|(_, tok)| !def.is_stopword(tok));
-                if !field_tokens.is_empty() {
-                    {
-                        let mut vocab = def.vocab.write();
-                        for (_, tok) in &field_tokens {
-                            vocab.insert(tok.clone());
-                        }
-                    }
-                    {
-                        let mut inv = def.inverted.write();
-                        for (field_name, tok) in &field_tokens {
-                            let inv_key = format!("{}\x00{}", field_name, tok);
-                            inv.entry(inv_key).or_default().insert(key.to_string());
-                        }
-                    }
-                    let token_count = field_tokens.len();
-                    let unique_terms: AHashSet<&str> =
-                        field_tokens.iter().map(|(_, tok)| tok.as_str()).collect();
-                    def.doc_count.fetch_add(1, Relaxed);
-                    def.total_tokens.fetch_add(token_count, Relaxed);
-                    {
-                        let mut df = def.doc_freq.write();
-                        for term in unique_terms {
-                            *df.entry(term.to_string()).or_insert(0) += 1;
-                        }
-                    }
+            for fname in &text_field_names {
+                if let Some(raw) = inner.get(fname)
+                    && let Ok(s) = std::str::from_utf8(raw)
+                {
+                    let tokens: Vec<String> = tokenize_for_vocab(s)
+                        .filter(|tok| !def.is_stopword(tok))
+                        .collect();
+                    def.set_text(key, fname, tokens);
                 }
             }
         }
@@ -1630,80 +1703,28 @@ pub fn maybe_index(index_store: &IndexStore, key: &str, fields: &[(String, Arc<[
 /// fields, and its vectors.
 fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)]) {
     {
-        // ── Update spell-check vocab and BM25 corpus statistics ─────────────
+        // ── Spell-check vocabulary, inverted index, BM25 statistics ─────────
         //
-        // One pass over the TEXT fields per document:
-        //   - collect all tokens (existing behaviour for vocab)
-        //   - count unique terms (for doc_freq — "how many docs contain this term")
-        //   - count total tokens (for total_tokens — feeds avgdl)
-        //
-        // We batch all writes: one vocab write-lock, one doc_freq write-lock,
-        // two atomic adds. No per-token lock churn.
-
-        // Collect (field_name, token) pairs so the inverted index can be keyed
-        // per field. Vocab gets all tokens regardless of field.
-        let mut field_tokens: Vec<(String, String)> = Vec::new();
+        // Each TEXT field written replaces what it held before: its words,
+        // stopwords left out (see `IndexDef::set_text`).
         for f in &def.fields {
             if !matches!(f.field_type, FieldType::Text) || f.options.noindex {
                 continue;
             }
-            let raw = match fields.iter().find(|(n, _)| n == &f.name) {
-                Some((_, b)) => b,
-                None => continue,
+            let Some((_, raw)) = fields.iter().find(|(n, _)| n == &f.name) else {
+                continue;
             };
-            let s = match std::str::from_utf8(raw) {
-                Ok(s) => s,
-                Err(_) => continue,
+            let tokens: Vec<String> = match std::str::from_utf8(raw) {
+                Ok(s) => tokenize_for_vocab(s)
+                    .filter(|tok| !def.is_stopword(tok))
+                    .collect(),
+                Err(_) => Vec::new(),
             };
-            for tok in tokenize_for_vocab(s) {
-                field_tokens.push((f.name.clone(), tok));
-            }
+            def.set_text(key, &f.name, tokens);
         }
+    }
 
-        // Strip stopwords before writing to any index structure.
-        // Done once here so vocab, inverted index, and BM25 stats are all
-        // consistent — none of them ever see stopwords.
-        field_tokens.retain(|(_, tok)| !def.is_stopword(tok));
-
-        if !field_tokens.is_empty() {
-            // Vocab — all tokens, field-agnostic
-            {
-                let mut vocab = def.vocab.write();
-                for (_, tok) in &field_tokens {
-                    vocab.insert(tok.clone());
-                }
-            }
-
-            // Inverted index — keyed by "fieldname\x00token"
-            {
-                let mut inv = def.inverted.write();
-                for (field_name, tok) in &field_tokens {
-                    let inv_key = format!("{}\x00{}", field_name, tok);
-                    inv.entry(inv_key).or_default().insert(key.to_string());
-                }
-            }
-
-            // BM25 corpus statistics — updated once per document per HSET.
-            // doc_count and total_tokens are atomics (no lock needed on the write path).
-            // doc_freq needs a write lock but we batch all term updates under one lock
-            // acquisition.
-            let token_count = field_tokens.len();
-            let unique_terms: ahash::AHashSet<&str> =
-                field_tokens.iter().map(|(_, tok)| tok.as_str()).collect();
-
-            def.doc_count
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            def.total_tokens
-                .fetch_add(token_count, std::sync::atomic::Ordering::Relaxed);
-
-            {
-                let mut df = def.doc_freq.write();
-                for term in unique_terms {
-                    *df.entry(term.to_string()).or_insert(0) += 1;
-                }
-            }
-        }
-
+    {
         // ── Update live vector indexes ────────────────────────────────────────
         //
         // Walk every VECTOR field in this index's schema. Each one may have
@@ -2460,23 +2481,10 @@ pub fn maybe_unindex(index_store: &IndexStore, key: &str) {
             continue;
         }
 
-        // Remove from inverted index — walk every posting list and remove
-        // this key. We don't know which tokens this doc contributed, so we
-        // scan the whole map. This is O(unique_tokens_in_corpus) on delete,
-        // which is acceptable: deletes are rare compared to reads, and
-        // posting lists shrink correctly.
-        //
-        // Alternative: maintain a forward index (key → [tokens]) to make
-        // this O(tokens_in_doc). Add that later if delete-heavy workloads
-        // appear in benchmarks.
-        {
-            let mut inv = def.inverted.write();
-            inv.values_mut().for_each(|set| {
-                set.remove(key);
-            });
-            // Drop empty posting lists to keep memory bounded
-            inv.retain(|_, set| !set.is_empty());
-        }
+        // What its TEXT fields put in comes out: the words it held, from the
+        // inverted index and the BM25 statistics. It used to walk every
+        // posting list, and leave the statistics as they were.
+        def.remove_text(key);
 
         // Tombstone the key in every VECTOR field's live index.
         // The HSET-equivalent inserts into one or more of these; deletion

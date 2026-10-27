@@ -226,7 +226,7 @@ pub fn route_named(
             .nodes
             .read()
             .get(id)
-            .map(|n| (cluster.endpoint_of(n), n.client_port))
+            .map(|n| (cluster.endpoint_of(n), n.client_facing_port()))
     };
     let moved_to = |id: &crate::cluster::NodeId| match node_addr(id) {
         Some((ip, port)) => RouteDecision::Moved {

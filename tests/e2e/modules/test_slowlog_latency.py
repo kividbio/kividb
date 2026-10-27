@@ -511,6 +511,14 @@ class TestSlowlogConcurrent:
 # LATENCY tests
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _slow_command(r):
+    """A command the latency monitor records: one that takes at least
+    `latency-monitor-threshold` (in ms), which it goes by, as in Redis, and
+    not `slowlog-log-slower-than`."""
+    r.config_set("latency-monitor-threshold", 1)
+    r.execute_command("DEBUG", "SLEEP", "0.005")
+
+
 class TestLatencyLatest:
     """LATENCY LATEST"""
 
@@ -526,9 +534,7 @@ class TestLatencyLatest:
         r = redis.Redis(host=KIVI_HOST, port=port, decode_responses=True)
         try:
             r.flushdb()
-            for i in range(10):
-                r.set(f"lat_{i}", i)
-                r.get(f"lat_{i}")
+            _slow_command(r)
             result = r.execute_command("LATENCY", "LATEST")
             assert isinstance(result, list)
             event_names = [entry[0] for entry in result]
@@ -540,13 +546,14 @@ class TestLatencyLatest:
             proc.terminate()
             proc.wait(timeout=5)
 
-    def test_latest_entry_has_three_fields(self, r):
-        # Force some latency samples
-        for i in range(5):
-            r.set(f"latest_struct_{i}", i)
+    def test_latest_entry_has_four_fields(self, r):
+        # Event, time, latest ms and most ms, as in Redis.
+        _slow_command(r)
         result = r.execute_command("LATENCY", "LATEST")
+        assert result
         for entry in result:
-            assert len(entry) == 3, f"Expected 3 fields per entry, got {len(entry)}: {entry}"
+            assert len(entry) == 4, f"Expected 4 fields per entry, got {len(entry)}: {entry}"
+            assert entry[3] >= entry[2]
 
     def test_latest_timestamp_is_unix_seconds(self, r):
         for i in range(3):
@@ -588,8 +595,7 @@ class TestLatencyHistory:
         r = redis.Redis(host=KIVI_HOST, port=port, decode_responses=True)
         try:
             r.flushdb()
-            for i in range(15):
-                r.set(f"hist_{i}", i)
+            _slow_command(r)
             cmd_history = r.execute_command("LATENCY", "HISTORY", "command")
             fast_history = r.execute_command("LATENCY", "HISTORY", "fast-command")
             total_samples = len(cmd_history) + len(fast_history)
@@ -873,6 +879,7 @@ class TestSlowlogLatencyIntegration:
             for i in range(10):
                 r.set(f"both_{i}", i)
                 r.get(f"both_{i}")
+            _slow_command(r)
 
             slowlog_len = r.execute_command("SLOWLOG", "LEN")
             latency_latest = r.execute_command("LATENCY", "LATEST")
@@ -952,14 +959,16 @@ class TestSlowlogLatencyIntegration:
             r.execute_command("LATENCY", "RESET")
 
             pipe = r.pipeline(transaction=False)
+            pipe.config_set("latency-monitor-threshold", 1)
             for i in range(20):
                 pipe.set(f"pipe_{i}", i)
+            pipe.execute_command("DEBUG", "SLEEP", "0.005")
             pipe.execute()
 
             slowlog_len = r.execute_command("SLOWLOG", "LEN")
             latency_latest = r.execute_command("LATENCY", "LATEST")
 
-            assert slowlog_len >= 20, (
+            assert slowlog_len >= 22, (
                 f"Expected >= 20 slowlog entries for 20 pipelined SETs, got {slowlog_len}"
             )
             if not _IS_REDIS:
@@ -971,13 +980,9 @@ class TestSlowlogLatencyIntegration:
 
     def test_latency_fast_vs_command_classification(self):
         """
-        Commands that complete in < 1ms should appear under 'fast-command',
-        commands >= 1ms under 'command'. With threshold=0 both categories
-        should eventually be populated under realistic conditions.
-
-        We simply assert that the latency tracker correctly returns the
-        events it does have, with valid structure — we cannot force a
-        sub/super millisecond boundary deterministically in a test.
+        A command Redis flags fast (GET, SET, ...) that crosses
+        `latency-monitor-threshold` is a 'fast-command' event, any other a
+        'command' event; DEBUG SLEEP is the latter.
         """
         if _IS_REDIS:
             pytest.skip("Redis LATENCY does not classify individual commands")
@@ -986,13 +991,12 @@ class TestSlowlogLatencyIntegration:
         r = redis.Redis(host=KIVI_HOST, port=port, decode_responses=True)
         try:
             r.flushdb()
-            for i in range(50):
-                r.set(f"classify_{i}", i)
-                r.get(f"classify_{i}")
+            _slow_command(r)
 
             latest = r.execute_command("LATENCY", "LATEST")
+            assert [entry[0] for entry in latest] == ["command"], latest
             for entry in latest:
-                name, ts, ms = entry
+                name, ts, ms, _most = entry
                 assert name in ("command", "fast-command"), (
                     f"Unexpected latency event name: {name!r}"
                 )

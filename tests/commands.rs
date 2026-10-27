@@ -2022,3 +2022,28 @@ fn test_restore_of_a_huge_claimed_length_is_bad_data_not_a_crash() {
         "{reply:?}"
     );
 }
+
+// Without Lua, every script command says which build has it: BullMQ and
+// Sidekiq show this error to their users.
+#[cfg(not(feature = "lua"))]
+#[test]
+fn test_script_commands_without_lua_name_the_build() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for cmd in [
+        &["EVAL", "return 1", "0"][..],
+        &["EVALSHA", "0000000000000000000000000000000000000000", "0"],
+        &["SCRIPT", "LOAD", "return 1"],
+        &["FUNCTION", "LIST"],
+        &["FCALL", "f", "0"],
+    ] {
+        let reply = c.cmds(cmd);
+        assert!(
+            matches!(&reply, RespValue::Error(e) if e.starts_with("ERR this build of KiviDB has no Lua")
+                && e.contains(&format!("kividb/kividb:v{}-lua", env!("CARGO_PKG_VERSION")))),
+            "{cmd:?}: {reply:?}"
+        );
+    }
+}

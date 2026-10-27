@@ -87,6 +87,8 @@ pub enum BlockState {
     StreamIds {
         ids: Vec<crate::types::StreamId>,
         deadline: Option<std::time::Instant>,
+        /// Its registrations: dropping this, however the wait ends, removes them.
+        registered: crate::wait_table::StreamWait,
     },
     /// A command waiting in line for its keys (the blocking list and
     /// sorted-set commands): its deadline (`None` = wait forever) and its
@@ -550,6 +552,11 @@ impl BlockingWait {
     /// resume dispatch. Called before [`wait`](Self::wait), which consumes self.
     pub fn take_state(&mut self) -> Option<BlockState> {
         self.state.take()
+    }
+
+    /// Whether it ends by itself at a time: `clients_in_timeout_table`.
+    pub fn has_timeout(&self) -> bool {
+        self.timeout.is_some()
     }
 
     /// Whether parking this from a resume dispatch is intended rather than a

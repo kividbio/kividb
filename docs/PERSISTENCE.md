@@ -225,13 +225,23 @@ An older release stops reading at the first section it does not know, so
 these come after everything it does. A snapshot written by this version
 cannot be read by an older one once it contains any of these.
 
-## Known limitation
+## When a write is acknowledged
 
-A write is acknowledged when its record is queued for the AOF, not when it
-has been written to the file. If the process is killed outright (`kill -9`,
-the OOM killer), the writes of the last fraction of a millisecond may not be
-in the file. A normal shutdown loses nothing, and a power failure can lose up
-to a second, as with `appendfsync everysec` in Redis.
+With the AOF on, the replies to a batch of commands that wrote are sent once
+their records have been written to the file (the operating system's page
+cache), as in Redis. A process killed outright (`kill -9`, the OOM killer)
+loses no acknowledged write; a power failure can lose up to a second, as with
+`appendfsync everysec` in Redis, since the file is synced once a second.
+Connections waiting at the same time are answered by one write (a group
+commit), and reads wait for nothing. Before 1.2 a write was acknowledged
+once its record was queued, and a killed process could lose the last few.
+
+The wait costs writes: on a 16-core server, 20-28% of `SET`s a second with
+50 clients, with or without pipelining, and under 10% with one client.
+`aof-ack-after-write no` (in the config file, or `CONFIG SET` at run time)
+acknowledges a write once its record is queued, as before 1.2, at full
+speed, and a killed process can lose the last few acknowledged writes. The
+default is `yes`.
 
 ## Verifying
 

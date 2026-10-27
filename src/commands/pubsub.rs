@@ -1,5 +1,5 @@
 use crate::commands::ctx::Ctx;
-use crate::resp::write::{resp_array, resp_bulk_str, resp_error, resp_integer};
+use crate::resp::write::{resp_array, resp_bulk, resp_error, resp_integer};
 use std::sync::Arc;
 
 pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
@@ -13,12 +13,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
 fn publish(ctx: &mut Ctx, shard: bool) -> Vec<u8> {
     if ctx.cmd.len() != 3 {
-        return resp_error("ERR wrong number of arguments for 'publish' command");
+        let name = if shard { "spublish" } else { "publish" };
+        return resp_error(&format!(
+            "ERR wrong number of arguments for '{name}' command"
+        ));
     }
-    let channel = match std::str::from_utf8(ctx.cmd[1]) {
-        Ok(s) => s,
-        Err(_) => return resp_error("ERR channel must be valid UTF-8"),
-    };
+    // Any bytes, as in Redis: it refused a name that was not UTF-8 (#161).
+    let channel = ctx.cmd[1];
     let payload: Arc<[u8]> = Arc::from(ctx.cmd[2]);
     // By this connection: whether it is a client's command, one in a
     // transaction, or a script's redis.call.
@@ -71,48 +72,40 @@ fn pubsub_cmd(ctx: &mut Ctx) -> Vec<u8> {
             ],
         ),
         "CHANNELS" => {
-            let pat = ctx.cmd.get(2).and_then(|b| std::str::from_utf8(b).ok());
+            let pat = ctx.cmd.get(2).copied();
             let items: Vec<Vec<u8>> = ctx
                 .pubsub
                 .channels(pat)
                 .iter()
-                .map(|c| resp_bulk_str(c))
+                .map(|c| resp_bulk(c))
                 .collect();
             resp_array(items)
         }
         "NUMSUB" => {
-            let names: Vec<&str> = ctx.cmd[2..]
-                .iter()
-                .filter_map(|b| std::str::from_utf8(b).ok())
-                .collect();
-            let counts = ctx.pubsub.numsub(&names);
+            let counts = ctx.pubsub.numsub(&ctx.cmd[2..]);
             let mut out = Vec::with_capacity(counts.len() * 2);
             for (ch, n) in counts {
-                out.push(resp_bulk_str(&ch));
+                out.push(resp_bulk(&ch));
                 out.push(resp_integer(n as i64));
             }
             resp_array(out)
         }
         "NUMPAT" => resp_integer(ctx.pubsub.numpat() as i64),
         "SHARDCHANNELS" => {
-            let pat = ctx.cmd.get(2).and_then(|b| std::str::from_utf8(b).ok());
+            let pat = ctx.cmd.get(2).copied();
             let items: Vec<Vec<u8>> = ctx
                 .pubsub
                 .shard_channels(pat)
                 .iter()
-                .map(|c| resp_bulk_str(c))
+                .map(|c| resp_bulk(c))
                 .collect();
             resp_array(items)
         }
         "SHARDNUMSUB" => {
-            let names: Vec<&str> = ctx.cmd[2..]
-                .iter()
-                .filter_map(|b| std::str::from_utf8(b).ok())
-                .collect();
-            let counts = ctx.pubsub.shardnumsub(&names);
+            let counts = ctx.pubsub.shardnumsub(&ctx.cmd[2..]);
             let mut out = Vec::with_capacity(counts.len() * 2);
             for (ch, n) in counts {
-                out.push(resp_bulk_str(&ch));
+                out.push(resp_bulk(&ch));
                 out.push(resp_integer(n as i64));
             }
             resp_array(out)

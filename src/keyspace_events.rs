@@ -15,6 +15,9 @@ pub const KS_STREAM: u32 = 1 << 10;
 pub const KS_KEY_MISS: u32 = 1 << 11;
 /// `a` (Redis 8.10): array commands. One of `A`'s.
 pub const KS_ARRAY: u32 = 1 << 19;
+/// `d`: the module types' commands (JSON, time series, vector sets). One of
+/// `A`'s, as in Redis.
+pub const KS_MODULE: u32 = 1 << 20;
 /// `n`: a key that was not there has been created. (Not one of `A`'s.)
 pub const KS_NEW: u32 = 1 << 16;
 /// `o` (Redis 8.2): a key's value has been replaced whole, by `SET`, a
@@ -55,6 +58,7 @@ pub fn parse_ks_flags(s: &str) -> u32 {
             't' => flags |= KS_STREAM,
             'm' => flags |= KS_KEY_MISS,
             'a' => flags |= KS_ARRAY,
+            'd' => flags |= KS_MODULE,
             'n' => flags |= KS_NEW,
             'o' => flags |= KS_OVERWRITTEN,
             'c' => flags |= KS_TYPE_CHANGED,
@@ -72,12 +76,113 @@ pub fn parse_ks_flags(s: &str) -> u32 {
                     | KS_EVICTED
                     | KS_HASH
                     | KS_STREAM
-                    | KS_ARRAY;
+                    | KS_ARRAY
+                    | KS_MODULE;
             }
             _ => {}
         }
     }
     flags
+}
+
+/// The characters `notify-keyspace-events` takes.
+const KS_FLAG_CHARS: &str = "KEg$lshzxetmdnaocASTIV";
+
+/// [`parse_ks_flags`], or `None` for a character that is not a flag: `CONFIG
+/// SET` and the config file refuse it, as Redis does. It was dropped
+/// (`KEAQ!` was `AKE`, #160).
+pub fn parse_ks_flags_strict(s: &str) -> Option<u32> {
+    s.chars()
+        .all(|c| KS_FLAG_CHARS.contains(c))
+        .then(|| parse_ks_flags(s))
+}
+
+/// Redis's error for a bad `notify-keyspace-events`.
+pub const BAD_FLAGS: &str = "Invalid event class character. Use 'Ag$lshzxeKEtmdn'.";
+
+/// An event a command announces, found from the command and its reply: for
+/// the commands that publish nothing of their own (#160).
+pub struct CommandEvent {
+    pub class: u32,
+    pub event: String,
+    /// Where in the command the key is.
+    pub key: usize,
+    /// Another database than the one selected (`MOVE`'s `move_to`).
+    pub db: Option<usize>,
+}
+
+/// The events Redis (or its module) announces for `name`, which ran and
+/// answered `reply` (not an error).
+pub fn command_events(name: &str, cmd: &[&[u8]], reply: &[u8]) -> Vec<CommandEvent> {
+    let int = || {
+        reply
+            .strip_prefix(b":")
+            .and_then(|rest| std::str::from_utf8(rest).ok())
+            .and_then(|rest| rest.trim_end().parse::<i64>().ok())
+    };
+    let one = |class: u32, event: &str, key: usize| {
+        vec![CommandEvent {
+            class,
+            event: event.to_string(),
+            key,
+            db: None,
+        }]
+    };
+    let has = |word: &[u8]| cmd.iter().skip(2).any(|arg| arg.eq_ignore_ascii_case(word));
+    match name {
+        // An empty value changes nothing, and Redis says nothing then.
+        "SETRANGE" if cmd.len() == 4 && !cmd[3].is_empty() => one(KS_STRING, "setrange", 1),
+        "SETBIT" => one(KS_STRING, "setbit", 1),
+        "BITFIELD" if has(b"SET") || has(b"INCRBY") => one(KS_STRING, "setbit", 1),
+        // An empty result deletes the destination.
+        "BITOP" if cmd.len() > 2 => match int() {
+            Some(0) => one(KS_GENERIC, "del", 2),
+            _ => one(KS_STRING, "set", 2),
+        },
+        "PFADD" if int() == Some(1) => one(KS_STRING, "pfadd", 1),
+        "PFMERGE" => one(KS_STRING, "pfadd", 1),
+        // A geo set is a sorted set: `GEOADD` is a `ZADD`.
+        "GEOADD" if int() != Some(0) || has(b"CH") || has(b"XX") => one(KS_SORTED_SET, "zadd", 1),
+        "MOVE" if int() == Some(1) && cmd.len() == 3 => {
+            let to = std::str::from_utf8(cmd[2])
+                .ok()
+                .and_then(|db| db.parse().ok());
+            vec![
+                CommandEvent {
+                    class: KS_GENERIC,
+                    event: "move_from".into(),
+                    key: 1,
+                    db: None,
+                },
+                CommandEvent {
+                    class: KS_GENERIC,
+                    event: "move_to".into(),
+                    key: 1,
+                    db: to,
+                },
+            ]
+        }
+        // The modules' events are their commands' names, for each key.
+        "TS.MADD" => (1..cmd.len())
+            .step_by(3)
+            .flat_map(|key| one(KS_MODULE, "ts.add", key))
+            .collect(),
+        "TS.CREATERULE" | "TS.DELETERULE" => Vec::new(),
+        "JSON.DEL" | "JSON.FORGET" | "JSON.CLEAR" | "VREM" | "VSETATTR" if int() == Some(0) => {
+            Vec::new()
+        }
+        _ if name.starts_with("JSON.")
+            || name.starts_with("TS.")
+            || matches!(name, "VADD" | "VREM" | "VSETATTR") =>
+        {
+            let event = name.to_ascii_lowercase();
+            crate::keyspec::key_positions(name, cmd)
+                .iter()
+                .flat_map(|key| one(KS_MODULE, &event, key))
+                .collect()
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// The classes of event `A` stands for.
@@ -90,7 +195,8 @@ const KS_ALL: u32 = KS_GENERIC
     | KS_EVICTED
     | KS_HASH
     | KS_STREAM
-    | KS_ARRAY;
+    | KS_ARRAY
+    | KS_MODULE;
 
 /// The flags as `CONFIG GET notify-keyspace-events` writes them — in
 /// Redis's order, whatever order they were given in: the classes of event
@@ -111,6 +217,7 @@ pub fn flags_to_string(flags: u32) -> String {
             (KS_EVICTED, 'e'),
             (KS_STREAM, 't'),
             (KS_ARRAY, 'a'),
+            (KS_MODULE, 'd'),
         ] {
             if flags & flag != 0 {
                 s.push(c);

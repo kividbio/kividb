@@ -221,6 +221,25 @@ pub fn totals() -> Vec<(String, Totals)> {
     out
 }
 
+/// The time under which `percent` per cent of the calls counted in `buckets`
+/// took, in microseconds: `INFO latencystats` (#158). The buckets are powers
+/// of two, so it is the top of the bucket that call falls in.
+pub fn percentile_usec(buckets: &[u64; BUCKETS], percent: f64) -> f64 {
+    let calls: u64 = buckets.iter().sum();
+    if calls == 0 {
+        return 0.0;
+    }
+    let wanted = ((percent / 100.0) * calls as f64).ceil().max(1.0) as u64;
+    let mut so_far = 0;
+    for (i, count) in buckets.iter().enumerate() {
+        so_far += count;
+        if so_far >= wanted {
+            return (1u64 << i) as f64;
+        }
+    }
+    (1u64 << (BUCKETS - 1)) as f64
+}
+
 /// `CONFIG RESETSTAT`.
 pub fn reset() {
     for (_, counters) in ALL.lock().iter() {

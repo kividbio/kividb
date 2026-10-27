@@ -18,11 +18,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         "LATEST" => {
             let samples = ctx.latency.latest();
             let mut out = format!("*{}\r\n", samples.len()).into_bytes();
-            for (name, ts, ms) in samples {
-                out.extend_from_slice(b"*3\r\n");
+            // Four fields, as Redis gives them: the maximum is what
+            // redis_exporter reads (#158).
+            for (name, ts, ms, max) in samples {
+                out.extend_from_slice(b"*4\r\n");
                 out.extend_from_slice(&resp_bulk_str(&name));
                 out.extend_from_slice(&resp_integer(ts as i64));
                 out.extend_from_slice(&resp_integer(ms as i64));
+                out.extend_from_slice(&resp_integer(max as i64));
             }
             Some(out)
         }
@@ -144,7 +147,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             let mut issues: Vec<String> = Vec::new();
 
-            for (event, _ts, ms) in &samples {
+            for (event, _ts, ms, _max) in &samples {
                 if *ms >= CRIT_MS {
                     issues.push(format!(
                         "- Event '{}': latency is {}ms — CRITICAL. \
@@ -177,6 +180,31 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(resp_bulk_str(&report))
             }
         }
+
+        "HELP" => Some(resp_array(
+            [
+                "LATENCY <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                "DOCTOR",
+                "    Return a human readable latency analysis report.",
+                "GRAPH <event>",
+                "    Return an ASCII latency graph for the <event> class.",
+                "HISTORY <event>",
+                "    Return time-latency samples for the <event> class.",
+                "LATEST",
+                "    Return the latest latency samples for all events.",
+                "RESET [<event> ...]",
+                "    Reset latency data of one or more <event> classes.",
+                "    (default: reset all data for all event classes)",
+                "HISTOGRAM [COMMAND ...]",
+                "    Return a cumulative distribution of latencies in the format of a histogram for the specified command names.",
+                "    If no commands are specified then all histograms are replied.",
+                "HELP",
+                "    Print this help.",
+            ]
+            .iter()
+            .map(|line| resp_simple(line))
+            .collect(),
+        )),
 
         _ => Some(resp_error("ERR unknown subcommand for LATENCY")),
     }

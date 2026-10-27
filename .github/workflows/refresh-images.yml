@@ -1,10 +1,12 @@
 name: Refresh images
 
-# Rebuilds a released version's Docker images with the Debian security
-# updates published since the release, and points the version's tags (in
-# GHCR and Docker Hub) at the result. The kividb binary and everything else
-# in the image are the release's own, byte for byte: docker/refresh/Dockerfile
-# adds one `apt-get upgrade` layer on top of each per-arch image.
+# Rebuilds a released version's Docker images on the newest build of the
+# runtime base, with the Debian security updates published since the
+# release, and points the version's tags (in GHCR and Docker Hub) at the
+# result. The kividb binary, its home directory and licence files are the
+# release's own, byte for byte: docker/refresh/Dockerfile moves them from
+# each per-arch image onto the new base (distroless has no package manager to
+# upgrade with in place).
 #
 # Why not just release a patch version: a scanner flags the version people
 # already run, and the fix is in Debian's packages, not in kividb. The

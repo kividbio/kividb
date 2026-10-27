@@ -115,12 +115,66 @@ fn ft_dropindex(ctx: &mut Ctx) -> Option<Vec<u8>> {
         Err(_) => return Some(resp_error("ERR index name must be valid UTF-8")),
     };
 
-    // The index goes, and its aliases with it.
-    if crate::vector::remove_index(&mut ctx.index_store.write(), name) {
-        Some(resp_simple("OK"))
+    let delete_documents = match &cmd[2..] {
+        [] => false,
+        [dd] if dd.eq_ignore_ascii_case(b"DD") => true,
+        _ => return Some(resp_error("ERR syntax error")),
+    };
+
+    // The documents it covered, if they go too: found before the index goes,
+    // by its definition. They were kept whatever was asked (#162).
+    let documents: Vec<(usize, String)> = if delete_documents {
+        let store = ctx.index_store.read();
+        match store
+            .get(name)
+            .filter(|def| !crate::vector::is_alias(name, def))
+        {
+            Some(def) => {
+                let db = def.db_index;
+                let mut keys = Vec::new();
+                for shard in ctx.store[db].iter() {
+                    let map = shard.read();
+                    for (key, value) in map.iter() {
+                        let covered = def.prefixes.is_empty()
+                            || def.prefixes.iter().any(|p| key.starts_with(p.as_str()));
+                        if covered
+                            && crate::vector::doc_fields(&def.on, &def.fields, value).is_some()
+                        {
+                            keys.push((db, key.to_string()));
+                        }
+                    }
+                }
+                keys
+            }
+            None => Vec::new(),
+        }
     } else {
-        Some(resp_error("ERR no such index"))
+        Vec::new()
+    };
+
+    // The index goes, and its aliases with it.
+    if !crate::vector::remove_index(&mut ctx.index_store.write(), name) {
+        return Some(resp_error("ERR no such index"));
     }
+    // Then its documents. Not each as a DEL to replicas and the AOF: they
+    // run this command, and delete theirs.
+    for (db, key) in &documents {
+        if !crate::commands::helpers::delete_key(ctx.store, ctx.expiry_store, *db, key) {
+            continue;
+        }
+        crate::vector::maybe_unindex(ctx.index_store, key);
+        crate::stats::record_rdb_change();
+        crate::keyspace_events::notify(
+            ctx.pubsub,
+            *db,
+            crate::keyspace_events::KS_GENERIC,
+            "del",
+            key,
+        );
+        ctx.watch_registry.notify(*db, key);
+        crate::commands::handler::invalidate_tracked_key(ctx, key, false);
+    }
+    Some(resp_simple("OK"))
 }
 
 // ── FT.ALTER ─────────────────────────────────────────────────────────────────
@@ -368,8 +422,8 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             }
         }
     }
-    let filter = match crate::vector::filter::parse_query(&query_str, &params, &def) {
-        Ok(query) => query.filter,
+    let (filter, knn) = match crate::vector::filter::parse_query(&query_str, &params, &def) {
+        Ok(query) => (query.filter, query.knn),
         Err(e) => return Some(resp_error(&e)),
     };
 
@@ -487,6 +541,42 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
         timed_out = true;
     }
 
+    // ── A KNN clause: the nearest `k` of what the filter left ────────────────
+    //
+    // Exactly, as FT.SEARCH does with a filter, and with the distance under
+    // the clause's name, for the pipeline. It was dropped, and every
+    // document the filter left went on (#162).
+    if let Some(knn) = &knn {
+        let Some(field) = def.fields.iter().find(|f| f.name == knn.field) else {
+            return Some(resp_error("The vector field is gone from the index"));
+        };
+        let FieldType::Vector { metric, .. } = &field.field_type else {
+            return Some(resp_error("The vector field is gone from the index"));
+        };
+        let Some(live) = def.indexes.get(&knn.field) else {
+            return Some(resp_error("The vector field has no index"));
+        };
+        let candidates: std::collections::HashSet<String> = rows
+            .iter()
+            .filter_map(|row| row.get("__key").cloned())
+            .collect();
+        let nearest = knn_filtered(live, &knn.vector, knn.k, metric, &candidates);
+        let rank: ahash::AHashMap<String, (usize, f32)> = nearest
+            .into_iter()
+            .enumerate()
+            .map(|(i, found)| (found.key, (i, found.score)))
+            .collect();
+        rows.retain(|row| row.get("__key").is_some_and(|key| rank.contains_key(key)));
+        for row in &mut rows {
+            let (_, distance) = rank[&row["__key"]];
+            row.insert(
+                knn.alias.clone(),
+                crate::commands::search::distance_text(distance),
+            );
+        }
+        rows.sort_by_key(|row| rank[&row["__key"]].0);
+    }
+
     // ── The rest of the cluster ──────────────────────────────────────────────
     // Asked by a coordinator: the rows as they are, every column, and
     // whether this scan ran out of time. A coordinator: the rows of every
@@ -505,6 +595,16 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 }
             }
             Err(e) => return Some(resp_error(&e)),
+        }
+        // Each master sent its own nearest: the nearest of them all.
+        if let Some(knn) = &knn {
+            let distance = |row: &Row| {
+                row.get(&knn.alias)
+                    .and_then(|d| d.parse::<f64>().ok())
+                    .unwrap_or(f64::INFINITY)
+            };
+            rows.sort_by(|a, b| distance(a).total_cmp(&distance(b)));
+            rows.truncate(knn.k);
         }
     }
     if timed_out && crate::commands::search::on_timeout_fails() {

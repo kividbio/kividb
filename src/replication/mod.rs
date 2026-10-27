@@ -167,6 +167,16 @@ pub struct ReplState {
     /// Replica side: drop the local dataset before loading a full sync,
     /// instead of holding both until the new one is in (`repl-diskless-load`).
     pub flush_before_load: AtomicBool,
+    /// Master side: the stream this node followed as a replica until it was
+    /// promoted, and the first offset past what it had read of it (Redis's
+    /// `master_replid2` and `second_repl_offset`). The new master's stream
+    /// carries on from there, so a replica that followed the old one is
+    /// continued instead of resynced in full (#109).
+    pub repl_id2: RwLock<Option<(String, u64)>>,
+    /// The hub, for what is not a client's write: a replica's record of the
+    /// stream it reads, and a promotion's restart of the backlog. Weak, so
+    /// that the hub still ends when every real sender is gone.
+    hub: std::sync::OnceLock<mpsc::WeakUnboundedSender<HubMsg>>,
 }
 
 /// A position in a master's write stream, and the dataset that corresponds to
@@ -406,6 +416,8 @@ impl ReplState {
             has_resync_point: AtomicBool::new(false),
             apply_lock: parking_lot::Mutex::new(()),
             flush_before_load: AtomicBool::new(true),
+            repl_id2: RwLock::new(None),
+            hub: std::sync::OnceLock::new(),
         }
     }
 
@@ -794,6 +806,13 @@ impl ReplState {
         // `dataset_commit`.
         let _commit = self.dataset_commit.lock();
         self.repl_generation.fetch_add(1, Ordering::AcqRel);
+        // Where this replica stands in the stream it followed, read between
+        // two of its applier's batches: that stream goes on as this master's
+        // own (#109).
+        let followed = self.slave_mode.load(Ordering::Acquire).then(|| {
+            let _applying = self.apply_lock.lock();
+            self.resync_point.lock().clone()
+        });
         self.slave_mode.store(false, Ordering::Release);
         *self.master_addr.write() = None;
         *self.role.write() = "master".into();
@@ -807,12 +826,67 @@ impl ReplState {
         *self.last_sync_refusal.write() = None;
         // A master's dataset is its own from here on.
         self.set_resync_point(None);
+        // Its new stream starts where it had read the old one to, and keeps
+        // the old one's id as its second: the old master's other replicas
+        // ask to be continued under that id, from where each of them is,
+        // and get what they missed from the backlog this node kept as a
+        // replica. As Redis's `shiftReplicationId`.
+        if let Some(Some(point)) = followed {
+            self.repl_offset.store(point.offset, Ordering::Relaxed);
+            *self.repl_id2.write() = Some((point.repl_id.clone(), point.offset + 1));
+            // Recorded from here on, before any client writes: a replica
+            // continued later must find every write since the promotion.
+            self.backlog_active.store(true, Ordering::Relaxed);
+            if let Some(hub) = self.hub.get().and_then(|w| w.upgrade()) {
+                let _ = hub.send(HubMsg::Resume {
+                    offset: point.offset,
+                });
+            }
+            log_info!(
+                "Replication: Promoted; the stream {} goes on as {} from offset {} — its replicas \
+                 can be continued",
+                point.repl_id,
+                self.repl_id(),
+                point.offset
+            );
+        }
+    }
+
+    /// Replica side: record what was just read of the master's stream and
+    /// applied, ending at `end`, in this node's own backlog, so that if it is
+    /// promoted the master's other replicas can be continued from it.
+    pub fn record_received(&self, bytes: Vec<u8>, end: u64) {
+        if bytes.is_empty() {
+            return;
+        }
+        if let Some(hub) = self.hub.get().and_then(|w| w.upgrade()) {
+            let _ = hub.send(HubMsg::Received { bytes, end });
+        }
+    }
+
+    /// Whether a replica asking to continue `repl_id` from `offset` (the
+    /// first byte it wants) followed this node's stream: under its own id,
+    /// or under the one it followed before it was promoted, up to where it
+    /// had read it.
+    pub fn continues_stream(&self, repl_id: &str, offset: u64) -> bool {
+        repl_id == self.repl_id()
+            || self
+                .repl_id2
+                .read()
+                .as_ref()
+                .is_some_and(|(id, until)| id == repl_id && offset <= *until)
     }
 
     #[inline]
     pub fn become_slave(&self) {
         self.slave_mode.store(true, Ordering::Release);
         *self.role.write() = "slave".into();
+        // Its own replicas would get nothing from here on: a replica does
+        // not pass its master's stream on.
+        if let Some(hub) = self.hub.get().and_then(|w| w.upgrade()) {
+            let _ = hub.send(HubMsg::DropReplicas);
+        }
+        *self.repl_id2.write() = None;
         // The stream this node wrote as a master ends here. Were it promoted
         // again later under the same id, a replica that had followed the old
         // stream could be continued from an offset in another one.
@@ -945,16 +1019,36 @@ pub fn save_dataset(
             }
         })?;
     } else {
-        let maps: Vec<_> = store
-            .iter()
-            .map(crate::snapshot::collect_snapshot)
-            .collect();
-        crate::snapshot::write_snapshot_with_expiry(
-            "dump.kdb",
-            &maps,
-            Some(index_store),
-            Some(expiry_store),
-        )?;
+        // One instant, as with the AOF on: the dataset is captured with
+        // writes held, then written while they go on. It was copied a shard
+        // at a time, so a transaction, a script or an MSET whose keys were
+        // in two shards could be saved half applied (#148).
+        let frozen = {
+            let _cut = crate::write_gate::cut();
+            crate::snapshot::freeze_dataset_for_disk(store, Some(expiry_store), Some(index_store))
+        }?;
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tmp = format!(
+            "dump.kdb.{}.{}.tmp",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        if let Err(e) = frozen
+            .write_file(&tmp)
+            .and_then(|()| std::fs::rename(&tmp, "dump.kdb"))
+        {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        // As the writer this replaced said it: operators and tests look for it.
+        let shown = std::env::current_dir()
+            .map(|dir| dir.join("dump.kdb"))
+            .unwrap_or_else(|_| "dump.kdb".into());
+        log_info!(
+            "Snapshot saved  → {} ({} databases)",
+            shown.display(),
+            store.len()
+        );
     }
 
     // Best effort: without the file, the next start does a full resync.
@@ -973,6 +1067,7 @@ pub fn save_dataset(
         }
     }
     crate::stats::RDB_SAVES.fetch_add(1, Ordering::Relaxed);
+    crate::stats::record_save();
     Ok(())
 }
 
@@ -1130,6 +1225,12 @@ pub enum HubMsg {
         base: u64,
     },
     Propagate(ReplPayload),
+    /// Replica side: bytes of the master's stream this node has read and
+    /// applied, ending at offset `end`. Kept in the backlog, not forwarded.
+    Received {
+        bytes: Vec<u8>,
+        end: u64,
+    },
     AckOffset {
         replica_id: u64,
         offset: u64,
@@ -1155,7 +1256,17 @@ pub enum HubMsg {
     Resume {
         offset: u64,
     },
+    /// Let go of every replica: this node has become a replica itself, and
+    /// does not pass its master's stream on (#144). Their connections close,
+    /// and when they connect again they are told why.
+    DropReplicas,
 }
+
+/// What a replica answers a node that asks to replicate from it: KiviDB does
+/// not chain replicas, and one that took the request would send its data
+/// once and nothing after (#144).
+pub const NOT_A_MASTER: &str = "ERR this server is a replica, and KiviDB does not chain replicas: \
+     replicate from its master instead";
 
 /// The most recent part of the write stream, kept by the hub so that a
 /// replica which lost its connection can be sent what it missed instead of
@@ -1266,6 +1377,7 @@ pub type HubTx = mpsc::UnboundedSender<HubMsg>;
 /// its queue crosses this line instead of growing the master's memory without bound.
 pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx {
     let (hub_tx, mut hub_rx) = mpsc::unbounded_channel::<HubMsg>();
+    let _ = state.hub.set(hub_tx.downgrade());
     // For the heartbeat, which the hub sends to itself. Weak, so that the hub
     // still ends when every real sender is gone.
     let own_tx = hub_tx.downgrade();
@@ -1417,6 +1529,14 @@ pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx
                     backlog.align(offset);
                     backlog.report(&state);
                 }
+                HubMsg::Received { bytes, end } => {
+                    // Contiguous with what is kept, or the start of a new run
+                    // (after a full sync, or a gap).
+                    let start = end.saturating_sub(bytes.len() as u64);
+                    backlog.align(start);
+                    backlog.push(&bytes, state.backlog_size.load(Ordering::Relaxed) as usize);
+                    backlog.report(&state);
+                }
                 HubMsg::Barrier(done) => {
                     let _ = done.send(());
                 }
@@ -1425,6 +1545,28 @@ pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx
                     // Tear down registration (client disconnect / rollback).
                     channel_replicas.retain(|r| r.id != replica_id);
                     forget_replica(&state, replica_id);
+                }
+                HubMsg::DropReplicas => {
+                    // Dropping each `tx` ends its forwarder, and so its
+                    // connection, as an eviction does.
+                    for replica in channel_replicas.drain(..) {
+                        forget_replica(&state, replica.id);
+                        log_info!(
+                            "Replication: Replica {} disconnected: this node is now a replica \
+                             itself",
+                            replica.addr
+                        );
+                    }
+                    if !socket_replicas.is_empty() {
+                        let n = socket_replicas.len();
+                        socket_replicas.clear();
+                        let before = state
+                            .connected_replicas
+                            .fetch_sub(n as i64, Ordering::Relaxed);
+                        if before < n as i64 {
+                            state.connected_replicas.store(0, Ordering::Relaxed);
+                        }
+                    }
                 }
                 HubMsg::Register(conn) => {
                     log_info!("Replication: Socket replica registered: {}", conn.addr);
@@ -1670,7 +1812,7 @@ pub async fn request_continuation(
     let Some(psync) = psync else {
         return Err(registration);
     };
-    if psync.repl_id != repl_state.repl_id() {
+    if !repl_state.continues_stream(&psync.repl_id, psync.offset) {
         // It followed some other master.
         repl_state.sync_partial_err.fetch_add(1, Ordering::Relaxed);
         return Err(registration);
@@ -2118,7 +2260,6 @@ pub fn is_write_command(name: &str) -> bool {
         14 => matches!(
             name,
             "FT.ALIASUPDATE"
-                | "GEODELBYMEMBER"
                 | "GEOSEARCHSTORE"
                 | "JSON.ARRAPPEND"
                 | "JSON.ARRINSERT"
@@ -2176,7 +2317,6 @@ pub(crate) const WRITE_COMMANDS_FOR_TEST: &[&str] = &[
     "FT.DROPINDEX",
     "FT.SYNUPDATE",
     "GEOADD",
-    "GEODELBYMEMBER",
     "GEOSEARCHSTORE",
     "GETDEL",
     "GETEX",
@@ -2351,7 +2491,7 @@ fn is_write_command_reference(name: &str) -> bool {
         "FT.DICTADD" | "FT.DICTDEL" |
         // Bitmaps / HLL / Geo
         "SETBIT" | "BITOP" | "BITFIELD" | "PFADD" | "PFMERGE" |
-        "GEOADD" | "GEODELBYMEMBER" | "GEOSEARCHSTORE" |
+        "GEOADD" | "GEOSEARCHSTORE" |
         // Arrays (Redis 8.8). ARSEEK counts as a write: it moves the insert
         // cursor, which is persisted state a replica must mirror or its
         // ARINSERT/ARNEXT would diverge from the master's.
@@ -2375,7 +2515,12 @@ pub fn is_denied_on_readonly_replica(name: &str, cmd: &[&[u8]]) -> bool {
         // `READONLY You can't write against a read only replica.` back, so it
         // could not even read. Redis allows SELECT on a replica.
         "SELECT" => false,
-        "EVAL" | "EVALSHA" | "FCALL" => true,
+        // As Redis: a script runs on a replica, and a write it makes is
+        // refused there (`run_from_script`). One that declares it may write
+        // (a shebang without `no-writes`, a function without it) is refused
+        // before it runs. Every script was, the ones that only read too
+        // (#145).
+        "EVAL" | "EVALSHA" | "FCALL" => script_may_write(name, cmd),
         "GEORADIUS" | "GEORADIUSBYMEMBER" => georadius_stores(cmd),
         // MIGRATE removes keys from this node.
         "MIGRATE" => true,
@@ -2401,6 +2546,27 @@ pub fn is_denied_on_readonly_replica(name: &str, cmd: &[&[u8]]) -> bool {
             )
         }
         _ => is_write_command(name),
+    }
+}
+
+/// Whether `EVAL`, `EVALSHA` or `FCALL` runs something that has declared it
+/// may write. See [`is_denied_on_readonly_replica`].
+fn script_may_write(name: &str, cmd: &[&[u8]]) -> bool {
+    #[cfg(feature = "lua")]
+    {
+        let Some(target) = cmd.get(1) else {
+            return false;
+        };
+        match name {
+            "EVAL" => crate::commands::script_declares_writes(target),
+            "EVALSHA" => crate::commands::cached_script_declares_writes(target),
+            _ => !crate::commands::function_declares_no_writes(target),
+        }
+    }
+    #[cfg(not(feature = "lua"))]
+    {
+        let _ = (name, cmd);
+        false
     }
 }
 

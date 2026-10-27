@@ -281,7 +281,7 @@ pub fn key_positions(name: &str, cmd: &[&[u8]]) -> Keys {
         | "XSETID" | "XACK" | "XACKDEL" | "XNACK" | "XAUTOCLAIM" | "XCLAIM" | "XCFGSET" | "XIDMPRECORD"
         // Geo
         | "GEOADD" | "GEODIST" | "GEOPOS" | "GEOHASH" | "GEOSEARCH" | "GEORADIUS_RO"
-        | "GEORADIUSBYMEMBER_RO" | "GEODELBYMEMBER"
+        | "GEORADIUSBYMEMBER_RO"
         // JSON
         | "JSON.GET" | "JSON.SET" | "JSON.DEL" | "JSON.FORGET" | "JSON.TYPE"
         | "JSON.NUMINCRBY" | "JSON.NUMMULTBY" | "JSON.STRAPPEND" | "JSON.STRLEN"

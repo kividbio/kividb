@@ -1293,3 +1293,93 @@ fn test_vlinks_missing_key() {
 
     assert!(c.cmds(&["VLINKS", "nokey", "a"]).is_nil());
 }
+
+/// `VSIM ... FILTER` keeps the elements whose attributes pass, as in Redis;
+/// it was taken and ignored. `REDUCE` is refused rather than ignored, and
+/// `VINFO` says the vectors are kept at full precision (#132).
+#[test]
+fn test_vsim_filter_reduce_and_quantization() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&["VADD", "points", "VALUES", "3", "1", "0", "0", "a"]);
+    c.cmds(&[
+        "VADD",
+        "points",
+        "VALUES",
+        "3",
+        "0.9",
+        "0.1",
+        "0",
+        "b",
+        "SETATTR",
+        r#"{"color":"blue","size":1}"#,
+    ]);
+    c.cmds(&[
+        "VADD",
+        "points",
+        "VALUES",
+        "3",
+        "0",
+        "1",
+        "0",
+        "c",
+        "SETATTR",
+        r#"{"color":"red","size":3}"#,
+    ]);
+    let names = |reply: &RespValue| -> Vec<String> {
+        reply
+            .as_array()
+            .iter()
+            .map(|v| v.as_str().to_string())
+            .collect()
+    };
+    let all = c.cmds(&["VSIM", "points", "VALUES", "3", "1", "0", "0"]);
+    assert_eq!(names(&all), ["a", "b", "c"]);
+    let red = c.cmds(&[
+        "VSIM",
+        "points",
+        "VALUES",
+        "3",
+        "1",
+        "0",
+        "0",
+        "FILTER",
+        r#".color == "red""#,
+    ]);
+    assert_eq!(names(&red), ["c"]);
+    let sized = c.cmds(&[
+        "VSIM",
+        "points",
+        "VALUES",
+        "3",
+        "1",
+        "0",
+        "0",
+        "FILTER",
+        ".size >= 1 and .size < 3",
+    ]);
+    assert_eq!(names(&sized), ["b"]);
+    let bad = c.cmds(&[
+        "VSIM", "points", "VALUES", "3", "1", "0", "0", "FILTER", "(.size",
+    ]);
+    assert!(bad.is_error(), "{bad:?}");
+
+    let reduce = c.cmds(&[
+        "VADD", "q", "REDUCE", "2", "VALUES", "4", "1", "2", "3", "4", "x",
+    ]);
+    assert!(reduce.is_error(), "{reduce:?}");
+
+    assert_eq!(
+        c.cmds(&["VADD", "r", "VALUES", "2", "0", "0", "o", "Q8"])
+            .as_int(),
+        1
+    );
+    let info = c.cmds(&["VINFO", "r"]);
+    let info = info.as_array();
+    let at = info
+        .iter()
+        .position(|v| matches!(v, RespValue::Bulk(b) if b == b"quant-type"))
+        .expect("quant-type");
+    assert_eq!(info[at + 1].as_str(), "f32");
+}

@@ -37,6 +37,8 @@ impl AofSender for AofBridge {
         };
         if failed {
             crate::aof::record_lost_aof_record();
+        } else {
+            crate::aof::records_queued();
         }
     }
 }

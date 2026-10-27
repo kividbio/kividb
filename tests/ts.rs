@@ -1266,6 +1266,100 @@ fn test_ts_createrule_deleterule() {
     );
 }
 
+/// As RedisTimeSeries: a compaction gets a bucket once it has closed, and
+/// the bucket still open is reported only with `LATEST`. It was written as
+/// samples came, and `LATEST` changed nothing (#128). The compaction knows
+/// its source (`sourceKey`), across a `DUMP` and `RESTORE` too.
+#[test]
+fn test_ts_compaction_writes_closed_buckets_and_latest_adds_the_open_one() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&["TS.CREATE", "ob:src"]);
+    c.cmds(&["TS.CREATE", "ob:dst"]);
+    assert!(
+        c.cmds(&[
+            "TS.CREATERULE",
+            "ob:src",
+            "ob:dst",
+            "AGGREGATION",
+            "sum",
+            "10000"
+        ])
+        .is_ok()
+    );
+    c.cmds(&["TS.ADD", "ob:src", "1000", "1"]);
+    c.cmds(&["TS.ADD", "ob:src", "2000", "1"]);
+
+    let range = |c: &mut Conn, extra: &[&str]| -> Vec<(i64, String)> {
+        let mut args = vec!["TS.RANGE", "ob:dst", "-", "+"];
+        args.extend_from_slice(extra);
+        c.cmds(&args)
+            .as_array()
+            .iter()
+            .map(|row| {
+                let row = row.as_array();
+                (row[0].as_int(), row[1].as_str().to_string())
+            })
+            .collect()
+    };
+    assert!(range(&mut c, &[]).is_empty(), "the open bucket was written");
+    assert_eq!(range(&mut c, &["LATEST"]), [(0, "2".to_string())]);
+    let got = c.cmds(&["TS.GET", "ob:dst", "LATEST"]);
+    assert_eq!(got.as_array()[1].as_str(), "2");
+    assert!(c.cmds(&["TS.GET", "ob:dst"]).as_array().is_empty());
+
+    // The first sample of the next bucket closes this one.
+    c.cmds(&["TS.ADD", "ob:src", "12000", "5"]);
+    assert_eq!(range(&mut c, &[]), [(0, "2".to_string())]);
+    assert_eq!(
+        range(&mut c, &["LATEST"]),
+        [(0, "2".to_string()), (10000, "5".to_string())]
+    );
+    // A sample added to a closed bucket updates it.
+    c.cmds(&["TS.ADD", "ob:src", "3000", "1"]);
+    assert_eq!(range(&mut c, &[]), [(0, "3".to_string())]);
+
+    let source_key = |c: &mut Conn, key: &str| {
+        let info = c.cmds(&["TS.INFO", key]);
+        let arr = info.as_array();
+        let at = arr
+            .iter()
+            .position(|v| *v == RespValue::Bulk(b"sourceKey".to_vec()))
+            .expect("sourceKey");
+        match &arr[at + 1] {
+            RespValue::Bulk(b) => Some(String::from_utf8(b.clone()).unwrap()),
+            _ => None,
+        }
+    };
+    assert_eq!(source_key(&mut c, "ob:dst").as_deref(), Some("ob:src"));
+    assert_eq!(source_key(&mut c, "ob:src"), None);
+    // One source to a compaction.
+    c.cmds(&["TS.CREATE", "ob:other"]);
+    assert!(
+        c.cmds(&[
+            "TS.CREATERULE",
+            "ob:other",
+            "ob:dst",
+            "AGGREGATION",
+            "sum",
+            "10000"
+        ])
+        .is_error()
+    );
+
+    // Kept by the snapshot format.
+    let dump = c.cmd(&[b"DUMP", b"ob:dst"]);
+    let RespValue::Bulk(payload) = dump else {
+        panic!("{dump:?}")
+    };
+    assert!(c.cmd(&[b"RESTORE", b"ob:copy", b"0", &payload]).is_ok());
+    assert_eq!(source_key(&mut c, "ob:copy").as_deref(), Some("ob:src"));
+
+    assert!(c.cmds(&["TS.DELETERULE", "ob:src", "ob:dst"]).is_ok());
+    assert_eq!(source_key(&mut c, "ob:dst"), None);
+}
+
 /// TS.CREATERULE duplicate rule rejected
 #[test]
 fn test_ts_createrule_duplicate() {

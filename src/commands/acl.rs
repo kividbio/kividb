@@ -278,9 +278,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             } else {
                 256
             };
-            let byte_count = bits / 8;
-            let random_bytes: Vec<u8> = (0..byte_count).map(|_| rand::random::<u8>()).collect();
-            let hex: String = random_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+            // A hex digit per 4 bits, as Redis gives them: 1 to 4 bits are one
+            // digit. Whole bytes were taken, none for under 8 bits, and the
+            // password was empty (#140).
+            let digits = bits.div_ceil(4);
+            let random_bytes: Vec<u8> = (0..digits.div_ceil(2))
+                .map(|_| rand::random::<u8>())
+                .collect();
+            let mut hex: String = random_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+            hex.truncate(digits);
             Some(resp_bulk_str(&hex))
         }
 
@@ -356,6 +362,40 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ))),
             }
         }
+
+        // Its error said to try it, and it was unknown (#134).
+        "HELP" => Some(crate::commands::server::help(
+            "ACL",
+            &[
+                (
+                    "CAT [<category>]",
+                    "List all commands that belong to <category>, or all command categories",
+                ),
+                (
+                    "DELUSER <username> [<username> ...]",
+                    "Delete a list of users.",
+                ),
+                (
+                    "DRYRUN <username> <command> [<arg> ...]",
+                    "Returns whether the user can execute the given command without executing the command.",
+                ),
+                ("GETUSER <username>", "Get the user's details."),
+                (
+                    "GENPASS [<bits>]",
+                    "Generate a secure 256-bit user password. The optional `bits` argument can be used to specify a different size.",
+                ),
+                ("LIST", "Show users details in config file format."),
+                ("LOAD", "Reload users from the ACL file."),
+                ("LOG [<count> | RESET]", "Show the ACL log entries."),
+                ("SAVE", "Save the current config to the ACL file."),
+                (
+                    "SETUSER <username> <attribute> [<attribute> ...]",
+                    "Create or modify a user with the specified attributes.",
+                ),
+                ("USERS", "List all the registered usernames."),
+                ("WHOAMI", "Return the current connection username."),
+            ],
+        )),
 
         _ => Some(resp_error(&format!(
             "ERR unknown subcommand '{}'. Try ACL HELP.",

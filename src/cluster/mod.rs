@@ -170,6 +170,9 @@ pub struct ClusterState {
     state_ok: AtomicBool,
     /// `cluster-require-full-coverage`.
     require_full_coverage: AtomicBool,
+    /// `cluster-replica-validity-factor`: how stale a replica's data may be
+    /// for it to stand for election, in node timeouts; 0 = always stand.
+    replica_validity_factor: AtomicU64,
     /// True while our own IP is the loopback placeholder used when binding to
     /// a wildcard address with no `cluster-announce-ip`. While set, we send an
     /// empty address so peers record the one they observe instead.
@@ -188,9 +191,14 @@ pub struct ClusterState {
     /// Bus traffic counters for `CLUSTER INFO`.
     pub stats_messages_sent: AtomicU64,
     pub stats_messages_received: AtomicU64,
+    /// Outbound bus connections opened (`cluster_stats_bus_connects`).
+    pub stats_bus_connects: AtomicU64,
     /// Long-lived outbound bus links, by `ip:bus_port`. See
     /// `bus::dialer::send_frame`.
     pub(crate) links: parking_lot::Mutex<AHashMap<String, tokio::sync::mpsc::Sender<Vec<u8>>>>,
+    /// The connection each peer is pinged over, by `ip:bus_port`, kept open
+    /// between heartbeats. See `bus::dialer::send_ping`.
+    pub(crate) ping_links: parking_lot::Mutex<AHashMap<String, bus::dialer::PingLink>>,
 }
 
 impl ClusterState {
@@ -226,6 +234,7 @@ impl ClusterState {
             bus_runtime: std::sync::OnceLock::new(),
             state_ok: AtomicBool::new(false),
             require_full_coverage: AtomicBool::new(true),
+            replica_validity_factor: AtomicU64::new(10),
             self_ip_is_guess: AtomicBool::new(false),
             bus_secret: std::sync::OnceLock::new(),
             background_save: std::sync::OnceLock::new(),
@@ -234,7 +243,9 @@ impl ClusterState {
             last_saved_fingerprint: AtomicU64::new(0),
             stats_messages_sent: AtomicU64::new(0),
             stats_messages_received: AtomicU64::new(0),
+            stats_bus_connects: AtomicU64::new(0),
             links: parking_lot::Mutex::new(AHashMap::new()),
+            ping_links: parking_lot::Mutex::new(AHashMap::new()),
         };
         state.refresh_state();
         state
@@ -276,6 +287,7 @@ impl ClusterState {
                 pong_received_ms: 0,
                 fail_since_ms: 0,
                 hostname: String::new(),
+                announced_client_port: 0,
             },
         );
         Self::build(
@@ -387,7 +399,9 @@ impl ClusterState {
             bus_port,
         );
         state.set_require_full_coverage(config.cluster_require_full_coverage);
+        state.set_replica_validity_factor(config.cluster_replica_validity_factor);
         state.set_my_hostname(&config.cluster_announce_hostname);
+        state.set_my_announced_client_port(config.cluster_announce_client_port);
         if !config.cluster_bus_secret.is_empty() {
             let _ = state
                 .bus_secret
@@ -409,6 +423,9 @@ impl ClusterState {
         }
         let repl_state = std::sync::Arc::clone(&hooks.replica_starter.repl_state);
         let _ = self.hooks.set(hooks);
+        // The keys of an import this node was receiving when it went down,
+        // which never completed (#108).
+        migration::drop_unfinished_imports(self);
         self.start_the_clock_on_peers();
         self.start_background_save();
         bus::start(
@@ -561,6 +578,25 @@ impl ClusterState {
         }
     }
 
+    /// Set this node's `cluster-announce-client-port` (0: none). Peers learn
+    /// it from the next heartbeat.
+    pub fn set_my_announced_client_port(&self, port: u16) {
+        if let Some(me) = self.nodes.write().get_mut(&self.myself()) {
+            me.announced_client_port = port;
+        }
+    }
+
+    /// Record the client port a peer announces. As for its hostname: its own
+    /// word stands, none included; second-hand it only fills in.
+    pub fn set_peer_client_port(&self, id: NodeId, port: u16, authoritative: bool) {
+        if id == self.myself() || (port == 0 && !authoritative) {
+            return;
+        }
+        if let Some(node) = self.nodes.write().get_mut(&id) {
+            node.announced_client_port = port;
+        }
+    }
+
     /// Record a peer's hostname. `authoritative` when it is the peer's own
     /// word, which may also be that it has none; second-hand it only fills
     /// in. Saved when it changes.
@@ -630,6 +666,16 @@ impl ClusterState {
             self.self_ip_is_guess.store(false, Ordering::Relaxed);
             log_info!("Cluster: Learned own address from an outgoing link: {local_ip}");
         }
+    }
+
+    /// `cluster-replica-validity-factor`.
+    pub fn replica_validity_factor(&self) -> u64 {
+        self.replica_validity_factor.load(Ordering::Relaxed)
+    }
+
+    pub fn set_replica_validity_factor(&self, factor: u64) {
+        self.replica_validity_factor
+            .store(factor, Ordering::Relaxed);
     }
 
     pub fn set_require_full_coverage(&self, yes: bool) {
@@ -1828,7 +1874,7 @@ impl ClusterState {
     /// Take ownership of `slots` at the end of an atomic migration to this
     /// node. One new epoch covers them all, so the claim wins over the
     /// previous owner's wherever the two meet.
-    pub fn take_over_slots(&self, slots: impl Iterator<Item = u16>) {
+    pub fn take_over_slots(&self, slots: impl Iterator<Item = u16>) -> std::io::Result<()> {
         let t = std::time::Instant::now();
         let mut steps: Vec<(&str, u128)> = Vec::new();
         let me = self.myself();
@@ -1851,11 +1897,12 @@ impl ClusterState {
         steps.push(("slots", t.elapsed().as_millis()));
         self.refresh_state();
         steps.push(("refresh", t.elapsed().as_millis()));
-        let _ = persist::save_from_state(self);
+        let saved = persist::save_from_state(self);
         steps.push(("save", t.elapsed().as_millis()));
         if t.elapsed() > std::time::Duration::from_millis(100) {
             log_info!("Cluster: slow takeover, ms at each step: {steps:?}");
         }
+        saved
     }
 
     /// Record that `slots` now belong to `new_owner`, at the end of an atomic

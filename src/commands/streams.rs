@@ -975,8 +975,9 @@ pub fn xread(ctx: &mut Ctx) -> Vec<u8> {
     // when the command first arrived and must be reused verbatim — see
     // `BlockState::StreamIds`. Take this before resolving anything.
     let resumed = blocking::take_resume(ctx);
+    // The old registrations are dropped here, on every key, not just the one that fired.
     let (carried_ids, carried_deadline) = match blocking::take_state(ctx) {
-        Some(blocking::BlockState::StreamIds { ids, deadline }) => (Some(ids), Some(deadline)),
+        Some(blocking::BlockState::StreamIds { ids, deadline, .. }) => (Some(ids), Some(deadline)),
         _ => (None, None),
     };
     let timed_out = matches!(resumed, Some(None));
@@ -1033,12 +1034,13 @@ pub fn xread(ctx: &mut Ctx) -> Vec<u8> {
             // Register on all keys FIRST — before the second check.
             // This ensures we cannot miss a notification that arrives
             // between our first read (which found nothing) and registration.
+            let mut registered = ctx.wait_table.stream_wait();
             let rxs: Vec<(
                 String,
                 tokio::sync::oneshot::Receiver<crate::wait_table::Value>,
             )> = keys
                 .iter()
-                .map(|k| (k.to_string(), ctx.wait_table.register(k)))
+                .map(|k| (k.to_string(), registered.register(k)))
                 .collect();
 
             // SECOND CHECK: re-read immediately after registering.
@@ -1048,8 +1050,7 @@ pub fn xread(ctx: &mut Ctx) -> Vec<u8> {
             let immediate = read_streams(ctx, resp, &keys, &resolved_ids, count, caps);
             if !immediate.is_empty() {
                 // Data arrived in the registration window — return it directly.
-                // The registered receivers will be dropped here, which closes
-                // the oneshot channels cleanly (senders see closed and skip).
+                // Dropping `registered` unregisters every key.
                 return stream_results_reply(resp, immediate);
             }
 
@@ -1063,6 +1064,7 @@ pub fn xread(ctx: &mut Ctx) -> Vec<u8> {
                 Some(blocking::BlockState::StreamIds {
                     ids: resolved_ids,
                     deadline,
+                    registered,
                 }),
             ) {
                 ParkOutcome::Parked => Vec::new(),

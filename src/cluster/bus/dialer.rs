@@ -2,11 +2,14 @@
 //
 // Outbound bus connections.
 //
-// Two kinds. Request/response exchanges — MEET, the heartbeat PING, a vote
-// request — each open a short-lived connection, send one message, and read
-// the reply. Fire-and-forget traffic — forwarded PUBLISHes, FAIL broadcasts —
-// goes over one long-lived link per peer, so a busy pub/sub channel does not
-// cost a TCP handshake per message.
+// Three kinds. The heartbeat PING goes over one connection per peer, kept
+// open between heartbeats: pinging every peer every second over a new
+// connection each time was N x (N - 1) TCP handshakes a second (#112). Other
+// request/response exchanges — MEET, a vote request — are rare, and each opens
+// a short-lived connection, sends one message, and reads the reply.
+// Fire-and-forget traffic — forwarded PUBLISHes, FAIL broadcasts — goes over
+// one long-lived link per peer, so a busy pub/sub channel does not cost a TCP
+// handshake per message.
 
 use crate::cluster::ClusterState;
 use crate::cluster::bus::message::{BusMessage, decode, encode};
@@ -29,6 +32,7 @@ async fn connect(
         .map_err(|_| format!("connection to {addr} timed out"))?
         .map_err(|e| format!("connect {addr}: {e}"))?;
     let _ = tcp.set_nodelay(true);
+    state.stats_bus_connects.fetch_add(1, Ordering::Relaxed);
     let local = tcp.local_addr().ok();
     let mut sock: Box<dyn crate::node_tls::AsyncStream> = if crate::node_tls::cluster() {
         let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h);
@@ -62,40 +66,134 @@ pub async fn exchange(
     timeout: Duration,
 ) -> Result<Option<BusMessage>, String> {
     let mut sock = connect(state, addr, timeout).await?;
-    sock.write_all(&encode(msg))
-        .await
-        .map_err(|e| format!("write to {addr}: {e}"))?;
+    match round_trip(state, &mut sock, addr, msg, timeout).await {
+        Answer::Reply(reply) => Ok(Some(reply)),
+        // Closed, or no reply in time.
+        Answer::Closed | Answer::TimedOut => Ok(None),
+        Answer::Failed(e) => Err(e),
+    }
+}
+
+/// How a request on a connection ended.
+enum Answer {
+    Reply(BusMessage),
+    /// The peer closed the connection without answering.
+    Closed,
+    /// No answer in time.
+    TimedOut,
+    Failed(String),
+}
+
+/// Send `msg` on `sock` and read one reply.
+async fn round_trip(
+    state: &ClusterState,
+    sock: &mut Box<dyn crate::node_tls::AsyncStream>,
+    addr: &str,
+    msg: &BusMessage,
+    timeout: Duration,
+) -> Answer {
+    let deadline = tokio::time::Instant::now() + timeout;
+    match tokio::time::timeout(timeout, sock.write_all(&encode(msg))).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => return Answer::Closed,
+        Err(_) => return Answer::TimedOut,
+    }
     state.stats_messages_sent.fetch_add(1, Ordering::Relaxed);
 
     let mut buf: Vec<u8> = Vec::with_capacity(2048);
     let mut tmp = [0u8; 4096];
-    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Ok(None);
+            return Answer::TimedOut;
         }
         let n = match tokio::time::timeout(remaining, sock.read(&mut tmp)).await {
-            Ok(Ok(0)) | Err(_) => return Ok(None), // closed, or no reply in time
+            Ok(Ok(0)) => return Answer::Closed,
+            Err(_) => return Answer::TimedOut,
             Ok(Ok(n)) => n,
-            Ok(Err(e)) => return Err(format!("read from {addr}: {e}")),
+            Ok(Err(_)) => return Answer::Closed,
         };
         buf.extend_from_slice(&tmp[..n]);
         match decode(&buf) {
-            Ok(Some((reply, _consumed))) => {
+            Ok(Some((reply, consumed))) => {
                 state
                     .stats_messages_received
                     .fetch_add(1, Ordering::Relaxed);
-                return Ok(Some(reply));
+                // One request, one reply: anything after it means the two
+                // ends no longer agree on what answers what.
+                if consumed != buf.len() {
+                    return Answer::Failed(format!("{addr} sent more than one reply"));
+                }
+                return Answer::Reply(reply);
             }
             Ok(None) => {
                 if crate::cluster::bus::message::exceeds_buffer_limit(&buf) {
-                    return Err(format!("oversized reply from {addr}"));
+                    return Answer::Failed(format!("oversized reply from {addr}"));
                 }
             }
-            Err(e) => return Err(format!("decode reply from {addr}: {e}")),
+            Err(e) => return Answer::Failed(format!("decode reply from {addr}: {e}")),
         }
     }
+}
+
+/// A peer's ping connection: `None` until one is opened, and again after it
+/// breaks. Locked for the length of one PING and its PONG.
+pub(crate) type PingLink = Arc<tokio::sync::Mutex<Option<Box<dyn crate::node_tls::AsyncStream>>>>;
+
+/// A PING and its PONG over the peer's ping connection (#112), opened when
+/// there is none and dropped when anything goes wrong, so that a reply that
+/// comes late is never read as the answer to the next PING. A connection
+/// found closed when it is reused (the peer restarted, say) is replaced at
+/// once, once. A peer whose last PING is still unanswered is not sent
+/// another: it is already ageing towards PFAIL.
+async fn ping_on_link(
+    state: &Arc<ClusterState>,
+    addr: &str,
+    ping: &BusMessage,
+    timeout: Duration,
+) -> Result<Option<BusMessage>, String> {
+    let link = Arc::clone(
+        state
+            .ping_links
+            .lock()
+            .entry(addr.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None))),
+    );
+    let Ok(mut held) = link.try_lock() else {
+        return Err("the previous ping is still unanswered".into());
+    };
+    for attempt in 0..2 {
+        let reused = held.is_some();
+        if held.is_none() {
+            *held = Some(connect(state, addr, timeout).await?);
+        }
+        let Some(sock) = held.as_mut() else {
+            return Err(format!("no connection to {addr}"));
+        };
+        match round_trip(state, sock, addr, ping, timeout).await {
+            Answer::Reply(reply) => return Ok(Some(reply)),
+            Answer::Closed if reused && attempt == 0 => {
+                *held = None;
+            }
+            Answer::Closed | Answer::TimedOut => {
+                *held = None;
+                return Ok(None);
+            }
+            Answer::Failed(e) => {
+                *held = None;
+                return Err(e);
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Close the ping connections of peers that are no longer pinged.
+pub(crate) fn prune_ping_links(state: &ClusterState, pinged: &[String]) {
+    state
+        .ping_links
+        .lock()
+        .retain(|addr, _| pinged.iter().any(|p| p == addr));
 }
 
 /// The address a reply from `peer_ip` should be attributed to when the peer
@@ -209,6 +307,7 @@ pub(super) fn our_ping(state: &ClusterState) -> BusMessage {
         sender_flags: me.flags & (NodeFlags::MASTER | NodeFlags::REPLICA),
         sender_master_id: me.master_id,
         sender_hostname: me.hostname.clone(),
+        sender_announced_client_port: me.announced_client_port,
         gossip,
         slot_claims: state.my_slot_claims(),
     }
@@ -240,7 +339,7 @@ pub async fn send_ping(
         }
     }
 
-    match exchange(&state, &addr, &ping, Duration::from_secs(3)).await? {
+    match ping_on_link(&state, &addr, &ping, Duration::from_secs(3)).await? {
         Some(reply) => {
             crate::cluster::bus::listener::process_message(
                 &state,

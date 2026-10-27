@@ -103,6 +103,16 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
             ctx.config.cluster_announce_port.to_string(),
         ),
         (
+            "cluster-announce-client-port",
+            ctx.cluster
+                .nodes
+                .read()
+                .get(&ctx.cluster.myself())
+                .map(|me| me.announced_client_port)
+                .unwrap_or(ctx.config.cluster_announce_client_port)
+                .to_string(),
+        ),
+        (
             "cluster-announce-bus-port",
             ctx.config.cluster_announce_bus_port.to_string(),
         ),
@@ -128,6 +138,18 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
         (
             "cluster-require-full-coverage",
             yes_no(ctx.config.cluster_require_full_coverage),
+        ),
+        (
+            "cluster-slot-migration-handoff-max-lag-bytes",
+            crate::cluster::migration::handoff_max_lag_bytes(ctx.config).to_string(),
+        ),
+        (
+            "cluster-slot-migration-write-pause-timeout",
+            crate::cluster::migration::write_pause_timeout_ms(ctx.config).to_string(),
+        ),
+        (
+            "cluster-replica-validity-factor",
+            ctx.cluster.replica_validity_factor().to_string(),
         ),
         (
             "slowlog-entry-max-argc",
@@ -237,6 +259,16 @@ fn config_set_array(param: &str, value: &str) -> Vec<u8> {
 
 const NOT_MEMORY_OR_PERCENT: &str = "ERR argument must be a memory or percent value";
 
+/// The reply to a script command in a build without Lua. Job queues such as
+/// BullMQ and Sidekiq show it to their users, so it names the build to use.
+#[cfg(not(feature = "lua"))]
+const NO_LUA: &str = concat!(
+    "ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the ",
+    "lua or full variant (Docker image kividb/kividb:v",
+    env!("CARGO_PKG_VERSION"),
+    "-lua, or a kividb-lua release file)"
+);
+
 /// A setting's own name, for one Redis also takes under an older one.
 fn config_name(name: &str) -> &str {
     match name {
@@ -276,32 +308,6 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     Some(resp_simple("OK"))
                 }
                 Err(_) => Some(resp_error("ERR value is not an integer or out of range")),
-            },
-            "array-slice-size" | "array-sparse-kmax" | "array-sparse-kmin" => {
-                Some(config_set_array(&param, value))
-            }
-            "stream-node-max-entries" => match value.parse::<i64>() {
-                Ok(v) if v >= 0 => {
-                    crate::commands::stream_extra::NODE_MAX_ENTRIES
-                        .store(v, std::sync::atomic::Ordering::Relaxed);
-                    Some(resp_simple("OK"))
-                }
-                _ => Some(resp_error(
-                    "ERR CONFIG SET failed (possibly related to argument \
-                                 'stream-node-max-entries') - argument must be between 0 and \
-                                 9223372036854775807 inclusive",
-                )),
-            },
-            "stream-node-max-bytes" => match memory_size(value) {
-                Some(v) if v <= i64::MAX as usize => {
-                    crate::commands::stream_extra::NODE_MAX_BYTES
-                        .store(v as i64, std::sync::atomic::Ordering::Relaxed);
-                    Some(resp_simple("OK"))
-                }
-                _ => Some(resp_error(
-                    "ERR CONFIG SET failed (possibly related to argument \
-                                 'stream-node-max-bytes') - argument must be a memory value",
-                )),
             },
             "slowlog-max-len" => match value.parse::<usize>() {
                 Ok(v) => {
@@ -361,6 +367,43 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                 }
                 Err(_) => Some(resp_error("ERR value is not an integer or out of range")),
             },
+            // Active defrag (#113): see src/compaction.rs.
+            "activedefrag" => match value.to_ascii_lowercase().as_str() {
+                "yes" | "no" => {
+                    crate::compaction::set_enabled(value.eq_ignore_ascii_case("yes"));
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument 'activedefrag') - argument must be 'yes' or 'no'",
+                )),
+            },
+            "active-defrag-ignore-bytes" => match memory_size(value) {
+                Some(bytes) => {
+                    crate::compaction::set_ignore_bytes(bytes as u64);
+                    Some(resp_simple("OK"))
+                }
+                None => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument 'active-defrag-ignore-bytes') - argument must be a memory value",
+                )),
+            },
+            "active-defrag-threshold-lower" => match value.parse::<u32>() {
+                Ok(percent) if percent <= 1000 => {
+                    crate::compaction::set_threshold_lower(percent);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument 'active-defrag-threshold-lower') - argument must be between 0 and 1000 inclusive",
+                )),
+            },
+            "active-defrag-cycle-max" => match value.parse::<u32>() {
+                Ok(percent) if (1..=99).contains(&percent) => {
+                    crate::compaction::set_cycle_max(percent);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument 'active-defrag-cycle-max') - argument must be between 1 and 99 inclusive",
+                )),
+            },
             "requirepass" => {
                 // Update the default user's password in acl_store — this is the
                 // authoritative source for authentication, not config.requirepass.
@@ -412,23 +455,6 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                                      Valid values: debug, verbose, notice, warning, nothing",
                 )),
             },
-            // Redis's name for it since 7.0; the old one is kept.
-            "lua-time-limit" | "busy-reply-threshold" => {
-                #[cfg(feature = "lua")]
-                {
-                    match value.parse::<u64>() {
-                        Ok(v) => {
-                            crate::commands::lua::lua_time_limit_ms_set(v);
-                            Some(resp_simple("OK"))
-                        }
-                        Err(_) => Some(resp_error("ERR value is not an integer or out of range")),
-                    }
-                }
-                #[cfg(not(feature = "lua"))]
-                {
-                    Some(resp_simple("OK"))
-                }
-            }
             // Taken with the command gate held alone (`run_command`): no
             // command that went by the old setting is still running.
             "lua-parallel-scripts" => match value.to_ascii_lowercase().as_str() {
@@ -499,6 +525,17 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     Some(resp_simple("OK"))
                 }
             }
+            // What clients are told; nodes keep reaching each other at the
+            // client port (#110).
+            "cluster-announce-client-port" => match value.parse::<u16>() {
+                Ok(port) => {
+                    ctx.cluster.set_my_announced_client_port(port);
+                    Some(resp_simple("OK"))
+                }
+                Err(_) => Some(resp_error(
+                    "ERR argument must be between 0 and 65535 inclusive",
+                )),
+            },
             "cluster-preferred-endpoint-type" => match crate::cluster::Endpoint::parse(value) {
                 Some(endpoint) => {
                     ctx.cluster.set_preferred_endpoint(endpoint);
@@ -529,10 +566,18 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                 Err(_) => Some(resp_error("ERR value is not an integer or out of range")),
             },
             "notify-keyspace-events" => {
-                let new_flags = crate::keyspace_events::parse_ks_flags(value);
-                crate::keyspace_events::KS_FLAGS
-                    .store(new_flags, std::sync::atomic::Ordering::Relaxed);
-                Some(resp_simple("OK"))
+                match crate::keyspace_events::parse_ks_flags_strict(value) {
+                    Some(new_flags) => {
+                        crate::keyspace_events::KS_FLAGS
+                            .store(new_flags, std::sync::atomic::Ordering::Relaxed);
+                        Some(resp_simple("OK"))
+                    }
+                    None => Some(resp_error(&format!(
+                        "ERR CONFIG SET failed (possibly related to argument \
+                     'notify-keyspace-events') - {}",
+                        crate::keyspace_events::BAD_FLAGS
+                    ))),
+                }
             }
             "repl-backlog-size" => match value.parse::<u64>() {
                 Ok(v) if v >= 1 => {
@@ -677,6 +722,37 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     )))
                 }
             }
+            // Read at the start of each slot migration's handoff: a
+            // change applies to the next one (#111).
+            "cluster-slot-migration-handoff-max-lag-bytes" => match memory_size(value) {
+                Some(bytes) if bytes <= i64::MAX as usize => {
+                    crate::cluster::migration::set_handoff_max_lag_bytes(bytes as u64);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument \
+                                 'cluster-slot-migration-handoff-max-lag-bytes') - argument must be a memory value",
+                )),
+            },
+            "cluster-slot-migration-write-pause-timeout" => match value.parse::<i64>() {
+                Ok(ms) if ms >= 0 => {
+                    crate::cluster::migration::set_write_pause_timeout_ms(ms as u64);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument \
+                                 'cluster-slot-migration-write-pause-timeout') - argument must be between 0 and 9223372036854775807 inclusive",
+                )),
+            },
+            "cluster-replica-validity-factor" => match value.parse::<i64>() {
+                Ok(factor) if factor >= 0 => {
+                    ctx.cluster.set_replica_validity_factor(factor as u64);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR argument must be between 0 and 9223372036854775807 inclusive",
+                )),
+            },
             "tracking-table-max-keys" => match value.parse::<usize>() {
                 Ok(max_keys) => {
                     let dropped = ctx.tracking_table.set_max_keys(max_keys);
@@ -743,6 +819,142 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     "ERR argument couldn't be parsed into an integer",
                 )),
             },
+            // What a running Redis cannot be told either.
+            "daemonize" | "databases" | "pidfile" | "logfile" | "log-format" | "unixsocket"
+            | "supervised" | "io-threads" | "tcp-backlog" | "set-proc-title" | "appendfilename"
+            | "appenddirname" | "aclfile" => {
+                let unchanged = config_rows(ctx)
+                    .iter()
+                    .any(|(name, current)| *name == param && current == value);
+                if unchanged {
+                    Some(resp_simple("OK"))
+                } else {
+                    Some(resp_error(&format!(
+                        "ERR CONFIG SET failed (possibly related to argument \
+                                     '{param}') - can't set immutable config"
+                    )))
+                }
+            }
+            _ => None,
+        }
+    })();
+    let reply = reply
+        .or_else(|| config_set_global(&param, value))
+        .unwrap_or_else(|| config_set_other(ctx, &param, value));
+    if reply.starts_with(b"+") {
+        let secret = matches!(
+            param.as_str(),
+            "requirepass" | "masterauth" | "tls-key-file-pass"
+        );
+        log_info!(
+            "CONFIG SET {param} {}",
+            if secret { "(hidden)" } else { value }
+        );
+    }
+    reply
+}
+
+/// `CONFIG SET` of a setting that is the server's as a whole, not of a
+/// connection, a store or the replication: what a line of the configuration
+/// file with it does too (#142). `None`: not one of these.
+pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
+    let param = param.to_string();
+    let remembered = REMEMBERED_CONFIG.lock().contains_key(param.as_str())
+        || crate::redis_settings::is_hidden(&param);
+    (|| {
+        match param.as_str() {
+            "array-slice-size" | "array-sparse-kmax" | "array-sparse-kmin" => {
+                Some(config_set_array(&param, value))
+            }
+            "stream-node-max-entries" => match value.parse::<i64>() {
+                Ok(v) if v >= 0 => {
+                    crate::commands::stream_extra::NODE_MAX_ENTRIES
+                        .store(v, std::sync::atomic::Ordering::Relaxed);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument \
+                                 'stream-node-max-entries') - argument must be between 0 and \
+                                 9223372036854775807 inclusive",
+                )),
+            },
+            // What the latency monitor records (#158): remembered too, for
+            // `CONFIG GET`.
+            // Whether a reply to a write waits for its AOF record (#147).
+            "aof-ack-after-write" => match value.to_ascii_lowercase().as_str() {
+                "yes" | "no" => {
+                    crate::aof::set_ack_after_write(value.eq_ignore_ascii_case("yes"));
+                    REMEMBERED_CONFIG
+                        .lock()
+                        .insert(param.clone(), value.to_ascii_lowercase());
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error("ERR argument must be 'yes' or 'no'")),
+            },
+            // The policy of a series made without one (#127).
+            "ts-duplicate-policy" => match crate::types::DuplicatePolicy::parse(value) {
+                Some(policy) => {
+                    crate::types::DuplicatePolicy::set_server_default(&policy);
+                    REMEMBERED_CONFIG
+                        .lock()
+                        .insert(param.clone(), policy.as_str().to_ascii_lowercase());
+                    Some(resp_simple("OK"))
+                }
+                None => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument 'ts-duplicate-policy') \
+                     - argument(s) must be one of the following: block, first, last, min, max, sum",
+                )),
+            },
+            "latency-monitor-threshold" => match value.parse::<i64>() {
+                Ok(ms) if ms >= 0 => {
+                    crate::latency::set_threshold_ms(ms as u64);
+                    REMEMBERED_CONFIG
+                        .lock()
+                        .insert(param.clone(), ms.to_string());
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR argument must be between 0 and 9223372036854775807 inclusive",
+                )),
+            },
+            "stream-node-max-bytes" => match memory_size(value) {
+                Some(v) if v <= i64::MAX as usize => {
+                    crate::commands::stream_extra::NODE_MAX_BYTES
+                        .store(v as i64, std::sync::atomic::Ordering::Relaxed);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument \
+                                 'stream-node-max-bytes') - argument must be a memory value",
+                )),
+            },
+            // Redis's name for it since 7.0; the old one is kept.
+            "lua-time-limit" | "busy-reply-threshold" => {
+                #[cfg(feature = "lua")]
+                {
+                    match value.parse::<u64>() {
+                        Ok(v) => {
+                            crate::commands::lua::lua_time_limit_ms_set(v);
+                            Some(resp_simple("OK"))
+                        }
+                        Err(_) => Some(resp_error("ERR value is not an integer or out of range")),
+                    }
+                }
+                // Nothing runs to a limit here: remembered, for `CONFIG
+                // GET`.
+                #[cfg(not(feature = "lua"))]
+                {
+                    match value.parse::<u64>() {
+                        Ok(v) => {
+                            REMEMBERED_CONFIG
+                                .lock()
+                                .insert("busy-reply-threshold".to_string(), v.to_string());
+                            Some(resp_simple("OK"))
+                        }
+                        Err(_) => Some(resp_error("ERR value is not an integer or out of range")),
+                    }
+                }
+            }
             "maxmemory-clients" => {
                 let value = match value.strip_suffix('%') {
                     Some(percent) => match percent.parse::<u64>() {
@@ -774,48 +986,189 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                 )),
                 None => Some(resp_error("ERR argument must be a memory value")),
             },
-            // What a running Redis cannot be told either.
-            "daemonize" | "databases" | "pidfile" | "logfile" | "log-format" | "unixsocket"
-            | "supervised" | "io-threads" | "tcp-backlog" | "set-proc-title" | "appendfilename"
-            | "appenddirname" | "aclfile" => {
-                let unchanged = config_rows(ctx)
-                    .iter()
-                    .any(|(name, current)| *name == param && current == value);
-                if unchanged {
-                    Some(resp_simple("OK"))
-                } else {
-                    Some(resp_error(&format!(
-                        "ERR CONFIG SET failed (possibly related to argument \
-                                     '{param}') - can't set immutable config"
-                    )))
-                }
-            }
             // A setting of Redis's that means nothing here — how
             // it encodes small values, how it sizes its buffers.
             // It is accepted, so that a client or a tool that
             // sets it does not fail, and remembered, so that
             // `CONFIG GET` answers with what was set.
-            _ => {
+            _ if remembered => {
                 REMEMBERED_CONFIG
                     .lock()
                     .insert(param.clone(), value.to_string());
                 Some(resp_simple("OK"))
             }
+            _ => None,
         }
-    })();
-    let reply = reply.unwrap_or_else(|| resp_simple("OK"));
-    if reply.starts_with(b"+") {
-        let secret = matches!(
-            param.as_str(),
-            "requirepass" | "masterauth" | "tls-key-file-pass"
-        );
-        log_info!(
-            "CONFIG SET {param} {}",
-            if secret { "(hidden)" } else { value }
-        );
-    }
-    reply
+    })()
 }
+
+/// `CONFIG SET` of a name no arm of [`config_set_one`] or
+/// [`config_set_global`] takes (#143).
+fn config_set_other(ctx: &Ctx, param: &str, value: &str) -> Vec<u8> {
+    let immutable = || {
+        resp_error(&format!(
+            "ERR CONFIG SET failed (possibly related to argument '{param}') - can't set \
+             immutable config"
+        ))
+    };
+    // One `CONFIG GET` reports, read only at startup
+    // (`repl-replica-max-backlog-bytes`, `backupdirname`, ...): to what it
+    // already is, is no change.
+    if let Some((_, current)) = config_rows(ctx).into_iter().find(|(name, _)| name == param) {
+        return if current == value {
+            resp_simple("OK")
+        } else {
+            immutable()
+        };
+    }
+    // A command-line flag (`threads`, `io-model`, `aof`, ...).
+    if is_startup_flag(param) {
+        return immutable();
+    }
+    // A cluster setting this server does not have
+    // (`cluster-allow-reads-when-down`, ...) would change how the cluster
+    // behaves, so taking it and doing nothing would mislead whoever set it
+    // (#111); a name that is not Redis's either is most likely misspelt.
+    // Both are refused, as Redis refuses a setting it does not know.
+    if param.starts_with("cluster-") || !crate::redis_settings::is_redis_setting(param) {
+        return resp_error(&format!(
+            "ERR Unknown option or number of arguments for CONFIG SET - '{param}'"
+        ));
+    }
+    // Any other setting of Redis's: remembered, as above.
+    remember_config(param, value);
+    resp_simple("OK")
+}
+
+/// Whether `name` is one of the server's command-line flags.
+fn is_startup_flag(name: &str) -> bool {
+    use clap::CommandFactory;
+    crate::config::Config::command()
+        .get_arguments()
+        .any(|arg| arg.get_long() == Some(name))
+}
+
+/// Remember a setting of Redis's that means nothing here (see
+/// [`REMEMBERED_CONFIG`]).
+pub(crate) fn remember_config(name: &str, value: &str) {
+    REMEMBERED_CONFIG
+        .lock()
+        .insert(name.to_string(), value.to_string());
+}
+
+/// What TLS was set up from before a `CONFIG SET`, to put back.
+#[cfg(feature = "tls")]
+struct TlsBefore {
+    listener: Option<crate::tls::acceptor::Files>,
+    nodes: Option<crate::tls::acceptor::Files>,
+}
+
+/// `CONFIG SET` of TLS's files and `tls-auth-clients` (#156). The
+/// certificate, key and CA files are read again, as Redis reads them, also
+/// when a path is the same (a file renewed in place), and every handshake
+/// from then on, from clients and between nodes, uses them; connections
+/// already open keep theirs. Several are taken together, so that a
+/// certificate and its key can change in one `CONFIG SET`. If they cannot be
+/// loaded, nothing changes.
+#[cfg(feature = "tls")]
+fn config_set_tls(ctx: &Ctx, changes: &[(String, String)]) -> Result<TlsBefore, Vec<u8>> {
+    use crate::tls::acceptor;
+    let first = &changes[0].0;
+    let failed = |why: &str| {
+        resp_error(&format!(
+            "ERR CONFIG SET failed (possibly related to argument '{first}') - {why}"
+        ))
+    };
+    if let Some((_, value)) = changes.iter().find(|(name, _)| name == "tls-auth-clients")
+        && !crate::config::TLS_AUTH_CLIENTS.contains(&value.to_ascii_lowercase().as_str())
+    {
+        return Err(failed(
+            "argument(s) must be one of the following: no, yes, optional",
+        ));
+    }
+    let port = ctx.config.tls_port;
+    let before = TlsBefore {
+        listener: acceptor::files(port),
+        nodes: crate::node_tls::files(),
+    };
+    if before.listener.is_none() && before.nodes.is_none() {
+        // Nothing to load them into: what they would be for starts only
+        // with the server.
+        return Err(failed("can't set immutable config"));
+    }
+    let changed = |files: &Option<acceptor::Files>| {
+        files.clone().map(|mut files| {
+            for (name, value) in changes {
+                let value = if name == "tls-auth-clients" {
+                    value.to_ascii_lowercase()
+                } else {
+                    value.clone()
+                };
+                files.set(name, &value);
+            }
+            files
+        })
+    };
+    let unable = |e: String| {
+        log_warn!("TLS: CONFIG SET {first}: {e}");
+        failed("Unable to update TLS configuration. Check server logs.")
+    };
+    if let Some(files) = changed(&before.listener) {
+        acceptor::install(port, &files).map_err(unable)?;
+    }
+    if let Some(files) = changed(&before.nodes)
+        && let Err(e) = crate::node_tls::reload(files)
+    {
+        if let Some(files) = &before.listener {
+            let _ = acceptor::install(port, files);
+        }
+        return Err(unable(e));
+    }
+    for (name, value) in changes {
+        log_info!("CONFIG SET {name} {value}");
+    }
+    log_info!("TLS: certificates loaded again");
+    Ok(before)
+}
+
+/// Put TLS back as it was before [`config_set_tls`].
+#[cfg(feature = "tls")]
+fn config_set_tls_undo(ctx: &Ctx, before: TlsBefore) {
+    if let Some(files) = before.listener {
+        let _ = crate::tls::acceptor::install(ctx.config.tls_port, &files);
+    }
+    if let Some(files) = before.nodes {
+        let _ = crate::node_tls::reload(files);
+    }
+}
+
+/// `INFO keysizes`: a pass over every key. Asked for by name it is counted
+/// now; as part of `INFO all` or `everything`, which exporters scrape every
+/// few seconds, a count up to [`KEYSIZES_REUSED_FOR`] old is given again,
+/// so that they cost one pass per that time and not one each (#158).
+fn keysizes_section(ctx: &Ctx, fresh: bool) -> String {
+    static LAST: std::sync::LazyLock<
+        parking_lot::Mutex<ahash::AHashMap<usize, (std::time::Instant, String)>>,
+    > = std::sync::LazyLock::new(Default::default);
+    let server = Arc::as_ptr(ctx.store) as *const () as usize;
+    if !fresh
+        && let Some((at, text)) = LAST.lock().get(&server)
+        && at.elapsed() < KEYSIZES_REUSED_FOR
+    {
+        return text.clone();
+    }
+    let text: String = ctx
+        .store
+        .iter()
+        .enumerate()
+        .map(|(i, db)| keysizes(i, db))
+        .collect();
+    LAST.lock()
+        .insert(server, (std::time::Instant::now(), text.clone()));
+    text
+}
+
+const KEYSIZES_REUSED_FOR: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// What a remembered setting is now (see [`REMEMBERED_CONFIG`]).
 pub(crate) fn remembered_config(name: &str) -> Option<String> {
@@ -853,12 +1206,20 @@ static REMEMBERED_CONFIG: std::sync::LazyLock<
             // No save points: nothing is saved on a timer.
             ("save", ""),
             ("appendfsync", "everysec"),
-            ("lazyfree-lazy-user-del", "yes"),
+            // `DEL` frees what it deletes before it replies (#152).
+            ("lazyfree-lazy-user-del", "no"),
             ("lazyfree-lazy-user-flush", "no"),
             ("lazyfree-lazy-expire", "yes"),
             ("lazyfree-lazy-server-del", "yes"),
-            ("activedefrag", "no"),
             ("close-on-replica-write", "yes"),
+            ("hz", "10"),
+            ("activerehashing", "yes"),
+            ("lazyfree-lazy-eviction", "no"),
+            ("timeout", "0"),
+            ("tcp-keepalive", "300"),
+            ("latency-monitor-threshold", "0"),
+            ("ts-duplicate-policy", "last"),
+            ("aof-ack-after-write", "yes"),
         ]
         .into_iter()
         .map(|(name, value)| (name.to_string(), value.to_string()))
@@ -883,7 +1244,8 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
     #[cfg(feature = "lua")]
     let lua_time_limit = crate::commands::lua::lua_time_limit_ms().to_string();
     #[cfg(not(feature = "lua"))]
-    let lua_time_limit = "5000".to_string();
+    let lua_time_limit =
+        remembered_config("busy-reply-threshold").unwrap_or_else(|| "5000".to_string());
     let in_effect: Vec<(&str, String)> = vec![
         ("bind", ctx.config.bind.clone()),
         (
@@ -911,6 +1273,27 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
             "lfu-decay-time",
             crate::eviction::lfu_decay_time().to_string(),
         ),
+        (
+            "activedefrag",
+            if crate::compaction::enabled() {
+                "yes"
+            } else {
+                "no"
+            }
+            .to_string(),
+        ),
+        (
+            "active-defrag-ignore-bytes",
+            crate::compaction::ignore_bytes().to_string(),
+        ),
+        (
+            "active-defrag-threshold-lower",
+            crate::compaction::threshold_lower().to_string(),
+        ),
+        (
+            "active-defrag-cycle-max",
+            crate::compaction::cycle_max().to_string(),
+        ),
         ("requirepass", requirepass),
         (
             "dir",
@@ -933,9 +1316,6 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
             "loglevel",
             crate::loglevel::log::level_str(LOG_LEVEL.load(Relaxed)).to_string(),
         ),
-        ("hz", "10".to_string()),
-        ("activerehashing", "yes".to_string()),
-        ("lazyfree-lazy-eviction", "no".to_string()),
         (
             "repl-backlog-size",
             ctx.repl_state.backlog_size.load(Relaxed).to_string(),
@@ -954,8 +1334,6 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
             .to_string(),
         ),
         ("tcp-backlog", "511".to_string()),
-        ("timeout", "0".to_string()),
-        ("tcp-keepalive", "300".to_string()),
         ("lua-time-limit", lua_time_limit.clone()),
         (
             "lua-parallel-scripts",
@@ -1005,6 +1383,18 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
             rows.push((name.to_string(), value));
         }
     }
+    // TLS's files, as `CONFIG SET` last loaded them.
+    #[cfg(feature = "tls")]
+    {
+        let files = crate::tls::acceptor::files(ctx.config.tls_port)
+            .or_else(crate::node_tls::files)
+            .unwrap_or_else(|| crate::tls::acceptor::Files::of(ctx.config));
+        for name in crate::tls::acceptor::SETTINGS {
+            if !rows.iter().any(|(known, _)| known == name) {
+                rows.push((name.to_string(), files.get(name).unwrap_or_default()));
+            }
+        }
+    }
     // The master this server replicates, under both of the setting's names.
     let master = ctx
         .repl_state
@@ -1017,9 +1407,8 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
             rows.push((name.to_string(), master.clone()));
         }
     }
-    const HIDDEN: [&str; 2] = ["key-load-delay", "rdb-key-save-delay"];
     for (name, value) in REMEMBERED_CONFIG.lock().iter() {
-        if !rows.iter().any(|(known, _)| known == name) && !HIDDEN.contains(&name.as_str()) {
+        if !rows.iter().any(|(known, _)| known == name) && !crate::redis_settings::is_hidden(name) {
             rows.push((name.clone(), value.clone()));
         }
     }
@@ -1294,7 +1683,6 @@ const ALL_COMMANDS: &[&str] = &[
     "GEORADIUSBYMEMBER",
     "GEOSEARCH",
     "GEOSEARCHSTORE",
-    "GEODELBYMEMBER",
     "GET",
     "GETBIT",
     "GETDEL",
@@ -1696,6 +2084,12 @@ const ADMIN_COMMANDS: &[&str] = &[
 ];
 
 /// The `fast` ACL category.
+/// Whether `name` (upper case) is a command Redis flags `fast`: the latency
+/// monitor's `fast-command` event, not `command`.
+pub(crate) fn is_fast_command(name: &str) -> bool {
+    FAST_COMMANDS.contains(&name)
+}
+
 const FAST_COMMANDS: &[&str] = &[
     "APPEND",
     "ASKING",
@@ -2094,7 +2488,6 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
             "GEORADIUSBYMEMBER",
             "GEOSEARCH",
             "GEOSEARCHSTORE",
-            "GEODELBYMEMBER",
             "GEOHASH",
             "GEORADIUSBYMEMBER_RO",
             "GEORADIUS_RO",
@@ -2547,12 +2940,11 @@ pub(crate) fn extract_keys(args: &[&[u8]], with_flags: bool) -> Result<Vec<Vec<u
         | "RPUSHX" | "LPOP" | "RPOP" | "LSET" | "LINSERT" | "LREM" | "LTRIM" | "LMPOP" | "SADD"
         | "SREM" | "SPOP" | "ZADD" | "ZREM" | "ZINCRBY" | "ZPOPMIN" | "ZPOPMAX" | "ZMPOP"
         | "XADD" | "XDEL" | "XDELEX" | "XTRIM" | "XSETID" | "XGROUP" | "XACK" | "XAUTOCLAIM"
-        | "XCLAIM" | "XREADGROUP" | "PFADD" | "BITOP" | "BITFIELD" | "GEOADD"
-        | "GEODELBYMEMBER" | "JSON.SET" | "JSON.DEL" | "JSON.MSET" | "JSON.NUMINCRBY"
-        | "JSON.NUMMULTBY" | "JSON.STRAPPEND" | "JSON.ARRAPPEND" | "JSON.ARRINSERT"
-        | "JSON.ARRPOP" | "JSON.ARRTRIM" | "JSON.CLEAR" | "JSON.TOGGLE" | "JSON.MERGE" | "VADD"
-        | "VREM" | "VSETATTR" | "TS.ADD" | "TS.INCRBY" | "TS.DECRBY" | "TS.CREATE" | "TS.DEL"
-        | "TS.ALTER" => {
+        | "XCLAIM" | "XREADGROUP" | "PFADD" | "BITOP" | "BITFIELD" | "GEOADD" | "JSON.SET"
+        | "JSON.DEL" | "JSON.MSET" | "JSON.NUMINCRBY" | "JSON.NUMMULTBY" | "JSON.STRAPPEND"
+        | "JSON.ARRAPPEND" | "JSON.ARRINSERT" | "JSON.ARRPOP" | "JSON.ARRTRIM" | "JSON.CLEAR"
+        | "JSON.TOGGLE" | "JSON.MERGE" | "VADD" | "VREM" | "VSETATTR" | "TS.ADD" | "TS.INCRBY"
+        | "TS.DECRBY" | "TS.CREATE" | "TS.DEL" | "TS.ALTER" => {
             if args.len() < 2 {
                 return Err("ERR Invalid arguments specified".into());
             }
@@ -2793,13 +3185,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             match result {
                 Ok(_) => {
                     crate::stats::reset_rdb_changes();
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs() as i64;
-
-                    *ctx.lastsave.write() = now;
-
                     Some(resp_simple("OK"))
                 }
                 Err(e) => Some(resp_error(&format!("ERR save failed : {e}"))),
@@ -2816,9 +3201,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let expiry_store_snap = Arc::clone(ctx.expiry_store);
             let index_store_snap = Arc::clone(ctx.index_store);
             let repl_state = Arc::clone(ctx.repl_state);
-            let lastsave = Arc::clone(ctx.lastsave);
 
             tokio::spawn(async move {
+                let started = std::time::Instant::now();
                 let snap = tokio::task::spawn_blocking(move || {
                     crate::replication::save_dataset(
                         &store,
@@ -2834,11 +3219,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let ok = matches!(snap, Ok(Ok(())));
                 if ok {
                     crate::stats::reset_rdb_changes();
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs() as i64;
-                    *lastsave.write() = now;
+                    crate::stats::LAST_BGSAVE_SECS
+                        .store(started.elapsed().as_secs() as i64, Ordering::Relaxed);
                 } else {
                     let why = match snap {
                         Ok(Err(e)) => e.to_string(),
@@ -2859,10 +3241,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             Some(resp_simple("Background saving started"))
         }
 
-        "LASTSAVE" => {
-            let t = *ctx.lastsave.read();
-            Some(resp_integer(t))
-        }
+        "LASTSAVE" => Some(resp_integer(crate::stats::last_save())),
 
         "FLUSHDB" => {
             let db = *ctx.selected_db;
@@ -2952,16 +3331,34 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 out.push_str(&format!("uptime_in_days:{}\r\n", uptime / 86400));
                 out.push_str("hz:10\r\n");
                 out.push_str("configured_hz:10\r\n");
-                out.push_str("multiplexing_api:epoll\r\n");
+                out.push_str(&format!(
+                    "multiplexing_api:{}\r\n",
+                    crate::stats::multiplexing_api()
+                ));
                 out.push_str("atomicvar_api:atomic-builtin\r\n");
                 out.push_str("gcc_version:0.0.0\r\n");
-                out.push_str("config_file:\r\n");
+                // The file it was started with, if there is one.
+                let config_file = Some(std::path::Path::new(&ctx.config.configfile))
+                    .filter(|path| path.is_file())
+                    .and_then(|path| std::path::absolute(path).ok())
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                out.push_str(&format!("config_file:{config_file}\r\n"));
+                // Off is -1, as `CONFIG GET` writes it.
                 out.push_str(&format!(
                     "slowlog_log_slower_than:{}\r\n",
-                    ctx.slowlog.threshold_us()
+                    match ctx.slowlog.threshold_us() {
+                        u64::MAX => -1,
+                        us => us as i64,
+                    }
                 ));
                 out.push_str(&format!("slowlog_max_len:{}\r\n", ctx.slowlog.len_cap()));
-                out.push_str("executable:/usr/local/bin/kividb\r\n");
+                out.push_str(&format!(
+                    "executable:{}\r\n",
+                    std::env::current_exe()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                ));
                 out.push_str("\r\n");
             }
 
@@ -3025,9 +3422,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             if want("keysizes") {
                 out.push_str("# Keysizes\r\n");
-                for (i, db) in ctx.store.iter().enumerate() {
-                    out.push_str(&keysizes(i, db));
-                }
+                out.push_str(&keysizes_section(ctx, asked("keysizes")));
                 out.push_str("\r\n");
             }
 
@@ -3039,7 +3434,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
                 out.push_str(&format!(
                     "total_commands_processed:{}\r\n",
-                    crate::stats::TOTAL_COMMANDS_PROCESSED.load(Ordering::Relaxed)
+                    crate::stats::TOTAL_COMMANDS_PROCESSED.total()
                 ));
                 out.push_str(&format!(
                     "instantaneous_ops_per_sec:{}\r\n",
@@ -3060,21 +3455,33 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "total_net_output_bytes:{}\r\n",
                     crate::stats::TOTAL_NET_OUTPUT_BYTES.load(Ordering::Relaxed)
                 ));
-                out.push_str("instantaneous_input_kbps:0\r\n");
-                out.push_str("instantaneous_output_kbps:0\r\n");
+                out.push_str(&format!(
+                    "instantaneous_input_kbps:{:.2}\r\n",
+                    crate::stats::INSTANTANEOUS_INPUT_BPS.load(Ordering::Relaxed) as f64 / 1024.0
+                ));
+                out.push_str(&format!(
+                    "instantaneous_output_kbps:{:.2}\r\n",
+                    crate::stats::INSTANTANEOUS_OUTPUT_BPS.load(Ordering::Relaxed) as f64 / 1024.0
+                ));
                 out.push_str(&format!(
                     "rejected_connections:{}\r\n",
                     crate::stats::REJECTED_CONNECTIONS.load(Ordering::Relaxed)
                 ));
-                out.push_str("total_reads_processed:0\r\n");
-                out.push_str("total_writes_processed:0\r\n");
+                out.push_str(&format!(
+                    "total_reads_processed:{}\r\n",
+                    crate::stats::TOTAL_READS_PROCESSED.total()
+                ));
+                out.push_str(&format!(
+                    "total_writes_processed:{}\r\n",
+                    crate::stats::TOTAL_WRITES_PROCESSED.total()
+                ));
                 out.push_str(&format!(
                     "keyspace_hits:{}\r\n",
-                    crate::stats::KEYSPACE_HITS.load(Ordering::Relaxed)
+                    crate::stats::KEYSPACE_HITS.total()
                 ));
                 out.push_str(&format!(
                     "keyspace_misses:{}\r\n",
-                    crate::stats::KEYSPACE_MISSES.load(Ordering::Relaxed)
+                    crate::stats::KEYSPACE_MISSES.total()
                 ));
                 out.push_str(&format!(
                     "expired_keys:{}\r\n",
@@ -3091,6 +3498,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 out.push_str(&format!(
                     "evicted_keys:{}\r\n",
                     crate::stats::EVICTED_KEYS.load(Ordering::Relaxed)
+                ));
+                out.push_str(&format!(
+                    "evicted_scripts:{}\r\n",
+                    crate::stats::EVICTED_SCRIPTS.load(Ordering::Relaxed)
                 ));
                 // Slowlog totals (Redis 8.8). Milliseconds to two places,
                 // as Redis writes them (`0.00`).
@@ -3159,6 +3570,36 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 out.push_str("\r\n");
             }
 
+            // Each command's percentiles, as Redis 7 gives them
+            // (`latency-tracking`, `latency-tracking-info-percentiles`): the
+            // section was empty (#158).
+            if want("latencystats")
+                && remembered_config("latency-tracking").as_deref() != Some("no")
+            {
+                out.push_str("# Latencystats\r\n");
+                let percentiles: Vec<f64> = remembered_config("latency-tracking-info-percentiles")
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .filter_map(|p| p.parse().ok())
+                    .collect();
+                for (name, totals) in crate::cmdstats::totals() {
+                    let line: Vec<String> = percentiles
+                        .iter()
+                        .map(|p| {
+                            format!(
+                                "p{p}={:.3}",
+                                crate::cmdstats::percentile_usec(&totals.buckets, *p)
+                            )
+                        })
+                        .collect();
+                    out.push_str(&format!(
+                        "latency_percentiles_usec_{name}:{}\r\n",
+                        line.join(",")
+                    ));
+                }
+                out.push_str("\r\n");
+            }
+
             if want("replication") {
                 let role = ctx.repl_state.role();
                 let offset = ctx
@@ -3207,6 +3648,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         v.load(std::sync::atomic::Ordering::Relaxed)
                     };
                     out.push_str(&format!("master_replid:{repl_id}\r\n"));
+                    let (replid2, second) = match ctx.repl_state.repl_id2.read().as_ref() {
+                        Some((id, until)) => (id.clone(), *until as i64),
+                        None => ("0".repeat(40), -1),
+                    };
+                    out.push_str(&format!("master_replid2:{replid2}\r\n"));
+                    out.push_str(&format!("second_repl_offset:{second}\r\n"));
                     out.push_str(&format!("master_repl_offset:{offset}\r\n"));
                     out.push_str(&format!(
                         "repl_backlog_active:{}\r\n",
@@ -3291,16 +3738,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
 
             if want("memory") {
-                let (rss, peak, vsize) = crate::commands::memory::read_proc_status_pub();
-                // Only Linux's VmSize/VmRSS are comparable enough for this to
-                // mean anything — see `memory::fragmentation`.
-                let (frag_ratio, frag_bytes) = crate::commands::memory::fragmentation(rss, vsize);
+                let (rss, _, _) = crate::commands::memory::read_proc_status_pub();
                 let maxmem = crate::RUNTIME_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed);
                 // What the process has allocated — what `maxmemory` is
                 // measured against — as distinct from what the operating
                 // system has given it, which is the RSS below.
-                let used = crate::memory_use::allocated();
-                let startup_memory: usize = 1_000_000;
+                let (used, peak) = crate::commands::memory::used_and_peak();
+                let (frag_ratio, frag_bytes) = crate::commands::memory::fragmentation(rss, used);
+                // What the server had allocated before any data; KiviDB
+                // counts no other overhead apart from the dataset.
+                let startup_memory = crate::commands::memory::startup_used().min(used);
                 let overhead = startup_memory;
                 let dataset = used.saturating_sub(overhead);
                 let dataset_perc = if used > 0 {
@@ -3316,6 +3763,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     crate::commands::memory::human_bytes_pub(used)
                 ));
                 out.push_str(&format!("used_memory_rss:{rss}\r\n"));
+                // KiviDB's slabs of small string values that hold something
+                // (#113): `used_memory` counts the blocks in them.
+                let fill = crate::value_slab::fill();
+                out.push_str(&format!("value_slab_bytes:{}\r\n", fill.slab_bytes));
+                out.push_str(&format!("value_slab_live_bytes:{}\r\n", fill.live_bytes));
                 out.push_str(&format!(
                     "used_memory_rss_human:{}\r\n",
                     crate::commands::memory::human_bytes_pub(rss)
@@ -3328,7 +3780,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 out.push_str(&format!(
                     "used_memory_peak_perc:{:.2}%\r\n",
                     if peak > 0 {
-                        rss as f64 / peak as f64 * 100.0
+                        used as f64 / peak as f64 * 100.0
                     } else {
                         100.0
                     }
@@ -3389,11 +3841,28 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 out.push_str(&format!("mem_fragmentation_ratio:{frag_ratio:.4}\r\n"));
                 out.push_str(&format!("mem_fragmentation_bytes:{frag_bytes}\r\n"));
                 out.push_str("mem_not_counted_for_evict:0\r\n");
-                out.push_str("mem_replication_backlog:0\r\n");
-                out.push_str("mem_clients_slaves:0\r\n");
-                out.push_str("mem_clients_normal:0\r\n");
+                // The backlog's bytes, and the clients' query buffers: they
+                // were 0 (#152).
+                out.push_str(&format!(
+                    "mem_replication_backlog:{}\r\n",
+                    ctx.repl_state.backlog_histlen.load(Ordering::Relaxed)
+                ));
+                let (clients_normal, clients_replicas) = ctx.client_registry.buffer_totals();
+                out.push_str(&format!("mem_clients_slaves:{clients_replicas}\r\n"));
+                out.push_str(&format!("mem_clients_normal:{clients_normal}\r\n"));
                 out.push_str("mem_aof_buffer:0\r\n");
-                out.push_str("active_defrag_running:0\r\n");
+                out.push_str(&format!(
+                    "active_defrag_running:{}\r\n",
+                    u8::from(crate::compaction::running())
+                ));
+                out.push_str(&format!(
+                    "active_defrag_hits:{}\r\n",
+                    crate::compaction::hits()
+                ));
+                out.push_str(&format!(
+                    "active_defrag_misses:{}\r\n",
+                    crate::compaction::misses()
+                ));
                 out.push_str(&format!(
                     "lazyfree_pending_objects:{}\r\n",
                     crate::lazyfree::pending_objects()
@@ -3417,16 +3886,22 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 out.push_str(&format!("tracking_total_keys:{keys}\r\n"));
                 out.push_str(&format!("tracking_total_items:{items}\r\n"));
                 out.push_str(&format!("tracking_total_prefixes:{prefixes}\r\n"));
-                out.push_str("clients_in_timeout_table:0\r\n");
+                out.push_str(&format!(
+                    "clients_in_timeout_table:{}\r\n",
+                    crate::client_registry::ClientRegistryInner::in_timeout_table()
+                ));
                 let (blocking_keys, on_nokey) = ctx.wait_table.blocking_keys();
                 out.push_str(&format!("total_blocking_keys:{blocking_keys}\r\n"));
                 out.push_str(&format!("total_blocking_keys_on_nokey:{on_nokey}\r\n"));
-                out.push_str("maxclients:10000\r\n");
+                out.push_str(&format!(
+                    "maxclients:{}\r\n",
+                    remembered_config("maxclients").unwrap_or_else(|| "10000".to_string())
+                ));
                 out.push_str("\r\n");
             }
 
             if want("persistence") {
-                let lastsave = *ctx.lastsave.read();
+                let lastsave = crate::stats::last_save();
                 let chg = crate::stats::rdb_changes_since_save();
                 out.push_str("# Persistence\r\n");
                 // 1 on a replica while a full sync is being loaded: the
@@ -3456,7 +3931,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
                 out.push_str(&format!(
                     "rdb_last_bgsave_time_sec:{}\r\n",
-                    if lastsave > 0 { lastsave } else { -1 }
+                    crate::stats::LAST_BGSAVE_SECS.load(Ordering::Relaxed)
                 ));
                 out.push_str(&format!(
                     "rdb_last_bgsave_status:{}\r\n",
@@ -3588,14 +4063,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     }
                     // Redis's debugging settings: not listed by a pattern,
                     // and answered when asked for by name.
-                    for hidden in ["key-load-delay", "rdb-key-save-delay"] {
+                    for (hidden, default) in crate::redis_settings::HIDDEN_SETTINGS {
                         if patterns.iter().any(|pattern| pattern == hidden) {
                             pairs.push(resp_bulk_str(hidden));
                             pairs.push(resp_bulk_str(
                                 REMEMBERED_CONFIG
                                     .lock()
-                                    .get(hidden)
-                                    .map_or("0", |value| value.as_str()),
+                                    .get(*hidden)
+                                    .map_or(*default, |value| value.as_str()),
                             ));
                         }
                     }
@@ -3640,6 +4115,22 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             "ERR CONFIG SET failed (possibly related to argument '{twice}') -                              duplicate parameter"
                         )));
                     }
+                    // TLS's files are loaded together, first: a
+                    // certificate and its key are only good as a pair.
+                    #[cfg(feature = "tls")]
+                    let (tls, settings): (Vec<_>, Vec<_>) =
+                        settings.into_iter().partition(|(name, _)| {
+                            crate::tls::acceptor::SETTINGS.contains(&name.as_str())
+                        });
+                    #[cfg(feature = "tls")]
+                    let mut tls_before = if tls.is_empty() {
+                        None
+                    } else {
+                        match config_set_tls(ctx, &tls) {
+                            Ok(before) => Some(before),
+                            Err(reply) => return Some(reply),
+                        }
+                    };
                     // Several at once: all of them, or none. Each is set as
                     // it would be alone, in order; if one is refused, the
                     // ones before it are put back to what they were.
@@ -3650,7 +4141,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     };
                     for (i, (param, value)) in settings.iter().enumerate() {
                         let mut reply = config_set_one(ctx, param, value);
-                        if reply.starts_with(b"-") && !reply.starts_with(b"-ERR CONFIG SET failed")
+                        // Redis's own reply to a setting it does not know
+                        // is not wrapped either.
+                        if reply.starts_with(b"-")
+                            && !reply.starts_with(b"-ERR CONFIG SET failed")
+                            && !reply.starts_with(b"-ERR Unknown option")
                         {
                             let why = String::from_utf8_lossy(&reply[1..]);
                             let why = why.trim_end().trim_start_matches("ERR ");
@@ -3660,6 +4155,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             ));
                         }
                         if reply.starts_with(b"-") {
+                            #[cfg(feature = "tls")]
+                            if let Some(before) = tls_before.take() {
+                                config_set_tls_undo(ctx, before);
+                            }
                             for (param, _) in &settings[..i] {
                                 match before.iter().find(|(known, _)| known == param) {
                                     Some((_, old)) => {
@@ -3677,9 +4176,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
                 "RESETSTAT" => {
                     crate::cmdstats::reset();
-                    crate::stats::KEYSPACE_HITS.store(0, Ordering::Relaxed);
-                    crate::stats::KEYSPACE_MISSES.store(0, Ordering::Relaxed);
-                    crate::stats::TOTAL_COMMANDS_PROCESSED.store(0, Ordering::Relaxed);
+                    crate::stats::KEYSPACE_HITS.reset();
+                    crate::stats::KEYSPACE_MISSES.reset();
+                    crate::stats::TOTAL_COMMANDS_PROCESSED.reset();
+                    crate::stats::TOTAL_READS_PROCESSED.reset();
+                    crate::stats::TOTAL_WRITES_PROCESSED.reset();
                     crate::stats::TOTAL_CONNECTIONS_RECEIVED.store(0, Ordering::Relaxed);
                     crate::stats::TOTAL_ERROR_REPLIES.store(0, Ordering::Relaxed);
                     crate::stats::TOTAL_NET_INPUT_BYTES.store(0, Ordering::Relaxed);
@@ -3872,8 +4373,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             Err(e) => Some(resp_error(&e)),
                         };
                     }
+                    // As the other containers answer, and Redis; it was
+                    // nil (#134).
                     _ => {
-                        return Some(resp_null_array());
+                        return Some(resp_error(&format!(
+                            "ERR unknown subcommand '{}'. Try COMMAND HELP.",
+                            String::from_utf8_lossy(cmd[1])
+                        )));
                     }
                 }
             }
@@ -4793,10 +5299,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             #[cfg(not(feature = "lua"))]
             {
-                Some(resp_error(
-                    "ERR Lua scripting is not supported by KiviDB. \
-                     See COMMANDS.md for the design rationale.",
-                ))
+                Some(resp_error(NO_LUA))
             }
         }
 
@@ -4807,10 +5310,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             #[cfg(not(feature = "lua"))]
             {
-                Some(resp_error(
-                    "ERR SCRIPT subsystem is not supported by KiviDB (requires Lua). \
-                     See COMMANDS.md for the design rationale.",
-                ))
+                Some(resp_error(NO_LUA))
             }
         }
 
@@ -4821,10 +5321,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             #[cfg(not(feature = "lua"))]
             {
-                Some(resp_error(
-                    "ERR FUNCTION subsystem is not supported by KiviDB (requires Lua). \
-                     See COMMANDS.md for the design rationale.",
-                ))
+                Some(resp_error(NO_LUA))
             }
         }
 
@@ -4835,10 +5332,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             #[cfg(not(feature = "lua"))]
             {
-                Some(resp_error(
-                    "ERR FUNCTION subsystem is not supported by KiviDB (requires Lua). \
-                     See COMMANDS.md for the design rationale.",
-                ))
+                Some(resp_error(NO_LUA))
             }
         }
 

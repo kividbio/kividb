@@ -154,6 +154,8 @@ pub fn load(path: &Path) -> std::io::Result<Option<LoadedConfig>> {
                 // stale by definition and is re-established by gossip.
                 fail_since_ms: 0,
                 hostname: hostname.to_string(),
+                // Not persisted: the peer says it again on its next heartbeat.
+                announced_client_port: 0,
             },
         );
     }
@@ -579,6 +581,7 @@ mod tests {
                 pong_received_ms: 0,
                 fail_since_ms: 0,
                 hostname: String::new(),
+                announced_client_port: 0,
             },
         );
         let slots: Box<[Option<NodeId>; CLUSTER_SLOTS]> = vec![None; CLUSTER_SLOTS]
@@ -613,6 +616,7 @@ mod tests {
                 pong_received_ms: 0,
                 fail_since_ms: 0,
                 hostname: String::new(),
+                announced_client_port: 0,
             },
         );
         // Assign slots 0..=99, 200..=200, 5000..=5474 to me.

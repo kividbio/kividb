@@ -835,6 +835,36 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// A word as it is to match: itself, or any word of the synonym groups
+    /// it is in (`FT.SYNUPDATE`), as RediSearch expands a query's terms. The
+    /// groups were kept and searched with nothing (#130). Being the query's,
+    /// the expansion finds documents indexed before the group was made, as
+    /// RediSearch's rescan does.
+    fn exact(&self, fields: &[String], word: String) -> Filter {
+        let mut words = vec![word];
+        for group in self.def.synonyms.values() {
+            if group
+                .iter()
+                .any(|term| term.eq_ignore_ascii_case(&words[0]))
+            {
+                for term in group {
+                    let term = term.to_lowercase();
+                    if !words.contains(&term) {
+                        words.push(term);
+                    }
+                }
+            }
+        }
+        words
+            .into_iter()
+            .map(|word| Filter::Text {
+                fields: fields.to_vec(),
+                term: TextMatch::Exact(word),
+            })
+            .reduce(|a, b| Filter::Or(Box::new(a), Box::new(b)))
+            .unwrap_or(Filter::MatchNone)
+    }
+
     /// A bare word, with its wildcards. `None` for a stopword.
     fn word(&mut self, scope: Option<&[String]>) -> Result<Option<Filter>, String> {
         let start = self.pos;
@@ -871,10 +901,7 @@ impl<'a> Parser<'a> {
             if word.is_empty() || self.def.is_stopword(&word) {
                 return Ok(None);
             }
-            return Ok(Some(Filter::Text {
-                fields,
-                term: TextMatch::Exact(word),
-            }));
+            return Ok(Some(self.exact(&fields, word)));
         }
 
         // %word% — one edit per pair of percent signs, up to three.
@@ -928,10 +955,7 @@ impl<'a> Parser<'a> {
         let Some(first) = tokens.next() else {
             return Ok(None);
         };
-        let text = |token: String| Filter::Text {
-            fields: fields.clone(),
-            term: TextMatch::Exact(token),
-        };
+        let text = |token: String| self.exact(&fields, token);
         Ok(Some(
             tokens.fold(text(first), |acc, token| acc.and(text(token))),
         ))

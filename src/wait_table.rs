@@ -1,6 +1,5 @@
 use ahash::AHashMap;
 use parking_lot::Mutex;
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use tokio::sync::oneshot;
@@ -9,10 +8,6 @@ use tokio::sync::oneshot;
 // looks at the key for itself once it is woken — so it is always empty; the
 // type is what the connection loop's wait is written against.
 pub(crate) type Value = Arc<[u8]>;
-
-struct Waiter {
-    tx: oneshot::Sender<Value>,
-}
 
 /// A blocked client's place in line, taken when its command first has to
 /// wait and kept until it is answered. The client holds it; the table holds
@@ -35,8 +30,10 @@ struct Queued {
 
 pub struct WaitTable {
     // Key → stream readers (`XREAD BLOCK`, `XREADGROUP BLOCK`) waiting on it,
-    // in the order they arrived. See [`WaitTable::notify_stream_waiters`].
-    inner: Mutex<AHashMap<String, VecDeque<Waiter>>>,
+    // by registration: a [`StreamWait`] takes its own out when it is dropped,
+    // without looking through the others. They are all woken together, so
+    // their order does not matter. See [`WaitTable::notify_stream_waiters`].
+    inner: Mutex<AHashMap<String, AHashMap<u64, oneshot::Sender<Value>>>>,
     /// Key → clients waiting to be told the key was written: the blocking
     /// list and sorted-set commands and `TS.READ`. See
     /// [`WaitTable::register_signal`].
@@ -301,7 +298,7 @@ impl WaitTable {
     pub fn blocking_keys(&self) -> (usize, usize) {
         let mut keys: ahash::AHashSet<String> = ahash::AHashSet::new();
         for (key, waiters) in self.inner.lock().iter() {
-            if waiters.iter().any(|waiter| !waiter.tx.is_closed()) {
+            if waiters.values().any(|tx| !tx.is_closed()) {
                 keys.insert(key.clone());
             }
         }
@@ -345,16 +342,12 @@ impl WaitTable {
         }
     }
 
-    /// Register a stream reader on `key` and return the receiver it is woken
-    /// through. A tokio oneshot, so the caller does not block an OS thread.
-    pub fn register(&self, key: &str) -> oneshot::Receiver<Value> {
-        let (tx, rx) = oneshot::channel();
-        self.inner
-            .lock()
-            .entry(key.to_string())
-            .or_default()
-            .push_back(Waiter { tx });
-        rx
+    /// A stream reader's registrations, all taken out when it is dropped.
+    pub fn stream_wait(self: &Arc<Self>) -> StreamWait {
+        StreamWait {
+            table: self.clone(),
+            registered: Vec::new(),
+        }
     }
 
     /// Wake all waiters registered on `key` without delivering a value.
@@ -365,37 +358,61 @@ impl WaitTable {
         // We reuse the existing Value channel but send a zero-length sentinel.
         // The receiver treats any arrival as "data may be available, go check".
         let sentinel: Value = Arc::from([].as_slice());
-        let mut map = self.inner.lock();
-        let queue = match map.get_mut(key) {
-            Some(q) => q,
-            None => return 0,
+        // Every waiter is woken (a broadcast: every XREAD BLOCK client on the
+        // key deserves to look), and the key leaves the table. A sender whose
+        // receiver is gone fails to send, and is not counted.
+        let Some(waiters) = self.inner.lock().remove(key) else {
+            return 0;
         };
-        let mut notified = 0;
-        // Notify ALL waiters (broadcast), not just the first.
-        // Multiple XREAD BLOCK clients on the same key all deserve to wake.
-        queue.retain(|waiter| {
-            // is_closed() means the receiver was dropped (timeout or disconnect)
-            if waiter.tx.is_closed() {
-                return false; // drop dead waiter
-            }
-            // We can't send through a shared ref — we need to drain and re-insert.
-            // Instead, just mark: we'll drain below.
-            true
-        });
-        // Drain all live waiters and notify them
-        let live: Vec<Waiter> = {
-            let q = map.get_mut(key).unwrap();
-            std::mem::take(q).into_iter().collect()
-        };
-        for waiter in live {
-            if waiter.tx.send(sentinel.clone()).is_ok() {
-                notified += 1;
+        waiters
+            .into_values()
+            .map(|tx| tx.send(sentinel.clone()).is_ok())
+            .filter(|sent| *sent)
+            .count()
+    }
+}
+
+/// A stream reader's registrations, removed from every key when dropped.
+pub struct StreamWait {
+    table: Arc<WaitTable>,
+    /// Each registration's key and its own id: a reader may name a stream
+    /// twice (`XREAD STREAMS s s 0 0`), and each is a waiter of its own.
+    registered: Vec<(String, u64)>,
+}
+
+impl StreamWait {
+    /// Register on `key` and return the receiver the reader is woken
+    /// through. A tokio oneshot, so the caller does not block an OS thread.
+    pub fn register(&mut self, key: &str) -> oneshot::Receiver<Value> {
+        let (tx, rx) = oneshot::channel();
+        let id = self.table.next_ticket.fetch_add(1, Ordering::Relaxed);
+        self.table
+            .inner
+            .lock()
+            .entry(key.to_string())
+            .or_default()
+            .insert(id, tx);
+        self.registered.push((key.to_string(), id));
+        rx
+    }
+}
+
+impl Drop for StreamWait {
+    fn drop(&mut self) {
+        if self.registered.is_empty() {
+            return;
+        }
+        let mut map = self.table.inner.lock();
+        for (key, id) in &self.registered {
+            // Gone already if an XADD woke the key's waiters.
+            let Some(waiters) = map.get_mut(key) else {
+                continue;
+            };
+            waiters.remove(id);
+            if waiters.is_empty() {
+                map.remove(key);
             }
         }
-        if map.get(key).map(|q| q.is_empty()).unwrap_or(true) {
-            map.remove(key);
-        }
-        notified
     }
 }
 
@@ -481,6 +498,52 @@ mod signal_tests {
         drop(third);
         table.notify_signal("k");
         assert!(!table.has_signal_waiters());
+    }
+
+    /// Dropping a reader's wait unregisters it from every key, even with its
+    /// receivers still alive (racers aborted but not yet dropped).
+    #[test]
+    fn a_stream_reader_unregisters_from_every_key() {
+        let table = Arc::new(WaitTable::new());
+        let mut wait = table.stream_wait();
+        let rxs: Vec<_> = (0..1000).map(|i| wait.register(&format!("s{i}"))).collect();
+        drop(wait);
+        assert!(table.inner.lock().is_empty());
+        drop(rxs);
+    }
+
+    /// A reader may name a stream twice (`XREAD STREAMS s s 0 0`): each is
+    /// woken, and dropping the reader takes both out.
+    #[test]
+    fn a_stream_named_twice_is_two_waiters() {
+        let table = Arc::new(WaitTable::new());
+        let mut wait = table.stream_wait();
+        let mut first = wait.register("s");
+        let mut second = wait.register("s");
+        assert_eq!(table.notify_stream_waiters("s"), 2);
+        assert!(first.try_recv().is_ok());
+        assert!(second.try_recv().is_ok());
+        let _again = wait.register("s");
+        let _again_too = wait.register("s");
+        drop(wait);
+        assert!(table.inner.lock().is_empty());
+    }
+
+    #[test]
+    fn unregistering_one_reader_leaves_the_others_waiting() {
+        let table = Arc::new(WaitTable::new());
+        let (mut first, mut second) = (table.stream_wait(), table.stream_wait());
+        let mut first_a = first.register("a");
+        let mut first_b = first.register("b");
+        let mut second_a = second.register("a");
+
+        drop(first);
+        assert_eq!(table.notify_stream_waiters("a"), 1);
+        assert!(second_a.try_recv().is_ok());
+        assert!(first_a.try_recv().is_err());
+        assert!(first_b.try_recv().is_err());
+        drop(second);
+        assert!(table.inner.lock().is_empty());
     }
 
     #[test]

@@ -402,18 +402,107 @@ fn seal(ctx: &Ctx) -> Vec<u8> {
         IN_PROGRESS.store(false, Ordering::Relaxed);
     }
     if ttl > 0 {
-        // `backup-sealed-ttl`: clean up by ourselves if nobody does.
-        let _ = std::thread::Builder::new()
-            .name("kividb-backup-ttl".into())
-            .spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs(ttl));
-                let mut backup = BACKUP.lock();
-                if backup.seq == seq && backup.phase == Phase::Sealed {
-                    remove_files(&mut backup);
-                }
-            });
+        remove_after(seq, std::time::Duration::from_secs(ttl));
     }
     resp_simple("OK")
+}
+
+/// `backup-sealed-ttl`: clean the sealed backup `seq` up by ourselves, after
+/// `wait`, if nobody has.
+fn remove_after(seq: u64, wait: std::time::Duration) {
+    let _ = std::thread::Builder::new()
+        .name("kividb-backup-ttl".into())
+        .spawn(move || {
+            std::thread::sleep(wait);
+            let mut backup = BACKUP.lock();
+            if backup.seq == seq && backup.phase == Phase::Sealed {
+                remove_files(&mut backup);
+            }
+        });
+}
+
+/// At startup: the backup the directory holds, from before a restart (#150).
+/// Its state was only in memory, so a sealed backup could neither be cleaned
+/// up nor make way for another, and its `backup-sealed-ttl` never ran out.
+///
+/// A manifest whose base and incremental files are there is a sealed backup,
+/// sealed when the manifest was written: `BACKUP LIST` lists it, `BACKUP
+/// CLEANUP` removes it, and the TTL counts from its seal. Any other file a
+/// backup writes is what one the restart cut short left behind: a failed
+/// backup, which `BACKUP CLEANUP` or the next `BACKUP START` removes.
+///
+/// Called by the server binary only: the library's in-process test servers
+/// share this state, and take up no backup from disk.
+#[allow(dead_code)]
+pub(crate) fn recover(config: &crate::config::Config) {
+    let dir = PathBuf::from(&config.backupdirname);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let leftovers = entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        name.starts_with("appendonly.aof.") || name.starts_with(".appendonly.aof.")
+    });
+    if !leftovers {
+        return;
+    }
+    let modified = |path: &Path| {
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |at| at.as_secs())
+    };
+    let manifest_path = dir.join(MANIFEST_NAME);
+    let sealed = std::fs::read_to_string(&manifest_path)
+        .and_then(|text| parse_manifest(&text))
+        .ok()
+        .and_then(|(base, incr)| {
+            let seq = base
+                .strip_prefix("appendonly.aof.")?
+                .strip_suffix(".base.kdb")?
+                .parse::<u64>()
+                .ok()?;
+            let (base, incr) = (dir.join(base), dir.join(incr?));
+            (base.is_file() && incr.is_file()).then_some((seq, base, incr))
+        });
+    let mut backup = BACKUP.lock();
+    match sealed {
+        Some((seq, base, incr)) => {
+            NEXT_SEQ.fetch_max(seq + 1, Ordering::Relaxed);
+            *backup = Backup {
+                phase: Phase::Sealed,
+                error: String::new(),
+                start_time: modified(&base),
+                end_time: modified(&manifest_path),
+                seq,
+                dir,
+                files: vec![absolute(&base), absolute(&incr), absolute(&manifest_path)],
+                tap: None,
+                incr_done: None,
+            };
+            let ttl = sealed_ttl(config);
+            if ttl > 0 {
+                let age = unix_secs().saturating_sub(backup.end_time);
+                remove_after(seq, std::time::Duration::from_secs(ttl.saturating_sub(age)));
+            }
+            log_info!(
+                "Backup: a sealed backup is in '{}' (BACKUP LIST, BACKUP CLEANUP)",
+                backup.dir.display()
+            );
+        }
+        None => {
+            backup.phase = Phase::Failed;
+            backup.error = "interrupted by a restart".into();
+            backup.dir = dir;
+            log_warn!(
+                "Backup: '{}' holds a backup that a restart interrupted; BACKUP CLEANUP or the \
+                 next BACKUP START removes it",
+                backup.dir.display()
+            );
+        }
+    }
 }
 
 fn abort(ctx: &Ctx) -> Vec<u8> {

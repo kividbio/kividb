@@ -304,6 +304,10 @@ pub fn default_user_is_open(store: &AclStore) -> bool {
         .is_some_and(|user| user.enabled && user.nopass)
 }
 
+/// Redis's reply to `AUTH <password>` when the default user needs none.
+pub const AUTH_WITHOUT_PASSWORD: &str = "-ERR AUTH <password> called without any password \
+    configured for the default user. Are you sure your configuration is correct?\r\n";
+
 /// The user `username` authenticates as with `password`, if it does.
 pub fn authenticate(store: &AclStore, username: &str, password: &str) -> Option<AclUser> {
     let user = store
