@@ -586,9 +586,44 @@ impl ReplState {
         self.full_sync_guard.store(guard as u8, Ordering::Relaxed);
     }
 
-    /// How long a replica waits on a silent master before giving up on it.
+    /// How long a replica waits on a silent master before giving up on it,
+    /// and a master on a silent replica.
     pub fn repl_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.repl_timeout_secs.load(Ordering::Relaxed).max(1))
+    }
+
+    /// Whether replica `replica_id` is online and has sent no `REPLCONF ACK`
+    /// for longer than `repl-timeout`.
+    fn replica_is_silent(&self, replica_id: u64) -> bool {
+        let timeout_ms = self.repl_timeout().as_millis() as u64;
+        self.replica_progress
+            .lock()
+            .get(&replica_id)
+            .is_some_and(|p| {
+                p.state() == ReplicaState::Online
+                    && unix_ms().saturating_sub(p.last_ack_ms.load(Ordering::Relaxed)) > timeout_ms
+            })
+    }
+
+    /// Resolves once replica `replica_id` has gone silent (see
+    /// [`Self::replica_is_silent`]); its connection is then to be closed.
+    ///
+    /// A replica sends an ACK every second. One whose host is gone without
+    /// closing the connection (a terminated VM, a lost network path, a paused
+    /// container) sends none, and nothing else ended its connection: the
+    /// socket stays open while the peer's kernel answers, and when it does
+    /// not, for the kernel's retransmission limit, a quarter of an hour. It
+    /// was listed `online` with its lag growing, and counted in
+    /// `connected_slaves`, until the master restarted. Redis drops it after
+    /// `repl-timeout`, as this does. Only once online: a replica sends no ACK
+    /// while it loads the dataset.
+    pub async fn replica_timed_out(&self, replica_id: u64) {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            if self.replica_is_silent(replica_id) {
+                return;
+            }
+        }
     }
 
     pub fn link_state(&self) -> LinkState {

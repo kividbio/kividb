@@ -1603,6 +1603,7 @@ where
     // dataset at one instant, so every write is in exactly one of {payload,
     // stream}.
     let (peer_ip, peer_port) = replica_endpoint(&peer_addr, listening_port);
+    let endpoint = format!("{peer_ip}:{peer_port}");
     let registration = crate::replication::ReplicaRegistration {
         replica_id,
         addr: peer_addr.clone(),
@@ -1736,10 +1737,21 @@ where
     // `forward_task` reads from). Either way, force the socket writer closed so the
     // whole connection tears down instead of the reader lingering on a live replica
     // the hub has already forgotten about.
+    let mut write_task = write_task;
+    let mut forward_task = forward_task;
     tokio::select! {
-        _ = write_task => {}
-        _ = forward_task => {
+        _ = &mut write_task => {}
+        _ = &mut forward_task => {
             drop(resp_tx);
+        }
+        // A replica that has gone silent: see `ReplState::replica_timed_out`.
+        _ = repl_state.replica_timed_out(replica_id) => {
+            log_warn!(
+                "Replication: disconnecting timedout replica {endpoint}: no REPLCONF ACK for {} s (repl-timeout)",
+                repl_state.repl_timeout().as_secs()
+            );
+            forward_task.abort();
+            write_task.abort();
         }
     }
     ack_reader_task.abort();

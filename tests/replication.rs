@@ -1452,3 +1452,89 @@ fn test_promotion_during_a_full_sync_keeps_the_promoted_nodes_dataset() {
     assert_eq!(c.cmds(&["GET", "mine:0"]).as_str(), "v");
     assert!(c.cmds(&["SET", "after-promotion", "1"]).is_ok());
 }
+
+/// A replica that stops sending `REPLCONF ACK` without closing its
+/// connection (its VM terminated, its container paused) is dropped after
+/// `repl-timeout`, as in Redis. It was listed `online`, its lag growing, and
+/// counted in `connected_slaves` until the master restarted. A replica that
+/// goes on acknowledging stays.
+#[test]
+fn test_a_silent_replica_is_dropped_after_repl_timeout() {
+    let master_port = spawn_server(Config::default());
+    let mut master = Conn::connect(master_port);
+    let live_port = spawn_server(replica_of(master_port));
+    wait_link_up(&mut Conn::connect(live_port));
+
+    // A replica that syncs, acknowledges once, and then says nothing more,
+    // its connection left open.
+    let mut silent = Conn::connect(master_port);
+    assert!(silent.cmds(&["REPLCONF", "listening-port", "7777"]).is_ok());
+    silent
+        .stream
+        .write_all(b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n")
+        .unwrap();
+    let mut line = String::new();
+    silent.reader.read_line(&mut line).unwrap();
+    let offset = line
+        .trim_end()
+        .strip_prefix("+FULLRESYNC ")
+        .and_then(|rest| rest.split(' ').nth(1))
+        .unwrap_or_else(|| panic!("not a FULLRESYNC: {line:?}"))
+        .to_string();
+    // The payload, after any newlines the master sends while it prepares it.
+    let len = loop {
+        line.clear();
+        silent.reader.read_line(&mut line).unwrap();
+        if let Some(len) = line.trim_end().strip_prefix('$') {
+            break len.parse::<usize>().unwrap();
+        }
+    };
+    let mut payload = vec![0u8; len];
+    silent.reader.read_exact(&mut payload).unwrap();
+    let ack = format!(
+        "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n${}\r\n{offset}\r\n",
+        offset.len()
+    );
+    silent.stream.write_all(ack.as_bytes()).unwrap();
+    wait_until("both replicas online", Duration::from_secs(10), || {
+        repl_info(&mut master, "connected_slaves").as_deref() == Some("2")
+            && master
+                .cmds(&["INFO", "replication"])
+                .as_str()
+                .contains("port=7777,state=online")
+    });
+
+    assert!(master.cmds(&["CONFIG", "SET", "repl-timeout", "2"]).is_ok());
+    wait_until(
+        "the silent replica dropped",
+        Duration::from_secs(10),
+        || repl_info(&mut master, "connected_slaves").as_deref() == Some("1"),
+    );
+    // The one that is left is the live one, and it stays.
+    thread::sleep(Duration::from_secs(4));
+    assert_eq!(
+        repl_info(&mut master, "connected_slaves").as_deref(),
+        Some("1")
+    );
+    let slave0 = repl_info(&mut master, "slave0").unwrap();
+    assert!(
+        !slave0.contains("port=7777") && slave0.contains("state=online"),
+        "{slave0}"
+    );
+    // And the silent one's connection was closed.
+    let mut rest = Vec::new();
+    silent
+        .stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let closed = loop {
+        let mut buf = [0u8; 4096];
+        match silent.reader.read(&mut buf) {
+            Ok(0) => break true,
+            Ok(n) => rest.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => break true,
+            Err(_) => break false,
+        }
+    };
+    assert!(closed, "the silent replica's connection is still open");
+}

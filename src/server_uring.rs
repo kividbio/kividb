@@ -58,6 +58,7 @@ pub async fn handle_replica_connection_uring(
     // stream}. See `replication::begin_full_sync`.
     let (peer_ip, peer_port) =
         crate::replication::replica_client::replica_endpoint(&peer_addr, listening_port);
+    let endpoint = format!("{peer_ip}:{peer_port}");
     let registration = crate::replication::ReplicaRegistration {
         replica_id,
         addr: peer_addr.clone(),
@@ -237,6 +238,13 @@ pub async fn handle_replica_connection_uring(
     tokio::select! {
         _ = ack_reader => {}
         _ = forward_task => {}
+        // A replica that has gone silent: see `ReplState::replica_timed_out`.
+        _ = repl_state.replica_timed_out(replica_id) => {
+            log_warn!(
+                "Replication: disconnecting timedout replica {endpoint}: no REPLCONF ACK for {} s (repl-timeout)",
+                repl_state.repl_timeout().as_secs()
+            );
+        }
     }
 
     let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
