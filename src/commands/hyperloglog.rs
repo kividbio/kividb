@@ -3,6 +3,7 @@ use crate::commands::helpers::{delete_key_if_expired, expire_on_read, is_expired
 use crate::resp::write::*;
 use crate::store;
 use crate::store::Key;
+use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::types::SharedBytes;
 use crate::{read_lock, write_lock};
@@ -242,9 +243,9 @@ fn get_or_create_hll(ctx: &mut Ctx, key: &str) -> Result<Vec<u8>, Vec<u8>> {
     let shard = store::get_shard(db, key);
     let map = read_lock!(shard);
     match map.get(key) {
-        Some(KiviDBValue::String(b)) => {
-            if !is_hll(b) {
-                return Err(not_hll(b));
+        Some(ValueRef::String(b)) => {
+            if !is_hll(&b) {
+                return Err(not_hll(&b));
             }
             Ok(b.to_vec())
         }
@@ -274,9 +275,9 @@ fn get_hll_blob(ctx: &Ctx, key: &str) -> Result<Vec<u8>, Vec<u8>> {
     let shard = store::get_shard(db, key);
     let map = read_lock!(shard);
     match map.get(key) {
-        Some(KiviDBValue::String(b)) => {
-            if !is_hll(b) {
-                return Err(not_hll(b));
+        Some(ValueRef::String(b)) => {
+            if !is_hll(&b) {
+                return Err(not_hll(&b));
             }
             Ok(b.to_vec())
         }
@@ -363,11 +364,11 @@ fn cmd_pfcount(ctx: &mut Ctx) -> Vec<u8> {
 
         let counted = match map.get(key) {
             None => return resp_integer(0),
-            Some(KiviDBValue::String(b)) if is_hll(b) => match cached_count(b) {
+            Some(ValueRef::String(b)) if is_hll(&b) => match cached_count(&b) {
                 Some(count) => return resp_integer(count as i64),
-                None => (b.clone(), hll_count(&b[HLL_HEADER_SIZE..])),
+                None => (b.to_shared(), hll_count(&b[HLL_HEADER_SIZE..])),
             },
-            Some(KiviDBValue::String(b)) => return not_hll(b),
+            Some(ValueRef::String(b)) => return not_hll(&b),
             _ => {
                 return resp_error(
                     "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -382,12 +383,10 @@ fn cmd_pfcount(ctx: &mut Ctx) -> Vec<u8> {
         // their own cache, and the dataset digest leaves it out.
         let (counted_bytes, count) = counted;
         let mut map = write_lock!(shard);
-        if let Some(KiviDBValue::String(now)) = map.get_mut(key)
-            && SharedBytes::ptr_eq(now, &counted_bytes)
-        {
+        if matches!(map.get(key), Some(ValueRef::String(now)) if now.is(&counted_bytes)) {
             let mut blob = counted_bytes.to_vec();
             blob[8..16].copy_from_slice(&count.to_le_bytes());
-            *now = SharedBytes::from(blob.as_slice());
+            map.insert(key, KiviDBValue::String(SharedBytes::from(blob.as_slice())));
         }
         return resp_integer(count as i64);
     }
@@ -411,8 +410,8 @@ fn cmd_pfcount(ctx: &mut Ctx) -> Vec<u8> {
         let shard = store::get_shard(db, key);
         let map = read_lock!(shard);
 
-        if let Some(KiviDBValue::String(b)) = map.get(key)
-            && is_hll(b)
+        if let Some(ValueRef::String(b)) = map.get(key)
+            && is_hll(&b)
         {
             // Merge: take element-wise max of each register
             let src = &b[HLL_HEADER_SIZE..];
@@ -459,9 +458,9 @@ fn cmd_pfmerge(ctx: &mut Ctx) -> Vec<u8> {
         let shard = store::get_shard(db, key);
         let map = read_lock!(shard);
 
-        if let Some(KiviDBValue::String(b)) = map.get(key) {
-            if !is_hll(b) {
-                return not_hll(b);
+        if let Some(ValueRef::String(b)) = map.get(key) {
+            if !is_hll(&b) {
+                return not_hll(&b);
             }
             let src = &b[HLL_HEADER_SIZE..];
             let dst = &mut merged_blob[HLL_HEADER_SIZE..];

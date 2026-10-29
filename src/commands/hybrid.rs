@@ -19,6 +19,7 @@
 // over 2k lines. Hybrid is structurally distinct (two parallel rankings
 // then fusion) — co-locating it with FT.SEARCH would entangle the parsers.
 
+use crate::store::ValueRef;
 use ahash::AHashMap;
 
 use crate::commands::ctx::Ctx;
@@ -667,10 +668,14 @@ fn read_numeric_field(
     key: &str,
     field: &str,
 ) -> f64 {
-    let Some(value) = crate::store::get_shard(db, key).read().get(key).cloned() else {
+    let Some(value) = crate::store::get_shard(db, key)
+        .read()
+        .get(key)
+        .map(ValueRef::to_value)
+    else {
         return f64::NEG_INFINITY;
     };
-    let Some(inner) = crate::vector::doc_fields(&def.on, &def.fields, &value) else {
+    let Some(inner) = crate::vector::doc_fields(&def.on, &def.fields, value.view()) else {
         return f64::NEG_INFINITY;
     };
     // By the name the query knows the field by.
@@ -864,9 +869,9 @@ pub fn ft_hybrid(ctx: &mut Ctx) -> Option<Vec<u8>> {
             let value = crate::store::get_shard(db_ref, key)
                 .read()
                 .get(key.as_str())
-                .cloned();
+                .map(ValueRef::to_value);
             let inner = value.as_ref().and_then(|value| {
-                crate::vector::doc_fields(&def_clone.on, &def_clone.fields, value)
+                crate::vector::doc_fields(&def_clone.on, &def_clone.fields, value.view())
             });
             if let Some(inner) = inner {
                 // A field of a JSON document goes by the name the schema

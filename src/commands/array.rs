@@ -21,7 +21,7 @@ use crate::resp::write::{
     resp_null_for,
 };
 use crate::store;
-use crate::store::Key;
+use crate::store::ValueRef;
 use crate::types::{ARRAY_MAX_INDEX, ArrayInner, ArraySliceShape, KiviDBValue};
 use crate::{read_lock, write_lock};
 use std::sync::Arc;
@@ -181,7 +181,7 @@ fn with_array_read<T>(
     let map = read_lock!(shard);
     match map.get(key) {
         None => Ok(missing),
-        Some(KiviDBValue::Array(arc)) => Ok(f(&arc.read())),
+        Some(ValueRef::Array(arc)) => Ok(f(&arc.read())),
         Some(_) => Err(resp_error(ERR_WRONGTYPE)),
     }
 }
@@ -200,28 +200,24 @@ fn with_array_write<T>(
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
     let mut map = write_lock!(shard);
-    let entry = map.entry(Key::from(key)).or_insert_with(|| {
+    let arc = match map.get_or_insert_with(key, || {
         KiviDBValue::Array(Arc::new(parking_lot::RwLock::new(ArrayInner::new())))
-    });
-    match entry {
-        KiviDBValue::Array(arc) => {
-            let arc = Arc::clone(arc);
-            let (out, drop_key) = {
-                let mut inner = arc.write();
-                let out = f(&mut inner);
-                let drop_key =
-                    inner.is_empty() && inner.next_insert == 0 && inner.ring_size.is_none();
-                (out, drop_key)
-            };
-            if drop_key {
-                map.remove(key);
-            }
-            Ok(out)
-        }
-        // `or_insert_with` only fires when the key was absent, so reaching a
-        // non-Array here means the key already existed with another type.
-        _ => Err(resp_error(ERR_WRONGTYPE)),
+    }) {
+        ValueRef::Array(arc) => Arc::clone(arc),
+        // Made only when the key was absent, so anything but an array here
+        // means the key already existed with another type.
+        _ => return Err(resp_error(ERR_WRONGTYPE)),
+    };
+    let (out, drop_key) = {
+        let mut inner = arc.write();
+        let out = f(&mut inner);
+        let drop_key = inner.is_empty() && inner.next_insert == 0 && inner.ring_size.is_none();
+        (out, drop_key)
+    };
+    if drop_key {
+        map.remove(key);
     }
+    Ok(out)
 }
 
 /// Mutate the array at `key` only if it already exists — never creates it.
@@ -240,7 +236,7 @@ fn with_existing_array_write<T>(
     let mut map = write_lock!(shard);
     match map.get(key) {
         None => Ok(missing),
-        Some(KiviDBValue::Array(arc)) => {
+        Some(ValueRef::Array(arc)) => {
             let arc = Arc::clone(arc);
             let (out, drop_key) = {
                 let mut inner = arc.write();

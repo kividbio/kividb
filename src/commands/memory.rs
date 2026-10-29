@@ -3,7 +3,7 @@ use crate::commands::helpers::parse_utf8;
 use crate::read_lock;
 use crate::resp::write::*;
 use crate::store;
-use crate::types::KiviDBValue;
+use crate::store::ValueRef;
 
 pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
     if name != "MEMORY" {
@@ -114,9 +114,9 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
         // key and the value, as the allocator rounds it. Redis's suite
         // holds it to that (at least the three, at most twice them or 64),
         // which a share of the table's entries does not fit.
-        KiviDBValue::String(b) => size_class(16 + key.len() + 2 + b.len() + 2),
+        ValueRef::String(b) => size_class(16 + key.len() + 2 + b.len() + 2),
 
-        KiviDBValue::List(arc) => {
+        ValueRef::List(arc) => {
             let inner = arc.read();
             let len = inner.len();
             let avg = if len == 0 || samples == 0 {
@@ -135,7 +135,7 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             key_overhead + avg * len + 80
         }
 
-        KiviDBValue::Hash(arc) => {
+        ValueRef::Hash(arc) => {
             let inner = arc.read();
             let len = inner.len();
             let (avg_k, avg_v) = if len == 0 {
@@ -154,7 +154,7 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             key_overhead + (avg_k + avg_v) * len + 120
         }
 
-        KiviDBValue::Set(arc) => {
+        ValueRef::Set(arc) => {
             let inner = arc.read();
             let len = inner.len();
             let avg = if len == 0 {
@@ -173,7 +173,7 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             key_overhead + avg * len + 80
         }
 
-        KiviDBValue::SortedSet(arc) => {
+        ValueRef::SortedSet(arc) => {
             let inner = arc.read();
             let len = inner.members.len();
             let avg = if len == 0 {
@@ -194,7 +194,7 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             key_overhead + (avg + 8) * len * 2 + 120
         }
 
-        KiviDBValue::Stream(arc) => {
+        ValueRef::Stream(arc) => {
             let inner = arc.read();
             let len = inner.entries.len();
             let avg = if len == 0 {
@@ -219,18 +219,18 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             key_overhead + avg * len + 200
         }
 
-        KiviDBValue::Json(arc) => {
+        ValueRef::Json(arc) => {
             let s = arc.read().to_string();
             key_overhead + s.len() + 64
         }
 
-        KiviDBValue::TimeSeries(arc) => {
+        ValueRef::TimeSeries(arc) => {
             let inner = arc.read();
             // Each sample: 8 bytes timestamp + 8 bytes f64
             key_overhead + inner.samples.len() * 16 + 200
         }
 
-        KiviDBValue::VectorSet(arc) => {
+        ValueRef::VectorSet(arc) => {
             let inner = arc.read();
             // Each entry: dim * 4 bytes (f32) + attrs string
             let count = inner.entries.len();
@@ -238,7 +238,7 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             key_overhead + count * dim * 4 + 200
         }
 
-        KiviDBValue::Array(arc) => {
+        ValueRef::Array(arc) => {
             let inner = arc.read();
             let len = inner.entries.len();
             // Sample values the same way the other collection types do —
@@ -260,7 +260,7 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             // Per entry: 8-byte index key + value bytes + BTreeMap node share.
             key_overhead + len * (8 + avg + 32) + 100
         }
-        KiviDBValue::HashEx(arc) => {
+        ValueRef::HashEx(arc) => {
             let inner = arc.read();
             let len = inner.fields.len();
             let (avg_k, avg_v) = if len == 0 {

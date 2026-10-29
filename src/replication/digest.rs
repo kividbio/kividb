@@ -17,7 +17,7 @@
 // which keys are stored; members of hashes and sets, whose order also
 // differs from node to node, are summed the same way.
 
-use crate::types::KiviDBValue;
+use crate::store::ValueRef;
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
 /// Where a HyperLogLog keeps its cached cardinality, if `bytes` is one.
@@ -25,28 +25,28 @@ fn hll_cache(bytes: &[u8]) -> Option<std::ops::Range<usize>> {
     (bytes.len() == 16 + 12288 && bytes.starts_with(b"HYLL")).then_some(8..16)
 }
 
-fn value_digest(h: &mut Xxh3, value: &KiviDBValue) {
+fn value_digest(h: &mut Xxh3, value: crate::store::ValueRef<'_>) {
     match value {
-        KiviDBValue::String(bytes) => {
+        ValueRef::String(bytes) => {
             h.update(b"s");
-            match hll_cache(bytes) {
+            match hll_cache(&bytes) {
                 // A HyperLogLog's cached count is not part of its value:
                 // each node fills it in when it counts (#28).
                 Some(cache) => {
                     h.update(&bytes[..cache.start]);
                     h.update(&bytes[cache.end..]);
                 }
-                None => h.update(bytes),
+                None => h.update(&bytes),
             }
         }
-        KiviDBValue::List(list) => {
+        ValueRef::List(list) => {
             h.update(b"l");
             for item in list.read().iter() {
                 h.update(&(item.len() as u64).to_le_bytes());
                 h.update(item);
             }
         }
-        KiviDBValue::Hash(hash) => {
+        ValueRef::Hash(hash) => {
             h.update(b"h");
             let mut sum = 0u64;
             for (field, value) in hash.read().iter() {
@@ -58,7 +58,7 @@ fn value_digest(h: &mut Xxh3, value: &KiviDBValue) {
             }
             h.update(&sum.to_le_bytes());
         }
-        KiviDBValue::Set(set) => {
+        ValueRef::Set(set) => {
             h.update(b"S");
             let sum = set
                 .read()
@@ -66,7 +66,7 @@ fn value_digest(h: &mut Xxh3, value: &KiviDBValue) {
                 .fold(0u64, |sum, member| sum.wrapping_add(xxh3_64(member)));
             h.update(&sum.to_le_bytes());
         }
-        KiviDBValue::SortedSet(zset) => {
+        ValueRef::SortedSet(zset) => {
             h.update(b"z");
             for (score, member) in zset.read().by_score.keys() {
                 h.update(&score.to_bits().to_le_bytes());
@@ -162,6 +162,7 @@ pub fn dataset_digest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::KiviDBValue;
 
     #[test]
     fn the_fingerprint_follows_the_data_not_its_order() {
@@ -171,7 +172,7 @@ mod tests {
         let eb = crate::store::new_expiry_store(1);
         let set = |store: &crate::store::Store, k: &str, v: &str| {
             crate::write_lock!(crate::store::get_shard(&store[0], k)).insert(
-                k.into(),
+                k,
                 KiviDBValue::String(crate::types::SharedBytes::from(v.as_bytes())),
             );
         };
@@ -205,7 +206,7 @@ mod tests {
             KiviDBValue::String(crate::types::SharedBytes::from(blob.as_slice()))
         };
         let put = |store: &crate::store::Store, v: KiviDBValue| {
-            crate::write_lock!(crate::store::get_shard(&store[0], "h")).insert("h".into(), v);
+            crate::write_lock!(crate::store::get_shard(&store[0], "h")).insert("h", v);
         };
         put(&a, hll(0, 1));
         put(&b, hll(7, 1));

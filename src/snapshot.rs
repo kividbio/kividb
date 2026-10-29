@@ -1,5 +1,6 @@
 use crate::store;
 use crate::store::Key;
+use crate::store::ValueRef;
 use crate::types::SharedBytes;
 use crate::types::{
     ConsumerGroup, KiviDBValue, PelEntry, SortedSetInner, StreamEntry, StreamId, StreamInner,
@@ -394,17 +395,21 @@ pub fn write_kdb_db_end(w: &mut impl Write) -> io::Result<()> {
 }
 
 /// One key/value pair — the key, a type tag, then the value's own encoding.
-pub fn write_kdb_entry(w: &mut impl Write, key: &str, value: &KiviDBValue) -> io::Result<()> {
+pub fn write_kdb_entry(
+    w: &mut impl Write,
+    key: &str,
+    value: crate::store::ValueRef<'_>,
+) -> io::Result<()> {
     // Write key first (shared by all types)
     write_bytes(w, key.as_bytes())?;
 
     match value {
-        KiviDBValue::String(bytes) => {
+        ValueRef::String(bytes) => {
             w.write_all(&[TAG_STRING])?;
-            write_bytes(w, bytes)?;
+            write_bytes(w, &bytes)?;
         }
 
-        KiviDBValue::List(arc) => {
+        ValueRef::List(arc) => {
             w.write_all(&[TAG_LIST])?;
             let inner = arc.read();
             // u32 element count
@@ -414,7 +419,7 @@ pub fn write_kdb_entry(w: &mut impl Write, key: &str, value: &KiviDBValue) -> io
             }
         }
 
-        KiviDBValue::Hash(arc) => {
+        ValueRef::Hash(arc) => {
             w.write_all(&[TAG_HASH])?;
             let inner = arc.read();
             w.write_all(&(inner.len() as u32).to_le_bytes())?;
@@ -424,7 +429,7 @@ pub fn write_kdb_entry(w: &mut impl Write, key: &str, value: &KiviDBValue) -> io
             }
         }
 
-        KiviDBValue::Set(arc) => {
+        ValueRef::Set(arc) => {
             w.write_all(&[TAG_SET])?;
             let inner = arc.read();
             w.write_all(&(inner.len() as u32).to_le_bytes())?;
@@ -433,7 +438,7 @@ pub fn write_kdb_entry(w: &mut impl Write, key: &str, value: &KiviDBValue) -> io
             }
         }
 
-        KiviDBValue::SortedSet(arc) => {
+        ValueRef::SortedSet(arc) => {
             w.write_all(&[TAG_SORTEDSET])?;
             let inner = arc.read();
             // Iterate by_score so order is preserved on reload (nice-to-have)
@@ -444,11 +449,11 @@ pub fn write_kdb_entry(w: &mut impl Write, key: &str, value: &KiviDBValue) -> io
             }
         }
 
-        KiviDBValue::Stream(arc) => {
+        ValueRef::Stream(arc) => {
             write_stream_value(w, &arc.read())?;
         }
 
-        KiviDBValue::Json(arc) => {
+        ValueRef::Json(arc) => {
             w.write_all(&[TAG_JSON])?;
             let inner = arc.read();
             // serde_json::to_vec is the fastest compact serialiser you already depend on
@@ -456,7 +461,7 @@ pub fn write_kdb_entry(w: &mut impl Write, key: &str, value: &KiviDBValue) -> io
             write_bytes(w, &json_bytes)?;
         }
 
-        KiviDBValue::TimeSeries(arc) => {
+        ValueRef::TimeSeries(arc) => {
             let inner = arc.read();
             // The duplicate policy and the compaction rules were not saved at
             // all: after a restart (or on a replica, after a full sync) every
@@ -503,7 +508,7 @@ pub fn write_kdb_entry(w: &mut impl Write, key: &str, value: &KiviDBValue) -> io
             }
         }
 
-        KiviDBValue::VectorSet(arc) => {
+        ValueRef::VectorSet(arc) => {
             w.write_all(&[TAG_VECTORSET])?;
             let inner = arc.read();
             w.write_all(&(inner.dim as u32).to_le_bytes())?;
@@ -542,7 +547,7 @@ pub fn write_kdb_entry(w: &mut impl Write, key: &str, value: &KiviDBValue) -> io
             }
         }
 
-        KiviDBValue::HashEx(arc) => {
+        ValueRef::HashEx(arc) => {
             w.write_all(&[TAG_HASH_EX])?;
             let inner = arc.read();
             w.write_all(&(inner.fields.len() as u32).to_le_bytes())?;
@@ -568,7 +573,7 @@ pub fn write_kdb_entry(w: &mut impl Write, key: &str, value: &KiviDBValue) -> io
             }
         }
 
-        KiviDBValue::Array(arc) => {
+        ValueRef::Array(arc) => {
             w.write_all(&[TAG_ARRAY])?;
             let inner = arc.read();
             // Sparse: (index, value) pairs, not a dense run — an array
@@ -729,7 +734,7 @@ pub fn write_kdb_image(
     write_kdb_header(w, maps.len() as u32)?;
     for map in maps {
         for (k, v) in map {
-            write_kdb_entry(w, k, v)?;
+            write_kdb_entry(w, k, v.view())?;
         }
         write_kdb_db_end(w)?;
     }
@@ -3765,8 +3770,8 @@ fn freeze(
                             strings.reserve(map.len());
                             for (key, value) in map.iter() {
                                 match value {
-                                    KiviDBValue::String(bytes) => {
-                                        strings.push((key.clone(), bytes.clone()));
+                                    ValueRef::String(bytes) => {
+                                        strings.push((Key::from(key), bytes.to_shared()));
                                     }
                                     other => write_kdb_entry(&mut encoded, key, other)?,
                                 }
@@ -3944,7 +3949,7 @@ pub fn dump_payload(value: &KiviDBValue) -> io::Result<Vec<u8>> {
     if serialize_value(value, &mut out).is_err() {
         out.clear();
         write_kdb_header(&mut out, 1)?;
-        write_kdb_entry(&mut out, DUMP_IMAGE_KEY, value)?;
+        write_kdb_entry(&mut out, DUMP_IMAGE_KEY, value.view())?;
         write_kdb_db_end(&mut out)?;
     }
     let crc = crc64_digest(&out);
@@ -4584,7 +4589,7 @@ mod expiry_section_tests {
         write_kdb_header(&mut out, maps.len() as u32).unwrap();
         for map in maps {
             for (k, v) in map {
-                write_kdb_entry(&mut out, k, v).unwrap();
+                write_kdb_entry(&mut out, k, v.view()).unwrap();
             }
             write_kdb_db_end(&mut out).unwrap();
         }
@@ -4876,7 +4881,7 @@ mod function_section_tests {
         write_kdb_entry(
             &mut out,
             "k",
-            &KiviDBValue::String(SharedBytes::from(&b"v"[..])),
+            KiviDBValue::String(SharedBytes::from(&b"v"[..])).view(),
         )
         .unwrap();
         write_kdb_db_end(&mut out).unwrap();

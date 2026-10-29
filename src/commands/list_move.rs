@@ -15,6 +15,7 @@ use crate::keyspace_events::{KS_GENERIC, KS_LIST, notify};
 use crate::resp::write::*;
 use crate::store;
 use crate::store::Key;
+use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::{read_lock, write_lock};
 use parking_lot::RwLock;
@@ -160,7 +161,7 @@ fn list_at(ctx: &Ctx, key: &str) -> Result<Option<List>, Vec<u8>> {
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     match read_lock!(shard).get(key) {
         None => Ok(None),
-        Some(KiviDBValue::List(l)) => Ok(Some(Arc::clone(l))),
+        Some(ValueRef::List(l)) => Ok(Some(Arc::clone(l))),
         Some(_) => Err(resp_error(WRONGTYPE)),
     }
 }
@@ -233,7 +234,7 @@ pub(super) fn move_elements(
                 map.insert(Key::from(dst), KiviDBValue::List(Arc::clone(&l)));
                 l
             }
-            Some(KiviDBValue::List(l)) => Arc::clone(l),
+            Some(ValueRef::List(l)) => Arc::clone(l),
             Some(_) => {
                 // The destination changed type after we checked it. Put the
                 // elements back where they came from rather than lose them.
@@ -260,7 +261,7 @@ pub(super) fn move_elements(
         let mut map = write_lock!(shard);
         let still_empty = matches!(
             map.get(src),
-            Some(KiviDBValue::List(l)) if Arc::ptr_eq(l, &src_list) && l.read().is_empty()
+            Some(ValueRef::List(l)) if Arc::ptr_eq(l, &src_list) && l.read().is_empty()
         );
         if still_empty {
             map.remove(src);

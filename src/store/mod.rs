@@ -7,7 +7,8 @@ use parking_lot::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::available_parallelism;
 
-use crate::types::KiviDBValue;
+mod shard_map;
+pub use shard_map::{Relocated, ShardMap, ValueRef};
 
 /// Which shard `key` is in, of `shards` (a power of two). The keyspace and
 /// the expiry store have the same number, so one index serves both: a
@@ -145,10 +146,8 @@ const SHRINK_MIN_CAPACITY: usize = 256;
 /// go back and forth unless its keys do, by more than an eighth. The rehash
 /// holds the shard's lock no longer than the growth it undoes did. Returns
 /// whether it shrank.
-pub fn shrink_if_sparse<V>(map: &RwLock<AHashMap<Key, V>>) -> bool {
-    let sparse = |m: &AHashMap<Key, V>| {
-        m.capacity() >= SHRINK_MIN_CAPACITY && m.len() * 9 <= m.capacity() * 4
-    };
+pub fn shrink_if_sparse<M: Sizes>(map: &RwLock<M>) -> bool {
+    let sparse = |m: &M| m.capacity() >= SHRINK_MIN_CAPACITY && m.len() * 9 <= m.capacity() * 4;
     if !sparse(&map.read()) {
         return false;
     }
@@ -159,6 +158,46 @@ pub fn shrink_if_sparse<V>(map: &RwLock<AHashMap<Key, V>>) -> bool {
     let keep = m.len() + m.len() / 8;
     m.shrink_to(keep);
     true
+}
+
+/// What [`shrink_if_sparse`] and a flush need of a table: the keyspace's
+/// and the expiry store's are different types.
+#[allow(clippy::len_without_is_empty)]
+pub trait Sizes: Default {
+    fn len(&self) -> usize;
+    fn capacity(&self) -> usize;
+    fn shrink_to(&mut self, keys: usize);
+    fn clear(&mut self);
+}
+
+impl<V> Sizes for AHashMap<Key, V> {
+    fn len(&self) -> usize {
+        (**self).len()
+    }
+    fn capacity(&self) -> usize {
+        (**self).capacity()
+    }
+    fn shrink_to(&mut self, keys: usize) {
+        (**self).shrink_to(keys)
+    }
+    fn clear(&mut self) {
+        (**self).clear()
+    }
+}
+
+impl Sizes for ShardMap {
+    fn len(&self) -> usize {
+        ShardMap::len(self)
+    }
+    fn capacity(&self) -> usize {
+        ShardMap::capacity(self)
+    }
+    fn shrink_to(&mut self, keys: usize) {
+        ShardMap::shrink_to(self, keys)
+    }
+    fn clear(&mut self) {
+        ShardMap::clear(self)
+    }
 }
 
 impl Default for ExpiryCell {
@@ -181,7 +220,7 @@ pub type ExpiryStore = Arc<Vec<ExpiryDb>>;
 /// the same size as a `String` was, so the table is no larger.
 pub type Key = compact_str::CompactString;
 
-pub type Shard = Arc<RwLock<AHashMap<Key, KiviDBValue>>>;
+pub type Shard = Arc<RwLock<ShardMap>>;
 pub type Db = Arc<Vec<Shard>>;
 pub type Store = Arc<Vec<Db>>;
 
@@ -201,7 +240,7 @@ pub fn new_store(dbs: usize) -> Store {
     let dbs = (0..dbs)
         .map(|_| {
             let shards = (0..num_shards)
-                .map(|_| Arc::new(RwLock::new(AHashMap::new())))
+                .map(|_| Arc::new(RwLock::new(ShardMap::new())))
                 .collect::<Vec<_>>();
             Arc::new(shards)
         })
@@ -283,11 +322,11 @@ impl Flushed {
 
 /// Empty one shard, releasing its table when the table is large enough to be
 /// worth releasing. See [`SHARD_RELEASE_MIN_CAPACITY`].
-fn clear_shard_map<K, V>(map: &mut AHashMap<K, V>) -> Flushed {
+fn clear_shard_map<M: Sizes>(map: &mut M) -> Flushed {
     let entries = map.len();
     let capacity = map.capacity();
     if capacity >= SHARD_RELEASE_MIN_CAPACITY {
-        *map = AHashMap::new();
+        *map = M::default();
         Flushed {
             entries,
             slots_released: capacity,
@@ -315,7 +354,7 @@ pub fn clear_db(db: &Db) -> Flushed {
 /// The values of one database, taken out of it to be freed elsewhere: what
 /// `FLUSHDB ASYNC` and `FLUSHALL ASYNC` hand to the lazyfree thread. A shard
 /// keeps a small table, as [`clear_shard_map`] does.
-pub fn take_db(db: &Db) -> (Vec<AHashMap<Key, KiviDBValue>>, Flushed) {
+pub fn take_db(db: &Db) -> (Vec<ShardMap>, Flushed) {
     let mut taken = Vec::with_capacity(db.len());
     let mut total = Flushed::default();
     for shard in db.iter() {
@@ -326,7 +365,7 @@ pub fn take_db(db: &Db) -> (Vec<AHashMap<Key, KiviDBValue>>, Flushed) {
             total.slots_released += capacity;
             std::mem::take(&mut *map)
         } else {
-            std::mem::replace(&mut *map, AHashMap::with_capacity(capacity))
+            std::mem::replace(&mut *map, ShardMap::with_capacity(capacity))
         });
     }
     total.keys = total.entries;
@@ -372,7 +411,7 @@ pub fn rebuild_ts_label_index(store: &Store, ts: &SharedTsIndex) {
     for db in store.iter() {
         for shard in db.iter() {
             for (key, value) in shard.read().iter() {
-                if let KiviDBValue::TimeSeries(series) = value {
+                if let ValueRef::TimeSeries(series) = value {
                     for (label, label_value) in series.read().labels.iter() {
                         index
                             .entry(format!("{label}={label_value}"))
@@ -435,7 +474,7 @@ mod flush_tests {
             let key = format!("flush-key-{i:012}");
             get_shard(&store[db_index], &key)
                 .write()
-                .insert(key.into(), val());
+                .insert(key.as_str(), val());
         }
     }
 
@@ -586,7 +625,7 @@ mod staging_swap_tests {
         let staging = new_store(1);
         let k = "swap-key";
         let val = KiviDBValue::String(crate::types::SharedBytes::from(&b"from-staging"[..]));
-        get_shard(&staging[0], k).write().insert(k.into(), val);
+        get_shard(&staging[0], k).write().insert(k, val);
         assert!(get_shard(&live[0], k).read().get(k).is_none());
         swap_kv_with_staging(&live, &staging);
         match get_shard(&live[0], k)
@@ -594,7 +633,7 @@ mod staging_swap_tests {
             .get(k)
             .expect("key on live after swap")
         {
-            KiviDBValue::String(b) => assert_eq!(&b[..], b"from-staging"),
+            ValueRef::String(b) => assert_eq!(&b[..], b"from-staging"),
             _ => panic!("expected string value"),
         }
     }

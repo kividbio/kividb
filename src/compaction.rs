@@ -23,13 +23,13 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::store::{Key, Shard, Store};
-use crate::types::KiviDBValue;
+use crate::store::{Key, Relocated, Shard, Store, ValueRef};
 use crate::value_slab;
 
-/// Entries looked at under one hold of a shard's read lock, and the most
-/// values moved under one hold of its write lock.
-const BATCH: usize = 256;
+/// Buckets looked at under one hold of a shard's read lock (about half as
+/// many entries), and so at most that many values moved under one hold of
+/// its write lock.
+const BATCH: usize = 512;
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
 static IGNORE_BYTES: AtomicU64 = AtomicU64::new(64 << 20);
@@ -158,26 +158,29 @@ fn compact(store: &Store) {
 }
 
 /// Move the values of `shard` that are in slabs being emptied, [`BATCH`]
-/// entries at a time.
+/// buckets at a time.
 fn compact_shard(shard: &Shard, regions: &[usize]) {
+    // A bucket index: entries keep their buckets while others come and go;
+    // only a resize moves them, and then some are looked at twice or missed
+    // until the next set, which is harmless. Where walking past the first
+    // `at` entries again on every batch cost the whole shard each time.
     let mut at = 0usize;
     loop {
         let started = Instant::now();
-        let mut looked = 0usize;
+        let looked;
+        let buckets;
         let moving: Vec<Key> = {
             let map = shard.read();
-            // Entries keep their places in the table while others come and
-            // go; only a resize moves them, and then some are looked at twice
-            // or missed until the next set, which is harmless.
-            map.iter()
-                .skip(at)
-                .take(BATCH)
-                .inspect(|_| looked += 1)
+            buckets = map.buckets();
+            let end = (at + BATCH).min(buckets);
+            looked = end.saturating_sub(at);
+            (at..end)
+                .filter_map(|index| map.bucket(index))
                 .filter(|(_, value)| {
-                    matches!(value, KiviDBValue::String(bytes)
+                    matches!(value, ValueRef::String(bytes)
                         if value_slab::is_evacuating(bytes.block(), regions))
                 })
-                .map(|(key, _)| key.clone())
+                .map(|(key, _)| Key::from(key))
                 .collect()
         };
         at += looked;
@@ -186,13 +189,12 @@ fn compact_shard(shard: &Shard, regions: &[usize]) {
             {
                 let mut map = shard.write();
                 for key in &moving {
-                    if let Some(KiviDBValue::String(bytes)) = map.get_mut(key.as_str()) {
-                        match bytes.relocate(regions) {
-                            Some(was) => old.push(was),
-                            None => {
-                                MISSES.fetch_add(1, Ordering::Relaxed);
-                            }
+                    match map.relocate_string(key, regions) {
+                        Relocated::Moved(was) => old.push(was),
+                        Relocated::Held => {
+                            MISSES.fetch_add(1, Ordering::Relaxed);
                         }
+                        Relocated::Stays => {}
                     }
                 }
             }
@@ -202,7 +204,7 @@ fn compact_shard(shard: &Shard, regions: &[usize]) {
             drop(old);
         }
         rest(started.elapsed());
-        if looked < BATCH {
+        if at >= buckets {
             return;
         }
     }

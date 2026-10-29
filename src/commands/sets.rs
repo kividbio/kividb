@@ -4,6 +4,7 @@ use crate::keyspace_events::{KS_SET, notify};
 use crate::resp::write::*;
 use crate::store;
 use crate::store::Key;
+use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::{read_lock, write_lock};
 use ahash::AHashSet;
@@ -35,7 +36,7 @@ fn get_or_create_set(ctx: &Ctx, key: &str) -> Result<Set, Vec<u8>> {
     // reading, which other readers of the shard do not wait for. It was
     // always taken for writing, in case the set had to be made.
     match read_lock!(shard).get(key) {
-        Some(KiviDBValue::Set(s)) => return Ok(Arc::clone(s)),
+        Some(ValueRef::Set(s)) => return Ok(Arc::clone(s)),
         Some(_) => {
             return Err(resp_error(
                 "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -52,7 +53,7 @@ fn get_or_create_set(ctx: &Ctx, key: &str) -> Result<Set, Vec<u8>> {
             map.insert(Key::from(key), KiviDBValue::Set(Arc::clone(&s)));
             Ok(s)
         }
-        Some(KiviDBValue::Set(s)) => Ok(Arc::clone(s)),
+        Some(ValueRef::Set(s)) => Ok(Arc::clone(s)),
         Some(_) => Err(resp_error(
             "WRONGTYPE Operation against a key holding the wrong kind of value",
         )),
@@ -78,7 +79,7 @@ fn load_set(ctx: &Ctx, key: &str) -> Option<crate::member_set::MemberSet> {
 
     match map.get(key) {
         None => Some(crate::member_set::MemberSet::new()),
-        Some(KiviDBValue::Set(s)) => Some(s.read().clone()),
+        Some(ValueRef::Set(s)) => Some(s.read().clone()),
         Some(_) => None,
     }
 }
@@ -225,7 +226,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             match map.get(key) {
                 None => Some(resp_integer(0)),
-                Some(KiviDBValue::Set(s)) => Some(resp_integer(s.read().len() as i64)),
+                Some(ValueRef::Set(s)) => Some(resp_integer(s.read().len() as i64)),
                 Some(_) => Some(resp_error(
                     "WRONGTYPE Operation against a key holding the wrong kind of value",
                 )),
@@ -253,7 +254,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     crate::stats::record_miss();
                     Some(resp_integer(0))
                 }
-                Some(KiviDBValue::Set(s)) => {
+                Some(ValueRef::Set(s)) => {
                     let inner = s.read();
                     let found = inner.contains(member);
                     if found {
@@ -295,7 +296,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let zeros = vec![resp_integer(0); cmd.len() - 2];
                     Some(resp_array(zeros))
                 }
-                Some(KiviDBValue::Set(s)) => {
+                Some(ValueRef::Set(s)) => {
                     let inner = s.read();
                     let results: Vec<Vec<u8>> = cmd[2..]
                         .iter()
@@ -334,7 +335,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     // (`shared.emptyset[c->resp]`), not an empty array.
                     Some(resp_set_for(reply_resp(ctx), vec![]))
                 }
-                Some(KiviDBValue::Set(s)) => {
+                Some(ValueRef::Set(s)) => {
                     let inner = s.read();
                     let mut buf = Vec::with_capacity(16 + inner.len() * 24);
                     // RESP3 has a real set type (`~`); RESP2 only has arrays.
@@ -378,7 +379,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     crate::stats::record_miss();
                     Some(resp_integer(0))
                 }
-                Some(KiviDBValue::Set(s)) => {
+                Some(ValueRef::Set(s)) => {
                     let mut inner = s.write();
                     let mut removed = 0i64;
                     for m in cmd.iter().skip(2) {
@@ -437,7 +438,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     // With a count, a missing key is an empty set under RESP3.
                     Some(_) => Some(resp_set_for(resp, vec![])),
                 },
-                Some(KiviDBValue::Set(s)) => {
+                Some(ValueRef::Set(s)) => {
                     let mut inner = s.write();
                     // Which members go is random, as the command's name
                     // says, and each is found without looking at the rest:
@@ -515,7 +516,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     }
                     Some(_) => Some(resp_array(vec![])),
                 },
-                Some(KiviDBValue::Set(s)) => {
+                Some(ValueRef::Set(s)) => {
                     let inner = s.read(); // read-only — no removal
                     let mut rng = rand::thread_rng();
                     crate::stats::record_hit();
@@ -581,11 +582,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let source = match read_lock!(store::get_shard(db_ref, &src_key)).get(src_key.as_str())
             {
                 None => None,
-                Some(KiviDBValue::Set(s)) => Some(Arc::clone(s)),
+                Some(ValueRef::Set(s)) => Some(Arc::clone(s)),
                 Some(_) => return Some(resp_error(WRONGTYPE)),
             };
             match read_lock!(store::get_shard(db_ref, &dst_key)).get(dst_key.as_str()) {
-                None | Some(KiviDBValue::Set(_)) => {}
+                None | Some(ValueRef::Set(_)) => {}
                 Some(_) => return Some(resp_error(WRONGTYPE)),
             }
             let Some(source) = source else {
@@ -605,7 +606,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let shard = store::get_shard(db_ref, &dst_key);
                 let mut map = write_lock!(shard);
                 match map.get(dst_key.as_str()) {
-                    Some(KiviDBValue::Set(s)) => s.write().insert(Arc::clone(&member)),
+                    Some(ValueRef::Set(s)) => s.write().insert(Arc::clone(&member)),
                     _ => {
                         let mut new_set = crate::member_set::MemberSet::new();
                         new_set.insert(Arc::clone(&member));
@@ -820,7 +821,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     crate::stats::record_miss();
                     Some(resp_array(vec![resp_bulk_str("0"), resp_array(vec![])]))
                 }
-                Some(value @ KiviDBValue::Set(s)) => {
+                Some(value @ ValueRef::Set(s)) => {
                     // A set Redis would encode compactly comes back whole.
                     let (cursor, count) = if crate::commands::generics::scans_whole(value) {
                         (0, usize::MAX)

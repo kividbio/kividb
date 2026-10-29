@@ -17,12 +17,12 @@
 // Replicas are not told. A field's TTL travels to them as the moment it
 // expires (`HPEXPIREAT`), and each runs this same sweep.
 
+use crate::store::ValueRef;
 use ahash::AHashMap;
 use parking_lot::Mutex;
 use std::time::Instant;
 
 use crate::store::{ExpiryStore, Store};
-use crate::types::KiviDBValue;
 use crate::vector::IndexStore;
 
 /// A hash with field TTLs: which server's store it is in, which database,
@@ -56,7 +56,7 @@ pub fn track_key(store: &Store, db: usize, key: &str) {
         return;
     };
     let earliest = match crate::store::get_shard(db_ref, key).read().get(key) {
-        Some(KiviDBValue::HashEx(hash)) => hash.read().expiries.values().min().copied(),
+        Some(ValueRef::HashEx(hash)) => hash.read().expiries.values().min().copied(),
         _ => None,
     };
     if let Some(at) = earliest {
@@ -73,7 +73,7 @@ pub fn rescan(store: &Store) {
                 .read()
                 .iter()
                 .filter_map(|(key, value)| match value {
-                    KiviDBValue::HashEx(hash) => hash
+                    ValueRef::HashEx(hash) => hash
                         .read()
                         .expiries
                         .values()
@@ -121,7 +121,7 @@ pub fn sweep(store: &Store, expiry_store: &ExpiryStore, index_store: &IndexStore
                 .read()
                 .get(key.as_str())
             {
-                Some(KiviDBValue::HashEx(hash)) => Some(std::sync::Arc::clone(hash)),
+                Some(ValueRef::HashEx(hash)) => Some(std::sync::Arc::clone(hash)),
                 _ => None,
             };
             if let Some(hash) = hash {
@@ -148,7 +148,7 @@ pub fn sweep(store: &Store, expiry_store: &ExpiryStore, index_store: &IndexStore
                 let mut map = crate::store::get_shard(db_ref, &key).write();
                 let still_empty = matches!(
                     map.get(key.as_str()),
-                    Some(KiviDBValue::HashEx(hash)) if hash.read().fields.is_empty()
+                    Some(ValueRef::HashEx(hash)) if hash.read().fields.is_empty()
                 );
                 still_empty && map.remove(key.as_str()).is_some()
             };
@@ -224,7 +224,7 @@ fn watched_in(store: &Store) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::HashInner;
+    use crate::types::{HashInner, KiviDBValue};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -243,7 +243,7 @@ mod tests {
 
     fn fields_of(store: &Store, key: &str) -> Option<Vec<String>> {
         match crate::store::get_shard(&store[0], key).read().get(key) {
-            Some(KiviDBValue::HashEx(hash)) => {
+            Some(ValueRef::HashEx(hash)) => {
                 let mut names: Vec<String> = hash.read().fields.keys().cloned().collect();
                 names.sort();
                 Some(names)
@@ -260,7 +260,7 @@ mod tests {
         let put = |key: &str, value: KiviDBValue| {
             crate::store::get_shard(&store[0], key)
                 .write()
-                .insert(key.into(), value);
+                .insert(key, value);
             track_key(&store, 0, key);
         };
         let soon = Some(Duration::from_millis(30));
@@ -288,7 +288,7 @@ mod tests {
         crate::store::get_shard(&store[0], "replaced")
             .write()
             .insert(
-                "replaced".into(),
+                "replaced",
                 KiviDBValue::String(crate::types::SharedBytes::from(&b"x"[..])),
             );
         std::thread::sleep(Duration::from_millis(60));

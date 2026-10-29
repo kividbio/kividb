@@ -3,6 +3,7 @@
 // FT.CREATE's schema, FT.INFO, and FT.SEARCH: the arguments, running a parsed
 // query (`vector::filter`) against an index, and the reply.
 
+use crate::store::ValueRef;
 use ahash::{AHashMap, AHashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -399,8 +400,8 @@ fn count_docs(db: &Db, def: &IndexDef, cluster: Option<&crate::cluster::ClusterS
                 .read()
                 .iter()
                 .filter(|(key, value)| {
-                    crate::vector::is_document(&def.on, value)
-                        && covers(def, key.as_str())
+                    crate::vector::is_document(&def.on, *value)
+                        && covers(def, key)
                         && cluster.is_none_or(|c| crate::cluster::search::serves(c, key))
                 })
                 .count()
@@ -908,7 +909,10 @@ fn with_doc<R>(
     f: impl FnOnce(&Fields, Option<&serde_json::Value>) -> R,
 ) -> Option<R> {
     // Out of the shard, so that its lock is not held while `f` runs.
-    let value = crate::store::get_shard(db, key).read().get(key).cloned()?;
+    let value = crate::store::get_shard(db, key)
+        .read()
+        .get(key)
+        .map(ValueRef::to_value)?;
     match (&def.on, &value) {
         (IndexOn::Hash, KiviDBValue::Hash(hash)) => Some(f(&hash.read(), None)),
         (IndexOn::Hash, KiviDBValue::HashEx(hash)) => Some(f(&hash.read().fields, None)),

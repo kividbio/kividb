@@ -1414,14 +1414,14 @@ fn backfill_new_vector_fields(ctx: &Ctx, index_name: &str, new_field_names: &[St
             // HashEx: sweep expired fields first, then clone the survivors.
             // Hash: clone directly. The clone is a shallow Arc clone per value.
             let fields: crate::types::HashFields = match value {
-                crate::types::KiviDBValue::Json(doc)
+                crate::store::ValueRef::Json(doc)
                     if matches!(doc_on, crate::vector::IndexOn::Json) =>
                 {
                     crate::vector::project_json(&doc_schema, &doc.read())
                 }
                 _ if matches!(doc_on, crate::vector::IndexOn::Json) => continue,
-                crate::types::KiviDBValue::Hash(h) => h.read().clone(),
-                crate::types::KiviDBValue::HashEx(h) => {
+                crate::store::ValueRef::Hash(h) => h.read().clone(),
+                crate::store::ValueRef::HashEx(h) => {
                     let mut w = h.write();
                     w.sweep_expired();
                     drop(w);

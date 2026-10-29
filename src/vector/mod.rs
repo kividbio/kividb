@@ -1,4 +1,5 @@
 pub mod filter;
+use crate::store::ValueRef;
 use ahash::{AHashMap, AHashSet};
 use parking_lot::RwLock;
 use rand::Rng;
@@ -1466,12 +1467,12 @@ impl std::ops::Deref for DocFields<'_> {
 }
 
 /// Whether `value` is the kind of document an index `ON on` covers.
-pub fn is_document(on: &IndexOn, value: &crate::types::KiviDBValue) -> bool {
+pub fn is_document(on: &IndexOn, value: crate::store::ValueRef<'_>) -> bool {
     matches!(
         (on, value),
-        (IndexOn::Hash, crate::types::KiviDBValue::Hash(_))
-            | (IndexOn::Hash, crate::types::KiviDBValue::HashEx(_))
-            | (IndexOn::Json, crate::types::KiviDBValue::Json(_))
+        (IndexOn::Hash, crate::store::ValueRef::Hash(_))
+            | (IndexOn::Hash, crate::store::ValueRef::HashEx(_))
+            | (IndexOn::Json, crate::store::ValueRef::Json(_))
     )
 }
 
@@ -1480,18 +1481,16 @@ pub fn is_document(on: &IndexOn, value: &crate::types::KiviDBValue) -> bool {
 pub fn doc_fields<'a>(
     on: &IndexOn,
     schema: &[SchemaField],
-    value: &'a crate::types::KiviDBValue,
+    value: crate::store::ValueRef<'a>,
 ) -> Option<DocFields<'a>> {
     match (on, value) {
-        (IndexOn::Hash, crate::types::KiviDBValue::Hash(hash)) => {
-            Some(DocFields::Hash(hash.read()))
-        }
+        (IndexOn::Hash, crate::store::ValueRef::Hash(hash)) => Some(DocFields::Hash(hash.read())),
         // A hash is no less a document for one of its fields having a TTL:
         // it used to drop out of every query the moment one was given one.
-        (IndexOn::Hash, crate::types::KiviDBValue::HashEx(hash)) => {
+        (IndexOn::Hash, crate::store::ValueRef::HashEx(hash)) => {
             Some(DocFields::HashEx(hash.read()))
         }
-        (IndexOn::Json, crate::types::KiviDBValue::Json(doc)) => {
+        (IndexOn::Json, crate::store::ValueRef::Json(doc)) => {
             Some(DocFields::Json(project_json(schema, &doc.read())))
         }
         _ => None,
@@ -1651,7 +1650,10 @@ pub fn reindex_hash_key(index_store: &IndexStore, db: &crate::store::Db, key: &s
     {
         return;
     }
-    let value = crate::store::get_shard(db, key).read().get(key).cloned();
+    let value = crate::store::get_shard(db, key)
+        .read()
+        .get(key)
+        .map(ValueRef::to_value);
     let pairs: Vec<(String, Arc<[u8]>)> = match value {
         Some(crate::types::KiviDBValue::Hash(hash)) => hash
             .read()
@@ -1672,7 +1674,10 @@ pub fn reindex_json_key(index_store: &IndexStore, db: &crate::store::Db, key: &s
     {
         return;
     }
-    let value = crate::store::get_shard(db, key).read().get(key).cloned();
+    let value = crate::store::get_shard(db, key)
+        .read()
+        .get(key)
+        .map(ValueRef::to_value);
     if let Some(crate::types::KiviDBValue::Json(doc)) = value {
         maybe_index_json(index_store, key, &doc.read());
     }
@@ -2672,7 +2677,7 @@ pub fn compact_hnsw(
             for (key, value) in map.iter() {
                 let matches =
                     prefixes.is_empty() || prefixes.iter().any(|p| key.starts_with(p.as_str()));
-                if !matches || already.contains(key.as_str()) {
+                if !matches || already.contains(key) {
                     continue;
                 }
                 let Some(inner) = doc_fields(&doc_on, &doc_schema, value) else {

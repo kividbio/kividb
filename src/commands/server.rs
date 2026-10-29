@@ -3020,12 +3020,12 @@ fn keysizes(db: usize, shards: &crate::store::Db) -> String {
     for shard in shards.iter() {
         for value in read_lock!(shard).values() {
             let (kind, len) = match value {
-                crate::types::KiviDBValue::String(b) => (0, b.len()),
-                crate::types::KiviDBValue::List(l) => (1, l.read().len()),
-                crate::types::KiviDBValue::Set(s) => (2, s.read().len()),
-                crate::types::KiviDBValue::SortedSet(z) => (3, z.read().len()),
-                crate::types::KiviDBValue::Hash(h) => (4, h.read().len()),
-                crate::types::KiviDBValue::HashEx(h) => (4, h.read().len()),
+                crate::store::ValueRef::String(b) => (0, b.len()),
+                crate::store::ValueRef::List(l) => (1, l.read().len()),
+                crate::store::ValueRef::Set(s) => (2, s.read().len()),
+                crate::store::ValueRef::SortedSet(z) => (3, z.read().len()),
+                crate::store::ValueRef::Hash(h) => (4, h.read().len()),
+                crate::store::ValueRef::HashEx(h) => (4, h.read().len()),
                 _ => continue,
             };
             let bin = (usize::BITS - len.leading_zeros()) as usize;

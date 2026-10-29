@@ -32,10 +32,10 @@
 use crate::commands::ctx::Ctx;
 use crate::store::Store;
 use ahash::AHashMap;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use rand::Rng;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock};
 use std::time::{Instant, SystemTime};
 
 // ── The policy ────────────────────────────────────────────────────────────────
@@ -425,50 +425,56 @@ pub fn allowed_when_out_of_memory(name: &str) -> bool {
 /// How much a policy wants a key gone: the highest goes.
 type Unwanted = u64;
 
-/// A shard of either store, to read: the keyspace's and the expiry store's
-/// are different types that both lock to a map.
-trait Shard<V> {
-    type Key: AsRef<str>;
-    fn read_map(&self) -> impl std::ops::Deref<Target = AHashMap<Self::Key, V>>;
+/// A key sampled for eviction, with its expiry time when it was sampled
+/// from the expiry store.
+type Sampled = (String, Option<SystemTime>);
+
+/// A shard of either store, to sample from: the keyspace's and the expiry
+/// store's are different types.
+trait Sample {
+    /// Up to `count` keys from about `at` in the shard, into `found`.
+    fn sample_into(&self, at: usize, count: usize, found: &mut Vec<Sampled>);
 }
 
-impl<V> Shard<V> for Arc<RwLock<AHashMap<crate::store::Key, V>>> {
-    type Key = crate::store::Key;
-    fn read_map(&self) -> impl std::ops::Deref<Target = AHashMap<Self::Key, V>> {
-        self.read()
+impl Sample for crate::store::Shard {
+    fn sample_into(&self, at: usize, count: usize, found: &mut Vec<Sampled>) {
+        // From a random bucket: as many buckets as keys wanted, over how
+        // full the table is, where walking to a random key walked past half
+        // the shard on average.
+        let map = self.read();
+        found.extend(
+            map.sample_from(at, count)
+                .map(|(key, _)| (key.to_string(), None)),
+        );
     }
 }
 
-impl Shard<SystemTime> for crate::store::ExpiryShard {
-    type Key = crate::store::Key;
-    fn read_map(&self) -> impl std::ops::Deref<Target = AHashMap<Self::Key, SystemTime>> {
-        self.read()
+impl Sample for crate::store::ExpiryShard {
+    fn sample_into(&self, at: usize, count: usize, found: &mut Vec<Sampled>) {
+        let map = self.read();
+        if map.is_empty() {
+            return;
+        }
+        let from = at % map.len();
+        found.extend(
+            map.iter()
+                .skip(from)
+                .take(count)
+                .map(|(key, expires)| (key.to_string(), Some(*expires))),
+        );
     }
 }
 
-/// Up to `count` keys of one database, from a random place in it, each with
-/// what `take` makes of its value. Nothing of the caller's runs with a shard
-/// locked but `take`.
-fn sample<V, T>(
-    shards: &[impl Shard<V>],
-    count: usize,
-    rng: &mut impl Rng,
-    take: impl Fn(&V) -> T,
-) -> Vec<(String, T)> {
+/// Up to `count` keys of one database, from a random place in it.
+fn sample(shards: &[impl Sample], count: usize, rng: &mut impl Rng) -> Vec<Sampled> {
     let mut found = Vec::with_capacity(count);
     if shards.is_empty() {
         return found;
     }
     let first = rng.gen_range(0..shards.len());
     for step in 0..shards.len() {
-        let map = shards[(first + step) % shards.len()].read_map();
-        if map.is_empty() {
-            continue;
-        }
-        let from = rng.gen_range(0..map.len());
-        for (key, value) in map.iter().skip(from).take(count - found.len()) {
-            found.push((key.as_ref().to_string(), take(value)));
-        }
+        let at = rng.gen_range(0..usize::MAX);
+        shards[(first + step) % shards.len()].sample_into(at, count - found.len(), &mut found);
         if found.len() >= count {
             break;
         }
@@ -483,10 +489,10 @@ fn choose(ctx: &Ctx, policy: Policy, dbs: &[usize], rng: &mut impl Rng) -> Optio
     let count = samples();
     let mut worst: Option<(Unwanted, usize, String)> = None;
     for &db in dbs {
-        let candidates: Vec<(String, Option<SystemTime>)> = if policy.volatile() {
-            sample(&ctx.expiry_store[db], count, rng, |at| Some(*at))
+        let candidates: Vec<Sampled> = if policy.volatile() {
+            sample(&ctx.expiry_store[db], count, rng)
         } else {
-            sample(&ctx.store[db], count, rng, |_| None)
+            sample(&ctx.store[db], count, rng)
         };
         for (key, expires) in candidates {
             let unwanted: Unwanted = match policy {
@@ -606,6 +612,8 @@ pub fn make_room(ctx: &mut Ctx, limit: usize, ordered: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::RwLock;
+    use std::sync::Arc;
 
     #[test]
     fn policies_by_name() {
@@ -635,24 +643,25 @@ mod tests {
 
     #[test]
     fn a_sample_is_no_more_than_was_asked_for_and_finds_what_there_is() {
-        let shards: Vec<Arc<RwLock<AHashMap<crate::store::Key, u8>>>> = (0..8)
-            .map(|_| Arc::new(RwLock::new(AHashMap::new())))
+        let shards: Vec<crate::store::Shard> = (0..8)
+            .map(|_| Arc::new(RwLock::new(crate::store::ShardMap::new())))
             .collect();
+        let one = || crate::types::KiviDBValue::String(crate::types::SharedBytes::from("1"));
         let mut rng = rand::thread_rng();
-        let keys = |found: Vec<(String, u8)>| -> Vec<String> {
+        let keys = |found: Vec<Sampled>| -> Vec<String> {
             found.into_iter().map(|(key, _)| key).collect()
         };
-        assert!(sample(&shards, 5, &mut rng, |v| *v).is_empty());
+        assert!(sample(&shards, 5, &mut rng).is_empty());
 
         // One key, in one shard of eight: it is found wherever the walk starts.
-        shards[3].write().insert("only".into(), 1);
+        shards[3].write().insert("only", one());
         for _ in 0..50 {
-            assert_eq!(keys(sample(&shards, 5, &mut rng, |v| *v)), ["only"]);
+            assert_eq!(keys(sample(&shards, 5, &mut rng)), ["only"]);
         }
         for i in 0..100 {
-            shards[i % 8].write().insert(format!("k{i}").into(), 1);
+            shards[i % 8].write().insert(format!("k{i}"), one());
         }
-        let found = sample(&shards, 5, &mut rng, |v| *v);
-        assert!((1..=5).contains(&found.len()), "{found:?}");
+        let found = sample(&shards, 5, &mut rng);
+        assert_eq!(found.len(), 5, "{found:?}");
     }
 }

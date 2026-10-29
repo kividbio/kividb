@@ -4,6 +4,7 @@ use crate::keyspace_events::{KS_GENERIC, KS_STRING, notify};
 use crate::resp::write::*;
 use crate::store;
 use crate::store::Key;
+use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::types::SharedBytes;
 use crate::{read_lock, write_lock};
@@ -50,10 +51,7 @@ fn shards_of<'k>(db: &store::Db, keys: impl Iterator<Item = &'k str>) -> Vec<usi
 /// makes a read of several keys a read of one moment.
 struct ReadShards<'a> {
     shards: usize,
-    held: Vec<(
-        usize,
-        parking_lot::RwLockReadGuard<'a, ahash::AHashMap<Key, KiviDBValue>>,
-    )>,
+    held: Vec<(usize, parking_lot::RwLockReadGuard<'a, store::ShardMap>)>,
 }
 
 impl<'a> ReadShards<'a> {
@@ -69,7 +67,7 @@ impl<'a> ReadShards<'a> {
     }
 
     /// The table `key` is in, if it is a key this was locked for.
-    fn map(&self, key: &str) -> Option<&ahash::AHashMap<Key, KiviDBValue>> {
+    fn map(&self, key: &str) -> Option<&store::ShardMap> {
         let index = store::shard_index(self.shards, key);
         let at = self
             .held
@@ -82,10 +80,7 @@ impl<'a> ReadShards<'a> {
 /// The same for writing: what makes a write of several keys one step.
 struct WriteShards<'a> {
     shards: usize,
-    held: Vec<(
-        usize,
-        parking_lot::RwLockWriteGuard<'a, ahash::AHashMap<Key, KiviDBValue>>,
-    )>,
+    held: Vec<(usize, parking_lot::RwLockWriteGuard<'a, store::ShardMap>)>,
 }
 
 impl<'a> WriteShards<'a> {
@@ -101,7 +96,7 @@ impl<'a> WriteShards<'a> {
     }
 
     /// The table `key` is in. The key must be one this was locked for.
-    fn map(&mut self, key: &str) -> &mut ahash::AHashMap<Key, KiviDBValue> {
+    fn map(&mut self, key: &str) -> &mut store::ShardMap {
         let index = store::shard_index(self.shards, key);
         let at = self
             .held
@@ -294,7 +289,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // GET: capture old value before any mutation (nil if absent/wrong-type)
             let old_val: Option<SharedBytes> = if want_get {
                 match existing {
-                    Some(KiviDBValue::String(v)) => Some(v.clone()),
+                    Some(ValueRef::String(v)) => Some(v.to_shared()),
                     Some(_) => {
                         // Redis returns WRONGTYPE if GET is used on a non-string key
                         return Some(resp_error(
@@ -313,12 +308,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // string to compare — wrong type is WRONGTYPE.
             let current_bytes: Option<SharedBytes> = match existing {
                 // Only a condition that compares values reads this.
-                Some(KiviDBValue::String(_))
+                Some(ValueRef::String(_))
                     if matches!(condition, Condition::None | Condition::NX | Condition::XX) =>
                 {
                     None
                 }
-                Some(KiviDBValue::String(v)) => Some(v.clone()),
+                Some(ValueRef::String(v)) => Some(v.to_shared()),
                 Some(_) => {
                     if condition == Condition::NX {
                         return Some(resp_null_bulk());
@@ -400,12 +395,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             //
             // We insert directly here (already holding the write lock) rather than
             // calling store_value so we don't re-acquire the shard lock.
-            let replaced = if key_exists {
-                // An overwrite keeps the key it has: no new string for it.
-                map.get_mut(key).map(|slot| std::mem::replace(slot, value))
-            } else {
-                map.insert(Key::from(key), value)
-            };
+            // An overwrite keeps the key it has: no new string for it.
+            let replaced = map.insert(key, value);
             drop(map); // ← release write lock BEFORE touching expiry_store
             // The value that was there is let go of with the shard unlocked:
             // its count is in memory nothing has touched lately, and freeing
@@ -463,9 +454,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let shard = &db[index];
             let map = read_lock!(shard);
             Some(match map.get(key) {
-                Some(KiviDBValue::String(v)) => {
+                Some(ValueRef::String(v)) => {
                     crate::stats::record_hit();
-                    resp_bulk(v)
+                    resp_bulk(&v)
                 }
                 Some(_) => {
                     crate::stats::record_miss();
@@ -628,7 +619,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             let next = match map.get(key.as_str()) {
                 None => 1i64,
-                Some(KiviDBValue::String(v)) => {
+                Some(ValueRef::String(v)) => {
                     let s = match std::str::from_utf8(v.as_ref()) {
                         Ok(k) => k,
                         Err(_) => {
@@ -686,7 +677,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let shard = store::get_shard(db, key);
             let map = read_lock!(shard);
             match map.get(key) {
-                Some(KiviDBValue::String(v)) => Some(resp_integer(v.len() as i64)),
+                Some(ValueRef::String(v)) => Some(resp_integer(v.len() as i64)),
                 Some(_) => Some(resp_error(
                     "WRONGTYPE Operation against a key holding the wrong kind of value",
                 )),
@@ -717,14 +708,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let mut map = write_lock!(shard);
             let new_val: SharedBytes = match map.get(key) {
                 None => SharedBytes::from(*suffix),
-                Some(KiviDBValue::String(existing)) => {
+                Some(ValueRef::String(existing)) => {
                     // As Redis: a string does not grow past 512 MB.
                     if existing.len() + suffix.len() > MAX_STRING_LEN {
                         return Some(resp_error(
                             "ERR string exceeds maximum allowed size (proto-max-bulk-len)",
                         ));
                     }
-                    SharedBytes::concat(&[existing, suffix])
+                    SharedBytes::concat(&[&existing, suffix])
                 }
                 Some(_) => {
                     return Some(resp_error(
@@ -954,9 +945,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     continue;
                 }
                 let val = match shards.map(key).and_then(|map| map.get(key)) {
-                    Some(KiviDBValue::String(v)) => {
+                    Some(ValueRef::String(v)) => {
                         crate::stats::record_hit();
-                        resp_bulk(v.as_slice())
+                        resp_bulk(v.as_bytes())
                     }
                     _ => {
                         crate::stats::record_miss();
@@ -989,8 +980,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let mut shards = WriteShards::lock(&ctx.store[db], pairs.iter().map(|p| p.0));
                 for (key, _) in &pairs {
                     // A key past its time is not there, and is written over.
-                    if shards.map(key).contains_key(*key) && !is_expired(ctx.expiry_store, db, key)
-                    {
+                    if shards.map(key).contains_key(key) && !is_expired(ctx.expiry_store, db, key) {
                         return Some(resp_integer(0));
                     }
                 }
@@ -1030,7 +1020,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // Check overflow properly
             let next = match map.get(key.as_str()) {
                 None => delta,
-                Some(KiviDBValue::String(v)) => match std::str::from_utf8(v)
+                Some(ValueRef::String(v)) => match std::str::from_utf8(&v)
                     .ok()
                     .and_then(|s| s.parse::<i64>().ok())
                 {
@@ -1074,7 +1064,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let mut map = write_lock!(shard);
             let next = match map.get(key.as_str()) {
                 None => -1i64,
-                Some(KiviDBValue::String(v)) => match std::str::from_utf8(v)
+                Some(ValueRef::String(v)) => match std::str::from_utf8(&v)
                     .ok()
                     .and_then(|s| s.parse::<i64>().ok())
                 {
@@ -1120,7 +1110,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let mut map = write_lock!(shard);
             let next = match map.get(key.as_str()) {
                 None => -delta,
-                Some(KiviDBValue::String(v)) => match std::str::from_utf8(v)
+                Some(ValueRef::String(v)) => match std::str::from_utf8(&v)
                     .ok()
                     .and_then(|s| s.parse::<i64>().ok())
                 {
@@ -1169,8 +1159,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let mut map = write_lock!(shard);
             let current: f64 = match map.get(key.as_str()) {
                 None => 0.0,
-                Some(KiviDBValue::String(v)) => {
-                    match std::str::from_utf8(v).ok().and_then(|s| s.parse().ok()) {
+                Some(ValueRef::String(v)) => {
+                    match std::str::from_utf8(&v).ok().and_then(|s| s.parse().ok()) {
                         Some(n) => n,
                         None => return Some(resp_error("ERR value is not a valid float")),
                     }
@@ -1237,10 +1227,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let map = read_lock!(shard);
             match map.get(key) {
                 None => Some(resp_bulk(b"")),
-                Some(KiviDBValue::String(_)) if start < 0 && end < 0 && start > end => {
+                Some(ValueRef::String(_)) if start < 0 && end < 0 && start > end => {
                     Some(resp_bulk(b""))
                 }
-                Some(KiviDBValue::String(v)) => {
+                Some(ValueRef::String(v)) => {
                     let len = v.len() as i64;
                     // Convert negative indices: -1 = last byte
                     let s = if start < 0 {
@@ -1309,7 +1299,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let mut map = write_lock!(shard);
             let existing: Vec<u8> = match map.get(key) {
                 None => vec![],
-                Some(KiviDBValue::String(v)) => v.to_vec(), // copy into owned Vec to mutate
+                Some(ValueRef::String(v)) => v.to_vec(), // copy into owned Vec to mutate
                 Some(_) => {
                     return Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -1360,9 +1350,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let shard = store::get_shard(db, key);
                 let map = read_lock!(shard);
                 match map.get(key) {
-                    Some(KiviDBValue::String(v)) => {
+                    Some(ValueRef::String(v)) => {
                         crate::stats::record_hit();
-                        Some(v.clone())
+                        Some(v.to_shared())
                     }
                     Some(_) => {
                         crate::stats::record_miss();
@@ -1548,7 +1538,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let shard = store::get_shard(db, key1);
                     let map = read_lock!(shard);
                     match map.get(key1) {
-                        Some(KiviDBValue::String(v)) => v.clone(),
+                        Some(ValueRef::String(v)) => v.to_shared(),
                         Some(_) => {
                             return Some(resp_error(
                                 "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -1568,7 +1558,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let shard = store::get_shard(db, key2);
                     let map = read_lock!(shard);
                     match map.get(key2) {
-                        Some(KiviDBValue::String(v)) => v.clone(),
+                        Some(ValueRef::String(v)) => v.to_shared(),
                         Some(_) => {
                             return Some(resp_error(
                                 "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -1753,8 +1743,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let map = read_lock!(shard);
             match map.get(key) {
                 None => Some(resp_null_bulk()),
-                Some(KiviDBValue::String(v)) => {
-                    let hex = value_digest(v);
+                Some(ValueRef::String(v)) => {
+                    let hex = value_digest(&v);
                     Some(resp_bulk_str(&hex))
                 }
                 Some(_) => Some(resp_error(
@@ -1798,7 +1788,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let should_delete = match map.get(key) {
                 None => return Some(resp_integer(0)),
                 Some(_) if cmd.len() == 2 => true,
-                Some(KiviDBValue::String(stored)) => {
+                Some(ValueRef::String(stored)) => {
                     let arg = cmd[3];
                     let digest = cmd[2].eq_ignore_ascii_case(b"IFDEQ")
                         || cmd[2].eq_ignore_ascii_case(b"IFDNE");
@@ -1810,9 +1800,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     } else if cmd[2].eq_ignore_ascii_case(b"IFNE") {
                         stored.as_ref() != arg
                     } else if cmd[2].eq_ignore_ascii_case(b"IFDEQ") {
-                        digest_matches(stored, arg)
+                        digest_matches(&stored, arg)
                     } else if cmd[2].eq_ignore_ascii_case(b"IFDNE") {
-                        !digest_matches(stored, arg)
+                        !digest_matches(&stored, arg)
                     } else {
                         return Some(resp_error(
                             "ERR Invalid condition. Use IFEQ, IFNE, IFDEQ, or IFDNE",
@@ -2229,7 +2219,7 @@ fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
 
     let existing: Option<&[u8]> = match map.get(key.as_str()) {
         None => None,
-        Some(KiviDBValue::String(v)) => Some(v),
+        Some(ValueRef::String(v)) => Some(v.as_bytes()),
         Some(_) => {
             return resp_error("WRONGTYPE Operation against a key holding the wrong kind of value");
         }

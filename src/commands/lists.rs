@@ -6,6 +6,7 @@ use crate::keyspace_events::{KS_LIST, notify};
 use crate::resp::write::*;
 use crate::store;
 use crate::store::Key;
+use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::{read_lock, write_lock};
 use parking_lot::RwLock;
@@ -19,7 +20,7 @@ fn pop_from(ctx: &Ctx, key: &str, left: bool, count: usize) -> Result<Vec<Arc<[u
     let shard = store::get_shard(db_ref, key);
     let map = read_lock!(shard);
     match map.get(key) {
-        Some(KiviDBValue::List(list)) => {
+        Some(ValueRef::List(list)) => {
             let mut list = list.write();
             let mut popped = Vec::with_capacity(count.min(list.len()));
             while popped.len() < count {
@@ -70,7 +71,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     map.insert(Key::from(key), KiviDBValue::List(Arc::clone(&l)));
                     l
                 }
-                Some(KiviDBValue::List(l)) => Arc::clone(l),
+                Some(ValueRef::List(l)) => Arc::clone(l),
                 Some(_) => {
                     return Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -117,7 +118,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     map.insert(Key::from(key), KiviDBValue::List(Arc::clone(&l)));
                     l
                 }
-                Some(KiviDBValue::List(l)) => Arc::clone(l),
+                Some(ValueRef::List(l)) => Arc::clone(l),
                 Some(_) => {
                     return Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -167,7 +168,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 // No key: a null array where a count asked for an array.
                 None if count.is_some() => Some(resp_null_array()),
                 None => Some(resp_null_bulk()),
-                Some(KiviDBValue::List(l)) => {
+                Some(ValueRef::List(l)) => {
                     let mut inner = l.write();
                     match count {
                         // No count: original behaviour — return single bulk string or nil
@@ -235,7 +236,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 // No key: a null array where a count asked for an array.
                 None if count.is_some() => Some(resp_null_array()),
                 None => Some(resp_null_bulk()),
-                Some(KiviDBValue::List(l)) => {
+                Some(ValueRef::List(l)) => {
                     let mut inner = l.write();
                     match count {
                         None => match inner.pop_back() {
@@ -294,7 +295,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     crate::stats::record_miss();
                     Some(resp_integer(0))
                 }
-                Some(KiviDBValue::List(l)) => {
+                Some(ValueRef::List(l)) => {
                     crate::stats::record_hit();
                     Some(resp_integer(l.read().len() as i64))
                 }
@@ -335,7 +336,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     crate::stats::record_miss();
                     Some(resp_array(vec![]))
                 }
-                Some(KiviDBValue::List(l)) => {
+                Some(ValueRef::List(l)) => {
                     let inner = l.read();
                     let len = inner.len() as i64;
 
@@ -413,7 +414,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             match map.get(key) {
                 None => Some(resp_simple("OK")),
-                Some(KiviDBValue::List(l)) => {
+                Some(ValueRef::List(l)) => {
                     let mut inner = l.write();
                     let len = inner.len() as i64;
 
@@ -539,7 +540,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         None => resp_null_bulk(),
                     })
                 }
-                Some(KiviDBValue::List(l)) => {
+                Some(ValueRef::List(l)) => {
                     let inner = l.read();
                     let list_len = inner.len();
 
@@ -641,7 +642,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     crate::stats::record_miss();
                     Some(resp_null_bulk())
                 }
-                Some(KiviDBValue::List(l)) => {
+                Some(ValueRef::List(l)) => {
                     let inner = l.read();
                     let len = inner.len() as i64;
                     let real_idx = if idx < 0 { len + idx } else { idx };
@@ -689,7 +690,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     crate::stats::record_miss();
                     Some(resp_integer(0))
                 }
-                Some(KiviDBValue::List(l)) => {
+                Some(ValueRef::List(l)) => {
                     let list = Arc::clone(l);
                     drop(map); // release shard lock before locking inner list
                     let mut inner = list.write();
@@ -727,7 +728,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             match map.get(key) {
                 None => Some(resp_integer(0)),
-                Some(KiviDBValue::List(l)) => {
+                Some(ValueRef::List(l)) => {
                     let list = Arc::clone(l);
                     drop(map);
                     let mut inner = list.write();
@@ -765,7 +766,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             match map.get(key) {
                 None => Some(resp_error("ERR no such key")),
-                Some(KiviDBValue::List(l)) => {
+                Some(ValueRef::List(l)) => {
                     let mut inner = l.write();
                     let len = inner.len() as i64;
                     let real_idx = if idx < 0 { len + idx } else { idx };
@@ -808,7 +809,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             match map.get(key) {
                 None => Some(resp_integer(0)),
-                Some(KiviDBValue::List(l)) => {
+                Some(ValueRef::List(l)) => {
                     let mut inner = l.write();
                     let pos = inner.iter().position(|v| v.as_ref() == *pivot);
                     match pos {
@@ -852,7 +853,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             match map.get(key) {
                 None => Some(resp_integer(0)),
-                Some(KiviDBValue::List(l)) => {
+                Some(ValueRef::List(l)) => {
                     let mut inner = l.write();
                     let mut removed = 0i64;
                     let limit = count.unsigned_abs() as usize;

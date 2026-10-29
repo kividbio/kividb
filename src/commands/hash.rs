@@ -5,6 +5,7 @@ use crate::keyspace_events::{KS_HASH, notify, notify_subkeys};
 use crate::resp::write::*;
 use crate::store;
 use crate::store::Key;
+use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::{read_lock, write_lock};
 use ahash::AHashMap;
@@ -53,7 +54,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let added = {
                 let mut map = write_lock!(shard);
                 match map.get(key) {
-                    Some(KiviDBValue::Hash(h)) => {
+                    Some(ValueRef::Hash(h)) => {
                         let h = Arc::clone(h);
                         drop(map);
                         let mut inner = h.write();
@@ -65,7 +66,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         }
                         new_count
                     }
-                    Some(KiviDBValue::HashEx(hx)) => {
+                    Some(ValueRef::HashEx(hx)) => {
                         let hx = Arc::clone(hx);
                         drop(map);
                         let mut inner = hx.write();
@@ -230,7 +231,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let shard = store::get_shard(db_ref, key);
                 let mut map = write_lock!(shard);
                 match map.get(key) {
-                    Some(KiviDBValue::Hash(h)) => {
+                    Some(ValueRef::Hash(h)) => {
                         let h = Arc::clone(h);
                         drop(map);
                         let mut inner = h.write();
@@ -238,7 +239,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             inner.insert(field.clone(), Arc::clone(val));
                         }
                     }
-                    Some(KiviDBValue::HashEx(hx)) => {
+                    Some(ValueRef::HashEx(hx)) => {
                         let hx = Arc::clone(hx);
                         drop(map);
                         let mut inner = hx.write();
@@ -654,7 +655,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let was_set = {
                 let mut map = write_lock!(shard);
                 match map.get(key) {
-                    Some(KiviDBValue::Hash(h)) => {
+                    Some(ValueRef::Hash(h)) => {
                         let h = Arc::clone(h);
                         drop(map);
                         let mut inner = h.write();
@@ -665,7 +666,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             true
                         }
                     }
-                    Some(KiviDBValue::HashEx(hx)) => {
+                    Some(ValueRef::HashEx(hx)) => {
                         let hx = Arc::clone(hx);
                         drop(map);
                         let mut inner = hx.write();
@@ -745,16 +746,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let map = read_lock!(shard);
 
             match map.get(key) {
-                Some(v) if matches!(v, KiviDBValue::Hash(_) | KiviDBValue::HashEx(_)) => {
+                Some(v) if matches!(v, ValueRef::Hash(_) | ValueRef::HashEx(_)) => {
                     // Get a borrow into the field map regardless of variant.
                     let plain_guard;
                     let ex_guard;
                     let inner: &crate::types::HashFields = match v {
-                        KiviDBValue::Hash(h) => {
+                        ValueRef::Hash(h) => {
                             plain_guard = h.read();
                             &plain_guard
                         }
-                        KiviDBValue::HashEx(hx) => {
+                        ValueRef::HashEx(hx) => {
                             // Sweep expired fields under write lock first.
                             hx.write().sweep_expired();
                             ex_guard = hx.read();
@@ -853,7 +854,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let map = read_lock!(shard);
 
             match map.get(key) {
-                Some(v) if matches!(v, KiviDBValue::Hash(_) | KiviDBValue::HashEx(_)) => {
+                Some(v) if matches!(v, ValueRef::Hash(_) | ValueRef::HashEx(_)) => {
                     // A hash Redis would encode compactly comes back whole.
                     let (cursor, count) = if crate::commands::generics::scans_whole(v) {
                         (0, usize::MAX)
@@ -864,11 +865,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let plain_guard;
                     let ex_guard;
                     let inner: &crate::types::HashFields = match v {
-                        KiviDBValue::Hash(h) => {
+                        ValueRef::Hash(h) => {
                             plain_guard = h.read();
                             &plain_guard
                         }
-                        KiviDBValue::HashEx(hx) => {
+                        ValueRef::HashEx(hx) => {
                             // Sweep expired fields under write lock first.
                             hx.write().sweep_expired();
                             ex_guard = hx.read();
@@ -1134,11 +1135,11 @@ where
     let map = read_lock!(shard);
     match map.get(key) {
         None => None,
-        Some(KiviDBValue::Hash(h)) => {
+        Some(ValueRef::Hash(h)) => {
             let inner = h.read();
             Some(Ok(f(&inner)))
         }
-        Some(KiviDBValue::HashEx(hx)) => {
+        Some(ValueRef::HashEx(hx)) => {
             // Sweep expired fields under a write lock before exposing them.
             // This is the lazy-eviction tick — readers also clean up.
             let mut inner_w = hx.write();
@@ -1171,11 +1172,11 @@ where
     let map = read_lock!(shard);
     match map.get(key) {
         None => None,
-        Some(KiviDBValue::Hash(h)) => {
+        Some(ValueRef::Hash(h)) => {
             let mut inner = h.write();
             Some(Ok(f(&mut inner, None)))
         }
-        Some(KiviDBValue::HashEx(hx)) => {
+        Some(ValueRef::HashEx(hx)) => {
             let mut inner = hx.write();
             inner.sweep_expired();
             // Split borrow so the closure can touch both maps.
@@ -1385,8 +1386,8 @@ fn apply_field_expire_inner(
     }
     let variant = match map.get(key) {
         None => Variant::Missing,
-        Some(KiviDBValue::Hash(h)) => Variant::Hash(Arc::clone(h)),
-        Some(KiviDBValue::HashEx(h)) => Variant::HashEx(Arc::clone(h)),
+        Some(ValueRef::Hash(h)) => Variant::Hash(Arc::clone(h)),
+        Some(ValueRef::HashEx(h)) => Variant::HashEx(Arc::clone(h)),
         Some(_) => Variant::WrongType,
     };
 
@@ -1590,7 +1591,7 @@ fn run_hfe_read(ctx: &mut Ctx, cmd_name: &str, mode: HfeReadMode) -> Option<Vec<
                 .map(|_| resp_integer(HFE_NO_SUCH_FIELD))
                 .collect(),
         )),
-        Some(KiviDBValue::Hash(h)) => {
+        Some(ValueRef::Hash(h)) => {
             // Plain Hash → no field has a TTL. Either field exists (-1) or it
             // doesn't (-2).
             let inner = h.read();
@@ -1606,7 +1607,7 @@ fn run_hfe_read(ctx: &mut Ctx, cmd_name: &str, mode: HfeReadMode) -> Option<Vec<
                 .collect();
             Some(resp_array(out))
         }
-        Some(KiviDBValue::HashEx(hx)) => {
+        Some(ValueRef::HashEx(hx)) => {
             // Sweep expired fields under write lock first so we don't report
             // stale data.
             hx.write().sweep_expired();
@@ -1658,7 +1659,7 @@ fn run_hpersist(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 .map(|_| resp_integer(HFE_NO_SUCH_FIELD))
                 .collect(),
         )),
-        Some(KiviDBValue::Hash(h)) => {
+        Some(ValueRef::Hash(h)) => {
             // Plain Hash has no TTLs by definition: existing field → -1, missing → -2.
             let inner = h.read();
             let out: Vec<Vec<u8>> = fields
@@ -1673,7 +1674,7 @@ fn run_hpersist(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 .collect();
             Some(resp_array(out))
         }
-        Some(KiviDBValue::HashEx(hx)) => {
+        Some(ValueRef::HashEx(hx)) => {
             // Sweep then operate under write lock. We need write because we
             // remove from the expiries map.
             let mut inner = hx.write();
@@ -1735,7 +1736,7 @@ fn run_hgetdel(ctx: &mut Ctx) -> Option<Vec<u8>> {
         None => Some(resp_array(
             fields.iter().map(|_| resp_null_for(resp)).collect(),
         )),
-        Some(KiviDBValue::Hash(h)) => {
+        Some(ValueRef::Hash(h)) => {
             let h = Arc::clone(h);
             drop(map);
             let mut inner = h.write();
@@ -1758,7 +1759,7 @@ fn run_hgetdel(ctx: &mut Ctx) -> Option<Vec<u8>> {
             }
             Some(resp_array(out))
         }
-        Some(KiviDBValue::HashEx(hx)) => {
+        Some(ValueRef::HashEx(hx)) => {
             let hx = Arc::clone(hx);
             drop(map);
             let mut inner = hx.write();
@@ -1921,7 +1922,7 @@ fn run_hgetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
             None => Some(resp_array(
                 fields.iter().map(|_| resp_null_for(resp)).collect(),
             )),
-            Some(KiviDBValue::Hash(plain)) => {
+            Some(ValueRef::Hash(plain)) => {
                 // Upgrade in place: only if at least one requested field
                 // exists. Otherwise this call is purely a (failing) read.
                 let plain = Arc::clone(plain);
@@ -1944,7 +1945,7 @@ fn run_hgetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                     ctx, &key, &new_arc, &fields, action, resp,
                 )))
             }
-            Some(KiviDBValue::HashEx(hx)) => {
+            Some(ValueRef::HashEx(hx)) => {
                 let hx = Arc::clone(hx);
                 drop(wmap);
                 Some(resp_array(hgetex_apply(
@@ -1962,7 +1963,7 @@ fn run_hgetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
             None => Some(resp_array(
                 fields.iter().map(|_| resp_null_for(resp)).collect(),
             )),
-            Some(KiviDBValue::Hash(h)) => {
+            Some(ValueRef::Hash(h)) => {
                 let h = Arc::clone(h);
                 drop(map);
                 // PERSIST on a plain Hash is a no-op; just read the values.
@@ -1977,7 +1978,7 @@ fn run_hgetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 crate::stats::record_hit();
                 Some(resp_array(out))
             }
-            Some(KiviDBValue::HashEx(hx)) => {
+            Some(ValueRef::HashEx(hx)) => {
                 let hx = Arc::clone(hx);
                 drop(map);
                 crate::stats::record_hit();
@@ -2402,8 +2403,8 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
     // Get or upgrade-or-create a HashEx for this key.
     let hx = match map.get(key.as_str()) {
-        Some(KiviDBValue::HashEx(h)) => Arc::clone(h),
-        Some(KiviDBValue::Hash(plain)) => {
+        Some(ValueRef::HashEx(h)) => Arc::clone(h),
+        Some(ValueRef::Hash(plain)) => {
             // Upgrade in place
             let plain = Arc::clone(plain);
             let mut plain_w = plain.write();

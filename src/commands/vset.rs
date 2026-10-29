@@ -13,6 +13,7 @@ use crate::commands::helpers::parse_utf8;
 use crate::resp::write::*;
 use crate::store;
 use crate::store::Key;
+use crate::store::ValueRef;
 use crate::types::{KiviDBValue, VSetEntry, VectorSetInner};
 use crate::{read_lock, write_lock};
 use parking_lot::RwLock;
@@ -52,7 +53,7 @@ fn get_or_create_vset(
     let mut map = write_lock!(shard);
 
     match map.get(key) {
-        Some(KiviDBValue::VectorSet(vs)) => {
+        Some(ValueRef::VectorSet(vs)) => {
             let inner = vs.read();
             if inner.dim != dim {
                 return Err(resp_error(&format!(
@@ -283,7 +284,7 @@ fn vrem(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = read_lock!(shard);
 
     let vs = match map.get(key) {
-        Some(KiviDBValue::VectorSet(vs)) => Arc::clone(vs),
+        Some(ValueRef::VectorSet(vs)) => Arc::clone(vs),
         Some(_) => {
             return Some(resp_error(
                 "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -328,7 +329,7 @@ fn vcard(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        Some(KiviDBValue::VectorSet(vs)) => Some(resp_integer(vs.read().entries.len() as i64)),
+        Some(ValueRef::VectorSet(vs)) => Some(resp_integer(vs.read().entries.len() as i64)),
         Some(_) => Some(resp_error(
             "WRONGTYPE Operation against a key holding the wrong kind of value",
         )),
@@ -357,7 +358,7 @@ fn vdim(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        Some(KiviDBValue::VectorSet(vs)) => Some(resp_integer(vs.read().dim as i64)),
+        Some(ValueRef::VectorSet(vs)) => Some(resp_integer(vs.read().dim as i64)),
         Some(_) => Some(resp_error(
             "WRONGTYPE Operation against a key holding the wrong kind of value",
         )),
@@ -396,7 +397,7 @@ fn vemb(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        Some(KiviDBValue::VectorSet(vs)) => {
+        Some(ValueRef::VectorSet(vs)) => {
             let inner = vs.read();
             match inner.entries.get(element) {
                 None => Some(resp_null_bulk()),
@@ -451,7 +452,7 @@ fn vismember(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        Some(KiviDBValue::VectorSet(vs)) => {
+        Some(ValueRef::VectorSet(vs)) => {
             let found = vs.read().entries.contains_key(element);
             Some(resp_integer(found as i64))
         }
@@ -488,7 +489,7 @@ fn vgetattr(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        Some(KiviDBValue::VectorSet(vs)) => {
+        Some(ValueRef::VectorSet(vs)) => {
             let inner = vs.read();
             match inner.entries.get(element) {
                 None => Some(resp_null_bulk()),
@@ -530,7 +531,7 @@ fn vsetattr(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = read_lock!(shard);
 
     match map.get(key.as_str()) {
-        Some(KiviDBValue::VectorSet(vs)) => {
+        Some(ValueRef::VectorSet(vs)) => {
             let mut inner = vs.write();
             match inner.entries.get_mut(&element) {
                 None => Some(resp_error("ERR no such element")),
@@ -573,7 +574,7 @@ fn vinfo(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        Some(KiviDBValue::VectorSet(vs)) => {
+        Some(ValueRef::VectorSet(vs)) => {
             let inner = vs.read();
             let count = inner.entries.len();
             let dim = inner.dim;
@@ -648,7 +649,7 @@ fn vlinks(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        Some(KiviDBValue::VectorSet(vs)) => {
+        Some(ValueRef::VectorSet(vs)) => {
             let inner = vs.read();
             let query_vec = match inner.entries.get(element) {
                 None => return Some(resp_null_bulk()),
@@ -720,7 +721,7 @@ fn vrandmember(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        Some(KiviDBValue::VectorSet(vs)) => {
+        Some(ValueRef::VectorSet(vs)) => {
             let inner = vs.read();
             let names: Vec<&str> = inner.entries.keys().map(|s| s.as_str()).collect();
 
@@ -833,7 +834,7 @@ fn vrange(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        Some(KiviDBValue::VectorSet(vs)) => {
+        Some(ValueRef::VectorSet(vs)) => {
             let inner = vs.read();
             let mut names: Vec<&str> = inner.entries.keys().map(|s| s.as_str()).collect();
             names.sort_unstable();
@@ -1009,7 +1010,7 @@ fn vsim(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = read_lock!(shard);
 
     let vs = match map.get(key.as_str()) {
-        Some(KiviDBValue::VectorSet(vs)) => Arc::clone(vs),
+        Some(ValueRef::VectorSet(vs)) => Arc::clone(vs),
         Some(_) => {
             return Some(resp_error(
                 "WRONGTYPE Operation against a key holding the wrong kind of value",

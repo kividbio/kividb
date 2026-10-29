@@ -3,6 +3,7 @@
 use crate::commands::*;
 use crate::replication;
 use crate::resp::write::{resp_array, resp_error, resp_integer, resp_null_bulk};
+use crate::store::ValueRef;
 use ctx::Ctx;
 use std::sync::atomic::Ordering;
 
@@ -143,7 +144,7 @@ fn replace_watch_begin(ctx: &Ctx, name: &str) -> Option<ReplaceWatch> {
             let key = std::str::from_utf8(ctx.cmd[pos]).ok()?;
             let value = crate::read_lock!(crate::store::get_shard(ctx.store.get(db)?, key))
                 .get(key)?
-                .clone();
+                .to_value();
             Some((db, pos, value))
         })
         .collect();
@@ -171,7 +172,7 @@ fn replace_watch_end(ctx: &Ctx, watch: ReplaceWatch) {
         };
         let now = crate::read_lock!(crate::store::get_shard(&ctx.store[db], key))
             .get(key)
-            .cloned();
+            .map(ValueRef::to_value);
         if let Some(now) = now
             && !now.same_value(&old)
         {

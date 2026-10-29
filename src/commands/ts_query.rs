@@ -10,7 +10,8 @@ use crate::commands::ts::{LabelFilter, keys_matching_filters};
 use crate::read_lock;
 use crate::resp::write::*;
 use crate::store;
-use crate::types::{KiviDBValue, TsAggregation, TsInner};
+use crate::store::ValueRef;
+use crate::types::{TsAggregation, TsInner};
 use ahash::AHashMap;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
@@ -594,7 +595,7 @@ pub(super) fn series_at(ctx: &Ctx, key: &str) -> Result<Option<Arc<RwLock<TsInne
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     match read_lock!(shard).get(key) {
         None => Ok(None),
-        Some(KiviDBValue::TimeSeries(inner)) => Ok(Some(Arc::clone(inner))),
+        Some(ValueRef::TimeSeries(inner)) => Ok(Some(Arc::clone(inner))),
         Some(_) => Err(resp_error(WRONGTYPE)),
     }
 }

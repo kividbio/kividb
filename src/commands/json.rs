@@ -4,6 +4,7 @@ use crate::commands::json_path::{self, Location, Query, Step};
 use crate::resp::write::*;
 use crate::store;
 use crate::store::Key;
+use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::{read_lock, write_lock};
 use parking_lot::RwLock;
@@ -63,7 +64,7 @@ fn read_doc(ctx: &Ctx, key: &str, missing: Vec<u8>, f: impl FnOnce(&Value) -> Ve
     let shard = store::get_shard(db, key);
     let map = read_lock!(shard);
     match map.get(key) {
-        Some(KiviDBValue::Json(tree)) => f(&tree.read()),
+        Some(ValueRef::Json(tree)) => f(&tree.read()),
         Some(_) => resp_error(WRONGTYPE),
         None => missing,
     }
@@ -80,7 +81,7 @@ fn write_doc(
     let shard = store::get_shard(db, key);
     let map = read_lock!(shard);
     match map.get(key) {
-        Some(KiviDBValue::Json(tree)) => f(&mut tree.write()),
+        Some(ValueRef::Json(tree)) => f(&mut tree.write()),
         Some(_) => resp_error(WRONGTYPE),
         None => missing,
     }
@@ -273,7 +274,7 @@ fn set_key(
     let shard = store::get_shard(db, key);
     let mut map = write_lock!(shard);
     match map.get(key) {
-        Some(KiviDBValue::Json(tree)) => set_in(&mut tree.write(), query, value, nx, xx),
+        Some(ValueRef::Json(tree)) => set_in(&mut tree.write(), query, value, nx, xx),
         Some(_) => Err(resp_error(WRONGTYPE)),
         None if !query.is_root() => Err(resp_error("ERR new objects must be created at the root")),
         None if xx => Ok(false),
@@ -698,7 +699,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     };
                     let shard = store::get_shard(db, key);
                     let map = read_lock!(shard);
-                    let Some(KiviDBValue::Json(tree)) = map.get(key) else {
+                    let Some(ValueRef::Json(tree)) = map.get(key) else {
                         return resp_null_for(resp);
                     };
                     let root = tree.read();

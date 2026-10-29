@@ -3,6 +3,7 @@ use crate::commands::helpers::*;
 use crate::resp::write::*;
 use crate::store;
 use crate::store::Key;
+use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::types::SharedBytes;
 use crate::{read_lock, write_lock};
@@ -69,7 +70,7 @@ fn cmd_getbit(ctx: &mut Ctx) -> Vec<u8> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        Some(KiviDBValue::String(bytes)) => {
+        Some(ValueRef::String(bytes)) => {
             let (byte_idx, mask) = bit_byte_and_mask(offset);
             if byte_idx >= bytes.len() {
                 resp_integer(0)
@@ -122,7 +123,7 @@ fn cmd_setbit(ctx: &mut Ctx) -> Vec<u8> {
 
     // Get existing bytes or start empty
     let existing: Vec<u8> = match map.get(key) {
-        Some(KiviDBValue::String(b)) => b.to_vec(), // Arc<[u8]> → Vec<u8> (clone)
+        Some(ValueRef::String(b)) => b.to_vec(), // Arc<[u8]> → Vec<u8> (clone)
         None => vec![],
         _ => {
             return resp_error("WRONGTYPE Operation against a key holding the wrong kind of value");
@@ -191,7 +192,7 @@ fn cmd_bitcount(ctx: &mut Ctx) -> Vec<u8> {
         let shard = store::get_shard(db, key);
         let map = read_lock!(shard);
         match map.get(key) {
-            Some(KiviDBValue::String(b)) => resp_integer(popcount(b) as i64),
+            Some(ValueRef::String(b)) => resp_integer(popcount(&b) as i64),
             None => resp_integer(0),
             _ => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
         }
@@ -233,7 +234,7 @@ fn cmd_bitcount(ctx: &mut Ctx) -> Vec<u8> {
         let map = read_lock!(shard);
 
         let bytes: SharedBytes = match map.get(key).filter(|_| !gone) {
-            Some(KiviDBValue::String(b)) => b.clone(),
+            Some(ValueRef::String(b)) => b.to_shared(),
             None => SharedBytes::from(&[][..]),
             _ => {
                 return resp_error(
@@ -382,7 +383,7 @@ fn cmd_bitpos(ctx: &mut Ctx) -> Vec<u8> {
     let map = read_lock!(shard);
 
     let bytes = match map.get(key) {
-        Some(KiviDBValue::String(b)) => b.clone(),
+        Some(ValueRef::String(b)) => b.to_shared(),
         None => {
             return resp_integer(if search_bit == 0 { 0 } else { -1 });
         }
@@ -505,7 +506,7 @@ fn cmd_bitop(ctx: &mut Ctx) -> Vec<u8> {
         let shard = store::get_shard(db, key);
         let map = read_lock!(shard);
         match map.get(key) {
-            Some(KiviDBValue::String(b)) => sources.push(b.to_vec()),
+            Some(ValueRef::String(b)) => sources.push(b.to_vec()),
             None => sources.push(vec![]),
             _ => {
                 return resp_error(
@@ -627,7 +628,7 @@ fn cmd_bitfield(ctx: &mut Ctx, readonly: bool) -> Vec<u8> {
     let mut current_bytes: Vec<u8> = {
         let map = read_lock!(shard);
         match map.get(key.as_str()) {
-            Some(KiviDBValue::String(b)) => b.to_vec(),
+            Some(ValueRef::String(b)) => b.to_vec(),
             None => vec![],
             _ => {
                 return resp_error(

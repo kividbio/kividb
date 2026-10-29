@@ -7,6 +7,7 @@ use crate::keyspace_events::{KS_SORTED_SET, notify};
 use crate::resp::write::*;
 use crate::store;
 use crate::store::Key;
+use crate::store::ValueRef;
 use crate::types::{KiviDBValue, SortedSetInner, ZMember};
 use crate::{read_lock, write_lock};
 use ordered_float::OrderedFloat;
@@ -147,7 +148,7 @@ fn get_or_create_zset(ctx: &mut Ctx, key: &str) -> Result<Arc<RwLock<SortedSetIn
     let mut map = write_lock!(shard);
 
     match map.get(key) {
-        Some(KiviDBValue::SortedSet(zs)) => Ok(Arc::clone(zs)),
+        Some(ValueRef::SortedSet(zs)) => Ok(Arc::clone(zs)),
         Some(_) => Err(resp_error(
             "WRONGTYPE Operation against a key holding the wrong kind of value",
         )),
@@ -757,7 +758,7 @@ fn zcard(ctx: &mut Ctx) -> Vec<u8> {
 
     match map.get(key) {
         None => resp_integer(0),
-        Some(KiviDBValue::SortedSet(zs)) => resp_integer(zs.read().len() as i64),
+        Some(ValueRef::SortedSet(zs)) => resp_integer(zs.read().len() as i64),
         Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
     }
 }
@@ -783,7 +784,7 @@ fn zscore(ctx: &mut Ctx) -> Vec<u8> {
             crate::stats::record_miss();
             resp_null_bulk()
         }
-        Some(KiviDBValue::SortedSet(zs)) => match zs.read().members.get(cmd[2]) {
+        Some(ValueRef::SortedSet(zs)) => match zs.read().members.get(cmd[2]) {
             Some(&score) => {
                 crate::stats::record_hit();
                 score_reply(resp, score)
@@ -824,7 +825,7 @@ fn zmscore(ctx: &mut Ctx) -> Vec<u8> {
             let nils = vec![resp_null_for(resp); cmd.len() - 2];
             resp_array(nils)
         }
-        Some(KiviDBValue::SortedSet(zs)) => {
+        Some(ValueRef::SortedSet(zs)) => {
             let inner = zs.read();
             let results = cmd[2..]
                 .iter()
@@ -873,7 +874,7 @@ fn zrank(ctx: &mut Ctx) -> Vec<u8> {
             crate::stats::record_miss();
             none()
         }
-        Some(KiviDBValue::SortedSet(zs)) => {
+        Some(ValueRef::SortedSet(zs)) => {
             let inner = zs.read();
             let member = cmd[2];
 
@@ -941,7 +942,7 @@ fn zrevrank(ctx: &mut Ctx) -> Vec<u8> {
     };
     match map.get(key) {
         None => none(),
-        Some(KiviDBValue::SortedSet(zs)) => {
+        Some(ValueRef::SortedSet(zs)) => {
             let inner = zs.read();
             let member = cmd[2];
 
@@ -1148,7 +1149,7 @@ fn zcount(ctx: &mut Ctx) -> Vec<u8> {
 
     match map.get(key) {
         None => resp_integer(0),
-        Some(KiviDBValue::SortedSet(zs)) => {
+        Some(ValueRef::SortedSet(zs)) => {
             let inner = zs.read();
             // score_in_range is a closure — captures min/max by value.
             // Rust lesson: closures that only read captured vars implement Fn,
@@ -1220,7 +1221,7 @@ fn zrem(ctx: &mut Ctx) -> Vec<u8> {
 
     match map.get(key) {
         None => resp_integer(0),
-        Some(KiviDBValue::SortedSet(zs)) => {
+        Some(ValueRef::SortedSet(zs)) => {
             let mut inner = zs.write();
             let mut removed = 0i64;
             for m in &cmd[2..] {
@@ -1276,7 +1277,7 @@ fn zrange(ctx: &mut Ctx) -> Vec<u8> {
 
     match map.get(key) {
         None => resp_array(vec![]),
-        Some(KiviDBValue::SortedSet(zs)) => {
+        Some(ValueRef::SortedSet(zs)) => {
             let inner = zs.read();
             let pairs = zrange_pairs(&inner, &params);
             range_reply(&pairs, resp, with_scores)
@@ -1330,7 +1331,7 @@ fn zset_pop(ctx: &mut Ctx, max: bool) -> Vec<u8> {
 
     match map.get(key) {
         None => resp_array(vec![]),
-        Some(KiviDBValue::SortedSet(zs)) => {
+        Some(ValueRef::SortedSet(zs)) => {
             let mut inner = zs.write();
             let mut popped: Vec<(ZMember, f64)> =
                 Vec::with_capacity(count.min(inner.by_score.len()));
@@ -1390,7 +1391,7 @@ fn zscan(ctx: &mut Ctx) -> Vec<u8> {
 
     match map.get(key) {
         None => resp_array(vec![resp_bulk_str("0"), resp_array(vec![])]),
-        Some(value @ KiviDBValue::SortedSet(zs)) => {
+        Some(value @ ValueRef::SortedSet(zs)) => {
             // A sorted set Redis would encode compactly comes back whole.
             let (cursor, count) = if crate::commands::generics::scans_whole(value) {
                 (0, usize::MAX)
@@ -1870,7 +1871,7 @@ fn zremrangebyscore(ctx: &mut Ctx) -> Vec<u8> {
 
     match map.get(key) {
         None => resp_integer(0),
-        Some(KiviDBValue::SortedSet(zs)) => {
+        Some(ValueRef::SortedSet(zs)) => {
             let mut inner = zs.write();
             // Collect members to remove first (can't mutate while iterating)
             let to_remove: Vec<(f64, ZMember)> = inner
@@ -1909,7 +1910,7 @@ fn zremrangebyrank(ctx: &mut Ctx) -> Vec<u8> {
 
     match map.get(key) {
         None => resp_integer(0),
-        Some(KiviDBValue::SortedSet(zs)) => {
+        Some(ValueRef::SortedSet(zs)) => {
             let mut inner = zs.write();
             let len = inner.by_score.len() as i64;
             if len == 0 {
@@ -1979,7 +1980,7 @@ fn zremrangebylex(ctx: &mut Ctx) -> Vec<u8> {
 
     match map.get(key) {
         None => resp_integer(0),
-        Some(KiviDBValue::SortedSet(zs)) => {
+        Some(ValueRef::SortedSet(zs)) => {
             let mut inner = zs.write();
             let to_remove: Vec<(OrderedFloat<f64>, ZMember)> = inner
                 .by_score
@@ -2049,7 +2050,7 @@ fn zrandmember(ctx: &mut Ctx) -> Vec<u8> {
                 resp_null_bulk()
             }
         }
-        Some(KiviDBValue::SortedSet(zs)) => {
+        Some(ValueRef::SortedSet(zs)) => {
             let inner = zs.read();
             // Collect into a Vec for index-based random access
             let entries: Vec<(&ZMember, f64)> =
@@ -2138,7 +2139,7 @@ fn zlexcount(ctx: &mut Ctx) -> Vec<u8> {
 
     match map.get(key) {
         None => resp_integer(0),
-        Some(KiviDBValue::SortedSet(zs)) => {
+        Some(ValueRef::SortedSet(zs)) => {
             let inner = zs.read();
             let count = inner
                 .by_score
@@ -2199,7 +2200,7 @@ fn zrangestore(ctx: &mut Ctx) -> Vec<u8> {
 
         match map.get(src) {
             None => vec![],
-            Some(KiviDBValue::SortedSet(zs)) => zrange_pairs(&zs.read(), &params),
+            Some(ValueRef::SortedSet(zs)) => zrange_pairs(&zs.read(), &params),
             Some(_) => {
                 return resp_error(
                     "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -2228,7 +2229,7 @@ fn read_zset_snapshot(
 
     match map.get(key) {
         None => Ok(None),
-        Some(KiviDBValue::SortedSet(zs)) => {
+        Some(ValueRef::SortedSet(zs)) => {
             // Clone member→score into a plain BTreeMap for manipulation.
             // We use Vec<u8> keys here (not Arc) since we're working with owned
             // data outside the lock — the lock is dropped after this block.
@@ -2240,7 +2241,7 @@ fn read_zset_snapshot(
                 .collect();
             Ok(Some(snapshot))
         }
-        Some(KiviDBValue::Set(set)) => Ok(Some(
+        Some(ValueRef::Set(set)) => Ok(Some(
             set.read()
                 .iter()
                 .map(|member| (member.as_ref().to_vec(), 1.0))
@@ -2655,7 +2656,7 @@ fn execute_range(ctx: &Ctx, key: &str, params: &RangeParams, with_scores: bool) 
 
     match map.get(key) {
         None => resp_array(vec![]),
-        Some(KiviDBValue::SortedSet(zs)) => {
+        Some(ValueRef::SortedSet(zs)) => {
             let inner = zs.read();
             let pairs = zrange_pairs(&inner, params);
             range_reply(&pairs, resp, with_scores)
@@ -2688,7 +2689,7 @@ fn pop_members(
     let shard = store::get_shard(db_ref, key);
     let map = read_lock!(shard);
     match map.get(key) {
-        Some(KiviDBValue::SortedSet(zs)) => {
+        Some(ValueRef::SortedSet(zs)) => {
             let mut inner = zs.write();
             let mut popped = Vec::new();
             while popped.len() < count {
@@ -2780,7 +2781,7 @@ fn zmpop(ctx: &mut Ctx) -> Vec<u8> {
 
         match map.get(key) {
             None => continue,
-            Some(KiviDBValue::SortedSet(zs)) => {
+            Some(ValueRef::SortedSet(zs)) => {
                 let mut inner = zs.write();
                 if inner.is_empty() {
                     continue;

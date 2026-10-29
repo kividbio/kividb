@@ -14,6 +14,7 @@ use crate::resp::write::{
     resp_array, resp_bulk_str, resp_error, resp_integer, resp_null_bulk, resp_simple,
 };
 use crate::store::Key;
+use crate::store::ValueRef;
 use crate::store::{self, SharedTsIndex, Store};
 use crate::types::{CompactionRule, DuplicatePolicy, KiviDBValue, TsAggregation, TsInner};
 use crate::{read_lock, write_lock};
@@ -269,7 +270,7 @@ pub(super) fn keys_matching_filters(
             for shard in db.iter() {
                 let map = read_lock!(shard);
                 for (k, v) in map.iter() {
-                    if matches!(v, KiviDBValue::TimeSeries(_)) {
+                    if matches!(v, ValueRef::TimeSeries(_)) {
                         all.push(k.to_string());
                     }
                 }
@@ -284,7 +285,7 @@ pub(super) fn keys_matching_filters(
         .filter(|k| {
             let shard = store::get_shard(db, k);
             let map = read_lock!(shard);
-            if let Some(KiviDBValue::TimeSeries(inner)) = map.get(k.as_str()) {
+            if let Some(ValueRef::TimeSeries(inner)) = map.get(k.as_str()) {
                 // Clone just the labels AHashMap — cheap for small label sets
                 let labels = inner.read().labels.clone();
                 filters.iter().all(|f| f.matches(&labels))
@@ -305,7 +306,7 @@ fn series_for_append(ctx: &Ctx, key: &str) -> Result<(Series, bool), Vec<u8>> {
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     let mut map = write_lock!(shard);
     match map.get(key) {
-        Some(KiviDBValue::TimeSeries(inner)) => Ok((Arc::clone(inner), false)),
+        Some(ValueRef::TimeSeries(inner)) => Ok((Arc::clone(inner), false)),
         Some(_) => Err(resp_error(WRONGTYPE)),
         None => {
             let mut fresh = TsInner::new();
@@ -369,7 +370,7 @@ fn after_append(ctx: &Ctx, key: &str, series: &Series, ts: u64) {
         let dest = {
             let shard = store::get_shard(&ctx.store[*ctx.selected_db], &dest_key);
             match read_lock!(shard).get(dest_key.as_str()) {
-                Some(KiviDBValue::TimeSeries(inner)) => Arc::clone(inner),
+                Some(ValueRef::TimeSeries(inner)) => Arc::clone(inner),
                 // The destination was deleted or replaced; the rule is dead.
                 _ => continue,
             }
@@ -484,7 +485,7 @@ fn ts_alter(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = write_lock!(shard);
 
     match map.get(key.as_str()) {
-        Some(KiviDBValue::TimeSeries(inner)) => {
+        Some(ValueRef::TimeSeries(inner)) => {
             let mut ts = inner.write();
             let old_labels = ts.labels.clone();
 
@@ -646,7 +647,7 @@ fn ts_madd(ctx: &mut Ctx) -> Option<Vec<u8>> {
         let existing = {
             let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
             match read_lock!(shard).get(key) {
-                Some(KiviDBValue::TimeSeries(inner)) => Ok(Arc::clone(inner)),
+                Some(ValueRef::TimeSeries(inner)) => Ok(Arc::clone(inner)),
                 Some(_) => Err(resp_error(WRONGTYPE)),
                 None => Err(resp_error("TSDB: the key does not exist")),
             }
@@ -784,7 +785,7 @@ fn ts_del(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = read_lock!(shard);
 
     match map.get(key.as_str()) {
-        Some(KiviDBValue::TimeSeries(inner)) => {
+        Some(ValueRef::TimeSeries(inner)) => {
             let mut ts = inner.write();
             // BTreeMap has no retain-with-range, so we collect keys to remove first
             // Teaching: this is O(N) over the range — unavoidable for correctness
@@ -975,7 +976,7 @@ fn ts_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        Some(KiviDBValue::TimeSeries(inner)) => {
+        Some(ValueRef::TimeSeries(inner)) => {
             let ts = inner.read();
             let mut out = Vec::new();
 
@@ -1134,7 +1135,7 @@ fn ts_createrule(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = write_lock!(shard);
 
     match map.get(src_key.as_str()) {
-        Some(KiviDBValue::TimeSeries(inner)) => {
+        Some(ValueRef::TimeSeries(inner)) => {
             let mut ts = inner.write();
             // Disallow duplicate destination rules
             if ts.rules.iter().any(|r| r.dest_key == rule.dest_key) {
@@ -1176,7 +1177,7 @@ fn ts_deleterule(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = write_lock!(shard);
 
     match map.get(src_key.as_str()) {
-        Some(KiviDBValue::TimeSeries(inner)) => {
+        Some(ValueRef::TimeSeries(inner)) => {
             let mut ts = inner.write();
             let before = ts.rules.len();
             ts.rules.retain(|r| r.dest_key != dest_key);

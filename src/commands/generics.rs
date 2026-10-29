@@ -11,6 +11,7 @@ use crate::keyspace_events::{KS_GENERIC, notify};
 use crate::resp::write::*;
 use crate::store;
 use crate::store::Key;
+use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::{read_lock, write_lock};
 use std::sync::Arc;
@@ -28,17 +29,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// reply with every element and cursor 0, whatever the cursor and `COUNT`
 /// say. Clients rely on it — BullMQ's dependency pagination expects a small
 /// set in one page.
-pub(crate) fn scans_whole(value: &KiviDBValue) -> bool {
+pub(crate) fn scans_whole(value: ValueRef<'_>) -> bool {
     matches!(encoding_of(value), "intset" | "listpack" | "listpackex")
 }
 
-fn encoding_of(value: &KiviDBValue) -> &'static str {
+fn encoding_of(value: ValueRef<'_>) -> &'static str {
     // An entry of a compact structure is at most this long.
     const SMALL: usize = 64;
     match value {
-        KiviDBValue::String(bytes) => {
+        ValueRef::String(bytes) => {
             let integer = bytes.len() <= 20
-                && std::str::from_utf8(bytes)
+                && std::str::from_utf8(&bytes)
                     .ok()
                     .and_then(|text| text.parse::<i64>().ok())
                     .is_some_and(|n| n.to_string().as_bytes() == &bytes[..]);
@@ -50,7 +51,7 @@ fn encoding_of(value: &KiviDBValue) -> &'static str {
                 "raw"
             }
         }
-        KiviDBValue::List(list) => {
+        ValueRef::List(list) => {
             let list = list.read();
             // One node of a quicklist holds 8 kB.
             if list.iter().map(|element| element.len() + 11).sum::<usize>() <= 8192 {
@@ -59,7 +60,7 @@ fn encoding_of(value: &KiviDBValue) -> &'static str {
                 "quicklist"
             }
         }
-        KiviDBValue::Set(set) => {
+        ValueRef::Set(set) => {
             let set = set.read();
             let integers = set.iter().all(|member| {
                 std::str::from_utf8(member)
@@ -75,7 +76,7 @@ fn encoding_of(value: &KiviDBValue) -> &'static str {
                 "hashtable"
             }
         }
-        KiviDBValue::SortedSet(zset) => {
+        ValueRef::SortedSet(zset) => {
             let zset = zset.read();
             if zset.members.len() <= 128 && zset.members.keys().all(|member| member.len() <= SMALL)
             {
@@ -84,7 +85,7 @@ fn encoding_of(value: &KiviDBValue) -> &'static str {
                 "skiplist"
             }
         }
-        KiviDBValue::Hash(hash) => {
+        ValueRef::Hash(hash) => {
             let hash = hash.read();
             let small = hash.len() <= 512
                 && hash
@@ -92,7 +93,7 @@ fn encoding_of(value: &KiviDBValue) -> &'static str {
                     .all(|(field, value)| field.len() <= SMALL && value.len() <= SMALL);
             if small { "listpack" } else { "hashtable" }
         }
-        KiviDBValue::HashEx(hash) => {
+        ValueRef::HashEx(hash) => {
             let hash = hash.read();
             let small = hash.fields.len() <= 512
                 && hash
@@ -101,8 +102,8 @@ fn encoding_of(value: &KiviDBValue) -> &'static str {
                     .all(|(field, value)| field.len() <= SMALL && value.len() <= SMALL);
             if small { "listpackex" } else { "hashtable" }
         }
-        KiviDBValue::Stream(_) => "stream",
-        KiviDBValue::Array(_) => "sliced-array",
+        ValueRef::Stream(_) => "stream",
+        ValueRef::Array(_) => "sliced-array",
         _ => "raw",
     }
 }
@@ -776,7 +777,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let shard = store::get_shard(db_ref, &src);
                 let map = read_lock!(shard);
                 match map.get(src.as_str()) {
-                    Some(v) => v.clone(),
+                    Some(v) => v.to_value(),
                     None => return Some(resp_error("ERR no such key")),
                 }
             };
@@ -1094,10 +1095,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let start = rand::random::<usize>() % shards.max(1);
                 let picked = (0..shards).find_map(|step| {
                     let map = read_lock!(ctx.store[db][(start + step) % shards]);
-                    if map.is_empty() {
-                        return None;
-                    }
-                    map.keys().nth(rand::random::<usize>() % map.len()).cloned()
+                    map.random_entry(rand::random::<usize>)
+                        .map(|(key, _)| key.to_string())
                 });
                 match picked {
                     None => break,
@@ -1167,7 +1166,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let shard = store::get_shard(db, key);
             let map = read_lock!(shard);
             let value = match map.get(key) {
-                Some(v) => v.clone(),
+                Some(v) => v.to_value(),
                 None => return Some(resp_null_bulk()),
             };
             drop(map);
@@ -1414,9 +1413,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             let mut elements: Vec<Arc<[u8]>> = match map.get(key) {
                 None => vec![], // ← don't return, just give empty vec
-                Some(KiviDBValue::List(l)) => l.read().iter().cloned().collect(),
-                Some(KiviDBValue::Set(s)) => s.read().iter().cloned().collect(),
-                Some(KiviDBValue::SortedSet(z)) => {
+                Some(ValueRef::List(l)) => l.read().iter().cloned().collect(),
+                Some(ValueRef::Set(s)) => s.read().iter().cloned().collect(),
+                Some(ValueRef::SortedSet(z)) => {
                     z.read().by_score.keys().map(|(_, m)| m.clone()).collect()
                 }
                 Some(_) => {
@@ -1427,7 +1426,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
             // A sorted set has an order of its own, which `BY nosort` keeps
             // — backwards, with `DESC`.
-            let in_score_order = matches!(map.get(key), Some(KiviDBValue::SortedSet(_)));
+            let in_score_order = matches!(map.get(key), Some(ValueRef::SortedSet(_)));
             drop(map);
 
             let constant_by_lex = by_pattern
@@ -1475,7 +1474,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                                     let map = read_lock!(shard);
 
                                     match map.get(lookup_key.as_str()) {
-                                        Some(KiviDBValue::Hash(h)) => {
+                                        Some(ValueRef::Hash(h)) => {
                                             let inner = h.read();
                                             inner
                                                 .get(field)
@@ -1491,7 +1490,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                                     let map = read_lock!(shard);
 
                                     match map.get(lookup_key.as_str()) {
-                                        Some(KiviDBValue::String(s)) => std::str::from_utf8(s)
+                                        Some(ValueRef::String(s)) => std::str::from_utf8(&s)
                                             .ok()
                                             .and_then(|v| v.parse::<f64>().ok()),
                                         _ => None,
@@ -1616,7 +1615,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             let map = read_lock!(shard);
                             // Hash field branch — push raw bytes, not resp_bulk
                             let val = match map.get(lookup_key.as_str()) {
-                                Some(KiviDBValue::Hash(h)) => {
+                                Some(ValueRef::Hash(h)) => {
                                     let inner = h.read();
                                     inner.get(field).map(|v| v.to_vec()) // raw bytes
                                 }
@@ -1629,7 +1628,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             let shard = store::get_shard(db, &lookup_key);
                             let map = read_lock!(shard);
                             let val = match map.get(lookup_key.as_str()) {
-                                Some(KiviDBValue::String(s)) => Some(s.to_vec()), // raw bytes
+                                Some(ValueRef::String(s)) => Some(s.to_vec()), // raw bytes
                                 _ => None,
                             };
                             out.push(val.unwrap_or_default());

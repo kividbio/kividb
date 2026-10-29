@@ -6,7 +6,6 @@
 //! retained bytes can be split into "still allocated by us" (bucket arrays that
 //! `clear()` keeps) versus "freed to the allocator but not returned to the OS".
 
-use ahash::AHashMap;
 use kividb::store::{self, Store};
 use kividb::types::KiviDBValue;
 
@@ -110,7 +109,7 @@ fn main() {
         let shard = store::get_shard(&store[0], &key);
         shard
             .write()
-            .insert(key.into(), KiviDBValue::String(val_src.clone()));
+            .insert(key.as_str(), KiviDBValue::String(val_src.clone()));
     }
 
     let (len, cap) = table_stats(&store);
@@ -146,7 +145,7 @@ fn main() {
     // What FLUSHDB would have to do to actually release the tables.
     for db in store.iter() {
         for shard in db.iter() {
-            *shard.write() = AHashMap::new();
+            *shard.write() = store::ShardMap::new();
         }
     }
     let (len, cap) = table_stats(&store);

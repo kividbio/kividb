@@ -589,7 +589,7 @@ fn capture(env: &Env, ranges: &[(u16, u16)]) -> std::io::Result<Vec<Captured>> {
             let expires_at = {
                 let exp = crate::commands::helpers::get_expiry_shard(&env.expiry_store, 0, key);
                 crate::read_lock!(exp)
-                    .get(key.as_str())
+                    .get(key)
                     .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0)

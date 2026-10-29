@@ -1627,7 +1627,7 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
         let value = {
             let shard = crate::store::get_shard(&ctx.store[db], key);
             match crate::read_lock!(shard).get(key) {
-                Some(v) => v.clone(),
+                Some(v) => v.to_value(),
                 None => continue,
             }
         };
