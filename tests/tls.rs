@@ -251,14 +251,19 @@ fn handshake_ok(port: u16, cert_der: &[u8]) -> bool {
                 .await
                 .unwrap();
             let name = rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
-            let Ok(mut tls) = connector.connect(name, stream).await else {
-                return false;
+            let ping = async {
+                let Ok(mut tls) = connector.connect(name, stream).await else {
+                    return false;
+                };
+                // TLS 1.3: a refused certificate shows at the first read.
+                tls.write_all(b"*1\r\n$4\r\nPING\r\n").await.is_ok() && {
+                    let mut reply = [0u8; 7];
+                    tls.read_exact(&mut reply).await.is_ok() && &reply == b"+PONG\r\n"
+                }
             };
-            // TLS 1.3: a refused certificate shows at the first read.
-            tls.write_all(b"*1\r\n$4\r\nPING\r\n").await.is_ok() && {
-                let mut reply = [0u8; 7];
-                tls.read_exact(&mut reply).await.is_ok() && &reply == b"+PONG\r\n"
-            }
+            tokio::time::timeout(Duration::from_secs(5), ping)
+                .await
+                .unwrap_or(false)
         })
 }
 
@@ -717,7 +722,7 @@ fn writes_over_tls_with_the_aof_on_are_answered_at_once() {
             let _ = self.0.wait();
         }
     }
-    let bin = std::env::var("CARGO_BIN_EXE_kividb").expect("built with the kividb binary");
+    let bin = env!("CARGO_BIN_EXE_kividb");
     let certs = generate_certs();
     for io_model in [None, Some("tokio")] {
         let dir = tempfile::tempdir().unwrap();
@@ -742,7 +747,7 @@ fn writes_over_tls_with_the_aof_on_are_answered_at_once() {
             args.extend(["--io-model".into(), model.into()]);
         }
         let _server = Killed(
-            std::process::Command::new(&bin)
+            std::process::Command::new(bin)
                 .args(&args)
                 .current_dir(dir.path())
                 .stdout(std::process::Stdio::null())
@@ -1052,6 +1057,87 @@ fn test_plain_connection_to_tls_port_fails() {
             );
         }
         Err(_) => {} // read error — also correct
+    }
+}
+
+/// A client that never finishes its handshake holds up no one else, and is
+/// dropped after the handshake timeout (10 s).
+#[test]
+fn a_stalled_handshake_does_not_block_other_clients() {
+    let certs = generate_certs();
+    let plain = free_port();
+    let tls = free_port();
+    start_server_with_tls(plain, tls, &certs);
+
+    let mut idle = TcpStream::connect(("127.0.0.1", tls)).unwrap();
+    // A failed handshake, before and while the other is pending.
+    let mut garbage = TcpStream::connect(("127.0.0.1", tls)).unwrap();
+    send_cmd(&mut garbage, &["PING"]);
+    drop(garbage);
+
+    assert!(handshake_ok(tls, &certs.cert_der));
+    assert!(handshake_ok(tls, &certs.cert_der));
+
+    idle.set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    let mut buf = [0u8; 1];
+    match idle.read(&mut buf) {
+        Ok(0) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => panic!("the stalled handshake was not dropped: {other:?}"),
+    }
+}
+
+/// As above, in the server binary: with its default I/O model, io_uring on
+/// Linux, and with tokio.
+#[test]
+fn a_stalled_handshake_does_not_block_the_binary() {
+    struct Killed(std::process::Child);
+    impl Drop for Killed {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let bin = env!("CARGO_BIN_EXE_kividb");
+    let certs = generate_certs();
+    for io_model in [None, Some("tokio")] {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = free_port();
+        let tls = free_port();
+        let mut args = vec![
+            "--port".to_string(),
+            plain.to_string(),
+            "--bind".into(),
+            "127.0.0.1".into(),
+            "--dir".into(),
+            dir.path().to_str().unwrap().into(),
+            "--tls-port".into(),
+            tls.to_string(),
+            "--tls-cert-file".into(),
+            certs.cert_path.to_str().unwrap().into(),
+            "--tls-key-file".into(),
+            certs.key_path.to_str().unwrap().into(),
+        ];
+        if let Some(model) = io_model {
+            args.extend(["--io-model".into(), model.into()]);
+        }
+        let _server = Killed(
+            std::process::Command::new(bin)
+                .args(&args)
+                .current_dir(dir.path())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("failed to start kividb"),
+        );
+        wait_open(plain);
+        wait_open(tls);
+
+        let _idle = TcpStream::connect(("127.0.0.1", tls)).unwrap();
+        assert!(
+            handshake_ok(tls, &certs.cert_der),
+            "a TLS client waited on an idle one (io model {io_model:?})"
+        );
     }
 }
 
