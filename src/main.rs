@@ -627,7 +627,6 @@ async fn bind_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
 fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std::error::Error>> {
     stats::IO_URING.store(true, std::sync::atomic::Ordering::Relaxed);
     let store: store::Store = store::new_store(config.databases);
-    let expiry_store: store::ExpiryStore = store::new_expiry_store(config.databases);
     let index_store = vector::new_index_store();
     let lastsave = Arc::new(RwLock::new(0i64));
     let aof_enabled = config.aof;
@@ -699,7 +698,6 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     crate::stats::spawn_instantaneous_ops_sampler();
     crate::commands::helpers::spawn_active_expire_task(
         Arc::clone(&store),
-        Arc::clone(&expiry_store),
         Arc::clone(&index_store),
         pubsub.clone(),
         Arc::clone(&latency),
@@ -729,7 +727,6 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
         let loaded = crate::aof::recover_local(
             config.aof,
             &store,
-            &expiry_store,
             &index_store,
             &dict_store,
             &wait_table,
@@ -770,7 +767,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                 .iter()
                 .any(|db| db.iter().any(|shard| !crate::read_lock!(shard).is_empty()))
         {
-            repl_state.fingerprint_at_start(&store, &expiry_store, &hub_tx);
+            repl_state.fingerprint_at_start(&store, &hub_tx);
         }
         if !loaded.index_names.is_empty() {
             vector::SNAPSHOT_INDEX_REBUILD.store(true, std::sync::atomic::Ordering::Release);
@@ -800,7 +797,6 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     // NEW — handles both OS signals AND command-issued SHUTDOWN
     let shutdown_signal = Arc::clone(&shutdown);
     let signal_snapshot_store = Arc::clone(&store);
-    let signal_snapshot_expiry_store = Arc::clone(&expiry_store);
     let signal_snapshot_index_store = Arc::clone(&index_store);
     let signal_repl_state = Arc::clone(&repl_state);
     std::thread::spawn(move || {
@@ -878,7 +874,6 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                     // beside it, so that the restart can ask to continue.
                     let result = crate::replication::save_dataset(
                         &signal_snapshot_store,
-                        &signal_snapshot_expiry_store,
                         &signal_snapshot_index_store,
                         &signal_repl_state,
                     );
@@ -929,7 +924,6 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     // startup is (#146). With the AOF off, the thread only waits.
     aof::spawn_auto_rewrite_thread(
         Arc::clone(&store),
-        Arc::clone(&expiry_store),
         Arc::clone(&index_store),
         config.aof_rewrite_percentage,
         config.aof_rewrite_min_size,
@@ -939,7 +933,6 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     // `ReplicaStarter::start`), so it never competes with the io_uring workers.
     let replica_starter = crate::replication::replica_client::ReplicaStarter {
         store: Arc::clone(&store),
-        expiry_store: Arc::clone(&expiry_store),
         index_store: Arc::clone(&index_store),
         dict_store: Arc::clone(&dict_store),
         wait_table: Arc::clone(&wait_table),
@@ -1012,7 +1005,6 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
             let mut inbox = inbox_ends[worker].take().expect("one inbox a worker");
             let shutdown = Arc::clone(&shutdown);
             let store = Arc::clone(&store);
-            let expiry_store = Arc::clone(&expiry_store);
             let lastsave = Arc::clone(&lastsave);
             let aof_tx = aof_tx.clone();
             let config = Arc::clone(&config);
@@ -1073,7 +1065,6 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                         let start_client = std::rc::Rc::new(
                             move |stream: tokio_uring::net::TcpStream, peer_addr_str: String| {
                             let store = Arc::clone(&store);
-                            let expiry_store = Arc::clone(&expiry_store);
                             let lastsave = Arc::clone(&lastsave);
                             let aof_tx = aof_tx.clone();
                             let config = Arc::clone(&config);
@@ -1102,7 +1093,6 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                                 if let Err(e) = server_uring::handle_client(
                                     stream,
                                     store,
-                                    expiry_store,
                                     lastsave,
                                     aof_tx,
                                     aof_enabled,
@@ -1234,7 +1224,6 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
 
         let tls_config = Arc::clone(&config);
         let tls_store = Arc::clone(&store);
-        let tls_expiry_store = expiry_store.clone();
         let tls_lastsave = Arc::clone(&lastsave);
         // The writer's own queue, as plaintext connections have. A reply to a
         // write waits until a barrier sent on this queue is in the file, and
@@ -1308,7 +1297,6 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                         let peer_addr_str = peer_addr.to_string();
 
                         let store = Arc::clone(&tls_store);
-                        let expiry_store = tls_expiry_store.clone();
                         let lastsave = Arc::clone(&tls_lastsave);
                         let aof_tx = tls_aof_tx.clone();
                         let config = Arc::clone(&tls_config);
@@ -1335,7 +1323,6 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                             if let Err(e) = server::handle_client(
                                 tls_stream,
                                 store,
-                                expiry_store,
                                 lastsave,
                                 aof_tx,
                                 tls_aof_enabled,
@@ -1403,7 +1390,6 @@ async fn async_main_tokio(
     log_info!("Bind address   : {}", config.addr());
 
     let store: store::Store = store::new_store(config.databases);
-    let expiry_store: store::ExpiryStore = store::new_expiry_store(config.databases);
     let lastsave = Arc::new(RwLock::new(0i64));
     let aof_enabled = config.aof;
     // Initialise the runtime toggle to match the startup flag.
@@ -1429,7 +1415,6 @@ async fn async_main_tokio(
     let latency = crate::latency::new_latency_tracker();
     crate::commands::helpers::spawn_active_expire_task(
         Arc::clone(&store),
-        Arc::clone(&expiry_store),
         Arc::clone(&index_store),
         pubsub.clone(),
         Arc::clone(&latency),
@@ -1489,7 +1474,6 @@ async fn async_main_tokio(
         let loaded = crate::aof::recover_local(
             config.aof,
             &store,
-            &expiry_store,
             &index_store,
             &dict_store,
             &wait_table,
@@ -1530,7 +1514,7 @@ async fn async_main_tokio(
                 .iter()
                 .any(|db| db.iter().any(|shard| !crate::read_lock!(shard).is_empty()))
         {
-            repl_state.fingerprint_at_start(&store, &expiry_store, &hub_tx);
+            repl_state.fingerprint_at_start(&store, &hub_tx);
         }
         if !loaded.index_names.is_empty() {
             vector::SNAPSHOT_INDEX_REBUILD.store(true, std::sync::atomic::Ordering::Release);
@@ -1566,7 +1550,6 @@ async fn async_main_tokio(
     // startup is (#146). With the AOF off, the thread only waits.
     aof::spawn_auto_rewrite_thread(
         Arc::clone(&store),
-        Arc::clone(&expiry_store),
         Arc::clone(&index_store),
         config.aof_rewrite_percentage,
         config.aof_rewrite_min_size,
@@ -1583,7 +1566,6 @@ async fn async_main_tokio(
     // `ReplicaStarter::start`).
     let replica_starter = crate::replication::replica_client::ReplicaStarter {
         store: Arc::clone(&store),
-        expiry_store: Arc::clone(&expiry_store),
         index_store: Arc::clone(&index_store),
         dict_store: Arc::clone(&dict_store),
         wait_table: Arc::clone(&wait_table),
@@ -1639,7 +1621,6 @@ async fn async_main_tokio(
 
         let tls_config = Arc::clone(&config);
         let tls_store = Arc::clone(&store);
-        let tls_expiry_store = expiry_store.clone();
         let tls_lastsave = Arc::clone(&lastsave);
         // The writer's own queue, as plaintext connections have. A reply to a
         // write waits until a barrier sent on this queue is in the file, and
@@ -1697,7 +1678,6 @@ async fn async_main_tokio(
                 let peer_addr_str = peer_addr.to_string();
 
                 let store = Arc::clone(&tls_store);
-                let expiry_store = tls_expiry_store.clone();
                 let lastsave = Arc::clone(&tls_lastsave);
                 let aof_tx = tls_aof_tx.clone();
                 let config = Arc::clone(&tls_config);
@@ -1724,7 +1704,6 @@ async fn async_main_tokio(
                     if let Err(e) = server::handle_client(
                         tls_stream,
                         store,
-                        expiry_store,
                         lastsave,
                         aof_tx,
                         aof_enabled,
@@ -1772,7 +1751,6 @@ async fn async_main_tokio(
     };
 
     let snapshot_store = Arc::clone(&store);
-    let snapshot_expiry_store = Arc::clone(&expiry_store);
     let snapshot_index_store = Arc::clone(&index_store);
     let snapshot_repl_state = Arc::clone(&repl_state);
     // Interval that fires every 50ms to check for command-issued SHUTDOWN.
@@ -1797,7 +1775,6 @@ async fn async_main_tokio(
                         {
                         let peer_addr_str = peer_addr.to_string();
                         let store = Arc::clone(&store);
-                        let expiry_store = Arc::clone(&expiry_store);
                         let lastsave = Arc::clone(&lastsave);
                         let aof_tx = aof_tx.clone();
                         let config = Arc::clone(&config);
@@ -1823,7 +1800,6 @@ async fn async_main_tokio(
                             if let Err(e) = server::handle_client(
                                 socket,
                                 store,
-                                expiry_store,
                                 lastsave,
                                 aof_tx,
                                 aof_enabled,
@@ -1895,7 +1871,6 @@ async fn async_main_tokio(
                         {
                         let peer_addr_str = peer_addr.to_string();
                         let store = Arc::clone(&store);
-                        let expiry_store = Arc::clone(&expiry_store);
                         let lastsave = Arc::clone(&lastsave);
                         let aof_tx = aof_tx.clone();
                         let config = Arc::clone(&config);
@@ -1921,7 +1896,6 @@ async fn async_main_tokio(
                             if let Err(e) = server::handle_client(
                                 socket,
                                 store,
-                                expiry_store,
                                 lastsave,
                                 aof_tx,
                                 aof_enabled,
@@ -1990,7 +1964,6 @@ async fn async_main_tokio(
     if m != mode::NOSAVE {
         log_info!("Stopping — writing final snapshot...");
         let store_c = Arc::clone(&snapshot_store);
-        let expiry_c = Arc::clone(&snapshot_expiry_store);
         let index_c = Arc::clone(&snapshot_index_store);
         let repl_c = Arc::clone(&snapshot_repl_state);
         // With the replica's position in its master's stream beside it, so
@@ -2001,7 +1974,7 @@ async fn async_main_tokio(
             // made after the snapshot's cut was acknowledged and then lost.
             // The guard is this thread's, and is never let go.
             let _no_more_commands = crate::command_gate::enter_alone();
-            let saved = crate::replication::save_dataset(&store_c, &expiry_c, &index_c, &repl_c);
+            let saved = crate::replication::save_dataset(&store_c, &index_c, &repl_c);
             std::mem::forget(_no_more_commands);
             saved
         })

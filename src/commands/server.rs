@@ -2,21 +2,22 @@ use crate::commands::ctx::Ctx;
 use crate::loglevel::LOG_LEVEL;
 use crate::read_lock;
 use crate::resp::write::*;
-use crate::store::ExpiryDb;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::SystemTime;
 
 /// Average remaining TTL in milliseconds for keys with a future expiry (Redis `avg_ttl`).
-fn avg_ttl_ms(expiry_db: &ExpiryDb) -> i64 {
-    let now = SystemTime::now();
+fn avg_ttl_ms(db: &crate::store::Db) -> i64 {
+    let now = crate::commands::helpers::unix_ms(std::time::SystemTime::now());
     let mut sum_ms: u128 = 0;
     let mut n = 0usize;
-    for shard in expiry_db.iter() {
+    for shard in db.iter() {
+        if shard.holds_no_ttl() {
+            continue;
+        }
         let map = read_lock!(shard);
-        for exp_at in map.values() {
-            if let Ok(rem) = exp_at.duration_since(now) {
-                sum_ms += rem.as_millis();
+        for (_, at) in map.expiring() {
+            if at >= now {
+                sum_ms += u128::from(at - now);
                 n += 1;
             }
         }
@@ -441,10 +442,7 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     // and on io_uring the connection still carried the
                     // boot-time aof_enabled=false, so that write was
                     // never logged at all.
-                    if !was_on
-                        && let Err(e) =
-                            crate::aof::checkpoint(ctx.store, ctx.expiry_store, ctx.index_store)
-                    {
+                    if !was_on && let Err(e) = crate::aof::checkpoint(ctx.store, ctx.index_store) {
                         crate::aof::AOF_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
                         return Some(resp_error(&format!("ERR enabling AOF failed: {e}")));
                     }
@@ -1636,7 +1634,7 @@ fn touch_watched_keys(ctx: &Ctx, db: Option<usize>) {
         return;
     }
     ctx.watch_registry.notify_existing(db, &|db, key| {
-        if crate::commands::helpers::is_expired(ctx.expiry_store, db, key) {
+        if crate::commands::helpers::is_expired(ctx.store, db, key) {
             return false;
         }
         ctx.store.get(db).is_some_and(|shards| {
@@ -3389,12 +3387,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
     match name {
         "SAVE" => {
-            let result = crate::replication::save_dataset(
-                ctx.store,
-                ctx.expiry_store,
-                ctx.index_store,
-                ctx.repl_state,
-            );
+            let result =
+                crate::replication::save_dataset(ctx.store, ctx.index_store, ctx.repl_state);
             match result {
                 Ok(_) => {
                     crate::stats::reset_rdb_changes();
@@ -3411,19 +3405,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 return Some(resp_error("ERR Background save already in progress"));
             }
             let store = Arc::clone(ctx.store);
-            let expiry_store_snap = Arc::clone(ctx.expiry_store);
             let index_store_snap = Arc::clone(ctx.index_store);
             let repl_state = Arc::clone(ctx.repl_state);
 
             tokio::spawn(async move {
                 let started = std::time::Instant::now();
                 let snap = tokio::task::spawn_blocking(move || {
-                    crate::replication::save_dataset(
-                        &store,
-                        &expiry_store_snap,
-                        &index_store_snap,
-                        &repl_state,
-                    )
+                    crate::replication::save_dataset(&store, &index_store_snap, &repl_state)
                 })
                 .await;
                 // `LASTSAVE` is the last save that *succeeded*. It used to
@@ -3462,13 +3450,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let flushed = if flush_is_async(cmd) {
                 let (values, flushed) = crate::store::take_db(&ctx.store[db]);
                 crate::lazyfree::free_later(values, flushed.keys as u64);
-                crate::store::clear_expiry_db(&ctx.expiry_store[db]);
                 // Nothing to give back to the OS yet: the values are freed
                 // in the background.
                 crate::store::Flushed::default()
             } else {
-                let mut flushed = crate::store::clear_db(&ctx.store[db]);
-                flushed += crate::store::clear_expiry_db(&ctx.expiry_store[db]);
+                let flushed = crate::store::clear_db(&ctx.store[db]);
                 count_flushed_in_place(&flushed);
                 flushed
             };
@@ -3615,18 +3601,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             if want("keyspace") {
                 out.push_str("# Keyspace\r\n");
-                for (i, (db, expiry_db)) in
-                    ctx.store.iter().zip(ctx.expiry_store.iter()).enumerate()
-                {
-                    let keys: usize = db.iter().map(|shard| read_lock!(shard).len()).sum();
-                    let expires: usize =
-                        expiry_db.iter().map(|shard| read_lock!(shard).len()).sum();
+                for (i, db) in ctx.store.iter().enumerate() {
+                    let (keys, expires) = db.iter().fold((0usize, 0usize), |(k, e), shard| {
+                        let map = read_lock!(shard);
+                        (k + map.len(), e + map.ttl_len())
+                    });
                     if keys > 0 || expires > 0 {
-                        let avg_ttl = if expires > 0 {
-                            avg_ttl_ms(expiry_db)
-                        } else {
-                            0
-                        };
+                        let avg_ttl = if expires > 0 { avg_ttl_ms(db) } else { 0 };
                         out.push_str(&format!(
                             "db{}:keys={},expires={},avg_ttl={}\r\n",
                             i, keys, expires, avg_ttl
@@ -4677,12 +4658,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     keys += flushed.keys;
                 }
                 crate::lazyfree::free_later(values, keys as u64);
-                for db in ctx.expiry_store.iter() {
-                    crate::store::clear_expiry_db(db);
-                }
                 crate::store::Flushed::default()
             } else {
-                let flushed = crate::store::clear_store(ctx.store, ctx.expiry_store);
+                let flushed = crate::store::clear_store(ctx.store);
                 count_flushed_in_place(&flushed);
                 flushed
             };
@@ -5438,7 +5416,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             crate::aof::checkpoint_in_background(
                 Arc::clone(ctx.store),
-                Arc::clone(ctx.expiry_store),
                 Arc::clone(ctx.index_store),
             );
             Some(resp_simple("Background append only file rewriting started"))

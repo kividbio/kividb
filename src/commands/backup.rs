@@ -204,7 +204,6 @@ fn fail(seq: u64, error: String) {
 /// What the worker thread needs from the server.
 struct Handles {
     store: crate::store::Store,
-    expiry_store: crate::store::ExpiryStore,
     index_store: crate::vector::IndexStore,
     repl_state: Arc<ReplState>,
 }
@@ -222,11 +221,7 @@ fn run_backup(handles: Handles, seq: u64, dir: PathBuf, tap: u64) {
     let frozen = {
         let _cut = crate::write_gate::cut();
         handles.repl_state.attach_tap(tap, tx);
-        crate::snapshot::freeze_dataset(
-            &handles.store,
-            Some(&handles.expiry_store),
-            Some(&handles.index_store),
-        )
+        crate::snapshot::freeze_dataset(&handles.store, Some(&handles.index_store))
     };
     {
         let mut backup = BACKUP.lock();
@@ -339,7 +334,6 @@ fn start(ctx: &Ctx) -> Vec<u8> {
 
     let handles = Handles {
         store: Arc::clone(ctx.store),
-        expiry_store: Arc::clone(ctx.expiry_store),
         index_store: Arc::clone(ctx.index_store),
         repl_state: Arc::clone(ctx.repl_state),
     };

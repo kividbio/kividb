@@ -347,8 +347,8 @@ fn cmd_pfcount(ctx: &mut Ctx) -> Vec<u8> {
             None => return resp_error("ERR key must be valid UTF-8"),
         };
 
-        if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-            expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+        if is_expired(ctx.store, *ctx.selected_db, key) {
+            expire_on_read(ctx.store, *ctx.selected_db, key);
             return resp_integer(0);
         }
 
@@ -399,8 +399,8 @@ fn cmd_pfcount(ctx: &mut Ctx) -> Vec<u8> {
             None => continue,
         };
 
-        if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-            expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+        if is_expired(ctx.store, *ctx.selected_db, key) {
+            expire_on_read(ctx.store, *ctx.selected_db, key);
             continue;
         }
 
@@ -552,8 +552,8 @@ fn cmd_pfdebug(ctx: &mut Ctx) -> Vec<u8> {
         None => return resp_error("ERR key must be valid UTF-8"),
     };
 
-    if is_expired(ctx.expiry_store, *ctx.selected_db, &key) {
-        delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, &key);
+    if is_expired(ctx.store, *ctx.selected_db, &key) {
+        delete_key_if_expired(ctx.store, *ctx.selected_db, &key);
         return resp_error("ERR no such key");
     }
 

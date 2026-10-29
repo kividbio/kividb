@@ -425,8 +425,8 @@ fn cmd_geodist(ctx: &mut Ctx) -> Vec<u8> {
         "M"
     };
 
-    if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-        expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+    if is_expired(ctx.store, *ctx.selected_db, key) {
+        expire_on_read(ctx.store, *ctx.selected_db, key);
         return resp_null_bulk();
     }
 
@@ -493,8 +493,8 @@ fn cmd_geopos(ctx: &mut Ctx) -> Vec<u8> {
         None => return resp_error("ERR key must be valid UTF-8"),
     };
 
-    if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-        expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+    if is_expired(ctx.store, *ctx.selected_db, key) {
+        expire_on_read(ctx.store, *ctx.selected_db, key);
         let nils = vec![resp_null_for(resp); cmd.len() - 2];
         return resp_array(nils);
     }
@@ -548,8 +548,8 @@ fn cmd_geohash(ctx: &mut Ctx) -> Vec<u8> {
         None => return resp_error("ERR key must be valid UTF-8"),
     };
 
-    if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-        expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+    if is_expired(ctx.store, *ctx.selected_db, key) {
+        expire_on_read(ctx.store, *ctx.selected_db, key);
         let nils = vec![resp_null_for(resp); cmd.len() - 2];
         return resp_array(nils);
     }
@@ -856,7 +856,7 @@ fn geo_search(ctx: &mut Ctx, form: Form, read_only: bool) -> Vec<u8> {
 
     // The set, if there is one. (Its members are looked at under its lock,
     // which the search takes for as long as it runs.)
-    let gone = lazy_expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, &key);
+    let gone = lazy_expire_on_read(ctx.store, *ctx.selected_db, &key);
     let zset = {
         let shard = store::get_shard(&ctx.store[*ctx.selected_db], &key);
         let map = read_lock!(shard);
@@ -1075,7 +1075,7 @@ fn geo_search(ctx: &mut Ctx, form: Form, read_only: bool) -> Vec<u8> {
     if let Some(dest) = store_key {
         let db = *ctx.selected_db;
         if found.is_empty() {
-            crate::commands::helpers::delete_key(ctx.store, ctx.expiry_store, db, &dest);
+            crate::commands::helpers::delete_key(ctx.store, db, &dest);
             return resp_integer(0);
         }
         let mut stored = SortedSetInner::new();
@@ -1091,7 +1091,7 @@ fn geo_search(ctx: &mut Ctx, form: Form, read_only: bool) -> Vec<u8> {
         }
         // The destination is a new key: whatever was there, and its time
         // to live, are gone.
-        crate::commands::helpers::delete_key(ctx.store, ctx.expiry_store, db, &dest);
+        crate::commands::helpers::delete_key(ctx.store, db, &dest);
         let shard = store::get_shard(&ctx.store[db], &dest);
         write_lock!(shard).insert(
             Key::from(dest),

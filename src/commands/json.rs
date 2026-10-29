@@ -306,7 +306,7 @@ fn remove_at(root: &mut Value, location: &Location) -> bool {
 
 /// Delete the whole key: the value, its TTL and whatever indexed it.
 fn delete_document(ctx: &Ctx, key: &str) -> bool {
-    let removed = delete_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+    let removed = delete_key(ctx.store, *ctx.selected_db, key);
     if removed {
         crate::vector::maybe_unindex(ctx.index_store, key);
     }

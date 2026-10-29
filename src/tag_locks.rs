@@ -287,6 +287,7 @@ pub fn sees_the_whole_keyspace(name: &str) -> bool {
 
 /// Whether `cmd` is the command that switches this on or off. It is run
 /// with the command gate held alone.
+#[inline(always)]
 pub fn is_switch(name: &str, cmd: &[&[u8]]) -> bool {
     name == "CONFIG"
         && cmd

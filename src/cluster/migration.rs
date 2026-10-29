@@ -279,7 +279,6 @@ pub fn ranges_text(ranges: &[(u16, u16)]) -> String {
 #[derive(Clone)]
 pub struct Env {
     pub store: crate::store::Store,
-    pub expiry_store: crate::store::ExpiryStore,
     pub index_store: crate::vector::IndexStore,
     pub repl_state: Arc<ReplState>,
     pub hub_tx: HubTx,
@@ -291,7 +290,6 @@ impl Env {
     pub fn from_ctx(ctx: &crate::commands::ctx::Ctx<'_>) -> Self {
         Self {
             store: Arc::clone(ctx.store),
-            expiry_store: Arc::clone(ctx.expiry_store),
             index_store: Arc::clone(ctx.index_store),
             repl_state: Arc::clone(ctx.repl_state),
             hub_tx: ctx.hub_tx.clone(),
@@ -438,7 +436,6 @@ impl Peer {
 fn delete_keys_in(env: &Env, ranges: &[(u16, u16)]) -> usize {
     delete_keys(
         &env.store,
-        &env.expiry_store,
         &env.index_store,
         &env.repl_state,
         &env.hub_tx,
@@ -449,7 +446,6 @@ fn delete_keys_in(env: &Env, ranges: &[(u16, u16)]) -> usize {
 /// Delete every key whose slot `in_slots` picks, telling replicas and the AOF.
 fn delete_keys(
     store: &crate::store::Store,
-    expiry_store: &crate::store::ExpiryStore,
     index_store: &crate::vector::IndexStore,
     repl_state: &Arc<ReplState>,
     hub_tx: &HubTx,
@@ -471,7 +467,7 @@ fn delete_keys(
             let _order = crate::write_order::lock_keys(0, chunk.iter().map(|k| k.as_bytes()));
             let mut del = vec![b"DEL".to_vec()];
             for key in chunk {
-                if crate::commands::helpers::delete_key(store, expiry_store, 0, key) {
+                if crate::commands::helpers::delete_key(store, 0, key) {
                     crate::vector::maybe_unindex(index_store, key);
                     del.push(key.as_bytes().to_vec());
                     removed += 1;
@@ -501,7 +497,6 @@ pub(crate) fn drop_lost_slots(cluster: &ClusterState, slots: Vec<u16>) {
     };
     let starter = &hooks.replica_starter;
     let store = Arc::clone(&starter.store);
-    let expiry_store = Arc::clone(&starter.expiry_store);
     let index_store = Arc::clone(&starter.index_store);
     let repl_state = Arc::clone(&starter.repl_state);
     let hub_tx = starter.hub_tx.clone();
@@ -512,14 +507,9 @@ pub(crate) fn drop_lost_slots(cluster: &ClusterState, slots: Vec<u16>) {
             for slot in &slots {
                 lost[*slot as usize] = true;
             }
-            let removed = delete_keys(
-                &store,
-                &expiry_store,
-                &index_store,
-                &repl_state,
-                &hub_tx,
-                |slot| lost[slot as usize],
-            );
+            let removed = delete_keys(&store, &index_store, &repl_state, &hub_tx, |slot| {
+                lost[slot as usize]
+            });
             if removed > 0 {
                 log_info!(
                     "Cluster: deleted {removed} key(s) in {} slot(s) owned by another node",
@@ -582,24 +572,19 @@ fn capture(env: &Env, ranges: &[(u16, u16)]) -> std::io::Result<Vec<Captured>> {
     };
     for shard in db.iter() {
         let map = crate::read_lock!(shard);
-        for (key, value) in map.iter() {
+        for entry in map.entries() {
+            let key = entry.key();
             if !in_ranges(ranges, key_hash_slot(key.as_bytes())) {
                 continue;
             }
-            let expires_at = {
-                let exp = crate::commands::helpers::get_expiry_shard(&env.expiry_store, 0, key);
-                crate::read_lock!(exp)
-                    .get(key)
-                    .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0)
-            };
+            // In the entry beside the value.
+            let expires_at = entry.expires().unwrap_or(0);
             if expires_at != 0 && expires_at <= now {
                 continue;
             }
             out.push(Captured {
                 key: key.to_string(),
-                value: value.deep_clone(),
+                value: entry.value().deep_clone(),
                 expires_at,
             });
         }

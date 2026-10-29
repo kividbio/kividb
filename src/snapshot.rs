@@ -656,45 +656,20 @@ pub fn write_kdb_index_sections(
 /// restart, and every replica full sync, therefore turned each expiring key
 /// into a permanent one: a session store reloaded with every session immortal.
 ///
-/// Only keys present in `maps` are written, so a key deleted between the value
-/// snapshot and this pass cannot leave an expiry pointing at nothing. Times are
-/// absolute Unix milliseconds — the same form `PEXPIREAT` replicates — so they
-/// mean the same thing on whichever node loads them.
+/// Times are absolute Unix milliseconds — the same form `PEXPIREAT`
+/// replicates — so they mean the same thing on whichever node loads them.
+/// They are taken from the keys' own entries as the dataset is captured
+/// ([`freeze`]), so an expiry cannot outlive its key into an image.
 ///
 /// It is written *last*, after the index sections, deliberately: a build that
 /// predates it reads the sections it knows and then stops, so a dump written
 /// by this build still loads there (without TTLs, as before) if a release has
 /// to be rolled back.
-pub fn write_kdb_expiry_section(
-    w: &mut impl Write,
-    maps: &[HashMap<String, KiviDBValue>],
-    expiry_store: Option<&store::ExpiryStore>,
-) -> io::Result<()> {
-    let Some(expiry_store) = expiry_store else {
-        return Ok(());
-    };
-    let per_db: ExpiryMaps = maps
-        .iter()
-        .enumerate()
-        .map(|(db_idx, map)| {
-            let mut out = HashMap::new();
-            let Some(db) = expiry_store.get(db_idx) else {
-                return out;
-            };
-            for shard in db.iter() {
-                for (key, at) in shard.read().iter() {
-                    if map.contains_key(key.as_str()) {
-                        out.insert(key.to_string(), system_time_to_unix_ms(*at));
-                    }
-                }
-            }
-            out
-        })
-        .collect();
-    write_kdb_expiry_maps(w, &per_db)
-}
-
-/// The expiry section, from already-collected maps.
+///
+/// This writes it from maps already collected, as the tests make images; a
+/// capture of the keyspace writes the same layout from the entries it holds
+/// ([`FrozenDataset`]).
+#[cfg(test)]
 pub fn write_kdb_expiry_maps(
     w: &mut impl Write,
     per_db: &[HashMap<String, u64>],
@@ -724,12 +699,13 @@ fn unix_ms_now() -> u64 {
     system_time_to_unix_ms(std::time::SystemTime::now())
 }
 
-/// A complete KDB image: header, databases, index sections, expiries.
+/// A complete KDB image of owned values: header, databases, index sections.
+/// Values in hand have no time to live: a dataset with TTLs is written from
+/// a capture of the keyspace ([`freeze_dataset`]).
 pub fn write_kdb_image(
     w: &mut impl Write,
     maps: &[HashMap<String, KiviDBValue>],
     index_store: Option<&crate::vector::IndexStore>,
-    expiry_store: Option<&store::ExpiryStore>,
 ) -> io::Result<()> {
     write_kdb_header(w, maps.len() as u32)?;
     for map in maps {
@@ -739,7 +715,6 @@ pub fn write_kdb_image(
         write_kdb_db_end(w)?;
     }
     write_kdb_index_sections(w, index_store)?;
-    write_kdb_expiry_section(w, maps, expiry_store)?;
     write_kdb_alias_section(w, index_store)?;
     write_kdb_functions_section(w, function_libraries().as_deref())
 }
@@ -1161,30 +1136,20 @@ fn read_alias_section(r: &mut impl Read) -> io::Result<Vec<(String, String)>> {
     Ok(aliases)
 }
 
-/// Write a snapshot without key expiries. Kept for callers that have no
-/// expiry store to hand; the server paths use [`write_snapshot_with_expiry`].
-// Unused by the binary, which always has an expiry store; the library exports
-// it and the snapshot tests are written against it.
-#[allow(dead_code)]
-pub fn write_snapshot(
-    path: &str,
-    maps: &[HashMap<String, KiviDBValue>],
-    index_store: Option<&crate::vector::IndexStore>,
-) -> io::Result<()> {
-    write_snapshot_with_expiry(path, maps, index_store, None)
-}
-
-/// Write a snapshot to `path`, replacing whatever is there atomically.
+/// Write a snapshot of owned values (no key expiries: see
+/// [`write_kdb_image`]) to `path`, replacing whatever is there atomically.
 ///
 /// The image is written to a sibling temp file, fsynced, and renamed into
 /// place. Writing straight into `path` (as this used to) truncates the only
 /// good copy first, so a crash or a full disk mid-save left a torn file where
 /// the previous snapshot had been.
-pub fn write_snapshot_with_expiry(
+// Unused by the binary, which writes from a capture of the keyspace; the
+// library exports it and the snapshot tests are written against it.
+#[allow(dead_code)]
+pub fn write_snapshot(
     path: &str,
     maps: &[HashMap<String, KiviDBValue>],
     index_store: Option<&crate::vector::IndexStore>,
-    expiry_store: Option<&store::ExpiryStore>,
 ) -> io::Result<()> {
     let display_path = std::env::current_dir()
         .map(|d| d.join(path))
@@ -1202,7 +1167,7 @@ pub fn write_snapshot_with_expiry(
     let result = (|| -> io::Result<()> {
         let raw = File::create(&tmp_path)?;
         let mut file = BufWriter::with_capacity(1 << 20, raw); // 1 MiB write buffer
-        write_kdb_image(&mut file, maps, index_store, expiry_store)?;
+        write_kdb_image(&mut file, maps, index_store)?;
         file.flush()?;
         file.get_ref().sync_all()?;
         drop(file);
@@ -1768,22 +1733,19 @@ fn read_expiry_section(r: &mut impl Read, expiries: &mut ExpiryMaps) -> io::Resu
     Ok(())
 }
 
-/// Install loaded expiries into the live expiry store.
-pub fn restore_expiries_into_store(
-    expiries: ExpiryMaps,
-    expiry_store: &store::ExpiryStore,
-) -> usize {
+/// Give the keys of `store` the times to live loaded with them (once their
+/// values are in). A key that is not there is given none. Returns how many
+/// were given one.
+pub fn restore_expiries_into_store(expiries: ExpiryMaps, store: &store::Store) -> usize {
     let mut total = 0usize;
     for (db_idx, map) in expiries.into_iter().enumerate() {
-        let Some(db) = expiry_store.get(db_idx) else {
+        let Some(db) = store.get(db_idx) else {
             break;
         };
-        total += map.len();
         for (key, at_ms) in map {
-            let at = std::time::UNIX_EPOCH + std::time::Duration::from_millis(at_ms);
-            store::get_expiry_shard(db, &key)
-                .write()
-                .insert(Key::from(key), at);
+            if write_lock!(store::get_shard(db, &key)).set_expires(&key, at_ms) {
+                total += 1;
+            }
         }
     }
     total
@@ -3679,10 +3641,9 @@ pub fn restore_into_store(dbs: Vec<HashMap<String, KiviDBValue>>, store: &store:
 #[allow(dead_code)]
 pub fn full_sync_payload(
     store: &crate::store::Store,
-    expiry_store: Option<&store::ExpiryStore>,
     index_store: Option<&crate::vector::IndexStore>,
 ) -> std::io::Result<Vec<u8>> {
-    freeze_dataset(store, expiry_store, index_store)?.into_payload()
+    freeze_dataset(store, index_store)?.into_payload()
 }
 
 /// A dataset captured at one instant, not yet laid out as a payload.
@@ -3698,15 +3659,14 @@ pub struct FrozenDataset {
     dbs: Vec<FrozenDb>,
     index_section: Vec<u8>,
     alias_section: Vec<u8>,
-    expiries: ExpiryMaps,
     /// The function libraries at the same instant.
     functions: Option<Vec<u8>>,
 }
 
 /// What one thread of the capture took: a hold on each string's entry
-/// (its key and bytes, which do not change while held), and everything else
-/// laid out.
-type FrozenPart = (Vec<store::EntryRef>, Vec<u8>);
+/// (its key, bytes and time to live, which do not change while held),
+/// everything else laid out, and the times to live of everything else.
+type FrozenPart = (Vec<store::EntryRef>, Vec<u8>, Vec<(Key, u64)>);
 
 #[derive(Default)]
 struct FrozenDb {
@@ -3714,31 +3674,44 @@ struct FrozenDb {
     strings: Vec<Vec<store::EntryRef>>,
     /// Complete KDB entries for every non-string key, likewise.
     encoded: Vec<Vec<u8>>,
+    /// The non-string keys with a time to live, and when it ends (Unix
+    /// milliseconds), likewise.
+    timed: Vec<Vec<(Key, u64)>>,
+}
+
+impl FrozenDb {
+    /// How many of the keys captured have a time to live.
+    fn timed_count(&self) -> usize {
+        let strings = self
+            .strings
+            .iter()
+            .flatten()
+            .filter(|e| e.expires().is_some())
+            .count();
+        strings + self.timed.iter().map(Vec::len).sum::<usize>()
+    }
 }
 
 /// Capture the dataset. The caller is expected to hold the write gate
 /// (`write_gate::cut`) so that nothing changes underneath.
 pub fn freeze_dataset(
     store: &crate::store::Store,
-    expiry_store: Option<&store::ExpiryStore>,
     index_store: Option<&crate::vector::IndexStore>,
 ) -> std::io::Result<FrozenDataset> {
-    freeze(store, expiry_store, index_store, false)
+    freeze(store, index_store, false)
 }
 
 /// [`freeze_dataset`] for `dump.kdb`: with the vector indexes' graphs, which
 /// a replica rebuilds but a restart should not have to.
 pub fn freeze_dataset_for_disk(
     store: &crate::store::Store,
-    expiry_store: Option<&store::ExpiryStore>,
     index_store: Option<&crate::vector::IndexStore>,
 ) -> std::io::Result<FrozenDataset> {
-    freeze(store, expiry_store, index_store, true)
+    freeze(store, index_store, true)
 }
 
 fn freeze(
     store: &crate::store::Store,
-    expiry_store: Option<&store::ExpiryStore>,
     index_store: Option<&crate::vector::IndexStore>,
     with_graphs: bool,
 ) -> std::io::Result<FrozenDataset> {
@@ -3767,19 +3740,26 @@ fn freeze(
                     scope.spawn(move || {
                         let mut strings = Vec::new();
                         let mut encoded = Vec::new();
+                        let mut timed = Vec::new();
                         for shard in run {
                             let map = read_lock!(shard);
                             strings.reserve(map.len());
                             for entry in map.entries() {
                                 match entry.value() {
                                     // Eight bytes and a count: no copy of
-                                    // the key, nor of the bytes.
+                                    // the key, nor of the bytes, nor of
+                                    // its time to live.
                                     ValueRef::String(_) => strings.push(entry.hold()),
-                                    other => write_kdb_entry(&mut encoded, entry.key(), other)?,
+                                    other => {
+                                        write_kdb_entry(&mut encoded, entry.key(), other)?;
+                                        if let Some(at) = entry.expires() {
+                                            timed.push((Key::from(entry.key()), at));
+                                        }
+                                    }
                                 }
                             }
                         }
-                        Ok((strings, encoded))
+                        Ok((strings, encoded, timed))
                     })
                 })
                 .collect();
@@ -3793,9 +3773,10 @@ fn freeze(
         });
         let mut frozen = FrozenDb::default();
         for part in parts {
-            let (strings, encoded) = part?;
+            let (strings, encoded, timed) = part?;
             frozen.strings.push(strings);
             frozen.encoded.push(encoded);
+            frozen.timed.push(timed);
         }
         dbs.push(frozen);
     }
@@ -3811,44 +3792,10 @@ fn freeze(
     let mut alias_section = Vec::new();
     write_kdb_alias_section(&mut alias_section, index_store)?;
 
-    let expiries = match expiry_store {
-        None => Vec::new(),
-        Some(expiry_store) => store
-            .iter()
-            .enumerate()
-            .map(|(db_idx, db)| {
-                let mut live = HashMap::new();
-                let Some(exp_db) = expiry_store.get(db_idx) else {
-                    return live;
-                };
-                for shard in exp_db.iter() {
-                    // Copied out before the value shard is consulted: holding
-                    // an expiry shard while taking a value shard is the reverse
-                    // of the order the command handlers nest them in.
-                    let entries: Vec<(String, std::time::SystemTime)> = shard
-                        .read()
-                        .iter()
-                        .map(|(key, at)| (key.to_string(), *at))
-                        .collect();
-                    for (key, at) in entries {
-                        // Only for keys that exist: an expiry outliving its
-                        // key must not travel and attach to a later key of
-                        // the same name.
-                        if read_lock!(store::get_shard(db, &key)).contains_key(key.as_str()) {
-                            live.insert(key, system_time_to_unix_ms(at));
-                        }
-                    }
-                }
-                live
-            })
-            .collect(),
-    };
-
     Ok(FrozenDataset {
         dbs,
         index_section,
         alias_section,
-        expiries,
         functions: function_libraries(),
     })
 }
@@ -3896,7 +3843,7 @@ impl FrozenDataset {
 
     fn write_to(self, out: &mut impl Write) -> std::io::Result<()> {
         write_kdb_header(out, self.dbs.len() as u32)?;
-        for db in self.dbs {
+        for db in &self.dbs {
             for entry in db.strings.iter().flatten() {
                 write_bytes(out, entry.key().as_bytes())?;
                 out.write_all(&[TAG_STRING])?;
@@ -3908,9 +3855,36 @@ impl FrozenDataset {
             write_kdb_db_end(out)?;
         }
         out.write_all(&self.index_section)?;
-        write_kdb_expiry_maps(out, &self.expiries)?;
+        self.write_expiries(out)?;
         out.write_all(&self.alias_section)?;
         write_kdb_functions_section(out, self.functions.as_deref())
+    }
+}
+
+impl FrozenDataset {
+    /// The expiry section ([`write_kdb_expiry_maps`]'s layout), from the
+    /// times the capture took with the keys.
+    fn write_expiries(&self, out: &mut impl Write) -> std::io::Result<()> {
+        let counts: Vec<usize> = self.dbs.iter().map(FrozenDb::timed_count).collect();
+        if counts.iter().all(|&n| n == 0) {
+            return Ok(());
+        }
+        out.write_all(KDB_EXPIRY_MAGIC)?;
+        out.write_all(&(self.dbs.len() as u32).to_le_bytes())?;
+        for (db, count) in self.dbs.iter().zip(counts) {
+            out.write_all(&(count as u32).to_le_bytes())?;
+            for entry in db.strings.iter().flatten() {
+                if let Some(at) = entry.expires() {
+                    write_bytes(out, entry.key().as_bytes())?;
+                    out.write_all(&at.to_le_bytes())?;
+                }
+            }
+            for (key, at) in db.timed.iter().flatten() {
+                write_bytes(out, key.as_bytes())?;
+                out.write_all(&at.to_le_bytes())?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -4700,7 +4674,7 @@ mod expiry_section_tests {
         assert!(load_snapshot_from(&full[..full.len() - 3]).is_err());
     }
 
-    /// `write_snapshot_with_expiry` replaces the file atomically: a save that
+    /// `write_snapshot` replaces the file atomically: a save that
     /// fails must leave the previous snapshot intact, not a truncated file.
     #[test]
     fn snapshot_file_is_replaced_atomically() {
@@ -4708,12 +4682,12 @@ mod expiry_section_tests {
         let path = dir.path().join("dump.kdb");
         let path_s = path.to_str().unwrap();
         let first = vec![HashMap::from([("a".to_string(), string("1"))])];
-        write_snapshot_with_expiry(path_s, &first, None, None).unwrap();
+        write_snapshot(path_s, &first, None).unwrap();
         let second = vec![HashMap::from([
             ("a".to_string(), string("1")),
             ("b".to_string(), string("2")),
         ])];
-        write_snapshot_with_expiry(path_s, &second, None, None).unwrap();
+        write_snapshot(path_s, &second, None).unwrap();
 
         assert_eq!(load_snapshot(path_s).unwrap().dbs[0].len(), 2);
         // No temp files left behind.
@@ -4790,7 +4764,7 @@ mod field_option_tests {
         store.write().insert("bare".into(), bare);
 
         let mut image = Vec::new();
-        write_kdb_image(&mut image, &[HashMap::new()], Some(&store), None).unwrap();
+        write_kdb_image(&mut image, &[HashMap::new()], Some(&store)).unwrap();
         let loaded = load_snapshot_from(image.as_slice()).unwrap();
 
         let idx = loaded
@@ -4831,7 +4805,7 @@ mod verify_tests {
             );
         }
         let mut out = Vec::new();
-        write_kdb_image(&mut out, &[map, HashMap::new()], None, None).unwrap();
+        write_kdb_image(&mut out, &[map, HashMap::new()], None).unwrap();
         out
     }
 

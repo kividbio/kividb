@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::pubsub::PubSubHub;
 use crate::replication::{HubTx, ReplState};
-use crate::store::{ExpiryStore, SharedTsIndex, Store};
+use crate::store::{SharedTsIndex, Store};
 use crate::vector::{DictStore, IndexStore};
 use crate::wait_table::WaitTable;
 use parking_lot::RwLock;
@@ -86,7 +86,6 @@ impl AofSender for GlobalAofSender {
 pub struct Ctx<'a> {
     pub cmd: Vec<&'a [u8]>,
     pub store: &'a Store,
-    pub expiry_store: &'a ExpiryStore,
     /// Not read: `LASTSAVE` is `stats::last_save()`, which every save
     /// moves (#149). Still passed around by the connection loops.
     pub lastsave: &'a Arc<RwLock<i64>>,

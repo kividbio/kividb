@@ -339,7 +339,6 @@ fn exec_fast_apply_sets(
 pub async fn handle_client<S>(
     mut stream: S,
     store: store::Store,
-    expiry_store: store::ExpiryStore,
     lastsave: Arc<RwLock<i64>>,
     aof_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     aof_enabled: bool,
@@ -748,7 +747,6 @@ where
                     let env = &*lua_env.get_or_insert_with(|| {
                         crate::lua_vm_blocking::ClientExecEnv::snapshot(
                             &store,
-                            &expiry_store,
                             &lastsave,
                             crate::lua_vm_blocking::AofBridge::Tokio(aof_tx.clone()),
                             &config,
@@ -798,7 +796,6 @@ where
                     let mut response = commands::execute_command(Ctx {
                         cmd,
                         store: &store,
-                        expiry_store: &expiry_store,
                         lastsave: &lastsave,
                         selected_db: &mut selected_db,
                         aof_tx: &aof_tx,
@@ -878,7 +875,6 @@ where
                 let mut response = commands::execute_command(Ctx {
                     cmd,
                     store: &store,
-                    expiry_store: &expiry_store,
                     lastsave: &lastsave,
                     selected_db: &mut selected_db,
                     aof_tx: &aof_tx,
@@ -1139,12 +1135,7 @@ where
                                 // A key that has already expired is watched
                                 // as the absent key it is: its removal, when
                                 // it comes, is not a change.
-                                commands::helpers::lazy_expire_key(
-                                    &store,
-                                    &expiry_store,
-                                    selected_db,
-                                    key,
-                                );
+                                commands::helpers::lazy_expire_key(&store, selected_db, key);
                                 tx.watched_keys.push((selected_db, key.to_string()));
                                 watch_registry.as_ref().watch(
                                     selected_db,
@@ -1241,7 +1232,7 @@ where
                     // has been modified, whether or not anything has got
                     // round to removing it. Removing it now says so.
                     for (db, key) in &tx.watched_keys {
-                        commands::helpers::lazy_expire_key(&store, &expiry_store, *db, key);
+                        commands::helpers::lazy_expire_key(&store, *db, key);
                     }
                     let refusal = if !tx.active {
                         None
@@ -1409,7 +1400,7 @@ where
                                     if let Some((_, guard)) =
                                         guards.iter_mut().find(|(p, _)| *p == ptr)
                                     {
-                                        guard.insert_str(key, value);
+                                        guard.insert_str_expiring(key, value, None);
                                     }
                                     // Notify while STILL HOLDING this key's shard lock. Doing this
                                     // after `drop(guards)` below would reopen the exact race this
@@ -1420,17 +1411,9 @@ where
                                     // it here cannot deadlock against the shard lock we're holding.
                                     watch_registry.as_ref().notify(selected_db, key);
                                 }
-                                // Release before touching expiry_store, matching SET's own
-                                // handler: it's a separate lock, no need to hold both at once.
+                                // A plain SET takes the key's time to live away, in
+                                // the same step as it writes the value.
                                 drop(guards);
-
-                                for (key, _) in sets.iter() {
-                                    let exp_shard =
-                                        store::get_expiry_shard(&expiry_store[selected_db], key);
-                                    if exp_shard.read().contains_key(key.as_str()) {
-                                        exp_shard.write().remove(key.as_str());
-                                    }
-                                }
 
                                 let count = sets.len();
                                 let mut exec_out = format!("*{count}\r\n").into_bytes();
@@ -1440,7 +1423,6 @@ where
                                     let cmd_ctx = Ctx {
                                         cmd: raw_cmd.iter().map(|v| v.as_slice()).collect(),
                                         store: &store,
-                                        expiry_store: &expiry_store,
                                         lastsave: &lastsave,
                                         selected_db: &mut selected_db,
                                         aof_tx: &aof_tx,
@@ -1548,7 +1530,6 @@ where
                                     let r = commands::execute_command(Ctx {
                                         cmd: exec_slices,
                                         store: &store,
-                                        expiry_store: &expiry_store,
                                         lastsave: &lastsave,
                                         selected_db: &mut selected_db,
                                         aof_tx: &aof_tx,
@@ -1593,7 +1574,6 @@ where
                                     let r = commands::execute_command(Ctx {
                                         cmd: queued_cmd.iter().map(|b| b.as_slice()).collect(),
                                         store: &store,
-                                        expiry_store: &expiry_store,
                                         lastsave: &lastsave,
                                         selected_db: &mut selected_db,
                                         aof_tx: &aof_tx,
@@ -2057,7 +2037,6 @@ where
                             let env = &*lua_env.get_or_insert_with(|| {
                                 crate::lua_vm_blocking::ClientExecEnv::snapshot(
                                     &store,
-                                    &expiry_store,
                                     &lastsave,
                                     crate::lua_vm_blocking::AofBridge::Tokio(aof_tx.clone()),
                                     &config,
@@ -2096,7 +2075,6 @@ where
                             let r = commands::execute_command(Ctx {
                                 cmd,
                                 store: &store,
-                                expiry_store: &expiry_store,
                                 lastsave: &lastsave,
                                 selected_db: &mut selected_db,
                                 aof_tx: &aof_tx,
@@ -2141,7 +2119,6 @@ where
                         let r = commands::execute_command(Ctx {
                             cmd,
                             store: &store,
-                            expiry_store: &expiry_store,
                             lastsave: &lastsave,
                             selected_db: &mut selected_db,
                             aof_tx: &aof_tx,
@@ -2304,7 +2281,6 @@ where
                     resp_tx,
                     write_task,
                     store,
-                    expiry_store,
                     lastsave,
                     aof_tx,
                     crate::aof::AOF_ENABLED.load(std::sync::atomic::Ordering::Relaxed),

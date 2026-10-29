@@ -3,7 +3,7 @@ use crate::commands::helpers::{
     ERR_INVALID_EXPIRE_PEXPIRE_CMD, ERR_INVALID_EXPIRE_PEXPIREAT_CMD, ERR_VALUE_NOT_INTEGER,
     absolute_when_ms_from_pexpire_ms, delete_key, delete_key_if_expired,
     expire_modifier_allows_set, expire_on_read, expiry_at_after, expiry_unix_millis,
-    expiry_unix_secs, get_expiry_shard, glob_match, is_expired, lazy_expire_on_read,
+    expiry_unix_secs, from_unix_ms, get_expiry, glob_match, is_expired, lazy_expire_on_read,
     parse_bytes_as_i128, parse_expire_modifier_flags, parse_utf8, set_expiry,
     system_time_from_unix_millis_i128, take_key, ttl_remaining_secs_ceil,
 };
@@ -185,7 +185,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // Falling out of the loop with shard_idx == num_shards means
             // every shard was gone through: next_cursor stays 0 (done).
 
-            keys.retain(|k| !lazy_expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, k));
+            keys.retain(|k| !lazy_expire_on_read(ctx.store, *ctx.selected_db, k));
             if let Some(ref pat) = options.pattern {
                 keys.retain(|k| glob_match(pat, k));
             }
@@ -221,7 +221,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             let mut matching: Vec<String> = Vec::new();
             for key in candidates {
-                if lazy_expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, &key) {
+                if lazy_expire_on_read(ctx.store, *ctx.selected_db, &key) {
                     continue;
                 }
                 if glob_match(pattern, &key) {
@@ -260,7 +260,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         None => return Some(resp_error("ERR key must be valid UTF-8")),
                     };
                     let db = *ctx.selected_db;
-                    let gone = lazy_expire_on_read(ctx.store, ctx.expiry_store, db, key);
+                    let gone = lazy_expire_on_read(ctx.store, db, key);
                     let map = read_lock!(store::get_shard(&ctx.store[db], key));
                     Some(match map.get(key).filter(|_| !gone) {
                         Some(value) => resp_bulk_str(encoding_of(value)),
@@ -282,7 +282,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         None => return Some(resp_error("ERR key must be valid UTF-8")),
                     };
                     let db = *ctx.selected_db;
-                    let gone = lazy_expire_on_read(ctx.store, ctx.expiry_store, db, key);
+                    let gone = lazy_expire_on_read(ctx.store, db, key);
                     if gone || !read_lock!(store::get_shard(&ctx.store[db], key)).contains_key(key) {
                         return Some(resp_null_bulk());
                     }
@@ -347,8 +347,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         Some(k) => k,
                         None => return Some(resp_error("ERR key must be valid UTF-8")),
                     };
-                    if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                        expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+                    if is_expired(ctx.store, *ctx.selected_db, key) {
+                        expire_on_read(ctx.store, *ctx.selected_db, key);
                         return Some(resp_null_bulk());
                     }
                     let db = &ctx.store[*ctx.selected_db];
@@ -375,27 +375,25 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => return Some(resp_error("ERR must be valid UTF-8")),
             };
 
-            if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+            if is_expired(ctx.store, *ctx.selected_db, key) {
+                expire_on_read(ctx.store, *ctx.selected_db, key);
                 return Some(resp_integer(-2));
             }
 
             let db_ref = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db_ref, key);
-            if !read_lock!(shard).contains_key(key) {
-                return Some(resp_integer(-2)); // key does not exist
-            }
-
-            let expiry_shard = get_expiry_shard(ctx.expiry_store, *ctx.selected_db, key);
-            let map = read_lock!(expiry_shard);
-            match map.get(key) {
+            let expires = match read_lock!(shard).get_expiring(key) {
+                None => return Some(resp_integer(-2)), // key does not exist
+                Some((_, expires)) => expires,
+            };
+            match expires {
                 None => Some(resp_integer(-1)), // key exists but no TTL
-                Some(exp) => {
-                    match exp.duration_since(crate::script_clock::wall_system_time_now()) {
-                        Ok(d) => Some(resp_integer(ttl_remaining_secs_ceil(d))),
-                        Err(_) => Some(resp_integer(-2)),
-                    }
-                }
+                Some(at) => match from_unix_ms(at)
+                    .duration_since(crate::script_clock::wall_system_time_now())
+                {
+                    Ok(d) => Some(resp_integer(ttl_remaining_secs_ceil(d))),
+                    Err(_) => Some(resp_integer(-2)),
+                },
             }
         }
 
@@ -410,15 +408,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => return Some(resp_error("ERR must be valid UTF-8")),
             };
 
-            let expiry_shard = get_expiry_shard(ctx.expiry_store, *ctx.selected_db, key);
-            let mut map = write_lock!(expiry_shard);
-            match map.remove(key) {
-                Some(_) => {
-                    drop(map);
-                    notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "persist", key);
-                    Some(resp_integer(1))
-                }
-                None => Some(resp_integer(0)),
+            if crate::commands::helpers::clear_expiry(ctx.store, *ctx.selected_db, key) {
+                notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "persist", key);
+                Some(resp_integer(1))
+            } else {
+                Some(resp_integer(0))
             }
         }
 
@@ -434,8 +428,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
 
             // Expired keys are invisible — report as "none"
-            if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+            if is_expired(ctx.store, *ctx.selected_db, key) {
+                expire_on_read(ctx.store, *ctx.selected_db, key);
                 return Some(resp_simple("none"));
             }
 
@@ -477,7 +471,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
 
             if ms == 0 {
-                let removed = delete_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+                let removed = delete_key(ctx.store, *ctx.selected_db, key);
                 if removed {
                     crate::vector::maybe_unindex(ctx.index_store, key);
                     crate::vector::maybe_request_compaction(
@@ -498,8 +492,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => return Some(resp_error(ERR_INVALID_EXPIRE_PEXPIRE_CMD)),
             };
 
-            let exp_shard = get_expiry_shard(ctx.expiry_store, *ctx.selected_db, key);
-            let current = read_lock!(exp_shard).get(key).copied();
+            let current = get_expiry(ctx.store, *ctx.selected_db, key);
 
             if !expire_modifier_allows_set(&flags, current, new_exp) {
                 return Some(resp_integer(0));
@@ -507,7 +500,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             let now = crate::script_clock::wall_system_time_now();
             if new_exp <= now {
-                let removed = delete_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+                let removed = delete_key(ctx.store, *ctx.selected_db, key);
                 if removed {
                     crate::vector::maybe_unindex(ctx.index_store, key);
                     crate::vector::maybe_request_compaction(
@@ -519,7 +512,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 return Some(resp_integer(if removed { 1 } else { 0 }));
             }
 
-            set_expiry(ctx.expiry_store, *ctx.selected_db, key, new_exp);
+            set_expiry(ctx.store, *ctx.selected_db, key, new_exp);
             notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "expire", key);
             Some(resp_integer(1))
         }
@@ -561,7 +554,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let new_exp = expiry_unix_secs(unix_secs_u64);
             let now = crate::script_clock::wall_system_time_now();
             if new_exp <= now {
-                let removed = delete_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+                let removed = delete_key(ctx.store, *ctx.selected_db, key);
                 if removed {
                     crate::vector::maybe_unindex(ctx.index_store, key);
                     crate::vector::maybe_request_compaction(
@@ -574,8 +567,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
 
             if let Some(ref f) = flag {
-                let exp_shard = get_expiry_shard(ctx.expiry_store, *ctx.selected_db, key);
-                let current = read_lock!(exp_shard).get(key).copied();
+                let current = get_expiry(ctx.store, *ctx.selected_db, key);
                 let should_set = match f.as_str() {
                     "NX" => current.is_none(),
                     "XX" => current.is_some(),
@@ -590,7 +582,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
             }
 
-            set_expiry(ctx.expiry_store, *ctx.selected_db, key, new_exp);
+            set_expiry(ctx.store, *ctx.selected_db, key, new_exp);
             notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "expire", key);
             Some(resp_integer(1))
         }
@@ -628,7 +620,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             let now = crate::script_clock::wall_system_time_now();
             if new_exp <= now {
-                let removed = delete_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+                let removed = delete_key(ctx.store, *ctx.selected_db, key);
                 if removed {
                     crate::vector::maybe_unindex(ctx.index_store, key);
                     crate::vector::maybe_request_compaction(
@@ -641,8 +633,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
 
             if let Some(ref f) = flag {
-                let exp_shard = get_expiry_shard(ctx.expiry_store, *ctx.selected_db, key);
-                let current = read_lock!(exp_shard).get(key).copied();
+                let current = get_expiry(ctx.store, *ctx.selected_db, key);
                 let should_set = match f.as_str() {
                     "NX" => current.is_none(),
                     "XX" => current.is_some(),
@@ -657,7 +648,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
             }
 
-            set_expiry(ctx.expiry_store, *ctx.selected_db, key, new_exp);
+            set_expiry(ctx.store, *ctx.selected_db, key, new_exp);
             notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "expire", key);
             Some(resp_integer(1))
         }
@@ -676,27 +667,25 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => return Some(resp_error("ERR must be valid UTF-8")),
             };
 
-            if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+            if is_expired(ctx.store, *ctx.selected_db, key) {
+                expire_on_read(ctx.store, *ctx.selected_db, key);
                 return Some(resp_integer(-2));
             }
 
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
-            if !read_lock!(shard).contains_key(key) {
-                return Some(resp_integer(-2));
-            }
-
-            let expiry_shard = get_expiry_shard(ctx.expiry_store, *ctx.selected_db, key);
-            let map = read_lock!(expiry_shard);
-            match map.get(key) {
+            let expires = match read_lock!(shard).get_expiring(key) {
+                None => return Some(resp_integer(-2)),
+                Some((_, expires)) => expires,
+            };
+            match expires {
                 None => Some(resp_integer(-1)),
-                Some(exp) => {
-                    match exp.duration_since(crate::script_clock::wall_system_time_now()) {
-                        Ok(d) => Some(resp_integer(d.as_millis() as i64)),
-                        Err(_) => Some(resp_integer(-2)),
-                    }
-                }
+                Some(at) => match from_unix_ms(at)
+                    .duration_since(crate::script_clock::wall_system_time_now())
+                {
+                    Ok(d) => Some(resp_integer(d.as_millis() as i64)),
+                    Err(_) => Some(resp_integer(-2)),
+                },
             }
         }
 
@@ -718,36 +707,25 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let db = *ctx.selected_db;
             let db_ref = &ctx.store[db];
 
-            // Read + remove from src
-            let value = {
+            // Read + remove from src, with its time to live
+            let (value, expiry) = {
                 let shard = store::get_shard(db_ref, &src);
                 let mut map = write_lock!(shard);
                 match map.remove(src.as_str()) {
-                    Some(v) => v.into_value(),
+                    Some(v) => {
+                        let expiry = v.expires();
+                        (v.into_value(), expiry)
+                    }
                     None => return Some(resp_error("ERR no such key")),
                 }
             };
 
-            // Move expiry if present
-            let expiry = {
-                let exp_shard =
-                    crate::commands::helpers::get_expiry_shard(ctx.expiry_store, db, &src);
-                let mut map = write_lock!(exp_shard);
-                map.remove(src.as_str())
-            };
-
-            // Write to dst
+            // Write to dst, the time to live going with the value: the one
+            // dst had, if any, goes.
             {
                 let shard = store::get_shard(db_ref, &dst);
                 let mut map = write_lock!(shard);
-                map.insert(Key::from(&*dst), value);
-            }
-
-            // Set or clear expiry on dst
-            if let Some(exp) = expiry {
-                crate::commands::helpers::set_expiry(ctx.expiry_store, db, &dst, exp);
-            } else {
-                crate::commands::helpers::clear_expiry(ctx.expiry_store, db, &dst);
+                map.insert_expiring(Key::from(&*dst), value, expiry);
             }
             notify(ctx.pubsub, db, KS_GENERIC, "rename_from", &src);
             notify(ctx.pubsub, db, KS_GENERIC, "rename_to", &dst);
@@ -773,11 +751,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let db_ref = &ctx.store[db];
 
             // Check src exists
-            let src_value = {
+            let (src_value, expiry) = {
                 let shard = store::get_shard(db_ref, &src);
                 let map = read_lock!(shard);
-                match map.get(src.as_str()) {
-                    Some(v) => v.to_value(),
+                match map.get_expiring(src.as_str()) {
+                    Some((v, expiry)) => (v.to_value(), expiry),
                     None => return Some(resp_error("ERR no such key")),
                 }
             };
@@ -798,18 +776,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             {
                 let shard = store::get_shard(db_ref, &dst);
-                write_lock!(shard).insert(Key::from(&*dst), src_value);
-            }
-
-            // Move expiry
-            let expiry = {
-                let exp_shard =
-                    crate::commands::helpers::get_expiry_shard(ctx.expiry_store, db, &src);
-                let mut map = write_lock!(exp_shard);
-                map.remove(src.as_str())
-            };
-            if let Some(exp) = expiry {
-                crate::commands::helpers::set_expiry(ctx.expiry_store, db, &dst, exp);
+                write_lock!(shard).insert_expiring(Key::from(&*dst), src_value, expiry);
             }
             notify(ctx.pubsub, db, KS_GENERIC, "rename_from", &src);
             notify(ctx.pubsub, db, KS_GENERIC, "rename_to", &dst);
@@ -863,15 +830,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 return Some(resp_error("ERR invalid DB index"));
             }
 
-            // Read source value
-            let value = {
+            // Read source value, and its time to live
+            let (value, expiry) = {
                 let db_ref = &ctx.store[src_db];
                 let shard = store::get_shard(db_ref, &src_key);
                 let map = read_lock!(shard);
-                match map.get(src_key.as_str()) {
+                match map.get_expiring(src_key.as_str()) {
                     // A copy of its own, not another name for the same
                     // value. See `deep_clone`.
-                    Some(v) => v.deep_clone(),
+                    Some((v, expiry)) => (v.deep_clone(), expiry),
                     None => return Some(resp_integer(0)),
                 }
             };
@@ -886,26 +853,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
             }
 
-            // Write to destination
+            // Write to destination, with the source's time to live (the
+            // key replaced may have had one: the copy has the source's, or
+            // none).
             {
                 let shard = store::get_shard(dst_db_ref, &dst_key);
-                write_lock!(shard).insert(Key::from(&*dst_key), value);
-            }
-
-            // Copy expiry if same db or if source has one
-            let expiry = {
-                let exp_shard =
-                    crate::commands::helpers::get_expiry_shard(ctx.expiry_store, src_db, &src_key);
-                let map = read_lock!(exp_shard);
-                map.get(src_key.as_str()).copied()
-            };
-            match expiry {
-                Some(exp) => {
-                    crate::commands::helpers::set_expiry(ctx.expiry_store, dst_db, &dst_key, exp);
-                }
-                // The key replaced may have had a time to live. The copy
-                // has the source's: none.
-                None => crate::commands::helpers::clear_expiry(ctx.expiry_store, dst_db, &dst_key),
+                write_lock!(shard).insert_expiring(Key::from(&*dst_key), value, expiry);
             }
             notify(ctx.pubsub, dst_db, KS_GENERIC, "copy_to", &dst_key);
             Some(resp_integer(1))
@@ -932,8 +885,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 };
                 // Redis: expireIfNeeded deletes volatile keys first; that removal does not add
                 // to the DEL count (see redis `delGenericCommand`).
-                if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                    if delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key) {
+                if is_expired(ctx.store, *ctx.selected_db, key) {
+                    if delete_key_if_expired(ctx.store, *ctx.selected_db, key) {
                         crate::vector::maybe_unindex(ctx.index_store, key);
                         crate::vector::maybe_request_compaction(
                             ctx.index_store,
@@ -944,11 +897,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     continue;
                 }
                 let deleted = if unlink {
-                    take_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key)
+                    take_key(ctx.store, *ctx.selected_db, key)
                         .map(crate::lazyfree::release)
                         .is_some()
                 } else {
-                    delete_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key)
+                    delete_key(ctx.store, *ctx.selected_db, key)
                 };
                 if deleted {
                     crate::vector::maybe_unindex(ctx.index_store, key);
@@ -991,13 +944,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 return Some(resp_integer(0));
             }
 
-            // Read + remove from source
-            let value = {
+            // Read + remove from source, with its time to live
+            let (value, expiry) = {
                 let db_ref = &ctx.store[src_db];
                 let shard = store::get_shard(db_ref, &key);
                 let mut map = write_lock!(shard);
                 match map.remove(key.as_str()) {
-                    Some(v) => v.into_value(),
+                    Some(v) => {
+                        let expiry = v.expires();
+                        (v.into_value(), expiry)
+                    }
                     None => return Some(resp_integer(0)),
                 }
             };
@@ -1011,7 +967,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     // Restore to source
                     drop(map);
                     let src_shard = store::get_shard(&ctx.store[src_db], &key);
-                    write_lock!(src_shard).insert(Key::from(key), value);
+                    write_lock!(src_shard).insert_expiring(Key::from(key), value, expiry);
                     return Some(resp_integer(0));
                 }
             }
@@ -1019,18 +975,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // Write to target
             {
                 let shard = store::get_shard(dst_db_ref, &key);
-                write_lock!(shard).insert(Key::from(&*key), value);
-            }
-
-            // Move expiry
-            let expiry = {
-                let exp_shard =
-                    crate::commands::helpers::get_expiry_shard(ctx.expiry_store, src_db, &key);
-                let mut map = write_lock!(exp_shard);
-                map.remove(key.as_str())
-            };
-            if let Some(exp) = expiry {
-                crate::commands::helpers::set_expiry(ctx.expiry_store, target_db, &key, exp);
+                write_lock!(shard).insert_expiring(Key::from(&*key), value, expiry);
             }
 
             Some(resp_integer(1))
@@ -1071,15 +1016,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 std::mem::swap(&mut *map1, &mut *map2);
             }
 
-            // Swap expiry shards too
-            let exp1_ref = &ctx.expiry_store[db1];
-            let exp2_ref = &ctx.expiry_store[db2];
-            for (shard1, shard2) in exp1_ref.iter().zip(exp2_ref.iter()) {
-                let mut map1 = write_lock!(shard1);
-                let mut map2 = write_lock!(shard2);
-                std::mem::swap(&mut *map1, &mut *map2);
-            }
-
             Some(resp_simple("OK"))
         }
 
@@ -1100,7 +1036,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 });
                 match picked {
                     None => break,
-                    Some(key) if lazy_expire_on_read(ctx.store, ctx.expiry_store, db, &key) => {
+                    Some(key) if lazy_expire_on_read(ctx.store, db, &key) => {
                         expired = Some(key);
                     }
                     Some(key) => return Some(resp_bulk_str(&key)),
@@ -1132,8 +1068,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     Some(k) => k,
                     None => continue,
                 };
-                if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                    expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+                if is_expired(ctx.store, *ctx.selected_db, key) {
+                    expire_on_read(ctx.store, *ctx.selected_db, key);
                     continue;
                 }
                 let shard = store::get_shard(db, key);
@@ -1158,8 +1094,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(k) => k,
                 None => return Some(resp_error("ERR key must be valid UTF-8")),
             };
-            if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+            if is_expired(ctx.store, *ctx.selected_db, key) {
+                expire_on_read(ctx.store, *ctx.selected_db, key);
                 return Some(resp_null_bulk());
             }
             let db = &ctx.store[*ctx.selected_db];
@@ -1271,8 +1207,17 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 _ => Vec::new(),
             };
 
-            // Store it
-            crate::commands::helpers::store_value(ctx.store, ctx.expiry_store, db_idx, &key, value);
+            // Store it, with its time to live
+            let expires_at = (ttl_ms > 0).then(|| {
+                if absttl {
+                    expiry_unix_millis(ttl_ms)
+                } else {
+                    expiry_at_after(Duration::from_millis(ttl_ms))
+                }
+            });
+            crate::commands::helpers::store_value_expiring(
+                ctx.store, db_idx, &key, value, expires_at,
+            );
             if !ts_labels.is_empty() {
                 let mut index = write_lock!(ctx.ts_index);
                 for (label, label_value) in ts_labels {
@@ -1281,16 +1226,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         .or_default()
                         .insert(key.clone());
                 }
-            }
-
-            // Apply TTL
-            if ttl_ms > 0 {
-                let expires_at = if absttl {
-                    expiry_unix_millis(ttl_ms)
-                } else {
-                    expiry_at_after(Duration::from_millis(ttl_ms))
-                };
-                crate::commands::helpers::set_expiry(ctx.expiry_store, db_idx, &key, expires_at);
             }
 
             if crate::eviction::recording() {
@@ -1323,8 +1258,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => return Some(resp_error("ERR key must be valid UTF-8")),
             };
 
-            if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+            if is_expired(ctx.store, *ctx.selected_db, key) {
+                expire_on_read(ctx.store, *ctx.selected_db, key);
                 // SORT on missing key returns empty array, or 0 if STORE
                 return Some(resp_array(vec![]));
             }
@@ -1690,23 +1625,17 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
 
             // Lazy-evict expired keys, same as TTL/PTTL do.
-            if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+            if is_expired(ctx.store, *ctx.selected_db, key) {
+                expire_on_read(ctx.store, *ctx.selected_db, key);
                 return Some(resp_integer(-2));
             }
 
-            // Key existence check on the value shard.
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
-            if !read_lock!(shard).contains_key(key) {
-                return Some(resp_integer(-2));
-            }
-
-            // Look up the expiry. None → no TTL.
-            let exp_shard = get_expiry_shard(ctx.expiry_store, *ctx.selected_db, key);
-            let exp = match read_lock!(exp_shard).get(key).copied() {
-                Some(e) => e,
-                None => return Some(resp_integer(-1)),
+            let exp = match read_lock!(shard).get_expiring(key) {
+                None => return Some(resp_integer(-2)),
+                Some((_, None)) => return Some(resp_integer(-1)),
+                Some((_, Some(at))) => from_unix_ms(at),
             };
 
             Some(resp_integer(system_time_to_unix(exp, TimeUnit::Secs)))
@@ -1725,21 +1654,17 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => return Some(resp_error("ERR must be valid UTF-8")),
             };
 
-            if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+            if is_expired(ctx.store, *ctx.selected_db, key) {
+                expire_on_read(ctx.store, *ctx.selected_db, key);
                 return Some(resp_integer(-2));
             }
 
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
-            if !read_lock!(shard).contains_key(key) {
-                return Some(resp_integer(-2));
-            }
-
-            let exp_shard = get_expiry_shard(ctx.expiry_store, *ctx.selected_db, key);
-            let exp = match read_lock!(exp_shard).get(key).copied() {
-                Some(e) => e,
-                None => return Some(resp_integer(-1)),
+            let exp = match read_lock!(shard).get_expiring(key) {
+                None => return Some(resp_integer(-2)),
+                Some((_, None)) => return Some(resp_integer(-1)),
+                Some((_, Some(at))) => from_unix_ms(at),
             };
 
             Some(resp_integer(system_time_to_unix(exp, TimeUnit::Millis)))

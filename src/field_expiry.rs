@@ -22,7 +22,7 @@ use ahash::AHashMap;
 use parking_lot::Mutex;
 use std::time::Instant;
 
-use crate::store::{ExpiryStore, Store};
+use crate::store::Store;
 use crate::vector::IndexStore;
 
 /// A hash with field TTLs: which server's store it is in, which database,
@@ -91,7 +91,7 @@ pub fn rescan(store: &Store) {
 
 /// Expire the fields that are due, in every hash of `store` that is being
 /// watched.
-pub fn sweep(store: &Store, expiry_store: &ExpiryStore, index_store: &IndexStore) {
+pub fn sweep(store: &Store, index_store: &IndexStore) {
     let id = store_id(store);
     let now = Instant::now();
     let due: Vec<(usize, String)> = {
@@ -153,7 +153,6 @@ pub fn sweep(store: &Store, expiry_store: &ExpiryStore, index_store: &IndexStore
                 still_empty && map.remove(key.as_str()).is_some()
             };
             if removed {
-                crate::commands::helpers::clear_expiry(expiry_store, db, &key);
                 crate::vector::maybe_unindex(index_store, &key);
                 next = None;
             }
@@ -255,7 +254,6 @@ mod tests {
     #[test]
     fn due_fields_go_and_an_empty_hash_goes_with_them() {
         let store = crate::store::new_store(1);
-        let expiry_store = crate::store::new_expiry_store(1);
         let index_store = crate::vector::new_index_store();
         let put = |key: &str, value: KiviDBValue| {
             crate::store::get_shard(&store[0], key)
@@ -271,11 +269,11 @@ mod tests {
         assert_eq!(watched_in(&store), 2, "a hash without TTLs is not watched");
 
         // Nothing is due yet.
-        sweep(&store, &expiry_store, &index_store);
+        sweep(&store, &index_store);
         assert_eq!(fields_of(&store, "some").unwrap().len(), 3);
 
         std::thread::sleep(Duration::from_millis(60));
-        sweep(&store, &expiry_store, &index_store);
+        sweep(&store, &index_store);
         assert_eq!(fields_of(&store, "some").unwrap(), ["b", "c"]);
         assert_eq!(fields_of(&store, "all"), None, "an empty hash is deleted");
         assert_eq!(fields_of(&store, "none").unwrap(), ["a"]);
@@ -289,7 +287,7 @@ mod tests {
             .write()
             .insert_str("replaced", &b"x"[..]);
         std::thread::sleep(Duration::from_millis(60));
-        sweep(&store, &expiry_store, &index_store);
+        sweep(&store, &index_store);
         assert_eq!(watched_in(&store), 1);
 
         // After a rescan, what is there is what is watched.

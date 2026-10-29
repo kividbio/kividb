@@ -89,10 +89,7 @@ fn value_digest(h: &mut Xxh3, value: crate::store::ValueRef<'_>) {
 
 /// The fingerprint of the dataset. Call with nothing writing to it: at
 /// startup, or on a replica between syncs.
-pub fn dataset_digest(
-    store: &crate::store::Store,
-    expiry_store: &crate::store::ExpiryStore,
-) -> u64 {
+pub fn dataset_digest(store: &crate::store::Store) -> u64 {
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
@@ -108,13 +105,23 @@ pub fn dataset_digest(
                     scope.spawn(move || {
                         let mut sum = 0u64;
                         for shard in run {
-                            for (key, value) in crate::read_lock!(shard).iter() {
+                            for entry in crate::read_lock!(shard).entries() {
+                                let key = entry.key();
                                 let mut h = Xxh3::new();
                                 h.update(&(db_index as u64).to_le_bytes());
                                 h.update(&(key.len() as u64).to_le_bytes());
                                 h.update(key.as_bytes());
-                                value_digest(&mut h, value);
+                                value_digest(&mut h, entry.value());
                                 sum = sum.wrapping_add(h.digest());
+                                // Its time to live, if it has one.
+                                if let Some(ms) = entry.expires() {
+                                    let mut h = Xxh3::new();
+                                    h.update(b"ttl");
+                                    h.update(&(db_index as u64).to_le_bytes());
+                                    h.update(key.as_bytes());
+                                    h.update(&ms.to_le_bytes());
+                                    sum = sum.wrapping_add(h.digest());
+                                }
                             }
                         }
                         sum
@@ -127,34 +134,6 @@ pub fn dataset_digest(
                 .fold(0u64, u64::wrapping_add)
         });
         total = total.wrapping_add(keys_sum);
-
-        // Times to live, of keys that exist.
-        if let Some(exp_db) = expiry_store.get(db_index) {
-            for shard in exp_db.iter() {
-                let entries: Vec<(String, u64)> = crate::read_lock!(shard)
-                    .iter()
-                    .map(|(key, at)| {
-                        let ms = at
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0);
-                        (key.to_string(), ms)
-                    })
-                    .collect();
-                for (key, ms) in entries {
-                    if crate::read_lock!(crate::store::get_shard(db, &key))
-                        .contains_key(key.as_str())
-                    {
-                        let mut h = Xxh3::new();
-                        h.update(b"ttl");
-                        h.update(&(db_index as u64).to_le_bytes());
-                        h.update(key.as_bytes());
-                        h.update(&ms.to_le_bytes());
-                        total = total.wrapping_add(h.digest());
-                    }
-                }
-            }
-        }
     }
     total
 }
@@ -168,8 +147,6 @@ mod tests {
     fn the_fingerprint_follows_the_data_not_its_order() {
         let a = crate::store::new_store(1);
         let b = crate::store::new_store(1);
-        let ea = crate::store::new_expiry_store(1);
-        let eb = crate::store::new_expiry_store(1);
         let set = |store: &crate::store::Store, k: &str, v: &str| {
             crate::write_lock!(crate::store::get_shard(&store[0], k)).insert_str(k, v.as_bytes());
         };
@@ -179,9 +156,16 @@ mod tests {
         for i in (0..100).rev() {
             set(&b, &format!("k{i}"), "v");
         }
-        assert_eq!(dataset_digest(&a, &ea), dataset_digest(&b, &eb));
+        assert_eq!(dataset_digest(&a), dataset_digest(&b));
         set(&b, "k7", "w");
-        assert_ne!(dataset_digest(&a, &ea), dataset_digest(&b, &eb));
+        assert_ne!(dataset_digest(&a), dataset_digest(&b));
+        // A time to live is part of it.
+        crate::write_lock!(crate::store::get_shard(&a[0], "k7")).insert_str("k7", b"w");
+        assert_eq!(dataset_digest(&a), dataset_digest(&b));
+        crate::write_lock!(crate::store::get_shard(&a[0], "k7")).set_expires("k7", 99);
+        assert_ne!(dataset_digest(&a), dataset_digest(&b));
+        crate::write_lock!(crate::store::get_shard(&b[0], "k7")).set_expires("k7", 99);
+        assert_eq!(dataset_digest(&a), dataset_digest(&b));
     }
 
     /// A HyperLogLog's cached count is each node's own: two that differ only
@@ -189,10 +173,6 @@ mod tests {
     #[test]
     fn a_hyperloglogs_cached_count_is_not_part_of_the_fingerprint() {
         let (a, b) = (crate::store::new_store(1), crate::store::new_store(1));
-        let (ea, eb) = (
-            crate::store::new_expiry_store(1),
-            crate::store::new_expiry_store(1),
-        );
         let hll = |cache: u8, register: u8| {
             let mut blob = vec![0u8; 16 + 12288];
             blob[..4].copy_from_slice(b"HYLL");
@@ -207,8 +187,8 @@ mod tests {
         };
         put(&a, hll(0, 1));
         put(&b, hll(7, 1));
-        assert_eq!(dataset_digest(&a, &ea), dataset_digest(&b, &eb));
+        assert_eq!(dataset_digest(&a), dataset_digest(&b));
         put(&b, hll(7, 2));
-        assert_ne!(dataset_digest(&a, &ea), dataset_digest(&b, &eb));
+        assert_ne!(dataset_digest(&a), dataset_digest(&b));
     }
 }

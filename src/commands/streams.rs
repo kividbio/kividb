@@ -702,7 +702,7 @@ pub fn xlen(ctx: &mut Ctx) -> Vec<u8> {
         None => return resp_error("ERR key must be valid UTF-8"),
     };
 
-    let gone = lazy_expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+    let gone = lazy_expire_on_read(ctx.store, *ctx.selected_db, key);
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);

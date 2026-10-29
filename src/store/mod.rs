@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use ahash::AHashMap;
 use ahash::AHashSet;
@@ -14,9 +13,7 @@ pub use shard_map::{
     EntryRef, EntryView, Leftover, NewEntry, Relocated, ShardMap, StrRef, Taken, ValueRef,
 };
 
-/// Which shard `key` is in, of `shards` (a power of two). The keyspace and
-/// the expiry store have the same number, so one index serves both: a
-/// command that looks in both hashes its key once.
+/// Which shard `key` is in, of `shards` (a power of two).
 ///
 /// 64-bit FNV-1a on every target (a 32-bit `usize` can't hold its
 /// constants); the shard is taken from its low bits.
@@ -30,11 +27,8 @@ pub fn shard_index(shards: usize, key: &str) -> usize {
     (hash as usize) & (shards - 1)
 }
 
+#[inline(always)]
 pub fn get_shard<'a>(db: &'a Db, key: &str) -> &'a Shard {
-    &db[shard_index(db.len(), key)]
-}
-
-pub fn get_expiry_shard<'a>(db: &'a ExpiryDb, key: &str) -> &'a ExpiryShard {
     &db[shard_index(db.len(), key)]
 }
 
@@ -51,168 +45,130 @@ pub fn num_shards() -> usize {
 
 /// One shard of expiry times.
 ///
+/// Its table behind a lock, and beside the lock how many of its keys have a
+/// time to live.
+///
 /// Nearly every command asks whether its key has expired, and in most
-/// datasets most shards hold no expiry time at all. Taking the lock to find
-/// that out writes the lock's word, which every thread asking shares: on many
-/// cores the cache line spends its time moving between them. So the shard
-/// keeps a count beside the lock, written by whoever held the lock for
-/// writing as they let go, and read by anybody without taking anything.
-pub struct ExpiryCell {
-    /// Entries in `map`, as of the last writer to let go of it.
-    len: AtomicUsize,
-    map: RwLock<AHashMap<Key, SystemTime>>,
+/// datasets most shards hold no key with a time to live. A read that finds
+/// its key finds the key's time in the same entry; a command that asks
+/// before it locks the shard for what it does would take the lock twice. So
+/// the shard keeps the count beside the lock, written by whoever held the
+/// lock for writing as they let go, and read by anybody without taking
+/// anything.
+pub struct ShardLock {
+    map: RwLock<ShardMap>,
+    /// Keys in `map` with a time to live, as of the last writer to let go.
+    ttls: AtomicUsize,
 }
 
-/// The write lock of an [`ExpiryCell`]. It is the map, and on the way out it
-/// leaves the map's size where a reader can see it without the lock.
-pub struct ExpiryWrite<'a> {
-    map: parking_lot::RwLockWriteGuard<'a, AHashMap<Key, SystemTime>>,
-    len: &'a AtomicUsize,
+/// The write lock of a [`ShardLock`]. It is the table, and on the way out
+/// it leaves the count of keys with a time to live where a reader can see
+/// it without the lock.
+pub struct ShardWrite<'a> {
+    map: parking_lot::RwLockWriteGuard<'a, ShardMap>,
+    ttls: &'a AtomicUsize,
 }
 
-impl std::ops::Deref for ExpiryWrite<'_> {
-    type Target = AHashMap<Key, SystemTime>;
-    #[inline]
-    fn deref(&self) -> &Self::Target {
+impl std::ops::Deref for ShardWrite<'_> {
+    type Target = ShardMap;
+    #[inline(always)]
+    fn deref(&self) -> &ShardMap {
         &self.map
     }
 }
 
-impl std::ops::DerefMut for ExpiryWrite<'_> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
+impl std::ops::DerefMut for ShardWrite<'_> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut ShardMap {
         &mut self.map
     }
 }
 
-impl Drop for ExpiryWrite<'_> {
-    #[inline]
+impl Drop for ShardWrite<'_> {
+    #[inline(always)]
     fn drop(&mut self) {
         // Before the lock is released (the guard is dropped after this).
-        self.len.store(self.map.len(), Ordering::Release);
+        // Its line is this thread's already: the lock's word is beside it.
+        let ttls = self.map.ttl_len();
+        if self.ttls.load(Ordering::Relaxed) != ttls {
+            self.ttls.store(ttls, Ordering::Release);
+        }
     }
 }
 
-impl ExpiryCell {
-    pub fn new() -> Self {
-        ExpiryCell {
-            len: AtomicUsize::new(0),
-            map: RwLock::new(AHashMap::new()),
+impl ShardLock {
+    pub fn new(map: ShardMap) -> Self {
+        ShardLock {
+            ttls: AtomicUsize::new(map.ttl_len()),
+            map: RwLock::new(map),
         }
     }
 
-    #[inline]
-    pub fn read(&self) -> parking_lot::RwLockReadGuard<'_, AHashMap<Key, SystemTime>> {
+    #[inline(always)]
+    pub fn read(&self) -> parking_lot::RwLockReadGuard<'_, ShardMap> {
         self.map.read()
     }
 
-    #[inline]
-    pub fn write(&self) -> ExpiryWrite<'_> {
-        ExpiryWrite {
+    #[inline(always)]
+    pub fn write(&self) -> ShardWrite<'_> {
+        ShardWrite {
             map: self.map.write(),
-            len: &self.len,
+            ttls: &self.ttls,
         }
     }
 
-    /// No key in this shard has an expiry time, as of the last write to it.
-    /// Costs one load and takes no lock. A writer adding the first one at
-    /// this moment is not seen, exactly as if this had been asked a moment
-    /// earlier.
+    /// No key in this shard has a time to live, as of the last write to
+    /// it. Costs one load and takes no lock. A writer giving the first one
+    /// a time at this moment is not seen, exactly as if this had been asked
+    /// a moment earlier.
+    #[inline(always)]
+    pub fn holds_no_ttl(&self) -> bool {
+        self.ttls.load(Ordering::Acquire) == 0
+    }
+
+    /// How many of this shard's keys have a time to live, as of the last
+    /// write to it, read without the lock.
     #[inline]
-    pub fn holds_nothing(&self) -> bool {
-        self.len.load(Ordering::Acquire) == 0
+    pub fn ttl_count(&self) -> usize {
+        self.ttls.load(Ordering::Acquire)
     }
 
-    /// [`shrink_if_sparse`] for this shard's times. The count is left as it
-    /// is: shrinking takes no key out.
+    /// Give the table back the room of keys that have gone (#113).
+    ///
+    /// A hash table grows as keys come and does not shrink as they go:
+    /// after a reshard moved half the keys away, or a big delete, each
+    /// shard's table kept the size it had at its largest, and the memory of
+    /// every empty slot. Called on each shard about once a second (see
+    /// `commands::helpers::shrink_sparse_tables`), as Redis resizes its
+    /// tables from its cron.
+    ///
+    /// A table holding no more than 4/9 of what it has room for is shrunk
+    /// to its keys and an eighth more, and so is the list of the keys with
+    /// a time to live. Tables grow by doubling, so the smallest one with
+    /// that room has room for less than twice it: a table just shrunk, and
+    /// one just grown, are never sparse enough to shrink, and a shard does
+    /// not go back and forth unless its keys do, by more than an eighth.
+    /// The rehash holds the shard's lock no longer than the growth it
+    /// undoes did. Returns whether it shrank.
     pub fn shrink_if_sparse(&self) -> bool {
-        shrink_if_sparse(&self.map)
+        if !self.read().is_sparse() {
+            return false;
+        }
+        let mut m = self.write();
+        if !m.is_sparse() {
+            return false;
+        }
+        let keep = m.len() + m.len() / 8;
+        m.shrink_to(keep);
+        true
     }
 }
 
-/// Tables with room for fewer keys than this are left as they are: what
-/// shrinking one would give back is not worth a rehash.
-const SHRINK_MIN_CAPACITY: usize = 256;
-
-/// Give a table back the room of keys that have gone (#113).
-///
-/// A hash table grows as keys come and does not shrink as they go: after a
-/// reshard moved half the keys away, or a big delete, each shard's table
-/// kept the size it had at its largest, and the memory of every empty slot.
-/// Called on each shard about once a second (see
-/// `commands::helpers::shrink_sparse_tables`), as Redis resizes its tables
-/// from its cron.
-///
-/// A table holding no more than 4/9 of what it has room for is shrunk to
-/// its keys and an eighth more. Tables grow by doubling, so the smallest one
-/// with that room has room for less than twice it: a table just shrunk, and
-/// one just grown, are never sparse enough to shrink, and a shard does not
-/// go back and forth unless its keys do, by more than an eighth. The rehash
-/// holds the shard's lock no longer than the growth it undoes did. Returns
-/// whether it shrank.
-pub fn shrink_if_sparse<M: Sizes>(map: &RwLock<M>) -> bool {
-    let sparse = |m: &M| m.capacity() >= SHRINK_MIN_CAPACITY && m.len() * 9 <= m.capacity() * 4;
-    if !sparse(&map.read()) {
-        return false;
-    }
-    let mut m = map.write();
-    if !sparse(&m) {
-        return false;
-    }
-    let keep = m.len() + m.len() / 8;
-    m.shrink_to(keep);
-    true
-}
-
-/// What [`shrink_if_sparse`] and a flush need of a table: the keyspace's
-/// and the expiry store's are different types.
-#[allow(clippy::len_without_is_empty)]
-pub trait Sizes: Default {
-    fn len(&self) -> usize;
-    fn capacity(&self) -> usize;
-    fn shrink_to(&mut self, keys: usize);
-    fn clear(&mut self);
-}
-
-impl<V> Sizes for AHashMap<Key, V> {
-    fn len(&self) -> usize {
-        (**self).len()
-    }
-    fn capacity(&self) -> usize {
-        (**self).capacity()
-    }
-    fn shrink_to(&mut self, keys: usize) {
-        (**self).shrink_to(keys)
-    }
-    fn clear(&mut self) {
-        (**self).clear()
-    }
-}
-
-impl Sizes for ShardMap {
-    fn len(&self) -> usize {
-        ShardMap::len(self)
-    }
-    fn capacity(&self) -> usize {
-        ShardMap::capacity(self)
-    }
-    fn shrink_to(&mut self, keys: usize) {
-        ShardMap::shrink_to(self, keys)
-    }
-    fn clear(&mut self) {
-        ShardMap::clear(self)
-    }
-}
-
-impl Default for ExpiryCell {
+impl Default for ShardLock {
     fn default() -> Self {
-        Self::new()
+        Self::new(ShardMap::new())
     }
 }
-
-pub type ExpiryShard = Arc<ExpiryCell>;
-pub type ExpiryDb = Arc<Vec<ExpiryShard>>;
-pub type ExpiryStore = Arc<Vec<ExpiryDb>>;
 
 /// A key, as the keyspace holds it: the bytes in the entry itself when there
 /// are twenty-four or fewer, which is nearly every key anybody uses, and on
@@ -224,7 +180,7 @@ pub type ExpiryStore = Arc<Vec<ExpiryDb>>;
 /// the same size as a `String` was, so the table is no larger.
 pub type Key = compact_str::CompactString;
 
-pub type Shard = Arc<RwLock<ShardMap>>;
+pub type Shard = Arc<ShardLock>;
 pub type Db = Arc<Vec<Shard>>;
 pub type Store = Arc<Vec<Db>>;
 
@@ -244,25 +200,12 @@ pub fn new_store(dbs: usize) -> Store {
     let dbs = (0..dbs)
         .map(|_| {
             let shards = (0..num_shards)
-                .map(|_| Arc::new(RwLock::new(ShardMap::new())))
+                .map(|_| Arc::new(ShardLock::default()))
                 .collect::<Vec<_>>();
             Arc::new(shards)
         })
         .collect::<Vec<_>>();
 
-    Arc::new(dbs)
-}
-
-pub fn new_expiry_store(dbs: usize) -> ExpiryStore {
-    let num_shards = num_shards();
-    let dbs = (0..dbs)
-        .map(|_| {
-            let shards = (0..num_shards)
-                .map(|_| Arc::new(ExpiryCell::new()))
-                .collect::<Vec<_>>();
-            Arc::new(shards)
-        })
-        .collect::<Vec<_>>();
     Arc::new(dbs)
 }
 
@@ -276,7 +219,7 @@ macro_rules! mem_swap_rwlock_maps {
 /// asking the allocator to return pages to the OS.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Flushed {
-    /// Entries removed: keys, and the TTLs of those that had one.
+    /// Entries removed: keys.
     pub entries: usize,
     /// Keys removed.
     pub keys: usize,
@@ -326,11 +269,11 @@ impl Flushed {
 
 /// Empty one shard, releasing its table when the table is large enough to be
 /// worth releasing. See [`SHARD_RELEASE_MIN_CAPACITY`].
-fn clear_shard_map<M: Sizes>(map: &mut M) -> Flushed {
+fn clear_shard_map(map: &mut ShardMap) -> Flushed {
     let entries = map.len();
     let capacity = map.capacity();
     if capacity >= SHARD_RELEASE_MIN_CAPACITY {
-        *map = M::default();
+        *map = ShardMap::default();
         Flushed {
             entries,
             slots_released: capacity,
@@ -349,7 +292,7 @@ fn clear_shard_map<M: Sizes>(map: &mut M) -> Flushed {
 pub fn clear_db(db: &Db) -> Flushed {
     let mut total = Flushed::default();
     for shard in db.iter() {
-        total += clear_shard_map(&mut *shard.write());
+        total += clear_shard_map(&mut shard.write());
     }
     total.keys = total.entries;
     total
@@ -376,23 +319,11 @@ pub fn take_db(db: &Db) -> (Vec<ShardMap>, Flushed) {
     (taken, total)
 }
 
-/// Empty every expiry shard of one database.
-pub fn clear_expiry_db(db: &ExpiryDb) -> Flushed {
-    let mut total = Flushed::default();
-    for shard in db.iter() {
-        total += clear_shard_map(&mut *shard.write());
-    }
-    total
-}
-
 /// Empty every database. Used by `FLUSHALL` and `CLUSTER RESET HARD`.
-pub fn clear_store(store: &Store, expiry: &ExpiryStore) -> Flushed {
+pub fn clear_store(store: &Store) -> Flushed {
     let mut total = Flushed::default();
     for db in store.iter() {
         total += clear_db(db);
-    }
-    for db in expiry.iter() {
-        total += clear_expiry_db(db);
     }
     total
 }
@@ -444,30 +375,10 @@ pub fn swap_kv_with_staging(live: &Store, staging: &Store) {
     }
 }
 
-/// Same as [`swap_kv_with_staging`] for expiry shards.
-pub fn swap_expiry_with_staging(live: &ExpiryStore, staging: &ExpiryStore) {
-    assert_eq!(
-        live.len(),
-        staging.len(),
-        "staging expiry db count mismatch"
-    );
-    for (db_live, db_staging) in live.iter().zip(staging.iter()) {
-        assert_eq!(
-            db_live.len(),
-            db_staging.len(),
-            "staging expiry shard count mismatch"
-        );
-        for (s_live, s_staging) in db_live.iter().zip(db_staging.iter()) {
-            mem_swap_rwlock_maps!(s_live, s_staging);
-        }
-    }
-}
-
 #[cfg(test)]
 mod flush_tests {
     use super::*;
     use crate::types::KiviDBValue;
-    use std::time::SystemTime;
 
     fn val() -> KiviDBValue {
         KiviDBValue::String(crate::types::SharedBytes::from(&b"v"[..]))
@@ -534,26 +445,24 @@ mod flush_tests {
     }
 
     #[test]
-    fn clear_store_empties_every_db_and_expiry() {
+    fn clear_store_empties_every_db_and_its_times_to_live() {
         let store = new_store(4);
-        let expiry = new_expiry_store(4);
         for db in 0..4 {
             fill(&store, db, 64);
-            let key = format!("exp-{db}");
-            get_expiry_shard(&expiry[db], &key)
-                .write()
-                .insert(Key::from(key), SystemTime::now());
+            let key = format!("flush-key-{:012}", 7);
+            assert!(get_shard(&store[db], &key).write().set_expires(&key, 1));
         }
 
-        let flushed = clear_store(&store, &expiry);
+        let flushed = clear_store(&store);
 
-        assert_eq!(flushed.entries, 4 * 64 + 4);
+        assert_eq!(flushed.entries, 4 * 64);
         for db in 0..4 {
             assert_eq!(total(&store[db]).0, 0, "db{db} still has keys");
-            assert_eq!(
-                expiry[db].iter().map(|s| s.read().len()).sum::<usize>(),
-                0,
-                "db{db} still has expiries"
+            assert!(
+                store[db]
+                    .iter()
+                    .all(|s| s.holds_no_ttl() && s.read().ttl_len() == 0),
+                "db{db} still has times to live"
             );
         }
     }
@@ -620,7 +529,6 @@ mod flush_tests {
 mod staging_swap_tests {
     use super::*;
     use crate::types::KiviDBValue;
-    use std::time::SystemTime;
 
     /// Full-resync uses swap so live never serves an empty cleared map while RDB is on the wire.
     #[test]
@@ -643,101 +551,152 @@ mod staging_swap_tests {
     }
 
     #[test]
-    fn swap_expiry_with_staging_moves_expiry_shards() {
-        let live = new_expiry_store(1);
-        let staging = new_expiry_store(1);
+    fn a_swap_moves_times_to_live_with_their_keys() {
+        let live = new_store(1);
+        let staging = new_store(1);
         let k = "exp-key";
-        let t = SystemTime::now();
-        get_expiry_shard(&staging[0], k)
+        let val = KiviDBValue::String(crate::types::SharedBytes::from(&b"v"[..]));
+        get_shard(&staging[0], k)
             .write()
-            .insert(Key::from(k), t);
-        assert!(get_expiry_shard(&live[0], k).read().get(k).is_none());
-        swap_expiry_with_staging(&live, &staging);
-        assert_eq!(get_expiry_shard(&live[0], k).read().get(k), Some(&t));
+            .insert_expiring(k, val, Some(1_234));
+        assert!(!get_shard(&staging[0], k).holds_no_ttl());
+        swap_kv_with_staging(&live, &staging);
+        assert_eq!(get_shard(&live[0], k).read().expires(k), Some(1_234));
+        assert!(!get_shard(&live[0], k).holds_no_ttl());
+        assert!(get_shard(&staging[0], k).holds_no_ttl());
     }
 }
 
 #[cfg(test)]
 mod shrink_tests {
     use super::*;
+    use crate::types::KiviDBValue;
 
-    fn table(keys: usize) -> RwLock<AHashMap<Key, u64>> {
-        let map: AHashMap<Key, u64> = (0..keys as u64)
-            .map(|i| (Key::from(format!("key-{i}")), i))
-            .collect();
-        RwLock::new(map)
+    fn table(keys: usize) -> ShardLock {
+        let mut map = ShardMap::new();
+        for i in 0..keys {
+            map.insert(
+                format!("key-{i}"),
+                KiviDBValue::String(crate::types::SharedBytes::from(i.to_string().as_str())),
+            );
+        }
+        ShardLock::new(map)
+    }
+
+    fn value(map: &ShardLock, key: &str) -> Option<Vec<u8>> {
+        match map.read().get(key) {
+            Some(ValueRef::String(b)) => Some(b.to_vec()),
+            _ => None,
+        }
     }
 
     #[test]
     fn a_table_keys_have_mostly_left_shrinks_once() {
         let map = table(100_000);
         let grown = map.read().capacity();
-        map.write().retain(|_, i| *i % 10 == 0);
-        assert!(shrink_if_sparse(&map));
+        for i in (0..100_000).filter(|i| i % 10 != 0) {
+            map.write().remove(&format!("key-{i}"));
+        }
+        assert!(map.shrink_if_sparse());
         let shrunk = map.read().capacity();
         assert!(shrunk * 4 < grown, "{grown} -> {shrunk}");
         assert!(shrunk >= 10_000 + 10_000 / 8, "no room left: {shrunk}");
         assert_eq!(map.read().len(), 10_000);
-        assert_eq!(map.read().get("key-990"), Some(&990));
+        assert_eq!(value(&map, "key-990"), Some(b"990".to_vec()));
         // Not again until more keys go.
-        assert!(!shrink_if_sparse(&map));
+        assert!(!map.shrink_if_sparse());
+    }
+
+    #[test]
+    fn a_list_of_times_to_live_most_have_left_shrinks() {
+        let map = table(10_000);
+        for i in 0..10_000 {
+            map.write().set_expires(&format!("key-{i}"), u64::MAX / 2);
+        }
+        let grown = {
+            let m = map.read();
+            assert_eq!(m.ttl_len(), 10_000);
+            m.ttl_len()
+        };
+        for i in (0..10_000).filter(|i| i % 10 != 0) {
+            assert!(map.write().persist(&format!("key-{i}")));
+        }
+        // The table is full; the list is not.
+        assert!(map.shrink_if_sparse());
+        assert_eq!(map.read().ttl_len(), 1_000);
+        assert_eq!(map.read().len(), 10_000);
+        assert_eq!(map.read().expires("key-990"), Some(u64::MAX / 2));
+        assert_eq!(map.read().expires("key-991"), None);
+        assert!(grown > 1_000);
+        assert!(!map.shrink_if_sparse());
     }
 
     #[test]
     fn full_small_and_just_grown_tables_are_left_alone() {
         let map = table(100_000);
-        assert!(!shrink_if_sparse(&map));
+        assert!(!map.shrink_if_sparse());
         let small = table(100);
         small.write().clear();
-        assert!(!shrink_if_sparse(&small));
+        assert!(!small.shrink_if_sparse());
         // Grown by one key past its room: half empty, but not sparse.
         let map = table(0);
         let mut i = 0u64;
         loop {
             let before = map.read().capacity();
-            map.write().insert(Key::from(format!("key-{i}")), i);
+            map.write().insert_str(format!("key-{i}"), b"v");
             i += 1;
             if before >= 4096 && map.read().capacity() > before {
                 break;
             }
         }
-        assert!(!shrink_if_sparse(&map));
+        assert!(!map.shrink_if_sparse());
     }
 }
 
 #[cfg(test)]
-mod expiry_cell_tests {
-    use super::ExpiryCell;
-    use std::time::SystemTime;
+mod shard_lock_tests {
+    use super::*;
+    use crate::types::KiviDBValue;
+
+    fn s() -> KiviDBValue {
+        KiviDBValue::String(crate::types::SharedBytes::from(&b"v"[..]))
+    }
 
     /// The count readers see without the lock follows every way a writer
-    /// can change the map, because it is taken as the writer lets go.
+    /// can give a key a time to live or take it away, because it is taken
+    /// as the writer lets go.
     #[test]
     fn the_count_follows_what_writers_do() {
-        let cell = ExpiryCell::new();
-        assert!(cell.holds_nothing());
+        let cell = ShardLock::default();
+        assert!(cell.holds_no_ttl());
 
-        cell.write()
-            .insert(crate::store::Key::from("a"), SystemTime::now());
-        assert!(!cell.holds_nothing());
+        cell.write().insert_expiring("a", s(), Some(5));
+        assert!(!cell.holds_no_ttl());
 
-        cell.write()
-            .entry(crate::store::Key::from("b"))
-            .or_insert_with(SystemTime::now);
+        cell.write().insert_str("b", b"x");
+        cell.write().set_expires("b", 9);
+        assert_eq!(cell.ttl_count(), 2);
         cell.write().remove("a");
-        assert!(!cell.holds_nothing());
+        assert!(!cell.holds_no_ttl());
+        // An overwrite keeps it; one that says so takes it away.
+        cell.write().insert("b", s());
+        assert_eq!(cell.read().expires("b"), Some(9));
+        cell.write().insert_expiring("b", s(), None);
+        assert!(cell.holds_no_ttl());
 
-        cell.write().retain(|_, _| false);
-        assert!(cell.holds_nothing());
+        cell.write().insert_expiring("c", s(), Some(1));
+        assert!(cell.write().persist("c"));
+        assert!(cell.holds_no_ttl());
+        cell.write().set_expires("c", 3);
+        cell.write().clear();
+        assert!(cell.holds_no_ttl());
 
         // Swapped whole, as SWAPDB and a flush do.
-        let other = ExpiryCell::new();
-        other
-            .write()
-            .insert(crate::store::Key::from("c"), SystemTime::now());
+        let other = ShardLock::default();
+        other.write().insert_expiring("c", s(), Some(2));
         std::mem::swap(&mut *cell.write(), &mut *other.write());
-        assert!(!cell.holds_nothing());
-        assert!(other.holds_nothing());
-        assert_eq!(cell.read().len(), 1);
+        assert!(!cell.holds_no_ttl());
+        assert!(other.holds_no_ttl());
+        assert_eq!(cell.read().ttl_len(), 1);
     }
 }

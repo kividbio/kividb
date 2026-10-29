@@ -10,7 +10,7 @@
 
 use crate::commands::blocking;
 use crate::commands::ctx::Ctx;
-use crate::commands::helpers::{clear_expiry, lazy_expire_key, parse_utf8};
+use crate::commands::helpers::{lazy_expire_key, parse_utf8};
 use crate::keyspace_events::{KS_GENERIC, KS_LIST, notify};
 use crate::resp::write::*;
 use crate::store;
@@ -184,14 +184,14 @@ pub(super) fn move_elements(
     spec: &MoveSpec,
 ) -> Result<Option<Moved>, Vec<u8>> {
     let db = *ctx.selected_db;
-    lazy_expire_key(ctx.store, ctx.expiry_store, db, src);
+    lazy_expire_key(ctx.store, db, src);
     // The source first, as in Redis: with nothing to move, what the
     // destination holds does not come into it.
     let Some(src_list) = list_at(ctx, src)? else {
         return Ok(None);
     };
     if dst != src {
-        lazy_expire_key(ctx.store, ctx.expiry_store, db, dst);
+        lazy_expire_key(ctx.store, db, dst);
         // The destination's type is checked before anything leaves the source.
         list_at(ctx, dst)?;
     }
@@ -264,9 +264,9 @@ pub(super) fn move_elements(
             Some(ValueRef::List(l)) if Arc::ptr_eq(l, &src_list) && l.read().is_empty()
         );
         if still_empty {
-            map.remove(src);
+            let removed = map.remove(src);
             drop(map);
-            clear_expiry(ctx.expiry_store, db, src);
+            drop(removed);
             source_deleted = true;
         }
     }

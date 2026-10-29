@@ -178,7 +178,6 @@ pub(super) fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             store_value(
                 ctx.store,
-                ctx.expiry_store,
                 db,
                 key,
                 KiviDBValue::Hash(Arc::new(RwLock::new(hash))),

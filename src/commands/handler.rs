@@ -1294,7 +1294,6 @@ fn drop_if_empty(ctx: &Ctx, db: usize, key: &str) -> bool {
         still_empty && map.remove(key).is_some()
     };
     if removed {
-        helpers::clear_expiry(ctx.expiry_store, db, key);
         crate::vector::maybe_unindex(ctx.index_store, key);
         crate::keyspace_events::notify(
             ctx.pubsub,
@@ -1588,7 +1587,6 @@ mod replica_loading_gate_tests {
 
     fn run_as_slave(repl_state: &Arc<ReplState>, cmd: Vec<Vec<u8>>, apply_stream: bool) -> Vec<u8> {
         let store = crate::store::new_store(1);
-        let expiry_store = crate::store::new_expiry_store(1);
         let lastsave = Arc::new(RwLock::new(0i64));
         let (hub_tx, mut hub_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::replication::HubMsg>();
@@ -1617,7 +1615,6 @@ mod replica_loading_gate_tests {
         execute_command(Ctx {
             cmd: cmd.iter().map(|v| v.as_slice()).collect(),
             store: &store,
-            expiry_store: &expiry_store,
             lastsave: &lastsave,
             selected_db: &mut selected_db,
             aof_tx: &NoopAofSender,

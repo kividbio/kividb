@@ -743,12 +743,7 @@ fn zcard(ctx: &mut Ctx) -> Vec<u8> {
         None => return resp_error("ERR key must be valid UTF-8"),
     };
 
-    if crate::commands::helpers::lazy_expire_on_read(
-        ctx.store,
-        ctx.expiry_store,
-        *ctx.selected_db,
-        key,
-    ) {
+    if crate::commands::helpers::lazy_expire_on_read(ctx.store, *ctx.selected_db, key) {
         return resp_integer(0);
     }
 
@@ -2405,15 +2400,9 @@ fn parse_weights_aggregate(cmd: &[&[u8]], start: usize, num_keys: usize) -> Weig
 /// behind rather than an empty sorted set.
 fn store_zset(ctx: &mut Ctx, dst_key: &str, members: ahash::AHashMap<Vec<u8>, f64>) {
     if members.is_empty() {
-        crate::commands::helpers::delete_key(
-            ctx.store,
-            ctx.expiry_store,
-            *ctx.selected_db,
-            dst_key,
-        );
+        crate::commands::helpers::delete_key(ctx.store, *ctx.selected_db, dst_key);
         return;
     }
-    crate::commands::helpers::clear_expiry(ctx.expiry_store, *ctx.selected_db, dst_key);
     let mut inner = SortedSetInner::new();
     for (member, score) in members {
         let arc: ZMember = Arc::from(member.as_slice());
@@ -2422,7 +2411,9 @@ fn store_zset(ctx: &mut Ctx, dst_key: &str, members: ahash::AHashMap<Vec<u8>, f6
     let zs = Arc::new(RwLock::new(inner));
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, dst_key);
-    write_lock!(shard).insert(Key::from(dst_key), KiviDBValue::SortedSet(zs));
+    let replaced =
+        write_lock!(shard).insert_expiring(Key::from(dst_key), KiviDBValue::SortedSet(zs), None);
+    drop(replaced);
 }
 
 fn zrangebyscore(ctx: &mut Ctx) -> Vec<u8> {

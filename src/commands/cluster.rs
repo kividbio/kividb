@@ -1621,23 +1621,16 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
         let Ok(key) = std::str::from_utf8(key) else {
             continue;
         };
-        if crate::commands::helpers::lazy_expire_key(ctx.store, ctx.expiry_store, db, key) {
+        if crate::commands::helpers::lazy_expire_key(ctx.store, db, key) {
             continue;
         }
-        let value = {
+        // The value and its time to live, read together.
+        let (value, expires_at_ms) = {
             let shard = crate::store::get_shard(&ctx.store[db], key);
-            match crate::read_lock!(shard).get(key) {
-                Some(v) => v.to_value(),
+            match crate::read_lock!(shard).get_expiring(key) {
+                Some((v, expires)) => (v.to_value(), expires.unwrap_or(0)),
                 None => continue,
             }
-        };
-        let expires_at_ms = {
-            let shard = crate::commands::helpers::get_expiry_shard(ctx.expiry_store, db, key);
-            crate::read_lock!(shard)
-                .get(key)
-                .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0)
         };
         if expires_at_ms != 0 && expires_at_ms <= now_ms {
             continue;
@@ -1758,7 +1751,7 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
     // ── Delete what the destination confirmed ────────────────────────────
     if !copy {
         for key in &moved {
-            crate::commands::helpers::delete_key(ctx.store, ctx.expiry_store, db, key);
+            crate::commands::helpers::delete_key(ctx.store, db, key);
             crate::vector::maybe_unindex(ctx.index_store, key);
         }
     }
@@ -1841,7 +1834,7 @@ fn cmd_reset(ctx: &mut Ctx) -> Vec<u8> {
     // FLUSHALL the data on hard reset, mirroring Redis behavior.
     if hard {
         let new_id = ctx.cluster.hard_reset();
-        let flushed = crate::store::clear_store(ctx.store, ctx.expiry_store);
+        let flushed = crate::store::clear_store(ctx.store);
         let indexes = crate::vector::drop_all_indexes(ctx.index_store);
         crate::vector::drop_all_dicts(ctx.dict_store);
         crate::store::clear_ts_label_index(ctx.ts_index);

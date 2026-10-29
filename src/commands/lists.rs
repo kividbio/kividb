@@ -284,7 +284,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => return Some(resp_error("ERR must be valid UTF-8")),
             };
 
-            let gone = lazy_expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+            let gone = lazy_expire_on_read(ctx.store, *ctx.selected_db, key);
 
             let db_ref = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db_ref, key);
@@ -801,7 +801,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let pivot = &cmd[3];
             let element = &cmd[4];
 
-            lazy_expire_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+            lazy_expire_key(ctx.store, *ctx.selected_db, key);
 
             let db_ref = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db_ref, key);

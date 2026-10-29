@@ -71,7 +71,7 @@ fn sets_at(ctx: &Ctx, keys: &[&[u8]]) -> Result<Vec<Option<Set>>, Vec<u8>> {
             out.push(None);
             continue;
         };
-        let gone = lazy_expire_on_read(ctx.store, ctx.expiry_store, db, key);
+        let gone = lazy_expire_on_read(ctx.store, db, key);
         let shard = store::get_shard(&ctx.store[db], key);
         match read_lock!(shard).get(key).filter(|_| !gone) {
             None => out.push(None),

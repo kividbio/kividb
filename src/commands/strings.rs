@@ -24,16 +24,6 @@ fn utf8_pairs<'a>(cmd: &[&'a [u8]]) -> Option<Vec<(&'a str, &'a [u8])>> {
         .collect()
 }
 
-/// A key's time to live is dropped, if it has one: what a plain write does.
-/// Its value shard may be held, as it is by the commands above: that is the
-/// order the two are always taken in.
-fn forget_expiry(expiry_store: &store::ExpiryStore, db: usize, key: &str) {
-    let shard = get_expiry_shard(expiry_store, db, key);
-    if !shard.holds_nothing() && read_lock!(shard).contains_key(key) {
-        write_lock!(shard).remove(key);
-    }
-}
-
 /// The shards a command's keys are in, each once, in the order they stand
 /// in the database.
 ///
@@ -80,7 +70,7 @@ impl<'a> ReadShards<'a> {
 /// The same for writing: what makes a write of several keys one step.
 struct WriteShards<'a> {
     shards: usize,
-    held: Vec<(usize, parking_lot::RwLockWriteGuard<'a, store::ShardMap>)>,
+    held: Vec<(usize, store::ShardWrite<'a>)>,
 }
 
 impl<'a> WriteShards<'a> {
@@ -265,21 +255,24 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             // ── check & handle expiry on the existing key ─────────────────────────
             // Do this before taking the write lock so we don't hold it longer than needed.
-            // The keyspace and the expiry store have the same shards: the key
-            // is hashed once for both.
             let db = &ctx.store[*ctx.selected_db];
             let index = store::shard_index(db.len(), key);
-            let exp_shard = &ctx.expiry_store[*ctx.selected_db][index];
-            if !exp_shard.holds_nothing() && is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+            let shard = &db[index];
+            if !shard.holds_no_ttl() && is_expired(ctx.store, *ctx.selected_db, key) {
+                delete_key_if_expired(ctx.store, *ctx.selected_db, key);
             }
 
             // ── single write-lock scope ───────────────────────────────────────────
-            let shard = &db[index];
             // Made before the shard is locked, for the same reason the old
             // value is dropped after: allocating and copying are not the
-            // shard's to wait for. A condition that fails wastes it.
-            let value = store::NewEntry::string(key, cmd[2]);
+            // shard's to wait for. A condition that fails wastes it. Its
+            // time to live is in it: the key's own with KEEPTTL, else the
+            // one given, or none.
+            let value = if keepttl {
+                store::NewEntry::string(key, cmd[2])
+            } else {
+                store::NewEntry::string_expiring(key, cmd[2], expiry.map(unix_ms))
+            };
             let mut map = write_lock!(shard);
 
             // Looked up once; what follows asks this, not the map again.
@@ -389,32 +382,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
 
             // ── write ─────────────────────────────────────────────────────────────
-            // KEEPTTL: preserve existing expiry — don't touch expiry_store at all.
-            // For everything else: the store_value call (below) clears stale expiry,
-            // then we optionally set a new one.
-            //
-            // We insert directly here (already holding the write lock) rather than
-            // calling store_value so we don't re-acquire the shard lock.
-            // An overwrite keeps the key it has: no new string for it.
+            // The value and its time to live, in one step.
             let replaced = map.insert_entry(value);
-            drop(map); // ← release write lock BEFORE touching expiry_store
+            drop(map);
             // The value that was there is let go of with the shard unlocked:
             // its count is in memory nothing has touched lately, and freeing
             // it is the allocator's time, neither of them the shard's to wait
             // for.
             drop(replaced);
-
-            if !keepttl {
-                // Only take the expiry locks if there's actually an expiry to clear.
-                // With no TTLs in the shard, this costs one load.
-                if !exp_shard.holds_nothing() && read_lock!(exp_shard).contains_key(key) {
-                    write_lock!(exp_shard).remove(key);
-                }
-                // Then set new one if provided
-                if let Some(exp) = expiry {
-                    set_expiry(ctx.expiry_store, *ctx.selected_db, key, exp);
-                }
-            }
 
             notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "set", key);
             if !keepttl && expiry.is_some() {
@@ -440,21 +415,18 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Err(_) => return Some(resp_error("ERR must be valid UTF-8")),
             };
 
-            // One hash for both stores: they have the same shards.
             let db = &ctx.store[*ctx.selected_db];
-            let index = store::shard_index(db.len(), key);
-            if !ctx.expiry_store[*ctx.selected_db][index].holds_nothing()
-                && is_expired(ctx.expiry_store, *ctx.selected_db, key)
-            {
-                expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
-                crate::stats::record_miss();
-                return Some(resp_null_bulk());
-            }
-
-            let shard = &db[index];
+            let shard = store::get_shard(db, key);
             let map = read_lock!(shard);
-            Some(match map.get(key) {
-                Some(ValueRef::String(v)) => {
+            // The key's time to live is in the entry the value is read from.
+            Some(match map.get_expiring(key) {
+                Some((_, Some(at))) if is_past(at) => {
+                    drop(map);
+                    expire_on_read(ctx.store, *ctx.selected_db, key);
+                    crate::stats::record_miss();
+                    resp_null_bulk()
+                }
+                Some((ValueRef::String(v), _)) => {
                     crate::stats::record_hit();
                     resp_bulk(&v)
                 }
@@ -496,7 +468,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 if !read_lock!(shard).contains_key(key) {
                     return Some(resp_integer(0));
                 }
-                let removed = delete_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+                let removed = delete_key(ctx.store, *ctx.selected_db, key);
                 if removed {
                     crate::vector::maybe_unindex(ctx.index_store, key);
                     crate::vector::maybe_request_compaction(
@@ -521,8 +493,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => return Some(resp_error(ERR_INVALID_EXPIRE_EXPIRE_CMD)),
             };
 
-            let exp_shard = get_expiry_shard(ctx.expiry_store, *ctx.selected_db, key);
-            let current = read_lock!(exp_shard).get(key).copied();
+            let current = get_expiry(ctx.store, *ctx.selected_db, key);
 
             if !expire_modifier_allows_set(&flags, current, new_abs) {
                 return Some(resp_integer(0));
@@ -530,7 +501,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             let now = crate::script_clock::wall_system_time_now();
             if new_abs <= now {
-                let removed = delete_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+                let removed = delete_key(ctx.store, *ctx.selected_db, key);
                 if removed {
                     crate::vector::maybe_unindex(ctx.index_store, key);
                     crate::vector::maybe_request_compaction(
@@ -542,7 +513,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 return Some(resp_integer(if removed { 1 } else { 0 }));
             }
 
-            set_expiry(ctx.expiry_store, *ctx.selected_db, key, new_abs);
+            set_expiry(ctx.store, *ctx.selected_db, key, new_abs);
             notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "expire", key);
             Some(resp_integer(1))
         }
@@ -564,8 +535,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let value: KiviDBValue = KiviDBValue::String(SharedBytes::from(cmd[3]));
             let expires_at = expiry_at_after(Duration::from_secs(secs));
 
-            store_value(ctx.store, ctx.expiry_store, *ctx.selected_db, key, value);
-            set_expiry(ctx.expiry_store, *ctx.selected_db, key, expires_at);
+            store_value_expiring(ctx.store, *ctx.selected_db, key, value, Some(expires_at));
             notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "set", key);
             notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "expire", key);
             Some(resp_simple("OK"))
@@ -587,8 +557,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let Some(key) = parse_utf8(k) else {
                     continue;
                 };
-                if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                    expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+                if is_expired(ctx.store, *ctx.selected_db, key) {
+                    expire_on_read(ctx.store, *ctx.selected_db, key);
                     continue;
                 }
                 let shard = store::get_shard(db, key);
@@ -667,8 +637,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(k) => k,
                 None => return Some(resp_error("ERR must be valid UTF-8")),
             };
-            if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+            if is_expired(ctx.store, *ctx.selected_db, key) {
+                expire_on_read(ctx.store, *ctx.selected_db, key);
                 return Some(resp_integer(0));
             }
             let db = &ctx.store[*ctx.selected_db];
@@ -698,8 +668,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => return Some(resp_error("ERR must be valid UTF-8")),
             };
             let suffix = &cmd[2];
-            if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+            if is_expired(ctx.store, *ctx.selected_db, key) {
+                delete_key_if_expired(ctx.store, *ctx.selected_db, key);
             }
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
@@ -741,26 +711,28 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(k) => k,
                 None => return Some(resp_error("ERR must be valid UTF-8")),
             };
-            if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+            if is_expired(ctx.store, *ctx.selected_db, key) {
+                delete_key_if_expired(ctx.store, *ctx.selected_db, key);
                 return Some(resp_null_bulk());
             }
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let mut map = write_lock!(shard);
-            match map.remove(key).map(store::Taken::into_value) {
-                Some(KiviDBValue::String(v)) => {
+            match map.remove(key) {
+                Some(taken) if matches!(taken.value(), ValueRef::String(_)) => {
                     drop(map);
-                    // also clear expiry
-                    let expiry_shard = get_expiry_shard(ctx.expiry_store, *ctx.selected_db, key);
-                    write_lock!(expiry_shard).remove(key);
+                    let ValueRef::String(v) = taken.value() else {
+                        unreachable!()
+                    };
                     crate::stats::record_hit();
                     notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "del", key);
                     Some(resp_bulk(&v))
                 }
                 Some(other) => {
-                    // put it back — we peeked the wrong type
-                    map.insert(Key::from(key), other);
+                    // put it back — we peeked the wrong type — with its
+                    // time to live
+                    let expires = other.expires();
+                    map.insert_expiring(Key::from(key), other.into_value(), expires);
                     crate::stats::record_miss();
                     Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -789,11 +761,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let mut map = write_lock!(shard);
-            let old = map.insert(key, new_val).map(store::Taken::into_value);
+            // GETSET always persists the key.
+            let old = map
+                .insert_expiring(key, new_val, None)
+                .map(store::Taken::into_value);
             drop(map);
-            // clear any existing TTL — GETSET always persists the key
-            let expiry_shard = get_expiry_shard(ctx.expiry_store, *ctx.selected_db, key);
-            write_lock!(expiry_shard).remove(key);
             notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "set", key);
             match old {
                 Some(KiviDBValue::String(v)) => {
@@ -826,8 +798,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => return Some(resp_error("ERR must be valid UTF-8")),
             };
             // Check expiry first — an expired key counts as non-existent
-            if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+            if is_expired(ctx.store, *ctx.selected_db, key) {
+                delete_key_if_expired(ctx.store, *ctx.selected_db, key);
             }
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
@@ -859,8 +831,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
             let value = KiviDBValue::String(SharedBytes::from(cmd[3]));
             let expires_at = expiry_at_after(Duration::from_millis(millis));
-            store_value(ctx.store, ctx.expiry_store, *ctx.selected_db, key, value);
-            set_expiry(ctx.expiry_store, *ctx.selected_db, key, expires_at);
+            store_value_expiring(ctx.store, *ctx.selected_db, key, value, Some(expires_at));
             notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "set", key);
             notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "expire", key);
             Some(resp_simple("OK"))
@@ -890,8 +861,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 // some of the keys set and the others not yet.
                 let mut shards = WriteShards::lock(&ctx.store[db], pairs.iter().map(|p| p.0));
                 for (key, value) in &pairs {
-                    shards.map(key).insert_str(*key, *value);
-                    forget_expiry(ctx.expiry_store, db, key);
+                    shards.map(key).insert_str_expiring(*key, *value, None);
                 }
             }
             for (key, _) in &pairs {
@@ -931,13 +901,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 // A key past its time is not there. It is left for the next
                 // command on it, or the sweep, to remove: that takes its
                 // shard for writing, which this holds for reading.
-                if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                    crate::stats::record_miss();
-                    results.push(nil.clone());
-                    continue;
-                }
-                let val = match shards.map(key).and_then(|map| map.get(key)) {
-                    Some(ValueRef::String(v)) => {
+                let val = match shards.map(key).and_then(|map| map.get_expiring(key)) {
+                    Some((_, Some(at))) if is_past(at) => {
+                        crate::stats::record_miss();
+                        nil.clone()
+                    }
+                    Some((ValueRef::String(v), _)) => {
                         crate::stats::record_hit();
                         resp_bulk(v.as_bytes())
                     }
@@ -972,13 +941,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let mut shards = WriteShards::lock(&ctx.store[db], pairs.iter().map(|p| p.0));
                 for (key, _) in &pairs {
                     // A key past its time is not there, and is written over.
-                    if shards.map(key).contains_key(key) && !is_expired(ctx.expiry_store, db, key) {
+                    let map = shards.map(key);
+                    if map.contains_key(key) && !map.expires(key).is_some_and(is_past) {
                         return Some(resp_integer(0));
                     }
                 }
                 for (key, value) in &pairs {
-                    shards.map(key).insert_str(*key, *value);
-                    forget_expiry(ctx.expiry_store, db, key);
+                    shards.map(key).insert_str_expiring(*key, *value, None);
                 }
             }
             for (key, _) in &pairs {
@@ -1195,8 +1164,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
-            if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+            if is_expired(ctx.store, *ctx.selected_db, key) {
+                expire_on_read(ctx.store, *ctx.selected_db, key);
                 return Some(resp_bulk(b""));
             }
             let db = &ctx.store[*ctx.selected_db];
@@ -1268,8 +1237,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR string exceeds maximum allowed size (proto-max-bulk-len)",
                 ));
             }
-            if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+            if is_expired(ctx.store, *ctx.selected_db, key) {
+                delete_key_if_expired(ctx.store, *ctx.selected_db, key);
             }
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
@@ -1313,8 +1282,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(k) => k,
                 None => return Some(resp_error("ERR must be valid UTF-8")),
             };
-            if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+            if is_expired(ctx.store, *ctx.selected_db, key) {
+                delete_key_if_expired(ctx.store, *ctx.selected_db, key);
                 return Some(resp_null_bulk());
             }
 
@@ -1364,7 +1333,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             Ok(t) => t,
                             Err(e) => return Some(resp_error(e)),
                         };
-                        set_expiry(ctx.expiry_store, *ctx.selected_db, key, exp);
+                        set_expiry(ctx.store, *ctx.selected_db, key, exp);
                     }
 
                     "PX" => {
@@ -1382,7 +1351,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             Ok(t) => t,
                             Err(e) => return Some(resp_error(e)),
                         };
-                        set_expiry(ctx.expiry_store, *ctx.selected_db, key, exp);
+                        set_expiry(ctx.store, *ctx.selected_db, key, exp);
                     }
 
                     // EXAT / PXAT: store absolute wall times (scripts see frozen wall clock).
@@ -1396,7 +1365,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             None => return Some(resp_error("ERR invalid expire time in GETEX")),
                         };
                         set_expiry(
-                            ctx.expiry_store,
+                            ctx.store,
                             *ctx.selected_db,
                             key,
                             expiry_unix_secs(unix_secs),
@@ -1413,7 +1382,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             None => return Some(resp_error("ERR invalid expire time in GETEX")),
                         };
                         set_expiry(
-                            ctx.expiry_store,
+                            ctx.store,
                             *ctx.selected_db,
                             key,
                             expiry_unix_millis(unix_millis),
@@ -1421,7 +1390,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     }
 
                     "PERSIST" => {
-                        clear_expiry(ctx.expiry_store, *ctx.selected_db, key);
+                        clear_expiry(ctx.store, *ctx.selected_db, key);
                     }
 
                     _ => return Some(resp_error("ERR syntax error")),
@@ -1504,8 +1473,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // We read key1 first, drop lock, then read key2. This avoids holding
             // two shard locks simultaneously (deadlock risk if same shard).
             let s1: SharedBytes = {
-                if is_expired(ctx.expiry_store, *ctx.selected_db, key1) {
-                    expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key1);
+                if is_expired(ctx.store, *ctx.selected_db, key1) {
+                    expire_on_read(ctx.store, *ctx.selected_db, key1);
                     SharedBytes::from(&[][..])
                 } else {
                     let db = &ctx.store[*ctx.selected_db];
@@ -1524,8 +1493,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
 
             let s2: SharedBytes = {
-                if is_expired(ctx.expiry_store, *ctx.selected_db, key2) {
-                    expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key2);
+                if is_expired(ctx.store, *ctx.selected_db, key2) {
+                    expire_on_read(ctx.store, *ctx.selected_db, key2);
                     SharedBytes::from(&[][..])
                 } else {
                     let db = &ctx.store[*ctx.selected_db];
@@ -1708,8 +1677,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(k) => k,
                 None => return Some(resp_error("ERR must be valid UTF-8")),
             };
-            if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+            if is_expired(ctx.store, *ctx.selected_db, key) {
+                expire_on_read(ctx.store, *ctx.selected_db, key);
                 return Some(resp_null_bulk());
             }
             let db = &ctx.store[*ctx.selected_db];
@@ -1747,8 +1716,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let db_idx = *ctx.selected_db;
 
             // An expired key does not exist; the reply is 0, not nil.
-            if is_expired(ctx.expiry_store, db_idx, key) {
-                delete_key_if_expired(ctx.store, ctx.expiry_store, db_idx, key);
+            if is_expired(ctx.store, db_idx, key) {
+                delete_key_if_expired(ctx.store, db_idx, key);
                 return Some(resp_integer(0));
             }
 
@@ -1792,9 +1761,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if !should_delete {
                 return Some(resp_integer(0));
             }
-            map.remove(key);
+            let removed = map.remove(key);
             drop(map);
-            clear_expiry(ctx.expiry_store, db_idx, key);
+            drop(removed);
             crate::vector::maybe_unindex(ctx.index_store, key);
             Some(resp_integer(1))
         }
@@ -1927,8 +1896,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         Some(k) => k,
                         None => continue,
                     };
-                    let exists = if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                        delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+                    let exists = if is_expired(ctx.store, *ctx.selected_db, key) {
+                        delete_key_if_expired(ctx.store, *ctx.selected_db, key);
                         false
                     } else {
                         let db = &ctx.store[*ctx.selected_db];
@@ -1959,10 +1928,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let mut map = write_lock!(shard);
                     map.insert(Key::from(key), value);
                 } else {
-                    store_value(ctx.store, ctx.expiry_store, *ctx.selected_db, key, value);
-                    if let Some(exp) = expiry {
-                        set_expiry(ctx.expiry_store, *ctx.selected_db, key, exp);
-                    }
+                    store_value_expiring(ctx.store, *ctx.selected_db, key, value, expiry);
                 }
             }
             Some(resp_integer(1))
@@ -2185,7 +2151,7 @@ fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
     effects_begin();
 
     // A key that has already expired behaves exactly like an absent one.
-    lazy_expire_key(ctx.store, ctx.expiry_store, *ctx.selected_db, &key);
+    lazy_expire_key(ctx.store, *ctx.selected_db, &key);
 
     let db = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db, &key);
@@ -2288,10 +2254,7 @@ fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
 
     // ENX: only set a TTL when the key has none, so a window rate limiter
     // creates a new window without extending a live one.
-    let has_ttl = existed && {
-        let shard = get_expiry_shard(ctx.expiry_store, *ctx.selected_db, &key);
-        read_lock!(shard).contains_key(key.as_str())
-    };
+    let has_ttl = existed && map.expires(key.as_str()).is_some();
     let new_expiry = match expiry {
         IncrexExpiry::Set(at) if !(enx && has_ttl) => Some(at),
         _ => None,
@@ -2304,9 +2267,9 @@ fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
         && at <= SystemTime::now()
     {
         if existed {
-            map.remove(key.as_str());
+            let removed = map.remove(key.as_str());
             drop(map);
-            clear_expiry(ctx.expiry_store, *ctx.selected_db, &key);
+            drop(removed);
             let lazy = crate::commands::server::remembered_config("lazyfree-lazy-expire")
                 .is_some_and(|v| v.eq_ignore_ascii_case("yes"));
             effect(vec![
@@ -2319,8 +2282,16 @@ fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
         return reply;
     }
 
-    map.insert_str(&*key, new_repr.as_bytes());
-    drop(map); // release the value lock before touching expiry_store
+    // The value and its time to live in one step.
+    let replaced = if persist {
+        map.insert_str_expiring(&*key, new_repr.as_bytes(), None)
+    } else if let Some(at) = new_expiry {
+        map.insert_str_expiring(&*key, new_repr.as_bytes(), Some(unix_ms(at)))
+    } else {
+        map.insert_str(&*key, new_repr.as_bytes())
+    };
+    drop(map);
+    drop(replaced);
 
     // Propagated as a SET of the result, so float formatting cannot drift on
     // replicas or an AOF replay, with the TTL as it now is (Redis 8.10).
@@ -2328,9 +2299,7 @@ fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
     let mut persisted = false;
     if persist {
         persisted = has_ttl;
-        clear_expiry(ctx.expiry_store, *ctx.selected_db, &key);
     } else if let Some(at) = new_expiry {
-        set_expiry(ctx.expiry_store, *ctx.selected_db, &key, at);
         let ms = at.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
         set.extend([as_bytes("PXAT"), as_bytes(&ms.to_string())]);
     } else {

@@ -13,10 +13,11 @@
 //! ```text
 //! 0   u32  holders (low 24 bits) | form (top 8)
 //! 4   u32  reserved for use times (LRU/LFU), zero for now
-//! 8   u8   key length, or LONG_KEY: the length is the u32 at 12
-//! 9   u8   flags
+//! 8   u8   key length, or LONG_KEY: the length is a u32 after the header
+//! 9   u8   flags: HAS_TTL
 //! 10  u16  length of an inline string
-//! 12  [u32 key length]   only for a long key
+//! 12  [u32 position, u64 expiry time]   only with a time to live
+//!     [u32 key length]   only for a long key
 //!     key bytes
 //!     an inline string's bytes, or, 8-aligned, a KiviDBValue kept whole
 //! ```
@@ -26,12 +27,21 @@
 //! to be inline) is its `KiviDBValue`, kept whole in the block: its handle
 //! is borrowed in place, so a collection is reached as before.
 //!
+//! **Time to live.** A key that has one keeps it in its entry: the time it
+//! expires at, in milliseconds since the Unix epoch, and where the entry is
+//! in its shard's list of the keys that have one (which is how expiry and
+//! the `volatile-*` policies find them). A key without one pays nothing for
+//! it. A read finds the time in the block it reads anyway.
+//!
 //! **Holders.** The table holds each entry once. A frozen snapshot, and
 //! whatever else must read a key and its value once the shard is unlocked,
 //! takes another hold ([`EntryRef`]); the block goes when the last hold
-//! does. Nothing in a block is written after it is made, but by compaction
-//! moving the block whole, which it does only when the table's is the only
-//! hold, and only with the shard locked for writing.
+//! does. What a holder can read of a block (the key, the value, the time to
+//! live) is never written while anybody but the table holds it: a time to
+//! live is changed in place only when the table's is the only hold, and
+//! otherwise in a new entry. The position is the table's own, written only
+//! with the shard locked for writing, and read by nothing else. Compaction
+//! moves a block whole, and only when the table's is the only hold.
 
 use std::alloc::Layout;
 use std::ptr::NonNull;
@@ -65,8 +75,20 @@ const INLINE: u32 = 1;
 /// A `KiviDBValue` kept whole after the key.
 const WHOLE: u32 = 2;
 
-/// `klen` of a key of 255 bytes or more: its length is the u32 after the
+/// The key has a time to live: its position and expiry time follow the
 /// header.
+const HAS_TTL: u8 = 1;
+/// What a time to live takes in an entry: the position, then the time.
+const TTL_ROOM: usize = 12;
+/// Where the position in the shard's list of keys with a time to live is.
+const POS_AT: usize = HEADER;
+/// Where the expiry time is: 8-aligned, as blocks are 16-aligned.
+const EXPIRES_AT: usize = HEADER + 4;
+const _: () = assert!(EXPIRES_AT.is_multiple_of(8) && POS_AT + 4 == EXPIRES_AT);
+const _: () = assert!(EXPIRES_AT + 8 == HEADER + TTL_ROOM);
+
+/// `klen` of a key of 255 bytes or more: its length is the u32 after the
+/// header (and after the time to live, if there is one).
 const LONG_KEY: u8 = u8::MAX;
 
 /// Blocks are aligned to this; slab blocks are, and the system allocator's
@@ -77,33 +99,40 @@ const ALIGN: usize = 16;
 /// a slab holds.
 pub const INLINE_MAX: usize = value_slab::MAX_BLOCK;
 
+/// Where a long key's length is, in an entry with (`ttl`) or without a time
+/// to live.
+#[inline(always)]
+const fn long_len_at(ttl: bool) -> usize {
+    HEADER + TTL_ROOM * ttl as usize
+}
+
 /// Where the key starts, for a key of `klen` bytes. Without a branch: it
 /// is asked for on every lookup.
 #[inline(always)]
-const fn key_at(klen: usize) -> usize {
-    HEADER + 4 * (klen >= LONG_KEY as usize) as usize
+const fn key_at(klen: usize, ttl: bool) -> usize {
+    long_len_at(ttl) + 4 * (klen >= LONG_KEY as usize) as usize
 }
 
 /// Where a whole `KiviDBValue` goes, after a key of `klen` bytes.
 #[inline]
-const fn whole_at(klen: usize) -> usize {
-    (key_at(klen) + klen).next_multiple_of(8)
+const fn whole_at(klen: usize, ttl: bool) -> usize {
+    (key_at(klen, ttl) + klen).next_multiple_of(8)
 }
 
 #[inline]
-fn inline_size(klen: usize, vlen: usize) -> usize {
-    key_at(klen) + klen + vlen
+fn inline_size(klen: usize, vlen: usize, ttl: bool) -> usize {
+    key_at(klen, ttl) + klen + vlen
 }
 
 #[inline]
-fn whole_size(klen: usize) -> usize {
-    whole_at(klen) + std::mem::size_of::<KiviDBValue>()
+fn whole_size(klen: usize, ttl: bool) -> usize {
+    whole_at(klen, ttl) + std::mem::size_of::<KiviDBValue>()
 }
 
 /// Whether a string of `vlen` bytes under a key of `klen` is kept inline.
 #[inline]
-fn fits_inline(klen: usize, vlen: usize) -> bool {
-    vlen <= u16::MAX as usize && inline_size(klen, vlen) <= INLINE_MAX
+fn fits_inline(klen: usize, vlen: usize, ttl: bool) -> bool {
+    vlen <= u16::MAX as usize && inline_size(klen, vlen, ttl) <= INLINE_MAX
 }
 
 fn allocate(size: usize) -> NonNull<u8> {
@@ -147,19 +176,22 @@ unsafe impl Sync for Entry {}
 
 impl Entry {
     /// A new entry, with one hold: the caller's (the table's, once in it).
-    pub(super) fn new(key: &[u8], value: KiviDBValue) -> Entry {
+    /// `expires` is its time to live, as the time it ends at (milliseconds
+    /// since the Unix epoch), if it has one.
+    pub(super) fn new(key: &[u8], value: KiviDBValue, expires: Option<u64>) -> Entry {
         if let KiviDBValue::String(bytes) = &value
-            && fits_inline(key.len(), bytes.len())
+            && fits_inline(key.len(), bytes.len(), expires.is_some())
         {
-            return Self::inline(key, bytes);
+            return Self::inline(key, bytes, expires);
         }
         let klen = key.len();
-        let at = Self::begin(key, whole_size(klen), WHOLE, 0);
+        let ttl = expires.is_some();
+        let at = Self::begin(key, whole_size(klen, ttl), WHOLE, 0, expires);
         // SAFETY: the block has room for the value at `whole_at`, aligned
         // for it, and nothing else has the block yet.
         unsafe {
             (at.as_ptr() as *mut u8)
-                .add(whole_at(klen))
+                .add(whole_at(klen, ttl))
                 .cast::<KiviDBValue>()
                 .write(value);
         }
@@ -168,48 +200,70 @@ impl Entry {
 
     /// A new entry for the string `bytes`: inline if it fits, else in a
     /// `SharedBytes` of its own.
-    pub(super) fn string(key: &[u8], bytes: &[u8]) -> Entry {
-        if fits_inline(key.len(), bytes.len()) {
-            Self::inline(key, bytes)
+    pub(super) fn string(key: &[u8], bytes: &[u8], expires: Option<u64>) -> Entry {
+        if fits_inline(key.len(), bytes.len(), expires.is_some()) {
+            Self::inline(key, bytes, expires)
         } else {
-            Self::new(key, KiviDBValue::String(SharedBytes::from(bytes)))
+            Self::new(key, KiviDBValue::String(SharedBytes::from(bytes)), expires)
         }
     }
 
-    fn inline(key: &[u8], bytes: &[u8]) -> Entry {
+    fn inline(key: &[u8], bytes: &[u8], expires: Option<u64>) -> Entry {
         let klen = key.len();
-        let at = Self::begin(key, inline_size(klen, bytes.len()), INLINE, bytes.len());
+        let ttl = expires.is_some();
+        let at = Self::begin(
+            key,
+            inline_size(klen, bytes.len(), ttl),
+            INLINE,
+            bytes.len(),
+            expires,
+        );
         // SAFETY: the block has room for the bytes after the key.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
-                (at.as_ptr() as *mut u8).add(key_at(klen) + klen),
+                (at.as_ptr() as *mut u8).add(key_at(klen, ttl) + klen),
                 bytes.len(),
             );
         }
         Entry(at)
     }
 
-    /// A block of `size`, its header and key written.
-    fn begin(key: &[u8], size: usize, form: u32, vlen: usize) -> NonNull<Header> {
+    /// A block of `size`, its header, time to live and key written.
+    fn begin(
+        key: &[u8],
+        size: usize,
+        form: u32,
+        vlen: usize,
+        expires: Option<u64>,
+    ) -> NonNull<Header> {
         let klen = key.len();
         assert!(klen <= u32::MAX as usize, "a key of {klen} bytes");
+        let ttl = expires.is_some();
         let at = allocate(size).cast::<Header>();
-        // SAFETY: `size` covers the header, the long key's length and the
-        // key, and the block is 16-aligned and nobody else's.
+        // SAFETY: `size` covers the header, the time to live, the long key's
+        // length and the key, and the block is 16-aligned and nobody else's.
         unsafe {
             at.as_ptr().write(Header {
                 word: AtomicU32::new(1 | form << FORM_SHIFT),
                 lru: AtomicU32::new(0),
                 klen: klen.min(LONG_KEY as usize) as u8,
-                flags: 0,
+                flags: if ttl { HAS_TTL } else { 0 },
                 vlen: vlen as u16,
             });
             let base = at.as_ptr() as *mut u8;
-            if klen >= LONG_KEY as usize {
-                base.add(HEADER).cast::<u32>().write_unaligned(klen as u32);
+            if let Some(ms) = expires {
+                base.add(POS_AT)
+                    .cast::<AtomicU32>()
+                    .write(AtomicU32::new(0));
+                base.add(EXPIRES_AT).cast::<u64>().write(ms);
             }
-            std::ptr::copy_nonoverlapping(key.as_ptr(), base.add(key_at(klen)), klen);
+            if klen >= LONG_KEY as usize {
+                base.add(long_len_at(ttl))
+                    .cast::<u32>()
+                    .write_unaligned(klen as u32);
+            }
+            std::ptr::copy_nonoverlapping(key.as_ptr(), base.add(key_at(klen, ttl)), klen);
         }
         at
     }
@@ -230,12 +284,24 @@ impl Entry {
         self.header().word.load(Ordering::Relaxed) >> FORM_SHIFT
     }
 
+    /// Whether the key has a time to live.
+    #[inline(always)]
+    pub(super) fn has_ttl(self) -> bool {
+        self.header().flags & HAS_TTL != 0
+    }
+
     #[inline(always)]
     fn klen(&self) -> usize {
         let short = self.header().klen;
         if short == LONG_KEY {
-            // SAFETY: a long key's length follows the header.
-            unsafe { self.base().add(HEADER).cast::<u32>().read_unaligned() as usize }
+            // SAFETY: a long key's length follows the header and the time
+            // to live.
+            unsafe {
+                self.base()
+                    .add(long_len_at(self.has_ttl()))
+                    .cast::<u32>()
+                    .read_unaligned() as usize
+            }
         } else {
             short as usize
         }
@@ -262,7 +328,7 @@ impl Entry {
     pub(super) fn key<'a>(self) -> &'a [u8] {
         let klen = self.klen();
         // SAFETY: `klen` bytes of key at `key_at`, never written again.
-        unsafe { std::slice::from_raw_parts(self.base().add(key_at(klen)), klen) }
+        unsafe { std::slice::from_raw_parts(self.base().add(key_at(klen, self.has_ttl())), klen) }
     }
 
     /// The key, as the `&str` it was made from.
@@ -280,8 +346,12 @@ impl Entry {
         if self.form() == INLINE {
             let vlen = self.header().vlen as usize;
             // SAFETY: `vlen` bytes follow the key, never written again.
-            let bytes =
-                unsafe { std::slice::from_raw_parts(self.base().add(key_at(klen) + klen), vlen) };
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    self.base().add(key_at(klen, self.has_ttl()) + klen),
+                    vlen,
+                )
+            };
             ValueRef::String(StrRef::bytes(bytes))
         } else {
             ValueRef::from(self.whole())
@@ -294,22 +364,86 @@ impl Entry {
         debug_assert_eq!(self.form(), WHOLE);
         // SAFETY: a whole entry's value is at `whole_at`, aligned, and
         // lives as long as the entry.
-        unsafe { &*self.base().add(whole_at(self.klen())).cast::<KiviDBValue>() }
+        unsafe {
+            &*self
+                .base()
+                .add(whole_at(self.klen(), self.has_ttl()))
+                .cast::<KiviDBValue>()
+        }
+    }
+
+    /// When the key's time to live ends, in milliseconds since the Unix
+    /// epoch, if it has one.
+    #[inline(always)]
+    pub(super) fn expires(self) -> Option<u64> {
+        if self.has_ttl() {
+            // SAFETY: an entry with a time to live has its time at
+            // `EXPIRES_AT`, aligned; it changes only as `set_expires` says.
+            Some(unsafe { self.base().add(EXPIRES_AT).cast::<u64>().read() })
+        } else {
+            None
+        }
+    }
+
+    /// Change the time to live the key has, in place.
+    ///
+    /// # Safety
+    /// The entry has a time to live, the caller holds the shard for writing,
+    /// and the table's is the only hold: nothing else reads the time.
+    pub(super) unsafe fn set_expires(self, ms: u64) {
+        debug_assert!(self.has_ttl() && self.holders() == 1);
+        // SAFETY: as the caller promises.
+        unsafe { (self.base().add(EXPIRES_AT) as *mut u64).write(ms) };
+    }
+
+    #[inline]
+    fn pos_cell(&self) -> &AtomicU32 {
+        debug_assert!(self.has_ttl());
+        // SAFETY: an entry with a time to live has its position at
+        // `POS_AT`, 4-aligned, made in `begin`.
+        unsafe { &*self.base().add(POS_AT).cast::<AtomicU32>() }
+    }
+
+    /// Where the entry is in its shard's list of keys with a time to live.
+    #[inline]
+    pub(super) fn pos(self) -> usize {
+        self.pos_cell().load(Ordering::Relaxed) as usize
+    }
+
+    /// Say where the entry is in its shard's list. The caller holds the
+    /// shard for writing; the entry has a time to live.
+    #[inline]
+    pub(super) fn set_pos(self, pos: usize) {
+        self.pos_cell().store(pos as u32, Ordering::Relaxed);
+    }
+
+    /// A new entry with the same key and value, and `expires` for its time
+    /// to live: what changes whether a key has one, or changes it when the
+    /// entry is held. One hold, the caller's; this entry is left as it was.
+    pub(super) fn remade(self, expires: Option<u64>) -> Entry {
+        match self.value() {
+            ValueRef::String(bytes) if bytes.shared().is_none() => {
+                Self::string(self.key(), bytes.as_bytes(), expires)
+            }
+            // Another handle on the same value: a collection is not copied.
+            other => Self::new(self.key(), other.to_value(), expires),
+        }
     }
 
     /// The block's size.
     #[inline]
     pub(super) fn size(self) -> usize {
         let klen = self.klen();
+        let ttl = self.has_ttl();
         if self.form() == INLINE {
-            inline_size(klen, self.header().vlen as usize)
+            inline_size(klen, self.header().vlen as usize, ttl)
         } else {
-            whole_size(klen)
+            whole_size(klen, ttl)
         }
     }
 
     #[inline]
-    fn holders(self) -> u32 {
+    pub(super) fn holders(self) -> u32 {
         self.header().word.load(Ordering::Acquire) & HOLDERS
     }
 
@@ -337,7 +471,9 @@ impl Entry {
         if self.form() == WHOLE {
             // SAFETY: the last hold: nothing reads the value any more.
             unsafe {
-                std::ptr::drop_in_place(self.base().add(whole_at(self.klen())) as *mut KiviDBValue)
+                std::ptr::drop_in_place(
+                    self.base().add(whole_at(self.klen(), self.has_ttl())) as *mut KiviDBValue
+                )
             };
         }
         // SAFETY: the block came from `allocate(size)`.
@@ -381,8 +517,10 @@ impl Entry {
             let to = allocate(size);
             // SAFETY: the only hold is the table's, and the shard is held
             // for writing: nothing reads the block while it is copied, and
-            // nothing but the slot knows where it is. The copy is the
-            // value's move; the old block is freed without dropping it.
+            // nothing but the slot (and the shard's list of keys with a time
+            // to live, which the caller fixes) knows where it is. The copy
+            // is the value's move; the old block is freed without dropping
+            // it.
             unsafe { std::ptr::copy_nonoverlapping(self.base(), to.as_ptr(), size) };
             return Relocation::Moved {
                 to: Entry(to.cast()),
@@ -390,7 +528,9 @@ impl Entry {
             };
         }
         // SAFETY: as above, nothing else reads the value.
-        let value = unsafe { &mut *(self.base().add(whole_at(self.klen())) as *mut KiviDBValue) };
+        let value = unsafe {
+            &mut *(self.base().add(whole_at(self.klen(), self.has_ttl())) as *mut KiviDBValue)
+        };
         match value {
             KiviDBValue::String(bytes) => match bytes.relocate(regions) {
                 Some(old) => Relocation::BytesMoved(old),
@@ -428,9 +568,9 @@ impl Drop for Left {
     }
 }
 
-/// A hold on an entry: its key and value can be read with no shard locked,
-/// and neither changes while it is held. What a frozen snapshot keeps of a
-/// string.
+/// A hold on an entry: its key, value and time to live can be read with no
+/// shard locked, and none of them changes while it is held. What a frozen
+/// snapshot keeps of a string.
 pub struct EntryRef(Entry);
 
 impl EntryRef {
@@ -447,6 +587,12 @@ impl EntryRef {
 
     pub fn value(&self) -> ValueRef<'_> {
         self.0.value()
+    }
+
+    /// When the key's time to live ended, as it was when this was taken:
+    /// milliseconds since the Unix epoch.
+    pub fn expires(&self) -> Option<u64> {
+        self.0.expires()
     }
 
     /// Whether `entry` is this one.
@@ -487,6 +633,11 @@ impl Taken {
 
     pub fn value(&self) -> ValueRef<'_> {
         self.0.value()
+    }
+
+    /// When the key's time to live ended, if it had one.
+    pub fn expires(&self) -> Option<u64> {
+        self.0.expires()
     }
 
     /// The value, owned.
@@ -559,6 +710,13 @@ impl Slot {
         Slot(self.0 & !ADDRESS | at)
     }
 
+    /// The fragment of this slot's key's hash, as a hash that has it: what
+    /// a slot for another entry of the same key is made with.
+    #[inline]
+    pub(super) fn hash_part(self) -> u64 {
+        (self.0 >> 52) << 32
+    }
+
     #[inline(always)]
     pub(super) fn entry(self) -> Entry {
         // SAFETY: made from an entry's address, never zero.
@@ -610,6 +768,13 @@ fn prefetch(at: *const u8, lines: usize) {
     let _ = (at, lines);
 }
 
+/// Ask for the line of an entry its time to live is in: what a pass over a
+/// shard's keys with one reads of each.
+#[inline(always)]
+pub(super) fn prefetch_expiry(entry: Entry) {
+    prefetch(entry.base().wrapping_add(EXPIRES_AT), 1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,26 +790,29 @@ mod tests {
     #[test]
     fn a_slot_keeps_its_entry_fragment_and_hint() {
         for (klen, vlen) in [(1, 0), (15, 100), (15, 1000), (300, 3000), (15, 70_000)] {
-            let key = vec![b'k'; klen];
-            let entry = Entry::string(&key, &vec![7u8; vlen]);
-            let hash = 0xabc_u64 << 32 | 0x1234_5678;
-            let slot = Slot::new(entry, hash);
-            assert!(slot.entry() == entry);
-            assert!(slot.may_be(hash));
-            assert!(!slot.may_be(hash ^ 1 << 40));
-            // The low bits are not the fragment's: hashbrown's index.
-            assert!(slot.may_be(hash ^ 0xffff));
-            let lines = HINT_LINES[((slot.0 >> ADDRESS_BITS) & 0xf) as usize] as usize;
-            let need = entry.size().div_ceil(64);
-            assert!(lines >= need.min(64), "{lines} lines for {need}");
-            let moved = Entry::string(&key, &vec![7u8; vlen]);
-            let again = slot.moved_to(moved);
-            assert!(again.entry() == moved);
-            assert_eq!(again.0 >> ADDRESS_BITS, slot.0 >> ADDRESS_BITS);
-            // SAFETY: each made here with one hold, used no more.
-            unsafe {
-                entry.release();
-                moved.release();
+            for ttl in [None, Some(1_700_000_000_000)] {
+                let key = vec![b'k'; klen];
+                let entry = Entry::string(&key, &vec![7u8; vlen], ttl);
+                let hash = 0xabc_u64 << 32 | 0x1234_5678;
+                let slot = Slot::new(entry, hash);
+                assert!(slot.entry() == entry);
+                assert!(slot.may_be(hash));
+                assert!(slot.may_be(slot.hash_part()));
+                assert!(!slot.may_be(hash ^ 1 << 40));
+                // The low bits are not the fragment's: hashbrown's index.
+                assert!(slot.may_be(hash ^ 0xffff));
+                let lines = HINT_LINES[((slot.0 >> ADDRESS_BITS) & 0xf) as usize] as usize;
+                let need = entry.size().div_ceil(64);
+                assert!(lines >= need.min(64), "{lines} lines for {need}");
+                let moved = Entry::string(&key, &vec![7u8; vlen], ttl);
+                let again = slot.moved_to(moved);
+                assert!(again.entry() == moved);
+                assert_eq!(again.0 >> ADDRESS_BITS, slot.0 >> ADDRESS_BITS);
+                // SAFETY: each made here with one hold, used no more.
+                unsafe {
+                    entry.release();
+                    moved.release();
+                }
             }
         }
     }
@@ -652,19 +820,88 @@ mod tests {
     #[test]
     fn the_header_is_twelve_bytes_and_the_key_follows() {
         assert_eq!(HEADER, 12);
-        let entry = Entry::string(b"key", b"value");
+        let entry = Entry::string(b"key", b"value", None);
         assert_eq!(entry.size(), 12 + 3 + 5);
         assert_eq!(entry.key(), b"key");
         assert_eq!(entry.form(), INLINE);
         assert_eq!(entry.holders(), 1);
+        assert!(!entry.has_ttl());
+        assert_eq!(entry.expires(), None);
         // SAFETY: made here with one hold, used no more.
         unsafe { entry.release() };
         let long = vec![b'x'; 255];
-        let entry = Entry::new(&long, KiviDBValue::List(Default::default()));
+        let entry = Entry::new(&long, KiviDBValue::List(Default::default()), None);
         assert_eq!(entry.key(), &long[..]);
         assert_eq!(entry.form(), WHOLE);
         assert_eq!(entry.size() % 8, 0);
         // SAFETY: as above.
         unsafe { entry.release() };
+    }
+
+    #[test]
+    fn a_time_to_live_takes_twelve_bytes_before_the_key() {
+        let at = 1_700_000_000_123u64;
+        let entry = Entry::string(b"key", b"value", Some(at));
+        assert_eq!(entry.size(), 12 + 12 + 3 + 5);
+        assert!(entry.has_ttl());
+        assert_eq!(entry.expires(), Some(at));
+        assert_eq!(entry.key(), b"key");
+        assert!(matches!(entry.value(), ValueRef::String(b) if b.as_bytes() == b"value"));
+        entry.set_pos(77);
+        assert_eq!(entry.pos(), 77);
+        // SAFETY: the only hold, and nothing else has the entry.
+        unsafe { entry.set_expires(at + 5) };
+        assert_eq!(entry.expires(), Some(at + 5));
+        // Remade without it, and with it again: key and value the same.
+        let bare = entry.remade(None);
+        assert_eq!(bare.size(), 12 + 3 + 5);
+        assert_eq!(bare.expires(), None);
+        let back = bare.remade(Some(at));
+        assert_eq!(back.expires(), Some(at));
+        assert!(matches!(back.value(), ValueRef::String(b) if b.as_bytes() == b"value"));
+        // SAFETY: each made here with one hold, used no more.
+        unsafe {
+            entry.release();
+            bare.release();
+            back.release();
+        }
+        // A long key's length comes after the time.
+        for klen in [254usize, 255, 1000] {
+            let long = vec![b'y'; klen];
+            let entry = Entry::new(&long, KiviDBValue::List(Default::default()), Some(at));
+            assert_eq!(entry.key(), &long[..]);
+            assert_eq!(entry.expires(), Some(at));
+            assert_eq!(entry.size() % 8, 0);
+            assert!(matches!(entry.value(), ValueRef::List(_)));
+            let remade = entry.remade(None);
+            assert_eq!(remade.key(), &long[..]);
+            assert!(matches!(remade.value(), ValueRef::List(_)));
+            // SAFETY: as above.
+            unsafe {
+                entry.release();
+                remade.release();
+            }
+        }
+    }
+
+    #[test]
+    fn a_string_at_the_inline_edge_goes_out_of_line_for_its_time_to_live() {
+        // Fits inline without a time to live, not with one.
+        let key = b"k";
+        let vlen = INLINE_MAX - HEADER - key.len();
+        let bytes = vec![3u8; vlen];
+        let entry = Entry::string(key, &bytes, None);
+        assert_eq!(entry.form(), INLINE);
+        let timed = entry.remade(Some(1));
+        assert_eq!(timed.form(), WHOLE);
+        assert!(matches!(timed.value(), ValueRef::String(b) if b.as_bytes() == &bytes[..]));
+        let again = timed.remade(None);
+        assert_eq!(again.form(), INLINE);
+        // SAFETY: each made here with one hold, used no more.
+        unsafe {
+            entry.release();
+            timed.release();
+            again.release();
+        }
     }
 }

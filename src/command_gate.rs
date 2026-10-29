@@ -409,6 +409,7 @@ pub fn alone_on_this_thread() -> bool {
 ///   their timeout. Holding the gate while they do would hold up every
 ///   transaction on the server for that long, and they touch no data while
 ///   they wait.
+#[inline(always)]
 pub fn skips(name: &str, cmd: &[&[u8]]) -> bool {
     let sub = |word: &[u8]| cmd.get(1).is_some_and(|s| s.eq_ignore_ascii_case(word));
     match name {

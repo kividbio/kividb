@@ -168,12 +168,7 @@ fn with_array_read<T>(
     missing: T,
     f: impl FnOnce(&ArrayInner) -> T,
 ) -> Result<T, Vec<u8>> {
-    if crate::commands::helpers::lazy_expire_on_read(
-        ctx.store,
-        ctx.expiry_store,
-        *ctx.selected_db,
-        key,
-    ) {
+    if crate::commands::helpers::lazy_expire_on_read(ctx.store, *ctx.selected_db, key) {
         return Ok(missing);
     }
     let db_ref = &ctx.store[*ctx.selected_db];
@@ -196,7 +191,7 @@ fn with_array_write<T>(
     key: &str,
     f: impl FnOnce(&mut ArrayInner) -> T,
 ) -> Result<T, Vec<u8>> {
-    crate::commands::helpers::lazy_expire_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+    crate::commands::helpers::lazy_expire_key(ctx.store, *ctx.selected_db, key);
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
     let mut map = write_lock!(shard);
@@ -227,8 +222,7 @@ fn with_existing_array_write<T>(
     missing: T,
     f: impl FnOnce(&mut ArrayInner) -> T,
 ) -> Result<T, Vec<u8>> {
-    if crate::commands::helpers::lazy_expire_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key)
-    {
+    if crate::commands::helpers::lazy_expire_key(ctx.store, *ctx.selected_db, key) {
         return Ok(missing);
     }
     let db_ref = &ctx.store[*ctx.selected_db];

@@ -136,7 +136,6 @@ static REWRITES_ASKED_FOR: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 /// rewrite had begun, and go on as if it were done.
 pub fn checkpoint_in_background(
     store: crate::store::Store,
-    expiry_store: crate::store::ExpiryStore,
     index_store: crate::vector::IndexStore,
 ) {
     struct Asked;
@@ -150,7 +149,7 @@ pub fn checkpoint_in_background(
     tokio::spawn(async move {
         tokio::task::spawn_blocking(move || {
             let _asked = asked;
-            checkpoint(&store, &expiry_store, &index_store)
+            checkpoint(&store, &index_store)
         })
         .await
         .ok();
@@ -790,24 +789,22 @@ fn turn_over_aof(generation: u64) -> impl FnOnce() -> std::io::Result<()> {
 /// if the snapshot did not get there (see `checkpoint_completed`).
 pub fn checkpoint(
     store: &crate::store::Store,
-    expiry_store: &crate::store::ExpiryStore,
     index_store: &crate::vector::IndexStore,
 ) -> std::io::Result<()> {
-    checkpoint_noting(store, expiry_store, index_store, &mut || {})
+    checkpoint_noting(store, index_store, &mut || {})
 }
 
 /// [`checkpoint`], calling `at_cut` while writes are held for the capture:
 /// what it reads is as of the dataset written.
 pub fn checkpoint_noting(
     store: &crate::store::Store,
-    expiry_store: &crate::store::ExpiryStore,
     index_store: &crate::vector::IndexStore,
     at_cut: &mut dyn FnMut(),
 ) -> std::io::Result<()> {
     REWRITE_ACTIVE.store(true, Ordering::Release);
     let aof_on = AOF_ENABLED.load(Ordering::Relaxed);
     let started = std::time::Instant::now();
-    let result = checkpoint_inner(store, expiry_store, index_store, at_cut);
+    let result = checkpoint_inner(store, index_store, at_cut);
     // With the AOF on, a checkpoint is its rewrite (#149): these were never
     // set.
     if aof_on {
@@ -825,7 +822,6 @@ pub fn checkpoint_noting(
 
 fn checkpoint_inner(
     store: &crate::store::Store,
-    expiry_store: &crate::store::ExpiryStore,
     index_store: &crate::vector::IndexStore,
     at_cut: &mut dyn FnMut(),
 ) -> std::io::Result<()> {
@@ -837,8 +833,7 @@ fn checkpoint_inner(
     let cut = crate::write_gate::cut();
     let started = std::time::Instant::now();
     at_cut();
-    let frozen =
-        crate::snapshot::freeze_dataset_for_disk(store, Some(expiry_store), Some(index_store));
+    let frozen = crate::snapshot::freeze_dataset_for_disk(store, Some(index_store));
     let turn_over = match (&frozen, aof_on) {
         (Ok(_), true) => Some(turn_over_aof(generation)),
         _ => None,
@@ -1025,7 +1020,6 @@ pub static AUTO_REWRITE_MIN_SIZE: std::sync::atomic::AtomicU64 =
 /// answered OK and rewrites went on.
 pub fn spawn_auto_rewrite_thread(
     store: crate::store::Store,
-    expiry_store: crate::store::ExpiryStore,
     index_store: crate::vector::IndexStore,
     percentage: u64,
     min_size: u64,
@@ -1050,7 +1044,7 @@ pub fn spawn_auto_rewrite_thread(
                 percentage,
                 base_size() as f64 / (1024.0 * 1024.0),
             );
-            if let Err(e) = checkpoint(&store, &expiry_store, &index_store) {
+            if let Err(e) = checkpoint(&store, &index_store) {
                 log_warn!("AOF: auto-checkpoint failed: {e}");
             }
         }
@@ -1422,7 +1416,6 @@ impl Drop for DeferIndexing {
 pub fn replay_aof(
     path: &str,
     store: &crate::store::Store,
-    expiry_store: &crate::store::ExpiryStore,
     index_store: &crate::vector::IndexStore,
     dict_store: &crate::vector::DictStore,
     wait_table: &std::sync::Arc<crate::wait_table::WaitTable>,
@@ -1508,7 +1501,7 @@ pub fn replay_aof(
         } = loaded;
         crate::vector::restore_dictionaries(index_store, dictionaries);
         stats.preamble_keys = crate::snapshot::restore_into_store(dbs, store) as u64;
-        crate::snapshot::restore_expiries_into_store(expiries, expiry_store);
+        crate::snapshot::restore_expiries_into_store(expiries, store);
         // Schemas and graphs travel inside the image, so the replay never has
         // to re-execute an `FT.CREATE` or rebuild a graph it already has.
         crate::vector::register_index_schemas(index_store, &index_schemas, &hnsw_graphs);
@@ -1538,7 +1531,6 @@ pub fn replay_aof(
                 cmd,
                 store,
                 repl_state,
-                expiry_store,
                 index_store,
                 dict_store,
                 wait_table,
@@ -1595,7 +1587,6 @@ pub struct LocalRecovery {
 pub fn recover_local(
     aof_enabled: bool,
     store: &crate::store::Store,
-    expiry_store: &crate::store::ExpiryStore,
     index_store: &crate::vector::IndexStore,
     dict_store: &crate::vector::DictStore,
     wait_table: &std::sync::Arc<crate::wait_table::WaitTable>,
@@ -1617,7 +1608,6 @@ pub fn recover_local(
         match preload(
             &config.preload_file,
             store,
-            expiry_store,
             index_store,
             dict_store,
             wait_table,
@@ -1663,8 +1653,7 @@ pub fn recover_local(
                 crate::vector::restore_dictionaries(index_store, dictionaries);
                 if !dbs.is_empty() {
                     let total = crate::snapshot::restore_into_store(dbs, store);
-                    let with_ttl =
-                        crate::snapshot::restore_expiries_into_store(expiries, expiry_store);
+                    let with_ttl = crate::snapshot::restore_expiries_into_store(expiries, store);
                     log_info!("Loaded {total} keys from snapshot ({with_ttl} with a TTL)");
                     dump_loaded = true;
                 }
@@ -1691,7 +1680,7 @@ pub fn recover_local(
                     fatal_persistence(&format!("dump.rdb cannot be loaded: {e}"));
                 }
                 let total = crate::snapshot::restore_into_store(dbs, store);
-                let with_ttl = crate::snapshot::restore_expiries_into_store(expiries, expiry_store);
+                let with_ttl = crate::snapshot::restore_expiries_into_store(expiries, store);
                 log_info!("Loaded {total} keys from snapshot ({with_ttl} with a TTL)");
                 dump_loaded = true;
             }
@@ -1722,7 +1711,6 @@ pub fn recover_local(
                 if let Err(e) = replay_aof(
                     AOF_PREV_PATH,
                     store,
-                    expiry_store,
                     index_store,
                     dict_store,
                     wait_table,
@@ -1775,7 +1763,6 @@ pub fn recover_local(
                 recovery.exact_dump = false;
                 let names = recover_from_aof(
                     store,
-                    expiry_store,
                     index_store,
                     dict_store,
                     wait_table,
@@ -1807,7 +1794,6 @@ pub fn recover_local(
 fn preload(
     target: &str,
     store: &crate::store::Store,
-    expiry_store: &crate::store::ExpiryStore,
     index_store: &crate::vector::IndexStore,
     dict_store: &crate::vector::DictStore,
     wait_table: &std::sync::Arc<crate::wait_table::WaitTable>,
@@ -1847,7 +1833,7 @@ fn preload(
         let (dbs, expiries, functions) = crate::snapshot::load_redis_rdb_with_expiry(&base_str)?;
         crate::snapshot::restore_functions(functions)?;
         let keys = crate::snapshot::restore_into_store(dbs, store);
-        crate::snapshot::restore_expiries_into_store(expiries, expiry_store);
+        crate::snapshot::restore_expiries_into_store(expiries, store);
         keys
     } else {
         let crate::snapshot::LoadedSnapshot {
@@ -1861,7 +1847,7 @@ fn preload(
         crate::snapshot::restore_functions(functions)?;
         crate::vector::restore_dictionaries(index_store, dictionaries);
         let keys = crate::snapshot::restore_into_store(dbs, store);
-        crate::snapshot::restore_expiries_into_store(expiries, expiry_store);
+        crate::snapshot::restore_expiries_into_store(expiries, store);
         crate::vector::register_index_schemas(index_store, &index_schemas, &hnsw_graphs);
         index_names = index_schemas.into_iter().map(|s| s.name).collect();
         keys
@@ -1873,7 +1859,6 @@ fn preload(
         let stats = replay_aof(
             &incr.to_string_lossy(),
             store,
-            expiry_store,
             index_store,
             dict_store,
             wait_table,
@@ -1909,7 +1894,6 @@ fn preload(
 #[must_use = "indexes are left empty by the replay and must be backfilled"]
 pub fn recover_from_aof(
     store: &crate::store::Store,
-    expiry_store: &crate::store::ExpiryStore,
     index_store: &crate::vector::IndexStore,
     dict_store: &crate::vector::DictStore,
     wait_table: &std::sync::Arc<crate::wait_table::WaitTable>,
@@ -1924,7 +1908,6 @@ pub fn recover_from_aof(
     match replay_aof(
         AOF_PATH,
         store,
-        expiry_store,
         index_store,
         dict_store,
         wait_table,

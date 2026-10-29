@@ -937,14 +937,9 @@ impl ReplState {
     /// keep the stream from its first byte, so that a replica whose dataset
     /// has the same fingerprint can be continued from there. Call before any
     /// client is served.
-    pub fn fingerprint_at_start(
-        &self,
-        store: &crate::store::Store,
-        expiry_store: &crate::store::ExpiryStore,
-        hub_tx: &HubTx,
-    ) {
+    pub fn fingerprint_at_start(&self, store: &crate::store::Store, hub_tx: &HubTx) {
         let started = std::time::Instant::now();
-        let digest = digest::dataset_digest(store, expiry_store);
+        let digest = digest::dataset_digest(store);
         *self.startup_digest.lock() = Some(digest);
         self.resume_as_master(self.repl_id(), 0, hub_tx);
         log_info!(
@@ -1029,7 +1024,6 @@ fn dump_fingerprint(path: &str) -> std::io::Result<(u64, u64)> {
 /// master to continue rather than send everything again.
 pub fn save_dataset(
     store: &crate::store::Store,
-    expiry_store: &crate::store::ExpiryStore,
     index_store: &crate::vector::IndexStore,
     repl_state: &ReplState,
 ) -> std::io::Result<()> {
@@ -1045,7 +1039,7 @@ pub fn save_dataset(
     // instant the dataset is captured: no write is half-way then.
     let mut master_point: Option<(String, u64)> = None;
     if crate::aof::AOF_ENABLED.load(Ordering::Relaxed) {
-        crate::aof::checkpoint_noting(store, expiry_store, index_store, &mut || {
+        crate::aof::checkpoint_noting(store, index_store, &mut || {
             if !repl_state.is_slave() && repl_state.feeds_hub() {
                 master_point = Some((
                     repl_state.repl_id(),
@@ -1060,7 +1054,7 @@ pub fn save_dataset(
         // in two shards could be saved half applied (#148).
         let frozen = {
             let _cut = crate::write_gate::cut();
-            crate::snapshot::freeze_dataset_for_disk(store, Some(expiry_store), Some(index_store))
+            crate::snapshot::freeze_dataset_for_disk(store, Some(index_store))
         }?;
         static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let tmp = format!(
@@ -1790,7 +1784,6 @@ pub struct ReplicaRegistration {
 /// Writes stall for the duration of the serialisation. Reads are not blocked.
 pub fn begin_full_sync(
     store: &crate::store::Store,
-    expiry_store: &crate::store::ExpiryStore,
     index_store: &crate::vector::IndexStore,
     repl_state: &ReplState,
     hub_tx: &HubTx,
@@ -1832,8 +1825,7 @@ pub fn begin_full_sync(
     // Only what must be captured atomically is captured under the cut. String
     // values are immutable and shared, so they are merely referenced here and
     // copied out afterwards; see `snapshot::freeze_dataset`.
-    let frozen = match crate::snapshot::freeze_dataset(store, Some(expiry_store), Some(index_store))
-    {
+    let frozen = match crate::snapshot::freeze_dataset(store, Some(index_store)) {
         Ok(f) => f,
         Err(e) => {
             drop(cut);

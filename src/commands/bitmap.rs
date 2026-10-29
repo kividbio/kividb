@@ -58,8 +58,8 @@ fn cmd_getbit(ctx: &mut Ctx) -> Vec<u8> {
         None => return resp_error("ERR bit offset is not an integer or out of range"),
     };
 
-    if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-        expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+    if is_expired(ctx.store, *ctx.selected_db, key) {
+        expire_on_read(ctx.store, *ctx.selected_db, key);
         return resp_integer(0);
     }
 
@@ -179,8 +179,8 @@ fn cmd_bitcount(ctx: &mut Ctx) -> Vec<u8> {
 
     // Hot path: whole string — no range parsing
     if cmd.len() == 2 {
-        if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-            expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+        if is_expired(ctx.store, *ctx.selected_db, key) {
+            expire_on_read(ctx.store, *ctx.selected_db, key);
             return resp_integer(0);
         }
         let db = &ctx.store[*ctx.selected_db];
@@ -221,8 +221,8 @@ fn cmd_bitcount(ctx: &mut Ctx) -> Vec<u8> {
             false
         };
 
-        let gone = is_expired(ctx.expiry_store, *ctx.selected_db, key)
-            && expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+        let gone = is_expired(ctx.store, *ctx.selected_db, key)
+            && expire_on_read(ctx.store, *ctx.selected_db, key);
 
         let db = &ctx.store[*ctx.selected_db];
         let shard = store::get_shard(db, key);
@@ -368,8 +368,8 @@ fn cmd_bitpos(ctx: &mut Ctx) -> Vec<u8> {
         _ => unreachable!(),
     };
 
-    if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-        expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+    if is_expired(ctx.store, *ctx.selected_db, key) {
+        expire_on_read(ctx.store, *ctx.selected_db, key);
         return resp_integer(if search_bit == 0 { 0 } else { -1 });
     }
 
@@ -493,8 +493,8 @@ fn cmd_bitop(ctx: &mut Ctx) -> Vec<u8> {
                 continue;
             }
         };
-        if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-            delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+        if is_expired(ctx.store, *ctx.selected_db, key) {
+            delete_key_if_expired(ctx.store, *ctx.selected_db, key);
             sources.push(vec![]);
             continue;
         }

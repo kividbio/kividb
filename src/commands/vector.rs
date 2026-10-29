@@ -159,7 +159,7 @@ fn ft_dropindex(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // Then its documents. Not each as a DEL to replicas and the AOF: they
     // run this command, and delete theirs.
     for (db, key) in &documents {
-        if !crate::commands::helpers::delete_key(ctx.store, ctx.expiry_store, *db, key) {
+        if !crate::commands::helpers::delete_key(ctx.store, *db, key) {
             continue;
         }
         crate::vector::maybe_unindex(ctx.index_store, key);

@@ -21,7 +21,7 @@
 use crate::config::Config;
 use crate::replication::{FullSyncGuard, HubTx, LinkState, ReplState};
 use crate::resp::parse::parse_resp_command;
-use crate::store::{self, ExpiryStore, SharedTsIndex, Store};
+use crate::store::{self, SharedTsIndex, Store};
 use crate::vector::{CompactionTx, DictStore, IndexStore};
 use crate::wait_table::WaitTable;
 use std::sync::Arc;
@@ -92,7 +92,6 @@ impl Drop for SlaveUpstreamGuard {
 #[derive(Clone)]
 pub struct ReplicaStarter {
     pub store: Store,
-    pub expiry_store: ExpiryStore,
     pub index_store: IndexStore,
     pub dict_store: DictStore,
     pub wait_table: Arc<WaitTable>,
@@ -121,7 +120,6 @@ impl ReplicaStarter {
             tracking_table: Arc::clone(ctx.tracking_table),
             monitor_registry: Arc::clone(ctx.monitor_registry),
             store: Arc::clone(ctx.store),
-            expiry_store: Arc::clone(ctx.expiry_store),
             index_store: Arc::clone(ctx.index_store),
             dict_store: Arc::clone(ctx.dict_store),
             wait_table: Arc::clone(ctx.wait_table),
@@ -404,7 +402,6 @@ async fn run_replication_session(
 ) -> Result<SessionEnd, SessionError> {
     let ReplicaStarter {
         store,
-        expiry_store,
         index_store,
         dict_store,
         wait_table,
@@ -599,12 +596,10 @@ async fn run_replication_session(
                 .and_then(|hex| u64::from_str_radix(hex, 16).ok()),
         );
         let ours = {
-            let (store, expiry_store) = (store.clone(), expiry_store.clone());
-            tokio::task::spawn_blocking(move || {
-                crate::replication::digest::dataset_digest(&store, &expiry_store)
-            })
-            .await
-            .ok()
+            let store = store.clone();
+            tokio::task::spawn_blocking(move || crate::replication::digest::dataset_digest(&store))
+                .await
+                .ok()
         };
         let (ask_id, ask_offset) = match offered {
             Some((id, digest)) if ours == Some(digest) && id.len() == 40 => {
@@ -800,15 +795,13 @@ async fn run_replication_session(
                 {
                     let _cut = crate::write_gate::cut();
                     let empty = store::new_store(config.databases);
-                    let empty_expiry = store::new_expiry_store(config.databases);
                     store::swap_kv_with_staging(store, &empty);
-                    store::swap_expiry_with_staging(expiry_store, &empty_expiry);
                     index_store.write().clear();
                     dict_store.write().clear();
                     crate::store::rebuild_ts_label_index(store, ts_index);
                     wait_table.clear();
-                    // `empty` and `empty_expiry` now hold the old dataset, and
-                    // take it with them.
+                    // `empty` now holds the old dataset, and takes it with
+                    // it.
                 }
                 crate::commands::memory::purge_allocator();
                 log_warn!(
@@ -836,7 +829,6 @@ async fn run_replication_session(
             // local AOF record cannot straddle it.
             let _cut = crate::write_gate::cut();
             store::swap_kv_with_staging(store, &staged.store);
-            store::swap_expiry_with_staging(expiry_store, &staged.expiry);
             index_store.write().clear();
             dict_store.write().clear();
             crate::store::rebuild_ts_label_index(store, ts_index);
@@ -854,7 +846,6 @@ async fn run_replication_session(
         // that glibc parks in its arenas, so without this the replica keeps the old
         // dataset's footprint resident on top of the new one.
         drop(staged.store);
-        drop(staged.expiry);
         crate::commands::memory::purge_allocator();
 
         // ── Phase 7: Command stream ──────────────────────────────────────────
@@ -952,14 +943,12 @@ async fn run_replication_session(
         // quiesced), so the stream must not be appending yet.
         if crate::aof::AOF_ENABLED.load(Ordering::Relaxed) {
             let store_for_rewrite = Arc::clone(store);
-            let expiry_for_rewrite = Arc::clone(expiry_store);
             let index_for_rewrite = Arc::clone(index_store);
             let repl_state_for_rewrite = Arc::clone(repl_state);
             log_info!("Replication: AOF is on — rebasing it onto the synced dataset");
             let rebased = tokio::task::spawn_blocking(move || {
                 crate::replication::save_dataset(
                     &store_for_rewrite,
-                    &expiry_for_rewrite,
                     &index_for_rewrite,
                     &repl_state_for_rewrite,
                 )
@@ -1078,7 +1067,6 @@ async fn run_replication_session(
                             $cmd,
                             store,
                             repl_state,
-                            expiry_store,
                             index_store,
                             dict_store,
                             wait_table,
@@ -1320,7 +1308,6 @@ impl Drop for SyncInProgress<'_> {
 /// A full-sync payload, parsed into stores that are not yet live.
 struct StagedSync {
     store: Store,
-    expiry: ExpiryStore,
     index_schemas: Vec<crate::vector::IndexSchema>,
     dictionaries: Vec<(String, Vec<String>)>,
     /// The master's function libraries, from a KDB image or a Redis RDB file
@@ -1337,7 +1324,6 @@ struct StagedSync {
 /// must not go on to replace the live dataset with whatever was read so far.
 fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync, SessionError> {
     let staging_store = store::new_store(databases);
-    let staging_expiry = store::new_expiry_store(databases);
 
     let is_kividb = payload.len() >= 8 && payload[..8] == *crate::snapshot::KDB_MAGIC;
     let (dbs, expiries, index_schemas, dictionaries, functions) = if is_kividb {
@@ -1360,10 +1346,9 @@ fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync
     };
 
     let keys = crate::snapshot::restore_into_store(dbs, &staging_store);
-    let keys_with_ttl = crate::snapshot::restore_expiries_into_store(expiries, &staging_expiry);
+    let keys_with_ttl = crate::snapshot::restore_expiries_into_store(expiries, &staging_store);
     Ok(StagedSync {
         store: staging_store,
-        expiry: staging_expiry,
         index_schemas,
         dictionaries,
         functions,
@@ -1633,7 +1618,6 @@ impl ReplicationApplyEnv {
         cmd: Vec<Vec<u8>>,
         store: &Store,
         repl_state: &Arc<ReplState>,
-        expiry_store: &ExpiryStore,
         index_store: &IndexStore,
         dict_store: &DictStore,
         wait_table: &Arc<WaitTable>,
@@ -1651,7 +1635,6 @@ impl ReplicationApplyEnv {
         let out = execute_command(Ctx {
             cmd: cmd_refs,
             store,
-            expiry_store,
             lastsave: &self.lastsave,
             selected_db,
             aof_tx: self.aof_tx.as_ref(),
@@ -1738,7 +1721,6 @@ pub async fn handle_replica_connection<R>(
     resp_tx: mpsc::Sender<Vec<u8>>,
     write_task: tokio::task::JoinHandle<()>,
     store: store::Store,
-    expiry_store: store::ExpiryStore,
     _lastsave: Arc<parking_lot::RwLock<i64>>,
     _aof_tx: mpsc::UnboundedSender<Vec<u8>>,
     _aof_enabled: bool,
@@ -1845,14 +1827,12 @@ where
         Err(registration) => {
             match tokio::task::spawn_blocking({
                 let store = Arc::clone(&store);
-                let expiry_store = Arc::clone(&expiry_store);
                 let index_store = Arc::clone(&index_store);
                 let repl_state = Arc::clone(&repl_state);
                 let hub_tx = hub_tx.clone();
                 move || {
                     crate::replication::begin_full_sync(
                         &store,
-                        &expiry_store,
                         &index_store,
                         &repl_state,
                         &hub_tx,
@@ -1992,7 +1972,6 @@ mod repl_apply_env_tests {
     async fn replication_apply_env_reuses_scaffold_for_many_writes() {
         let cfg = std::sync::Arc::new(crate::config::Config::default_replica());
         let store = crate::store::new_store(cfg.databases);
-        let expiry = crate::store::new_expiry_store(cfg.databases);
         let repl_state = std::sync::Arc::new(ReplState::new_master());
         let index = crate::vector::new_index_store();
         let dict = crate::vector::new_dict_store();
@@ -2003,7 +1982,6 @@ mod repl_apply_env_tests {
         let (hub_tx, _hub_rx) = tokio::sync::mpsc::unbounded_channel();
         let starter = super::ReplicaStarter {
             store: std::sync::Arc::clone(&store),
-            expiry_store: std::sync::Arc::clone(&expiry),
             index_store: std::sync::Arc::clone(&index),
             dict_store: std::sync::Arc::clone(&dict),
             wait_table: std::sync::Arc::clone(&wait),
@@ -2029,7 +2007,6 @@ mod repl_apply_env_tests {
                 vec![b"SET".to_vec(), ks.as_bytes().to_vec(), b"v".to_vec()],
                 &store,
                 &repl_state,
-                &expiry,
                 &index,
                 &dict,
                 &wait,
@@ -2047,7 +2024,6 @@ mod repl_apply_env_tests {
             vec![b"GET".to_vec(), br"rk0".to_vec()],
             &store,
             &repl_state,
-            &expiry,
             &index,
             &dict,
             &wait,
@@ -2246,29 +2222,37 @@ mod full_sync_guard_tests {
     #[test]
     fn payload_round_trip_keeps_keys_and_ttls() {
         let store = crate::store::new_store(2);
-        let expiry = crate::store::new_expiry_store(2);
         for (db, key) in [(0usize, "a"), (0, "b"), (1, "c")] {
             crate::store::get_shard(&store[db], key)
                 .write()
                 .insert_str(key, &b"v"[..]);
         }
-        let in_an_hour = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
-        crate::store::get_expiry_shard(&expiry[0], "a")
+        let in_an_hour = crate::commands::helpers::now_ms() + 3_600_000;
+        crate::store::get_shard(&store[0], "a")
             .write()
-            .insert(crate::store::Key::from("a"), in_an_hour);
-        // An expiry for a key that does not exist must not travel.
-        crate::store::get_expiry_shard(&expiry[0], "ghost")
-            .write()
-            .insert(crate::store::Key::from("ghost"), in_an_hour);
+            .set_expires("a", in_an_hour);
+        // A time to live for a key that does not exist is none.
+        assert!(
+            !crate::store::get_shard(&store[0], "ghost")
+                .write()
+                .set_expires("ghost", in_an_hour)
+        );
 
-        let payload = crate::snapshot::full_sync_payload(&store, Some(&expiry), None).unwrap();
+        let payload = crate::snapshot::full_sync_payload(&store, None).unwrap();
         let staged = load_full_sync_payload(&payload, 2).expect("payload loads");
         assert_eq!(staged.keys, 3);
         assert_eq!(staged.keys_with_ttl, 1);
-        assert!(
-            crate::store::get_expiry_shard(&staged.expiry[0], "a")
+        assert_eq!(
+            crate::store::get_shard(&staged.store[0], "a")
                 .read()
-                .contains_key("a")
+                .expires("a"),
+            Some(in_an_hour)
+        );
+        assert_eq!(
+            crate::store::get_shard(&staged.store[0], "b")
+                .read()
+                .expires("b"),
+            None
         );
         assert!(
             crate::store::get_shard(&staged.store[1], "c")
@@ -2282,18 +2266,17 @@ mod full_sync_guard_tests {
     #[test]
     fn keys_already_expired_are_dropped_on_load() {
         let store = crate::store::new_store(1);
-        let expiry = crate::store::new_expiry_store(1);
         for key in ["live", "dead"] {
             crate::store::get_shard(&store[0], key)
                 .write()
                 .insert_str(key, &b"v"[..]);
         }
-        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(5);
-        crate::store::get_expiry_shard(&expiry[0], "dead")
+        let past = crate::commands::helpers::now_ms() - 5_000;
+        crate::store::get_shard(&store[0], "dead")
             .write()
-            .insert(crate::store::Key::from("dead"), past);
+            .set_expires("dead", past);
 
-        let payload = crate::snapshot::full_sync_payload(&store, Some(&expiry), None).unwrap();
+        let payload = crate::snapshot::full_sync_payload(&store, None).unwrap();
         let staged = load_full_sync_payload(&payload, 1).expect("payload loads");
         assert_eq!(staged.keys, 1);
         assert!(

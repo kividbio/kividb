@@ -102,7 +102,6 @@ async fn server_tokio(
     use tokio::sync::mpsc;
 
     let store = store::new_store(config.databases);
-    let expiry_store = store::new_expiry_store(config.databases);
     let index_store = vector::new_index_store();
     let lastsave = Arc::new(RwLock::new(0i64));
     let aof_enabled = config.aof;
@@ -126,7 +125,6 @@ async fn server_tokio(
     let latency = crate::latency::new_latency_tracker();
     crate::commands::helpers::spawn_active_expire_task(
         Arc::clone(&store),
-        Arc::clone(&expiry_store),
         Arc::clone(&index_store),
         pubsub.clone(),
         Arc::clone(&latency),
@@ -195,7 +193,6 @@ async fn server_tokio(
     // `ReplicaStarter::start`).
     let replica_starter = crate::replication::replica_client::ReplicaStarter {
         store: Arc::clone(&store),
-        expiry_store: Arc::clone(&expiry_store),
         index_store: Arc::clone(&index_store),
         dict_store: Arc::clone(&dict_store),
         wait_table: Arc::clone(&wait_table),
@@ -253,7 +250,6 @@ async fn server_tokio(
 
         let tls_config = Arc::clone(&config);
         let tls_store = Arc::clone(&store);
-        let tls_expiry_store = expiry_store.clone();
         let tls_lastsave = Arc::clone(&lastsave);
         let tls_aof_tx = aof_tx.clone();
         let tls_started_at = Arc::clone(&started_at);
@@ -303,7 +299,6 @@ async fn server_tokio(
                 let peer_addr_str = peer_addr.to_string();
 
                 let store = Arc::clone(&tls_store);
-                let expiry_store = tls_expiry_store.clone();
                 let lastsave = Arc::clone(&tls_lastsave);
                 let aof_tx = tls_aof_tx.clone();
                 let config = Arc::clone(&tls_config);
@@ -330,7 +325,6 @@ async fn server_tokio(
                     let _ = server::handle_client(
                         tls_stream,
                         store,
-                        expiry_store,
                         lastsave,
                         aof_tx,
                         aof_enabled,
@@ -375,7 +369,6 @@ async fn server_tokio(
         crate::stats::TOTAL_CONNECTIONS_RECEIVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let peer_addr_str = peer_addr.to_string();
         let store = Arc::clone(&store);
-        let expiry_store = Arc::clone(&expiry_store);
         let index_store = Arc::clone(&index_store);
         let lastsave = Arc::clone(&lastsave);
         let aof_tx = aof_tx.clone();
@@ -401,7 +394,6 @@ async fn server_tokio(
             let _ = server::handle_client(
                 socket,
                 store,
-                expiry_store,
                 lastsave,
                 aof_tx,
                 aof_enabled,

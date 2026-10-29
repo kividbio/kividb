@@ -971,7 +971,6 @@ fn spawn_master_that_goes_silent() -> u16 {
                             let payload = kividb::snapshot::full_sync_payload(
                                 &kividb::store::new_store(16),
                                 None,
-                                None,
                             )
                             .unwrap();
                             stream

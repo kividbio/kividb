@@ -70,7 +70,7 @@ fn get_or_create_set(ctx: &Ctx, key: &str) -> Result<Set, Vec<u8>> {
 // while doing O(n) work (diff/inter/union). The clone is O(n) in the set size,
 // same as the operation itself, so it doesn't change the complexity class.
 fn load_set(ctx: &Ctx, key: &str) -> Option<crate::member_set::MemberSet> {
-    if lazy_expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key) {
+    if lazy_expire_on_read(ctx.store, *ctx.selected_db, key) {
         return Some(crate::member_set::MemberSet::new());
     }
     let db_ref = &ctx.store[*ctx.selected_db];
@@ -157,14 +157,12 @@ fn store_set(ctx: &mut Ctx, dst_key: &str, members: Vec<Arc<[u8]>>) {
     let db = *ctx.selected_db;
     let db_ref = &ctx.store[db];
     let shard = store::get_shard(db_ref, dst_key);
-    {
-        let mut map = write_lock!(shard);
-        map.insert(
-            Key::from(dst_key),
-            KiviDBValue::Set(Arc::new(RwLock::new(set))),
-        );
-    }
-    crate::commands::helpers::clear_expiry(ctx.expiry_store, db, dst_key);
+    let replaced = write_lock!(shard).insert_expiring(
+        Key::from(dst_key),
+        KiviDBValue::Set(Arc::new(RwLock::new(set))),
+        None,
+    );
+    drop(replaced);
 }
 
 pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
@@ -216,7 +214,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => return Some(resp_error("ERR must be valid UTF-8")),
             };
 
-            if lazy_expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key) {
+            if lazy_expire_on_read(ctx.store, *ctx.selected_db, key) {
                 return Some(resp_integer(0));
             }
 
