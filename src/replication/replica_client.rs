@@ -2061,21 +2061,10 @@ mod repl_apply_env_tests {
         .unwrap();
 
         let shard = crate::store::get_shard(&store[0], "rk0");
-        #[cfg(not(target_os = "linux"))]
-        {
-            let map = shard.read();
-            match map.get("rk0") {
-                Some(crate::store::ValueRef::String(b)) => assert_eq!(&b[..], b"v"),
-                _ => panic!("unexpected value variant for rk0"),
-            }
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let map = shard.read();
-            match map.get("rk0") {
-                Some(KiviDBValue::String(b)) => assert_eq!(&b[..], b"v"),
-                _ => panic!("unexpected value variant for rk0"),
-            }
+        let map = shard.read();
+        match map.get("rk0") {
+            Some(crate::store::ValueRef::String(b)) => assert_eq!(&b[..], b"v"),
+            _ => panic!("unexpected value variant for rk0"),
         }
     }
 }
