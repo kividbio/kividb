@@ -540,11 +540,10 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
         let Some(live) = def.indexes.get(&knn.field) else {
             return Some(resp_error("The vector field has no index"));
         };
-        let candidates: std::collections::HashSet<String> = rows
+        let candidates = rows
             .iter()
-            .filter_map(|row| row.get("__key").cloned())
-            .collect();
-        let (nearest, cut) = knn_filtered(live, &knn.vector, knn.k, metric, &candidates, deadline);
+            .filter_map(|row| row.get("__key").map(String::as_str));
+        let (nearest, cut) = knn_filtered(live, &knn.vector, knn.k, metric, candidates, deadline);
         timed_out |= cut;
         let rank: ahash::AHashMap<String, (usize, f32)> = nearest
             .into_iter()
@@ -1253,66 +1252,153 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
 // ── Helpers for filtered search ──────────────────────────────────────────────
 
+/// The nearest `k` of the documents offered to it, measured as they come:
+/// what a filtered KNN keeps while the filter runs.
+///
+/// A filter used to hand its keys over as a set of cloned `String`s, which
+/// the KNN then looked up again one by one. The scorer is offered each key
+/// as the filter accepts it, measures it at once against the query (scaled
+/// to unit length once, for a cosine), and keeps only the best `k`: a key is
+/// copied only when it is among them so far.
+///
+/// Each offer takes the vector index's locks for itself and lets them go:
+/// it runs under a shard's read lock, and a write to that shard can hold the
+/// shard while it waits on them.
+pub(crate) struct FilteredKnn<'a> {
+    live: &'a LiveIndex,
+    query: crate::vector::PreparedQuery<'a>,
+    best: Best,
+}
+
+impl<'a> FilteredKnn<'a> {
+    pub(crate) fn new(
+        live: &'a LiveIndex,
+        query: &'a [f32],
+        k: usize,
+        metric: &'a crate::vector::DistanceMetric,
+    ) -> Self {
+        Self {
+            live,
+            query: crate::vector::PreparedQuery::new(metric, query),
+            best: Best::new(k),
+        }
+    }
+
+    /// Measure the document at `key`, if the index holds a vector for it.
+    #[inline]
+    pub(crate) fn offer(&mut self, key: &str) {
+        let dim = self.query.vector().len();
+        let distance = match self.live {
+            LiveIndex::Flat(idx) => {
+                let vectors = idx.vectors.read();
+                match vectors.get(key) {
+                    Some(v) if v.len() == dim => self.query.to_raw(v),
+                    _ => return,
+                }
+            }
+            LiveIndex::Hnsw(idx) => {
+                let Some(id) = idx.key_to_id.read().get(key).copied() else {
+                    return;
+                };
+                let nodes = idx.nodes.read();
+                match nodes.get(id) {
+                    Some(n) if !n.vector.is_empty() && n.vector.len() == dim => {
+                        self.query.to_unit(&n.vector)
+                    }
+                    _ => return,
+                }
+            }
+        };
+        self.best.offer(distance, key);
+    }
+
+    /// The nearest, nearest first.
+    pub(crate) fn nearest(self) -> Vec<crate::vector::KnnResult> {
+        self.best.into_sorted()
+    }
+}
+
+/// The `k` smallest distances offered, with their keys: a max-heap whose
+/// top is the one to beat.
+struct Best {
+    k: usize,
+    heap: std::collections::BinaryHeap<Far>,
+}
+
+/// A distance ordered for the heap: `total_cmp`, so a NaN is the farthest.
+struct Far(f32, String);
+
+impl PartialEq for Far {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.total_cmp(&other.0).is_eq()
+    }
+}
+impl Eq for Far {}
+impl PartialOrd for Far {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Far {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+impl Best {
+    fn new(k: usize) -> Self {
+        Self {
+            k,
+            heap: std::collections::BinaryHeap::with_capacity(k.min(4096) + 1),
+        }
+    }
+
+    #[inline]
+    fn offer(&mut self, distance: f32, key: &str) {
+        if self.heap.len() < self.k {
+            self.heap.push(Far(distance, key.to_string()));
+        } else if let Some(mut top) = self.heap.peek_mut()
+            && distance.total_cmp(&top.0).is_lt()
+        {
+            // In place: the key's buffer is reused.
+            top.0 = distance;
+            top.1.clear();
+            top.1.push_str(key);
+        }
+    }
+
+    fn into_sorted(self) -> Vec<crate::vector::KnnResult> {
+        self.heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|Far(score, key)| crate::vector::KnnResult { key, score })
+            .collect()
+    }
+}
+
 /// Brute-force KNN over only the keys in `candidates`. Stops when
 /// `deadline` has passed, with the nearest of the candidates measured so
 /// far, and then the second value is true.
-pub(crate) fn knn_filtered(
+pub(crate) fn knn_filtered<'k>(
     live_index: &crate::vector::LiveIndex,
     query: &[f32],
     k: usize,
     metric: &crate::vector::DistanceMetric,
-    candidates: &std::collections::HashSet<String>,
+    candidates: impl IntoIterator<Item = &'k str>,
     deadline: Option<std::time::Instant>,
 ) -> (Vec<crate::vector::KnnResult>, bool) {
+    let mut scorer = FilteredKnn::new(live_index, query, k, metric);
     // A distance per candidate: the clock is read every DEADLINE_EVERY.
     let mut seen = 0u32;
     let mut cut = false;
-    let mut in_time = |_: &&String| {
-        cut = cut || crate::commands::search::deadline_due(deadline, &mut seen);
-        !cut
-    };
-    // Pull the vectors for candidate keys only
-    let mut scored: Vec<(f32, String)> = match live_index {
-        crate::vector::LiveIndex::Flat(idx) => {
-            let vectors = idx.vectors.read();
-            candidates
-                .iter()
-                .take_while(&mut in_time)
-                .filter_map(|key| vectors.get(key).map(|v| (v.clone(), key.clone())))
-                .filter(|(v, _)| v.len() == query.len())
-                .map(|(v, key)| (crate::vector::distance(metric, query, &v), key))
-                .collect()
+    for key in candidates {
+        if crate::commands::search::deadline_due(deadline, &mut seen) {
+            cut = true;
+            break;
         }
-        crate::vector::LiveIndex::Hnsw(idx) => {
-            let key_to_id = idx.key_to_id.read();
-            let nodes = idx.nodes.read();
-            candidates
-                .iter()
-                .take_while(&mut in_time)
-                .filter_map(|key| key_to_id.get(key).map(|&id| (id, key.clone())))
-                .filter_map(|(id, key)| {
-                    let n = &nodes[id];
-                    if n.vector.is_empty() || n.vector.len() != query.len() {
-                        return None;
-                    }
-                    let dist = crate::vector::distance(metric, query, &n.vector);
-                    Some((dist, key))
-                })
-                .collect()
-        }
-    };
-
-    if scored.len() > k {
-        scored.select_nth_unstable_by(k, |a, b| a.0.total_cmp(&b.0));
-        scored.truncate(k);
+        scorer.offer(key);
     }
-    scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-
-    let nearest = scored
-        .into_iter()
-        .map(|(score, key)| crate::vector::KnnResult { key, score })
-        .collect();
-    (nearest, cut)
+    (scorer.nearest(), cut)
 }
 
 /// Backfill a subset of vector fields after FT.ALTER added them.
@@ -1717,4 +1803,88 @@ fn ft_debug_compact(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let _ = ctx.compaction_tx.try_send(req);
 
     Some(resp_simple("OK"))
+}
+
+#[cfg(test)]
+mod filtered_knn_tests {
+    use super::*;
+
+    fn vector(dim: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..dim)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// The nearest `k` keys of `keys`, by the plain distance: what the
+    /// filtered KNN returned before.
+    fn exact(
+        data: &[(String, Vec<f32>)],
+        keys: &[&str],
+        q: &[f32],
+        k: usize,
+        metric: &crate::vector::DistanceMetric,
+    ) -> Vec<String> {
+        let mut scored: Vec<(f32, &str)> = data
+            .iter()
+            .filter(|(key, _)| keys.contains(&key.as_str()))
+            .map(|(key, v)| (crate::vector::distance(metric, q, v), key.as_str()))
+            .collect();
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+        scored
+            .into_iter()
+            .take(k)
+            .map(|(_, key)| key.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_scorer_keeps_the_exact_nearest_of_the_keys_offered() {
+        use crate::vector::{DistanceMetric, HnswIndex, VectorIndex};
+        let dim = 37;
+        let data: Vec<(String, Vec<f32>)> = (0..600)
+            .map(|i| (format!("doc:{i}"), vector(dim, i as u64 + 1)))
+            .collect();
+        // Every third key, as a filter would leave them, and one with no vector.
+        let mut keys: Vec<&str> = data.iter().step_by(3).map(|(k, _)| k.as_str()).collect();
+        keys.push("doc:none");
+        for metric in [
+            DistanceMetric::Cosine,
+            DistanceMetric::L2,
+            DistanceMetric::InnerProduct,
+        ] {
+            let flat = Arc::new(VectorIndex::new());
+            let graph = Arc::new(HnswIndex::new(16, 64));
+            for (key, v) in &data {
+                flat.insert(key.clone(), v.clone());
+                crate::vector::hnsw_insert(&graph, key.clone(), v.clone(), &metric);
+            }
+            let q = vector(dim, 9_999);
+            for k in [0usize, 1, 10, 500] {
+                let want = exact(&data, &keys, &q, k, &metric);
+                for live in [
+                    LiveIndex::Flat(flat.clone()),
+                    LiveIndex::Hnsw(graph.clone()),
+                ] {
+                    let (got, cut) =
+                        knn_filtered(&live, &q, k, &metric, keys.iter().copied(), None);
+                    assert!(!cut);
+                    let got_keys: Vec<String> = got.iter().map(|r| r.key.clone()).collect();
+                    assert_eq!(got_keys.len(), want.len(), "{metric:?} k={k}");
+                    // Equal up to the order of near ties.
+                    let mut a = got_keys.clone();
+                    let mut b = want.clone();
+                    a.sort();
+                    b.sort();
+                    assert_eq!(a, b, "{metric:?} k={k}");
+                    assert!(got.windows(2).all(|w| w[0].score <= w[1].score));
+                }
+            }
+        }
+    }
 }

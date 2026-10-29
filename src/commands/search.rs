@@ -873,22 +873,42 @@ pub(crate) fn filter_search(
     only: Option<&AHashSet<String>>,
     deadline: Option<Instant>,
 ) -> FilterHits {
-    let db = &ctx.store[*ctx.selected_db];
     let mut terms = AHashSet::new();
     query_terms(filter, &mut terms);
     let range = filter.vector_range();
     let mut out: Vec<Match> = Vec::new();
-    let mut timed_out = false;
-
-    let mut consider = |key: &str, fields: &Fields| {
-        if !filter::eval(filter, fields) {
-            return;
-        }
+    let timed_out = filter_each(ctx, def, filter, only, deadline, |key, fields| {
         out.push(Match {
             key: key.to_string(),
             score: relevance(def, fields, &terms),
             distance: range.and_then(|clause| filter::range_distance(clause, fields)),
         });
+    });
+    FilterHits {
+        matches: out,
+        timed_out,
+    }
+}
+
+/// Every document of the index that the filter accepts, into `accept`, with
+/// its key and fields: [`filter_search`] without the copies, for a caller
+/// that keeps only some of them. True if it stopped because `deadline` had
+/// passed. `accept` may run under a shard's read lock.
+pub(crate) fn filter_each(
+    ctx: &Ctx,
+    def: &IndexDef,
+    filter: &Filter,
+    only: Option<&AHashSet<String>>,
+    deadline: Option<Instant>,
+    mut accept: impl FnMut(&str, &Fields),
+) -> bool {
+    let db = &ctx.store[*ctx.selected_db];
+    let mut timed_out = false;
+
+    let mut consider = |key: &str, fields: &Fields| {
+        if filter::eval(filter, fields) {
+            accept(key, fields);
+        }
     };
 
     // The keys to look at, if they are known without reading everything: the
@@ -925,10 +945,7 @@ pub(crate) fn filter_search(
     }
     // A scan that reached the end is whole, however long it took: only one
     // that stopped early has timed out.
-    FilterHits {
-        matches: out,
-        timed_out,
-    }
+    timed_out
 }
 
 /// Run `f` on the document at `key`, if there is one of the kind the index
@@ -1371,20 +1388,19 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 }
             } else {
                 // The filter first, then the nearest among what it left:
-                // exact, whatever the index type.
-                let found = filter_search(ctx, &def, &filter, args.inkeys.as_ref(), deadline);
-                let allowed: std::collections::HashSet<String> =
-                    found.matches.into_iter().map(|m| m.key).collect();
-                let (nearest, cut) = crate::commands::vector::knn_filtered(
-                    live,
-                    &knn.vector,
-                    knn.k,
-                    metric,
-                    &allowed,
+                // exact, whatever the index type. Each document the filter
+                // accepts is measured as it is found.
+                let mut scorer =
+                    crate::commands::vector::FilteredKnn::new(live, &knn.vector, knn.k, metric);
+                timed_out = filter_each(
+                    ctx,
+                    &def,
+                    &filter,
+                    args.inkeys.as_ref(),
                     deadline,
+                    |key, _| scorer.offer(key),
                 );
-                timed_out = found.timed_out || cut;
-                nearest
+                scorer.nearest()
             };
             nearest
                 .into_iter()
