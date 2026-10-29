@@ -155,6 +155,25 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Changed
 
+- **Vector search: distances in SIMD, a filtered KNN without copies.**
+  Every vector distance (HNSW search and insert, FLAT, the KNN step of a
+  filtered query) was a scalar sum the compiler could not vectorise. The
+  dot product, squared L2 and cosine are now AVX-512, AVX2 with FMA or NEON
+  kernels, picked at run time, with a portable eight-way sum elsewhere; no
+  new dependency. A cosine query is scaled to unit length once per search.
+  A filtered `KNN` measures each document as the filter accepts it and
+  keeps the best `k`, instead of copying every accepted key into a set and
+  looking each up again. Results are the same up to float rounding. On an
+  Azure D16s_v5, server on 8 CPUs, M 16, EF_CONSTRUCTION 128
+  (redis/vector-db-benchmark; Redis 8.10.3 in brackets):
+  dbpedia-openai-100K-1536 at ef 128 goes from 330 to 811 queries a second
+  with one client (978) and from 1883 to 3894 with 16 (5005), recall 0.985
+  (0.980); its upload from 126 s to 29 s (14 s). h-and-m-2048 with filters
+  uploads in 41 s instead of 156 s (20 s); its filtered queries gain only
+  a quarter, 9.0 to 11.3 a second with one client (167) and 52 to 69 with
+  16 (964), recall 0.998 for both, because a TAG or NUMERIC filter still
+  reads every document.
+
 - **Release candidates are no longer published as GitHub Releases.** A tag
   such as `v1.2.0-rc1` is still built, its images are still pushed to GHCR
   (`ghcr.io/kividbio/kividb:v1.2.0-rc1`) and smoke-tested, and its Linux
