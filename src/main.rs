@@ -990,7 +990,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
             .map(|_| std::sync::atomic::AtomicUsize::new(0))
             .collect(),
     );
-    type Passed = (std::net::TcpStream, String);
+    type Passed = (std::net::TcpStream, String, crate::client_registry::Slot);
     let (inboxes, mut inbox_ends): (Vec<_>, Vec<_>) = (0..threads)
         .map(|_| {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Passed>();
@@ -1060,10 +1060,13 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                             }
                         }
                         let loads_of_clients = Arc::clone(&loads);
+                        let admitting = Arc::clone(&client_registry);
                         // Starts a client on this worker. Its place in the
                         // worker's count was taken by whoever chose the worker.
                         let start_client = std::rc::Rc::new(
-                            move |stream: tokio_uring::net::TcpStream, peer_addr_str: String| {
+                            move |stream: tokio_uring::net::TcpStream,
+                                  peer_addr_str: String,
+                                  slot: crate::client_registry::Slot| {
                             let store = Arc::clone(&store);
                             let lastsave = Arc::clone(&lastsave);
                             let aof_tx = aof_tx.clone();
@@ -1090,6 +1093,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                             let counted = Counted(Arc::clone(&loads_of_clients), worker);
                             tokio_uring::spawn(async move {
                                 let _counted = counted;
+                                let _slot = slot;
                                 if let Err(e) = server_uring::handle_client(
                                     stream,
                                     store,
@@ -1133,10 +1137,11 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                             // What other workers pass to this one.
                             let start_client = std::rc::Rc::clone(&start_client);
                             tokio_uring::spawn(async move {
-                                while let Some((stream, peer_addr_str)) = inbox.recv().await {
+                                while let Some((stream, peer_addr_str, slot)) = inbox.recv().await {
                                     start_client(
                                         tokio_uring::net::TcpStream::from_std(stream),
                                         peer_addr_str,
+                                        slot,
                                     );
                                 }
                             });
@@ -1153,6 +1158,14 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                                     log_throttled!(10, crate::loglevel::WARN, "Accept error: {e} — if this is \"Too many open files\", raise the open-file limit (ulimit -n, or LimitNOFILE= under systemd)");
                                     continue;
                                 }
+                            };
+                            let Some(mut slot) = crate::client_registry::admit(&admitting) else {
+                                tokio_uring::spawn(async move {
+                                    let _ = stream
+                                        .write_all(crate::client_registry::TOO_MANY_CLIENTS.to_vec())
+                                        .await;
+                                });
+                                continue;
                             };
                             crate::stats::TOTAL_CONNECTIONS_RECEIVED
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1180,18 +1193,19 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                                     let passed = unsafe { std::net::TcpStream::from_raw_fd(copy) };
                                     loads[worker].fetch_sub(1, Ordering::Relaxed);
                                     loads[least].fetch_add(1, Ordering::Relaxed);
-                                    match inboxes[least].send((passed, peer_addr_str)) {
+                                    match inboxes[least].send((passed, peer_addr_str, slot)) {
                                         Ok(()) => continue,
-                                        Err(tokio::sync::mpsc::error::SendError((_, peer))) => {
+                                        Err(tokio::sync::mpsc::error::SendError((_, peer, back))) => {
                                             // That worker has gone: it stays here.
                                             loads[least].fetch_sub(1, Ordering::Relaxed);
                                             loads[worker].fetch_add(1, Ordering::Relaxed);
                                             peer_addr_str = peer;
+                                            slot = back;
                                         }
                                     }
                                 }
                             }
-                            start_client(stream, peer_addr_str);
+                            start_client(stream, peer_addr_str, slot);
                         }
                     });
                 }));
@@ -1284,7 +1298,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                         let Some(acceptor) = acceptor::current(server) else {
                             continue;
                         };
-                        let Some(slot) = acceptor::handshake_slot() else {
+                        let Some(slot) = crate::client_registry::admit(&tls_client_registry) else {
                             continue;
                         };
                         let store = Arc::clone(&tls_store);
@@ -1311,7 +1325,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                         let tracking_table = Arc::clone(&tls_tracking_table);
 
                         tokio::spawn(async move {
-                            let Some(tls_stream) =
+                            let Some((tls_stream, _slot)) =
                                 acceptor::handshake(&acceptor, tcp_stream, peer_addr, slot).await
                             else {
                                 return;
@@ -1666,7 +1680,7 @@ async fn async_main_tokio(
                 let Some(acceptor) = acceptor::current(server) else {
                     continue;
                 };
-                let Some(slot) = acceptor::handshake_slot() else {
+                let Some(slot) = crate::client_registry::admit(&tls_client_registry) else {
                     continue;
                 };
                 let store = Arc::clone(&tls_store);
@@ -1693,7 +1707,7 @@ async fn async_main_tokio(
                 let tracking_table = Arc::clone(&tls_tracking_table);
 
                 tokio::spawn(async move {
-                    let Some(tls_stream) =
+                    let Some((tls_stream, _slot)) =
                         acceptor::handshake(&acceptor, tcp_stream, peer_addr, slot).await
                     else {
                         return;
@@ -1770,6 +1784,10 @@ async fn async_main_tokio(
             result = listener.accept() => {
                 match result {
                     Ok((socket, peer_addr)) => {
+                        let Some(slot) = crate::client_registry::admit(&client_registry) else {
+                            crate::client_registry::turn_away(socket);
+                            continue;
+                        };
                         crate::stats::TOTAL_CONNECTIONS_RECEIVED
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -1798,6 +1816,7 @@ async fn async_main_tokio(
                         let monitor_registry = Arc::clone(&monitor_registry);
                         let tracking_table = Arc::clone(&tracking_table);
                         tokio::spawn(async move {
+                            let _slot = slot;
                             if let Err(e) = server::handle_client(
                                 socket,
                                 store,
@@ -1866,6 +1885,10 @@ async fn async_main_tokio(
             result = listener.accept() => {
                 match result {
                     Ok((socket, peer_addr)) => {
+                        let Some(slot) = crate::client_registry::admit(&client_registry) else {
+                            crate::client_registry::turn_away(socket);
+                            continue;
+                        };
                         crate::stats::TOTAL_CONNECTIONS_RECEIVED
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -1894,6 +1917,7 @@ async fn async_main_tokio(
                         let monitor_registry = Arc::clone(&monitor_registry);
                         let tracking_table = Arc::clone(&tracking_table);
                         tokio::spawn(async move {
+                            let _slot = slot;
                             if let Err(e) = server::handle_client(
                                 socket,
                                 store,

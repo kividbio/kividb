@@ -126,37 +126,20 @@ pub mod acceptor {
     /// How long a client has to finish its handshake once connected.
     pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-    /// How many clients may be in their handshake at once, in this process:
-    /// a part of the usual 1024 file descriptors, leaving the rest to clients.
-    const MAX_PENDING_HANDSHAKES: usize = 256;
-
-    static PENDING_HANDSHAKES: tokio::sync::Semaphore =
-        tokio::sync::Semaphore::const_new(MAX_PENDING_HANDSHAKES);
-
-    /// A place for one more handshake, or `None` when all are taken and the
-    /// connection is to be dropped. Never waits.
-    pub fn handshake_slot() -> Option<tokio::sync::SemaphorePermit<'static>> {
-        let slot = PENDING_HANDSHAKES.try_acquire().ok();
-        if slot.is_none() {
-            crate::log_throttled!(
-                10,
-                crate::loglevel::WARN,
-                "TLS: {MAX_PENDING_HANDSHAKES} handshakes pending; dropping new connections"
-            );
-        }
-        slot
-    }
-
     /// Complete the handshake of a client that connected from `peer`, or
-    /// log why it did not and give up on it. `_slot` is freed on return.
+    /// log why it did not and give up on it. The client keeps its `slot`
+    /// once connected; it is given back if the handshake fails.
     pub async fn handshake(
         acceptor: &TlsAcceptor,
         tcp: tokio::net::TcpStream,
         peer: std::net::SocketAddr,
-        _slot: tokio::sync::SemaphorePermit<'static>,
-    ) -> Option<tokio_rustls::server::TlsStream<tokio::net::TcpStream>> {
+        slot: crate::client_registry::Slot,
+    ) -> Option<(
+        tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        crate::client_registry::Slot,
+    )> {
         match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
-            Ok(Ok(tls)) => Some(tls),
+            Ok(Ok(tls)) => Some((tls, slot)),
             Ok(Err(e)) => {
                 // Full `Debug` — rustls errors often have empty `Display`.
                 crate::log_verbose!("TLS: handshake failed from {peer}: {e} ({e:?})");
@@ -443,9 +426,10 @@ pub mod acceptor {
             (client, server, peer)
         }
 
-        /// A handshake gives its slot back however it ends.
+        /// A client keeps its slot once connected; a handshake that fails,
+        /// runs out of time or is cancelled gives it back.
         #[tokio::test]
-        async fn a_handshake_frees_its_slot_however_it_ends() {
+        async fn a_handshake_keeps_its_slot_only_if_it_connects() {
             let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
             let cert = certified.cert.der().clone();
             let key = PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
@@ -454,8 +438,8 @@ pub mod acceptor {
                 .with_single_cert(vec![cert.clone()], key)
                 .unwrap();
             let acceptor = TlsAcceptor::from(Arc::new(config));
-            let free = || PENDING_HANDSHAKES.available_permits();
-            assert_eq!(free(), MAX_PENDING_HANDSHAKES);
+            let registry = crate::client_registry::new_client_registry();
+            let slot = || crate::client_registry::admit(&registry).unwrap();
 
             let mut roots = RootCertStore::empty();
             roots.add(cert).unwrap();
@@ -466,36 +450,34 @@ pub mod acceptor {
             ));
             let (tcp, server, peer) = connect().await;
             let (accepted, connected) = tokio::join!(
-                handshake(&acceptor, server, peer, handshake_slot().unwrap()),
+                handshake(&acceptor, server, peer, slot()),
                 client.connect(ServerName::try_from("localhost").unwrap(), tcp),
             );
-            assert!(accepted.is_some() && connected.is_ok());
-            assert_eq!(free(), MAX_PENDING_HANDSHAKES);
+            let (tls, kept) = accepted.unwrap();
+            assert!(connected.is_ok());
+            assert_eq!(registry.slots_held(), 1);
+            drop((tls, kept));
+            assert_eq!(registry.slots_held(), 0);
 
             let (mut tcp, server, peer) = connect().await;
             tcp.write_all(b"PING\r\n").await.unwrap();
-            assert!(
-                handshake(&acceptor, server, peer, handshake_slot().unwrap())
-                    .await
-                    .is_none()
-            );
-            assert_eq!(free(), MAX_PENDING_HANDSHAKES);
+            assert!(handshake(&acceptor, server, peer, slot()).await.is_none());
+            assert_eq!(registry.slots_held(), 0);
 
             let (_tcp, server, peer) = connect().await;
-            let slot = handshake_slot().unwrap();
             let task = {
-                let acceptor = acceptor.clone();
+                let (acceptor, slot) = (acceptor.clone(), slot());
                 tokio::spawn(async move { handshake(&acceptor, server, peer, slot).await })
             };
-            assert_eq!(free(), MAX_PENDING_HANDSHAKES - 1);
+            assert_eq!(registry.slots_held(), 1);
             task.abort();
-            assert!(task.await.unwrap_err().is_cancelled());
-            assert_eq!(free(), MAX_PENDING_HANDSHAKES);
+            assert!(task.await.is_err_and(|e| e.is_cancelled()));
+            assert_eq!(registry.slots_held(), 0);
 
-            let slots: Vec<_> = std::iter::from_fn(handshake_slot).collect();
-            assert_eq!(slots.len(), MAX_PENDING_HANDSHAKES);
-            drop(slots);
-            assert_eq!(free(), MAX_PENDING_HANDSHAKES);
+            let (_tcp, server, peer) = connect().await;
+            tokio::time::pause();
+            assert!(handshake(&acceptor, server, peer, slot()).await.is_none());
+            assert_eq!(registry.slots_held(), 0);
         }
     }
 }

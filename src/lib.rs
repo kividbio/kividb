@@ -288,7 +288,7 @@ async fn server_tokio(
                 let Some(acceptor) = acceptor::current(server) else {
                     continue;
                 };
-                let Some(slot) = acceptor::handshake_slot() else {
+                let Some(slot) = crate::client_registry::admit(&tls_client_registry) else {
                     continue;
                 };
                 let store = Arc::clone(&tls_store);
@@ -315,7 +315,7 @@ async fn server_tokio(
                 let tracking_table = Arc::clone(&tls_tracking_table);
 
                 tokio::spawn(async move {
-                    let Some(tls_stream) =
+                    let Some((tls_stream, _slot)) =
                         acceptor::handshake(&acceptor, tcp_stream, peer_addr, slot).await
                     else {
                         return;
@@ -368,6 +368,10 @@ async fn server_tokio(
             Ok(v) => v,
             Err(_) => continue,
         };
+        let Some(slot) = crate::client_registry::admit(&client_registry) else {
+            crate::client_registry::turn_away(socket);
+            continue;
+        };
         crate::stats::TOTAL_CONNECTIONS_RECEIVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let peer_addr_str = peer_addr.to_string();
         let store = Arc::clone(&store);
@@ -393,6 +397,7 @@ async fn server_tokio(
         let monitor_registry = Arc::clone(&monitor_registry);
         let tracking_table = Arc::clone(&tracking_table);
         tokio::spawn(async move {
+            let _slot = slot;
             let _ = server::handle_client(
                 socket,
                 store,

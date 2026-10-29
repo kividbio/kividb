@@ -84,6 +84,11 @@ impl Write for BlockingTls {
 }
 
 fn make_tls_client(port: u16, cert_der: &[u8]) -> BlockingTls {
+    try_tls_client(port, cert_der).expect("tls handshake")
+}
+
+/// A TLS client, or `None` if its handshake fails.
+fn try_tls_client(port: u16, cert_der: &[u8]) -> Option<BlockingTls> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store
         .add(rustls::pki_types::CertificateDer::from(cert_der.to_vec()))
@@ -106,13 +111,10 @@ fn make_tls_client(port: u16, cert_der: &[u8]) -> BlockingTls {
             .await
             .expect("tcp connect");
         let domain = rustls::pki_types::ServerName::try_from("127.0.0.1").expect("server name");
-        connector
-            .connect(domain, stream)
-            .await
-            .expect("tls handshake")
-    });
+        connector.connect(domain, stream).await.ok()
+    })?;
 
-    BlockingTls { rt, stream }
+    Some(BlockingTls { rt, stream })
 }
 
 // ── Minimal blocking RESP helpers ─────────────────────────────────────────────
@@ -1138,6 +1140,130 @@ fn a_stalled_handshake_does_not_block_the_binary() {
             handshake_ok(tls, &certs.cert_der),
             "a TLS client waited on an idle one (io model {io_model:?})"
         );
+    }
+}
+
+/// `maxclients` counts TLS clients still in their handshake, and connected
+/// ones, plaintext or TLS. A place is given back when its connection ends:
+/// closed, a failed handshake, or one that ran out of time. In the binary,
+/// with its default I/O model, io_uring on Linux, and with tokio.
+#[test]
+fn maxclients_counts_pending_handshakes() {
+    struct Killed(std::process::Child);
+    impl Drop for Killed {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    /// What `f` gives, once it gives something: a connection just closed
+    /// gives its place back a moment later.
+    fn until<T>(mut f: impl FnMut() -> Option<T>) -> T {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(v) = f() {
+                return v;
+            }
+            assert!(std::time::Instant::now() < deadline, "no place was free");
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+    fn plain_client(port: u16) -> Option<TcpStream> {
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        send_cmd(&mut c, &["PING"]);
+        let mut reply = [0u8; 7];
+        (c.read_exact(&mut reply).is_ok() && &reply == b"+PONG\r\n").then_some(c)
+    }
+    fn turned_away(port: u16) -> bool {
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut reply = String::new();
+        c.read_to_string(&mut reply).is_ok() && reply == "-ERR max number of clients reached\r\n"
+    }
+
+    let bin = env!("CARGO_BIN_EXE_kividb");
+    let certs = generate_certs();
+    for io_model in [None, Some("tokio")] {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("kividb.conf");
+        std::fs::write(&conf, "maxclients 3\n").unwrap();
+        let plain = free_port();
+        let tls = free_port();
+        let mut args = vec![
+            "--port".to_string(),
+            plain.to_string(),
+            "--bind".into(),
+            "127.0.0.1".into(),
+            "--dir".into(),
+            dir.path().to_str().unwrap().into(),
+            "--configfile".into(),
+            conf.to_str().unwrap().into(),
+            "--tls-port".into(),
+            tls.to_string(),
+            "--tls-cert-file".into(),
+            certs.cert_path.to_str().unwrap().into(),
+            "--tls-key-file".into(),
+            certs.key_path.to_str().unwrap().into(),
+        ];
+        if let Some(model) = io_model {
+            args.extend(["--io-model".into(), model.into()]);
+        }
+        let _server = Killed(
+            std::process::Command::new(bin)
+                .args(&args)
+                .current_dir(dir.path())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("failed to start kividb"),
+        );
+        wait_open(plain);
+        wait_open(tls);
+        let model = format!("io model {io_model:?}");
+
+        // One place held by a stalled handshake leaves two for others.
+        let mut stalled = TcpStream::connect(("127.0.0.1", tls)).unwrap();
+        let mut connected = until(|| try_tls_client(tls, &certs.cert_der));
+        send_cmd(&mut connected, &["PING"]);
+        assert_eq!(read_resp(&mut connected), "PONG", "{model}");
+        let closing = until(|| plain_client(plain));
+
+        // Full.
+        assert!(turned_away(plain), "{model}");
+        assert!(!handshake_ok(tls, &certs.cert_der), "{model}");
+        send_cmd(&mut connected, &["PING"]);
+        assert_eq!(read_resp(&mut connected), "PONG", "{model}");
+
+        // A client that closes gives its place back.
+        drop(closing);
+        let failing = until(|| plain_client(plain));
+        assert!(turned_away(plain), "{model}");
+
+        // So does a failed handshake.
+        drop(failing);
+        for _ in 0..3 {
+            let mut garbage = TcpStream::connect(("127.0.0.1", tls)).unwrap();
+            garbage
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            send_cmd(&mut garbage, &["PING"]);
+            let _ = garbage.read_to_end(&mut Vec::new());
+        }
+        let last = until(|| plain_client(plain));
+        assert!(turned_away(plain), "{model}");
+
+        // And a handshake that runs out of time.
+        stalled
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        match stalled.read(&mut [0u8; 1]) {
+            Ok(0) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("the stalled handshake was not dropped ({model}): {other:?}"),
+        }
+        let _more = until(|| plain_client(plain));
+        assert!(turned_away(plain), "{model}");
+        drop((connected, last));
     }
 }
 

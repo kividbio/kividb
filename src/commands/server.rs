@@ -1030,6 +1030,18 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                     }
                 }
             }
+            "maxclients" => match value.parse::<u32>() {
+                Ok(n) if n >= 1 => {
+                    crate::client_registry::set_max_clients(n as usize);
+                    REMEMBERED_CONFIG
+                        .lock()
+                        .insert(param.clone(), n.to_string());
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR argument must be between 1 and 4294967295 inclusive",
+                )),
+            },
             "maxmemory-clients" => {
                 let value = match value.strip_suffix('%') {
                     Some(percent) => match percent.parse::<u64>() {
