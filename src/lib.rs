@@ -281,22 +281,18 @@ async fn server_tokio(
                     Ok(pair) => pair,
                     Err(e) => {
                         log_warn!("TLS: accept error: {e}");
+                        // Out of file descriptors, it would otherwise spin.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                         continue;
                     }
                 };
 
-                let tls_stream = match listen_acceptor.accept(tcp_stream).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log_verbose!("TLS: handshake failed from {peer_addr}: {e} ({e:?})");
-                        continue;
-                    }
+                // The handshake is the connection's own task: one client that
+                // never finishes it holds up no other.
+                let Some(slot) = crate::client_registry::admit(&tls_client_registry) else {
+                    continue;
                 };
-
-                crate::stats::TOTAL_CONNECTIONS_RECEIVED
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let peer_addr_str = peer_addr.to_string();
-
+                let handshaker = listen_acceptor.clone();
                 let store = Arc::clone(&tls_store);
                 let expiry_store = tls_expiry_store.clone();
                 let lastsave = Arc::clone(&tls_lastsave);
@@ -322,6 +318,15 @@ async fn server_tokio(
                 let tracking_table = Arc::clone(&tls_tracking_table);
 
                 tokio::spawn(async move {
+                    let Some((tls_stream, _slot)) =
+                        acceptor::handshake(&handshaker, tcp_stream, peer_addr, slot).await
+                    else {
+                        return;
+                    };
+                    crate::stats::TOTAL_CONNECTIONS_RECEIVED
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let peer_addr_str = peer_addr.to_string();
+
                     let _ = server::handle_client(
                         tls_stream,
                         store,
@@ -362,6 +367,10 @@ async fn server_tokio(
             Ok(v) => v,
             Err(_) => continue,
         };
+        let Some(slot) = crate::client_registry::admit(&client_registry) else {
+            crate::client_registry::turn_away(socket);
+            continue;
+        };
         crate::stats::TOTAL_CONNECTIONS_RECEIVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let peer_addr_str = peer_addr.to_string();
         let store = Arc::clone(&store);
@@ -388,6 +397,7 @@ async fn server_tokio(
         let monitor_registry = Arc::clone(&monitor_registry);
         let tracking_table = Arc::clone(&tracking_table);
         tokio::spawn(async move {
+            let _slot = slot;
             let _ = server::handle_client(
                 socket,
                 store,

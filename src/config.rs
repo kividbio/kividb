@@ -38,6 +38,12 @@ pub struct Config {
     #[arg(skip)]
     pub bind_explicit: bool,
 
+    /// `maxclients`, from the config file: plaintext and TLS clients, TLS
+    /// ones from the start of their handshake. Lowered at startup to what
+    /// the open-file limit leaves room for.
+    #[arg(skip = 10_000usize)]
+    pub maxclients: usize,
+
     /// Number of worker threads (0 = auto)
     #[arg(long, default_value_t = 0)]
     pub threads: usize,
@@ -493,6 +499,7 @@ impl Default for Config {
             cluster_bus_port_protected_mode: false,
             protected_mode: true,
             bind_explicit: false,
+            maxclients: 10_000,
             cluster_bus_secret: String::new(),
             cluster_config_file: "nodes.conf".into(),
             cluster_require_full_coverage: true,
@@ -603,6 +610,7 @@ impl Config {
             cluster_bus_port_protected_mode: false,
             protected_mode: true,
             bind_explicit: false,
+            maxclients: 10_000,
             cluster_bus_secret: String::new(),
             cluster_config_file: "nodes.conf".into(),
             cluster_require_full_coverage: true,
@@ -1452,6 +1460,14 @@ impl Config {
             "lfu-log-factor" => set!(lfu_log_factor, number(key, one()?)?),
             "lfu-decay-time" => set!(lfu_decay_time, number(key, one()?)?),
             "key-access-tracking" => set!(key_access_tracking, yes_no(key, one()?)?),
+            "maxclients" => match one()?.parse::<u32>() {
+                Ok(n) if n >= 1 => self.maxclients = n as usize,
+                _ => {
+                    return Err(
+                        "'maxclients' must be between 1 and 4294967295 inclusive".to_string()
+                    );
+                }
+            },
             // Tuning knobs for machinery KiviDB does not have, or does not
             // expose. They change nothing a client could observe.
             "activerehashing"
@@ -1741,6 +1757,21 @@ mod config_file_tests {
                 .apply_config_text("port x\n", &|id| id == "port")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn maxclients_is_read_from_the_file() {
+        assert_eq!(Config::default().maxclients, 10_000);
+        assert_eq!(load("maxclients 50\n").unwrap().0.maxclients, 50);
+        for bad in [
+            "maxclients 0\n",
+            "maxclients -1\n",
+            "maxclients x\n",
+            "maxclients\n",
+        ] {
+            let err = load(bad).unwrap_err();
+            assert!(err.contains("maxclients"), "{bad}: {err}");
+        }
     }
 
     #[test]
