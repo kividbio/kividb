@@ -1575,9 +1575,10 @@ pub fn maybe_index_json(index_store: &IndexStore, db: usize, key: &str, doc: &se
 /// [`maybe_index_json`] for whatever is at `key` now, if it is a JSON
 /// document and any index is `ON JSON`.
 /// A hash was put under `key` whole (`RESTORE`, and so `MIGRATE` and slot
-/// migration): the `ON HASH` indexes that cover it are brought up to date
-/// with all of its fields. A restored hash used to be in no index, so that a
-/// key moved to another node of a cluster could not be found there.
+/// migration; `RENAME`): the `ON HASH` indexes that cover it are brought up
+/// to date with all of its fields. A restored hash used to be in no index, so
+/// that a key moved to another node of a cluster could not be found there.
+/// A hash some of whose fields have a TTL is a document too.
 pub fn reindex_hash_key(
     index_store: &IndexStore,
     store: &crate::store::Store,
@@ -1602,6 +1603,12 @@ pub fn reindex_hash_key(
     let pairs: Vec<(String, Arc<[u8]>)> = match value {
         Some(crate::types::KiviDBValue::Hash(hash)) => hash
             .read()
+            .iter()
+            .map(|(field, value)| (field.to_string(), Arc::clone(value)))
+            .collect(),
+        Some(crate::types::KiviDBValue::HashEx(hash)) => hash
+            .read()
+            .fields
             .iter()
             .map(|(field, value)| (field.to_string(), Arc::clone(value)))
             .collect(),

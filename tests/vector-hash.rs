@@ -693,6 +693,120 @@ fn test_key_expired_by_a_read_leaves_the_index() {
     }
 }
 
+/// `RENAME` takes the old name out of the indexes and indexes the new one,
+/// in place of whatever was there: the old name used to stay, and a KNN
+/// query returned it; the new one was in no index.
+#[test]
+fn test_rename_moves_the_document_in_the_index() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for algo in ["FLAT", "HNSW"] {
+        let index = format!("idx:ren:{algo}");
+        let p = format!("r{algo}:");
+        assert!(
+            c.cmds(&[
+                "FT.CREATE",
+                &index,
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                &p,
+                "SCHEMA",
+                "body",
+                "TEXT",
+                "vec",
+                "VECTOR",
+                algo,
+                "6",
+                "TYPE",
+                "FLOAT32",
+                "DIM",
+                "4",
+                "DISTANCE_METRIC",
+                "L2",
+            ])
+            .is_ok()
+        );
+        let one = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
+        let two = pack_f32(&[0.0, 1.0, 0.0, 0.0]);
+        let three = pack_f32(&[0.0, 0.0, 1.0, 0.0]);
+        let (a, b, x, y, z) = (
+            format!("{p}a"),
+            format!("{p}b"),
+            format!("{p}x"),
+            format!("{p}y"),
+            format!("{p}z"),
+        );
+        let knn = |c: &mut Conn, q: &[u8]| -> Vec<(String, f32)> {
+            let r = c.cmd(&[
+                b"FT.SEARCH",
+                index.as_bytes(),
+                b"*=>[KNN 10 @vec $q AS score]",
+                b"PARAMS",
+                b"2",
+                b"q",
+                q,
+                b"RETURN",
+                b"1",
+                b"score",
+                b"DIALECT",
+                b"2",
+            ]);
+            // A key the index still holds but that is gone comes back
+            // with no fields, and so no score.
+            let arr = r.as_array();
+            arr[1..]
+                .chunks(2)
+                .map(|hit| {
+                    let score = hit[1].as_array().get(1).map_or(f32::NAN, parse_score);
+                    (hit[0].as_str().to_string(), score)
+                })
+                .collect()
+        };
+        let text = |c: &mut Conn, word: &str| -> Vec<String> {
+            let r = c.cmds(&["FT.SEARCH", &index, &format!("@body:{word}"), "NOCONTENT"]);
+            r.as_array()[1..]
+                .iter()
+                .map(|v| v.as_str().to_string())
+                .collect()
+        };
+
+        // Renamed within the prefix.
+        c.cmd(&[b"HSET", a.as_bytes(), b"body", b"hello", b"vec", &one]);
+        assert!(c.cmds(&["RENAME", &a, &b]).is_ok());
+        let hits = knn(&mut c, &one);
+        assert_eq!(hits.len(), 1, "{algo}: {hits:?}");
+        assert_eq!(hits[0].0, b, "{algo}: {hits:?}");
+        assert_eq!(text(&mut c, "hello"), vec![b.clone()], "{algo}");
+
+        // Renamed out of it.
+        assert!(c.cmds(&["RENAME", &b, "elsewhere:b"]).is_ok());
+        assert_eq!(knn(&mut c, &one), Vec::new(), "{algo}");
+        assert_eq!(text(&mut c, "hello"), Vec::<String>::new(), "{algo}");
+
+        // Renamed over another document: the one under the name now is the
+        // one in the index, with its own vector and words.
+        c.cmd(&[b"HSET", x.as_bytes(), b"body", b"from", b"vec", &two]);
+        c.cmd(&[b"HSET", y.as_bytes(), b"body", b"over", b"vec", &three]);
+        assert!(c.cmds(&["RENAME", &x, &y]).is_ok());
+        let hits = knn(&mut c, &two);
+        assert_eq!(hits.len(), 1, "{algo}: {hits:?}");
+        assert_eq!(hits[0].0, y, "{algo}: {hits:?}");
+        assert!(hits[0].1 < 1e-5, "{algo}: {hits:?}");
+        assert_eq!(text(&mut c, "from"), vec![y.clone()], "{algo}");
+        assert_eq!(text(&mut c, "over"), Vec::<String>::new(), "{algo}");
+
+        // RENAMENX to a free name.
+        assert_eq!(c.cmds(&["RENAMENX", &y, &z]).as_int(), 1);
+        let hits = knn(&mut c, &two);
+        assert_eq!(hits.len(), 1, "{algo}: {hits:?}");
+        assert_eq!(hits[0].0, z, "{algo}: {hits:?}");
+    }
+}
+
 #[test]
 fn test_flat_knn_l2() {
     let port = free_port();

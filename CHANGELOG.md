@@ -33,6 +33,13 @@ A patch release of 1.1.0.
   something else deleted the key. Only a key the background expiry cycle
   removed left them.
 
+- **`RENAME` and `RENAMENX` keep the search indexes up to date.** A
+  document renamed stayed in the indexes under its old name, and a KNN
+  query went on returning that name, while the new name was in no index.
+  Now the old name leaves the indexes and the new one is indexed whole, in
+  place of whatever the indexes held for it before, so that a document
+  renamed over another is found with its own vector and words.
+
 ## [1.1.2]
 
 A patch release of 1.1.0. It replaces 1.1.1, which was withdrawn.

@@ -1167,6 +1167,20 @@ fn settle_written_keys(ctx: &Ctx, name: &str) {
             }
         }
     }
+    // A key renamed: the old name leaves the indexes of its database, and
+    // whatever is under the new one now is indexed whole, in place of what
+    // was there before. `RENAME` used to leave the old name in the indexes
+    // (a KNN query still returned it) and never index the new one.
+    if matches!(name, "RENAME" | "RENAMENX") {
+        let db = *ctx.selected_db;
+        for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
+            if let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) {
+                crate::vector::maybe_unindex(ctx.index_store, db, key);
+                crate::vector::reindex_hash_key(ctx.index_store, ctx.store, db, key);
+                crate::vector::reindex_json_key(ctx.index_store, ctx.store, db, key);
+            }
+        }
+    }
     // A command that can leave a hash with field TTLs under a key: the
     // background sweep has to know the key. See `field_expiry`.
     match name {
