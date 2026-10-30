@@ -529,7 +529,7 @@ fn evict(ctx: &mut Ctx, db: usize, key: &str, ordered: bool) -> bool {
         // Gone already.
         return false;
     }
-    crate::vector::maybe_unindex(ctx.index_store, key);
+    crate::vector::maybe_unindex(ctx.index_store, db, key);
     crate::vector::maybe_request_compaction(ctx.index_store, ctx.compaction_tx, key);
     crate::stats::record_evicted();
     crate::stats::record_rdb_change();

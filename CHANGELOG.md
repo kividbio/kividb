@@ -49,6 +49,35 @@ A patch release of 1.1.0.
   not timed out. `min-replicas-to-write` and `WAIT` were not misled: they
   already went by each replica's last acknowledgement.
 
+- **After an AOF replay, each HNSW graph held one vector.** At startup from
+  an append-only file with no snapshot in it, the pass that rebuilds the
+  indexes skipped every vector after the first: it asked, for each
+  document, whether the graph had come with a snapshot, and after the first
+  insert the graph had vectors. An unfiltered KNN query then found one
+  document, and `FT.INFO` gave `hnsw_live_count` 1. The question is now
+  asked once per field, before the pass. The bug was there since 1.0.
+
+- **A write in one database no longer touches the indexes of another.**
+  An index belongs to the database it was created in, but a hash written or
+  deleted under the same key in any other database was applied to it: an
+  `HSET` there put its vector in the index in place of the index's own
+  document's, and added its words, and a `DEL` there took the index's
+  document out, so a KNN query no longer found it. Writes, deletions, expiry
+  and eviction now go to the indexes of their own database only.
+
+- **A key deleted on being found expired leaves the search indexes.** A
+  key read after its TTL ran out is deleted by that read, but it stayed in
+  the indexes that covered it, and a KNN query went on returning it until
+  something else deleted the key. Only a key the background expiry cycle
+  removed left them.
+
+- **`RENAME` and `RENAMENX` keep the search indexes up to date.** A
+  document renamed stayed in the indexes under its old name, and a KNN
+  query went on returning that name, while the new name was in no index.
+  Now the old name leaves the indexes and the new one is indexed whole, in
+  place of whatever the indexes held for it before, so that a document
+  renamed over another is found with its own vector and words.
+
 ## [1.1.2]
 
 A patch release of 1.1.0. It replaces 1.1.1, which was withdrawn.

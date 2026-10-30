@@ -154,7 +154,7 @@ pub fn sweep(store: &Store, expiry_store: &ExpiryStore, index_store: &IndexStore
             };
             if removed {
                 crate::commands::helpers::clear_expiry(expiry_store, db, &key);
-                crate::vector::maybe_unindex(index_store, &key);
+                crate::vector::maybe_unindex(index_store, db, &key);
                 next = None;
             }
             emptied = removed;
