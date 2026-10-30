@@ -27,6 +27,12 @@ A patch release of 1.1.0.
   document out, so a KNN query no longer found it. Writes, deletions, expiry
   and eviction now go to the indexes of their own database only.
 
+- **A key deleted on being found expired leaves the search indexes.** A
+  key read after its TTL ran out is deleted by that read, but it stayed in
+  the indexes that covered it, and a KNN query went on returning it until
+  something else deleted the key. Only a key the background expiry cycle
+  removed left them.
+
 ## [1.1.2]
 
 A patch release of 1.1.0. It replaces 1.1.1, which was withdrawn.

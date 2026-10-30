@@ -2474,6 +2474,41 @@ pub fn knn_hnsw(
         .collect()
 }
 
+// ── Keys that expire on being read ───────────────────────────────────────────
+//
+// A key found expired by a read is deleted there and then (`helpers::
+// delete_key_if_expired`), where there is no index store to hand. Each
+// server's store is paired with its index store here, so that the key leaves
+// its indexes too: before, it stayed in the graph and was still found by a
+// KNN query. (A process holds one server, except under test.)
+
+static INDEX_STORES: RwLock<Vec<(usize, IndexStore)>> = RwLock::new(Vec::new());
+
+fn store_id(store: &crate::store::Store) -> usize {
+    Arc::as_ptr(store) as *const () as usize
+}
+
+/// Pair a server's store with its index store.
+pub fn register_index_store(store: &crate::store::Store, index_store: &IndexStore) {
+    let id = store_id(store);
+    let mut stores = INDEX_STORES.write();
+    stores.retain(|(other, _)| *other != id);
+    stores.push((id, Arc::clone(index_store)));
+}
+
+/// `key` of database `db` expired and was deleted by a read.
+pub fn unindex_expired(store: &crate::store::Store, db: usize, key: &str) {
+    let id = store_id(store);
+    let index_store = INDEX_STORES
+        .read()
+        .iter()
+        .find(|(other, _)| *other == id)
+        .map(|(_, index_store)| Arc::clone(index_store));
+    if let Some(index_store) = index_store {
+        maybe_unindex(&index_store, db, key);
+    }
+}
+
 /// Called when a key is deleted. Removes it from any matching indexes.
 /// For FLAT this is O(1). For HNSW we tombstone — mark deleted but
 /// leave the graph structure intact (full graph surgery is expensive).

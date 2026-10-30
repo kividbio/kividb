@@ -614,6 +614,85 @@ fn test_write_in_another_db_leaves_the_index_alone() {
     }
 }
 
+/// A key that expired and was deleted by a read leaves its indexes: it
+/// used to stay in them, and a KNN query went on returning it.
+#[test]
+fn test_key_expired_by_a_read_leaves_the_index() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for algo in ["FLAT", "HNSW"] {
+        let index = format!("idx:exp:{algo}");
+        let prefix = format!("e{algo}:");
+        assert!(
+            c.cmds(&[
+                "FT.CREATE",
+                &index,
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                &prefix,
+                "SCHEMA",
+                "vec",
+                "VECTOR",
+                algo,
+                "6",
+                "TYPE",
+                "FLOAT32",
+                "DIM",
+                "4",
+                "DISTANCE_METRIC",
+                "L2",
+            ])
+            .is_ok()
+        );
+        const DOCS: usize = 20;
+        for i in 0..DOCS {
+            let key = format!("{prefix}{i}");
+            let v = pack_f32(&[i as f32, 0.0, 0.0, 0.0]);
+            c.cmd(&[b"HSET", key.as_bytes(), b"vec", &v]);
+        }
+        // Half of them expire, and a read finds each expired: the
+        // background cycle runs every 100 ms, so nearly all are deleted by
+        // the read.
+        let expiring: Vec<String> = (0..DOCS)
+            .step_by(2)
+            .map(|i| format!("{prefix}{i}"))
+            .collect();
+        for key in &expiring {
+            assert_eq!(c.cmds(&["PEXPIRE", key, "1"]).as_int(), 1);
+        }
+        thread::sleep(Duration::from_millis(5));
+        for key in &expiring {
+            assert_eq!(c.cmds(&["EXISTS", key]).as_int(), 0);
+        }
+
+        let q = pack_f32(&[0.0, 0.0, 0.0, 0.0]);
+        let r = c.cmd(&[
+            b"FT.SEARCH",
+            index.as_bytes(),
+            b"*=>[KNN 20 @vec $q]",
+            b"NOCONTENT",
+            b"PARAMS",
+            b"2",
+            b"q",
+            &q,
+            b"DIALECT",
+            b"2",
+        ]);
+        let found: Vec<&str> = r.as_array()[1..].iter().map(|v| v.as_str()).collect();
+        for key in &expiring {
+            assert!(
+                !found.contains(&key.as_str()),
+                "{algo}: KNN returned {key}, which expired: {found:?}"
+            );
+        }
+        assert_eq!(found.len(), DOCS - expiring.len(), "{algo}: {found:?}");
+    }
+}
+
 #[test]
 fn test_flat_knn_l2() {
     let port = free_port();
