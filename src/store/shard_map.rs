@@ -315,9 +315,11 @@ fn expired(entry: Entry, now: &AtomicU64) -> bool {
 }
 
 /// Whether the time to live that ends at `at` has, by the shard's time.
+/// Never while the thread is loading a dataset or applying its master's
+/// stream (`expiry::held`): what expired there is said by a `DEL`.
 #[inline]
 fn past(at: u64, now: &AtomicU64) -> bool {
-    now_at(now) > at
+    now_at(now) > at && !crate::expiry::held()
 }
 
 /// The shard's time: the one its write lock keeps, read from the clock the

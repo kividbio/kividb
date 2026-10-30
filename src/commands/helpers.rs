@@ -609,10 +609,11 @@ pub fn now_ms() -> u64 {
 
 /// Whether the time to live that ends at `at` has: past it, not at it. A
 /// key lives through the millisecond it ends in, as in Redis, so never for
-/// less than it was given.
+/// less than it was given. Never while this thread is loading a dataset or
+/// applying its master's stream (`expiry::held`).
 #[inline(always)]
 pub fn is_past(at: u64) -> bool {
-    now_ms() > at
+    now_ms() > at && !crate::expiry::held()
 }
 
 pub fn is_expired(store: &Store, db: usize, key: &str) -> bool {
@@ -697,6 +698,11 @@ pub fn take_key(store: &Store, db: usize, key: &str) -> Option<KiviDBValue> {
 /// master's `DEL` (see `expiry`).
 #[inline]
 pub fn delete_key_if_expired(store: &Store, db: usize, key: &str) -> bool {
+    // Loading, or applying the master's stream: a key's time does not make
+    // it gone. The `DEL` that follows does.
+    if crate::expiry::held() {
+        return false;
+    }
     let shard = store::get_shard(&store[db], key);
     let target = crate::expiry::of(store);
     if target.as_ref().is_some_and(crate::expiry::Target::on_replica) {
