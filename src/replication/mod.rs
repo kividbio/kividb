@@ -1940,7 +1940,8 @@ pub fn replicate_expired(repl_state: &ReplState, hub_tx: &HubTx, db: usize, part
     // One AOF record: a `SELECT` and the `DEL` it qualifies must not be
     // separable by a crash.
     let mut record = Vec::new();
-    for payload in repl_state.encode_for_stream(db, parts) {
+    let (payloads, now_in) = expired_for_stream(repl_state, db, parts);
+    for payload in payloads {
         repl_state
             .repl_offset
             .fetch_add(payload.len() as u64, Ordering::Relaxed);
@@ -1960,7 +1961,38 @@ pub fn replicate_expired(repl_state: &ReplState, hub_tx: &HubTx, db: usize, part
     }
     repl_state
         .repl_stream_last_db
-        .store(db as u64, Ordering::Relaxed);
+        .store(now_in as u64, Ordering::Relaxed);
+}
+
+/// `parts`, the deletion of a key expired in database `db`, encoded for the
+/// write stream; and the database the stream is in after it.
+///
+/// While no client has left database 0, a client's write carries no
+/// `SELECT`: whether it needs one is read from `repl_stream_last_db` before
+/// it is sent ([`ReplState::encode_for_stream`]). A key can be in another
+/// database all the same (`MOVE`, `COPY ... DB`, `SWAPDB`, a dataset
+/// loaded), and expiry deletes it beside those writes. Sent as a `SELECT`
+/// and a `DEL`, with the stream then taken to be in the key's database, a
+/// write that read 0 meanwhile went after the `SELECT` and was applied in
+/// the key's database by the replica and by a replay of the AOF; and as it
+/// stored 0 after, every write of database 0 from then on was too. So the
+/// deletion goes in one piece that goes back to 0, which leaves the stream
+/// where those writes take it to be.
+fn expired_for_stream(
+    repl_state: &ReplState,
+    db: usize,
+    parts: &[Vec<u8>],
+) -> (Vec<Vec<u8>>, usize) {
+    if db == 0 || repl_state.several_databases.load(Ordering::Relaxed) {
+        return (repl_state.encode_for_stream(db, parts), db);
+    }
+    let select = |db: usize| {
+        crate::resp::write::encode_resp_command(&[b"SELECT".to_vec(), db.to_string().into_bytes()])
+    };
+    let mut piece = select(db);
+    piece.extend_from_slice(&crate::resp::write::encode_resp_command(parts));
+    piece.extend_from_slice(&select(0));
+    (vec![piece], 0)
 }
 
 /// Append an already-encoded write to this node's own AOF and stop.

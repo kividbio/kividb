@@ -356,6 +356,17 @@ fn wait_all_expired(master: &mut Conn) {
     });
 }
 
+/// How many keys database `db` holds, by `INFO keyspace`: not by a
+/// `SELECT`, which would change how the master's stream says databases.
+fn keys_in(c: &mut Conn, db: usize) -> i64 {
+    let prefix = format!("db{db}:keys=");
+    c.cmd(&["INFO", "keyspace"])
+        .s()
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .map_or(0, |rest| rest.split(',').next().unwrap().parse().unwrap())
+}
+
 fn assert_same(master: &mut Conn, replica: &mut Conn) {
     wait_caught_up(master, replica);
     let (m, r) = (dataset(master), dataset(replica));
@@ -750,4 +761,77 @@ fn a_replica_that_lags_converges_with_keys_expiring_meanwhile() {
     assert_kept(&mut m, "master", &must_stay);
     assert_kept(&mut r, "replica", &must_stay);
     drop(master);
+}
+
+/// Keys put in another database without a `SELECT` (`MOVE`), and expired
+/// there while other clients write to database 0, which, while no client
+/// has left it, they do with no `SELECT`. Each `DEL` went as a `SELECT` and
+/// the `DEL`, the stream then taken to be in the key's database: writes of
+/// database 0 sent meanwhile were applied there by the replica and by the
+/// replay, and so was every one after (3,300 keys the master deleted stayed
+/// on its replica in 8 s of six clients writing).
+#[test]
+fn a_key_expired_in_a_database_no_client_selected_leaves_the_stream_in_0() {
+    let mut master = Server::start(&["--aof"]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let (mut m, mut r) = (master.conn(), replica.conn());
+    wait_link_up(&mut r);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writers: Vec<_> = (0..4)
+        .map(|w| {
+            let (stop, port) = (Arc::clone(&stop), master.port);
+            std::thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                let mut n = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let key = format!("w:{w}:{}", n % 200);
+                    assert_eq!(c.cmd(&["SET", &key, &n.to_string()]).s(), "OK");
+                    n += 1;
+                }
+            })
+        })
+        .collect();
+    let mut moved = 0;
+    let until = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < until {
+        let key = format!("e:{moved}");
+        assert_eq!(m.cmd(&["SET", &key, "v", "PX", "5"]).s(), "OK");
+        moved += m.cmd(&["MOVE", &key, "3"]).i();
+    }
+    stop.store(true, Ordering::Relaxed);
+    for w in writers {
+        w.join().unwrap();
+    }
+    assert!(moved > 100, "only {moved} keys moved");
+
+    wait_until("the master to expire every key it moved", 30, || {
+        keys_in(&mut m, 3) == 0
+    });
+    wait_caught_up(&mut m, &mut r);
+    assert_eq!(
+        keys_in(&mut r, 3),
+        0,
+        "the replica keeps keys of database 3 its master deleted"
+    );
+    assert_same(&mut m, &mut r);
+
+    // And the AOF, replayed.
+    let expected = dataset(&mut m);
+    assert_eq!(m.cmd(&["SET", "aof-mark", "1"]).s(), "OK");
+    wait_until("the AOF to have everything", 20, || {
+        position(&master.aof(), b"$8\r\naof-mark\r\n").is_some()
+    });
+    drop((m, r, replica));
+    master.kill();
+    master.restart();
+    let mut m = master.conn();
+    assert_eq!(
+        keys_in(&mut m, 3),
+        0,
+        "the replay wrote database 0's keys in 3"
+    );
+    assert_eq!(m.cmd(&["DEL", "aof-mark"]).i(), 1);
+    assert_eq!(dataset(&mut m), expected, "the replay");
 }
