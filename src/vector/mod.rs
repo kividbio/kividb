@@ -1551,15 +1551,15 @@ pub fn json_return_value(doc: &serde_json::Value, path: &str) -> Option<Vec<u8>>
     })
 }
 
-/// A JSON document was written: bring the `ON JSON` indexes that cover its
-/// key up to date with it.
-pub fn maybe_index_json(index_store: &IndexStore, key: &str, doc: &serde_json::Value) {
+/// A JSON document in database `db` was written: bring the `ON JSON`
+/// indexes of that database that cover its key up to date with it.
+pub fn maybe_index_json(index_store: &IndexStore, db: usize, key: &str, doc: &serde_json::Value) {
     if indexing_deferred() {
         return;
     }
     let store = index_store.read();
     for (name, def) in store.iter() {
-        if is_alias(name, def) || !matches!(def.on, IndexOn::Json) {
+        if is_alias(name, def) || !matches!(def.on, IndexOn::Json) || def.db_index != db {
             continue;
         }
         let covered =
@@ -1578,7 +1578,12 @@ pub fn maybe_index_json(index_store: &IndexStore, key: &str, doc: &serde_json::V
 /// migration): the `ON HASH` indexes that cover it are brought up to date
 /// with all of its fields. A restored hash used to be in no index, so that a
 /// key moved to another node of a cluster could not be found there.
-pub fn reindex_hash_key(index_store: &IndexStore, db: &crate::store::Db, key: &str) {
+pub fn reindex_hash_key(
+    index_store: &IndexStore,
+    store: &crate::store::Store,
+    db: usize,
+    key: &str,
+) {
     if indexing_deferred()
         || !index_store
             .read()
@@ -1587,7 +1592,13 @@ pub fn reindex_hash_key(index_store: &IndexStore, db: &crate::store::Db, key: &s
     {
         return;
     }
-    let value = crate::store::get_shard(db, key).read().get(key).cloned();
+    let Some(db_ref) = store.get(db) else {
+        return;
+    };
+    let value = crate::store::get_shard(db_ref, key)
+        .read()
+        .get(key)
+        .cloned();
     let pairs: Vec<(String, Arc<[u8]>)> = match value {
         Some(crate::types::KiviDBValue::Hash(hash)) => hash
             .read()
@@ -1596,10 +1607,15 @@ pub fn reindex_hash_key(index_store: &IndexStore, db: &crate::store::Db, key: &s
             .collect(),
         _ => return,
     };
-    maybe_index(index_store, key, &pairs);
+    maybe_index(index_store, db, key, &pairs);
 }
 
-pub fn reindex_json_key(index_store: &IndexStore, db: &crate::store::Db, key: &str) {
+pub fn reindex_json_key(
+    index_store: &IndexStore,
+    store: &crate::store::Store,
+    db: usize,
+    key: &str,
+) {
     if indexing_deferred()
         || !index_store
             .read()
@@ -1608,22 +1624,30 @@ pub fn reindex_json_key(index_store: &IndexStore, db: &crate::store::Db, key: &s
     {
         return;
     }
-    let value = crate::store::get_shard(db, key).read().get(key).cloned();
+    let Some(db_ref) = store.get(db) else {
+        return;
+    };
+    let value = crate::store::get_shard(db_ref, key)
+        .read()
+        .get(key)
+        .cloned();
     if let Some(crate::types::KiviDBValue::Json(doc)) = value {
-        maybe_index_json(index_store, key, &doc.read());
+        maybe_index_json(index_store, db, key, &doc.read());
     }
 }
 
-/// Some fields of a hash were written: bring the `ON HASH` indexes that
-/// cover its key up to date with them.
-pub fn maybe_index(index_store: &IndexStore, key: &str, fields: &[(String, Arc<[u8]>)]) {
+/// Some fields of a hash in database `db` were written: bring the `ON HASH`
+/// indexes of that database that cover its key up to date with them. The
+/// same key in another database is another document: an `HSET` there used
+/// to overwrite this one's vector in the graph.
+pub fn maybe_index(index_store: &IndexStore, db: usize, key: &str, fields: &[(String, Arc<[u8]>)]) {
     if indexing_deferred() {
         return;
     }
     let store = index_store.read();
 
     for (name, def) in store.iter() {
-        if is_alias(name, def) || !matches!(def.on, IndexOn::Hash) {
+        if is_alias(name, def) || !matches!(def.on, IndexOn::Hash) || def.db_index != db {
             continue;
         }
         let matches =
@@ -2453,14 +2477,18 @@ pub fn knn_hnsw(
 /// Called when a key is deleted. Removes it from any matching indexes.
 /// For FLAT this is O(1). For HNSW we tombstone — mark deleted but
 /// leave the graph structure intact (full graph surgery is expensive).
-pub fn maybe_unindex(index_store: &IndexStore, key: &str) {
+///
+/// Only the indexes of database `db`: the same key in another database is
+/// another document. A `DEL` in one database used to take the document of
+/// the same name out of an index of another.
+pub fn maybe_unindex(index_store: &IndexStore, db: usize, key: &str) {
     if indexing_deferred() {
         return;
     }
     let store = index_store.read();
 
     for (name, def) in store.iter() {
-        if is_alias(name, def) {
+        if is_alias(name, def) || def.db_index != db {
             continue;
         }
         let matches =
@@ -2916,6 +2944,7 @@ mod alias_tests {
         }
         maybe_index(
             &store,
+            0,
             "doc:1",
             &[("t".to_string(), Arc::from(&b"hello world"[..]))],
         );

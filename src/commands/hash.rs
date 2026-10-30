@@ -107,7 +107,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }; // shard write lock drops here
 
             // Now update any matching vector indexes — outside the shard lock
-            crate::vector::maybe_index(ctx.index_store, key, &pairs);
+            crate::vector::maybe_index(ctx.index_store, *ctx.selected_db, key, &pairs);
             notify(ctx.pubsub, *ctx.selected_db, KS_HASH, "hset", key);
             let fields = pairs.iter().map(|(f, _)| f.as_bytes());
             notify_subkeys(ctx.pubsub, *ctx.selected_db, "hset", key, fields);
@@ -265,7 +265,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
             }
 
-            crate::vector::maybe_index(ctx.index_store, key, &pairs);
+            crate::vector::maybe_index(ctx.index_store, *ctx.selected_db, key, &pairs);
             notify(ctx.pubsub, *ctx.selected_db, KS_HASH, "hset", key);
             let fields = pairs.iter().map(|(f, _)| f.as_bytes());
             notify_subkeys(ctx.pubsub, *ctx.selected_db, "hset", key, fields);
@@ -2479,7 +2479,7 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
         notify(ctx.pubsub, db, KS_HASH, "hdel", &key);
         notify_subkeys(ctx.pubsub, db, "hdel", &key, all_fields());
     } else {
-        crate::vector::maybe_index(ctx.index_store, &key, &pairs);
+        crate::vector::maybe_index(ctx.index_store, db, &key, &pairs);
         notify(ctx.pubsub, db, KS_HASH, "hset", &key);
         notify_subkeys(ctx.pubsub, db, "hset", &key, all_fields());
         if !expiring.is_empty() {

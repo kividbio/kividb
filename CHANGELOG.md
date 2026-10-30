@@ -19,6 +19,14 @@ A patch release of 1.1.0.
   document, and `FT.INFO` gave `hnsw_live_count` 1. The question is now
   asked once per field, before the pass. The bug was there since 1.0.
 
+- **A write in one database no longer touches the indexes of another.**
+  An index belongs to the database it was created in, but a hash written or
+  deleted under the same key in any other database was applied to it: an
+  `HSET` there put its vector in the index in place of the index's own
+  document's, and added its words, and a `DEL` there took the index's
+  document out, so a KNN query no longer found it. Writes, deletions, expiry
+  and eviction now go to the indexes of their own database only.
+
 ## [1.1.2]
 
 A patch release of 1.1.0. It replaces 1.1.1, which was withdrawn.

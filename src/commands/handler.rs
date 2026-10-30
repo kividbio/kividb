@@ -1132,7 +1132,7 @@ fn drop_if_empty(ctx: &Ctx, db: usize, key: &str) -> bool {
     };
     if removed {
         helpers::clear_expiry(ctx.expiry_store, db, key);
-        crate::vector::maybe_unindex(ctx.index_store, key);
+        crate::vector::maybe_unindex(ctx.index_store, db, key);
         crate::keyspace_events::notify(
             ctx.pubsub,
             db,
@@ -1161,9 +1161,9 @@ fn settle_written_keys(ctx: &Ctx, name: &str) {
     if name == "RESTORE" {
         for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
             if let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) {
-                let db = &ctx.store[*ctx.selected_db];
-                crate::vector::reindex_hash_key(ctx.index_store, db, key);
-                crate::vector::reindex_json_key(ctx.index_store, db, key);
+                let db = *ctx.selected_db;
+                crate::vector::reindex_hash_key(ctx.index_store, ctx.store, db, key);
+                crate::vector::reindex_json_key(ctx.index_store, ctx.store, db, key);
             }
         }
     }
@@ -1198,7 +1198,8 @@ fn settle_written_keys(ctx: &Ctx, name: &str) {
                 if let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) {
                     crate::vector::reindex_json_key(
                         ctx.index_store,
-                        &ctx.store[*ctx.selected_db],
+                        ctx.store,
+                        *ctx.selected_db,
                         key,
                     );
                 }

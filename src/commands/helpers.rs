@@ -443,7 +443,7 @@ fn expire_batch(
         crate::keyspace_events::notify_expired(store, db, key);
         crate::watch::expired(store, db, key);
         crate::tracking::expired(store, key);
-        crate::vector::maybe_unindex(index_store, key);
+        crate::vector::maybe_unindex(index_store, db, key);
     }
 }
 

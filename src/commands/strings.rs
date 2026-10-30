@@ -507,7 +507,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
                 let removed = delete_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
                 if removed {
-                    crate::vector::maybe_unindex(ctx.index_store, key);
+                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                     crate::vector::maybe_request_compaction(
                         ctx.index_store,
                         ctx.compaction_tx,
@@ -541,7 +541,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if new_abs <= now {
                 let removed = delete_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
                 if removed {
-                    crate::vector::maybe_unindex(ctx.index_store, key);
+                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                     crate::vector::maybe_request_compaction(
                         ctx.index_store,
                         ctx.compaction_tx,
@@ -1817,7 +1817,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             map.remove(key);
             drop(map);
             clear_expiry(ctx.expiry_store, db_idx, key);
-            crate::vector::maybe_unindex(ctx.index_store, key);
+            crate::vector::maybe_unindex(ctx.index_store, db_idx, key);
             Some(resp_integer(1))
         }
 

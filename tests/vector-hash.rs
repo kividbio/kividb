@@ -535,6 +535,85 @@ fn test_flushdb_drops_indexes_for_selected_db_only() {
     );
 }
 
+/// A write in one database leaves the indexes of another alone: an `HSET`
+/// of the same key in database 1 used to overwrite the vector a database-0
+/// index held for it, and its `DEL` took the database-0 document out.
+#[test]
+fn test_write_in_another_db_leaves_the_index_alone() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for algo in ["FLAT", "HNSW"] {
+        let index = format!("idx:db0:{algo}");
+        let prefix = format!("{algo}:");
+        assert!(
+            c.cmds(&[
+                "FT.CREATE",
+                &index,
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                &prefix,
+                "SCHEMA",
+                "vec",
+                "VECTOR",
+                algo,
+                "6",
+                "TYPE",
+                "FLOAT32",
+                "DIM",
+                "4",
+                "DISTANCE_METRIC",
+                "L2",
+            ])
+            .is_ok()
+        );
+        let mine = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
+        let theirs = pack_f32(&[0.0, 0.0, 0.0, 9.0]);
+        let key = format!("{prefix}1");
+        c.cmd(&[b"HSET", key.as_bytes(), b"vec", &mine]);
+
+        // The same key in database 1: written, then deleted.
+        assert!(c.cmds(&["SELECT", "1"]).is_ok());
+        c.cmd(&[b"HSET", key.as_bytes(), b"vec", &theirs]);
+        let knn = |c: &mut Conn| {
+            c.cmd(&[
+                b"FT.SEARCH",
+                index.as_bytes(),
+                b"*=>[KNN 1 @vec $q AS score]",
+                b"PARAMS",
+                b"2",
+                b"q",
+                &mine,
+                b"RETURN",
+                b"1",
+                b"score",
+                b"DIALECT",
+                b"2",
+            ])
+        };
+        assert!(c.cmds(&["SELECT", "0"]).is_ok());
+        let r = knn(&mut c);
+        let arr = r.as_array();
+        assert_eq!(arr[0].as_int(), 1, "{algo}, after the HSET in db 1: {r:?}");
+        let score = parse_score(&arr[2].as_array()[1]);
+        assert!(
+            score < 1e-5,
+            "{algo}: the index holds db 1's vector for {key}: {score}"
+        );
+
+        assert!(c.cmds(&["SELECT", "1"]).is_ok());
+        assert_eq!(c.cmds(&["DEL", &key]).as_int(), 1);
+        assert!(c.cmds(&["SELECT", "0"]).is_ok());
+        let r = knn(&mut c);
+        let arr = r.as_array();
+        assert_eq!(arr[0].as_int(), 1, "{algo}, after the DEL in db 1: {r:?}");
+        assert_eq!(arr[1].as_str(), key);
+    }
+}
+
 #[test]
 fn test_flat_knn_l2() {
     let port = free_port();
