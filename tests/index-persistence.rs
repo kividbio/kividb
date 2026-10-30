@@ -2042,3 +2042,116 @@ fn vector_types_survive_snapshot_restart() {
     kill_server(&mut srv2);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// An unfiltered KNN for `k` of the HNSW index `idx:aofv`, asked again while
+/// the server is still rebuilding its indexes (`LOADING`).
+fn aof_graph_knn(c: &mut Conn, k: usize) -> Vec<String> {
+    let q = pack_f32(&[0.5, 0.5, 0.5, 0.5]);
+    let query = format!("*=>[KNN {k} @v $q]");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let reply = loop {
+        let reply = c.cmd(&[
+            b"FT.SEARCH",
+            b"idx:aofv",
+            query.as_bytes(),
+            b"NOCONTENT",
+            b"LIMIT",
+            b"0",
+            b"1000",
+            b"PARAMS",
+            b"2",
+            b"q",
+            &q,
+            b"DIALECT",
+            b"2",
+        ]);
+        match &reply {
+            RespValue::Error(e) if e.starts_with("LOADING") && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            _ => break reply,
+        }
+    };
+    let mut keys: Vec<String> = reply.as_array()[1..]
+        .iter()
+        .map(|v| v.as_str().to_string())
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// Replayed from an append-only file with no snapshot in it, an HNSW graph
+/// gets every vector back. The pass that rebuilds the indexes asked, for
+/// each document, whether the graph had come with a snapshot; after its
+/// first insert it had vectors, so every later one was skipped and the graph
+/// held one.
+#[test]
+fn hnsw_graph_gets_every_vector_after_an_aof_replay() {
+    let _serial = persist_serial();
+    let dir = temp_dir("hnsw_aof_replay");
+    let port1 = free_port();
+    let mut srv1 = start_aof_server(port1, &dir, &[]);
+    assert!(
+        wait_for_server(port1, Duration::from_secs(10)),
+        "srv1 start"
+    );
+    const DOCS: usize = 60;
+    let before = {
+        let mut c = Conn::connect(port1);
+        assert!(
+            c.cmds(&[
+                "FT.CREATE",
+                "idx:aofv",
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                "g:",
+                "SCHEMA",
+                "v",
+                "VECTOR",
+                "HNSW",
+                "6",
+                "TYPE",
+                "FLOAT32",
+                "DIM",
+                "4",
+                "DISTANCE_METRIC",
+                "L2",
+            ])
+            .is_ok()
+        );
+        for i in 0..DOCS {
+            let key = format!("g:{i}");
+            let v = pack_f32(&[i as f32 / DOCS as f32, 0.5, (i % 7) as f32 / 7.0, 0.25]);
+            c.cmd(&[b"HSET", key.as_bytes(), b"v", &v]);
+        }
+        // Written and synced: the AOF is flushed every second.
+        thread::sleep(Duration::from_millis(1500));
+        aof_graph_knn(&mut c, DOCS)
+    };
+    assert_eq!(before.len(), DOCS, "{before:?}");
+    send_shutdown_nosave(port1);
+    assert!(
+        wait_for_exit(&mut srv1, Duration::from_secs(8)),
+        "srv1 stop"
+    );
+    assert!(
+        !dir.join("dump.kdb").exists(),
+        "the case is a replay with no snapshot"
+    );
+
+    let port2 = free_port();
+    let mut srv2 = start_aof_server(port2, &dir, &[]);
+    assert!(
+        wait_for_server(port2, Duration::from_secs(10)),
+        "srv2 start"
+    );
+    {
+        let mut c = Conn::connect(port2);
+        assert_eq!(aof_graph_knn(&mut c, DOCS), before);
+    }
+    send_shutdown_nosave(port2);
+    let _ = wait_for_exit(&mut srv2, Duration::from_secs(8));
+    let _ = std::fs::remove_dir_all(&dir);
+}

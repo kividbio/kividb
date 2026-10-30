@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.3]
+
+A patch release of 1.1.0.
+
+### Fixed
+
+- **After an AOF replay, each HNSW graph held one vector.** At startup from
+  an append-only file with no snapshot in it, the pass that rebuilds the
+  indexes skipped every vector after the first: it asked, for each
+  document, whether the graph had come with a snapshot, and after the first
+  insert the graph had vectors. An unfiltered KNN query then found one
+  document, and `FT.INFO` gave `hnsw_live_count` 1. The question is now
+  asked once per field, before the pass. The bug was there since 1.0.
+
 ## [1.1.2]
 
 A patch release of 1.1.0. It replaces 1.1.1, which was withdrawn.
