@@ -288,20 +288,23 @@ fn expiry_threads() -> usize {
 /// 1.8 million live keys takes more than its 25 ms, and each found only the
 /// few that had come due since. That was a whole core of eight, taken from
 /// the workers, with its shard locks in their way.
+///
+/// `target` is where the store's expired keys are told (`expiry::of`),
+/// found once by the thread rather than on every cycle.
 pub fn active_expire_cycle(
     store: &Store,
     index_store: &IndexStore,
     cursor: &mut ExpireCursor,
+    target: Option<&crate::expiry::Target>,
 ) -> bool {
     // A replica expires nothing itself: its master's `DEL`s say what has
     // gone (see `expiry`). Its clients are told a key past its time is not
     // there all the same.
-    let target = crate::expiry::of(store);
-    if target.as_ref().is_some_and(crate::expiry::Target::on_replica) {
+    if target.is_some_and(crate::expiry::Target::on_replica) {
         return false;
     }
     // Whom the keys it expires are told to, if anyone.
-    let told = target.filter(crate::expiry::Target::observed);
+    let told = target.filter(|target| target.observed());
     // The shards this cycle's part owns.
     let shards: usize = store
         .iter()
@@ -338,7 +341,7 @@ pub fn active_expire_cycle(
             // the budget ran out after the first batch: with 49 million keys
             // the thread spent its time copying and deleted 5,000 a second.
             loop {
-                let (looked, due) = expire_pass(store, index_store, db, shard, now, told.as_ref());
+                let (looked, due) = expire_pass(store, index_store, db, shard, now, told);
                 seen += looked;
                 due_total += due;
                 if started.elapsed() >= ACTIVE_EXPIRE_BUDGET {
@@ -518,6 +521,7 @@ pub fn spawn_active_expire_task(
         let latency = (part == 0).then(|| latency.clone());
         std::thread::spawn(move || {
             let mut cursor = ExpireCursor::part(part, parts);
+            let target = crate::expiry::of(&store);
             // Every 100 ms, as Redis's `hz 10`; straight after a cycle that
             // is behind (its time ran out while more than a tenth of what it
             // looked at was expired), as Redis goes on while it keeps finding
@@ -533,7 +537,8 @@ pub fn spawn_active_expire_task(
                     continue;
                 }
                 let started = std::time::Instant::now();
-                let behind = active_expire_cycle(&store, &index_store, &mut cursor);
+                let behind =
+                    active_expire_cycle(&store, &index_store, &mut cursor, target.as_ref());
                 wait = Duration::from_millis(if behind { 1 } else { 100 });
                 if shrunk_at.elapsed() >= SHRINK_PERIOD {
                     shrink_sparse_tables(&store, &cursor);
@@ -711,7 +716,10 @@ pub fn delete_key_if_expired(store: &Store, db: usize, key: &str) -> bool {
     }
     let shard = store::get_shard(&store[db], key);
     let target = crate::expiry::of(store);
-    if target.as_ref().is_some_and(crate::expiry::Target::on_replica) {
+    if target
+        .as_ref()
+        .is_some_and(crate::expiry::Target::on_replica)
+    {
         return read_lock!(shard).expires(key).is_some_and(is_past);
     }
     let told = target.filter(crate::expiry::Target::observed);
@@ -1315,7 +1323,7 @@ mod active_expiry_tests {
         let mut cursor = ExpireCursor::default();
         let mut cycles = 0;
         while keys(&store) > 20_001 {
-            active_expire_cycle(&store, &index, &mut cursor);
+            active_expire_cycle(&store, &index, &mut cursor, None);
             cycles += 1;
             assert!(cycles < 1000, "the cycle never caught up");
         }
@@ -1392,7 +1400,7 @@ mod active_expiry_tests {
         }
         put(&store, "gone", past);
         let mut cursor = ExpireCursor::default();
-        assert!(!active_expire_cycle(&store, &index, &mut cursor));
+        assert!(!active_expire_cycle(&store, &index, &mut cursor, None));
         assert_eq!(keys(&store), 2_000);
     }
 
@@ -1427,7 +1435,7 @@ mod active_expiry_tests {
         let mut cursor = ExpireCursor::default();
         let mut cycles = 0;
         while keys(&store) > 0 {
-            active_expire_cycle(&store, &index, &mut cursor);
+            active_expire_cycle(&store, &index, &mut cursor, None);
             cycles += 1;
             assert!(cycles < 1000, "never emptied");
         }
@@ -1443,7 +1451,7 @@ mod active_expiry_tests {
             put(&store, &format!("gone:{i}"), past);
         }
         let mut even = ExpireCursor::part(0, 2);
-        while active_expire_cycle(&store, &index, &mut even) {}
+        while active_expire_cycle(&store, &index, &mut even, None) {}
         let shards = store[0].len();
         for (s, cell) in store[0].iter().enumerate() {
             let left = cell.read().ttl_len();
@@ -1457,7 +1465,7 @@ mod active_expiry_tests {
             .sum();
         assert!(odd_left > 0, "part 0 went through part 1's shards");
         let mut odd = ExpireCursor::part(1, 2);
-        while active_expire_cycle(&store, &index, &mut odd) {}
+        while active_expire_cycle(&store, &index, &mut odd, None) {}
         assert_eq!(times(&store), 0);
         assert_eq!(keys(&store), 0);
     }

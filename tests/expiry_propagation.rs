@@ -253,7 +253,10 @@ impl Server {
     #[cfg(unix)]
     fn signal(&self, signal: libc::c_int) {
         // SAFETY: a signal to our own child, which has not been reaped.
-        assert_eq!(unsafe { libc::kill(self.child.id() as libc::pid_t, signal) }, 0);
+        assert_eq!(
+            unsafe { libc::kill(self.child.id() as libc::pid_t, signal) },
+            0
+        );
     }
 }
 
@@ -394,7 +397,8 @@ fn expiring_writes(port: u16, clients: usize, stop: Arc<AtomicBool>) -> Vec<(Str
                     let ttl = 2 + (n * 7 + c as u64) % 9;
                     let probe = format!("p:{c}:{n}");
                     assert_eq!(
-                        conn.cmd(&["SET", &probe, "100", "PX", &ttl.to_string()]).s(),
+                        conn.cmd(&["SET", &probe, "100", "PX", &ttl.to_string()])
+                            .s(),
                         "OK"
                     );
                     std::thread::sleep(Duration::from_micros(ttl * 1000 - 500 + (n % 3) * 500));
@@ -485,7 +489,10 @@ fn a_restart_after_the_deadline_does_not_bring_a_key_back() {
         assert_eq!(c.cmd(&["EXISTS", &key]).i(), 0);
         let live = format!("live:{i}");
         assert_eq!(c.cmd(&["GET", &live]).s(), "6", "{live}");
-        assert!(c.cmd(&["PTTL", &live]).i() > 0, "{live} kept its time to live");
+        assert!(
+            c.cmd(&["PTTL", &live]).i() > 0,
+            "{live} kept its time to live"
+        );
     }
     // Taken out once the server is up, each with its `DEL` in the log: a
     // second restart finds them gone by the log itself.
@@ -534,14 +541,23 @@ fn a_key_that_expires_while_the_server_runs_stays_gone_after_a_restart() {
 fn each_expired_key_is_deleted_once_in_the_aof() {
     let server = Server::start(&["--aof"]);
     let mut c = server.conn();
-    assert_eq!(c.cmd(&["CONFIG", "GET", "lazyfree-lazy-expire"]).arr()[1].s(), "yes");
+    assert_eq!(
+        c.cmd(&["CONFIG", "GET", "lazyfree-lazy-expire"]).arr()[1].s(),
+        "yes"
+    );
     // Read, or swept, whichever comes first, some each way.
     for i in 0..2000 {
-        assert_eq!(c.cmd(&["SET", &format!("r:{i}"), "v", "PX", "30"]).s(), "OK");
+        assert_eq!(
+            c.cmd(&["SET", &format!("r:{i}"), "v", "PX", "30"]).s(),
+            "OK"
+        );
     }
     // Written over, after their time.
     for i in 0..200 {
-        assert_eq!(c.cmd(&["SET", &format!("w:{i}"), "5", "PX", "30"]).s(), "OK");
+        assert_eq!(
+            c.cmd(&["SET", &format!("w:{i}"), "5", "PX", "30"]).s(),
+            "OK"
+        );
     }
     std::thread::sleep(Duration::from_millis(40));
     for i in 0..2000 {
@@ -578,7 +594,10 @@ fn each_expired_key_is_deleted_once_in_the_aof() {
         );
     }
     // With `lazyfree-lazy-expire no`, `DEL`.
-    assert_eq!(c.cmd(&["CONFIG", "SET", "lazyfree-lazy-expire", "no"]).s(), "OK");
+    assert_eq!(
+        c.cmd(&["CONFIG", "SET", "lazyfree-lazy-expire", "no"]).s(),
+        "OK"
+    );
     assert_eq!(c.cmd(&["SET", "d", "v", "PX", "20"]).s(), "OK");
     wait_until("the DEL of d", 10, || {
         count(&server.aof(), b"*2\r\n$3\r\nDEL\r\n$1\r\nd\r\n") == 1
@@ -597,8 +616,14 @@ fn expired_keys_reach_the_replica_as_deletions() {
     let (mut m, mut r) = (master.conn(), replica.conn());
     wait_link_up(&mut r);
     for i in 0..100 {
-        assert_eq!(m.cmd(&["SET", &format!("a:{i}"), "v", "PX", "100"]).s(), "OK");
-        assert_eq!(m.cmd(&["SET", &format!("g:{i}"), "v", "PX", "20"]).s(), "OK");
+        assert_eq!(
+            m.cmd(&["SET", &format!("a:{i}"), "v", "PX", "100"]).s(),
+            "OK"
+        );
+        assert_eq!(
+            m.cmd(&["SET", &format!("g:{i}"), "v", "PX", "20"]).s(),
+            "OK"
+        );
     }
     std::thread::sleep(Duration::from_millis(30));
     // Lazily, on the master: read past their time.
@@ -613,7 +638,11 @@ fn expired_keys_reach_the_replica_as_deletions() {
     });
     wait_caught_up(&mut m, &mut r);
     assert_eq!(r.cmd(&["DBSIZE"]).i(), 0);
-    assert_eq!(r.info("stats", "expired_keys"), "0", "the replica expired nothing itself");
+    assert_eq!(
+        r.info("stats", "expired_keys"),
+        "0",
+        "the replica expired nothing itself"
+    );
 
     // A key past its time on a replica whose master has not deleted it yet:
     // stopped, the master cannot. Here, a master that is paused.
@@ -621,11 +650,21 @@ fn expired_keys_reach_the_replica_as_deletions() {
     wait_caught_up(&mut m, &mut r);
     assert_eq!(m.cmd(&["CLIENT", "PAUSE", "3000", "WRITE"]).s(), "OK");
     std::thread::sleep(Duration::from_millis(400));
-    assert_eq!(r.cmd(&["GET", "held"]), V::Nil, "past its time: not there to clients");
+    assert_eq!(
+        r.cmd(&["GET", "held"]),
+        V::Nil,
+        "past its time: not there to clients"
+    );
     assert_eq!(r.cmd(&["EXISTS", "held"]).i(), 0);
-    assert_eq!(r.cmd(&["DBSIZE"]).i(), 1, "but still in the replica's table");
+    assert_eq!(
+        r.cmd(&["DBSIZE"]).i(),
+        1,
+        "but still in the replica's table"
+    );
     assert_eq!(m.cmd(&["CLIENT", "UNPAUSE"]).s(), "OK");
-    wait_until("the master's DEL of held", 20, || r.cmd(&["DBSIZE"]).i() == 0);
+    wait_until("the master's DEL of held", 20, || {
+        r.cmd(&["DBSIZE"]).i() == 0
+    });
 }
 
 /// Writes from many clients to keys that expire as they are written: the
@@ -675,7 +714,10 @@ fn a_replica_that_lags_converges_with_keys_expiring_meanwhile() {
     // Keys the replica has, then writes to them while they live, made while
     // the replica is stopped, and their time passing before it goes on.
     for i in 0..200 {
-        assert_eq!(m.cmd(&["SET", &format!("c:{i}"), "5", "PX", "1500"]).s(), "OK");
+        assert_eq!(
+            m.cmd(&["SET", &format!("c:{i}"), "5", "PX", "1500"]).s(),
+            "OK"
+        );
         assert_eq!(m.cmd(&["RPUSH", &format!("q:{i}"), "a"]).i(), 1);
         assert_eq!(m.cmd(&["PEXPIRE", &format!("q:{i}"), "1500"]).i(), 1);
     }
@@ -700,7 +742,10 @@ fn a_replica_that_lags_converges_with_keys_expiring_meanwhile() {
     wait_all_expired(&mut m);
     assert_same(&mut m, &mut r);
     for i in 0..200 {
-        assert_eq!(r.cmd(&["EXISTS", &format!("c:{i}"), &format!("q:{i}")]).i(), 0);
+        assert_eq!(
+            r.cmd(&["EXISTS", &format!("c:{i}"), &format!("q:{i}")]).i(),
+            0
+        );
     }
     assert_kept(&mut m, "master", &must_stay);
     assert_kept(&mut r, "replica", &must_stay);
