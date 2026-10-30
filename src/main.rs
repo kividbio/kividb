@@ -374,6 +374,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "none".to_string()
         }
     );
+    // io_uring's workers hold open files of their own, kept from clients.
+    #[cfg(target_os = "linux")]
+    let uring = match config.io_model {
+        IoModel::Uring => true,
+        IoModel::Tokio => false,
+        IoModel::Auto => is_uring_available(),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let uring = false;
+    if let Err(e) = crate::client_registry::fit_max_clients(if uring { threads } else { 0 }) {
+        log_fatal!("{e}");
+        std::process::exit(1);
+    }
 
     // `backupdirname` is relative to `dir`, which is now the working
     // directory.
@@ -393,7 +406,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             run_tokio(config, started_at)?;
         }
         IoModel::Auto => {
-            if is_uring_available() {
+            if uring {
                 log_info!("I/O model      : io_uring");
                 run_uring(config, started_at)?;
             } else {

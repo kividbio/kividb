@@ -684,6 +684,96 @@ pub fn set_max_clients(n: usize) {
     MAX_CLIENTS.store(n, Ordering::Relaxed);
 }
 
+pub fn max_clients() -> usize {
+    MAX_CLIENTS.load(Ordering::Relaxed)
+}
+
+/// io_uring workers, set at startup: each holds open files of its own.
+static URING_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Open files kept for everything but clients: Redis's 32, about twice what
+/// the tokio loop holds. io_uring holds 7 more, and 7 a worker (its ring,
+/// epolls, eventfd and listener), so it keeps 8 more and 8 a worker.
+fn reserved_fds() -> usize {
+    match URING_WORKERS.load(Ordering::Relaxed) {
+        0 => 32,
+        workers => workers.saturating_mul(8).saturating_add(40),
+    }
+}
+
+/// How many of `max` clients a soft open-file limit of `soft` leaves room
+/// for, with `reserved` kept back.
+#[cfg(unix)]
+fn clients_for(soft: libc::rlim_t, max: usize, reserved: usize) -> usize {
+    let reserved = libc::rlim_t::try_from(reserved).unwrap_or(libc::RLIM_INFINITY);
+    usize::try_from(soft.saturating_sub(reserved)).map_or(max, |n| n.min(max))
+}
+
+/// Raises the soft open-file limit toward what `max` clients need, never past
+/// the hard limit, and gives how many of them it then leaves room for.
+#[cfg(unix)]
+pub fn clients_that_fit(max: usize) -> std::io::Result<usize> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid rlimit for getrlimit to fill in.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let reserved = reserved_fds();
+    let wanted =
+        libc::rlim_t::try_from(max.saturating_add(reserved)).unwrap_or(libc::RLIM_INFINITY);
+    // The most that is taken: macOS refuses more than kern.maxfilesperproc,
+    // whatever the hard limit says.
+    let (mut soft, mut high) = (limit.rlim_cur, wanted.min(limit.rlim_max));
+    while soft < high {
+        let next = soft + (high - soft).div_ceil(2);
+        let raised = libc::rlimit {
+            rlim_cur: next,
+            rlim_max: limit.rlim_max,
+        };
+        // SAFETY: `raised` is a valid rlimit.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+            soft = next;
+        } else {
+            high = next - 1;
+        }
+    }
+    Ok(clients_for(soft, max, reserved))
+}
+
+#[cfg(not(unix))]
+pub fn clients_that_fit(max: usize) -> std::io::Result<usize> {
+    Ok(max)
+}
+
+/// At startup, makes room under the open-file limit for `maxclients`, or
+/// lowers it to what fits. `Err` when not even one client would, or the
+/// limit can't be read.
+pub fn fit_max_clients(uring_workers: usize) -> Result<(), String> {
+    URING_WORKERS.store(uring_workers, Ordering::Relaxed);
+    let max = max_clients();
+    let reserved = reserved_fds();
+    let fits = clients_that_fit(max).map_err(|e| format!("Can't read the open-file limit: {e}"))?;
+    if fits == 0 {
+        return Err(format!(
+            "The open-file limit (ulimit -n) is too low: KiviDB needs at least {}",
+            reserved + 1
+        ));
+    }
+    if fits < max {
+        crate::log_warn!(
+            "maxclients {max} needs {} open files, but the limit (ulimit -n) allows {}: \
+             maxclients is {fits}",
+            max.saturating_add(reserved),
+            fits + reserved
+        );
+        crate::commands::server::config_set_global("maxclients", &fits.to_string());
+    }
+    Ok(())
+}
+
 /// What a plaintext client turned away for `maxclients` is told, as Redis
 /// tells it.
 pub const TOO_MANY_CLIENTS: &[u8] = b"-ERR max number of clients reached\r\n";
@@ -1121,6 +1211,23 @@ mod tests {
         assert_eq!(held.len(), 50);
         drop(held);
         assert_eq!(registry.slots_held(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clients_fit_under_the_open_file_limit_less_what_is_reserved() {
+        use super::clients_for;
+        assert_eq!(clients_for(10_032, 10_000, 32), 10_000);
+        assert_eq!(clients_for(1_024, 10_000, 32), 992);
+        assert_eq!(clients_for(1_024, 10_000, 72), 952);
+        assert_eq!(clients_for(33, 10_000, 32), 1);
+        assert_eq!(clients_for(32, 10_000, 32), 0);
+        assert_eq!(clients_for(0, 10_000, 32), 0);
+        assert_eq!(
+            clients_for(libc::RLIM_INFINITY, u32::MAX as usize, 32),
+            u32::MAX as usize
+        );
+        assert_eq!(clients_for(1_024, 10_000, usize::MAX), 0);
     }
 
     fn after(commands: &[&[&str]]) -> String {

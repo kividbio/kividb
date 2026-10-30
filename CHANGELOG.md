@@ -214,7 +214,7 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   `io-model`, `aof`, `repl-replica-max-backlog-bytes`, `backupdirname`,
   `bind`, `dir`, ...) gets `can't set immutable config`, unless set to what
   it already is; it was answered `OK` and left as it was. Redis's settings
-  that mean nothing here (`maxclients`, `hz`, `timeout`, `tcp-keepalive`,
+  that mean nothing here (`hz`, `timeout`, `tcp-keepalive`,
   the encodings, ...) are still taken, and `CONFIG GET` now gives back what
   was set for `hz`, `timeout`, `tcp-keepalive`, `activerehashing` and
   `lazyfree-lazy-eviction` too, and for `busy-reply-threshold` in a build
@@ -257,6 +257,17 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   `assert`'s message is a string or a number: `assert(false, nil)` says
   `assertion failed!`, and a table is refused with
   `bad argument #2 to 'assert' (string expected, got table)`.
+
+- **`maxclients` is enforced.** It was accepted, and shown by `CONFIG GET`
+  and `INFO`, but nothing checked it. Plaintext and TLS clients now count
+  against it, TLS ones from the start of their handshake; one more is closed,
+  a plaintext one after `ERR max number of clients reached`. The default is
+  10000, as in Redis, within the open-file limit: at startup KiviDB raises
+  the soft limit (`ulimit -n`) to `maxclients` plus what the server keeps
+  for itself (32 files, or on io_uring 40 and 8 a worker) if the hard limit
+  allows, and lowers `maxclients` to fit if it does not, with a warning.
+  `CONFIG SET maxclients` refuses a value the limit cannot hold, as Redis
+  does.
 
 ### Fixed
 
@@ -607,7 +618,7 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   and `instantaneous_output_kbps` are measured; `INFO server` gives
   `slowlog_log_slower_than:-1` when the slow log is off, the
   `multiplexing_api` in use (`io_uring`, `epoll`, ...), the `config_file`
-  and the `executable`; `maxclients` is what was set.
+  and the `executable`; `maxclients` is the one in effect.
 
 - **`mem_fragmentation_ratio` was virtual size over RSS, so `MEMORY DOCTOR`
   always warned (#152).** It is now Redis's: RSS over `used_memory`, on
@@ -659,7 +670,7 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   were unknown directives, and had no flag either: they could only be set
   after every start. They are now read from the file, checked as
   `CONFIG SET` checks them. Redis's settings KiviDB has no use for
-  (`maxclients`, `maxmemory-clients`, `client-query-buffer-limit`,
+  (`maxmemory-clients`, `client-query-buffer-limit`,
   `latency-tracking`, the encodings, and any other of Redis 8's) are
   accepted with a warning, as `hz` and `timeout` already were, so that a
   `redis.conf` carried over starts. A name that is neither KiviDB's nor
