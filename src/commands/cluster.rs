@@ -143,6 +143,12 @@ fn cmd_info(state: &ClusterState) -> Vec<u8> {
             .stats_messages_received
             .load(std::sync::atomic::Ordering::Relaxed)
     ));
+    out.push_str(&format!(
+        "cluster_stats_bus_connects:{}\r\n",
+        state
+            .stats_bus_connects
+            .load(std::sync::atomic::Ordering::Relaxed)
+    ));
     out.push_str("total_cluster_links_buffer_limit_exceeded:0\r\n");
 
     resp_bulk_str(&out)
@@ -246,7 +252,7 @@ fn cmd_nodes(state: &ClusterState) -> Vec<u8> {
             "{} {}:{}@{}{}",
             node_id_str(&node.id),
             node.ip,
-            node.client_port,
+            node.client_facing_port(),
             node.cluster_port,
             crate::cluster::persist::hostname_suffix(&node.hostname)
         );
@@ -367,7 +373,7 @@ fn slots_node_entry(state: &ClusterState, node: &crate::cluster::ClusterNode) ->
             Endpoint::Unknown => resp_null_bulk(),
             _ => resp_bulk_str(&state.endpoint_of(node)),
         },
-        resp_integer(node.client_port as i64),
+        resp_integer(node.client_facing_port() as i64),
         resp_bulk_str(node_id_str(&node.id)),
     ];
     let mut metadata: Vec<Vec<u8>> = Vec::new();
@@ -458,7 +464,7 @@ fn node_description(state: &ClusterState, node: &crate::cluster::ClusterNode) ->
         resp_bulk_str("id"),
         resp_bulk_str(node_id_str(&node.id)),
         resp_bulk_str("port"),
-        resp_integer(node.client_port as i64),
+        resp_integer(node.client_facing_port() as i64),
         resp_bulk_str("ip"),
         resp_bulk_str(&node.ip),
         resp_bulk_str("endpoint"),
@@ -971,17 +977,16 @@ fn cmd_replicas(ctx: &mut Ctx) -> Vec<u8> {
         return resp_error("ERR Unknown node");
     }
 
-    // Output format matches CLUSTER NODES — one line per replica as a bulk string.
-    use std::fmt::Write;
-    let mut out = String::new();
+    // An array, as Redis replies: one bulk string per replica, in the format
+    // of a `CLUSTER NODES` line. It was one string of the lines (#138).
+    let mut out = Vec::new();
     for n in nodes.values() {
         if n.flags.contains(crate::cluster::NodeFlags::REPLICA) && n.master_id == Some(master_id) {
-            let _ = writeln!(
-                out,
+            out.push(resp_bulk_str(&format!(
                 "{} {}:{}@{}{} {} {} {} {} {} connected",
                 crate::cluster::node_id_str(&n.id),
                 n.ip,
-                n.client_port,
+                n.client_facing_port(),
                 n.cluster_port,
                 crate::cluster::persist::hostname_suffix(&n.hostname),
                 format_flags_for_nodes(n.flags),
@@ -989,10 +994,10 @@ fn cmd_replicas(ctx: &mut Ctx) -> Vec<u8> {
                 n.ping_sent_ms,
                 n.pong_received_ms,
                 n.config_epoch,
-            );
+            )));
         }
     }
-    resp_bulk_str(&out)
+    resp_array(out)
 }
 
 // ── CLUSTER REPLICATE node-id ────────────────────────────────────────────────
@@ -1102,7 +1107,8 @@ fn cmd_failover(ctx: &mut Ctx) -> Vec<u8> {
             // a real election: the other masters have to agree.
             let state = Arc::clone(ctx.cluster);
             bus.spawn(async move {
-                crate::cluster::bus::heartbeat::start_forced_election(&state, master_id).await;
+                crate::cluster::bus::heartbeat::start_forced_election(&state, master_id, None)
+                    .await;
             });
             resp_simple("OK")
         }
@@ -1615,23 +1621,16 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
         let Ok(key) = std::str::from_utf8(key) else {
             continue;
         };
-        if crate::commands::helpers::lazy_expire_key(ctx.store, ctx.expiry_store, db, key) {
+        if crate::commands::helpers::lazy_expire_key(ctx.store, db, key) {
             continue;
         }
-        let value = {
+        // The value and its time to live, read together.
+        let (value, expires_at_ms) = {
             let shard = crate::store::get_shard(&ctx.store[db], key);
-            match crate::read_lock!(shard).get(key) {
-                Some(v) => v.clone(),
+            match crate::read_lock!(shard).get_expiring(key) {
+                Some((v, expires)) => (v.to_value(), expires.unwrap_or(0)),
                 None => continue,
             }
-        };
-        let expires_at_ms = {
-            let shard = crate::commands::helpers::get_expiry_shard(ctx.expiry_store, db, key);
-            crate::read_lock!(shard)
-                .get(key)
-                .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0)
         };
         if expires_at_ms != 0 && expires_at_ms <= now_ms {
             continue;
@@ -1752,7 +1751,7 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
     // ── Delete what the destination confirmed ────────────────────────────
     if !copy {
         for key in &moved {
-            crate::commands::helpers::delete_key(ctx.store, ctx.expiry_store, db, key);
+            crate::commands::helpers::delete_key(ctx.store, db, key);
             crate::vector::maybe_unindex(ctx.index_store, key);
         }
     }
@@ -1835,7 +1834,7 @@ fn cmd_reset(ctx: &mut Ctx) -> Vec<u8> {
     // FLUSHALL the data on hard reset, mirroring Redis behavior.
     if hard {
         let new_id = ctx.cluster.hard_reset();
-        let flushed = crate::store::clear_store(ctx.store, ctx.expiry_store);
+        let flushed = crate::store::clear_store(ctx.store);
         let indexes = crate::vector::drop_all_indexes(ctx.index_store);
         crate::vector::drop_all_dicts(ctx.dict_store);
         crate::store::clear_ts_label_index(ctx.ts_index);
@@ -1941,7 +1940,9 @@ fn cmd_slot_stats(ctx: &mut Ctx) -> Vec<u8> {
                 ));
             }
             let mut limit: usize = 16384;
-            let mut descending = false;
+            // Busiest first unless asked otherwise, as in Redis: the
+            // command is for finding the hot slots. It was ascending (#139).
+            let mut descending = true;
             let mut i = 4;
             while i < cmd.len() {
                 let arg = match std::str::from_utf8(cmd[i]) {

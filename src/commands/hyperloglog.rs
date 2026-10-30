@@ -2,9 +2,7 @@ use crate::commands::ctx::Ctx;
 use crate::commands::helpers::{delete_key_if_expired, expire_on_read, is_expired, parse_utf8};
 use crate::resp::write::*;
 use crate::store;
-use crate::store::Key;
-use crate::types::KiviDBValue;
-use crate::types::SharedBytes;
+use crate::store::ValueRef;
 use crate::{read_lock, write_lock};
 
 // ── HyperLogLog constants ─────────────────────────────────────────────────────
@@ -242,9 +240,9 @@ fn get_or_create_hll(ctx: &mut Ctx, key: &str) -> Result<Vec<u8>, Vec<u8>> {
     let shard = store::get_shard(db, key);
     let map = read_lock!(shard);
     match map.get(key) {
-        Some(KiviDBValue::String(b)) => {
-            if !is_hll(b) {
-                return Err(not_hll(b));
+        Some(ValueRef::String(b)) => {
+            if !is_hll(&b) {
+                return Err(not_hll(&b));
             }
             Ok(b.to_vec())
         }
@@ -260,10 +258,7 @@ fn save_hll(ctx: &mut Ctx, key: &str, blob: Vec<u8>) {
     let db = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db, key);
     let mut map = write_lock!(shard);
-    map.insert(
-        Key::from(key_owned),
-        KiviDBValue::String(SharedBytes::from(blob.as_slice())),
-    );
+    map.insert_str(key_owned, blob.as_slice());
 }
 
 // Like get_or_create_hll but returns an error if the key doesn't exist,
@@ -274,9 +269,9 @@ fn get_hll_blob(ctx: &Ctx, key: &str) -> Result<Vec<u8>, Vec<u8>> {
     let shard = store::get_shard(db, key);
     let map = read_lock!(shard);
     match map.get(key) {
-        Some(KiviDBValue::String(b)) => {
-            if !is_hll(b) {
-                return Err(not_hll(b));
+        Some(ValueRef::String(b)) => {
+            if !is_hll(&b) {
+                return Err(not_hll(&b));
             }
             Ok(b.to_vec())
         }
@@ -352,8 +347,8 @@ fn cmd_pfcount(ctx: &mut Ctx) -> Vec<u8> {
             None => return resp_error("ERR key must be valid UTF-8"),
         };
 
-        if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-            expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+        if is_expired(ctx.store, *ctx.selected_db, key) {
+            expire_on_read(ctx.store, *ctx.selected_db, key);
             return resp_integer(0);
         }
 
@@ -363,11 +358,11 @@ fn cmd_pfcount(ctx: &mut Ctx) -> Vec<u8> {
 
         let counted = match map.get(key) {
             None => return resp_integer(0),
-            Some(KiviDBValue::String(b)) if is_hll(b) => match cached_count(b) {
+            Some(ValueRef::String(b)) if is_hll(&b) => match cached_count(&b) {
                 Some(count) => return resp_integer(count as i64),
-                None => (b.clone(), hll_count(&b[HLL_HEADER_SIZE..])),
+                None => (b.to_shared(), hll_count(&b[HLL_HEADER_SIZE..])),
             },
-            Some(KiviDBValue::String(b)) => return not_hll(b),
+            Some(ValueRef::String(b)) => return not_hll(&b),
             _ => {
                 return resp_error(
                     "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -382,12 +377,14 @@ fn cmd_pfcount(ctx: &mut Ctx) -> Vec<u8> {
         // their own cache, and the dataset digest leaves it out.
         let (counted_bytes, count) = counted;
         let mut map = write_lock!(shard);
-        if let Some(KiviDBValue::String(now)) = map.get_mut(key)
-            && SharedBytes::ptr_eq(now, &counted_bytes)
+        // The same bytes as were counted (a string kept in its key's entry
+        // has no identity of its own to compare): the count is theirs.
+        if matches!(map.get(key), Some(ValueRef::String(now))
+            if now.is(&counted_bytes) || now.as_bytes() == counted_bytes.as_slice())
         {
             let mut blob = counted_bytes.to_vec();
             blob[8..16].copy_from_slice(&count.to_le_bytes());
-            *now = SharedBytes::from(blob.as_slice());
+            map.insert_str(key, blob.as_slice());
         }
         return resp_integer(count as i64);
     }
@@ -402,8 +399,8 @@ fn cmd_pfcount(ctx: &mut Ctx) -> Vec<u8> {
             None => continue,
         };
 
-        if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-            expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+        if is_expired(ctx.store, *ctx.selected_db, key) {
+            expire_on_read(ctx.store, *ctx.selected_db, key);
             continue;
         }
 
@@ -411,8 +408,8 @@ fn cmd_pfcount(ctx: &mut Ctx) -> Vec<u8> {
         let shard = store::get_shard(db, key);
         let map = read_lock!(shard);
 
-        if let Some(KiviDBValue::String(b)) = map.get(key)
-            && is_hll(b)
+        if let Some(ValueRef::String(b)) = map.get(key)
+            && is_hll(&b)
         {
             // Merge: take element-wise max of each register
             let src = &b[HLL_HEADER_SIZE..];
@@ -459,9 +456,9 @@ fn cmd_pfmerge(ctx: &mut Ctx) -> Vec<u8> {
         let shard = store::get_shard(db, key);
         let map = read_lock!(shard);
 
-        if let Some(KiviDBValue::String(b)) = map.get(key) {
-            if !is_hll(b) {
-                return not_hll(b);
+        if let Some(ValueRef::String(b)) = map.get(key) {
+            if !is_hll(&b) {
+                return not_hll(&b);
             }
             let src = &b[HLL_HEADER_SIZE..];
             let dst = &mut merged_blob[HLL_HEADER_SIZE..];
@@ -555,8 +552,8 @@ fn cmd_pfdebug(ctx: &mut Ctx) -> Vec<u8> {
         None => return resp_error("ERR key must be valid UTF-8"),
     };
 
-    if is_expired(ctx.expiry_store, *ctx.selected_db, &key) {
-        delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, &key);
+    if is_expired(ctx.store, *ctx.selected_db, &key) {
+        delete_key_if_expired(ctx.store, *ctx.selected_db, &key);
         return resp_error("ERR no such key");
     }
 

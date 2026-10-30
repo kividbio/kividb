@@ -12,12 +12,20 @@
 //   FT.SEARCH     each master is asked for the first offset+count matches,
 //                 with their scores and sort keys; the coordinator orders
 //                 them all as one node would, and takes the page asked for.
-//                 The total is the sum of the masters' totals.
+//                 The total is the sum of the masters' totals. A master's
+//                 reply says whether its scan ran out of time; the
+//                 coordinator ORs those flags and applies ON_TIMEOUT.
 //   FT.AGGREGATE  each master sends the rows that match the query, before
-//                 any step; the coordinator runs the steps (GROUPBY, REDUCE,
-//                 APPLY, FILTER, SORTBY, LIMIT) over all of them, so every
-//                 reducer is exact. WITHCURSOR keeps the cursor on the
-//                 coordinator.
+//                 any step, and whether it timed out; the coordinator runs
+//                 the steps (GROUPBY, REDUCE, APPLY, FILTER, SORTBY, LIMIT)
+//                 over all of them, so every reducer is exact, then applies
+//                 ON_TIMEOUT. WITHCURSOR keeps the cursor on the coordinator.
+//
+// Whether a master's part timed out travels only when the coordinator asks
+// for it (see `ask_for_timeout_flag`), so that during a rolling upgrade
+// each side gets the reply it understands: a master from before the flag
+// does not know the question and answers as it always did, and a
+// coordinator from before it never asks.
 //
 // Relevance (BM25) is computed by each master over its own documents, as in
 // RediSearch's coordinator. A node answers only for the slots it serves, so
@@ -212,7 +220,10 @@ fn ask_once(
     let mut preamble = 0;
     if !password.is_empty() {
         out.extend(if user.is_empty() {
-            encode(&[b"AUTH", password.as_bytes()])
+            // As the default user, by name: `AUTH <password>` is refused by a
+            // node that has no password (#135), and with the name it logs in as
+            // before.
+            encode(&[b"AUTH", b"default", password.as_bytes()])
         } else {
             encode(&[b"AUTH", user.as_bytes(), password.as_bytes()])
         });
@@ -294,11 +305,66 @@ pub fn fan_out(ctx: &crate::commands::ctx::Ctx, cmd: &[Vec<u8>]) -> Result<Vec<R
     }
 }
 
+/// The parameter a coordinator adds to what it asks a master, to be told
+/// whether that master's part ran out of time. A parameter, because every
+/// version takes `PARAMS` anywhere in FT.SEARCH and FT.AGGREGATE, and one
+/// the query does not use changes nothing: a master from before the flag
+/// ignores it, and answers in the shape it always did.
+const TIMEOUT_FLAG_PARAM: &[u8] = b"__kividb_timeout_flag";
+
+/// Ask the masters for their timeout flag: `PARAMS 2 <name> 1`, last.
+pub fn ask_for_timeout_flag(cmd: &mut Vec<Vec<u8>>) {
+    cmd.extend([
+        b"PARAMS".to_vec(),
+        b"2".to_vec(),
+        TIMEOUT_FLAG_PARAM.to_vec(),
+        b"1".to_vec(),
+    ]);
+}
+
+/// Whether a coordinator asked this master for its timeout flag (see
+/// [`ask_for_timeout_flag`]).
+pub fn wants_timeout_flag(cmd: &[&[u8]]) -> bool {
+    matches!(
+        cmd,
+        [.., params, two, name, one]
+            if params.eq_ignore_ascii_case(b"PARAMS")
+                && *two == b"2"
+                && *name == TIMEOUT_FLAG_PARAM
+                && *one == b"1"
+    )
+}
+
+/// A master's FT.SEARCH reply to a coordinator that asked for the flag:
+/// the RESP2 page, then whether that master's scan ran out of time.
+pub fn encode_search(page: Vec<u8>, timed_out: bool) -> Vec<u8> {
+    use crate::resp::write::{resp_array, resp_integer};
+    resp_array(vec![page, resp_integer(i64::from(timed_out))])
+}
+
+/// The page and timeout flag in a master's reply to [`encode_search`]. A
+/// master from before the flag answers with the page alone, which begins
+/// with its total, an integer, where the flagged reply begins with the
+/// page, an array: that page did not time out.
+pub fn decode_search(reply: Reply) -> Result<(Reply, bool), String> {
+    match reply {
+        Reply::Array(mut items) if matches!(items.as_slice(), [Reply::Array(_), Reply::Int(_)]) => {
+            let timed_out = matches!(items.pop(), Some(Reply::Int(n)) if n != 0);
+            Ok((items.remove(0), timed_out))
+        }
+        Reply::Array(items) if matches!(items.first(), Some(Reply::Int(_))) => {
+            Ok((Reply::Array(items), false))
+        }
+        _ => Err("ERR a master answered the search with something else".into()),
+    }
+}
+
 /// The rows of an aggregation, as a master sends them to its coordinator:
-/// every column of every row.
-pub fn encode_rows(rows: &[ahash::AHashMap<String, String>]) -> Vec<u8> {
-    use crate::resp::write::{resp_array, resp_bulk_str};
-    resp_array(
+/// every column of every row, then, if the coordinator asked for it (see
+/// [`ask_for_timeout_flag`]), whether that master's scan ran out of time.
+pub fn encode_rows(rows: &[ahash::AHashMap<String, String>], timed_out: Option<bool>) -> Vec<u8> {
+    use crate::resp::write::{resp_array, resp_bulk_str, resp_integer};
+    let body = resp_array(
         rows.iter()
             .map(|row| {
                 resp_array(
@@ -308,25 +374,41 @@ pub fn encode_rows(rows: &[ahash::AHashMap<String, String>]) -> Vec<u8> {
                 )
             })
             .collect(),
-    )
+    );
+    match timed_out {
+        Some(timed_out) => resp_array(vec![body, resp_integer(i64::from(timed_out))]),
+        None => body,
+    }
 }
 
-/// The rows in a master's reply to [`encode_rows`].
-pub fn decode_rows(reply: Reply) -> Vec<ahash::AHashMap<String, String>> {
-    let Reply::Array(rows) = reply else {
-        return Vec::new();
+/// The rows and timeout flag in a master's reply to [`encode_rows`]. A
+/// master from before the flag sends the rows alone: an array of arrays,
+/// where the flagged reply ends with an integer. Those rows did not time
+/// out.
+pub fn decode_rows(reply: Reply) -> (Vec<ahash::AHashMap<String, String>>, bool) {
+    let (rows, timed_out) = match reply {
+        Reply::Array(mut wrap) if matches!(wrap.as_slice(), [Reply::Array(_), Reply::Int(_)]) => {
+            let timed_out = matches!(wrap.pop(), Some(Reply::Int(n)) if n != 0);
+            (wrap.remove(0), timed_out)
+        }
+        rows => (rows, false),
     };
-    rows.into_iter()
-        .filter_map(|row| match row {
-            Reply::Array(cells) => Some(
-                cells
-                    .chunks(2)
-                    .filter_map(|pair| Some((pair.first()?.text()?, pair.get(1)?.text()?)))
-                    .collect(),
-            ),
-            _ => None,
-        })
-        .collect()
+    let rows = match rows {
+        Reply::Array(rows) => rows
+            .into_iter()
+            .filter_map(|row| match row {
+                Reply::Array(cells) => Some(
+                    cells
+                        .chunks(2)
+                        .filter_map(|pair| Some((pair.first()?.text()?, pair.get(1)?.text()?)))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    (rows, timed_out)
 }
 
 #[cfg(test)]
@@ -343,7 +425,86 @@ mod tests {
         let mut row = ahash::AHashMap::new();
         row.insert("__key".to_string(), "doc:1".to_string());
         row.insert("price".to_string(), "10".to_string());
-        let back = decode_rows(parse_reply(&encode_rows(&[row.clone()])).unwrap());
-        assert_eq!(back, vec![row]);
+        let (back, timed_out) =
+            decode_rows(parse_reply(&encode_rows(&[row.clone()], Some(false))).unwrap());
+        assert_eq!(back, vec![row.clone()]);
+        assert!(!timed_out);
+
+        let (empty, timed_out) = decode_rows(parse_reply(&encode_rows(&[], Some(true))).unwrap());
+        assert!(empty.is_empty());
+        assert!(timed_out);
+
+        let page = crate::resp::write::resp_array(vec![crate::resp::write::resp_integer(2)]);
+        let (inner, timed_out) =
+            decode_search(parse_reply(&encode_search(page, true)).unwrap()).unwrap();
+        assert!(timed_out);
+        let Reply::Array(items) = inner else { panic!() };
+        assert!(matches!(items[0], Reply::Int(2)));
+    }
+
+    /// A master from before the timeout flag answers with the page or the
+    /// rows alone: read as not timed out, in every shape they take.
+    #[test]
+    fn a_reply_without_the_flag_is_one_that_did_not_time_out() {
+        use crate::resp::write::{resp_array, resp_bulk_str, resp_integer};
+        // Pages: none found; a key and its score; one with its fields too.
+        for page in [
+            resp_array(vec![resp_integer(0)]),
+            resp_array(vec![
+                resp_integer(1),
+                resp_bulk_str("doc:1"),
+                resp_bulk_str("1"),
+            ]),
+            resp_array(vec![
+                resp_integer(7),
+                resp_bulk_str("doc:1"),
+                resp_bulk_str("0.5"),
+                resp_array(vec![resp_bulk_str("t"), resp_bulk_str("hello")]),
+            ]),
+        ] {
+            let alone = parse_reply(&page).unwrap();
+            let (inner, timed_out) = decode_search(alone.clone()).unwrap();
+            assert!(!timed_out);
+            assert_eq!(format!("{inner:?}"), format!("{alone:?}"));
+            // The same page with the flag is told apart from it.
+            let (flagged, timed_out) =
+                decode_search(parse_reply(&encode_search(page, true)).unwrap()).unwrap();
+            assert!(timed_out);
+            assert_eq!(format!("{flagged:?}"), format!("{alone:?}"));
+        }
+        assert!(decode_search(Reply::Simple("OK".into())).is_err());
+        assert!(decode_search(Reply::Array(vec![Reply::Bulk(Some(b"x".to_vec()))])).is_err());
+
+        // Rows: none, one, two.
+        let mut row = ahash::AHashMap::new();
+        row.insert("__key".to_string(), "doc:1".to_string());
+        for rows in [vec![], vec![row.clone()], vec![row.clone(), row.clone()]] {
+            let (back, timed_out) = decode_rows(parse_reply(&encode_rows(&rows, None)).unwrap());
+            assert_eq!(back, rows);
+            assert!(!timed_out);
+            let (back, timed_out) =
+                decode_rows(parse_reply(&encode_rows(&rows, Some(true))).unwrap());
+            assert_eq!(back, rows);
+            assert!(timed_out);
+        }
+    }
+
+    #[test]
+    fn only_a_coordinator_that_asks_is_told_whether_a_part_timed_out() {
+        let asks = |cmd: &[Vec<u8>]| -> bool {
+            let parts: Vec<&[u8]> = cmd.iter().map(Vec::as_slice).collect();
+            wants_timeout_flag(&parts)
+        };
+        let mut cmd: Vec<Vec<u8>> = vec![b"FT.SEARCH".to_vec(), b"idx".to_vec(), b"*".to_vec()];
+        assert!(!asks(&cmd));
+        cmd.extend([
+            b"PARAMS".to_vec(),
+            b"2".to_vec(),
+            b"a".to_vec(),
+            b"1".to_vec(),
+        ]);
+        assert!(!asks(&cmd));
+        ask_for_timeout_flag(&mut cmd);
+        assert!(asks(&cmd));
     }
 }

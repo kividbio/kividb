@@ -21,7 +21,7 @@
 use crate::config::Config;
 use crate::replication::{FullSyncGuard, HubTx, LinkState, ReplState};
 use crate::resp::parse::parse_resp_command;
-use crate::store::{self, ExpiryStore, SharedTsIndex, Store};
+use crate::store::{self, SharedTsIndex, Store};
 use crate::vector::{CompactionTx, DictStore, IndexStore};
 use crate::wait_table::WaitTable;
 use std::sync::Arc;
@@ -92,7 +92,6 @@ impl Drop for SlaveUpstreamGuard {
 #[derive(Clone)]
 pub struct ReplicaStarter {
     pub store: Store,
-    pub expiry_store: ExpiryStore,
     pub index_store: IndexStore,
     pub dict_store: DictStore,
     pub wait_table: Arc<WaitTable>,
@@ -121,7 +120,6 @@ impl ReplicaStarter {
             tracking_table: Arc::clone(ctx.tracking_table),
             monitor_registry: Arc::clone(ctx.monitor_registry),
             store: Arc::clone(ctx.store),
-            expiry_store: Arc::clone(ctx.expiry_store),
             index_store: Arc::clone(ctx.index_store),
             dict_store: Arc::clone(ctx.dict_store),
             wait_table: Arc::clone(ctx.wait_table),
@@ -404,7 +402,6 @@ async fn run_replication_session(
 ) -> Result<SessionEnd, SessionError> {
     let ReplicaStarter {
         store,
-        expiry_store,
         index_store,
         dict_store,
         wait_table,
@@ -453,11 +450,14 @@ async fn run_replication_session(
     // ── Phase 0: AUTH, when the master requires it ───────────────────────
     let (master_user, master_auth) = repl_state.master_credentials();
     if !master_auth.is_empty() {
-        let mut parts = vec!["AUTH"];
-        if !master_user.is_empty() {
-            parts.push(&master_user);
-        }
-        parts.push(&master_auth);
+        // As the default user when no user is given: `AUTH <password>`
+        // is refused by a master that has no password (#135).
+        let user = if master_user.is_empty() {
+            "default"
+        } else {
+            master_user.as_str()
+        };
+        let parts = vec!["AUTH", user, master_auth.as_str()];
         send_command(&mut writer, &parts).await?;
         let reply = guarded(
             read_line(&mut reader),
@@ -510,11 +510,21 @@ async fn run_replication_session(
     // ── Phase 2: REPLCONF listening-port ────────────────────────────────
     // The port clients reach *this* node on, so the master's `INFO` and `ROLE`
     // list the replica by an address someone can actually connect to rather
-    // than this connection's ephemeral source port.
+    // than this connection's ephemeral source port. As in Redis, that is the
+    // TLS port when the replica replicates over TLS, and it is when there is
+    // no plaintext port (port 0); otherwise the plaintext port. Both as they
+    // are now: `CONFIG SET` moves them.
     let listening_port = if config.replica_announced_port != 0 {
         config.replica_announced_port
     } else {
-        config.port
+        use crate::listen::{Kind, current_port, server_of};
+        let plain = current_port(server_of(config), Kind::Plain);
+        let tls = current_port(server_of(config), Kind::Tls);
+        if tls != 0 && (plain == 0 || crate::node_tls::replication()) {
+            tls
+        } else {
+            plain
+        }
     };
     send_command(
         &mut writer,
@@ -586,12 +596,10 @@ async fn run_replication_session(
                 .and_then(|hex| u64::from_str_radix(hex, 16).ok()),
         );
         let ours = {
-            let (store, expiry_store) = (store.clone(), expiry_store.clone());
-            tokio::task::spawn_blocking(move || {
-                crate::replication::digest::dataset_digest(&store, &expiry_store)
-            })
-            .await
-            .ok()
+            let store = store.clone();
+            tokio::task::spawn_blocking(move || crate::replication::digest::dataset_digest(&store))
+                .await
+                .ok()
         };
         let (ask_id, ask_offset) = match offered {
             Some((id, digest)) if ours == Some(digest) && id.len() == 40 => {
@@ -650,6 +658,19 @@ async fn run_replication_session(
             len
         };
         offset = point.offset + prelude_len as u64;
+        // A master that was this one's sibling, promoted since, continues the
+        // old stream under its own id: follow that id from here on (#109).
+        if let Some(id) = tok
+            .get(1)
+            .filter(|id| id.len() == 40 && **id != point.repl_id)
+            && let Some(current) = repl_state.resync_point.lock().as_mut()
+        {
+            log_info!(
+                "Replication: The master continues {} as {id}",
+                current.repl_id
+            );
+            current.repl_id = id.to_string();
+        }
         log_info!(
             "Replication: Partial resync: continuing from offset {} — no dataset transfer",
             point.offset
@@ -774,15 +795,13 @@ async fn run_replication_session(
                 {
                     let _cut = crate::write_gate::cut();
                     let empty = store::new_store(config.databases);
-                    let empty_expiry = store::new_expiry_store(config.databases);
                     store::swap_kv_with_staging(store, &empty);
-                    store::swap_expiry_with_staging(expiry_store, &empty_expiry);
                     index_store.write().clear();
                     dict_store.write().clear();
                     crate::store::rebuild_ts_label_index(store, ts_index);
                     wait_table.clear();
-                    // `empty` and `empty_expiry` now hold the old dataset, and
-                    // take it with them.
+                    // `empty` now holds the old dataset, and takes it with
+                    // it.
                 }
                 crate::commands::memory::purge_allocator();
                 log_warn!(
@@ -810,7 +829,6 @@ async fn run_replication_session(
             // local AOF record cannot straddle it.
             let _cut = crate::write_gate::cut();
             store::swap_kv_with_staging(store, &staged.store);
-            store::swap_expiry_with_staging(expiry_store, &staged.expiry);
             index_store.write().clear();
             dict_store.write().clear();
             crate::store::rebuild_ts_label_index(store, ts_index);
@@ -828,7 +846,6 @@ async fn run_replication_session(
         // that glibc parks in its arenas, so without this the replica keeps the old
         // dataset's footprint resident on top of the new one.
         drop(staged.store);
-        drop(staged.expiry);
         crate::commands::memory::purge_allocator();
 
         // ── Phase 7: Command stream ──────────────────────────────────────────
@@ -926,14 +943,12 @@ async fn run_replication_session(
         // quiesced), so the stream must not be appending yet.
         if crate::aof::AOF_ENABLED.load(Ordering::Relaxed) {
             let store_for_rewrite = Arc::clone(store);
-            let expiry_for_rewrite = Arc::clone(expiry_store);
             let index_for_rewrite = Arc::clone(index_store);
             let repl_state_for_rewrite = Arc::clone(repl_state);
             log_info!("Replication: AOF is on — rebasing it onto the synced dataset");
             let rebased = tokio::task::spawn_blocking(move || {
                 crate::replication::save_dataset(
                     &store_for_rewrite,
-                    &expiry_for_rewrite,
                     &index_for_rewrite,
                     &repl_state_for_rewrite,
                 )
@@ -959,7 +974,9 @@ async fn run_replication_session(
     // incomplete command still sitting in `repl_buf`. This is the offset
     // reported, acknowledged, and continued from.
     let mut applied = offset - repl_buf.len() as u64;
-    repl_state.repl_offset.store(applied, Ordering::Relaxed);
+    if !publish_applied(repl_state, my_generation, applied) {
+        return Ok(SessionEnd::Superseded);
+    }
 
     let ack_interval = Duration::from_secs(1);
     send_ack(&mut writer, applied, timeout).await?;
@@ -983,10 +1000,20 @@ async fn run_replication_session(
     // Bytes already in `repl_buf` (the prelude, or what arrived during the
     // index rebuild) must be applied before blocking on the socket.
     let mut pending_input = !repl_buf.is_empty();
+    // How far into `repl_buf` a transaction still arriving has been looked
+    // through for its `EXEC` (`transaction_at`).
+    let mut transaction_scanned = 0usize;
 
     loop {
+        // Nothing is written to `repl_offset` on the way out, here or below:
+        // every batch has already published its position, and a session that
+        // has been superseded has no position to publish. A promoted node's
+        // offset is its own stream's by then, and a re-pointed one's is the
+        // new session's. Writing the old position over it took back the
+        // writes a promoted master had taken meanwhile; the next full sync
+        // restarted the backlog at the shorter offset, and replicas continued
+        // before it were later sent the stream from the middle of a command.
         if repl_state.generation() != my_generation {
-            repl_state.repl_offset.store(applied, Ordering::Relaxed);
             log_info!(
                 "Replication: Command stream from {addr} superseded (epoch {my_generation}) — \
                  dropping connection"
@@ -1007,7 +1034,6 @@ async fn run_replication_session(
             };
             match read_n {
                 Some(0) => {
-                    repl_state.repl_offset.store(applied, Ordering::Relaxed);
                     return Ok(SessionEnd::MasterClosed);
                 }
                 Some(n) => {
@@ -1020,7 +1046,6 @@ async fn run_replication_session(
                 None => {
                     let timeout = repl_state.repl_timeout();
                     if heartbeats_seen && last_io.elapsed() > timeout {
-                        repl_state.repl_offset.store(applied, Ordering::Relaxed);
                         return Err(SessionError::Link(format!(
                             "no data from master for {}s (repl-timeout) — master is \
                              unreachable",
@@ -1034,23 +1059,14 @@ async fn run_replication_session(
         let mut applied_commands = false;
         if pending_input {
             pending_input = false;
-            // The commands and the position move together: whoever holds
-            // this lock sees a dataset that is exactly the stream up to the
-            // resync point. A save takes it to record that point beside the
-            // dataset it writes.
-            let _applying = repl_state.apply_lock.lock();
-            let mut parse_pos = 0usize;
-            while let Some((consumed, cmd)) = parse_resp_command(&repl_buf[parse_pos..]) {
-                if cmd.len() == 1 && cmd[0].eq_ignore_ascii_case(b"PING") {
-                    // The master's heartbeat. Nothing to apply.
-                    heartbeats_seen = true;
-                } else {
+            // One command, a write the master sent as it is.
+            macro_rules! apply {
+                ($cmd:expr) => {
                     repl_apply
                         .apply_command(
-                            cmd.iter().map(|v| v.to_vec()).collect(),
+                            $cmd,
                             store,
                             repl_state,
-                            expiry_store,
                             index_store,
                             dict_store,
                             wait_table,
@@ -1058,7 +1074,7 @@ async fn run_replication_session(
                             config,
                             compaction_tx,
                             &mut selected_db,
-                            &crate::watch::NoopWatchRegistry,
+                            &crate::watch::ForStore(store),
                             addr.as_str(),
                         )
                         .map_err(|e| {
@@ -1066,19 +1082,107 @@ async fn run_replication_session(
                             // be a point in the stream: resync in full.
                             repl_state.set_resync_point(None);
                             SessionError::Link(e.to_string())
-                        })?;
+                        })?
+                };
+            }
+            // Commands one by one up to a `MULTI`; then the transaction it
+            // opens, as one step, once its `EXEC` has arrived; and so on.
+            // A transaction not yet arrived in full stays in `repl_buf`, not
+            // applied and not counted: should the link drop now, it is asked
+            // for again from its `MULTI` (as Redis keeps a replica's offset
+            // at the `MULTI` until the `EXEC`).
+            loop {
+                let transaction = match transaction_at(&repl_buf, &mut transaction_scanned) {
+                    StreamTransaction::Whole(whole) => Some(whole),
+                    StreamTransaction::Partial => break,
+                    StreamTransaction::None => None,
+                };
+                // Alone before the lock below, never after: a command can
+                // hold the gate while it waits for that lock (`SAVE` does),
+                // and would wait for ever behind a transaction waiting for
+                // the gate.
+                let _alone = transaction.is_some().then(crate::command_gate::enter_alone);
+                // The commands and the position move together: whoever holds
+                // this lock sees a dataset that is exactly the stream up to the
+                // resync point. A save takes it to record that point beside the
+                // dataset it writes.
+                let _applying = repl_state.apply_lock.lock();
+                // Looked at under the lock a promotion takes to read where the
+                // stream stands (`become_master`): what was read from the old
+                // master after that is not this node's to apply any more, nor
+                // to count in an offset that is now its own stream's.
+                if repl_state.generation() != my_generation {
+                    log_info!(
+                        "Replication: Command stream from {addr} superseded (epoch \
+                         {my_generation}) — dropping connection"
+                    );
+                    return Ok(SessionEnd::Superseded);
                 }
-                parse_pos += consumed;
+                let parse_pos = match transaction {
+                    Some(whole) => {
+                        // As `EXEC` runs on the master: alone, so that no
+                        // reader here sees half of it; as one write, so that
+                        // no snapshot or backup is cut inside it; and to this
+                        // node's AOF as one group, between its own `MULTI`
+                        // and `EXEC`.
+                        let _whole = crate::write_gate::enter();
+                        let _propagation = repl_apply.propagation_group(repl_state);
+                        heartbeats_seen |= whole.heartbeat;
+                        for cmd in whole.commands {
+                            apply!(cmd);
+                        }
+                        whole.len
+                    }
+                    None => {
+                        let mut parse_pos = 0usize;
+                        while let Some((consumed, cmd)) = parse_resp_command(&repl_buf[parse_pos..])
+                        {
+                            if is_named(&cmd, b"MULTI") {
+                                // Applied whole, on the next turn.
+                                break;
+                            }
+                            if is_named(&cmd, b"PING") {
+                                // The master's heartbeat. Nothing to apply.
+                                heartbeats_seen = true;
+                            } else {
+                                apply!(cmd.iter().map(|v| v.to_vec()).collect());
+                            }
+                            parse_pos += consumed;
+                        }
+                        parse_pos
+                    }
+                };
+                if parse_pos == 0 {
+                    break;
+                }
                 applied_commands = true;
-            }
-            if parse_pos > 0 {
+                let read: Vec<u8> = repl_buf[..parse_pos].to_vec();
                 repl_buf.drain(0..parse_pos);
+                transaction_scanned = 0;
+                applied = offset - repl_buf.len() as u64;
+                repl_state.repl_offset.store(applied, Ordering::Relaxed);
+                if let Some(point) = repl_state.resync_point.lock().as_mut() {
+                    point.offset = applied;
+                    point.db = selected_db;
+                }
+                // Kept in this node's backlog, in the master's numbering: if it
+                // is promoted, the master's other replicas carry on from it (#109).
+                repl_state.record_received(read, applied);
             }
-            applied = offset - repl_buf.len() as u64;
-            repl_state.repl_offset.store(applied, Ordering::Relaxed);
-            if let Some(point) = repl_state.resync_point.lock().as_mut() {
-                point.offset = applied;
-                point.db = selected_db;
+            // What is left is the start of a command still arriving — or, if
+            // the master sent the stream from a position that is not where
+            // this replica stands, the middle of one. That never parses: the
+            // replica would wait for ever, applying nothing and acknowledging
+            // the same offset, and look healthy from both sides. Resync in
+            // full instead.
+            if !crate::resp::parse::can_start_command(&repl_buf)
+                || !crate::resp::parse::can_start_command(&repl_buf[transaction_scanned..])
+            {
+                repl_state.set_resync_point(None);
+                return Err(SessionError::Link(format!(
+                    "the master's stream does not read as commands from offset {applied} \
+                     (it was sent from another position than this replica's) — resyncing in full"
+                )));
             }
         }
 
@@ -1090,6 +1194,97 @@ async fn run_replication_session(
             last_ack = Instant::now();
         }
     }
+}
+
+/// Publish `applied` as this node's replication offset, unless the session
+/// that applied it has been superseded — by a promotion, whose stream the
+/// offset now counts, or by a re-point, whose session owns it. Under the lock
+/// a promotion takes to read where the stream stands, so that the two cannot
+/// cross. False when superseded.
+fn publish_applied(repl_state: &ReplState, my_generation: u64, applied: u64) -> bool {
+    let _applying = repl_state.apply_lock.lock();
+    if repl_state.generation() != my_generation {
+        return false;
+    }
+    repl_state.repl_offset.store(applied, Ordering::Relaxed);
+    true
+}
+
+/// Whether `cmd` is the bare command `name` — `MULTI`, `EXEC`, `PING`.
+fn is_named(cmd: &[&[u8]], name: &[u8]) -> bool {
+    cmd.len() == 1 && cmd[0].eq_ignore_ascii_case(name)
+}
+
+/// What the front of the stream holds.
+enum StreamTransaction {
+    /// Not a `MULTI`.
+    None,
+    /// A `MULTI` whose `EXEC` has not arrived yet.
+    Partial,
+    Whole(WholeTransaction),
+}
+
+/// A transaction from the master, `MULTI` to `EXEC`.
+struct WholeTransaction {
+    /// Bytes of the stream it takes, `MULTI` and `EXEC` included.
+    len: usize,
+    /// The commands between them.
+    commands: Vec<Vec<Vec<u8>>>,
+    /// A heartbeat came in the middle of it.
+    heartbeat: bool,
+}
+
+/// The transaction at the front of `buf`, if one is.
+///
+/// A large one — a script that wrote a million keys — arrives over many
+/// reads, and is looked at again after each. `scanned` keeps how far it has
+/// been looked through already (0 for none), so that it is not parsed from
+/// its start every time.
+fn transaction_at(buf: &[u8], scanned: &mut usize) -> StreamTransaction {
+    let multi_len = match parse_resp_command(buf) {
+        Some((consumed, cmd)) if is_named(&cmd, b"MULTI") => consumed,
+        _ => return StreamTransaction::None,
+    };
+    let mut pos = (*scanned).max(multi_len);
+    let end = loop {
+        match parse_resp_command(&buf[pos..]) {
+            Some((consumed, cmd)) => {
+                let at = pos;
+                pos += consumed;
+                if is_named(&cmd, b"EXEC") {
+                    break at;
+                }
+            }
+            None => {
+                *scanned = pos;
+                return StreamTransaction::Partial;
+            }
+        }
+    };
+    let mut whole = WholeTransaction {
+        len: pos,
+        commands: Vec::new(),
+        heartbeat: false,
+    };
+    let mut at = multi_len;
+    while at < end {
+        let Some((consumed, cmd)) = parse_resp_command(&buf[at..]) else {
+            break;
+        };
+        at += consumed;
+        if is_named(&cmd, b"PING") {
+            // The master's heartbeat, sent while the transaction was on
+            // its way. Nothing to apply.
+            whole.heartbeat = true;
+        } else if !is_named(&cmd, b"MULTI") {
+            // A `MULTI` inside one is not something a master sends; Redis
+            // refuses it and carries on with the transaction, as here.
+            whole
+                .commands
+                .push(cmd.iter().map(|v| v.to_vec()).collect());
+        }
+    }
+    StreamTransaction::Whole(whole)
 }
 
 /// Holds `slave_sync_in_progress` for as long as it lives.
@@ -1113,7 +1308,6 @@ impl Drop for SyncInProgress<'_> {
 /// A full-sync payload, parsed into stores that are not yet live.
 struct StagedSync {
     store: Store,
-    expiry: ExpiryStore,
     index_schemas: Vec<crate::vector::IndexSchema>,
     dictionaries: Vec<(String, Vec<String>)>,
     /// The master's function libraries, from a KDB image or a Redis RDB file
@@ -1130,7 +1324,6 @@ struct StagedSync {
 /// must not go on to replace the live dataset with whatever was read so far.
 fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync, SessionError> {
     let staging_store = store::new_store(databases);
-    let staging_expiry = store::new_expiry_store(databases);
 
     let is_kividb = payload.len() >= 8 && payload[..8] == *crate::snapshot::KDB_MAGIC;
     let (dbs, expiries, index_schemas, dictionaries, functions) = if is_kividb {
@@ -1153,10 +1346,9 @@ fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync
     };
 
     let keys = crate::snapshot::restore_into_store(dbs, &staging_store);
-    let keys_with_ttl = crate::snapshot::restore_expiries_into_store(expiries, &staging_expiry);
+    let keys_with_ttl = crate::snapshot::restore_expiries_into_store(expiries, &staging_store);
     Ok(StagedSync {
         store: staging_store,
-        expiry: staging_expiry,
         index_schemas,
         dictionaries,
         functions,
@@ -1344,6 +1536,20 @@ pub(crate) struct ReplicationApplyEnv {
 }
 
 impl ReplicationApplyEnv {
+    /// A transaction from the master, as one group to this node's AOF (and,
+    /// were anything to go to the hub, there too). See
+    /// [`crate::replication::PropagationGroup`].
+    fn propagation_group<'a>(
+        &'a self,
+        repl_state: &'a ReplState,
+    ) -> crate::replication::PropagationGroup<'a> {
+        crate::replication::PropagationGroup::begin(
+            repl_state,
+            &self.discard_hub_tx,
+            self.aof_tx.as_ref(),
+        )
+    }
+
     /// For the replication stream: applied writes are appended to this node's
     /// own AOF, and their client-visible side effects go to the server's real
     /// hubs (see [`ReplicaStarter`]).
@@ -1412,7 +1618,6 @@ impl ReplicationApplyEnv {
         cmd: Vec<Vec<u8>>,
         store: &Store,
         repl_state: &Arc<ReplState>,
-        expiry_store: &ExpiryStore,
         index_store: &IndexStore,
         dict_store: &DictStore,
         wait_table: &Arc<WaitTable>,
@@ -1420,7 +1625,7 @@ impl ReplicationApplyEnv {
         config: &Arc<Config>,
         compaction_tx: &CompactionTx,
         selected_db: &mut usize,
-        watch_registry: &crate::watch::NoopWatchRegistry,
+        watch_registry: &dyn crate::watch::WatchNotifier,
         peer_addr: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         use crate::commands::ctx::Ctx;
@@ -1430,7 +1635,6 @@ impl ReplicationApplyEnv {
         let out = execute_command(Ctx {
             cmd: cmd_refs,
             store,
-            expiry_store,
             lastsave: &self.lastsave,
             selected_db,
             aof_tx: self.aof_tx.as_ref(),
@@ -1517,7 +1721,6 @@ pub async fn handle_replica_connection<R>(
     resp_tx: mpsc::Sender<Vec<u8>>,
     write_task: tokio::task::JoinHandle<()>,
     store: store::Store,
-    expiry_store: store::ExpiryStore,
     _lastsave: Arc<parking_lot::RwLock<i64>>,
     _aof_tx: mpsc::UnboundedSender<Vec<u8>>,
     _aof_enabled: bool,
@@ -1603,6 +1806,7 @@ where
     // dataset at one instant, so every write is in exactly one of {payload,
     // stream}.
     let (peer_ip, peer_port) = replica_endpoint(&peer_addr, listening_port);
+    let endpoint = format!("{peer_ip}:{peer_port}");
     let registration = crate::replication::ReplicaRegistration {
         replica_id,
         addr: peer_addr.clone(),
@@ -1623,14 +1827,12 @@ where
         Err(registration) => {
             match tokio::task::spawn_blocking({
                 let store = Arc::clone(&store);
-                let expiry_store = Arc::clone(&expiry_store);
                 let index_store = Arc::clone(&index_store);
                 let repl_state = Arc::clone(&repl_state);
                 let hub_tx = hub_tx.clone();
                 move || {
                     crate::replication::begin_full_sync(
                         &store,
-                        &expiry_store,
                         &index_store,
                         &repl_state,
                         &hub_tx,
@@ -1736,10 +1938,21 @@ where
     // `forward_task` reads from). Either way, force the socket writer closed so the
     // whole connection tears down instead of the reader lingering on a live replica
     // the hub has already forgotten about.
+    let mut write_task = write_task;
+    let mut forward_task = forward_task;
     tokio::select! {
-        _ = write_task => {}
-        _ = forward_task => {
+        _ = &mut write_task => {}
+        _ = &mut forward_task => {
             drop(resp_tx);
+        }
+        // A replica that has gone silent: see `ReplState::replica_timed_out`.
+        _ = repl_state.replica_timed_out(replica_id) => {
+            log_warn!(
+                "Replication: disconnecting timedout replica {endpoint}: no REPLCONF ACK for {} s (repl-timeout)",
+                repl_state.repl_timeout().as_secs()
+            );
+            forward_task.abort();
+            write_task.abort();
         }
     }
     ack_reader_task.abort();
@@ -1754,13 +1967,11 @@ where
 mod repl_apply_env_tests {
     use super::ReplicationApplyEnv;
     use crate::replication::ReplState;
-    use crate::types::KiviDBValue;
 
     #[tokio::test]
     async fn replication_apply_env_reuses_scaffold_for_many_writes() {
         let cfg = std::sync::Arc::new(crate::config::Config::default_replica());
         let store = crate::store::new_store(cfg.databases);
-        let expiry = crate::store::new_expiry_store(cfg.databases);
         let repl_state = std::sync::Arc::new(ReplState::new_master());
         let index = crate::vector::new_index_store();
         let dict = crate::vector::new_dict_store();
@@ -1771,7 +1982,6 @@ mod repl_apply_env_tests {
         let (hub_tx, _hub_rx) = tokio::sync::mpsc::unbounded_channel();
         let starter = super::ReplicaStarter {
             store: std::sync::Arc::clone(&store),
-            expiry_store: std::sync::Arc::clone(&expiry),
             index_store: std::sync::Arc::clone(&index),
             dict_store: std::sync::Arc::clone(&dict),
             wait_table: std::sync::Arc::clone(&wait),
@@ -1797,7 +2007,6 @@ mod repl_apply_env_tests {
                 vec![b"SET".to_vec(), ks.as_bytes().to_vec(), b"v".to_vec()],
                 &store,
                 &repl_state,
-                &expiry,
                 &index,
                 &dict,
                 &wait,
@@ -1815,7 +2024,6 @@ mod repl_apply_env_tests {
             vec![b"GET".to_vec(), br"rk0".to_vec()],
             &store,
             &repl_state,
-            &expiry,
             &index,
             &dict,
             &wait,
@@ -1829,21 +2037,10 @@ mod repl_apply_env_tests {
         .unwrap();
 
         let shard = crate::store::get_shard(&store[0], "rk0");
-        #[cfg(not(target_os = "linux"))]
-        {
-            let map = shard.read();
-            match map.get("rk0") {
-                Some(KiviDBValue::String(b)) => assert_eq!(&b[..], b"v"),
-                _ => panic!("unexpected value variant for rk0"),
-            }
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let map = shard.read();
-            match map.get("rk0") {
-                Some(KiviDBValue::String(b)) => assert_eq!(&b[..], b"v"),
-                _ => panic!("unexpected value variant for rk0"),
-            }
+        let map = shard.read();
+        match map.get("rk0") {
+            Some(crate::store::ValueRef::String(b)) => assert_eq!(&b[..], b"v"),
+            _ => panic!("unexpected value variant for rk0"),
         }
     }
 }
@@ -1958,7 +2155,6 @@ mod slave_upstream_guard_tests {
 mod full_sync_guard_tests {
     use super::{full_sync_refusal, load_full_sync_payload};
     use crate::replication::FullSyncGuard;
-    use crate::types::KiviDBValue;
 
     #[test]
     fn an_empty_master_is_refused_when_the_replica_holds_data() {
@@ -2026,30 +2222,37 @@ mod full_sync_guard_tests {
     #[test]
     fn payload_round_trip_keeps_keys_and_ttls() {
         let store = crate::store::new_store(2);
-        let expiry = crate::store::new_expiry_store(2);
         for (db, key) in [(0usize, "a"), (0, "b"), (1, "c")] {
-            crate::store::get_shard(&store[db], key).write().insert(
-                key.into(),
-                KiviDBValue::String(crate::types::SharedBytes::from(&b"v"[..])),
-            );
+            crate::store::get_shard(&store[db], key)
+                .write()
+                .insert_str(key, &b"v"[..]);
         }
-        let in_an_hour = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
-        crate::store::get_expiry_shard(&expiry[0], "a")
+        let in_an_hour = crate::commands::helpers::now_ms() + 3_600_000;
+        crate::store::get_shard(&store[0], "a")
             .write()
-            .insert(crate::store::Key::from("a"), in_an_hour);
-        // An expiry for a key that does not exist must not travel.
-        crate::store::get_expiry_shard(&expiry[0], "ghost")
-            .write()
-            .insert(crate::store::Key::from("ghost"), in_an_hour);
+            .set_expires("a", in_an_hour);
+        // A time to live for a key that does not exist is none.
+        assert!(
+            !crate::store::get_shard(&store[0], "ghost")
+                .write()
+                .set_expires("ghost", in_an_hour)
+        );
 
-        let payload = crate::snapshot::full_sync_payload(&store, Some(&expiry), None).unwrap();
+        let payload = crate::snapshot::full_sync_payload(&store, None).unwrap();
         let staged = load_full_sync_payload(&payload, 2).expect("payload loads");
         assert_eq!(staged.keys, 3);
         assert_eq!(staged.keys_with_ttl, 1);
-        assert!(
-            crate::store::get_expiry_shard(&staged.expiry[0], "a")
+        assert_eq!(
+            crate::store::get_shard(&staged.store[0], "a")
                 .read()
-                .contains_key("a")
+                .expires("a"),
+            Some(in_an_hour)
+        );
+        assert_eq!(
+            crate::store::get_shard(&staged.store[0], "b")
+                .read()
+                .expires("b"),
+            None
         );
         assert!(
             crate::store::get_shard(&staged.store[1], "c")
@@ -2063,19 +2266,17 @@ mod full_sync_guard_tests {
     #[test]
     fn keys_already_expired_are_dropped_on_load() {
         let store = crate::store::new_store(1);
-        let expiry = crate::store::new_expiry_store(1);
         for key in ["live", "dead"] {
-            crate::store::get_shard(&store[0], key).write().insert(
-                key.into(),
-                KiviDBValue::String(crate::types::SharedBytes::from(&b"v"[..])),
-            );
+            crate::store::get_shard(&store[0], key)
+                .write()
+                .insert_str(key, &b"v"[..]);
         }
-        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(5);
-        crate::store::get_expiry_shard(&expiry[0], "dead")
+        let past = crate::commands::helpers::now_ms() - 5_000;
+        crate::store::get_shard(&store[0], "dead")
             .write()
-            .insert(crate::store::Key::from("dead"), past);
+            .set_expires("dead", past);
 
-        let payload = crate::snapshot::full_sync_payload(&store, Some(&expiry), None).unwrap();
+        let payload = crate::snapshot::full_sync_payload(&store, None).unwrap();
         let staged = load_full_sync_payload(&payload, 1).expect("payload loads");
         assert_eq!(staged.keys, 1);
         assert!(
@@ -2083,5 +2284,83 @@ mod full_sync_guard_tests {
                 .read()
                 .contains_key("dead")
         );
+    }
+}
+
+#[cfg(test)]
+mod stream_transaction_tests {
+    use super::*;
+
+    fn enc(parts: &[&str]) -> Vec<u8> {
+        let parts: Vec<Vec<u8>> = parts.iter().map(|p| p.as_bytes().to_vec()).collect();
+        crate::resp::write::encode_resp_command(&parts)
+    }
+
+    fn whole(t: StreamTransaction) -> WholeTransaction {
+        match t {
+            StreamTransaction::Whole(whole) => whole,
+            StreamTransaction::Partial => panic!("partial"),
+            StreamTransaction::None => panic!("none"),
+        }
+    }
+
+    #[test]
+    fn a_command_that_is_not_multi_is_not_a_transaction() {
+        let mut scanned = 0;
+        let buf = enc(&["SET", "a", "1"]);
+        assert!(matches!(
+            transaction_at(&buf, &mut scanned),
+            StreamTransaction::None
+        ));
+        assert!(matches!(
+            transaction_at(b"", &mut scanned),
+            StreamTransaction::None
+        ));
+    }
+
+    #[test]
+    fn a_transaction_is_whole_only_once_its_exec_is_there() {
+        let mut stream = enc(&["MULTI"]);
+        stream.extend_from_slice(&enc(&["SET", "a", "1"]));
+        stream.extend_from_slice(&enc(&["PING"]));
+        stream.extend_from_slice(&enc(&["SET", "b", "2"]));
+        let exec_at = stream.len();
+        stream.extend_from_slice(&enc(&["EXEC"]));
+        let len = stream.len();
+        stream.extend_from_slice(&enc(&["SET", "after", "3"]));
+
+        // Arriving a few bytes at a time: partial until the `EXEC` is
+        // whole, and what was looked through is not looked through again.
+        let mut scanned = 0;
+        for cut in 1..len {
+            assert!(
+                matches!(
+                    transaction_at(&stream[..cut], &mut scanned),
+                    StreamTransaction::Partial | StreamTransaction::None
+                ),
+                "at {cut}"
+            );
+            assert!(scanned <= exec_at);
+        }
+        assert_eq!(scanned, exec_at);
+        let t = whole(transaction_at(&stream, &mut scanned));
+        assert_eq!(t.len, len, "MULTI to EXEC, and nothing after");
+        assert!(t.heartbeat);
+        assert_eq!(
+            t.commands,
+            vec![
+                vec![b"SET".to_vec(), b"a".to_vec(), b"1".to_vec()],
+                vec![b"SET".to_vec(), b"b".to_vec(), b"2".to_vec()],
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_transaction_is_whole_and_applies_nothing() {
+        let mut stream = enc(&["multi"]);
+        stream.extend_from_slice(&enc(&["exec"]));
+        let t = whole(transaction_at(&stream, &mut 0));
+        assert_eq!(t.len, stream.len());
+        assert!(t.commands.is_empty());
     }
 }

@@ -8,7 +8,7 @@ path = "src/main.rs"
 
 [package]
 name = "kividb"
-version = "1.1.2-rc2"
+version = "1.2.0-rc2"
 edition = "2024"
 description = "A fast Redis®-compatible in-memory store written in Rust"
 license = "AGPL-3.0-only"
@@ -57,6 +57,9 @@ either = "1"
 regex-lite = "0.1"
 tokio-rustls  = { version = "0.26", optional = true }
 rustls-pemfile = { version = "2",   optional = true }
+# The names in a client certificate, for `tls-auth-clients-allowed-names`:
+# the X.509 parser rustls already builds with.
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std"], optional = true }
 mlua = { version = "0.10", features = ["lua54", "vendored", "send"], optional = true }
 sha1 = { version = "0.10", optional = true }
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
@@ -71,7 +74,7 @@ hashbrown = { version = "0.17", default-features = false }
 boxcar = "0.2"
 
 [features]
-tls = ["dep:tokio-rustls", "dep:rustls-pemfile"]
+tls = ["dep:tokio-rustls", "dep:rustls-pemfile", "dep:webpki"]
 # The builds with Lua use mimalloc (on Linux): see `mimalloc` below.
 lua = ["dep:mlua", "dep:sha1", "mimalloc"]
 # `mimalloc`: mimalloc under the counting allocator, on Linux. Part of the

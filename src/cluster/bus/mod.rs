@@ -89,6 +89,7 @@ pub fn start(
     match spawned {
         Ok(_) => {
             let _ = ready_rx.recv();
+            heartbeat::spawn_bus_watchdog();
         }
         Err(e) => log_error!("Cluster: could not start the bus thread: {e}"),
     }

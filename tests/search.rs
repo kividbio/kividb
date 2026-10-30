@@ -10,7 +10,7 @@
 // One server is shared by every test; each uses its own index and key prefix.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -176,14 +176,39 @@ impl Conn {
 
 // ── Server ────────────────────────────────────────────────────────────────────
 
+/// Whether nothing has `port`, asked with a socket that is bound and never
+/// listens (see tests/generics.rs).
+fn port_is_free(port: u16) -> bool {
+    let Ok(probe) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None) else {
+        return false;
+    };
+    #[cfg(unix)]
+    let _ = probe.set_reuse_address(true);
+    probe
+        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
+        .is_ok()
+}
+
+/// A port nothing listens on, outside the range the system hands out to
+/// outgoing connections: a client dialling a server that is not listening
+/// yet could otherwise be given the very port it dials, and talk to itself.
+fn free_port() -> u16 {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    loop {
+        let step = NEXT.fetch_add(1, Ordering::Relaxed);
+        let from = (std::process::id() as u16).wrapping_mul(37);
+        let port = 10_000 + from.wrapping_add(step) % 20_000;
+        if port_is_free(port) {
+            return port;
+        }
+    }
+}
+
 fn port() -> u16 {
     static PORT: OnceLock<u16> = OnceLock::new();
     *PORT.get_or_init(|| {
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let port = free_port();
         thread::spawn(move || {
             kividb::run_for_test(kividb::config::Config {
                 port,
@@ -207,6 +232,88 @@ fn port() -> u16 {
 
 fn conn() -> Conn {
     Conn::connect(port())
+}
+
+/// A server of its own, so `FT.CONFIG SET ON_TIMEOUT` and a large insert do
+/// not share the process-wide index names of the other tests. `FT.CONFIG`
+/// itself is still process-wide; fail tests restore `ON_TIMEOUT` at once.
+fn own_conn() -> Conn {
+    let port = free_port();
+    thread::spawn(move || {
+        kividb::run_for_test(kividb::config::Config {
+            port,
+            bind: "127.0.0.1".to_string(),
+            threads: 2,
+            loglevel: "error".to_string(),
+            io_model: kividb::config::IoModel::Tokio,
+            configfile: "./kividb.conf".to_string(),
+            ..Default::default()
+        });
+    });
+    for _ in 0..200 {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return Conn::connect(port);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!("server on port {port} did not start");
+}
+
+/// `n` hashes `{prefix}{start}` …, pipelined so a timeout test can fill the
+/// index without a round trip per document.
+fn hset_many(c: &mut Conn, prefix: &str, start: usize, n: usize) {
+    const BATCH: usize = 250;
+    let mut i = 0;
+    while i < n {
+        let end = (i + BATCH).min(n);
+        let keys: Vec<String> = (start + i..start + end)
+            .map(|j| format!("{prefix}{j}"))
+            .collect();
+        let mut buf = Vec::new();
+        for key in &keys {
+            let args = ["HSET", key.as_str(), "t", "hello"];
+            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            for a in args {
+                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                buf.extend_from_slice(a.as_bytes());
+                buf.extend_from_slice(b"\r\n");
+            }
+        }
+        c.writer.write_all(&buf).unwrap();
+        for _ in 0..keys.len() {
+            assert!(matches!(c.read(), V::Int(_)), "HSET");
+        }
+        i = end;
+    }
+}
+
+/// `n` hashes `{prefix}{start}` … with a TAG `c`, `red` for even numbers and
+/// `blue` for odd, and a 4-dimension vector `v`, pipelined like
+/// [`hset_many`].
+fn hset_tagged_many(c: &mut Conn, prefix: &str, start: usize, n: usize) {
+    const BATCH: usize = 250;
+    let mut i = 0;
+    while i < n {
+        let end = (i + BATCH).min(n);
+        let mut buf = Vec::new();
+        for j in start + i..start + end {
+            let key = format!("{prefix}{j}");
+            let tag: &[u8] = if j % 2 == 0 { b"red" } else { b"blue" };
+            let blob = vector(&[j as f32, 1.0, 2.0, 3.0]);
+            let args: [&[u8]; 6] = [b"HSET", key.as_bytes(), b"c", tag, b"v", &blob];
+            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            for a in args {
+                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                buf.extend_from_slice(a);
+                buf.extend_from_slice(b"\r\n");
+            }
+        }
+        c.writer.write_all(&buf).unwrap();
+        for _ in start + i..start + end {
+            assert!(matches!(c.read(), V::Int(_)), "HSET");
+        }
+        i = end;
+    }
 }
 
 fn vector(floats: &[f32]) -> Vec<u8> {
@@ -2331,8 +2438,9 @@ fn explain_and_profile_describe_the_query() {
 #[test]
 fn the_query_engine_settings_can_be_read_and_set() {
     let mut c = conn();
+    // No limit unless one is set: see `a_query_is_cut_short_when_it_runs_out_of_time`.
     let reply = c.cmd(&["FT.CONFIG", "GET", "TIMEOUT"]);
-    assert_eq!(reply, V::Arr(vec![strings(&["TIMEOUT", "500"])]));
+    assert_eq!(reply, V::Arr(vec![strings(&["TIMEOUT", "0"])]));
     assert!(c.cmd(&["FT.CONFIG", "GET", "*"]).arr().len() > 10);
     assert!(c.cmd(&["FT.CONFIG", "GET", "NOSUCH"]).arr().is_empty());
 
@@ -2404,4 +2512,458 @@ fn a_hash_with_a_field_ttl_is_still_a_document() {
     ]);
     assert_eq!(reply.i(), 1);
     assert_eq!(hose(&mut c), ["x1:4", "x1:6"]);
+}
+
+/// `TIMEOUT` was accepted as a skip-word; a value that is not a number is
+/// refused now that the argument is acted on.
+#[test]
+fn search_timeout_must_be_a_non_negative_integer() {
+    let mut c = conn();
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "tb1",
+            "PREFIX",
+            "1",
+            "tb1:",
+            "SCHEMA",
+            "t",
+            "TEXT",
+        ])
+        .ok()
+    );
+    assert!(
+        c.cmd(&["FT.SEARCH", "tb1", "*", "TIMEOUT", "soon"])
+            .err()
+            .contains("TIMEOUT")
+    );
+    assert!(
+        c.cmd(&["FT.AGGREGATE", "tb1", "*", "TIMEOUT", "soon"])
+            .err()
+            .contains("TIMEOUT")
+    );
+    assert!(c.cmd(&["FT.SEARCH", "tb1", "*", "TIMEOUT"]).is_err_reply());
+}
+
+/// Whether a RESP3 reply carries the timeout warning.
+fn warned(reply: &V) -> bool {
+    reply
+        .get("warning")
+        .arr()
+        .iter()
+        .any(|w| w.s().contains("Timeout limit was reached"))
+}
+
+/// The value of `name` in the first row of a RESP3 FT.AGGREGATE reply.
+fn first_row(reply: &V, name: &str) -> String {
+    reply.get("results").arr()[0]
+        .get("extra_attributes")
+        .get(name)
+        .s()
+        .to_string()
+}
+
+/// `TIMEOUT` / `ON_TIMEOUT` cut a query short. Documents are loaded until a
+/// 1 ms RESP3 search reports the timeout warning, and then four times as
+/// many again: what took longer than 1 ms then takes five times as long, so
+/// that a fast host does not finish the queries below in time after all.
+#[test]
+fn a_query_is_cut_short_when_it_runs_out_of_time() {
+    let mut c = own_conn();
+    assert!(matches!(c.cmd(&["HELLO", "3"]), V::Map(_)));
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "to",
+            "PREFIX",
+            "1",
+            "to:",
+            "SCHEMA",
+            "t",
+            "TEXT",
+        ])
+        .ok()
+    );
+
+    let mut n = 0usize;
+    let mut timed_out = false;
+    while n < 200_000 {
+        hset_many(&mut c, "to:", n, 8_000);
+        n += 8_000;
+        // Twice in a row: one search held up by the host, not by its
+        // documents, is not the size to grow from.
+        let mut late = || {
+            let reply = c.cmd(&["FT.SEARCH", "to", "*", "NOCONTENT", "TIMEOUT", "1"]);
+            warned(&reply)
+        };
+        if late() && late() {
+            timed_out = true;
+            break;
+        }
+    }
+    assert!(timed_out, "TIMEOUT 1 still finished after {n} documents");
+    hset_many(&mut c, "to:", n, 4 * n);
+    n *= 5;
+    let count = |c: &mut Conn, timeout: &str| -> V {
+        c.cmd(&[
+            "FT.AGGREGATE",
+            "to",
+            "*",
+            "TIMEOUT",
+            timeout,
+            "GROUPBY",
+            "0",
+            "REDUCE",
+            "COUNT",
+            "0",
+            "AS",
+            "c",
+        ])
+    };
+
+    // `TIMEOUT 0` is no limit, for both commands.
+    let all = c.cmd(&[
+        "FT.SEARCH",
+        "to",
+        "*",
+        "NOCONTENT",
+        "LIMIT",
+        "0",
+        "0",
+        "TIMEOUT",
+        "0",
+    ]);
+    assert_eq!(all.get("total_results").i(), n as i64, "{all:?}");
+    assert!(!warned(&all), "{all:?}");
+    let all = count(&mut c, "0");
+    assert_eq!(first_row(&all, "c"), n.to_string(), "{all:?}");
+    assert!(!warned(&all), "{all:?}");
+
+    assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "fail"]).ok());
+    let search = c.cmd(&["FT.SEARCH", "to", "*", "TIMEOUT", "1"]);
+    let aggregate = count(&mut c, "1");
+    assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "return"]).ok());
+    for failed in [search, aggregate] {
+        assert!(
+            failed.err().contains("Timeout limit was reached"),
+            "{failed:?}"
+        );
+    }
+
+    // `return`, the default: what was found, and the warning.
+    let reply = c.cmd(&[
+        "FT.SEARCH",
+        "to",
+        "*",
+        "NOCONTENT",
+        "LIMIT",
+        "0",
+        "0",
+        "TIMEOUT",
+        "1",
+    ]);
+    assert!(warned(&reply), "{reply:?}");
+    assert!(reply.get("total_results").i() < n as i64, "{reply:?}");
+    let reply = count(&mut c, "1");
+    assert!(warned(&reply), "{reply:?}");
+    assert!(
+        first_row(&reply, "c").parse::<usize>().unwrap() < n,
+        "{reply:?}"
+    );
+
+    // A cursor over a partial result says so on every page, not only the
+    // first.
+    let reply = c.cmd(&[
+        "FT.AGGREGATE",
+        "to",
+        "*",
+        "LOAD",
+        "1",
+        "@t",
+        "TIMEOUT",
+        "1",
+        "WITHCURSOR",
+        "COUNT",
+        "10",
+    ]);
+    assert!(warned(&reply.arr()[0]), "{reply:?}");
+    let cursor = reply.arr()[1].i();
+    assert!(cursor > 0, "{reply:?}");
+    let page = c.cmd(&["FT.CURSOR", "READ", "to", &cursor.to_string()]);
+    assert!(warned(&page.arr()[0]), "{page:?}");
+    assert_eq!(page.arr()[0].get("results").arr().len(), 10, "{page:?}");
+    if page.arr()[1].i() != 0 {
+        assert!(c.cmd(&["FT.CURSOR", "DEL", "to", &cursor.to_string()]).ok());
+    }
+
+    // Over RESP2 the same timeout is silent: a count short of the whole,
+    // not an error.
+    let _ = c.cmd(&["HELLO", "2"]);
+    let reply = c.cmd(&[
+        "FT.SEARCH",
+        "to",
+        "*",
+        "NOCONTENT",
+        "LIMIT",
+        "0",
+        "0",
+        "TIMEOUT",
+        "1",
+    ]);
+    assert!(matches!(reply, V::Arr(_)), "{reply:?}");
+    assert!(reply.arr()[0].i() < n as i64, "{reply:?}");
+}
+
+/// A query that runs to the end is whole, however long it took: only one
+/// that was cut short is reported as timed out. A few hundred large
+/// documents take well over 1 ms to match and score, and are fewer than
+/// the scan reads the clock for, so it does run to the end; it used to be
+/// reported as timed out anyway, an error under `ON_TIMEOUT fail`.
+#[test]
+fn a_query_that_finishes_is_not_reported_as_timed_out() {
+    let mut c = own_conn();
+    assert!(matches!(c.cmd(&["HELLO", "3"]), V::Map(_)));
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "tf",
+            "PREFIX",
+            "1",
+            "tf:",
+            "SCHEMA",
+            "t",
+            "TEXT",
+        ])
+        .ok()
+    );
+    let text = "hello world ".repeat(10_000);
+    for i in 0..300 {
+        assert!(matches!(
+            c.cmd(&["HSET", &format!("tf:{i}"), "t", &text]),
+            V::Int(1)
+        ));
+    }
+
+    let started = Instant::now();
+    let reply = c.cmd(&["FT.SEARCH", "tf", "hello", "NOCONTENT", "TIMEOUT", "1"]);
+    let took = started.elapsed();
+    assert_eq!(reply.get("total_results").i(), 300, "{reply:?}");
+    assert!(!warned(&reply), "after {took:?}: {reply:?}");
+
+    let reply = c.cmd(&[
+        "FT.AGGREGATE",
+        "tf",
+        "hello",
+        "TIMEOUT",
+        "1",
+        "GROUPBY",
+        "0",
+        "REDUCE",
+        "COUNT",
+        "0",
+        "AS",
+        "c",
+    ]);
+    assert_eq!(first_row(&reply, "c"), "300", "{reply:?}");
+    assert!(!warned(&reply), "{reply:?}");
+}
+
+/// A TAG filter has no candidates of its own: FT.SEARCH's KNN with one, and
+/// FT.AGGREGATE with one, read every document, and the clock is read
+/// between runs of documents rather than before each. They still stop at
+/// `TIMEOUT`, and with `TIMEOUT 0` they are whole. Grown as in
+/// `a_query_is_cut_short_when_it_runs_out_of_time`.
+#[test]
+fn a_tag_filtered_scan_is_cut_short_when_it_runs_out_of_time() {
+    let mut c = own_conn();
+    assert!(matches!(c.cmd(&["HELLO", "3"]), V::Map(_)));
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "tk",
+            "PREFIX",
+            "1",
+            "tk:",
+            "SCHEMA",
+            "c",
+            "TAG",
+            "v",
+            "VECTOR",
+            "FLAT",
+            "6",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            "4",
+            "DISTANCE_METRIC",
+            "L2",
+        ])
+        .ok()
+    );
+    let q = [0.0f32, 1.0, 2.0, 3.0];
+    let knn = |c: &mut Conn, timeout: &str| -> V {
+        search_with_vector(
+            c,
+            "tk",
+            "(@c:{red})=>[KNN 10 @v $q]",
+            &q,
+            &["NOCONTENT", "TIMEOUT", timeout],
+        )
+    };
+
+    let mut n = 0usize;
+    let mut timed_out = false;
+    while n < 400_000 {
+        hset_tagged_many(&mut c, "tk:", n, 8_000);
+        n += 8_000;
+        if warned(&knn(&mut c, "1")) && warned(&knn(&mut c, "1")) {
+            timed_out = true;
+            break;
+        }
+    }
+    assert!(timed_out, "TIMEOUT 1 still finished after {n} documents");
+    hset_tagged_many(&mut c, "tk:", n, 4 * n);
+    n *= 5;
+
+    // `TIMEOUT 0`: the ten nearest red documents, 0, 2, … 18, in order.
+    let all = knn(&mut c, "0");
+    assert!(!warned(&all), "{all:?}");
+    let keys: Vec<String> = all
+        .get("results")
+        .arr()
+        .iter()
+        .map(|r| r.get("id").s().to_string())
+        .collect();
+    let nearest: Vec<String> = (0..10).map(|i| format!("tk:{}", 2 * i)).collect();
+    assert_eq!(keys, nearest, "{all:?}");
+
+    let cut = knn(&mut c, "1");
+    assert!(warned(&cut), "{cut:?}");
+
+    let count = |c: &mut Conn, timeout: &str| -> V {
+        c.cmd(&[
+            "FT.AGGREGATE",
+            "tk",
+            "@c:{red}",
+            "TIMEOUT",
+            timeout,
+            "GROUPBY",
+            "0",
+            "REDUCE",
+            "COUNT",
+            "0",
+            "AS",
+            "n",
+        ])
+    };
+    let all = count(&mut c, "0");
+    assert!(!warned(&all), "{all:?}");
+    assert_eq!(first_row(&all, "n"), (n / 2).to_string(), "{all:?}");
+    let cut = count(&mut c, "1");
+    assert!(warned(&cut), "{cut:?}");
+    assert!(
+        first_row(&cut, "n").parse::<usize>().unwrap() < n / 2,
+        "{cut:?}"
+    );
+
+    // Under `ON_TIMEOUT fail`, an error.
+    assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "fail"]).ok());
+    let search = knn(&mut c, "1");
+    let aggregate = count(&mut c, "1");
+    assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "return"]).ok());
+    for failed in [search, aggregate] {
+        assert!(
+            failed.err().contains("Timeout limit was reached"),
+            "{failed:?}"
+        );
+    }
+}
+
+/// FT.AGGREGATE's `TIMEOUT` is the option where an option can be, not a word
+/// of another clause: an `APPLY … AS TIMEOUT`, or a parameter of that name,
+/// was taken for it, and the word after it for the milliseconds.
+#[test]
+fn an_aggregate_word_named_timeout_is_not_the_option() {
+    let mut c = conn();
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "tn",
+            "PREFIX",
+            "1",
+            "tn:",
+            "SCHEMA",
+            "n",
+            "NUMERIC",
+            "c",
+            "TAG",
+        ])
+        .ok()
+    );
+    c.cmd(&["HSET", "tn:1", "n", "1", "c", "red"]);
+    c.cmd(&["HSET", "tn:2", "n", "2", "c", "blue"]);
+
+    let reply = c.cmd(&[
+        "FT.AGGREGATE",
+        "tn",
+        "*",
+        "LOAD",
+        "1",
+        "@n",
+        "APPLY",
+        "@n*10",
+        "AS",
+        "TIMEOUT",
+        "SORTBY",
+        "2",
+        "@n",
+        "ASC",
+    ]);
+    assert_eq!(reply.arr()[0].i(), 2, "{reply:?}");
+    assert_eq!(
+        reply.arr()[1].pairs(),
+        [
+            ("n".to_string(), "1".to_string()),
+            ("TIMEOUT".to_string(), "10".to_string())
+        ],
+        "{reply:?}"
+    );
+
+    let reply = c.cmd(&[
+        "FT.AGGREGATE",
+        "tn",
+        "@c:{$TIMEOUT}",
+        "PARAMS",
+        "2",
+        "TIMEOUT",
+        "red",
+        "LOAD",
+        "1",
+        "@n",
+        "DIALECT",
+        "2",
+    ]);
+    assert_eq!(reply.arr()[0].i(), 1, "{reply:?}");
+    assert_eq!(
+        reply.arr()[1].pairs(),
+        [("n".to_string(), "1".to_string())],
+        "{reply:?}"
+    );
+
+    // The option itself, after them, is still read, and checked.
+    assert!(
+        c.cmd(&[
+            "FT.AGGREGATE",
+            "tn",
+            "*",
+            "APPLY",
+            "@n",
+            "AS",
+            "TIMEOUT",
+            "TIMEOUT",
+            "soon",
+        ])
+        .err()
+        .contains("TIMEOUT")
+    );
 }

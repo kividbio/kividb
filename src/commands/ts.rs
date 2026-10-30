@@ -14,6 +14,7 @@ use crate::resp::write::{
     resp_array, resp_bulk_str, resp_error, resp_integer, resp_null_bulk, resp_simple,
 };
 use crate::store::Key;
+use crate::store::ValueRef;
 use crate::store::{self, SharedTsIndex, Store};
 use crate::types::{CompactionRule, DuplicatePolicy, KiviDBValue, TsAggregation, TsInner};
 use crate::{read_lock, write_lock};
@@ -269,7 +270,7 @@ pub(super) fn keys_matching_filters(
             for shard in db.iter() {
                 let map = read_lock!(shard);
                 for (k, v) in map.iter() {
-                    if matches!(v, KiviDBValue::TimeSeries(_)) {
+                    if matches!(v, ValueRef::TimeSeries(_)) {
                         all.push(k.to_string());
                     }
                 }
@@ -284,7 +285,7 @@ pub(super) fn keys_matching_filters(
         .filter(|k| {
             let shard = store::get_shard(db, k);
             let map = read_lock!(shard);
-            if let Some(KiviDBValue::TimeSeries(inner)) = map.get(k.as_str()) {
+            if let Some(ValueRef::TimeSeries(inner)) = map.get(k.as_str()) {
                 // Clone just the labels AHashMap — cheap for small label sets
                 let labels = inner.read().labels.clone();
                 filters.iter().all(|f| f.matches(&labels))
@@ -305,10 +306,12 @@ fn series_for_append(ctx: &Ctx, key: &str) -> Result<(Series, bool), Vec<u8>> {
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     let mut map = write_lock!(shard);
     match map.get(key) {
-        Some(KiviDBValue::TimeSeries(inner)) => Ok((Arc::clone(inner), false)),
+        Some(ValueRef::TimeSeries(inner)) => Ok((Arc::clone(inner), false)),
         Some(_) => Err(resp_error(WRONGTYPE)),
         None => {
-            let series: Series = Arc::new(RwLock::new(TsInner::new()));
+            let mut fresh = TsInner::new();
+            fresh.duplicate_policy = DuplicatePolicy::server_default();
+            let series: Series = Arc::new(RwLock::new(fresh));
             map.insert(Key::from(key), KiviDBValue::TimeSeries(Arc::clone(&series)));
             Ok((series, true))
         }
@@ -326,28 +329,40 @@ fn series_for_append(ctx: &Ctx, key: &str) -> Result<(Series, bool), Vec<u8>> {
 /// rule never got past 2. It also ran for `TS.ADD` alone — samples written
 /// with `TS.MADD`, `TS.INCRBY` or `TS.DECRBY` never reached a compaction.
 ///
-/// The destination's open bucket is therefore always current, which is what
-/// `LATEST` asks for on a range query.
+/// As RedisTimeSeries: a bucket is written to the destination once it has
+/// closed, when the first sample of a later one arrives, and again if a
+/// sample is added to it after; the bucket still open is reported only to
+/// `LATEST` ([`ts_query::open_bucket`]). The open bucket was written as
+/// samples came, so a reader saw partial values as final (#128).
 fn after_append(ctx: &Ctx, key: &str, series: &Series, ts: u64) {
     let updates: Vec<(String, u64, f64)> = {
         let source = series.read();
+        let Some(&newest) = source.samples.keys().next_back() else {
+            return;
+        };
         source
             .rules
             .iter()
             .filter(|rule| rule.bucket_duration > 0 && rule.dest_key != key)
-            .map(|rule| {
-                let start = ts_query::bucket_start(ts, rule.align_timestamp, rule.bucket_duration);
-                let end = start + rule.bucket_duration as i128;
-                let first = start.max(0) as u64;
-                let last = (end - 1).clamp(0, u64::MAX as i128) as u64;
-                let samples: Vec<(u64, f64)> = source
-                    .samples
-                    .range(first..=last)
-                    .map(|(t, v)| (*t, *v))
-                    .collect();
-                let value =
-                    ts_query::aggregate_bucket(&rule.aggregation, &samples, &source, start, end);
-                (rule.dest_key.clone(), first, value)
+            .filter_map(|rule| {
+                let bucket_of =
+                    |t: u64| ts_query::bucket_start(t, rule.align_timestamp, rule.bucket_duration);
+                let (start, open) = (bucket_of(ts), bucket_of(newest));
+                let closed = if start < open {
+                    // A bucket that had closed, changed.
+                    start
+                } else {
+                    // The open one: if this is its first sample, the one
+                    // before it has just closed.
+                    let (first, last) = ts_query::bucket_bounds(start, rule.bucket_duration);
+                    if source.samples.range(first..=last).nth(1).is_some() {
+                        return None;
+                    }
+                    let (&before, _) = source.samples.range(..first).next_back()?;
+                    bucket_of(before)
+                };
+                let (first, value) = ts_query::bucket_value(&source, rule, closed);
+                Some((rule.dest_key.clone(), first, value))
             })
             .collect()
     };
@@ -355,7 +370,7 @@ fn after_append(ctx: &Ctx, key: &str, series: &Series, ts: u64) {
         let dest = {
             let shard = store::get_shard(&ctx.store[*ctx.selected_db], &dest_key);
             match read_lock!(shard).get(dest_key.as_str()) {
-                Some(KiviDBValue::TimeSeries(inner)) => Arc::clone(inner),
+                Some(ValueRef::TimeSeries(inner)) => Arc::clone(inner),
                 // The destination was deleted or replaced; the rule is dead.
                 _ => continue,
             }
@@ -431,9 +446,7 @@ fn ts_create(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let mut ts = TsInner::new();
     ts.retention = retention;
     ts.chunk_size = chunk_size;
-    if let Some(dp) = dup_policy {
-        ts.duplicate_policy = dp;
-    }
+    ts.duplicate_policy = dup_policy.unwrap_or_else(DuplicatePolicy::server_default);
     for (lk, lv) in &labels {
         ts.labels.insert(lk.clone(), lv.clone());
     }
@@ -472,7 +485,7 @@ fn ts_alter(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = write_lock!(shard);
 
     match map.get(key.as_str()) {
-        Some(KiviDBValue::TimeSeries(inner)) => {
+        Some(ValueRef::TimeSeries(inner)) => {
             let mut ts = inner.write();
             let old_labels = ts.labels.clone();
 
@@ -634,7 +647,7 @@ fn ts_madd(ctx: &mut Ctx) -> Option<Vec<u8>> {
         let existing = {
             let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
             match read_lock!(shard).get(key) {
-                Some(KiviDBValue::TimeSeries(inner)) => Ok(Arc::clone(inner)),
+                Some(ValueRef::TimeSeries(inner)) => Ok(Arc::clone(inner)),
                 Some(_) => Err(resp_error(WRONGTYPE)),
                 None => Err(resp_error("TSDB: the key does not exist")),
             }
@@ -772,7 +785,7 @@ fn ts_del(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = read_lock!(shard);
 
     match map.get(key.as_str()) {
-        Some(KiviDBValue::TimeSeries(inner)) => {
+        Some(ValueRef::TimeSeries(inner)) => {
             let mut ts = inner.write();
             // BTreeMap has no retain-with-range, so we collect keys to remove first
             // Teaching: this is O(N) over the range — unavoidable for correctness
@@ -809,25 +822,27 @@ fn ts_get(ctx: &mut Ctx) -> Option<Vec<u8>> {
         Err(_) => return Some(resp_error("ERR key must be valid UTF-8")),
     };
 
-    let db = &ctx.store[*ctx.selected_db];
-    let shard = store::get_shard(db, key);
-    let map = read_lock!(shard);
-
-    match map.get(key) {
-        Some(KiviDBValue::TimeSeries(inner)) => {
-            let ts = inner.read();
-            match ts.last_ts {
-                Some(lt) => {
-                    let val = ts.samples.get(&lt).copied().unwrap_or(0.0);
-                    Some(ts_query::sample_reply(resp, lt, val))
-                }
-                None => Some(resp_array(vec![])), // empty series
-            }
+    let latest = match cmd.get(2) {
+        None => false,
+        Some(arg) if arg.eq_ignore_ascii_case(b"LATEST") && cmd.len() == 3 => true,
+        Some(_) => return Some(resp_error("ERR syntax error")),
+    };
+    let inner = match ts_query::series_at(ctx, key) {
+        Ok(Some(inner)) => inner,
+        Ok(None) => return Some(resp_null_bulk()),
+        Err(e) => return Some(e),
+    };
+    // A compaction's bucket still open, with `LATEST` (#128).
+    if latest && let Some((at, value)) = ts_query::open_bucket(ctx, &inner, key) {
+        return Some(ts_query::sample_reply(resp, at, value));
+    }
+    let ts = inner.read();
+    match ts.last_ts {
+        Some(lt) => {
+            let val = ts.samples.get(&lt).copied().unwrap_or(0.0);
+            Some(ts_query::sample_reply(resp, lt, val))
         }
-        Some(_) => Some(resp_error(
-            "WRONGTYPE Operation against a key holding the wrong kind of value",
-        )),
-        None => Some(resp_null_bulk()),
+        None => Some(resp_array(vec![])), // empty series
     }
 }
 
@@ -842,6 +857,7 @@ fn ts_mget(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let mut selected_labels: Vec<String> = Vec::new();
     let mut filters: Vec<LabelFilter> = Vec::new();
     let mut filter_started = false;
+    let mut latest = false;
 
     let mut i = 1;
     while i < cmd.len() {
@@ -849,7 +865,7 @@ fn ts_mget(ctx: &mut Ctx) -> Option<Vec<u8>> {
             .unwrap_or("")
             .to_ascii_uppercase();
         match tok.as_str() {
-            "LATEST" => {}
+            "LATEST" => latest = true,
             "WITHLABELS" => {
                 withlabels = true;
             }
@@ -888,14 +904,17 @@ fn ts_mget(ctx: &mut Ctx) -> Option<Vec<u8>> {
     }
 
     let matching_keys = keys_matching_filters(ctx.store, *ctx.selected_db, ctx.ts_index, &filters);
-    let db = &ctx.store[*ctx.selected_db];
     let mut results = Vec::new();
 
     for k in &matching_keys {
-        let shard = store::get_shard(db, k);
-        let map = read_lock!(shard);
-
-        if let Some(KiviDBValue::TimeSeries(inner)) = map.get(k.as_str()) {
+        // The series, and no shard held while it is read: `LATEST` reads its
+        // source's as well.
+        if let Ok(Some(inner)) = ts_query::series_at(ctx, k) {
+            let open = if latest {
+                ts_query::open_bucket(ctx, &inner, k)
+            } else {
+                None
+            };
             let ts = inner.read();
 
             // Labels portion
@@ -920,13 +939,14 @@ fn ts_mget(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 resp_array(vec![])
             };
 
-            // Latest sample
-            let sample_resp = match ts.last_ts {
-                Some(lt) => {
+            // Latest sample: with `LATEST`, a compaction's open bucket.
+            let sample_resp = match (open, ts.last_ts) {
+                (Some((at, value)), _) => ts_query::sample_reply(resp, at, value),
+                (None, Some(lt)) => {
                     let val = ts.samples.get(&lt).copied().unwrap_or(0.0);
                     ts_query::sample_reply(resp, lt, val)
                 }
-                None => resp_array(vec![]),
+                (None, None) => resp_array(vec![]),
             };
 
             results.push(resp_array(vec![resp_bulk_str(k), labels_resp, sample_resp]));
@@ -939,6 +959,7 @@ fn ts_mget(ctx: &mut Ctx) -> Option<Vec<u8>> {
 // ── TS.INFO ───────────────────────────────────────────────────────────────────
 
 fn ts_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
+    let resp = crate::commands::handler::effective_resp_for_reply(ctx);
     let cmd = &ctx.cmd;
     if cmd.len() < 2 {
         return Some(resp_error(
@@ -955,7 +976,7 @@ fn ts_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        Some(KiviDBValue::TimeSeries(inner)) => {
+        Some(ValueRef::TimeSeries(inner)) => {
             let ts = inner.read();
             let mut out = Vec::new();
 
@@ -988,6 +1009,13 @@ fn ts_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 .map(|(lk, lv)| resp_array(vec![resp_bulk_str(lk), resp_bulk_str(lv)]))
                 .collect();
             out.push(resp_array(label_pairs));
+
+            out.push(resp_bulk_str("sourceKey"));
+            out.push(match &ts.source {
+                Some(source) => resp_bulk_str(source),
+                // RESP3's null to a RESP3 client: `$-1` there breaks it.
+                None => crate::resp::write::resp_null_for(resp),
+            });
 
             // Rules
             out.push(resp_bulk_str("rules"));
@@ -1078,13 +1106,16 @@ fn ts_createrule(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "TSDB: the source key and destination key should be different",
         ));
     }
-    {
-        let dest_shard = store::get_shard(&ctx.store[*ctx.selected_db], &dest_key);
-        match read_lock!(dest_shard).get(dest_key.as_str()) {
-            Some(KiviDBValue::TimeSeries(_)) => {}
-            Some(_) => return Some(resp_error(WRONGTYPE)),
-            None => return Some(resp_error("TSDB: the key does not exist")),
-        }
+    let dest = match ts_query::series_at(ctx, &dest_key) {
+        Ok(Some(dest)) => dest,
+        Ok(None) => return Some(resp_error("TSDB: the key does not exist")),
+        Err(e) => return Some(e),
+    };
+    // As RedisTimeSeries: a compaction has one source.
+    if dest.read().source.is_some() {
+        return Some(resp_error(
+            "TSDB: the destination key already has a src rule",
+        ));
     }
     let align: u64 = cmd
         .get(6)
@@ -1104,13 +1135,16 @@ fn ts_createrule(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = write_lock!(shard);
 
     match map.get(src_key.as_str()) {
-        Some(KiviDBValue::TimeSeries(inner)) => {
+        Some(ValueRef::TimeSeries(inner)) => {
             let mut ts = inner.write();
             // Disallow duplicate destination rules
             if ts.rules.iter().any(|r| r.dest_key == rule.dest_key) {
                 return Some(resp_error("TSDB: compaction rule already exists"));
             }
             ts.rules.push(rule);
+            drop(ts);
+            drop(map);
+            dest.write().source = Some(src_key);
             Some(resp_simple("OK"))
         }
         Some(_) => Some(resp_error(
@@ -1143,13 +1177,21 @@ fn ts_deleterule(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = write_lock!(shard);
 
     match map.get(src_key.as_str()) {
-        Some(KiviDBValue::TimeSeries(inner)) => {
+        Some(ValueRef::TimeSeries(inner)) => {
             let mut ts = inner.write();
             let before = ts.rules.len();
             ts.rules.retain(|r| r.dest_key != dest_key);
             if ts.rules.len() == before {
                 Some(resp_error("TSDB: compaction rule does not exist"))
             } else {
+                drop(ts);
+                drop(map);
+                if let Ok(Some(dest)) = ts_query::series_at(ctx, &dest_key) {
+                    let mut dest = dest.write();
+                    if dest.source.as_deref() == Some(src_key.as_str()) {
+                        dest.source = None;
+                    }
+                }
                 Some(resp_simple("OK"))
             }
         }

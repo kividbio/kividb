@@ -582,10 +582,10 @@ fn test_vsim_withscores() {
 
     assert_eq!(arr[2].as_str(), "b");
     let score_b: f32 = arr[3].as_str().parse().unwrap();
-    // Cosine similarity of orthogonal vectors = 0.0
+    // Orthogonal vectors: 0.5, as Redis scores cosine, (1 + cosine) / 2 (#171)
     assert!(
-        score_b < 0.01,
-        "orthogonal vector similarity should be ~0.0, got {score_b}"
+        (score_b - 0.5).abs() < 0.01,
+        "orthogonal vector similarity should be ~0.5, got {score_b}"
     );
 }
 
@@ -1005,7 +1005,9 @@ fn test_vset_full_workflow() {
 // 3. VSIM / VLINKS — distance metric honoured
 // ═════════════════════════════════════════════════════════════════════════════
 
-// Scenario: cosine similarity (default) — identical vectors score 1.0
+// Scenario: cosine similarity (default), scored as Redis does (#171):
+// (1 + cosine) / 2, so identical vectors score 1.0, vectors at right angles
+// 0.5, and opposite vectors 0.0
 //   VADD vs VALUES 3 1 0 0 a
 //   VADD vs VALUES 3 1 0 0 b  (identical to a)
 //   VSIM vs ELE a WITHSCORES → b first with score ~1.0
@@ -1018,8 +1020,9 @@ fn test_vsim_cosine_default() {
     c.cmds(&["VADD", "vs", "VALUES", "3", "1", "0", "0", "a"]);
     c.cmds(&["VADD", "vs", "VALUES", "3", "1", "0", "0", "b"]); // identical direction
     c.cmds(&["VADD", "vs", "VALUES", "3", "0", "1", "0", "c"]); // orthogonal to a
+    c.cmds(&["VADD", "vs", "VALUES", "3", "-1", "0", "0", "d"]); // opposite to a
 
-    let r = c.cmds(&["VSIM", "vs", "ELE", "a", "WITHSCORES", "COUNT", "3"]);
+    let r = c.cmds(&["VSIM", "vs", "ELE", "a", "WITHSCORES", "COUNT", "4"]);
     let arr = r.as_array();
     // Results: a(1.0), b(1.0), c(0.0) — a and b are identical, c is orthogonal
     // a itself may or may not be included depending on implementation
@@ -1043,10 +1046,16 @@ fn test_vsim_cosine_default() {
             bs > 0.99,
             "identical vectors should have similarity ~1.0, got {bs}"
         );
-        // c should be ~0.0 similarity with a (orthogonal)
+        // c is at right angles to a: 0.5, as in Redis
         assert!(
-            cs < 0.01,
-            "orthogonal vectors should have similarity ~0.0, got {cs}"
+            (cs - 0.5).abs() < 0.01,
+            "orthogonal vectors should have similarity ~0.5, got {cs}"
+        );
+        let d_score = pairs.iter().find(|(n, _)| *n == "d").map(|(_, s)| *s);
+        // d is opposite: 0.0, the lowest score, never negative
+        assert!(
+            d_score.is_some_and(|ds| ds.abs() < 0.01),
+            "opposite vectors should have similarity ~0.0, got {d_score:?}"
         );
     }
 }
@@ -1117,8 +1126,8 @@ fn test_vsim_explicit_cosine_metric() {
     let b_score = pairs.iter().find(|(n, _)| *n == "b").map(|(_, s)| *s);
     if let Some(bs) = b_score {
         assert!(
-            bs < 0.1,
-            "orthogonal vectors (cosine) should score ~0.0, got {bs}"
+            (bs - 0.5).abs() < 0.1,
+            "orthogonal vectors (cosine) should score ~0.5, got {bs}"
         );
     }
 }
@@ -1292,4 +1301,94 @@ fn test_vlinks_missing_key() {
     let mut c = Conn::connect(port);
 
     assert!(c.cmds(&["VLINKS", "nokey", "a"]).is_nil());
+}
+
+/// `VSIM ... FILTER` keeps the elements whose attributes pass, as in Redis;
+/// it was taken and ignored. `REDUCE` is refused rather than ignored, and
+/// `VINFO` says the vectors are kept at full precision (#132).
+#[test]
+fn test_vsim_filter_reduce_and_quantization() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&["VADD", "points", "VALUES", "3", "1", "0", "0", "a"]);
+    c.cmds(&[
+        "VADD",
+        "points",
+        "VALUES",
+        "3",
+        "0.9",
+        "0.1",
+        "0",
+        "b",
+        "SETATTR",
+        r#"{"color":"blue","size":1}"#,
+    ]);
+    c.cmds(&[
+        "VADD",
+        "points",
+        "VALUES",
+        "3",
+        "0",
+        "1",
+        "0",
+        "c",
+        "SETATTR",
+        r#"{"color":"red","size":3}"#,
+    ]);
+    let names = |reply: &RespValue| -> Vec<String> {
+        reply
+            .as_array()
+            .iter()
+            .map(|v| v.as_str().to_string())
+            .collect()
+    };
+    let all = c.cmds(&["VSIM", "points", "VALUES", "3", "1", "0", "0"]);
+    assert_eq!(names(&all), ["a", "b", "c"]);
+    let red = c.cmds(&[
+        "VSIM",
+        "points",
+        "VALUES",
+        "3",
+        "1",
+        "0",
+        "0",
+        "FILTER",
+        r#".color == "red""#,
+    ]);
+    assert_eq!(names(&red), ["c"]);
+    let sized = c.cmds(&[
+        "VSIM",
+        "points",
+        "VALUES",
+        "3",
+        "1",
+        "0",
+        "0",
+        "FILTER",
+        ".size >= 1 and .size < 3",
+    ]);
+    assert_eq!(names(&sized), ["b"]);
+    let bad = c.cmds(&[
+        "VSIM", "points", "VALUES", "3", "1", "0", "0", "FILTER", "(.size",
+    ]);
+    assert!(bad.is_error(), "{bad:?}");
+
+    let reduce = c.cmds(&[
+        "VADD", "q", "REDUCE", "2", "VALUES", "4", "1", "2", "3", "4", "x",
+    ]);
+    assert!(reduce.is_error(), "{reduce:?}");
+
+    assert_eq!(
+        c.cmds(&["VADD", "r", "VALUES", "2", "0", "0", "o", "Q8"])
+            .as_int(),
+        1
+    );
+    let info = c.cmds(&["VINFO", "r"]);
+    let info = info.as_array();
+    let at = info
+        .iter()
+        .position(|v| matches!(v, RespValue::Bulk(b) if b == b"quant-type"))
+        .expect("quant-type");
+    assert_eq!(info[at + 1].as_str(), "f32");
 }

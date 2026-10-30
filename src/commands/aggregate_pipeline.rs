@@ -102,12 +102,94 @@ fn parse_sort_keys(words: &[String]) -> Vec<(String, bool)> {
     keys
 }
 
+/// The number at `cmd[i]`, or 0.
+fn count_at(cmd: &[&[u8]], i: usize) -> usize {
+    cmd.get(i)
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+/// Where the clause at `cmd[i]` ends: what [`run`] steps over for it,
+/// without running it.
+fn clause_end(cmd: &[&[u8]], i: usize) -> usize {
+    let is = |at: usize, word: &str| {
+        cmd.get(at)
+            .is_some_and(|a| a.eq_ignore_ascii_case(word.as_bytes()))
+    };
+    let clause = String::from_utf8_lossy(cmd[i]).to_ascii_uppercase();
+    match clause.as_str() {
+        "LOAD" if cmd.get(i + 1).is_some_and(|a| *a == b"*") => i + 2,
+        "LOAD" | "PARAMS" => i + 2 + count_at(cmd, i + 1),
+        "GROUPBY" => {
+            let mut at = i + 2 + count_at(cmd, i + 1);
+            while is(at, "REDUCE") {
+                at += 3 + count_at(cmd, at + 2);
+                if is(at, "AS") {
+                    at += 2;
+                }
+            }
+            at
+        }
+        "APPLY" if is(i + 2, "AS") => i + 4,
+        "APPLY" | "FILTER" | "DIALECT" | "SCORER" | "TIMEOUT" => i + 2,
+        "SORTBY" => {
+            let at = i + 2 + count_at(cmd, i + 1);
+            if is(at, "MAX") { at + 2 } else { at }
+        }
+        "LIMIT" => i + 3,
+        "WITHCURSOR" => {
+            let mut at = i + 1;
+            while is(at, "COUNT") || is(at, "MAXIDLE") {
+                at += 2;
+            }
+            at
+        }
+        _ => i + 1,
+    }
+}
+
+/// Where the option `name` (`TIMEOUT`, ...) is in the clauses from
+/// `cmd[start]` on, walked clause by clause as [`run`] walks them: a word
+/// inside a clause (an `APPLY`'s `AS timeout`, a parameter's name or value,
+/// a `FILTER`'s expression) is not the option.
+pub fn option_at(cmd: &[&[u8]], start: usize, name: &str) -> Option<usize> {
+    let mut i = start;
+    while i < cmd.len() {
+        if cmd[i].eq_ignore_ascii_case(name.as_bytes()) {
+            return Some(i);
+        }
+        i = clause_end(cmd, i);
+    }
+    None
+}
+
 /// Execute pipeline clauses starting at cmd[start_idx]. Returns the
 /// transformed rows. On an unrecognised clause we advance past it (lenient
 /// behaviour matching the existing ft_aggregate implementation), which
 /// handles tokens like SCORER/DIALECT that ft_search consumes earlier.
-pub fn run(mut rows: Vec<Row>, cmd: &[&[u8]], start_idx: usize) -> Vec<Row> {
+pub fn run(rows: Vec<Row>, cmd: &[&[u8]], start_idx: usize) -> Vec<Row> {
+    run_within(rows, cmd, start_idx, None).0
+}
+
+/// [`run`], stopping when `deadline` has passed; then the second value is
+/// true. A step cut short keeps only what it finished (an `APPLY` the rows
+/// it computed, a `FILTER` the rows it found good, a `GROUPBY` the groups
+/// of the rows it read, or the groups it reduced), a sort with no time left
+/// is left out, and so are the steps after it, but `LIMIT`, which is cheap
+/// and bounds the reply. Under [`DEADLINE_EVERY`] rows no step reads the
+/// clock.
+///
+/// [`DEADLINE_EVERY`]: crate::commands::search::DEADLINE_EVERY
+pub fn run_within(
+    mut rows: Vec<Row>,
+    cmd: &[&[u8]],
+    start_idx: usize,
+    deadline: Option<std::time::Instant>,
+) -> (Vec<Row>, bool) {
+    use crate::commands::search::{deadline_due, no_time_for};
     let mut i = start_idx;
+    let mut cut = false;
 
     while i < cmd.len() {
         let clause = match std::str::from_utf8(cmd[i]) {
@@ -117,6 +199,10 @@ pub fn run(mut rows: Vec<Row>, cmd: &[&[u8]], start_idx: usize) -> Vec<Row> {
                 continue;
             }
         };
+        if cut && clause != "LIMIT" {
+            i = clause_end(cmd, i);
+            continue;
+        }
 
         match clause.as_str() {
             "LOAD" => {
@@ -137,7 +223,7 @@ pub fn run(mut rows: Vec<Row>, cmd: &[&[u8]], start_idx: usize) -> Vec<Row> {
             }
 
             "GROUPBY" => {
-                let (consumed, new_rows) = run_groupby(rows, cmd, i);
+                let (consumed, new_rows) = run_groupby(rows, cmd, i, deadline, &mut cut);
                 rows = new_rows;
                 i = consumed;
             }
@@ -169,10 +255,18 @@ pub fn run(mut rows: Vec<Row>, cmd: &[&[u8]], start_idx: usize) -> Vec<Row> {
                             expr_str.to_string()
                         };
 
-                        for row in rows.iter_mut() {
+                        let mut seen = 0u32;
+                        let mut done = rows.len();
+                        for (at, row) in rows.iter_mut().enumerate() {
+                            if deadline_due(deadline, &mut seen) {
+                                done = at;
+                                cut = true;
+                                break;
+                            }
                             let value = crate::commands::expr::eval(&ast, row).to_resp_string();
                             row.insert(alias.clone(), value);
                         }
+                        rows.truncate(done);
                     } else {
                         i += 1;
                     }
@@ -185,7 +279,13 @@ pub fn run(mut rows: Vec<Row>, cmd: &[&[u8]], start_idx: usize) -> Vec<Row> {
                     if let Ok(expr_str) = std::str::from_utf8(expr_bytes)
                         && let Some(ast) = crate::commands::expr::parse(expr_str)
                     {
-                        rows.retain(|row| crate::commands::expr::eval(&ast, row).is_truthy());
+                        let mut seen = 0u32;
+                        rows.retain(|row| {
+                            if !cut && deadline_due(deadline, &mut seen) {
+                                cut = true;
+                            }
+                            !cut && crate::commands::expr::eval(&ast, row).is_truthy()
+                        });
                     }
                     i += 1;
                 }
@@ -233,7 +333,11 @@ pub fn run(mut rows: Vec<Row>, cmd: &[&[u8]], start_idx: usize) -> Vec<Row> {
                     sort_keys.push((field, ascending));
                 }
 
-                rows.sort_by(|a, b| compare_rows(a, b, &sort_keys));
+                if no_time_for(deadline, rows.len()) {
+                    cut = true;
+                } else {
+                    rows.sort_by(|a, b| compare_rows(a, b, &sort_keys));
+                }
 
                 // `MAX n`: only the first n are wanted.
                 if cmd.get(i).is_some_and(|a| a.eq_ignore_ascii_case(b"MAX")) {
@@ -295,7 +399,7 @@ pub fn run(mut rows: Vec<Row>, cmd: &[&[u8]], start_idx: usize) -> Vec<Row> {
         }
     }
 
-    rows
+    (rows, cut)
 }
 
 // ── GROUPBY + REDUCE ────────────────────────────────────────────────────────
@@ -303,7 +407,14 @@ pub fn run(mut rows: Vec<Row>, cmd: &[&[u8]], start_idx: usize) -> Vec<Row> {
 // Extracted as its own function to keep `run` readable. Returns the
 // post-clause cursor index and the new rows.
 
-fn run_groupby(rows: Vec<Row>, cmd: &[&[u8]], start: usize) -> (usize, Vec<Row>) {
+fn run_groupby(
+    rows: Vec<Row>,
+    cmd: &[&[u8]],
+    start: usize,
+    deadline: Option<std::time::Instant>,
+    cut: &mut bool,
+) -> (usize, Vec<Row>) {
+    use crate::commands::search::{DEADLINE_EVERY, deadline_due, past_deadline};
     let mut i = start + 1; // skip GROUPBY
 
     let nargs = cmd
@@ -387,7 +498,12 @@ fn run_groupby(rows: Vec<Row>, cmd: &[&[u8]], start: usize) -> (usize, Vec<Row>)
     // The rows of each group, groups in the order they first appear.
     let mut index: ahash::AHashMap<Vec<String>, usize> = ahash::AHashMap::new();
     let mut groups: Vec<(Vec<String>, Vec<&Row>)> = Vec::new();
+    let mut seen = 0u32;
     for row in &rows {
+        if deadline_due(deadline, &mut seen) {
+            *cut = true;
+            break;
+        }
         let key: Vec<String> = group_props
             .iter()
             .map(|p| row.get(p).cloned().unwrap_or_default())
@@ -400,7 +516,20 @@ fn run_groupby(rows: Vec<Row>, cmd: &[&[u8]], start: usize) -> (usize, Vec<Row>)
     }
 
     let mut new_rows: Vec<Row> = Vec::with_capacity(groups.len());
+    // A group's reducers cost as many rows as it has: the clock is read
+    // every DEADLINE_EVERY rows reduced, however they are grouped. Grouping
+    // cut short, the groups of the rows it read are reduced whole: that is
+    // no more work than reading them was.
+    let mut reduced = 0usize;
     for (group_key, members) in &groups {
+        if !*cut && reduced >= DEADLINE_EVERY as usize {
+            reduced = 0;
+            if past_deadline(deadline) {
+                *cut = true;
+                break;
+            }
+        }
+        reduced += members.len();
         let mut row: Row = ahash::AHashMap::new();
         for (prop, val) in group_props.iter().zip(group_key.iter()) {
             row.insert(prop.clone(), val.clone());
@@ -606,4 +735,107 @@ fn collect(args: &[String], members: &[&Row]) -> String {
         entries = entries.into_iter().skip(offset).take(count).collect();
     }
     nested(&Value::Array(entries))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn words(line: &str) -> Vec<&[u8]> {
+        line.split(' ').map(str::as_bytes).collect()
+    }
+
+    /// An option is found where an option can be, not inside another
+    /// clause that has a word of the same name.
+    #[test]
+    fn an_option_is_found_only_where_an_option_is() {
+        let at = |line: &str| option_at(&words(line), 3, "TIMEOUT");
+        assert_eq!(at("FT.AGGREGATE idx * TIMEOUT 5"), Some(3));
+        assert_eq!(at("FT.AGGREGATE idx * LOAD 1 @t TIMEOUT 5"), Some(6));
+        assert_eq!(at("FT.AGGREGATE idx * APPLY @t AS TIMEOUT"), None);
+        assert_eq!(
+            at("FT.AGGREGATE idx * APPLY @t AS timeout TIMEOUT 7"),
+            Some(7)
+        );
+        assert_eq!(at("FT.AGGREGATE idx * PARAMS 2 TIMEOUT 5"), None);
+        assert_eq!(at("FT.AGGREGATE idx * PARAMS 2 x TIMEOUT"), None);
+        assert_eq!(at("FT.AGGREGATE idx * FILTER TIMEOUT"), None);
+        assert_eq!(at("FT.AGGREGATE idx * LOAD 2 @a TIMEOUT"), None);
+        assert_eq!(
+            at(
+                "FT.AGGREGATE idx * GROUPBY 1 @a REDUCE COUNT 0 AS TIMEOUT SORTBY 2 @TIMEOUT DESC MAX 3"
+            ),
+            None
+        );
+        assert_eq!(
+            at("FT.AGGREGATE idx * GROUPBY 1 @a REDUCE SUM 1 @b AS s WITHCURSOR COUNT 2 TIMEOUT 9"),
+            Some(15)
+        );
+        assert_eq!(
+            at("FT.AGGREGATE idx * LIMIT 0 10 DIALECT 2 TIMEOUT 1"),
+            Some(8)
+        );
+    }
+
+    fn rows(n: usize) -> Vec<Row> {
+        (0..n)
+            .map(|i| {
+                let mut row = Row::new();
+                row.insert("n".to_string(), i.to_string());
+                row.insert("g".to_string(), (i % 3).to_string());
+                row
+            })
+            .collect()
+    }
+
+    /// Past the deadline a pipeline stops, keeping only rows it finished;
+    /// under DEADLINE_EVERY rows, or with time left, it runs to the end.
+    #[test]
+    fn a_pipeline_keeps_the_deadline() {
+        let gone = Some(Instant::now() - Duration::from_secs(1));
+        let later = Some(Instant::now() + Duration::from_secs(60));
+        let many = crate::commands::search::DEADLINE_EVERY as usize * 4;
+        let cmd = words("FT.AGGREGATE idx * APPLY @n*2 AS d SORTBY 2 @n DESC LIMIT 0 5");
+
+        let (out, cut) = run_within(rows(10), &cmd, 3, gone);
+        assert!(!cut);
+        assert_eq!(out.len(), 5);
+        assert_eq!(out[0]["d"], "18");
+
+        let (out, cut) = run_within(rows(many), &cmd, 3, later);
+        assert!(!cut);
+        assert_eq!(out[0]["n"], (many - 1).to_string());
+
+        // APPLY stops at the first clock read: the rows it computed, then
+        // LIMIT; SORTBY is left out.
+        let (out, cut) = run_within(rows(many), &cmd, 3, gone);
+        assert!(cut);
+        assert_eq!(out.len(), 5);
+        assert!(out.iter().all(|row| row.contains_key("d")));
+
+        // FILTER keeps only rows it found good.
+        let cmd = words("FT.AGGREGATE idx * FILTER @g==1");
+        let (out, cut) = run_within(rows(many), &cmd, 3, gone);
+        assert!(cut);
+        assert!(out.len() < many / 3);
+        assert!(out.iter().all(|row| row["g"] == "1"));
+
+        // GROUPBY: the groups of the rows it read.
+        let cmd = words("FT.AGGREGATE idx * GROUPBY 1 @g REDUCE COUNT 0 AS c");
+        let (out, cut) = run_within(rows(many), &cmd, 3, gone);
+        assert!(cut);
+        let counted: usize = out
+            .iter()
+            .map(|row| row["c"].parse::<usize>().unwrap())
+            .sum();
+        assert!(counted < many);
+        let (out, cut) = run_within(rows(many), &cmd, 3, later);
+        assert!(!cut);
+        let counted: usize = out
+            .iter()
+            .map(|row| row["c"].parse::<usize>().unwrap())
+            .sum();
+        assert_eq!(counted, many);
+    }
 }

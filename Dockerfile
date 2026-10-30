@@ -42,20 +42,31 @@ RUN if [ "$(uname -m)" = aarch64 ]; then export RUSTFLAGS="-C target-feature=+ls
 # The runtime image has no shell to make the home directory with.
 RUN mkdir -p /rootfs/home/kividb
 
+# The one library the binary needs that the runtime image does not have:
+# libgcc_s, for unwinding. Kept at its multiarch path (amd64 or arm64), where
+# glibc's loader looks.
+RUN mkdir -p /rootfs/libgcc \
+    && cp --parents /usr/lib/*-linux-gnu/libgcc_s.so.1 /rootfs/libgcc/
+
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
-# Distroless: glibc, libgcc, CA certificates and time zones -- what the binary
-# links against (libc, libm, libgcc_s) and the update check's HTTPS needs --
-# and nothing else: no shell, no package manager, no perl or util-linux. Up to
-# 1.1.0 the runtime was debian:bookworm-slim, whose ~90 packages carried every
-# CVE a scanner reported on the image (4 critical and 60 high, none of them in
-# code kividb runs). Same Debian release as the builder, so the same glibc.
+# Distroless, without OpenSSL: glibc, CA certificates and time zones, and
+# libgcc_s copied in from the builder -- what the binary links against (libc,
+# libm, libgcc_s) -- and nothing else: no shell, no package manager, no perl or
+# util-linux. Up to 1.1.0 the runtime was debian:bookworm-slim, whose ~90
+# packages carried every CVE a scanner reported on the image (4 critical and
+# 60 high, none of them in code kividb runs). Then distroless/cc, which ships
+# libssl3: the binary never loads it (TLS is rustls, built in), but scanners
+# reported its CVEs on the image all the same (12 in October 2026). Same Debian
+# release as the builder, so the same glibc.
 #
 # It has no redis-cli either. To debug a container, connect from another one
 # (`docker run --rm -it --network container:<name> redis redis-cli -p 6380`,
 # or `kubectl debug` in Kubernetes).
 #
 # Pinned by digest; Dependabot proposes each new one (.github/dependabot.yml).
-FROM gcr.io/distroless/cc-debian12@sha256:e5d81ddde149641e2a9ba55be4545bc125c67de07508b03ba4c22e6eb0ded5aa
+FROM gcr.io/distroless/base-nossl-debian12@sha256:e35893f8ca1cabfbd60394af94899c20930c4615355adf97c5da660a51b61bca
+
+COPY --from=builder /rootfs/libgcc/ /
 
 # The same non-root user as before 1.1.1, UID and GID 1000, so data written by
 # an older image (a bind mount, a named volume) stays writable.

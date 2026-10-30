@@ -1003,14 +1003,22 @@ fn test_ping_requires_auth() {
     assert!(result.error_str().contains("NOAUTH"));
 }
 
+/// With no password set, `AUTH <password>` is Redis's error: how a client
+/// finds out that the password it was given is not in use. It was OK (#135).
+/// `AUTH default <anything>` logs in, as a `nopass` user does in Redis.
 #[test]
-fn test_auth_no_password_set_always_ok() {
+fn test_auth_password_when_none_is_set_is_an_error() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
 
-    // When no requirepass is set, AUTH always succeeds
-    assert!(c.cmds(&["AUTH", "anything"]).is_ok());
+    assert_eq!(
+        c.cmds(&["AUTH", "anything"]).error_str(),
+        "ERR AUTH <password> called without any password configured for the default user. \
+         Are you sure your configuration is correct?"
+    );
+    assert!(c.cmds(&["AUTH", "default", "anything"]).is_ok());
+    assert!(c.cmds(&["PING"]).as_str() == "PONG");
 }
 
 #[test]
@@ -2082,4 +2090,48 @@ fn a_script_runs_under_its_users_acl() {
         admin.cmds(&["EXISTS", "other"]),
         RespValue::Int(0)
     ));
+}
+
+/// `ACL HELP` answers, as every other container's `HELP` does; it was
+/// unknown, in an error that said to try it. `COMMAND` with a subcommand it
+/// does not have is an error, not nil (#134).
+#[test]
+fn acl_help_and_command_s_unknown_subcommand() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let help = c.cmds(&["ACL", "HELP"]);
+    let lines: Vec<&str> = help.as_array().iter().map(|line| line.as_str()).collect();
+    assert!(lines[0].starts_with("ACL <subcommand>"), "{lines:?}");
+    assert!(lines.contains(&"SETUSER <username> <attribute> [<attribute> ...]"));
+
+    let nope = c.cmds(&["COMMAND", "NOPE"]);
+    assert_eq!(
+        nope.error_str(),
+        "ERR unknown subcommand 'NOPE'. Try COMMAND HELP."
+    );
+}
+
+/// `ACL GENPASS bits` gives a hex digit per 4 bits, as Redis does: 1 to 4
+/// bits gave an empty password (#140).
+#[test]
+fn acl_genpass_gives_a_digit_per_four_bits() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    for (bits, digits) in [
+        (1, 1),
+        (4, 1),
+        (5, 2),
+        (8, 2),
+        (9, 3),
+        (256, 64),
+        (4096, 1024),
+    ] {
+        let pass = c.cmds(&["ACL", "GENPASS", &bits.to_string()]);
+        let pass = pass.as_str();
+        assert_eq!(pass.len(), digits, "{bits} bits: {pass:?}");
+        assert!(pass.chars().all(|ch| ch.is_ascii_hexdigit()), "{pass:?}");
+    }
+    assert_eq!(c.cmds(&["ACL", "GENPASS"]).as_str().len(), 64);
 }

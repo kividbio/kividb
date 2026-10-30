@@ -2,8 +2,7 @@ use crate::commands::ctx::Ctx;
 use crate::commands::helpers::*;
 use crate::resp::write::*;
 use crate::store;
-use crate::store::Key;
-use crate::types::KiviDBValue;
+use crate::store::ValueRef;
 use crate::types::SharedBytes;
 use crate::{read_lock, write_lock};
 
@@ -59,8 +58,8 @@ fn cmd_getbit(ctx: &mut Ctx) -> Vec<u8> {
         None => return resp_error("ERR bit offset is not an integer or out of range"),
     };
 
-    if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-        expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+    if is_expired(ctx.store, *ctx.selected_db, key) {
+        expire_on_read(ctx.store, *ctx.selected_db, key);
         return resp_integer(0);
     }
 
@@ -69,7 +68,7 @@ fn cmd_getbit(ctx: &mut Ctx) -> Vec<u8> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        Some(KiviDBValue::String(bytes)) => {
+        Some(ValueRef::String(bytes)) => {
             let (byte_idx, mask) = bit_byte_and_mask(offset);
             if byte_idx >= bytes.len() {
                 resp_integer(0)
@@ -122,7 +121,7 @@ fn cmd_setbit(ctx: &mut Ctx) -> Vec<u8> {
 
     // Get existing bytes or start empty
     let existing: Vec<u8> = match map.get(key) {
-        Some(KiviDBValue::String(b)) => b.to_vec(), // Arc<[u8]> → Vec<u8> (clone)
+        Some(ValueRef::String(b)) => b.to_vec(), // Arc<[u8]> → Vec<u8> (clone)
         None => vec![],
         _ => {
             return resp_error("WRONGTYPE Operation against a key holding the wrong kind of value");
@@ -157,10 +156,7 @@ fn cmd_setbit(ctx: &mut Ctx) -> Vec<u8> {
         new_bytes[byte_idx] &= !mask;
     }
 
-    map.insert(
-        Key::from(key_owned),
-        KiviDBValue::String(SharedBytes::from(new_bytes.as_slice())),
-    );
+    map.insert_str(key_owned, new_bytes.as_slice());
 
     resp_integer(old_bit)
 }
@@ -183,15 +179,15 @@ fn cmd_bitcount(ctx: &mut Ctx) -> Vec<u8> {
 
     // Hot path: whole string — no range parsing
     if cmd.len() == 2 {
-        if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-            expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+        if is_expired(ctx.store, *ctx.selected_db, key) {
+            expire_on_read(ctx.store, *ctx.selected_db, key);
             return resp_integer(0);
         }
         let db = &ctx.store[*ctx.selected_db];
         let shard = store::get_shard(db, key);
         let map = read_lock!(shard);
         match map.get(key) {
-            Some(KiviDBValue::String(b)) => resp_integer(popcount(b) as i64),
+            Some(ValueRef::String(b)) => resp_integer(popcount(&b) as i64),
             None => resp_integer(0),
             _ => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
         }
@@ -225,15 +221,15 @@ fn cmd_bitcount(ctx: &mut Ctx) -> Vec<u8> {
             false
         };
 
-        let gone = is_expired(ctx.expiry_store, *ctx.selected_db, key)
-            && expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+        let gone = is_expired(ctx.store, *ctx.selected_db, key)
+            && expire_on_read(ctx.store, *ctx.selected_db, key);
 
         let db = &ctx.store[*ctx.selected_db];
         let shard = store::get_shard(db, key);
         let map = read_lock!(shard);
 
         let bytes: SharedBytes = match map.get(key).filter(|_| !gone) {
-            Some(KiviDBValue::String(b)) => b.clone(),
+            Some(ValueRef::String(b)) => b.to_shared(),
             None => SharedBytes::from(&[][..]),
             _ => {
                 return resp_error(
@@ -372,8 +368,8 @@ fn cmd_bitpos(ctx: &mut Ctx) -> Vec<u8> {
         _ => unreachable!(),
     };
 
-    if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-        expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+    if is_expired(ctx.store, *ctx.selected_db, key) {
+        expire_on_read(ctx.store, *ctx.selected_db, key);
         return resp_integer(if search_bit == 0 { 0 } else { -1 });
     }
 
@@ -382,7 +378,7 @@ fn cmd_bitpos(ctx: &mut Ctx) -> Vec<u8> {
     let map = read_lock!(shard);
 
     let bytes = match map.get(key) {
-        Some(KiviDBValue::String(b)) => b.clone(),
+        Some(ValueRef::String(b)) => b.to_shared(),
         None => {
             return resp_integer(if search_bit == 0 { 0 } else { -1 });
         }
@@ -497,15 +493,15 @@ fn cmd_bitop(ctx: &mut Ctx) -> Vec<u8> {
                 continue;
             }
         };
-        if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-            delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+        if is_expired(ctx.store, *ctx.selected_db, key) {
+            delete_key_if_expired(ctx.store, *ctx.selected_db, key);
             sources.push(vec![]);
             continue;
         }
         let shard = store::get_shard(db, key);
         let map = read_lock!(shard);
         match map.get(key) {
-            Some(KiviDBValue::String(b)) => sources.push(b.to_vec()),
+            Some(ValueRef::String(b)) => sources.push(b.to_vec()),
             None => sources.push(vec![]),
             _ => {
                 return resp_error(
@@ -590,10 +586,7 @@ fn cmd_bitop(ctx: &mut Ctx) -> Vec<u8> {
     // Store result at dest key
     let dest_shard = store::get_shard(db, &dest_key);
     let mut map = write_lock!(dest_shard);
-    map.insert(
-        Key::from(dest_key),
-        KiviDBValue::String(SharedBytes::from(result.as_slice())),
-    );
+    map.insert_str(dest_key, result.as_slice());
     drop(map);
 
     resp_integer(result_len)
@@ -627,7 +620,7 @@ fn cmd_bitfield(ctx: &mut Ctx, readonly: bool) -> Vec<u8> {
     let mut current_bytes: Vec<u8> = {
         let map = read_lock!(shard);
         match map.get(key.as_str()) {
-            Some(KiviDBValue::String(b)) => b.to_vec(),
+            Some(ValueRef::String(b)) => b.to_vec(),
             None => vec![],
             _ => {
                 return resp_error(
@@ -757,10 +750,7 @@ fn cmd_bitfield(ctx: &mut Ctx, readonly: bool) -> Vec<u8> {
     }
     if modified {
         let mut map = write_lock!(shard);
-        map.insert(
-            Key::from(key),
-            KiviDBValue::String(SharedBytes::from(current_bytes.as_slice())),
-        );
+        map.insert_str(key, current_bytes.as_slice());
     } else {
         ctx.skip_write_side_effects = true;
     }

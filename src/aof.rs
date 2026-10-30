@@ -136,7 +136,6 @@ static REWRITES_ASKED_FOR: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 /// rewrite had begun, and go on as if it were done.
 pub fn checkpoint_in_background(
     store: crate::store::Store,
-    expiry_store: crate::store::ExpiryStore,
     index_store: crate::vector::IndexStore,
 ) {
     struct Asked;
@@ -150,7 +149,7 @@ pub fn checkpoint_in_background(
     tokio::spawn(async move {
         tokio::task::spawn_blocking(move || {
             let _asked = asked;
-            checkpoint(&store, &expiry_store, &index_store)
+            checkpoint(&store, &index_store)
         })
         .await
         .ok();
@@ -204,6 +203,153 @@ fn as_turn_over_mark(item: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(rest.try_into().ok()?))
 }
 
+// ── Written before it is acknowledged ────────────────────────────────────────
+//
+// A write was acknowledged as soon as its record was queued for the writer:
+// a process killed then (`kill -9`, the OOM killer, a container stopped
+// without a grace period) lost writes its clients had been told were made, a
+// few in a test, more under a burst (#147). As in Redis, a reply now waits
+// until the records of the commands it answers are in the file (the page
+// cache; `appendfsync everysec` syncs it within the second, as before).
+//
+// A connection whose replies answer a write sends a barrier down its own AOF
+// queue, behind its records, and then writes what is queued itself, if no
+// one else is writing: no thread to wake and wait for. Otherwise whoever is
+// writing (another connection, or the writer thread) takes its barrier with
+// what it writes. Every barrier is answered once what came before it is
+// written: one write, for as many connections as were waiting, is a group
+// commit. Waking the writer thread for each write and waiting to be woken
+// back halved the writes a second.
+
+/// The queue and the file, shared by the writer thread and the connections
+/// that write what is queued themselves (see [`written`]).
+struct Log {
+    rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    file: std::fs::File,
+}
+
+static LOG: parking_lot::Mutex<Option<Log>> = parking_lot::const_mutex(None);
+
+/// Wakes the writer thread: a record or a barrier has been queued. Kept as a
+/// permit if it is busy, so nothing queued is left behind.
+static QUEUED: std::sync::LazyLock<tokio::sync::Notify> =
+    std::sync::LazyLock::new(tokio::sync::Notify::new);
+
+/// Something has been sent down the AOF's queue. Every sender calls it.
+///
+/// While replies wait for their writes, the writer thread is not woken: the
+/// connection that sent the record writes it before it replies (see
+/// [`written`]), and woken, the thread took the lock first and left the
+/// connection waiting to be woken in turn — a quarter of the writes a
+/// second. What no reply waits for (an expiry's delete, a replica's stream)
+/// is written with the next connection's, or by the writer's next sync, a
+/// second at most.
+#[inline]
+pub fn records_queued() {
+    if !acks_wait() {
+        QUEUED.notify_one();
+    }
+}
+
+/// Write whatever is queued, and answer the barriers it covers. Whether a
+/// barrier was answered; `None` if someone else is writing now.
+fn write_what_is_queued(block: bool) -> Option<bool> {
+    let mut log = if block { LOG.lock() } else { LOG.try_lock()? };
+    let log = log.as_mut()?;
+    Some(write_queued(&mut log.file, &mut log.rx, None).1)
+}
+
+/// A barrier in the queue, followed by its number.
+const BARRIER_MARK: &[u8] = b"\0kividb-aof-barrier\0";
+
+static BARRIERS: std::sync::LazyLock<
+    parking_lot::Mutex<ahash::AHashMap<u64, tokio::sync::oneshot::Sender<()>>>,
+> = std::sync::LazyLock::new(Default::default);
+static NEXT_BARRIER: AtomicU64 = AtomicU64::new(1);
+
+/// The number in a barrier; `None` for anything else.
+fn as_barrier(item: &[u8]) -> Option<u64> {
+    let rest = item.strip_prefix(BARRIER_MARK)?;
+    Some(u64::from_le_bytes(rest.try_into().ok()?))
+}
+
+/// `aof-ack-after-write`: whether a reply to a write waits for its record
+/// to be in the file. `yes`, the default, is Redis's guarantee; `no` is
+/// 1.1.2's behaviour, faster for writes, where a killed process can lose
+/// the last few acknowledged writes.
+static ACK_AFTER_WRITE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_ack_after_write(on: bool) {
+    ACK_AFTER_WRITE.store(on, Ordering::Relaxed);
+}
+
+/// Whether a connection's replies may have to wait for the AOF: it is on,
+/// and acknowledges after writing.
+#[inline]
+pub fn acks_wait() -> bool {
+    AOF_ENABLED.load(Ordering::Relaxed) && ACK_AFTER_WRITE.load(Ordering::Relaxed)
+}
+
+/// Whether a command may write a record its reply should wait for: a write,
+/// or a script or a transaction that may make some.
+#[inline]
+pub fn may_log(name: &[u8]) -> bool {
+    crate::replication::is_write_command_bytes(name)
+        || name.eq_ignore_ascii_case(b"EVAL")
+        || name.eq_ignore_ascii_case(b"EVALSHA")
+        || name.eq_ignore_ascii_case(b"FCALL")
+        || name.eq_ignore_ascii_case(b"EXEC")
+}
+
+/// Wait until every record queued on `tx` before now is in the file.
+///
+/// Bounded: should the writer be gone, a reply is late, not lost. With the
+/// AOF off, or no writer, nothing to wait for.
+pub async fn written(tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
+    if !acks_wait() || !WRITER_RUNNING.load(Ordering::Acquire) {
+        return;
+    }
+    let id = NEXT_BARRIER.fetch_add(1, Ordering::Relaxed);
+    let (done, wait) = tokio::sync::oneshot::channel();
+    BARRIERS.lock().insert(id, done);
+    let mut mark = BARRIER_MARK.to_vec();
+    mark.extend_from_slice(&id.to_le_bytes());
+    if tx.send(mark).is_err() {
+        BARRIERS.lock().remove(&id);
+        return;
+    }
+    // Write it ourselves, unless someone else is writing. They may have
+    // taken all there was before our barrier came: then the writer thread
+    // takes it.
+    if write_what_is_queued(false).is_none() {
+        QUEUED.notify_one();
+    }
+    if tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+        .await
+        .is_err()
+    {
+        BARRIERS.lock().remove(&id);
+        log_throttled!(
+            10,
+            crate::loglevel::WARN,
+            "AOF: a reply waited 5 s for its write to reach {AOF_PATH} and was sent without it"
+        );
+    }
+}
+
+/// Answer the barriers taken: what came before them has been written.
+fn release_barriers(barriers: &mut Vec<u64>) {
+    if barriers.is_empty() {
+        return;
+    }
+    let mut waiting = BARRIERS.lock();
+    for id in barriers.drain(..) {
+        if let Some(done) = waiting.remove(&id) {
+            let _ = done.send(());
+        }
+    }
+}
+
 /// The AOF queue, reachable from code that was never handed one.
 ///
 /// Installed once at startup by whichever server path is running (see
@@ -228,14 +374,14 @@ pub fn install_global_aof_sender(tx: Box<dyn crate::commands::ctx::AofSender>) {
 }
 
 thread_local! {
-    /// The records of the script this thread is running, held back until it
-    /// ends (`RecordGroup`).
+    /// The records of the script or transaction this thread is running, held
+    /// back until it ends (`RecordGroup`).
     static RECORD_GROUP: std::cell::RefCell<Option<Vec<u8>>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// Queue a record for the AOF: at once — or, while this thread is running a
-/// script, with everything else the script writes.
+/// script or a transaction, with everything else it writes.
 pub fn queue_record(tx: &dyn crate::commands::ctx::AofSender, data: Vec<u8>) {
     let data = RECORD_GROUP.with(|group| match group.borrow_mut().as_mut() {
         Some(held) => {
@@ -249,7 +395,20 @@ pub fn queue_record(tx: &dyn crate::commands::ctx::AofSender, data: Vec<u8>) {
     }
 }
 
-/// Everything a script writes, as one piece of the AOF.
+/// Put `data` in front of the records this thread's group holds — the
+/// `MULTI` of a group that turns out to be a transaction, at its second
+/// write. False if no group is open.
+pub(crate) fn put_in_front_of_group(data: &[u8]) -> bool {
+    RECORD_GROUP.with(|group| match group.borrow_mut().as_mut() {
+        Some(held) => {
+            held.splice(0..0, data.iter().copied());
+            true
+        }
+        None => false,
+    })
+}
+
+/// Everything a script, or a transaction, writes, as one piece of the AOF.
 ///
 /// Each `redis.call` that writes makes a record. Queued one by one, they
 /// reach the file in whatever groups the writer happens to take them, and a
@@ -262,15 +421,17 @@ pub fn queue_record(tx: &dyn crate::commands::ctx::AofSender, data: Vec<u8>) {
 ///
 /// One message is one `write`, short of the kernel cutting that write at a
 /// page boundary as the process dies: far rarer than a kill between two
-/// messages, and not excluded. Nothing marks the group in the file.
-#[cfg_attr(not(feature = "lua"), allow(dead_code))]
+/// messages, and not excluded. So the group is marked in the file: it is
+/// opened by a [`crate::replication::PropagationGroup`], which puts a
+/// `MULTI` before its records and an `EXEC` after them, and a replay drops a
+/// `MULTI` whose `EXEC` is not there (#172). A transaction's records are
+/// grouped the same way.
 pub struct RecordGroup<'a> {
     tx: &'a dyn crate::commands::ctx::AofSender,
     /// False for a script called by a script: the outer one's group holds.
     outermost: bool,
 }
 
-#[cfg_attr(not(feature = "lua"), allow(dead_code))]
 impl<'a> RecordGroup<'a> {
     pub fn begin(tx: &'a dyn crate::commands::ctx::AofSender) -> Self {
         let outermost = RECORD_GROUP.with(|group| {
@@ -321,19 +482,20 @@ pub fn request_flush() {
     }
 }
 
-pub async fn start_aof_writer(mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
+pub async fn start_aof_writer(rx: mpsc::UnboundedReceiver<Vec<u8>>) {
     let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel::<()>(1);
     let _ = FLUSH_TX.set(flush_tx);
-    WRITER_RUNNING.store(true, Ordering::Release);
 
     // A server asked to keep an append-only file that cannot open one must
     // not run: it would accept writes and keep none of them. (This used to be
     // a panic in this task alone — the server carried on, serving, with
     // nothing being logged.)
-    let mut file = match open_aof() {
+    let file = match open_aof() {
         Ok(file) => file,
         Err(e) => fatal_persistence(&format!("{AOF_PATH} cannot be opened for appending: {e}")),
     };
+    *LOG.lock() = Some(Log { rx, file });
+    WRITER_RUNNING.store(true, Ordering::Release);
 
     // Whatever survived startup (an AOF that was just replayed, or nothing) is
     // the baseline the first growth ratio is measured against. The writer opens
@@ -346,13 +508,13 @@ pub async fn start_aof_writer(mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                do_fsync(&mut file, &mut rx);
+                do_fsync();
             }
             Some(()) = flush_rx.recv() => {
-                do_fsync(&mut file, &mut rx);
+                do_fsync();
             }
-            Some(cmd) = rx.recv() => {
-                write_queued(&mut file, &mut rx, Some(cmd));
+            () = QUEUED.notified() => {
+                let released = write_what_is_queued(true).unwrap_or(false);
                 // Not straight back to waiting. A sender wakes a writer
                 // that is waiting, with a system call, and under load the
                 // writer was back to waiting before the next record came:
@@ -360,8 +522,15 @@ pub async fn start_aof_writer(mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
                 // scripts on several threads were what it was doing. What
                 // arrives in this pause is taken together, with no wake-up
                 // at all. A record that arrives alone is still written at
-                // once: the pause is after it, not before.
-                std::thread::sleep(WRITER_PAUSE);
+                // once: the pause is after it, not before. Not when it has
+                // answered barriers: their clients wait on it, and send
+                // nothing until they have their replies. Nor while replies
+                // wait for writes at all: a connection's records come before
+                // its barrier, and a pause after them made the barrier wait
+                // it out, halving the writes a second (#147).
+                if !released && !acks_wait() {
+                    std::thread::sleep(WRITER_PAUSE);
+                }
             }
         }
     }
@@ -402,30 +571,39 @@ fn perform_turn_over(file: &mut std::fs::File, generation: u64) -> std::io::Resu
 }
 
 /// Write `first` and whatever else is queued, turning the log over at each
-/// mark on the way (see [`turn_over_mark`]). Returns whether anything was
-/// written.
+/// mark on the way (see [`turn_over_mark`]), and answering the barriers
+/// taken once what was before them is written. Returns whether anything was
+/// written, and whether any barrier was answered.
 fn write_queued(
     file: &mut std::fs::File,
     rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
     mut first: Option<Vec<u8>>,
-) -> bool {
+) -> (bool, bool) {
     let mut wrote = false;
+    let mut released = false;
+    let mut barriers = Vec::new();
     loop {
         let mut batch = Vec::new();
         let mark = match first.take() {
-            Some(item) => match as_turn_over_mark(&item) {
-                Some(generation) => Some(generation),
-                None => {
+            Some(item) => match (as_turn_over_mark(&item), as_barrier(&item)) {
+                (Some(generation), _) => Some(generation),
+                (None, Some(id)) => {
+                    barriers.push(id);
+                    drain_into(&mut batch, rx, &mut barriers)
+                }
+                (None, None) => {
                     batch = item;
-                    drain_into(&mut batch, rx)
+                    drain_into(&mut batch, rx, &mut barriers)
                 }
             },
-            None => drain_into(&mut batch, rx),
+            None => drain_into(&mut batch, rx, &mut barriers),
         };
         wrote |= !batch.is_empty();
         write_batch(file, &batch);
+        released |= !barriers.is_empty();
+        release_barriers(&mut barriers);
         let Some(generation) = mark else {
-            return wrote;
+            return (wrote, released);
         };
         let result = perform_turn_over(file, generation);
         let mut waiters = TURN_OVER_WAITERS.lock();
@@ -484,13 +662,18 @@ const MAX_AOF_BATCH_BYTES: usize = 4 * 1024 * 1024;
 const WRITER_PAUSE: std::time::Duration = std::time::Duration::from_micros(150);
 
 /// Take queued records into `batch`, up to a turn-over mark, whose save
-/// number is returned.
-fn drain_into(batch: &mut Vec<u8>, rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) -> Option<u64> {
+/// number is returned; the barriers met on the way go to `barriers`.
+fn drain_into(
+    batch: &mut Vec<u8>,
+    rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+    barriers: &mut Vec<u64>,
+) -> Option<u64> {
     while batch.len() < MAX_AOF_BATCH_BYTES {
         match rx.try_recv() {
-            Ok(more) => match as_turn_over_mark(&more) {
-                Some(generation) => return Some(generation),
-                None => batch.extend_from_slice(&more),
+            Ok(more) => match (as_turn_over_mark(&more), as_barrier(&more)) {
+                (Some(generation), _) => return Some(generation),
+                (None, Some(id)) => barriers.push(id),
+                (None, None) => batch.extend_from_slice(&more),
             },
             Err(_) => break,
         }
@@ -512,13 +695,29 @@ fn write_batch(file: &mut std::fs::File, batch: &[u8]) {
     }
 }
 
-fn do_fsync(file: &mut std::fs::File, rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) {
-    // Drain pending writes before fsyncing, coalesced into one write.
-    let had_data = write_queued(file, rx, None);
+/// Write what is queued and sync the file — on a handle of its own, outside
+/// the lock, so that connections writing their records do not wait out the
+/// disk.
+fn do_fsync() {
+    let (had_data, written, file) = {
+        let mut log = LOG.lock();
+        let Some(log) = log.as_mut() else {
+            return;
+        };
+        // Drain pending writes before fsyncing, coalesced into one write.
+        let had_data = write_queued(&mut log.file, &mut log.rx, None).0;
+        // What the sync covers: what is on this file now. Records others
+        // write once the lock is let go may miss it, so they are not counted.
+        let written = AOF_WRITTEN.load(Ordering::Relaxed);
+        (had_data, written, log.file.try_clone())
+    };
+    let Ok(file) = file else {
+        return;
+    };
 
     // Skip the syscall only when there is nothing *unsynced*.
     //
-    // Records land on the file in the `rx.recv()` arm without an fsync.
+    // Records land on the file as they are queued, without an fsync.
     // `WAITAOF` then `request_flush()`s; the drain here is often empty
     // because the write already happened. Skipping `sync_data` in that case
     // leaves `AOF_FSYNCED` behind `AOF_WRITTEN` and WAITAOF times out at `[0,0]`.
@@ -528,7 +727,7 @@ fn do_fsync(file: &mut std::fs::File, rx: &mut mpsc::UnboundedReceiver<Vec<u8>>)
     // to hop to tokio's blocking pool every second on an empty fd — the same
     // overhead the AOF-off path already avoided, and the RSS ratchet on a
     // quiet box (`used_memory` is process RSS).
-    if !had_data && AOF_WRITTEN.load(Ordering::Relaxed) == AOF_FSYNCED.load(Ordering::Relaxed) {
+    if !had_data && written == AOF_FSYNCED.load(Ordering::Relaxed) {
         return;
     }
 
@@ -539,8 +738,7 @@ fn do_fsync(file: &mut std::fs::File, rx: &mut mpsc::UnboundedReceiver<Vec<u8>>)
             "AOF: fsync of {AOF_PATH} failed: {e} — writes acknowledged since the last good fsync may be lost on power failure; check the disk"
         );
     } else {
-        let written = AOF_WRITTEN.load(Ordering::Relaxed);
-        AOF_FSYNCED.store(written, Ordering::Relaxed);
+        AOF_FSYNCED.fetch_max(written, Ordering::Relaxed);
     }
 }
 
@@ -557,6 +755,8 @@ fn turn_over_aof(generation: u64) -> impl FnOnce() -> std::io::Result<()> {
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
         TURN_OVER_WAITERS.lock().push((generation, done_tx));
         send_to_global_writer(turn_over_mark(generation));
+        // Waited for: never left to the next sync.
+        QUEUED.notify_one();
         Some(done_rx)
     } else {
         None
@@ -589,29 +789,39 @@ fn turn_over_aof(generation: u64) -> impl FnOnce() -> std::io::Result<()> {
 /// if the snapshot did not get there (see `checkpoint_completed`).
 pub fn checkpoint(
     store: &crate::store::Store,
-    expiry_store: &crate::store::ExpiryStore,
     index_store: &crate::vector::IndexStore,
 ) -> std::io::Result<()> {
-    checkpoint_noting(store, expiry_store, index_store, &mut || {})
+    checkpoint_noting(store, index_store, &mut || {})
 }
 
 /// [`checkpoint`], calling `at_cut` while writes are held for the capture:
 /// what it reads is as of the dataset written.
 pub fn checkpoint_noting(
     store: &crate::store::Store,
-    expiry_store: &crate::store::ExpiryStore,
     index_store: &crate::vector::IndexStore,
     at_cut: &mut dyn FnMut(),
 ) -> std::io::Result<()> {
     REWRITE_ACTIVE.store(true, Ordering::Release);
-    let result = checkpoint_inner(store, expiry_store, index_store, at_cut);
+    let aof_on = AOF_ENABLED.load(Ordering::Relaxed);
+    let started = std::time::Instant::now();
+    let result = checkpoint_inner(store, index_store, at_cut);
+    // With the AOF on, a checkpoint is its rewrite (#149): these were never
+    // set.
+    if aof_on {
+        AOF_LAST_REWRITE_OK.store(result.is_ok(), Ordering::Relaxed);
+        if result.is_ok() {
+            AOF_LAST_REWRITE_MS.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        }
+    }
+    if result.is_ok() {
+        crate::stats::record_save();
+    }
     REWRITE_ACTIVE.store(false, Ordering::Release);
     result
 }
 
 fn checkpoint_inner(
     store: &crate::store::Store,
-    expiry_store: &crate::store::ExpiryStore,
     index_store: &crate::vector::IndexStore,
     at_cut: &mut dyn FnMut(),
 ) -> std::io::Result<()> {
@@ -623,8 +833,7 @@ fn checkpoint_inner(
     let cut = crate::write_gate::cut();
     let started = std::time::Instant::now();
     at_cut();
-    let frozen =
-        crate::snapshot::freeze_dataset_for_disk(store, Some(expiry_store), Some(index_store));
+    let frozen = crate::snapshot::freeze_dataset_for_disk(store, Some(index_store));
     let turn_over = match (&frozen, aof_on) {
         (Ok(_), true) => Some(turn_over_aof(generation)),
         _ => None,
@@ -811,7 +1020,6 @@ pub static AUTO_REWRITE_MIN_SIZE: std::sync::atomic::AtomicU64 =
 /// answered OK and rewrites went on.
 pub fn spawn_auto_rewrite_thread(
     store: crate::store::Store,
-    expiry_store: crate::store::ExpiryStore,
     index_store: crate::vector::IndexStore,
     percentage: u64,
     min_size: u64,
@@ -836,7 +1044,7 @@ pub fn spawn_auto_rewrite_thread(
                 percentage,
                 base_size() as f64 / (1024.0 * 1024.0),
             );
-            if let Err(e) = checkpoint(&store, &expiry_store, &index_store) {
+            if let Err(e) = checkpoint(&store, &index_store) {
                 log_warn!("AOF: auto-checkpoint failed: {e}");
             }
         }
@@ -863,6 +1071,9 @@ pub struct ReplayStats {
     /// Keys restored from the KDB preamble, before a single record was
     /// replayed. Zero for a log with no preamble.
     pub preamble_keys: u64,
+    /// Records of a transaction whose `EXEC` is not in the file, its `MULTI`
+    /// included: dropped, and cut off with the tail (`truncated_tail`).
+    pub reverted: u64,
 }
 
 /// Split a raw AOF into its optional KDB image and the command stream.
@@ -1001,6 +1212,45 @@ fn parse_aof_commands(buf: &[u8]) -> (Vec<Vec<Vec<u8>>>, usize) {
         }
     }
     (out, pos)
+}
+
+/// `MULTI` or `EXEC`, the marks around a transaction's records.
+fn is_transaction_mark(cmd: &[Vec<u8>]) -> bool {
+    cmd.len() == 1
+        && (cmd[0].eq_ignore_ascii_case(b"MULTI") || cmd[0].eq_ignore_ascii_case(b"EXEC"))
+}
+
+/// The index of the `MULTI` of a transaction that has no `EXEC` after it,
+/// if the log ends inside one.
+///
+/// As in Redis, a `MULTI` inside a transaction is not a second one, and an
+/// `EXEC` with no transaction open closes nothing.
+fn unfinished_transaction(commands: &[Vec<Vec<u8>>]) -> Option<usize> {
+    let mut open = None;
+    for (i, cmd) in commands.iter().enumerate() {
+        if cmd.len() != 1 {
+            continue;
+        }
+        if cmd[0].eq_ignore_ascii_case(b"MULTI") {
+            open = open.or(Some(i));
+        } else if cmd[0].eq_ignore_ascii_case(b"EXEC") {
+            open = None;
+        }
+    }
+    open
+}
+
+/// Where record `index` starts in `buf`, whose first `index` records are
+/// whole.
+fn record_offset(buf: &[u8], index: usize) -> usize {
+    let mut pos = 0;
+    for _ in 0..index {
+        match parse_one_command(&buf[pos..]) {
+            Some((_, used)) => pos += used,
+            None => break,
+        }
+    }
+    pos
 }
 
 /// What the bytes after the last whole record are.
@@ -1166,7 +1416,6 @@ impl Drop for DeferIndexing {
 pub fn replay_aof(
     path: &str,
     store: &crate::store::Store,
-    expiry_store: &crate::store::ExpiryStore,
     index_store: &crate::vector::IndexStore,
     dict_store: &crate::vector::DictStore,
     wait_table: &std::sync::Arc<crate::wait_table::WaitTable>,
@@ -1209,6 +1458,19 @@ pub fn replay_aof(
             }
         }
     }
+    // A transaction whose `EXEC` is not in the file — the process died while
+    // it was being written — is dropped whole, and the file cut before its
+    // `MULTI`, as Redis does ("Revert incomplete MULTI/EXEC transaction in AOF
+    // file"). Half of it is a dataset no client ever saw. Everything after
+    // that `MULTI` is in it: one whose `EXEC` never came is unfinished however
+    // much follows, in Redis as here.
+    let mut commands = commands;
+    if let Some(multi) = unfinished_transaction(&commands) {
+        stats.reverted = (commands.len() - multi) as u64;
+        stats.valid_len = (buf.len() - tail.len() + record_offset(tail, multi)) as u64;
+        stats.truncated_tail = true;
+        commands.truncate(multi);
+    }
     let live = live_after_flushes(&commands);
 
     // A `FLUSHALL` in the tail discards the image along with everything else
@@ -1239,7 +1501,7 @@ pub fn replay_aof(
         } = loaded;
         crate::vector::restore_dictionaries(index_store, dictionaries);
         stats.preamble_keys = crate::snapshot::restore_into_store(dbs, store) as u64;
-        crate::snapshot::restore_expiries_into_store(expiries, expiry_store);
+        crate::snapshot::restore_expiries_into_store(expiries, store);
         // Schemas and graphs travel inside the image, so the replay never has
         // to re-execute an `FT.CREATE` or rebuild a graph it already has.
         crate::vector::register_index_schemas(index_store, &index_schemas, &hnsw_graphs);
@@ -1253,7 +1515,10 @@ pub fn replay_aof(
     let _indexing = DeferIndexing::start();
 
     for (cmd, live) in commands.into_iter().zip(live) {
-        if cmd.is_empty() {
+        // What is left of a transaction here is whole: its commands are
+        // applied in order, and nothing runs beside a replay to see them
+        // half done. Its `MULTI` and `EXEC` have nothing more to do.
+        if cmd.is_empty() || is_transaction_mark(&cmd) {
             continue;
         }
         if !live {
@@ -1266,7 +1531,6 @@ pub fn replay_aof(
                 cmd,
                 store,
                 repl_state,
-                expiry_store,
                 index_store,
                 dict_store,
                 wait_table,
@@ -1323,7 +1587,6 @@ pub struct LocalRecovery {
 pub fn recover_local(
     aof_enabled: bool,
     store: &crate::store::Store,
-    expiry_store: &crate::store::ExpiryStore,
     index_store: &crate::vector::IndexStore,
     dict_store: &crate::vector::DictStore,
     wait_table: &std::sync::Arc<crate::wait_table::WaitTable>,
@@ -1345,7 +1608,6 @@ pub fn recover_local(
         match preload(
             &config.preload_file,
             store,
-            expiry_store,
             index_store,
             dict_store,
             wait_table,
@@ -1391,8 +1653,7 @@ pub fn recover_local(
                 crate::vector::restore_dictionaries(index_store, dictionaries);
                 if !dbs.is_empty() {
                     let total = crate::snapshot::restore_into_store(dbs, store);
-                    let with_ttl =
-                        crate::snapshot::restore_expiries_into_store(expiries, expiry_store);
+                    let with_ttl = crate::snapshot::restore_expiries_into_store(expiries, store);
                     log_info!("Loaded {total} keys from snapshot ({with_ttl} with a TTL)");
                     dump_loaded = true;
                 }
@@ -1419,7 +1680,7 @@ pub fn recover_local(
                     fatal_persistence(&format!("dump.rdb cannot be loaded: {e}"));
                 }
                 let total = crate::snapshot::restore_into_store(dbs, store);
-                let with_ttl = crate::snapshot::restore_expiries_into_store(expiries, expiry_store);
+                let with_ttl = crate::snapshot::restore_expiries_into_store(expiries, store);
                 log_info!("Loaded {total} keys from snapshot ({with_ttl} with a TTL)");
                 dump_loaded = true;
             }
@@ -1450,7 +1711,6 @@ pub fn recover_local(
                 if let Err(e) = replay_aof(
                     AOF_PREV_PATH,
                     store,
-                    expiry_store,
                     index_store,
                     dict_store,
                     wait_table,
@@ -1503,7 +1763,6 @@ pub fn recover_local(
                 recovery.exact_dump = false;
                 let names = recover_from_aof(
                     store,
-                    expiry_store,
                     index_store,
                     dict_store,
                     wait_table,
@@ -1535,7 +1794,6 @@ pub fn recover_local(
 fn preload(
     target: &str,
     store: &crate::store::Store,
-    expiry_store: &crate::store::ExpiryStore,
     index_store: &crate::vector::IndexStore,
     dict_store: &crate::vector::DictStore,
     wait_table: &std::sync::Arc<crate::wait_table::WaitTable>,
@@ -1575,7 +1833,7 @@ fn preload(
         let (dbs, expiries, functions) = crate::snapshot::load_redis_rdb_with_expiry(&base_str)?;
         crate::snapshot::restore_functions(functions)?;
         let keys = crate::snapshot::restore_into_store(dbs, store);
-        crate::snapshot::restore_expiries_into_store(expiries, expiry_store);
+        crate::snapshot::restore_expiries_into_store(expiries, store);
         keys
     } else {
         let crate::snapshot::LoadedSnapshot {
@@ -1589,7 +1847,7 @@ fn preload(
         crate::snapshot::restore_functions(functions)?;
         crate::vector::restore_dictionaries(index_store, dictionaries);
         let keys = crate::snapshot::restore_into_store(dbs, store);
-        crate::snapshot::restore_expiries_into_store(expiries, expiry_store);
+        crate::snapshot::restore_expiries_into_store(expiries, store);
         crate::vector::register_index_schemas(index_store, &index_schemas, &hnsw_graphs);
         index_names = index_schemas.into_iter().map(|s| s.name).collect();
         keys
@@ -1601,7 +1859,6 @@ fn preload(
         let stats = replay_aof(
             &incr.to_string_lossy(),
             store,
-            expiry_store,
             index_store,
             dict_store,
             wait_table,
@@ -1637,7 +1894,6 @@ fn preload(
 #[must_use = "indexes are left empty by the replay and must be backfilled"]
 pub fn recover_from_aof(
     store: &crate::store::Store,
-    expiry_store: &crate::store::ExpiryStore,
     index_store: &crate::vector::IndexStore,
     dict_store: &crate::vector::DictStore,
     wait_table: &std::sync::Arc<crate::wait_table::WaitTable>,
@@ -1652,7 +1908,6 @@ pub fn recover_from_aof(
     match replay_aof(
         AOF_PATH,
         store,
-        expiry_store,
         index_store,
         dict_store,
         wait_table,
@@ -1702,9 +1957,16 @@ pub fn recover_from_aof(
                 // Normal after a hard kill: the process died part-way through
                 // appending. Say so explicitly rather than leaving a silently
                 // shorter dataset to be discovered later.
+                if stats.reverted > 0 {
+                    log_warn!(
+                        "Revert incomplete MULTI/EXEC transaction in AOF file: its EXEC is \
+                         not in the file, and its {} record(s) are dropped",
+                        stats.reverted
+                    );
+                }
                 log_warn!(
-                    "AOF ended with a partial record (likely an unclean shutdown); \
-                     the incomplete tail ({} bytes) is cut off",
+                    "AOF ended with a partial record or transaction (likely an unclean \
+                     shutdown); the incomplete tail ({} bytes) is cut off",
                     stats.bytes - stats.valid_len
                 );
                 // Cut it off the file, too. Left there, the next record
@@ -1829,6 +2091,36 @@ mod replay_parse_tests {
         let (cmds, used) = parse_aof_commands(buf);
         assert!(cmds.is_empty());
         assert_eq!(used, 0);
+    }
+
+    #[test]
+    fn a_transaction_without_its_exec_is_found_where_it_starts() {
+        let mut buf = enc(&["SET", "a", "1"]);
+        buf.extend_from_slice(&enc(&["MULTI"]));
+        buf.extend_from_slice(&enc(&["SET", "b", "1"]));
+        buf.extend_from_slice(&enc(&["SET", "c", "1"]));
+        buf.extend_from_slice(&enc(&["EXEC"]));
+        let whole = enc(&["SET", "a", "1"]).len();
+        let first_multi = buf.len() - whole;
+        buf.extend_from_slice(&enc(&["MULTI"]));
+        buf.extend_from_slice(&enc(&["SET", "d", "1"]));
+        let (cmds, _) = parse_aof_commands(&buf);
+        assert_eq!(
+            unfinished_transaction(&cmds[..5]),
+            None,
+            "closed by its EXEC"
+        );
+        assert_eq!(unfinished_transaction(&cmds), Some(5));
+        assert_eq!(record_offset(&buf, 5), whole + first_multi);
+        assert_eq!(record_offset(&buf, 1), whole);
+        // A `MULTI` inside one is not a second: the first is where it starts.
+        let mut nested = cmds.clone();
+        nested.push(vec![b"MULTI".to_vec()]);
+        assert_eq!(unfinished_transaction(&nested), Some(5));
+        // An `EXEC` with nothing open closes nothing.
+        assert_eq!(unfinished_transaction(&[vec![b"EXEC".to_vec()]]), None);
+        assert!(is_transaction_mark(&cmds[1]) && is_transaction_mark(&cmds[4]));
+        assert!(!is_transaction_mark(&cmds[0]));
     }
 }
 

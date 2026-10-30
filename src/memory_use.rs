@@ -116,6 +116,14 @@ unsafe impl GlobalAlloc for Counting {
     }
 }
 
+/// Count `delta` bytes as allocated (freed, if negative) by what is not the
+/// global allocator: the slabs of string values (`value_slab`), which count
+/// each block they hand out.
+#[inline]
+pub fn note(delta: isize) {
+    count(delta);
+}
+
 /// Bytes allocated and not yet freed, by the whole process.
 pub fn allocated() -> usize {
     // The counters that have been given out, and the shared one.

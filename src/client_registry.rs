@@ -64,7 +64,15 @@ pub struct Activity {
     /// Written only by the connection's own loop (or the script it is
     /// waiting on), so each is a load and a store, no locked instruction.
     io: [AtomicU64; 7],
+    /// `CLIENT LIST`'s `multi` and `watch` (#158): the commands queued in the
+    /// transaction, plus one (0 outside one), in the high half; the keys
+    /// watched in the low. Written by the connection's loop as its replies go
+    /// out, only when they changed.
+    tx: AtomicU64,
 }
+
+/// Clients blocked in a command with a timeout: `clients_in_timeout_table`.
+static IN_TIMEOUT_TABLE: AtomicU64 = AtomicU64::new(0);
 
 const IO_NET_IN: usize = 0;
 const IO_NET_OUT: usize = 1;
@@ -319,6 +327,24 @@ fn unpack<const N: usize>(from: &[AtomicU64; N], len: usize) -> String {
 }
 
 impl Activity {
+    /// The connection's transaction now: the commands queued if it is in
+    /// one, and the keys it watches. See [`Activity::tx`].
+    #[inline]
+    pub fn note_tx(&self, queued: Option<usize>, watched: usize) {
+        let multi = queued.map_or(0, |n| n as u64 + 1).min(u32::MAX as u64);
+        let packed = (multi << 32) | (watched as u64).min(u32::MAX as u64);
+        if self.tx.load(Ordering::Relaxed) != packed {
+            self.tx.store(packed, Ordering::Relaxed);
+        }
+    }
+
+    /// `(multi, watch)` as `CLIENT LIST` writes them: `multi` is -1 outside
+    /// a transaction.
+    fn tx(&self) -> (i64, u64) {
+        let packed = self.tx.load(Ordering::Relaxed);
+        ((packed >> 32) as i64 - 1, packed & u32::MAX as u64)
+    }
+
     /// See [`Activity::closing_after_reply`].
     pub fn closes_after_reply(&self) -> bool {
         self.closing_after_reply.load(Ordering::Relaxed)
@@ -453,6 +479,13 @@ impl Activity {
     }
 }
 
+/// How many out-of-band messages (invalidations, RESP3 pub/sub, MONITOR
+/// lines) a connection's push queue holds before a client that does not read
+/// them is closed (#161). Generous because it costs nothing until used: the
+/// channel allocates as it fills. Redis puts no limit on a normal client's
+/// output buffer at all.
+pub const PUSH_QUEUE_FRAMES: usize = 65_536;
+
 #[derive(Debug)]
 pub struct ClientInfo {
     pub id: u64,
@@ -480,6 +513,8 @@ pub struct ClientInfo {
     /// While the client is blocked in a command: how `CLIENT UNBLOCK` ends
     /// its wait.
     unblock_tx: Option<oneshot::Sender<crate::commands::blocking::Unblock>>,
+    /// Blocked with a timeout: counted in [`IN_TIMEOUT_TABLE`].
+    blocked_with_timeout: bool,
     // Tracking state
     pub tracking: bool,
     pub tracking_bcast: bool,
@@ -540,6 +575,7 @@ impl ClientInfo {
             tracking_redirect_broken: false,
             kill_tx: Some(kill_tx),
             unblock_tx: None,
+            blocked_with_timeout: false,
             push_tx: None,
             tracking_optin: false,
             tracking_optout: false,
@@ -589,8 +625,8 @@ impl ClientInfo {
         }
         format!(
             "id={} addr={} laddr={} fd=0 name={} age={} idle={} flags={} db={} sub={} psub={} \
-            ssub={} multi=-1 watch=0 qbuf={} qbuf-free={} argv-mem=0 multi-mem=0 \
-            rbs=0 rbp=0 obl=0 oll=0 omem=0 omem-shared=0 omem-unshared=0 tot-mem=0 events=r cmd={} \
+            ssub={} multi={} watch={} qbuf={} qbuf-free={} argv-mem=0 multi-mem=0 \
+            rbs=0 rbp=0 obl=0 oll=0 omem=0 omem-shared=0 omem-unshared=0 tot-mem={} events=r cmd={} \
             user={} redir={} resp={} lib-name={} lib-ver={} io-thread=0 tot-net-in={} \
             tot-net-out={} tot-cmds={} read-events={} avg-pipeline-len-sum={} \
             avg-pipeline-len-cnt={}\n",
@@ -605,8 +641,12 @@ impl ClientInfo {
             self.subscriptions[0],
             self.subscriptions[1],
             self.subscriptions[2],
+            self.activity.tx().0,
+            self.activity.tx().1,
             qbuf,
             qbuf_free,
+            // What KiviDB measures of a client's memory: its query buffer.
+            qbuf + qbuf_free,
             self.activity.last_cmd(),
             self.user,
             self.tracking_redirect.map_or(-1, |id| id as i64),
@@ -648,6 +688,9 @@ impl ClientRegistryInner {
 
     pub fn unregister(&self, id: u64) {
         let gone = self.clients.write().remove(&id);
+        if gone.as_ref().is_some_and(|info| info.blocked_with_timeout) {
+            IN_TIMEOUT_TABLE.fetch_sub(1, Ordering::Relaxed);
+        }
         if let Some(info) = gone.as_ref() {
             log_verbose!(
                 "Client id={} ({}{}) disconnected after {:.1}s",
@@ -683,10 +726,20 @@ impl ClientRegistryInner {
         &self,
         id: u64,
         unblock: Option<oneshot::Sender<crate::commands::blocking::Unblock>>,
+        with_timeout: bool,
     ) {
         let blocked = unblock.is_some();
         if let Some(info) = self.clients.write().get_mut(&id) {
             info.unblock_tx = unblock;
+            let counted = blocked && with_timeout;
+            if counted != info.blocked_with_timeout {
+                if counted {
+                    IN_TIMEOUT_TABLE.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    IN_TIMEOUT_TABLE.fetch_sub(1, Ordering::Relaxed);
+                }
+                info.blocked_with_timeout = counted;
+            }
         }
         if blocked {
             crate::pause::went_on(id);
@@ -701,6 +754,26 @@ impl ClientRegistryInner {
             .get_mut(&id)
             .and_then(|info| info.unblock_tx.take());
         sender.is_some_and(|tx| tx.send(how).is_ok())
+    }
+
+    /// `clients_in_timeout_table` (#158): clients blocked with a timeout.
+    pub fn in_timeout_table() -> u64 {
+        IN_TIMEOUT_TABLE.load(Ordering::Relaxed)
+    }
+
+    /// What the clients' query buffers hold, the replicas' apart:
+    /// `(mem_clients_normal, mem_clients_slaves)` (#152).
+    pub fn buffer_totals(&self) -> (u64, u64) {
+        let (mut normal, mut replicas) = (0u64, 0u64);
+        for info in self.clients.read().values() {
+            let (len, free) = info.query_buffer.values();
+            if info.flags.contains('S') {
+                replicas += len + free;
+            } else {
+                normal += len + free;
+            }
+        }
+        (normal, replicas)
     }
 
     pub fn register_push_tx(&self, id: u64, tx: mpsc::Sender<Vec<u8>>) {
@@ -771,6 +844,7 @@ impl ClientRegistryInner {
                 push_tx: c.push_tx.clone(),
                 kill_tx: None,
                 unblock_tx: None,
+                blocked_with_timeout: false,
                 tracking_optin: c.tracking_optin,
                 tracking_optout: c.tracking_optout,
                 tracking_caching_next: c.tracking_caching_next,
@@ -802,6 +876,7 @@ impl ClientRegistryInner {
             readonly: c.readonly,
             kill_tx: None,
             unblock_tx: None,
+            blocked_with_timeout: false,
             tracking: c.tracking,
             tracking_bcast: c.tracking_bcast,
             tracking_prefixes: c.tracking_prefixes.clone(),

@@ -37,6 +37,8 @@ impl AofSender for AofBridge {
         };
         if failed {
             crate::aof::record_lost_aof_record();
+        } else {
+            crate::aof::records_queued();
         }
     }
 }
@@ -45,7 +47,6 @@ impl AofSender for AofBridge {
 #[derive(Clone)]
 pub(crate) struct ClientExecEnv {
     pub store: crate::store::Store,
-    pub expiry_store: crate::store::ExpiryStore,
     pub lastsave: std::sync::Arc<parking_lot::RwLock<i64>>,
     pub aof_bridge: AofBridge,
     pub config: std::sync::Arc<crate::config::Config>,
@@ -96,7 +97,6 @@ impl ClientExecEnv {
         let out = execute_command(Ctx {
             cmd: cmd_refs,
             store: &self.store,
-            expiry_store: &self.expiry_store,
             lastsave: &self.lastsave,
             selected_db: &mut db,
             aof_tx: &self.aof_bridge,
@@ -139,7 +139,6 @@ impl ClientExecEnv {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn snapshot(
         store: &crate::store::Store,
-        expiry_store: &crate::store::ExpiryStore,
         lastsave: &std::sync::Arc<parking_lot::RwLock<i64>>,
         aof_bridge: AofBridge,
         config: &std::sync::Arc<crate::config::Config>,
@@ -167,7 +166,6 @@ impl ClientExecEnv {
     ) -> Self {
         Self {
             store: store.clone(),
-            expiry_store: expiry_store.clone(),
             lastsave: lastsave.clone(),
             aof_bridge,
             config: config.clone(),

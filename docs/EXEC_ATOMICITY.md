@@ -41,6 +41,44 @@ write from outside cannot slip past `WATCH`), and in the e2e suite
 `test_acid.py::TestFullACIDScenario::test_balance_transfer_acid` and
 `TestAtomicity::test_multi_key_transfer_is_atomic`.
 
+## On replicas, and in the AOF
+
+A transaction is one step on a replica as well, and in the AOF: as in Redis,
+its writes go to both between a `MULTI` and an `EXEC`
+(`PropagationGroup`, in `src/replication/mod.rs`). So does a script's,
+whether its writes are made alone or beside other scripts by hash tag.
+
+* A replica keeps what follows a `MULTI` until the `EXEC` has arrived, and
+  then applies it the way `EXEC` runs on the master: alone in the gate. A
+  reader on a replica never sees a transfer half done. The offset a replica
+  reports, and asks to continue from after a broken link, stays at the
+  `MULTI` until then, so a transaction cut off by the link going down is
+  sent again whole.
+* In the AOF the transaction's records are written together, with the
+  `MULTI` and the `EXEC` around them. A restart after a crash that left a
+  `MULTI` without its `EXEC` at the end of the file drops what follows the
+  `MULTI` and cuts it off the file, as Redis does with
+  `aof-load-truncated yes`, logging `Revert incomplete MULTI/EXEC
+  transaction in AOF file`.
+* A transaction or a script that writes once is sent as that write: one
+  write is one step already (Redis 7 does the same). One that writes
+  nothing sends nothing.
+* A backup and a slot migration take each write as it is made, without the
+  `MULTI` and `EXEC`: a backup's file is replayed by itself, whole, and a
+  migration moves keys one command at a time.
+
+Up to 1.1.2, a transaction reached replicas and the AOF one command at a
+time (#172). A replica running 1.1.2 or earlier, of a newer master, applies the writes one by one
+as it always did, and logs `ERR unknown command 'MULTI'` and `'EXEC'` as a
+`Replicated command error (non-fatal)`: upgrade replicas before their
+master.
+
+Tests: `tests/replication.rs` (`test_a_replica_never_shows_half_a_transaction`,
+`test_a_replica_never_shows_half_a_script`,
+`test_a_transaction_reaches_replicas_between_multi_and_exec`) and
+`tests/backup.rs` (`a_transaction_is_logged_between_multi_and_exec`,
+`a_transaction_cut_off_at_the_end_of_the_aof_is_dropped_whole`).
+
 ## What `WATCH` guarantees
 
 `WATCH` / `MULTI` / `EXEC` used as optimistic locking is safe **between

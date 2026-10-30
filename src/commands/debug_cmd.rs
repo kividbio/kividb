@@ -46,9 +46,55 @@ pub fn handle(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 "Value at:0 refcount:1 encoding:raw serializedlength:1",
             ))
         }
+        "populate" => Some(populate(ctx)),
         "set-active-expire" | "set-disable-deny-scripts" => Some(resp_simple("OK")),
         _ => Some(resp_simple("OK")),
     }
+}
+
+/// `DEBUG POPULATE count [prefix] [size]`, as Redis: `count` string keys,
+/// `prefix:0` onwards (`key:0` without a prefix), each holding `value:N`,
+/// cut or padded with zero bytes to `size` when one is given. A key that is
+/// there already is left as it is. It replied `OK` and made nothing, so a
+/// tool or test that loads data this way believed it had (#173).
+fn populate(ctx: &mut Ctx) -> Vec<u8> {
+    let cmd = &ctx.cmd;
+    if !(3..=5).contains(&cmd.len()) {
+        return resp_error("ERR wrong number of arguments for 'debug|populate' command");
+    }
+    let number = |arg: &[u8]| std::str::from_utf8(arg).ok()?.parse::<i64>().ok();
+    let Some(count) = number(cmd[2]) else {
+        return resp_error("ERR value is not an integer or out of range");
+    };
+    if count < 0 {
+        return resp_error("ERR value is out of range, must be positive");
+    }
+    let prefix = match cmd.get(3) {
+        Some(prefix) => match std::str::from_utf8(prefix) {
+            Ok(prefix) => prefix.to_string(),
+            Err(_) => return resp_error("ERR must be valid UTF-8"),
+        },
+        None => "key".to_string(),
+    };
+    let size = match cmd.get(4).map(|arg| number(arg)) {
+        None => 0,
+        Some(Some(size)) if size >= 0 => size as usize,
+        Some(_) => return resp_error("ERR value is not an integer or out of range"),
+    };
+    let db = &ctx.store[*ctx.selected_db];
+    for i in 0..count as u64 {
+        let key = format!("{prefix}:{i}");
+        let mut value = format!("value:{i}").into_bytes();
+        if size > 0 {
+            value.resize(size, 0);
+        }
+        let shard = crate::store::get_shard(db, &key);
+        let mut map = crate::write_lock!(shard);
+        if !map.contains_key(key.as_str()) {
+            map.insert_str(key.as_str(), &value[..]);
+        }
+    }
+    resp_simple("OK")
 }
 
 fn debug_protocol_reply(conn_resp: u8, effective_resp: u8, kind: &str) -> Vec<u8> {

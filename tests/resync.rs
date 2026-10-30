@@ -813,6 +813,110 @@ fn partial_resyncs_under_load_lose_and_repeat_nothing() {
     assert_eq!(m.stat("sync_partial_ok"), 6);
 }
 
+/// A replica promoted while clients are already writing to it, as after a
+/// `CLUSTER FAILOVER`: the replication session it ran as a replica noticed
+/// the promotion up to 200 ms later, and then wrote its own last position
+/// over the new master's offset. The writes of that moment stayed in the
+/// backlog and reached the replicas continued from it, but the master's
+/// offset no longer counted them. The next full sync restarted the backlog
+/// at the shorter offset ("Backlog restarted at offset X (it ended at X+N)"),
+/// and a replica that had been continued before it, asking after a restart
+/// to continue from its own position, was sent the stream from N bytes too
+/// far on: from the middle of a command. It parsed nothing of it, ever, and
+/// went on acknowledging the position it was stuck at — online, lag 0, and
+/// no write applied after its partial resync.
+#[test]
+fn a_replica_continued_by_a_promoted_master_gets_every_write_after_its_next_resync() {
+    let master = Server::start(&[]);
+    let master_port = master.port.to_string();
+    let promoted = Server::start(&[
+        "--replicaof",
+        "127.0.0.1",
+        &master_port,
+        "--repl-backlog-size",
+        "16777216",
+    ]);
+    let follower = Server::start(&["--replicaof", "127.0.0.1", &master_port]);
+    let (mut m, mut p, mut f) = (master.conn(), promoted.conn(), follower.conn());
+    write_batch(&mut m, 0, 50);
+    wait_link_up(&mut p);
+    wait_link_up(&mut f);
+    assert_same_dataset(&mut m, &mut p);
+    assert_same_dataset(&mut m, &mut f);
+
+    // A client that writes to the replica until it is promoted, and goes on
+    // writing to it afterwards, through the moment its old session notices.
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let stop = Arc::clone(&stop);
+        let mut c = promoted.conn();
+        std::thread::spawn(move || {
+            let mut written = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                // Of different lengths, so that a position off by some
+                // number of writes is not also a command boundary.
+                let value = "v".repeat(written % 7 + 1);
+                if c.cmd(&["SET", &format!("during:{written}"), &value]).ok() {
+                    written += 1;
+                }
+            }
+            written
+        })
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(p.cmd(&["REPLICAOF", "NO", "ONE"]).ok());
+    std::thread::sleep(Duration::from_millis(600));
+    stop.store(true, Ordering::Relaxed);
+    assert!(
+        writer.join().unwrap() > 0,
+        "no write reached the promoted node"
+    );
+
+    // The master's other replica follows the promoted one, through a link
+    // the test can cut, and is continued: same stream, carried on.
+    let relay = Relay::to(promoted.port);
+    assert!(
+        f.cmd(&["REPLICAOF", "127.0.0.1", &relay.port.to_string()])
+            .ok()
+    );
+    wait_until("the follower to have every write", || {
+        f.cmd(&["DBSIZE"]) == p.cmd(&["DBSIZE"])
+    });
+    assert_eq!(p.stat("sync_partial_ok"), 1, "{}", promoted.log());
+    assert_eq!(p.stat("sync_full"), 0);
+
+    // A full sync on the promoted node: a new replica.
+    let third = Server::start(&["--replicaof", "127.0.0.1", &promoted.port.to_string()]);
+    let mut t = third.conn();
+    wait_link_up(&mut t);
+    assert_eq!(p.stat("sync_full"), 1);
+
+    // The follower loses its link, as when it is restarted, while more is
+    // written than the promoted node's writes of that moment came to; and
+    // asks to continue from where it is.
+    relay.cut();
+    wait_link_down(&mut f);
+    let big = "b".repeat(256 * 1024);
+    for i in 0..8 {
+        assert!(p.cmd(&["SET", &format!("big:{i}"), &big]).ok());
+    }
+    write_batch(&mut p, 1, 30);
+    relay.restore();
+    wait_link_up(&mut f);
+    // And writes made after it was continued reach it.
+    write_batch(&mut p, 2, 30);
+
+    assert_same_dataset(&mut p, &mut f);
+    assert_same_dataset(&mut p, &mut t);
+    assert_eq!(p.stat("sync_partial_ok"), 2, "{}", follower.log());
+    assert_eq!(p.stat("sync_full"), 1, "{}", follower.log());
+    assert!(
+        !promoted.log().contains("Backlog restarted"),
+        "{}",
+        promoted.log()
+    );
+}
+
 /// Several connections writing the same keys at once: the replica — and the
 /// append-only file — must take those writes in the order the master did.
 /// They did not; with six writers, hundreds of list elements were out of

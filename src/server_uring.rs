@@ -2,7 +2,6 @@ use crate::commands;
 use crate::pubsub::PubSubHub;
 use crate::resp;
 use crate::store;
-use crate::types::SharedBytes;
 use crate::vector;
 use crate::watch::WatchNotifier;
 use commands::ctx::Ctx;
@@ -29,7 +28,6 @@ use tokio_uring::net::TcpStream;
 pub async fn handle_replica_connection_uring(
     stream: Rc<TcpStream>,
     store: store::Store,
-    expiry_store: store::ExpiryStore,
     index_store: vector::IndexStore,
     hub_tx: crate::replication::HubTx,
     repl_state: Arc<crate::replication::ReplState>,
@@ -58,6 +56,7 @@ pub async fn handle_replica_connection_uring(
     // stream}. See `replication::begin_full_sync`.
     let (peer_ip, peer_port) =
         crate::replication::replica_client::replica_endpoint(&peer_addr, listening_port);
+    let endpoint = format!("{peer_ip}:{peer_port}");
     let registration = crate::replication::ReplicaRegistration {
         replica_id,
         addr: peer_addr.clone(),
@@ -83,7 +82,6 @@ pub async fn handle_replica_connection_uring(
                 move || {
                     crate::replication::begin_full_sync(
                         &store,
-                        &expiry_store,
                         &index_store,
                         &repl_state,
                         &hub_tx,
@@ -237,6 +235,13 @@ pub async fn handle_replica_connection_uring(
     tokio::select! {
         _ = ack_reader => {}
         _ = forward_task => {}
+        // A replica that has gone silent: see `ReplState::replica_timed_out`.
+        _ = repl_state.replica_timed_out(replica_id) => {
+            log_warn!(
+                "Replication: disconnecting timedout replica {endpoint}: no REPLCONF ACK for {} s (repl-timeout)",
+                repl_state.repl_timeout().as_secs()
+            );
+        }
     }
 
     let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
@@ -301,6 +306,7 @@ async fn park_blocking_uring(
         let payload = std::mem::take(out_buf);
         crate::stats::TOTAL_NET_OUTPUT_BYTES
             .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::stats::record_write();
         let _w = write_guard.lock().await;
         let (res, mut returned) = stream.write_all(payload).await;
         drop(_w);
@@ -319,7 +325,7 @@ async fn park_blocking_uring(
     let block_state = wait.take_state();
     let (client_registry, client_id) = client;
     let (unblock_tx, mut unblock_rx) = tokio::sync::oneshot::channel();
-    client_registry.set_blocked(client_id, Some(unblock_tx));
+    client_registry.set_blocked(client_id, Some(unblock_tx), wait.has_timeout());
     let fd = std::os::fd::AsRawFd::as_raw_fd(&**stream);
     let delivery = {
         let waiting = wait.wait();
@@ -352,7 +358,7 @@ async fn park_blocking_uring(
             }
         }
     };
-    client_registry.set_blocked(client_id, None);
+    client_registry.set_blocked(client_id, None, false);
     // However it ended, the command is dispatched again: with what it was
     // waiting for, or as if its time had run out — which is also how it
     // leaves the line it was standing in.
@@ -497,6 +503,7 @@ fn open_subscriptions(
             }
             crate::stats::TOTAL_NET_OUTPUT_BYTES
                 .fetch_add(frames.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::stats::record_write();
             let (res, _) = stream.write_all(frames).await;
             if res.is_err() {
                 break;
@@ -510,7 +517,6 @@ fn open_subscriptions(
 pub async fn handle_client(
     stream: TcpStream,
     store: store::Store,
-    expiry_store: store::ExpiryStore,
     lastsave: Arc<RwLock<i64>>,
     aof_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     _aof_enabled: bool,
@@ -586,7 +592,8 @@ pub async fn handle_client(
     let mut out_buf: Vec<u8> = Vec::with_capacity(65536);
     let mut spare_buf: Vec<u8> = Vec::with_capacity(65536);
     // Push channel for out-of-band invalidation messages (CLIENT TRACKING).
-    let (push_tx, mut push_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+    let (push_tx, mut push_rx) =
+        tokio::sync::mpsc::channel::<Vec<u8>>(crate::client_registry::PUSH_QUEUE_FRAMES);
     client_registry.register_push_tx(client_id, push_tx.clone());
 
     // Out-of-band pushes (CLIENT TRACKING invalidations, RESP3 pub/sub
@@ -620,6 +627,7 @@ pub async fn handle_client(
                 let _w = write_guard.lock().await;
                 crate::stats::TOTAL_NET_OUTPUT_BYTES
                     .fetch_add(msg.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                crate::stats::record_write();
                 let (res, _) = stream.write_all(msg).await;
                 if res.is_err() {
                     break;
@@ -721,6 +729,9 @@ pub async fn handle_client(
     // Transaction state — only touched when MULTI/EXEC/WATCH are used.
     use crate::commands::transaction::TxState;
     let mut tx = TxState::new();
+    // A command of the batch being answered may have queued an AOF
+    // record: its reply waits for it (see `aof::written`).
+    let mut aof_wait = false;
     let dirty_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Negotiated RESP protocol version, updated by HELLO. Kept as local connection
     // state (not read from client_registry per command) so execute_command's
@@ -815,6 +826,7 @@ pub async fn handle_client(
         }
         crate::stats::TOTAL_NET_INPUT_BYTES
             .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::stats::record_read();
         activity.note_read(n);
 
         query_buffer_peak = query_buffer_peak.max(parse_buf.len().saturating_sub(parse_start));
@@ -893,6 +905,9 @@ pub async fn handle_client(
             if !blocking_slot.resuming() {
                 activity.record(&cmd, selected_db);
             }
+            if !aof_wait && crate::aof::acks_wait() && crate::aof::may_log(cmd[0]) {
+                aof_wait = true;
+            }
             // The command before this one is over: its reply is settled, and
             // what it left to tell tracking clients follows it.
             reply_gate.settle(&mut out_buf);
@@ -964,7 +979,6 @@ pub async fn handle_client(
                     let env = &*lua_env.get_or_insert_with(|| {
                         crate::lua_vm_blocking::ClientExecEnv::snapshot(
                             &store,
-                            &expiry_store,
                             &lastsave,
                             crate::lua_vm_blocking::AofBridge::Tokio(aof_tx.clone()),
                             &config,
@@ -999,15 +1013,6 @@ pub async fn handle_client(
                     )
                     .await;
                     if slowlog_enabled && elapsed_us >= slowlog.threshold_us() {
-                        let elapsed_ms = (elapsed_us / 1000) as u32;
-                        latency.record(
-                            if elapsed_ms < 1 {
-                                "fast-command"
-                            } else {
-                                "command"
-                            },
-                            elapsed_ms,
-                        );
                         let client_name = client_registry
                             .get(client_id)
                             .map(|info| info.name.clone())
@@ -1023,7 +1028,6 @@ pub async fn handle_client(
                     let mut response = commands::execute_command(Ctx {
                         cmd,
                         store: &store,
-                        expiry_store: &expiry_store,
                         lastsave: &lastsave,
                         selected_db: &mut selected_db,
                         aof_tx: &aof_tx,
@@ -1057,6 +1061,9 @@ pub async fn handle_client(
                         blocking: Some(blocking_slot.prime()),
                     });
                     if let Some(wait) = blocking_slot.take_parked() {
+                        if std::mem::take(&mut aof_wait) {
+                            crate::aof::written(&aof_tx).await;
+                        }
                         match park_blocking_uring(
                             wait,
                             &mut blocking_slot,
@@ -1093,7 +1100,6 @@ pub async fn handle_client(
                 let mut response = commands::execute_command(Ctx {
                     cmd,
                     store: &store,
-                    expiry_store: &expiry_store,
                     lastsave: &lastsave,
                     selected_db: &mut selected_db,
                     aof_tx: &aof_tx,
@@ -1128,6 +1134,9 @@ pub async fn handle_client(
                 });
                 if let Some(wait) = blocking_slot.take_parked() {
                     waited_from = Some(now_us());
+                    if std::mem::take(&mut aof_wait) {
+                        crate::aof::written(&aof_tx).await;
+                    }
                     match park_blocking_uring(
                         wait,
                         &mut blocking_slot,
@@ -1162,15 +1171,6 @@ pub async fn handle_client(
                     + waited_from.map_or(0, |from| now_us().saturating_sub(from));
 
                 if elapsed_us >= slowlog.threshold_us() {
-                    let elapsed_ms = (elapsed_us / 1000) as u32;
-                    latency.record(
-                        if elapsed_ms < 1 {
-                            "fast-command"
-                        } else {
-                            "command"
-                        },
-                        elapsed_ms,
-                    );
                     let client_name = client_registry
                         .get(client_id)
                         .map(|info| info.name.clone())
@@ -1228,6 +1228,11 @@ pub async fn handle_client(
                     .and_then(|user| crate::acl::check_permission(user, &cmd_name, &cmd).err());
                 if let Some(denied) = denied {
                     acl_log.record(denied.reason(), denied.object(), username, &peer_addr);
+                    // Refused inside MULTI, it is not queued, and EXEC runs nothing, as
+                    // for a command refused for any other reason (#159).
+                    if tx.active {
+                        tx.aborted = true;
+                    }
                     out_buf
                         .extend_from_slice(format!("-{}\r\n", denied.message(username)).as_bytes());
                     parse_offset += consumed;
@@ -1242,6 +1247,13 @@ pub async fn handle_client(
             // it has subscriptions. Mirrors the tokio loop in server.rs: inside
             // MULTI they are queued, and EXEC runs them (#23).
             if crate::pubsub::is_subscription_command(cmd_name.as_str()) && !tx.active {
+                if let Some(refusal) =
+                    crate::pubsub::shard_subscribe_refusal(cmd_name.as_str(), &cmd, &cluster_state)
+                {
+                    out_buf.extend_from_slice(&refusal);
+                    parse_offset += consumed;
+                    continue;
+                }
                 let subs = subscriptions.get_or_insert_with(|| {
                     open_subscriptions(&pubsub, &client_registry, client_id, &stream, &write_guard)
                 });
@@ -1265,6 +1277,14 @@ pub async fn handle_client(
             // A replica whose dataset may already be this master's is first
             // offered the fingerprint (see `replication::digest`), and the
             // connection stays a client until it asks again.
+            // A replica does not take replicas of its own (#144).
+            if (cmd_name == "PSYNC" || cmd_name == "SYNC") && repl_state.is_slave() {
+                out_buf.extend_from_slice(&crate::resp::write::resp_error(
+                    crate::replication::NOT_A_MASTER,
+                ));
+                parse_offset += consumed;
+                continue;
+            }
             if cmd_name == "PSYNC"
                 && let Some(offer) = repl_state.digest_offer(&client_registry, client_id, &cmd)
             {
@@ -1335,12 +1355,7 @@ pub async fn handle_client(
                                 // A key that has already expired is watched
                                 // as the absent key it is: its removal, when
                                 // it comes, is not a change.
-                                commands::helpers::lazy_expire_key(
-                                    &store,
-                                    &expiry_store,
-                                    selected_db,
-                                    key,
-                                );
+                                commands::helpers::lazy_expire_key(&store, selected_db, key);
                                 tx.watched_keys.push((selected_db, key.to_string()));
                                 watch_registry.as_ref().watch(
                                     selected_db,
@@ -1437,7 +1452,7 @@ pub async fn handle_client(
                     // has been modified, whether or not anything has got
                     // round to removing it. Removing it now says so.
                     for (db, key) in &tx.watched_keys {
-                        commands::helpers::lazy_expire_key(&store, &expiry_store, *db, key);
+                        commands::helpers::lazy_expire_key(&store, *db, key);
                     }
                     let refusal = if !tx.active {
                         None
@@ -1482,6 +1497,19 @@ pub async fn handle_client(
                         // command, the transaction is alone: no other command —
                         // read or write — runs in between. See `command_gate`.
                         let _alone = crate::command_gate::enter_alone();
+                        // And as one write: a snapshot, a backup or a full sync cuts
+                        // before it or after it, never between two of its commands
+                        // (#148). The writes it runs are inside this one.
+                        let _whole = crate::write_gate::enter();
+                        // And to replicas and the AOF as one: its writes in the
+                        // stream between a `MULTI` and an `EXEC`, its records
+                        // written together (#172). Dropped first, while the
+                        // gates are still held.
+                        let _propagation = crate::replication::PropagationGroup::begin(
+                            &repl_state,
+                            &hub_tx,
+                            &aof_tx,
+                        );
                         if dirty_flag.load(std::sync::atomic::Ordering::Acquire) {
                             watch_registry.as_ref().unwatch_all(
                                 &tx.watched_keys
@@ -1594,12 +1622,7 @@ pub async fn handle_client(
                                     if let Some((_, guard)) =
                                         guards.iter_mut().find(|(p, _)| *p == ptr)
                                     {
-                                        guard.insert(
-                                            store::Key::from(&**key),
-                                            crate::types::KiviDBValue::String(SharedBytes::from(
-                                                value.as_slice(),
-                                            )),
-                                        );
+                                        guard.insert_str_expiring(&**key, value, None);
                                     }
                                     // Notify while STILL HOLDING this key's shard lock. Doing this
                                     // after `drop(guards)` below would reopen the exact race this
@@ -1610,17 +1633,9 @@ pub async fn handle_client(
                                     // it here cannot deadlock against the shard lock we're holding.
                                     watch_registry.as_ref().notify(selected_db, key);
                                 }
-                                // Release before touching expiry_store, matching SET's own
-                                // handler: it's a separate lock, no need to hold both at once.
+                                // A plain SET takes the key's time to live away, in
+                                // the same step as it writes the value.
                                 drop(guards);
-
-                                for (key, _) in sets.iter() {
-                                    let exp_shard =
-                                        store::get_expiry_shard(&expiry_store[selected_db], key);
-                                    if exp_shard.read().contains_key(key.as_str()) {
-                                        exp_shard.write().remove(key.as_str());
-                                    }
-                                }
 
                                 let count = sets.len();
                                 let mut exec_out = format!("*{count}\r\n").into_bytes();
@@ -1630,7 +1645,6 @@ pub async fn handle_client(
                                     let cmd_ctx = Ctx {
                                         cmd: raw_cmd.iter().map(|v| v.as_slice()).collect(),
                                         store: &store,
-                                        expiry_store: &expiry_store,
                                         lastsave: &lastsave,
                                         selected_db: &mut selected_db,
                                         aof_tx: &aof_tx,
@@ -1735,7 +1749,6 @@ pub async fn handle_client(
                                     let r = commands::execute_command(Ctx {
                                         cmd: _exec_slices,
                                         store: &store,
-                                        expiry_store: &expiry_store,
                                         lastsave: &lastsave,
                                         selected_db: &mut selected_db,
                                         aof_tx: &aof_tx,
@@ -1781,7 +1794,6 @@ pub async fn handle_client(
                                     let r = commands::execute_command(Ctx {
                                         cmd: queued_borrowed,
                                         store: &store,
-                                        expiry_store: &expiry_store,
                                         lastsave: &lastsave,
                                         selected_db: &mut selected_db,
                                         aof_tx: &aof_tx,
@@ -1820,15 +1832,6 @@ pub async fn handle_client(
                                 };
 
                                 if elapsed_us >= slowlog.threshold_us() {
-                                    let elapsed_ms = (elapsed_us / 1000) as u32;
-                                    latency.record(
-                                        if elapsed_ms < 1 {
-                                            "fast-command"
-                                        } else {
-                                            "command"
-                                        },
-                                        elapsed_ms,
-                                    );
                                     slowlog.record(
                                         &raw_cmd,
                                         elapsed_us,
@@ -1862,6 +1865,10 @@ pub async fn handle_client(
                     // nopass users authenticate with any password.
                     if cmd.len() < 2 {
                         b"-ERR wrong number of arguments for 'auth' command\r\n".to_vec()
+                    } else if cmd.len() == 2 && crate::acl::default_user_is_open(&acl_store) {
+                        // As Redis: how a client learns that the password it
+                        // was given is not in use. It was answered OK (#135).
+                        crate::acl::AUTH_WITHOUT_PASSWORD.as_bytes().to_vec()
                     } else {
                         let (provided_username, provided_password) = if cmd.len() >= 3 {
                             // AUTH username password
@@ -2081,8 +2088,22 @@ pub async fn handle_client(
                 "WAITAOF" => {
                     if cmd.len() < 4 {
                         b"-ERR wrong number of arguments for 'waitaof' command\r\n".to_vec()
-                    } else if !aof_enabled {
-                        b"*2\r\n:1\r\n:0\r\n".to_vec()
+                    } else if !aof_enabled
+                        && !crate::aof::AOF_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        // Nothing goes to an AOF, so nothing is on disk by
+                        // one: it answered that the write was (#137). On at
+                        // the start, or turned on since by `CONFIG SET`.
+                        let num_local = std::str::from_utf8(cmd[1])
+                            .ok()
+                            .and_then(|s| s.parse::<i64>().ok())
+                            .unwrap_or(0);
+                        if num_local != 0 {
+                            b"-ERR WAITAOF cannot be used when numlocal is set but appendonly is disabled.\r\n"
+                                .to_vec()
+                        } else {
+                            b"*2\r\n:0\r\n:0\r\n".to_vec()
+                        }
                     } else {
                         let timeout_ms: u64 =
                             std::str::from_utf8(cmd.get(3).copied().unwrap_or(b"0"))
@@ -2227,7 +2248,6 @@ pub async fn handle_client(
                             let env = &*lua_env.get_or_insert_with(|| {
                                 crate::lua_vm_blocking::ClientExecEnv::snapshot(
                                     &store,
-                                    &expiry_store,
                                     &lastsave,
                                     crate::lua_vm_blocking::AofBridge::Tokio(aof_tx.clone()),
                                     &config,
@@ -2266,7 +2286,6 @@ pub async fn handle_client(
                             let r = commands::execute_command(Ctx {
                                 cmd,
                                 store: &store,
-                                expiry_store: &expiry_store,
                                 lastsave: &lastsave,
                                 selected_db: &mut selected_db,
                                 aof_tx: &aof_tx,
@@ -2310,7 +2329,6 @@ pub async fn handle_client(
                         let r = commands::execute_command(Ctx {
                             cmd,
                             store: &store,
-                            expiry_store: &expiry_store,
                             lastsave: &lastsave,
                             selected_db: &mut selected_db,
                             aof_tx: &aof_tx,
@@ -2347,15 +2365,6 @@ pub async fn handle_client(
                     };
 
                     if elapsed_us >= slowlog.threshold_us() {
-                        let elapsed_ms = (elapsed_us / 1000) as u32;
-                        latency.record(
-                            if elapsed_ms < 1 {
-                                "fast-command"
-                            } else {
-                                "command"
-                            },
-                            elapsed_ms,
-                        );
                         let client_name = client_registry
                             .get(client_id)
                             .map(|info| info.name.clone())
@@ -2457,10 +2466,16 @@ pub async fn handle_client(
         // they reach the client immediately instead of waiting for the next
         // command. The guard keeps the two writers from interleaving.
         activity.note_flush(out_buf.len(), commands_before);
+        activity.note_tx(tx.active.then_some(tx.queue.len()), tx.watched_keys.len());
+        // Replies to writes go out once their records are in the AOF (#147).
+        if std::mem::take(&mut aof_wait) {
+            crate::aof::written(&aof_tx).await;
+        }
         if !out_buf.is_empty() {
             std::mem::swap(&mut out_buf, &mut spare_buf);
             crate::stats::TOTAL_NET_OUTPUT_BYTES
                 .fetch_add(spare_buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::stats::record_write();
             let _w = write_guard.lock().await;
             let (res, returned) = stream.write_all(spare_buf).await;
             drop(_w);
@@ -2494,7 +2509,6 @@ pub async fn handle_client(
                 handle_replica_connection_uring(
                     stream,
                     Arc::clone(&store),
-                    Arc::clone(&expiry_store),
                     Arc::clone(&index_store),
                     hub_tx.clone(),
                     Arc::clone(&repl_state),

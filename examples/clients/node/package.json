@@ -1,0 +1,14 @@
+{
+  "name": "kividb-node-examples",
+  "private": true,
+  "type": "module",
+  "description": "KiviDB with ioredis and BullMQ",
+  "scripts": {
+    "quickstart": "node quickstart.mjs",
+    "bullmq": "node bullmq.mjs"
+  },
+  "dependencies": {
+    "bullmq": "^5.0.0",
+    "ioredis": "^5.4.0"
+  }
+}

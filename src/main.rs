@@ -19,6 +19,7 @@ pub mod cluster;
 pub mod cmdstats;
 pub mod command_gate;
 mod commands;
+mod compaction;
 mod config;
 pub mod eviction;
 pub mod field_expiry;
@@ -36,6 +37,7 @@ pub mod node_tls;
 pub mod pause;
 pub mod protected_mode;
 mod pubsub;
+pub mod redis_settings;
 pub mod replication;
 mod resp;
 mod script_clock;
@@ -50,6 +52,7 @@ pub mod tag_locks;
 pub mod tracking;
 pub mod types;
 mod update_check;
+mod value_slab;
 mod vector;
 pub mod wait_table;
 pub mod watch;
@@ -164,7 +167,11 @@ fn print_banner(threads: usize, config: &Arc<Config>) {
         println!("  * Memory         : {mem_gb}GiB available");
     }
     println!("  * CPUs           : {cores} cores detected");
-    println!("  * Listening on   : {bind}:{port}");
+    if port == 0 {
+        println!("  * Listening on   : no plaintext port (port 0): TLS only");
+    } else {
+        println!("  * Listening on   : {bind}:{port}");
+    }
 
     #[cfg(feature = "tls")]
     if config.tls_enabled() {
@@ -173,7 +180,7 @@ fn print_banner(threads: usize, config: &Arc<Config>) {
 
     // Cluster-specific lines, only when enabled
     if config.cluster_enabled {
-        let bus_port = port + 10000;
+        let bus_port = config.cluster_bus_port();
         println!("  * Cluster bus    : {bind}:{bus_port}");
         println!("  * Node timeout   : {}ms", config.cluster_node_timeout);
         // The node ID isn't known here — it's generated/loaded inside
@@ -329,6 +336,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // commands are spared looking for a tag to wait on.
     tag_locks::set_enabled(cfg!(feature = "lua") && config.lua_parallel_scripts);
     eviction::configure(&config);
+    compaction::configure(&config);
     keyspace_events::KS_FLAGS.store(
         keyspace_events::parse_ks_flags(&config.notify_keyspace_events),
         std::sync::atomic::Ordering::Relaxed,
@@ -366,6 +374,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "none".to_string()
         }
     );
+
+    // `backupdirname` is relative to `dir`, which is now the working
+    // directory.
+    commands::backup::recover(&config);
+    // `LASTSAVE` until the first save: the start, as in Redis (#149).
+    stats::record_save();
+    crate::commands::memory::note_startup();
 
     #[cfg(target_os = "linux")]
     match config.io_model {
@@ -590,6 +605,15 @@ fn claim_port(addr: &SocketAddr) -> std::io::Result<Option<std::os::unix::net::U
     }
 }
 
+/// Log that clients are taken on `addr`, or with port 0 that they are not.
+fn ready(addr: &SocketAddr) {
+    if addr.port() == 0 {
+        log_info!("No plaintext port (port 0): accepting TLS connections only");
+    } else {
+        log_info!("Ready to accept connections on {addr}");
+    }
+}
+
 /// The client listener, or a fatal error that says what to do about it.
 #[allow(dead_code)]
 async fn bind_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
@@ -601,8 +625,8 @@ async fn bind_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
 
 #[cfg(target_os = "linux")]
 fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std::error::Error>> {
+    stats::IO_URING.store(true, std::sync::atomic::Ordering::Relaxed);
     let store: store::Store = store::new_store(config.databases);
-    let expiry_store: store::ExpiryStore = store::new_expiry_store(config.databases);
     let index_store = vector::new_index_store();
     let lastsave = Arc::new(RwLock::new(0i64));
     let aof_enabled = config.aof;
@@ -674,17 +698,17 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     crate::stats::spawn_instantaneous_ops_sampler();
     crate::commands::helpers::spawn_active_expire_task(
         Arc::clone(&store),
-        Arc::clone(&expiry_store),
         Arc::clone(&index_store),
         pubsub.clone(),
         Arc::clone(&latency),
     );
+    crate::compaction::spawn(Arc::clone(&store));
     if config.cluster_enabled {
         log_info!(
             "Cluster: Node ID        : {}",
             crate::cluster::node_id_str(&cluster_state.myself())
         );
-        log_info!("Cluster: Bus port       : {}", config.port + 10000);
+        log_info!("Cluster: Bus port       : {}", config.cluster_bus_port());
     }
     let watch_registry = crate::watch::new_watch_registry();
     crate::watch::register_for(&store, &watch_registry);
@@ -703,7 +727,6 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
         let loaded = crate::aof::recover_local(
             config.aof,
             &store,
-            &expiry_store,
             &index_store,
             &dict_store,
             &wait_table,
@@ -744,7 +767,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                 .iter()
                 .any(|db| db.iter().any(|shard| !crate::read_lock!(shard).is_empty()))
         {
-            repl_state.fingerprint_at_start(&store, &expiry_store, &hub_tx);
+            repl_state.fingerprint_at_start(&store, &hub_tx);
         }
         if !loaded.index_names.is_empty() {
             vector::SNAPSHOT_INDEX_REBUILD.store(true, std::sync::atomic::Ordering::Release);
@@ -774,7 +797,6 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     // NEW — handles both OS signals AND command-issued SHUTDOWN
     let shutdown_signal = Arc::clone(&shutdown);
     let signal_snapshot_store = Arc::clone(&store);
-    let signal_snapshot_expiry_store = Arc::clone(&expiry_store);
     let signal_snapshot_index_store = Arc::clone(&index_store);
     let signal_repl_state = Arc::clone(&repl_state);
     std::thread::spawn(move || {
@@ -838,11 +860,20 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
 
                 if m != crate::shutdown::mode::NOSAVE {
                     log_info!("Writing final snapshot...");
+                    // No command runs from here to the exit: the snapshot is
+                    // cut at one moment (#148), and a write a connection
+                    // already open made after that moment was acknowledged
+                    // and then lost with the process. Taken alone, the gate
+                    // waits for the commands running now and lets no other
+                    // start; it is never let go. Forgotten, not kept in a
+                    // binding: one dropped at the end of this block opened
+                    // the gate again before `process::exit` below, and the
+                    // writes that ran in between were acknowledged and lost.
+                    std::mem::forget(crate::command_gate::enter_alone());
                     // With the replica's position in its master's stream
                     // beside it, so that the restart can ask to continue.
                     let result = crate::replication::save_dataset(
                         &signal_snapshot_store,
-                        &signal_snapshot_expiry_store,
                         &signal_snapshot_index_store,
                         &signal_repl_state,
                     );
@@ -888,21 +919,20 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
             .block_on(aof::start_aof_writer(tokio_rx))
     });
 
-    if aof_enabled {
-        aof::spawn_auto_rewrite_thread(
-            Arc::clone(&store),
-            Arc::clone(&expiry_store),
-            Arc::clone(&index_store),
-            config.aof_rewrite_percentage,
-            config.aof_rewrite_min_size,
-        );
-    }
+    // Whether or not the AOF is on now: `CONFIG SET appendonly yes` turns
+    // it on later, and its log is to be rewritten as one turned on at
+    // startup is (#146). With the AOF off, the thread only waits.
+    aof::spawn_auto_rewrite_thread(
+        Arc::clone(&store),
+        Arc::clone(&index_store),
+        config.aof_rewrite_percentage,
+        config.aof_rewrite_min_size,
+    );
 
     // Replica client — runs on its own thread and runtime (see
     // `ReplicaStarter::start`), so it never competes with the io_uring workers.
     let replica_starter = crate::replication::replica_client::ReplicaStarter {
         store: Arc::clone(&store),
-        expiry_store: Arc::clone(&expiry_store),
         index_store: Arc::clone(&index_store),
         dict_store: Arc::clone(&dict_store),
         wait_table: Arc::clone(&wait_table),
@@ -933,11 +963,16 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     // KiviDB started on it by mistake: it would come up "ready", and the
     // kernel would hand each of the two a share of the clients. Claim the
     // port first, and refuse to start if it is taken — as Redis would.
-    let _port_claim = match claim_port(&addr) {
-        Ok(claim) => claim,
-        Err(e) => {
-            log_fatal!("{}", cant_listen(&addr, &e));
-            std::process::exit(1);
+    // Port 0: no plaintext port, until `CONFIG SET port` opens one.
+    let _port_claim = if addr.port() == 0 {
+        None
+    } else {
+        match claim_port(&addr) {
+            Ok(claim) => claim,
+            Err(e) => {
+                log_fatal!("{}", cant_listen(&addr, &e));
+                std::process::exit(1);
+            }
         }
     };
 
@@ -970,7 +1005,6 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
             let mut inbox = inbox_ends[worker].take().expect("one inbox a worker");
             let shutdown = Arc::clone(&shutdown);
             let store = Arc::clone(&store);
-            let expiry_store = Arc::clone(&expiry_store);
             let lastsave = Arc::clone(&lastsave);
             let aof_tx = aof_tx.clone();
             let config = Arc::clone(&config);
@@ -995,23 +1029,28 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
             std::thread::spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     tokio_uring::start(async move {
-                        let socket =
-                            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
-                                .unwrap();
-                        socket.set_reuse_address(true).unwrap();
-                        socket.set_reuse_port(true).unwrap();
-                        socket.set_nonblocking(true).unwrap();
-                        if let Err(e) = socket.bind(&addr.into()).and_then(|()| socket.listen(1024)) {
-                            log_fatal!("{}", cant_listen(&addr, &e));
-                            std::process::exit(1);
-                        }
-
-                        let listener = tokio_uring::net::TcpListener::from_std(socket.into());
+                        // Port 0: none, until `CONFIG SET port` opens one.
+                        let listener = (addr.port() != 0).then(|| {
+                            let socket =
+                                socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+                                    .unwrap();
+                            socket.set_reuse_address(true).unwrap();
+                            socket.set_reuse_port(true).unwrap();
+                            socket.set_nonblocking(true).unwrap();
+                            if let Err(e) = socket.bind(&addr.into()).and_then(|()| socket.listen(1024)) {
+                                log_fatal!("{}", cant_listen(&addr, &e));
+                                std::process::exit(1);
+                            }
+                            tokio_uring::net::TcpListener::from_std(socket.into())
+                        });
                         // `CONFIG SET port` moves it.
-                        let mut listener =
-                            crate::listen::UringListener::new(listener, addr.port(), addr);
+                        let mut listener = crate::listen::UringListener::new(
+                            listener,
+                            crate::listen::server_of(&config),
+                            addr,
+                        );
                         static READY: std::sync::Once = std::sync::Once::new();
-                        READY.call_once(|| log_info!("Ready to accept connections on {addr}"));
+                        READY.call_once(|| ready(&addr));
 
                         /// One connection in a worker's count, until it is dropped.
                         struct Counted(Arc<Vec<std::sync::atomic::AtomicUsize>>, usize);
@@ -1026,7 +1065,6 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                         let start_client = std::rc::Rc::new(
                             move |stream: tokio_uring::net::TcpStream, peer_addr_str: String| {
                             let store = Arc::clone(&store);
-                            let expiry_store = Arc::clone(&expiry_store);
                             let lastsave = Arc::clone(&lastsave);
                             let aof_tx = aof_tx.clone();
                             let config = Arc::clone(&config);
@@ -1055,7 +1093,6 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                                 if let Err(e) = server_uring::handle_client(
                                     stream,
                                     store,
-                                    expiry_store,
                                     lastsave,
                                     aof_tx,
                                     aof_enabled,
@@ -1171,51 +1208,31 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
 
     // TLS uses Tokio's `TlsStream` + `server::handle_client` — same as the pure Tokio binary path.
     // io_uring stays on the cleartext port; TLS is accepted on `tls_port` in parallel.
+    // Also with no TLS port: `CONFIG SET tls-port` opens one.
     #[cfg(feature = "tls")]
-    if config.tls_enabled() {
+    {
         use crate::tls::acceptor;
-        use tokio::net::TcpListener;
 
-        let tls_acceptor = match acceptor::build(
-            &config.tls_cert_file,
-            &config.tls_key_file,
-            &config.tls_ca_cert_file,
-            &config.tls_auth_clients,
-        ) {
-            Ok(a) => a,
-            Err(e) => {
-                log_fatal!("TLS: {e}");
-                std::process::exit(1);
-            }
-        };
+        // Checked here, so that a certificate that cannot be loaded stops
+        // the server as it starts.
+        if config.tls_enabled()
+            && let Err(e) = acceptor::build(&acceptor::Files::of(&config))
+        {
+            log_fatal!("TLS: {e}");
+            std::process::exit(1);
+        }
 
         let tls_config = Arc::clone(&config);
         let tls_store = Arc::clone(&store);
-        let tls_expiry_store = expiry_store.clone();
         let tls_lastsave = Arc::clone(&lastsave);
-        // server::handle_client expects a tokio Sender; bridge from the std SyncSender once here.
-        let (tls_aof_tx, mut tls_aof_bridge_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        {
-            let std_tx = aof_tx.clone();
-            // io_uring `run_uring` has no Tokio runtime on the main thread — cannot use `tokio::spawn` here.
-            std::thread::spawn(move || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(async move {
-                        while let Some(msg) = tls_aof_bridge_rx.recv().await {
-                            // Same contract as AofSender: a record is
-                            // never dropped silently. The only failure
-                            // here is a gone consumer (shutdown).
-                            if std_tx.send(msg).is_err() {
-                                crate::aof::record_lost_aof_record();
-                                break;
-                            }
-                        }
-                    });
-            });
-        }
+        // The writer's own queue, as plaintext connections have. A reply to a
+        // write waits until a barrier sent on this queue is in the file, and
+        // the connection writes the queue itself to get there (`aof::written`).
+        // TLS connections used to have a queue of their own, copied onto this
+        // one by a task: the barrier was still on that queue when the
+        // connection wrote, and nothing else wrote it until the next
+        // once-a-second sync, so each write over TLS waited up to a second.
+        let tls_aof_tx = aof_tx.clone();
         let tls_started_at = Arc::clone(&started_at);
         let tls_index_store = Arc::clone(&index_store);
         let tls_wait_table = Arc::clone(&wait_table);
@@ -1236,7 +1253,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
         let tls_tracking_table = Arc::clone(&tracking_table);
         let tls_aof_enabled = aof_enabled;
 
-        let listen_acceptor = tls_acceptor.clone();
+        let server = crate::listen::server_of(&config);
         std::thread::spawn(move || {
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -1244,23 +1261,13 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                 .build()
                 .unwrap()
                 .block_on(async move {
-                    let tls_addr: SocketAddr =
-                        format!("{}:{}", tls_config.bind, tls_config.tls_port)
-                            .parse()
-                            .expect("invalid TLS bind address");
-                    let tls_listener = match TcpListener::bind(tls_addr).await {
+                    let mut tls_listener = match acceptor::listener(&tls_config) {
                         Ok(l) => l,
                         Err(e) => {
                             log_warn!("TLS: bind failed on io_uring binary path: {e}");
                             return;
                         }
                     };
-
-                    log_info!(
-                        "TLS listener   : {}:{}",
-                        tls_config.bind,
-                        tls_config.tls_port
-                    );
 
                     loop {
                         let (tcp_stream, peer_addr) = match tls_listener.accept().await {
@@ -1271,7 +1278,11 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                             }
                         };
 
-                        let tls_stream = match listen_acceptor.clone().accept(tcp_stream).await {
+                        // Installed before the port is opened.
+                        let Some(acceptor) = acceptor::current(server) else {
+                            continue;
+                        };
+                        let tls_stream = match acceptor.accept(tcp_stream).await {
                             Ok(s) => s,
                             Err(e) => {
                                 // Full `Debug` — rustls errors often have empty `Display`; memtier may log "(null)" for the same failure.
@@ -1286,7 +1297,6 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                         let peer_addr_str = peer_addr.to_string();
 
                         let store = Arc::clone(&tls_store);
-                        let expiry_store = tls_expiry_store.clone();
                         let lastsave = Arc::clone(&tls_lastsave);
                         let aof_tx = tls_aof_tx.clone();
                         let config = Arc::clone(&tls_config);
@@ -1313,7 +1323,6 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                             if let Err(e) = server::handle_client(
                                 tls_stream,
                                 store,
-                                expiry_store,
                                 lastsave,
                                 aof_tx,
                                 tls_aof_enabled,
@@ -1381,7 +1390,6 @@ async fn async_main_tokio(
     log_info!("Bind address   : {}", config.addr());
 
     let store: store::Store = store::new_store(config.databases);
-    let expiry_store: store::ExpiryStore = store::new_expiry_store(config.databases);
     let lastsave = Arc::new(RwLock::new(0i64));
     let aof_enabled = config.aof;
     // Initialise the runtime toggle to match the startup flag.
@@ -1407,11 +1415,11 @@ async fn async_main_tokio(
     let latency = crate::latency::new_latency_tracker();
     crate::commands::helpers::spawn_active_expire_task(
         Arc::clone(&store),
-        Arc::clone(&expiry_store),
         Arc::clone(&index_store),
         pubsub.clone(),
         Arc::clone(&latency),
     );
+    crate::compaction::spawn(Arc::clone(&store));
     let watch_registry = crate::watch::new_watch_registry();
     crate::watch::register_for(&store, &watch_registry);
     let client_registry = crate::client_registry::new_client_registry();
@@ -1440,7 +1448,7 @@ async fn async_main_tokio(
             "Cluster: Node ID        : {}",
             crate::cluster::node_id_str(&cluster_state.myself())
         );
-        log_info!("Cluster: Bus port       : {}", config.port + 10000);
+        log_info!("Cluster: Bus port       : {}", config.cluster_bus_port());
     }
 
     if !config.aclfile.is_empty() {
@@ -1466,7 +1474,6 @@ async fn async_main_tokio(
         let loaded = crate::aof::recover_local(
             config.aof,
             &store,
-            &expiry_store,
             &index_store,
             &dict_store,
             &wait_table,
@@ -1507,11 +1514,13 @@ async fn async_main_tokio(
                 .iter()
                 .any(|db| db.iter().any(|shard| !crate::read_lock!(shard).is_empty()))
         {
-            repl_state.fingerprint_at_start(&store, &expiry_store, &hub_tx);
+            repl_state.fingerprint_at_start(&store, &hub_tx);
         }
         if !loaded.index_names.is_empty() {
             vector::SNAPSHOT_INDEX_REBUILD.store(true, std::sync::atomic::Ordering::Release);
-            listener_early = Some(bind_listener(addr).await?);
+            if addr.port() != 0 {
+                listener_early = Some(bind_listener(addr).await?);
+            }
             if loaded.hnsw_loaded {
                 log_info!(
                     "Listening on {addr} — HNSW graph(s) loaded from snapshot; running text/numeric index pass in background"
@@ -1536,15 +1545,15 @@ async fn async_main_tokio(
     // occupy every worker thread and the writer would never be polled -- the
     // server would hang holding all locks. A dedicated runtime makes that
     // impossible. (The io_uring path already does this for its own reasons.)
-    if aof_enabled {
-        aof::spawn_auto_rewrite_thread(
-            Arc::clone(&store),
-            Arc::clone(&expiry_store),
-            Arc::clone(&index_store),
-            config.aof_rewrite_percentage,
-            config.aof_rewrite_min_size,
-        );
-    }
+    // Whether or not the AOF is on now: `CONFIG SET appendonly yes` turns
+    // it on later, and its log is to be rewritten as one turned on at
+    // startup is (#146). With the AOF off, the thread only waits.
+    aof::spawn_auto_rewrite_thread(
+        Arc::clone(&store),
+        Arc::clone(&index_store),
+        config.aof_rewrite_percentage,
+        config.aof_rewrite_min_size,
+    );
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1557,7 +1566,6 @@ async fn async_main_tokio(
     // `ReplicaStarter::start`).
     let replica_starter = crate::replication::replica_client::ReplicaStarter {
         store: Arc::clone(&store),
-        expiry_store: Arc::clone(&expiry_store),
         index_store: Arc::clone(&index_store),
         dict_store: Arc::clone(&dict_store),
         wait_table: Arc::clone(&wait_table),
@@ -1583,56 +1591,45 @@ async fn async_main_tokio(
     start_configured_replication(&config, &cluster_state, &replica_starter);
 
     // ONE listener — tokio's multi-thread runtime handles distribution
+    // Port 0: none, until `CONFIG SET port` opens one.
     let listener = match listener_early {
-        Some(l) => l,
-        None => bind_listener(addr).await?,
+        Some(l) => Some(l),
+        None if addr.port() == 0 => None,
+        None => Some(bind_listener(addr).await?),
     };
     // `CONFIG SET port` moves it.
-    let mut listener = crate::listen::Listener::new(listener, addr.port());
-    log_info!("Ready to accept connections on {addr}");
+    let mut listener = crate::listen::Listener::new(
+        listener,
+        addr,
+        crate::listen::server_of(&config),
+        crate::listen::Kind::Plain,
+    );
+    ready(&addr);
 
+    // Also with no TLS port: `CONFIG SET tls-port` opens one.
     #[cfg(feature = "tls")]
-    if config.tls_enabled() {
+    {
         use crate::tls::acceptor;
 
-        let tls_acceptor = match acceptor::build(
-            &config.tls_cert_file,
-            &config.tls_key_file,
-            &config.tls_ca_cert_file,
-            &config.tls_auth_clients,
-        ) {
-            Ok(a) => a,
+        let mut tls_listener = match acceptor::listener(&config) {
+            Ok(listener) => listener,
             Err(e) => {
                 log_fatal!("TLS: {e}");
                 std::process::exit(1);
             }
         };
 
-        let tls_addr: SocketAddr = format!("{}:{}", config.bind, config.tls_port)
-            .parse()
-            .expect("invalid TLS bind address");
-        let tls_listener = TcpListener::bind(tls_addr).await?;
-
-        log_info!("TLS listener   : {}:{}", config.bind, config.tls_port);
-
         let tls_config = Arc::clone(&config);
         let tls_store = Arc::clone(&store);
-        let tls_expiry_store = expiry_store.clone();
         let tls_lastsave = Arc::clone(&lastsave);
-        // server::handle_client expects a tokio Sender; bridge from the std SyncSender once here.
-        let (tls_aof_tx, mut tls_aof_bridge_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        {
-            let std_tx = aof_tx.clone();
-            tokio::spawn(async move {
-                while let Some(msg) = tls_aof_bridge_rx.recv().await {
-                    // Same contract as AofSender: never drop silently.
-                    if std_tx.send(msg).is_err() {
-                        crate::aof::record_lost_aof_record();
-                        break;
-                    }
-                }
-            });
-        }
+        // The writer's own queue, as plaintext connections have. A reply to a
+        // write waits until a barrier sent on this queue is in the file, and
+        // the connection writes the queue itself to get there (`aof::written`).
+        // TLS connections used to have a queue of their own, copied onto this
+        // one by a task: the barrier was still on that queue when the
+        // connection wrote, and nothing else wrote it until the next
+        // once-a-second sync, so each write over TLS waited up to a second.
+        let tls_aof_tx = aof_tx.clone();
         let tls_started_at = Arc::clone(&started_at);
         let tls_index_store = Arc::clone(&index_store);
         let tls_wait_table = Arc::clone(&wait_table);
@@ -1652,7 +1649,7 @@ async fn async_main_tokio(
         let tls_monitor_registry = Arc::clone(&monitor_registry);
         let tls_tracking_table = Arc::clone(&tracking_table);
 
-        let listen_acceptor = tls_acceptor.clone();
+        let server = crate::listen::server_of(&config);
         tokio::spawn(async move {
             loop {
                 let (tcp_stream, peer_addr) = match tls_listener.accept().await {
@@ -1663,7 +1660,11 @@ async fn async_main_tokio(
                     }
                 };
 
-                let tls_stream = match listen_acceptor.accept(tcp_stream).await {
+                // Installed before the port is opened.
+                let Some(acceptor) = acceptor::current(server) else {
+                    continue;
+                };
+                let tls_stream = match acceptor.accept(tcp_stream).await {
                     Ok(s) => s,
                     Err(e) => {
                         log_verbose!("TLS: handshake failed from {peer_addr}: {e} ({e:?})");
@@ -1677,7 +1678,6 @@ async fn async_main_tokio(
                 let peer_addr_str = peer_addr.to_string();
 
                 let store = Arc::clone(&tls_store);
-                let expiry_store = tls_expiry_store.clone();
                 let lastsave = Arc::clone(&tls_lastsave);
                 let aof_tx = tls_aof_tx.clone();
                 let config = Arc::clone(&tls_config);
@@ -1704,7 +1704,6 @@ async fn async_main_tokio(
                     if let Err(e) = server::handle_client(
                         tls_stream,
                         store,
-                        expiry_store,
                         lastsave,
                         aof_tx,
                         aof_enabled,
@@ -1752,7 +1751,6 @@ async fn async_main_tokio(
     };
 
     let snapshot_store = Arc::clone(&store);
-    let snapshot_expiry_store = Arc::clone(&expiry_store);
     let snapshot_index_store = Arc::clone(&index_store);
     let snapshot_repl_state = Arc::clone(&repl_state);
     // Interval that fires every 50ms to check for command-issued SHUTDOWN.
@@ -1777,7 +1775,6 @@ async fn async_main_tokio(
                         {
                         let peer_addr_str = peer_addr.to_string();
                         let store = Arc::clone(&store);
-                        let expiry_store = Arc::clone(&expiry_store);
                         let lastsave = Arc::clone(&lastsave);
                         let aof_tx = aof_tx.clone();
                         let config = Arc::clone(&config);
@@ -1803,7 +1800,6 @@ async fn async_main_tokio(
                             if let Err(e) = server::handle_client(
                                 socket,
                                 store,
-                                expiry_store,
                                 lastsave,
                                 aof_tx,
                                 aof_enabled,
@@ -1875,7 +1871,6 @@ async fn async_main_tokio(
                         {
                         let peer_addr_str = peer_addr.to_string();
                         let store = Arc::clone(&store);
-                        let expiry_store = Arc::clone(&expiry_store);
                         let lastsave = Arc::clone(&lastsave);
                         let aof_tx = aof_tx.clone();
                         let config = Arc::clone(&config);
@@ -1901,7 +1896,6 @@ async fn async_main_tokio(
                             if let Err(e) = server::handle_client(
                                 socket,
                                 store,
-                                expiry_store,
                                 lastsave,
                                 aof_tx,
                                 aof_enabled,
@@ -1970,13 +1964,19 @@ async fn async_main_tokio(
     if m != mode::NOSAVE {
         log_info!("Stopping — writing final snapshot...");
         let store_c = Arc::clone(&snapshot_store);
-        let expiry_c = Arc::clone(&snapshot_expiry_store);
         let index_c = Arc::clone(&snapshot_index_store);
         let repl_c = Arc::clone(&snapshot_repl_state);
         // With the replica's position in its master's stream beside it, so
         // that the restart can ask to continue.
         let result = tokio::task::spawn_blocking(move || {
-            crate::replication::save_dataset(&store_c, &expiry_c, &index_c, &repl_c)
+            // No command runs from here to the exit, as on io_uring above:
+            // the connections already open keep running, and a write one
+            // made after the snapshot's cut was acknowledged and then lost.
+            // The guard is this thread's, and is never let go.
+            let _no_more_commands = crate::command_gate::enter_alone();
+            let saved = crate::replication::save_dataset(&store_c, &index_c, &repl_c);
+            std::mem::forget(_no_more_commands);
+            saved
         })
         .await;
         match result {

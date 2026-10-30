@@ -8,6 +8,7 @@ pub mod cluster;
 pub mod cmdstats;
 pub mod command_gate;
 pub mod commands;
+pub mod compaction;
 pub mod config;
 pub mod eviction;
 pub mod field_expiry;
@@ -23,6 +24,7 @@ pub mod node_tls;
 pub mod pause;
 pub mod protected_mode;
 pub mod pubsub;
+pub mod redis_settings;
 pub mod replication;
 pub mod resp;
 pub mod script_clock;
@@ -37,6 +39,7 @@ pub mod tag_locks;
 pub mod tracking;
 pub mod types;
 pub mod update_check;
+pub mod value_slab;
 pub mod vector;
 pub mod wait_table;
 pub mod watch;
@@ -70,10 +73,13 @@ pub fn run_for_test(config: config::Config) {
         crate::tag_locks::set_enabled(true);
     }
     crate::eviction::configure(&cfg);
+    crate::compaction::configure(&cfg);
     if let Err(e) = crate::node_tls::init(&cfg) {
         panic!("TLS between nodes: {e}");
     }
     crate::protected_mode::set(cfg.protected_mode);
+    crate::stats::record_save();
+    crate::commands::memory::note_startup();
     let started_at = std::time::Instant::now();
 
     tokio::runtime::Builder::new_multi_thread()
@@ -96,7 +102,6 @@ async fn server_tokio(
     use tokio::sync::mpsc;
 
     let store = store::new_store(config.databases);
-    let expiry_store = store::new_expiry_store(config.databases);
     let index_store = vector::new_index_store();
     let lastsave = Arc::new(RwLock::new(0i64));
     let aof_enabled = config.aof;
@@ -120,11 +125,11 @@ async fn server_tokio(
     let latency = crate::latency::new_latency_tracker();
     crate::commands::helpers::spawn_active_expire_task(
         Arc::clone(&store),
-        Arc::clone(&expiry_store),
         Arc::clone(&index_store),
         pubsub.clone(),
         Arc::clone(&latency),
     );
+    crate::compaction::spawn(Arc::clone(&store));
     let watch_registry = crate::watch::new_watch_registry();
     crate::watch::register_for(&store, &watch_registry);
     let client_registry = crate::client_registry::new_client_registry();
@@ -188,7 +193,6 @@ async fn server_tokio(
     // `ReplicaStarter::start`).
     let replica_starter = crate::replication::replica_client::ReplicaStarter {
         store: Arc::clone(&store),
-        expiry_store: Arc::clone(&expiry_store),
         index_store: Arc::clone(&index_store),
         dict_store: Arc::clone(&dict_store),
         wait_table: Arc::clone(&wait_table),
@@ -224,35 +228,28 @@ async fn server_tokio(
     }
 
     let addr: SocketAddr = config.addr().parse()?;
-    let listener = TcpListener::bind(addr).await?;
+    // Port 0: no plaintext port, until `CONFIG SET port` opens one.
+    let listener = if addr.port() == 0 {
+        None
+    } else {
+        Some(TcpListener::bind(addr).await?)
+    };
 
+    // Also with no TLS port: `CONFIG SET tls-port` opens one.
     #[cfg(feature = "tls")]
-    if config.tls_enabled() {
+    {
         use crate::tls::acceptor;
 
-        let tls_acceptor = match acceptor::build(
-            &config.tls_cert_file,
-            &config.tls_key_file,
-            &config.tls_ca_cert_file,
-            &config.tls_auth_clients,
-        ) {
-            Ok(a) => a,
+        let mut tls_listener = match acceptor::listener(&config) {
+            Ok(listener) => listener,
             Err(e) => {
                 log_fatal!("TLS: {e}");
                 std::process::exit(1);
             }
         };
 
-        let tls_addr: SocketAddr = format!("{}:{}", config.bind, config.tls_port)
-            .parse()
-            .expect("invalid TLS bind address");
-        let tls_listener = TcpListener::bind(tls_addr).await?;
-
-        log_info!("TLS listener   : {}:{}", config.bind, config.tls_port);
-
         let tls_config = Arc::clone(&config);
         let tls_store = Arc::clone(&store);
-        let tls_expiry_store = expiry_store.clone();
         let tls_lastsave = Arc::clone(&lastsave);
         let tls_aof_tx = aof_tx.clone();
         let tls_started_at = Arc::clone(&started_at);
@@ -274,7 +271,7 @@ async fn server_tokio(
         let tls_monitor_registry = Arc::clone(&monitor_registry);
         let tls_tracking_table = Arc::clone(&tracking_table);
 
-        let listen_acceptor = tls_acceptor.clone();
+        let server = crate::listen::server_of(&config);
         tokio::spawn(async move {
             loop {
                 let (tcp_stream, peer_addr) = match tls_listener.accept().await {
@@ -285,7 +282,11 @@ async fn server_tokio(
                     }
                 };
 
-                let tls_stream = match listen_acceptor.accept(tcp_stream).await {
+                // Installed before the port is opened.
+                let Some(acceptor) = acceptor::current(server) else {
+                    continue;
+                };
+                let tls_stream = match acceptor.accept(tcp_stream).await {
                     Ok(s) => s,
                     Err(e) => {
                         log_verbose!("TLS: handshake failed from {peer_addr}: {e} ({e:?})");
@@ -298,7 +299,6 @@ async fn server_tokio(
                 let peer_addr_str = peer_addr.to_string();
 
                 let store = Arc::clone(&tls_store);
-                let expiry_store = tls_expiry_store.clone();
                 let lastsave = Arc::clone(&tls_lastsave);
                 let aof_tx = tls_aof_tx.clone();
                 let config = Arc::clone(&tls_config);
@@ -325,7 +325,6 @@ async fn server_tokio(
                     let _ = server::handle_client(
                         tls_stream,
                         store,
-                        expiry_store,
                         lastsave,
                         aof_tx,
                         aof_enabled,
@@ -356,7 +355,12 @@ async fn server_tokio(
         });
     }
 
-    let mut listener = crate::listen::Listener::new(listener, config.port);
+    let mut listener = crate::listen::Listener::new(
+        listener,
+        addr,
+        crate::listen::server_of(&config),
+        crate::listen::Kind::Plain,
+    );
     loop {
         let (socket, peer_addr) = match listener.accept().await {
             Ok(v) => v,
@@ -365,7 +369,6 @@ async fn server_tokio(
         crate::stats::TOTAL_CONNECTIONS_RECEIVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let peer_addr_str = peer_addr.to_string();
         let store = Arc::clone(&store);
-        let expiry_store = Arc::clone(&expiry_store);
         let index_store = Arc::clone(&index_store);
         let lastsave = Arc::clone(&lastsave);
         let aof_tx = aof_tx.clone();
@@ -391,7 +394,6 @@ async fn server_tokio(
             let _ = server::handle_client(
                 socket,
                 store,
-                expiry_store,
                 lastsave,
                 aof_tx,
                 aof_enabled,

@@ -232,7 +232,461 @@ fn start_server_with_tls(plain_port: u16, tls_port: u16, certs: &TempCerts) {
     }
 }
 
+/// Whether a client that trusts only `cert_der` completes a handshake.
+fn handshake_ok(port: u16, cert_der: &[u8]) -> bool {
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(cert_der.to_vec()))
+        .unwrap();
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async move {
+            let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let name = rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
+            let Ok(mut tls) = connector.connect(name, stream).await else {
+                return false;
+            };
+            // TLS 1.3: a refused certificate shows at the first read.
+            tls.write_all(b"*1\r\n$4\r\nPING\r\n").await.is_ok() && {
+                let mut reply = [0u8; 7];
+                tls.read_exact(&mut reply).await.is_ok() && &reply == b"+PONG\r\n"
+            }
+        })
+}
+
+fn plain_cmd(port: u16, args: &[&str]) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    send_cmd(&mut stream, args);
+    let line = read_resp(&mut stream);
+    match line.strip_prefix('*') {
+        Some(n) => (0..n.parse::<usize>().unwrap())
+            .map(|_| read_resp(&mut stream))
+            .collect::<Vec<_>>()
+            .join(" "),
+        None => line,
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// `CONFIG SET` of the certificate and key loads them, for every handshake
+/// from then on, also when the path is the same and the file was renewed in
+/// place; files that cannot be loaded change nothing (#156).
+#[test]
+fn config_set_loads_a_new_certificate() {
+    let first = generate_certs();
+    let plain = free_port();
+    let tls = free_port();
+    start_server_with_tls(plain, tls, &first);
+    assert!(handshake_ok(tls, &first.cert_der));
+
+    let second = generate_certs();
+    let reply = plain_cmd(
+        plain,
+        &[
+            "CONFIG",
+            "SET",
+            "tls-cert-file",
+            second.cert_path.to_str().unwrap(),
+            "tls-key-file",
+            second.key_path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(reply, "OK");
+    assert!(handshake_ok(tls, &second.cert_der));
+    assert!(!handshake_ok(tls, &first.cert_der));
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "GET", "tls-cert-file"]),
+        format!("tls-cert-file {}", second.cert_path.to_str().unwrap())
+    );
+
+    // Renewed in place: the same paths, new files.
+    let renewed = generate_certs();
+    std::fs::copy(&renewed.cert_path, &second.cert_path).unwrap();
+    std::fs::copy(&renewed.key_path, &second.key_path).unwrap();
+    assert!(handshake_ok(tls, &second.cert_der));
+    let reply = plain_cmd(
+        plain,
+        &[
+            "CONFIG",
+            "SET",
+            "tls-cert-file",
+            second.cert_path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(reply, "OK");
+    assert!(handshake_ok(tls, &renewed.cert_der));
+
+    // A certificate without its key: refused, and nothing changes.
+    let reply = plain_cmd(
+        plain,
+        &[
+            "CONFIG",
+            "SET",
+            "tls-cert-file",
+            first.cert_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        reply.contains("Unable to update TLS configuration"),
+        "{reply}"
+    );
+    let reply = plain_cmd(plain, &["CONFIG", "SET", "tls-cert-file", "/no/such/file"]);
+    assert!(reply.starts_with("ERR CONFIG SET failed"), "{reply}");
+    assert!(handshake_ok(tls, &renewed.cert_der));
+}
+
+// ── TLS port changed at runtime ───────────────────────────────────────────────
+
+/// Wait until something listens on `port`.
+fn wait_open(port: u16) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "server port {port} never opened"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Whether nothing listens on `port`: a connection to it is refused.
+/// Whether nothing accepts on `port`, within two seconds. A port closed with
+/// `CONFIG SET` is let go by each accept loop as it wakes, a moment after
+/// the reply (on io_uring the reply comes from the same thread as the loop,
+/// so it cannot wait for it): CI caught it still open the instant after.
+fn closed(port: u16) -> bool {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_err() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A server with a plaintext port only, as one starts without TLS.
+fn start_server_without_tls() -> u16 {
+    let plain = free_port();
+    let cfg = kividb::config::Config {
+        port: plain,
+        bind: "127.0.0.1".to_string(),
+        ..Default::default()
+    };
+    thread::spawn(move || kividb::run_for_test(cfg));
+    wait_open(plain);
+    plain
+}
+
+/// `CONFIG SET tls-port` moves the TLS port, closes it with 0 and opens it
+/// again; a TLS connection made before stays up through all of it.
+#[test]
+fn config_set_tls_port_moves_closes_and_opens_it() {
+    let certs = generate_certs();
+    let plain = free_port();
+    let first = free_port();
+    start_server_with_tls(plain, first, &certs);
+    let mut kept = make_tls_client(first, &certs.cert_der);
+    send_cmd(&mut kept, &["SET", "kept", "1"]);
+    assert_eq!(read_resp(&mut kept), "OK");
+
+    let second = free_port();
+    let reply = plain_cmd(plain, &["CONFIG", "SET", "tls-port", &second.to_string()]);
+    assert_eq!(reply, "OK");
+    assert!(handshake_ok(second, &certs.cert_der));
+    assert!(closed(first), "the old TLS port is still open");
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "GET", "tls-port"]),
+        format!("tls-port {second}")
+    );
+    assert!(plain_cmd(plain, &["INFO", "tls"]).contains(&format!("tls_port:{second}")));
+    send_cmd(&mut kept, &["GET", "kept"]);
+    assert_eq!(read_resp(&mut kept), "1");
+
+    // Closed: the port only; the connection made before stays.
+    assert_eq!(plain_cmd(plain, &["CONFIG", "SET", "tls-port", "0"]), "OK");
+    assert!(closed(second), "the TLS port is still open");
+    let info = plain_cmd(plain, &["INFO", "tls"]);
+    assert!(
+        info.contains("tls_enabled:0") && info.contains("tls_port:0"),
+        "{info}"
+    );
+    send_cmd(&mut kept, &["PING"]);
+    assert_eq!(read_resp(&mut kept), "PONG");
+
+    // And opened again.
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "SET", "tls-port", &first.to_string()]),
+        "OK"
+    );
+    assert!(handshake_ok(first, &certs.cert_der));
+    send_cmd(&mut kept, &["PING"]);
+    assert_eq!(read_resp(&mut kept), "PONG");
+}
+
+/// A server that started without TLS is given it with `CONFIG SET`: the
+/// certificate, its key and the port in one, or one after the other.
+#[test]
+fn config_set_turns_tls_on_at_runtime() {
+    let certs = generate_certs();
+    let cert = certs.cert_path.to_str().unwrap();
+    let key = certs.key_path.to_str().unwrap();
+
+    let plain = start_server_without_tls();
+    let tls = free_port();
+    let reply = plain_cmd(
+        plain,
+        &[
+            "CONFIG",
+            "SET",
+            "tls-port",
+            &tls.to_string(),
+            "tls-cert-file",
+            cert,
+            "tls-key-file",
+            key,
+        ],
+    );
+    assert_eq!(reply, "OK");
+    assert!(handshake_ok(tls, &certs.cert_der));
+    let mut conn = make_tls_client(tls, &certs.cert_der);
+    send_cmd(&mut conn, &["SET", "over", "tls"]);
+    assert_eq!(read_resp(&mut conn), "OK");
+    assert_eq!(plain_cmd(plain, &["GET", "over"]), "tls");
+
+    // One at a time: the port is refused until there is a certificate and
+    // a key to serve it with.
+    let plain = start_server_without_tls();
+    let tls = free_port();
+    let reply = plain_cmd(plain, &["CONFIG", "SET", "tls-port", &tls.to_string()]);
+    assert!(reply.contains("tls-cert-file and tls-key-file"), "{reply}");
+    assert!(closed(tls));
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "GET", "tls-port"]),
+        "tls-port 0"
+    );
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "SET", "tls-cert-file", cert]),
+        "OK"
+    );
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "SET", "tls-key-file", key]),
+        "OK"
+    );
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "SET", "tls-port", &tls.to_string()]),
+        "OK"
+    );
+    assert!(handshake_ok(tls, &certs.cert_der));
+}
+
+/// What cannot be done is refused with an error, and changes nothing.
+#[test]
+fn config_set_tls_refuses_what_it_cannot_do() {
+    let certs = generate_certs();
+    let cert = certs.cert_path.to_str().unwrap();
+    let key = certs.key_path.to_str().unwrap();
+
+    // Files that cannot be loaded, on a server without TLS.
+    let plain = start_server_without_tls();
+    let tls = free_port();
+    let reply = plain_cmd(
+        plain,
+        &[
+            "CONFIG",
+            "SET",
+            "tls-cert-file",
+            "/no/such/file",
+            "tls-key-file",
+            key,
+            "tls-port",
+            &tls.to_string(),
+        ],
+    );
+    assert!(
+        reply.contains("Unable to update TLS configuration"),
+        "{reply}"
+    );
+    assert!(closed(tls));
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "GET", "tls-cert-file"]),
+        "tls-cert-file "
+    );
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "GET", "tls-port"]),
+        "tls-port 0"
+    );
+
+    // Not a port.
+    for bad in ["abc", "-1", "65536"] {
+        let reply = plain_cmd(plain, &["CONFIG", "SET", "tls-port", bad]);
+        assert!(reply.starts_with("ERR CONFIG SET failed"), "{bad}: {reply}");
+    }
+
+    // A port something else has.
+    let plain = free_port();
+    let tls = free_port();
+    start_server_with_tls(plain, tls, &certs);
+    let taken = free_port();
+    let _holder = std::net::TcpListener::bind(("127.0.0.1", taken)).unwrap();
+    let reply = plain_cmd(plain, &["CONFIG", "SET", "tls-port", &taken.to_string()]);
+    assert!(reply.contains("Unable to listen on this port"), "{reply}");
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "GET", "tls-port"]),
+        format!("tls-port {tls}")
+    );
+    assert!(handshake_ok(tls, &certs.cert_der));
+
+    // With the TLS port open, a certificate that does not load is refused.
+    let reply = plain_cmd(plain, &["CONFIG", "SET", "tls-cert-file", "/no/such/file"]);
+    assert!(
+        reply.contains("Unable to update TLS configuration"),
+        "{reply}"
+    );
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "GET", "tls-cert-file"]),
+        format!("tls-cert-file {cert}")
+    );
+    assert!(handshake_ok(tls, &certs.cert_der));
+}
+
+// ── No plaintext port (port 0) ────────────────────────────────────────────────
+
+/// A command's reply on `conn`, arrays joined by spaces, as `plain_cmd`.
+fn cmd_on(conn: &mut (impl Read + Write), args: &[&str]) -> String {
+    send_cmd(conn, args);
+    let line = read_resp(conn);
+    match line.strip_prefix('*') {
+        Some(n) => (0..n.parse::<usize>().unwrap())
+            .map(|_| read_resp(conn))
+            .collect::<Vec<_>>()
+            .join(" "),
+        None => line,
+    }
+}
+
+/// `port 0` with a TLS port: the server listens on the TLS port only, and
+/// `CONFIG SET port` opens a plaintext port and closes it again.
+#[test]
+fn port_0_at_startup_serves_tls_only() {
+    let certs = generate_certs();
+    let tls = free_port();
+    let cfg = kividb::config::Config {
+        port: 0,
+        bind: "127.0.0.1".to_string(),
+        tls_port: tls,
+        tls_cert_file: certs.cert_path.to_str().unwrap().to_string(),
+        tls_key_file: certs.key_path.to_str().unwrap().to_string(),
+        ..Default::default()
+    };
+    assert!(cfg.validate(true).is_ok());
+    thread::spawn(move || kividb::run_for_test(cfg));
+    wait_open(tls);
+
+    let mut conn = make_tls_client(tls, &certs.cert_der);
+    assert_eq!(cmd_on(&mut conn, &["PING"]), "PONG");
+    assert_eq!(cmd_on(&mut conn, &["CONFIG", "GET", "port"]), "port 0");
+    assert!(cmd_on(&mut conn, &["INFO", "server"]).contains("tcp_port:0\r\n"));
+    // Nothing to close the TLS port in favour of.
+    let reply = cmd_on(&mut conn, &["CONFIG", "SET", "tls-port", "0"]);
+    assert!(reply.contains("set port first"), "{reply}");
+    assert!(handshake_ok(tls, &certs.cert_der));
+
+    let plain = free_port();
+    assert_eq!(
+        cmd_on(&mut conn, &["CONFIG", "SET", "port", &plain.to_string()]),
+        "OK"
+    );
+    assert_eq!(plain_cmd(plain, &["PING"]), "PONG");
+    assert_eq!(cmd_on(&mut conn, &["CONFIG", "SET", "port", "0"]), "OK");
+    assert!(closed(plain), "the plaintext port is still open");
+    assert_eq!(cmd_on(&mut conn, &["PING"]), "PONG");
+}
+
+/// `CONFIG SET port 0` closes the plaintext port: connections already open
+/// on it stay open, as in Redis, and TLS goes on; `CONFIG SET port` opens it
+/// again.
+#[test]
+fn config_set_port_0_closes_the_plaintext_port() {
+    let certs = generate_certs();
+    let plain = free_port();
+    let tls = free_port();
+    start_server_with_tls(plain, tls, &certs);
+    let mut kept = TcpStream::connect(("127.0.0.1", plain)).unwrap();
+    kept.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut over_tls = make_tls_client(tls, &certs.cert_der);
+
+    assert_eq!(cmd_on(&mut kept, &["CONFIG", "SET", "port", "0"]), "OK");
+    assert!(closed(plain), "the plaintext port is still open");
+    assert_eq!(cmd_on(&mut kept, &["SET", "still", "here"]), "OK");
+    assert_eq!(cmd_on(&mut over_tls, &["GET", "still"]), "here");
+    assert_eq!(cmd_on(&mut over_tls, &["CONFIG", "GET", "port"]), "port 0");
+    assert!(handshake_ok(tls, &certs.cert_der));
+
+    assert_eq!(
+        cmd_on(
+            &mut over_tls,
+            &["CONFIG", "SET", "port", &plain.to_string()]
+        ),
+        "OK"
+    );
+    assert_eq!(plain_cmd(plain, &["PING"]), "PONG");
+}
+
+/// Port 0 leaves a server without TLS no port: refused. On one that is
+/// given TLS in the same `CONFIG SET`, it is taken.
+#[test]
+fn config_set_port_0_without_tls_is_refused() {
+    let plain = start_server_without_tls();
+    let reply = plain_cmd(plain, &["CONFIG", "SET", "port", "0"]);
+    assert!(
+        reply.starts_with("ERR CONFIG SET failed") && reply.contains("port 0"),
+        "{reply}"
+    );
+    assert_eq!(plain_cmd(plain, &["PING"]), "PONG");
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "GET", "port"]),
+        format!("port {plain}")
+    );
+
+    let certs = generate_certs();
+    let tls = free_port();
+    let mut conn = TcpStream::connect(("127.0.0.1", plain)).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let reply = cmd_on(
+        &mut conn,
+        &[
+            "CONFIG",
+            "SET",
+            "port",
+            "0",
+            "tls-port",
+            &tls.to_string(),
+            "tls-cert-file",
+            certs.cert_path.to_str().unwrap(),
+            "tls-key-file",
+            certs.key_path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(reply, "OK");
+    assert!(closed(plain));
+    assert!(handshake_ok(tls, &certs.cert_der));
+}
 
 /// Basic TLS: PING over TLS returns PONG.
 #[test]
@@ -246,6 +700,262 @@ fn test_tls_ping() {
     send_cmd(&mut conn, &["PING"]);
     let resp = read_resp(&mut conn);
     assert_eq!(resp, "PONG");
+}
+
+/// With the AOF on, a write over TLS is answered once its record is in the
+/// file, as over plaintext: in milliseconds. 1.2.0-rc1 answered each one at
+/// the next once-a-second sync, so a client doing SETs one after another got
+/// one reply a second. Only the server binary had that path (the in-process
+/// servers above never did), so this starts the binary: with its default
+/// I/O model, io_uring on Linux, and with tokio.
+#[test]
+fn writes_over_tls_with_the_aof_on_are_answered_at_once() {
+    struct Killed(std::process::Child);
+    impl Drop for Killed {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let bin = std::env::var("CARGO_BIN_EXE_kividb").expect("built with the kividb binary");
+    let certs = generate_certs();
+    for io_model in [None, Some("tokio")] {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = free_port();
+        let tls = free_port();
+        let mut args = vec![
+            "--port".to_string(),
+            plain.to_string(),
+            "--bind".into(),
+            "127.0.0.1".into(),
+            "--dir".into(),
+            dir.path().to_str().unwrap().into(),
+            "--aof".into(),
+            "--tls-port".into(),
+            tls.to_string(),
+            "--tls-cert-file".into(),
+            certs.cert_path.to_str().unwrap().into(),
+            "--tls-key-file".into(),
+            certs.key_path.to_str().unwrap().into(),
+        ];
+        if let Some(model) = io_model {
+            args.extend(["--io-model".into(), model.into()]);
+        }
+        let _server = Killed(
+            std::process::Command::new(&bin)
+                .args(&args)
+                .current_dir(dir.path())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("failed to start kividb"),
+        );
+        wait_open(plain);
+        wait_open(tls);
+
+        let mut conn = make_tls_client(tls, &certs.cert_der);
+        let started = std::time::Instant::now();
+        for i in 0..20 {
+            send_cmd(&mut conn, &["SET", &format!("k{i}"), "v"]);
+            assert_eq!(read_resp(&mut conn), "OK");
+        }
+        let took = started.elapsed();
+        // About a millisecond each; at the sync's pace, twenty took 10 to 20 s.
+        assert!(
+            took < Duration::from_secs(3),
+            "20 SETs over TLS with the AOF on took {took:?} (io model {io_model:?})"
+        );
+        send_cmd(&mut conn, &["DBSIZE"]);
+        assert_eq!(read_resp(&mut conn), "20");
+    }
+}
+
+/// A plaintext PING on `port`, with a fresh connection: the reply, or what
+/// went wrong. A connection that is accepted and never answered gives
+/// "accepted, and hangs".
+#[cfg(target_os = "linux")]
+fn plain_ping(port: u16) -> Result<String, String> {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut conn = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+        .map_err(|e| format!("connect: {e} ({:?})", e.kind()))?;
+    conn.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    conn.write_all(b"*1\r\n$4\r\nPING\r\n")
+        .map_err(|e| format!("write: {e}"))?;
+    let mut reply = [0u8; 7];
+    match conn.read(&mut reply) {
+        Ok(0) => Err("closed without a reply".into()),
+        Ok(n) => Ok(String::from_utf8_lossy(&reply[..n]).trim_end().to_string()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            Err("accepted, and hangs".into())
+        }
+        Err(e) => Err(format!("read: {e}")),
+    }
+}
+
+/// That `port`, closed by a `CONFIG SET` that has just answered, refuses
+/// connections: the very first one. The port is shut before the reply.
+#[cfg(target_os = "linux")]
+fn refused(port: u16, what: &str) {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    match TcpStream::connect_timeout(&addr, Duration::from_secs(1)) {
+        Err(e) => assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::ConnectionRefused,
+            "{what}: port {port}: {e}"
+        ),
+        Ok(conn) => {
+            drop(conn);
+            panic!(
+                "{what}: port {port} is still open: a PING on it: {:?}",
+                plain_ping(port)
+            );
+        }
+    }
+}
+
+/// `CONFIG SET port` closes the plaintext port with 0 and opens it, on a
+/// new port or the old one, again and again, with both I/O models, and
+/// `tls-port` moves and closes the TLS port in between. A closed port
+/// refuses connections at once; an open one serves them; connections made
+/// before stay up through all of it.
+///
+/// It starts the binary: the in-process servers of the tests above run the
+/// tokio model only. On io_uring, the default on Linux, 1.2.0-rc2 could not
+/// open a plaintext port with `CONFIG SET port` ("Address already in use",
+/// on any port), and after `CONFIG SET port 0` its sockets went on
+/// listening, and the connections they took were never answered.
+///
+/// Linux only: io_uring is Linux only, and the tests above cover the tokio
+/// model everywhere. On Windows a server process started here also kept
+/// the ports of those tests' in-process servers open after they were
+/// closed, for as long as it ran (`config_set_port_0_without_tls_is_refused`
+/// failed in eight of twelve runs).
+#[cfg(target_os = "linux")]
+#[test]
+fn config_set_port_closes_and_opens_it_on_both_io_models() {
+    struct Killed(std::process::Child);
+    impl Drop for Killed {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let bin = std::env::var("CARGO_BIN_EXE_kividb").expect("built with the kividb binary");
+    let certs = generate_certs();
+    for io_model in ["uring", "tokio"] {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = free_port();
+        let tls = free_port();
+        let _server = Killed(
+            std::process::Command::new(&bin)
+                .args([
+                    "--port",
+                    &plain.to_string(),
+                    "--bind",
+                    "127.0.0.1",
+                    "--dir",
+                    dir.path().to_str().unwrap(),
+                    // Fails to start where io_uring is not to be had,
+                    // rather than falling back to tokio.
+                    "--io-model",
+                    io_model,
+                    // Several io_uring workers, each with a socket on the
+                    // port, as on any machine with more than one core.
+                    "--threads",
+                    "4",
+                    "--tls-port",
+                    &tls.to_string(),
+                    "--tls-cert-file",
+                    certs.cert_path.to_str().unwrap(),
+                    "--tls-key-file",
+                    certs.key_path.to_str().unwrap(),
+                ])
+                .current_dir(dir.path())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("failed to start kividb"),
+        );
+        wait_open(plain);
+        wait_open(tls);
+        let mut over_tls = make_tls_client(tls, &certs.cert_der);
+        let info = cmd_on(&mut over_tls, &["INFO", "server"]);
+        assert_eq!(
+            info.contains("multiplexing_api:io_uring"),
+            io_model == "uring",
+            "{io_model}: {info}"
+        );
+        let mut kept = TcpStream::connect(("127.0.0.1", plain)).unwrap();
+        kept.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(plain_ping(plain), Ok("+PONG".into()), "{io_model}");
+
+        let (n, m) = (free_port(), free_port());
+        let mut current = plain;
+        for port in [0, n, 0, m, 0, plain] {
+            let what = format!("{io_model}: CONFIG SET port {port}");
+            assert_eq!(
+                cmd_on(&mut over_tls, &["CONFIG", "SET", "port", &port.to_string()]),
+                "OK",
+                "{what}"
+            );
+            if port == 0 {
+                refused(current, &what);
+            } else {
+                assert_eq!(plain_ping(port), Ok("+PONG".into()), "{what}");
+                if current != 0 {
+                    refused(current, &what);
+                }
+            }
+            current = port;
+            assert_eq!(
+                cmd_on(&mut over_tls, &["CONFIG", "GET", "port"]),
+                format!("port {port}"),
+                "{what}"
+            );
+            assert_eq!(cmd_on(&mut over_tls, &["PING"]), "PONG", "{what}");
+            assert!(handshake_ok(tls, &certs.cert_der), "{what}: TLS");
+            assert_eq!(cmd_on(&mut kept, &["PING"]), "PONG", "{what}");
+        }
+
+        // The TLS port, moved and closed and opened again, with the
+        // plaintext port open.
+        let moved = free_port();
+        let what = format!("{io_model}: CONFIG SET tls-port");
+        let mut on_plain = TcpStream::connect(("127.0.0.1", plain)).unwrap();
+        on_plain
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(
+            cmd_on(
+                &mut on_plain,
+                &["CONFIG", "SET", "tls-port", &moved.to_string()]
+            ),
+            "OK",
+            "{what}"
+        );
+        assert!(handshake_ok(moved, &certs.cert_der), "{what}");
+        refused(tls, &what);
+        assert_eq!(
+            cmd_on(&mut on_plain, &["CONFIG", "SET", "tls-port", "0"]),
+            "OK",
+            "{what}"
+        );
+        refused(moved, &what);
+        assert_eq!(
+            cmd_on(
+                &mut on_plain,
+                &["CONFIG", "SET", "tls-port", &tls.to_string()]
+            ),
+            "OK",
+            "{what}"
+        );
+        assert!(handshake_ok(tls, &certs.cert_der), "{what}");
+        assert_eq!(cmd_on(&mut over_tls, &["PING"]), "PONG", "{what}");
+        assert_eq!(cmd_on(&mut kept, &["PING"]), "PONG", "{what}");
+    }
 }
 
 /// SET and GET over TLS produce the expected value.
@@ -661,4 +1371,150 @@ fn test_no_ca_file_means_no_client_cert() {
     let port = start_server_with_client_auth(&pki, false, "yes");
 
     assert_eq!(tls_ping(port, &pki.ca_der, None).as_deref(), Ok("+PONG"));
+}
+
+// ── tls-auth-clients-allowed-names ───────────────────────────────────────────
+
+/// A client certificate signed by `pki`'s CA with subject CN `cn` (none if
+/// empty) and DNS names `dns`.
+fn named_cert(pki: &Pki, cn: &str, dns: &[&str]) -> (Vec<u8>, Vec<u8>) {
+    let mut params =
+        CertificateParams::new(dns.iter().map(|name| name.to_string()).collect::<Vec<_>>())
+            .unwrap();
+    if !cn.is_empty() {
+        params.distinguished_name.push(DnType::CommonName, cn);
+    }
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    let key = KeyPair::generate().unwrap();
+    let cert = params.signed_by(&key, &pki.ca_cert, &pki.ca_key).unwrap();
+    (cert.der().to_vec(), key.serialize_der())
+}
+
+/// A TLS connection presenting `client`, kept open.
+fn client_conn(port: u16, ca_der: &[u8], (cert, key): (Vec<u8>, Vec<u8>)) -> BlockingTls {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(CertificateDer::from(ca_der.to_vec())).unwrap();
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(
+            vec![CertificateDer::from(cert)],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key)),
+        )
+        .unwrap();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let stream = rt.block_on(async move {
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let name = rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
+        connector.connect(name, tcp).await.unwrap()
+    });
+    BlockingTls { rt, stream }
+}
+
+/// `tls-auth-clients-allowed-names`: of the certificates the CA signed, only
+/// those with a CN or DNS name that matches are taken; `*` is one label;
+/// `CONFIG SET` changes it for new connections.
+#[test]
+fn allowed_names_pin_client_certificates() {
+    let pki = generate_pki();
+    let plain = free_port();
+    let tls = free_port();
+    let cfg = kividb::config::Config {
+        port: plain,
+        bind: "127.0.0.1".to_string(),
+        tls_port: tls,
+        tls_cert_file: pki.cert_path.to_str().unwrap().to_string(),
+        tls_key_file: pki.key_path.to_str().unwrap().to_string(),
+        tls_ca_cert_file: pki.ca_path.to_str().unwrap().to_string(),
+        tls_auth_clients_allowed_names: "*.DB1.nodes.kividb.internal".to_string(),
+        ..Default::default()
+    };
+    assert!(cfg.validate(true).is_ok());
+    thread::spawn(move || kividb::run_for_test(cfg));
+    wait_open(plain);
+    wait_open(tls);
+    let ping = |cert| tls_ping(tls, &pki.ca_der, Some(cert));
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "GET", "tls-auth-clients-allowed-names"]),
+        "tls-auth-clients-allowed-names *.db1.nodes.kividb.internal"
+    );
+
+    // A DNS name or the CN, in any case.
+    let node0 = named_cert(&pki, "client", &["node-0.db1.nodes.kividb.internal"]);
+    assert_eq!(ping(node0.clone()).as_deref(), Ok("+PONG"));
+    let by_cn = named_cert(&pki, "Node-1.db1.nodes.kividb.internal", &[]);
+    assert_eq!(ping(by_cn).as_deref(), Ok("+PONG"));
+    // Another database under the same CA, a name two labels down, the
+    // parent itself, and no matching name at all: refused.
+    for refused in [
+        named_cert(&pki, "", &["x.db2.nodes.kividb.internal"]),
+        named_cert(&pki, "", &["a.b.db1.nodes.kividb.internal"]),
+        named_cert(&pki, "", &["db1.nodes.kividb.internal"]),
+        named_cert(&pki, "client", &[]),
+    ] {
+        let reply = ping(refused);
+        assert!(reply.is_err(), "accepted: {reply:?}");
+    }
+    // Not asked for one under `optional`: still no certificate is fine.
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "SET", "tls-auth-clients", "optional"]),
+        "OK"
+    );
+    assert_eq!(tls_ping(tls, &pki.ca_der, None).as_deref(), Ok("+PONG"));
+    let reply = ping(named_cert(&pki, "", &["x.db2.nodes.kividb.internal"]));
+    assert!(reply.is_err(), "accepted: {reply:?}");
+
+    // Changed at runtime: new connections only.
+    let mut kept = client_conn(tls, &pki.ca_der, node0.clone());
+    assert_eq!(cmd_on(&mut kept, &["PING"]), "PONG");
+    let reply = plain_cmd(
+        plain,
+        &[
+            "CONFIG",
+            "SET",
+            "tls-auth-clients-allowed-names",
+            "*.db2.nodes.kividb.internal,admin.example",
+        ],
+    );
+    assert_eq!(reply, "OK");
+    assert_eq!(
+        plain_cmd(plain, &["CONFIG", "GET", "tls-auth-clients-allowed-names"]),
+        "tls-auth-clients-allowed-names *.db2.nodes.kividb.internal admin.example"
+    );
+    assert!(ping(node0.clone()).is_err());
+    assert_eq!(
+        ping(named_cert(&pki, "", &["x.db2.nodes.kividb.internal"])).as_deref(),
+        Ok("+PONG")
+    );
+    assert_eq!(
+        ping(named_cert(&pki, "admin.example", &[])).as_deref(),
+        Ok("+PONG")
+    );
+    assert_eq!(cmd_on(&mut kept, &["PING"]), "PONG");
+
+    // What is not a name: refused, and nothing changes.
+    for bad in ["a.*.example", "*", "db1..internal"] {
+        let reply = plain_cmd(
+            plain,
+            &["CONFIG", "SET", "tls-auth-clients-allowed-names", bad],
+        );
+        assert!(reply.starts_with("ERR CONFIG SET failed"), "{bad}: {reply}");
+    }
+    assert!(ping(node0.clone()).is_err());
+
+    // Empty: off.
+    assert_eq!(
+        plain_cmd(
+            plain,
+            &["CONFIG", "SET", "tls-auth-clients-allowed-names", ""]
+        ),
+        "OK"
+    );
+    assert_eq!(ping(node0).as_deref(), Ok("+PONG"));
 }

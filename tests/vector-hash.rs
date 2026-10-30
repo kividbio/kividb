@@ -5532,3 +5532,189 @@ fn test_vector_type_unknown_is_refused() {
         );
     }
 }
+
+// ── #162: BM25 statistics, FT.DROPINDEX DD, KNN in FT.AGGREGATE ───────────────
+
+fn score_of(reply: &RespValue) -> String {
+    reply.as_array()[2].as_str().to_string()
+}
+
+/// What a document scores for a word does not change when other documents
+/// come and go: the BM25 statistics count what is there. They only grew,
+/// and a score fell a hundredfold after 200 documents were added and
+/// deleted (#162).
+#[test]
+fn test_bm25_statistics_follow_updates_and_deletes() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    assert!(
+        !c.cmds(&[
+            "FT.CREATE",
+            "docs",
+            "PREFIX",
+            "1",
+            "doc:",
+            "SCHEMA",
+            "body",
+            "TEXT"
+        ])
+        .is_error()
+    );
+    c.cmds(&["HSET", "doc:keep", "body", "rare word here"]);
+    c.cmds(&["HSET", "doc:other", "body", "common filler text"]);
+    let before = score_of(&c.cmds(&["FT.SEARCH", "docs", "rare", "WITHSCORES", "NOCONTENT"]));
+    for i in 0..200 {
+        c.cmds(&[
+            "HSET",
+            &format!("doc:{i}"),
+            "body",
+            "rare common filler text",
+        ]);
+    }
+    for i in 0..200 {
+        c.cmds(&["DEL", &format!("doc:{i}")]);
+    }
+    // Written again, with the same words: counted once.
+    for _ in 0..50 {
+        c.cmds(&["HSET", "doc:other", "body", "common filler text"]);
+    }
+    let after = score_of(&c.cmds(&["FT.SEARCH", "docs", "rare", "WITHSCORES", "NOCONTENT"]));
+    assert_eq!(before, after);
+
+    // A field written again no longer matches what it held.
+    c.cmds(&["HSET", "doc:keep", "body", "another thing"]);
+    let found = c.cmds(&["FT.SEARCH", "docs", "rare", "NOCONTENT"]);
+    assert_eq!(found.as_array()[0].as_int(), 0, "{found:?}");
+    let found = c.cmds(&["FT.SEARCH", "docs", "another", "NOCONTENT"]);
+    assert_eq!(found.as_array()[0].as_int(), 1, "{found:?}");
+}
+
+/// `FT.DROPINDEX index DD` deletes the documents the index covered; they
+/// were kept (#162).
+#[test]
+fn test_dropindex_dd_deletes_the_documents() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    assert!(
+        !c.cmds(&[
+            "FT.CREATE",
+            "idx",
+            "PREFIX",
+            "1",
+            "item:",
+            "SCHEMA",
+            "name",
+            "TEXT"
+        ])
+        .is_error()
+    );
+    c.cmds(&["HSET", "item:1", "name", "a"]);
+    c.cmds(&["HSET", "item:2", "name", "b"]);
+    c.cmds(&["SET", "item:3", "a string, not a document"]);
+    c.cmds(&["HSET", "other:1", "name", "c"]);
+    assert!(c.cmds(&["FT.DROPINDEX", "idx", "BOGUS"]).is_error());
+    assert!(matches!(
+        c.cmds(&["FT.DROPINDEX", "idx", "DD"]),
+        RespValue::SimpleStr(_)
+    ));
+    assert_eq!(c.cmds(&["EXISTS", "item:1", "item:2"]).as_int(), 0);
+    assert_eq!(c.cmds(&["EXISTS", "item:3", "other:1"]).as_int(), 2);
+    assert!(c.cmds(&["FT.INFO", "idx"]).is_error());
+}
+
+/// A KNN clause in `FT.AGGREGATE` keeps the nearest `k` of what the filter
+/// left, with the distance to group, sort or load by; it was dropped, and
+/// every document went on (#162).
+#[test]
+fn test_aggregate_with_knn_keeps_the_nearest() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let r = c.cmds(&[
+        "FT.CREATE",
+        "p",
+        "PREFIX",
+        "1",
+        "p:",
+        "SCHEMA",
+        "name",
+        "TEXT",
+        "cat",
+        "TAG",
+        "v",
+        "VECTOR",
+        "FLAT",
+        "6",
+        "TYPE",
+        "FLOAT32",
+        "DIM",
+        "2",
+        "DISTANCE_METRIC",
+        "L2",
+    ]);
+    assert!(!r.is_error(), "{r:?}");
+    for (key, name, cat, v) in [
+        ("p:1", "near", "a", [1.0f32, 0.0]),
+        ("p:2", "far", "a", [9.0, 9.0]),
+        ("p:3", "nearest", "b", [0.5, 0.0]),
+    ] {
+        let bytes = pack_f32(&v);
+        c.cmd(&[
+            b"HSET",
+            key.as_bytes(),
+            b"name",
+            name.as_bytes(),
+            b"cat",
+            cat.as_bytes(),
+            b"v",
+            &bytes,
+        ]);
+    }
+    let q = pack_f32(&[0.0, 0.0]);
+    let r = c.cmd(&[
+        b"FT.AGGREGATE",
+        b"p",
+        b"*=>[KNN 1 @v $q AS d]",
+        b"PARAMS",
+        b"2",
+        b"q",
+        &q,
+        b"LOAD",
+        b"2",
+        b"@name",
+        b"@d",
+        b"DIALECT",
+        b"2",
+    ]);
+    let rows = r.as_array();
+    assert_eq!(rows.len(), 2, "{r:?}");
+    let row = rows[1].as_array();
+    let field = |name: &str| {
+        row.chunks(2)
+            .find(|p| p[0].as_str() == name)
+            .map(|p| p[1].as_str().to_string())
+    };
+    assert_eq!(field("name").as_deref(), Some("nearest"), "{r:?}");
+    assert!(field("d").is_some(), "{r:?}");
+
+    // With a filter: the nearest of those it left.
+    let r = c.cmd(&[
+        b"FT.AGGREGATE",
+        b"p",
+        b"@cat:{a}=>[KNN 1 @v $q AS d]",
+        b"PARAMS",
+        b"2",
+        b"q",
+        &q,
+        b"LOAD",
+        b"1",
+        b"@name",
+        b"DIALECT",
+        b"2",
+    ]);
+    let rows = r.as_array();
+    assert_eq!(rows.len(), 2, "{r:?}");
+    assert_eq!(rows[1].as_array()[1].as_str(), "near", "{r:?}");
+}

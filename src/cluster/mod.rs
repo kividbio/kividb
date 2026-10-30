@@ -56,6 +56,10 @@ pub struct ElectionState {
     /// voters are asked to grant the vote without it being FAIL, and the
     /// election is not abandoned just because the master is alive.
     pub manual: bool,
+    /// For a manual failover whose master is holding writes for it: the
+    /// time (Unix ms) by which it has to be won, or it is given up. See
+    /// `heartbeat::MANUAL_FAILOVER_TIMEOUT`.
+    pub deadline_ms: Option<u64>,
 }
 
 /// What the cluster layer needs from the rest of the server. Installed once
@@ -120,6 +124,13 @@ pub enum MigrationState {
     Importing { src_id: NodeId },
 }
 
+/// The locks below are `parking_lot` locks: a reader queues behind a waiting
+/// writer, so a thread must never take a lock it already holds, read or
+/// write, and a guard must not be kept across an `.await`. Where one thread
+/// holds several, it takes them in this order and no other: `forgotten`,
+/// `save_lock`, `failure_reports`, `nodes`, `slots`, `migrations`, `myself`.
+/// A temporary guard (`self.nodes.read().get(..)`) is held to the end of
+/// its statement, or of the `match` / `if let` / `for` it heads.
 pub struct ClusterState {
     pub enabled: bool,
     /// This node's id. Behind a lock only so `CLUSTER RESET HARD` can replace
@@ -170,6 +181,9 @@ pub struct ClusterState {
     state_ok: AtomicBool,
     /// `cluster-require-full-coverage`.
     require_full_coverage: AtomicBool,
+    /// `cluster-replica-validity-factor`: how stale a replica's data may be
+    /// for it to stand for election, in node timeouts; 0 = always stand.
+    replica_validity_factor: AtomicU64,
     /// True while our own IP is the loopback placeholder used when binding to
     /// a wildcard address with no `cluster-announce-ip`. While set, we send an
     /// empty address so peers record the one they observe instead.
@@ -188,9 +202,14 @@ pub struct ClusterState {
     /// Bus traffic counters for `CLUSTER INFO`.
     pub stats_messages_sent: AtomicU64,
     pub stats_messages_received: AtomicU64,
+    /// Outbound bus connections opened (`cluster_stats_bus_connects`).
+    pub stats_bus_connects: AtomicU64,
     /// Long-lived outbound bus links, by `ip:bus_port`. See
     /// `bus::dialer::send_frame`.
     pub(crate) links: parking_lot::Mutex<AHashMap<String, tokio::sync::mpsc::Sender<Vec<u8>>>>,
+    /// The connection each peer is pinged over, by `ip:bus_port`, kept open
+    /// between heartbeats. See `bus::dialer::send_ping`.
+    pub(crate) ping_links: parking_lot::Mutex<AHashMap<String, bus::dialer::PingLink>>,
 }
 
 impl ClusterState {
@@ -226,6 +245,7 @@ impl ClusterState {
             bus_runtime: std::sync::OnceLock::new(),
             state_ok: AtomicBool::new(false),
             require_full_coverage: AtomicBool::new(true),
+            replica_validity_factor: AtomicU64::new(10),
             self_ip_is_guess: AtomicBool::new(false),
             bus_secret: std::sync::OnceLock::new(),
             background_save: std::sync::OnceLock::new(),
@@ -234,7 +254,9 @@ impl ClusterState {
             last_saved_fingerprint: AtomicU64::new(0),
             stats_messages_sent: AtomicU64::new(0),
             stats_messages_received: AtomicU64::new(0),
+            stats_bus_connects: AtomicU64::new(0),
             links: parking_lot::Mutex::new(AHashMap::new()),
+            ping_links: parking_lot::Mutex::new(AHashMap::new()),
         };
         state.refresh_state();
         state
@@ -276,6 +298,7 @@ impl ClusterState {
                 pong_received_ms: 0,
                 fail_since_ms: 0,
                 hostname: String::new(),
+                announced_client_port: 0,
             },
         );
         Self::build(
@@ -368,8 +391,9 @@ impl ClusterState {
             })?;
         // With `tls-cluster` the port to reach this node on is its TLS port,
         // for clients and for the other nodes alike (see `node_tls`); the bus
-        // stays where it is.
-        let client_port = if config.tls_cluster {
+        // stays where it is. A node with no plaintext port (port 0) has
+        // `tls-cluster`: see `Config::validate`.
+        let client_port = if config.tls_cluster || config.port == 0 {
             config.tls_port
         } else {
             config.port
@@ -387,7 +411,9 @@ impl ClusterState {
             bus_port,
         );
         state.set_require_full_coverage(config.cluster_require_full_coverage);
+        state.set_replica_validity_factor(config.cluster_replica_validity_factor);
         state.set_my_hostname(&config.cluster_announce_hostname);
+        state.set_my_announced_client_port(config.cluster_announce_client_port);
         if !config.cluster_bus_secret.is_empty() {
             let _ = state
                 .bus_secret
@@ -409,6 +435,9 @@ impl ClusterState {
         }
         let repl_state = std::sync::Arc::clone(&hooks.replica_starter.repl_state);
         let _ = self.hooks.set(hooks);
+        // The keys of an import this node was receiving when it went down,
+        // which never completed (#108).
+        migration::drop_unfinished_imports(self);
         self.start_the_clock_on_peers();
         self.start_background_save();
         bus::start(
@@ -561,6 +590,25 @@ impl ClusterState {
         }
     }
 
+    /// Set this node's `cluster-announce-client-port` (0: none). Peers learn
+    /// it from the next heartbeat.
+    pub fn set_my_announced_client_port(&self, port: u16) {
+        if let Some(me) = self.nodes.write().get_mut(&self.myself()) {
+            me.announced_client_port = port;
+        }
+    }
+
+    /// Record the client port a peer announces. As for its hostname: its own
+    /// word stands, none included; second-hand it only fills in.
+    pub fn set_peer_client_port(&self, id: NodeId, port: u16, authoritative: bool) {
+        if id == self.myself() || (port == 0 && !authoritative) {
+            return;
+        }
+        if let Some(node) = self.nodes.write().get_mut(&id) {
+            node.announced_client_port = port;
+        }
+    }
+
     /// Record a peer's hostname. `authoritative` when it is the peer's own
     /// word, which may also be that it has none; second-hand it only fills
     /// in. Saved when it changes.
@@ -630,6 +678,16 @@ impl ClusterState {
             self.self_ip_is_guess.store(false, Ordering::Relaxed);
             log_info!("Cluster: Learned own address from an outgoing link: {local_ip}");
         }
+    }
+
+    /// `cluster-replica-validity-factor`.
+    pub fn replica_validity_factor(&self) -> u64 {
+        self.replica_validity_factor.load(Ordering::Relaxed)
+    }
+
+    pub fn set_replica_validity_factor(&self, factor: u64) {
+        self.replica_validity_factor
+            .store(factor, Ordering::Relaxed);
     }
 
     pub fn set_require_full_coverage(&self, yes: bool) {
@@ -1062,8 +1120,14 @@ impl ClusterState {
         // Slots this node itself was serving and has just lost.
         let mut lost: Vec<u16> = Vec::new();
         {
-            let migrations = self.migrations.read();
+            // `slots` before `migrations`, the order everything else takes
+            // them in (see `ClusterState`). Taken the other way round, a bus
+            // thread holding `migrations` and waiting for `slots` met the end
+            // of a slot migration holding `slots` and waiting for
+            // `migrations` (`take_over_slots`, `hand_over_slots`), and both
+            // waited for good.
             let mut slots = self.slots.write();
+            let migrations = self.migrations.read();
             for claim in claims {
                 for slot in claim.start..=claim.end {
                     let i = slot as usize;
@@ -1632,8 +1696,8 @@ impl ClusterState {
 
     /// Begin an election to replace `master_id`. Returns the new epoch. Bumps
     /// current_epoch so the election claim takes the highest epoch in the
-    /// cluster.
-    pub fn start_election(&self, master_id: NodeId, manual: bool) -> u64 {
+    /// cluster. `deadline_ms`: see [`ElectionState::deadline_ms`].
+    pub fn start_election(&self, master_id: NodeId, manual: bool, deadline_ms: Option<u64>) -> u64 {
         let new_epoch = self.bump_epoch();
         let mut election = self.election.lock();
         *election = Some(ElectionState {
@@ -1643,6 +1707,7 @@ impl ClusterState {
             votes_received: ahash::AHashSet::new(),
             completed: false,
             manual,
+            deadline_ms,
         });
         new_epoch
     }
@@ -1828,7 +1893,7 @@ impl ClusterState {
     /// Take ownership of `slots` at the end of an atomic migration to this
     /// node. One new epoch covers them all, so the claim wins over the
     /// previous owner's wherever the two meet.
-    pub fn take_over_slots(&self, slots: impl Iterator<Item = u16>) {
+    pub fn take_over_slots(&self, slots: impl Iterator<Item = u16>) -> std::io::Result<()> {
         let t = std::time::Instant::now();
         let mut steps: Vec<(&str, u128)> = Vec::new();
         let me = self.myself();
@@ -1851,11 +1916,12 @@ impl ClusterState {
         steps.push(("slots", t.elapsed().as_millis()));
         self.refresh_state();
         steps.push(("refresh", t.elapsed().as_millis()));
-        let _ = persist::save_from_state(self);
+        let saved = persist::save_from_state(self);
         steps.push(("save", t.elapsed().as_millis()));
         if t.elapsed() > std::time::Duration::from_millis(100) {
             log_info!("Cluster: slow takeover, ms at each step: {steps:?}");
         }
+        saved
     }
 
     /// Record that `slots` now belong to `new_owner`, at the end of an atomic

@@ -42,11 +42,11 @@
       "ingest.total_time_s": { "regression_if": "above", "tolerance_pct": 30 }
     },
     "kividb_vs_redis_ratio": {
-      "_comment": "Computed fresh each run from both engines on the SAME instance -- much less noisy than the absolute gate above, since both numbers share whatever the CI hardware happens to be that day. min_ratio is kividb_metric/redis_metric for rps (higher=better, so a floor) or redis_metric/kividb_metric for *_time_s (lower=better for kividb, so also expressed as a floor on the 'kividb is faster by this factor' ratio -- currently <1.0 for ingest, being tracked honestly, not hidden).",
-      "search_by_ef.64.rps": { "kind": "kividb_over_redis", "min_ratio": 2.0 },
-      "search_by_ef.128.rps": { "kind": "kividb_over_redis", "min_ratio": 2.0 },
-      "search_by_ef.256.rps": { "kind": "kividb_over_redis", "min_ratio": 2.0 },
-      "search_by_ef.512.rps": { "kind": "kividb_over_redis", "min_ratio": 2.0 },
+      "_comment": "Computed fresh each run from both engines on the SAME instance -- much less noisy than the absolute gate above, since both numbers share whatever the CI hardware happens to be that day. min_ratio is kividb_metric/redis_metric for rps (higher=better, so a floor) or redis_metric/kividb_metric for *_time_s (lower=better for kividb, so also expressed as a floor on the 'kividb is faster by this factor' ratio -- currently <1.0 for ingest, being tracked honestly, not hidden). The rps floors were 2.0 while the other engine was redis-stack-server 7.4 (RediSearch 2.10). Against Redis 8.10.2's query engine, compared since 2026-10-16 (109f067), KiviDB measured 1.21, 1.08, 0.94 and 0.88 at ef 64-512 on this workflow's Azure arm64 machines (run 39869377109): every run failed on a floor that no longer described the comparison. 0.75 catches KiviDB falling well behind Redis 8.10 without failing on today's numbers.",
+      "search_by_ef.64.rps": { "kind": "kividb_over_redis", "min_ratio": 0.75 },
+      "search_by_ef.128.rps": { "kind": "kividb_over_redis", "min_ratio": 0.75 },
+      "search_by_ef.256.rps": { "kind": "kividb_over_redis", "min_ratio": 0.75 },
+      "search_by_ef.512.rps": { "kind": "kividb_over_redis", "min_ratio": 0.75 },
       "ingest.total_time_s": { "kind": "redis_over_kividb", "min_ratio": 0.4 }
     }
   }

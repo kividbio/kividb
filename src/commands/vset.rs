@@ -13,6 +13,7 @@ use crate::commands::helpers::parse_utf8;
 use crate::resp::write::*;
 use crate::store;
 use crate::store::Key;
+use crate::store::ValueRef;
 use crate::types::{KiviDBValue, VSetEntry, VectorSetInner};
 use crate::{read_lock, write_lock};
 use parking_lot::RwLock;
@@ -52,7 +53,7 @@ fn get_or_create_vset(
     let mut map = write_lock!(shard);
 
     match map.get(key) {
-        Some(KiviDBValue::VectorSet(vs)) => {
+        Some(ValueRef::VectorSet(vs)) => {
             let inner = vs.read();
             if inner.dim != dim {
                 return Err(resp_error(&format!(
@@ -129,15 +130,19 @@ fn vadd(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let mut i = 2usize;
     let mut attrs: Option<String> = None;
 
-    // Optional REDUCE dim — we parse it but don't implement PCA reduction.
-    // Accepting it means client libraries don't break.
+    // REDUCE projects the vectors to fewer dimensions, at random, with a
+    // projection kept with the set for every query after. It was taken and
+    // ignored, and the set kept the dimension given (#132): refused.
     if cmd
         .get(i)
         .and_then(|b| std::str::from_utf8(b).ok())
         .map(|s| s.eq_ignore_ascii_case("REDUCE"))
         .unwrap_or(false)
     {
-        i += 2; // skip REDUCE + dim
+        return Some(resp_error(
+            "ERR REDUCE is not supported by KiviDB: vectors are kept at the dimension they are \
+             given",
+        ));
     }
 
     let mut parsed_metric = crate::vector::DistanceMetric::Cosine;
@@ -209,6 +214,8 @@ fn vadd(ctx: &mut Ctx) -> Option<Vec<u8>> {
             }
         };
         match tok.as_str() {
+            // Kept at full precision whichever is asked for: `VINFO` says
+            // so (`f32`).
             "NOQUANT" | "Q8" | "BIN" | "CAS" => {
                 i += 1;
             }
@@ -277,7 +284,7 @@ fn vrem(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = read_lock!(shard);
 
     let vs = match map.get(key) {
-        Some(KiviDBValue::VectorSet(vs)) => Arc::clone(vs),
+        Some(ValueRef::VectorSet(vs)) => Arc::clone(vs),
         Some(_) => {
             return Some(resp_error(
                 "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -322,7 +329,7 @@ fn vcard(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        Some(KiviDBValue::VectorSet(vs)) => Some(resp_integer(vs.read().entries.len() as i64)),
+        Some(ValueRef::VectorSet(vs)) => Some(resp_integer(vs.read().entries.len() as i64)),
         Some(_) => Some(resp_error(
             "WRONGTYPE Operation against a key holding the wrong kind of value",
         )),
@@ -351,7 +358,7 @@ fn vdim(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        Some(KiviDBValue::VectorSet(vs)) => Some(resp_integer(vs.read().dim as i64)),
+        Some(ValueRef::VectorSet(vs)) => Some(resp_integer(vs.read().dim as i64)),
         Some(_) => Some(resp_error(
             "WRONGTYPE Operation against a key holding the wrong kind of value",
         )),
@@ -390,7 +397,7 @@ fn vemb(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        Some(KiviDBValue::VectorSet(vs)) => {
+        Some(ValueRef::VectorSet(vs)) => {
             let inner = vs.read();
             match inner.entries.get(element) {
                 None => Some(resp_null_bulk()),
@@ -445,7 +452,7 @@ fn vismember(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        Some(KiviDBValue::VectorSet(vs)) => {
+        Some(ValueRef::VectorSet(vs)) => {
             let found = vs.read().entries.contains_key(element);
             Some(resp_integer(found as i64))
         }
@@ -482,7 +489,7 @@ fn vgetattr(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        Some(KiviDBValue::VectorSet(vs)) => {
+        Some(ValueRef::VectorSet(vs)) => {
             let inner = vs.read();
             match inner.entries.get(element) {
                 None => Some(resp_null_bulk()),
@@ -524,7 +531,7 @@ fn vsetattr(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = read_lock!(shard);
 
     match map.get(key.as_str()) {
-        Some(KiviDBValue::VectorSet(vs)) => {
+        Some(ValueRef::VectorSet(vs)) => {
             let mut inner = vs.write();
             match inner.entries.get_mut(&element) {
                 None => Some(resp_error("ERR no such element")),
@@ -567,7 +574,7 @@ fn vinfo(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        Some(KiviDBValue::VectorSet(vs)) => {
+        Some(ValueRef::VectorSet(vs)) => {
             let inner = vs.read();
             let count = inner.entries.len();
             let dim = inner.dim;
@@ -577,8 +584,9 @@ fn vinfo(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 resp_integer(dim as i64),
                 resp_bulk_str("vector-count"),
                 resp_integer(count as i64),
+                // Redis's name for vectors kept unquantized.
                 resp_bulk_str("quant-type"),
-                resp_bulk_str("NOQUANT"),
+                resp_bulk_str("f32"),
                 resp_bulk_str("index-type"),
                 resp_bulk_str("FLAT"),
                 resp_bulk_str("max-level"),
@@ -595,6 +603,21 @@ fn vinfo(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
 // ── VLINKS ────────────────────────────────────────────────────────────────────
 //
+/// The score `VSIM` and `VLINKS` give an element, from its distance to the
+/// query. Cosine, the only metric Redis's vector sets have, is Redis's
+/// `1 - distance / 2`: from 1 (the same direction) through 0.5 (at right
+/// angles) to 0 (opposite), as `(1 + cosine) / 2`. It was the cosine
+/// itself, from -1 to 1, which put a threshold such as `score > 0.8` in
+/// another place than on Redis (#171). The other metrics are KiviDB's own
+/// (`METRIC`): the dot product, and `1 / (1 + distance)` for L2.
+fn similarity(metric: &crate::vector::DistanceMetric, distance: f32) -> f32 {
+    match metric {
+        crate::vector::DistanceMetric::Cosine => 1.0 - distance / 2.0,
+        crate::vector::DistanceMetric::InnerProduct => 1.0 - distance,
+        crate::vector::DistanceMetric::L2 => 1.0 / (1.0 + distance),
+    }
+}
+
 // VLINKS key element [WITHSCORES]
 // Returns the HNSW graph neighbours of an element.
 // Since we use brute-force, every other element is a "neighbour".
@@ -626,7 +649,7 @@ fn vlinks(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        Some(KiviDBValue::VectorSet(vs)) => {
+        Some(ValueRef::VectorSet(vs)) => {
             let inner = vs.read();
             let query_vec = match inner.entries.get(element) {
                 None => return Some(resp_null_bulk()),
@@ -655,11 +678,7 @@ fn vlinks(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 .flat_map(|(score, name)| {
                     let mut items = vec![resp_bulk_str(name)];
                     if with_scores {
-                        let similarity = match inner.metric {
-                            crate::vector::DistanceMetric::Cosine => 1.0 - score,
-                            crate::vector::DistanceMetric::InnerProduct => 1.0 - score,
-                            crate::vector::DistanceMetric::L2 => 1.0 / (1.0 + score),
-                        };
+                        let similarity = similarity(&inner.metric, *score);
                         items.push(resp_bulk_str(&format!("{:.6}", similarity)));
                     }
                     items
@@ -702,7 +721,7 @@ fn vrandmember(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        Some(KiviDBValue::VectorSet(vs)) => {
+        Some(ValueRef::VectorSet(vs)) => {
             let inner = vs.read();
             let names: Vec<&str> = inner.entries.keys().map(|s| s.as_str()).collect();
 
@@ -815,7 +834,7 @@ fn vrange(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        Some(KiviDBValue::VectorSet(vs)) => {
+        Some(ValueRef::VectorSet(vs)) => {
             let inner = vs.read();
             let mut names: Vec<&str> = inner.entries.keys().map(|s| s.as_str()).collect();
             names.sort_unstable();
@@ -932,6 +951,7 @@ fn vsim(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let mut with_scores = false;
     let mut with_attribs = false;
     let mut count = 10usize;
+    let mut filter: Option<super::vset_filter::Filter> = None;
 
     while i < cmd.len() {
         let tok = match std::str::from_utf8(cmd[i]) {
@@ -960,13 +980,21 @@ fn vsim(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 }
                 i += 2;
             }
-            // EF, FILTER, TRUTH, NOTHREAD — accept and ignore for compatibility
+            // The search is exact: how far it looks is not a choice.
             "EF" | "FILTER-EF" => {
                 i += 2;
             }
+            // Only the elements whose attributes pass are scored (#132).
             "FILTER" => {
+                let Some(expr) = cmd.get(i + 1).and_then(|b| std::str::from_utf8(b).ok()) else {
+                    return Some(resp_error(super::vset_filter::SYNTAX_ERROR));
+                };
+                match super::vset_filter::Filter::compile(expr) {
+                    Some(compiled) => filter = Some(compiled),
+                    None => return Some(resp_error(super::vset_filter::SYNTAX_ERROR)),
+                }
                 i += 2;
-            } // We don't evaluate filter expressions yet
+            }
             "TRUTH" | "NOTHREAD" => {
                 i += 1;
             }
@@ -982,7 +1010,7 @@ fn vsim(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let map = read_lock!(shard);
 
     let vs = match map.get(key.as_str()) {
-        Some(KiviDBValue::VectorSet(vs)) => Arc::clone(vs),
+        Some(ValueRef::VectorSet(vs)) => Arc::clone(vs),
         Some(_) => {
             return Some(resp_error(
                 "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -1009,6 +1037,11 @@ fn vsim(ctx: &mut Ctx) -> Option<Vec<u8>> {
         .entries
         .iter()
         .filter(|(_, entry)| entry.vector.len() == query_vec.len())
+        .filter(|(_, entry)| {
+            filter
+                .as_ref()
+                .is_none_or(|filter| filter.matches(entry.attrs.as_deref()))
+        })
         .map(|(name, entry)| {
             (
                 crate::vector::distance(&inner.metric, &query_vec, &entry.vector),
@@ -1030,16 +1063,10 @@ fn vsim(ctx: &mut Ctx) -> Option<Vec<u8>> {
     for (score, name) in &scored {
         out.push(resp_bulk_str(name));
         if with_scores {
-            // Convert distance to similarity score matching Redis semantics per metric:
-            // Cosine:       similarity = 1.0 - cosine_distance  (range 0..1)
-            // InnerProduct: similarity = 1.0 - ip_distance = dot product (Redis uses this)
-            // L2:           Redis returns 1 / (1 + l2_distance) — bounded 0..1
-            let similarity = match inner.metric {
-                crate::vector::DistanceMetric::Cosine => 1.0 - score,
-                crate::vector::DistanceMetric::InnerProduct => 1.0 - score,
-                crate::vector::DistanceMetric::L2 => 1.0 / (1.0 + score),
-            };
-            out.push(resp_bulk_str(&format!("{:.6}", similarity)));
+            out.push(resp_bulk_str(&format!(
+                "{:.6}",
+                similarity(&inner.metric, *score)
+            )));
         }
         if with_attribs {
             let attrs = inner

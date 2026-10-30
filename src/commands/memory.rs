@@ -3,7 +3,7 @@ use crate::commands::helpers::parse_utf8;
 use crate::read_lock;
 use crate::resp::write::*;
 use crate::store;
-use crate::types::KiviDBValue;
+use crate::store::ValueRef;
 
 pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
     if name != "MEMORY" {
@@ -76,19 +76,23 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
         None => return Some(resp_error("ERR key must be valid UTF-8")),
     };
 
-    // Parse optional SAMPLES count
-    let samples = if cmd.len() >= 5 {
-        let opt = String::from_utf8_lossy(cmd[3]).to_ascii_uppercase();
-        if opt == "SAMPLES" {
-            std::str::from_utf8(cmd[4])
+    // `SAMPLES count`, as Redis reads it: how many elements of a collection
+    // are looked at, 5 by default; 0 is all of them. It divided by zero for
+    // a hash, set or sorted set, and the worker panicked (#151).
+    let samples = match &cmd[3..] {
+        [] => 5,
+        [opt, count] if opt.eq_ignore_ascii_case(b"SAMPLES") => {
+            match std::str::from_utf8(count)
                 .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(5)
-        } else {
-            5
+                .and_then(|s| s.parse::<i64>().ok())
+            {
+                None => return Some(resp_error("ERR value is not an integer or out of range")),
+                Some(n) if n < 0 => return Some(resp_error("ERR syntax error")),
+                Some(0) => usize::MAX,
+                Some(n) => n as usize,
+            }
         }
-    } else {
-        5
+        _ => return Some(resp_error("ERR syntax error")),
     };
 
     let db = &ctx.store[*ctx.selected_db];
@@ -110,9 +114,9 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
         // key and the value, as the allocator rounds it. Redis's suite
         // holds it to that (at least the three, at most twice them or 64),
         // which a share of the table's entries does not fit.
-        KiviDBValue::String(b) => size_class(16 + key.len() + 2 + b.len() + 2),
+        ValueRef::String(b) => size_class(16 + key.len() + 2 + b.len() + 2),
 
-        KiviDBValue::List(arc) => {
+        ValueRef::List(arc) => {
             let inner = arc.read();
             let len = inner.len();
             let avg = if len == 0 || samples == 0 {
@@ -131,7 +135,7 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             key_overhead + avg * len + 80
         }
 
-        KiviDBValue::Hash(arc) => {
+        ValueRef::Hash(arc) => {
             let inner = arc.read();
             let len = inner.len();
             let (avg_k, avg_v) = if len == 0 {
@@ -150,7 +154,7 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             key_overhead + (avg_k + avg_v) * len + 120
         }
 
-        KiviDBValue::Set(arc) => {
+        ValueRef::Set(arc) => {
             let inner = arc.read();
             let len = inner.len();
             let avg = if len == 0 {
@@ -169,7 +173,7 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             key_overhead + avg * len + 80
         }
 
-        KiviDBValue::SortedSet(arc) => {
+        ValueRef::SortedSet(arc) => {
             let inner = arc.read();
             let len = inner.members.len();
             let avg = if len == 0 {
@@ -190,7 +194,7 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             key_overhead + (avg + 8) * len * 2 + 120
         }
 
-        KiviDBValue::Stream(arc) => {
+        ValueRef::Stream(arc) => {
             let inner = arc.read();
             let len = inner.entries.len();
             let avg = if len == 0 {
@@ -215,18 +219,18 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             key_overhead + avg * len + 200
         }
 
-        KiviDBValue::Json(arc) => {
+        ValueRef::Json(arc) => {
             let s = arc.read().to_string();
             key_overhead + s.len() + 64
         }
 
-        KiviDBValue::TimeSeries(arc) => {
+        ValueRef::TimeSeries(arc) => {
             let inner = arc.read();
             // Each sample: 8 bytes timestamp + 8 bytes f64
             key_overhead + inner.samples.len() * 16 + 200
         }
 
-        KiviDBValue::VectorSet(arc) => {
+        ValueRef::VectorSet(arc) => {
             let inner = arc.read();
             // Each entry: dim * 4 bytes (f32) + attrs string
             let count = inner.entries.len();
@@ -234,7 +238,7 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             key_overhead + count * dim * 4 + 200
         }
 
-        KiviDBValue::Array(arc) => {
+        ValueRef::Array(arc) => {
             let inner = arc.read();
             let len = inner.entries.len();
             // Sample values the same way the other collection types do —
@@ -256,7 +260,7 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             // Per entry: 8-byte index key + value bytes + BTreeMap node share.
             key_overhead + len * (8 + avg + 32) + 100
         }
-        KiviDBValue::HashEx(arc) => {
+        ValueRef::HashEx(arc) => {
             let inner = arc.read();
             let len = inner.fields.len();
             let (avg_k, avg_v) = if len == 0 {
@@ -284,13 +288,15 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
 }
 
 fn memory_stats() -> Vec<u8> {
-    let (rss, peak, vsize) = read_proc_status();
+    let (rss, _, vsize) = read_proc_status();
+    // Allocated, as in `INFO memory`: see `memory_use`.
+    let (used, peak) = used_and_peak();
 
     let rss_human = human_bytes(rss);
     let peak_human = human_bytes(peak);
     let vsize_human = human_bytes(vsize);
 
-    let (frag_ratio, frag_bytes) = fragmentation(rss, vsize);
+    let (frag_ratio, frag_bytes) = fragmentation(rss, used);
 
     // Flat key-value array matching Redis field names
     let mut pairs: Vec<Vec<u8>> = Vec::new();
@@ -301,8 +307,6 @@ fn memory_stats() -> Vec<u8> {
         };
     }
 
-    // Allocated, as in `INFO memory`: see `memory_use`.
-    let used = crate::memory_use::allocated();
     kv!("used_memory", used);
     kv!("used_memory_human", human_bytes(used));
     kv!("used_memory_rss", rss);
@@ -316,7 +320,7 @@ fn memory_stats() -> Vec<u8> {
         format!(
             "{:.2}%",
             if peak > 0 {
-                rss as f64 / peak as f64 * 100.0
+                used as f64 / peak as f64 * 100.0
             } else {
                 100.0
             }
@@ -330,7 +334,10 @@ fn memory_stats() -> Vec<u8> {
     kv!("allocator_rss_bytes", "0");
     kv!("rss_overhead_ratio", "1.0");
     kv!("rss_overhead_bytes", "0");
-    kv!("active_defrag_running", "0");
+    kv!(
+        "active_defrag_running",
+        u8::from(crate::compaction::running()).to_string()
+    );
     kv!(
         "lazyfree_pending_objects",
         crate::lazyfree::pending_objects().to_string()
@@ -499,53 +506,82 @@ pub fn read_proc_status_pub() -> (usize, usize, usize) {
     read_proc_status()
 }
 
-/// Redis-style `(mem_fragmentation_ratio, mem_fragmentation_bytes)`.
+/// Redis's `(mem_fragmentation_ratio, mem_fragmentation_bytes)`: what the
+/// operating system holds for the process (`rss`) over what it has allocated
+/// (`used`, `used_memory`), and the difference (#152). Above 1, memory freed
+/// is held in pages that something still uses, or by the allocator.
 ///
-/// Only Linux reports two directly comparable numbers: `VmSize` is the virtual
-/// address space that contains `VmRSS`, so the ratio is meaningfully >= 1.
-///
-/// Everywhere else the second number measures something different and the
-/// ratio is not a fragmentation signal at all:
-///
-/// * macOS — `ps` virtual size, already special-cased before this existed.
-/// * Windows — `PagefileUsage` is *private commit*, while the working set also
-///   counts shared pages (DLLs). Commit is routinely the smaller of the two, so
-///   the ratio lands below 1 and reads as nonsense: a real run reported
-///   `mem_fragmentation_ratio:0.4279`.
-///
-/// Reporting a neutral `1.0` there is honest — no fragmentation information is
-/// available — where a computed sub-1 ratio would be actively wrong.
-pub(crate) fn fragmentation(rss: usize, vsize: usize) -> (f64, usize) {
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    {
-        let _ = (rss, vsize);
-        (1.0, 0)
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        let ratio = if rss > 0 {
-            vsize as f64 / rss as f64
-        } else {
-            1.0
-        };
-        (ratio, vsize.saturating_sub(rss))
-    }
+/// It was the virtual size over the RSS: 176 on an empty server and 56 with
+/// 100,000 keys, where RSS over `used_memory` was about 1.8, so that
+/// `MEMORY DOCTOR` always warned and alerts above 1.5 always fired.
+pub(crate) fn fragmentation(rss: usize, used: usize) -> (f64, i64) {
+    let ratio = if used > 0 {
+        rss as f64 / used as f64
+    } else {
+        1.0
+    };
+    (ratio, rss as i64 - used as i64)
+}
+
+/// The most `used_memory` has been: Redis's `used_memory_peak` (#152). It
+/// was the most RSS seen, and only when `INFO` or `MEMORY` ran.
+static PEAK_USED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `used_memory` now, and its peak including now. Sampled every 100 ms (see
+/// `stats::spawn_instantaneous_ops_sampler`) and whenever it is read, as
+/// Redis samples it in its cron and its commands.
+pub(crate) fn used_and_peak() -> (usize, usize) {
+    use std::sync::atomic::Ordering;
+    let used = crate::memory_use::allocated();
+    (used, PEAK_USED.fetch_max(used, Ordering::Relaxed).max(used))
+}
+
+/// `used_memory` once the server has started, before any data:
+/// `used_memory_startup`.
+static STARTUP_USED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The server has started: what it has allocated is its own, not data's.
+pub(crate) fn note_startup() {
+    let _ = STARTUP_USED.compare_exchange(
+        0,
+        crate::memory_use::allocated(),
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// See [`STARTUP_USED`].
+pub(crate) fn startup_used() -> usize {
+    STARTUP_USED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn human_bytes_pub(bytes: usize) -> String {
     human_bytes(bytes)
 }
 
+/// As Redis's: nothing to say about an almost empty instance, whose RSS is
+/// mostly the program's own; fragmentation above 1.4 that is more than
+/// 10 MB; a peak half as large again as now.
 fn memory_doctor() -> Vec<u8> {
-    let (rss, peak, vsize) = read_proc_status();
-    let (frag_ratio, _) = fragmentation(rss, vsize);
+    let (rss, _, _) = read_proc_status();
+    let (used, peak) = used_and_peak();
+    let (frag_ratio, frag_bytes) = fragmentation(rss, used);
 
-    let msg = if frag_ratio > 1.5 {
-        "High fragmentation: RSS fragmentation ratio above 1.5. \
-         Consider MEMORY PURGE or restart to reclaim pages."
-    } else if rss > 0 && peak > 0 && rss > (peak as f64 * 1.1) as usize {
-        "RSS exceeds peak by more than 10%. \
-         Allocator may be holding released memory pages."
+    let msg = if used < 5 << 20 {
+        "Hi Sam, this instance is empty or is using very little memory, my issues detector \
+         can't be used in these conditions."
+    } else if frag_ratio > 1.4 && frag_bytes > 10 << 20 && crate::compaction::enabled() {
+        // Active defrag is on (the default since 1.2): it told the reader to
+        // turn it on (#173).
+        "High fragmentation: RSS fragmentation ratio above 1.4 (the process holds over 40% more \
+         than it has allocated). Active defrag is on and works through it as the server runs; \
+         MEMORY PURGE gives freed memory back to the system at once."
+    } else if frag_ratio > 1.4 && frag_bytes > 10 << 20 {
+        "High fragmentation: RSS fragmentation ratio above 1.4 (the process holds over 40% more \
+         than it has allocated). Consider MEMORY PURGE, or turn on activedefrag."
+    } else if peak > used / 2 * 3 {
+        "Peak memory: in the past this instance used more than 150% of the memory it is using \
+         now. The allocator keeps some of it, which shows as fragmentation."
     } else {
         "Sam, I love your taste in T-shirts, but your memory is just fine."
     };
@@ -571,9 +607,9 @@ fn memory_purge() -> Vec<u8> {
 }
 
 fn memory_malloc_stats() -> Vec<u8> {
-    // On Linux you'd call malloc_info() — complex and rarely needed.
-    // Return minimal valid XML matching the format clients expect.
-    resp_bulk_str("<malloc version=\"1\"><heap nr=\"0\"/><total/></malloc>")
+    // What Redis answers when built without jemalloc, as KiviDB is: it was
+    // a fixed piece of XML that looked like statistics (#152).
+    resp_bulk_str("Stats not supported for the current allocator")
 }
 
 #[cfg(test)]

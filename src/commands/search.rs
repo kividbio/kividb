@@ -3,8 +3,10 @@
 // FT.CREATE's schema, FT.INFO, and FT.SEARCH: the arguments, running a parsed
 // query (`vector::filter`) against an index, and the reply.
 
+use crate::store::ValueRef;
 use ahash::{AHashMap, AHashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::commands::ctx::Ctx;
 use crate::resp::write::*;
@@ -398,8 +400,8 @@ fn count_docs(db: &Db, def: &IndexDef, cluster: Option<&crate::cluster::ClusterS
                 .read()
                 .iter()
                 .filter(|(key, value)| {
-                    crate::vector::is_document(&def.on, value)
-                        && covers(def, key.as_str())
+                    crate::vector::is_document(&def.on, *value)
+                        && covers(def, key)
                         && cluster.is_none_or(|c| crate::cluster::search::serves(c, key))
                 })
                 .count()
@@ -626,6 +628,102 @@ pub(crate) struct Match {
     pub distance: Option<f32>,
 }
 
+/// Documents a filter accepted, and whether the scan stopped because the
+/// query's timeout ran out.
+pub(crate) struct FilterHits {
+    pub matches: Vec<Match>,
+    pub timed_out: bool,
+}
+
+/// When the query must stop. `timeout_ms` is the command's `TIMEOUT`, or
+/// the engine's `FT.CONFIG TIMEOUT` (`search-timeout`) when the command did
+/// not name one. `0` is no limit, and the default.
+pub(crate) fn search_deadline(timeout_ms: Option<u64>) -> Option<Instant> {
+    let ms =
+        timeout_ms.unwrap_or_else(|| crate::commands::search_tools::config_number("TIMEOUT", 0));
+    if ms == 0 {
+        None
+    } else {
+        // A limit further off than the clock can count is none: adding it
+        // would panic where the clock counts less far.
+        Instant::now().checked_add(Duration::from_millis(ms))
+    }
+}
+
+pub(crate) fn past_deadline(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|d| Instant::now() >= d)
+}
+
+/// Documents between clock reads during a scan. A million-document query
+/// then pays a thousand reads, not a million.
+pub(crate) const DEADLINE_EVERY: u32 = 1024;
+
+/// True when `deadline` has passed, reading the clock every [`DEADLINE_EVERY`]
+/// documents. `seen` is how many have been looked at since the last read.
+pub(crate) fn deadline_due(deadline: Option<Instant>, seen: &mut u32) -> bool {
+    if deadline.is_none() {
+        return false;
+    }
+    *seen += 1;
+    if *seen < DEADLINE_EVERY {
+        return false;
+    }
+    *seen = 0;
+    past_deadline(deadline)
+}
+
+/// Every document of `db` into `each`, shard by shard, until `deadline` has
+/// passed: then true. The clock is read between runs of [`DEADLINE_EVERY`]
+/// documents, counted across shards, and only while documents are left to
+/// read: a scan that got to the end is whole, however long it took.
+///
+/// Not in the loop over the documents of a run: the scan waits on memory,
+/// document after document, and with a check in that loop, however cheap,
+/// the compiler kept less of the per-document work inline. Filtered KNN
+/// queries took 12% longer that way.
+pub(crate) fn scan_docs(
+    db: &Db,
+    deadline: Option<Instant>,
+    mut each: impl FnMut(&str, ValueRef<'_>),
+) -> bool {
+    let run = DEADLINE_EVERY as usize;
+    let mut seen = 0usize;
+    for shard in db.iter() {
+        let map = shard.read();
+        let mut left = map.len();
+        let mut docs = map.iter();
+        while left > 0 {
+            if seen >= run {
+                seen = 0;
+                if past_deadline(deadline) {
+                    return true;
+                }
+            }
+            let this_run = left.min(run);
+            for (key, value) in docs.by_ref().take(this_run) {
+                each(key, value);
+            }
+            left -= this_run;
+            seen += this_run;
+        }
+    }
+    false
+}
+
+/// Whether a step over `n` items that cannot stop part-way (a sort) is to
+/// be left out because the deadline has passed. Fewer than
+/// [`DEADLINE_EVERY`] items cost less than reading the clock, and always
+/// run: a query that small is never reported as cut short.
+pub(crate) fn no_time_for(deadline: Option<Instant>, n: usize) -> bool {
+    n >= DEADLINE_EVERY as usize && past_deadline(deadline)
+}
+
+/// `ON_TIMEOUT fail` and `return_strict` error instead of returning what
+/// was found.
+pub(crate) fn on_timeout_fails() -> bool {
+    crate::commands::search_tools::on_timeout_fails()
+}
+
 /// The exact words a query looks for: what relevance is scored on, and what
 /// `HIGHLIGHT` marks.
 pub(crate) fn query_terms(filter: &Filter, out: &mut AHashSet<String>) {
@@ -767,28 +865,50 @@ pub(crate) fn relevance(def: &IndexDef, fields: &Fields, terms: &AHashSet<String
 }
 
 /// Every document of the index that the filter accepts. In no particular
-/// order.
+/// order. Stops when `deadline` has passed, and then `timed_out` is true.
 pub(crate) fn filter_search(
     ctx: &Ctx,
     def: &IndexDef,
     filter: &Filter,
     only: Option<&AHashSet<String>>,
-) -> Vec<Match> {
-    let db = &ctx.store[*ctx.selected_db];
+    deadline: Option<Instant>,
+) -> FilterHits {
     let mut terms = AHashSet::new();
     query_terms(filter, &mut terms);
     let range = filter.vector_range();
     let mut out: Vec<Match> = Vec::new();
-
-    let mut consider = |key: &str, fields: &Fields| {
-        if !filter::eval(filter, fields) {
-            return;
-        }
+    let timed_out = filter_each(ctx, def, filter, only, deadline, |key, fields| {
         out.push(Match {
             key: key.to_string(),
             score: relevance(def, fields, &terms),
             distance: range.and_then(|clause| filter::range_distance(clause, fields)),
         });
+    });
+    FilterHits {
+        matches: out,
+        timed_out,
+    }
+}
+
+/// Every document of the index that the filter accepts, into `accept`, with
+/// its key and fields: [`filter_search`] without the copies, for a caller
+/// that keeps only some of them. True if it stopped because `deadline` had
+/// passed. `accept` may run under a shard's read lock.
+pub(crate) fn filter_each(
+    ctx: &Ctx,
+    def: &IndexDef,
+    filter: &Filter,
+    only: Option<&AHashSet<String>>,
+    deadline: Option<Instant>,
+    mut accept: impl FnMut(&str, &Fields),
+) -> bool {
+    let db = &ctx.store[*ctx.selected_db];
+    let mut timed_out = false;
+
+    let mut consider = |key: &str, fields: &Fields| {
+        if filter::eval(filter, fields) {
+            accept(key, fields);
+        }
     };
 
     // The keys to look at, if they are known without reading everything: the
@@ -800,7 +920,12 @@ pub(crate) fn filter_search(
     };
     match known {
         Some(keys) => {
+            let mut seen = 0u32;
             for key in &keys {
+                if deadline_due(deadline, &mut seen) {
+                    timed_out = true;
+                    break;
+                }
                 if !covers(def, key) {
                     continue;
                 }
@@ -808,20 +933,19 @@ pub(crate) fn filter_search(
             }
         }
         None => {
-            for shard in db.iter() {
-                let map = shard.read();
-                for (key, value) in map.iter() {
-                    if !covers(def, key) {
-                        continue;
-                    }
-                    if let Some(fields) = crate::vector::doc_fields(&def.on, &def.fields, value) {
-                        consider(key, &fields);
-                    }
+            timed_out = scan_docs(db, deadline, |key, value| {
+                if !covers(def, key) {
+                    return;
                 }
-            }
+                if let Some(fields) = crate::vector::doc_fields(&def.on, &def.fields, value) {
+                    consider(key, &fields);
+                }
+            });
         }
     }
-    out
+    // A scan that reached the end is whole, however long it took: only one
+    // that stopped early has timed out.
+    timed_out
 }
 
 /// Run `f` on the document at `key`, if there is one of the kind the index
@@ -833,7 +957,10 @@ fn with_doc<R>(
     f: impl FnOnce(&Fields, Option<&serde_json::Value>) -> R,
 ) -> Option<R> {
     // Out of the shard, so that its lock is not held while `f` runs.
-    let value = crate::store::get_shard(db, key).read().get(key).cloned()?;
+    let value = crate::store::get_shard(db, key)
+        .read()
+        .get(key)
+        .map(ValueRef::to_value)?;
     match (&def.on, &value) {
         (IndexOn::Hash, KiviDBValue::Hash(hash)) => Some(f(&hash.read(), None)),
         (IndexOn::Hash, KiviDBValue::HashEx(hash)) => Some(f(&hash.read().fields, None)),
@@ -868,6 +995,8 @@ struct SearchArgs {
     inkeys: Option<AHashSet<String>>,
     /// `HIGHLIGHT`: the fields (empty: every TEXT field) and the two tags.
     highlight: Option<(Vec<String>, String, String)>,
+    /// Command `TIMEOUT` in milliseconds. `None` uses `FT.CONFIG TIMEOUT`.
+    timeout_ms: Option<u64>,
 }
 
 fn parse_search_args(cmd: &[&[u8]], start: usize) -> Result<SearchArgs, String> {
@@ -908,7 +1037,14 @@ fn parse_search_args(cmd: &[&[u8]], start: usize) -> Result<SearchArgs, String> 
             // How words are expanded, and how phrases are held together:
             // none of it applies to an index without stemming or slop.
             "VERBATIM" | "NOSTOPWORDS" | "INORDER" => i += 1,
-            "SLOP" | "TIMEOUT" | "LANGUAGE" | "EXPANDER" | "PAYLOAD" => {
+            "TIMEOUT" => {
+                let raw = arg(i + 1, "TIMEOUT")?;
+                args.timeout_ms = Some(raw.parse::<u64>().map_err(|_| {
+                    "Bad arguments for TIMEOUT: expected a non-negative integer".to_string()
+                })?);
+                i += 2;
+            }
+            "SLOP" | "LANGUAGE" | "EXPANDER" | "PAYLOAD" => {
                 arg(i + 1, &word)?;
                 i += 2;
             }
@@ -1096,7 +1232,7 @@ pub(crate) fn number_text(value: f64) -> String {
     }
 }
 
-fn distance_text(distance: f32) -> String {
+pub(crate) fn distance_text(distance: f32) -> String {
     if distance == 0.0 {
         "0".to_string()
     } else {
@@ -1160,6 +1296,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
     let query_text =
         std::str::from_utf8(cmd[2]).map_err(|_| "The query must be valid UTF-8".to_string())?;
     let args = parse_search_args(cmd, 3)?;
+    let deadline = search_deadline(args.timeout_ms);
 
     let def = ctx
         .index_store
@@ -1218,6 +1355,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
     query_terms(&filter, &mut terms);
 
     // ── The matches, in the query's own order ────────────────────────────────
+    let mut timed_out = false;
     let mut hits: Vec<Hit> = match &query.knn {
         Some(knn) => {
             let field = def
@@ -1250,13 +1388,19 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 }
             } else {
                 // The filter first, then the nearest among what it left:
-                // exact, whatever the index type.
-                let allowed: std::collections::HashSet<String> =
-                    filter_search(ctx, &def, &filter, args.inkeys.as_ref())
-                        .into_iter()
-                        .map(|m| m.key)
-                        .collect();
-                crate::commands::vector::knn_filtered(live, &knn.vector, knn.k, metric, &allowed)
+                // exact, whatever the index type. Each document the filter
+                // accepts is measured as it is found.
+                let mut scorer =
+                    crate::commands::vector::FilteredKnn::new(live, &knn.vector, knn.k, metric);
+                timed_out = filter_each(
+                    ctx,
+                    &def,
+                    &filter,
+                    args.inkeys.as_ref(),
+                    deadline,
+                    |key, _| scorer.offer(key),
+                );
+                scorer.nearest()
             };
             nearest
                 .into_iter()
@@ -1274,8 +1418,14 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 _ => None,
             };
             let by_distance = filter.vector_range().is_some() && !filter.has_text();
-            let mut matches = filter_search(ctx, &def, &filter, args.inkeys.as_ref());
-            if by_distance {
+            let found = filter_search(ctx, &def, &filter, args.inkeys.as_ref(), deadline);
+            timed_out = found.timed_out;
+            let mut matches = found.matches;
+            // A sort cannot stop part-way. Past the deadline it is left
+            // out, and what was found comes back in the order it was found.
+            if no_time_for(deadline, matches.len()) {
+                timed_out = true;
+            } else if by_distance {
                 // Nearest first.
                 matches.sort_by(|a, b| {
                     a.distance
@@ -1290,7 +1440,6 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
             matches
                 .into_iter()
                 .map(|found| Hit {
-                    key: found.key,
                     // For a coordinator, what this node's order is by.
                     score: match found.distance {
                         Some(distance) if shard && by_distance => f64::from(distance),
@@ -1302,12 +1451,12 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                         }
                         _ => Vec::new(),
                     },
+                    key: found.key,
                     sort_key: None,
                 })
                 .collect()
         }
     };
-
     // In a cluster, only the keys of the slots this node serves: a key part
     // of the way through a migration is not counted twice.
     if ctx.cluster.enabled {
@@ -1320,7 +1469,16 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
         let numeric = schema_field.is_some_and(|f| matches!(f.field_type, FieldType::Numeric));
         let unf = schema_field.is_some_and(|f| f.options.unf);
         let source = schema_field.map_or(name.as_str(), |f| f.name.as_str());
+        // A document read for each hit: as long as the scan, so the deadline
+        // is kept here too. Cut short, the hits are not sorted.
+        let mut seen = 0u32;
+        let mut keyed = true;
         for hit in &mut hits {
+            if deadline_due(deadline, &mut seen) {
+                timed_out = true;
+                keyed = false;
+                break;
+            }
             // A value the query produced (the distance) or one the document
             // holds.
             hit.sort_key = match hit.extras.iter().find(|(alias, _)| alias == name) {
@@ -1338,21 +1496,32 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 .flatten(),
             };
         }
-        hits.sort_by(|a, b| {
-            use std::cmp::Ordering;
-            let order = match (&a.sort_key, &b.sort_key) {
-                (Some(SortKey::Number(x)), Some(SortKey::Number(y))) => x.total_cmp(y),
-                (Some(SortKey::Text(x)), Some(SortKey::Text(y))) => x.cmp(y),
-                (Some(SortKey::Number(_)), Some(SortKey::Text(_))) => Ordering::Less,
-                (Some(SortKey::Text(_)), Some(SortKey::Number(_))) => Ordering::Greater,
-                // A document without the value comes last, either way round.
-                (Some(_), None) => return Ordering::Less,
-                (None, Some(_)) => return Ordering::Greater,
-                (None, None) => Ordering::Equal,
-            };
-            let order = if *ascending { order } else { order.reverse() };
-            order.then_with(|| a.key.cmp(&b.key))
-        });
+        if keyed && no_time_for(deadline, hits.len()) {
+            timed_out = true;
+            keyed = false;
+        }
+        if keyed {
+            hits.sort_by(|a, b| {
+                use std::cmp::Ordering;
+                let order = match (&a.sort_key, &b.sort_key) {
+                    (Some(SortKey::Number(x)), Some(SortKey::Number(y))) => x.total_cmp(y),
+                    (Some(SortKey::Text(x)), Some(SortKey::Text(y))) => x.cmp(y),
+                    (Some(SortKey::Number(_)), Some(SortKey::Text(_))) => Ordering::Less,
+                    (Some(SortKey::Text(_)), Some(SortKey::Number(_))) => Ordering::Greater,
+                    // A document without the value comes last, either way round.
+                    (Some(_), None) => return Ordering::Less,
+                    (None, Some(_)) => return Ordering::Greater,
+                    (None, None) => Ordering::Equal,
+                };
+                let order = if *ascending { order } else { order.reverse() };
+                order.then_with(|| a.key.cmp(&b.key))
+            });
+        }
+    }
+    // A shard answers with what it found and whether it timed out; the
+    // coordinator applies `ON_TIMEOUT`.
+    if timed_out && !shard && on_timeout_fails() {
+        return Err("Timeout limit was reached".into());
     }
 
     // ── The page ─────────────────────────────────────────────────────────────
@@ -1447,7 +1616,14 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
             },
         })
         .collect();
-    Ok(encode_page(ctx.resp, &page, total, &args, nocontent))
+    let page = encode_page(ctx.resp, &page, total, &args, nocontent, timed_out);
+    // A coordinator that asks for it is told whether this part timed out;
+    // one from before there was a timeout gets the page as it expects it.
+    if shard && crate::cluster::search::wants_timeout_flag(&ctx.cmd) {
+        Ok(crate::cluster::search::encode_search(page, timed_out))
+    } else {
+        Ok(page)
+    }
 }
 
 /// A hit of the page, with what is shown of it.
@@ -1465,6 +1641,7 @@ fn encode_page(
     total: usize,
     args: &SearchArgs,
     nocontent: bool,
+    timed_out: bool,
 ) -> Vec<u8> {
     let fields_of = |hit: &PageHit| hit.fields.clone();
     let sort_key_reply = |hit: &PageHit| match &hit.sort_key {
@@ -1514,7 +1691,11 @@ fn encode_page(
                 resp_bulk_str("total_results"),
                 resp_integer(total as i64),
                 resp_bulk_str("warning"),
-                resp_array(vec![]),
+                resp_array(if timed_out {
+                    vec![resp_bulk_str("Timeout limit was reached")]
+                } else {
+                    vec![]
+                }),
             ],
         );
     }
@@ -1579,6 +1760,7 @@ fn coordinate(
     shard_cmd.push(b"LIMIT".to_vec());
     shard_cmd.push(b"0".to_vec());
     shard_cmd.push((args.offset + args.count).to_string().into_bytes());
+    crate::cluster::search::ask_for_timeout_flag(&mut shard_cmd);
 
     // This node's part, then the others'.
     let local = {
@@ -1611,7 +1793,10 @@ fn coordinate(
     use crate::cluster::search::Reply;
     let mut total = 0usize;
     let mut hits: Vec<PageHit> = Vec::new();
+    let mut timed_out = false;
     for reply in replies {
+        let (reply, shard_timed_out) = crate::cluster::search::decode_search(reply)?;
+        timed_out |= shard_timed_out;
         let Reply::Array(items) = reply else {
             return Err("ERR a master answered the search with something else".into());
         };
@@ -1698,7 +1883,12 @@ fn coordinate(
         .skip(args.offset)
         .take(args.count)
         .collect();
-    Ok(encode_page(ctx.resp, &page, total, args, nocontent))
+    if timed_out && on_timeout_fails() {
+        return Err("Timeout limit was reached".into());
+    }
+    Ok(encode_page(
+        ctx.resp, &page, total, args, nocontent, timed_out,
+    ))
 }
 
 #[cfg(test)]
@@ -1919,6 +2109,9 @@ mod tests {
         assert_eq!((args.offset, args.count), (5, 20));
         assert_eq!(args.params["p"], b"v");
         assert!(args.withscores && args.nocontent);
+        assert_eq!(parse(&["TIMEOUT", "50"]).unwrap().timeout_ms, Some(50));
+        assert_eq!(parse(&["TIMEOUT", "0"]).unwrap().timeout_ms, Some(0));
+        assert!(parse(&["TIMEOUT", "soon"]).is_err());
 
         for bad in [
             &["BOGUS"][..],
@@ -1937,5 +2130,32 @@ mod tests {
                 .unwrap_err()
                 .contains("Unknown argument `BOGUS`")
         );
+    }
+
+    #[test]
+    fn a_deadline_already_passed_is_past() {
+        assert!(past_deadline(Some(Instant::now() - Duration::from_secs(1))));
+        assert!(!past_deadline(None));
+        assert!(search_deadline(Some(0)).is_none());
+        assert!(search_deadline(Some(50)).is_some());
+        // As far off as a TIMEOUT can say: a deadline or none, not a panic.
+        let _ = search_deadline(Some(u64::MAX));
+    }
+
+    #[test]
+    fn the_clock_is_read_every_1024_documents() {
+        let deadline = Some(Instant::now() - Duration::from_secs(1));
+        let mut seen = 0u32;
+        for _ in 0..DEADLINE_EVERY - 1 {
+            assert!(!deadline_due(deadline, &mut seen));
+        }
+        assert!(deadline_due(deadline, &mut seen));
+        assert!(!deadline_due(None, &mut 0u32));
+        // A sort of fewer items than that always runs; of more, not past it.
+        assert!(!no_time_for(deadline, DEADLINE_EVERY as usize - 1));
+        assert!(no_time_for(deadline, DEADLINE_EVERY as usize));
+        assert!(!no_time_for(None, usize::MAX));
+        let later = Some(Instant::now() + Duration::from_secs(60));
+        assert!(!no_time_for(later, usize::MAX));
     }
 }

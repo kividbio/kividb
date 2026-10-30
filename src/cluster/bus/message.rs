@@ -25,6 +25,11 @@
 //   MFSTART <sender_id>  /  MFACK <sender_id> <offset>
 //     Manual-failover handshake between a replica and its master.
 //
+//   OFFSET <sender_id>  /  OFFSET_ACK <sender_id> <offset>
+//     A replica whose master failed asks its fellow replicas how far each has
+//     read, to rank itself before it stands for election. A node that does not
+//     know OFFSET drops the connection: the asker counts it as unknown.
+//
 // <sender_endpoint> is a colon-packed string:
 //     "<ip>:<client_port>:<cluster_port>:<config_epoch>"
 // Yes, this means an IPv6 address would break the parser. We use IPv4 only
@@ -56,6 +61,9 @@ pub struct GossipEntry {
     pub master_id: Option<NodeId>,
     /// Empty when the node announces none, or the sender does not know it.
     pub hostname: String,
+    /// The node's `cluster-announce-client-port`; 0 when none, or unknown.
+    /// Travels in the flags string as `cport=<port>`, as the hostname does.
+    pub announced_client_port: u16,
 }
 
 /// One slot range the sender claims to own, with the epoch at which the
@@ -87,6 +95,8 @@ pub enum BusMessage {
         sender_master_id: Option<NodeId>,
         /// Empty when the sender announces none.
         sender_hostname: String,
+        /// Its `cluster-announce-client-port`; 0 when it announces none.
+        sender_announced_client_port: u16,
         gossip: Vec<GossipEntry>,
         slot_claims: Vec<SlotClaim>,
     },
@@ -100,6 +110,8 @@ pub enum BusMessage {
         sender_master_id: Option<NodeId>,
         /// Empty when the sender announces none.
         sender_hostname: String,
+        /// Its `cluster-announce-client-port`; 0 when it announces none.
+        sender_announced_client_port: u16,
         gossip: Vec<GossipEntry>,
         slot_claims: Vec<SlotClaim>,
     },
@@ -154,6 +166,13 @@ pub enum BusMessage {
         sender_id: NodeId,
         target_offset: u64,
     },
+
+    /// A replica asks another replica of the same master for its replication
+    /// offset, to rank itself before an election.
+    OffsetQuery { sender_id: NodeId },
+
+    /// The answer: the replica's replication offset.
+    OffsetAck { sender_id: NodeId, offset: u64 },
 }
 
 impl BusMessage {
@@ -167,7 +186,9 @@ impl BusMessage {
             | BusMessage::Fail { sender_id, .. }
             | BusMessage::Publish { sender_id, .. }
             | BusMessage::MfStart { sender_id }
-            | BusMessage::MfAck { sender_id, .. } => sender_id,
+            | BusMessage::MfAck { sender_id, .. }
+            | BusMessage::OffsetQuery { sender_id }
+            | BusMessage::OffsetAck { sender_id, .. } => sender_id,
         }
     }
 }
@@ -201,6 +222,7 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
             sender_flags,
             sender_master_id,
             sender_hostname,
+            sender_announced_client_port,
             gossip,
             slot_claims,
         } => resp_array(vec![
@@ -212,7 +234,11 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
                 *sender_cluster_port,
                 *sender_config_epoch,
             )),
-            resp_bulk_str(&flags_with_host(*sender_flags, sender_hostname)),
+            resp_bulk_str(&flags_with_host(
+                *sender_flags,
+                sender_hostname,
+                *sender_announced_client_port,
+            )),
             match sender_master_id {
                 Some(m) => resp_bulk(m),
                 None => resp_bulk(b""),
@@ -229,6 +255,7 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
             sender_flags,
             sender_master_id,
             sender_hostname,
+            sender_announced_client_port,
             gossip,
             slot_claims,
         } => resp_array(vec![
@@ -240,7 +267,11 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
                 *sender_cluster_port,
                 *sender_config_epoch,
             )),
-            resp_bulk_str(&flags_with_host(*sender_flags, sender_hostname)),
+            resp_bulk_str(&flags_with_host(
+                *sender_flags,
+                sender_hostname,
+                *sender_announced_client_port,
+            )),
             match sender_master_id {
                 Some(m) => resp_bulk(m),
                 None => resp_bulk(b""),
@@ -314,6 +345,14 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
             resp_bulk(sender_id),
             resp_bulk_str(&target_offset.to_string()),
         ]),
+        BusMessage::OffsetQuery { sender_id } => {
+            resp_array(vec![resp_bulk_str("OFFSET"), resp_bulk(sender_id)])
+        }
+        BusMessage::OffsetAck { sender_id, offset } => resp_array(vec![
+            resp_bulk_str("OFFSET_ACK"),
+            resp_bulk(sender_id),
+            resp_bulk_str(&offset.to_string()),
+        ]),
     }
 }
 
@@ -349,7 +388,11 @@ fn encode_gossip(gossip: &[GossipEntry]) -> Vec<u8> {
                     g.cluster_port,
                     g.config_epoch,
                 )),
-                resp_bulk_str(&flags_with_host(g.flags, &g.hostname)),
+                resp_bulk_str(&flags_with_host(
+                    g.flags,
+                    &g.hostname,
+                    g.announced_client_port,
+                )),
                 match g.master_id {
                     Some(m) => resp_bulk(&m),
                     None => resp_bulk(b""),
@@ -377,8 +420,9 @@ fn format_flags(f: NodeFlags) -> String {
     parts.join(",")
 }
 
-/// The flags string with the node's hostname in it, if it has one.
-fn flags_with_host(flags: NodeFlags, hostname: &str) -> String {
+/// The flags string with the node's hostname and announced client port in
+/// it, where it has them.
+fn flags_with_host(flags: NodeFlags, hostname: &str, client_port: u16) -> String {
     let mut s = format_flags(flags);
     if !hostname.is_empty() {
         if !s.is_empty() {
@@ -387,7 +431,23 @@ fn flags_with_host(flags: NodeFlags, hostname: &str) -> String {
         s.push_str("host=");
         s.push_str(hostname);
     }
+    if client_port != 0 {
+        if !s.is_empty() {
+            s.push(',');
+        }
+        s.push_str("cport=");
+        s.push_str(&client_port.to_string());
+    }
     s
+}
+
+/// The announced client port in a flags string; 0 if there is none.
+fn cport_of(flags: &str) -> u16 {
+    flags
+        .split(',')
+        .find_map(|tok| tok.strip_prefix("cport="))
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0)
 }
 
 /// The hostname in a flags string; empty if there is none.
@@ -460,6 +520,7 @@ pub fn decode(buf: &[u8]) -> Result<Option<(BusMessage, usize)>, String> {
             let flags_str = std::str::from_utf8(&parts[3]).map_err(|_| "bad flags utf8")?;
             let sender_flags = parse_flags(flags_str);
             let sender_hostname = host_of(flags_str);
+            let sender_announced_client_port = cport_of(flags_str);
             let sender_master_id = if parts[4].is_empty() {
                 None
             } else {
@@ -477,6 +538,7 @@ pub fn decode(buf: &[u8]) -> Result<Option<(BusMessage, usize)>, String> {
                     sender_flags,
                     sender_master_id,
                     sender_hostname,
+                    sender_announced_client_port,
                     gossip,
                     slot_claims,
                 }
@@ -490,6 +552,7 @@ pub fn decode(buf: &[u8]) -> Result<Option<(BusMessage, usize)>, String> {
                     sender_flags,
                     sender_master_id,
                     sender_hostname,
+                    sender_announced_client_port,
                     gossip,
                     slot_claims,
                 }
@@ -602,6 +665,27 @@ pub fn decode(buf: &[u8]) -> Result<Option<(BusMessage, usize)>, String> {
                 consumed,
             )))
         }
+        "OFFSET" => {
+            if parts.len() < 2 {
+                return Err(format!("OFFSET expects 2 fields, got {}", parts.len()));
+            }
+            let sender_id = parse_node_id(&parts[1]).ok_or("bad sender id")?;
+            Ok(Some((BusMessage::OffsetQuery { sender_id }, consumed)))
+        }
+        "OFFSET_ACK" => {
+            if parts.len() < 3 {
+                return Err(format!("OFFSET_ACK expects 3 fields, got {}", parts.len()));
+            }
+            let sender_id = parse_node_id(&parts[1]).ok_or("bad sender id")?;
+            let offset: u64 = std::str::from_utf8(&parts[2])
+                .map_err(|_| "bad offset utf8")?
+                .parse()
+                .map_err(|_| "bad offset parse")?;
+            Ok(Some((
+                BusMessage::OffsetAck { sender_id, offset },
+                consumed,
+            )))
+        }
         other => Err(format!("unknown bus message type: {other}")),
     }
 }
@@ -665,6 +749,7 @@ fn parse_gossip(buf: &[u8]) -> Result<Vec<GossipEntry>, String> {
             flags,
             master_id,
             hostname: host_of(flags_str),
+            announced_client_port: cport_of(flags_str),
         });
     }
     Ok(out)
@@ -878,6 +963,7 @@ mod tests {
             sender_flags: NodeFlags::MASTER,
             sender_master_id: None,
             sender_hostname: String::new(),
+            sender_announced_client_port: 0,
         };
         let bytes = encode(&msg);
         let (decoded, consumed) = decode(&bytes).unwrap().unwrap();
@@ -900,6 +986,7 @@ mod tests {
             sender_config_epoch: 0,
             gossip: vec![GossipEntry {
                 hostname: String::new(),
+                announced_client_port: 0,
                 id: other,
                 ip: "10.0.0.2".into(),
                 client_port: 6381,
@@ -912,6 +999,7 @@ mod tests {
             sender_flags: NodeFlags::MASTER,
             sender_master_id: None,
             sender_hostname: String::new(),
+            sender_announced_client_port: 0,
         };
         let bytes = encode(&msg);
         let (decoded, _) = decode(&bytes).unwrap().unwrap();
@@ -923,6 +1011,63 @@ mod tests {
             }
             other => panic!("expected Ping, got {:?}", other),
         }
+    }
+
+    /// An announced client port goes in the flags string too (#110), as
+    /// `cport=<port>`: the sender's own, and each gossiped node's. A node
+    /// that does not know the token skips it, and reads the flags as before.
+    #[test]
+    fn announced_client_ports_travel_in_the_flags() {
+        let me = generate_node_id();
+        let other = generate_node_id();
+        let msg = BusMessage::Ping {
+            sender_id: me,
+            sender_ip: "10.0.0.1".into(),
+            sender_client_port: 6380,
+            sender_cluster_port: 16380,
+            sender_config_epoch: 3,
+            sender_flags: NodeFlags::MASTER,
+            sender_master_id: None,
+            sender_hostname: "a.example".into(),
+            sender_announced_client_port: 30001,
+            gossip: vec![GossipEntry {
+                id: other,
+                ip: "10.0.0.2".into(),
+                client_port: 6380,
+                cluster_port: 16380,
+                config_epoch: 2,
+                flags: NodeFlags::REPLICA,
+                master_id: Some(me),
+                hostname: String::new(),
+                announced_client_port: 30002,
+            }],
+            slot_claims: vec![],
+        };
+        let (decoded, _) = decode(&encode(&msg)).unwrap().unwrap();
+        match decoded {
+            BusMessage::Ping {
+                sender_hostname,
+                sender_announced_client_port,
+                sender_flags,
+                gossip,
+                ..
+            } => {
+                assert_eq!(sender_hostname, "a.example");
+                assert_eq!(sender_announced_client_port, 30001);
+                assert_eq!(sender_flags, NodeFlags::MASTER);
+                assert_eq!(gossip[0].announced_client_port, 30002);
+                assert_eq!(gossip[0].flags, NodeFlags::REPLICA);
+            }
+            other => panic!("expected Ping, got {:?}", other),
+        }
+        // What an older node's parser makes of it: the flags, and nothing else.
+        assert_eq!(
+            parse_flags("master,host=a.example,cport=30001"),
+            NodeFlags::MASTER
+        );
+        assert_eq!(cport_of("master,host=a.example,cport=30001"), 30001);
+        assert_eq!(cport_of("master,host=a.example"), 0);
+        assert_eq!(cport_of("master,cport=nonsense"), 0);
     }
 
     /// Hostnames go in the flags strings, where a node that does not know
@@ -947,11 +1092,13 @@ mod tests {
                 flags: NodeFlags::REPLICA,
                 master_id: Some(me),
                 hostname: "shard-1b.db.example".into(),
+                announced_client_port: 0,
             }],
             slot_claims: vec![],
             sender_flags: NodeFlags::MASTER,
             sender_master_id: None,
             sender_hostname: "shard-1a.db.example".into(),
+            sender_announced_client_port: 0,
         };
         let bytes = encode(&msg);
         let (decoded, _) = decode(&bytes).unwrap().unwrap();
@@ -1028,6 +1175,7 @@ mod tests {
             gossip: vec![
                 GossipEntry {
                     hostname: String::new(),
+                    announced_client_port: 0,
                     id: other1,
                     ip: "10.0.0.2".into(),
                     client_port: 6381,
@@ -1038,6 +1186,7 @@ mod tests {
                 },
                 GossipEntry {
                     hostname: String::new(),
+                    announced_client_port: 0,
                     id: other2,
                     ip: "10.0.0.3".into(),
                     client_port: 6382,
@@ -1048,6 +1197,7 @@ mod tests {
                 },
                 GossipEntry {
                     hostname: String::new(),
+                    announced_client_port: 0,
                     id: other3,
                     ip: "10.0.0.4".into(),
                     client_port: 6383,
@@ -1061,6 +1211,7 @@ mod tests {
             sender_flags: NodeFlags::MASTER,
             sender_master_id: None,
             sender_hostname: String::new(),
+            sender_announced_client_port: 0,
         };
         let bytes = encode(&msg);
         let (decoded, consumed) = decode(&bytes).unwrap().unwrap();
@@ -1109,6 +1260,7 @@ mod tests {
             sender_flags: NodeFlags::MASTER,
             sender_master_id: None,
             sender_hostname: String::new(),
+            sender_announced_client_port: 0,
         };
         let bytes = encode(&msg);
         let (decoded, _) = decode(&bytes).unwrap().unwrap();
@@ -1316,5 +1468,24 @@ mod tests {
             }
             other => panic!("expected FailoverAuthAck, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn offset_query_and_answer_round_trip() {
+        let me = generate_node_id();
+        let ask = BusMessage::OffsetQuery { sender_id: me };
+        let (decoded, consumed) = decode(&encode(&ask)).unwrap().unwrap();
+        assert_eq!(consumed, encode(&ask).len());
+        assert!(matches!(decoded, BusMessage::OffsetQuery { sender_id } if sender_id == me));
+
+        let ack = BusMessage::OffsetAck {
+            sender_id: me,
+            offset: u64::MAX - 1,
+        };
+        let (decoded, _) = decode(&encode(&ack)).unwrap().unwrap();
+        assert!(matches!(
+            decoded,
+            BusMessage::OffsetAck { sender_id, offset } if sender_id == me && offset == u64::MAX - 1
+        ));
     }
 }

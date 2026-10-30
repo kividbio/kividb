@@ -41,6 +41,40 @@ use std::time::{Duration, Instant};
 /// Inclusive slot ranges.
 pub type Ranges = Vec<(u16, u16)>;
 
+// `cluster-slot-migration-handoff-max-lag-bytes` and
+// `cluster-slot-migration-write-pause-timeout` as `CONFIG SET` last made
+// them; `UNSET` until then, and the values the server started with apply.
+// Read at the start of each handoff, so a change applies to the next one.
+const UNSET: u64 = u64::MAX;
+static HANDOFF_MAX_LAG_BYTES: AtomicU64 = AtomicU64::new(UNSET);
+static WRITE_PAUSE_TIMEOUT_MS: AtomicU64 = AtomicU64::new(UNSET);
+
+/// How far behind the stream may be when the handoff starts.
+pub fn handoff_max_lag_bytes(config: &crate::config::Config) -> u64 {
+    match HANDOFF_MAX_LAG_BYTES.load(Ordering::Relaxed) {
+        UNSET => config.cluster_slot_migration_handoff_max_lag_bytes,
+        v => v,
+    }
+}
+
+/// How long the handoff may hold client writes, in milliseconds.
+pub fn write_pause_timeout_ms(config: &crate::config::Config) -> u64 {
+    match WRITE_PAUSE_TIMEOUT_MS.load(Ordering::Relaxed) {
+        UNSET => config.cluster_slot_migration_write_pause_timeout,
+        v => v,
+    }
+}
+
+/// `CONFIG SET cluster-slot-migration-handoff-max-lag-bytes`.
+pub fn set_handoff_max_lag_bytes(bytes: u64) {
+    HANDOFF_MAX_LAG_BYTES.store(bytes.min(UNSET - 1), Ordering::Relaxed);
+}
+
+/// `CONFIG SET cluster-slot-migration-write-pause-timeout`.
+pub fn set_write_pause_timeout_ms(ms: u64) {
+    WRITE_PAUSE_TIMEOUT_MS.store(ms.min(UNSET - 1), Ordering::Relaxed);
+}
+
 /// Finished tasks kept for `CLUSTER MIGRATION STATUS`.
 const FINISHED_TASKS_KEPT: usize = 64;
 /// Commands per round trip while sending.
@@ -245,7 +279,6 @@ pub fn ranges_text(ranges: &[(u16, u16)]) -> String {
 #[derive(Clone)]
 pub struct Env {
     pub store: crate::store::Store,
-    pub expiry_store: crate::store::ExpiryStore,
     pub index_store: crate::vector::IndexStore,
     pub repl_state: Arc<ReplState>,
     pub hub_tx: HubTx,
@@ -257,7 +290,6 @@ impl Env {
     pub fn from_ctx(ctx: &crate::commands::ctx::Ctx<'_>) -> Self {
         Self {
             store: Arc::clone(ctx.store),
-            expiry_store: Arc::clone(ctx.expiry_store),
             index_store: Arc::clone(ctx.index_store),
             repl_state: Arc::clone(ctx.repl_state),
             hub_tx: ctx.hub_tx.clone(),
@@ -349,7 +381,10 @@ impl Peer {
         let (user, password) = env.repl_state.master_credentials();
         if !password.is_empty() {
             let auth = if user.is_empty() {
-                command(&[b"AUTH", password.as_bytes()])
+                // As the default user, by name: `AUTH <password>` is refused by a
+                // node that has no password (#135), and with the name it logs in as
+                // before.
+                command(&[b"AUTH", b"default", password.as_bytes()])
             } else {
                 command(&[b"AUTH", user.as_bytes(), password.as_bytes()])
             };
@@ -401,7 +436,6 @@ impl Peer {
 fn delete_keys_in(env: &Env, ranges: &[(u16, u16)]) -> usize {
     delete_keys(
         &env.store,
-        &env.expiry_store,
         &env.index_store,
         &env.repl_state,
         &env.hub_tx,
@@ -412,7 +446,6 @@ fn delete_keys_in(env: &Env, ranges: &[(u16, u16)]) -> usize {
 /// Delete every key whose slot `in_slots` picks, telling replicas and the AOF.
 fn delete_keys(
     store: &crate::store::Store,
-    expiry_store: &crate::store::ExpiryStore,
     index_store: &crate::vector::IndexStore,
     repl_state: &Arc<ReplState>,
     hub_tx: &HubTx,
@@ -434,7 +467,7 @@ fn delete_keys(
             let _order = crate::write_order::lock_keys(0, chunk.iter().map(|k| k.as_bytes()));
             let mut del = vec![b"DEL".to_vec()];
             for key in chunk {
-                if crate::commands::helpers::delete_key(store, expiry_store, 0, key) {
+                if crate::commands::helpers::delete_key(store, 0, key) {
                     crate::vector::maybe_unindex(index_store, key);
                     del.push(key.as_bytes().to_vec());
                     removed += 1;
@@ -464,7 +497,6 @@ pub(crate) fn drop_lost_slots(cluster: &ClusterState, slots: Vec<u16>) {
     };
     let starter = &hooks.replica_starter;
     let store = Arc::clone(&starter.store);
-    let expiry_store = Arc::clone(&starter.expiry_store);
     let index_store = Arc::clone(&starter.index_store);
     let repl_state = Arc::clone(&starter.repl_state);
     let hub_tx = starter.hub_tx.clone();
@@ -475,17 +507,12 @@ pub(crate) fn drop_lost_slots(cluster: &ClusterState, slots: Vec<u16>) {
             for slot in &slots {
                 lost[*slot as usize] = true;
             }
-            let removed = delete_keys(
-                &store,
-                &expiry_store,
-                &index_store,
-                &repl_state,
-                &hub_tx,
-                |slot| lost[slot as usize],
-            );
+            let removed = delete_keys(&store, &index_store, &repl_state, &hub_tx, |slot| {
+                lost[slot as usize]
+            });
             if removed > 0 {
                 log_info!(
-                    "Cluster: deleted {removed} key(s) in {} slot(s) now owned by another node",
+                    "Cluster: deleted {removed} key(s) in {} slot(s) owned by another node",
                     slots.len()
                 );
             }
@@ -545,24 +572,19 @@ fn capture(env: &Env, ranges: &[(u16, u16)]) -> std::io::Result<Vec<Captured>> {
     };
     for shard in db.iter() {
         let map = crate::read_lock!(shard);
-        for (key, value) in map.iter() {
+        for entry in map.entries() {
+            let key = entry.key();
             if !in_ranges(ranges, key_hash_slot(key.as_bytes())) {
                 continue;
             }
-            let expires_at = {
-                let exp = crate::commands::helpers::get_expiry_shard(&env.expiry_store, 0, key);
-                crate::read_lock!(exp)
-                    .get(key.as_str())
-                    .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0)
-            };
+            // In the entry beside the value.
+            let expires_at = entry.expires().unwrap_or(0);
             if expires_at != 0 && expires_at <= now {
                 continue;
             }
             out.push(Captured {
                 key: key.to_string(),
-                value: value.deep_clone(),
+                value: entry.value().deep_clone(),
                 expires_at,
             });
         }
@@ -788,7 +810,7 @@ fn migrate_out(env: &Env, task: &Task) -> Result<u64, String> {
     canceled()?;
 
     // ── Follow the stream until it is nearly caught up ───────────────────
-    let max_lag = env.config.cluster_slot_migration_handoff_max_lag_bytes as usize;
+    let max_lag = handoff_max_lag_bytes(&env.config) as usize;
     // Decode whatever the tap holds right now into the commands that matter.
     let drain = |commands: &mut Vec<Vec<Vec<u8>>>| -> Result<usize, String> {
         let mut bytes = 0usize;
@@ -818,10 +840,7 @@ fn migrate_out(env: &Env, task: &Task) -> Result<u64, String> {
     // ── Handoff ──────────────────────────────────────────────────────────
     // Pause client writes, let the ones in flight finish, send what they
     // wrote, and hand the slots over.
-    let pause_timeout = env
-        .config
-        .cluster_slot_migration_write_pause_timeout
-        .max(100);
+    let pause_timeout = write_pause_timeout_ms(&env.config).max(100);
     let paused_at = Instant::now();
     crate::pause::set_handoff_pause(pause_timeout as i64);
     let pause = PauseGuard(true);
@@ -946,6 +965,7 @@ pub fn start_import(env: Env, ranges: Ranges) -> Result<String, String> {
         attempt_failed: Arc::new(AtomicBool::new(false)),
     })?;
 
+    save_imports(cluster);
     let task_id = id.clone();
     let thread_env = env.clone();
     let spawned = std::thread::Builder::new()
@@ -954,6 +974,7 @@ pub fn start_import(env: Env, ranges: Ranges) -> Result<String, String> {
     if let Err(e) = spawned {
         env.registry()
             .finish(&id, TaskState::Failed, Some(e.to_string()));
+        save_imports(&env.cluster);
         return Err(format!("could not start the import thread: {e}"));
     }
     Ok(id)
@@ -981,6 +1002,98 @@ fn single_owner(cluster: &ClusterState, ranges: &[(u16, u16)]) -> Result<NodeId,
     owner.ok_or_else(|| "no slots given".to_string())
 }
 
+// ── Imports under way, on disk ───────────────────────────────────────────────
+//
+// The keys an import has received are a copy: the source keeps serving the
+// slots, and deletes its own copy only once this node has taken them over.
+// If this node goes down first, the task (kept in memory) is gone, and so is
+// anything that would remove the partial copy: it would stay, unreachable
+// (-MOVED), in DBSIZE, KEYS and snapshots, and come back to life if the slots
+// were ever given to this node (#108). So the ranges of the imports under way
+// are kept in a file next to the cluster config, and at startup the keys in
+// those of them this node does not own are deleted.
+//
+// Only the atomic import's: keys moved here by MIGRATE (key by key) were
+// deleted at the source as they left, and are the only copy. Those Redis
+// keeps, and so does this.
+
+/// `<cluster-config-file>.imports`.
+fn imports_path(cluster: &ClusterState) -> Option<std::path::PathBuf> {
+    cluster.config_path.as_ref().map(|p| {
+        let mut name = p.as_os_str().to_owned();
+        name.push(".imports");
+        std::path::PathBuf::from(name)
+    })
+}
+
+/// Write down the ranges of the imports under way (none: remove the file).
+fn save_imports(cluster: &ClusterState) {
+    let Some(path) = imports_path(cluster) else {
+        return;
+    };
+    let lines: Vec<String> = cluster
+        .slot_migrations
+        .all()
+        .iter()
+        .filter(|t| t.operation == Operation::Import && t.state == TaskState::InProgress)
+        .map(|t| format!("{} {}", t.id, ranges_text(&t.ranges)))
+        .collect();
+    let written = if lines.is_empty() {
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    } else {
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = std::path::PathBuf::from(tmp);
+        std::fs::write(&tmp, lines.join("\n") + "\n").and_then(|()| std::fs::rename(&tmp, &path))
+    };
+    if let Err(e) = written {
+        log_warn!(
+            "Cluster: Could not record the imports under way in {}: {e}",
+            path.display()
+        );
+    }
+}
+
+/// At startup: delete the keys of the imports that were under way when this
+/// node went down, in the slots it does not own (#108). Then forget them.
+pub(crate) fn drop_unfinished_imports(cluster: &ClusterState) {
+    let Some(path) = imports_path(cluster) else {
+        return;
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let me = cluster.myself();
+    let mut cut_short: Vec<u16> = Vec::new();
+    for line in text.lines() {
+        let mut words = line.split_whitespace();
+        let _task = words.next();
+        let ranges: Vec<&[u8]> = words
+            .flat_map(|r| r.split('-'))
+            .map(str::as_bytes)
+            .collect();
+        let Ok(ranges) = parse_ranges(&ranges) else {
+            continue;
+        };
+        let slots = cluster.slots.read();
+        cut_short.extend(slots_of(&ranges).filter(|&s| slots[s as usize] != Some(me)));
+    }
+    cut_short.sort_unstable();
+    cut_short.dedup();
+    if !cut_short.is_empty() {
+        log_info!(
+            "Cluster: {} slot(s) were being imported when this node stopped; \
+             deleting what had arrived of them",
+            cut_short.len()
+        );
+        drop_lost_slots(cluster, cut_short);
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
 fn run_import(env: Env, task_id: String) {
     let registry = env.registry();
     loop {
@@ -993,6 +1106,7 @@ fn run_import(env: Env, task_id: String) {
         if task.cancel.load(Ordering::Relaxed) {
             delete_unowned(&env, &task.ranges);
             registry.finish(&task_id, TaskState::Canceled, None);
+            save_imports(&env.cluster);
             return;
         }
 
@@ -1003,6 +1117,7 @@ fn run_import(env: Env, task_id: String) {
                 // Including: the slots are ours already. Either way there is
                 // nothing left to import.
                 registry.finish(&task_id, TaskState::Failed, Some(error));
+                save_imports(&env.cluster);
                 return;
             }
         };
@@ -1074,6 +1189,7 @@ fn import_attempt(env: &Env, task: &Task, source: NodeId) -> Option<String> {
             }
             delete_unowned(env, &task.ranges);
             registry.finish(&task.id, TaskState::Canceled, None);
+            save_imports(&env.cluster);
             return None;
         }
         if task.attempt_failed.load(Ordering::Relaxed) {
@@ -1127,10 +1243,26 @@ pub fn take_over(cluster: &ClusterState, task_id: &str) -> Result<(), String> {
     };
     // The source keeps client writes paused until this answer arrives.
     let started = Instant::now();
-    super::persist::with_deferred_sync(|| cluster.take_over_slots(slots_of(&task.ranges)));
+    // Saved before the source is told: it deletes its copy when told, and a
+    // restart of this node with the slots not in its config would delete
+    // this one (#108). Not saved, not taken over: the slots go back to the
+    // source, which keeps serving them.
+    if let Err(e) =
+        super::persist::with_deferred_sync(|| cluster.take_over_slots(slots_of(&task.ranges)))
+    {
+        cluster.hand_over_slots(slots_of(&task.ranges), task.source);
+        log_warn!(
+            "Cluster: Could not save the cluster config while taking over slots {} ({e}); \
+             leaving them with {}",
+            ranges_text(&task.ranges),
+            super::node_id_str(&task.source)
+        );
+        return Err(format!("could not save the cluster config: {e}"));
+    }
     cluster
         .slot_migrations
         .finish(task_id, TaskState::Completed, None);
+    save_imports(cluster);
     log_info!(
         "Cluster: Slots {} imported from {} (taken over in {} ms)",
         ranges_text(&task.ranges),

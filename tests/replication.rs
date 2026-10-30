@@ -258,10 +258,16 @@ fn test_waitaof() {
     start_server(port);
     let mut c = Conn::connect(port);
 
-    let r = c.cmds(&["WAITAOF", "1", "0", "0"]);
+    // With the AOF off, nothing is on disk by one: asking for a local fsync
+    // is an error, as in Redis, and none is reported. It reported one (#137).
+    assert!(matches!(
+        c.cmds(&["WAITAOF", "1", "0", "0"]),
+        RespValue::Error(_)
+    ));
+    let r = c.cmds(&["WAITAOF", "0", "0", "0"]);
     let arr = r.as_array();
     assert_eq!(arr.len(), 2);
-    assert_eq!(arr[0].as_int(), 1);
+    assert_eq!(arr[0].as_int(), 0);
     assert_eq!(arr[1].as_int(), 0);
 }
 
@@ -677,6 +683,209 @@ fn wait_link_up(c: &mut Conn) {
     });
 }
 
+/// A script runs on a replica, and only a write it makes is refused, as in
+/// Redis; every EVAL, EVALSHA and FCALL was refused before it ran (#145).
+/// One that declares it may write is refused at once; one that declares
+/// `no-writes` runs.
+#[cfg(feature = "lua")]
+#[test]
+fn test_scripts_that_read_run_on_a_replica() {
+    let master = spawn_server(Config::default());
+    let replica = spawn_server(replica_of(master));
+    let mut r = Conn::connect(replica);
+    wait_link_up(&mut r);
+    let mut m = Conn::connect(master);
+    assert!(m.cmds(&["SET", "first", "1"]).is_ok());
+    assert!(m
+        .cmds(&[
+            "FUNCTION",
+            "LOAD",
+            "#!lua name=replica_lib\n\
+             redis.register_function{function_name='reads', \
+             callback=function(keys) return redis.call('GET', keys[1]) end, flags={'no-writes'}}\n\
+             redis.register_function('writes', function(keys) return redis.call('SET', keys[1], 'x') end)",
+        ])
+        .as_str()
+        .contains("replica_lib"));
+    wait_until("the replica to have first", Duration::from_secs(10), || {
+        r.cmds(&["GET", "first"]) == RespValue::Bulk(b"1".to_vec())
+    });
+    let refused =
+        |reply: &RespValue| matches!(reply, RespValue::Error(e) if e.contains("READONLY"));
+
+    let read = r.cmds(&["EVAL", "return redis.call('GET', KEYS[1])", "1", "first"]);
+    assert_eq!(read, RespValue::Bulk(b"1".to_vec()));
+    let write = r.cmds(&[
+        "EVAL",
+        "return redis.call('SET', KEYS[1], 'x')",
+        "1",
+        "first",
+    ]);
+    assert!(refused(&write), "{write:?}");
+    let declared = r.cmds(&["EVAL", "#!lua\nreturn 1", "0"]);
+    assert!(refused(&declared), "{declared:?}");
+    let no_writes = r.cmds(&["EVAL", "#!lua flags=no-writes\nreturn 2", "0"]);
+    assert_eq!(no_writes, RespValue::Int(2));
+
+    wait_until(
+        "the replica to have the library",
+        Duration::from_secs(10),
+        || r.cmds(&["FCALL", "reads", "1", "first"]) == RespValue::Bulk(b"1".to_vec()),
+    );
+    let write = r.cmds(&["FCALL", "writes", "1", "first"]);
+    assert!(refused(&write), "{write:?}");
+    assert_eq!(r.cmds(&["GET", "first"]), RespValue::Bulk(b"1".to_vec()));
+}
+
+/// `mem_replication_backlog` is what the backlog holds: it was 0 (#152).
+#[test]
+fn test_info_memory_reports_the_replication_backlog() {
+    let master = spawn_server(Config::default());
+    let replica = spawn_server(replica_of(master));
+    let mut r = Conn::connect(replica);
+    wait_link_up(&mut r);
+    let mut m = Conn::connect(master);
+    m.cmds(&["SET", "backlog:k", &"v".repeat(1000)]);
+    let backlog = |m: &mut Conn| -> u64 {
+        m.cmds(&["INFO", "memory"])
+            .as_str()
+            .lines()
+            .find_map(|line| line.strip_prefix("mem_replication_backlog:"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    wait_until(
+        "the backlog to hold the write",
+        Duration::from_secs(10),
+        || backlog(&mut m) >= 1000,
+    );
+}
+
+/// A shard channel's message reaches a replica's subscribers, as a
+/// channel's does: `SPUBLISH` was not sent down the replication stream
+/// (#161).
+#[test]
+fn test_spublish_reaches_a_replicas_subscribers() {
+    let master = spawn_server(Config::default());
+    let replica = spawn_server(replica_of(master));
+    let mut r = Conn::connect(replica);
+    wait_link_up(&mut r);
+    let mut sub = Conn::connect(replica);
+    let ack = sub.cmds(&["SSUBSCRIBE", "news"]);
+    assert_eq!(ack.as_array()[0].as_str(), "ssubscribe");
+    let mut m = Conn::connect(master);
+    m.cmds(&["SPUBLISH", "news", "hello"]);
+    let message = sub.read_value();
+    let parts = message.as_array();
+    assert_eq!(parts[0].as_str(), "smessage");
+    assert_eq!(parts[2].as_str(), "hello");
+}
+
+/// A replica given a `masterauth` still replicates a master that has no
+/// password, and one that has that password. `AUTH <password>` is refused
+/// where no password is set (#135): the replica logs in as the default user
+/// by name.
+#[test]
+fn test_masterauth_works_with_and_without_a_password_on_the_master() {
+    for master_pass in ["", "s3cret"] {
+        let master = spawn_server(Config {
+            requirepass: master_pass.to_string(),
+            ..Default::default()
+        });
+        let replica = spawn_server(Config {
+            masterauth: "s3cret".to_string(),
+            ..replica_of(master)
+        });
+        let mut r = Conn::connect(replica);
+        wait_link_up(&mut r);
+        let mut m = Conn::connect(master);
+        if !master_pass.is_empty() {
+            assert!(m.cmds(&["AUTH", master_pass]).is_ok());
+        }
+        assert!(m.cmds(&["SET", "auth:k", "v"]).is_ok());
+        wait_until(
+            "the replica to have auth:k",
+            Duration::from_secs(10),
+            || r.cmds(&["GET", "auth:k"]) == RespValue::Bulk(b"v".to_vec()),
+        );
+    }
+}
+
+/// On a replica, WATCH sees the writes its master sends: an EXEC after the
+/// master changed a watched key runs nothing. It ran (#159).
+#[test]
+fn test_watch_on_a_replica_sees_its_masters_writes() {
+    let master = spawn_server(Config::default());
+    let replica = spawn_server(replica_of(master));
+    let mut r = Conn::connect(replica);
+    wait_link_up(&mut r);
+    let mut m = Conn::connect(master);
+    assert!(m.cmds(&["SET", "w", "1"]).is_ok());
+    wait_until("the replica to have w", Duration::from_secs(10), || {
+        r.cmds(&["GET", "w"]) == RespValue::Bulk(b"1".to_vec())
+    });
+    assert!(r.cmds(&["WATCH", "w"]).is_ok());
+    assert!(m.cmds(&["SET", "w", "from-master"]).is_ok());
+    wait_until(
+        "the replica to have the new w",
+        Duration::from_secs(10),
+        || {
+            let mut probe = Conn::connect(replica);
+            probe.cmds(&["GET", "w"]) == RespValue::Bulk(b"from-master".to_vec())
+        },
+    );
+    assert!(r.cmds(&["MULTI"]).is_ok());
+    r.cmds(&["GET", "w"]);
+    assert_eq!(r.cmds(&["EXEC"]), RespValue::Nil);
+}
+
+/// A replica does not take replicas of its own. One that did sent its data
+/// once and nothing after, while the replica of it reported its link up
+/// (#144). It now says why, and the would-be replica's link stays down; a
+/// master made a replica lets go of the replicas it had.
+#[test]
+fn test_a_replica_refuses_replicas_of_its_own() {
+    let master = spawn_server(Config::default());
+    let replica = spawn_server(replica_of(master));
+    let mut r = Conn::connect(replica);
+    wait_link_up(&mut r);
+
+    let mut psync = Conn::connect(replica);
+    let reply = psync.cmds(&["PSYNC", "?", "-1"]);
+    assert!(
+        matches!(&reply, RespValue::Error(e) if e.contains("does not chain replicas")),
+        "PSYNC to a replica: {reply:?}"
+    );
+
+    let sub = spawn_server(replica_of(replica));
+    let mut s = Conn::connect(sub);
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        repl_info(&mut s, "master_link_status").as_deref(),
+        Some("down")
+    );
+    assert_eq!(repl_info(&mut r, "connected_slaves"), None);
+
+    // A master with a replica, made a replica itself: the replica it had is
+    // let go, and its link goes down rather than staying up with nothing in it.
+    let other = spawn_server(Config::default());
+    let follower = spawn_server(replica_of(other));
+    let mut f = Conn::connect(follower);
+    wait_link_up(&mut f);
+    let mut o = Conn::connect(other);
+    assert!(
+        o.cmds(&["REPLICAOF", "127.0.0.1", &master.to_string()])
+            .is_ok()
+    );
+    wait_until(
+        "the follower's link to go down",
+        Duration::from_secs(10),
+        || repl_info(&mut f, "master_link_status").as_deref() == Some("down"),
+    );
+}
+
 /// Link liveness, the reported symptom: a replica must not say its link is up when
 /// it has no working connection to the master. Following a master that cannot
 /// be reached at all, the node is a read-only replica with the link down from
@@ -761,7 +970,6 @@ fn spawn_master_that_goes_silent() -> u16 {
                         Some("PSYNC") => {
                             let payload = kividb::snapshot::full_sync_payload(
                                 &kividb::store::new_store(16),
-                                None,
                                 None,
                             )
                             .unwrap();
@@ -1451,4 +1659,347 @@ fn test_promotion_during_a_full_sync_keeps_the_promoted_nodes_dataset() {
     );
     assert_eq!(c.cmds(&["GET", "mine:0"]).as_str(), "v");
     assert!(c.cmds(&["SET", "after-promotion", "1"]).is_ok());
+}
+
+/// `REPLICAOF NO ONE` on one of a master's replicas, then its sibling
+/// pointed at it: the sibling is continued from where it was, not resynced
+/// in full (#109). The promoted replica keeps the stream it followed as its
+/// second id, and kept, as a replica, what it read of it.
+#[test]
+fn test_a_promoted_replica_continues_its_sibling() {
+    let (m, a, b) = (free_port(), free_port(), free_port());
+    start_server(m);
+    start_server(a);
+    start_server(b);
+    let field = |c: &mut Conn, section: &str, name: &str| -> String {
+        let info = c.cmds(&["INFO", section]).as_str().to_string();
+        info.lines()
+            .find_map(|l| l.strip_prefix(&format!("{name}:")))
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let wait = |what: &str, mut ok: Box<dyn FnMut() -> bool>| {
+        for _ in 0..200 {
+            if ok() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("timed out waiting for {what}");
+    };
+
+    let mut mc = Conn::connect(m);
+    for i in 0..100 {
+        assert!(mc.cmds(&["SET", &format!("k:{i}"), "v"]).is_ok());
+    }
+    for port in [a, b] {
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["REPLICAOF", "127.0.0.1", &m.to_string()]).is_ok());
+    }
+    let master_offset = field(&mut mc, "replication", "master_repl_offset");
+    let old_id = field(&mut mc, "replication", "master_replid");
+    for port in [a, b] {
+        let want = master_offset.clone();
+        wait(
+            "a replica to catch up",
+            Box::new(move || {
+                let mut c = Conn::connect(port);
+                field(&mut c, "replication", "master_link_status") == "up"
+                    && field(&mut c, "replication", "slave_repl_offset") == want
+            }),
+        );
+    }
+
+    let mut ac = Conn::connect(a);
+    assert!(ac.cmds(&["REPLICAOF", "NO", "ONE"]).is_ok());
+    assert_eq!(field(&mut ac, "replication", "master_replid2"), old_id);
+    assert_eq!(
+        field(&mut ac, "replication", "master_repl_offset"),
+        master_offset
+    );
+    // A write on the new master before its sibling arrives.
+    assert!(ac.cmds(&["SET", "k:0", "after"]).is_ok());
+
+    let mut bc = Conn::connect(b);
+    assert!(bc.cmds(&["REPLICAOF", "127.0.0.1", &a.to_string()]).is_ok());
+    wait(
+        "the sibling to follow the promoted replica",
+        Box::new(move || {
+            let mut c = Conn::connect(b);
+            field(&mut c, "replication", "master_link_status") == "up"
+                && field(&mut c, "replication", "master_port") == a.to_string()
+        }),
+    );
+    assert_eq!(field(&mut ac, "stats", "sync_full"), "0");
+    assert_eq!(field(&mut ac, "stats", "sync_partial_ok"), "1");
+    wait(
+        "the write to reach the sibling",
+        Box::new(move || {
+            let mut c = Conn::connect(b);
+            c.cmds(&["GET", "k:0"]).as_str() == "after"
+        }),
+    );
+    assert_eq!(bc.cmds(&["GET", "k:99"]).as_str(), "v");
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TRANSACTIONS AND SCRIPTS AS ONE STEP ON A REPLICA (#172)
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Run `transfer` on the master many times while a reader on its replica
+/// reads both keys at once: `a` and `b` start at 0 and every transfer moves 1
+/// from one to the other, so a sum other than 0 is half a transfer.
+fn assert_replica_never_shows_half_of(transfer: impl Fn(&mut Conn) + Send + 'static) {
+    let master = spawn_server(Config::default());
+    let replica = spawn_server(replica_of(master));
+    let mut r = Conn::connect(replica);
+    wait_link_up(&mut r);
+    let mut m = Conn::connect(master);
+    assert!(m.cmds(&["MSET", "a", "0", "b", "0"]).is_ok());
+    wait_until(
+        "the replica to have a and b",
+        Duration::from_secs(10),
+        || {
+            r.cmds(&["MGET", "a", "b"])
+                == RespValue::Array(vec![
+                    RespValue::Bulk(b"0".to_vec()),
+                    RespValue::Bulk(b"0".to_vec()),
+                ])
+        },
+    );
+
+    const TRANSFERS: i64 = 3000;
+    let writer = thread::spawn(move || {
+        for _ in 0..TRANSFERS {
+            transfer(&mut m);
+        }
+    });
+    let mut reads = 0u64;
+    let mut torn = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let both = r.cmds(&["MGET", "a", "b"]);
+        let both = both.as_array();
+        let (a, b) = (both[0].as_int(), both[1].as_int());
+        reads += 1;
+        if a + b != 0 && torn.len() < 5 {
+            torn.push((a, b));
+        }
+        // Until the replica has the last transfer.
+        if writer.is_finished() && a == -TRANSFERS {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the replica stopped at a = {a}"
+        );
+    }
+    writer.join().unwrap();
+    assert!(
+        torn.is_empty(),
+        "a reader on the replica saw half a transfer (a, b): {torn:?} in {reads} reads"
+    );
+}
+
+/// A transaction is one step on a replica too: a reader there never sees its
+/// first write without its second. Its writes reached the replica one by
+/// one, and were applied one by one (#172).
+#[test]
+fn test_a_replica_never_shows_half_a_transaction() {
+    assert_replica_never_shows_half_of(|m| {
+        assert!(m.cmds(&["MULTI"]).is_ok());
+        m.cmds(&["DECRBY", "a", "1"]);
+        m.cmds(&["INCRBY", "b", "1"]);
+        assert_eq!(m.cmds(&["EXEC"]).as_array().len(), 2);
+    });
+}
+
+/// The same for a script that writes twice.
+#[cfg(feature = "lua")]
+#[test]
+fn test_a_replica_never_shows_half_a_script() {
+    assert_replica_never_shows_half_of(|m| {
+        let reply = m.cmds(&[
+            "EVAL",
+            "redis.call('DECRBY', KEYS[1], 1) return redis.call('INCRBY', KEYS[2], 1)",
+            "2",
+            "a",
+            "b",
+        ]);
+        assert!(matches!(reply, RespValue::Int(_)), "{reply:?}");
+    });
+}
+
+/// One command of the replication stream, as a replica reads it.
+fn read_stream_command(r: &mut impl BufRead) -> Vec<String> {
+    let header = read_line_raw(r);
+    let count: usize = header
+        .strip_prefix('*')
+        .unwrap_or_else(|| panic!("not a command: {header:?}"))
+        .parse()
+        .unwrap();
+    (0..count)
+        .map(|_| {
+            let len: usize = read_line_raw(r).trim_start_matches('$').parse().unwrap();
+            let mut arg = vec![0u8; len + 2];
+            r.read_exact(&mut arg).unwrap();
+            arg.truncate(len);
+            String::from_utf8(arg).unwrap()
+        })
+        .collect()
+}
+
+/// What a replica is sent for a transaction: its writes between a `MULTI`
+/// and an `EXEC`, when it wrote more than once; as they are, when it wrote
+/// once; nothing at all, when it wrote nothing.
+#[test]
+fn test_a_transaction_reaches_replicas_between_multi_and_exec() {
+    let master = spawn_server(Config::default());
+    // A replica by hand: the full sync, then the stream.
+    let stream = TcpStream::connect(("127.0.0.1", master)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    writer
+        .write_all(b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n")
+        .unwrap();
+    let mut reader = BufReader::new(stream);
+    let greeting = read_line_raw(&mut reader);
+    assert!(greeting.starts_with("+FULLRESYNC"), "{greeting}");
+    let len: usize = read_line_raw(&mut reader)
+        .trim_start_matches('$')
+        .parse()
+        .unwrap();
+    let mut payload = vec![0u8; len];
+    reader.read_exact(&mut payload).unwrap();
+
+    let mut m = Conn::connect(master);
+    wait_until(
+        "the master to count its replica",
+        Duration::from_secs(10),
+        || repl_info(&mut m, "connected_slaves").as_deref() == Some("1"),
+    );
+    for transaction in [
+        &[&["SET", "x", "1"][..], &["GET", "x"], &["SET", "y", "2"]][..],
+        &[&["SET", "z", "3"]],
+        &[&["GET", "z"]],
+    ] {
+        assert!(m.cmds(&["MULTI"]).is_ok());
+        for command in transaction {
+            m.cmds(command);
+        }
+        assert_eq!(m.cmds(&["EXEC"]).as_array().len(), transaction.len());
+    }
+    assert!(m.cmds(&["SET", "last", "4"]).is_ok());
+
+    let mut sent = Vec::new();
+    while sent
+        .last()
+        .is_none_or(|c: &Vec<String>| c[0] != "SET" || c[1] != "last")
+    {
+        let command = read_stream_command(&mut reader);
+        if !["PING", "SELECT", "REPLCONF"].contains(&command[0].as_str()) {
+            sent.push(command);
+        }
+    }
+    let words = |c: &[&str]| c.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        sent,
+        vec![
+            words(&["MULTI"]),
+            words(&["SET", "x", "1"]),
+            words(&["SET", "y", "2"]),
+            words(&["EXEC"]),
+            words(&["SET", "z", "3"]),
+            words(&["SET", "last", "4"]),
+        ]
+    );
+}
+
+/// A replica that stops sending `REPLCONF ACK` without closing its
+/// connection (its VM terminated, its container paused) is dropped after
+/// `repl-timeout`, as in Redis. It was listed `online`, its lag growing, and
+/// counted in `connected_slaves` until the master restarted. A replica that
+/// goes on acknowledging stays.
+#[test]
+fn test_a_silent_replica_is_dropped_after_repl_timeout() {
+    let master_port = spawn_server(Config::default());
+    let mut master = Conn::connect(master_port);
+    let live_port = spawn_server(replica_of(master_port));
+    wait_link_up(&mut Conn::connect(live_port));
+
+    // A replica that syncs, acknowledges once, and then says nothing more,
+    // its connection left open.
+    let mut silent = Conn::connect(master_port);
+    assert!(silent.cmds(&["REPLCONF", "listening-port", "7777"]).is_ok());
+    silent
+        .stream
+        .write_all(b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n")
+        .unwrap();
+    let mut line = String::new();
+    silent.reader.read_line(&mut line).unwrap();
+    let offset = line
+        .trim_end()
+        .strip_prefix("+FULLRESYNC ")
+        .and_then(|rest| rest.split(' ').nth(1))
+        .unwrap_or_else(|| panic!("not a FULLRESYNC: {line:?}"))
+        .to_string();
+    // The payload, after any newlines the master sends while it prepares it.
+    let len = loop {
+        line.clear();
+        silent.reader.read_line(&mut line).unwrap();
+        if let Some(len) = line.trim_end().strip_prefix('$') {
+            break len.parse::<usize>().unwrap();
+        }
+    };
+    let mut payload = vec![0u8; len];
+    silent.reader.read_exact(&mut payload).unwrap();
+    let ack = format!(
+        "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n${}\r\n{offset}\r\n",
+        offset.len()
+    );
+    silent.stream.write_all(ack.as_bytes()).unwrap();
+    wait_until("both replicas online", Duration::from_secs(10), || {
+        repl_info(&mut master, "connected_slaves").as_deref() == Some("2")
+            && master
+                .cmds(&["INFO", "replication"])
+                .as_str()
+                .contains("port=7777,state=online")
+    });
+
+    assert!(master.cmds(&["CONFIG", "SET", "repl-timeout", "2"]).is_ok());
+    wait_until(
+        "the silent replica dropped",
+        Duration::from_secs(10),
+        || repl_info(&mut master, "connected_slaves").as_deref() == Some("1"),
+    );
+    // The one that is left is the live one, and it stays.
+    thread::sleep(Duration::from_secs(4));
+    assert_eq!(
+        repl_info(&mut master, "connected_slaves").as_deref(),
+        Some("1")
+    );
+    let slave0 = repl_info(&mut master, "slave0").unwrap();
+    assert!(
+        !slave0.contains("port=7777") && slave0.contains("state=online"),
+        "{slave0}"
+    );
+    // And the silent one's connection was closed.
+    let mut rest = Vec::new();
+    silent
+        .stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let closed = loop {
+        let mut buf = [0u8; 4096];
+        match silent.reader.read(&mut buf) {
+            Ok(0) => break true,
+            Ok(n) => rest.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => break true,
+            Err(_) => break false,
+        }
+    };
+    assert!(closed, "the silent replica's connection is still open");
 }

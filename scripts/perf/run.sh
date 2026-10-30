@@ -14,6 +14,8 @@
 #   N=60000             commands measured per workload
 #   LTO=fat             the release profile as shipped (slow to build);
 #                       default off, which is enough to compare two trees
+#   WORKLOADS=full      also INCR and DEL, and each of GET, SET, INCR, DEL
+#                       with a TTL on every key and under allkeys-lru
 #   PROFILE=1           keep the hottest functions of each workload in
 #                       target/perf/out-<tag>/profile-*.txt
 #   DNS=1 OFFLINE=      let cargo fetch a new dependency (the image's DNS is
@@ -28,7 +30,7 @@ OUT="$REPO/target/perf"
 TAG=${1:?usage: run.sh <tag>} MODEL=${MODEL:-uring}
 mkdir -p "$OUT/out-$TAG"
 MSYS_NO_PATHCONV=1 docker run --rm --security-opt seccomp=unconfined ${DNS:+--dns 1.1.1.1} \
-  -e MODEL="$MODEL" -e N="${N:-60000}" -e LTO="${LTO:-off}" ${OFFLINE+-e OFFLINE="$OFFLINE"} ${PROFILE:+-e PROFILE="$TAG"} \
+  -e MODEL="$MODEL" -e N="${N:-60000}" -e WORKLOADS="${WORKLOADS:-}" -e LTO="${LTO:-off}" ${OFFLINE+-e OFFLINE="$OFFLINE"} ${PROFILE:+-e PROFILE="$TAG"} \
   -v "$(cygpath -w "$REPO" 2>/dev/null || echo "$REPO"):/src:ro" \
   -v "$(cygpath -w "$HERE" 2>/dev/null || echo "$HERE"):/perf:ro" \
   -v "$(cygpath -w "$OUT/out-$TAG" 2>/dev/null || echo "$OUT/out-$TAG"):/out" \

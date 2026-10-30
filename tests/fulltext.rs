@@ -1186,3 +1186,53 @@ fn test_spellcheck_reads_words_as_the_index_does() {
         "{r:?}"
     );
 }
+
+/// A query term matches every term of its synonym groups (`FT.SYNUPDATE`),
+/// in documents indexed before the group was made as well as after, as in
+/// RediSearch. The groups were kept, and searching changed nothing (#130).
+#[test]
+fn test_synonym_groups_expand_query_terms() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&["HSET", "syn:1", "name", "Desk lamp"]);
+    assert!(
+        c.cmds(&[
+            "FT.CREATE",
+            "syn",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "syn:",
+            "SCHEMA",
+            "name",
+            "TEXT"
+        ])
+        .as_str()
+            == "OK"
+    );
+    assert!(
+        c.cmds(&["FT.SYNUPDATE", "syn", "g1", "lamp", "light"])
+            .as_str()
+            == "OK"
+    );
+    c.cmds(&["HSET", "syn:3", "name", "Reading lamp"]);
+    c.cmds(&["HSET", "syn:4", "name", "Ceiling light"]);
+    c.cmds(&["HSET", "syn:5", "name", "Office chair"]);
+    let found = |c: &mut Conn, query: &str| -> Vec<String> {
+        let reply = c.cmds(&["FT.SEARCH", "syn", query, "NOCONTENT", "SORTBY", "name"]);
+        let mut keys: Vec<String> = reply.as_array()[1..]
+            .iter()
+            .map(|key| key.as_str().to_string())
+            .collect();
+        keys.sort();
+        keys
+    };
+    let lamps = ["syn:1", "syn:3", "syn:4"];
+    assert_eq!(found(&mut c, "light"), lamps);
+    assert_eq!(found(&mut c, "lamp"), lamps);
+    assert_eq!(found(&mut c, "@name:light"), lamps);
+    assert_eq!(found(&mut c, "light office"), Vec::<String>::new());
+    assert_eq!(found(&mut c, "chair"), ["syn:5"]);
+}

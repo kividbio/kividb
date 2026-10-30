@@ -60,6 +60,11 @@ pub(crate) async fn send_one_round(state: &Arc<ClusterState>) {
             .collect()
     };
 
+    let pinged: Vec<String> = peers
+        .iter()
+        .map(|(_, ip, port)| format!("{ip}:{port}"))
+        .collect();
+    dialer::prune_ping_links(state, &pinged);
     for (peer_id, ip, bus_port) in peers {
         let state = Arc::clone(state);
         tokio::spawn(async move {
@@ -81,6 +86,49 @@ pub(crate) async fn send_one_round(state: &Arc<ClusterState>) {
 
 pub const FAILURE_DETECTION_INTERVAL: Duration = Duration::from_millis(100);
 
+/// When the failure-detection loop last began a tick (Unix ms; 0 before the
+/// first). It runs every 100 ms on the bus thread, so a time long past means
+/// the bus is stuck. See [`spawn_bus_watchdog`].
+static BUS_TICKED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How long the bus may go without a tick before the watchdog says so.
+const BUS_STALL_WARN: Duration = Duration::from_secs(10);
+
+/// Log when the bus has stopped running, and when it runs again. A bus
+/// stuck on a lock answers no peer and is failed over, and everything on
+/// the node that reads the topology waits with it; nothing else said so in
+/// the log. A thread of its own, so that it is not stuck with the bus.
+pub(crate) fn spawn_bus_watchdog() {
+    let spawned = std::thread::Builder::new()
+        .name("kividb-bus-watch".into())
+        .spawn(|| {
+            let mut stalled = false;
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                let ticked = BUS_TICKED_MS.load(Ordering::Relaxed);
+                if ticked == 0 {
+                    continue;
+                }
+                let silent = now_ms_local().saturating_sub(ticked);
+                if !stalled && silent > BUS_STALL_WARN.as_millis() as u64 {
+                    stalled = true;
+                    log_warn!(
+                        "Cluster: The cluster bus has not run for {} s: this node is not \
+                         heartbeating, and commands that read the cluster topology may not \
+                         be answered",
+                        silent / 1000
+                    );
+                } else if stalled && silent < 1_000 {
+                    stalled = false;
+                    log_warn!("Cluster: The cluster bus is running again");
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        log_warn!("Cluster: could not start the bus watchdog: {e}");
+    }
+}
+
 /// Periodic task that checks for stale peers (no PONG in node_timeout_ms)
 /// and applies PFAIL / FAIL flags. Runs ~10x per second so failures are
 /// detected promptly once the timeout window has elapsed.
@@ -96,6 +144,7 @@ pub async fn run_failure_detection_loop(
     ticker.tick().await;
     loop {
         ticker.tick().await;
+        BUS_TICKED_MS.store(now_ms_local(), Ordering::Relaxed);
         let newly_failed = state.run_failure_detection_tick();
         for id in newly_failed {
             log_warn!("Cluster: Node {} marked FAIL by quorum", node_id_str(&id));
@@ -224,6 +273,18 @@ async fn check_election(
 
         // Master FAIL'd, no election yet — start one (after delay).
         (true, None) => {
+            // A replica whose data is too old does not stand: it would win
+            // the slots and lose whatever it never received (#107).
+            if let Some(why) = too_stale_to_stand(state, repl_state) {
+                let now = now_ms_local();
+                if now.saturating_sub(LAST_STALE_LOG_MS.swap(now, Ordering::Relaxed)) >= 10_000 {
+                    log_warn!(
+                        "Cluster: Not standing for election for failed master {}: {why}",
+                        node_id_str(&master_id)
+                    );
+                }
+                return;
+            }
             // Make sure we don't kick off concurrent election attempts.
             if state
                 .election_pending
@@ -233,33 +294,52 @@ async fn check_election(
                 return; // Another tick is already in the delay phase.
             }
 
-            let delay_ms = 500 + (rand_u32() % 500) as u64;
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            // The delay is spent in a task of its own: this loop also detects
+            // failures and keeps replication pointed right, every 100 ms, and
+            // a ranked delay can be seconds.
+            let state = Arc::clone(state);
+            let repl_state = Arc::clone(repl_state);
+            tokio::spawn(async move {
+                // The replicas that have read further go first, a second
+                // apart, as in Redis: so the most up-to-date one normally
+                // wins, and the others' writes are not lost to it (#107).
+                let rank = replica_rank(&state, &repl_state, master_id).await;
+                let delay_ms = 500 + (rand_u32() % 500) as u64 + 1000 * rank;
+                if rank > 0 {
+                    log_info!(
+                        "Cluster: {rank} replica(s) of failed master {} have read further; \
+                         standing for election in {delay_ms} ms",
+                        node_id_str(&master_id)
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 
-            // Re-check: still a replica of that master, and it is still FAIL.
-            let still_failed = {
-                let nodes = state.nodes.read();
-                let still_its_replica = nodes
-                    .get(&state.myself())
-                    .is_some_and(|me| me.master_id == Some(master_id));
-                still_its_replica
-                    && nodes
-                        .get(&master_id)
-                        .map(|m| m.flags.contains(NodeFlags::FAIL))
-                        .unwrap_or(false)
-            };
-            if !still_failed {
+                // Re-check: still a replica of that master, it is still FAIL,
+                // and no other replica has taken over meanwhile.
+                let still_failed = {
+                    let nodes = state.nodes.read();
+                    let still_its_replica = nodes
+                        .get(&state.myself())
+                        .is_some_and(|me| me.master_id == Some(master_id));
+                    still_its_replica
+                        && nodes
+                            .get(&master_id)
+                            .map(|m| m.flags.contains(NodeFlags::FAIL))
+                            .unwrap_or(false)
+                };
+                if !still_failed {
+                    state.election_pending.store(false, Ordering::SeqCst);
+                    return;
+                }
+
+                let epoch = state.start_election(master_id, false, None);
                 state.election_pending.store(false, Ordering::SeqCst);
-                return;
-            }
-
-            let epoch = state.start_election(master_id, false);
-            state.election_pending.store(false, Ordering::SeqCst);
-            log_warn!(
-                "Cluster: Starting election for epoch {epoch} (failed master: {})",
-                node_id_str(&master_id)
-            );
-            broadcast_auth_request(state, master_id, epoch, false).await;
+                log_warn!(
+                    "Cluster: Starting election for epoch {epoch} (failed master: {})",
+                    node_id_str(&master_id)
+                );
+                broadcast_auth_request(&state, master_id, epoch, false).await;
+            });
         }
 
         // Election running — check progress.
@@ -268,6 +348,24 @@ async fn check_election(
                 return;
             }
             let quorum = state.election_quorum(master_id);
+            // A manual failover is won while the master still holds writes
+            // for it, or not at all. Won later, the master has been taking
+            // writes again, and those it acknowledged between our promotion
+            // and its hearing of it are lost (#185). Given up, the master
+            // goes on as it was once its pause is over.
+            if let Some(deadline) = election.deadline_ms
+                && now_ms_local() >= deadline
+            {
+                log_warn!(
+                    "Cluster: Manual failover abandoned: the election at epoch {} was not won \
+                     in time ({} of {} votes)",
+                    election.epoch,
+                    election.votes_received.len(),
+                    quorum
+                );
+                state.end_election();
+                return;
+            }
             if election.votes_received.len() >= quorum {
                 log_info!(
                     "Cluster: Won election at epoch {} ({} votes, quorum {})",
@@ -292,6 +390,103 @@ async fn check_election(
             }
         }
     }
+}
+
+/// When a too-stale replica last said it would not stand (logged at most
+/// every 10 s; the check runs every 100 ms).
+static LAST_STALE_LOG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Why this replica's data is too old for it to stand for election, if it
+/// is: its link to the master has been down longer than
+/// `node timeout × cluster-replica-validity-factor + repl-ping-replica-period`,
+/// counting from when the master stopped answering (Redis's rule). A factor
+/// of 0 means always stand.
+fn too_stale_to_stand(
+    state: &ClusterState,
+    repl_state: &crate::replication::ReplState,
+) -> Option<String> {
+    let factor = state.replica_validity_factor();
+    if factor == 0 || repl_state.slave_link_up.load(Ordering::Acquire) {
+        return None;
+    }
+    let down_since = repl_state.master_link_down_since_ms.load(Ordering::Relaxed);
+    if down_since == 0 {
+        return None;
+    }
+    let ping_period_ms = repl_state.repl_ping_period_secs.load(Ordering::Relaxed) * 1000;
+    let down_for = now_ms_local().saturating_sub(down_since);
+    data_too_old(down_for, state.node_timeout_ms, ping_period_ms, factor).map(|(age, limit)| {
+        format!(
+            "its data is {} s old, more than the {} s cluster-replica-validity-factor {factor} allows",
+            age / 1000,
+            limit / 1000
+        )
+    })
+}
+
+/// Redis's rule, in milliseconds: with the link to the master down for
+/// `down_for`, the data's age and the limit it is over, if it is. The link
+/// was down for at least the node timeout before the master could be marked
+/// FAIL; that much does not count against the data.
+fn data_too_old(
+    down_for: u64,
+    node_timeout: u64,
+    ping_period: u64,
+    factor: u64,
+) -> Option<(u64, u64)> {
+    let age = if down_for > node_timeout {
+        down_for - node_timeout
+    } else {
+        down_for
+    };
+    let limit = node_timeout
+        .saturating_mul(factor)
+        .saturating_add(ping_period);
+    (factor != 0 && age > limit).then_some((age, limit))
+}
+
+/// How many other replicas of `master_id` have read further than we have.
+/// Each is asked (`OFFSET`); one that does not answer, an older version
+/// among them, is not counted, so it never holds us back.
+async fn replica_rank(
+    state: &Arc<ClusterState>,
+    repl_state: &crate::replication::ReplState,
+    master_id: NodeId,
+) -> u64 {
+    let mine = repl_state.repl_offset.load(Ordering::Relaxed);
+    let me = state.myself();
+    let siblings: Vec<String> = {
+        let nodes = state.nodes.read();
+        nodes
+            .values()
+            .filter(|n| {
+                n.id != me
+                    && n.master_id == Some(master_id)
+                    && !n.flags.contains(NodeFlags::FAIL)
+                    && !n.flags.contains(NodeFlags::HANDSHAKE)
+                    && !n.ip.is_empty()
+                    && n.cluster_port != 0
+            })
+            .map(|n| format!("{}:{}", n.ip, n.cluster_port))
+            .collect()
+    };
+    let mut asked = tokio::task::JoinSet::new();
+    for addr in siblings {
+        let state = Arc::clone(state);
+        asked.spawn(async move {
+            let ask = BusMessage::OffsetQuery { sender_id: me };
+            dialer::exchange(&state, &addr, &ask, Duration::from_millis(500)).await
+        });
+    }
+    let mut ahead = 0;
+    while let Some(answer) = asked.join_next().await {
+        if let Ok(Ok(Some(BusMessage::OffsetAck { offset, .. }))) = answer
+            && offset > mine
+        {
+            ahead += 1;
+        }
+    }
+    ahead
 }
 
 /// Take over from `old_master` at `epoch`: claim its slots, switch role in
@@ -365,6 +560,9 @@ pub(crate) async fn broadcast_auth_request(
                     sender_id,
                     request_epoch,
                 })) => {
+                    if let Some(delay) = test_vote_delay() {
+                        tokio::time::sleep(delay).await;
+                    }
                     let count = state.record_vote(sender_id, request_epoch);
                     log_verbose!(
                         "Cluster: Got vote from {} for epoch {} (total: {})",
@@ -391,11 +589,37 @@ pub(crate) async fn broadcast_auth_request(
     }
 }
 
+/// For the tests of an election that runs long, and never set otherwise:
+/// `KIVIDB_TEST_VOTE_DELAY_MS`, how long a vote this node was given is held
+/// before it is counted. A voter syncs its vote to disk before it answers,
+/// and on a disk every other test is syncing to as well that has taken
+/// seconds (#185).
+fn test_vote_delay() -> Option<Duration> {
+    static DELAY: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *DELAY.get_or_init(|| {
+        let ms: u64 = std::env::var("KIVIDB_TEST_VOTE_DELAY_MS")
+            .ok()?
+            .parse()
+            .ok()?;
+        Some(Duration::from_millis(ms))
+    })
+}
+
 // ── Manual failover ──────────────────────────────────────────────────────────
 
-/// How long a master holds writes for a replica that asked to take over, and
-/// how long that replica waits to catch up before giving up.
+/// How long a replica that asked its master to hold writes has, from asking,
+/// to catch up and win its election; it gives the failover up if it has not.
+///
+/// The master holds writes for twice as long (`MANUAL_FAILOVER_PAUSE`), as
+/// in Redis, so that a replica that takes over does so while they are still
+/// held. Both used to be 5 s, and the election was not bounded at all: one
+/// whose votes were slow in coming (a voter syncs its vote to disk before it
+/// answers) was won after the master had begun taking writes again, and the
+/// writes it acknowledged before it heard of the promotion were lost (#185).
 pub const MANUAL_FAILOVER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a master holds writes for a replica that asked to take over.
+const MANUAL_FAILOVER_PAUSE: Duration = Duration::from_secs(10);
 
 /// The master's side of `CLUSTER FAILOVER`: stop accepting writes, and tell
 /// the replica how far it has to read to have everything.
@@ -429,7 +653,7 @@ pub(crate) async fn answer_mfstart(
         (replica.ip.clone(), replica.client_port)
     };
 
-    crate::pause::set_handoff_pause(MANUAL_FAILOVER_TIMEOUT.as_millis() as i64);
+    crate::pause::set_handoff_pause(MANUAL_FAILOVER_PAUSE.as_millis() as i64);
     // Let writes that were already in the gate finish and queue. One that is
     // past the pause check but not yet in the gate waits for the failover
     // there, and is redirected (`pause::HANDOFF`).
@@ -493,6 +717,9 @@ pub async fn run_manual_failover(
         format!("{}:{}", m.ip, m.cluster_port)
     };
 
+    // From before the master is asked: it holds writes from a moment later,
+    // for twice this.
+    let deadline_ms = now_ms_local() + MANUAL_FAILOVER_TIMEOUT.as_millis() as u64;
     let reply = dialer::exchange(
         &state,
         &master_addr,
@@ -508,9 +735,8 @@ pub async fn run_manual_failover(
     };
 
     // Catch up to the point the master stopped at.
-    let deadline = tokio::time::Instant::now() + MANUAL_FAILOVER_TIMEOUT;
     while repl_state.repl_offset.load(Ordering::Relaxed) < target_offset {
-        if tokio::time::Instant::now() >= deadline {
+        if now_ms_local() >= deadline_ms {
             return Err(format!(
                 "did not catch up with the master in time (at {} of {target_offset})",
                 repl_state.repl_offset.load(Ordering::Relaxed)
@@ -519,13 +745,19 @@ pub async fn run_manual_failover(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    start_forced_election(&state, master_id).await;
+    // Won by the same deadline, or given up (`check_election`).
+    start_forced_election(&state, master_id, Some(deadline_ms)).await;
     Ok(())
 }
 
-/// Start an election that does not require the master to be FAIL.
-pub async fn start_forced_election(state: &Arc<ClusterState>, master_id: NodeId) {
-    let epoch = state.start_election(master_id, true);
+/// Start an election that does not require the master to be FAIL, to be won
+/// by `deadline_ms` if there is one (see [`MANUAL_FAILOVER_TIMEOUT`]).
+pub async fn start_forced_election(
+    state: &Arc<ClusterState>,
+    master_id: NodeId,
+    deadline_ms: Option<u64>,
+) {
+    let epoch = state.start_election(master_id, true, deadline_ms);
     log_info!(
         "Cluster: Manual failover: starting election at epoch {epoch} to replace {}",
         node_id_str(&master_id)
@@ -546,4 +778,30 @@ fn now_ms_local() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::data_too_old;
+
+    #[test]
+    fn a_replica_too_long_without_its_master_does_not_stand() {
+        // Node timeout 5 s, ping period 10 s, factor 10: 60 s of data age.
+        let (timeout, ping) = (5_000, 10_000);
+        // Just failed: down for about the node timeout.
+        assert_eq!(data_too_old(6_000, timeout, ping, 10), None);
+        // The node timeout itself does not count.
+        assert_eq!(data_too_old(65_000, timeout, ping, 10), None);
+        assert_eq!(
+            data_too_old(65_001, timeout, ping, 10),
+            Some((60_001, 60_000))
+        );
+        // Factor 0: always stand.
+        assert_eq!(data_too_old(10_000_000, timeout, ping, 0), None);
+        // Factor 1: 15 s.
+        assert_eq!(
+            data_too_old(21_000, timeout, ping, 1),
+            Some((16_000, 15_000))
+        );
+    }
 }

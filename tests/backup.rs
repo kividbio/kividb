@@ -96,6 +96,22 @@ impl Conn {
         self.read()
     }
 
+    /// An `INCR`'s reply, or `None` once the server is gone.
+    fn try_cmd(&mut self, args: &[&str]) -> Option<V> {
+        let mut buf = format!("*{}\r\n", args.len()).into_bytes();
+        for a in args {
+            buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+            buf.extend_from_slice(a.as_bytes());
+            buf.extend_from_slice(b"\r\n");
+        }
+        self.writer.write_all(&buf).ok()?;
+        let mut line = String::new();
+        if self.reader.read_line(&mut line).ok()? == 0 {
+            return None;
+        }
+        line.trim_end().strip_prefix(':')?.parse().ok().map(V::Int)
+    }
+
     fn read(&mut self) -> V {
         let mut line = String::new();
         self.reader.read_line(&mut line).expect("reply");
@@ -254,6 +270,121 @@ fn copy_backup(c: &mut Conn, to: &Path) -> PathBuf {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// Two keys on different shards, as the server will lay them out.
+fn keys_on_two_shards() -> (String, String) {
+    let shards = kividb::store::num_shards();
+    let first = "pair:0".to_string();
+    let other = (1..10_000)
+        .map(|i| format!("pair:{i}"))
+        .find(|k| {
+            kividb::store::shard_index(shards, k) != kividb::store::shard_index(shards, &first)
+        })
+        .expect("a key on another shard");
+    (first, other)
+}
+
+fn counter(snapshot: &kividb::snapshot::LoadedSnapshot, key: &str) -> i64 {
+    match snapshot.dbs[0].get(key) {
+        Some(kividb::types::KiviDBValue::String(b)) => {
+            std::str::from_utf8(b.as_ref()).unwrap().parse().unwrap()
+        }
+        None => 0,
+        Some(_) => panic!("{key} is not a string"),
+    }
+}
+
+/// An AOF turned on with `CONFIG SET appendonly yes` is rewritten on its
+/// own once it has grown, as one turned on at startup is. It grew until the
+/// next restart (#146).
+#[test]
+fn an_aof_turned_on_at_runtime_is_rewritten_on_its_own() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    assert!(c.cmd(&["CONFIG", "SET", "appendonly", "yes"]).ok());
+    assert!(
+        c.cmd(&["CONFIG", "SET", "auto-aof-rewrite-min-size", "1024"])
+            .ok()
+    );
+    assert!(
+        c.cmd(&["CONFIG", "SET", "auto-aof-rewrite-percentage", "10"])
+            .ok()
+    );
+    for i in 0..2000 {
+        assert!(c.cmd(&["SET", &format!("key:{i}"), &"x".repeat(50)]).ok());
+    }
+    let aof = server.dir.join("appendonly.aof");
+    let grown = std::fs::metadata(&aof).unwrap().len();
+    assert!(grown > 100_000, "the log should have grown: {grown} bytes");
+    // The check runs every 10 seconds.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while std::fs::metadata(&aof).unwrap().len() >= grown {
+        assert!(
+            Instant::now() < deadline,
+            "appendonly.aof was never rewritten"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 2000);
+}
+
+/// A snapshot is the dataset at one moment, with the AOF off as with it on:
+/// a transaction that changes two keys on two shards is in it whole or not
+/// at all. With the AOF off it was copied a shard at a time, and a SAVE
+/// could keep half of one (#148).
+#[test]
+fn a_snapshot_never_holds_half_a_transaction() {
+    for aof in [false, true] {
+        let server = Server::start(if aof { &["--aof"] } else { &[] });
+        let (a, b) = keys_on_two_shards();
+        // Enough keys that copying the dataset takes a while, for a
+        // transaction to land in the middle of it.
+        let mut fill = server.conn();
+        for batch in 0..100 {
+            let mut args = vec!["MSET".to_string()];
+            for i in 0..2000 {
+                args.push(format!("fill:{batch}:{i}"));
+                args.push("x".repeat(32));
+            }
+            let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            assert!(fill.cmd(&refs).ok());
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (stop, a, b) = (Arc::clone(&stop), a.clone(), b.clone());
+            let mut c = server.conn();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    assert!(c.cmd(&["MULTI"]).ok());
+                    c.cmd(&["INCR", &a]);
+                    c.cmd(&["INCR", &b]);
+                    assert_eq!(c.cmd(&["EXEC"]).arr().len(), 2);
+                }
+            })
+        };
+        let mut c = server.conn();
+        // BGSAVE: it copies the dataset on a thread of its own, beside the
+        // commands (SAVE is a command, and a transaction waits for it).
+        for _ in 0..15 {
+            assert!(!c.cmd(&["BGSAVE"]).is_err());
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !c
+                .cmd(&["INFO", "persistence"])
+                .s()
+                .contains("rdb_bgsave_in_progress:0")
+            {
+                assert!(Instant::now() < deadline, "BGSAVE did not finish");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let path = server.dir.join("dump.kdb");
+            let snapshot = kividb::snapshot::load_snapshot(path.to_str().unwrap()).unwrap();
+            let (x, y) = (counter(&snapshot, &a), counter(&snapshot, &b));
+            assert_eq!(x, y, "aof {aof}: the snapshot holds half a transaction");
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+    }
+}
 
 /// A backup taken while writes are running restores to the dataset as it was
 /// at SEAL: everything before START, everything between START and SEAL, and
@@ -426,7 +557,9 @@ fn a_backup_taken_under_load_restores_to_the_seal_boundary() {
                 .i(),
             1
         );
-        let compacted = r.cmd(&["TS.RANGE", "ts:dst", "-", "+"]);
+        // The bucket is still open: with LATEST, from the source the
+        // compaction still knows (#128).
+        let compacted = r.cmd(&["TS.RANGE", "ts:dst", "-", "+", "LATEST"]);
         assert_eq!(compacted.arr().len(), 1);
         assert_eq!(compacted.arr()[0].arr()[1].s(), "20", "avg of 10 and 30");
 
@@ -480,6 +613,199 @@ fn an_unsealed_backup_can_be_aborted_and_started_again() {
 
     assert!(c.cmd(&["BACKUP", "BOGUS"]).is_err());
     assert!(matches!(c.cmd(&["BACKUP", "HELP"]), V::Arr(_)));
+}
+
+fn persistence_field(c: &mut Conn, name: &str) -> i64 {
+    let info = c.cmd(&["INFO", "persistence"]);
+    info.s()
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{name}:")))
+        .unwrap_or_else(|| panic!("no {name} in INFO persistence"))
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+fn wait_for_field(c: &mut Conn, name: &str, wanted: i64) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while persistence_field(c, name) != wanted {
+        assert!(Instant::now() < deadline, "{name} never became {wanted}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// `LASTSAVE` was 0 after every start, and moved only for `SAVE` and
+/// `BGSAVE`; the AOF's rewrite fields were never set, and
+/// `rdb_last_bgsave_time_sec` held the time of the save, not how long it
+/// took (#149).
+#[test]
+fn lastsave_starts_at_the_start_and_moves_with_every_save() {
+    let before = unix_now();
+    let server = Server::start(&["--aof"]);
+    let mut c = server.conn();
+    let started = c.cmd(&["LASTSAVE"]).i();
+    assert!(started >= before && started <= unix_now(), "{started}");
+    assert_eq!(persistence_field(&mut c, "aof_last_rewrite_time_ms"), -1);
+    assert_eq!(persistence_field(&mut c, "rdb_last_bgsave_time_sec"), -1);
+
+    // LASTSAVE counts in seconds.
+    std::thread::sleep(Duration::from_millis(1100));
+    assert!(c.cmd(&["SET", "k", "v"]).ok());
+    assert!(!c.cmd(&["BGREWRITEAOF"]).is_err());
+    wait_for_field(&mut c, "aof_rewrite_in_progress", 0);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while c.cmd(&["LASTSAVE"]).i() == started {
+        assert!(
+            Instant::now() < deadline,
+            "BGREWRITEAOF did not move LASTSAVE"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(persistence_field(&mut c, "aof_last_rewrite_time_ms") >= 0);
+    assert!(persistence_field(&mut c, "aof_last_rewrite_time_sec") >= 0);
+
+    assert!(c.cmd(&["BGSAVE"]).s().contains("started"));
+    wait_for_field(&mut c, "rdb_bgsave_in_progress", 0);
+    let took = persistence_field(&mut c, "rdb_last_bgsave_time_sec");
+    assert!((0..60).contains(&took), "{took}");
+}
+
+/// With the AOF on, a write is acknowledged once its record is in the file:
+/// a server killed with no warning keeps every write its clients were told
+/// was made. It acknowledged the write once the record was queued, and lost
+/// the last few (#147).
+#[test]
+fn a_killed_server_keeps_every_acknowledged_write() {
+    let mut server = Server::start(&["--aof"]);
+    let port = server.port;
+    // The default; `no` gives up the guarantee for speed (1.1.2's way).
+    let mut c = server.conn();
+    let setting = c.cmd(&["CONFIG", "GET", "aof-ack-after-write"]);
+    assert_eq!(setting.arr()[1].s(), "yes");
+    assert!(c.cmd(&["CONFIG", "SET", "aof-ack-after-write", "no"]).ok());
+    assert!(c.cmd(&["CONFIG", "SET", "aof-ack-after-write", "yes"]).ok());
+    assert!(
+        c.cmd(&["CONFIG", "SET", "aof-ack-after-write", "maybe"])
+            .is_err()
+    );
+    drop(c);
+    for round in 0..3 {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writers: Vec<_> = (0..6)
+            .map(|w| {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut c = Conn::connect(port);
+                    let key = format!("acked:{round}:{w}");
+                    let mut acked = 0i64;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let reply = c.try_cmd(&["INCR", &key]);
+                        match reply {
+                            Some(V::Int(n)) => acked = n,
+                            _ => break,
+                        }
+                    }
+                    (key, acked)
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(700));
+        server.child.kill().unwrap();
+        server.child.wait().unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let acked: Vec<(String, i64)> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+        server.child = kividb(&server.dir, port, &["--aof"])
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("could not restart kividb");
+        let mut c = server.conn();
+        for (key, acked) in acked {
+            let kept: i64 = match c.cmd(&["GET", &key]) {
+                V::Str(n) => n.parse().unwrap(),
+                _ => 0,
+            };
+            assert!(
+                kept >= acked,
+                "round {round}: {key} kept {kept}, {acked} acknowledged"
+            );
+        }
+    }
+}
+
+/// A backup's state was only in memory: after a restart, a sealed backup
+/// could not be cleaned up, and no other could start (#150).
+#[test]
+fn a_backup_from_before_a_restart_can_be_listed_and_cleaned_up() {
+    let mut server = Server::start(&[]);
+    let mut c = server.conn();
+    c.cmd(&["SET", "k", "v"]);
+    assert!(c.cmd(&["BACKUP", "START"]).ok());
+    wait_for_state(&mut c, "incrementing");
+    assert!(c.cmd(&["BACKUP", "SEAL"]).ok());
+    let listed = c.cmd(&["BACKUP", "LIST"]).strings();
+    drop(c);
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+
+    server.child = kividb(&server.dir, server.port, &[])
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("could not restart kividb");
+    let mut c = server.conn();
+    assert_eq!(status(&mut c).0, "sealed");
+    assert_eq!(c.cmd(&["BACKUP", "LIST"]).strings(), listed);
+    assert!(c.cmd(&["BACKUP", "CLEANUP"]).ok());
+    assert_eq!(status(&mut c).0, "idle");
+    assert!(c.cmd(&["BACKUP", "START"]).ok());
+    wait_for_state(&mut c, "incrementing");
+    drop(c);
+
+    // Cut short by the restart: a failed backup, which the next one clears.
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    server.child = kividb(&server.dir, server.port, &[])
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("could not restart kividb");
+    let mut c = server.conn();
+    assert_eq!(status(&mut c).0, "failed");
+    assert!(c.cmd(&["BACKUP", "START"]).ok());
+    wait_for_state(&mut c, "incrementing");
+    assert!(c.cmd(&["BACKUP", "SEAL"]).ok());
+    let files = c.cmd(&["BACKUP", "LIST"]).strings();
+    assert_eq!(files.len(), 3, "{files:?}");
+}
+
+/// A sealed backup's `backup-sealed-ttl` counts from its seal, across a
+/// restart (#150).
+#[test]
+fn a_sealed_backup_from_before_a_restart_still_runs_out() {
+    let mut server = Server::start(&["--backup-sealed-ttl", "3"]);
+    let mut c = server.conn();
+    assert!(c.cmd(&["BACKUP", "START"]).ok());
+    wait_for_state(&mut c, "incrementing");
+    assert!(c.cmd(&["BACKUP", "SEAL"]).ok());
+    drop(c);
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    server.child = kividb(&server.dir, server.port, &["--backup-sealed-ttl", "3"])
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("could not restart kividb");
+    let mut c = server.conn();
+    assert_eq!(status(&mut c).0, "sealed");
+    wait_for_state(&mut c, "idle");
+    let left = std::fs::read_dir(server.dir.join("backupdir"))
+        .unwrap()
+        .count();
+    assert_eq!(left, 0);
 }
 
 /// `preload-file` means "start from exactly this". If it cannot be loaded the
@@ -723,6 +1049,143 @@ fn a_truncated_aof_tail_is_cut_off_and_the_log_stays_usable() {
     let mut c = server.conn();
     assert_eq!(c.cmd(&["DBSIZE"]).i(), 21);
     assert_eq!(c.cmd(&["GET", "after"]).s(), "v");
+}
+
+/// `parts` as a record of the AOF.
+fn record(parts: &[&str]) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", parts.len()).into_bytes();
+    for p in parts {
+        out.extend_from_slice(format!("${}\r\n{p}\r\n", p.len()).as_bytes());
+    }
+    out
+}
+
+fn holds(log: &[u8], records: &[&[&str]]) -> bool {
+    let wanted: Vec<u8> = records.iter().flat_map(|r| record(r)).collect();
+    log.windows(wanted.len()).any(|w| w == wanted.as_slice())
+}
+
+/// A transaction's records are in the AOF between a `MULTI` and an `EXEC`,
+/// as in Redis, so that a replay can tell a whole one from one cut off by a
+/// crash; a script's too. One that wrote once is logged as that one write
+/// (#172).
+#[test]
+fn a_transaction_is_logged_between_multi_and_exec() {
+    let server = Server::start(&["--aof"]);
+    let mut c = server.conn();
+    // The stream's first write says which database it is for.
+    assert!(c.cmd(&["SET", "first", "0"]).ok());
+    assert!(c.cmd(&["MULTI"]).ok());
+    c.cmd(&["SET", "x", "1"]);
+    c.cmd(&["GET", "x"]);
+    c.cmd(&["SET", "y", "2"]);
+    assert_eq!(c.cmd(&["EXEC"]).arr().len(), 3);
+    assert!(c.cmd(&["MULTI"]).ok());
+    c.cmd(&["SET", "z", "3"]);
+    assert_eq!(c.cmd(&["EXEC"]).arr().len(), 1);
+    #[cfg(feature = "lua")]
+    {
+        c.cmd(&[
+            "EVAL",
+            "redis.call('SET', KEYS[1], 'a') return redis.call('SET', KEYS[2], 'b')",
+            "2",
+            "s1",
+            "s2",
+        ]);
+        c.cmd(&["EVAL", "return redis.call('SET', KEYS[1], 'c')", "1", "s3"]);
+    }
+    assert!(c.cmd(&["SET", "last", "4"]).ok());
+
+    // Acknowledged after it is written: the file holds it now.
+    let log = std::fs::read(server.dir.join("appendonly.aof")).unwrap();
+    assert!(
+        holds(
+            &log,
+            &[
+                &["MULTI"],
+                &["SET", "x", "1"],
+                &["SET", "y", "2"],
+                &["EXEC"]
+            ]
+        ),
+        "{}",
+        String::from_utf8_lossy(&log)
+    );
+    let multis = log
+        .windows(record(&["MULTI"]).len())
+        .filter(|w| *w == record(&["MULTI"]).as_slice())
+        .count();
+    #[cfg(feature = "lua")]
+    {
+        assert!(holds(
+            &log,
+            &[
+                &["MULTI"],
+                &["SET", "s1", "a"],
+                &["SET", "s2", "b"],
+                &["EXEC"]
+            ]
+        ));
+        assert!(holds(&log, &[&["SET", "s3", "c"], &["SET", "last", "4"]]));
+        assert_eq!(multis, 2, "{}", String::from_utf8_lossy(&log));
+    }
+    #[cfg(not(feature = "lua"))]
+    assert_eq!(multis, 1, "{}", String::from_utf8_lossy(&log));
+    assert!(holds(&log, &[&["EXEC"], &["SET", "z", "3"]]));
+}
+
+/// A transaction cut off at the end of the AOF â€” its `EXEC` never written â€”
+/// is dropped whole and cut off the file, as Redis reverts it; everything
+/// before it is kept. Whether the cut fell between two of its records or in
+/// the middle of one (#172).
+#[test]
+fn a_transaction_cut_off_at_the_end_of_the_aof_is_dropped_whole() {
+    for torn in [false, true] {
+        let mut server = Server::start(&["--aof"]);
+        let mut c = server.conn();
+        for i in 0..10 {
+            assert!(c.cmd(&["SET", &format!("k{i}"), "v"]).ok());
+        }
+        assert!(c.cmd(&["MULTI"]).ok());
+        c.cmd(&["SET", "whole1", "v"]);
+        c.cmd(&["SET", "whole2", "v"]);
+        assert_eq!(c.cmd(&["EXEC"]).arr().len(), 2);
+        drop(c);
+        std::thread::sleep(Duration::from_millis(1500));
+        server.child.kill().unwrap();
+        server.child.wait().unwrap();
+
+        let aof = server.dir.join("appendonly.aof");
+        let mut log = std::fs::read(&aof).unwrap();
+        for r in [&["MULTI"][..], &["SET", "cut1", "v"], &["SET", "cut2", "v"]] {
+            log.extend_from_slice(&record(r));
+        }
+        if torn {
+            log.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$4\r\ncu");
+        }
+        std::fs::write(&aof, &log).unwrap();
+
+        let mut c = restart_with_aof(&mut server);
+        assert_eq!(c.cmd(&["DBSIZE"]).i(), 12, "torn {torn}");
+        assert_eq!(c.cmd(&["EXISTS", "cut1", "cut2"]).i(), 0, "torn {torn}");
+        assert_eq!(c.cmd(&["EXISTS", "whole1", "whole2"]).i(), 2, "torn {torn}");
+        assert!(c.cmd(&["SET", "after", "v"]).ok());
+        drop(c);
+        std::thread::sleep(Duration::from_millis(1500));
+        server.child.kill().unwrap();
+        server.child.wait().unwrap();
+        let log = std::fs::read(&aof).unwrap();
+        assert!(
+            !log.windows(3).any(|w| w == b"cut"),
+            "torn {torn}: the unfinished transaction was left in the file"
+        );
+
+        // What was written after it follows whole transactions: this loads,
+        // and has nothing to revert.
+        let mut c = restart_with_aof(&mut server);
+        assert_eq!(c.cmd(&["DBSIZE"]).i(), 13, "torn {torn}");
+        assert_eq!(c.cmd(&["GET", "after"]).s(), "v");
+    }
 }
 
 /// A server with the AOF on, a key written, a checkpoint (SAVE), another
@@ -969,6 +1432,85 @@ impl V {
 }
 
 // ── Scripts ───────────────────────────────────────────────────────────────────
+
+/// What Redis's scripts call that did nothing or was missing (#154):
+/// `redis.log` writes to the server's log, `redis.replicate_commands()` is
+/// true, `redis.set_repl(redis.REPL_ALL)` is taken and the others refused.
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_logs_and_asks_for_effects_replication() {
+    let server = Server::start(&["--logfile", "kividb.log", "--loglevel", "notice"]);
+    let mut c = server.conn();
+    let reply = c.cmd(&[
+        "EVAL",
+        "redis.log(redis.LOG_WARNING, 'from', 'a script', 7) \
+         redis.log(redis.LOG_DEBUG, 'not at notice') \
+         return redis.replicate_commands()",
+        "0",
+    ]);
+    assert_eq!(reply.i(), 1, "{reply:?}");
+    let reply = c.cmd(&[
+        "EVAL",
+        "redis.set_repl(redis.REPL_ALL) return redis.call('SET', KEYS[1], 'v')",
+        "1",
+        "k",
+    ]);
+    assert!(reply.ok(), "{reply:?}");
+    for script in [
+        "redis.set_repl(redis.REPL_NONE)",
+        "redis.log(redis.LOG_WARNING)",
+        "redis.log(9, 'x')",
+    ] {
+        assert!(c.cmd(&["EVAL", script, "0"]).is_err(), "{script}");
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let log = std::fs::read_to_string(server.dir.join("kividb.log")).unwrap_or_default();
+        if log.contains("from a script 7") {
+            assert!(!log.contains("not at notice"), "{log}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "not in the log: {log}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `SCRIPT KILL` does not stop a script that has written: half its writes
+/// would stay. It is answered UNKILLABLE, as in Redis, and the script runs
+/// on; it was answered OK and ran on all the same (#129).
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_that_has_written_is_unkillable() {
+    let server = Server::start(&[]);
+    let port = server.port;
+    let mut c = server.conn();
+    assert!(c.cmd(&["CONFIG", "SET", "lua-time-limit", "200"]).ok());
+
+    std::thread::spawn(move || {
+        let mut r = Conn::connect(port);
+        r.cmd(&["EVAL", "redis.call('SET', 'w', '1') while true do end", "0"])
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let reply = c.cmd(&["GET", "w"]);
+        if reply.is_err() && reply.s().starts_with("BUSY") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the script never got busy: {reply:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let reply = c.cmd(&["SCRIPT", "KILL"]);
+    assert!(
+        reply.is_err() && reply.s().starts_with("UNKILLABLE"),
+        "{reply:?}"
+    );
+    // It runs on: the server is still busy with it.
+    let reply = c.cmd(&["PING"]);
+    assert!(reply.is_err() && reply.s().starts_with("BUSY"), "{reply:?}");
+}
 
 /// While a script runs, other clients wait for it; once it has overrun
 /// `lua-time-limit` they are told BUSY — and SCRIPT KILL still gets through

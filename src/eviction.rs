@@ -32,11 +32,11 @@
 use crate::commands::ctx::Ctx;
 use crate::store::Store;
 use ahash::AHashMap;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use rand::Rng;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock};
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
 
 // ── The policy ────────────────────────────────────────────────────────────────
 
@@ -425,50 +425,78 @@ pub fn allowed_when_out_of_memory(name: &str) -> bool {
 /// How much a policy wants a key gone: the highest goes.
 type Unwanted = u64;
 
-/// A shard of either store, to read: the keyspace's and the expiry store's
-/// are different types that both lock to a map.
-trait Shard<V> {
-    type Key: AsRef<str>;
-    fn read_map(&self) -> impl std::ops::Deref<Target = AHashMap<Self::Key, V>>;
-}
+/// A key sampled for eviction, with its expiry time when it was sampled
+/// from the keys with one (milliseconds since the Unix epoch).
+type Sampled = (String, Option<u64>);
 
-impl<V> Shard<V> for Arc<RwLock<AHashMap<crate::store::Key, V>>> {
-    type Key = crate::store::Key;
-    fn read_map(&self) -> impl std::ops::Deref<Target = AHashMap<Self::Key, V>> {
-        self.read()
+/// Up to `count` keys from about `at` in `shard`, into `found`: of all its
+/// keys, or (`volatile`) of those with a time to live.
+fn sample_into(
+    shard: &crate::store::Shard,
+    volatile: bool,
+    at: usize,
+    count: usize,
+    found: &mut Vec<Sampled>,
+) {
+    if !volatile {
+        // From a random bucket: as many buckets as keys wanted, over how
+        // full the table is, where walking to a random key walked past half
+        // the shard on average.
+        let map = shard.read();
+        found.extend(
+            map.sample_from(at, count)
+                .map(|(key, _)| (key.to_string(), None)),
+        );
+        return;
     }
-}
-
-impl Shard<SystemTime> for crate::store::ExpiryShard {
-    type Key = crate::store::Key;
-    fn read_map(&self) -> impl std::ops::Deref<Target = AHashMap<Self::Key, SystemTime>> {
-        self.read()
+    if shard.holds_no_ttl() {
+        return;
     }
+    let map = shard.read();
+    let keys = map.ttl_len();
+    if keys == 0 {
+        return;
+    }
+    // Places in the shard's list of keys with a time to live, each found in
+    // one step: all of them if there are no more than wanted, else `count`
+    // spread from `at` by a stride with no factor in common with a power of
+    // two. Walking to a random one walked past half the shard's times on
+    // average.
+    const STRIDE: usize = 0x9e37_79b9_7f4a_7c15_u64 as usize;
+    let take = count.min(keys);
+    found.extend((0..take).filter_map(|i| {
+        let place = if take == keys {
+            i
+        } else {
+            at.wrapping_add(i.wrapping_mul(STRIDE)) % keys
+        };
+        map.ttl_entry(place)
+            .map(|(key, _, expires)| (key.to_string(), Some(expires)))
+    }));
 }
 
-/// Up to `count` keys of one database, from a random place in it, each with
-/// what `take` makes of its value. Nothing of the caller's runs with a shard
-/// locked but `take`.
-fn sample<V, T>(
-    shards: &[impl Shard<V>],
+/// Up to `count` keys of one database, from a random place in it: of all
+/// its keys, or (`volatile`) of those with a time to live.
+fn sample(
+    shards: &[crate::store::Shard],
+    volatile: bool,
     count: usize,
     rng: &mut impl Rng,
-    take: impl Fn(&V) -> T,
-) -> Vec<(String, T)> {
+) -> Vec<Sampled> {
     let mut found = Vec::with_capacity(count);
     if shards.is_empty() {
         return found;
     }
     let first = rng.gen_range(0..shards.len());
     for step in 0..shards.len() {
-        let map = shards[(first + step) % shards.len()].read_map();
-        if map.is_empty() {
-            continue;
-        }
-        let from = rng.gen_range(0..map.len());
-        for (key, value) in map.iter().skip(from).take(count - found.len()) {
-            found.push((key.as_ref().to_string(), take(value)));
-        }
+        let at = rng.gen_range(0..usize::MAX);
+        sample_into(
+            &shards[(first + step) % shards.len()],
+            volatile,
+            at,
+            count - found.len(),
+            &mut found,
+        );
         if found.len() >= count {
             break;
         }
@@ -483,22 +511,13 @@ fn choose(ctx: &Ctx, policy: Policy, dbs: &[usize], rng: &mut impl Rng) -> Optio
     let count = samples();
     let mut worst: Option<(Unwanted, usize, String)> = None;
     for &db in dbs {
-        let candidates: Vec<(String, Option<SystemTime>)> = if policy.volatile() {
-            sample(&ctx.expiry_store[db], count, rng, |at| Some(*at))
-        } else {
-            sample(&ctx.store[db], count, rng, |_| None)
-        };
+        let candidates: Vec<Sampled> = sample(&ctx.store[db], policy.volatile(), count, rng);
         for (key, expires) in candidates {
             let unwanted: Unwanted = match policy {
                 // Every sampled key is as unwanted as the next, and the
                 // sample was random already.
                 Policy::AllKeysRandom | Policy::VolatileRandom => 0,
-                Policy::VolatileTtl => {
-                    let at = expires
-                        .and_then(|at| at.duration_since(SystemTime::UNIX_EPOCH).ok())
-                        .map_or(u64::MAX, |at| at.as_millis() as u64);
-                    u64::MAX - at
-                }
+                Policy::VolatileTtl => u64::MAX - expires.unwrap_or(u64::MAX),
                 Policy::AllKeysLru | Policy::VolatileLru => record_of(db, key.as_bytes())
                     .map_or(u64::MAX, |record| now.saturating_sub(record.used) as u64),
                 Policy::AllKeysLrm | Policy::VolatileLrm => record_of(db, key.as_bytes())
@@ -525,7 +544,7 @@ fn evict(ctx: &mut Ctx, db: usize, key: &str, ordered: bool) -> bool {
     let _order = (ordered && !crate::command_gate::alone_on_this_thread())
         .then(|| crate::write_order::lock_keys(db, std::iter::once(key.as_bytes())));
 
-    if !crate::commands::helpers::delete_key(ctx.store, ctx.expiry_store, db, key) {
+    if !crate::commands::helpers::delete_key(ctx.store, db, key) {
         // Gone already.
         return false;
     }
@@ -572,9 +591,7 @@ pub fn make_room(ctx: &mut Ctx, limit: usize, ordered: bool) -> bool {
     let dbs: Vec<usize> = (0..ctx.store.len())
         .filter(|&db| {
             if policy.volatile() {
-                ctx.expiry_store[db]
-                    .iter()
-                    .any(|shard| !shard.read().is_empty())
+                ctx.store[db].iter().any(|shard| !shard.holds_no_ttl())
             } else {
                 ctx.store[db].iter().any(|shard| !shard.read().is_empty())
             }
@@ -591,9 +608,6 @@ pub fn make_room(ctx: &mut Ctx, limit: usize, ordered: bool) -> bool {
         if evict(ctx, db, &key, ordered) {
             misses = 0;
         } else {
-            // A TTL without a key would be chosen for ever by a volatile
-            // policy.
-            crate::commands::helpers::clear_expiry(ctx.expiry_store, db, &key);
             misses += 1;
             if misses > 64 {
                 return false;
@@ -606,6 +620,7 @@ pub fn make_room(ctx: &mut Ctx, limit: usize, ordered: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn policies_by_name() {
@@ -635,24 +650,65 @@ mod tests {
 
     #[test]
     fn a_sample_is_no_more_than_was_asked_for_and_finds_what_there_is() {
-        let shards: Vec<Arc<RwLock<AHashMap<crate::store::Key, u8>>>> = (0..8)
-            .map(|_| Arc::new(RwLock::new(AHashMap::new())))
+        let shards: Vec<crate::store::Shard> = (0..8)
+            .map(|_| Arc::new(crate::store::ShardLock::default()))
             .collect();
+        let one = || crate::types::KiviDBValue::String(crate::types::SharedBytes::from("1"));
         let mut rng = rand::thread_rng();
-        let keys = |found: Vec<(String, u8)>| -> Vec<String> {
+        let keys = |found: Vec<Sampled>| -> Vec<String> {
             found.into_iter().map(|(key, _)| key).collect()
         };
-        assert!(sample(&shards, 5, &mut rng, |v| *v).is_empty());
+        assert!(sample(&shards, false, 5, &mut rng).is_empty());
+        assert!(sample(&shards, true, 5, &mut rng).is_empty());
 
         // One key, in one shard of eight: it is found wherever the walk starts.
-        shards[3].write().insert("only".into(), 1);
+        shards[3].write().insert("only", one());
         for _ in 0..50 {
-            assert_eq!(keys(sample(&shards, 5, &mut rng, |v| *v)), ["only"]);
+            assert_eq!(keys(sample(&shards, false, 5, &mut rng)), ["only"]);
+        }
+        // Without a time to live it is no volatile policy's.
+        assert!(sample(&shards, true, 5, &mut rng).is_empty());
+        shards[3].write().set_expires("only", 1_234);
+        for _ in 0..50 {
+            assert_eq!(
+                sample(&shards, true, 5, &mut rng),
+                [("only".to_string(), Some(1_234))]
+            );
         }
         for i in 0..100 {
-            shards[i % 8].write().insert(format!("k{i}").into(), 1);
+            shards[i % 8].write().insert(format!("k{i}"), one());
         }
-        let found = sample(&shards, 5, &mut rng, |v| *v);
-        assert!((1..=5).contains(&found.len()), "{found:?}");
+        let found = sample(&shards, false, 5, &mut rng);
+        assert_eq!(found.len(), 5, "{found:?}");
+    }
+
+    /// The volatile sample is from the keys with a time to live alone, as
+    /// many as asked for, and spread over them rather than a run of them.
+    #[test]
+    fn a_volatile_sample_is_of_keys_with_a_time_to_live() {
+        let shards: Vec<crate::store::Shard> = (0..2)
+            .map(|_| Arc::new(crate::store::ShardLock::default()))
+            .collect();
+        for i in 0..1_000u64 {
+            let mut map = shards[(i % 2) as usize].write();
+            map.insert_str(format!("k{i}"), b"v");
+            if i % 4 == 0 {
+                map.set_expires(&format!("k{i}"), 10_000 + i);
+            }
+        }
+        let mut rng = rand::thread_rng();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let found = sample(&shards, true, 5, &mut rng);
+            assert_eq!(found.len(), 5);
+            for (key, at) in found {
+                let i: u64 = key[1..].parse().unwrap();
+                assert_eq!(i % 4, 0, "{key} has no time to live");
+                assert_eq!(at, Some(10_000 + i));
+                seen.insert(i);
+            }
+        }
+        // 1,000 picks of 250 keys: nearly all of them seen.
+        assert!(seen.len() > 200, "{} of 250", seen.len());
     }
 }

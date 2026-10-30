@@ -421,6 +421,123 @@ fn test_multi_exec_preserves_db_state() {
 /// is never seen half-moved: a reader's `MGET` cannot land between the two
 /// commands. It could — one command ran at a time, but nothing kept another
 /// client's command from running between them.
+/// A command refused by ACL inside MULTI aborts the transaction, as one
+/// refused for any other reason does: EXEC ran the others (#159).
+#[test]
+fn test_a_command_refused_by_acl_aborts_the_transaction() {
+    let port = free_port();
+    start_server(port);
+    let mut admin = Conn::connect(port);
+    assert!(
+        admin
+            .cmds(&[
+                "ACL",
+                "SETUSER",
+                "limited",
+                "on",
+                ">pw",
+                "~*",
+                "+@all",
+                "-flushall"
+            ])
+            .is_ok()
+    );
+    let mut c = Conn::connect(port);
+    assert!(c.cmds(&["AUTH", "limited", "pw"]).is_ok());
+    assert!(c.cmds(&["MULTI"]).is_ok());
+    c.cmds(&["SET", "a", "1"]);
+    assert!(c.cmds(&["FLUSHALL"]).error_msg().starts_with("NOPERM"));
+    c.cmds(&["SET", "b", "2"]);
+    assert!(c.cmds(&["EXEC"]).error_msg().starts_with("EXECABORT"));
+    assert!(admin.cmds(&["GET", "a"]).is_nil());
+    assert!(admin.cmds(&["GET", "b"]).is_nil());
+}
+
+/// A write that changed nothing leaves a WATCH on its key alone, as in
+/// Redis: `SET ... NX` on a key that exists, `SADD` of a member there
+/// already (#159).
+#[test]
+fn test_a_write_that_changes_nothing_does_not_fail_a_watch() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let mut other = Conn::connect(port);
+    c.cmds(&["SET", "w", "1"]);
+    c.cmds(&["SADD", "s", "m"]);
+    assert!(c.cmds(&["WATCH", "w", "s"]).is_ok());
+    assert!(other.cmds(&["SET", "w", "2", "NX"]).is_nil());
+    assert_eq!(other.cmds(&["SADD", "s", "m"]).as_int(), 0);
+    assert_eq!(other.cmds(&["EXPIRE", "missing", "10"]).as_int(), 0);
+    assert!(c.cmds(&["MULTI"]).is_ok());
+    c.cmds(&["SET", "w", "3"]);
+    assert_eq!(c.cmds(&["EXEC"]).as_array().len(), 1);
+
+    // One that does change it still fails it.
+    assert!(c.cmds(&["WATCH", "w"]).is_ok());
+    assert!(other.cmds(&["SET", "w", "4", "XX"]).is_ok());
+    assert!(c.cmds(&["MULTI"]).is_ok());
+    c.cmds(&["SET", "w", "5"]);
+    assert!(c.cmds(&["EXEC"]).is_nil());
+}
+
+/// A DEL of keys on several shards is one step: a reader never finds some
+/// of them gone and others not. Nor a RENAME, the source gone and the
+/// destination not there yet (#159).
+#[test]
+fn test_readers_never_see_a_multi_key_write_half_done() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    let port = free_port();
+    start_server(port);
+    let keys: Vec<String> = (0..200).map(|i| format!("d{i}")).collect();
+    let mut w = Conn::connect(port);
+    // Before the reader starts: a reader that came first found neither
+    // `from` nor `to`, and counted that as a RENAME half done.
+    w.cmds(&["SET", "from", "x"]);
+    let stop = Arc::new(AtomicBool::new(false));
+    let torn = Arc::new(AtomicU64::new(0));
+    let reader = {
+        let (stop, torn, keys) = (Arc::clone(&stop), Arc::clone(&torn), keys.clone());
+        thread::spawn(move || {
+            let mut r = Conn::connect(port);
+            let mut args = vec!["MGET"];
+            args.extend(keys.iter().map(|k| k.as_str()));
+            while !stop.load(Ordering::Relaxed) {
+                let got = r.cmds(&args);
+                let present = got.as_array().iter().filter(|v| !v.is_nil()).count();
+                if present != 0 && present != keys.len() {
+                    torn.fetch_add(1, Ordering::Relaxed);
+                }
+                let renamed = r.cmds(&["MGET", "from", "to"]);
+                if renamed.as_array().iter().all(|v| v.is_nil()) {
+                    torn.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        })
+    };
+    for _ in 0..300 {
+        let mut mset = vec!["MSET"];
+        for k in &keys {
+            mset.push(k);
+            mset.push("v");
+        }
+        assert!(w.cmds(&mset).is_ok());
+        let mut del = vec!["DEL"];
+        del.extend(keys.iter().map(|k| k.as_str()));
+        assert_eq!(w.cmds(&del).as_int(), keys.len() as i64);
+        assert!(w.cmds(&["RENAME", "from", "to"]).is_ok());
+        assert!(w.cmds(&["RENAME", "to", "from"]).is_ok());
+    }
+    stop.store(true, Ordering::Relaxed);
+    reader.join().unwrap();
+    assert_eq!(
+        torn.load(Ordering::Relaxed),
+        0,
+        "a reader saw a write half done"
+    );
+}
+
 #[test]
 fn test_readers_never_see_a_transaction_half_applied() {
     use std::sync::Arc;

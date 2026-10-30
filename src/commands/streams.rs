@@ -12,6 +12,7 @@ use crate::replication::script_feed::{effect, effect_of_metadata, effects_begin}
 use crate::resp::write::*;
 use crate::store;
 use crate::store::Key;
+use crate::store::ValueRef;
 use crate::types::{ConsumerGroup, KiviDBValue, PelEntry, StreamEntry, StreamId, StreamInner};
 use crate::{read_lock, write_lock};
 use ahash::AHashMap;
@@ -155,7 +156,7 @@ fn xidmprecord(ctx: &mut Ctx) -> Vec<u8> {
     let defaults = stream_extra::idmp_defaults(ctx.config);
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     let stream = match read_lock!(shard).get(key) {
-        Some(KiviDBValue::Stream(s)) => Arc::clone(s),
+        Some(ValueRef::Stream(s)) => Arc::clone(s),
         Some(_) => {
             return resp_error("WRONGTYPE Operation against a key holding the wrong kind of value");
         }
@@ -197,7 +198,7 @@ fn get_or_create_stream(ctx: &mut Ctx, key: &str) -> Result<Arc<RwLock<StreamInn
     let mut map = write_lock!(shard);
 
     match map.get(key) {
-        Some(KiviDBValue::Stream(s)) => Ok(Arc::clone(s)),
+        Some(ValueRef::Stream(s)) => Ok(Arc::clone(s)),
         Some(_) => Err(resp_error(
             "WRONGTYPE Operation against a key holding the wrong kind of value",
         )),
@@ -701,7 +702,7 @@ pub fn xlen(ctx: &mut Ctx) -> Vec<u8> {
         None => return resp_error("ERR key must be valid UTF-8"),
     };
 
-    let gone = lazy_expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+    let gone = lazy_expire_on_read(ctx.store, *ctx.selected_db, key);
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -709,7 +710,7 @@ pub fn xlen(ctx: &mut Ctx) -> Vec<u8> {
 
     match map.get(key).filter(|_| !gone) {
         None => resp_integer(0),
-        Some(KiviDBValue::Stream(s)) => resp_integer(s.read().entries.len() as i64),
+        Some(ValueRef::Stream(s)) => resp_integer(s.read().entries.len() as i64),
         Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
     }
 }
@@ -761,7 +762,7 @@ pub fn xrange(ctx: &mut Ctx) -> Vec<u8> {
 
     match map.get(key) {
         None => resp_array(vec![]),
-        Some(KiviDBValue::Stream(s)) => {
+        Some(ValueRef::Stream(s)) => {
             let inner = s.read();
             let items: Vec<Vec<u8>> = inner
                 .entries
@@ -820,7 +821,7 @@ pub fn xrevrange(ctx: &mut Ctx) -> Vec<u8> {
 
     match map.get(key) {
         None => resp_array(vec![]),
-        Some(KiviDBValue::Stream(s)) => {
+        Some(ValueRef::Stream(s)) => {
             let inner = s.read();
             // BTreeMap::range gives ascending; rev() flips it
             let items: Vec<Vec<u8>> = inner
@@ -866,7 +867,7 @@ fn read_streams(
         let db_ref = &ctx.store[*ctx.selected_db];
         let shard = store::get_shard(db_ref, key);
         let map = read_lock!(shard);
-        let Some(KiviDBValue::Stream(stream)) = map.get(*key) else {
+        let Some(ValueRef::Stream(stream)) = map.get(key) else {
             continue;
         };
         let inner = stream.read();
@@ -975,8 +976,9 @@ pub fn xread(ctx: &mut Ctx) -> Vec<u8> {
     // when the command first arrived and must be reused verbatim — see
     // `BlockState::StreamIds`. Take this before resolving anything.
     let resumed = blocking::take_resume(ctx);
+    // The old registrations are dropped here, on every key, not just the one that fired.
     let (carried_ids, carried_deadline) = match blocking::take_state(ctx) {
-        Some(blocking::BlockState::StreamIds { ids, deadline }) => (Some(ids), Some(deadline)),
+        Some(blocking::BlockState::StreamIds { ids, deadline, .. }) => (Some(ids), Some(deadline)),
         _ => (None, None),
     };
     let timed_out = matches!(resumed, Some(None));
@@ -993,7 +995,7 @@ pub fn xread(ctx: &mut Ctx) -> Vec<u8> {
                     let db_ref = &ctx.store[*ctx.selected_db];
                     let shard = store::get_shard(db_ref, key);
                     let map = read_lock!(shard);
-                    let Some(KiviDBValue::Stream(s)) = map.get(*key) else {
+                    let Some(ValueRef::Stream(s)) = map.get(key) else {
                         return StreamId::min();
                     };
                     let inner = s.read();
@@ -1033,12 +1035,13 @@ pub fn xread(ctx: &mut Ctx) -> Vec<u8> {
             // Register on all keys FIRST — before the second check.
             // This ensures we cannot miss a notification that arrives
             // between our first read (which found nothing) and registration.
+            let mut registered = ctx.wait_table.stream_wait();
             let rxs: Vec<(
                 String,
                 tokio::sync::oneshot::Receiver<crate::wait_table::Value>,
             )> = keys
                 .iter()
-                .map(|k| (k.to_string(), ctx.wait_table.register(k)))
+                .map(|k| (k.to_string(), registered.register(k)))
                 .collect();
 
             // SECOND CHECK: re-read immediately after registering.
@@ -1048,8 +1051,7 @@ pub fn xread(ctx: &mut Ctx) -> Vec<u8> {
             let immediate = read_streams(ctx, resp, &keys, &resolved_ids, count, caps);
             if !immediate.is_empty() {
                 // Data arrived in the registration window — return it directly.
-                // The registered receivers will be dropped here, which closes
-                // the oneshot channels cleanly (senders see closed and skip).
+                // Dropping `registered` unregisters every key.
                 return stream_results_reply(resp, immediate);
             }
 
@@ -1063,6 +1065,7 @@ pub fn xread(ctx: &mut Ctx) -> Vec<u8> {
                 Some(blocking::BlockState::StreamIds {
                     ids: resolved_ids,
                     deadline,
+                    registered,
                 }),
             ) {
                 ParkOutcome::Parked => Vec::new(),
@@ -1094,7 +1097,7 @@ pub fn xdel(ctx: &mut Ctx) -> Vec<u8> {
 
     match map.get(key) {
         None => resp_integer(0),
-        Some(KiviDBValue::Stream(s)) => {
+        Some(ValueRef::Stream(s)) => {
             let mut inner = s.write();
             let mut removed = 0i64;
             for id_bytes in &cmd[2..] {
@@ -1189,7 +1192,7 @@ pub fn xtrim(ctx: &mut Ctx) -> Vec<u8> {
 
     match map.get(key) {
         None => resp_integer(0),
-        Some(KiviDBValue::Stream(s)) => {
+        Some(ValueRef::Stream(s)) => {
             let mut inner = s.write();
             let removed = match approx {
                 None => trim_stream(&mut inner, &to, refs),
@@ -1268,7 +1271,7 @@ pub fn xsetid(ctx: &mut Ctx) -> Vec<u8> {
     let shard = store::get_shard(db_ref, &key);
     let map = read_lock!(shard);
     let stream = match map.get(key.as_str()) {
-        Some(KiviDBValue::Stream(s)) => s,
+        Some(ValueRef::Stream(s)) => s,
         Some(_) => {
             return resp_error("WRONGTYPE Operation against a key holding the wrong kind of value");
         }
@@ -1434,7 +1437,7 @@ pub fn xgroup_destroy(ctx: &mut Ctx) -> Vec<u8> {
 
     match map.get(key) {
         None => resp_integer(0),
-        Some(KiviDBValue::Stream(s)) => {
+        Some(ValueRef::Stream(s)) => {
             let mut inner = s.write();
             resp_integer(inner.groups.remove(group).is_some() as i64)
         }
@@ -1475,7 +1478,7 @@ pub fn xgroup_setid(ctx: &mut Ctx) -> Vec<u8> {
 
     match map.get(key) {
         None => resp_error("ERR no such key"),
-        Some(KiviDBValue::Stream(s)) => {
+        Some(ValueRef::Stream(s)) => {
             let mut inner = s.write();
             let added = inner.entries_added;
             let new_id = if id_str == "$" {
@@ -1533,7 +1536,7 @@ pub fn xgroup_createconsumer(ctx: &mut Ctx) -> Vec<u8> {
 
     match map.get(key) {
         None => resp_error("ERR no such key"),
-        Some(KiviDBValue::Stream(s)) => {
+        Some(ValueRef::Stream(s)) => {
             let mut inner = s.write();
             match inner.groups.get_mut(&group) {
                 None => resp_error(&format!(
@@ -1578,7 +1581,7 @@ pub fn xgroup_delconsumer(ctx: &mut Ctx) -> Vec<u8> {
 
     match map.get(key) {
         None => resp_error("ERR no such key"),
-        Some(KiviDBValue::Stream(s)) => {
+        Some(ValueRef::Stream(s)) => {
             let mut inner = s.write();
             match inner.groups.get_mut(&group) {
                 None => resp_error(&format!(
@@ -1939,7 +1942,7 @@ fn next_claimable_in(
     for key in keys {
         let shard = store::get_shard(&ctx.store[*ctx.selected_db], key.as_str());
         let map = read_lock!(shard);
-        let Some(KiviDBValue::Stream(stream)) = map.get(key.as_str()) else {
+        let Some(ValueRef::Stream(stream)) = map.get(key.as_str()) else {
             continue;
         };
         let inner = stream.read();
@@ -1985,7 +1988,7 @@ fn run_xreadgroup_delivery(
         let shard = store::get_shard(db_ref, key.as_str());
         let map = read_lock!(shard);
         match map.get(key.as_str()) {
-            Some(KiviDBValue::Stream(s)) => {
+            Some(ValueRef::Stream(s)) => {
                 if !s.read().groups.contains_key(spec.group) {
                     return Err(nogroup_error(key, spec.group));
                 }
@@ -2219,7 +2222,7 @@ pub fn xack(ctx: &mut Ctx) -> Vec<u8> {
 
     match map.get(key) {
         None => resp_integer(0),
-        Some(KiviDBValue::Stream(s)) => {
+        Some(ValueRef::Stream(s)) => {
             let mut inner = s.write();
             match inner.groups.get_mut(&group) {
                 None => resp_integer(0),
@@ -2257,7 +2260,7 @@ pub fn xpending(ctx: &mut Ctx) -> Vec<u8> {
 
     match map.get(key) {
         None => resp_error("ERR no such key"),
-        Some(KiviDBValue::Stream(s)) => {
+        Some(ValueRef::Stream(s)) => {
             let inner = s.read();
             let g = match inner.groups.get(&group) {
                 None => return resp_error("NOGROUP No such consumer group"),
@@ -2498,7 +2501,7 @@ pub fn xclaim(ctx: &mut Ctx) -> Vec<u8> {
         None => resp_error(&format!(
             "NOGROUP No such key '{key}' or consumer group '{group}'"
         )),
-        Some(KiviDBValue::Stream(s)) => {
+        Some(ValueRef::Stream(s)) => {
             let mut guard = s.write();
             let StreamInner {
                 entries, groups, ..
@@ -2652,7 +2655,7 @@ pub fn xautoclaim(ctx: &mut Ctx) -> Vec<u8> {
         None => resp_error(&format!(
             "NOGROUP No such key '{key}' or consumer group '{group}'"
         )),
-        Some(KiviDBValue::Stream(s)) => {
+        Some(ValueRef::Stream(s)) => {
             let mut guard = s.write();
             let StreamInner {
                 entries, groups, ..
@@ -2796,7 +2799,7 @@ fn xinfo_stream(ctx: &mut Ctx) -> Vec<u8> {
 
     match map.get(key) {
         None => resp_error("ERR no such key"),
-        Some(KiviDBValue::Stream(s)) => {
+        Some(ValueRef::Stream(s)) => {
             let inner = s.read();
             // XINFO STREAM key FULL [COUNT count]
             if let Some(full) = cmd.get(3) {
@@ -3078,7 +3081,7 @@ fn xinfo_groups(ctx: &mut Ctx) -> Vec<u8> {
 
     match map.get(key) {
         None => resp_error("ERR no such key"),
-        Some(KiviDBValue::Stream(s)) => {
+        Some(ValueRef::Stream(s)) => {
             let inner = s.read();
             let groups: Vec<Vec<u8>> = groups_in_order(&inner)
                 .into_iter()
@@ -3131,7 +3134,7 @@ fn xinfo_consumers(ctx: &mut Ctx) -> Vec<u8> {
 
     match map.get(key) {
         None => resp_error("ERR no such key"),
-        Some(KiviDBValue::Stream(s)) => {
+        Some(ValueRef::Stream(s)) => {
             let inner = s.read();
             let g = match inner.groups.get(&group) {
                 None => return resp_error("NOGROUP No such consumer group"),
@@ -3232,7 +3235,7 @@ pub fn xdelex(ctx: &mut Ctx) -> Vec<u8> {
     let stream = match map.get(key.as_str()) {
         // No stream → every id is -1.
         None => return resp_array(ids.iter().map(|_| resp_integer(-1)).collect()),
-        Some(KiviDBValue::Stream(s)) => Arc::clone(s),
+        Some(ValueRef::Stream(s)) => Arc::clone(s),
         Some(_) => {
             return resp_error("WRONGTYPE Operation against a key holding the wrong kind of value");
         }
@@ -3299,7 +3302,7 @@ pub fn xackdel(ctx: &mut Ctx) -> Vec<u8> {
     let stream = {
         let map = read_lock!(shard);
         match map.get(key.as_str()) {
-            Some(KiviDBValue::Stream(s)) => Arc::clone(s),
+            Some(ValueRef::Stream(s)) => Arc::clone(s),
             Some(_) => {
                 return resp_error(
                     "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -3387,7 +3390,7 @@ pub fn xcfgset(ctx: &mut Ctx) -> Vec<u8> {
     let map = read_lock!(shard);
 
     let stream_arc = match map.get(key.as_str()) {
-        Some(KiviDBValue::Stream(s)) => Arc::clone(s),
+        Some(ValueRef::Stream(s)) => Arc::clone(s),
         Some(_) => {
             return resp_error("WRONGTYPE Operation against a key holding the wrong kind of value");
         }
@@ -3645,7 +3648,7 @@ pub fn xnack(ctx: &mut Ctx) -> Vec<u8> {
 
     match map.get(key) {
         None => no_group(),
-        Some(KiviDBValue::Stream(s)) => {
+        Some(ValueRef::Stream(s)) => {
             let mut inner = s.write();
             // FORCE needs to know which IDs exist in the stream; take that set
             // before borrowing `groups` mutably.

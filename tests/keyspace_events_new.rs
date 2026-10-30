@@ -232,5 +232,85 @@ fn overwritten_type_changed_and_array_events() {
     c.cmd(&["INCREX", "n", "BYFLOAT", "0.5", "EX", "100"]);
     assert_eq!(event(&mut sub), "incrbyfloat n");
     assert_eq!(event(&mut sub), "expire n");
+
+    // Events as Redis names them, from the commands that announced nothing
+    // too, and `keymiss` (#160).
+    c.ok(&["CONFIG", "SET", "notify-keyspace-events", "EAm"]);
+    c.ok(&["SET", "num", "1"]);
+    assert_eq!(event(&mut sub), "set num");
+    for command in [
+        &["INCR", "num"][..],
+        &["DECR", "num"],
+        &["DECRBY", "num", "2"],
+    ] {
+        c.cmd(command);
+        assert_eq!(event(&mut sub), "incrby num", "{command:?}");
+    }
+    c.cmd(&["GETSET", "num", "5"]);
+    assert_eq!(event(&mut sub), "set num");
+    c.cmd(&["SETNX", "fresh", "1"]);
+    assert_eq!(event(&mut sub), "set fresh");
+    c.cmd(&["GETEX", "fresh", "EX", "100"]);
+    assert_eq!(event(&mut sub), "expire fresh");
+    c.cmd(&["GETEX", "fresh", "PERSIST"]);
+    assert_eq!(event(&mut sub), "persist fresh");
+    c.cmd(&["GETDEL", "fresh"]);
+    assert_eq!(event(&mut sub), "del fresh");
+    c.cmd(&["RPUSH", "src", "a", "b"]);
+    assert_eq!(event(&mut sub), "rpush src");
+    c.cmd(&["LMOVE", "src", "dst", "LEFT", "RIGHT"]);
+    // Redis's order (`lmoveGenericCommand`): the push, then the pop (#173).
+    assert_eq!(event(&mut sub), "rpush dst");
+    assert_eq!(event(&mut sub), "lpop src");
+    c.cmd(&["SETRANGE", "num", "0", "9"]);
+    assert_eq!(event(&mut sub), "setrange num");
+    c.cmd(&["SETBIT", "bits", "1", "1"]);
+    assert_eq!(event(&mut sub), "setbit bits");
+    c.cmd(&["PFADD", "hll", "a"]);
+    assert_eq!(event(&mut sub), "pfadd hll");
+    c.cmd(&["GEOADD", "g", "13.36", "38.11", "p"]);
+    assert_eq!(event(&mut sub), "zadd g");
+    assert_eq!(c.cmd(&["MOVE", "g", "1"]), V::Int(1));
+    assert_eq!(event(&mut sub), "move_from g");
+    c.cmd(&["EXISTS", "nothing-here"]); // only asks: no keymiss
+    assert_eq!(c.cmd(&["GET", "missing"]), V::Nil);
+    assert_eq!(event(&mut sub), "keymiss missing");
+    c.ok(&["JSON.SET", "j", "$", "{\"a\":1}"]);
+    assert_eq!(event(&mut sub), "json.set j");
+
+    // A flag that is not one is refused, and the flags stay as they were.
+    assert!(matches!(
+        c.cmd(&["CONFIG", "SET", "notify-keyspace-events", "KEAQ!"]),
+        V::Error(_)
+    ));
+    c.ok(&["SET", "after", "1"]);
+    assert_eq!(event(&mut sub), "set after");
+
+    // A move that empties its source, in Redis's order: the push to the
+    // destination, the pop from the source, then its delete (#173). The
+    // delete came first, and the pop before the push.
+    c.ok(&["CONFIG", "SET", "notify-keyspace-events", "Elg"]);
+    assert_eq!(c.cmd(&["RPUSH", "from", "x"]), V::Int(1));
+    assert_eq!(event(&mut sub), "rpush from");
+    assert_eq!(
+        c.cmd(&["LMOVE", "from", "to", "LEFT", "RIGHT"]),
+        V::Bulk(b"x".to_vec())
+    );
+    assert_eq!(event(&mut sub), "rpush to");
+    assert_eq!(event(&mut sub), "lpop from");
+    assert_eq!(event(&mut sub), "del from");
+    // One that does not empty it has no delete.
+    c.cmd(&["RPUSH", "from", "y", "z"]);
+    assert_eq!(event(&mut sub), "rpush from");
+    c.cmd(&["RPOPLPUSH", "from", "to"]);
+    assert_eq!(event(&mut sub), "lpush to");
+    assert_eq!(event(&mut sub), "rpop from");
+    c.ok(&["SET", "marker2", "1"]); // not an `l` or `g` event: nothing
+    c.cmd(&["DEL", "marker2"]);
+    assert_eq!(
+        event(&mut sub),
+        "del marker2",
+        "no delete for a source left with y"
+    );
     c.ok(&["CONFIG", "SET", "notify-keyspace-events", ""]);
 }

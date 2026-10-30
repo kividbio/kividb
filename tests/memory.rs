@@ -148,7 +148,110 @@ fn start_server(port: u16) {
     });
 }
 
+fn used_memory(c: &mut Conn) -> u64 {
+    let RespValue::Bulk(info) = c.cmd(&["INFO", "memory"]) else {
+        panic!("INFO memory");
+    };
+    String::from_utf8(info)
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("used_memory:"))
+        .expect("used_memory")
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// `cmd key` for each key, pipelined; the replies are read and dropped.
+fn pipeline(c: &mut Conn, cmd: &[&str], keys: impl Iterator<Item = String>) {
+    let keys: Vec<String> = keys.collect();
+    for chunk in keys.chunks(1000) {
+        let mut buf = String::new();
+        for key in chunk {
+            buf.push_str(&format!("*{}\r\n", cmd.len() + 1));
+            buf.push_str(&format!("${}\r\n{}\r\n", cmd[0].len(), cmd[0]));
+            buf.push_str(&format!("${}\r\n{}\r\n", key.len(), key));
+            for a in &cmd[1..] {
+                buf.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+            }
+        }
+        c.writer.write_all(buf.as_bytes()).unwrap();
+        for _ in chunk {
+            assert!(!c.read_value().is_error());
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
+// TABLES GIVE BACK THE ROOM OF KEYS THAT HAVE GONE (#113)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// After most keys are deleted, `used_memory` falls within a few
+/// seconds, by the room the tables held for them: tables used to keep the
+/// size they had at their largest.
+#[test]
+fn test_tables_shrink_after_most_keys_are_deleted() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let n = 400_000;
+    // `used_memory` is the whole process's, other tests' servers included:
+    // what this test adds is measured from here.
+    let before = used_memory(&mut c);
+    pipeline(&mut c, &["SET", "v"], (0..n).map(|i| format!("k:{i}")));
+    pipeline(
+        &mut c,
+        &["EXPIRE", "100000"],
+        (0..n).map(|i| format!("k:{i}")),
+    );
+    let loaded = used_memory(&mut c).saturating_sub(before);
+    pipeline(
+        &mut c,
+        &["DEL"],
+        (0..n).filter(|i| i % 10 != 0).map(|i| format!("k:{i}")),
+    );
+    // With values this small the tables of values and of times are most of
+    // the memory: on Windows, 42 MB loaded, 39 MB left with the tables kept
+    // at their size after the delete, 5 MB with them shrunk.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let now = used_memory(&mut c).saturating_sub(before);
+        if now * 3 < loaded {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{now} bytes left after deleting 90% of the keys, {loaded} loaded"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    assert!(matches!(c.cmd(&["DBSIZE"]), RespValue::Integer(k) if k == n / 10));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+/// `SAMPLES 0` is every element, as in Redis: it divided by zero for a
+/// hash, a set and a sorted set, and the worker panicked and the
+/// connection closed (#151). A count that is not a number is an error.
+#[test]
+fn test_memory_usage_samples_zero_is_every_element() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmd(&["HSET", "h", "a", "1", "b", "2"]);
+    c.cmd(&["SADD", "s", "a", "b"]);
+    c.cmd(&["ZADD", "z", "1", "a", "2", "b"]);
+    c.cmd(&["RPUSH", "l", "a", "b"]);
+    for key in ["h", "s", "z", "l"] {
+        let all = c.cmd(&["MEMORY", "USAGE", key, "SAMPLES", "0"]).as_int();
+        assert!(all > 0, "{key}: {all}");
+    }
+    assert!(c.cmd(&["MEMORY", "USAGE", "h", "SAMPLES", "x"]).is_error());
+    assert!(c.cmd(&["MEMORY", "USAGE", "h", "SAMPLES", "-1"]).is_error());
+    assert!(c.cmd(&["MEMORY", "USAGE", "h", "BOGUS", "1"]).is_error());
+    // The connection is still there.
+    assert!(matches!(c.cmd(&["PING"]), RespValue::SimpleStr(s) if s == "PONG"));
+}
+
 // MEMORY USAGE
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -403,6 +506,46 @@ fn test_memory_stats_human_field_is_non_empty_string() {
 // MEMORY DOCTOR
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// `mem_fragmentation_ratio` is RSS over `used_memory`, as in Redis; it was
+/// virtual size over RSS, 56 with 100,000 keys. `used_memory_peak` is the
+/// peak of `used_memory`, not of RSS (#152).
+#[test]
+fn info_memory_fragmentation_is_rss_over_used_memory() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let value = "x".repeat(100);
+    for i in 0..50_000 {
+        c.cmd(&["SET", &format!("frag:{i}"), &value]);
+    }
+    let info = c.cmd(&["INFO", "memory"]);
+    let field = |name: &str| -> f64 {
+        info.as_str()
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}:")))
+            .unwrap_or_else(|| panic!("no {name}"))
+            .trim_end_matches('%')
+            .parse()
+            .unwrap()
+    };
+    let (used, rss, ratio) = (
+        field("used_memory"),
+        field("used_memory_rss"),
+        field("mem_fragmentation_ratio"),
+    );
+    assert!(
+        (ratio - rss / used).abs() < 0.01,
+        "{ratio} vs {rss} / {used}"
+    );
+    // Not near 1 with as little as this: a new server's RSS is mostly its
+    // own (threads, Lua's VMs), 5.3 on a CI runner. Virtual over resident
+    // size, the old figure, was 56.
+    assert!(ratio > 0.3 && ratio < 10.0, "{ratio}");
+    assert!(field("used_memory_peak") >= used);
+    let startup = field("used_memory_startup");
+    assert!(startup > 0.0 && startup < used, "{startup} {used}");
+}
+
 #[test]
 fn test_memory_doctor_returns_non_empty_string() {
     let port = free_port();
@@ -419,11 +562,19 @@ fn test_memory_doctor_healthy_on_fresh_server() {
     start_server(port);
     let mut c = Conn::connect(port);
     let result = c.cmd(&["MEMORY", "DOCTOR"]);
-    // Fresh server should report healthy
+    // The figures are the process's, and the other tests here fill and
+    // free memory in it: any of the doctor's findings can be true.
+    let msg = result.as_str();
     assert!(
-        result.as_str().contains("fine") || result.as_str().contains("fragmentation"),
-        "Expected healthy message or fragmentation warning, got: {}",
-        result.as_str()
+        [
+            "fine",
+            "very little memory",
+            "High fragmentation",
+            "Peak memory"
+        ]
+        .iter()
+        .any(|finding| msg.contains(finding)),
+        "Expected one of MEMORY DOCTOR's findings, got: {msg}"
     );
 }
 
@@ -474,14 +625,15 @@ fn test_memory_malloc_stats_returns_string() {
 }
 
 #[test]
-fn test_memory_malloc_stats_contains_malloc_tag() {
+fn test_memory_malloc_stats_says_what_redis_without_jemalloc_says() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
     let result = c.cmd(&["MEMORY", "MALLOC-STATS"]);
-    assert!(
-        result.as_str().contains("malloc"),
-        "MEMORY MALLOC-STATS should contain '<malloc' tag"
+    // It was a fixed piece of XML that looked like statistics (#152).
+    assert_eq!(
+        result.as_str(),
+        "Stats not supported for the current allocator"
     );
 }
 

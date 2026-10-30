@@ -374,7 +374,35 @@ pub enum DuplicatePolicy {
     Sum,
 }
 
+/// The duplicate policy of a series made without one (`TS.CREATE` or
+/// `TS.ADD` with no `DUPLICATE_POLICY`): `ts-duplicate-policy`, `last`
+/// unless set (#127). RedisTimeSeries's default is `block`; KiviDB's stays
+/// `last`, so that a server upgraded in place, and an AOF it replays, keep
+/// doing what they did. A series keeps the policy it was made with.
+static DEFAULT_DUPLICATE_POLICY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+
 impl DuplicatePolicy {
+    const ALL: [DuplicatePolicy; 6] = [
+        DuplicatePolicy::Block,
+        DuplicatePolicy::First,
+        DuplicatePolicy::Last,
+        DuplicatePolicy::Min,
+        DuplicatePolicy::Max,
+        DuplicatePolicy::Sum,
+    ];
+
+    /// See [`DEFAULT_DUPLICATE_POLICY`].
+    pub fn server_default() -> Self {
+        let at = DEFAULT_DUPLICATE_POLICY.load(std::sync::atomic::Ordering::Relaxed);
+        Self::ALL[at as usize % Self::ALL.len()].clone()
+    }
+
+    /// Set [`DEFAULT_DUPLICATE_POLICY`].
+    pub fn set_server_default(policy: &DuplicatePolicy) {
+        let at = Self::ALL.iter().position(|p| p == policy).unwrap_or(2);
+        DEFAULT_DUPLICATE_POLICY.store(at as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_uppercase().as_str() {
             "BLOCK" => Some(DuplicatePolicy::Block),
@@ -550,6 +578,10 @@ pub struct TsInner {
 
     /// Max timestamp ever seen (for TS.GET and INCRBY/DECRBY).
     pub last_ts: Option<u64>,
+
+    /// The series this one is a compaction of (`TS.CREATERULE`): `sourceKey`
+    /// in `TS.INFO`, and where `LATEST` finds the bucket still open (#128).
+    pub source: Option<String>,
 }
 
 impl TsInner {
@@ -562,6 +594,7 @@ impl TsInner {
             labels: AHashMap::new(),
             rules: Vec::new(),
             last_ts: None,
+            source: None,
         }
     }
 

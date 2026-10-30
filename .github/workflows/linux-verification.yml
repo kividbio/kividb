@@ -83,6 +83,15 @@ jobs:
         # elapsed time, and full parallelism on a 2-core hosted runner makes
         # the timing-sensitive ones flap.
         run: cargo test --no-fail-fast -- --test-threads=4
+      - name: cargo test (24-node cluster)
+        # Ignored by the run above: it starts 24 server processes, too many to
+        # share the runner with other suites, so it runs alone. In release:
+        # 24 idle debug builds alone saturate a hosted runner's CPUs, and
+        # starved nodes fall behind on heartbeats and gossip.
+        run: >-
+          cargo test --release --test cluster
+          a_24_node_cluster_fails_over_and_the_old_master_rejoins
+          -- --ignored --exact --test-threads=1
 
   # ── Drive real traffic through BOTH I/O models ──────────────────────────────
   io-model-matrix:

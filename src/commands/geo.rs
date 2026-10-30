@@ -3,6 +3,7 @@ use crate::commands::helpers::{expire_on_read, is_expired, lazy_expire_on_read, 
 use crate::resp::write::*;
 use crate::store;
 use crate::store::Key;
+use crate::store::ValueRef;
 use crate::types::{KiviDBValue, SortedSetInner, ZMember};
 use crate::{read_lock, write_lock};
 use ordered_float::OrderedFloat;
@@ -273,7 +274,7 @@ fn get_or_create_zset(ctx: &mut Ctx, key: &str) -> Result<Arc<RwLock<SortedSetIn
     let mut map = write_lock!(shard);
 
     match map.get(key) {
-        Some(KiviDBValue::SortedSet(zs)) => Ok(Arc::clone(zs)),
+        Some(ValueRef::SortedSet(zs)) => Ok(Arc::clone(zs)),
         Some(_) => Err(resp_error(
             "WRONGTYPE Operation against a key holding the wrong kind of value",
         )),
@@ -424,8 +425,8 @@ fn cmd_geodist(ctx: &mut Ctx) -> Vec<u8> {
         "M"
     };
 
-    if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-        expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+    if is_expired(ctx.store, *ctx.selected_db, key) {
+        expire_on_read(ctx.store, *ctx.selected_db, key);
         return resp_null_bulk();
     }
 
@@ -434,7 +435,7 @@ fn cmd_geodist(ctx: &mut Ctx) -> Vec<u8> {
     let map = read_lock!(shard);
 
     let zs = match map.get(key) {
-        Some(KiviDBValue::SortedSet(z)) => z.clone(),
+        Some(ValueRef::SortedSet(z)) => z.clone(),
         None => return resp_null_bulk(),
         _ => {
             return resp_error("WRONGTYPE Operation against a key holding the wrong kind of value");
@@ -492,8 +493,8 @@ fn cmd_geopos(ctx: &mut Ctx) -> Vec<u8> {
         None => return resp_error("ERR key must be valid UTF-8"),
     };
 
-    if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-        expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+    if is_expired(ctx.store, *ctx.selected_db, key) {
+        expire_on_read(ctx.store, *ctx.selected_db, key);
         let nils = vec![resp_null_for(resp); cmd.len() - 2];
         return resp_array(nils);
     }
@@ -503,7 +504,7 @@ fn cmd_geopos(ctx: &mut Ctx) -> Vec<u8> {
     let map = read_lock!(shard);
 
     let zs = match map.get(key) {
-        Some(KiviDBValue::SortedSet(z)) => z.clone(),
+        Some(ValueRef::SortedSet(z)) => z.clone(),
         None => {
             let nils = vec![resp_null_for(resp); cmd.len() - 2];
             return resp_array(nils);
@@ -547,8 +548,8 @@ fn cmd_geohash(ctx: &mut Ctx) -> Vec<u8> {
         None => return resp_error("ERR key must be valid UTF-8"),
     };
 
-    if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-        expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+    if is_expired(ctx.store, *ctx.selected_db, key) {
+        expire_on_read(ctx.store, *ctx.selected_db, key);
         let nils = vec![resp_null_for(resp); cmd.len() - 2];
         return resp_array(nils);
     }
@@ -558,7 +559,7 @@ fn cmd_geohash(ctx: &mut Ctx) -> Vec<u8> {
     let map = read_lock!(shard);
 
     let zs = match map.get(key) {
-        Some(KiviDBValue::SortedSet(z)) => z.clone(),
+        Some(ValueRef::SortedSet(z)) => z.clone(),
         None => {
             let nils = vec![resp_null_for(resp); cmd.len() - 2];
             return resp_array(nils);
@@ -855,12 +856,12 @@ fn geo_search(ctx: &mut Ctx, form: Form, read_only: bool) -> Vec<u8> {
 
     // The set, if there is one. (Its members are looked at under its lock,
     // which the search takes for as long as it runs.)
-    let gone = lazy_expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, &key);
+    let gone = lazy_expire_on_read(ctx.store, *ctx.selected_db, &key);
     let zset = {
         let shard = store::get_shard(&ctx.store[*ctx.selected_db], &key);
         let map = read_lock!(shard);
         match map.get(key.as_str()).filter(|_| !gone) {
-            Some(KiviDBValue::SortedSet(zset)) => Some(Arc::clone(zset)),
+            Some(ValueRef::SortedSet(zset)) => Some(Arc::clone(zset)),
             Some(_) => {
                 return resp_error(
                     "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -1074,7 +1075,7 @@ fn geo_search(ctx: &mut Ctx, form: Form, read_only: bool) -> Vec<u8> {
     if let Some(dest) = store_key {
         let db = *ctx.selected_db;
         if found.is_empty() {
-            crate::commands::helpers::delete_key(ctx.store, ctx.expiry_store, db, &dest);
+            crate::commands::helpers::delete_key(ctx.store, db, &dest);
             return resp_integer(0);
         }
         let mut stored = SortedSetInner::new();
@@ -1090,7 +1091,7 @@ fn geo_search(ctx: &mut Ctx, form: Form, read_only: bool) -> Vec<u8> {
         }
         // The destination is a new key: whatever was there, and its time
         // to live, are gone.
-        crate::commands::helpers::delete_key(ctx.store, ctx.expiry_store, db, &dest);
+        crate::commands::helpers::delete_key(ctx.store, db, &dest);
         let shard = store::get_shard(&ctx.store[db], &dest);
         write_lock!(shard).insert(
             Key::from(dest),

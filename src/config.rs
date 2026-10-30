@@ -3,6 +3,54 @@ use clap::Parser;
 /// The values `tls-auth-clients` accepts.
 pub const TLS_AUTH_CLIENTS: [&str; 3] = ["yes", "no", "optional"];
 
+/// `tls-auth-clients-allowed-names` as a list of names, lower case: words
+/// separated by spaces or commas, each a DNS name, or `*.` and one, where
+/// `*` stands for exactly one label, as it does in a certificate. Empty:
+/// any name. `Err` says which word is neither.
+pub fn allowed_names(value: &str) -> Result<Vec<String>, String> {
+    value
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|name| !name.is_empty())
+        .map(|name| {
+            let name = name.trim_end_matches('.').to_ascii_lowercase();
+            let label = |label: &str| {
+                !label.is_empty()
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            };
+            if name
+                .strip_prefix("*.")
+                .unwrap_or(&name)
+                .split('.')
+                .all(label)
+            {
+                Ok(name)
+            } else {
+                Err(format!(
+                    "'{name}' is not a DNS name, nor '*.' and one: '*' may only be the whole \
+                     first label"
+                ))
+            }
+        })
+        .collect()
+}
+
+/// Whether `name`, as a certificate gives it, matches `pattern`, one of
+/// [`allowed_names`]: the same name, in any case, or for `*.parent` one label
+/// more than `parent`.
+#[cfg_attr(not(feature = "tls"), allow(dead_code))]
+pub fn allowed_name_matches(pattern: &str, name: &str) -> bool {
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    match pattern.strip_prefix("*.") {
+        Some(parent) => name
+            .strip_suffix(parent)
+            .and_then(|head| head.strip_suffix('.'))
+            .is_some_and(|label| !label.is_empty() && !label.contains('.')),
+        None => name == pattern,
+    }
+}
+
 #[derive(clap::ValueEnum, Debug, Clone, Default, PartialEq)]
 pub enum IoModel {
     #[default]
@@ -117,6 +165,27 @@ pub struct Config {
     #[arg(long, default_value_t = 1)]
     pub lfu_decay_time: u32,
 
+    /// Move string values off the slabs deletes have left sparse, so that
+    /// their memory goes back to the system (Redis `activedefrag`; see
+    /// `src/compaction.rs`). On unless switched off.
+    #[arg(long, default_value = "yes", value_parser = parse_yes_no, num_args = 1)]
+    pub activedefrag: bool,
+
+    /// Waste in the slabs under which active defrag does not start (Redis
+    /// `active-defrag-ignore-bytes`).
+    #[arg(long, default_value_t = 64 << 20)]
+    pub active_defrag_ignore_bytes: u64,
+
+    /// Waste, as a percentage of what is in the slabs, over which active
+    /// defrag starts (Redis `active-defrag-threshold-lower`).
+    #[arg(long, default_value_t = 20)]
+    pub active_defrag_threshold_lower: u32,
+
+    /// The most of one core active defrag uses, a percentage (Redis
+    /// `active-defrag-cycle-max`).
+    #[arg(long, default_value_t = 10)]
+    pub active_defrag_cycle_max: u32,
+
     /// Working directory: where `dump.kdb`, `appendonly.aof`, backups and
     /// `nodes.conf` live (Redis `dir`). Empty = the directory the server was
     /// started in.
@@ -210,6 +279,16 @@ pub struct Config {
     /// Has no effect while `tls-ca-cert-file` is empty.
     #[arg(long, default_value = "yes")]
     pub tls_auth_clients: String,
+
+    /// The names a client certificate must carry to be accepted, separated
+    /// by spaces or commas: a client (or replica, or node on the cluster
+    /// bus) that presents a certificate is refused unless its subject CN or
+    /// one of its DNS names matches one of them. A name is exact, or starts
+    /// with `*.`, where `*` stands for exactly one label: `*.db.example`
+    /// takes `node-0.db.example`, not `a.b.db.example`. Case does not
+    /// matter. Empty (the default): any certificate the CA signed.
+    #[arg(long, default_value = "")]
+    pub tls_auth_clients_allowed_names: String,
 
     /// The cluster bus over TLS, and the TLS port announced as this node's
     /// port, so that what nodes open to each other is TLS (Redis
@@ -349,6 +428,13 @@ pub struct Config {
     #[arg(long, default_value_t = 0)]
     pub cluster_announce_port: u16,
 
+    /// The port clients are told to reach this node on (redirects, `CLUSTER
+    /// SLOTS`, `SHARDS`, `NODES`), where it is not the client port nodes use
+    /// between themselves: a NodePort, a load balancer that maps ports. 0 =
+    /// the client port. Settable at runtime.
+    #[arg(long, default_value_t = 0)]
+    pub cluster_announce_client_port: u16,
+
     /// Bus port announced to the cluster. 0 = `port` + 10000.
     #[arg(long, default_value_t = 0)]
     pub cluster_announce_bus_port: u16,
@@ -376,6 +462,13 @@ pub struct Config {
     /// by a failed node (Redis `cluster-require-full-coverage`).
     #[arg(long, default_value = "yes", value_parser = parse_yes_no, num_args = 1)]
     pub cluster_require_full_coverage: bool,
+
+    /// A replica whose link to its master has been down longer than this
+    /// many node timeouts (plus `repl-ping-replica-period`) does not stand
+    /// for election when the master fails; 0 = always stand (Redis
+    /// `cluster-replica-validity-factor`).
+    #[arg(long, default_value_t = 10)]
+    pub cluster_replica_validity_factor: u64,
 
     /// Arguments kept per slowlog entry (Redis 8.8 `slowlog-entry-max-argc`).
     #[arg(long, default_value_t = 32)]
@@ -447,6 +540,10 @@ impl Default for Config {
             lfu_log_factor: 10,
             key_access_tracking: false,
             lfu_decay_time: 1,
+            activedefrag: true,
+            active_defrag_ignore_bytes: 64 << 20,
+            active_defrag_threshold_lower: 20,
+            active_defrag_cycle_max: 10,
             dir: String::new(),
             loglevel: "info".into(),
             logfile: String::new(),
@@ -466,6 +563,7 @@ impl Default for Config {
             tls_key_file: "".into(),
             tls_ca_cert_file: "".into(),
             tls_auth_clients: "yes".into(),
+            tls_auth_clients_allowed_names: String::new(),
             tls_cluster: false,
             tls_replication: false,
             tls_client_cert_file: String::new(),
@@ -489,6 +587,7 @@ impl Default for Config {
             cluster_announce_hostname: String::new(),
             cluster_preferred_endpoint_type: "ip".into(),
             cluster_announce_port: 0,
+            cluster_announce_client_port: 0,
             cluster_announce_bus_port: 0,
             cluster_bus_port_protected_mode: false,
             protected_mode: true,
@@ -496,6 +595,7 @@ impl Default for Config {
             cluster_bus_secret: String::new(),
             cluster_config_file: "nodes.conf".into(),
             cluster_require_full_coverage: true,
+            cluster_replica_validity_factor: 10,
             slowlog_entry_max_argc: 32,
             slowlog_entry_max_string_len: 128,
             stream_idmp_duration: 100,
@@ -557,6 +657,10 @@ impl Config {
             lfu_log_factor: 10,
             key_access_tracking: false,
             lfu_decay_time: 1,
+            activedefrag: true,
+            active_defrag_ignore_bytes: 64 << 20,
+            active_defrag_threshold_lower: 20,
+            active_defrag_cycle_max: 10,
             dir: String::new(),
             loglevel: "warn".into(),
             logfile: String::new(),
@@ -576,6 +680,7 @@ impl Config {
             tls_key_file: String::new(),
             tls_ca_cert_file: String::new(),
             tls_auth_clients: "yes".into(),
+            tls_auth_clients_allowed_names: String::new(),
             tls_cluster: false,
             tls_replication: false,
             tls_client_cert_file: String::new(),
@@ -599,6 +704,7 @@ impl Config {
             cluster_announce_hostname: String::new(),
             cluster_preferred_endpoint_type: "ip".into(),
             cluster_announce_port: 0,
+            cluster_announce_client_port: 0,
             cluster_announce_bus_port: 0,
             cluster_bus_port_protected_mode: false,
             protected_mode: true,
@@ -606,6 +712,7 @@ impl Config {
             cluster_bus_secret: String::new(),
             cluster_config_file: "nodes.conf".into(),
             cluster_require_full_coverage: true,
+            cluster_replica_validity_factor: 10,
             slowlog_entry_max_argc: 32,
             slowlog_entry_max_string_len: 128,
             stream_idmp_duration: 100,
@@ -672,6 +779,19 @@ impl Config {
             ));
         }
 
+        if let Err(e) = allowed_names(&self.tls_auth_clients_allowed_names) {
+            return Err(format!("invalid tls-auth-clients-allowed-names: {e}"));
+        }
+        if !self.tls_auth_clients_allowed_names.trim().is_empty()
+            && (self.tls_ca_cert_file.is_empty() || self.tls_auth_clients == "no")
+        {
+            warnings.push(
+                "tls-auth-clients-allowed-names has no effect: clients are asked for a \
+                 certificate only with tls-ca-cert-file and tls-auth-clients yes or optional"
+                    .to_string(),
+            );
+        }
+
         if self.tls_cluster || self.tls_replication {
             if !tls_compiled {
                 return Err(
@@ -695,6 +815,25 @@ impl Config {
         }
         if self.tls_cluster && (!self.cluster_enabled || self.tls_port == 0) {
             return Err("tls-cluster needs cluster-enabled yes and a tls-port".into());
+        }
+        // Port 0 is no plaintext port, as in Redis; with no Unix socket here,
+        // the TLS port is then the only one to reach the server on.
+        if self.port == 0 {
+            if self.tls_port == 0 {
+                return Err(
+                    "port 0 turns the plaintext port off, which leaves no port to \
+                            reach this server on: set tls-port (with tls-cert-file and \
+                            tls-key-file) to serve TLS only, or give port a number"
+                        .into(),
+                );
+            }
+            if self.cluster_enabled && !self.tls_cluster {
+                return Err(
+                    "port 0 on a cluster node needs tls-cluster yes: the node is \
+                            then known to the cluster and its clients by its TLS port"
+                        .into(),
+                );
+            }
         }
 
         match self.replica_full_sync_guard.as_str() {
@@ -736,10 +875,10 @@ impl Config {
                         .into(),
                 );
             }
-            if self.port > u16::MAX - 10000 {
+            if self.client_port() > u16::MAX - 10000 {
                 return Err(format!(
                     "port {} leaves no room for the cluster bus port (port + 10000)",
-                    self.port
+                    self.client_port()
                 ));
             }
             if self.cluster_bus_secret.is_empty() {
@@ -762,9 +901,20 @@ impl Config {
         Ok(warnings)
     }
 
-    /// The port the cluster bus listens on.
+    /// The port the cluster bus listens on: 10000 above the client port.
     pub fn cluster_bus_port(&self) -> u16 {
-        self.port.saturating_add(10000)
+        self.client_port().saturating_add(10000)
+    }
+
+    /// The port the server started with for clients: `port`, or with port 0
+    /// (no plaintext port) `tls-port`. Redis derives the bus port from the
+    /// TLS port the same way when the node is reached over TLS.
+    pub fn client_port(&self) -> u16 {
+        if self.port == 0 {
+            self.tls_port
+        } else {
+            self.port
+        }
     }
 
     /// Returns true if TLS should be enabled.
@@ -845,6 +995,22 @@ impl Config {
         out.push_str(&format!("maxmemory-samples {}\n", self.maxmemory_samples));
         out.push_str(&format!("lfu-log-factor {}\n", self.lfu_log_factor));
         out.push_str(&format!("lfu-decay-time {}\n", self.lfu_decay_time));
+        out.push_str(&format!(
+            "activedefrag {}\n",
+            if self.activedefrag { "yes" } else { "no" }
+        ));
+        out.push_str(&format!(
+            "active-defrag-ignore-bytes {}\n",
+            self.active_defrag_ignore_bytes
+        ));
+        out.push_str(&format!(
+            "active-defrag-threshold-lower {}\n",
+            self.active_defrag_threshold_lower
+        ));
+        out.push_str(&format!(
+            "active-defrag-cycle-max {}\n",
+            self.active_defrag_cycle_max
+        ));
         out.push_str(&format!(
             "key-access-tracking {}\n",
             if self.key_access_tracking {
@@ -944,6 +1110,12 @@ impl Config {
                 self.cluster_announce_port
             ));
         }
+        if self.cluster_announce_client_port != 0 {
+            out.push_str(&format!(
+                "cluster-announce-client-port {}\n",
+                self.cluster_announce_client_port
+            ));
+        }
         if self.cluster_announce_bus_port != 0 {
             out.push_str(&format!(
                 "cluster-announce-bus-port {}\n",
@@ -964,6 +1136,10 @@ impl Config {
         out.push_str(&format!(
             "cluster-config-file {}\n",
             self.cluster_config_file
+        ));
+        out.push_str(&format!(
+            "cluster-replica-validity-factor {}\n",
+            self.cluster_replica_validity_factor
         ));
         out.push_str(&format!(
             "cluster-require-full-coverage {}\n",
@@ -1274,6 +1450,9 @@ impl Config {
                 set!(cluster_preferred_endpoint_type, kind.to_ascii_lowercase())
             }
             "cluster-announce-port" => set!(cluster_announce_port, number(key, one()?)?),
+            "cluster-announce-client-port" => {
+                set!(cluster_announce_client_port, number(key, one()?)?)
+            }
             "cluster-announce-bus-port" => set!(cluster_announce_bus_port, number(key, one()?)?),
             "cluster-bus-secret" => set!(cluster_bus_secret, one()?.to_string()),
             "cluster-bus-port-protected-mode" => {
@@ -1282,6 +1461,9 @@ impl Config {
             "cluster-config-file" => set!(cluster_config_file, one()?.to_string()),
             "cluster-require-full-coverage" => {
                 set!(cluster_require_full_coverage, yes_no(key, one()?)?)
+            }
+            "cluster-replica-validity-factor" => {
+                set!(cluster_replica_validity_factor, number(key, one()?)?)
             }
             "cluster-slot-migration-handoff-max-lag-bytes" => set!(
                 cluster_slot_migration_handoff_max_lag_bytes,
@@ -1354,6 +1536,12 @@ impl Config {
             "tls-replication" => set!(tls_replication, yes_no(key, one()?)?),
             "tls-client-cert-file" => set!(tls_client_cert_file, one()?.to_string()),
             "tls-client-key-file" => set!(tls_client_key_file, one()?.to_string()),
+            // A list: one word or several, as `bind`.
+            "tls-auth-clients-allowed-names" => {
+                let names = allowed_names(&args.join(" "))
+                    .map_err(|e| format!("invalid value for '{key}': {e}"))?;
+                set!(tls_auth_clients_allowed_names, names.join(" "))
+            }
             "tls-auth-clients" => {
                 let value = one()?.to_ascii_lowercase();
                 if !TLS_AUTH_CLIENTS.contains(&value.as_str()) {
@@ -1364,7 +1552,16 @@ impl Config {
                 }
                 set!(tls_auth_clients, value)
             }
-            "notify-keyspace-events" => set!(notify_keyspace_events, one()?.to_string()),
+            "notify-keyspace-events" => {
+                let flags = one()?;
+                if crate::keyspace_events::parse_ks_flags_strict(flags).is_none() {
+                    return Err(format!(
+                        "invalid value '{flags}' for 'notify-keyspace-events': {}",
+                        crate::keyspace_events::BAD_FLAGS
+                    ));
+                }
+                set!(notify_keyspace_events, flags.to_string())
+            }
 
             // ── Redis directives that name something KiviDB has one way of
             // doing. The value KiviDB already behaves as is accepted quietly;
@@ -1451,7 +1648,17 @@ impl Config {
             }
             "lfu-log-factor" => set!(lfu_log_factor, number(key, one()?)?),
             "lfu-decay-time" => set!(lfu_decay_time, number(key, one()?)?),
+            "activedefrag" => set!(activedefrag, yes_no(key, one()?)?),
+            "active-defrag-ignore-bytes" => {
+                set!(active_defrag_ignore_bytes, parse_memory(key, one()?)?)
+            }
+            "active-defrag-threshold-lower" => {
+                set!(active_defrag_threshold_lower, number(key, one()?)?)
+            }
+            "active-defrag-cycle-max" => set!(active_defrag_cycle_max, number(key, one()?)?),
             "key-access-tracking" => set!(key_access_tracking, yes_no(key, one()?)?),
+            "tracking-table-max-keys" => crate::tracking::DEFAULT_MAX_KEYS
+                .store(number(key, one()?)?, std::sync::atomic::Ordering::Relaxed),
             // Tuning knobs for machinery KiviDB does not have, or does not
             // expose. They change nothing a client could observe.
             "activerehashing"
@@ -1482,10 +1689,48 @@ impl Config {
                 if args.is_empty() {
                     return Err(format!("'{key}' needs a value"));
                 }
+                // For `CONFIG GET`, as `CONFIG SET` remembers it.
+                crate::commands::server::config_set_global(key, &args.join(" "));
                 return no_effect("KiviDB has no such setting");
             }
 
-            _ => return Err(format!("unknown directive '{key}'")),
+            // A setting `CONFIG SET` takes that is the server's as a whole
+            // (`array-slice-size`, `busy-reply-threshold`, ...): set, and
+            // checked, as `CONFIG SET` sets it. One of Redis's that KiviDB has
+            // no use for (`maxclients`, ...) is remembered, as `CONFIG SET`
+            // remembers it, so that a redis.conf carried over starts (#142).
+            _ => {
+                if args.is_empty() {
+                    return Err(format!("'{key}' needs a value"));
+                }
+                let value = args.join(" ");
+                match crate::commands::server::config_set_global(key, &value) {
+                    Some(reply) if reply.starts_with(b"-") => {
+                        let why = String::from_utf8_lossy(&reply[1..]);
+                        let why = why.trim_end();
+                        let why = why.strip_prefix("ERR ").unwrap_or(why);
+                        return Err(format!("invalid value '{value}' for '{key}': {why}"));
+                    }
+                    // Remembered for `CONFIG GET`, and in effect too.
+                    Some(_)
+                        if matches!(
+                            key,
+                            "latency-monitor-threshold"
+                                | "ts-duplicate-policy"
+                                | "aof-ack-after-write"
+                        ) || crate::commands::server::remembered_config(key).is_none() => {}
+                    Some(_) => return no_effect("KiviDB has no such setting"),
+                    None if key.starts_with("cluster-")
+                        || !crate::redis_settings::is_redis_setting(key) =>
+                    {
+                        return Err(format!("unknown directive '{key}'"));
+                    }
+                    None => {
+                        crate::commands::server::remember_config(key, &value);
+                        return no_effect("KiviDB has no such setting");
+                    }
+                }
+            }
         }
         Ok(None)
     }
@@ -1743,6 +1988,49 @@ mod config_file_tests {
         );
     }
 
+    /// What `CONFIG SET` takes, the file takes too (#142): the settings the
+    /// server keeps for itself are set as `CONFIG SET` sets them, Redis's
+    /// are accepted with a warning, and a misspelt name still stops the
+    /// server. The values are the defaults: the settings are the process's.
+    #[test]
+    fn config_set_settings_are_directives_too() {
+        let (_, warnings) = load(
+            "stream-node-max-entries 100\nstream-node-max-bytes 4kb\n\
+             tracking-table-max-keys 1000000\nbusy-reply-threshold 5000\n\
+             search-timeout 0\nsearch-on-timeout return\n",
+        )
+        .unwrap();
+        #[cfg(feature = "lua")]
+        assert!(warnings.is_empty(), "{warnings:?}");
+        #[cfg(not(feature = "lua"))]
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let (_, warnings) = load(
+            "maxclients 10000\nlatency-tracking yes\nhash-max-listpack-entries 512\n\
+             proto-max-bulk-len 512mb\nlatency-monitor-threshold 0\nacllog-max-len 128\n",
+        )
+        .unwrap();
+        // All but latency-monitor-threshold, which the latency monitor goes
+        // by (#158).
+        assert_eq!(warnings.len(), 5, "{warnings:?}");
+        assert!(warnings[0].contains("'maxclients'"), "{warnings:?}");
+        let err = load("array-slice-size 300\n").unwrap_err();
+        assert!(err.contains("power of two"), "{err}");
+        let err = load("stream-node-max-entries -1\n").unwrap_err();
+        assert!(err.contains("stream-node-max-entries"), "{err}");
+        for bad in [
+            "search-timeout -1\n",
+            "search-timeout soon\n",
+            "search-on-timeout never\n",
+        ] {
+            let err = load(bad).unwrap_err();
+            assert!(err.contains("search-"), "{bad}: {err}");
+        }
+        for typo in ["maxclientz 1\n", "cluster-allow-reads-when-down yes\n"] {
+            let err = load(typo).unwrap_err();
+            assert!(err.contains("unknown directive"), "{typo}: {err}");
+        }
+    }
+
     #[test]
     fn redis_directives_with_no_effect_are_reported_and_not_fatal() {
         let (_, warnings) = load("save 900 1\ntcp-keepalive 300\nappendfsync always\n").unwrap();
@@ -1770,10 +2058,12 @@ mod config_file_tests {
             slowlog-max-len 1\nslowlog-entry-max-argc 1\nslowlog-entry-max-string-len 1\n\
             cluster-enabled yes\ncluster-node-timeout 1\ncluster-announce-ip a\n\
             cluster-announce-hostname h\ncluster-preferred-endpoint-type ip\n\
-            cluster-announce-port 1\ncluster-announce-bus-port 1\n\
+            cluster-announce-port 1\ncluster-announce-client-port 1\n\
+            cluster-announce-bus-port 1\n\
             cluster-bus-port-protected-mode no\ncluster-bus-secret s\n\
             cluster-config-file f\n\
-            cluster-require-full-coverage no\ncluster-slot-migration-handoff-max-lag-bytes 1\n\
+            cluster-require-full-coverage no\ncluster-replica-validity-factor 1\n\
+            cluster-slot-migration-handoff-max-lag-bytes 1\n\
             cluster-slot-migration-write-pause-timeout 1\nrepl-replica-max-backlog-bytes 1\n\
             masterauth a\nmasteruser u\nrepl-timeout 1\nrepl-ping-replica-period 1\n\
             min-replicas-to-write 1\nmin-replicas-max-lag 1\n\
@@ -1846,6 +2136,67 @@ mod validate_tests {
     fn tls_port_without_cert_is_fatal_on_a_tls_build() {
         let c = Config {
             tls_port: 6380,
+            ..cfg()
+        };
+        assert!(c.validate(true).is_err());
+    }
+
+    /// Port 0 is no plaintext port: only with a TLS port, and in a cluster
+    /// only with `tls-cluster`, whose bus is then 10000 above the TLS port.
+    #[test]
+    fn port_0_needs_a_tls_port() {
+        let plain_off = Config { port: 0, ..cfg() };
+        let err = plain_off.validate(true).unwrap_err();
+        assert!(err.contains("port 0"), "{err}");
+        assert!(plain_off.validate(false).is_err());
+
+        let tls_only = Config {
+            port: 0,
+            tls_port: 6381,
+            tls_cert_file: "cert.pem".into(),
+            tls_key_file: "key.pem".into(),
+            ..cfg()
+        };
+        assert!(tls_only.validate(true).is_ok());
+        assert_eq!(tls_only.client_port(), 6381);
+        assert_eq!(tls_only.cluster_bus_port(), 16381);
+
+        let cluster = Config {
+            cluster_enabled: true,
+            ..tls_only.clone()
+        };
+        let err = cluster.validate(true).unwrap_err();
+        assert!(err.contains("tls-cluster"), "{err}");
+        let tls_cluster = Config {
+            tls_cluster: true,
+            tls_ca_cert_file: "ca.pem".into(),
+            ..cluster
+        };
+        assert!(tls_cluster.validate(true).is_ok());
+    }
+
+    /// `*` is one label, case does not matter, and what is not a name is
+    /// refused.
+    #[test]
+    fn allowed_names_match_one_label_for_a_star() {
+        use super::{allowed_name_matches, allowed_names};
+        let names = allowed_names("*.DB1.nodes.kividb.internal, admin.example ").unwrap();
+        assert_eq!(names, ["*.db1.nodes.kividb.internal", "admin.example"]);
+        let ok = |name: &str| names.iter().any(|p| allowed_name_matches(p, name));
+        assert!(ok("node-0.db1.nodes.kividb.internal"));
+        assert!(ok("Node-1.DB1.Nodes.Kividb.Internal."));
+        assert!(ok("ADMIN.example"));
+        assert!(!ok("db1.nodes.kividb.internal"));
+        assert!(!ok("a.b.db1.nodes.kividb.internal"));
+        assert!(!ok("x.db2.nodes.kividb.internal"));
+        assert!(!ok("x.xdb1.nodes.kividb.internal"));
+        assert!(!ok("other.admin.example"));
+        for bad in ["*", "a.*.b", "*.*.b", "a*.b", "a..b", "*.", "a b/c"] {
+            assert!(allowed_names(bad).is_err(), "{bad} was taken");
+        }
+        assert_eq!(allowed_names(" , ").unwrap(), Vec::<String>::new());
+        let c = Config {
+            tls_auth_clients_allowed_names: "a.*".into(),
             ..cfg()
         };
         assert!(c.validate(true).is_err());

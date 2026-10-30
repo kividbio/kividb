@@ -19,7 +19,7 @@
 //! members, and 4 of 5 stream IDs differed by a millisecond.
 
 use crate::commands::ctx::Ctx;
-use crate::commands::helpers::{get_expiry_shard, parse_utf8};
+use crate::commands::helpers::parse_utf8;
 use crate::read_lock;
 use std::time::UNIX_EPOCH;
 
@@ -382,13 +382,8 @@ fn owned(cmd: &[&[u8]]) -> Vec<Vec<u8>> {
 
 /// When `key` expires, in Unix milliseconds, if it has a TTL.
 fn expiry_ms(ctx: &Ctx<'_>, key: &str) -> Option<u64> {
-    let shard = get_expiry_shard(ctx.expiry_store, *ctx.selected_db, key);
-    let at = read_lock!(shard).get(key).copied()?;
-    Some(
-        at.duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64,
-    )
+    let shard = crate::store::get_shard(&ctx.store[*ctx.selected_db], key);
+    read_lock!(shard).expires(key)
 }
 
 /// `cmd` with a relative `EX seconds` / `PX milliseconds` option, looked for

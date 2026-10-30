@@ -26,6 +26,7 @@ enum Resp {
     Int(i64),
     Bulk(Vec<u8>),
     Array(Vec<Resp>),
+    Map(Vec<(Resp, Resp)>),
     Nil,
 }
 
@@ -48,6 +49,12 @@ impl Resp {
         match self {
             Resp::Array(v) => v,
             other => panic!("not an array: {other:?}"),
+        }
+    }
+    fn map(&self) -> &[(Resp, Resp)] {
+        match self {
+            Resp::Map(v) => v,
+            other => panic!("not a map: {other:?}"),
         }
     }
     fn is_ok(&self) -> bool {
@@ -118,6 +125,25 @@ impl Conn {
             .unwrap_or_else(|e| panic!("{args:?} failed: {e}"))
     }
 
+    /// Several commands in one write, so a timeout test can fill an index
+    /// without a round trip per document.
+    fn pipeline(&mut self, commands: &[Vec<&str>]) -> Vec<Resp> {
+        let mut buf = Vec::new();
+        for args in commands {
+            buf.extend(format!("*{}\r\n", args.len()).into_bytes());
+            for a in args {
+                buf.extend(format!("${}\r\n", a.len()).as_bytes());
+                buf.extend(a.as_bytes());
+                buf.extend(b"\r\n");
+            }
+        }
+        self.stream.write_all(&buf).unwrap();
+        commands
+            .iter()
+            .map(|_| self.read().unwrap_or_else(|e| panic!("pipeline: {e}")))
+            .collect()
+    }
+
     fn read(&mut self) -> std::io::Result<Resp> {
         let mut line = String::new();
         if self.reader.read_line(&mut line)? == 0 {
@@ -152,6 +178,16 @@ impl Conn {
                     Resp::Array(items)
                 }
             }
+            "%" => {
+                let n: i64 = rest.parse().unwrap();
+                let mut pairs = Vec::with_capacity(n.max(0) as usize);
+                for _ in 0..n.max(0) {
+                    pairs.push((self.read()?, self.read()?));
+                }
+                Resp::Map(pairs)
+            }
+            "," => Resp::Simple(rest.to_string()),
+            "_" => Resp::Nil,
             other => panic!("unexpected RESP type {other:?} in {line:?}"),
         })
     }
@@ -204,16 +240,26 @@ struct Node {
     dir: PathBuf,
     child: Option<Child>,
     extra: Vec<String>,
+    /// Environment variables of its process, besides the test's own.
+    env: Vec<(String, String)>,
 }
 
 impl Node {
     fn start(extra: &[&str]) -> Self {
+        Self::start_with_env(extra, &[])
+    }
+
+    fn start_with_env(extra: &[&str], env: &[(&str, &str)]) -> Self {
         let dir = tempfile::tempdir().unwrap().keep();
         let mut node = Node {
             port: cluster_port(),
             dir,
             child: None,
             extra: extra.iter().map(|s| s.to_string()).collect(),
+            env: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
         };
         node.spawn();
         node
@@ -244,6 +290,7 @@ impl Node {
                 "kividb.conf",
             ])
             .args(&self.extra)
+            .envs(self.env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(log))
@@ -420,7 +467,12 @@ fn wait_cluster_ok(nodes: &[&Node], known: usize) {
 
 /// Attach a fresh node as a replica of `master` and wait for it to sync.
 fn add_replica(cluster: &[Node], master: &Node) -> Node {
-    let replica = Node::start(&[]);
+    add_replica_with_env(cluster, master, &[])
+}
+
+/// [`add_replica`], its process given `env` as well.
+fn add_replica_with_env(cluster: &[Node], master: &Node, env: &[(&str, &str)]) -> Node {
+    let replica = Node::start_with_env(&[], env);
     let r = cluster[0]
         .conn()
         .cmd(&["CLUSTER", "MEET", "127.0.0.1", &replica.port.to_string()]);
@@ -430,11 +482,14 @@ fn add_replica(cluster: &[Node], master: &Node) -> Node {
         "replica to learn of its master",
         Duration::from_secs(15),
         || {
+            // The master's id is also in its other replicas' rows, as their
+            // master, so look for the row that starts with it.
             replica
                 .conn()
                 .cmd(&["CLUSTER", "NODES"])
                 .text()
-                .contains(&master_id)
+                .lines()
+                .any(|l| l.starts_with(&master_id))
         },
     );
     let r = replica.conn().cmd(&["CLUSTER", "REPLICATE", &master_id]);
@@ -534,6 +589,90 @@ fn routing_uses_the_real_key_positions() {
     );
 }
 
+/// A script may use only the keys this node serves, and, unless it is
+/// flagged `allow-cross-slot-keys`, only those in its own slot: one that
+/// wrote a key of another node's slot left it here, where no client would
+/// find it (#153).
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_uses_only_keys_this_node_serves() {
+    let (nodes, ranges) = form_cluster(2);
+    let here = &nodes[0];
+    let mine = key_in(ranges[0].0..=ranges[0].1, "mine");
+    let also_mine = (0..100_000)
+        .map(|i| format!("also:{i}"))
+        .find(|k| (ranges[0].0..=ranges[0].1).contains(&slot_of(k)) && slot_of(k) != slot_of(&mine))
+        .expect("another key of node 0");
+    let theirs = key_in(ranges[1].0..=ranges[1].1, "theirs");
+    let write = |key: &str| format!("return redis.call('SET', '{key}', 'v')");
+    let non_local = |reply: &Resp| {
+        reply.err().is_some_and(|e| {
+            e.contains("Script attempted to access a non local key in a cluster node")
+        })
+    };
+    let same_slot = |reply: &Resp| {
+        reply.err().is_some_and(|e| {
+            e.contains("Script attempted to access keys that do not hash to the same slot")
+        })
+    };
+
+    // Its own slot: fine, declared or not.
+    assert!(
+        here.conn()
+            .cmd(&["EVAL", &write(&mine), "1", &mine])
+            .is_ok()
+    );
+    assert!(here.conn().cmd(&["EVAL", &write(&mine), "0"]).is_ok());
+
+    // Another node's key, with keys of its own or none: refused, and not stored.
+    let r = here.conn().cmd(&["EVAL", &write(&theirs), "1", &mine]);
+    assert!(same_slot(&r), "{r:?}");
+    let r = here.conn().cmd(&["EVAL", &write(&theirs), "0"]);
+    assert!(non_local(&r), "{r:?}");
+    let slot = slot_of(&theirs).to_string();
+    assert_eq!(
+        here.conn()
+            .cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot])
+            .int(),
+        0
+    );
+
+    // A key of this node in another slot: refused, unless the script says it
+    // may; another node's key is refused all the same.
+    let r = here.conn().cmd(&["EVAL", &write(&also_mine), "1", &mine]);
+    assert!(same_slot(&r), "{r:?}");
+    let flagged = |body: String| format!("#!lua flags=allow-cross-slot-keys\n{body}");
+    assert!(
+        here.conn()
+            .cmd(&["EVAL", &flagged(write(&also_mine)), "1", &mine])
+            .is_ok()
+    );
+    let r = here
+        .conn()
+        .cmd(&["EVAL", &flagged(write(&theirs)), "1", &mine]);
+    assert!(non_local(&r), "{r:?}");
+
+    // A script with no keys takes the slot of the first one it uses.
+    let two =
+        format!("redis.call('SET', '{mine}', 'v') return redis.call('SET', '{also_mine}', 'v')");
+    let r = here.conn().cmd(&["EVAL", &two, "0"]);
+    assert!(same_slot(&r), "{r:?}");
+
+    // A function is held to the same, by its flags.
+    let library = format!(
+        "#!lua name=lib\n\
+         redis.register_function('strict', function(keys) return redis.call('SET', '{theirs}', 'v') end)\n\
+         redis.register_function{{function_name='loose', callback=function(keys) return redis.call('SET', '{also_mine}', 'v') end, flags={{'allow-cross-slot-keys'}}}}"
+    );
+    assert_eq!(
+        here.conn().cmd(&["FUNCTION", "LOAD", &library]).text(),
+        "lib"
+    );
+    let r = here.conn().cmd(&["FCALL", "strict", "1", &mine]);
+    assert!(same_slot(&r), "{r:?}");
+    assert!(here.conn().cmd(&["FCALL", "loose", "1", &mine]).is_ok());
+}
+
 /// Six masters, introduced only to the first: each has to learn of the other
 /// four through gossip. (They did not, where the clock was coarse: gossip
 /// kept mentioning the same three nodes.)
@@ -622,6 +761,9 @@ fn command_describes_where_each_commands_keys_are() {
     let mixed = c.cmd(&["COMMAND", "INFO", "get", "nosuchcommand"]);
     assert_eq!(mixed.array().len(), 2);
     assert_eq!(mixed.array()[1], Resp::Nil);
+    // Listed with no command behind it, and not Redis's (#126).
+    let gone = c.cmd(&["COMMAND", "INFO", "geodelbymember"]);
+    assert_eq!(gone.array(), [Resp::Nil]);
 }
 
 /// A transaction is routed command by command as it is queued. One that
@@ -711,6 +853,30 @@ fn replica_follows_its_master_and_serves_reads_after_readonly() {
 
     // Replicas do not count toward the cluster's size.
     assert_eq!(master.cluster_info("cluster_size"), "2");
+
+    // An array with a `CLUSTER NODES` line per replica, as in Redis; it was
+    // one string (#138). A master without replicas has an empty one.
+    let replicas = master.conn().cmd(&["CLUSTER", "REPLICAS", &master.id()]);
+    assert_eq!(replicas.array().len(), 1, "{replicas:?}");
+    let line = replicas.array()[0].text();
+    assert!(
+        line.starts_with(&replica.id()) && !line.ends_with('\n'),
+        "{line:?}"
+    );
+    let none = master.conn().cmd(&["CLUSTER", "SLAVES", &nodes[1].id()]);
+    assert!(none.array().is_empty(), "{none:?}");
+
+    // Busiest slot first by default, as in Redis; it was the emptiest (#139).
+    let stats = master.conn().cmd(&[
+        "CLUSTER",
+        "SLOT-STATS",
+        "ORDERBY",
+        "key-count",
+        "LIMIT",
+        "1",
+    ]);
+    let top = &stats.array()[0].array();
+    assert_eq!(top[0].int(), slot_of(&key) as i64, "{stats:?}");
 
     // Without READONLY, the replica redirects to its master.
     let mut c = replica.conn();
@@ -882,6 +1048,175 @@ fn nodes_announce_hostnames_and_clients_can_be_sent_by_them() {
     let text = nodes[2].conn().cmd(&["CLUSTER", "NODES"]).text();
     assert!(text.contains(&format!(",{} ", host(0))), "{text}");
     assert!(text.contains(&format!(",{} ", host(2))), "{text}");
+}
+
+/// `cluster-announce-client-port`: what clients are told to connect to,
+/// where it is not the port nodes reach each other on (a NodePort, a load
+/// balancer that maps ports) (#110). Redirects, `CLUSTER SLOTS`, `SHARDS` and
+/// `NODES` give it; the cluster itself keeps working on the real ports.
+#[test]
+fn nodes_announce_a_client_port_of_their_own() {
+    let (nodes, ranges) = form_cluster(3);
+    let r = nodes[1]
+        .conn()
+        .cmd(&["CONFIG", "SET", "cluster-announce-client-port", "30001"]);
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(
+        nodes[1]
+            .conn()
+            .cmd(&["CONFIG", "GET", "cluster-announce-client-port"])
+            .array()[1]
+            .text(),
+        "30001"
+    );
+    let mut c = nodes[0].conn();
+    let key = key_in(ranges[1].0..=ranges[1].1, "cp");
+    wait_until(
+        "the others to tell clients the new port",
+        Duration::from_secs(15),
+        || {
+            c.cmd(&["GET", &key])
+                .err()
+                .is_some_and(|e| e.ends_with(" 127.0.0.1:30001"))
+        },
+    );
+    fn texts(r: &Resp, out: &mut Vec<String>) {
+        match r {
+            Resp::Array(items) => items.iter().for_each(|i| texts(i, out)),
+            Resp::Bulk(b) => out.push(String::from_utf8_lossy(b).into_owned()),
+            Resp::Int(n) => out.push(n.to_string()),
+            _ => {}
+        }
+    }
+    let mut slots = Vec::new();
+    texts(&c.cmd(&["CLUSTER", "SLOTS"]), &mut slots);
+    assert!(slots.contains(&"30001".to_string()), "{slots:?}");
+    let mut shards = Vec::new();
+    texts(&c.cmd(&["CLUSTER", "SHARDS"]), &mut shards);
+    assert!(shards.contains(&"30001".to_string()), "{shards:?}");
+    let text = c.cmd(&["CLUSTER", "NODES"]).text();
+    assert!(
+        text.contains(&format!("{} 127.0.0.1:30001@", nodes[1].id())),
+        "{text}"
+    );
+    // The cluster itself still reaches it on its real port.
+    assert_eq!(nodes[1].cluster_info("cluster_state"), "ok");
+    assert_eq!(nodes[0].cluster_info("cluster_state"), "ok");
+
+    // Back to none: the client port again.
+    assert!(
+        nodes[1]
+            .conn()
+            .cmd(&["CONFIG", "SET", "cluster-announce-client-port", "0"])
+            .is_ok()
+    );
+    let real = format!(" 127.0.0.1:{}", nodes[1].port);
+    wait_until(
+        "clients to be sent to the real port again",
+        Duration::from_secs(15),
+        || {
+            c.cmd(&["GET", &key])
+                .err()
+                .is_some_and(|e| e.ends_with(&real))
+        },
+    );
+}
+
+/// `CONFIG GET` while this node's entry in the node table is being written
+/// does not stop the node. It read the table twice in one statement, still
+/// holding the first read when it took the second, and a writer that queued
+/// in between waited for the first while the second waited for the writer:
+/// for good, and every command that reads the topology queued behind them.
+/// In a cluster the writer is the bus, on every heartbeat; the operator asks
+/// `CONFIG GET cluster-announce-hostname` of every node it looks after. Here
+/// `CONFIG SET cluster-announce-client-port` writes, to hit it in seconds.
+#[test]
+fn config_get_while_the_node_table_is_written_does_not_hang_the_node() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    let node = Node::start(&[]);
+    let stop = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicU64::new(0));
+    let mut workers = Vec::new();
+    for i in 0..8 {
+        let (stop, done, port) = (Arc::clone(&stop), Arc::clone(&done), node.port);
+        workers.push(std::thread::spawn(move || {
+            let mut c = Conn::connect(port);
+            let mut n = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                n += 1;
+                let port = (30_000 + n % 2).to_string();
+                let args: &[&str] = if i % 4 == 0 {
+                    &["CONFIG", "SET", "cluster-announce-client-port", &port]
+                } else {
+                    &["CONFIG", "GET", "cluster-announce-hostname"]
+                };
+                // A reply that does not come (10 s) ends the loop.
+                if c.try_cmd(args).is_err() {
+                    return;
+                }
+                done.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+    std::thread::sleep(Duration::from_secs(5));
+    stop.store(true, Ordering::Relaxed);
+    for w in workers {
+        let _ = w.join();
+    }
+    let mut c = Conn::connect(node.port);
+    c.stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let info = c.try_cmd(&["CLUSTER", "INFO"]);
+    assert!(
+        info.is_ok(),
+        "the node stopped answering after {} commands: {info:?}",
+        done.load(Ordering::Relaxed)
+    );
+    assert_eq!(c.cmd(&["PING"]), Resp::Simple("PONG".into()));
+}
+
+/// Heartbeats go over one connection per peer, kept open (#112): pinging
+/// every peer every second used to open a new connection each time, N x
+/// (N - 1) a second across the cluster. A peer that restarts is reached
+/// again on a new one.
+#[test]
+fn heartbeats_reuse_one_connection_per_peer() {
+    let (mut nodes, _) = form_cluster(6);
+    let stat = |n: &Node, f: &str| -> u64 { n.cluster_info(f).parse().unwrap_or(0) };
+    // Let every link come up.
+    std::thread::sleep(Duration::from_secs(3));
+    let (connects, sent) = (
+        stat(&nodes[0], "cluster_stats_bus_connects"),
+        stat(&nodes[0], "cluster_stats_messages_sent"),
+    );
+    std::thread::sleep(Duration::from_secs(5));
+    let new_connects = stat(&nodes[0], "cluster_stats_bus_connects") - connects;
+    let new_messages = stat(&nodes[0], "cluster_stats_messages_sent") - sent;
+    // Five peers, five seconds: 25 pings, on connections already open.
+    assert!(new_messages >= 20, "{new_messages} messages sent");
+    assert!(
+        new_connects <= 2,
+        "{new_connects} connections opened in 5 s"
+    );
+
+    nodes[3].restart();
+    wait_cluster_ok(&nodes.iter().collect::<Vec<_>>(), 6);
+    wait_until(
+        "the restarted node to be heard from again",
+        Duration::from_secs(20),
+        || {
+            let id = nodes[3].id();
+            nodes[0]
+                .conn()
+                .cmd(&["CLUSTER", "NODES"])
+                .text()
+                .lines()
+                .find(|l| l.starts_with(&id))
+                .is_some_and(|l| !l.contains("fail"))
+        },
+    );
 }
 
 /// `cluster-bus-secret`: nodes that share it form a cluster; a node with
@@ -1113,6 +1448,332 @@ fn failover_promotes_the_replica_and_the_old_master_rejoins_as_a_replica() {
     assert_eq!(c.cmd(&["GET", &key]).text(), "after-failover");
 }
 
+/// After a failover, the failed master's other replica carries on from the
+/// new master by a partial resync, not a full one (#109): the new master
+/// keeps the old stream's id as its second, and has kept, as a replica, the
+/// stream it read.
+#[test]
+fn after_a_failover_the_other_replica_is_continued_not_resynced() {
+    let (mut nodes, ranges) = form_cluster(3);
+    let a = add_replica(&nodes, &nodes[0]);
+    let b = add_replica(&nodes, &nodes[0]);
+    {
+        let all: Vec<&Node> = nodes.iter().chain([&a, &b]).collect();
+        wait_cluster_ok(&all, 5);
+    }
+    let range = ranges[0].0..=ranges[0].1;
+    let keys: Vec<String> = (0..200)
+        .map(|i| key_in(range.clone(), &format!("cont{i}")))
+        .collect();
+    for k in &keys {
+        assert!(nodes[0].conn().cmd(&["SET", k, "before"]).is_ok());
+    }
+    assert_eq!(nodes[0].conn().cmd(&["WAIT", "2", "5000"]).int(), 2);
+    let old_id = nodes[0].repl_info("master_replid").unwrap();
+
+    nodes[0].kill();
+    wait_until("a replica to be promoted", Duration::from_secs(40), || {
+        a.is_master() || b.is_master()
+    });
+    let (winner, other) = if a.is_master() { (&a, &b) } else { (&b, &a) };
+    // The cluster view says master a moment before replication does.
+    wait_until(
+        "the new master to keep the old stream's id",
+        Duration::from_secs(10),
+        || winner.repl_info("master_replid2").as_deref() == Some(old_id.as_str()),
+    );
+    // Writes on the new master before the other replica is back with it.
+    assert!(winner.conn().cmd(&["SET", &keys[0], "after"]).is_ok());
+
+    wait_until(
+        "the other replica to follow the new master",
+        Duration::from_secs(40),
+        || {
+            other.repl_info("master_link_status").as_deref() == Some("up")
+                && other.my_row()[3] == winner.id()
+        },
+    );
+    let stats = winner.conn().cmd(&["INFO", "stats"]).text();
+    assert_eq!(
+        info_field(&stats, "sync_full").as_deref(),
+        Some("0"),
+        "{stats}"
+    );
+    assert_eq!(
+        info_field(&stats, "sync_partial_ok").as_deref(),
+        Some("1"),
+        "{stats}"
+    );
+    wait_until(
+        "the write after the failover to arrive",
+        Duration::from_secs(10),
+        || {
+            let mut c = other.conn();
+            c.cmd(&["READONLY"]);
+            c.cmd(&["GET", &keys[0]]).text() == "after"
+        },
+    );
+    let mut c = other.conn();
+    assert!(c.cmd(&["READONLY"]).is_ok());
+    for k in &keys[1..] {
+        assert_eq!(c.cmd(&["GET", k]).text(), "before", "{k}");
+    }
+}
+
+/// With two replicas, the one that has read further wins the election
+/// (#107). Replica B is stopped while writes go on, the master dies, and B
+/// comes back behind: it asks A how far A has read, and stands a second
+/// later. Before, either could win, and B winning lost the writes it missed.
+#[test]
+fn the_replica_that_read_further_wins_the_election() {
+    let (mut nodes, ranges) = form_cluster(3);
+    let a = add_replica(&nodes, &nodes[0]);
+    let mut b = add_replica(&nodes, &nodes[0]);
+    {
+        let all: Vec<&Node> = nodes.iter().chain([&a, &b]).collect();
+        wait_cluster_ok(&all, 5);
+    }
+
+    b.kill();
+    let range = ranges[0].0..=ranges[0].1;
+    let keys: Vec<String> = (0..50)
+        .map(|i| key_in(range.clone(), &format!("rank{i}")))
+        .collect();
+    for k in &keys {
+        assert!(nodes[0].conn().cmd(&["SET", k, "v"]).is_ok());
+    }
+    assert_eq!(nodes[0].conn().cmd(&["WAIT", "1", "5000"]).int(), 1);
+
+    nodes[0].kill();
+    b.spawn();
+    wait_until("a replica to be promoted", Duration::from_secs(40), || {
+        a.is_master() || b.is_master()
+    });
+    assert!(
+        a.is_master() && !b.is_master(),
+        "the replica that had read further must win"
+    );
+    for k in &keys {
+        assert_eq!(a.conn().cmd(&["GET", k]).text(), "v", "{k}");
+    }
+}
+
+/// Eight masters with two replicas each: once settled, heartbeats open no new
+/// bus connections. When a master dies, one of its replicas takes over with
+/// the highest config epoch, the other follows it, and the old master rejoins
+/// as a replica.
+#[test]
+#[ignore = "starts 24 nodes"]
+fn a_24_node_cluster_fails_over_and_the_old_master_rejoins() {
+    const MASTERS: usize = 8;
+    const REPLICAS_PER_MASTER: usize = 2;
+    const VICTIM: usize = 3;
+    const NODES: usize = MASTERS * (1 + REPLICAS_PER_MASTER);
+    let (mut masters, mut ranges) = form_cluster(MASTERS);
+    let mut replicas = Vec::new();
+    for master in &masters {
+        for _ in 0..REPLICAS_PER_MASTER {
+            replicas.push(add_replica(&masters, master));
+        }
+    }
+    let nodes_of = |n: &Node| n.conn().cmd(&["CLUSTER", "NODES"]).text();
+    fn row<'a>(nodes: &'a str, id: &str) -> Option<Vec<&'a str>> {
+        nodes
+            .lines()
+            .find(|l| l.starts_with(id))
+            .map(|l| l.split(' ').collect())
+    }
+    let epoch = |n: &Node| -> u64 { n.my_row()[6].parse().unwrap() };
+    {
+        let all: Vec<&Node> = masters.iter().chain(&replicas).collect();
+        wait_cluster_ok(&all, NODES);
+        let pairs: Vec<(String, String)> = replicas
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.id(), masters[i / REPLICAS_PER_MASTER].id()))
+            .collect();
+        wait_until(
+            "every node to agree on who replicates whom",
+            Duration::from_secs(30),
+            || {
+                all.iter().all(|n| {
+                    let nodes = nodes_of(n);
+                    pairs.iter().all(|(replica, master)| {
+                        row(&nodes, replica)
+                            .is_some_and(|r| r[2].contains("slave") && r[3] == master)
+                    })
+                })
+            },
+        );
+        wait_until(
+            "the masters to have distinct config epochs",
+            Duration::from_secs(15),
+            || {
+                let mut epochs: Vec<u64> = masters.iter().map(epoch).collect();
+                epochs.sort_unstable();
+                epochs.dedup();
+                epochs.len() == MASTERS
+            },
+        );
+
+        // Measured before the failover, which rightly redials the dead node.
+        let total = |f: &str| -> u64 {
+            all.iter()
+                .map(|n| n.cluster_info(f).parse::<u64>().unwrap_or(0))
+                .sum()
+        };
+        // Let every link come up.
+        std::thread::sleep(Duration::from_secs(2));
+        let (connects, sent) = (
+            total("cluster_stats_bus_connects"),
+            total("cluster_stats_messages_sent"),
+        );
+        std::thread::sleep(Duration::from_secs(5));
+        let new_connects = total("cluster_stats_bus_connects") - connects;
+        let new_messages = total("cluster_stats_messages_sent") - sent;
+        assert!(
+            new_messages >= (NODES * (NODES - 1)) as u64,
+            "{new_messages} messages sent in 5 s"
+        );
+        assert!(
+            new_connects <= 2,
+            "{new_connects} connections opened in 5 s"
+        );
+    }
+
+    let (start, end) = ranges.remove(VICTIM);
+    let keys: Vec<String> = (0..100)
+        .map(|i| key_in(start..=end, &format!("big{i}")))
+        .collect();
+    let mut writer = masters[VICTIM].conn();
+    for k in &keys {
+        assert!(writer.cmd(&["SET", k, "v"]).is_ok());
+    }
+    let wait = REPLICAS_PER_MASTER.to_string();
+    assert_eq!(
+        writer.cmd(&["WAIT", &wait, "5000"]).int(),
+        REPLICAS_PER_MASTER as i64
+    );
+    let its_replicas = VICTIM * REPLICAS_PER_MASTER..(VICTIM + 1) * REPLICAS_PER_MASTER;
+    for replica in &replicas[its_replicas.clone()] {
+        let mut c = replica.conn();
+        assert!(c.cmd(&["READONLY"]).is_ok());
+        for k in &keys {
+            assert_eq!(c.cmd(&["GET", k]).text(), "v", "{k}");
+        }
+    }
+
+    let mut victim = masters.remove(VICTIM);
+    let pair: Vec<Node> = replicas.drain(its_replicas).collect();
+    let elsewhere: Vec<String> = ranges.iter().map(|r| key_in(r.0..=r.1, "kept")).collect();
+    for (m, k) in masters.iter().zip(&elsewhere) {
+        assert!(m.conn().cmd(&["SET", k, "v"]).is_ok());
+    }
+    let victim_id = victim.id();
+    let survivors: Vec<&Node> = masters.iter().chain(&replicas).chain(&pair).collect();
+
+    victim.kill();
+    let killed = Instant::now();
+    wait_until(
+        "every survivor to mark the master FAIL",
+        Duration::from_secs(30),
+        || {
+            survivors.iter().all(|n| {
+                row(&nodes_of(n), &victim_id).is_some_and(|r| r[2].split(',').any(|f| f == "fail"))
+            })
+        },
+    );
+    let detected = killed.elapsed();
+    wait_until("a replica to be promoted", Duration::from_secs(30), || {
+        pair.iter().any(Node::is_master)
+    });
+    let promoted = killed.elapsed();
+    let (winner, other) = if pair[0].is_master() {
+        (&pair[0], &pair[1])
+    } else {
+        (&pair[1], &pair[0])
+    };
+    let moved = format!("MOVED {} 127.0.0.1:{}", slot_of(&keys[0]), winner.port);
+    wait_until(
+        "every survivor to be up and send the slot to the new master",
+        Duration::from_secs(30),
+        || {
+            survivors.iter().all(|n| {
+                n.cluster_info("cluster_state") == "ok"
+                    && (n.port == winner.port
+                        || n.conn().cmd(&["GET", &keys[0]]).err() == Some(moved.as_str()))
+            })
+        },
+    );
+    let recovered = killed.elapsed();
+    eprintln!(
+        "24 nodes: FAIL everywhere after {detected:?}, replica promoted after {promoted:?}, \
+         cluster up after {recovered:?}"
+    );
+
+    assert!(!other.is_master(), "only one replica is promoted");
+    let won_at = epoch(winner);
+    for m in &masters {
+        let at = epoch(m);
+        assert!(
+            at < won_at,
+            "{} is at config epoch {at}, the new master at {won_at}",
+            m.port
+        );
+    }
+    assert_eq!(winner.my_row()[8..], [format!("{start}-{end}")]);
+    for k in &keys {
+        assert_eq!(winner.conn().cmd(&["GET", k]).text(), "v", "{k}");
+    }
+    for (m, k) in masters.iter().zip(&elsewhere) {
+        assert_eq!(m.conn().cmd(&["GET", k]).text(), "v", "{k}");
+    }
+    assert!(winner.conn().cmd(&["SET", &keys[0], "after"]).is_ok());
+
+    wait_until(
+        "the other replica to follow the new master",
+        Duration::from_secs(40),
+        || {
+            other.repl_info("master_link_status").as_deref() == Some("up")
+                && other.my_row()[3] == winner.id()
+        },
+    );
+    wait_until(
+        "the write after the failover to reach the other replica",
+        Duration::from_secs(10),
+        || {
+            let mut c = other.conn();
+            c.cmd(&["READONLY"]);
+            c.cmd(&["GET", &keys[0]]).text() == "after"
+        },
+    );
+
+    victim.spawn();
+    wait_until(
+        "the old master to rejoin as a replica of the new one",
+        Duration::from_secs(40),
+        || {
+            !victim.is_master()
+                && victim.repl_info("master_link_status").as_deref() == Some("up")
+                && victim.my_row()[3] == winner.id()
+        },
+    );
+    wait_until(
+        "FAIL to be cleared everywhere",
+        Duration::from_secs(20),
+        || {
+            survivors
+                .iter()
+                .all(|n| row(&nodes_of(n), &victim_id).is_some_and(|r| !r[2].contains("fail")))
+        },
+    );
+    let mut c = victim.conn();
+    assert!(c.cmd(&["READONLY"]).is_ok());
+    assert_eq!(c.cmd(&["GET", &keys[0]]).text(), "after");
+    let all: Vec<&Node> = survivors.into_iter().chain([&victim]).collect();
+    wait_cluster_ok(&all, NODES);
+}
+
 /// `CLUSTER FAILOVER` on a replica of a healthy master swaps the two, and no
 /// write the master acknowledged is lost in the handover.
 #[test]
@@ -1125,33 +1786,8 @@ fn manual_failover_swaps_roles_without_losing_acknowledged_writes() {
     }
     let key = key_in(ranges[0].0..=ranges[0].1, "m");
 
-    // A writer that follows redirects and counts only acknowledged INCRs.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let writer = {
-        let stop = std::sync::Arc::clone(&stop);
-        let key = key.clone();
-        let ports = [nodes[0].port, replica.port];
-        std::thread::spawn(move || {
-            let mut acked = 0i64;
-            let mut target = 0usize;
-            let mut conn = Conn::connect(ports[target]);
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                match conn.try_cmd(&["INCR", &key]) {
-                    Ok(Resp::Int(_)) => acked += 1,
-                    // Redirected, read-only, paused or dropped: not
-                    // acknowledged. Try the other node.
-                    _ => {
-                        target = 1 - target;
-                        std::thread::sleep(Duration::from_millis(5));
-                        if let Some(c) = Conn::try_connect(ports[target]) {
-                            conn = c;
-                        }
-                    }
-                }
-            }
-            acked
-        })
-    };
+    let writer = counting_writer(&stop, &key, [nodes[0].port, replica.port]);
 
     std::thread::sleep(Duration::from_millis(500));
     let reply = replica.conn().cmd(&["CLUSTER", "FAILOVER"]);
@@ -1188,6 +1824,102 @@ fn manual_failover_swaps_roles_without_losing_acknowledged_writes() {
     // A failover against a master is refused.
     let reply = replica.conn().cmd(&["CLUSTER", "FAILOVER"]);
     assert!(reply.err().is_some_and(|e| e.contains("replica")));
+}
+
+/// A writer that INCRs `key` until `stop`, follows redirects between the two
+/// `ports`, and counts only the INCRs acknowledged.
+fn counting_writer(
+    stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    key: &str,
+    ports: [u16; 2],
+) -> std::thread::JoinHandle<i64> {
+    let stop = std::sync::Arc::clone(stop);
+    let key = key.to_string();
+    std::thread::spawn(move || {
+        let mut acked = 0i64;
+        let mut target = 0usize;
+        let mut conn = Conn::connect(ports[target]);
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            match conn.try_cmd(&["INCR", &key]) {
+                Ok(Resp::Int(_)) => acked += 1,
+                // Redirected, read-only, paused or dropped: not
+                // acknowledged. Try the other node.
+                _ => {
+                    target = 1 - target;
+                    std::thread::sleep(Duration::from_millis(5));
+                    if let Some(c) = Conn::try_connect(ports[target]) {
+                        conn = c;
+                    }
+                }
+            }
+        }
+        acked
+    })
+}
+
+/// A manual failover whose election outlasts the time it has loses no write
+/// the master acknowledged (#185). The votes reach the replica 6 s late, as
+/// they do from voters whose disks are slow to sync them. The master used to
+/// hold writes for 5 s and the replica to take over whenever it won: so the
+/// master took writes again, and those it acknowledged between the replica's
+/// promotion and its own hearing of it were lost. Now the master holds
+/// writes for twice as long as the replica has to win in, and a replica that
+/// has not won in that time gives the failover up.
+#[test]
+fn a_manual_failover_that_runs_out_of_time_loses_no_acknowledged_write() {
+    let (nodes, ranges) = form_cluster(3);
+    let replica = add_replica_with_env(&nodes, &nodes[0], &[("KIVIDB_TEST_VOTE_DELAY_MS", "6000")]);
+    {
+        let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+        wait_cluster_ok(&all, 4);
+    }
+    let key = key_in(ranges[0].0..=ranges[0].1, "late");
+
+    // Several writers, for more writes in whatever window there is.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writers: Vec<_> = (0..4)
+        .map(|_| counting_writer(&stop, &key, [nodes[0].port, replica.port]))
+        .collect();
+
+    std::thread::sleep(Duration::from_millis(500));
+    let reply = replica.conn().cmd(&["CLUSTER", "FAILOVER"]);
+    assert!(reply.is_ok(), "CLUSTER FAILOVER: {reply:?}");
+
+    // Past the late votes and the master's hold on writes, whichever way
+    // the failover went; then until the shard has one master again, and its
+    // replica follows it.
+    std::thread::sleep(Duration::from_secs(11));
+    let master_and_replica = || {
+        if replica.is_master() {
+            (&replica, &nodes[0])
+        } else {
+            (&nodes[0], &replica)
+        }
+    };
+    wait_until(
+        "one master for the shard, followed by the other node",
+        Duration::from_secs(30),
+        || {
+            let (master, follower) = master_and_replica();
+            !follower.is_master()
+                && master.is_master()
+                && follower.repl_info("master_link_status").as_deref() == Some("up")
+        },
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let acked: i64 = writers.into_iter().map(|w| w.join().unwrap()).sum();
+    assert!(acked > 0, "the writers never got a write through");
+
+    // Not equal, necessarily: an INCR held by the pause for longer than the
+    // client waits is applied, but was never acknowledged.
+    let (master, _) = master_and_replica();
+    let value: i64 = master.conn().cmd(&["GET", &key]).text().parse().unwrap();
+    assert!(
+        value >= acked,
+        "{} acknowledged INCRs lost: the counter is {value}, {acked} were acknowledged",
+        acked - value
+    );
 }
 
 // ── Resharding ────────────────────────────────────────────────────────────────
@@ -1315,6 +2047,85 @@ fn migrate_moves_a_slot_with_every_type_and_ttl() {
 // ── Atomic slot migration (CLUSTER MIGRATION) ─────────────────────────────────
 
 /// One field of a task from `CLUSTER MIGRATION STATUS`.
+/// The destination of an import goes down before it takes the slots over:
+/// what it had received is deleted when it comes back, and the source still
+/// serves all of it (#108). It used to stay: unreachable (MOVED), but in
+/// DBSIZE, KEYS and snapshots, and live again if the slots came back.
+#[test]
+fn keys_of_an_import_cut_short_by_a_restart_are_dropped() {
+    let (mut nodes, _) = form_cluster(2);
+    let mut s = nodes[0].conn();
+    let big = "x".repeat(20_000);
+    let mut inside: Vec<String> = Vec::new();
+    for i in 0..6000 {
+        let key = format!("big:{i}");
+        if slot_of(&key) <= 4000 {
+            assert!(s.cmd(&["SET", &key, &big]).is_ok());
+            inside.push(key);
+        }
+    }
+
+    // What arrives has to outlive the restart, as it does with an AOF.
+    let mut d = nodes[1].conn();
+    assert!(d.cmd(&["CONFIG", "SET", "appendonly", "yes"]).is_ok());
+    assert!(d.cmd(&["CONFIG", "REWRITE"]).is_ok());
+    wait_until("the AOF to be on", Duration::from_secs(20), || {
+        d.cmd(&["INFO", "persistence"])
+            .text()
+            .contains("aof_rewrite_in_progress:0")
+    });
+    let task_id = d
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "4000"])
+        .text();
+    wait_until("some keys to arrive", Duration::from_secs(20), || {
+        d.cmd(&["DBSIZE"]).int() > 200
+    });
+    // Long enough for the AOF to have them on disk (fsync every second).
+    std::thread::sleep(Duration::from_millis(1500));
+    nodes[1].kill();
+    let first = slot_of(&inside[0]).to_string();
+    if s.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &first]).int() == 0 {
+        // Quick enough to take the slots over first: nothing to check.
+        return;
+    }
+    let _ = task_id;
+
+    nodes[1].spawn();
+    let mut d = nodes[1].conn();
+    wait_until(
+        "the restarted destination to drop the partial import",
+        Duration::from_secs(30),
+        || d.cmd(&["DBSIZE"]).int() == 0,
+    );
+    // The source has it all, and the cluster agrees it owns it.
+    for key in inside.iter().step_by(13) {
+        assert_eq!(s.cmd(&["STRLEN", key]).int(), 20_000, "{key}");
+    }
+    let reply = d.cmd(&["GET", &inside[0]]);
+    assert!(
+        reply.err().is_some_and(|e| e.starts_with("MOVED")),
+        "{reply:?}"
+    );
+    // And a later import of the same slots starts from nothing and completes.
+    let again = d
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "4000"])
+        .text();
+    wait_until(
+        "the second import to complete",
+        Duration::from_secs(60),
+        || {
+            let status = d.cmd(&["CLUSTER", "MIGRATION", "STATUS", "ID", &again]);
+            status
+                .array()
+                .first()
+                .is_some_and(|task| task_field(task, "state").text() == "completed")
+        },
+    );
+    for key in inside.iter().step_by(13) {
+        assert_eq!(d.cmd(&["STRLEN", key]).int(), 20_000, "{key}");
+    }
+}
+
 fn task_field(task: &Resp, name: &str) -> Resp {
     task.array()
         .chunks(2)
@@ -1753,6 +2564,29 @@ fn keys_of_a_slot_lost_to_another_master_are_dropped() {
 // ── Pub/Sub ───────────────────────────────────────────────────────────────────
 
 /// A message published on one node reaches a subscriber connected to another.
+/// `SSUBSCRIBE` is routed by its channel's slot, as in Redis: `MOVED` from a
+/// node that does not have it, `CROSSSLOT` for channels of two slots. It
+/// succeeded anywhere (#161).
+#[test]
+fn ssubscribe_is_routed_by_slot() {
+    let (nodes, ranges) = form_cluster(2);
+    let mine = key_in(ranges[0].0..=ranges[0].1, "chan");
+    let theirs = key_in(ranges[1].0..=ranges[1].1, "chan");
+    let mut c = nodes[0].conn();
+    let reply = c.cmd(&["SSUBSCRIBE", &theirs]);
+    assert!(
+        reply.err().is_some_and(|e| e.starts_with("MOVED")),
+        "{reply:?}"
+    );
+    let reply = c.cmd(&["SSUBSCRIBE", &mine, &theirs]);
+    assert!(
+        reply.err().is_some_and(|e| e.starts_with("CROSSSLOT")),
+        "{reply:?}"
+    );
+    let reply = c.cmd(&["SSUBSCRIBE", &mine]);
+    assert_eq!(reply.array()[0].text(), "ssubscribe", "{reply:?}");
+}
+
 #[test]
 fn publish_reaches_subscribers_on_other_nodes() {
     let (nodes, _) = form_cluster(3);
@@ -2597,4 +3431,167 @@ fn nodes_talk_to_each_other_as_masteruser_with_default_limited() {
     );
     let found = admin(&nodes[3]).cmd(&["FT.SEARCH", "docs", "hello", "NOCONTENT"]);
     assert_eq!(found.array()[0].int(), 3, "{found:?}");
+}
+
+/// A shard that runs out of time tells the coordinator, which applies
+/// `ON_TIMEOUT`: `fail` is an error, `return` a partial reply. RESP3 puts
+/// the warning on the coordinator's reply; over RESP2 there is none.
+/// Documents are loaded until a 1 ms search times out, then four times as
+/// many again, so that a fast host does not finish the queries after it.
+#[test]
+fn a_timed_out_search_is_reported_across_the_cluster() {
+    let (nodes, ranges) = form_cluster(3);
+    let owner = |key: &str| {
+        let slot = slot_of(key);
+        ranges
+            .iter()
+            .position(|(a, b)| (*a..=*b).contains(&slot))
+            .unwrap()
+    };
+    let r = nodes[0].conn().cmd(&[
+        "FT.CREATE",
+        "to",
+        "PREFIX",
+        "1",
+        "to:",
+        "SCHEMA",
+        "t",
+        "TEXT",
+    ]);
+    assert!(r.is_ok(), "{r:?}");
+
+    let insert = |start: usize, n: usize| {
+        let mut buckets: Vec<Vec<String>> = vec![Vec::new(); nodes.len()];
+        for i in start..start + n {
+            let key = format!("to:{i}");
+            let node = owner(&key);
+            buckets[node].push(key);
+        }
+        for (i, keys) in buckets.iter().enumerate() {
+            if keys.is_empty() {
+                continue;
+            }
+            let mut c = nodes[i].conn();
+            for chunk in keys.chunks(250) {
+                let cmds: Vec<Vec<&str>> = chunk
+                    .iter()
+                    .map(|k| vec!["HSET", k.as_str(), "t", "x"])
+                    .collect();
+                for r in c.pipeline(&cmds) {
+                    assert!(matches!(r, Resp::Int(_)), "{r:?}");
+                }
+            }
+        }
+    };
+
+    let warned = |reply: &Resp| {
+        reply.map().iter().any(|(k, v)| {
+            k.text() == "warning"
+                && v.array()
+                    .iter()
+                    .any(|w| w.text().contains("Timeout limit was reached"))
+        })
+    };
+
+    let mut n = 0usize;
+    let mut timed_out = false;
+    while n < 200_000 {
+        insert(n, 8_000);
+        n += 8_000;
+        let mut c = nodes[0].conn();
+        let hello = c.cmd(&["HELLO", "3"]);
+        assert!(matches!(hello, Resp::Map(_)), "{hello:?}");
+        // Twice in a row: one search held up by the host, not by its
+        // documents, is not the size to grow from.
+        let mut late = || {
+            let reply = c.cmd(&["FT.SEARCH", "to", "*", "NOCONTENT", "TIMEOUT", "1"]);
+            warned(&reply)
+        };
+        if late() && late() {
+            timed_out = true;
+            break;
+        }
+    }
+    assert!(
+        timed_out,
+        "TIMEOUT 1 still finished after {n} documents across the cluster"
+    );
+    insert(n, 4 * n);
+    n *= 5;
+
+    // No limit: every master's part, whole.
+    let mut c = nodes[1].conn();
+    let all = c.cmd(&[
+        "FT.SEARCH",
+        "to",
+        "*",
+        "NOCONTENT",
+        "LIMIT",
+        "0",
+        "0",
+        "TIMEOUT",
+        "0",
+    ]);
+    assert_eq!(all.array()[0].int(), n as i64, "{all:?}");
+    let count = |c: &mut Conn, timeout: &str| {
+        c.cmd(&[
+            "FT.AGGREGATE",
+            "to",
+            "*",
+            "TIMEOUT",
+            timeout,
+            "GROUPBY",
+            "0",
+            "REDUCE",
+            "COUNT",
+            "0",
+            "AS",
+            "c",
+        ])
+    };
+    let all = count(&mut c, "0");
+    assert_eq!(all.array()[1].array()[1].text(), n.to_string(), "{all:?}");
+
+    assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "fail"]).is_ok());
+    let failed = c.cmd(&["FT.SEARCH", "to", "*", "TIMEOUT", "1"]);
+    assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "return"]).is_ok());
+    assert!(
+        failed
+            .err()
+            .is_some_and(|e| e.contains("Timeout limit was reached")),
+        "{failed:?}"
+    );
+
+    assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "fail"]).is_ok());
+    let failed = count(&mut c, "1");
+    assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "return"]).is_ok());
+    assert!(
+        failed
+            .err()
+            .is_some_and(|e| e.contains("Timeout limit was reached")),
+        "{failed:?}"
+    );
+
+    let mut c = nodes[2].conn();
+    let hello = c.cmd(&["HELLO", "3"]);
+    assert!(matches!(hello, Resp::Map(_)), "{hello:?}");
+    let reply = c.cmd(&["FT.SEARCH", "to", "*", "NOCONTENT", "TIMEOUT", "1"]);
+    assert!(warned(&reply), "{reply:?}");
+    let reply = count(&mut c, "1");
+    assert!(warned(&reply), "{reply:?}");
+
+    // Over RESP2: a count short of the whole, and no error.
+    let mut c = nodes[0].conn();
+    let reply = c.cmd(&[
+        "FT.SEARCH",
+        "to",
+        "*",
+        "NOCONTENT",
+        "LIMIT",
+        "0",
+        "0",
+        "TIMEOUT",
+        "1",
+    ]);
+    assert!(reply.array()[0].int() < n as i64, "{reply:?}");
 }

@@ -938,9 +938,66 @@ fn test_latency_no_subcommand_is_error() {
 // LATENCY — sample population and entry structure
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// After issuing commands, LATENCY LATEST must contain at least one event.
-// threshold=0 — fast commands still cross the slowlog threshold, so the server
-// records latency samples (see latency.record gating in server paths).
+/// A command the latency monitor records: one that takes at least
+/// `latency-monitor-threshold`, which it now goes by, and not
+/// `slowlog-log-slower-than` (#158). The threshold is the process's; it is
+/// left set.
+fn slow_command(c: &mut Conn) {
+    c.cmd(&["CONFIG", "SET", "latency-monitor-threshold", "1"]);
+    c.cmd(&["DEBUG", "SLEEP", "0.005"]);
+}
+
+/// What monitoring reads, as Redis gives it (#158): the latency monitor goes
+/// by `latency-monitor-threshold`, `LATENCY LATEST` has the maximum as a
+/// fourth field, `LATENCY HELP` answers, `INFO latencystats` has each
+/// command's percentiles, and `INFO server` says what it runs on.
+#[test]
+fn monitoring_sees_what_redis_shows() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    slow_command(&mut c);
+    c.cmd(&["DEBUG", "SLEEP", "0.002"]);
+    let latest = c.cmd(&["LATENCY", "LATEST"]);
+    let command = latest
+        .as_array()
+        .iter()
+        .map(|entry| entry.as_array())
+        .find(|entry| entry[0].as_str() == "command")
+        .unwrap_or_else(|| panic!("no command event: {latest:?}"));
+    let (last, most) = (command[2].as_int(), command[3].as_int());
+    assert!(most >= 5 && most >= last, "{latest:?}");
+
+    assert!(c.cmd(&["LATENCY", "HELP"]).as_array().len() > 4);
+
+    c.cmd(&["GET", "nothing"]);
+    let stats = c.cmd(&["INFO", "latencystats"]);
+    let get = stats
+        .as_str()
+        .lines()
+        .find(|line| line.starts_with("latency_percentiles_usec_get:"))
+        .unwrap_or_else(|| panic!("{}", stats.as_str()));
+    assert!(
+        get.contains("p50=") && get.contains("p99=") && get.contains("p99.9="),
+        "{get}"
+    );
+
+    let server = c.cmd(&["INFO", "server"]);
+    let field = |name: &str| {
+        server
+            .as_str()
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}:")))
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert!(["epoll", "io_uring", "iocp", "kqueue"].contains(&field("multiplexing_api").as_str()));
+    assert!(!field("executable").is_empty());
+    assert_ne!(field("executable"), "/usr/local/bin/kividb");
+}
+
+// After a slow command, LATENCY LATEST must contain at least one event.
 #[test]
 fn test_latency_latest_populates_after_commands() {
     let port = free_port();
@@ -948,9 +1005,7 @@ fn test_latency_latest_populates_after_commands() {
     let mut c = Conn::connect(port);
 
     c.cmd(&["LATENCY", "RESET"]);
-    for i in 0..20u32 {
-        c.cmd(&["SET", &format!("lat_{i}"), "v"]);
-    }
+    slow_command(&mut c);
 
     let latest = c.cmd(&["LATENCY", "LATEST"]);
     assert!(
@@ -959,24 +1014,23 @@ fn test_latency_latest_populates_after_commands() {
     );
 }
 
-// Each entry in LATENCY LATEST has exactly 3 fields: name, timestamp, latency_ms.
+// Each entry in LATENCY LATEST has 4 fields, as in Redis: name, timestamp,
+// latest ms, most ms (#158).
 #[test]
 fn test_latency_latest_entry_has_three_fields() {
     let port = free_port();
     start_server_log_all(port);
     let mut c = Conn::connect(port);
 
-    for i in 0..10u32 {
-        c.cmd(&["SET", &format!("struct_{i}"), "v"]);
-    }
+    slow_command(&mut c);
 
     let latest = c.cmd(&["LATENCY", "LATEST"]);
     for entry in latest.as_array() {
         assert!(entry.is_array());
         assert_eq!(
             entry.as_array().len(),
-            3,
-            "each LATENCY LATEST entry must have 3 fields [name, ts, ms]: {:?}",
+            4,
+            "each LATENCY LATEST entry must have 4 fields [name, ts, ms, max]: {:?}",
             entry
         );
     }
@@ -989,9 +1043,7 @@ fn test_latency_latest_event_names_are_valid() {
     start_server_log_all(port);
     let mut c = Conn::connect(port);
 
-    for i in 0..15u32 {
-        c.cmd(&["SET", &format!("names_{i}"), "v"]);
-    }
+    slow_command(&mut c);
 
     let latest = c.cmd(&["LATENCY", "LATEST"]);
     for entry in latest.as_array() {
@@ -1168,16 +1220,11 @@ fn test_latency_graph_returns_string_for_known_event() {
     start_server_log_all(port);
     let mut c = Conn::connect(port);
 
-    for i in 0..20u32 {
-        c.cmd(&["SET", &format!("graph_{i}"), "v"]);
-    }
+    slow_command(&mut c);
 
     let latest = c.cmd(&["LATENCY", "LATEST"]);
     let events = latest.as_array();
-    assert!(
-        !events.is_empty(),
-        "need latency samples for GRAPH test (use threshold=0 server)"
-    );
+    assert!(!events.is_empty(), "need latency samples for GRAPH test");
 
     let event_name = events[0].as_array()[0].as_str().to_string();
     let graph = c.cmd(&["LATENCY", "GRAPH", &event_name]);
@@ -1201,16 +1248,11 @@ fn test_latency_graph_is_redis_s_ascii_graph() {
     start_server_log_all(port);
     let mut c = Conn::connect(port);
 
-    for i in 0..20u32 {
-        c.cmd(&["SET", &format!("spark_{i}"), "v"]);
-    }
+    slow_command(&mut c);
 
     let latest = c.cmd(&["LATENCY", "LATEST"]);
     let events = latest.as_array();
-    assert!(
-        !events.is_empty(),
-        "need latency samples for GRAPH test (use threshold=0 server)"
-    );
+    assert!(!events.is_empty(), "need latency samples for GRAPH test");
 
     let event_name = events[0].as_array()[0].as_str().to_string();
     let graph = c.cmd(&["LATENCY", "GRAPH", &event_name]);

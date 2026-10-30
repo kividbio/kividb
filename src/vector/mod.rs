@@ -1,4 +1,6 @@
 pub mod filter;
+pub mod simd;
+use crate::store::ValueRef;
 use ahash::{AHashMap, AHashSet};
 use parking_lot::RwLock;
 use rand::Rng;
@@ -676,9 +678,123 @@ pub struct IndexDef {
     pub inverted: Arc<RwLock<AHashMap<String, AHashSet<String>>>>,
     //                                     ^^^^^^  ^^^^^^^^^^^^^^^^^^
     //                                     token   set of doc keys containing it
+    /// What each document's TEXT fields put into the inverted index and the
+    /// statistics above, by key and field, stopwords left out: what is taken
+    /// back out when a field is written again or the document goes. Without
+    /// it nothing was: an update added a document's words again, a delete
+    /// left them counted, and BM25 scores drifted until a restart (#162).
+    pub forward: Arc<RwLock<ForwardIndex>>,
 }
 
+/// By document key, by TEXT field: the words it put in (see
+/// [`IndexDef::forward`]).
+pub type ForwardIndex = AHashMap<String, AHashMap<String, Vec<String>>>;
+
 impl IndexDef {
+    /// Make `tokens` — stopwords already left out — what TEXT field `field`
+    /// of the document at `key` holds: the inverted index, the vocabulary
+    /// and the BM25 statistics become what they would be had the document
+    /// always held them.
+    pub fn set_text(&self, key: &str, field: &str, tokens: Vec<String>) {
+        self.change_text(key, |fields| {
+            if tokens.is_empty() {
+                fields.remove(field);
+            } else {
+                fields.insert(field.to_string(), tokens);
+            }
+        });
+    }
+
+    /// The document at `key` is gone: take out everything its TEXT fields
+    /// put in.
+    pub fn remove_text(&self, key: &str) {
+        self.change_text(key, |fields| fields.clear());
+    }
+
+    fn change_text(&self, key: &str, change: impl FnOnce(&mut AHashMap<String, Vec<String>>)) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut forward = self.forward.write();
+        let old = forward.remove(key).unwrap_or_default();
+        let mut new = old.clone();
+        change(&mut new);
+        if old.is_empty() && new.is_empty() {
+            return;
+        }
+        let words = |fields: &AHashMap<String, Vec<String>>| -> (usize, AHashSet<String>) {
+            let total = fields.values().map(Vec::len).sum();
+            let unique = fields.values().flatten().cloned().collect();
+            (total, unique)
+        };
+        let postings = |fields: &AHashMap<String, Vec<String>>| -> AHashSet<String> {
+            fields
+                .iter()
+                .flat_map(|(field, tokens)| tokens.iter().map(move |t| format!("{field}\x00{t}")))
+                .collect()
+        };
+        let (old_total, old_unique) = words(&old);
+        let (new_total, new_unique) = words(&new);
+        let (old_postings, new_postings) = (postings(&old), postings(&new));
+        {
+            let mut inverted = self.inverted.write();
+            for gone in old_postings.difference(&new_postings) {
+                if let Some(set) = inverted.get_mut(gone) {
+                    set.remove(key);
+                    if set.is_empty() {
+                        inverted.remove(gone);
+                    }
+                }
+            }
+            for came in new_postings.difference(&old_postings) {
+                inverted
+                    .entry(came.clone())
+                    .or_default()
+                    .insert(key.to_string());
+            }
+        }
+        {
+            let mut doc_freq = self.doc_freq.write();
+            for gone in old_unique.difference(&new_unique) {
+                if let Some(n) = doc_freq.get_mut(gone) {
+                    *n = n.saturating_sub(1);
+                    if *n == 0 {
+                        doc_freq.remove(gone);
+                    }
+                }
+            }
+            for came in new_unique.difference(&old_unique) {
+                *doc_freq.entry(came.clone()).or_insert(0) += 1;
+            }
+        }
+        if !new_unique.is_empty() {
+            let mut vocab = self.vocab.write();
+            for word in &new_unique {
+                if !vocab.contains(word) {
+                    vocab.insert(word.clone());
+                }
+            }
+        }
+        // Only changed here, under the forward index's lock: a load and a
+        // store do not race.
+        match (old_total > 0, new_total > 0) {
+            (false, true) => {
+                self.doc_count.fetch_add(1, Relaxed);
+            }
+            (true, false) => {
+                let n = self.doc_count.load(Relaxed);
+                self.doc_count.store(n.saturating_sub(1), Relaxed);
+            }
+            _ => {}
+        }
+        let tokens = self.total_tokens.load(Relaxed);
+        self.total_tokens.store(
+            tokens.saturating_sub(old_total).saturating_add(new_total),
+            Relaxed,
+        );
+        if !new.is_empty() {
+            forward.insert(key.to_string(), new);
+        }
+    }
+
     /// Whether `token` is one of this index's stopwords.
     pub fn is_stopword(&self, token: &str) -> bool {
         match &self.stopwords {
@@ -865,6 +981,7 @@ impl IndexSchema {
             total_tokens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             doc_freq: Arc::new(RwLock::new(AHashMap::new())),
             inverted: Arc::new(RwLock::new(AHashMap::new())),
+            forward: Arc::new(RwLock::new(AHashMap::new())),
         }
     }
 }
@@ -889,23 +1006,10 @@ pub fn backfill_text_fields(db: &crate::store::Db, def: &IndexDef, fields: &[Str
                 let Some(text) = inner.get(field).and_then(|b| std::str::from_utf8(b).ok()) else {
                     continue;
                 };
-                let tokens: AHashSet<String> = tokenize_for_vocab(text)
+                let tokens: Vec<String> = tokenize_for_vocab(text)
                     .filter(|tok| !def.is_stopword(tok))
                     .collect();
-                if tokens.is_empty() {
-                    continue;
-                }
-                let mut vocab = def.vocab.write();
-                let mut inverted = def.inverted.write();
-                let mut doc_freq = def.doc_freq.write();
-                for token in tokens {
-                    inverted
-                        .entry(format!("{field}\x00{token}"))
-                        .or_default()
-                        .insert(key.to_string());
-                    *doc_freq.entry(token.clone()).or_insert(0) += 1;
-                    vocab.insert(token);
-                }
+                def.set_text(key, field, tokens);
             }
         }
     }
@@ -1016,43 +1120,14 @@ pub fn backfill_from_db_progress(
                 }
             }
 
-            if !text_field_names.is_empty() {
-                let mut field_tokens: Vec<(String, String)> = Vec::new();
-                for fname in &text_field_names {
-                    if let Some(raw) = inner.get(fname)
-                        && let Ok(s) = std::str::from_utf8(raw)
-                    {
-                        for tok in tokenize_for_vocab(s) {
-                            field_tokens.push((fname.clone(), tok));
-                        }
-                    }
-                }
-                field_tokens.retain(|(_, tok)| !def.is_stopword(tok));
-                if !field_tokens.is_empty() {
-                    {
-                        let mut vocab = def.vocab.write();
-                        for (_, tok) in &field_tokens {
-                            vocab.insert(tok.clone());
-                        }
-                    }
-                    {
-                        let mut inv = def.inverted.write();
-                        for (field_name, tok) in &field_tokens {
-                            let inv_key = format!("{}\x00{}", field_name, tok);
-                            inv.entry(inv_key).or_default().insert(key.to_string());
-                        }
-                    }
-                    let token_count = field_tokens.len();
-                    let unique_terms: AHashSet<&str> =
-                        field_tokens.iter().map(|(_, tok)| tok.as_str()).collect();
-                    def.doc_count.fetch_add(1, Relaxed);
-                    def.total_tokens.fetch_add(token_count, Relaxed);
-                    {
-                        let mut df = def.doc_freq.write();
-                        for term in unique_terms {
-                            *df.entry(term.to_string()).or_insert(0) += 1;
-                        }
-                    }
+            for fname in &text_field_names {
+                if let Some(raw) = inner.get(fname)
+                    && let Ok(s) = std::str::from_utf8(raw)
+                {
+                    let tokens: Vec<String> = tokenize_for_vocab(s)
+                        .filter(|tok| !def.is_stopword(tok))
+                        .collect();
+                    def.set_text(key, fname, tokens);
                 }
             }
         }
@@ -1393,12 +1468,12 @@ impl std::ops::Deref for DocFields<'_> {
 }
 
 /// Whether `value` is the kind of document an index `ON on` covers.
-pub fn is_document(on: &IndexOn, value: &crate::types::KiviDBValue) -> bool {
+pub fn is_document(on: &IndexOn, value: crate::store::ValueRef<'_>) -> bool {
     matches!(
         (on, value),
-        (IndexOn::Hash, crate::types::KiviDBValue::Hash(_))
-            | (IndexOn::Hash, crate::types::KiviDBValue::HashEx(_))
-            | (IndexOn::Json, crate::types::KiviDBValue::Json(_))
+        (IndexOn::Hash, crate::store::ValueRef::Hash(_))
+            | (IndexOn::Hash, crate::store::ValueRef::HashEx(_))
+            | (IndexOn::Json, crate::store::ValueRef::Json(_))
     )
 }
 
@@ -1407,18 +1482,16 @@ pub fn is_document(on: &IndexOn, value: &crate::types::KiviDBValue) -> bool {
 pub fn doc_fields<'a>(
     on: &IndexOn,
     schema: &[SchemaField],
-    value: &'a crate::types::KiviDBValue,
+    value: crate::store::ValueRef<'a>,
 ) -> Option<DocFields<'a>> {
     match (on, value) {
-        (IndexOn::Hash, crate::types::KiviDBValue::Hash(hash)) => {
-            Some(DocFields::Hash(hash.read()))
-        }
+        (IndexOn::Hash, crate::store::ValueRef::Hash(hash)) => Some(DocFields::Hash(hash.read())),
         // A hash is no less a document for one of its fields having a TTL:
         // it used to drop out of every query the moment one was given one.
-        (IndexOn::Hash, crate::types::KiviDBValue::HashEx(hash)) => {
+        (IndexOn::Hash, crate::store::ValueRef::HashEx(hash)) => {
             Some(DocFields::HashEx(hash.read()))
         }
-        (IndexOn::Json, crate::types::KiviDBValue::Json(doc)) => {
+        (IndexOn::Json, crate::store::ValueRef::Json(doc)) => {
             Some(DocFields::Json(project_json(schema, &doc.read())))
         }
         _ => None,
@@ -1578,7 +1651,10 @@ pub fn reindex_hash_key(index_store: &IndexStore, db: &crate::store::Db, key: &s
     {
         return;
     }
-    let value = crate::store::get_shard(db, key).read().get(key).cloned();
+    let value = crate::store::get_shard(db, key)
+        .read()
+        .get(key)
+        .map(ValueRef::to_value);
     let pairs: Vec<(String, Arc<[u8]>)> = match value {
         Some(crate::types::KiviDBValue::Hash(hash)) => hash
             .read()
@@ -1599,7 +1675,10 @@ pub fn reindex_json_key(index_store: &IndexStore, db: &crate::store::Db, key: &s
     {
         return;
     }
-    let value = crate::store::get_shard(db, key).read().get(key).cloned();
+    let value = crate::store::get_shard(db, key)
+        .read()
+        .get(key)
+        .map(ValueRef::to_value);
     if let Some(crate::types::KiviDBValue::Json(doc)) = value {
         maybe_index_json(index_store, key, &doc.read());
     }
@@ -1630,80 +1709,28 @@ pub fn maybe_index(index_store: &IndexStore, key: &str, fields: &[(String, Arc<[
 /// fields, and its vectors.
 fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)]) {
     {
-        // ── Update spell-check vocab and BM25 corpus statistics ─────────────
+        // ── Spell-check vocabulary, inverted index, BM25 statistics ─────────
         //
-        // One pass over the TEXT fields per document:
-        //   - collect all tokens (existing behaviour for vocab)
-        //   - count unique terms (for doc_freq — "how many docs contain this term")
-        //   - count total tokens (for total_tokens — feeds avgdl)
-        //
-        // We batch all writes: one vocab write-lock, one doc_freq write-lock,
-        // two atomic adds. No per-token lock churn.
-
-        // Collect (field_name, token) pairs so the inverted index can be keyed
-        // per field. Vocab gets all tokens regardless of field.
-        let mut field_tokens: Vec<(String, String)> = Vec::new();
+        // Each TEXT field written replaces what it held before: its words,
+        // stopwords left out (see `IndexDef::set_text`).
         for f in &def.fields {
             if !matches!(f.field_type, FieldType::Text) || f.options.noindex {
                 continue;
             }
-            let raw = match fields.iter().find(|(n, _)| n == &f.name) {
-                Some((_, b)) => b,
-                None => continue,
+            let Some((_, raw)) = fields.iter().find(|(n, _)| n == &f.name) else {
+                continue;
             };
-            let s = match std::str::from_utf8(raw) {
-                Ok(s) => s,
-                Err(_) => continue,
+            let tokens: Vec<String> = match std::str::from_utf8(raw) {
+                Ok(s) => tokenize_for_vocab(s)
+                    .filter(|tok| !def.is_stopword(tok))
+                    .collect(),
+                Err(_) => Vec::new(),
             };
-            for tok in tokenize_for_vocab(s) {
-                field_tokens.push((f.name.clone(), tok));
-            }
+            def.set_text(key, &f.name, tokens);
         }
+    }
 
-        // Strip stopwords before writing to any index structure.
-        // Done once here so vocab, inverted index, and BM25 stats are all
-        // consistent — none of them ever see stopwords.
-        field_tokens.retain(|(_, tok)| !def.is_stopword(tok));
-
-        if !field_tokens.is_empty() {
-            // Vocab — all tokens, field-agnostic
-            {
-                let mut vocab = def.vocab.write();
-                for (_, tok) in &field_tokens {
-                    vocab.insert(tok.clone());
-                }
-            }
-
-            // Inverted index — keyed by "fieldname\x00token"
-            {
-                let mut inv = def.inverted.write();
-                for (field_name, tok) in &field_tokens {
-                    let inv_key = format!("{}\x00{}", field_name, tok);
-                    inv.entry(inv_key).or_default().insert(key.to_string());
-                }
-            }
-
-            // BM25 corpus statistics — updated once per document per HSET.
-            // doc_count and total_tokens are atomics (no lock needed on the write path).
-            // doc_freq needs a write lock but we batch all term updates under one lock
-            // acquisition.
-            let token_count = field_tokens.len();
-            let unique_terms: ahash::AHashSet<&str> =
-                field_tokens.iter().map(|(_, tok)| tok.as_str()).collect();
-
-            def.doc_count
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            def.total_tokens
-                .fetch_add(token_count, std::sync::atomic::Ordering::Relaxed);
-
-            {
-                let mut df = def.doc_freq.write();
-                for term in unique_terms {
-                    *df.entry(term.to_string()).or_insert(0) += 1;
-                }
-            }
-        }
-
+    {
         // ── Update live vector indexes ────────────────────────────────────────
         //
         // Walk every VECTOR field in this index's schema. Each one may have
@@ -1742,28 +1769,18 @@ fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)]) {
 
 // ── Distance functions ───────────────────────────────────────────────────────
 //
-// L2 and inner product use the scalar implementation. The compiler's
-// auto-vectorizer handles these well-shaped iterator chains.
-//
-// Cosine uses an explicit NEON path on aarch64 — the multi-accumulator
-// pattern (dot + |a|^2 + |b|^2 in parallel) is what the auto-vectorizer
-// has trouble matching, so manual intrinsics give a real speedup here.
+// Each is one pass of a kernel in `simd`: AVX-512, AVX2 with FMA, or NEON,
+// picked at run time, or eight independent sums where there is none. The
+// sequential `iter().map().sum()` these replace could not be vectorised: the
+// compiler may not reorder float additions.
 
 pub fn dist_l2_sq(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| {
-            let d = x - y;
-            d * d
-        })
-        .sum()
+    simd::l2_sq(a, b)
 }
 
 pub fn dist_cosine(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let mag_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let mag_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let denom = mag_a * mag_b;
+    let (dot, na, nb) = simd::dot_norms(a, b);
+    let denom = na.sqrt() * nb.sqrt();
     if denom == 0.0 {
         return 1.0;
     }
@@ -1771,8 +1788,7 @@ pub fn dist_cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 pub fn dist_ip(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    1.0 - dot
+    1.0 - simd::dot(a, b)
 }
 
 pub fn distance(metric: &DistanceMetric, a: &[f32], b: &[f32]) -> f32 {
@@ -1788,7 +1804,7 @@ pub fn distance(metric: &DistanceMetric, a: &[f32], b: &[f32]) -> f32 {
 /// denominator is always 1.0 and we skip the two sqrt() calls entirely.
 /// For L2 and InnerProduct the behaviour is identical to `distance`.
 #[inline(always)]
-fn distance_prenorm(metric: &DistanceMetric, a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn distance_prenorm(metric: &DistanceMetric, a: &[f32], b: &[f32]) -> f32 {
     match metric {
         DistanceMetric::Cosine => dist_ip(a, b), // |a|=|b|=1 → 1 – dot(a,b)
         DistanceMetric::L2 => dist_l2_sq(a, b),
@@ -1797,12 +1813,61 @@ fn distance_prenorm(metric: &DistanceMetric, a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Normalize a vector to unit length in-place (for cosine ingestion).
-fn normalize_to_unit(v: Vec<f32>) -> Vec<f32> {
-    let mag: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+fn normalize_to_unit(mut v: Vec<f32>) -> Vec<f32> {
+    let mag = simd::norm_sq(&v).sqrt();
     if mag > 0.0 {
-        v.into_iter().map(|x| x / mag).collect()
-    } else {
-        v
+        for x in &mut v {
+            *x /= mag;
+        }
+    }
+    v
+}
+
+/// A query made ready to be measured against many stored vectors: for a
+/// cosine, scaled to unit length once, so that each distance after is one
+/// pass that leaves out the query's own norm.
+pub struct PreparedQuery<'a> {
+    metric: &'a DistanceMetric,
+    vector: std::borrow::Cow<'a, [f32]>,
+}
+
+impl<'a> PreparedQuery<'a> {
+    pub fn new(metric: &'a DistanceMetric, query: &'a [f32]) -> Self {
+        let vector = match metric {
+            DistanceMetric::Cosine => std::borrow::Cow::Owned(normalize_to_unit(query.to_vec())),
+            _ => std::borrow::Cow::Borrowed(query),
+        };
+        Self { metric, vector }
+    }
+
+    /// The query as it is measured: of unit length for a cosine.
+    pub fn vector(&self) -> &[f32] {
+        &self.vector
+    }
+
+    /// The distance to a vector stored as it was given (a FLAT index):
+    /// what [`distance`] gives on the query as it was.
+    #[inline]
+    pub fn to_raw(&self, stored: &[f32]) -> f32 {
+        match self.metric {
+            DistanceMetric::Cosine => {
+                let (dot, nb) = simd::dot_norm_b(&self.vector, stored);
+                if nb == 0.0 {
+                    // A zero vector on either side, as `dist_cosine` has it.
+                    return 1.0;
+                }
+                1.0 - dot / nb.sqrt()
+            }
+            DistanceMetric::L2 => dist_l2_sq(&self.vector, stored),
+            DistanceMetric::InnerProduct => dist_ip(&self.vector, stored),
+        }
+    }
+
+    /// The distance to a vector an HNSW graph holds: of unit length for a
+    /// cosine.
+    #[inline]
+    pub fn to_unit(&self, stored: &[f32]) -> f32 {
+        distance_prenorm(self.metric, &self.vector, stored)
     }
 }
 
@@ -1847,11 +1912,12 @@ pub fn knn_flat(
     // Collect all distances first, then partial-sort.
     // Avoids the heap tie-breaking problem entirely.
     let vectors = index.vectors.read();
+    let prepared = PreparedQuery::new(metric, query);
 
     let mut scored: Vec<(f32, &str)> = vectors
         .iter()
         .filter(|(_, vec)| vec.len() == query.len())
-        .map(|(key, vec)| (distance(metric, query, vec), key.as_str()))
+        .map(|(key, vec)| (prepared.to_raw(vec), key.as_str()))
         .collect();
 
     // partial_sort_unstable would be ideal but isn't in std.
@@ -2460,23 +2526,10 @@ pub fn maybe_unindex(index_store: &IndexStore, key: &str) {
             continue;
         }
 
-        // Remove from inverted index — walk every posting list and remove
-        // this key. We don't know which tokens this doc contributed, so we
-        // scan the whole map. This is O(unique_tokens_in_corpus) on delete,
-        // which is acceptable: deletes are rare compared to reads, and
-        // posting lists shrink correctly.
-        //
-        // Alternative: maintain a forward index (key → [tokens]) to make
-        // this O(tokens_in_doc). Add that later if delete-heavy workloads
-        // appear in benchmarks.
-        {
-            let mut inv = def.inverted.write();
-            inv.values_mut().for_each(|set| {
-                set.remove(key);
-            });
-            // Drop empty posting lists to keep memory bounded
-            inv.retain(|_, set| !set.is_empty());
-        }
+        // What its TEXT fields put in comes out: the words it held, from the
+        // inverted index and the BM25 statistics. It used to walk every
+        // posting list, and leave the statistics as they were.
+        def.remove_text(key);
 
         // Tombstone the key in every VECTOR field's live index.
         // The HSET-equivalent inserts into one or more of these; deletion
@@ -2664,7 +2717,7 @@ pub fn compact_hnsw(
             for (key, value) in map.iter() {
                 let matches =
                     prefixes.is_empty() || prefixes.iter().any(|p| key.starts_with(p.as_str()));
-                if !matches || already.contains(key.as_str()) {
+                if !matches || already.contains(key) {
                     continue;
                 }
                 let Some(inner) = doc_fields(&doc_on, &doc_schema, value) else {
@@ -2772,6 +2825,84 @@ pub fn maybe_request_compaction(
                 field_name: field_name.clone(),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod prepared_query_tests {
+    use super::*;
+
+    fn vector(dim: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..dim)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state >> 40) as f32 / (1u64 << 24) as f32) * 4.0 - 2.0
+            })
+            .collect()
+    }
+
+    /// The scalar code the kernels replaced.
+    fn scalar_cosine(a: &[f32], b: &[f32]) -> f32 {
+        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let ma = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let mb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if ma * mb == 0.0 {
+            return 1.0;
+        }
+        1.0 - dot / (ma * mb)
+    }
+
+    #[test]
+    fn a_prepared_query_measures_what_distance_does() {
+        let metrics = [
+            DistanceMetric::Cosine,
+            DistanceMetric::L2,
+            DistanceMetric::InnerProduct,
+        ];
+        for dim in [1usize, 3, 7, 8, 15, 16, 25, 128, 512, 1536, 2048] {
+            let q = vector(dim, dim as u64);
+            let s = vector(dim, 7 + dim as u64);
+            for metric in &metrics {
+                let prepared = PreparedQuery::new(metric, &q);
+                let want = distance(metric, &q, &s);
+                let tol = 1e-4 * want.abs().max(1.0) * (dim as f32).sqrt();
+                let got = prepared.to_raw(&s);
+                assert!(
+                    (got - want).abs() <= tol,
+                    "{metric:?} {dim}: {got} vs {want}"
+                );
+            }
+            // Against a vector the graph holds: of unit length for a cosine.
+            let cosine = DistanceMetric::Cosine;
+            let unit = normalize_to_unit(s.clone());
+            let got = PreparedQuery::new(&cosine, &q).to_unit(&unit);
+            let want = scalar_cosine(&q, &s);
+            assert!(
+                (got - want).abs() <= 1e-5,
+                "unit cosine {dim}: {got} vs {want}"
+            );
+            assert!(
+                (dist_cosine(&q, &s) - want).abs() <= 1e-5,
+                "dist_cosine {dim}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_vector_is_at_cosine_distance_one() {
+        let cosine = DistanceMetric::Cosine;
+        let zero = vec![0.0f32; 16];
+        let v = vector(16, 3);
+        assert_eq!(dist_cosine(&zero, &v), 1.0);
+        assert_eq!(PreparedQuery::new(&cosine, &zero).to_raw(&v), 1.0);
+        assert_eq!(PreparedQuery::new(&cosine, &v).to_raw(&zero), 1.0);
+        assert_eq!(
+            PreparedQuery::new(&cosine, &zero).to_unit(&normalize_to_unit(v)),
+            1.0
+        );
     }
 }
 

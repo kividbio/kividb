@@ -211,7 +211,10 @@ pub(crate) fn run_on(
     let mut steps = 0;
     if !password.is_empty() {
         out.extend(if user.is_empty() {
-            encode(&[b"AUTH", password.as_bytes()])
+            // As the default user, by name: `AUTH <password>` is refused by a
+            // node that has no password (#135), and with the name it logs in as
+            // before.
+            encode(&[b"AUTH", b"default", password.as_bytes()])
         } else {
             encode(&[b"AUTH", user.as_bytes(), password.as_bytes()])
         });

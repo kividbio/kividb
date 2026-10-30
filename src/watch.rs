@@ -182,6 +182,49 @@ pub fn new_watch_registry() -> WatchRegistry {
     Arc::new(WatchRegistryInner::new())
 }
 
+/// The watches of the server whose store is `.0`, for what writes to it
+/// without a connection of its own: a replica applying its master's stream.
+/// A client watching a key on the replica sees the master's writes to it
+/// (#159); it saw none.
+pub struct ForStore<'a>(pub &'a crate::store::Store);
+
+impl ForStore<'_> {
+    fn registry(&self) -> Option<WatchRegistry> {
+        if WATCHES.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        let id = store_id(self.0);
+        REGISTRIES
+            .read()
+            .iter()
+            .find(|(known, _)| *known == id)
+            .and_then(|(_, registry)| registry.upgrade())
+    }
+}
+
+impl WatchNotifier for ForStore<'_> {
+    fn watch(&self, _db: usize, _key: &str, _flag: Arc<AtomicBool>) {}
+    fn notify(&self, db: usize, key: &str) {
+        if let Some(registry) = self.registry() {
+            registry.notify(db, key);
+        }
+    }
+    fn unwatch_all(&self, _flags: &[Arc<AtomicBool>]) {}
+    fn has_watchers(&self) -> bool {
+        WATCHES.load(Ordering::Relaxed) > 0
+    }
+    fn notify_db(&self, db: Option<usize>) {
+        if let Some(registry) = self.registry() {
+            registry.notify_db(db);
+        }
+    }
+    fn notify_existing(&self, db: Option<usize>, exists: &dyn Fn(usize, &str) -> bool) {
+        if let Some(registry) = self.registry() {
+            registry.notify_existing(db, exists);
+        }
+    }
+}
+
 // ── No-op implementation — used by replication ────────────────────────────
 
 pub struct NoopWatchRegistry;

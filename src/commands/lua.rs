@@ -20,12 +20,176 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+/// Redis's `struct` library (Roberto Ierusalimschy's lua_struct):
+/// `struct.pack`, `struct.unpack`, `struct.size`, on Lua 5.4's `string.pack`,
+/// one item at a time, so that `c0` (a string as long as the value before it)
+/// works (#154). Its formats as Redis's: `s` is a zero-terminated string,
+/// `l`, `L` and `T` are 8 bytes, `c` alone is one byte, numbers given for
+/// integers are cut to integers. The chunk returns the library.
+const STRUCT_LIBRARY: &str = r##"
+local struct = {}
+local function struct_items(fmt)
+    local items, at = {}, 1
+    while at <= #fmt do
+        local option = fmt:sub(at, at)
+        local size = fmt:match("^%d+", at + 1) or ""
+        at = at + 1 + #size
+        items[#items + 1] = { option, size }
+    end
+    return items
+end
+local struct_plain = {}
+for option in ("xbBhHiIfd"):gmatch(".") do struct_plain[option] = true end
+local function struct_option(option, size)
+    if option == "s" then return "z" end
+    if option == "l" then return "i8" end
+    if option == "L" or option == "T" then return "I8" end
+    if option == "c" then return "c" .. (size == "" and "1" or size) end
+    if struct_plain[option] then return option .. size end
+    error("invalid format option '" .. option .. "'")
+end
+local function struct_integer(value)
+    local n = tonumber(value)
+    if n == nil then error("bad argument to 'pack' (number expected)") end
+    return math.tointeger(n) or (n >= 0 and math.floor(n) or math.ceil(n))
+end
+local function struct_state(option)
+    return option == "<" or option == ">" or option == "=" or option == "!"
+end
+struct.pack = function(fmt, ...)
+    local values, next_value, state, out = table.pack(...), 1, "", {}
+    for _, item in ipairs(struct_items(fmt)) do
+        local option, size = item[1], item[2]
+        if struct_state(option) then
+            state = state .. option .. size
+        elseif option == " " then
+        elseif option == "x" then
+            out[#out + 1] = string.pack(state .. "x" .. size)
+        elseif option == "c" and size == "0" then
+            out[#out + 1] = tostring(values[next_value])
+            next_value = next_value + 1
+        else
+            local value = values[next_value]
+            next_value = next_value + 1
+            if option == "s" or option == "c" then
+                value = tostring(value)
+            elseif option ~= "f" and option ~= "d" then
+                value = struct_integer(value)
+            end
+            out[#out + 1] = string.pack(state .. struct_option(option, size), value)
+        end
+    end
+    return table.concat(out)
+end
+struct.unpack = function(fmt, data, at)
+    at = at or 1
+    local state, out, last = "", {}, nil
+    for _, item in ipairs(struct_items(fmt)) do
+        local option, size = item[1], item[2]
+        if struct_state(option) then
+            state = state .. option .. size
+        elseif option == " " then
+        elseif option == "x" then
+            at = string.unpack(state .. "x" .. size, data, at)
+        elseif option == "c" and size == "0" then
+            local length = math.tointeger(last)
+            if length == nil then error("format 'c0' needs a previous size") end
+            if at + length - 1 > #data then error("data string too short") end
+            last = data:sub(at, at + length - 1)
+            out[#out + 1] = last
+            at = at + length
+        else
+            local value
+            value, at = string.unpack(state .. struct_option(option, size), data, at)
+            out[#out + 1] = value
+            last = value
+        end
+    end
+    out[#out + 1] = at
+    return table.unpack(out)
+end
+struct.size = function(fmt)
+    local state, total = "", 0
+    for _, item in ipairs(struct_items(fmt)) do
+        local option, size = item[1], item[2]
+        if struct_state(option) then
+            state = state .. option .. size
+        elseif option == "s" or (option == "c" and size == "0") then
+            error("options 'c0' - 's' have undefined sizes")
+        elseif option ~= " " then
+            total = total + string.packsize(state .. struct_option(option, size))
+        end
+    end
+    return total
+end
+return struct
+"##;
+
 /// Scripts by SHA1. A source is shared with whoever runs it: scripts are a
 /// few kilobytes each, and one was copied whole for every call.
 static SCRIPT_STORE: OnceLock<RwLock<HashMap<String, Arc<str>>>> = OnceLock::new();
 
 fn script_store() -> &'static RwLock<HashMap<String, Arc<str>>> {
     SCRIPT_STORE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// How many scripts sent only with `EVAL` the cache keeps, as Redis 7.4:
+/// past this, the least recently used goes. A client that writes its values
+/// into the script, rather than passing them as arguments, grew the cache
+/// for ever (#155). `SCRIPT LOAD`ed scripts are not counted, and stay.
+const EVAL_SCRIPTS_MAX: usize = 500;
+
+/// The scripts sent only with `EVAL`, by when they were last run.
+#[derive(Default)]
+struct EvalScripts {
+    by_use: std::collections::BTreeMap<u64, String>,
+    last_used: HashMap<String, u64>,
+    clock: u64,
+}
+
+static EVAL_SCRIPTS: std::sync::LazyLock<parking_lot::Mutex<EvalScripts>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// A script `EVAL` has just put in the cache: counted, and the least
+/// recently used let go past [`EVAL_SCRIPTS_MAX`].
+fn eval_script_added(sha: &str) {
+    let mut scripts = EVAL_SCRIPTS.lock();
+    scripts.clock += 1;
+    let now = scripts.clock;
+    if let Some(was) = scripts.last_used.insert(sha.to_string(), now) {
+        scripts.by_use.remove(&was);
+    }
+    scripts.by_use.insert(now, sha.to_string());
+    while scripts.by_use.len() > EVAL_SCRIPTS_MAX {
+        let Some((_, oldest)) = scripts.by_use.pop_first() else {
+            break;
+        };
+        scripts.last_used.remove(&oldest);
+        script_store().write().remove(&oldest);
+        crate::stats::EVICTED_SCRIPTS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A cached script has been run: if it is one `EVAL` sent, it is now the most
+/// recently used.
+fn eval_script_used(sha: &str) {
+    let mut scripts = EVAL_SCRIPTS.lock();
+    let Some(was) = scripts.last_used.get(sha).copied() else {
+        return;
+    };
+    scripts.clock += 1;
+    let now = scripts.clock;
+    scripts.by_use.remove(&was);
+    scripts.by_use.insert(now, sha.to_string());
+    scripts.last_used.insert(sha.to_string(), now);
+}
+
+/// `SCRIPT LOAD` of a script: kept from now on, whatever `EVAL` sent.
+fn eval_script_loaded(sha: &str) {
+    let mut scripts = EVAL_SCRIPTS.lock();
+    if let Some(was) = scripts.last_used.remove(sha) {
+        scripts.by_use.remove(&was);
+    }
 }
 
 /// Whether a script's first line is a shebang with the `no-writes` flag.
@@ -37,6 +201,21 @@ pub(crate) fn script_declares_no_writes(source: &[u8]) -> bool {
                 .filter_map(|word| word.strip_prefix("flags="))
                 .any(|flags| flags.split(',').any(|flag| flag.trim() == "no-writes"))
         })
+}
+
+/// Whether a script says it may write: a shebang without `no-writes`. One
+/// with no shebang says nothing, and runs on a replica until it writes.
+pub(crate) fn script_declares_writes(source: &[u8]) -> bool {
+    source.starts_with(b"#!") && !script_declares_no_writes(source)
+}
+
+/// [`script_declares_writes`] of the cached script with this SHA1.
+pub(crate) fn cached_script_declares_writes(sha: &[u8]) -> bool {
+    let sha = String::from_utf8_lossy(sha).to_ascii_lowercase();
+    script_store()
+        .read()
+        .get(&sha)
+        .is_some_and(|source| script_declares_writes(source.as_bytes()))
 }
 
 /// The same, of the cached script with this SHA1.
@@ -187,6 +366,11 @@ static LUA_HOLD_DEPTH: AtomicUsize = AtomicUsize::new(0);
 static LUA_SCRIPT_BUSY_OTHERS: AtomicBool = AtomicBool::new(false);
 /// Unix ms at which the script now holding the VM took it.
 static LUA_SCRIPT_STARTED_MS: AtomicU64 = AtomicU64::new(0);
+/// Whether the script now holding the VM has written. `SCRIPT KILL` comes
+/// from another client, on another thread, and the script's own note of it
+/// is in its thread's [`SCRIPT_EVAL`]: read there, it was always no, and a
+/// script that had written was answered OK and ran on (#129).
+static LUA_HOLDER_WROTE: AtomicBool = AtomicBool::new(false);
 /// Bytes the functions' VM held when it was last let go: `INFO`'s
 /// `used_memory_vm_functions`, read without waiting for a running script.
 static FUNCTIONS_VM_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -680,6 +864,12 @@ struct ScriptEval {
     had_shebang: bool,
     /// `#!lua flags=no-writes` — exempt from NOREPLICAS on read-only `redis.call`.
     no_writes_flag: bool,
+    /// `allow-cross-slot-keys`: in a cluster, `redis.call` may use keys of
+    /// other slots than the script's, as long as this node serves them.
+    allow_cross_slot: bool,
+    /// In a cluster, the slot the script works in: its first key's, from
+    /// `KEYS`, or else the first key a `redis.call` used.
+    slot: Option<u16>,
 }
 
 thread_local! {
@@ -714,6 +904,30 @@ pub(crate) fn script_eval_script_resp() -> Option<u8> {
 #[inline]
 pub(crate) fn script_allow_oom() -> bool {
     SCRIPT_EVAL.with(|c| c.borrow().as_ref().is_some_and(|s| s.allow_oom))
+}
+
+/// The running script's slot, and whether it may use keys of other slots
+/// (see [`ScriptEval::slot`]); `None` outside a script.
+pub(crate) fn script_slot() -> Option<(Option<u16>, bool)> {
+    SCRIPT_EVAL.with(|c| c.borrow().as_ref().map(|s| (s.slot, s.allow_cross_slot)))
+}
+
+/// Make `slot` the running script's slot, if it has none yet.
+pub(crate) fn script_settle_slot(slot: u16) {
+    SCRIPT_EVAL.with(|c| {
+        if let Some(s) = c.borrow_mut().as_mut() {
+            s.slot.get_or_insert(slot);
+        }
+    });
+}
+
+/// The slot of a script's first key, in a cluster: where the command that
+/// runs it was routed.
+fn first_key_slot(ctx: &Ctx, first_key: Option<&[u8]>) -> Option<u16> {
+    if !ctx.cluster.enabled {
+        return None;
+    }
+    first_key.map(crate::cluster::slot::key_hash_slot)
 }
 
 /// Redis `min-slaves-to-write` / `min-replicas-to-write` gate for nested `redis.call`.
@@ -783,6 +997,7 @@ where
     let prev = LUA_HOLD_DEPTH.fetch_add(1, Ordering::SeqCst);
     if prev == 0 {
         LUA_SCRIPT_STARTED_MS.store(crate::replication::unix_ms(), Ordering::Relaxed);
+        LUA_HOLDER_WROTE.store(false, Ordering::SeqCst);
         LUA_SCRIPT_BUSY_OTHERS.store(true, Ordering::SeqCst);
     }
     struct OuterDepth;
@@ -950,6 +1165,10 @@ pub(crate) fn script_note_successful_write() {
             se.wrote = true;
         }
     });
+    // The script holding the shared VM: for `SCRIPT KILL`, from elsewhere.
+    if EXEC_LUA.with(|c| c.borrow().is_some()) {
+        LUA_HOLDER_WROTE.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Commands that run or compile the Lua VM for long stretches — must not block a Tokio worker
@@ -1069,8 +1288,7 @@ fn dispatch_lua_script_kill() -> Vec<u8> {
     if LUA_HOLD_DEPTH.load(Ordering::SeqCst) == 0 {
         return resp_error("ERR No scripts in execution.");
     }
-    let wrote = SCRIPT_EVAL.with(|c| c.borrow().as_ref().map(|s| s.wrote).unwrap_or(false));
-    if wrote {
+    if LUA_HOLDER_WROTE.load(Ordering::SeqCst) {
         return resp_error(
             "UNKILLABLE Sorry the script already executed write commands against the dataset.",
         );
@@ -1534,10 +1752,76 @@ fn new_lua_vm() -> Lua {
         .set("REDIS_VERSION_NUM", (8i64 << 16) | (10 << 8))
         .unwrap();
 
+    // To the server's log, at Redis's level for it; it did nothing (#154).
     let log_fn = lua
-        .create_function(|_, _args: LuaMultiValue| Ok(()))
+        .create_function(|_, args: LuaMultiValue| {
+            let mut args = args.into_iter();
+            let (Some(level), Some(first)) = (args.next(), args.next()) else {
+                return Err(LuaError::RuntimeError(
+                    "redis.log() requires two arguments or more.".into(),
+                ));
+            };
+            let level = match level {
+                LuaValue::Integer(0) => crate::loglevel::DEBUG,
+                LuaValue::Integer(1) => crate::loglevel::VERBOSE,
+                LuaValue::Integer(2) => crate::loglevel::INFO,
+                LuaValue::Integer(3) => crate::loglevel::WARN,
+                LuaValue::Number(n) if n.fract() == 0.0 && (0.0..=3.0).contains(&n) => [
+                    crate::loglevel::DEBUG,
+                    crate::loglevel::VERBOSE,
+                    crate::loglevel::INFO,
+                    crate::loglevel::WARN,
+                ][n as usize],
+                _ => return Err(LuaError::RuntimeError("Invalid debug level.".into())),
+            };
+            if !crate::loglevel::enabled(level) {
+                return Ok(());
+            }
+            // The arguments joined by spaces, as Redis writes them.
+            let text = |value: LuaValue| match value {
+                LuaValue::String(s) => s.to_string_lossy().to_string(),
+                LuaValue::Integer(n) => n.to_string(),
+                LuaValue::Number(n) => n.to_string(),
+                LuaValue::Boolean(b) => b.to_string(),
+                LuaValue::Nil => "nil".into(),
+                other => other.type_name().to_string(),
+            };
+            let line: Vec<String> = std::iter::once(first).chain(args).map(text).collect();
+            crate::log_at!(level, "{}", line.join(" "));
+            Ok(())
+        })
         .unwrap();
     redis_table.set("log", log_fn).unwrap();
+
+    // Before Redis 7, how a script asked to be replicated as its effects:
+    // here every script is, so it is true, as in Redis 7 (#154). A script
+    // that opens with it failed before doing anything.
+    let replicate_commands = lua.create_function(|_, _: LuaMultiValue| Ok(true)).unwrap();
+    redis_table
+        .set("replicate_commands", replicate_commands)
+        .unwrap();
+    redis_table.set("REPL_NONE", 0i64).unwrap();
+    redis_table.set("REPL_AOF", 1i64).unwrap();
+    redis_table.set("REPL_SLAVE", 2i64).unwrap();
+    redis_table.set("REPL_REPLICA", 2i64).unwrap();
+    redis_table.set("REPL_ALL", 3i64).unwrap();
+    // What a script's writes go to: everything, which is what KiviDB does.
+    // Keeping them from the AOF or the replicas is not supported, and is
+    // refused rather than ignored.
+    let set_repl = lua
+        .create_function(|_, flags: LuaValue| match flags {
+            LuaValue::Integer(3) => Ok(()),
+            LuaValue::Number(3.0) => Ok(()),
+            LuaValue::Integer(0..=2) | LuaValue::Number(_) => Err(LuaError::RuntimeError(
+                "redis.set_repl() other than REDIS.REPL_ALL is not supported by KiviDB".into(),
+            )),
+            _ => Err(LuaError::RuntimeError(
+                "Invalid replication flags. Use REPL_AOF, REPL_REPLICA, REPL_ALL or REPL_NONE."
+                    .into(),
+            )),
+        })
+        .unwrap();
+    redis_table.set("set_repl", set_repl).unwrap();
 
     let placeholder = lua
         .create_function(|_, _: LuaMultiValue| {
@@ -1884,13 +2168,37 @@ end
     .exec()
     .unwrap();
 
+    // Redis's `struct` library: see [`STRUCT_LIBRARY`]. Compiled into a VM
+    // the first time a script there reaches for it: every VM made it up
+    // front, and the functions VM held a third of a megabyte more.
+    let stub = lua.create_table().unwrap();
+    let meta = lua.create_table().unwrap();
+    meta.set(
+        "__index",
+        lua.create_function(|lua, (stub, key): (LuaTable, LuaValue)| {
+            let library: LuaTable = lua.load(STRUCT_LIBRARY).set_name("=struct").eval()?;
+            for pair in library.pairs::<LuaValue, LuaValue>() {
+                let (name, value) = pair?;
+                stub.raw_set(name, value)?;
+            }
+            stub.set_metatable(None);
+            stub.raw_get::<LuaValue>(key)
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    stub.set_metatable(Some(meta));
+    lua.globals().set("struct", stub).unwrap();
+
     // Lua 5.1 compat: `unpack` was a global; in 5.2+ it moved to `table.unpack`.
     // Redis's scripting environment re-exports it as a global, so scripts can use either form.
     lua.load("unpack = table.unpack").exec().unwrap();
 
-    // A table raised by `error` or `assert` is kept with its `err` and the
-    // line, as Redis's error handler reads one: see [`remember_error_table`].
-    // SAFETY: C functions that do what Lua's own `error` and `assert` do.
+    // A table raised by `error` is kept with its `err` and the line, as
+    // Redis's error handler reads one: see [`remember_error_table`]. `pcall`
+    // and `assert` are Redis's (#90).
+    // SAFETY: C functions that do what Lua's own `error`, Lua 5.1's `assert`
+    // and Redis's `pcall` do.
     unsafe {
         let globals = lua.globals();
         globals
@@ -1898,6 +2206,9 @@ end
             .unwrap();
         globals
             .set("assert", lua.create_c_function(script_assert).unwrap())
+            .unwrap();
+        globals
+            .set("pcall", lua.create_c_function(script_pcall).unwrap())
             .unwrap();
     }
 
@@ -3291,8 +3602,12 @@ fn eval(ctx: &mut Ctx, use_sha: bool, read_only: bool) -> Vec<u8> {
         } else {
             sha
         };
-        match script_store().read().get(sha).cloned() {
-            Some(src) => src,
+        let found = script_store().read().get(sha).cloned();
+        match found {
+            Some(src) => {
+                eval_script_used(sha);
+                src
+            }
             None => return resp_error("NOSCRIPT No matching script. Please use EVAL."),
         }
     } else {
@@ -3303,14 +3618,24 @@ fn eval(ctx: &mut Ctx, use_sha: bool, read_only: bool) -> Vec<u8> {
         // The stored copy, so that a script sent again and again is the one
         // already compiled (see `compiled_script`).
         let sha = sha1_hex(source);
-        if let Some(stored) = script_store().read().get(&sha).cloned() {
+        let stored = script_store().read().get(&sha).cloned();
+        if let Some(stored) = stored {
+            eval_script_used(&sha);
             stored
         } else {
-            script_store()
+            let mut added = false;
+            let stored = script_store()
                 .write()
-                .entry(sha)
-                .or_insert_with(|| Arc::from(source))
-                .clone()
+                .entry(sha.clone())
+                .or_insert_with(|| {
+                    added = true;
+                    Arc::from(source)
+                })
+                .clone();
+            if added {
+                eval_script_added(&sha);
+            }
+            stored
         }
     };
 
@@ -3417,8 +3742,8 @@ thread_local! {
     /// What [`remember_error_table`] kept of the table a script raised last
     /// on this thread: what `tostring` makes of it, then its message, marked.
     /// It lasts until the call it was raised in returns ([`table_errors`]),
-    /// or until `error` or `assert` raise another table, or a value that is
-    /// not a string with the place before it. A finalizer's raise is not
+    /// or until `error` raises another table, or a value that is not a
+    /// string with the place before it. A finalizer's raise is not
     /// kept ([`in_finalizer`]).
     static RAISED_TABLE: RefCell<Option<Box<str>>> = const { RefCell::new(None) };
     /// Whether [`RAISED_TABLE`] holds anything: a call that succeeds reads
@@ -3445,24 +3770,133 @@ unsafe extern "C-unwind" fn script_error(state: *mut mlua::ffi::lua_State) -> st
     }
 }
 
-/// `assert` in scripts: Lua's own (`luaB_assert`), with a table for its
-/// message kept as `error` keeps one.
+/// `assert` in scripts: Lua 5.1's, which Redis has (#90). Its message is a
+/// string or a number, given the place it was raised at, and
+/// `assertion failed!` without one; a table is refused.
 unsafe extern "C-unwind" fn script_assert(state: *mut mlua::ffi::lua_State) -> std::ffi::c_int {
     use mlua::ffi;
     unsafe {
         if ffi::lua_toboolean(state, 1) != 0 {
             return ffi::lua_gettop(state);
         }
-        ffi::luaL_checkany(state, 1);
-        ffi::lua_remove(state, 1);
-        ffi::lua_pushstring(state, c"assertion failed!".as_ptr());
-        ffi::lua_settop(state, 1);
-        raise_script_error(state, 1)
+        if ffi::lua_type(state, 1) == ffi::LUA_TNONE {
+            return ffi::luaL_error(
+                state,
+                c"bad argument #1 to '%s' (value expected)".as_ptr(),
+                called_as(state),
+            );
+        }
+        if ffi::lua_type(state, 2) > ffi::LUA_TNIL && ffi::lua_isstring(state, 2) == 0 {
+            return ffi::luaL_error(
+                state,
+                c"bad argument #2 to '%s' (string expected, got %s)".as_ptr(),
+                called_as(state),
+                ffi::luaL_typename(state, 2),
+            );
+        }
+        let message = ffi::luaL_optstring(state, 2, c"assertion failed!".as_ptr());
+        ffi::luaL_error(state, c"%s".as_ptr(), message)
     }
 }
 
-/// Raise the value at 1 as `luaB_error` does: a string with the place at
-/// `level` before it, a table kept.
+/// The name the running C function was called by, as Lua 5.1 gives it in a
+/// bad-argument error: `'?'` when the call gives none, as from `pcall` (5.4
+/// would look for a global of that value).
+unsafe fn called_as(state: *mut mlua::ffi::lua_State) -> *const std::ffi::c_char {
+    use mlua::ffi;
+    unsafe {
+        let mut ar: ffi::lua_Debug = std::mem::zeroed();
+        if ffi::lua_getstack(state, 0, &mut ar) != 0
+            && ffi::lua_getinfo(state, c"n".as_ptr(), &mut ar) != 0
+            && !ar.name.is_null()
+        {
+            ar.name
+        } else {
+            c"?".as_ptr()
+        }
+    }
+}
+
+/// `pcall` in scripts: Lua's own (`luaB_pcall`, so a coroutine can still
+/// yield inside it), but what it catches is handed back as Redis's `pcall`
+/// (`luaRedisPcall`) hands it back (#90): see [`caught_as_redis`].
+unsafe extern "C-unwind" fn script_pcall(state: *mut mlua::ffi::lua_State) -> std::ffi::c_int {
+    use mlua::ffi;
+    unsafe {
+        ffi::luaL_checkany(state, 1);
+        ffi::lua_pushboolean(state, 1);
+        ffi::lua_insert(state, 1);
+        let status = ffi::lua_pcallk(
+            state,
+            ffi::lua_gettop(state) - 2,
+            ffi::LUA_MULTRET,
+            0,
+            0,
+            Some(finish_script_pcall),
+        );
+        finish_script_pcall(state, status, 0)
+    }
+}
+
+/// The rest of [`script_pcall`], as `finishpcall` is of `luaB_pcall`.
+unsafe extern "C-unwind" fn finish_script_pcall(
+    state: *mut mlua::ffi::lua_State,
+    status: std::ffi::c_int,
+    extra: mlua::ffi::lua_KContext,
+) -> std::ffi::c_int {
+    use mlua::ffi;
+    unsafe {
+        if status != ffi::LUA_OK && status != ffi::LUA_YIELD {
+            let caught = caught_as_redis(state);
+            ffi::lua_pushboolean(state, 0);
+            ffi::lua_rotate(state, -(caught + 1), 1);
+            return caught + 1;
+        }
+        ffi::lua_gettop(state) - extra as std::ffi::c_int
+    }
+}
+
+/// What a script's `pcall` hands back for the error at the top of the stack,
+/// left at the top: how many values that is. A table whose `err` is a string
+/// or a number is its `err`, as in Redis, where `redis.call` raises such a
+/// table; a table with any other `err` is followed by it, as Redis leaves it.
+/// An error from Rust (`redis.call`, `cjson`, ...) is mlua's object, whose
+/// `tostring` is `runtime error: ` and the message, then a traceback: it is
+/// the message, as Redis's is. Anything else is left as it is.
+///
+/// The bytes read are Lua's, on the stack until they are copied: a Lua error
+/// here unwinds through no Rust value that needs dropping.
+unsafe fn caught_as_redis(state: *mut mlua::ffi::lua_State) -> std::ffi::c_int {
+    use mlua::ffi;
+    unsafe {
+        match ffi::lua_type(state, -1) {
+            ffi::LUA_TTABLE => {
+                ffi::lua_getfield(state, -1, c"err".as_ptr());
+                if ffi::lua_isstring(state, -1) == 0 {
+                    return 2;
+                }
+                ffi::lua_replace(state, -2);
+            }
+            ffi::LUA_TUSERDATA => {
+                let mut len = 0;
+                let text = ffi::luaL_tolstring(state, -1, &mut len);
+                let text = std::slice::from_raw_parts(text.cast::<u8>(), len);
+                let text =
+                    memchr::memmem::find(text, b"\nstack traceback").map_or(text, |at| &text[..at]);
+                let text = text.strip_prefix(b"runtime error: ").unwrap_or(text);
+                let text = text.trim_ascii_end();
+                ffi::lua_pushlstring(state, text.as_ptr().cast(), text.len());
+                ffi::lua_replace(state, -3);
+                ffi::lua_pop(state, 1);
+            }
+            _ => {}
+        }
+        1
+    }
+}
+
+/// Raise the value at 1 as `luaB_error` does, for `error`: a string with the
+/// place at `level` before it, a table kept.
 unsafe fn raise_script_error(state: *mut mlua::ffi::lua_State, level: std::ffi::c_int) -> ! {
     use mlua::ffi;
     unsafe {
@@ -3490,7 +3924,7 @@ unsafe fn raise_script_error(state: *mut mlua::ffi::lua_State, level: std::ffi::
 /// Here that cost every call about 2,400 instructions (an `EVALSHA` of a
 /// `GET` 11% more) for the rare one that fails (#80); this costs nothing
 /// until a table is raised. The table itself is left alone: a script that
-/// catches it with `pcall` has it as it made it.
+/// catches it with `xpcall` has it as it made it.
 ///
 /// The Lua calls that can fail (out of memory) come before any Rust value
 /// is made, so a Lua error unwinds through none that needs dropping.
@@ -3509,7 +3943,7 @@ unsafe fn remember_error_table(state: *mut mlua::ffi::lua_State) {
             forget_raised_table();
             return;
         }
-        // The frame that raised it: past `error` (or `assert`) itself.
+        // The frame that raised it: past `error` itself.
         let mut line = 1;
         let mut ar: ffi::lua_Debug = std::mem::zeroed();
         for level in 1..=3 {
@@ -3814,6 +4248,7 @@ fn install_eval_timeout_hook(lua: &Lua) -> Result<(), String> {
 struct EvalShebangFlags {
     allow_oom: bool,
     no_writes: bool,
+    allow_cross_slot: bool,
 }
 
 /// Redis `#lua` / `#!lua flags=…` first line — strip before `lua.load`, validate engine/options.
@@ -3850,7 +4285,8 @@ fn preprocess_eval_script(source: &str) -> Result<(&str, EvalShebangFlags), Stri
                 match f {
                     "allow-oom" => flags.allow_oom = true,
                     "no-writes" => flags.no_writes = true,
-                    "allow-stale" | "no-cluster" | "allow-cross-slot-keys" => {}
+                    "allow-cross-slot-keys" => flags.allow_cross_slot = true,
+                    "allow-stale" | "no-cluster" => {}
                     _ => return Err(format!("Unexpected flag in script shebang: {}", f)),
                 }
             }
@@ -3894,6 +4330,7 @@ fn eval_script(
     }
     let _script_clock_guard = ScriptClockGuard;
 
+    let slot = first_key_slot(ctx, keys.first().copied());
     SCRIPT_EVAL.with(|c| {
         *c.borrow_mut() = Some(ScriptEval {
             ctx_addr: ctx_ptr as usize,
@@ -3903,12 +4340,16 @@ fn eval_script(
             allow_oom,
             had_shebang,
             no_writes_flag: sb.no_writes,
+            allow_cross_slot: sb.allow_cross_slot,
+            slot,
         });
     });
 
     let _clear_eval = ClearScriptEval { lua };
-    // What the script writes goes to the AOF as one piece, when it ends.
-    let _aof_group = crate::aof::RecordGroup::begin(ctx.aof_tx);
+    // What the script writes goes to replicas between a `MULTI` and an
+    // `EXEC`, and to the AOF as one piece, when it ends (#172).
+    let _propagation =
+        crate::replication::PropagationGroup::begin(ctx.repl_state, ctx.hub_tx, ctx.aof_tx);
 
     install_redis_eval_handlers(lua)?;
     set_global_keys_argv(lua, &keys, &argv)?;
@@ -4011,6 +4452,7 @@ fn eval_function_call(
     }
     let _script_clock_guard = ScriptClockGuard;
 
+    let slot = first_key_slot(ctx, keys.first().map(|k| k.as_slice()));
     SCRIPT_EVAL.with(|c| {
         *c.borrow_mut() = Some(ScriptEval {
             ctx_addr: ctx_ptr as usize,
@@ -4021,12 +4463,16 @@ fn eval_function_call(
             // A function is held to what a script with a first line is.
             had_shebang: true,
             no_writes_flag: run.no_writes,
+            allow_cross_slot: run.allow_cross_slot,
+            slot,
         });
     });
 
     let _clear_eval = ClearScriptEval { lua };
-    // What the script writes goes to the AOF as one piece, when it ends.
-    let _aof_group = crate::aof::RecordGroup::begin(ctx.aof_tx);
+    // What the script writes goes to replicas between a `MULTI` and an
+    // `EXEC`, and to the AOF as one piece, when it ends (#172).
+    let _propagation =
+        crate::replication::PropagationGroup::begin(ctx.repl_state, ctx.hub_tx, ctx.aof_tx);
 
     install_redis_eval_handlers(lua)?;
     set_global_keys_argv(lua, &keys, &argv)?;
@@ -4147,6 +4593,7 @@ fn fcall_inner(
             read_only: read_only || no_writes,
             allow_oom,
             no_writes,
+            allow_cross_slot: has("allow-cross-slot-keys"),
         },
     )
 }
@@ -4156,6 +4603,7 @@ struct FunctionRun {
     read_only: bool,
     allow_oom: bool,
     no_writes: bool,
+    allow_cross_slot: bool,
 }
 
 fn fcall(ctx: &mut Ctx, read_only: bool) -> Vec<u8> {
@@ -4971,6 +5419,7 @@ fn script_cmd(ctx: &mut Ctx) -> Vec<u8> {
                 .write()
                 .entry(sha.clone())
                 .or_insert_with(|| Arc::from(source));
+            eval_script_loaded(&sha);
             resp_bulk_str(&sha)
         }
         "EXISTS" => {
@@ -4998,6 +5447,7 @@ fn script_cmd(ctx: &mut Ctx) -> Vec<u8> {
                 Some(_) => return resp_error("ERR SCRIPT FLUSH only support SYNC|ASYNC option"),
             };
             let scripts = std::mem::take(&mut *script_store().write());
+            *EVAL_SCRIPTS.lock() = EvalScripts::default();
             let vm = lua_vms_renew_for_admin(&[Vm::Eval]).unwrap_or_default();
             if async_free && scripts.len() > 64 {
                 let n = scripts.len() as u64;

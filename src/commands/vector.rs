@@ -115,12 +115,66 @@ fn ft_dropindex(ctx: &mut Ctx) -> Option<Vec<u8>> {
         Err(_) => return Some(resp_error("ERR index name must be valid UTF-8")),
     };
 
-    // The index goes, and its aliases with it.
-    if crate::vector::remove_index(&mut ctx.index_store.write(), name) {
-        Some(resp_simple("OK"))
+    let delete_documents = match &cmd[2..] {
+        [] => false,
+        [dd] if dd.eq_ignore_ascii_case(b"DD") => true,
+        _ => return Some(resp_error("ERR syntax error")),
+    };
+
+    // The documents it covered, if they go too: found before the index goes,
+    // by its definition. They were kept whatever was asked (#162).
+    let documents: Vec<(usize, String)> = if delete_documents {
+        let store = ctx.index_store.read();
+        match store
+            .get(name)
+            .filter(|def| !crate::vector::is_alias(name, def))
+        {
+            Some(def) => {
+                let db = def.db_index;
+                let mut keys = Vec::new();
+                for shard in ctx.store[db].iter() {
+                    let map = shard.read();
+                    for (key, value) in map.iter() {
+                        let covered = def.prefixes.is_empty()
+                            || def.prefixes.iter().any(|p| key.starts_with(p.as_str()));
+                        if covered
+                            && crate::vector::doc_fields(&def.on, &def.fields, value).is_some()
+                        {
+                            keys.push((db, key.to_string()));
+                        }
+                    }
+                }
+                keys
+            }
+            None => Vec::new(),
+        }
     } else {
-        Some(resp_error("ERR no such index"))
+        Vec::new()
+    };
+
+    // The index goes, and its aliases with it.
+    if !crate::vector::remove_index(&mut ctx.index_store.write(), name) {
+        return Some(resp_error("ERR no such index"));
     }
+    // Then its documents. Not each as a DEL to replicas and the AOF: they
+    // run this command, and delete theirs.
+    for (db, key) in &documents {
+        if !crate::commands::helpers::delete_key(ctx.store, *db, key) {
+            continue;
+        }
+        crate::vector::maybe_unindex(ctx.index_store, key);
+        crate::stats::record_rdb_change();
+        crate::keyspace_events::notify(
+            ctx.pubsub,
+            *db,
+            crate::keyspace_events::KS_GENERIC,
+            "del",
+            key,
+        );
+        ctx.watch_registry.notify(*db, key);
+        crate::commands::handler::invalidate_tracked_key(ctx, key, false);
+    }
+    Some(resp_simple("OK"))
 }
 
 // ── FT.ALTER ─────────────────────────────────────────────────────────────────
@@ -368,8 +422,8 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             }
         }
     }
-    let filter = match crate::vector::filter::parse_query(&query_str, &params, &def) {
-        Ok(query) => query.filter,
+    let (filter, knn) = match crate::vector::filter::parse_query(&query_str, &params, &def) {
+        Ok(query) => (query.filter, query.knn),
         Err(e) => return Some(resp_error(&e)),
     };
 
@@ -381,6 +435,24 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
         Ok(cursor) => cursor,
         Err(e) => return Some(resp_error(&e)),
     };
+    // `TIMEOUT` where an option may be, not a word of another clause that
+    // happens to read `TIMEOUT` (`APPLY … AS timeout`, a parameter).
+    let mut timeout_ms = None;
+    if let Some(at) = crate::commands::aggregate_pipeline::option_at(cmd, 3, "TIMEOUT") {
+        match cmd
+            .get(at + 1)
+            .and_then(|a| std::str::from_utf8(a).ok())
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            Some(ms) => timeout_ms = Some(ms),
+            None => {
+                return Some(resp_error(
+                    "Bad arguments for TIMEOUT: expected a non-negative integer",
+                ));
+            }
+        }
+    }
+    let deadline = crate::commands::search::search_deadline(timeout_ms);
 
     // ── Stage 0: Collect all matching rows ────────────────────────────────────
     //
@@ -391,93 +463,149 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // In a cluster, only the keys of the slots this node serves: see
     // `cluster::search`.
     let cluster = ctx.cluster.enabled.then_some(ctx.cluster);
+    // The deadline is kept between runs of documents: see `scan_docs`.
+    let timed_out_scan = crate::commands::search::scan_docs(db_ref, deadline, |key, value| {
+        // ── Prefix check ─────────────────────────────────────────────
+        let matches =
+            def.prefixes.is_empty() || def.prefixes.iter().any(|p| key.starts_with(p.as_str()));
+        if !matches {
+            return;
+        }
+        if cluster.is_some_and(|c| !crate::cluster::search::serves(c, key)) {
+            return;
+        }
 
-    for shard in db_ref.iter() {
-        #[cfg(target_os = "linux")]
-        let map = shard.read();
-        #[cfg(not(target_os = "linux"))]
-        let map = shard.read();
+        let Some(inner) = crate::vector::doc_fields(&def.on, &def.fields, value) else {
+            return;
+        };
+        let json = matches!(def.on, crate::vector::IndexOn::Json);
 
-        for (key, value) in map.iter() {
-            // ── Prefix check ─────────────────────────────────────────────
-            let matches =
-                def.prefixes.is_empty() || def.prefixes.iter().any(|p| key.starts_with(p.as_str()));
-            if !matches {
-                continue;
-            }
-            if cluster.is_some_and(|c| !crate::cluster::search::serves(c, key)) {
-                continue;
-            }
+        // ── Filter check ──────────────────────────────────────────────
+        // Evaluate the filter against the raw hash fields BEFORE converting
+        // to strings. This is the correct order: filter is cheap (byte
+        // comparisons on Arc<[u8]>), string conversion is not free.
+        // For MatchAll, eval() returns true immediately — no overhead.
+        if !crate::vector::filter::eval(&filter, &*inner) {
+            return;
+        }
 
-            let Some(inner) = crate::vector::doc_fields(&def.on, &def.fields, value) else {
+        // ── Build row ─────────────────────────────────────────────────
+        // Only rows that passed the filter reach here.
+        let mut row: Row = ahash::AHashMap::new();
+
+        // Always include the key itself as a special field.
+        // Prefixed with __ so it doesn't collide with user field names.
+        row.insert("__key".to_string(), key.to_string());
+        if addscores {
+            row.insert(
+                "__score".to_string(),
+                crate::commands::search::number_text(crate::commands::search::relevance(
+                    &def, &inner, &terms,
+                )),
+            );
+        }
+
+        for (field, val) in inner.iter() {
+            // Text only: a vector's bytes are not a value a row can show
+            // or a pipeline can compute with.
+            let Ok(s) = std::str::from_utf8(val) else {
                 continue;
             };
-            let json = matches!(def.on, crate::vector::IndexOn::Json);
-
-            // ── Filter check ──────────────────────────────────────────────
-            // Evaluate the filter against the raw hash fields BEFORE converting
-            // to strings. This is the correct order: filter is cheap (byte
-            // comparisons on Arc<[u8]>), string conversion is not free.
-            // For MatchAll, eval() returns true immediately — no overhead.
-            if !crate::vector::filter::eval(&filter, &*inner) {
-                continue;
-            }
-
-            // ── Build row ─────────────────────────────────────────────────
-            // Only rows that passed the filter reach here.
-            let mut row: Row = ahash::AHashMap::new();
-
-            // Always include the key itself as a special field.
-            // Prefixed with __ so it doesn't collide with user field names.
-            row.insert("__key".to_string(), key.to_string());
-            if addscores {
-                row.insert(
-                    "__score".to_string(),
-                    crate::commands::search::number_text(crate::commands::search::relevance(
-                        &def, &inner, &terms,
-                    )),
-                );
-            }
-
-            for (field, val) in inner.iter() {
-                // Text only: a vector's bytes are not a value a row can show
-                // or a pipeline can compute with.
-                let Ok(s) = std::str::from_utf8(val) else {
-                    continue;
-                };
-                // A field of a JSON document goes by the name the schema
-                // gives its path.
-                let shown = match def.fields.iter().find(|f| json && &f.name == field) {
-                    Some(f) => f.attribute().to_string(),
-                    None => field.clone(),
-                };
-                row.insert(shown, s.to_string());
-            }
-
-            rows.push(row);
+            // A field of a JSON document goes by the name the schema
+            // gives its path.
+            let shown = match def.fields.iter().find(|f| json && &f.name == field) {
+                Some(f) => f.attribute().to_string(),
+                None => field.clone(),
+            };
+            row.insert(shown, s.to_string());
         }
+
+        rows.push(row);
+    });
+    let mut timed_out = timed_out_scan;
+
+    // ── A KNN clause: the nearest `k` of what the filter left ────────────────
+    //
+    // Exactly, as FT.SEARCH does with a filter, and with the distance under
+    // the clause's name, for the pipeline. It was dropped, and every
+    // document the filter left went on (#162). After a scan cut short, of
+    // the rows it found; and it keeps the deadline too.
+    if let Some(knn) = &knn {
+        let Some(field) = def.fields.iter().find(|f| f.name == knn.field) else {
+            return Some(resp_error("The vector field is gone from the index"));
+        };
+        let FieldType::Vector { metric, .. } = &field.field_type else {
+            return Some(resp_error("The vector field is gone from the index"));
+        };
+        let Some(live) = def.indexes.get(&knn.field) else {
+            return Some(resp_error("The vector field has no index"));
+        };
+        let candidates = rows
+            .iter()
+            .filter_map(|row| row.get("__key").map(String::as_str));
+        let (nearest, cut) = knn_filtered(live, &knn.vector, knn.k, metric, candidates, deadline);
+        timed_out |= cut;
+        let rank: ahash::AHashMap<String, (usize, f32)> = nearest
+            .into_iter()
+            .enumerate()
+            .map(|(i, found)| (found.key, (i, found.score)))
+            .collect();
+        rows.retain(|row| row.get("__key").is_some_and(|key| rank.contains_key(key)));
+        for row in &mut rows {
+            let (_, distance) = rank[&row["__key"]];
+            row.insert(
+                knn.alias.clone(),
+                crate::commands::search::distance_text(distance),
+            );
+        }
+        rows.sort_by_key(|row| rank[&row["__key"]].0);
     }
 
     // ── The rest of the cluster ──────────────────────────────────────────────
-    // Asked by a coordinator: the rows as they are, every column. A
-    // coordinator: the rows of every other master too, before any step.
+    // Asked by a coordinator: the rows as they are, every column, and
+    // whether this scan ran out of time, if the coordinator asks (one from
+    // before there was a timeout does not). A coordinator: the rows of every
+    // other master too, before any step, then `ON_TIMEOUT`.
     if crate::cluster::search::is_forwarded(ctx) {
-        return Some(crate::cluster::search::encode_rows(&rows));
+        let flag = crate::cluster::search::wants_timeout_flag(cmd).then_some(timed_out);
+        return Some(crate::cluster::search::encode_rows(&rows, flag));
     }
     if crate::cluster::search::coordinates(ctx) {
-        let owned: Vec<Vec<u8>> = cmd.iter().map(|a| a.to_vec()).collect();
+        let mut owned: Vec<Vec<u8>> = cmd.iter().map(|a| a.to_vec()).collect();
+        crate::cluster::search::ask_for_timeout_flag(&mut owned);
         match crate::cluster::search::fan_out(ctx, &owned) {
             Ok(replies) => {
                 for reply in replies {
-                    rows.extend(crate::cluster::search::decode_rows(reply));
+                    let (more, shard_timed_out) = crate::cluster::search::decode_rows(reply);
+                    rows.extend(more);
+                    timed_out |= shard_timed_out;
                 }
             }
             Err(e) => return Some(resp_error(&e)),
         }
+        // Each master sent its own nearest: the nearest of them all.
+        if let Some(knn) = &knn {
+            let distance = |row: &Row| {
+                row.get(&knn.alias)
+                    .and_then(|d| d.parse::<f64>().ok())
+                    .unwrap_or(f64::INFINITY)
+            };
+            rows.sort_by(|a, b| distance(a).total_cmp(&distance(b)));
+            rows.truncate(knn.k);
+        }
+    }
+    if timed_out && crate::commands::search::on_timeout_fails() {
+        return Some(resp_error("Timeout limit was reached"));
     }
 
     // ── Parse and execute pipeline clauses ────────────────────────────────────
-    let rows = crate::commands::aggregate_pipeline::run(rows, cmd, 3);
+    // To the same deadline: GROUPBY, APPLY, FILTER and SORTBY over a large
+    // scan cost as much as the scan.
+    let (rows, cut) = crate::commands::aggregate_pipeline::run_within(rows, cmd, 3, deadline);
+    timed_out |= cut;
+    if cut && crate::commands::search::on_timeout_fails() {
+        return Some(resp_error("Timeout limit was reached"));
+    }
 
     // ── Emit final rows ─────────────────────────────────────────────────────
     //
@@ -590,12 +718,14 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             rows_out,
             count,
             max_idle,
+            timed_out,
         ));
     }
     Some(crate::commands::search_tools::rows_reply(
         ctx.resp,
         rows_out.len(),
         &rows_out,
+        timed_out,
     ))
 }
 // ── format_f64 ────────────────────────────────────────────────────────────────
@@ -1122,53 +1252,153 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
 // ── Helpers for filtered search ──────────────────────────────────────────────
 
-/// Brute-force KNN over only the keys in `candidates`.
-pub(crate) fn knn_filtered(
+/// The nearest `k` of the documents offered to it, measured as they come:
+/// what a filtered KNN keeps while the filter runs.
+///
+/// A filter used to hand its keys over as a set of cloned `String`s, which
+/// the KNN then looked up again one by one. The scorer is offered each key
+/// as the filter accepts it, measures it at once against the query (scaled
+/// to unit length once, for a cosine), and keeps only the best `k`: a key is
+/// copied only when it is among them so far.
+///
+/// Each offer takes the vector index's locks for itself and lets them go:
+/// it runs under a shard's read lock, and a write to that shard can hold the
+/// shard while it waits on them.
+pub(crate) struct FilteredKnn<'a> {
+    live: &'a LiveIndex,
+    query: crate::vector::PreparedQuery<'a>,
+    best: Best,
+}
+
+impl<'a> FilteredKnn<'a> {
+    pub(crate) fn new(
+        live: &'a LiveIndex,
+        query: &'a [f32],
+        k: usize,
+        metric: &'a crate::vector::DistanceMetric,
+    ) -> Self {
+        Self {
+            live,
+            query: crate::vector::PreparedQuery::new(metric, query),
+            best: Best::new(k),
+        }
+    }
+
+    /// Measure the document at `key`, if the index holds a vector for it.
+    #[inline]
+    pub(crate) fn offer(&mut self, key: &str) {
+        let dim = self.query.vector().len();
+        let distance = match self.live {
+            LiveIndex::Flat(idx) => {
+                let vectors = idx.vectors.read();
+                match vectors.get(key) {
+                    Some(v) if v.len() == dim => self.query.to_raw(v),
+                    _ => return,
+                }
+            }
+            LiveIndex::Hnsw(idx) => {
+                let Some(id) = idx.key_to_id.read().get(key).copied() else {
+                    return;
+                };
+                let nodes = idx.nodes.read();
+                match nodes.get(id) {
+                    Some(n) if !n.vector.is_empty() && n.vector.len() == dim => {
+                        self.query.to_unit(&n.vector)
+                    }
+                    _ => return,
+                }
+            }
+        };
+        self.best.offer(distance, key);
+    }
+
+    /// The nearest, nearest first.
+    pub(crate) fn nearest(self) -> Vec<crate::vector::KnnResult> {
+        self.best.into_sorted()
+    }
+}
+
+/// The `k` smallest distances offered, with their keys: a max-heap whose
+/// top is the one to beat.
+struct Best {
+    k: usize,
+    heap: std::collections::BinaryHeap<Far>,
+}
+
+/// A distance ordered for the heap: `total_cmp`, so a NaN is the farthest.
+struct Far(f32, String);
+
+impl PartialEq for Far {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.total_cmp(&other.0).is_eq()
+    }
+}
+impl Eq for Far {}
+impl PartialOrd for Far {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Far {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+impl Best {
+    fn new(k: usize) -> Self {
+        Self {
+            k,
+            heap: std::collections::BinaryHeap::with_capacity(k.min(4096) + 1),
+        }
+    }
+
+    #[inline]
+    fn offer(&mut self, distance: f32, key: &str) {
+        if self.heap.len() < self.k {
+            self.heap.push(Far(distance, key.to_string()));
+        } else if let Some(mut top) = self.heap.peek_mut()
+            && distance.total_cmp(&top.0).is_lt()
+        {
+            // In place: the key's buffer is reused.
+            top.0 = distance;
+            top.1.clear();
+            top.1.push_str(key);
+        }
+    }
+
+    fn into_sorted(self) -> Vec<crate::vector::KnnResult> {
+        self.heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|Far(score, key)| crate::vector::KnnResult { key, score })
+            .collect()
+    }
+}
+
+/// Brute-force KNN over only the keys in `candidates`. Stops when
+/// `deadline` has passed, with the nearest of the candidates measured so
+/// far, and then the second value is true.
+pub(crate) fn knn_filtered<'k>(
     live_index: &crate::vector::LiveIndex,
     query: &[f32],
     k: usize,
     metric: &crate::vector::DistanceMetric,
-    candidates: &std::collections::HashSet<String>,
-) -> Vec<crate::vector::KnnResult> {
-    // Pull the vectors for candidate keys only
-    let mut scored: Vec<(f32, String)> = match live_index {
-        crate::vector::LiveIndex::Flat(idx) => {
-            let vectors = idx.vectors.read();
-            candidates
-                .iter()
-                .filter_map(|key| vectors.get(key).map(|v| (v.clone(), key.clone())))
-                .filter(|(v, _)| v.len() == query.len())
-                .map(|(v, key)| (crate::vector::distance(metric, query, &v), key))
-                .collect()
+    candidates: impl IntoIterator<Item = &'k str>,
+    deadline: Option<std::time::Instant>,
+) -> (Vec<crate::vector::KnnResult>, bool) {
+    let mut scorer = FilteredKnn::new(live_index, query, k, metric);
+    // A distance per candidate: the clock is read every DEADLINE_EVERY.
+    let mut seen = 0u32;
+    let mut cut = false;
+    for key in candidates {
+        if crate::commands::search::deadline_due(deadline, &mut seen) {
+            cut = true;
+            break;
         }
-        crate::vector::LiveIndex::Hnsw(idx) => {
-            let key_to_id = idx.key_to_id.read();
-            let nodes = idx.nodes.read();
-            candidates
-                .iter()
-                .filter_map(|key| key_to_id.get(key).map(|&id| (id, key.clone())))
-                .filter_map(|(id, key)| {
-                    let n = &nodes[id];
-                    if n.vector.is_empty() || n.vector.len() != query.len() {
-                        return None;
-                    }
-                    let dist = crate::vector::distance(metric, query, &n.vector);
-                    Some((dist, key))
-                })
-                .collect()
-        }
-    };
-
-    if scored.len() > k {
-        scored.select_nth_unstable_by(k, |a, b| a.0.total_cmp(&b.0));
-        scored.truncate(k);
+        scorer.offer(key);
     }
-    scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-
-    scored
-        .into_iter()
-        .map(|(score, key)| crate::vector::KnnResult { key, score })
-        .collect()
+    (scorer.nearest(), cut)
 }
 
 /// Backfill a subset of vector fields after FT.ALTER added them.
@@ -1258,14 +1488,14 @@ fn backfill_new_vector_fields(ctx: &Ctx, index_name: &str, new_field_names: &[St
             // HashEx: sweep expired fields first, then clone the survivors.
             // Hash: clone directly. The clone is a shallow Arc clone per value.
             let fields: crate::types::HashFields = match value {
-                crate::types::KiviDBValue::Json(doc)
+                crate::store::ValueRef::Json(doc)
                     if matches!(doc_on, crate::vector::IndexOn::Json) =>
                 {
                     crate::vector::project_json(&doc_schema, &doc.read())
                 }
                 _ if matches!(doc_on, crate::vector::IndexOn::Json) => continue,
-                crate::types::KiviDBValue::Hash(h) => h.read().clone(),
-                crate::types::KiviDBValue::HashEx(h) => {
+                crate::store::ValueRef::Hash(h) => h.read().clone(),
+                crate::store::ValueRef::HashEx(h) => {
                     let mut w = h.write();
                     w.sweep_expired();
                     drop(w);
@@ -1573,4 +1803,88 @@ fn ft_debug_compact(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let _ = ctx.compaction_tx.try_send(req);
 
     Some(resp_simple("OK"))
+}
+
+#[cfg(test)]
+mod filtered_knn_tests {
+    use super::*;
+
+    fn vector(dim: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..dim)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// The nearest `k` keys of `keys`, by the plain distance: what the
+    /// filtered KNN returned before.
+    fn exact(
+        data: &[(String, Vec<f32>)],
+        keys: &[&str],
+        q: &[f32],
+        k: usize,
+        metric: &crate::vector::DistanceMetric,
+    ) -> Vec<String> {
+        let mut scored: Vec<(f32, &str)> = data
+            .iter()
+            .filter(|(key, _)| keys.contains(&key.as_str()))
+            .map(|(key, v)| (crate::vector::distance(metric, q, v), key.as_str()))
+            .collect();
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+        scored
+            .into_iter()
+            .take(k)
+            .map(|(_, key)| key.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_scorer_keeps_the_exact_nearest_of_the_keys_offered() {
+        use crate::vector::{DistanceMetric, HnswIndex, VectorIndex};
+        let dim = 37;
+        let data: Vec<(String, Vec<f32>)> = (0..600)
+            .map(|i| (format!("doc:{i}"), vector(dim, i as u64 + 1)))
+            .collect();
+        // Every third key, as a filter would leave them, and one with no vector.
+        let mut keys: Vec<&str> = data.iter().step_by(3).map(|(k, _)| k.as_str()).collect();
+        keys.push("doc:none");
+        for metric in [
+            DistanceMetric::Cosine,
+            DistanceMetric::L2,
+            DistanceMetric::InnerProduct,
+        ] {
+            let flat = Arc::new(VectorIndex::new());
+            let graph = Arc::new(HnswIndex::new(16, 64));
+            for (key, v) in &data {
+                flat.insert(key.clone(), v.clone());
+                crate::vector::hnsw_insert(&graph, key.clone(), v.clone(), &metric);
+            }
+            let q = vector(dim, 9_999);
+            for k in [0usize, 1, 10, 500] {
+                let want = exact(&data, &keys, &q, k, &metric);
+                for live in [
+                    LiveIndex::Flat(flat.clone()),
+                    LiveIndex::Hnsw(graph.clone()),
+                ] {
+                    let (got, cut) =
+                        knn_filtered(&live, &q, k, &metric, keys.iter().copied(), None);
+                    assert!(!cut);
+                    let got_keys: Vec<String> = got.iter().map(|r| r.key.clone()).collect();
+                    assert_eq!(got_keys.len(), want.len(), "{metric:?} k={k}");
+                    // Equal up to the order of near ties.
+                    let mut a = got_keys.clone();
+                    let mut b = want.clone();
+                    a.sort();
+                    b.sort();
+                    assert_eq!(a, b, "{metric:?} k={k}");
+                    assert!(got.windows(2).all(|w| w[0].score <= w[1].score));
+                }
+            }
+        }
+    }
 }

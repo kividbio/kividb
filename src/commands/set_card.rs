@@ -9,7 +9,7 @@ use crate::commands::helpers::{lazy_expire_on_read, parse_utf8};
 use crate::read_lock;
 use crate::resp::write::*;
 use crate::store;
-use crate::types::KiviDBValue;
+use crate::store::ValueRef;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
@@ -71,11 +71,11 @@ fn sets_at(ctx: &Ctx, keys: &[&[u8]]) -> Result<Vec<Option<Set>>, Vec<u8>> {
             out.push(None);
             continue;
         };
-        let gone = lazy_expire_on_read(ctx.store, ctx.expiry_store, db, key);
+        let gone = lazy_expire_on_read(ctx.store, db, key);
         let shard = store::get_shard(&ctx.store[db], key);
         match read_lock!(shard).get(key).filter(|_| !gone) {
             None => out.push(None),
-            Some(KiviDBValue::Set(s)) => out.push(Some(Arc::clone(s))),
+            Some(ValueRef::Set(s)) => out.push(Some(Arc::clone(s))),
             Some(_) => {
                 return Err(resp_error(
                     "WRONGTYPE Operation against a key holding the wrong kind of value",

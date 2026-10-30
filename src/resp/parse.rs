@@ -45,6 +45,79 @@ pub fn parse_resp_command(buf: &[u8]) -> Option<(usize, Vec<&[u8]>)> {
     Some((idx, parts))
 }
 
+/// Whether `buf`, what a replica holds of its master's stream once every
+/// whole command in it has been taken, can still be the start of a command.
+///
+/// [`parse_resp_command`] answers "not yet" to anything it cannot read, so a
+/// stream sent from a position that is not where the replica stands — the
+/// middle of a command — is waited on for ever. This tells the two apart: it
+/// is false as soon as what has arrived cannot begin `*<count>` followed by
+/// `$<length>` arguments. No limit is put on the numbers; the peer is a
+/// server.
+pub fn can_start_command(buf: &[u8]) -> bool {
+    /// A decimal line from `at`: its value and where the next one begins,
+    /// `Ok(None)` if it has not arrived in full, `Err` if it is not one.
+    fn number(buf: &[u8], at: usize) -> Result<Option<(usize, usize)>, ()> {
+        let mut value: usize = 0;
+        let mut idx = at;
+        loop {
+            let Some(&b) = buf.get(idx) else {
+                return Ok(None);
+            };
+            match b {
+                b'0'..=b'9' => {
+                    value = value
+                        .checked_mul(10)
+                        .and_then(|v| v.checked_add((b - b'0') as usize))
+                        .ok_or(())?;
+                }
+                b'\r' if idx > at => break,
+                _ => return Err(()),
+            }
+            idx += 1;
+        }
+        match buf.get(idx + 1) {
+            None => Ok(None),
+            Some(b'\n') => Ok(Some((value, idx + 2))),
+            Some(_) => Err(()),
+        }
+    }
+
+    match buf.first() {
+        None => return true,
+        Some(b'*') => {}
+        Some(_) => return false,
+    }
+    let (count, mut idx) = match number(buf, 1) {
+        Ok(Some(n)) => n,
+        Ok(None) => return true,
+        Err(()) => return false,
+    };
+    for _ in 0..count {
+        match buf.get(idx) {
+            None => return true,
+            Some(b'$') => {}
+            Some(_) => return false,
+        }
+        let (len, data) = match number(buf, idx + 1) {
+            Ok(Some(n)) => n,
+            Ok(None) => return true,
+            Err(()) => return false,
+        };
+        let Some(end) = data.checked_add(len) else {
+            return false;
+        };
+        if end >= buf.len() {
+            return true;
+        }
+        if buf[end] != b'\r' || buf.get(end + 1).is_some_and(|b| *b != b'\n') {
+            return false;
+        }
+        idx = end + 2;
+    }
+    true
+}
+
 // ── Requests from clients ─────────────────────────────────────────────────────
 //
 // What a client sends is not to be trusted to be a request. The parser above
@@ -666,6 +739,41 @@ mod inline_line_ending_tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn a_stream_from_the_middle_of_a_command_is_told_from_one_still_arriving() {
+        let set = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$5\r\nhello\r\n";
+        // Every prefix of a command is one still arriving.
+        for end in 0..=set.len() {
+            assert!(can_start_command(&set[..end]), "{:?}", &set[..end]);
+        }
+        // Every suffix but the whole command, and the empty one, is the
+        // middle of one: what a replica sent the stream from the wrong
+        // position holds.
+        let two: Vec<u8> = [&set[..], &set[..]].concat();
+        for start in 1..set.len() {
+            assert!(
+                !can_start_command(&two[start..]),
+                "{:?}",
+                String::from_utf8_lossy(&two[start..])
+            );
+        }
+        for bad in [
+            &b"*x\r\n"[..],
+            b"*\r\n",
+            b"*1\rX",
+            b"*1\r\nSET",
+            b"*1\r\n$3\r\nSETX",
+            b"*1\r\n$3\r\nSET\rX",
+            b"*99999999999999999999999\r\n",
+        ] {
+            assert!(
+                !can_start_command(bad),
+                "{:?}",
+                String::from_utf8_lossy(bad)
+            );
+        }
     }
 
     #[test]
