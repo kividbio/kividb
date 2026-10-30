@@ -1019,7 +1019,7 @@ fn docs_field<'a>(docs: &'a RespValue, name: &str) -> &'a str {
     docs_value(docs, name).as_str()
 }
 
-// COMMAND DOCS GET names the command and gives Redis's summary, group,
+// COMMAND DOCS GET names the command and gives the summary, group,
 // complexity, since, and the argument list redis-cli builds hints from.
 #[test]
 fn test_command_docs_get() {
@@ -1057,7 +1057,8 @@ fn test_command_docs_several_names() {
     let arr = result.as_array();
     assert_eq!(arr.len(), 4, "{result:?}");
     assert_eq!(arr[0].as_str(), "ft.search");
-    assert_eq!(docs_field(&arr[1], "group"), "search");
+    assert_eq!(docs_field(&arr[1], "group"), "module");
+    assert_eq!(docs_field(&arr[1], "module"), "search");
     assert_eq!(arr[2].as_str(), "set");
     assert_eq!(docs_field(&arr[3], "group"), "string");
 }
@@ -1095,9 +1096,58 @@ fn test_command_docs_all_includes_get() {
     assert!(names.contains(&"ft.search"), "{names:?}");
 }
 
-// Redis 8.10.2 JSON: XADD 5.0.0, GETEX 6.2.0, HEXPIRE 7.4.0.
+// With no names, only top-level commands are listed; subcommands are nested
+// under their container's `subcommands`, as Redis does.
 #[test]
-fn test_command_docs_since_from_redis_json() {
+fn test_command_docs_all_nests_subcommands() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "DOCS"]);
+    let arr = result.as_array();
+    let names: Vec<&str> = arr.iter().step_by(2).map(|v| v.as_str()).collect();
+    assert!(
+        names.iter().all(|n| !n.contains('|')),
+        "subcommand at top level: {:?}",
+        names.iter().filter(|n| n.contains('|')).collect::<Vec<_>>()
+    );
+    let i = names.iter().position(|n| *n == "acl").expect("acl");
+    let subs = docs_value(&arr[i * 2 + 1], "subcommands");
+    let sub_names: Vec<&str> = subs
+        .as_array()
+        .iter()
+        .step_by(2)
+        .map(|v| v.as_str())
+        .collect();
+    assert!(sub_names.contains(&"acl|cat"), "{sub_names:?}");
+}
+
+// Module-style commands report group `module` plus the module's name.
+#[test]
+fn test_command_docs_module_commands() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for (name, module) in [
+        ("JSON.SET", "ReJSON"),
+        ("TS.ADD", "timeseries"),
+        ("VADD", "vectorset"),
+        ("FT.CREATE", "search"),
+    ] {
+        let result = c.cmds(&["COMMAND", "DOCS", name]);
+        let arr = result.as_array();
+        assert_eq!(arr.len(), 2, "{name} {result:?}");
+        assert_eq!(docs_field(&arr[1], "group"), "module", "{name}");
+        assert_eq!(docs_field(&arr[1], "module"), module, "{name}");
+    }
+}
+
+// `since` comes from the command JSON: XADD 5.0.0, GETEX 6.2.0, and
+// HEXPIRE 9.0.0 (the Valkey release that added it).
+#[test]
+fn test_command_docs_since_from_command_json() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
@@ -1110,10 +1160,10 @@ fn test_command_docs_since_from_redis_json() {
     assert_eq!(arr[2].as_str(), "getex");
     assert_eq!(docs_field(&arr[3], "since"), "6.2.0");
     assert_eq!(arr[4].as_str(), "hexpire");
-    assert_eq!(docs_field(&arr[5], "since"), "7.4.0");
+    assert_eq!(docs_field(&arr[5], "since"), "9.0.0");
 }
 
-// SADD / HSET / LPUSH complexity is Redis's O(1)-per-element wording, not O(N).
+// SADD / HSET / LPUSH complexity is the O(1)-per-element wording, not O(N).
 #[test]
 fn test_command_docs_complexity_o1_style() {
     let port = free_port();

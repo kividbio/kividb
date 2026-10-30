@@ -1,17 +1,16 @@
 // `COMMAND DOCS`: summary, since, group, complexity, history, doc_flags and
 // arguments, for redis-cli and clients that ask on connect. The command used
 // to answer with an empty array so those clients would still start. The
-// fields are generated from Redis 8.10.2's command JSON, the same source as
-// the key specs, so `since` and `complexity` are Redis's and redis-cli can
-// build argument hints. Arity and key positions stay on `COMMAND` /
-// `COMMAND INFO`.
+// table is generated from Valkey's BSD-3-Clause command JSON plus
+// `scripts/command_docs_extras.json` (see `scripts/gen_command_docs.py`).
+// Arity and key positions stay on `COMMAND` / `COMMAND INFO`.
 
 use super::command_docs_table::TABLE;
 use crate::resp::write::{
     resp_array, resp_bulk_str, resp_integer, resp_map_for, resp_set_for, resp_simple,
 };
 use ahash::AHashMap;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 
 pub(super) struct History(pub &'static str, pub &'static str);
 
@@ -33,6 +32,7 @@ pub(super) struct Docs {
     pub since: &'static str,
     pub group: &'static str,
     pub complexity: &'static str,
+    pub module: Option<&'static str>,
     pub doc_flags: &'static [&'static str],
     pub deprecated_since: Option<&'static str>,
     pub replaced_by: Option<&'static str>,
@@ -49,22 +49,28 @@ fn lookup(name: &str) -> Option<&'static Docs> {
 }
 
 pub(crate) fn reply(resp: u8, requested: &[&[u8]], all: &[&str]) -> Vec<u8> {
-    let names: Vec<String> = if requested.is_empty() {
-        let mut names: Vec<String> = all.iter().map(|n| n.to_ascii_uppercase()).collect();
-        let mut extra = Vec::new();
-        for name in &names {
-            if let Some(docs) = lookup(name) {
-                extra.extend(docs.subcommands.iter().map(|s| (*s).to_string()));
-            }
-        }
-        names.extend(extra);
-        names
-    } else {
-        requested
-            .iter()
-            .filter_map(|raw| served_name(raw, all))
-            .collect()
-    };
+    if requested.is_empty() {
+        return all_docs(resp, all);
+    }
+    let names: Vec<String> = requested
+        .iter()
+        .filter_map(|raw| served_name(raw, all))
+        .collect();
+    encode_reply(resp, names)
+}
+
+/// The no-argument reply: top-level commands only, subcommands nested under
+/// each container. redis-cli asks for it on every connect, so it is built
+/// once per RESP version (`all` is the server's fixed command list).
+fn all_docs(resp: u8, all: &[&str]) -> Vec<u8> {
+    static RESP2: OnceLock<Vec<u8>> = OnceLock::new();
+    static RESP3: OnceLock<Vec<u8>> = OnceLock::new();
+    let cell = if resp >= 3 { &RESP3 } else { &RESP2 };
+    cell.get_or_init(|| encode_reply(resp, all.iter().map(|n| n.to_ascii_uppercase()).collect()))
+        .clone()
+}
+
+fn encode_reply(resp: u8, names: Vec<String>) -> Vec<u8> {
     let mut pairs = Vec::with_capacity(names.len() * 2);
     for name in names {
         let Some(docs) = lookup(&name) else {
@@ -104,6 +110,10 @@ fn encode_docs(resp: u8, docs: &Docs) -> Vec<u8> {
     if !docs.complexity.is_empty() {
         pairs.push(resp_bulk_str("complexity"));
         pairs.push(resp_bulk_str(docs.complexity));
+    }
+    if let Some(module) = docs.module {
+        pairs.push(resp_bulk_str("module"));
+        pairs.push(resp_bulk_str(module));
     }
     if !docs.doc_flags.is_empty() {
         pairs.push(resp_bulk_str("doc_flags"));
@@ -204,7 +214,7 @@ mod tests {
     use super::{lookup, reply};
 
     #[test]
-    fn get_matches_redis_json() {
+    fn get_matches_command_json() {
         let docs = lookup("GET").expect("GET");
         assert_eq!(docs.summary, "Returns the string value of a key.");
         assert_eq!(docs.group, "string");
@@ -216,10 +226,10 @@ mod tests {
     }
 
     #[test]
-    fn since_is_redis_not_one_oh() {
+    fn since_is_real_not_one_oh() {
         assert_eq!(lookup("XADD").unwrap().since, "5.0.0");
         assert_eq!(lookup("GETEX").unwrap().since, "6.2.0");
-        assert_eq!(lookup("HEXPIRE").unwrap().since, "7.4.0");
+        assert_eq!(lookup("HEXPIRE").unwrap().since, "9.0.0");
         assert_eq!(lookup("ARSET").unwrap().since, "8.8.0");
         assert_eq!(lookup("DIGEST").unwrap().since, "8.4.0");
     }
@@ -234,10 +244,45 @@ mod tests {
 
     #[test]
     fn module_groups() {
-        assert_eq!(lookup("FT.SEARCH").unwrap().group, "search");
-        assert_eq!(lookup("JSON.SET").unwrap().group, "json");
-        assert_eq!(lookup("TS.ADD").unwrap().group, "timeseries");
-        assert_eq!(lookup("VADD").unwrap().group, "vectorset");
+        for (name, module) in [
+            ("FT.SEARCH", "search"),
+            ("FT.CONFIG|GET", "search"),
+            ("JSON.SET", "ReJSON"),
+            ("TS.ADD", "timeseries"),
+            ("VADD", "vectorset"),
+        ] {
+            let docs = lookup(name).unwrap();
+            assert_eq!(docs.group, "module", "{name}");
+            assert_eq!(docs.module, Some(module), "{name}");
+        }
+        assert_eq!(lookup("GET").unwrap().module, None);
+    }
+
+    #[test]
+    fn no_invented_since_or_summary() {
+        for name in ["FT.DEBUG", "FT.DEBUG|COMPACT", "FT.CONFIG", "FT.CURSOR"] {
+            assert_eq!(lookup(name).unwrap().since, "", "{name}");
+        }
+        for name in ["FT.CONFIG", "FT.CURSOR", "FT.DEBUG"] {
+            assert_eq!(lookup(name).unwrap().summary, "", "{name}");
+        }
+    }
+
+    #[test]
+    fn unserved_commands_have_no_entry() {
+        for name in [
+            "FT.SUGADD",
+            "FT.SUGDEL",
+            "FT.SUGGET",
+            "FT.SUGLEN",
+            "RESTORE-ASKING",
+            "SENTINEL",
+            "SFLUSH",
+            "TRIMSLOTS",
+            "GEODELBYMEMBER",
+        ] {
+            assert!(lookup(name).is_none(), "{name}");
+        }
     }
 
     #[test]
@@ -247,9 +292,9 @@ mod tests {
     }
 
     #[test]
-    fn setnx_carries_doc_flags() {
-        let docs = lookup("SETNX").unwrap();
+    fn cluster_slaves_carries_doc_flags() {
+        let docs = lookup("CLUSTER|SLAVES").unwrap();
         assert_eq!(docs.doc_flags, &["deprecated"]);
-        assert_eq!(docs.deprecated_since, Some("2.6.12"));
+        assert_eq!(docs.deprecated_since, Some("5.0.0"));
     }
 }

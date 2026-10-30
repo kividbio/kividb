@@ -11,10 +11,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **`COMMAND DOCS` returns documentation.** It used to answer with an empty
   array so redis-cli could still connect. It now replies, for each named
-  command (or every command when none are named), with `summary`, `since`,
-  `group`, `complexity`, `history`, `doc_flags` and `arguments`, taken from
-  Redis 8.10.2's command JSON. A name that is not a command is omitted, as
-  Redis omits it. Arity and key positions stay on `COMMAND` / `COMMAND INFO`.
+  command (or every top-level command, with subcommands nested, when none
+  are named), with `summary`, `since`, `group`, `complexity`, `history`,
+  `doc_flags` and `arguments`. The table is generated from Valkey 9.1.3's
+  BSD-3-Clause command JSON, plus KiviDB's own entries for commands Valkey
+  does not have. Search, JSON, time series and vector set commands report
+  `group: module` and a `module` name, as Redis does with those modules
+  loaded. A name that is not a command is omitted, as Redis omits it. Arity
+  and key positions stay on `COMMAND` / `COMMAND INFO`.
 
 ## [1.2.0]
 
