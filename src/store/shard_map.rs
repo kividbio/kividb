@@ -523,8 +523,12 @@ impl ShardMap {
                     },
                 );
                 // The key's use goes on: a value written over keeps the
-                // count of an LFU policy, as in Redis.
-                entry.set_access(old.access());
+                // count of an LFU policy, as in Redis. Not one past its
+                // time: that key is gone, and this is a new one, which
+                // starts where a new key does.
+                if !stale {
+                    entry.set_access(old.access());
+                }
                 *at.get_mut() = Slot::new(entry, hash);
                 ttl_replaced(list, old, entry);
                 // SAFETY: the table's hold on the old entry goes to the caller.

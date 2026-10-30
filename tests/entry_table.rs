@@ -349,14 +349,16 @@ fn the_access_word_follows_the_key() {
         drop(map.insert_entry(NewEntry::string("k", b"x")));
         assert_eq!(map.access("k"), Some(7));
         // A time to live given (a new entry), changed in place, changed
-        // while the entry is held (a new entry again), taken away.
-        assert!(map.set_expires("k", 1_000));
+        // while the entry is held (a new entry again), taken away. Times to
+        // come: a key past its time is not there to be given one.
+        let t = u64::MAX / 2;
+        assert!(map.set_expires("k", t + 1_000));
         assert_eq!(map.access("k"), Some(7));
-        assert!(map.set_expires("k", 2_000));
+        assert!(map.set_expires("k", t + 2_000));
         let held = map.get_ref("k").unwrap();
-        assert!(map.set_expires("k", 3_000));
+        assert!(map.set_expires("k", t + 3_000));
         assert_eq!(map.access("k"), Some(7));
-        drop(map.insert_str_expiring("k", b"y", Some(4_000)));
+        drop(map.insert_str_expiring("k", b"y", Some(t + 4_000)));
         assert_eq!(map.access("k"), Some(7));
         assert!(map.persist("k"));
         assert_eq!(map.access("k"), Some(7));
@@ -371,6 +373,13 @@ fn the_access_word_follows_the_key() {
         // A key made anew starts from nothing.
         map.insert_str("k", b"v");
         assert_eq!(map.access("k"), Some(0));
+        // And so does one written over once its time has passed: the old
+        // key is gone, and its use with it.
+        map.touch(b"k", |w| w + 7);
+        drop(map.insert_str_expiring("k", b"v", Some(1)));
+        assert_eq!(map.access("k"), Some(7), "written over while it lived");
+        drop(map.insert_str("k", b"w"));
+        assert_eq!(map.access("k"), Some(0), "written over past its time");
     });
 }
 
