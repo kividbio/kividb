@@ -2268,10 +2268,12 @@ mod full_sync_guard_tests {
         );
     }
 
-    /// A key whose TTL ran out while the payload was in transit is gone on
-    /// arrival, not resurrected without a TTL.
+    /// A key whose TTL ran out while the payload was in transit is loaded
+    /// with its time, past as it is: not resurrected without a TTL, and not
+    /// deleted by the replica either. Its clients do not see it, and the
+    /// master's `DEL` of it is on its way (see `expiry`).
     #[test]
-    fn keys_already_expired_are_dropped_on_load() {
+    fn keys_already_expired_are_kept_for_the_masters_del() {
         let store = crate::store::new_store(1);
         for key in ["live", "dead"] {
             crate::store::get_shard(&store[0], key)
@@ -2285,12 +2287,10 @@ mod full_sync_guard_tests {
 
         let payload = crate::snapshot::full_sync_payload(&store, None).unwrap();
         let staged = load_full_sync_payload(&payload, 1).expect("payload loads");
-        assert_eq!(staged.keys, 1);
-        assert!(
-            !crate::store::get_shard(&staged.store[0], "dead")
-                .read()
-                .contains_key("dead")
-        );
+        assert_eq!(staged.keys, 2);
+        let shard = crate::store::get_shard(&staged.store[0], "dead").read();
+        assert_eq!(shard.expires("dead"), Some(past));
+        assert!(!shard.contains_key("dead"), "past its time to a reader");
     }
 }
 
