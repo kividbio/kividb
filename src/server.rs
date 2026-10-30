@@ -1344,6 +1344,19 @@ where
                                 selected_db,
                                 sets.iter().map(|(key, _)| key.as_bytes()),
                             );
+                            // A key past its time is expired before it is
+                            // written over, as a SET's key is outside a
+                            // transaction (`handler::expire_named_keys`).
+                            if crate::store::any_expiry() {
+                                for (key, _) in sets.iter() {
+                                    commands::helpers::lazy_expire_key(
+                                        &store,
+                                        &expiry_store,
+                                        selected_db,
+                                        key,
+                                    );
+                                }
+                            }
                             let mut guards: Vec<(usize, _)> = order
                                 .iter()
                                 .map(|&i| (shard_ptrs[i], shards[i].write()))

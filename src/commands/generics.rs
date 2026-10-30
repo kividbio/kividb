@@ -875,6 +875,18 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
             };
 
+            // A destination past its time is not there: in the source's
+            // database the write has expired it already (`handler`); in
+            // another, it is expired here.
+            if dst_db != src_db {
+                crate::commands::helpers::lazy_expire_key(
+                    ctx.store,
+                    ctx.expiry_store,
+                    dst_db,
+                    &dst_key,
+                );
+            }
+
             // Check destination
             let dst_db_ref = &ctx.store[dst_db];
             {
@@ -989,6 +1001,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if target_db >= ctx.store.len() || target_db == src_db {
                 return Some(resp_integer(0));
             }
+            // A key past its time in the target database is not there: it is
+            // expired, as the write expires the key it moves (`handler`).
+            crate::commands::helpers::lazy_expire_key(ctx.store, ctx.expiry_store, target_db, &key);
 
             // Read + remove from source
             let value = {

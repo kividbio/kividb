@@ -2296,3 +2296,26 @@ fn mset_drops_a_time_to_live_and_msetnx_sees_past_an_expired_key() {
     assert_eq!(c.cmds(&["MSETNX", "gone", "x", "third", "x"]).as_int(), 0);
     assert!(c.cmds(&["GET", "third"]).is_nil());
 }
+
+/// `INCR` on a key whose time to live has passed, before active expiry
+/// reaps it, starts from nothing, and the result has no time to live. It
+/// read the old value and kept the old deadline, so the acknowledged write
+/// was deleted moments later.
+#[test]
+fn test_incr_of_an_expired_key_starts_fresh_and_stays() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let keys: Vec<String> = (0..10).map(|i| format!("counter:{i}")).collect();
+    for key in &keys {
+        assert!(c.cmds(&["SET", key, "100", "PX", "20"]).is_ok());
+        thread::sleep(Duration::from_millis(30));
+        assert_eq!(c.cmds(&["INCR", key]).as_int(), 1, "INCR {key}");
+    }
+    // Past several active expiry cycles.
+    thread::sleep(Duration::from_millis(300));
+    for key in &keys {
+        assert_eq!(c.cmds(&["GET", key]).as_str(), "1", "GET {key}");
+        assert_eq!(c.cmds(&["TTL", key]).as_int(), -1, "TTL {key}");
+    }
+}

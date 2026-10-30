@@ -387,9 +387,13 @@ fn stale(seen: usize, due: usize) -> bool {
 }
 
 /// Delete the keys of `batch`, all in shard `shard` of database `db`, that
-/// are still past their time: one lock of the expiry shard to take them out
-/// of it, then one of the value shard, the two never held together, as every
-/// writer takes them. A key given a new time meanwhile is left alone.
+/// are still past their time. A key given a new time meanwhile is left
+/// alone.
+///
+/// The value shard and then the expiry shard are held together while the
+/// keys go (see [`take_if_due`]): taken out of the expiry store first and
+/// the keyspace after, with neither held between, a write to the key could
+/// come in between and be deleted with it once it had been acknowledged.
 fn expire_batch(
     store: &Store,
     expiry_store: &ExpiryStore,
@@ -399,37 +403,27 @@ fn expire_batch(
     batch: &[Key],
     now: SystemTime,
 ) {
-    let mut due: Vec<&Key> = Vec::with_capacity(batch.len());
-    {
-        let mut times = write_lock!(expiry_store[db][shard]);
-        for key in batch {
-            if times.get(key.as_str()).is_some_and(|exp| *exp < now) {
-                times.remove(key.as_str());
-                due.push(key);
-            }
-        }
-    }
-    if due.is_empty() {
-        return;
-    }
     // Both stores have as many shards, picked by the same hash; if that ever
     // changes, find each key's value shard.
     let values_db = &store[db];
     let same_shards = values_db.len() == expiry_store[db].len();
-    let mut gone: Vec<&Key> = Vec::with_capacity(due.len());
-    let mut freed: Vec<KiviDBValue> = Vec::with_capacity(due.len());
+    let mut gone: Vec<&Key> = Vec::with_capacity(batch.len());
+    let mut freed: Vec<KiviDBValue> = Vec::with_capacity(batch.len());
     if same_shards {
         let mut values = write_lock!(values_db[shard]);
-        for key in due {
-            if let Some(value) = values.remove(key.as_str()) {
-                freed.push(value);
-                gone.push(key);
+        let mut times = write_lock!(expiry_store[db][shard]);
+        for key in batch {
+            if times.get(key.as_str()).is_some_and(|exp| *exp < now) {
+                times.remove(key.as_str());
+                if let Some(value) = values.remove(key.as_str()) {
+                    freed.push(value);
+                    gone.push(key);
+                }
             }
         }
     } else {
-        for key in due {
-            if let Some(value) = write_lock!(store::get_shard(values_db, key)).remove(key.as_str())
-            {
+        for key in batch {
+            if let Some(value) = take_if_due(store, expiry_store, db, key, now) {
                 freed.push(value);
                 gone.push(key);
             }
@@ -667,7 +661,32 @@ pub fn take_key(
     removed
 }
 
-/// [`delete_key`] plus `expired_keys` stat — use only after an `is_expired` check (lazy TTL).
+/// `key` of database `db`, if its time has passed by `now`: taken out of
+/// the keyspace and its time out of the expiry store, the two shards held
+/// together (the value's, then the time's), so that no write to the key
+/// falls between the two and goes with it. `None`, and nothing touched, if
+/// it is not past its time, or has none. A time with no key left under it is
+/// taken out all the same.
+fn take_if_due(
+    store: &Store,
+    expiry_store: &ExpiryStore,
+    db: usize,
+    key: &str,
+    now: SystemTime,
+) -> Option<KiviDBValue> {
+    let mut values = write_lock!(store::get_shard(&store[db], key));
+    let mut times = write_lock!(get_expiry_shard(expiry_store, db, key));
+    if !times.get(key).is_some_and(|exp| *exp < now) {
+        return None;
+    }
+    times.remove(key);
+    drop(times);
+    values.remove(key)
+}
+
+/// [`delete_key`] plus `expired_keys` stat — use only after an `is_expired`
+/// check (lazy TTL). A key given a new time meanwhile, or a new value
+/// without one, is left alone.
 #[inline]
 pub fn delete_key_if_expired(
     store: &Store,
@@ -675,7 +694,12 @@ pub fn delete_key_if_expired(
     db: usize,
     key: &str,
 ) -> bool {
-    let removed = delete_key(store, expiry_store, db, key);
+    // Past it, not at it, as `is_expired` has it: the script's clock inside
+    // a script.
+    let now = crate::script_clock::wall_system_time_now();
+    let taken = take_if_due(store, expiry_store, db, key, now);
+    let removed = taken.is_some();
+    drop(taken);
     if removed {
         crate::stats::record_expired();
         crate::keyspace_events::notify_expired(store, db, key);
@@ -1392,5 +1416,34 @@ mod active_expiry_tests {
         while active_expire_cycle(&store, &expiry, &index, &mut odd) {}
         assert_eq!(times(&expiry), 0);
         assert_eq!(keys(&store), 0);
+    }
+
+    /// A lazy deletion takes a key past its time, and leaves one that was
+    /// given a new value without a time meanwhile, or a new time: what it
+    /// found expired is looked at again under the locks.
+    #[test]
+    fn a_lazy_deletion_looks_again() {
+        let store = store::new_store(1);
+        let expiry = store::new_expiry_store(1);
+        let past = SystemTime::now() - Duration::from_secs(5);
+        put(&store, &expiry, "gone", past);
+        assert!(is_expired(&expiry, 0, "gone"));
+        assert!(delete_key_if_expired(&store, &expiry, 0, "gone"));
+        assert_eq!((keys(&store), times(&expiry)), (0, 0));
+
+        // Found expired, then written over before the deletion got to it.
+        put(&store, &expiry, "k", past);
+        assert!(is_expired(&expiry, 0, "k"));
+        store_value(
+            &store,
+            &expiry,
+            0,
+            "k",
+            KiviDBValue::String(SharedBytes::from(&b"new"[..])),
+        );
+        assert!(!delete_key_if_expired(&store, &expiry, 0, "k"));
+        set_expiry(&expiry, 0, "k", SystemTime::now() + Duration::from_secs(60));
+        assert!(!delete_key_if_expired(&store, &expiry, 0, "k"));
+        assert_eq!((keys(&store), times(&expiry)), (1, 1));
     }
 }

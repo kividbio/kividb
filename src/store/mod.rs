@@ -81,8 +81,40 @@ impl Drop for ExpiryWrite<'_> {
     #[inline]
     fn drop(&mut self) {
         // Before the lock is released (the guard is dropped after this).
-        self.len.store(self.map.len(), Ordering::Release);
+        // Only a writer stores it, and this one holds the lock.
+        let (was, now) = (self.len.load(Ordering::Relaxed), self.map.len());
+        if was != now {
+            self.len.store(now, Ordering::Release);
+            if (was == 0) != (now == 0) {
+                timed_shard_changed(now != 0);
+            }
+        }
     }
+}
+
+/// Expiry shards, of every store, that hold at least one time, as of the
+/// last writer to let go of each. A write looks at it before it looks for
+/// the keys it names that are past their time (`handler`): with none
+/// anywhere, which is most datasets, that costs one load.
+static TIMED_SHARDS: AtomicUsize = AtomicUsize::new(0);
+
+#[cold]
+#[inline(never)]
+fn timed_shard_changed(timed: bool) {
+    if timed {
+        TIMED_SHARDS.fetch_add(1, Ordering::Release);
+    } else {
+        TIMED_SHARDS.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// Whether any key, of any store, may have a time to live. False only when
+/// no expiry shard held a time as its last writer let go; a writer adding
+/// the first one at this moment is not seen, as with
+/// [`ExpiryCell::holds_nothing`].
+#[inline(always)]
+pub fn any_expiry() -> bool {
+    TIMED_SHARDS.load(Ordering::Acquire) != 0
 }
 
 impl ExpiryCell {
@@ -119,6 +151,16 @@ impl ExpiryCell {
 impl Default for ExpiryCell {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for ExpiryCell {
+    fn drop(&mut self) {
+        // A store dropped with times in it (a replica's staging store, a
+        // test's) leaves the count as if it had been emptied.
+        if self.len.load(Ordering::Acquire) != 0 {
+            timed_shard_changed(false);
+        }
     }
 }
 
