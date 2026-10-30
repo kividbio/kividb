@@ -499,6 +499,7 @@ fn expire_batch(
     for key in gone {
         crate::stats::record_expired();
         crate::stats::EXPIRED_KEYS_ACTIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::eviction::forget(db, key.as_bytes());
         crate::keyspace_events::notify_expired(store, db, key);
         crate::watch::expired(store, db, key);
         crate::tracking::expired(store, key);
@@ -826,6 +827,7 @@ pub fn delete_key_if_expired(
     drop(taken);
     if removed {
         crate::stats::record_expired();
+        crate::eviction::forget(db, key.as_bytes());
         crate::keyspace_events::notify_expired(store, db, key);
         crate::watch::expired(store, db, key);
         crate::tracking::expired(store, key);
