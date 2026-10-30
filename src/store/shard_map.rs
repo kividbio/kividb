@@ -254,7 +254,7 @@ pub struct ShardMap {
     /// [`UNPINNED`] here, never writes it.
     now: AtomicU64,
     /// Keys past their time that writes under this lock put new values
-    /// over, to be announced as `expired` when it lets go.
+    /// over, to be expired when it lets go (`expiry::written_over`).
     written_over: Vec<String>,
 }
 
@@ -336,17 +336,14 @@ fn now_at(now: &AtomicU64) -> u64 {
 }
 
 /// A key a write found past its time: expired lazily, as Redis counts it.
-/// Kept for the write lock to announce once it lets go (`ShardWrite`).
+/// Kept for the write lock to expire once it lets go (`ShardWrite`): its
+/// `expired` event, the clients watching or caching it, its documents, and
+/// the `DEL` propagated before the write's own record.
 #[cold]
 #[inline(never)]
 fn written_over_expired(over: &mut Vec<String>, key: &[u8]) {
     crate::stats::record_expired();
-    if crate::keyspace_events::KS_FLAGS.load(std::sync::atomic::Ordering::Relaxed)
-        & crate::keyspace_events::KS_EXPIRED
-        != 0
-    {
-        over.push(String::from_utf8_lossy(key).into_owned());
-    }
+    over.push(String::from_utf8_lossy(key).into_owned());
 }
 
 /// How far ahead a pass over the list asks for entries' lines.

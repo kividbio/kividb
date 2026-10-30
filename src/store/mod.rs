@@ -74,8 +74,9 @@ pub struct ShardLock {
     ttls: AtomicUsize,
     /// Whether `map` holds any key, as of the last writer to let go.
     keys: AtomicBool,
-    /// The store (its address) and database this shard is in, for the
-    /// `expired` events of keys a write puts a value over.
+    /// The store (its address) and database this shard is in, for what is
+    /// done about keys past their time that a write puts a value over
+    /// (`expiry::written_over`).
     place: std::sync::OnceLock<(usize, usize)>,
 }
 
@@ -125,8 +126,10 @@ impl Drop for ShardWrite<'_> {
 }
 
 impl ShardWrite<'_> {
-    /// Let go of the shard, then announce `expired` for the keys past their
-    /// time that writes under the lock put new values over.
+    /// Let go of the shard, then expire the keys past their time that
+    /// writes under the lock put new values over: their events, watches,
+    /// caches and indexes, and their `DEL` propagated, all before the
+    /// write's own (`expiry::written_over`).
     #[cold]
     #[inline(never)]
     fn unlock_and_announce(&mut self) {
@@ -134,7 +137,7 @@ impl ShardWrite<'_> {
         // SAFETY: dropped once, here, from `drop`; `map` is not used after.
         unsafe { std::mem::ManuallyDrop::drop(&mut self.map) };
         if let Some(&(store, db)) = self.lock.place.get() {
-            crate::keyspace_events::written_over_expired(store, db, &keys);
+            crate::expiry::written_over(store, db, &keys);
         }
     }
 }

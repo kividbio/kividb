@@ -293,6 +293,15 @@ pub fn active_expire_cycle(
     index_store: &IndexStore,
     cursor: &mut ExpireCursor,
 ) -> bool {
+    // A replica expires nothing itself: its master's `DEL`s say what has
+    // gone (see `expiry`). Its clients are told a key past its time is not
+    // there all the same.
+    let target = crate::expiry::of(store);
+    if target.as_ref().is_some_and(crate::expiry::Target::on_replica) {
+        return false;
+    }
+    // Whom the keys it expires are told to, if anyone.
+    let told = target.filter(crate::expiry::Target::observed);
     // The shards this cycle's part owns.
     let shards: usize = store
         .iter()
@@ -329,7 +338,7 @@ pub fn active_expire_cycle(
             // the budget ran out after the first batch: with 49 million keys
             // the thread spent its time copying and deleted 5,000 a second.
             loop {
-                let (looked, due) = expire_pass(store, index_store, db, shard, now);
+                let (looked, due) = expire_pass(store, index_store, db, shard, now, told.as_ref());
                 seen += looked;
                 due_total += due;
                 if started.elapsed() >= ACTIVE_EXPIRE_BUDGET {
@@ -361,14 +370,26 @@ fn expire_pass(
     db: usize,
     shard: usize,
     now: u64,
+    told: Option<&crate::expiry::Target>,
 ) -> (usize, usize) {
     // Found with the shard locked for reading: what reads it goes on.
     let (due, looked) = read_lock!(store[db][shard]).due(now, ACTIVE_EXPIRE_BATCH);
-    if !due.is_empty() {
-        expire_batch(store, index_store, db, shard, &due, now);
+    if told.is_some() {
+        // Each `DEL` is ordered against the writes to its key, which wait
+        // on it meanwhile: a few keys at a time, so that a batch does not
+        // hold the order of a thousand keys at once.
+        for part in due.chunks(TOLD_BATCH) {
+            expire_batch(store, index_store, db, shard, part, now, told);
+        }
+    } else if !due.is_empty() {
+        expire_batch(store, index_store, db, shard, &due, now, None);
     }
     (looked, due.len())
 }
+
+/// How many keys active expiry deletes under one lock of their shard while
+/// their `DEL`s are propagated.
+const TOLD_BATCH: usize = 64;
 
 /// Whether more than [`ACTIVE_EXPIRE_STALE_PERCENT`] of the `seen` keys
 /// were `due`: a cycle whose time ran out with this true is behind.
@@ -378,7 +399,9 @@ fn stale(seen: usize, due: usize) -> bool {
 
 /// Delete the keys of `batch`, all in shard `shard` of database `db`, that
 /// are still past their time, under one lock of the shard. A key given a new
-/// time meanwhile, or a new value without one, is left alone.
+/// time meanwhile, or a new value without one, is left alone. With `told`,
+/// the `DEL` of each key deleted is propagated, as a write's record is:
+/// holding the write gate and the keys' order from before they go.
 fn expire_batch(
     store: &Store,
     index_store: &IndexStore,
@@ -386,7 +409,9 @@ fn expire_batch(
     shard: usize,
     batch: &[Key],
     now: u64,
+    told: Option<&crate::expiry::Target>,
 ) {
+    let ordered = told.map(|_| crate::expiry::order(db, batch.iter().map(|k| k.as_bytes())));
     let mut gone: Vec<&Key> = Vec::with_capacity(batch.len());
     let mut freed: Vec<store::Taken> = Vec::with_capacity(batch.len());
     {
@@ -398,6 +423,10 @@ fn expire_batch(
             }
         }
     }
+    if let Some(told) = told {
+        told.propagate(db, gone.iter().map(|key| key.as_str()));
+    }
+    drop(ordered);
     // Freed outside the lock.
     drop(freed);
     for key in gone {
@@ -466,8 +495,12 @@ pub fn spawn_active_expire_task(
     index_store: IndexStore,
     pubsub: crate::pubsub::PubSubHub,
     latency: crate::latency::SharedLatencyTracker,
+    repl_state: &std::sync::Arc<crate::replication::ReplState>,
+    hub_tx: &crate::replication::HubTx,
 ) {
     crate::keyspace_events::register_hub(&store, &pubsub);
+    // Where the keys it expires are told (see `expiry`).
+    crate::expiry::register(&store, repl_state, hub_tx);
     crate::vector::register_index_store(&store, &index_store);
     // Whatever was loaded at startup that has field TTLs.
     crate::field_expiry::rescan(&store);
@@ -657,11 +690,28 @@ pub fn take_key(store: &Store, db: usize, key: &str) -> Option<KiviDBValue> {
 
 /// [`delete_key`] plus `expired_keys` stat — use only after an `is_expired`
 /// check (lazy TTL). A key given a new time meanwhile is left alone.
+///
+/// On a master something reads the write stream of, the key's `DEL` is
+/// propagated, ordered as a write to the key is. A replica deletes nothing:
+/// it answers whether the key is past its time, and leaves it for its
+/// master's `DEL` (see `expiry`).
 #[inline]
 pub fn delete_key_if_expired(store: &Store, db: usize, key: &str) -> bool {
     let shard = store::get_shard(&store[db], key);
+    let target = crate::expiry::of(store);
+    if target.as_ref().is_some_and(crate::expiry::Target::on_replica) {
+        return read_lock!(shard).expires(key).is_some_and(is_past);
+    }
+    let told = target.filter(crate::expiry::Target::observed);
+    let ordered = told
+        .as_ref()
+        .map(|_| crate::expiry::order(db, std::iter::once(key.as_bytes())));
     let removed = write_lock!(shard).remove_if_due(key, now_ms());
     let gone = removed.is_some();
+    if gone && let Some(told) = &told {
+        told.propagate(db, [key]);
+    }
+    drop(ordered);
     drop(removed);
     if gone {
         crate::stats::record_expired();
@@ -1292,7 +1342,7 @@ mod active_expiry_tests {
         let shard = due("k");
         // A key past its time takes a new one only with a new value.
         put(&store, "k", SystemTime::now() + Duration::from_secs(60));
-        expire_batch(&store, &index, 0, shard, &[Key::from("k")], now);
+        expire_batch(&store, &index, 0, shard, &[Key::from("k")], now, None);
         let shard = due("j");
         store_value(
             &store,
@@ -1300,7 +1350,7 @@ mod active_expiry_tests {
             "j",
             KiviDBValue::String(SharedBytes::from(&b"w"[..])),
         );
-        expire_batch(&store, &index, 0, shard, &[Key::from("j")], now);
+        expire_batch(&store, &index, 0, shard, &[Key::from("j")], now, None);
         assert_eq!(keys(&store), 2);
         assert_eq!(times(&store), 1);
     }
@@ -1354,7 +1404,7 @@ mod active_expiry_tests {
                 n += 1;
             }
         }
-        let (looked, due) = expire_pass(&store, &index, 0, 0, now_ms());
+        let (looked, due) = expire_pass(&store, &index, 0, 0, now_ms(), None);
         assert_eq!(due, ACTIVE_EXPIRE_BATCH);
         assert_eq!(
             looked, ACTIVE_EXPIRE_BATCH,

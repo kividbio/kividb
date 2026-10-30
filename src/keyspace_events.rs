@@ -329,6 +329,9 @@ fn hub_for_id(id: usize) -> Option<crate::pubsub::PubSubHub> {
 /// database `db` of the store at `store`: `expired` for each, as Redis
 /// announces a key a write finds expired, before the write's own events.
 pub fn written_over_expired(store: usize, db: usize, keys: &[String]) {
+    if KS_FLAGS.load(Ordering::Relaxed) & KS_EXPIRED == 0 {
+        return;
+    }
     if let Some(hub) = hub_for_id(store) {
         for key in keys {
             notify(&hub, db, KS_EXPIRED, "expired", key);

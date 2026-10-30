@@ -2022,7 +2022,11 @@ pub fn register_index_store(store: &crate::store::Store, index_store: &IndexStor
 
 /// `key` of database `db` expired and was deleted by a read.
 pub fn unindex_expired(store: &crate::store::Store, db: usize, key: &str) {
-    let id = store_id(store);
+    unindex_expired_in(store_id(store), db, key);
+}
+
+/// [`unindex_expired`], for the store at address `id`.
+pub fn unindex_expired_in(id: usize, db: usize, key: &str) {
     let index_store = INDEX_STORES
         .read()
         .iter()
