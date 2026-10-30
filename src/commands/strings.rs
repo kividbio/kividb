@@ -111,6 +111,20 @@ impl<'a> WriteShards<'a> {
     }
 }
 
+/// The value shard of `key`, for a write to it: a key past its time is
+/// expired first, as the dispatcher expires the keys other writes name
+/// (`handler::expire_named_keys`, which leaves these to this). The keyspace
+/// and the expiry store have the same shards, so the key is hashed once for
+/// both.
+#[inline]
+fn shard_for_write<'s>(ctx: &Ctx, db: &'s store::Db, key: &str) -> &'s store::Shard {
+    let index = store::shard_index(db.len(), key);
+    if is_expired_in(&ctx.expiry_store[*ctx.selected_db][index], key) {
+        delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+    }
+    &db[index]
+}
+
 pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
     let cmd = &ctx.cmd;
 
@@ -623,7 +637,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Ok(k) => k,
                 Err(_) => return Some(resp_error("ERR must be valid UTF-8")),
             };
-            let shard = store::get_shard(db, &key);
+            let shard = shard_for_write(ctx, db, &key);
             let mut map = write_lock!(shard);
 
             let next = match map.get(key.as_str()) {
@@ -1016,7 +1030,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
             let db = &ctx.store[*ctx.selected_db];
-            let shard = store::get_shard(db, &key);
+            let shard = shard_for_write(ctx, db, &key);
             let mut map = write_lock!(shard);
             // Check overflow properly
             let next = match map.get(key.as_str()) {
@@ -1061,7 +1075,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Err(_) => return Some(resp_error("ERR must be valid UTF-8")),
             };
             let db = &ctx.store[*ctx.selected_db];
-            let shard = store::get_shard(db, &key);
+            let shard = shard_for_write(ctx, db, &key);
             let mut map = write_lock!(shard);
             let next = match map.get(key.as_str()) {
                 None => -1i64,
@@ -1107,7 +1121,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
             let db = &ctx.store[*ctx.selected_db];
-            let shard = store::get_shard(db, &key);
+            let shard = shard_for_write(ctx, db, &key);
             let mut map = write_lock!(shard);
             let next = match map.get(key.as_str()) {
                 None => -delta,

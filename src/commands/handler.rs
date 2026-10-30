@@ -1031,6 +1031,14 @@ fn run_command(ctx: &mut Ctx, name: &str) -> Vec<u8> {
 /// key's time again under its shards' locks.
 #[inline(never)]
 fn expire_named_keys(ctx: &Ctx, name: &str) {
+    // These look at their keys' times themselves, with the shard they have
+    // found already (`strings::shard_for_write`, and `DEL`'s own check).
+    if matches!(
+        name,
+        "SET" | "DEL" | "UNLINK" | "INCR" | "INCRBY" | "DECR" | "DECRBY"
+    ) {
+        return;
+    }
     let db = *ctx.selected_db;
     for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
         if let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) {

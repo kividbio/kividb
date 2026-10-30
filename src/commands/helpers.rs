@@ -381,13 +381,31 @@ fn expire_pass(
     told: Option<&crate::expiry::Target>,
 ) -> (usize, usize) {
     let mut looked = 0usize;
-    let due: Vec<Key> = read_lock!(expiry_store[db][shard])
+    // The earliest of the times that have not ended.
+    let mut earliest: Option<SystemTime> = None;
+    let cell = &expiry_store[db][shard];
+    let times = read_lock!(cell);
+    let due: Vec<Key> = times
         .iter()
-        .inspect(|_| looked += 1)
+        .inspect(|(_, exp)| {
+            looked += 1;
+            if **exp >= now {
+                earliest = Some(earliest.map_or(**exp, |at| at.min(**exp)));
+            }
+        })
         .filter(|(_, exp)| **exp < now)
         .take(ACTIVE_EXPIRE_BATCH)
         .map(|(k, _)| k.clone())
         .collect();
+    // Every time in the shard looked at, and none ended: until a writer
+    // comes, a write needs no lock to know its key has not expired
+    // (`is_expired_in`).
+    if due.is_empty()
+        && let Some(at) = earliest
+    {
+        cell.note_due_after(&times, unix_nanos(at));
+    }
+    drop(times);
     if told.is_some() {
         // Each `DEL` is ordered against the writes to its key, which wait
         // on it meanwhile: a few keys at a time, so that a batch does not
@@ -632,9 +650,27 @@ pub fn expiry_unix_millis(ts_ms: u64) -> SystemTime {
 }
 
 pub fn is_expired(expiry_store: &ExpiryStore, db: usize, key: &str) -> bool {
-    let shard = get_expiry_shard(expiry_store, db, key);
+    is_expired_in(get_expiry_shard(expiry_store, db, key), key)
+}
+
+/// Nanoseconds since the Unix epoch; 0 before it.
+#[inline]
+fn unix_nanos(at: SystemTime) -> u64 {
+    at.duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos() as u64)
+}
+
+/// [`is_expired`], for a key whose expiry shard the caller has found.
+#[inline]
+pub fn is_expired_in(shard: &store::ExpiryCell, key: &str) -> bool {
     // Usually: nothing in this shard expires, and no lock is needed to know.
     if shard.holds_nothing() {
+        return false;
+    }
+    let now = crate::script_clock::wall_system_time_now();
+    // Or nothing in it can have yet (see `ExpiryCell::due_after`).
+    let after = shard.due_after();
+    if after != 0 && unix_nanos(now) < after {
         return false;
     }
     let map = read_lock!(shard);
@@ -643,7 +679,7 @@ pub fn is_expired(expiry_store: &ExpiryStore, db: usize, key: &str) -> bool {
         // in, as in Redis, so never for less than it was given. Never while
         // this thread is loading a dataset or applying its master's stream
         // (`expiry::held`).
-        Some(exp) => crate::script_clock::wall_system_time_now() > *exp && !crate::expiry::held(),
+        Some(exp) => now > *exp && !crate::expiry::held(),
         None => false,
     }
 }
@@ -1578,6 +1614,33 @@ mod active_expiry_tests {
         drop(script);
         batch.join().unwrap();
         assert_eq!(keys(&store), 0);
+    }
+
+    /// A pass that finds nothing due in a shard says so, and a key there is
+    /// then known not to have expired without a lock; a write to the
+    /// shard's times makes that unknown again.
+    #[test]
+    fn a_shard_with_nothing_due_is_known_to_be_so() {
+        let store = store::new_store(1);
+        let expiry = store::new_expiry_store(1);
+        let index: IndexStore = Default::default();
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        put(&store, &expiry, "k", future);
+        let shard = store::shard_index(expiry[0].len(), "k");
+        let cell = &expiry[0][shard];
+        assert_eq!(cell.due_after(), 0);
+        let (_, due) = expire_pass(&store, &expiry, &index, 0, shard, SystemTime::now(), None);
+        assert_eq!(due, 0);
+        assert_eq!(cell.due_after(), unix_nanos(future));
+        assert!(!is_expired(&expiry, 0, "k"));
+
+        set_expiry(&expiry, 0, "k", SystemTime::now() - Duration::from_secs(5));
+        assert_eq!(cell.due_after(), 0, "a writer let go of the shard");
+        assert!(is_expired(&expiry, 0, "k"));
+        // A pass that finds something due says nothing.
+        let (_, due) = expire_pass(&store, &expiry, &index, 0, shard, SystemTime::now(), None);
+        assert_eq!(due, 1);
+        assert_eq!(cell.due_after(), 0);
     }
 
     /// While a thread loads a dataset, a key past its time is not expired
