@@ -234,3 +234,250 @@ mod tests {
         assert!(of(&store).is_none());
     }
 }
+
+/// What a master tells for a key that goes for its time, and what a
+/// replica, or a thread loading a dataset or applying its master's stream,
+/// does with one: through the hub's queue, as a replica's stream gets it.
+///
+/// Adapted from Parikalp Bhardwaj's tests of his design of the same fix
+/// (his `replication::expiry`): his `Applying` is [`hold`] here, his
+/// `store_follows_master` is [`Target::on_replica`], and the sweep is given
+/// its [`Target`] as the expiry threads give it.
+#[cfg(test)]
+mod propagation_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use tokio::sync::mpsc;
+
+    use crate::commands::helpers::{
+        ExpireCursor, active_expire_cycle, delete_key_if_expired, expire_on_read, is_expired,
+        now_ms,
+    };
+    use crate::replication::{HubMsg, ReplState};
+    use crate::shared_bytes::SharedBytes;
+    use crate::store::{self, Store, ValueRef};
+    use crate::types::KiviDBValue;
+    use crate::vector::IndexStore;
+
+    /// A store whose expired keys are told to a hub queue, as with a
+    /// replica attached. Never freed: a store is found by its address
+    /// (`of`), which a store freed here could hand to another test's.
+    fn server() -> (Store, Arc<ReplState>, mpsc::UnboundedReceiver<HubMsg>) {
+        let store = store::new_store(2);
+        std::mem::forget(Arc::clone(&store));
+        let repl_state = Arc::new(ReplState::new_master());
+        repl_state.backlog_active.store(true, Ordering::Relaxed);
+        let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        super::register(&store, &repl_state, &hub_tx);
+        (store, repl_state, hub_rx)
+    }
+
+    /// Everything in the stream so far, as one text.
+    fn stream(rx: &mut mpsc::UnboundedReceiver<HubMsg>) -> String {
+        let mut out = String::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let HubMsg::Propagate(payload) = msg {
+                out.push_str(&String::from_utf8_lossy(&payload));
+            }
+        }
+        out
+    }
+
+    fn command(parts: &[&str]) -> String {
+        let parts: Vec<Vec<u8>> = parts.iter().map(|p| p.as_bytes().to_vec()).collect();
+        String::from_utf8(crate::resp::write::encode_resp_command(&parts)).unwrap()
+    }
+
+    /// `key` = `5`, long past its time.
+    fn stale(store: &Store, db: usize, key: &str) {
+        drop(store::get_shard(&store[db], key).write().insert_expiring(
+            key,
+            KiviDBValue::String(SharedBytes::from(&b"5"[..])),
+            Some(1),
+        ));
+    }
+
+    /// What `key` holds, past its time or not.
+    fn text(store: &Store, db: usize, key: &str) -> Option<Vec<u8>> {
+        match store::get_shard(&store[db], key).read().peek_expiring(key) {
+            Some((ValueRef::String(b), _)) => Some(b.to_vec()),
+            _ => None,
+        }
+    }
+
+    fn with_ttl(store: &Store) -> usize {
+        store[0].iter().map(|s| s.read().ttl_len()).sum()
+    }
+
+    #[test]
+    fn a_read_that_finds_a_key_past_its_time_sends_its_deletion_once() {
+        let (store, _repl, mut rx) = server();
+        stale(&store, 0, "k");
+        assert!(delete_key_if_expired(&store, 0, "k"));
+        assert!(!delete_key_if_expired(&store, 0, "k"), "gone already");
+        let sent = stream(&mut rx);
+        assert_eq!(
+            sent.matches(&command(&["UNLINK", "k"])).count(),
+            1,
+            "{sent:?}"
+        );
+        assert!(!sent.contains("DEL\r\n"), "{sent:?}");
+    }
+
+    /// Told once the shard is let go of, and before anything after the
+    /// write: with the write still holding the key's order, so that its
+    /// own record follows the `DEL` (`written_over`).
+    #[test]
+    fn a_write_over_a_key_past_its_time_sends_its_deletion_once_it_lets_go() {
+        let (store, _repl, mut rx) = server();
+        stale(&store, 0, "k");
+        let shard = store::get_shard(&store[0], "k");
+        let mut map = shard.write();
+        drop(map.insert_str("k", b"1"));
+        assert!(stream(&mut rx).is_empty(), "not before the lock lets go");
+        drop(map);
+        // After the `SELECT 0` that opens the stream.
+        assert_eq!(
+            stream(&mut rx),
+            format!("{}{}", command(&["SELECT", "0"]), command(&["UNLINK", "k"]))
+        );
+        assert_eq!(text(&store, 0, "k"), Some(b"1".to_vec()));
+        assert_eq!(shard.read().expires("k"), None);
+        // A live key written over sends nothing.
+        drop(shard.write().insert_expiring(
+            "k",
+            KiviDBValue::String(SharedBytes::from(&b"2"[..])),
+            Some(now_ms() + 3_600_000),
+        ));
+        drop(shard.write().insert_str("k", b"3"));
+        assert!(stream(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn the_sweep_sends_each_deletion_once() {
+        let (store, _repl, mut rx) = server();
+        let index = IndexStore::default();
+        let keys: Vec<String> = (0..50).map(|i| format!("gone:{i}")).collect();
+        for key in &keys {
+            stale(&store, 0, key);
+        }
+        let target = super::of(&store);
+        let mut cursor = ExpireCursor::default();
+        let mut cycles = 0;
+        while with_ttl(&store) > 0 {
+            active_expire_cycle(&store, &index, &mut cursor, target.as_ref());
+            cycles += 1;
+            assert!(cycles < 1000, "the sweep never got to them");
+        }
+        // A read after the sweep finds nothing to delete.
+        for key in &keys {
+            assert!(!delete_key_if_expired(&store, 0, key));
+        }
+        let sent = stream(&mut rx);
+        for key in &keys {
+            assert_eq!(sent.matches(&command(&["UNLINK", key])).count(), 1, "{key}");
+        }
+    }
+
+    /// While no client has left database 0 its writes carry no `SELECT`:
+    /// a deletion in another database goes back to 0 in the same piece,
+    /// and leaves the stream there (`replication::expired_for_stream`).
+    /// Once one has, it goes with its `SELECT`, as every write then does.
+    #[test]
+    fn a_key_of_another_database_is_deleted_there_and_the_stream_goes_back() {
+        let (store, repl, mut rx) = server();
+        stale(&store, 1, "k");
+        assert!(delete_key_if_expired(&store, 1, "k"));
+        assert_eq!(
+            stream(&mut rx),
+            format!(
+                "{}{}{}",
+                command(&["SELECT", "1"]),
+                command(&["UNLINK", "k"]),
+                command(&["SELECT", "0"])
+            )
+        );
+        assert_eq!(repl.repl_stream_last_db.load(Ordering::Relaxed), 0);
+
+        repl.several_databases.store(true, Ordering::Relaxed);
+        stale(&store, 1, "j");
+        assert!(delete_key_if_expired(&store, 1, "j"));
+        assert_eq!(
+            stream(&mut rx),
+            format!("{}{}", command(&["SELECT", "1"]), command(&["UNLINK", "j"]))
+        );
+        assert_eq!(repl.repl_stream_last_db.load(Ordering::Relaxed), 1);
+    }
+
+    /// Loading a dataset, or applying the master's stream, every key is
+    /// live: a write keeps the old value's time, and nothing is deleted or
+    /// sent.
+    #[test]
+    fn under_a_hold_nothing_is_past_its_time() {
+        let (store, _repl, mut rx) = server();
+        stale(&store, 0, "k");
+        let shard = store::get_shard(&store[0], "k");
+        {
+            let _hold = super::hold();
+            assert!(!is_expired(&store, 0, "k"));
+            assert!(!delete_key_if_expired(&store, 0, "k"));
+            assert!(shard.read().get("k").is_some());
+            // INCR as the master ran it, with `k` alive.
+            drop(shard.write().insert_str("k", b"6"));
+            assert_eq!(shard.read().expires("k"), Some(1));
+        }
+        assert!(stream(&mut rx).is_empty());
+        assert_eq!(text(&store, 0, "k"), Some(b"6".to_vec()));
+        // Past its time again, now that nothing holds it.
+        assert!(is_expired(&store, 0, "k"));
+    }
+
+    /// A write that has changed its key and not yet sent itself on holds
+    /// the key's order (`write_order`): a deletion of the key for its time
+    /// waits for it, so that the write's record is not after the deletion
+    /// in the stream when its change was before it in the store.
+    #[test]
+    fn a_deletion_waits_for_a_write_to_its_key_still_on_its_way() {
+        let (store, _repl, mut rx) = server();
+        stale(&store, 0, "k");
+        let writing = crate::write_order::lock_keys(0, std::iter::once(&b"k"[..]));
+        let deleted = Arc::new(AtomicBool::new(false));
+        let deleter = {
+            let (store, deleted) = (Arc::clone(&store), Arc::clone(&deleted));
+            std::thread::spawn(move || {
+                assert!(delete_key_if_expired(&store, 0, "k"));
+                deleted.store(true, Ordering::SeqCst);
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!deleted.load(Ordering::SeqCst), "it did not wait");
+        drop(writing);
+        deleter.join().unwrap();
+        assert!(stream(&mut rx).contains(&command(&["UNLINK", "k"])));
+    }
+
+    /// A replica takes a key past its time as gone, and leaves it, to reads
+    /// and to the sweep, for its master's deletion.
+    #[test]
+    fn a_replica_neither_deletes_nor_sends() {
+        let (store, repl, mut rx) = server();
+        repl.become_slave();
+        stale(&store, 0, "k");
+        assert!(delete_key_if_expired(&store, 0, "k"), "gone, to a read");
+        assert!(expire_on_read(&store, 0, "k"));
+        let target = super::of(&store);
+        assert!(target.as_ref().is_some_and(super::Target::on_replica));
+        let mut cursor = ExpireCursor::default();
+        let index = IndexStore::default();
+        assert!(!active_expire_cycle(
+            &store,
+            &index,
+            &mut cursor,
+            target.as_ref()
+        ));
+        assert_eq!(text(&store, 0, "k"), Some(b"5".to_vec()), "still there");
+        assert!(stream(&mut rx).is_empty());
+    }
+}
