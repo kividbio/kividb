@@ -567,9 +567,11 @@ pub fn from_unix_ms(ms: u64) -> SystemTime {
 }
 
 /// Now, as times to live are kept: the script's clock inside a script.
+/// The same number as `unix_ms(script_clock::wall_system_time_now())`,
+/// without the round trip through a `SystemTime` and two 128-bit divisions.
 #[inline]
 pub fn now_ms() -> u64 {
-    unix_ms(crate::script_clock::wall_system_time_now())
+    crate::script_clock::wall_ms_now()
 }
 
 /// Whether the time to live that ends at `at` has: past it, not at it. A

@@ -74,6 +74,24 @@ pub fn ttl_wall_ms_now() -> u128 {
     })
 }
 
+/// [`ttl_wall_ms_now`] as a `u64`, in 64-bit arithmetic: what a key's
+/// entry keeps a time to live as, read on every write lock that looks at a
+/// key with one.
+#[inline]
+pub fn wall_ms_now() -> u64 {
+    SCRIPT_STATE.with(|s| {
+        if let Some((_, sec, us)) = s.borrow().1 {
+            return sec.saturating_mul(1000).saturating_add(u64::from(us / 1000));
+        }
+        let d = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        d.as_secs()
+            .saturating_mul(1000)
+            .saturating_add(u64::from(d.subsec_millis()))
+    })
+}
+
 /// The time by which a time to live is set, told and ended: the wall clock
 /// in whole milliseconds, and during a script the moment the script began.
 ///
