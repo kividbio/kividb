@@ -618,9 +618,11 @@ pub(crate) fn no_such_index(name: &str) -> String {
     format!("SEARCH_INDEX_NOT_FOUND Index not found: {name}")
 }
 
-/// Whether `error`, a node's error reply without its `-`, is
-/// [`no_such_index`]'s, or the wording KiviDB used before it.
+/// Whether `error`, a node's error reply without its `-` (its line ending
+/// may still be there), is [`no_such_index`]'s, or the wording KiviDB used
+/// before it.
 pub(crate) fn is_no_such_index(error: &str) -> bool {
+    let error = error.trim_end();
     error.starts_with("SEARCH_INDEX_NOT_FOUND ") || error.ends_with("no such index")
 }
 

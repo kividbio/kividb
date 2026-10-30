@@ -2225,8 +2225,23 @@ fn a_cursor_reads_an_aggregation_a_few_rows_at_a_time() {
     assert_eq!(titles(&reply), ["Alien", "Arrival", "Fargo"]);
     assert_eq!(reply.arr()[1].i().to_string(), cursor);
     // Another index's name does not open it.
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "a3other",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "a3other:",
+            "SCHEMA",
+            "title",
+            "TEXT",
+        ])
+        .ok()
+    );
     assert_eq!(
-        c.cmd(&["FT.CURSOR", "READ", "q1", &cursor]).err(),
+        c.cmd(&["FT.CURSOR", "READ", "a3other", &cursor]).err(),
         "Cursor not found"
     );
     assert!(c.cmd(&["FT.CURSOR", "DEL", "a3", &cursor]).ok());
