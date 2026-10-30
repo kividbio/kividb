@@ -381,29 +381,29 @@ fn expire_pass(
     told: Option<&crate::expiry::Target>,
 ) -> (usize, usize) {
     let mut looked = 0usize;
-    // The earliest of the times that have not ended.
-    let mut earliest: Option<SystemTime> = None;
+    let mut due: Vec<Key> = Vec::new();
+    // The earliest of the times that have not ended: one comparison more
+    // for each, in a pass that runs over every time of the shard ten times
+    // a second.
+    let mut earliest = UNIX_EPOCH + Duration::from_secs(1 << 40);
     let cell = &expiry_store[db][shard];
     let times = read_lock!(cell);
-    let due: Vec<Key> = times
-        .iter()
-        .inspect(|(_, exp)| {
-            looked += 1;
-            if **exp >= now {
-                earliest = Some(earliest.map_or(**exp, |at| at.min(**exp)));
+    for (key, exp) in times.iter() {
+        looked += 1;
+        if *exp < now {
+            due.push(key.clone());
+            if due.len() == ACTIVE_EXPIRE_BATCH {
+                break;
             }
-        })
-        .filter(|(_, exp)| **exp < now)
-        .take(ACTIVE_EXPIRE_BATCH)
-        .map(|(k, _)| k.clone())
-        .collect();
+        } else if *exp < earliest {
+            earliest = *exp;
+        }
+    }
     // Every time in the shard looked at, and none ended: until a writer
     // comes, a write needs no lock to know its key has not expired
     // (`is_expired_in`).
-    if due.is_empty()
-        && let Some(at) = earliest
-    {
-        cell.note_due_after(&times, unix_nanos(at));
+    if due.is_empty() && looked > 0 {
+        cell.note_due_after(&times, unix_nanos(earliest));
     }
     drop(times);
     if told.is_some() {
