@@ -1584,9 +1584,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 if new_list.is_empty() {
                     dst_map.remove(dst.as_str());
                 } else {
-                    dst_map.insert(
+                    dst_map.insert_expiring(
                         Key::from(dst),
                         KiviDBValue::List(std::sync::Arc::new(parking_lot::RwLock::new(new_list))),
+                        None,
                     );
                 }
                 return Some(resp_integer(count));

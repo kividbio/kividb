@@ -680,6 +680,28 @@ fn test_sort_store() {
     assert_eq!(c.cmds(&["TYPE", "dst"]).as_str(), "list");
 }
 
+// SORT STORE should clear any existing TTL on destination for non-empty result.
+#[test]
+fn test_sort_store_clears_existing_ttl() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "src", "3", "1", "2"]);
+    c.cmds(&["SET", "dst", "old_value"]);
+    c.cmds(&["EXPIRE", "dst", "100"]);
+    assert!(c.cmds(&["TTL", "dst"]).as_int() > 0);
+
+    let count = c.cmds(&["SORT", "src", "STORE", "dst"]).as_int();
+    assert_eq!(count, 3);
+    assert_eq!(c.cmds(&["TTL", "dst"]).as_int(), -1);
+    assert_eq!(c.cmds(&["TYPE", "dst"]).as_str(), "list");
+
+    let range = c.cmds(&["LRANGE", "dst", "0", "-1"]);
+    let vals: Vec<&str> = range.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(vals, vec!["1", "2", "3"]);
+}
+
 // SORT STORE on empty result deletes the destination key.
 #[test]
 fn test_sort_store_empty_deletes_dst() {
