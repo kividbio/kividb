@@ -1919,6 +1919,50 @@ pub fn replicate_from_background(
         .store(db as u64, Ordering::Relaxed);
 }
 
+/// A key this master has expired in database `db`: `parts`, its `DEL` (or
+/// `UNLINK`), to replicas, taps and the AOF, as the write that deleted it
+/// (see `expiry`). As [`replicate_from_background`], but also from inside a
+/// command: in a script, its AOF record goes with the script's records.
+///
+/// Call it holding the write gate and the key's place in the order of
+/// writes (`expiry::order`), with the key already gone. A replica
+/// propagates nothing: its master tells it what expired.
+pub fn replicate_expired(repl_state: &ReplState, hub_tx: &HubTx, db: usize, parts: &[Vec<u8>]) {
+    if repl_state.is_slave() {
+        return;
+    }
+    let aof = crate::aof::AOF_ENABLED.load(Ordering::Relaxed);
+    let has_replicas = repl_state.feeds_hub();
+    let tapped = repl_state.stream_taps.load(Ordering::Relaxed) > 0;
+    if !aof && !has_replicas && !tapped {
+        return;
+    }
+    // One AOF record: a `SELECT` and the `DEL` it qualifies must not be
+    // separable by a crash.
+    let mut record = Vec::new();
+    for payload in repl_state.encode_for_stream(db, parts) {
+        repl_state
+            .repl_offset
+            .fetch_add(payload.len() as u64, Ordering::Relaxed);
+        if tapped {
+            repl_state.feed_taps(&payload);
+        }
+        if aof {
+            record.extend_from_slice(&payload);
+        }
+        if has_replicas {
+            propagate(hub_tx, payload);
+        }
+    }
+    if aof {
+        crate::aof::AOF_WRITTEN.fetch_add(record.len() as u64, Ordering::Relaxed);
+        crate::aof::queue_record(&crate::commands::ctx::GlobalAofSender, record);
+    }
+    repl_state
+        .repl_stream_last_db
+        .store(db as u64, Ordering::Relaxed);
+}
+
 /// Append an already-encoded write to this node's own AOF and stop.
 ///
 /// Used by both nodes that must log without forwarding: a replica applying its

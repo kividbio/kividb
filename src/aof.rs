@@ -1176,6 +1176,13 @@ pub fn replay_aof(
     repl_state: &std::sync::Arc<crate::replication::ReplState>,
     skip_preamble: bool,
 ) -> std::io::Result<ReplayStats> {
+    // Each record is applied to the keys as they were when it was written:
+    // a key the master expired since has a `DEL` further on. Expired by the
+    // clock now, `SET k 5 PXAT t` and an `INCR k` made while it lived
+    // replayed after `t` as an INCR of a missing key, `1` with no time to
+    // live, for good. The preamble's keys too, past their time or not. And
+    // active expiry waits until the replay is done (`expiry::loading`).
+    let _loading = crate::expiry::loading_guard();
     let buf = std::fs::read(path)?;
     let mut stats = ReplayStats {
         bytes: buf.len() as u64,
@@ -1332,6 +1339,11 @@ pub fn recover_local(
     compaction_tx: &crate::vector::CompactionTx,
     repl_state: &std::sync::Arc<crate::replication::ReplState>,
 ) -> LocalRecovery {
+    // Keys past their time are loaded too, from the snapshot as from the
+    // log: the log's writes to them were made while they lived, and a key
+    // that went since has its `DEL` in the log. Expiry takes the rest out
+    // once the server is up, and logs their `DEL`s.
+    let _loading = crate::expiry::loading_guard();
     let mut recovery = LocalRecovery {
         index_names: Vec::new(),
         hnsw_loaded: false,

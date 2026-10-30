@@ -289,12 +289,24 @@ fn expiry_threads() -> usize {
 /// 1.8 million live keys takes more than its 25 ms, and each found only the
 /// few that had come due since. That was a whole core of eight, taken from
 /// the workers, with its shard locks in their way.
+///
+/// `target` is where the store's expired keys are told (`expiry::of`),
+/// found once by the thread rather than on every cycle.
 pub fn active_expire_cycle(
     store: &Store,
     expiry_store: &ExpiryStore,
     index_store: &IndexStore,
     cursor: &mut ExpireCursor,
+    target: Option<&crate::expiry::Target>,
 ) -> bool {
+    // A replica expires nothing itself: its master's `DEL`s say what has
+    // gone (see `expiry`). Its clients are told a key past its time is not
+    // there all the same.
+    if target.is_some_and(crate::expiry::Target::on_replica) {
+        return false;
+    }
+    // Whom the keys it expires are told to, if anyone.
+    let told = target.filter(|target| target.observed());
     // The shards this cycle's part owns.
     let shards: usize = expiry_store
         .iter()
@@ -332,7 +344,8 @@ pub fn active_expire_cycle(
             // the budget ran out after the first batch: with 49 million keys
             // the thread spent its time copying and deleted 5,000 a second.
             loop {
-                let (looked, due) = expire_pass(store, expiry_store, index_store, db, shard, now);
+                let (looked, due) =
+                    expire_pass(store, expiry_store, index_store, db, shard, now, told);
                 seen += looked;
                 due_total += due;
                 if started.elapsed() >= ACTIVE_EXPIRE_BUDGET {
@@ -365,6 +378,7 @@ fn expire_pass(
     db: usize,
     shard: usize,
     now: SystemTime,
+    told: Option<&crate::expiry::Target>,
 ) -> (usize, usize) {
     let mut looked = 0usize;
     let due: Vec<Key> = read_lock!(expiry_store[db][shard])
@@ -374,11 +388,22 @@ fn expire_pass(
         .take(ACTIVE_EXPIRE_BATCH)
         .map(|(k, _)| k.clone())
         .collect();
-    if !due.is_empty() {
-        expire_batch(store, expiry_store, index_store, db, shard, &due, now);
+    if told.is_some() {
+        // Each `DEL` is ordered against the writes to its key, which wait
+        // on it meanwhile: a few keys at a time, so that a batch does not
+        // hold the order of a thousand keys at once.
+        for part in due.chunks(TOLD_BATCH) {
+            expire_batch(store, expiry_store, index_store, db, shard, part, now, told);
+        }
+    } else if !due.is_empty() {
+        expire_batch(store, expiry_store, index_store, db, shard, &due, now, None);
     }
     (looked, due.len())
 }
+
+/// How many keys active expiry deletes under one lock of their shard while
+/// their `DEL`s are propagated.
+const TOLD_BATCH: usize = 64;
 
 /// Whether more than [`ACTIVE_EXPIRE_STALE_PERCENT`] of the `seen` keys
 /// were `due`: a cycle whose time ran out with this true is behind.
@@ -388,12 +413,15 @@ fn stale(seen: usize, due: usize) -> bool {
 
 /// Delete the keys of `batch`, all in shard `shard` of database `db`, that
 /// are still past their time. A key given a new time meanwhile is left
-/// alone.
+/// alone. With `told`, the `DEL` of each key deleted is propagated, as a
+/// write's record is: holding the write gate and the keys' order from
+/// before they go.
 ///
 /// The value shard and then the expiry shard are held together while the
 /// keys go (see [`take_if_due`]): taken out of the expiry store first and
 /// the keyspace after, with neither held between, a write to the key could
 /// come in between and be deleted with it once it had been acknowledged.
+#[allow(clippy::too_many_arguments)]
 fn expire_batch(
     store: &Store,
     expiry_store: &ExpiryStore,
@@ -402,7 +430,15 @@ fn expire_batch(
     shard: usize,
     batch: &[Key],
     now: SystemTime,
+    told: Option<&crate::expiry::Target>,
 ) {
+    let ordered = told.map(|_| crate::expiry::order(db, batch.iter().map(|k| k.as_bytes())));
+    // Writes were paused, for a handoff say, while this waited for the
+    // gate: a `DEL` now would come after the cut the handoff took. The
+    // keys go once the pause is over.
+    if ordered.is_some() && crate::pause::expiry_deferred() {
+        return;
+    }
     // Both stores have as many shards, picked by the same hash; if that ever
     // changes, find each key's value shard.
     let values_db = &store[db];
@@ -429,6 +465,10 @@ fn expire_batch(
             }
         }
     }
+    if let Some(told) = told {
+        told.propagate(db, gone.iter().map(|key| key.as_str()));
+    }
+    drop(ordered);
     // Freed outside the lock.
     drop(freed);
     for key in gone {
@@ -487,8 +527,12 @@ pub fn spawn_active_expire_task(
     index_store: IndexStore,
     pubsub: crate::pubsub::PubSubHub,
     latency: crate::latency::SharedLatencyTracker,
+    repl_state: &std::sync::Arc<crate::replication::ReplState>,
+    hub_tx: &crate::replication::HubTx,
 ) {
     crate::keyspace_events::register_hub(&store, &pubsub);
+    // Where the keys it expires are told (see `expiry`).
+    crate::expiry::register(&store, repl_state, hub_tx);
     crate::vector::register_index_store(&store, &index_store);
     // Whatever was loaded at startup that has field TTLs.
     crate::field_expiry::rescan(&store);
@@ -501,6 +545,7 @@ pub fn spawn_active_expire_task(
         let latency = (part == 0).then(|| latency.clone());
         std::thread::spawn(move || {
             let mut cursor = ExpireCursor::part(part, parts);
+            let target = crate::expiry::of(&store);
             // Every 100 ms, as Redis's `hz 10`; straight after a cycle that
             // is behind (its time ran out while more than a tenth of what it
             // looked at was expired), as Redis goes on while it keeps finding
@@ -511,11 +556,20 @@ pub fn spawn_active_expire_task(
                 // Nothing expires while writes are paused, as in Redis: the
                 // keys and fields that come due meanwhile go once the pause
                 // is over.
-                if crate::pause::expiry_deferred() {
+                // Nor while the server loads its dataset: a key loaded past
+                // its time stays for the writes to it that follow in the log
+                // (see `expiry::loading_guard`).
+                if crate::pause::expiry_deferred() || crate::expiry::loading() {
                     continue;
                 }
                 let started = std::time::Instant::now();
-                let behind = active_expire_cycle(&store, &expiry_store, &index_store, &mut cursor);
+                let behind = active_expire_cycle(
+                    &store,
+                    &expiry_store,
+                    &index_store,
+                    &mut cursor,
+                    target.as_ref(),
+                );
                 wait = Duration::from_millis(if behind { 1 } else { 100 });
                 let Some(latency) = &latency else {
                     continue;
@@ -579,8 +633,10 @@ pub fn is_expired(expiry_store: &ExpiryStore, db: usize, key: &str) -> bool {
     let map = read_lock!(shard);
     match map.get(key) {
         // Past it, not at it: a key lives through the millisecond it ends
-        // in, as in Redis, so never for less than it was given.
-        Some(exp) => crate::script_clock::wall_system_time_now() > *exp,
+        // in, as in Redis, so never for less than it was given. Never while
+        // this thread is loading a dataset or applying its master's stream
+        // (`expiry::held`).
+        Some(exp) => crate::script_clock::wall_system_time_now() > *exp && !crate::expiry::held(),
         None => false,
     }
 }
@@ -687,6 +743,11 @@ fn take_if_due(
 /// [`delete_key`] plus `expired_keys` stat — use only after an `is_expired`
 /// check (lazy TTL). A key given a new time meanwhile, or a new value
 /// without one, is left alone.
+///
+/// On a master something reads the write stream of, the key's `DEL` is
+/// propagated, ordered as a write to the key is. A replica deletes nothing:
+/// it answers whether the key is past its time, and leaves it for its
+/// master's `DEL` (see `expiry`).
 #[inline]
 pub fn delete_key_if_expired(
     store: &Store,
@@ -694,11 +755,31 @@ pub fn delete_key_if_expired(
     db: usize,
     key: &str,
 ) -> bool {
+    // Loading, or applying the master's stream: a key's time does not make
+    // it gone. The `DEL` that follows does.
+    if crate::expiry::held() {
+        return false;
+    }
+    let target = crate::expiry::of(store);
+    if target
+        .as_ref()
+        .is_some_and(crate::expiry::Target::on_replica)
+    {
+        return is_expired(expiry_store, db, key);
+    }
+    let told = target.filter(crate::expiry::Target::observed);
+    let ordered = told
+        .as_ref()
+        .map(|_| crate::expiry::order(db, std::iter::once(key.as_bytes())));
     // Past it, not at it, as `is_expired` has it: the script's clock inside
     // a script.
     let now = crate::script_clock::wall_system_time_now();
     let taken = take_if_due(store, expiry_store, db, key, now);
     let removed = taken.is_some();
+    if removed && let Some(told) = &told {
+        told.propagate(db, [key]);
+    }
+    drop(ordered);
     drop(taken);
     if removed {
         crate::stats::record_expired();
@@ -1282,7 +1363,7 @@ mod active_expiry_tests {
         let mut cursor = ExpireCursor::default();
         let mut cycles = 0;
         while keys(&store) > 20_001 {
-            active_expire_cycle(&store, &expiry, &index, &mut cursor);
+            active_expire_cycle(&store, &expiry, &index, &mut cursor, None);
             cycles += 1;
             assert!(cycles < 1000, "the cycle never caught up");
         }
@@ -1315,6 +1396,7 @@ mod active_expiry_tests {
             shard,
             &[Key::from("k")],
             SystemTime::now(),
+            None,
         );
         assert_eq!(keys(&store), 1);
         assert_eq!(times(&expiry), 1);
@@ -1346,7 +1428,13 @@ mod active_expiry_tests {
         }
         put(&store, &expiry, "gone", past);
         let mut cursor = ExpireCursor::default();
-        assert!(!active_expire_cycle(&store, &expiry, &index, &mut cursor));
+        assert!(!active_expire_cycle(
+            &store,
+            &expiry,
+            &index,
+            &mut cursor,
+            None
+        ));
         assert_eq!(keys(&store), 2_000);
     }
 
@@ -1371,7 +1459,7 @@ mod active_expiry_tests {
                 n += 1;
             }
         }
-        let (looked, due) = expire_pass(&store, &expiry, &index, 0, 0, SystemTime::now());
+        let (looked, due) = expire_pass(&store, &expiry, &index, 0, 0, SystemTime::now(), None);
         assert_eq!(due, ACTIVE_EXPIRE_BATCH);
         assert_eq!(
             looked, ACTIVE_EXPIRE_BATCH,
@@ -1382,7 +1470,7 @@ mod active_expiry_tests {
         let mut cursor = ExpireCursor::default();
         let mut cycles = 0;
         while keys(&store) > 0 {
-            active_expire_cycle(&store, &expiry, &index, &mut cursor);
+            active_expire_cycle(&store, &expiry, &index, &mut cursor, None);
             cycles += 1;
             assert!(cycles < 1000, "never emptied");
         }
@@ -1399,7 +1487,7 @@ mod active_expiry_tests {
             put(&store, &expiry, &format!("gone:{i}"), past);
         }
         let mut even = ExpireCursor::part(0, 2);
-        while active_expire_cycle(&store, &expiry, &index, &mut even) {}
+        while active_expire_cycle(&store, &expiry, &index, &mut even, None) {}
         let shards = expiry[0].len();
         for (s, cell) in expiry[0].iter().enumerate() {
             let left = cell.read().len();
@@ -1413,7 +1501,7 @@ mod active_expiry_tests {
             .sum();
         assert!(odd_left > 0, "part 0 went through part 1's shards");
         let mut odd = ExpireCursor::part(1, 2);
-        while active_expire_cycle(&store, &expiry, &index, &mut odd) {}
+        while active_expire_cycle(&store, &expiry, &index, &mut odd, None) {}
         assert_eq!(times(&expiry), 0);
         assert_eq!(keys(&store), 0);
     }
@@ -1445,5 +1533,28 @@ mod active_expiry_tests {
         set_expiry(&expiry, 0, "k", SystemTime::now() + Duration::from_secs(60));
         assert!(!delete_key_if_expired(&store, &expiry, 0, "k"));
         assert_eq!((keys(&store), times(&expiry)), (1, 1));
+    }
+
+    /// While a thread loads a dataset, a key past its time is not expired
+    /// on it, and is not deleted.
+    #[test]
+    fn nothing_expires_while_held() {
+        let store = store::new_store(1);
+        let expiry = store::new_expiry_store(1);
+        put(
+            &store,
+            &expiry,
+            "k",
+            SystemTime::now() - Duration::from_secs(5),
+        );
+        {
+            let _hold = crate::expiry::hold();
+            assert!(!is_expired(&expiry, 0, "k"));
+            assert!(!delete_key_if_expired(&store, &expiry, 0, "k"));
+            assert!(!lazy_expire_key(&store, &expiry, 0, "k"));
+        }
+        assert_eq!(keys(&store), 1);
+        assert!(lazy_expire_key(&store, &expiry, 0, "k"));
+        assert_eq!(keys(&store), 0);
     }
 }

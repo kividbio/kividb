@@ -10,6 +10,7 @@ pub mod command_gate;
 pub mod commands;
 pub mod config;
 pub mod eviction;
+pub mod expiry;
 pub mod field_expiry;
 pub mod latency;
 pub mod lazyfree;
@@ -124,6 +125,8 @@ async fn server_tokio(
         Arc::clone(&index_store),
         pubsub.clone(),
         Arc::clone(&latency),
+        &repl_state,
+        &hub_tx,
     );
     let watch_registry = crate::watch::new_watch_registry();
     crate::watch::register_for(&store, &watch_registry);

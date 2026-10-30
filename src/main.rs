@@ -21,6 +21,7 @@ pub mod command_gate;
 mod commands;
 mod config;
 pub mod eviction;
+pub mod expiry;
 pub mod field_expiry;
 pub mod keyspace_events;
 pub mod keyspec;
@@ -694,6 +695,8 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
         Arc::clone(&index_store),
         pubsub.clone(),
         Arc::clone(&latency),
+        &repl_state,
+        &hub_tx,
     );
     if config.cluster_enabled {
         log_info!(
@@ -1444,6 +1447,8 @@ async fn async_main_tokio(
         Arc::clone(&index_store),
         pubsub.clone(),
         Arc::clone(&latency),
+        &repl_state,
+        &hub_tx,
     );
     let watch_registry = crate::watch::new_watch_registry();
     crate::watch::register_for(&store, &watch_registry);
