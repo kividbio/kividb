@@ -412,6 +412,12 @@ fn expire_batch(
     told: Option<&crate::expiry::Target>,
 ) {
     let ordered = told.map(|_| crate::expiry::order(db, batch.iter().map(|k| k.as_bytes())));
+    // Writes were paused, for a handoff say, while this waited for the
+    // gate: a `DEL` now would come after the cut the handoff took. The
+    // keys go once the pause is over.
+    if ordered.is_some() && crate::pause::expiry_deferred() {
+        return;
+    }
     let mut gone: Vec<&Key> = Vec::with_capacity(batch.len());
     let mut freed: Vec<store::Taken> = Vec::with_capacity(batch.len());
     {
