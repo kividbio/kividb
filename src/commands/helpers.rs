@@ -432,6 +432,13 @@ fn expire_batch(
     now: SystemTime,
     told: Option<&crate::expiry::Target>,
 ) {
+    // Not in the middle of a script or a transaction, which hold the
+    // command gate alone, as no key expires in the middle of one in Redis.
+    // A key a script wrote to and that then went before the script ended
+    // had its `DEL` logged ahead of the script's records, which go to the
+    // AOF together when it ends: replayed, the script's write made the key
+    // again. Taken first, as a command takes it.
+    let _command = crate::command_gate::enter();
     let ordered = told.map(|_| crate::expiry::order(db, batch.iter().map(|k| k.as_bytes())));
     // Writes were paused, for a handoff say, while this waited for the
     // gate: a `DEL` now would come after the cut the handoff took. The
@@ -1533,6 +1540,44 @@ mod active_expiry_tests {
         set_expiry(&expiry, 0, "k", SystemTime::now() + Duration::from_secs(60));
         assert!(!delete_key_if_expired(&store, &expiry, 0, "k"));
         assert_eq!((keys(&store), times(&expiry)), (1, 1));
+    }
+
+    /// Active expiry waits for a script or a transaction, which holds the
+    /// command gate alone, to finish: no key expires in the middle of one.
+    #[test]
+    fn a_batch_waits_for_a_script_to_finish() {
+        let store = store::new_store(1);
+        let expiry = store::new_expiry_store(1);
+        put(
+            &store,
+            &expiry,
+            "k",
+            SystemTime::now() - Duration::from_secs(5),
+        );
+        let shard = store::shard_index(expiry[0].len(), "k");
+        let script = crate::command_gate::enter_alone();
+        let batch = {
+            let (store, expiry) = (store.clone(), expiry.clone());
+            std::thread::spawn(move || {
+                let index: IndexStore = Default::default();
+                let batch = [Key::from("k")];
+                expire_batch(
+                    &store,
+                    &expiry,
+                    &index,
+                    0,
+                    shard,
+                    &batch,
+                    SystemTime::now(),
+                    None,
+                );
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(keys(&store), 1, "expired in the middle of a script");
+        drop(script);
+        batch.join().unwrap();
+        assert_eq!(keys(&store), 0);
     }
 
     /// While a thread loads a dataset, a key past its time is not expired
