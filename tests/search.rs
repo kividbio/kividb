@@ -2246,8 +2246,15 @@ fn a_cursor_reads_an_aggregation_a_few_rows_at_a_time() {
     assert!(c.cmd(&["FT.DROPINDEX", "a3"]).ok());
     assert_eq!(
         c.cmd(&["FT.CURSOR", "READ", "a3", &cursor]).err(),
-        "Cursor not found"
+        "SEARCH_INDEX_NOT_FOUND Index not found: a3"
     );
+    // Asked of an index that is not there, as Redis answers: first.
+    for sub in ["READ", "DEL", "GC"] {
+        assert_eq!(
+            c.cmd(&["FT.CURSOR", sub, "nosuch", "not-a-number"]).err(),
+            "SEARCH_INDEX_NOT_FOUND Index not found: nosuch"
+        );
+    }
 }
 
 /// `FT.EXPLAIN` echoed the query back; `FT.PROFILE` returned an empty array.

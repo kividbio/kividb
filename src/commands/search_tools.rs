@@ -194,6 +194,14 @@ pub(crate) fn ft_cursor(ctx: &mut Ctx) -> Option<Vec<u8>> {
     if !matches!(sub.as_str(), "READ" | "DEL" | "GC") {
         return Some(resp_error("Unknown subcommand"));
     }
+    // The index first, as in Redis. The cursors of one that has gone went
+    // with it.
+    if let Some(index) = cmd.get(2).map(|a| text(a))
+        && !ctx.index_store.read().contains_key(index)
+    {
+        CURSORS.lock().retain(|_, cursor| cursor.index != index);
+        return Some(resp_error(&crate::commands::search::no_such_index(index)));
+    }
     if sub == "GC" {
         // Collection of idle cursors: here that happens on every use.
         let mut cursors = CURSORS.lock();
@@ -209,15 +217,10 @@ pub(crate) fn ft_cursor(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "ERR wrong number of arguments for 'FT.CURSOR' command",
         ));
     };
-    let index_exists = ctx.index_store.read().contains_key(index);
-
     let mut cursors = CURSORS.lock();
     forget_idle(&mut cursors);
     let known = cursors.get(&id).is_some_and(|cursor| cursor.index == index);
-    if known && !index_exists {
-        cursors.remove(&id);
-    }
-    if !known || !index_exists {
+    if !known {
         return Some(resp_error(if sub == "DEL" {
             "Cursor does not exist"
         } else {
