@@ -9,6 +9,8 @@
 //
 // Each test runs its own servers, as processes: an AOF is replayed by a
 // restart, and a replica is held back by stopping its process.
+//
+// The I/O model is the platform's own unless `KIVIDB_TEST_IO_MODEL` says.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -211,6 +213,7 @@ impl Server {
     }
 
     fn run(&mut self) {
+        let io_model = std::env::var("KIVIDB_TEST_IO_MODEL").ok();
         let child = Command::new(env!("CARGO_BIN_EXE_kividb"))
             .current_dir(&self.dir)
             .args([
@@ -218,13 +221,12 @@ impl Server {
                 &self.port.to_string(),
                 "--bind",
                 "127.0.0.1",
-                "--io-model",
-                "tokio",
                 "--threads",
                 "4",
                 "--configfile",
                 "kividb.conf",
             ])
+            .args(io_model.iter().flat_map(|m| ["--io-model", m.as_str()]))
             .args(&self.extra)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
