@@ -611,8 +611,17 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
     Some(resp_map_for(resp, out))
 }
 
+/// The error for an index that does not exist, as Redis 8 gives it for
+/// every command that names one: `SEARCH_INDEX_NOT_FOUND`, then the name.
+/// Clients look for "not found" in it to know they should create the index.
 pub(crate) fn no_such_index(name: &str) -> String {
-    format!("{name}: no such index")
+    format!("SEARCH_INDEX_NOT_FOUND Index not found: {name}")
+}
+
+/// Whether `error`, a node's error reply without its `-`, is
+/// [`no_such_index`]'s, or the wording KiviDB used before it.
+pub(crate) fn is_no_such_index(error: &str) -> bool {
+    error.starts_with("SEARCH_INDEX_NOT_FOUND ") || error.ends_with("no such index")
 }
 
 // ── Running a filter ──────────────────────────────────────────────────────────

@@ -90,6 +90,21 @@ A patch release of 1.1.0.
   Anything else after the index name is now refused with `Unknown argument`.
 <!-- 1.1.3: wording at publish -->
 
+- **Search: a missing index is reported in Redis 8's words.** Every
+  command that names an index that does not exist (`FT.INFO`, `FT.SEARCH`,
+  `FT.AGGREGATE`, `FT.PROFILE`, `FT.EXPLAIN`, `FT.EXPLAINCLI`,
+  `FT.DROPINDEX`, `FT.ALTER`, `FT.ALIASADD`, `FT.ALIASUPDATE`,
+  `FT.ALIASLIST`, `FT.TAGVALS`, `FT.SPELLCHECK`, `FT.SYNUPDATE`,
+  `FT.SYNDUMP`, `FT.CURSOR`, `FT.HYBRID`) now replies
+  `SEARCH_INDEX_NOT_FOUND Index not found: <name>`, as Redis 8.10 does.
+  `FT.INFO`, `FT.SEARCH` and a few others replied `<name>: no such index`,
+  the rest `ERR no such index`. Clients that create the index when the
+  error says "not found" failed on a new database: mem0's Valkey store
+  could not start. This is a compatibility fix, but the text changes: a
+  client that looked for `no such index` must look for `Index not found`.
+  In a cluster, a node still giving the old words is understood.
+<!-- 1.1.3: wording at publish -->
+
 ## [1.1.2]
 
 A patch release of 1.1.0. It replaces 1.1.1, which was withdrawn.
