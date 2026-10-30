@@ -331,6 +331,7 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
             "maxmemory" => match memory_size(value) {
                 Some(v) => {
                     crate::RUNTIME_MAXMEMORY.store(v, std::sync::atomic::Ordering::Relaxed);
+                    crate::memory_use::limit_changed();
                     // A limit below what is in use is enforced
                     // now, not at the next write.
                     if v != 0 {

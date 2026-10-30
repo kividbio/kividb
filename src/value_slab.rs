@@ -202,7 +202,8 @@ fn capacity(class: usize) -> i32 {
 }
 
 /// The most blocks a slab nobody owns may hold and be in its class's list:
-/// a quarter of it free.
+/// a quarter of it free, or a sixty-fourth (at least one block) while memory
+/// is near `maxmemory`.
 ///
 /// Listed with the first block freed, a full slab went to the next thread
 /// that needed one, gave it that block and was full again: under random
@@ -210,9 +211,25 @@ fn capacity(class: usize) -> i32 {
 /// of another, a SET of 100 bytes took the class's lock twice, and eight
 /// threads on one class fell from 7.4 to 1.8 million SETs a second. Taken
 /// with a quarter free, a slab gives its owner hundreds of blocks a lock.
+///
+/// But what a slab has free until then is memory the process holds and
+/// cannot use. Where every write frees a block of another slab, the slabs
+/// settle between three quarters full and full: at its `maxmemory` a server
+/// evicts a key for every key it writes, and with 1 KB values and a limit of
+/// 1 GiB it held 1,203 MiB (#202); 100-byte values wasted more still. So near
+/// the limit (`memory_use::near_limit`) a slab is used again once a 64th of
+/// it is free, and the slabs stay within about 1.5% of full. A slab then
+/// gives its owner fewer blocks a lock (8 of 100 bytes, 1 of 1 KB), which
+/// next to the eviction each of those writes makes is nothing.
 #[inline]
 fn listable(class: usize) -> i32 {
-    capacity(class) - capacity(class) / 4
+    let capacity = capacity(class);
+    let free = if crate::memory_use::near_limit() {
+        (capacity / 64).max(1)
+    } else {
+        capacity / 4
+    };
+    capacity - free
 }
 
 #[derive(Clone, Copy)]
@@ -346,15 +363,19 @@ pub unsafe fn free(block: NonNull<u8>, class: usize) {
     // reads the state, the owner letting go writes the state and then reads
     // the count. With weaker orders both could read the old value (seen
     // under Miri), and the last free of a slab would settle it nowhere.
-    let before = slab.live.fetch_sub(1, Ordering::SeqCst);
-    // A slab nobody owns that now has room enough to be listed, or holds
-    // nothing, changes list. An owned one is settled when its owner lets go
-    // of it.
-    if (before == listable(class) + 1 || before == 1) && slab.state.load(Ordering::SeqCst) != OWNED
-    {
-        let partial = PARTIAL_SLABS[class].lock();
-        if slab.generation.load(Ordering::Relaxed) == generation {
-            settle(partial, slab, class);
+    let now = slab.live.fetch_sub(1, Ordering::SeqCst) - 1;
+    // A slab nobody owns that holds nothing goes back to the system, and a
+    // full one with room enough now goes in its class's list. Not only the
+    // free that brings it to [`listable`]: that moves with `maxmemory`, and a
+    // slab already below it is listed by its next free. An owned one is
+    // settled when its owner lets go of it.
+    if now == 0 || now <= listable(class) {
+        let state = slab.state.load(Ordering::SeqCst);
+        if state != OWNED && (now == 0 || state == FULL) {
+            let partial = PARTIAL_SLABS[class].lock();
+            if slab.generation.load(Ordering::Relaxed) == generation {
+                settle(partial, slab, class);
+            }
         }
     }
 }

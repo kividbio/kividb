@@ -642,6 +642,51 @@ fn what_is_on_disk_is_loaded_whatever_the_limit() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// At its limit a server frees a block for every block it takes, and what
+/// the slabs hold beyond the blocks in them is memory the process holds and
+/// cannot use: it stays small (#202). Used again only once a quarter of
+/// them was free, the slabs settled about 14% (1 KB values) and 25%
+/// (100-byte values) above what was in them.
+#[test]
+fn at_the_limit_the_slabs_stay_full() {
+    // (value size, room under the limit, keys written): about four times
+    // what fits.
+    for (size, room, keys) in [(1000, 16 * MB, 64_000), (100, 4 * MB, 128_000)] {
+        let server = Server::start(&["--maxmemory-policy", "allkeys-random"]);
+        let mut c = server.conn();
+        c.limit_to(room);
+        let value = "v".repeat(size);
+        // Pipelined, a thousand at a time; the keys evicted are spread over
+        // the slabs at random.
+        for batch in 0..keys / 1000 {
+            let mut buf = Vec::new();
+            for i in 0..1000 {
+                let key = format!("k{}", batch * 1000 + i);
+                buf.extend_from_slice(
+                    format!(
+                        "*3\r\n$3\r\nSET\r\n${}\r\n{key}\r\n${size}\r\n{value}\r\n",
+                        key.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+            c.writer.write_all(&buf).unwrap();
+            for _ in 0..1000 {
+                let reply = c.read();
+                assert!(reply.ok(), "{reply:?}");
+            }
+        }
+        let evicted = c.evicted();
+        assert!(evicted > keys as i64 / 2, "{evicted} evicted of {keys}");
+        let slabs: i64 = c.info("memory", "value_slab_bytes").parse().unwrap();
+        let live: i64 = c.info("memory", "value_slab_live_bytes").parse().unwrap();
+        assert!(
+            slabs - live <= live / 25 + 256 * KB,
+            "values of {size} bytes: {slabs} bytes of slabs for {live} bytes in them"
+        );
+    }
+}
+
 /// `RESTORE ... IDLETIME` and `FREQ` give the restored key the standing it
 /// had where it was dumped (#21). They were read and thrown away.
 #[test]

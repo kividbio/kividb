@@ -315,6 +315,26 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **Under `maxmemory`, the process holds about what it is allowed (#202).**
+  A server at its limit evicts a key for every key it writes, and the room a
+  key left in a slab of values was not used again until a quarter of that
+  slab was free: the slabs settled between three quarters full and full,
+  and the process held well over its `maxmemory`. One server thread, a
+  1 GiB limit, `allkeys-lfu`, 2 million keys of 1 KB read at random and
+  written on a miss: 1,204 MiB resident at its peak, 165 MiB of it free
+  space inside slabs; Redis 8.10 held 1,047 MiB. Near the limit (within an
+  eighth of it) a slab is now used again once a 64th of it is free: the
+  same run peaks at 1,039 MiB, 1.5% over the limit, with the same hit rate
+  and throughput. With values of 100 bytes to 16 KB and one request in ten
+  a `DEL`, the peak went from 1,112 to 1,072 MiB (Redis 1,063). Away from
+  the limit the slabs are used again at a quarter free, as before, which
+  keeps eight threads overwriting small values from contending. Nothing in
+  `INFO memory` changes meaning: `used_memory` is still what was allocated
+  (a value's block counted at its size class), `used_memory_rss` what the
+  kernel has given the process, `mem_fragmentation_ratio` the one over the
+  other, and eviction is still measured against `used_memory`; what is new
+  is that the difference between them stays small at the limit.
+
 - **An index rebuilt after an AOF replay held one vector of each HNSW
   field.** At startup from an append-only file without a snapshot preamble,
   the background pass that rebuilds the indexes skipped every vector after

@@ -12,10 +12,16 @@
 //! that threads do not contend), and the total is their sum. A thread's
 //! counter goes negative when it frees what another allocated; only the sum
 //! means anything.
+//!
+//! What is counted is what was asked for (a slab block at its class's size).
+//! What the process holds besides is free space: in the slabs, between
+//! blocks given back, and in the system allocator's heap. Near the limit the
+//! slabs keep theirs small (see [`near_limit`]), so that a process at its
+//! `maxmemory` holds about that much (#202).
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::cell::Cell;
-use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 
 /// What the counter is in front of: the system allocator, or mimalloc on
 /// Linux when built with the `mimalloc` feature.
@@ -138,6 +144,28 @@ pub fn allocated() -> usize {
 
 static RECENT: AtomicUsize = AtomicUsize::new(0);
 
+/// Whether memory was near `maxmemory` the last time a command looked
+/// ([`over`]).
+static NEAR: AtomicBool = AtomicBool::new(false);
+
+/// Whether memory is near `maxmemory`: within an eighth of it, or 4 MB.
+///
+/// The slabs of values read it to decide how much room a slab must have
+/// before it is used again (`value_slab::listable`). A server at its limit
+/// frees a block for every block it takes (it evicts to make room), and
+/// what a slab has free is memory the process holds and cannot use until
+/// the slab is taken again.
+#[inline]
+pub fn near_limit() -> bool {
+    NEAR.load(Ordering::Relaxed)
+}
+
+/// `maxmemory` was changed: memory is not near it until a command finds
+/// that it is.
+pub fn limit_changed() {
+    NEAR.store(false, Ordering::Relaxed);
+}
+
 thread_local! {
     static CALLS: Cell<u32> = const { Cell::new(0) };
 }
@@ -150,6 +178,8 @@ thread_local! {
 /// the limit, and then it is taken every time: far below the limit a figure
 /// a few commands old is as good as a new one, and near it the command
 /// after the one that went over is the one that has to see that it did.
+///
+/// Whether it is near is kept for the slabs: see [`near_limit`].
 pub fn over(limit: usize) -> bool {
     let calls = CALLS.with(|calls| {
         let n = calls.get();
@@ -158,6 +188,9 @@ pub fn over(limit: usize) -> bool {
     });
     let recent = RECENT.load(Ordering::Relaxed);
     let near = recent.saturating_add((limit / 8).max(4 << 20)) >= limit;
+    if near != NEAR.load(Ordering::Relaxed) {
+        NEAR.store(near, Ordering::Relaxed);
+    }
     let now = if near || calls.is_multiple_of(32) {
         let now = allocated();
         RECENT.store(now, Ordering::Relaxed);
