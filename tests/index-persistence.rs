@@ -2155,3 +2155,187 @@ fn hnsw_graph_gets_every_vector_after_an_aof_replay() {
     let _ = wait_for_exit(&mut srv2, Duration::from_secs(8));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// FT.DROPINDEX DD — the deletes are events, AOF records and survive a restart
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// `FT.DROPINDEX … DD` deletes the documents, each with a `del` event as in
+/// Redis. The AOF holds the drop without `DD`, then a DEL of what was
+/// deleted, and a restart replays that: the documents stay gone, the rest
+/// stays.
+#[test]
+fn dropindex_dd_is_logged_as_the_drop_and_deletes() {
+    let _serial = persist_serial();
+    let dir = temp_dir("aof_dd");
+    let port1 = free_port();
+    let mut srv1 = start_aof_server(port1, &dir, &[]);
+    assert!(
+        wait_for_server(port1, Duration::from_secs(10)),
+        "srv1 start"
+    );
+    let mut c = Conn::connect(port1);
+    assert!(
+        c.cmds(&["CONFIG", "SET", "notify-keyspace-events", "Eg"])
+            .is_ok()
+    );
+    assert!(
+        c.cmds(&[
+            "FT.CREATE",
+            "idx:dd",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "doc:",
+            "SCHEMA",
+            "body",
+            "TEXT",
+        ])
+        .is_ok()
+    );
+    assert!(
+        c.cmds(&[
+            "FT.CREATE",
+            "idx:ddj",
+            "ON",
+            "JSON",
+            "PREFIX",
+            "1",
+            "jdoc:",
+            "SCHEMA",
+            "$.body",
+            "AS",
+            "body",
+            "TEXT",
+        ])
+        .is_ok()
+    );
+    c.cmds(&["HSET", "doc:1", "body", "hello"]);
+    c.cmds(&["HSET", "doc:2", "body", "world"]);
+    c.cmds(&["SET", "doc:3", "a string, not a document"]);
+    c.cmds(&["HSET", "other:1", "body", "hello"]);
+    c.cmds(&["JSON.SET", "jdoc:1", "$", r#"{"body":"hello"}"#]);
+    c.cmds(&["HSET", "jdoc:2", "body", "a hash, not a JSON document"]);
+
+    let mut sub = Conn::connect(port1);
+    sub.cmds(&["SUBSCRIBE", "__keyevent@0__:del"]);
+    sub.cmds(&["SUBSCRIBE", "done"]);
+
+    assert!(c.cmds(&["FT.DROPINDEX", "idx:dd", "DD"]).is_ok());
+    assert!(c.cmds(&["FT.DROPINDEX", "idx:ddj", "dd"]).is_ok());
+    c.cmds(&["PUBLISH", "done", "1"]);
+    let mut deleted = Vec::new();
+    loop {
+        let message = sub.read_value();
+        let parts = message.as_array();
+        if parts[1].as_str() == "done" {
+            break;
+        }
+        deleted.push(parts[2].as_str().to_string());
+    }
+    deleted.sort();
+    assert_eq!(deleted, ["doc:1", "doc:2", "jdoc:1"]);
+    assert_eq!(c.cmds(&["EXISTS", "doc:1", "doc:2", "jdoc:1"]).as_int(), 0);
+    assert_eq!(
+        c.cmds(&["EXISTS", "doc:3", "other:1", "jdoc:2"]).as_int(),
+        3
+    );
+
+    // Written and synced: the AOF is flushed every second.
+    thread::sleep(Duration::from_millis(1500));
+    let aof = std::fs::read(dir.join("appendonly.aof")).unwrap();
+    let count = |needle: &[u8]| aof.windows(needle.len()).filter(|w| *w == needle).count();
+    assert_eq!(
+        count(b"*2\r\n$12\r\nFT.DROPINDEX\r\n$6\r\nidx:dd\r\n"),
+        1,
+        "the drop, without DD"
+    );
+    assert_eq!(
+        count(b"$2\r\nDD\r\n") + count(b"$2\r\ndd\r\n"),
+        0,
+        "DD logged"
+    );
+    assert_eq!(count(b"$3\r\nDEL\r\n"), 2, "a DEL for each index");
+    // Written, then deleted.
+    assert_eq!(count(b"$5\r\ndoc:1\r\n"), 2);
+    assert_eq!(count(b"$6\r\njdoc:1\r\n"), 2);
+    // Written only.
+    assert_eq!(count(b"$5\r\ndoc:3\r\n"), 1);
+    assert_eq!(count(b"$6\r\njdoc:2\r\n"), 1);
+
+    send_shutdown_nosave(port1);
+    assert!(
+        wait_for_exit(&mut srv1, Duration::from_secs(8)),
+        "srv1 stop"
+    );
+
+    let port2 = free_port();
+    let mut srv2 = start_aof_server(port2, &dir, &[]);
+    assert!(
+        wait_for_server(port2, Duration::from_secs(10)),
+        "srv2 start"
+    );
+    {
+        let mut c = Conn::connect(port2);
+        assert_eq!(c.cmds(&["EXISTS", "doc:1", "doc:2", "jdoc:1"]).as_int(), 0);
+        assert_eq!(
+            c.cmds(&["EXISTS", "doc:3", "other:1", "jdoc:2"]).as_int(),
+            3
+        );
+        assert!(c.cmds(&["FT._LIST"]).as_array().is_empty());
+    }
+    send_shutdown_nosave(port2);
+    let _ = wait_for_exit(&mut srv2, Duration::from_secs(8));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An AOF written before 1.1.3 has `FT.DROPINDEX … DD` in it, from a server
+/// that kept the documents. Replayed, it drops the index and keeps them, as
+/// that server did.
+#[test]
+fn a_dd_in_an_older_aof_keeps_the_documents() {
+    let _serial = persist_serial();
+    let dir = temp_dir("aof_old_dd");
+    let records: &[&[&str]] = &[
+        &["SELECT", "0"],
+        &[
+            "FT.CREATE",
+            "idx:old",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "doc:",
+            "SCHEMA",
+            "body",
+            "TEXT",
+        ],
+        &["HSET", "doc:1", "body", "hello"],
+        &["FT.DROPINDEX", "idx:old", "DD"],
+        &["HSET", "doc:2", "body", "after the drop"],
+    ];
+    let mut aof = Vec::new();
+    for record in records {
+        aof.extend_from_slice(format!("*{}\r\n", record.len()).as_bytes());
+        for part in *record {
+            aof.extend_from_slice(format!("${}\r\n{part}\r\n", part.len()).as_bytes());
+        }
+    }
+    std::fs::write(dir.join("appendonly.aof"), aof).unwrap();
+
+    let port = free_port();
+    let mut srv = start_aof_server(port, &dir, &[]);
+    assert!(
+        wait_for_server(port, Duration::from_secs(10)),
+        "server start"
+    );
+    {
+        let mut c = Conn::connect(port);
+        assert_eq!(c.cmds(&["EXISTS", "doc:1", "doc:2"]).as_int(), 2);
+        assert!(c.cmds(&["FT._LIST"]).as_array().is_empty());
+    }
+    send_shutdown_nosave(port);
+    let _ = wait_for_exit(&mut srv, Duration::from_secs(8));
+    let _ = std::fs::remove_dir_all(&dir);
+}

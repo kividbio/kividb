@@ -126,6 +126,8 @@ pub fn commands_for_propagation(
         "XTRIM" if cmd.get(3).is_some_and(|mark| *mark == b"~") => effects_take(),
         // Propagated as the pending-list changes they made; see `effects_begin`.
         "XREADGROUP" | "XCLAIM" | "XAUTOCLAIM" => effects_take(),
+        // The drop, then a DEL of each document `DD` deleted.
+        "FT.DROPINDEX" => effects_take(),
         "MIGRATE" => migrate_feed(cmd, resp),
         "LMOVEM" | "BLMOVEM" => lmovem_feed(name, cmd, resp),
         "TS.ADD" => ts_add_feed(cmd, resp),

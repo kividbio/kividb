@@ -78,6 +78,18 @@ A patch release of 1.1.0.
   place of whatever the indexes held for it before, so that a document
   renamed over another is found with its own vector and words.
 
+- **`FT.DROPINDEX index DD` deletes the documents, as in Redis.** `DD`
+  was ignored, and the documents of the index stayed: an application that
+  reset its search data this way (mem0's `Memory.reset()`, RedisVL's
+  `SearchIndex.delete()`) found its old documents still there. The keys the
+  index covered are now deleted, for HASH and JSON indexes alike, each with
+  a `del` keyspace event. Replicas and the AOF get the drop and a `DEL` of
+  each document deleted, as Redis sends them; a `DD` already in an AOF
+  written by an earlier 1.1, or sent by such a master, still keeps the
+  documents, as that server did. In a cluster every master deletes its own.
+  Anything else after the index name is now refused with `Unknown argument`.
+<!-- 1.1.3: wording at publish -->
+
 ## [1.1.2]
 
 A patch release of 1.1.0. It replaces 1.1.1, which was withdrawn.

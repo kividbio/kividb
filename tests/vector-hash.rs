@@ -5804,3 +5804,108 @@ fn test_vector_type_unknown_is_refused() {
         );
     }
 }
+
+// ── FT.DROPINDEX DD ───────────────────────────────────────────────────────────
+
+/// `FT.DROPINDEX index DD` deletes the documents the index covered, of HASH
+/// and JSON indexes, given by name or by alias; they were kept. From another
+/// database it deletes nothing, as in Redis, where the deletes run in the
+/// database selected.
+#[test]
+fn test_dropindex_dd_deletes_the_documents() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    assert!(
+        c.cmds(&[
+            "FT.CREATE",
+            "ddh",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "ddh:",
+            "SCHEMA",
+            "name",
+            "TEXT",
+        ])
+        .is_ok()
+    );
+    assert!(
+        c.cmds(&[
+            "FT.CREATE",
+            "ddj",
+            "ON",
+            "JSON",
+            "PREFIX",
+            "1",
+            "ddj:",
+            "SCHEMA",
+            "$.name",
+            "AS",
+            "name",
+            "TEXT",
+        ])
+        .is_ok()
+    );
+    c.cmds(&["HSET", "ddh:1", "name", "a"]);
+    c.cmds(&["HSET", "ddh:2", "name", "b"]);
+    c.cmds(&["SET", "ddh:3", "a string, not a document"]);
+    c.cmds(&["HSET", "ddother:1", "name", "c"]);
+    c.cmds(&["JSON.SET", "ddj:1", "$", r#"{"name":"a"}"#]);
+    c.cmds(&["HSET", "ddj:2", "name", "a hash, not a JSON document"]);
+
+    assert!(c.cmds(&["FT.DROPINDEX", "ddh", "BOGUS"]).is_error());
+    assert!(c.cmds(&["FT.DROPINDEX", "ddh", "DD", "DD"]).is_error());
+    assert!(c.cmds(&["FT.DROPINDEX", "ddh", "DD"]).is_ok());
+    assert_eq!(c.cmds(&["EXISTS", "ddh:1", "ddh:2"]).as_int(), 0);
+    assert_eq!(c.cmds(&["EXISTS", "ddh:3", "ddother:1"]).as_int(), 2);
+    assert!(c.cmds(&["FT.INFO", "ddh"]).is_error());
+
+    assert!(c.cmds(&["FT.ALIASADD", "ddj_alias", "ddj"]).is_ok());
+    assert!(c.cmds(&["FT.DROPINDEX", "ddj_alias", "dd"]).is_ok());
+    assert_eq!(c.cmds(&["EXISTS", "ddj:1"]).as_int(), 0);
+    assert_eq!(c.cmds(&["EXISTS", "ddj:2"]).as_int(), 1);
+    assert!(c.cmds(&["FT.INFO", "ddj"]).is_error());
+
+    // Without DD the documents stay.
+    assert!(
+        c.cmds(&[
+            "FT.CREATE",
+            "ddk",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "ddother:",
+            "SCHEMA",
+            "name",
+            "TEXT",
+        ])
+        .is_ok()
+    );
+    assert!(c.cmds(&["FT.DROPINDEX", "ddk"]).is_ok());
+    assert_eq!(c.cmds(&["EXISTS", "ddother:1"]).as_int(), 1);
+
+    // From another database: the index goes, its documents stay.
+    assert!(
+        c.cmds(&[
+            "FT.CREATE",
+            "ddx",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "ddother:",
+            "SCHEMA",
+            "name",
+            "TEXT",
+        ])
+        .is_ok()
+    );
+    assert!(c.cmds(&["SELECT", "1"]).is_ok());
+    assert!(c.cmds(&["FT.DROPINDEX", "ddx", "DD"]).is_ok());
+    assert!(c.cmds(&["SELECT", "0"]).is_ok());
+    assert_eq!(c.cmds(&["EXISTS", "ddother:1"]).as_int(), 1);
+    assert!(c.cmds(&["FT.INFO", "ddx"]).is_error());
+}
