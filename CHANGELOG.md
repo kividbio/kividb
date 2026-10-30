@@ -5,6 +5,50 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.3]
+
+A patch release of 1.1.0.
+<!-- 1.1.3: wording at publish -->
+
+### Changed
+
+- **`maxclients` is enforced.** `CONFIG SET` took it and `CONFIG GET` gave
+  it back, but nothing checked it, and a config file that set it did not
+  start (`unknown directive 'maxclients'`). Plaintext and TLS clients now
+  count against it, TLS ones from the start of their handshake; one more is
+  closed, a plaintext one after `ERR max number of clients reached`, as in
+  Redis. It is read from the config file, `INFO clients` gives the one in
+  effect, and lowering it leaves the clients already connected. The default
+  is 10000, as in Redis, within the open-file limit: at startup KiviDB
+  raises the soft limit (`ulimit -n`) to `maxclients` plus what the server
+  keeps for itself (32 files, or on io_uring 40 and 8 a worker) if the hard
+  limit allows, and lowers `maxclients` to fit if it does not, with a
+  warning. It does not start if not even one client fits. `CONFIG SET
+  maxclients` refuses a value the limit cannot hold, as Redis does.
+
+### Fixed
+
+<!-- 1.1.3: wording at publish -->
+- **A TLS client that does not finish its handshake no longer holds up the
+  others.** Handshakes ran one at a time in the TLS listener, so a client
+  that connected to `tls-port` and sent nothing kept every TLS client after
+  it waiting. Each handshake now runs in its connection's own task, and a
+  client that has not finished it within 10 seconds is disconnected, on both
+  I/O models. A failing accept on `tls-port` (out of file descriptors, most
+  often) is retried after 50 ms, rather than at once in a loop.
+
+- **A master drops a replica that has gone silent, after `repl-timeout`,
+  as Redis does.** A replica whose host went away without closing the
+  connection (a terminated VM, a lost network path, a paused container)
+  stayed in `INFO replication` as `state=online`, its lag growing, and was
+  counted in `connected_slaves` until the master restarted. Now a replica
+  that is online and sends no `REPLCONF ACK` for `repl-timeout` seconds (60
+  by default) is disconnected, with `Replication: disconnecting timedout
+  replica <ip>:<port>` in the log, on both I/O models and over plaintext
+  and TLS alike. A replica still loading the dataset sends no ACK and is
+  not timed out. `min-replicas-to-write` and `WAIT` were not misled: they
+  already went by each replica's last acknowledgement.
+
 ## [1.1.2]
 
 A patch release of 1.1.0. It replaces 1.1.1, which was withdrawn.
