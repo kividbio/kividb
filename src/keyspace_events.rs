@@ -315,11 +315,25 @@ pub fn register_hub(store: &crate::store::Store, hub: &crate::pubsub::PubSubHub)
 
 /// The hub registered for `store`.
 pub fn hub_for(store: &crate::store::Store) -> Option<crate::pubsub::PubSubHub> {
-    let id = store_id(store);
+    hub_for_id(store_id(store))
+}
+
+fn hub_for_id(id: usize) -> Option<crate::pubsub::PubSubHub> {
     HUBS.read()
         .iter()
         .find(|(known, _)| *known == id)
         .map(|(_, hub)| hub.clone())
+}
+
+/// Writes put new values over `keys`, which were past their time, in
+/// database `db` of the store at `store`: `expired` for each, as Redis
+/// announces a key a write finds expired, before the write's own events.
+pub fn written_over_expired(store: usize, db: usize, keys: &[String]) {
+    if let Some(hub) = hub_for_id(store) {
+        for key in keys {
+            notify(&hub, db, KS_EXPIRED, "expired", key);
+        }
+    }
 }
 
 /// A key's TTL ran out and the key was removed: publish `expired`.

@@ -1168,3 +1168,27 @@ fn test_scan_of_a_small_collection_returns_it_whole() {
     assert_ne!(parts[0].as_str(), "0", "a large set is paged");
     assert!(parts[1].as_array().len() < 300);
 }
+
+/// `RPUSH` onto a list whose time to live has passed, before active expiry
+/// reaps it, makes a new list without one. It pushed onto the old list,
+/// which then went, with the new element, at its old deadline.
+#[test]
+fn test_rpush_onto_an_expired_list_starts_fresh_and_stays() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let keys: Vec<String> = (0..10).map(|i| format!("queue:{i}")).collect();
+    for key in &keys {
+        assert_eq!(c.cmds(&["RPUSH", key, "a"]).as_int(), 1);
+        assert_eq!(c.cmds(&["PEXPIRE", key, "20"]).as_int(), 1);
+        thread::sleep(Duration::from_millis(30));
+        assert_eq!(c.cmds(&["RPUSH", key, "b"]).as_int(), 1, "RPUSH {key}");
+    }
+    thread::sleep(Duration::from_millis(300));
+    for key in &keys {
+        let items = c.cmds(&["LRANGE", key, "0", "-1"]);
+        let items: Vec<&str> = items.as_array().iter().map(|v| v.as_str()).collect();
+        assert_eq!(items, vec!["b"], "LRANGE {key}");
+        assert_eq!(c.cmds(&["TTL", key]).as_int(), -1, "TTL {key}");
+    }
+}

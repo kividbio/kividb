@@ -706,6 +706,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             let db = *ctx.selected_db;
             let db_ref = &ctx.store[db];
+            // `remove` takes a key past its time too.
+            if is_expired(ctx.store, db, &src) {
+                delete_key_if_expired(ctx.store, db, &src);
+            }
 
             // Read + remove from src, with its time to live
             let (value, expiry) = {
@@ -942,6 +946,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             if target_db >= ctx.store.len() || target_db == src_db {
                 return Some(resp_integer(0));
+            }
+
+            // `remove` takes a key past its time too.
+            if is_expired(ctx.store, src_db, &key) {
+                delete_key_if_expired(ctx.store, src_db, &key);
             }
 
             // Read + remove from source, with its time to live

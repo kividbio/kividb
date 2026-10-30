@@ -1284,7 +1284,8 @@ mod active_expiry_tests {
             shard
         };
         let shard = due("k");
-        set_expiry(&store, 0, "k", SystemTime::now() + Duration::from_secs(60));
+        // A key past its time takes a new one only with a new value.
+        put(&store, "k", SystemTime::now() + Duration::from_secs(60));
         expire_batch(&store, &index, 0, shard, &[Key::from("k")], now);
         let shard = due("j");
         store_value(
