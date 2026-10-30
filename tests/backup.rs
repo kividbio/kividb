@@ -1554,3 +1554,99 @@ fn a_script_past_its_time_limit_is_busy_and_can_be_killed() {
     let reply = c.cmd(&["EVAL", "return redis.call('GET', KEYS[1])", "1", "k"]);
     assert_eq!(reply.s(), "v");
 }
+
+// ── AOF off means no file, and no failure ────────────────────────────────────
+
+/// With `appendonly no`, a server in a directory it cannot write to used to
+/// die at startup: the writer thread opened `appendonly.aof` whether or not
+/// the AOF was on, and a failed open was fatal (#47). A read-only directory
+/// stands in for the wrong owner, the full disk or the hardened systemd unit.
+#[test]
+fn a_server_with_the_aof_off_starts_in_a_read_only_directory() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let port = free_port();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&dir, perms).unwrap();
+    }
+    let child = kividb(&dir, port, &[])
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("could not start kividb");
+    let server = Server { port, dir: dir.clone(), child };
+    let mut c = server.conn();
+    assert_eq!(c.cmd(&["PING"]).s(), "PONG");
+    assert_eq!(c.cmd(&["SET", "k", "v"]).s(), "OK");
+    assert_eq!(c.cmd(&["GET", "k"]).s(), "v");
+    // Nothing was created, and nothing is required: no appendonly.aof.
+    assert!(!dir.join("appendonly.aof").exists());
+    #[cfg(unix)]
+    {
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&dir, perms).unwrap();
+    }
+}
+
+/// Turning the AOF on later creates the log and logs into it, and turning it
+/// off closes it without removing it — Redis leaves the file where it is.
+#[test]
+fn the_aof_turned_on_at_runtime_logs_and_off_leaves_the_file() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    assert!(c.cmd(&["CONFIG", "SET", "appendonly", "yes"]).ok());
+    assert_eq!(c.cmd(&["SET", "before", "1"]).s(), "OK");
+    let aof = server.dir.join("appendonly.aof");
+    // The record is in the file within the fsync second.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut size = 0u64;
+    while Instant::now() < deadline {
+        size = std::fs::metadata(&aof).map(|m| m.len()).unwrap_or(0);
+        if size > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(size > 0, "appendonly.aof never received a record");
+    assert!(c.cmd(&["CONFIG", "SET", "appendonly", "no"]).ok());
+    assert_eq!(
+        c.cmd(&["CONFIG", "GET", "appendonly"]).field("appendonly").s(),
+        "no"
+    );
+    // Writes after the toggle are not logged; the file stays as it was.
+    assert_eq!(c.cmd(&["SET", "after", "1"]).s(), "OK");
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(std::fs::metadata(&aof).unwrap().len(), size);
+    assert!(aof.exists(), "turning the AOF off removes the file");
+}
+
+/// Enabling the AOF in a directory that cannot be opened for appending is an
+/// error the client is told, not an exit of the server; the flag stays off,
+/// and the server keeps serving.
+#[test]
+fn enabling_the_aof_where_it_cannot_be_opened_is_an_error_not_an_exit() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    // A directory in the log's place: opening `appendonly.aof` for appending
+    // fails there, even as root.
+    let blocker = dir.join("appendonly.aof");
+    std::fs::create_dir(&blocker).unwrap();
+    let port = free_port();
+    let child = kividb(&dir, port, &[])
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("could not start kividb");
+    let server = Server { port, dir: dir.clone(), child };
+    let mut c = server.conn();
+    let reply = c.cmd(&["CONFIG", "SET", "appendonly", "yes"]);
+    assert!(reply.is_err(), "enabling should fail: {reply:?}");
+    assert_eq!(
+        c.cmd(&["CONFIG", "GET", "appendonly"]).field("appendonly").s(),
+        "no"
+    );
+    // Still serving, still writable.
+    assert_eq!(c.cmd(&["SET", "k", "v"]).s(), "OK");
+    assert_eq!(c.cmd(&["GET", "k"]).s(), "v");
+}
