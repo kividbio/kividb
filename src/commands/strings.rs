@@ -278,6 +278,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // Looked up once; what follows asks this, not the map again.
             let existing = map.get(key);
             let key_exists = existing.is_some();
+            // A document written over leaves the indexes that hold it.
+            let was_document = matches!(
+                existing,
+                Some(ValueRef::Hash(_) | ValueRef::HashEx(_) | ValueRef::Json(_))
+            );
 
             // GET: capture old value before any mutation (nil if absent/wrong-type)
             let old_val: Option<SharedBytes> = if want_get {
@@ -390,6 +395,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // it is the allocator's time, neither of them the shard's to wait
             // for.
             drop(replaced);
+            if was_document {
+                crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
+            }
 
             notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "set", key);
             if !keepttl && expiry.is_some() {
@@ -470,7 +478,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
                 let removed = delete_key(ctx.store, *ctx.selected_db, key);
                 if removed {
-                    crate::vector::maybe_unindex(ctx.index_store, key);
+                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                     crate::vector::maybe_request_compaction(
                         ctx.index_store,
                         ctx.compaction_tx,
@@ -503,7 +511,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if new_abs <= now {
                 let removed = delete_key(ctx.store, *ctx.selected_db, key);
                 if removed {
-                    crate::vector::maybe_unindex(ctx.index_store, key);
+                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                     crate::vector::maybe_request_compaction(
                         ctx.index_store,
                         ctx.compaction_tx,
@@ -1768,7 +1776,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let removed = map.remove(key);
             drop(map);
             drop(removed);
-            crate::vector::maybe_unindex(ctx.index_store, key);
+            crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
             Some(resp_integer(1))
         }
 

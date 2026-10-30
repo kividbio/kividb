@@ -445,6 +445,28 @@ impl ShardMap {
         self.find_live(self.hash_of(key), key).is_some()
     }
 
+    /// `key`'s access word: when it was last used, or how often
+    /// (`eviction::Access`). `None` if there is no such key.
+    #[inline]
+    pub fn access(&self, key: &str) -> Option<u32> {
+        let key = key.as_bytes();
+        self.find(self.hash_of(key), key)
+            .map(|s| s.entry().access())
+    }
+
+    /// Make `key`'s access word over with `next`, written only if that
+    /// changes it. A read lock is enough: the word is atomic, and no part
+    /// of the key or its value (see `entry`'s note on it). Nothing happens
+    /// if there is no such key. The key is taken as the command gave it, in
+    /// bytes: a key is found by its bytes, and one that is not UTF-8 is not
+    /// there to find.
+    #[inline]
+    pub fn touch(&self, key: &[u8], next: impl FnOnce(u32) -> u32) {
+        if let Some(s) = self.find(self.hash_of(key), key) {
+            s.entry().touch(next);
+        }
+    }
+
     /// A hold on `key`'s entry: its key and value, readable once the shard
     /// is let go of, and unchanged for as long as it is held.
     pub fn get_ref(&self, key: &str) -> Option<EntryRef> {
@@ -500,6 +522,9 @@ impl ShardMap {
                         Ttl::Set(expires) => expires,
                     },
                 );
+                // The key's use goes on: a value written over keeps the
+                // count of an LFU policy, as in Redis.
+                entry.set_access(old.access());
                 *at.get_mut() = Slot::new(entry, hash);
                 ttl_replaced(list, old, entry);
                 // SAFETY: the table's hold on the old entry goes to the caller.
@@ -659,15 +684,17 @@ impl ShardMap {
         self.ttl.len()
     }
 
-    /// The key at place `index` of the list of keys with a time to live,
-    /// its value and when its time ends: what a pick at random from them is
-    /// (`index` modulo how many there are).
-    pub fn ttl_entry(&self, index: usize) -> Option<(&str, ValueRef<'_>, u64)> {
+    /// The entry at place `index` of the list of keys with a time to live:
+    /// what a pick at random from them is (`index` modulo how many there
+    /// are).
+    pub fn ttl_entry(&self, index: usize) -> Option<EntryView<'_>> {
         if self.ttl.is_empty() {
             return None;
         }
-        let e = self.ttl[index % self.ttl.len()];
-        Some((e.key_str(), e.value(), e.expires().unwrap_or(0)))
+        Some(EntryView {
+            entry: self.ttl[index % self.ttl.len()],
+            _map: std::marker::PhantomData,
+        })
     }
 
     /// Every key with a time to live, and when it ends.
@@ -823,19 +850,22 @@ impl ShardMap {
         })
     }
 
-    /// Up to `count` keys and values from the buckets at and after `start`
-    /// (taken modulo the bucket count), wrapping round once: what a sample
-    /// from a random place in the table is. Costs about `count` divided by
-    /// how full the table is, where walking to the n-th key cost n.
-    pub fn sample_from(
-        &self,
-        start: usize,
-        count: usize,
-    ) -> impl Iterator<Item = (&str, ValueRef<'_>)> {
+    /// Up to `count` entries from the buckets at and after `start` (taken
+    /// modulo the bucket count), wrapping round once: what a sample from a
+    /// random place in the table is. Costs about `count` divided by how
+    /// full the table is, where walking to the n-th key cost n.
+    pub fn sample_from(&self, start: usize, count: usize) -> impl Iterator<Item = EntryView<'_>> {
         let buckets = self.buckets();
         let start = if buckets == 0 { 0 } else { start % buckets };
         (0..buckets)
-            .filter_map(move |step| self.bucket((start + step) % buckets))
+            .filter_map(move |step| {
+                self.table
+                    .get_bucket((start + step) % buckets)
+                    .map(|s| EntryView {
+                        entry: s.entry(),
+                        _map: std::marker::PhantomData,
+                    })
+            })
             .take(if self.is_empty() { 0 } else { count })
     }
 
@@ -853,7 +883,9 @@ impl ShardMap {
                 return Some(found);
             }
         }
-        self.sample_from(pick(), 1).next()
+        self.sample_from(pick(), 1)
+            .next()
+            .map(|e| (e.key(), e.value()))
     }
 
     /// Whether the entry in bucket `index`, or its string's bytes, is in a
@@ -967,6 +999,11 @@ impl<'a> EntryView<'a> {
     /// When the key's time to live ends, if it has one.
     pub fn expires(&self) -> Option<u64> {
         self.entry.expires()
+    }
+
+    /// The key's access word (`eviction::Access`).
+    pub fn access(&self) -> u32 {
+        self.entry.access()
     }
 
     /// A hold on the entry, to read it once the shard is let go of.

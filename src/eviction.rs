@@ -19,11 +19,13 @@
 //! | `volatile-random` | keys with a TTL      | whichever comes up            |
 //! | `volatile-ttl`    | keys with a TTL      | nearest to expiring           |
 //!
-//! When a key was last used, or modified, and how often, is recorded here
-//! and not in the keyspace, and only while a policy that asks for it is
-//! selected: with `noeviction` a command pays one atomic load for all of
-//! this. The records are kept by a hash of the key, so two keys can share
-//! one; the choice is approximate anyway.
+//! When a key was last used (or modified), or how often, is kept in the
+//! key's own entry, in one 32-bit word of its header, as Redis keeps it in
+//! the object's `lru` field: see [`Access`]. It is written only while a
+//! policy that asks for it is selected (or `key-access-tracking` is on):
+//! with `noeviction` a command pays one atomic load for all of this. The
+//! word is written only when it changes, so a key read again and again
+//! within the same second dirties its cache line once.
 //!
 //! An eviction is a deletion like any other: replicas and the AOF are sent a
 //! `DEL`, a `WATCH` on the key is tripped, clients caching it are told, and
@@ -31,8 +33,6 @@
 
 use crate::commands::ctx::Ctx;
 use crate::store::Store;
-use ahash::AHashMap;
-use parking_lot::Mutex;
 use rand::Rng;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
@@ -100,6 +100,10 @@ impl Policy {
         matches!(self, Policy::AllKeysLfu | Policy::VolatileLfu)
     }
 
+    fn is_lrm(self) -> bool {
+        matches!(self, Policy::AllKeysLrm | Policy::VolatileLrm)
+    }
+
     /// It chooses by how keys have been used, so their use is recorded.
     fn records_use(self) -> bool {
         !matches!(
@@ -112,8 +116,24 @@ impl Policy {
     }
 }
 
+/// What a use of a key writes to its word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum Track {
+    /// Nothing.
+    Off,
+    /// The clock, at every use: the LRU policies, and `key-access-tracking`
+    /// under a policy that keeps nothing itself.
+    Used,
+    /// The clock, at every write only: the LRM policies.
+    Modified,
+    /// The LFU count.
+    Frequency,
+}
+
 static POLICY: AtomicU8 = AtomicU8::new(Policy::NoEviction as u8);
 static RECORDING: AtomicBool = AtomicBool::new(false);
+static TRACK: AtomicU8 = AtomicU8::new(Track::Off as u8);
 /// `key-access-tracking`: record use whatever the policy.
 static TRACK_ALWAYS: AtomicBool = AtomicBool::new(false);
 static SAMPLES: AtomicUsize = AtomicUsize::new(5);
@@ -124,25 +144,43 @@ pub fn policy() -> Policy {
     POLICIES[POLICY.load(Ordering::Relaxed) as usize].0
 }
 
+fn track() -> Track {
+    match TRACK.load(Ordering::Relaxed) {
+        1 => Track::Used,
+        2 => Track::Modified,
+        3 => Track::Frequency,
+        _ => Track::Off,
+    }
+}
+
+/// Select `policy`. Nothing is cleared: a word written for the other kind
+/// of policy (a clock read as a count, or the other way round) carries the
+/// other kind's tag, and counts as nothing known until the key is used
+/// again (see [`Access`]). That is what clearing the records did, without
+/// a pass over every key; Redis reads the other kind's word as its own,
+/// and says that "LRU and LFU data will take some time to adjust".
 pub fn set_policy(policy: Policy) {
-    let before = self::policy();
     POLICY.store(policy as u8, Ordering::Relaxed);
     let recording = policy.records_use() || key_access_tracking();
+    let track = if !recording {
+        Track::Off
+    } else if policy.is_lfu() {
+        Track::Frequency
+    } else if policy.is_lrm() {
+        Track::Modified
+    } else {
+        Track::Used
+    };
+    TRACK.store(track as u8, Ordering::Relaxed);
     RECORDING.store(recording, Ordering::Relaxed);
-    if !recording || policy.is_lfu() != before.is_lfu() {
-        // What was recorded is of no use to the new policy.
-        for stripe in RECORDS.iter() {
-            *stripe.lock() = AHashMap::new();
-        }
-    }
 }
 
 /// `key-access-tracking`: whether a key's use is recorded under every
 /// policy, so that `OBJECT IDLETIME` and `FREQ` report it under
 /// `noeviction` too, as Redis does (#21). Off by default: recording costs
-/// every command about 500 instructions (11-13% of a GET or SET) and a key
-/// about 53 bytes (195 -> 248 at 100 B), measured on 2026-10-20. Under an
-/// LRU or LFU policy it is recorded either way.
+/// every command a second lookup of each of its keys, under its shard's read
+/// lock (it costs a key nothing: the word is in every entry anyway). Under
+/// an LRU or LFU policy it is recorded either way.
 pub fn key_access_tracking() -> bool {
     TRACK_ALWAYS.load(Ordering::Relaxed)
 }
@@ -192,34 +230,94 @@ pub fn configure(config: &crate::config::Config) {
 /// that it is not the first to go before it has had a chance to be used.
 const LFU_INITIAL: u8 = 5;
 
-#[derive(Clone, Copy)]
-struct Use {
-    /// Seconds on [`clock`] when it was last read or written.
-    used: u32,
-    /// And when it was last written.
-    modified: u32,
-    /// Logarithmic count of uses, decaying.
-    frequency: u8,
-    /// Minutes on [`clock`] when `frequency` was last decayed.
-    decayed: u32,
-}
-
-const RECORD_STRIPES: usize = 64;
-/// A stripe that has grown past this is looked at: see [`trim`].
-const STRIPE_FLOOR: usize = 4096;
-
-static RECORDS: LazyLock<Vec<Mutex<AHashMap<u64, Use>>>> = LazyLock::new(|| {
-    (0..RECORD_STRIPES)
-        .map(|_| Mutex::new(AHashMap::new()))
-        .collect()
-});
-/// How large a stripe may be before the older half of it is dropped.
-static STRIPE_LIMIT: AtomicUsize = AtomicUsize::new(STRIPE_FLOOR);
-
 /// Where [`clock`] starts: far enough above 0 that a key can be older than
 /// the server, as `RESTORE ... IDLETIME` makes one (Redis's LRU clock,
 /// 24 bits of seconds, holds 194 days).
 const CLOCK_BASE: u32 = 1 << 24;
+
+/// A key's access word: the 32 bits its entry's header keeps for this
+/// (`store::entry`), as Redis's `robj.lru`. The top two bits say what the
+/// rest is:
+///
+/// ```text
+/// 00  nothing recorded (a key made while nothing was, or never used)
+/// 01  [`clock`] seconds when last used (LRU), or written (LRM): 30 bits
+/// 10  LFU: minutes when last used, 16 bits (wrapping) << 8 | count, 8 bits
+/// ```
+///
+/// The LFU half is Redis's own: a logarithmic count that grows less likely
+/// to rise the higher it is (`lfu-log-factor`), and falls by one for every
+/// `lfu-decay-time` minutes the key goes unused. A word of the other kind,
+/// or none, is read as nothing known: the oldest idle time (the server's
+/// age), and a count of [`LFU_INITIAL`].
+pub struct Access;
+
+impl Access {
+    const TAG: u32 = 0b11 << 30;
+    const CLOCK: u32 = 0b01 << 30;
+    const LFU: u32 = 0b10 << 30;
+    const PAYLOAD: u32 = !Self::TAG;
+
+    /// The clock in the word, if it holds one.
+    #[inline]
+    fn clock_of(word: u32) -> Option<u32> {
+        (word & Self::TAG == Self::CLOCK).then_some(word & Self::PAYLOAD)
+    }
+
+    #[inline]
+    fn clock_word(seconds: u32) -> u32 {
+        Self::CLOCK | (seconds & Self::PAYLOAD)
+    }
+
+    #[inline]
+    fn lfu_word(minutes: u32, count: u8) -> u32 {
+        Self::LFU | (minutes & 0xffff) << 8 | count as u32
+    }
+
+    /// The count in an LFU word, decayed to `minutes` (not written back:
+    /// as Redis's `LFUDecrAndReturn`). [`LFU_INITIAL`] for any other word.
+    fn frequency(word: u32, minutes: u32, decay: u32) -> u8 {
+        if word & Self::TAG != Self::LFU {
+            return LFU_INITIAL;
+        }
+        let count = (word & 0xff) as u8;
+        let then = (word >> 8) & 0xffff;
+        let now = minutes & 0xffff;
+        // The minutes wrap at 2^16 (45 days), as Redis's do.
+        let elapsed = if now >= then {
+            now - then
+        } else {
+            0xffff - then + now
+        };
+        // A period of 0 is no decay at all.
+        let periods = elapsed.checked_div(decay).unwrap_or(0);
+        count.saturating_sub(periods.min(255) as u8)
+    }
+
+    /// The word after a use, at `seconds` on [`clock`]; `roll` is a random
+    /// number in [0, 1) for the LFU count's chance to rise.
+    ///
+    /// A word of 0 is a new entry, and the write that made the key is not a
+    /// use of it: the key starts at [`LFU_INITIAL`], as Redis's new objects
+    /// do. Counting it would put every new key one above that, level with a
+    /// key read once, and a stream of new keys would push out the keys that
+    /// are read (hot keys kept 34% against Redis's 96% in a test of that).
+    fn after_use(word: u32, track: Track, seconds: u32, roll: impl FnOnce() -> f64) -> u32 {
+        match track {
+            Track::Off => word,
+            Track::Used | Track::Modified => Self::clock_word(seconds),
+            Track::Frequency if word == 0 => Self::lfu_word(seconds / 60, LFU_INITIAL),
+            Track::Frequency => {
+                let minutes = seconds / 60;
+                let mut count = Self::frequency(word, minutes, lfu_decay_time());
+                if counts(count, roll) {
+                    count += 1;
+                }
+                Self::lfu_word(minutes, count)
+            }
+        }
+    }
+}
 
 /// Seconds since the first call, plus [`CLOCK_BASE`].
 fn clock() -> u32 {
@@ -227,34 +325,16 @@ fn clock() -> u32 {
     CLOCK_BASE + START.elapsed().as_secs() as u32
 }
 
-fn record_id(db: usize, key: &[u8]) -> u64 {
-    xxhash_rust::xxh3::xxh3_64_with_seed(key, db as u64)
-}
-
-fn decayed(mut record: Use, now: u32) -> Use {
-    let period = lfu_decay_time();
-    let minutes = now / 60;
-    // A period of 0 is no decay at all.
-    let periods = minutes
-        .saturating_sub(record.decayed)
-        .checked_div(period)
-        .unwrap_or(0);
-    if periods > 0 {
-        record.frequency = record.frequency.saturating_sub(periods.min(255) as u8);
-        record.decayed = minutes;
-    }
-    record
-}
-
 /// Whether this use is counted: less and less likely as the count grows, so
-/// that 255 is reached after about a million uses with the default factor.
-fn counts(frequency: u8) -> bool {
+/// that 255 is reached after about a million uses with the default factor
+/// (Redis's `LFULogIncr`). `roll` is drawn only below 255.
+fn counts(frequency: u8, roll: impl FnOnce() -> f64) -> bool {
     if frequency == u8::MAX {
         return false;
     }
     let above = frequency.saturating_sub(LFU_INITIAL) as f64;
     let chance = 1.0 / (above * lfu_log_factor() as f64 + 1.0);
-    rand::random::<f64>() < chance
+    roll() < chance
 }
 
 /// Whether commands have to report the keys they use. One atomic load.
@@ -263,92 +343,58 @@ pub fn recording() -> bool {
     RECORDING.load(Ordering::Relaxed)
 }
 
-/// `key` was read, or written.
+/// `key` was read, or written: its word is brought up to date, in place,
+/// with its shard locked for reading (see `ShardMap::touch`). A key that is
+/// not there is left alone. The key is found by its bytes, without asking
+/// whether they are UTF-8 (that check was a quarter of this).
 pub fn used(store: &Store, db: usize, key: &[u8], wrote: bool) {
-    let now = clock();
-    let id = record_id(db, key);
-    let mut stripe = RECORDS[id as usize % RECORD_STRIPES].lock();
-    let record = stripe.entry(id).or_insert(Use {
-        used: now,
-        modified: now,
-        frequency: LFU_INITIAL,
-        decayed: now / 60,
-    });
-    *record = decayed(*record, now);
-    if counts(record.frequency) {
-        record.frequency += 1;
-    }
-    record.used = now;
-    if wrote {
-        record.modified = now;
-    }
-    if stripe.len() > STRIPE_LIMIT.load(Ordering::Relaxed) {
-        trim(store, &mut stripe);
-    }
-}
-
-/// Records outlive their keys — a key that is deleted, or expires, leaves
-/// its record behind, and a read of a key that is not there makes one. So a
-/// stripe that has outgrown what the keyspace accounts for drops the older
-/// half of its records. A key without a record counts as older than any key
-/// with one, so nothing a policy would have kept is lost by it.
-fn trim(store: &Store, stripe: &mut AHashMap<u64, Use>) {
-    let keys: usize = store
-        .iter()
-        .flat_map(|db| db.iter())
-        .map(|shard| shard.read().len())
-        .sum();
-    let limit = STRIPE_FLOOR.max(keys / RECORD_STRIPES * 2);
-    STRIPE_LIMIT.store(limit, Ordering::Relaxed);
-    if stripe.len() <= limit {
+    let track = track();
+    if track == Track::Off || (track == Track::Modified && !wrote) {
         return;
     }
-    let mut ages: Vec<u32> = stripe.values().map(|record| record.used).collect();
-    let middle = ages.len() / 2;
-    let (_, median, _) = ages.select_nth_unstable(middle);
-    let median = *median;
-    stripe.retain(|_, record| record.used > median);
+    let seconds = clock();
+    crate::store::get_shard_of_bytes(&store[db], key)
+        .read()
+        .touch(key, |word| {
+            Access::after_use(word, track, seconds, rand::random::<f64>)
+        });
 }
 
-fn record_of(db: usize, key: &[u8]) -> Option<Use> {
-    let id = record_id(db, key);
-    RECORDS[id as usize % RECORD_STRIPES]
-        .lock()
-        .get(&id)
-        .map(|record| decayed(*record, clock()))
-}
-
-/// Seconds since `key` was last used (`OBJECT IDLETIME`), as far as is known.
-pub fn idle_seconds(db: usize, key: &[u8]) -> u64 {
-    match record_of(db, key) {
-        Some(record) => clock().saturating_sub(record.used) as u64,
-        None => (clock() - CLOCK_BASE) as u64,
+/// Seconds since a key with the access word `word` was last used (`OBJECT
+/// IDLETIME`), as far as is known: since the server started if nothing is.
+pub fn idle_seconds(word: u32) -> u64 {
+    let now = clock();
+    match Access::clock_of(word) {
+        Some(then) => now.saturating_sub(then) as u64,
+        None => (now - CLOCK_BASE) as u64,
     }
+}
+
+/// The frequency count of a key with the access word `word` (`OBJECT FREQ`).
+pub fn frequency(word: u32) -> u8 {
+    Access::frequency(word, clock() / 60, lfu_decay_time())
 }
 
 /// `RESTORE ... IDLETIME` / `FREQ`: the restored key keeps the standing it
 /// had where it was dumped. As in Redis, the frequency is set under an LFU
-/// policy and the idle time under any other.
+/// policy and the idle time under any other; without either, the restore
+/// is a use like any write.
 pub fn restored(store: &Store, db: usize, key: &[u8], idle: Option<u64>, freq: Option<u8>) {
-    used(store, db, key, true);
-    let id = record_id(db, key);
-    let mut stripe = RECORDS[id as usize % RECORD_STRIPES].lock();
-    let Some(record) = stripe.get_mut(&id) else {
+    let track = track();
+    if track == Track::Off {
         return;
-    };
-    if policy().is_lfu() {
-        if let Some(freq) = freq {
-            record.frequency = freq;
-        }
-    } else if let Some(idle) = idle {
-        let idle = idle.min(u64::from(CLOCK_BASE)) as u32;
-        record.used = clock().saturating_sub(idle);
     }
-}
-
-/// The frequency count of `key` (`OBJECT FREQ`).
-pub fn frequency(db: usize, key: &[u8]) -> u8 {
-    record_of(db, key).map_or(LFU_INITIAL, |record| record.frequency)
+    let seconds = clock();
+    crate::store::get_shard_of_bytes(&store[db], key)
+        .read()
+        .touch(key, |word| match (track, idle, freq) {
+            (Track::Frequency, _, Some(freq)) => Access::lfu_word(seconds / 60, freq),
+            (Track::Used | Track::Modified, Some(idle), _) => {
+                let idle = idle.min(u64::from(CLOCK_BASE)) as u32;
+                Access::clock_word(seconds.saturating_sub(idle))
+            }
+            _ => Access::after_use(word, track, seconds, rand::random::<f64>),
+        });
 }
 
 // ── Making room ───────────────────────────────────────────────────────────────
@@ -426,8 +472,9 @@ pub fn allowed_when_out_of_memory(name: &str) -> bool {
 type Unwanted = u64;
 
 /// A key sampled for eviction, with its expiry time when it was sampled
-/// from the keys with one (milliseconds since the Unix epoch).
-type Sampled = (String, Option<u64>);
+/// from the keys with one (milliseconds since the Unix epoch), and its
+/// access word ([`Access`]) as it was then.
+type Sampled = (String, Option<u64>, u32);
 
 /// Up to `count` keys from about `at` in `shard`, into `found`: of all its
 /// keys, or (`volatile`) of those with a time to live.
@@ -445,7 +492,7 @@ fn sample_into(
         let map = shard.read();
         found.extend(
             map.sample_from(at, count)
-                .map(|(key, _)| (key.to_string(), None)),
+                .map(|e| (e.key().to_string(), None, e.access())),
         );
         return;
     }
@@ -471,7 +518,7 @@ fn sample_into(
             at.wrapping_add(i.wrapping_mul(STRIDE)) % keys
         };
         map.ttl_entry(place)
-            .map(|(key, _, expires)| (key.to_string(), Some(expires)))
+            .map(|e| (e.key().to_string(), e.expires(), e.access()))
     }));
 }
 
@@ -508,24 +555,27 @@ fn sample(
 /// in `dbs`.
 fn choose(ctx: &Ctx, policy: Policy, dbs: &[usize], rng: &mut impl Rng) -> Option<(usize, String)> {
     let now = clock();
+    let decay = lfu_decay_time();
     let count = samples();
     let mut worst: Option<(Unwanted, usize, String)> = None;
     for &db in dbs {
         let candidates: Vec<Sampled> = sample(&ctx.store[db], policy.volatile(), count, rng);
-        for (key, expires) in candidates {
+        for (key, expires, word) in candidates {
             let unwanted: Unwanted = match policy {
                 // Every sampled key is as unwanted as the next, and the
                 // sample was random already.
                 Policy::AllKeysRandom | Policy::VolatileRandom => 0,
                 Policy::VolatileTtl => u64::MAX - expires.unwrap_or(u64::MAX),
-                Policy::AllKeysLru | Policy::VolatileLru => record_of(db, key.as_bytes())
-                    .map_or(u64::MAX, |record| now.saturating_sub(record.used) as u64),
-                Policy::AllKeysLrm | Policy::VolatileLrm => record_of(db, key.as_bytes())
-                    .map_or(u64::MAX, |record| {
-                        now.saturating_sub(record.modified) as u64
-                    }),
+                // A key whose use is not known goes first, as one older
+                // than any whose use is.
+                Policy::AllKeysLru
+                | Policy::VolatileLru
+                | Policy::AllKeysLrm
+                | Policy::VolatileLrm => {
+                    Access::clock_of(word).map_or(u64::MAX, |then| now.saturating_sub(then) as u64)
+                }
                 Policy::AllKeysLfu | Policy::VolatileLfu => {
-                    (u8::MAX - frequency(db, key.as_bytes())) as u64
+                    (u8::MAX - Access::frequency(word, now / 60, decay)) as u64
                 }
                 Policy::NoEviction => return None,
             };
@@ -548,7 +598,7 @@ fn evict(ctx: &mut Ctx, db: usize, key: &str, ordered: bool) -> bool {
         // Gone already.
         return false;
     }
-    crate::vector::maybe_unindex(ctx.index_store, key);
+    crate::vector::maybe_unindex(ctx.index_store, db, key);
     crate::vector::maybe_request_compaction(ctx.index_store, ctx.compaction_tx, key);
     crate::stats::record_evicted();
     crate::stats::record_rdb_change();
@@ -588,12 +638,15 @@ pub fn make_room(ctx: &mut Ctx, limit: usize, ordered: bool) -> bool {
     }
     // The databases worth sampling. Found once: a database is not emptied
     // and refilled in the time this takes, and if it is, it is found empty.
+    // Without a lock: this runs on every write while memory is full, and
+    // locking every shard of every empty database (16 x 256 on 32 cores)
+    // cost more than the write and the eviction together.
     let dbs: Vec<usize> = (0..ctx.store.len())
         .filter(|&db| {
             if policy.volatile() {
                 ctx.store[db].iter().any(|shard| !shard.holds_no_ttl())
             } else {
-                ctx.store[db].iter().any(|shard| !shard.read().is_empty())
+                ctx.store[db].iter().any(|shard| !shard.holds_no_keys())
             }
         })
         .collect();
@@ -636,16 +689,71 @@ mod tests {
 
     #[test]
     fn frequency_decays_by_the_minute() {
-        let record = Use {
-            used: 0,
-            modified: 0,
-            frequency: 12,
-            decayed: 0,
-        };
-        // Ten minutes on, with the default of one count a minute.
-        assert_eq!(decayed(record, 600).frequency, 2);
-        assert_eq!(decayed(record, 6000).frequency, 0);
-        assert_eq!(decayed(record, 59).frequency, 12);
+        let word = Access::lfu_word(0, 12);
+        // Ten minutes on, with one count a minute (the default).
+        assert_eq!(Access::frequency(word, 10, 1), 2);
+        assert_eq!(Access::frequency(word, 100, 1), 0);
+        assert_eq!(Access::frequency(word, 0, 1), 12);
+        // Every two minutes; and never.
+        assert_eq!(Access::frequency(word, 10, 2), 7);
+        assert_eq!(Access::frequency(word, 10_000, 0), 12);
+        // The minutes wrap at 2^16, as Redis's do.
+        let late = Access::lfu_word(0xfffe, 12);
+        assert_eq!(Access::frequency(late, 0x1_0003, 1), 8);
+    }
+
+    /// A clock word and a count are told apart, and neither is read as the
+    /// other: after a switch from LRU to LFU, or back, a key's word means
+    /// nothing until the key is used again.
+    #[test]
+    fn a_word_says_what_it_holds() {
+        let clock = Access::clock_word(CLOCK_BASE + 100);
+        assert_eq!(Access::clock_of(clock), Some(CLOCK_BASE + 100));
+        assert_eq!(Access::frequency(clock, 1, 1), LFU_INITIAL);
+        let lfu = Access::lfu_word(1, 200);
+        assert_eq!(Access::clock_of(lfu), None);
+        assert_eq!(Access::frequency(lfu, 1, 1), 200);
+        assert_eq!(Access::clock_of(0), None);
+        assert_eq!(Access::frequency(0, 1, 1), LFU_INITIAL);
+    }
+
+    #[test]
+    fn a_use_writes_what_the_policy_keeps() {
+        let now = CLOCK_BASE + 7_200;
+        let never = || -> f64 { panic!("no roll wanted") };
+        assert_eq!(Access::after_use(42, Track::Off, now, never), 42);
+        for track in [Track::Used, Track::Modified] {
+            let word = Access::after_use(0, track, now, never);
+            assert_eq!(Access::clock_of(word), Some(now));
+            // Used again in the same second: the very same word, which is
+            // what lets a read leave the line alone.
+            assert_eq!(Access::after_use(word, track, now, never), word);
+        }
+        // The write that makes a key is no use of it: a new entry (a word
+        // of 0) starts at the initial count, as Redis's new keys do.
+        let new = Access::after_use(0, Track::Frequency, now, never);
+        assert_eq!(Access::frequency(new, now / 60, 1), LFU_INITIAL);
+        // Its first use always counts (the chance is 1 at the initial
+        // count); so does a key's first use after a switch from LRU.
+        let first = Access::after_use(new, Track::Frequency, now, || 0.99);
+        assert_eq!(Access::frequency(first, now / 60, 1), LFU_INITIAL + 1);
+        let clock = Access::clock_word(now);
+        let first = Access::after_use(clock, Track::Frequency, now, || 0.99);
+        assert_eq!(Access::frequency(first, now / 60, 1), LFU_INITIAL + 1);
+        // Higher up, a use counts only on a lucky roll.
+        let high = Access::lfu_word(now / 60, 100);
+        assert_eq!(Access::after_use(high, Track::Frequency, now, || 0.5), high);
+        assert_eq!(
+            Access::frequency(
+                Access::after_use(high, Track::Frequency, now, || 0.0),
+                now / 60,
+                1
+            ),
+            101
+        );
+        // 255 is the ceiling, and no roll is drawn for it.
+        let top = Access::lfu_word(now / 60, 255);
+        assert_eq!(Access::after_use(top, Track::Frequency, now, never), top);
     }
 
     #[test]
@@ -656,7 +764,7 @@ mod tests {
         let one = || crate::types::KiviDBValue::String(crate::types::SharedBytes::from("1"));
         let mut rng = rand::thread_rng();
         let keys = |found: Vec<Sampled>| -> Vec<String> {
-            found.into_iter().map(|(key, _)| key).collect()
+            found.into_iter().map(|(key, _, _)| key).collect()
         };
         assert!(sample(&shards, false, 5, &mut rng).is_empty());
         assert!(sample(&shards, true, 5, &mut rng).is_empty());
@@ -672,7 +780,7 @@ mod tests {
         for _ in 0..50 {
             assert_eq!(
                 sample(&shards, true, 5, &mut rng),
-                [("only".to_string(), Some(1_234))]
+                [("only".to_string(), Some(1_234), 0)]
             );
         }
         for i in 0..100 {
@@ -701,7 +809,7 @@ mod tests {
         for _ in 0..200 {
             let found = sample(&shards, true, 5, &mut rng);
             assert_eq!(found.len(), 5);
-            for (key, at) in found {
+            for (key, at, _) in found {
                 let i: u64 = key[1..].parse().unwrap();
                 assert_eq!(i % 4, 0, "{key} has no time to live");
                 assert_eq!(at, Some(10_000 + i));

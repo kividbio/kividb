@@ -171,6 +171,36 @@ pub struct Knn {
     /// The name the distance is reported under.
     pub alias: String,
     pub ef_runtime: Option<usize>,
+    /// `HYBRID_POLICY`: how a filtered KNN is carried out, if the query says.
+    pub policy: Option<HybridPolicy>,
+    /// `BATCH_SIZE`. Accepted, for `BATCHES`, and not used: see
+    /// [`HybridPolicy::Batches`].
+    pub batch_size: Option<usize>,
+}
+
+/// `HYBRID_POLICY` of a filtered KNN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HybridPolicy {
+    /// Measure every document the filter lets through: exact.
+    AdhocBf,
+    /// RediSearch asks the graph for batches of nearest neighbours and
+    /// filters each. Here it is the graph search that keeps only what the
+    /// filter lets through (`vector::knn_hnsw_admitting`), with no limit on
+    /// how far it walks: the same idea, approximate as it is, without
+    /// batches.
+    Batches,
+}
+
+impl HybridPolicy {
+    fn parse(word: &str) -> Result<Self, String> {
+        match word.to_ascii_uppercase().as_str() {
+            "ADHOC_BF" => Ok(Self::AdhocBf),
+            "BATCHES" => Ok(Self::Batches),
+            _ => Err(format!(
+                "Error parsing vector similarity parameters: invalid hybrid policy `{word}`"
+            )),
+        }
+    }
 }
 
 /// A parsed query.
@@ -209,10 +239,13 @@ pub fn parse_query(query: &str, params: &Params, def: &IndexDef) -> Result<Query
                 match name.as_str() {
                     "yield_distance_as" => clause.alias = value,
                     "ef_runtime" => clause.ef_runtime = Some(parser.count(&value)?),
+                    "hybrid_policy" => clause.policy = Some(HybridPolicy::parse(&value)?),
+                    "batch_size" => clause.batch_size = Some(parser.count(&value)?),
                     _ => {}
                 }
             }
         }
+        check_policy(&clause)?;
         knn = Some(clause);
         parser.skip_ws();
     }
@@ -220,6 +253,17 @@ pub fn parse_query(query: &str, params: &Params, def: &IndexDef) -> Result<Query
         return Err(parser.syntax_error());
     }
     Ok(Query { filter, knn })
+}
+
+/// `BATCH_SIZE` belongs to `BATCHES`.
+fn check_policy(clause: &Knn) -> Result<(), String> {
+    if clause.batch_size.is_some() && clause.policy == Some(HybridPolicy::AdhocBf) {
+        return Err(
+            "Error parsing vector similarity parameters: 'batch size' is irrelevant for 'ADHOC_BF' policy"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 struct Parser<'a> {
@@ -1000,6 +1044,8 @@ impl<'a> Parser<'a> {
             vector: self.vector_param(vector_name, *dim, *data_type)?,
             alias: format!("__{attribute}_score"),
             ef_runtime: None,
+            policy: None,
+            batch_size: None,
         };
         let mut options = options.iter();
         while let Some(option) = options.next() {
@@ -1007,9 +1053,10 @@ impl<'a> Parser<'a> {
             match option.to_ascii_uppercase().as_str() {
                 "AS" => clause.alias = value()?.to_string(),
                 "EF_RUNTIME" => clause.ef_runtime = Some(self.count(value()?)?),
-                // Tuning for how the search is carried out; the results are
-                // the same.
-                "EPSILON" | "HYBRID_POLICY" | "BATCH_SIZE" => {
+                "HYBRID_POLICY" => clause.policy = Some(HybridPolicy::parse(value()?)?),
+                "BATCH_SIZE" => clause.batch_size = Some(self.count(value()?)?),
+                // For a range query; a KNN has no use for it.
+                "EPSILON" => {
                     value()?;
                 }
                 _ => return Err(self.syntax_error_at(start)),

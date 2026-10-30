@@ -741,3 +741,58 @@ fn key_access_tracking_keeps_idle_time_under_noeviction() {
         "GET uses it"
     );
 }
+
+/// `CONFIG SET maxmemory-policy` between the LRU and LFU kinds at runtime:
+/// what a key's word held for the other kind counts as nothing known (a
+/// count of 5, an idle time as long as the server has run) until the key
+/// is used again. Under an LRM policy only a write is a use.
+#[test]
+fn switching_between_lru_and_lfu_at_runtime_starts_each_key_afresh() {
+    let server = Server::start(&["--maxmemory-policy", "allkeys-lru"]);
+    let mut c = server.conn();
+    let set_policy = |c: &mut Conn, policy: &str| {
+        assert!(
+            c.cmd(&["CONFIG", "SET", "maxmemory-policy", policy]).ok(),
+            "{policy}"
+        );
+    };
+    assert!(c.cmd(&["SET", "foo", "bar"]).ok());
+    std::thread::sleep(Duration::from_millis(2100));
+    assert!(c.cmd(&["OBJECT", "IDLETIME", "foo"]).i() >= 2);
+
+    set_policy(&mut c, "allkeys-lfu");
+    assert_eq!(
+        c.cmd(&["OBJECT", "FREQ", "foo"]).i(),
+        5,
+        "a clock is no count"
+    );
+    for _ in 0..3 {
+        c.cmd(&["GET", "foo"]);
+    }
+    let freq = c.cmd(&["OBJECT", "FREQ", "foo"]).i();
+    assert!((6..=8).contains(&freq), "freq {freq} after three uses");
+    // OBJECT, TYPE and EXISTS are not uses.
+    c.cmd(&["TYPE", "foo"]);
+    c.cmd(&["EXISTS", "foo"]);
+    assert_eq!(c.cmd(&["OBJECT", "FREQ", "foo"]).i(), freq);
+    // A value written over keeps its count, as in Redis.
+    assert!(c.cmd(&["SET", "foo", "baz"]).ok());
+    assert!(c.cmd(&["OBJECT", "FREQ", "foo"]).i() >= freq);
+
+    set_policy(&mut c, "volatile-lru");
+    let idle = c.cmd(&["OBJECT", "IDLETIME", "foo"]).i();
+    assert!(idle >= 2, "a count is no clock: idle {idle}");
+    c.cmd(&["GET", "foo"]);
+    assert!(c.cmd(&["OBJECT", "IDLETIME", "foo"]).i() < 2);
+
+    set_policy(&mut c, "allkeys-lrm");
+    assert!(c.cmd(&["SET", "bar", "1"]).ok());
+    std::thread::sleep(Duration::from_millis(2100));
+    c.cmd(&["GET", "bar"]);
+    assert!(
+        c.cmd(&["OBJECT", "IDLETIME", "bar"]).i() >= 2,
+        "a read is no modification"
+    );
+    assert_eq!(c.cmd(&["INCR", "bar"]).i(), 2);
+    assert!(c.cmd(&["OBJECT", "IDLETIME", "bar"]).i() < 2);
+}

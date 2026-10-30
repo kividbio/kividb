@@ -174,7 +174,7 @@ pub(super) fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 crate::read_lock!(shard).contains_key(key)
             };
             if replaced {
-                crate::vector::maybe_unindex(ctx.index_store, key);
+                crate::vector::maybe_unindex(ctx.index_store, db, key);
             }
             store_value(
                 ctx.store,
@@ -182,7 +182,13 @@ pub(super) fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 key,
                 KiviDBValue::Hash(Arc::new(RwLock::new(hash))),
             );
-            crate::vector::maybe_index(ctx.index_store, key, &pairs);
+            crate::vector::maybe_index(
+                ctx.index_store,
+                db,
+                key,
+                &pairs,
+                crate::vector::Write::Whole,
+            );
             notify(ctx.pubsub, db, KS_HASH, "hset", key);
             resp_simple("OK")
         }

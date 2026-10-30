@@ -308,7 +308,7 @@ fn remove_at(root: &mut Value, location: &Location) -> bool {
 fn delete_document(ctx: &Ctx, key: &str) -> bool {
     let removed = delete_key(ctx.store, *ctx.selected_db, key);
     if removed {
-        crate::vector::maybe_unindex(ctx.index_store, key);
+        crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
     }
     removed
 }

@@ -1,4 +1,5 @@
 pub mod filter;
+pub mod postings;
 pub mod simd;
 use crate::store::ValueRef;
 use ahash::{AHashMap, AHashSet};
@@ -7,7 +8,7 @@ use rand::Rng;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
 
 /// True while snapshot startup is rebuilding vector / FT live indexes from keys.
 /// [`crate::commands::handler::execute_command`] returns `-LOADING` for commands not on the
@@ -684,6 +685,10 @@ pub struct IndexDef {
     /// it nothing was: an update added a document's words again, a delete
     /// left them counted, and BM25 scores drifted until a restart (#162).
     pub forward: Arc<RwLock<ForwardIndex>>,
+    /// The TAG and NUMERIC postings, and the document ids they are kept in
+    /// (see [`postings`]). Empty, and given no document, for an index with
+    /// no TAG or NUMERIC field.
+    pub postings: postings::SharedPostings,
 }
 
 /// By document key, by TEXT field: the words it put in (see
@@ -793,6 +798,21 @@ impl IndexDef {
         if !new.is_empty() {
             forward.insert(key.to_string(), new);
         }
+    }
+
+    /// Whether the index has a TAG or a NUMERIC field: whether it keeps
+    /// postings (see [`postings`]).
+    #[inline]
+    pub fn keeps_postings(&self) -> bool {
+        self.fields
+            .iter()
+            .any(|f| matches!(f.field_type, FieldType::Tag | FieldType::Numeric))
+    }
+
+    /// Whether `key` is under one of the index's prefixes.
+    #[inline]
+    pub fn covers(&self, key: &str) -> bool {
+        self.prefixes.is_empty() || self.prefixes.iter().any(|p| key.starts_with(p.as_str()))
     }
 
     /// Whether `token` is one of this index's stopwords.
@@ -967,6 +987,7 @@ impl IndexSchema {
                 indexes.insert(f.name.clone(), live);
             }
         }
+        let postings = Arc::new(RwLock::new(postings::Postings::new(&self.fields)));
         IndexDef {
             name: self.name,
             db_index: self.db_index,
@@ -982,6 +1003,7 @@ impl IndexSchema {
             doc_freq: Arc::new(RwLock::new(AHashMap::new())),
             inverted: Arc::new(RwLock::new(AHashMap::new())),
             forward: Arc::new(RwLock::new(AHashMap::new())),
+            postings,
         }
     }
 }
@@ -1015,6 +1037,68 @@ pub fn backfill_text_fields(db: &crate::store::Db, def: &IndexDef, fields: &[Str
     }
 }
 
+/// Start keeping postings for TAG and NUMERIC fields added to an index
+/// (`FT.ALTER`), and fill them in from the documents it covers — all of its
+/// postings, which is as cheap as only the new ones. With `scan` false
+/// (`SKIPINITIALSCAN`), documents are only given ids, so that `NOT` and `*`
+/// still know every document.
+pub fn backfill_postings(db: &crate::store::Db, def: &IndexDef, added: &[SchemaField], scan: bool) {
+    def.postings.write().add_fields(added);
+    for shard in db.iter() {
+        let map = shard.read();
+        for (key, value) in map.iter() {
+            if !def.covers(key) {
+                continue;
+            }
+            let Some(inner) = doc_fields(&def.on, &def.fields, value) else {
+                continue;
+            };
+            let mut postings = def.postings.write();
+            if scan {
+                postings.write_doc(key, &inner);
+            } else {
+                postings.ensure(key);
+            }
+        }
+    }
+}
+
+/// Build every index again from the documents of its database: after
+/// `SWAPDB`, which swaps what two databases hold under the indexes of each.
+pub fn rebuild_indexes(index_store: &IndexStore, store: &crate::store::Store) {
+    let rebuilt: Vec<IndexDef> = {
+        let mut indexes = index_store.write();
+        let names: Vec<String> = indexes
+            .iter()
+            .filter(|(name, def)| !is_alias(name, def))
+            .map(|(name, _)| name.clone())
+            .collect();
+        let mut rebuilt = Vec::with_capacity(names.len());
+        for name in names {
+            let def = &indexes[&name];
+            let fresh = IndexSchema {
+                name: def.name.clone(),
+                db_index: def.db_index,
+                on: def.on.clone(),
+                prefixes: def.prefixes.clone(),
+                fields: def.fields.clone(),
+                aliases: Vec::new(),
+                stopwords: def.stopwords.as_deref().cloned(),
+                synonyms: def.synonyms.clone(),
+            }
+            .into_def();
+            indexes.insert(name, fresh.clone());
+            rebuilt.push(fresh);
+        }
+        rebuilt
+    };
+    for def in rebuilt {
+        if let Some(db) = store.get(def.db_index) {
+            backfill_from_db(db, &def);
+        }
+    }
+}
+
 /// Backfill an `IndexDef` by scanning all matching keys in `db`.
 /// This is the DB-access core shared by `backfill_index` (called on FT.CREATE)
 /// and snapshot restoration (called on startup after keys are loaded).
@@ -1042,6 +1126,12 @@ pub fn backfill_from_db_progress(
         data_type: VectorType,
         metric: DistanceMetric,
         live: LiveIndex,
+        /// The graph came with the snapshot: its vectors are not inserted
+        /// again. Decided once, before the walk — asked per key, the first
+        /// vector this walk inserts would make the graph look loaded and the
+        /// rest would be skipped, which left a graph rebuilt after an AOF
+        /// replay holding one vector.
+        loaded: bool,
     }
     let mut vec_work: Vec<VecFieldWork> = Vec::new();
     for vf in def.vector_fields() {
@@ -1059,12 +1149,15 @@ pub fn backfill_from_db_progress(
             Some(LiveIndex::Hnsw(a)) => LiveIndex::Hnsw(Arc::clone(a)),
             None => continue,
         };
+        let loaded = skip_hnsw_if_populated
+            && matches!(&live, LiveIndex::Hnsw(idx) if idx.live_count.load(Relaxed) > 0);
         vec_work.push(VecFieldWork {
             name: vf.name.clone(),
             dim,
             data_type,
             metric,
             live,
+            loaded,
         });
     }
 
@@ -1074,6 +1167,7 @@ pub fn backfill_from_db_progress(
         .filter(|f| matches!(f.field_type, FieldType::Text) && !f.options.noindex)
         .map(|f| f.name.clone())
         .collect();
+    let keeps_postings = def.keeps_postings();
 
     let mut keys_matched: usize = 0;
 
@@ -1100,6 +1194,11 @@ pub fn backfill_from_db_progress(
             let Some(inner) = doc_fields(&def.on, &def.fields, value) else {
                 continue;
             };
+            let doc = if keeps_postings {
+                def.postings.write().write_doc(key, &inner)
+            } else {
+                postings::NO_DOC
+            };
 
             for w in &vec_work {
                 let raw_bytes = match inner.get(&w.name) {
@@ -1112,10 +1211,10 @@ pub fn backfill_from_db_progress(
                 match &w.live {
                     LiveIndex::Flat(idx) => idx.insert(key.to_string(), vec),
                     LiveIndex::Hnsw(idx) => {
-                        if skip_hnsw_if_populated && idx.live_count.load(Relaxed) > 0 {
+                        if w.loaded {
                             continue;
                         }
-                        hnsw_insert(idx, key.to_string(), vec, &w.metric);
+                        hnsw_insert_doc(idx, key.to_string(), vec, &w.metric, doc);
                     }
                 }
             }
@@ -1266,6 +1365,13 @@ pub struct HnswNode {
     pub key: String,
     pub vector: Vec<f32>,
     pub neighbors: parking_lot::Mutex<Vec<Vec<usize>>>, // neighbors[layer] = [node_id, ...]
+    /// The id its document has in the index's postings, or
+    /// [`postings::NO_DOC`] until it is looked up: a node made by a
+    /// compaction, or read from a snapshot, learns it the first time a
+    /// filtered search asks (see [`knn_hnsw_admitting`]). A document keeps
+    /// its id for as long as it is in the index, and leaving the index
+    /// deletes its node first, so a node never names another's.
+    pub doc: AtomicU32,
 }
 
 impl HnswNode {
@@ -1274,6 +1380,7 @@ impl HnswNode {
             key,
             vector,
             neighbors: parking_lot::Mutex::new(neighbors),
+            doc: AtomicU32::new(postings::NO_DOC),
         }
     }
 
@@ -1615,24 +1722,23 @@ pub fn json_return_value(doc: &serde_json::Value, path: &str) -> Option<Vec<u8>>
     })
 }
 
-/// A JSON document was written: bring the `ON JSON` indexes that cover its
-/// key up to date with it.
-pub fn maybe_index_json(index_store: &IndexStore, key: &str, doc: &serde_json::Value) {
+/// A JSON document was written: bring the `ON JSON` indexes of database
+/// `db` that cover its key up to date with it.
+pub fn maybe_index_json(index_store: &IndexStore, db: usize, key: &str, doc: &serde_json::Value) {
     if indexing_deferred() {
         return;
     }
     let store = index_store.read();
     for (name, def) in store.iter() {
-        if is_alias(name, def) || !matches!(def.on, IndexOn::Json) {
-            continue;
-        }
-        let covered =
-            def.prefixes.is_empty() || def.prefixes.iter().any(|p| key.starts_with(p.as_str()));
-        if !covered {
+        if is_alias(name, def)
+            || !matches!(def.on, IndexOn::Json)
+            || def.db_index != db
+            || !def.covers(key)
+        {
             continue;
         }
         let fields: Vec<(String, Arc<[u8]>)> = project_json(&def.fields, doc).into_iter().collect();
-        index_fields(def, key, &fields);
+        index_fields(def, key, &fields, Write::Whole);
     }
 }
 
@@ -1642,31 +1748,12 @@ pub fn maybe_index_json(index_store: &IndexStore, key: &str, doc: &serde_json::V
 /// migration): the `ON HASH` indexes that cover it are brought up to date
 /// with all of its fields. A restored hash used to be in no index, so that a
 /// key moved to another node of a cluster could not be found there.
-pub fn reindex_hash_key(index_store: &IndexStore, db: &crate::store::Db, key: &str) {
-    if indexing_deferred()
-        || !index_store
-            .read()
-            .values()
-            .any(|def| matches!(def.on, IndexOn::Hash))
-    {
-        return;
-    }
-    let value = crate::store::get_shard(db, key)
-        .read()
-        .get(key)
-        .map(ValueRef::to_value);
-    let pairs: Vec<(String, Arc<[u8]>)> = match value {
-        Some(crate::types::KiviDBValue::Hash(hash)) => hash
-            .read()
-            .iter()
-            .map(|(field, value)| (field.to_string(), Arc::clone(value)))
-            .collect(),
-        _ => return,
-    };
-    maybe_index(index_store, key, &pairs);
-}
-
-pub fn reindex_json_key(index_store: &IndexStore, db: &crate::store::Db, key: &str) {
+pub fn reindex_json_key(
+    index_store: &IndexStore,
+    store: &crate::store::Store,
+    db: usize,
+    key: &str,
+) {
     if indexing_deferred()
         || !index_store
             .read()
@@ -1675,39 +1762,128 @@ pub fn reindex_json_key(index_store: &IndexStore, db: &crate::store::Db, key: &s
     {
         return;
     }
-    let value = crate::store::get_shard(db, key)
+    let Some(db_ref) = store.get(db) else {
+        return;
+    };
+    let value = crate::store::get_shard(db_ref, key)
         .read()
         .get(key)
         .map(ValueRef::to_value);
     if let Some(crate::types::KiviDBValue::Json(doc)) = value {
-        maybe_index_json(index_store, key, &doc.read());
+        maybe_index_json(index_store, db, key, &doc.read());
     }
 }
 
-/// Some fields of a hash were written: bring the `ON HASH` indexes that
-/// cover its key up to date with them.
-pub fn maybe_index(index_store: &IndexStore, key: &str, fields: &[(String, Arc<[u8]>)]) {
+/// Bring every index of database `db` that covers `key` up to date with what
+/// is there now, whatever it is: for a command that changed a document
+/// other than by writing fields of it (`HDEL`, `HINCRBY`, a field that
+/// expired), or put one under a key (`RENAME`, `COPY`, `MOVE`, `RESTORE`).
+/// A key that holds no document of an index any more leaves it.
+///
+/// With [`Write::Refresh`], a vector already in the graph is left there: the
+/// write did not touch it, and inserting it again would cost an insertion.
+pub fn reindex_key(
+    index_store: &IndexStore,
+    store: &crate::store::Store,
+    db: usize,
+    key: &str,
+    how: Write,
+) {
+    if indexing_deferred() {
+        return;
+    }
+    let indexes = index_store.read();
+    if !indexes
+        .iter()
+        .any(|(name, def)| !is_alias(name, def) && def.db_index == db && def.covers(key))
+    {
+        return;
+    }
+    let Some(db_ref) = store.get(db) else {
+        return;
+    };
+    let value = crate::store::get_shard(db_ref, key)
+        .read()
+        .get(key)
+        .map(ValueRef::to_value);
+    for (name, def) in indexes.iter() {
+        if is_alias(name, def) || def.db_index != db || !def.covers(key) {
+            continue;
+        }
+        match (&def.on, &value) {
+            (IndexOn::Hash, Some(crate::types::KiviDBValue::Hash(hash))) => {
+                let pairs: Vec<(String, Arc<[u8]>)> = hash
+                    .read()
+                    .iter()
+                    .map(|(field, value)| (field.to_string(), Arc::clone(value)))
+                    .collect();
+                index_fields(def, key, &pairs, how);
+            }
+            (IndexOn::Hash, Some(crate::types::KiviDBValue::HashEx(hash))) => {
+                let pairs: Vec<(String, Arc<[u8]>)> = hash
+                    .read()
+                    .fields
+                    .iter()
+                    .map(|(field, value)| (field.to_string(), Arc::clone(value)))
+                    .collect();
+                index_fields(def, key, &pairs, how);
+            }
+            (IndexOn::Json, Some(crate::types::KiviDBValue::Json(doc))) => {
+                let fields: Vec<(String, Arc<[u8]>)> =
+                    project_json(&def.fields, &doc.read()).into_iter().collect();
+                index_fields(def, key, &fields, how);
+            }
+            _ => unindex_from(def, key),
+        }
+    }
+}
+
+/// How a write is applied to an index (see [`index_fields`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Write {
+    /// The fields given were written; the document's others are as they
+    /// were (`HSET`).
+    Fields,
+    /// The fields given are all the document has: a field of the schema not
+    /// among them is one it does not hold (a new hash, a JSON document, a
+    /// value put under the key whole).
+    Whole,
+    /// [`Write::Whole`], but a vector the graph already holds for the key is
+    /// left there (see [`reindex_key`]).
+    Refresh,
+}
+
+/// Some fields of a hash in database `db` were written: bring the `ON HASH`
+/// indexes of that database that cover its key up to date with them. `how`
+/// is [`Write::Whole`] for a hash the write created.
+pub fn maybe_index(
+    index_store: &IndexStore,
+    db: usize,
+    key: &str,
+    fields: &[(String, Arc<[u8]>)],
+    how: Write,
+) {
     if indexing_deferred() {
         return;
     }
     let store = index_store.read();
 
     for (name, def) in store.iter() {
-        if is_alias(name, def) || !matches!(def.on, IndexOn::Hash) {
+        if is_alias(name, def)
+            || !matches!(def.on, IndexOn::Hash)
+            || def.db_index != db
+            || !def.covers(key)
+        {
             continue;
         }
-        let matches =
-            def.prefixes.is_empty() || def.prefixes.iter().any(|p| key.starts_with(p.as_str()));
-        if !matches {
-            continue;
-        }
-        index_fields(def, key, fields);
+        index_fields(def, key, fields, how);
     }
 }
 
 /// Index `fields` of the document at `key` in `def`: the words of its TEXT
-/// fields, and its vectors.
-fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)]) {
+/// fields, its TAG and NUMERIC values, and its vectors.
+fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)], how: Write) {
+    let whole = how != Write::Fields;
     {
         // ── Spell-check vocabulary, inverted index, BM25 statistics ─────────
         //
@@ -1718,6 +1894,9 @@ fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)]) {
                 continue;
             }
             let Some((_, raw)) = fields.iter().find(|(n, _)| n == &f.name) else {
+                if whole {
+                    def.set_text(key, &f.name, Vec::new());
+                }
                 continue;
             };
             let tokens: Vec<String> = match std::str::from_utf8(raw) {
@@ -1729,6 +1908,16 @@ fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)]) {
             def.set_text(key, &f.name, tokens);
         }
     }
+
+    // ── TAG and NUMERIC postings ─────────────────────────────────────────────
+    //
+    // Every document of the index is given an id, whatever it holds: `*`
+    // and `NOT` are in terms of all of them.
+    let doc = if def.keeps_postings() {
+        def.postings.write().write(key, fields, whole)
+    } else {
+        postings::NO_DOC
+    };
 
     {
         // ── Update live vector indexes ────────────────────────────────────────
@@ -1746,24 +1935,101 @@ fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)]) {
                 } => (*dim, *data_type, metric.clone()),
                 _ => continue,
             };
-            let raw_bytes = match fields.iter().find(|(n, _)| n == &f.name) {
-                Some((_, b)) => b.clone(),
-                None => continue,
-            };
-            let Some(vec) = data_type.decode(&raw_bytes, dim) else {
+            let Some(live) = def.indexes.get(&f.name) else {
                 continue;
             };
-            let live = match def.indexes.get(&f.name) {
-                Some(l) => l,
-                None => continue,
+            let vec = fields
+                .iter()
+                .find(|(n, _)| n == &f.name)
+                .and_then(|(_, b)| data_type.decode(b, dim));
+            let Some(vec) = vec else {
+                // The document holds no vector there (any more).
+                if whole {
+                    unindex_vector(live, key);
+                }
+                continue;
             };
             match live {
                 LiveIndex::Flat(idx) => idx.insert(key.to_string(), vec),
                 LiveIndex::Hnsw(idx) => {
-                    crate::vector::hnsw_insert(idx, key.to_string(), vec, &metric);
+                    if how == Write::Refresh && idx.key_to_id.read().contains_key(key) {
+                        continue;
+                    }
+                    hnsw_insert_doc(idx, key.to_string(), vec, &metric, doc);
                 }
             }
         }
+    }
+}
+
+/// Take the vector of the document at `key` out of a vector index: from a
+/// FLAT index, at once; from a graph, by deleting its node in place.
+fn unindex_vector(live: &LiveIndex, key: &str) {
+    match live {
+        LiveIndex::Flat(idx) => {
+            idx.vectors.write().remove(key);
+        }
+        LiveIndex::Hnsw(idx) => {
+            let node_id = idx.key_to_id.write().remove(key);
+            if let Some(node_id) = node_id {
+                let mut nodes = idx.nodes.write();
+                if let Some(node) = nodes.get_mut(node_id)
+                    && !node.vector.is_empty()
+                {
+                    node.clear();
+                    idx.tombstone_count.fetch_add(1, Relaxed);
+                    idx.live_count.fetch_sub(1, Relaxed);
+                }
+            }
+        }
+    }
+}
+
+/// The document at `key` has left `def`: its vectors, then its postings
+/// (the order a filtered search relies on: see [`HnswNode::doc`]), then its
+/// words.
+fn unindex_from(def: &IndexDef, key: &str) {
+    for live in def.indexes.values() {
+        unindex_vector(live, key);
+    }
+    if def.keeps_postings() {
+        def.postings.write().remove(key);
+    }
+    def.remove_text(key);
+}
+
+// ── Keys that expire on being read ───────────────────────────────────────────
+//
+// A key found expired by a read is deleted there and then (`helpers::
+// delete_key_if_expired`), where there is no index store to hand. Each
+// server's store is paired with its index store here, so that the key leaves
+// its indexes too: before, it stayed in the graph and was still found by a
+// KNN query.
+
+static INDEX_STORES: RwLock<Vec<(usize, IndexStore)>> = RwLock::new(Vec::new());
+
+fn store_id(store: &crate::store::Store) -> usize {
+    Arc::as_ptr(store) as *const () as usize
+}
+
+/// Pair a server's store with its index store.
+pub fn register_index_store(store: &crate::store::Store, index_store: &IndexStore) {
+    let id = store_id(store);
+    let mut stores = INDEX_STORES.write();
+    stores.retain(|(other, _)| *other != id);
+    stores.push((id, Arc::clone(index_store)));
+}
+
+/// `key` of database `db` expired and was deleted by a read.
+pub fn unindex_expired(store: &crate::store::Store, db: usize, key: &str) {
+    let id = store_id(store);
+    let index_store = INDEX_STORES
+        .read()
+        .iter()
+        .find(|(other, _)| *other == id)
+        .map(|(_, index_store)| Arc::clone(index_store));
+    if let Some(index_store) = index_store {
+        maybe_unindex(&index_store, db, key);
     }
 }
 
@@ -2007,6 +2273,17 @@ fn select_neighbors_heuristic(
 
 /// Insert a new vector into the HNSW index.
 pub fn hnsw_insert(index: &Arc<HnswIndex>, key: String, vector: Vec<f32>, metric: &DistanceMetric) {
+    hnsw_insert_doc(index, key, vector, metric, postings::NO_DOC);
+}
+
+/// [`hnsw_insert`] of the vector of the document whose id is `doc`.
+pub fn hnsw_insert_doc(
+    index: &Arc<HnswIndex>,
+    key: String,
+    vector: Vec<f32>,
+    metric: &DistanceMetric,
+    doc: u32,
+) {
     use std::sync::atomic::Ordering::Relaxed;
 
     // ── Phase 0: tombstone old node if key exists ─────────────────────────
@@ -2077,7 +2354,9 @@ pub fn hnsw_insert(index: &Arc<HnswIndex>, key: String, vector: Vec<f32>, metric
                     // No live nodes at all — we become the entry point
                     drop(k2id);
                     let neighbors = (0..=level).map(|_| Vec::new()).collect();
-                    let new_id = nodes.push(HnswNode::new(key.clone(), vector, neighbors));
+                    let node = HnswNode::new(key.clone(), vector, neighbors);
+                    node.doc.store(doc, Relaxed);
+                    let new_id = nodes.push(node);
                     index.key_to_id.write().insert(key, new_id);
                     index.live_count.fetch_add(1, Relaxed);
                     *index.entry_point.write() = Some(new_id);
@@ -2199,7 +2478,9 @@ pub fn hnsw_insert(index: &Arc<HnswIndex>, key: String, vector: Vec<f32>, metric
     // Append the node. Nothing finds it until a neighbour links back to it
     // below, or a reader looks its key up after the next line.
     let forward_links = neighbors_per_layer.clone();
-    let new_id = nodes.push(HnswNode::new(key.clone(), vector, neighbors_per_layer));
+    let node = HnswNode::new(key.clone(), vector, neighbors_per_layer);
+    node.doc.store(doc, Relaxed);
+    let new_id = nodes.push(node);
     index.key_to_id.write().insert(key, new_id);
     index.live_count.fetch_add(1, Relaxed);
 
@@ -2507,54 +2788,147 @@ pub fn knn_hnsw(
         .collect()
 }
 
+/// KNN over the graph, among only the nodes `admit` lets in: the search
+/// walks every node, as an unfiltered one does, but only those let in are
+/// kept as results, and it goes on until it holds `ef` of them or has
+/// nowhere nearer to go. hnswlib filters the same way.
+///
+/// `query` is as the graph holds vectors: of unit length for a cosine (see
+/// [`PreparedQuery::vector`]). After `budget` distances the search gives up
+/// and returns `None`: a filter that lets few nodes in makes the walk long,
+/// and measuring the few it lets in is then the cheaper way.
+pub fn knn_hnsw_admitting(
+    index: &HnswIndex,
+    query: &[f32],
+    k: usize,
+    ef: usize,
+    metric: &DistanceMetric,
+    admit: &mut dyn FnMut(&HnswNode) -> bool,
+    budget: usize,
+) -> Option<Vec<KnnResult>> {
+    use ordered_float::OrderedFloat;
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    let ef = ef.max(k);
+    let mut ep_id = (*index.entry_point.read())?;
+    let mut nodes = index.nodes.read();
+    if nodes.get(ep_id).is_none_or(|n| n.vector.is_empty()) {
+        ep_id = index.key_to_id.read().values().next().copied()?;
+    }
+
+    // Down to layer 1, nearest first, as an unfiltered search goes.
+    let ep_level = nodes[ep_id].layer_count().saturating_sub(1);
+    let mut curr = ep_id;
+    for lc in (1..=ep_level).rev() {
+        let found = hnsw_search_layer_concurrent(&mut nodes, query, curr, 1, lc, metric);
+        if let Some(&(_, best)) = found.first() {
+            curr = best;
+        }
+    }
+
+    // Layer 0, keeping only what is let in.
+    let mut spent = 0usize;
+    let mut visited = postings::Bits::new();
+    let mut candidates: BinaryHeap<Reverse<(OrderedFloat<f32>, usize)>> = BinaryHeap::new();
+    let mut results: BinaryHeap<(OrderedFloat<f32>, usize)> = BinaryHeap::new();
+    let mut neighbors: Vec<usize> = Vec::with_capacity(64);
+
+    let start = &nodes[curr];
+    if start.vector.is_empty() {
+        return Some(Vec::new());
+    }
+    let d = OrderedFloat(distance_prenorm(metric, query, &start.vector));
+    spent += 1;
+    visited.set(curr as u32);
+    candidates.push(Reverse((d, curr)));
+    if admit(start) {
+        results.push((d, curr));
+    }
+    let mut bound = if results.len() >= ef {
+        results.peek().map_or(f32::INFINITY, |(d, _)| d.0)
+    } else {
+        f32::INFINITY
+    };
+
+    let mut expanded = 0usize;
+    while let Some(Reverse((d, id))) = candidates.pop() {
+        if d.0 > bound && results.len() >= ef {
+            break;
+        }
+        expanded += 1;
+        if expanded.is_multiple_of(EXPANSIONS_PER_YIELD) {
+            parking_lot::RwLockReadGuard::bump(&mut nodes);
+        }
+        neighbors.clear();
+        if let Some(list) = nodes[id].neighbors.lock().first() {
+            neighbors.extend_from_slice(list);
+        }
+        for &nb in &neighbors {
+            if visited.get(nb as u32) {
+                continue;
+            }
+            visited.set(nb as u32);
+            let node = &nodes[nb];
+            if node.vector.is_empty() || node.vector.len() != query.len() {
+                continue;
+            }
+            spent += 1;
+            if spent > budget {
+                return None;
+            }
+            let dist = distance_prenorm(metric, query, &node.vector);
+            if results.len() < ef || dist < bound {
+                candidates.push(Reverse((OrderedFloat(dist), nb)));
+                if admit(node) {
+                    results.push((OrderedFloat(dist), nb));
+                    if results.len() > ef {
+                        results.pop();
+                    }
+                    if results.len() >= ef {
+                        bound = results.peek().map_or(f32::INFINITY, |(d, _)| d.0);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut found: Vec<(f32, usize)> = results.into_iter().map(|(d, id)| (d.0, id)).collect();
+    found.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+    found.truncate(k);
+    Some(
+        found
+            .into_iter()
+            .filter(|(_, id)| !nodes[*id].vector.is_empty())
+            .map(|(score, id)| KnnResult {
+                key: nodes[id].key.clone(),
+                score,
+            })
+            .collect(),
+    )
+}
+
 /// Called when a key is deleted. Removes it from any matching indexes.
 /// For FLAT this is O(1). For HNSW we tombstone — mark deleted but
 /// leave the graph structure intact (full graph surgery is expensive).
-pub fn maybe_unindex(index_store: &IndexStore, key: &str) {
+///
+/// Only the indexes of database `db`: the same key in another database is
+/// another document. A `DEL` in one database used to take the document of
+/// the same name out of an index of another.
+pub fn maybe_unindex(index_store: &IndexStore, db: usize, key: &str) {
     if indexing_deferred() {
         return;
     }
     let store = index_store.read();
 
     for (name, def) in store.iter() {
-        if is_alias(name, def) {
+        if is_alias(name, def) || def.db_index != db || !def.covers(key) {
             continue;
         }
-        let matches =
-            def.prefixes.is_empty() || def.prefixes.iter().any(|p| key.starts_with(p.as_str()));
-        if !matches {
-            continue;
-        }
-
-        // What its TEXT fields put in comes out: the words it held, from the
-        // inverted index and the BM25 statistics. It used to walk every
-        // posting list, and leave the statistics as they were.
-        def.remove_text(key);
-
-        // Tombstone the key in every VECTOR field's live index.
-        // The HSET-equivalent inserts into one or more of these; deletion
-        // hits all of them since we don't know which ones held a value.
-        for live in def.indexes.values() {
-            match live {
-                LiveIndex::Flat(idx) => {
-                    idx.vectors.write().remove(key);
-                }
-                LiveIndex::Hnsw(idx) => {
-                    let node_id = idx.key_to_id.write().remove(key);
-                    if let Some(node_id) = node_id {
-                        let mut nodes = idx.nodes.write();
-                        if let Some(node) = nodes.get_mut(node_id)
-                            && !node.vector.is_empty()
-                        {
-                            node.clear();
-                            use std::sync::atomic::Ordering::Relaxed;
-                            idx.tombstone_count.fetch_add(1, Relaxed);
-                            idx.live_count.fetch_sub(1, Relaxed);
-                        }
-                    }
-                }
-            }
-        }
+        // Every vector field's, its postings, and what its TEXT fields put
+        // in: the words it held, from the inverted index and the BM25
+        // statistics.
+        unindex_from(def, key);
     }
 }
 // ── HNSW compaction ───────────────────────────────────────────────────────────
@@ -3038,8 +3412,10 @@ mod alias_tests {
         }
         maybe_index(
             &store,
+            0,
             "doc:1",
             &[("t".to_string(), Arc::from(&b"hello world"[..]))],
+            Write::Fields,
         );
         let g = store.read();
         assert_eq!(

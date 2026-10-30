@@ -291,6 +291,10 @@ fn compaction_moves_entries_and_their_strings_out_of_sparse_slabs() {
             map.remove(&key(klen(i), i));
         }
         let held = map.get_ref(&key(15, 5)).unwrap();
+        // Each key's access word, to see that it moves with its entry.
+        for i in (0..n).filter(|i| i.is_multiple_of(5)) {
+            map.touch(key(klen(i), i).as_bytes(), |_| i as u32 + 1);
+        }
         let chosen = value_slab::plan_evacuation(usize::MAX);
         assert!(chosen > 0);
         let regions = value_slab::regions_snapshot();
@@ -311,11 +315,106 @@ fn compaction_moves_entries_and_their_strings_out_of_sparse_slabs() {
         for i in (0..n).filter(|i| i.is_multiple_of(5)) {
             let k = key(klen(i), i);
             assert_eq!(text(map.get(&k)), Some(bytes(vlen(i), i)), "{i}");
+            assert_eq!(map.access(&k), Some(i as u32 + 1), "{i}");
         }
         assert!(matches!(held.value(), ValueRef::String(b) if b.as_bytes() == &bytes(100, 5)[..]));
         drop(held);
         value_slab::finish_evacuation();
         drop(map);
+    });
+}
+
+/// A key's access word (when it was last used, or how often) stays with
+/// the key through every write that makes it a new entry, and is written
+/// only when it changes.
+#[test]
+fn the_access_word_follows_the_key() {
+    let _one = one_at_a_time();
+    on_a_thread(|| {
+        let mut map = ShardMap::new();
+        assert_eq!(map.access("k"), None);
+        map.touch(b"k", |_| panic!("no such key"));
+        map.insert_str("k", b"v");
+        assert_eq!(map.access("k"), Some(0), "a new entry's word");
+        map.touch(b"k", |w| w + 7);
+        assert_eq!(map.access("k"), Some(7));
+        // Written over: by a string inline, a long one, a collection, an
+        // entry made unlocked.
+        drop(map.insert_str("k", b"w"));
+        assert_eq!(map.access("k"), Some(7));
+        drop(map.insert_str("k", bytes(10_000, 1)));
+        assert_eq!(map.access("k"), Some(7));
+        drop(map.insert("k", list(&[b"a", b"b"])));
+        assert_eq!(map.access("k"), Some(7));
+        drop(map.insert_entry(NewEntry::string("k", b"x")));
+        assert_eq!(map.access("k"), Some(7));
+        // A time to live given (a new entry), changed in place, changed
+        // while the entry is held (a new entry again), taken away.
+        assert!(map.set_expires("k", 1_000));
+        assert_eq!(map.access("k"), Some(7));
+        assert!(map.set_expires("k", 2_000));
+        let held = map.get_ref("k").unwrap();
+        assert!(map.set_expires("k", 3_000));
+        assert_eq!(map.access("k"), Some(7));
+        drop(map.insert_str_expiring("k", b"y", Some(4_000)));
+        assert_eq!(map.access("k"), Some(7));
+        assert!(map.persist("k"));
+        assert_eq!(map.access("k"), Some(7));
+        drop(held);
+        // `touch` sees what is there, and the same word is no write.
+        map.touch(b"k", |w| {
+            assert_eq!(w, 7);
+            w
+        });
+        drop(map.remove("k"));
+        assert_eq!(map.access("k"), None);
+        // A key made anew starts from nothing.
+        map.insert_str("k", b"v");
+        assert_eq!(map.access("k"), Some(0));
+    });
+}
+
+/// The access word is the one thing written in a held entry, and it is
+/// written with the shard locked only for reading: readers touching a key
+/// while others read its held entries, unlocked, is no data race (Miri
+/// checks).
+#[test]
+fn touching_a_held_entry_changes_nothing_a_holder_reads() {
+    let _one = one_at_a_time();
+    on_a_thread(|| {
+        let map = Arc::new(std::sync::RwLock::new(ShardMap::new()));
+        let rounds = scaled(2_000);
+        let v = bytes(100, 9);
+        map.write().unwrap().insert_str("k", &v);
+        let held = map.read().unwrap().get_ref("k").unwrap();
+        let toucher = {
+            let map = Arc::clone(&map);
+            thread::spawn(move || {
+                for i in 0..rounds {
+                    map.read().unwrap().touch(b"k", |_| i as u32);
+                }
+            })
+        };
+        let reader = {
+            let held = held.clone();
+            let v = v.clone();
+            thread::spawn(move || {
+                for _ in 0..rounds {
+                    assert_eq!(held.key(), "k");
+                    assert!(matches!(held.value(), ValueRef::String(b) if b.as_bytes() == &v[..]));
+                }
+            })
+        };
+        for i in 0..rounds {
+            if i.is_multiple_of(10) {
+                // A write: a new entry, the held one left as it was.
+                drop(map.write().unwrap().insert_str("k", &v));
+            }
+            let _ = map.read().unwrap().access("k");
+        }
+        toucher.join().unwrap();
+        reader.join().unwrap();
+        assert!(matches!(held.value(), ValueRef::String(b) if b.as_bytes() == &v[..]));
     });
 }
 

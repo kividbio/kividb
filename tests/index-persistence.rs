@@ -2042,3 +2042,216 @@ fn vector_types_survive_snapshot_restart() {
     kill_server(&mut srv2);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TAG and NUMERIC postings after a restart
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Queries that the postings answer, for comparing a server with another.
+const POSTINGS_QUERIES: [&str; 8] = [
+    "@c:{red}",
+    "@c:{red | blue}",
+    "-@c:{red}",
+    "@n:[10 (40]",
+    "(@c:{blue} @n:[-inf 25])",
+    "(@c:{gr*} | @n>=90)",
+    "@n!=7",
+    "*",
+];
+
+fn postings_answers(c: &mut Conn) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    for query in POSTINGS_QUERIES {
+        // A server still building its indexes says LOADING: asked again.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let reply = loop {
+            let reply = c.cmds(&[
+                "FT.SEARCH",
+                "idx:post",
+                query,
+                "NOCONTENT",
+                "LIMIT",
+                "0",
+                "10000",
+            ]);
+            match &reply {
+                RespValue::Error(e) if e.starts_with("LOADING") && Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                _ => break reply,
+            }
+        };
+        let mut keys: Vec<String> = reply.as_array()[1..]
+            .iter()
+            .map(|v| v.as_str().to_string())
+            .collect();
+        keys.sort();
+        out.push(keys);
+    }
+    let q = pack_f32(&[0.5, 0.5, 0.5, 0.5]);
+    let reply = c.cmd(&[
+        b"FT.SEARCH",
+        b"idx:post",
+        b"(@c:{blue})=>[KNN 5 @v $q]",
+        b"NOCONTENT",
+        b"PARAMS",
+        b"2",
+        b"q",
+        &q,
+        b"DIALECT",
+        b"2",
+    ]);
+    out.push(
+        reply.as_array()[1..]
+            .iter()
+            .map(|v| v.as_str().to_string())
+            .collect(),
+    );
+    out
+}
+
+/// Documents, then writes that change what the postings hold.
+fn postings_dataset(c: &mut Conn) {
+    assert!(
+        c.cmds(&[
+            "FT.CREATE",
+            "idx:post",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "p:",
+            "SCHEMA",
+            "c",
+            "TAG",
+            "n",
+            "NUMERIC",
+            "v",
+            "VECTOR",
+            "HNSW",
+            "6",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            "4",
+            "DISTANCE_METRIC",
+            "L2",
+        ])
+        .is_ok()
+    );
+    let colours = ["red", "blue", "green", "grey", "red,blue"];
+    for i in 0..300 {
+        let key = format!("p:{i}");
+        let n = (i % 100).to_string();
+        let v = pack_f32(&[i as f32 / 300.0, 0.5, (i % 7) as f32 / 7.0, 0.25]);
+        c.cmd(&[
+            b"HSET",
+            key.as_bytes(),
+            b"c",
+            colours[i % 5].as_bytes(),
+            b"n",
+            n.as_bytes(),
+            b"v",
+            &v,
+        ]);
+    }
+    for i in (0..300).step_by(7) {
+        c.cmds(&["HDEL", &format!("p:{i}"), "c"]);
+    }
+    for i in (1..300).step_by(11) {
+        c.cmds(&["HINCRBY", &format!("p:{i}"), "n", "50"]);
+    }
+    for i in (2..300).step_by(13) {
+        c.cmds(&["DEL", &format!("p:{i}")]);
+    }
+    for i in (3..300).step_by(17) {
+        c.cmds(&["RENAME", &format!("p:{i}"), &format!("p:r{i}")]);
+    }
+    c.cmds(&["HSET", "p:5", "c", "green"]);
+}
+
+#[test]
+fn postings_are_the_same_after_a_snapshot_restart() {
+    let _serial = persist_serial();
+    let dir = temp_dir("postings_snap");
+    let port1 = free_port();
+    let mut srv1 = start_server_in_dir(port1, &dir);
+    assert!(
+        wait_for_server(port1, Duration::from_secs(10)),
+        "srv1 start"
+    );
+    let before = {
+        let mut c = Conn::connect(port1);
+        postings_dataset(&mut c);
+        let before = postings_answers(&mut c);
+        assert!(c.cmds(&["SAVE"]).is_ok());
+        before
+    };
+    assert!(before[0].len() > 50, "{before:?}");
+    send_shutdown_nosave(port1);
+    assert!(
+        wait_for_exit(&mut srv1, Duration::from_secs(8)),
+        "srv1 stop"
+    );
+
+    let port2 = free_port();
+    let mut srv2 = start_server_in_dir(port2, &dir);
+    assert!(
+        wait_for_server(port2, Duration::from_secs(10)),
+        "srv2 start"
+    );
+    {
+        let mut c = Conn::connect(port2);
+        assert_eq!(postings_answers(&mut c), before);
+        // And kept up to date after.
+        c.cmds(&["HSET", "p:0", "c", "red"]);
+        c.cmds(&["DEL", "p:1"]);
+        let mut expected = before[0].clone();
+        if !expected.contains(&"p:0".to_string()) {
+            expected.push("p:0".to_string());
+        }
+        expected.retain(|k| k != "p:1");
+        expected.sort();
+        assert_eq!(postings_answers(&mut c)[0], expected);
+    }
+    kill_server(&mut srv2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn postings_are_the_same_after_an_aof_replay() {
+    let _serial = persist_serial();
+    let dir = temp_dir("postings_aof");
+    let port1 = free_port();
+    let mut srv1 = start_aof_server(port1, &dir, &[]);
+    assert!(
+        wait_for_server(port1, Duration::from_secs(10)),
+        "srv1 start"
+    );
+    let before = {
+        let mut c = Conn::connect(port1);
+        postings_dataset(&mut c);
+        // Written and synced: the AOF is flushed every second.
+        thread::sleep(Duration::from_millis(1500));
+        postings_answers(&mut c)
+    };
+    send_shutdown_nosave(port1);
+    assert!(
+        wait_for_exit(&mut srv1, Duration::from_secs(8)),
+        "srv1 stop"
+    );
+
+    let port2 = free_port();
+    let mut srv2 = start_aof_server(port2, &dir, &[]);
+    assert!(
+        wait_for_server(port2, Duration::from_secs(10)),
+        "srv2 start"
+    );
+    {
+        let mut c = Conn::connect(port2);
+        assert_eq!(postings_answers(&mut c), before);
+    }
+    send_shutdown_nosave(port2);
+    let _ = wait_for_exit(&mut srv2, Duration::from_secs(8));
+    let _ = std::fs::remove_dir_all(&dir);
+}

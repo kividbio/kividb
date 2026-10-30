@@ -5,6 +5,21 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`COMMAND DOCS` returns documentation.** It used to answer with an empty
+  array so redis-cli could still connect. It now replies, for each named
+  command (or every top-level command, with subcommands nested, when none
+  are named), with `summary`, `since`, `group`, `complexity`, `history`,
+  `doc_flags` and `arguments`. The table is generated from Valkey 9.1.3's
+  BSD-3-Clause command JSON, plus KiviDB's own entries for commands Valkey
+  does not have. Search, JSON, time series and vector set commands report
+  `group: module` and a `module` name, as Redis does with those modules
+  loaded. A name that is not a command is omitted, as Redis omits it. Arity
+  and key positions stay on `COMMAND` / `COMMAND INFO`.
+
 ## [1.2.0]
 
 See [docs/releases/v1.2.0.md](docs/releases/v1.2.0.md) for what to check before upgrading.
@@ -174,6 +189,46 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   16 (964), recall 0.998 for both, because a TAG or NUMERIC filter still
   reads every document.
 
+- **Vector and full-text search: TAG and NUMERIC fields are indexed.**
+  A TAG or NUMERIC clause in a query (`FT.SEARCH`, `FT.AGGREGATE`, the
+  filter of a `KNN`) used to be tried on every document. Each index now
+  numbers its documents and keeps, for each tag, the documents that hold it
+  (a sorted list, or a bitmap when that is smaller) and each NUMERIC field's
+  values in order; `AND`, `OR`, `NOT`, `*` and `~` of such clauses become a
+  set of documents without reading any. A TEXT clause narrows to its
+  candidates and is checked; a clause they cannot answer falls back to the
+  scan. A filtered `KNN` then measures each matching document when there are
+  few, up to `max(2000, sqrt(12 * ef * N))` of the `N` in the graph, and
+  otherwise searches the graph keeping only matching nodes, with as many
+  distances as measuring would cost and measuring when they run out (the
+  constant is where the two cost the same on dbpedia-openai-100K-1536, from
+  5% to 80% of documents, ef 64 to 256; the graph search kept the recall of
+  an unfiltered one). `HYBRID_POLICY ADHOC_BF` always measures; `BATCHES`
+  is the filtered graph search with no limit (Redis reads the graph in
+  batches; `BATCH_SIZE` is accepted). A FLAT index always measures. On an
+  Azure D16s_v5, server on 8 CPUs, M 16, EF_CONSTRUCTION 128
+  (redis/vector-db-benchmark; Redis 8.10.3 in brackets), h-and-m-2048 with
+  filters goes from 11.7 to 426 queries a second with one client at ef 128
+  (167) and from 71 to 1944 with 16 (979), recall 0.998 (0.998); its upload
+  takes 39 s as before (20 s). dbpedia-openai-100K-1536, unfiltered, is
+  unchanged: 839 a second at ef 128 (1013), recall 0.984 (0.980). A 10%
+  TAG filter over 100,000 1536-dimension vectors takes 2.8 ms instead of
+  62 (Redis 2.0 ms at recall 0.42; KiviDB's is exact). Without a vector,
+  over 200,000 hashes, `@t:{v}` matching 1% takes 0.41 ms instead of 116
+  (0.28), a 1% NUMERIC range 0.42 ms instead of 105 (0.67), a TAG and a
+  range together 0.14 ms instead of 121 (0.52); a query that matches a
+  quarter of the documents still reads each, 13.9 ms (2.1). This costs
+  memory: about 90 bytes a document for its number, and 33 to 37 for each
+  TAG or NUMERIC field it has, plus 24 bytes and the text of each distinct
+  tag; h-and-m (13 TAG and 11 NUMERIC fields) takes 2.29 GB instead of 2.19.
+  `FT.INFO` reports `doc_ids`, `tag_values` and the bytes of each kind of
+  posting. `FT.AGGREGATE` without `SORTBY` returns rows in the order of the
+  documents' numbers. `FT.DEBUG POSTINGS <index> ON|OFF` turns their use
+  off, to compare. Along the way: a key expired by a read, a key renamed,
+  and a hash overwritten by `SET` now leave the indexes (a KNN query used to
+  still return them), and a write in one database no longer touches the
+  indexes of another.
+
 - **Release candidates are no longer published as GitHub Releases.** A tag
   such as `v1.2.0-rc1` is still built, its images are still pushed to GHCR
   (`ghcr.io/kividbio/kividb:v1.2.0-rc1`) and smoke-tested, and its Linux
@@ -259,6 +314,14 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   `bad argument #2 to 'assert' (string expected, got table)`.
 
 ### Fixed
+
+- **An index rebuilt after an AOF replay held one vector of each HNSW
+  field.** At startup from an append-only file without a snapshot preamble,
+  the background pass that rebuilds the indexes skipped every vector after
+  the first: it asked, for each document, whether the graph had come with a
+  snapshot, and after the first insert it had vectors. A KNN query then
+  found one document. The question is now asked once per field, before the
+  pass. The bug was there since 1.0.
 
 - **On io_uring, `CONFIG SET port` opens the plaintext port, and `port 0`
   closes it.** On the io_uring I/O model, the default on Linux, `CONFIG SET

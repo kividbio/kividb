@@ -12,7 +12,7 @@
 //!
 //! ```text
 //! 0   u32  holders (low 24 bits) | form (top 8)
-//! 4   u32  reserved for use times (LRU/LFU), zero for now
+//! 4   u32  access word: when last used, or how often (`eviction::Access`)
 //! 8   u8   key length, or LONG_KEY: the length is a u32 after the header
 //! 9   u8   flags: HAS_TTL
 //! 10  u16  length of an inline string
@@ -42,6 +42,16 @@
 //! otherwise in a new entry. The position is the table's own, written only
 //! with the shard locked for writing, and read by nothing else. Compaction
 //! moves a block whole, and only when the table's is the only hold.
+//!
+//! **The access word is the exception.** When a key was last used, or how
+//! often (Redis's `robj.lru`), is written in place with the shard locked
+//! only for reading, and whoever holds the entry: it is an atomic word,
+//! written with a relaxed store, and only when it changes. It is no part of
+//! the key or the value, and no holder reads it: a frozen snapshot does not
+//! save it. Two threads using one key at once may each write it, and one
+//! write is then lost: a use not counted, which the policies, choosing from
+//! a sample, can afford. A new entry for the same key (a write, a time to
+//! live given or taken) starts from the old entry's word.
 
 use std::alloc::Layout;
 use std::ptr::NonNull;
@@ -419,14 +429,45 @@ impl Entry {
 
     /// A new entry with the same key and value, and `expires` for its time
     /// to live: what changes whether a key has one, or changes it when the
-    /// entry is held. One hold, the caller's; this entry is left as it was.
+    /// entry is held. One hold, the caller's; this entry is left as it was,
+    /// and the new one has its access word.
     pub(super) fn remade(self, expires: Option<u64>) -> Entry {
-        match self.value() {
+        let new = match self.value() {
             ValueRef::String(bytes) if bytes.shared().is_none() => {
                 Self::string(self.key(), bytes.as_bytes(), expires)
             }
             // Another handle on the same value: a collection is not copied.
             other => Self::new(self.key(), other.to_value(), expires),
+        };
+        new.header().lru.store(self.access(), Ordering::Relaxed);
+        new
+    }
+
+    /// The access word: when the key was last used, or how often
+    /// (`eviction::Access`). Zero in a new entry.
+    #[inline(always)]
+    pub(super) fn access(self) -> u32 {
+        self.header().lru.load(Ordering::Relaxed)
+    }
+
+    /// Give the entry the access word `word`. The entry must live (the
+    /// shard is locked, for reading is enough): see the module's note on
+    /// the access word.
+    #[inline(always)]
+    pub(super) fn set_access(self, word: u32) {
+        self.header().lru.store(word, Ordering::Relaxed);
+    }
+
+    /// The access word made over by `next`, and written only if that
+    /// changes it: a key read many times in the same second leaves its line
+    /// as it was, and does not take it from the other cores reading it.
+    #[inline(always)]
+    pub(super) fn touch(self, next: impl FnOnce(u32) -> u32) {
+        let cell = &self.header().lru;
+        let word = cell.load(Ordering::Relaxed);
+        let new = next(word);
+        if new != word {
+            cell.store(new, Ordering::Relaxed);
         }
     }
 

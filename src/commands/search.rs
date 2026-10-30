@@ -490,6 +490,16 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
         "num_records",
         resp_integer(def.inverted.read().values().map(|s| s.len()).sum::<usize>() as i64),
     );
+    // What the TAG and NUMERIC postings hold, and what they cost.
+    if def.keeps_postings() {
+        let p = def.postings.read();
+        let bytes = p.bytes();
+        put("doc_ids", resp_integer(p.len() as i64));
+        put("tag_values", resp_integer(bytes.tag_values as i64));
+        put("postings_ids_bytes", resp_integer(bytes.ids as i64));
+        put("postings_tag_bytes", resp_integer(bytes.tags as i64));
+        put("postings_numeric_bytes", resp_integer(bytes.numbers as i64));
+    }
     put("indexing", resp_integer(0));
     put("percent_indexed", resp_bulk_str("1"));
     put("hash_indexing_failures", resp_integer(0));
@@ -811,6 +821,175 @@ fn candidates(filter: &Filter, def: &IndexDef) -> Option<AHashSet<String>> {
     }
 }
 
+// ── Answering from postings ──────────────────────────────────────────────────
+//
+// An index with a TAG or NUMERIC field keeps postings for them (see
+// `vector::postings`). A filter made of TAG and NUMERIC clauses, `AND`, `OR`,
+// `NOT`, `*` and `~`, is then a set of document ids read off them, exactly
+// the documents the filter matches: nothing is read to find them. A TEXT
+// clause narrows the set to the documents its words are in, and the set is
+// then one to try the filter on. A clause the postings know nothing of
+// (a fuzzy word, a vector range) leaves the documents the rest allows, if
+// the rest allows fewer than all: those are tried. Only a filter that
+// allows anything the postings cannot narrow is tried on every document.
+
+use crate::vector::postings::{Bits, Postings};
+
+/// What postings say of the documents a filter matches.
+enum Cand {
+    /// Exactly these.
+    Exact(Bits),
+    /// Among these: each is to be tried.
+    Superset(Bits),
+    /// Any of them.
+    Unknown,
+}
+
+fn resolve(filter: &Filter, def: &IndexDef, p: &Postings) -> Cand {
+    let known = |found: Option<Bits>| found.map_or(Cand::Unknown, Cand::Exact);
+    match filter {
+        Filter::MatchAll | Filter::Optional(_) => Cand::Exact(p.live().clone()),
+        Filter::MatchNone => Cand::Exact(Bits::new()),
+        Filter::Tag {
+            field,
+            values,
+            prefixes,
+            separator,
+            case_sensitive,
+        } => known(p.tag(field, values, prefixes, *separator, *case_sensitive)),
+        Filter::Numeric {
+            field,
+            lo,
+            lo_exclusive,
+            hi,
+            hi_exclusive,
+        } => known(p.range(field, *lo, *lo_exclusive, *hi, *hi_exclusive)),
+        Filter::NumericNot { field, value } => known(p.not_equal(field, *value)),
+        Filter::Text { .. } | Filter::Phrase { .. } => match candidates(filter, def) {
+            Some(keys) => {
+                let mut ids = Bits::new();
+                for key in &keys {
+                    if let Some(id) = p.id(key) {
+                        ids.set(id);
+                    }
+                }
+                Cand::Superset(ids)
+            }
+            None => Cand::Unknown,
+        },
+        Filter::VectorRange { .. } => Cand::Unknown,
+        Filter::And(l, r) => match (resolve(l, def, p), resolve(r, def, p)) {
+            (Cand::Exact(mut a), Cand::Exact(b)) => {
+                a.and_with(&b);
+                Cand::Exact(a)
+            }
+            (Cand::Exact(mut a) | Cand::Superset(mut a), Cand::Exact(b) | Cand::Superset(b)) => {
+                a.and_with(&b);
+                Cand::Superset(a)
+            }
+            (Cand::Exact(a) | Cand::Superset(a), Cand::Unknown)
+            | (Cand::Unknown, Cand::Exact(a) | Cand::Superset(a)) => Cand::Superset(a),
+            (Cand::Unknown, Cand::Unknown) => Cand::Unknown,
+        },
+        Filter::Or(l, r) => match (resolve(l, def, p), resolve(r, def, p)) {
+            (Cand::Exact(mut a), Cand::Exact(b)) => {
+                a.or_with(&b);
+                Cand::Exact(a)
+            }
+            (Cand::Unknown, _) | (_, Cand::Unknown) => Cand::Unknown,
+            (Cand::Exact(mut a) | Cand::Superset(mut a), Cand::Exact(b) | Cand::Superset(b)) => {
+                a.or_with(&b);
+                Cand::Superset(a)
+            }
+        },
+        Filter::Not(inner) => match resolve(inner, def, p) {
+            Cand::Exact(b) => {
+                let mut all = p.live().clone();
+                all.and_not(&b);
+                Cand::Exact(all)
+            }
+            _ => Cand::Unknown,
+        },
+    }
+}
+
+/// The documents a query is to look at, read off the index's postings.
+pub(crate) struct Plan {
+    pub ids: Bits,
+    /// They are exactly the matches; otherwise each is to be tried.
+    pub exact: bool,
+}
+
+/// The documents of `def` that `filter` may match, among `only` if given,
+/// from postings: `None` if they cannot narrow it, and every document is to
+/// be tried.
+pub(crate) fn plan(
+    ctx: &Ctx,
+    def: &IndexDef,
+    filter: &Filter,
+    only: Option<&AHashSet<String>>,
+) -> Option<Plan> {
+    let db = *ctx.selected_db;
+    // The postings are of the index's own database's documents.
+    if !def.keeps_postings() || def.db_index != db {
+        return None;
+    }
+    let (mut ids, exact, volatile) = {
+        let p = def.postings.read();
+        if !p.enabled() || p.unused {
+            return None;
+        }
+        let (mut ids, exact) = match resolve(filter, def, &p) {
+            Cand::Exact(ids) => (ids, true),
+            Cand::Superset(ids) => (ids, false),
+            Cand::Unknown => return None,
+        };
+        if let Some(only) = only {
+            let mut named = Bits::new();
+            for key in only {
+                if let Some(id) = p.id(key) {
+                    named.set(id);
+                }
+            }
+            ids.and_with(&named);
+        }
+        // Trying nearly every document one by one costs more than reading
+        // them all in order.
+        if !exact && ids.count() * 2 > p.len() {
+            return None;
+        }
+        // A hash with field TTLs can lose a field to a read before the
+        // indexes hear of it: such documents are tried, whatever the
+        // postings say of them.
+        let volatile: Vec<(String, u32)> = crate::field_expiry::watched_keys(ctx.store, db)
+            .into_iter()
+            .filter(|key| only.is_none_or(|only| only.contains(key)))
+            .filter_map(|key| p.id(&key).map(|id| (key, id)))
+            .collect();
+        (ids, exact, volatile)
+    };
+    let store = &ctx.store[db];
+    for (key, id) in volatile {
+        if exact {
+            let matches = with_doc(store, def, &key, |fields, _| filter::eval(filter, fields));
+            if matches == Some(true) {
+                ids.set(id);
+            } else {
+                ids.unset(id);
+            }
+        } else {
+            ids.set(id);
+        }
+    }
+    Some(Plan { ids, exact })
+}
+
+/// The keys of the documents `ids` names, in id order.
+pub(crate) fn keys_of(def: &IndexDef, ids: &Bits) -> Vec<Arc<str>> {
+    let p = def.postings.read();
+    ids.iter().filter_map(|id| p.key(id).cloned()).collect()
+}
+
 /// BM25 relevance of one document for the query's words.
 ///
 ///   score(d, Q) = Σ_t  IDF(t) · tf_norm(t, d) · weight(field)
@@ -905,6 +1084,23 @@ pub(crate) fn filter_each(
     let db = &ctx.store[*ctx.selected_db];
     let mut timed_out = false;
 
+    // From postings, if they narrow the filter: the documents they name, each
+    // read only to hand it over, or to try it where they are not exact.
+    if let Some(plan) = plan(ctx, def, filter, only) {
+        let mut seen = 0u32;
+        for key in keys_of(def, &plan.ids) {
+            if deadline_due(deadline, &mut seen) {
+                return true;
+            }
+            with_doc(db, def, &key, |fields, _| {
+                if plan.exact || filter::eval(filter, fields) {
+                    accept(&key, fields);
+                }
+            });
+        }
+        return false;
+    }
+
     let mut consider = |key: &str, fields: &Fields| {
         if filter::eval(filter, fields) {
             accept(key, fields);
@@ -950,7 +1146,7 @@ pub(crate) fn filter_each(
 
 /// Run `f` on the document at `key`, if there is one of the kind the index
 /// covers: on its fields, and for a JSON document on the document too.
-fn with_doc<R>(
+pub(crate) fn with_doc<R>(
     db: &Db,
     def: &IndexDef,
     key: &str,
@@ -1386,6 +1582,19 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                         crate::vector::knn_hnsw(graph, &knn.vector, knn.k, ef, metric)
                     }
                 }
+            } else if let Some((nearest, cut)) = crate::commands::vector::knn_planned(
+                ctx,
+                &def,
+                &filter,
+                args.inkeys.as_ref(),
+                knn,
+                field,
+                deadline,
+            ) {
+                // The documents the filter matches, from postings: see
+                // `knn_planned`.
+                timed_out = cut;
+                nearest
             } else {
                 // The filter first, then the nearest among what it left:
                 // exact, whatever the index type. Each document the filter

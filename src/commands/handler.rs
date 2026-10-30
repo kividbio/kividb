@@ -353,7 +353,13 @@ fn script_key_refusal(ctx: &Ctx, name: &str) -> Option<Vec<u8>> {
 /// here the shards are worked on at once (#159). `MSET` and `MSETNX` lock
 /// all their shards together, and need no more.
 fn writes_keys_of_several_shards(ctx: &Ctx, name: &str, cmd0: &[u8]) -> bool {
-    if matches!(name, "MSET" | "MSETNX") || !replication::is_write_command_bytes(cmd0) {
+    // One argument is at most one key (`DEL k`, `INCR k`): asked first, as
+    // `key_positions` is a long match on the name, and every write comes
+    // through here.
+    if ctx.cmd.len() < 3
+        || matches!(name, "MSET" | "MSETNX")
+        || !replication::is_write_command_bytes(cmd0)
+    {
         return false;
     }
     let keys = crate::keyspec::key_positions(name, &ctx.cmd);
@@ -1294,7 +1300,7 @@ fn drop_if_empty(ctx: &Ctx, db: usize, key: &str) -> bool {
         still_empty && map.remove(key).is_some()
     };
     if removed {
-        crate::vector::maybe_unindex(ctx.index_store, key);
+        crate::vector::maybe_unindex(ctx.index_store, db, key);
         crate::keyspace_events::notify(
             ctx.pubsub,
             db,
@@ -1304,6 +1310,36 @@ fn drop_if_empty(ctx: &Ctx, db: usize, key: &str) -> bool {
         );
     }
     removed
+}
+
+/// `COPY` and `MOVE`: the key they wrote, in the database they wrote it
+/// to, is indexed whole; the one `MOVE` took away leaves the indexes of its
+/// database.
+fn reindex_copied(ctx: &Ctx, name: &str) {
+    use crate::vector::Write;
+    let here = *ctx.selected_db;
+    let text = |i: usize| ctx.cmd.get(i).and_then(|a| std::str::from_utf8(a).ok());
+    let number = |i: usize| text(i).and_then(|s| s.parse::<usize>().ok());
+    if name == "MOVE" {
+        if let (Some(key), Some(to)) = (text(1), number(2)) {
+            crate::vector::reindex_key(ctx.index_store, ctx.store, here, key, Write::Whole);
+            crate::vector::reindex_key(ctx.index_store, ctx.store, to, key, Write::Whole);
+        }
+        return;
+    }
+    let Some(key) = text(2) else {
+        return;
+    };
+    let mut to = here;
+    let mut i = 3;
+    while i < ctx.cmd.len() {
+        if ctx.cmd[i].eq_ignore_ascii_case(b"DB") {
+            to = number(i + 1).unwrap_or(here);
+            i += 1;
+        }
+        i += 1;
+    }
+    crate::vector::reindex_key(ctx.index_store, ctx.store, to, key, Write::Whole);
 }
 
 /// What a write leaves to be done to the keys it named.
@@ -1319,24 +1355,35 @@ fn drop_if_empty(ctx: &Ctx, db: usize, key: &str) -> bool {
 /// handler having to remember; on a replica and during AOF replay they run
 /// for the same commands, so the two sides agree.
 fn settle_written_keys(ctx: &Ctx, name: &str) {
-    // A key restored whole is indexed as a whole: see `reindex_hash_key`.
-    if name == "RESTORE" {
-        for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
-            if let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) {
-                let db = &ctx.store[*ctx.selected_db];
-                crate::vector::reindex_hash_key(ctx.index_store, db, key);
-                crate::vector::reindex_json_key(ctx.index_store, db, key);
-            }
-        }
-    }
+    use crate::vector::Write;
     // A command that can leave a hash with field TTLs under a key: the
     // background sweep has to know the key. See `field_expiry`.
-    match name {
+    //
+    // Each also changes a document other than by writing fields of it, or
+    // puts one under a key, or takes one away: the indexes that cover the
+    // key are brought up to date with what is there now (see
+    // `vector::reindex_key`). A value put under a key whole (`RESTORE`, and
+    // so `MIGRATE` and slot migration; `RENAME`) is indexed whole.
+    //
+    // Every write comes through here: the names below all begin with one of
+    // a few letters, and `SET` and the like are let through on one compare.
+    let first = name.as_bytes().first().copied().unwrap_or(0);
+    let named_below = matches!(first, b'H' | b'R' | b'C' | b'M' | b'J') || name == "SWAPDB";
+    match if named_below { name } else { "" } {
         "HEXPIRE" | "HPEXPIRE" | "HEXPIREAT" | "HPEXPIREAT" | "HSETEX" | "HGETEX" | "HIMPORT"
         | "RENAME" | "RENAMENX" | "RESTORE" => {
+            let how = match name {
+                "RENAME" | "RENAMENX" | "RESTORE" => Some(Write::Whole),
+                "HIMPORT" => None,
+                _ => Some(Write::Refresh),
+            };
+            let db = *ctx.selected_db;
             for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
                 if let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) {
-                    crate::field_expiry::track_key(ctx.store, *ctx.selected_db, key);
+                    crate::field_expiry::track_key(ctx.store, db, key);
+                    if let Some(how) = how {
+                        crate::vector::reindex_key(ctx.index_store, ctx.store, db, key, how);
+                    }
                 }
             }
         }
@@ -1349,8 +1396,20 @@ fn settle_written_keys(ctx: &Ctx, name: &str) {
                     }
                 }
             }
+            reindex_copied(ctx, name);
         }
-        "SWAPDB" => crate::field_expiry::rescan(ctx.store),
+        "HDEL" | "HINCRBY" | "HINCRBYFLOAT" | "HSETNX" | "HGETDEL" => {
+            for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
+                if let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) {
+                    let db = *ctx.selected_db;
+                    crate::vector::reindex_key(ctx.index_store, ctx.store, db, key, Write::Refresh);
+                }
+            }
+        }
+        "SWAPDB" => {
+            crate::field_expiry::rescan(ctx.store);
+            crate::vector::rebuild_indexes(ctx.index_store, ctx.store);
+        }
         // A JSON document was written: the `ON JSON` indexes that cover it
         // are brought up to date. Here and not in each command, so that
         // every command that writes one is covered — and so is a replica,
@@ -1360,7 +1419,8 @@ fn settle_written_keys(ctx: &Ctx, name: &str) {
                 if let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) {
                     crate::vector::reindex_json_key(
                         ctx.index_store,
-                        &ctx.store[*ctx.selected_db],
+                        ctx.store,
+                        *ctx.selected_db,
                         key,
                     );
                 }

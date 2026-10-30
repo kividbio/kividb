@@ -468,7 +468,7 @@ fn delete_keys(
             let mut del = vec![b"DEL".to_vec()];
             for key in chunk {
                 if crate::commands::helpers::delete_key(store, 0, key) {
-                    crate::vector::maybe_unindex(index_store, key);
+                    crate::vector::maybe_unindex(index_store, 0, key);
                     del.push(key.as_bytes().to_vec());
                     removed += 1;
                 }
