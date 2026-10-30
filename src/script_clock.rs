@@ -28,7 +28,7 @@ pub fn enter_script_execution() {
             let ms = wall
                 .as_secs()
                 .saturating_mul(1000)
-                .saturating_add(u64::from(wall.subsec_micros() / 1000));
+                .saturating_add(u64::from(wall.subsec_millis()));
             FROZEN_MS.with(|f| f.set(ms.max(1)));
         }
         st.0 += 1;
@@ -127,34 +127,6 @@ fn clock_ms() -> u64 {
         .saturating_add(u64::from(d.subsec_millis()))
 }
 
-#[cfg(test)]
-mod wall_ms_tests {
-    use super::*;
-
-    #[test]
-    fn the_fast_clock_agrees_with_the_slow_one() {
-        let before = ttl_wall_ms_now() as u64;
-        let fast = wall_ms_now();
-        let after = ttl_wall_ms_now() as u64;
-        assert!(before <= fast && fast <= after, "{before} {fast} {after}");
-    }
-
-    #[test]
-    fn a_script_sees_its_frozen_time() {
-        enter_script_execution();
-        let frozen = ttl_wall_ms_now() as u64;
-        std::thread::sleep(Duration::from_millis(5));
-        assert_eq!(wall_ms_now(), frozen);
-        enter_script_execution();
-        assert_eq!(wall_ms_now(), frozen);
-        exit_script_execution();
-        assert_eq!(wall_ms_now(), frozen);
-        exit_script_execution();
-        std::thread::sleep(Duration::from_millis(2));
-        assert!(wall_ms_now() > frozen);
-    }
-}
-
 /// The time by which a time to live is set, told and ended: the wall clock
 /// in whole milliseconds, and during a script the moment the script began.
 ///
@@ -182,4 +154,32 @@ pub fn time_command_wall_tuple() -> (u64, u32) {
             .unwrap_or_default();
         (d.as_secs(), d.subsec_micros())
     })
+}
+
+#[cfg(test)]
+mod wall_ms_tests {
+    use super::*;
+
+    #[test]
+    fn the_fast_clock_agrees_with_the_slow_one() {
+        let before = ttl_wall_ms_now() as u64;
+        let fast = wall_ms_now();
+        let after = ttl_wall_ms_now() as u64;
+        assert!(before <= fast && fast <= after, "{before} {fast} {after}");
+    }
+
+    #[test]
+    fn a_script_sees_its_frozen_time() {
+        enter_script_execution();
+        let frozen = ttl_wall_ms_now() as u64;
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(wall_ms_now(), frozen);
+        enter_script_execution();
+        assert_eq!(wall_ms_now(), frozen);
+        exit_script_execution();
+        assert_eq!(wall_ms_now(), frozen);
+        exit_script_execution();
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(wall_ms_now() > frozen);
+    }
 }
