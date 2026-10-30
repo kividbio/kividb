@@ -1192,3 +1192,23 @@ fn test_rpush_onto_an_expired_list_starts_fresh_and_stays() {
         assert_eq!(c.cmds(&["TTL", key]).as_int(), -1, "TTL {key}");
     }
 }
+
+/// `SORT ... STORE` from a list whose time to live has passed sorts nothing,
+/// as from a missing key: the destination goes and the reply is 0. It
+/// answered with an empty array and left the destination as it was.
+#[test]
+fn test_sort_store_from_an_expired_list_empties_the_destination() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    for i in 0..10 {
+        let (src, dst) = (format!("sort:src:{i}"), format!("sort:dst:{i}"));
+        assert_eq!(c.cmds(&["RPUSH", &src, "3", "1", "2"]).as_int(), 3);
+        assert_eq!(c.cmds(&["RPUSH", &dst, "old"]).as_int(), 1);
+        assert_eq!(c.cmds(&["PEXPIRE", &src, "20"]).as_int(), 1);
+        thread::sleep(Duration::from_millis(30));
+        assert_eq!(c.cmds(&["SORT", &src, "STORE", &dst]).as_int(), 0, "{src}");
+        assert_eq!(c.cmds(&["EXISTS", &dst]).as_int(), 0, "{dst}");
+        assert_eq!(c.cmds(&["SORT", &src]).as_array().len(), 0);
+    }
+}

@@ -1269,10 +1269,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => return Some(resp_error("ERR key must be valid UTF-8")),
             };
 
+            // A source past its time is a missing one: an empty array, or with
+            // STORE, the destination deleted and 0, as for any missing key.
+            // It returned the empty array here, STORE or not, and left the
+            // destination as it was.
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 expire_on_read(ctx.store, *ctx.selected_db, key);
-                // SORT on missing key returns empty array, or 0 if STORE
-                return Some(resp_array(vec![]));
             }
 
             // ── Parse options ──────────────────────────────────────────────────
