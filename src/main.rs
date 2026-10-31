@@ -21,6 +21,7 @@ pub mod command_gate;
 mod commands;
 mod config;
 pub mod eviction;
+pub mod expiry;
 pub mod field_expiry;
 pub mod keyspace_events;
 pub mod keyspec;
@@ -688,12 +689,19 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
         rx.recv().unwrap()
     };
     crate::stats::spawn_instantaneous_ops_sampler();
+    // No key is swept until what it deletes can be logged: the dataset is
+    // loaded and the AOF's queue installed, further down. A `DEL` queued
+    // before that went nowhere, and the key's writes stayed in the AOF
+    // without it.
+    let starting = crate::expiry::loading_guard();
     crate::commands::helpers::spawn_active_expire_task(
         Arc::clone(&store),
         Arc::clone(&expiry_store),
         Arc::clone(&index_store),
         pubsub.clone(),
         Arc::clone(&latency),
+        &repl_state,
+        &hub_tx,
     );
     if config.cluster_enabled {
         log_info!(
@@ -896,6 +904,8 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     // Reachable from the replication applier, which is built too deep to be
     // handed this channel directly. See `aof::install_global_aof_sender`.
     aof::install_global_aof_sender(Box::new(aof_tx.clone()));
+    // The keys active expiry deletes are logged from here on.
+    drop(starting);
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1444,6 +1454,8 @@ async fn async_main_tokio(
         Arc::clone(&index_store),
         pubsub.clone(),
         Arc::clone(&latency),
+        &repl_state,
+        &hub_tx,
     );
     let watch_registry = crate::watch::new_watch_registry();
     crate::watch::register_for(&store, &watch_registry);

@@ -4,7 +4,7 @@ use std::time::SystemTime;
 use ahash::AHashMap;
 use ahash::AHashSet;
 use parking_lot::RwLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread::available_parallelism;
 
 use crate::types::KiviDBValue;
@@ -52,6 +52,11 @@ pub fn num_shards() -> usize {
 pub struct ExpiryCell {
     /// Entries in `map`, as of the last writer to let go of it.
     len: AtomicUsize,
+    /// No time in `map` ends before this, in nanoseconds since the Unix
+    /// epoch: what the expiry cycle found when it last looked at every time
+    /// in the shard and none had ended. 0 when not known, which is what
+    /// every writer leaves it as it lets go. See [`ExpiryCell::due_after`].
+    due_after: AtomicU64,
     map: RwLock<AHashMap<Key, SystemTime>>,
 }
 
@@ -59,7 +64,7 @@ pub struct ExpiryCell {
 /// leaves the map's size where a reader can see it without the lock.
 pub struct ExpiryWrite<'a> {
     map: parking_lot::RwLockWriteGuard<'a, AHashMap<Key, SystemTime>>,
-    len: &'a AtomicUsize,
+    cell: &'a ExpiryCell,
 }
 
 impl std::ops::Deref for ExpiryWrite<'_> {
@@ -81,14 +86,53 @@ impl Drop for ExpiryWrite<'_> {
     #[inline]
     fn drop(&mut self) {
         // Before the lock is released (the guard is dropped after this).
-        self.len.store(self.map.len(), Ordering::Release);
+        // Only a writer stores it, and this one holds the lock.
+        let len = &self.cell.len;
+        let (was, now) = (len.load(Ordering::Relaxed), self.map.len());
+        if was != now {
+            len.store(now, Ordering::Release);
+            if (was == 0) != (now == 0) {
+                timed_shard_changed(now != 0);
+            }
+        }
+        // A time may have been given or changed: none is known not to have
+        // ended any more.
+        if self.cell.due_after.load(Ordering::Relaxed) != 0 {
+            self.cell.due_after.store(0, Ordering::Release);
+        }
     }
+}
+
+/// Expiry shards, of every store, that hold at least one time, as of the
+/// last writer to let go of each. A write looks at it before it looks for
+/// the keys it names that are past their time (`handler`): with none
+/// anywhere, which is most datasets, that costs one load.
+static TIMED_SHARDS: AtomicUsize = AtomicUsize::new(0);
+
+#[cold]
+#[inline(never)]
+fn timed_shard_changed(timed: bool) {
+    if timed {
+        TIMED_SHARDS.fetch_add(1, Ordering::Release);
+    } else {
+        TIMED_SHARDS.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// Whether any key, of any store, may have a time to live. False only when
+/// no expiry shard held a time as its last writer let go; a writer adding
+/// the first one at this moment is not seen, as with
+/// [`ExpiryCell::holds_nothing`].
+#[inline(always)]
+pub fn any_expiry() -> bool {
+    TIMED_SHARDS.load(Ordering::Acquire) != 0
 }
 
 impl ExpiryCell {
     pub fn new() -> Self {
         ExpiryCell {
             len: AtomicUsize::new(0),
+            due_after: AtomicU64::new(0),
             map: RwLock::new(AHashMap::new()),
         }
     }
@@ -102,8 +146,37 @@ impl ExpiryCell {
     pub fn write(&self) -> ExpiryWrite<'_> {
         ExpiryWrite {
             map: self.map.write(),
-            len: &self.len,
+            cell: self,
         }
+    }
+
+    /// No time in this shard ends before what this returns, in nanoseconds
+    /// since the Unix epoch; 0 if that is not known. One load, no lock: a
+    /// write to a key with a time to live asks whether the key has expired,
+    /// and when every key in its shard has a long time to live, as with
+    /// sessions or counters, this says it cannot have without looking.
+    ///
+    /// Known when the expiry cycle last went through every time in the
+    /// shard and found none that had ended ([`ExpiryCell::note_due_after`]);
+    /// unknown again as soon as a writer lets go of the shard. A writer
+    /// giving a key a time at this very moment is not seen, as with
+    /// [`ExpiryCell::holds_nothing`].
+    #[inline]
+    pub fn due_after(&self) -> u64 {
+        self.due_after.load(Ordering::Acquire)
+    }
+
+    /// Say that no time in this shard ends before `nanos` (since the Unix
+    /// epoch, more than 0): for the expiry cycle, which holds the shard for
+    /// reading (`_held`) and has looked at every time in it. A writer can
+    /// only change one after this lock is let go of, and then makes it
+    /// unknown again.
+    pub fn note_due_after(
+        &self,
+        _held: &parking_lot::RwLockReadGuard<'_, AHashMap<Key, SystemTime>>,
+        nanos: u64,
+    ) {
+        self.due_after.store(nanos.max(1), Ordering::Release);
     }
 
     /// No key in this shard has an expiry time, as of the last write to it.
@@ -119,6 +192,16 @@ impl ExpiryCell {
 impl Default for ExpiryCell {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for ExpiryCell {
+    fn drop(&mut self) {
+        // A store dropped with times in it (a replica's staging store, a
+        // test's) leaves the count as if it had been emptied.
+        if self.len.load(Ordering::Acquire) != 0 {
+            timed_shard_changed(false);
+        }
     }
 }
 

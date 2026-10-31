@@ -78,6 +78,32 @@ A patch release of 1.1.0.
   place of whatever the indexes held for it before, so that a document
   renamed over another is found with its own vector and words.
 
+- **A write to a key whose time to live has passed starts a new key.** A
+  key past its time stays in memory until a read finds it or the
+  background expiry cycle comes to it, and a write that came first acted on
+  it as it was: `INCR` counted on from the old value, `RPUSH` pushed onto
+  the old list, and the key kept its old time to live, so the write was
+  deleted with the key moments after it had been acknowledged. A write now
+  finds such a key gone, as in Redis: it is expired first (counted in
+  `expired_keys`, announced as `expired`), and the write makes a new key,
+  with no time to live. `SORT ... STORE` from such a key deletes the
+  destination and returns 0, as from a missing key; it left the
+  destination as it was.
+
+- **Keys expire on replicas and in the AOF as they do on the master.** The
+  master logged and propagated nothing when a key expired, so a replica,
+  and the AOF replayed at a restart, expired keys by their own clocks: a
+  replica deleted keys while its master's writes to them were still on the
+  way, and diverged from it, and a restart after a key's time replayed a
+  write made while it lived onto a missing key, which then came back with
+  no time to live, for good. Now the master writes `UNLINK` (`DEL` with
+  `lazyfree-lazy-expire no`) to its AOF and replication stream for every
+  key it expires, whether a read, a write or the expiry cycle found it.
+  Nothing expires while the AOF or a snapshot is loaded or a master's
+  stream applied, and a replica deletes no expired key itself: its clients
+  see the key as gone until the master's `DEL` arrives, as in Redis.
+<!-- 1.1.3: wording at publish -->
+
 ## [1.1.2]
 
 A patch release of 1.1.0. It replaces 1.1.1, which was withdrawn.

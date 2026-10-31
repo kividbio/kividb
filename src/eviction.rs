@@ -346,6 +346,18 @@ pub fn restored(store: &Store, db: usize, key: &[u8], idle: Option<u64>, freq: O
     }
 }
 
+/// `key` expired and was deleted: its record goes with it, so that a key
+/// made under the same name afterwards, by the write that found it expired
+/// say, starts as a new key does (`LFU_INITIAL`, used now), as in Redis.
+/// Records otherwise outlive their keys (see `trim`).
+pub fn forget(db: usize, key: &[u8]) {
+    if !recording() {
+        return;
+    }
+    let id = record_id(db, key);
+    RECORDS[id as usize % RECORD_STRIPES].lock().remove(&id);
+}
+
 /// The frequency count of `key` (`OBJECT FREQ`).
 pub fn frequency(db: usize, key: &[u8]) -> u8 {
     record_of(db, key).map_or(LFU_INITIAL, |record| record.frequency)
