@@ -2777,13 +2777,19 @@ fn missing_keys(ports: &[u16], keys: &[String]) -> Vec<String> {
 
 /// A writer that sets keys `{tag}:w0`, `{tag}:w1`, ... until `stop`, going
 /// wherever it is redirected, round the nodes of `ports` when one does not
-/// answer, and returns the keys whose `SET` was acknowledged.
+/// answer, and returns the keys whose `SET` was acknowledged. While `hold`
+/// is set it sends nothing, and says so in `held` once its last write is
+/// answered.
 fn acknowledged_writer(
     stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    hold: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    held: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     ports: Vec<u16>,
     tag: &str,
 ) -> std::thread::JoinHandle<Vec<String>> {
     let stop = std::sync::Arc::clone(stop);
+    let hold = std::sync::Arc::clone(hold);
+    let held = std::sync::Arc::clone(held);
     let tag = tag.to_string();
     std::thread::spawn(move || {
         let mut acked = Vec::new();
@@ -2792,6 +2798,12 @@ fn acknowledged_writer(
         let mut port = ports[0];
         let mut conn: Option<Conn> = None;
         while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            if hold.load(std::sync::atomic::Ordering::SeqCst) {
+                held.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            held.store(false, std::sync::atomic::Ordering::SeqCst);
             if conn.is_none() {
                 conn = Conn::try_connect(port);
                 if let Some(c) = &conn {
@@ -2860,12 +2872,37 @@ fn a_master_back_empty_inside_the_node_timeout_loses_no_acknowledged_write() {
         .map(|n| n.port)
         .collect();
     let stop = Arc::new(AtomicBool::new(false));
-    let writer = acknowledged_writer(&stop, ports.clone(), &tag);
+    let hold = Arc::new(AtomicBool::new(false));
+    let held = Arc::new(AtomicBool::new(false));
+    let writer = acknowledged_writer(&stop, &hold, &held, ports.clone(), &tag);
     std::thread::sleep(Duration::from_millis(500));
+
+    // Replication is asynchronous: a write the master answered in the
+    // moment before the kill may not have left it, and is lost by any
+    // master killed outright, Redis's too. That is not what this test is
+    // about, so the writer is held and the replica let catch up first.
+    hold.store(true, Ordering::SeqCst);
+    wait_until("the writer to hold", Duration::from_secs(10), || {
+        held.load(Ordering::SeqCst)
+    });
+    wait_until(
+        "the replica to have every acknowledged write",
+        Duration::from_secs(30),
+        || {
+            let offset = |port: u16, field: &str| {
+                Conn::try_connect(port)
+                    .and_then(|mut c| c.try_cmd(&["INFO", "replication"]).ok())
+                    .and_then(|i| info_field(&i.text(), field))
+            };
+            let sent = offset(masters[0].port, "master_repl_offset");
+            sent.is_some() && sent == offset(replicas[0].port, "slave_repl_offset")
+        },
+    );
 
     // Killed and back in well under the node timeout.
     masters[0].kill();
     masters[0].spawn();
+    hold.store(false, Ordering::SeqCst);
 
     // Long enough for the old behaviour to show: the replica's second try,
     // 10 s after it first refused, found keys on the master and gave in.
