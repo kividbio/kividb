@@ -30,6 +30,11 @@
 //   replica is sent) or a master's stream is applied, a key's time does not
 //   make it gone (`held`). What expired there is said by the `DEL` that
 //   follows.
+// * Nor does active expiry run while a dataset is loaded (`Loading`): it
+//   runs on threads of its own, started before the load, and it took a key
+//   out between the replay's `SET k 5 PXAT t` and its `INCR k`, which then
+//   made the key again. Nor in the middle of a transaction or a script,
+//   which is one step: it takes the command gate, as a command does.
 // * A replica deletes no expired key itself. Its clients are answered as if
 //   one were gone, and the key stays until its master's `DEL` arrives
 //   (`on_replica`). Nor does it propagate anything: a replica's stream is its
@@ -38,6 +43,7 @@
 use std::cell::Cell;
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use parking_lot::RwLock;
 
@@ -211,6 +217,35 @@ pub fn held() -> bool {
     HELD.with(|held| held.get() > 0)
 }
 
+/// Datasets being loaded, on any thread: active expiry deletes nothing
+/// meanwhile ([`loading`]).
+static LOADING: AtomicUsize = AtomicUsize::new(0);
+
+/// While this lives, a dataset is being loaded: no key is swept, on any
+/// thread. [`hold`] is the loading thread's own; the sweep runs on threads
+/// of its own, from before the load.
+pub struct Loading(());
+
+impl Loading {
+    /// Count a load in until the guard is dropped. Nests.
+    pub fn start() -> Loading {
+        LOADING.fetch_add(1, Ordering::SeqCst);
+        Loading(())
+    }
+}
+
+impl Drop for Loading {
+    fn drop(&mut self) {
+        LOADING.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Whether a dataset is being loaded ([`Loading`]).
+#[inline]
+pub fn loading() -> bool {
+    LOADING.load(Ordering::SeqCst) > 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +261,16 @@ mod tests {
         assert!(held());
         drop(outer);
         assert!(!held());
+    }
+
+    #[test]
+    fn loading_nests_and_is_every_threads() {
+        let outer = Loading::start();
+        let inner = Loading::start();
+        assert!(std::thread::spawn(loading).join().unwrap());
+        drop(inner);
+        assert!(loading());
+        drop(outer);
     }
 
     #[test]

@@ -160,7 +160,7 @@ fn free_port() -> u16 {
     }
 }
 
-fn kividb(dir: &Path, port: u16, extra: &[String]) -> Child {
+fn kividb(dir: &Path, port: u16, extra: &[String], env: &[(String, String)]) -> Child {
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -182,6 +182,7 @@ fn kividb(dir: &Path, port: u16, extra: &[String]) -> Child {
     }
     command
         .args(extra)
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(log)
@@ -194,6 +195,8 @@ struct Server {
     dir: PathBuf,
     child: Child,
     args: Vec<String>,
+    /// The environment it is started with, besides the test's.
+    env: Vec<(String, String)>,
 }
 
 impl Server {
@@ -201,12 +204,13 @@ impl Server {
         let dir = tempfile::tempdir().unwrap().keep();
         let port = free_port();
         let args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
-        let child = kividb(&dir, port, &args);
+        let child = kividb(&dir, port, &args, &[]);
         let server = Server {
             port,
             dir,
             child,
             args,
+            env: Vec::new(),
         };
         assert_eq!(server.conn().cmd(&["PING"]).s(), "PONG");
         server
@@ -230,7 +234,7 @@ impl Server {
     /// connection made the moment it comes up can be reset (master does the
     /// same): it is tried again.
     fn restart(&mut self) {
-        self.child = kividb(&self.dir, self.port, &self.args);
+        self.child = kividb(&self.dir, self.port, &self.args, &self.env);
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let up = TcpStream::connect(("127.0.0.1", self.port)).and_then(|mut s| {
@@ -518,6 +522,109 @@ fn a_restart_after_the_deadline_does_not_bring_a_key_back() {
     for i in 0..100 {
         assert_eq!(c.cmd(&["GET", &format!("k:{i}")]), V::Nil);
     }
+}
+
+/// The same, with active expiry given every chance to run beside the
+/// replay: it is started before the dataset is loaded, and it used to take a
+/// key out between the replay's `SET k 5 PX t` and its `INCR k`, which then
+/// made `k` again, `1` with no time to live. Each command of the replay is
+/// made to take 200 ms here (`KIVIDB_TEST_REPLAY_DELAY_MS`): a second
+/// between each key's two, in which the sweep comes round ten times.
+#[test]
+fn active_expiry_does_not_run_beside_the_replay() {
+    let mut server = Server::start(&["--aof"]);
+    let mut c = server.conn();
+    for i in 0..5 {
+        let key = format!("k:{i}");
+        assert_eq!(c.cmd(&["SET", &key, "5", "PX", "1500"]).s(), "OK");
+    }
+    for i in 0..5 {
+        assert_eq!(c.cmd(&["INCR", &format!("k:{i}")]).i(), 6);
+    }
+    wait_until("the writes to reach the AOF", 10, || {
+        count(&server.aof(), b"$4\r\nINCR\r\n") >= 5
+    });
+    server.kill();
+    std::thread::sleep(Duration::from_millis(1700));
+
+    server.env = vec![("KIVIDB_TEST_REPLAY_DELAY_MS".into(), "200".into())];
+    server.restart();
+    let mut c = server.conn();
+    for i in 0..5 {
+        let key = format!("k:{i}");
+        assert_eq!(c.cmd(&["GET", &key]), V::Nil, "{key} came back");
+    }
+    wait_until("the expired keys' DELs to reach the AOF", 20, || {
+        let aof = server.aof();
+        (0..5).all(|i| deletions(&aof, &format!("k:{i}")) == 1)
+    });
+    server.env.clear();
+    server.kill();
+    server.restart();
+    assert_eq!(server.conn().cmd(&["DBSIZE"]).i(), 0);
+}
+
+/// Active expiry in the middle of a script: the script is one step, and a
+/// key it set comes due, by the clock, while it runs. The sweep used to take
+/// the key out under the script, whose `INCR` then made it again, `1` with
+/// no time to live; and the key's `DEL` went into the AOF ahead of the
+/// script's own writes. It waits for the script, as for a transaction.
+#[cfg(feature = "lua")]
+#[test]
+fn active_expiry_does_not_run_in_the_middle_of_a_script() {
+    let mut server = Server::start(&["--aof"]);
+    let mut c = server.conn();
+    // 400 ms of work after the `SET`, its key due 20 ms in.
+    let script = "redis.call('SET', KEYS[1], '5', 'PX', '20') \
+                  local t = os.clock() \
+                  while os.clock() - t < 0.4 do end \
+                  return redis.call('INCR', KEYS[1])";
+    for i in 0..3 {
+        let key = format!("s:{i}");
+        assert_eq!(
+            c.cmd(&["EVAL", script, "1", &key]).i(),
+            6,
+            "{key} went in the middle of the script"
+        );
+    }
+    wait_until("the keys to expire, with their DELs logged", 20, || {
+        let aof = server.aof();
+        (0..3).all(|i| deletions(&aof, &format!("s:{i}")) == 1)
+    });
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 0);
+    // Each `DEL` after the script's writes to its key.
+    let aof = server.aof();
+    for i in 0..3 {
+        let key = format!("s:{i}");
+        let incr = position(
+            &aof,
+            format!("$4\r\nINCR\r\n${}\r\n{key}\r\n", key.len()).as_bytes(),
+        )
+        .or_else(|| {
+            position(
+                &aof,
+                format!("$4\r\nincr\r\n${}\r\n{key}\r\n", key.len()).as_bytes(),
+            )
+        })
+        .unwrap_or_else(|| panic!("no INCR of {key} in the AOF"));
+        let gone = ["DEL", "UNLINK"]
+            .iter()
+            .filter_map(|cmd| {
+                position(
+                    &aof,
+                    format!("${}\r\n{cmd}\r\n${}\r\n{key}\r\n", cmd.len(), key.len()).as_bytes(),
+                )
+            })
+            .min()
+            .unwrap();
+        assert!(
+            gone > incr,
+            "the DEL of {key} is ahead of the script's writes"
+        );
+    }
+    server.kill();
+    server.restart();
+    assert_eq!(server.conn().cmd(&["DBSIZE"]).i(), 0);
 }
 
 /// The same with the server up past the deadline: active expiry takes the

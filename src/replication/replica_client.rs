@@ -1326,7 +1326,10 @@ fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync
     let staging_store = store::new_store(databases);
     // A key past its time is loaded all the same: the master's `DEL` of it
     // is on its way, and the writes made to it before are in the stream.
+    // Nothing is swept meanwhile either (a replica's sweep deletes nothing,
+    // and this is a staging store; but the node's role can change under it).
     let _hold = crate::expiry::hold();
+    let _loading = crate::expiry::Loading::start();
 
     let is_kividb = payload.len() >= 8 && payload[..8] == *crate::snapshot::KDB_MAGIC;
     let (dbs, expiries, index_schemas, dictionaries, functions) = if is_kividb {

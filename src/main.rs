@@ -697,6 +697,10 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
         rx.recv().unwrap()
     };
     crate::stats::spawn_instantaneous_ops_sampler();
+    // No key is swept until what it deletes can be logged: the dataset is
+    // loaded and the AOF's sender installed, further down. A `DEL` sent
+    // before that went nowhere, and the key came back at the next restart.
+    let starting = crate::expiry::Loading::start();
     crate::commands::helpers::spawn_active_expire_task(
         Arc::clone(&store),
         Arc::clone(&index_store),
@@ -914,6 +918,8 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     // Reachable from the replication applier, which is built too deep to be
     // handed this channel directly. See `aof::install_global_aof_sender`.
     aof::install_global_aof_sender(Box::new(aof_tx.clone()));
+    // The keys active expiry deletes are logged from here on.
+    drop(starting);
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()

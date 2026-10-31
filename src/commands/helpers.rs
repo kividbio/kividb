@@ -405,6 +405,12 @@ fn stale(seen: usize, due: usize) -> bool {
 /// time meanwhile, or a new value without one, is left alone. With `told`,
 /// the `DEL` of each key deleted is propagated, as a write's record is:
 /// holding the write gate and the keys' order from before they go.
+///
+/// Inside the command gate, as a command: not in the middle of a
+/// transaction or a script, which is one step, nor of a script that runs
+/// beside others under the keys' hash tag (`tag_locks`). Taken there, the
+/// key went from under the script, and its `DEL` went ahead of the script's
+/// writes. And nothing while a dataset is being loaded (`expiry::Loading`).
 fn expire_batch(
     store: &Store,
     index_store: &IndexStore,
@@ -414,6 +420,15 @@ fn expire_batch(
     now: u64,
     told: Option<&crate::expiry::Target>,
 ) {
+    // In the order a command takes them: the command gate, the write gate,
+    // the keys' tags' locks, the keys' order.
+    let _command = crate::command_gate::enter();
+    let _gate = told.map(|_| crate::write_gate::enter());
+    let _tags = if crate::tag_locks::enabled() {
+        crate::tag_locks::lock_keys(batch.iter().map(|k| k.as_bytes()))
+    } else {
+        None
+    };
     let ordered = told.map(|_| crate::expiry::order(db, batch.iter().map(|k| k.as_bytes())));
     // Writes were paused, for a handoff say, while this waited for the
     // gate: a `DEL` now would come after the cut the handoff took. The
@@ -425,10 +440,14 @@ fn expire_batch(
     let mut freed: Vec<store::Taken> = Vec::with_capacity(batch.len());
     {
         let mut values = write_lock!(store[db][shard]);
-        for key in batch {
-            if let Some(value) = values.remove_if_due(key.as_str(), now) {
-                freed.push(value);
-                gone.push(key);
+        // Looked at with the shard locked: a load counted in after this
+        // finds the keys gone before it writes to them.
+        if !crate::expiry::loading() {
+            for key in batch {
+                if let Some(value) = values.remove_if_due(key.as_str(), now) {
+                    freed.push(value);
+                    gone.push(key);
+                }
             }
         }
     }
@@ -532,8 +551,9 @@ pub fn spawn_active_expire_task(
                 std::thread::sleep(wait);
                 // Nothing expires while writes are paused, as in Redis: the
                 // keys and fields that come due meanwhile go once the pause
-                // is over.
-                if crate::pause::expiry_deferred() {
+                // is over. Nor while a dataset is being loaded: the load
+                // says what is gone, by the `DEL`s in it (`expiry::Loading`).
+                if crate::pause::expiry_deferred() || crate::expiry::loading() {
                     continue;
                 }
                 let started = std::time::Instant::now();
