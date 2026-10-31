@@ -182,7 +182,7 @@ fn ask(
     definition: Option<&[Vec<u8>]>,
 ) -> Result<Reply, String> {
     match ask_once(host, port, credentials, db, cmd) {
-        Err(e) if e.ends_with("no such index") && definition.is_some() => {
+        Err(e) if crate::commands::search::is_no_such_index(&e) && definition.is_some() => {
             let create: Vec<&[u8]> = definition.unwrap().iter().map(Vec::as_slice).collect();
             crate::cluster::ddl::run_on(host, port, &credentials.0, &credentials.1, &create)?;
             log_info!("Cluster: gave {host}:{port} the definition of an index it lacked");

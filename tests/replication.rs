@@ -1538,3 +1538,53 @@ fn test_a_silent_replica_is_dropped_after_repl_timeout() {
     };
     assert!(closed, "the silent replica's connection is still open");
 }
+
+/// `FT.DROPINDEX … DD` on a master deletes the documents on its replica too:
+/// the replica is sent the drop and a DEL of each.
+#[test]
+fn test_dropindex_dd_deletes_the_documents_on_the_replica() {
+    let master_port = spawn_server(Config::default());
+    let mut master = Conn::connect(master_port);
+    let replica_port = spawn_server(replica_of(master_port));
+    let mut replica = Conn::connect(replica_port);
+    wait_link_up(&mut replica);
+
+    assert!(
+        master
+            .cmds(&[
+                "FT.CREATE",
+                "idx:rdd",
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                "rdd:",
+                "SCHEMA",
+                "t",
+                "TEXT",
+            ])
+            .is_ok()
+    );
+    master.cmds(&["HSET", "rdd:1", "t", "a"]);
+    master.cmds(&["HSET", "rdd:2", "t", "b"]);
+    master.cmds(&["SET", "rdd:3", "a string, not a document"]);
+    master.cmds(&["HSET", "rother:1", "t", "c"]);
+    wait_until("the replica has the keys", Duration::from_secs(10), || {
+        replica
+            .cmds(&["EXISTS", "rdd:1", "rdd:2", "rdd:3", "rother:1"])
+            .as_int()
+            == 4
+    });
+
+    assert!(master.cmds(&["FT.DROPINDEX", "idx:rdd", "DD"]).is_ok());
+    wait_until(
+        "the replica deletes the documents",
+        Duration::from_secs(10),
+        || replica.cmds(&["EXISTS", "rdd:1", "rdd:2"]).as_int() == 0,
+    );
+    assert_eq!(replica.cmds(&["EXISTS", "rdd:3", "rother:1"]).as_int(), 2);
+    assert!(matches!(
+        replica.cmds(&["FT.INFO", "idx:rdd"]),
+        RespValue::Error(_)
+    ));
+}

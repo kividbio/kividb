@@ -102,6 +102,31 @@ A patch release of 1.1.0.
   Nothing expires while the AOF or a snapshot is loaded or a master's
   stream applied, and a replica deletes no expired key itself: its clients
   see the key as gone until the master's `DEL` arrives, as in Redis.
+- **`FT.DROPINDEX index DD` deletes the documents, as in Redis.** `DD`
+  was ignored, and the documents of the index stayed: an application that
+  reset its search data this way (mem0's `Memory.reset()`, RedisVL's
+  `SearchIndex.delete()`) found its old documents still there. The keys the
+  index covered are now deleted, for HASH and JSON indexes alike, each with
+  a `del` keyspace event. Replicas and the AOF get the drop and a `DEL` of
+  each document deleted, as Redis sends them; a `DD` already in an AOF
+  written by an earlier 1.1, or sent by such a master, still keeps the
+  documents, as that server did. In a cluster every master deletes its own.
+  Anything else after the index name is now refused with `Unknown argument`.
+<!-- 1.1.3: wording at publish -->
+
+- **Search: a missing index is reported in Redis 8's words.** Every
+  command that names an index that does not exist (`FT.INFO`, `FT.SEARCH`,
+  `FT.AGGREGATE`, `FT.PROFILE`, `FT.EXPLAIN`, `FT.EXPLAINCLI`,
+  `FT.DROPINDEX`, `FT.ALTER`, `FT.ALIASADD`, `FT.ALIASUPDATE`,
+  `FT.ALIASLIST`, `FT.TAGVALS`, `FT.SPELLCHECK`, `FT.SYNUPDATE`,
+  `FT.SYNDUMP`, `FT.CURSOR`, `FT.HYBRID`) now replies
+  `SEARCH_INDEX_NOT_FOUND Index not found: <name>`, as Redis 8.10 does.
+  `FT.INFO`, `FT.SEARCH` and a few others replied `<name>: no such index`,
+  the rest `ERR no such index`. Clients that create the index when the
+  error says "not found" failed on a new database: mem0's Valkey store
+  could not start. This is a compatibility fix, but the text changes: a
+  client that looked for `no such index` must look for `Index not found`.
+  In a cluster, a node still giving the old words is understood.
 <!-- 1.1.3: wording at publish -->
 
 ## [1.1.2]
