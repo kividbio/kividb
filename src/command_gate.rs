@@ -491,19 +491,30 @@ mod tests {
         assert!(done.load(Ordering::SeqCst));
     }
 
+    /// The gate is the process's: a test beside this one may be taking it
+    /// alone. Its taker then waits for `mine`, and the other thread, queued
+    /// behind the taker, would wait for ever while this one waits for it. So
+    /// the other thread gives up after a while, `mine` is let go of, and the
+    /// check is made again.
     #[test]
     fn commands_do_not_wait_for_each_other() {
-        let _mine = enter();
-        let entered = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&entered);
-        std::thread::spawn(move || {
-            let _theirs = enter();
-            flag.store(true, Ordering::SeqCst);
-        })
-        .join()
-        .unwrap();
-        assert!(entered.load(Ordering::SeqCst));
-        std::thread::sleep(Duration::from_millis(1));
+        for _ in 0..50 {
+            let mine = enter();
+            let entered = std::thread::spawn(|| {
+                let deadline = std::time::Instant::now() + Duration::from_millis(200);
+                enter_unless(Duration::from_millis(5), || {
+                    std::time::Instant::now() > deadline
+                })
+                .is_some()
+            })
+            .join()
+            .unwrap();
+            drop(mine);
+            if entered {
+                return;
+            }
+        }
+        panic!("a command never got in beside another");
     }
 
     #[test]
