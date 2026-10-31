@@ -443,14 +443,40 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     // and on io_uring the connection still carried the
                     // boot-time aof_enabled=false, so that write was
                     // never logged at all.
-                    if !was_on && let Err(e) = crate::aof::checkpoint(ctx.store, ctx.index_store) {
-                        crate::aof::AOF_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
-                        return Some(resp_error(&format!("ERR enabling AOF failed: {e}")));
+                    if !was_on {
+                        // The file is opened on the writer thread, which
+                        // owns the handle: opened here, it would be a
+                        // second handle to the same inode, and the first
+                        // thing the writer closed. An open that fails is
+                        // an error, the way Redis answers, not an exit (#47).
+                        if let Err(e) = crate::aof::open_log_blocking() {
+                            crate::aof::AOF_ENABLED
+                                .store(false, std::sync::atomic::Ordering::Relaxed);
+                            return Some(resp_error(&format!(
+                                "ERR enabling AOF failed: opening appendonly.aof: {e}"
+                            )));
+                        }
+                        if let Err(e) = crate::aof::checkpoint(ctx.store, ctx.index_store) {
+                            crate::aof::AOF_ENABLED
+                                .store(false, std::sync::atomic::Ordering::Relaxed);
+                            // Close what was opened, so a later try at a
+                            // writable directory starts from a clean slate.
+                            crate::aof::close_log_blocking();
+                            return Some(resp_error(&format!("ERR enabling AOF failed: {e}")));
+                        }
                     }
                     Some(resp_simple("OK"))
                 }
                 "no" | "0" | "false" => {
-                    crate::aof::AOF_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+                    let was_on =
+                        crate::aof::AOF_ENABLED.swap(false, std::sync::atomic::Ordering::Relaxed);
+                    if was_on {
+                        // Nothing queues a record with the flag down; the
+                        // writer closes the file it held. Nothing is
+                        // removed: like Redis, the log stays for the next
+                        // start.
+                        crate::aof::close_log_blocking();
+                    }
                     Some(resp_simple("OK"))
                 }
                 _ => Some(resp_error("ERR Invalid argument for CONFIG SET appendonly")),

@@ -225,10 +225,20 @@ fn as_turn_over_mark(item: &[u8]) -> Option<u64> {
 /// that write what is queued themselves (see [`written`]).
 struct Log {
     rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    file: std::fs::File,
+    /// `None` while the AOF is off: no file is open, and none exists. A
+    /// record that arrives while nothing is open is dropped — with the flag
+    /// off, nothing should be queueing records anyway.
+    file: Option<std::fs::File>,
 }
 
 static LOG: parking_lot::Mutex<Option<Log>> = parking_lot::const_mutex(None);
+
+/// Whether the writer has the log open — the flag alone says a command may
+/// queue a record, but between the flag going up and the writer's open
+/// landing, only this says the record has somewhere to go.
+pub fn log_is_open() -> bool {
+    LOG.lock().as_ref().is_some_and(|log| log.file.is_some())
+}
 
 /// Wakes the writer thread: a record or a barrier has been queued. Kept as a
 /// permit if it is busy, so nothing queued is left behind.
@@ -256,7 +266,10 @@ pub fn records_queued() {
 fn write_what_is_queued(block: bool) -> Option<bool> {
     let mut log = if block { LOG.lock() } else { LOG.try_lock()? };
     let log = log.as_mut()?;
-    Some(write_queued(&mut log.file, &mut log.rx, None).1)
+    let Some(file) = log.file.as_mut() else {
+        return Some(false);
+    };
+    Some(write_queued(file, &mut log.rx, None).1)
 }
 
 /// A barrier in the queue, followed by its number.
@@ -485,14 +498,30 @@ pub fn request_flush() {
 pub async fn start_aof_writer(rx: mpsc::UnboundedReceiver<Vec<u8>>) {
     let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel::<()>(1);
     let _ = FLUSH_TX.set(flush_tx);
+    let (open_tx, mut open_rx) = tokio::sync::mpsc::
+unbounded_channel::<std::sync::mpsc::SyncSender<std::io::Result<()>>>();
+    let (close_tx, mut close_rx) =
+        tokio::sync::mpsc::unbounded_channel::<std::sync::mpsc::SyncSender<()>>();
+    // `OnceLock::set` is a no-op when a previous server in this process (a
+    // test) already set these; the writer of that server is gone with it.
+    let _ = OPEN_TX.set(open_tx);
+    let _ = CLOSE_TX.set(close_tx);
 
-    // A server asked to keep an append-only file that cannot open one must
-    // not run: it would accept writes and keep none of them. (This used to be
-    // a panic in this task alone — the server carried on, serving, with
-    // nothing being logged.)
-    let file = match open_aof() {
-        Ok(file) => file,
-        Err(e) => fatal_persistence(&format!("{AOF_PATH} cannot be opened for appending: {e}")),
+    // Opened only when the AOF is on: with it off, no file is created and
+    // none is required, so a server whose data directory cannot be written
+    // still starts and serves (#47). A server asked to keep an append-only
+    // file that cannot open one must not run: it would accept writes and
+    // keep none of them. (This used to be a panic in this task alone — the
+    // server carried on, serving, with nothing being logged.)
+    let file = if AOF_ENABLED.load(Ordering::Relaxed) {
+        match open_aof() {
+            Ok(file) => Some(file),
+            Err(e) => fatal_persistence(&format!(
+                "{AOF_PATH} cannot be opened for appending: {e}"
+            )),
+        }
+    } else {
+        None
     };
     *LOG.lock() = Some(Log { rx, file });
     WRITER_RUNNING.store(true, Ordering::Release);
@@ -512,6 +541,25 @@ pub async fn start_aof_writer(rx: mpsc::UnboundedReceiver<Vec<u8>>) {
             }
             Some(()) = flush_rx.recv() => {
                 do_fsync();
+            }
+            Some(done) = open_rx.recv() => {
+                // The one thread that owns the handle opens the file, and
+                // puts it in the log: until it is there, nothing writes to
+                // it, and a record queued in between would be dropped.
+                let result = open_aof().map(|file| {
+                    if let Some(log) = LOG.lock().as_mut() {
+                        log.file = Some(file);
+                    }
+                });
+                let _ = done.send(result);
+            }
+            Some(done) = close_rx.recv() => {
+                // Take the handle: closing it is the writer's business, and
+                // dropping it here is the whole of "off".
+                if let Some(log) = LOG.lock().as_mut() {
+                    log.file = None;
+                }
+                let _ = done.send(());
             }
             () = QUEUED.notified() => {
                 let released = write_what_is_queued(true).unwrap_or(false);
@@ -569,6 +617,18 @@ fn perform_turn_over(file: &mut std::fs::File, generation: u64) -> std::io::Resu
     *file = open_aof()?;
     Ok(())
 }
+
+/// Open the log from the writer thread, replacing whatever handle it held.
+/// The reply carries the open's error, so `CONFIG SET appendonly yes` can
+/// fail with one rather than exit the server (#47).
+/// Static channels, not call arguments: the writer selects over a fixed set
+/// of futures, and the callers — a connection worker — cannot borrow into it.
+static OPEN_TX: std::sync::OnceLock<
+    tokio::sync::mpsc::UnboundedSender<std::sync::mpsc::SyncSender<std::io::Result<()>>>,
+> = std::sync::OnceLock::new();
+static CLOSE_TX: std::sync::OnceLock<
+    tokio::sync::mpsc::UnboundedSender<std::sync::mpsc::SyncSender<()>>,
+> = std::sync::OnceLock::new();
 
 /// Write `first` and whatever else is queued, turning the log over at each
 /// mark on the way (see [`turn_over_mark`]), and answering the barriers
@@ -704,12 +764,15 @@ fn do_fsync() {
         let Some(log) = log.as_mut() else {
             return;
         };
+        let Some(file) = log.file.as_mut() else {
+            return;
+        };
         // Drain pending writes before fsyncing, coalesced into one write.
-        let had_data = write_queued(&mut log.file, &mut log.rx, None).0;
+        let had_data = write_queued(file, &mut log.rx, None).0;
         // What the sync covers: what is on this file now. Records others
         // write once the lock is let go may miss it, so they are not counted.
         let written = AOF_WRITTEN.load(Ordering::Relaxed);
-        (had_data, written, log.file.try_clone())
+        (had_data, written, file.try_clone())
     };
     let Ok(file) = file else {
         return;
@@ -739,6 +802,42 @@ fn do_fsync() {
         );
     } else {
         AOF_FSYNCED.fetch_max(written, Ordering::Relaxed);
+    }
+}
+
+/// Ask the writer to open the log, and wait for it.
+///
+/// Sync, like [`turn_over_aof`]: the waiter may be a blocking worker (`CONFIG
+/// SET appendonly` reaching the resume dispatch of a parked command, the
+/// replica applier), where `.await` is not available. The open is one syscall
+/// on a thread of the writer's own; it blocks the worker for that long and no
+/// longer.
+pub fn open_log_blocking() -> std::io::Result<()> {
+    let (done, wait) = std::sync::mpsc::sync_channel(1);
+    if let Some(tx) = OPEN_TX.get() {
+        tx.send(done)
+            .map_err(|_| std::io::Error::other("AOF writer is gone"))?;
+        wait
+            .recv()
+            .map_err(|_| std::io::Error::other("AOF writer dropped the open"))?
+    } else {
+        // No writer: the caller that starts one opens the file itself, with
+        // AOF_ENABLED already up (see `start_aof_writer`). Between here and
+        // there nothing queues a record, so an "open" now would be one that
+        // nothing writes to and nothing closes; report success and let the
+        // writer's own open decide whether the directory is writable.
+        Ok(())
+    }
+}
+
+/// Ask the writer to close the log, and wait for it. Sync, like
+/// [`open_log_blocking`], for the same reason.
+pub fn close_log_blocking() {
+    let (done, wait) = std::sync::mpsc::sync_channel(1);
+    if let Some(tx) = CLOSE_TX.get()
+        && tx.send(done).is_ok()
+    {
+        let _ = wait.recv();
     }
 }
 
@@ -802,7 +901,7 @@ pub fn checkpoint_noting(
     at_cut: &mut dyn FnMut(),
 ) -> std::io::Result<()> {
     REWRITE_ACTIVE.store(true, Ordering::Release);
-    let aof_on = AOF_ENABLED.load(Ordering::Relaxed);
+    let aof_on = AOF_ENABLED.load(Ordering::Relaxed) && log_is_open();
     let started = std::time::Instant::now();
     let result = checkpoint_inner(store, index_store, at_cut);
     // With the AOF on, a checkpoint is its rewrite (#149): these were never
@@ -825,7 +924,7 @@ fn checkpoint_inner(
     index_store: &crate::vector::IndexStore,
     at_cut: &mut dyn FnMut(),
 ) -> std::io::Result<()> {
-    let aof_on = AOF_ENABLED.load(Ordering::Relaxed);
+    let aof_on = AOF_ENABLED.load(Ordering::Relaxed) && log_is_open();
     let generation = next_generation();
 
     // Between whole writes: a write is either in what is captured, with its
