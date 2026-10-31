@@ -43,6 +43,7 @@ use parking_lot::{Mutex, MutexGuard};
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -276,6 +277,89 @@ pub fn lock_keys<'a>(keys: impl Iterator<Item = &'a [u8]>) -> Option<KeysGuard> 
     })
 }
 
+/// What active expiry holds of the tags of a batch of keys: the locks it
+/// could take, and which it could not ([`try_lock_keys`]).
+pub struct TriedKeys {
+    _held: Vec<MutexGuard<'static, ()>>,
+    /// The stripes that were busy: their keys are left for another time.
+    busy: Vec<usize>,
+}
+
+impl TriedKeys {
+    /// Whether `key` may be taken: it has no tag, or its tag's lock is held.
+    #[inline]
+    pub fn may_take(&self, key: &[u8]) -> bool {
+        self.busy.is_empty() || tag_of(key).is_none_or(|tag| !self.busy.contains(&stripe_of(tag)))
+    }
+
+    /// Whether some key's tag was busy, and is to be left.
+    #[inline]
+    pub fn left_some(&self) -> bool {
+        !self.busy.is_empty()
+    }
+}
+
+/// How many times in a row a thread may find a stripe busy in
+/// [`try_lock_keys`] before it waits for it, and how long it then waits at
+/// most.
+const PATIENT_AFTER: u8 = 3;
+const PATIENCE: Duration = Duration::from_millis(5);
+
+thread_local! {
+    /// For each stripe, how many times in a row [`try_lock_keys`] found it
+    /// busy on this thread.
+    static MISSES: [Cell<u8>; STRIPES] = const { [const { Cell::new(0) }; STRIPES] };
+}
+
+/// The lock of each tagged key in `keys`, for active expiry, which holds the
+/// write gate already: without waiting for a lock that is held, or not for
+/// long. `None` when no key has a tag.
+///
+/// Waiting there, under the gate, is how it hung (with the sweep holding
+/// a slot of the write gate and waiting for a tag, a read under that tag
+/// waiting for the same slot to delete an expired key, and a checkpoint
+/// waiting for the sweep's slot and holding back the read). So a stripe
+/// that is held is not waited for: its keys are left (`TriedKeys::may_take`),
+/// and found again on the next cycle. A stripe found busy
+/// [`PATIENT_AFTER`] times in a row, as a hash tag whose queue is never idle
+/// is, is waited for, [`PATIENCE`] at most: a script's tag is held for a
+/// moment at a time, and a `parking_lot` lock is handed to a thread that
+/// waits for it within half a millisecond or so. The wait is bounded, so
+/// nothing waits on the sweep for longer than that.
+pub fn try_lock_keys<'a>(keys: impl Iterator<Item = &'a [u8]>) -> Option<TriedKeys> {
+    let mut stripes: Vec<usize> = keys.filter_map(tag_of).map(stripe_of).collect();
+    if stripes.is_empty() {
+        return None;
+    }
+    // In the order of the table, as `lock_keys` takes them.
+    stripes.sort_unstable();
+    stripes.dedup();
+    let mut held = Vec::with_capacity(stripes.len());
+    let mut busy = Vec::new();
+    MISSES.with(|misses| {
+        for stripe in stripes {
+            let missed = &misses[stripe];
+            let lock = &STRIPE[stripe].0;
+            let guard = if missed.get() >= PATIENT_AFTER {
+                lock.try_lock_for(PATIENCE)
+            } else {
+                lock.try_lock()
+            };
+            match guard {
+                Some(guard) => {
+                    missed.set(0);
+                    held.push(guard);
+                }
+                None => {
+                    missed.set(missed.get().saturating_add(1));
+                    busy.push(stripe);
+                }
+            }
+        }
+    });
+    Some(TriedKeys { _held: held, busy })
+}
+
 /// Commands that read or change keys they do not name. With tag locks on
 /// they take the command gate alone: no script is then part-way through.
 pub fn sees_the_whole_keyspace(name: &str) -> bool {
@@ -387,6 +471,86 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("it was let through when the script ended");
         waiter.join().unwrap();
+    }
+
+    /// Active expiry's way: a held tag is not waited for, and its keys are
+    /// left; the others, and keys without a tag, are taken.
+    #[test]
+    fn a_tag_that_is_held_is_left_and_not_waited_for() {
+        let other = (0..)
+            .map(|i| format!("free-{i}"))
+            .find(|tag| stripe_of(tag.as_bytes()) != stripe_of(b"held-tag"))
+            .unwrap();
+        let free_key = format!("{{{other}}}:k");
+        let held = lock_for_script(b"held-tag");
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let started = std::time::Instant::now();
+                    let tried = try_lock_keys(
+                        [b"{held-tag}:a".as_slice(), free_key.as_bytes(), b"plain"].into_iter(),
+                    )
+                    .expect("two keys have a tag");
+                    assert!(started.elapsed() < Duration::from_secs(1), "it waited");
+                    assert!(tried.left_some());
+                    assert!(!tried.may_take(b"{held-tag}:a"));
+                    assert!(tried.may_take(free_key.as_bytes()));
+                    assert!(tried.may_take(b"plain"));
+                    assert!(try_lock_keys([b"plain".as_slice()].into_iter()).is_none());
+                })
+                .join()
+                .unwrap();
+        });
+        drop(held);
+    }
+
+    /// A tag held for ever is waited for a bounded time at most, however
+    /// often it is tried; and a tag that is busy nearly all the time, but
+    /// let go of now and then, is taken in the end: its keys do not wait
+    /// for ever.
+    #[test]
+    fn a_busy_tag_is_waited_for_a_little_and_not_for_ever() {
+        let forever = lock_for_script(b"never-let-go");
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    for _ in 0..10 {
+                        let started = std::time::Instant::now();
+                        let tried =
+                            try_lock_keys([b"{never-let-go}:k".as_slice()].into_iter()).unwrap();
+                        assert!(tried.left_some());
+                        assert!(started.elapsed() < Duration::from_secs(1));
+                    }
+                })
+                .join()
+                .unwrap();
+        });
+        drop(forever);
+
+        // Held by another thread all the time but for a moment between
+        // holds, as a queue's scripts hold their tag.
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    let _held = lock_for_script(b"busy-queue-tag");
+                    std::thread::sleep(Duration::from_micros(300));
+                }
+            });
+            scope
+                .spawn(|| {
+                    std::thread::sleep(Duration::from_millis(20));
+                    let taken = (0..200).any(|_| {
+                        let tried =
+                            try_lock_keys([b"{busy-queue-tag}:k".as_slice()].into_iter()).unwrap();
+                        !tried.left_some()
+                    });
+                    stop.store(true, Ordering::Relaxed);
+                    assert!(taken, "the busy tag was never taken");
+                })
+                .join()
+                .unwrap();
+        });
     }
 
     #[test]

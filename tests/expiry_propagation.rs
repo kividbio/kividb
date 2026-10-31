@@ -1054,3 +1054,144 @@ fn a_key_expired_in_a_database_no_client_selected_leaves_the_stream_in_0() {
     assert_eq!(m.cmd(&["DEL", "aof-mark"]).i(), 1);
     assert_eq!(dataset(&mut m), expected, "the replay");
 }
+
+// ── Expiry, the write gate and hash tags: no deadlock ─────────────────────────
+//
+// What a write holds, it takes in one order: the write gate (whose shared
+// side is a lock per thread's slot, and which a checkpoint or a full resync
+// takes whole, slot by slot), then the locks of its keys' hash tags
+// (`tag_locks`), then the keys' order. A key's expiry is a write too: its
+// `DEL` is logged and propagated under the same. Taken the other way round,
+// the server hung for good:
+//
+// * a read under a tag's lock (a client's command on a tagged key, or a
+//   read-only script running beside others under its tag) found a key past
+//   its time, and entered the write gate to delete it;
+// * active expiry, holding a slot of the write gate, waited for that tag;
+// * a checkpoint, holding the read's slot already, waited for the sweep's;
+//   and the read waited for the checkpoint.
+
+#[cfg(feature = "lua")]
+impl Conn {
+    /// Send a command, and read nothing.
+    fn send(&mut self, args: &[&str]) {
+        let mut buf = format!("*{}\r\n", args.len()).into_bytes();
+        for a in args {
+            buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+            buf.extend_from_slice(a.as_bytes());
+            buf.extend_from_slice(b"\r\n");
+        }
+        self.writer.write_all(&buf).unwrap();
+    }
+
+    /// The next reply, or `None` if none comes within `secs`.
+    fn reply_within(&mut self, secs: u64) -> Option<V> {
+        self.writer
+            .set_read_timeout(Some(Duration::from_secs(secs)))
+            .unwrap();
+        let ready = self.reader.fill_buf().is_ok_and(|buf| !buf.is_empty());
+        self.writer
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        ready.then(|| self.read())
+    }
+}
+
+/// A read-only script that works for `ARGV[1]` seconds, then reads its key.
+#[cfg(feature = "lua")]
+const SLOW_READ: &str = "local t = os.clock() \
+                         while os.clock() - t < tonumber(ARGV[1]) do end \
+                         return redis.call('GET', KEYS[1])";
+
+/// The hang, laid out step by step. A read-only script runs beside others
+/// under the tag `{t}`, holding its lock, and at its end reads `{t}:gone`,
+/// which was past its time when it began (the script's clock stands still)
+/// and which nothing has deleted: writes were paused meanwhile, and the
+/// sweep waits for a pause to end. Then, while the script runs: writes are
+/// let go on; the sweep goes for `{t}:gone`, and with `writer`, a `SET` of
+/// another key of the tag, each holding a slot of the write gate and
+/// waiting for the tag; and `BGREWRITEAOF` cuts. The reader's thread took
+/// its slot of the gate before any other (its `SET` came first), so the cut
+/// holds it before it comes to the others', and waits there.
+///
+/// Three connections, each served by a worker thread of its own (a worker
+/// with a connection more than another passes the next one on).
+#[cfg(feature = "lua")]
+fn a_read_under_a_tag_meets_a_cut(writer_too: bool) {
+    let mut server = Server::start(&["--aof"]);
+    let mut reader = server.conn();
+    let mut writer = server.conn();
+    let mut admin = server.conn();
+    // The first slot of the write gate is the reader's thread's.
+    assert_eq!(reader.cmd(&["SET", "first", "1"]).s(), "OK");
+    // Seen to be quick: from now on it runs beside others, under its tag.
+    assert_eq!(
+        reader.cmd(&["EVAL_RO", SLOW_READ, "1", "{warm}:k", "0"]),
+        V::Nil
+    );
+    assert_eq!(reader.cmd(&["SET", "{t}:gone", "v", "PX", "20"]).s(), "OK");
+    assert_eq!(admin.cmd(&["CLIENT", "PAUSE", "30000", "WRITE"]).s(), "OK");
+    std::thread::sleep(Duration::from_millis(100));
+    // Past its time, and nothing deletes it while writes are paused.
+    reader.send(&["EVAL_RO", SLOW_READ, "1", "{t}:gone", "1.5"]);
+    std::thread::sleep(Duration::from_millis(200));
+    if writer_too {
+        // Held by the pause until it ends.
+        writer.send(&["SET", "{t}:w", "1"]);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(admin.cmd(&["CLIENT", "UNPAUSE"]).s(), "OK");
+    // The sweep comes round within 100 ms.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        matches!(admin.cmd(&["BGREWRITEAOF"]), V::Str(_)),
+        "BGREWRITEAOF was refused"
+    );
+    assert_eq!(
+        reader.reply_within(20),
+        Some(V::Nil),
+        "hung: the script under {{t}} never finished"
+    );
+    if writer_too {
+        assert_eq!(
+            writer.reply_within(20),
+            Some(V::Str("OK".into())),
+            "hung: the SET under {{t}} never finished"
+        );
+    }
+    wait_until("the rewrite to finish", 30, || {
+        admin.info("persistence", "aof_rewrite_in_progress") == "0"
+    });
+    assert_eq!(admin.cmd(&["EXISTS", "{t}:gone"]).i(), 0);
+    assert_eq!(admin.cmd(&["SET", "last", "1"]).s(), "OK");
+    // In the file before the kill: a write can be answered before its
+    // record is written.
+    wait_until("the last write to reach the AOF", 10, || {
+        count(&server.aof(), b"$4\r\nlast\r\n") > 0
+    });
+    // And what was logged, before the cut and after it, replays to the same.
+    server.kill();
+    server.restart();
+    let mut c = server.conn();
+    assert_eq!(
+        c.cmd(&["EXISTS", "{t}:gone"]).i(),
+        0,
+        "{{t}}:gone came back"
+    );
+    assert_eq!(c.cmd(&["GET", "first"]), V::Str("1".into()));
+    assert_eq!(c.cmd(&["GET", "last"]), V::Str("1".into()));
+    if writer_too {
+        assert_eq!(c.cmd(&["GET", "{t}:w"]), V::Str("1".into()));
+    }
+}
+
+/// The sweep waited for a tag while holding a slot of the write gate; a
+/// read under the tag found a key expired and entered the gate to delete
+/// it; a checkpoint held the read's slot and waited for the sweep's. Hung,
+/// every time, before both fixes: the sweep no longer waits for a tag that
+/// is held, and a read enters the write gate before it takes a tag's lock.
+#[cfg(feature = "lua")]
+#[test]
+fn a_read_under_a_tag_the_sweep_and_a_cut_do_not_deadlock() {
+    a_read_under_a_tag_meets_a_cut(false);
+}

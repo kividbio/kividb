@@ -462,12 +462,27 @@ fn expire_batch(
     // beside others under its tag (`tag_locks`) holds the command gate only
     // as a command does, and its tag's lock: without that lock, a key of the
     // tag went from under the script all the same.
+    // A tag that is held is not waited for (`tag_locks::try_lock_keys`):
+    // waiting there, with a slot of the write gate held, hung the server. A
+    // read under the tag that found a key expired waited for the same slot,
+    // to delete it, behind a checkpoint that waited for this. The keys of a
+    // tag that is held are left for the next cycle.
     let _gate = told.map(|_| crate::write_gate::enter());
-    let _tags = if crate::tag_locks::enabled() {
-        crate::tag_locks::lock_keys(batch.iter().map(|k| k.as_bytes()))
+    let tags = if crate::tag_locks::enabled() {
+        crate::tag_locks::try_lock_keys(batch.iter().map(|k| k.as_bytes()))
     } else {
         None
     };
+    let batch: Vec<&Key> = match &tags {
+        Some(tags) if tags.left_some() => batch
+            .iter()
+            .filter(|key| tags.may_take(key.as_bytes()))
+            .collect(),
+        _ => batch.iter().collect(),
+    };
+    if batch.is_empty() {
+        return;
+    }
     let ordered = told.map(|_| crate::expiry::order(db, batch.iter().map(|k| k.as_bytes())));
     // Writes were paused, for a handoff say, while this waited for the
     // gate: a `DEL` now would come after the cut the handoff took. The
@@ -484,7 +499,7 @@ fn expire_batch(
     if same_shards {
         let mut values = write_lock!(values_db[shard]);
         let mut times = write_lock!(expiry_store[db][shard]);
-        for key in batch {
+        for key in batch.iter().copied() {
             if times.get(key.as_str()).is_some_and(|exp| *exp < now) {
                 times.remove(key.as_str());
                 if let Some(value) = values.remove(key.as_str()) {
@@ -494,7 +509,7 @@ fn expire_batch(
             }
         }
     } else {
-        for key in batch {
+        for key in batch.iter().copied() {
             if let Some(value) = take_if_due(store, expiry_store, db, key, now) {
                 freed.push(value);
                 gone.push(key);
