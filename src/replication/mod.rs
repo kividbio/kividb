@@ -2327,6 +2327,92 @@ pub fn replicate_from_background(
         .store(db as u64, Ordering::Relaxed);
 }
 
+/// A key this master has expired in database `db`: `parts`, its `DEL` (or
+/// `UNLINK`), to replicas, taps and the AOF, as the write that deleted it
+/// (see `expiry`). As [`replicate_from_background`], but also from inside a
+/// command: in a transaction or a script it goes with the group's writes,
+/// where it was made, and to the AOF through the group's records.
+///
+/// Call it holding the write gate and the key's place in the order of
+/// writes (`expiry::order`), with the key already gone. A replica
+/// propagates nothing: its master tells it what expired.
+pub fn replicate_expired(repl_state: &ReplState, hub_tx: &HubTx, db: usize, parts: &[Vec<u8>]) {
+    if repl_state.is_slave() {
+        return;
+    }
+    let aof = crate::aof::AOF_ENABLED.load(Ordering::Relaxed);
+    let has_replicas = repl_state.feeds_hub();
+    let tapped = repl_state.stream_taps.load(Ordering::Relaxed) > 0;
+    if !aof && !has_replicas && !tapped {
+        return;
+    }
+    let grouped = in_group();
+    if grouped {
+        note_group_write(aof);
+    }
+    // One AOF record: a `SELECT` and the `DEL` it qualifies must not be
+    // separable by a crash.
+    let mut record = Vec::new();
+    let (payloads, now_in) = expired_for_stream(repl_state, db, parts);
+    for payload in payloads {
+        if tapped {
+            repl_state.feed_taps(&payload);
+        }
+        if aof {
+            record.extend_from_slice(&payload);
+        }
+        if grouped && has_replicas {
+            GROUP_STREAM.with(|stream| stream.borrow_mut().extend_from_slice(&payload));
+        } else {
+            repl_state
+                .repl_offset
+                .fetch_add(payload.len() as u64, Ordering::Relaxed);
+            if has_replicas {
+                propagate(hub_tx, payload);
+            }
+        }
+    }
+    if aof {
+        crate::aof::AOF_WRITTEN.fetch_add(record.len() as u64, Ordering::Relaxed);
+        crate::aof::queue_record(&crate::commands::ctx::GlobalAofSender, record);
+    }
+    repl_state
+        .repl_stream_last_db
+        .store(now_in as u64, Ordering::Relaxed);
+}
+
+/// `parts`, the deletion of a key expired in database `db`, encoded for the
+/// write stream; and the database the stream is in after it.
+///
+/// While no client has left database 0, a client's write carries no
+/// `SELECT`: whether it needs one is read from `repl_stream_last_db` before
+/// it is sent ([`ReplState::encode_for_stream`]). A key can be in another
+/// database all the same (`MOVE`, `COPY ... DB`, `SWAPDB`, a dataset
+/// loaded), and expiry deletes it beside those writes. Sent as a `SELECT`
+/// and a `DEL`, with the stream then taken to be in the key's database, a
+/// write that read 0 meanwhile went after the `SELECT` and was applied in
+/// the key's database by the replica and by a replay of the AOF; and as it
+/// stored 0 after, every write of database 0 from then on was too (3,300
+/// keys deleted on the master stayed on its replica in 8 s of six clients
+/// writing). So the deletion goes in one piece that goes back to 0, which
+/// leaves the stream where those writes take it to be.
+fn expired_for_stream(
+    repl_state: &ReplState,
+    db: usize,
+    parts: &[Vec<u8>],
+) -> (Vec<Vec<u8>>, usize) {
+    if db == 0 || repl_state.several_databases.load(Ordering::Relaxed) {
+        return (repl_state.encode_for_stream(db, parts), db);
+    }
+    let select = |db: usize| {
+        crate::resp::write::encode_resp_command(&[b"SELECT".to_vec(), db.to_string().into_bytes()])
+    };
+    let mut piece = select(db);
+    piece.extend_from_slice(&crate::resp::write::encode_resp_command(parts));
+    piece.extend_from_slice(&select(0));
+    (vec![piece], 0)
+}
+
 /// Append an already-encoded write to this node's own AOF and stop.
 ///
 /// Used by both nodes that must log without forwarding: a replica applying its

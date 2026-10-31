@@ -45,10 +45,15 @@ pub fn register_for(store: &crate::store::Store, registry: &WatchRegistry) {
 /// been modified.
 #[inline]
 pub fn expired(store: &crate::store::Store, db: usize, key: &str) {
+    expired_in(store_id(store), db, key);
+}
+
+/// [`expired`], for the store at address `id`.
+#[inline]
+pub fn expired_in(id: usize, db: usize, key: &str) {
     if WATCHES.load(Ordering::Relaxed) == 0 {
         return;
     }
-    let id = store_id(store);
     let registry = REGISTRIES
         .read()
         .iter()

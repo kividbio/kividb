@@ -453,7 +453,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let shard = store::get_shard(db, key);
             let map = read_lock!(shard);
             // The key's time to live is in the entry the value is read from.
-            Some(match map.get_expiring(key) {
+            Some(match map.peek_expiring(key) {
                 Some((_, Some(at))) if is_past(at) => {
                     drop(map);
                     expire_on_read(ctx.store, *ctx.selected_db, key);
@@ -946,7 +946,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 // A key past its time is not there. It is left for the next
                 // command on it, or the sweep, to remove: that takes its
                 // shard for writing, which this holds for reading.
-                let val = match shards.map(key).and_then(|map| map.get_expiring(key)) {
+                let val = match shards.map(key).and_then(|map| map.peek_expiring(key)) {
                     Some((_, Some(at))) if is_past(at) => {
                         crate::stats::record_miss();
                         nil.clone()

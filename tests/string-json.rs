@@ -2325,3 +2325,26 @@ fn test_restore_of_a_redis_8_10_json_document() {
     let value: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(value, serde_json::json!({"a": 1, "b": [1, 2]}));
 }
+
+/// `INCR` on a key whose time to live has passed, before active expiry
+/// reaps it, starts from nothing, and the result has no time to live. It
+/// read the old value and kept the old deadline, so the acknowledged write
+/// was deleted moments later.
+#[test]
+fn test_incr_of_an_expired_key_starts_fresh_and_stays() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let keys: Vec<String> = (0..10).map(|i| format!("counter:{i}")).collect();
+    for key in &keys {
+        assert!(c.cmds(&["SET", key, "100", "PX", "20"]).is_ok());
+        thread::sleep(Duration::from_millis(30));
+        assert_eq!(c.cmds(&["INCR", key]).as_int(), 1, "INCR {key}");
+    }
+    // Past several active expiry cycles.
+    thread::sleep(Duration::from_millis(300));
+    for key in &keys {
+        assert_eq!(c.cmds(&["GET", key]).as_str(), "1", "GET {key}");
+        assert_eq!(c.cmds(&["TTL", key]).as_int(), -1, "TTL {key}");
+    }
+}

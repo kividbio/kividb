@@ -289,19 +289,21 @@ fn strings_are_written_in_place_when_the_block_still_fits() {
         assert_eq!(text(map.get("l")), Some(bytes(5_000, 2)));
 
         // A time to live: kept, changed in place, or (given or taken away)
-        // a new block, since it is room before the key.
+        // a new block, since it is room before the key. Times to come: a
+        // key past its time is gone, and written over as a new one.
+        let t = u64::MAX / 2;
         assert!(matches!(map.set_str("t", b"aaaa"), Written::New));
         assert!(matches!(
-            map.set_str_expiring("t", b"bbbb", Some(5_000)),
+            map.set_str_expiring("t", b"bbbb", Some(t + 5_000)),
             Written::Replaced(_)
         ));
         assert!(matches!(map.set_str("t", b"cccc"), Written::InPlace));
-        assert_eq!(map.expires("t"), Some(5_000));
+        assert_eq!(map.expires("t"), Some(t + 5_000));
         assert!(matches!(
-            map.set_str_expiring("t", b"dddd", Some(6_000)),
+            map.set_str_expiring("t", b"dddd", Some(t + 6_000)),
             Written::InPlace
         ));
-        assert_eq!(map.expires("t"), Some(6_000));
+        assert_eq!(map.expires("t"), Some(t + 6_000));
         assert_eq!(map.ttl_len(), 1);
         assert!(matches!(
             map.set_str_expiring("t", b"eeee", None),
@@ -425,7 +427,7 @@ fn lookups_write_a_keys_use_inside_an_access_scope() {
         let mut map = ShardMap::new();
         map.set_str("k", b"v");
         map.set_str("t", b"v");
-        map.set_expires("t", 1 << 40);
+        map.set_expires("t", u64::MAX / 2);
         assert_eq!(map.access("k"), Some(0));
         // A clock word (top bits 01): written as it is.
         let stamp = 0x4000_0123;
@@ -460,7 +462,7 @@ fn lookups_write_a_keys_use_inside_an_access_scope() {
             assert_eq!(map.access("k"), Some(next));
             map.insert("k", list(&[b"a"]));
             assert_eq!(map.access("k"), Some(next));
-            assert!(map.set_expires("k", 1 << 40));
+            assert!(map.set_expires("k", u64::MAX / 2));
             let _ = map.get_expiring("k");
             assert_eq!(map.access("k"), Some(next));
             assert_eq!(map.append_in_place("x", b"y"), None);
@@ -605,14 +607,16 @@ fn the_access_word_follows_the_key() {
         assert!(matches!(map.set_str("k", b"y"), Written::InPlace));
         assert_eq!(map.access("k"), Some(7));
         // A time to live given (a new entry), changed in place, changed
-        // while the entry is held (a new entry again), taken away.
-        assert!(map.set_expires("k", 1_000));
+        // while the entry is held (a new entry again), taken away. Times to
+        // come: a key past its time is not there to be given one.
+        let t = u64::MAX / 2;
+        assert!(map.set_expires("k", t + 1_000));
         assert_eq!(map.access("k"), Some(7));
-        assert!(map.set_expires("k", 2_000));
+        assert!(map.set_expires("k", t + 2_000));
         let held = map.get_ref("k").unwrap();
-        assert!(map.set_expires("k", 3_000));
+        assert!(map.set_expires("k", t + 3_000));
         assert_eq!(map.access("k"), Some(7));
-        drop(map.insert_str_expiring("k", b"y", Some(4_000)));
+        drop(map.insert_str_expiring("k", b"y", Some(t + 4_000)));
         assert_eq!(map.access("k"), Some(7));
         assert!(map.persist("k"));
         assert_eq!(map.access("k"), Some(7));
@@ -627,6 +631,13 @@ fn the_access_word_follows_the_key() {
         // A key made anew starts from nothing.
         map.insert_str("k", b"v");
         assert_eq!(map.access("k"), Some(0));
+        // And so does one written over once its time has passed: the old
+        // key is gone, and its use with it.
+        map.touch(b"k", |w| w + 7);
+        drop(map.insert_str_expiring("k", b"v", Some(1)));
+        assert_eq!(map.access("k"), Some(7), "written over while it lived");
+        drop(map.insert_str("k", b"w"));
+        assert_eq!(map.access("k"), Some(0), "written over past its time");
     });
 }
 
