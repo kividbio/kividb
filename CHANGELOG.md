@@ -10,6 +10,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 A patch release of 1.1.0.
 <!-- 1.1.3: wording at publish -->
 
+**Upgrading replicas and clusters: upgrade the replicas first, then their
+master.** A 1.1.3 master that restarts with no data tells its replicas not
+to copy its empty dataset. A 1.1.2 replica does not understand that: once
+the master stops waiting, after 30 seconds, it syncs and drops its data, as
+1.1.2 did. With the replicas on 1.1.3 first, nothing is lost.
+
 ### Changed
 
 - **`maxclients` is enforced.** `CONFIG SET` took it and `CONFIG GET` gave
