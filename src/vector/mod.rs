@@ -1412,7 +1412,7 @@ pub struct HnswIndex {
     pub key_to_id: RwLock<AHashMap<String, usize>>,
     pub entry_point: RwLock<Option<usize>>, // node id of current entry point
     pub m: usize,                           // max neighbours per layer (except L0)
-    pub m0: usize,                          // max neighbours at layer 0 (= 2*M)
+    pub m0: usize,                          // max neighbours at layer 0 (= 2*M); see `slack`
     pub ef_construction: usize,
     pub ml: f64, // level multiplier = 1/ln(M)
 
@@ -1472,7 +1472,11 @@ impl HnswIndex {
     ) -> Self {
         let mut index = Self::new(m, ef_construction);
         let dim = nodes.iter().flatten().map(|n| n.vector.len()).next();
-        let slots = dim.map(|dim| index.slots.get_or_init(|| slots::Slots::new(dim, index.m0)));
+        let slots = dim.map(|dim| {
+            index
+                .slots
+                .get_or_init(|| slots::Slots::new(dim, index.m0 + slack(index.m0)))
+        });
         let count = nodes.len();
         {
             let graph = index.nodes.get_mut();
@@ -2509,7 +2513,7 @@ pub fn hnsw_insert_doc(
     // the schema rules out) has nowhere to go.
     let slots = index
         .slots
-        .get_or_init(|| slots::Slots::new(vector.len(), index.m0));
+        .get_or_init(|| slots::Slots::new(vector.len(), index.m0 + slack(index.m0)));
     if vector.len() != slots.dim() {
         return;
     }
@@ -2622,7 +2626,7 @@ pub fn hnsw_insert_doc(
                 }
                 seen.clear();
                 index.links(&nodes, nb, lc, &mut seen);
-                if seen.len() < m_max {
+                if seen.len() < m_max + slack(m_max) {
                     continue; // won't overflow
                 }
                 let nb_vec = slots.vector(nb);
@@ -2735,7 +2739,7 @@ pub fn hnsw_insert_doc(
                     upper.push(Vec::new());
                 }
                 let links = &mut upper[lc - 1];
-                if links.len() < m_max {
+                if links.len() < m_max + slack(m_max) {
                     links.push(new_id as u32);
                     continue;
                 }
@@ -2766,6 +2770,26 @@ pub fn hnsw_insert_doc(
             }
         }
     }
+}
+
+/// How many links past its most a node's list may take before it is pruned
+/// back to its most, so that a pruning is paid once for several back-links
+/// rather than for each.
+///
+/// A list is full nearly always, so with no slack every back-link pruned it
+/// again: an insert pruned some 32 neighbours, each measuring the
+/// neighbour's links against one another, and that was half the distances
+/// an insert measured. Pruning to below the most instead (leaving room)
+/// saves as much, but leaves nodes with fewer links than before, and recall
+/// at ef 64 fell by 0.004 in graphs built by the server. With slack a node
+/// has at least the links it had, and up to 4 more: 16 bytes a node.
+/// Measured on dbpedia-openai-100K-1536 (M 16, EF_CONSTRUCTION 128, an
+/// 8-CPU D16s_v5): see the commit that brought it.
+const PRUNE_SLACK: usize = 4;
+
+/// [`PRUNE_SLACK`], for a list of at most `m_max` links.
+fn slack(m_max: usize) -> usize {
+    PRUNE_SLACK.min(m_max / 4)
 }
 
 /// Put a new node in the graph: in a deleted node's slot if there is one,
@@ -3854,7 +3878,7 @@ mod concurrent_insert_tests {
                 index.links(&nodes, id, lc, &mut list);
                 let m_max = if lc == 0 { index.m0 } else { index.m };
                 assert!(
-                    list.len() <= m_max,
+                    list.len() <= m_max + slack(m_max),
                     "node {id} layer {lc}: {} links",
                     list.len()
                 );
