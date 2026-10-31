@@ -735,6 +735,22 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
             &compaction_tx,
             &repl_state,
         );
+        // A cluster master killed with no AOF has only what it last saved,
+        // if anything: it serves none of its slots until its replica, which
+        // may hold the data, has taken over or said it holds nothing.
+        if config.cluster_enabled {
+            crate::replication::CLEAN_EXIT_MARKER.store(true, std::sync::atomic::Ordering::Relaxed);
+            let stopped_cleanly = crate::replication::take_clean_exit_marker();
+            let keys: usize = store
+                .iter()
+                .flat_map(|db| db.iter())
+                .map(|shard| crate::read_lock!(shard).len())
+                .sum();
+            cluster_state.check_dataset_at_start(
+                config.aof || stopped_cleanly || !config.preload_file.is_empty(),
+                keys,
+            );
+        }
         // A node that was a replica when it was last saved, and has loaded
         // exactly that save, can ask its master to continue from there.
         if loaded.exact_dump
@@ -877,6 +893,9 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                         &signal_snapshot_index_store,
                         &signal_repl_state,
                     );
+                    if result.is_ok() {
+                        crate::replication::note_clean_exit();
+                    }
                     if let Err(e) = result {
                         // Not a clean exit: whatever restarts this node
                         // should know its last writes are not on disk.
@@ -1482,6 +1501,22 @@ async fn async_main_tokio(
             &compaction_tx,
             &repl_state,
         );
+        // A cluster master killed with no AOF has only what it last saved,
+        // if anything: it serves none of its slots until its replica, which
+        // may hold the data, has taken over or said it holds nothing.
+        if config.cluster_enabled {
+            crate::replication::CLEAN_EXIT_MARKER.store(true, std::sync::atomic::Ordering::Relaxed);
+            let stopped_cleanly = crate::replication::take_clean_exit_marker();
+            let keys: usize = store
+                .iter()
+                .flat_map(|db| db.iter())
+                .map(|shard| crate::read_lock!(shard).len())
+                .sum();
+            cluster_state.check_dataset_at_start(
+                config.aof || stopped_cleanly || !config.preload_file.is_empty(),
+                keys,
+            );
+        }
         // A node that was a replica when it was last saved, and has loaded
         // exactly that save, can ask its master to continue from there.
         if loaded.exact_dump
@@ -1980,7 +2015,10 @@ async fn async_main_tokio(
         })
         .await;
         match result {
-            Ok(Ok(())) => log_info!("Goodbye."),
+            Ok(Ok(())) => {
+                crate::replication::note_clean_exit();
+                log_info!("Goodbye.");
+            }
             // Not a clean exit: whatever restarts this node should know its
             // last writes are not on disk.
             Ok(Err(e)) => {

@@ -1255,12 +1255,25 @@ Full resync sends a KDB snapshot followed by a live command stream.
 `INFO replication` on a master reports `connected_slaves`, one
 `slaveN:ip=…,port=…,state=online,offset=…,lag=…` line per replica (`offset` is
 what that replica has acknowledged, `lag` the seconds since it last did),
-`master_replid` and `master_repl_offset`. On a replica it reports
+`master_replid` and `master_repl_offset`, and `master_lost_dataset:1` while a
+cluster master that came back without its dataset waits for its replica
+(see below). On a replica it reports
 `master_link_status` — `up` only when the replica is synced and receiving —
 `master_last_io_seconds_ago`, `master_link_down_since_seconds` while the link
 is down, `master_sync_in_progress`, `slave_repl_offset`, and the guard's state
 (`replica_full_sync_guard`, `replica_full_syncs_refused`,
 `replica_last_sync_refusal`).
+
+In a cluster, a master that starts with neither an AOF nor a snapshot from a
+clean shutdown (killed outright, with no persistence), and that has replicas,
+may be behind them: they hold the data it lost. It serves none of its slots
+(`CLUSTERDOWN`) and answers a replica's `PSYNC` with `+LOSTDATA <node id>`. A
+replica that holds the data takes over (an election, as `CLUSTER FAILOVER
+FORCE`) and the old master becomes its replica; one that holds nothing says
+so, and once every replica has, the master serves what it has. It also serves
+once every replica has failed, or after `max(30 s, 6 × cluster-node-timeout)`
+if no replica that knows `+LOSTDATA` has asked. A clean stop (`SHUTDOWN`,
+SIGTERM) leaves `dump.kdb.clean` beside the final snapshot to say it is whole.
 
 A replica loads its own `dump.kdb` and AOF at startup before it contacts its
 master. What reaches a replica is the *effect* of each write: a random pop as

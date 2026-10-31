@@ -20,6 +20,33 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   loaded. A name that is not a command is omitted, as Redis omits it. Arity
   and key positions stay on `COMMAND` / `COMMAND INFO`.
 
+### Fixed
+
+- **A cluster master back without its data no longer wipes its replica.**
+  With no AOF, a shard master killed outright (no final snapshot) and back
+  inside `cluster-node-timeout` kept its node id and slots from nodes.conf
+  and served them empty, so nobody failed it over. Its replica refused the
+  empty dataset only until clients had written a key to the master, and
+  then dropped every key it held and loaded those: in an AKS run, 25,939
+  acknowledged writes, and 53,271 on a second try. Now a master that
+  starts with neither an AOF nor a snapshot from a clean shutdown, and has
+  replicas, serves none of its slots (`CLUSTERDOWN`; `cluster_state:fail`
+  and `master_lost_dataset:1` on that node) and answers its replica's
+  `PSYNC` with `+LOSTDATA`. A replica holding the data takes over (an
+  election, as `CLUSTER FAILOVER FORCE`) and the old master follows it; a
+  replica holding nothing says so, and once every replica has, the master
+  serves what it has (a whole cluster restarted with no persistence: no
+  failovers). The master serves anyway once every replica has failed, or
+  when none that knows `+LOSTDATA` (an older version) has asked within
+  `max(30 s, 6 node timeouts)`. And a replica no longer drops its dataset
+  for the master it followed until a moment ago (within `repl-timeout`)
+  when that master is back under a replication id that does not continue
+  its stream and holds fewer than `replica-full-sync-guard-ratio` percent
+  of its keys, whatever the guard's mode; it takes over instead. With the
+  AOF on, or after a clean stop (`SHUTDOWN`, SIGTERM: a marker,
+  `dump.kdb.clean`, is left beside the final snapshot), restarts go on as
+  before.
+
 ## [1.2.0]
 
 See [docs/releases/v1.2.0.md](docs/releases/v1.2.0.md) for what to check before upgrading.

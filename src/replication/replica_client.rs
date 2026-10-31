@@ -181,6 +181,9 @@ enum SessionError {
     Link(String),
     /// The dataset guard refused the full resync. The local dataset is intact.
     Refused(String),
+    /// The master lost its dataset, and this replica, which holds it, is
+    /// taking over rather than syncing from it. The local dataset is intact.
+    TakingOver(String),
     /// See [`SessionEnd::Superseded`].
     Superseded,
 }
@@ -298,6 +301,23 @@ pub async fn start_replica(
                 }
                 failures += 1;
                 REFUSED_RETRY_DELAY
+            }
+            Err(SessionError::TakingOver(reason)) => {
+                let first = repl_state
+                    .full_syncs_refused
+                    .fetch_add(1, Ordering::Relaxed)
+                    == 0;
+                *repl_state.last_sync_refusal.write() = Some(reason.clone());
+                if first || verbose {
+                    log_error!(
+                        "Replication: NOT syncing from {master_host}:{master_port}: {reason}. \
+                         The local dataset has been kept."
+                    );
+                }
+                failures += 1;
+                // Soon again: the takeover is being decided, and asked for
+                // again if it fails.
+                RECONNECT_DELAY
             }
         };
 
@@ -563,7 +583,15 @@ async fn run_replication_session(
     // same one, it holds exactly what that master started with, and asks to
     // be continued from there. Masters that do not know the capability
     // answer it with an error, which is fine.
-    send_command(&mut writer, &["REPLCONF", "capa", "dataset-digest"]).await?;
+    //
+    // And a master that came back without its dataset says so
+    // (`+LOSTDATA <its node id>`) to a replica that takes that word, instead
+    // of offering a sync: see `ClusterState::check_dataset_at_start`.
+    send_command(
+        &mut writer,
+        &["REPLCONF", "capa", "dataset-digest", "capa", "lost-data"],
+    )
+    .await?;
     let _ = guarded(
         read_line(&mut reader),
         timeout,
@@ -572,7 +600,10 @@ async fn run_replication_session(
         "REPLCONF capa dataset-digest",
     )
     .await?;
-    let mut resume = repl_state.resync_point.lock().clone();
+    // Where this node's dataset stands, kept aside: `resume` below may be
+    // replaced by what a fingerprint offer leads to.
+    let held = repl_state.resync_point.lock().clone();
+    let mut resume = held.clone();
     let (ask_id, ask_offset) = match &resume {
         Some(point) => (point.repl_id.clone(), (point.offset + 1).to_string()),
         None => ("?".to_string(), "-1".to_string()),
@@ -588,6 +619,39 @@ async fn run_replication_session(
         "PSYNC",
     )
     .await?;
+    // The master lost its dataset in a restart. If this node holds what it
+    // had, this node takes over from it (the master serves nothing until
+    // then); otherwise it says it has nothing to keep by asking again, and
+    // is sent the master's dataset as usual.
+    if let Some(node) = fullresync.trim().strip_prefix("+LOSTDATA ") {
+        let node = node.trim().to_string();
+        let local_keys = count_keys(store);
+        let ours = repl_state
+            .stream_origin()
+            .is_none_or(|origin| origin == node);
+        if local_keys > 0 && ours && repl_state.full_sync_guard() != FullSyncGuard::Off {
+            let reason = format!(
+                "the master lost its dataset in a restart, and this replica holds {local_keys} \
+                 keys of it"
+            );
+            let reason = if repl_state.request_take_over(&node, &reason) {
+                format!("{reason}; taking over from it")
+            } else {
+                reason
+            };
+            return Err(SessionError::TakingOver(reason));
+        }
+        send_command(&mut writer, &["PSYNC", "?", "-1"]).await?;
+        resume = None;
+        fullresync = guarded(
+            read_line(&mut reader),
+            timeout,
+            repl_state,
+            my_generation,
+            "PSYNC",
+        )
+        .await?;
+    }
     if let Some(offer) = fullresync.trim().strip_prefix("+DIGEST ") {
         let mut parts = offer.split_whitespace();
         let offered = parts.next().map(str::to_string).zip(
@@ -671,6 +735,7 @@ async fn run_replication_session(
             );
             current.repl_id = id.to_string();
         }
+        repl_state.set_stream_origin(repl_state.cluster_master_node());
         log_info!(
             "Replication: Partial resync: continuing from offset {} — no dataset transfer",
             point.offset
@@ -692,9 +757,25 @@ async fn run_replication_session(
             log_info!("Replication: Full resync from {master_repl_id} offset={master_offset}");
         }
         upstream.mark_syncing();
-        // The dataset is about to be replaced: it is no position in any stream
-        // until the new one is in.
-        repl_state.set_resync_point(None);
+        // The node this replica was following until a moment ago (within
+        // `repl-timeout`), now under a replication id whose stream does not
+        // continue the one this dataset is a position in: it restarted
+        // without that stream. A dataset much smaller than this one is then
+        // not this one's successor, whatever the guard's mode; see
+        // `full_sync_refusal_with`. (A replica cut off for longer has no
+        // say: the master may have shrunk meanwhile, by deletes or expiry.)
+        let master_node = repl_state.cluster_master_node();
+        let down_since = repl_state.master_link_down_since_ms.load(Ordering::Relaxed);
+        let recently_in_sync = down_since == 0
+            || crate::replication::unix_ms().saturating_sub(down_since)
+                <= repl_state.repl_timeout().as_millis() as u64;
+        let history_lost = recently_in_sync
+            && held
+                .as_ref()
+                .is_some_and(|point| point.repl_id != master_repl_id)
+            && master_node.is_some()
+            && repl_state.stream_origin() == master_node;
+        let lost_from = master_node.filter(|_| history_lost);
 
         // ── Phase 5: Receive the payload ─────────────────────────────────────
         // Format: $<len>\r\n<len bytes>
@@ -790,7 +871,10 @@ async fn run_replication_session(
         let syncing;
         let staged = match verified_keys {
             Some(incoming_keys) => {
-                guard_full_sync(repl_state, local_keys, incoming_keys)?;
+                guard_full_sync(repl_state, local_keys, incoming_keys, lost_from.as_deref())?;
+                // The dataset is about to be replaced: it is no position in
+                // any stream until the new one is in.
+                repl_state.set_resync_point(None);
                 syncing = SyncInProgress::begin(repl_state);
                 {
                     let _cut = crate::write_gate::cut();
@@ -812,7 +896,8 @@ async fn run_replication_session(
             }
             None => {
                 let staged = load_full_sync_payload(&rdb_bytes, config.databases)?;
-                guard_full_sync(repl_state, local_keys, staged.keys)?;
+                guard_full_sync(repl_state, local_keys, staged.keys, lost_from.as_deref())?;
+                repl_state.set_resync_point(None);
                 syncing = SyncInProgress::begin(repl_state);
                 staged
             }
@@ -867,6 +952,7 @@ async fn run_replication_session(
             offset: master_offset,
             db: 0,
         }));
+        repl_state.set_stream_origin(repl_state.cluster_master_node());
         // The dataset is the master's from here on; a promotion now finds it
         // whole and stops this session at its next look at the epoch.
         drop(commit);
@@ -1376,29 +1462,60 @@ fn count_keys(store: &Store) -> usize {
 /// it refuses, keeps what it has, and says so.
 ///
 /// Returns `Err(Refused)` with the reason; `Ok` means proceed.
+///
+/// `lost_from`: the node this replica follows, when it has restarted without
+/// the stream this replica's dataset is from (see `full_sync_refusal_with`).
+/// A sync from it that is refused for that is followed by a takeover.
 fn guard_full_sync(
     repl_state: &ReplState,
     local_keys: usize,
     incoming_keys: usize,
+    lost_from: Option<&str>,
 ) -> Result<(), SessionError> {
     let ratio = repl_state.full_sync_guard_ratio.load(Ordering::Relaxed);
-    match full_sync_refusal(
+    match full_sync_refusal_with(
         repl_state.full_sync_guard(),
         ratio,
         local_keys,
         incoming_keys,
+        lost_from.is_some(),
     ) {
-        Some(reason) => Err(SessionError::Refused(reason)),
+        Some(reason) => match lost_from {
+            Some(node) if repl_state.request_take_over(node, &reason) => Err(
+                SessionError::TakingOver(format!("{reason}; taking over from it")),
+            ),
+            _ => Err(SessionError::Refused(reason)),
+        },
         None => Ok(()),
     }
 }
 
 /// The guard's decision, as a pure function of its inputs.
+#[cfg(test)]
 pub(crate) fn full_sync_refusal(
     guard: FullSyncGuard,
     ratio_percent: u64,
     local_keys: usize,
     incoming_keys: usize,
+) -> Option<String> {
+    full_sync_refusal_with(guard, ratio_percent, local_keys, incoming_keys, false)
+}
+
+/// [`full_sync_refusal`], told whether the master is the node this replica's
+/// dataset came from, restarted without the stream that dataset is a
+/// position in (`history_lost`). Its dataset is then not one that grew out of
+/// this replica's: a much smaller one — below `ratio_percent` of this one's
+/// keys — is refused in `empty` mode too. That is what a master killed with
+/// no persistence looks like once clients have written a few keys to it:
+/// the "no keys" check alone gave way to it at the first write. A master
+/// restarted from its AOF or snapshot holds about what the replica holds,
+/// and is followed as before.
+pub(crate) fn full_sync_refusal_with(
+    guard: FullSyncGuard,
+    ratio_percent: u64,
+    local_keys: usize,
+    incoming_keys: usize,
+    history_lost: bool,
 ) -> Option<String> {
     if guard == FullSyncGuard::Off || local_keys == 0 {
         return None;
@@ -1406,6 +1523,15 @@ pub(crate) fn full_sync_refusal(
     if incoming_keys == 0 {
         return Some(format!(
             "the master has no keys, and this replica holds {local_keys}"
+        ));
+    }
+    if history_lost
+        && (incoming_keys as u128) * 100 < (local_keys as u128) * (ratio_percent as u128)
+    {
+        return Some(format!(
+            "the master restarted without the stream this replica's dataset is from, and holds \
+             {incoming_keys} keys, fewer than {ratio_percent}% of the {local_keys} this replica \
+             holds"
         ));
     }
     if guard == FullSyncGuard::Shrink
@@ -2153,7 +2279,7 @@ mod slave_upstream_guard_tests {
 /// master silently discarded a larger local dataset.
 #[cfg(test)]
 mod full_sync_guard_tests {
-    use super::{full_sync_refusal, load_full_sync_payload};
+    use super::{full_sync_refusal, full_sync_refusal_with, load_full_sync_payload};
     use crate::replication::FullSyncGuard;
 
     #[test]
@@ -2179,6 +2305,20 @@ mod full_sync_guard_tests {
     #[test]
     fn off_accepts_everything() {
         assert!(full_sync_refusal(FullSyncGuard::Off, 50, 1_000_000, 0).is_none());
+        assert!(full_sync_refusal_with(FullSyncGuard::Off, 50, 1_000_000, 1, true).is_none());
+    }
+
+    /// The master restarted without the stream this replica's dataset is
+    /// from: in `empty` mode too, a dataset below the ratio is refused (the
+    /// AKS run's master had 987 keys to the replica's 25939), and one about
+    /// the replica's size — a master back from its AOF — is followed.
+    #[test]
+    fn a_master_that_lost_its_stream_is_held_to_the_ratio() {
+        let r = full_sync_refusal_with(FullSyncGuard::Empty, 50, 25_939, 987, true);
+        assert!(r.is_some_and(|r| r.contains("restarted without")));
+        assert!(full_sync_refusal_with(FullSyncGuard::Empty, 50, 25_939, 25_900, true).is_none());
+        // Not the same history: as before.
+        assert!(full_sync_refusal_with(FullSyncGuard::Empty, 50, 25_939, 987, false).is_none());
     }
 
     /// `empty` is the narrow default: a master with *some* data is the
