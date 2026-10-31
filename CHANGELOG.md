@@ -20,6 +20,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   loaded. A name that is not a command is omitted, as Redis omits it. Arity
   and key positions stay on `COMMAND` / `COMMAND INFO`.
 
+### Changed
+
+- **HNSW vector search is about 1.3 times as fast, and vector ingest about
+  twice as fast.** A search of a 1536-dimension graph spent most of its
+  time waiting for vectors to come from memory: each node's vector was an
+  allocation of its own, reached through the node, its links were locked
+  for every node expanded, and nothing was fetched ahead. The vectors, the
+  layer-0 links and a live flag now sit in blocks of fixed-size slots
+  indexed by node id (on huge pages where the kernel allows), links are
+  read without a lock, and each neighbour's vector is prefetched before it
+  is measured. A full list of links may take a few more before it is
+  pruned, instead of being pruned again for each one. On
+  dbpedia-openai-100K-1536 (M 16, EF_CONSTRUCTION 128, an 8-CPU server),
+  ef 128 went from 618 to 817 queries a second on one client and from
+  2,917 to 3,716 on sixteen, and the upload from 44.4 to 21.4 s
+  (h-and-m-2048: 58.2 to 28.0 s). Recall is the same or a little higher
+  at every ef, and the snapshot format is unchanged. A deleted vector's
+  slot is now filled by the next insert; each graph takes some 390 bytes
+  less per vector.
+
 ## [1.2.0]
 
 See [docs/releases/v1.2.0.md](docs/releases/v1.2.0.md) for what to check before upgrading.

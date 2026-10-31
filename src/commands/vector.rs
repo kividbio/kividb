@@ -1367,10 +1367,8 @@ impl<'a> FilteredKnn<'a> {
                     return;
                 };
                 let nodes = idx.nodes.read();
-                match nodes.get(id) {
-                    Some(n) if !n.vector.is_empty() && n.vector.len() == dim => {
-                        self.query.to_unit(&n.vector)
-                    }
+                match idx.vector_of(&nodes, id, key) {
+                    Some(v) if v.len() == dim => self.query.to_unit(v),
                     _ => return,
                 }
             }
@@ -1643,10 +1641,10 @@ fn knn_measured(
                 };
                 let nodes = graph.nodes.read();
                 for (id, key) in found {
-                    if let Some(node) = nodes.get(id)
-                        && node.vector.len() == dim
+                    if let Some(v) = graph.vector_of(&nodes, id, key)
+                        && v.len() == dim
                     {
-                        best.offer(query.to_unit(&node.vector), key);
+                        best.offer(query.to_unit(v), key);
                     }
                 }
             }
