@@ -38,10 +38,19 @@
 //! takes another hold ([`EntryRef`]); the block goes when the last hold
 //! does. What a holder can read of a block (the key, the value, the time to
 //! live) is never written while anybody but the table holds it: a time to
-//! live is changed in place only when the table's is the only hold, and
-//! otherwise in a new entry. The position is the table's own, written only
-//! with the shard locked for writing, and read by nothing else. Compaction
-//! moves a block whole, and only when the table's is the only hold.
+//! live, or an inline string, is changed in place only when the table's is
+//! the only hold, and otherwise in a new entry. The position is the table's
+//! own, written only with the shard locked for writing, and read by nothing
+//! else. Compaction moves a block whole, and only when the table's is the
+//! only hold.
+//!
+//! **Writes in place.** An inline string can be written over, grown or
+//! shrunk in its own block when the new length keeps the block's size in
+//! the same slab class: the block is freed by its size, which says its
+//! class, so a length that would say another one needs a new block. The
+//! slot's size hint does not change either: a class never spans two
+//! counts of cache lines (its sizes are within one 16-, 32- or 64-byte
+//! step, and lines are 64 bytes).
 //!
 //! **The access word is the exception.** When a key was last used, or how
 //! often (Redis's `robj.lru`), is written in place with the shard locked
@@ -471,6 +480,82 @@ impl Entry {
         }
     }
 
+    /// The length of the string, if it is kept inline.
+    #[inline]
+    pub(super) fn inline_len(self) -> Option<usize> {
+        (self.form() == INLINE).then(|| self.header().vlen as usize)
+    }
+
+    /// Whether an inline string of `vlen` bytes can take this entry's value's
+    /// place in its own block: the value is an inline string, the table's is
+    /// the only hold, and the block's size stays in its slab class (see the
+    /// module). Whether the key has a time to live stays as it is.
+    #[inline]
+    pub(super) fn fits_in_place(self, vlen: usize) -> bool {
+        if self.form() != INLINE || self.holders() != 1 {
+            return false;
+        }
+        let klen = self.klen();
+        let ttl = self.has_ttl();
+        let now = inline_size(klen, self.header().vlen as usize, ttl);
+        // An inline entry is in a slab: its class is never `None`.
+        value_slab::class_of(inline_size(klen, vlen, ttl)) == value_slab::class_of(now)
+    }
+
+    /// Where an inline string's bytes start.
+    #[inline]
+    fn inline_at(self) -> usize {
+        key_at(self.klen(), self.has_ttl()) + self.klen()
+    }
+
+    /// The inline string made `bytes`, in this block.
+    ///
+    /// # Safety
+    /// The caller holds the shard for writing, and `fits_in_place(bytes.len())`.
+    pub(super) unsafe fn write_in_place(self, bytes: &[u8]) {
+        debug_assert!(self.fits_in_place(bytes.len()));
+        // SAFETY: nothing but the table holds the entry and the shard is
+        // locked for writing: nothing reads the bytes or the length while
+        // they change, and the block has room up to its class's size.
+        unsafe {
+            let base = self.0.as_ptr() as *mut u8;
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(self.inline_at()), bytes.len());
+            self.set_vlen(bytes.len());
+        }
+    }
+
+    /// `patch` written over the inline string from `offset`, which may be
+    /// past its end: the gap is filled with zero bytes. The string grows to
+    /// reach the patch's end, and never shrinks.
+    ///
+    /// # Safety
+    /// As [`Entry::write_in_place`], for the string's length after it:
+    /// `fits_in_place(max(len, offset + patch.len()))`.
+    pub(super) unsafe fn write_at_in_place(self, offset: usize, patch: &[u8]) {
+        let vlen = self.header().vlen as usize;
+        let len = vlen.max(offset + patch.len());
+        debug_assert!(self.fits_in_place(len));
+        // SAFETY: as in `write_in_place`.
+        unsafe {
+            let at = (self.0.as_ptr() as *mut u8).add(self.inline_at());
+            if offset > vlen {
+                std::ptr::write_bytes(at.add(vlen), 0, offset - vlen);
+            }
+            std::ptr::copy_nonoverlapping(patch.as_ptr(), at.add(offset), patch.len());
+            self.set_vlen(len);
+        }
+    }
+
+    /// # Safety
+    /// As [`Entry::write_in_place`]: nobody else reads the header.
+    #[inline]
+    unsafe fn set_vlen(self, vlen: usize) {
+        debug_assert!(vlen <= u16::MAX as usize);
+        // SAFETY: as the caller promises; written through the block's own
+        // pointer, with no reference to the header alive.
+        unsafe { std::ptr::addr_of_mut!((*self.0.as_ptr()).vlen).write(vlen as u16) };
+    }
+
     /// The block's size.
     #[inline]
     pub(super) fn size(self) -> usize {
@@ -778,6 +863,22 @@ impl Slot {
         let lines = HINT_LINES[((self.0 >> ADDRESS_BITS) & 0xf) as usize] as usize;
         prefetch((self.0 & ADDRESS) as *const u8, lines.min(PREFETCH_LINES));
         true
+    }
+}
+
+impl Slot {
+    /// Ask for the entry's first lines, as many as the hint says (up to
+    /// [`PREFETCH_LINES`]): for a walk over buckets that will read them.
+    #[inline(always)]
+    pub(super) fn prefetch(self) {
+        let lines = HINT_LINES[((self.0 >> ADDRESS_BITS) & 0xf) as usize] as usize;
+        prefetch((self.0 & ADDRESS) as *const u8, lines.min(PREFETCH_LINES));
+    }
+
+    /// Ask for the entry's first line only.
+    #[inline(always)]
+    pub(super) fn prefetch_header(self) {
+        prefetch((self.0 & ADDRESS) as *const u8, 1);
     }
 }
 

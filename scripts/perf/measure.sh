@@ -8,7 +8,8 @@
 # Env: N (100000), P (16), MODEL (tokio), PROFILE=<tag> prints that tag's
 # hottest functions for each workload into /out/profile-<workload>.txt
 # WORKLOADS=full adds INCR and DEL, and GET, SET, INCR and DEL with a TTL on
-# every key and under allkeys-lru (the memory redesign's matrix).
+# every key and under allkeys-lru, and GET, SET and INCR under allkeys-lfu
+# (the memory redesign's matrix).
 set -u
 N=${N:-100000} P=${P:-16} MODEL=${MODEL:-tokio} PORT=6400
 mkdir -p /out
@@ -53,6 +54,7 @@ one() { # tag, label, redis-benchmark args...
 
 V100=$(printf 'x%.0s' $(seq 100))
 LRU="--maxmemory 64gb --maxmemory-policy allkeys-lru"
+LFU="--maxmemory 64gb --maxmemory-policy allkeys-lfu"
 for tag in "$@"; do
   DSIZE=100;  one "$tag" GET-100  -d 100  -t get
   DSIZE=100;  one "$tag" SET-100  -d 100  -t set
@@ -76,6 +78,9 @@ for tag in "$@"; do
     SERVER_EXTRA=$LRU PRELOAD="SET counter:__rand_int__ 0" DSIZE=100 one "$tag" INCR-LRU -t incr
     SERVER_EXTRA=$LRU PRELOAD="-d 100 -t set" PRELOAD_R=200000 PRELOAD_N=400000 DSIZE=100 \
       one "$tag" DEL-LRU -r 200000 DEL key:__rand_int__
+    SERVER_EXTRA=$LFU DSIZE=100 one "$tag" GET-100-LFU -d 100 -t get
+    SERVER_EXTRA=$LFU DSIZE=100 one "$tag" SET-100-LFU -d 100 -t set
+    SERVER_EXTRA=$LFU PRELOAD="SET counter:__rand_int__ 0" DSIZE=100 one "$tag" INCR-LFU -t incr
   fi
 done | tee /out/raw.txt
 echo done

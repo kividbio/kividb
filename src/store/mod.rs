@@ -6,11 +6,13 @@ use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::available_parallelism;
 
+mod access;
 mod entry;
 mod shard_map;
+pub use access::AccessScope;
 #[allow(unused_imports)] // Not every item is named outside the store yet.
 pub use shard_map::{
-    EntryRef, EntryView, Leftover, NewEntry, Relocated, ShardMap, StrRef, Taken, ValueRef,
+    EntryRef, EntryView, Leftover, Relocated, ShardMap, StrRef, Taken, ValueRef, Written,
 };
 
 /// Which shard `key` is in, of `shards` (a power of two).

@@ -101,6 +101,24 @@ impl SharedBytes {
         }
     }
 
+    /// Copy `parts` into a new block and let the caller finish the bytes before
+    /// the immutable value is exposed to readers.
+    pub(crate) fn concat_with_mutation(parts: &[&[u8]], finish: impl FnOnce(&mut [u8])) -> Self {
+        let len = parts.iter().map(|part| part.len()).sum();
+        // SAFETY: the parts initialize every byte before `finish` receives the
+        // exclusive slice; the new block is not visible until this returns.
+        unsafe {
+            Self::make(len, |mut at| {
+                let start = at;
+                for part in parts {
+                    std::ptr::copy_nonoverlapping(part.as_ptr(), at, part.len());
+                    at = at.add(part.len());
+                }
+                finish(std::slice::from_raw_parts_mut(start, len));
+            })
+        }
+    }
+
     #[inline]
     fn header(&self) -> &Header {
         // SAFETY: the block lives as long as any holder does.
@@ -345,6 +363,14 @@ mod tests {
         }
         assert_eq!(&SharedBytes::concat(&[b"ab", b"", b"cde"])[..], b"abcde");
         assert_eq!(&SharedBytes::from("text")[..], b"text");
+    }
+
+    #[test]
+    fn concat_finishes_mutation_before_sharing_bytes() {
+        let bytes = SharedBytes::concat_with_mutation(&[b"header", b"body"], |bytes| {
+            bytes[6] = b'B';
+        });
+        assert_eq!(&bytes[..], b"headerBody");
     }
 
     #[test]

@@ -21,7 +21,7 @@ pub(crate) mod hash_import;
 pub mod helpers;
 pub(crate) mod hotkeys;
 mod hybrid;
-mod hyperloglog;
+pub(crate) mod hyperloglog;
 mod json;
 pub(crate) mod json_fpha;
 pub(crate) mod json_path;

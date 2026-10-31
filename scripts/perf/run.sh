@@ -15,7 +15,8 @@
 #   LTO=fat             the release profile as shipped (slow to build);
 #                       default off, which is enough to compare two trees
 #   WORKLOADS=full      also INCR and DEL, and each of GET, SET, INCR, DEL
-#                       with a TTL on every key and under allkeys-lru
+#                       with a TTL on every key and under allkeys-lru, and
+#                       GET, SET and INCR under allkeys-lfu
 #   PROFILE=1           keep the hottest functions of each workload in
 #                       target/perf/out-<tag>/profile-*.txt
 #   DNS=1 OFFLINE=      let cargo fetch a new dependency (the image's DNS is

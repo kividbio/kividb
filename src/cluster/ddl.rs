@@ -50,6 +50,9 @@ pub fn is_definition_command(name: &str) -> bool {
 
 /// An error that means the command had already been applied.
 fn already_done(error: &str) -> bool {
+    if crate::commands::search::is_no_such_index(error) {
+        return true;
+    }
     let e = error.to_ascii_lowercase();
     e.contains("already exists") || e.contains("unknown index") || e.contains("does not exist")
 }
@@ -250,6 +253,10 @@ mod tests {
         assert!(should_forward(b":2\r\n"));
         assert!(should_forward(b"-Index already exists\r\n"));
         assert!(should_forward(b"-Unknown Index name\r\n"));
+        assert!(should_forward(
+            b"-SEARCH_INDEX_NOT_FOUND Index not found: idx\r\n"
+        ));
+        assert!(should_forward(b"-ERR no such index\r\n"));
         assert!(!should_forward(b"-ERR syntax error\r\n"));
     }
 

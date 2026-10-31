@@ -556,15 +556,30 @@ class TestLatencyLatest:
             assert entry[3] >= entry[2]
 
     def test_latest_timestamp_is_unix_seconds(self, r):
-        for i in range(3):
-            r.set(f"latest_ts_{i}", i)
+        # An entry's time is when its event was last recorded, which for an
+        # event of an earlier test (or of the RESP2 pass, against a server
+        # shared by both) can be minutes ago. So every entry is checked to
+        # be in Unix seconds, and the event this test records itself to be
+        # from after the test started.
+        started = int(time.time())
+        _slow_command(r)  # recorded as `command`, in Redis too
         result = r.execute_command("LATENCY", "LATEST")
         now = int(time.time())
+        assert result
+        ours = []
         for entry in result:
+            name = entry[0].decode() if isinstance(entry[0], bytes) else entry[0]
             ts = entry[1]
             assert isinstance(ts, int)
-            # Timestamp should be within the last minute
-            assert now - 60 <= ts <= now + 5, f"Suspicious timestamp: {ts}"
+            # Seconds since 2020, not milliseconds, and not ahead of the clock.
+            assert 1_577_836_800 <= ts <= now + 5, f"Suspicious timestamp: {entry}"
+            if name == "command":
+                ours.append(ts)
+        assert ours, f"No `command` event after DEBUG SLEEP: {result}"
+        assert started - 1 <= max(ours) <= now + 5, (
+            f"`command` was last recorded at {max(ours)}, "
+            f"before this test started at {started}"
+        )
 
     def test_latest_latency_is_non_negative(self, r):
         for i in range(3):

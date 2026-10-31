@@ -720,6 +720,11 @@ pub fn set_expiry(store: &Store, db: usize, key: &str, expires_at: SystemTime) {
 pub fn clear_expiry(store: &Store, db: usize, key: &str) -> bool {
     let shard = store::get_shard(&store[db], key);
     if shard.holds_no_ttl() {
+        // Nothing to take away, and nothing to lock for that; but the key
+        // is still used, if this command's use is being written.
+        if store::AccessScope::active() {
+            read_lock!(shard).contains_key(key);
+        }
         return false;
     }
     write_lock!(shard).persist(key)

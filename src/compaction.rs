@@ -8,8 +8,10 @@
 //! time:
 //! - under a shard's read lock it looks through [`BATCH`] entries for values
 //!   in the slabs being emptied ([`value_slab::plan_evacuation`]);
-//! - under the write lock it moves those it found, each a copy of at most
-//!   512 bytes, and frees the old blocks once the lock is let go;
+//! - under the write lock it moves those it found, [`MOVES_PER_HOLD`] at a
+//!   time, each a copy of a key's whole entry (up to 4 KiB, the next one
+//!   asked for while it copies), and frees the old blocks once the lock is
+//!   let go;
 //! - then it sleeps, long enough to keep to `active-defrag-cycle-max` per
 //!   cent of one core.
 //!
@@ -27,9 +29,15 @@ use crate::store::{Relocated, Shard, Store};
 use crate::value_slab;
 
 /// Buckets looked at under one hold of a shard's read lock (about half as
-/// many entries), and so at most that many values moved under one hold of
-/// its write lock.
-const BATCH: usize = 512;
+/// many entries). Each entry is read to tell where its value is, somewhere
+/// else in memory: with 512 a hold took about 50 us, and a write waiting for
+/// it held up the reads behind it; with 128, and the entries asked for
+/// ahead, about 11.
+const BATCH: usize = 128;
+
+/// Entries moved under one hold of a shard's write lock. A command waiting
+/// for the shard waits for no more than these copies.
+const MOVES_PER_HOLD: usize = 32;
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
 static IGNORE_BYTES: AtomicU64 = AtomicU64::new(64 << 20);
@@ -177,16 +185,17 @@ fn compact_shard(shard: &Shard, regions: &[usize]) {
             buckets = map.buckets();
             let end = (at + BATCH).min(buckets);
             looked = end.saturating_sub(at);
-            (at..end)
-                .filter(|&index| map.evacuating_at(index, regions))
-                .collect()
+            map.evacuating_in(at, end, regions)
         };
         at += looked;
-        if !moving.is_empty() {
-            let mut old = Vec::with_capacity(moving.len());
+        for chunk in moving.chunks(MOVES_PER_HOLD) {
+            let mut old = Vec::with_capacity(chunk.len());
             {
                 let mut map = shard.write();
-                for &index in &moving {
+                for (i, &index) in chunk.iter().enumerate() {
+                    if let Some(&next) = chunk.get(i + 1) {
+                        map.prefetch_bucket(next);
+                    }
                     match map.relocate_at(index, regions) {
                         Relocated::Moved(was) => old.push(was),
                         Relocated::Held => {

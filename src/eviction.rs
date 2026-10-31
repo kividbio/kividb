@@ -2,10 +2,12 @@
 //!
 //! With `noeviction` — the default — a write that would use more memory is
 //! refused. With any other policy the server deletes keys to make room for
-//! it, choosing as Redis does: it looks at a few keys picked at random
-//! (`maxmemory-samples`) and deletes the one the policy likes least, until
-//! it is under the limit or there is nothing left that the policy lets it
-//! delete.
+//! it, choosing much as Redis does: it looks at a few keys picked at random
+//! (`maxmemory-samples`), and again at the few it liked least the last
+//! time, and deletes the one the policy likes least, until it is under the
+//! limit or there is nothing left that the policy lets it delete. Every key
+//! is as likely to be picked as any other (see `sample_shard`), and the keys
+//! looked at again are read again, as they are now (see `KEPT`).
 //!
 //! | policy            | among                | deletes the one               |
 //! |-------------------|----------------------|-------------------------------|
@@ -23,9 +25,20 @@
 //! key's own entry, in one 32-bit word of its header, as Redis keeps it in
 //! the object's `lru` field: see [`Access`]. It is written only while a
 //! policy that asks for it is selected (or `key-access-tracking` is on):
-//! with `noeviction` a command pays one atomic load for all of this. The
-//! word is written only when it changes, so a key read again and again
-//! within the same second dirties its cache line once.
+//! with `noeviction` a command pays one atomic load for all of this, and
+//! each of its lookups one thread-local load. The word is written only when
+//! it changes, so a key read again and again within the same second dirties
+//! its cache line once.
+//!
+//! **Where a use is written.** By the lookups the command makes anyway: the
+//! dispatcher opens a `store::AccessScope` around the command with the
+//! [`stamp`] a use writes, and the lookups that read or write a key write
+//! it to the entry they find (see `store::access`). A command that only
+//! asks about keys (`OBJECT`, `TYPE`, `TTL`, `EXISTS`, ...) opens one that
+//! writes nothing. Two kinds of use are still written after the command, by
+//! a second lookup of each key it names ([`used`]): a modification under
+//! the LRM policies, which only the command's outcome tells; and the keys a
+//! script declares, which its calls need not read.
 //!
 //! An eviction is a deletion like any other: replicas and the AOF are sent a
 //! `DEL`, a `WATCH` on the key is tripped, clients caching it are told, and
@@ -34,8 +47,8 @@
 use crate::commands::ctx::Ctx;
 use crate::store::Store;
 use rand::Rng;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 // ── The policy ────────────────────────────────────────────────────────────────
@@ -178,9 +191,9 @@ pub fn set_policy(policy: Policy) {
 /// `key-access-tracking`: whether a key's use is recorded under every
 /// policy, so that `OBJECT IDLETIME` and `FREQ` report it under
 /// `noeviction` too, as Redis does (#21). Off by default: recording costs
-/// every command a second lookup of each of its keys, under its shard's read
-/// lock (it costs a key nothing: the word is in every entry anyway). Under
-/// an LRU or LFU policy it is recorded either way.
+/// every command a clock reading, and each lookup a store to the key's
+/// entry when its word changes (it costs a key nothing: the word is in every
+/// entry anyway). Under an LRU or LFU policy it is recorded either way.
 pub fn key_access_tracking() -> bool {
     TRACK_ALWAYS.load(Ordering::Relaxed)
 }
@@ -319,10 +332,59 @@ impl Access {
     }
 }
 
+static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+
 /// Seconds since the first call, plus [`CLOCK_BASE`].
 fn clock() -> u32 {
-    static START: LazyLock<Instant> = LazyLock::new(Instant::now);
-    CLOCK_BASE + START.elapsed().as_secs() as u32
+    clock_at(Instant::now())
+}
+
+/// [`clock`] at `now`.
+#[inline]
+fn clock_at(now: Instant) -> u32 {
+    CLOCK_BASE + now.saturating_duration_since(*START).as_secs() as u32
+}
+
+/// What a command that uses keys has its lookups write to them, starting
+/// at `now` (`store::AccessScope`): the clock (LRU), or the minute with the
+/// stamp's top bit set (LFU, see [`counted`]). 0, nothing, when nothing is
+/// recorded, or only modifications are (LRM: see the module).
+#[inline]
+pub fn stamp(now: Instant) -> u32 {
+    match track() {
+        Track::Used => Access::clock_word(clock_at(now)),
+        Track::Frequency => Access::LFU | ((clock_at(now) / 60) & 0xffff) << 8,
+        Track::Off | Track::Modified => 0,
+    }
+}
+
+/// [`stamp`] for a command that only writes, and whose writes all go
+/// through: a modification is a use under the LRM policies too.
+#[inline]
+pub fn write_stamp(now: Instant) -> u32 {
+    match track() {
+        Track::Modified => Access::clock_word(clock_at(now)),
+        _ => stamp(now),
+    }
+}
+
+/// The access word `word` after one more use, under the LFU stamp `stamp`
+/// (see [`stamp`]).
+pub(crate) fn counted(word: u32, stamp: u32) -> u32 {
+    let minutes = (stamp >> 8) & 0xffff;
+    Access::after_use(word, Track::Frequency, minutes * 60, rand::random::<f64>)
+}
+
+/// Whether a command's keys have their use written after it, by [`used`],
+/// rather than by its lookups: under the LRM policies, and for a script
+/// (`script`).
+#[inline]
+pub fn used_after(script: bool) -> bool {
+    match track() {
+        Track::Off => false,
+        Track::Modified => true,
+        Track::Used | Track::Frequency => script,
+    }
 }
 
 /// Whether this use is counted: less and less likely as the count grows, so
@@ -343,9 +405,10 @@ pub fn recording() -> bool {
     RECORDING.load(Ordering::Relaxed)
 }
 
-/// `key` was read, or written: its word is brought up to date, in place,
-/// with its shard locked for reading (see `ShardMap::touch`). A key that is
-/// not there is left alone. The key is found by its bytes, without asking
+/// `key` was read, or written, by a command whose use is written after it
+/// ([`used_after`]): its word is brought up to date, in place, with its
+/// shard locked for reading (see `ShardMap::touch`). A key that is not
+/// there is left alone. The key is found by its bytes, without asking
 /// whether they are UTF-8 (that check was a quarter of this).
 pub fn used(store: &Store, db: usize, key: &[u8], wrote: bool) {
     let track = track();
@@ -471,120 +534,352 @@ pub fn allowed_when_out_of_memory(name: &str) -> bool {
 /// How much a policy wants a key gone: the highest goes.
 type Unwanted = u64;
 
-/// A key sampled for eviction, with its expiry time when it was sampled
-/// from the keys with one (milliseconds since the Unix epoch), and its
-/// access word ([`Access`]) as it was then.
-type Sampled = (String, Option<u64>, u32);
-
-/// Up to `count` keys from about `at` in `shard`, into `found`: of all its
-/// keys, or (`volatile`) of those with a time to live.
-fn sample_into(
-    shard: &crate::store::Shard,
-    volatile: bool,
-    at: usize,
-    count: usize,
-    found: &mut Vec<Sampled>,
-) {
-    if !volatile {
-        // From a random bucket: as many buckets as keys wanted, over how
-        // full the table is, where walking to a random key walked past half
-        // the shard on average.
-        let map = shard.read();
-        found.extend(
-            map.sample_from(at, count)
-                .map(|e| (e.key().to_string(), None, e.access())),
-        );
-        return;
+/// How much `policy` wants a key gone whose access word is `word` and whose
+/// time to live ends at `expires`; `now` is [`clock`].
+#[inline]
+fn unwanted(policy: Policy, word: u32, expires: Option<u64>, now: u32, decay: u32) -> Unwanted {
+    match policy {
+        // Every sampled key is as unwanted as the next, and the sample was
+        // random already.
+        Policy::AllKeysRandom | Policy::VolatileRandom | Policy::NoEviction => 0,
+        Policy::VolatileTtl => u64::MAX - expires.unwrap_or(u64::MAX),
+        // A key whose use is not known goes first, as one older than any
+        // whose use is.
+        Policy::AllKeysLru | Policy::VolatileLru | Policy::AllKeysLrm | Policy::VolatileLrm => {
+            Access::clock_of(word).map_or(u64::MAX, |then| now.saturating_sub(then) as u64)
+        }
+        Policy::AllKeysLfu | Policy::VolatileLfu => {
+            (u8::MAX - Access::frequency(word, now / 60, decay)) as u64
+        }
     }
-    if shard.holds_no_ttl() {
-        return;
-    }
-    let map = shard.read();
-    let keys = map.ttl_len();
-    if keys == 0 {
-        return;
-    }
-    // Places in the shard's list of keys with a time to live, each found in
-    // one step: all of them if there are no more than wanted, else `count`
-    // spread from `at` by a stride with no factor in common with a power of
-    // two. Walking to a random one walked past half the shard's times on
-    // average.
-    const STRIDE: usize = 0x9e37_79b9_7f4a_7c15_u64 as usize;
-    let take = count.min(keys);
-    found.extend((0..take).filter_map(|i| {
-        let place = if take == keys {
-            i
-        } else {
-            at.wrapping_add(i.wrapping_mul(STRIDE)) % keys
-        };
-        map.ttl_entry(place)
-            .map(|e| (e.key().to_string(), e.expires(), e.access()))
-    }));
 }
 
-/// Up to `count` keys of one database, from a random place in it: of all
-/// its keys, or (`volatile`) of those with a time to live.
-fn sample(
+/// How many random buckets are tried for each key wanted before the next
+/// full bucket from a random one is settled for. A table is kept at least
+/// 4/9 full (`store::shrink_if_sparse`), but may be sparser until it is
+/// shrunk.
+const TRIES: usize = 32;
+
+/// Up to `count` keys of `map`, each handed to `found` with its place (a
+/// bucket of the table, or of the list of keys with a time to live): of all
+/// its keys, or (`volatile`) of those with a time to live. How many it found.
+///
+/// Each is at a place picked at random, a bucket picked again until it is
+/// full, so that every key is as likely to be looked at as any other. The
+/// keys of a run of buckets from a random one, as this used to take them,
+/// are not: the first key after a run of empty buckets comes first far more
+/// often than one after a full bucket, and the same few places are looked
+/// at again and again. The policy takes what it does not want from them, a
+/// key it wants comes in from the keys after, and in time all a sample of
+/// them holds is keys the policy wants, of which one goes. Under
+/// `allkeys-lfu`, with a set of keys read again and again and a stream of
+/// new keys written once (a test in which Redis 8.10 keeps 96% of the read
+/// keys), runs of buckets kept 76% of them, and of the read keys that went,
+/// four in five had been read more often than every new key still there.
+fn sample_shard<'m>(
+    map: &'m crate::store::ShardMap,
+    volatile: bool,
+    count: usize,
+    rng: &mut impl Rng,
+    mut found: impl FnMut(usize, crate::store::EntryView<'m>),
+) -> usize {
+    if volatile {
+        // A list without gaps: any place holds a key.
+        let keys = map.ttl_len();
+        let (count, every) = if keys <= count {
+            (keys, true)
+        } else {
+            (count, false)
+        };
+        for i in 0..count {
+            let place = if every { i } else { rng.gen_range(0..keys) };
+            if let Some(e) = map.ttl_entry(place) {
+                found(place, e);
+            }
+        }
+        return count;
+    }
+    let keys = map.len();
+    let buckets = map.buckets();
+    if keys <= count {
+        // All of them.
+        let mut n = 0;
+        for place in 0..buckets {
+            if n == keys {
+                break;
+            }
+            if let Some(e) = map.entry_at(place) {
+                found(place, e);
+                n += 1;
+            }
+        }
+        return n;
+    }
+    // A table has a power of two of buckets.
+    let mask = buckets.next_power_of_two() - 1;
+    'keys: for _ in 0..count {
+        for _ in 0..TRIES {
+            let place = rng.r#gen::<usize>() & mask;
+            if place >= buckets {
+                continue;
+            }
+            if let Some(e) = map.entry_at(place) {
+                found(place, e);
+                continue 'keys;
+            }
+        }
+        // Very sparse: the next full bucket from a random one.
+        let start = rng.gen_range(0..buckets);
+        for step in 0..buckets {
+            let place = (start + step) % buckets;
+            if let Some(e) = map.entry_at(place) {
+                found(place, e);
+                continue 'keys;
+            }
+        }
+    }
+    count
+}
+
+/// Up to `count` keys of one database, from a random shard and as many after
+/// it as it takes, each handed to `found` with its shard and place: of all
+/// its keys, or (`volatile`) of those with a time to live. Shards with none,
+/// as far as is known without a lock, are passed over unlocked.
+fn sample_db(
     shards: &[crate::store::Shard],
     volatile: bool,
     count: usize,
     rng: &mut impl Rng,
-) -> Vec<Sampled> {
-    let mut found = Vec::with_capacity(count);
+    mut found: impl FnMut(usize, usize, crate::store::EntryView<'_>),
+) {
     if shards.is_empty() {
-        return found;
+        return;
     }
     let first = rng.gen_range(0..shards.len());
+    let mut got = 0;
     for step in 0..shards.len() {
-        let at = rng.gen_range(0..usize::MAX);
-        sample_into(
-            &shards[(first + step) % shards.len()],
-            volatile,
-            at,
-            count - found.len(),
-            &mut found,
-        );
-        if found.len() >= count {
+        let index = (first + step) % shards.len();
+        let shard = &shards[index];
+        if (volatile && shard.holds_no_ttl()) || (!volatile && shard.holds_no_keys()) {
+            continue;
+        }
+        let map = shard.read();
+        got += sample_shard(&map, volatile, count - got, rng, |place, e| {
+            found(index, place, e)
+        });
+        if got >= count {
             break;
         }
     }
-    found
+}
+
+/// How many of the keys looked at for one eviction, after the one that goes,
+/// a thread keeps for its next: those the policy wanted least.
+///
+/// A sample is a handful of keys, and the one of them the policy wants
+/// least is often a key it wants: when every key sampled is. Looking at more
+/// keys makes that rarer, and the keys looked at last time are the cheapest
+/// to look at again: their lines were read a moment ago. So each choice is
+/// among the keys of a new sample and those kept from the last, each kept
+/// key read again where it was found — how long since it was used, or how
+/// often, as it is now, not as it was: a kept key that has been used since
+/// is only as unwanted as it is now. (Redis keeps a pool of sixteen keys
+/// with what they were worth when sampled, and a key used since it was put
+/// there still goes first.) With four, the test above keeps as many of
+/// its read keys as Redis does.
+const KEPT: usize = 4;
+
+/// Where a key looked at for an eviction was found: its database, shard and
+/// place (see [`sample_shard`]), which entry it was ([`EntryView::id`]),
+/// and how unwanted it was.
+///
+/// [`EntryView::id`]: crate::store::EntryView::id
+#[derive(Clone, Copy, Default)]
+struct Spot {
+    db: usize,
+    shard: usize,
+    place: usize,
+    id: usize,
+    unwanted: Unwanted,
+}
+
+/// The keys a thread keeps from one eviction to its next ([`KEPT`]).
+#[derive(Clone, Copy, Default)]
+struct Kept {
+    len: usize,
+    spots: [Spot; KEPT],
+}
+
+thread_local! {
+    static KEPT_SPOTS: std::cell::Cell<Kept> = std::cell::Cell::new(Kept::default());
+}
+
+/// The most unwanted keys of a choice, most unwanted first, each entry once:
+/// the one to go, and the [`KEPT`] after it. The key of the first is a
+/// copy, made when it came first (the shard is not held after).
+struct Choice {
+    top: [Spot; KEPT + 1],
+    len: usize,
+    key: Option<crate::store::Key>,
+}
+
+impl Choice {
+    fn new() -> Self {
+        Choice {
+            top: [Spot::default(); KEPT + 1],
+            len: 0,
+            key: None,
+        }
+    }
+
+    /// `spot`, whose key is `key`. Among keys as unwanted, the one offered
+    /// first stays first.
+    #[inline]
+    fn offer(&mut self, spot: Spot, key: &str) {
+        let top = &self.top[..self.len];
+        if top.iter().any(|s| s.id == spot.id) {
+            // Sampled twice, or kept and sampled again.
+            return;
+        }
+        let at = top
+            .iter()
+            .position(|s| spot.unwanted > s.unwanted)
+            .unwrap_or(self.len);
+        if at > KEPT {
+            return;
+        }
+        if at == 0 {
+            self.key = Some(crate::store::Key::from(key));
+        }
+        // Those after it move down one, the last falling off a full list.
+        let len = (self.len + 1).min(KEPT + 1);
+        self.top.copy_within(at..len - 1, at + 1);
+        self.top[at] = spot;
+        self.len = len;
+    }
+
+    /// The key to delete, and the database it is in; the keys after it are
+    /// kept for the thread's next choice.
+    fn decide(self) -> Option<(usize, crate::store::Key)> {
+        let mut kept = Kept::default();
+        if self.len > 1 {
+            kept.len = self.len - 1;
+            kept.spots[..kept.len].copy_from_slice(&self.top[1..self.len]);
+        }
+        KEPT_SPOTS.with(|k| k.set(kept));
+        let db = self.top[0].db;
+        self.key.map(|key| (db, key))
+    }
 }
 
 /// The key to delete next: the least wanted of a sample from each database
-/// in `dbs`.
-fn choose(ctx: &Ctx, policy: Policy, dbs: &[usize], rng: &mut impl Rng) -> Option<(usize, String)> {
+/// in `dbs`, and of the keys kept from this thread's last choice.
+fn choose(
+    ctx: &Ctx,
+    policy: Policy,
+    dbs: &[usize],
+    rng: &mut impl Rng,
+) -> Option<(usize, crate::store::Key)> {
     let now = clock();
     let decay = lfu_decay_time();
-    let count = samples();
-    let mut worst: Option<(Unwanted, usize, String)> = None;
-    for &db in dbs {
-        let candidates: Vec<Sampled> = sample(&ctx.store[db], policy.volatile(), count, rng);
-        for (key, expires, word) in candidates {
-            let unwanted: Unwanted = match policy {
-                // Every sampled key is as unwanted as the next, and the
-                // sample was random already.
-                Policy::AllKeysRandom | Policy::VolatileRandom => 0,
-                Policy::VolatileTtl => u64::MAX - expires.unwrap_or(u64::MAX),
-                // A key whose use is not known goes first, as one older
-                // than any whose use is.
-                Policy::AllKeysLru
-                | Policy::VolatileLru
-                | Policy::AllKeysLrm
-                | Policy::VolatileLrm => {
-                    Access::clock_of(word).map_or(u64::MAX, |then| now.saturating_sub(then) as u64)
-                }
-                Policy::AllKeysLfu | Policy::VolatileLfu => {
-                    (u8::MAX - Access::frequency(word, now / 60, decay)) as u64
-                }
-                Policy::NoEviction => return None,
+    let volatile = policy.volatile();
+    let random = matches!(policy, Policy::AllKeysRandom | Policy::VolatileRandom);
+    // Under a random policy any key will do: one is enough, and nothing is
+    // worth keeping.
+    let count = if random { 1 } else { samples() };
+    let mut choice = Choice::new();
+    if !random {
+        let kept = KEPT_SPOTS.with(|k| k.take());
+        for spot in &kept.spots[..kept.len] {
+            // Where it was, if it is still there (the same entry: a key
+            // deleted and written again is a new entry, and a new key). A
+            // place in a database that has gone from the sample is passed
+            // over, as are those of another store's.
+            if !dbs.contains(&spot.db) {
+                continue;
+            }
+            let Some(shard) = ctx.store.get(spot.db).and_then(|db| db.get(spot.shard)) else {
+                continue;
             };
-            if worst.as_ref().is_none_or(|(most, _, _)| unwanted > *most) {
-                worst = Some((unwanted, db, key));
+            let map = shard.read();
+            let entry = if volatile {
+                map.ttl_entry(spot.place)
+            } else {
+                map.entry_at(spot.place)
+            };
+            if let Some(e) = entry.filter(|e| e.id() == spot.id) {
+                let unwanted = unwanted(policy, e.access(), e.expires(), now, decay);
+                choice.offer(Spot { unwanted, ..*spot }, e.key());
             }
         }
     }
-    worst.map(|(_, db, key)| (db, key))
+    for &db in dbs {
+        sample_db(&ctx.store[db], volatile, count, rng, |shard, place, e| {
+            let unwanted = unwanted(policy, e.access(), e.expires(), now, decay);
+            let spot = Spot {
+                db,
+                shard,
+                place,
+                id: e.id(),
+                unwanted,
+            };
+            choice.offer(spot, e.key());
+        });
+    }
+    choice.decide()
+}
+
+/// The databases worth sampling, as a thread last found them: those with
+/// keys (or, under a volatile policy, keys with a time to live).
+///
+/// Found without a lock, by asking each shard; but asked of every shard of
+/// every database on every evicting write, that was a load from each of
+/// 16 x 128 lines of memory (the shards are apart), nearly all of them the
+/// empty databases'. A thread asks again once its answer is
+/// [`Dbs::TRUSTED`] old, or when none of the databases it knows of has a
+/// key to give.
+#[derive(Default)]
+struct Dbs {
+    store: usize,
+    volatile: bool,
+    found: Option<Instant>,
+    list: Vec<usize>,
+}
+
+impl Dbs {
+    const TRUSTED: std::time::Duration = std::time::Duration::from_millis(10);
+
+    /// The list, found again if it is not to be trusted (`fresh`: it is not).
+    fn get(&mut self, ctx: &Ctx, volatile: bool, fresh: bool) -> &[usize] {
+        let store = Arc::as_ptr(ctx.store) as *const () as usize;
+        let now = Instant::now();
+        if fresh
+            || self.store != store
+            || self.volatile != volatile
+            || self
+                .found
+                .is_none_or(|found| now.saturating_duration_since(found) >= Self::TRUSTED)
+        {
+            self.store = store;
+            self.volatile = volatile;
+            self.found = Some(now);
+            self.list.clear();
+            self.list.extend((0..ctx.store.len()).filter(|&db| {
+                ctx.store[db].iter().any(|shard| {
+                    if volatile {
+                        !shard.holds_no_ttl()
+                    } else {
+                        !shard.holds_no_keys()
+                    }
+                })
+            }));
+        }
+        &self.list
+    }
+}
+
+thread_local! {
+    static DBS: std::cell::RefCell<Dbs> = std::cell::RefCell::new(Dbs::default());
 }
 
 /// Delete `key` to make room, with everything a deletion entails.
@@ -636,28 +931,30 @@ pub fn make_room(ctx: &mut Ctx, limit: usize, ordered: bool) -> bool {
     if policy == Policy::NoEviction {
         return false;
     }
-    // The databases worth sampling. Found once: a database is not emptied
-    // and refilled in the time this takes, and if it is, it is found empty.
-    // Without a lock: this runs on every write while memory is full, and
-    // locking every shard of every empty database (16 x 256 on 32 cores)
-    // cost more than the write and the eviction together.
-    let dbs: Vec<usize> = (0..ctx.store.len())
-        .filter(|&db| {
-            if policy.volatile() {
-                ctx.store[db].iter().any(|shard| !shard.holds_no_ttl())
-            } else {
-                ctx.store[db].iter().any(|shard| !shard.holds_no_keys())
-            }
-        })
-        .collect();
+    // Taken out for the while, and put back: nothing here makes room again.
+    let mut dbs = DBS.with(|d| std::mem::take(&mut *d.borrow_mut()));
+    let done = make_room_in(ctx, policy, limit, ordered, &mut dbs);
+    DBS.with(|d| *d.borrow_mut() = dbs);
+    done
+}
+
+fn make_room_in(ctx: &mut Ctx, policy: Policy, limit: usize, ordered: bool, dbs: &mut Dbs) -> bool {
+    let volatile = policy.volatile();
+    let mut fresh = false;
     let mut rng = rand::thread_rng();
     // A key that could not be deleted — it went between being chosen and
     // being deleted — is no reason to stop, but nothing but those is.
     let mut misses = 0;
     while crate::memory_use::allocated() > limit {
-        let Some((db, key)) = choose(ctx, policy, &dbs, &mut rng) else {
-            return false;
+        let Some((db, key)) = choose(ctx, policy, dbs.get(ctx, volatile, fresh), &mut rng) else {
+            if fresh {
+                return false;
+            }
+            // Nothing where there were keys: ask again where they are.
+            fresh = true;
+            continue;
         };
+        fresh = false;
         if evict(ctx, db, &key, ordered) {
             misses = 0;
         } else {
@@ -754,6 +1051,104 @@ mod tests {
         // 255 is the ceiling, and no roll is drawn for it.
         let top = Access::lfu_word(now / 60, 255);
         assert_eq!(Access::after_use(top, Track::Frequency, now, never), top);
+    }
+
+    /// A key sampled, with its expiry time when it was sampled from the keys
+    /// with one, and its access word.
+    type Sampled = (String, Option<u64>, u32);
+
+    fn sample(
+        shards: &[crate::store::Shard],
+        volatile: bool,
+        count: usize,
+        rng: &mut impl Rng,
+    ) -> Vec<Sampled> {
+        let mut found = Vec::new();
+        sample_db(shards, volatile, count, rng, |_, _, e| {
+            let expires = if volatile { e.expires() } else { None };
+            found.push((e.key().to_string(), expires, e.access()))
+        });
+        found
+    }
+
+    /// Every key is as likely to be sampled as any other, wherever it is in
+    /// its table: a key after a run of empty buckets no more than one after
+    /// a full bucket. (Taken as a run of buckets from a random one, the key
+    /// after the longest run of empty ones came up many times as often as
+    /// the average key, and the keys in a run of full ones hardly at all.)
+    #[test]
+    fn every_key_is_as_likely_to_be_sampled() {
+        let shard = crate::store::ShardLock::default();
+        {
+            let mut map = shard.write();
+            for i in 0..3_000 {
+                map.insert_str(format!("k{i}"), b"v");
+            }
+            // Gaps here and there: a third of the keys stay.
+            for i in (0..3_000).filter(|i| i % 3 != 0) {
+                map.remove(&format!("k{i}"));
+            }
+        }
+        let map = shard.read();
+        assert_eq!(map.len(), 1_000);
+        let mut times = std::collections::HashMap::<String, u32>::new();
+        let mut rng = rand::thread_rng();
+        // 200 times each, on average.
+        for _ in 0..40_000 {
+            let n = sample_shard(&map, false, 5, &mut rng, |_, e| {
+                *times.entry(e.key().to_string()).or_default() += 1;
+            });
+            assert_eq!(n, 5);
+        }
+        assert_eq!(times.len(), 1_000);
+        let least = *times.values().min().unwrap();
+        let most = *times.values().max().unwrap();
+        // Seven standard deviations either side (about 14 each).
+        assert!(
+            least >= 100 && most <= 300,
+            "keys sampled from {least} to {most} times"
+        );
+    }
+
+    /// Of the keys looked at for an eviction, the most unwanted goes, and
+    /// the next most unwanted are kept for the next choice, each entry once;
+    /// among keys as unwanted, the one looked at first.
+    #[test]
+    fn the_most_unwanted_goes_and_the_next_are_kept() {
+        let spot = |id: usize, unwanted: Unwanted| Spot {
+            db: 3,
+            shard: 1,
+            place: id * 10,
+            id,
+            unwanted,
+        };
+        let mut c = Choice::new();
+        for (id, unwanted) in [
+            (1, 10),
+            (2, 30),
+            (3, 20),
+            (2, 30),
+            (4, 5),
+            (5, 25),
+            (6, 1),
+            (7, 40),
+            (8, 20),
+        ] {
+            c.offer(spot(id, unwanted), &format!("k{id}"));
+        }
+        let ids = |s: &[Spot]| s.iter().map(|s| s.id).collect::<Vec<_>>();
+        // 2 is there once; 8 is as unwanted as 3, and came after it.
+        assert_eq!(ids(&c.top[..c.len]), [7, 2, 5, 3, 8]);
+        assert_eq!(
+            c.decide().map(|(db, key)| (db, key.to_string())),
+            Some((3, "k7".to_string()))
+        );
+        let kept = KEPT_SPOTS.with(|k| k.get());
+        assert_eq!(ids(&kept.spots[..kept.len]), [2, 5, 3, 8]);
+        assert_eq!(kept.spots[0].place, 20);
+        // Nothing looked at: nothing goes, and nothing is kept.
+        assert!(Choice::new().decide().is_none());
+        assert_eq!(KEPT_SPOTS.with(|k| k.get()).len, 0);
     }
 
     #[test]

@@ -2255,3 +2255,406 @@ fn postings_are_the_same_after_an_aof_replay() {
     let _ = wait_for_exit(&mut srv2, Duration::from_secs(8));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A reply as text: its strings and numbers, spaced.
+fn text_of(v: &RespValue) -> String {
+    match v {
+        RespValue::Array(items) => items.iter().map(text_of).collect::<Vec<_>>().join(" "),
+        RespValue::Int(n) => n.to_string(),
+        other => other.try_as_str().unwrap_or("?").to_string(),
+    }
+}
+
+/// The stems of TEXT fields, the index's language and its language field
+/// come back after a restart from the snapshot and the AOF written after it:
+/// the same documents found, with the same scores.
+#[test]
+fn stems_and_languages_survive_restart() {
+    let _serial = persist_serial();
+    let dir = temp_dir("stems");
+    let port1 = free_port();
+    let mut srv1 = start_aof_server(port1, &dir, &[]);
+    assert!(
+        wait_for_server(port1, Duration::from_secs(10)),
+        "srv1 start"
+    );
+
+    let queries: &[(&str, &str)] = &[
+        ("en", "@t:preferences"),
+        ("en", "dog"),
+        ("en", "@n:run"),
+        ("de", "häusern"),
+        ("ml", "haus"),
+    ];
+    let run = |c: &mut Conn| -> Vec<String> {
+        queries
+            .iter()
+            .map(|(index, query)| {
+                let mut args = vec!["FT.SEARCH", index, query, "WITHSCORES", "NOCONTENT"];
+                if *index == "ml" {
+                    args.extend(["LANGUAGE", "german"]);
+                }
+                text_of(&c.cmds(&args))
+            })
+            .collect()
+    };
+    let before = {
+        let mut c = Conn::connect(port1);
+        for create in [
+            &[
+                "FT.CREATE",
+                "en",
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                "en:",
+                "SCHEMA",
+                "t",
+                "TEXT",
+                "n",
+                "TEXT",
+                "NOSTEM",
+            ][..],
+            &[
+                "FT.CREATE",
+                "de",
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                "de:",
+                "LANGUAGE",
+                "german",
+                "SCHEMA",
+                "t",
+                "TEXT",
+            ],
+            &[
+                "FT.CREATE",
+                "ml",
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                "ml:",
+                "LANGUAGE_FIELD",
+                "lang",
+                "SCHEMA",
+                "t",
+                "TEXT",
+            ],
+        ] {
+            assert!(c.cmds(create).is_ok());
+        }
+        c.cmds(&["HSET", "en:1", "t", "I prefer email", "n", "running"]);
+        c.cmds(&["HSET", "de:1", "t", "Die Häuser sind schön"]);
+        c.cmds(&["HSET", "ml:1", "t", "laufende Häuser", "lang", "german"]);
+        // Into the snapshot: dump.kdb, and an AOF delta after it.
+        assert!(!c.cmds(&["BGREWRITEAOF"]).is_error());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while c
+            .cmds(&["INFO", "persistence"])
+            .as_str()
+            .contains("aof_rewrite_in_progress:1")
+        {
+            assert!(Instant::now() < deadline, "the rewrite did not finish");
+            thread::sleep(Duration::from_millis(50));
+        }
+        thread::sleep(Duration::from_millis(500));
+        // Into the AOF only.
+        c.cmds(&["HSET", "en:2", "t", "running dogs"]);
+        c.cmds(&["HSET", "de:2", "t", "ein Haus"]);
+        c.cmds(&["HSET", "ml:2", "t", "Häuser", "lang", "german"]);
+        let before = run(&mut c);
+        assert!(before[0].contains("en:1"), "{before:?}");
+        assert!(before[1].contains("en:2"), "{before:?}");
+        assert!(!before[2].contains("en:"), "NOSTEM: {before:?}");
+        assert!(
+            before[3].contains("de:1") && before[3].contains("de:2"),
+            "{before:?}"
+        );
+        assert!(
+            before[4].contains("ml:1") && before[4].contains("ml:2"),
+            "{before:?}"
+        );
+        before
+    };
+    kill_server(&mut srv1);
+
+    let port2 = free_port();
+    let mut srv2 = start_aof_server(port2, &dir, &[]);
+    assert!(
+        wait_for_server(port2, Duration::from_secs(10)),
+        "srv2 start"
+    );
+    {
+        let mut c = Conn::connect(port2);
+        assert_eq!(run(&mut c), before);
+        let info = text_of(&c.cmds(&["FT.INFO", "de"]));
+        assert!(info.contains("default_language"), "{info}");
+        let info = text_of(&c.cmds(&["FT.INFO", "ml"]));
+        assert!(info.contains("language_field"), "{info}");
+    }
+    send_shutdown_nosave(port2);
+    let _ = wait_for_exit(&mut srv2, Duration::from_secs(8));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// FT.DROPINDEX DD — the deletes are events, AOF records and survive a restart
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// The AOF records of `aof`, each as its arguments joined by spaces.
+fn aof_records(aof: &[u8]) -> Vec<String> {
+    let mut records = Vec::new();
+    let mut at = 0;
+    let line = |at: &mut usize| -> Option<String> {
+        let end = aof[*at..].windows(2).position(|w| w == b"\r\n")? + *at;
+        let text = String::from_utf8_lossy(&aof[*at..end]).to_string();
+        *at = end + 2;
+        Some(text)
+    };
+    while at < aof.len() {
+        let Some(head) = line(&mut at) else { break };
+        let Some(count) = head.strip_prefix('*').and_then(|n| n.parse::<usize>().ok()) else {
+            // Not a record: a preamble, which comes first if at all.
+            continue;
+        };
+        let mut parts = Vec::with_capacity(count);
+        for _ in 0..count {
+            let len: usize = line(&mut at).unwrap()[1..].parse().unwrap();
+            parts.push(String::from_utf8_lossy(&aof[at..at + len]).to_string());
+            at += len + 2;
+        }
+        records.push(parts.join(" "));
+    }
+    records
+}
+
+/// `commands` with each run of DELs made one, its keys in order: the
+/// documents of an index are deleted in no particular order, and sent in
+/// as many DELs as it takes.
+fn dels_merged(commands: &[String]) -> Vec<String> {
+    let mut merged: Vec<String> = Vec::new();
+    for command in commands {
+        match (command.strip_prefix("DEL "), merged.last_mut()) {
+            (Some(keys), Some(last)) if last.starts_with("DEL ") => {
+                last.push(' ');
+                last.push_str(keys);
+            }
+            _ => merged.push(command.clone()),
+        }
+    }
+    for command in &mut merged {
+        if let Some(keys) = command.strip_prefix("DEL ") {
+            let mut keys: Vec<&str> = keys.split(' ').collect();
+            keys.sort();
+            *command = format!("DEL {}", keys.join(" "));
+        }
+    }
+    merged
+}
+
+/// `FT.DROPINDEX … DD` deletes the documents, each with a `del` event as in
+/// Redis, for a HASH index, a JSON one and one in another database. The AOF
+/// holds a DEL of each document, then the drop without `DD`, as Redis 8.10
+/// writes them, and a restart replays that: the documents stay gone, the
+/// rest stays.
+#[test]
+fn dropindex_dd_is_logged_as_a_del_of_each_document_then_the_drop() {
+    let _serial = persist_serial();
+    let dir = temp_dir("aof_dd");
+    let port1 = free_port();
+    let mut srv1 = start_aof_server(port1, &dir, &[]);
+    assert!(
+        wait_for_server(port1, Duration::from_secs(10)),
+        "srv1 start"
+    );
+    let mut c = Conn::connect(port1);
+    assert!(
+        c.cmds(&["CONFIG", "SET", "notify-keyspace-events", "Eg"])
+            .is_ok()
+    );
+    let create = |c: &mut Conn, name: &str, on: &str, prefix: &str, field: &[&str]| {
+        let mut args = vec!["FT.CREATE", name, "ON", on, "PREFIX", "1", prefix, "SCHEMA"];
+        args.extend_from_slice(field);
+        let reply = c.cmds(&args);
+        assert!(reply.is_ok(), "{reply:?}");
+    };
+    create(&mut c, "idx:dd", "HASH", "doc:", &["body", "TEXT"]);
+    create(
+        &mut c,
+        "idx:ddj",
+        "JSON",
+        "jdoc:",
+        &["$.body", "AS", "body", "TEXT"],
+    );
+    c.cmds(&["HSET", "doc:1", "body", "hello"]);
+    c.cmds(&["HSET", "doc:2", "body", "world"]);
+    c.cmds(&["SET", "doc:3", "a string, not a document"]);
+    c.cmds(&["HSET", "other:1", "body", "hello"]);
+    c.cmds(&["JSON.SET", "jdoc:1", "$", r#"{"body":"hello"}"#]);
+    c.cmds(&["HSET", "jdoc:2", "body", "a hash, not a JSON document"]);
+    let mut db3 = Conn::connect(port1);
+    assert!(db3.cmds(&["SELECT", "3"]).is_ok());
+    create(&mut db3, "idx:dd3", "HASH", "d3:", &["body", "TEXT"]);
+    db3.cmds(&["HSET", "d3:1", "body", "hello"]);
+    // The same name in database 0: not a document of the index.
+    c.cmds(&["HSET", "d3:1", "body", "database 0's"]);
+
+    let mut sub = Conn::connect(port1);
+    sub.cmds(&["PSUBSCRIBE", "__keyevent@*__:del"]);
+    sub.cmds(&["SUBSCRIBE", "done"]);
+
+    assert!(c.cmds(&["FT.DROPINDEX", "idx:dd", "DD"]).is_ok());
+    assert!(c.cmds(&["FT.DROPINDEX", "idx:ddj", "dd"]).is_ok());
+    assert!(db3.cmds(&["FT.DROPINDEX", "idx:dd3", "DD"]).is_ok());
+    c.cmds(&["PUBLISH", "done", "1"]);
+    let mut deleted = Vec::new();
+    loop {
+        let message = sub.read_value();
+        let parts = message.as_array();
+        if parts[0].as_str() == "message" {
+            break;
+        }
+        deleted.push(format!("{} {}", parts[2].as_str(), parts[3].as_str()));
+    }
+    deleted.sort();
+    assert_eq!(
+        deleted,
+        [
+            "__keyevent@0__:del doc:1",
+            "__keyevent@0__:del doc:2",
+            "__keyevent@0__:del jdoc:1",
+            "__keyevent@3__:del d3:1",
+        ]
+    );
+    assert_eq!(c.cmds(&["EXISTS", "doc:1", "doc:2", "jdoc:1"]).as_int(), 0);
+    assert_eq!(
+        c.cmds(&["EXISTS", "doc:3", "other:1", "jdoc:2", "d3:1"])
+            .as_int(),
+        4
+    );
+    assert_eq!(db3.cmds(&["EXISTS", "d3:1"]).as_int(), 0);
+
+    // Written and synced: the AOF is flushed every second.
+    thread::sleep(Duration::from_millis(1500));
+    let records = aof_records(&std::fs::read(dir.join("appendonly.aof")).unwrap());
+    assert!(
+        !records
+            .iter()
+            .any(|r| r.to_ascii_uppercase().ends_with(" DD")),
+        "DD logged: {records:?}"
+    );
+    let first_del = records
+        .iter()
+        .position(|r| r.starts_with("DEL "))
+        .unwrap_or_else(|| panic!("no DEL logged: {records:?}"));
+    // Once a database other than 0 has been used, every record carries its
+    // own `SELECT`: only those that change the database are kept here.
+    let mut db = "0";
+    let mut logged = Vec::new();
+    for record in &records[first_del..] {
+        if let Some(selected) = record.strip_prefix("SELECT ") {
+            if selected == db {
+                continue;
+            }
+            db = selected;
+        }
+        logged.push(record.clone());
+    }
+    assert_eq!(
+        dels_merged(&logged),
+        [
+            "DEL doc:1 doc:2",
+            "FT.DROPINDEX idx:dd",
+            "DEL jdoc:1",
+            "FT.DROPINDEX idx:ddj",
+            "SELECT 3",
+            "DEL d3:1",
+            "FT.DROPINDEX idx:dd3",
+        ]
+    );
+
+    send_shutdown_nosave(port1);
+    assert!(
+        wait_for_exit(&mut srv1, Duration::from_secs(8)),
+        "srv1 stop"
+    );
+
+    let port2 = free_port();
+    let mut srv2 = start_aof_server(port2, &dir, &[]);
+    assert!(
+        wait_for_server(port2, Duration::from_secs(10)),
+        "srv2 start"
+    );
+    {
+        let mut c = Conn::connect(port2);
+        assert_eq!(c.cmds(&["EXISTS", "doc:1", "doc:2", "jdoc:1"]).as_int(), 0);
+        assert_eq!(
+            c.cmds(&["EXISTS", "doc:3", "other:1", "jdoc:2", "d3:1"])
+                .as_int(),
+            4
+        );
+        assert!(c.cmds(&["SELECT", "3"]).is_ok());
+        assert_eq!(c.cmds(&["EXISTS", "d3:1"]).as_int(), 0);
+        assert!(c.cmds(&["FT._LIST"]).as_array().is_empty());
+    }
+    send_shutdown_nosave(port2);
+    let _ = wait_for_exit(&mut srv2, Duration::from_secs(8));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An AOF written by 1.1.2 has `FT.DROPINDEX … DD` in it, as it was typed,
+/// from a server that kept the documents. Replayed now, it drops the index
+/// and keeps them, as that server did. (A 1.2.0 release candidate logged
+/// `DD` the same way and deleted them; nothing in the file tells the two
+/// apart, and keeping is what loses no data.)
+#[test]
+fn a_dd_in_an_aof_written_by_1_1_2_keeps_the_documents() {
+    let _serial = persist_serial();
+    let dir = temp_dir("aof_old_dd");
+    let records: &[&[&str]] = &[
+        &["SELECT", "0"],
+        &[
+            "FT.CREATE",
+            "idx:old",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "doc:",
+            "SCHEMA",
+            "body",
+            "TEXT",
+        ],
+        &["HSET", "doc:1", "body", "hello"],
+        &["HSET", "other:1", "body", "hello"],
+        &["FT.DROPINDEX", "idx:old", "DD"],
+        &["HSET", "doc:2", "body", "after the drop"],
+    ];
+    let mut aof = Vec::new();
+    for record in records {
+        aof.extend_from_slice(format!("*{}\r\n", record.len()).as_bytes());
+        for part in *record {
+            aof.extend_from_slice(format!("${}\r\n{part}\r\n", part.len()).as_bytes());
+        }
+    }
+    std::fs::write(dir.join("appendonly.aof"), aof).unwrap();
+
+    let port = free_port();
+    let mut srv = start_aof_server(port, &dir, &[]);
+    assert!(
+        wait_for_server(port, Duration::from_secs(10)),
+        "server start"
+    );
+    {
+        let mut c = Conn::connect(port);
+        assert_eq!(c.cmds(&["EXISTS", "doc:1", "doc:2", "other:1"]).as_int(), 3);
+        assert!(c.cmds(&["FT._LIST"]).as_array().is_empty());
+    }
+    send_shutdown_nosave(port);
+    let _ = wait_for_exit(&mut srv, Duration::from_secs(8));
+    let _ = std::fs::remove_dir_all(&dir);
+}

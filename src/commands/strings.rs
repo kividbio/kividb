@@ -96,6 +96,27 @@ impl<'a> WriteShards<'a> {
     }
 }
 
+/// `n` in decimal, written into `buf`: what the counters write, without a
+/// `String` to make and free.
+#[inline]
+fn decimal(n: i64, buf: &mut [u8; 20]) -> &[u8] {
+    let mut at = buf.len();
+    let mut rest = n.unsigned_abs();
+    loop {
+        at -= 1;
+        buf[at] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    if n < 0 {
+        at -= 1;
+        buf[at] = b'-';
+    }
+    &buf[at..]
+}
+
 pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
     let cmd = &ctx.cmd;
 
@@ -263,26 +284,17 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
 
             // ── single write-lock scope ───────────────────────────────────────────
-            // Made before the shard is locked, for the same reason the old
-            // value is dropped after: allocating and copying are not the
-            // shard's to wait for. A condition that fails wastes it. Its
-            // time to live is in it: the key's own with KEEPTTL, else the
-            // one given, or none.
-            let value = if keepttl {
-                store::NewEntry::string(key, cmd[2])
-            } else {
-                store::NewEntry::string_expiring(key, cmd[2], expiry.map(unix_ms))
-            };
             let mut map = write_lock!(shard);
 
-            // Looked up once; what follows asks this, not the map again.
-            let existing = map.get(key);
+            // Looked up once; what follows asks this, not the map again. A
+            // plain SET asks nothing of what is there: it is not looked up
+            // before it is written over.
+            let existing = if want_get || condition != Condition::None {
+                map.get(key)
+            } else {
+                None
+            };
             let key_exists = existing.is_some();
-            // A document written over leaves the indexes that hold it.
-            let was_document = matches!(
-                existing,
-                Some(ValueRef::Hash(_) | ValueRef::HashEx(_) | ValueRef::Json(_))
-            );
 
             // GET: capture old value before any mutation (nil if absent/wrong-type)
             let old_val: Option<SharedBytes> = if want_get {
@@ -387,9 +399,23 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
 
             // ── write ─────────────────────────────────────────────────────────────
-            // The value and its time to live, in one step.
-            let replaced = map.insert_entry(value);
+            // The value and its time to live, in one step: the key's own
+            // with KEEPTTL, else the one given, or none. Over the old value
+            // in its own entry when it can be (`ShardMap::set_str`).
+            let replaced = if keepttl {
+                map.set_str(key, cmd[2])
+            } else {
+                map.set_str_expiring(key, cmd[2], expiry.map(unix_ms))
+            };
             drop(map);
+            // A document written over leaves the indexes that hold it. What
+            // was there is what the write replaced: a plain SET does not look
+            // the key up first. (Written over in place, it was a string.)
+            let was_document = matches!(
+                &replaced,
+                store::Written::Replaced(old)
+                    if matches!(old.value(), ValueRef::Hash(_) | ValueRef::HashEx(_) | ValueRef::Json(_))
+            );
             // The value that was there is let go of with the shard unlocked:
             // its count is in memory nothing has touched lately, and freeing
             // it is the allocator's time, neither of them the shard's to wait
@@ -540,10 +566,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(n) if n > 0 => n,
                 _ => return Some(resp_error("ERR invalid expire time in SETEX")),
             };
-            let value: KiviDBValue = KiviDBValue::String(SharedBytes::from(cmd[3]));
             let expires_at = expiry_at_after(Duration::from_secs(secs));
-
-            store_value_expiring(ctx.store, *ctx.selected_db, key, value, Some(expires_at));
+            let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
+            let replaced =
+                write_lock!(shard).set_str_expiring(key, cmd[3], Some(unix_ms(expires_at)));
+            drop(replaced);
             notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "set", key);
             notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "expire", key);
             Some(resp_simple("OK"))
@@ -588,14 +615,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
 
             let db = &ctx.store[*ctx.selected_db];
-            let key = match String::from_utf8(cmd[1].to_vec()) {
-                Ok(k) => k,
-                Err(_) => return Some(resp_error("ERR must be valid UTF-8")),
+            let key = match parse_utf8(cmd[1]) {
+                Some(k) => k,
+                None => return Some(resp_error("ERR must be valid UTF-8")),
             };
-            let shard = store::get_shard(db, &key);
+            let shard = store::get_shard(db, key);
             let mut map = write_lock!(shard);
 
-            let next = match map.get(key.as_str()) {
+            let next = match map.get(key) {
                 None => 1i64,
                 Some(ValueRef::String(v)) => {
                     let s = match std::str::from_utf8(v.as_ref()) {
@@ -629,9 +656,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
 
             // INCR must read then write so the lock scope is unavoidable.
-            map.insert_str(&*key, next.to_string());
+            drop(map.set_str(key, decimal(next, &mut [0; 20])));
             drop(map); // explicitly drop lock before AOF
-            notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "incrby", &key);
+            notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "incrby", key);
             Some(resp_integer(next))
         }
 
@@ -682,6 +709,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let mut map = write_lock!(shard);
+            // At the end of the string, in its own entry, when it has room.
+            if let Some(len) = map.append_in_place(key, suffix) {
+                drop(map);
+                notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "append", key);
+                return Some(resp_integer(len as i64));
+            }
             let new_val: SharedBytes = match map.get(key) {
                 None => SharedBytes::from(*suffix),
                 Some(ValueRef::String(existing)) => {
@@ -765,36 +798,34 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(k) => k,
                 None => return Some(resp_error("ERR must be valid UTF-8")),
             };
-            // The old value is what the insert gives back, past its time or not.
-            if is_expired(ctx.store, *ctx.selected_db, key) {
-                delete_key_if_expired(ctx.store, *ctx.selected_db, key);
-            }
-            let new_val = KiviDBValue::String(SharedBytes::from(cmd[2]));
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let mut map = write_lock!(shard);
-            // GETSET always persists the key.
-            let old = map
-                .insert_expiring(key, new_val, None)
-                .map(store::Taken::into_value);
-            drop(map);
-            notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "set", key);
-            match old {
-                Some(KiviDBValue::String(v)) => {
+            // The reply is the old value, made before it is written over. A
+            // key of another type is left as it is, as in Redis (it was
+            // replaced, and the reply was the error).
+            let reply = match map.get(key) {
+                Some(ValueRef::String(v)) => {
                     crate::stats::record_hit();
-                    Some(resp_bulk(&v))
+                    resp_bulk(&v)
                 }
                 Some(_) => {
                     crate::stats::record_miss();
-                    Some(resp_error(
+                    return Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
-                    ))
+                    ));
                 }
                 None => {
                     crate::stats::record_miss();
-                    Some(resp_null_bulk())
+                    resp_null_bulk()
                 }
-            }
+            };
+            // GETSET always persists the key.
+            let replaced = map.set_str_expiring(key, cmd[2], None);
+            drop(map);
+            drop(replaced);
+            notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "set", key);
+            Some(reply)
         }
 
         // ── SETNX ─────────────────────────────────────────────────────────────────────
@@ -819,7 +850,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if map.contains_key(key) {
                 return Some(resp_integer(0));
             }
-            map.insert_str(key, cmd[2]);
+            drop(map.set_str(key, cmd[2]));
             drop(map);
             notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "set", key);
             Some(resp_integer(1))
@@ -841,9 +872,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(n) if n > 0 => n,
                 _ => return Some(resp_error("ERR invalid expire time in PSETEX")),
             };
-            let value = KiviDBValue::String(SharedBytes::from(cmd[3]));
             let expires_at = expiry_at_after(Duration::from_millis(millis));
-            store_value_expiring(ctx.store, *ctx.selected_db, key, value, Some(expires_at));
+            let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
+            let replaced =
+                write_lock!(shard).set_str_expiring(key, cmd[3], Some(unix_ms(expires_at)));
+            drop(replaced);
             notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "set", key);
             notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "expire", key);
             Some(resp_simple("OK"))
@@ -873,7 +906,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 // some of the keys set and the others not yet.
                 let mut shards = WriteShards::lock(&ctx.store[db], pairs.iter().map(|p| p.0));
                 for (key, value) in &pairs {
-                    shards.map(key).insert_str_expiring(*key, *value, None);
+                    drop(shards.map(key).set_str_expiring(*key, *value, None));
                 }
             }
             for (key, _) in &pairs {
@@ -959,7 +992,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     }
                 }
                 for (key, value) in &pairs {
-                    shards.map(key).insert_str_expiring(*key, *value, None);
+                    drop(shards.map(key).set_str_expiring(*key, *value, None));
                 }
             }
             for (key, _) in &pairs {
@@ -976,19 +1009,19 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'incrby' command",
                 ));
             }
-            let key = match String::from_utf8(cmd[1].to_vec()) {
-                Ok(k) => k,
-                Err(_) => return Some(resp_error("ERR must be valid UTF-8")),
+            let key = match parse_utf8(cmd[1]) {
+                Some(k) => k,
+                None => return Some(resp_error("ERR must be valid UTF-8")),
             };
             let delta: i64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
             let db = &ctx.store[*ctx.selected_db];
-            let shard = store::get_shard(db, &key);
+            let shard = store::get_shard(db, key);
             let mut map = write_lock!(shard);
             // Check overflow properly
-            let next = match map.get(key.as_str()) {
+            let next = match map.get(key) {
                 None => delta,
                 Some(ValueRef::String(v)) => match std::str::from_utf8(&v)
                     .ok()
@@ -1008,9 +1041,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     ));
                 }
             };
-            map.insert_str(&*key, next.to_string().as_bytes());
+            drop(map.set_str(key, decimal(next, &mut [0; 20])));
             drop(map);
-            notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "incrby", &key);
+            notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "incrby", key);
             Some(resp_integer(next))
         }
 
@@ -1022,14 +1055,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'decr' command",
                 ));
             }
-            let key = match String::from_utf8(cmd[1].to_vec()) {
-                Ok(k) => k,
-                Err(_) => return Some(resp_error("ERR must be valid UTF-8")),
+            let key = match parse_utf8(cmd[1]) {
+                Some(k) => k,
+                None => return Some(resp_error("ERR must be valid UTF-8")),
             };
             let db = &ctx.store[*ctx.selected_db];
-            let shard = store::get_shard(db, &key);
+            let shard = store::get_shard(db, key);
             let mut map = write_lock!(shard);
-            let next = match map.get(key.as_str()) {
+            let next = match map.get(key) {
                 None => -1i64,
                 Some(ValueRef::String(v)) => match std::str::from_utf8(&v)
                     .ok()
@@ -1049,9 +1082,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     ));
                 }
             };
-            map.insert_str(&*key, next.to_string().as_bytes());
+            drop(map.set_str(key, decimal(next, &mut [0; 20])));
             drop(map);
-            notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "incrby", &key);
+            notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "incrby", key);
             Some(resp_integer(next))
         }
 
@@ -1061,18 +1094,18 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'decrby' command",
                 ));
             }
-            let key = match String::from_utf8(cmd[1].to_vec()) {
-                Ok(k) => k,
-                Err(_) => return Some(resp_error("ERR must be valid UTF-8")),
+            let key = match parse_utf8(cmd[1]) {
+                Some(k) => k,
+                None => return Some(resp_error("ERR must be valid UTF-8")),
             };
             let delta: i64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
             let db = &ctx.store[*ctx.selected_db];
-            let shard = store::get_shard(db, &key);
+            let shard = store::get_shard(db, key);
             let mut map = write_lock!(shard);
-            let next = match map.get(key.as_str()) {
+            let next = match map.get(key) {
                 None => -delta,
                 Some(ValueRef::String(v)) => match std::str::from_utf8(&v)
                     .ok()
@@ -1092,9 +1125,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     ));
                 }
             };
-            map.insert_str(&*key, next.to_string().as_bytes());
+            drop(map.set_str(key, decimal(next, &mut [0; 20])));
             drop(map);
-            notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "incrby", &key);
+            notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "incrby", key);
             Some(resp_integer(next))
         }
 
@@ -1107,18 +1140,18 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'incrbyfloat' command",
                 ));
             }
-            let key = match String::from_utf8(cmd[1].to_vec()) {
-                Ok(k) => k,
-                Err(_) => return Some(resp_error("ERR must be valid UTF-8")),
+            let key = match parse_utf8(cmd[1]) {
+                Some(k) => k,
+                None => return Some(resp_error("ERR must be valid UTF-8")),
             };
             let delta: f64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not a valid float")),
             };
             let db = &ctx.store[*ctx.selected_db];
-            let shard = store::get_shard(db, &key);
+            let shard = store::get_shard(db, key);
             let mut map = write_lock!(shard);
-            let current: f64 = match map.get(key.as_str()) {
+            let current: f64 = match map.get(key) {
                 None => 0.0,
                 Some(ValueRef::String(v)) => {
                     match std::str::from_utf8(&v).ok().and_then(|s| s.parse().ok()) {
@@ -1138,9 +1171,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             // Redis trims trailing zeros. format!("{}", f) already does this in Rust for many cases.
             let s = format!("{}", next);
-            map.insert_str(&*key, s.as_bytes());
+            drop(map.set_str(key, s.as_bytes()));
             drop(map);
-            notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "incrbyfloat", &key);
+            notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "incrbyfloat", key);
             Some(resp_bulk_str(&s))
         }
 
@@ -1255,6 +1288,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let mut map = write_lock!(shard);
+            // In the string's own entry, when it has room.
+            if !patch.is_empty()
+                && let Some(len) = map.set_range_in_place(key, offset, patch)
+            {
+                return Some(resp_integer(len as i64));
+            }
             let existing: Vec<u8> = match map.get(key) {
                 None => vec![],
                 Some(ValueRef::String(v)) => v.to_vec(), // copy into owned Vec to mutate
@@ -1276,7 +1315,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             buf[offset..offset + patch.len()].copy_from_slice(patch);
             let new_len = buf.len() as i64;
-            map.insert_str(key, buf.as_slice());
+            drop(map.set_str(key, buf.as_slice()));
             drop(map);
             Some(resp_integer(new_len))
         }

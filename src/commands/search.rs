@@ -4,7 +4,7 @@
 // query (`vector::filter`) against an index, and the reply.
 
 use crate::store::ValueRef;
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -277,6 +277,7 @@ fn create(ctx: &mut Ctx) -> Result<(), String> {
     let mut on = IndexOn::Hash;
     let mut prefixes: Vec<String> = Vec::new();
     let mut stopwords: Option<Vec<String>> = None;
+    let mut language = crate::vector::stem::LanguageOptions::default();
     let mut skip_initial_scan = false;
     let mut schema_found = false;
     let mut i = 2usize;
@@ -333,10 +334,26 @@ fn create(ctx: &mut Ctx) -> Result<(), String> {
                 skip_initial_scan = true;
                 i += 1;
             }
+            // What the words of TEXT fields are stemmed in (see `stem`).
+            "LANGUAGE" => {
+                let name = cmd
+                    .get(i + 1)
+                    .map(|a| text(a))
+                    .ok_or_else(|| "Bad arguments for LANGUAGE: expected a value".to_string())?;
+                language.language = crate::vector::stem::Language::parse(name)
+                    .ok_or_else(|| "Invalid language".to_string())?;
+                i += 2;
+            }
+            "LANGUAGE_FIELD" => {
+                let field = cmd.get(i + 1).map(|a| text(a)).ok_or_else(|| {
+                    "Bad arguments for LANGUAGE_FIELD: expected a value".to_string()
+                })?;
+                language.field = Some(field.to_string());
+                i += 2;
+            }
             // Ranking and storage hints with no counterpart here. They
             // change no result a query can see.
-            "LANGUAGE" | "LANGUAGE_FIELD" | "SCORE" | "SCORE_FIELD" | "PAYLOAD_FIELD"
-            | "TEMPORARY" => {
+            "SCORE" | "SCORE_FIELD" | "PAYLOAD_FIELD" | "TEMPORARY" => {
                 if cmd.get(i + 1).is_none() {
                     return Err(format!("Bad arguments for {word}: expected a value"));
                 }
@@ -372,6 +389,7 @@ fn create(ctx: &mut Ctx) -> Result<(), String> {
         aliases: Vec::new(),
         stopwords,
         synonyms: Default::default(),
+        language,
     }
     .into_def();
 
@@ -391,6 +409,21 @@ fn create(ctx: &mut Ctx) -> Result<(), String> {
 }
 
 // ── FT.INFO ───────────────────────────────────────────────────────────────────
+
+/// What `index_definition` of FT.INFO says of the index's language, as Redis
+/// says it: nothing for English.
+fn language_definition(language: &crate::vector::stem::LanguageOptions) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    if language.language != crate::vector::stem::Language::English {
+        out.push(resp_bulk_str("default_language"));
+        out.push(resp_bulk_str(language.language.name()));
+    }
+    if let Some(field) = &language.field {
+        out.push(resp_bulk_str("language_field"));
+        out.push(resp_bulk_str(field));
+    }
+    out
+}
 
 /// Documents the index covers: hashes, or JSON documents, under its prefixes.
 fn count_docs(db: &Db, def: &IndexDef, cluster: Option<&crate::cluster::ClusterState>) -> usize {
@@ -469,9 +502,11 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 }),
                 resp_bulk_str("prefixes"),
                 resp_array(def.prefixes.iter().map(|p| resp_bulk_str(p)).collect()),
-                resp_bulk_str("default_score"),
-                resp_bulk_str("1"),
-            ],
+            ]
+            .into_iter()
+            .chain(language_definition(&def.language))
+            .chain([resp_bulk_str("default_score"), resp_bulk_str("1")])
+            .collect(),
         ),
     );
     put(
@@ -485,11 +520,19 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
     );
     put("num_docs", resp_integer(num_docs as i64));
     put("max_doc_id", resp_integer(num_docs as i64));
-    put("num_terms", resp_integer(def.vocab.read().len() as i64));
+    let (num_terms, num_records, text_bytes) = {
+        let text = def.text.read();
+        (text.num_terms(), text.num_records(), text.bytes())
+    };
+    put("num_terms", resp_integer(num_terms as i64));
+    put("num_records", resp_integer(num_records as i64));
+    // What the TEXT index holds, and what it costs.
+    put("text_terms_bytes", resp_integer(text_bytes.terms as i64));
     put(
-        "num_records",
-        resp_integer(def.inverted.read().values().map(|s| s.len()).sum::<usize>() as i64),
+        "text_postings_bytes",
+        resp_integer(text_bytes.postings as i64),
     );
+    put("text_docs_bytes", resp_integer(text_bytes.docs as i64));
     // What the TAG and NUMERIC postings hold, and what they cost.
     if def.keeps_postings() {
         let p = def.postings.read();
@@ -623,8 +666,19 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
     Some(resp_map_for(resp, out))
 }
 
+/// The error for an index that does not exist, as Redis 8 gives it for
+/// every command that names one: `SEARCH_INDEX_NOT_FOUND`, then the name.
+/// Clients look for "not found" in it to know they should create the index.
 pub(crate) fn no_such_index(name: &str) -> String {
-    format!("{name}: no such index")
+    format!("SEARCH_INDEX_NOT_FOUND Index not found: {name}")
+}
+
+/// Whether `error`, a node's error reply without its `-` (its line ending
+/// may still be there), is [`no_such_index`]'s, or the wording KiviDB used
+/// before it.
+pub(crate) fn is_no_such_index(error: &str) -> bool {
+    let error = error.trim_end();
+    error.starts_with("SEARCH_INDEX_NOT_FOUND ") || error.ends_with("no such index")
 }
 
 // ── Running a filter ──────────────────────────────────────────────────────────
@@ -700,6 +754,7 @@ pub(crate) fn scan_docs(
     let mut seen = 0usize;
     for shard in db.iter() {
         let map = shard.read();
+        let expired = expired_in(&map);
         let mut left = map.len();
         let mut docs = map.iter();
         while left > 0 {
@@ -710,14 +765,33 @@ pub(crate) fn scan_docs(
                 }
             }
             let this_run = left.min(run);
-            for (key, value) in docs.by_ref().take(this_run) {
-                each(key, value);
+            if expired.is_empty() {
+                for (key, value) in docs.by_ref().take(this_run) {
+                    each(key, value);
+                }
+            } else {
+                for (key, value) in docs.by_ref().take(this_run) {
+                    if !expired.contains(key) {
+                        each(key, value);
+                    }
+                }
             }
             left -= this_run;
             seen += this_run;
         }
     }
     false
+}
+
+/// The keys of a shard whose time to live has ended, which nothing has
+/// deleted yet: no documents, as a read finds them.
+fn expired_in(map: &crate::store::ShardMap) -> AHashSet<String> {
+    if map.ttl_len() == 0 {
+        return AHashSet::new();
+    }
+    let now = crate::commands::helpers::now_ms();
+    let (due, _) = map.due(now, usize::MAX);
+    due.into_iter().map(|key| key.to_string()).collect()
 }
 
 /// Whether a step over `n` items that cannot stop part-way (a sort) is to
@@ -739,10 +813,17 @@ pub(crate) fn on_timeout_fails() -> bool {
 pub(crate) fn query_terms(filter: &Filter, out: &mut AHashSet<String>) {
     match filter {
         Filter::Text {
-            term: TextMatch::Exact(term),
+            term: TextMatch::Exact(term) | TextMatch::Expanded(term),
             ..
         } => {
             out.insert(term.clone());
+        }
+        // A stem, written as the index has it.
+        Filter::Text {
+            term: TextMatch::Stem(stem),
+            ..
+        } => {
+            out.insert(format!("{}{}", crate::vector::stem::STEM_PREFIX, stem.stem));
         }
         Filter::Phrase { terms, .. } => out.extend(terms.iter().cloned()),
         Filter::And(l, r) | Filter::Or(l, r) => {
@@ -754,42 +835,42 @@ pub(crate) fn query_terms(filter: &Filter, out: &mut AHashSet<String>) {
     }
 }
 
-/// The documents that could match, read off the inverted index — or `None`
-/// if the filter has to be tried on every document.
+/// The documents that could match, read off the TEXT index (by their ids),
+/// and whether they are exactly the documents that match — or `None` if the
+/// filter has to be tried on every document.
 ///
-/// What comes back is a superset: every key is evaluated before it counts.
-/// (The index is only ever added to as documents change, so it may name a
-/// document that no longer holds the word.)
-fn candidates(filter: &Filter, def: &IndexDef) -> Option<AHashSet<String>> {
-    let postings = |fields: &[String], pick: &dyn Fn(&str) -> bool, exact: Option<&str>| {
-        let inverted = def.inverted.read();
-        let mut keys: AHashSet<String> = AHashSet::new();
-        for field in fields {
-            match exact {
-                Some(term) => {
-                    if let Some(set) = inverted.get(&format!("{field}\x00{term}")) {
-                        keys.extend(set.iter().cloned());
-                    }
-                }
-                None => {
-                    let start = format!("{field}\x00");
-                    for (entry, set) in inverted.iter() {
-                        if entry.strip_prefix(&start).is_some_and(pick) {
-                            keys.extend(set.iter().cloned());
-                        }
-                    }
-                }
-            }
-        }
-        keys
+/// A word, a stem, a prefix, suffix or infix, and `AND` and `OR` of them,
+/// are exact: the TEXT index holds every document's words as they are now
+/// (and no stopword, which a pattern does not match, as in Redis). A phrase
+/// gives the documents to try: it is about where the words are.
+fn candidates(filter: &Filter, def: &IndexDef) -> Option<(Bits, bool)> {
+    let numbers = |fields: &[String]| -> Vec<u16> {
+        fields.iter().filter_map(|f| def.text_field(f)).collect()
+    };
+    let word = |fields: &[String], term: &str| {
+        let mut out = Bits::new();
+        def.text.read().docs_with(term, &numbers(fields), &mut out);
+        out
+    };
+    let matching = |fields: &[String], pick: &dyn Fn(&str) -> bool| {
+        let mut out = Bits::new();
+        def.text
+            .read()
+            .docs_matching(&numbers(fields), pick, &mut out);
+        out
     };
     match filter {
-        Filter::MatchNone => Some(AHashSet::new()),
+        Filter::MatchNone => Some((Bits::new(), true)),
         Filter::Text { fields, term } => Some(match term {
-            TextMatch::Exact(t) => postings(fields, &|_| false, Some(t)),
-            TextMatch::Prefix(p) => postings(fields, &|tok| tok.starts_with(p.as_str()), None),
-            TextMatch::Suffix(s) => postings(fields, &|tok| tok.ends_with(s.as_str()), None),
-            TextMatch::Infix(s) => postings(fields, &|tok| tok.contains(s.as_str()), None),
+            // A stopword a synonym brings in is in no index.
+            TextMatch::Exact(t) | TextMatch::Expanded(t) => (word(fields, t), !def.is_stopword(t)),
+            TextMatch::Stem(stem) => {
+                let term = format!("{}{}", crate::vector::stem::STEM_PREFIX, stem.stem);
+                (word(fields, &term), true)
+            }
+            TextMatch::Prefix(p) => (matching(fields, &|tok| tok.starts_with(p.as_str())), true),
+            TextMatch::Suffix(s) => (matching(fields, &|tok| tok.ends_with(s.as_str())), true),
+            TextMatch::Infix(s) => (matching(fields, &|tok| tok.contains(s.as_str())), true),
             // Every word of the vocabulary would have to be measured against
             // it; trying the documents costs the same.
             TextMatch::Fuzzy(..) => return None,
@@ -799,21 +880,25 @@ fn candidates(filter: &Filter, def: &IndexDef) -> Option<AHashSet<String>> {
             let mut sets = terms
                 .iter()
                 .filter(|t| !def.is_stopword(t))
-                .map(|t| postings(fields, &|_| false, Some(t)));
-            let first = sets.next()?;
-            Some(sets.fold(first, |acc, set| {
-                acc.into_iter().filter(|k| set.contains(k)).collect()
-            }))
+                .map(|t| word(fields, t));
+            let mut all = sets.next()?;
+            for set in sets {
+                all.and_with(&set);
+            }
+            Some((all, false))
         }
         Filter::And(l, r) => match (candidates(l, def), candidates(r, def)) {
-            (Some(a), Some(b)) => Some(a.into_iter().filter(|k| b.contains(k)).collect()),
-            (Some(a), None) | (None, Some(a)) => Some(a),
+            (Some((mut a, exact_a)), Some((b, exact_b))) => {
+                a.and_with(&b);
+                Some((a, exact_a && exact_b))
+            }
+            (Some((a, _)), None) | (None, Some((a, _))) => Some((a, false)),
             (None, None) => None,
         },
         Filter::Or(l, r) => match (candidates(l, def), candidates(r, def)) {
-            (Some(mut a), Some(b)) => {
-                a.extend(b);
-                Some(a)
+            (Some((mut a, exact_a)), Some((b, exact_b))) => {
+                a.or_with(&b);
+                Some((a, exact_a && exact_b))
             }
             _ => None,
         },
@@ -826,8 +911,9 @@ fn candidates(filter: &Filter, def: &IndexDef) -> Option<AHashSet<String>> {
 // An index with a TAG or NUMERIC field keeps postings for them (see
 // `vector::postings`). A filter made of TAG and NUMERIC clauses, `AND`, `OR`,
 // `NOT`, `*` and `~`, is then a set of document ids read off them, exactly
-// the documents the filter matches: nothing is read to find them. A TEXT
-// clause narrows the set to the documents its words are in, and the set is
+// the documents the filter matches: nothing is read to find them. So is a
+// TEXT word, stem or pattern, read off the TEXT index (`vector::text`); a
+// phrase narrows the set to the documents its words are in, and the set is
 // then one to try the filter on. A clause the postings know nothing of
 // (a fuzzy word, a vector range) leaves the documents the rest allows, if
 // the rest allows fewer than all: those are tried. Only a filter that
@@ -866,15 +952,8 @@ fn resolve(filter: &Filter, def: &IndexDef, p: &Postings) -> Cand {
         } => known(p.range(field, *lo, *lo_exclusive, *hi, *hi_exclusive)),
         Filter::NumericNot { field, value } => known(p.not_equal(field, *value)),
         Filter::Text { .. } | Filter::Phrase { .. } => match candidates(filter, def) {
-            Some(keys) => {
-                let mut ids = Bits::new();
-                for key in &keys {
-                    if let Some(id) = p.id(key) {
-                        ids.set(id);
-                    }
-                }
-                Cand::Superset(ids)
-            }
+            Some((ids, true)) => Cand::Exact(ids),
+            Some((ids, false)) => Cand::Superset(ids),
             None => Cand::Unknown,
         },
         Filter::VectorRange { .. } => Cand::Unknown,
@@ -918,6 +997,10 @@ pub(crate) struct Plan {
     pub ids: Bits,
     /// They are exactly the matches; otherwise each is to be tried.
     pub exact: bool,
+    /// Some documents of the index have fields with a time to live: what
+    /// their postings hold may be behind them (whether they match was tried
+    /// on them).
+    pub volatile: bool,
 }
 
 /// The documents of `def` that `filter` may match, among `only` if given,
@@ -969,6 +1052,7 @@ pub(crate) fn plan(
         (ids, exact, volatile)
     };
     let store = &ctx.store[db];
+    let any_volatile = !volatile.is_empty();
     for (key, id) in volatile {
         if exact {
             let matches = with_doc(store, def, &key, |fields, _| filter::eval(filter, fields));
@@ -981,66 +1065,28 @@ pub(crate) fn plan(
             ids.set(id);
         }
     }
-    Some(Plan { ids, exact })
+    Some(Plan {
+        ids,
+        exact,
+        volatile: any_volatile,
+    })
 }
 
 /// The keys of the documents `ids` names, in id order.
 pub(crate) fn keys_of(def: &IndexDef, ids: &Bits) -> Vec<Arc<str>> {
-    let p = def.postings.read();
+    let p = def.postings.peek();
     ids.iter().filter_map(|id| p.key(id).cloned()).collect()
 }
 
-/// BM25 relevance of one document for the query's words.
-///
-///   score(d, Q) = Σ_t  IDF(t) · tf_norm(t, d) · weight(field)
-///
-///   IDF(t)       = ln((N - df(t) + 0.5) / (df(t) + 0.5) + 1)
-///   tf_norm(t,d) = tf · (k1 + 1) / (tf + k1 · (1 - b + b · dl/avgdl))
-pub(crate) fn relevance(def: &IndexDef, fields: &Fields, terms: &AHashSet<String>) -> f64 {
-    const K1: f64 = 1.2;
-    const B: f64 = 0.75;
-    if terms.is_empty() {
-        return 1.0;
-    }
-    use std::sync::atomic::Ordering::Relaxed;
-    let n = def.doc_count.load(Relaxed).max(1) as f64;
-    let avgdl = (def.total_tokens.load(Relaxed) as f64 / n).max(1.0);
-    let df_map = def.doc_freq.read();
-
-    let mut score = 0.0f64;
-    for field in &def.fields {
-        if !matches!(field.field_type, FieldType::Text) || field.options.noindex {
-            continue;
-        }
-        let Some(value) = fields
-            .get(&field.name)
-            .and_then(|b| std::str::from_utf8(b).ok())
-        else {
-            continue;
-        };
-        let mut tf: AHashMap<&str, usize> = AHashMap::new();
-        let mut dl = 0usize;
-        for token in crate::vector::tokenize_for_vocab(value) {
-            if def.is_stopword(&token) {
-                continue;
-            }
-            dl += 1;
-            if let Some(term) = terms.get(&token) {
-                *tf.entry(term.as_str()).or_insert(0) += 1;
-            }
-        }
-        if dl == 0 {
-            continue;
-        }
-        for (term, count) in tf {
-            let df = df_map.get(term).copied().unwrap_or(1) as f64;
-            let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
-            let count = count as f64;
-            let tf_norm = (count * (K1 + 1.0)) / (count + K1 * (1.0 - B + B * dl as f64 / avgdl));
-            score += idf * tf_norm * field.options.weight;
-        }
-    }
-    score.max(0.001)
+/// Relevance of the document at `key`, whose fields are `fields`, for the
+/// query `scoring` was made for: as Redis 8 scores it (see `vector::score`).
+pub(crate) fn relevance(
+    def: &IndexDef,
+    key: &str,
+    fields: &Fields,
+    scoring: &crate::vector::score::Scoring,
+) -> f64 {
+    scoring.score(def, key, fields)
 }
 
 /// Every document of the index that the filter accepts. In no particular
@@ -1052,14 +1098,26 @@ pub(crate) fn filter_search(
     only: Option<&AHashSet<String>>,
     deadline: Option<Instant>,
 ) -> FilterHits {
-    let mut terms = AHashSet::new();
-    query_terms(filter, &mut terms);
+    let scorer = crate::vector::score::Scorer::default_scorer();
+    filter_search_scored(ctx, def, filter, only, deadline, scorer)
+}
+
+/// [`filter_search`], scored by `scorer` (`SCORER`).
+pub(crate) fn filter_search_scored(
+    ctx: &Ctx,
+    def: &IndexDef,
+    filter: &Filter,
+    only: Option<&AHashSet<String>>,
+    deadline: Option<Instant>,
+    scorer: crate::vector::score::Scorer,
+) -> FilterHits {
+    let scoring = crate::vector::score::Scoring::new(def, filter, scorer);
     let range = filter.vector_range();
     let mut out: Vec<Match> = Vec::new();
     let timed_out = filter_each(ctx, def, filter, only, deadline, |key, fields| {
         out.push(Match {
             key: key.to_string(),
-            score: relevance(def, fields, &terms),
+            score: relevance(def, key, fields, &scoring),
             distance: range.and_then(|clause| filter::range_distance(clause, fields)),
         });
     });
@@ -1108,16 +1166,35 @@ pub(crate) fn filter_each(
     };
 
     // The keys to look at, if they are known without reading everything: the
-    // ones the caller named, or the ones the inverted index names.
-    let known: Option<AHashSet<String>> = match (only, candidates(filter, def)) {
-        (Some(only), Some(found)) => Some(found.into_iter().filter(|k| only.contains(k)).collect()),
-        (Some(only), None) => Some(only.clone()),
-        (None, found) => found,
+    // ones the caller named, or the ones the TEXT index names. Those are the
+    // matches if the TEXT index says so, and it is of this database.
+    let found = {
+        // Every write queued so far applied (the TEXT index's part too: see
+        // `postings::WithId`), and no id given back while the TEXT index's
+        // are turned into keys. The postings, then the TEXT index.
+        let p = def.postings.read();
+        candidates(filter, def).map(|(ids, exact)| {
+            let keys: Vec<Arc<str>> = ids.iter().filter_map(|id| p.key(id).cloned()).collect();
+            (keys, exact && def.db_index == *ctx.selected_db)
+        })
+    };
+    let (known, exact): (Option<Vec<Arc<str>>>, bool) = match (only, found) {
+        (Some(only), Some((found, exact))) => (
+            Some(found.into_iter().filter(|k| only.contains(&**k)).collect()),
+            exact,
+        ),
+        (Some(only), None) => (
+            Some(only.iter().map(|k| Arc::from(k.as_str())).collect()),
+            false,
+        ),
+        (None, Some((found, exact))) => (Some(found), exact),
+        (None, None) => (None, false),
     };
     match known {
         Some(keys) => {
             let mut seen = 0u32;
             for key in &keys {
+                let key: &str = key;
                 if deadline_due(deadline, &mut seen) {
                     timed_out = true;
                     break;
@@ -1125,7 +1202,11 @@ pub(crate) fn filter_each(
                 if !covers(def, key) {
                     continue;
                 }
-                with_doc(db, def, key, |fields, _| consider(key, fields));
+                with_doc(db, def, key, |fields, _| {
+                    if exact || filter::eval(filter, fields) {
+                        accept(key, fields);
+                    }
+                });
             }
         }
         None => {
@@ -1152,11 +1233,17 @@ pub(crate) fn with_doc<R>(
     key: &str,
     f: impl FnOnce(&Fields, Option<&serde_json::Value>) -> R,
 ) -> Option<R> {
-    // Out of the shard, so that its lock is not held while `f` runs.
-    let value = crate::store::get_shard(db, key)
-        .read()
-        .get(key)
-        .map(ValueRef::to_value)?;
+    // Out of the shard, so that its lock is not held while `f` runs. A key
+    // whose time to live has ended is no document, though nothing has
+    // deleted it yet.
+    let value = {
+        let map = crate::store::get_shard(db, key).read();
+        let (value, expires) = map.get_expiring(key)?;
+        if expires.is_some_and(crate::commands::helpers::is_past) {
+            return None;
+        }
+        value.to_value()
+    };
     match (&def.on, &value) {
         (IndexOn::Hash, KiviDBValue::Hash(hash)) => Some(f(&hash.read(), None)),
         (IndexOn::Hash, KiviDBValue::HashEx(hash)) => Some(f(&hash.read().fields, None)),
@@ -1169,6 +1256,364 @@ pub(crate) fn with_doc<R>(
         }
         _ => None,
     }
+}
+
+// ── The page, from postings ──────────────────────────────────────────────────
+//
+// A query whose matches the postings know exactly (`Plan::exact`), in an
+// order they know too, has its page picked from them: of the 250,000
+// documents a broad TAG filter matches, the ten on the page are read, not
+// the 250,000. How many match is the size of the set. What the reply shows
+// of a document (its fields, score, sort key) is read off the documents of
+// the page, as the full path reads it, so the reply is the full path's.
+//
+// The orders are the full path's:
+// * no SORTBY: by relevance, then by key. Without a query word to score,
+//   every match scores the same, so: by key.
+// * SORTBY a NUMERIC field: by its number (`f64::total_cmp`), then by key;
+//   the documents without a number last, by key, either way round.
+//
+// A key whose time to live has ended is no document, though nothing has
+// deleted it yet (`with_doc`): those are found in the keyspace's lists of
+// keys with a time to live, while the lists are no longer than the matches
+// are many. In a cluster, only the keys of the slots this node serves count.
+//
+// The full path answers instead whenever this cannot: text to score, a
+// vector clause, SORTBY another kind of field, a NUMERIC field holding NaN
+// (no place in the postings' order), field TTLs under a numeric order, more
+// keys with a time to live than matches, or a document of the page found
+// changed since the postings were read.
+
+/// A page of FT.SEARCH picked from postings, and how many documents match.
+struct Posted {
+    page: Vec<Hit>,
+    total: usize,
+    timed_out: bool,
+}
+
+/// What a page picked from postings is in the order of.
+#[derive(Clone, Copy)]
+enum PageOrder<'a> {
+    /// The key: what relevance comes down to when every match scores the same.
+    Key,
+    /// The number in the NUMERIC field read from `field`, then the key.
+    Number { field: &'a str, ascending: bool },
+}
+
+/// The deadline of a pick from postings: the clock read every
+/// [`DEADLINE_EVERY`] steps, and once past it, past it.
+struct Clock {
+    deadline: Option<Instant>,
+    seen: u32,
+    out: bool,
+}
+
+impl Clock {
+    fn new(deadline: Option<Instant>) -> Self {
+        Self {
+            deadline,
+            seen: 0,
+            out: false,
+        }
+    }
+
+    /// One more step: whether the deadline has passed.
+    #[inline]
+    fn ran_out(&mut self) -> bool {
+        if !self.out && deadline_due(self.deadline, &mut self.seen) {
+            self.out = true;
+        }
+        self.out
+    }
+}
+
+/// Whether every document `filter` matches has the same relevance, so that
+/// without SORTBY the order is the key's alone (the full path's tie-break).
+/// Scored as `vector::score` scores (Redis 8's way): a word by its
+/// frequency; a TAG value by how many documents hold it, against the
+/// document's TEXT length, and `*` against that length too; a NUMERIC
+/// clause and `NOT` the same for every document. In an index with no TEXT
+/// field every length is 0. TFIDF and BM25 (not BM25STD) divide by what
+/// differs from document to document.
+fn every_match_scores_the_same(
+    def: &IndexDef,
+    filter: &Filter,
+    scorer: crate::vector::score::Scorer,
+) -> bool {
+    use crate::vector::score::Scorer;
+    fn same(filter: &Filter, lengths: bool) -> bool {
+        match filter {
+            Filter::MatchNone
+            | Filter::Numeric { .. }
+            | Filter::NumericNot { .. }
+            | Filter::Not(_) => true,
+            Filter::MatchAll => !lengths,
+            Filter::Tag {
+                values, prefixes, ..
+            } => !lengths && values.len() == 1 && prefixes.is_empty(),
+            Filter::And(l, r) => same(l, lengths) && same(r, lengths),
+            _ => false,
+        }
+    }
+    let lengths = def.text_fields().next().is_some();
+    match scorer {
+        Scorer::DocScore | Scorer::Hamming => true,
+        Scorer::Tfidf | Scorer::TfidfDocNorm | Scorer::Bm25 if lengths => false,
+        _ => same(filter, lengths),
+    }
+}
+
+/// FT.SEARCH's page and count from postings, reading only the documents of
+/// the page: see above. `None` where the full path is to answer.
+fn page_from_postings(
+    ctx: &Ctx,
+    def: &IndexDef,
+    filter: &Filter,
+    args: &SearchArgs,
+    deadline: Option<Instant>,
+) -> Option<Posted> {
+    // A distance is no part of the postings.
+    if filter.vector_range().is_some() {
+        return None;
+    }
+    let scorer = args
+        .scorer
+        .unwrap_or_else(crate::vector::score::Scorer::default_scorer);
+    let (order, numeric) = match &args.sortby {
+        // Only the count (LIMIT 0 0): no order to keep.
+        None if args.count == 0 || every_match_scores_the_same(def, filter, scorer) => {
+            (PageOrder::Key, None)
+        }
+        None => return None,
+        Some((name, ascending)) => {
+            let field = def
+                .field_by_attribute(name)
+                .filter(|f| matches!(f.field_type, FieldType::Numeric))?;
+            let order = PageOrder::Number {
+                field: &field.name,
+                ascending: *ascending,
+            };
+            (order, Some(field.name.as_str()))
+        }
+    };
+    if def.postings.peek().read_all {
+        return None;
+    }
+    let plan = plan(ctx, def, filter, args.inkeys.as_ref())?;
+    // Exactly the matches. Ordered by a number, with the numbers the
+    // documents hold, which a field's time to live may have taken away.
+    if !plan.exact || (plan.volatile && numeric.is_some()) {
+        return None;
+    }
+    let mut ids = plan.ids;
+    let db = &ctx.store[*ctx.selected_db];
+
+    // Keys whose time to live has ended, which nothing has deleted yet.
+    let ttls: usize = db.iter().map(|shard| shard.ttl_count()).sum();
+    let mut expired: Vec<crate::store::Key> = Vec::new();
+    if ttls > 0 {
+        // Reading the documents costs less than going through the lists.
+        if ttls > ids.count() {
+            return None;
+        }
+        let now = crate::commands::helpers::now_ms();
+        for shard in db.iter() {
+            if !shard.holds_no_ttl() {
+                expired.extend(shard.read().due(now, usize::MAX).0);
+            }
+        }
+    }
+
+    // How many of the matches the page needs, in order.
+    let need = if args.count == 0 {
+        0
+    } else {
+        args.offset.saturating_add(args.count)
+    };
+    let (picked, total, timed_out) = {
+        // What was written since the plan is not among its ids.
+        let p = def.postings.peek();
+        // Documents that left the index since the plan was made.
+        ids.and_with(p.live());
+        for key in &expired {
+            if let Some(id) = p.id(key) {
+                ids.unset(id);
+            }
+        }
+        if ctx.cluster.enabled {
+            let slots = crate::cluster::search::served_slots(ctx.cluster);
+            let mut served = Bits::new();
+            for id in ids.iter() {
+                let slot = p.slot(id) as usize;
+                if slots[slot / 64] & (1 << (slot % 64)) != 0 {
+                    served.set(id);
+                }
+            }
+            ids = served;
+        }
+        let total = ids.count();
+        let need = need.min(total);
+        let mut clock = Clock::new(deadline);
+        let first: Vec<(u32, Option<f64>)> = match order {
+            PageOrder::Key => first_by_key(&p, &ids, need, total, &mut clock)
+                .into_iter()
+                .map(|id| (id, None))
+                .collect(),
+            PageOrder::Number { field, ascending } => {
+                first_by_number(&p, field, &ids, need, ascending, &mut clock)?
+            }
+        };
+        let picked: Vec<(Arc<str>, Option<f64>)> = first
+            .into_iter()
+            .skip(args.offset)
+            .filter_map(|(id, number)| Some((Arc::clone(p.key(id)?), number)))
+            .collect();
+        (picked, total, clock.out)
+    };
+
+    // The documents of the page. One that is gone, no longer matches, or
+    // holds another number than the postings had was written after they
+    // were read: then the full path answers. Scored as the full path scores
+    // (a TEXT query, its words read off the TEXT index, comes here too when
+    // sorted by a number).
+    let scoring = crate::vector::score::Scoring::new(def, filter, scorer);
+    let mut page = Vec::with_capacity(picked.len());
+    for (key, number) in picked {
+        let hit = with_doc(db, def, &key, |fields, _| {
+            if !filter::eval(filter, fields) {
+                return None;
+            }
+            let sort_key = match numeric {
+                Some(source) => {
+                    let found = sort_key_of(fields, source, true, false);
+                    let same = match (&found, number) {
+                        (Some(SortKey::Number(x)), Some(n)) => x.to_bits() == n.to_bits(),
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    if !same {
+                        return None;
+                    }
+                    found
+                }
+                None => None,
+            };
+            Some(Hit {
+                key: key.to_string(),
+                score: relevance(def, &key, fields, &scoring),
+                extras: Vec::new(),
+                sort_key,
+            })
+        })
+        .flatten()?;
+        page.push(hit);
+    }
+    Some(Posted {
+        page,
+        total,
+        timed_out,
+    })
+}
+
+/// The key of document `id`, from postings `p`.
+#[inline]
+fn key_of(p: &Postings, id: u32) -> &str {
+    p.key(id).map_or("", |key| &**key)
+}
+
+/// The first `need` of `ids` (`of` of them) in the order of their keys,
+/// from the postings' order of them (`Postings::first_by_key`). Cut short
+/// when `clock` runs out: then the first of those found.
+fn first_by_key(p: &Postings, ids: &Bits, need: usize, of: usize, clock: &mut Clock) -> Vec<u32> {
+    p.first_by_key(ids, need, of, &mut || clock.ran_out())
+}
+
+/// The first `need` of `ids` in the order SORTBY gives the NUMERIC field
+/// read from `field`: by the number (`f64::total_cmp`), ascending or not,
+/// then by key; those without a number last, by key. Each with its number.
+/// `None` if a document holds NaN, which has no place in the postings'
+/// order. Cut short when `clock` runs out.
+fn first_by_number(
+    p: &Postings,
+    field: &str,
+    ids: &Bits,
+    need: usize,
+    ascending: bool,
+    clock: &mut Clock,
+) -> Option<Vec<(u32, Option<f64>)>> {
+    let numbers = p.numbers(field)?;
+    if numbers.any_nan() {
+        return None;
+    }
+    let mut valued = ids.clone();
+    valued.and_with(numbers.has());
+    let with_number = valued.count();
+    let want = need.min(with_number);
+    let mut picked: Vec<(f64, u32)> = Vec::with_capacity(want);
+    if want > 0 {
+        let value = |id: u32| numbers.value(id).unwrap_or(0.0);
+        let cmp = |a: &(f64, u32), b: &(f64, u32)| {
+            let order = a.0.total_cmp(&b.0);
+            let order = if ascending { order } else { order.reverse() };
+            order.then_with(|| key_of(p, a.1).cmp(key_of(p, b.1)))
+        };
+        // Going through the numbers in order meets the `want` first after
+        // about want * ordered / with_number of them; taking the number of
+        // each, after with_number. Whichever is fewer.
+        let walked = want as u128 * numbers.ordered() as u128 / with_number as u128;
+        // Matches bunched up late in the numbers' order make the walk far
+        // longer than that: past four times as long, it gives up, and the
+        // number of each is taken instead.
+        let mut gave_up = false;
+        if walked < with_number as u128 {
+            let mut budget = (walked * 4).max(4096);
+            // Those equal to the last one wanted are taken too: their keys
+            // decide which of them are on the page.
+            let mut last: Option<u64> = None;
+            numbers.walk(ascending, |place, id| {
+                if clock.ran_out() || last.is_some_and(|last| last != place) {
+                    return false;
+                }
+                if budget == 0 {
+                    gave_up = true;
+                    return false;
+                }
+                budget -= 1;
+                if valued.get(id) {
+                    picked.push((value(id), id));
+                    if picked.len() == want {
+                        last = Some(place);
+                    }
+                }
+                true
+            });
+        }
+        if walked >= with_number as u128 || gave_up {
+            picked.clear();
+            for id in valued.iter() {
+                if clock.ran_out() {
+                    break;
+                }
+                picked.push((value(id), id));
+            }
+            if want < picked.len() {
+                picked.select_nth_unstable_by(want, cmp);
+                picked.truncate(want);
+            }
+        }
+        picked.sort_unstable_by(cmp);
+        picked.truncate(want);
+    }
+    let mut first: Vec<(u32, Option<f64>)> =
+        picked.into_iter().map(|(n, id)| (id, Some(n))).collect();
+    if need > with_number && !clock.out {
+        let mut rest = ids.clone();
+        rest.and_not(numbers.has());
+        let of = rest.count();
+        let more = first_by_key(p, &rest, need - with_number, of, clock);
+        first.extend(more.into_iter().map(|id| (id, None)));
+    }
+    Some(first)
 }
 
 // ── FT.SEARCH arguments ───────────────────────────────────────────────────────
@@ -1193,6 +1638,10 @@ struct SearchArgs {
     highlight: Option<(Vec<String>, String, String)>,
     /// Command `TIMEOUT` in milliseconds. `None` uses `FT.CONFIG TIMEOUT`.
     timeout_ms: Option<u64>,
+    /// `VERBATIM` and `LANGUAGE`: how the query's words are expanded.
+    query: filter::QueryOptions,
+    /// `SCORER`; `FT.CONFIG DEFAULT_SCORER` if not given.
+    scorer: Option<crate::vector::score::Scorer>,
 }
 
 fn parse_search_args(cmd: &[&[u8]], start: usize) -> Result<SearchArgs, String> {
@@ -1230,9 +1679,14 @@ fn parse_search_args(cmd: &[&[u8]], start: usize) -> Result<SearchArgs, String> 
                 args.withsortkeys = true;
                 i += 1;
             }
-            // How words are expanded, and how phrases are held together:
-            // none of it applies to an index without stemming or slop.
-            "VERBATIM" | "NOSTOPWORDS" | "INORDER" => i += 1,
+            // The query's words are looked for as they are, not also as
+            // their stems.
+            "VERBATIM" => {
+                args.query.verbatim = true;
+                i += 1;
+            }
+            // How phrases are held together: not applied here.
+            "NOSTOPWORDS" | "INORDER" => i += 1,
             "TIMEOUT" => {
                 let raw = arg(i + 1, "TIMEOUT")?;
                 args.timeout_ms = Some(raw.parse::<u64>().map_err(|_| {
@@ -1240,13 +1694,24 @@ fn parse_search_args(cmd: &[&[u8]], start: usize) -> Result<SearchArgs, String> 
                 })?);
                 i += 2;
             }
-            "SLOP" | "LANGUAGE" | "EXPANDER" | "PAYLOAD" => {
+            "LANGUAGE" => {
+                let name = arg(i + 1, "LANGUAGE")?;
+                args.query.language = Some(
+                    crate::vector::stem::Language::parse(name)
+                        .ok_or_else(|| "No such language".to_string())?,
+                );
+                i += 2;
+            }
+            "SLOP" | "EXPANDER" | "PAYLOAD" => {
                 arg(i + 1, &word)?;
                 i += 2;
             }
-            // One ranking function is implemented: BM25.
             "SCORER" => {
-                arg(i + 1, "SCORER")?;
+                let name = arg(i + 1, "SCORER")?;
+                args.scorer = Some(
+                    crate::vector::score::Scorer::parse(name)
+                        .ok_or_else(|| format!("No such scorer {name}"))?,
+                );
                 i += 2;
             }
             "DIALECT" => {
@@ -1420,6 +1885,19 @@ enum SortKey {
 }
 
 /// A float as Redis prints one: the shortest text that reads back the same.
+/// What SORTBY orders a document by: its field `source`, a number if the
+/// field is NUMERIC, folded to lower case unless the field is UNF.
+fn sort_key_of(fields: &Fields, source: &str, numeric: bool, unf: bool) -> Option<SortKey> {
+    let raw = std::str::from_utf8(fields.get(source)?).ok()?;
+    if numeric {
+        raw.trim().parse::<f64>().ok().map(SortKey::Number)
+    } else if unf {
+        Some(SortKey::Text(raw.to_string()))
+    } else {
+        Some(SortKey::Text(raw.to_lowercase()))
+    }
+}
+
 pub(crate) fn number_text(value: f64) -> String {
     if value == value.trunc() && value.abs() < 1e15 {
         format!("{}", value as i64)
@@ -1437,15 +1915,30 @@ pub(crate) fn distance_text(distance: f32) -> String {
 }
 
 /// `text`, with each word that is one of `terms` wrapped in the two tags.
-fn highlight(value: &str, terms: &AHashSet<String>, open: &str, close: &str) -> String {
+fn highlight(
+    value: &str,
+    terms: &AHashSet<String>,
+    open: &str,
+    close: &str,
+    language: crate::vector::stem::Language,
+) -> String {
+    use crate::vector::stem;
     let mut out = String::with_capacity(value.len() + 16);
     let mut word = String::new();
+    // A word is marked if the query found it by its stem, too.
+    let stems = terms.iter().any(|t| stem::is_stem(t));
+    let found = |t: &str| {
+        terms.contains(t)
+            || (stems
+                && stem::index_stem(language, t)
+                    .is_some_and(|s| terms.contains(&format!("{}{s}", stem::STEM_PREFIX))))
+    };
     let flush = |word: &mut String, out: &mut String| {
         if word.is_empty() {
             return;
         }
         let token = crate::vector::tokenize_for_vocab(word).next();
-        if token.is_some_and(|t| terms.contains(&t)) {
+        if token.is_some_and(|t| found(&t)) {
             out.push_str(open);
             out.push_str(word);
             out.push_str(close);
@@ -1500,7 +1993,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
         .get(index_name)
         .cloned()
         .ok_or_else(|| no_such_index(index_name))?;
-    let query = filter::parse_query(query_text, &args.params, &def)?;
+    let query = filter::parse_query_with(query_text, &args.params, &def, args.query)?;
     // Ordered by distance rather than relevance.
     let by_distance =
         query.knn.is_some() || (query.filter.vector_range().is_some() && !query.filter.has_text());
@@ -1550,9 +2043,16 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
     let mut terms = AHashSet::new();
     query_terms(&filter, &mut terms);
 
-    // ── The matches, in the query's own order ────────────────────────────────
+    // ── The page, from postings, where they know it ─────────────────────────
+    let posted = match &query.knn {
+        Some(_) => None,
+        None => page_from_postings(ctx, &def, &filter, &args, deadline),
+    };
+
+    // ── Otherwise every match, in the query's own order ─────────────────────
     let mut timed_out = false;
     let mut hits: Vec<Hit> = match &query.knn {
+        _ if posted.is_some() => Vec::new(),
         Some(knn) => {
             let field = def
                 .fields
@@ -1627,7 +2127,11 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 _ => None,
             };
             let by_distance = filter.vector_range().is_some() && !filter.has_text();
-            let found = filter_search(ctx, &def, &filter, args.inkeys.as_ref(), deadline);
+            let scorer = args
+                .scorer
+                .unwrap_or_else(crate::vector::score::Scorer::default_scorer);
+            let found =
+                filter_search_scored(ctx, &def, &filter, args.inkeys.as_ref(), deadline, scorer);
             timed_out = found.timed_out;
             let mut matches = found.matches;
             // A sort cannot stop part-way. Past the deadline it is left
@@ -1673,7 +2177,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
     }
 
     // ── SORTBY ───────────────────────────────────────────────────────────────
-    if let Some((name, ascending)) = &args.sortby {
+    if let Some((name, ascending)) = args.sortby.as_ref().filter(|_| posted.is_none()) {
         let schema_field = def.field_by_attribute(name);
         let numeric = schema_field.is_some_and(|f| matches!(f.field_type, FieldType::Numeric));
         let unf = schema_field.is_some_and(|f| f.options.unf);
@@ -1693,14 +2197,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
             hit.sort_key = match hit.extras.iter().find(|(alias, _)| alias == name) {
                 Some((_, value)) => value.parse::<f64>().ok().map(SortKey::Number),
                 None => with_doc(db, &def, &hit.key, |fields, _| {
-                    let raw = std::str::from_utf8(fields.get(source)?).ok()?.to_string();
-                    if numeric {
-                        raw.trim().parse::<f64>().ok().map(SortKey::Number)
-                    } else if unf {
-                        Some(SortKey::Text(raw))
-                    } else {
-                        Some(SortKey::Text(raw.to_lowercase()))
-                    }
+                    sort_key_of(fields, source, numeric, unf)
                 })
                 .flatten(),
             };
@@ -1727,19 +2224,27 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
             });
         }
     }
+    // ── The page ─────────────────────────────────────────────────────────────
+    let (page, total) = match posted {
+        Some(posted) => {
+            timed_out = posted.timed_out;
+            (posted.page, posted.total)
+        }
+        None => {
+            let total = hits.len();
+            let page: Vec<Hit> = hits
+                .into_iter()
+                .skip(args.offset)
+                .take(args.count)
+                .collect();
+            (page, total)
+        }
+    };
     // A shard answers with what it found and whether it timed out; the
     // coordinator applies `ON_TIMEOUT`.
     if timed_out && !shard && on_timeout_fails() {
         return Err("Timeout limit was reached".into());
     }
-
-    // ── The page ─────────────────────────────────────────────────────────────
-    let total = hits.len();
-    let page: Vec<Hit> = hits
-        .into_iter()
-        .skip(args.offset)
-        .take(args.count)
-        .collect();
     let nocontent = args.nocontent || args.returns.as_ref().is_some_and(|r| r.is_empty());
 
     // The fields of one hit, as (name, value).
@@ -1755,7 +2260,9 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                         .iter()
                         .any(|name| field.is_some_and(|f| f.attribute() == name)));
             match std::str::from_utf8(value) {
-                Ok(value) if wanted => highlight(value, &terms, open, close).into_bytes(),
+                Ok(value) if wanted => {
+                    highlight(value, &terms, open, close, def.language.language).into_bytes()
+                }
                 _ => value.to_vec(),
             }
         };
@@ -2276,7 +2783,13 @@ mod tests {
     fn highlighting_marks_whole_words() {
         let terms: AHashSet<String> = ["fox".to_string(), "quick".to_string()].into();
         assert_eq!(
-            highlight("The Quick brown fox, foxes", &terms, "<b>", "</b>"),
+            highlight(
+                "The Quick brown fox, foxes",
+                &terms,
+                "<b>",
+                "</b>",
+                crate::vector::stem::Language::English
+            ),
             "The <b>Quick</b> brown <b>fox</b>, foxes"
         );
     }
@@ -2339,6 +2852,124 @@ mod tests {
                 .unwrap_err()
                 .contains("Unknown argument `BOGUS`")
         );
+    }
+
+    /// Postings of `count` documents `k0` …, their NUMERIC field `n` from
+    /// `values` in turn.
+    fn numbered(values: &[&str], count: usize) -> Postings {
+        let schema = vec![SchemaField {
+            name: "n".into(),
+            field_type: FieldType::Numeric,
+            options: FieldOptions::default(),
+        }];
+        let mut p = Postings::new(&schema);
+        for i in 0..count {
+            let value: Arc<[u8]> = Arc::from(values[i % values.len()].as_bytes());
+            p.write(&format!("k{i}"), &[("n".to_string(), value)], true);
+        }
+        // What the postings' thread does once there is enough of it.
+        while p.tidy_step() {}
+        p
+    }
+
+    /// `ids` in the full path's SORTBY order: every one sorted.
+    fn sorted_whole(p: &Postings, ids: &Bits, ascending: bool) -> Vec<u32> {
+        use std::cmp::Ordering;
+        let numbers = p.numbers("n").unwrap();
+        let mut all: Vec<u32> = ids.iter().collect();
+        all.sort_by(|&a, &b| {
+            let order = match (numbers.value(a), numbers.value(b)) {
+                (Some(x), Some(y)) if ascending => x.total_cmp(&y),
+                (Some(x), Some(y)) => y.total_cmp(&x),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            };
+            order.then_with(|| key_of(p, a).cmp(key_of(p, b)))
+        });
+        all
+    }
+
+    #[test]
+    fn a_page_from_postings_is_in_the_full_paths_order() {
+        // Ties, minus zero beside zero, infinities, and a value that is no
+        // number (last, either way round).
+        let p = numbered(
+            &["3", "-0", "0", "x", "-1.5", "3", "inf", "-inf", "0", "7"],
+            300,
+        );
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..40 {
+            // From all of them to a few: both ways through the numbers.
+            let keep = [100, 90, 50, 10, 2][round % 5];
+            let mut ids = Bits::new();
+            for id in p.live().iter() {
+                if next() % 100 < keep {
+                    ids.set(id);
+                }
+            }
+            let of = ids.count();
+            for ascending in [true, false] {
+                let whole = sorted_whole(&p, &ids, ascending);
+                let needs = [0, 1, 2, 5, 17, of / 2, of.saturating_sub(1), of];
+                for need in needs.into_iter().filter(|&need| need <= of) {
+                    let mut clock = Clock::new(None);
+                    let first: Vec<u32> =
+                        first_by_number(&p, "n", &ids, need, ascending, &mut clock)
+                            .unwrap()
+                            .into_iter()
+                            .map(|(id, _)| id)
+                            .collect();
+                    assert_eq!(
+                        first.as_slice(),
+                        &whole[..need],
+                        "round {round}, {need} of {of}, ascending {ascending}"
+                    );
+                    assert!(!clock.out);
+                }
+            }
+            let mut by_key: Vec<u32> = ids.iter().collect();
+            by_key.sort_by(|&a, &b| key_of(&p, a).cmp(key_of(&p, b)));
+            for need in [0, 1, 3, of / 5, of / 3, of]
+                .into_iter()
+                .filter(|&n| n <= of)
+            {
+                let first = first_by_key(&p, &ids, need, of, &mut Clock::new(None));
+                assert_eq!(first.as_slice(), &by_key[..need], "round {round}");
+            }
+        }
+        // A NaN anywhere in the field: no order from the postings.
+        let p = numbered(&["1", "nan"], 10);
+        assert!(first_by_number(&p, "n", p.live(), 3, true, &mut Clock::new(None)).is_none());
+    }
+
+    #[test]
+    fn a_page_from_postings_stops_at_the_deadline() {
+        let p = numbered(&["1", "2", "x"], 5000);
+        let Some(past) = Instant::now().checked_sub(Duration::from_secs(1)) else {
+            return;
+        };
+        // The clock is read after 1024 documents: the first of those.
+        let mut clock = Clock::new(Some(past));
+        let first = first_by_key(&p, p.live(), 3000, 5000, &mut clock);
+        assert!(clock.out);
+        assert!(first.len() < 3000, "{}", first.len());
+        let mut clock = Clock::new(Some(past));
+        let first = first_by_number(&p, "n", p.live(), 4000, true, &mut clock).unwrap();
+        assert!(clock.out);
+        assert!(first.len() < 4000, "{}", first.len());
+        // Without a deadline, whole: those with a number, then the others.
+        let mut clock = Clock::new(None);
+        let first = first_by_number(&p, "n", p.live(), 4000, true, &mut clock).unwrap();
+        assert_eq!(first.len(), 4000);
+        assert!(first[3333].1.is_some() && first[3334].1.is_none());
+        assert!(!clock.out);
     }
 
     #[test]
