@@ -131,8 +131,6 @@ A patch release of 1.1.0.
   In a cluster, a node still giving the old words is understood.
 <!-- 1.1.3: wording at publish -->
 
-### Fixed
-
 - **A cluster master back without its data no longer wipes its replica.**
   With no AOF, a shard master killed outright (no final snapshot) and back
   inside `cluster-node-timeout` kept its node id and slots from nodes.conf
