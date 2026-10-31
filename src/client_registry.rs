@@ -508,6 +508,10 @@ pub struct ClientInfo {
     /// A replica that said `REPLCONF capa dataset-digest`, and has not yet
     /// been offered the fingerprint: see `replication::digest`.
     pub replica_takes_digest: bool,
+    /// A replica that said `REPLCONF capa lost-data`: 1, or 2 once it has
+    /// been told `+LOSTDATA`; 0 if it did not. See
+    /// `ReplState::psync_offer`.
+    pub replica_lost_data: u8,
     /// Channels, patterns and shard channels this client is subscribed to.
     pub subscriptions: [usize; 3],
 }
@@ -550,6 +554,7 @@ impl ClientInfo {
             resp: 2,
             replica_listening_port: 0,
             replica_takes_digest: false,
+            replica_lost_data: 0,
             subscriptions: [0; 3],
         };
         (info, kill_rx)
@@ -780,6 +785,7 @@ impl ClientRegistryInner {
                 resp: c.resp,
                 replica_listening_port: c.replica_listening_port,
                 replica_takes_digest: c.replica_takes_digest,
+                replica_lost_data: c.replica_lost_data,
                 subscriptions: c.subscriptions,
             })
             .collect()
@@ -817,6 +823,7 @@ impl ClientRegistryInner {
             resp: c.resp,
             replica_listening_port: c.replica_listening_port,
             replica_takes_digest: c.replica_takes_digest,
+            replica_lost_data: c.replica_lost_data,
             subscriptions: c.subscriptions,
         })
     }

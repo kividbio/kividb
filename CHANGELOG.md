@@ -5,6 +5,37 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.3]
+
+A patch release of 1.1.0.
+
+### Fixed
+
+- **A cluster master back without its data no longer wipes its replica.**
+  With no AOF, a shard master killed outright (no final snapshot) and back
+  inside `cluster-node-timeout` kept its node id and slots from nodes.conf
+  and served them empty, so nobody failed it over. Its replica refused the
+  empty dataset only until clients had written a key to the master, and
+  then dropped every key it held and loaded those: in a test on 1.1.2, all
+  2,000 keys written before the kill and about 230 acknowledged after it.
+  Now a master that starts with neither an AOF nor a snapshot from a clean
+  shutdown, and has replicas, serves none of its slots (`CLUSTERDOWN`;
+  `cluster_state:fail`, and `master_lost_dataset:1` in `INFO replication`
+  on that node) and answers its replica's `PSYNC` with `+LOSTDATA`. A
+  replica holding the data takes over (an election, as `CLUSTER FAILOVER
+  FORCE`) and the old master follows it; a replica holding nothing says so,
+  and once every replica has, the master serves what it has (a whole
+  cluster restarted with no persistence: no failovers). The master serves
+  anyway once every replica has failed, or when none that knows `+LOSTDATA`
+  (1.1.2 and earlier) has asked within `max(30 s, 6 node timeouts)`. And a
+  replica no longer drops its dataset for the master it followed until a
+  moment ago (within `repl-timeout`) when that master is back under a
+  replication id that does not continue its stream and holds fewer than
+  `replica-full-sync-guard-ratio` percent (50 by default) of its keys,
+  whatever the guard's mode; it takes over instead. With the AOF on, or
+  after a clean stop (`SHUTDOWN`, SIGTERM: a marker, `dump.kdb.clean`, is
+  left beside the final snapshot), restarts go on as before.
+
 ## [1.1.2]
 
 A patch release of 1.1.0. It replaces 1.1.1, which was withdrawn.
