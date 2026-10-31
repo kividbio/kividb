@@ -72,6 +72,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   about 3 seconds a million documents rather than 1, while the replicas
   that each took as long again afterwards now keep up as it goes.
 
+- **Checkpoints run one at a time, and a crash during one loses nothing.**
+  Overlapping checkpoints (`BGREWRITEAOF`, `SAVE`, `BGSAVE`, the automatic
+  AOF rewrite, the snapshot at shutdown) and a crash while a checkpoint
+  turned the AOF over could lose acknowledged writes or bring back deleted
+  keys. Each `BGREWRITEAOF` started a checkpoint of its own beside any
+  already running: they shared a save number, the last to finish put its
+  snapshot in place even when it was the oldest (keys deleted by a
+  `FLUSHALL` in between came back, and what was written after it was
+  lost), and each removed `appendonly.aof.prev` while another still needed
+  it. A `BGREWRITEAOF` sent every few milliseconds had hundreds of them, and
+  threads, at once, holding writes back for seconds. And a crash after
+  `appendonly.aof` was moved aside and before the new log took its name
+  left no log, so the next start replayed nothing that was written since
+  the last snapshot. Now a checkpoint has the persistence files to itself
+  from the choice of its save number until it has removed the old log;
+  `BGREWRITEAOF` asked for while one runs is served by exactly one more
+  after it, on the same thread; `SAVE` from a script while a checkpoint
+  runs answers that one is in progress rather than wait for it; the new log
+  is written before the old one is moved aside; and a start that finds
+  `appendonly.aof.prev` without a log beside it replays it.
+
 ## [1.2.0]
 
 See [docs/releases/v1.2.0.md](docs/releases/v1.2.0.md) for what to check before upgrading.
