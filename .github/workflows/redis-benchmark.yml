@@ -80,12 +80,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install redis-benchmark and redis-server
+      # Redis 8.10.2 from packages.redis.io, as vector-benchmark.yml does.
+      # Ubuntu's own redis-server is 7.0, which is not the Redis KiviDB is
+      # compared with anywhere else (it reports itself as 8.10). Pinned: do not
+      # float on whatever the repo's latest is on a given day.
+      - name: Install redis-benchmark and redis-server (Redis 8.10.2)
+        env:
+          REDIS_VERSION: "8.10.2"
         run: |
+          set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq redis-tools redis-server
+          sudo apt-get install -y -qq ca-certificates curl gnupg lsb-release
+          curl -fsSL https://packages.redis.io/gpg \
+            | sudo gpg --yes --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] \
+            https://packages.redis.io/deb $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/redis.list
+          sudo apt-get update -qq
+          deb=$(apt-cache madison redis-server | awk -v v="$REDIS_VERSION" '$3 ~ (":" v "-") {print $3; exit}')
+          if [[ -z "$deb" ]]; then
+            echo "::error::packages.redis.io has no redis-server $REDIS_VERSION for $(lsb_release -cs)" >&2
+            apt-cache madison redis-server >&2
+            exit 1
+          fi
+          sudo apt-get install -y -qq --allow-downgrades \
+            "redis=$deb" "redis-server=$deb" "redis-tools=$deb"
           redis-benchmark --version
           redis-server --version
+          redis-server --version | grep -q "v=$REDIS_VERSION " \
+            || { echo "::error::expected Redis $REDIS_VERSION" >&2; exit 1; }
           # Installing redis-server starts it as a service on the default port;
           # stop it so the benchmark controls its own instance on :7777 and
           # nothing else is competing for CPU during a run.
