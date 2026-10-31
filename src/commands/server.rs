@@ -3238,6 +3238,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let load = |v: &std::sync::atomic::AtomicU64| {
                         v.load(std::sync::atomic::Ordering::Relaxed)
                     };
+                    // KiviDB extension: a cluster master that came back
+                    // without its dataset, and serves none of its slots
+                    // until a replica takes over (`LostDataset`).
+                    if ctx.cluster.lost_dataset() {
+                        out.push_str("master_lost_dataset:1\r\n");
+                    }
                     out.push_str(&format!("master_replid:{repl_id}\r\n"));
                     out.push_str(&format!("master_repl_offset:{offset}\r\n"));
                     out.push_str(&format!(
@@ -4076,6 +4082,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 {
                     ctx.client_registry.update(ctx.client_id, |info| {
                         info.replica_takes_digest = true;
+                    });
+                }
+                if cmd[i].eq_ignore_ascii_case(b"capa")
+                    && cmd[i + 1].eq_ignore_ascii_case(b"lost-data")
+                {
+                    ctx.client_registry.update(ctx.client_id, |info| {
+                        info.replica_lost_data = 1;
                     });
                 }
                 i += 2;

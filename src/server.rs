@@ -1047,9 +1047,11 @@ where
             // ── Connection handoffs (break parse loop so `buffer` can be drained/moved) ──
             // A replica whose dataset may already be this master's is first
             // offered the fingerprint (see `replication::digest`), and the
-            // connection stays a client until it asks again.
+            // connection stays a client until it asks again; so is one of a
+            // master that lost its dataset (`ReplState::psync_offer`).
             if cmd_name == "PSYNC"
-                && let Some(offer) = repl_state.digest_offer(&client_registry, client_id, &cmd)
+                && let Some(offer) =
+                    repl_state.psync_offer(&cluster_state, &client_registry, client_id, &cmd)
             {
                 combined.extend_from_slice(&offer);
                 parse_offset += consumed;
