@@ -118,6 +118,24 @@ impl Conn {
             .unwrap_or_else(|e| panic!("{args:?} failed: {e}"))
     }
 
+    /// Send every command in one write, then read every reply.
+    fn pipeline(&mut self, commands: &[Vec<&str>]) -> Vec<Resp> {
+        let mut buf = Vec::new();
+        for args in commands {
+            buf.extend(format!("*{}\r\n", args.len()).into_bytes());
+            for a in args {
+                buf.extend(format!("${}\r\n", a.len()).as_bytes());
+                buf.extend(a.as_bytes());
+                buf.extend(b"\r\n");
+            }
+        }
+        self.stream.write_all(&buf).unwrap();
+        commands
+            .iter()
+            .map(|_| self.read().unwrap_or_else(|e| panic!("pipeline: {e}")))
+            .collect()
+    }
+
     fn read(&mut self) -> std::io::Result<Resp> {
         let mut line = String::new();
         if self.reader.read_line(&mut line)? == 0 {
@@ -1008,6 +1026,50 @@ fn index_definitions_reach_every_master() {
             .iter()
             .all(|i| i.text() != "docs")
     }));
+}
+
+/// `FT.DROPINDEX … DD` run on one master deletes the documents every
+/// master holds, and only those. Asked again, of an index every master has
+/// dropped, a node answers as Redis 8 does, and the others' same answer is
+/// not taken for a failure to apply it.
+#[test]
+fn dropindex_dd_deletes_the_documents_on_every_master() {
+    let (nodes, ranges) = form_cluster(3);
+    let r = nodes[0].conn().cmd(&[
+        "FT.CREATE",
+        "dd",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "dd:",
+        "SCHEMA",
+        "title",
+        "TEXT",
+    ]);
+    assert!(r.is_ok(), "{r:?}");
+    let mut keys = Vec::new();
+    for (node, range) in nodes.iter().zip(&ranges) {
+        let doc = key_in(range.0..=range.1, "dd");
+        let kept = key_in(range.0..=range.1, "kept");
+        assert_eq!(node.conn().cmd(&["HSET", &doc, "title", "hi"]).int(), 1);
+        assert_eq!(node.conn().cmd(&["HSET", &kept, "title", "hi"]).int(), 1);
+        keys.push((doc, kept));
+    }
+
+    let r = nodes[1].conn().cmd(&["FT.DROPINDEX", "dd", "DD"]);
+    assert!(r.is_ok(), "{r:?}");
+    for (node, (doc, kept)) in nodes.iter().zip(&keys) {
+        assert_eq!(node.conn().cmd(&["EXISTS", doc]).int(), 0, "{doc}");
+        assert_eq!(node.conn().cmd(&["EXISTS", kept]).int(), 1, "{kept}");
+    }
+
+    let r = nodes[2].conn().cmd(&["FT.DROPINDEX", "dd"]);
+    assert_eq!(
+        r.err(),
+        Some("SEARCH_INDEX_NOT_FOUND Index not found: dd"),
+        "{r:?}"
+    );
 }
 
 // ── Failover ──────────────────────────────────────────────────────────────────
@@ -2597,4 +2659,444 @@ fn nodes_talk_to_each_other_as_masteruser_with_default_limited() {
     );
     let found = admin(&nodes[3]).cmd(&["FT.SEARCH", "docs", "hello", "NOCONTENT"]);
     assert_eq!(found.array()[0].int(), 3, "{found:?}");
+}
+
+// ── A master back without its data ───────────────────────────────────────────
+
+/// `masters` masters sharing the slots, each with one replica, every node
+/// started with `extra`. Returns the masters, their replicas (in the same
+/// order) and each master's inclusive slot range.
+fn form_with_replicas(masters: usize, extra: &[&str]) -> (Vec<Node>, Vec<Node>, Vec<(u16, u16)>) {
+    let nodes: Vec<Node> = (0..masters).map(|_| Node::start(extra)).collect();
+    let per = 16384 / masters;
+    let mut ranges = Vec::new();
+    for (i, node) in nodes.iter().enumerate() {
+        let start = (i * per) as u16;
+        let end = if i == masters - 1 {
+            16383
+        } else {
+            ((i + 1) * per - 1) as u16
+        };
+        let r = node.conn().cmd(&[
+            "CLUSTER",
+            "ADDSLOTSRANGE",
+            &start.to_string(),
+            &end.to_string(),
+        ]);
+        assert!(r.is_ok(), "ADDSLOTSRANGE: {r:?}");
+        ranges.push((start, end));
+    }
+    for node in &nodes[1..] {
+        let r = nodes[0]
+            .conn()
+            .cmd(&["CLUSTER", "MEET", "127.0.0.1", &node.port.to_string()]);
+        assert!(r.is_ok(), "MEET: {r:?}");
+    }
+    wait_cluster_ok(&nodes.iter().collect::<Vec<_>>(), masters);
+    let mut replicas = Vec::new();
+    for master in &nodes {
+        let replica = Node::start(extra);
+        let r = nodes[0]
+            .conn()
+            .cmd(&["CLUSTER", "MEET", "127.0.0.1", &replica.port.to_string()]);
+        assert!(r.is_ok(), "MEET: {r:?}");
+        let master_id = master.id();
+        wait_until(
+            "replica to learn of its master",
+            Duration::from_secs(15),
+            || {
+                replica
+                    .conn()
+                    .cmd(&["CLUSTER", "NODES"])
+                    .text()
+                    .lines()
+                    .any(|l| l.starts_with(&master_id))
+            },
+        );
+        let r = replica.conn().cmd(&["CLUSTER", "REPLICATE", &master_id]);
+        assert!(r.is_ok(), "REPLICATE: {r:?}");
+        wait_until("replica to sync", Duration::from_secs(20), || {
+            replica.repl_info("master_link_status").as_deref() == Some("up")
+        });
+        replicas.push(replica);
+    }
+    let all: Vec<&Node> = nodes.iter().chain(replicas.iter()).collect();
+    wait_cluster_ok(&all, 2 * masters);
+    (nodes, replicas, ranges)
+}
+
+/// The port in a `MOVED <slot> <host>:<port>` error.
+fn moved_port(error: &str) -> Option<u16> {
+    error
+        .strip_prefix("MOVED ")?
+        .rsplit(':')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// The port of the master serving `key`, asked of each of `ports` in turn
+/// and following a redirect; `None` while no node will say.
+fn serving_port(ports: &[u16], key: &str) -> Option<u16> {
+    for &port in ports {
+        let Some(mut c) = Conn::try_connect(port) else {
+            continue;
+        };
+        match c.try_cmd(&["GET", key]) {
+            Ok(Resp::Error(e)) => {
+                if let Some(p) = moved_port(&e) {
+                    return Some(p);
+                }
+            }
+            Ok(_) => return Some(port),
+            Err(_) => {}
+        }
+    }
+    None
+}
+
+/// The keys of `keys` (all of one slot) that the master serving them does
+/// not hold with the value `v`.
+fn missing_keys(ports: &[u16], keys: &[String]) -> Vec<String> {
+    let Some(first) = keys.first() else {
+        return Vec::new();
+    };
+    let port = serving_port(ports, first).expect("a master serving the slot");
+    let mut c = Conn::connect(port);
+    let mut missing = Vec::new();
+    for chunk in keys.chunks(500) {
+        let gets: Vec<Vec<&str>> = chunk.iter().map(|k| vec!["GET", k.as_str()]).collect();
+        for (k, r) in chunk.iter().zip(c.pipeline(&gets)) {
+            if r != Resp::Bulk(b"v".to_vec()) {
+                missing.push(k.clone());
+            }
+        }
+    }
+    missing
+}
+
+/// A writer that sets keys `{tag}:w0`, `{tag}:w1`, ... until `stop`, going
+/// wherever it is redirected, round the nodes of `ports` when one does not
+/// answer, and returns the keys whose `SET` was acknowledged. While `hold`
+/// is set it sends nothing, and says so in `held` once its last write is
+/// answered.
+fn acknowledged_writer(
+    stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    hold: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    held: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ports: Vec<u16>,
+    tag: &str,
+) -> std::thread::JoinHandle<Vec<String>> {
+    let stop = std::sync::Arc::clone(stop);
+    let hold = std::sync::Arc::clone(hold);
+    let held = std::sync::Arc::clone(held);
+    let tag = tag.to_string();
+    std::thread::spawn(move || {
+        let mut acked = Vec::new();
+        let mut i = 0u64;
+        let mut at = 0usize;
+        let mut port = ports[0];
+        let mut conn: Option<Conn> = None;
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            if hold.load(std::sync::atomic::Ordering::SeqCst) {
+                held.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            held.store(false, std::sync::atomic::Ordering::SeqCst);
+            if conn.is_none() {
+                conn = Conn::try_connect(port);
+                if let Some(c) = &conn {
+                    let _ = c.stream.set_read_timeout(Some(Duration::from_secs(2)));
+                } else {
+                    at = (at + 1) % ports.len();
+                    port = ports[at];
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+            }
+            let key = format!("{{{tag}}}:w{i}");
+            i += 1;
+            match conn.as_mut().map(|c| c.try_cmd(&["SET", &key, "v"])) {
+                Some(Ok(r)) if r.is_ok() => acked.push(key),
+                Some(Ok(Resp::Error(e))) => {
+                    if let Some(p) = moved_port(&e) {
+                        port = p;
+                        conn = None;
+                    } else {
+                        // CLUSTERDOWN, TRYAGAIN: not acknowledged; again
+                        // in a moment.
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+                _ => {
+                    conn = None;
+                    at = (at + 1) % ports.len();
+                    port = ports[at];
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        acked
+    })
+}
+
+/// The AKS run's B2: a shard master with no persistence is killed outright
+/// and is back, empty, well inside the node timeout, with its node id and
+/// slots from nodes.conf, so nobody fails it over. Its replica holds the
+/// shard's only copy. It used to refuse the empty master's dataset only
+/// while the master had no keys at all; once clients had written a few, the
+/// next attempt (10 s later) dropped every key it held and loaded those.
+/// Now the master knows it came back without its dataset: it serves nothing
+/// and its replica takes over. Every write acknowledged before the kill, or
+/// after it by whichever node then served the slot, is there at the end.
+#[test]
+fn a_master_back_empty_inside_the_node_timeout_loses_no_acknowledged_write() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (mut masters, replicas, ranges) = form_with_replicas(3, &[]);
+    let tag = key_in(ranges[0].0..=ranges[0].1, "lost");
+    let before: Vec<String> = (0..2000).map(|i| format!("{{{tag}}}:b{i}")).collect();
+    {
+        let mut c = masters[0].conn();
+        for chunk in before.chunks(500) {
+            let sets: Vec<Vec<&str>> = chunk.iter().map(|k| vec!["SET", k.as_str(), "v"]).collect();
+            assert!(c.pipeline(&sets).iter().all(Resp::is_ok));
+        }
+        assert_eq!(c.cmd(&["WAIT", "1", "5000"]).int(), 1);
+    }
+    let ports: Vec<u16> = masters
+        .iter()
+        .chain(replicas.iter())
+        .map(|n| n.port)
+        .collect();
+    let stop = Arc::new(AtomicBool::new(false));
+    let hold = Arc::new(AtomicBool::new(false));
+    let held = Arc::new(AtomicBool::new(false));
+    let writer = acknowledged_writer(&stop, &hold, &held, ports.clone(), &tag);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Replication is asynchronous: a write the master answered in the
+    // moment before the kill may not have left it, and is lost by any
+    // master killed outright, Redis's too. That is not what this test is
+    // about, so the writer is held and the replica let catch up first.
+    hold.store(true, Ordering::SeqCst);
+    wait_until("the writer to hold", Duration::from_secs(10), || {
+        held.load(Ordering::SeqCst)
+    });
+    wait_until(
+        "the replica to have every acknowledged write",
+        Duration::from_secs(30),
+        || {
+            let offset = |port: u16, field: &str| {
+                Conn::try_connect(port)
+                    .and_then(|mut c| c.try_cmd(&["INFO", "replication"]).ok())
+                    .and_then(|i| info_field(&i.text(), field))
+            };
+            let sent = offset(masters[0].port, "master_repl_offset");
+            sent.is_some() && sent == offset(replicas[0].port, "slave_repl_offset")
+        },
+    );
+
+    // Killed and back in well under the node timeout.
+    masters[0].kill();
+    masters[0].spawn();
+    hold.store(false, Ordering::SeqCst);
+
+    // Long enough for the old behaviour to show: the replica's second try,
+    // 10 s after it first refused, found keys on the master and gave in.
+    // Meanwhile: does the master ever list the replica as online while the
+    // replica says it is not in sync with it?
+    let mut contradictions = Vec::new();
+    let until = Instant::now() + Duration::from_secs(25);
+    while Instant::now() < until {
+        let replica_out = |r: &Node| {
+            Conn::try_connect(r.port)
+                .and_then(|mut c| c.try_cmd(&["INFO", "replication"]).ok())
+                .map(|i| i.text())
+                .is_some_and(|i| {
+                    info_field(&i, "role").as_deref() == Some("slave")
+                        && info_field(&i, "master_link_status").as_deref() == Some("down")
+                })
+        };
+        if replica_out(&replicas[0])
+            && let Some(info) = Conn::try_connect(masters[0].port)
+                .and_then(|mut c| c.try_cmd(&["INFO", "replication"]).ok())
+                .map(|i| i.text())
+            && info.contains("state=online")
+            && replica_out(&replicas[0])
+        {
+            contradictions.push(info);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    stop.store(true, Ordering::Relaxed);
+    let during = writer.join().unwrap();
+
+    wait_until(
+        "a master to serve the slot",
+        Duration::from_secs(30),
+        || serving_port(&ports, &before[0]).is_some(),
+    );
+    let lost_before = missing_keys(&ports, &before);
+    let lost_during = missing_keys(&ports, &during);
+    assert!(
+        lost_before.is_empty() && lost_during.is_empty(),
+        "{} of {} keys written before the kill and {} of {} acknowledged after it are gone \
+         (first: {:?}); the master listed a replica out of sync with it as online {} \
+         time(s){}.\nrestarted master:\n{}\nreplica:\n{}",
+        lost_before.len(),
+        before.len(),
+        lost_during.len(),
+        during.len(),
+        lost_before.first().or(lost_during.first()),
+        contradictions.len(),
+        contradictions
+            .first()
+            .map(|i| format!(":\n{i}"))
+            .unwrap_or_default(),
+        masters[0].log(),
+        replicas[0].log()
+    );
+    assert!(
+        contradictions.is_empty(),
+        "the master listed as online a replica that was not in sync with it:\n{}",
+        contradictions[0]
+    );
+    assert!(
+        !during.is_empty(),
+        "no write was acknowledged after the kill"
+    );
+    // The replica took over; the old master follows it.
+    wait_until(
+        "the old master to follow its replica",
+        Duration::from_secs(30),
+        || replicas[0].is_master() && !masters[0].is_master(),
+    );
+    let log = masters[0].log();
+    assert!(log.contains("came back without its dataset"), "{log}");
+}
+
+/// A whole cluster with no persistence killed outright and started again:
+/// every node is empty, so nobody holds anything to protect. Each master
+/// asks its replica, hears that it has nothing, and serves; nobody fails
+/// over.
+#[test]
+fn a_cluster_killed_whole_without_persistence_serves_again_without_failovers() {
+    let (mut masters, mut replicas, ranges) = form_with_replicas(3, &[]);
+    for node in masters.iter_mut().chain(replicas.iter_mut()) {
+        node.kill();
+    }
+    // The replicas first: they are the ones that could take over.
+    for node in replicas.iter_mut().chain(masters.iter_mut()) {
+        node.spawn();
+    }
+    let all: Vec<&Node> = masters.iter().chain(replicas.iter()).collect();
+    wait_cluster_ok(&all, 6);
+    for (master, range) in masters.iter().zip(&ranges) {
+        let key = key_in(range.0..=range.1, "cold");
+        let mut c = master.conn();
+        wait_until("the master to take writes", Duration::from_secs(20), || {
+            c.cmd(&["SET", &key, "v"]).is_ok()
+        });
+    }
+    for master in &masters {
+        assert!(master.is_master(), "{}", master.log());
+    }
+    for replica in &replicas {
+        assert!(!replica.is_master(), "{}", replica.log());
+        let log = replica.log();
+        assert!(!log.to_lowercase().contains("starting election"), "{log}");
+    }
+}
+
+/// A master back empty whose replica is gone too: there is nothing anyone
+/// could take over with. The master serves nothing at first, and its slots
+/// once the replica is seen to be down.
+#[test]
+fn a_master_back_empty_without_its_replica_serves_once_the_replica_is_down() {
+    let (mut masters, mut replicas, ranges) = form_with_replicas(3, &[]);
+    let key = key_in(ranges[0].0..=ranges[0].1, "alone");
+    replicas[0].kill();
+    masters[0].kill();
+    masters[0].spawn();
+    let first = masters[0].conn().cmd(&["SET", &key, "v"]);
+    assert!(
+        first.err().is_some_and(|e| e.starts_with("CLUSTERDOWN")),
+        "{first:?}"
+    );
+    wait_until("the master to serve again", Duration::from_secs(30), || {
+        masters[0].conn().cmd(&["SET", &key, "v"]).is_ok()
+    });
+    assert!(masters[0].is_master());
+    let log = masters[0].log();
+    assert!(log.contains("came back without its dataset"), "{log}");
+}
+
+/// With the AOF on, a master killed outright and back inside the node
+/// timeout carries on as before: it has its dataset, serves at once, and
+/// nobody takes over.
+#[test]
+fn a_master_restarted_with_its_aof_carries_on_as_before() {
+    let (mut masters, replicas, ranges) = form_with_replicas(3, &["--aof"]);
+    let tag = key_in(ranges[0].0..=ranges[0].1, "aof");
+    let keys: Vec<String> = (0..500).map(|i| format!("{{{tag}}}:k{i}")).collect();
+    {
+        let mut c = masters[0].conn();
+        let sets: Vec<Vec<&str>> = keys.iter().map(|k| vec!["SET", k.as_str(), "v"]).collect();
+        assert!(c.pipeline(&sets).iter().all(Resp::is_ok));
+        assert_eq!(c.cmd(&["WAIT", "1", "5000"]).int(), 1);
+    }
+    masters[0].kill();
+    masters[0].spawn();
+    let mut c = masters[0].conn();
+    assert_eq!(c.cmd(&["GET", &keys[0]]).text(), "v");
+    assert!(c.cmd(&["SET", &keys[0], "v"]).is_ok());
+    let ports: Vec<u16> = masters.iter().map(|n| n.port).collect();
+    assert!(missing_keys(&ports, &keys).is_empty());
+    wait_until(
+        "the replica to follow it again",
+        Duration::from_secs(30),
+        || replicas[0].repl_info("master_link_status").as_deref() == Some("up"),
+    );
+    assert!(masters[0].is_master() && !replicas[0].is_master());
+    let log = masters[0].log();
+    assert!(!log.contains("came back without its dataset"), "{log}");
+}
+
+/// A master stopped cleanly (SIGTERM, its final snapshot written) with no
+/// AOF has its whole dataset when it starts again: it is not taken for one
+/// that lost it.
+#[cfg(unix)]
+#[test]
+fn a_master_stopped_cleanly_without_an_aof_carries_on_as_before() {
+    let (mut masters, replicas, ranges) = form_with_replicas(3, &[]);
+    let tag = key_in(ranges[0].0..=ranges[0].1, "clean");
+    let keys: Vec<String> = (0..500).map(|i| format!("{{{tag}}}:k{i}")).collect();
+    {
+        let mut c = masters[0].conn();
+        let sets: Vec<Vec<&str>> = keys.iter().map(|k| vec!["SET", k.as_str(), "v"]).collect();
+        assert!(c.pipeline(&sets).iter().all(Resp::is_ok));
+        assert_eq!(c.cmd(&["WAIT", "1", "5000"]).int(), 1);
+    }
+    let mut child = masters[0].child.take().unwrap();
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+    }
+    let _ = child.wait();
+    masters[0].spawn();
+    let mut c = masters[0].conn();
+    assert_eq!(c.cmd(&["GET", &keys[0]]).text(), "v");
+    assert!(c.cmd(&["SET", &keys[0], "v"]).is_ok());
+    let ports: Vec<u16> = masters.iter().map(|n| n.port).collect();
+    assert!(missing_keys(&ports, &keys).is_empty());
+    wait_until(
+        "the replica to follow it again",
+        Duration::from_secs(30),
+        || replicas[0].repl_info("master_link_status").as_deref() == Some("up"),
+    );
+    assert!(masters[0].is_master() && !replicas[0].is_master());
+    let log = masters[0].log();
+    assert!(!log.contains("came back without its dataset"), "{log}");
 }

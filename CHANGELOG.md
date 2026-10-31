@@ -5,6 +5,185 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.3]
+
+A patch release of 1.1.0.
+<!-- 1.1.3: wording at publish -->
+
+**Upgrading replicas and clusters: upgrade the replicas first, then their
+master.** A 1.1.3 master that restarts with no data tells its replicas not
+to copy its empty dataset. A 1.1.2 replica does not understand that: once
+the master stops waiting, after 30 seconds, it syncs and drops its data, as
+1.1.2 did. With the replicas on 1.1.3 first, nothing is lost.
+
+### Changed
+
+- **`maxclients` is enforced.** `CONFIG SET` took it and `CONFIG GET` gave
+  it back, but nothing checked it, and a config file that set it did not
+  start (`unknown directive 'maxclients'`). Plaintext and TLS clients now
+  count against it, TLS ones from the start of their handshake; one more is
+  closed, a plaintext one after `ERR max number of clients reached`, as in
+  Redis. It is read from the config file, `INFO clients` gives the one in
+  effect, and lowering it leaves the clients already connected. The default
+  is 10000, as in Redis, within the open-file limit: at startup KiviDB
+  raises the soft limit (`ulimit -n`) to `maxclients` plus what the server
+  keeps for itself (32 files, or on io_uring 40 and 8 a worker) if the hard
+  limit allows, and lowers `maxclients` to fit if it does not, with a
+  warning. It does not start if not even one client fits. `CONFIG SET
+  maxclients` refuses a value the limit cannot hold, as Redis does.
+
+### Fixed
+
+<!-- 1.1.3: wording at publish -->
+- **A TLS client that does not finish its handshake no longer holds up the
+  others.** Handshakes ran one at a time in the TLS listener, so a client
+  that connected to `tls-port` and sent nothing kept every TLS client after
+  it waiting. Each handshake now runs in its connection's own task, and a
+  client that has not finished it within 10 seconds is disconnected, on both
+  I/O models. A failing accept on `tls-port` (out of file descriptors, most
+  often) is retried after 50 ms, rather than at once in a loop.
+
+- **A master drops a replica that has gone silent, after `repl-timeout`,
+  as Redis does.** A replica whose host went away without closing the
+  connection (a terminated VM, a lost network path, a paused container)
+  stayed in `INFO replication` as `state=online`, its lag growing, and was
+  counted in `connected_slaves` until the master restarted. Now a replica
+  that is online and sends no `REPLCONF ACK` for `repl-timeout` seconds (60
+  by default) is disconnected, with `Replication: disconnecting timedout
+  replica <ip>:<port>` in the log, on both I/O models and over plaintext
+  and TLS alike. A replica still loading the dataset sends no ACK and is
+  not timed out. `min-replicas-to-write` and `WAIT` were not misled: they
+  already went by each replica's last acknowledgement.
+
+- **After an AOF replay, each HNSW graph held one vector.** At startup from
+  an append-only file with no snapshot in it, the pass that rebuilds the
+  indexes skipped every vector after the first: it asked, for each
+  document, whether the graph had come with a snapshot, and after the first
+  insert the graph had vectors. An unfiltered KNN query then found one
+  document, and `FT.INFO` gave `hnsw_live_count` 1. The question is now
+  asked once per field, before the pass. The bug was there since 1.0.
+
+- **A write in one database no longer touches the indexes of another.**
+  An index belongs to the database it was created in, but a hash written or
+  deleted under the same key in any other database was applied to it: an
+  `HSET` there put its vector in the index in place of the index's own
+  document's, and added its words, and a `DEL` there took the index's
+  document out, so a KNN query no longer found it. Writes, deletions, expiry
+  and eviction now go to the indexes of their own database only.
+
+- **A key deleted on being found expired leaves the search indexes.** A
+  key read after its TTL ran out is deleted by that read, but it stayed in
+  the indexes that covered it, and a KNN query went on returning it until
+  something else deleted the key. Only a key the background expiry cycle
+  removed left them.
+
+- **`RENAME` and `RENAMENX` keep the search indexes up to date.** A
+  document renamed stayed in the indexes under its old name, and a KNN
+  query went on returning that name, while the new name was in no index.
+  Now the old name leaves the indexes and the new one is indexed whole, in
+  place of whatever the indexes held for it before, so that a document
+  renamed over another is found with its own vector and words.
+
+- **A write to a key whose time to live has passed starts a new key.** A
+  key past its time stays in memory until a read finds it or the
+  background expiry cycle comes to it, and a write that came first acted on
+  it as it was: `INCR` counted on from the old value, `RPUSH` pushed onto
+  the old list, and the key kept its old time to live, so the write was
+  deleted with the key moments after it had been acknowledged. A write now
+  finds such a key gone, as in Redis: it is expired first (counted in
+  `expired_keys`, announced as `expired`), and the write makes a new key,
+  with no time to live. `SORT ... STORE` from such a key deletes the
+  destination and returns 0, as from a missing key; it left the
+  destination as it was.
+
+- **Keys expire on replicas and in the AOF as they do on the master.** The
+  master logged and propagated nothing when a key expired, so a replica,
+  and the AOF replayed at a restart, expired keys by their own clocks: a
+  replica deleted keys while its master's writes to them were still on the
+  way, and diverged from it, and a restart after a key's time replayed a
+  write made while it lived onto a missing key, which then came back with
+  no time to live, for good. Now the master writes `UNLINK` (`DEL` with
+  `lazyfree-lazy-expire no`) to its AOF and replication stream for every
+  key it expires, whether a read, a write or the expiry cycle found it.
+  Nothing expires while the AOF or a snapshot is loaded or a master's
+  stream applied, and a replica deletes no expired key itself: its clients
+  see the key as gone until the master's `DEL` arrives, as in Redis.
+- **`FT.DROPINDEX index DD` deletes the documents, as in Redis.** `DD`
+  was ignored, and the documents of the index stayed: an application that
+  reset its search data this way (mem0's `Memory.reset()`, RedisVL's
+  `SearchIndex.delete()`) found its old documents still there. The keys the
+  index covered are now deleted, for HASH and JSON indexes alike, each with
+  a `del` keyspace event. Replicas and the AOF get `DEL`s of the documents
+  deleted and then the drop without `DD`, in Redis's order and as 1.2 sends
+  them, so a replica that got only part of it still has the index to run
+  `DD` again; a `DD` already in an AOF
+  written by an earlier 1.1, or sent by such a master, still keeps the
+  documents, as that server did. In a cluster every master deletes its own.
+  Anything else after the index name is now refused with `Unknown argument`.
+<!-- 1.1.3: wording at publish -->
+
+- **Search: a missing index is reported in Redis 8's words.** Every
+  command that names an index that does not exist (`FT.INFO`, `FT.SEARCH`,
+  `FT.AGGREGATE`, `FT.PROFILE`, `FT.EXPLAIN`, `FT.EXPLAINCLI`,
+  `FT.DROPINDEX`, `FT.ALTER`, `FT.ALIASADD`, `FT.ALIASUPDATE`,
+  `FT.ALIASLIST`, `FT.TAGVALS`, `FT.SPELLCHECK`, `FT.SYNUPDATE`,
+  `FT.SYNDUMP`, `FT.CURSOR`, `FT.HYBRID`) now replies
+  `SEARCH_INDEX_NOT_FOUND Index not found: <name>`, as Redis 8.10 does.
+  `FT.INFO`, `FT.SEARCH` and a few others replied `<name>: no such index`,
+  the rest `ERR no such index`. Clients that create the index when the
+  error says "not found" failed on a new database: mem0's Valkey store
+  could not start. This is a compatibility fix, but the text changes: a
+  client that looked for `no such index` must look for `Index not found`.
+  In a cluster, a node still giving the old words is understood.
+<!-- 1.1.3: wording at publish -->
+
+- **A cluster master back without its data no longer wipes its replica.**
+  With no AOF, a shard master killed outright (no final snapshot) and back
+  inside `cluster-node-timeout` kept its node id and slots from nodes.conf
+  and served them empty, so nobody failed it over. Its replica refused the
+  empty dataset only until clients had written a key to the master, and
+  then dropped every key it held and loaded those: in a test on 1.1.2, all
+  2,000 keys written before the kill and about 230 acknowledged after it.
+  Now a master that starts with neither an AOF nor a snapshot from a clean
+  shutdown, and has replicas, serves none of its slots (`CLUSTERDOWN`;
+  `cluster_state:fail`, and `master_lost_dataset:1` in `INFO replication`
+  on that node) and answers its replica's `PSYNC` with `+LOSTDATA`. A
+  replica holding the data takes over (an election, as `CLUSTER FAILOVER
+  FORCE`) and the old master follows it; a replica holding nothing says so,
+  and once every replica has, the master serves what it has (a whole
+  cluster restarted with no persistence: no failovers). The master serves
+  anyway once every replica has failed, or when none that knows `+LOSTDATA`
+  (1.1.2 and earlier) has asked within `max(30 s, 6 node timeouts)`. And a
+  replica no longer drops its dataset for the master it followed until a
+  moment ago (within `repl-timeout`) when that master is back under a
+  replication id that does not continue its stream and holds fewer than
+  `replica-full-sync-guard-ratio` percent (50 by default) of its keys,
+  whatever the guard's mode; it takes over instead. With the AOF on, or
+  after a clean stop (`SHUTDOWN`, SIGTERM: a marker, `dump.kdb.clean`, is
+  left beside the final snapshot), restarts go on as before.
+
+<!-- 1.1.3: wording at publish -->
+- **Checkpoints run one at a time, and a crash during one loses nothing.**
+  Overlapping checkpoints (`BGREWRITEAOF`, `SAVE`, `BGSAVE`, the automatic
+  AOF rewrite, the snapshot at shutdown) and a crash while a checkpoint
+  turned the AOF over could lose acknowledged writes or bring back deleted
+  keys. Each `BGREWRITEAOF` started a checkpoint of its own beside any
+  already running: they shared a save number, the last to finish put its
+  snapshot in place even when it was the oldest (keys deleted by a
+  `FLUSHALL` in between came back, and what was written after it was
+  lost), and each removed `appendonly.aof.prev` while another still needed
+  it. A `BGREWRITEAOF` sent every few milliseconds had hundreds of them, and
+  threads, at once, holding writes back for seconds. And a crash after
+  `appendonly.aof` was moved aside and before the new log took its name
+  left no log, so the next start replayed nothing that was written since
+  the last snapshot. Now a checkpoint has the persistence files to itself
+  from the choice of its save number until it has removed the old log;
+  `BGREWRITEAOF` asked for while one runs is served by exactly one more
+  after it, on the same thread; `SAVE` from a script while a checkpoint
+  runs answers that one is in progress rather than wait for it; the new log
+  is written before the old one is moved aside; and a start that finds
+  `appendonly.aof.prev` without a log beside it replays it.
+
 ## [1.1.2]
 
 A patch release of 1.1.0. It replaces 1.1.1, which was withdrawn.

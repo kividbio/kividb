@@ -1707,14 +1707,17 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
     }
 
     // A key whose expiry passed while the image sat on disk (or in transit to
-    // a replica) is gone, not "present without a TTL".
+    // a replica) is gone, not "present without a TTL". Unless it is loaded
+    // under an AOF, or by a replica (`expiry::held`): it is kept, with its
+    // time, for the `DEL` that says it went, as Redis keeps it.
     let now_ms = unix_ms_now();
+    let keep_past = crate::expiry::held();
     for (db, exp) in result.iter_mut().zip(expiries.iter_mut()) {
         exp.retain(|key, at_ms| {
             if !db.contains_key(key) {
                 return false;
             }
-            if *at_ms <= now_ms {
+            if *at_ms <= now_ms && !keep_past {
                 db.remove(key);
                 return false;
             }
@@ -2362,8 +2365,9 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
                 let expiry_ms = pending_expiry.take();
                 if let Some(val) = rdb_read_value(&mut r, type_id)? {
                     match expiry_ms {
-                        // Already past its expiry: dropped.
-                        Some(ms) if ms <= now_ms => {}
+                        // Already past its expiry: dropped. Not by a replica,
+                        // or under an AOF (see `read_image`).
+                        Some(ms) if ms <= now_ms && !crate::expiry::held() => {}
                         Some(ms) => {
                             expiries[current_db].insert(key.clone(), ms);
                             result[current_db].insert(key, val);

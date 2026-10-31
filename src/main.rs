@@ -21,6 +21,7 @@ pub mod command_gate;
 mod commands;
 mod config;
 pub mod eviction;
+pub mod expiry;
 pub mod field_expiry;
 pub mod keyspace_events;
 pub mod keyspec;
@@ -367,6 +368,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     );
 
+    // `maxclients` within the open-file limit. io_uring's workers hold open
+    // files of their own, kept from clients.
+    crate::client_registry::set_max_clients(config.maxclients);
+    #[cfg(target_os = "linux")]
+    let uring = match config.io_model {
+        IoModel::Uring => true,
+        IoModel::Tokio => false,
+        IoModel::Auto => is_uring_available(),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let uring = false;
+    if let Err(e) = crate::client_registry::fit_max_clients(if uring { threads } else { 0 }) {
+        log_fatal!("{e}");
+        std::process::exit(1);
+    }
+
     #[cfg(target_os = "linux")]
     match config.io_model {
         IoModel::Uring => {
@@ -378,7 +395,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             run_tokio(config, started_at)?;
         }
         IoModel::Auto => {
-            if is_uring_available() {
+            if uring {
                 log_info!("I/O model      : io_uring");
                 run_uring(config, started_at)?;
             } else {
@@ -672,12 +689,19 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
         rx.recv().unwrap()
     };
     crate::stats::spawn_instantaneous_ops_sampler();
+    // No key is swept until what it deletes can be logged: the dataset is
+    // loaded and the AOF's queue installed, further down. A `DEL` queued
+    // before that went nowhere, and the key's writes stayed in the AOF
+    // without it.
+    let starting = crate::expiry::loading_guard();
     crate::commands::helpers::spawn_active_expire_task(
         Arc::clone(&store),
         Arc::clone(&expiry_store),
         Arc::clone(&index_store),
         pubsub.clone(),
         Arc::clone(&latency),
+        &repl_state,
+        &hub_tx,
     );
     if config.cluster_enabled {
         log_info!(
@@ -712,6 +736,22 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
             &compaction_tx,
             &repl_state,
         );
+        // A cluster master killed with no AOF has only what it last saved,
+        // if anything: it serves none of its slots until its replica, which
+        // may hold the data, has taken over or said it holds nothing.
+        if config.cluster_enabled {
+            crate::replication::CLEAN_EXIT_MARKER.store(true, std::sync::atomic::Ordering::Relaxed);
+            let stopped_cleanly = crate::replication::take_clean_exit_marker();
+            let keys: usize = store
+                .iter()
+                .flat_map(|db| db.iter())
+                .map(|shard| crate::read_lock!(shard).len())
+                .sum();
+            cluster_state.check_dataset_at_start(
+                config.aof || stopped_cleanly || !config.preload_file.is_empty(),
+                keys,
+            );
+        }
         // A node that was a replica when it was last saved, and has loaded
         // exactly that save, can ask its master to continue from there.
         if loaded.exact_dump
@@ -846,6 +886,9 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                         &signal_snapshot_index_store,
                         &signal_repl_state,
                     );
+                    if result.is_ok() {
+                        crate::replication::note_clean_exit();
+                    }
                     if let Err(e) = result {
                         // Not a clean exit: whatever restarts this node
                         // should know its last writes are not on disk.
@@ -880,6 +923,8 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     // Reachable from the replication applier, which is built too deep to be
     // handed this channel directly. See `aof::install_global_aof_sender`.
     aof::install_global_aof_sender(Box::new(aof_tx.clone()));
+    // The keys active expiry deletes are logged from here on.
+    drop(starting);
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -955,7 +1000,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
             .map(|_| std::sync::atomic::AtomicUsize::new(0))
             .collect(),
     );
-    type Passed = (std::net::TcpStream, String);
+    type Passed = (std::net::TcpStream, String, crate::client_registry::Slot);
     let (inboxes, mut inbox_ends): (Vec<_>, Vec<_>) = (0..threads)
         .map(|_| {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Passed>();
@@ -1021,10 +1066,13 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                             }
                         }
                         let loads_of_clients = Arc::clone(&loads);
+                        let admitting = Arc::clone(&client_registry);
                         // Starts a client on this worker. Its place in the
                         // worker's count was taken by whoever chose the worker.
                         let start_client = std::rc::Rc::new(
-                            move |stream: tokio_uring::net::TcpStream, peer_addr_str: String| {
+                            move |stream: tokio_uring::net::TcpStream,
+                                  peer_addr_str: String,
+                                  slot: crate::client_registry::Slot| {
                             let store = Arc::clone(&store);
                             let expiry_store = Arc::clone(&expiry_store);
                             let lastsave = Arc::clone(&lastsave);
@@ -1052,6 +1100,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                             let counted = Counted(Arc::clone(&loads_of_clients), worker);
                             tokio_uring::spawn(async move {
                                 let _counted = counted;
+                                let _slot = slot;
                                 if let Err(e) = server_uring::handle_client(
                                     stream,
                                     store,
@@ -1096,10 +1145,11 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                             // What other workers pass to this one.
                             let start_client = std::rc::Rc::clone(&start_client);
                             tokio_uring::spawn(async move {
-                                while let Some((stream, peer_addr_str)) = inbox.recv().await {
+                                while let Some((stream, peer_addr_str, slot)) = inbox.recv().await {
                                     start_client(
                                         tokio_uring::net::TcpStream::from_std(stream),
                                         peer_addr_str,
+                                        slot,
                                     );
                                 }
                             });
@@ -1116,6 +1166,14 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                                     log_throttled!(10, crate::loglevel::WARN, "Accept error: {e} — if this is \"Too many open files\", raise the open-file limit (ulimit -n, or LimitNOFILE= under systemd)");
                                     continue;
                                 }
+                            };
+                            let Some(mut slot) = crate::client_registry::admit(&admitting) else {
+                                tokio_uring::spawn(async move {
+                                    let _ = stream
+                                        .write_all(crate::client_registry::TOO_MANY_CLIENTS.to_vec())
+                                        .await;
+                                });
+                                continue;
                             };
                             crate::stats::TOTAL_CONNECTIONS_RECEIVED
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1143,18 +1201,19 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                                     let passed = unsafe { std::net::TcpStream::from_raw_fd(copy) };
                                     loads[worker].fetch_sub(1, Ordering::Relaxed);
                                     loads[least].fetch_add(1, Ordering::Relaxed);
-                                    match inboxes[least].send((passed, peer_addr_str)) {
+                                    match inboxes[least].send((passed, peer_addr_str, slot)) {
                                         Ok(()) => continue,
-                                        Err(tokio::sync::mpsc::error::SendError((_, peer))) => {
+                                        Err(tokio::sync::mpsc::error::SendError((_, peer, back))) => {
                                             // That worker has gone: it stays here.
                                             loads[least].fetch_sub(1, Ordering::Relaxed);
                                             loads[worker].fetch_add(1, Ordering::Relaxed);
                                             peer_addr_str = peer;
+                                            slot = back;
                                         }
                                     }
                                 }
                             }
-                            start_client(stream, peer_addr_str);
+                            start_client(stream, peer_addr_str, slot);
                         }
                     });
                 }));
@@ -1267,24 +1326,18 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                             Ok(pair) => pair,
                             Err(e) => {
                                 log_warn!("TLS: accept error: {e}");
+                                // Out of file descriptors, it would otherwise spin.
+                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                                 continue;
                             }
                         };
 
-                        let tls_stream = match listen_acceptor.clone().accept(tcp_stream).await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                // Full `Debug` — rustls errors often have empty `Display`; memtier may log "(null)" for the same failure.
-                                log_verbose!("TLS: handshake failed from {peer_addr}: {e} ({e:?})");
-                                continue;
-                            }
+                        // The handshake is the connection's own task: one
+                        // client that never finishes it holds up no other.
+                        let Some(slot) = crate::client_registry::admit(&tls_client_registry) else {
+                            continue;
                         };
-
-                        crate::stats::TOTAL_CONNECTIONS_RECEIVED
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                        let peer_addr_str = peer_addr.to_string();
-
+                        let handshaker = listen_acceptor.clone();
                         let store = Arc::clone(&tls_store);
                         let expiry_store = tls_expiry_store.clone();
                         let lastsave = Arc::clone(&tls_lastsave);
@@ -1310,6 +1363,15 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                         let tracking_table = Arc::clone(&tls_tracking_table);
 
                         tokio::spawn(async move {
+                            let Some((tls_stream, _slot)) =
+                                acceptor::handshake(&handshaker, tcp_stream, peer_addr, slot).await
+                            else {
+                                return;
+                            };
+                            crate::stats::TOTAL_CONNECTIONS_RECEIVED
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let peer_addr_str = peer_addr.to_string();
+
                             if let Err(e) = server::handle_client(
                                 tls_stream,
                                 store,
@@ -1411,6 +1473,8 @@ async fn async_main_tokio(
         Arc::clone(&index_store),
         pubsub.clone(),
         Arc::clone(&latency),
+        &repl_state,
+        &hub_tx,
     );
     let watch_registry = crate::watch::new_watch_registry();
     crate::watch::register_for(&store, &watch_registry);
@@ -1475,6 +1539,22 @@ async fn async_main_tokio(
             &compaction_tx,
             &repl_state,
         );
+        // A cluster master killed with no AOF has only what it last saved,
+        // if anything: it serves none of its slots until its replica, which
+        // may hold the data, has taken over or said it holds nothing.
+        if config.cluster_enabled {
+            crate::replication::CLEAN_EXIT_MARKER.store(true, std::sync::atomic::Ordering::Relaxed);
+            let stopped_cleanly = crate::replication::take_clean_exit_marker();
+            let keys: usize = store
+                .iter()
+                .flat_map(|db| db.iter())
+                .map(|shard| crate::read_lock!(shard).len())
+                .sum();
+            cluster_state.check_dataset_at_start(
+                config.aof || stopped_cleanly || !config.preload_file.is_empty(),
+                keys,
+            );
+        }
         // A node that was a replica when it was last saved, and has loaded
         // exactly that save, can ask its master to continue from there.
         if loaded.exact_dump
@@ -1659,23 +1739,18 @@ async fn async_main_tokio(
                     Ok(pair) => pair,
                     Err(e) => {
                         log_warn!("TLS: accept error: {e}");
+                        // Out of file descriptors, it would otherwise spin.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                         continue;
                     }
                 };
 
-                let tls_stream = match listen_acceptor.accept(tcp_stream).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log_verbose!("TLS: handshake failed from {peer_addr}: {e} ({e:?})");
-                        continue;
-                    }
+                // The handshake is the connection's own task: one client that
+                // never finishes it holds up no other.
+                let Some(slot) = crate::client_registry::admit(&tls_client_registry) else {
+                    continue;
                 };
-
-                crate::stats::TOTAL_CONNECTIONS_RECEIVED
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                let peer_addr_str = peer_addr.to_string();
-
+                let handshaker = listen_acceptor.clone();
                 let store = Arc::clone(&tls_store);
                 let expiry_store = tls_expiry_store.clone();
                 let lastsave = Arc::clone(&tls_lastsave);
@@ -1701,6 +1776,15 @@ async fn async_main_tokio(
                 let tracking_table = Arc::clone(&tls_tracking_table);
 
                 tokio::spawn(async move {
+                    let Some((tls_stream, _slot)) =
+                        acceptor::handshake(&handshaker, tcp_stream, peer_addr, slot).await
+                    else {
+                        return;
+                    };
+                    crate::stats::TOTAL_CONNECTIONS_RECEIVED
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let peer_addr_str = peer_addr.to_string();
+
                     if let Err(e) = server::handle_client(
                         tls_stream,
                         store,
@@ -1771,6 +1855,10 @@ async fn async_main_tokio(
             result = listener.accept() => {
                 match result {
                     Ok((socket, peer_addr)) => {
+                        let Some(slot) = crate::client_registry::admit(&client_registry) else {
+                            crate::client_registry::turn_away(socket);
+                            continue;
+                        };
                         crate::stats::TOTAL_CONNECTIONS_RECEIVED
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -1800,6 +1888,7 @@ async fn async_main_tokio(
                         let monitor_registry = Arc::clone(&monitor_registry);
                         let tracking_table = Arc::clone(&tracking_table);
                         tokio::spawn(async move {
+                            let _slot = slot;
                             if let Err(e) = server::handle_client(
                                 socket,
                                 store,
@@ -1869,6 +1958,10 @@ async fn async_main_tokio(
             result = listener.accept() => {
                 match result {
                     Ok((socket, peer_addr)) => {
+                        let Some(slot) = crate::client_registry::admit(&client_registry) else {
+                            crate::client_registry::turn_away(socket);
+                            continue;
+                        };
                         crate::stats::TOTAL_CONNECTIONS_RECEIVED
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -1898,6 +1991,7 @@ async fn async_main_tokio(
                         let monitor_registry = Arc::clone(&monitor_registry);
                         let tracking_table = Arc::clone(&tracking_table);
                         tokio::spawn(async move {
+                            let _slot = slot;
                             if let Err(e) = server::handle_client(
                                 socket,
                                 store,
@@ -1980,7 +2074,10 @@ async fn async_main_tokio(
         })
         .await;
         match result {
-            Ok(Ok(())) => log_info!("Goodbye."),
+            Ok(Ok(())) => {
+                crate::replication::note_clean_exit();
+                log_info!("Goodbye.");
+            }
             // Not a clean exit: whatever restarts this node should know its
             // last writes are not on disk.
             Ok(Err(e)) => {

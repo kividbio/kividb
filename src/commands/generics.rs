@@ -478,7 +478,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if ms == 0 {
                 let removed = delete_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
                 if removed {
-                    crate::vector::maybe_unindex(ctx.index_store, key);
+                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                     crate::vector::maybe_request_compaction(
                         ctx.index_store,
                         ctx.compaction_tx,
@@ -508,7 +508,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if new_exp <= now {
                 let removed = delete_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
                 if removed {
-                    crate::vector::maybe_unindex(ctx.index_store, key);
+                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                     crate::vector::maybe_request_compaction(
                         ctx.index_store,
                         ctx.compaction_tx,
@@ -562,7 +562,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if new_exp <= now {
                 let removed = delete_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
                 if removed {
-                    crate::vector::maybe_unindex(ctx.index_store, key);
+                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                     crate::vector::maybe_request_compaction(
                         ctx.index_store,
                         ctx.compaction_tx,
@@ -629,7 +629,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if new_exp <= now {
                 let removed = delete_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
                 if removed {
-                    crate::vector::maybe_unindex(ctx.index_store, key);
+                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                     crate::vector::maybe_request_compaction(
                         ctx.index_store,
                         ctx.compaction_tx,
@@ -875,6 +875,18 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
             };
 
+            // A destination past its time is not there: in the source's
+            // database the write has expired it already (`handler`); in
+            // another, it is expired here.
+            if dst_db != src_db {
+                crate::commands::helpers::lazy_expire_key(
+                    ctx.store,
+                    ctx.expiry_store,
+                    dst_db,
+                    &dst_key,
+                );
+            }
+
             // Check destination
             let dst_db_ref = &ctx.store[dst_db];
             {
@@ -933,7 +945,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 // to the DEL count (see redis `delGenericCommand`).
                 if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
                     if delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key) {
-                        crate::vector::maybe_unindex(ctx.index_store, key);
+                        crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                         crate::vector::maybe_request_compaction(
                             ctx.index_store,
                             ctx.compaction_tx,
@@ -950,7 +962,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     delete_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key)
                 };
                 if deleted {
-                    crate::vector::maybe_unindex(ctx.index_store, key);
+                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                     crate::vector::maybe_request_compaction(
                         ctx.index_store,
                         ctx.compaction_tx,
@@ -989,6 +1001,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if target_db >= ctx.store.len() || target_db == src_db {
                 return Some(resp_integer(0));
             }
+            // A key past its time in the target database is not there: it is
+            // expired, as the write expires the key it moves (`handler`).
+            crate::commands::helpers::lazy_expire_key(ctx.store, ctx.expiry_store, target_db, &key);
 
             // Read + remove from source
             let value = {
@@ -1324,11 +1339,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => return Some(resp_error("ERR key must be valid UTF-8")),
             };
 
-            if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
-                // SORT on missing key returns empty array, or 0 if STORE
-                return Some(resp_array(vec![]));
-            }
+            // A source past its time is a missing one: an empty array, or with
+            // STORE, the destination deleted and 0, as for any missing key.
+            // It returned the empty array here, STORE or not, and left the
+            // destination as it was.
+            let expired = is_expired(ctx.expiry_store, *ctx.selected_db, key)
+                && expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
 
             // ── Parse options ──────────────────────────────────────────────────
             let mut alpha = false;
@@ -1410,9 +1426,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let map = read_lock!(shard);
-            let missing = !map.contains_key(key);
+            // Gone, if it was past its time; still there only while writes
+            // are paused (see `expire_on_read`).
+            let found = if expired { None } else { map.get(key) };
+            let missing = found.is_none();
 
-            let mut elements: Vec<Arc<[u8]>> = match map.get(key) {
+            let mut elements: Vec<Arc<[u8]>> = match found {
                 None => vec![], // ← don't return, just give empty vec
                 Some(KiviDBValue::List(l)) => l.read().iter().cloned().collect(),
                 Some(KiviDBValue::Set(s)) => s.read().iter().cloned().collect(),
@@ -1427,7 +1446,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
             // A sorted set has an order of its own, which `BY nosort` keeps
             // — backwards, with `DESC`.
-            let in_score_order = matches!(map.get(key), Some(KiviDBValue::SortedSet(_)));
+            let in_score_order = matches!(found, Some(KiviDBValue::SortedSet(_)));
             drop(map);
 
             let constant_by_lex = by_pattern
@@ -1505,8 +1524,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             if missing {
                 if let Some(ref dst) = store_dst {
-                    let dst_shard = store::get_shard(&ctx.store[*ctx.selected_db], dst);
-                    write_lock!(dst_shard).remove(dst.as_str());
+                    // With its time to live, if it had one: left behind, the
+                    // time went to whatever was written there next.
+                    delete_key(ctx.store, ctx.expiry_store, *ctx.selected_db, dst);
                     return Some(resp_integer(0));
                 }
                 return Some(resp_array(vec![]));

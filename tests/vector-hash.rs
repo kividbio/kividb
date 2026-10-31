@@ -535,6 +535,278 @@ fn test_flushdb_drops_indexes_for_selected_db_only() {
     );
 }
 
+/// A write in one database leaves the indexes of another alone: an `HSET`
+/// of the same key in database 1 used to overwrite the vector a database-0
+/// index held for it, and its `DEL` took the database-0 document out.
+#[test]
+fn test_write_in_another_db_leaves_the_index_alone() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for algo in ["FLAT", "HNSW"] {
+        let index = format!("idx:db0:{algo}");
+        let prefix = format!("{algo}:");
+        assert!(
+            c.cmds(&[
+                "FT.CREATE",
+                &index,
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                &prefix,
+                "SCHEMA",
+                "vec",
+                "VECTOR",
+                algo,
+                "6",
+                "TYPE",
+                "FLOAT32",
+                "DIM",
+                "4",
+                "DISTANCE_METRIC",
+                "L2",
+            ])
+            .is_ok()
+        );
+        let mine = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
+        let theirs = pack_f32(&[0.0, 0.0, 0.0, 9.0]);
+        let key = format!("{prefix}1");
+        c.cmd(&[b"HSET", key.as_bytes(), b"vec", &mine]);
+
+        // The same key in database 1: written, then deleted.
+        assert!(c.cmds(&["SELECT", "1"]).is_ok());
+        c.cmd(&[b"HSET", key.as_bytes(), b"vec", &theirs]);
+        let knn = |c: &mut Conn| {
+            c.cmd(&[
+                b"FT.SEARCH",
+                index.as_bytes(),
+                b"*=>[KNN 1 @vec $q AS score]",
+                b"PARAMS",
+                b"2",
+                b"q",
+                &mine,
+                b"RETURN",
+                b"1",
+                b"score",
+                b"DIALECT",
+                b"2",
+            ])
+        };
+        assert!(c.cmds(&["SELECT", "0"]).is_ok());
+        let r = knn(&mut c);
+        let arr = r.as_array();
+        assert_eq!(arr[0].as_int(), 1, "{algo}, after the HSET in db 1: {r:?}");
+        let score = parse_score(&arr[2].as_array()[1]);
+        assert!(
+            score < 1e-5,
+            "{algo}: the index holds db 1's vector for {key}: {score}"
+        );
+
+        assert!(c.cmds(&["SELECT", "1"]).is_ok());
+        assert_eq!(c.cmds(&["DEL", &key]).as_int(), 1);
+        assert!(c.cmds(&["SELECT", "0"]).is_ok());
+        let r = knn(&mut c);
+        let arr = r.as_array();
+        assert_eq!(arr[0].as_int(), 1, "{algo}, after the DEL in db 1: {r:?}");
+        assert_eq!(arr[1].as_str(), key);
+    }
+}
+
+/// A key that expired and was deleted by a read leaves its indexes: it
+/// used to stay in them, and a KNN query went on returning it.
+#[test]
+fn test_key_expired_by_a_read_leaves_the_index() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for algo in ["FLAT", "HNSW"] {
+        let index = format!("idx:exp:{algo}");
+        let prefix = format!("e{algo}:");
+        assert!(
+            c.cmds(&[
+                "FT.CREATE",
+                &index,
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                &prefix,
+                "SCHEMA",
+                "vec",
+                "VECTOR",
+                algo,
+                "6",
+                "TYPE",
+                "FLOAT32",
+                "DIM",
+                "4",
+                "DISTANCE_METRIC",
+                "L2",
+            ])
+            .is_ok()
+        );
+        const DOCS: usize = 20;
+        for i in 0..DOCS {
+            let key = format!("{prefix}{i}");
+            let v = pack_f32(&[i as f32, 0.0, 0.0, 0.0]);
+            c.cmd(&[b"HSET", key.as_bytes(), b"vec", &v]);
+        }
+        // Half of them expire, and a read finds each expired: the
+        // background cycle runs every 100 ms, so nearly all are deleted by
+        // the read.
+        let expiring: Vec<String> = (0..DOCS)
+            .step_by(2)
+            .map(|i| format!("{prefix}{i}"))
+            .collect();
+        for key in &expiring {
+            assert_eq!(c.cmds(&["PEXPIRE", key, "1"]).as_int(), 1);
+        }
+        thread::sleep(Duration::from_millis(5));
+        for key in &expiring {
+            assert_eq!(c.cmds(&["EXISTS", key]).as_int(), 0);
+        }
+
+        let q = pack_f32(&[0.0, 0.0, 0.0, 0.0]);
+        let r = c.cmd(&[
+            b"FT.SEARCH",
+            index.as_bytes(),
+            b"*=>[KNN 20 @vec $q]",
+            b"NOCONTENT",
+            b"PARAMS",
+            b"2",
+            b"q",
+            &q,
+            b"DIALECT",
+            b"2",
+        ]);
+        let found: Vec<&str> = r.as_array()[1..].iter().map(|v| v.as_str()).collect();
+        for key in &expiring {
+            assert!(
+                !found.contains(&key.as_str()),
+                "{algo}: KNN returned {key}, which expired: {found:?}"
+            );
+        }
+        assert_eq!(found.len(), DOCS - expiring.len(), "{algo}: {found:?}");
+    }
+}
+
+/// `RENAME` takes the old name out of the indexes and indexes the new one,
+/// in place of whatever was there: the old name used to stay, and a KNN
+/// query returned it; the new one was in no index.
+#[test]
+fn test_rename_moves_the_document_in_the_index() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for algo in ["FLAT", "HNSW"] {
+        let index = format!("idx:ren:{algo}");
+        let p = format!("r{algo}:");
+        assert!(
+            c.cmds(&[
+                "FT.CREATE",
+                &index,
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                &p,
+                "SCHEMA",
+                "body",
+                "TEXT",
+                "vec",
+                "VECTOR",
+                algo,
+                "6",
+                "TYPE",
+                "FLOAT32",
+                "DIM",
+                "4",
+                "DISTANCE_METRIC",
+                "L2",
+            ])
+            .is_ok()
+        );
+        let one = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
+        let two = pack_f32(&[0.0, 1.0, 0.0, 0.0]);
+        let three = pack_f32(&[0.0, 0.0, 1.0, 0.0]);
+        let (a, b, x, y, z) = (
+            format!("{p}a"),
+            format!("{p}b"),
+            format!("{p}x"),
+            format!("{p}y"),
+            format!("{p}z"),
+        );
+        let knn = |c: &mut Conn, q: &[u8]| -> Vec<(String, f32)> {
+            let r = c.cmd(&[
+                b"FT.SEARCH",
+                index.as_bytes(),
+                b"*=>[KNN 10 @vec $q AS score]",
+                b"PARAMS",
+                b"2",
+                b"q",
+                q,
+                b"RETURN",
+                b"1",
+                b"score",
+                b"DIALECT",
+                b"2",
+            ]);
+            // A key the index still holds but that is gone comes back
+            // with no fields, and so no score.
+            let arr = r.as_array();
+            arr[1..]
+                .chunks(2)
+                .map(|hit| {
+                    let score = hit[1].as_array().get(1).map_or(f32::NAN, parse_score);
+                    (hit[0].as_str().to_string(), score)
+                })
+                .collect()
+        };
+        let text = |c: &mut Conn, word: &str| -> Vec<String> {
+            let r = c.cmds(&["FT.SEARCH", &index, &format!("@body:{word}"), "NOCONTENT"]);
+            r.as_array()[1..]
+                .iter()
+                .map(|v| v.as_str().to_string())
+                .collect()
+        };
+
+        // Renamed within the prefix.
+        c.cmd(&[b"HSET", a.as_bytes(), b"body", b"hello", b"vec", &one]);
+        assert!(c.cmds(&["RENAME", &a, &b]).is_ok());
+        let hits = knn(&mut c, &one);
+        assert_eq!(hits.len(), 1, "{algo}: {hits:?}");
+        assert_eq!(hits[0].0, b, "{algo}: {hits:?}");
+        assert_eq!(text(&mut c, "hello"), vec![b.clone()], "{algo}");
+
+        // Renamed out of it.
+        assert!(c.cmds(&["RENAME", &b, "elsewhere:b"]).is_ok());
+        assert_eq!(knn(&mut c, &one), Vec::new(), "{algo}");
+        assert_eq!(text(&mut c, "hello"), Vec::<String>::new(), "{algo}");
+
+        // Renamed over another document: the one under the name now is the
+        // one in the index, with its own vector and words.
+        c.cmd(&[b"HSET", x.as_bytes(), b"body", b"from", b"vec", &two]);
+        c.cmd(&[b"HSET", y.as_bytes(), b"body", b"over", b"vec", &three]);
+        assert!(c.cmds(&["RENAME", &x, &y]).is_ok());
+        let hits = knn(&mut c, &two);
+        assert_eq!(hits.len(), 1, "{algo}: {hits:?}");
+        assert_eq!(hits[0].0, y, "{algo}: {hits:?}");
+        assert!(hits[0].1 < 1e-5, "{algo}: {hits:?}");
+        assert_eq!(text(&mut c, "from"), vec![y.clone()], "{algo}");
+        assert_eq!(text(&mut c, "over"), Vec::<String>::new(), "{algo}");
+
+        // RENAMENX to a free name.
+        assert_eq!(c.cmds(&["RENAMENX", &y, &z]).as_int(), 1);
+        let hits = knn(&mut c, &two);
+        assert_eq!(hits.len(), 1, "{algo}: {hits:?}");
+        assert_eq!(hits[0].0, z, "{algo}: {hits:?}");
+    }
+}
+
 #[test]
 fn test_flat_knn_l2() {
     let port = free_port();
@@ -5531,4 +5803,109 @@ fn test_vector_type_unknown_is_refused() {
             "{algo}: {r:?}"
         );
     }
+}
+
+// ── FT.DROPINDEX DD ───────────────────────────────────────────────────────────
+
+/// `FT.DROPINDEX index DD` deletes the documents the index covered, of HASH
+/// and JSON indexes, given by name or by alias; they were kept. From another
+/// database it deletes nothing, as in Redis, where the deletes run in the
+/// database selected.
+#[test]
+fn test_dropindex_dd_deletes_the_documents() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    assert!(
+        c.cmds(&[
+            "FT.CREATE",
+            "ddh",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "ddh:",
+            "SCHEMA",
+            "name",
+            "TEXT",
+        ])
+        .is_ok()
+    );
+    assert!(
+        c.cmds(&[
+            "FT.CREATE",
+            "ddj",
+            "ON",
+            "JSON",
+            "PREFIX",
+            "1",
+            "ddj:",
+            "SCHEMA",
+            "$.name",
+            "AS",
+            "name",
+            "TEXT",
+        ])
+        .is_ok()
+    );
+    c.cmds(&["HSET", "ddh:1", "name", "a"]);
+    c.cmds(&["HSET", "ddh:2", "name", "b"]);
+    c.cmds(&["SET", "ddh:3", "a string, not a document"]);
+    c.cmds(&["HSET", "ddother:1", "name", "c"]);
+    c.cmds(&["JSON.SET", "ddj:1", "$", r#"{"name":"a"}"#]);
+    c.cmds(&["HSET", "ddj:2", "name", "a hash, not a JSON document"]);
+
+    assert!(c.cmds(&["FT.DROPINDEX", "ddh", "BOGUS"]).is_error());
+    assert!(c.cmds(&["FT.DROPINDEX", "ddh", "DD", "DD"]).is_error());
+    assert!(c.cmds(&["FT.DROPINDEX", "ddh", "DD"]).is_ok());
+    assert_eq!(c.cmds(&["EXISTS", "ddh:1", "ddh:2"]).as_int(), 0);
+    assert_eq!(c.cmds(&["EXISTS", "ddh:3", "ddother:1"]).as_int(), 2);
+    assert!(c.cmds(&["FT.INFO", "ddh"]).is_error());
+
+    assert!(c.cmds(&["FT.ALIASADD", "ddj_alias", "ddj"]).is_ok());
+    assert!(c.cmds(&["FT.DROPINDEX", "ddj_alias", "dd"]).is_ok());
+    assert_eq!(c.cmds(&["EXISTS", "ddj:1"]).as_int(), 0);
+    assert_eq!(c.cmds(&["EXISTS", "ddj:2"]).as_int(), 1);
+    assert!(c.cmds(&["FT.INFO", "ddj"]).is_error());
+
+    // Without DD the documents stay.
+    assert!(
+        c.cmds(&[
+            "FT.CREATE",
+            "ddk",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "ddother:",
+            "SCHEMA",
+            "name",
+            "TEXT",
+        ])
+        .is_ok()
+    );
+    assert!(c.cmds(&["FT.DROPINDEX", "ddk"]).is_ok());
+    assert_eq!(c.cmds(&["EXISTS", "ddother:1"]).as_int(), 1);
+
+    // From another database: the index goes, its documents stay.
+    assert!(
+        c.cmds(&[
+            "FT.CREATE",
+            "ddx",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "ddother:",
+            "SCHEMA",
+            "name",
+            "TEXT",
+        ])
+        .is_ok()
+    );
+    assert!(c.cmds(&["SELECT", "1"]).is_ok());
+    assert!(c.cmds(&["FT.DROPINDEX", "ddx", "DD"]).is_ok());
+    assert!(c.cmds(&["SELECT", "0"]).is_ok());
+    assert_eq!(c.cmds(&["EXISTS", "ddother:1"]).as_int(), 1);
+    assert!(c.cmds(&["FT.INFO", "ddx"]).is_error());
 }

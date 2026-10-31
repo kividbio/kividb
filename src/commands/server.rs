@@ -743,6 +743,35 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     "ERR argument couldn't be parsed into an integer",
                 )),
             },
+            // More clients only if the open-file limit can be raised for
+            // them, as in Redis. Fewer than are connected: they stay, and no
+            // new one comes in until enough have gone.
+            "maxclients" => match value.parse::<u32>() {
+                Ok(n) if n >= 1 => {
+                    let n = n as usize;
+                    if n > crate::client_registry::max_clients() {
+                        match crate::client_registry::clients_that_fit(n) {
+                            Ok(fits) if fits == n => {}
+                            Ok(fits) => {
+                                return Some(resp_error(&format!(
+                                    "ERR The operating system is not able to handle the \
+                                     specified number of clients, try with {fits}"
+                                )));
+                            }
+                            Err(e) => {
+                                return Some(resp_error(&format!(
+                                    "ERR Can't read the open-file limit: {e}"
+                                )));
+                            }
+                        }
+                    }
+                    crate::client_registry::set_max_clients(n);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR argument must be between 1 and 4294967295 inclusive",
+                )),
+            },
             "maxmemory-clients" => {
                 let value = match value.strip_suffix('%') {
                     Some(percent) => match percent.parse::<u64>() {
@@ -848,7 +877,6 @@ static REMEMBERED_CONFIG: std::sync::LazyLock<
             ("client-query-buffer-limit", "1073741824"),
             ("latency-tracking", "yes"),
             ("latency-tracking-info-percentiles", "50 99 99.9"),
-            ("maxclients", "10000"),
             ("maxmemory-clients", "0"),
             // No save points: nothing is saved on a timer.
             ("save", ""),
@@ -934,6 +962,10 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
             crate::loglevel::log::level_str(LOG_LEVEL.load(Relaxed)).to_string(),
         ),
         ("hz", "10".to_string()),
+        (
+            "maxclients",
+            crate::client_registry::max_clients().to_string(),
+        ),
         ("activerehashing", "yes".to_string()),
         ("lazyfree-lazy-eviction", "no".to_string()),
         (
@@ -3206,6 +3238,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let load = |v: &std::sync::atomic::AtomicU64| {
                         v.load(std::sync::atomic::Ordering::Relaxed)
                     };
+                    // KiviDB extension: a cluster master that came back
+                    // without its dataset, and serves none of its slots
+                    // until a replica takes over (`LostDataset`).
+                    if ctx.cluster.lost_dataset() {
+                        out.push_str("master_lost_dataset:1\r\n");
+                    }
                     out.push_str(&format!("master_replid:{repl_id}\r\n"));
                     out.push_str(&format!("master_repl_offset:{offset}\r\n"));
                     out.push_str(&format!(
@@ -3421,7 +3459,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let (blocking_keys, on_nokey) = ctx.wait_table.blocking_keys();
                 out.push_str(&format!("total_blocking_keys:{blocking_keys}\r\n"));
                 out.push_str(&format!("total_blocking_keys_on_nokey:{on_nokey}\r\n"));
-                out.push_str("maxclients:10000\r\n");
+                out.push_str(&format!(
+                    "maxclients:{}\r\n",
+                    crate::client_registry::max_clients()
+                ));
                 out.push_str("\r\n");
             }
 
@@ -4041,6 +4082,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 {
                     ctx.client_registry.update(ctx.client_id, |info| {
                         info.replica_takes_digest = true;
+                    });
+                }
+                if cmd[i].eq_ignore_ascii_case(b"capa")
+                    && cmd[i + 1].eq_ignore_ascii_case(b"lost-data")
+                {
+                    ctx.client_registry.update(ctx.client_id, |info| {
+                        info.replica_lost_data = 1;
                     });
                 }
                 i += 2;

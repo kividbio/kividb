@@ -53,6 +53,35 @@ pub mod acceptor {
         Ok(TlsAcceptor::from(Arc::new(config)))
     }
 
+    /// How long a client has to finish its handshake once connected.
+    pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Complete the handshake of a client that connected from `peer`, or
+    /// log why it did not and give up on it. The client keeps its `slot`
+    /// once connected; it is given back if the handshake fails.
+    pub async fn handshake(
+        acceptor: &TlsAcceptor,
+        tcp: tokio::net::TcpStream,
+        peer: std::net::SocketAddr,
+        slot: crate::client_registry::Slot,
+    ) -> Option<(
+        tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        crate::client_registry::Slot,
+    )> {
+        match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
+            Ok(Ok(tls)) => Some((tls, slot)),
+            Ok(Err(e)) => {
+                // Full `Debug` — rustls errors often have empty `Display`.
+                crate::log_verbose!("TLS: handshake failed from {peer}: {e} ({e:?})");
+                None
+            }
+            Err(_) => {
+                crate::log_verbose!("TLS: handshake timed out from {peer}");
+                None
+            }
+        }
+    }
+
     /// The verifier for client certificates, or `None` when clients are not
     /// asked for one.
     fn client_verifier(
@@ -86,5 +115,76 @@ pub mod acceptor {
             .build()
             .map_err(|e| format!("[TLS] Client certificate verifier error: {e}"))?;
         Ok(Some(verifier))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio_rustls::rustls::pki_types::{PrivateKeyDer, ServerName};
+
+        async fn connect() -> (TcpStream, TcpStream, std::net::SocketAddr) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (server, peer) = listener.accept().await.unwrap();
+            (client, server, peer)
+        }
+
+        /// A client keeps its slot once connected; a handshake that fails,
+        /// runs out of time or is cancelled gives it back.
+        #[tokio::test]
+        async fn a_handshake_keeps_its_slot_only_if_it_connects() {
+            let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+            let cert = certified.cert.der().clone();
+            let key = PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+            let config = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert.clone()], key)
+                .unwrap();
+            let acceptor = TlsAcceptor::from(Arc::new(config));
+            let registry = crate::client_registry::new_client_registry();
+            let slot = || crate::client_registry::admit(&registry).unwrap();
+
+            let mut roots = RootCertStore::empty();
+            roots.add(cert).unwrap();
+            let client = tokio_rustls::TlsConnector::from(Arc::new(
+                tokio_rustls::rustls::ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+            ));
+            let (tcp, server, peer) = connect().await;
+            let (accepted, connected) = tokio::join!(
+                handshake(&acceptor, server, peer, slot()),
+                client.connect(ServerName::try_from("localhost").unwrap(), tcp),
+            );
+            let (tls, kept) = accepted.unwrap();
+            assert!(connected.is_ok());
+            assert_eq!(registry.slots_held(), 1);
+            drop((tls, kept));
+            assert_eq!(registry.slots_held(), 0);
+
+            let (mut tcp, server, peer) = connect().await;
+            tcp.write_all(b"PING\r\n").await.unwrap();
+            assert!(handshake(&acceptor, server, peer, slot()).await.is_none());
+            assert_eq!(registry.slots_held(), 0);
+
+            let (_tcp, server, peer) = connect().await;
+            let task = {
+                let (acceptor, slot) = (acceptor.clone(), slot());
+                tokio::spawn(async move { handshake(&acceptor, server, peer, slot).await })
+            };
+            assert_eq!(registry.slots_held(), 1);
+            task.abort();
+            assert!(task.await.is_err_and(|e| e.is_cancelled()));
+            assert_eq!(registry.slots_held(), 0);
+
+            let (_tcp, server, peer) = connect().await;
+            tokio::time::pause();
+            assert!(handshake(&acceptor, server, peer, slot()).await.is_none());
+            assert_eq!(registry.slots_held(), 0);
+        }
     }
 }

@@ -400,6 +400,16 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     // What a script calls is shown to MONITOR as called by `lua`.
     crate::monitor::feed(ctx.monitor_registry, &ctx.cmd, *ctx.selected_db, "lua");
 
+    // A write from a script finds the keys it names that are past their
+    // time gone, as one from a client does (see `run_command`), by the
+    // script's clock.
+    if !ctx.apply_replication
+        && crate::store::any_expiry()
+        && replication::is_write_command_bytes(cmd0)
+    {
+        expire_named_keys(ctx, name2);
+    }
+
     // Unknown-command message must match Redis's wording (Tcl tests use glob `*Unknown Redis*`).
     let started = std::time::Instant::now();
     let result = dispatch_command_handlers(ctx, name2)
@@ -888,6 +898,18 @@ fn run_command(ctx: &mut Ctx, name: &str) -> Vec<u8> {
         None
     };
 
+    // A write finds the keys it names that are past their time gone, as in
+    // Redis (`lookupKeyWrite` expires them first). Each is expired as a read
+    // expires it (`helpers::delete_key_if_expired`), inside the gate and the
+    // order this command holds for its own record, before it looks at it.
+    // Without this a write to a key past its time that active expiry had not
+    // taken out yet changed the dead value and kept its time: `INCR` said
+    // 101, and the key then went, with the write the client had been told
+    // of. With no time to live anywhere, one load.
+    if writes_operation && !ctx.apply_replication && crate::store::any_expiry() {
+        expire_named_keys(ctx, name);
+    }
+
     // HOTKEYS: one relaxed load when no session is running.
     let hotkeys_started = hotkeys::active().then(std::time::Instant::now);
 
@@ -1001,6 +1023,28 @@ fn run_command(ctx: &mut Ctx, name: &str) -> Vec<u8> {
         result
     };
     crate::tracking::with_what_came_before(result)
+}
+
+/// Expire the keys a write names that are past their time, in the
+/// connection's database, before the write runs: it finds them gone, as it
+/// would in Redis. See `helpers::delete_key_if_expired`, which looks at each
+/// key's time again under its shards' locks.
+#[inline(never)]
+fn expire_named_keys(ctx: &Ctx, name: &str) {
+    // These look at their keys' times themselves, with the shard they have
+    // found already (`strings::shard_for_write`, and `DEL`'s own check).
+    if matches!(
+        name,
+        "SET" | "DEL" | "UNLINK" | "INCR" | "INCRBY" | "DECR" | "DECRBY"
+    ) {
+        return;
+    }
+    let db = *ctx.selected_db;
+    for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
+        if let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) {
+            crate::commands::helpers::lazy_expire_key(ctx.store, ctx.expiry_store, db, key);
+        }
+    }
 }
 
 /// Replication/AOF propagation, WATCH notification, RDB-change tracking, MONITOR broadcast,
@@ -1132,7 +1176,7 @@ fn drop_if_empty(ctx: &Ctx, db: usize, key: &str) -> bool {
     };
     if removed {
         helpers::clear_expiry(ctx.expiry_store, db, key);
-        crate::vector::maybe_unindex(ctx.index_store, key);
+        crate::vector::maybe_unindex(ctx.index_store, db, key);
         crate::keyspace_events::notify(
             ctx.pubsub,
             db,
@@ -1161,9 +1205,23 @@ fn settle_written_keys(ctx: &Ctx, name: &str) {
     if name == "RESTORE" {
         for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
             if let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) {
-                let db = &ctx.store[*ctx.selected_db];
-                crate::vector::reindex_hash_key(ctx.index_store, db, key);
-                crate::vector::reindex_json_key(ctx.index_store, db, key);
+                let db = *ctx.selected_db;
+                crate::vector::reindex_hash_key(ctx.index_store, ctx.store, db, key);
+                crate::vector::reindex_json_key(ctx.index_store, ctx.store, db, key);
+            }
+        }
+    }
+    // A key renamed: the old name leaves the indexes of its database, and
+    // whatever is under the new one now is indexed whole, in place of what
+    // was there before. `RENAME` used to leave the old name in the indexes
+    // (a KNN query still returned it) and never index the new one.
+    if matches!(name, "RENAME" | "RENAMENX") {
+        let db = *ctx.selected_db;
+        for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
+            if let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) {
+                crate::vector::maybe_unindex(ctx.index_store, db, key);
+                crate::vector::reindex_hash_key(ctx.index_store, ctx.store, db, key);
+                crate::vector::reindex_json_key(ctx.index_store, ctx.store, db, key);
             }
         }
     }
@@ -1198,7 +1256,8 @@ fn settle_written_keys(ctx: &Ctx, name: &str) {
                 if let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) {
                     crate::vector::reindex_json_key(
                         ctx.index_store,
-                        &ctx.store[*ctx.selected_db],
+                        ctx.store,
+                        *ctx.selected_db,
                         key,
                     );
                 }

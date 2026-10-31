@@ -567,3 +567,240 @@ fn config_set_port_moves_the_listener_or_changes_nothing() {
     assert!(there.cmds(&["CONFIG", "SET", "port", "0"]).is_error());
     assert!(there.cmds(&["CONFIG", "SET", "port", "x"]).is_error());
 }
+
+/// A kividb of its own, killed when dropped. Its log is `kividb.log` in `dir`.
+#[cfg(unix)]
+struct Limited {
+    child: std::process::Child,
+    port: u16,
+    dir: tempfile::TempDir,
+}
+
+#[cfg(unix)]
+impl Drop for Limited {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(unix)]
+impl Limited {
+    fn log(&self) -> String {
+        std::fs::read_to_string(self.dir.path().join("kividb.log")).unwrap_or_default()
+    }
+}
+
+/// A kividb with `soft` and `hard` open-file limits, set in the child only,
+/// and `conf` as its config file.
+#[cfg(unix)]
+fn start_with_open_files(soft: u64, hard: u64, conf: &str) -> Limited {
+    use std::os::unix::process::CommandExt;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("kividb.conf");
+    std::fs::write(
+        &file,
+        format!(
+            "{conf}\nlogfile {}\n",
+            dir.path().join("kividb.log").display()
+        ),
+    )
+    .unwrap();
+    let port = free_port();
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_kividb"));
+    command.args([
+        "--port",
+        &port.to_string(),
+        "--bind",
+        "127.0.0.1",
+        "--dir",
+        dir.path().to_str().unwrap(),
+        "--configfile",
+        file.to_str().unwrap(),
+    ]);
+    // SAFETY: setrlimit is async-signal-safe.
+    unsafe {
+        command.pre_exec(move || {
+            let limit = libc::rlimit {
+                rlim_cur: soft as libc::rlim_t,
+                rlim_max: hard as libc::rlim_t,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    Limited {
+        child: command.spawn().expect("start kividb"),
+        port,
+        dir,
+    }
+}
+
+/// Whether a connection to `port` is turned away for `maxclients`.
+#[cfg(unix)]
+fn turned_away(port: u16) -> bool {
+    let mut extra = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    extra
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut reply = String::new();
+    extra.read_to_string(&mut reply).unwrap();
+    reply == "-ERR max number of clients reached\r\n"
+}
+
+#[cfg(unix)]
+fn maxclients(c: &mut Conn) -> String {
+    c.cmds(&["CONFIG", "GET", "maxclients"]).as_array()[1]
+        .as_str()
+        .to_string()
+}
+
+#[cfg(unix)]
+#[test]
+fn maxclients_is_kept_when_the_soft_limit_allows_it() {
+    let server = start_with_open_files(100, 100, "io-model tokio\nthreads 1\nmaxclients 50");
+    let mut c = Conn::connect(server.port);
+    assert_eq!(maxclients(&mut c), "50");
+    let log = server.log();
+    assert!(!log.contains("open files"), "{log}");
+}
+
+/// The soft limit is raised for `maxclients`, and that many clients connect;
+/// one more is turned away.
+#[cfg(unix)]
+#[test]
+fn the_soft_limit_is_raised_up_to_the_hard_limit_for_maxclients() {
+    let server = start_with_open_files(40, 100, "io-model tokio\nthreads 1\nmaxclients 50");
+    let port = server.port;
+    let mut clients: Vec<Conn> = (0..50).map(|_| Conn::connect(port)).collect();
+    for c in &mut clients {
+        assert_eq!(c.cmds(&["PING"]).as_str(), "PONG");
+    }
+    assert_eq!(maxclients(&mut clients[0]), "50");
+    assert!(turned_away(port));
+    // Lower than the clients connected: they stay, no new one comes in.
+    assert!(
+        clients[0]
+            .cmds(&["CONFIG", "SET", "maxclients", "10"])
+            .is_ok()
+    );
+    assert_eq!(clients[49].cmds(&["PING"]).as_str(), "PONG");
+    assert!(turned_away(port));
+    clients.truncate(5);
+    // Room again, once the server has seen them go.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !matches!(Conn::connect(port).cmds(&["PING"]), RespValue::SimpleStr(s) if s == "PONG") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no room after clients left"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn maxclients_is_lowered_to_the_hard_limit_and_not_set_past_it() {
+    let server = start_with_open_files(40, 60, "io-model tokio\nthreads 1\nmaxclients 100");
+    let mut c = Conn::connect(server.port);
+    assert_eq!(maxclients(&mut c), "28");
+    let info = c.cmds(&["INFO", "clients"]);
+    assert!(info.as_str().contains("maxclients:28\r\n"), "{info:?}");
+    let log = server.log();
+    assert!(
+        log.contains("maxclients 100 needs 132 open files, but the limit (ulimit -n) allows 60: maxclients is 28"),
+        "{log}"
+    );
+
+    for refused in [
+        &["maxclients", "29"][..],
+        &["hz", "20", "maxclients", "1000"],
+    ] {
+        let reply = c.cmds(&[&["CONFIG", "SET"][..], refused].concat());
+        assert!(
+            matches!(&reply, RespValue::Error(e) if e.ends_with(
+                "The operating system is not able to handle the specified number of clients, try with 28"
+            )),
+            "{reply:?}"
+        );
+        assert_eq!(maxclients(&mut c), "28");
+    }
+    assert_eq!(
+        c.cmds(&["CONFIG", "GET", "hz"]).as_array()[1].as_str(),
+        "10"
+    );
+    // Lowered, and taken back with a setting refused after it.
+    assert!(
+        c.cmds(&[
+            "CONFIG",
+            "SET",
+            "maxclients",
+            "5",
+            "slowlog-log-slower-than",
+            "x"
+        ])
+        .is_error()
+    );
+    assert_eq!(maxclients(&mut c), "28");
+    assert!(c.cmds(&["CONFIG", "SET", "maxclients", "10"]).is_ok());
+    assert!(c.cmds(&["CONFIG", "SET", "maxclients", "28"]).is_ok());
+    assert_eq!(maxclients(&mut c), "28");
+    assert!(c.cmds(&["CONFIG", "SET", "maxclients", "0"]).is_error());
+    assert_eq!(maxclients(&mut c), "28");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_limit_with_no_room_for_a_client_stops_the_server() {
+    let mut server = start_with_open_files(32, 32, "io-model tokio\nthreads 1");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = server.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(std::time::Instant::now() < deadline, "still running");
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(!status.success());
+    let log = server.log();
+    assert!(
+        log.contains("The open-file limit (ulimit -n) is too low"),
+        "{log}"
+    );
+}
+
+/// With 150 open files, `maxclients` clients connect and are answered, and
+/// one more is turned away: on io_uring, whose 4 workers keep 72 files back,
+/// and on tokio, which keeps 32 whatever its threads.
+#[cfg(target_os = "linux")]
+#[test]
+fn maxclients_leaves_room_for_what_the_io_model_holds() {
+    for (io_model, fits) in [("uring", 78), ("tokio", 118)] {
+        let server = start_with_open_files(
+            150,
+            150,
+            &format!("io-model {io_model}\nthreads 4\nmaxclients 1000"),
+        );
+        let port = server.port;
+        // As many as it lets in are answered, before their number is checked.
+        let mut clients = vec![Conn::connect(port)];
+        let max: usize = maxclients(&mut clients[0]).parse().unwrap();
+        clients.extend((1..max).map(|_| Conn::connect(port)));
+        for c in &mut clients {
+            assert_eq!(c.cmds(&["PING"]).as_str(), "PONG", "{io_model}");
+        }
+        assert_eq!(max, fits, "{io_model}");
+        assert!(turned_away(port), "{io_model}");
+        let more = (fits + 1).to_string();
+        let reply = clients[0].cmds(&["CONFIG", "SET", "maxclients", &more]);
+        assert!(
+            matches!(&reply, RespValue::Error(e) if e.ends_with(&format!("try with {fits}"))),
+            "{io_model}: {reply:?}"
+        );
+        let log = server.log();
+        assert!(log.contains("maxclients 1000 needs"), "{io_model}: {log}");
+    }
+}

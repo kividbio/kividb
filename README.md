@@ -345,6 +345,13 @@ list.
 | `--tls-auth-clients <yes\|optional\|no>` | `yes` | Whether clients must present a certificate (only with `--tls-ca-cert-file`) |
 | `--update-check <yes\|no>` | `yes` | The [startup update check](#startup-update-check) |
 
+`maxclients` (default `10000`, in the file or with `CONFIG SET`) counts plaintext and TLS
+clients, TLS ones from the start of their handshake. At startup KiviDB raises the soft
+open-file limit to `maxclients` plus what it keeps for itself (32 files, or on io_uring 40 and
+8 a worker thread) if the hard limit allows; if not, it lowers `maxclients` to fit and logs a
+warning. Cluster bus links, a replica's link to its master and files written while saving
+are not counted in that; leave room for them in a large cluster.
+
 ### TLS
 
 TLS clients connect on a separate port, `--tls-port`; plain traffic stays on `--port`.

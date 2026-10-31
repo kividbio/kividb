@@ -111,6 +111,7 @@ pub async fn run_failure_detection_loop(
                 |_| true,
             );
         }
+        state.check_lost_dataset_fence();
         check_election(&state, &repl_state).await;
         state.reconcile_replication();
     }

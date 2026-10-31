@@ -167,6 +167,36 @@ pub struct ReplState {
     /// Replica side: drop the local dataset before loading a full sync,
     /// instead of holding both until the new one is in (`repl-diskless-load`).
     pub flush_before_load: AtomicBool,
+    /// Replica side, in a cluster: the node whose stream `resync_point` is
+    /// a position in — the master this node followed when its dataset last
+    /// became a copy of a master's. `None` when not known.
+    stream_origin: RwLock<Option<String>>,
+    /// What the replication client needs to ask of the cluster layer; see
+    /// [`ClusterLink`]. Not set outside cluster mode.
+    cluster_link: std::sync::OnceLock<ClusterLink>,
+}
+
+/// The replication client's view of the cluster, installed by
+/// `ClusterState::start`. The client runs on a thread of its own and knows
+/// its master only by address; these answer by node id.
+pub struct ClusterLink {
+    /// The node id of the master this node follows, in the cluster's view.
+    pub master_node: MasterNodeFn,
+    /// Have this replica take over from master `node` (a node id), because
+    /// `why`: an election that does not wait for the master to be failed.
+    /// False when it cannot (it is not that master's replica).
+    pub take_over: TakeOverFn,
+}
+
+/// See [`ClusterLink::master_node`].
+pub type MasterNodeFn = Box<dyn Fn() -> Option<String> + Send + Sync>;
+/// See [`ClusterLink::take_over`].
+pub type TakeOverFn = Box<dyn Fn(&str, &str) -> bool + Send + Sync>;
+
+impl std::fmt::Debug for ClusterLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClusterLink")
+    }
 }
 
 /// A position in a master's write stream, and the dataset that corresponds to
@@ -406,6 +436,47 @@ impl ReplState {
             has_resync_point: AtomicBool::new(false),
             apply_lock: parking_lot::Mutex::new(()),
             flush_before_load: AtomicBool::new(true),
+            stream_origin: RwLock::new(None),
+            cluster_link: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Give the replication client its view of the cluster (once).
+    pub fn install_cluster_link(&self, link: ClusterLink) {
+        let _ = self.cluster_link.set(link);
+    }
+
+    /// The node id of the master this node follows, if this is a cluster
+    /// replica.
+    pub fn cluster_master_node(&self) -> Option<String> {
+        self.cluster_link.get().and_then(|l| (l.master_node)())
+    }
+
+    /// Ask the cluster layer to have this replica take over from `node`.
+    pub fn request_take_over(&self, node: &str, why: &str) -> bool {
+        self.cluster_link
+            .get()
+            .is_some_and(|l| (l.take_over)(node, why))
+    }
+
+    /// The node whose stream this replica's dataset is from, if known.
+    pub fn stream_origin(&self) -> Option<String> {
+        self.stream_origin.read().clone()
+    }
+
+    pub fn set_stream_origin(&self, node: Option<String>) {
+        *self.stream_origin.write() = node;
+    }
+
+    /// A replica that started on a saved resync point: that point is a
+    /// position in the stream of the master its cluster config names.
+    pub fn note_stream_origin_if_unknown(&self, node: Option<String>) {
+        if self.resync_point.lock().is_none() {
+            return;
+        }
+        let mut origin = self.stream_origin.write();
+        if origin.is_none() {
+            *origin = node;
         }
     }
 
@@ -586,9 +657,44 @@ impl ReplState {
         self.full_sync_guard.store(guard as u8, Ordering::Relaxed);
     }
 
-    /// How long a replica waits on a silent master before giving up on it.
+    /// How long a replica waits on a silent master before giving up on it,
+    /// and a master on a silent replica.
     pub fn repl_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.repl_timeout_secs.load(Ordering::Relaxed).max(1))
+    }
+
+    /// Whether replica `replica_id` is online and has sent no `REPLCONF ACK`
+    /// for longer than `repl-timeout`.
+    fn replica_is_silent(&self, replica_id: u64) -> bool {
+        let timeout_ms = self.repl_timeout().as_millis() as u64;
+        self.replica_progress
+            .lock()
+            .get(&replica_id)
+            .is_some_and(|p| {
+                p.state() == ReplicaState::Online
+                    && unix_ms().saturating_sub(p.last_ack_ms.load(Ordering::Relaxed)) > timeout_ms
+            })
+    }
+
+    /// Resolves once replica `replica_id` has gone silent (see
+    /// [`Self::replica_is_silent`]); its connection is then to be closed.
+    ///
+    /// A replica sends an ACK every second. One whose host is gone without
+    /// closing the connection (a terminated VM, a lost network path, a paused
+    /// container) sends none, and nothing else ended its connection: the
+    /// socket stays open while the peer's kernel answers, and when it does
+    /// not, for the kernel's retransmission limit, a quarter of an hour. It
+    /// was listed `online` with its lag growing, and counted in
+    /// `connected_slaves`, until the master restarted. Redis drops it after
+    /// `repl-timeout`, as this does. Only once online: a replica sends no ACK
+    /// while it loads the dataset.
+    pub async fn replica_timed_out(&self, replica_id: u64) {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            if self.replica_is_silent(replica_id) {
+                return;
+            }
+        }
     }
 
     pub fn link_state(&self) -> LinkState {
@@ -807,6 +913,7 @@ impl ReplState {
         *self.last_sync_refusal.write() = None;
         // A master's dataset is its own from here on.
         self.set_resync_point(None);
+        self.set_stream_origin(None);
     }
 
     #[inline]
@@ -843,6 +950,64 @@ impl ReplState {
              data will be continued rather than sent it",
             started.elapsed().as_millis()
         );
+    }
+
+    /// What to answer a replica's `PSYNC` with, if not the sync itself.
+    ///
+    /// A cluster master that came back without its dataset (see
+    /// `ClusterState::check_dataset_at_start`) first tells a replica that
+    /// takes the word (`REPLCONF capa lost-data`) so: `+LOSTDATA <node id>`.
+    /// A replica that holds the dataset takes over instead of syncing; one
+    /// that holds nothing asks again, and once every replica of this master
+    /// has said that, this master serves what it has and the sync goes
+    /// ahead. A replica that does not take the word is offered the sync as
+    /// before: its own guard refuses an empty master.
+    ///
+    /// Otherwise the fingerprint offer, [`Self::digest_offer`].
+    pub fn psync_offer(
+        &self,
+        cluster: &crate::cluster::ClusterState,
+        registry: &crate::client_registry::ClientRegistry,
+        client_id: u64,
+        cmd: &[&[u8]],
+    ) -> Option<Vec<u8>> {
+        if cluster.lost_dataset() && !self.is_slave() {
+            let (mut stage, mut addr, mut port) = (0u8, String::new(), 0u16);
+            registry.update(client_id, |info| {
+                stage = info.replica_lost_data;
+                if stage == 1 {
+                    info.replica_lost_data = 2;
+                }
+                addr = info.addr.clone();
+                port = info.replica_listening_port;
+            });
+            match stage {
+                1 => {
+                    cluster.note_lost_dataset_offer();
+                    log_warn!("Replication: Told replica {addr} that this master lost its dataset");
+                    return Some(
+                        format!(
+                            "+LOSTDATA {}\r\n",
+                            crate::cluster::node_id_str(&cluster.myself())
+                        )
+                        .into_bytes(),
+                    );
+                }
+                2 => {
+                    let (ip, source_port) = replica_client::peer_ip_port(&addr);
+                    let port = if port != 0 { port } else { source_port };
+                    if !cluster.replica_has_nothing(&ip, port) {
+                        return Some(
+                            b"-LOSTDATA this master lost its dataset and waits for its other \
+                              replicas\r\n"
+                                .to_vec(),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.digest_offer(registry, client_id, cmd)
     }
 
     /// The answer to a `PSYNC` that cannot be continued, from a replica that
@@ -892,6 +1057,49 @@ impl ReplState {
     }
 }
 
+/// Left beside `dump.kdb` by a cluster node whose final save at shutdown
+/// succeeded: that dump is everything the node had. A master that starts
+/// without it (and without an AOF) did not stop cleanly, and its dataset may
+/// be behind its replicas' — see `ClusterState::check_dataset_at_start`.
+pub const CLEAN_EXIT_PATH: &str = "dump.kdb.clean";
+const CLEAN_EXIT_MAGIC: &str = "kividb-clean-exit 1";
+
+/// Whether this process leaves [`CLEAN_EXIT_PATH`]: set in cluster mode.
+pub static CLEAN_EXIT_MARKER: AtomicBool = AtomicBool::new(false);
+
+/// After a successful final save at shutdown: say so beside the dump.
+pub fn note_clean_exit() {
+    if !CLEAN_EXIT_MARKER.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Ok((len, hash)) = dump_fingerprint("dump.kdb") {
+        let tmp = format!("{CLEAN_EXIT_PATH}.tmp");
+        if std::fs::write(&tmp, format!("{CLEAN_EXIT_MAGIC}\n{len}\n{hash}\n")).is_ok() {
+            let _ = std::fs::rename(&tmp, CLEAN_EXIT_PATH);
+        }
+    }
+}
+
+/// Whether the previous process stopped cleanly with the `dump.kdb` that is
+/// here now. The marker is removed — durably, before anything is served —
+/// so that a crash later in this process is not taken for a clean stop.
+pub fn take_clean_exit_marker() -> bool {
+    let Ok(text) = std::fs::read_to_string(CLEAN_EXIT_PATH) else {
+        return false;
+    };
+    let _ = std::fs::remove_file(CLEAN_EXIT_PATH);
+    if let Ok(dir) = std::fs::File::open(".") {
+        let _ = dir.sync_all();
+    }
+    let mut lines = text.lines();
+    if lines.next() != Some(CLEAN_EXIT_MAGIC) {
+        return false;
+    }
+    let len: Option<u64> = lines.next().and_then(|l| l.parse().ok());
+    let hash: Option<u64> = lines.next().and_then(|l| l.parse().ok());
+    matches!((len, hash, dump_fingerprint("dump.kdb")), (Some(l), Some(h), Ok((dl, dh))) if l == dl && h == dh)
+}
+
 /// Where a save leaves the resync point of the dataset it wrote.
 pub const RESYNC_PATH: &str = "dump.kdb.repl";
 const RESYNC_MAGIC: &str = "kividb-resync 1";
@@ -924,6 +1132,11 @@ pub fn save_dataset(
     index_store: &crate::vector::IndexStore,
     repl_state: &ReplState,
 ) -> std::io::Result<()> {
+    // No other checkpoint or save from here to the point saved beside the
+    // dump below, which must be the point of this dump. Taken before the
+    // applier's lock, so the applier does not wait while this waits for
+    // its turn (and nothing that has its turn waits for that lock).
+    let turn = crate::aof::checkpoint_turn()?;
     // The replica's applier is between commands, and stays there until the
     // save is done: the point read here is the dataset written below.
     let _applying = repl_state.apply_lock.lock();
@@ -936,7 +1149,7 @@ pub fn save_dataset(
     // instant the dataset is captured: no write is half-way then.
     let mut master_point: Option<(String, u64)> = None;
     if crate::aof::AOF_ENABLED.load(Ordering::Relaxed) {
-        crate::aof::checkpoint_noting(store, expiry_store, index_store, &mut || {
+        crate::aof::checkpoint_noting(&turn, store, expiry_store, index_store, &mut || {
             if !repl_state.is_slave() && repl_state.feeds_hub() {
                 master_point = Some((
                     repl_state.repl_id(),
@@ -973,6 +1186,7 @@ pub fn save_dataset(
         }
     }
     crate::stats::RDB_SAVES.fetch_add(1, Ordering::Relaxed);
+    drop(turn);
     Ok(())
 }
 
@@ -1882,6 +2096,82 @@ pub fn replicate_from_background(
     repl_state
         .repl_stream_last_db
         .store(db as u64, Ordering::Relaxed);
+}
+
+/// A key this master has expired in database `db`: `parts`, its `DEL` (or
+/// `UNLINK`), to replicas, taps and the AOF, as the write that deleted it
+/// (see `expiry`). As [`replicate_from_background`], but also from inside a
+/// command: in a script, its AOF record goes with the script's records.
+///
+/// Call it holding the write gate and the key's place in the order of
+/// writes (`expiry::order`), with the key already gone. A replica
+/// propagates nothing: its master tells it what expired.
+pub fn replicate_expired(repl_state: &ReplState, hub_tx: &HubTx, db: usize, parts: &[Vec<u8>]) {
+    if repl_state.is_slave() {
+        return;
+    }
+    let aof = crate::aof::AOF_ENABLED.load(Ordering::Relaxed);
+    let has_replicas = repl_state.feeds_hub();
+    let tapped = repl_state.stream_taps.load(Ordering::Relaxed) > 0;
+    if !aof && !has_replicas && !tapped {
+        return;
+    }
+    // One AOF record: a `SELECT` and the `DEL` it qualifies must not be
+    // separable by a crash.
+    let mut record = Vec::new();
+    let (payloads, now_in) = expired_for_stream(repl_state, db, parts);
+    for payload in payloads {
+        repl_state
+            .repl_offset
+            .fetch_add(payload.len() as u64, Ordering::Relaxed);
+        if tapped {
+            repl_state.feed_taps(&payload);
+        }
+        if aof {
+            record.extend_from_slice(&payload);
+        }
+        if has_replicas {
+            propagate(hub_tx, payload);
+        }
+    }
+    if aof {
+        crate::aof::AOF_WRITTEN.fetch_add(record.len() as u64, Ordering::Relaxed);
+        crate::aof::queue_record(&crate::commands::ctx::GlobalAofSender, record);
+    }
+    repl_state
+        .repl_stream_last_db
+        .store(now_in as u64, Ordering::Relaxed);
+}
+
+/// `parts`, the deletion of a key expired in database `db`, encoded for the
+/// write stream; and the database the stream is in after it.
+///
+/// While no client has left database 0, a client's write carries no
+/// `SELECT`: whether it needs one is read from `repl_stream_last_db` before
+/// it is sent ([`ReplState::encode_for_stream`]). A key can be in another
+/// database all the same (`MOVE`, `COPY ... DB`, `SWAPDB`, a dataset
+/// loaded), and expiry deletes it beside those writes. Sent as a `SELECT`
+/// and a `DEL`, with the stream then taken to be in the key's database, a
+/// write that read 0 meanwhile went after the `SELECT` and was applied in
+/// the key's database by the replica and by a replay of the AOF; and as it
+/// stored 0 after, every write of database 0 from then on was too. So the
+/// deletion goes in one piece that goes back to 0, which leaves the stream
+/// where those writes take it to be.
+fn expired_for_stream(
+    repl_state: &ReplState,
+    db: usize,
+    parts: &[Vec<u8>],
+) -> (Vec<Vec<u8>>, usize) {
+    if db == 0 || repl_state.several_databases.load(Ordering::Relaxed) {
+        return (repl_state.encode_for_stream(db, parts), db);
+    }
+    let select = |db: usize| {
+        crate::resp::write::encode_resp_command(&[b"SELECT".to_vec(), db.to_string().into_bytes()])
+    };
+    let mut piece = select(db);
+    piece.extend_from_slice(&crate::resp::write::encode_resp_command(parts));
+    piece.extend_from_slice(&select(0));
+    (vec![piece], 0)
 }
 
 /// Append an already-encoded write to this node's own AOF and stop.

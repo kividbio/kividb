@@ -58,6 +58,7 @@ pub async fn handle_replica_connection_uring(
     // stream}. See `replication::begin_full_sync`.
     let (peer_ip, peer_port) =
         crate::replication::replica_client::replica_endpoint(&peer_addr, listening_port);
+    let endpoint = format!("{peer_ip}:{peer_port}");
     let registration = crate::replication::ReplicaRegistration {
         replica_id,
         addr: peer_addr.clone(),
@@ -237,6 +238,13 @@ pub async fn handle_replica_connection_uring(
     tokio::select! {
         _ = ack_reader => {}
         _ = forward_task => {}
+        // A replica that has gone silent: see `ReplState::replica_timed_out`.
+        _ = repl_state.replica_timed_out(replica_id) => {
+            log_warn!(
+                "Replication: disconnecting timedout replica {endpoint}: no REPLCONF ACK for {} s (repl-timeout)",
+                repl_state.repl_timeout().as_secs()
+            );
+        }
     }
 
     let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
@@ -1264,9 +1272,11 @@ pub async fn handle_client(
             // ── Connection handoffs (break parse loop so `parse_buf` can be drained) ──
             // A replica whose dataset may already be this master's is first
             // offered the fingerprint (see `replication::digest`), and the
-            // connection stays a client until it asks again.
+            // connection stays a client until it asks again; so is one of a
+            // master that lost its dataset (`ReplState::psync_offer`).
             if cmd_name == "PSYNC"
-                && let Some(offer) = repl_state.digest_offer(&client_registry, client_id, &cmd)
+                && let Some(offer) =
+                    repl_state.psync_offer(&cluster_state, &client_registry, client_id, &cmd)
             {
                 out_buf.extend_from_slice(&offer);
                 parse_offset += consumed;
@@ -1563,6 +1573,19 @@ pub async fn handle_client(
                                 selected_db,
                                 sets.iter().map(|(key, _)| key.as_bytes()),
                             );
+                            // A key past its time is expired before it is
+                            // written over, as a SET's key is outside a
+                            // transaction (`handler::expire_named_keys`).
+                            if crate::store::any_expiry() {
+                                for (key, _) in sets.iter() {
+                                    commands::helpers::lazy_expire_key(
+                                        &store,
+                                        &expiry_store,
+                                        selected_db,
+                                        key,
+                                    );
+                                }
+                            }
                             let mut guards: Vec<(usize, _)> = order
                                 .iter()
                                 .map(|&i| (shard_ptrs[i], shards[i].write()))

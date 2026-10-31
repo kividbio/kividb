@@ -115,12 +115,121 @@ fn ft_dropindex(ctx: &mut Ctx) -> Option<Vec<u8>> {
         Err(_) => return Some(resp_error("ERR index name must be valid UTF-8")),
     };
 
-    // The index goes, and its aliases with it.
-    if crate::vector::remove_index(&mut ctx.index_store.write(), name) {
-        Some(resp_simple("OK"))
+    // `DD` deletes the documents too; they used to be kept. Nothing else
+    // may follow the name. A replica or an AOF replay drops the index only,
+    // whatever follows: a master sends what `DD` deleted as DELs of its own,
+    // and before 1.1.3 it kept the documents and sent the command as typed.
+    let delete_documents = if ctx.apply_replication {
+        false
     } else {
-        Some(resp_error("ERR no such index"))
+        match &cmd[2..] {
+            [] => false,
+            [dd] if dd.eq_ignore_ascii_case(b"DD") => true,
+            _ => return Some(resp_error("SEARCH_ARG_UNRECOGNIZED Unknown argument")),
+        }
+    };
+
+    // The documents, found by the definition before it goes. Only in the
+    // index's own database: Redis deletes them in the one selected, and so
+    // from another one deletes nothing.
+    let documents: Vec<String> = if delete_documents {
+        let store = ctx.index_store.read();
+        match store
+            .get(name)
+            .filter(|def| !crate::vector::is_alias(name, def))
+        {
+            Some(def) if def.db_index == *ctx.selected_db => {
+                let db = def.db_index;
+                let mut keys = Vec::new();
+                for shard in ctx.store[db].iter() {
+                    for (key, value) in shard.read().iter() {
+                        let covered = def.prefixes.is_empty()
+                            || def.prefixes.iter().any(|p| key.starts_with(p.as_str()));
+                        if covered && crate::vector::is_document(&def.on, value) {
+                            keys.push(key.to_string());
+                        }
+                    }
+                }
+                keys
+            }
+            _ => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
+    // The index goes, and its aliases with it.
+    if !crate::vector::remove_index(&mut ctx.index_store.write(), name) {
+        return Some(resp_error(&crate::commands::search::no_such_index(name)));
     }
+
+    // Replicas and the AOF are sent the documents deleted as DELs, then the
+    // drop without `DD`, in Redis's order and as 1.2 sends them: a replica
+    // that gets only part of it still has the index, to run `DD` again. In
+    // a cluster one DEL names the keys of one slot only, as a slot
+    // migration following the stream sends a command on by its first key.
+    crate::replication::script_feed::effects_begin();
+    let by_slot = ctx.cluster.enabled;
+    let slot_of = |key: &str| {
+        if by_slot {
+            crate::cluster::key_hash_slot(key.as_bytes())
+        } else {
+            0
+        }
+    };
+    let mut documents = documents;
+    if by_slot {
+        documents.sort_by_cached_key(|key| slot_of(key));
+    }
+    let db = *ctx.selected_db;
+    let mut deleted: Vec<Vec<u8>> = Vec::new();
+    let mut slot = documents.first().map(|key| slot_of(key));
+    for key in &documents {
+        if by_slot && slot != Some(slot_of(key)) {
+            slot = Some(slot_of(key));
+            dropindex_del_effect(&mut deleted);
+        }
+        // One that has expired is gone already.
+        if crate::commands::helpers::is_expired(ctx.expiry_store, db, key)
+            || !crate::commands::helpers::delete_key(ctx.store, ctx.expiry_store, db, key)
+        {
+            continue;
+        }
+        crate::vector::maybe_unindex(ctx.index_store, db, key);
+        crate::stats::record_rdb_change();
+        crate::keyspace_events::notify(
+            ctx.pubsub,
+            db,
+            crate::keyspace_events::KS_GENERIC,
+            "del",
+            key,
+        );
+        ctx.watch_registry.notify(db, key);
+        crate::commands::handler::invalidate_tracked_key(ctx, key, true);
+        deleted.push(key.as_bytes().to_vec());
+        if deleted.len() == DROPINDEX_DELS_PER_RECORD {
+            dropindex_del_effect(&mut deleted);
+        }
+    }
+    dropindex_del_effect(&mut deleted);
+    crate::replication::script_feed::effect(vec![
+        b"FT.DROPINDEX".to_vec(),
+        name.as_bytes().to_vec(),
+    ]);
+    Some(resp_simple("OK"))
+}
+
+/// How many keys one propagated DEL of `FT.DROPINDEX … DD` names at most.
+const DROPINDEX_DELS_PER_RECORD: usize = 512;
+
+fn dropindex_del_effect(keys: &mut Vec<Vec<u8>>) {
+    if keys.is_empty() {
+        return;
+    }
+    let mut parts = Vec::with_capacity(keys.len() + 1);
+    parts.push(b"DEL".to_vec());
+    parts.append(keys);
+    crate::replication::script_feed::effect(parts);
 }
 
 // ── FT.ALTER ─────────────────────────────────────────────────────────────────
@@ -212,7 +321,11 @@ fn ft_alter(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let mut store = ctx.index_store.write();
     let def = match store.get_mut(&index_name) {
         Some(d) => d,
-        None => return Some(resp_error("ERR no such index")),
+        None => {
+            return Some(resp_error(&crate::commands::search::no_such_index(
+                &index_name,
+            )));
+        }
     };
 
     // Check for duplicate field names — Redis rejects them
@@ -788,7 +901,11 @@ fn ft_synupdate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let mut store = ctx.index_store.write();
     let def = match store.get_mut(&index_name) {
         Some(d) => d,
-        None => return Some(resp_error("ERR no such index")),
+        None => {
+            return Some(resp_error(&crate::commands::search::no_such_index(
+                &index_name,
+            )));
+        }
     };
 
     // entry().or_insert_with() is the idiomatic Rust "get or create" pattern.
@@ -840,7 +957,11 @@ fn ft_syndump(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let store = ctx.index_store.read();
     let def = match store.get(index_name) {
         Some(d) => d,
-        None => return Some(resp_error("ERR no such index")),
+        None => {
+            return Some(resp_error(&crate::commands::search::no_such_index(
+                index_name,
+            )));
+        }
     };
 
     if def.synonyms.is_empty() {
@@ -978,7 +1099,11 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
         let store = ctx.index_store.read();
         let def = match store.get(&index_name) {
             Some(d) => d,
-            None => return Some(resp_error("ERR no such index")),
+            None => {
+                return Some(resp_error(&crate::commands::search::no_such_index(
+                    &index_name,
+                )));
+            }
         };
         Arc::clone(&def.vocab)
     };
@@ -1327,7 +1452,7 @@ fn ft_alias_add(ctx: &mut Ctx) -> Option<Vec<u8>> {
     }
     // The target may itself be given by alias.
     let Some(real) = crate::vector::resolve_index_name(&store, &index) else {
-        return Some(resp_error("ERR no such index"));
+        return Some(resp_error(&crate::commands::search::no_such_index(&index)));
     };
     let def = store[&real].clone();
     crate::vector::set_alias(&mut store, &alias, &def);
@@ -1372,7 +1497,7 @@ fn ft_alias_update(ctx: &mut Ctx) -> Option<Vec<u8>> {
         return Some(resp_error("ERR Alias already exists as an index name"));
     }
     let Some(real) = crate::vector::resolve_index_name(&store, &index) else {
-        return Some(resp_error("ERR no such index"));
+        return Some(resp_error(&crate::commands::search::no_such_index(&index)));
     };
     let def = store[&real].clone();
     crate::vector::set_alias(&mut store, &alias, &def);
@@ -1399,7 +1524,7 @@ fn ft_alias_list(ctx: &mut Ctx) -> Option<Vec<u8>> {
         .get(index)
         .is_none_or(|def| crate::vector::is_alias(index, def))
     {
-        return Some(resp_error("ERR no such index"));
+        return Some(resp_error(&crate::commands::search::no_such_index(index)));
     }
     let aliases: Vec<Vec<u8>> = crate::vector::index_aliases(&store, index)
         .iter()
@@ -1551,7 +1676,11 @@ fn ft_debug_compact(ctx: &mut Ctx) -> Option<Vec<u8>> {
         let store = ctx.index_store.read();
         let def = match store.get(&index_name) {
             Some(d) => d,
-            None => return Some(resp_error("ERR no such index")),
+            None => {
+                return Some(resp_error(&crate::commands::search::no_such_index(
+                    &index_name,
+                )));
+            }
         };
         match def.indexes.get(&field_name) {
             Some(crate::vector::LiveIndex::Hnsw(_)) => {}

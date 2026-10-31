@@ -120,6 +120,39 @@ pub enum MigrationState {
     Importing { src_id: NodeId },
 }
 
+/// A master that came back without its dataset, still owning its slots.
+///
+/// With no AOF, a master killed outright (no final snapshot) restarts with
+/// nothing, or with a snapshot from some earlier clean stop. If it is back
+/// inside the node timeout nobody fails it over: it keeps its node id and
+/// its slots from nodes.conf and serves them, empty or stale, while its
+/// replica holds the only good copy. The replica used to refuse an empty
+/// master only until clients had written a key or two to it, and then drop
+/// everything it had and load those (the AKS run's B2: 25,939 acknowledged
+/// writes gone, then 53,271 more).
+///
+/// So such a master is fenced: it serves none of its slots (`CLUSTERDOWN`,
+/// and `cluster_state:fail` in its own `CLUSTER INFO`) until one of these:
+///
+/// * a replica that holds its data takes over (it is told, on asking for a
+///   sync, `+LOSTDATA`), and this node, its slots gone, follows it;
+/// * every live replica answers that it holds nothing either — a whole
+///   cluster restarted with no persistence, where someone has to serve;
+/// * every replica of it has failed (FAIL, the masters' verdict: a replica
+///   that is only suspected may be busy taking over);
+/// * no replica that understands `+LOSTDATA` has asked for a sync within
+///   `max(30 s, 6 node timeouts)` — replicas of an older version.
+#[derive(Default)]
+pub struct LostDataset {
+    fenced: AtomicBool,
+    /// When the fence went up (Unix ms).
+    since_ms: AtomicU64,
+    /// How many times a replica was told `+LOSTDATA`.
+    offers: AtomicU64,
+    /// The replicas (`ip`, `port`) that answered they hold nothing.
+    empty_replicas: parking_lot::Mutex<ahash::AHashSet<(String, u16)>>,
+}
+
 pub struct ClusterState {
     pub enabled: bool,
     /// This node's id. Behind a lock only so `CLUSTER RESET HARD` can replace
@@ -166,8 +199,14 @@ pub struct ClusterState {
     pub bus_runtime: std::sync::OnceLock<tokio::runtime::Handle>,
     /// Whether this node is serving: every slot assigned to a node that has
     /// not failed, and a majority of masters reachable. Recomputed by
-    /// [`Self::refresh_state`]; read on the routing path.
+    /// [`Self::refresh_state`].
     state_ok: AtomicBool,
+    /// What the routing path reads: serving, by `state_ok` or because
+    /// `cluster-require-full-coverage` is off, and not fenced for a lost
+    /// dataset. One load. Recomputed by [`Self::refresh_state`].
+    serving: AtomicBool,
+    /// See [`LostDataset`].
+    lost: LostDataset,
     /// `cluster-require-full-coverage`.
     require_full_coverage: AtomicBool,
     /// True while our own IP is the loopback placeholder used when binding to
@@ -225,6 +264,8 @@ impl ClusterState {
             hooks: std::sync::OnceLock::new(),
             bus_runtime: std::sync::OnceLock::new(),
             state_ok: AtomicBool::new(false),
+            serving: AtomicBool::new(false),
+            lost: LostDataset::default(),
             require_full_coverage: AtomicBool::new(true),
             self_ip_is_guess: AtomicBool::new(false),
             bus_secret: std::sync::OnceLock::new(),
@@ -409,6 +450,26 @@ impl ClusterState {
         }
         let repl_state = std::sync::Arc::clone(&hooks.replica_starter.repl_state);
         let _ = self.hooks.set(hooks);
+        let (asked, taker) = (
+            std::sync::Arc::downgrade(self),
+            std::sync::Arc::downgrade(self),
+        );
+        repl_state.install_cluster_link(crate::replication::ClusterLink {
+            master_node: Box::new(move || {
+                let state = asked.upgrade()?;
+                state.my_master_id().map(|id| node_id_str(&id).to_string())
+            }),
+            take_over: Box::new(move |master, why| {
+                taker
+                    .upgrade()
+                    .is_some_and(|state| state.take_over_from(master, why))
+            }),
+        });
+        // A replica that started on a saved resync point holds the stream of
+        // the master nodes.conf names.
+        repl_state.note_stream_origin_if_unknown(
+            self.my_master_id().map(|id| node_id_str(&id).to_string()),
+        );
         self.start_the_clock_on_peers();
         self.start_background_save();
         bus::start(
@@ -682,13 +743,12 @@ impl ClusterState {
         }
     }
 
-    /// Whether keyed commands may be served right now. Always true with
-    /// `cluster-require-full-coverage no`.
+    /// Whether keyed commands may be served right now: the cluster is up,
+    /// or `cluster-require-full-coverage` is off; and this node is not a
+    /// master fenced for a lost dataset ([`LostDataset`]).
     #[inline]
     pub fn is_serving(&self) -> bool {
-        !self.enabled
-            || self.state_ok.load(Ordering::Relaxed)
-            || !self.require_full_coverage.load(Ordering::Relaxed)
+        !self.enabled || self.serving.load(Ordering::Relaxed)
     }
 
     /// `(assigned, ok, pfail, fail)` slot counts, by the state of each slot's
@@ -752,6 +812,7 @@ impl ClusterState {
     pub fn refresh_state(&self) {
         if !self.enabled {
             self.state_ok.store(true, Ordering::Relaxed);
+            self.serving.store(true, Ordering::Relaxed);
             return;
         }
         let (assigned, _ok, _pfail, fail) = self.slot_health();
@@ -781,7 +842,184 @@ impl ClusterState {
                 ok = false;
             }
         }
+        let fenced = self.fence_holds();
+        let ok = ok && !fenced;
         self.state_ok.store(ok, Ordering::Relaxed);
+        self.serving.store(
+            !fenced && (ok || !self.require_full_coverage.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+        );
+    }
+
+    // ── A master back without its dataset ────────────────────────────────────
+
+    /// Decide, once at startup — after the dataset is loaded, before any
+    /// client is served — whether this node is a master that came back
+    /// without its dataset: see [`LostDataset`]. `trusted` is true when the
+    /// dataset is known to be all the node had: the AOF is on, or the
+    /// previous process stopped cleanly with the snapshot that was loaded
+    /// (`replication::take_clean_exit_marker`), or an operator chose it
+    /// (`preload-file`). A restart of either kind goes on exactly as before.
+    pub fn check_dataset_at_start(&self, trusted: bool, keys: usize) {
+        if !self.enabled || trusted {
+            return;
+        }
+        let me = self.myself();
+        let (is_master, replicas) = {
+            let nodes = self.nodes.read();
+            let is_master = nodes
+                .get(&me)
+                .is_some_and(|n| n.flags.contains(NodeFlags::MASTER));
+            let replicas = nodes.values().filter(|n| n.master_id == Some(me)).count();
+            (is_master, replicas)
+        };
+        if !is_master || !self.owns_any_slot(me) {
+            return;
+        }
+        if replicas == 0 {
+            log_warn!(
+                "Cluster: This master came back without its dataset ({keys} keys loaded; no AOF, \
+                 and no snapshot from a clean shutdown), and has no replica that could hold it: \
+                 serving what it has"
+            );
+            return;
+        }
+        self.lost.since_ms.store(now_ms(), Ordering::Relaxed);
+        self.lost.fenced.store(true, Ordering::Relaxed);
+        log_warn!(
+            "Cluster: This master came back without its dataset ({keys} keys loaded; no AOF, and \
+             no snapshot from a clean shutdown). It serves none of its slots until a replica that \
+             holds them takes over, or its replicas answer that they hold nothing either"
+        );
+        self.refresh_state();
+    }
+
+    /// Whether this node is fenced for a lost dataset ([`LostDataset`]).
+    pub fn lost_dataset(&self) -> bool {
+        self.lost.fenced.load(Ordering::Relaxed)
+    }
+
+    /// A replica was told `+LOSTDATA`.
+    pub fn note_lost_dataset_offer(&self) {
+        self.lost.offers.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A replica told `+LOSTDATA` answered that it holds nothing (it asked
+    /// for a sync again). Returns whether the fence is down: every live
+    /// replica of this master has said so.
+    pub fn replica_has_nothing(&self, ip: &str, port: u16) -> bool {
+        if !self.lost.fenced.load(Ordering::Relaxed) {
+            return true;
+        }
+        let answered = {
+            let mut set = self.lost.empty_replicas.lock();
+            set.insert((ip.to_string(), port));
+            set.len()
+        };
+        let live = self.live_replicas_of_me();
+        if answered < live {
+            log_info!(
+                "Cluster: Replica {ip}:{port} holds nothing of this master's lost dataset; \
+                 waiting for {} more",
+                live - answered
+            );
+            return false;
+        }
+        self.lift_fence("its replicas hold nothing of it either");
+        self.refresh_state();
+        true
+    }
+
+    /// The periodic look at the fence (from the failure detector): lifted
+    /// when every replica has failed, or when none that understands
+    /// `+LOSTDATA` has asked for a sync in time.
+    pub fn check_lost_dataset_fence(&self) {
+        if !self.lost.fenced.load(Ordering::Relaxed) {
+            return;
+        }
+        if self.live_replicas_of_me() == 0 {
+            self.lift_fence("every replica of it has failed: none can take over");
+            self.refresh_state();
+            return;
+        }
+        let waited = now_ms().saturating_sub(self.lost.since_ms.load(Ordering::Relaxed));
+        let limit = (6 * self.node_timeout_ms).max(30_000);
+        if self.lost.offers.load(Ordering::Relaxed) == 0 && waited > limit {
+            self.lift_fence(&format!(
+                "no replica able to take over has asked for a sync in {} s (an older version?)",
+                limit / 1000
+            ));
+            self.refresh_state();
+        }
+    }
+
+    /// Whether the fence still holds; it falls by itself once this node no
+    /// longer serves slots as a master (a replica took over, and this node
+    /// follows it). Called by `refresh_state`: takes `nodes` and `slots`,
+    /// one after the other.
+    fn fence_holds(&self) -> bool {
+        if !self.lost.fenced.load(Ordering::Relaxed) {
+            return false;
+        }
+        let me = self.myself();
+        let master = self
+            .nodes
+            .read()
+            .get(&me)
+            .is_some_and(|n| n.flags.contains(NodeFlags::MASTER));
+        if master && self.owns_any_slot(me) {
+            return true;
+        }
+        self.lift_fence("it serves no slots any more");
+        false
+    }
+
+    fn lift_fence(&self, why: &str) {
+        if self.lost.fenced.swap(false, Ordering::Relaxed) {
+            log_warn!("Cluster: Lost-dataset fence lifted: {why}");
+        }
+    }
+
+    /// This master's replicas, in its view, that have not failed. One only
+    /// suspected (PFAIL) counts: a replica winning an election can be slow
+    /// to answer pings while it saves its new configuration, and the fence
+    /// must not fall then — this master would take writes that the
+    /// promotion then throws away.
+    fn live_replicas_of_me(&self) -> usize {
+        let me = self.myself();
+        self.nodes
+            .read()
+            .values()
+            .filter(|n| {
+                n.master_id == Some(me)
+                    && !n.flags.intersects(NodeFlags::FAIL | NodeFlags::HANDSHAKE)
+            })
+            .count()
+    }
+
+    /// Have this replica take over from `master` (a node id) at once, with
+    /// an election that does not wait for the master to be failed — what
+    /// `CLUSTER FAILOVER FORCE` starts. For a master that has lost the data
+    /// this replica holds. False if `master` is not this node's master.
+    pub fn take_over_from(self: &std::sync::Arc<Self>, master: &str, why: &str) -> bool {
+        let Some(master_id) = parse_node_id(master.as_bytes()) else {
+            return false;
+        };
+        if self.my_master_id() != Some(master_id) {
+            return false;
+        }
+        if self.election.lock().is_some() || self.election_pending.load(Ordering::SeqCst) {
+            return true;
+        }
+        let Some(bus) = self.bus_runtime.get() else {
+            return false;
+        };
+        log_warn!("Cluster: Taking over from master {master}: {why}");
+        let state = std::sync::Arc::clone(self);
+        bus.spawn(async move {
+            bus::heartbeat::start_forced_election(&state, master_id).await;
+        });
+        true
     }
 
     pub fn current_epoch(&self) -> u64 {
@@ -2172,6 +2410,71 @@ mod tests {
             "two of three unreachable: the minority side"
         );
         assert_eq!(cs.cluster_state_str(), "fail");
+    }
+
+    // ── A master back without its dataset ────────────────────────────────
+
+    /// A dataset known to be whole (AOF, clean stop) is served as before; a
+    /// master back without one serves nothing until its replicas have said
+    /// they hold nothing either.
+    #[test]
+    fn a_master_back_without_its_dataset_is_fenced_until_its_replicas_answer() {
+        let (cs, _a, _b) = three_master_cluster();
+        let me = cs.myself();
+        add_replica(&cs, me);
+        add_replica(&cs, me);
+        cs.check_dataset_at_start(true, 0);
+        assert!(cs.is_serving() && !cs.lost_dataset());
+
+        cs.check_dataset_at_start(false, 0);
+        assert!(cs.lost_dataset());
+        assert!(!cs.is_serving());
+        assert_eq!(cs.cluster_state_str(), "fail");
+        // Periodic look: both replicas are live, so it holds.
+        cs.check_lost_dataset_fence();
+        assert!(!cs.is_serving());
+
+        assert!(!cs.replica_has_nothing("10.0.0.2", 7001));
+        assert!(
+            !cs.replica_has_nothing("10.0.0.2", 7001),
+            "the same one twice"
+        );
+        assert!(!cs.is_serving());
+        assert!(cs.replica_has_nothing("10.0.0.3", 7001));
+        assert!(cs.is_serving() && !cs.lost_dataset());
+        assert_eq!(cs.cluster_state_str(), "ok");
+    }
+
+    /// With no replica that could take over, there is nothing to wait for.
+    #[test]
+    fn a_master_back_without_its_dataset_or_reachable_replicas_serves() {
+        let (cs, _a, _b) = three_master_cluster();
+        cs.check_dataset_at_start(false, 0);
+        assert!(cs.is_serving(), "no replica at all: not fenced");
+
+        let me = cs.myself();
+        let r = add_replica(&cs, me);
+        cs.check_dataset_at_start(false, 0);
+        assert!(!cs.is_serving());
+        set_flag(&cs, r, NodeFlags::PFAIL);
+        cs.check_lost_dataset_fence();
+        assert!(!cs.is_serving(), "only suspected: it may be taking over");
+        set_flag(&cs, r, NodeFlags::FAIL);
+        cs.check_lost_dataset_fence();
+        assert!(cs.is_serving() && !cs.lost_dataset());
+    }
+
+    /// Once a replica has taken the slots over, the fence falls with them.
+    #[test]
+    fn the_fence_falls_with_the_slots() {
+        let (cs, _a, _b) = three_master_cluster();
+        let me = cs.myself();
+        add_replica(&cs, me);
+        cs.check_dataset_at_start(false, 0);
+        assert!(!cs.is_serving());
+        cs.release_slot_range(0, 5460).unwrap();
+        cs.refresh_state();
+        assert!(!cs.lost_dataset());
     }
 
     // ── FAIL is not forever ──────────────────────────────────────────────

@@ -372,7 +372,11 @@ fn report_8_schema_errors_name_the_problem() {
     assert_eq!(err.err(), "No schema found");
     // None of them left an index behind.
     for index in ["r8:a", "r8:b", "r8:c", "r8:d", "r8:e", "r8:f"] {
-        assert!(c.cmd(&["FT.INFO", index]).err().contains("no such index"));
+        assert!(
+            c.cmd(&["FT.INFO", index])
+                .err()
+                .contains("Index not found: ")
+        );
     }
     // An index that is there cannot be created again.
     assert!(c.cmd(&["FT.CREATE", "r8:ok", "SCHEMA", "f", "TEXT"]).ok());
@@ -1136,7 +1140,7 @@ fn sorting_paging_and_what_is_returned() {
     assert!(
         c.cmd(&["FT.SEARCH", "nosuch", "*"])
             .err()
-            .contains("no such index")
+            .contains("Index not found: ")
     );
 }
 
@@ -2221,8 +2225,23 @@ fn a_cursor_reads_an_aggregation_a_few_rows_at_a_time() {
     assert_eq!(titles(&reply), ["Alien", "Arrival", "Fargo"]);
     assert_eq!(reply.arr()[1].i().to_string(), cursor);
     // Another index's name does not open it.
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "a3other",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "a3other:",
+            "SCHEMA",
+            "title",
+            "TEXT",
+        ])
+        .ok()
+    );
     assert_eq!(
-        c.cmd(&["FT.CURSOR", "READ", "q1", &cursor]).err(),
+        c.cmd(&["FT.CURSOR", "READ", "a3other", &cursor]).err(),
         "Cursor not found"
     );
     assert!(c.cmd(&["FT.CURSOR", "DEL", "a3", &cursor]).ok());
@@ -2242,8 +2261,15 @@ fn a_cursor_reads_an_aggregation_a_few_rows_at_a_time() {
     assert!(c.cmd(&["FT.DROPINDEX", "a3"]).ok());
     assert_eq!(
         c.cmd(&["FT.CURSOR", "READ", "a3", &cursor]).err(),
-        "Cursor not found"
+        "SEARCH_INDEX_NOT_FOUND Index not found: a3"
     );
+    // Asked of an index that is not there, as Redis answers: first.
+    for sub in ["READ", "DEL", "GC"] {
+        assert_eq!(
+            c.cmd(&["FT.CURSOR", sub, "nosuch", "not-a-number"]).err(),
+            "SEARCH_INDEX_NOT_FOUND Index not found: nosuch"
+        );
+    }
 }
 
 /// `FT.EXPLAIN` echoed the query back; `FT.PROFILE` returned an empty array.

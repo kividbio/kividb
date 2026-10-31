@@ -1753,7 +1753,7 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
     if !copy {
         for key in &moved {
             crate::commands::helpers::delete_key(ctx.store, ctx.expiry_store, db, key);
-            crate::vector::maybe_unindex(ctx.index_store, key);
+            crate::vector::maybe_unindex(ctx.index_store, db, key);
         }
     }
 
