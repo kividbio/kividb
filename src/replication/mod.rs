@@ -1132,6 +1132,11 @@ pub fn save_dataset(
     index_store: &crate::vector::IndexStore,
     repl_state: &ReplState,
 ) -> std::io::Result<()> {
+    // No other checkpoint or save from here to the point saved beside the
+    // dump below, which must be the point of this dump. Taken before the
+    // applier's lock, so the applier does not wait while this waits for
+    // its turn (and nothing that has its turn waits for that lock).
+    let turn = crate::aof::checkpoint_turn()?;
     // The replica's applier is between commands, and stays there until the
     // save is done: the point read here is the dataset written below.
     let _applying = repl_state.apply_lock.lock();
@@ -1144,7 +1149,7 @@ pub fn save_dataset(
     // instant the dataset is captured: no write is half-way then.
     let mut master_point: Option<(String, u64)> = None;
     if crate::aof::AOF_ENABLED.load(Ordering::Relaxed) {
-        crate::aof::checkpoint_noting(store, expiry_store, index_store, &mut || {
+        crate::aof::checkpoint_noting(&turn, store, expiry_store, index_store, &mut || {
             if !repl_state.is_slave() && repl_state.feeds_hub() {
                 master_point = Some((
                     repl_state.repl_id(),
@@ -1181,6 +1186,7 @@ pub fn save_dataset(
         }
     }
     crate::stats::RDB_SAVES.fetch_add(1, Ordering::Relaxed);
+    drop(turn);
     Ok(())
 }
 
