@@ -143,6 +143,12 @@ pub fn of_id(id: usize) -> Option<Target> {
 /// or after both; and the order of its keys, so that its record falls where
 /// its change did among the other writes to them. Both nest: a command that
 /// holds them already takes nothing more.
+///
+/// Never entered for the first time with a hash tag's lock held: whoever
+/// takes one holds the write gate already (`tag_locks`), a read too. A
+/// read that took a tag and then entered the gate here, to delete a key it
+/// found past its time, hung behind a checkpoint that waited for a writer
+/// waiting for the tag.
 pub struct Ordered {
     _order: crate::write_order::OrderGuard,
     _gate: crate::write_gate::WriteGuard,
