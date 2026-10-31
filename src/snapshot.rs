@@ -1989,9 +1989,10 @@ fn write_hnsw_graph(
 
     w.write_all(&(count as u32).to_le_bytes())?;
 
+    let mut links: Vec<u32> = Vec::new();
     for id in 0..count {
-        let node = match nodes.get(id) {
-            Some(node) if !node.vector.is_empty() => node,
+        let (node, vector) = match (nodes.get(id), hnsw.vector(id)) {
+            (Some(node), Some(vector)) => (node, vector),
             _ => {
                 w.write_all(&[0u8])?; // tombstone slot
                 continue;
@@ -1999,21 +2000,19 @@ fn write_hnsw_graph(
         };
         w.write_all(&[1u8])?; // live node
         write_bytes(w, node.key.as_bytes())?;
-        w.write_all(&(node.vector.len() as u32).to_le_bytes())?;
-        for f in &node.vector {
+        w.write_all(&(vector.len() as u32).to_le_bytes())?;
+        for f in vector {
             w.write_all(&f.to_le_bytes())?;
         }
-        let neighbors = node.neighbors.lock().clone();
-        w.write_all(&(neighbors.len() as u32).to_le_bytes())?;
-        for layer_neighbors in &neighbors {
-            let kept: Vec<usize> = layer_neighbors
-                .iter()
-                .copied()
-                .filter(|&nb| nb < count)
-                .collect();
-            w.write_all(&(kept.len() as u32).to_le_bytes())?;
-            for nb_id in kept {
-                w.write_all(&(nb_id as u32).to_le_bytes())?;
+        let layers = node.layer_count();
+        w.write_all(&(layers as u32).to_le_bytes())?;
+        for layer in 0..layers {
+            links.clear();
+            hnsw.links(&nodes, id, layer, &mut links);
+            links.retain(|&nb| (nb as usize) < count);
+            w.write_all(&(links.len() as u32).to_le_bytes())?;
+            for &nb_id in &links {
+                w.write_all(&nb_id.to_le_bytes())?;
             }
         }
     }
@@ -2066,21 +2065,16 @@ fn read_hnsw_graphs(
         r.read_exact(&mut ncount_buf)?;
         let node_count = u32::from_le_bytes(ncount_buf) as usize;
 
-        let mut nodes: Vec<crate::vector::HnswNode> = Vec::with_capacity(hint(node_count));
-        let mut key_to_id: ahash::AHashMap<String, usize> =
-            ahash::AHashMap::with_capacity(hint(node_count));
-        let mut live_count: usize = 0;
-        let mut tombstone_count: usize = 0;
+        let mut nodes: Vec<Option<crate::vector::RestoredNode>> =
+            Vec::with_capacity(hint(node_count));
 
-        for node_id in 0..node_count {
+        for _ in 0..node_count {
             let mut live_flag = [0u8];
             r.read_exact(&mut live_flag)?;
 
             if live_flag[0] == 0 {
-                tombstone_count += 1;
-                nodes.push(crate::vector::HnswNode::tombstone());
+                nodes.push(None);
             } else {
-                live_count += 1;
                 let key_bytes = read_bytes(r)?;
                 let key = String::from_utf8(key_bytes)
                     .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad hnsw key"))?;
@@ -2117,8 +2111,11 @@ fn read_hnsw_graphs(
                     neighbors.push(nb_list);
                 }
 
-                key_to_id.insert(key.clone(), node_id);
-                nodes.push(crate::vector::HnswNode::new(key, vector, neighbors));
+                nodes.push(Some(crate::vector::RestoredNode {
+                    key,
+                    vector,
+                    neighbors,
+                }));
             }
         }
 
@@ -2135,21 +2132,10 @@ fn read_hnsw_graphs(
         r.read_exact(&mut efc_buf)?;
         let ef_construction = u32::from_le_bytes(efc_buf) as usize;
 
-        // An entry point outside the graph would be read out of bounds by
-        // the first search: start from any live node instead.
-        let entry_point = match entry_point {
-            Some(id) if id < node_count => Some(id),
-            _ => key_to_id.values().next().copied(),
-        };
-        let hnsw = crate::vector::HnswIndex::restore(
-            m,
-            ef_construction,
-            nodes,
-            key_to_id,
-            entry_point,
-            live_count,
-            tombstone_count,
-        );
+        // An entry point outside the graph, or deleted, would be read out
+        // of bounds by the first search: `restore` starts from any live
+        // node instead.
+        let hnsw = crate::vector::HnswIndex::restore(m, ef_construction, nodes, entry_point);
         out.entry(idx_name)
             .or_default()
             .insert(fld_name, std::sync::Arc::new(hnsw));
