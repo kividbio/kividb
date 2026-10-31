@@ -1722,8 +1722,9 @@ impl Config {
             // A setting `CONFIG SET` takes that is the server's as a whole
             // (`array-slice-size`, `busy-reply-threshold`, ...): set, and
             // checked, as `CONFIG SET` sets it. One of Redis's that KiviDB has
-            // no use for (`maxclients`, ...) is remembered, as `CONFIG SET`
-            // remembers it, so that a redis.conf carried over starts (#142).
+            // no use for (`hash-max-listpack-entries`, ...) is remembered, as
+            // `CONFIG SET` remembers it, so that a redis.conf carried over
+            // starts (#142).
             _ => {
                 if args.is_empty() {
                     return Err(format!("'{key}' needs a value"));
@@ -1743,6 +1744,7 @@ impl Config {
                             "latency-monitor-threshold"
                                 | "ts-duplicate-policy"
                                 | "aof-ack-after-write"
+                                | "maxclients"
                         ) || crate::commands::server::remembered_config(key).is_none() => {}
                     Some(_) => return no_effect("KiviDB has no such setting"),
                     None if key.starts_with("cluster-")
@@ -2050,10 +2052,12 @@ mod config_file_tests {
              proto-max-bulk-len 512mb\nlatency-monitor-threshold 0\nacllog-max-len 128\n",
         )
         .unwrap();
-        // All but latency-monitor-threshold, which the latency monitor goes
-        // by (#158).
-        assert_eq!(warnings.len(), 5, "{warnings:?}");
-        assert!(warnings[0].contains("'maxclients'"), "{warnings:?}");
+        // All but maxclients and latency-monitor-threshold, which the
+        // latency monitor goes by (#158).
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
+        assert!(warnings[0].contains("'latency-tracking'"), "{warnings:?}");
+        let err = load("maxclients 0\n").unwrap_err();
+        assert!(err.contains("maxclients"), "{err}");
         let err = load("array-slice-size 300\n").unwrap_err();
         assert!(err.contains("power of two"), "{err}");
         let err = load("stream-node-max-entries -1\n").unwrap_err();

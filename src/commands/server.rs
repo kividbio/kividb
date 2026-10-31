@@ -864,6 +864,24 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     "ERR argument couldn't be parsed into an integer",
                 )),
             },
+            // More clients only if the open-file limit can be raised for
+            // them, as in Redis; set below in `config_set_global`.
+            "maxclients" => {
+                let n = value
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|&n| n as usize > crate::client_registry::max_clients())?;
+                match crate::client_registry::clients_that_fit(n as usize) {
+                    Ok(fits) if fits == n as usize => None,
+                    Ok(fits) => Some(resp_error(&format!(
+                        "ERR The operating system is not able to handle the specified \
+                         number of clients, try with {fits}"
+                    ))),
+                    Err(e) => Some(resp_error(&format!(
+                        "ERR Can't read the open-file limit: {e}"
+                    ))),
+                }
+            }
             // A per-server setting, so it is handled here: `config_set_global`
             // has no context to store it in.
             "hll-write-format" => {
@@ -1060,6 +1078,18 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                     }
                 }
             }
+            "maxclients" => match value.parse::<u32>() {
+                Ok(n) if n >= 1 => {
+                    crate::client_registry::set_max_clients(n as usize);
+                    REMEMBERED_CONFIG
+                        .lock()
+                        .insert(param.clone(), n.to_string());
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR argument must be between 1 and 4294967295 inclusive",
+                )),
+            },
             "maxmemory-clients" => {
                 let value = match value.strip_suffix('%') {
                     Some(percent) => match percent.parse::<u64>() {
