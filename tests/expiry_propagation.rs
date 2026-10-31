@@ -1195,3 +1195,13 @@ fn a_read_under_a_tag_meets_a_cut(writer_too: bool) {
 fn a_read_under_a_tag_the_sweep_and_a_cut_do_not_deadlock() {
     a_read_under_a_tag_meets_a_cut(false);
 }
+
+/// The same with a write to the tag in place of the sweep: it holds its
+/// slot of the write gate, as it must, while it waits for the tag. So the
+/// sweep's own order is not enough: a read must not enter the write gate
+/// while it holds a tag's lock.
+#[cfg(feature = "lua")]
+#[test]
+fn a_read_under_a_tag_a_write_and_a_cut_do_not_deadlock() {
+    a_read_under_a_tag_meets_a_cut(true);
+}

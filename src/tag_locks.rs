@@ -38,6 +38,15 @@
 // The locks are stripes: a fixed table indexed by a hash of the tag. Two
 // tags that land on one stripe wait for each other when they need not, and
 // nothing else.
+//
+// Whoever takes a tag's lock holds the write gate (`write_gate`) first, a
+// read as a write does: the gate, then the tags' locks, then the keys'
+// order. A read under a tag's lock that finds a key past its time deletes
+// it, and its `DEL` is logged and propagated under the write gate
+// (`expiry::order`). Entering the gate there, with the tag held, hung the
+// server: a write to the tag, or active expiry, held a slot of the gate and
+// waited for the tag, and a checkpoint, holding the read's slot already,
+// waited for theirs.
 
 use parking_lot::{Mutex, MutexGuard};
 use std::cell::{Cell, RefCell};
@@ -140,6 +149,9 @@ pub fn take_next_script_allowed() -> bool {
 /// script running beside others — its tag's lock.
 pub struct ScriptGuard {
     _stripe: Option<MutexGuard<'static, ()>>,
+    /// Entered before the stripe is taken, and let go of after it: a
+    /// read-only script (`EVAL_RO`) holds no write gate otherwise.
+    _gate: Option<crate::write_gate::WriteGuard>,
     /// Whether this guard is the one that set the tag: a tagged script
     /// called by a tagged script leaves the outer one's in place.
     outermost: bool,
@@ -155,7 +167,11 @@ impl Drop for ScriptGuard {
     }
 }
 
-fn hold(tag: &[u8], stripe: Option<MutexGuard<'static, ()>>) -> ScriptGuard {
+fn hold(
+    tag: &[u8],
+    stripe: Option<MutexGuard<'static, ()>>,
+    gate: Option<crate::write_gate::WriteGuard>,
+) -> ScriptGuard {
     let outermost = SCRIPT_TAG.with(|held| {
         let mut held = held.borrow_mut();
         if held.is_some() {
@@ -170,6 +186,7 @@ fn hold(tag: &[u8], stripe: Option<MutexGuard<'static, ()>>) -> ScriptGuard {
     }
     ScriptGuard {
         _stripe: stripe,
+        _gate: gate,
         outermost,
         _not_send: PhantomData,
     }
@@ -180,8 +197,13 @@ fn hold(tag: &[u8], stripe: Option<MutexGuard<'static, ()>>) -> ScriptGuard {
 /// The script has had its turn among the scripts of its tag already
 /// ([`script_turn`]), so what this waits for, if anything, is a client's
 /// command on a key of the tag: a moment.
+///
+/// The write gate first, as for any tag's lock (see the top): a read-only
+/// script holds none otherwise, and one that finds a key past its time
+/// enters it to delete the key.
 pub fn lock_for_script(tag: &[u8]) -> ScriptGuard {
-    hold(tag, Some(STRIPE[stripe_of(tag)].0.lock()))
+    let gate = crate::write_gate::enter();
+    hold(tag, Some(STRIPE[stripe_of(tag)].0.lock()), Some(gate))
 }
 
 /// The turns of the scripts of each stripe: see [`script_turn`].
@@ -201,7 +223,7 @@ pub async fn script_turn(tag: &[u8]) -> tokio::sync::MutexGuard<'static, ()> {
 /// Hold a script to `tag` without the lock: one that has the command gate
 /// alone, and so has nothing to be locked against.
 pub fn hold_script_to(tag: &[u8]) -> ScriptGuard {
-    hold(tag, None)
+    hold(tag, None, None)
 }
 
 /// Whether this thread is running a script that is held to a tag.
@@ -236,14 +258,20 @@ pub fn script_tag_for_message() -> String {
     })
 }
 
-/// Held by a command from a client: the lock of every tagged key it names.
+/// Held by a command from a client: the lock of every tagged key it names,
+/// and the write gate, entered before them and let go of after them.
 pub struct KeysGuard {
     _one: Option<MutexGuard<'static, ()>>,
     _more: Vec<MutexGuard<'static, ()>>,
+    _gate: crate::write_gate::WriteGuard,
 }
 
 /// Take the lock of each tagged key in `keys`. `None` — nothing taken, and
 /// nothing allocated — when no key has a tag, which is the usual case.
+///
+/// The write gate first (see the top), for a read too: one that finds a key
+/// past its time deletes it under the gate, and must not enter it with a
+/// tag held. A write holds the gate already, and this costs it a count.
 pub fn lock_keys<'a>(keys: impl Iterator<Item = &'a [u8]>) -> Option<KeysGuard> {
     let mut first: Option<usize> = None;
     let mut more: Vec<usize> = Vec::new();
@@ -257,10 +285,12 @@ pub fn lock_keys<'a>(keys: impl Iterator<Item = &'a [u8]>) -> Option<KeysGuard> 
         }
     }
     let first = first?;
+    let gate = crate::write_gate::enter();
     if more.is_empty() {
         return Some(KeysGuard {
             _one: Some(STRIPE[first].0.lock()),
             _more: Vec::new(),
+            _gate: gate,
         });
     }
     // Several: in the order of the table, so that two commands naming the
@@ -274,6 +304,7 @@ pub fn lock_keys<'a>(keys: impl Iterator<Item = &'a [u8]>) -> Option<KeysGuard> 
             .into_iter()
             .map(|stripe| STRIPE[stripe].0.lock())
             .collect(),
+        _gate: gate,
     })
 }
 
@@ -551,6 +582,29 @@ mod tests {
                 .join()
                 .unwrap();
         });
+    }
+
+    /// A tag's lock is never held without the write gate: whoever takes
+    /// one enters the gate first, and lets go of it after.
+    #[test]
+    fn a_tag_is_held_inside_the_write_gate() {
+        assert!(!crate::write_gate::held_by_this_thread());
+        let keys = lock_keys([b"{gated}:k".as_slice()].into_iter());
+        assert!(crate::write_gate::held_by_this_thread());
+        drop(keys);
+        assert!(!crate::write_gate::held_by_this_thread());
+        assert!(lock_keys([b"untagged".as_slice()].into_iter()).is_none());
+        assert!(!crate::write_gate::held_by_this_thread(), "no tag, no gate");
+        let script = lock_for_script(b"gated");
+        assert!(crate::write_gate::held_by_this_thread());
+        drop(script);
+        assert!(!crate::write_gate::held_by_this_thread());
+        let held = hold_script_to(b"gated");
+        assert!(
+            !crate::write_gate::held_by_this_thread(),
+            "no lock, no gate"
+        );
+        drop(held);
     }
 
     #[test]
