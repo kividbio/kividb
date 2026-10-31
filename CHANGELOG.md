@@ -107,8 +107,10 @@ A patch release of 1.1.0.
   reset its search data this way (mem0's `Memory.reset()`, RedisVL's
   `SearchIndex.delete()`) found its old documents still there. The keys the
   index covered are now deleted, for HASH and JSON indexes alike, each with
-  a `del` keyspace event. Replicas and the AOF get the drop and a `DEL` of
-  each document deleted, as Redis sends them; a `DD` already in an AOF
+  a `del` keyspace event. Replicas and the AOF get `DEL`s of the documents
+  deleted and then the drop without `DD`, in Redis's order and as 1.2 sends
+  them, so a replica that got only part of it still has the index to run
+  `DD` again; a `DD` already in an AOF
   written by an earlier 1.1, or sent by such a master, still keeps the
   documents, as that server did. In a cluster every master deletes its own.
   Anything else after the index name is now refused with `Unknown argument`.

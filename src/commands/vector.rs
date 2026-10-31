@@ -163,16 +163,32 @@ fn ft_dropindex(ctx: &mut Ctx) -> Option<Vec<u8>> {
         return Some(resp_error(&crate::commands::search::no_such_index(name)));
     }
 
-    // Replicas and the AOF are sent the drop without `DD`, then a DEL of
-    // each document deleted, as Redis sends them.
+    // Replicas and the AOF are sent the documents deleted as DELs, then the
+    // drop without `DD`, in Redis's order and as 1.2 sends them: a replica
+    // that gets only part of it still has the index, to run `DD` again. In
+    // a cluster one DEL names the keys of one slot only, as a slot
+    // migration following the stream sends a command on by its first key.
     crate::replication::script_feed::effects_begin();
-    crate::replication::script_feed::effect(vec![
-        b"FT.DROPINDEX".to_vec(),
-        name.as_bytes().to_vec(),
-    ]);
+    let by_slot = ctx.cluster.enabled;
+    let slot_of = |key: &str| {
+        if by_slot {
+            crate::cluster::key_hash_slot(key.as_bytes())
+        } else {
+            0
+        }
+    };
+    let mut documents = documents;
+    if by_slot {
+        documents.sort_by_cached_key(|key| slot_of(key));
+    }
     let db = *ctx.selected_db;
     let mut deleted: Vec<Vec<u8>> = Vec::new();
+    let mut slot = documents.first().map(|key| slot_of(key));
     for key in &documents {
+        if by_slot && slot != Some(slot_of(key)) {
+            slot = Some(slot_of(key));
+            dropindex_del_effect(&mut deleted);
+        }
         // One that has expired is gone already.
         if crate::commands::helpers::is_expired(ctx.expiry_store, db, key)
             || !crate::commands::helpers::delete_key(ctx.store, ctx.expiry_store, db, key)
@@ -196,6 +212,10 @@ fn ft_dropindex(ctx: &mut Ctx) -> Option<Vec<u8>> {
         }
     }
     dropindex_del_effect(&mut deleted);
+    crate::replication::script_feed::effect(vec![
+        b"FT.DROPINDEX".to_vec(),
+        name.as_bytes().to_vec(),
+    ]);
     Some(resp_simple("OK"))
 }
 
