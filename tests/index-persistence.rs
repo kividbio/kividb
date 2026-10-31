@@ -2257,6 +2257,16 @@ fn dropindex_dd_is_logged_as_the_drop_and_deletes() {
         "DD logged"
     );
     assert_eq!(count(b"$3\r\nDEL\r\n"), 2, "a DEL for each index");
+    // The DELs first, then the drop, as Redis and 1.2 send them.
+    let at = |needle: &[u8]| aof.windows(needle.len()).position(|w| w == needle).unwrap();
+    assert!(
+        at(b"$3\r\nDEL\r\n$5\r\ndoc:") < at(b"$12\r\nFT.DROPINDEX\r\n$6\r\nidx:dd\r\n"),
+        "the drop before the DEL"
+    );
+    assert!(
+        at(b"$3\r\nDEL\r\n$6\r\njdoc:1") < at(b"$12\r\nFT.DROPINDEX\r\n$7\r\nidx:ddj\r\n"),
+        "the drop before the DEL"
+    );
     // Written, then deleted.
     assert_eq!(count(b"$5\r\ndoc:1\r\n"), 2);
     assert_eq!(count(b"$6\r\njdoc:1\r\n"), 2);
