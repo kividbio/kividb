@@ -211,7 +211,7 @@ fn flag_set(resp: u8, flags: &[&str]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{lookup, reply};
+    use super::{TABLE, lookup, reply};
 
     #[test]
     fn get_matches_command_json() {
@@ -226,12 +226,36 @@ mod tests {
     }
 
     #[test]
-    fn since_is_real_not_one_oh() {
+    fn since_matches_redis_versions() {
         assert_eq!(lookup("XADD").unwrap().since, "5.0.0");
         assert_eq!(lookup("GETEX").unwrap().since, "6.2.0");
-        assert_eq!(lookup("HEXPIRE").unwrap().since, "9.0.0");
+        assert_eq!(lookup("HEXPIRE").unwrap().since, "7.4.0");
+        assert_eq!(lookup("HGETEX").unwrap().since, "8.0.0");
+        assert_eq!(lookup("HGETDEL").unwrap().since, "8.0.0");
+        assert_eq!(lookup("MSETEX").unwrap().since, "8.4.0");
+        assert_eq!(lookup("CLUSTER|SYNCSLOTS").unwrap().since, "");
         assert_eq!(lookup("ARSET").unwrap().since, "8.8.0");
         assert_eq!(lookup("DIGEST").unwrap().since, "8.4.0");
+    }
+
+    #[test]
+    fn since_does_not_name_a_newer_redis_release() {
+        for (name, docs) in TABLE {
+            if docs.since.is_empty() {
+                continue;
+            }
+            let parts: Vec<u8> = docs
+                .since
+                .split('.')
+                .map(|part| part.parse().expect("numeric version"))
+                .collect();
+            assert_eq!(parts.len(), 3, "{name}: {}", docs.since);
+            assert!(
+                (parts[0], parts[1], parts[2]) <= (8, 10, 0),
+                "{name}: {}",
+                docs.since
+            );
+        }
     }
 
     #[test]
