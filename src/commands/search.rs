@@ -754,6 +754,7 @@ pub(crate) fn scan_docs(
     let mut seen = 0usize;
     for shard in db.iter() {
         let map = shard.read();
+        let expired = expired_in(&map);
         let mut left = map.len();
         let mut docs = map.iter();
         while left > 0 {
@@ -764,14 +765,33 @@ pub(crate) fn scan_docs(
                 }
             }
             let this_run = left.min(run);
-            for (key, value) in docs.by_ref().take(this_run) {
-                each(key, value);
+            if expired.is_empty() {
+                for (key, value) in docs.by_ref().take(this_run) {
+                    each(key, value);
+                }
+            } else {
+                for (key, value) in docs.by_ref().take(this_run) {
+                    if !expired.contains(key) {
+                        each(key, value);
+                    }
+                }
             }
             left -= this_run;
             seen += this_run;
         }
     }
     false
+}
+
+/// The keys of a shard whose time to live has ended, which nothing has
+/// deleted yet: no documents, as a read finds them.
+fn expired_in(map: &crate::store::ShardMap) -> AHashSet<String> {
+    if map.ttl_len() == 0 {
+        return AHashSet::new();
+    }
+    let now = crate::commands::helpers::now_ms();
+    let (due, _) = map.due(now, usize::MAX);
+    due.into_iter().map(|key| key.to_string()).collect()
 }
 
 /// Whether a step over `n` items that cannot stop part-way (a sort) is to
@@ -977,6 +997,10 @@ pub(crate) struct Plan {
     pub ids: Bits,
     /// They are exactly the matches; otherwise each is to be tried.
     pub exact: bool,
+    /// Some documents of the index have fields with a time to live: what
+    /// their postings hold may be behind them (whether they match was tried
+    /// on them).
+    pub volatile: bool,
 }
 
 /// The documents of `def` that `filter` may match, among `only` if given,
@@ -1028,6 +1052,7 @@ pub(crate) fn plan(
         (ids, exact, volatile)
     };
     let store = &ctx.store[db];
+    let any_volatile = !volatile.is_empty();
     for (key, id) in volatile {
         if exact {
             let matches = with_doc(store, def, &key, |fields, _| filter::eval(filter, fields));
@@ -1040,12 +1065,16 @@ pub(crate) fn plan(
             ids.set(id);
         }
     }
-    Some(Plan { ids, exact })
+    Some(Plan {
+        ids,
+        exact,
+        volatile: any_volatile,
+    })
 }
 
 /// The keys of the documents `ids` names, in id order.
 pub(crate) fn keys_of(def: &IndexDef, ids: &Bits) -> Vec<Arc<str>> {
-    let p = def.postings.read();
+    let p = def.postings.peek();
     ids.iter().filter_map(|id| p.key(id).cloned()).collect()
 }
 
@@ -1139,12 +1168,16 @@ pub(crate) fn filter_each(
     // The keys to look at, if they are known without reading everything: the
     // ones the caller named, or the ones the TEXT index names. Those are the
     // matches if the TEXT index says so, and it is of this database.
-    let found = candidates(filter, def).map(|(ids, exact)| {
-        (
-            keys_of(def, &ids),
-            exact && def.db_index == *ctx.selected_db,
-        )
-    });
+    let found = {
+        // Every write queued so far applied (the TEXT index's part too: see
+        // `postings::WithId`), and no id given back while the TEXT index's
+        // are turned into keys. The postings, then the TEXT index.
+        let p = def.postings.read();
+        candidates(filter, def).map(|(ids, exact)| {
+            let keys: Vec<Arc<str>> = ids.iter().filter_map(|id| p.key(id).cloned()).collect();
+            (keys, exact && def.db_index == *ctx.selected_db)
+        })
+    };
     let (known, exact): (Option<Vec<Arc<str>>>, bool) = match (only, found) {
         (Some(only), Some((found, exact))) => (
             Some(found.into_iter().filter(|k| only.contains(&**k)).collect()),
@@ -1200,11 +1233,17 @@ pub(crate) fn with_doc<R>(
     key: &str,
     f: impl FnOnce(&Fields, Option<&serde_json::Value>) -> R,
 ) -> Option<R> {
-    // Out of the shard, so that its lock is not held while `f` runs.
-    let value = crate::store::get_shard(db, key)
-        .read()
-        .get(key)
-        .map(ValueRef::to_value)?;
+    // Out of the shard, so that its lock is not held while `f` runs. A key
+    // whose time to live has ended is no document, though nothing has
+    // deleted it yet.
+    let value = {
+        let map = crate::store::get_shard(db, key).read();
+        let (value, expires) = map.get_expiring(key)?;
+        if expires.is_some_and(crate::commands::helpers::is_past) {
+            return None;
+        }
+        value.to_value()
+    };
     match (&def.on, &value) {
         (IndexOn::Hash, KiviDBValue::Hash(hash)) => Some(f(&hash.read(), None)),
         (IndexOn::Hash, KiviDBValue::HashEx(hash)) => Some(f(&hash.read().fields, None)),
@@ -1217,6 +1256,364 @@ pub(crate) fn with_doc<R>(
         }
         _ => None,
     }
+}
+
+// ── The page, from postings ──────────────────────────────────────────────────
+//
+// A query whose matches the postings know exactly (`Plan::exact`), in an
+// order they know too, has its page picked from them: of the 250,000
+// documents a broad TAG filter matches, the ten on the page are read, not
+// the 250,000. How many match is the size of the set. What the reply shows
+// of a document (its fields, score, sort key) is read off the documents of
+// the page, as the full path reads it, so the reply is the full path's.
+//
+// The orders are the full path's:
+// * no SORTBY: by relevance, then by key. Without a query word to score,
+//   every match scores the same, so: by key.
+// * SORTBY a NUMERIC field: by its number (`f64::total_cmp`), then by key;
+//   the documents without a number last, by key, either way round.
+//
+// A key whose time to live has ended is no document, though nothing has
+// deleted it yet (`with_doc`): those are found in the keyspace's lists of
+// keys with a time to live, while the lists are no longer than the matches
+// are many. In a cluster, only the keys of the slots this node serves count.
+//
+// The full path answers instead whenever this cannot: text to score, a
+// vector clause, SORTBY another kind of field, a NUMERIC field holding NaN
+// (no place in the postings' order), field TTLs under a numeric order, more
+// keys with a time to live than matches, or a document of the page found
+// changed since the postings were read.
+
+/// A page of FT.SEARCH picked from postings, and how many documents match.
+struct Posted {
+    page: Vec<Hit>,
+    total: usize,
+    timed_out: bool,
+}
+
+/// What a page picked from postings is in the order of.
+#[derive(Clone, Copy)]
+enum PageOrder<'a> {
+    /// The key: what relevance comes down to when every match scores the same.
+    Key,
+    /// The number in the NUMERIC field read from `field`, then the key.
+    Number { field: &'a str, ascending: bool },
+}
+
+/// The deadline of a pick from postings: the clock read every
+/// [`DEADLINE_EVERY`] steps, and once past it, past it.
+struct Clock {
+    deadline: Option<Instant>,
+    seen: u32,
+    out: bool,
+}
+
+impl Clock {
+    fn new(deadline: Option<Instant>) -> Self {
+        Self {
+            deadline,
+            seen: 0,
+            out: false,
+        }
+    }
+
+    /// One more step: whether the deadline has passed.
+    #[inline]
+    fn ran_out(&mut self) -> bool {
+        if !self.out && deadline_due(self.deadline, &mut self.seen) {
+            self.out = true;
+        }
+        self.out
+    }
+}
+
+/// Whether every document `filter` matches has the same relevance, so that
+/// without SORTBY the order is the key's alone (the full path's tie-break).
+/// Scored as `vector::score` scores (Redis 8's way): a word by its
+/// frequency; a TAG value by how many documents hold it, against the
+/// document's TEXT length, and `*` against that length too; a NUMERIC
+/// clause and `NOT` the same for every document. In an index with no TEXT
+/// field every length is 0. TFIDF and BM25 (not BM25STD) divide by what
+/// differs from document to document.
+fn every_match_scores_the_same(
+    def: &IndexDef,
+    filter: &Filter,
+    scorer: crate::vector::score::Scorer,
+) -> bool {
+    use crate::vector::score::Scorer;
+    fn same(filter: &Filter, lengths: bool) -> bool {
+        match filter {
+            Filter::MatchNone
+            | Filter::Numeric { .. }
+            | Filter::NumericNot { .. }
+            | Filter::Not(_) => true,
+            Filter::MatchAll => !lengths,
+            Filter::Tag {
+                values, prefixes, ..
+            } => !lengths && values.len() == 1 && prefixes.is_empty(),
+            Filter::And(l, r) => same(l, lengths) && same(r, lengths),
+            _ => false,
+        }
+    }
+    let lengths = def.text_fields().next().is_some();
+    match scorer {
+        Scorer::DocScore | Scorer::Hamming => true,
+        Scorer::Tfidf | Scorer::TfidfDocNorm | Scorer::Bm25 if lengths => false,
+        _ => same(filter, lengths),
+    }
+}
+
+/// FT.SEARCH's page and count from postings, reading only the documents of
+/// the page: see above. `None` where the full path is to answer.
+fn page_from_postings(
+    ctx: &Ctx,
+    def: &IndexDef,
+    filter: &Filter,
+    args: &SearchArgs,
+    deadline: Option<Instant>,
+) -> Option<Posted> {
+    // A distance is no part of the postings.
+    if filter.vector_range().is_some() {
+        return None;
+    }
+    let scorer = args
+        .scorer
+        .unwrap_or_else(crate::vector::score::Scorer::default_scorer);
+    let (order, numeric) = match &args.sortby {
+        // Only the count (LIMIT 0 0): no order to keep.
+        None if args.count == 0 || every_match_scores_the_same(def, filter, scorer) => {
+            (PageOrder::Key, None)
+        }
+        None => return None,
+        Some((name, ascending)) => {
+            let field = def
+                .field_by_attribute(name)
+                .filter(|f| matches!(f.field_type, FieldType::Numeric))?;
+            let order = PageOrder::Number {
+                field: &field.name,
+                ascending: *ascending,
+            };
+            (order, Some(field.name.as_str()))
+        }
+    };
+    if def.postings.peek().read_all {
+        return None;
+    }
+    let plan = plan(ctx, def, filter, args.inkeys.as_ref())?;
+    // Exactly the matches. Ordered by a number, with the numbers the
+    // documents hold, which a field's time to live may have taken away.
+    if !plan.exact || (plan.volatile && numeric.is_some()) {
+        return None;
+    }
+    let mut ids = plan.ids;
+    let db = &ctx.store[*ctx.selected_db];
+
+    // Keys whose time to live has ended, which nothing has deleted yet.
+    let ttls: usize = db.iter().map(|shard| shard.ttl_count()).sum();
+    let mut expired: Vec<crate::store::Key> = Vec::new();
+    if ttls > 0 {
+        // Reading the documents costs less than going through the lists.
+        if ttls > ids.count() {
+            return None;
+        }
+        let now = crate::commands::helpers::now_ms();
+        for shard in db.iter() {
+            if !shard.holds_no_ttl() {
+                expired.extend(shard.read().due(now, usize::MAX).0);
+            }
+        }
+    }
+
+    // How many of the matches the page needs, in order.
+    let need = if args.count == 0 {
+        0
+    } else {
+        args.offset.saturating_add(args.count)
+    };
+    let (picked, total, timed_out) = {
+        // What was written since the plan is not among its ids.
+        let p = def.postings.peek();
+        // Documents that left the index since the plan was made.
+        ids.and_with(p.live());
+        for key in &expired {
+            if let Some(id) = p.id(key) {
+                ids.unset(id);
+            }
+        }
+        if ctx.cluster.enabled {
+            let slots = crate::cluster::search::served_slots(ctx.cluster);
+            let mut served = Bits::new();
+            for id in ids.iter() {
+                let slot = p.slot(id) as usize;
+                if slots[slot / 64] & (1 << (slot % 64)) != 0 {
+                    served.set(id);
+                }
+            }
+            ids = served;
+        }
+        let total = ids.count();
+        let need = need.min(total);
+        let mut clock = Clock::new(deadline);
+        let first: Vec<(u32, Option<f64>)> = match order {
+            PageOrder::Key => first_by_key(&p, &ids, need, total, &mut clock)
+                .into_iter()
+                .map(|id| (id, None))
+                .collect(),
+            PageOrder::Number { field, ascending } => {
+                first_by_number(&p, field, &ids, need, ascending, &mut clock)?
+            }
+        };
+        let picked: Vec<(Arc<str>, Option<f64>)> = first
+            .into_iter()
+            .skip(args.offset)
+            .filter_map(|(id, number)| Some((Arc::clone(p.key(id)?), number)))
+            .collect();
+        (picked, total, clock.out)
+    };
+
+    // The documents of the page. One that is gone, no longer matches, or
+    // holds another number than the postings had was written after they
+    // were read: then the full path answers. Scored as the full path scores
+    // (a TEXT query, its words read off the TEXT index, comes here too when
+    // sorted by a number).
+    let scoring = crate::vector::score::Scoring::new(def, filter, scorer);
+    let mut page = Vec::with_capacity(picked.len());
+    for (key, number) in picked {
+        let hit = with_doc(db, def, &key, |fields, _| {
+            if !filter::eval(filter, fields) {
+                return None;
+            }
+            let sort_key = match numeric {
+                Some(source) => {
+                    let found = sort_key_of(fields, source, true, false);
+                    let same = match (&found, number) {
+                        (Some(SortKey::Number(x)), Some(n)) => x.to_bits() == n.to_bits(),
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    if !same {
+                        return None;
+                    }
+                    found
+                }
+                None => None,
+            };
+            Some(Hit {
+                key: key.to_string(),
+                score: relevance(def, &key, fields, &scoring),
+                extras: Vec::new(),
+                sort_key,
+            })
+        })
+        .flatten()?;
+        page.push(hit);
+    }
+    Some(Posted {
+        page,
+        total,
+        timed_out,
+    })
+}
+
+/// The key of document `id`, from postings `p`.
+#[inline]
+fn key_of(p: &Postings, id: u32) -> &str {
+    p.key(id).map_or("", |key| &**key)
+}
+
+/// The first `need` of `ids` (`of` of them) in the order of their keys,
+/// from the postings' order of them (`Postings::first_by_key`). Cut short
+/// when `clock` runs out: then the first of those found.
+fn first_by_key(p: &Postings, ids: &Bits, need: usize, of: usize, clock: &mut Clock) -> Vec<u32> {
+    p.first_by_key(ids, need, of, &mut || clock.ran_out())
+}
+
+/// The first `need` of `ids` in the order SORTBY gives the NUMERIC field
+/// read from `field`: by the number (`f64::total_cmp`), ascending or not,
+/// then by key; those without a number last, by key. Each with its number.
+/// `None` if a document holds NaN, which has no place in the postings'
+/// order. Cut short when `clock` runs out.
+fn first_by_number(
+    p: &Postings,
+    field: &str,
+    ids: &Bits,
+    need: usize,
+    ascending: bool,
+    clock: &mut Clock,
+) -> Option<Vec<(u32, Option<f64>)>> {
+    let numbers = p.numbers(field)?;
+    if numbers.any_nan() {
+        return None;
+    }
+    let mut valued = ids.clone();
+    valued.and_with(numbers.has());
+    let with_number = valued.count();
+    let want = need.min(with_number);
+    let mut picked: Vec<(f64, u32)> = Vec::with_capacity(want);
+    if want > 0 {
+        let value = |id: u32| numbers.value(id).unwrap_or(0.0);
+        let cmp = |a: &(f64, u32), b: &(f64, u32)| {
+            let order = a.0.total_cmp(&b.0);
+            let order = if ascending { order } else { order.reverse() };
+            order.then_with(|| key_of(p, a.1).cmp(key_of(p, b.1)))
+        };
+        // Going through the numbers in order meets the `want` first after
+        // about want * ordered / with_number of them; taking the number of
+        // each, after with_number. Whichever is fewer.
+        let walked = want as u128 * numbers.ordered() as u128 / with_number as u128;
+        // Matches bunched up late in the numbers' order make the walk far
+        // longer than that: past four times as long, it gives up, and the
+        // number of each is taken instead.
+        let mut gave_up = false;
+        if walked < with_number as u128 {
+            let mut budget = (walked * 4).max(4096);
+            // Those equal to the last one wanted are taken too: their keys
+            // decide which of them are on the page.
+            let mut last: Option<u64> = None;
+            numbers.walk(ascending, |place, id| {
+                if clock.ran_out() || last.is_some_and(|last| last != place) {
+                    return false;
+                }
+                if budget == 0 {
+                    gave_up = true;
+                    return false;
+                }
+                budget -= 1;
+                if valued.get(id) {
+                    picked.push((value(id), id));
+                    if picked.len() == want {
+                        last = Some(place);
+                    }
+                }
+                true
+            });
+        }
+        if walked >= with_number as u128 || gave_up {
+            picked.clear();
+            for id in valued.iter() {
+                if clock.ran_out() {
+                    break;
+                }
+                picked.push((value(id), id));
+            }
+            if want < picked.len() {
+                picked.select_nth_unstable_by(want, cmp);
+                picked.truncate(want);
+            }
+        }
+        picked.sort_unstable_by(cmp);
+        picked.truncate(want);
+    }
+    let mut first: Vec<(u32, Option<f64>)> =
+        picked.into_iter().map(|(n, id)| (id, Some(n))).collect();
+    if need > with_number && !clock.out {
+        let mut rest = ids.clone();
+        rest.and_not(numbers.has());
+        let of = rest.count();
+        let more = first_by_key(p, &rest, need - with_number, of, clock);
+        first.extend(more.into_iter().map(|id| (id, None)));
+    }
+    Some(first)
 }
 
 // ── FT.SEARCH arguments ───────────────────────────────────────────────────────
@@ -1488,6 +1885,19 @@ enum SortKey {
 }
 
 /// A float as Redis prints one: the shortest text that reads back the same.
+/// What SORTBY orders a document by: its field `source`, a number if the
+/// field is NUMERIC, folded to lower case unless the field is UNF.
+fn sort_key_of(fields: &Fields, source: &str, numeric: bool, unf: bool) -> Option<SortKey> {
+    let raw = std::str::from_utf8(fields.get(source)?).ok()?;
+    if numeric {
+        raw.trim().parse::<f64>().ok().map(SortKey::Number)
+    } else if unf {
+        Some(SortKey::Text(raw.to_string()))
+    } else {
+        Some(SortKey::Text(raw.to_lowercase()))
+    }
+}
+
 pub(crate) fn number_text(value: f64) -> String {
     if value == value.trunc() && value.abs() < 1e15 {
         format!("{}", value as i64)
@@ -1633,9 +2043,16 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
     let mut terms = AHashSet::new();
     query_terms(&filter, &mut terms);
 
-    // ── The matches, in the query's own order ────────────────────────────────
+    // ── The page, from postings, where they know it ─────────────────────────
+    let posted = match &query.knn {
+        Some(_) => None,
+        None => page_from_postings(ctx, &def, &filter, &args, deadline),
+    };
+
+    // ── Otherwise every match, in the query's own order ─────────────────────
     let mut timed_out = false;
     let mut hits: Vec<Hit> = match &query.knn {
+        _ if posted.is_some() => Vec::new(),
         Some(knn) => {
             let field = def
                 .fields
@@ -1760,7 +2177,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
     }
 
     // ── SORTBY ───────────────────────────────────────────────────────────────
-    if let Some((name, ascending)) = &args.sortby {
+    if let Some((name, ascending)) = args.sortby.as_ref().filter(|_| posted.is_none()) {
         let schema_field = def.field_by_attribute(name);
         let numeric = schema_field.is_some_and(|f| matches!(f.field_type, FieldType::Numeric));
         let unf = schema_field.is_some_and(|f| f.options.unf);
@@ -1780,14 +2197,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
             hit.sort_key = match hit.extras.iter().find(|(alias, _)| alias == name) {
                 Some((_, value)) => value.parse::<f64>().ok().map(SortKey::Number),
                 None => with_doc(db, &def, &hit.key, |fields, _| {
-                    let raw = std::str::from_utf8(fields.get(source)?).ok()?.to_string();
-                    if numeric {
-                        raw.trim().parse::<f64>().ok().map(SortKey::Number)
-                    } else if unf {
-                        Some(SortKey::Text(raw))
-                    } else {
-                        Some(SortKey::Text(raw.to_lowercase()))
-                    }
+                    sort_key_of(fields, source, numeric, unf)
                 })
                 .flatten(),
             };
@@ -1814,19 +2224,27 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
             });
         }
     }
+    // ── The page ─────────────────────────────────────────────────────────────
+    let (page, total) = match posted {
+        Some(posted) => {
+            timed_out = posted.timed_out;
+            (posted.page, posted.total)
+        }
+        None => {
+            let total = hits.len();
+            let page: Vec<Hit> = hits
+                .into_iter()
+                .skip(args.offset)
+                .take(args.count)
+                .collect();
+            (page, total)
+        }
+    };
     // A shard answers with what it found and whether it timed out; the
     // coordinator applies `ON_TIMEOUT`.
     if timed_out && !shard && on_timeout_fails() {
         return Err("Timeout limit was reached".into());
     }
-
-    // ── The page ─────────────────────────────────────────────────────────────
-    let total = hits.len();
-    let page: Vec<Hit> = hits
-        .into_iter()
-        .skip(args.offset)
-        .take(args.count)
-        .collect();
     let nocontent = args.nocontent || args.returns.as_ref().is_some_and(|r| r.is_empty());
 
     // The fields of one hit, as (name, value).
@@ -2434,6 +2852,124 @@ mod tests {
                 .unwrap_err()
                 .contains("Unknown argument `BOGUS`")
         );
+    }
+
+    /// Postings of `count` documents `k0` …, their NUMERIC field `n` from
+    /// `values` in turn.
+    fn numbered(values: &[&str], count: usize) -> Postings {
+        let schema = vec![SchemaField {
+            name: "n".into(),
+            field_type: FieldType::Numeric,
+            options: FieldOptions::default(),
+        }];
+        let mut p = Postings::new(&schema);
+        for i in 0..count {
+            let value: Arc<[u8]> = Arc::from(values[i % values.len()].as_bytes());
+            p.write(&format!("k{i}"), &[("n".to_string(), value)], true);
+        }
+        // What the postings' thread does once there is enough of it.
+        while p.tidy_step() {}
+        p
+    }
+
+    /// `ids` in the full path's SORTBY order: every one sorted.
+    fn sorted_whole(p: &Postings, ids: &Bits, ascending: bool) -> Vec<u32> {
+        use std::cmp::Ordering;
+        let numbers = p.numbers("n").unwrap();
+        let mut all: Vec<u32> = ids.iter().collect();
+        all.sort_by(|&a, &b| {
+            let order = match (numbers.value(a), numbers.value(b)) {
+                (Some(x), Some(y)) if ascending => x.total_cmp(&y),
+                (Some(x), Some(y)) => y.total_cmp(&x),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            };
+            order.then_with(|| key_of(p, a).cmp(key_of(p, b)))
+        });
+        all
+    }
+
+    #[test]
+    fn a_page_from_postings_is_in_the_full_paths_order() {
+        // Ties, minus zero beside zero, infinities, and a value that is no
+        // number (last, either way round).
+        let p = numbered(
+            &["3", "-0", "0", "x", "-1.5", "3", "inf", "-inf", "0", "7"],
+            300,
+        );
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..40 {
+            // From all of them to a few: both ways through the numbers.
+            let keep = [100, 90, 50, 10, 2][round % 5];
+            let mut ids = Bits::new();
+            for id in p.live().iter() {
+                if next() % 100 < keep {
+                    ids.set(id);
+                }
+            }
+            let of = ids.count();
+            for ascending in [true, false] {
+                let whole = sorted_whole(&p, &ids, ascending);
+                let needs = [0, 1, 2, 5, 17, of / 2, of.saturating_sub(1), of];
+                for need in needs.into_iter().filter(|&need| need <= of) {
+                    let mut clock = Clock::new(None);
+                    let first: Vec<u32> =
+                        first_by_number(&p, "n", &ids, need, ascending, &mut clock)
+                            .unwrap()
+                            .into_iter()
+                            .map(|(id, _)| id)
+                            .collect();
+                    assert_eq!(
+                        first.as_slice(),
+                        &whole[..need],
+                        "round {round}, {need} of {of}, ascending {ascending}"
+                    );
+                    assert!(!clock.out);
+                }
+            }
+            let mut by_key: Vec<u32> = ids.iter().collect();
+            by_key.sort_by(|&a, &b| key_of(&p, a).cmp(key_of(&p, b)));
+            for need in [0, 1, 3, of / 5, of / 3, of]
+                .into_iter()
+                .filter(|&n| n <= of)
+            {
+                let first = first_by_key(&p, &ids, need, of, &mut Clock::new(None));
+                assert_eq!(first.as_slice(), &by_key[..need], "round {round}");
+            }
+        }
+        // A NaN anywhere in the field: no order from the postings.
+        let p = numbered(&["1", "nan"], 10);
+        assert!(first_by_number(&p, "n", p.live(), 3, true, &mut Clock::new(None)).is_none());
+    }
+
+    #[test]
+    fn a_page_from_postings_stops_at_the_deadline() {
+        let p = numbered(&["1", "2", "x"], 5000);
+        let Some(past) = Instant::now().checked_sub(Duration::from_secs(1)) else {
+            return;
+        };
+        // The clock is read after 1024 documents: the first of those.
+        let mut clock = Clock::new(Some(past));
+        let first = first_by_key(&p, p.live(), 3000, 5000, &mut clock);
+        assert!(clock.out);
+        assert!(first.len() < 3000, "{}", first.len());
+        let mut clock = Clock::new(Some(past));
+        let first = first_by_number(&p, "n", p.live(), 4000, true, &mut clock).unwrap();
+        assert!(clock.out);
+        assert!(first.len() < 4000, "{}", first.len());
+        // Without a deadline, whole: those with a number, then the others.
+        let mut clock = Clock::new(None);
+        let first = first_by_number(&p, "n", p.live(), 4000, true, &mut clock).unwrap();
+        assert_eq!(first.len(), 4000);
+        assert!(first[3333].1.is_some() && first[3334].1.is_none());
+        assert!(!clock.out);
     }
 
     #[test]

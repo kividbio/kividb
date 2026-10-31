@@ -864,6 +864,18 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     "ERR argument couldn't be parsed into an integer",
                 )),
             },
+            // A per-server setting, so it is handled here: `config_set_global`
+            // has no context to store it in.
+            "hll-write-format" => {
+                let v = value.to_ascii_lowercase();
+                if v != "legacy" && v != "redis" {
+                    return Some(resp_error(
+                        "ERR CONFIG SET failed (possibly related to argument 'hll-write-format') - argument(s) must be one of the following: legacy redis",
+                    ));
+                }
+                ctx.repl_state.set_hll_write_redis(v == "redis");
+                Some(resp_simple("OK"))
+            }
             // What a running Redis cannot be told either.
             "daemonize" | "databases" | "pidfile" | "logfile" | "log-format" | "unixsocket"
             | "supervised" | "io-threads" | "tcp-backlog" | "set-proc-title" | "appendfilename"
@@ -1609,6 +1621,15 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
         (
             "search-min-stem-len",
             crate::commands::search_tools::config_value("MINSTEMLEN"),
+        ),
+        (
+            "hll-write-format",
+            if ctx.repl_state.hll_write_redis() {
+                "redis"
+            } else {
+                "legacy"
+            }
+            .to_string(),
         ),
     ];
     for (name, value) in in_effect {

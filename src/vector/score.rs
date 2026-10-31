@@ -37,7 +37,7 @@
 
 use super::IndexDef;
 use super::filter::{Doc, Filter, TextMatch};
-use super::postings::Bits;
+use super::postings::{Bits, Postings};
 use super::stem::STEM_PREFIX;
 use super::text::{TextIndex, Token};
 use ahash::AHashMap;
@@ -425,6 +425,10 @@ impl<'q> Scoring<'q> {
             Scorer::Hamming => return 0.0,
             _ => {}
         }
+        // The postings, then the TEXT index: the order a write takes them in
+        // (see `postings::WithId`). A TAG prefix counts its values' documents
+        // there.
+        let postings = def.postings.peek();
         let text = def.text.read();
         let entry = id.map_or(&[][..], |id| text.doc(id));
         let terms = DocTerms::read(
@@ -433,10 +437,11 @@ impl<'q> Scoring<'q> {
             &self.wanted,
             self.scorer == Scorer::Tfidf,
         );
-        let Some(res) = self.node(def, &text, self.filter, &terms, doc) else {
+        let Some(res) = self.node(def, &postings, &text, self.filter, &terms, doc) else {
             return 0.0;
         };
         drop(text);
+        drop(postings);
         let raw = res.value;
         match self.scorer {
             Scorer::Bm25Std => raw,
@@ -533,6 +538,7 @@ impl<'q> Scoring<'q> {
     fn node(
         &self,
         def: &IndexDef,
+        postings: &Postings,
         text: &TextIndex,
         filter: &Filter,
         doc: &DocTerms,
@@ -613,7 +619,7 @@ impl<'q> Scoring<'q> {
                 let tag = |value: &str| {
                     let df = match self.tag_df.get(&(field.clone(), value.to_string())) {
                         Some(df) => *df,
-                        None => def.postings.read().tag_docs(field, value),
+                        None => postings.tag_docs(field, value),
                     };
                     Res::leaf(Kind::Term, self.term(1, df, doc.len), Vec::new())
                 };
@@ -639,13 +645,13 @@ impl<'q> Scoring<'q> {
                 super::filter::eval(filter, fields)
                     .then(|| Res::leaf(Kind::Numeric, self.numeric_value(), Vec::new()))
             }
-            Filter::Not(inner) => match self.node(def, text, inner, doc, fields) {
+            Filter::Not(inner) => match self.node(def, postings, text, inner, doc, fields) {
                 Some(_) => None,
                 None if super::filter::eval(inner, fields) => None,
                 None => Some(Res::leaf(Kind::Virtual, 0.0, Vec::new())),
             },
             Filter::Optional(inner) => Some(
-                self.node(def, text, inner, doc, fields)
+                self.node(def, postings, text, inner, doc, fields)
                     .unwrap_or_else(|| Res::leaf(Kind::Virtual, 0.0, Vec::new())),
             ),
             Filter::And(..) | Filter::Or(..) => {
@@ -654,7 +660,7 @@ impl<'q> Scoring<'q> {
                 operands(filter, &mut parts);
                 let mut children = Vec::with_capacity(parts.len());
                 for part in parts {
-                    match self.node(def, text, part, doc, fields) {
+                    match self.node(def, postings, text, part, doc, fields) {
                         Some(res) => children.push(res),
                         None if and => return None,
                         None => {}

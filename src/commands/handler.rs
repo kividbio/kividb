@@ -934,9 +934,13 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // MIGRATE is deliberately not gated. It blocks on the network for up to
     // its timeout, which would stall every write behind a cut, and it needs no
     // protection: it propagates as an idempotent `DEL`.
+    //
+    // Nor is FT.DROPINDEX here: with `DD` it may delete millions of documents,
+    // and it takes the gate, and the order of their keys, a few at a time
+    // itself (`vector::ft_dropindex`).
     let writes_operation = replication::command_mutates_for_replication(name, &ctx.cmd);
     let script = matches!(name, "EVAL" | "EVALSHA" | "FCALL");
-    let gated = (writes_operation && name != "MIGRATE") || script;
+    let gated = (writes_operation && name != "MIGRATE" && name != "FT.DROPINDEX") || script;
 
     // And, while anything is listening to the write stream, a write is
     // ordered against the other writes to the same keys, so that the stream

@@ -125,6 +125,22 @@ pub fn parse_reply(bytes: &[u8]) -> Result<Reply, String> {
     read_reply(&mut BufReader::new(bytes))
 }
 
+/// The slots this node answers for, as [`serves`] has them: one bit each,
+/// read off the slot table at once. A query that filters many keys looks
+/// each one's slot up here instead of taking three locks for it.
+pub fn served_slots(cluster: &ClusterState) -> Vec<u64> {
+    let me = cluster.myself();
+    let master = cluster.my_master_id();
+    let slots = cluster.slots.read();
+    let mut served = vec![0u64; slots.len().div_ceil(64)];
+    for (slot, owner) in slots.iter().enumerate() {
+        if owner.is_some() && (*owner == Some(me) || *owner == master) {
+            served[slot / 64] |= 1 << (slot % 64);
+        }
+    }
+    served
+}
+
 /// Whether this node answers for `key`: its slot is this node's, or, on a
 /// replica, its master's.
 pub fn serves(cluster: &ClusterState, key: &str) -> bool {
