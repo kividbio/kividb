@@ -211,7 +211,7 @@ fn flag_set(resp: u8, flags: &[&str]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{lookup, reply};
+    use super::{TABLE, lookup, reply};
 
     #[test]
     fn get_matches_command_json() {
@@ -229,9 +229,25 @@ mod tests {
     fn since_is_real_not_one_oh() {
         assert_eq!(lookup("XADD").unwrap().since, "5.0.0");
         assert_eq!(lookup("GETEX").unwrap().since, "6.2.0");
-        assert_eq!(lookup("HEXPIRE").unwrap().since, "9.0.0");
+        assert_eq!(lookup("HEXPIRE").unwrap().since, "7.4.0");
+        assert_eq!(lookup("HGETDEL").unwrap().since, "8.0.0");
+        assert_eq!(lookup("MSETEX").unwrap().since, "8.4.0");
         assert_eq!(lookup("ARSET").unwrap().since, "8.8.0");
         assert_eq!(lookup("DIGEST").unwrap().since, "8.4.0");
+    }
+
+    /// Clients read `since` against Redis's versions, so none may be newer
+    /// than the `redis_version` INFO reports.
+    #[test]
+    fn since_is_not_past_newest_redis() {
+        let parse = |v: &str| -> Vec<u32> { v.split('.').map(|n| n.parse().unwrap()).collect() };
+        let newest = parse("8.10.0");
+        for (name, docs) in TABLE {
+            if !docs.since.is_empty() {
+                assert!(parse(docs.since) <= newest, "{name}: {}", docs.since);
+            }
+        }
+        assert_eq!(lookup("CLUSTER|SYNCSLOTS").unwrap().since, "");
     }
 
     #[test]
