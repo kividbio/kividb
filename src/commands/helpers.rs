@@ -457,6 +457,17 @@ fn expire_batch(
     // AOF together when it ends: replayed, the script's write made the key
     // again. Taken first, as a command takes it.
     let _command = crate::command_gate::enter();
+    // Then the rest in the order a command takes them: the write gate, the
+    // locks of the keys' hash tags, the keys' order. A script that runs
+    // beside others under its tag (`tag_locks`) holds the command gate only
+    // as a command does, and its tag's lock: without that lock, a key of the
+    // tag went from under the script all the same.
+    let _gate = told.map(|_| crate::write_gate::enter());
+    let _tags = if crate::tag_locks::enabled() {
+        crate::tag_locks::lock_keys(batch.iter().map(|k| k.as_bytes()))
+    } else {
+        None
+    };
     let ordered = told.map(|_| crate::expiry::order(db, batch.iter().map(|k| k.as_bytes())));
     // Writes were paused, for a handoff say, while this waited for the
     // gate: a `DEL` now would come after the cut the handoff took. The

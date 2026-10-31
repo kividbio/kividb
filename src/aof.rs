@@ -1288,9 +1288,26 @@ pub fn replay_aof(
         {
             stats.errors += 1;
         }
+        if let Some(delay) = test_replay_delay() {
+            std::thread::sleep(delay);
+        }
     }
 
     Ok(stats)
+}
+
+/// For the tests of what runs beside a replay, and never set otherwise:
+/// `KIVIDB_TEST_REPLAY_DELAY_MS`, how long each command of a replay of the
+/// AOF takes, after it is applied.
+fn test_replay_delay() -> Option<std::time::Duration> {
+    static DELAY: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *DELAY.get_or_init(|| {
+        let ms: u64 = std::env::var("KIVIDB_TEST_REPLAY_DELAY_MS")
+            .ok()?
+            .parse()
+            .ok()?;
+        Some(std::time::Duration::from_millis(ms))
+    })
 }
 
 pub const AOF_PATH: &str = "appendonly.aof";
