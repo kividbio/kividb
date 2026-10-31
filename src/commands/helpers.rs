@@ -411,6 +411,12 @@ fn stale(seen: usize, due: usize) -> bool {
 /// beside others under the keys' hash tag (`tag_locks`). Taken there, the
 /// key went from under the script, and its `DEL` went ahead of the script's
 /// writes. And nothing while a dataset is being loaded (`expiry::Loading`).
+///
+/// The tags' locks are not waited for (`tag_locks::try_lock_keys`): a key
+/// whose tag is held is left for the next cycle. Waiting for one, holding a
+/// slot of the write gate, hung the server: a read under the tag that found
+/// a key expired waited for the same slot, behind a checkpoint that waited
+/// for the sweep.
 fn expire_batch(
     store: &Store,
     index_store: &IndexStore,
@@ -424,11 +430,22 @@ fn expire_batch(
     // the keys' tags' locks, the keys' order.
     let _command = crate::command_gate::enter();
     let _gate = told.map(|_| crate::write_gate::enter());
-    let _tags = if crate::tag_locks::enabled() {
-        crate::tag_locks::lock_keys(batch.iter().map(|k| k.as_bytes()))
+    let tags = if crate::tag_locks::enabled() {
+        crate::tag_locks::try_lock_keys(batch.iter().map(|k| k.as_bytes()))
     } else {
         None
     };
+    // The keys of a tag that is held are left for the next cycle.
+    let batch: Vec<&Key> = match &tags {
+        Some(tags) if tags.left_some() => batch
+            .iter()
+            .filter(|key| tags.may_take(key.as_bytes()))
+            .collect(),
+        _ => batch.iter().collect(),
+    };
+    if batch.is_empty() {
+        return;
+    }
     let ordered = told.map(|_| crate::expiry::order(db, batch.iter().map(|k| k.as_bytes())));
     // Writes were paused, for a handoff say, while this waited for the
     // gate: a `DEL` now would come after the cut the handoff took. The
@@ -443,7 +460,7 @@ fn expire_batch(
         // Looked at with the shard locked: a load counted in after this
         // finds the keys gone before it writes to them.
         if !crate::expiry::loading() {
-            for key in batch {
+            for key in batch.iter().copied() {
                 if let Some(value) = values.remove_if_due(key.as_str(), now) {
                     freed.push(value);
                     gone.push(key);
