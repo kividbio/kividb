@@ -1362,6 +1362,27 @@ mod tests {
     }
 
     #[test]
+    fn a_key_past_its_time_is_not_written_in_place() {
+        let mut map = ShardMap::new();
+        // SET k v KEEPTTL, INCR, SETRANGE's fallback: a new key, no time to live.
+        map.insert_str_expiring("set", "5", Some(1));
+        assert!(matches!(map.set_str("set", "6"), Written::Replaced(_)));
+        assert_eq!(text(map.get("set")), Some(b"6".to_vec()));
+        assert_eq!(map.expires("set"), None);
+        // APPEND and SETRANGE leave it to the caller's write of a new value.
+        map.insert_str_expiring("app", "5", Some(1));
+        assert_eq!(map.append_in_place("app", b"6"), None);
+        map.insert_str_expiring("rng", "5", Some(1));
+        assert_eq!(map.set_range_in_place("rng", 0, b"6"), None);
+        assert_eq!(map.take_written_over(), vec!["set".to_string()]);
+        // A live key is still written in place.
+        map.insert_str_expiring("live", "5", Some(u64::MAX - 1));
+        assert!(matches!(map.set_str("live", "6"), Written::InPlace));
+        assert_eq!(map.append_in_place("live", b"7"), Some(2));
+        assert_eq!(map.expires("live"), Some(u64::MAX - 1));
+    }
+
+    #[test]
     fn a_write_lock_sees_one_time() {
         let shard = crate::store::ShardLock::default();
         let soon = crate::commands::helpers::now_ms() + 200;
