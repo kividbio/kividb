@@ -406,7 +406,7 @@ fn expire_batch(
         crate::keyspace_events::notify_expired(store, db, key);
         crate::watch::expired(store, db, key);
         crate::tracking::expired(store, key);
-        crate::vector::maybe_unindex(index_store, key);
+        crate::vector::maybe_unindex(index_store, db, key);
     }
 }
 
@@ -468,6 +468,7 @@ pub fn spawn_active_expire_task(
     latency: crate::latency::SharedLatencyTracker,
 ) {
     crate::keyspace_events::register_hub(&store, &pubsub);
+    crate::vector::register_index_store(&store, &index_store);
     // Whatever was loaded at startup that has field TTLs.
     crate::field_expiry::rescan(&store);
     let parts = expiry_threads();
@@ -635,6 +636,11 @@ pub fn set_expiry(store: &Store, db: usize, key: &str, expires_at: SystemTime) {
 pub fn clear_expiry(store: &Store, db: usize, key: &str) -> bool {
     let shard = store::get_shard(&store[db], key);
     if shard.holds_no_ttl() {
+        // Nothing to take away, and nothing to lock for that; but the key
+        // is still used, if this command's use is being written.
+        if store::AccessScope::active() {
+            read_lock!(shard).contains_key(key);
+        }
         return false;
     }
     write_lock!(shard).persist(key)
@@ -665,6 +671,9 @@ pub fn delete_key_if_expired(store: &Store, db: usize, key: &str) -> bool {
         crate::keyspace_events::notify_expired(store, db, key);
         crate::watch::expired(store, db, key);
         crate::tracking::expired(store, key);
+        // Out of its indexes too: it used to stay in the graph, and be
+        // found by a KNN query, until something else deleted it.
+        crate::vector::unindex_expired(store, db, key);
     }
     gone
 }

@@ -680,6 +680,28 @@ fn test_sort_store() {
     assert_eq!(c.cmds(&["TYPE", "dst"]).as_str(), "list");
 }
 
+// SORT STORE should clear any existing TTL on destination for non-empty result.
+#[test]
+fn test_sort_store_clears_existing_ttl() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "src", "3", "1", "2"]);
+    c.cmds(&["SET", "dst", "old_value"]);
+    c.cmds(&["EXPIRE", "dst", "100"]);
+    assert!(c.cmds(&["TTL", "dst"]).as_int() > 0);
+
+    let count = c.cmds(&["SORT", "src", "STORE", "dst"]).as_int();
+    assert_eq!(count, 3);
+    assert_eq!(c.cmds(&["TTL", "dst"]).as_int(), -1);
+    assert_eq!(c.cmds(&["TYPE", "dst"]).as_str(), "list");
+
+    let range = c.cmds(&["LRANGE", "dst", "0", "-1"]);
+    let vals: Vec<&str> = range.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(vals, vec!["1", "2", "3"]);
+}
+
 // SORT STORE on empty result deletes the destination key.
 #[test]
 fn test_sort_store_empty_deletes_dst() {
@@ -999,6 +1021,232 @@ fn test_command_list_filterby_aclcat() {
     assert!(commands.contains(&"GET".to_string()));
     assert!(commands.contains(&"SET".to_string()));
     assert!(commands.contains(&"APPEND".to_string()));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// COMMAND DOCS
+// ═════════════════════════════════════════════════════════════════════════════
+
+fn docs_value<'a>(docs: &'a RespValue, name: &str) -> &'a RespValue {
+    let arr = docs.as_array();
+    for pair in arr.chunks(2) {
+        if pair[0].as_str() == name {
+            return &pair[1];
+        }
+    }
+    panic!("COMMAND DOCS entry has no {name}: {docs:?}");
+}
+
+fn docs_field<'a>(docs: &'a RespValue, name: &str) -> &'a str {
+    docs_value(docs, name).as_str()
+}
+
+// COMMAND DOCS GET names the command and gives the summary, group,
+// complexity, since, and the argument list redis-cli builds hints from.
+#[test]
+fn test_command_docs_get() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "DOCS", "GET"]);
+    let arr = result.as_array();
+    assert_eq!(arr.len(), 2, "{result:?}");
+    assert_eq!(arr[0].as_str(), "get");
+    assert_eq!(
+        docs_field(&arr[1], "summary"),
+        "Returns the string value of a key."
+    );
+    assert_eq!(docs_field(&arr[1], "group"), "string");
+    assert_eq!(docs_field(&arr[1], "complexity"), "O(1)");
+    assert_eq!(docs_field(&arr[1], "since"), "1.0.0");
+    let args = docs_value(&arr[1], "arguments").as_array();
+    assert_eq!(args.len(), 1, "{args:?}");
+    assert_eq!(docs_field(&args[0], "name"), "key");
+    assert_eq!(docs_field(&args[0], "type"), "key");
+    assert_eq!(docs_field(&args[0], "display_text"), "key");
+    assert_eq!(docs_value(&args[0], "key_spec_index").as_int(), 0);
+}
+
+// Names are case-insensitive, and several names come back in the order asked.
+#[test]
+fn test_command_docs_several_names() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "DOCS", "ft.search", "SET"]);
+    let arr = result.as_array();
+    assert_eq!(arr.len(), 4, "{result:?}");
+    assert_eq!(arr[0].as_str(), "ft.search");
+    assert_eq!(docs_field(&arr[1], "group"), "module");
+    assert_eq!(docs_field(&arr[1], "module"), "search");
+    assert_eq!(arr[2].as_str(), "set");
+    assert_eq!(docs_field(&arr[3], "group"), "string");
+}
+
+// A name that is not a command is omitted, not nil.
+#[test]
+fn test_command_docs_unknown_name_is_omitted() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "DOCS", "nosuch", "PING"]);
+    let arr = result.as_array();
+    assert_eq!(arr.len(), 2, "{result:?}");
+    assert_eq!(arr[0].as_str(), "ping");
+    assert_eq!(docs_field(&arr[1], "group"), "connection");
+}
+
+// With no names, every command is documented, including GET.
+#[test]
+fn test_command_docs_all_includes_get() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "DOCS"]);
+    let arr = result.as_array();
+    assert!(
+        arr.len() >= 2 && arr.len().is_multiple_of(2),
+        "len {}",
+        arr.len()
+    );
+    let names: Vec<&str> = arr.iter().step_by(2).map(|v| v.as_str()).collect();
+    assert!(names.contains(&"get"), "{names:?}");
+    assert!(names.contains(&"ft.search"), "{names:?}");
+}
+
+// With no names, only top-level commands are listed; subcommands are nested
+// under their container's `subcommands`, as Redis does.
+#[test]
+fn test_command_docs_all_nests_subcommands() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "DOCS"]);
+    let arr = result.as_array();
+    let names: Vec<&str> = arr.iter().step_by(2).map(|v| v.as_str()).collect();
+    assert!(
+        names.iter().all(|n| !n.contains('|')),
+        "subcommand at top level: {:?}",
+        names.iter().filter(|n| n.contains('|')).collect::<Vec<_>>()
+    );
+    let i = names.iter().position(|n| *n == "acl").expect("acl");
+    let subs = docs_value(&arr[i * 2 + 1], "subcommands");
+    let sub_names: Vec<&str> = subs
+        .as_array()
+        .iter()
+        .step_by(2)
+        .map(|v| v.as_str())
+        .collect();
+    assert!(sub_names.contains(&"acl|cat"), "{sub_names:?}");
+}
+
+// Module-style commands report group `module` plus the module's name.
+#[test]
+fn test_command_docs_module_commands() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for (name, module) in [
+        ("JSON.SET", "ReJSON"),
+        ("TS.ADD", "timeseries"),
+        ("VADD", "vectorset"),
+        ("FT.CREATE", "search"),
+    ] {
+        let result = c.cmds(&["COMMAND", "DOCS", name]);
+        let arr = result.as_array();
+        assert_eq!(arr.len(), 2, "{name} {result:?}");
+        assert_eq!(docs_field(&arr[1], "group"), "module", "{name}");
+        assert_eq!(docs_field(&arr[1], "module"), module, "{name}");
+    }
+}
+
+// `since` comes from the command JSON: XADD 5.0.0, GETEX 6.2.0, and
+// HEXPIRE 7.4.0 (the Redis release that added it, not Valkey's 9.0.0).
+#[test]
+fn test_command_docs_since_from_command_json() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "DOCS", "XADD", "GETEX", "HEXPIRE"]);
+    let arr = result.as_array();
+    assert_eq!(arr.len(), 6, "{result:?}");
+    assert_eq!(arr[0].as_str(), "xadd");
+    assert_eq!(docs_field(&arr[1], "since"), "5.0.0");
+    assert_eq!(arr[2].as_str(), "getex");
+    assert_eq!(docs_field(&arr[3], "since"), "6.2.0");
+    assert_eq!(arr[4].as_str(), "hexpire");
+    assert_eq!(docs_field(&arr[5], "since"), "7.4.0");
+}
+
+// SADD / HSET / LPUSH complexity is the O(1)-per-element wording, not O(N).
+#[test]
+fn test_command_docs_complexity_o1_style() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for name in ["SADD", "HSET", "LPUSH"] {
+        let result = c.cmds(&["COMMAND", "DOCS", name]);
+        let arr = result.as_array();
+        assert_eq!(arr.len(), 2, "{name} {result:?}");
+        let complexity = docs_field(&arr[1], "complexity");
+        assert!(complexity.starts_with("O(1)"), "{name}: {complexity}");
+    }
+}
+
+// SET's argument tree is present so redis-cli can hint `key value [NX|XX]…`.
+#[test]
+fn test_command_docs_set_has_arguments() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "DOCS", "SET"]);
+    let arr = result.as_array();
+    assert_eq!(arr.len(), 2, "{result:?}");
+    let args = docs_value(&arr[1], "arguments").as_array();
+    assert!(args.len() >= 2, "{args:?}");
+    assert_eq!(docs_field(&args[0], "name"), "key");
+    assert_eq!(docs_field(&args[1], "name"), "value");
+    let names: Vec<&str> = args.iter().map(|a| docs_field(a, "name")).collect();
+    assert!(names.contains(&"condition"), "{names:?}");
+    assert!(names.contains(&"expiration"), "{names:?}");
+}
+
+// Every command COMMAND LIST names has documentation.
+#[test]
+fn test_command_docs_covers_command_list() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let listed: Vec<String> = c
+        .cmds(&["COMMAND", "LIST"])
+        .as_array()
+        .iter()
+        .map(|v| v.as_str().to_string())
+        .filter(|n| !n.contains('|'))
+        .collect();
+    let docs = c.cmds(&["COMMAND", "DOCS"]);
+    let documented: std::collections::HashSet<&str> = docs
+        .as_array()
+        .iter()
+        .step_by(2)
+        .map(|v| v.as_str())
+        .collect();
+    let missing: Vec<&str> = listed
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|n| !documented.contains(n))
+        .collect();
+    assert!(missing.is_empty(), "COMMAND DOCS missing {missing:?}");
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

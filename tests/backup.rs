@@ -316,9 +316,11 @@ fn an_aof_turned_on_at_runtime_is_rewritten_on_its_own() {
     let aof = server.dir.join("appendonly.aof");
     let grown = std::fs::metadata(&aof).unwrap().len();
     assert!(grown > 100_000, "the log should have grown: {grown} bytes");
-    // The check runs every 10 seconds.
+    // The check runs every 10 seconds. While the log is turned over it is
+    // renamed to `appendonly.aof.prev` before the new one takes its name:
+    // not there for a moment is the rewrite under way.
     let deadline = Instant::now() + Duration::from_secs(30);
-    while std::fs::metadata(&aof).unwrap().len() >= grown {
+    while std::fs::metadata(&aof).map_or(0, |m| m.len()) >= grown {
         assert!(
             Instant::now() < deadline,
             "appendonly.aof was never rewritten"

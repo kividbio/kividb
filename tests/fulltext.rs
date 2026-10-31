@@ -1236,3 +1236,51 @@ fn test_synonym_groups_expand_query_terms() {
     assert_eq!(found(&mut c, "light office"), Vec::<String>::new());
     assert_eq!(found(&mut c, "chair"), ["syn:5"]);
 }
+
+// ── Document ids reused ──────────────────────────────────────────────────────
+
+/// The TEXT index knows documents by numbers, which a deleted document gives
+/// back to the next one: what a document held must not be found under the
+/// one that gets its number, and a document written again holds only its
+/// new words. Patterns are answered from the index as words are.
+#[test]
+fn test_reused_document_numbers_hold_only_their_own_words() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    create_text_index(&mut c, "idx", "doc:", "title");
+
+    c.cmds(&["HSET", "doc:1", "title", "apple orchard"]);
+    c.cmds(&["HSET", "doc:2", "title", "banana grove"]);
+    c.cmds(&["HSET", "doc:3", "title", "cherry orchard"]);
+    c.cmds(&["DEL", "doc:1"]);
+    // Takes the number doc:1 gave back.
+    c.cmds(&["HSET", "doc:4", "title", "zebra crossing"]);
+    // Written again: its old words go.
+    c.cmds(&["HSET", "doc:2", "title", "kiwi orchard"]);
+    thread::sleep(Duration::from_millis(50));
+
+    let keys = |c: &mut Conn, q: &str| -> Vec<String> {
+        let r = c.cmds(&["FT.SEARCH", "idx", q, "LIMIT", "0", "10"]);
+        let mut keys: Vec<String> = r.ft_search_keys().iter().map(|k| k.to_string()).collect();
+        keys.sort();
+        keys
+    };
+    assert!(keys(&mut c, "apple").is_empty());
+    assert!(keys(&mut c, "banana").is_empty());
+    assert_eq!(keys(&mut c, "zebra"), ["doc:4"]);
+    assert_eq!(keys(&mut c, "orchard"), ["doc:2", "doc:3"]);
+    assert_eq!(keys(&mut c, "kiwi | zebra"), ["doc:2", "doc:4"]);
+    assert_eq!(keys(&mut c, "orchard -kiwi"), ["doc:3"]);
+    assert_eq!(keys(&mut c, "orch*"), ["doc:2", "doc:3"]);
+    assert_eq!(keys(&mut c, "*ebra"), ["doc:4"]);
+    assert!(keys(&mut c, "app*").is_empty());
+    // Stemmed: `crossing` is indexed with `+cross`.
+    assert_eq!(keys(&mut c, "crosses"), ["doc:4"]);
+
+    c.cmds(&["DEL", "doc:2", "doc:3", "doc:4"]);
+    thread::sleep(Duration::from_millis(50));
+    assert!(keys(&mut c, "orchard").is_empty());
+    assert!(keys(&mut c, "orch*").is_empty());
+}

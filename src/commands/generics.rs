@@ -283,9 +283,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     };
                     let db = *ctx.selected_db;
                     let gone = lazy_expire_on_read(ctx.store, db, key);
-                    if gone || !read_lock!(store::get_shard(&ctx.store[db], key)).contains_key(key) {
+                    // The key's access word, read without counting as a use.
+                    let word = if gone {
+                        None
+                    } else {
+                        read_lock!(store::get_shard(&ctx.store[db], key)).access(key)
+                    };
+                    let Some(word) = word else {
                         return Some(resp_null_bulk());
-                    }
+                    };
                     let lfu = crate::eviction::policy().is_lfu();
                     let recording = crate::eviction::recording();
                     Some(match (subcommand.as_str(), lfu) {
@@ -299,12 +305,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                              Please note that when switching between policies at runtime LRU \
                              and LFU data will take some time to adjust.",
                         ),
-                        ("FREQ", true) => {
-                            resp_integer(crate::eviction::frequency(db, key.as_bytes()) as i64)
-                        }
-                        _ if recording => {
-                            resp_integer(crate::eviction::idle_seconds(db, key.as_bytes()) as i64)
-                        }
+                        ("FREQ", true) => resp_integer(crate::eviction::frequency(word) as i64),
+                        _ if recording => resp_integer(crate::eviction::idle_seconds(word) as i64),
                         // Nothing is recorded: with `noeviction` and the
                         // policies that do not go by use, keys are not
                         // watched.
@@ -473,7 +475,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if ms == 0 {
                 let removed = delete_key(ctx.store, *ctx.selected_db, key);
                 if removed {
-                    crate::vector::maybe_unindex(ctx.index_store, key);
+                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                     crate::vector::maybe_request_compaction(
                         ctx.index_store,
                         ctx.compaction_tx,
@@ -502,7 +504,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if new_exp <= now {
                 let removed = delete_key(ctx.store, *ctx.selected_db, key);
                 if removed {
-                    crate::vector::maybe_unindex(ctx.index_store, key);
+                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                     crate::vector::maybe_request_compaction(
                         ctx.index_store,
                         ctx.compaction_tx,
@@ -556,7 +558,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if new_exp <= now {
                 let removed = delete_key(ctx.store, *ctx.selected_db, key);
                 if removed {
-                    crate::vector::maybe_unindex(ctx.index_store, key);
+                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                     crate::vector::maybe_request_compaction(
                         ctx.index_store,
                         ctx.compaction_tx,
@@ -622,7 +624,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if new_exp <= now {
                 let removed = delete_key(ctx.store, *ctx.selected_db, key);
                 if removed {
-                    crate::vector::maybe_unindex(ctx.index_store, key);
+                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                     crate::vector::maybe_request_compaction(
                         ctx.index_store,
                         ctx.compaction_tx,
@@ -887,7 +889,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 // to the DEL count (see redis `delGenericCommand`).
                 if is_expired(ctx.store, *ctx.selected_db, key) {
                     if delete_key_if_expired(ctx.store, *ctx.selected_db, key) {
-                        crate::vector::maybe_unindex(ctx.index_store, key);
+                        crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                         crate::vector::maybe_request_compaction(
                             ctx.index_store,
                             ctx.compaction_tx,
@@ -904,7 +906,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     delete_key(ctx.store, *ctx.selected_db, key)
                 };
                 if deleted {
-                    crate::vector::maybe_unindex(ctx.index_store, key);
+                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                     crate::vector::maybe_request_compaction(
                         ctx.index_store,
                         ctx.compaction_tx,
@@ -1054,8 +1056,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         "TOUCH" => {
             // TOUCH key [key ...]
             // Returns the count of keys that exist (expired keys count as absent).
-            // What it is for — marking the keys as used — the dispatcher
-            // does for every command's keys: see `eviction::used`.
+            // What it is for — marking the keys as used — the lookup below
+            // does, as every command's lookups of its keys do: see
+            // `store::AccessScope`.
             if cmd.len() < 2 {
                 return Some(resp_error(
                     "ERR wrong number of arguments for 'touch' command",
@@ -1408,7 +1411,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                                     let shard = store::get_shard(db, &lookup_key);
                                     let map = read_lock!(shard);
 
-                                    match map.get(lookup_key.as_str()) {
+                                    match map.peek(lookup_key.as_str()) {
                                         Some(ValueRef::Hash(h)) => {
                                             let inner = h.read();
                                             inner
@@ -1424,7 +1427,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                                     let shard = store::get_shard(db, &lookup_key);
                                     let map = read_lock!(shard);
 
-                                    match map.get(lookup_key.as_str()) {
+                                    match map.peek(lookup_key.as_str()) {
                                         Some(ValueRef::String(s)) => std::str::from_utf8(&s)
                                             .ok()
                                             .and_then(|v| v.parse::<f64>().ok()),
@@ -1549,7 +1552,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             let shard = store::get_shard(db, &lookup_key);
                             let map = read_lock!(shard);
                             // Hash field branch — push raw bytes, not resp_bulk
-                            let val = match map.get(lookup_key.as_str()) {
+                            let val = match map.peek(lookup_key.as_str()) {
                                 Some(ValueRef::Hash(h)) => {
                                     let inner = h.read();
                                     inner.get(field).map(|v| v.to_vec()) // raw bytes
@@ -1562,7 +1565,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             let lookup_key = pat.replace('*', elem_str);
                             let shard = store::get_shard(db, &lookup_key);
                             let map = read_lock!(shard);
-                            let val = match map.get(lookup_key.as_str()) {
+                            let val = match map.peek(lookup_key.as_str()) {
                                 Some(ValueRef::String(s)) => Some(s.to_vec()), // raw bytes
                                 _ => None,
                             };
@@ -1584,9 +1587,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 if new_list.is_empty() {
                     dst_map.remove(dst.as_str());
                 } else {
-                    dst_map.insert(
+                    dst_map.insert_expiring(
                         Key::from(dst),
                         KiviDBValue::List(std::sync::Arc::new(parking_lot::RwLock::new(new_list))),
+                        None,
                     );
                 }
                 return Some(resp_integer(count));

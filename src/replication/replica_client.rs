@@ -551,6 +551,44 @@ async fn run_replication_session(
     )
     .await?;
 
+    // ── Phase 3b: which release the master is ───────────────────────────
+    // A `FT.DROPINDEX … DD` in the stream is run as the master that sent it
+    // ran it: a 1.2.0 release candidate deleted the documents and left each
+    // replica to delete its own; 1.1 and before kept them (see
+    // `replication::dd_deleted_by`). Releases since send the deletes and
+    // never `DD`. A master that does not say is taken to have kept them.
+    send_command(&mut writer, &["INFO", "server"]).await?;
+    let head = guarded(
+        read_line(&mut reader),
+        timeout,
+        repl_state,
+        my_generation,
+        "INFO server",
+    )
+    .await?;
+    let mut master_version = None;
+    if let Some(len) = head.strip_prefix('$').and_then(|n| n.parse::<usize>().ok()) {
+        let mut body = vec![0u8; len + 2];
+        guarded(
+            reader.read_exact(&mut body),
+            timeout,
+            repl_state,
+            my_generation,
+            "INFO server",
+        )
+        .await?;
+        master_version = String::from_utf8_lossy(&body)
+            .lines()
+            .find_map(|line| line.strip_prefix("kividb_version:"))
+            .map(|version| version.trim().to_string());
+    }
+    repl_state.master_dd_deletes.store(
+        master_version
+            .as_deref()
+            .is_some_and(crate::replication::dd_deleted_by),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
     // ── Phase 4: PSYNC ───────────────────────────────────────────────────
     // If this node's dataset is a known position in a master's stream — it
     // was following one and lost the connection, or was restarted cleanly —

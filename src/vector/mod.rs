@@ -1,13 +1,17 @@
 pub mod filter;
+pub mod postings;
+pub mod score;
 pub mod simd;
+pub mod slots;
+pub mod stem;
+pub mod text;
 use crate::store::ValueRef;
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashMap;
 use parking_lot::RwLock;
 use rand::Rng;
-use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::sync::atomic::Ordering::Relaxed;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
 
 /// True while snapshot startup is rebuilding vector / FT live indexes from keys.
 /// [`crate::commands::handler::execute_command`] returns `-LOADING` for commands not on the
@@ -378,6 +382,7 @@ impl IndexDef {
             a.push(self.prefixes.len().to_string());
             a.extend(self.prefixes.iter().cloned());
         }
+        a.extend(self.language.words());
         if let Some(words) = &self.stopwords {
             a.push("STOPWORDS".into());
             a.push(words.len().to_string());
@@ -648,151 +653,187 @@ pub struct IndexDef {
     /// index. `None` is the default list; an empty list is "none at all".
     pub stopwords: Option<Arc<Vec<String>>>,
     pub synonyms: SynonymGroups,
-    /// Indexed vocabulary — every distinct token observed in any TEXT field
-    /// of any indexed key. Used by FT.SPELLCHECK to find candidates near
-    /// a misspelled query term without re-scanning the keyspace.
-    ///
-    /// Append-only between rebuilds (see backfill_index for the rebuild path).
-    /// Wrapped in Arc<RwLock<>> so the IndexStore's outer lock can be
-    /// dropped before reading or writing the vocab — keeps the fast path
-    /// (HSET / DEL / FT.SEARCH) free of vocab lock contention.
-    pub vocab: Arc<RwLock<BTreeSet<String>>>,
-    // ── BM25 corpus statistics ─────────────────────────────────────────────
-    //
-    // These three are everything BM25 needs beyond per-document data:
-    //
-    //   doc_count    — total documents indexed. The "N" in the IDF formula.
-    //   total_tokens — sum of token counts across every document. Dividing
-    //                  this by doc_count gives avgdl (average document length).
-    //   doc_freq     — for each term, how many *documents* contain it (df(t)).
-    //                  Note: this is documents, not occurrences. "rust rust"
-    //                  in one doc contributes df("rust") += 1, not += 2.
-    //
-    // All three live behind their own Arc<RwLock> so the IndexStore's outer
-    // lock can be released before touching them — same pattern as `vocab`.
-    // AtomicUsize for doc_count/total_tokens avoids a lock on the read path
-    // (BM25 reads them once per query, not per document).
-    pub doc_count: Arc<AtomicUsize>,
-    pub total_tokens: Arc<AtomicUsize>,
-    pub doc_freq: Arc<RwLock<AHashMap<String, usize>>>,
-    pub inverted: Arc<RwLock<AHashMap<String, AHashSet<String>>>>,
-    //                                     ^^^^^^  ^^^^^^^^^^^^^^^^^^
-    //                                     token   set of doc keys containing it
-    /// What each document's TEXT fields put into the inverted index and the
-    /// statistics above, by key and field, stopwords left out: what is taken
-    /// back out when a field is written again or the document goes. Without
-    /// it nothing was: an update added a document's words again, a delete
-    /// left them counted, and BM25 scores drifted until a restart (#162).
-    pub forward: Arc<RwLock<ForwardIndex>>,
+    /// `LANGUAGE` and `LANGUAGE_FIELD`: what TEXT fields are stemmed in.
+    pub language: stem::LanguageOptions,
+    /// With `LANGUAGE_FIELD`: the documents whose words were stemmed in a
+    /// language other than the index's, and that language. For a write of
+    /// some fields of a hash that leaves its language field as it was.
+    pub doc_languages: Arc<RwLock<AHashMap<String, stem::Language>>>,
+    /// The TEXT fields' inverted and forward index, and their BM25
+    /// statistics, in terms of the document ids of [`IndexDef::postings`]
+    /// (see [`text`]). Every document of an index with a TEXT field has an
+    /// id, whether or not the index has a TAG or NUMERIC field.
+    pub text: Arc<RwLock<text::TextIndex>>,
+    /// The TAG and NUMERIC postings, and the document ids they are kept in
+    /// (see [`postings`]). For an index with no TAG or NUMERIC field, only
+    /// the ids, and only if it has a TEXT field.
+    pub postings: postings::SharedPostings,
 }
 
-/// By document key, by TEXT field: the words it put in (see
-/// [`IndexDef::forward`]).
-pub type ForwardIndex = AHashMap<String, AHashMap<String, Vec<String>>>;
-
 impl IndexDef {
-    /// Make `tokens` — stopwords already left out — what TEXT field `field`
-    /// of the document at `key` holds: the inverted index, the vocabulary
-    /// and the BM25 statistics become what they would be had the document
-    /// always held them.
-    pub fn set_text(&self, key: &str, field: &str, tokens: Vec<String>) {
-        self.change_text(key, |fields| {
-            if tokens.is_empty() {
-                fields.remove(field);
-            } else {
-                fields.insert(field.to_string(), tokens);
-            }
+    /// The indexed TEXT fields, in the schema's order: a field's place among
+    /// them is its number in [`IndexDef::text`].
+    pub fn text_fields(&self) -> impl Iterator<Item = &SchemaField> {
+        self.fields
+            .iter()
+            .filter(|f| matches!(f.field_type, FieldType::Text) && !f.options.noindex)
+    }
+
+    /// The number of TEXT field `name` in [`IndexDef::text`]: `None` if it
+    /// is not an indexed TEXT field.
+    pub fn text_field(&self, name: &str) -> Option<u16> {
+        self.text_fields()
+            .position(|f| f.name == name)
+            .map(|i| i as u16)
+    }
+
+    /// By TEXT field number: what an occurrence of a word there counts, its
+    /// `WEIGHT`, truncated, and at least 1 (RediSearch's frequencies are
+    /// whole numbers).
+    pub fn text_units(&self) -> Vec<u32> {
+        self.text_fields()
+            .map(|f| (f.options.weight as u32).max(1))
+            .collect()
+    }
+
+    /// Whether the index gives its documents ids: it has a TEXT, TAG or
+    /// NUMERIC field.
+    #[inline]
+    pub fn gives_ids(&self) -> bool {
+        self.fields.iter().any(|f| match f.field_type {
+            FieldType::Tag | FieldType::Numeric => true,
+            FieldType::Text => !f.options.noindex,
+            _ => false,
+        })
+    }
+
+    /// Make what the TEXT fields numbered in `changes` of document `doc` hold
+    /// the words given, stopwords already left out, each followed by its stem
+    /// if it has one (`stem::index_words`): the inverted index, the
+    /// vocabulary and the BM25 statistics become what they would be had the
+    /// document always held them.
+    pub fn write_text(&self, doc: u32, changes: &[(u16, Vec<String>)]) {
+        if changes.is_empty() {
+            return;
+        }
+        let units = self.text_units();
+        self.text.write().set(doc, changes, |f| {
+            units.get(f as usize).copied().unwrap_or(1)
         });
     }
 
-    /// The document at `key` is gone: take out everything its TEXT fields
-    /// put in.
-    pub fn remove_text(&self, key: &str) {
-        self.change_text(key, |fields| fields.clear());
+    /// The TEXT index's part of a write, run by the postings with the
+    /// document's id, under their lock (see [`postings::WithId`]): what
+    /// [`IndexDef::write_text`] does with `changes`, after the fields
+    /// numbered in `restemmed` (with whether they stem) are stemmed again
+    /// in `language` from the words they hold. `None` if there is nothing
+    /// to do.
+    fn text_write(
+        &self,
+        mut changes: Vec<(u16, Vec<String>)>,
+        restemmed: Vec<(u16, bool)>,
+        language: stem::Language,
+    ) -> Option<postings::WithId> {
+        if changes.is_empty() && restemmed.is_empty() {
+            return None;
+        }
+        let text = Arc::clone(&self.text);
+        let units = self.text_units();
+        Some(Box::new(move |doc| {
+            let mut text = text.write();
+            for (number, stems) in restemmed {
+                if let Some(tokens) = restem(&text, doc, number, stems, language) {
+                    changes.push((number, tokens));
+                }
+            }
+            if !changes.is_empty() {
+                text.set(doc, &changes, |f| {
+                    units.get(f as usize).copied().unwrap_or(1)
+                });
+            }
+        }))
     }
 
-    fn change_text(&self, key: &str, change: impl FnOnce(&mut AHashMap<String, Vec<String>>)) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let mut forward = self.forward.write();
-        let old = forward.remove(key).unwrap_or_default();
-        let mut new = old.clone();
-        change(&mut new);
-        if old.is_empty() && new.is_empty() {
-            return;
+    /// The TEXT index's part of a removal: take out everything the
+    /// document's TEXT fields put in, by the postings, under their lock,
+    /// before its id is given back (see [`postings::WithId`]).
+    fn text_removal(&self) -> Option<postings::WithId> {
+        self.text_fields().next()?;
+        let text = Arc::clone(&self.text);
+        let units = self.text_units();
+        Some(Box::new(move |doc| {
+            text.write()
+                .remove(doc, |f| units.get(f as usize).copied().unwrap_or(1));
+        }))
+    }
+
+    /// The document at `key` is gone: forget the language it was in.
+    fn forget_language(&self, key: &str) {
+        if self.language.field.is_some() {
+            self.doc_languages.write().remove(key);
         }
-        let words = |fields: &AHashMap<String, Vec<String>>| -> (usize, AHashSet<String>) {
-            let total = fields.values().map(Vec::len).sum();
-            let unique = fields.values().flatten().cloned().collect();
-            (total, unique)
+    }
+
+    /// The language the words of the document at `key` are stemmed in, for a
+    /// write of `fields` (all of the document's if `whole`): the one its
+    /// language field names, or for a write that leaves that field as it
+    /// was, the one it had. Kept for the next write.
+    fn doc_language(
+        &self,
+        key: &str,
+        fields: &[(String, Arc<[u8]>)],
+        whole: bool,
+    ) -> stem::Language {
+        let Some(name) = &self.language.field else {
+            return self.language.language;
         };
-        let postings = |fields: &AHashMap<String, Vec<String>>| -> AHashSet<String> {
-            fields
-                .iter()
-                .flat_map(|(field, tokens)| tokens.iter().map(move |t| format!("{field}\x00{t}")))
-                .collect()
+        let given = fields.iter().find(|(n, _)| n == name).map(|(_, v)| &**v);
+        if given.is_none() && !whole {
+            return self
+                .doc_languages
+                .read()
+                .get(key)
+                .copied()
+                .unwrap_or(self.language.language);
+        }
+        let language = self.language.of(given);
+        let mut languages = self.doc_languages.write();
+        if language == self.language.language {
+            languages.remove(key);
+        } else {
+            languages.insert(key.to_string(), language);
+        }
+        language
+    }
+
+    /// The language of the document at `key`, whose fields are all of `doc`.
+    fn language_of(&self, key: &str, doc: &Fields) -> stem::Language {
+        let Some(name) = &self.language.field else {
+            return self.language.language;
         };
-        let (old_total, old_unique) = words(&old);
-        let (new_total, new_unique) = words(&new);
-        let (old_postings, new_postings) = (postings(&old), postings(&new));
-        {
-            let mut inverted = self.inverted.write();
-            for gone in old_postings.difference(&new_postings) {
-                if let Some(set) = inverted.get_mut(gone) {
-                    set.remove(key);
-                    if set.is_empty() {
-                        inverted.remove(gone);
-                    }
-                }
-            }
-            for came in new_postings.difference(&old_postings) {
-                inverted
-                    .entry(came.clone())
-                    .or_default()
-                    .insert(key.to_string());
-            }
+        let language = self.language.of(doc.get(name.as_str()).map(|v| &**v));
+        let mut languages = self.doc_languages.write();
+        if language == self.language.language {
+            languages.remove(key);
+        } else {
+            languages.insert(key.to_string(), language);
         }
-        {
-            let mut doc_freq = self.doc_freq.write();
-            for gone in old_unique.difference(&new_unique) {
-                if let Some(n) = doc_freq.get_mut(gone) {
-                    *n = n.saturating_sub(1);
-                    if *n == 0 {
-                        doc_freq.remove(gone);
-                    }
-                }
-            }
-            for came in new_unique.difference(&old_unique) {
-                *doc_freq.entry(came.clone()).or_insert(0) += 1;
-            }
-        }
-        if !new_unique.is_empty() {
-            let mut vocab = self.vocab.write();
-            for word in &new_unique {
-                if !vocab.contains(word) {
-                    vocab.insert(word.clone());
-                }
-            }
-        }
-        // Only changed here, under the forward index's lock: a load and a
-        // store do not race.
-        match (old_total > 0, new_total > 0) {
-            (false, true) => {
-                self.doc_count.fetch_add(1, Relaxed);
-            }
-            (true, false) => {
-                let n = self.doc_count.load(Relaxed);
-                self.doc_count.store(n.saturating_sub(1), Relaxed);
-            }
-            _ => {}
-        }
-        let tokens = self.total_tokens.load(Relaxed);
-        self.total_tokens.store(
-            tokens.saturating_sub(old_total).saturating_add(new_total),
-            Relaxed,
-        );
-        if !new.is_empty() {
-            forward.insert(key.to_string(), new);
-        }
+        language
+    }
+
+    /// Whether the index has a TAG or a NUMERIC field: whether it keeps
+    /// postings (see [`postings`]).
+    #[inline]
+    pub fn keeps_postings(&self) -> bool {
+        self.fields
+            .iter()
+            .any(|f| matches!(f.field_type, FieldType::Tag | FieldType::Numeric))
+    }
+
+    /// Whether `key` is under one of the index's prefixes.
+    #[inline]
+    pub fn covers(&self, key: &str) -> bool {
+        self.prefixes.is_empty() || self.prefixes.iter().any(|p| key.starts_with(p.as_str()))
     }
 
     /// Whether `token` is one of this index's stopwords.
@@ -895,6 +936,7 @@ pub fn set_alias(store: &mut AHashMap<String, IndexDef>, alias: &str, index: &In
         aliases: Vec::new(),
         stopwords: None,
         synonyms: Default::default(),
+        language: Default::default(),
     }
     .into_def();
     store.insert(alias.to_string(), marker);
@@ -949,6 +991,8 @@ pub struct IndexSchema {
     pub stopwords: Option<Vec<String>>,
     /// The index's synonym groups (`FT.SYNUPDATE`).
     pub synonyms: SynonymGroups,
+    /// See [`IndexDef::language`].
+    pub language: stem::LanguageOptions,
 }
 
 impl IndexSchema {
@@ -967,6 +1011,7 @@ impl IndexSchema {
                 indexes.insert(f.name.clone(), live);
             }
         }
+        let postings = postings::PostingsLock::new(postings::Postings::new(&self.fields));
         IndexDef {
             name: self.name,
             db_index: self.db_index,
@@ -976,12 +1021,10 @@ impl IndexSchema {
             indexes,
             stopwords: self.stopwords.map(Arc::new),
             synonyms: self.synonyms,
-            vocab: Arc::new(RwLock::new(BTreeSet::new())),
-            doc_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            total_tokens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            doc_freq: Arc::new(RwLock::new(AHashMap::new())),
-            inverted: Arc::new(RwLock::new(AHashMap::new())),
-            forward: Arc::new(RwLock::new(AHashMap::new())),
+            language: self.language,
+            doc_languages: Arc::new(RwLock::new(AHashMap::new())),
+            text: Arc::new(RwLock::new(text::TextIndex::new())),
+            postings,
         }
     }
 }
@@ -1002,15 +1045,88 @@ pub fn backfill_text_fields(db: &crate::store::Db, def: &IndexDef, fields: &[Str
             let Some(inner) = doc_fields(&def.on, &def.fields, value) else {
                 continue;
             };
+            let language = def.language_of(key, &inner);
+            let mut changes = Vec::new();
             for field in fields {
                 let Some(text) = inner.get(field).and_then(|b| std::str::from_utf8(b).ok()) else {
                     continue;
                 };
-                let tokens: Vec<String> = tokenize_for_vocab(text)
-                    .filter(|tok| !def.is_stopword(tok))
-                    .collect();
-                def.set_text(key, field, tokens);
+                let Some(schema) = def.fields.iter().find(|f| &f.name == field) else {
+                    continue;
+                };
+                let Some(number) = def.text_field(field) else {
+                    continue;
+                };
+                changes.push((number, stem::index_words(def, schema, language, text)));
             }
+            if !changes.is_empty() {
+                let doc = def.postings.write().ensure(key);
+                def.write_text(doc, &changes);
+            }
+        }
+    }
+}
+
+/// Start keeping postings for TAG and NUMERIC fields added to an index
+/// (`FT.ALTER`), and fill them in from the documents it covers — all of its
+/// postings, which is as cheap as only the new ones. With `scan` false
+/// (`SKIPINITIALSCAN`), documents are only given ids, so that `NOT` and `*`
+/// still know every document.
+pub fn backfill_postings(db: &crate::store::Db, def: &IndexDef, added: &[SchemaField], scan: bool) {
+    def.postings.write().add_fields(added);
+    for shard in db.iter() {
+        let map = shard.read();
+        for (key, value) in map.iter() {
+            if !def.covers(key) {
+                continue;
+            }
+            let Some(inner) = doc_fields(&def.on, &def.fields, value) else {
+                continue;
+            };
+            let mut postings = def.postings.write();
+            if scan {
+                postings.write_doc(key, &inner);
+            } else {
+                postings.ensure(key);
+            }
+            def.postings.done(postings);
+        }
+    }
+}
+
+/// Build every index again from the documents of its database: after
+/// `SWAPDB`, which swaps what two databases hold under the indexes of each.
+pub fn rebuild_indexes(index_store: &IndexStore, store: &crate::store::Store) {
+    let rebuilt: Vec<IndexDef> = {
+        let mut indexes = index_store.write();
+        let names: Vec<String> = indexes
+            .iter()
+            .filter(|(name, def)| !is_alias(name, def))
+            .map(|(name, _)| name.clone())
+            .collect();
+        let mut rebuilt = Vec::with_capacity(names.len());
+        for name in names {
+            let def = &indexes[&name];
+            let fresh = IndexSchema {
+                name: def.name.clone(),
+                db_index: def.db_index,
+                on: def.on.clone(),
+                prefixes: def.prefixes.clone(),
+                fields: def.fields.clone(),
+                aliases: Vec::new(),
+                stopwords: def.stopwords.as_deref().cloned(),
+                synonyms: def.synonyms.clone(),
+                language: def.language.clone(),
+            }
+            .into_def();
+            indexes.insert(name, fresh.clone());
+            rebuilt.push(fresh);
+        }
+        rebuilt
+    };
+    for def in rebuilt {
+        if let Some(db) = store.get(def.db_index) {
+            backfill_from_db(db, &def);
         }
     }
 }
@@ -1042,6 +1158,12 @@ pub fn backfill_from_db_progress(
         data_type: VectorType,
         metric: DistanceMetric,
         live: LiveIndex,
+        /// The graph came with the snapshot: its vectors are not inserted
+        /// again. Decided once, before the walk — asked per key, the first
+        /// vector this walk inserts would make the graph look loaded and the
+        /// rest would be skipped, which left a graph rebuilt after an AOF
+        /// replay holding one vector.
+        loaded: bool,
     }
     let mut vec_work: Vec<VecFieldWork> = Vec::new();
     for vf in def.vector_fields() {
@@ -1059,21 +1181,20 @@ pub fn backfill_from_db_progress(
             Some(LiveIndex::Hnsw(a)) => LiveIndex::Hnsw(Arc::clone(a)),
             None => continue,
         };
+        let loaded = skip_hnsw_if_populated
+            && matches!(&live, LiveIndex::Hnsw(idx) if idx.live_count.load(Relaxed) > 0);
         vec_work.push(VecFieldWork {
             name: vf.name.clone(),
             dim,
             data_type,
             metric,
             live,
+            loaded,
         });
     }
 
-    let text_field_names: Vec<String> = def
-        .fields
-        .iter()
-        .filter(|f| matches!(f.field_type, FieldType::Text) && !f.options.noindex)
-        .map(|f| f.name.clone())
-        .collect();
+    let text_fields: Vec<&SchemaField> = def.text_fields().collect();
+    let gives_ids = def.gives_ids();
 
     let mut keys_matched: usize = 0;
 
@@ -1100,6 +1221,14 @@ pub fn backfill_from_db_progress(
             let Some(inner) = doc_fields(&def.on, &def.fields, value) else {
                 continue;
             };
+            let doc = if gives_ids {
+                let mut postings = def.postings.write();
+                let doc = postings.write_doc(key, &inner);
+                def.postings.done(postings);
+                doc
+            } else {
+                postings::NO_DOC
+            };
 
             for w in &vec_work {
                 let raw_bytes = match inner.get(&w.name) {
@@ -1112,24 +1241,27 @@ pub fn backfill_from_db_progress(
                 match &w.live {
                     LiveIndex::Flat(idx) => idx.insert(key.to_string(), vec),
                     LiveIndex::Hnsw(idx) => {
-                        if skip_hnsw_if_populated && idx.live_count.load(Relaxed) > 0 {
+                        if w.loaded {
                             continue;
                         }
-                        hnsw_insert(idx, key.to_string(), vec, &w.metric);
+                        hnsw_insert_doc(idx, key.to_string(), vec, &w.metric, doc);
                     }
                 }
             }
 
-            for fname in &text_field_names {
-                if let Some(raw) = inner.get(fname)
+            if text_fields.is_empty() {
+                continue;
+            }
+            let language = def.language_of(key, &inner);
+            let mut changes = Vec::new();
+            for (number, field) in text_fields.iter().enumerate() {
+                if let Some(raw) = inner.get(&field.name)
                     && let Ok(s) = std::str::from_utf8(raw)
                 {
-                    let tokens: Vec<String> = tokenize_for_vocab(s)
-                        .filter(|tok| !def.is_stopword(tok))
-                        .collect();
-                    def.set_text(key, fname, tokens);
+                    changes.push((number as u16, stem::index_words(def, field, language, s)));
                 }
             }
+            def.write_text(doc, &changes);
         }
     }
 }
@@ -1253,45 +1385,52 @@ impl VectorIndex {
     }
 }
 
-/// One node in the HNSW graph.
-/// Each node lives in layers 0..=top_layer.
-/// `neighbors[layer]` is the list of neighbour node ids at that layer.
+/// One node in the HNSW graph: its key, its document id, and its links
+/// above layer 0. Its vector, its layer-0 links and whether it is live are
+/// kept apart, in the graph's slots at its id ([`slots::Slots`]): those are
+/// what a search reads for every node it meets, and there they are found
+/// from the id alone.
 ///
-/// A node's key and vector do not change while it is in the graph (deleting
-/// it empties both, under the graph's write lock). Its neighbour lists have a
-/// lock of their own, so that inserts link themselves into different parts of
-/// the graph at the same time, as hnswlib's do.
+/// A node's key and vector do not change while it is in the graph.
+/// Deleting it, or filling its slot again for a new node, happens under the
+/// graph's write lock. Its links have a lock of their own (`upper`), so that
+/// inserts link themselves into different parts of the graph at the same
+/// time, as hnswlib's do; layer 0's are read without it.
 #[derive(Debug)]
 pub struct HnswNode {
     pub key: String,
-    pub vector: Vec<f32>,
-    pub neighbors: parking_lot::Mutex<Vec<Vec<usize>>>, // neighbors[layer] = [node_id, ...]
+    /// The node's lock, held to change its links at any layer. It guards
+    /// the lists above layer 0: `upper[l - 1]` is layer `l`'s.
+    upper: parking_lot::Mutex<Vec<Vec<u32>>>,
+    /// The top layer the node is in.
+    level: usize,
+    /// The id its document has in the index's postings, or
+    /// [`postings::NO_DOC`] until it is looked up: a node made by a
+    /// compaction, or read from a snapshot, learns it the first time a
+    /// filtered search asks (see [`knn_hnsw_admitting`]). A document keeps
+    /// its id for as long as it is in the index, and leaving the index
+    /// deletes its node first, so a node never names another's.
+    pub doc: AtomicU32,
 }
 
 impl HnswNode {
-    pub fn new(key: String, vector: Vec<f32>, neighbors: Vec<Vec<usize>>) -> Self {
+    fn new(key: String, level: usize, upper: Vec<Vec<u32>>, doc: u32) -> Self {
         Self {
             key,
-            vector,
-            neighbors: parking_lot::Mutex::new(neighbors),
+            upper: parking_lot::Mutex::new(upper),
+            level,
+            doc: AtomicU32::new(doc),
         }
     }
 
-    /// The slot a deleted node leaves.
-    pub fn tombstone() -> Self {
-        Self::new(String::new(), Vec::new(), Vec::new())
+    /// The node of a slot that holds none (deleted, or never filled).
+    fn empty() -> Self {
+        Self::new(String::new(), 0, Vec::new(), postings::NO_DOC)
     }
 
-    /// Empty the slot: the node is deleted.
-    fn clear(&mut self) {
-        self.vector = Vec::new();
-        self.key = String::new();
-        *self.neighbors.get_mut() = Vec::new();
-    }
-
-    /// How many layers the node is in (none once deleted).
-    fn layer_count(&self) -> usize {
-        self.neighbors.lock().len()
+    /// How many layers the node is in.
+    pub fn layer_count(&self) -> usize {
+        self.level + 1
     }
 }
 
@@ -1305,13 +1444,17 @@ type NodesGuard<'a> = parking_lot::RwLockReadGuard<'a, HnswNodes>;
 /// The HNSW graph index.
 #[derive(Debug, Default)]
 pub struct HnswIndex {
-    /// Searches and inserts hold this for reading; only deleting a node, which
-    /// empties its slot, takes it for writing.
+    /// Searches and inserts hold this for reading. Deleting a node, and
+    /// filling a deleted node's slot again, take it for writing: a reader
+    /// may still hold the id. Vectors are read only while it is held.
     pub nodes: RwLock<HnswNodes>,
+    /// The vectors, layer-0 links and live flags, by id: made with the
+    /// first vector, which sets the dimension.
+    slots: std::sync::OnceLock<slots::Slots>,
     pub key_to_id: RwLock<AHashMap<String, usize>>,
     pub entry_point: RwLock<Option<usize>>, // node id of current entry point
     pub m: usize,                           // max neighbours per layer (except L0)
-    pub m0: usize,                          // max neighbours at layer 0 (= 2*M)
+    pub m0: usize,                          // max neighbours at layer 0 (= 2*M); see `slack`
     pub ef_construction: usize,
     pub ml: f64, // level multiplier = 1/ln(M)
 
@@ -1320,20 +1463,30 @@ pub struct HnswIndex {
     /// check don't have to walk the whole Vec.
     pub live_count: AtomicUsize,
 
-    /// Number of tombstoned slots currently in `nodes`.
-    /// Invariant: nodes.len() == live_count + tombstone_count (at rest).
+    /// Number of deleted slots in `nodes` not filled again yet.
+    /// Invariant: nodes.count() == live_count + tombstone_count (at rest).
     pub tombstone_count: AtomicUsize,
 
     /// True while a background compaction is already scheduled/running for
     /// this index. Prevents piling up duplicate compaction tasks on a
     /// write-heavy delete stream.
     pub compaction_in_progress: AtomicBool,
+
+    /// Deleted slots, which the next inserts fill before the graph grows.
+    free: parking_lot::Mutex<Vec<u32>>,
+
+    /// Bumped each time a slot is filled again. A search holds ids across
+    /// the moments it lets its read lock go; if this moved meanwhile, an id
+    /// it kept may name another node now, and it measures its results again
+    /// before it answers.
+    reused: AtomicU64,
 }
 
 impl HnswIndex {
     pub fn new(m: usize, ef_construction: usize) -> Self {
         Self {
             nodes: RwLock::new(HnswNodes::new()),
+            slots: std::sync::OnceLock::new(),
             key_to_id: RwLock::new(AHashMap::new()),
             entry_point: RwLock::new(None),
             m,
@@ -1343,33 +1496,145 @@ impl HnswIndex {
             live_count: AtomicUsize::new(0),
             tombstone_count: AtomicUsize::new(0),
             compaction_in_progress: AtomicBool::new(false),
+            free: parking_lot::Mutex::new(Vec::new()),
+            reused: AtomicU64::new(0),
         }
     }
 
-    /// Reconstruct an `HnswIndex` from a serialised snapshot (all structural
-    /// data already parsed by the snapshot reader). The graph topology is
-    /// preserved exactly — no backfill or re-insertion is needed.
+    /// Reconstruct an `HnswIndex` from a serialised snapshot: for each slot
+    /// in order, `None` for a deleted one, or the node's key, vector (as the
+    /// graph held it) and links by layer. The graph topology is preserved
+    /// exactly — no backfill or re-insertion is needed. Deleted slots are
+    /// filled again by the next inserts.
     pub fn restore(
         m: usize,
         ef_construction: usize,
-        nodes: Vec<HnswNode>,
-        key_to_id: AHashMap<String, usize>,
+        nodes: Vec<Option<RestoredNode>>,
         entry_point: Option<usize>,
-        live_count: usize,
-        tombstone_count: usize,
     ) -> Self {
-        Self {
-            nodes: RwLock::new(nodes.into_iter().collect()),
-            key_to_id: RwLock::new(key_to_id),
-            entry_point: RwLock::new(entry_point),
-            m,
-            m0: m * 2,
-            ef_construction,
-            ml: 1.0 / (m as f64).ln(),
-            live_count: AtomicUsize::new(live_count),
-            tombstone_count: AtomicUsize::new(tombstone_count),
-            compaction_in_progress: AtomicBool::new(false),
+        let mut index = Self::new(m, ef_construction);
+        let dim = nodes.iter().flatten().map(|n| n.vector.len()).next();
+        let slots = dim.map(|dim| {
+            index
+                .slots
+                .get_or_init(|| slots::Slots::new(dim, index.m0 + slack(index.m0)))
+        });
+        let count = nodes.len();
+        {
+            let graph = index.nodes.get_mut();
+            let mut key_to_id = index.key_to_id.write();
+            let mut free = index.free.lock();
+            for (id, entry) in nodes.into_iter().enumerate() {
+                if let Some(slots) = slots {
+                    slots.reserve(id);
+                }
+                let node = match (entry, slots) {
+                    (Some(n), Some(slots)) if n.vector.len() == slots.dim() => {
+                        let mut layers = n.neighbors.into_iter().map(|list| {
+                            list.into_iter()
+                                .filter(|&nb| nb < count && nb != id)
+                                .map(|nb| nb as u32)
+                                .collect::<Vec<u32>>()
+                        });
+                        let layer0 = layers.next().unwrap_or_default();
+                        let upper: Vec<Vec<u32>> = layers.collect();
+                        // SAFETY: the graph is not shared yet.
+                        unsafe { slots.write_vector(id, &n.vector) };
+                        slots.write_links(id, layer0);
+                        slots.flag(id).store(1, Release);
+                        key_to_id.insert(n.key.clone(), id);
+                        index.live_count.fetch_add(1, Relaxed);
+                        HnswNode::new(n.key, upper.len(), upper, postings::NO_DOC)
+                    }
+                    _ => {
+                        free.push(id as u32);
+                        index.tombstone_count.fetch_add(1, Relaxed);
+                        HnswNode::empty()
+                    }
+                };
+                graph.push(node);
+            }
+            // The lowest ids are filled first.
+            free.reverse();
         }
+        let entry_point = match entry_point {
+            Some(id) if index.is_live(id) => Some(id),
+            _ => index.key_to_id.read().values().next().copied(),
+        };
+        *index.entry_point.write() = entry_point;
+        index
+    }
+
+    /// The slots, once the first vector has made them.
+    #[inline]
+    pub fn slots(&self) -> Option<&slots::Slots> {
+        self.slots.get()
+    }
+
+    /// Whether slot `id` holds a live node.
+    #[inline]
+    pub fn is_live(&self, id: usize) -> bool {
+        self.slots.get().is_some_and(|s| s.has(id) && s.is_live(id))
+    }
+
+    /// The vector of node `id` if it is live. The caller holds the graph
+    /// for reading (see [`HnswIndex::nodes`]).
+    #[inline]
+    pub fn vector(&self, id: usize) -> Option<&[f32]> {
+        let s = self.slots.get()?;
+        (s.has(id) && s.is_live(id)).then(|| s.vector(id))
+    }
+
+    /// The vector of node `id` if it is live and is `key`'s: a slot found
+    /// through `key_to_id` may have been filled again for another key
+    /// between the lookup and the read lock.
+    #[inline]
+    pub fn vector_of<'a>(
+        &'a self,
+        nodes: &'a HnswNodes,
+        id: usize,
+        key: &str,
+    ) -> Option<&'a [f32]> {
+        let v = self.vector(id)?;
+        nodes.get(id).filter(|n| n.key == key).map(|_| v)
+    }
+
+    /// The links of node `id` at `layer`, appended to `out`. The caller
+    /// holds the graph for reading.
+    pub fn links(&self, nodes: &HnswNodes, id: usize, layer: usize, out: &mut Vec<u32>) {
+        if layer == 0 {
+            if let Some(s) = self.slots.get()
+                && s.has(id)
+            {
+                s.read_links(id, out);
+            }
+        } else if let Some(node) = nodes.get(id)
+            && let Some(list) = node.upper.lock().get(layer - 1)
+        {
+            out.extend_from_slice(list);
+        }
+    }
+
+    /// Bytes the slots take: the vectors, layer-0 links and flags.
+    pub fn slot_bytes(&self) -> usize {
+        self.slots.get().map_or(0, |s| s.bytes())
+    }
+
+    /// Delete node `id`: its slot is emptied and kept for the next insert.
+    /// Under the graph's write lock.
+    fn delete(&self, nodes: &mut HnswNodes, id: usize) {
+        if !self.is_live(id) {
+            return;
+        }
+        let Some(s) = self.slots.get() else { return };
+        s.flag(id).store(0, Release);
+        s.write_links(id, std::iter::empty());
+        if let Some(node) = nodes.get_mut(id) {
+            *node = HnswNode::empty();
+        }
+        self.free.lock().push(id as u32);
+        self.tombstone_count.fetch_add(1, Relaxed);
+        self.live_count.fetch_sub(1, Relaxed);
     }
 
     /// Draw a random top layer for a new node.
@@ -1393,6 +1658,14 @@ impl HnswIndex {
             tomb as f64 / total as f64
         }
     }
+}
+
+/// A node as a snapshot holds it: see [`HnswIndex::restore`].
+pub struct RestoredNode {
+    pub key: String,
+    pub vector: Vec<f32>,
+    /// Links by layer, layer 0 first.
+    pub neighbors: Vec<Vec<usize>>,
 }
 
 /// Install index definitions carried by a KDB image (short write lock).
@@ -1615,24 +1888,23 @@ pub fn json_return_value(doc: &serde_json::Value, path: &str) -> Option<Vec<u8>>
     })
 }
 
-/// A JSON document was written: bring the `ON JSON` indexes that cover its
-/// key up to date with it.
-pub fn maybe_index_json(index_store: &IndexStore, key: &str, doc: &serde_json::Value) {
+/// A JSON document was written: bring the `ON JSON` indexes of database
+/// `db` that cover its key up to date with it.
+pub fn maybe_index_json(index_store: &IndexStore, db: usize, key: &str, doc: &serde_json::Value) {
     if indexing_deferred() {
         return;
     }
     let store = index_store.read();
     for (name, def) in store.iter() {
-        if is_alias(name, def) || !matches!(def.on, IndexOn::Json) {
-            continue;
-        }
-        let covered =
-            def.prefixes.is_empty() || def.prefixes.iter().any(|p| key.starts_with(p.as_str()));
-        if !covered {
+        if is_alias(name, def)
+            || !matches!(def.on, IndexOn::Json)
+            || def.db_index != db
+            || !def.covers(key)
+        {
             continue;
         }
         let fields: Vec<(String, Arc<[u8]>)> = project_json(&def.fields, doc).into_iter().collect();
-        index_fields(def, key, &fields);
+        index_fields(def, key, &fields, Write::Whole);
     }
 }
 
@@ -1642,31 +1914,12 @@ pub fn maybe_index_json(index_store: &IndexStore, key: &str, doc: &serde_json::V
 /// migration): the `ON HASH` indexes that cover it are brought up to date
 /// with all of its fields. A restored hash used to be in no index, so that a
 /// key moved to another node of a cluster could not be found there.
-pub fn reindex_hash_key(index_store: &IndexStore, db: &crate::store::Db, key: &str) {
-    if indexing_deferred()
-        || !index_store
-            .read()
-            .values()
-            .any(|def| matches!(def.on, IndexOn::Hash))
-    {
-        return;
-    }
-    let value = crate::store::get_shard(db, key)
-        .read()
-        .get(key)
-        .map(ValueRef::to_value);
-    let pairs: Vec<(String, Arc<[u8]>)> = match value {
-        Some(crate::types::KiviDBValue::Hash(hash)) => hash
-            .read()
-            .iter()
-            .map(|(field, value)| (field.to_string(), Arc::clone(value)))
-            .collect(),
-        _ => return,
-    };
-    maybe_index(index_store, key, &pairs);
-}
-
-pub fn reindex_json_key(index_store: &IndexStore, db: &crate::store::Db, key: &str) {
+pub fn reindex_json_key(
+    index_store: &IndexStore,
+    store: &crate::store::Store,
+    db: usize,
+    key: &str,
+) {
     if indexing_deferred()
         || !index_store
             .read()
@@ -1675,60 +1928,181 @@ pub fn reindex_json_key(index_store: &IndexStore, db: &crate::store::Db, key: &s
     {
         return;
     }
-    let value = crate::store::get_shard(db, key)
+    let Some(db_ref) = store.get(db) else {
+        return;
+    };
+    let value = crate::store::get_shard(db_ref, key)
         .read()
         .get(key)
         .map(ValueRef::to_value);
     if let Some(crate::types::KiviDBValue::Json(doc)) = value {
-        maybe_index_json(index_store, key, &doc.read());
+        maybe_index_json(index_store, db, key, &doc.read());
     }
 }
 
-/// Some fields of a hash were written: bring the `ON HASH` indexes that
-/// cover its key up to date with them.
-pub fn maybe_index(index_store: &IndexStore, key: &str, fields: &[(String, Arc<[u8]>)]) {
+/// Bring every index of database `db` that covers `key` up to date with what
+/// is there now, whatever it is: for a command that changed a document
+/// other than by writing fields of it (`HDEL`, `HINCRBY`, a field that
+/// expired), or put one under a key (`RENAME`, `COPY`, `MOVE`, `RESTORE`).
+/// A key that holds no document of an index any more leaves it.
+///
+/// With [`Write::Refresh`], a vector already in the graph is left there: the
+/// write did not touch it, and inserting it again would cost an insertion.
+pub fn reindex_key(
+    index_store: &IndexStore,
+    store: &crate::store::Store,
+    db: usize,
+    key: &str,
+    how: Write,
+) {
+    if indexing_deferred() {
+        return;
+    }
+    let indexes = index_store.read();
+    if !indexes
+        .iter()
+        .any(|(name, def)| !is_alias(name, def) && def.db_index == db && def.covers(key))
+    {
+        return;
+    }
+    let Some(db_ref) = store.get(db) else {
+        return;
+    };
+    let value = crate::store::get_shard(db_ref, key)
+        .read()
+        .get(key)
+        .map(ValueRef::to_value);
+    for (name, def) in indexes.iter() {
+        if is_alias(name, def) || def.db_index != db || !def.covers(key) {
+            continue;
+        }
+        match (&def.on, &value) {
+            (IndexOn::Hash, Some(crate::types::KiviDBValue::Hash(hash))) => {
+                let pairs: Vec<(String, Arc<[u8]>)> = hash
+                    .read()
+                    .iter()
+                    .map(|(field, value)| (field.to_string(), Arc::clone(value)))
+                    .collect();
+                index_fields(def, key, &pairs, how);
+            }
+            (IndexOn::Hash, Some(crate::types::KiviDBValue::HashEx(hash))) => {
+                let pairs: Vec<(String, Arc<[u8]>)> = hash
+                    .read()
+                    .fields
+                    .iter()
+                    .map(|(field, value)| (field.to_string(), Arc::clone(value)))
+                    .collect();
+                index_fields(def, key, &pairs, how);
+            }
+            (IndexOn::Json, Some(crate::types::KiviDBValue::Json(doc))) => {
+                let fields: Vec<(String, Arc<[u8]>)> =
+                    project_json(&def.fields, &doc.read()).into_iter().collect();
+                index_fields(def, key, &fields, how);
+            }
+            _ => unindex_from(def, key),
+        }
+    }
+}
+
+/// How a write is applied to an index (see [`index_fields`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Write {
+    /// The fields given were written; the document's others are as they
+    /// were (`HSET`).
+    Fields,
+    /// The fields given are all the document has: a field of the schema not
+    /// among them is one it does not hold (a new hash, a JSON document, a
+    /// value put under the key whole).
+    Whole,
+    /// [`Write::Whole`], but a vector the graph already holds for the key is
+    /// left there (see [`reindex_key`]).
+    Refresh,
+}
+
+/// Some fields of a hash in database `db` were written: bring the `ON HASH`
+/// indexes of that database that cover its key up to date with them. `how`
+/// is [`Write::Whole`] for a hash the write created.
+pub fn maybe_index(
+    index_store: &IndexStore,
+    db: usize,
+    key: &str,
+    fields: &[(String, Arc<[u8]>)],
+    how: Write,
+) {
     if indexing_deferred() {
         return;
     }
     let store = index_store.read();
 
     for (name, def) in store.iter() {
-        if is_alias(name, def) || !matches!(def.on, IndexOn::Hash) {
+        if is_alias(name, def)
+            || !matches!(def.on, IndexOn::Hash)
+            || def.db_index != db
+            || !def.covers(key)
+        {
             continue;
         }
-        let matches =
-            def.prefixes.is_empty() || def.prefixes.iter().any(|p| key.starts_with(p.as_str()));
-        if !matches {
-            continue;
-        }
-        index_fields(def, key, fields);
+        index_fields(def, key, fields, how);
     }
 }
 
 /// Index `fields` of the document at `key` in `def`: the words of its TEXT
-/// fields, and its vectors.
-fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)]) {
-    {
-        // ── Spell-check vocabulary, inverted index, BM25 statistics ─────────
-        //
-        // Each TEXT field written replaces what it held before: its words,
-        // stopwords left out (see `IndexDef::set_text`).
-        for f in &def.fields {
-            if !matches!(f.field_type, FieldType::Text) || f.options.noindex {
-                continue;
-            }
+/// fields, its TAG and NUMERIC values, and its vectors.
+fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)], how: Write) {
+    let whole = how != Write::Fields;
+
+    // ── The words of the TEXT fields written ────────────────────────────────
+    //
+    // Each TEXT field written replaces what it held before: its words,
+    // stopwords left out, with their stems (see `IndexDef::write_text`).
+    // Read before any lock is taken.
+    let mut changes: Vec<(u16, Vec<String>)> = Vec::new();
+    let mut restemmed: Vec<(u16, bool)> = Vec::new();
+    let mut language = def.language.language;
+    if def.text_fields().next().is_some() {
+        let before = (def.language.field.is_some() && !whole).then(|| {
+            def.doc_languages
+                .read()
+                .get(key)
+                .copied()
+                .unwrap_or(def.language.language)
+        });
+        language = def.doc_language(key, fields, whole);
+        for (number, f) in def.text_fields().enumerate() {
+            let number = number as u16;
             let Some((_, raw)) = fields.iter().find(|(n, _)| n == &f.name) else {
+                if whole {
+                    changes.push((number, Vec::new()));
+                } else if before.is_some_and(|before| before != language) {
+                    // The document's language changed and this field did
+                    // not: its words are stemmed again in the new one.
+                    restemmed.push((number, !f.options.nostem));
+                }
                 continue;
             };
             let tokens: Vec<String> = match std::str::from_utf8(raw) {
-                Ok(s) => tokenize_for_vocab(s)
-                    .filter(|tok| !def.is_stopword(tok))
-                    .collect(),
+                Ok(s) => stem::index_words(def, f, language, s),
                 Err(_) => Vec::new(),
             };
-            def.set_text(key, &f.name, tokens);
+            changes.push((number, tokens));
         }
     }
+
+    // ── Document id, TAG and NUMERIC postings ───────────────────────────────
+    //
+    // Every document of the index is given an id, whatever it holds: `*`
+    // and `NOT` are in terms of all of them, and the TEXT index is too. A
+    // write that finds a query reading them is queued, not kept waiting (see
+    // `postings`): its vector then learns its id when a filtered search
+    // first asks. Its words (inverted index, vocabulary, BM25 statistics) go
+    // with it: the postings write them with the id they give it, under their
+    // lock, at once or when the queue is applied (see `postings::WithId`).
+    let doc = if def.gives_ids() {
+        let words = def.text_write(changes, restemmed, language);
+        def.postings.write_fields(key, fields, whole, words)
+    } else {
+        postings::NO_DOC
+    };
 
     {
         // ── Update live vector indexes ────────────────────────────────────────
@@ -1746,24 +2120,123 @@ fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)]) {
                 } => (*dim, *data_type, metric.clone()),
                 _ => continue,
             };
-            let raw_bytes = match fields.iter().find(|(n, _)| n == &f.name) {
-                Some((_, b)) => b.clone(),
-                None => continue,
-            };
-            let Some(vec) = data_type.decode(&raw_bytes, dim) else {
+            let Some(live) = def.indexes.get(&f.name) else {
                 continue;
             };
-            let live = match def.indexes.get(&f.name) {
-                Some(l) => l,
-                None => continue,
+            let vec = fields
+                .iter()
+                .find(|(n, _)| n == &f.name)
+                .and_then(|(_, b)| data_type.decode(b, dim));
+            let Some(vec) = vec else {
+                // The document holds no vector there (any more).
+                if whole {
+                    unindex_vector(live, key);
+                }
+                continue;
             };
             match live {
                 LiveIndex::Flat(idx) => idx.insert(key.to_string(), vec),
                 LiveIndex::Hnsw(idx) => {
-                    crate::vector::hnsw_insert(idx, key.to_string(), vec, &metric);
+                    if how == Write::Refresh && idx.key_to_id.read().contains_key(key) {
+                        continue;
+                    }
+                    hnsw_insert_doc(idx, key.to_string(), vec, &metric, doc);
                 }
             }
         }
+    }
+}
+
+/// The words TEXT field `number` of document `doc` holds in `text`, stemmed
+/// again in `language` if the field `stems`: `None` if it holds none.
+fn restem(
+    text: &text::TextIndex,
+    doc: u32,
+    number: u16,
+    stems: bool,
+    language: stem::Language,
+) -> Option<Vec<String>> {
+    let words = text.field_words(doc, number)?;
+    let mut tokens = Vec::with_capacity(words.len() * 2);
+    for word in words {
+        let stemmed = if stems {
+            stem::index_stem(language, &word)
+        } else {
+            None
+        };
+        tokens.push(word);
+        if let Some(s) = stemmed {
+            tokens.push(format!("{}{s}", stem::STEM_PREFIX));
+        }
+    }
+    Some(tokens)
+}
+
+/// Take the vector of the document at `key` out of a vector index: from a
+/// FLAT index, at once; from a graph, by deleting its node in place.
+fn unindex_vector(live: &LiveIndex, key: &str) {
+    match live {
+        LiveIndex::Flat(idx) => {
+            idx.vectors.write().remove(key);
+        }
+        LiveIndex::Hnsw(idx) => {
+            let node_id = idx.key_to_id.write().remove(key);
+            if let Some(node_id) = node_id {
+                let mut nodes = idx.nodes.write();
+                if nodes.get(node_id).is_some_and(|n| n.key == key) {
+                    idx.delete(&mut nodes, node_id);
+                }
+            }
+        }
+    }
+}
+
+/// The document at `key` has left `def`: its vectors, then its words, then
+/// its postings and its id (the order a filtered search relies on: see
+/// [`HnswNode::doc`]; the words are in terms of the id).
+fn unindex_from(def: &IndexDef, key: &str) {
+    for live in def.indexes.values() {
+        unindex_vector(live, key);
+    }
+    // The words are taken out by the postings, before they give the id back.
+    if def.gives_ids() {
+        def.postings.remove(key, def.text_removal());
+    }
+    def.forget_language(key);
+}
+
+// ── Keys that expire on being read ───────────────────────────────────────────
+//
+// A key found expired by a read is deleted there and then (`helpers::
+// delete_key_if_expired`), where there is no index store to hand. Each
+// server's store is paired with its index store here, so that the key leaves
+// its indexes too: before, it stayed in the graph and was still found by a
+// KNN query.
+
+static INDEX_STORES: RwLock<Vec<(usize, IndexStore)>> = RwLock::new(Vec::new());
+
+fn store_id(store: &crate::store::Store) -> usize {
+    Arc::as_ptr(store) as *const () as usize
+}
+
+/// Pair a server's store with its index store.
+pub fn register_index_store(store: &crate::store::Store, index_store: &IndexStore) {
+    let id = store_id(store);
+    let mut stores = INDEX_STORES.write();
+    stores.retain(|(other, _)| *other != id);
+    stores.push((id, Arc::clone(index_store)));
+}
+
+/// `key` of database `db` expired and was deleted by a read.
+pub fn unindex_expired(store: &crate::store::Store, db: usize, key: &str) {
+    let id = store_id(store);
+    let index_store = INDEX_STORES
+        .read()
+        .iter()
+        .find(|(other, _)| *other == id)
+        .map(|(_, index_store)| Arc::clone(index_store));
+    if let Some(index_store) = index_store {
+        maybe_unindex(&index_store, db, key);
     }
 }
 
@@ -1955,16 +2428,18 @@ pub fn knn_flat(
 /// `keep_pruned` — if true, fill remaining slots with the discarded set so
 ///                 we always return exactly m_max neighbors when possible.
 /// Choose up to `m_max` of `candidates` as a node's neighbours. Like the
-/// search, it offers its read lock to a waiting insert every few candidates.
+/// search, it offers its read lock to a waiting writer every few candidates.
 fn select_neighbors_heuristic(
+    slots: &slots::Slots,
     nodes: &mut NodesGuard<'_>,
-    candidates: &[(f32, usize)],
+    candidates: &[(f32, u32)],
     m_max: usize,
     metric: &DistanceMetric,
     keep_pruned: bool,
-) -> Vec<usize> {
-    let mut result: Vec<(f32, usize)> = Vec::with_capacity(m_max);
-    let mut discarded: Vec<(f32, usize)> = Vec::new();
+) -> Vec<u32> {
+    let mut result: Vec<(f32, u32)> = Vec::with_capacity(m_max);
+    let mut discarded: Vec<(f32, u32)> = Vec::new();
+    let next_lines = PREFETCH_NEXT;
 
     'cand: for (i, &(d_to_q, cand_id)) in candidates.iter().enumerate() {
         if result.len() >= m_max {
@@ -1973,16 +2448,20 @@ fn select_neighbors_heuristic(
         if i > 0 && i.is_multiple_of(EXPANSIONS_PER_YIELD) {
             parking_lot::RwLockReadGuard::bump(nodes);
         }
-        let cand_vec = &nodes[cand_id].vector;
-        if cand_vec.is_empty() {
+        if let Some(&(_, next)) = candidates.get(i + 1) {
+            slots.prefetch(next as usize, next_lines);
+        }
+        let cand = cand_id as usize;
+        if !slots.is_live(cand) {
             continue;
         }
+        let cand_vec = slots.vector(cand);
         // Key heuristic check: is the candidate closer to q than to any
         // already-selected result neighbor?  If a result neighbor is closer
         // to the candidate than q is, the candidate is "dominated" — the
         // result neighbor already covers that direction better.
         for &(_, sel_id) in &result {
-            let d_cand_to_sel = distance_prenorm(metric, cand_vec, &nodes[sel_id].vector);
+            let d_cand_to_sel = distance_prenorm(metric, cand_vec, slots.vector(sel_id as usize));
             if d_cand_to_sel < d_to_q {
                 discarded.push((d_to_q, cand_id));
                 continue 'cand;
@@ -2005,24 +2484,59 @@ fn select_neighbors_heuristic(
     result.into_iter().map(|(_, id)| id).collect()
 }
 
+/// The `m_max` of `ids` nearest the vector `of`, nearest first: the
+/// neighbours a node keeps when one more is linked to it than it has room
+/// for and the list pruned during the search is out of date.
+fn nearest_of(
+    slots: &slots::Slots,
+    metric: &DistanceMetric,
+    of: &[f32],
+    ids: &[u32],
+    m_max: usize,
+) -> Vec<u32> {
+    BACKLINK_SCRATCH.with(|cell| {
+        let mut scored = cell.borrow_mut();
+        scored.clear();
+        scored.reserve(ids.len());
+        for &id in ids {
+            if !slots.is_live(id as usize) {
+                continue;
+            }
+            scored.push((distance_prenorm(metric, of, slots.vector(id as usize)), id));
+        }
+        scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        scored.truncate(m_max);
+        scored.iter().map(|&(_, id)| id).collect()
+    })
+}
+
 /// Insert a new vector into the HNSW index.
 pub fn hnsw_insert(index: &Arc<HnswIndex>, key: String, vector: Vec<f32>, metric: &DistanceMetric) {
-    use std::sync::atomic::Ordering::Relaxed;
+    hnsw_insert_doc(index, key, vector, metric, postings::NO_DOC);
+}
 
-    // ── Phase 0: tombstone old node if key exists ─────────────────────────
-    {
-        let key_to_id = index.key_to_id.read();
-        if let Some(&old_id) = key_to_id.get(&key) {
-            drop(key_to_id);
-            let mut nodes = index.nodes.write();
-            if let Some(node) = nodes.get_mut(old_id)
-                && !node.vector.is_empty()
-            {
-                node.clear();
-                index.tombstone_count.fetch_add(1, Relaxed);
-                index.live_count.fetch_sub(1, Relaxed);
-            }
-            // don't return — we still need to insert the new node
+/// A forward neighbour that will overflow when it receives its back-link,
+/// pruned during the search: (neighbour id, layer, its neighbours as the
+/// search saw them, the list to replace them with). The new node is not in
+/// the graph yet, so the list names it [`NEW_NODE`].
+type PrecomputedBacklink = (u32, usize, Vec<u32>, Vec<u32>);
+const NEW_NODE: u32 = u32::MAX;
+
+/// [`hnsw_insert`] of the vector of the document whose id is `doc`.
+pub fn hnsw_insert_doc(
+    index: &Arc<HnswIndex>,
+    key: String,
+    vector: Vec<f32>,
+    metric: &DistanceMetric,
+    doc: u32,
+) {
+    // ── Phase 0: delete the key's old node, if it has one ─────────────────
+    // Its slot goes to the free list; this insert may well fill it again.
+    let old_id = index.key_to_id.write().remove(&key);
+    if let Some(old_id) = old_id {
+        let mut nodes = index.nodes.write();
+        if nodes.get(old_id).is_some_and(|n| n.key == key) {
+            index.delete(&mut nodes, old_id);
         }
     }
 
@@ -2033,6 +2547,14 @@ pub fn hnsw_insert(index: &Arc<HnswIndex>, key: String, vector: Vec<f32>, metric
     } else {
         vector
     };
+    // The first vector sets the graph's dimension; one of another (which
+    // the schema rules out) has nowhere to go.
+    let slots = index
+        .slots
+        .get_or_init(|| slots::Slots::new(vector.len(), index.m0 + slack(index.m0)));
+    if vector.len() != slots.dim() {
+        return;
+    }
 
     let level = {
         use rand::Rng;
@@ -2046,18 +2568,10 @@ pub fn hnsw_insert(index: &Arc<HnswIndex>, key: String, vector: Vec<f32>, metric
     // ── Phase 2: pure read traversal — NO global write lock held ─────────
     // This is the hot path. Concurrent inserts and searches run freely here.
     //
-    // precomputed_backlinks: for each forward neighbor predicted to overflow
-    // after receiving a backlink, we pre-score its current neighbors against
-    // its own vector during Phase 2 (read lock, concurrent). Phase 6 inserts
-    // new_id into that sorted list and runs a bounded heuristic (K=4) — only
-    // O(M×K) pairwise distance calls under the write lock instead of O(M²).
-    // Tuple: (nb_id, layer, nb_vec_owned, pre_scored_sorted, snapshot_len).
-    // A forward neighbour that will overflow when it receives its back-link,
-    // pruned during the search: (neighbour id, layer, its neighbours as the
-    // search saw them, the list to replace them with). The new node is not in
-    // the graph yet, so the list names it NEW_NODE.
-    type PrecomputedBacklink = (usize, usize, Vec<usize>, Vec<usize>);
-    const NEW_NODE: usize = usize::MAX;
+    // For each forward neighbour predicted to overflow when it receives its
+    // back-link, its neighbours are scored against it here, under the read
+    // lock, so that linking (under the neighbour's lock) only swaps the
+    // pruned list in.
     let mut precomputed_backlinks: Vec<PrecomputedBacklink> = Vec::new();
 
     // The whole insert holds the graph for reading: it appends its node and
@@ -2067,17 +2581,26 @@ pub fn hnsw_insert(index: &Arc<HnswIndex>, key: String, vector: Vec<f32>, metric
     // that comes after it: 6,000 inserts a second on 64 cores, 51 of 62
     // workers waiting.
     let mut nodes = index.nodes.read();
-    let neighbors_per_layer: Vec<Vec<usize>> = if let Some(mut ep) = ep_snapshot {
+    let mut neighbors_per_layer: Vec<Vec<u32>> = if let Some(mut ep) = ep_snapshot {
         // Check if entry point is tombstoned — find a live replacement
-        if nodes.get(ep).map(|n| n.vector.is_empty()).unwrap_or(true) {
+        if !index.is_live(ep) {
             let k2id = index.key_to_id.read();
             match k2id.values().next().copied() {
                 Some(id) => ep = id,
                 None => {
                     // No live nodes at all — we become the entry point
                     drop(k2id);
-                    let neighbors = (0..=level).map(|_| Vec::new()).collect();
-                    let new_id = nodes.push(HnswNode::new(key.clone(), vector, neighbors));
+                    let mut links: Vec<Vec<u32>> = (0..=level).map(|_| Vec::new()).collect();
+                    let new_id = publish(
+                        index,
+                        slots,
+                        &mut nodes,
+                        key.clone(),
+                        &vector,
+                        level,
+                        doc,
+                        &mut links,
+                    );
                     index.key_to_id.write().insert(key, new_id);
                     index.live_count.fetch_add(1, Relaxed);
                     *index.entry_point.write() = Some(new_id);
@@ -2086,13 +2609,13 @@ pub fn hnsw_insert(index: &Arc<HnswIndex>, key: String, vector: Vec<f32>, metric
             }
         }
 
-        let ep_level = nodes[ep].layer_count().saturating_sub(1);
+        let ep_level = nodes.get(ep).map_or(0, |n| n.level);
 
         // Greedy descent from top layer to level+1 (just finding better ep)
-        let mut curr_ep = ep;
-        let mut per_layer: Vec<Vec<usize>> = Vec::with_capacity(level + 1);
+        let mut curr_ep = ep as u32;
+        let mut per_layer: Vec<Vec<u32>> = Vec::with_capacity(level + 1);
         for lc in (level + 1..=ep_level).rev() {
-            let results = hnsw_search_layer_concurrent(&mut nodes, &vector, curr_ep, 1, lc, metric);
+            let results = search_layer(index, slots, &mut nodes, &vector, curr_ep, 1, lc, metric);
             if let Some(&(_, best)) = results.first() {
                 curr_ep = best;
             }
@@ -2101,7 +2624,9 @@ pub fn hnsw_insert(index: &Arc<HnswIndex>, key: String, vector: Vec<f32>, metric
         // Search and collect neighbors for layers 0..=min(level, ep_level)
         for lc in (0..=level.min(ep_level)).rev() {
             let m_max = if lc == 0 { index.m0 } else { index.m };
-            let candidates = hnsw_search_layer_concurrent(
+            let candidates = search_layer(
+                index,
+                slots,
                 &mut nodes,
                 &vector,
                 curr_ep,
@@ -2112,7 +2637,8 @@ pub fn hnsw_insert(index: &Arc<HnswIndex>, key: String, vector: Vec<f32>, metric
             if let Some(&(_, best)) = candidates.first() {
                 curr_ep = best;
             }
-            let selected = select_neighbors_heuristic(&mut nodes, &candidates, m_max, metric, true);
+            let selected =
+                select_neighbors_heuristic(slots, &mut nodes, &candidates, m_max, metric, true);
             per_layer.push(selected);
         }
 
@@ -2128,33 +2654,35 @@ pub fn hnsw_insert(index: &Arc<HnswIndex>, key: String, vector: Vec<f32>, metric
         // that the back-link will overflow; linking then only swaps the
         // pruned list in. Pruning reads up to M x 4 vectors from all over the
         // graph, for some 32 neighbours an insert.
+        let mut seen: Vec<u32> = Vec::with_capacity(index.m0);
         for (lc, forward_neighbors) in per_layer.iter().enumerate() {
             let m_max = if lc == 0 { index.m0 } else { index.m };
             for &nb_id in forward_neighbors {
-                let nb_node = &nodes[nb_id];
-                if nb_node.vector.is_empty() {
+                let nb = nb_id as usize;
+                if !slots.is_live(nb) {
                     continue;
                 }
-                let lc_neighbors = match nb_node.neighbors.lock().get(lc) {
-                    Some(n) if n.len() >= m_max => n.clone(),
-                    _ => continue, // won't overflow
-                };
-                let nb_vec = &nb_node.vector;
-                let vector_of = |id: usize| {
+                seen.clear();
+                index.links(&nodes, nb, lc, &mut seen);
+                if seen.len() < m_max + slack(m_max) {
+                    continue; // won't overflow
+                }
+                let nb_vec = slots.vector(nb);
+                let vector_of = |id: u32| {
                     if id == NEW_NODE {
                         &vector[..]
                     } else {
-                        &nodes[id].vector[..]
+                        slots.vector(id as usize)
                     }
                 };
-                let mut scored: Vec<(f32, usize)> = lc_neighbors
+                let mut scored: Vec<(f32, u32)> = seen
                     .iter()
-                    .filter_map(|&id| {
-                        let n = &nodes[id];
-                        if n.vector.is_empty() {
-                            return None;
-                        }
-                        Some((distance_prenorm(metric, nb_vec, &n.vector), id))
+                    .filter(|&&id| slots.is_live(id as usize))
+                    .map(|&id| {
+                        (
+                            distance_prenorm(metric, nb_vec, slots.vector(id as usize)),
+                            id,
+                        )
                     })
                     .collect();
                 scored.push((distance_prenorm(metric, nb_vec, &vector), NEW_NODE));
@@ -2185,7 +2713,7 @@ pub fn hnsw_insert(index: &Arc<HnswIndex>, key: String, vector: Vec<f32>, metric
                 let kept = scored.iter().filter(|(d, _)| !d.is_infinite());
                 let dropped = scored.iter().filter(|(d, _)| d.is_infinite());
                 pruned.extend(kept.chain(dropped).take(m_max).map(|&(_, id)| id));
-                precomputed_backlinks.push((nb_id, lc, lc_neighbors, pruned));
+                precomputed_backlinks.push((nb_id, lc, seen.clone(), pruned));
                 parking_lot::RwLockReadGuard::bump(&mut nodes);
             }
         }
@@ -2198,8 +2726,16 @@ pub fn hnsw_insert(index: &Arc<HnswIndex>, key: String, vector: Vec<f32>, metric
 
     // Append the node. Nothing finds it until a neighbour links back to it
     // below, or a reader looks its key up after the next line.
-    let forward_links = neighbors_per_layer.clone();
-    let new_id = nodes.push(HnswNode::new(key.clone(), vector, neighbors_per_layer));
+    let new_id = publish(
+        index,
+        slots,
+        &mut nodes,
+        key.clone(),
+        &vector,
+        level,
+        doc,
+        &mut neighbors_per_layer,
+    );
     index.key_to_id.write().insert(key, new_id);
     index.live_count.fetch_add(1, Relaxed);
 
@@ -2209,8 +2745,8 @@ pub fn hnsw_insert(index: &Arc<HnswIndex>, key: String, vector: Vec<f32>, metric
         match *ep {
             None => *ep = Some(new_id),
             Some(current_ep) => {
-                let current_level = nodes[current_ep].layer_count().saturating_sub(1);
-                if level > current_level {
+                let current_level = nodes.get(current_ep).map_or(0, |n| n.level);
+                if level > current_level || !index.is_live(current_ep) {
                     *ep = Some(new_id);
                 }
             }
@@ -2218,87 +2754,165 @@ pub fn hnsw_insert(index: &Arc<HnswIndex>, key: String, vector: Vec<f32>, metric
     }
 
     // Back-links, each under that neighbour's lock alone.
-    for (lc, forward) in forward_links.iter().enumerate() {
+    let mut list: Vec<u32> = Vec::with_capacity(index.m0 + 1);
+    for (lc, forward) in neighbors_per_layer.iter().enumerate() {
         let m_max = if lc == 0 { index.m0 } else { index.m };
         for &nb_id in forward {
-            let nb = &nodes[nb_id];
-            if nb.vector.is_empty() {
+            let nb = nb_id as usize;
+            if nb == new_id || !slots.is_live(nb) {
                 continue;
             }
-            let mut links = nb.neighbors.lock();
-            while links.len() <= lc {
-                links.push(Vec::new());
-            }
-            let list = &mut links[lc];
-            list.push(new_id);
-            if list.len() <= m_max {
+            let Some(nb_node) = nodes.get(nb) else {
                 continue;
+            };
+            let mut upper = nb_node.upper.lock();
+            if lc == 0 {
+                if slots.push_link(nb, new_id as u32) {
+                    continue;
+                }
+                list.clear();
+                slots.read_links(nb, &mut list);
+            } else {
+                while upper.len() < lc {
+                    upper.push(Vec::new());
+                }
+                let links = &mut upper[lc - 1];
+                if links.len() < m_max + slack(m_max) {
+                    links.push(new_id as u32);
+                    continue;
+                }
+                list.clear();
+                list.extend_from_slice(links);
             }
 
             // Fast path: the list pruned during the search, if the
-            // neighbour's list is still the one it pruned (with new_id just
-            // pushed on the end).
-            let fresh = precomputed_backlinks.iter().find(|(pid, plc, seen, _)| {
-                *pid == nb_id && *plc == lc && list[..list.len() - 1] == seen[..]
-            });
-            if let Some((_, _, _, pruned)) = fresh {
-                list.clear();
-                list.extend(
-                    pruned
-                        .iter()
-                        .map(|&id| if id == NEW_NODE { new_id } else { id }),
-                );
-                continue;
+            // neighbour's list is still the one it pruned.
+            let fresh = precomputed_backlinks
+                .iter()
+                .find(|(pid, plc, seen, _)| *pid == nb_id && *plc == lc && *seen == list);
+            let replacement: Vec<u32> = if let Some((_, _, _, pruned)) = fresh {
+                pruned
+                    .iter()
+                    .map(|&id| if id == NEW_NODE { new_id as u32 } else { id })
+                    .collect()
+            } else {
+                // Stale (a concurrent insert changed the list): keep the
+                // m_max nearest.
+                list.push(new_id as u32);
+                nearest_of(slots, metric, slots.vector(nb), &list, m_max)
+            };
+            if lc == 0 {
+                slots.write_links(nb, replacement);
+            } else {
+                upper[lc - 1] = replacement;
             }
-
-            // Stale (a concurrent insert changed the list): keep the m_max
-            // nearest.
-            let candidates: Vec<usize> = std::mem::take(list);
-            BACKLINK_SCRATCH.with(|cell| {
-                let mut scored = cell.borrow_mut();
-                scored.clear();
-                scored.reserve(candidates.len());
-                for &id in &candidates {
-                    let n = &nodes[id];
-                    if n.vector.is_empty() {
-                        continue;
-                    }
-                    scored.push((distance_prenorm(metric, &nb.vector, &n.vector), id));
-                }
-                scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-                scored.truncate(m_max);
-                list.reserve(scored.len());
-                list.extend(scored.iter().map(|&(_, id)| id));
-            });
         }
     }
 }
+
+/// How many links past its most a node's list may take before it is pruned
+/// back to its most, so that a pruning is paid once for several back-links
+/// rather than for each.
+///
+/// A list is full nearly always, so with no slack every back-link pruned it
+/// again: an insert pruned some 32 neighbours, each measuring the
+/// neighbour's links against one another, and that was half the distances
+/// an insert measured. Pruning to below the most instead (leaving room)
+/// saves as much, but leaves nodes with fewer links than before, and recall
+/// at ef 64 fell by 0.004 in graphs built by the server. With slack a node
+/// has at least the links it had, and up to 4 more: 16 bytes a node.
+/// Measured on dbpedia-openai-100K-1536 (M 16, EF_CONSTRUCTION 128, an
+/// 8-CPU D16s_v5): see the commit that brought it.
+const PRUNE_SLACK: usize = 4;
+
+/// [`PRUNE_SLACK`], for a list of at most `m_max` links.
+fn slack(m_max: usize) -> usize {
+    PRUNE_SLACK.min(m_max / 4)
+}
+
+/// Put a new node in the graph: in a deleted node's slot if there is one,
+/// under the write lock (a search may still hold that id), or else in a
+/// new slot, which no reader can reach before its node is there. `links`
+/// are its links by layer; a link to the slot it takes is dropped (a node
+/// met live in the search may have been deleted since, and its slot be the
+/// one given to this node).
+#[allow(clippy::too_many_arguments)]
+fn publish(
+    index: &HnswIndex,
+    slots: &slots::Slots,
+    nodes: &mut NodesGuard<'_>,
+    key: String,
+    vector: &[f32],
+    level: usize,
+    doc: u32,
+    links: &mut [Vec<u32>],
+) -> usize {
+    let reuse = index.free.lock().pop();
+    if let Some(id) = reuse {
+        for list in links.iter_mut() {
+            list.retain(|&x| x != id);
+        }
+        let id = id as usize;
+        let upper = links[1..].to_vec();
+        let layer0 = &links[0];
+        parking_lot::RwLockReadGuard::unlocked(nodes, || {
+            let mut graph = index.nodes.write();
+            // SAFETY: the graph is held for writing, so no one reads the
+            // slot; it was deleted, so no one writes it.
+            unsafe { slots.write_vector(id, vector) };
+            slots.write_links(id, layer0.iter().copied());
+            if let Some(node) = graph.get_mut(id) {
+                *node = HnswNode::new(key, level, upper, doc);
+            }
+            slots.flag(id).store(1, Release);
+            index.reused.fetch_add(1, Release);
+            index.tombstone_count.fetch_sub(1, Relaxed);
+        });
+        id
+    } else {
+        let upper = links[1..].to_vec();
+        let layer0 = &links[0];
+        nodes.push_with(|id| {
+            slots.reserve(id);
+            // SAFETY: a new slot: nothing links to it and no key names it.
+            unsafe { slots.write_vector(id, vector) };
+            slots.write_links(id, layer0.iter().copied());
+            slots.flag(id).store(1, Release);
+            HnswNode::new(key, level, upper, doc)
+        })
+    }
+}
+
 thread_local! {
-    static BACKLINK_SCRATCH: std::cell::RefCell<Vec<(f32, usize)>> =
+    static BACKLINK_SCRATCH: std::cell::RefCell<Vec<(f32, u32)>> =
         std::cell::RefCell::new(Vec::with_capacity(64));
 }
+
+type MinHeap =
+    std::collections::BinaryHeap<std::cmp::Reverse<(ordered_float::OrderedFloat<f32>, u32)>>;
+type MaxHeap = std::collections::BinaryHeap<(ordered_float::OrderedFloat<f32>, u32)>;
+
 /// Per-thread scratch buffers for HNSW search.
 /// Allocated once per thread, reused across every search call.
-/// clear() is O(n) but avoids malloc/free on the hot path.
 struct SearchBuffers {
-    visited: AHashSet<usize>,
-    candidates:
-        std::collections::BinaryHeap<std::cmp::Reverse<(ordered_float::OrderedFloat<f32>, usize)>>,
-    dynamic: std::collections::BinaryHeap<(ordered_float::OrderedFloat<f32>, usize)>,
-    neighbor_scratch: Vec<usize>,
+    visited: slots::Visited,
+    candidates: MinHeap,
+    dynamic: MaxHeap,
+    neighbor_scratch: Vec<u32>,
 }
 impl SearchBuffers {
     fn new() -> Self {
         Self {
-            visited: AHashSet::with_capacity(256),
+            visited: slots::Visited::default(),
             candidates: std::collections::BinaryHeap::with_capacity(256),
             dynamic: std::collections::BinaryHeap::with_capacity(256),
             neighbor_scratch: Vec::with_capacity(64),
         }
     }
 
-    fn clear(&mut self) {
-        self.visited.clear();
+    /// Empty, for a graph of `nodes` slots.
+    fn clear(&mut self, nodes: usize) {
+        self.visited.reset(nodes);
         self.candidates.clear();
         self.dynamic.clear();
         self.neighbor_scratch.clear();
@@ -2310,46 +2924,68 @@ thread_local! {
         std::cell::RefCell::new(SearchBuffers::new());
 }
 
-/// Greedy beam search within one layer.
-/// Returns up to `ef` candidates as (distance, node_id), sorted ascending.
 /// How many candidates a search expands between offers of its read lock to a
-/// waiting insert (see [`hnsw_search_layer_concurrent`]).
+/// waiting writer (see [`search_layer`]).
 const EXPANSIONS_PER_YIELD: usize = 4;
 
-/// Search one layer of the graph from `ep`, the graph held for reading.
+/// Cache lines of each neighbour's vector asked for as soon as the
+/// neighbours of a node are known, before any is measured, and of the next
+/// neighbour's while one is measured.
 ///
-/// Every few candidates the read lock is handed to a delete waiting for the
-/// write lock, if there is one, and taken back: a writer that waits holds back
-/// every reader that comes after it, so a long search would hold up all of
-/// them. Ids stay valid across the yield: nodes are only appended, and deleted
-/// ones are tombstoned in place.
-fn hnsw_search_layer_concurrent(
+/// The hardware brings the rest of a vector in once its first lines are
+/// read. Measured on dbpedia-openai-100K-1536 (D16s_v5, ef 128): nothing
+/// asked for, 778 queries a second on one thread and 3,872 on eight; the
+/// whole of the next vector, 766 and 3,526 (the lines asked for push out
+/// those being read); 4 and 8 lines, 958 and 4,353. From 1 to 4 lines up
+/// front and 2 to 8 of the next measured within a few percent of that.
+const PREFETCH_FIRST: usize = 4;
+const PREFETCH_NEXT: usize = 8;
+
+/// Search one layer of the graph from `ep`, the graph held for reading.
+/// Returns up to `ef` candidates as (distance, node_id), sorted ascending.
+///
+/// Every few candidates the read lock is handed to a writer waiting for it,
+/// if there is one, and taken back: a writer that waits holds back every
+/// reader that comes after it, so a long search would hold up all of them.
+/// Ids stay valid across the yield: slots never move. One may name another
+/// node after it, if a deleted slot was filled again meanwhile; the search
+/// then only measures a node it did not mean to (see [`HnswIndex::reused`]).
+///
+/// The neighbours of each node expanded are read without a lock, and their
+/// vectors asked for before any is measured: the vectors are the search's
+/// cost, and most come from memory.
+#[allow(clippy::too_many_arguments)]
+fn search_layer(
+    index: &HnswIndex,
+    slots: &slots::Slots,
     nodes: &mut NodesGuard<'_>,
     query: &[f32],
-    ep: usize,
+    ep: u32,
     ef: usize,
     layer: usize,
     metric: &DistanceMetric,
-) -> Vec<(f32, usize)> {
-    let ep_dist = {
-        let n = &nodes[ep];
-        if n.vector.is_empty() {
-            return vec![];
-        }
-        distance_prenorm(metric, query, &n.vector)
-    };
+) -> Vec<(f32, u32)> {
+    use ordered_float::OrderedFloat;
+    use std::cmp::Reverse;
+    let ep_id = ep as usize;
+    if !slots.has(ep_id) || !slots.is_live(ep_id) {
+        return vec![];
+    }
+    let ep_dist = distance_prenorm(metric, query, slots.vector(ep_id));
+    let (first, next) = (PREFETCH_FIRST, PREFETCH_NEXT);
 
     SEARCH_BUFFERS.with(|cell| {
-        let mut bufs = cell.borrow_mut();
-        bufs.clear();
+        let mut guard = cell.borrow_mut();
+        let bufs = &mut *guard;
+        bufs.clear(nodes.count());
 
-        let of_ep = ordered_float::OrderedFloat(ep_dist);
+        let of_ep = OrderedFloat(ep_dist);
         bufs.visited.insert(ep);
-        bufs.candidates.push(std::cmp::Reverse((of_ep, ep)));
+        bufs.candidates.push(Reverse((of_ep, ep)));
         bufs.dynamic.push((of_ep, ep));
 
         let mut expanded = 0usize;
-        while let Some(std::cmp::Reverse((c_dist, c_id))) = bufs.candidates.pop() {
+        while let Some(Reverse((c_dist, c_id))) = bufs.candidates.pop() {
             let worst = bufs.dynamic.peek().map(|(d, _)| d.0).unwrap_or(f32::MAX);
             if bufs.dynamic.len() >= ef && c_dist.0 > worst {
                 break;
@@ -2359,34 +2995,33 @@ fn hnsw_search_layer_concurrent(
                 parking_lot::RwLockReadGuard::bump(nodes);
             }
 
-            // Copy neighbors into the thread-local scratch buffer.
+            // The neighbours not met yet, each asked for ahead of its turn.
             bufs.neighbor_scratch.clear();
-            {
-                let links = nodes[c_id].neighbors.lock();
-                if let Some(list) = links.get(layer) {
-                    bufs.neighbor_scratch.extend_from_slice(list);
+            index.links(nodes, c_id as usize, layer, &mut bufs.neighbor_scratch);
+            let mut fresh = 0;
+            for i in 0..bufs.neighbor_scratch.len() {
+                let id = bufs.neighbor_scratch[i];
+                if bufs.visited.insert(id) {
+                    bufs.neighbor_scratch[fresh] = id;
+                    fresh += 1;
+                    slots.prefetch(id as usize, first);
                 }
             }
 
-            // Index-based iteration so we can mutate other bufs fields inside.
-            for i in 0..bufs.neighbor_scratch.len() {
+            for i in 0..fresh {
+                if i + 1 < fresh {
+                    slots.prefetch(bufs.neighbor_scratch[i + 1] as usize, next);
+                }
                 let nb_id = bufs.neighbor_scratch[i];
-                if !bufs.visited.insert(nb_id) {
+                if !slots.is_live(nb_id as usize) {
                     continue;
                 }
-
-                let nb_dist = {
-                    let n = &nodes[nb_id];
-                    if n.vector.is_empty() {
-                        continue;
-                    }
-                    distance_prenorm(metric, query, &n.vector)
-                };
+                let nb_dist = distance_prenorm(metric, query, slots.vector(nb_id as usize));
 
                 let worst = bufs.dynamic.peek().map(|(d, _)| d.0).unwrap_or(f32::MAX);
                 if nb_dist < worst || bufs.dynamic.len() < ef {
-                    let of = ordered_float::OrderedFloat(nb_dist);
-                    bufs.candidates.push(std::cmp::Reverse((of, nb_id)));
+                    let of = OrderedFloat(nb_dist);
+                    bufs.candidates.push(Reverse((of, nb_id)));
                     bufs.dynamic.push((of, nb_id));
                     if bufs.dynamic.len() > ef {
                         bufs.dynamic.pop();
@@ -2395,11 +3030,49 @@ fn hnsw_search_layer_concurrent(
             }
         }
 
-        // Drain dynamic into result vec — reuse the allocation
-        let mut result: Vec<(f32, usize)> = bufs.dynamic.drain().map(|(d, id)| (d.0, id)).collect();
+        let mut result: Vec<(f32, u32)> = bufs.dynamic.drain().map(|(d, id)| (d.0, id)).collect();
         result.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
         result
     })
+}
+
+/// The `k` nearest of `found` (sorted ascending), as results: the live
+/// ones, with their keys. If a deleted slot was filled again since the
+/// search took note of `reused`, an id it holds may name another node now,
+/// and each is measured again first.
+#[allow(clippy::too_many_arguments)]
+fn into_results(
+    index: &HnswIndex,
+    slots: &slots::Slots,
+    nodes: &HnswNodes,
+    query: &[f32],
+    metric: &DistanceMetric,
+    mut found: Vec<(f32, u32)>,
+    k: usize,
+    reused: u64,
+) -> Vec<KnnResult> {
+    if index.reused.load(Acquire) != reused {
+        for r in found.iter_mut() {
+            let id = r.1 as usize;
+            r.0 = if slots.is_live(id) {
+                distance_prenorm(metric, query, slots.vector(id))
+            } else {
+                f32::INFINITY
+            };
+        }
+        found.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+    }
+    found.truncate(k);
+    found
+        .into_iter()
+        .filter(|(_, id)| slots.is_live(*id as usize))
+        .filter_map(|(score, id)| {
+            nodes.get(id as usize).map(|n| KnnResult {
+                key: n.key.clone(),
+                score,
+            })
+        })
+        .collect()
 }
 
 /// KNN search using the HNSW graph.
@@ -2421,19 +3094,23 @@ pub fn knn_hnsw(
         query
     };
 
+    let Some(slots) = index.slots() else {
+        return vec![];
+    };
+    if query.len() != slots.dim() {
+        return vec![];
+    }
+
     let mut ep_id = match *index.entry_point.read() {
         Some(id) => id,
         None => return vec![],
     };
 
     let mut nodes = index.nodes.read();
+    let reused = index.reused.load(Acquire);
 
     // Handle tombstoned entry point
-    if nodes
-        .get(ep_id)
-        .map(|n| n.vector.is_empty())
-        .unwrap_or(true)
-    {
+    if !index.is_live(ep_id) {
         let k2id = index.key_to_id.read();
         match k2id.values().next().copied() {
             Some(id) => ep_id = id,
@@ -2445,44 +3122,33 @@ pub fn knn_hnsw(
 
     // Small graph: brute force
     if live_count < 500 {
-        let mut scored: Vec<(f32, usize)> = nodes
+        let mut scored: Vec<(f32, u32)> = nodes
             .iter()
-            .filter_map(|(i, n)| {
-                if n.vector.is_empty() || n.vector.len() != query.len() {
-                    return None;
-                }
-                Some((distance_prenorm(metric, query, &n.vector), i))
-            })
+            .filter(|(i, _)| slots.is_live(*i))
+            .map(|(i, _)| (distance_prenorm(metric, query, slots.vector(i)), i as u32))
             .collect();
         scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-        scored.truncate(k);
-        return scored
-            .into_iter()
-            .map(|(score, id)| KnnResult {
-                key: nodes[id].key.clone(),
-                score,
-            })
-            .collect();
+        return into_results(index, slots, &nodes, query, metric, scored, k, reused);
     }
 
     // Large graph: HNSW traversal
-    let ep_level = nodes[ep_id].layer_count().saturating_sub(1);
-    let mut curr_ep = ep_id;
+    let ep_level = nodes.get(ep_id).map_or(0, |n| n.level);
+    let mut curr_ep = ep_id as u32;
 
     for lc in (1..=ep_level).rev() {
-        let candidates = hnsw_search_layer_concurrent(&mut nodes, query, curr_ep, 1, lc, metric);
+        let candidates = search_layer(index, slots, &mut nodes, query, curr_ep, 1, lc, metric);
         if let Some(&(_, best)) = candidates.first() {
             curr_ep = best;
         }
     }
 
-    let mut results = hnsw_search_layer_concurrent(&mut nodes, query, curr_ep, ef, 0, metric);
+    let mut results = search_layer(index, slots, &mut nodes, query, curr_ep, ef, 0, metric);
 
     // Fallback search from original entry point if we got too few results
-    if results.len() < k && curr_ep != ep_id {
-        let mut more = hnsw_search_layer_concurrent(&mut nodes, query, ep_id, ef, 0, metric);
+    if results.len() < k && curr_ep as usize != ep_id {
+        let mut more = search_layer(index, slots, &mut nodes, query, ep_id as u32, ef, 0, metric);
         results.append(&mut more);
-        let mut seen: AHashMap<usize, f32> = AHashMap::new();
+        let mut seen: AHashMap<u32, f32> = AHashMap::new();
         for (dist, id) in results {
             seen.entry(id)
                 .and_modify(|d| {
@@ -2496,65 +3162,185 @@ pub fn knn_hnsw(
         results.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
     }
 
-    results.truncate(k);
-    results
-        .into_iter()
-        .filter(|(_, id)| !nodes[*id].vector.is_empty())
-        .map(|(score, id)| KnnResult {
-            key: nodes[id].key.clone(),
-            score,
-        })
-        .collect()
+    into_results(index, slots, &nodes, query, metric, results, k, reused)
 }
+
+/// KNN over the graph, among only the nodes `admit` lets in: the search
+/// walks every node, as an unfiltered one does, but only those let in are
+/// kept as results, and it goes on until it holds `ef` of them or has
+/// nowhere nearer to go. hnswlib filters the same way.
+///
+/// `query` is as the graph holds vectors: of unit length for a cosine (see
+/// [`PreparedQuery::vector`]). After `budget` distances the search gives up
+/// and returns `None`: a filter that lets few nodes in makes the walk long,
+/// and measuring the few it lets in is then the cheaper way.
+///
+/// When `deadline` has passed, the search stops with the nearest of the
+/// nodes let in so far, and the second value is true: a query's `TIMEOUT`
+/// holds here as in a scan. `BATCHES` gives the walk no budget, and a filter
+/// that lets few nodes in makes it walk the whole graph.
+#[allow(clippy::too_many_arguments)]
+pub fn knn_hnsw_admitting(
+    index: &HnswIndex,
+    query: &[f32],
+    k: usize,
+    ef: usize,
+    metric: &DistanceMetric,
+    admit: &mut dyn FnMut(&HnswNode) -> bool,
+    budget: usize,
+    deadline: Option<std::time::Instant>,
+) -> Option<(Vec<KnnResult>, bool)> {
+    use ordered_float::OrderedFloat;
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    let ef = ef.max(k);
+    let slots = index.slots()?;
+    if query.len() != slots.dim() {
+        return Some((Vec::new(), false));
+    }
+    let mut ep_id = (*index.entry_point.read())?;
+    let mut nodes = index.nodes.read();
+    let reused = index.reused.load(Acquire);
+    if !index.is_live(ep_id) {
+        ep_id = index.key_to_id.read().values().next().copied()?;
+    }
+
+    // Down to layer 1, nearest first, as an unfiltered search goes.
+    let ep_level = nodes.get(ep_id).map_or(0, |n| n.level);
+    let mut curr = ep_id as u32;
+    for lc in (1..=ep_level).rev() {
+        let found = search_layer(index, slots, &mut nodes, query, curr, 1, lc, metric);
+        if let Some(&(_, best)) = found.first() {
+            curr = best;
+        }
+    }
+
+    // Layer 0, keeping only what is let in.
+    let (first, next) = (PREFETCH_FIRST, PREFETCH_NEXT);
+    let mut spent = 0usize;
+    let mut visited = slots::Visited::default();
+    visited.reset(nodes.count());
+    let mut candidates: BinaryHeap<Reverse<(OrderedFloat<f32>, u32)>> = BinaryHeap::new();
+    let mut results: BinaryHeap<(OrderedFloat<f32>, u32)> = BinaryHeap::new();
+    let mut neighbors: Vec<u32> = Vec::with_capacity(64);
+
+    if !index.is_live(curr as usize) {
+        return Some((Vec::new(), false));
+    }
+    let d = OrderedFloat(distance_prenorm(metric, query, slots.vector(curr as usize)));
+    spent += 1;
+    visited.insert(curr);
+    candidates.push(Reverse((d, curr)));
+    if let Some(n) = nodes.get(curr as usize)
+        && admit(n)
+    {
+        results.push((d, curr));
+    }
+    let mut bound = if results.len() >= ef {
+        results.peek().map_or(f32::INFINITY, |(d, _)| d.0)
+    } else {
+        f32::INFINITY
+    };
+
+    let mut expanded = 0usize;
+    let mut cut = false;
+    while let Some(Reverse((d, id))) = candidates.pop() {
+        if d.0 > bound && results.len() >= ef {
+            break;
+        }
+        expanded += 1;
+        // The clock every DEADLINE_EXPANSIONS nodes expanded: a few
+        // thousand distances apart.
+        if expanded.is_multiple_of(DEADLINE_EXPANSIONS)
+            && deadline.is_some_and(|d| std::time::Instant::now() >= d)
+        {
+            cut = true;
+            break;
+        }
+        if expanded.is_multiple_of(EXPANSIONS_PER_YIELD) {
+            parking_lot::RwLockReadGuard::bump(&mut nodes);
+        }
+        neighbors.clear();
+        slots.read_links(id as usize, &mut neighbors);
+        let mut fresh = 0;
+        for i in 0..neighbors.len() {
+            let nb = neighbors[i];
+            if visited.insert(nb) {
+                neighbors[fresh] = nb;
+                fresh += 1;
+                slots.prefetch(nb as usize, first);
+            }
+        }
+        for i in 0..fresh {
+            if i + 1 < fresh {
+                slots.prefetch(neighbors[i + 1] as usize, next);
+            }
+            let nb = neighbors[i];
+            if !slots.is_live(nb as usize) {
+                continue;
+            }
+            spent += 1;
+            if spent > budget {
+                return None;
+            }
+            let dist = distance_prenorm(metric, query, slots.vector(nb as usize));
+            if results.len() < ef || dist < bound {
+                candidates.push(Reverse((OrderedFloat(dist), nb)));
+                if let Some(n) = nodes.get(nb as usize)
+                    && admit(n)
+                {
+                    results.push((OrderedFloat(dist), nb));
+                    if results.len() > ef {
+                        results.pop();
+                    }
+                    if results.len() >= ef {
+                        bound = results.peek().map_or(f32::INFINITY, |(d, _)| d.0);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut found: Vec<(f32, u32)> = results.into_iter().map(|(d, id)| (d.0, id)).collect();
+    found.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+    if index.reused.load(Acquire) != reused {
+        // A slot filled again meanwhile holds another document now: it is
+        // let in again or not.
+        found.retain(|(_, id)| match nodes.get(*id as usize) {
+            Some(n) => admit(n),
+            None => false,
+        });
+    }
+    let nearest = into_results(index, slots, &nodes, query, metric, found, k, reused);
+    Some((nearest, cut))
+}
+
+/// Nodes a filtered graph search expands between reads of the clock
+/// (`knn_hnsw_admitting`).
+const DEADLINE_EXPANSIONS: usize = 64;
 
 /// Called when a key is deleted. Removes it from any matching indexes.
 /// For FLAT this is O(1). For HNSW we tombstone — mark deleted but
 /// leave the graph structure intact (full graph surgery is expensive).
-pub fn maybe_unindex(index_store: &IndexStore, key: &str) {
+///
+/// Only the indexes of database `db`: the same key in another database is
+/// another document. A `DEL` in one database used to take the document of
+/// the same name out of an index of another.
+pub fn maybe_unindex(index_store: &IndexStore, db: usize, key: &str) {
     if indexing_deferred() {
         return;
     }
     let store = index_store.read();
 
     for (name, def) in store.iter() {
-        if is_alias(name, def) {
+        if is_alias(name, def) || def.db_index != db || !def.covers(key) {
             continue;
         }
-        let matches =
-            def.prefixes.is_empty() || def.prefixes.iter().any(|p| key.starts_with(p.as_str()));
-        if !matches {
-            continue;
-        }
-
-        // What its TEXT fields put in comes out: the words it held, from the
-        // inverted index and the BM25 statistics. It used to walk every
-        // posting list, and leave the statistics as they were.
-        def.remove_text(key);
-
-        // Tombstone the key in every VECTOR field's live index.
-        // The HSET-equivalent inserts into one or more of these; deletion
-        // hits all of them since we don't know which ones held a value.
-        for live in def.indexes.values() {
-            match live {
-                LiveIndex::Flat(idx) => {
-                    idx.vectors.write().remove(key);
-                }
-                LiveIndex::Hnsw(idx) => {
-                    let node_id = idx.key_to_id.write().remove(key);
-                    if let Some(node_id) = node_id {
-                        let mut nodes = idx.nodes.write();
-                        if let Some(node) = nodes.get_mut(node_id)
-                            && !node.vector.is_empty()
-                        {
-                            node.clear();
-                            use std::sync::atomic::Ordering::Relaxed;
-                            idx.tombstone_count.fetch_add(1, Relaxed);
-                            idx.live_count.fetch_sub(1, Relaxed);
-                        }
-                    }
-                }
-            }
-        }
+        // Every vector field's, its postings, and what its TEXT fields put
+        // in: the words it held, from the inverted index and the BM25
+        // statistics.
+        unindex_from(def, key);
     }
 }
 // ── HNSW compaction ───────────────────────────────────────────────────────────
@@ -2663,12 +3449,7 @@ pub fn compact_hnsw(
         let nodes = old_arc.nodes.read();
         nodes
             .iter()
-            .filter_map(|(_, n)| {
-                if n.vector.is_empty() {
-                    return None;
-                }
-                Some((n.key.clone(), n.vector.clone()))
-            })
+            .filter_map(|(id, n)| Some((n.key.clone(), old_arc.vector(id)?.to_vec())))
             .collect()
     };
 
@@ -2935,6 +3716,7 @@ mod flush_index_tests {
             aliases: Vec::new(),
             stopwords: None,
             synonyms: Default::default(),
+            language: Default::default(),
         }
         .into_def();
         let graph = match def.indexes.get("vec") {
@@ -2971,6 +3753,7 @@ mod flush_index_tests {
                 aliases: Vec::new(),
                 stopwords: None,
                 synonyms: Default::default(),
+                language: Default::default(),
             }
             .into_def()
         };
@@ -3001,6 +3784,7 @@ mod alias_tests {
             aliases: Vec::new(),
             stopwords: None,
             synonyms: Default::default(),
+            language: Default::default(),
         }
         .into_def()
     }
@@ -3038,22 +3822,14 @@ mod alias_tests {
         }
         maybe_index(
             &store,
+            0,
             "doc:1",
             &[("t".to_string(), Arc::from(&b"hello world"[..]))],
+            Write::Fields,
         );
         let g = store.read();
-        assert_eq!(
-            g["idx"]
-                .doc_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
-        assert_eq!(
-            g["alias"]
-                .doc_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0
-        );
+        assert_eq!(g["idx"].text.read().doc_count(), 1);
+        assert_eq!(g["alias"].text.read().doc_count(), 0);
     }
 
     #[test]
@@ -3068,6 +3844,7 @@ mod alias_tests {
             aliases: vec!["a".into()],
             stopwords: None,
             synonyms: Default::default(),
+            language: Default::default(),
         };
         register_index_schemas(&store, &[schema], &Default::default());
         let g = store.read();
@@ -3126,19 +3903,25 @@ mod concurrent_insert_tests {
         let nodes = index.nodes.read();
         let count = nodes.count();
         let overwrites = THREADS * (PER_THREAD / 100);
-        assert_eq!(count, THREADS * PER_THREAD + overwrites);
+        // An overwrite deletes the key's node and the slot is filled again
+        // by a later insert: the graph grows by fewer slots than inserts.
+        let tombstones = index.tombstone_count.load(Relaxed);
         assert_eq!(index.live_count.load(Relaxed), THREADS * PER_THREAD);
-        assert_eq!(index.tombstone_count.load(Relaxed), overwrites);
+        assert!(tombstones <= overwrites, "{tombstones} empty slots");
+        assert_eq!(count, THREADS * PER_THREAD + tombstones);
+        let mut list = Vec::new();
         for (id, node) in nodes.iter() {
-            let links = node.neighbors.lock();
-            for (lc, list) in links.iter().enumerate() {
+            for lc in 0..node.layer_count() {
+                list.clear();
+                index.links(&nodes, id, lc, &mut list);
                 let m_max = if lc == 0 { index.m0 } else { index.m };
                 assert!(
-                    list.len() <= m_max,
+                    list.len() <= m_max + slack(m_max),
                     "node {id} layer {lc}: {} links",
                     list.len()
                 );
-                for &nb in list {
+                for &nb in &list {
+                    let nb = nb as usize;
                     assert!(nb < count && nb != id, "node {id} links to {nb}");
                 }
             }
@@ -3158,5 +3941,157 @@ mod concurrent_insert_tests {
         }
         let total = THREADS * PER_THREAD;
         assert!(found * 100 >= total * 98, "found {found} of {total}");
+    }
+}
+
+#[cfg(test)]
+mod slot_reuse_tests {
+    use super::*;
+
+    fn point(i: usize) -> Vec<f32> {
+        vec![i as f32, (i % 7) as f32, 1.0, 2.0]
+    }
+
+    /// A graph past the size searched by brute force.
+    fn graph(n: usize) -> Arc<HnswIndex> {
+        let index = Arc::new(HnswIndex::new(8, 64));
+        for i in 0..n {
+            hnsw_insert(&index, format!("k{i}"), point(i), &DistanceMetric::L2);
+        }
+        index
+    }
+
+    #[test]
+    fn a_deleted_nodes_slot_is_filled_by_the_next_insert() {
+        let metric = DistanceMetric::L2;
+        let index = graph(600);
+        let live = LiveIndex::Hnsw(Arc::clone(&index));
+        unindex_vector(&live, "k10");
+        assert_eq!(index.tombstone_count.load(Relaxed), 1);
+        assert_eq!(index.live_count.load(Relaxed), 599);
+        let slots_before = index.nodes.read().count();
+
+        hnsw_insert(&index, "new".into(), vec![10.25, 3.0, 1.0, 2.0], &metric);
+        assert_eq!(index.nodes.read().count(), slots_before, "no new slot");
+        assert_eq!(index.tombstone_count.load(Relaxed), 0);
+        assert_eq!(index.live_count.load(Relaxed), 600);
+        assert_eq!(index.key_to_id.read().get("new"), Some(&10));
+
+        let hits = knn_hnsw(&index, &[10.25, 3.0, 1.0, 2.0], 1, 64, &metric);
+        assert_eq!(hits[0].key, "new");
+        assert!(hits[0].score < 1e-6);
+        let all = knn_hnsw(&index, &point(10), 600, 600, &metric);
+        assert!(
+            all.iter().all(|h| h.key != "k10"),
+            "the deleted key is gone"
+        );
+        // Every result is measured against its own vector.
+        for h in &all {
+            let i: usize = match h.key.strip_prefix('k') {
+                Some(i) => i.parse().unwrap(),
+                None => continue,
+            };
+            let want = dist_l2_sq(&point(10), &point(i));
+            assert!(
+                (h.score - want).abs() < 1e-3,
+                "{}: {} vs {want}",
+                h.key,
+                h.score
+            );
+        }
+    }
+
+    #[test]
+    fn an_overwritten_key_keeps_its_slot() {
+        let metric = DistanceMetric::L2;
+        let index = graph(600);
+        let slots_before = index.nodes.read().count();
+        for round in 0..3 {
+            hnsw_insert(
+                &index,
+                "k5".into(),
+                vec![1000.0 + round as f32, 0.0, 0.0, 0.0],
+                &metric,
+            );
+        }
+        assert_eq!(index.nodes.read().count(), slots_before);
+        assert_eq!(index.live_count.load(Relaxed), 600);
+        assert_eq!(index.tombstone_count.load(Relaxed), 0);
+        let hits = knn_hnsw(&index, &[1002.0, 0.0, 0.0, 0.0], 1, 64, &metric);
+        assert_eq!(hits[0].key, "k5");
+        assert!(hits[0].score < 1e-3);
+    }
+
+    #[test]
+    fn a_restored_graph_fills_its_deleted_slots_first() {
+        let metric = DistanceMetric::L2;
+        let node = |key: &str, v: [f32; 2], links: Vec<usize>| {
+            Some(RestoredNode {
+                key: key.into(),
+                vector: v.to_vec(),
+                neighbors: vec![links],
+            })
+        };
+        // The entry point saved is a deleted slot; a link points past the
+        // graph.
+        let nodes = vec![
+            node("a", [1.0, 0.0], vec![2, 9]),
+            None,
+            node("c", [0.0, 1.0], vec![0]),
+        ];
+        let index = Arc::new(HnswIndex::restore(8, 64, nodes, Some(1)));
+        assert_eq!(index.live_count.load(Relaxed), 2);
+        assert_eq!(index.tombstone_count.load(Relaxed), 1);
+        let ep = index.entry_point.read().unwrap();
+        assert!(index.is_live(ep));
+        let mut links = Vec::new();
+        index.links(&index.nodes.read(), 0, 0, &mut links);
+        assert_eq!(links, [2]);
+
+        hnsw_insert(&index, "b".into(), vec![1.0, 1.0], &metric);
+        assert_eq!(index.nodes.read().count(), 3);
+        assert_eq!(index.key_to_id.read().get("b"), Some(&1));
+        let hits = knn_hnsw(&index, &[1.0, 1.0], 3, 50, &metric);
+        assert_eq!(hits[0].key, "b");
+        assert_eq!(hits.len(), 3);
+    }
+
+    #[test]
+    fn deletes_and_inserts_racing_searches_leave_every_answer_right() {
+        let metric = DistanceMetric::L2;
+        let index = graph(1000);
+        std::thread::scope(|s| {
+            for t in 0..4 {
+                let index = &index;
+                let metric = &metric;
+                s.spawn(move || {
+                    for r in 0..200 {
+                        let i = (t * 250 + r) % 1000;
+                        let live = LiveIndex::Hnsw(Arc::clone(index));
+                        unindex_vector(&live, &format!("k{i}"));
+                        hnsw_insert(index, format!("k{i}"), point(i), metric);
+                    }
+                });
+            }
+            for _ in 0..2 {
+                let index = &index;
+                let metric = &metric;
+                s.spawn(move || {
+                    for r in 0..300 {
+                        let q = point(r * 3 % 1000);
+                        for h in knn_hnsw(index, &q, 10, 64, metric) {
+                            let i: usize = h.key[1..].parse().unwrap();
+                            let want = dist_l2_sq(&q, &point(i));
+                            assert!((h.score - want).abs() < 1e-3, "{}: {}", h.key, h.score);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(index.live_count.load(Relaxed), 1000);
+        assert_eq!(
+            index.nodes.read().count(),
+            1000 + index.tombstone_count.load(Relaxed)
+        );
     }
 }

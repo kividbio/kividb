@@ -259,6 +259,15 @@ fn own_conn() -> Conn {
     panic!("server on port {port} did not start");
 }
 
+/// Held by every test that times a query out or sets `ON_TIMEOUT`, for the
+/// whole test. `FT.CONFIG` is the process's, not a server's: one test's
+/// `ON_TIMEOUT fail` turned the timeout of another, running at the same
+/// time, into an error where it expected the warning (CI on #208).
+fn timeout_test() -> std::sync::MutexGuard<'static, ()> {
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// `n` hashes `{prefix}{start}` …, pipelined so a timeout test can fill the
 /// index without a round trip per document.
 fn hset_many(c: &mut Conn, prefix: &str, start: usize, n: usize) {
@@ -288,8 +297,8 @@ fn hset_many(c: &mut Conn, prefix: &str, start: usize, n: usize) {
 }
 
 /// `n` hashes `{prefix}{start}` … with a TAG `c`, `red` for even numbers and
-/// `blue` for odd, and a 4-dimension vector `v`, pipelined like
-/// [`hset_many`].
+/// `blue` for odd, a TAG `r`, `rare` for one number in 8192 and `common` for
+/// the rest, and a 4-dimension vector `v`, pipelined like [`hset_many`].
 fn hset_tagged_many(c: &mut Conn, prefix: &str, start: usize, n: usize) {
     const BATCH: usize = 250;
     let mut i = 0;
@@ -299,8 +308,9 @@ fn hset_tagged_many(c: &mut Conn, prefix: &str, start: usize, n: usize) {
         for j in start + i..start + end {
             let key = format!("{prefix}{j}");
             let tag: &[u8] = if j % 2 == 0 { b"red" } else { b"blue" };
+            let rare: &[u8] = if j % 8192 == 1 { b"rare" } else { b"common" };
             let blob = vector(&[j as f32, 1.0, 2.0, 3.0]);
-            let args: [&[u8]; 6] = [b"HSET", key.as_bytes(), b"c", tag, b"v", &blob];
+            let args: [&[u8]; 8] = [b"HSET", key.as_bytes(), b"c", tag, b"r", rare, b"v", &blob];
             buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
             for a in args {
                 buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
@@ -479,7 +489,11 @@ fn report_8_schema_errors_name_the_problem() {
     assert_eq!(err.err(), "No schema found");
     // None of them left an index behind.
     for index in ["r8:a", "r8:b", "r8:c", "r8:d", "r8:e", "r8:f"] {
-        assert!(c.cmd(&["FT.INFO", index]).err().contains("no such index"));
+        assert!(
+            c.cmd(&["FT.INFO", index])
+                .err()
+                .contains("Index not found: ")
+        );
     }
     // An index that is there cannot be created again.
     assert!(c.cmd(&["FT.CREATE", "r8:ok", "SCHEMA", "f", "TEXT"]).ok());
@@ -1243,7 +1257,7 @@ fn sorting_paging_and_what_is_returned() {
     assert!(
         c.cmd(&["FT.SEARCH", "nosuch", "*"])
             .err()
-            .contains("no such index")
+            .contains("Index not found: ")
     );
 }
 
@@ -2328,8 +2342,23 @@ fn a_cursor_reads_an_aggregation_a_few_rows_at_a_time() {
     assert_eq!(titles(&reply), ["Alien", "Arrival", "Fargo"]);
     assert_eq!(reply.arr()[1].i().to_string(), cursor);
     // Another index's name does not open it.
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "a3other",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "a3other:",
+            "SCHEMA",
+            "title",
+            "TEXT",
+        ])
+        .ok()
+    );
     assert_eq!(
-        c.cmd(&["FT.CURSOR", "READ", "q1", &cursor]).err(),
+        c.cmd(&["FT.CURSOR", "READ", "a3other", &cursor]).err(),
         "Cursor not found"
     );
     assert!(c.cmd(&["FT.CURSOR", "DEL", "a3", &cursor]).ok());
@@ -2349,8 +2378,15 @@ fn a_cursor_reads_an_aggregation_a_few_rows_at_a_time() {
     assert!(c.cmd(&["FT.DROPINDEX", "a3"]).ok());
     assert_eq!(
         c.cmd(&["FT.CURSOR", "READ", "a3", &cursor]).err(),
-        "Cursor not found"
+        "SEARCH_INDEX_NOT_FOUND Index not found: a3"
     );
+    // Asked of an index that is not there, as Redis answers: first.
+    for sub in ["READ", "DEL", "GC"] {
+        assert_eq!(
+            c.cmd(&["FT.CURSOR", sub, "nosuch", "not-a-number"]).err(),
+            "SEARCH_INDEX_NOT_FOUND Index not found: nosuch"
+        );
+    }
 }
 
 /// `FT.EXPLAIN` echoed the query back; `FT.PROFILE` returned an empty array.
@@ -2365,7 +2401,9 @@ fn explain_and_profile_describe_the_query() {
             "(alien | heat) @genre:{scifi} @rating:[8 +inf]"
         ])
         .s(),
-        "INTERSECT {\n  UNION {\n    alien\n    heat\n  }\n  TAG:@genre {\n    scifi\n  }\n  \
+        // As Redis 8.10 has it: each word with its stem.
+        "INTERSECT {\n  UNION {\n    UNION {\n      alien\n      +alien(expanded)\n    }\n    \
+         UNION {\n      heat\n      +heat(expanded)\n    }\n  }\n  TAG:@genre {\n    scifi\n  }\n  \
          NUMERIC {8.000000 <= @rating <= inf}\n}\n"
     );
     assert_eq!(
@@ -2569,6 +2607,7 @@ fn first_row(reply: &V, name: &str) -> String {
 /// that a fast host does not finish the queries below in time after all.
 #[test]
 fn a_query_is_cut_short_when_it_runs_out_of_time() {
+    let _one = timeout_test();
     let mut c = own_conn();
     assert!(matches!(c.cmd(&["HELLO", "3"]), V::Map(_)));
     assert!(
@@ -2775,6 +2814,7 @@ fn a_query_that_finishes_is_not_reported_as_timed_out() {
 /// `a_query_is_cut_short_when_it_runs_out_of_time`.
 #[test]
 fn a_tag_filtered_scan_is_cut_short_when_it_runs_out_of_time() {
+    let _one = timeout_test();
     let mut c = own_conn();
     assert!(matches!(c.cmd(&["HELLO", "3"]), V::Map(_)));
     assert!(
@@ -2875,6 +2915,206 @@ fn a_tag_filtered_scan_is_cut_short_when_it_runs_out_of_time() {
         assert!(
             failed.err().contains("Timeout limit was reached"),
             "{failed:?}"
+        );
+    }
+}
+
+/// Each way a filtered KNN query is answered keeps `TIMEOUT` and
+/// `ON_TIMEOUT`, forced one by one rather than wherever a grown timeout
+/// happens to land: from postings, each candidate measured (`HYBRID_POLICY
+/// ADHOC_BF`); from postings, the graph searched (`BATCHES`, with a filter
+/// that lets so few through that the walk covers the graph); with postings
+/// off, every document tried; and FT.AGGREGATE's KNN step, with postings on
+/// and off. Under `ON_TIMEOUT return`, the default, each is a partial reply,
+/// with the warning in RESP3 and silent in RESP2; under `fail`, an error in
+/// both. The default policy over a FLAT index (each candidate measured) is
+/// `a_tag_filtered_scan_is_cut_short_when_it_runs_out_of_time`.
+#[test]
+fn a_filtered_knn_keeps_on_timeout_whichever_way_it_is_answered() {
+    let _one = timeout_test();
+    let mut c = own_conn();
+    assert!(matches!(c.cmd(&["HELLO", "3"]), V::Map(_)));
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "tw",
+            "PREFIX",
+            "1",
+            "tw:",
+            "SCHEMA",
+            "c",
+            "TAG",
+            "r",
+            "TAG",
+            "v",
+            "VECTOR",
+            "HNSW",
+            "10",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            "4",
+            "DISTANCE_METRIC",
+            "L2",
+            "M",
+            "4",
+            "EF_CONSTRUCTION",
+            "16",
+        ])
+        .ok()
+    );
+    let blob = vector(&[0.0, 1.0, 2.0, 3.0]);
+
+    struct Way {
+        name: &'static str,
+        filter: &'static str,
+        attributes: &'static str,
+        postings: bool,
+        aggregate: bool,
+    }
+    let ways = [
+        Way {
+            name: "postings, each candidate measured (ADHOC_BF)",
+            filter: "@c:{red}",
+            attributes: " HYBRID_POLICY ADHOC_BF",
+            postings: true,
+            aggregate: false,
+        },
+        Way {
+            name: "postings, the graph searched (BATCHES)",
+            filter: "@r:{rare}",
+            attributes: " HYBRID_POLICY BATCHES",
+            postings: true,
+            aggregate: false,
+        },
+        Way {
+            name: "postings off, every document tried",
+            filter: "@c:{red}",
+            attributes: "",
+            postings: false,
+            aggregate: false,
+        },
+        Way {
+            name: "FT.AGGREGATE from postings",
+            filter: "@c:{red}",
+            attributes: "",
+            postings: true,
+            aggregate: true,
+        },
+        Way {
+            name: "FT.AGGREGATE, postings off",
+            filter: "@c:{red}",
+            attributes: "",
+            postings: false,
+            aggregate: true,
+        },
+    ];
+    let ask = |c: &mut Conn, way: &Way, timeout: &str| -> V {
+        if !way.postings {
+            assert!(c.cmd(&["FT.DEBUG", "POSTINGS", "tw", "OFF"]).ok());
+        }
+        let query = format!("({})=>[KNN 10 @v $q{}]", way.filter, way.attributes);
+        let mut args: Vec<&[u8]> = if way.aggregate {
+            vec![b"FT.AGGREGATE", b"tw", query.as_bytes()]
+        } else {
+            vec![b"FT.SEARCH", b"tw", query.as_bytes(), b"NOCONTENT"]
+        };
+        args.extend([
+            &b"TIMEOUT"[..],
+            timeout.as_bytes(),
+            b"PARAMS",
+            b"2",
+            b"q",
+            &blob,
+            b"DIALECT",
+            b"2",
+        ]);
+        let reply = c.raw(&args);
+        if !way.postings {
+            assert!(c.cmd(&["FT.DEBUG", "POSTINGS", "tw", "ON"]).ok());
+        }
+        reply
+    };
+
+    // Grown until every way reports the timeout twice in a row, then five
+    // times as large, as in `a_query_is_cut_short_when_it_runs_out_of_time`.
+    let mut n = 0usize;
+    let mut late = [false; 5];
+    while n < 400_000 && !late.iter().all(|&l| l) {
+        hset_tagged_many(&mut c, "tw:", n, 8_000);
+        n += 8_000;
+        for (way, late) in ways.iter().zip(&mut late) {
+            if !*late {
+                *late = warned(&ask(&mut c, way, "1")) && warned(&ask(&mut c, way, "1"));
+            }
+        }
+    }
+    for (way, late) in ways.iter().zip(late) {
+        assert!(
+            late,
+            "{}: TIMEOUT 1 still finished after {n} documents",
+            way.name
+        );
+    }
+    hset_tagged_many(&mut c, "tw:", n, 4 * n);
+
+    let ids = |reply: &V| -> Vec<String> {
+        reply
+            .get("results")
+            .arr()
+            .iter()
+            .map(|r| r.get("id").s().to_string())
+            .collect()
+    };
+    let red: Vec<String> = (0..10).map(|i| format!("tw:{}", 2 * i)).collect();
+    for way in &ways {
+        // `TIMEOUT 0`: whole. Measured and tried, the ten nearest red
+        // documents exactly; the graph search is approximate.
+        let all = ask(&mut c, way, "0");
+        assert!(!warned(&all), "{}: {all:?}", way.name);
+        let results = all.get("results").arr().len();
+        if way.aggregate {
+            assert_eq!(results, 10, "{}: {all:?}", way.name);
+        } else if way.filter == "@c:{red}" {
+            assert_eq!(ids(&all), red, "{}: {all:?}", way.name);
+        } else {
+            assert!(results > 0 && results <= 10, "{}: {all:?}", way.name);
+            for id in ids(&all) {
+                let j: usize = id["tw:".len()..].parse().unwrap();
+                assert_eq!(j % 8192, 1, "{}: {id} is not rare: {all:?}", way.name);
+            }
+        }
+
+        // `TIMEOUT 1`, `return`: what was found, and the warning.
+        let cut = ask(&mut c, way, "1");
+        assert!(warned(&cut), "{}: {cut:?}", way.name);
+        assert!(
+            cut.get("results").arr().len() <= 10,
+            "{}: {cut:?}",
+            way.name
+        );
+    }
+    // RESP2: the same partial reply, without a warning to put it in.
+    assert!(matches!(c.cmd(&["HELLO", "2"]), V::Arr(_)));
+    for way in &ways {
+        let cut = ask(&mut c, way, "1");
+        assert!(matches!(cut, V::Arr(_)), "{} (RESP2): {cut:?}", way.name);
+    }
+
+    // `fail`: an error, in both protocols.
+    assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "fail"]).ok());
+    let mut failed = Vec::new();
+    for resp in ["2", "3"] {
+        let _ = c.cmd(&["HELLO", resp]);
+        for way in &ways {
+            failed.push((way.name, resp, ask(&mut c, way, "1")));
+        }
+    }
+    assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "return"]).ok());
+    for (name, resp, reply) in failed {
+        assert!(
+            matches!(&reply, V::Err(e) if e.contains("Timeout limit was reached")),
+            "{name} (RESP{resp}): {reply:?}"
         );
     }
 }

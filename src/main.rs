@@ -866,6 +866,11 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
 
                 // Signal the io_uring accept workers to stop their loop.
                 shutdown_signal.store(true, Ordering::SeqCst);
+                // And stop their ports, after the flag: the accept each
+                // worker is waiting in ends, and the worker sees the flag.
+                // Left listening, a port went on taking connections after
+                // the process had exited (see `listen::stop_uring_ports`).
+                crate::listen::stop_uring_ports();
 
                 // Read the mode the SHUTDOWN command (or OS signal) requested.
                 // OS signals leave SHUTDOWN_MODE at its default (SAVE), which is correct.
@@ -1167,6 +1172,14 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
 
                             let (stream, peer_addr) = match listener.accept().await {
                                 Ok(v) => v,
+                                // Its port was stopped for the shutdown.
+                                // The connections open here are served, as
+                                // the final snapshot lets them, until the
+                                // process ends.
+                                Err(_) if shutdown.load(Ordering::Relaxed) => {
+                                    std::future::pending::<()>().await;
+                                    return;
+                                }
                                 Err(e) => {
                                     log_throttled!(10, crate::loglevel::WARN, "Accept error: {e} — if this is \"Too many open files\", raise the open-file limit (ulimit -n, or LimitNOFILE= under systemd)");
                                     continue;

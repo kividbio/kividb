@@ -48,6 +48,24 @@ pub fn track(store: &Store, db: usize, key: &str, at: Instant) {
     }
 }
 
+/// The keys of database `db` that hold a hash with field TTLs. Reading such
+/// a hash can drop a field that is past its time before the sweep gets to
+/// it, and the indexes hear of it only from the sweep: a query that answers
+/// from postings tries these documents themselves (see
+/// `commands::search::plan`).
+pub fn watched_keys(store: &Store, db: usize) -> Vec<String> {
+    let id = store_id(store);
+    let watched = WATCHED.lock();
+    let Some(watched) = watched.as_ref() else {
+        return Vec::new();
+    };
+    watched
+        .keys()
+        .filter(|(store, d, _)| *store == id && *d == db)
+        .map(|(_, _, key)| key.clone())
+        .collect()
+}
+
 /// Look at `key` and, if it is a hash with field TTLs, [`track`] it. For the
 /// commands that put such a hash under a key: the field-TTL commands
 /// themselves, and `RENAME`, `COPY`, `RESTORE`, `MOVE`.
@@ -153,10 +171,18 @@ pub fn sweep(store: &Store, index_store: &IndexStore) {
                 still_empty && map.remove(key.as_str()).is_some()
             };
             if removed {
-                crate::vector::maybe_unindex(index_store, &key);
+                crate::vector::maybe_unindex(index_store, db, &key);
                 next = None;
             }
             emptied = removed;
+        }
+        // Fields went: the indexes that cover the hash are brought up to
+        // date with what it holds now. Also when none was found here to
+        // expire: a read that came first dropped them (and left the indexes
+        // as they were), and once the watch is dropped below, queries stop
+        // trying this document themselves (see `watched_keys`).
+        if !emptied {
+            crate::vector::reindex_key(index_store, store, db, &key, crate::vector::Write::Refresh);
         }
 
         if let Some(hub) = &hub {

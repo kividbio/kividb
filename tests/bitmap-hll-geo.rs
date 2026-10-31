@@ -121,6 +121,12 @@ impl RespValue {
     fn is_error(&self) -> bool {
         matches!(self, RespValue::Error(_))
     }
+    fn error_str(&self) -> &str {
+        match self {
+            RespValue::Error(s) => s,
+            _ => panic!("not an error: {:?}", self),
+        }
+    }
 }
 
 // ── Server fixture ────────────────────────────────────────────────────────────
@@ -763,7 +769,414 @@ fn test_pfselftest() {
     assert!(c.cmds(&["PFSELFTEST"]).is_ok());
 }
 
-// PFDEBUG ENCODING — always returns "dense"
+// Redis 8.0.5 HLL fixtures, and KiviDB 1.1.1 HLLs for backward compatibility.
+const REDIS_HLL_SPARSE: &[u8] = include_bytes!("fixtures/redis-8.0-hll-small-sparse.bin");
+const REDIS_HLL_SPARSE_DUMP: &[u8] = include_bytes!("fixtures/redis-8.0-hll-small-sparse.dump");
+const REDIS_HLL_DENSE_ABC: &[u8] = include_bytes!("fixtures/redis-8.0-hll-small-dense.bin");
+const REDIS_HLL_DENSE_ABCD: &[u8] = include_bytes!("fixtures/redis-8.0-hll-abcd-dense.bin");
+const REDIS_HLL_N1000: &[u8] = include_bytes!("fixtures/redis-8.0-hll-n1000-sparse.bin");
+const REDIS_HLL_N10000: &[u8] = include_bytes!("fixtures/redis-8.0-hll-n10000-dense.bin");
+const REDIS_HLL_SPARSE_12304: &[u8] = include_bytes!("fixtures/redis-8.0-hll-sparse-12304.bin");
+const LEGACY_HLL_ABC: &[u8] = include_bytes!("fixtures/kividb-legacy-hll-abc.bin");
+const LEGACY_HLL_ABCD: &[u8] = include_bytes!("fixtures/kividb-legacy-hll-abcd.bin");
+
+fn stale(blob: &[u8]) -> Vec<u8> {
+    let mut blob = blob.to_vec();
+    blob[15] |= 0x80;
+    blob
+}
+
+fn get_blob(c: &mut Conn, key: &str) -> Vec<u8> {
+    match c.cmd(&[b"GET", key.as_bytes()]) {
+        RespValue::Bulk(bytes) => bytes,
+        other => panic!("GET {key}: {other:?}"),
+    }
+}
+
+fn hll_write_format(c: &mut Conn) -> String {
+    match c.cmds(&["CONFIG", "GET", "hll-write-format"]) {
+        RespValue::Array(items) => items[1].as_str().to_string(),
+        other => panic!("CONFIG GET hll-write-format: {other:?}"),
+    }
+}
+
+#[test]
+fn pfadd_writes_redis_dense_layout() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    assert!(
+        c.cmds(&["CONFIG", "SET", "hll-write-format", "redis"])
+            .is_ok()
+    );
+
+    c.cmds(&["PFADD", "hll", "a", "b", "c"]);
+    assert_eq!(c.cmds(&["PFCOUNT", "hll"]).as_int(), 3);
+    assert_eq!(get_blob(&mut c, "hll"), REDIS_HLL_DENSE_ABC);
+
+    assert_eq!(c.cmds(&["PFADD", "hll", "d"]).as_int(), 1);
+    assert_eq!(c.cmds(&["PFCOUNT", "hll"]).as_int(), 4);
+    assert_eq!(get_blob(&mut c, "hll"), REDIS_HLL_DENSE_ABCD);
+}
+
+#[test]
+fn reads_redis_sparse_hll_and_converts_it_when_added_to() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    assert!(
+        c.cmds(&["CONFIG", "SET", "hll-write-format", "redis"])
+            .is_ok()
+    );
+
+    assert!(c.cmd(&[b"SET", b"hll", REDIS_HLL_SPARSE]).is_ok());
+    let sparse_before = get_blob(&mut c, "hll");
+    assert_eq!(c.cmds(&["PFDEBUG", "ENCODING", "hll"]).as_str(), "sparse");
+    assert_eq!(
+        c.cmds(&["PFDEBUG", "DECODE", "hll"]).as_str(),
+        "Z:8436 v:1,1 Z:4274 v:2,1 Z:3068 v:1,1 Z:603"
+    );
+    assert_eq!(c.cmds(&["PFCOUNT", "hll"]).as_int(), 3);
+    assert_eq!(c.cmds(&["PFCOUNT", "hll", "nosuch"]).as_int(), 3);
+    assert_eq!(c.cmds(&["PFADD", "hll", "a", "b", "c"]).as_int(), 0);
+    assert_eq!(c.cmds(&["PFDEBUG", "ENCODING", "hll"]).as_str(), "sparse");
+    assert_eq!(
+        get_blob(&mut c, "hll"),
+        sparse_before,
+        "no-op PFADD must not rewrite sparse bytes"
+    );
+
+    assert_eq!(c.cmds(&["PFADD", "hll", "d"]).as_int(), 1);
+    assert_eq!(c.cmds(&["PFDEBUG", "ENCODING", "hll"]).as_str(), "dense");
+    assert_eq!(c.cmds(&["PFCOUNT", "hll"]).as_int(), 4);
+    assert_eq!(get_blob(&mut c, "hll"), REDIS_HLL_DENSE_ABCD);
+}
+
+#[test]
+fn counts_redis_hlls_with_ertl_estimator() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    assert!(c.cmd(&[b"SET", b"n1000", &stale(REDIS_HLL_N1000)]).is_ok());
+    assert_eq!(c.cmds(&["PFCOUNT", "n1000"]).as_int(), 997);
+
+    assert!(
+        c.cmd(&[b"SET", b"n10000", &stale(REDIS_HLL_N10000)])
+            .is_ok()
+    );
+    assert_eq!(c.cmds(&["PFCOUNT", "n10000"]).as_int(), 10017);
+}
+
+#[test]
+fn restores_redis_sparse_hll() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    assert!(
+        c.cmd(&[b"RESTORE", b"hll", b"0", REDIS_HLL_SPARSE_DUMP])
+            .is_ok()
+    );
+    assert_eq!(c.cmds(&["PFDEBUG", "ENCODING", "hll"]).as_str(), "sparse");
+    assert_eq!(c.cmds(&["PFCOUNT", "hll"]).as_int(), 3);
+}
+
+#[test]
+fn keeps_legacy_hll_hash_and_layout() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    assert!(c.cmd(&[b"SET", b"hll", LEGACY_HLL_ABC]).is_ok());
+    assert_eq!(c.cmds(&["PFCOUNT", "hll"]).as_int(), 3);
+    assert_eq!(c.cmds(&["PFADD", "hll", "a", "b", "c"]).as_int(), 0);
+    assert_eq!(c.cmds(&["PFADD", "hll", "d"]).as_int(), 1);
+    assert_eq!(c.cmds(&["PFCOUNT", "hll"]).as_int(), 4);
+    assert_eq!(get_blob(&mut c, "hll"), LEGACY_HLL_ABCD);
+}
+
+#[test]
+fn pure_legacy_pfmerge_stays_legacy() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    assert!(c.cmd(&[b"SET", b"abc", LEGACY_HLL_ABC]).is_ok());
+    assert!(c.cmd(&[b"SET", b"abcd", LEGACY_HLL_ABCD]).is_ok());
+    assert!(c.cmds(&["PFMERGE", "dest", "abc", "abcd"]).is_ok());
+    assert_eq!(c.cmds(&["PFCOUNT", "dest"]).as_int(), 4);
+    assert_eq!(get_blob(&mut c, "dest"), LEGACY_HLL_ABCD);
+
+    assert_eq!(c.cmds(&["PFADD", "dest", "a", "b", "c", "d"]).as_int(), 0);
+    assert_eq!(c.cmds(&["PFADD", "dest", "e"]).as_int(), 1);
+    assert_eq!(c.cmds(&["PFCOUNT", "dest"]).as_int(), 5);
+}
+
+#[test]
+fn pfmerge_writes_a_redis_sparse_source_as_dense() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    assert!(
+        c.cmds(&["CONFIG", "SET", "hll-write-format", "redis"])
+            .is_ok()
+    );
+
+    assert!(c.cmd(&[b"SET", b"sparse", REDIS_HLL_SPARSE]).is_ok());
+    assert!(c.cmds(&["PFMERGE", "dest", "sparse"]).is_ok());
+    assert_eq!(c.cmds(&["PFDEBUG", "ENCODING", "dest"]).as_str(), "dense");
+    assert_eq!(c.cmds(&["PFCOUNT", "dest"]).as_int(), 3);
+    assert_eq!(get_blob(&mut c, "dest"), REDIS_HLL_DENSE_ABC);
+}
+
+#[test]
+fn ambiguous_12304_byte_hlls_are_resolved_by_sparse_validation() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    assert_eq!(REDIS_HLL_SPARSE_12304.len(), 12304);
+    assert!(
+        c.cmd(&[b"SET", b"hll", &stale(REDIS_HLL_SPARSE_12304)])
+            .is_ok()
+    );
+    assert_eq!(c.cmds(&["PFDEBUG", "ENCODING", "hll"]).as_str(), "sparse");
+    assert_eq!(c.cmds(&["PFCOUNT", "hll"]).as_int(), 31516);
+
+    assert_eq!(LEGACY_HLL_ABC.len(), 12304);
+    assert!(c.cmd(&[b"SET", b"hll", LEGACY_HLL_ABC]).is_ok());
+    assert_eq!(c.cmds(&["PFDEBUG", "ENCODING", "hll"]).as_str(), "dense");
+    assert_eq!(c.cmds(&["PFCOUNT", "hll"]).as_int(), 3);
+
+    // A malformed sparse stream of the same length fails validation and keeps
+    // the legacy fallback. The two formats have no marker to reject it as
+    // neither: every 12304-byte encoding-1 payload is a possible legacy value.
+    let mut malformed = vec![0xFFu8; 12304];
+    malformed[..4].copy_from_slice(b"HYLL");
+    malformed[4] = 1;
+    malformed[15] = 0x80;
+    assert!(c.cmd(&[b"SET", b"hll", &malformed]).is_ok());
+    assert_eq!(c.cmds(&["PFDEBUG", "ENCODING", "hll"]).as_str(), "dense");
+}
+
+#[test]
+fn pfadd_with_elements_replaces_an_expired_key() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    assert_eq!(c.cmds(&["PFADD", "hll", "a", "b", "c"]).as_int(), 1);
+    assert_eq!(c.cmds(&["PEXPIRE", "hll", "50"]).as_int(), 1);
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(c.cmds(&["EXISTS", "hll"]).as_int(), 0);
+
+    assert_eq!(c.cmds(&["PFADD", "hll", "d"]).as_int(), 1);
+    assert_eq!(c.cmds(&["EXISTS", "hll"]).as_int(), 1);
+    assert_eq!(c.cmds(&["PFCOUNT", "hll"]).as_int(), 1);
+    assert_eq!(c.cmds(&["TTL", "hll"]).as_int(), -1);
+
+    // A non-expired HLL is still updated in place.
+    assert_eq!(c.cmds(&["PFADD", "hll", "e"]).as_int(), 1);
+    assert_eq!(c.cmds(&["PFCOUNT", "hll"]).as_int(), 2);
+}
+
+#[test]
+fn mixed_legacy_and_redis_pfmerge_is_refused_without_mutating_the_destination() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    assert!(c.cmd(&[b"SET", b"legacy", LEGACY_HLL_ABC]).is_ok());
+    assert!(c.cmd(&[b"SET", b"redis", REDIS_HLL_DENSE_ABCD]).is_ok());
+
+    let err = c.cmds(&["PFMERGE", "new", "legacy", "redis"]);
+    assert!(err.is_error(), "{err:?}");
+    assert_eq!(
+        err.error_str(),
+        "ERR Cannot merge HyperLogLogs with different hash formats."
+    );
+    assert_eq!(c.cmds(&["EXISTS", "new"]).as_int(), 0);
+
+    assert!(c.cmd(&[b"SET", b"dest", LEGACY_HLL_ABC]).is_ok());
+    let before = get_blob(&mut c, "dest");
+    let err = c.cmds(&["PFMERGE", "dest", "redis"]);
+    assert!(err.is_error(), "{err:?}");
+    assert_eq!(get_blob(&mut c, "dest"), before);
+    assert_eq!(c.cmds(&["PFCOUNT", "dest"]).as_int(), 3);
+
+    assert!(c.cmd(&[b"SET", b"dest", REDIS_HLL_DENSE_ABC]).is_ok());
+    let before = get_blob(&mut c, "dest");
+    let err = c.cmds(&["PFMERGE", "dest", "legacy"]);
+    assert!(err.is_error(), "{err:?}");
+    assert_eq!(get_blob(&mut c, "dest"), before);
+    assert_eq!(c.cmds(&["PFCOUNT", "dest"]).as_int(), 3);
+}
+
+#[test]
+fn mixed_legacy_and_redis_pfcount_is_refused() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    assert!(c.cmd(&[b"SET", b"legacy", LEGACY_HLL_ABC]).is_ok());
+    assert!(c.cmd(&[b"SET", b"redis", REDIS_HLL_DENSE_ABCD]).is_ok());
+
+    for keys in [["legacy", "redis"], ["redis", "legacy"]] {
+        let err = c.cmds(&["PFCOUNT", keys[0], keys[1]]);
+        assert!(err.is_error(), "{err:?}");
+        assert_eq!(
+            err.error_str(),
+            "ERR Cannot PFCOUNT HyperLogLogs with different hash formats."
+        );
+    }
+}
+
+#[test]
+fn pfmerge_inherits_the_source_format_not_the_write_default() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    // The write default is legacy, but the only source is Redis's format.
+    assert_eq!(hll_write_format(&mut c), "legacy");
+    assert!(c.cmd(&[b"SET", b"abc", REDIS_HLL_DENSE_ABC]).is_ok());
+    assert!(c.cmds(&["PFMERGE", "dest", "abc"]).is_ok());
+    assert_eq!(c.cmds(&["PFCOUNT", "dest"]).as_int(), 3);
+    assert_eq!(get_blob(&mut c, "dest"), REDIS_HLL_DENSE_ABC);
+    assert_eq!(get_blob(&mut c, "dest")[4], 0, "Redis dense encoding");
+
+    // And the other way round: the write default is Redis, the source legacy.
+    assert!(
+        c.cmds(&["CONFIG", "SET", "hll-write-format", "redis"])
+            .is_ok()
+    );
+    assert!(c.cmd(&[b"SET", b"legacy", LEGACY_HLL_ABC]).is_ok());
+    assert!(c.cmds(&["PFMERGE", "legacy_dest", "legacy"]).is_ok());
+    assert_eq!(c.cmds(&["PFCOUNT", "legacy_dest"]).as_int(), 3);
+    assert_eq!(get_blob(&mut c, "legacy_dest"), LEGACY_HLL_ABC);
+    assert_eq!(get_blob(&mut c, "legacy_dest")[4], 1, "legacy encoding");
+}
+
+#[test]
+fn pure_redis_pfmerge_stays_redis() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    assert!(
+        c.cmds(&["CONFIG", "SET", "hll-write-format", "redis"])
+            .is_ok()
+    );
+
+    assert!(c.cmd(&[b"SET", b"abc", REDIS_HLL_DENSE_ABC]).is_ok());
+    assert!(c.cmd(&[b"SET", b"abcd", REDIS_HLL_DENSE_ABCD]).is_ok());
+    assert!(c.cmds(&["PFMERGE", "dest", "abc", "abcd"]).is_ok());
+    assert_eq!(c.cmds(&["PFCOUNT", "dest"]).as_int(), 4);
+    assert_eq!(c.cmds(&["PFDEBUG", "ENCODING", "dest"]).as_str(), "dense");
+}
+
+#[test]
+fn rejects_corrupt_sparse_hll_without_panicking() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let mut corrupt = stale(REDIS_HLL_SPARSE);
+    corrupt.pop();
+    assert!(c.cmd(&[b"SET", b"hll", &corrupt]).is_ok());
+    let commands: &[&[&str]] = &[
+        &["PFCOUNT", "hll"],
+        &["PFADD", "hll", "a"],
+        &["PFDEBUG", "GETREG", "hll"],
+        &["PFDEBUG", "DECODE", "hll"],
+        &["PFDEBUG", "ENCODING", "hll"],
+        &["PFDEBUG", "TODENSE", "hll"],
+        &["PFDEBUG", "RESET", "hll"],
+    ];
+    for command in commands {
+        let err = c.cmds(command);
+        assert!(err.is_error(), "{command:?}: {err:?}");
+        assert_eq!(
+            err.error_str(),
+            "INVALIDOBJ Corrupted HLL object detected",
+            "{command:?}"
+        );
+    }
+
+    assert!(c.cmds(&["PFMERGE", "hll", "hll"]).is_error());
+    assert!(c.cmds(&["PFMERGE", "dest", "hll"]).is_error());
+    assert_eq!(c.cmds(&["EXISTS", "dest"]).as_int(), 0);
+}
+
+#[test]
+fn hll_write_format_is_per_server() {
+    let (first_port, second_port) = (free_port(), free_port());
+    start_server(first_port);
+    start_server(second_port);
+    let mut first = Conn::connect(first_port);
+    let mut second = Conn::connect(second_port);
+
+    assert_eq!(hll_write_format(&mut first), "legacy");
+    assert_eq!(hll_write_format(&mut second), "legacy");
+
+    assert!(
+        first
+            .cmds(&["CONFIG", "SET", "hll-write-format", "redis"])
+            .is_ok()
+    );
+    assert_eq!(hll_write_format(&mut first), "redis");
+    assert_eq!(
+        hll_write_format(&mut second),
+        "legacy",
+        "a setting on one server must not change another in the same process"
+    );
+
+    first.cmds(&["PFADD", "hll", "a", "b", "c"]);
+    second.cmds(&["PFADD", "hll", "a", "b", "c"]);
+    assert_eq!(get_blob(&mut first, "hll")[4], 0, "redis dense encoding");
+    assert_eq!(get_blob(&mut second, "hll")[4], 1, "legacy encoding");
+
+    let err = second.cmds(&["CONFIG", "SET", "hll-write-format", "bogus"]);
+    assert!(err.is_error(), "{err:?}");
+    assert_eq!(hll_write_format(&mut second), "legacy");
+}
+
+#[test]
+fn legacy_small_hlls_with_few_elements_are_not_misclassified_as_sparse() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    // 2 elements
+    c.cmds(&["DEL", "h"]);
+    c.cmds(&["PFADD", "h", "a", "b"]);
+    assert_eq!(c.cmds(&["PFCOUNT", "h"]).as_int(), 2);
+    assert_eq!(c.cmds(&["PFADD", "h", "x"]).as_int(), 1);
+    assert_eq!(c.cmds(&["PFCOUNT", "h"]).as_int(), 3);
+
+    // 3 elements
+    c.cmds(&["DEL", "h"]);
+    c.cmds(&["PFADD", "h", "1", "2", "3"]);
+    assert_eq!(c.cmds(&["PFCOUNT", "h"]).as_int(), 3);
+    assert_eq!(c.cmds(&["PFADD", "h", "4"]).as_int(), 1);
+    assert_eq!(c.cmds(&["PFCOUNT", "h"]).as_int(), 4);
+
+    // 4 elements
+    c.cmds(&["DEL", "h"]);
+    c.cmds(&["PFADD", "h", "a", "b", "c", "d"]);
+    assert_eq!(c.cmds(&["PFCOUNT", "h"]).as_int(), 4);
+    assert_eq!(c.cmds(&["PFADD", "h", "e"]).as_int(), 1);
+    assert_eq!(c.cmds(&["PFCOUNT", "h"]).as_int(), 5);
+
+    // 5 elements
+    c.cmds(&["DEL", "h"]);
+    c.cmds(&["PFADD", "h", "a", "b", "c", "d", "e"]);
+    assert_eq!(c.cmds(&["PFCOUNT", "h"]).as_int(), 5);
+    assert_eq!(c.cmds(&["PFADD", "h", "f"]).as_int(), 1);
+    assert_eq!(c.cmds(&["PFCOUNT", "h"]).as_int(), 6);
+}
+
+// PFDEBUG ENCODING — dense for new/dense values, sparse for Redis sparse ones
 #[test]
 fn test_pfdebug_encoding() {
     let port = free_port();
@@ -772,6 +1185,12 @@ fn test_pfdebug_encoding() {
 
     c.cmds(&["PFADD", "hll", "a", "b", "c"]);
     assert_eq!(c.cmds(&["PFDEBUG", "ENCODING", "hll"]).as_str(), "dense");
+
+    assert!(c.cmd(&[b"SET", b"sparse", REDIS_HLL_SPARSE]).is_ok());
+    assert_eq!(
+        c.cmds(&["PFDEBUG", "ENCODING", "sparse"]).as_str(),
+        "sparse"
+    );
 }
 
 // PFDEBUG GETREG — returns 16384 register values
@@ -795,37 +1214,51 @@ fn test_pfdebug_getreg() {
     assert!(nonzero >= 1, "no registers set after PFADD");
 }
 
-// PFDEBUG DECODE — returns human-readable state string
+#[test]
+fn pfdebug_getreg_leaves_redis_sparse_bytes_unchanged() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    assert!(c.cmd(&[b"SET", b"sparse", REDIS_HLL_SPARSE]).is_ok());
+    let before = get_blob(&mut c, "sparse");
+    assert_eq!(
+        c.cmds(&["PFDEBUG", "GETREG", "sparse"]).as_array().len(),
+        16384
+    );
+    assert_eq!(get_blob(&mut c, "sparse"), before);
+}
+
+// PFDEBUG DECODE — Redis's sparse opcode listing, an error for dense
 #[test]
 fn test_pfdebug_decode() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
 
-    c.cmds(&["PFADD", "hll", "a", "b", "c"]);
-    let desc = c.cmds(&["PFDEBUG", "DECODE", "hll"]).as_str().to_string();
-    // Should contain these fields
-    assert!(
-        desc.contains("encoding:dense"),
-        "missing encoding field: {desc}"
+    assert!(c.cmd(&[b"SET", b"sparse", REDIS_HLL_SPARSE]).is_ok());
+    assert_eq!(
+        c.cmds(&["PFDEBUG", "DECODE", "sparse"]).as_str(),
+        "Z:8436 v:1,1 Z:4274 v:2,1 Z:3068 v:1,1 Z:603"
     );
-    assert!(
-        desc.contains("registers:16384"),
-        "missing registers field: {desc}"
-    );
-    assert!(desc.contains("nonzero:"), "missing nonzero field: {desc}");
-    assert!(desc.contains("estimate:"), "missing estimate field: {desc}");
+
+    c.cmds(&["PFADD", "dense", "a", "b", "c"]);
+    assert!(c.cmds(&["PFDEBUG", "DECODE", "dense"]).is_error());
 }
 
-// PFDEBUG TODENSE — no-op for us, returns OK
+// PFDEBUG TODENSE — 0 if already dense, 1 if it converts a sparse value
 #[test]
 fn test_pfdebug_todense() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
 
-    c.cmds(&["PFADD", "hll", "x"]);
-    assert!(c.cmds(&["PFDEBUG", "TODENSE", "hll"]).is_ok());
+    c.cmds(&["PFADD", "dense", "x"]);
+    assert_eq!(c.cmds(&["PFDEBUG", "TODENSE", "dense"]).as_int(), 0);
+
+    assert!(c.cmd(&[b"SET", b"sparse", REDIS_HLL_SPARSE]).is_ok());
+    assert_eq!(c.cmds(&["PFDEBUG", "TODENSE", "sparse"]).as_int(), 1);
+    assert_eq!(c.cmds(&["PFDEBUG", "ENCODING", "sparse"]).as_str(), "dense");
+    assert_eq!(c.cmds(&["PFCOUNT", "sparse"]).as_int(), 3);
 }
 
 // PFDEBUG RESET — clears all registers, count goes to 0
@@ -1658,6 +2091,10 @@ fn pfcount_caches_the_count_in_the_value_and_pfadd_marks_it_stale() {
         other => panic!("{other:?}"),
     };
 
+    assert!(
+        c.cmds(&["CONFIG", "SET", "hll-write-format", "redis"])
+            .is_ok()
+    );
     c.cmds(&["PFADD", "hll", "a", "b", "c"]);
     assert_eq!(c.cmds(&["PFCOUNT", "hll"]).as_int(), 3);
     assert_eq!(byte(&mut c, "15"), b"\x00");

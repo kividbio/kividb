@@ -227,6 +227,12 @@ pub fn subcommands() -> impl Iterator<Item = &'static str> {
         .filter(|name| name.contains('|'))
 }
 
+/// Every name the table has, subcommands as `CONFIG|GET`. For tests.
+#[cfg(test)]
+pub(crate) fn all_names() -> impl Iterator<Item = &'static str> {
+    arity_table::TABLE.iter().map(|(name, _)| *name)
+}
+
 /// Whether `name` (upper case) is in the table.
 pub fn is_known(name: &str) -> bool {
     // `CONFIG|GET` is how a subcommand is written down, not something a

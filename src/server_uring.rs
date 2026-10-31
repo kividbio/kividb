@@ -1616,13 +1616,21 @@ pub async fn handle_client(
                                     crate::resp::write::resp_null_array()
                                 }
                             } else {
+                                // Each SET is a use, and a modification, of its
+                                // key, as the same SET is outside a transaction
+                                // (it went unrecorded here).
+                                let _access = crate::eviction::recording().then(|| {
+                                    crate::store::AccessScope::open(crate::eviction::write_stamp(
+                                        std::time::Instant::now(),
+                                    ))
+                                });
                                 for (key, value) in sets.iter() {
                                     let shard = store::get_shard(&store[selected_db], key);
                                     let ptr = Arc::as_ptr(shard) as usize;
                                     if let Some((_, guard)) =
                                         guards.iter_mut().find(|(p, _)| *p == ptr)
                                     {
-                                        guard.insert_str_expiring(&**key, value, None);
+                                        drop(guard.set_str_expiring(&**key, value, None));
                                     }
                                     // Notify while STILL HOLDING this key's shard lock. Doing this
                                     // after `drop(guards)` below would reopen the exact race this

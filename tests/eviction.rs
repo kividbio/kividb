@@ -517,6 +517,42 @@ fn allkeys_lfu_keeps_what_is_used_often() {
     assert!(busy >= 95, "only {busy} of 100 busy keys are left");
 }
 
+/// A set of keys read again and again outlives a stream of keys written
+/// once and never read, under `allkeys-lfu`: what goes is what was not read.
+/// The keys looked at for an eviction were a run of buckets from a random
+/// one, and in time the runs held nothing but read keys, of which one went:
+/// at a larger size of this, a quarter of the read keys went (Redis 8.10
+/// keeps 96% of them).
+#[test]
+fn allkeys_lfu_keeps_a_read_set_under_a_stream_of_new_keys() {
+    let server = Server::start(&["--maxmemory-policy", "allkeys-lfu"]);
+    let mut c = server.conn();
+    // Room for about 3,800 keys of 1 KB, of which the read set is a third.
+    c.limit_to(4 * MB);
+    let value = value();
+    const READ: usize = 1_200;
+    for i in 0..READ {
+        assert!(c.cmd(&["SET", &format!("read{i}"), &value]).ok());
+    }
+    // Each new key followed by a read of one of the set, picked at random.
+    let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+    for i in 0..16_000 {
+        let reply = c.cmd(&["SET", &format!("once{i}"), &value]);
+        assert!(reply.ok(), "write {i} was refused: {reply:?}");
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        c.cmd(&["GET", &format!("read{}", x % READ as u64)]);
+    }
+    c.lift_the_limit();
+    assert!(c.evicted() > 10_000, "{} evicted", c.evicted());
+    let left = c.surviving("read", READ);
+    assert!(
+        left >= READ * 88 / 100,
+        "only {left} of {READ} read keys are left"
+    );
+}
+
 /// What a master evicts, its replicas delete: an eviction is sent to them
 /// like any other deletion.
 #[test]
@@ -642,6 +678,51 @@ fn what_is_on_disk_is_loaded_whatever_the_limit() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// At its limit a server frees a block for every block it takes, and what
+/// the slabs hold beyond the blocks in them is memory the process holds and
+/// cannot use: it stays small (#202). Used again only once a quarter of
+/// them was free, the slabs settled about 14% (1 KB values) and 25%
+/// (100-byte values) above what was in them.
+#[test]
+fn at_the_limit_the_slabs_stay_full() {
+    // (value size, room under the limit, keys written): about four times
+    // what fits.
+    for (size, room, keys) in [(1000, 16 * MB, 64_000), (100, 4 * MB, 128_000)] {
+        let server = Server::start(&["--maxmemory-policy", "allkeys-random"]);
+        let mut c = server.conn();
+        c.limit_to(room);
+        let value = "v".repeat(size);
+        // Pipelined, a thousand at a time; the keys evicted are spread over
+        // the slabs at random.
+        for batch in 0..keys / 1000 {
+            let mut buf = Vec::new();
+            for i in 0..1000 {
+                let key = format!("k{}", batch * 1000 + i);
+                buf.extend_from_slice(
+                    format!(
+                        "*3\r\n$3\r\nSET\r\n${}\r\n{key}\r\n${size}\r\n{value}\r\n",
+                        key.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+            c.writer.write_all(&buf).unwrap();
+            for _ in 0..1000 {
+                let reply = c.read();
+                assert!(reply.ok(), "{reply:?}");
+            }
+        }
+        let evicted = c.evicted();
+        assert!(evicted > keys as i64 / 2, "{evicted} evicted of {keys}");
+        let slabs: i64 = c.info("memory", "value_slab_bytes").parse().unwrap();
+        let live: i64 = c.info("memory", "value_slab_live_bytes").parse().unwrap();
+        assert!(
+            slabs - live <= live / 25 + 256 * KB,
+            "values of {size} bytes: {slabs} bytes of slabs for {live} bytes in them"
+        );
+    }
+}
+
 /// `RESTORE ... IDLETIME` and `FREQ` give the restored key the standing it
 /// had where it was dumped (#21). They were read and thrown away.
 #[test]
@@ -739,5 +820,338 @@ fn key_access_tracking_keeps_idle_time_under_noeviction() {
     assert!(
         c.cmd(&["OBJECT", "IDLETIME", "other"]).i() < 2,
         "GET uses it"
+    );
+}
+
+/// `CONFIG SET maxmemory-policy` between the LRU and LFU kinds at runtime:
+/// what a key's word held for the other kind counts as nothing known (a
+/// count of 5, an idle time as long as the server has run) until the key
+/// is used again. Under an LRM policy only a write is a use.
+#[test]
+fn switching_between_lru_and_lfu_at_runtime_starts_each_key_afresh() {
+    let server = Server::start(&["--maxmemory-policy", "allkeys-lru"]);
+    let mut c = server.conn();
+    let set_policy = |c: &mut Conn, policy: &str| {
+        assert!(
+            c.cmd(&["CONFIG", "SET", "maxmemory-policy", policy]).ok(),
+            "{policy}"
+        );
+    };
+    assert!(c.cmd(&["SET", "foo", "bar"]).ok());
+    std::thread::sleep(Duration::from_millis(2100));
+    assert!(c.cmd(&["OBJECT", "IDLETIME", "foo"]).i() >= 2);
+
+    set_policy(&mut c, "allkeys-lfu");
+    assert_eq!(
+        c.cmd(&["OBJECT", "FREQ", "foo"]).i(),
+        5,
+        "a clock is no count"
+    );
+    for _ in 0..3 {
+        c.cmd(&["GET", "foo"]);
+    }
+    let freq = c.cmd(&["OBJECT", "FREQ", "foo"]).i();
+    assert!((6..=8).contains(&freq), "freq {freq} after three uses");
+    // OBJECT, TYPE and EXISTS are not uses.
+    c.cmd(&["TYPE", "foo"]);
+    c.cmd(&["EXISTS", "foo"]);
+    assert_eq!(c.cmd(&["OBJECT", "FREQ", "foo"]).i(), freq);
+    // A value written over keeps its count, as in Redis.
+    assert!(c.cmd(&["SET", "foo", "baz"]).ok());
+    assert!(c.cmd(&["OBJECT", "FREQ", "foo"]).i() >= freq);
+
+    set_policy(&mut c, "volatile-lru");
+    let idle = c.cmd(&["OBJECT", "IDLETIME", "foo"]).i();
+    assert!(idle >= 2, "a count is no clock: idle {idle}");
+    c.cmd(&["GET", "foo"]);
+    assert!(c.cmd(&["OBJECT", "IDLETIME", "foo"]).i() < 2);
+
+    set_policy(&mut c, "allkeys-lrm");
+    assert!(c.cmd(&["SET", "bar", "1"]).ok());
+    std::thread::sleep(Duration::from_millis(2100));
+    c.cmd(&["GET", "bar"]);
+    assert!(
+        c.cmd(&["OBJECT", "IDLETIME", "bar"]).i() >= 2,
+        "a read is no modification"
+    );
+    assert_eq!(c.cmd(&["INCR", "bar"]).i(), 2);
+    assert!(c.cmd(&["OBJECT", "IDLETIME", "bar"]).i() < 2);
+}
+
+/// Which commands are a use of which keys, family by family: each command
+/// that reads or writes a key counts once (LFU, every use counted:
+/// `lfu-log-factor 0`), and what only asks about a key never does. The use
+/// is written by the command's own lookup of its key; these are the counts
+/// it had when it was written after the command, by a second lookup.
+#[test]
+fn each_command_family_uses_its_keys_once() {
+    let server = Server::start(&["--maxmemory-policy", "allkeys-lfu"]);
+    let mut c = server.conn();
+    for (name, value) in [("lfu-log-factor", "0"), ("lfu-decay-time", "0")] {
+        assert!(c.cmd(&["CONFIG", "SET", name, value]).ok(), "{name}");
+    }
+    type Case<'a> = (
+        &'a [&'a [&'a str]],
+        &'a [&'a [&'a str]],
+        &'a [(&'a str, i64)],
+    );
+    let cases: &[Case] = &[
+        // strings
+        (&[&["SET", "a", "1"]], &[&["GET", "a"]], &[("a", 1)]),
+        (&[&["SET", "a", "1"]], &[&["SET", "a", "2"]], &[("a", 1)]),
+        (
+            &[&["SET", "a", "1", "EX", "100"]],
+            &[&["SET", "a", "2", "EX", "100"]],
+            &[("a", 1)],
+        ),
+        (
+            &[&["SET", "a", "1"]],
+            &[&["SET", "a", "2", "NX"]],
+            &[("a", 1)],
+        ),
+        (
+            &[&["SET", "a", "1"]],
+            &[&["SET", "a", "2", "GET"]],
+            &[("a", 1)],
+        ),
+        (
+            &[&["SET", "a", "1"]],
+            &[&["SET", "a", "2", "BOGUS"]],
+            &[("a", 1)],
+        ),
+        (&[&["SET", "a", "1"]], &[&["GETSET", "a", "2"]], &[("a", 1)]),
+        (
+            &[&["SET", "a", "1"]],
+            &[&["SETEX", "a", "100", "2"]],
+            &[("a", 1)],
+        ),
+        (
+            &[&["SET", "a", "1"]],
+            &[&["GETEX", "a", "EX", "100"]],
+            &[("a", 1)],
+        ),
+        (&[&["SET", "a", "1"]], &[&["INCR", "a"]], &[("a", 1)]),
+        (&[&["SET", "a", "x"]], &[&["INCR", "a"]], &[("a", 1)]),
+        (
+            &[&["SET", "a", "1"]],
+            &[&["INCRBYFLOAT", "a", "1.5"]],
+            &[("a", 1)],
+        ),
+        (
+            &[&["SET", "a", "hello"]],
+            &[&["APPEND", "a", "!"]],
+            &[("a", 1)],
+        ),
+        (
+            &[&["SET", "a", "hello"]],
+            &[&["SETRANGE", "a", "1", "E"]],
+            &[("a", 1)],
+        ),
+        (
+            &[&["SET", "a", "1"], &["SET", "b", "1"]],
+            &[&["MGET", "a", "b", "zz"]],
+            &[("a", 1), ("b", 1)],
+        ),
+        (
+            &[&["SET", "a", "1"]],
+            &[&["MSET", "a", "2", "b", "3"]],
+            &[("a", 1)],
+        ),
+        // Named twice, used twice, as Redis counts each lookup; INCR looks
+        // its key up twice and names it once.
+        (&[&["SET", "a", "1"]], &[&["MGET", "a", "a"]], &[("a", 2)]),
+        (
+            &[&["SADD", "a", "x"]],
+            &[&["SUNION", "a", "a"]],
+            &[("a", 2)],
+        ),
+        (
+            &[&["RPUSH", "a", "x", "y"]],
+            &[&["LMOVE", "a", "a", "LEFT", "RIGHT"]],
+            &[("a", 2)],
+        ),
+        (&[&["SET", "a", "1"]], &[&["STRLEN", "a"]], &[("a", 1)]),
+        (
+            &[&["SET", "a", "1"]],
+            &[&["SETBIT", "a", "3", "1"]],
+            &[("a", 1)],
+        ),
+        (&[&["PFADD", "a", "x"]], &[&["PFCOUNT", "a"]], &[("a", 1)]),
+        // collections
+        (
+            &[&["RPUSH", "a", "x"]],
+            &[&["LPUSH", "a", "y"]],
+            &[("a", 1)],
+        ),
+        (
+            &[&["RPUSH", "a", "x"]],
+            &[&["LRANGE", "a", "0", "-1"]],
+            &[("a", 1)],
+        ),
+        (
+            &[&["RPUSH", "a", "x", "y"], &["RPUSH", "b", "z"]],
+            &[&["LMOVE", "a", "b", "LEFT", "RIGHT"]],
+            &[("a", 1), ("b", 1)],
+        ),
+        (&[&["SET", "a", "1"]], &[&["LPUSH", "a", "x"]], &[("a", 1)]),
+        (
+            &[&["HSET", "a", "f", "1"]],
+            &[&["HGET", "a", "f"]],
+            &[("a", 1)],
+        ),
+        (
+            &[&["HSET", "a", "f", "1"]],
+            &[&["HINCRBY", "a", "f", "2"]],
+            &[("a", 1)],
+        ),
+        (
+            &[&["SADD", "a", "x"]],
+            &[&["SISMEMBER", "a", "x"]],
+            &[("a", 1)],
+        ),
+        (
+            &[
+                &["SADD", "a", "x"],
+                &["SADD", "b", "x"],
+                &["SADD", "d", "q"],
+            ],
+            &[&["SINTERSTORE", "d", "a", "b"]],
+            &[("a", 1), ("b", 1), ("d", 1)],
+        ),
+        (
+            &[&["ZADD", "a", "1", "x"]],
+            &[&["ZINCRBY", "a", "2", "x"]],
+            &[("a", 1)],
+        ),
+        (
+            &[&["ZADD", "a", "1", "x"]],
+            &[&["ZRANGE", "a", "0", "-1"]],
+            &[("a", 1)],
+        ),
+        (
+            &[&["XADD", "a", "*", "f", "1"]],
+            &[&["XRANGE", "a", "-", "+"]],
+            &[("a", 1)],
+        ),
+        // keys
+        (
+            &[&["SET", "a", "1"]],
+            &[&["EXPIRE", "a", "100"]],
+            &[("a", 1)],
+        ),
+        (
+            &[&["SET", "a", "1", "EX", "100"]],
+            &[&["PERSIST", "a"]],
+            &[("a", 1)],
+        ),
+        (&[&["SET", "a", "1"]], &[&["PERSIST", "a"]], &[("a", 1)]),
+        (
+            &[&["SET", "a", "1"], &["SET", "b", "1"]],
+            &[&["TOUCH", "a", "b"]],
+            &[("a", 1), ("b", 1)],
+        ),
+        (&[&["SET", "a", "1"]], &[&["DUMP", "a"]], &[("a", 1)]),
+        (
+            &[&["SET", "a", "1"], &["SET", "b", "2"]],
+            &[&["COPY", "a", "b", "REPLACE"]],
+            &[("a", 1), ("b", 1)],
+        ),
+        (
+            &[&["RPUSH", "a", "2", "1"], &["SET", "w_1", "1"]],
+            &[&["SORT", "a", "BY", "w_*"]],
+            &[("a", 1), ("w_1", 0)],
+        ),
+        (
+            &[&["SET", "a", "1"]],
+            &[&["MEMORY", "USAGE", "a"]],
+            &[("a", 1)],
+        ),
+        // transactions, the plain one and the one under WATCH alike
+        (
+            &[&["SET", "a", "1"]],
+            &[&["MULTI"], &["SET", "a", "2"], &["GET", "a"], &["EXEC"]],
+            &[("a", 2)],
+        ),
+        (
+            &[&["SET", "a", "1"]],
+            &[&["WATCH", "a"], &["MULTI"], &["SET", "a", "2"], &["EXEC"]],
+            &[("a", 1)],
+        ),
+        // only asking
+        (
+            &[&["SET", "a", "1"]],
+            &[&["OBJECT", "ENCODING", "a"]],
+            &[("a", 0)],
+        ),
+        (&[&["SET", "a", "1"]], &[&["TYPE", "a"]], &[("a", 0)]),
+        (&[&["SET", "a", "1"]], &[&["TTL", "a"]], &[("a", 0)]),
+        (&[&["SET", "a", "1"]], &[&["EXPIRETIME", "a"]], &[("a", 0)]),
+        (&[&["SET", "a", "1"]], &[&["EXISTS", "a"]], &[("a", 0)]),
+        (&[&["SET", "a", "1"]], &[&["SCAN", "0"]], &[("a", 0)]),
+        (&[&["SET", "a", "1"]], &[&["KEYS", "*"]], &[("a", 0)]),
+        (&[&["SET", "a", "1"]], &[&["RANDOMKEY"]], &[("a", 0)]),
+        (&[&["SET", "a", "1"]], &[&["GET", "zz"]], &[("a", 0)]),
+    ];
+    for (setup, commands, keys) in cases {
+        c.cmd(&["FLUSHALL"]);
+        for command in *setup {
+            c.cmd(command);
+        }
+        let before: Vec<i64> = keys
+            .iter()
+            .map(|(k, _)| c.cmd(&["OBJECT", "FREQ", k]).i())
+            .collect();
+        for command in *commands {
+            c.cmd(command);
+        }
+        for ((key, uses), before) in keys.iter().zip(before) {
+            let after = c.cmd(&["OBJECT", "FREQ", key]).i();
+            assert_eq!(after - before, *uses, "{key} after {commands:?}");
+        }
+    }
+
+    // Under an LRU policy, the same lookups reset the idle time.
+    assert!(
+        c.cmd(&["CONFIG", "SET", "maxmemory-policy", "allkeys-lru"])
+            .ok()
+    );
+    c.cmd(&["FLUSHALL"]);
+    let families: &[&[&str]] = &[
+        &["GET", "s"],
+        &["SET", "s2", "x"],
+        &["INCR", "n"],
+        &["APPEND", "s3", "!"],
+        &["LPUSH", "l", "y"],
+        &["HGET", "h", "f"],
+        &["SADD", "t", "y"],
+        &["ZSCORE", "z", "x"],
+        &["EXPIRE", "s4", "100"],
+    ];
+    for setup in [
+        &["SET", "s", "x"][..],
+        &["SET", "s2", "x"],
+        &["SET", "n", "1"],
+        &["SET", "s3", "x"],
+        &["SET", "s4", "x"],
+        &["SET", "q", "x"],
+        &["RPUSH", "l", "x"],
+        &["HSET", "h", "f", "1"],
+        &["SADD", "t", "x"],
+        &["ZADD", "z", "1", "x"],
+    ] {
+        c.cmd(setup);
+    }
+    std::thread::sleep(Duration::from_millis(2100));
+    for command in families {
+        c.cmd(command);
+        let idle = c.cmd(&["OBJECT", "IDLETIME", command[1]]).i();
+        assert!(idle < 2, "idle {idle} after {command:?}");
+    }
+    for command in [&["TYPE", "q"][..], &["TTL", "q"], &["EXISTS", "q"]] {
+        c.cmd(command);
+    }
+    assert!(
+        c.cmd(&["OBJECT", "IDLETIME", "q"]).i() >= 2,
+        "only asked about"
     );
 }

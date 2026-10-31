@@ -205,6 +205,14 @@ pub(crate) fn ft_cursor(ctx: &mut Ctx) -> Option<Vec<u8>> {
     if !matches!(sub.as_str(), "READ" | "DEL" | "GC") {
         return Some(resp_error("Unknown subcommand"));
     }
+    // The index first, as in Redis. The cursors of one that has gone went
+    // with it.
+    if let Some(index) = cmd.get(2).map(|a| text(a))
+        && !ctx.index_store.read().contains_key(index)
+    {
+        CURSORS.lock().retain(|_, cursor| cursor.index != index);
+        return Some(resp_error(&crate::commands::search::no_such_index(index)));
+    }
     if sub == "GC" {
         // Collection of idle cursors: here that happens on every use.
         let mut cursors = CURSORS.lock();
@@ -220,15 +228,10 @@ pub(crate) fn ft_cursor(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "ERR wrong number of arguments for 'FT.CURSOR' command",
         ));
     };
-    let index_exists = ctx.index_store.read().contains_key(index);
-
     let mut cursors = CURSORS.lock();
     forget_idle(&mut cursors);
     let known = cursors.get(&id).is_some_and(|cursor| cursor.index == index);
-    if known && !index_exists {
-        cursors.remove(&id);
-    }
-    if !known || !index_exists {
+    if !known {
         return Some(resp_error(if sub == "DEL" {
             "Cursor does not exist"
         } else {
@@ -300,11 +303,14 @@ static CONFIG: LazyLock<Mutex<Vec<(&'static str, String)>>> = LazyLock::new(|| {
             ("MAXAGGREGATERESULTS", "unlimited"),
             ("DEFAULT_DIALECT", "1"),
             ("MINPREFIX", "2"),
+            // Acted on: the shortest word, in bytes, whose stem is indexed
+            // (see `vector::stem`). `search-min-stem-len` is this setting.
             ("MINSTEMLEN", "4"),
             ("MAXPREFIXEXPANSIONS", "200"),
             ("MAXEXPANSIONS", "200"),
             ("MAXDOCTABLESIZE", "1000000"),
             ("MIN_PHONETIC_TERM_LEN", "3"),
+            // Acted on: the ranking function of a query that names none.
             ("DEFAULT_SCORER", "BM25STD"),
             ("WORKERS", "0"),
             ("NOGC", "false"),
@@ -366,9 +372,19 @@ pub(crate) fn set_config(name: &str, value: &str) -> bool {
     match config.iter_mut().find(|(n, _)| *n == name) {
         Some(slot) if config_value_ok(name, value) => {
             slot.1 = value.to_string();
+            config_applied(name, value);
             true
         }
         _ => false,
+    }
+}
+
+/// What a setting this engine keeps elsewhere does once set.
+fn config_applied(name: &str, value: &str) {
+    if name == "MINSTEMLEN"
+        && let Ok(len) = value.parse::<usize>()
+    {
+        crate::vector::stem::set_min_stem_len(len);
     }
 }
 
@@ -382,7 +398,10 @@ fn config_value_ok(name: &str, value: &str) -> bool {
         "NOGC" | "PARTIAL_INDEXED_DOCS" => {
             matches!(value.to_ascii_lowercase().as_str(), "true" | "false")
         }
-        "DEFAULT_SCORER" => !value.is_empty(),
+        "DEFAULT_SCORER" => crate::vector::score::Scorer::parse(value).is_some(),
+        "MINSTEMLEN" => value
+            .parse::<u64>()
+            .is_ok_and(|n| n >= crate::vector::stem::MIN_STEM_LEN_FLOOR as u64),
         "MAXAGGREGATERESULTS" => value == "unlimited" || value.parse::<u64>().is_ok(),
         "DEFAULT_DIALECT" => matches!(value, "1" | "2" | "3" | "4"),
         // No more than `search-timeout` takes, which is this setting too: a
@@ -442,11 +461,15 @@ pub(crate) fn ft_config(ctx: &mut Ctx) -> Option<Vec<u8>> {
             let Some(slot) = config.iter_mut().find(|(n, _)| *n == name) else {
                 return Some(resp_error("Invalid option"));
             };
+            if name == "MINSTEMLEN" && value.parse::<u64>().is_ok_and(|n| n < 2) {
+                return Some(resp_error("Minimum stem length cannot be lower than 2"));
+            }
             if !config_value_ok(&name, value) {
                 return Some(resp_error(&format!(
                     "Bad arguments for {name}: Could not convert argument to expected type"
                 )));
             }
+            config_applied(&name, value);
             // As `search-on-timeout` reads it back.
             slot.1 = if name == "ON_TIMEOUT" {
                 value.to_ascii_lowercase()
@@ -517,6 +540,12 @@ fn bound(value: f64) -> String {
 fn term_text(term: &TextMatch) -> String {
     match term {
         TextMatch::Exact(word) => word.clone(),
+        TextMatch::Stem(stem) => format!(
+            "{}{}(expanded)",
+            crate::vector::stem::STEM_PREFIX,
+            stem.stem
+        ),
+        TextMatch::Expanded(word) => format!("{word}(expanded)"),
         TextMatch::Prefix(start) => format!("PREFIX{{{start}*}}"),
         TextMatch::Suffix(end) => format!("SUFFIX{{*{end}}}"),
         TextMatch::Infix(part) => format!("INFIX{{*{part}*}}"),
@@ -524,27 +553,13 @@ fn term_text(term: &TextMatch) -> String {
     }
 }
 
-/// `@field:` if the clause names one field, nothing if it is every field.
+/// `@field:` (`@a|b:`) if the clause names its fields, nothing if it is
+/// every field.
 fn scope(fields: &[String], every: usize) -> String {
-    match fields {
-        [only] if every != 1 => format!("@{only}:"),
-        _ => String::new(),
-    }
-}
-
-/// Every operand of a run of the same operator: `a b c` is one INTERSECT of
-/// three, not one inside another.
-fn operands<'a>(filter: &'a Filter, and: bool, out: &mut Vec<&'a Filter>) {
-    match filter {
-        Filter::And(l, r) if and => {
-            operands(l, and, out);
-            operands(r, and, out);
-        }
-        Filter::Or(l, r) if !and => {
-            operands(l, and, out);
-            operands(r, and, out);
-        }
-        other => out.push(other),
+    if fields.is_empty() || fields.len() >= every {
+        String::new()
+    } else {
+        format!("@{}:", fields.join("|"))
     }
 }
 
@@ -560,10 +575,20 @@ fn explain_filter(filter: &Filter, text_fields: usize, depth: usize, out: &mut V
     };
     match filter {
         Filter::And(..) | Filter::Or(..) => {
+            // Every operand of a run of the same operator: `a b c` is one
+            // INTERSECT of three, not one inside another; a word with its
+            // stems is a UNION of its own, in the word's fields.
             let and = matches!(filter, Filter::And(..));
             let mut children = Vec::new();
-            operands(filter, and, &mut children);
-            block(if and { "INTERSECT" } else { "UNION" }, &children, out);
+            crate::vector::score::operands(filter, &mut children);
+            let fields = match children.first() {
+                Some(Filter::Text { fields, .. }) if crate::vector::score::is_expansion(filter) => {
+                    scope(fields, text_fields)
+                }
+                _ => String::new(),
+            };
+            let open = format!("{fields}{}", if and { "INTERSECT" } else { "UNION" });
+            block(&open, &children, out);
         }
         Filter::Not(inner) => block("NOT", &[inner], out),
         Filter::Optional(inner) => block("OPTIONAL", &[inner], out),
@@ -657,6 +682,20 @@ fn explain_query(query: &filter::Query, text_fields: usize) -> Vec<String> {
     out
 }
 
+/// `VERBATIM` and `LANGUAGE`, wherever in the command they are.
+fn query_options(cmd: &[&[u8]]) -> Result<filter::QueryOptions, String> {
+    let mut options = filter::QueryOptions {
+        verbatim: cmd.iter().skip(3).any(|a| is(a, "VERBATIM")),
+        language: None,
+    };
+    if let Some(at) = cmd.iter().skip(3).position(|a| is(a, "LANGUAGE")) {
+        let name = cmd.get(at + 4).map(|a| text(a)).unwrap_or_default();
+        options.language =
+            Some(crate::vector::stem::Language::parse(name).ok_or("No such language")?);
+    }
+    Ok(options)
+}
+
 /// `FT.EXPLAIN index query [PARAMS …] [DIALECT n]` — the plan as one
 /// string; `FT.EXPLAINCLI` — as an array of its lines.
 pub(crate) fn ft_explain(ctx: &mut Ctx, lines: bool) -> Option<Vec<u8>> {
@@ -671,7 +710,9 @@ pub(crate) fn ft_explain(ctx: &mut Ctx, lines: bool) -> Option<Vec<u8>> {
     let Some(def) = ctx.index_store.read().get(index).cloned() else {
         return Some(resp_error(&crate::commands::search::no_such_index(index)));
     };
-    let query = match filter::parse_query(text(cmd[2]), &params_of(cmd), &def) {
+    let query = match query_options(cmd)
+        .and_then(|options| filter::parse_query_with(text(cmd[2]), &params_of(cmd), &def, options))
+    {
         Ok(query) => query,
         Err(e) => return Some(resp_error(&e)),
     };
@@ -725,7 +766,7 @@ fn iterator_profile(filter: &Filter, reads: i64) -> Vec<u8> {
         Filter::And(..) | Filter::Or(..) => {
             let and = matches!(filter, Filter::And(..));
             let mut children = Vec::new();
-            operands(filter, and, &mut children);
+            crate::vector::score::operands(filter, &mut children);
             node(if and { "INTERSECT" } else { "UNION" }, None, children)
         }
         Filter::Not(inner) => node("NOT", None, vec![inner]),
@@ -804,7 +845,10 @@ pub(crate) fn ft_profile(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let plan = (kind != "HYBRID")
         .then(|| ctx.index_store.read().get(&index).cloned())
         .flatten()
-        .and_then(|def| filter::parse_query(text(cmd[at + 1]), &params_of(cmd), &def).ok());
+        .and_then(|def| {
+            let options = query_options(&cmd[at - 1..]).unwrap_or_default();
+            filter::parse_query_with(text(cmd[at + 1]), &params_of(cmd), &def, options).ok()
+        });
     let parsing = parse_started.elapsed();
 
     // The command, as it would have been sent.
