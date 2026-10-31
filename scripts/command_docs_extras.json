@@ -720,6 +720,9 @@
             }
         ]
     },
+    "CLUSTER SYNCSLOTS": {
+        "since": ""
+    },
     "DELEX": {
         "summary": "Deletes a key, optionally only when its value or value digest matches a condition.",
         "complexity": "O(1) for IFEQ and IFNE. O(N) for IFDEQ and IFDNE, N being the length of the value.",
@@ -3848,6 +3851,21 @@
         "module": "search",
         "since": "2.0.0"
     },
+    "HEXPIRE": {
+        "since": "7.4.0"
+    },
+    "HEXPIREAT": {
+        "since": "7.4.0"
+    },
+    "HEXPIRETIME": {
+        "since": "7.4.0"
+    },
+    "HGETDEL": {
+        "since": "8.0.0"
+    },
+    "HGETEX": {
+        "since": "8.0.0"
+    },
     "HIMPORT": {
         "summary": "Bulk loads hashes through a field set prepared once per connection. Use a subcommand.",
         "group": "hash",
@@ -4004,6 +4022,27 @@
         "complexity": "O(1)",
         "group": "server",
         "since": "8.6.0"
+    },
+    "HPERSIST": {
+        "since": "7.4.0"
+    },
+    "HPEXPIRE": {
+        "since": "7.4.0"
+    },
+    "HPEXPIREAT": {
+        "since": "7.4.0"
+    },
+    "HPEXPIRETIME": {
+        "since": "7.4.0"
+    },
+    "HPTTL": {
+        "since": "7.4.0"
+    },
+    "HSETEX": {
+        "since": "8.0.0"
+    },
+    "HTTL": {
+        "since": "7.4.0"
     },
     "INCREX": {
         "summary": "Adds to a numeric value with optional bounds, saturation and expiry, all in one step.",
@@ -4768,6 +4807,9 @@
                 ]
             }
         ]
+    },
+    "MSETEX": {
+        "since": "8.4.0"
     },
     "SDIFFCARD": {
         "summary": "Counts the members of the first set that are in none of the others, without building the result.",

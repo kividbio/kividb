@@ -1167,7 +1167,7 @@ fn test_command_docs_module_commands() {
 }
 
 // `since` comes from the command JSON: XADD 5.0.0, GETEX 6.2.0, and
-// HEXPIRE 9.0.0 (the Valkey release that added it).
+// HEXPIRE 7.4.0 (the Redis release that added it, not Valkey's 9.0.0).
 #[test]
 fn test_command_docs_since_from_command_json() {
     let port = free_port();
@@ -1182,7 +1182,7 @@ fn test_command_docs_since_from_command_json() {
     assert_eq!(arr[2].as_str(), "getex");
     assert_eq!(docs_field(&arr[3], "since"), "6.2.0");
     assert_eq!(arr[4].as_str(), "hexpire");
-    assert_eq!(docs_field(&arr[5], "since"), "9.0.0");
+    assert_eq!(docs_field(&arr[5], "since"), "7.4.0");
 }
 
 // SADD / HSET / LPUSH complexity is the O(1)-per-element wording, not O(N).
