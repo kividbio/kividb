@@ -1205,3 +1205,160 @@ fn a_read_under_a_tag_the_sweep_and_a_cut_do_not_deadlock() {
 fn a_read_under_a_tag_a_write_and_a_cut_do_not_deadlock() {
     a_read_under_a_tag_meets_a_cut(true);
 }
+
+/// Everything at once, for a while, with a watchdog: reads, writes and
+/// scripts beside others on a few hash tags whose keys expire as they are
+/// read, the sweep, `BGREWRITEAOF` after `BGREWRITEAOF`, and a replica made
+/// to sync in full again and again. The test fails if no write has been
+/// answered for 8 s: a hang holds every write back, behind a cut, while
+/// reads that need no gate may still be answered.
+#[cfg(feature = "lua")]
+#[test]
+fn tagged_reads_of_expiring_keys_beside_checkpoints_and_full_syncs_do_not_hang() {
+    const TAGS: u64 = 4;
+    const SECS: u64 = 15;
+    let master = Server::start(&["--aof"]);
+    let port = master.port;
+    let stop = Arc::new(AtomicBool::new(false));
+    let answered = Arc::new(AtomicU64::new(0));
+    let rewrites = Arc::new(AtomicU64::new(0));
+    let syncs = Arc::new(AtomicU64::new(0));
+    let key = |n: u64| format!("{{q{}}}:{}", n % TAGS, n % 97);
+    let mut threads = Vec::new();
+    // Each round of `work` says whether it wrote: those are counted.
+    type Work = Box<dyn Fn(&mut Conn, u64) -> bool + Send>;
+    let mut client = |work: Work| {
+        let (stop, answered) = (Arc::clone(&stop), Arc::clone(&answered));
+        threads.push(std::thread::spawn(move || {
+            let mut c = Conn::connect(port);
+            let mut n = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                n += 1;
+                if work(&mut c, n) {
+                    answered.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }));
+    };
+    // Writers: keys of the tags that live a few milliseconds.
+    for w in 0..3u64 {
+        client(Box::new(move |c, n| {
+            let n = n * 3 + w;
+            let k = key(n);
+            assert_eq!(
+                c.cmd(&["SET", &k, "v", "PX", &(1 + n % 5).to_string()]).s(),
+                "OK"
+            );
+            let counter = format!("{{q{}}}:c", n % TAGS);
+            let _ = c.cmd(&["INCR", &counter]);
+            true
+        }));
+    }
+    // Readers of the same keys, about when they expire: lazy expiry under
+    // the tags' locks.
+    for r in 0..3u64 {
+        client(Box::new(move |c, n| {
+            let n = n * 5 + r;
+            let _ = c.cmd(&["GET", &key(n)]);
+            let _ = c.cmd(&["MGET", &key(n + TAGS), &key(n + 2 * TAGS)]);
+            let _ = c.cmd(&["EXISTS", &key(n + 3 * TAGS)]);
+            false
+        }));
+    }
+    // Scripts beside others under a tag (once seen to be quick), read-only
+    // and not, reading keys past their time. The read-only one holds its
+    // tag a while (2 ms, three times in four) before it reads eight keys of
+    // it: long enough for a write to the tag and a cut to come meanwhile,
+    // and short enough for it to stay a quick script.
+    let slow_reads = "local t = os.clock() \
+                      while os.clock() - t < tonumber(ARGV[1]) do end \
+                      local n = 0 \
+                      for i = 1, #KEYS do \
+                        if redis.call('GET', KEYS[i]) then n = n + 1 end \
+                      end \
+                      return n";
+    for s in 0..3u64 {
+        client(Box::new(move |c, n| {
+            let n = n * 7 + s;
+            let keys: Vec<String> = (0..8).map(|i| key(n + i * TAGS)).collect();
+            let mut args = vec!["EVAL_RO", slow_reads, "8"];
+            args.extend(keys.iter().map(String::as_str));
+            args.push(if n % 4 == 0 { "0" } else { "0.002" });
+            let read = c.cmd(&args);
+            assert!(matches!(read, V::Int(_)), "{read:?}");
+            let counter = format!("{{q{}}}:s", n % TAGS);
+            let write = c.cmd(&[
+                "EVAL",
+                "redis.call('GET', KEYS[1]) return redis.call('INCR', KEYS[2])",
+                "2",
+                &key(n),
+                &counter,
+            ]);
+            assert!(matches!(write, V::Int(_)), "{write:?}");
+            true
+        }));
+    }
+    // Checkpoints, one after another. (A `BGREWRITEAOF` is never refused:
+    // it is queued behind the one running. So each waits for the last.)
+    {
+        let (stop, rewrites) = (Arc::clone(&stop), Arc::clone(&rewrites));
+        threads.push(std::thread::spawn(move || {
+            let mut c = Conn::connect(port);
+            while !stop.load(Ordering::Relaxed) {
+                if matches!(c.cmd(&["BGREWRITEAOF"]), V::Str(_)) {
+                    rewrites.fetch_add(1, Ordering::Relaxed);
+                }
+                while !stop.load(Ordering::Relaxed)
+                    && c.info("persistence", "aof_rewrite_in_progress") != "0"
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }));
+    }
+    // A replica, started afresh again and again: a full sync each time.
+    {
+        let (stop, syncs) = (Arc::clone(&stop), Arc::clone(&syncs));
+        let master_port = port.to_string();
+        threads.push(std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let replica = Server::start(&["--replicaof", "127.0.0.1", &master_port]);
+                let mut r = replica.conn();
+                wait_link_up(&mut r);
+                syncs.fetch_add(1, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        }));
+    }
+    // The watchdog.
+    let deadline = Instant::now() + Duration::from_secs(SECS);
+    let (mut seen, mut since) = (0, Instant::now());
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        let now = answered.load(Ordering::Relaxed);
+        if now != seen {
+            (seen, since) = (now, Instant::now());
+        }
+        assert!(
+            since.elapsed() < Duration::from_secs(8),
+            "hung: no write answered for 8 s ({seen} before; {} rewrites, {} full syncs)",
+            rewrites.load(Ordering::Relaxed),
+            syncs.load(Ordering::Relaxed)
+        );
+        assert!(
+            threads.iter().all(|t| !t.is_finished()),
+            "a client thread stopped (it panicked)"
+        );
+    }
+    stop.store(true, Ordering::Relaxed);
+    for t in threads {
+        t.join().expect("a client thread panicked");
+    }
+    let mut c = Conn::connect(port);
+    wait_until("the last rewrite to finish", 30, || {
+        c.info("persistence", "aof_rewrite_in_progress") == "0"
+    });
+    assert_eq!(c.cmd(&["SET", "after", "1"]).s(), "OK");
+    assert!(rewrites.load(Ordering::Relaxed) > 0, "no rewrite ran");
+    assert!(syncs.load(Ordering::Relaxed) > 0, "no full sync ran");
+}
