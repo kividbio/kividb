@@ -5,8 +5,8 @@ usage: python -I gen_command_docs.py <valkey src/commands dir> <server.rs> <out.
 The base is Valkey's `src/commands/*.json` (BSD-3-Clause) at VALKEY_TAG /
 VALKEY_COMMIT below. Each extra path is a commands.json style file (one
 object mapping command names to specs, `CONTAINER SUB` for a subcommand),
-or a directory of such files. Later files override earlier ones of the same
-full name. `scripts/command_docs_extras.json` covers the commands KiviDB
+or a directory of such files. Later files override fields from earlier ones
+of the same full name. `scripts/command_docs_extras.json` covers the commands KiviDB
 serves that Valkey does not have; its summaries and complexities are
 KiviDB's own text.
 
@@ -304,7 +304,7 @@ def main() -> None:
             top = full.split("|", 1)[0]
             if top not in served or full in SKIP:
                 continue
-            entries[full] = spec
+            entries[full] = entries.get(full, {}) | spec
             if "container" in spec:
                 children[spec["container"].upper()].add(full)
 
