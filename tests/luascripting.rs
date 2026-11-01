@@ -1970,3 +1970,74 @@ fn test_each_flush_leaves_the_other_kind_working() {
     );
     assert!(c.cmds(&["SCRIPT", "FLUSH", "NOW"]).is_error());
 }
+
+/// A script may not run what Redis 8.10 flags `noscript`: `SAVE`, `CONFIG
+/// SET`, `MULTI`, `SUBSCRIBE`, `CLIENT SETNAME`, ... It ran them. The
+/// subcommands Redis lets a script run (`CONFIG HELP`, `CLUSTER KEYSLOT`,
+/// `BACKUP LIST`, ...) still run.
+#[test]
+fn a_script_may_not_run_noscript_commands() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let from_script = |c: &mut Conn, args: &[&str]| {
+        let quoted: Vec<String> = args.iter().map(|a| format!("'{a}'")).collect();
+        let script = format!("return redis.pcall({})", quoted.join(", "));
+        c.cmds(&["EVAL", &script, "0"])
+    };
+    let refused: &[&[&str]] = &[
+        &["SAVE"],
+        &["BGSAVE"],
+        &["BGREWRITEAOF"],
+        &["CONFIG", "SET", "maxmemory", "0"],
+        &["config", "get", "maxmemory"],
+        &["CONFIG", "REWRITE"],
+        &["MULTI"],
+        &["EXEC"],
+        &["WATCH", "k"],
+        &["SUBSCRIBE", "ch"],
+        &["CLIENT", "SETNAME", "x"],
+        &["CLIENT", "ID"],
+        &["ACL", "WHOAMI"],
+        &["FUNCTION", "LIST"],
+        &["SCRIPT", "FLUSH"],
+        &["EVAL", "return 1", "0"],
+        &["HELLO"],
+        &["ROLE"],
+        &["DEBUG", "SLEEP", "0"],
+        &["REPLICAOF", "NO", "ONE"],
+        &["SLAVEOF", "NO", "ONE"],
+        &["LATENCY", "LATEST"],
+        &["HOTKEYS", "START", "METRICS", "1", "CPU"],
+        &["BACKUP", "START"],
+        &["CLUSTER", "RESET"],
+        &["CLUSTER", "SETSLOT", "1", "STABLE"],
+    ];
+    for args in refused {
+        let reply = from_script(&mut c, args);
+        assert!(
+            reply.is_error() && reply.as_error().contains("not allowed from script"),
+            "{args:?}: {reply:?}"
+        );
+    }
+    let allowed: &[&[&str]] = &[
+        &["PING"],
+        &["CONFIG", "HELP"],
+        &["CLIENT", "HELP"],
+        &["SCRIPT", "HELP"],
+        &["HOTKEYS", "HELP"],
+        &["BACKUP", "LIST"],
+        &["CLUSTER", "KEYSLOT", "k"],
+    ];
+    for args in allowed {
+        let reply = from_script(&mut c, args);
+        assert!(
+            !reply.is_error() || !reply.as_error().contains("not allowed from script"),
+            "{args:?}: {reply:?}"
+        );
+    }
+    // Nothing a refused command would have changed has.
+    assert_eq!(c.cmds(&["PING"]), RespValue::SimpleStr("PONG".into()));
+    assert!(c.cmds(&["CLIENT", "GETNAME"]).is_nil());
+}

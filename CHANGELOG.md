@@ -44,6 +44,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A script may not run what Redis does not let a script run.** Redis
+  refuses, from `EVAL` and `FCALL`, the commands its command table flags
+  `noscript`, with "This Redis command is not allowed from script":
+  `SAVE`, `BGSAVE`, `BGREWRITEAOF`, `SHUTDOWN`, `CONFIG GET` / `SET` /
+  `REWRITE`, `ACL` and `CLIENT` subcommands, `MULTI`, `EXEC`, `WATCH`, the
+  subscribe commands, `MONITOR`, `REPLICAOF`, `DEBUG`, `HELLO`, `EVAL`
+  itself and others. KiviDB refused only `CLUSTER`, `HOTKEYS` and `BACKUP`,
+  and ran the rest. A `SAVE` in a script on a replica could hang it: the
+  script held a slot of the write gate and waited for the replication
+  applier, which waited for a backup's or a full sync's cut, which waited
+  for the gate. The list is now Redis 8.10's. Of `CLUSTER`, a script may
+  run what only reads (`INFO`, `NODES`, `SLOTS`, `KEYSLOT`, ...), as in
+  Redis, but not what changes the cluster, which Redis allows: a slot's
+  handoff here waits for the writes in flight, the script among them.
+  `HOTKEYS HELP`, `BACKUP LIST` and `BACKUP STATUS` run from a script, as in
+  Redis.
+
 - **A key a command leaves where it was keeps its LFU count.** `GETDEL` of
   a key of another type took the key out, saw its type, and put it back as
   a new key: its time to live was kept, but under an LFU policy its access

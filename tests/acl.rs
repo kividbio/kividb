@@ -2076,13 +2076,21 @@ fn a_script_runs_under_its_users_acl() {
         "{:?}",
         other_key.error_str()
     );
+    let other_command = c.cmds(&["EVAL", "return redis.call('FLUSHALL')", "0"]);
+    assert!(
+        other_command.error_str().contains("NOPERM"),
+        "{:?}",
+        other_command.error_str()
+    );
+    // No script may run `ACL SETUSER`, as in Redis: refused before its
+    // user's ACL is asked.
     let escalate = c.cmds(&[
         "EVAL",
         "return redis.call('ACL', 'SETUSER', 'lim', '+@all', '~*')",
         "0",
     ]);
     assert!(
-        escalate.error_str().contains("NOPERM"),
+        escalate.error_str().contains("not allowed from script"),
         "{:?}",
         escalate.error_str()
     );

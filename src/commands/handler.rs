@@ -236,7 +236,7 @@ pub(crate) fn execute_command_from_script(
     };
 
     // Redis `CMD_NOSCRIPT` — must win over "cluster disabled" and other dispatch errors.
-    if matches!(name, "CLUSTER" | "HOTKEYS" | "BACKUP") {
+    if not_allowed_from_script(name, parts.get(1).copied()) {
         return resp_error("ERR This Redis command is not allowed from script");
     }
 
@@ -285,6 +285,81 @@ pub(crate) fn execute_command_from_script(
     // caught (`lua::bridge`) and the script goes on.
     ctx.cmd = saved_cmd;
     reply.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+/// Whether a script may not run the command `name` (in capitals), whose
+/// first argument is `sub`: the commands and subcommands Redis 8.10 flags
+/// `noscript`, refused as Redis refuses them, before anything else is looked
+/// at. They change the connection (`MULTI`, `SUBSCRIBE`, `HELLO`, `CLIENT
+/// SETNAME`, ...), the server (`CONFIG SET`, `ACL SETUSER`, `REPLICAOF`,
+/// `SHUTDOWN`, ...), or wait for what waits for the script: a script holds a
+/// slot of the write gate, and a `SAVE` in one, on a replica, waited for the
+/// apply lock, whose holder waited for a backup's or a full sync's cut,
+/// which waited for the gate.
+///
+/// One difference from Redis: of `CLUSTER`, a script may run only what
+/// reads (`INFO`, `NODES`, `SLOTS`, `KEYSLOT`, ...). The subcommands that
+/// change the cluster, which Redis flags `admin` but lets a script run,
+/// are refused too: a slot's handoff here waits for the writes in flight,
+/// and the script is one of them.
+fn not_allowed_from_script(name: &str, sub: Option<&[u8]>) -> bool {
+    let sub_is = |names: &[&str]| {
+        sub.is_some_and(|sub| names.iter().any(|n| sub.eq_ignore_ascii_case(n.as_bytes())))
+    };
+    match name {
+        "AUTH" | "BGREWRITEAOF" | "BGSAVE" | "DEBUG" | "DISCARD" | "EVAL" | "EVALSHA"
+        | "EVALSHA_RO" | "EVAL_RO" | "EXEC" | "FAILOVER" | "FCALL" | "FCALL_RO" | "HELLO"
+        | "MONITOR" | "MULTI" | "PSUBSCRIBE" | "PSYNC" | "PUNSUBSCRIBE" | "QUIT" | "REPLCONF"
+        | "REPLICAOF" | "RESET" | "ROLE" | "SAVE" | "SHUTDOWN" | "SLAVEOF" | "SSUBSCRIBE"
+        | "SUBSCRIBE" | "SUNSUBSCRIBE" | "SYNC" | "UNSUBSCRIBE" | "UNWATCH" | "WATCH" => true,
+        "ACL" => sub_is(&[
+            "CAT", "DELUSER", "DRYRUN", "GENPASS", "GETUSER", "LIST", "LOAD", "LOG", "SAVE",
+            "SETUSER", "USERS", "WHOAMI",
+        ]),
+        "BACKUP" => sub_is(&["ABORT", "CLEANUP", "SEAL", "START"]),
+        "CLIENT" => sub_is(&[
+            "CACHING",
+            "GETNAME",
+            "GETREDIR",
+            "ID",
+            "INFO",
+            "KILL",
+            "LIST",
+            "NO-EVICT",
+            "NO-TOUCH",
+            "PAUSE",
+            "REPLY",
+            "SETINFO",
+            "SETNAME",
+            "TRACKING",
+            "TRACKINGINFO",
+            "UNBLOCK",
+            "UNPAUSE",
+        ]),
+        "CLUSTER" => !sub_is(&[
+            "COUNTKEYSINSLOT",
+            "GETKEYSINSLOT",
+            "HELP",
+            "INFO",
+            "KEYSLOT",
+            "LINKS",
+            "MYID",
+            "MYSHARDID",
+            "NODES",
+            "SHARDS",
+            "SLOT-STATS",
+            "SLOTS",
+        ]),
+        "CONFIG" => sub_is(&["GET", "RESETSTAT", "REWRITE", "SET"]),
+        "FUNCTION" => sub_is(&[
+            "DELETE", "DUMP", "FLUSH", "KILL", "LIST", "LOAD", "RESTORE", "STATS",
+        ]),
+        "HOTKEYS" => sub_is(&["GET", "RESET", "START", "STOP"]),
+        "LATENCY" => sub_is(&["DOCTOR", "GRAPH", "HISTOGRAM", "HISTORY", "LATEST", "RESET"]),
+        "MODULE" => sub_is(&["LIST", "LOAD", "LOADEX", "UNLOAD"]),
+        "SCRIPT" => sub_is(&["DEBUG", "EXISTS", "FLUSH", "KILL", "LOAD"]),
+        _ => false,
+    }
 }
 
 /// The rest of [`execute_command_from_script`], with the command in `ctx.cmd`.
@@ -1748,6 +1823,141 @@ pub(crate) fn invalidate_tracked_key(ctx: &Ctx, key: &str, by_client: bool) {
     } else {
         // Evicted to make room for the command that is about to run.
         crate::tracking::before_the_reply(invalidate);
+    }
+}
+
+#[cfg(test)]
+mod noscript_tests {
+    use super::not_allowed_from_script;
+
+    /// Every command and subcommand Redis 8.10's `src/commands/*.json` flag
+    /// `NOSCRIPT`, and some it does not.
+    #[test]
+    fn the_noscript_commands_are_redis_s() {
+        let redis: &[(&str, &[&str])] = &[
+            (
+                "ACL",
+                &[
+                    "CAT", "DELUSER", "DRYRUN", "GENPASS", "GETUSER", "LIST", "LOAD", "LOG",
+                    "SAVE", "SETUSER", "USERS", "WHOAMI",
+                ],
+            ),
+            ("BACKUP", &["ABORT", "CLEANUP", "SEAL", "START"]),
+            (
+                "CLIENT",
+                &[
+                    "CACHING",
+                    "GETNAME",
+                    "GETREDIR",
+                    "ID",
+                    "INFO",
+                    "KILL",
+                    "LIST",
+                    "NO-EVICT",
+                    "NO-TOUCH",
+                    "PAUSE",
+                    "REPLY",
+                    "SETINFO",
+                    "SETNAME",
+                    "TRACKING",
+                    "TRACKINGINFO",
+                    "UNBLOCK",
+                    "UNPAUSE",
+                ],
+            ),
+            ("CLUSTER", &["RESET"]),
+            ("CONFIG", &["GET", "RESETSTAT", "REWRITE", "SET"]),
+            (
+                "FUNCTION",
+                &[
+                    "DELETE", "DUMP", "FLUSH", "KILL", "LIST", "LOAD", "RESTORE", "STATS",
+                ],
+            ),
+            ("HOTKEYS", &["GET", "RESET", "START", "STOP"]),
+            (
+                "LATENCY",
+                &["DOCTOR", "GRAPH", "HISTOGRAM", "HISTORY", "LATEST", "RESET"],
+            ),
+            ("MODULE", &["LIST", "LOAD", "LOADEX", "UNLOAD"]),
+            ("SCRIPT", &["DEBUG", "EXISTS", "FLUSH", "KILL", "LOAD"]),
+        ];
+        for (name, subs) in redis {
+            for sub in *subs {
+                assert!(
+                    not_allowed_from_script(name, Some(sub.as_bytes())),
+                    "{name} {sub}"
+                );
+                let lower = sub.to_ascii_lowercase();
+                assert!(not_allowed_from_script(name, Some(lower.as_bytes())));
+            }
+            assert!(!not_allowed_from_script(name, Some(b"HELP")), "{name} HELP");
+        }
+        for name in [
+            "AUTH",
+            "BGREWRITEAOF",
+            "BGSAVE",
+            "DEBUG",
+            "DISCARD",
+            "EVAL",
+            "EVALSHA",
+            "EVALSHA_RO",
+            "EVAL_RO",
+            "EXEC",
+            "FAILOVER",
+            "FCALL",
+            "FCALL_RO",
+            "HELLO",
+            "MONITOR",
+            "MULTI",
+            "PSUBSCRIBE",
+            "PSYNC",
+            "PUNSUBSCRIBE",
+            "QUIT",
+            "REPLCONF",
+            "REPLICAOF",
+            "RESET",
+            "ROLE",
+            "SAVE",
+            "SHUTDOWN",
+            "SLAVEOF",
+            "SSUBSCRIBE",
+            "SUBSCRIBE",
+            "SUNSUBSCRIBE",
+            "SYNC",
+            "UNSUBSCRIBE",
+            "UNWATCH",
+            "WATCH",
+        ] {
+            assert!(not_allowed_from_script(name, None), "{name}");
+        }
+        for (name, sub) in [
+            ("GET", None),
+            ("SET", None),
+            ("PUBLISH", None),
+            ("INFO", None),
+            ("BACKUP", Some(&b"LIST"[..])),
+            ("BACKUP", Some(b"STATUS")),
+            ("CLUSTER", Some(b"KEYSLOT")),
+            ("CLUSTER", Some(b"NODES")),
+            ("OBJECT", Some(b"FREQ")),
+            ("MEMORY", Some(b"USAGE")),
+        ] {
+            assert!(!not_allowed_from_script(name, sub), "{name} {sub:?}");
+        }
+        // KiviDB's own: what changes the cluster.
+        for sub in [
+            "SETSLOT",
+            "FAILOVER",
+            "MEET",
+            "FORGET",
+            "ADDSLOTS",
+            "MIGRATION",
+        ] {
+            assert!(
+                not_allowed_from_script("CLUSTER", Some(sub.as_bytes())),
+                "{sub}"
+            );
+        }
     }
 }
 
