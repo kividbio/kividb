@@ -576,6 +576,65 @@ fn without_lazyfree_lazy_expire_the_deletion_is_del() {
     assert!(positions(&s.aof(), "UNLINK", "k").is_empty());
 }
 
+/// The same from a config file (#232). It was accepted, logged as having
+/// no effect, and on 1.1 ignored: `CONFIG GET` said `yes` and the AOF got
+/// `UNLINK`. A value other than yes or no stops the server, as any value a
+/// config file gives that cannot be used does.
+#[test]
+fn lazyfree_lazy_expire_no_in_a_config_file_makes_the_deletion_del() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    std::fs::write(
+        dir.join("kividb.conf"),
+        "appendonly yes\nlazyfree-lazy-expire no\n",
+    )
+    .unwrap();
+    let mut s = Server {
+        dir,
+        port: free_port(),
+        extra: Vec::new(),
+        child: None,
+    };
+    s.run();
+    let mut c = s.conn();
+    assert_eq!(
+        c.cmd(&["CONFIG", "GET", "lazyfree-lazy-expire"]),
+        V::Array(vec![
+            V::Bulk(b"lazyfree-lazy-expire".to_vec()),
+            V::Bulk(b"no".to_vec())
+        ])
+    );
+    c.ok(&["SET", "k", "v", "PX", "50"]);
+    wait_for("the sweep", || c.cmd(&["DBSIZE"]).int() == 0);
+    aof_holds(&s, "DEL", 1);
+    assert!(positions(&s.aof(), "UNLINK", "k").is_empty());
+    let log = std::fs::read_to_string(s.dir.join("server.log")).unwrap();
+    assert!(
+        !log.contains("'lazyfree-lazy-expire' is accepted but has no effect"),
+        "{log}"
+    );
+    assert!(matches!(
+        c.cmd(&["CONFIG", "SET", "lazyfree-lazy-expire", "maybe"]),
+        V::Error(e) if e.contains("'yes' or 'no'")
+    ));
+
+    s.kill();
+    std::fs::write(s.dir.join("kividb.conf"), "lazyfree-lazy-expire maybe\n").unwrap();
+    let status = Command::new(env!("CARGO_BIN_EXE_kividb"))
+        .current_dir(&s.dir)
+        .args([
+            "--port",
+            &free_port().to_string(),
+            "--configfile",
+            "kividb.conf",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!status.success());
+}
+
 /// A key of another database is deleted there, and the AOF goes back to
 /// the database its next write is in.
 #[test]

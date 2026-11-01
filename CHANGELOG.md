@@ -44,6 +44,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`lazyfree-lazy-expire` in a config file is applied, and said to be.**
+  1.1 accepted the directive and ignored it: `CONFIG GET` still said `yes`
+  and expired keys still reached the AOF and replicas as `UNLINK` (#232).
+  1.2 applied it, but its startup log said it had no effect, as it said of
+  `latency-tracking` and `latency-tracking-info-percentiles`, which have
+  one too; it no longer does. `lazyfree-lazy-expire`, the other
+  `lazyfree-*` settings and `latency-tracking` take only `yes` or `no`, in
+  a config file and in `CONFIG SET`, as in Redis; any value was taken.
+
 - **A script may not run what Redis does not let a script run.** Redis
   refuses, from `EVAL` and `FCALL`, the commands its command table flags
   `noscript`, with "This Redis command is not allowed from script":
