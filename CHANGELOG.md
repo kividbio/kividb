@@ -44,6 +44,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`CONFIG GET threads` gives the `--threads` value.** It gave an empty
+  reply, though `CONFIG SET threads` was refused as a setting that cannot
+  change at runtime. `CONFIG SET` with a name and no value to pair with it
+  (`CONFIG SET replicaof <host> <port>`, say) now gets Redis 8.10's
+  `ERR syntax error` instead of a wrong-number-of-arguments error (#257).
+
 - **A search's count leaves out a key the expiry is deleting.** The
   background sweep, or a read, that deleted a key past its time took it out
   of the search indexes only after letting go of the key's shard. An
@@ -51,6 +57,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `LIMIT 0 0` say) still counted the key's document. The key is now marked
   as leaving until it is out of the indexes, and the count leaves it out
   (#249).
+  
 - **A replica no longer keeps a key its master moved, or found expired
   while moving.** A `MOVE` that found its key past its time answered `0`
   but was still sent to replicas and the AOF, and the replica, which never
@@ -61,6 +68,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   expired in the database it was moved to could have its `DEL` sent before
   the `MOVE`: `MOVE` and `COPY ... DB` are now ordered against the key in
   both databases.
+  
 - **`expired` comes before the event of a write that makes the key
   again.** When the background sweep, or another client's read, deleted a
   key past its time, its `expired` notification was published after the

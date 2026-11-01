@@ -302,6 +302,66 @@ fn test_config_get_requirepass_redacted() {
     c.cmds(&["CONFIG", "SET", "requirepass", ""]);
 }
 
+/// `CONFIG GET threads` gives the `--threads` the server was started with
+/// (#257). It used to give nothing, though `CONFIG SET threads` was refused
+/// as a setting that cannot change while the server runs.
+#[test]
+fn config_get_threads_gives_the_configured_value() {
+    let _turn = maxmemory_turn();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["CONFIG", "GET", "threads"]);
+    let arr = result.as_array();
+    assert_eq!(arr.len(), 2, "{result:?}");
+    assert_eq!(arr[0].as_str(), "threads");
+    assert_eq!(arr[1].as_str(), "2");
+    assert!(c.cmds(&["CONFIG", "SET", "threads", "2"]).is_ok());
+    let reply = c.cmds(&["CONFIG", "SET", "threads", "4"]);
+    assert!(
+        matches!(&reply, RespValue::Error(e) if e == "ERR CONFIG SET failed (possibly related to \
+            argument 'threads') - can't set immutable config"),
+        "{reply:?}"
+    );
+}
+
+/// `CONFIG SET` with a name and no value to pair with it is a syntax error,
+/// as in Redis 8.10, and not an arity error (#257): `CONFIG SET replicaof
+/// <host> <port>` read as a wrong number of arguments, where Redis says
+/// `ERR syntax error`. `replicaof` as one value is refused as Redis refuses
+/// it: it cannot be set at runtime.
+#[test]
+fn config_set_with_an_unpaired_name_is_a_syntax_error() {
+    let _turn = maxmemory_turn();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for args in [
+        &["CONFIG", "SET", "replicaof", "127.0.0.1", "6390"][..],
+        &["CONFIG", "SET", "maxmemory", "1", "maxmemory-policy"][..],
+    ] {
+        let reply = c.cmds(args);
+        assert!(
+            matches!(&reply, RespValue::Error(e) if e == "ERR syntax error"),
+            "{args:?}: {reply:?}"
+        );
+    }
+    let reply = c.cmds(&["CONFIG", "SET", "replicaof", "127.0.0.1 6390"]);
+    assert!(
+        matches!(&reply, RespValue::Error(e) if e == "ERR CONFIG SET failed (possibly related to \
+            argument 'replicaof') - can't set immutable config"),
+        "{reply:?}"
+    );
+    let reply = c.cmds(&["CONFIG", "SET", "maxmemory"]);
+    assert!(
+        matches!(&reply, RespValue::Error(e)
+            if e == "ERR wrong number of arguments for 'config|set' command"),
+        "{reply:?}"
+    );
+}
+
 #[test]
 fn test_config_rewrite_with_configfile() {
     let port = free_port();
