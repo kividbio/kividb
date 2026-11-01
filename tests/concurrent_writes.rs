@@ -12,6 +12,13 @@
 // `BITFIELD INCRBY`, `SADD` against a `SREM` that removed the set it had
 // just made, the `*STORE` commands, `COPY` without `REPLACE`.
 //
+// A few single-key commands that do all of their reading and writing under
+// one hold of the shard (`SADD`, `HSET`, `ZADD`, `LPUSH`, `INCR`, `SET`,
+// `PFADD`, ...) take that order shared when nothing observes them, so that
+// a hot key is not held to one command at a time; the tests of one key from
+// many clients, and of those commands beside ones that hold the order whole
+// (`SREM`, `HDEL`, `ZREM`, `LPOP`, `SUNIONSTORE`), check that path.
+//
 // A real server process, on the default I/O model (io_uring on Linux), so
 // that the clients' commands run on several threads at once.
 
@@ -49,8 +56,10 @@ impl Conn {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)) {
+                // Long: a debug build, beside the other tests of this file
+                // and every server they start, is slow.
                 stream
-                    .set_read_timeout(Some(Duration::from_secs(60)))
+                    .set_read_timeout(Some(Duration::from_secs(300)))
                     .unwrap();
                 stream.set_nodelay(true).unwrap();
                 let writer = stream.try_clone().unwrap();
@@ -357,16 +366,15 @@ fn sadd_beside_srem_of_another_member_keeps_the_member() {
 
     let mut one = server.conn();
     let missing = (0..KEYS)
-        .filter(|k| {
-            one.cmd(&["SISMEMBER", &format!("set:{k}"), "member"])
-                .i()
-                != 1
-        })
+        .filter(|k| one.cmd(&["SISMEMBER", &format!("set:{k}"), "member"]).i() != 1)
         .count();
     assert_eq!(missing, 0, "{missing} of {KEYS} sets lost their member");
     // And exactly one `SADD` of each key added it.
     let added: i64 = replies.iter().flatten().sum();
-    assert_eq!(added, KEYS as i64, "SADD replied 1 {added} times for {KEYS} keys");
+    assert_eq!(
+        added, KEYS as i64,
+        "SADD replied 1 {added} times for {KEYS} keys"
+    );
 }
 
 /// `BITFIELD ... INCRBY` from fifty clients on one key adds up.
@@ -395,14 +403,18 @@ fn bitfield_incrby_from_fifty_clients_adds_up() {
 /// `SUNIONSTORE acc acc other`, both keys in one shard, beside `SADD`s to
 /// `acc`: every member added is still there. The union read `acc`, a `SADD`
 /// landed, and the union wrote the old `acc` back over it.
+///
+/// Each union copies the whole of `acc`: kept small, so that the test takes
+/// seconds and not minutes (it took 215 s in a release build with 50 000
+/// members, and a debug build's clients gave up waiting).
 #[test]
 fn sunionstore_of_one_shard_beside_sadd_loses_no_member() {
     let server = Server::start();
     let keys = keys_in_shard_of("acc", "union:", 2);
     let (acc, other) = (keys[0].clone(), keys[1].clone());
-    const ADDERS: usize = 25;
-    const STORERS: usize = 25;
-    const EACH: usize = 2000;
+    const ADDERS: usize = 20;
+    const STORERS: usize = 10;
+    const EACH: usize = 400;
 
     let mut one = server.conn();
     one.cmd(&["SADD", &other, "from-other"]);
@@ -448,10 +460,8 @@ fn copy_to_one_destination_from_two_clients_copies_once() {
         let mut replies = Vec::new();
         for chunk in destinations.chunks(BATCH) {
             barrier.wait();
-            let batch: Vec<Vec<String>> = chunk
-                .iter()
-                .map(|d| args(&["COPY", source, d]))
-                .collect();
+            let batch: Vec<Vec<String>> =
+                chunk.iter().map(|d| args(&["COPY", source, d])).collect();
             replies.extend(conn.pipeline(&batch).iter().map(V::i));
         }
         replies
@@ -460,5 +470,265 @@ fn copy_to_one_destination_from_two_clients_copies_once() {
     let both = (0..KEYS)
         .filter(|&k| replies[0][k] + replies[1][k] != 1)
         .count();
-    assert_eq!(both, 0, "{both} of {KEYS} destinations were copied to twice, or never");
+    assert_eq!(
+        both, 0,
+        "{both} of {KEYS} destinations were copied to twice, or never"
+    );
+}
+
+/// Adders run `add` on each key while removers run `remove` of something it
+/// never held, which removes the key once it finds it empty. Whatever order
+/// they ran in, what was added is there afterwards: `holds` answers `1`, or
+/// a score, for every key. The collection a write had just made, still
+/// empty, used to be taken for one emptied, and removed, with the write then
+/// going into a collection no longer in the keyspace.
+fn adds_beside_removes_of_something_else(
+    add: &'static [&'static str],
+    remove: &'static [&'static str],
+    holds: &'static [&'static str],
+) {
+    let server = Server::start();
+    const ADDERS: usize = 10;
+    const REMOVERS: usize = 30;
+    const KEYS: usize = 10_000;
+    const BATCH: usize = 200;
+    let command = |words: &[&str], key: &str| -> Vec<String> {
+        let mut command = vec![words[0].to_string(), key.to_string()];
+        command.extend(words[1..].iter().map(|w| w.to_string()));
+        command
+    };
+
+    at_once(&server, ADDERS + REMOVERS, move |c, conn, barrier| {
+        for start in (0..KEYS).step_by(BATCH) {
+            barrier.wait();
+            let batch: Vec<Vec<String>> = (start..start + BATCH)
+                .map(|k| {
+                    let key = format!("key:{k}");
+                    command(if c < ADDERS { add } else { remove }, &key)
+                })
+                .collect();
+            conn.pipeline(&batch);
+        }
+    });
+
+    let mut one = server.conn();
+    let missing = (0..KEYS)
+        .filter(|k| {
+            let args = command(holds, &format!("key:{k}"));
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            // `1`, or the score.
+            !matches!(one.cmd(&args), V::Int(1) | V::Str(_))
+        })
+        .count();
+    assert_eq!(missing, 0, "{missing} of {KEYS} keys lost what was added");
+}
+
+#[test]
+fn hset_beside_hdel_of_another_field_keeps_the_field() {
+    adds_beside_removes_of_something_else(
+        &["HSET", "field", "value"],
+        &["HDEL", "never"],
+        &["HEXISTS", "field"],
+    );
+}
+
+#[test]
+fn zadd_beside_zrem_of_another_member_keeps_the_member() {
+    adds_beside_removes_of_something_else(
+        &["ZADD", "1", "member"],
+        &["ZREM", "never"],
+        &["ZSCORE", "member"],
+    );
+}
+
+/// Pushes beside pops that empty the list: every element pushed is popped
+/// once or still in the list, and none twice. A push into a list a pop had
+/// just emptied and removed would be lost.
+#[test]
+fn lpush_beside_lpop_that_empties_the_list_loses_nothing() {
+    let server = Server::start();
+    const PUSHERS: usize = 20;
+    const POPPERS: usize = 20;
+    const EACH: usize = 2000;
+
+    let popped = at_once(&server, PUSHERS + POPPERS, |c, conn, _| {
+        let mut popped = Vec::new();
+        for start in (0..EACH).step_by(50) {
+            let batch: Vec<Vec<String>> = (start..start + 50)
+                .map(|i| {
+                    if c < PUSHERS {
+                        args(&["LPUSH", "list", &format!("{c}:{i}")])
+                    } else {
+                        args(&["LPOP", "list"])
+                    }
+                })
+                .collect();
+            let replies = conn.pipeline(&batch);
+            if c >= PUSHERS {
+                popped.extend(replies.into_iter().filter_map(|v| match v {
+                    V::Str(s) => Some(s),
+                    _ => None,
+                }));
+            }
+        }
+        popped
+    });
+
+    let mut one = server.conn();
+    let V::Arr(left) = one.cmd(&["LRANGE", "list", "0", "-1"]) else {
+        panic!("LRANGE");
+    };
+    let mut seen: Vec<String> = popped.into_iter().flatten().collect();
+    seen.extend(left.into_iter().map(|v| match v {
+        V::Str(s) => s,
+        other => panic!("LRANGE element: {other:?}"),
+    }));
+    let all = seen.len();
+    seen.sort();
+    seen.dedup();
+    assert_eq!(
+        all,
+        seen.len(),
+        "{} elements came out twice",
+        all - seen.len()
+    );
+    assert_eq!(seen.len(), PUSHERS * EACH, "elements were lost");
+}
+
+/// Fifty clients on one key at once — the case `write_order` lets such
+/// writes share (`lock_key_shared`): `INCR`, `HINCRBY`, `ZINCRBY` and
+/// `SADD` add up as one client's would.
+#[test]
+fn one_hot_key_of_each_kind_from_fifty_clients_adds_up() {
+    let server = Server::start();
+    const CLIENTS: usize = 50;
+    const EACH: usize = 1000;
+
+    at_once(&server, CLIENTS, |c, conn, _| {
+        for start in (0..EACH).step_by(50) {
+            let batch: Vec<Vec<String>> = (start..start + 50)
+                .flat_map(|i| {
+                    [
+                        args(&["INCR", "counter"]),
+                        args(&["HINCRBY", "hash", "field", "1"]),
+                        args(&["ZINCRBY", "zset", "1", "member"]),
+                        args(&["SADD", "set", &format!("{c}:{i}")]),
+                    ]
+                })
+                .collect();
+            conn.pipeline(&batch);
+        }
+    });
+
+    let total = (CLIENTS * EACH) as i64;
+    let mut one = server.conn();
+    let number = |v: V| match v {
+        V::Str(s) => s.parse::<f64>().unwrap() as i64,
+        V::Int(n) => n,
+        other => panic!("not a number: {other:?}"),
+    };
+    assert_eq!(number(one.cmd(&["GET", "counter"])), total, "INCR");
+    assert_eq!(
+        number(one.cmd(&["HGET", "hash", "field"])),
+        total,
+        "HINCRBY"
+    );
+    assert_eq!(
+        number(one.cmd(&["ZSCORE", "zset", "member"])),
+        total,
+        "ZINCRBY"
+    );
+    assert_eq!(one.cmd(&["SCARD", "set"]).i(), total, "SADD");
+}
+
+/// `SET ... NX` of the same new keys from fifty clients: exactly one of them
+/// sets each key, and the key holds what that one wrote.
+#[test]
+fn set_nx_from_fifty_clients_sets_each_key_once() {
+    let server = Server::start();
+    const CLIENTS: usize = 50;
+    const KEYS: usize = 2000;
+    const BATCH: usize = 100;
+
+    let replies = at_once(&server, CLIENTS, |c, conn, barrier| {
+        let mut set = Vec::new();
+        for start in (0..KEYS).step_by(BATCH) {
+            barrier.wait();
+            let batch: Vec<Vec<String>> = (start..start + BATCH)
+                .map(|k| args(&["SET", &format!("nx:{k}"), &c.to_string(), "NX"]))
+                .collect();
+            set.extend(
+                conn.pipeline(&batch)
+                    .into_iter()
+                    .map(|v| v == V::Str("OK".into())),
+            );
+        }
+        set
+    });
+
+    // Who set each key.
+    let mut winners = vec![Vec::new(); KEYS];
+    for (c, set) in replies.iter().enumerate() {
+        for (k, &won) in set.iter().enumerate() {
+            if won {
+                winners[k].push(c);
+            }
+        }
+    }
+    let mut one = server.conn();
+    for (k, winners) in winners.iter().enumerate() {
+        assert_eq!(winners.len(), 1, "nx:{k} was set by {winners:?}");
+        let value = one.cmd(&["GET", &format!("nx:{k}")]);
+        assert_eq!(value, V::Str(winners[0].to_string()), "nx:{k}");
+    }
+}
+
+/// `HSET` of a new field beside the field-expiry sweep that empties the hash
+/// of its one field with a time and removes it: the new field is there
+/// afterwards. The sweep holds the hash's order whole, and `HSET` holds the
+/// hash's shard while it writes the field.
+///
+/// A guard more than a reproduction: the window is a few instructions wide,
+/// and the sweep comes once every tenth of a second.
+#[test]
+fn hset_beside_the_field_expiry_sweep_keeps_the_new_field() {
+    let server = Server::start();
+    const CLIENTS: usize = 20;
+    const KEYS: usize = 2000;
+    const ROUNDS: usize = 3;
+
+    let mut one = server.conn();
+    for round in 0..ROUNDS {
+        let key = move |k: usize| format!("fields:{round}:{k}");
+        let batch: Vec<Vec<String>> = (0..KEYS)
+            .flat_map(|k| {
+                [
+                    args(&["HSET", &key(k), "old", "v"]),
+                    args(&["HPEXPIRE", &key(k), "50", "FIELDS", "1", "old"]),
+                ]
+            })
+            .collect();
+        one.pipeline(&batch);
+        // Due in 50 ms, and swept within a tenth of a second of that: the
+        // new fields are written from just before until well after.
+        std::thread::sleep(Duration::from_millis(45));
+        at_once(&server, CLIENTS, move |c, conn, _| {
+            let started = Instant::now();
+            let mut k = c;
+            while started.elapsed() < Duration::from_millis(250) {
+                let batch: Vec<Vec<String>> = (0..50)
+                    .map(|i| args(&["HSET", &key((k + i * CLIENTS) % KEYS), "new", "v"]))
+                    .collect();
+                conn.pipeline(&batch);
+                k += 50 * CLIENTS;
+            }
+        });
+        let missing = (0..KEYS)
+            .filter(|&k| one.cmd(&["HEXISTS", &key(k), "new"]).i() != 1)
+            .count();
+        assert_eq!(
+            missing, 0,
+            "round {round}: {missing} of {KEYS} hashes lost the new field"
+        );
+    }
 }

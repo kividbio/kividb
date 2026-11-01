@@ -1159,6 +1159,15 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         // No other command is running: there is nothing to be ordered
         // against, and the writes made from inside this one take nothing.
         Some(crate::write_order::held_exclusively())
+    } else if ordered && !replication::write_is_observed(ctx) && atomic_under_its_shard(ctx, name) {
+        // Its key's order shared, beside the writes like it, which the shard
+        // orders (see `write_order::lock_key_shared`). Not while anything
+        // reads the write stream: the stream carries the writes to a key in
+        // the order they take this lock whole.
+        Some(crate::write_order::lock_key_shared(
+            *ctx.selected_db,
+            ctx.cmd[1],
+        ))
     } else if ordered {
         let keys = crate::keyspec::key_positions(name, &ctx.cmd);
         let here = *ctx.selected_db;
@@ -1443,6 +1452,55 @@ fn notify_watchers(ctx: &Ctx, name: &str) {
         {
             ctx.watch_registry.notify(db, key);
         }
+    }
+}
+
+/// Whether the command is one that reads and writes its one key, `cmd[1]`,
+/// under one hold of the key's shard lock: two of them on the key run one
+/// before the other with nothing more, and while nothing reads the write
+/// stream each takes its key's order shared (`write_order::lock_key_shared`).
+///
+/// Each was looked at for it, and is kept so (#271):
+///
+/// * `INCR` and the like: found, worked out and written under the shard's
+///   write lock.
+/// * `SET`, with any of its options: its condition (`NX`, `XX`, `IFEQ`,
+///   ...), the old value for `GET` and the write, under the shard's write
+///   lock. A document it writes over leaves its indexes after the shard is
+///   let go of; every command that writes a document holds the order whole,
+///   and so waits for that.
+/// * `LPUSH`, `RPUSH`: the list found or made, and pushed to, under the
+///   shard's write lock.
+/// * `SADD`, `ZADD`, `ZINCRBY`, `HSET`, `HMSET`, `HSETNX`, `HINCRBY`,
+///   `HINCRBYFLOAT`: the collection written with the shard held, for reading
+///   when it is there (so that nothing can take it out of the keyspace
+///   meanwhile), for writing when it is made — and made with what goes into
+///   it, never empty.
+/// * `PFADD`: the registers looked at under the shard's read lock; when one
+///   is to change, the new value is made from them and put in their place
+///   under the write lock only if they are still what is there, else made
+///   again under it.
+///
+/// The hash commands only while no search index is defined: they bring the
+/// indexes up to date after the shard is let go of, and two of them beside
+/// each other could leave an index with the earlier one's fields.
+///
+/// Never a command that removes what it finds (`SREM`, `HDEL`, `LPOP`, ...)
+/// or writes back what it read under an earlier hold of the shard
+/// (`SUNIONSTORE`, `BITFIELD`, `APPEND`, ...): those hold the order whole,
+/// and these wait for them.
+#[inline]
+fn atomic_under_its_shard(ctx: &Ctx, name: &str) -> bool {
+    if ctx.cmd.len() < 2 {
+        return false;
+    }
+    match name {
+        "SET" | "INCR" | "DECR" | "INCRBY" | "DECRBY" | "INCRBYFLOAT" | "LPUSH" | "RPUSH"
+        | "SADD" | "ZADD" | "ZINCRBY" | "PFADD" => true,
+        "HSET" | "HMSET" | "HSETNX" | "HINCRBY" | "HINCRBYFLOAT" => {
+            ctx.index_store.read().is_empty()
+        }
+        _ => false,
     }
 }
 

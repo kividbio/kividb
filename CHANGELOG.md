@@ -135,7 +135,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   holds the order of its keys, as it already did with the AOF on or a
   replica attached; so do the active and lazy expiry of keys, eviction and
   the expiry of hash fields. It still propagates nothing unless something
-  is listening.
+  is listening. `SET`, `INCR` and the like, `LPUSH`/`RPUSH`, `SADD`, `ZADD`,
+  `ZINCRBY`, `PFADD` and (with no search index defined) `HSET`, `HMSET`,
+  `HSETNX`, `HINCRBY` and `HINCRBYFLOAT` read and write their one key under
+  one hold of its shard's lock, and take its order shared while nothing is
+  listening, so one hot key still takes as many of them a second as before;
+  `SADD`, `HSET`, `ZADD` and their kin now write the collection with its
+  shard held, and make a new one with its members rather than empty, and
+  `PFADD` writes its registers back only over the value it read them from.
 - **A replica no longer keeps a key its master deleted at an `EXPIRE` or
   `PEXPIRE`.** `PEXPIRE k 1` read the clock twice, for the key's new time
   and to see whether that time had already come, and about once in 650

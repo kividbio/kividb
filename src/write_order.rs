@@ -34,15 +34,28 @@
 // back under another, and two of them at once lost elements (#271). Holding
 // the order of a key says nothing about propagating the write: whether
 // anything is listening decides that, separately (`write_is_observed`).
+//
+// A few commands need less: they do the whole of their reading and writing
+// of their one key under one hold of its shard's lock, so two of them on one
+// key already run one before the other (`SADD`, `HSET`, `LPUSH`, `INCR`,
+// `PFADD`, ...; see `handler::atomic_under_its_shard`). While nothing is
+// listening, such a write takes its key's stripe *shared*
+// ([`lock_key_shared`]): beside the others like it, which the shard orders,
+// and never beside a write that holds the stripe whole — every other write,
+// an expiry, an eviction, the field-expiry sweep. Holding one lock whole for
+// the whole of every command on a hot key halved what one key could take
+// (`SADD` 645k a second to 339k, 12 threads): the commands queued for it,
+// one at a time, where the shard had let them overlap but for the moment
+// each changes the value.
 
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::cell::Cell;
 use std::marker::PhantomData;
 
 /// A power of two. Large enough that unrelated keys rarely share a stripe.
 const STRIPES: usize = 4096;
 
-static STRIPE: [Mutex<()>; STRIPES] = [const { parking_lot::const_mutex(()) }; STRIPES];
+static STRIPE: [RwLock<()>; STRIPES] = [const { parking_lot::const_rwlock(()) }; STRIPES];
 
 /// [`HELD`]: no guard on this thread.
 const FREE: u8 = 0;
@@ -66,12 +79,28 @@ thread_local! {
 pub struct OrderGuard {
     /// The stripe of a single-key write — nearly all of them — held without
     /// allocating.
-    _one: Option<MutexGuard<'static, ()>>,
-    _stripes: Vec<MutexGuard<'static, ()>>,
+    _one: Option<RwLockWriteGuard<'static, ()>>,
+    /// Or held shared, by a write that only has to keep the others out
+    /// ([`lock_key_shared`]).
+    _shared: Option<RwLockReadGuard<'static, ()>>,
+    _stripes: Vec<RwLockWriteGuard<'static, ()>>,
     /// Whether this guard is the one that set [`HELD`].
     outermost: bool,
     /// Tied to the thread that took it.
     _not_send: PhantomData<*const ()>,
+}
+
+impl OrderGuard {
+    /// A guard that holds no stripe.
+    fn holding_none(outermost: bool) -> Self {
+        OrderGuard {
+            _one: None,
+            _shared: None,
+            _stripes: Vec::new(),
+            outermost,
+            _not_send: PhantomData,
+        }
+    }
 }
 
 impl Drop for OrderGuard {
@@ -103,26 +132,37 @@ pub fn lock_keys<'a>(db: usize, keys: impl Iterator<Item = &'a [u8]>) -> OrderGu
         NO_STRIPE
     };
     HELD.with(|h| h.set(held));
-    let (one, stripes) = match (first, keys.next()) {
-        (None, _) => (None, Vec::new()),
-        (Some(only), None) => (Some(STRIPE[only].lock()), Vec::new()),
+    let mut guard = OrderGuard::holding_none(true);
+    match (first, keys.next()) {
+        (None, _) => {}
+        (Some(only), None) => guard._one = Some(STRIPE[only].write()),
         (Some(first), Some(second)) => {
             let mut stripes: Vec<usize> = vec![first, stripe_of(db, second)];
             stripes.extend(keys.map(|key| stripe_of(db, key)));
             stripes.sort_unstable();
             stripes.dedup();
-            (
-                None,
-                stripes.into_iter().map(|i| STRIPE[i].lock()).collect(),
-            )
+            guard._stripes = stripes.into_iter().map(|i| STRIPE[i].write()).collect();
         }
-    };
-    OrderGuard {
-        _one: one,
-        _stripes: stripes,
-        outermost: true,
-        _not_send: PhantomData,
     }
+    guard
+}
+
+/// The order lock of `key`, in database `db`, held shared: for a write that
+/// nothing listens to, by a command that reads and writes its one key under
+/// one hold of the key's shard lock, so that two such writes of the key are
+/// ordered by the shard already (see the module). It waits for, and keeps
+/// out, every write that holds the key's order whole ([`lock_keys`]): one
+/// that reads the key under one hold of the shard and writes it under
+/// another (`SUNIONSTORE`, `BITFIELD`), one that may empty it (`SREM`), an
+/// expiry, an eviction. Nested, it takes nothing, as [`lock_keys`] does.
+pub fn lock_key_shared(db: usize, key: &[u8]) -> OrderGuard {
+    if HELD.with(|h| h.get()) != FREE {
+        return nested();
+    }
+    HELD.with(|h| h.set(STRIPES_HELD));
+    let mut guard = OrderGuard::holding_none(true);
+    guard._shared = Some(STRIPE[stripe_of(db, key)].read());
+    guard
 }
 
 /// [`lock_keys`] for keys of several databases, each `(db, key)`: for a
@@ -145,12 +185,9 @@ pub fn lock_keys_in<'a>(keys: impl Iterator<Item = (usize, &'a [u8])>) -> OrderG
         STRIPES_HELD
     };
     HELD.with(|h| h.set(held));
-    OrderGuard {
-        _one: None,
-        _stripes: stripes.into_iter().map(|i| STRIPE[i].lock()).collect(),
-        outermost: true,
-        _not_send: PhantomData,
-    }
+    let mut guard = OrderGuard::holding_none(true);
+    guard._stripes = stripes.into_iter().map(|i| STRIPE[i].write()).collect();
+    guard
 }
 
 /// Mark this thread as ordered without taking any stripe — for a write that
@@ -164,12 +201,7 @@ pub fn held_exclusively() -> OrderGuard {
         }
         free
     });
-    OrderGuard {
-        _one: None,
-        _stripes: Vec::new(),
-        outermost,
-        _not_send: PhantomData,
-    }
+    OrderGuard::holding_none(outermost)
 }
 
 /// The order of one key, for a walk over many keys (the backfill of a
@@ -187,24 +219,18 @@ pub fn held_exclusively() -> OrderGuard {
 pub fn lock_key_for_walk(db: usize, key: &[u8]) -> OrderGuard {
     match HELD.with(|h| h.get()) {
         FREE => lock_keys(db, std::iter::once(key)),
-        NO_STRIPE => OrderGuard {
-            _one: Some(STRIPE[stripe_of(db, key)].lock()),
-            _stripes: Vec::new(),
-            outermost: false,
-            _not_send: PhantomData,
-        },
+        NO_STRIPE => {
+            let mut guard = OrderGuard::holding_none(false);
+            guard._one = Some(STRIPE[stripe_of(db, key)].write());
+            guard
+        }
         _ => nested(),
     }
 }
 
 /// The guard of a write made from inside another: it takes nothing.
 fn nested() -> OrderGuard {
-    OrderGuard {
-        _one: None,
-        _stripes: Vec::new(),
-        outermost: false,
-        _not_send: PhantomData,
-    }
+    OrderGuard::holding_none(false)
 }
 
 #[cfg(test)]
@@ -228,6 +254,67 @@ mod tests {
         drop(guard);
         other.join().unwrap();
         assert!(entered.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn shared_holds_of_one_key_overlap() {
+        let guard = lock_key_shared(0, b"s");
+        std::thread::spawn(|| {
+            let _guard = lock_key_shared(0, b"s");
+        })
+        .join()
+        .unwrap();
+        drop(guard);
+    }
+
+    #[test]
+    fn a_shared_hold_and_a_whole_one_take_turns() {
+        // The whole hold waits for the shared one.
+        let shared = lock_key_shared(0, b"t");
+        let entered = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&entered);
+        let whole = std::thread::spawn(move || {
+            let _guard = lock_keys(0, [b"t".as_slice()].into_iter());
+            flag.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!entered.load(Ordering::SeqCst), "the whole hold got in");
+        drop(shared);
+        whole.join().unwrap();
+        assert!(entered.load(Ordering::SeqCst));
+
+        // And the shared one for the whole one.
+        let whole = lock_keys(0, [b"u".as_slice(), b"t".as_slice()].into_iter());
+        let entered = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&entered);
+        let shared = std::thread::spawn(move || {
+            let _guard = lock_key_shared(0, b"t");
+            flag.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!entered.load(Ordering::SeqCst), "the shared hold got in");
+        drop(whole);
+        shared.join().unwrap();
+        assert!(entered.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_shared_hold_nested_in_a_whole_one_takes_nothing() {
+        let outer = lock_keys(0, [b"v".as_slice()].into_iter());
+        // On this thread: it would wait for itself if it took the stripe.
+        let inner = lock_key_shared(0, b"v");
+        drop(inner);
+        assert_eq!(HELD.with(|h| h.get()), STRIPES_HELD);
+        drop(outer);
+        assert_eq!(HELD.with(|h| h.get()), FREE);
+        let shared = lock_key_shared(0, b"v");
+        assert_eq!(HELD.with(|h| h.get()), STRIPES_HELD);
+        let inner = lock_keys(0, [b"v".as_slice()].into_iter());
+        drop(inner);
+        // Nor does a walk's hold: the key's stripe may be the one held.
+        drop(lock_key_for_walk(0, b"v"));
+        drop(shared);
+        assert_eq!(HELD.with(|h| h.get()), FREE);
     }
 
     #[test]

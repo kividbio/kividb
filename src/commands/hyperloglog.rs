@@ -560,22 +560,6 @@ fn get_optional_hll(ctx: &Ctx, key: &str) -> Result<Option<SharedBytes>, Vec<u8>
     }
 }
 
-/// The raw bytes of an HLL, or an empty blob in the configured write format.
-///
-/// The bytes are not classified here: every caller needs the format anyway,
-/// and classifying an ambiguous 12304-byte sparse value walks its body, so
-/// doing it once is the point.
-fn get_or_create_hll(ctx: &mut Ctx, key: &str, write_redis: bool) -> Result<SharedBytes, Vec<u8>> {
-    let db = &ctx.store[*ctx.selected_db];
-    let shard = store::get_shard(db, key);
-    let map = read_lock!(shard);
-    match map.get(key) {
-        Some(ValueRef::String(b)) => Ok(b.to_shared()),
-        None => Ok(make_empty_hll_shared(write_redis)),
-        _ => Err(wrongtype()),
-    }
-}
-
 fn classify_for_reply(blob: &[u8]) -> Result<HllFormat, Vec<u8>> {
     classify_hll(blob).map_err(hll_error)
 }
@@ -602,60 +586,117 @@ fn cmd_pfadd(ctx: &mut Ctx) -> Vec<u8> {
     delete_expired_key(ctx, &key);
 
     let write_redis = ctx.repl_state.hll_write_redis();
+    let elements = &cmd[2..];
+    let db = &ctx.store[*ctx.selected_db];
+    let shard = store::get_shard(db, &key);
 
-    // If no elements are given, create the key if it is missing and otherwise
-    // just check that it is an HLL.
-    if cmd.len() == 2 {
-        let db = &ctx.store[*ctx.selected_db];
-        let shard = store::get_shard(db, &key);
-        let exists = read_lock!(shard).contains_key(key.as_str());
-        if exists {
-            return match get_hll_blob(ctx, &key)
-                .and_then(|blob| classify_for_reply(blob.as_slice()))
-            {
+    // If no elements are given, the key is made if it is missing, and
+    // otherwise only checked to be an HLL.
+    if elements.is_empty() {
+        let mut map = write_lock!(shard);
+        return match map.get(&key) {
+            Some(ValueRef::String(blob)) => match classify_for_reply(&blob) {
                 Ok(_) => resp_integer(0),
                 Err(e) => e,
-            };
-        }
-        save_hll(ctx, &key, make_empty_hll_shared(write_redis));
-        return resp_integer(1);
+            },
+            Some(_) => wrongtype(),
+            None => {
+                let empty = make_empty_hll_shared(write_redis);
+                map.insert(Key::from(key.as_str()), KiviDBValue::String(empty));
+                resp_integer(1)
+            }
+        };
     }
 
-    let blob = match get_or_create_hll(ctx, &key, write_redis) {
-        Ok(b) => b,
-        Err(e) => return e,
+    // The registers are written back only over the very value they were
+    // read from. Read under one hold of the shard's lock and written under
+    // another, two `PFADD`s at once each wrote back the registers it had
+    // read with only its own elements in them, and the other's were lost
+    // (#271).
+    //
+    // The value is looked at, and the new one made, with no lock held: the
+    // shard's read lock is kept only to take a hold on the value, and its
+    // write lock only to see that the value is still that one and to put the
+    // new one in its place. Telling a legacy dense HLL from a sparse one
+    // walks its 12 KB, and making the new value copies them; done under the
+    // write lock, `PFADD` to 100 000 small HLLs, nearly every one of which
+    // changes a register, ran 8% slower. Once an HLL has seen most of what it
+    // is given, nearly every `PFADD` changes no register, and takes no write
+    // lock.
+    let seen = match read_lock!(shard).get(&key) {
+        Some(ValueRef::String(blob)) => Some(blob.to_shared()),
+        Some(_) => return wrongtype(),
+        None => None,
     };
-    let format = match classify_for_reply(blob.as_slice()) {
-        Ok(format) => format,
-        Err(e) => return e,
+    let empty;
+    let from = match &seen {
+        Some(seen) => seen,
+        None => {
+            empty = make_empty_hll_shared(write_redis);
+            &empty
+        }
     };
-    let legacy = format == HllFormat::LegacyDense;
-    let registers = match hll_registers(blob.as_slice(), format) {
-        Ok(registers) => registers,
+    let updated = match pfadd_registers(from.as_slice(), elements) {
+        Ok(Some(updated)) => updated,
+        Ok(None) => return resp_integer(0),
         Err(e) => return e,
     };
 
-    if !cmd[2..]
+    let mut map = write_lock!(shard);
+    let unchanged = match (map.get(&key), &seen) {
+        (Some(ValueRef::String(now)), Some(seen)) => {
+            now.is(seen) || now.as_bytes() == seen.as_slice()
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    let updated = if unchanged {
+        updated
+    } else {
+        // Written meanwhile: made again, from what is there now.
+        let now = match map.get(&key) {
+            Some(ValueRef::String(blob)) => blob.to_shared(),
+            Some(_) => return wrongtype(),
+            None => make_empty_hll_shared(write_redis),
+        };
+        match pfadd_registers(now.as_slice(), elements) {
+            Ok(Some(updated)) => updated,
+            Ok(None) => return resp_integer(0),
+            Err(e) => return e,
+        }
+    };
+    let replaced = map.insert(Key::from(key.as_str()), KiviDBValue::String(updated));
+    drop(map);
+    // What was there is freed with the shard let go of.
+    drop(replaced);
+    resp_integer(1)
+}
+
+/// The HLL `blob` with `elements` added, written dense: `None` when no
+/// register would change, `Err` the reply when `blob` is no HLL.
+fn pfadd_registers(blob: &[u8], elements: &[&[u8]]) -> Result<Option<SharedBytes>, Vec<u8>> {
+    let format = classify_for_reply(blob)?;
+    let legacy = format == HllFormat::LegacyDense;
+    let registers = hll_registers(blob, format)?;
+    if !elements
         .iter()
         .any(|element| hll_would_change(registers.as_slice(), element, legacy))
     {
-        return resp_integer(0);
+        return Ok(None);
     }
-
     let encoding = if legacy {
         HLL_LEGACY_ENCODING
     } else {
         HLL_DENSE_ENCODING
     };
-    let header = dense_header(&blob, encoding, true);
+    let header = dense_header(blob, encoding, true);
     let updated = SharedBytes::concat_with_mutation(&[&header, registers.as_slice()], |bytes| {
         let registers = &mut bytes[HLL_HEADER_SIZE..];
-        for element in &cmd[2..] {
+        for element in elements {
             hll_add(registers, element, legacy);
         }
     });
-    save_hll(ctx, &key, updated);
-    resp_integer(1)
+    Ok(Some(updated))
 }
 
 // ── PFCOUNT ───────────────────────────────────────────────────────────────────
