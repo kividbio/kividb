@@ -339,6 +339,61 @@ fn a_write_over_an_expired_key_counts_and_announces_it() {
     );
     assert_eq!(next_event(&mut sub, Duration::from_millis(200)), None);
     assert_eq!(expired_keys(&mut c) - before, 1);
+    drop(sub);
+
+    // Many keys past their time, written while the sweep takes them:
+    // whichever gets to a key first, its `expired` comes before the write's
+    // own event. The sweep announced a key once it had let its shard go,
+    // and an INCR that came in between, and made the key again, was now and
+    // then announced first.
+    c.ok(&["SELECT", "0"]);
+    c.ok(&["CONFIG", "SET", "notify-keyspace-events", "Ex$"]);
+    let mut sub = Conn::connect(port);
+    sub.cmd(&["PSUBSCRIBE", "__keyevent@0__:*"]);
+    let pipeline = |c: &mut Conn, commands: &[Vec<&str>]| -> Vec<V> {
+        let mut buf = Vec::new();
+        for args in commands {
+            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            for arg in args {
+                buf.extend_from_slice(format!("${}\r\n{arg}\r\n", arg.len()).as_bytes());
+            }
+        }
+        c.stream.write_all(&buf).unwrap();
+        commands.iter().map(|_| c.read()).collect()
+    };
+    for round in 0..20u64 {
+        let keys: Vec<String> = (0..500).map(|i| format!("race:{round}:{i}")).collect();
+        let sets: Vec<Vec<&str>> = keys
+            .iter()
+            .map(|k| vec!["SET", k.as_str(), "1", "PX", "20"])
+            .collect();
+        assert!(
+            pipeline(&mut c, &sets)
+                .iter()
+                .all(|r| *r == V::Simple("OK".into()))
+        );
+        thread::sleep(Duration::from_millis(25 + round * 7 % 100));
+        let incrs: Vec<Vec<&str>> = keys.iter().map(|k| vec!["INCR", k.as_str()]).collect();
+        assert!(pipeline(&mut c, &incrs).iter().all(|r| *r == V::Int(1)));
+        let mut seen: std::collections::HashMap<String, Vec<String>> = Default::default();
+        let mut incremented = 0;
+        while incremented < keys.len() {
+            let (channel, key) = next_event(&mut sub, Duration::from_secs(5))
+                .unwrap_or_else(|| panic!("round {round}: {incremented} incrby seen"));
+            let event = channel.rsplit(':').next().unwrap().to_string();
+            if event == "incrby" {
+                incremented += 1;
+            }
+            seen.entry(key).or_default().push(event);
+        }
+        for key in &keys {
+            assert_eq!(
+                seen.get(key).map(Vec::as_slice),
+                Some(&["set".to_string(), "expired".into(), "incrby".into()][..]),
+                "round {round}: {key}"
+            );
+        }
+    }
 }
 
 /// The next `pmessage`'s channel and message, if one comes within `wait`.

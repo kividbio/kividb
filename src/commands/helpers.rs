@@ -493,6 +493,9 @@ fn expire_batch(
         if !crate::expiry::loading() {
             for key in batch.iter().copied() {
                 if let Some(value) = values.remove_if_due(key.as_str(), now) {
+                    // Announced before the shard is let go of (see
+                    // `delete_key_if_expired`).
+                    crate::keyspace_events::notify_expired(store, db, key);
                     freed.push(value);
                     gone.push(key);
                 }
@@ -509,7 +512,6 @@ fn expire_batch(
     for key in gone {
         crate::stats::record_expired();
         crate::stats::EXPIRED_KEYS_ACTIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        crate::keyspace_events::notify_expired(store, db, key);
         crate::watch::expired(store, db, key);
         crate::tracking::expired(store, key);
         crate::vector::maybe_unindex(index_store, db, key);
@@ -802,7 +804,19 @@ pub fn delete_key_if_expired(store: &Store, db: usize, key: &str) -> bool {
     let ordered = told
         .as_ref()
         .map(|_| crate::expiry::order(db, std::iter::once(key.as_bytes())));
-    let removed = write_lock!(shard).remove_if_due(key, now_ms());
+    // `expired` is announced before the shard is let go of: a command that
+    // then finds the key gone, and writes it anew, announces its own event
+    // after it, as in Redis. Announced once the lock was let go of, the
+    // `expired` of a key the sweep took could come after the `incrby` of an
+    // INCR that came in between and made the key again.
+    let removed = {
+        let mut map = write_lock!(shard);
+        let removed = map.remove_if_due(key, now_ms());
+        if removed.is_some() {
+            crate::keyspace_events::notify_expired(store, db, key);
+        }
+        removed
+    };
     let gone = removed.is_some();
     if gone && let Some(told) = &told {
         told.propagate(db, [key]);
@@ -811,7 +825,6 @@ pub fn delete_key_if_expired(store: &Store, db: usize, key: &str) -> bool {
     drop(removed);
     if gone {
         crate::stats::record_expired();
-        crate::keyspace_events::notify_expired(store, db, key);
         crate::watch::expired(store, db, key);
         crate::tracking::expired(store, key);
         // Out of its indexes too: it used to stay in the graph, and be

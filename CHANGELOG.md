@@ -44,6 +44,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`expired` comes before the event of a write that makes the key
+  again.** When the background sweep, or another client's read, deleted a
+  key past its time, its `expired` notification was published after the
+  key's shard was let go of. A write that came in between and made the key
+  anew (`INCR` on a counter whose window ran out, say) could have its own
+  event (`incrby`) published first, which Redis never does. `expired` is now
+  published before the shard is let go of.
+
 - **A key past its time is not counted as used.** Under an LRU or LFU
   policy, `MGET`, a `GET` on a replica, a command refused with an error,
   a key a command names twice, and a script's commands could bring the
