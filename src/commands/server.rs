@@ -1539,6 +1539,9 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
         ("logfile", ctx.config.logfile.clone()),
         ("log-format", ctx.config.log_format.clone()),
         ("databases", ctx.config.databases.to_string()),
+        // As given with `--threads` (0: one per core), the value `CONFIG
+        // REWRITE` keeps, not the count it resolved to on this machine.
+        ("threads", ctx.config.threads.to_string()),
         // The value in force, not the one the server started with.
         (
             "maxmemory",
@@ -4388,10 +4391,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
                 "SET" => {
                     // CONFIG SET parameter value [parameter value ...]
-                    if cmd.len() < 4 || !cmd.len().is_multiple_of(2) {
+                    if cmd.len() < 4 {
                         return Some(resp_error(
                             "ERR wrong number of arguments for 'config|set' command",
                         ));
+                    }
+                    // A name with no value to pair with it is Redis's syntax
+                    // error, not an arity one: `CONFIG SET replicaof <host>
+                    // <port>` gets the same reply as from Redis 8.10.
+                    if !cmd.len().is_multiple_of(2) {
+                        return Some(resp_error("ERR syntax error"));
                     }
                     let mut settings: Vec<(String, String)> = cmd[2..]
                         .chunks(2)

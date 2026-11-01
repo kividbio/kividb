@@ -36,6 +36,8 @@ import time
 import pytest
 import redis
 
+from utils.helpers import free_port as _free_port
+
 # ── Binary / path resolution (same pattern as test_persistence.py) ─────────────
 
 _here = os.path.dirname(os.path.abspath(__file__))
@@ -47,18 +49,39 @@ _IS_REDIS = any(name in os.path.basename(KIVI_BINARY)
 
 # ── Low-level helpers ──────────────────────────────────────────────────────────
 
-def _free_port() -> int:
-    """Return an OS-assigned free TCP port."""
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+# Every server this module started and has not stopped, by port: what a
+# failure report reads the logs of, and what `teardown_module` stops when a
+# failed `setup_class` left its servers running (pytest skips the class's
+# teardown then).
+_RUNNING: dict[int, tuple[subprocess.Popen, str]] = {}
+
+_LOG_NAME = "server.log"
+
+
+def _read_tail(workdir: str, lines: int = 40) -> str:
+    try:
+        with open(os.path.join(workdir, _LOG_NAME), errors="replace") as f:
+            return "".join(f.readlines()[-lines:]) or "(empty)"
+    except OSError as exc:
+        return f"(log unreadable: {exc})"
+
+
+def _log_tail(port: int) -> str:
+    entry = _RUNNING.get(port)
+    if entry is None:
+        return "(no log: not a server this module started)"
+    return _read_tail(entry[1])
 
 
 def _start(port: int, extra: list[str] = ()) -> tuple[subprocess.Popen, str]:
     """
-    Start the server on *port* inside a fresh temp directory.
-    Returns (proc, workdir).  The caller must pass workdir to _stop() so
-    the directory is cleaned up after the server exits.
+    Start the server on *port* inside a fresh temp directory, logging to
+    server.log there. Returns (proc, workdir).  The caller must pass workdir
+    to _stop() so the directory is cleaned up after the server exits.
+
+    Fails unless the server that answers on *port* is the process just
+    started: one that could not bind would otherwise leave the test talking
+    to whatever else is listening there (#262).
     """
     workdir = tempfile.mkdtemp(prefix="kivirep_")
     if _IS_REDIS:
@@ -73,21 +96,39 @@ def _start(port: int, extra: list[str] = ()) -> tuple[subprocess.Popen, str]:
             *extra,
         ]
     else:
-        cmd = [KIVI_BINARY, "--port", str(port), "--loglevel", "error",
+        # Notice level: the replication log lines are what a failed sync
+        # wait reports.
+        cmd = [KIVI_BINARY, "--port", str(port), "--loglevel", "notice",
                "--io-model", "tokio", *extra]
-    proc = subprocess.Popen(
-        cmd,
-        cwd=workdir,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    with open(os.path.join(workdir, _LOG_NAME), "wb") as log:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=workdir,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+
+    def give_up(why: str):
+        tail = _read_tail(workdir)
+        proc.kill()
+        proc.wait(timeout=5)
+        shutil.rmtree(workdir, ignore_errors=True)
+        pytest.fail(f"Server on port {port} {why}\n--- its log ---\n{tail}")
+
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            give_up(f"exited with code {proc.returncode} before it was ready")
         try:
             c = redis.Redis(host="127.0.0.1", port=port,
                             socket_connect_timeout=0.5, socket_timeout=1)
             c.dbsize()  # raises BusyLoadingError during dataset load
+            pid = c.info("server").get("process_id")
             c.close()
+            if pid is not None and int(pid) != proc.pid:
+                give_up(f"is answered by another process (pid {pid}), not the "
+                        f"server just started (pid {proc.pid})")
+            _RUNNING[port] = (proc, workdir)
             return proc, workdir
         except redis.exceptions.BusyLoadingError:
             time.sleep(0.1)
@@ -95,13 +136,12 @@ def _start(port: int, extra: list[str] = ()) -> tuple[subprocess.Popen, str]:
             time.sleep(0.05)
         except Exception:
             time.sleep(0.05)
-    proc.terminate()
-    shutil.rmtree(workdir, ignore_errors=True)
-    pytest.fail(f"Server on port {port} did not start within 30 s")
+    give_up("did not start within 30 s")
 
 
 def _stop(proc: subprocess.Popen, port: int, workdir: str = ""):
     """Terminate a server, wait until its port is gone, then remove its data dir."""
+    _RUNNING.pop(port, None)
     proc.terminate()
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
@@ -121,24 +161,55 @@ def _client(port: int, **kw) -> redis.Redis:
     )
 
 
-def _wait_sync(replica: redis.Redis, timeout: float = 10.0) -> bool:
+def teardown_module(module):
+    """Stop what a failed setup left running: pytest skips teardown_class
+    when setup_class fails, and the servers would outlive the run."""
+    for port, (proc, workdir) in list(_RUNNING.items()):
+        _stop(proc, port, workdir)
+
+
+# A full sync of an empty dataset takes milliseconds; the bound is for a
+# runner that is busy with everything else.
+SYNC_TIMEOUT = 30.0
+
+
+def _require_sync(replica: redis.Redis, primary_port: int,
+                  timeout: float = SYNC_TIMEOUT):
     """
-    Poll until the replica reports master_link_status=up and is not
-    in the middle of a bulk sync.  Returns True on success.
+    Poll the replica's INFO replication until it follows *primary_port*, its
+    link is up and no bulk sync is in progress. Fails the test otherwise, with
+    what both sides report and the end of both logs.
     """
     deadline = time.monotonic() + timeout
+    info: dict | str = {}
     while time.monotonic() < deadline:
         try:
             info = replica.info("replication")
             if (
                 info.get("master_link_status") == "up"
                 and not info.get("master_sync_in_progress", 0)
+                and int(info.get("master_port", primary_port)) == primary_port
             ):
-                return True
-        except redis.RedisError:
-            pass
+                return
+        except redis.RedisError as exc:
+            info = f"INFO replication failed: {exc!r}"
         time.sleep(0.1)
-    return False
+
+    replica_port = replica.connection_pool.connection_kwargs["port"]
+    try:
+        with redis.Redis(host="127.0.0.1", port=primary_port, socket_timeout=2,
+                         decode_responses=True) as primary:
+            primary_info = primary.info("replication")
+    except redis.RedisError as exc:
+        primary_info = f"INFO replication failed: {exc!r}"
+    pytest.fail(
+        f"Replica on port {replica_port} did not finish syncing with the primary "
+        f"on port {primary_port} within {timeout:.0f} s\n"
+        f"replica INFO replication: {info}\n"
+        f"primary INFO replication: {primary_info}\n"
+        f"--- replica log ---\n{_log_tail(replica_port)}\n"
+        f"--- primary log ---\n{_log_tail(primary_port)}"
+    )
 
 
 def _wait_replica_count(primary: redis.Redis, n: int, timeout: float = 8.0) -> bool:
@@ -179,8 +250,7 @@ def _replicaof(replica: redis.Redis, primary_port: int):
         replica.execute_command("REPLICAOF", "127.0.0.1", str(primary_port))
     except redis.ResponseError as exc:
         pytest.skip(f"Server does not support REPLICAOF: {exc}")
-    if not _wait_sync(replica):
-        pytest.fail("Replica failed to synchronise with primary within 10 s")
+    _require_sync(replica, primary_port)
 
 
 # ── Helper: single-use primary+replica pair ────────────────────────────────────
@@ -240,8 +310,7 @@ class TestReplicationSetup:
             cls.r.execute_command("REPLICAOF", "127.0.0.1", str(cls.pp))
         except redis.ResponseError as exc:
             pytest.skip(f"Server does not support REPLICAOF: {exc}")
-        if not _wait_sync(cls.r):
-            pytest.fail("Replica did not sync in setup_class")
+        _require_sync(cls.r, cls.pp)
 
     @classmethod
     def teardown_class(cls):
@@ -343,8 +412,7 @@ class TestDataReplication:
             cls.r.execute_command("REPLICAOF", "127.0.0.1", str(cls.pp))
         except redis.ResponseError as exc:
             pytest.skip(f"Server does not support REPLICAOF: {exc}")
-        if not _wait_sync(cls.r):
-            pytest.fail("Replica did not sync in setup_class")
+        _require_sync(cls.r, cls.pp)
 
     @classmethod
     def teardown_class(cls):
@@ -539,8 +607,7 @@ class TestExpiryReplication:
             cls.r.execute_command("REPLICAOF", "127.0.0.1", str(cls.pp))
         except redis.ResponseError as exc:
             pytest.skip(f"REPLICAOF not supported: {exc}")
-        if not _wait_sync(cls.r):
-            pytest.fail("Replica did not sync in setup_class")
+        _require_sync(cls.r, cls.pp)
 
     @classmethod
     def teardown_class(cls):
@@ -626,8 +693,7 @@ class TestReplicationConsistency:
             cls.r.execute_command("REPLICAOF", "127.0.0.1", str(cls.pp))
         except redis.ResponseError as exc:
             pytest.skip(f"REPLICAOF not supported: {exc}")
-        if not _wait_sync(cls.r):
-            pytest.fail("Replica did not sync in setup_class")
+        _require_sync(cls.r, cls.pp)
 
     @classmethod
     def teardown_class(cls):
@@ -777,8 +843,8 @@ class TestMultipleReplicas:
             cls.r2.execute_command("REPLICAOF", "127.0.0.1", str(cls.pp))
         except redis.ResponseError as exc:
             pytest.skip(f"REPLICAOF not supported: {exc}")
-        if not _wait_sync(cls.r1) or not _wait_sync(cls.r2):
-            pytest.fail("Replicas did not sync in setup_class")
+        _require_sync(cls.r1, cls.pp)
+        _require_sync(cls.r2, cls.pp)
         if not _wait_replica_count(cls.p, 2):
             pytest.fail("Primary did not report 2 replicas in setup_class")
 
@@ -1037,8 +1103,7 @@ class TestReplicationReadLoad:
             cls.r.execute_command("REPLICAOF", "127.0.0.1", str(cls.pp))
         except redis.ResponseError as exc:
             pytest.skip(f"REPLICAOF not supported: {exc}")
-        if not _wait_sync(cls.r):
-            pytest.fail("Replica did not sync in setup_class")
+        _require_sync(cls.r, cls.pp)
 
     @classmethod
     def teardown_class(cls):
@@ -1141,3 +1206,32 @@ class TestReplicationReadLoad:
         expected = {f"sc:{i:02d}" for i in range(n)}
         assert found == expected, \
             f"SCAN on replica: missing={expected - found}, extra={found - expected}"
+
+
+# ── TestHarness ────────────────────────────────────────────────────────────────
+
+class TestHarness:
+    """
+    The helpers above, on the case that broke them (#262): two servers handed
+    the same port. The second could not bind, and the test went on with the
+    first in its place: a "replica" told REPLICAOF its own address, which
+    never syncs.
+    """
+
+    def test_ports_are_outside_the_ephemeral_range_and_never_repeat(self):
+        ports = [_free_port() for _ in range(200)]
+        assert len(set(ports)) == len(ports), "free_port() returned a port twice"
+        assert all(10000 <= p < 30000 for p in ports), \
+            f"ports outside 10000-29999: {[p for p in ports if not 10000 <= p < 30000]}"
+
+    def test_start_refuses_a_port_another_server_answers(self):
+        port = _free_port()
+        proc, workdir = _start(port)
+        try:
+            with pytest.raises(pytest.fail.Exception, match=str(port)):
+                _start(port)
+            # The first server is untouched, and still the one listed.
+            assert proc.poll() is None
+            assert _RUNNING[port][0] is proc
+        finally:
+            _stop(proc, port, workdir)

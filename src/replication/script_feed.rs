@@ -564,8 +564,10 @@ fn expire_feed(ctx: &Ctx<'_>, cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
         return vec![vec![b"DEL".to_vec(), cmd[1].to_vec()]];
     }
 
+    // Answered 1 and left no time to live: the key is gone, and so it goes
+    // to the readers of the stream. Sending nothing left it there for good.
     let Some(ms) = expiry_ms(ctx, key) else {
-        return Vec::new();
+        return vec![vec![b"DEL".to_vec(), cmd[1].to_vec()]];
     };
     vec![vec![
         b"PEXPIREAT".to_vec(),

@@ -1423,6 +1423,10 @@ fn page_from_postings(
             }
         }
     }
+    // And the keys an expiry has taken out of the store and not yet out of
+    // the postings (`vector::mark_leaving`). Read after the lists: a key in
+    // none of them by then, because an expiry took it, was marked first.
+    let leaving = crate::vector::leaving(crate::vector::store_id(ctx.store), *ctx.selected_db);
 
     // How many of the matches the page needs, in order.
     let need = if args.count == 0 {
@@ -1431,11 +1435,18 @@ fn page_from_postings(
         args.offset.saturating_add(args.count)
     };
     let (picked, total, timed_out) = {
-        // What was written since the plan is not among its ids.
-        let p = def.postings.peek();
+        // What was written since the plan is not among its ids. What was
+        // queued is applied: an expiry unmarks a key once its removal is
+        // applied or queued.
+        let p = def.postings.read();
         // Documents that left the index since the plan was made.
         ids.and_with(p.live());
         for key in &expired {
+            if let Some(id) = p.id(key) {
+                ids.unset(id);
+            }
+        }
+        for key in &leaving {
             if let Some(id) = p.id(key) {
                 ids.unset(id);
             }

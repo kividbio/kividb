@@ -44,6 +44,30 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A replica no longer keeps a key its master deleted at an `EXPIRE` or
+  `PEXPIRE`.** `PEXPIRE k 1` read the clock twice, for the key's new time
+  and to see whether that time had already come, and about once in 650
+  calls a millisecond began in between. The master then deleted the key at
+  once, answered `1`, and sent nothing to its replicas or its AOF: they kept
+  the key for good (31 keys of 20,000 in a test; under load, a key written
+  to again afterwards held a different value on the replica). As in Redis,
+  only a negative time to live now deletes the key at once; a positive one
+  that has already run out by then expires the key as any other, with its
+  `DEL`. `EXPIRE` had the same race, over a whole second.
+- **`CONFIG GET threads` gives the `--threads` value.** It gave an empty
+  reply, though `CONFIG SET threads` was refused as a setting that cannot
+  change at runtime. `CONFIG SET` with a name and no value to pair with it
+  (`CONFIG SET replicaof <host> <port>`, say) now gets Redis 8.10's
+  `ERR syntax error` instead of a wrong-number-of-arguments error (#257).
+
+- **A search's count leaves out a key the expiry is deleting.** The
+  background sweep, or a read, that deleted a key past its time took it out
+  of the search indexes only after letting go of the key's shard. An
+  `FT.SEARCH` counted from the indexes in between (a TAG or NUMERIC query,
+  `LIMIT 0 0` say) still counted the key's document. The key is now marked
+  as leaving until it is out of the indexes, and the count leaves it out
+  (#249).
+  
 - **A replica no longer keeps a key its master moved, or found expired
   while moving.** A `MOVE` that found its key past its time answered `0`
   but was still sent to replicas and the AOF, and the replica, which never
@@ -84,7 +108,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   wrong. Redis does take writes again the moment a manual failover runs
   out of time on its master, without asking whether it still owns its
   slots.
-
+  
 - **`expired` comes before the event of a write that makes the key
   again.** When the background sweep, or another client's read, deleted a
   key past its time, its `expired` notification was published after the
