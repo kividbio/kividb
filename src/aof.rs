@@ -243,9 +243,20 @@ static WRITER_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// Who waits for each turn-over the writer has yet to reach, by save number.
 /// std mpsc, not tokio oneshot: the waiter is often `SAVE` / `CONFIG SET`
 /// running on a connection worker, where `oneshot::blocking_recv` panics.
+/// What each is sent is the old log, still to be synced, if it has one.
 static TURN_OVER_WAITERS: parking_lot::Mutex<
-    Vec<(u64, std::sync::mpsc::SyncSender<std::io::Result<()>>)>,
+    Vec<(u64, std::sync::mpsc::SyncSender<std::io::Result<OldLog>>)>,
 > = parking_lot::Mutex::new(Vec::new());
+
+/// The log a turn-over moved aside, as the writer leaves it to the
+/// checkpoint: `None` if it needs nothing more.
+type OldLog = Option<std::fs::File>;
+
+/// Set from a turn-over until the old log it moved aside is synced: the
+/// writer does not sync the new log before then. Records in the new log
+/// come after those in the old one, and a power failure must not keep them
+/// and lose the old one's last records.
+static OLD_LOG_UNSYNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The start of a turn-over mark. No record begins with a zero byte.
 const TURN_OVER_MARK: &[u8] = b"\0kividb-aof-turn-over\0";
@@ -622,17 +633,42 @@ pub const AOF_PREV_PATH: &str = "appendonly.aof.prev";
 /// becomes `appendonly.aof.prev`, and a new, empty delta for save number
 /// `generation` takes its place.
 ///
-/// Called with writes held (see [`checkpoint`]), so everything queued came
-/// from a write made before the dataset was captured: it belongs with the
-/// old log, which with the old snapshot describes the dataset as captured.
-/// Nothing is dropped.
-fn perform_turn_over(file: &mut std::fs::File, generation: u64) -> std::io::Result<()> {
-    file.sync_data()?;
-    let turned = turn_over_files(generation);
+/// Everything queued ahead of the mark came from a write made before the
+/// dataset was captured: it belongs with the old log, which with the old
+/// snapshot describes the dataset as captured. Nothing is dropped.
+///
+/// It runs with the log locked, in whichever thread reaches the mark — often
+/// a connection's — and every reply waiting for the AOF waits for it: so it
+/// only renames. The new log was written and synced before the mark was
+/// placed (see [`prepare_new_log`]), and the old one is handed back to be
+/// synced by the checkpoint, with the lock let go (see [`finish_turn_over`]).
+/// Synced here, on a disk running behind, it held every write for seconds
+/// (#243).
+fn perform_turn_over(file: &mut std::fs::File) -> std::io::Result<OldLog> {
+    let moved = move_log_aside();
     // Whether or not it got all the way: the writer goes on in whatever file
     // has the log's name now, never in one that has been moved aside.
-    *file = open_aof()?;
-    turned
+    let old = std::mem::replace(file, open_aof()?);
+    match moved? {
+        MovedAside::ToSync => {
+            OLD_LOG_UNSYNCED.store(true, Ordering::Release);
+            Ok(Some(old))
+        }
+        MovedAside::Synced => Ok(None),
+    }
+}
+
+/// Make durable what a turn-over left to sync: the old log, and the
+/// directory that has both logs under their new names. The writer syncs the
+/// new log again once they are.
+fn finish_turn_over(old: OldLog) -> std::io::Result<()> {
+    let Some(old) = old else {
+        return Ok(());
+    };
+    failpoint("turn-over-syncing");
+    let synced = old.sync_data().and_then(|()| sync_dir());
+    OLD_LOG_UNSYNCED.store(false, Ordering::Release);
+    synced
 }
 
 /// Write `first` and whatever else is queued, turning the log over at each
@@ -670,11 +706,22 @@ fn write_queued(
         let Some(generation) = mark else {
             return (wrote, released);
         };
-        let result = perform_turn_over(file, generation);
-        let mut waiters = TURN_OVER_WAITERS.lock();
-        if let Some(at) = waiters.iter().position(|(g, _)| *g == generation) {
-            let (_, done) = waiters.swap_remove(at);
-            let _ = done.send(result);
+        let result = perform_turn_over(file);
+        let done = {
+            let mut waiters = TURN_OVER_WAITERS.lock();
+            waiters
+                .iter()
+                .position(|(g, _)| *g == generation)
+                .map(|at| waiters.swap_remove(at).1)
+        };
+        let undelivered = match done {
+            Some(done) => done.send(result).err().map(|unsent| unsent.0),
+            None => Some(result),
+        };
+        // No one to sync the old log: synced here, so that the new one is
+        // not left unsynced for good.
+        if let Some(Ok(old)) = undelivered {
+            let _ = finish_turn_over(old);
         }
     }
 }
@@ -687,25 +734,51 @@ const TURN_OVER_TMP: &str = "appendonly.aof.rewrite.tmp";
 /// still needed: how long that old log was before. See [`settle_turn_over`].
 const TURN_OVER_APPENDING: &str = "appendonly.aof.prev.len";
 
-/// The files' part of [`perform_turn_over`], for when no writer has the log
-/// open as well.
+// ── The files of a turn-over ─────────────────────────────────────────────────
+//
+// Stopped at any point, a turn-over leaves files that recovery reads as they
+// were before it or as they are after it (see [`recover_turn_over`]). The
+// new, empty log is written in full first, under a name of its own; then the
+// log is moved aside, and the new one takes its name. It used to be the
+// other way round: a crash after the log was moved aside left
+// `appendonly.aof.prev` and no log at all, and a start that found no log
+// replayed nothing, `.prev` included — every write since the snapshot lost.
+//
+// Three steps: [`prepare_new_log`], [`move_log_aside`], and the syncs
+// ([`finish_turn_over`]). Only the second runs with the log locked.
+
+/// The first step of a turn-over: the new, empty log for save number
+/// `generation`, written in full and synced under a name of its own.
 ///
-/// Stopped at any point, it leaves files that recovery reads as they were
-/// before it or as they are after it (see [`recover_turn_over`]). The new,
-/// empty log is written in full first, under a name of its own; then the log
-/// is moved aside, and the new one takes its name. It used to be the other
-/// way round: a crash after the log was moved aside left
-/// `appendonly.aof.prev` and no log at all, and a start that found no log
-/// replayed nothing, `.prev` included — every write since the snapshot lost.
-fn turn_over_files(generation: u64) -> std::io::Result<()> {
+/// Done by the checkpoint before it places its mark, with nothing locked:
+/// it waits for the disk, and on a disk running behind that is seconds.
+/// Stopped after this, the files read as they did before it: recovery
+/// removes the new log (see [`recover_turn_over`]).
+fn prepare_new_log(generation: u64) -> std::io::Result<()> {
     use std::io::Write;
     settle_turn_over()?;
-    {
-        let mut fresh = std::fs::File::create(TURN_OVER_TMP)?;
-        fresh.write_all(AOF_DELTA_MAGIC)?;
-        fresh.write_all(&generation.to_le_bytes())?;
-        fresh.sync_all()?;
-    }
+    let mut fresh = std::fs::File::create(TURN_OVER_TMP)?;
+    fresh.write_all(AOF_DELTA_MAGIC)?;
+    fresh.write_all(&generation.to_le_bytes())?;
+    fresh.sync_all()
+}
+
+/// What [`move_log_aside`] left to sync.
+enum MovedAside {
+    /// The old log, now `appendonly.aof.prev`, and the directory.
+    ToSync,
+    /// Nothing: the old log's records were added to an older one, synced.
+    Synced,
+}
+
+/// The rest of a turn-over, once [`prepare_new_log`] has run: the log is
+/// moved aside, and the new one takes its name.
+///
+/// Neither the old log nor the directory is synced in the usual case: that
+/// is left to the caller ([`MovedAside::ToSync`]), so that a writer holding
+/// the log's lock does not wait for the disk.
+fn move_log_aside() -> std::io::Result<MovedAside> {
+    use std::io::Write;
     let prev = std::path::Path::new(AOF_PREV_PATH);
     let mut current = Vec::new();
     if prev.exists() {
@@ -741,19 +814,19 @@ fn turn_over_files(generation: u64) -> std::io::Result<()> {
         std::fs::rename(TURN_OVER_TMP, AOF_PATH)?;
         sync_dir()?;
         std::fs::remove_file(TURN_OVER_APPENDING)?;
+        Ok(MovedAside::Synced)
     } else {
         if std::path::Path::new(AOF_PATH).exists() {
             std::fs::rename(AOF_PATH, prev)?;
             failpoint("turn-over-moved-aside");
         }
         std::fs::rename(TURN_OVER_TMP, AOF_PATH)?;
-        sync_dir()?;
+        Ok(MovedAside::ToSync)
     }
-    Ok(())
 }
 
 /// Put right what a turn-over that stopped while adding the log's records
-/// to the old log left (see [`turn_over_files`]). If the new log had not yet
+/// to the old log left (see [`move_log_aside`]). If the new log had not yet
 /// taken the log's name, those records are still in the log, and are cut off
 /// the old log again; if it had, the old log is whole and the note is all
 /// that is left.
@@ -940,6 +1013,11 @@ fn do_fsync() {
     if !had_data && written == AOF_FSYNCED.load(Ordering::Relaxed) {
         return;
     }
+    // Not ahead of the old log a turn-over has just moved aside: the next
+    // second's sync covers this, once the checkpoint has synced that one.
+    if OLD_LOG_UNSYNCED.load(Ordering::Acquire) {
+        return;
+    }
 
     if let Err(e) = file.sync_data() {
         log_throttled!(
@@ -973,10 +1051,19 @@ fn turn_over_aof(generation: u64) -> impl FnOnce() -> std::io::Result<()> {
     };
     move || match queued {
         // No writer running: nothing else has the file open.
-        None => turn_over_files(generation),
-        Some(done) => done
-            .recv()
-            .map_err(|_| std::io::Error::other("AOF writer dropped the turn-over"))?,
+        None => match move_log_aside()? {
+            MovedAside::ToSync => {
+                if let Ok(old) = std::fs::File::open(AOF_PREV_PATH) {
+                    old.sync_data()?;
+                }
+                sync_dir()
+            }
+            MovedAside::Synced => Ok(()),
+        },
+        Some(done) => finish_turn_over(
+            done.recv()
+                .map_err(|_| std::io::Error::other("AOF writer dropped the turn-over"))??,
+        ),
     }
 }
 
@@ -1086,6 +1173,11 @@ fn checkpoint_inner(
     let aof_on = AOF_ENABLED.load(Ordering::Relaxed);
     let generation = next_generation();
     failpoint("checkpoint-cutting");
+    if aof_on {
+        // Before writes are held, and before the log is locked to turn it
+        // over: it waits for the disk.
+        prepare_new_log(generation)?;
+    }
 
     // Between whole writes: a write is either in what is captured, with its
     // record in the old log, or after it, with its record in the new one.

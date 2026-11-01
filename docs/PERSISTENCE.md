@@ -190,6 +190,7 @@ only what happened next. Redis rewrites at this point for the same reason.
 | `aof_last_rewrite_time_ms` | The same in milliseconds, because the seconds field shows a short checkpoint as `0`. |
 | `aof_last_bgrewrite_status` | `err` if the last checkpoint failed. Durability is intact, but the log keeps growing. |
 | `aof_lost_records` | Non-zero means the log has a hole and can no longer reconstruct the dataset. |
+| `aof_acks_before_write` | Replies to writes sent after waiting 5 s for their records to reach the file, without them: the disk fell more than 5 s behind. A process killed then can lose those writes. 0 on a disk that keeps up (see [When a write is acknowledged](#when-a-write-is-acknowledged)). |
 
 `rdb_last_bgsave_status` and `LASTSAVE` report snapshots, as in Redis.
 
@@ -257,11 +258,28 @@ cannot be read by an older one once it contains any of these.
 With the AOF on, the replies to a batch of commands that wrote are sent once
 their records have been written to the file (the operating system's page
 cache), as in Redis. A process killed outright (`kill -9`, the OOM killer)
-loses no acknowledged write; a power failure can lose up to a second, as with
-`appendfsync everysec` in Redis, since the file is synced once a second.
-Connections waiting at the same time are answered by one write (a group
-commit), and reads wait for nothing. Before 1.2 a write was acknowledged
-once its record was queued, and a killed process could lose the last few.
+loses no acknowledged write while the disk keeps up (see below); a power
+failure can lose up to a second, as with `appendfsync everysec` in Redis,
+since the file is synced once a second. Connections waiting at the same
+time are answered by one write (a group commit), and reads wait for
+nothing. Before 1.2 a write was acknowledged once its record was queued,
+and a killed process could lose the last few.
+
+A reply waits at most 5 seconds for its records. Only if the disk falls
+more than 5 seconds behind (a disk slower than the writes it is given, or
+one busy with something else) is the reply sent without them: the server
+logs `AOF: a reply waited 5 s for its write to reach appendonly.aof and was
+sent without it`, and `aof_acks_before_write` in `INFO persistence` counts
+each one. A process killed right then can lose those writes. On a disk that
+keeps up the counter stays at 0. If it grows, give the AOF a faster disk
+(more IOPS and throughput: on a cloud, a premium or provisioned volume
+rather than a small standard one), or write less to it.
+
+A checkpoint does not hold writes back while it waits for the disk: its
+snapshot goes to the disk a few megabytes at a time rather than all at once
+when it is synced, and the old log is synced after it is turned over, not
+with the log locked. Before 1.2.0 the checkpoint after a bulk load stalled
+writes for seconds at a time on a slow cloud disk (#243).
 
 The wait costs writes: on a 16-core server, 20-28% of `SET`s a second with
 50 clients, with or without pipelining, and under 10% with one client.

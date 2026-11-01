@@ -109,6 +109,108 @@ const TAG_TIMESERIES_V2: u8 = 14;
 /// only for a compaction, so other series stay readable by older builds.
 const TAG_TIMESERIES_V3: u8 = 15;
 
+/// A snapshot file that goes to the disk as it is written, a few megabytes
+/// at a time, rather than all at once when it is synced.
+///
+/// Written into the page cache at memory speed and synced at the end, a
+/// gigabyte of snapshot was a gigabyte queued at the disk at once. On a slow
+/// disk that is seconds, and everything else waited behind it: the AOF's
+/// once-a-second sync, and the file system's journal, which every append to
+/// the AOF needs whenever it updates the file's size or time. A connection
+/// appending its records waited out the snapshot in `write`, and its reply
+/// with it, and so did every reply waiting for the AOF behind it — 2 to 3
+/// seconds at a time on a 150 MB/s disk, more on a slower or busier one
+/// (#243). Here each [`PACE_BYTES`] written is handed to the disk, and the
+/// piece before it waited for: never more than two pieces queued, so the AOF
+/// and the journal get their turns while a snapshot is written, and the
+/// snapshot's pages leave the page cache once they are on the disk. A fast
+/// disk writes a piece in a few milliseconds, and the snapshot takes about as
+/// long as before.
+pub(crate) struct PacedFile {
+    file: File,
+    /// Bytes written so far.
+    written: u64,
+    /// Up to here, handed to the disk.
+    started: u64,
+    /// Up to here, on the disk.
+    done: u64,
+}
+
+/// How much of a snapshot is written before it is handed to the disk.
+const PACE_BYTES: u64 = 8 << 20;
+
+impl PacedFile {
+    pub(crate) fn new(file: File) -> Self {
+        PacedFile {
+            file,
+            written: 0,
+            started: 0,
+            done: 0,
+        }
+    }
+
+    pub(crate) fn sync_all(&self) -> io::Result<()> {
+        self.file.sync_all()
+    }
+
+    /// Hand what was written since the last call to the disk, and wait for
+    /// what was handed to it before. Best effort: whatever this does not do,
+    /// the final `sync_all` does, and reports.
+    fn pace(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let fd = self.file.as_raw_fd();
+            // SAFETY: plain system calls on a descriptor this owns; they
+            // touch no memory of ours.
+            unsafe {
+                libc::sync_file_range(
+                    fd,
+                    self.started as libc::off64_t,
+                    (self.written - self.started) as libc::off64_t,
+                    libc::SYNC_FILE_RANGE_WRITE,
+                );
+                if self.started > self.done {
+                    let len = (self.started - self.done) as libc::off64_t;
+                    let waited = libc::sync_file_range(
+                        fd,
+                        self.done as libc::off64_t,
+                        len,
+                        libc::SYNC_FILE_RANGE_WAIT_BEFORE
+                            | libc::SYNC_FILE_RANGE_WRITE
+                            | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+                    );
+                    if waited == 0 {
+                        libc::posix_fadvise(
+                            fd,
+                            self.done as libc::off_t,
+                            len as libc::off_t,
+                            libc::POSIX_FADV_DONTNEED,
+                        );
+                    }
+                }
+            }
+        }
+        self.done = self.started;
+        self.started = self.written;
+    }
+}
+
+impl Write for PacedFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.file.write(buf)?;
+        self.written += n as u64;
+        if self.written - self.started >= PACE_BYTES {
+            self.pace();
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
 fn write_bytes(w: &mut impl Write, data: &[u8]) -> io::Result<()> {
     w.write_all(&(data.len() as u32).to_le_bytes())?;
     w.write_all(data)
@@ -1229,7 +1331,7 @@ pub fn write_snapshot(
         TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
     let result = (|| -> io::Result<()> {
-        let raw = File::create(&tmp_path)?;
+        let raw = PacedFile::new(File::create(&tmp_path)?);
         let mut file = BufWriter::with_capacity(1 << 20, raw); // 1 MiB write buffer
         write_kdb_image(&mut file, maps, index_store)?;
         file.flush()?;
@@ -3896,7 +3998,7 @@ impl FrozenDataset {
     /// written as it is laid out, not gathered in memory first: for a dump of
     /// the whole dataset that would be the dataset over again.
     pub fn write_file(self, path: &str) -> std::io::Result<()> {
-        let raw = File::create(path)?;
+        let raw = PacedFile::new(File::create(path)?);
         let mut file = BufWriter::with_capacity(1 << 20, raw);
         self.write_to(&mut file)?;
         file.flush()?;

@@ -106,9 +106,12 @@ What the RDB reader takes from Redis:
   writes to survive a restart. Without it, data is only on disk after a
   `BGSAVE`, or at a clean shutdown.
 - **With the AOF on, a write is answered once its record is in the file**,
-  as in Redis: a `kill -9` or an OOM kill loses no acknowledged write, and a
-  power failure loses up to a second, as with Redis's `appendfsync
-  everysec`. Before 1.2 a write was answered once its record was queued,
+  as in Redis: a `kill -9` or an OOM kill loses no acknowledged write while
+  the disk keeps up, and a power failure loses up to a second, as with
+  Redis's `appendfsync everysec`. A reply waits at most 5 s for its record;
+  if the disk falls further behind than that, replies go out without their
+  writes and `aof_acks_before_write` counts them, so size the AOF's disk for
+  the write load. Before 1.2 a write was answered once its record was queued,
   and a hard kill could lose the last few; `aof-ack-after-write no` still
   does that, for more writes a second (see [PERSISTENCE.md](PERSISTENCE.md)).
 - [PERSISTENCE.md](PERSISTENCE.md) covers snapshots, checkpoints, backups

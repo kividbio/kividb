@@ -44,6 +44,36 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A checkpoint no longer stalls writes on a slow disk (#243).** With the
+  AOF on, the checkpoint after a bulk load held `SET`s back for seconds at a
+  time on a slow cloud disk, and replies went out without their writes
+  once they had waited 5 s. Two things made every write wait for the disk.
+  The snapshot went into the page cache at memory speed and was synced at
+  the end: a gigabyte queued at the disk at once, with the file system's
+  journal behind it, and every append to the AOF needs the journal now and
+  then (its size and time). And the log was turned over, old log synced,
+  new log synced, directory synced, by whichever thread reached the
+  turn-over, holding the log's lock, often a connection's. The snapshot now
+  goes to the disk 8 MB at a time, never more than two pieces queued, and
+  leaves the page cache once it is there; the new log is written before the
+  turn-over, and the old log and the directory are synced after it, by the
+  checkpoint, with the lock let go (the new log is not synced before the old
+  one is, so that a power failure cannot keep newer writes and lose older
+  ones). On a 150 MB/s Azure Standard SSD, during a checkpoint of 5 million
+  keys under a steady `SET` load, the longest `SET` went from 2.5 s to under
+  0.4 s. On a 100 MB/s Standard HDD, after a bulk load of 2.5 million `SET`s,
+  it went from 5 s, with 42 replies sent without their writes, to under 1 s
+  and none. On a slow disk under load a checkpoint now takes longer (it
+  leaves the AOF its share of the disk); on a fast disk `SET`s and `GET`s a
+  second are unchanged.
+
+- **`INFO persistence` counts the replies sent without their writes.** A
+  reply to a write waits at most 5 s for its record to reach the AOF; when
+  the disk falls further behind than that, it is sent anyway, and a process
+  killed then can lose that write. `aof_acks_before_write` counts them (0 on
+  a disk that keeps up), and the documentation no longer says that a killed
+  process loses nothing whatever the disk does.
+
 - **A replica no longer keeps a key its master deleted at an `EXPIRE` or
   `PEXPIRE`.** `PEXPIRE k 1` read the clock twice, for the key's new time
   and to see whether that time had already come, and about once in 650

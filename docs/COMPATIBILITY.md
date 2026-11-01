@@ -50,10 +50,13 @@ other files:
 **Durability**
 - With the AOF on, a write is acknowledged once its record is in the file,
   as in Redis: a hard kill (`kill -9`, the OOM killer) loses no acknowledged
-  write, and a power failure up to a second, as with Redis's `everysec`.
-  Before 1.2 a write was acknowledged once its record was queued, and a
-  hard kill could lose the last few; `aof-ack-after-write no` still does
-  that, for more writes a second.
+  write while the disk keeps up, and a power failure up to a second, as with
+  Redis's `everysec`. A reply waits at most 5 s for its record: a disk more
+  than 5 s behind gets replies sent without their writes, counted in
+  `aof_acks_before_write` (Redis waits for as long as the write takes).
+  Before 1.2 a write was acknowledged once its record was queued,
+  and a hard kill could lose the last few; `aof-ack-after-write no` still
+  does that, for more writes a second.
 
 **Data**
 - HyperLogLog registers aren't in Redis's layout
