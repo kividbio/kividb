@@ -237,9 +237,11 @@ fn run_backup(handles: Handles, seq: u64, dir: PathBuf, tap: u64) {
 
     // ── BASE ─────────────────────────────────────────────────────────────
     let base_path = dir.join(base_name(seq));
+    // The image is not counted against `maxmemory` while it is written
+    // (#284).
     let written = frozen
-        .and_then(|frozen| frozen.into_payload())
-        .and_then(|image| write_durably(&base_path, &image));
+        .and_then(|frozen| frozen.into_image())
+        .and_then(|(image, _not_counted)| write_durably(&base_path, &image));
     if let Err(e) = written {
         close_tap(&handles.repl_state, tap);
         return fail(seq, format!("could not write the base snapshot: {e}"));

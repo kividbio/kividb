@@ -3822,6 +3822,11 @@ pub struct FrozenDataset {
     functions: Option<Vec<u8>>,
     /// The indexes' languages (see [`write_kdb_language_section`]).
     language_section: Vec<u8>,
+    /// What all of the above takes, which is no key's and which deleting
+    /// keys does not give back: not counted against `maxmemory` while the
+    /// capture lives (#284). Its holds on strings are counted as the table
+    /// lets go of them (`store::entry`).
+    _not_counted: crate::memory_use::NotCounted,
 }
 
 /// What one thread of the capture took: a hold on each string's entry
@@ -3841,15 +3846,14 @@ struct FrozenDb {
 }
 
 impl FrozenDb {
-    /// How many of the keys captured have a time to live.
-    fn timed_count(&self) -> usize {
-        let strings = self
-            .strings
-            .iter()
-            .flatten()
-            .filter(|e| e.expires().is_some())
-            .count();
-        strings + self.timed.iter().map(Vec::len).sum::<usize>()
+    /// What the capture of the database takes besides the entries it holds.
+    fn own_bytes(&self) -> usize {
+        let held = self.strings.iter().map(Vec::capacity).sum::<usize>()
+            * std::mem::size_of::<store::EntryRef>();
+        let encoded = self.encoded.iter().map(Vec::capacity).sum::<usize>();
+        let timed =
+            self.timed.iter().map(Vec::capacity).sum::<usize>() * std::mem::size_of::<(Key, u64)>();
+        held + encoded + timed
     }
 }
 
@@ -3954,13 +3958,20 @@ fn freeze(
     write_kdb_alias_section(&mut alias_section, index_store)?;
     let mut language_section = Vec::new();
     write_kdb_language_section(&mut language_section, index_store)?;
+    let functions = function_libraries();
+    let own = dbs.iter().map(FrozenDb::own_bytes).sum::<usize>()
+        + index_section.capacity()
+        + alias_section.capacity()
+        + language_section.capacity()
+        + functions.as_ref().map_or(0, Vec::capacity);
 
     Ok(FrozenDataset {
         dbs,
         index_section,
         alias_section,
-        functions: function_libraries(),
+        functions,
         language_section,
+        _not_counted: crate::memory_use::NotCounted::new(own),
     })
 }
 
@@ -3974,7 +3985,15 @@ fn frozen_string(entry: &store::EntryRef) -> &[u8] {
 
 impl FrozenDataset {
     /// Lay the captured dataset out as a KDB image.
+    #[allow(dead_code)]
     pub fn into_payload(self) -> std::io::Result<Vec<u8>> {
+        self.into_image().map(|(image, _)| image)
+    }
+
+    /// Lay the captured dataset out as a KDB image, which is not counted
+    /// against `maxmemory` while the second part lives: a full sync's or a
+    /// backup's image, which deleting keys does not give back (#284).
+    pub fn into_image(self) -> std::io::Result<(Vec<u8>, crate::memory_use::NotCounted)> {
         let strings_bytes: usize = self
             .dbs
             .iter()
@@ -3990,8 +4009,12 @@ impl FrozenDataset {
         let mut out = Vec::with_capacity(
             16 + strings_bytes + encoded_bytes + self.index_section.len() + 4 * self.dbs.len(),
         );
+        let mut not_counted = crate::memory_use::NotCounted::new(out.capacity());
+        let before = out.capacity();
         self.write_to(&mut out)?;
-        Ok(out)
+        // Grown past what was reckoned (the sections after the keys).
+        not_counted.add(out.capacity().saturating_sub(before));
+        Ok((out, not_counted))
     }
 
     /// Write the image to `path`, made durable, under that name. The image is
@@ -4005,21 +4028,36 @@ impl FrozenDataset {
         file.get_ref().sync_all()
     }
 
-    fn write_to(self, out: &mut impl Write) -> std::io::Result<()> {
+    fn write_to(mut self, out: &mut impl Write) -> std::io::Result<()> {
+        // Captured, with writes going on again: a test writes over and
+        // deletes keys the capture holds here.
+        crate::aof::failpoint("snapshot-writing");
         write_kdb_header(out, self.dbs.len() as u32)?;
-        for db in &self.dbs {
-            for entry in db.strings.iter().flatten() {
-                write_bytes(out, entry.key().as_bytes())?;
-                out.write_all(&[TAG_STRING])?;
-                write_bytes(out, frozen_string(entry))?;
+        // The times to live of the strings, for the expiry section after
+        // the keys: each string's hold goes as soon as it is written, so
+        // that a key written over or deleted since the capture is freed
+        // then, not when the whole image is (#284).
+        let mut timed_strings: Vec<Vec<(Key, u64)>> = Vec::with_capacity(self.dbs.len());
+        for db in &mut self.dbs {
+            let mut timed = Vec::new();
+            for part in std::mem::take(&mut db.strings) {
+                for entry in part {
+                    write_bytes(out, entry.key().as_bytes())?;
+                    out.write_all(&[TAG_STRING])?;
+                    write_bytes(out, frozen_string(&entry))?;
+                    if let Some(at) = entry.expires() {
+                        timed.push((Key::from(entry.key()), at));
+                    }
+                }
             }
+            timed_strings.push(timed);
             for encoded in &db.encoded {
                 out.write_all(encoded)?;
             }
             write_kdb_db_end(out)?;
         }
         out.write_all(&self.index_section)?;
-        self.write_expiries(out)?;
+        self.write_expiries(out, &timed_strings)?;
         out.write_all(&self.alias_section)?;
         write_kdb_functions_section(out, self.functions.as_deref())?;
         out.write_all(&self.language_section)
@@ -4028,23 +4066,27 @@ impl FrozenDataset {
 
 impl FrozenDataset {
     /// The expiry section ([`write_kdb_expiry_maps`]'s layout), from the
-    /// times the capture took with the keys.
-    fn write_expiries(&self, out: &mut impl Write) -> std::io::Result<()> {
-        let counts: Vec<usize> = self.dbs.iter().map(FrozenDb::timed_count).collect();
+    /// times the capture took with the keys: `strings`, those of each
+    /// database's strings, taken as they were written.
+    fn write_expiries(
+        &self,
+        out: &mut impl Write,
+        strings: &[Vec<(Key, u64)>],
+    ) -> std::io::Result<()> {
+        let counts: Vec<usize> = self
+            .dbs
+            .iter()
+            .zip(strings)
+            .map(|(db, strings)| strings.len() + db.timed.iter().map(Vec::len).sum::<usize>())
+            .collect();
         if counts.iter().all(|&n| n == 0) {
             return Ok(());
         }
         out.write_all(KDB_EXPIRY_MAGIC)?;
         out.write_all(&(self.dbs.len() as u32).to_le_bytes())?;
-        for (db, count) in self.dbs.iter().zip(counts) {
+        for ((db, strings), count) in self.dbs.iter().zip(strings).zip(counts) {
             out.write_all(&(count as u32).to_le_bytes())?;
-            for entry in db.strings.iter().flatten() {
-                if let Some(at) = entry.expires() {
-                    write_bytes(out, entry.key().as_bytes())?;
-                    out.write_all(&at.to_le_bytes())?;
-                }
-            }
-            for (key, at) in db.timed.iter().flatten() {
+            for (key, at) in strings.iter().chain(db.timed.iter().flatten()) {
                 write_bytes(out, key.as_bytes())?;
                 out.write_all(&at.to_le_bytes())?;
             }

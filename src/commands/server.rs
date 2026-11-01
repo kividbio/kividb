@@ -332,6 +332,7 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                 Some(v) => {
                     crate::RUNTIME_MAXMEMORY.store(v, std::sync::atomic::Ordering::Relaxed);
                     crate::memory_use::limit_changed();
+                    crate::eviction::limit_changed();
                     // A limit below what is in use is enforced
                     // now, not at the next write.
                     if v != 0 {
@@ -4146,7 +4147,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
                 out.push_str(&format!("mem_fragmentation_ratio:{frag_ratio:.4}\r\n"));
                 out.push_str(&format!("mem_fragmentation_bytes:{frag_bytes}\r\n"));
-                out.push_str("mem_not_counted_for_evict:0\r\n");
+                // What a snapshot being written keeps alive (#284): in
+                // Redis, the forked child's, outside `used_memory` altogether.
+                out.push_str(&format!(
+                    "mem_not_counted_for_evict:{}\r\n",
+                    crate::memory_use::not_counted()
+                ));
                 // The backlog's bytes, and the clients' query buffers: they
                 // were 0 (#152).
                 out.push_str(&format!(

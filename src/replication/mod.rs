@@ -1777,6 +1777,20 @@ pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx
         let mut without_replicas: Option<tokio::time::Instant> = None;
 
         loop {
+            // What is queued for the replicas and not yet taken by their
+            // forwarders is not counted against `maxmemory`, as Redis does not
+            // count its replicas' output buffers: a full sync queues every
+            // write made while its payload is laid out and sent, and evicting
+            // keys for it gives nothing back (#284). Each replica is queued
+            // the same writes, shared: the longest queue is what they hold.
+            // Taken again after every message and every second.
+            crate::memory_use::set_replica_queued(
+                channel_replicas
+                    .iter()
+                    .map(|r| r.pending_bytes.load(Ordering::Relaxed))
+                    .max()
+                    .unwrap_or(0) as usize,
+            );
             let msg = tokio::select! {
                 msg = hub_rx.recv() => match msg {
                     Some(m) => m,
@@ -2187,7 +2201,7 @@ pub fn begin_full_sync(
     drop(cut);
     let held = started.elapsed();
 
-    let payload = frozen.into_payload()?;
+    let (payload, not_counted) = frozen.into_image()?;
     if held > std::time::Duration::from_millis(100) {
         log_info!(
             "Replication: Full-sync cut held writes for {} ms ({} byte payload)",
@@ -2195,7 +2209,11 @@ pub fn begin_full_sync(
             payload.len()
         );
     }
-    Ok(FullSync { base, payload })
+    Ok(FullSync {
+        base,
+        payload,
+        not_counted,
+    })
 }
 
 /// What [`begin_full_sync`] cut: the offset the payload corresponds to, and
@@ -2203,6 +2221,10 @@ pub fn begin_full_sync(
 pub struct FullSync {
     pub base: u64,
     pub payload: Vec<u8>,
+    /// The payload is not counted against `maxmemory` while this lives
+    /// (#284): kept until the payload is sent, as Redis does not count what
+    /// is queued for its replicas either.
+    pub not_counted: crate::memory_use::NotCounted,
 }
 
 impl FullSync {

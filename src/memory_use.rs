@@ -142,6 +142,112 @@ pub fn allocated() -> usize {
     total.max(0) as usize
 }
 
+/// What the calling thread has allocated less what it has freed, while it
+/// has a counter of its own (`None` once it shares the last one): unlike
+/// [`allocated`], not moved by what other threads allocate meanwhile. For
+/// tests that measure what an operation allocates in a process whose other
+/// threads (a test harness's) allocate at the same time.
+pub fn allocated_by_this_thread() -> Option<isize> {
+    let stripe = MINE.try_with(Cell::get).ok()?;
+    if stripe == usize::MAX {
+        // Nothing counted yet: its counter, when it is given one, starts at
+        // nought.
+        return Some(0);
+    }
+    (stripe < OWNED).then(|| COUNTS[stripe].0.load(Ordering::Relaxed))
+}
+
+/// Bytes allocated that deleting keys would not give back: Redis's
+/// `mem_not_counted_for_evict`. `maxmemory` is measured against what is
+/// allocated less these ([`counted`]).
+///
+/// What a snapshot keeps while it is written, which in Redis is the forked
+/// child's, and outside the server's `used_memory`:
+///
+/// - entries the table has let go of (a key written over, deleted or
+///   evicted) that a frozen snapshot still holds (`store::entry`, which
+///   adds and takes away here as the table lets go of a held entry and its
+///   last hold goes);
+/// - what a snapshot lays out besides: the values it encodes at the cut,
+///   and a full-sync or backup image built in memory ([`NotCounted`]).
+///
+/// And, kept apart, what is queued for replicas ([`set_replica_queued`]):
+/// Redis does not count its replicas' output buffers either.
+///
+/// Without this, a write during a snapshot found memory over the limit and
+/// evicted a key, which gave nothing back while the snapshot held it, and
+/// the next, until nearly every key was gone (#284).
+///
+/// One counter for the process: it changes only while something holds an
+/// entry the table has let go of, or lays a snapshot out, never on a plain
+/// write.
+#[repr(align(128))]
+struct Shared(AtomicIsize);
+static NOT_COUNTED: Shared = Shared(AtomicIsize::new(0));
+
+/// Count `bytes` as allocated but not to be evicted for (see
+/// [`NOT_COUNTED`]); [`counted_again`] takes them back.
+#[inline]
+pub fn not_counted_add(bytes: usize) {
+    NOT_COUNTED.0.fetch_add(bytes as isize, Ordering::Relaxed);
+}
+
+/// Take back `bytes` [`not_counted_add`] counted.
+#[inline]
+pub fn counted_again(bytes: usize) {
+    NOT_COUNTED.0.fetch_sub(bytes as isize, Ordering::Relaxed);
+}
+
+/// What is queued for the replicas: the replication hub says, after each
+/// thing it does (`replication::start_hub`).
+static REPLICA_QUEUED: AtomicUsize = AtomicUsize::new(0);
+
+/// The replication hub's word on what is queued for its replicas.
+#[inline]
+pub fn set_replica_queued(bytes: usize) {
+    if REPLICA_QUEUED.load(Ordering::Relaxed) != bytes {
+        REPLICA_QUEUED.store(bytes, Ordering::Relaxed);
+    }
+}
+
+/// Bytes allocated that deleting keys would not give back (see
+/// [`NOT_COUNTED`]), and what is queued for replicas:
+/// `mem_not_counted_for_evict` in `INFO`.
+pub fn not_counted() -> usize {
+    (NOT_COUNTED.0.load(Ordering::Relaxed).max(0) as usize)
+        .saturating_add(REPLICA_QUEUED.load(Ordering::Relaxed))
+}
+
+/// What `maxmemory` is measured against: what is allocated, less what
+/// deleting keys would not give back.
+pub fn counted() -> usize {
+    allocated().saturating_sub(not_counted())
+}
+
+/// Bytes a snapshot laid out, not counted against `maxmemory` while this
+/// lives (see [`NOT_COUNTED`]).
+#[derive(Default)]
+pub struct NotCounted(usize);
+
+impl NotCounted {
+    pub fn new(bytes: usize) -> Self {
+        not_counted_add(bytes);
+        NotCounted(bytes)
+    }
+
+    /// `bytes` more.
+    pub fn add(&mut self, bytes: usize) {
+        not_counted_add(bytes);
+        self.0 += bytes;
+    }
+}
+
+impl Drop for NotCounted {
+    fn drop(&mut self) {
+        counted_again(self.0);
+    }
+}
+
 static RECENT: AtomicUsize = AtomicUsize::new(0);
 
 /// Whether memory was near `maxmemory` the last time a command looked
@@ -170,8 +276,9 @@ thread_local! {
     static CALLS: Cell<u32> = const { Cell::new(0) };
 }
 
-/// Whether more than `limit` bytes are allocated: the check every command
-/// makes against `maxmemory`, which has to be cheap.
+/// Whether more than `limit` bytes are allocated, less what deleting keys
+/// would not give back ([`counted`]): the check every command makes against
+/// `maxmemory`, which has to be cheap.
 ///
 /// The sum over the threads' counters is taken on every 32nd call from a
 /// thread and remembered in between — unless what was remembered is near
@@ -192,7 +299,7 @@ pub fn over(limit: usize) -> bool {
         NEAR.store(near, Ordering::Relaxed);
     }
     let now = if near || calls.is_multiple_of(32) {
-        let now = allocated();
+        let now = counted();
         RECENT.store(now, Ordering::Relaxed);
         now
     } else {
