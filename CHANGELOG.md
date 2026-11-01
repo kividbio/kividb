@@ -69,6 +69,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `dump.kdb.clean`, is left beside the final snapshot), restarts go on as
   before.
 
+- **`CLUSTER FAILOVER` no longer gives up under writes for want of an answer
+  its master had ready.** With the tokio I/O model (always, for cluster
+  nodes), a write that arrived just as its master began the handover waited
+  for it on its worker thread, and the task that thread would have run next
+  waited with it: no other thread takes that one (tokio's LIFO slot). When
+  it was the replication hub, which the handover waits on to know that
+  everything has been sent to the replica, the master answered only when
+  its pause on writes ran out, 10 s later; the replica had given up after 5,
+  and the roles stayed as they were. Seen as an intermittent CI failure of
+  `manual_failover_swaps_roles_without_losing_acknowledged_writes`. Nothing
+  was lost: writes went on at the master. The write now hands the thread's
+  other tasks to another thread while it waits.
+
 - **`FT.DROPINDEX index DD` reaches replicas and the AOF as the documents
   it deleted.** The command was sent on as typed, and each replica, and an
   AOF replayed at startup, ran `DD` again and deleted whatever its own copy

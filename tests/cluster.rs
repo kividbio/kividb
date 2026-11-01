@@ -1834,20 +1834,55 @@ fn manual_failover_swaps_roles_without_losing_acknowledged_writes() {
     let writer = counting_writer(&stop, &key, [nodes[0].port, replica.port]);
 
     std::thread::sleep(Duration::from_millis(500));
-    let reply = replica.conn().cmd(&["CLUSTER", "FAILOVER"]);
-    assert!(reply.is_ok(), "CLUSTER FAILOVER: {reply:?}");
-
-    let swapped = (0..300).any(|_| {
-        std::thread::sleep(Duration::from_millis(100));
-        replica.is_master() && !nodes[0].is_master()
-    });
-    if !swapped {
+    // A manual failover is given up, safely, when the replica has not caught
+    // up or won its election in the time the master holds writes for it: on
+    // a machine busy with the rest of the suite, the voters' answers (each
+    // synced to disk first) can be that slow. That is asked again, as an
+    // operator would. Anything else that stops it fails the test: a master
+    // that does not answer the request in time, as one did whose answer
+    // waited on a worker thread blocked by a write held for the handoff.
+    let logs = || {
         let logs: Vec<String> = nodes
             .iter()
             .chain(std::iter::once(&replica))
             .map(|n| format!("==== node {}\n{}", n.port, n.log()))
             .collect();
-        panic!("roles did not swap within 30 s\n{}", logs.join("\n"));
+        logs.join("\n")
+    };
+    let given_up_in_time = || {
+        let log = replica.log();
+        log.matches("Manual failover abandoned: the election")
+            .count()
+            + log
+                .matches("did not catch up with the master in time")
+                .count()
+    };
+    const ATTEMPTS: usize = 3;
+    let mut swapped = false;
+    for attempt in 1..=ATTEMPTS {
+        let reply = replica.conn().cmd(&["CLUSTER", "FAILOVER"]);
+        assert!(reply.is_ok(), "CLUSTER FAILOVER {attempt}: {reply:?}");
+        // The replica has 5 s to catch up and win; the master holds writes
+        // for 10.
+        swapped = (0..150).any(|_| {
+            std::thread::sleep(Duration::from_millis(100));
+            replica.is_master() && !nodes[0].is_master()
+        });
+        if swapped {
+            break;
+        }
+        assert_eq!(
+            given_up_in_time(),
+            attempt,
+            "failover {attempt} neither swapped the roles in 15 s nor ran out of time\n{}",
+            logs()
+        );
+    }
+    if !swapped {
+        panic!(
+            "roles did not swap in {ATTEMPTS} manual failovers\n{}",
+            logs()
+        );
     }
     wait_until(
         "the old master to follow the new one",
@@ -1872,6 +1907,10 @@ fn manual_failover_swaps_roles_without_losing_acknowledged_writes() {
 
 /// A writer that INCRs `key` until `stop`, follows redirects between the two
 /// `ports`, and counts only the INCRs acknowledged.
+///
+/// It waits for a reply longer than a handoff holds writes (10 s), so that
+/// an INCR the pause holds is answered, not given up on while it is still
+/// to be applied: that would be counted short of what was applied.
 fn counting_writer(
     stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     key: &str,
@@ -1879,10 +1918,16 @@ fn counting_writer(
 ) -> std::thread::JoinHandle<i64> {
     let stop = std::sync::Arc::clone(stop);
     let key = key.to_string();
+    let patient = |conn: Conn| {
+        conn.stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .ok()
+            .map(|_| conn)
+    };
     std::thread::spawn(move || {
         let mut acked = 0i64;
         let mut target = 0usize;
-        let mut conn = Conn::connect(ports[target]);
+        let mut conn = patient(Conn::connect(ports[target])).expect("a read timeout");
         while !stop.load(std::sync::atomic::Ordering::Relaxed) {
             match conn.try_cmd(&["INCR", &key]) {
                 Ok(Resp::Int(_)) => acked += 1,
@@ -1891,7 +1936,7 @@ fn counting_writer(
                 _ => {
                     target = 1 - target;
                     std::thread::sleep(Duration::from_millis(5));
-                    if let Some(c) = Conn::try_connect(ports[target]) {
+                    if let Some(c) = Conn::try_connect(ports[target]).and_then(patient) {
                         conn = c;
                     }
                 }
