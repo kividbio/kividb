@@ -44,6 +44,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A replica no longer keeps a key its master moved, or found expired
+  while moving.** A `MOVE` that found its key past its time answered `0`
+  but was still sent to replicas and the AOF, and the replica, which never
+  takes a key as expired while it applies its master's stream, moved the
+  key. It then kept it for good, in the database it moved it to, and later
+  kept a new key of the same name in the first. A `MOVE` or `COPY` that
+  moved nothing is no longer propagated, as in Redis. And a key that
+  expired in the database it was moved to could have its `DEL` sent before
+  the `MOVE`: `MOVE` and `COPY ... DB` are now ordered against the key in
+  both databases.
 - **`expired` comes before the event of a write that makes the key
   again.** When the background sweep, or another client's read, deleted a
   key past its time, its `expired` notification was published after the

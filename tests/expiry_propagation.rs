@@ -401,7 +401,23 @@ fn assert_same(master: &mut Conn, replica: &mut Conn) {
         m.len(),
         r.len()
     );
-    assert_eq!(master.cmd(&["DBSIZE"]), replica.cmd(&["DBSIZE"]));
+    // As many keys, past their time or not. Counted with the replica caught
+    // up and nothing written on the master in between: a key the master
+    // deleted while the datasets were read (the sweep, or a read, found it
+    // past its time) has its `DEL` on the way, and the replica, which does
+    // not delete keys itself, still holds it.
+    wait_until("the replica, caught up and quiet", 60, || {
+        let offset = master.info("replication", "master_repl_offset");
+        if replica.info("replication", "slave_repl_offset") != offset {
+            return false;
+        }
+        let sizes = (master.cmd(&["DBSIZE"]), replica.cmd(&["DBSIZE"]));
+        if master.info("replication", "master_repl_offset") != offset {
+            return false;
+        }
+        assert_eq!(sizes.0, sizes.1, "master and replica hold as many keys");
+        true
+    });
 }
 
 /// Writes to keys that expire as they are written to, from `clients`
@@ -956,6 +972,38 @@ fn a_key_expired_in_a_database_no_client_selected_leaves_the_stream_in_0() {
     );
     assert_eq!(m.cmd(&["DEL", "aof-mark"]).i(), 1);
     assert_eq!(dataset(&mut m), expected, "the replay");
+}
+
+/// A `MOVE` or `COPY` that answered 0 moved nothing, and is not sent: a
+/// replica, and a replay of the AOF, which never take a key as gone because
+/// of its time, moved a key past its time that the master had left where it
+/// was, and kept it in the other database for good.
+#[test]
+fn a_move_or_copy_that_moved_nothing_is_not_propagated() {
+    let master = Server::start(&["--aof"]);
+    let mut m = master.conn();
+    assert_eq!(m.cmd(&["SET", "here", "v"]).s(), "OK");
+    assert_eq!(m.cmd(&["SELECT", "3"]).s(), "OK");
+    assert_eq!(m.cmd(&["SET", "here", "w"]).s(), "OK");
+    assert_eq!(m.cmd(&["SELECT", "0"]).s(), "OK");
+    // A key that is not there; one the other database has already.
+    assert_eq!(m.cmd(&["MOVE", "missing", "3"]).i(), 0);
+    assert_eq!(m.cmd(&["MOVE", "here", "3"]).i(), 0);
+    assert_eq!(m.cmd(&["COPY", "missing", "there"]).i(), 0);
+    assert_eq!(m.cmd(&["COPY", "here", "here", "DB", "3"]).i(), 0);
+    assert_eq!(m.cmd(&["SET", "aof-mark", "1"]).s(), "OK");
+    wait_until("the AOF to have everything", 20, || {
+        position(&master.aof(), b"$8\r\naof-mark\r\n").is_some()
+    });
+    let aof = master.aof();
+    assert_eq!(position(&aof, b"$4\r\nMOVE\r\n"), None, "a MOVE was logged");
+    assert_eq!(position(&aof, b"$4\r\nCOPY\r\n"), None, "a COPY was logged");
+    // One that moves is.
+    assert_eq!(m.cmd(&["SET", "away", "v"]).s(), "OK");
+    assert_eq!(m.cmd(&["MOVE", "away", "3"]).i(), 1);
+    wait_until("the MOVE to be logged", 20, || {
+        position(&master.aof(), b"$4\r\nMOVE\r\n").is_some()
+    });
 }
 
 // ── Expiry, the write gate and hash tags: no deadlock ─────────────────────────
