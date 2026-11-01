@@ -6,6 +6,11 @@ pub static AOF_FSYNCED: AtomicU64 = AtomicU64::new(0);
 /// Records that never reached the writer. Should stay 0 outside shutdown; a
 /// non-zero value means the AOF has a hole and cannot reconstruct the dataset.
 pub static AOF_LOST_RECORDS: AtomicU64 = AtomicU64::new(0);
+/// Replies to writes sent after waiting [`ACK_WAIT_LIMIT`] for their records
+/// to reach the file, without them (`aof_acks_before_write` in `INFO`). Each
+/// is a write a process killed right then could lose: the disk had fallen
+/// that far behind.
+pub static AOF_ACKS_BEFORE_WRITE: AtomicU64 = AtomicU64::new(0);
 
 /// Count a record that could not be queued, and say so once.
 ///
@@ -355,10 +360,16 @@ pub fn may_log(name: &[u8]) -> bool {
         || name.eq_ignore_ascii_case(b"EXEC")
 }
 
+/// How long a reply to a write waits for its records to reach the file
+/// before it is sent without them. Counted in [`AOF_ACKS_BEFORE_WRITE`].
+const ACK_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Wait until every record queued on `tx` before now is in the file.
 ///
-/// Bounded: should the writer be gone, a reply is late, not lost. With the
-/// AOF off, or no writer, nothing to wait for.
+/// Bounded: should the writer be gone, or the disk fall more than
+/// [`ACK_WAIT_LIMIT`] behind, a reply is late, not lost — and is sent
+/// without its write, which a process killed then can lose. With the AOF
+/// off, or no writer, nothing to wait for.
 pub async fn written(tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
     if !acks_wait() || !WRITER_RUNNING.load(Ordering::Acquire) {
         return;
@@ -378,11 +389,9 @@ pub async fn written(tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
     if write_what_is_queued(false).is_none() {
         QUEUED.notify_one();
     }
-    if tokio::time::timeout(std::time::Duration::from_secs(5), wait)
-        .await
-        .is_err()
-    {
+    if tokio::time::timeout(ACK_WAIT_LIMIT, wait).await.is_err() {
         BARRIERS.lock().remove(&id);
+        AOF_ACKS_BEFORE_WRITE.fetch_add(1, Ordering::Relaxed);
         log_throttled!(
             10,
             crate::loglevel::WARN,
