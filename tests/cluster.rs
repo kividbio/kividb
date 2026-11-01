@@ -1858,31 +1858,39 @@ fn manual_failover_swaps_roles_without_losing_acknowledged_writes() {
                 .count()
     };
     const ATTEMPTS: usize = 3;
-    let mut swapped = false;
+    let mut promoted = false;
     for attempt in 1..=ATTEMPTS {
         let reply = replica.conn().cmd(&["CLUSTER", "FAILOVER"]);
         assert!(reply.is_ok(), "CLUSTER FAILOVER {attempt}: {reply:?}");
         // The replica has 5 s to catch up and win; the master holds writes
         // for 10.
-        swapped = (0..150).any(|_| {
+        promoted = (0..150).any(|_| {
             std::thread::sleep(Duration::from_millis(100));
-            replica.is_master() && !nodes[0].is_master()
+            replica.is_master()
         });
-        if swapped {
+        if promoted {
             break;
         }
         assert_eq!(
             given_up_in_time(),
             attempt,
-            "failover {attempt} neither swapped the roles in 15 s nor ran out of time\n{}",
+            "failover {attempt} neither promoted the replica in 15 s nor ran out of time\n{}",
             logs()
         );
     }
-    if !swapped {
+    if !promoted {
         panic!(
-            "roles did not swap in {ATTEMPTS} manual failovers\n{}",
+            "the replica was not promoted in {ATTEMPTS} manual failovers\n{}",
             logs()
         );
+    }
+    // The old master hears of it on the bus.
+    let swapped = (0..300).any(|_| {
+        std::thread::sleep(Duration::from_millis(100));
+        replica.is_master() && !nodes[0].is_master()
+    });
+    if !swapped {
+        panic!("the old master did not step down within 30 s\n{}", logs());
     }
     wait_until(
         "the old master to follow the new one",
