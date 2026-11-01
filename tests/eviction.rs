@@ -235,6 +235,11 @@ impl Server {
 
     /// Start one in `dir`, on whatever is saved there.
     fn start_in(dir: PathBuf, extra: &[&str]) -> Self {
+        Self::start_in_env(dir, extra, &[])
+    }
+
+    /// [`Server::start_in`], with `env` in its environment.
+    fn start_in_env(dir: PathBuf, extra: &[&str], env: &[(&str, &str)]) -> Self {
         let port = free_port();
         let log = std::fs::OpenOptions::new()
             .create(true)
@@ -256,6 +261,7 @@ impl Server {
                 "kividb.conf",
             ])
             .args(extra)
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(log)
@@ -1218,4 +1224,172 @@ fn each_command_family_uses_its_keys_once() {
         c.cmd(&["OBJECT", "IDLETIME", "q"]).i() >= 2,
         "only asked about"
     );
+}
+
+// ── Snapshots (#284) ──────────────────────────────────────────────────────────
+//
+// A snapshot captures the dataset at one instant and writes it out after:
+// it holds each string's entry, and a key written over, deleted or evicted
+// meanwhile stays allocated until the snapshot has written it. That is
+// memory evicting keys does not give back (in Redis it is the forked
+// child's, outside `used_memory`). Counted against `maxmemory`, each write
+// during a snapshot evicted a key to no effect, and the next, until nearly
+// every key was gone. The servers here stop each snapshot once it has
+// captured the dataset (`failpoint.snapshot-writing.<n>` in their
+// directory), for as long as the test needs.
+
+/// Keys of 8 KB values: kept on their own, not in the key's entry, as in
+/// the report.
+const SNAPSHOT_KEYS: usize = 3000;
+
+fn big_value(fill: char) -> String {
+    std::iter::repeat_n(fill, 8 * 1024).collect()
+}
+
+impl Server {
+    /// One whose snapshots stop once they have captured the dataset.
+    fn start_holding_snapshots(extra: &[&str]) -> Self {
+        let dir = tempfile::tempdir().unwrap().keep();
+        Self::start_in_env(
+            dir,
+            extra,
+            &[("KIVIDB_TEST_FAILPOINTS", "snapshot-writing")],
+        )
+    }
+
+    /// Wait for the `n`th snapshot to have captured the dataset and
+    /// stopped. Removing the file returned lets it go on.
+    fn snapshot_held(&self, n: u32) -> PathBuf {
+        let path = self.dir.join(format!("failpoint.snapshot-writing.{n}"));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !path.exists() {
+            assert!(Instant::now() < deadline, "no snapshot reached {path:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        path
+    }
+}
+
+impl Conn {
+    fn not_counted(&mut self) -> i64 {
+        self.info("memory", "mem_not_counted_for_evict")
+            .parse()
+            .unwrap()
+    }
+
+    /// Fill `s0 ..` with 8 KB values, and limit the server to 4 MB more
+    /// than it then uses.
+    fn fill_to_the_limit(&mut self) -> i64 {
+        let value = big_value('a');
+        for i in 0..SNAPSHOT_KEYS {
+            assert!(self.cmd(&["SET", &format!("s{i}"), &value]).ok());
+        }
+        self.limit_to(4 * MB)
+    }
+
+    /// While a snapshot holds every key: write over every one, a tenth of
+    /// them deleted first. Not a key is evicted for it, and nothing is
+    /// refused: what the snapshot holds is not counted.
+    fn write_over_everything(&mut self) {
+        let value = big_value('b');
+        for i in 0..SNAPSHOT_KEYS / 10 {
+            assert_eq!(self.cmd(&["DEL", &format!("s{i}")]).i(), 1);
+        }
+        for i in 0..SNAPSHOT_KEYS {
+            let reply = self.cmd(&["SET", &format!("s{i}"), &value]);
+            assert!(reply.ok(), "write {i} was refused: {reply:?}");
+        }
+        assert_eq!(self.evicted(), 0, "keys were evicted for the snapshot");
+        let held = self.not_counted();
+        assert!(
+            held > 16 * MB,
+            "the snapshot holds 24 MB of values written over; {held} bytes are not counted"
+        );
+    }
+
+    /// Once the snapshot is written: what it held is freed, nothing is left
+    /// uncounted, and the server is under its limit with every key.
+    fn snapshot_let_go(&mut self, limit: i64) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let held = self.not_counted();
+            if held == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{held} bytes are still not counted"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let used = self.used_memory();
+        assert!(
+            used <= limit,
+            "{used} bytes used, over the limit of {limit}"
+        );
+        assert_eq!(self.evicted(), 0);
+        assert_eq!(self.cmd(&["DBSIZE"]).i(), SNAPSHOT_KEYS as i64);
+        assert_eq!(self.cmd(&["GET", "s0"]).s(), big_value('b'));
+    }
+
+    fn wait_for(&mut self, section: &str, field: &str, value: &str) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while self.info(section, field) != value {
+            assert!(Instant::now() < deadline, "{field} never became {value}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+#[test]
+fn writes_during_a_bgsave_evict_nothing_that_fits() {
+    let server = Server::start_holding_snapshots(&["--maxmemory-policy", "allkeys-lru"]);
+    let mut c = server.conn();
+    let limit = c.fill_to_the_limit();
+    assert_eq!(c.cmd(&["BGSAVE"]).s(), "Background saving started");
+    let held = server.snapshot_held(1);
+    c.write_over_everything();
+    std::fs::remove_file(held).unwrap();
+    c.wait_for("persistence", "rdb_bgsave_in_progress", "0");
+    assert_eq!(c.info("persistence", "rdb_last_bgsave_status"), "ok");
+    c.snapshot_let_go(limit);
+}
+
+#[test]
+fn writes_during_an_aof_rewrite_evict_nothing_that_fits() {
+    let server = Server::start_holding_snapshots(&["--maxmemory-policy", "allkeys-lru", "--aof"]);
+    let mut c = server.conn();
+    let limit = c.fill_to_the_limit();
+    assert!(c.cmd(&["BGREWRITEAOF"]).s().contains("rewriting started"));
+    let held = server.snapshot_held(1);
+    c.write_over_everything();
+    std::fs::remove_file(held).unwrap();
+    c.wait_for("persistence", "aof_rewrite_in_progress", "0");
+    c.snapshot_let_go(limit);
+}
+
+/// A full sync lays the whole dataset out in memory for the replica, and
+/// queues for it every write made meanwhile: neither is given back by
+/// evicting keys, and neither is counted (Redis does not count what it
+/// queues for a replica either). Once sent, the payload is not kept: a copy
+/// of it stayed in the writer's buffer for as long as the replica was
+/// connected, over the limit for good.
+#[test]
+fn writes_during_a_full_sync_evict_nothing_that_fits() {
+    let master = Server::start_holding_snapshots(&["--maxmemory-policy", "allkeys-lru"]);
+    let replica = Server::start(&[]);
+    let (mut m, mut r) = (master.conn(), replica.conn());
+    let limit = m.fill_to_the_limit();
+    assert!(
+        r.cmd(&["REPLICAOF", "127.0.0.1", &master.port.to_string()])
+            .ok()
+    );
+    let held = master.snapshot_held(1);
+    m.write_over_everything();
+    std::fs::remove_file(held).unwrap();
+    r.wait_for("replication", "master_link_status", "up");
+    assert_eq!(m.cmd(&["WAIT", "1", "10000"]).i(), 1);
+    m.snapshot_let_go(limit);
+    assert_eq!(r.cmd(&["DBSIZE"]).i(), SNAPSHOT_KEYS as i64);
+    assert_eq!(r.cmd(&["GET", "s0"]).s(), big_value('b'));
 }

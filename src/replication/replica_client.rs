@@ -1968,8 +1968,11 @@ pub(crate) fn peer_ip_port(peer_addr: &str) -> (String, u16) {
 /// We send the full RDB dump then register with the hub to receive
 /// ongoing write command propagation.
 #[allow(clippy::too_many_arguments)]
-pub async fn handle_replica_connection<R>(
+pub async fn handle_replica_connection<R, W>(
     reader: R,
+    // The socket's writing half, which the writer task behind `resp_tx`
+    // writes to: the payload of a full sync is written to it directly.
+    writer: Arc<tokio::sync::Mutex<W>>,
     resp_tx: mpsc::Sender<Vec<u8>>,
     write_task: tokio::task::JoinHandle<()>,
     store: store::Store,
@@ -1996,6 +1999,7 @@ pub async fn handle_replica_connection<R>(
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let rollback_hub = |hub: &crate::replication::HubTx, id: u64| {
         let _ = hub.send(crate::replication::HubMsg::Deregister(id));
@@ -2013,7 +2017,21 @@ where
     // queueing an unbounded backlog — see `replication::mod::start_hub`.
     let pending_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-    let resp_tx_fwd = resp_tx.clone();
+    // The forwarder writes to the socket itself, one batch at a time, as the
+    // io_uring loop's does. Handed to the writer task, the replica's queue
+    // was emptied into the writer's at memory speed, however slowly the
+    // replica read: memory counted against `maxmemory`, where the replica's
+    // own queue is not (#284).
+    let writer_fwd = Arc::clone(&writer);
+    let write_batch = move |batch: Vec<u8>| {
+        let writer = Arc::clone(&writer_fwd);
+        async move {
+            use tokio::io::AsyncWriteExt;
+            crate::stats::TOTAL_NET_OUTPUT_BYTES.fetch_add(batch.len() as u64, Ordering::Relaxed);
+            crate::stats::record_write();
+            writer.lock().await.write_all(&batch).await.is_ok()
+        }
+    };
     let pending_bytes_fwd = Arc::clone(&pending_bytes);
     let forward_task = tokio::spawn(async move {
         if rdb_enqueued_rx.await.is_err() {
@@ -2040,14 +2058,14 @@ where
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         pending_bytes_fwd.fetch_sub(batch.len() as u64, Ordering::Relaxed);
-                        let _ = resp_tx_fwd.send(batch).await.is_err();
+                        write_batch(batch).await;
                         return;
                     }
                 }
             }
 
             pending_bytes_fwd.fetch_sub(batch.len() as u64, Ordering::Relaxed);
-            if resp_tx_fwd.send(batch).await.is_err() {
+            if !write_batch(batch).await {
                 break;
             }
         }
@@ -2110,6 +2128,9 @@ where
     // ── 3. `+CONTINUE`; or `+FULLRESYNC` (omitted for legacy pre-PSYNC
     // `SYNC\r\n`) and then the payload.
     let mut frames: Vec<Vec<u8>> = Vec::with_capacity(3);
+    // The payload is not counted against `maxmemory` until it is written
+    // (#284).
+    let mut payload_not_counted = None;
     match full_sync {
         None => frames.push(format!("+CONTINUE {}\r\n", repl_state.repl_id()).into_bytes()),
         Some(sync) => {
@@ -2118,19 +2139,32 @@ where
             }
             frames.push(format!("${}\r\n", sync.payload.len()).into_bytes());
             frames.push(sync.payload);
+            payload_not_counted = Some(sync.not_counted);
             if let Some(replica) = repl_state.replica(replica_id) {
                 replica.set_state(crate::replication::ReplicaState::SendBulk);
             }
         }
     }
     let full = frames.len() > 1;
-    for frame in frames {
-        if resp_tx.send(frame).await.is_err() {
-            rollback_hub(&hub_tx, replica_id);
-            drop(rdb_enqueued_tx);
-            return Ok(());
+    // Written here, as the io_uring loop writes them, not queued for the
+    // writer task: the forwarder starts once the payload is written, so the
+    // writes made meanwhile wait in the replica's own queue, which is not
+    // counted against `maxmemory`, rather than in the writer's behind the
+    // payload, which was; and the payload is let go of once it is written.
+    // Nothing is queued for the writer task before these.
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut out = writer.lock().await;
+        for frame in frames {
+            crate::stats::TOTAL_NET_OUTPUT_BYTES.fetch_add(frame.len() as u64, Ordering::Relaxed);
+            if out.write_all(&frame).await.is_err() {
+                rollback_hub(&hub_tx, replica_id);
+                drop(rdb_enqueued_tx);
+                return Ok(());
+            }
         }
     }
+    drop(payload_not_counted);
 
     let _ = rdb_enqueued_tx.send(());
     if full {

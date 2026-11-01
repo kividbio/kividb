@@ -174,6 +174,12 @@ impl SharedBytes {
         Some(std::mem::replace(self, SharedBytes { to }))
     }
 
+    /// Whether this is the bytes' only holder: letting go of it frees them.
+    #[inline]
+    pub fn is_unique(&self) -> bool {
+        self.header().holders.load(Ordering::Acquire) == 1
+    }
+
     /// The bytes this takes on the heap, header and all.
     #[inline]
     pub fn heap_size(&self) -> usize {

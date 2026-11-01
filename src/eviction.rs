@@ -882,17 +882,16 @@ thread_local! {
     static DBS: std::cell::RefCell<Dbs> = std::cell::RefCell::new(Dbs::default());
 }
 
-/// Delete `key` to make room, with everything a deletion entails.
-fn evict(ctx: &mut Ctx, db: usize, key: &str, ordered: bool) -> bool {
+/// Delete `key` to make room, with everything a deletion entails. Returns
+/// about how much memory that gives back (see `store::Taken::footprint`),
+/// or None if the key was gone already.
+fn evict(ctx: &mut Ctx, db: usize, key: &str, ordered: bool) -> Option<usize> {
     // Ordered against other writes to the key, like any write, while
     // anything reads the write stream. See `write_order`.
     let _order = (ordered && !crate::command_gate::alone_on_this_thread())
         .then(|| crate::write_order::lock_keys(db, std::iter::once(key.as_bytes())));
 
-    if !crate::commands::helpers::delete_key(ctx.store, db, key) {
-        // Gone already.
-        return false;
-    }
+    let given = crate::commands::helpers::delete_key_sized(ctx.store, db, key)?;
     crate::vector::maybe_unindex(ctx.index_store, db, key);
     crate::vector::maybe_request_compaction(ctx.index_store, ctx.compaction_tx, key);
     crate::stats::record_evicted();
@@ -915,20 +914,29 @@ fn evict(ctx: &mut Ctx, db: usize, key: &str, ordered: bool) -> bool {
         crate::replication::replicate_one_write(ctx, &[b"DEL".to_vec(), key.as_bytes().to_vec()]);
         *ctx.selected_db = selected;
     }
-    true
+    Some(given)
 }
 
 /// Delete keys until memory use is at most `limit`. False if the policy has
 /// nothing more to delete and it is still over: the write is refused.
 ///
+/// Memory use is what `maxmemory` is measured against: what is allocated,
+/// less what deleting keys would not give back (`memory_use::counted`), such
+/// as what a snapshot being written still holds of keys written over,
+/// deleted or evicted since it began (#284).
+///
 /// Called with the write gate held and before the command has locked its
 /// own keys' order.
 pub fn make_room(ctx: &mut Ctx, limit: usize, ordered: bool) -> bool {
     let policy = policy();
-    if crate::memory_use::allocated() <= limit {
+    let used = crate::memory_use::counted();
+    if used <= limit {
         return true;
     }
     if policy == Policy::NoEviction {
+        return false;
+    }
+    if stalled(used) {
         return false;
     }
     // Taken out for the while, and put back: nothing here makes room again.
@@ -938,6 +946,39 @@ pub fn make_room(ctx: &mut Ctx, limit: usize, ordered: bool) -> bool {
     done
 }
 
+/// Memory use when deleting keys last stopped giving memory back (see
+/// [`make_room_in`]), or 0.
+static STALLED_AT: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether deleting keys has stopped giving memory back, and memory use is
+/// no lower since: deleting more would only lose keys, so the write is
+/// refused. Over once memory use is lower, or the limit is changed.
+fn stalled(used: usize) -> bool {
+    let at = STALLED_AT.load(Ordering::Relaxed);
+    if at == 0 {
+        return false;
+    }
+    if used >= at {
+        return true;
+    }
+    STALLED_AT.store(0, Ordering::Relaxed);
+    false
+}
+
+/// `maxmemory` changed: whatever made deleting keys no use is looked at
+/// again.
+pub fn limit_changed() {
+    STALLED_AT.store(0, Ordering::Relaxed);
+}
+
+/// Whether keys that took `given` bytes have been evicted to no effect:
+/// twice what memory use was over the limit by (`over`), and a megabyte
+/// more for what other threads allocate meanwhile, and memory use (`used`)
+/// is no lower than when it began (`began`).
+fn fruitless(given: usize, over: usize, used: usize, began: usize) -> bool {
+    given > over.saturating_mul(2).saturating_add(1 << 20) && used >= began
+}
+
 fn make_room_in(ctx: &mut Ctx, policy: Policy, limit: usize, ordered: bool, dbs: &mut Dbs) -> bool {
     let volatile = policy.volatile();
     let mut fresh = false;
@@ -945,7 +986,31 @@ fn make_room_in(ctx: &mut Ctx, policy: Policy, limit: usize, ordered: bool, dbs:
     // A key that could not be deleted — it went between being chosen and
     // being deleted — is no reason to stop, but nothing but those is.
     let mut misses = 0;
-    while crate::memory_use::allocated() > limit {
+    // Nor is an eviction that gives nothing back, now and then; but keys
+    // that took far more than memory use was over by, evicted with memory
+    // use no lower, are memory that evicting keys does not give back: the
+    // keyspace was emptied that way (#284). Rather than lose every key,
+    // stop, and refuse writes while memory use stays that high.
+    let began = crate::memory_use::counted();
+    let over = began.saturating_sub(limit);
+    let mut given = 0usize;
+    loop {
+        let used = crate::memory_use::counted();
+        if used <= limit {
+            return true;
+        }
+        if fruitless(given, over, used, began) {
+            STALLED_AT.store(used, Ordering::Relaxed);
+            log_throttled!(
+                60,
+                crate::loglevel::WARN,
+                "maxmemory: keys taking {given} bytes were evicted and memory use did not go \
+                 down ({used} bytes counted against maxmemory {limit}, {} not counted): \
+                 evicting stops, and writes are refused with OOM until memory use comes down",
+                crate::memory_use::not_counted()
+            );
+            return false;
+        }
         let Some((db, key)) = choose(ctx, policy, dbs.get(ctx, volatile, fresh), &mut rng) else {
             if fresh {
                 return false;
@@ -955,22 +1020,41 @@ fn make_room_in(ctx: &mut Ctx, policy: Policy, limit: usize, ordered: bool, dbs:
             continue;
         };
         fresh = false;
-        if evict(ctx, db, &key, ordered) {
-            misses = 0;
-        } else {
-            misses += 1;
-            if misses > 64 {
-                return false;
+        match evict(ctx, db, &key, ordered) {
+            Some(size) => {
+                misses = 0;
+                given = given.saturating_add(size);
+            }
+            None => {
+                misses += 1;
+                if misses > 64 {
+                    return false;
+                }
             }
         }
     }
-    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// Eviction stops only once keys well past what memory use was over by
+    /// have gone with memory use no lower: not for a deletion or two that
+    /// give nothing back, nor while memory use comes down.
+    #[test]
+    fn eviction_stops_when_it_gives_nothing_back() {
+        const MB: usize = 1 << 20;
+        // 8 KB over; 1.1 MB of keys evicted, memory use as it was.
+        assert!(fruitless(MB + 17 * 1024, 8 * 1024, 100 * MB, 100 * MB));
+        assert!(!fruitless(MB, 8 * 1024, 100 * MB, 100 * MB));
+        // Lower than when it began: the evictions are working.
+        assert!(!fruitless(50 * MB, 8 * 1024, 100 * MB - 1, 100 * MB));
+        // Far over: twice that is evicted first.
+        assert!(!fruitless(40 * MB, 20 * MB, 120 * MB, 120 * MB));
+        assert!(fruitless(42 * MB, 20 * MB, 121 * MB, 120 * MB));
+    }
 
     #[test]
     fn policies_by_name() {

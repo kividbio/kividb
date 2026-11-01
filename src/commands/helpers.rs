@@ -779,12 +779,24 @@ pub fn delete_key(store: &Store, db: usize, key: &str) -> bool {
     take_key(store, db, key).is_some()
 }
 
+/// [`delete_key`], saying about how much memory the key took: what
+/// deleting it gives back, or leaves to a snapshot that still holds it
+/// (`store::Taken::footprint`). For eviction to see that it gets anywhere.
+pub fn delete_key_sized(store: &Store, db: usize, key: &str) -> Option<usize> {
+    let value_shard = store::get_shard(&store[db], key);
+    let removed = write_lock!(value_shard).remove(key)?;
+    // Freed (or left to what holds it) with the shard unlocked.
+    Some(removed.footprint())
+}
+
 /// [`delete_key`], handing back the value, for `UNLINK` to free: after the
 /// shard lock is released, and in the background if it is large.
 pub fn take_key(store: &Store, db: usize, key: &str) -> Option<KiviDBValue> {
     let value_shard = store::get_shard(&store[db], key);
     let removed = write_lock!(value_shard).remove(key);
-    removed.map(store::Taken::into_value)
+    // To be freed: what a snapshot still holds of the key is not to be
+    // evicted for (#284).
+    removed.map(store::Taken::into_value_to_free)
 }
 
 /// [`delete_key`] plus `expired_keys` stat — use only after an `is_expired`

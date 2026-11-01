@@ -904,7 +904,7 @@ impl ShardMap {
         ttl_replaced(&mut self.ttl, old, new);
         // SAFETY: the table's hold, given up: whoever else holds the old
         // entry still reads it as it was.
-        unsafe { old.release() };
+        unsafe { old.let_go() };
         true
     }
 
@@ -931,7 +931,7 @@ impl ShardMap {
         *slot = Slot::new(new, slot.hash_part());
         ttl_replaced(&mut self.ttl, old, new);
         // SAFETY: as in `set_expires`.
-        unsafe { old.release() };
+        unsafe { old.let_go() };
         true
     }
 
@@ -1145,7 +1145,7 @@ impl ShardMap {
         self.ttl.clear();
         for slot in self.table.drain() {
             // SAFETY: the table's hold, given up.
-            unsafe { slot.entry().release() };
+            unsafe { slot.entry().let_go() };
         }
     }
 

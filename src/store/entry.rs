@@ -36,8 +36,13 @@
 //! **Holders.** The table holds each entry once. A frozen snapshot, and
 //! whatever else must read a key and its value once the shard is unlocked,
 //! takes another hold ([`EntryRef`]); the block goes when the last hold
-//! does. What a holder can read of a block (the key, the value, the time to
-//! live) is never written while anybody but the table holds it: a time to
+//! does. An entry the table lets go of while another holds it is memory
+//! that deleting keys does not give back until that hold goes: it is
+//! counted as such (`memory_use::NOT_COUNTED`), so that a write during a
+//! snapshot does not evict key after key to no effect (#284; see
+//! [`Entry::let_go`]). What a holder can read of a block (the key, the
+//! value, the time to live) is never written while anybody but the table
+//! holds it: a time to
 //! live, or an inline string, is changed in place only when the table's is
 //! the only hold, and otherwise in a new entry. The position is the table's
 //! own, written only with the shard locked for writing, and read by nothing
@@ -84,10 +89,16 @@ const HEADER: usize = std::mem::size_of::<Header>();
 const _: () = assert!(HEADER == 12);
 
 const FORM_SHIFT: u32 = 24;
-const HOLDERS: u32 = (1 << FORM_SHIFT) - 1;
+/// The table let go of the entry while something else held it: its block
+/// is counted as memory deleting keys would not give back
+/// (`memory_use::NOT_COUNTED`), until its last hold goes.
+const LEFT_HELD: u32 = 1 << 23;
+/// With [`LEFT_HELD`]: so are its string's bytes, kept on their own.
+const LEFT_HELD_BYTES: u32 = 1 << 22;
+const HOLDERS: u32 = (1 << 22) - 1;
 /// More holds than this and the process stops, as `Arc` does long before
-/// its count could wrap into the form.
-const MAX_HOLDERS: u32 = 1 << 23;
+/// its count could wrap into the flags.
+const MAX_HOLDERS: u32 = 1 << 21;
 
 /// A string whose bytes follow the key.
 const INLINE: u32 = 1;
@@ -166,6 +177,12 @@ fn allocate(size: usize) -> NonNull<u8> {
             }
         }
     }
+}
+
+/// What a block of `size` bytes adds to `memory_use::allocated`: a slab's
+/// block counts at its class's size.
+fn allocated_size(size: usize) -> usize {
+    value_slab::class_of(size).map_or(size, value_slab::block_size)
 }
 
 /// # Safety
@@ -588,11 +605,15 @@ impl Entry {
     /// # Safety
     /// The caller has a hold, and does not use the entry again.
     pub(super) unsafe fn release(self) {
-        if self.header().word.fetch_sub(1, Ordering::Release) & HOLDERS != 1 {
+        let before = self.header().word.fetch_sub(1, Ordering::Release);
+        if before & HOLDERS != 1 {
             return;
         }
         // What the other holders did with the entry comes before it goes.
         fence(Ordering::Acquire);
+        if before & LEFT_HELD != 0 {
+            self.counted_again(before & LEFT_HELD_BYTES != 0);
+        }
         let size = self.size();
         if self.form() == WHOLE {
             // SAFETY: the last hold: nothing reads the value any more.
@@ -606,12 +627,88 @@ impl Entry {
         unsafe { deallocate(self.0.cast(), size) };
     }
 
-    /// The value, owned, and the caller's hold given up. A string kept
-    /// inline is copied out; anything else is another handle on it.
+    /// Let go of the table's hold: [`Entry::release`], and if something
+    /// else holds the entry (a frozen snapshot), what it keeps alive is
+    /// counted as memory deleting keys does not give back until it lets go
+    /// too (#284).
+    ///
+    /// Nothing takes a new hold on an entry the table has let go of (holds
+    /// are taken from the table, with the shard locked), so a count of one
+    /// read here is the table's alone, and stays so.
     ///
     /// # Safety
-    /// The caller has a hold, and does not use the entry again.
-    pub(super) unsafe fn into_value(self) -> KiviDBValue {
+    /// The caller has the table's hold, and does not use the entry again.
+    #[inline]
+    pub(super) unsafe fn let_go(self) {
+        if self.header().word.load(Ordering::Relaxed) & HOLDERS != 1 {
+            self.left_held(true);
+        }
+        // SAFETY: as the caller promises.
+        unsafe { self.release() };
+    }
+
+    /// The table is letting go of the entry while another holds it: count
+    /// what the entry keeps alive as not to be evicted for, and say so in
+    /// the entry, for its last hold to take back ([`Entry::release`]). With
+    /// `bytes`, a string's bytes kept on their own are counted too, if the
+    /// entry is all that has them now (nothing gets another handle on them
+    /// from an entry the table has let go of).
+    ///
+    /// Counted and marked before the table's hold goes: the last hold may go
+    /// on another thread at any moment after that.
+    #[cold]
+    #[inline(never)]
+    fn left_held(self, bytes: bool) {
+        let bytes = bytes && self.string_bytes().is_some_and(SharedBytes::is_unique);
+        crate::memory_use::not_counted_add(self.held_size(bytes));
+        let flags = LEFT_HELD | if bytes { LEFT_HELD_BYTES } else { 0 };
+        self.header().word.fetch_or(flags, Ordering::Relaxed);
+    }
+
+    /// The last hold of an entry the table let go of while held is going:
+    /// what [`Entry::left_held`] counted is counted again.
+    #[cold]
+    #[inline(never)]
+    fn counted_again(self, bytes: bool) {
+        crate::memory_use::counted_again(self.held_size(bytes));
+    }
+
+    /// A string's bytes kept on their own, not inline.
+    fn string_bytes<'a>(self) -> Option<&'a SharedBytes> {
+        if self.form() != WHOLE {
+            return None;
+        }
+        match self.whole() {
+            KiviDBValue::String(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
+
+    /// What the entry keeps allocated, as the allocator counts it: its
+    /// block, and with `bytes` its string's. The same at the first hold's
+    /// going as at the last: none of it changes while the entry is held.
+    fn held_size(self, bytes: bool) -> usize {
+        let own = match self.string_bytes() {
+            Some(b) if bytes => allocated_size(b.heap_size()),
+            _ => 0,
+        };
+        allocated_size(self.size()) + own
+    }
+
+    /// The value, owned, and the table's hold given up. A string kept
+    /// inline is copied out; anything else is another handle on it.
+    /// `kept`: the value lives on (under another key), rather than being
+    /// taken to be freed, so whatever else holds the entry keeps only its
+    /// block alive, not the value too.
+    ///
+    /// # Safety
+    /// The caller has the table's hold, and does not use the entry again.
+    pub(super) unsafe fn into_value(self, kept: bool) -> KiviDBValue {
+        // Before the value has another handle: whether the entry is all
+        // that has a string's bytes.
+        if self.header().word.load(Ordering::Relaxed) & HOLDERS != 1 {
+            self.left_held(!kept);
+        }
         let value = self.value().to_value();
         // SAFETY: as the caller promises.
         unsafe { self.release() };
@@ -774,19 +871,36 @@ impl Taken {
         entry
     }
 
-    /// The value, owned.
+    /// About how much memory the entry takes: its block, and a string's
+    /// bytes kept on their own (a collection's are not reckoned).
+    pub fn footprint(&self) -> usize {
+        self.0.held_size(true)
+    }
+
+    /// The value, owned, to keep (under another key, say).
     pub fn into_value(self) -> KiviDBValue {
         let entry = self.0;
         std::mem::forget(self);
         // SAFETY: the hold was this one's.
-        unsafe { entry.into_value() }
+        unsafe { entry.into_value(true) }
+    }
+
+    /// The value, owned, to be freed: what `UNLINK` hands to be freed in
+    /// the background. Unlike [`Taken::into_value`], what a frozen snapshot
+    /// still holds of the entry is all counted as memory deleting keys does
+    /// not give back, as when it is dropped.
+    pub fn into_value_to_free(self) -> KiviDBValue {
+        let entry = self.0;
+        std::mem::forget(self);
+        // SAFETY: the hold was this one's.
+        unsafe { entry.into_value(false) }
     }
 }
 
 impl Drop for Taken {
     fn drop(&mut self) {
-        // SAFETY: the hold is this one's.
-        unsafe { self.0.release() };
+        // SAFETY: the hold is this one's: the table's, given up.
+        unsafe { self.0.let_go() };
     }
 }
 
@@ -1032,6 +1146,53 @@ mod tests {
                 remade.release();
             }
         }
+    }
+
+    /// An entry the table lets go of while another holds it is marked, with
+    /// whether its string's bytes were counted too, and its count of holds
+    /// is what it was; one let go of with no other hold is freed as before.
+    /// (What is counted is the process's: see tests/eviction.rs.)
+    #[test]
+    fn an_entry_let_go_of_while_held_is_marked_for_its_last_hold() {
+        const _: () = assert!(MAX_HOLDERS < LEFT_HELD_BYTES && HOLDERS < LEFT_HELD_BYTES);
+        let big = vec![9u8; 2 * INLINE_MAX];
+        for (bytes, kept, flags) in [
+            (&b"inline"[..], false, LEFT_HELD),
+            (&big[..], false, LEFT_HELD | LEFT_HELD_BYTES),
+            // Taken to keep under another key: the bytes live on there.
+            (&big[..], true, LEFT_HELD),
+        ] {
+            let entry = Entry::string(b"k", bytes, None);
+            // SAFETY: the entry lives, with the table's hold (this one).
+            let held = unsafe { EntryRef::new(entry) };
+            assert_eq!(entry.holders(), 2);
+            let value = if kept {
+                // SAFETY: the table's hold, used no more.
+                Some(unsafe { entry.into_value(true) })
+            } else {
+                // SAFETY: as above.
+                unsafe { entry.let_go() };
+                None
+            };
+            let word = entry.header().word.load(Ordering::Relaxed);
+            assert_eq!(word & (LEFT_HELD | LEFT_HELD_BYTES), flags);
+            assert_eq!(entry.holders(), 1);
+            assert!(matches!(held.value(), ValueRef::String(b) if b.as_bytes() == bytes));
+            // What the last hold takes back: the block, and the bytes if
+            // they were counted.
+            let block = allocated_size(entry.size());
+            let counted = entry.held_size(flags & LEFT_HELD_BYTES != 0);
+            if flags & LEFT_HELD_BYTES != 0 {
+                assert!(counted > block + big.len());
+            } else {
+                assert_eq!(counted, block);
+            }
+            drop(held);
+            drop(value);
+        }
+        let alone = Entry::string(b"k", &big, None);
+        // SAFETY: the only hold, used no more.
+        unsafe { alone.let_go() };
     }
 
     #[test]

@@ -44,6 +44,35 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Writes during a snapshot no longer evict keys that fit under
+  `maxmemory` (#284).** A snapshot (`BGSAVE`, `SAVE`, an AOF rewrite, a
+  replica's full sync, a backup) captures the dataset at one instant and
+  writes it out after, holding each string value until it has written it.
+  A key written over, deleted or evicted meanwhile stayed allocated until
+  then, and was counted against `maxmemory`: each write over the limit
+  evicted a key, which gave nothing back, then the next, until the
+  keyspace was nearly empty. 5,000 writes of 8 KB values over keys of a
+  14,000-key dataset under a 128 MB limit, during a `BGSAVE`, left 3,324
+  keys; during an AOF rewrite 3,744; during a full sync, which also lays
+  the whole dataset out in memory for the replica, 1,121 and refused writes
+  with `OOM`. The values a snapshot still holds, what it lays out in memory
+  (its encoded collections, a full sync's or a backup's image) and what is
+  queued for replicas are now not counted against `maxmemory`, as in Redis,
+  where they are the forked child's memory or the replicas' output buffers;
+  `INFO memory` reports them as `mem_not_counted_for_evict`, which was
+  always 0. The same writes now evict nothing. Memory can exceed
+  `maxmemory` by that much while the snapshot is written, as a Redis
+  process and its child do together; the snapshot now lets each value go as
+  soon as it has written it, rather than all of them at the end. Should
+  evicting keys still give no memory back, eviction now stops once keys
+  taking twice what memory was over the limit by, and a megabyte more, have
+  gone with memory use no lower, and writes are refused with `OOM` until it
+  comes down, rather than every key going. And with `--io-model tokio` a
+  full sync's payload is no longer copied into the replica connection's
+  buffer, which kept its size, and `used_memory` over `maxmemory`, for as
+  long as the replica stayed connected. 1.1 has the same fault.
+  (Reported and analysed by @Parikalp-Bhardwaj.)
+
 - **`MIGRATE` no longer loses a write made while its keys travel (#274).**
   `MIGRATE` without `COPY` dumped its keys, sent them, waited for the
   destination's reply and then deleted them here, holding no lock across

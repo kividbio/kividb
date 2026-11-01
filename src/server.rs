@@ -272,20 +272,52 @@ fn spawn_mux_to_socket<S>(
 where
     S: AsyncWrite + Unpin + Send + 'static,
 {
+    // A frame this large (a full sync's payload, as large as the dataset) is
+    // written as it is. Copied into the buffer, it was the dataset twice
+    // over, and the buffer kept that size for as long as the replica stayed
+    // connected: memory counted against `maxmemory`, which evictions could
+    // not give back (#284).
+    const WRITTEN_AS_IS: usize = 1 << 20;
+    /// A buffer grown past this by a burst of small frames is let go of.
+    const BUFFER_KEPT: usize = 4 << 20;
+    async fn write_out<S: AsyncWrite + Unpin>(
+        writer: &Mutex<tokio::io::WriteHalf<S>>,
+        bytes: &[u8],
+    ) -> bool {
+        crate::stats::TOTAL_NET_OUTPUT_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        crate::stats::record_write();
+        writer.lock().await.write_all(bytes).await.is_ok()
+    }
     tokio::spawn(async move {
         let mut out_buf = Vec::with_capacity(65536);
-        while let Some(r) = resp_rx.recv().await {
-            out_buf.extend_from_slice(&r);
-            while let Ok(r2) = resp_rx.try_recv() {
-                out_buf.extend_from_slice(&r2);
+        'frames: while let Some(first) = resp_rx.recv().await {
+            let mut next = Some(first);
+            while let Some(r) = next.take() {
+                if r.len() >= WRITTEN_AS_IS {
+                    // In order: what came before it goes first.
+                    if !out_buf.is_empty() {
+                        if !write_out(&writer, &out_buf).await {
+                            break 'frames;
+                        }
+                        out_buf.clear();
+                    }
+                    if !write_out(&writer, &r).await {
+                        break 'frames;
+                    }
+                } else {
+                    out_buf.extend_from_slice(&r);
+                }
+                next = resp_rx.try_recv().ok();
             }
-            crate::stats::TOTAL_NET_OUTPUT_BYTES.fetch_add(out_buf.len() as u64, Ordering::Relaxed);
-            crate::stats::record_write();
-            let mut g = writer.lock().await;
-            if g.write_all(&out_buf).await.is_err() {
-                break;
+            if !out_buf.is_empty() {
+                if !write_out(&writer, &out_buf).await {
+                    break;
+                }
+                out_buf.clear();
             }
-            out_buf.clear();
+            if out_buf.capacity() > BUFFER_KEPT {
+                out_buf = Vec::with_capacity(65536);
+            }
         }
     })
 }
@@ -2288,6 +2320,7 @@ where
 
                 crate::replication::replica_client::handle_replica_connection(
                     reader,
+                    Arc::clone(&writer),
                     resp_tx,
                     write_task,
                     store,
