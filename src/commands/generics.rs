@@ -500,8 +500,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 return Some(resp_integer(0));
             }
 
-            let now = crate::script_clock::wall_system_time_now();
-            if new_exp <= now {
+            // Only a negative time to live deletes the key here (see
+            // `EXPIRE`). `PEXPIRE k 1` found the clock a millisecond on, as
+            // it does about once in 650 calls, and deleted the key with
+            // nothing propagated: the replica kept it for good.
+            if ms < 0 {
                 let removed = delete_key(ctx.store, *ctx.selected_db, key);
                 if removed {
                     crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);

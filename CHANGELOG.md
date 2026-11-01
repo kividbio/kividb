@@ -44,6 +44,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A replica no longer keeps a key its master deleted at an `EXPIRE` or
+  `PEXPIRE`.** `PEXPIRE k 1` read the clock twice, for the key's new time
+  and to see whether that time had already come, and about once in 650
+  calls a millisecond began in between. The master then deleted the key at
+  once, answered `1`, and sent nothing to its replicas or its AOF: they kept
+  the key for good (31 keys of 20,000 in a test; under load, a key written
+  to again afterwards held a different value on the replica). As in Redis,
+  only a negative time to live now deletes the key at once; a positive one
+  that has already run out by then expires the key as any other, with its
+  `DEL`. `EXPIRE` had the same race, over a whole second.
 - **A replica no longer keeps a key its master moved, or found expired
   while moving.** A `MOVE` that found its key past its time answered `0`
   but was still sent to replicas and the AOF, and the replica, which never
