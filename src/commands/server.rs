@@ -3587,6 +3587,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 });
                 out.push_str(&format!("arch_bits:{}\r\n", usize::BITS));
                 out.push_str(&format!("kividb_version:{}\r\n", env!("CARGO_PKG_VERSION")));
+                // That a replica of this server need not expire keys
+                // itself: each one expired here is sent to it as a `DEL`
+                // (`replication::expiry_propagated_by`).
+                out.push_str(crate::replication::EXPIRY_PROPAGATED_INFO);
+                out.push_str("\r\n");
                 out.push_str(&format!(
                     "os:{} {}\r\n",
                     std::env::consts::OS,

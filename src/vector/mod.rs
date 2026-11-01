@@ -1141,16 +1141,17 @@ pub fn backfill_from_db(db: &crate::store::Db, def: &IndexDef) {
 /// Like [`backfill_from_db`], but logs progress every [`BACKFILL_PROGRESS_KEYS`] matching keys
 /// when `log_progress` is true (used after KDB snapshot restore).
 ///
-/// When `skip_hnsw_if_populated` is true (snapshot startup only), HNSW vector inserts are
-/// skipped for any field whose graph already has vectors (e.g. loaded from `KIVIHN1`), while
-/// FLAT fields and TEXT / inverted-index work still run.
+/// When `keep_loaded_hnsw` is true (startup only), an HNSW graph that already holds vectors
+/// (loaded from the snapshot's `KIVIHN1` section) is brought up to date with the keys rather
+/// than built again (see `loaded` below). FLAT fields and TEXT / inverted-index work run as
+/// for any backfill.
 const BACKFILL_PROGRESS_KEYS: usize = 50_000;
 
 pub fn backfill_from_db_progress(
     db: &crate::store::Db,
     def: &IndexDef,
     log_progress: bool,
-    skip_hnsw_if_populated: bool,
+    keep_loaded_hnsw: bool,
 ) {
     struct VecFieldWork {
         name: String,
@@ -1158,11 +1159,18 @@ pub fn backfill_from_db_progress(
         data_type: VectorType,
         metric: DistanceMetric,
         live: LiveIndex,
-        /// The graph came with the snapshot: its vectors are not inserted
-        /// again. Decided once, before the walk — asked per key, the first
-        /// vector this walk inserts would make the graph look loaded and the
-        /// rest would be skipped, which left a graph rebuilt after an AOF
-        /// replay holding one vector.
+        /// The graph came with the snapshot. It is the graph as it was at
+        /// the checkpoint, and the keys are as they are now: the writes
+        /// replayed from the AOF since (whose indexing a replay defers) are
+        /// in the keys only. So a vector the graph holds as the key holds it
+        /// is left where it is, one it lacks or holds otherwise is inserted,
+        /// and after the walk a node whose key no longer holds a vector is
+        /// deleted. The graph used to be taken as it was, and the vectors
+        /// written after the checkpoint were in no graph after a restart.
+        ///
+        /// Decided once, before the walk — asked per key, the first vector
+        /// this walk inserts would make the graph look loaded, which left a
+        /// graph rebuilt after an AOF replay holding one vector.
         loaded: bool,
     }
     let mut vec_work: Vec<VecFieldWork> = Vec::new();
@@ -1181,7 +1189,7 @@ pub fn backfill_from_db_progress(
             Some(LiveIndex::Hnsw(a)) => LiveIndex::Hnsw(Arc::clone(a)),
             None => continue,
         };
-        let loaded = skip_hnsw_if_populated
+        let loaded = keep_loaded_hnsw
             && matches!(&live, LiveIndex::Hnsw(idx) if idx.live_count.load(Relaxed) > 0);
         vec_work.push(VecFieldWork {
             name: vf.name.clone(),
@@ -1241,7 +1249,7 @@ pub fn backfill_from_db_progress(
                 match &w.live {
                     LiveIndex::Flat(idx) => idx.insert(key.to_string(), vec),
                     LiveIndex::Hnsw(idx) => {
-                        if w.loaded {
+                        if w.loaded && holds_vector(idx, key, &vec, &w.metric) {
                             continue;
                         }
                         hnsw_insert_doc(idx, key.to_string(), vec, &w.metric, doc);
@@ -1263,6 +1271,50 @@ pub fn backfill_from_db_progress(
             }
             def.write_text(doc, &changes);
         }
+    }
+
+    // A loaded graph's nodes whose keys were deleted since the checkpoint, or
+    // no longer hold a vector in the field. Each is looked at under its
+    // key's shard lock, so that a write to the key made meanwhile (by a
+    // master's stream) is either seen here or indexed after this deletes.
+    for w in vec_work.iter().filter(|w| w.loaded) {
+        let LiveIndex::Hnsw(idx) = &w.live else {
+            continue;
+        };
+        let keys: Vec<String> = idx.key_to_id.read().keys().cloned().collect();
+        for key in keys {
+            let map = crate::store::get_shard(db, &key).read();
+            let holds = def.covers(&key)
+                && map
+                    .peek(&key)
+                    .and_then(|value| doc_fields(&def.on, &def.fields, value))
+                    .and_then(|inner| {
+                        inner
+                            .get(&w.name)
+                            .map(|raw| w.data_type.decode(raw, w.dim).is_some())
+                    })
+                    .unwrap_or(false);
+            if !holds {
+                unindex_vector(&w.live, &key);
+            }
+        }
+    }
+}
+
+/// Whether `index` holds `vector` for `key`, as an insert of it would have
+/// stored it (a cosine vector at unit length, by the same arithmetic).
+fn holds_vector(index: &HnswIndex, key: &str, vector: &[f32], metric: &DistanceMetric) -> bool {
+    let Some(id) = index.key_to_id.read().get(key).copied() else {
+        return false;
+    };
+    let nodes = index.nodes.read();
+    let Some(held) = index.vector_of(&nodes, id, key) else {
+        return false;
+    };
+    if matches!(metric, DistanceMetric::Cosine) {
+        held == normalize_to_unit(vector.to_vec()).as_slice()
+    } else {
+        held == vector
     }
 }
 

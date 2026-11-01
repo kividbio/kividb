@@ -44,6 +44,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **HNSW vectors written after a checkpoint are found again after a crash.**
+  A checkpoint (`BGREWRITEAOF`, the automatic AOF rewrite, or `SAVE` /
+  `BGSAVE` with the AOF on) writes `dump.kdb` with the HNSW graphs, and
+  starts the AOF over with the writes made after it. A server killed after
+  that (`kill -9`, a crash, a lost machine) came back with the graphs as the
+  snapshot had them: the vectors written since the checkpoint were in the
+  hashes and counted in `num_docs`, but no KNN query found them (none of
+  1,000 in a test), and a vector deleted or overwritten since was still
+  found under its key. A clean shutdown, which writes a fresh snapshot, did
+  not lose them. The graph from the snapshot is now brought up to date with
+  the keys at startup: vectors it holds unchanged stay as they are, the
+  others are inserted, and those of deleted keys or fields are taken out.
+  FLAT, TEXT, TAG and NUMERIC fields were rebuilt from the keys already and
+  were right. 1.1.2 and 1.1.3 have the bug; files they wrote load correctly.
+
 - **A cluster master back without its data no longer wipes its replica.**
   With no AOF, a shard master killed outright (no final snapshot) and back
   inside `cluster-node-timeout` kept its node id and slots from nodes.conf
@@ -81,6 +96,36 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `manual_failover_swaps_roles_without_losing_acknowledged_writes`. Nothing
   was lost: writes went on at the master. The write now hands the thread's
   other tasks to another thread while it waits.
+- **A replica of a KiviDB master older than 1.1.3 no longer keeps the keys
+  that master expires.** Since 1.1.3 a replica does not expire keys by its
+  own clock: it waits for the `DEL` (or `UNLINK`) its master sends for each
+  key it expires, so that the two cannot come apart. A 1.1.2 or older master
+  sends none, so a newer replica following it (as in the recommended
+  upgrade order, replicas first) kept every key the master expired: unseen
+  by reads, but in memory, and still there after the master was upgraded
+  if the replica went on by a partial resync. Ten keys of `PX 1000` left a
+  1.1.2 master at one key and its replica at eleven, for good. A replica now
+  asks its master which release it is (it already did, for `FT.DROPINDEX
+  DD`): under a master that sends no deletions (KiviDB 1.1.2 and before,
+  and 1.2.0-rc1 and -rc2, cut before the fix reached 1.2) it expires keys
+  itself, deleting them locally and propagating nothing, as every replica
+  did before 1.1.3. A master now says in `INFO server` that it sends them
+  (`kividb_expired_keys_propagated:1`); 1.1.3 and later 1.1 releases are
+  known by their version; a master that is not KiviDB (Redis, Valkey) sends
+  them; and one whose `INFO` cannot be read (refused to the replication user
+  by an ACL, say) is taken to send them, as 1.1.3 took every master: a
+  replica that waits for deletions that never come keeps keys that read as
+  gone, while one that also deletes keys under a master that sends them can
+  come apart from it. And when a replica is continued by a master that
+  sends deletions (a partial resync) while its dataset may hold keys left
+  by one that did not (it has followed such a master, or loaded its dataset
+  at startup), it first deletes the keys whose time ended before that
+  master started, before applying anything of its stream; a key that
+  expired later is that master's to delete. Only the replica's own clock is
+  read, against the master's `uptime_in_seconds`. Under a master that sends
+  deletions nothing changes: no key expires while a dataset is loaded or
+  the master's stream applied, and the replica deletes none itself.
+  Fixes #231.
 
 - **`FT.DROPINDEX index DD` reaches replicas and the AOF as the documents
   it deleted.** The command was sent on as typed, and each replica, and an

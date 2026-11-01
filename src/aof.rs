@@ -2071,7 +2071,8 @@ pub fn recover_local(
                 if recovery.index_names.is_empty() {
                     recovery.index_names = names;
                 }
-                // Delta writes are not in the snapshot's HNSW graph.
+                // Delta writes are not in the snapshot's HNSW graph: the
+                // backfill after this brings it up to date with the keys.
                 if dump_loaded {
                     recovery.hnsw_loaded = false;
                 }

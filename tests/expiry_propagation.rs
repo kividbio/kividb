@@ -15,11 +15,11 @@
 // The I/O model is the platform's own unless `KIVIDB_TEST_IO_MODEL` says.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 // ── RESP client ───────────────────────────────────────────────────────────────
@@ -222,6 +222,21 @@ impl Server {
 
     fn aof(&self) -> Vec<u8> {
         std::fs::read(self.dir.join("appendonly.aof")).unwrap_or_default()
+    }
+
+    fn log(&self) -> String {
+        std::fs::read_to_string(self.dir.join("server.log")).unwrap_or_default()
+    }
+
+    /// `SHUTDOWN`: the final save, and then the process is gone.
+    fn shutdown(&mut self) {
+        let mut c = self.conn();
+        let _ = c.writer.write_all(b"*1\r\n$8\r\nSHUTDOWN\r\n");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while self.child.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "the server did not shut down");
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// Killed, with no chance to save or to expire anything more.
@@ -1249,4 +1264,359 @@ fn tagged_reads_of_expiring_keys_beside_checkpoints_and_full_syncs_do_not_hang()
     assert_eq!(c.cmd(&["SET", "after", "1"]).s(), "OK");
     assert!(rewrites.load(Ordering::Relaxed) > 0, "no rewrite ran");
     assert!(syncs.load(Ordering::Relaxed) > 0, "no full sync ran");
+}
+
+// ── Replicas of a master that sends no deletions (#231) ───────────────────────
+//
+// Before 1.1.3 a master propagated nothing when it expired a key, and its
+// replicas expired keys by their own clocks. A replica that waits for its
+// master's `DEL`s, following such a master (replicas are upgraded first),
+// kept every key the master expired, for good: unseen by reads, but in
+// memory. It now expires keys itself under such a master, and once it is
+// continued by a master that does send them, deletes the keys whose time
+// ended before that master started.
+
+/// A stand-in master's `INFO server`: KiviDB `version`, up `uptime` seconds,
+/// with the line by which a build says it sends its expired keys if `says`.
+fn info_of(version: &str, uptime: u64, says: bool) -> String {
+    let mut info = format!(
+        "# Server\r\nredis_version:8.10.0\r\nkividb_version:{version}\r\nuptime_in_seconds:{uptime}\r\n"
+    );
+    if says {
+        info.push_str("kividb_expired_keys_propagated:1\r\n");
+    }
+    info
+}
+
+/// The id a stand-in master gives its stream.
+const STAND_IN_ID: &str = "0123456789012345678901234567890123456789";
+
+/// A master that is not this build: it answers a replica's handshake with
+/// `info` as its `INFO server` (which may be changed between connections),
+/// a request for a full sync with `payload` and then `commands`, and a
+/// request to be continued with `+CONTINUE` and nothing more. Each link is
+/// kept open until the replica closes it.
+struct StandIn {
+    port: u16,
+    info: Arc<Mutex<String>>,
+    /// How many times a replica was continued.
+    continued: Arc<AtomicU64>,
+}
+
+impl StandIn {
+    fn start(info: String, payload: Vec<u8>, commands: Vec<Vec<String>>) -> Self {
+        let port = free_port();
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let info = Arc::new(Mutex::new(info));
+        let continued = Arc::new(AtomicU64::new(0));
+        let (shared_info, shared_continued) = (Arc::clone(&info), Arc::clone(&continued));
+        let stream_of: Vec<u8> = commands
+            .iter()
+            .flat_map(|command| {
+                let mut encoded = format!("*{}\r\n", command.len()).into_bytes();
+                for part in command {
+                    encoded.extend_from_slice(format!("${}\r\n{part}\r\n", part.len()).as_bytes());
+                }
+                encoded
+            })
+            .collect();
+        let (payload, stream_of) = (Arc::new(payload), Arc::new(stream_of));
+        std::thread::spawn(move || {
+            for link in listener.incoming() {
+                let Ok(link) = link else {
+                    return;
+                };
+                let (info, continued) = (Arc::clone(&shared_info), Arc::clone(&shared_continued));
+                let (payload, stream_of) = (Arc::clone(&payload), Arc::clone(&stream_of));
+                std::thread::spawn(move || {
+                    let _ = serve_replica(link, &info, &continued, &payload, &stream_of);
+                });
+            }
+        });
+        StandIn {
+            port,
+            info,
+            continued,
+        }
+    }
+
+    fn set_info(&self, info: String) {
+        *self.info.lock().unwrap() = info;
+    }
+}
+
+/// One RESP array of bulk strings from `reader`, its words upper-cased.
+fn read_command(reader: &mut BufReader<TcpStream>) -> std::io::Result<Vec<String>> {
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Err(std::io::ErrorKind::UnexpectedEof.into());
+    }
+    let argc: usize = line.trim().trim_start_matches('*').parse().unwrap_or(0);
+    let mut args = Vec::with_capacity(argc);
+    for _ in 0..argc {
+        line.clear();
+        reader.read_line(&mut line)?;
+        let len: usize = line.trim().trim_start_matches('$').parse().unwrap_or(0);
+        let mut data = vec![0u8; len + 2];
+        reader.read_exact(&mut data)?;
+        data.truncate(len);
+        args.push(String::from_utf8_lossy(&data).to_ascii_uppercase());
+    }
+    Ok(args)
+}
+
+fn serve_replica(
+    mut link: TcpStream,
+    info: &Mutex<String>,
+    continued: &AtomicU64,
+    payload: &[u8],
+    stream_of: &[u8],
+) -> std::io::Result<()> {
+    let mut reader = BufReader::new(link.try_clone()?);
+    loop {
+        let args = read_command(&mut reader)?;
+        match args.first().map(String::as_str) {
+            Some("PING") => link.write_all(b"+PONG\r\n")?,
+            Some("REPLCONF") | Some("AUTH") => link.write_all(b"+OK\r\n")?,
+            Some("INFO") => {
+                let info = info.lock().unwrap().clone();
+                link.write_all(format!("${}\r\n{info}\r\n", info.len()).as_bytes())?;
+            }
+            Some("PSYNC") if args.get(1).is_some_and(|id| id == "?") => {
+                link.write_all(format!("+FULLRESYNC {STAND_IN_ID} 0\r\n").as_bytes())?;
+                link.write_all(format!("${}\r\n", payload.len()).as_bytes())?;
+                link.write_all(payload)?;
+                link.write_all(stream_of)?;
+                break;
+            }
+            Some("PSYNC") => {
+                link.write_all(format!("+CONTINUE {STAND_IN_ID}\r\n").as_bytes())?;
+                continued.fetch_add(1, Ordering::SeqCst);
+                break;
+            }
+            _ => return Ok(()),
+        }
+    }
+    // The replica's acknowledgements, until it goes.
+    let mut sink = [0u8; 256];
+    while reader.read(&mut sink)? > 0 {}
+    Ok(())
+}
+
+/// What a new replica of an empty master is sent: a real full-sync payload.
+fn empty_payload() -> Vec<u8> {
+    let master = Server::start(&[]);
+    let link = TcpStream::connect(("127.0.0.1", master.port)).unwrap();
+    link.set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    (&link)
+        .write_all(b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n")
+        .unwrap();
+    let mut reader = BufReader::new(link);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.starts_with("+FULLRESYNC"), "{line:?}");
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    let len: usize = line.trim().trim_start_matches('$').parse().unwrap();
+    let mut payload = vec![0u8; len];
+    reader.read_exact(&mut payload).unwrap();
+    payload
+}
+
+/// Ten keys that expire 300 ms after they are written, one that does not,
+/// and `done`: what each stand-in master sends after the full sync.
+fn ten_expiring_keys() -> Vec<Vec<String>> {
+    let mut commands = vec![vec!["SELECT".to_string(), "0".to_string()]];
+    for i in 0..10 {
+        commands.push(
+            ["SET", &format!("exp:{i}"), "v", "PX", "300"]
+                .map(String::from)
+                .to_vec(),
+        );
+    }
+    commands.push(["SET", "keep", "v"].map(String::from).to_vec());
+    commands.push(["SET", "done", "1"].map(String::from).to_vec());
+    commands
+}
+
+/// A replica of KiviDB 1.1.2, which never sends the deletion of a key it
+/// expires, expires keys itself, as replicas did before 1.1.3. It used to
+/// keep all ten for good.
+#[test]
+fn a_replica_of_a_master_before_1_1_3_expires_keys_itself() {
+    for version in ["1.1.2", "1.0.6", "1.2.0-rc2"] {
+        let master = StandIn::start(
+            info_of(version, 100, false),
+            empty_payload(),
+            ten_expiring_keys(),
+        );
+        let port = master.port.to_string();
+        let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+        let mut r = replica.conn();
+        wait_until("the stream to be applied", 30, || {
+            r.cmd(&["EXISTS", "done"]) == V::Int(1)
+        });
+        wait_until(
+            &format!("the replica of {version} to expire the keys itself"),
+            20,
+            || r.cmd(&["DBSIZE"]).i() == 2,
+        );
+        assert_eq!(r.cmd(&["GET", "keep"]).s(), "v", "{version}");
+        assert_eq!(r.info("stats", "expired_keys"), "10", "{version}");
+        assert!(
+            replica.log().contains("does not send the deletion"),
+            "{version}: {}",
+            replica.log()
+        );
+    }
+}
+
+/// A replica of a master that sends the deletion of every key it expires
+/// (1.1.3 on, or a build that says so) deletes none itself, as since 1.1.3:
+/// the ten keys stay, unseen, until their `DEL`s come.
+#[test]
+fn a_replica_of_a_master_that_sends_deletions_waits_for_them() {
+    for (version, says) in [("1.1.3", false), ("1.2.0", false), ("1.2.0-rc2", true)] {
+        let master = StandIn::start(
+            info_of(version, 100, says),
+            empty_payload(),
+            ten_expiring_keys(),
+        );
+        let port = master.port.to_string();
+        let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+        let mut r = replica.conn();
+        wait_until("the stream to be applied", 30, || {
+            r.cmd(&["EXISTS", "done"]) == V::Int(1)
+        });
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(
+            r.cmd(&["EXISTS", "exp:0"]).i(),
+            0,
+            "{version}: gone to reads"
+        );
+        assert_eq!(
+            r.cmd(&["DBSIZE"]).i(),
+            12,
+            "{version}: but left for the DELs"
+        );
+        assert_eq!(r.info("stats", "expired_keys"), "0", "{version}");
+    }
+}
+
+/// A replica holding keys that expired under a master that never deleted
+/// them (here written by a stand-in that sends no `DEL`s, as a 1.1.3 replica
+/// of a 1.1.2 master kept them), restarted from its AOF and continued by a
+/// master that sends deletions: the keys whose time ended before that
+/// master started go, as nobody would send their `DEL`s; while a master
+/// that was already up when they expired is left to send them.
+#[test]
+fn a_replica_continued_by_a_master_that_sends_deletions_drops_keys_older_than_it() {
+    let master = StandIn::start(
+        info_of("1.2.0", 3600, true),
+        empty_payload(),
+        ten_expiring_keys(),
+    );
+    let port = master.port.to_string();
+    let mut replica = Server::start(&["--replicaof", "127.0.0.1", &port, "--aof"]);
+    let mut r = replica.conn();
+    wait_until("the stream to be applied", 30, || {
+        r.cmd(&["EXISTS", "done"]) == V::Int(1)
+    });
+    // Past their time by more than a second, and more than the uptime
+    // below, by the time the replica is continued.
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(r.cmd(&["DBSIZE"]).i(), 12);
+    drop(r);
+
+    // Up for an hour: it was there when the keys expired, and is theirs to
+    // delete.
+    replica.shutdown();
+    replica.restart();
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    assert_eq!(
+        master.continued.load(Ordering::SeqCst),
+        1,
+        "{}",
+        replica.log()
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(r.cmd(&["DBSIZE"]).i(), 12, "{}", replica.log());
+    drop(r);
+
+    // Started a moment ago: the keys expired before it, under a master
+    // that sent nothing for them.
+    master.set_info(info_of("1.2.0", 0, true));
+    replica.shutdown();
+    replica.restart();
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    assert_eq!(
+        master.continued.load(Ordering::SeqCst),
+        2,
+        "{}",
+        replica.log()
+    );
+    assert_eq!(r.cmd(&["DBSIZE"]).i(), 2, "{}", replica.log());
+    assert_eq!(r.cmd(&["GET", "keep"]).s(), "v");
+    assert_eq!(r.info("stats", "expired_keys"), "10");
+}
+
+/// Across releases, with real binaries: a replica of this build following a
+/// KiviDB 1.1.2 master converges with it while keys expire, and stays so
+/// once the master is upgraded to this build and continues it. Needs the
+/// 1.1.2 binary in `KIVIDB_V112_BINARY` (a release tarball's `kividb`):
+/// `cargo test --test expiry_propagation -- --ignored`.
+#[test]
+#[ignore = "needs a KiviDB 1.1.2 binary in KIVIDB_V112_BINARY"]
+fn a_replica_of_a_real_1_1_2_master_converges_and_stays_so_after_the_upgrade() {
+    let old = std::env::var("KIVIDB_V112_BINARY").expect("KIVIDB_V112_BINARY");
+    let dir = tempfile::tempdir().unwrap().keep();
+    let port = free_port();
+    let child = Command::new(&old)
+        .current_dir(&dir)
+        .args(["--port", &port.to_string(), "--bind", "127.0.0.1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("could not start the 1.1.2 binary");
+    let mut master = Server {
+        port,
+        dir,
+        child,
+        args: Vec::new(),
+        env: Vec::new(),
+    };
+    let mut m = master.conn();
+    assert!(m.info("server", "kividb_version").starts_with("1.1.2"));
+    let master_port = port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &master_port]);
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    for i in 0..100 {
+        m.cmd(&["SET", &format!("exp:{i}"), "v", "PX", "300"]);
+    }
+    m.cmd(&["SET", "keep", "v"]);
+    wait_until("the replica to converge with its 1.1.2 master", 20, || {
+        m.cmd(&["DBSIZE"]).i() == 1 && r.cmd(&["DBSIZE"]).i() == 1
+    });
+    drop(m);
+
+    // The master upgraded in place: stopped cleanly, and started as this
+    // build on the same directory and port.
+    master.shutdown();
+    master.restart();
+    let mut m = master.conn();
+    wait_link_up(&mut r);
+    for i in 0..100 {
+        m.cmd(&["SET", &format!("new:{i}"), "v", "PX", "300"]);
+    }
+    wait_until(
+        "the replica to converge with its upgraded master",
+        20,
+        || m.cmd(&["DBSIZE"]).i() == 1 && r.cmd(&["DBSIZE"]).i() == 1,
+    );
+    assert_eq!(r.cmd(&["GET", "keep"]).s(), "v");
 }
