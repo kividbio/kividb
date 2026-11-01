@@ -130,7 +130,9 @@ pub fn commands_for_propagation(
         // as DELs, then the drop without `DD` (`vector::ft_dropindex`); by a
         // replica to its own AOF too.
         "FT.DROPINDEX" => Vec::new(),
-        "MIGRATE" => migrate_feed(cmd, resp),
+        // Sent by the command itself, as one `DEL` of the keys it deleted
+        // (`cluster::delete_moved`): which they are, its reply does not say.
+        "MIGRATE" => Vec::new(),
         "LMOVEM" | "BLMOVEM" => lmovem_feed(name, cmd, resp),
         "TS.ADD" => ts_add_feed(cmd, resp),
         "TS.MADD" => ts_madd_feed(cmd, resp),
@@ -185,60 +187,6 @@ fn xadd_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
 
     let mut parts: Vec<Vec<u8>> = cmd.iter().map(|b| b.to_vec()).collect();
     parts[opts.id_index] = assigned;
-    vec![parts]
-}
-
-/// The keys a `MIGRATE` invocation names, in either form:
-///
-/// ```text
-/// MIGRATE host port key   db timeout [COPY] [REPLACE] [AUTH ..] [AUTH2 ..]
-/// MIGRATE host port ""    db timeout [...] KEYS key [key ...]
-/// ```
-///
-/// `KEYS` is always the last option, so everything after it is a key.
-pub(crate) fn migrate_keys<'a>(cmd: &[&'a [u8]]) -> Vec<&'a [u8]> {
-    if cmd.len() < 6 {
-        return Vec::new();
-    }
-    if !cmd[3].is_empty() {
-        return vec![cmd[3]];
-    }
-    match cmd[6..]
-        .iter()
-        .position(|a| a.eq_ignore_ascii_case(b"KEYS"))
-    {
-        Some(i) => cmd[6 + i + 1..].to_vec(),
-        None => Vec::new(),
-    }
-}
-
-/// True when `MIGRATE` was asked to leave the source keys in place.
-pub(crate) fn migrate_is_copy(cmd: &[&[u8]]) -> bool {
-    let options_end = cmd
-        .iter()
-        .skip(6)
-        .position(|a| a.eq_ignore_ascii_case(b"KEYS"))
-        .map_or(cmd.len(), |i| 6 + i);
-    cmd.get(6..options_end)
-        .is_some_and(|opts| opts.iter().any(|a| a.eq_ignore_ascii_case(b"COPY")))
-}
-
-/// `MIGRATE` is propagated as the `DEL` of the keys it moved away, as Redis
-/// does. Sending it verbatim would have every replica — and AOF replay — open
-/// its own connection to the destination and migrate the keys again.
-///
-/// Nothing is propagated for `COPY` (the source keeps its keys) or for any
-/// reply other than `+OK` (`NOKEY`, or an error that left the keys in place).
-fn migrate_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
-    if !resp.starts_with(b"+OK") || migrate_is_copy(cmd) {
-        return Vec::new();
-    }
-    let keys = migrate_keys(cmd);
-    if keys.is_empty() {
-        return Vec::new();
-    }
-    let mut parts = vec![b"DEL".to_vec()];
-    parts.extend(keys.into_iter().map(|k| k.to_vec()));
     vec![parts]
 }
 
@@ -766,55 +714,6 @@ mod tests {
         // replica that the master declined to create.
         let owned = cmd(&["XADD", "s", "NOMKSTREAM", "*", "f", "v"]);
         assert!(xadd_feed(&refs(&owned), b"$-1\r\n").is_empty());
-    }
-
-    #[test]
-    fn migrate_is_propagated_as_del_of_the_moved_keys() {
-        let owned = cmd(&["MIGRATE", "10.0.0.2", "6379", "k1", "0", "5000"]);
-        let out = commands_for_propagation_test("MIGRATE", &refs(&owned), b"+OK\r\n");
-        assert_eq!(out, vec![cmd(&["DEL", "k1"])]);
-
-        let owned = cmd(&[
-            "MIGRATE", "10.0.0.2", "6379", "", "0", "5000", "REPLACE", "KEYS", "a", "b", "c",
-        ]);
-        let out = commands_for_propagation_test("MIGRATE", &refs(&owned), b"+OK\r\n");
-        assert_eq!(out, vec![cmd(&["DEL", "a", "b", "c"])]);
-    }
-
-    #[test]
-    fn migrate_that_moved_nothing_propagates_nothing() {
-        // COPY leaves the source keys in place.
-        let owned = cmd(&["MIGRATE", "h", "1", "k1", "0", "5000", "COPY"]);
-        assert!(commands_for_propagation_test("MIGRATE", &refs(&owned), b"+OK\r\n").is_empty());
-        // NOKEY: nothing existed to move.
-        let owned = cmd(&["MIGRATE", "h", "1", "k1", "0", "5000"]);
-        assert!(commands_for_propagation_test("MIGRATE", &refs(&owned), b"+NOKEY\r\n").is_empty());
-        // A failed transfer leaves the keys where they were.
-        assert!(
-            commands_for_propagation_test("MIGRATE", &refs(&owned), b"-IOERR timeout\r\n")
-                .is_empty()
-        );
-    }
-
-    /// A key literally named `COPY` or `KEYS` must not be read as an option.
-    #[test]
-    fn migrate_options_are_not_confused_with_key_names() {
-        let owned = cmd(&["MIGRATE", "h", "1", "", "0", "5000", "KEYS", "COPY", "x"]);
-        assert!(!migrate_is_copy(&refs(&owned)));
-        assert_eq!(
-            migrate_keys(&refs(&owned)),
-            vec![b"COPY".as_slice(), b"x".as_slice()]
-        );
-        let owned = cmd(&["MIGRATE", "h", "1", "COPY", "0", "5000"]);
-        assert!(!migrate_is_copy(&refs(&owned)));
-    }
-
-    /// `migrate_feed` without needing a `Ctx`.
-    fn commands_for_propagation_test(name: &str, cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
-        match name {
-            "MIGRATE" => migrate_feed(cmd, resp),
-            _ => unreachable!(),
-        }
     }
 
     #[test]

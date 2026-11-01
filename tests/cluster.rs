@@ -2311,6 +2311,208 @@ fn migrate_moves_a_slot_with_every_type_and_ttl() {
     );
 }
 
+/// Run `args` (a `MIGRATE`) on `node`, started with the failpoint
+/// `migrate-before-delete`, and run `meanwhile` while it is stopped there:
+/// after the destination has confirmed the keys, before the source deletes
+/// them. `hit` is which time the node reaches the failpoint (from 1).
+fn migrate_with_writes_meanwhile(
+    node: &Node,
+    args: &[String],
+    hit: u32,
+    meanwhile: impl FnOnce(),
+) -> Resp {
+    let port = node.port;
+    let args = args.to_vec();
+    let migrate = std::thread::spawn(move || {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        Conn::connect(port).cmd(&refs)
+    });
+    let failpoint = node
+        .dir
+        .join(format!("failpoint.migrate-before-delete.{hit}"));
+    wait_until(
+        "MIGRATE to reach the failpoint",
+        Duration::from_secs(10),
+        || failpoint.exists(),
+    );
+    meanwhile();
+    std::fs::remove_file(&failpoint).unwrap();
+    migrate.join().unwrap()
+}
+
+/// A write to a key while `MIGRATE` has it on the wire is not lost (#274).
+/// `MIGRATE` holds no lock across the round trip to the destination, and a
+/// write in that time was acknowledged here and then deleted along with the
+/// key: the destination had the value from before it. Now a key that does
+/// not hold what was sent is kept, `MIGRATE` answers `TRYAGAIN`, and only
+/// the keys it did delete are deleted on its replicas. Moving the key again
+/// with `REPLACE` takes the write along.
+#[test]
+fn a_write_while_migrate_is_on_the_wire_is_not_lost() {
+    let env = [("KIVIDB_TEST_FAILPOINTS", "migrate-before-delete")];
+    let (nodes, ranges) = form_cluster_with_env(2, &env);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let replica = add_replica(&nodes, src);
+    {
+        let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+        wait_cluster_ok(&all, 3);
+    }
+    let (src_id, dst_id) = (src.id(), dst.id());
+
+    // Keys of one slot without a hash tag: a build with Lua locks a tagged
+    // key's tag for the whole of a command that names it
+    // (`lua-parallel-scripts`), MIGRATE's round trip included, and the
+    // writes below would wait for it.
+    let names = ["a", "counter", "c", "ttl"];
+    let first = key_in(ranges[0].0..=ranges[0].1, "race");
+    let slot_number = slot_of(&first);
+    let keys: Vec<String> = (0..)
+        .map(|i| format!("race:{i}"))
+        .filter(|key| slot_of(key) == slot_number)
+        .take(names.len())
+        .collect();
+    let slot = slot_number.to_string();
+    let k = |name: &str| keys[names.iter().position(|n| *n == name).unwrap()].clone();
+    let mut s = src.conn();
+    for name in ["a", "counter", "c", "ttl"] {
+        assert!(s.cmd(&["SET", &k(name), "1"]).is_ok());
+    }
+    let reply = dst
+        .conn()
+        .cmd(&["CLUSTER", "SETSLOT", &slot, "IMPORTING", &src_id]);
+    assert!(reply.is_ok(), "SETSLOT IMPORTING: {reply:?}");
+    assert!(
+        s.cmd(&["CLUSTER", "SETSLOT", &slot, "MIGRATING", &dst_id])
+            .is_ok()
+    );
+    let port = dst.port.to_string();
+    let migrate = |extra: &[&str], keys: &[&str]| -> Vec<String> {
+        let mut args: Vec<String> = ["MIGRATE", "127.0.0.1", &port, "", "0", "5000"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        args.extend(extra.iter().map(|s| s.to_string()));
+        args.push("KEYS".to_string());
+        args.extend(keys.iter().map(|n| k(n)));
+        args
+    };
+
+    // The KEYS form: `counter` is written meanwhile, `a` and `c` are not.
+    let reply =
+        migrate_with_writes_meanwhile(src, &migrate(&[], &["a", "counter", "c"]), 1, || {
+            assert_eq!(src.conn().cmd(&["INCR", &k("counter")]).int(), 2);
+        });
+    let error = reply.err().unwrap_or_else(|| panic!("MIGRATE: {reply:?}"));
+    assert!(error.starts_with("TRYAGAIN"), "{error}");
+    assert!(error.contains(&k("counter")), "{error}");
+    // The acknowledged INCR is here; the keys that were not written are gone.
+    assert_eq!(s.cmd(&["GET", &k("counter")]).text(), "2");
+    assert_eq!(s.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 2);
+
+    // The key form: a new time to live is a write too.
+    let mut args: Vec<String> = ["MIGRATE", "127.0.0.1", &port, &k("ttl"), "0", "5000"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let reply = migrate_with_writes_meanwhile(src, &args, 2, || {
+        assert_eq!(src.conn().cmd(&["PEXPIRE", &k("ttl"), "500000"]).int(), 1);
+    });
+    assert!(
+        reply.err().is_some_and(|e| e.starts_with("TRYAGAIN")),
+        "{reply:?}"
+    );
+    assert!(s.cmd(&["PTTL", &k("ttl")]).int() > 400_000);
+
+    // The replica deleted what its master deleted, and nothing else.
+    assert_eq!(s.cmd(&["WAIT", "1", "10000"]).int(), 1);
+    let mut r = replica.conn();
+    assert!(r.cmd(&["READONLY"]).is_ok());
+    assert_eq!(r.cmd(&["GET", &k("counter")]).text(), "2");
+    assert!(r.cmd(&["PTTL", &k("ttl")]).int() > 400_000);
+    assert_eq!(r.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 2);
+
+    // Moved again, with REPLACE (the destination has the older copy), the
+    // keys arrive as they are now.
+    args.push("REPLACE".to_string());
+    let reply = migrate_with_writes_meanwhile(src, &args, 3, || {});
+    assert!(reply.is_ok(), "MIGRATE: {reply:?}");
+    let reply = migrate_with_writes_meanwhile(src, &migrate(&["REPLACE"], &["counter"]), 4, || {});
+    assert!(reply.is_ok(), "MIGRATE: {reply:?}");
+    assert_eq!(s.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 0);
+    for node in [dst, src] {
+        assert!(
+            node.conn()
+                .cmd(&["CLUSTER", "SETSLOT", &slot, "NODE", &dst_id])
+                .is_ok()
+        );
+    }
+    let mut d = dst.conn();
+    assert_eq!(d.cmd(&["GET", &k("counter")]).text(), "2");
+    assert_eq!(d.cmd(&["GET", &k("a")]).text(), "1");
+    assert!(d.cmd(&["PTTL", &k("ttl")]).int() > 400_000);
+    assert_eq!(s.cmd(&["WAIT", "1", "10000"]).int(), 1);
+    assert_eq!(r.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 0);
+}
+
+/// A write that comes right after `MIGRATE` has deleted a key reaches the
+/// replicas after the key's `DEL`, as it reached the store after the
+/// deletion (#274). The deletion and its `DEL` were two steps, the `DEL`
+/// sent by the handler once `MIGRATE` had answered: a `SET` of the key in
+/// between was sent first, and a replica applied `SET` then `DEL`, losing
+/// the key its master kept.
+///
+/// The slot is importing at the destination but not migrating here (as a
+/// tool may leave it), so this node serves a write to the key once it is
+/// gone instead of redirecting it.
+#[test]
+fn a_write_right_after_migrate_deletes_a_key_reaches_replicas_in_order() {
+    let env = [("KIVIDB_TEST_FAILPOINTS", "migrate-deleted")];
+    let (nodes, ranges) = form_cluster_with_env(2, &env);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let replica = add_replica(&nodes, src);
+    {
+        let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+        wait_cluster_ok(&all, 3);
+    }
+    let src_id = src.id();
+
+    let key = key_in(ranges[0].0..=ranges[0].1, "order");
+    let slot = slot_of(&key).to_string();
+    let mut s = src.conn();
+    assert!(s.cmd(&["SET", &key, "old"]).is_ok());
+    let reply = dst
+        .conn()
+        .cmd(&["CLUSTER", "SETSLOT", &slot, "IMPORTING", &src_id]);
+    assert!(reply.is_ok(), "SETSLOT IMPORTING: {reply:?}");
+
+    let (port, dst_port) = (src.port, dst.port.to_string());
+    let moved_key = key.clone();
+    let migrate = std::thread::spawn(move || {
+        Conn::connect(port).cmd(&["MIGRATE", "127.0.0.1", &dst_port, &moved_key, "0", "5000"])
+    });
+    let failpoint = src.dir.join("failpoint.migrate-deleted.1");
+    wait_until(
+        "MIGRATE to reach the failpoint",
+        Duration::from_secs(10),
+        || failpoint.exists(),
+    );
+    // The key is gone here; a SET makes it again. Before the fix it was
+    // answered (and sent on) at once; now it waits for the `DEL` to go first.
+    let set_key = key.clone();
+    let set = std::thread::spawn(move || Conn::connect(port).cmd(&["SET", &set_key, "new"]));
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::remove_file(&failpoint).unwrap();
+    let reply = migrate.join().unwrap();
+    assert!(reply.is_ok(), "MIGRATE: {reply:?}");
+    assert!(set.join().unwrap().is_ok());
+
+    assert_eq!(s.cmd(&["GET", &key]).text(), "new");
+    assert_eq!(s.cmd(&["WAIT", "1", "10000"]).int(), 1);
+    let mut r = replica.conn();
+    assert!(r.cmd(&["READONLY"]).is_ok());
+    assert_eq!(r.cmd(&["GET", &key]), Resp::Bulk(b"new".to_vec()));
+}
+
 // ── Atomic slot migration (CLUSTER MIGRATION) ─────────────────────────────────
 
 /// One field of a task from `CLUSTER MIGRATION STATUS`.
