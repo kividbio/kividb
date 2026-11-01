@@ -118,6 +118,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is written before the old one is moved aside; and a start that finds
   `appendonly.aof.prev` without a log beside it replays it.
 
+- **`FT.AGGREGATE … ADDSCORES` shows the score in every row (#234).** As
+  in Redis 8.10, each row now starts with `__score`, whatever else the
+  command loads, sorts by or computes. It showed only where a `LOAD` or a
+  `SORTBY` named `@__score`, and a plain `ADDSCORES` gave rows with no
+  fields. A `GROUPBY`'s rows have no score of their own, as before.
+  `FT.EXPLAIN` writes `NOT{`, `OPTIONAL{` and `<empty>` as Redis does
+  (it wrote `NOT {`, `OPTIONAL {` and `<EMPTY>`), `FT.EXPLAINCLI` ends
+  with Redis's empty last line, and `FT.DEBUG HELP` lists the subcommands
+  instead of answering that it is not one. A query word shorter than
+  `search-min-stem-len` is still shown, and looked for, with its stems:
+  the length decides which words of a document are indexed with a stem,
+  not what a query looks for, in Redis as here.
+
 ## [1.2.0]
 
 See [docs/releases/v1.2.0.md](docs/releases/v1.2.0.md) for what to check before upgrading.

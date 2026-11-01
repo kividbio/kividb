@@ -807,8 +807,14 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let count = |i: usize| -> usize { word(i).parse::<usize>().unwrap_or(0) };
     let mut everything = false;
     let mut grouped = false;
-    // (the row's field, the name to show it under)
+    // (the row's field, the name to show it under). `ADDSCORES` shows the
+    // score first in every row, whatever else is asked for, as Redis does:
+    // it showed only when a `SORTBY` or `LOAD` named it, and a plain
+    // `ADDSCORES` gave empty rows (#234).
     let mut shown: Vec<(String, String)> = Vec::new();
+    if addscores {
+        shown.push(("__score".to_string(), "__score".to_string()));
+    }
     let mut i = 3usize;
     while i < cmd.len() {
         match word(i).as_str() {
@@ -865,6 +871,10 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
         .map(|row| {
             let mut pairs: Vec<(String, String)> = Vec::new();
             if everything || grouped {
+                // A group is not a document, and has no score.
+                if let Some(score) = row.get("__score").filter(|_| addscores && !grouped) {
+                    pairs.push(("__score".to_string(), score.clone()));
+                }
                 let mut fields: Vec<(&String, &String)> =
                     row.iter().filter(|(k, _)| !k.starts_with("__")).collect();
                 fields.sort();
@@ -2156,6 +2166,13 @@ fn ft_debug(ctx: &mut Ctx) -> Option<Vec<u8>> {
         "COMPACT" => ft_debug_compact(ctx),
         "POSTINGS" => ft_debug_postings(ctx),
         "PAGE" => ft_debug_page(ctx),
+        // The subcommands, by name, as Redis's `_FT.DEBUG HELP` lists its.
+        "HELP" if cmd.len() == 2 => Some(resp_array(
+            ["COMPACT", "POSTINGS", "PAGE", "HELP"]
+                .iter()
+                .map(|name| resp_bulk_str(name))
+                .collect(),
+        )),
         _ => Some(resp_error(&format!(
             "ERR unknown FT.DEBUG subcommand '{sub}'"
         ))),

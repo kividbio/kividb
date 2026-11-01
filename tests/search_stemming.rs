@@ -1125,3 +1125,196 @@ fn the_very_word_ranks_above_its_other_forms() {
     );
     c.cmd(&["FT.DROPINDEX", "len", "DD"]);
 }
+
+/// The rows of an FT.AGGREGATE reply (after the count), as name/value pairs.
+fn agg_rows(reply: &V) -> Vec<Vec<(String, String)>> {
+    reply.arr()[1..]
+        .iter()
+        .map(|row| {
+            row.arr()
+                .chunks(2)
+                .map(|p| (p[0].s().to_string(), p[1].s().to_string()))
+                .collect()
+        })
+        .collect()
+}
+
+/// #234: `ADDSCORES` puts `__score` first in every row, whatever else the
+/// command asks to see, as Redis 8.10.2 does. Without a `LOAD` or a
+/// `SORTBY` naming it, the rows came back empty.
+#[test]
+fn aggregate_addscores_puts_the_score_in_every_row() {
+    let _one = one_at_a_time();
+    let mut c = conn();
+    index_of(
+        &mut c,
+        "ag",
+        "ag:",
+        &["t", "TEXT", "n", "NUMERIC", "SORTABLE"],
+        &[
+            ("1", &["t", "cables here", "n", "1"][..]),
+            ("2", &["t", "cable cable", "n", "2"][..]),
+        ],
+    );
+    let (high, low) = (1.2037695220150502, 0.1823215567939546);
+    let close = |a: &str, b: f64| (a.parse::<f64>().unwrap() - b).abs() <= 1e-9;
+    let agg = |c: &mut Conn, tail: &[&str]| {
+        let mut args = vec!["FT.AGGREGATE", "ag"];
+        args.extend_from_slice(tail);
+        agg_rows(&c.cmd(&args))
+    };
+    let names = |rows: &[Vec<(String, String)>]| -> Vec<Vec<String>> {
+        rows.iter()
+            .map(|row| row.iter().map(|(k, _)| k.clone()).collect())
+            .collect()
+    };
+
+    // The score alone; the rows in no set order.
+    let rows = agg(&mut c, &["cable", "ADDSCORES"]);
+    assert_eq!(names(&rows), [["__score"], ["__score"]]);
+    let mut scores: Vec<f64> = rows.iter().map(|r| r[0].1.parse().unwrap()).collect();
+    scores.sort_by(f64::total_cmp);
+    assert!(close(&scores[0].to_string(), low) && close(&scores[1].to_string(), high));
+    for tail in [
+        &["*", "ADDSCORES"][..],
+        &["cable", "ADDSCORES", "DIALECT", "2"][..],
+        &["cable", "ADDSCORES", "SCORER", "TFIDF"][..],
+        &["cable", "ADDSCORES", "LOAD", "1", "@__score"][..],
+    ] {
+        assert_eq!(
+            names(&agg(&mut c, tail)),
+            [["__score"], ["__score"]],
+            "{tail:?}"
+        );
+    }
+
+    // Ahead of what is loaded, sorted by or computed.
+    let rows = agg(&mut c, &["cable", "ADDSCORES", "LOAD", "1", "@t"]);
+    assert_eq!(names(&rows), [["__score", "t"], ["__score", "t"]]);
+    let rows = agg(&mut c, &["cable", "ADDSCORES", "SORTBY", "2", "@n", "DESC"]);
+    assert_eq!(names(&rows), [["__score", "n"], ["__score", "n"]]);
+    assert!(close(&rows[0][0].1, high) && rows[0][1].1 == "2");
+    assert!(close(&rows[1][0].1, low) && rows[1][1].1 == "1");
+    let rows = agg(
+        &mut c,
+        &["cable", "ADDSCORES", "APPLY", "@__score*2", "AS", "s2"],
+    );
+    assert_eq!(names(&rows), [["__score", "s2"], ["__score", "s2"]]);
+    let rows = agg(&mut c, &["cable", "ADDSCORES", "LOAD", "*"]);
+    assert!(
+        rows.iter()
+            .all(|row| row[0].0 == "__score" && row.len() == 3)
+    );
+    let rows = agg(&mut c, &["cable", "ADDSCORES", "FILTER", "@__score > 0.5"]);
+    assert_eq!(names(&rows), [["__score"]]);
+    assert!(close(&rows[0][0].1, high));
+    let rows = agg(
+        &mut c,
+        &["cable", "ADDSCORES", "SORTBY", "2", "@__score", "DESC"],
+    );
+    assert!(close(&rows[0][0].1, high) && close(&rows[1][0].1, low));
+
+    // A group has no score of its own.
+    let rows = agg(
+        &mut c,
+        &[
+            "cable",
+            "ADDSCORES",
+            "GROUPBY",
+            "0",
+            "REDUCE",
+            "SUM",
+            "1",
+            "@__score",
+            "AS",
+            "total",
+        ],
+    );
+    assert_eq!(names(&rows), [["total"]]);
+    assert!((rows[0][0].1.parse::<f64>().unwrap() - (high + low)).abs() < 1e-5);
+
+    // Without ADDSCORES, no score.
+    assert_eq!(names(&agg(&mut c, &["cable"])), [[""; 0], [""; 0]]);
+
+    // A cursor's rows too.
+    let reply = c.cmd(&[
+        "FT.AGGREGATE",
+        "ag",
+        "cable",
+        "ADDSCORES",
+        "WITHCURSOR",
+        "COUNT",
+        "1",
+    ]);
+    let first = agg_rows(&reply.arr()[0]);
+    assert_eq!(names(&first), [["__score"]]);
+    if let V::Int(cursor) = reply.arr()[1] {
+        c.cmd(&["FT.CURSOR", "DEL", "ag", &cursor.to_string()]);
+    }
+    c.cmd(&["FT.DROPINDEX", "ag", "DD"]);
+}
+
+/// #234: `FT.EXPLAIN` shows what the query runs, a word shorter than
+/// `MINSTEMLEN` expanded with its stems as the query is (the length limits
+/// which words are indexed with a stem, not what a query looks for), as
+/// Redis 8.10.2 shows and runs it. And the shape of Redis's text: `NOT{`,
+/// `OPTIONAL{`, `<empty>`, and `FT.EXPLAINCLI`'s empty last line.
+#[test]
+fn explain_shows_what_the_query_runs() {
+    let _one = one_at_a_time();
+    let mut c = conn();
+    assert!(c.cmd(&["CONFIG", "SET", "search-min-stem-len", "6"]).ok());
+    index_of(
+        &mut c,
+        "es",
+        "es:",
+        &["t", "TEXT"],
+        &[("1", &["t", "cats"][..]), ("2", &["t", "cat"][..])],
+    );
+    let plan = c.cmd(&["FT.EXPLAIN", "es", "cats"]);
+    let found = c.cmd(&["FT.SEARCH", "es", "cats", "NOCONTENT"]);
+    let lines = c.cmd(&["FT.EXPLAINCLI", "es", "cats"]);
+    let not = c.cmd(&["FT.EXPLAIN", "es", "-cats"]);
+    let optional = c.cmd(&["FT.EXPLAIN", "es", "foo ~cats", "DIALECT", "2"]);
+    let empty = c.cmd(&["FT.EXPLAIN", "es", "is"]);
+    assert!(c.cmd(&["CONFIG", "SET", "search-min-stem-len", "4"]).ok());
+    c.cmd(&["FT.DROPINDEX", "es", "DD"]);
+
+    let cats = "UNION {\n  cats\n  +cat(expanded)\n  cat(expanded)\n}\n";
+    assert_eq!(plan.s(), cats);
+    assert_eq!(found.id_set(), ["es:1", "es:2"]);
+    assert_eq!(
+        lines,
+        V::Arr(
+            [
+                "UNION {",
+                "  cats",
+                "  +cat(expanded)",
+                "  cat(expanded)",
+                "}",
+                ""
+            ]
+            .iter()
+            .map(|s| V::Str(s.to_string()))
+            .collect()
+        )
+    );
+    assert_eq!(
+        not.s(),
+        "NOT{\n  UNION {\n    cats\n    +cat(expanded)\n    cat(expanded)\n  }\n}\n"
+    );
+    assert_eq!(
+        optional.s(),
+        "INTERSECT {\n  UNION {\n    foo\n    +foo(expanded)\n  }\n  OPTIONAL{\n    UNION {\n      \
+         cats\n      +cat(expanded)\n      cat(expanded)\n    }\n  }\n}\n"
+    );
+    assert_eq!(empty.s(), "<empty>\n");
+
+    // FT.DEBUG HELP names the subcommands.
+    let help = c.cmd(&["FT.DEBUG", "HELP"]);
+    let help: Vec<&str> = help.arr().iter().map(V::s).collect();
+    assert!(
+        help.contains(&"COMPACT") && help.contains(&"HELP"),
+        "{help:?}"
+    );
+}
