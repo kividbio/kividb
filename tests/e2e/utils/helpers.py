@@ -82,6 +82,56 @@ def wait_for_port(host: str, port: int, timeout: float = 30.0) -> bool:
     return wait_for_ready(host, port, timeout)
 
 
+# ── Ports for servers a test starts itself ─────────────────────────────────────
+#
+# Ports come from 10000-29999, below every OS's ephemeral range (Linux
+# 32768-60999, Windows and macOS 49152-65535). A port from that range can be
+# taken as the source port of any outgoing connection in the moment between
+# picking it and the server binding it, which is also why the Rust tests'
+# `free_port()` stays out of it.
+#
+# And no port is handed out twice in one process. These used to come from
+# `bind(("127.0.0.1", 0))`, which on Linux returns the same port to two calls
+# in a row about once in 17,000 pairs. The second server of the pair then
+# failed to bind and exited, the test found the first one answering on the
+# port and took it for the second: a "replica" told `REPLICAOF` its own
+# address, which never syncs (#262).
+_PORT_LOW, _PORT_HIGH = 10000, 30000
+_ports_handed_out: set[int] = set()
+_next_port = _PORT_LOW + (os.getpid() * 7919) % (_PORT_HIGH - _PORT_LOW)
+_port_lock = threading.Lock()
+
+
+def _port_is_free(port: int) -> bool:
+    """Whether a server could bind *port* now. Binds without listening: a
+    listening probe can be connected to by a client dialling the port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        if os.name == "posix":
+            # As servers do, so a port with a closed connection in TIME_WAIT
+            # counts as free. (On Windows this option means something else.)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("0.0.0.0", port))
+            return True
+        except OSError:
+            return False
+
+
+def free_port() -> int:
+    """A TCP port for a server the test starts itself: outside the ephemeral
+    range, not in use now, and never returned before in this process."""
+    global _next_port
+    span = _PORT_HIGH - _PORT_LOW
+    with _port_lock:
+        for _ in range(span):
+            port = _next_port
+            _next_port = _PORT_LOW + (port - _PORT_LOW + 1) % span
+            if port not in _ports_handed_out and _port_is_free(port):
+                _ports_handed_out.add(port)
+                return port
+    raise RuntimeError(f"no free port left in {_PORT_LOW}-{_PORT_HIGH - 1}")
+
+
 # ── Redis client factory ───────────────────────────────────────────────────────
 
 # ── Protocol under test ────────────────────────────────────────────────────────
