@@ -2432,8 +2432,20 @@ pub(crate) fn failpoint(name: &'static str) {
         return;
     }
     log_warn!("Test failpoint {path} reached — waiting for it to be removed");
-    while std::path::Path::new(&path).exists() {
-        std::thread::sleep(std::time::Duration::from_millis(5));
+    let wait = || {
+        while std::path::Path::new(&path).exists() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    // On a worker of the tokio server (a command's step), the worker's other
+    // tasks are handed to another first, so that the test's own commands are
+    // served meanwhile: a new connection's accept, waiting behind this one,
+    // was not (seen with two workers in CI).
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(wait)
+        }
+        _ => wait(),
     }
 }
 
