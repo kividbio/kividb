@@ -44,6 +44,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **HNSW vectors written after a checkpoint are found again after a crash.**
+  A checkpoint (`BGREWRITEAOF`, the automatic AOF rewrite, or `SAVE` /
+  `BGSAVE` with the AOF on) writes `dump.kdb` with the HNSW graphs, and
+  starts the AOF over with the writes made after it. A server killed after
+  that (`kill -9`, a crash, a lost machine) came back with the graphs as the
+  snapshot had them: the vectors written since the checkpoint were in the
+  hashes and counted in `num_docs`, but no KNN query found them (none of
+  1,000 in a test), and a vector deleted or overwritten since was still
+  found under its key. A clean shutdown, which writes a fresh snapshot, did
+  not lose them. The graph from the snapshot is now brought up to date with
+  the keys at startup: vectors it holds unchanged stay as they are, the
+  others are inserted, and those of deleted keys or fields are taken out.
+  FLAT, TEXT, TAG and NUMERIC fields were rebuilt from the keys already and
+  were right. 1.1.2 and 1.1.3 have the bug; files they wrote load correctly.
+
 - **A cluster master back without its data no longer wipes its replica.**
   With no AOF, a shard master killed outright (no final snapshot) and back
   inside `cluster-node-timeout` kept its node id and slots from nodes.conf
