@@ -1156,10 +1156,19 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         Some(crate::write_order::held_exclusively())
     } else if ordered {
         let keys = crate::keyspec::key_positions(name, &ctx.cmd);
-        Some(crate::write_order::lock_keys(
-            *ctx.selected_db,
-            keys.iter().map(|pos| ctx.cmd[pos]),
-        ))
+        let here = *ctx.selected_db;
+        match database_written_too(ctx, name) {
+            // The key's record is ordered where it goes as well: see
+            // `write_order::lock_keys_in`.
+            Some(there) if there != here => Some(crate::write_order::lock_keys_in(
+                keys.iter()
+                    .flat_map(|pos| [(here, ctx.cmd[pos]), (there, ctx.cmd[pos])]),
+            )),
+            _ => Some(crate::write_order::lock_keys(
+                here,
+                keys.iter().map(|pos| ctx.cmd[pos]),
+            )),
+        }
     } else {
         None
     };
@@ -1382,6 +1391,20 @@ fn changed_nothing(name: &str, cmd: &[&[u8]], result: &[u8]) -> bool {
     }
 }
 
+/// Whether a `MOVE` or a `COPY` answered `0`: it moved or copied nothing,
+/// and is not propagated, as Redis does not propagate it. A replica, and a
+/// replay of the AOF, never take a key as gone because of its time: a key
+/// past its time that the master's `MOVE` had found gone, and left where it
+/// was for the sweep, was moved by the replica. The sweep's `DEL` then
+/// deleted nothing there, and the replica kept the key in the other
+/// database for good; and when the key's name was used again, the
+/// replica's `MOVE` of the new key found the old one in its way and left
+/// the new one behind, for good too.
+#[inline]
+fn moved_nothing(name: &str, result: &[u8]) -> bool {
+    matches!(name, "MOVE" | "COPY") && result == b":0\r\n"
+}
+
 /// Mark every `WATCH` on a key this write touched as dirty.
 ///
 /// It used to notify `cmd[1]` and nothing else. So `MSET a 1 b 2` left a
@@ -1508,6 +1531,27 @@ fn drop_if_empty(ctx: &Ctx, db: usize, key: &str) -> bool {
 /// `COPY` and `MOVE`: the key they wrote, in the database they wrote it
 /// to, is indexed whole; the one `MOVE` took away leaves the indexes of its
 /// database.
+/// The other database a write puts a key in: `MOVE key db`'s, and
+/// `COPY ... DB db`'s.
+#[inline]
+fn database_written_too(ctx: &Ctx, name: &str) -> Option<usize> {
+    if !matches!(name, "MOVE" | "COPY") {
+        return None;
+    }
+    let number = |i: usize| {
+        ctx.cmd
+            .get(i)
+            .and_then(|a| std::str::from_utf8(a).ok())
+            .and_then(|s| s.parse::<usize>().ok())
+    };
+    if name == "MOVE" {
+        return number(2);
+    }
+    (3..ctx.cmd.len())
+        .find(|&i| ctx.cmd[i].eq_ignore_ascii_case(b"DB"))
+        .and_then(|i| number(i + 1))
+}
+
 fn reindex_copied(ctx: &Ctx, name: &str) {
     use crate::vector::Write;
     let here = *ctx.selected_db;
@@ -1676,7 +1720,7 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
         // `write_is_observed`), but reaching that no-op used to cost a
         // `Vec<Vec<u8>>` clone of every argument here *plus* a full RESP encode
         // inside — allocations on every single write, discarded immediately.
-        if replication::write_is_observed(ctx) {
+        if replication::write_is_observed(ctx) && !moved_nothing(name, result) {
             // Propagate the command's *effect*, not the bytes the client sent.
             // `SPOP` and `XADD … *` produce a different result each time they
             // run, so a replica re-executing them diverges (measured: a replica
