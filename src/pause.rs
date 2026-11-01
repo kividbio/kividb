@@ -219,6 +219,20 @@ pub fn set_handoff_pause(duration_ms: i64) {
     set_pause(duration_ms, true);
 }
 
+/// How long [`hold_writes`] pauses writes for: until the pause is ended, in
+/// effect (a century).
+const UNTIL_ENDED_MS: i64 = 100 * 365 * 24 * 3600 * 1000;
+
+/// Pause writes as a handoff does (see `HANDOFF`), with no end of its own:
+/// until `clear_pause`. For a master that is not sure it still owns its
+/// slots (`ClusterState::hold_writes_until_confirmed`). A pause that ran out
+/// by itself let it take writes again while its replica could be taking the
+/// slots over, and what it acknowledged before it heard of that was lost
+/// (#242).
+pub fn hold_writes() {
+    set_handoff_pause(UNTIL_ENDED_MS);
+}
+
 /// Whether a write that has just entered the write gate has to step out
 /// again: a handoff is under way. One atomic load when none is.
 #[inline]
@@ -391,6 +405,12 @@ mod tests {
         set_pause(60_000, true);
         assert!(!handoff());
         clear_pause();
+        // Writes held until further notice are a handoff, and end with it.
+        hold_writes();
+        assert!(handoff() && holds(&[b"SET", b"k", b"v"], none));
+        assert!(!holds(&[b"GET", b"k"], none));
+        clear_pause();
+        assert!(!handoff());
 
         // A write that waits out a handoff on a worker of the multi-threaded
         // runtime leaves that worker's other tasks to run. Here the one that

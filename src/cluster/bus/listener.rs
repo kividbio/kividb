@@ -107,7 +107,9 @@ async fn handle_bus_connection(
                         other => process_message(&state, other, peer),
                     };
                     buf.drain(0..consumed);
-                    if let Some(bytes) = reply {
+                    if let Some(bytes) = reply
+                        && !crate::cluster::bus::heartbeat::test_bus_muted()
+                    {
                         sock.write_all(&bytes).await?;
                         state.stats_messages_sent.fetch_add(1, Ordering::Relaxed);
                     }
@@ -326,9 +328,15 @@ pub fn process_message(
             sender_id,
             failed_id,
         } => {
-            // Only a member's verdict counts, and never one about ourselves:
-            // we know we are up.
-            if sender_is_member(state, &sender_id) && state.mark_node_failed(failed_id) {
+            // Only a member's verdict counts.
+            if !sender_is_member(state, &sender_id) {
+                return None;
+            }
+            if failed_id == state.myself() {
+                // We know we are up, but the cluster has failed us: our
+                // replicas are about to stand for election (#242).
+                state.note_marked_failed(sender_id);
+            } else if state.mark_node_failed(failed_id) {
                 log_warn!(
                     "Cluster: Node {} marked FAIL (reported by {})",
                     node_id_str(&failed_id),

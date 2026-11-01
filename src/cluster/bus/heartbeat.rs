@@ -43,6 +43,9 @@ pub async fn run_heartbeat_loop(state: Arc<ClusterState>) {
 /// heard from, and a node that restarted without its nodes.conf, or whose
 /// only route back is our reaching out, was never heard from again.
 pub(crate) async fn send_one_round(state: &Arc<ClusterState>) {
+    if test_bus_muted() {
+        return;
+    }
     // Snapshot the peer list so we don't hold the lock during async I/O.
     let peers: Vec<(NodeId, String, u16)> = {
         let nodes = state.nodes.read();
@@ -144,6 +147,7 @@ pub async fn run_failure_detection_loop(
     ticker.tick().await;
     loop {
         ticker.tick().await;
+        apply_test_bus_control();
         BUS_TICKED_MS.store(now_ms_local(), Ordering::Relaxed);
         let newly_failed = state.run_failure_detection_tick();
         for id in newly_failed {
@@ -162,6 +166,7 @@ pub async fn run_failure_detection_loop(
         }
         state.check_lost_dataset_fence();
         check_election(&state, &repl_state).await;
+        check_held_writes(&state);
         state.reconcile_replication();
     }
 }
@@ -173,6 +178,9 @@ pub(crate) fn broadcast(
     msg: &BusMessage,
     wanted: impl Fn(&crate::cluster::ClusterNode) -> bool,
 ) {
+    if test_bus_muted() {
+        return;
+    }
     let me = state.myself();
     let targets: Vec<String> = state
         .nodes
@@ -353,7 +361,8 @@ async fn check_election(
             // for it, or not at all. Won later, the master has been taking
             // writes again, and those it acknowledged between our promotion
             // and its hearing of it are lost (#185). Given up, the master
-            // goes on as it was once its pause is over.
+            // holds writes until it has made sure it still owns its slots
+            // (#242).
             if let Some(deadline) = election.deadline_ms
                 && now_ms_local() >= deadline
             {
@@ -516,6 +525,9 @@ pub(crate) async fn broadcast_auth_request(
     epoch: u64,
     force: bool,
 ) {
+    if test_bus_muted() {
+        return;
+    }
     let masters: Vec<(NodeId, String, u16)> = {
         let nodes = state.nodes.read();
         nodes
@@ -613,13 +625,16 @@ fn test_vote_delay() -> Option<Duration> {
 ///
 /// The master holds writes for twice as long (`MANUAL_FAILOVER_PAUSE`), as
 /// in Redis, so that a replica that takes over does so while they are still
-/// held. Both used to be 5 s, and the election was not bounded at all: one
+/// held, and then until it has made sure it still owns its slots (#242).
+/// Both used to be 5 s, and the election was not bounded at all: one
 /// whose votes were slow in coming (a voter syncs its vote to disk before it
 /// answers) was won after the master had begun taking writes again, and the
 /// writes it acknowledged before it heard of the promotion were lost (#185).
 pub const MANUAL_FAILOVER_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long a master holds writes for a replica that asked to take over.
+/// How long a master holds writes for a replica that asked to take over
+/// before it asks the cluster whether it still owns its slots. It holds them
+/// until it knows: see `ClusterState::hold_writes_until_confirmed`.
 const MANUAL_FAILOVER_PAUSE: Duration = Duration::from_secs(10);
 
 /// The master's side of `CLUSTER FAILOVER`: stop accepting writes, and tell
@@ -654,7 +669,14 @@ pub(crate) async fn answer_mfstart(
         (replica.ip.clone(), replica.client_port)
     };
 
-    crate::pause::set_handoff_pause(MANUAL_FAILOVER_PAUSE.as_millis() as i64);
+    // Held until the replica has taken over (this node follows it then), or,
+    // once the replica's time is up, until this node has made sure it still
+    // owns its slots (#242).
+    let already_held = state.writes_held();
+    state.hold_writes_until_confirmed(
+        crate::cluster::HoldReason::ManualFailover,
+        now_ms_local() + MANUAL_FAILOVER_PAUSE.as_millis() as u64,
+    );
     // Let writes that were already in the gate finish and queue. One that is
     // past the pause check but not yet in the gate waits for the failover
     // there, and is redirected (`pause::HANDOFF`).
@@ -685,7 +707,9 @@ pub(crate) async fn answer_mfstart(
     };
     let Some(target_offset) = target else {
         // The replica is not attached; there is nothing to hand over.
-        crate::pause::clear_pause();
+        if !already_held {
+            state.release_held_writes("the replica that asked for a failover is not attached");
+        }
         return None;
     };
     log_info!(
@@ -766,6 +790,203 @@ pub async fn start_forced_election(
     broadcast_auth_request(state, master_id, epoch, true).await;
 }
 
+// ── Writes held until this master knows it still owns its slots ─────────────
+
+/// What a peer's answer to our PING says, for [`still_owner`].
+#[derive(Debug, Clone)]
+pub(crate) struct Answer {
+    pub from: NodeId,
+    /// It says it is a master.
+    pub master: bool,
+    /// The master it says it follows.
+    pub master_id: Option<NodeId>,
+    /// It holds this node FAIL.
+    pub holds_us_failed: bool,
+}
+
+/// Whether this master, `me`, can be sure from a round's `answers` that it
+/// still owns its slots: a majority of the masters that own slots (`quorum`,
+/// this one counted) have answered without holding it FAIL — no replica of
+/// it can be elected without such a majority's votes, and a master votes
+/// only for the replica of a master it holds FAIL — and every replica of it
+/// that was asked (`replicas`) has answered, as its replica, without holding
+/// it FAIL. A replica that has taken over answers as a master and claims the
+/// slots, and this node follows it then.
+pub(crate) fn still_owner(
+    me: NodeId,
+    quorum: usize,
+    replicas: &[NodeId],
+    answers: &[Answer],
+) -> Result<(), String> {
+    if let Some(a) = answers.iter().find(|a| a.holds_us_failed) {
+        return Err(format!("{} still holds it FAIL", node_id_str(&a.from)));
+    }
+    for replica in replicas {
+        match answers.iter().find(|a| a.from == *replica) {
+            None => {
+                return Err(format!(
+                    "its replica {} has not answered",
+                    node_id_str(replica)
+                ));
+            }
+            Some(a) if a.master || a.master_id != Some(me) => {
+                return Err(format!("{} is no longer its replica", node_id_str(replica)));
+            }
+            Some(_) => {}
+        }
+    }
+    let masters = 1 + answers
+        .iter()
+        .filter(|a| a.master && !replicas.contains(&a.from))
+        .count();
+    if masters < quorum {
+        return Err(format!(
+            "{masters} of the {quorum} masters it needs have answered, itself counted"
+        ));
+    }
+    Ok(())
+}
+
+/// From the failure detector: if this master holds writes until it knows it
+/// still owns its slots, and it is time to ask, ask.
+fn check_held_writes(state: &Arc<ClusterState>) {
+    if !state.held_writes_due() {
+        return;
+    }
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        let answer = ask_whether_still_owner(&state).await;
+        state.held_writes_answered(answer);
+    });
+}
+
+/// One round of asking: PING every other master that owns slots, and every
+/// replica of this one that has not failed, each over a connection of its
+/// own, and see what their PONGs say ([`still_owner`]). A PONG is a reply,
+/// made after our PING arrived, so it is no older than the round. Each is
+/// taken in like any other: one from a replica that has taken over makes
+/// this node follow it, and that lets the writes go.
+async fn ask_whether_still_owner(state: &Arc<ClusterState>) -> Result<(), String> {
+    if test_bus_muted() {
+        return Err("(test) the bus is muted".into());
+    }
+    let me = state.myself();
+    let master = state
+        .nodes
+        .read()
+        .get(&me)
+        .is_some_and(|n| n.flags.contains(NodeFlags::MASTER));
+    if !master || !state.owns_any_slot(me) {
+        // Nothing to hold writes for.
+        return Ok(());
+    }
+    let owners: ahash::AHashSet<NodeId> = state.slots.read().iter().flatten().copied().collect();
+    let (masters, replicas) = {
+        let nodes = state.nodes.read();
+        let reachable = |n: &&crate::cluster::ClusterNode| {
+            n.id != me
+                && !n.flags.contains(NodeFlags::HANDSHAKE)
+                && !n.ip.is_empty()
+                && n.cluster_port != 0
+        };
+        let address = |n: &crate::cluster::ClusterNode| (n.id, n.ip.clone(), n.cluster_port);
+        let masters: Vec<(NodeId, String, u16)> = nodes
+            .values()
+            .filter(reachable)
+            .filter(|n| n.flags.contains(NodeFlags::MASTER) && owners.contains(&n.id))
+            .map(address)
+            .collect();
+        let replicas: Vec<(NodeId, String, u16)> = nodes
+            .values()
+            .filter(reachable)
+            .filter(|n| n.master_id == Some(me) && !n.flags.contains(NodeFlags::FAIL))
+            .map(address)
+            .collect();
+        (masters, replicas)
+    };
+    let quorum = state.election_quorum(me);
+    let ping = dialer::our_ping(state);
+    let wait = Duration::from_millis(state.node_timeout_ms.clamp(500, 5_000));
+    let mut asked = tokio::task::JoinSet::new();
+    for (id, ip, port) in masters.into_iter().chain(replicas.iter().cloned()) {
+        let (state, ping) = (Arc::clone(state), ping.clone());
+        asked.spawn(async move {
+            let reply = dialer::exchange(&state, &format!("{ip}:{port}"), &ping, wait).await;
+            (id, ip, reply)
+        });
+    }
+    let mut answers = Vec::new();
+    while let Some(joined) = asked.join_next().await {
+        let Ok((id, ip, Ok(Some(reply)))) = joined else {
+            continue;
+        };
+        if let BusMessage::Pong {
+            sender_id,
+            sender_flags,
+            sender_master_id,
+            gossip,
+            ..
+        } = &reply
+            && *sender_id == id
+        {
+            answers.push(Answer {
+                from: id,
+                master: sender_flags.contains(NodeFlags::MASTER),
+                master_id: *sender_master_id,
+                holds_us_failed: gossip
+                    .iter()
+                    .any(|g| g.id == me && g.flags.contains(NodeFlags::FAIL)),
+            });
+        }
+        crate::cluster::bus::listener::process_message(state, reply, dialer::peer_socket_addr(&ip));
+    }
+    let replicas: Vec<NodeId> = replicas.iter().map(|r| r.0).collect();
+    still_owner(me, quorum, &replicas, &answers)
+}
+
+// ── For the tests of a bus that falls behind ─────────────────────────────────
+
+/// `KIVIDB_TEST_BUS_CONTROL`, never set otherwise: a file, read on every
+/// tick of the failure detector, that says what this node's bus is to do.
+/// `stall`: stop, as a bus stuck behind a slow disk does — the bus thread
+/// waits on the file, and nothing is sent, taken in or decided until it says
+/// otherwise. `mute`: send nothing and answer nothing, but take in what
+/// comes, as a node does whose answers come too late to count. Anything
+/// else, or no file: run.
+fn test_bus_control() -> Option<&'static std::path::Path> {
+    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| std::env::var_os("KIVIDB_TEST_BUS_CONTROL").map(Into::into))
+        .as_deref()
+}
+
+static TEST_BUS_MUTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this node's bus is muted for a test (see [`test_bus_control`]).
+#[inline]
+pub(crate) fn test_bus_muted() -> bool {
+    TEST_BUS_MUTED.load(Ordering::Relaxed)
+}
+
+fn apply_test_bus_control() {
+    let Some(path) = test_bus_control() else {
+        return;
+    };
+    let mode = || {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    if mode() == "stall" {
+        log_warn!("Cluster: (test) the bus is stalled");
+        while mode() == "stall" {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        log_warn!("Cluster: (test) the bus runs again");
+    }
+    TEST_BUS_MUTED.store(mode() == "mute", Ordering::Relaxed);
+}
+
 /// For the delay before a replica stands for election. It has to differ
 /// between the replicas of one master, or they split the vote; the clock's
 /// nanoseconds, which this used to be, come in steps of 100 on some systems.
@@ -783,7 +1004,62 @@ fn now_ms_local() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::data_too_old;
+    use super::{Answer, data_too_old, still_owner};
+    use crate::cluster::node::{NODE_ID_ZERO, NodeId};
+
+    fn id(n: u8) -> NodeId {
+        let mut id = NODE_ID_ZERO;
+        id[0] = b'0' + n;
+        id
+    }
+
+    fn answer(from: u8, master: bool, master_id: Option<u8>, holds_us_failed: bool) -> Answer {
+        Answer {
+            from: id(from),
+            master,
+            master_id: master_id.map(id),
+            holds_us_failed,
+        }
+    }
+
+    #[test]
+    fn a_master_is_sure_of_its_slots_once_a_majority_and_its_replicas_say_so() {
+        // Three masters (1 is us), one replica of us (4): quorum 2.
+        let (me, replicas) = (id(1), [id(4)]);
+        let replica_ok = answer(4, false, Some(1), false);
+        let all = [
+            answer(2, true, None, false),
+            answer(3, true, None, false),
+            replica_ok.clone(),
+        ];
+        assert_eq!(still_owner(me, 2, &replicas, &all), Ok(()));
+        // One other master is enough for a majority.
+        assert!(still_owner(me, 2, &replicas, &all[1..]).is_ok());
+        // None is not.
+        assert!(still_owner(me, 2, &replicas, std::slice::from_ref(&replica_ok)).is_err());
+        // A master that still holds us FAIL may have voted for our replica.
+        let failed_by_3 = [
+            answer(2, true, None, false),
+            answer(3, true, None, true),
+            replica_ok.clone(),
+        ];
+        assert!(still_owner(me, 2, &replicas, &failed_by_3).is_err());
+        // So may a replica that holds us FAIL be standing.
+        let replica_fails_us = [
+            answer(2, true, None, false),
+            answer(4, false, Some(1), true),
+        ];
+        assert!(still_owner(me, 2, &replicas, &replica_fails_us).is_err());
+        // A replica that has not answered may have been promoted.
+        assert!(still_owner(me, 2, &replicas, &all[..2]).is_err());
+        // And one that answers as a master has been.
+        let promoted = [answer(2, true, None, false), answer(4, true, None, false)];
+        assert!(still_owner(me, 2, &replicas, &promoted).is_err());
+        // A replica's answer does not count towards the masters.
+        assert!(still_owner(me, 2, &replicas, &[replica_ok]).is_err());
+        // No replica to ask, one master: only ourselves needed.
+        assert_eq!(still_owner(me, 1, &[], &[]), Ok(()));
+    }
 
     #[test]
     fn a_replica_too_long_without_its_master_does_not_stand() {

@@ -198,7 +198,7 @@ pub(crate) fn prune_ping_links(state: &ClusterState, pinged: &[String]) {
 
 /// The address a reply from `peer_ip` should be attributed to when the peer
 /// does not state one itself.
-fn peer_socket_addr(peer_ip: &str) -> std::net::SocketAddr {
+pub(crate) fn peer_socket_addr(peer_ip: &str) -> std::net::SocketAddr {
     format!("{peer_ip}:0")
         .parse()
         .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)))

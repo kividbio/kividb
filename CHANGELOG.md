@@ -78,6 +78,36 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   expired in the database it was moved to could have its `DEL` sent before
   the `MOVE`: `MOVE` and `COPY ... DB` are now ordered against the key in
   both databases.
+
+- **A master that may have been failed over takes no write until it knows
+  it has not (#242).** Under load, a master slow to answer the cluster bus
+  kept acknowledging writes after its replica was promoted, and those were
+  lost: 107 `INCR`s in one run. The replica had asked to take over
+  (`CLUSTER FAILOVER`) and given the failover up when the votes came too
+  late; the cluster marked the slow master FAIL meanwhile, and the replica
+  stood again of its own accord and won. The master's 10 s hold on writes
+  for the manual failover had run out by then, and it took writes until it
+  heard of the promotion, 1.5 s later. Now the master holds writes from the
+  manual failover on until it hears that its replica took over (they are
+  then redirected with `MOVED`) or, once the 10 s are up, until a majority
+  of the masters and every replica of it have answered a `PING` without
+  holding it FAIL, each replica as its replica: no replica can be elected
+  without such a majority. A failover given up for any other reason costs
+  that one round trip more. And a master that the cluster tells it has
+  been marked FAIL (it is up, but was too slow to answer), and that has a
+  replica that could take over, serves none of its slots until it has made
+  sure of them in the same way: commands on its keys are answered
+  `-CLUSTERDOWN`, and `CLUSTER INFO` says `cluster_state:fail`. Its replicas
+  are about to stand for election. With no failover, that lasts until the
+  other nodes clear the verdict, at most twice the node timeout after they
+  reached it. Redis 8.10 answers `-CLUSTERDOWN` there too, by another
+  route: its single thread answers the bus and clients alike, and a master
+  whose messages do not get through sees the others as unreachable. A
+  KiviDB master's bus runs beside its clients and can fall behind them,
+  and it hears the others, so its own view of the cluster said nothing was
+  wrong. Redis does take writes again the moment a manual failover runs
+  out of time on its master, without asking whether it still owns its
+  slots.
   
 - **`expired` comes before the event of a write that makes the key
   again.** When the background sweep, or another client's read, deleted a
