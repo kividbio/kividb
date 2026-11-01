@@ -1,6 +1,6 @@
 {
   "$schema": "vector-benchmark-baseline-v2",
-  "_provenance": "Seeded 2026-07-26 from a real run: redis-performance/vector-db-benchmark (v0, commit 02bb200c3845edde804f7608a8341a023e9d0e0c) redis-m-16-ef-128 config, glove-25-angular dataset (1,183,514 vectors, 25-dim), kividb (this repo's HEAD, including the ACL default-user fix) and redis/redis-stack-server:latest, both single-instance, same host (Docker on WSL2/Ubuntu). Update via `workflow_dispatch` with update_baseline=true after a reviewed, intentional change -- never hand-edit the numbers without a real run backing them.",
+  "_provenance": "Updated by .github/workflows/vector-benchmark.yml run 41273218810 (workflow_dispatch, update_baseline=true).",
   "_honesty_note": "Search: kividb clearly and consistently outperforms Redis Stack here (~2.3-2.5x RPS at every ef tier), matching and exceeding the publicly published comparison. Ingestion: kividb was SLOWER than Redis Stack in this run (913.7s vs 516.2s total time-to-queryable) -- the OPPOSITE of the published '4.7x faster' ingestion claim. This was verified against the tool's own source (engine/clients/redis/upload.py's post_upload polls FT.INFO's percent_indexed to 100% before stopping the clock, so this is a real total-time-to-queryable number, not a partial one). Not investigated further here -- gates below hold kividb to *not regressing further* from today's real, measured numbers, not to the marketing claim.",
   "_known_calibration_gap": "These numbers were measured on a 16-core dev machine, where kividb's src/config.rs resolve_threads() (available_parallelism() - 2) gives it 14 worker threads. The actual CI target (.github/workflows/vector-benchmark.yml, t3.xlarge = 4 vCPUs) only gives kividb 2 threads -- confirmed live (2026-07-26) by forcing --threads 2 on this same dev machine against the same real dataset: results dropped to the 500-1600 QPS range, matching the first real t3.xlarge CI run's 450-950 QPS (the residual gap is Redis Stack sharing the same 4 vCPUs concurrently in CI, which this isolated local test didn't reproduce). Redis Stack's search path is far less sensitive to this than kividb's HNSW path is, which is why the competitive ratio (not just the absolute numbers) looked far worse on the small instance. Conclusion: the first CI run's REGRESSED verdict was a baseline/hardware mismatch, not a real code regression.",
   "_stale_pending_recalibration": "The workflow has moved twice since these numbers were captured (2026-07-26): (1) x86 t3.xlarge/EF_CONSTRUCTION=128/the old Python v0 tool -> ARM (Graviton)/EF_CONSTRUCTION=256/kividbio's Rust vector-db-benchmark fork (dedicated kividb engine, merged upstream as redis/vector-db-benchmark#203 on 2026-07-26); (2) single shared instance (t4g.xlarge, burstable, running both the server AND the 100-thread client) -> a dedicated server + client pair in one cluster placement group (c7gn.12xlarge/c7gn.16xlarge by default), matching kivi-benchmark's memtier topology -- the shared-instance setup was confounding kividb's real numbers with CPU contention from its own benchmark client and, on a burstable instance, credit-exhaustion throttling partway through long runs (both observed live: kividb ingest measured at 735 rec/s average, degrading over the run, on the old topology). The kividb/redis_stack number blocks below predate BOTH changes and are not comparable to a run under the current tool/config/topology -- both gates below will misfire until this file is recalibrated for real via workflow_dispatch update_baseline=true on the actual server+client topology. Do not trust a 'REGRESSED' or 'ok' verdict from this file until that has happened.",
@@ -14,40 +14,119 @@
     "redis_version": "8.10.2"
   },
   "kividb": {
-    "ingest": { "upload_time_s": 913.7351476040003, "total_time_s": 913.7392669559999 },
+    "ingest": {
+      "upload_time_s": 31.200323477,
+      "total_time_s": 31.466301025
+    },
     "search_by_ef": {
-      "64": { "rps": 3279.815045351875, "p50_ms": 21.029636499861226, "p95_ms": 45.82494405021861, "precision": 0.938276 },
-      "128": { "rps": 3005.4025299207105, "p50_ms": 22.08762950021992, "p95_ms": 47.18756204988494, "precision": 0.956264 },
-      "256": { "rps": 2155.189855038597, "p50_ms": 37.567386000091574, "p95_ms": 67.3337552003204, "precision": 0.9863 },
-      "512": { "rps": 1512.7793258905451, "p50_ms": 56.85184949993527, "p95_ms": 99.2533938998804, "precision": 0.996748 }
+      "64": {
+        "rps": 38501.09611658117,
+        "p50_ms": 2.391365,
+        "p95_ms": 3.2747359499999997,
+        "precision": 0.9476089999999462
+      },
+      "128": {
+        "rps": 34451.72343902436,
+        "p50_ms": 2.7113850000000004,
+        "p95_ms": 3.600592,
+        "precision": 0.9646199999999424
+      },
+      "256": {
+        "rps": 23620.773470636293,
+        "p50_ms": 4.0012665,
+        "p95_ms": 5.349017,
+        "precision": 0.9907879999999465
+      },
+      "512": {
+        "rps": 15092.873164912264,
+        "p50_ms": 6.330951,
+        "p95_ms": 8.57515805,
+        "precision": 0.9983429999999789
+      }
     }
   },
   "redis": {
-    "ingest": { "upload_time_s": 516.2082495190002, "total_time_s": 516.2156178160003 },
+    "ingest": {
+      "upload_time_s": 59.285188399,
+      "total_time_s": 59.47301821399999
+    },
     "search_by_ef": {
-      "64": { "rps": 1405.6748314194544, "p50_ms": 66.20118099999672, "p95_ms": 99.10164925011024, "precision": 0.906661 },
-      "128": { "rps": 1264.3415544244856, "p50_ms": 73.48487450008179, "p95_ms": 113.05281769989503, "precision": 0.931971 },
-      "256": { "rps": 901.4191308196664, "p50_ms": 105.65381449987399, "p95_ms": 151.5607680497851, "precision": 0.976123 },
-      "512": { "rps": 601.2488104820611, "p50_ms": 164.49933850003617, "p95_ms": 229.4531845501978, "precision": 0.993624 }
+      "64": {
+        "rps": 20554.55367750677,
+        "p50_ms": 4.708429,
+        "p95_ms": 7.276418999999999,
+        "precision": 0.9116139999999654
+      },
+      "128": {
+        "rps": 20057.804144492322,
+        "p50_ms": 4.881009000000001,
+        "p95_ms": 5.845659,
+        "precision": 0.9366139999999499
+      },
+      "256": {
+        "rps": 14107.048536156788,
+        "p50_ms": 7.022093,
+        "p95_ms": 7.408975999999999,
+        "precision": 0.9790759999999451
+      },
+      "512": {
+        "rps": 9032.649846087803,
+        "p50_ms": 11.000561000000001,
+        "p95_ms": 11.579654049999998,
+        "precision": 0.9950449999999582
+      }
     }
   },
   "gates": {
     "kividb_absolute": {
       "_comment": "kividb vs its own historical numbers above. Generous tolerance -- absolute perf varies across CI instance types/loads over time; this catches a real regression, not hardware noise.",
-      "search_by_ef.64.rps": { "regression_if": "below", "tolerance_pct": 20 },
-      "search_by_ef.128.rps": { "regression_if": "below", "tolerance_pct": 20 },
-      "search_by_ef.256.rps": { "regression_if": "below", "tolerance_pct": 20 },
-      "search_by_ef.512.rps": { "regression_if": "below", "tolerance_pct": 20 },
-      "search_by_ef.512.p95_ms": { "regression_if": "above", "tolerance_pct": 40 },
-      "ingest.total_time_s": { "regression_if": "above", "tolerance_pct": 30 }
+      "search_by_ef.64.rps": {
+        "regression_if": "below",
+        "tolerance_pct": 20
+      },
+      "search_by_ef.128.rps": {
+        "regression_if": "below",
+        "tolerance_pct": 20
+      },
+      "search_by_ef.256.rps": {
+        "regression_if": "below",
+        "tolerance_pct": 20
+      },
+      "search_by_ef.512.rps": {
+        "regression_if": "below",
+        "tolerance_pct": 20
+      },
+      "search_by_ef.512.p95_ms": {
+        "regression_if": "above",
+        "tolerance_pct": 40
+      },
+      "ingest.total_time_s": {
+        "regression_if": "above",
+        "tolerance_pct": 30
+      }
     },
     "kividb_vs_redis_ratio": {
       "_comment": "Computed fresh each run from both engines on the SAME instance -- much less noisy than the absolute gate above, since both numbers share whatever the CI hardware happens to be that day. min_ratio is kividb_metric/redis_metric for rps (higher=better, so a floor) or redis_metric/kividb_metric for *_time_s (lower=better for kividb, so also expressed as a floor on the 'kividb is faster by this factor' ratio -- currently <1.0 for ingest, being tracked honestly, not hidden). The rps floors were 2.0 while the other engine was redis-stack-server 7.4 (RediSearch 2.10). Against Redis 8.10.2's query engine, compared since 2026-10-16 (109f067), KiviDB measured 1.21, 1.08, 0.94 and 0.88 at ef 64-512 on this workflow's Azure arm64 machines (run 39869377109): every run failed on a floor that no longer described the comparison. 0.75 catches KiviDB falling well behind Redis 8.10 without failing on today's numbers.",
-      "search_by_ef.64.rps": { "kind": "kividb_over_redis", "min_ratio": 0.75 },
-      "search_by_ef.128.rps": { "kind": "kividb_over_redis", "min_ratio": 0.75 },
-      "search_by_ef.256.rps": { "kind": "kividb_over_redis", "min_ratio": 0.75 },
-      "search_by_ef.512.rps": { "kind": "kividb_over_redis", "min_ratio": 0.75 },
-      "ingest.total_time_s": { "kind": "redis_over_kividb", "min_ratio": 0.4 }
+      "search_by_ef.64.rps": {
+        "kind": "kividb_over_redis",
+        "min_ratio": 0.75
+      },
+      "search_by_ef.128.rps": {
+        "kind": "kividb_over_redis",
+        "min_ratio": 0.75
+      },
+      "search_by_ef.256.rps": {
+        "kind": "kividb_over_redis",
+        "min_ratio": 0.75
+      },
+      "search_by_ef.512.rps": {
+        "kind": "kividb_over_redis",
+        "min_ratio": 0.75
+      },
+      "ingest.total_time_s": {
+        "kind": "redis_over_kividb",
+        "min_ratio": 0.4
+      }
     }
   },
   "datasets": {
@@ -64,20 +143,139 @@
       "gates": {
         "kividb_absolute": {
           "_comment": "kividb vs its own recorded numbers: fail on a drop of more than 10% in throughput at any measured config, or recall more than 0.01 lower. Report-only until a run records them.",
-          "search.ef64_p1.rps": { "regression_if": "below", "tolerance_pct": 10 },
-          "search.ef128_p1.rps": { "regression_if": "below", "tolerance_pct": 10 },
-          "search.ef256_p1.rps": { "regression_if": "below", "tolerance_pct": 10 },
-          "search.ef128_p16.rps": { "regression_if": "below", "tolerance_pct": 10 },
-          "search.ef128_p100.rps": { "regression_if": "below", "tolerance_pct": 10 },
-          "search.ef128_p1.recall": { "regression_if": "below", "tolerance_abs": 0.01 },
-          "ingest.total_time_s": { "regression_if": "above", "tolerance_pct": 30 }
+          "search.ef64_p1.rps": {
+            "regression_if": "below",
+            "tolerance_pct": 10
+          },
+          "search.ef128_p1.rps": {
+            "regression_if": "below",
+            "tolerance_pct": 10
+          },
+          "search.ef256_p1.rps": {
+            "regression_if": "below",
+            "tolerance_pct": 10
+          },
+          "search.ef128_p16.rps": {
+            "regression_if": "below",
+            "tolerance_pct": 10
+          },
+          "search.ef128_p100.rps": {
+            "regression_if": "below",
+            "tolerance_pct": 10
+          },
+          "search.ef128_p1.recall": {
+            "regression_if": "below",
+            "tolerance_abs": 0.01
+          },
+          "ingest.total_time_s": {
+            "regression_if": "above",
+            "tolerance_pct": 30
+          }
         },
         "kividb_vs_redis_ratio": {
           "_comment": "Same run, same machines. KiviDB answered filtered queries about 2x faster than Redis 8.10 in the manual runs these reproduce (351 vs 164 q/s at 1 client, 1,586 vs 949 at 16, ef 128), so a floor of 1.2x catches the filter path losing most of that lead while leaving room for noise. Recall may be at most 0.01 below Redis's.",
-          "search.ef128_p1.rps": { "kind": "kividb_over_redis", "min_ratio": 1.2 },
-          "search.ef128_p16.rps": { "kind": "kividb_over_redis", "min_ratio": 1.2 },
-          "search.ef128_p100.rps": { "kind": "kividb_over_redis", "min_ratio": 1.2 },
-          "search.ef128_p1.recall": { "kind": "kividb_minus_redis", "min_delta": -0.01 }
+          "search.ef128_p1.rps": {
+            "kind": "kividb_over_redis",
+            "min_ratio": 1.2
+          },
+          "search.ef128_p16.rps": {
+            "kind": "kividb_over_redis",
+            "min_ratio": 1.2
+          },
+          "search.ef128_p100.rps": {
+            "kind": "kividb_over_redis",
+            "min_ratio": 1.2
+          },
+          "search.ef128_p1.recall": {
+            "kind": "kividb_minus_redis",
+            "min_delta": -0.01
+          }
+        }
+      },
+      "kividb": {
+        "ingest": {
+          "upload_time_s": 14.802254124,
+          "total_time_s": 16.433506308
+        },
+        "search": {
+          "ef64_p1": {
+            "rps": 285.40849027537774,
+            "p50_ms": 2.141784,
+            "p95_ms": 10.113932049999992,
+            "recall": 0.9982625714285716,
+            "precision": 0.9982625714285716
+          },
+          "ef128_p1": {
+            "rps": 245.41739774750633,
+            "p50_ms": 2.4389239999999996,
+            "p95_ms": 15.3162426,
+            "recall": 0.9984265714285717,
+            "precision": 0.9984265714285717
+          },
+          "ef256_p1": {
+            "rps": 214.33531733409245,
+            "p50_ms": 2.552368,
+            "p95_ms": 16.7925611,
+            "recall": 0.9985145714285716,
+            "precision": 0.9985145714285716
+          },
+          "ef128_p16": {
+            "rps": 3113.8307106484904,
+            "p50_ms": 3.060129,
+            "p95_ms": 19.34884695,
+            "recall": 0.9984265714285709,
+            "precision": 0.9984265714285709
+          },
+          "ef128_p100": {
+            "rps": 4541.576575790597,
+            "p50_ms": 17.718148499999998,
+            "p95_ms": 52.229614999999995,
+            "recall": 0.9984265714285709,
+            "precision": 0.9984265714285709
+          }
+        }
+      },
+      "redis": {
+        "ingest": {
+          "upload_time_s": 15.050108568,
+          "total_time_s": 16.678553453
+        },
+        "search": {
+          "ef64_p1": {
+            "rps": 128.99376459913995,
+            "p50_ms": 2.9043660000000004,
+            "p95_ms": 40.639375349999995,
+            "recall": 0.9985745714285714,
+            "precision": 0.9985745714285714
+          },
+          "ef128_p1": {
+            "rps": 129.65607010123964,
+            "p50_ms": 2.887426,
+            "p95_ms": 40.407846150000005,
+            "recall": 0.9985745714285714,
+            "precision": 0.9985745714285714
+          },
+          "ef256_p1": {
+            "rps": 129.8141687707109,
+            "p50_ms": 2.872126,
+            "p95_ms": 40.4007113,
+            "recall": 0.9985745714285714,
+            "precision": 0.9985745714285714
+          },
+          "ef128_p16": {
+            "rps": 1761.7059290791237,
+            "p50_ms": 3.3482065,
+            "p95_ms": 48.20258704999999,
+            "recall": 0.9985745714285711,
+            "precision": 0.9985745714285711
+          },
+          "ef128_p100": {
+            "rps": 1789.6162829269754,
+            "p50_ms": 51.804744,
+            "p95_ms": 92.87834479999995,
+            "recall": 0.9985745714285716,
+            "precision": 0.9985745714285716
+          }
         }
       }
     },
@@ -93,20 +291,139 @@
       "gates": {
         "kividb_absolute": {
           "_comment": "As for h-and-m: fail on a throughput drop of more than 10%, or recall more than 0.01 lower. Report-only until a run records them.",
-          "search.ef64_p1.rps": { "regression_if": "below", "tolerance_pct": 10 },
-          "search.ef128_p1.rps": { "regression_if": "below", "tolerance_pct": 10 },
-          "search.ef256_p1.rps": { "regression_if": "below", "tolerance_pct": 10 },
-          "search.ef128_p16.rps": { "regression_if": "below", "tolerance_pct": 10 },
-          "search.ef128_p100.rps": { "regression_if": "below", "tolerance_pct": 10 },
-          "search.ef128_p1.recall": { "regression_if": "below", "tolerance_abs": 0.01 },
-          "ingest.total_time_s": { "regression_if": "above", "tolerance_pct": 30 }
+          "search.ef64_p1.rps": {
+            "regression_if": "below",
+            "tolerance_pct": 10
+          },
+          "search.ef128_p1.rps": {
+            "regression_if": "below",
+            "tolerance_pct": 10
+          },
+          "search.ef256_p1.rps": {
+            "regression_if": "below",
+            "tolerance_pct": 10
+          },
+          "search.ef128_p16.rps": {
+            "regression_if": "below",
+            "tolerance_pct": 10
+          },
+          "search.ef128_p100.rps": {
+            "regression_if": "below",
+            "tolerance_pct": 10
+          },
+          "search.ef128_p1.recall": {
+            "regression_if": "below",
+            "tolerance_abs": 0.01
+          },
+          "ingest.total_time_s": {
+            "regression_if": "above",
+            "tolerance_pct": 30
+          }
         },
         "kividb_vs_redis_ratio": {
           "_comment": "Same floor as glove's: 0.75x Redis's throughput. KiviDB was near parity in the manual runs (818 vs 854 q/s at 1 client, ef 128). Recall may be at most 0.01 below Redis's.",
-          "search.ef128_p1.rps": { "kind": "kividb_over_redis", "min_ratio": 0.75 },
-          "search.ef128_p16.rps": { "kind": "kividb_over_redis", "min_ratio": 0.75 },
-          "search.ef128_p100.rps": { "kind": "kividb_over_redis", "min_ratio": 0.75 },
-          "search.ef128_p1.recall": { "kind": "kividb_minus_redis", "min_delta": -0.01 }
+          "search.ef128_p1.rps": {
+            "kind": "kividb_over_redis",
+            "min_ratio": 0.75
+          },
+          "search.ef128_p16.rps": {
+            "kind": "kividb_over_redis",
+            "min_ratio": 0.75
+          },
+          "search.ef128_p100.rps": {
+            "kind": "kividb_over_redis",
+            "min_ratio": 0.75
+          },
+          "search.ef128_p1.recall": {
+            "kind": "kividb_minus_redis",
+            "min_delta": -0.01
+          }
+        }
+      },
+      "kividb": {
+        "ingest": {
+          "upload_time_s": 11.73475845,
+          "total_time_s": 12.414097933999999
+        },
+        "search": {
+          "ef64_p1": {
+            "rps": 943.0226666682183,
+            "p50_ms": 1.0707220000000002,
+            "p95_ms": 1.32676205,
+            "recall": 0.9683800000000022,
+            "precision": 0.9683800000000022
+          },
+          "ef128_p1": {
+            "rps": 595.6434702582608,
+            "p50_ms": 1.6961039999999998,
+            "p95_ms": 2.159748,
+            "recall": 0.9858800000000004,
+            "precision": 0.9858800000000004
+          },
+          "ef256_p1": {
+            "rps": 366.90918448934514,
+            "p50_ms": 2.7581849999999997,
+            "p95_ms": 3.5586990000000003,
+            "recall": 0.9944399999999995,
+            "precision": 0.9944399999999995
+          },
+          "ef128_p16": {
+            "rps": 7309.662470897018,
+            "p50_ms": 2.213845,
+            "p95_ms": 2.815979,
+            "recall": 0.9858799999999998,
+            "precision": 0.9858799999999998
+          },
+          "ef128_p100": {
+            "rps": 10279.615576587998,
+            "p50_ms": 9.304825,
+            "p95_ms": 12.79453295,
+            "recall": 0.9858799999999989,
+            "precision": 0.9858799999999989
+          }
+        }
+      },
+      "redis": {
+        "ingest": {
+          "upload_time_s": 10.275018234,
+          "total_time_s": 10.953227536
+        },
+        "search": {
+          "ef64_p1": {
+            "rps": 874.2308461720277,
+            "p50_ms": 1.142203,
+            "p95_ms": 1.359775,
+            "recall": 0.9573000000000027,
+            "precision": 0.9573000000000027
+          },
+          "ef128_p1": {
+            "rps": 569.2760303027803,
+            "p50_ms": 1.7722240000000002,
+            "p95_ms": 2.114911,
+            "recall": 0.9807199999999999,
+            "precision": 0.9807199999999999
+          },
+          "ef256_p1": {
+            "rps": 349.0630143672153,
+            "p50_ms": 2.913967,
+            "p95_ms": 3.4931893,
+            "recall": 0.9916600000000002,
+            "precision": 0.9916600000000002
+          },
+          "ef128_p16": {
+            "rps": 7414.308623906218,
+            "p50_ms": 2.176005,
+            "p95_ms": 2.6025179500000006,
+            "recall": 0.980720000000001,
+            "precision": 0.980720000000001
+          },
+          "ef128_p100": {
+            "rps": 8088.825096747242,
+            "p50_ms": 12.310469000000001,
+            "p95_ms": 12.980448,
+            "recall": 0.9807199999999999,
+            "precision": 0.9807199999999999
+          }
         }
       }
     }
