@@ -759,3 +759,55 @@ fn a_crash_while_records_are_added_to_an_old_log_does_not_replay_them_twice() {
         assert_eq!(c.cmd(&["DBSIZE"]).i(), 2);
     }
 }
+
+// ── Writes while a turn-over waits for the disk ──────────────────────────────
+
+/// A turn-over synced the old log, and the directory, in whichever thread
+/// reached its mark, holding the log's lock: every write waited for the
+/// disk. On a slow disk with a backlog that was seconds at a time, and
+/// replies went out without their writes after 5 (#243). The old log is now
+/// synced by the checkpoint with the lock let go; the step is held here, as
+/// a slow disk would hold it.
+#[test]
+fn writes_go_on_while_a_turn_over_syncs_the_old_log() {
+    for &io in io_models() {
+        for end in ["finishes", "is killed"] {
+            let mut server = Server::start(io, "turn-over-syncing");
+            let mut c = server.conn();
+            fill(&mut c, "before", 500);
+            assert_eq!(c.cmd(&["BGREWRITEAOF"]).s(), STARTED);
+            assert!(server.reached("turn-over-syncing.1", LONG));
+
+            let started = Instant::now();
+            for i in 0..200 {
+                assert!(c.cmd(&["SET", &format!("during:{i}"), "1"]).ok());
+            }
+            let took = started.elapsed();
+            assert!(
+                took < Duration::from_secs(3),
+                "{io}: writes waited for the old log's sync ({took:?})"
+            );
+            assert_eq!(info_field(&mut c, "aof_acks_before_write"), "0", "{io}");
+
+            if end == "finishes" {
+                server.release("turn-over-syncing.1");
+                wait_idle(&mut c);
+                assert!(!server.dir.join("appendonly.aof.prev").exists(), "{io}");
+                durable(&mut c);
+            }
+            // Acknowledged, so in the new log: killed with the old log not
+            // yet synced, or after the checkpoint, nothing is lost.
+            drop(c);
+            server.kill();
+            server.failpoints.clear();
+            let mut c = server.restart();
+            assert_eq!(c.cmd(&["DBSIZE"]).i(), 700, "{io}, checkpoint {end}");
+            assert!(c.cmd(&["SAVE"]).ok());
+            assert!(!server.dir.join("appendonly.aof.prev").exists());
+            drop(c);
+            server.kill();
+            let mut c = server.restart();
+            assert_eq!(c.cmd(&["DBSIZE"]).i(), 700, "{io}, checkpoint {end}");
+        }
+    }
+}

@@ -4315,6 +4315,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         "err"
                     }
                 ));
+                // Replies to writes sent after 5 s without their records in
+                // the file, because the disk fell that far behind: writes a
+                // process killed then could lose. 0 on a disk that keeps up.
+                out.push_str(&format!(
+                    "aof_acks_before_write:{}\r\n",
+                    crate::aof::AOF_ACKS_BEFORE_WRITE.load(Ordering::Relaxed)
+                ));
                 out.push_str("aof_last_cow_size:0\r\n");
                 out.push_str("module_fork_in_progress:0\r\n");
                 out.push_str("module_fork_last_cow_size:0\r\n");
