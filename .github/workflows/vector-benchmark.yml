@@ -5,6 +5,40 @@ name: Vector Benchmark
 # the official redis/vector-db-benchmark (see below for why upstream, not our
 # fork), glove-25-angular (1.18M vectors), HNSW M=16/EF_CONSTRUCTION=256.
 #
+# Datasets (the `datasets` input picks any subset; all three by default):
+#
+#   glove-25-angular -- unfiltered, low-dimension (25), 1.18M vectors. The
+#     original gate, unchanged: same tool pin (VDB_BENCHMARK_REF), HNSW
+#     M=16/EF_CONSTRUCTION=256, ef 64/128/256/512 at parallel=100, same gates
+#     and baseline (the top-level blocks of benchmarks/vector-baseline.json).
+#   h-and-m-2048-angular-filters -- FILTERED search: 105,542 2048-dim
+#     fashion embeddings with TAG/NUMERIC metadata, every query a KNN under a
+#     metadata filter (median 2% of documents match). This is the workload
+#     where a filter-path regression shows; glove alone never exercises it.
+#   dbpedia-openai-100K-1536-angular -- unfiltered, HIGH-dimension (1536),
+#     100K OpenAI embeddings: distance-kernel and HNSW cost per vector, which
+#     glove's 25 dimensions hide.
+#
+# The two added datasets reproduce the manual kividb-vs-Redis 8.10 runs:
+# HNSW M=16/EF_CONSTRUCTION=128, upload 16 threads/batch 64, ef 64/128/256 at
+# 1 client plus ef 128 at 16 and 100 clients. They need a newer tool pin
+# (VDB_BENCHMARK_REF_EXTRA): at VDB_BENCHMARK_REF the tool's kividb engine
+# ran metadata filters wrongly (upstream #237, "recall 0.000 -> 1.000") and
+# did not escape TAG values (#375). glove stays on its own pin so its numbers
+# remain comparable with its baseline; the tool also changed what its
+# precision metric means in between (#249). Each added dataset has its own
+# section in the baseline file and its own gates; see "Compare against
+# baseline".
+#
+# Engines: kividb and Redis 8.10.2 are compared and gated. Dragonfly
+# (DRAGONFLY_VERSION, native arm64 binary, one proactor thread per core) runs
+# on every dataset too, after them and on the same terms -- one engine
+# resident at a time, the same tool settings -- but is REPORT-ONLY: its
+# numbers go into the summary table next to the other two, ingest time first,
+# and no gate is ever computed on it; a failed Dragonfly run is a warning, not
+# a failed job. Dragonfly's FT.SEARCH serves the filtered dataset's TAG/NUMERIC
+# prefilters (checked on a dry run: recall 0.998, like the others).
+#
 # Server + client, one virtual network, like the main benchmark: kividb and
 # Redis run on a dedicated SERVER instance; vector-db-benchmark
 # (the driver) runs on a SEPARATE CLIENT instance -- the same topology
@@ -66,6 +100,14 @@ name: Vector Benchmark
 # timeout-minutes -- and recalibrate via update_baseline once a real run
 # lands on this topology instead of trusting the pre-existing numbers in
 # benchmarks/vector-baseline.json, which predate this topology entirely.
+#
+# The two added datasets are small (105K and 100K vectors; 1.4 GB and 0.75 GB
+# on the client's 64 GB disk once extracted; under 2.5 GB peak RSS for any
+# engine on the server's 128 GB). On a dry run of this workflow's commands
+# (D32ps_v5 server, KiviDB 1.2.0-rc3), all three engines took ~33 min on
+# h-and-m -- Redis's 1-client filtered queries alone ~13 min, its query set at
+# ~128 q/s, three repetitions -- ~7 min on dbpedia and ~3 min on glove; ~45
+# min in all, plus ~10 min to build the second tool pin on a cold cache.
 
 on:
   # Manual only, from master (the Azure sign-in trusts master runs only; pick
@@ -95,6 +137,10 @@ on:
         description: "Azure region for both machines (the arm64 quota is in centralindia)"
         required: false
         default: "centralindia"
+      datasets:
+        description: "Datasets to run, space-separated: any of glove-25-angular h-and-m-2048-angular-filters dbpedia-openai-100K-1536-angular"
+        required: false
+        default: "glove-25-angular h-and-m-2048-angular-filters dbpedia-openai-100K-1536-angular"
       update_baseline:
         description: "After a run (regressed or not), overwrite benchmarks/vector-baseline.json with these results and commit. Only use after deliberately reviewing why numbers changed."
         type: boolean
@@ -122,10 +168,19 @@ env:
   VDB_BENCHMARK_REPO: "redis/vector-db-benchmark"
   VDB_BENCHMARK_REF: "31a28b5ae6d35da96de6d218ada209868a628b42"
   DATASET: "glove-25-angular"
+  # The filtered and high-dimension datasets run on a newer pin of the same
+  # upstream repo (tag 0.2.0) -- see the top-of-file comment for why glove
+  # does not share it. Bump deliberately, like VDB_BENCHMARK_REF.
+  VDB_BENCHMARK_REF_EXTRA: "d22d44e8b46009a800a59e952710166ece2e38a1"
+  EXTRA_DATASETS_ALLOWED: "h-and-m-2048-angular-filters dbpedia-openai-100K-1536-angular"
   # Exact packages.redis.io arm64 build of Redis 8.10.2, whose query engine
   # (vector search included) ships with Redis itself -- see the top-of-file
   # comment.
   REDIS_DEB: "6:8.10.2-1rl1~jammy1"
+  # Dragonfly, the third engine: REPORT-ONLY (no gate is ever computed on
+  # it). The native arm64 release binary at the version benchmark.yml pins,
+  # with one proactor thread per core, as the warefeats comparison runs it.
+  DRAGONFLY_VERSION: "v2.0.2"
 
 permissions:
   contents: read
@@ -159,7 +214,11 @@ jobs:
     # Build/provision overhead (~15-20 min) + up to 40 min poll budget per
     # engine (see the two "Run vector-db-benchmark against ..." steps) +
     # fetch/compare -- generous margin over the ~100 min worst case.
-    timeout-minutes: 130
+    # Dragonfly and the filtered/high-dimension datasets add ~10 min to build
+    # the second tool pin (cold cache) and ~45 min of runs (measured on a dry
+    # run; see the top-of-file comment). Each of those runs has a 40 min poll
+    # budget, which a healthy run never nears.
+    timeout-minutes: 180
     env:
       # Built as the arm64 release binaries and images are (release.yml,
       # Dockerfile): atomics as single LSE instructions. Without it the
@@ -175,6 +234,35 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
 
+      # glove=true|false, and extra= the other selected datasets in a fixed
+      # order. An empty input (a dispatch through the API that omits it)
+      # means all three, like the default.
+      - name: Resolve datasets
+        id: datasets
+        env:
+          REQUESTED: ${{ inputs.datasets }}
+        run: |
+          set -euo pipefail
+          REQUESTED="${REQUESTED//,/ }"
+          if [[ -z "${REQUESTED// /}" ]]; then
+            REQUESTED="$DATASET $EXTRA_DATASETS_ALLOWED"
+          fi
+          GLOVE=false
+          EXTRA=""
+          for ds in $REQUESTED; do
+            if [[ "$ds" == "$DATASET" ]]; then
+              GLOVE=true
+            elif [[ " $EXTRA_DATASETS_ALLOWED " == *" $ds "* ]]; then
+              [[ " $EXTRA " == *" $ds "* ]] || EXTRA="${EXTRA:+$EXTRA }$ds"
+            else
+              echo "::error::unknown dataset '$ds' (allowed: $DATASET $EXTRA_DATASETS_ALLOWED)" >&2
+              exit 1
+            fi
+          done
+          echo "glove=$GLOVE" >> "$GITHUB_OUTPUT"
+          echo "extra=$EXTRA" >> "$GITHUB_OUTPUT"
+          echo "glove=$GLOVE extra=$EXTRA"
+
       - name: Checkout vector-db-benchmark (kividbio fork, pinned -- see top-of-file comment)
         uses: actions/checkout@v4
         with:
@@ -182,12 +270,20 @@ jobs:
           ref: ${{ env.VDB_BENCHMARK_REF }}
           path: vector-db-benchmark
 
+      - name: Checkout vector-db-benchmark for the filtered/high-dimension datasets (newer pin)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.VDB_BENCHMARK_REPO }}
+          ref: ${{ env.VDB_BENCHMARK_REF_EXTRA }}
+          path: vector-db-benchmark-extra
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             .
             vector-db-benchmark
+            vector-db-benchmark-extra
 
       - name: Install libhdf5-dev (vector-db-benchmark's HDF5 dataset reader needs it to build)
         # dpkg-dev is for dpkg-architecture, used below to locate HDF5's
@@ -206,6 +302,13 @@ jobs:
           HDF5_DIR="/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/hdf5/serial" \
             cargo build --release --bin vector-db-benchmark
 
+      - name: Build vector-db-benchmark (newer pin, for the filtered/high-dimension datasets)
+        if: steps.datasets.outputs.extra != ''
+        working-directory: vector-db-benchmark-extra
+        run: |
+          HDF5_DIR="/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/hdf5/serial" \
+            cargo build --release --bin vector-db-benchmark
+
       - name: Write SSH private key
         env:
           BENCHMARK_SSH_PRIVATE_KEY: ${{ secrets.BENCHMARK_SSH_PRIVATE_KEY }}
@@ -215,6 +318,8 @@ jobs:
           chmod 600 "$SSH_KEY_PATH"
 
       - name: Deploy kividb to server, vector-db-benchmark to client
+        env:
+          EXTRA: ${{ steps.datasets.outputs.extra }}
         run: |
           set -euo pipefail
           SERVER_SSH="ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@$SERVER_HOST"
@@ -237,10 +342,21 @@ jobs:
           $CLIENT_SCP vector-db-benchmark/datasets/datasets.json \
             ubuntu@$CLIENT_HOST:/home/ubuntu/vdb/datasets/datasets.json
 
-      - name: Provision server (Redis 8.10)
+          # The newer pin gets its own directory (its own datasets.json, its
+          # own results/), so the two tools never read each other's files.
+          if [[ -n "$EXTRA" ]]; then
+            $CLIENT_SSH "mkdir -p /home/ubuntu/vdbx/datasets"
+            $CLIENT_SCP vector-db-benchmark-extra/target/release/vector-db-benchmark \
+              ubuntu@$CLIENT_HOST:/home/ubuntu/vdbx/vector-db-benchmark
+            $CLIENT_SSH "chmod +x /home/ubuntu/vdbx/vector-db-benchmark"
+            $CLIENT_SCP vector-db-benchmark-extra/datasets/datasets.json \
+              ubuntu@$CLIENT_HOST:/home/ubuntu/vdbx/datasets/datasets.json
+          fi
+
+      - name: Provision server (Redis 8.10, Dragonfly)
         run: |
           SSH="ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@$SERVER_HOST"
-          $SSH REDIS_DEB="${{ env.REDIS_DEB }}" bash << 'REMOTE'
+          $SSH REDIS_DEB="${{ env.REDIS_DEB }}" DRAGONFLY_VERSION="${{ env.DRAGONFLY_VERSION }}" bash << 'REMOTE'
           set -euo pipefail
 
           sudo apt-get update -qq
@@ -272,6 +388,16 @@ jobs:
           # the service-managed one to avoid a port clash or double-counting
           # its CPU/memory in the benchmark.
           sudo systemctl disable --now redis-server || true
+
+          # Dragonfly: the release's native arm64 binary, as benchmark.yml
+          # installs it.
+          cd /home/ubuntu
+          wget -q "https://github.com/dragonflydb/dragonfly/releases/download/${DRAGONFLY_VERSION}/dragonfly-aarch64.tar.gz" \
+            -O dragonfly-aarch64.tar.gz
+          tar -xzf dragonfly-aarch64.tar.gz
+          chmod +x dragonfly-aarch64
+          rm -f dragonfly-aarch64.tar.gz
+          ./dragonfly-aarch64 --version
           REMOTE
 
       - name: Provision client (HDF5 runtime lib, engines-files)
@@ -334,7 +460,189 @@ jobs:
             }
           ]
           ENGINES
+
+          # Dragonfly on glove: the same settings again under its own name
+          # (report-only -- see DRAGONFLY_VERSION).
+          cat > /home/ubuntu/vdb/dragonfly-engine.json << 'ENGINES'
+          [
+            {
+              "name": "dragonfly-glove25",
+              "engine": "dragonfly",
+              "connection_params": {},
+              "collection_params": { "hnsw_config": { "M": 16, "EF_CONSTRUCTION": 256 } },
+              "search_params": [
+                { "parallel": 100, "search_params": { "ef": 64 } },
+                { "parallel": 100, "search_params": { "ef": 128 } },
+                { "parallel": 100, "search_params": { "ef": 256 } },
+                { "parallel": 100, "search_params": { "ef": 512 } }
+              ],
+              "upload_params": { "parallel": 100, "batch_size": 64 }
+            }
+          ]
+          ENGINES
+
+          # The filtered and high-dimension datasets: the settings of the
+          # manual kividb-vs-Redis 8.10 runs these reproduce (HNSW M=16,
+          # EF_CONSTRUCTION=128, upload 16 threads/batch 64), with ef
+          # 64/128/256 at ONE client -- latency-bound, where a slower filter
+          # path shows first -- and ef 128 at 16 and 100 clients for
+          # throughput. One file per engine covers both datasets: the tool
+          # names its result files <name>-<dataset>-..., so they never
+          # collide. The kividb/redis engines index the filtered dataset's
+          # metadata schema as TAG/NUMERIC fields and send each query's
+          # filter, so the same file serves filtered and unfiltered data.
+          mkdir -p /home/ubuntu/vdbx
+          for e in kividb redis dragonfly; do
+            cat > /home/ubuntu/vdbx/$e-engine.json << ENGINES
+          [
+            {
+              "name": "$e-m16-ef128",
+              "engine": "$e",
+              "connection_params": {},
+              "collection_params": { "hnsw_config": { "M": 16, "EF_CONSTRUCTION": 128 } },
+              "search_params": [
+                { "parallel": 1, "search_params": { "ef": 64 } },
+                { "parallel": 1, "search_params": { "ef": 128 } },
+                { "parallel": 1, "search_params": { "ef": 256 } },
+                { "parallel": 16, "search_params": { "ef": 128 } },
+                { "parallel": 100, "search_params": { "ef": 128 } }
+              ],
+              "upload_params": { "parallel": 16, "batch_size": 64 }
+            }
+          ]
+          ENGINES
+          done
           REMOTE
+
+      # Start/stop/run helpers for the steps that came after glove's kividb
+      # and Redis steps: Dragonfly, and the filtered/high-dimension datasets.
+      # The same discipline as glove's own steps (which keep their inline
+      # code): one engine resident at a time -- each start asserts that NO
+      # engine port is open -- stop by the PID recorded at start, never by a
+      # command-line pattern, and runs detached on the client and polled (see
+      # the comment above glove's run steps for why). Ports: kividb 6380,
+      # Redis 6381, Dragonfly 6382.
+      - name: Write engine helpers
+        run: |
+          cat > /tmp/vecbench-helpers.sh << 'HELPERS'
+          VB_OPTS="-i $SSH_KEY_PATH -o StrictHostKeyChecking=no -o ConnectTimeout=30 -o ServerAliveInterval=30 -o ServerAliveCountMax=10"
+
+          # vb_start kividb|redis|dragonfly -- on the server.
+          vb_start() {
+            # shellcheck disable=SC2086
+            ssh $VB_OPTS "ubuntu@$SERVER_HOST" ENGINE="$1" bash << 'REMOTE'
+          set -euo pipefail
+          for p in 6380 6381 6382; do
+            if (exec 3<>/dev/tcp/127.0.0.1/$p) 2>/dev/null; then
+              echo "::error::something is already serving on :$p before $ENGINE's phase" >&2
+              exit 1
+            fi
+          done
+          case "$ENGINE" in
+            kividb)
+              PORT=6380
+              cd /home/ubuntu/kividb
+              nohup ./kividb --bind 0.0.0.0 --port 6380 --loglevel error > /tmp/kividb.log 2>&1 &
+              ;;
+            redis)
+              PORT=6381
+              nohup redis-server --port 6381 --bind 0.0.0.0 --protected-mode no \
+                --save '' --appendonly no \
+                --loadmodule "$(cat /home/ubuntu/redisearch-path)" \
+                > /tmp/redis.log 2>&1 &
+              ;;
+            dragonfly)
+              # One proactor thread per core; no snapshot file (like the
+              # others' no-persistence flags); its own working directory.
+              PORT=6382
+              ulimit -n 65535 || true
+              mkdir -p /tmp/dragonfly-dir
+              cd /tmp/dragonfly-dir
+              nohup /home/ubuntu/dragonfly-aarch64 --port 6382 --bind 0.0.0.0 \
+                --proactor_threads="$(nproc)" --dbfilename= --logtostderr \
+                > /tmp/dragonfly.log 2>&1 &
+              ;;
+          esac
+          echo $! > "/tmp/$ENGINE.pid"
+          for i in $(seq 1 30); do
+            if (exec 3<>/dev/tcp/127.0.0.1/$PORT) 2>/dev/null; then exit 0; fi
+            sleep 1
+          done
+          echo "$ENGINE never came up on :$PORT" >&2
+          tail -n 50 "/tmp/$ENGINE.log" >&2
+          exit 1
+          REMOTE
+          }
+
+          # vb_stop kividb|redis|dragonfly -- also prints the engine's peak
+          # RSS, then waits for the port to close and the memory to settle.
+          vb_stop() {
+            # shellcheck disable=SC2086
+            ssh $VB_OPTS "ubuntu@$SERVER_HOST" ENGINE="$1" bash << 'REMOTE'
+          set -uo pipefail
+          case "$ENGINE" in kividb) PORT=6380 ;; redis) PORT=6381 ;; *) PORT=6382 ;; esac
+          PID="$(cat "/tmp/$ENGINE.pid" 2>/dev/null || true)"
+          if [ -n "$PID" ]; then
+            echo "$ENGINE peak RSS: $(awk '/VmHWM/ {print $2, $3}' "/proc/$PID/status" 2>/dev/null)"
+            kill "$PID" 2>/dev/null || true
+            for _ in $(seq 1 30); do
+              kill -0 "$PID" 2>/dev/null || break
+              sleep 1
+            done
+            if kill -0 "$PID" 2>/dev/null; then
+              kill -9 "$PID" 2>/dev/null || true
+              sleep 2
+            fi
+          fi
+          if (exec 3<>/dev/tcp/127.0.0.1/$PORT) 2>/dev/null; then
+            echo "::error::something is still serving on :$PORT after stopping $ENGINE" >&2
+            exit 1
+          fi
+          sleep 5
+          free -m || true
+          REMOTE
+          }
+
+          # vb_run TAG DIR TOOL-ARGS... -- the tool in /home/ubuntu/DIR on the
+          # client, detached, polled for up to 40 min (glove's budget).
+          vb_run() {
+            local tag="$1" dir="$2"
+            shift 2
+            # shellcheck disable=SC2086
+            ssh $VB_OPTS "ubuntu@$CLIENT_HOST" TAG="$tag" DIR="$dir" SERVER_IP="$SERVER_PRIVATE_IP" \
+              TOOL_ARGS="'$*'" bash << 'REMOTE'
+          set -euo pipefail
+          cd "/home/ubuntu/$DIR"
+          rm -f "$TAG.log" "$TAG.exit"
+          # shellcheck disable=SC2086
+          nohup bash -c '
+            KIVIDB_PORT=6380 REDIS_PORT=6381 DRAGONFLY_PORT=6382 ./vector-db-benchmark \
+              --host "'"$SERVER_IP"'" '"$TOOL_ARGS"' --skip-if-exists false
+            echo $? > "'"$TAG"'.exit"
+          ' > "$TAG.log" 2>&1 < /dev/null &
+          echo $! > "$TAG.pid"
+          disown
+          REMOTE
+            echo "Polling $tag for completion (up to 40 min)..."
+            local finished=0
+            for _ in $(seq 1 160); do
+              sleep 15
+              # shellcheck disable=SC2086
+              if [[ "$(ssh $VB_OPTS "ubuntu@$CLIENT_HOST" "cd /home/ubuntu/$dir && (kill -0 \$(cat $tag.pid) 2>/dev/null && echo running) || echo done")" == "done" ]]; then
+                finished=1
+                break
+              fi
+            done
+            # shellcheck disable=SC2086
+            ssh $VB_OPTS "ubuntu@$CLIENT_HOST" "tail -n 60 /home/ubuntu/$dir/$tag.log" || true
+            if [[ "$finished" != "1" ]]; then
+              echo "::error::$tag did not finish within the poll budget" >&2
+              return 1
+            fi
+            # shellcheck disable=SC2086
+            [[ "$(ssh $VB_OPTS "ubuntu@$CLIENT_HOST" "cat /home/ubuntu/$dir/$tag.exit 2>/dev/null || echo 1")" == "0" ]]
+          }
+          HELPERS
 
       # ── One engine resident at a time ───────────────────────────────────────
       #
@@ -353,6 +661,7 @@ jobs:
       # now mirrors that, and each start asserts the other engine is absent so
       # the two can never silently overlap again.
       - name: Start kividb on server
+        if: steps.datasets.outputs.glove == 'true'
         run: |
           SSH="ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@$SERVER_HOST"
           $SSH bash << 'REMOTE'
@@ -398,6 +707,7 @@ jobs:
       # intermediary NAT/idle-connection policy, not just a dead peer), so
       # this decouples the run's lifetime from the SSH session's entirely.
       - name: Run vector-db-benchmark against kividb
+        if: steps.datasets.outputs.glove == 'true'
         run: |
           set -euo pipefail
           SSH="ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no -o ConnectTimeout=30 -o ServerAliveInterval=30 -o ServerAliveCountMax=10 ubuntu@$CLIENT_HOST"
@@ -437,6 +747,7 @@ jobs:
       # holding the whole ingested index in RAM at this point, so leaving it
       # resident is exactly the bias this ordering exists to remove.
       - name: Stop kividb on server
+        if: steps.datasets.outputs.glove == 'true'
         run: |
           set -euo pipefail
           SSH="ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@$SERVER_HOST"
@@ -468,6 +779,7 @@ jobs:
           REMOTE
 
       - name: Start Redis on server
+        if: steps.datasets.outputs.glove == 'true'
         run: |
           SSH="ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@$SERVER_HOST"
           $SSH bash << 'REMOTE'
@@ -500,6 +812,7 @@ jobs:
           REMOTE
 
       - name: Run vector-db-benchmark against Redis
+        if: steps.datasets.outputs.glove == 'true'
         run: |
           set -euo pipefail
           SSH="ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no -o ConnectTimeout=30 -o ServerAliveInterval=30 -o ServerAliveCountMax=10 ubuntu@$CLIENT_HOST"
@@ -535,6 +848,67 @@ jobs:
           EXIT_CODE="$($SSH 'cat /home/ubuntu/vdb/redis-run.exit 2>/dev/null || echo 1')"
           [[ "$EXIT_CODE" == "0" ]]
 
+      # Redis must be gone before the next engine starts, for the reason
+      # kividb is stopped before Redis's phase.
+      - name: Stop Redis on server
+        if: steps.datasets.outputs.glove == 'true'
+        run: |
+          set -euo pipefail
+          source /tmp/vecbench-helpers.sh
+          vb_stop redis
+
+      # Dragonfly on glove: report-only. A failure here is a warning, never a
+      # failed job -- but it is still stopped before anything else starts.
+      - name: Run vector-db-benchmark against Dragonfly (report-only)
+        if: steps.datasets.outputs.glove == 'true'
+        run: |
+          set -uo pipefail
+          source /tmp/vecbench-helpers.sh
+          if vb_start dragonfly && vb_run dragonfly-glove vdb \
+              --engines-file dragonfly-engine.json --datasets "$DATASET" --parallels 100; then
+            :
+          else
+            echo "::warning::Dragonfly on $DATASET failed; it is report-only, so the run goes on without its numbers"
+          fi
+          vb_stop dragonfly
+
+      # â”€â”€ Filtered and high-dimension datasets â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      #
+      # The same discipline as glove's steps above, in one loop: per dataset,
+      # kividb is started fresh, benchmarked and stopped, then Redis, then
+      # Dragonfly. A fresh server per dataset, not one kividb for all of them:
+      # an engine still holding the previous dataset's index would be measured
+      # with that index resident, the very bias the glove steps' ordering
+      # comment describes. Each dataset is downloaded by the tool on first use
+      # and reused by the next engines. kividb and Redis failures fail the job;
+      # Dragonfly's are warnings (report-only).
+      - name: Run vector-db-benchmark on the filtered/high-dimension datasets
+        if: steps.datasets.outputs.extra != ''
+        env:
+          EXTRA: ${{ steps.datasets.outputs.extra }}
+        run: |
+          set -uo pipefail
+          source /tmp/vecbench-helpers.sh
+          for ds in $EXTRA; do
+            for engine in kividb redis dragonfly; do
+              echo "::group::$ds on $engine"
+              ok=true
+              vb_start "$engine" && vb_run "$engine-$ds" vdbx \
+                --engines-file "$engine-engine.json" --engines "$engine-m16-ef128" --datasets "$ds" \
+                || ok=false
+              vb_stop "$engine" || exit 1
+              echo "::endgroup::"
+              if [[ "$ok" != true ]]; then
+                if [[ "$engine" == dragonfly ]]; then
+                  echo "::warning::Dragonfly on $ds failed; it is report-only, so the run goes on without its numbers"
+                else
+                  echo "::error::$engine run on $ds failed" >&2
+                  exit 1
+                fi
+              fi
+            done
+          done
+
       # Safety net only. In a clean run kividb is already stopped by its own
       # step above and Redis has just finished; this catches whatever is
       # left when an earlier step failed part-way. The instances are torn down
@@ -545,9 +919,12 @@ jobs:
         continue-on-error: true
         run: |
           SSH="ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@$SERVER_HOST"
-          $SSH 'kill $(cat /tmp/kividb.pid) 2>/dev/null || true; kill $(cat /tmp/redis.pid) 2>/dev/null || true'
+          $SSH 'kill $(cat /tmp/kividb.pid) 2>/dev/null || true; kill $(cat /tmp/redis.pid) 2>/dev/null || true; kill $(cat /tmp/dragonfly.pid) 2>/dev/null || true'
 
       - name: Fetch results from client
+        env:
+          GLOVE: ${{ steps.datasets.outputs.glove }}
+          EXTRA: ${{ steps.datasets.outputs.extra }}
         run: |
           set -euo pipefail
           SCP="scp -i $SSH_KEY_PATH -o StrictHostKeyChecking=no"
@@ -558,7 +935,16 @@ jobs:
           # creates it AS the copy of the remote `results` dir, which lands
           # the files at the same flat path compare_vector_baseline.py expects.
           rm -rf /tmp/vecbench-results
-          $SCP -r ubuntu@$CLIENT_HOST:/home/ubuntu/vdb/results /tmp/vecbench-results
+          if [[ "$GLOVE" == "true" ]]; then
+            $SCP -r ubuntu@$CLIENT_HOST:/home/ubuntu/vdb/results /tmp/vecbench-results
+          else
+            mkdir -p /tmp/vecbench-results
+          fi
+          # The newer pin's results, into a subdirectory that does not exist
+          # yet -- the same scp idiom.
+          if [[ -n "$EXTRA" ]]; then
+            $SCP -r ubuntu@$CLIENT_HOST:/home/ubuntu/vdbx/results /tmp/vecbench-results/extra
+          fi
 
       - name: Upload raw results artifact
         uses: actions/upload-artifact@v4
@@ -566,17 +952,42 @@ jobs:
           name: vector-bench-results-${{ github.run_id }}
           path: /tmp/vecbench-results/
 
+      # One compare per dataset, each against its own gates (glove: the
+      # baseline file's top-level blocks, unchanged; the others: their
+      # "datasets.<name>" sections -- ratio floors against Redis on the same
+      # run, recall within 0.01 of Redis's, and kividb within 10% of its own
+      # recorded numbers once a run has recorded them; until then those rows
+      # are report-only). Every dataset is compared even after one fails, so
+      # the summary always shows them all; the worst exit code wins.
       - name: Compare against baseline
         id: compare
+        env:
+          GLOVE: ${{ steps.datasets.outputs.glove }}
+          EXTRA: ${{ steps.datasets.outputs.extra }}
         run: |
           set +e
-          python3 tests/e2e/benchmarks/compare_vector_baseline.py \
-            --kividb-experiment kividb-glove25 --kividb-results-dir /tmp/vecbench-results \
-            --redis-experiment redis-glove25 --redis-results-dir /tmp/vecbench-results \
-            --dataset "${{ env.DATASET }}" \
-            --dump-results-json /tmp/vecbench-results/extracted.json \
-            --summary-out "$GITHUB_STEP_SUMMARY"
-          code=$?
+          code=0
+          if [[ "$GLOVE" == "true" ]]; then
+            python3 tests/e2e/benchmarks/compare_vector_baseline.py \
+              --kividb-experiment kividb-glove25 --kividb-results-dir /tmp/vecbench-results \
+              --redis-experiment redis-glove25 --redis-results-dir /tmp/vecbench-results \
+              --dataset "${{ env.DATASET }}" \
+              --dump-results-json /tmp/vecbench-results/extracted.json \
+              --report-engine dragonfly=dragonfly-glove25=/tmp/vecbench-results \
+              --summary-out "$GITHUB_STEP_SUMMARY"
+            code=$?
+          fi
+          for ds in $EXTRA; do
+            python3 tests/e2e/benchmarks/compare_vector_baseline.py \
+              --kividb-experiment kividb-m16-ef128 --kividb-results-dir /tmp/vecbench-results/extra \
+              --redis-experiment redis-m16-ef128 --redis-results-dir /tmp/vecbench-results/extra \
+              --dataset "$ds" \
+              --dump-results-json "/tmp/vecbench-results/extracted-$ds.json" \
+              --report-engine dragonfly=dragonfly-m16-ef128=/tmp/vecbench-results/extra \
+              --summary-out "$GITHUB_STEP_SUMMARY"
+            c=$?
+            if [[ $c -gt $code ]]; then code=$c; fi
+          done
           set -e
           if [[ $code -eq 1 ]]; then
             echo "regression=true" >> "$GITHUB_OUTPUT"
@@ -600,7 +1011,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: vector-bench-extracted-${{ github.run_id }}
-          path: /tmp/vecbench-results/extracted.json
+          path: /tmp/vecbench-results/extracted*.json
           if-no-files-found: ignore
 
   # ── Optional: record a new baseline (manual dispatch only) ──────────────
@@ -626,15 +1037,26 @@ jobs:
           python3 - << 'PY'
           import json, pathlib
           baseline_path = pathlib.Path("benchmarks/vector-baseline.json")
-          extracted = json.loads(pathlib.Path("/tmp/extracted/extracted.json").read_text())
           baseline = json.loads(baseline_path.read_text())
 
           # kividb_absolute gate "baseline" values are re-derived from
           # baseline["kividb"] at compare time (see compare_vector_baseline.py),
           # not stored per-gate -- so rewriting the two blocks above is
           # sufficient; nothing else in "gates" needs updating.
-          baseline["kividb"] = extracted["kividb"]
-          baseline["redis"] = extracted["redis"]
+          # glove (extracted.json) is only rewritten when this run included it.
+          glove = pathlib.Path("/tmp/extracted/extracted.json")
+          if glove.exists():
+              extracted = json.loads(glove.read_text())
+              baseline["kividb"] = extracted["kividb"]
+              baseline["redis"] = extracted["redis"]
+          # The other datasets (extracted-<dataset>.json): the same two
+          # blocks, inside their own "datasets.<dataset>" section.
+          for path in sorted(pathlib.Path("/tmp/extracted").glob("extracted-*.json")):
+              ds = path.name[len("extracted-"):-len(".json")]
+              extracted = json.loads(path.read_text())
+              section = baseline["datasets"][ds]
+              section["kividb"] = extracted["kividb"]
+              section["redis"] = extracted["redis"]
 
           baseline["_provenance"] = (
               "Updated by .github/workflows/vector-benchmark.yml run "
