@@ -589,6 +589,11 @@ fn a_deletion_in_another_database_is_replayed_there() {
     wait_for("the sweep", || c.info("expired_keys_active") >= 1);
     c.ok(&["SET", "after", "in-0"]);
     aof_holds(&s, "UNLINK", 1);
+    // In the file before the kill: a write can be answered before its
+    // record is written.
+    wait_for("the last write to reach the AOF", || {
+        !positions(&s.aof(), "SET", "after").is_empty()
+    });
     s.restart();
     let mut c = s.conn();
     assert_eq!(c.get("k").as_deref(), Some("in-0"));
@@ -729,8 +734,15 @@ fn writes_racing_expiry_converge_on_the_replica_and_the_aof() {
     }
     let (mut m, mut r) = (master.conn(), replica.conn());
     // And every key written once more: over a live key, one past its time
-    // the sweep has not got to, or one it has.
-    for i in 0..64 {
+    // the sweep has not got to, or one it has. Half of them only once every
+    // time to live (50 ms at most) has run out, so that some keys stay: the
+    // writers may have given all 64 a time to live in their last 50 ms, and
+    // an INCR keeps it, so with every key written at once nothing need stay.
+    for i in (0..64).step_by(2) {
+        let _ = m.cmd(&["INCR", &format!("race:{i}")]);
+    }
+    thread::sleep(Duration::from_millis(60));
+    for i in (1..64).step_by(2) {
         let _ = m.cmd(&["INCR", &format!("race:{i}")]);
     }
     // Until every time to live has run out, and the sweep has been.
