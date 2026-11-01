@@ -1722,7 +1722,7 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
             }
         }
     }
-    let mut moved: Vec<&str> = Vec::with_capacity(outgoing.len());
+    let mut moved: Vec<&Outgoing> = Vec::with_capacity(outgoing.len());
     let mut failure: Option<String> = None;
     for item in &outgoing {
         // ASKING's reply does not matter; RESTORE's does. A destination that
@@ -1734,7 +1734,7 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
             Ok(_) => read_status_reply(&mut reader),
         };
         match restore {
-            Ok(Ok(())) => moved.push(item.key.as_str()),
+            Ok(Ok(())) => moved.push(item),
             Ok(Err(reply)) => {
                 failure.get_or_insert(format!("ERR Target instance replied with error: {reply}"));
             }
@@ -1748,29 +1748,126 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
         }
     }
 
-    // ── Delete what the destination confirmed ────────────────────────────
-    if !copy {
-        for key in &moved {
-            crate::commands::helpers::delete_key(ctx.store, db, key);
-            crate::vector::maybe_unindex(ctx.index_store, db, key);
-        }
+    if copy || moved.is_empty() {
+        return match failure {
+            None => resp_simple("OK"),
+            Some(error) => resp_error(&error),
+        };
     }
 
+    // ── Delete what the destination confirmed ────────────────────────────
+    crate::aof::failpoint("migrate-before-delete");
+    let written = delete_moved(ctx, db, &moved);
+    if failure.is_none() && !written.is_empty() {
+        failure = Some(written_while_moving(&written, &addr));
+    }
     match failure {
         None => resp_simple("OK"),
-        Some(error) => {
-            // A partial failure still moved — and deleted — some keys. The
-            // error reply means nothing is propagated on our behalf, so tell
-            // replicas and the AOF about those deletions directly; otherwise
-            // they keep keys this node no longer has.
-            if !copy && !moved.is_empty() && crate::replication::write_is_observed(ctx) {
-                let mut del = vec![b"DEL".to_vec()];
-                del.extend(moved.iter().map(|k| k.as_bytes().to_vec()));
-                crate::replication::replicate_one_write(ctx, &del);
+        Some(error) => resp_error(&error),
+    }
+}
+
+/// Delete the keys the destination has confirmed, each only if it still
+/// holds what was sent: the same value, and the same time to live (#274).
+///
+/// `MIGRATE` holds no lock while the keys travel (it can wait on the network
+/// for as long as its timeout), so a key can be written in the meantime. The
+/// write is acknowledged here, and the destination has the value from before
+/// it: deleting the key would lose an acknowledged write. Such a key is kept,
+/// and returned, for `MIGRATE` to fail with: the slot then still holds it
+/// here, its newest value, and moving it again (with `REPLACE`, since the
+/// destination has a copy) takes the write along. A key gone meanwhile is
+/// returned too, unless it went because its time was up: the destination's
+/// copy has the same absolute time, and is gone there as well.
+///
+/// The deletions are one write, as far as a full sync, a checkpoint and the
+/// other writes to these keys are concerned: under the write gate and the
+/// keys' write order, held for the deletions only, never across the network.
+/// They are sent to replicas and the AOF as one `DEL` of exactly the keys
+/// deleted, before the order is let go of. (`MIGRATE`'s reply used to be
+/// propagated as a `DEL` of every key it named, deleted or not: one written
+/// meanwhile, or made meanwhile by a write to a key the dump had not found,
+/// was deleted on every replica and kept here.)
+fn delete_moved<'a>(ctx: &Ctx, db: usize, moved: &[&'a Outgoing]) -> Vec<&'a str> {
+    let nested = crate::write_gate::held_by_this_thread();
+    let mut gate = crate::write_gate::enter();
+    while !nested && !ctx.apply_replication && crate::pause::handoff() {
+        drop(gate);
+        crate::pause::wait_out_handoff();
+        gate = crate::write_gate::enter();
+    }
+    let _order = crate::write_order::lock_keys(db, moved.iter().map(|item| item.key.as_bytes()));
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut del: Vec<Vec<u8>> = vec![b"DEL".to_vec()];
+    let mut written: Vec<&'a str> = Vec::new();
+    for item in moved {
+        let key = item.key.as_str();
+        let shard = crate::store::get_shard(&ctx.store[db], key);
+        let removal = {
+            let mut map = crate::write_lock!(shard);
+            let expires_at_ms = map.expires(key).unwrap_or(0);
+            map.remove_if(key, |value| {
+                expires_at_ms == item.expires_at_ms
+                    && crate::snapshot::dump_payload(&value.to_value())
+                        .is_ok_and(|now| now == item.payload)
+            })
+        };
+        match removal {
+            crate::store::Removal::Taken(taken) => {
+                // Freed with the shard unlocked.
+                drop(taken);
+                crate::vector::maybe_unindex(ctx.index_store, db, key);
+                del.push(key.as_bytes().to_vec());
             }
-            resp_error(&error)
+            crate::store::Removal::Kept => written.push(key),
+            crate::store::Removal::Absent => {
+                let expired = item.expires_at_ms != 0 && item.expires_at_ms <= now_ms;
+                if !expired {
+                    written.push(key);
+                }
+            }
         }
     }
+    crate::aof::failpoint("migrate-deleted");
+    if del.len() > 1 && crate::replication::write_is_observed(ctx) {
+        crate::replication::replicate_one_write(ctx, &del);
+    }
+    drop(gate);
+    written
+}
+
+/// The error `MIGRATE` answers with when keys it moved were written while
+/// they travelled, and were kept here (see [`delete_moved`]).
+///
+/// `TRYAGAIN`: the move did not happen for those keys, and can be made
+/// again. A tool resharding a cluster (`redis-cli --cluster reshard`,
+/// `rebalance`) stops on it and says so, rather than moving on to the next
+/// keys as though the slot were empty here; run again (with `REPLACE`, or
+/// `--cluster-replace`, as the destination holds a copy) it takes the keys
+/// along with their writes.
+fn written_while_moving(keys: &[&str], addr: &str) -> String {
+    const SHOWN: usize = 5;
+    let mut names = keys
+        .iter()
+        .take(SHOWN)
+        .map(|k| format!("'{k}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if keys.len() > SHOWN {
+        names.push_str(&format!(" and {} more", keys.len() - SHOWN));
+    }
+    format!(
+        "TRYAGAIN {} written while being migrated, and kept here: {names}. The copy sent \
+         to {addr} may be older; MIGRATE them again with REPLACE",
+        if keys.len() == 1 {
+            "a key was"
+        } else {
+            "keys were"
+        }
+    )
 }
 
 /// Read one reply that is expected to be a status. `Ok(Ok(()))` for any `+`

@@ -44,6 +44,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`MIGRATE` no longer loses a write made while its keys travel (#274).**
+  `MIGRATE` without `COPY` dumped its keys, sent them, waited for the
+  destination's reply and then deleted them here, holding no lock across
+  the round trip (it can wait on the network for as long as its timeout).
+  A write to a key in that time was acknowledged, then deleted with the
+  key, and the destination had the value from before it. Now a key is
+  deleted only if it still holds what was sent, value and time to live; one
+  written meanwhile is kept, its newest value here, and `MIGRATE` answers
+  `TRYAGAIN` naming it, so that `redis-cli --cluster reshard` stops and
+  says so rather than going on as though the key had moved. Run again with
+  `REPLACE` (`--cluster-replace`), as the destination holds the older copy,
+  it moves the key with its write. The deletions, and their `DEL` to
+  replicas and the AOF, are now one write under the write gate and the
+  keys' write order, held for them only, never across the network: a `SET`
+  of a key right after its deletion used to reach replicas before the
+  `DEL`, which then deleted the key they should have kept, and a deletion
+  could fall inside a checkpoint's cut or after a failover handoff's. And
+  the `DEL` names the keys deleted only: it named every key `MIGRATE` was
+  given, so a key written meanwhile, or one the dump had not found and a
+  write made meanwhile, was deleted on every replica and kept here.
+
 - **A checkpoint no longer stalls writes on a slow disk (#243).** With the
   AOF on, the checkpoint after a bulk load held `SET`s back for seconds at a
   time on a slow cloud disk, and replies went out without their writes
