@@ -1078,6 +1078,73 @@ impl ShardMap {
         })
     }
 
+    /// [`ShardMap::entry_at`] for each of `places` into `out`, in order:
+    /// every bucket read, and every entry's first line asked for, before
+    /// any entry is read. Places picked at random are lines nobody has
+    /// read for a while, three of them for each key (its bucket, its slot,
+    /// its entry); asked for one key after another they are a wait after a
+    /// wait, and asked for together the waits overlap.
+    ///
+    /// Returns where the table is in memory, if any of the places held a
+    /// key: what [`ShardMap::prefetch_buckets`] takes, for as long as the
+    /// table has as many buckets.
+    #[inline]
+    pub fn entries_at<'m>(
+        &'m self,
+        places: &[usize],
+        out: &mut [Option<EntryView<'m>>],
+    ) -> Option<usize> {
+        let mut base = None;
+        for (place, out) in places.iter().zip(out.iter_mut()) {
+            *out = self.table.get_bucket(*place).map(|s| {
+                s.prefetch_header();
+                // The buckets are below the table's control bytes, the
+                // first just below them, each the size of a slot.
+                base = Some(
+                    (s as *const Slot as usize)
+                        .wrapping_add((*place + 1) * std::mem::size_of::<Slot>()),
+                );
+                EntryView {
+                    entry: s.entry(),
+                    _map: std::marker::PhantomData,
+                }
+            });
+        }
+        base
+    }
+
+    /// Ask for the lines that say whether the buckets at `places` are full,
+    /// and the lines of their slots, without reading them: so that an
+    /// [`ShardMap::entries_at`] of the same places a moment later finds
+    /// them there. `base` is what that returned for this table. A hint, and
+    /// only that: a base that is out of date (the table has been made anew
+    /// since) asks for lines nobody wants, and reads nothing.
+    #[inline]
+    pub fn prefetch_buckets(&self, base: usize, places: &[usize]) {
+        let slot = std::mem::size_of::<Slot>();
+        for &place in places {
+            super::entry::prefetch(base.wrapping_add(place) as *const u8, 1);
+            super::entry::prefetch(base.wrapping_sub((place + 1) * slot) as *const u8, 1);
+        }
+    }
+
+    /// Take out the entry in bucket `index` if it is the entry `id` still
+    /// (see [`EntryView::id`]): a key [`ShardMap::entry_at`] found, taken
+    /// out without hashing it again to find it. `None` if the bucket holds
+    /// another entry or none.
+    pub fn remove_at(&mut self, index: usize, id: usize) -> Option<Taken> {
+        let at = self.table.get_bucket_entry(index).ok()?;
+        if at.get().entry().base() as usize != id {
+            return None;
+        }
+        let entry = at.remove().0.entry();
+        if entry.has_ttl() {
+            ttl_take(&mut self.ttl, entry);
+        }
+        // SAFETY: the table's hold goes to the caller.
+        Some(unsafe { Taken::new(entry) })
+    }
+
     /// Up to `count` entries from the buckets at and after `start` (taken
     /// modulo the bucket count), wrapping round once. Costs about `count`
     /// divided by how full the table is. Not a sample of keys each as

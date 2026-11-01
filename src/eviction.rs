@@ -209,7 +209,7 @@ pub fn samples() -> usize {
 }
 
 pub fn set_samples(n: usize) {
-    SAMPLES.store(n.clamp(1, 64), Ordering::Relaxed);
+    SAMPLES.store(n.clamp(1, MOST_SAMPLES), Ordering::Relaxed);
 }
 
 pub fn lfu_log_factor() -> u32 {
@@ -560,6 +560,9 @@ fn unwanted(policy: Policy, word: u32, expires: Option<u64>, now: u32, decay: u3
 /// shrunk.
 const TRIES: usize = 32;
 
+/// The most keys a sample can ask for: the highest `maxmemory-samples`.
+const MOST_SAMPLES: usize = 64;
+
 /// Up to `count` keys of `map`, each handed to `found` with its place (a
 /// bucket of the table, or of the list of keys with a time to live): of all
 /// its keys, or (`volatile`) of those with a time to live. How many it found.
@@ -581,8 +584,23 @@ fn sample_shard<'m>(
     volatile: bool,
     count: usize,
     rng: &mut impl Rng,
-    mut found: impl FnMut(usize, crate::store::EntryView<'m>),
+    found: impl FnMut(usize, crate::store::EntryView<'m>),
 ) -> usize {
+    sample_shard_from(map, volatile, count, &[], rng, found).0
+}
+
+/// [`sample_shard`], the first places tried for each key being `first`
+/// where there are any (places picked at random beforehand, from as many
+/// buckets as the table has: see [`Ahead`]). Also returns where the table
+/// is, if it was found out (`ShardMap::entries_at`).
+fn sample_shard_from<'m>(
+    map: &'m crate::store::ShardMap,
+    volatile: bool,
+    count: usize,
+    first: &[usize],
+    rng: &mut impl Rng,
+    mut found: impl FnMut(usize, crate::store::EntryView<'m>),
+) -> (usize, Option<usize>) {
     if volatile {
         // A list without gaps: any place holds a key.
         let keys = map.ttl_len();
@@ -597,7 +615,7 @@ fn sample_shard<'m>(
                 found(place, e);
             }
         }
-        return count;
+        return (count, None);
     }
     let keys = map.len();
     let buckets = map.buckets();
@@ -613,32 +631,53 @@ fn sample_shard<'m>(
                 n += 1;
             }
         }
-        return n;
+        return (n, None);
     }
     // A table has a power of two of buckets.
     let mask = buckets.next_power_of_two() - 1;
-    'keys: for _ in 0..count {
-        for _ in 0..TRIES {
-            let place = rng.r#gen::<usize>() & mask;
-            if place >= buckets {
-                continue;
-            }
-            if let Some(e) = map.entry_at(place) {
-                found(place, e);
-                continue 'keys;
+    // The places of every key still wanted are picked, then read together
+    // (`ShardMap::entries_at`), and an empty one picked again in the next
+    // round: for each key, as before, random buckets until one is full.
+    let count = count.min(MOST_SAMPLES);
+    let mut places = [0usize; MOST_SAMPLES];
+    let mut views: [Option<crate::store::EntryView<'m>>; MOST_SAMPLES] =
+        [const { None }; MOST_SAMPLES];
+    let mut wanted = count;
+    let mut base = None;
+    let first = &first[..first.len().min(count)];
+    for round in 0..TRIES {
+        if wanted == 0 {
+            return (count, base);
+        }
+        let given = if round == 0 { first.len() } else { 0 };
+        places[..given].copy_from_slice(&first[..given]);
+        for place in &mut places[given..wanted] {
+            // Past the last bucket (none is, with a power of two of them)
+            // is an empty one.
+            *place = rng.r#gen::<usize>() & mask;
+        }
+        base = map.entries_at(&places[..wanted], &mut views[..wanted]).or(base);
+        let mut empty = 0;
+        for (&place, view) in places[..wanted].iter().zip(&mut views[..wanted]) {
+            match view.take() {
+                Some(e) => found(place, e),
+                None => empty += 1,
             }
         }
+        wanted = empty;
+    }
+    for _ in 0..wanted {
         // Very sparse: the next full bucket from a random one.
         let start = rng.gen_range(0..buckets);
         for step in 0..buckets {
             let place = (start + step) % buckets;
             if let Some(e) = map.entry_at(place) {
                 found(place, e);
-                continue 'keys;
+                break;
             }
         }
     }
-    count
+    (count, base)
 }
 
 /// Up to `count` keys of one database, from a random shard and as many after
@@ -650,12 +689,32 @@ fn sample_db(
     volatile: bool,
     count: usize,
     rng: &mut impl Rng,
+    found: impl FnMut(usize, usize, crate::store::EntryView<'_>),
+) {
+    sample_db_ahead(shards, usize::MAX, volatile, count, rng, None, found);
+}
+
+/// [`sample_db`] of database `db`, starting with the shard and places
+/// `ahead` picked for it last time, if it picked any; and then picking the
+/// next sample's, and asking for their lines.
+fn sample_db_ahead(
+    shards: &[crate::store::Shard],
+    db: usize,
+    volatile: bool,
+    count: usize,
+    rng: &mut impl Rng,
+    mut ahead: Option<&mut Ahead>,
     mut found: impl FnMut(usize, usize, crate::store::EntryView<'_>),
 ) {
     if shards.is_empty() {
         return;
     }
-    let first = rng.gen_range(0..shards.len());
+    // The shard picked last time is as random a pick as one now.
+    let picked = ahead
+        .as_deref_mut()
+        .and_then(|a| a.take(db))
+        .filter(|p| p.shard < shards.len());
+    let first = picked.map_or_else(|| rng.gen_range(0..shards.len()), |p| p.shard);
     let mut got = 0;
     for step in 0..shards.len() {
         let index = (first + step) % shards.len();
@@ -664,13 +723,111 @@ fn sample_db(
             continue;
         }
         let map = shard.read();
-        got += sample_shard(&map, volatile, count - got, rng, |place, e| {
+        // Places picked for a table of as many buckets as this one has.
+        let given = match &picked {
+            Some(p) if step == 0 && p.buckets == map.buckets() => &p.places[..p.len],
+            _ => &[][..],
+        };
+        let (n, base) = sample_shard_from(&map, volatile, count - got, given, rng, |place, e| {
             found(index, place, e)
         });
+        got += n;
+        if let (Some(a), Some(base)) = (ahead.as_deref_mut(), base) {
+            a.learn(db, index, map.buckets(), base);
+        }
         if got >= count {
             break;
         }
     }
+    if let Some(a) = ahead
+        && !volatile
+    {
+        a.pick(shards, db, count, rng);
+    }
+}
+
+/// The next sample of a thread's, picked at the end of its last: the
+/// shard, and the places in it (random buckets, as [`sample_shard`] picks
+/// them), with the lines that say whether they are full, and their slots,
+/// asked for then. A key picked at random is three lines nobody has read
+/// for a while (its bucket, its slot, its entry), each needed to find the
+/// next, and those waits were most of what an eviction cost; by the next
+/// evicting write the first two have come in. What is picked is what would
+/// have been picked a moment later, and every key is read as it is when it
+/// is chosen among.
+struct Ahead {
+    next: Option<Picked>,
+    /// Where each shard's table was last seen, by database: its bucket
+    /// count and its base (`ShardMap::entries_at`).
+    bases: Vec<Vec<(usize, usize)>>,
+}
+
+#[derive(Clone, Copy)]
+struct Picked {
+    db: usize,
+    shard: usize,
+    buckets: usize,
+    len: usize,
+    places: [usize; MOST_SAMPLES],
+}
+
+impl Ahead {
+    const fn new() -> Self {
+        Ahead {
+            next: None,
+            bases: Vec::new(),
+        }
+    }
+
+    /// The pick for database `db`, if the last one was for it.
+    fn take(&mut self, db: usize) -> Option<Picked> {
+        self.next.take().filter(|p| p.db == db)
+    }
+
+    fn learn(&mut self, db: usize, shard: usize, buckets: usize, base: usize) {
+        if self.bases.len() <= db {
+            self.bases.resize_with(db + 1, Vec::new);
+        }
+        let shards = &mut self.bases[db];
+        if shards.len() <= shard {
+            shards.resize(shard + 1, (0, 0));
+        }
+        shards[shard] = (buckets, base);
+    }
+
+    /// Pick the next sample of `count` keys from database `db`.
+    fn pick(&mut self, shards: &[crate::store::Shard], db: usize, count: usize, rng: &mut impl Rng) {
+        let shard = rng.gen_range(0..shards.len());
+        let map = shards[shard].read();
+        let buckets = map.buckets();
+        if map.len() <= count || buckets == 0 {
+            // All its keys are taken, or none: nothing to pick.
+            self.next = None;
+            return;
+        }
+        let len = count.min(MOST_SAMPLES);
+        let mut places = [0; MOST_SAMPLES];
+        let mask = buckets.next_power_of_two() - 1;
+        for place in &mut places[..len] {
+            *place = rng.r#gen::<usize>() & mask;
+        }
+        if let Some(&(seen, base)) = self.bases.get(db).and_then(|s| s.get(shard))
+            && seen == buckets
+        {
+            map.prefetch_buckets(base, &places[..len]);
+        }
+        self.next = Some(Picked {
+            db,
+            shard,
+            buckets,
+            len,
+            places,
+        });
+    }
+}
+
+thread_local! {
+    static AHEAD: std::cell::RefCell<Ahead> = const { std::cell::RefCell::new(Ahead::new()) };
 }
 
 /// How many of the keys looked at for one eviction, after the one that goes,
@@ -758,17 +915,17 @@ impl Choice {
         self.len = len;
     }
 
-    /// The key to delete, and the database it is in; the keys after it are
+    /// The key to delete, and where it was found; the keys after it are
     /// kept for the thread's next choice.
-    fn decide(self) -> Option<(usize, crate::store::Key)> {
+    fn decide(self) -> Option<(Spot, crate::store::Key)> {
         let mut kept = Kept::default();
         if self.len > 1 {
             kept.len = self.len - 1;
             kept.spots[..kept.len].copy_from_slice(&self.top[1..self.len]);
         }
         KEPT_SPOTS.with(|k| k.set(kept));
-        let db = self.top[0].db;
-        self.key.map(|key| (db, key))
+        let spot = self.top[0];
+        self.key.map(|key| (spot, key))
     }
 }
 
@@ -779,8 +936,8 @@ fn choose(
     policy: Policy,
     dbs: &[usize],
     rng: &mut impl Rng,
-) -> Option<(usize, crate::store::Key)> {
-    let now = clock();
+    now: u32,
+) -> Option<(Spot, crate::store::Key)> {
     let decay = lfu_decay_time();
     let volatile = policy.volatile();
     let random = matches!(policy, Policy::AllKeysRandom | Policy::VolatileRandom);
@@ -813,8 +970,9 @@ fn choose(
             }
         }
     }
+    let mut ahead = AHEAD.with(|a| std::mem::replace(&mut *a.borrow_mut(), Ahead::new()));
     for &db in dbs {
-        sample_db(&ctx.store[db], volatile, count, rng, |shard, place, e| {
+        sample_db_ahead(&ctx.store[db], db, volatile, count, rng, Some(&mut ahead), |shard, place, e| {
             let unwanted = unwanted(policy, e.access(), e.expires(), now, decay);
             let spot = Spot {
                 db,
@@ -826,6 +984,7 @@ fn choose(
             choice.offer(spot, e.key());
         });
     }
+    AHEAD.with(|a| *a.borrow_mut() = ahead);
     choice.decide()
 }
 
@@ -850,9 +1009,8 @@ impl Dbs {
     const TRUSTED: std::time::Duration = std::time::Duration::from_millis(10);
 
     /// The list, found again if it is not to be trusted (`fresh`: it is not).
-    fn get(&mut self, ctx: &Ctx, volatile: bool, fresh: bool) -> &[usize] {
+    fn get(&mut self, ctx: &Ctx, volatile: bool, fresh: bool, now: Instant) -> &[usize] {
         let store = Arc::as_ptr(ctx.store) as *const () as usize;
-        let now = Instant::now();
         if fresh
             || self.store != store
             || self.volatile != volatile
@@ -882,17 +1040,35 @@ thread_local! {
     static DBS: std::cell::RefCell<Dbs> = std::cell::RefCell::new(Dbs::default());
 }
 
-/// Delete `key` to make room, with everything a deletion entails.
-fn evict(ctx: &mut Ctx, db: usize, key: &str, ordered: bool) -> bool {
+/// Delete `key`, found at `spot`, to make room, with everything a deletion
+/// entails.
+fn evict(ctx: &mut Ctx, spot: Spot, key: &str, volatile: bool, ordered: bool) -> bool {
+    let db = spot.db;
     // Ordered against other writes to the key, like any write, while
     // anything reads the write stream. See `write_order`.
     let _order = (ordered && !crate::command_gate::alone_on_this_thread())
         .then(|| crate::write_order::lock_keys(db, std::iter::once(key.as_bytes())));
 
-    if !crate::commands::helpers::delete_key(ctx.store, db, key) {
+    // Where it was found, if it is there still: its shard is the key's, and
+    // its bucket, unless the table has grown or shrunk since, is where the
+    // entry is, without the key hashed twice over to find them. (A place in
+    // the list of keys with a time to live moves as others leave it.)
+    let removed = {
+        let shard = &ctx.store[db][spot.shard];
+        let mut map = shard.write();
+        if volatile {
+            map.remove(key)
+        } else {
+            map.remove_at(spot.place, spot.id)
+                .or_else(|| map.remove(key))
+        }
+    };
+    if removed.is_none() {
         // Gone already.
         return false;
     }
+    // Freed with the shard let go of.
+    drop(removed);
     crate::vector::maybe_unindex(ctx.index_store, db, key);
     crate::vector::maybe_request_compaction(ctx.index_store, ctx.compaction_tx, key);
     crate::stats::record_evicted();
@@ -942,11 +1118,20 @@ fn make_room_in(ctx: &mut Ctx, policy: Policy, limit: usize, ordered: bool, dbs:
     let volatile = policy.volatile();
     let mut fresh = false;
     let mut rng = rand::thread_rng();
+    // One reading of the clock for all of it: it takes well under a second.
+    let now = Instant::now();
+    let seconds = clock_at(now);
     // A key that could not be deleted — it went between being chosen and
     // being deleted — is no reason to stop, but nothing but those is.
     let mut misses = 0;
     while crate::memory_use::allocated() > limit {
-        let Some((db, key)) = choose(ctx, policy, dbs.get(ctx, volatile, fresh), &mut rng) else {
+        let Some((spot, key)) = choose(
+            ctx,
+            policy,
+            dbs.get(ctx, volatile, fresh, now),
+            &mut rng,
+            seconds,
+        ) else {
             if fresh {
                 return false;
             }
@@ -955,7 +1140,7 @@ fn make_room_in(ctx: &mut Ctx, policy: Policy, limit: usize, ordered: bool, dbs:
             continue;
         };
         fresh = false;
-        if evict(ctx, db, &key, ordered) {
+        if evict(ctx, spot, &key, volatile, ordered) {
             misses = 0;
         } else {
             misses += 1;

@@ -882,9 +882,10 @@ impl Slot {
     }
 }
 
-/// Ask for `lines` cache lines from `at`. A hint: nothing is read.
+/// Ask for `lines` cache lines from `at`. A hint: nothing is read, and an
+/// address that is not mapped is no fault.
 #[inline(always)]
-fn prefetch(at: *const u8, lines: usize) {
+pub(super) fn prefetch(at: *const u8, lines: usize) {
     #[cfg(all(target_arch = "x86_64", not(miri)))]
     for line in 0..lines {
         // SAFETY: a prefetch reads nothing and faults on nothing.
