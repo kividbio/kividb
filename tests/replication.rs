@@ -2299,7 +2299,13 @@ fn test_dropindex_dd_is_sent_as_a_del_of_each_document_then_the_drop() {
         Duration::from_secs(10),
         || replica.cmds(&["EXISTS", "d:1", "d:2"]).as_int() == 0,
     );
-    assert!(replica.cmds(&["FT._LIST"]).as_array().is_empty());
+    // The drop comes after the DELs: the replica can have applied them and
+    // not it yet.
+    wait_until(
+        "the replica drops the indexes",
+        Duration::from_secs(10),
+        || replica.cmds(&["FT._LIST"]).as_array().is_empty(),
+    );
 }
 
 /// `commands` with each run of DELs made one, its keys in order: the
