@@ -486,39 +486,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(k) => k,
                 None => return Some(resp_error("ERR must be valid UTF-8")),
             };
-            let secs = match parse_bytes_as_i128(cmd[2]) {
-                Some(s) => s,
-                None => return Some(resp_error(ERR_VALUE_NOT_INTEGER)),
-            };
+            // The options are read before the time, as in Redis.
             let flags = match parse_expire_modifier_flags(cmd.as_slice(), 3) {
                 Ok(f) => f,
                 Err(msg) => return Some(resp_error(&msg)),
             };
-
-            let db = &ctx.store[*ctx.selected_db];
-            let shard = store::get_shard(db, key);
-
-            // Redis: EXPIRE key 0 deletes the key immediately (same as DEL).
-            if secs == 0 {
-                if !read_lock!(shard).contains_key(key) {
-                    return Some(resp_integer(0));
-                }
-                let removed = delete_key(ctx.store, *ctx.selected_db, key);
-                if removed {
-                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
-                    crate::vector::maybe_request_compaction(
-                        ctx.index_store,
-                        ctx.compaction_tx,
-                        key,
-                    );
-                }
-                return Some(resp_integer(if removed { 1 } else { 0 }));
-            }
-
-            if !read_lock!(shard).contains_key(key) {
-                return Some(resp_integer(0));
-            }
-
+            let secs = match parse_bytes_as_i128(cmd[2]) {
+                Some(s) => s,
+                None => return Some(resp_error(ERR_VALUE_NOT_INTEGER)),
+            };
+            // The clock is read once, here.
             let when_ms = match absolute_when_ms_from_expire_secs(secs) {
                 Ok(w) => w,
                 Err(e) => return Some(resp_error(e)),
@@ -527,36 +504,20 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(t) => t,
                 None => return Some(resp_error(ERR_INVALID_EXPIRE_EXPIRE_CMD)),
             };
-
-            let current = get_expiry(ctx.store, *ctx.selected_db, key);
-
-            if !expire_modifier_allows_set(&flags, current, new_abs) {
-                return Some(resp_integer(0));
-            }
-
-            // Only a negative time to live deletes the key here, as in
-            // Redis. A positive one ends after the time it was added to,
-            // however late this is: a key whose time has already come by
-            // now goes the way every expired key goes, with its `DEL`.
-            // Deleted here, it went with nothing propagated (the `DEL` is
-            // sent for a time to live of zero or less only), and stayed on
-            // every replica and in the AOF for good.
-            if secs < 0 {
-                let removed = delete_key(ctx.store, *ctx.selected_db, key);
-                if removed {
-                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
-                    crate::vector::maybe_request_compaction(
-                        ctx.index_store,
-                        ctx.compaction_tx,
-                        key,
-                    );
-                }
-                return Some(resp_integer(if removed { 1 } else { 0 }));
-            }
-
-            set_expiry(ctx.store, *ctx.selected_db, key, new_abs);
-            notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "expire", key);
-            Some(resp_integer(1))
+            // Only a time to live of zero or less deletes the key here, as in
+            // Redis, and as `expire_feed` propagates it. A positive one ends
+            // after the time it was added to, however late this is: a key
+            // whose time has already come by now goes the way every expired
+            // key goes, with its `DEL`. Deleted here, it went with nothing
+            // propagated, and stayed on every replica and in the AOF for
+            // good.
+            Some(crate::commands::generics::apply_expire(
+                ctx,
+                key,
+                new_abs,
+                secs <= 0,
+                &flags,
+            ))
         }
 
         "SETEX" => {
