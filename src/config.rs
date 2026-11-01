@@ -512,9 +512,10 @@ pub struct Config {
     #[arg(long, default_value_t = 1024 * 1024)]
     pub cluster_slot_migration_handoff_max_lag_bytes: u64,
 
-    /// Atomic slot migration: the longest the source keeps writes paused for
-    /// a handoff, in milliseconds, before giving the migration up (Redis 8.4
-    /// `cluster-slot-migration-write-pause-timeout`).
+    /// Atomic slot migration: how long the source waits, writes paused, for
+    /// the destination's answer to the takeover, in milliseconds, before it
+    /// asks the destination whether it took the slots; writes stay paused
+    /// until it knows (Redis 8.4 `cluster-slot-migration-write-pause-timeout`).
     #[arg(long, default_value_t = 10_000)]
     pub cluster_slot_migration_write_pause_timeout: u64,
     /// HLL write format during rolling upgrade: "legacy" or "redis".

@@ -225,10 +225,12 @@ const UNTIL_ENDED_MS: i64 = 100 * 365 * 24 * 3600 * 1000;
 
 /// Pause writes as a handoff does (see `HANDOFF`), with no end of its own:
 /// until `clear_pause`. For a master that is not sure it still owns its
-/// slots (`ClusterState::hold_writes_until_confirmed`). A pause that ran out
-/// by itself let it take writes again while its replica could be taking the
-/// slots over, and what it acknowledged before it heard of that was lost
-/// (#242).
+/// slots (`ClusterState::hold_writes_until_confirmed`), and for a slot
+/// migration's handoff until the source knows whether the destination took
+/// the slots over (`migration::await_takeover`). A pause that ran out by
+/// itself let it take writes again while its replica, or the migration's
+/// destination, could be taking the slots over, and what it acknowledged
+/// before it heard of that was lost (#242, #278).
 pub fn hold_writes() {
     set_handoff_pause(UNTIL_ENDED_MS);
 }
@@ -241,9 +243,10 @@ pub fn handoff() -> bool {
 }
 
 /// Wait for the handoff to end. Called by a write command, outside the write
-/// gate, on its worker thread: a handoff is bounded by its pause's timeout,
-/// and lasts as long as the handoff takes (a manual failover: until the
-/// replica has caught up and won its election).
+/// gate, on its worker thread: a handoff lasts as long as it takes (a manual
+/// failover: until the replica has caught up and won its election; a slot
+/// migration: until the source knows whether the destination took the
+/// slots), or until `CLIENT UNPAUSE`.
 ///
 /// On a worker of the multi-threaded tokio runtime (`--io-model tokio`) the
 /// wait gives the worker's other tasks to another thread first
