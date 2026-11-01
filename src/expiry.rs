@@ -39,6 +39,14 @@
 //   one were gone, and the key stays until its master's `DEL` arrives
 //   (`on_replica`). Nor does it propagate anything: a replica's stream is its
 //   master's.
+// * Except under a master that sends no such `DEL` (KiviDB 1.1.2 and
+//   before, followed during an upgrade that does replicas first): there the
+//   replica expires keys by its own clock, and applies its master's stream
+//   without a hold, as every replica did before (`on_replica`, #231). And a
+//   replica that goes on to a master that sends them, by a partial resync,
+//   first deletes the keys whose time ended before that master started,
+//   which nobody would send a `DEL` of
+//   (`commands::helpers::expire_keys_due_before`).
 
 use std::cell::Cell;
 use std::marker::PhantomData;
@@ -58,10 +66,17 @@ pub struct Target {
 }
 
 impl Target {
-    /// This node is a replica: it deletes no expired key of its own.
+    /// This node is a replica of a master that sends the deletion of every
+    /// key it expires: it deletes no expired key of its own. A replica of a
+    /// master that sends none (KiviDB before 1.1.3) expires keys itself, as
+    /// every replica did then, and tells no one ([`Target::observed`]).
     #[inline]
     pub fn on_replica(&self) -> bool {
         self.repl_state.is_slave()
+            && self
+                .repl_state
+                .master_propagates_expiry
+                .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Whether a key this node expires has to be told to anyone: it is a
@@ -529,6 +544,63 @@ mod propagation_tests {
             target.as_ref()
         ));
         assert_eq!(text(&store, 0, "k"), Some(b"5".to_vec()), "still there");
+        assert!(stream(&mut rx).is_empty());
+    }
+
+    /// A replica of a master that sends no deletions (before 1.1.3) expires
+    /// keys itself, to reads and to the sweep, and sends nothing.
+    #[test]
+    fn a_replica_of_a_master_that_sends_no_deletions_deletes_but_does_not_send() {
+        let (store, repl, mut rx) = server();
+        repl.become_slave();
+        repl.master_propagates_expiry
+            .store(false, Ordering::Relaxed);
+        let target = super::of(&store);
+        assert!(!target.as_ref().is_some_and(super::Target::on_replica));
+        stale(&store, 0, "read");
+        assert!(delete_key_if_expired(&store, 0, "read"));
+        assert_eq!(text(&store, 0, "read"), None, "deleted by the read");
+        stale(&store, 0, "swept");
+        let mut cursor = ExpireCursor::default();
+        let index = IndexStore::default();
+        let mut cycles = 0;
+        while with_ttl(&store) > 0 {
+            active_expire_cycle(&store, &index, &mut cursor, target.as_ref());
+            cycles += 1;
+            assert!(cycles < 1000, "the sweep never got to it");
+        }
+        assert_eq!(text(&store, 0, "swept"), None);
+        assert!(stream(&mut rx).is_empty());
+    }
+
+    /// The sweep at a partial resync deletes the keys whose time ended
+    /// before the time it is given, and no others, and sends nothing.
+    #[test]
+    fn keys_due_before_a_time_are_deleted_and_no_others() {
+        let (store, repl, mut rx) = server();
+        repl.become_slave();
+        let index = IndexStore::default();
+        let now = now_ms();
+        for (key, at) in [("long", 1), ("recent", now - 500), ("live", now + 60_000)] {
+            drop(store::get_shard(&store[1], key).write().insert_expiring(
+                key,
+                KiviDBValue::String(SharedBytes::from(&b"v"[..])),
+                Some(at),
+            ));
+        }
+        drop(
+            store::get_shard(&store[0], "forever")
+                .write()
+                .insert_str("forever", b"v"),
+        );
+        assert_eq!(
+            crate::commands::helpers::expire_keys_due_before(&store, &index, now - 1_000),
+            1
+        );
+        assert_eq!(text(&store, 1, "long"), None);
+        for (db, key) in [(1, "recent"), (1, "live"), (0, "forever")] {
+            assert_eq!(text(&store, db, key), Some(b"v".to_vec()), "{key}");
+        }
         assert!(stream(&mut rx).is_empty());
     }
 }
