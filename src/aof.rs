@@ -121,14 +121,36 @@ pub fn last_rewrite_ok() -> bool {
 
 /// Is a rewrite walking the store right now?
 pub fn rewrite_in_progress() -> bool {
-    REWRITE_ACTIVE.load(Ordering::Relaxed) || REWRITES_ASKED_FOR.load(Ordering::Relaxed) > 0
+    REWRITE_ACTIVE.load(Ordering::Relaxed) || REWRITE_ASKED.load(Ordering::Relaxed)
 }
 
-/// Checkpoints that `BGREWRITEAOF` has started and that have not finished —
-/// whether or not they have got as far as running.
-static REWRITES_ASKED_FOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// `BGREWRITEAOF`'s thread: whether it is running, and whether another
+/// rewrite was asked for while it ran.
+struct BackgroundRewrite {
+    running: bool,
+    again: bool,
+}
+
+static BACKGROUND_REWRITE: parking_lot::Mutex<BackgroundRewrite> =
+    parking_lot::Mutex::new(BackgroundRewrite {
+        running: false,
+        again: false,
+    });
+
+/// Set while `BGREWRITEAOF`'s thread runs, for [`rewrite_in_progress`].
+static REWRITE_ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `BGREWRITEAOF`: a checkpoint, on a thread of its own.
+///
+/// One thread, however many are asked for. Each used to have a thread of its
+/// own, and nothing kept them apart: a client asking every few milliseconds
+/// had hundreds of checkpoints running at once, holding writes back in turn,
+/// sharing a save number, and finishing in any order — an older snapshot
+/// could replace a newer one. Asked while one runs, this notes that another
+/// is wanted, and the thread runs exactly one more when the one it is on
+/// has finished. That one starts after this call, so what was acknowledged
+/// before the call is in a snapshot that finishes after it; every call made
+/// in the meantime is served by the same one.
 ///
 /// It is in progress from this moment, not from the moment that thread gets
 /// to it: a client that asks for a rewrite and then waits for
@@ -138,22 +160,54 @@ pub fn checkpoint_in_background(
     store: crate::store::Store,
     index_store: crate::vector::IndexStore,
 ) {
-    struct Asked;
-    impl Drop for Asked {
+    {
+        let mut rewrite = BACKGROUND_REWRITE.lock();
+        if rewrite.running {
+            rewrite.again = true;
+            return;
+        }
+        rewrite.running = true;
+        REWRITE_ASKED.store(true, Ordering::Release);
+    }
+    fn stopped() {
+        let mut rewrite = BACKGROUND_REWRITE.lock();
+        rewrite.running = false;
+        rewrite.again = false;
+        REWRITE_ASKED.store(false, Ordering::Release);
+    }
+    /// A thread that panics stops being the one that runs: the next
+    /// `BGREWRITEAOF` starts another.
+    struct Unwinding;
+    impl Drop for Unwinding {
         fn drop(&mut self) {
-            REWRITES_ASKED_FOR.fetch_sub(1, Ordering::Relaxed);
+            if std::thread::panicking() {
+                stopped();
+            }
         }
     }
-    REWRITES_ASKED_FOR.fetch_add(1, Ordering::Relaxed);
-    let asked = Asked;
-    tokio::spawn(async move {
-        tokio::task::spawn_blocking(move || {
-            let _asked = asked;
-            checkpoint(&store, &index_store)
-        })
-        .await
-        .ok();
-    });
+    let spawned = std::thread::Builder::new()
+        .name("kividb-bgrewrite".into())
+        .spawn(move || {
+            let _unwinding = Unwinding;
+            loop {
+                BACKGROUND_REWRITE.lock().again = false;
+                if let Err(e) = checkpoint(&store, &index_store) {
+                    log_warn!("AOF: BGREWRITEAOF failed: {e}");
+                }
+                // Decided under the lock a caller takes to ask for one more:
+                // one asked for after this starts a thread of its own.
+                let mut rewrite = BACKGROUND_REWRITE.lock();
+                if !rewrite.again {
+                    rewrite.running = false;
+                    REWRITE_ASKED.store(false, Ordering::Release);
+                    return;
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        stopped();
+        log_error!("AOF: BGREWRITEAOF could not start its thread: {e}");
+    }
 }
 
 // Global sender for requesting immediate fsync
@@ -565,9 +619,11 @@ pub const AOF_PREV_PATH: &str = "appendonly.aof.prev";
 /// Nothing is dropped.
 fn perform_turn_over(file: &mut std::fs::File, generation: u64) -> std::io::Result<()> {
     file.sync_data()?;
-    turn_over_files(generation)?;
+    let turned = turn_over_files(generation);
+    // Whether or not it got all the way: the writer goes on in whatever file
+    // has the log's name now, never in one that has been moved aside.
     *file = open_aof()?;
-    Ok(())
+    turned
 }
 
 /// Write `first` and whatever else is queued, turning the log over at each
@@ -614,34 +670,179 @@ fn write_queued(
     }
 }
 
+/// The new log of a turn-over, under a name of its own until it takes the
+/// log's.
+const TURN_OVER_TMP: &str = "appendonly.aof.rewrite.tmp";
+
+/// There while a turn-over adds the log's records to an old log that is
+/// still needed: how long that old log was before. See [`settle_turn_over`].
+const TURN_OVER_APPENDING: &str = "appendonly.aof.prev.len";
+
 /// The files' part of [`perform_turn_over`], for when no writer has the log
 /// open as well.
+///
+/// Stopped at any point, it leaves files that recovery reads as they were
+/// before it or as they are after it (see [`recover_turn_over`]). The new,
+/// empty log is written in full first, under a name of its own; then the log
+/// is moved aside, and the new one takes its name. It used to be the other
+/// way round: a crash after the log was moved aside left
+/// `appendonly.aof.prev` and no log at all, and a start that found no log
+/// replayed nothing, `.prev` included — every write since the snapshot lost.
 fn turn_over_files(generation: u64) -> std::io::Result<()> {
     use std::io::Write;
+    settle_turn_over()?;
+    {
+        let mut fresh = std::fs::File::create(TURN_OVER_TMP)?;
+        fresh.write_all(AOF_DELTA_MAGIC)?;
+        fresh.write_all(&generation.to_le_bytes())?;
+        fresh.sync_all()?;
+    }
     let prev = std::path::Path::new(AOF_PREV_PATH);
+    let mut current = Vec::new();
+    if prev.exists() {
+        current = match std::fs::read(AOF_PATH) {
+            Ok(current) => current,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        if checkpoint_completed(&current) {
+            // Left by a checkpoint that finished, all but removing it: what
+            // it holds is in the snapshot. Added to, it would be replayed
+            // on top of that snapshot, should this checkpoint not finish.
+            std::fs::remove_file(prev)?;
+        }
+    }
     if prev.exists() {
         // A turn-over before this one whose snapshot never reached the disk:
-        // its old log is still needed, and this log goes on from it.
-        let current = std::fs::read(AOF_PATH).unwrap_or_default();
+        // its old log is still needed, and this log goes on from it. Until
+        // the new log has the name, these records are in both; the old log's
+        // length is noted first, so that they are cut off it again rather
+        // than replayed twice if this stops before then.
         let records = if aof_delta_generation(&current).is_some() {
             &current[AOF_DELTA_HEADER_LEN..]
         } else {
             &current[..]
         };
         let mut old = std::fs::OpenOptions::new().append(true).open(prev)?;
+        let before = old.metadata()?.len();
+        write_file_durably(TURN_OVER_APPENDING, &before.to_le_bytes())?;
         old.write_all(records)?;
         old.sync_data()?;
-    } else if std::path::Path::new(AOF_PATH).exists() {
-        std::fs::rename(AOF_PATH, prev)?;
+        failpoint("turn-over-appended");
+        std::fs::rename(TURN_OVER_TMP, AOF_PATH)?;
+        sync_dir()?;
+        std::fs::remove_file(TURN_OVER_APPENDING)?;
+    } else {
+        if std::path::Path::new(AOF_PATH).exists() {
+            std::fs::rename(AOF_PATH, prev)?;
+            failpoint("turn-over-moved-aside");
+        }
+        std::fs::rename(TURN_OVER_TMP, AOF_PATH)?;
+        sync_dir()?;
     }
-    let tmp_path = "appendonly.aof.rewrite.tmp";
+    Ok(())
+}
+
+/// Put right what a turn-over that stopped while adding the log's records
+/// to the old log left (see [`turn_over_files`]). If the new log had not yet
+/// taken the log's name, those records are still in the log, and are cut off
+/// the old log again; if it had, the old log is whole and the note is all
+/// that is left.
+fn settle_turn_over() -> std::io::Result<()> {
+    let noted = match std::fs::read(TURN_OVER_APPENDING) {
+        Ok(noted) => noted,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if std::path::Path::new(TURN_OVER_TMP).exists() {
+        let before = noted
+            .get(..8)
+            .and_then(|b| b.try_into().ok())
+            .map(u64::from_le_bytes)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{TURN_OVER_APPENDING} is damaged"),
+                )
+            })?;
+        let old = std::fs::OpenOptions::new()
+            .write(true)
+            .open(AOF_PREV_PATH)?;
+        if old.metadata()?.len() > before {
+            old.set_len(before)?;
+            old.sync_all()?;
+        }
+    }
+    std::fs::remove_file(TURN_OVER_APPENDING)
+}
+
+/// Before recovery reads the logs: put right what a checkpoint's turn-over
+/// left, if the process stopped part-way through it.
+fn recover_turn_over() {
+    if let Err(e) = settle_turn_over() {
+        fatal_persistence(&format!(
+            "a turn-over of {AOF_PATH} that was stopped part-way cannot be put right: {e}"
+        ));
+    }
+    let log_len = match std::fs::metadata(AOF_PATH) {
+        Ok(meta) => meta.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => fatal_persistence(&format!("{AOF_PATH} exists but cannot be examined: {e}")),
+    };
+    if std::path::Path::new(AOF_PREV_PATH).exists() && log_len == 0 {
+        // Stopped after the log was moved aside and before the new one took
+        // its name (or, in older releases, with no new one written at all). The
+        // old log holds writes that are in no snapshot: the new log takes
+        // the name (a new one goes on from the next save number if there is
+        // none), and the old log is then replayed like that of any
+        // checkpoint that did not finish.
+        log_warn!(
+            "AOF: a checkpoint was stopped while turning {AOF_PATH} over — completing the \
+             turn-over, and replaying {AOF_PREV_PATH}"
+        );
+        let fresh = std::fs::read(TURN_OVER_TMP)
+            .is_ok_and(|b| b.len() == AOF_DELTA_HEADER_LEN && aof_delta_generation(&b).is_some());
+        let done = if fresh {
+            std::fs::rename(TURN_OVER_TMP, AOF_PATH)
+        } else {
+            let mut header = AOF_DELTA_MAGIC.to_vec();
+            header.extend_from_slice(&read_generation().saturating_add(1).to_le_bytes());
+            write_file_durably(AOF_PATH, &header)
+        };
+        if let Err(e) = done.and_then(|()| sync_dir()) {
+            fatal_persistence(&format!(
+                "{AOF_PATH} could not be put back after an interrupted checkpoint: {e}"
+            ));
+        }
+    } else if let Err(e) = std::fs::remove_file(TURN_OVER_TMP)
+        && e.kind() != std::io::ErrorKind::NotFound
     {
-        let mut fresh = std::fs::File::create(tmp_path)?;
-        fresh.write_all(AOF_DELTA_MAGIC)?;
-        fresh.write_all(&generation.to_le_bytes())?;
-        fresh.sync_all()?;
+        log_warn!("AOF: {TURN_OVER_TMP} could not be removed: {e}");
     }
-    std::fs::rename(tmp_path, AOF_PATH)
+}
+
+/// Write `bytes` to `path` so that a crash leaves the old file or the whole
+/// new one.
+fn write_file_durably(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = format!("{path}.tmp");
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    sync_dir()
+}
+
+/// Make the renames in the data directory durable before what depends on
+/// them: a power cut must not keep a later step and lose an earlier one.
+fn sync_dir() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(".")?.sync_all()?;
+    }
+    Ok(())
 }
 
 /// One write syscall per record is what made the AOF the bottleneck: each
@@ -791,17 +992,66 @@ pub fn checkpoint(
     store: &crate::store::Store,
     index_store: &crate::vector::IndexStore,
 ) -> std::io::Result<()> {
-    checkpoint_noting(store, index_store, &mut || {})
+    let turn = checkpoint_turn()?;
+    checkpoint_noting(&turn, store, index_store, &mut || {})
 }
 
-/// [`checkpoint`], calling `at_cut` while writes are held for the capture:
-/// what it reads is as of the dataset written.
+/// Held by whatever writes `dump.kdb`, from a checkpoint's choice of save
+/// number until it has removed the old log: one at a time.
+///
+/// Nothing kept checkpoints apart. Two at once took the same save number
+/// (it is read from `dump.kdb.gen`, which only a finished one writes), each
+/// put its snapshot in place whenever it finished — an older one last undid
+/// a newer one, and keys deleted in between came back — and each removed
+/// `appendonly.aof.prev` when it finished, while the other still needed it.
+static CHECKPOINT_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// The last save number chosen in this process. See [`next_generation`].
+static LAST_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// A checkpoint's turn (see [`CHECKPOINT_LOCK`]): while it is held, nothing
+/// else writes `dump.kdb`, its save number, or turns the log over.
+pub struct CheckpointTurn {
+    _held: parking_lot::MutexGuard<'static, ()>,
+}
+
+/// Wait for a checkpoint's turn.
+///
+/// The order is the turn, then the write gate: a checkpoint has its turn
+/// while it waits for the gate's cut, and the cut waits for every write in
+/// flight. A caller inside a write, holding a slot of the gate (a `SAVE` in
+/// a `MULTI`, say), must not wait here, then: the checkpoint that has the
+/// turn may be waiting for that very slot. It is told that a checkpoint is
+/// in progress instead, as Redis tells a `SAVE` during a `BGSAVE`.
+pub fn checkpoint_turn() -> std::io::Result<CheckpointTurn> {
+    let held = if crate::write_gate::held_by_this_thread() {
+        CHECKPOINT_LOCK
+            .try_lock()
+            .ok_or_else(|| std::io::Error::other("another checkpoint is in progress"))?
+    } else {
+        CHECKPOINT_LOCK.lock()
+    };
+    Ok(CheckpointTurn { _held: held })
+}
+
+/// [`checkpoint`], with its turn already taken, calling `at_cut` while
+/// writes are held for the capture: what it reads is as of the dataset
+/// written.
 pub fn checkpoint_noting(
+    _turn: &CheckpointTurn,
     store: &crate::store::Store,
     index_store: &crate::vector::IndexStore,
     at_cut: &mut dyn FnMut(),
 ) -> std::io::Result<()> {
+    /// Cleared however the checkpoint ends, a panic included.
+    struct Active;
+    impl Drop for Active {
+        fn drop(&mut self) {
+            REWRITE_ACTIVE.store(false, Ordering::Release);
+        }
+    }
     REWRITE_ACTIVE.store(true, Ordering::Release);
+    let _active = Active;
     let aof_on = AOF_ENABLED.load(Ordering::Relaxed);
     let started = std::time::Instant::now();
     let result = checkpoint_inner(store, index_store, at_cut);
@@ -816,7 +1066,6 @@ pub fn checkpoint_noting(
     if result.is_ok() {
         crate::stats::record_save();
     }
-    REWRITE_ACTIVE.store(false, Ordering::Release);
     result
 }
 
@@ -827,6 +1076,7 @@ fn checkpoint_inner(
 ) -> std::io::Result<()> {
     let aof_on = AOF_ENABLED.load(Ordering::Relaxed);
     let generation = next_generation();
+    failpoint("checkpoint-cutting");
 
     // Between whole writes: a write is either in what is captured, with its
     // record in the old log, or after it, with its record in the new one.
@@ -844,6 +1094,7 @@ fn checkpoint_inner(
     if let Some(turned) = turn_over {
         turned()?;
     }
+    failpoint("checkpoint-turned-over");
     if held > std::time::Duration::from_millis(100) {
         log_info!(
             "AOF: the checkpoint held writes for {} ms",
@@ -874,7 +1125,9 @@ fn checkpoint_inner(
             file.sync_all()?;
         }
         std::fs::rename(&gen_tmp, AOF_GEN_PATH)?;
-        std::fs::rename(&tmp_path, "dump.kdb")
+        std::fs::rename(&tmp_path, "dump.kdb")?;
+        // On disk before the old log goes.
+        sync_dir()
     })();
     if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp_path);
@@ -894,6 +1147,7 @@ fn checkpoint_inner(
         record_base_size();
         log_info!("AOF: rebased onto dump.kdb (generation {generation}) — log is now the delta");
     }
+    failpoint("checkpoint-finished");
     Ok(())
 }
 
@@ -930,8 +1184,15 @@ fn checkpoint_completed(log: &[u8]) -> bool {
         && file_fingerprint("dump.kdb").is_ok_and(|found| found == (len, hash))
 }
 
+/// The save number for a checkpoint that has its turn: past the one on disk,
+/// and past any this process chose before. A checkpoint that failed wrote
+/// none, and the next does not take its number again.
 fn next_generation() -> u64 {
-    read_generation().saturating_add(1)
+    let next = read_generation()
+        .max(LAST_GENERATION.load(Ordering::Relaxed))
+        .saturating_add(1);
+    LAST_GENERATION.store(next, Ordering::Relaxed);
+    next
 }
 
 fn read_generation() -> u64 {
@@ -1425,6 +1686,14 @@ pub fn replay_aof(
     repl_state: &std::sync::Arc<crate::replication::ReplState>,
     skip_preamble: bool,
 ) -> std::io::Result<ReplayStats> {
+    // Each record is applied to the keys as they were when it was written:
+    // a key the master expired since has a `DEL` further on. Expired by the
+    // clock now, `SET k 5 PXAT t` and an `INCR k` made while it lived
+    // replayed after `t` as an INCR of a missing key, `1` with no time to
+    // live, for good. The preamble's keys too, past their time or not. And no key is
+    // swept meanwhile, by the expiry threads, which run from before the load.
+    let _hold = crate::expiry::hold();
+    let _loading = crate::expiry::Loading::start();
     let buf = std::fs::read(path)?;
     let mut stats = ReplayStats {
         bytes: buf.len() as u64,
@@ -1545,9 +1814,26 @@ pub fn replay_aof(
         {
             stats.errors += 1;
         }
+        if let Some(delay) = test_replay_delay() {
+            std::thread::sleep(delay);
+        }
     }
 
     Ok(stats)
+}
+
+/// For the tests of what runs beside a replay, and never set otherwise:
+/// `KIVIDB_TEST_REPLAY_DELAY_MS`, how long each command of a replay of the
+/// AOF takes, after it is applied.
+fn test_replay_delay() -> Option<std::time::Duration> {
+    static DELAY: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *DELAY.get_or_init(|| {
+        let ms: u64 = std::env::var("KIVIDB_TEST_REPLAY_DELAY_MS")
+            .ok()?
+            .parse()
+            .ok()?;
+        Some(std::time::Duration::from_millis(ms))
+    })
 }
 
 pub const AOF_PATH: &str = "appendonly.aof";
@@ -1595,6 +1881,13 @@ pub fn recover_local(
     compaction_tx: &crate::vector::CompactionTx,
     repl_state: &std::sync::Arc<crate::replication::ReplState>,
 ) -> LocalRecovery {
+    // Keys past their time are loaded too, from the snapshot as from the
+    // log: the log's writes to them were made while they lived, and a key
+    // that went since has its `DEL` in the log. Expiry takes the rest out
+    // once the server is up, and logs their `DEL`s: not before both are in,
+    // though the expiry threads are running already.
+    let _hold = crate::expiry::hold();
+    let _loading = crate::expiry::Loading::start();
     let mut recovery = LocalRecovery {
         index_names: Vec::new(),
         hnsw_loaded: false,
@@ -1689,6 +1982,9 @@ pub fn recover_local(
         }
     }
 
+    if aof_enabled {
+        recover_turn_over();
+    }
     if should_recover_from_aof(aof_enabled) {
         let buf = match std::fs::read(AOF_PATH) {
             Ok(buf) => buf,
@@ -1990,6 +2286,53 @@ pub fn recover_from_aof(
     }
 
     index_store.read().keys().cloned().collect()
+}
+
+// ── Test hooks ───────────────────────────────────────────────────────────────
+
+/// `KIVIDB_TEST_FAILPOINTS`: names of steps of a checkpoint at which the
+/// process waits for a test, which can then start something else or kill it
+/// at exactly that step. At each step named it creates
+/// `failpoint.<name>.<n>` in the data directory (`n` counts from 1 for each
+/// name) and waits while the file is there. Read once; unset, a step costs
+/// a load and a branch, on paths that run once a checkpoint.
+fn failpoint(name: &'static str) {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let names = NAMES.get_or_init(|| {
+        std::env::var("KIVIDB_TEST_FAILPOINTS")
+            .map(|list| {
+                list.split(',')
+                    .map(|name| name.trim().to_string())
+                    .filter(|name| !name.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    if !names.iter().any(|n| n == name) {
+        return;
+    }
+    static HITS: parking_lot::Mutex<Vec<(&'static str, u64)>> = parking_lot::Mutex::new(Vec::new());
+    let hit = {
+        let mut hits = HITS.lock();
+        match hits.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, count)) => {
+                *count += 1;
+                *count
+            }
+            None => {
+                hits.push((name, 1));
+                1
+            }
+        }
+    };
+    let path = format!("failpoint.{name}.{hit}");
+    if std::fs::write(&path, b"").is_err() {
+        return;
+    }
+    log_warn!("AOF: test failpoint {path} reached — waiting for it to be removed");
+    while std::path::Path::new(&path).exists() {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 // ── Checkpoint in progress ───────────────────────────────────────────────────

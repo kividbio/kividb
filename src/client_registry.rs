@@ -1,7 +1,7 @@
 use ahash::AHashMap;
 use parking_lot::RwLock;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -677,13 +677,173 @@ pub type ClientRegistry = Arc<ClientRegistryInner>;
 
 pub struct ClientRegistryInner {
     clients: RwLock<AHashMap<u64, ClientInfo>>,
+    /// Connections holding a [`Slot`]: clients, and TLS ones still in their
+    /// handshake.
+    slots: AtomicUsize,
+}
+
+/// `maxclients`; 10000 is its default in `CONFIG GET`.
+static MAX_CLIENTS: AtomicUsize = AtomicUsize::new(10_000);
+
+pub fn set_max_clients(n: usize) {
+    MAX_CLIENTS.store(n, Ordering::Relaxed);
+}
+
+pub fn max_clients() -> usize {
+    MAX_CLIENTS.load(Ordering::Relaxed)
+}
+
+/// io_uring workers, set at startup: each holds open files of its own.
+static URING_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Open files kept for everything but clients: Redis's 32, about twice what
+/// the tokio loop holds. io_uring holds 7 more, and 7 a worker (its ring,
+/// epolls, eventfd and listener), so it keeps 8 more and 8 a worker.
+fn reserved_fds() -> usize {
+    match URING_WORKERS.load(Ordering::Relaxed) {
+        0 => 32,
+        workers => workers.saturating_mul(8).saturating_add(40),
+    }
+}
+
+/// How many of `max` clients a soft open-file limit of `soft` leaves room
+/// for, with `reserved` kept back.
+#[cfg(unix)]
+fn clients_for(soft: libc::rlim_t, max: usize, reserved: usize) -> usize {
+    let reserved = libc::rlim_t::try_from(reserved).unwrap_or(libc::RLIM_INFINITY);
+    usize::try_from(soft.saturating_sub(reserved)).map_or(max, |n| n.min(max))
+}
+
+/// Raises the soft open-file limit toward what `max` clients need, never past
+/// the hard limit, and gives how many of them it then leaves room for.
+#[cfg(unix)]
+pub fn clients_that_fit(max: usize) -> std::io::Result<usize> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid rlimit for getrlimit to fill in.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let reserved = reserved_fds();
+    let wanted =
+        libc::rlim_t::try_from(max.saturating_add(reserved)).unwrap_or(libc::RLIM_INFINITY);
+    // The most that is taken: macOS refuses more than kern.maxfilesperproc,
+    // whatever the hard limit says.
+    let (mut soft, mut high) = (limit.rlim_cur, wanted.min(limit.rlim_max));
+    while soft < high {
+        let next = soft + (high - soft).div_ceil(2);
+        let raised = libc::rlimit {
+            rlim_cur: next,
+            rlim_max: limit.rlim_max,
+        };
+        // SAFETY: `raised` is a valid rlimit.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+            soft = next;
+        } else {
+            high = next - 1;
+        }
+    }
+    Ok(clients_for(soft, max, reserved))
+}
+
+#[cfg(not(unix))]
+pub fn clients_that_fit(max: usize) -> std::io::Result<usize> {
+    Ok(max)
+}
+
+/// At startup, makes room under the open-file limit for `maxclients`, or
+/// lowers it to what fits. `Err` when not even one client would, or the
+/// limit can't be read.
+pub fn fit_max_clients(uring_workers: usize) -> Result<(), String> {
+    URING_WORKERS.store(uring_workers, Ordering::Relaxed);
+    let max = max_clients();
+    let reserved = reserved_fds();
+    let fits = clients_that_fit(max).map_err(|e| format!("Can't read the open-file limit: {e}"))?;
+    if fits == 0 {
+        return Err(format!(
+            "The open-file limit (ulimit -n) is too low: KiviDB needs at least {}",
+            reserved + 1
+        ));
+    }
+    if fits < max {
+        crate::log_warn!(
+            "maxclients {max} needs {} open files, but the limit (ulimit -n) allows {}: \
+             maxclients is {fits}",
+            max.saturating_add(reserved),
+            fits + reserved
+        );
+        crate::commands::server::config_set_global("maxclients", &fits.to_string());
+    }
+    Ok(())
+}
+
+/// What a plaintext client turned away for `maxclients` is told, as Redis
+/// tells it.
+pub const TOO_MANY_CLIENTS: &[u8] = b"-ERR max number of clients reached\r\n";
+
+/// Tell a plaintext client turned away for `maxclients` why, and close it.
+pub fn turn_away(mut socket: tokio::net::TcpStream) {
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        let _ = socket.write_all(TOO_MANY_CLIENTS).await;
+    });
+}
+
+/// A connection's place under `maxclients`, given back when dropped.
+pub struct Slot(ClientRegistry);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.slots.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A place for a connection just accepted, or `None` when `maxclients` are
+/// connected and it is to be closed. Never waits.
+pub fn admit(registry: &ClientRegistry) -> Option<Slot> {
+    let max = MAX_CLIENTS.load(Ordering::Relaxed);
+    let slot = ClientRegistryInner::admit_up_to(registry, max);
+    if slot.is_none() {
+        crate::log_throttled!(
+            10,
+            crate::loglevel::WARN,
+            "{max} clients connected (maxclients); closing new connections"
+        );
+    }
+    slot
 }
 
 impl ClientRegistryInner {
     pub fn new() -> Self {
         Self {
             clients: RwLock::new(AHashMap::new()),
+            slots: AtomicUsize::new(0),
         }
+    }
+
+    fn admit_up_to(registry: &ClientRegistry, max: usize) -> Option<Slot> {
+        let mut n = registry.slots.load(Ordering::Relaxed);
+        loop {
+            if n >= max {
+                return None;
+            }
+            match registry.slots.compare_exchange_weak(
+                n,
+                n + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Slot(Arc::clone(registry))),
+                Err(now) => n = now,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn slots_held(&self) -> usize {
+        self.slots.load(Ordering::Relaxed)
     }
 
     pub fn register(&self, info: ClientInfo) {
@@ -1021,6 +1181,61 @@ impl Default for ClientRegistryInner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slots_stop_at_the_limit_and_come_back_when_dropped() {
+        let registry = new_client_registry();
+        let held: Vec<_> = std::iter::from_fn(|| ClientRegistryInner::admit_up_to(&registry, 3))
+            .take(10)
+            .collect();
+        assert_eq!(held.len(), 3);
+        assert_eq!(registry.slots_held(), 3);
+        drop(held);
+        assert_eq!(registry.slots_held(), 0);
+        assert!(ClientRegistryInner::admit_up_to(&registry, 3).is_some());
+        assert!(ClientRegistryInner::admit_up_to(&registry, 0).is_none());
+    }
+
+    /// Taken at once from many threads, no more than the limit are given.
+    #[test]
+    fn slots_taken_at_once_never_pass_the_limit() {
+        let registry = new_client_registry();
+        let held = std::thread::scope(|s| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    s.spawn(|| {
+                        (0..100)
+                            .filter_map(|_| ClientRegistryInner::admit_up_to(&registry, 50))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .flat_map(|t| t.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(held.len(), 50);
+        drop(held);
+        assert_eq!(registry.slots_held(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clients_fit_under_the_open_file_limit_less_what_is_reserved() {
+        use super::clients_for;
+        assert_eq!(clients_for(10_032, 10_000, 32), 10_000);
+        assert_eq!(clients_for(1_024, 10_000, 32), 992);
+        assert_eq!(clients_for(1_024, 10_000, 72), 952);
+        assert_eq!(clients_for(33, 10_000, 32), 1);
+        assert_eq!(clients_for(32, 10_000, 32), 0);
+        assert_eq!(clients_for(0, 10_000, 32), 0);
+        assert_eq!(
+            clients_for(libc::RLIM_INFINITY, u32::MAX as usize, 32),
+            u32::MAX as usize
+        );
+        assert_eq!(clients_for(1_024, 10_000, usize::MAX), 0);
+    }
 
     fn after(commands: &[&[&str]]) -> String {
         let activity = Activity::default();

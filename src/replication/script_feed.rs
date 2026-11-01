@@ -126,6 +126,10 @@ pub fn commands_for_propagation(
         "XTRIM" if cmd.get(3).is_some_and(|mark| *mark == b"~") => effects_take(),
         // Propagated as the pending-list changes they made; see `effects_begin`.
         "XREADGROUP" | "XCLAIM" | "XAUTOCLAIM" => effects_take(),
+        // Sent by the command itself as it went: the documents `DD` deleted
+        // as DELs, then the drop without `DD` (`vector::ft_dropindex`); by a
+        // replica to its own AOF too.
+        "FT.DROPINDEX" => Vec::new(),
         "MIGRATE" => migrate_feed(cmd, resp),
         "LMOVEM" | "BLMOVEM" => lmovem_feed(name, cmd, resp),
         "TS.ADD" => ts_add_feed(cmd, resp),

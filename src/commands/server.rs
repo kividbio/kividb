@@ -864,6 +864,36 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     "ERR argument couldn't be parsed into an integer",
                 )),
             },
+            // More clients only if the open-file limit can be raised for
+            // them, as in Redis; set below in `config_set_global`.
+            "maxclients" => {
+                let n = value
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|&n| n as usize > crate::client_registry::max_clients())?;
+                match crate::client_registry::clients_that_fit(n as usize) {
+                    Ok(fits) if fits == n as usize => None,
+                    Ok(fits) => Some(resp_error(&format!(
+                        "ERR The operating system is not able to handle the specified \
+                         number of clients, try with {fits}"
+                    ))),
+                    Err(e) => Some(resp_error(&format!(
+                        "ERR Can't read the open-file limit: {e}"
+                    ))),
+                }
+            }
+            // A per-server setting, so it is handled here: `config_set_global`
+            // has no context to store it in.
+            "hll-write-format" => {
+                let v = value.to_ascii_lowercase();
+                if v != "legacy" && v != "redis" {
+                    return Some(resp_error(
+                        "ERR CONFIG SET failed (possibly related to argument 'hll-write-format') - argument(s) must be one of the following: legacy redis",
+                    ));
+                }
+                ctx.repl_state.set_hll_write_redis(v == "redis");
+                Some(resp_simple("OK"))
+            }
             // What a running Redis cannot be told either.
             "daemonize" | "databases" | "pidfile" | "logfile" | "log-format" | "unixsocket"
             | "supervised" | "io-threads" | "tcp-backlog" | "set-proc-title" | "appendfilename"
@@ -968,6 +998,23 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                     "ERR argument must be between 0 and 9223372036854775807 inclusive",
                 )),
             },
+            // The shortest word whose stem is indexed: `FT.CONFIG
+            // MINSTEMLEN`.
+            "search-min-stem-len" => match value.parse::<u64>() {
+                Ok(len)
+                    if (2..=u64::from(u32::MAX)).contains(&len)
+                        && crate::commands::search_tools::set_config(
+                            "MINSTEMLEN",
+                            &len.to_string(),
+                        ) =>
+                {
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument 'search-min-stem-len') \
+                     - argument must be between 2 and 4294967295 inclusive",
+                )),
+            },
             "search-on-timeout" => {
                 let policy = value.to_ascii_lowercase();
                 if matches!(policy.as_str(), "return" | "fail" | "return_strict")
@@ -1031,6 +1078,18 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                     }
                 }
             }
+            "maxclients" => match value.parse::<u32>() {
+                Ok(n) if n >= 1 => {
+                    crate::client_registry::set_max_clients(n as usize);
+                    REMEMBERED_CONFIG
+                        .lock()
+                        .insert(param.clone(), n.to_string());
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR argument must be between 1 and 4294967295 inclusive",
+                )),
+            },
             "maxmemory-clients" => {
                 let value = match value.strip_suffix('%') {
                     Some(percent) => match percent.parse::<u64>() {
@@ -1588,6 +1647,19 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
         (
             "search-on-timeout",
             crate::commands::search_tools::config_value("ON_TIMEOUT").to_ascii_lowercase(),
+        ),
+        (
+            "search-min-stem-len",
+            crate::commands::search_tools::config_value("MINSTEMLEN"),
+        ),
+        (
+            "hll-write-format",
+            if ctx.repl_state.hll_write_redis() {
+                "redis"
+            } else {
+                "legacy"
+            }
+            .to_string(),
         ),
     ];
     for (name, value) in in_effect {

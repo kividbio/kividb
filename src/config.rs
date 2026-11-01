@@ -517,6 +517,9 @@ pub struct Config {
     /// `cluster-slot-migration-write-pause-timeout`).
     #[arg(long, default_value_t = 10_000)]
     pub cluster_slot_migration_write_pause_timeout: u64,
+    /// HLL write format during rolling upgrade: "legacy" or "redis".
+    #[arg(long, default_value = "legacy")]
+    pub hll_write_format: String,
 }
 
 impl Default for Config {
@@ -605,6 +608,7 @@ impl Default for Config {
             preload_file: String::new(),
             cluster_slot_migration_handoff_max_lag_bytes: 1024 * 1024,
             cluster_slot_migration_write_pause_timeout: 10_000,
+            hll_write_format: "legacy".into(),
         }
     }
 }
@@ -722,6 +726,7 @@ impl Config {
             preload_file: String::new(),
             cluster_slot_migration_handoff_max_lag_bytes: 1024 * 1024,
             cluster_slot_migration_write_pause_timeout: 10_000,
+            hll_write_format: "legacy".into(),
         }
     }
 
@@ -865,6 +870,14 @@ impl Config {
                 "invalid repl-diskless-load '{}' (expected disabled, on-empty-db, swapdb or \
                  flushdb)",
                 self.repl_diskless_load
+            ));
+        }
+        if !self.hll_write_format.eq_ignore_ascii_case("legacy")
+            && !self.hll_write_format.eq_ignore_ascii_case("redis")
+        {
+            return Err(format!(
+                "invalid hll-write-format '{}' (expected legacy or redis)",
+                self.hll_write_format
             ));
         }
 
@@ -1067,6 +1080,7 @@ impl Config {
         out.push_str(&format!("repl-backlog-size {}\n", self.repl_backlog_size));
         out.push_str(&format!("repl-backlog-ttl {}\n", self.repl_backlog_ttl));
         out.push_str(&format!("repl-diskless-load {}\n", self.repl_diskless_load));
+        out.push_str(&format!("hll-write-format {}\n", self.hll_write_format));
         out.push_str(&format!("repl-timeout {}\n", self.repl_timeout));
         out.push_str(&format!(
             "min-replicas-to-write {}\n",
@@ -1360,6 +1374,17 @@ impl Config {
             "dir" => set!(dir, one()?.to_string()),
             "aof" | "appendonly" => set!(aof, yes_no(key, one()?)?),
             "aof-preamble" | "aof-use-rdb-preamble" => set!(aof_preamble, yes_no(key, one()?)?),
+            "hll-write-format" => {
+                let value = match one()?.to_ascii_lowercase().as_str() {
+                    value @ ("legacy" | "redis") => value.to_string(),
+                    other => {
+                        return Err(format!(
+                            "invalid value '{other}' for 'hll-write-format': expected legacy or redis"
+                        ));
+                    }
+                };
+                set!(hll_write_format, value)
+            }
             "lua-parallel-scripts" => set!(lua_parallel_scripts, yes_no(key, one()?)?),
             "aof-rewrite-percentage" | "auto-aof-rewrite-percentage" => {
                 set!(aof_rewrite_percentage, number(key, one()?)?)
@@ -1697,8 +1722,9 @@ impl Config {
             // A setting `CONFIG SET` takes that is the server's as a whole
             // (`array-slice-size`, `busy-reply-threshold`, ...): set, and
             // checked, as `CONFIG SET` sets it. One of Redis's that KiviDB has
-            // no use for (`maxclients`, ...) is remembered, as `CONFIG SET`
-            // remembers it, so that a redis.conf carried over starts (#142).
+            // no use for (`hash-max-listpack-entries`, ...) is remembered, as
+            // `CONFIG SET` remembers it, so that a redis.conf carried over
+            // starts (#142).
             _ => {
                 if args.is_empty() {
                     return Err(format!("'{key}' needs a value"));
@@ -1718,6 +1744,7 @@ impl Config {
                             "latency-monitor-threshold"
                                 | "ts-duplicate-policy"
                                 | "aof-ack-after-write"
+                                | "maxclients"
                         ) || crate::commands::server::remembered_config(key).is_none() => {}
                     Some(_) => return no_effect("KiviDB has no such setting"),
                     None if key.starts_with("cluster-")
@@ -1888,6 +1915,22 @@ mod config_file_tests {
     }
 
     #[test]
+    fn hll_write_format_cli_option_is_validated() {
+        use clap::Parser;
+        let config = Config::try_parse_from(["kividb", "--hll-write-format", "redis"]).unwrap();
+        assert_eq!(config.hll_write_format, "redis");
+        assert!(config.validate(false).is_ok());
+
+        let invalid = Config::try_parse_from(["kividb", "--hll-write-format", "invalid"]).unwrap();
+        assert!(
+            invalid
+                .validate(false)
+                .unwrap_err()
+                .contains("hll-write-format")
+        );
+    }
+
+    #[test]
     fn protected_mode_is_on_until_turned_off_or_a_bind_address_is_given() {
         let c = Config::default();
         assert!(c.protected_mode && !c.bind_explicit);
@@ -2009,10 +2052,12 @@ mod config_file_tests {
              proto-max-bulk-len 512mb\nlatency-monitor-threshold 0\nacllog-max-len 128\n",
         )
         .unwrap();
-        // All but latency-monitor-threshold, which the latency monitor goes
-        // by (#158).
-        assert_eq!(warnings.len(), 5, "{warnings:?}");
-        assert!(warnings[0].contains("'maxclients'"), "{warnings:?}");
+        // All but maxclients and latency-monitor-threshold, which the
+        // latency monitor goes by (#158).
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
+        assert!(warnings[0].contains("'latency-tracking'"), "{warnings:?}");
+        let err = load("maxclients 0\n").unwrap_err();
+        assert!(err.contains("maxclients"), "{err}");
         let err = load("array-slice-size 300\n").unwrap_err();
         assert!(err.contains("power of two"), "{err}");
         let err = load("stream-node-max-entries -1\n").unwrap_err();
@@ -2068,6 +2113,7 @@ mod config_file_tests {
             masterauth a\nmasteruser u\nrepl-timeout 1\nrepl-ping-replica-period 1\n\
             min-replicas-to-write 1\nmin-replicas-max-lag 1\n\
             repl-backlog-size 1mb\nrepl-backlog-ttl 1\nrepl-diskless-load swapdb\n\
+            hll-write-format redis\n\
             replica-full-sync-guard off\nreplica-full-sync-guard-ratio 1\n\
             replica-announced-port 1\nreplicaof h 1\nstream-idmp-duration 1\n\
             stream-idmp-maxsize 1\nbackupdirname b\nbackup-sealed-ttl 1\npreload-file f\n\

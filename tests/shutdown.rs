@@ -171,6 +171,53 @@ fn shutdown_keeps_every_acknowledged_write() {
     );
 }
 
+/// Once the server has exited, its port takes no connection. On io_uring the
+/// kernel kept the workers' sockets listening until it had torn their rings
+/// down, a moment after the process was gone: a client that connected then,
+/// as one waiting for a restart does, was answered by nobody and reset. The
+/// test above then read nothing back from the restarted server, and reported
+/// a snapshot that held 0.
+#[test]
+fn port_takes_no_connection_once_the_server_has_exited() {
+    let port = 16402u16;
+    let dir = std::env::temp_dir().join(format!("kividb-shutdown-port-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    for mode in ["NOSAVE", "SAVE"] {
+        for _ in 0..5 {
+            let mut server = Command::new(kividb_bin())
+                .args(["--port", &port.to_string(), "--dir", dir.to_str().unwrap()])
+                .spawn()
+                .expect("failed to start kividb");
+            assert!(wait_for_server(port, Duration::from_secs(10)));
+            let mut conn = TcpStream::connect(addr).unwrap();
+            let req = format!("*2\r\n$8\r\nSHUTDOWN\r\n${}\r\n{mode}\r\n", mode.len());
+            conn.write_all(req.as_bytes()).unwrap();
+            // The exit is seen as soon as it happens: no sleep between looks.
+            let start = Instant::now();
+            while server.try_wait().is_ok_and(|exited| exited.is_none()) {
+                assert!(
+                    start.elapsed() < Duration::from_secs(30),
+                    "no exit after SHUTDOWN {mode}"
+                );
+                std::hint::spin_loop();
+            }
+            let exited = Instant::now();
+            while exited.elapsed() < Duration::from_millis(200) {
+                if TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    panic!(
+                        "the port took a connection {:?} after the server exited (SHUTDOWN {mode})",
+                        exited.elapsed()
+                    );
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn shutdown_abort_keeps_server_alive() {
     let port = 16400u16;

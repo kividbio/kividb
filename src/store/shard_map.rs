@@ -18,16 +18,35 @@
 //! live the key had ([`ShardMap::insert`], [`ShardMap::insert_str`]), as
 //! writing the value of a key does in Redis when the command does not say
 //! otherwise; the `_expiring` forms set it, or take it away, in the same
-//! step. Beside the table, the shard keeps a list of the entries that have
-//! one, each entry knowing its place in it: what active expiry goes through
-//! and what the `volatile-*` policies pick from, at random in one step.
+//! step. A key past its time is absent to reads and writes here, though it
+//! stays in the table until expiry takes it out. Beside the table, the
+//! shard keeps a list of the entries that have one, each entry knowing its
+//! place in it: what active expiry goes through and what the `volatile-*`
+//! policies pick from, at random in one step.
+//!
+//! **A key's use.** The lookups a command makes to read or write a key
+//! write its use to the key's entry as they find it, when the command counts
+//! as a use under the eviction policy (`access`): [`ShardMap::get`],
+//! `get_expiring`, `peek_expiring`, `contains_key`, every write of a value,
+//! `set_expires` and `persist`. [`ShardMap::peek`], `expires`, `access` and
+//! the walks over the table never do.
+//!
+//! **Writes in place.** A string written over a string kept inline goes
+//! into the same block when the table alone holds the entry, the key is not
+//! past its time, and the new length keeps the block in its slab class
+//! ([`ShardMap::set_str`], `append_in_place`, `set_range_in_place`): nothing
+//! is allocated or freed, and the entry stays where it is. Anything else,
+//! and every entry somebody else holds (a snapshot being written), gets a
+//! new entry, as before.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use hashbrown::HashTable;
 use parking_lot::RwLock;
 
+use super::access;
 use super::entry::{Entry, Left, Relocation, Slot, prefetch_expiry};
 pub use super::entry::{EntryRef, Taken};
 use crate::shared_bytes::SharedBytes;
@@ -228,6 +247,40 @@ pub enum Leftover {
     Bytes(SharedBytes),
 }
 
+/// What a write of a key's value did ([`ShardMap::set_str`]).
+pub enum Written {
+    /// The key was not there.
+    New,
+    /// The value was written over the old one, in the same entry.
+    InPlace,
+    /// The key has a new entry; this is the old one, best dropped once the
+    /// shard is unlocked.
+    Replaced(Taken),
+}
+
+impl Written {
+    /// The old entry, if the key had one that is not its entry now.
+    #[inline]
+    pub fn replaced(self) -> Option<Taken> {
+        match self {
+            Written::Replaced(old) => Some(old),
+            Written::New | Written::InPlace => None,
+        }
+    }
+}
+
+/// `entry` was found or made by a lookup of a key hashed `hash` in the table
+/// `map` (its address): the key's use is written, if the command this
+/// thread runs counts as one (see `access`). One thread-local load when it
+/// does not.
+#[inline(always)]
+fn used(entry: Entry, hash: u64, map: u64) {
+    let stamp = access::stamp();
+    if stamp != 0 {
+        access::used(entry, stamp, map ^ hash);
+    }
+}
+
 /// One shard's keys and values: a table of [`Slot`]s, each the address of
 /// an entry holding a key and its value (`entry`).
 pub struct ShardMap {
@@ -237,6 +290,22 @@ pub struct ShardMap {
     /// here (`Entry::pos`). The order means nothing: a key that loses its
     /// time to live, or goes, has the last one moved into its place.
     ttl: Vec<Entry>,
+    /// The time a write lock holds the shard at, so that a command sees one
+    /// time throughout ([`now_at`]). [`UNPINNED`] while no write lock holds
+    /// the shard: every look reads the clock. [`PENDING`] once one does,
+    /// until the first entry with a time to live it looks at reads the
+    /// clock and keeps the time here. So a lock that meets no such entry
+    /// never reads the clock: reading it on every write lock of a shard
+    /// with a key with a time to live cost SET, INCR and DEL on such keys
+    /// 3-4% more instructions.
+    ///
+    /// Atomic so that a look through `&self` can keep the time; it is only
+    /// written under the write lock, so a reader, which only ever finds
+    /// [`UNPINNED`] here, never writes it.
+    now: AtomicU64,
+    /// Keys past their time that writes under this lock put new values
+    /// over, to be expired when it lets go (`expiry::written_over`).
+    written_over: Vec<String>,
 }
 
 /// What a write does with the time to live the key has.
@@ -283,6 +352,52 @@ fn ttl_replaced(ttl: &mut Vec<Entry>, old: Entry, new: Entry) {
     }
 }
 
+/// No write lock holds the shard: see `ShardMap::now`.
+const UNPINNED: u64 = 0;
+/// A write lock holds the shard and has not read the clock yet.
+const PENDING: u64 = u64::MAX;
+
+/// Whether `entry` is past its time, by the shard's time `now` (see
+/// `ShardMap::now`). Keys without a time to live never read the clock.
+#[inline(always)]
+fn expired(entry: Entry, now: &AtomicU64) -> bool {
+    entry.has_ttl() && entry.expires().is_some_and(|at| past(at, now))
+}
+
+/// Whether the time to live that ends at `at` has, by the shard's time.
+/// Never while the thread is loading a dataset or applying its master's
+/// stream (`expiry::held`): what expired there is said by a `DEL`.
+#[inline]
+fn past(at: u64, now: &AtomicU64) -> bool {
+    now_at(now) > at && !crate::expiry::held()
+}
+
+/// The shard's time: the one its write lock keeps, read from the clock the
+/// first time it is asked for; the clock's own without a write lock.
+#[inline]
+fn now_at(now: &AtomicU64) -> u64 {
+    match now.load(Ordering::Relaxed) {
+        UNPINNED => crate::commands::helpers::now_ms(),
+        PENDING => {
+            let t = crate::commands::helpers::now_ms();
+            now.store(t, Ordering::Relaxed);
+            t
+        }
+        t => t,
+    }
+}
+
+/// A key a write found past its time: expired lazily, as Redis counts it.
+/// Kept for the write lock to expire once it lets go (`ShardWrite`): its
+/// `expired` event, the clients watching or caching it, its documents, and
+/// the `DEL` propagated before the write's own record.
+#[cold]
+#[inline(never)]
+fn written_over_expired(over: &mut Vec<String>, key: &[u8]) {
+    crate::stats::record_expired();
+    over.push(String::from_utf8_lossy(key).into_owned());
+}
+
 /// How far ahead a pass over the list asks for entries' lines.
 const TTL_AHEAD: usize = 8;
 
@@ -304,6 +419,8 @@ impl ShardMap {
             table: HashTable::new(),
             hash: ahash::RandomState::new(),
             ttl: Vec::new(),
+            now: AtomicU64::new(UNPINNED),
+            written_over: Vec::new(),
         }
     }
 
@@ -312,6 +429,8 @@ impl ShardMap {
             table: HashTable::with_capacity(capacity),
             hash: ahash::RandomState::new(),
             ttl: Vec::new(),
+            now: AtomicU64::new(UNPINNED),
+            written_over: Vec::new(),
         }
     }
 
@@ -328,25 +447,95 @@ impl ShardMap {
             .copied()
     }
 
+    /// The slot of `key`, unless the key is past its time.
+    #[inline(always)]
+    fn find_live(&self, hash: u64, key: &[u8]) -> Option<Slot> {
+        self.find(hash, key)
+            .filter(|s| !expired(s.entry(), &self.now))
+    }
+
+    /// A write lock holds the shard from now: its time is the clock's when
+    /// it is first needed, and then the same throughout (see `now`).
+    #[inline(always)]
+    pub(super) fn pin_now(&mut self) {
+        *self.now.get_mut() = PENDING;
+    }
+
+    /// The write lock lets go: the clock's time again.
+    #[inline(always)]
+    pub(super) fn unpin_now(&mut self) {
+        *self.now.get_mut() = UNPINNED;
+    }
+
+    /// Whether [`written_over_expired`] kept any keys.
+    #[inline(always)]
+    pub(super) fn wrote_over_expired(&self) -> bool {
+        !self.written_over.is_empty()
+    }
+
+    /// The keys [`written_over_expired`] kept, taken.
+    pub(super) fn take_written_over(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.written_over)
+    }
+
+    /// This table, as a number: which table a key is in, for `access`.
+    #[inline(always)]
+    fn id(&self) -> u64 {
+        self as *const Self as usize as u64
+    }
+
+    /// `key`'s value: a use of the key (see the module).
     #[inline(always)]
     pub fn get(&self, key: &str) -> Option<ValueRef<'_>> {
         let key = key.as_bytes();
-        self.find(self.hash_of(key), key).map(|s| s.entry().value())
+        let hash = self.hash_of(key);
+        self.find_live(hash, key).map(|s| {
+            let e = s.entry();
+            used(e, hash, self.id());
+            e.value()
+        })
+    }
+
+    /// `key`'s value, without its use being written: for what only looks
+    /// (`OBJECT`, `SORT`'s `BY` and `GET` patterns, ...). A key past its
+    /// time is absent here too.
+    #[inline]
+    pub fn peek(&self, key: &str) -> Option<ValueRef<'_>> {
+        let key = key.as_bytes();
+        self.find_live(self.hash_of(key), key)
+            .map(|s| s.entry().value())
     }
 
     /// `key`'s value, and when its time to live ends (milliseconds since
-    /// the Unix epoch) if it has one: both from the one entry.
+    /// the Unix epoch) if it has one: both from the one entry. A use of the
+    /// key.
     #[inline(always)]
     pub fn get_expiring(&self, key: &str) -> Option<(ValueRef<'_>, Option<u64>)> {
         let key = key.as_bytes();
-        self.find(self.hash_of(key), key).map(|s| {
+        let hash = self.hash_of(key);
+        self.find_live(hash, key).map(|s| {
             let e = s.entry();
+            used(e, hash, self.id());
+            (e.value(), e.expires())
+        })
+    }
+
+    /// [`ShardMap::get_expiring`], past its time or not: for a reader that
+    /// checks the time itself, as `GET` does. A use of the key.
+    #[inline(always)]
+    pub fn peek_expiring(&self, key: &str) -> Option<(ValueRef<'_>, Option<u64>)> {
+        let key = key.as_bytes();
+        let hash = self.hash_of(key);
+        self.find(hash, key).map(|s| {
+            let e = s.entry();
+            used(e, hash, self.id());
             (e.value(), e.expires())
         })
     }
 
     /// When `key`'s time to live ends, in milliseconds since the Unix epoch:
-    /// `None` if it has none, or there is no such key.
+    /// `None` if it has none, or there is no such key. Past or not: this is
+    /// what lazy and active expiry go by.
     #[inline(always)]
     pub fn expires(&self, key: &str) -> Option<u64> {
         let key = key.as_bytes();
@@ -354,10 +543,18 @@ impl ShardMap {
             .and_then(|s| s.entry().expires())
     }
 
+    /// Whether there is such a key: a use of it, if there is.
     #[inline(always)]
     pub fn contains_key(&self, key: &str) -> bool {
         let key = key.as_bytes();
-        self.find(self.hash_of(key), key).is_some()
+        let hash = self.hash_of(key);
+        match self.find_live(hash, key) {
+            Some(s) => {
+                used(s.entry(), hash, self.id());
+                true
+            }
+            None => false,
+        }
     }
 
     /// `key`'s access word: when it was last used, or how often
@@ -382,12 +579,23 @@ impl ShardMap {
         }
     }
 
+    /// `key` is used, if it is there and this thread's command counts as
+    /// a use (see the module): a lookup for nothing else. The key is taken
+    /// in bytes, as `touch` takes it.
+    #[inline]
+    pub fn use_key(&self, key: &[u8]) {
+        let hash = self.hash_of(key);
+        if let Some(s) = self.find(hash, key) {
+            used(s.entry(), hash, self.id());
+        }
+    }
+
     /// A hold on `key`'s entry: its key and value, readable once the shard
     /// is let go of, and unchanged for as long as it is held.
     pub fn get_ref(&self, key: &str) -> Option<EntryRef> {
         let key = key.as_bytes();
         // SAFETY: the entry is in this table, which the caller has locked.
-        self.find(self.hash_of(key), key)
+        self.find_live(self.hash_of(key), key)
             .map(|s| unsafe { EntryRef::new(s.entry()) })
     }
 
@@ -395,26 +603,35 @@ impl ShardMap {
     /// value is the very one it had when `held` was taken.
     pub fn holds(&self, key: &str, held: &EntryRef) -> bool {
         let key = key.as_bytes();
-        self.find(self.hash_of(key), key)
+        self.find_live(self.hash_of(key), key)
             .is_some_and(|s| held.is(s.entry()))
     }
 
-    /// Put an entry under `key`, and give back what the key had. One
-    /// probe, whether the key is there or not.
+    /// Put an entry under `key`, and say what became of what the key had,
+    /// past its time or not. One probe, whether the key is there or not.
     ///
     /// `make` makes the entry, given the time to live it is to have: the one
     /// `ttl` says, or the key's own if it keeps it. Made once the key is
-    /// found, so that keeping a time to live costs nothing more.
+    /// found, so that keeping a time to live costs nothing more. A key past
+    /// its time is put as a new one, without it.
+    ///
+    /// With `in_place`, the string the entry is to hold: written over the
+    /// key's string in its own entry, if that can be done (see the module),
+    /// and nothing is made. Never over a key past its time.
     #[inline(always)]
     fn put(
         &mut self,
         key: &[u8],
         ttl: Ttl,
+        in_place: Option<&[u8]>,
         make: impl FnOnce(&[u8], Option<u64>) -> Entry,
-    ) -> Option<Taken> {
+    ) -> Written {
         let hash = self.hash_of(key);
+        let now = &self.now;
+        let map = self.id();
         let hasher = &self.hash;
         let list = &mut self.ttl;
+        let over = &mut self.written_over;
         match self.table.entry(
             hash,
             |s| s.may_be(hash) && s.entry().has_key(key),
@@ -422,20 +639,53 @@ impl ShardMap {
         ) {
             hashbrown::hash_table::Entry::Occupied(mut at) => {
                 let old = at.get().entry();
+                let stale = expired(old, now);
+                if stale {
+                    written_over_expired(over, key);
+                }
+                if !stale && let Some(bytes) = in_place {
+                    // The time to live is in the block before the key: a
+                    // write that gives the key one, or takes it away, needs
+                    // a new block.
+                    let room_stays = match ttl {
+                        Ttl::Keep => true,
+                        Ttl::Set(expires) => expires.is_some() == old.has_ttl(),
+                    };
+                    if room_stays && old.fits_in_place(bytes.len()) {
+                        // SAFETY: the shard is locked for writing (`&mut
+                        // self`), the table alone holds the entry, and the
+                        // bytes keep it in its class; a time to live it
+                        // has is there to change.
+                        unsafe {
+                            old.write_in_place(bytes);
+                            if let Ttl::Set(Some(ms)) = ttl {
+                                old.set_expires(ms);
+                            }
+                        }
+                        used(old, hash, map);
+                        return Written::InPlace;
+                    }
+                }
                 let entry = make(
                     key,
                     match ttl {
+                        Ttl::Keep if stale => None,
                         Ttl::Keep => old.expires(),
                         Ttl::Set(expires) => expires,
                     },
                 );
                 // The key's use goes on: a value written over keeps the
-                // count of an LFU policy, as in Redis.
-                entry.set_access(old.access());
+                // count of an LFU policy, as in Redis. Not one past its
+                // time: that key is gone, and this is a new one, which
+                // starts where a new key does.
+                if !stale {
+                    entry.set_access(old.access());
+                }
+                used(entry, hash, map);
                 *at.get_mut() = Slot::new(entry, hash);
                 ttl_replaced(list, old, entry);
                 // SAFETY: the table's hold on the old entry goes to the caller.
-                Some(unsafe { Taken::new(old) })
+                Written::Replaced(unsafe { Taken::new(old) })
             }
             hashbrown::hash_table::Entry::Vacant(place) => {
                 let entry = make(
@@ -445,11 +695,12 @@ impl ShardMap {
                         Ttl::Set(expires) => expires,
                     },
                 );
+                used(entry, hash, map);
                 place.insert(Slot::new(entry, hash));
                 if entry.has_ttl() {
                     ttl_push(list, entry);
                 }
-                None
+                Written::New
             }
         }
     }
@@ -459,9 +710,10 @@ impl ShardMap {
     /// time to live.
     #[inline]
     pub fn insert(&mut self, key: impl AsRef<str>, value: KiviDBValue) -> Option<Taken> {
-        self.put(key.as_ref().as_bytes(), Ttl::Keep, |key, expires| {
+        self.put(key.as_ref().as_bytes(), Ttl::Keep, None, |key, expires| {
             Entry::new(key, value, expires)
         })
+        .replaced()
     }
 
     /// [`ShardMap::insert`], the key's time to live set to `expires`
@@ -476,8 +728,10 @@ impl ShardMap {
         self.put(
             key.as_ref().as_bytes(),
             Ttl::Set(expires),
+            None,
             |key, expires| Entry::new(key, value, expires),
         )
+        .replaced()
     }
 
     /// Set `key` to the string `bytes`: [`ShardMap::insert`] of a string,
@@ -485,9 +739,80 @@ impl ShardMap {
     #[inline]
     pub fn insert_str(&mut self, key: impl AsRef<str>, bytes: impl AsRef<[u8]>) -> Option<Taken> {
         let bytes = bytes.as_ref();
-        self.put(key.as_ref().as_bytes(), Ttl::Keep, |key, expires| {
+        self.put(key.as_ref().as_bytes(), Ttl::Keep, None, |key, expires| {
             Entry::string(key, bytes, expires)
         })
+        .replaced()
+    }
+
+    /// Set `key` to the string `bytes`, keeping its time to live: in place,
+    /// in the key's own entry, when that can be done (see the module); else
+    /// as [`ShardMap::insert_str`].
+    #[inline]
+    pub fn set_str(&mut self, key: impl AsRef<str>, bytes: impl AsRef<[u8]>) -> Written {
+        let bytes = bytes.as_ref();
+        self.put(
+            key.as_ref().as_bytes(),
+            Ttl::Keep,
+            Some(bytes),
+            |key, expires| Entry::string(key, bytes, expires),
+        )
+    }
+
+    /// [`ShardMap::set_str`], the key's time to live set to `expires`, or
+    /// taken away.
+    #[inline]
+    pub fn set_str_expiring(
+        &mut self,
+        key: impl AsRef<str>,
+        bytes: impl AsRef<[u8]>,
+        expires: Option<u64>,
+    ) -> Written {
+        let bytes = bytes.as_ref();
+        self.put(
+            key.as_ref().as_bytes(),
+            Ttl::Set(expires),
+            Some(bytes),
+            |key, expires| Entry::string(key, bytes, expires),
+        )
+    }
+
+    /// `extra` added to the end of `key`'s string, in its own entry, if that
+    /// can be done (see the module). Returns the string's new length if it
+    /// was; `None` leaves everything as it was, for the caller to write a
+    /// new value.
+    pub fn append_in_place(&mut self, key: &str, extra: &[u8]) -> Option<usize> {
+        let key = key.as_bytes();
+        let hash = self.hash_of(key);
+        let map = self.id();
+        let entry = self.find_live(hash, key)?.entry();
+        let len = entry.inline_len()? + extra.len();
+        if !entry.fits_in_place(len) {
+            return None;
+        }
+        // SAFETY: locked for writing, held by the table alone, and in class.
+        unsafe { entry.write_at_in_place(len - extra.len(), extra) };
+        used(entry, hash, map);
+        Some(len)
+    }
+
+    /// `patch` written over `key`'s string from `offset`, the string grown
+    /// with zero bytes to reach it, in its own entry if that can be done
+    /// (see the module). Returns the string's new length if it was; `None`
+    /// leaves everything as it was.
+    pub fn set_range_in_place(&mut self, key: &str, offset: usize, patch: &[u8]) -> Option<usize> {
+        let key = key.as_bytes();
+        let hash = self.hash_of(key);
+        let map = self.id();
+        let entry = self.find_live(hash, key)?.entry();
+        let len = entry.inline_len()?.max(offset.checked_add(patch.len())?);
+        if !entry.fits_in_place(len) {
+            return None;
+        }
+        // SAFETY: as in `append_in_place`.
+        unsafe { entry.write_at_in_place(offset, patch) };
+        used(entry, hash, map);
+        Some(len)
     }
 
     /// [`ShardMap::insert_str`], the key's time to live set to `expires`, or
@@ -503,40 +828,19 @@ impl ShardMap {
         self.put(
             key.as_ref().as_bytes(),
             Ttl::Set(expires),
+            None,
             |key, expires| Entry::string(key, bytes, expires),
         )
-    }
-
-    /// Put an entry made before the shard was locked ([`NewEntry`]), with
-    /// the time to live it was made with, or, if it was made to keep the
-    /// key's, that one.
-    #[inline]
-    pub fn insert_entry(&mut self, entry: NewEntry) -> Option<Taken> {
-        let (made, keep) = (entry.entry, entry.keep);
-        std::mem::forget(entry);
-        let ttl = if keep {
-            Ttl::Keep
-        } else {
-            Ttl::Set(made.expires())
-        };
-        self.put(made.key(), ttl, |_, expires| {
-            if expires == made.expires() {
-                made
-            } else {
-                // The key had a time to live to keep: made again with it.
-                let again = made.remade(expires);
-                // SAFETY: the only hold, never put in a table.
-                unsafe { made.release() };
-                again
-            }
-        })
+        .replaced()
     }
 
     /// Give `key` the time to live that ends at `expires` (milliseconds
-    /// since the Unix epoch). Returns whether there is such a key.
+    /// since the Unix epoch). Returns whether there is such a key: one past
+    /// its time is left for expiry to take out.
     pub fn set_expires(&mut self, key: &str, expires: u64) -> bool {
         let key = key.as_bytes();
         let hash = self.hash_of(key);
+        let map = self.id();
         let Some(slot) = self
             .table
             .find_mut(hash, |s| s.may_be(hash) && s.entry().has_key(key))
@@ -544,13 +848,18 @@ impl ShardMap {
             return false;
         };
         let old = slot.entry();
+        if expired(old, &self.now) {
+            return false;
+        }
         if old.has_ttl() && old.holders() == 1 {
             // SAFETY: the shard is locked for writing, and nothing but the
             // table holds the entry.
             unsafe { old.set_expires(expires) };
+            used(old, hash, map);
             return true;
         }
         let new = old.remade(Some(expires));
+        used(new, hash, map);
         *slot = Slot::new(new, slot.hash_part());
         ttl_replaced(&mut self.ttl, old, new);
         // SAFETY: the table's hold, given up: whoever else holds the old
@@ -563,6 +872,7 @@ impl ShardMap {
     pub fn persist(&mut self, key: &str) -> bool {
         let key = key.as_bytes();
         let hash = self.hash_of(key);
+        let map = self.id();
         let Some(slot) = self
             .table
             .find_mut(hash, |s| s.may_be(hash) && s.entry().has_key(key))
@@ -570,6 +880,10 @@ impl ShardMap {
             return false;
         };
         let old = slot.entry();
+        if expired(old, &self.now) {
+            return false;
+        }
+        used(old, hash, map);
         if !old.has_ttl() {
             return false;
         }
@@ -817,6 +1131,45 @@ impl ShardMap {
                 if s.shared().is_some_and(|b| crate::value_slab::is_evacuating(b.block(), regions)))
     }
 
+    /// The buckets from `from` to `to` (not included) whose entry, or its
+    /// string's bytes, is in a slab compaction is emptying: [`evacuating_at`]
+    /// of each, with the entries' first lines asked for a few buckets ahead.
+    /// Each entry is somewhere else in memory, and the shard is locked for
+    /// reading while this runs: one after the other, their misses held the
+    /// lock about 50 us for 512 buckets.
+    ///
+    /// [`evacuating_at`]: ShardMap::evacuating_at
+    pub fn evacuating_in(&self, from: usize, to: usize, regions: &[usize]) -> Vec<usize> {
+        const AHEAD: usize = 8;
+        let to = to.min(self.buckets());
+        for index in from..(from + AHEAD).min(to) {
+            if let Some(slot) = self.table.get_bucket(index) {
+                slot.prefetch_header();
+            }
+        }
+        let mut found = Vec::new();
+        for index in from..to {
+            if index + AHEAD < to
+                && let Some(slot) = self.table.get_bucket(index + AHEAD)
+            {
+                slot.prefetch_header();
+            }
+            if self.evacuating_at(index, regions) {
+                found.push(index);
+            }
+        }
+        found
+    }
+
+    /// Ask for the first lines of the entry in bucket `index`, if there is
+    /// one: compaction's next copy.
+    #[inline]
+    pub fn prefetch_bucket(&self, index: usize) {
+        if let Some(slot) = self.table.get_bucket(index) {
+            slot.prefetch();
+        }
+    }
+
     /// Move the entry in bucket `index`, or its string's bytes, out of a
     /// slab compaction is emptying, if the table's is its only hold.
     pub fn relocate_at(&mut self, index: usize, regions: &[usize]) -> Relocated {
@@ -840,48 +1193,6 @@ impl ShardMap {
             }
             Relocation::BytesMoved(old) => Relocated::Moved(Leftover::Bytes(old)),
         }
-    }
-}
-
-/// A key's entry, made before its shard is locked: what the shard then
-/// waits for is only the table. Freed if dropped unused.
-pub struct NewEntry {
-    entry: Entry,
-    /// Whether the key keeps the time to live it has.
-    keep: bool,
-}
-
-impl NewEntry {
-    /// The key keeps its time to live, as [`ShardMap::insert`].
-    pub fn new(key: &str, value: KiviDBValue) -> Self {
-        NewEntry {
-            entry: Entry::new(key.as_bytes(), value, None),
-            keep: true,
-        }
-    }
-
-    /// The string `bytes`, copied once, into the entry. The key keeps its
-    /// time to live.
-    pub fn string(key: &str, bytes: &[u8]) -> Self {
-        NewEntry {
-            entry: Entry::string(key.as_bytes(), bytes, None),
-            keep: true,
-        }
-    }
-
-    /// The string `bytes`, the key's time to live to be `expires`, or none.
-    pub fn string_expiring(key: &str, bytes: &[u8], expires: Option<u64>) -> Self {
-        NewEntry {
-            entry: Entry::string(key.as_bytes(), bytes, expires),
-            keep: false,
-        }
-    }
-}
-
-impl Drop for NewEntry {
-    fn drop(&mut self) {
-        // SAFETY: the only hold, never put in a table.
-        unsafe { self.entry.release() };
     }
 }
 
@@ -1021,6 +1332,88 @@ mod tests {
             map.remove(&format!("k{i}"));
         }
         assert_eq!(map.random_entry(|| 0).map(|(k, _)| k), Some("k0"));
+    }
+
+    #[test]
+    fn a_key_past_its_time_is_absent_until_taken_out() {
+        let mut map = ShardMap::new();
+        map.insert_expiring("k", s("100"), Some(1));
+        assert!(map.get("k").is_none());
+        assert!(map.get_expiring("k").is_none());
+        assert!(!map.contains_key("k"));
+        assert!(map.get_ref("k").is_none());
+        assert!(!map.set_expires("k", u64::MAX));
+        assert!(!map.persist("k"));
+        // Expiry still sees it, by its own time.
+        assert_eq!(map.expires("k"), Some(1));
+        assert_eq!(map.ttl_len(), 1);
+
+        // A write puts a new key: the old time to live goes with the old value.
+        assert!(map.insert("k", s("1")).is_some());
+        assert_eq!(text(map.get("k")), Some(b"1".to_vec()));
+        assert_eq!(map.expires("k"), None);
+        assert_eq!(map.ttl_len(), 0);
+        assert!(map.remove_if_due("k", u64::MAX).is_none());
+
+        // A live key keeps its time to live through a write.
+        map.insert_expiring("live", s("a"), Some(u64::MAX - 1));
+        map.insert("live", s("b"));
+        assert_eq!(map.expires("live"), Some(u64::MAX - 1));
+    }
+
+    #[test]
+    fn a_key_past_its_time_is_not_written_in_place() {
+        let mut map = ShardMap::new();
+        // SET k v KEEPTTL, INCR, SETRANGE's fallback: a new key, no time to live.
+        map.insert_str_expiring("set", "5", Some(1));
+        assert!(matches!(map.set_str("set", "6"), Written::Replaced(_)));
+        assert_eq!(text(map.get("set")), Some(b"6".to_vec()));
+        assert_eq!(map.expires("set"), None);
+        // APPEND and SETRANGE leave it to the caller's write of a new value.
+        map.insert_str_expiring("app", "5", Some(1));
+        assert_eq!(map.append_in_place("app", b"6"), None);
+        map.insert_str_expiring("rng", "5", Some(1));
+        assert_eq!(map.set_range_in_place("rng", 0, b"6"), None);
+        assert_eq!(map.take_written_over(), vec!["set".to_string()]);
+        // A live key is still written in place.
+        map.insert_str_expiring("live", "5", Some(u64::MAX - 1));
+        assert!(matches!(map.set_str("live", "6"), Written::InPlace));
+        assert_eq!(map.append_in_place("live", b"7"), Some(2));
+        assert_eq!(map.expires("live"), Some(u64::MAX - 1));
+    }
+
+    #[test]
+    fn a_write_lock_sees_one_time() {
+        let shard = crate::store::ShardLock::default();
+        let soon = crate::commands::helpers::now_ms() + 200;
+        shard.write().insert_expiring("k", s("100"), Some(soon));
+        let mut map = shard.write();
+        // Live when the lock first looked at the time: the write that
+        // follows keeps it, however long after.
+        assert!(map.get("k").is_some());
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        map.insert("k", s("101"));
+        assert_eq!(map.expires("k"), Some(soon));
+        drop(map);
+        assert!(shard.read().get("k").is_none());
+    }
+
+    #[test]
+    fn a_write_lock_reads_the_clock_only_for_a_key_with_a_time_to_live() {
+        let shard = crate::store::ShardLock::default();
+        shard.write().insert("plain", s("1"));
+        shard
+            .write()
+            .insert_expiring("ttl", s("1"), Some(u64::MAX - 1));
+        let mut map = shard.write();
+        assert!(map.get("plain").is_some());
+        map.insert("plain", s("2"));
+        assert_eq!(map.now.load(Ordering::Relaxed), PENDING, "no clock read");
+        assert!(map.get("ttl").is_some());
+        let t = map.now.load(Ordering::Relaxed);
+        assert!(t != PENDING && t != UNPINNED, "read once, and kept");
+        drop(map);
+        assert_eq!(shard.read().now.load(Ordering::Relaxed), UNPINNED);
     }
 
     #[test]

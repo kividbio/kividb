@@ -61,6 +61,10 @@ pub struct ReplState {
     /// than 0. From then on every write travels with its own `SELECT`; see
     /// [`ReplState::note_database_selected`].
     pub several_databases: AtomicBool,
+    /// Whether a `FT.DROPINDEX … DD` this replica's master sends deleted the
+    /// documents on the master. Set at each connection to a master, from the
+    /// release it says it is (`INFO server`); see [`dd_deleted_by`].
+    pub master_dd_deletes: AtomicBool,
     /// How many taps are attached (see `taps`). Read on every write, so that
     /// the common case — none — costs one relaxed load.
     pub stream_taps: std::sync::atomic::AtomicUsize,
@@ -125,6 +129,11 @@ pub struct ReplState {
     /// runs several servers in one process and they need independent values.
     pub repl_timeout_secs: AtomicU64,
     pub repl_ping_period_secs: AtomicU64,
+    /// `hll-write-format`: whether new HyperLogLog values use Redis's dense
+    /// encoding and hash space, or the legacy KiviDB one. Per server rather
+    /// than process-wide: the test harness runs several servers in one
+    /// process, and an AOF-replaying server must have it before replay starts.
+    hll_write_redis: AtomicBool,
     /// Redis `min-replicas-to-write`: a master refuses writes while fewer
     /// replicas than this are good (see `min_replicas_max_lag`). 0 is off.
     pub min_replicas_to_write: AtomicU32,
@@ -416,6 +425,7 @@ impl ReplState {
             slave_sync_in_progress: AtomicBool::new(false),
             repl_stream_last_db: AtomicU64::new(u64::MAX),
             several_databases: AtomicBool::new(false),
+            master_dd_deletes: AtomicBool::new(false),
             stream_taps: std::sync::atomic::AtomicUsize::new(0),
             taps: RwLock::new(Vec::new()),
             repl_generation: AtomicU64::new(0),
@@ -429,6 +439,7 @@ impl ReplState {
             last_sync_refusal: RwLock::new(None),
             repl_timeout_secs: AtomicU64::new(60),
             repl_ping_period_secs: AtomicU64::new(10),
+            hll_write_redis: AtomicBool::new(false),
             min_replicas_to_write: AtomicU32::new(0),
             min_replicas_max_lag: AtomicU64::new(10),
             full_sync_guard: AtomicU8::new(FullSyncGuard::Empty as u8),
@@ -650,11 +661,23 @@ impl ReplState {
         state
             .backlog_ttl_secs
             .store(config.repl_backlog_ttl, Ordering::Relaxed);
+        state.hll_write_redis.store(
+            config.hll_write_format.eq_ignore_ascii_case("redis"),
+            Ordering::Relaxed,
+        );
         state.flush_before_load.store(
             flush_before_load(&config.repl_diskless_load).unwrap_or(true),
             Ordering::Relaxed,
         );
         state
+    }
+
+    pub fn hll_write_redis(&self) -> bool {
+        self.hll_write_redis.load(Ordering::Relaxed)
+    }
+
+    pub fn set_hll_write_redis(&self, redis: bool) {
+        self.hll_write_redis.store(redis, Ordering::Relaxed);
     }
 
     pub fn full_sync_guard(&self) -> FullSyncGuard {
@@ -1200,6 +1223,11 @@ pub fn save_dataset(
     index_store: &crate::vector::IndexStore,
     repl_state: &ReplState,
 ) -> std::io::Result<()> {
+    // No other checkpoint or save from here to the point saved beside the
+    // dump below, which must be the point of this dump. Taken before the
+    // applier's lock, so the applier does not wait while this waits for
+    // its turn (and nothing that has its turn waits for that lock).
+    let turn = crate::aof::checkpoint_turn()?;
     // The replica's applier is between commands, and stays there until the
     // save is done: the point read here is the dataset written below.
     let _applying = repl_state.apply_lock.lock();
@@ -1212,7 +1240,7 @@ pub fn save_dataset(
     // instant the dataset is captured: no write is half-way then.
     let mut master_point: Option<(String, u64)> = None;
     if crate::aof::AOF_ENABLED.load(Ordering::Relaxed) {
-        crate::aof::checkpoint_noting(store, index_store, &mut || {
+        crate::aof::checkpoint_noting(&turn, store, index_store, &mut || {
             if !repl_state.is_slave() && repl_state.feeds_hub() {
                 master_point = Some((
                     repl_state.repl_id(),
@@ -1270,6 +1298,7 @@ pub fn save_dataset(
     }
     crate::stats::RDB_SAVES.fetch_add(1, Ordering::Relaxed);
     crate::stats::record_save();
+    drop(turn);
     Ok(())
 }
 
@@ -1563,6 +1592,37 @@ const REPL_PING: &[u8] = b"*1\r\n$4\r\nPING\r\n";
 
 // NEW: global replica id counter
 static NEXT_REPLICA_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Whether KiviDB `version` (`kividb_version` of `INFO server`) deleted the
+/// documents of `FT.DROPINDEX … DD`, and sent the command on as typed.
+/// 1.1 and before kept them. 1.2.0's release candidates deleted them;
+/// releases since send the deletes instead, and never `DD`, so whatever
+/// this says of them is not asked. A version that cannot be read is taken
+/// to have kept them: deleting what such a master kept would lose data.
+pub fn dd_deleted_by(version: &str) -> bool {
+    let mut numbers = version
+        .split(['.', '-'])
+        .map(|part| part.parse::<u32>().ok());
+    match (numbers.next().flatten(), numbers.next().flatten()) {
+        (Some(major), Some(minor)) => (major, minor) >= (1, 2),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod dd_version_tests {
+    use super::dd_deleted_by;
+
+    #[test]
+    fn only_1_2_and_later_deleted_the_documents_of_dd() {
+        for kept in ["1.1.2", "1.1.0-rc1", "1.0.6", "0.9.0", "", "garbage", "1"] {
+            assert!(!dd_deleted_by(kept), "{kept}");
+        }
+        for deleted in ["1.2.0-rc1", "1.2.0-rc2", "1.2.0", "1.3.0", "2.0.0"] {
+            assert!(dd_deleted_by(deleted), "{deleted}");
+        }
+    }
+}
 
 pub fn next_replica_id() -> u64 {
     NEXT_REPLICA_ID.fetch_add(1, Ordering::Relaxed)
@@ -2446,6 +2506,92 @@ pub fn replicate_from_background(
         .store(db as u64, Ordering::Relaxed);
 }
 
+/// A key this master has expired in database `db`: `parts`, its `DEL` (or
+/// `UNLINK`), to replicas, taps and the AOF, as the write that deleted it
+/// (see `expiry`). As [`replicate_from_background`], but also from inside a
+/// command: in a transaction or a script it goes with the group's writes,
+/// where it was made, and to the AOF through the group's records.
+///
+/// Call it holding the write gate and the key's place in the order of
+/// writes (`expiry::order`), with the key already gone. A replica
+/// propagates nothing: its master tells it what expired.
+pub fn replicate_expired(repl_state: &ReplState, hub_tx: &HubTx, db: usize, parts: &[Vec<u8>]) {
+    if repl_state.is_slave() {
+        return;
+    }
+    let aof = crate::aof::AOF_ENABLED.load(Ordering::Relaxed);
+    let has_replicas = repl_state.feeds_hub();
+    let tapped = repl_state.stream_taps.load(Ordering::Relaxed) > 0;
+    if !aof && !has_replicas && !tapped {
+        return;
+    }
+    let grouped = in_group();
+    if grouped {
+        note_group_write(aof);
+    }
+    // One AOF record: a `SELECT` and the `DEL` it qualifies must not be
+    // separable by a crash.
+    let mut record = Vec::new();
+    let (payloads, now_in) = expired_for_stream(repl_state, db, parts);
+    for payload in payloads {
+        if tapped {
+            repl_state.feed_taps(&payload);
+        }
+        if aof {
+            record.extend_from_slice(&payload);
+        }
+        if grouped && has_replicas {
+            GROUP_STREAM.with(|stream| stream.borrow_mut().extend_from_slice(&payload));
+        } else {
+            repl_state
+                .repl_offset
+                .fetch_add(payload.len() as u64, Ordering::Relaxed);
+            if has_replicas {
+                propagate(hub_tx, payload);
+            }
+        }
+    }
+    if aof {
+        crate::aof::AOF_WRITTEN.fetch_add(record.len() as u64, Ordering::Relaxed);
+        crate::aof::queue_record(&crate::commands::ctx::GlobalAofSender, record);
+    }
+    repl_state
+        .repl_stream_last_db
+        .store(now_in as u64, Ordering::Relaxed);
+}
+
+/// `parts`, the deletion of a key expired in database `db`, encoded for the
+/// write stream; and the database the stream is in after it.
+///
+/// While no client has left database 0, a client's write carries no
+/// `SELECT`: whether it needs one is read from `repl_stream_last_db` before
+/// it is sent ([`ReplState::encode_for_stream`]). A key can be in another
+/// database all the same (`MOVE`, `COPY ... DB`, `SWAPDB`, a dataset
+/// loaded), and expiry deletes it beside those writes. Sent as a `SELECT`
+/// and a `DEL`, with the stream then taken to be in the key's database, a
+/// write that read 0 meanwhile went after the `SELECT` and was applied in
+/// the key's database by the replica and by a replay of the AOF; and as it
+/// stored 0 after, every write of database 0 from then on was too (3,300
+/// keys deleted on the master stayed on its replica in 8 s of six clients
+/// writing). So the deletion goes in one piece that goes back to 0, which
+/// leaves the stream where those writes take it to be.
+fn expired_for_stream(
+    repl_state: &ReplState,
+    db: usize,
+    parts: &[Vec<u8>],
+) -> (Vec<Vec<u8>>, usize) {
+    if db == 0 || repl_state.several_databases.load(Ordering::Relaxed) {
+        return (repl_state.encode_for_stream(db, parts), db);
+    }
+    let select = |db: usize| {
+        crate::resp::write::encode_resp_command(&[b"SELECT".to_vec(), db.to_string().into_bytes()])
+    };
+    let mut piece = select(db);
+    piece.extend_from_slice(&crate::resp::write::encode_resp_command(parts));
+    piece.extend_from_slice(&select(0));
+    (vec![piece], 0)
+}
+
 /// Append an already-encoded write to this node's own AOF and stop.
 ///
 /// Used by both nodes that must log without forwarding: a replica applying its
@@ -2603,6 +2749,7 @@ pub fn is_write_command(name: &str) -> bool {
                 | "LINSERT"
                 | "PERSIST"
                 | "PEXPIRE"
+                | "PFDEBUG"
                 | "PFMERGE"
                 | "RESTORE"
                 | "TS.MADD"
@@ -2793,6 +2940,7 @@ pub(crate) const WRITE_COMMANDS_FOR_TEST: &[&str] = &[
     "PEXPIRE",
     "PEXPIREAT",
     "PFADD",
+    "PFDEBUG",
     "PFMERGE",
     "PSETEX",
     "RENAME",
@@ -2910,7 +3058,7 @@ fn is_write_command_reference(name: &str) -> bool {
         "FT.ALIASDEL" | "FT.ALIASUPDATE" | "FT.SYNUPDATE" |
         "FT.DICTADD" | "FT.DICTDEL" |
         // Bitmaps / HLL / Geo
-        "SETBIT" | "BITOP" | "BITFIELD" | "PFADD" | "PFMERGE" |
+        "SETBIT" | "BITOP" | "BITFIELD" | "PFADD" | "PFDEBUG" | "PFMERGE" |
         "GEOADD" | "GEOSEARCHSTORE" |
         // Arrays (Redis 8.8). ARSEEK counts as a write: it moves the insert
         // cursor, which is persisted state a replica must mirror or its
@@ -2942,6 +3090,9 @@ pub fn is_denied_on_readonly_replica(name: &str, cmd: &[&[u8]]) -> bool {
         // (#145).
         "EVAL" | "EVALSHA" | "FCALL" => script_may_write(name, cmd),
         "GEORADIUS" | "GEORADIUSBYMEMBER" => georadius_stores(cmd),
+        // Only TODENSE and RESET rewrite the value; GETREG, DECODE and
+        // ENCODING are diagnostics, deliberately read-only here.
+        "PFDEBUG" => pfdebug_mutates(cmd),
         // MIGRATE removes keys from this node.
         "MIGRATE" => true,
         // Only HIMPORT SET writes; PREPARE / DISCARD are session state.
@@ -2998,6 +3149,16 @@ fn georadius_stores(cmd: &[&[u8]]) -> bool {
         .any(|a| a.eq_ignore_ascii_case(b"STORE") || a.eq_ignore_ascii_case(b"STOREDIST"))
 }
 
+/// `PFDEBUG` is a write only for the subcommands that rewrite the value.
+/// `GETREG` used to be listed here: Redis converts a sparse value to dense
+/// while printing the registers, but this implementation returns the registers
+/// without changing the stored encoding.
+fn pfdebug_mutates(cmd: &[&[u8]]) -> bool {
+    cmd.get(1).is_some_and(|sub| {
+        sub.eq_ignore_ascii_case(b"TODENSE") || sub.eq_ignore_ascii_case(b"RESET")
+    })
+}
+
 /// True if the full command should be replicated to replicas / counted as a mutating write.
 #[inline]
 pub fn command_mutates_for_replication(name: &str, cmd: &[&[u8]]) -> bool {
@@ -3006,6 +3167,7 @@ pub fn command_mutates_for_replication(name: &str, cmd: &[&[u8]]) -> bool {
         // Writes replicate as inner `redis.call` commands, not as `EVAL` / `EVALSHA` / `FCALL`.
         "EVAL" | "EVALSHA" | "FCALL" => false,
         "GEORADIUS" | "GEORADIUSBYMEMBER" => georadius_stores(cmd),
+        "PFDEBUG" => pfdebug_mutates(cmd),
         // Propagated as the `DEL` of whatever it moved away; see
         // `script_feed::commands_for_propagation`.
         "MIGRATE" => true,
@@ -3043,6 +3205,7 @@ pub fn inner_command_blocked_in_readonly_script(name: &str, cmd: &[&[u8]]) -> bo
         // writes nothing may do.
         "PUBLISH" | "SPUBLISH" | "PFCOUNT" => true,
         "GEORADIUS" | "GEORADIUSBYMEMBER" => georadius_stores(cmd),
+        "PFDEBUG" => pfdebug_mutates(cmd),
         "MIGRATE" => true,
         "HIMPORT" => crate::commands::hash_import::is_write(cmd),
         "SCRIPT" if cmd.len() >= 2 => {
@@ -3442,6 +3605,44 @@ mod replication_invariants_tests {
             "GEORADIUSBYMEMBER",
             &storedist
         ));
+    }
+
+    /// `PFDEBUG` is a write command by name, but only `TODENSE` and `RESET`
+    /// rewrite the stored HLL. The diagnostic subcommands must stay readable
+    /// on a replica and inside a read-only script, and must not replicate.
+    #[test]
+    fn pfdebug_is_a_write_only_when_it_rewrites() {
+        assert!(super::is_write_command("PFDEBUG"));
+        for sub in ["GETREG", "DECODE", "ENCODING"] {
+            let cmd: Vec<&[u8]> = vec![b"PFDEBUG", sub.as_bytes(), b"k"];
+            assert!(
+                !super::command_mutates_for_replication("PFDEBUG", &cmd),
+                "PFDEBUG {sub} must not propagate"
+            );
+            assert!(
+                !super::is_denied_on_readonly_replica("PFDEBUG", &cmd),
+                "PFDEBUG {sub} must be allowed on a read-only replica"
+            );
+            assert!(
+                !super::inner_command_blocked_in_readonly_script("PFDEBUG", &cmd),
+                "PFDEBUG {sub} must be allowed in a read-only script"
+            );
+        }
+        for sub in ["TODENSE", "RESET", "todense"] {
+            let cmd: Vec<&[u8]> = vec![b"PFDEBUG", sub.as_bytes(), b"k"];
+            assert!(
+                super::command_mutates_for_replication("PFDEBUG", &cmd),
+                "PFDEBUG {sub} must propagate"
+            );
+            assert!(
+                super::is_denied_on_readonly_replica("PFDEBUG", &cmd),
+                "PFDEBUG {sub} must be refused on a read-only replica"
+            );
+            assert!(
+                super::inner_command_blocked_in_readonly_script("PFDEBUG", &cmd),
+                "PFDEBUG {sub} must be refused in a read-only script"
+            );
+        }
     }
 
     /// The PING the master writes into an idle stream must be exactly one

@@ -705,7 +705,11 @@ pub fn ft_hybrid(ctx: &mut Ctx) -> Option<Vec<u8>> {
         let store = ctx.index_store.read();
         let def = match store.get(&q.index_name) {
             Some(d) => d.clone(),
-            None => return Some(resp_error("ERR no such index")),
+            None => {
+                return Some(resp_error(&crate::commands::search::no_such_index(
+                    &q.index_name,
+                )));
+            }
         };
 
         // Decode vector param: PARAMS holds raw bytes in the field's type.

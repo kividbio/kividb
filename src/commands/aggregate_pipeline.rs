@@ -132,7 +132,7 @@ fn clause_end(cmd: &[&[u8]], i: usize) -> usize {
             at
         }
         "APPLY" if is(i + 2, "AS") => i + 4,
-        "APPLY" | "FILTER" | "DIALECT" | "SCORER" | "TIMEOUT" => i + 2,
+        "APPLY" | "FILTER" | "DIALECT" | "SCORER" | "TIMEOUT" | "LANGUAGE" => i + 2,
         "SORTBY" => {
             let at = i + 2 + count_at(cmd, i + 1);
             if is(at, "MAX") { at + 2 } else { at }
@@ -380,7 +380,7 @@ pub fn run_within(
             }
 
             // Read where the command is: they say nothing to the pipeline.
-            "DIALECT" | "SCORER" | "TIMEOUT" => {
+            "DIALECT" | "SCORER" | "TIMEOUT" | "LANGUAGE" => {
                 i += 2;
             }
             // `WITHCURSOR [COUNT n] [MAXIDLE ms]`

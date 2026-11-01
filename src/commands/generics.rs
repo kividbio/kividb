@@ -708,6 +708,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             let db = *ctx.selected_db;
             let db_ref = &ctx.store[db];
+            // `remove` takes a key past its time too.
+            if is_expired(ctx.store, db, &src) {
+                delete_key_if_expired(ctx.store, db, &src);
+            }
 
             // Read + remove from src, with its time to live
             let (value, expiry) = {
@@ -946,6 +950,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 return Some(resp_integer(0));
             }
 
+            // `remove` takes a key past its time too.
+            if is_expired(ctx.store, src_db, &key) {
+                delete_key_if_expired(ctx.store, src_db, &key);
+            }
+
             // Read + remove from source, with its time to live
             let (value, expiry) = {
                 let db_ref = &ctx.store[src_db];
@@ -1056,8 +1065,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         "TOUCH" => {
             // TOUCH key [key ...]
             // Returns the count of keys that exist (expired keys count as absent).
-            // What it is for — marking the keys as used — the dispatcher
-            // does for every command's keys: see `eviction::used`.
+            // What it is for — marking the keys as used — the lookup below
+            // does, as every command's lookups of its keys do: see
+            // `store::AccessScope`.
             if cmd.len() < 2 {
                 return Some(resp_error(
                     "ERR wrong number of arguments for 'touch' command",
@@ -1260,10 +1270,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => return Some(resp_error("ERR key must be valid UTF-8")),
             };
 
+            // A source past its time is a missing one: an empty array, or with
+            // STORE, the destination deleted and 0, as for any missing key.
+            // It returned the empty array here, STORE or not, and left the
+            // destination as it was.
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 expire_on_read(ctx.store, *ctx.selected_db, key);
-                // SORT on missing key returns empty array, or 0 if STORE
-                return Some(resp_array(vec![]));
             }
 
             // ── Parse options ──────────────────────────────────────────────────
@@ -1410,7 +1422,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                                     let shard = store::get_shard(db, &lookup_key);
                                     let map = read_lock!(shard);
 
-                                    match map.get(lookup_key.as_str()) {
+                                    match map.peek(lookup_key.as_str()) {
                                         Some(ValueRef::Hash(h)) => {
                                             let inner = h.read();
                                             inner
@@ -1426,7 +1438,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                                     let shard = store::get_shard(db, &lookup_key);
                                     let map = read_lock!(shard);
 
-                                    match map.get(lookup_key.as_str()) {
+                                    match map.peek(lookup_key.as_str()) {
                                         Some(ValueRef::String(s)) => std::str::from_utf8(&s)
                                             .ok()
                                             .and_then(|v| v.parse::<f64>().ok()),
@@ -1551,7 +1563,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             let shard = store::get_shard(db, &lookup_key);
                             let map = read_lock!(shard);
                             // Hash field branch — push raw bytes, not resp_bulk
-                            let val = match map.get(lookup_key.as_str()) {
+                            let val = match map.peek(lookup_key.as_str()) {
                                 Some(ValueRef::Hash(h)) => {
                                     let inner = h.read();
                                     inner.get(field).map(|v| v.to_vec()) // raw bytes
@@ -1564,7 +1576,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             let lookup_key = pat.replace('*', elem_str);
                             let shard = store::get_shard(db, &lookup_key);
                             let map = read_lock!(shard);
-                            let val = match map.get(lookup_key.as_str()) {
+                            let val = match map.peek(lookup_key.as_str()) {
                                 Some(ValueRef::String(s)) => Some(s.to_vec()), // raw bytes
                                 _ => None,
                             };

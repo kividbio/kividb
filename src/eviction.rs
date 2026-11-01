@@ -25,9 +25,20 @@
 //! key's own entry, in one 32-bit word of its header, as Redis keeps it in
 //! the object's `lru` field: see [`Access`]. It is written only while a
 //! policy that asks for it is selected (or `key-access-tracking` is on):
-//! with `noeviction` a command pays one atomic load for all of this. The
-//! word is written only when it changes, so a key read again and again
-//! within the same second dirties its cache line once.
+//! with `noeviction` a command pays one atomic load for all of this, and
+//! each of its lookups one thread-local load. The word is written only when
+//! it changes, so a key read again and again within the same second dirties
+//! its cache line once.
+//!
+//! **Where a use is written.** By the lookups the command makes anyway: the
+//! dispatcher opens a `store::AccessScope` around the command with the
+//! [`stamp`] a use writes, and the lookups that read or write a key write
+//! it to the entry they find (see `store::access`). A command that only
+//! asks about keys (`OBJECT`, `TYPE`, `TTL`, `EXISTS`, ...) opens one that
+//! writes nothing. Two kinds of use are still written after the command, by
+//! a second lookup of each key it names ([`used`]): a modification under
+//! the LRM policies, which only the command's outcome tells; and the keys a
+//! script declares, which its calls need not read.
 //!
 //! An eviction is a deletion like any other: replicas and the AOF are sent a
 //! `DEL`, a `WATCH` on the key is tripped, clients caching it are told, and
@@ -180,9 +191,9 @@ pub fn set_policy(policy: Policy) {
 /// `key-access-tracking`: whether a key's use is recorded under every
 /// policy, so that `OBJECT IDLETIME` and `FREQ` report it under
 /// `noeviction` too, as Redis does (#21). Off by default: recording costs
-/// every command a second lookup of each of its keys, under its shard's read
-/// lock (it costs a key nothing: the word is in every entry anyway). Under
-/// an LRU or LFU policy it is recorded either way.
+/// every command a clock reading, and each lookup a store to the key's
+/// entry when its word changes (it costs a key nothing: the word is in every
+/// entry anyway). Under an LRU or LFU policy it is recorded either way.
 pub fn key_access_tracking() -> bool {
     TRACK_ALWAYS.load(Ordering::Relaxed)
 }
@@ -321,10 +332,59 @@ impl Access {
     }
 }
 
+static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+
 /// Seconds since the first call, plus [`CLOCK_BASE`].
 fn clock() -> u32 {
-    static START: LazyLock<Instant> = LazyLock::new(Instant::now);
-    CLOCK_BASE + START.elapsed().as_secs() as u32
+    clock_at(Instant::now())
+}
+
+/// [`clock`] at `now`.
+#[inline]
+fn clock_at(now: Instant) -> u32 {
+    CLOCK_BASE + now.saturating_duration_since(*START).as_secs() as u32
+}
+
+/// What a command that uses keys has its lookups write to them, starting
+/// at `now` (`store::AccessScope`): the clock (LRU), or the minute with the
+/// stamp's top bit set (LFU, see [`counted`]). 0, nothing, when nothing is
+/// recorded, or only modifications are (LRM: see the module).
+#[inline]
+pub fn stamp(now: Instant) -> u32 {
+    match track() {
+        Track::Used => Access::clock_word(clock_at(now)),
+        Track::Frequency => Access::LFU | ((clock_at(now) / 60) & 0xffff) << 8,
+        Track::Off | Track::Modified => 0,
+    }
+}
+
+/// [`stamp`] for a command that only writes, and whose writes all go
+/// through: a modification is a use under the LRM policies too.
+#[inline]
+pub fn write_stamp(now: Instant) -> u32 {
+    match track() {
+        Track::Modified => Access::clock_word(clock_at(now)),
+        _ => stamp(now),
+    }
+}
+
+/// The access word `word` after one more use, under the LFU stamp `stamp`
+/// (see [`stamp`]).
+pub(crate) fn counted(word: u32, stamp: u32) -> u32 {
+    let minutes = (stamp >> 8) & 0xffff;
+    Access::after_use(word, Track::Frequency, minutes * 60, rand::random::<f64>)
+}
+
+/// Whether a command's keys have their use written after it, by [`used`],
+/// rather than by its lookups: under the LRM policies, and for a script
+/// (`script`).
+#[inline]
+pub fn used_after(script: bool) -> bool {
+    match track() {
+        Track::Off => false,
+        Track::Modified => true,
+        Track::Used | Track::Frequency => script,
+    }
 }
 
 /// Whether this use is counted: less and less likely as the count grows, so
@@ -345,9 +405,10 @@ pub fn recording() -> bool {
     RECORDING.load(Ordering::Relaxed)
 }
 
-/// `key` was read, or written: its word is brought up to date, in place,
-/// with its shard locked for reading (see `ShardMap::touch`). A key that is
-/// not there is left alone. The key is found by its bytes, without asking
+/// `key` was read, or written, by a command whose use is written after it
+/// ([`used_after`]): its word is brought up to date, in place, with its
+/// shard locked for reading (see `ShardMap::touch`). A key that is not
+/// there is left alone. The key is found by its bytes, without asking
 /// whether they are UTF-8 (that check was a quarter of this).
 pub fn used(store: &Store, db: usize, key: &[u8], wrote: bool) {
     let track = track();

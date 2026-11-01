@@ -571,6 +571,44 @@ async fn run_replication_session(
     )
     .await?;
 
+    // ── Phase 3b: which release the master is ───────────────────────────
+    // A `FT.DROPINDEX … DD` in the stream is run as the master that sent it
+    // ran it: a 1.2.0 release candidate deleted the documents and left each
+    // replica to delete its own; 1.1 and before kept them (see
+    // `replication::dd_deleted_by`). Releases since send the deletes and
+    // never `DD`. A master that does not say is taken to have kept them.
+    send_command(&mut writer, &["INFO", "server"]).await?;
+    let head = guarded(
+        read_line(&mut reader),
+        timeout,
+        repl_state,
+        my_generation,
+        "INFO server",
+    )
+    .await?;
+    let mut master_version = None;
+    if let Some(len) = head.strip_prefix('$').and_then(|n| n.parse::<usize>().ok()) {
+        let mut body = vec![0u8; len + 2];
+        guarded(
+            reader.read_exact(&mut body),
+            timeout,
+            repl_state,
+            my_generation,
+            "INFO server",
+        )
+        .await?;
+        master_version = String::from_utf8_lossy(&body)
+            .lines()
+            .find_map(|line| line.strip_prefix("kividb_version:"))
+            .map(|version| version.trim().to_string());
+    }
+    repl_state.master_dd_deletes.store(
+        master_version
+            .as_deref()
+            .is_some_and(crate::replication::dd_deleted_by),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
     // ── Phase 4: PSYNC ───────────────────────────────────────────────────
     // If this node's dataset is a known position in a master's stream — it
     // was following one and lost the connection, or was restarted cleanly —
@@ -1410,6 +1448,12 @@ struct StagedSync {
 /// must not go on to replace the live dataset with whatever was read so far.
 fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync, SessionError> {
     let staging_store = store::new_store(databases);
+    // A key past its time is loaded all the same: the master's `DEL` of it
+    // is on its way, and the writes made to it before are in the stream.
+    // Nothing is swept meanwhile either (a replica's sweep deletes nothing,
+    // and this is a staging store; but the node's role can change under it).
+    let _hold = crate::expiry::hold();
+    let _loading = crate::expiry::Loading::start();
 
     let is_kividb = payload.len() >= 8 && payload[..8] == *crate::snapshot::KDB_MAGIC;
     let (dbs, expiries, index_schemas, dictionaries, functions) = if is_kividb {
@@ -1758,6 +1802,10 @@ impl ReplicationApplyEnv {
         use crate::commands::execute_command;
         let cmd_refs: Vec<&[u8]> = cmd.iter().map(|v| v.as_slice()).collect();
 
+        // A write the master made, or one the AOF holds, is applied to the
+        // keys as they were when it was made: none of them has expired here
+        // that the master has not said so of, by a `DEL` further on.
+        let _hold = crate::expiry::hold();
         let out = execute_command(Ctx {
             cmd: cmd_refs,
             store,
@@ -2401,10 +2449,12 @@ mod full_sync_guard_tests {
         );
     }
 
-    /// A key whose TTL ran out while the payload was in transit is gone on
-    /// arrival, not resurrected without a TTL.
+    /// A key whose TTL ran out while the payload was in transit is loaded
+    /// with its time, past as it is: not resurrected without a TTL, and not
+    /// deleted by the replica either. Its clients do not see it, and the
+    /// master's `DEL` of it is on its way (see `expiry`).
     #[test]
-    fn keys_already_expired_are_dropped_on_load() {
+    fn keys_already_expired_are_kept_for_the_masters_del() {
         let store = crate::store::new_store(1);
         for key in ["live", "dead"] {
             crate::store::get_shard(&store[0], key)
@@ -2418,12 +2468,10 @@ mod full_sync_guard_tests {
 
         let payload = crate::snapshot::full_sync_payload(&store, None).unwrap();
         let staged = load_full_sync_payload(&payload, 1).expect("payload loads");
-        assert_eq!(staged.keys, 1);
-        assert!(
-            !crate::store::get_shard(&staged.store[0], "dead")
-                .read()
-                .contains_key("dead")
-        );
+        assert_eq!(staged.keys, 2);
+        let shard = crate::store::get_shard(&staged.store[0], "dead").read();
+        assert_eq!(shard.expires("dead"), Some(past));
+        assert!(!shard.contains_key("dead"), "past its time to a reader");
     }
 }
 

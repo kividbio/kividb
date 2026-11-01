@@ -111,70 +111,190 @@ fn ft_dropindex(ctx: &mut Ctx) -> Option<Vec<u8>> {
         ));
     }
     let name = match std::str::from_utf8(cmd[1]) {
-        Ok(s) => s,
+        Ok(s) => s.to_string(),
         Err(_) => return Some(resp_error("ERR index name must be valid UTF-8")),
     };
 
+    // `DD` deletes the documents too. A server sends what it deleted as
+    // DELs, and the drop without `DD` (below), so a `DD` a replica or an AOF
+    // replay meets was written by a release before this one, and is run as
+    // that release ran it, where that can be known: 1.1 and before kept the
+    // documents; a 1.2.0 release candidate deleted them, and had each
+    // replica delete what it found. A replica knows which release its
+    // master is (`ReplState::master_dd_deletes`). An AOF does not say
+    // which release wrote a record, and one file can hold the records of
+    // several, so a replay keeps the documents: wrongly kept, a 1.2.0
+    // candidate's deleted documents come back and can be deleted again;
+    // wrongly deleted, a 1.1 server's documents would be lost.
+    let relaxed = std::sync::atomic::Ordering::Relaxed;
     let delete_documents = match &cmd[2..] {
         [] => false,
-        [dd] if dd.eq_ignore_ascii_case(b"DD") => true,
-        _ => return Some(resp_error("ERR syntax error")),
+        [dd] if dd.eq_ignore_ascii_case(b"DD") => {
+            !ctx.apply_replication
+                || (!crate::vector::DEFER_INDEXING.load(relaxed)
+                    && ctx.repl_state.master_dd_deletes.load(relaxed))
+        }
+        _ => return Some(resp_error("SEARCH_ARG_UNRECOGNIZED Unknown argument")),
     };
 
-    // The documents it covered, if they go too: found before the index goes,
-    // by its definition. They were kept whatever was asked (#162).
-    let documents: Vec<(usize, String)> = if delete_documents {
-        let store = ctx.index_store.read();
-        match store
-            .get(name)
-            .filter(|def| !crate::vector::is_alias(name, def))
-        {
-            Some(def) => {
-                let db = def.db_index;
-                let mut keys = Vec::new();
-                for shard in ctx.store[db].iter() {
-                    let map = shard.read();
-                    for (key, value) in map.iter() {
-                        let covered = def.prefixes.is_empty()
-                            || def.prefixes.iter().any(|p| key.starts_with(p.as_str()));
-                        if covered
-                            && crate::vector::doc_fields(&def.on, &def.fields, value).is_some()
-                        {
-                            keys.push((db, key.to_string()));
-                        }
-                    }
-                }
-                keys
-            }
-            None => Vec::new(),
-        }
-    } else {
-        Vec::new()
+    // The index's database, and what its documents are: taken from its
+    // definition, which is not held while the keys are looked through.
+    let found = ctx
+        .index_store
+        .read()
+        .get(&name)
+        .filter(|def| !crate::vector::is_alias(&name, def))
+        .map(|def| (def.db_index, def.on.clone(), def.prefixes.clone()));
+    let Some((db, on, prefixes)) = found else {
+        return Some(resp_error(&crate::commands::search::no_such_index(&name)));
     };
+    // The documents, if they go too: found before anything is deleted, one
+    // shard at a time.
+    let mut documents = Vec::new();
+    if delete_documents {
+        for shard in ctx.store[db].iter() {
+            let map = shard.read();
+            for (key, value) in map.iter() {
+                let covered =
+                    prefixes.is_empty() || prefixes.iter().any(|p| key.starts_with(p.as_str()));
+                if covered && crate::vector::is_document(&on, value) {
+                    documents.push(key.to_string());
+                }
+            }
+        }
+    }
+
+    // Replicas and the AOF get it as Redis 8.10 sends it: the documents
+    // deleted as DELs, and then the drop, without `DD`. A replica then
+    // deletes what its master deleted and nothing else, where it used to
+    // run `DD` itself and delete whatever its own copy of the index covered.
+    //
+    // The documents go a few at a time, each few a whole write of its own:
+    // the write gate and the order of their keys are held for them only, so
+    // a full resync or a checkpoint can cut between them, and writes to
+    // other keys go on, however many documents there are. The index goes
+    // last, as in Redis, so the state of this node after each record it
+    // sends is the state a replica reaches by applying it, and a `DD` cut
+    // short (the server killed part way, or a replica promoted with half
+    // of it) leaves the index there to run it again: the documents left
+    // are not orphaned. Dropping the index first would spare this node and
+    // its replicas taking each document out of it (about two seconds a
+    // million documents, measured), but not that.
+    //
+    // Each few is sent as one DEL of them all, where Redis sends a DEL of
+    // each: a record apiece cost more than the deletes themselves (half
+    // again as long, with the AOF on, for a million documents). In a
+    // cluster, one DEL names the keys of one slot only, as a command from a
+    // client would: a slot migration following the stream sends a command
+    // on by its first key. So the documents are taken a slot at a time.
+    //
+    // A replica sends the same to its own AOF, whatever its master sent, so
+    // that no `DD` is ever written again.
+    let propagate = crate::replication::write_is_observed(ctx);
+    let by_slot = propagate && ctx.cluster.enabled;
+    let slot_of = |key: &str| {
+        if by_slot {
+            crate::cluster::key_hash_slot(key.as_bytes())
+        } else {
+            0
+        }
+    };
+    if by_slot {
+        documents.sort_by_cached_key(|key| slot_of(key));
+    }
+    let nested = crate::write_gate::held_by_this_thread();
+    let mut deleted = 0usize;
+    let mut del: Vec<Vec<u8>> = Vec::new();
+    for chunk in documents.chunks(DROPINDEX_DOCUMENTS_PER_WRITE) {
+        let _gate = dropindex_write_gate(ctx, nested);
+        let _order = (propagate && !ctx.apply_replication)
+            .then(|| crate::write_order::lock_keys(db, chunk.iter().map(|k| k.as_bytes())));
+        let mut slot = chunk.first().map(|key| slot_of(key));
+        for key in chunk {
+            if by_slot && slot != Some(slot_of(key)) {
+                slot = Some(slot_of(key));
+                send_dels(ctx, db, &mut del);
+            }
+            // One that has expired is gone already, as any read finds it.
+            if crate::commands::helpers::is_expired(ctx.store, db, key) {
+                crate::commands::helpers::delete_key_if_expired(ctx.store, db, key);
+                continue;
+            }
+            if !crate::commands::helpers::delete_key(ctx.store, db, key) {
+                continue;
+            }
+            deleted += 1;
+            crate::vector::maybe_unindex(ctx.index_store, db, key);
+            crate::stats::record_rdb_change();
+            crate::keyspace_events::notify(
+                ctx.pubsub,
+                db,
+                crate::keyspace_events::KS_GENERIC,
+                "del",
+                key,
+            );
+            ctx.watch_registry.notify(db, key);
+            crate::commands::handler::invalidate_tracked_key(ctx, key, false);
+            if propagate {
+                if del.is_empty() {
+                    del.push(b"DEL".to_vec());
+                }
+                del.push(key.as_bytes().to_vec());
+            }
+        }
+        // Sent before the order of these keys is let go of.
+        send_dels(ctx, db, &mut del);
+    }
 
     // The index goes, and its aliases with it.
-    if !crate::vector::remove_index(&mut ctx.index_store.write(), name) {
-        return Some(resp_error("ERR no such index"));
-    }
-    // Then its documents. Not each as a DEL to replicas and the AOF: they
-    // run this command, and delete theirs.
-    for (db, key) in &documents {
-        if !crate::commands::helpers::delete_key(ctx.store, *db, key) {
-            continue;
+    let _gate = dropindex_write_gate(ctx, nested);
+    if !crate::vector::remove_index(&mut ctx.index_store.write(), &name) {
+        // Dropped meanwhile by another client, which sent the drop.
+        if deleted == 0 {
+            return Some(resp_error(&crate::commands::search::no_such_index(&name)));
         }
-        crate::vector::maybe_unindex(ctx.index_store, *db, key);
-        crate::stats::record_rdb_change();
-        crate::keyspace_events::notify(
-            ctx.pubsub,
-            *db,
-            crate::keyspace_events::KS_GENERIC,
-            "del",
-            key,
-        );
-        ctx.watch_registry.notify(*db, key);
-        crate::commands::handler::invalidate_tracked_key(ctx, key, false);
+        return Some(resp_simple("OK"));
+    }
+    if propagate {
+        propagate_in_db(ctx, db, &[b"FT.DROPINDEX".to_vec(), name.into_bytes()]);
     }
     Some(resp_simple("OK"))
+}
+
+/// How many documents `FT.DROPINDEX … DD` deletes under one hold of the
+/// write gate and of their keys' order.
+const DROPINDEX_DOCUMENTS_PER_WRITE: usize = 256;
+
+/// The write gate, for one part of an `FT.DROPINDEX`, which the handler
+/// leaves it to take (see `handler::run_command`): stepped out of while a
+/// handoff is under way, as the handler does for any other write. Inside a
+/// transaction or a script the gate is held already, and this takes nothing.
+fn dropindex_write_gate(ctx: &Ctx, nested: bool) -> crate::write_gate::WriteGuard {
+    let mut gate = crate::write_gate::enter();
+    while !nested && !ctx.apply_replication && crate::pause::handoff() {
+        drop(gate);
+        crate::pause::wait_out_handoff();
+        gate = crate::write_gate::enter();
+    }
+    gate
+}
+
+/// The DEL `del` holds, if it names a key, to replicas and the AOF; `del`
+/// is left empty.
+fn send_dels(ctx: &mut Ctx, db: usize, del: &mut Vec<Vec<u8>>) {
+    if del.len() > 1 {
+        propagate_in_db(ctx, db, del);
+    }
+    del.clear();
+}
+
+/// Hand `parts` to replicas and the AOF as a write made in database `db`,
+/// which need not be the one selected: an index's documents are in its own.
+fn propagate_in_db(ctx: &mut Ctx, db: usize, parts: &[Vec<u8>]) {
+    let selected = *ctx.selected_db;
+    *ctx.selected_db = db;
+    crate::replication::replicate_one_write(ctx, parts);
+    *ctx.selected_db = selected;
 }
 
 // ── FT.ALTER ─────────────────────────────────────────────────────────────────
@@ -266,7 +386,11 @@ fn ft_alter(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let mut store = ctx.index_store.write();
     let def = match store.get_mut(&index_name) {
         Some(d) => d,
-        None => return Some(resp_error("ERR no such index")),
+        None => {
+            return Some(resp_error(&crate::commands::search::no_such_index(
+                &index_name,
+            )));
+        }
     };
 
     // Check for duplicate field names — Redis rejects them
@@ -435,15 +559,40 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             }
         }
     }
-    let (filter, knn) = match crate::vector::filter::parse_query(&query_str, &params, &def) {
-        Ok(query) => (query.filter, query.knn),
-        Err(e) => return Some(resp_error(&e)),
+    // `VERBATIM`, `LANGUAGE` and `SCORER`, where an option may be.
+    let option = |name: &str| crate::commands::aggregate_pipeline::option_at(cmd, 3, name);
+    let value_of = |at: usize| cmd.get(at + 1).and_then(|a| std::str::from_utf8(a).ok());
+    let mut options = crate::vector::filter::QueryOptions {
+        verbatim: option("VERBATIM").is_some(),
+        language: None,
     };
+    if let Some(at) = option("LANGUAGE") {
+        match value_of(at).and_then(crate::vector::stem::Language::parse) {
+            Some(language) => options.language = Some(language),
+            None => return Some(resp_error("No such language")),
+        }
+    }
+    let scorer = match option("SCORER") {
+        Some(at) => match value_of(at).and_then(crate::vector::score::Scorer::parse) {
+            Some(scorer) => scorer,
+            None => {
+                return Some(resp_error(&format!(
+                    "No such scorer {}",
+                    value_of(at).unwrap_or_default()
+                )));
+            }
+        },
+        None => crate::vector::score::Scorer::default_scorer(),
+    };
+    let (filter, knn) =
+        match crate::vector::filter::parse_query_with(&query_str, &params, &def, options) {
+            Ok(query) => (query.filter, query.knn),
+            Err(e) => return Some(resp_error(&e)),
+        };
 
     // `ADDSCORES`: the relevance of each document, as `@__score`.
     let addscores = cmd.iter().any(|a| a.eq_ignore_ascii_case(b"ADDSCORES"));
-    let mut terms = ahash::AHashSet::new();
-    crate::commands::search::query_terms(&filter, &mut terms);
+    let scoring = crate::vector::score::Scoring::new(&def, &filter, scorer);
     let cursor = match crate::commands::search_tools::cursor_options(cmd) {
         Ok(cursor) => cursor,
         Err(e) => return Some(resp_error(&e)),
@@ -489,7 +638,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             row.insert(
                 "__score".to_string(),
                 crate::commands::search::number_text(crate::commands::search::relevance(
-                    &def, inner, &terms,
+                    &def, key, inner, &scoring,
                 )),
             );
         }
@@ -946,7 +1095,11 @@ fn ft_synupdate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let mut store = ctx.index_store.write();
     let def = match store.get_mut(&index_name) {
         Some(d) => d,
-        None => return Some(resp_error("ERR no such index")),
+        None => {
+            return Some(resp_error(&crate::commands::search::no_such_index(
+                &index_name,
+            )));
+        }
     };
 
     // entry().or_insert_with() is the idiomatic Rust "get or create" pattern.
@@ -998,7 +1151,11 @@ fn ft_syndump(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let store = ctx.index_store.read();
     let def = match store.get(index_name) {
         Some(d) => d,
-        None => return Some(resp_error("ERR no such index")),
+        None => {
+            return Some(resp_error(&crate::commands::search::no_such_index(
+                index_name,
+            )));
+        }
     };
 
     if def.synonyms.is_empty() {
@@ -1132,13 +1289,17 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // The vocab is maintained incrementally by maybe_index and backfill_index.
     // We clone the Arc to drop the IndexStore lock before doing the lookup
     // loop — keeps the fast path uncontended.
-    let vocab_arc = {
+    let text_arc = {
         let store = ctx.index_store.read();
         let def = match store.get(&index_name) {
             Some(d) => d,
-            None => return Some(resp_error("ERR no such index")),
+            None => {
+                return Some(resp_error(&crate::commands::search::no_such_index(
+                    &index_name,
+                )));
+            }
         };
-        Arc::clone(&def.vocab)
+        Arc::clone(&def.text)
     };
 
     // Take a read lock on the vocab itself. We need to convert it into a
@@ -1148,10 +1309,7 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
     //
     // The vocab is then a local owned BTreeSet; we drop the read lock before
     // any further work so concurrent HSETs can keep updating the index.
-    let mut vocab: BTreeSet<String> = {
-        let v = vocab_arc.read();
-        v.clone()
-    };
+    let mut vocab: BTreeSet<String> = text_arc.read().words().map(str::to_string).collect();
 
     // AFTER the vocab-building loop over shards,
     // this block is used to merge in any INCLUDE dicts and remove EXCLUDE dicts.
@@ -1329,10 +1487,8 @@ impl<'a> FilteredKnn<'a> {
                     return;
                 };
                 let nodes = idx.nodes.read();
-                match nodes.get(id) {
-                    Some(n) if !n.vector.is_empty() && n.vector.len() == dim => {
-                        self.query.to_unit(&n.vector)
-                    }
+                match idx.vector_of(&nodes, id, key) {
+                    Some(v) if v.len() == dim => self.query.to_unit(v),
                     _ => return,
                 }
             }
@@ -1491,7 +1647,7 @@ pub(crate) fn knn_planned(
             return Some((nearest, cut));
         }
         for key in gone {
-            if let Some(id) = def.postings.read().id(key) {
+            if let Some(id) = def.postings.peek().id(key) {
                 plan.ids.unset(id);
             }
             crate::vector::maybe_unindex(ctx.index_store, def.db_index, key);
@@ -1530,9 +1686,11 @@ fn knn_among(
             let mut admit = |node: &crate::vector::HnswNode| {
                 let mut doc = node.doc.load(Relaxed);
                 if doc == crate::vector::postings::NO_DOC {
-                    // Not known yet (a compaction or a snapshot made the
-                    // node): looked up once, and kept.
-                    match def.postings.read().id(&node.key) {
+                    // Not known yet (a compaction, a snapshot, or a write
+                    // that was queued made the node): looked up once, and
+                    // kept. A document written before the query began has
+                    // its id: the query's plan applied the queue.
+                    match def.postings.peek().id(&node.key) {
                         Some(id) => {
                             node.doc.store(id, Relaxed);
                             doc = id;
@@ -1603,10 +1761,10 @@ fn knn_measured(
                 };
                 let nodes = graph.nodes.read();
                 for (id, key) in found {
-                    if let Some(node) = nodes.get(id)
-                        && node.vector.len() == dim
+                    if let Some(v) = graph.vector_of(&nodes, id, key)
+                        && v.len() == dim
                     {
-                        best.offer(query.to_unit(&node.vector), key);
+                        best.offer(query.to_unit(v), key);
                     }
                 }
             }
@@ -1796,7 +1954,7 @@ fn ft_alias_add(ctx: &mut Ctx) -> Option<Vec<u8>> {
     }
     // The target may itself be given by alias.
     let Some(real) = crate::vector::resolve_index_name(&store, &index) else {
-        return Some(resp_error("ERR no such index"));
+        return Some(resp_error(&crate::commands::search::no_such_index(&index)));
     };
     let def = store[&real].clone();
     crate::vector::set_alias(&mut store, &alias, &def);
@@ -1841,7 +1999,7 @@ fn ft_alias_update(ctx: &mut Ctx) -> Option<Vec<u8>> {
         return Some(resp_error("ERR Alias already exists as an index name"));
     }
     let Some(real) = crate::vector::resolve_index_name(&store, &index) else {
-        return Some(resp_error("ERR no such index"));
+        return Some(resp_error(&crate::commands::search::no_such_index(&index)));
     };
     let def = store[&real].clone();
     crate::vector::set_alias(&mut store, &alias, &def);
@@ -1868,7 +2026,7 @@ fn ft_alias_list(ctx: &mut Ctx) -> Option<Vec<u8>> {
         .get(index)
         .is_none_or(|def| crate::vector::is_alias(index, def))
     {
-        return Some(resp_error("ERR no such index"));
+        return Some(resp_error(&crate::commands::search::no_such_index(index)));
     }
     let aliases: Vec<Vec<u8>> = crate::vector::index_aliases(&store, index)
         .iter()
@@ -1997,6 +2155,7 @@ fn ft_debug(ctx: &mut Ctx) -> Option<Vec<u8>> {
     match sub.as_str() {
         "COMPACT" => ft_debug_compact(ctx),
         "POSTINGS" => ft_debug_postings(ctx),
+        "PAGE" => ft_debug_page(ctx),
         _ => Some(resp_error(&format!(
             "ERR unknown FT.DEBUG subcommand '{sub}'"
         ))),
@@ -2020,6 +2179,24 @@ fn ft_debug_postings(ctx: &mut Ctx) -> Option<Vec<u8>> {
     Some(resp_simple("OK"))
 }
 
+/// `FT.DEBUG PAGE index ON|OFF`: whether a query whose page the postings
+/// know reads only the documents of that page (`search::page_from_postings`)
+/// or every document it matches, for comparing the two.
+fn ft_debug_page(ctx: &mut Ctx) -> Option<Vec<u8>> {
+    let cmd = &ctx.cmd;
+    let on = match cmd.get(3) {
+        Some(w) if cmd.len() == 4 && w.eq_ignore_ascii_case(b"ON") => true,
+        Some(w) if cmd.len() == 4 && w.eq_ignore_ascii_case(b"OFF") => false,
+        _ => return Some(resp_error("ERR syntax: FT.DEBUG PAGE <index> ON|OFF")),
+    };
+    let name = String::from_utf8_lossy(cmd[2]).into_owned();
+    let Some(def) = ctx.index_store.read().get(&name).cloned() else {
+        return Some(resp_error(&crate::commands::search::no_such_index(&name)));
+    };
+    def.postings.write().read_all = !on;
+    Some(resp_simple("OK"))
+}
+
 fn ft_debug_compact(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let cmd = &ctx.cmd;
     if cmd.len() != 4 {
@@ -2038,7 +2215,11 @@ fn ft_debug_compact(ctx: &mut Ctx) -> Option<Vec<u8>> {
         let store = ctx.index_store.read();
         let def = match store.get(&index_name) {
             Some(d) => d,
-            None => return Some(resp_error("ERR no such index")),
+            None => {
+                return Some(resp_error(&crate::commands::search::no_such_index(
+                    &index_name,
+                )));
+            }
         };
         match def.indexes.get(&field_name) {
             Some(crate::vector::LiveIndex::Hnsw(_)) => {}

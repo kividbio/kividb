@@ -6030,7 +6030,7 @@ pub(super) const TABLE: &[(&str, Docs)] = &[
     }),
     ("CLUSTER|SYNCSLOTS", Docs {
         summary: "A container for internal slot migration commands.",
-        since: "9.0.0",
+        since: "",
         group: "cluster",
         complexity: "Depends on subcommand.",
         module: None,
@@ -17208,7 +17208,7 @@ pub(super) const TABLE: &[(&str, Docs)] = &[
     }),
     ("HEXPIRE", Docs {
         summary: "Sets expiry time on hash fields.",
-        since: "9.0.0",
+        since: "7.4.0",
         group: "hash",
         complexity: "O(N) where N is the number of specified fields.",
         module: None,
@@ -17344,7 +17344,7 @@ pub(super) const TABLE: &[(&str, Docs)] = &[
     }),
     ("HEXPIREAT", Docs {
         summary: "Sets expiry time on hash fields.",
-        since: "9.0.0",
+        since: "7.4.0",
         group: "hash",
         complexity: "O(N) where N is the number of specified fields.",
         module: None,
@@ -17480,7 +17480,7 @@ pub(super) const TABLE: &[(&str, Docs)] = &[
     }),
     ("HEXPIRETIME", Docs {
         summary: "Returns Unix timestamps in seconds since the epoch at which the given key's field(s) will expire.",
-        since: "9.0.0",
+        since: "7.4.0",
         group: "hash",
         complexity: "O(N) where N is the number of specified fields.",
         module: None,
@@ -17607,7 +17607,7 @@ pub(super) const TABLE: &[(&str, Docs)] = &[
     }),
     ("HGETDEL", Docs {
         summary: "Returns the values of one or more fields and deletes them from a hash.",
-        since: "9.1.0",
+        since: "8.0.0",
         group: "hash",
         complexity: "O(N) where N is the number of fields to be retrieved and deleted.",
         module: None,
@@ -17670,7 +17670,7 @@ pub(super) const TABLE: &[(&str, Docs)] = &[
     }),
     ("HGETEX", Docs {
         summary: "Gets the value of one or more fields of a given hash key, and optionally sets their expiration time or time-to-live (TTL).",
-        since: "9.0.0",
+        since: "8.0.0",
         group: "hash",
         complexity: "O(N) where N is the number of specified fields.",
         module: None,
@@ -18400,7 +18400,7 @@ pub(super) const TABLE: &[(&str, Docs)] = &[
     }),
     ("HPERSIST", Docs {
         summary: "Remove the existing expiration on a hash key's field(s).",
-        since: "9.0.0",
+        since: "7.4.0",
         group: "hash",
         complexity: "O(N) where N is the number of specified fields.",
         module: None,
@@ -18463,7 +18463,7 @@ pub(super) const TABLE: &[(&str, Docs)] = &[
     }),
     ("HPEXPIRE", Docs {
         summary: "Sets expiry time on hash object.",
-        since: "9.0.0",
+        since: "7.4.0",
         group: "hash",
         complexity: "O(N) where N is the number of specified fields.",
         module: None,
@@ -18599,7 +18599,7 @@ pub(super) const TABLE: &[(&str, Docs)] = &[
     }),
     ("HPEXPIREAT", Docs {
         summary: "Sets expiration time on hash field.",
-        since: "9.0.0",
+        since: "7.4.0",
         group: "hash",
         complexity: "O(N) where N is the number of specified fields.",
         module: None,
@@ -18735,7 +18735,7 @@ pub(super) const TABLE: &[(&str, Docs)] = &[
     }),
     ("HPEXPIRETIME", Docs {
         summary: "Returns the Unix timestamp in milliseconds since Unix epoch at which the given key's field(s) will expire.",
-        since: "9.0.0",
+        since: "7.4.0",
         group: "hash",
         complexity: "O(N) where N is the number of specified fields.",
         module: None,
@@ -18798,7 +18798,7 @@ pub(super) const TABLE: &[(&str, Docs)] = &[
     }),
     ("HPTTL", Docs {
         summary: "Returns the remaining time to live in milliseconds of a hash key's field(s) that have an associated expiration.",
-        since: "9.0.0",
+        since: "7.4.0",
         group: "hash",
         complexity: "O(N) where N is the number of specified fields.",
         module: None,
@@ -19063,7 +19063,7 @@ pub(super) const TABLE: &[(&str, Docs)] = &[
     }),
     ("HSETEX", Docs {
         summary: "Sets the value of one or more fields of a given hash key, and optionally sets their expiration time.",
-        since: "9.0.0",
+        since: "8.0.0",
         group: "hash",
         complexity: "O(N) where N is the number of specified fields.",
         module: None,
@@ -19386,7 +19386,7 @@ pub(super) const TABLE: &[(&str, Docs)] = &[
     }),
     ("HTTL", Docs {
         summary: "Returns the remaining time to live (in seconds) of a hash key's field(s) that have an associated expiration.",
-        since: "9.0.0",
+        since: "7.4.0",
         group: "hash",
         complexity: "O(N) where N is the number of specified fields.",
         module: None,
@@ -22967,7 +22967,7 @@ pub(super) const TABLE: &[(&str, Docs)] = &[
     }),
     ("MSETEX", Docs {
         summary: "Atomically creates or modifies the string values of one or more keys, and optionally set their expiration.",
-        since: "9.1.0",
+        since: "8.4.0",
         group: "string",
         complexity: "O(N) where N is the number of keys to set.",
         module: None,

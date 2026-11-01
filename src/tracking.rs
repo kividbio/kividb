@@ -529,10 +529,15 @@ pub fn register_for(
 /// `key` has expired and been removed: the clients caching it are told.
 #[inline]
 pub fn expired(store: &crate::store::Store, key: &str) {
+    expired_in(store_id(store), key);
+}
+
+/// [`expired`], for the store at address `id`.
+#[inline]
+pub fn expired_in(id: usize, key: &str) {
     if TRACKING_CLIENT_COUNT.load(Ordering::Relaxed) == 0 {
         return;
     }
-    let id = store_id(store);
     let server = SERVERS
         .read()
         .iter()

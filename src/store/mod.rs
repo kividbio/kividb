@@ -6,11 +6,13 @@ use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::available_parallelism;
 
+mod access;
 mod entry;
 mod shard_map;
+pub use access::AccessScope;
 #[allow(unused_imports)] // Not every item is named outside the store yet.
 pub use shard_map::{
-    EntryRef, EntryView, Leftover, NewEntry, Relocated, ShardMap, StrRef, Taken, ValueRef,
+    EntryRef, EntryView, Leftover, Relocated, ShardMap, StrRef, Taken, ValueRef, Written,
 };
 
 /// Which shard `key` is in, of `shards` (a power of two).
@@ -74,15 +76,18 @@ pub struct ShardLock {
     ttls: AtomicUsize,
     /// Whether `map` holds any key, as of the last writer to let go.
     keys: AtomicBool,
+    /// The store (its address) and database this shard is in, for what is
+    /// done about keys past their time that a write puts a value over
+    /// (`expiry::written_over`).
+    place: std::sync::OnceLock<(usize, usize)>,
 }
 
 /// The write lock of a [`ShardLock`]. It is the table, and on the way out
 /// it leaves the count of keys with a time to live where a reader can see
 /// it without the lock.
 pub struct ShardWrite<'a> {
-    map: parking_lot::RwLockWriteGuard<'a, ShardMap>,
-    ttls: &'a AtomicUsize,
-    keys: &'a AtomicBool,
+    map: std::mem::ManuallyDrop<parking_lot::RwLockWriteGuard<'a, ShardMap>>,
+    lock: &'a ShardLock,
 }
 
 impl std::ops::Deref for ShardWrite<'_> {
@@ -103,15 +108,38 @@ impl std::ops::DerefMut for ShardWrite<'_> {
 impl Drop for ShardWrite<'_> {
     #[inline(always)]
     fn drop(&mut self) {
-        // Before the lock is released (the guard is dropped after this).
-        // Its line is this thread's already: the lock's word is beside it.
+        // Before the lock is released. Its line is this thread's already:
+        // the lock's word is beside it.
+        self.map.unpin_now();
         let ttls = self.map.ttl_len();
-        if self.ttls.load(Ordering::Relaxed) != ttls {
-            self.ttls.store(ttls, Ordering::Release);
+        if self.lock.ttls.load(Ordering::Relaxed) != ttls {
+            self.lock.ttls.store(ttls, Ordering::Release);
         }
         let keys = !self.map.is_empty();
-        if self.keys.load(Ordering::Relaxed) != keys {
-            self.keys.store(keys, Ordering::Release);
+        if self.lock.keys.load(Ordering::Relaxed) != keys {
+            self.lock.keys.store(keys, Ordering::Release);
+        }
+        if self.map.wrote_over_expired() {
+            return self.unlock_and_announce();
+        }
+        // SAFETY: dropped once, here; `map` is not used after.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.map) };
+    }
+}
+
+impl ShardWrite<'_> {
+    /// Let go of the shard, then expire the keys past their time that
+    /// writes under the lock put new values over: their events, watches,
+    /// caches and indexes, and their `DEL` propagated, all before the
+    /// write's own (`expiry::written_over`).
+    #[cold]
+    #[inline(never)]
+    fn unlock_and_announce(&mut self) {
+        let keys = self.map.take_written_over();
+        // SAFETY: dropped once, here, from `drop`; `map` is not used after.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.map) };
+        if let Some(&(store, db)) = self.lock.place.get() {
+            crate::expiry::written_over(store, db, &keys);
         }
     }
 }
@@ -122,6 +150,7 @@ impl ShardLock {
             ttls: AtomicUsize::new(map.ttl_len()),
             keys: AtomicBool::new(!map.is_empty()),
             map: RwLock::new(map),
+            place: std::sync::OnceLock::new(),
         }
     }
 
@@ -132,10 +161,11 @@ impl ShardLock {
 
     #[inline(always)]
     pub fn write(&self) -> ShardWrite<'_> {
+        let mut map = self.map.write();
+        map.pin_now();
         ShardWrite {
-            map: self.map.write(),
-            ttls: &self.ttls,
-            keys: &self.keys,
+            map: std::mem::ManuallyDrop::new(map),
+            lock: self,
         }
     }
 
@@ -236,7 +266,14 @@ pub fn new_store(dbs: usize) -> Store {
         })
         .collect::<Vec<_>>();
 
-    Arc::new(dbs)
+    let store = Arc::new(dbs);
+    let id = Arc::as_ptr(&store) as *const () as usize;
+    for (db, shards) in store.iter().enumerate() {
+        for shard in shards.iter() {
+            let _ = shard.place.set((id, db));
+        }
+    }
+    store
 }
 
 macro_rules! mem_swap_rwlock_maps {
@@ -704,31 +741,41 @@ mod shard_lock_tests {
         assert!(!cell.holds_no_keys());
         cell.write().remove("k");
         assert!(cell.holds_no_keys());
+        // Times to come: a key past its time is absent to these writes.
+        let t = u64::MAX / 2;
 
-        cell.write().insert_expiring("a", s(), Some(5));
+        cell.write().insert_expiring("a", s(), Some(t + 5));
         assert!(!cell.holds_no_ttl());
 
         cell.write().insert_str("b", b"x");
-        cell.write().set_expires("b", 9);
+        cell.write().set_expires("b", t + 9);
         assert_eq!(cell.ttl_count(), 2);
         cell.write().remove("a");
         assert!(!cell.holds_no_ttl());
         // An overwrite keeps it; one that says so takes it away.
         cell.write().insert("b", s());
-        assert_eq!(cell.read().expires("b"), Some(9));
+        assert_eq!(cell.read().expires("b"), Some(t + 9));
         cell.write().insert_expiring("b", s(), None);
         assert!(cell.holds_no_ttl());
 
-        cell.write().insert_expiring("c", s(), Some(1));
+        cell.write().insert_expiring("c", s(), Some(t + 1));
         assert!(cell.write().persist("c"));
         assert!(cell.holds_no_ttl());
-        cell.write().set_expires("c", 3);
+        cell.write().set_expires("c", t + 3);
         cell.write().clear();
         assert!(cell.holds_no_ttl());
 
+        // A write over a key past its time takes the old time away.
+        cell.write().insert_expiring("d", s(), Some(1));
+        assert_eq!(cell.ttl_count(), 1);
+        cell.write().insert("d", s());
+        assert!(cell.holds_no_ttl());
+        assert_eq!(cell.read().expires("d"), None);
+        cell.write().clear();
+
         // Swapped whole, as SWAPDB and a flush do.
         let other = ShardLock::default();
-        other.write().insert_expiring("c", s(), Some(2));
+        other.write().insert_expiring("c", s(), Some(t + 2));
         std::mem::swap(&mut *cell.write(), &mut *other.write());
         assert!(!cell.holds_no_ttl());
         assert!(other.holds_no_ttl());

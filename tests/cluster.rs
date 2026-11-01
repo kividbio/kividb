@@ -1345,6 +1345,50 @@ fn index_definitions_reach_every_master() {
     }));
 }
 
+/// `FT.DROPINDEX … DD` run on one master deletes the documents every
+/// master holds, and only those. Asked again, of an index every master has
+/// dropped, a node answers as Redis 8 does, and the others' same answer is
+/// not taken for a failure to apply it.
+#[test]
+fn dropindex_dd_deletes_the_documents_on_every_master() {
+    let (nodes, ranges) = form_cluster(3);
+    let r = nodes[0].conn().cmd(&[
+        "FT.CREATE",
+        "dd",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "dd:",
+        "SCHEMA",
+        "title",
+        "TEXT",
+    ]);
+    assert!(r.is_ok(), "{r:?}");
+    let mut keys = Vec::new();
+    for (node, range) in nodes.iter().zip(&ranges) {
+        let doc = key_in(range.0..=range.1, "dd");
+        let kept = key_in(range.0..=range.1, "kept");
+        assert_eq!(node.conn().cmd(&["HSET", &doc, "title", "hi"]).int(), 1);
+        assert_eq!(node.conn().cmd(&["HSET", &kept, "title", "hi"]).int(), 1);
+        keys.push((doc, kept));
+    }
+
+    let r = nodes[1].conn().cmd(&["FT.DROPINDEX", "dd", "DD"]);
+    assert!(r.is_ok(), "{r:?}");
+    for (node, (doc, kept)) in nodes.iter().zip(&keys) {
+        assert_eq!(node.conn().cmd(&["EXISTS", doc]).int(), 0, "{doc}");
+        assert_eq!(node.conn().cmd(&["EXISTS", kept]).int(), 1, "{kept}");
+    }
+
+    let r = nodes[2].conn().cmd(&["FT.DROPINDEX", "dd"]);
+    assert_eq!(
+        r.err(),
+        Some("SEARCH_INDEX_NOT_FOUND Index not found: dd"),
+        "{r:?}"
+    );
+}
+
 // ── Failover ──────────────────────────────────────────────────────────────────
 
 /// The whole arc: a master dies, the other masters agree it has failed, its

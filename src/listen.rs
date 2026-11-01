@@ -185,6 +185,30 @@ impl Drop for PortWatch {
     }
 }
 
+/// Stop the io_uring workers' ports from taking connections: the process is
+/// shutting down (`SHUTDOWN`, SIGTERM, SIGINT).
+///
+/// The kernel does not let go of a socket that an io_uring accept is waiting
+/// on when the process ends: it does when it tears the ring down, after the
+/// process is gone, and until then the port takes connections for nobody.
+/// A client that connected in that moment, as a restart was awaited, held a
+/// connection that was reset before the new server answered on it.
+/// A socket shut down listens no more, and the accept waiting on it ends.
+///
+/// The TLS port's loop is Tokio's, whose socket is closed with the process.
+#[cfg(target_os = "linux")]
+pub fn stop_uring_ports() {
+    let ports: Vec<_> = SERVERS
+        .lock()
+        .values()
+        .filter(|port| port.reuse_port)
+        .cloned()
+        .collect();
+    for port in ports {
+        port.shut_old(Vec::new());
+    }
+}
+
 /// `CONFIG SET port` or `tls-port`: listen on `port` instead, or on none
 /// for 0, or say why not.
 pub fn move_to(server: Server, kind: Kind, port: u16) -> Result<(), String> {

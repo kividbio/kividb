@@ -22,6 +22,7 @@ top of it.
 | `dbfilename` | Always `dump.kdb` (`dump.rdb` is accepted). Any other name is refused. |
 | `appendfilename` | Always `appendonly.aof`. Any other name is refused. |
 | `auto-aof-rewrite-percentage`, `auto-aof-rewrite-min-size` | When the AOF has grown by this percentage (default 100) over its size after the last checkpoint, and is at least this size (default 64 MB), a checkpoint runs. Checked every 10 seconds. `0` turns it off. Both can be changed with `CONFIG SET`. |
+| `hll-write-format` | `legacy` (the default) or `redis`. New HyperLogLog values use that format; existing values keep theirs. Per server, set in the config file or with `CONFIG SET`, and written by `CONFIG REWRITE`. See below before switching. |
 
 ## Checkpoints
 
@@ -80,6 +81,28 @@ what to do.
 
 Replay runs each command as the replica applier does, so a replayed write is
 neither sent to replicas nor appended again to the file it came from.
+
+### HyperLogLogs and `hll-write-format`
+
+`hll-write-format` is read from the configuration before the AOF is replayed,
+so a replayed `PFADD` or `PFMERGE` that creates a key writes it in the
+configured format. Values already in the snapshot or the log keep the format
+they were written in, whether that is KiviDB's legacy dense form or Redis's
+dense or sparse form; the setting only chooses the format of new values.
+
+A legacy HLL and a Redis one index different hash spaces. Changing the setting
+does not convert existing values, and there is no conversion that preserves
+their elements. `PFMERGE` and multi-key `PFCOUNT` therefore refuse a mixture.
+Set `redis` on every node of a deployment before expecting new keys to be
+interchangeable, and keep every node on `legacy` until all of them run a
+release that knows this setting.
+
+`PFADD` and `PFMERGE` are replayed and replicated as commands, not as values,
+so a replica applies them with its own `hll-write-format`. A master and its
+replicas must agree on it: a replica with a different setting creates a key in
+a different format, and a later operation across those keys is refused. The
+same applies to restoring an AOF written under another setting — the commands
+are valid, but keys created during the replay follow the setting in effect.
 
 Two things keep replay fast:
 

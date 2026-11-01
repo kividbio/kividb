@@ -9,6 +9,8 @@
 //   ~hello                          optional: restricts nothing
 //   "hello world"                   the two words, adjacent, in that order
 //   hel*   *llo   *ell*   %helo%    prefix, suffix, infix, fuzzy
+//                                   (a bare word also finds its stem:
+//                                   see `Parser::exact` and `stem`)
 //   @title:hello                    in that field
 //   @title|body:(hello | world)     in either field; any expression inside
 //   @tag:{a | b}   @tag:{pre*}      TAG: any of; prefix
@@ -23,6 +25,7 @@
 // `(-@k:{tenantB})=>[KNN …]` returned tenant B's documents, and a
 // `VECTOR_RANGE` query returned nothing at all without saying why.
 
+use super::stem::Language;
 use super::{DistanceMetric, FieldType, IndexDef, SchemaField, VectorType};
 use ahash::AHashMap;
 
@@ -60,12 +63,39 @@ pub enum TextMatch {
     Infix(String),
     /// Within this many edits.
     Fuzzy(String, usize),
+    /// A word whose stem the index holds is this one: the `+stem` a query's
+    /// word is expanded with (see `stem`).
+    Stem(Box<StemMatch>),
+    /// The bare stem a query's word is expanded with, where it differs from
+    /// the word: matched as [`TextMatch::Exact`] is.
+    Expanded(String),
+}
+
+/// What [`TextMatch::Stem`] needs to tell whether a document's word has the
+/// stem: the language its words were stemmed in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StemMatch {
+    pub stem: String,
+    /// The index's language.
+    pub language: Language,
+    /// `LANGUAGE_FIELD`: where a document's own language is.
+    pub language_field: Option<String>,
+    /// Fields of the clause that are `NOSTEM`: they hold no stems.
+    pub nostem: Vec<String>,
+}
+
+impl StemMatch {
+    /// Whether a word of a document in `language` was indexed with this stem.
+    fn has(&self, language: Language, token: &str) -> bool {
+        super::stem::index_stem(language, token).is_some_and(|s| s == self.stem)
+    }
 }
 
 impl TextMatch {
-    fn matches(&self, token: &str) -> bool {
+    pub(crate) fn matches(&self, token: &str) -> bool {
         match self {
-            TextMatch::Exact(t) => token == t,
+            TextMatch::Exact(t) | TextMatch::Expanded(t) => token == t,
+            TextMatch::Stem(stem) => stem.has(stem.language, token),
             TextMatch::Prefix(p) => token.starts_with(p.as_str()),
             TextMatch::Suffix(s) => token.ends_with(s.as_str()),
             TextMatch::Infix(s) => token.contains(s.as_str()),
@@ -203,6 +233,16 @@ impl HybridPolicy {
     }
 }
 
+/// What a query's words are looked for as, beyond themselves: `VERBATIM`
+/// and `LANGUAGE` of FT.SEARCH and FT.AGGREGATE.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct QueryOptions {
+    /// Words are not expanded with their stems.
+    pub verbatim: bool,
+    /// The language to stem the query's words in: the index's if `None`.
+    pub language: Option<Language>,
+}
+
 /// A parsed query.
 #[derive(Debug, Clone)]
 pub struct Query {
@@ -215,6 +255,16 @@ pub struct Query {
 /// Parse `query` against the schema of `def`, taking `$name` values from
 /// `params`. `Err` is the message for the client.
 pub fn parse_query(query: &str, params: &Params, def: &IndexDef) -> Result<Query, String> {
+    parse_query_with(query, params, def, QueryOptions::default())
+}
+
+/// [`parse_query`], with `VERBATIM` and `LANGUAGE` as given.
+pub fn parse_query_with(
+    query: &str,
+    params: &Params,
+    def: &IndexDef,
+    options: QueryOptions,
+) -> Result<Query, String> {
     let mut parser = Parser {
         src: query,
         pos: 0,
@@ -222,6 +272,8 @@ pub fn parse_query(query: &str, params: &Params, def: &IndexDef) -> Result<Query
         def,
         clauses: 0,
         depth: 0,
+        verbatim: options.verbatim,
+        language: options.language.unwrap_or(def.language.language),
     };
     parser.skip_ws();
     let filter = if parser.at_end() {
@@ -275,6 +327,10 @@ struct Parser<'a> {
     clauses: usize,
     /// How deep in parentheses, `-` and `~` the parse is.
     depth: u32,
+    /// `VERBATIM`: words are not expanded with their stems.
+    verbatim: bool,
+    /// The language the query's words are stemmed in.
+    language: Language,
 }
 
 /// The most clauses a query may have, and the deepest it may nest. A query is
@@ -884,7 +940,60 @@ impl<'a> Parser<'a> {
     /// groups were kept and searched with nothing (#130). Being the query's,
     /// the expansion finds documents indexed before the group was made, as
     /// RediSearch's rescan does.
-    fn exact(&self, fields: &[String], word: String) -> Filter {
+    ///
+    /// Then, as RediSearch's default expander does, the word is also looked
+    /// for as its stem: `word | +stem`, and `| stem` if the stem differs
+    /// from the word (`preferences | +prefer | prefer`). Not under
+    /// `VERBATIM`, nor for a clause in `NOSTEM` fields only, nor for a word
+    /// that is a number given as a parameter (`expand` false). A clause that
+    /// names its fields is expanded in those that stem; one that names none,
+    /// in all of them, as in RediSearch.
+    fn exact(&self, fields: &[String], scoped: bool, word: String, expand: bool) -> Filter {
+        let base = self.synonyms(fields, word.clone());
+        if !expand || self.verbatim {
+            return base;
+        }
+        let nostem = |name: &String| {
+            self.def
+                .fields
+                .iter()
+                .any(|f| f.name == *name && f.options.nostem)
+        };
+        let stem_fields: Vec<String> = if scoped {
+            fields.iter().filter(|f| !nostem(f)).cloned().collect()
+        } else {
+            fields.to_vec()
+        };
+        if stem_fields.is_empty() {
+            return base;
+        }
+        let Some(stem) = self.language.stem(&word) else {
+            return base;
+        };
+        let stemmed = Filter::Text {
+            fields: stem_fields.clone(),
+            term: TextMatch::Stem(Box::new(StemMatch {
+                stem: stem.clone(),
+                language: self.def.language.language,
+                language_field: self.def.language.field.clone(),
+                nostem: stem_fields.iter().filter(|f| nostem(f)).cloned().collect(),
+            })),
+        };
+        let mut node = Filter::Or(Box::new(base), Box::new(stemmed));
+        if stem != word {
+            node = Filter::Or(
+                Box::new(node),
+                Box::new(Filter::Text {
+                    fields: stem_fields,
+                    term: TextMatch::Expanded(stem),
+                }),
+            );
+        }
+        node
+    }
+
+    /// The word, or any word of the synonym groups it is in.
+    fn synonyms(&self, fields: &[String], word: String) -> Filter {
         let mut words = vec![word];
         for group in self.def.synonyms.values() {
             if group
@@ -945,7 +1054,9 @@ impl<'a> Parser<'a> {
             if word.is_empty() || self.def.is_stopword(&word) {
                 return Ok(None);
             }
-            return Ok(Some(self.exact(&fields, word)));
+            // A number given as a parameter is not stemmed, as in RediSearch.
+            let expand = word.parse::<f64>().is_err();
+            return Ok(Some(self.exact(&fields, scope.is_some(), word, expand)));
         }
 
         // %word% — one edit per pair of percent signs, up to three.
@@ -999,7 +1110,7 @@ impl<'a> Parser<'a> {
         let Some(first) = tokens.next() else {
             return Ok(None);
         };
-        let text = |token: String| self.exact(&fields, token);
+        let text = |token: String| self.exact(&fields, scope.is_some(), token, true);
         Ok(Some(
             tokens.fold(text(first), |acc, token| acc.and(text(token))),
         ))
@@ -1198,6 +1309,30 @@ pub fn eval(filter: &Filter, doc: &dyn Doc) -> bool {
             numeric_value(doc, field).is_some_and(|n| n != *value)
         }
 
+        Filter::Text {
+            fields,
+            term: TextMatch::Stem(stem),
+        } => {
+            // The language the document's words were stemmed in.
+            let language = stem
+                .language_field
+                .as_deref()
+                .and_then(|f| doc.field_bytes(f))
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .and_then(Language::parse)
+                .unwrap_or(stem.language);
+            fields
+                .iter()
+                .filter(|field| !stem.nostem.contains(field))
+                .any(|field| {
+                    doc.field_bytes(field)
+                        .and_then(|b| std::str::from_utf8(b).ok())
+                        .is_some_and(|text| {
+                            super::tokenize_for_vocab(text).any(|tok| stem.has(language, &tok))
+                        })
+                })
+        }
+
         Filter::Text { fields, term } => fields.iter().any(|field| {
             doc.field_bytes(field)
                 .and_then(|b| std::str::from_utf8(b).ok())
@@ -1280,6 +1415,7 @@ mod tests {
             aliases: vec![],
             stopwords: None,
             synonyms: Default::default(),
+            language: Default::default(),
         }
         .into_def()
     }
@@ -1359,6 +1495,29 @@ mod tests {
         assert!(matches("%quikc%%", &d) || matches("%%quikc%%", &d));
         assert!(matches("%quic%", &d));
         assert!(!matches("%qu%", &d));
+    }
+
+    #[test]
+    fn words_are_found_by_their_stems() {
+        let d = [("title", "I prefer email"), ("body", "running dogs")];
+        assert!(matches("@title:preferences", &d));
+        assert!(matches("preferred", &d));
+        assert!(matches("@body:dog", &d));
+        assert!(matches("@body:run", &d));
+        assert!(matches("runs", &d));
+        assert!(!matches("@title:dog", &d));
+        let verbatim = |query: &str| {
+            let def = schema();
+            let options = QueryOptions {
+                verbatim: true,
+                language: None,
+            };
+            let parsed = parse_query_with(query, &Params::new(), &def, options).unwrap();
+            eval(&parsed.filter, &doc(&d))
+        };
+        assert!(!verbatim("@title:preferences"));
+        assert!(verbatim("@title:prefer"));
+        assert!(!verbatim("@body:dog"));
     }
 
     #[test]
