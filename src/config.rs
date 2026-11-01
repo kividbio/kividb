@@ -1910,6 +1910,21 @@ mod config_file_tests {
         Ok((config, warnings))
     }
 
+    /// A config file refuses a `latency-tracking-info-percentiles` that is
+    /// not a list of numbers between 0 and 100, as Redis does (#255).
+    #[test]
+    fn latency_percentiles_in_a_config_file_must_be_numbers() {
+        for bad in ["abc", "50 abc", "101", "-1"] {
+            let err = load(&format!("latency-tracking-info-percentiles \"{bad}\"\n")).unwrap_err();
+            assert!(
+                err.contains("latency-tracking-info-percentiles"),
+                "{bad}: {err}"
+            );
+        }
+        load("latency-tracking-info-percentiles \"50 99 99.9\"\n").unwrap();
+        load("latency-tracking-info-percentiles \"\"\n").unwrap();
+    }
+
     #[test]
     fn tls_auth_clients_takes_yes_no_or_optional() {
         assert_eq!(Config::default().tls_auth_clients, "yes");

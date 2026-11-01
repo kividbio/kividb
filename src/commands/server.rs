@@ -933,6 +933,30 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
 /// `CONFIG SET` of a setting that is the server's as a whole, not of a
 /// connection, a store or the replication: what a line of the configuration
 /// file with it does too (#142). `None`: not one of these.
+/// Why `value` is not a list `latency-tracking-info-percentiles` takes, in
+/// Redis 8.10's words, or `None` when it is one. Words are split on single
+/// spaces, as Redis splits them, so a doubled or leading space is refused.
+fn latency_percentiles_error(value: &str) -> Option<&'static str> {
+    if value.is_empty() {
+        return None;
+    }
+    for word in value.split(' ') {
+        match word.parse::<f64>() {
+            Ok(p) if p.is_nan() => {
+                return Some("Invalid latency-tracking-info-percentiles parameters");
+            }
+            Ok(p) if !(0.0..=100.0).contains(&p) => {
+                return Some(
+                    "latency-tracking-info-percentiles parameters should sit between [0.0,100.0]",
+                );
+            }
+            Ok(_) => {}
+            Err(_) => return Some("Invalid latency-tracking-info-percentiles parameters"),
+        }
+    }
+    None
+}
+
 pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
     let param = param.to_string();
     let remembered = REMEMBERED_CONFIG.lock().contains_key(param.as_str())
@@ -1051,6 +1075,20 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                     ))
                 }
             }
+            // The percentiles `INFO latencystats` reports: a space-separated
+            // list of numbers between 0 and 100, or none at all. Anything
+            // else is refused with Redis's reply (#255).
+            "latency-tracking-info-percentiles" => match latency_percentiles_error(value) {
+                None => {
+                    REMEMBERED_CONFIG
+                        .lock()
+                        .insert(param.clone(), value.to_string());
+                    Some(resp_simple("OK"))
+                }
+                Some(why) => Some(resp_error(&format!(
+                    "ERR CONFIG SET failed (possibly related to argument '{param}') - {why}"
+                ))),
+            },
             "latency-monitor-threshold" => match value.parse::<i64>() {
                 Ok(ms) if ms >= 0 => {
                     crate::latency::set_threshold_ms(ms as u64);

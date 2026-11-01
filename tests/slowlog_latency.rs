@@ -997,6 +997,46 @@ fn monitoring_sees_what_redis_shows() {
     assert_ne!(field("executable"), "/usr/local/bin/kividb");
 }
 
+/// `latency-tracking-info-percentiles` takes a space-separated list of
+/// numbers between 0 and 100, or an empty list, and refuses anything else
+/// with Redis 8.10's reply (#255).
+#[test]
+fn latency_percentiles_refuse_what_is_not_a_list_of_numbers() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let set =
+        |c: &mut Conn, v: &str| c.cmd(&["CONFIG", "SET", "latency-tracking-info-percentiles", v]);
+    let get = |c: &mut Conn| {
+        let reply = c.cmd(&["CONFIG", "GET", "latency-tracking-info-percentiles"]);
+        reply.as_array()[1].as_str().to_string()
+    };
+    let invalid = "ERR CONFIG SET failed (possibly related to argument \
+                   'latency-tracking-info-percentiles') - Invalid \
+                   latency-tracking-info-percentiles parameters";
+    let range = "ERR CONFIG SET failed (possibly related to argument \
+                 'latency-tracking-info-percentiles') - latency-tracking-info-percentiles \
+                 parameters should sit between [0.0,100.0]";
+
+    assert!(set(&mut c, "25 75").is_ok());
+    for bad in ["abc", "50 abc", "nan", " 50", "50  99"] {
+        let reply = set(&mut c, bad);
+        assert!(reply.is_error(), "{bad:?}: {reply:?}");
+        assert_eq!(reply.as_str(), invalid, "{bad:?}");
+    }
+    for bad in ["101", "-1", "50 100.5", "inf"] {
+        let reply = set(&mut c, bad);
+        assert!(reply.is_error(), "{bad:?}: {reply:?}");
+        assert_eq!(reply.as_str(), range, "{bad:?}");
+    }
+    assert_eq!(get(&mut c), "25 75", "a refused value is not kept");
+
+    for good in ["50 99 99.9", "0 100", "1e1", ""] {
+        assert!(set(&mut c, good).is_ok(), "{good:?}");
+        assert_eq!(get(&mut c), good);
+    }
+}
+
 // After a slow command, LATENCY LATEST must contain at least one event.
 #[test]
 fn test_latency_latest_populates_after_commands() {
