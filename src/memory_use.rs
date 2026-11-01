@@ -142,6 +142,21 @@ pub fn allocated() -> usize {
     total.max(0) as usize
 }
 
+/// What the calling thread has allocated less what it has freed, while it
+/// has a counter of its own (`None` once it shares the last one): unlike
+/// [`allocated`], not moved by what other threads allocate meanwhile. For
+/// tests that measure what an operation allocates in a process whose other
+/// threads (a test harness's) allocate at the same time.
+pub fn allocated_by_this_thread() -> Option<isize> {
+    let stripe = MINE.try_with(Cell::get).ok()?;
+    if stripe == usize::MAX {
+        // Nothing counted yet: its counter, when it is given one, starts at
+        // nought.
+        return Some(0);
+    }
+    (stripe < OWNED).then(|| COUNTS[stripe].0.load(Ordering::Relaxed))
+}
+
 /// Bytes allocated that deleting keys would not give back: Redis's
 /// `mem_not_counted_for_evict`. `maxmemory` is measured against what is
 /// allocated less these ([`counted`]).

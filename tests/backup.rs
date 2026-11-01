@@ -243,6 +243,22 @@ fn status(c: &mut Conn) -> (String, String) {
     )
 }
 
+/// Wait for a server started from a dataset with search indexes to have
+/// built them: until then, in the background, most commands answer
+/// `LOADING` (`spawn_snapshot_index_backfill_thread` in src/main.rs).
+fn wait_until_loaded(c: &mut Conn) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match c.cmd(&["DBSIZE"]) {
+            V::Err(e) if e.starts_with("LOADING") => {
+                assert!(Instant::now() < deadline, "still loading: {e}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => return,
+        }
+    }
+}
+
 fn wait_for_state(c: &mut Conn, wanted: &str) {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
@@ -526,6 +542,7 @@ fn a_backup_taken_under_load_restores_to_the_seal_boundary() {
         let preload = format!("aof:{}", manifest.display());
         let restored = Server::start(&["--preload-file", &preload]);
         let mut r = restored.conn();
+        wait_until_loaded(&mut r);
 
         assert_eq!(r.cmd(&["GET", "k:499"]).s(), "v499");
         assert_eq!(r.cmd(&["GET", "k:0"]), V::Nil, "deleted during the window");

@@ -254,7 +254,11 @@ fn strings_are_written_in_place_when_the_block_still_fits() {
         // Key "k" (1 byte) and the 12-byte header: a 100-byte string is a
         // block of 113, in the 128-byte class, which holds 113 to 128.
         assert!(matches!(map.set_str("k", bytes(100, 1)), Written::New));
-        let before = kividb::memory_use::allocated() as isize;
+        // What this thread allocated: the harness's threads allocate too (a
+        // test's thread starts as another ends), and moved the process's
+        // total by hundreds of bytes in between.
+        let here = || kividb::memory_use::allocated_by_this_thread().expect("a counter of its own");
+        let before = here();
         for (len, seed) in [(100, 2), (115, 3), (101, 4), (100, 5)] {
             assert!(
                 matches!(map.set_str("k", bytes(len, seed)), Written::InPlace),
@@ -262,7 +266,7 @@ fn strings_are_written_in_place_when_the_block_still_fits() {
             );
             assert_eq!(text(map.get("k")), Some(bytes(len, seed)));
         }
-        let after = kividb::memory_use::allocated() as isize;
+        let after = here();
         assert!((after - before).abs() < 512, "{} bytes", after - before);
         // Past the class, either way: a new entry.
         assert!(matches!(
