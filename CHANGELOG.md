@@ -44,6 +44,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A key past its time is not counted as used.** Under an LRU or LFU
+  policy, `MGET`, a `GET` on a replica, a command refused with an error,
+  a key a command names twice, and a script's commands could bring the
+  idle time or the count of a key already past its time up to date, as if
+  it had been used: the lookup wrote the key's use before its deadline was
+  looked at. Only a live key's use is written now, and `GET` looks at the
+  time once.
+
 - **`lazyfree-lazy-expire` in a config file is applied, and said to be.**
   1.1 accepted the directive and ignored it: `CONFIG GET` still said `yes`
   and expired keys still reached the AOF and replicas as `UNLINK` (#232).

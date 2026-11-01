@@ -452,23 +452,24 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let map = read_lock!(shard);
-            // The key's time to live is in the entry the value is read from.
-            Some(match map.peek_expiring(key) {
-                Some((_, Some(at))) if is_past(at) => {
+            // The key's time to live is in the entry the value is read from,
+            // and looked at there, once.
+            Some(match map.lookup(key) {
+                store::Lookup::Past => {
                     drop(map);
                     expire_on_read(ctx.store, *ctx.selected_db, key);
                     crate::stats::record_miss();
                     resp_null_bulk()
                 }
-                Some((ValueRef::String(v), _)) => {
+                store::Lookup::Live(ValueRef::String(v)) => {
                     crate::stats::record_hit();
                     resp_bulk(&v)
                 }
-                Some(_) => {
+                store::Lookup::Live(_) => {
                     crate::stats::record_miss();
                     resp_error("WRONGTYPE Operation against a key holding the wrong kind of value")
                 }
-                None => {
+                store::Lookup::Absent => {
                     crate::stats::record_miss();
                     resp_null_bulk()
                 }
@@ -945,12 +946,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 // A key past its time is not there. It is left for the next
                 // command on it, or the sweep, to remove: that takes its
                 // shard for writing, which this holds for reading.
-                let val = match shards.map(key).and_then(|map| map.peek_expiring(key)) {
-                    Some((_, Some(at))) if is_past(at) => {
-                        crate::stats::record_miss();
-                        nil.clone()
-                    }
-                    Some((ValueRef::String(v), _)) => {
+                let val = match shards.map(key).map(|map| map.lookup(key)) {
+                    Some(store::Lookup::Live(ValueRef::String(v))) => {
                         crate::stats::record_hit();
                         resp_bulk(v.as_bytes())
                     }
