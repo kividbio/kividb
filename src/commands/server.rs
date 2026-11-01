@@ -336,9 +336,9 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     // A limit below what is in use is enforced
                     // now, not at the next write.
                     if v != 0 {
-                        let observed = crate::replication::write_is_observed(ctx);
+                        // Each key ordered against the writes to it (#271).
                         let _evicting = crate::write_gate::enter();
-                        crate::eviction::make_room(ctx, v, observed);
+                        crate::eviction::make_room(ctx, v, !ctx.apply_replication);
                     }
                     Some(resp_simple("OK"))
                 }

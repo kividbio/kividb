@@ -11,8 +11,6 @@ use ahash::AHashSet;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
-type Set = Arc<RwLock<crate::member_set::MemberSet>>;
-
 /// Effective protocol for the reply being built (honours `redis.setresp`).
 ///
 /// RESP3 gives set-valued replies a dedicated type (`~`), which clients use to
@@ -22,42 +20,6 @@ type Set = Arc<RwLock<crate::member_set::MemberSet>>;
 #[inline]
 fn reply_resp(ctx: &Ctx) -> u8 {
     crate::commands::handler::effective_resp_for_reply(ctx)
-}
-
-fn get_or_create_set(ctx: &Ctx, key: &str) -> Result<Set, Vec<u8>> {
-    // Why does this helper exist? Every mutating set command (SADD, SREM, SPOP, SMOVE)
-    // does the exact same "get shard → write-lock map → get-or-create set → clone Arc → drop map lock → lock inner set" dance.
-    // Without the helper you'd copy that pattern 6+ times and risk inconsistency.
-    // The helper encodes the lock-ordering contract in one place: shard map lock is taken and released before the inner set is touched.
-
-    let db_ref = &ctx.store[*ctx.selected_db];
-    let shard = store::get_shard(db_ref, key);
-    // Nearly always the set is there: looked for with the shard held for
-    // reading, which other readers of the shard do not wait for. It was
-    // always taken for writing, in case the set had to be made.
-    match read_lock!(shard).get(key) {
-        Some(ValueRef::Set(s)) => return Ok(Arc::clone(s)),
-        Some(_) => {
-            return Err(resp_error(
-                "WRONGTYPE Operation against a key holding the wrong kind of value",
-            ));
-        }
-        None => {}
-    }
-    let mut map = write_lock!(shard);
-
-    // Looked for again: it may have been made since the look above.
-    match map.get(key) {
-        None => {
-            let s = Arc::new(RwLock::new(crate::member_set::MemberSet::new()));
-            map.insert(Key::from(key), KiviDBValue::Set(Arc::clone(&s)));
-            Ok(s)
-        }
-        Some(ValueRef::Set(s)) => Ok(Arc::clone(s)),
-        Some(_) => Err(resp_error(
-            "WRONGTYPE Operation against a key holding the wrong kind of value",
-        )),
-    }
 }
 
 // ── load_set ──────────────────────────────────────────────────────────────────
@@ -184,19 +146,52 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => return Some(resp_error("ERR must be valid UTF-8")),
             };
 
-            let set = match get_or_create_set(ctx, key) {
-                Ok(s) => s,
-                Err(e) => return Some(e),
+            // The set is written with its shard held: for reading when it is
+            // there, which keeps a command that empties it from taking it out
+            // of the keyspace meanwhile; for writing when it is made, and
+            // then made with its members, never empty. Found, then let go of
+            // and written, the members went into a set a `SREM` had just
+            // removed (#271).
+            let insert = |set: &mut crate::member_set::MemberSet| {
+                cmd[2..]
+                    .iter()
+                    .filter(|member| set.insert_bytes(member))
+                    .count() as i64
             };
-
-            let mut inner = set.write();
-            let mut added = 0i64;
-            for member in &cmd[2..] {
-                if inner.insert_bytes(member) {
-                    added += 1;
+            let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
+            let found = match read_lock!(shard).get(key) {
+                Some(ValueRef::Set(s)) => Some(insert(&mut s.write())),
+                Some(_) => {
+                    return Some(resp_error(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    ));
                 }
-            }
-            drop(inner);
+                None => None,
+            };
+            let added = match found {
+                Some(added) => added,
+                None => {
+                    let mut map = write_lock!(shard);
+                    // Looked for again: it may have been made since.
+                    match map.get(key) {
+                        Some(ValueRef::Set(s)) => insert(&mut s.write()),
+                        Some(_) => {
+                            return Some(resp_error(
+                                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                            ));
+                        }
+                        None => {
+                            let mut set = crate::member_set::MemberSet::new();
+                            let added = insert(&mut set);
+                            map.insert(
+                                Key::from(key),
+                                KiviDBValue::Set(Arc::new(RwLock::new(set))),
+                            );
+                            added
+                        }
+                    }
+                }
+            };
             if added > 0 {
                 notify(ctx.pubsub, *ctx.selected_db, KS_SET, "sadd", key);
             }

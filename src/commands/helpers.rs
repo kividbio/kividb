@@ -478,6 +478,7 @@ fn expire_batch(
         return 0;
     }
     let ordered = told.map(|_| crate::expiry::order(db, batch.iter().map(|k| k.as_bytes())));
+    let unobserved = unobserved_order(told.is_none(), db, batch.iter().map(|k| k.as_bytes()));
     // Writes were paused, for a handoff say, while this waited for the
     // gate: a `DEL` now would come after the cut the handoff took. The
     // keys go once the pause is over.
@@ -513,6 +514,7 @@ fn expire_batch(
         told.propagate(db, gone.iter().map(|key| key.as_str()));
     }
     drop(ordered);
+    drop(unobserved);
     // Freed outside the lock.
     drop(freed);
     let count = gone.len();
@@ -543,6 +545,21 @@ fn shrink_sparse_tables(store: &Store, cursor: &ExpireCursor) {
             }
         }
     }
+}
+
+/// The order of `keys` (`write_order`), for an expiry that nothing observes
+/// (`unobserved`) and so takes neither the write gate nor `expiry::order`:
+/// a client's write to one of them holds it from before it reads the key
+/// until after it has written it, and the expiry falls before or after the
+/// whole of that write (#271). Nothing when this thread is alone, or holds
+/// the order already.
+fn unobserved_order<'a>(
+    unobserved: bool,
+    db: usize,
+    keys: impl Iterator<Item = &'a [u8]>,
+) -> Option<crate::write_order::OrderGuard> {
+    (unobserved && !crate::command_gate::alone_on_this_thread())
+        .then(|| crate::write_order::lock_keys(db, keys))
 }
 
 /// Lazy TTL: delete an expired key before a read and return true if it was removed.
@@ -831,6 +848,10 @@ pub fn delete_key_if_expired(store: &Store, db: usize, key: &str) -> bool {
     let ordered = told
         .as_ref()
         .map(|_| crate::expiry::order(db, std::iter::once(key.as_bytes())));
+    // Unobserved, the key's order all the same: a write that read the key
+    // before it was due must not write its old value back after it is gone
+    // (#271).
+    let unobserved = unobserved_order(told.is_none(), db, std::iter::once(key.as_bytes()));
     // `expired` is announced before the shard is let go of: a command that
     // then finds the key gone, and writes it anew, announces its own event
     // after it, as in Redis. Announced once the lock was let go of, the
@@ -852,6 +873,7 @@ pub fn delete_key_if_expired(store: &Store, db: usize, key: &str) -> bool {
         told.propagate(db, [key]);
     }
     drop(ordered);
+    drop(unobserved);
     drop(removed);
     if gone {
         crate::stats::record_expired();

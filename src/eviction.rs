@@ -886,8 +886,8 @@ thread_local! {
 /// about how much memory that gives back (see `store::Taken::footprint`),
 /// or None if the key was gone already.
 fn evict(ctx: &mut Ctx, db: usize, key: &str, ordered: bool) -> Option<usize> {
-    // Ordered against other writes to the key, like any write, while
-    // anything reads the write stream. See `write_order`.
+    // Ordered against other writes to the key, like any write (#271). See
+    // `write_order`.
     let _order = (ordered && !crate::command_gate::alone_on_this_thread())
         .then(|| crate::write_order::lock_keys(db, std::iter::once(key.as_bytes())));
 

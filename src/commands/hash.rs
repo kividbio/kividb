@@ -35,9 +35,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => return Some(resp_error("ERR must be valid UTF-8")),
             };
 
-            let db_ref = &ctx.store[*ctx.selected_db];
-            let shard = store::get_shard(db_ref, key);
-
             // Collect (field_name, bytes) pairs from the command args
             // cmd[2], cmd[3] = first pair; cmd[4], cmd[5] = second; ...
             let pairs: Vec<(String, Arc<[u8]>)> = cmd[2..]
@@ -51,61 +48,23 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 })
                 .collect();
 
-            let added = {
-                let mut map = write_lock!(shard);
-                match map.get(key) {
-                    Some(ValueRef::Hash(h)) => {
-                        let h = Arc::clone(h);
-                        drop(map);
-                        let mut inner = h.write();
-                        let mut new_count = 0i64;
-                        for (field, val) in &pairs {
-                            if inner.insert(field.clone(), Arc::clone(val)).is_none() {
-                                new_count += 1;
-                            }
-                        }
-                        new_count
+            let added = match write_hash(ctx, key, false, |fields, mut expiries| {
+                let mut new_count = 0i64;
+                for (field, val) in &pairs {
+                    // HSET removes any field-TTL; matches Redis 7.4 semantics
+                    // where setting a field clears its TTL.
+                    if let Some(expiries) = expiries.as_deref_mut() {
+                        expiries.remove(field);
                     }
-                    Some(ValueRef::HashEx(hx)) => {
-                        let hx = Arc::clone(hx);
-                        drop(map);
-                        let mut inner = hx.write();
-                        let mut new_count = 0i64;
-                        for (field, val) in &pairs {
-                            // HSET removes any field-TTL; matches Redis 7.4 semantics
-                            // where setting a field clears its TTL.
-                            inner.expiries.remove(field);
-                            if inner
-                                .fields
-                                .insert(field.clone(), Arc::clone(val))
-                                .is_none()
-                            {
-                                new_count += 1;
-                            }
-                        }
-                        new_count
-                    }
-                    Some(_) => {
-                        return Some(resp_error(
-                            "WRONGTYPE Operation against a key holding the wrong kind of value",
-                        ));
-                    }
-                    None => {
-                        let h =
-                            Arc::new(parking_lot::RwLock::new(crate::types::HashFields::default()));
-                        map.insert(Key::from(key), KiviDBValue::Hash(Arc::clone(&h)));
-                        drop(map);
-                        let mut inner = h.write();
-                        let mut new_count = 0i64;
-                        for (field, val) in &pairs {
-                            if inner.insert(field.clone(), Arc::clone(val)).is_none() {
-                                new_count += 1;
-                            }
-                        }
-                        new_count
+                    if fields.insert(field.clone(), Arc::clone(val)).is_none() {
+                        new_count += 1;
                     }
                 }
-            }; // shard write lock drops here
+                new_count
+            }) {
+                Ok(added) => added,
+                Err(e) => return Some(e),
+            };
 
             // Now update any matching vector indexes — outside the shard lock
             crate::vector::maybe_index(
@@ -232,44 +191,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 })
                 .collect();
 
-            {
-                let db_ref = &ctx.store[*ctx.selected_db];
-                let shard = store::get_shard(db_ref, key);
-                let mut map = write_lock!(shard);
-                match map.get(key) {
-                    Some(ValueRef::Hash(h)) => {
-                        let h = Arc::clone(h);
-                        drop(map);
-                        let mut inner = h.write();
-                        for (field, val) in &pairs {
-                            inner.insert(field.clone(), Arc::clone(val));
-                        }
+            if let Err(e) = write_hash(ctx, key, false, |fields, mut expiries| {
+                for (field, val) in &pairs {
+                    if let Some(expiries) = expiries.as_deref_mut() {
+                        expiries.remove(field);
                     }
-                    Some(ValueRef::HashEx(hx)) => {
-                        let hx = Arc::clone(hx);
-                        drop(map);
-                        let mut inner = hx.write();
-                        for (field, val) in &pairs {
-                            inner.expiries.remove(field);
-                            inner.fields.insert(field.clone(), Arc::clone(val));
-                        }
-                    }
-                    Some(_) => {
-                        return Some(resp_error(
-                            "WRONGTYPE Operation against a key holding the wrong kind of value",
-                        ));
-                    }
-                    None => {
-                        let h =
-                            Arc::new(parking_lot::RwLock::new(crate::types::HashFields::default()));
-                        map.insert(Key::from(key), KiviDBValue::Hash(Arc::clone(&h)));
-                        drop(map);
-                        let mut inner = h.write();
-                        for (field, val) in &pairs {
-                            inner.insert(field.clone(), Arc::clone(val));
-                        }
-                    }
+                    fields.insert(field.clone(), Arc::clone(val));
                 }
+            }) {
+                return Some(e);
             }
 
             crate::vector::maybe_index(
@@ -544,7 +474,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
 
-            let result = match with_hash_write(ctx, key, |fields, _expiries| {
+            // A hash past its time goes first; then the field is found and
+            // written, or the hash made with it, with the shard held all
+            // the while (`write_hash`). Made after another hold of the
+            // shard had found no hash, it was made twice by two increments
+            // at once, and both answered `incr` (#271).
+            lazy_expire_key(ctx.store, *ctx.selected_db, key);
+            let result = match write_hash(ctx, key, true, |fields, _expiries| {
                 let current: i64 = match fields.get(&field) {
                     None => 0,
                     Some(v) => match std::str::from_utf8(v).ok().and_then(|s| s.parse().ok()) {
@@ -560,20 +496,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 fields.insert(field.clone(), Arc::from(next.to_string().as_bytes()));
                 Ok(resp_integer(next))
             }) {
-                None => {
-                    // Key doesn't exist — create a fresh plain Hash with this one field
-                    let db_ref = &ctx.store[*ctx.selected_db];
-                    let shard = store::get_shard(db_ref, key);
-                    let mut map = write_lock!(shard);
-                    let h = Arc::new(parking_lot::RwLock::new(crate::types::HashFields::default()));
-                    h.write()
-                        .insert(field, Arc::from(incr.to_string().as_bytes()));
-                    map.insert(Key::from(key), KiviDBValue::Hash(Arc::clone(&h)));
-                    Some(resp_integer(incr))
-                }
-                Some(Err(e)) => Some(e),
-                Some(Ok(Err(parse_err))) => Some(parse_err),
-                Some(Ok(Ok(out))) => Some(out),
+                Err(e) | Ok(Err(e)) => Some(e),
+                Ok(Ok(out)) => Some(out),
             };
             if result
                 .as_ref()
@@ -605,7 +529,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => return Some(resp_error("ERR value is not a valid float")),
             };
 
-            let result = match with_hash_write(ctx, key, |fields, _expiries| {
+            // As `HINCRBY`.
+            lazy_expire_key(ctx.store, *ctx.selected_db, key);
+            let result = match write_hash(ctx, key, true, |fields, _expiries| {
                 let current: f64 = match fields.get(&field) {
                     None => 0.0,
                     Some(v) => match std::str::from_utf8(v).ok().and_then(|s| s.parse().ok()) {
@@ -621,19 +547,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 fields.insert(field.clone(), Arc::from(s.as_bytes()));
                 Ok(resp_bulk_str(&s))
             }) {
-                None => {
-                    let db_ref = &ctx.store[*ctx.selected_db];
-                    let shard = store::get_shard(db_ref, key);
-                    let mut map = write_lock!(shard);
-                    let s = format!("{}", incr);
-                    let h = Arc::new(parking_lot::RwLock::new(crate::types::HashFields::default()));
-                    h.write().insert(field, Arc::from(s.as_bytes()));
-                    map.insert(Key::from(key), KiviDBValue::Hash(Arc::clone(&h)));
-                    Some(resp_bulk_str(&s))
-                }
-                Some(Err(e)) => Some(e),
-                Some(Ok(Err(parse_err))) => Some(parse_err),
-                Some(Ok(Ok(out))) => Some(out),
+                Err(e) | Ok(Err(e)) => Some(e),
+                Ok(Ok(out)) => Some(out),
             };
             if result
                 .as_ref()
@@ -662,46 +577,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let field = crate::commands::helpers::name_from_bytes(cmd[2]).into_owned();
             let val: Arc<[u8]> = Arc::from(cmd[3]);
 
-            let db_ref = &ctx.store[*ctx.selected_db];
-            let shard = store::get_shard(db_ref, key);
-            let was_set = {
-                let mut map = write_lock!(shard);
-                match map.get(key) {
-                    Some(ValueRef::Hash(h)) => {
-                        let h = Arc::clone(h);
-                        drop(map);
-                        let mut inner = h.write();
-                        if inner.contains_key(&field) {
-                            false
-                        } else {
-                            inner.insert(field, val);
-                            true
-                        }
-                    }
-                    Some(ValueRef::HashEx(hx)) => {
-                        let hx = Arc::clone(hx);
-                        drop(map);
-                        let mut inner = hx.write();
-                        if inner.fields.contains_key(&field) {
-                            false
-                        } else {
-                            inner.fields.insert(field, val);
-                            true
-                        }
-                    }
-                    Some(_) => {
-                        return Some(resp_error(
-                            "WRONGTYPE Operation against a key holding the wrong kind of value",
-                        ));
-                    }
-                    None => {
-                        let h =
-                            Arc::new(parking_lot::RwLock::new(crate::types::HashFields::default()));
-                        h.write().insert(field, val);
-                        map.insert(Key::from(key), KiviDBValue::Hash(Arc::clone(&h)));
-                        true
-                    }
+            let was_set = match write_hash(ctx, key, false, |fields, _expiries| {
+                if fields.contains_key(&field) {
+                    false
+                } else {
+                    fields.insert(field.clone(), Arc::clone(&val));
+                    true
                 }
+            }) {
+                Ok(was_set) => was_set,
+                Err(e) => return Some(e),
             };
             if was_set {
                 notify(ctx.pubsub, *ctx.selected_db, KS_HASH, "hset", key);
@@ -1199,6 +1084,70 @@ where
             "WRONGTYPE Operation against a key holding the wrong kind of value",
         ))),
     }
+}
+
+/// Write fields of the hash at `key` with `write`, which is given its fields
+/// and, for a hash with field TTLs, their times; the hash is made if there
+/// is none, with what `write` puts in it. `Err` is the WRONGTYPE reply.
+///
+/// All of it with the key's shard held: for reading when the hash is there,
+/// which keeps a command that empties it (`HDEL`, the field-expiry sweep)
+/// from taking it out of the keyspace meanwhile; for writing when it is
+/// made, and then made whole, never empty. Found under one hold of the
+/// shard and written after it, the fields went into a hash no longer in the
+/// keyspace, and a new hash made twice at once kept one maker's fields
+/// (#271).
+///
+/// `sweep`: a hash's fields past their time go first.
+fn write_hash<R>(
+    ctx: &Ctx,
+    key: &str,
+    sweep: bool,
+    mut write: impl FnMut(&mut crate::types::HashFields, Option<&mut AHashMap<String, Instant>>) -> R,
+) -> Result<R, Vec<u8>> {
+    let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
+    match read_lock!(shard).get(key) {
+        Some(ValueRef::Hash(h)) => return Ok(write(&mut h.write(), None)),
+        Some(ValueRef::HashEx(hx)) => return Ok(write_hash_ex(hx, sweep, &mut write)),
+        Some(_) => {
+            return Err(resp_error(
+                "WRONGTYPE Operation against a key holding the wrong kind of value",
+            ));
+        }
+        None => {}
+    }
+    let mut map = write_lock!(shard);
+    // Looked for again: it may have been made since.
+    match map.get(key) {
+        Some(ValueRef::Hash(h)) => Ok(write(&mut h.write(), None)),
+        Some(ValueRef::HashEx(hx)) => Ok(write_hash_ex(hx, sweep, &mut write)),
+        Some(_) => Err(resp_error(
+            "WRONGTYPE Operation against a key holding the wrong kind of value",
+        )),
+        None => {
+            let mut fields = crate::types::HashFields::default();
+            let out = write(&mut fields, None);
+            if !fields.is_empty() {
+                let hash = Arc::new(parking_lot::RwLock::new(fields));
+                map.insert(Key::from(key), KiviDBValue::Hash(hash));
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// [`write_hash`]'s write of a hash with field TTLs.
+fn write_hash_ex<R>(
+    hash: &parking_lot::RwLock<crate::types::HashInner>,
+    sweep: bool,
+    write: &mut impl FnMut(&mut crate::types::HashFields, Option<&mut AHashMap<String, Instant>>) -> R,
+) -> R {
+    let mut inner = hash.write();
+    if sweep {
+        inner.sweep_expired();
+    }
+    let crate::types::HashInner { fields, expiries } = &mut *inner;
+    write(fields, Some(expiries))
 }
 
 // ── Hash field-TTL helpers ───────────────────────────────────────────────────
