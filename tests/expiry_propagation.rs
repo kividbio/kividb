@@ -753,6 +753,60 @@ fn each_expired_key_is_deleted_once_in_the_aof() {
     });
 }
 
+/// `PEXPIRE k 1`, which reads the clock twice: for the key's time, and to
+/// see whether that time has come already. When a millisecond began in
+/// between (about once in 650 calls) the master deleted the key there and
+/// then, answered `1`, and propagated nothing: it sends a `DEL` for a time
+/// to live of zero or less, and otherwise the key's new time, and there was
+/// none. The replica kept the key for good (31 of 20,000 here; in the
+/// lagging-replica test below, a key written to after it had gone). Now the
+/// key takes its time, and goes as every expired key goes.
+#[test]
+fn a_pexpire_whose_millisecond_has_passed_reaches_the_replica() {
+    let master = Server::start(&[]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let (mut m, mut r) = (master.conn(), replica.conn());
+    wait_link_up(&mut r);
+    let keys = 20_000;
+    for batch in 0..keys / 500 {
+        let mut buf = Vec::new();
+        for i in batch * 500..(batch + 1) * 500 {
+            let key = format!("x:{i}");
+            buf.extend_from_slice(
+                format!("*3\r\n$3\r\nSET\r\n${}\r\n{key}\r\n$1\r\nv\r\n", key.len()).as_bytes(),
+            );
+            buf.extend_from_slice(
+                format!(
+                    "*3\r\n$7\r\nPEXPIRE\r\n${}\r\n{key}\r\n$1\r\n1\r\n",
+                    key.len()
+                )
+                .as_bytes(),
+            );
+        }
+        m.writer.write_all(&buf).unwrap();
+        for _ in 0..500 {
+            assert_eq!(m.read(), V::Str("OK".into()));
+            assert_eq!(m.read(), V::Int(1));
+        }
+    }
+    wait_until("every key to expire on the master", 30, || {
+        m.cmd(&["DBSIZE"]).i() == 0
+    });
+    // Each went for its time, not by the PEXPIRE itself.
+    assert_eq!(m.info("stats", "expired_keys"), keys.to_string());
+    wait_caught_up(&mut m, &mut r);
+    let left: Vec<_> = r
+        .cmd(&["KEYS", "*"])
+        .arr()
+        .iter()
+        .take(5)
+        .cloned()
+        .collect();
+    assert!(left.is_empty(), "the replica kept {left:?}");
+    assert_eq!(r.cmd(&["DBSIZE"]).i(), 0);
+}
+
 /// What the master expires reaches its replica as a `DEL` (`UNLINK`), which
 /// the replica applies, and logs in its own AOF. The replica deletes no key
 /// itself: past its time, a key is not there to the replica's clients, and

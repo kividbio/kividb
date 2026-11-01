@@ -534,8 +534,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 return Some(resp_integer(0));
             }
 
-            let now = crate::script_clock::wall_system_time_now();
-            if new_abs <= now {
+            // Only a negative time to live deletes the key here, as in
+            // Redis. A positive one ends after the time it was added to,
+            // however late this is: a key whose time has already come by
+            // now goes the way every expired key goes, with its `DEL`.
+            // Deleted here, it went with nothing propagated (the `DEL` is
+            // sent for a time to live of zero or less only), and stayed on
+            // every replica and in the AOF for good.
+            if secs < 0 {
                 let removed = delete_key(ctx.store, *ctx.selected_db, key);
                 if removed {
                     crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
