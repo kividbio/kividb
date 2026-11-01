@@ -1276,7 +1276,8 @@ pub async fn handle_client(
             // ── Connection handoffs (break parse loop so `parse_buf` can be drained) ──
             // A replica whose dataset may already be this master's is first
             // offered the fingerprint (see `replication::digest`), and the
-            // connection stays a client until it asks again.
+            // connection stays a client until it asks again; so is one of a
+            // master that lost its dataset (`ReplState::psync_offer`).
             // A replica does not take replicas of its own (#144).
             if (cmd_name == "PSYNC" || cmd_name == "SYNC") && repl_state.is_slave() {
                 out_buf.extend_from_slice(&crate::resp::write::resp_error(
@@ -1286,7 +1287,8 @@ pub async fn handle_client(
                 continue;
             }
             if cmd_name == "PSYNC"
-                && let Some(offer) = repl_state.digest_offer(&client_registry, client_id, &cmd)
+                && let Some(offer) =
+                    repl_state.psync_offer(&cluster_state, &client_registry, client_id, &cmd)
             {
                 out_buf.extend_from_slice(&offer);
                 parse_offset += consumed;
