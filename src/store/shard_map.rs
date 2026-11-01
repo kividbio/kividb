@@ -27,9 +27,10 @@
 //! **A key's use.** The lookups a command makes to read or write a key
 //! write its use to the key's entry as they find it, when the command counts
 //! as a use under the eviction policy (`access`): [`ShardMap::get`],
-//! `get_expiring`, `peek_expiring`, `contains_key`, every write of a value,
-//! `set_expires` and `persist`. [`ShardMap::peek`], `expires`, `access` and
-//! the walks over the table never do.
+//! `get_expiring`, `lookup`, `contains_key`, `use_key`, every write of a
+//! value, `set_expires` and `persist`. [`ShardMap::peek`], `expires`,
+//! `access` and the walks over the table never do, and nothing does to a
+//! key past its time: that key is gone, whatever its entry says.
 //!
 //! **Writes in place.** A string written over a string kept inline goes
 //! into the same block when the table alone holds the entry, the key is not
@@ -258,6 +259,16 @@ pub enum Written {
     Replaced(Taken),
 }
 
+/// What [`ShardMap::remove_if`] did with a key.
+pub enum Removal {
+    /// It was taken out: its entry, best dropped once the shard is unlocked.
+    Taken(Taken),
+    /// It is there, and was left as it was.
+    Kept,
+    /// There is no such key.
+    Absent,
+}
+
 impl Written {
     /// The old entry, if the key had one that is not its entry now.
     #[inline]
@@ -306,6 +317,16 @@ pub struct ShardMap {
     /// Keys past their time that writes under this lock put new values
     /// over, to be expired when it lets go (`expiry::written_over`).
     written_over: Vec<String>,
+}
+
+/// What [`ShardMap::lookup`] finds under a key.
+pub enum Lookup<'a> {
+    /// The key's value: the key is live.
+    Live(ValueRef<'a>),
+    /// A key past its time, still in the table.
+    Past,
+    /// No such key.
+    Absent,
 }
 
 /// What a write does with the time to live the key has.
@@ -520,17 +541,36 @@ impl ShardMap {
         })
     }
 
-    /// [`ShardMap::get_expiring`], past its time or not: for a reader that
-    /// checks the time itself, as `GET` does. A use of the key.
+    /// [`ShardMap::get`], telling a key past its time from one not there:
+    /// for a reader that expires the one it finds past its time, as `GET`
+    /// does. The time is looked at once, here. A use of the key if it is
+    /// live, and only then: the access word of a key past its time was
+    /// brought up to date by a `GET` that went on to find it gone, by an
+    /// `MGET`, and by a `GET` on a replica, which leaves it for its master.
     #[inline(always)]
-    pub fn peek_expiring(&self, key: &str) -> Option<(ValueRef<'_>, Option<u64>)> {
+    pub fn lookup(&self, key: &str) -> Lookup<'_> {
         let key = key.as_bytes();
         let hash = self.hash_of(key);
-        self.find(hash, key).map(|s| {
-            let e = s.entry();
-            used(e, hash, self.id());
-            (e.value(), e.expires())
-        })
+        match self.find(hash, key) {
+            Some(s) => {
+                let e = s.entry();
+                if expired(e, &self.now) {
+                    return Lookup::Past;
+                }
+                used(e, hash, self.id());
+                Lookup::Live(e.value())
+            }
+            None => Lookup::Absent,
+        }
+    }
+
+    /// `key`'s value and when its time to live ends, past its time or not,
+    /// its use not written: what a key past its time still holds.
+    #[cfg(test)]
+    pub fn peek_expiring(&self, key: &str) -> Option<(ValueRef<'_>, Option<u64>)> {
+        let key = key.as_bytes();
+        self.find(self.hash_of(key), key)
+            .map(|s| (s.entry().value(), s.entry().expires()))
     }
 
     /// When `key`'s time to live ends, in milliseconds since the Unix epoch:
@@ -569,23 +609,23 @@ impl ShardMap {
     /// Make `key`'s access word over with `next`, written only if that
     /// changes it. A read lock is enough: the word is atomic, and no part
     /// of the key or its value (see `entry`'s note on it). Nothing happens
-    /// if there is no such key. The key is taken as the command gave it, in
-    /// bytes: a key is found by its bytes, and one that is not UTF-8 is not
-    /// there to find.
+    /// if there is no such key, or it is past its time. The key is taken as
+    /// the command gave it, in bytes: a key is found by its bytes, and one
+    /// that is not UTF-8 is not there to find.
     #[inline]
     pub fn touch(&self, key: &[u8], next: impl FnOnce(u32) -> u32) {
-        if let Some(s) = self.find(self.hash_of(key), key) {
+        if let Some(s) = self.find_live(self.hash_of(key), key) {
             s.entry().touch(next);
         }
     }
 
-    /// `key` is used, if it is there and this thread's command counts as
-    /// a use (see the module): a lookup for nothing else. The key is taken
-    /// in bytes, as `touch` takes it.
+    /// `key` is used, if it is there, not past its time, and this thread's
+    /// command counts as a use (see the module): a lookup for nothing else.
+    /// The key is taken in bytes, as `touch` takes it.
     #[inline]
     pub fn use_key(&self, key: &[u8]) {
         let hash = self.hash_of(key);
-        if let Some(s) = self.find(hash, key) {
+        if let Some(s) = self.find_live(hash, key) {
             used(s.entry(), hash, self.id());
         }
     }
@@ -970,6 +1010,82 @@ impl ShardMap {
                 Some(unsafe { Taken::new(entry) })
             }
             Err(_) => None,
+        }
+    }
+
+    /// Take `key` out if `take` says so of its value. If it says no, the
+    /// key is left as it was, its time to live and its access word with it,
+    /// and the lookup is a use of the key: what a `GETDEL` of a key of
+    /// another type does. One probe either way. Past its time or not, as
+    /// [`ShardMap::remove`].
+    ///
+    /// Taking the key out and putting it back, as `GETDEL` did, made it a
+    /// new entry: an LFU count of 5, whatever it had been (#221).
+    #[inline]
+    pub fn remove_if(&mut self, key: &str, take: impl FnOnce(ValueRef<'_>) -> bool) -> Removal {
+        let key = key.as_bytes();
+        let hash = self.hash_of(key);
+        let map = self.id();
+        match self
+            .table
+            .find_entry(hash, |s| s.may_be(hash) && s.entry().has_key(key))
+        {
+            Ok(at) => {
+                let entry = at.get().entry();
+                if !take(entry.value()) {
+                    used(entry, hash, map);
+                    return Removal::Kept;
+                }
+                let entry = at.remove().0.entry();
+                if entry.has_ttl() {
+                    ttl_take(&mut self.ttl, entry);
+                }
+                // SAFETY: the table's hold goes to the caller.
+                Removal::Taken(unsafe { Taken::new(entry) })
+            }
+            Err(_) => Removal::Absent,
+        }
+    }
+
+    /// Put an entry [`ShardMap::remove`] took, from this table or another
+    /// database's, under its key here: the entry itself, so that the key's
+    /// value, time to live and access word are what they were, as Redis
+    /// moves a key's object (`MOVE`). A key here past its time is written
+    /// over, and expired as a write expires it; that entry is given back,
+    /// best dropped once the shard is unlocked. A live key is left alone,
+    /// and `taken` is given back instead.
+    pub fn put_back(&mut self, taken: Taken) -> Result<Option<Taken>, Taken> {
+        let hash = self.hash_of(taken.key().as_bytes());
+        let now = &self.now;
+        let hasher = &self.hash;
+        let list = &mut self.ttl;
+        let over = &mut self.written_over;
+        let key = taken.key().as_bytes();
+        match self.table.entry(
+            hash,
+            |s| s.may_be(hash) && s.entry().has_key(key),
+            |s| hasher.hash_one(s.entry().key()),
+        ) {
+            hashbrown::hash_table::Entry::Occupied(mut at) => {
+                let old = at.get().entry();
+                if !expired(old, now) {
+                    return Err(taken);
+                }
+                written_over_expired(over, key);
+                let entry = taken.into_entry();
+                *at.get_mut() = Slot::new(entry, hash);
+                ttl_replaced(list, old, entry);
+                // SAFETY: the table's hold on the old entry goes to the caller.
+                Ok(Some(unsafe { Taken::new(old) }))
+            }
+            hashbrown::hash_table::Entry::Vacant(place) => {
+                let entry = taken.into_entry();
+                place.insert(Slot::new(entry, hash));
+                if entry.has_ttl() {
+                    ttl_push(list, entry);
+                }
+                Ok(None)
+            }
         }
     }
 
@@ -1359,6 +1475,37 @@ mod tests {
         map.insert_expiring("live", s("a"), Some(u64::MAX - 1));
         map.insert("live", s("b"));
         assert_eq!(map.expires("live"), Some(u64::MAX - 1));
+    }
+
+    /// Nothing writes the access word of a key past its time: not the
+    /// lookup `GET` and `MGET` make, not `use_key` (a command refused, a key
+    /// named twice), not `touch` (a command whose use is written after it).
+    #[test]
+    fn a_key_past_its_time_is_not_used() {
+        let mut map = ShardMap::new();
+        map.insert_expiring("dead", s("1"), Some(1));
+        map.insert_expiring("live", s("1"), Some(u64::MAX - 1));
+        let dead = map.access("dead").unwrap();
+        // A use writes this word (an LRU clock).
+        let stamp = 12345;
+        assert_ne!(dead, stamp);
+        let _scope = super::access::AccessScope::open(stamp);
+
+        assert!(matches!(map.lookup("dead"), Lookup::Past));
+        map.use_key(b"dead");
+        map.touch(b"dead", |_| stamp);
+        assert_eq!(map.access("dead"), Some(dead));
+
+        assert!(matches!(
+            map.lookup("live"),
+            Lookup::Live(ValueRef::String(_))
+        ));
+        assert_eq!(map.access("live"), Some(stamp));
+        map.touch(b"live", |_| 777);
+        assert_eq!(map.access("live"), Some(777));
+        map.use_key(b"live");
+        assert_eq!(map.access("live"), Some(stamp));
+        assert!(matches!(map.lookup("none"), Lookup::Absent));
     }
 
     #[test]

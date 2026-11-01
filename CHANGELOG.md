@@ -44,6 +44,57 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`expired` comes before the event of a write that makes the key
+  again.** When the background sweep, or another client's read, deleted a
+  key past its time, its `expired` notification was published after the
+  key's shard was let go of. A write that came in between and made the key
+  anew (`INCR` on a counter whose window ran out, say) could have its own
+  event (`incrby`) published first, which Redis never does. `expired` is now
+  published before the shard is let go of.
+
+- **A key past its time is not counted as used.** Under an LRU or LFU
+  policy, `MGET`, a `GET` on a replica, a command refused with an error,
+  a key a command names twice, and a script's commands could bring the
+  idle time or the count of a key already past its time up to date, as if
+  it had been used: the lookup wrote the key's use before its deadline was
+  looked at. Only a live key's use is written now, and `GET` looks at the
+  time once.
+
+- **`lazyfree-lazy-expire` in a config file is applied, and said to be.**
+  1.1 accepted the directive and ignored it: `CONFIG GET` still said `yes`
+  and expired keys still reached the AOF and replicas as `UNLINK` (#232).
+  1.2 applied it, but its startup log said it had no effect, as it said of
+  `latency-tracking` and `latency-tracking-info-percentiles`, which have
+  one too; it no longer does. `lazyfree-lazy-expire`, the other
+  `lazyfree-*` settings and `latency-tracking` take only `yes` or `no`, in
+  a config file and in `CONFIG SET`, as in Redis; any value was taken.
+
+- **A script may not run what Redis does not let a script run.** Redis
+  refuses, from `EVAL` and `FCALL`, the commands its command table flags
+  `noscript`, with "This Redis command is not allowed from script":
+  `SAVE`, `BGSAVE`, `BGREWRITEAOF`, `SHUTDOWN`, `CONFIG GET` / `SET` /
+  `REWRITE`, `ACL` and `CLIENT` subcommands, `MULTI`, `EXEC`, `WATCH`, the
+  subscribe commands, `MONITOR`, `REPLICAOF`, `DEBUG`, `HELLO`, `EVAL`
+  itself and others. KiviDB refused only `CLUSTER`, `HOTKEYS` and `BACKUP`,
+  and ran the rest. A `SAVE` in a script on a replica could hang it: the
+  script held a slot of the write gate and waited for the replication
+  applier, which waited for a backup's or a full sync's cut, which waited
+  for the gate. The list is now Redis 8.10's. Of `CLUSTER`, a script may
+  run what only reads (`INFO`, `NODES`, `SLOTS`, `KEYSLOT`, ...), as in
+  Redis, but not what changes the cluster, which Redis allows: a slot's
+  handoff here waits for the writes in flight, the script among them.
+  `HOTKEYS HELP`, `BACKUP LIST` and `BACKUP STATUS` run from a script, as in
+  Redis.
+
+- **A key a command leaves where it was keeps its LFU count.** `GETDEL` of
+  a key of another type took the key out, saw its type, and put it back as
+  a new key: its time to live was kept, but under an LFU policy its access
+  count started again at 5 (#221). `MOVE` to a database that already has
+  the key, and `RENAME` of a key to itself, did the same. Each now looks
+  at the key and leaves it as it is, counting the lookup as a use, as
+  Redis does. A key `MOVE` does move keeps its count and its idle time, as
+  its object does in Redis; it used to start afresh.
+
 - **HNSW vectors written after a checkpoint are found again after a crash.**
   A checkpoint (`BGREWRITEAOF`, the automatic AOF rewrite, or `SAVE` /
   `BGSAVE` with the AOF on) writes `dump.kdb` with the HNSW graphs, and

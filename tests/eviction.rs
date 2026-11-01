@@ -878,6 +878,70 @@ fn switching_between_lru_and_lfu_at_runtime_starts_each_key_afresh() {
     assert!(c.cmd(&["OBJECT", "IDLETIME", "bar"]).i() < 2);
 }
 
+/// A command that finds a key it does not act on leaves the key as it was:
+/// its LFU count and its time to live (#221). `GETDEL` of a key of another
+/// type took the key out and put a new one in, which started at 5, as did
+/// `MOVE` to a database that has the key, and `RENAME` of a key to itself.
+/// Each looks the key up, a use of it, as Redis does. A key `MOVE` does move
+/// keeps its count and its time to live, as its object does in Redis.
+#[test]
+fn a_key_left_where_it_was_keeps_its_count() {
+    let server = Server::start(&["--maxmemory-policy", "allkeys-lfu"]);
+    let mut c = server.conn();
+    // Every use counted, nothing decays: the counts are exact.
+    for (name, value) in [("lfu-log-factor", "0"), ("lfu-decay-time", "0")] {
+        assert!(c.cmd(&["CONFIG", "SET", name, value]).ok(), "{name}");
+    }
+    let freq = |c: &mut Conn, key: &str| c.cmd(&["OBJECT", "FREQ", key]).i();
+    let ttl_kept = |c: &mut Conn, key: &str| {
+        let ttl = c.cmd(&["PTTL", key]).i();
+        assert!(ttl > 50_000, "{key}: pttl {ttl}");
+    };
+    for key in ["h", "m", "r"] {
+        assert_eq!(c.cmd(&["HSET", key, "f", "v"]).i(), 1);
+        for _ in 0..20 {
+            c.cmd(&["HGET", key, "f"]);
+        }
+        assert_eq!(c.cmd(&["PEXPIRE", key, "100000"]).i(), 1);
+    }
+
+    let before = freq(&mut c, "h");
+    assert!(before > 20, "freq {before}");
+    let refused = c.cmd(&["GETDEL", "h"]);
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(freq(&mut c, "h"), before + 1, "GETDEL of a hash");
+    ttl_kept(&mut c, "h");
+
+    let before = freq(&mut c, "m");
+    assert!(c.cmd(&["SELECT", "1"]).ok());
+    assert!(c.cmd(&["SET", "m", "there"]).ok());
+    assert!(c.cmd(&["SELECT", "0"]).ok());
+    assert_eq!(c.cmd(&["MOVE", "m", "1"]).i(), 0);
+    assert_eq!(
+        freq(&mut c, "m"),
+        before + 1,
+        "MOVE to a database that has it"
+    );
+    ttl_kept(&mut c, "m");
+    assert!(c.cmd(&["SELECT", "1"]).ok());
+    assert_eq!(c.cmd(&["DEL", "m"]).i(), 1);
+    assert!(c.cmd(&["SELECT", "0"]).ok());
+    assert_eq!(c.cmd(&["MOVE", "m", "1"]).i(), 1);
+    assert_eq!(c.cmd(&["EXISTS", "m"]).i(), 0);
+    assert!(c.cmd(&["SELECT", "1"]).ok());
+    assert_eq!(freq(&mut c, "m"), before + 2, "MOVE");
+    ttl_kept(&mut c, "m");
+    assert_eq!(c.cmd(&["HGET", "m", "f"]).s(), "v");
+    assert!(c.cmd(&["SELECT", "0"]).ok());
+
+    let before = freq(&mut c, "r");
+    assert!(c.cmd(&["RENAME", "r", "r"]).ok());
+    // Named twice, so counted twice (see `each_command_family_uses_its_keys_once`).
+    assert_eq!(freq(&mut c, "r"), before + 2, "RENAME to itself");
+    ttl_kept(&mut c, "r");
+    assert!(c.cmd(&["RENAME", "nothere", "nothere"]).is_err());
+}
+
 /// Which commands are a use of which keys, family by family: each command
 /// that reads or writes a key counts once (LFU, every use counted:
 /// `lfu-log-factor 0`), and what only asks about a key never does. The use

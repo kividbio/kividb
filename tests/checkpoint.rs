@@ -519,9 +519,9 @@ fn threads(pid: u32) -> usize {
 
 /// `SAVE` and `BGSAVE` while a `BGREWRITEAOF` runs wait for it, and then
 /// save. A checkpoint has its turn while it waits for the write gate, so a
-/// `SAVE` from inside a write — from a script, which holds the gate — must
-/// not wait for that turn: it would be waiting for a checkpoint that waits
-/// for it. It is told a checkpoint is in progress.
+/// `SAVE` from inside a write — from a script, which holds the gate — would
+/// be waiting for a checkpoint that waits for it. A script may not run
+/// `SAVE` at all, as in Redis, during a checkpoint or not.
 #[test]
 fn saves_during_a_rewrite_wait_for_it_and_never_deadlock() {
     for &io in io_models() {
@@ -547,18 +547,19 @@ fn saves_during_a_rewrite_wait_for_it_and_never_deadlock() {
         #[cfg(feature = "lua")]
         {
             let script = "return redis.call('SAVE')";
+            let not_allowed =
+                |reply: &V| matches!(reply, V::Err(e) if e.contains("not allowed from script"));
             assert_eq!(c.cmd(&["BGREWRITEAOF"]).s(), STARTED);
             let held = wait_for_any(&server.dir, "failpoint.checkpoint-cutting.");
             let refused = c.cmd(&["EVAL", script, "0"]);
             assert!(
-                matches!(&refused, V::Err(e) if e.contains("checkpoint is in progress")),
+                not_allowed(&refused),
                 "{io}: SAVE in a script during a checkpoint: {refused:?}"
             );
             std::fs::remove_file(&held).unwrap();
             wait_idle(&mut c);
-            let releasing = release_all(&server.dir);
-            assert!(c.cmd(&["EVAL", script, "0"]).ok(), "{io}: SAVE in a script");
-            releasing.stop();
+            let refused = c.cmd(&["EVAL", script, "0"]);
+            assert!(not_allowed(&refused), "{io}: SAVE in a script: {refused:?}");
         }
 
         assert!(c.cmd(&["SET", "after", "1"]).ok());

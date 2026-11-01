@@ -966,6 +966,28 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                 }
                 _ => Some(resp_error("ERR argument must be 'yes' or 'no'")),
             },
+            // Settings of Redis's that take yes or no: remembered, and in
+            // effect where KiviDB has what they set (`lazyfree-lazy-expire`
+            // decides whether a key that expires is propagated as `UNLINK`
+            // or `DEL`; `latency-tracking`, whether `INFO latencystats`
+            // reports). Anything else is refused, as Redis refuses it.
+            "lazyfree-lazy-eviction"
+            | "lazyfree-lazy-expire"
+            | "lazyfree-lazy-server-del"
+            | "lazyfree-lazy-user-del"
+            | "lazyfree-lazy-user-flush"
+            | "latency-tracking" => match value.to_ascii_lowercase().as_str() {
+                yes_no @ ("yes" | "no") => {
+                    REMEMBERED_CONFIG
+                        .lock()
+                        .insert(param.clone(), yes_no.to_string());
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(&format!(
+                    "ERR CONFIG SET failed (possibly related to argument '{param}') - argument \
+                     must be 'yes' or 'no'"
+                ))),
+            },
             // The policy of a series made without one (#127).
             "ts-duplicate-policy" => match crate::types::DuplicatePolicy::parse(value) {
                 Some(policy) => {
