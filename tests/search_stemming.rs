@@ -781,3 +781,540 @@ fn highlighting_marks_words_found_by_their_stems() {
     );
     c.cmd(&["FT.DROPINDEX", "hl", "DD"]);
 }
+
+/// Makes `index` on `prefix` with `schema`, and the hashes `docs` (a key's
+/// suffix and its field/value pairs).
+fn index_of(c: &mut Conn, index: &str, prefix: &str, schema: &[&str], docs: &[(&str, &[&str])]) {
+    let mut create = vec![
+        "FT.CREATE",
+        index,
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        prefix,
+        "SCHEMA",
+    ];
+    create.extend_from_slice(schema);
+    assert!(c.cmd(&create).ok(), "{create:?}");
+    for (id, fields) in docs {
+        let key = format!("{prefix}{id}");
+        let mut hset = vec!["HSET", key.as_str()];
+        hset.extend_from_slice(fields);
+        c.cmd(&hset);
+    }
+}
+
+/// The ids and scores of `FT.SEARCH index query WITHSCORES NOCONTENT
+/// extra…` against Redis's, in the order of the reply: each place holds the
+/// score Redis's reply has there (so the order by score is Redis's), and
+/// each document its own score (so documents that tie may come either way).
+fn assert_ranked(c: &mut Conn, index: &str, query: &str, extra: &[&str], want: &[(&str, f64)]) {
+    let mut args = vec!["FT.SEARCH", index, query, "WITHSCORES", "NOCONTENT"];
+    args.extend_from_slice(extra);
+    let reply = c.cmd(&args);
+    let got = reply.scores();
+    let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * b.abs().max(1.0);
+    assert_eq!(got.len(), want.len(), "{query} {extra:?}: {reply:?}");
+    for ((id, g), (_, w)) in got.iter().zip(want) {
+        assert!(
+            close(*g, *w),
+            "{query} {extra:?}: {id} in Redis's place of {w}: {reply:?}"
+        );
+        let own = want.iter().find(|(k, _)| k == id);
+        assert!(
+            own.is_some_and(|(_, s)| close(*g, *s)),
+            "{query} {extra:?}: {id} scored {g}, Redis {own:?}"
+        );
+    }
+}
+
+/// #233: a document that holds the query's very word ranks above one that
+/// holds only another form of it, by the scores Redis 8.10.2 gives. The
+/// expected replies were read off Redis (search module 8.10.1) for the same
+/// commands, `EXPLAINSCORE` showing where each score comes from: the word
+/// and its `+stem` both score in a document that holds the word, and only
+/// the `+stem`, a rarer term's weight on a commoner one, in one that holds
+/// another form.
+#[test]
+fn the_very_word_ranks_above_its_other_forms() {
+    let _one = one_at_a_time();
+    let mut c = conn();
+
+    // The report's two documents.
+    index_of(
+        &mut c,
+        "rk",
+        "rk:",
+        &["t", "TEXT"],
+        &[
+            ("1", &["t", "cables here"][..]),
+            ("2", &["t", "cable cable"][..]),
+        ],
+    );
+    let (high, low) = (1.2037695220150502, 0.1823215567939546);
+    let cases: [Case; 10] = [
+        ("cable", &[], &[("rk:2", high), ("rk:1", low)]),
+        (
+            "cable",
+            &["SCORER", "BM25STD"],
+            &[("rk:2", high), ("rk:1", low)],
+        ),
+        ("cable", &["DIALECT", "2"], &[("rk:2", high), ("rk:1", low)]),
+        ("@t:cable", &[], &[("rk:2", high), ("rk:1", low)]),
+        (
+            "cable",
+            &["SCORER", "TFIDF"],
+            &[("rk:2", 3.0), ("rk:1", 1.0)],
+        ),
+        (
+            "cable",
+            &["SCORER", "TFIDF.DOCNORM"],
+            &[("rk:2", 3.0), ("rk:1", 0.5)],
+        ),
+        (
+            "cable",
+            &["SCORER", "BM25"],
+            &[("rk:2", 1.5789473387012856), ("rk:1", 0.3571428480196975)],
+        ),
+        (
+            "cable",
+            &["SCORER", "DISMAX"],
+            &[("rk:2", 2.0), ("rk:1", 1.0)],
+        ),
+        ("cable", &["VERBATIM"], &[("rk:2", 0.9530773797253608)]),
+        (
+            "cables",
+            &[],
+            &[("rk:1", 0.8754687373538999), ("rk:2", 0.25069214228968933)],
+        ),
+    ];
+    for (query, extra, want) in cases {
+        assert_ranked(&mut c, "rk", query, extra, want);
+    }
+    c.cmd(&["FT.DROPINDEX", "rk", "DD"]);
+
+    // A family of forms, and documents of other lengths.
+    index_of(
+        &mut c,
+        "fam",
+        "fam:",
+        &["t", "TEXT"],
+        &[
+            ("1", &["t", "cable"][..]),
+            ("2", &["t", "cables"][..]),
+            ("3", &["t", "cabling is fun"][..]),
+            ("4", &["t", "cable cables"][..]),
+            (
+                "5",
+                &["t", "the red cable lies on the old wooden table today"][..],
+            ),
+            ("6", &["t", "unrelated words here"][..]),
+            ("7", &["t", "cabled"][..]),
+        ],
+    );
+    let stem_only = 0.2734405734914201;
+    let cases: [Case; 5] = [
+        (
+            "cable",
+            &[],
+            &[
+                ("fam:1", 1.3620947570853874),
+                ("fam:4", 1.1914166699801543),
+                ("fam:5", 0.5843427579431802),
+                ("fam:2", stem_only),
+                ("fam:7", stem_only),
+                ("fam:3", 0.22379574217925907),
+            ],
+        ),
+        (
+            "cable",
+            &["SCORER", "TFIDF"],
+            &[
+                ("fam:1", 2.0),
+                ("fam:5", 2.0),
+                ("fam:4", 1.5),
+                ("fam:2", 1.0),
+                ("fam:3", 1.0),
+                ("fam:7", 1.0),
+            ],
+        ),
+        (
+            "cable",
+            &["SCORER", "BM25"],
+            &[
+                ("fam:4", 0.8200605315388058),
+                ("fam:1", 0.6542055899841382),
+                ("fam:5", 0.6542055899841382),
+                ("fam:2", 0.3271027949920691),
+                ("fam:3", 0.3271027949920691),
+                ("fam:7", 0.3271027949920691),
+            ],
+        ),
+        (
+            "cables",
+            &[],
+            &[
+                ("fam:2", 1.805195521932676),
+                ("fam:4", 1.5540697439662934),
+                ("fam:1", stem_only),
+                ("fam:7", stem_only),
+                ("fam:3", 0.22379574217925907),
+                ("fam:5", 0.11730683053904799),
+            ],
+        ),
+        (
+            "cable",
+            &["VERBATIM"],
+            &[
+                ("fam:1", 1.0886541835939674),
+                ("fam:4", 0.8910022674510373),
+                ("fam:5", 0.46703592740413225),
+            ],
+        ),
+    ];
+    for (query, extra, want) in cases {
+        assert_ranked(&mut c, "fam", query, extra, want);
+    }
+    c.cmd(&["FT.DROPINDEX", "fam", "DD"]);
+
+    // Field weights: a stem counts a fifth of its field's weight.
+    index_of(
+        &mut c,
+        "wt",
+        "wt:",
+        &["t", "TEXT", "WEIGHT", "2", "u", "TEXT", "WEIGHT", "5"],
+        &[
+            ("1", &["t", "cables here"][..]),
+            ("2", &["t", "cable cable"][..]),
+            ("3", &["u", "cable"][..]),
+            ("4", &["u", "cables"][..]),
+            ("5", &["t", "cable", "u", "cables"][..]),
+        ],
+    );
+    let cases: [Case; 3] = [
+        (
+            "cable",
+            &[],
+            &[
+                ("wt:2", 1.0716259801258294),
+                ("wt:3", 1.0432955045649779),
+                ("wt:5", 0.7737176049767156),
+                ("wt:1", 0.09476486618083234),
+                ("wt:4", 0.0870113769896297),
+            ],
+        ),
+        (
+            "cable",
+            &["SCORER", "TFIDF"],
+            &[
+                ("wt:2", 1.5),
+                ("wt:3", 1.2),
+                ("wt:5", 0.8),
+                ("wt:1", 0.5),
+                ("wt:4", 0.2),
+            ],
+        ),
+        (
+            "cables",
+            &[],
+            &[
+                ("wt:4", 1.0432955045649779),
+                ("wt:5", 1.0113472707786577),
+                ("wt:1", 0.8800577876370255),
+                ("wt:2", 0.12677154368020685),
+                ("wt:3", 0.0870113769896297),
+            ],
+        ),
+    ];
+    for (query, extra, want) in cases {
+        assert_ranked(&mut c, "wt", query, extra, want);
+    }
+    c.cmd(&["FT.DROPINDEX", "wt", "DD"]);
+
+    // A NOSTEM field holds no stems: there, only the very word is found.
+    index_of(
+        &mut c,
+        "nst",
+        "nst:",
+        &["t", "TEXT", "NOSTEM", "u", "TEXT"],
+        &[
+            ("1", &["t", "cables here"][..]),
+            ("2", &["t", "cable cable"][..]),
+            ("3", &["u", "cables here"][..]),
+            ("4", &["u", "cable cable"][..]),
+        ],
+    );
+    let cases: [Case; 4] = [
+        (
+            "cable",
+            &[],
+            &[
+                ("nst:4", 1.9061547594507215),
+                ("nst:2", 0.9530773797253608),
+                ("nst:3", std::f64::consts::LN_2),
+            ],
+        ),
+        ("@t:cable", &[], &[("nst:2", 0.9530773797253608)]),
+        (
+            "@u:cable",
+            &[],
+            &[
+                ("nst:4", 1.9061547594507215),
+                ("nst:3", std::f64::consts::LN_2),
+            ],
+        ),
+        (
+            "cables",
+            &[],
+            &[
+                ("nst:3", 1.3862943611198906),
+                ("nst:4", 0.9530773797253608),
+                ("nst:1", std::f64::consts::LN_2),
+            ],
+        ),
+    ];
+    for (query, extra, want) in cases {
+        assert_ranked(&mut c, "nst", query, extra, want);
+    }
+    c.cmd(&["FT.DROPINDEX", "nst", "DD"]);
+
+    // Longer documents, and a word repeated.
+    index_of(
+        &mut c,
+        "len",
+        "len:",
+        &["t", "TEXT"],
+        &[
+            ("1", &["t", "cables"][..]),
+            (
+                "2",
+                &["t", "cable one two three four five six seven eight nine"][..],
+            ),
+            (
+                "3",
+                &["t", "cable cable cable one two three four five six seven"][..],
+            ),
+            ("4", &["t", "cables cables cables"][..]),
+            ("5", &["t", "running runner runs ran"][..]),
+        ],
+    );
+    assert_ranked(
+        &mut c,
+        "len",
+        "cable",
+        &[],
+        &[
+            ("len:3", 1.5644124526306038),
+            ("len:2", 0.8802222305803186),
+            ("len:4", 0.5020174476346607),
+            ("len:1", 0.43328156051409783),
+        ],
+    );
+    assert_ranked(
+        &mut c,
+        "len",
+        "cable",
+        &["SCORER", "TFIDF.DOCNORM"],
+        &[
+            ("len:1", 1.0),
+            ("len:4", 1.0),
+            ("len:3", 0.9),
+            ("len:2", 0.3),
+        ],
+    );
+    c.cmd(&["FT.DROPINDEX", "len", "DD"]);
+}
+
+/// The rows of an FT.AGGREGATE reply (after the count), as name/value pairs.
+fn agg_rows(reply: &V) -> Vec<Vec<(String, String)>> {
+    reply.arr()[1..]
+        .iter()
+        .map(|row| {
+            row.arr()
+                .chunks(2)
+                .map(|p| (p[0].s().to_string(), p[1].s().to_string()))
+                .collect()
+        })
+        .collect()
+}
+
+/// #234: `ADDSCORES` puts `__score` first in every row, whatever else the
+/// command asks to see, as Redis 8.10.2 does. Without a `LOAD` or a
+/// `SORTBY` naming it, the rows came back empty.
+#[test]
+fn aggregate_addscores_puts_the_score_in_every_row() {
+    let _one = one_at_a_time();
+    let mut c = conn();
+    index_of(
+        &mut c,
+        "ag",
+        "ag:",
+        &["t", "TEXT", "n", "NUMERIC", "SORTABLE"],
+        &[
+            ("1", &["t", "cables here", "n", "1"][..]),
+            ("2", &["t", "cable cable", "n", "2"][..]),
+        ],
+    );
+    let (high, low) = (1.2037695220150502, 0.1823215567939546);
+    let close = |a: &str, b: f64| (a.parse::<f64>().unwrap() - b).abs() <= 1e-9;
+    let agg = |c: &mut Conn, tail: &[&str]| {
+        let mut args = vec!["FT.AGGREGATE", "ag"];
+        args.extend_from_slice(tail);
+        agg_rows(&c.cmd(&args))
+    };
+    let names = |rows: &[Vec<(String, String)>]| -> Vec<Vec<String>> {
+        rows.iter()
+            .map(|row| row.iter().map(|(k, _)| k.clone()).collect())
+            .collect()
+    };
+
+    // The score alone; the rows in no set order.
+    let rows = agg(&mut c, &["cable", "ADDSCORES"]);
+    assert_eq!(names(&rows), [["__score"], ["__score"]]);
+    let mut scores: Vec<f64> = rows.iter().map(|r| r[0].1.parse().unwrap()).collect();
+    scores.sort_by(f64::total_cmp);
+    assert!(close(&scores[0].to_string(), low) && close(&scores[1].to_string(), high));
+    for tail in [
+        &["*", "ADDSCORES"][..],
+        &["cable", "ADDSCORES", "DIALECT", "2"][..],
+        &["cable", "ADDSCORES", "SCORER", "TFIDF"][..],
+        &["cable", "ADDSCORES", "LOAD", "1", "@__score"][..],
+    ] {
+        assert_eq!(
+            names(&agg(&mut c, tail)),
+            [["__score"], ["__score"]],
+            "{tail:?}"
+        );
+    }
+
+    // Ahead of what is loaded, sorted by or computed.
+    let rows = agg(&mut c, &["cable", "ADDSCORES", "LOAD", "1", "@t"]);
+    assert_eq!(names(&rows), [["__score", "t"], ["__score", "t"]]);
+    let rows = agg(&mut c, &["cable", "ADDSCORES", "SORTBY", "2", "@n", "DESC"]);
+    assert_eq!(names(&rows), [["__score", "n"], ["__score", "n"]]);
+    assert!(close(&rows[0][0].1, high) && rows[0][1].1 == "2");
+    assert!(close(&rows[1][0].1, low) && rows[1][1].1 == "1");
+    let rows = agg(
+        &mut c,
+        &["cable", "ADDSCORES", "APPLY", "@__score*2", "AS", "s2"],
+    );
+    assert_eq!(names(&rows), [["__score", "s2"], ["__score", "s2"]]);
+    let rows = agg(&mut c, &["cable", "ADDSCORES", "LOAD", "*"]);
+    assert!(
+        rows.iter()
+            .all(|row| row[0].0 == "__score" && row.len() == 3)
+    );
+    let rows = agg(&mut c, &["cable", "ADDSCORES", "FILTER", "@__score > 0.5"]);
+    assert_eq!(names(&rows), [["__score"]]);
+    assert!(close(&rows[0][0].1, high));
+    let rows = agg(
+        &mut c,
+        &["cable", "ADDSCORES", "SORTBY", "2", "@__score", "DESC"],
+    );
+    assert!(close(&rows[0][0].1, high) && close(&rows[1][0].1, low));
+
+    // A group has no score of its own.
+    let rows = agg(
+        &mut c,
+        &[
+            "cable",
+            "ADDSCORES",
+            "GROUPBY",
+            "0",
+            "REDUCE",
+            "SUM",
+            "1",
+            "@__score",
+            "AS",
+            "total",
+        ],
+    );
+    assert_eq!(names(&rows), [["total"]]);
+    assert!((rows[0][0].1.parse::<f64>().unwrap() - (high + low)).abs() < 1e-5);
+
+    // Without ADDSCORES, no score.
+    assert_eq!(names(&agg(&mut c, &["cable"])), [[""; 0], [""; 0]]);
+
+    // A cursor's rows too.
+    let reply = c.cmd(&[
+        "FT.AGGREGATE",
+        "ag",
+        "cable",
+        "ADDSCORES",
+        "WITHCURSOR",
+        "COUNT",
+        "1",
+    ]);
+    let first = agg_rows(&reply.arr()[0]);
+    assert_eq!(names(&first), [["__score"]]);
+    if let V::Int(cursor) = reply.arr()[1] {
+        c.cmd(&["FT.CURSOR", "DEL", "ag", &cursor.to_string()]);
+    }
+    c.cmd(&["FT.DROPINDEX", "ag", "DD"]);
+}
+
+/// #234: `FT.EXPLAIN` shows what the query runs, a word shorter than
+/// `MINSTEMLEN` expanded with its stems as the query is (the length limits
+/// which words are indexed with a stem, not what a query looks for), as
+/// Redis 8.10.2 shows and runs it. And the shape of Redis's text: `NOT{`,
+/// `OPTIONAL{`, `<empty>`, and `FT.EXPLAINCLI`'s empty last line.
+#[test]
+fn explain_shows_what_the_query_runs() {
+    let _one = one_at_a_time();
+    let mut c = conn();
+    assert!(c.cmd(&["CONFIG", "SET", "search-min-stem-len", "6"]).ok());
+    index_of(
+        &mut c,
+        "es",
+        "es:",
+        &["t", "TEXT"],
+        &[("1", &["t", "cats"][..]), ("2", &["t", "cat"][..])],
+    );
+    let plan = c.cmd(&["FT.EXPLAIN", "es", "cats"]);
+    let found = c.cmd(&["FT.SEARCH", "es", "cats", "NOCONTENT"]);
+    let lines = c.cmd(&["FT.EXPLAINCLI", "es", "cats"]);
+    let not = c.cmd(&["FT.EXPLAIN", "es", "-cats"]);
+    let optional = c.cmd(&["FT.EXPLAIN", "es", "foo ~cats", "DIALECT", "2"]);
+    let empty = c.cmd(&["FT.EXPLAIN", "es", "is"]);
+    assert!(c.cmd(&["CONFIG", "SET", "search-min-stem-len", "4"]).ok());
+    c.cmd(&["FT.DROPINDEX", "es", "DD"]);
+
+    let cats = "UNION {\n  cats\n  +cat(expanded)\n  cat(expanded)\n}\n";
+    assert_eq!(plan.s(), cats);
+    assert_eq!(found.id_set(), ["es:1", "es:2"]);
+    assert_eq!(
+        lines,
+        V::Arr(
+            [
+                "UNION {",
+                "  cats",
+                "  +cat(expanded)",
+                "  cat(expanded)",
+                "}",
+                ""
+            ]
+            .iter()
+            .map(|s| V::Str(s.to_string()))
+            .collect()
+        )
+    );
+    assert_eq!(
+        not.s(),
+        "NOT{\n  UNION {\n    cats\n    +cat(expanded)\n    cat(expanded)\n  }\n}\n"
+    );
+    assert_eq!(
+        optional.s(),
+        "INTERSECT {\n  UNION {\n    foo\n    +foo(expanded)\n  }\n  OPTIONAL{\n    UNION {\n      \
+         cats\n      +cat(expanded)\n      cat(expanded)\n    }\n  }\n}\n"
+    );
+    assert_eq!(empty.s(), "<empty>\n");
+
+    // FT.DEBUG HELP names the subcommands.
+    let help = c.cmd(&["FT.DEBUG", "HELP"]);
+    let help: Vec<&str> = help.arr().iter().map(V::s).collect();
+    assert!(
+        help.contains(&"COMPACT") && help.contains(&"HELP"),
+        "{help:?}"
+    );
+}

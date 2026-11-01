@@ -2408,7 +2408,8 @@ fn explain_and_profile_describe_the_query() {
     );
     assert_eq!(
         c.cmd(&["FT.EXPLAINCLI", "a4", "-@genre:{crime}"]),
-        strings(&["NOT {", "  TAG:@genre {", "    crime", "  }", "}"])
+        // As Redis 8.10 has it: `NOT{`, and an empty last line.
+        strings(&["NOT{", "  TAG:@genre {", "    crime", "  }", "}", ""])
     );
     assert_eq!(c.cmd(&["FT.EXPLAIN", "a4", "*"]).s(), "<WILDCARD>\n");
     assert!(c.cmd(&["FT.EXPLAIN", "a4", "@nothere:x"]).is_err_reply());
