@@ -425,7 +425,14 @@ fn key_in(range: std::ops::RangeInclusive<u16>, prefix: &str) -> String {
 /// other and agreeing the cluster is up. Returns the nodes and each one's
 /// inclusive slot range.
 fn form_cluster(masters: usize) -> (Vec<Node>, Vec<(u16, u16)>) {
-    let nodes: Vec<Node> = (0..masters).map(|_| Node::start(&[])).collect();
+    form_cluster_with_env(masters, &[])
+}
+
+/// [`form_cluster`], each node's process given `env` as well.
+fn form_cluster_with_env(masters: usize, env: &[(&str, &str)]) -> (Vec<Node>, Vec<(u16, u16)>) {
+    let nodes: Vec<Node> = (0..masters)
+        .map(|_| Node::start_with_env(&[], env))
+        .collect();
     let per = 16384 / masters;
     let mut ranges = Vec::new();
     for (i, node) in nodes.iter().enumerate() {
@@ -2017,6 +2024,169 @@ fn a_manual_failover_that_runs_out_of_time_loses_no_acknowledged_write() {
         "{} acknowledged INCRs lost: the counter is {value}, {acked} were acknowledged",
         acked - value
     );
+}
+
+/// `KIVIDB_TEST_BUS_CONTROL`: the file, in a node's directory, that stalls
+/// or mutes its cluster bus while the rest of it serves on.
+const BUS_CONTROL: (&str, &str) = ("KIVIDB_TEST_BUS_CONTROL", "bus-control");
+
+/// Stall (`stall`), mute (`mute`) or run (`run`) `node`'s cluster bus.
+fn set_bus(node: &Node, mode: &str) {
+    std::fs::write(node.dir.join(BUS_CONTROL.1), mode).unwrap();
+}
+
+/// A manual failover given up, and the automatic one that followed it, lose
+/// no write the master acknowledged (#242). Seen under load: the master was
+/// slow to answer the bus, the replica did not win in time and gave the
+/// failover up, the master was marked FAIL meanwhile, and the replica stood
+/// again of its own accord and won. The master's hold on writes for the
+/// failover ran out before that, and it took writes again; those it
+/// acknowledged between the replica's promotion and its own hearing of it,
+/// 1.5 s later, were lost. Here the master's bus stalls once the replica
+/// stands, and the votes reach the replica 6 s late, so the failover runs
+/// out of time and the replica wins the election after it, past the
+/// master's 10 s. The master now holds writes from the failover on until it
+/// has made sure it still owns its slots, which it learns it does not.
+#[test]
+fn a_master_whose_manual_failover_was_given_up_holds_writes_until_it_knows_its_slots() {
+    let (nodes, ranges) = form_cluster_with_env(3, &[BUS_CONTROL]);
+    let replica = add_replica_with_env(&nodes, &nodes[0], &[("KIVIDB_TEST_VOTE_DELAY_MS", "6000")]);
+    {
+        let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+        wait_cluster_ok(&all, 4);
+    }
+    let key = key_in(ranges[0].0..=ranges[0].1, "given-up");
+    let logs = || {
+        let logs: Vec<String> = nodes
+            .iter()
+            .chain(std::iter::once(&replica))
+            .map(|n| format!("==== node {}\n{}", n.port, n.log()))
+            .collect();
+        logs.join("\n")
+    };
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writers: Vec<_> = (0..4)
+        .map(|_| counting_writer(&stop, &key, [nodes[0].port, replica.port]))
+        .collect();
+    std::thread::sleep(Duration::from_millis(500));
+
+    let asked = Instant::now();
+    let reply = replica.conn().cmd(&["CLUSTER", "FAILOVER"]);
+    assert!(reply.is_ok(), "CLUSTER FAILOVER: {reply:?}");
+    wait_until("the replica to stand", Duration::from_secs(10), || {
+        replica.log().contains("Manual failover: starting election")
+    });
+    set_bus(&nodes[0], "stall");
+
+    let took_over = (0..400).any(|_| {
+        std::thread::sleep(Duration::from_millis(100));
+        replica.is_master()
+    });
+    if !took_over {
+        set_bus(&nodes[0], "run");
+        panic!("the replica did not take over within 40 s\n{}", logs());
+    }
+    let replica_log = replica.log();
+    assert!(
+        replica_log.contains("Manual failover abandoned")
+            && replica_log.contains("Starting election for epoch"),
+        "the replica was to give the manual failover up, then win an election of its own\n{}",
+        logs()
+    );
+    // The master's bus runs again 2 s after the promotion, and not before
+    // its hold for the failover has had time to run out (10 s).
+    let resume = (Instant::now() + Duration::from_secs(2)).max(asked + Duration::from_secs(13));
+    std::thread::sleep(resume.saturating_duration_since(Instant::now()));
+    set_bus(&nodes[0], "run");
+
+    wait_until(
+        "the old master to follow the new one",
+        Duration::from_secs(30),
+        || {
+            !nodes[0].is_master()
+                && nodes[0].repl_info("master_link_status").as_deref() == Some("up")
+        },
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let acked: i64 = writers.into_iter().map(|w| w.join().unwrap()).sum();
+    assert!(acked > 0, "the writers never got a write through");
+
+    // Not equal, necessarily: an INCR held for longer than the client waits
+    // is applied, but was never acknowledged.
+    let value: i64 = replica.conn().cmd(&["GET", &key]).text().parse().unwrap();
+    assert!(
+        value >= acked,
+        "{} acknowledged INCRs lost: the counter is {value}, {acked} were acknowledged\n{}",
+        acked - value,
+        logs()
+    );
+}
+
+/// A master that hears the cluster has marked it FAIL serves none of its
+/// slots until it has made sure it still owns them (#242): its replica is
+/// about to stand for election, and what the master acknowledged after the
+/// replica's promotion and before it heard of it would be lost. Here the
+/// master's bus is muted — it takes in what it is sent, but sends and
+/// answers nothing — so the others mark it FAIL and tell it so, and the
+/// replica's votes come too late to count, so no failover happens. A write
+/// sent to the master then is refused, as Redis refuses one on a master cut
+/// off from the cluster, and taken again once the bus runs and the cluster
+/// has cleared the verdict.
+#[test]
+fn a_master_told_it_has_been_failed_holds_writes_until_it_knows_its_slots() {
+    let (nodes, ranges) = form_cluster_with_env(3, &[BUS_CONTROL]);
+    let replica =
+        add_replica_with_env(&nodes, &nodes[0], &[("KIVIDB_TEST_VOTE_DELAY_MS", "60000")]);
+    {
+        let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+        wait_cluster_ok(&all, 4);
+    }
+    let key = key_in(ranges[0].0..=ranges[0].1, "failed");
+    assert_eq!(nodes[0].conn().cmd(&["INCR", &key]), Resp::Int(1));
+
+    set_bus(&nodes[0], "mute");
+    let told = (0..200).any(|_| {
+        std::thread::sleep(Duration::from_millis(100));
+        nodes[0]
+            .log()
+            .contains("says this node has been marked FAIL: it serves none of its slots")
+    });
+    if !told {
+        set_bus(&nodes[0], "run");
+        panic!(
+            "the master did not hold writes within 20 s of its bus going quiet\n{}",
+            nodes[0].log()
+        );
+    }
+
+    // Refused, not acknowledged: the replica could be taking over.
+    let reply = nodes[0].conn().cmd(&["INCR", &key]);
+    assert!(
+        reply.err().is_some_and(|e| e.starts_with("CLUSTERDOWN")),
+        "INCR on a master the cluster holds failed: {reply:?}"
+    );
+    set_bus(&nodes[0], "run");
+    // No failover happened: once the others have cleared the verdict (two
+    // node timeouts after they reached it), the master takes writes again.
+    let mut answer = Resp::Nil;
+    let taken = (0..300).any(|_| {
+        std::thread::sleep(Duration::from_millis(100));
+        answer = nodes[0].conn().cmd(&["INCR", &key]);
+        !answer.err().is_some_and(|e| e.starts_with("CLUSTERDOWN"))
+    });
+    assert!(
+        taken && answer == Resp::Int(2),
+        "INCR: {answer:?}\n{}",
+        nodes[0].log()
+    );
+    wait_until(
+        "the master to say why it serves again",
+        Duration::from_secs(5),
+        || nodes[0].log().contains("this node still owns its slots"),
+    );
+    assert!(nodes[0].is_master() && !replica.is_master());
 }
 
 // ── Resharding ────────────────────────────────────────────────────────────────

@@ -62,6 +62,47 @@ pub struct ElectionState {
     pub deadline_ms: Option<u64>,
 }
 
+/// Why a master holds writes until it has made sure it still owns its
+/// slots. See [`ClusterState::hold_writes_until_confirmed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldReason {
+    /// Its replica asked to take over (`CLUSTER FAILOVER`): writes are
+    /// paused, as for the failover.
+    ManualFailover,
+    /// The cluster has marked it FAIL, and told it so: it serves none of its
+    /// slots (`-CLUSTERDOWN`).
+    MarkedFailed,
+}
+
+impl HoldReason {
+    fn describe(self) -> &'static str {
+        match self {
+            HoldReason::ManualFailover => "a manual failover",
+            HoldReason::MarkedFailed => "this node was marked FAIL",
+        }
+    }
+}
+
+/// Writes held by a master until it has made sure it still owns its slots.
+#[derive(Debug)]
+struct HeldWrites {
+    /// Why they are held: the first reason, if there came more.
+    reason: HoldReason,
+    /// When the hold began (Unix ms).
+    since_ms: u64,
+    /// When the cluster may next be asked (Unix ms).
+    ask_from_ms: u64,
+    /// A round of asking is under way.
+    asking: bool,
+    /// When "still held" was last logged (Unix ms; 0: never).
+    logged_ms: u64,
+    /// Writes are paused for it (`pause::hold_writes`).
+    paused: bool,
+}
+
+/// How long after a round that could not make sure the next one begins.
+const HELD_WRITES_RETRY_MS: u64 = 200;
+
 /// What the cluster layer needs from the rest of the server. Installed once
 /// at startup; absent in unit tests that exercise `ClusterState` on its own.
 pub struct ClusterHooks {
@@ -162,6 +203,7 @@ pub struct LostDataset {
 /// write, and a guard must not be kept across an `.await`. Where one thread
 /// holds several, it takes them in this order and no other: `forgotten`,
 /// `save_lock`, `failure_reports`, `nodes`, `slots`, `migrations`, `myself`.
+/// `held_writes` is only ever held alone.
 /// A temporary guard (`self.nodes.read().get(..)`) is held to the end of
 /// its statement, or of the `match` / `if let` / `for` it heads.
 pub struct ClusterState {
@@ -218,6 +260,13 @@ pub struct ClusterState {
     serving: AtomicBool,
     /// See [`LostDataset`].
     lost: LostDataset,
+    /// Writes this master holds until it has made sure it still owns its
+    /// slots. See [`Self::hold_writes_until_confirmed`].
+    held_writes: parking_lot::Mutex<Option<HeldWrites>>,
+    /// This master serves none of its slots, having been told it was marked
+    /// FAIL, until it has made sure it still owns them
+    /// ([`Self::note_marked_failed`]).
+    marked_failed: AtomicBool,
     /// `cluster-require-full-coverage`.
     require_full_coverage: AtomicBool,
     /// `cluster-replica-validity-factor`: how stale a replica's data may be
@@ -285,6 +334,8 @@ impl ClusterState {
             state_ok: AtomicBool::new(false),
             serving: AtomicBool::new(false),
             lost: LostDataset::default(),
+            held_writes: parking_lot::Mutex::new(None),
+            marked_failed: AtomicBool::new(false),
             require_full_coverage: AtomicBool::new(true),
             replica_validity_factor: AtomicU64::new(10),
             self_ip_is_guess: AtomicBool::new(false),
@@ -900,7 +951,7 @@ impl ClusterState {
                 ok = false;
             }
         }
-        let fenced = self.fence_holds();
+        let fenced = self.fence_holds() || self.marked_failed.load(Ordering::Relaxed);
         let ok = ok && !fenced;
         self.state_ok.store(ok, Ordering::Relaxed);
         self.serving.store(
@@ -1444,9 +1495,14 @@ impl ClusterState {
         // Whatever election we were running is moot: the shard has a master.
         *self.election.lock() = None;
         self.election_pending.store(false, Ordering::SeqCst);
-        // If we were holding writes for a manual failover, it has happened:
-        // release them, to be answered with a redirect to the new master.
+        // If we were holding writes, for a manual failover or until we knew
+        // whether we still owned our slots, the answer is in: let them go, to
+        // be answered with a redirect to the new master.
+        *self.held_writes.lock() = None;
         crate::pause::clear_pause();
+        if self.marked_failed.swap(false, Ordering::Relaxed) {
+            self.refresh_state();
+        }
         log_info!(
             "Cluster: Slots of this shard are now owned by {} — following it as a replica",
             node_id_str(&new_master)
@@ -2177,6 +2233,180 @@ impl ClusterState {
         self.refresh_state();
     }
 
+    // ── Writes held until this master knows it still owns its slots ──────────
+
+    /// Hold writes until this master has made sure it still owns its slots
+    /// (asked from `ask_from_ms` on, by the failure detector: see
+    /// [`Self::held_writes_due`]), or has learned that a replica took them
+    /// over and follows it ([`Self::follow_new_master`]). For a manual
+    /// failover they are paused, as a handoff pauses them; for a FAIL verdict
+    /// they are refused, with every other command on this master's keys
+    /// (`-CLUSTERDOWN`, see [`Self::note_marked_failed`]).
+    ///
+    /// Two things put a master in doubt (#242). Its replica asked to take
+    /// over (`CLUSTER FAILOVER`): the replica gives the failover up if it has
+    /// not won it in time, and the master used to take writes again when its
+    /// hold for it ran out. But a master slow enough for the failover to run
+    /// out of time can be slow enough to be marked FAIL, and its replica then
+    /// stands again, of its own accord. Or the cluster has marked it FAIL and
+    /// told it so: its replicas are about to stand. Either way, what it
+    /// acknowledged between a replica's promotion and its own hearing of it
+    /// was lost.
+    pub fn hold_writes_until_confirmed(&self, reason: HoldReason, ask_from_ms: u64) {
+        let pause = reason == HoldReason::ManualFailover;
+        if pause {
+            crate::pause::hold_writes();
+        } else {
+            self.marked_failed.store(true, Ordering::Relaxed);
+            self.refresh_state();
+        }
+        let mut held = self.held_writes.lock();
+        match held.as_mut() {
+            Some(h) => {
+                h.ask_from_ms = h.ask_from_ms.max(ask_from_ms);
+                h.paused |= pause;
+            }
+            None => {
+                *held = Some(HeldWrites {
+                    reason,
+                    since_ms: now_ms(),
+                    ask_from_ms,
+                    asking: false,
+                    logged_ms: 0,
+                    paused: pause,
+                })
+            }
+        }
+    }
+
+    /// Whether this master holds writes until it has made sure it still owns
+    /// its slots.
+    pub fn writes_held(&self) -> bool {
+        self.held_writes.lock().is_some()
+    }
+
+    /// Let the writes held go, if they are held, and log `why`.
+    pub fn release_held_writes(&self, why: &str) {
+        let Some(held) = self.held_writes.lock().take() else {
+            return;
+        };
+        // Said before it is done: a client is answered the moment it is.
+        log_info!(
+            "Cluster: Writes held since {} resumed after {} ms: {why}",
+            held.reason.describe(),
+            now_ms().saturating_sub(held.since_ms)
+        );
+        if self.marked_failed.swap(false, Ordering::Relaxed) {
+            self.refresh_state();
+        }
+        if held.paused && crate::pause::handoff() {
+            crate::pause::clear_pause();
+        }
+    }
+
+    /// From the failure detector: whether to ask the cluster, now, whether
+    /// this master still owns its slots. True once per round; the round ends
+    /// with [`Self::held_writes_answered`].
+    pub fn held_writes_due(&self) -> bool {
+        let mut held = self.held_writes.lock();
+        let Some(h) = held.as_mut() else {
+            return false;
+        };
+        if h.paused && !crate::pause::handoff() {
+            // Let go some other way (`CLIENT UNPAUSE`).
+            h.paused = false;
+            if !self.marked_failed.load(Ordering::Relaxed) {
+                let reason = h.reason;
+                *held = None;
+                drop(held);
+                log_warn!(
+                    "Cluster: Writes held since {} were let go before this node had made sure \
+                     it still owns its slots",
+                    reason.describe()
+                );
+                return false;
+            }
+        }
+        if h.asking || now_ms() < h.ask_from_ms {
+            return false;
+        }
+        h.asking = true;
+        true
+    }
+
+    /// The end of a round of asking: `Ok` if this master still owns its
+    /// slots, or why it cannot be sure of it yet.
+    pub fn held_writes_answered(&self, answer: Result<(), String>) {
+        let now = now_ms();
+        let mut held = self.held_writes.lock();
+        let Some(h) = held.as_mut() else {
+            return;
+        };
+        h.asking = false;
+        match answer {
+            Ok(()) => {
+                drop(held);
+                self.release_held_writes("this node still owns its slots");
+            }
+            Err(why) => {
+                h.ask_from_ms = now + HELD_WRITES_RETRY_MS;
+                if now.saturating_sub(h.logged_ms) >= 5_000 {
+                    h.logged_ms = now;
+                    let (reason, since) = (h.reason, h.since_ms);
+                    drop(held);
+                    log_warn!(
+                        "Cluster: Writes held since {} ({} ms ago) stay held: {why}",
+                        reason.describe(),
+                        now.saturating_sub(since)
+                    );
+                }
+            }
+        }
+    }
+
+    /// `reporter` says the cluster has marked this node FAIL. A master that
+    /// owns slots, and has a replica that can take them over, serves none of
+    /// them until it has made sure it still owns them (see
+    /// [`Self::hold_writes_until_confirmed`]): its replicas are about to
+    /// stand for election, and what it acknowledged after one of them was
+    /// promoted, and before it heard of it, would be lost. It answers
+    /// `-CLUSTERDOWN`, as a node does that sees the cluster down — and as
+    /// Redis does on a master whose messages do not get through, which sees
+    /// the others as unreachable. This node can still hear them, so its own
+    /// view of the cluster says nothing is wrong.
+    pub fn note_marked_failed(&self, reporter: NodeId) {
+        if !self.enabled {
+            return;
+        }
+        let me = self.myself();
+        let master = self
+            .nodes
+            .read()
+            .get(&me)
+            .is_some_and(|n| n.flags.contains(NodeFlags::MASTER));
+        if !master || !self.owns_any_slot(me) {
+            return;
+        }
+        if self.live_replicas_of_me() == 0 {
+            log_warn!(
+                "Cluster: {} says this node has been marked FAIL; no replica of it can take its \
+                 slots over, so it serves on",
+                node_id_str(&reporter)
+            );
+            return;
+        }
+        let first = !self.marked_failed.load(Ordering::Relaxed);
+        self.hold_writes_until_confirmed(HoldReason::MarkedFailed, now_ms());
+        if first {
+            log_warn!(
+                "Cluster: {} says this node has been marked FAIL: it serves none of its slots \
+                 (CLUSTERDOWN) until it has made sure it still owns them, or a replica has \
+                 taken them over",
+                node_id_str(&reporter)
+            );
+        }
+    }
+
     // ── Reset (CLUSTER RESET) ─────────────────────────────────────────────────
 
     /// Soft reset: clears slot assignments, peer table (keeping ourselves),
@@ -2219,6 +2449,7 @@ impl ClusterState {
         self.migrations.write().clear();
         self.failure_reports.write().clear();
         *self.election.lock() = None;
+        self.release_held_writes("the node was reset");
         let _ = self.save_to_disk();
     }
 
