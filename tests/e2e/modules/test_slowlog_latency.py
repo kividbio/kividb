@@ -99,12 +99,8 @@ def start_custom_server(port: int, extra_args: list[str]) -> subprocess.Popen:
     return proc
 
 
-def free_port() -> int:
-    """Return an unused TCP port."""
-    import socket as _socket
-    with _socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+# Outside the ephemeral range, and never the same port twice (#262).
+from utils.helpers import free_port  # noqa: E402
 
 
 def drain_slowlog(r: redis.Redis) -> None:

@@ -484,6 +484,10 @@ fn expire_batch(
     if ordered.is_some() && crate::pause::expiry_deferred() {
         return 0;
     }
+    // The keys taken are marked leaving until they have left their indexes
+    // too (see `vector::mark_leaving`), where the database has one.
+    let id = crate::vector::store_id(store);
+    let marks = crate::vector::has_index_of(index_store, db);
     let mut gone: Vec<&Key> = Vec::with_capacity(batch.len());
     let mut freed: Vec<store::Taken> = Vec::with_capacity(batch.len());
     {
@@ -496,6 +500,9 @@ fn expire_batch(
                     // Announced before the shard is let go of (see
                     // `delete_key_if_expired`).
                     crate::keyspace_events::notify_expired(store, db, key);
+                    if marks {
+                        crate::vector::mark_leaving(id, db, key.as_str());
+                    }
                     freed.push(value);
                     gone.push(key);
                 }
@@ -515,6 +522,9 @@ fn expire_batch(
         crate::watch::expired(store, db, key);
         crate::tracking::expired(store, key);
         crate::vector::maybe_unindex(index_store, db, key);
+        if marks {
+            crate::vector::unmark_leaving(id, db, key.as_str());
+        }
     }
     count
 }
@@ -801,6 +811,11 @@ pub fn delete_key_if_expired(store: &Store, db: usize, key: &str) -> bool {
         return read_lock!(shard).expires(key).is_some_and(is_past);
     }
     let told = target.filter(crate::expiry::Target::observed);
+    // Its indexes, if its database has one: the key is marked leaving from
+    // when it is gone from the store until it is gone from them too (see
+    // `vector::mark_leaving`).
+    let id = crate::vector::store_id(store);
+    let indexes = crate::vector::indexes_of(id, db);
     let ordered = told
         .as_ref()
         .map(|_| crate::expiry::order(db, std::iter::once(key.as_bytes())));
@@ -814,6 +829,9 @@ pub fn delete_key_if_expired(store: &Store, db: usize, key: &str) -> bool {
         let removed = map.remove_if_due(key, now_ms());
         if removed.is_some() {
             crate::keyspace_events::notify_expired(store, db, key);
+            if indexes.is_some() {
+                crate::vector::mark_leaving(id, db, key);
+            }
         }
         removed
     };
@@ -829,7 +847,10 @@ pub fn delete_key_if_expired(store: &Store, db: usize, key: &str) -> bool {
         crate::tracking::expired(store, key);
         // Out of its indexes too: it used to stay in the graph, and be
         // found by a KNN query, until something else deleted it.
-        crate::vector::unindex_expired(store, db, key);
+        if let Some(indexes) = &indexes {
+            crate::vector::maybe_unindex(indexes, db, key);
+            crate::vector::unmark_leaving(id, db, key);
+        }
     }
     gone
 }
