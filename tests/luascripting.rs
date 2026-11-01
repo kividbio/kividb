@@ -1220,7 +1220,8 @@ fn test_scripts_from_many_clients_at_once_run_one_at_a_time() {
 }
 
 /// A time to live is told in full by the script that set it, and outside a
-/// script is never told as more than a millisecond short. It used to be
+/// script is never told as more than a millisecond shorter than the time
+/// that has passed since (none, on an idle machine: 249 or 250). It used to be
 /// told as 249 of 250 every time: the clock it was set by dropped the part
 /// of a millisecond that the clock it was told by kept.
 #[test]
@@ -1244,11 +1245,18 @@ fn a_time_to_live_is_told_in_full_by_the_script_that_set_it() {
             &key,
         ]);
         assert_eq!(told.as_int(), 400, "PEXPIRE, round {i}");
+        // Two commands: as much time passes between them as the machine
+        // takes, and the time to live is that much shorter. Not more than
+        // that, and the millisecond the two clock readings can fall either
+        // side of: as much passed on the server as here, at most, from
+        // sending the SET to reading PTTL's reply.
+        let sent = std::time::Instant::now();
         c.cmds(&["SET", &key, "v", "PX", "250"]);
         let told = c.cmds(&["PTTL", &key]).as_int();
+        let passed = sent.elapsed().as_millis() as i64;
         assert!(
-            (249..=250).contains(&told),
-            "next command, round {i}: {told}"
+            (249 - passed..=250).contains(&told),
+            "next command, round {i}: {told}, with {passed} ms between them"
         );
     }
 }

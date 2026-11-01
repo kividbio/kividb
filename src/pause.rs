@@ -227,11 +227,31 @@ pub fn handoff() -> bool {
 }
 
 /// Wait for the handoff to end. Called by a write command, outside the write
-/// gate, on its worker thread: a handoff lasts milliseconds, and is bounded
-/// by its pause's timeout.
+/// gate, on its worker thread: a handoff is bounded by its pause's timeout,
+/// and lasts as long as the handoff takes (a manual failover: until the
+/// replica has caught up and won its election).
+///
+/// On a worker of the multi-threaded tokio runtime (`--io-model tokio`) the
+/// wait gives the worker's other tasks to another thread first
+/// (`block_in_place`). A task the worker had queued to run next (tokio's
+/// LIFO slot, which no other worker takes) otherwise waited with it: the
+/// replication hub, woken by the write before, did, and the master's
+/// handoff, which waits for the hub to have sent everything to the replica,
+/// waited for the pause to run out (10 s). By then the replica had given the
+/// failover up (it waits 5 s), and `CLUSTER FAILOVER` did nothing.
 pub fn wait_out_handoff() {
-    while handoff() {
-        std::thread::sleep(std::time::Duration::from_micros(200));
+    let wait = || {
+        while handoff() {
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+    };
+    let on_multi_thread_runtime = tokio::runtime::Handle::try_current().is_ok_and(|runtime| {
+        runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+    });
+    if on_multi_thread_runtime {
+        tokio::task::block_in_place(wait);
+    } else {
+        wait();
     }
 }
 
@@ -371,5 +391,33 @@ mod tests {
         set_pause(60_000, true);
         assert!(!handoff());
         clear_pause();
+
+        // A write that waits out a handoff on a worker of the multi-threaded
+        // runtime leaves that worker's other tasks to run. Here the one that
+        // ends the handoff, which the worker would have run next (its LIFO
+        // slot, which no other worker takes): it used to wait with the
+        // write, until the pause ran out.
+        set_handoff_pause(20_000);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let started = std::time::Instant::now();
+        runtime.block_on(async {
+            tokio::spawn(async {
+                let ender = tokio::spawn(async { clear_pause() });
+                wait_out_handoff();
+                ender.await.unwrap();
+            })
+            .await
+            .unwrap();
+        });
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the handoff was waited out for {:?}",
+            started.elapsed()
+        );
+        assert!(!handoff());
     }
 }
