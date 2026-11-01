@@ -2392,13 +2392,13 @@ pub fn recover_from_aof(
 
 // ── Test hooks ───────────────────────────────────────────────────────────────
 
-/// `KIVIDB_TEST_FAILPOINTS`: names of steps of a checkpoint at which the
-/// process waits for a test, which can then start something else or kill it
-/// at exactly that step. At each step named it creates
-/// `failpoint.<name>.<n>` in the data directory (`n` counts from 1 for each
-/// name) and waits while the file is there. Read once; unset, a step costs
-/// a load and a branch, on paths that run once a checkpoint.
-fn failpoint(name: &'static str) {
+/// `KIVIDB_TEST_FAILPOINTS`: names of steps (of a checkpoint, of a
+/// `MIGRATE`, of an index-wide walk) at which the process waits for a test,
+/// which can then start something else or kill it at exactly that step. At
+/// each step named it creates `failpoint.<name>.<n>` in the data directory
+/// (`n` counts from 1 for each name) and waits while the file is there. Read
+/// once; unset, a step costs a load and a branch.
+pub(crate) fn failpoint(name: &'static str) {
     static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     let names = NAMES.get_or_init(|| {
         std::env::var("KIVIDB_TEST_FAILPOINTS")
@@ -2431,7 +2431,7 @@ fn failpoint(name: &'static str) {
     if std::fs::write(&path, b"").is_err() {
         return;
     }
-    log_warn!("AOF: test failpoint {path} reached — waiting for it to be removed");
+    log_warn!("Test failpoint {path} reached — waiting for it to be removed");
     while std::path::Path::new(&path).exists() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }

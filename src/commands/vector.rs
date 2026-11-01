@@ -202,13 +202,16 @@ fn ft_dropindex(ctx: &mut Ctx) -> Option<Vec<u8>> {
     if by_slot {
         documents.sort_by_cached_key(|key| slot_of(key));
     }
+    crate::aof::failpoint("dropindex-collected");
     let nested = crate::write_gate::held_by_this_thread();
     let mut deleted = 0usize;
     let mut del: Vec<Vec<u8>> = Vec::new();
     for chunk in documents.chunks(DROPINDEX_DOCUMENTS_PER_WRITE) {
         let _gate = dropindex_write_gate(ctx, nested);
-        let _order = (propagate && !ctx.apply_replication)
-            .then(|| crate::write_order::lock_keys(db, chunk.iter().map(|k| k.as_bytes())));
+        // The order of the chunk's keys, whether or not anything reads the
+        // write stream: a write to one of them is then wholly before its
+        // deletion here, or wholly after (#275).
+        let _order = crate::write_order::lock_keys(db, chunk.iter().map(|k| k.as_bytes()));
         let mut slot = chunk.first().map(|key| slot_of(key));
         for key in chunk {
             if by_slot && slot != Some(slot_of(key)) {
@@ -220,7 +223,12 @@ fn ft_dropindex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 crate::commands::helpers::delete_key_if_expired(ctx.store, db, key);
                 continue;
             }
-            if !crate::commands::helpers::delete_key(ctx.store, db, key) {
+            // Only if it is still a document of the index (#275): one
+            // written meanwhile as another type (a string, a hash under an
+            // `ON JSON` index) is no longer one, and run after that write,
+            // `DD` would have kept it. (Whether the index covers it goes by
+            // its name and the index's prefixes, neither of which changes.)
+            if !delete_document(ctx.store, db, key, &on) {
                 continue;
             }
             deleted += 1;
@@ -269,6 +277,22 @@ const DROPINDEX_DOCUMENTS_PER_WRITE: usize = 256;
 /// leaves it to take (see `handler::run_command`): stepped out of while a
 /// handoff is under way, as the handler does for any other write. Inside a
 /// transaction or a script the gate is held already, and this takes nothing.
+/// Delete `key` if it holds a document of an index `ON on`, deciding and
+/// deleting under its shard's write lock. Whether it did.
+fn delete_document(
+    store: &crate::store::Store,
+    db: usize,
+    key: &str,
+    on: &crate::vector::IndexOn,
+) -> bool {
+    let shard = crate::store::get_shard(&store[db], key);
+    let removal = shard
+        .write()
+        .remove_if(key, |value| crate::vector::is_document(on, value));
+    // Freed with the shard unlocked.
+    matches!(removal, crate::store::Removal::Taken(_))
+}
+
 fn dropindex_write_gate(ctx: &Ctx, nested: bool) -> crate::write_gate::WriteGuard {
     let mut gate = crate::write_gate::enter();
     while !nested && !ctx.apply_replication && crate::pause::handoff() {
@@ -462,7 +486,7 @@ fn ft_alter(ctx: &mut Ctx) -> Option<Vec<u8>> {
     }
     if !skip_initial_scan && !newly_added_text_fields.is_empty() {
         crate::vector::backfill_text_fields(
-            &ctx.store[*ctx.selected_db],
+            &ctx.store[altered.db_index],
             &altered,
             &newly_added_text_fields,
         );
@@ -1818,8 +1842,6 @@ pub(crate) fn knn_filtered<'k>(
 fn backfill_new_vector_fields(ctx: &Ctx, index_name: &str, new_field_names: &[String]) {
     use crate::vector::FieldType;
 
-    let db_ref = &ctx.store[*ctx.selected_db];
-
     // Resolve metadata for each new field once, before the keyspace walk.
     // We hold the index store read lock only for this resolution; the walk
     // below takes shard read locks per shard and only re-enters the index
@@ -1870,66 +1892,39 @@ fn backfill_new_vector_fields(ctx: &Ctx, index_name: &str, new_field_names: &[St
             live,
         });
     }
-    let prefixes = def.prefixes.clone();
-    let (doc_on, doc_schema) = (def.on.clone(), def.fields.clone());
+    // The definition, to walk its documents by, with the index store let go
+    // of: a clone shares the live indexes.
+    let def = def.clone();
     drop(store);
 
     if work.is_empty() {
         return;
     }
 
-    // ── Walk every shard, every key, populate matching vector fields ──────────
-    for shard in db_ref.iter() {
-        #[cfg(target_os = "linux")]
-        let map = shard.read();
-        #[cfg(not(target_os = "linux"))]
-        let map = shard.read();
-
-        for (key, value) in map.iter() {
-            let matches =
-                prefixes.is_empty() || prefixes.iter().any(|p| key.starts_with(p.as_str()));
-            if !matches {
-                continue;
-            }
-            // Build a unified field view regardless of hash variant.
-            // HashEx: sweep expired fields first, then clone the survivors.
-            // Hash: clone directly. The clone is a shallow Arc clone per value.
-            let fields: crate::types::HashFields = match value {
-                crate::store::ValueRef::Json(doc)
-                    if matches!(doc_on, crate::vector::IndexOn::Json) =>
-                {
-                    crate::vector::project_json(&doc_schema, &doc.read())
-                }
-                _ if matches!(doc_on, crate::vector::IndexOn::Json) => continue,
-                crate::store::ValueRef::Hash(h) => h.read().clone(),
-                crate::store::ValueRef::HashEx(h) => {
-                    let mut w = h.write();
-                    w.sweep_expired();
-                    drop(w);
-                    h.read().fields.clone()
-                }
-                _ => continue,
+    // ── Walk the index's documents, populate the new vector fields ────────────
+    //
+    // A key at a time, under its write order, as it is now: see
+    // `vector::walk_documents` (#275). The walk used to index the fields as
+    // it found them, and a write to the key meanwhile, which indexed what it
+    // wrote, could be overwritten in the index by the walk's older copy.
+    crate::vector::walk_documents(&ctx.store[def.db_index], &def, |key, inner| {
+        for w in &work {
+            let raw_bytes = match inner.get(&w.name) {
+                Some(b) => b,
+                None => continue,
             };
-            let inner = &fields;
+            let Some(vec) = w.data_type.decode(raw_bytes, w.dim) else {
+                continue;
+            };
 
-            for w in &work {
-                let raw_bytes = match inner.get(&w.name) {
-                    Some(b) => b,
-                    None => continue,
-                };
-                let Some(vec) = w.data_type.decode(raw_bytes, w.dim) else {
-                    continue;
-                };
-
-                match &w.live {
-                    LiveIndex::Flat(idx) => idx.insert(key.to_string(), vec),
-                    LiveIndex::Hnsw(idx) => {
-                        crate::vector::hnsw_insert(idx, key.to_string(), vec, &w.metric);
-                    }
+            match &w.live {
+                LiveIndex::Flat(idx) => idx.insert(key.to_string(), vec),
+                LiveIndex::Hnsw(idx) => {
+                    crate::vector::hnsw_insert(idx, key.to_string(), vec, &w.metric);
                 }
             }
         }
-    }
+    });
 }
 
 // ── Alias commands ────────────────────────────────────────────────────────────

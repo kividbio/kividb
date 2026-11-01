@@ -1034,37 +1034,26 @@ impl IndexSchema {
 /// Without it a query for a word in the new field finds only documents
 /// written after the field was added.
 pub fn backfill_text_fields(db: &crate::store::Db, def: &IndexDef, fields: &[String]) {
-    for shard in db.iter() {
-        let map = shard.read();
-        for (key, value) in map.iter() {
-            let covered =
-                def.prefixes.is_empty() || def.prefixes.iter().any(|p| key.starts_with(p.as_str()));
-            if !covered {
-                continue;
-            }
-            let Some(inner) = doc_fields(&def.on, &def.fields, value) else {
+    walk_documents(db, def, |key, inner| {
+        let language = def.language_of(key, &inner);
+        let mut changes = Vec::new();
+        for field in fields {
+            let Some(text) = inner.get(field).and_then(|b| std::str::from_utf8(b).ok()) else {
                 continue;
             };
-            let language = def.language_of(key, &inner);
-            let mut changes = Vec::new();
-            for field in fields {
-                let Some(text) = inner.get(field).and_then(|b| std::str::from_utf8(b).ok()) else {
-                    continue;
-                };
-                let Some(schema) = def.fields.iter().find(|f| &f.name == field) else {
-                    continue;
-                };
-                let Some(number) = def.text_field(field) else {
-                    continue;
-                };
-                changes.push((number, stem::index_words(def, schema, language, text)));
-            }
-            if !changes.is_empty() {
-                let doc = def.postings.write().ensure(key);
-                def.write_text(doc, &changes);
-            }
+            let Some(schema) = def.fields.iter().find(|f| &f.name == field) else {
+                continue;
+            };
+            let Some(number) = def.text_field(field) else {
+                continue;
+            };
+            changes.push((number, stem::index_words(def, schema, language, text)));
         }
-    }
+        if !changes.is_empty() {
+            let doc = def.postings.write().ensure(key);
+            def.write_text(doc, &changes);
+        }
+    });
 }
 
 /// Start keeping postings for TAG and NUMERIC fields added to an index
@@ -1074,22 +1063,57 @@ pub fn backfill_text_fields(db: &crate::store::Db, def: &IndexDef, fields: &[Str
 /// still know every document.
 pub fn backfill_postings(db: &crate::store::Db, def: &IndexDef, added: &[SchemaField], scan: bool) {
     def.postings.write().add_fields(added);
+    walk_documents(db, def, |key, inner| {
+        let mut postings = def.postings.write();
+        if scan {
+            postings.write_doc(key, &inner);
+        } else {
+            postings.ensure(key);
+        }
+        def.postings.done(postings);
+    });
+}
+
+/// Each document of `def` in `db` (its database), with its fields as the
+/// index reads them: for a walk that indexes them (an index's backfill).
+///
+/// A key at a time, its write order held (`write_order::lock_key_for_walk`)
+/// while its value is read, under its shard's lock, and `visit` indexes it:
+/// a write to the key falls before the read, and the walk indexes what it
+/// wrote, or after `visit`, and indexes the key itself (#275). The walk
+/// used to read the whole shard under one read lock, and a write that
+/// changes a hash or a JSON document in place, under the value's own lock,
+/// does not wait for that: the walk could index what the key held before a
+/// write that had already indexed what it holds now, and the index kept the
+/// older value until the key's next write. (The order is the writes' own:
+/// held, before #271, by the writes something reads the stream of.)
+///
+/// The keys of a shard are listed first, under its read lock, and each is
+/// looked up again: a write to the key takes its order before its shard's
+/// lock, so the walk cannot hold the shard while it waits for an order.
+pub fn walk_documents(
+    db: &crate::store::Db,
+    def: &IndexDef,
+    mut visit: impl FnMut(&str, DocFields<'_>),
+) {
     for shard in db.iter() {
-        let map = shard.read();
-        for (key, value) in map.iter() {
-            if !def.covers(key) {
-                continue;
-            }
-            let Some(inner) = doc_fields(&def.on, &def.fields, value) else {
+        let keys: Vec<String> = shard
+            .read()
+            .keys()
+            .filter(|key| def.covers(key))
+            .map(str::to_string)
+            .collect();
+        for key in keys {
+            let _order = crate::write_order::lock_key_for_walk(def.db_index, key.as_bytes());
+            let map = shard.read();
+            let Some(inner) = map
+                .peek(&key)
+                .and_then(|value| doc_fields(&def.on, &def.fields, value))
+            else {
                 continue;
             };
-            let mut postings = def.postings.write();
-            if scan {
-                postings.write_doc(key, &inner);
-            } else {
-                postings.ensure(key);
-            }
-            def.postings.done(postings);
+            crate::aof::failpoint("index-walk-read");
+            visit(&key, inner);
         }
     }
 }
@@ -1206,72 +1230,60 @@ pub fn backfill_from_db_progress(
 
     let mut keys_matched: usize = 0;
 
-    for shard in db.iter() {
-        #[cfg(target_os = "linux")]
-        let map = shard.read();
-        #[cfg(not(target_os = "linux"))]
-        let map = shard.read();
-
-        for (key, value) in map.iter() {
-            let matches =
-                def.prefixes.is_empty() || def.prefixes.iter().any(|p| key.starts_with(p.as_str()));
-            if !matches {
-                continue;
-            }
-            keys_matched += 1;
-            if log_progress && keys_matched.is_multiple_of(BACKFILL_PROGRESS_KEYS) {
-                log_verbose!(
-                    "Index backfill `{}`: processed ~{} matching keys…",
-                    def.name,
-                    keys_matched
-                );
-            }
-            let Some(inner) = doc_fields(&def.on, &def.fields, value) else {
-                continue;
-            };
-            let doc = if gives_ids {
-                let mut postings = def.postings.write();
-                let doc = postings.write_doc(key, &inner);
-                def.postings.done(postings);
-                doc
-            } else {
-                postings::NO_DOC
-            };
-
-            for w in &vec_work {
-                let raw_bytes = match inner.get(&w.name) {
-                    Some(b) => b.clone(),
-                    None => continue,
-                };
-                let Some(vec) = w.data_type.decode(&raw_bytes, w.dim) else {
-                    continue;
-                };
-                match &w.live {
-                    LiveIndex::Flat(idx) => idx.insert(key.to_string(), vec),
-                    LiveIndex::Hnsw(idx) => {
-                        if w.loaded && holds_vector(idx, key, &vec, &w.metric) {
-                            continue;
-                        }
-                        hnsw_insert_doc(idx, key.to_string(), vec, &w.metric, doc);
-                    }
-                }
-            }
-
-            if text_fields.is_empty() {
-                continue;
-            }
-            let language = def.language_of(key, &inner);
-            let mut changes = Vec::new();
-            for (number, field) in text_fields.iter().enumerate() {
-                if let Some(raw) = inner.get(&field.name)
-                    && let Ok(s) = std::str::from_utf8(raw)
-                {
-                    changes.push((number as u16, stem::index_words(def, field, language, s)));
-                }
-            }
-            def.write_text(doc, &changes);
+    // Ordered against writes to each key: see `walk_documents`. `FT.CREATE`
+    // registers the index before this walk, so a write the walk has passed
+    // indexes itself.
+    walk_documents(db, def, |key, inner| {
+        keys_matched += 1;
+        if log_progress && keys_matched.is_multiple_of(BACKFILL_PROGRESS_KEYS) {
+            log_verbose!(
+                "Index backfill `{}`: processed ~{} matching keys…",
+                def.name,
+                keys_matched
+            );
         }
-    }
+        let doc = if gives_ids {
+            let mut postings = def.postings.write();
+            let doc = postings.write_doc(key, &inner);
+            def.postings.done(postings);
+            doc
+        } else {
+            postings::NO_DOC
+        };
+
+        for w in &vec_work {
+            let raw_bytes = match inner.get(&w.name) {
+                Some(b) => b.clone(),
+                None => continue,
+            };
+            let Some(vec) = w.data_type.decode(&raw_bytes, w.dim) else {
+                continue;
+            };
+            match &w.live {
+                LiveIndex::Flat(idx) => idx.insert(key.to_string(), vec),
+                LiveIndex::Hnsw(idx) => {
+                    if w.loaded && holds_vector(idx, key, &vec, &w.metric) {
+                        continue;
+                    }
+                    hnsw_insert_doc(idx, key.to_string(), vec, &w.metric, doc);
+                }
+            }
+        }
+
+        if text_fields.is_empty() {
+            return;
+        }
+        let language = def.language_of(key, &inner);
+        let mut changes = Vec::new();
+        for (number, field) in text_fields.iter().enumerate() {
+            if let Some(raw) = inner.get(&field.name)
+                && let Ok(s) = std::str::from_utf8(raw)
+            {
+                changes.push((number as u16, stem::index_words(def, field, language, s)));
+            }
+        }
+        def.write_text(doc, &changes);
+    });
 
     // A loaded graph's nodes whose keys were deleted since the checkpoint, or
     // no longer hold a vector in the field. Each is looked at under its
