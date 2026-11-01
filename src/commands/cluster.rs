@@ -1382,8 +1382,11 @@ fn cmd_migration(ctx: &mut Ctx) -> Vec<u8> {
 //     source → destination: a key, or a write, belonging to the slots
 // CLUSTER SYNCSLOTS TAKEOVER <task-id>
 //     source → destination: that was everything; the slots are yours
-// CLUSTER SYNCSLOTS FAIL <task-id> <reason>
-//     source → destination: I have given up on this attempt
+// CLUSTER SYNCSLOTS FAIL <task-id> <reason> [start end ...]
+//     source → destination: I have given up on this attempt. OK promises the
+//     slots were not taken and will not be in this attempt; an error says
+//     they have been, or are being, taken over
+//     (`migration::source_failed`)
 
 fn cmd_syncslots(ctx: &mut Ctx) -> Vec<u8> {
     use crate::cluster::migration;
@@ -1420,15 +1423,27 @@ fn cmd_syncslots(ctx: &mut Ctx) -> Vec<u8> {
             ctx.cluster.slot_migrations.cancel(Some(&task_id));
             resp_simple("OK")
         }
-        "TAKEOVER" => done(migration::take_over(ctx.cluster, &task_id)),
+        "TAKEOVER" => done(migration::take_over(ctx.cluster, &task_id, ctx.client_id)),
         "FAIL" => {
             let reason = ctx
                 .cmd
                 .get(4)
                 .map(|r| String::from_utf8_lossy(r).into_owned())
                 .unwrap_or_default();
-            migration::source_failed(ctx.cluster, &task_id, &reason);
-            resp_simple("OK")
+            // The slots, from a source that sends them (#278).
+            let ranges = match ctx.cmd.get(5..) {
+                Some(ranges) if !ranges.is_empty() => match migration::parse_ranges(ranges) {
+                    Ok(r) => r,
+                    Err(e) => return resp_error(&format!("ERR {e}")),
+                },
+                _ => Vec::new(),
+            };
+            done(migration::source_failed(
+                ctx.cluster,
+                &task_id,
+                &reason,
+                &ranges,
+            ))
         }
         "APPLY" => syncslots_apply(ctx, &task_id),
         other => resp_error(&format!(

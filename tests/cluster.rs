@@ -2839,6 +2839,112 @@ fn atomic_slot_migration_moves_a_range_under_load() {
     assert_eq!(r.cmd(&["LLEN", &list_key]).int(), 3);
 }
 
+/// A slot range moves while clients keep `INCR`ing a key in it, and the
+/// destination's answer to `TAKEOVER` does not reach the source within its
+/// `cluster-slot-migration-write-pause-timeout` (300 ms here): `failpoint`,
+/// set on the destination, says why. Every acknowledged `INCR` has to be on
+/// the destination at the end (#278). The source used to take writes again
+/// when its pause ran out by itself; when the destination took the slots
+/// after all, the source deleted its keys, and the writes it had
+/// acknowledged since were lost.
+fn a_handoff_whose_takeover_goes_unanswered(failpoint: (&str, &str)) {
+    let (nodes, _) = form_cluster_with_env(2, &[failpoint]);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let r = src.conn().cmd(&[
+        "CONFIG",
+        "SET",
+        "cluster-slot-migration-write-pause-timeout",
+        "300",
+    ]);
+    assert!(r.is_ok(), "{r:?}");
+    let key = key_in(0..=1000, "held");
+    let logs = || {
+        format!(
+            "==== source {}\n{}\n==== destination {}\n{}",
+            src.port,
+            src.log(),
+            dst.port,
+            dst.log()
+        )
+    };
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writers: Vec<_> = (0..4)
+        .map(|_| counting_writer(&stop, &key, [src.port, dst.port]))
+        .collect();
+    std::thread::sleep(Duration::from_millis(300));
+
+    let task_id = dst
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "1000"])
+        .text();
+    wait_until("the import to complete", Duration::from_secs(60), || {
+        let status = dst
+            .conn()
+            .cmd(&["CLUSTER", "MIGRATION", "STATUS", "ID", &task_id]);
+        status
+            .array()
+            .first()
+            .is_some_and(|task| task_field(task, "state").text() == "completed")
+    });
+    wait_until(
+        "the source to redirect the moved slots",
+        Duration::from_secs(30),
+        || {
+            src.conn()
+                .cmd(&["GET", &key])
+                .err()
+                .is_some_and(|e| e.starts_with("MOVED"))
+        },
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let acked: i64 = writers.into_iter().map(|w| w.join().unwrap()).sum();
+    assert!(acked > 0, "the writers never got a write through");
+
+    // Not equal, necessarily: an INCR held for longer than the client waits
+    // is applied, but was never acknowledged.
+    let value = match dst.conn().cmd(&["GET", &key]) {
+        Resp::Bulk(v) => String::from_utf8(v).unwrap().parse::<i64>().unwrap(),
+        Resp::Nil => 0,
+        other => panic!("GET on the destination: {other:?}\n{}", logs()),
+    };
+    assert!(
+        value >= acked,
+        "{} acknowledged INCRs lost: the counter is {value}, {acked} were acknowledged\n{}",
+        acked - value,
+        logs()
+    );
+    assert!(
+        dst.log().contains("(test) "),
+        "the failpoint {} was never reached\n{}",
+        failpoint.0,
+        logs()
+    );
+}
+
+/// The destination gets to the `TAKEOVER` only after the source has
+/// stopped waiting for its answer, as a destination does that is too busy
+/// (#278). The source asks it, and it promises not to take the slots in
+/// that attempt; the source gives the attempt up and takes writes again,
+/// and the late `TAKEOVER` is refused. The next attempt moves the slots.
+/// 900 ms: after the source's 300 ms, and before the destination's next
+/// attempt (1 s after the source gave up). The late `TAKEOVER` used to take
+/// the slots over then, with what had arrived of them deleted already.
+#[test]
+fn a_takeover_that_comes_after_the_write_pause_timeout_loses_no_acknowledged_write() {
+    a_handoff_whose_takeover_goes_unanswered(("KIVIDB_TEST_TAKEOVER_DELAY_MS", "900"));
+}
+
+/// The destination takes the slots over, but neither its answer to the
+/// `TAKEOVER` nor its claim reaches the source in time (its bus is muted
+/// for 1.2 s) (#278). The source asks it over a connection of its own,
+/// learns that the slots are taken, and hands them over.
+#[test]
+fn a_takeover_whose_answer_is_lost_loses_no_acknowledged_write() {
+    a_handoff_whose_takeover_goes_unanswered(("KIVIDB_TEST_TAKEOVER_LOST_MS", "1200"));
+}
+
 /// A migration that cannot finish — here because it is cancelled while the
 /// source is still sending — leaves the slots, and every key, where they were.
 #[test]

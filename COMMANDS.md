@@ -1102,9 +1102,14 @@ for them meanwhile. When the destination is nearly caught up
 pauses writes, sends the rest, and the destination takes ownership with a
 single epoch bump; the source then deletes its copy. Clients see no `-ASK` and
 no `-TRYAGAIN` — only, at the end, the `-MOVED` that tells them where the slots
-now are — and no acknowledged write is lost or applied twice. The pause is
-bounded by `--cluster-slot-migration-write-pause-timeout` (default 10000 ms),
-after which the attempt is abandoned and retried. During the pause all client
+now are — and no acknowledged write is lost or applied twice. If the
+destination has not answered the takeover within
+`--cluster-slot-migration-write-pause-timeout` (default 10000 ms), the source
+asks it, every 200 ms, whether it took the slots, and keeps writes paused until
+it knows: taken, and they are handed over; not taken, and the attempt is
+abandoned and retried. A destination the cluster has marked FAIL is taken not
+to have them, and the source claims them again at a newer epoch. `CLIENT
+UNPAUSE` ends the pause early. During the pause all client
 writes to the source wait, not only those for the moving slots.
 
 Until the takeover, what the destination has received is a copy: the source
@@ -1175,7 +1180,7 @@ deletes the keys it holds for that slot, as Redis does.
 | `--cluster-announce-client-port <port>` | `0` (the client port) | The port *clients* are told: in `MOVED`/`ASK` and `CLUSTER SLOTS`, `SHARDS` and `NODES`. Nodes keep reaching each other at the client port. For a NodePort, or a load balancer that maps ports. Settable at runtime. |
 | `--cluster-bus-port-protected-mode yes\|no` | `no` | Refuse to start as a cluster node while the bus is unauthenticated. |
 | `--cluster-slot-migration-handoff-max-lag-bytes <n>` | `1048576` | Atomic slot migration: how close the destination must be before writes are paused for the handoff. |
-| `--cluster-slot-migration-write-pause-timeout <ms>` | `10000` | Atomic slot migration: the longest writes stay paused for a handoff. |
+| `--cluster-slot-migration-write-pause-timeout <ms>` | `10000` | Atomic slot migration: how long the source waits for the takeover's answer before it asks the destination; writes stay paused until it knows. |
 
 ---
 

@@ -967,6 +967,12 @@ pub(crate) fn test_bus_muted() -> bool {
     TEST_BUS_MUTED.load(Ordering::Relaxed)
 }
 
+/// Mute this node's bus, or let it run, for a test's failpoint (see
+/// `migration::TEST_TAKEOVER_LOST`).
+pub(crate) fn set_test_bus_muted(muted: bool) {
+    TEST_BUS_MUTED.store(muted, Ordering::Relaxed);
+}
+
 fn apply_test_bus_control() {
     let Some(path) = test_bus_control() else {
         return;

@@ -65,6 +65,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   given, so a key written meanwhile, or one the dump had not found and a
   write made meanwhile, was deleted on every replica and kept here.
 
+- **A slot migration's handoff holds writes until the source knows where
+  the slots are (#278).** At the end of a `CLUSTER MIGRATION`, the source
+  paused writes for at most `cluster-slot-migration-write-pause-timeout`
+  (10 s), and the pause ran out by itself. If sending the last writes and
+  the destination's `TAKEOVER` took longer than that, or the `TAKEOVER`'s
+  answer was lost, the source took writes for the moving slots again
+  without sending them on; when the destination took the slots after all,
+  the source deleted its keys, and the writes it had acknowledged since
+  were lost. Now writes stay held until the source knows: the destination
+  answers the `TAKEOVER`, its claim of the slots arrives, or, asked every
+  200 ms over a connection of its own, it says it took the slots, or
+  promises that the attempt will not take them (then the source gives the
+  attempt up, takes writes again and the destination tries again; a
+  `TAKEOVER` it gets later, of that attempt or an earlier one, is
+  refused). The timeout is now how long the source waits for the answer
+  before it asks. A destination that is down cannot answer: the source
+  lets writes go without its answer only once the cluster has marked it
+  FAIL and no claim of the slots has arrived, and then claims the slots
+  again at an epoch above any the destination can have taken them at, so
+  that the destination gives them up if it comes back with them. Why
+  writes are still held is logged every 5 s, and `CLIENT UNPAUSE` lets
+  them go, as it does a master's hold for a manual failover (#242). A
+  handoff whose `TAKEOVER` is answered in time pauses writes as long as
+  before.
+
 - **A checkpoint no longer stalls writes on a slow disk (#243).** With the
   AOF on, the checkpoint after a bulk load held `SET`s back for seconds at a
   time on a slow cloud disk, and replies went out without their writes
