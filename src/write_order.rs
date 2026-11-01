@@ -39,12 +39,21 @@ const STRIPES: usize = 4096;
 
 static STRIPE: [Mutex<()>; STRIPES] = [const { parking_lot::const_mutex(()) }; STRIPES];
 
+/// [`HELD`]: no guard on this thread.
+const FREE: u8 = 0;
+/// [`HELD`]: a guard that holds no stripe — of a write that names no key
+/// (`FT.ALTER`, `FT.CREATE`), or [`held_exclusively`].
+const NO_STRIPE: u8 = 1;
+/// [`HELD`]: a guard that holds stripes.
+const STRIPES_HELD: u8 = 2;
+
 thread_local! {
     /// Set while this thread holds an [`OrderGuard`], so that a write made
     /// from inside another — a script's `redis.call`, the commands of a
     /// transaction applied as one — does not try to take a stripe its own
-    /// thread already holds.
-    static HELD: Cell<bool> = const { Cell::new(false) };
+    /// thread already holds. One of [`FREE`], [`NO_STRIPE`] and
+    /// [`STRIPES_HELD`].
+    static HELD: Cell<u8> = const { Cell::new(FREE) };
 }
 
 /// Held by a write from before it touches the store until its replication /
@@ -63,7 +72,7 @@ pub struct OrderGuard {
 impl Drop for OrderGuard {
     fn drop(&mut self) {
         if self.outermost {
-            HELD.with(|h| h.set(false));
+            HELD.with(|h| h.set(FREE));
         }
     }
 }
@@ -78,17 +87,17 @@ fn stripe_of(db: usize, key: &[u8]) -> usize {
 /// cannot deadlock. Nested on one thread, it takes nothing: the outer write's
 /// guard already orders everything this thread does until it is dropped.
 pub fn lock_keys<'a>(db: usize, keys: impl Iterator<Item = &'a [u8]>) -> OrderGuard {
-    if HELD.with(|h| h.get()) {
-        return OrderGuard {
-            _one: None,
-            _stripes: Vec::new(),
-            outermost: false,
-            _not_send: PhantomData,
-        };
+    if HELD.with(|h| h.get()) != FREE {
+        return nested();
     }
-    HELD.with(|h| h.set(true));
     let mut keys = keys;
     let first = keys.next().map(|key| stripe_of(db, key));
+    let held = if first.is_some() {
+        STRIPES_HELD
+    } else {
+        NO_STRIPE
+    };
+    HELD.with(|h| h.set(held));
     let (one, stripes) = match (first, keys.next()) {
         (None, _) => (None, Vec::new()),
         (Some(only), None) => (Some(STRIPE[only].lock()), Vec::new()),
@@ -119,18 +128,18 @@ pub fn lock_keys<'a>(db: usize, keys: impl Iterator<Item = &'a [u8]>) -> OrderGu
 /// `DEL` ahead of the `MOVE`, and the replica, and a replay of the AOF, kept
 /// the key there for good.
 pub fn lock_keys_in<'a>(keys: impl Iterator<Item = (usize, &'a [u8])>) -> OrderGuard {
-    if HELD.with(|h| h.get()) {
-        return OrderGuard {
-            _one: None,
-            _stripes: Vec::new(),
-            outermost: false,
-            _not_send: PhantomData,
-        };
+    if HELD.with(|h| h.get()) != FREE {
+        return nested();
     }
-    HELD.with(|h| h.set(true));
     let mut stripes: Vec<usize> = keys.map(|(db, key)| stripe_of(db, key)).collect();
     stripes.sort_unstable();
     stripes.dedup();
+    let held = if stripes.is_empty() {
+        NO_STRIPE
+    } else {
+        STRIPES_HELD
+    };
+    HELD.with(|h| h.set(held));
     OrderGuard {
         _one: None,
         _stripes: stripes.into_iter().map(|i| STRIPE[i].lock()).collect(),
@@ -143,11 +152,52 @@ pub fn lock_keys_in<'a>(keys: impl Iterator<Item = (usize, &'a [u8])>) -> OrderG
 /// holds the write gate exclusively, and so has no other write to be ordered
 /// against. Writes nested inside it then take nothing either.
 pub fn held_exclusively() -> OrderGuard {
-    let outermost = !HELD.with(|h| h.replace(true));
+    let outermost = HELD.with(|h| {
+        let free = h.get() == FREE;
+        if free {
+            h.set(NO_STRIPE);
+        }
+        free
+    });
     OrderGuard {
         _one: None,
         _stripes: Vec::new(),
         outermost,
+        _not_send: PhantomData,
+    }
+}
+
+/// The order of one key, for a walk over many keys (the backfill of a
+/// search index) that a command makes one key at a time: each key's write
+/// order is held while the walk reads its value and indexes it, so that a
+/// write to the key falls before the read, or after the indexing, and then
+/// indexes the key itself.
+///
+/// Unlike [`lock_keys`], it takes the stripe from inside a guard that holds
+/// none: the command's own, which names no key (`FT.ALTER`, `FT.CREATE`), or
+/// [`held_exclusively`]'s. One stripe taken while none is held cannot
+/// deadlock. Inside a guard that holds stripes (a transaction that also
+/// writes keys) it takes nothing, as [`lock_keys`] would: the key's stripe
+/// may be one of them.
+pub fn lock_key_for_walk(db: usize, key: &[u8]) -> OrderGuard {
+    match HELD.with(|h| h.get()) {
+        FREE => lock_keys(db, std::iter::once(key)),
+        NO_STRIPE => OrderGuard {
+            _one: Some(STRIPE[stripe_of(db, key)].lock()),
+            _stripes: Vec::new(),
+            outermost: false,
+            _not_send: PhantomData,
+        },
+        _ => nested(),
+    }
+}
+
+/// The guard of a write made from inside another: it takes nothing.
+fn nested() -> OrderGuard {
+    OrderGuard {
+        _one: None,
+        _stripes: Vec::new(),
+        outermost: false,
         _not_send: PhantomData,
     }
 }
@@ -215,16 +265,48 @@ mod tests {
         let inner = lock_keys(0, [b"n".as_slice()].into_iter());
         drop(inner);
         // The outer guard is still the one in charge.
-        assert!(HELD.with(|h| h.get()));
+        assert_eq!(HELD.with(|h| h.get()), STRIPES_HELD);
         drop(outer);
-        assert!(!HELD.with(|h| h.get()));
+        assert_eq!(HELD.with(|h| h.get()), FREE);
 
         let exclusive = held_exclusively();
         let inner = lock_keys(0, [b"n".as_slice()].into_iter());
         drop(inner);
-        assert!(HELD.with(|h| h.get()));
+        assert_eq!(HELD.with(|h| h.get()), NO_STRIPE);
         drop(exclusive);
-        assert!(!HELD.with(|h| h.get()));
+        assert_eq!(HELD.with(|h| h.get()), FREE);
+    }
+
+    #[test]
+    fn a_walk_inside_a_command_that_names_no_key_orders_each_key() {
+        // The guard of `FT.ALTER`: no key, no stripe.
+        let command = lock_keys(0, std::iter::empty());
+        let walking = lock_key_for_walk(0, b"doc:1");
+        let entered = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&entered);
+        // An `HSET` of the key the walk is at.
+        let write = std::thread::spawn(move || {
+            let _guard = lock_keys(0, [b"doc:1".as_slice()].into_iter());
+            flag.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!entered.load(Ordering::SeqCst), "the write got in");
+        drop(walking);
+        write.join().unwrap();
+        assert!(entered.load(Ordering::SeqCst));
+        // The command's guard is still the one in charge.
+        assert_eq!(HELD.with(|h| h.get()), NO_STRIPE);
+        drop(command);
+        assert_eq!(HELD.with(|h| h.get()), FREE);
+
+        // Inside a guard with stripes it takes nothing: no deadlock on a
+        // stripe this thread holds.
+        let outer = lock_keys(0, [b"doc:1".as_slice()].into_iter());
+        drop(lock_key_for_walk(0, b"doc:1"));
+        drop(outer);
+        // With nothing held, it is an ordinary guard.
+        drop(lock_key_for_walk(0, b"doc:1"));
+        assert_eq!(HELD.with(|h| h.get()), FREE);
     }
 
     #[test]

@@ -393,18 +393,26 @@ fn create(ctx: &mut Ctx) -> Result<(), String> {
     }
     .into_def();
 
-    if ctx.index_store.read().contains_key(&name) {
-        return Err("Index already exists".into());
+    // Registered before the documents already there are indexed, so that a
+    // write to one of them from here on indexes it itself (#275). The walk
+    // used to come first: a document written after the walk had passed it,
+    // and before the index was registered, was in no index until its next
+    // write. The walk takes each key's write order and reads it as it is
+    // then (`vector::walk_documents`), so it cannot put back what a write
+    // to the key has replaced. A clone of the definition shares its live
+    // indexes.
+    def.name = name.clone();
+    {
+        let mut store = ctx.index_store.write();
+        if store.contains_key(&name) {
+            return Err("Index already exists".into());
+        }
+        store.insert(name, def.clone());
     }
     if !skip_initial_scan {
-        crate::vector::backfill_from_db(&ctx.store[*ctx.selected_db], &def);
+        crate::vector::backfill_from_db(&ctx.store[def.db_index], &def);
     }
-    let mut store = ctx.index_store.write();
-    if store.contains_key(&name) {
-        return Err("Index already exists".into());
-    }
-    def.name = name.clone();
-    store.insert(name, def);
+    crate::aof::failpoint("ft-create-walked");
     Ok(())
 }
 

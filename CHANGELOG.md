@@ -411,6 +411,28 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   not made with (it was ignored; leaving `DISTANCE` out still means the
   set's own).
 
+- **An index's walks over its documents are ordered against writes to
+  them (#275).** `FT.ALTER`'s backfill of the fields it adds (vector, TEXT,
+  TAG and NUMERIC) read each document as it found it and indexed that, and
+  a write to the document meanwhile, which had indexed what it wrote, could
+  be overwritten in the index by the older copy: a search then found the
+  document by its old vector, words or tags until its next write. A hash
+  or JSON document is changed in place, under its own lock, which a walk
+  holding its shard's lock does not keep out. `FT.CREATE` looked through
+  the documents before it registered the index, so a document written in
+  between was in no index until its next write. Now `FT.CREATE` registers
+  the index first, and every walk takes each document's write order, reads
+  it as it is then and indexes that: a write falls before the read or after
+  the indexing, and indexes the document itself. (A write holds its keys'
+  order while something reads the write stream, the AOF or a replica, and
+  with #271 always.) `FT.DROPINDEX ... DD` collected the documents and
+  then deleted them, a few at a time, taking their write order only when
+  something read the write stream, and deleting whatever was there: a key
+  written meanwhile as a string, or as a hash under an `ON JSON` index,
+  was deleted, where run after that write `DD` would have kept it. It now
+  takes their order always, and deletes a key only if it is still a
+  document of the index, deciding under its shard's lock.
+
 ## [1.2.0]
 
 See [docs/releases/v1.2.0.md](docs/releases/v1.2.0.md) for what to check before upgrading.
