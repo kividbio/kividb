@@ -1220,7 +1220,8 @@ fn test_scripts_from_many_clients_at_once_run_one_at_a_time() {
 }
 
 /// A time to live is told in full by the script that set it, and outside a
-/// script is never told as more than a millisecond short. It used to be
+/// script is never told as more than a millisecond shorter than the time
+/// that has passed since (none, on an idle machine: 249 or 250). It used to be
 /// told as 249 of 250 every time: the clock it was set by dropped the part
 /// of a millisecond that the clock it was told by kept.
 #[test]
@@ -1244,11 +1245,18 @@ fn a_time_to_live_is_told_in_full_by_the_script_that_set_it() {
             &key,
         ]);
         assert_eq!(told.as_int(), 400, "PEXPIRE, round {i}");
+        // Two commands: as much time passes between them as the machine
+        // takes, and the time to live is that much shorter. Not more than
+        // that, and the millisecond the two clock readings can fall either
+        // side of: as much passed on the server as here, at most, from
+        // sending the SET to reading PTTL's reply.
+        let sent = std::time::Instant::now();
         c.cmds(&["SET", &key, "v", "PX", "250"]);
         let told = c.cmds(&["PTTL", &key]).as_int();
+        let passed = sent.elapsed().as_millis() as i64;
         assert!(
-            (249..=250).contains(&told),
-            "next command, round {i}: {told}"
+            (249 - passed..=250).contains(&told),
+            "next command, round {i}: {told}, with {passed} ms between them"
         );
     }
 }
@@ -1969,4 +1977,75 @@ fn test_each_flush_leaves_the_other_kind_working() {
         RespValue::SimpleStr("OK".into())
     );
     assert!(c.cmds(&["SCRIPT", "FLUSH", "NOW"]).is_error());
+}
+
+/// A script may not run what Redis 8.10 flags `noscript`: `SAVE`, `CONFIG
+/// SET`, `MULTI`, `SUBSCRIBE`, `CLIENT SETNAME`, ... It ran them. The
+/// subcommands Redis lets a script run (`CONFIG HELP`, `CLUSTER KEYSLOT`,
+/// `BACKUP LIST`, ...) still run.
+#[test]
+fn a_script_may_not_run_noscript_commands() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let from_script = |c: &mut Conn, args: &[&str]| {
+        let quoted: Vec<String> = args.iter().map(|a| format!("'{a}'")).collect();
+        let script = format!("return redis.pcall({})", quoted.join(", "));
+        c.cmds(&["EVAL", &script, "0"])
+    };
+    let refused: &[&[&str]] = &[
+        &["SAVE"],
+        &["BGSAVE"],
+        &["BGREWRITEAOF"],
+        &["CONFIG", "SET", "maxmemory", "0"],
+        &["config", "get", "maxmemory"],
+        &["CONFIG", "REWRITE"],
+        &["MULTI"],
+        &["EXEC"],
+        &["WATCH", "k"],
+        &["SUBSCRIBE", "ch"],
+        &["CLIENT", "SETNAME", "x"],
+        &["CLIENT", "ID"],
+        &["ACL", "WHOAMI"],
+        &["FUNCTION", "LIST"],
+        &["SCRIPT", "FLUSH"],
+        &["EVAL", "return 1", "0"],
+        &["HELLO"],
+        &["ROLE"],
+        &["DEBUG", "SLEEP", "0"],
+        &["REPLICAOF", "NO", "ONE"],
+        &["SLAVEOF", "NO", "ONE"],
+        &["LATENCY", "LATEST"],
+        &["HOTKEYS", "START", "METRICS", "1", "CPU"],
+        &["BACKUP", "START"],
+        &["CLUSTER", "RESET"],
+        &["CLUSTER", "SETSLOT", "1", "STABLE"],
+    ];
+    for args in refused {
+        let reply = from_script(&mut c, args);
+        assert!(
+            reply.is_error() && reply.as_error().contains("not allowed from script"),
+            "{args:?}: {reply:?}"
+        );
+    }
+    let allowed: &[&[&str]] = &[
+        &["PING"],
+        &["CONFIG", "HELP"],
+        &["CLIENT", "HELP"],
+        &["SCRIPT", "HELP"],
+        &["HOTKEYS", "HELP"],
+        &["BACKUP", "LIST"],
+        &["CLUSTER", "KEYSLOT", "k"],
+    ];
+    for args in allowed {
+        let reply = from_script(&mut c, args);
+        assert!(
+            !reply.is_error() || !reply.as_error().contains("not allowed from script"),
+            "{args:?}: {reply:?}"
+        );
+    }
+    // Nothing a refused command would have changed has.
+    assert_eq!(c.cmds(&["PING"]), RespValue::SimpleStr("PONG".into()));
+    assert!(c.cmds(&["CLIENT", "GETNAME"]).is_nil());
 }

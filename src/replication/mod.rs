@@ -65,6 +65,21 @@ pub struct ReplState {
     /// documents on the master. Set at each connection to a master, from the
     /// release it says it is (`INFO server`); see [`dd_deleted_by`].
     pub master_dd_deletes: AtomicBool,
+    /// Whether this replica's master sends a `DEL` (or `UNLINK`) for every
+    /// key it expires, as KiviDB does since 1.1.3 and Redis always has. Then
+    /// the replica deletes no expired key itself and waits for that `DEL`
+    /// (see `expiry`). A master that does not (KiviDB 1.1.2 and before, and
+    /// 1.2.0-rc1 and -rc2) leaves its replica to expire keys by its own clock,
+    /// as replicas did before 1.1.3. Set at each connection to a master, from
+    /// its `INFO server` ([`expiry_propagated_by`]).
+    pub master_propagates_expiry: AtomicBool,
+    /// Whether this node's dataset may hold keys past their time that no
+    /// master will send a `DEL` of: it was loaded at startup (it may have
+    /// been written while following a master that sent none), or it has
+    /// followed such a master since. Cleared once a master that sends them
+    /// has either replaced the dataset (a full sync) or swept it
+    /// (`commands::helpers::expire_keys_due_before`, at a partial resync).
+    pub expiry_sweep_owed: AtomicBool,
     /// How many taps are attached (see `taps`). Read on every write, so that
     /// the common case — none — costs one relaxed load.
     pub stream_taps: std::sync::atomic::AtomicUsize,
@@ -426,6 +441,8 @@ impl ReplState {
             repl_stream_last_db: AtomicU64::new(u64::MAX),
             several_databases: AtomicBool::new(false),
             master_dd_deletes: AtomicBool::new(false),
+            master_propagates_expiry: AtomicBool::new(true),
+            expiry_sweep_owed: AtomicBool::new(true),
             stream_taps: std::sync::atomic::AtomicUsize::new(0),
             taps: RwLock::new(Vec::new()),
             repl_generation: AtomicU64::new(0),
@@ -1606,6 +1623,107 @@ pub fn dd_deleted_by(version: &str) -> bool {
     match (numbers.next().flatten(), numbers.next().flatten()) {
         (Some(major), Some(minor)) => (major, minor) >= (1, 2),
         _ => false,
+    }
+}
+
+/// The line of `INFO server` by which a KiviDB master says it sends a `DEL`
+/// for every key it expires. Releases before it that did so are known by
+/// their version ([`expiry_propagated_by`]).
+pub const EXPIRY_PROPAGATED_INFO: &str = "kividb_expired_keys_propagated:1";
+
+/// Whether a master whose `INFO server` reply is `info` sends a `DEL` (or
+/// `UNLINK`) for every key it expires, so that its replicas need not
+/// expire keys themselves (see `ReplState::master_propagates_expiry`).
+///
+/// * It says so ([`EXPIRY_PROPAGATED_INFO`]): yes.
+/// * It is KiviDB (`kividb_version`) and does not say so: 1.1.3 and the
+///   1.1 releases after it do; 1.1.2 and before do not, nor do 1.2.0-rc1 and
+///   -rc2, which were cut before the fix reached 1.2. A version that cannot
+///   be read is taken to send them, as below.
+/// * It is not KiviDB (no `kividb_version`; every KiviDB release has said
+///   its version there): Redis and Valkey have always sent them.
+/// * It did not answer (`None`): `INFO` refused to the replication user by
+///   an ACL, say. Taken to send them, as 1.1.3 replicas take every master:
+///   a replica that waits for `DEL`s that never come keeps keys that read
+///   as gone, using memory, while one that deletes keys by its own clock
+///   under a master that also sends them can come apart from that master
+///   (a write the master made to a key still alive by its clock lands on
+///   a key the replica already deleted). Memory over divergence.
+pub fn expiry_propagated_by(info: Option<&str>) -> bool {
+    let Some(info) = info else {
+        return true;
+    };
+    if info
+        .lines()
+        .any(|line| line.trim() == EXPIRY_PROPAGATED_INFO)
+    {
+        return true;
+    }
+    let Some(version) = info
+        .lines()
+        .find_map(|line| line.strip_prefix("kividb_version:"))
+        .map(str::trim)
+    else {
+        return true;
+    };
+    let (release, pre) = match version.split_once('-') {
+        Some((release, pre)) => (release, Some(pre)),
+        None => (version, None),
+    };
+    let numbers: Option<Vec<u32>> = release.split('.').map(|n| n.parse().ok()).collect();
+    match numbers.as_deref() {
+        Some(&[major, minor, patch]) => match (major, minor, patch, pre) {
+            // The release candidates of 1.2.0 cut before the fix.
+            (1, 2, 0, Some(_)) => false,
+            _ => (major, minor, patch) >= (1, 1, 3),
+        },
+        _ => true,
+    }
+}
+
+/// The master's `uptime_in_seconds` in its `INFO server` reply `info`.
+pub fn uptime_in(info: &str) -> Option<u64> {
+    info.lines()
+        .find_map(|line| line.strip_prefix("uptime_in_seconds:"))
+        .and_then(|n| n.trim().parse().ok())
+}
+
+#[cfg(test)]
+mod expiry_version_tests {
+    use super::{EXPIRY_PROPAGATED_INFO, expiry_propagated_by, uptime_in};
+
+    fn kividb(version: &str) -> String {
+        format!("# Server\r\nredis_version:8.10.0\r\nkividb_version:{version}\r\n")
+    }
+
+    #[test]
+    fn masters_from_1_1_3_send_their_expired_keys_as_deletions() {
+        for old in [
+            "1.1.2",
+            "1.1.0-rc1",
+            "1.0.6",
+            "0.9.0",
+            "1.2.0-rc1",
+            "1.2.0-rc2",
+        ] {
+            assert!(!expiry_propagated_by(Some(&kividb(old))), "{old}");
+        }
+        for new in ["1.1.3", "1.1.4", "1.2.0", "1.2.1", "1.3.0-rc1", "2.0.0"] {
+            assert!(expiry_propagated_by(Some(&kividb(new))), "{new}");
+        }
+        // A build that says so, whatever its version.
+        let says = format!("{}{EXPIRY_PROPAGATED_INFO}\r\n", kividb("1.2.0-rc2"));
+        assert!(expiry_propagated_by(Some(&says)));
+    }
+
+    #[test]
+    fn a_master_that_is_not_kividb_or_does_not_say_is_taken_to_send_them() {
+        let redis = "# Server\r\nredis_version:8.10.0\r\nuptime_in_seconds:5\r\n";
+        assert!(expiry_propagated_by(Some(redis)));
+        assert!(expiry_propagated_by(None));
+        assert!(expiry_propagated_by(Some(&kividb("garbage"))));
+        assert_eq!(uptime_in(redis), Some(5));
+        assert_eq!(uptime_in(&kividb("1.1.2")), None);
     }
 }
 

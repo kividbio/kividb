@@ -44,6 +44,72 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`expired` comes before the event of a write that makes the key
+  again.** When the background sweep, or another client's read, deleted a
+  key past its time, its `expired` notification was published after the
+  key's shard was let go of. A write that came in between and made the key
+  anew (`INCR` on a counter whose window ran out, say) could have its own
+  event (`incrby`) published first, which Redis never does. `expired` is now
+  published before the shard is let go of.
+
+- **A key past its time is not counted as used.** Under an LRU or LFU
+  policy, `MGET`, a `GET` on a replica, a command refused with an error,
+  a key a command names twice, and a script's commands could bring the
+  idle time or the count of a key already past its time up to date, as if
+  it had been used: the lookup wrote the key's use before its deadline was
+  looked at. Only a live key's use is written now, and `GET` looks at the
+  time once.
+
+- **`lazyfree-lazy-expire` in a config file is applied, and said to be.**
+  1.1 accepted the directive and ignored it: `CONFIG GET` still said `yes`
+  and expired keys still reached the AOF and replicas as `UNLINK` (#232).
+  1.2 applied it, but its startup log said it had no effect, as it said of
+  `latency-tracking` and `latency-tracking-info-percentiles`, which have
+  one too; it no longer does. `lazyfree-lazy-expire`, the other
+  `lazyfree-*` settings and `latency-tracking` take only `yes` or `no`, in
+  a config file and in `CONFIG SET`, as in Redis; any value was taken.
+
+- **A script may not run what Redis does not let a script run.** Redis
+  refuses, from `EVAL` and `FCALL`, the commands its command table flags
+  `noscript`, with "This Redis command is not allowed from script":
+  `SAVE`, `BGSAVE`, `BGREWRITEAOF`, `SHUTDOWN`, `CONFIG GET` / `SET` /
+  `REWRITE`, `ACL` and `CLIENT` subcommands, `MULTI`, `EXEC`, `WATCH`, the
+  subscribe commands, `MONITOR`, `REPLICAOF`, `DEBUG`, `HELLO`, `EVAL`
+  itself and others. KiviDB refused only `CLUSTER`, `HOTKEYS` and `BACKUP`,
+  and ran the rest. A `SAVE` in a script on a replica could hang it: the
+  script held a slot of the write gate and waited for the replication
+  applier, which waited for a backup's or a full sync's cut, which waited
+  for the gate. The list is now Redis 8.10's. Of `CLUSTER`, a script may
+  run what only reads (`INFO`, `NODES`, `SLOTS`, `KEYSLOT`, ...), as in
+  Redis, but not what changes the cluster, which Redis allows: a slot's
+  handoff here waits for the writes in flight, the script among them.
+  `HOTKEYS HELP`, `BACKUP LIST` and `BACKUP STATUS` run from a script, as in
+  Redis.
+
+- **A key a command leaves where it was keeps its LFU count.** `GETDEL` of
+  a key of another type took the key out, saw its type, and put it back as
+  a new key: its time to live was kept, but under an LFU policy its access
+  count started again at 5 (#221). `MOVE` to a database that already has
+  the key, and `RENAME` of a key to itself, did the same. Each now looks
+  at the key and leaves it as it is, counting the lookup as a use, as
+  Redis does. A key `MOVE` does move keeps its count and its idle time, as
+  its object does in Redis; it used to start afresh.
+
+- **HNSW vectors written after a checkpoint are found again after a crash.**
+  A checkpoint (`BGREWRITEAOF`, the automatic AOF rewrite, or `SAVE` /
+  `BGSAVE` with the AOF on) writes `dump.kdb` with the HNSW graphs, and
+  starts the AOF over with the writes made after it. A server killed after
+  that (`kill -9`, a crash, a lost machine) came back with the graphs as the
+  snapshot had them: the vectors written since the checkpoint were in the
+  hashes and counted in `num_docs`, but no KNN query found them (none of
+  1,000 in a test), and a vector deleted or overwritten since was still
+  found under its key. A clean shutdown, which writes a fresh snapshot, did
+  not lose them. The graph from the snapshot is now brought up to date with
+  the keys at startup: vectors it holds unchanged stay as they are, the
+  others are inserted, and those of deleted keys or fields are taken out.
+  FLAT, TEXT, TAG and NUMERIC fields were rebuilt from the keys already and
+  were right. 1.1.2 and 1.1.3 have the bug; files they wrote load correctly.
+
 - **A cluster master back without its data no longer wipes its replica.**
   With no AOF, a shard master killed outright (no final snapshot) and back
   inside `cluster-node-timeout` kept its node id and slots from nodes.conf
@@ -68,6 +134,49 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   AOF on, or after a clean stop (`SHUTDOWN`, SIGTERM: a marker,
   `dump.kdb.clean`, is left beside the final snapshot), restarts go on as
   before.
+
+- **`CLUSTER FAILOVER` no longer gives up under writes for want of an answer
+  its master had ready.** With the tokio I/O model (always, for cluster
+  nodes), a write that arrived just as its master began the handover waited
+  for it on its worker thread, and the task that thread would have run next
+  waited with it: no other thread takes that one (tokio's LIFO slot). When
+  it was the replication hub, which the handover waits on to know that
+  everything has been sent to the replica, the master answered only when
+  its pause on writes ran out, 10 s later; the replica had given up after 5,
+  and the roles stayed as they were. Seen as an intermittent CI failure of
+  `manual_failover_swaps_roles_without_losing_acknowledged_writes`. Nothing
+  was lost: writes went on at the master. The write now hands the thread's
+  other tasks to another thread while it waits.
+- **A replica of a KiviDB master older than 1.1.3 no longer keeps the keys
+  that master expires.** Since 1.1.3 a replica does not expire keys by its
+  own clock: it waits for the `DEL` (or `UNLINK`) its master sends for each
+  key it expires, so that the two cannot come apart. A 1.1.2 or older master
+  sends none, so a newer replica following it (as in the recommended
+  upgrade order, replicas first) kept every key the master expired: unseen
+  by reads, but in memory, and still there after the master was upgraded
+  if the replica went on by a partial resync. Ten keys of `PX 1000` left a
+  1.1.2 master at one key and its replica at eleven, for good. A replica now
+  asks its master which release it is (it already did, for `FT.DROPINDEX
+  DD`): under a master that sends no deletions (KiviDB 1.1.2 and before,
+  and 1.2.0-rc1 and -rc2, cut before the fix reached 1.2) it expires keys
+  itself, deleting them locally and propagating nothing, as every replica
+  did before 1.1.3. A master now says in `INFO server` that it sends them
+  (`kividb_expired_keys_propagated:1`); 1.1.3 and later 1.1 releases are
+  known by their version; a master that is not KiviDB (Redis, Valkey) sends
+  them; and one whose `INFO` cannot be read (refused to the replication user
+  by an ACL, say) is taken to send them, as 1.1.3 took every master: a
+  replica that waits for deletions that never come keeps keys that read as
+  gone, while one that also deletes keys under a master that sends them can
+  come apart from it. And when a replica is continued by a master that
+  sends deletions (a partial resync) while its dataset may hold keys left
+  by one that did not (it has followed such a master, or loaded its dataset
+  at startup), it first deletes the keys whose time ended before that
+  master started, before applying anything of its stream; a key that
+  expired later is that master's to delete. Only the replica's own clock is
+  read, against the master's `uptime_in_seconds`. Under a master that sends
+  deletions nothing changes: no key expires while a dataset is loaded or
+  the master's stream applied, and the replica deletes none itself.
+  Fixes #231.
 
 - **`FT.DROPINDEX index DD` reaches replicas and the AOF as the documents
   it deleted.** The command was sent on as typed, and each replica, and an
@@ -117,6 +226,36 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   runs answers that one is in progress rather than wait for it; the new log
   is written before the old one is moved aside; and a start that finds
   `appendonly.aof.prev` without a log beside it replays it.
+
+- **`FT.AGGREGATE … ADDSCORES` shows the score in every row (#234).** As
+  in Redis 8.10, each row now starts with `__score`, whatever else the
+  command loads, sorts by or computes. It showed only where a `LOAD` or a
+  `SORTBY` named `@__score`, and a plain `ADDSCORES` gave rows with no
+  fields. A `GROUPBY`'s rows have no score of their own, as before.
+  `FT.EXPLAIN` writes `NOT{`, `OPTIONAL{` and `<empty>` as Redis does
+  (it wrote `NOT {`, `OPTIONAL {` and `<EMPTY>`), `FT.EXPLAINCLI` ends
+  with Redis's empty last line, and `FT.DEBUG HELP` lists the subcommands
+  instead of answering that it is not one. A query word shorter than
+  `search-min-stem-len` is still shown, and looked for, with its stems:
+  the length decides which words of a document are indexed with a stem,
+  not what a query looks for, in Redis as here.
+
+- **`VADD` refuses what it does not know (#235).** A `DISTANCE` it did not
+  know was taken as COSINE, and an option it did not know, or one missing
+  its value, was skipped. Now, as Redis 8.10 answers: `ERR invalid option
+  after element`; `ERR invalid M` for an `M` outside 4 to 4096 and `ERR
+  invalid EF` for an `EF` outside 1 to 1,000,000 (they were not checked);
+  and `ERR invalid vector specification` for a vector given wrong, which
+  includes `VALUES 0` and a NaN, both of which used to make a set; a
+  vector of another dimension than the set's is refused in Redis's words
+  (`ERR Vector dimension mismatch - got 3 but set has 2`).
+  `DISTANCE COSINE | L2 | IP`, before the vector or after the element, is
+  KiviDB's own: Redis 8.10's vector sets are cosine only and refuse the
+  word. An unknown value is `ERR invalid DISTANCE: use COSINE, L2 or IP`,
+  and one other than an existing set's is `ERR asked distance mismatch
+  with existing vector set`, as Redis refuses a quantization the set was
+  not made with (it was ignored; leaving `DISTANCE` out still means the
+  set's own).
 
 ## [1.2.0]
 
@@ -793,7 +932,8 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   angles scored 0 here and 0.5 in Redis, and opposite ones -1 and 0. The
   order of the results was always the same. A threshold an application
   sets on the score (`score > 0.8`) now means what it means on Redis.
-  Sets made with KiviDB's own `METRIC IP` or `METRIC L2` keep their scores.
+  Sets made with KiviDB's own `DISTANCE IP` or `DISTANCE L2` keep their
+  scores.
 
 - **Three small ones (#173):**
   - `DEBUG POPULATE` replied `OK` and made nothing. It makes its keys now,

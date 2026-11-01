@@ -566,8 +566,9 @@ fn scope(fields: &[String], every: usize) -> String {
 /// The plan of `filter`, a line at a time, as `FT.EXPLAIN` writes one.
 fn explain_filter(filter: &Filter, text_fields: usize, depth: usize, out: &mut Vec<String>) {
     let pad = "  ".repeat(depth);
+    // `open` with its brace: Redis writes `UNION {` but `NOT{`.
     let block = |open: &str, children: &[&Filter], out: &mut Vec<String>| {
-        out.push(format!("{pad}{open} {{"));
+        out.push(format!("{pad}{open}"));
         for child in children {
             explain_filter(child, text_fields, depth + 1, out);
         }
@@ -587,11 +588,11 @@ fn explain_filter(filter: &Filter, text_fields: usize, depth: usize, out: &mut V
                 }
                 _ => String::new(),
             };
-            let open = format!("{fields}{}", if and { "INTERSECT" } else { "UNION" });
+            let open = format!("{fields}{} {{", if and { "INTERSECT" } else { "UNION" });
             block(&open, &children, out);
         }
-        Filter::Not(inner) => block("NOT", &[inner], out),
-        Filter::Optional(inner) => block("OPTIONAL", &[inner], out),
+        Filter::Not(inner) => block("NOT{", &[inner], out),
+        Filter::Optional(inner) => block("OPTIONAL{", &[inner], out),
         Filter::Text { fields, term } => out.push(format!(
             "{pad}{}{}",
             scope(fields, text_fields),
@@ -633,7 +634,7 @@ fn explain_filter(filter: &Filter, text_fields: usize, depth: usize, out: &mut V
             bound(*hi)
         )),
         Filter::NumericNot { field, value } => {
-            out.push(format!("{pad}NOT {{"));
+            out.push(format!("{pad}NOT{{"));
             out.push(format!(
                 "{pad}  NUMERIC {{{} <= @{field} <= {}}}",
                 bound(*value),
@@ -655,7 +656,7 @@ fn explain_filter(filter: &Filter, text_fields: usize, depth: usize, out: &mut V
             }
         )),
         Filter::MatchAll => out.push(format!("{pad}<WILDCARD>")),
-        Filter::MatchNone => out.push(format!("{pad}<EMPTY>")),
+        Filter::MatchNone => out.push(format!("{pad}<empty>")),
     }
 }
 
@@ -718,7 +719,14 @@ pub(crate) fn ft_explain(ctx: &mut Ctx, lines: bool) -> Option<Vec<u8>> {
     };
     let plan = explain_query(&query, text_field_count(&def));
     Some(if lines {
-        resp_array(plan.iter().map(|line| resp_bulk_str(line)).collect())
+        // The lines of `FT.EXPLAIN`'s text, split at its newlines: as in
+        // Redis, the last is the empty one after the final newline.
+        resp_array(
+            plan.iter()
+                .chain(std::iter::once(&String::new()))
+                .map(|line| resp_bulk_str(line))
+                .collect(),
+        )
     } else {
         resp_bulk_str(&(plan.join("\n") + "\n"))
     })

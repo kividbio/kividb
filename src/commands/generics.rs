@@ -712,6 +712,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if is_expired(ctx.store, db, &src) {
                 delete_key_if_expired(ctx.store, db, &src);
             }
+            // A key renamed to itself stays as it is, as in Redis: it was
+            // taken out and put back, a new entry with a new LFU count.
+            if src == dst {
+                let there = read_lock!(store::get_shard(db_ref, &src)).contains_key(&src);
+                return Some(if there {
+                    resp_simple("OK")
+                } else {
+                    resp_error("ERR no such key")
+                });
+            }
 
             // Read + remove from src, with its time to live
             let (value, expiry) = {
@@ -955,41 +965,34 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 delete_key_if_expired(ctx.store, src_db, &key);
             }
 
-            // Read + remove from source, with its time to live
-            let (value, expiry) = {
-                let db_ref = &ctx.store[src_db];
-                let shard = store::get_shard(db_ref, &key);
-                let mut map = write_lock!(shard);
-                match map.remove(key.as_str()) {
-                    Some(v) => {
-                        let expiry = v.expires();
-                        (v.into_value(), expiry)
-                    }
-                    None => return Some(resp_integer(0)),
-                }
+            // As in Redis, the key is looked up, a use of it, and the target
+            // looked at before anything is taken: a key the target already
+            // has is left where it was. It was taken out and put back, a new
+            // entry with a new LFU count.
+            let src_shard = store::get_shard(&ctx.store[src_db], &key);
+            let dst_shard = store::get_shard(&ctx.store[target_db], &key);
+            if !read_lock!(src_shard).contains_key(&key) || read_lock!(dst_shard).contains_key(&key)
+            {
+                return Some(resp_integer(0));
+            }
+            let Some(taken) = write_lock!(src_shard).remove(&key) else {
+                return Some(resp_integer(0));
             };
-
-            // If key exists in target, put it back in source and return 0
-            let dst_db_ref = &ctx.store[target_db];
-            {
-                let shard = store::get_shard(dst_db_ref, &key);
-                let map = read_lock!(shard);
-                if map.contains_key(key.as_str()) {
-                    // Restore to source
-                    drop(map);
-                    let src_shard = store::get_shard(&ctx.store[src_db], &key);
-                    write_lock!(src_shard).insert_expiring(Key::from(key), value, expiry);
-                    return Some(resp_integer(0));
+            // The entry itself moves: the key's value, time to live and
+            // access word go with it, as its object does in Redis. If the
+            // target has been given the key meanwhile, it goes back.
+            let moved = write_lock!(dst_shard).put_back(taken);
+            match moved {
+                Ok(written_over) => {
+                    drop(written_over);
+                    Some(resp_integer(1))
+                }
+                Err(taken) => {
+                    let back = write_lock!(src_shard).put_back(taken);
+                    drop(back);
+                    Some(resp_integer(0))
                 }
             }
-
-            // Write to target
-            {
-                let shard = store::get_shard(dst_db_ref, &key);
-                write_lock!(shard).insert_expiring(Key::from(&*key), value, expiry);
-            }
-
-            Some(resp_integer(1))
         }
 
         "SWAPDB" => {

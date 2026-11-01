@@ -49,5 +49,66 @@
       "search_by_ef.512.rps": { "kind": "kividb_over_redis", "min_ratio": 0.75 },
       "ingest.total_time_s": { "kind": "redis_over_kividb", "min_ratio": 0.4 }
     }
+  },
+  "datasets": {
+    "_comment": "Datasets other than glove-25-angular (whose numbers and gates are the top-level blocks above). Each section has the same shape -- methodology, kividb, redis, gates -- with search results keyed by ef AND client count: search.ef<ef>_p<parallel>.<rps|p50_ms|p95_ms|recall|precision>. A section without kividb/redis blocks has no recorded run yet: its kividb_absolute gates are report-only until the first update_baseline run on master fills them in. Its ratio gates need no stored numbers and always apply.",
+    "h-and-m-2048-angular-filters": {
+      "methodology": {
+        "tool": "https://github.com/redis/vector-db-benchmark",
+        "tool_commit": "d22d44e8b46009a800a59e952710166ece2e38a1",
+        "engine_config": "M=16, EF_CONSTRUCTION=128; upload parallel 16, batch 64; ef 64/128/256 at 1 client, ef 128 at 16 and 100 clients",
+        "dataset": "h-and-m-2048-angular-filters",
+        "workload": "filtered: KNN under a TAG/NUMERIC metadata filter on every query",
+        "redis_version": "8.10.2"
+      },
+      "gates": {
+        "kividb_absolute": {
+          "_comment": "kividb vs its own recorded numbers: fail on a drop of more than 10% in throughput at any measured config, or recall more than 0.01 lower. Report-only until a run records them.",
+          "search.ef64_p1.rps": { "regression_if": "below", "tolerance_pct": 10 },
+          "search.ef128_p1.rps": { "regression_if": "below", "tolerance_pct": 10 },
+          "search.ef256_p1.rps": { "regression_if": "below", "tolerance_pct": 10 },
+          "search.ef128_p16.rps": { "regression_if": "below", "tolerance_pct": 10 },
+          "search.ef128_p100.rps": { "regression_if": "below", "tolerance_pct": 10 },
+          "search.ef128_p1.recall": { "regression_if": "below", "tolerance_abs": 0.01 },
+          "ingest.total_time_s": { "regression_if": "above", "tolerance_pct": 30 }
+        },
+        "kividb_vs_redis_ratio": {
+          "_comment": "Same run, same machines. KiviDB answered filtered queries about 2x faster than Redis 8.10 in the manual runs these reproduce (351 vs 164 q/s at 1 client, 1,586 vs 949 at 16, ef 128), so a floor of 1.2x catches the filter path losing most of that lead while leaving room for noise. Recall may be at most 0.01 below Redis's.",
+          "search.ef128_p1.rps": { "kind": "kividb_over_redis", "min_ratio": 1.2 },
+          "search.ef128_p16.rps": { "kind": "kividb_over_redis", "min_ratio": 1.2 },
+          "search.ef128_p100.rps": { "kind": "kividb_over_redis", "min_ratio": 1.2 },
+          "search.ef128_p1.recall": { "kind": "kividb_minus_redis", "min_delta": -0.01 }
+        }
+      }
+    },
+    "dbpedia-openai-100K-1536-angular": {
+      "methodology": {
+        "tool": "https://github.com/redis/vector-db-benchmark",
+        "tool_commit": "d22d44e8b46009a800a59e952710166ece2e38a1",
+        "engine_config": "M=16, EF_CONSTRUCTION=128; upload parallel 16, batch 64; ef 64/128/256 at 1 client, ef 128 at 16 and 100 clients",
+        "dataset": "dbpedia-openai-100K-1536-angular",
+        "workload": "unfiltered, high-dimension (1536)",
+        "redis_version": "8.10.2"
+      },
+      "gates": {
+        "kividb_absolute": {
+          "_comment": "As for h-and-m: fail on a throughput drop of more than 10%, or recall more than 0.01 lower. Report-only until a run records them.",
+          "search.ef64_p1.rps": { "regression_if": "below", "tolerance_pct": 10 },
+          "search.ef128_p1.rps": { "regression_if": "below", "tolerance_pct": 10 },
+          "search.ef256_p1.rps": { "regression_if": "below", "tolerance_pct": 10 },
+          "search.ef128_p16.rps": { "regression_if": "below", "tolerance_pct": 10 },
+          "search.ef128_p100.rps": { "regression_if": "below", "tolerance_pct": 10 },
+          "search.ef128_p1.recall": { "regression_if": "below", "tolerance_abs": 0.01 },
+          "ingest.total_time_s": { "regression_if": "above", "tolerance_pct": 30 }
+        },
+        "kividb_vs_redis_ratio": {
+          "_comment": "Same floor as glove's: 0.75x Redis's throughput. KiviDB was near parity in the manual runs (818 vs 854 q/s at 1 client, ef 128). Recall may be at most 0.01 below Redis's.",
+          "search.ef128_p1.rps": { "kind": "kividb_over_redis", "min_ratio": 0.75 },
+          "search.ef128_p16.rps": { "kind": "kividb_over_redis", "min_ratio": 0.75 },
+          "search.ef128_p100.rps": { "kind": "kividb_over_redis", "min_ratio": 0.75 },
+          "search.ef128_p1.recall": { "kind": "kividb_minus_redis", "min_delta": -0.01 }
+        }
+      }
+    }
   }
 }

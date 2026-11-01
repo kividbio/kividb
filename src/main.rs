@@ -426,9 +426,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Walk keys to populate TEXT / inverted / FLAT data, and HNSW only when graphs
-/// were not restored from the snapshot (see [`vector::backfill_from_db_progress`]
-/// `skip_hnsw_if_populated`).
+/// Walk keys to populate TEXT / inverted / FLAT data and HNSW graphs. A graph
+/// restored from the snapshot is kept and brought up to date with the keys,
+/// which an AOF delta may have changed since (see
+/// [`vector::backfill_from_db_progress`] `keep_loaded_hnsw`).
 ///
 /// Caller must set [`vector::SNAPSHOT_INDEX_REBUILD`] true before clients are
 /// accepted; the background thread clears it when this returns.

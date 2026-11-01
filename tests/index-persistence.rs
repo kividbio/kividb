@@ -2658,3 +2658,629 @@ fn a_dd_in_an_aof_written_by_1_1_2_keeps_the_documents() {
     let _ = wait_for_exit(&mut srv, Duration::from_secs(8));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Writes made after a checkpoint, and a crash: the HNSW graph that came with
+// the snapshot must take in what the AOF delta replays on top of it
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// A checkpoint (BGREWRITEAOF, SAVE, BGSAVE with the AOF on) writes dump.kdb,
+// with the HNSW graphs, and starts the AOF over as a delta. After a kill -9,
+// startup loads the dump and replays the delta. The graph used to be taken
+// as the snapshot had it: the vectors written after the checkpoint were
+// counted in `num_docs` and their hashes were there, but no KNN query found
+// them (0 of 1000 in the 1.1.3 gate); and a vector deleted or overwritten
+// after it was still found under its key.
+
+/// The vector numbered `seed`: eight floats, as good as random and distinct.
+fn ckpt_vec(seed: u32) -> Vec<f32> {
+    let mut x = (u64::from(seed) + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (0..8)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 40) as f32 / (1u64 << 24) as f32 + 0.01
+        })
+        .collect()
+}
+
+/// What one document holds, as the test wrote it.
+#[derive(Clone)]
+struct CkptDoc {
+    emb: Option<u32>,
+    flat: Option<u32>,
+    tag: &'static str,
+    num: u32,
+    word: &'static str,
+}
+
+/// The documents of one database's index, and the vectors that keys held
+/// once and must not be found under them any more.
+#[derive(Default)]
+struct CkptModel {
+    db: usize,
+    docs: std::collections::BTreeMap<String, CkptDoc>,
+    gone: Vec<(String, &'static str, u32)>,
+}
+
+const CKPT_WORDS: [&str; 3] = ["apple", "banana", "cherry"];
+
+impl CkptModel {
+    fn index(&self) -> String {
+        format!("idx:ckpt{}", self.db)
+    }
+
+    fn key(&self, i: u32) -> String {
+        format!("d{}:{i}", self.db)
+    }
+
+    /// A number unique to (database, document, version), for its vectors.
+    fn seed(&self, i: u32, version: u32, field: u32) -> u32 {
+        (self.db as u32) * 1_000_000 + version * 100_000 + i * 2 + field
+    }
+
+    fn create(&self, c: &mut Conn) {
+        assert!(c.cmds(&["SELECT", &self.db.to_string()]).is_ok());
+        let prefix = format!("d{}:", self.db);
+        let created = c.cmds(&[
+            "FT.CREATE",
+            &self.index(),
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            &prefix,
+            "SCHEMA",
+            "emb",
+            "VECTOR",
+            "HNSW",
+            "6",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            "8",
+            "DISTANCE_METRIC",
+            "COSINE",
+            "flat",
+            "VECTOR",
+            "FLAT",
+            "6",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            "8",
+            "DISTANCE_METRIC",
+            "L2",
+            "t",
+            "TAG",
+            "n",
+            "NUMERIC",
+            "body",
+            "TEXT",
+        ]);
+        assert!(created.is_ok(), "FT.CREATE: {created:?}");
+    }
+
+    /// Write document `i` whole, at `version`.
+    fn put(&mut self, c: &mut Conn, i: u32, version: u32) {
+        let doc = CkptDoc {
+            emb: Some(self.seed(i, version, 0)),
+            flat: Some(self.seed(i, version, 1)),
+            tag: if version == 0 { "even" } else { "later" },
+            num: i,
+            word: CKPT_WORDS[(i + version) as usize % 3],
+        };
+        self.forget_vectors(i, &doc);
+        let key = self.key(i);
+        let emb = pack_f32(&ckpt_vec(doc.emb.unwrap()));
+        let flat = pack_f32(&ckpt_vec(doc.flat.unwrap()));
+        let num = doc.num.to_string();
+        let reply = c.cmd(&[
+            b"HSET",
+            key.as_bytes(),
+            b"emb",
+            &emb,
+            b"flat",
+            &flat,
+            b"t",
+            doc.tag.as_bytes(),
+            b"n",
+            num.as_bytes(),
+            b"body",
+            doc.word.as_bytes(),
+        ]);
+        assert!(!reply.is_error(), "HSET {key}: {reply:?}");
+        self.docs.insert(key, doc);
+    }
+
+    /// Give document `i` a new HNSW vector only.
+    fn new_emb(&mut self, c: &mut Conn, i: u32, version: u32) {
+        let key = self.key(i);
+        let mut doc = self.docs[&key].clone();
+        doc.emb = Some(self.seed(i, version, 0));
+        self.forget_vectors(i, &doc);
+        let emb = pack_f32(&ckpt_vec(doc.emb.unwrap()));
+        let reply = c.cmd(&[b"HSET", key.as_bytes(), b"emb", &emb]);
+        assert!(!reply.is_error(), "HSET {key}: {reply:?}");
+        self.docs.insert(key, doc);
+    }
+
+    /// Take the HNSW vector out of document `i`; the rest stays.
+    fn drop_emb(&mut self, c: &mut Conn, i: u32) {
+        let key = self.key(i);
+        let mut doc = self.docs[&key].clone();
+        doc.emb = None;
+        self.forget_vectors(i, &doc);
+        assert_eq!(c.cmds(&["HDEL", &key, "emb"]).as_int(), 1);
+        self.docs.insert(key, doc);
+    }
+
+    fn delete(&mut self, c: &mut Conn, i: u32) {
+        let key = self.key(i);
+        let gone = CkptDoc {
+            emb: None,
+            flat: None,
+            tag: "",
+            num: 0,
+            word: "",
+        };
+        self.forget_vectors(i, &gone);
+        assert_eq!(c.cmds(&["DEL", &key]).as_int(), 1);
+        self.docs.remove(&key);
+    }
+
+    /// The vectors document `i` holds now and will not after `next`.
+    fn forget_vectors(&mut self, i: u32, next: &CkptDoc) {
+        let key = self.key(i);
+        if let Some(old) = self.docs.get(&key) {
+            if let Some(seed) = old.emb.filter(|&s| next.emb != Some(s)) {
+                self.gone.push((key.clone(), "emb", seed));
+            }
+            if let Some(seed) = old.flat.filter(|&s| next.flat != Some(s)) {
+                self.gone.push((key.clone(), "flat", seed));
+            }
+        }
+    }
+
+    /// The nearest document to vector `seed` by `field`, and its distance.
+    fn nearest(&self, c: &mut Conn, field: &str, seed: u32) -> Option<(String, f32)> {
+        let query = format!("*=>[KNN 1 @{field} $q AS score EF_RUNTIME 400]");
+        let q = pack_f32(&ckpt_vec(seed));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let reply = loop {
+            let reply = c.cmd(&[
+                b"FT.SEARCH",
+                self.index().as_bytes(),
+                query.as_bytes(),
+                b"PARAMS",
+                b"2",
+                b"q",
+                &q,
+                b"RETURN",
+                b"1",
+                b"score",
+                b"DIALECT",
+                b"2",
+            ]);
+            match &reply {
+                RespValue::Error(e) if e.starts_with("LOADING") && Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                _ => break reply,
+            }
+        };
+        let arr = reply.as_array();
+        if arr[0].as_int() == 0 {
+            return None;
+        }
+        // A key the graph has and the keyspace does not comes back with no
+        // fields: the graph said it is the nearest, so it counts as found.
+        let score: f32 = match arr[2].as_array() {
+            [_, score] => score.as_str().parse().unwrap(),
+            _ => 0.0,
+        };
+        Some((arr[1].as_str().to_string(), score))
+    }
+
+    fn count(&self, c: &mut Conn, query: &str) -> i64 {
+        let reply = c.cmds(&[
+            "FT.SEARCH",
+            &self.index(),
+            query,
+            "NOCONTENT",
+            "LIMIT",
+            "0",
+            "0",
+        ]);
+        reply.as_array()[0].as_int()
+    }
+
+    /// Everything the server answers for this index is what the model says,
+    /// or the reasons it is not.
+    fn mismatches(&self, c: &mut Conn) -> Vec<String> {
+        assert!(c.cmds(&["SELECT", &self.db.to_string()]).is_ok());
+        let mut out = Vec::new();
+        for field in ["emb", "flat"] {
+            let held: Vec<(&String, u32)> = self
+                .docs
+                .iter()
+                .filter_map(|(key, doc)| {
+                    let seed = if field == "emb" { doc.emb } else { doc.flat };
+                    seed.map(|s| (key, s))
+                })
+                .collect();
+            let missing: Vec<&String> = held
+                .iter()
+                .filter(|(key, seed)| match self.nearest(c, field, *seed) {
+                    Some((found, score)) => found != **key || score > 1e-4,
+                    None => true,
+                })
+                .map(|(key, _)| *key)
+                .collect();
+            if !missing.is_empty() {
+                out.push(format!(
+                    "{}: {} of {} vectors of @{field} not found by KNN, e.g. {:?}",
+                    self.index(),
+                    missing.len(),
+                    held.len(),
+                    &missing[..missing.len().min(5)]
+                ));
+            }
+            let ghosts: Vec<&String> = self
+                .gone
+                .iter()
+                .filter(|(_, f, _)| *f == field)
+                .filter(|(key, _, seed)| {
+                    matches!(self.nearest(c, field, *seed),
+                        Some((found, score)) if found == *key && score <= 1e-4)
+                })
+                .map(|(key, _, _)| key)
+                .collect();
+            if !ghosts.is_empty() {
+                out.push(format!(
+                    "{}: {} deleted or overwritten vectors of @{field} still found under their \
+                     keys, e.g. {:?}",
+                    self.index(),
+                    ghosts.len(),
+                    &ghosts[..ghosts.len().min(5)]
+                ));
+            }
+        }
+        let mut expect = |what: &str, query: &str, want: usize| {
+            let got = self.count(c, query);
+            if got != want as i64 {
+                out.push(format!(
+                    "{}: {what} {query}: {got}, want {want}",
+                    self.index()
+                ));
+            }
+        };
+        for tag in ["even", "later"] {
+            let want = self.docs.values().filter(|d| d.tag == tag).count();
+            expect("TAG", &format!("@t:{{{tag}}}"), want);
+        }
+        let want = self.docs.values().filter(|d| d.num < 50).count();
+        expect("NUMERIC", "@n:[0 49]", want);
+        for word in CKPT_WORDS {
+            let want = self.docs.values().filter(|d| d.word == word).count();
+            expect("TEXT", &format!("@body:{word}"), want);
+        }
+        expect("all", "*", self.docs.len());
+        out
+    }
+}
+
+/// Before the checkpoint: `before` documents in each of two databases.
+fn ckpt_models(c: &mut Conn, before: u32) -> Vec<CkptModel> {
+    let mut models: Vec<CkptModel> = (0..2)
+        .map(|db| CkptModel {
+            db,
+            ..Default::default()
+        })
+        .collect();
+    for m in &mut models {
+        m.create(c);
+        for i in 0..before {
+            m.put(c, i, 0);
+        }
+    }
+    models
+}
+
+/// After the checkpoint: new documents (numbered from `from`), documents
+/// overwritten whole or in their HNSW vector only, documents deleted,
+/// vectors taken out — of the documents the checkpoint has, and of ones
+/// written after it. Each `round` changes other documents than the last.
+fn ckpt_delta(c: &mut Conn, models: &mut [CkptModel], from: u32, after: u32, round: u32) {
+    let old = round * 60;
+    let version = round * 3;
+    for m in models.iter_mut() {
+        assert!(c.cmds(&["SELECT", &m.db.to_string()]).is_ok());
+        for i in from..from + after {
+            m.put(c, i, 0);
+        }
+        for i in old..old + 15 {
+            m.put(c, i, version + 1);
+        }
+        for i in old + 15..old + 30 {
+            m.new_emb(c, i, version + 2);
+        }
+        for i in old + 30..old + 45 {
+            m.delete(c, i);
+        }
+        for i in old + 45..old + 55 {
+            m.drop_emb(c, i);
+        }
+        for i in from..from + 5 {
+            m.delete(c, i);
+        }
+        for i in from + 5..from + 10 {
+            m.new_emb(c, i, version + 3);
+        }
+    }
+}
+
+/// Wait until a checkpoint started by `cmd` is over.
+fn ckpt_wait(c: &mut Conn, cmd: &str) {
+    let reply = c.cmds(&[cmd]);
+    assert!(!reply.is_error(), "{cmd}: {reply:?}");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let info = c.cmds(&["INFO", "persistence"]);
+        let info = info.as_str();
+        if !info.contains("aof_rewrite_in_progress:1") && !info.contains("rdb_bgsave_in_progress:1")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{cmd} did not finish");
+        thread::sleep(Duration::from_millis(50));
+    }
+    // And the writer has swapped the files.
+    thread::sleep(Duration::from_millis(500));
+}
+
+/// Until the AOF holds the last write.
+fn ckpt_wait_logged(dir: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let aof = std::fs::read(dir.join("appendonly.aof")).unwrap_or_default();
+        if aof.windows(14).any(|w| w == b"ckpt-last-mark") {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the AOF never held the last write"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn assert_models(c: &mut Conn, models: &[CkptModel], when: &str) {
+    let wrong: Vec<String> = models.iter().flat_map(|m| m.mismatches(c)).collect();
+    assert!(wrong.is_empty(), "{when}:\n  {}", wrong.join("\n  "));
+}
+
+/// Documents, a checkpoint by `checkpoint`, more writes, kill -9, restart:
+/// every index answers as before the kill.
+fn writes_after_a_checkpoint_survive_a_kill(checkpoint: &str) {
+    const BEFORE: u32 = 120;
+    const AFTER: u32 = 80;
+    let _serial = persist_serial();
+    let dir = temp_dir(&format!("ckpt_{}", checkpoint.to_lowercase()));
+    let extra: [&str; 0] = [];
+
+    let port1 = free_port();
+    let mut srv1 = start_aof_server(port1, &dir, &extra);
+    assert!(
+        wait_for_server(port1, Duration::from_secs(10)),
+        "srv1 start"
+    );
+    let mut models = {
+        let mut c = Conn::connect(port1);
+        let mut models = ckpt_models(&mut c, BEFORE);
+        ckpt_wait(&mut c, checkpoint);
+        ckpt_delta(&mut c, &mut models, BEFORE, AFTER, 0);
+        assert!(c.cmds(&["SET", "ckpt-last-mark", "1"]).is_ok());
+        assert_models(&mut c, &models, "before the kill");
+        models
+    };
+    ckpt_wait_logged(&dir);
+    assert!(
+        dir.join("dump.kdb").exists(),
+        "{checkpoint} wrote no dump.kdb"
+    );
+    kill_server(&mut srv1);
+
+    let port2 = free_port();
+    let mut srv2 = start_aof_server(port2, &dir, &extra);
+    assert!(
+        wait_for_server(port2, Duration::from_secs(10)),
+        "srv2 start"
+    );
+    {
+        let mut c = Conn::connect(port2);
+        assert_models(
+            &mut c,
+            &models,
+            &format!("after {checkpoint}, writes, kill -9, restart"),
+        );
+        // And it goes on from there: what is written now is found, and a
+        // second restart (from the snapshot written at shutdown) agrees.
+        ckpt_delta(&mut c, &mut models, BEFORE + AFTER, 20, 1);
+        assert_models(&mut c, &models, "writes after the restart");
+        assert!(c.cmds(&["SET", "ckpt-last-mark", "2"]).is_ok());
+    }
+    ckpt_wait_logged(&dir);
+    kill_server(&mut srv2);
+
+    let port3 = free_port();
+    let mut srv3 = start_aof_server(port3, &dir, &extra);
+    assert!(
+        wait_for_server(port3, Duration::from_secs(10)),
+        "srv3 start"
+    );
+    {
+        let mut c = Conn::connect(port3);
+        assert_models(&mut c, &models, "after a second kill -9 and restart");
+    }
+    send_shutdown_nosave(port3);
+    let _ = wait_for_exit(&mut srv3, Duration::from_secs(8));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn hnsw_writes_after_a_bgrewriteaof_survive_a_kill() {
+    writes_after_a_checkpoint_survive_a_kill("BGREWRITEAOF");
+}
+
+#[test]
+fn hnsw_writes_after_a_save_survive_a_kill() {
+    writes_after_a_checkpoint_survive_a_kill("SAVE");
+}
+
+#[test]
+fn hnsw_writes_after_a_bgsave_survive_a_kill() {
+    writes_after_a_checkpoint_survive_a_kill("BGSAVE");
+}
+
+/// Without the AOF a restart has the snapshot only: what was written after
+/// the SAVE is gone, from the keys and from the graphs alike.
+#[test]
+fn hnsw_without_aof_comes_back_as_saved() {
+    const BEFORE: u32 = 120;
+    let _serial = persist_serial();
+    let dir = temp_dir("ckpt_noaof");
+    let port1 = free_port();
+    let mut srv1 = start_server_in_dir(port1, &dir);
+    assert!(
+        wait_for_server(port1, Duration::from_secs(10)),
+        "srv1 start"
+    );
+    let models = {
+        let mut c = Conn::connect(port1);
+        let models = ckpt_models(&mut c, BEFORE);
+        assert!(c.cmds(&["SAVE"]).is_ok());
+        ckpt_writes_after_save(&mut c);
+        models
+    };
+    kill_server(&mut srv1);
+
+    let port2 = free_port();
+    let mut srv2 = start_server_in_dir(port2, &dir);
+    assert!(
+        wait_for_server(port2, Duration::from_secs(10)),
+        "srv2 start"
+    );
+    {
+        let mut c = Conn::connect(port2);
+        assert_models(
+            &mut c,
+            &models,
+            "after SAVE, writes, kill -9, restart without the AOF",
+        );
+    }
+    send_shutdown_nosave(port2);
+    let _ = wait_for_exit(&mut srv2, Duration::from_secs(8));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Writes after the SAVE of the test above, which the restart must not have.
+fn ckpt_writes_after_save(c: &mut Conn) {
+    let mut models: Vec<CkptModel> = (0..2)
+        .map(|db| CkptModel {
+            db,
+            ..Default::default()
+        })
+        .collect();
+    for m in &mut models {
+        assert!(c.cmds(&["SELECT", &m.db.to_string()]).is_ok());
+        for i in 0..10 {
+            m.put(c, i, 9);
+        }
+        for i in 500..520 {
+            m.put(c, i, 0);
+        }
+        m.delete(c, 20);
+    }
+}
+
+/// A replica: a full sync from a master with documents, writes after it
+/// through the stream, then the replica killed and started on its own files
+/// (its dump, written when it rebased its AOF on the sync, and its AOF).
+#[test]
+fn hnsw_writes_after_a_full_sync_survive_a_replica_kill() {
+    const BEFORE: u32 = 120;
+    const AFTER: u32 = 80;
+    let _serial = persist_serial();
+    let mdir = temp_dir("ckpt_master");
+    let rdir = temp_dir("ckpt_replica");
+    let extra: [&str; 0] = [];
+
+    let mport = free_port();
+    let mut master = start_server_in_dir(mport, &mdir);
+    assert!(
+        wait_for_server(mport, Duration::from_secs(10)),
+        "master start"
+    );
+    let mut mc = Conn::connect(mport);
+    let mut models = ckpt_models(&mut mc, BEFORE);
+
+    let rport = free_port();
+    let mport_s = mport.to_string();
+    let mut replica_args = extra.to_vec();
+    replica_args.extend(["--replicaof", "127.0.0.1", mport_s.as_str()]);
+    let mut replica = start_aof_server(rport, &rdir, &replica_args);
+    assert!(
+        wait_for_server(rport, Duration::from_secs(10)),
+        "replica start"
+    );
+    let mut rc = Conn::connect(rport);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !rc
+        .cmds(&["INFO", "replication"])
+        .as_str()
+        .contains("master_link_status:up")
+    {
+        assert!(Instant::now() < deadline, "the replica never synced");
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    ckpt_delta(&mut mc, &mut models, BEFORE, AFTER, 0);
+    assert!(mc.cmds(&["SELECT", "0"]).is_ok());
+    assert!(mc.cmds(&["SET", "ckpt-last-mark", "1"]).is_ok());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    assert!(rc.cmds(&["SELECT", "0"]).is_ok());
+    while rc.cmds(&["GET", "ckpt-last-mark"]) == RespValue::Nil {
+        assert!(
+            Instant::now() < deadline,
+            "the replica never got the writes"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_models(
+        &mut rc,
+        &models,
+        "on the replica, after the full sync and the stream",
+    );
+    ckpt_wait_logged(&rdir);
+    drop(rc);
+    kill_server(&mut replica);
+    send_shutdown_nosave(mport);
+    let _ = wait_for_exit(&mut master, Duration::from_secs(8));
+
+    let rport2 = free_port();
+    let mut alone = start_aof_server(rport2, &rdir, &extra);
+    assert!(
+        wait_for_server(rport2, Duration::from_secs(10)),
+        "replica restart"
+    );
+    {
+        let mut c = Conn::connect(rport2);
+        assert_models(&mut c, &models, "the replica's own files, after kill -9");
+    }
+    send_shutdown_nosave(rport2);
+    let _ = wait_for_exit(&mut alone, Duration::from_secs(8));
+    let _ = std::fs::remove_dir_all(&mdir);
+    let _ = std::fs::remove_dir_all(&rdir);
+}

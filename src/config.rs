@@ -1694,7 +1694,6 @@ impl Config {
             | "io-threads"
             | "io-threads-do-reads"
             | "lazyfree-lazy-eviction"
-            | "lazyfree-lazy-expire"
             | "lazyfree-lazy-server-del"
             | "lazyfree-lazy-user-del"
             | "no-appendfsync-on-rewrite"
@@ -1714,8 +1713,14 @@ impl Config {
                 if args.is_empty() {
                     return Err(format!("'{key}' needs a value"));
                 }
-                // For `CONFIG GET`, as `CONFIG SET` remembers it.
-                crate::commands::server::config_set_global(key, &args.join(" "));
+                // For `CONFIG GET`, as `CONFIG SET` remembers it, and
+                // checked as it checks it.
+                let value = args.join(" ");
+                if let Some(reply) = crate::commands::server::config_set_global(key, &value)
+                    && reply.starts_with(b"-")
+                {
+                    return Err(refused(key, &value, &reply));
+                }
                 return no_effect("KiviDB has no such setting");
             }
 
@@ -1732,12 +1737,11 @@ impl Config {
                 let value = args.join(" ");
                 match crate::commands::server::config_set_global(key, &value) {
                     Some(reply) if reply.starts_with(b"-") => {
-                        let why = String::from_utf8_lossy(&reply[1..]);
-                        let why = why.trim_end();
-                        let why = why.strip_prefix("ERR ").unwrap_or(why);
-                        return Err(format!("invalid value '{value}' for '{key}': {why}"));
+                        return Err(refused(key, &value, &reply));
                     }
-                    // Remembered for `CONFIG GET`, and in effect too.
+                    // Remembered for `CONFIG GET`, and in effect too. These
+                    // were in effect from a config file, but it warned that
+                    // they had no effect (#232).
                     Some(_)
                         if matches!(
                             key,
@@ -1745,6 +1749,9 @@ impl Config {
                                 | "ts-duplicate-policy"
                                 | "aof-ack-after-write"
                                 | "maxclients"
+                                | "lazyfree-lazy-expire"
+                                | "latency-tracking"
+                                | "latency-tracking-info-percentiles"
                         ) || crate::commands::server::remembered_config(key).is_none() => {}
                     Some(_) => return no_effect("KiviDB has no such setting"),
                     None if key.starts_with("cluster-")
@@ -1766,6 +1773,14 @@ impl Config {
 /// Split a config line into words. A word may be quoted — `"…"`, with `\"`,
 /// `\\`, `\n`, `\r` and `\t` — or `'…'`; a `#` where a word would start
 /// begins a comment.
+/// What a config file is told of a value `CONFIG SET` refused with `reply`.
+fn refused(key: &str, value: &str, reply: &[u8]) -> String {
+    let why = String::from_utf8_lossy(&reply[1..]);
+    let why = why.trim_end();
+    let why = why.strip_prefix("ERR ").unwrap_or(why);
+    format!("invalid value '{value}' for '{key}': {why}")
+}
+
 fn split_config_line(line: &str) -> Result<Vec<String>, String> {
     let mut words = Vec::new();
     let mut chars = line.chars().peekable();
@@ -2052,10 +2067,14 @@ mod config_file_tests {
              proto-max-bulk-len 512mb\nlatency-monitor-threshold 0\nacllog-max-len 128\n",
         )
         .unwrap();
-        // All but maxclients and latency-monitor-threshold, which the
-        // latency monitor goes by (#158).
-        assert_eq!(warnings.len(), 4, "{warnings:?}");
-        assert!(warnings[0].contains("'latency-tracking'"), "{warnings:?}");
+        // All but maxclients, latency-tracking and latency-monitor-threshold,
+        // which the latency monitor and `INFO latencystats` go by (#158,
+        // #232).
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(
+            warnings[0].contains("'hash-max-listpack-entries'"),
+            "{warnings:?}"
+        );
         let err = load("maxclients 0\n").unwrap_err();
         assert!(err.contains("maxclients"), "{err}");
         let err = load("array-slice-size 300\n").unwrap_err();
@@ -2074,6 +2093,31 @@ mod config_file_tests {
             let err = load(typo).unwrap_err();
             assert!(err.contains("unknown directive"), "{typo}: {err}");
         }
+    }
+
+    /// `lazyfree-lazy-expire` and `latency-tracking` from a config file are
+    /// set, as `CONFIG SET` sets them, and not reported as having no
+    /// effect: they have one (#232). A value other than yes or no is
+    /// refused, there and in the other `lazyfree-*` directives.
+    #[test]
+    fn lazyfree_lazy_expire_and_latency_tracking_are_applied_from_the_file() {
+        // Only to what they are already: other tests of this process go by
+        // them. tests/expired_propagation.rs sets `no` from a file.
+        let (_, warnings) = load("lazyfree-lazy-expire YES\nlatency-tracking yes\n").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        for bad in [
+            "lazyfree-lazy-expire maybe\n",
+            "lazyfree-lazy-user-del 1\n",
+            "lazyfree-lazy-user-flush on\n",
+            "latency-tracking sometimes\n",
+        ] {
+            let err = load(bad).unwrap_err();
+            assert!(err.contains("'yes' or 'no'"), "{bad}: {err}");
+        }
+        assert_eq!(
+            crate::commands::server::remembered_config("lazyfree-lazy-expire").as_deref(),
+            Some("yes")
+        );
     }
 
     #[test]

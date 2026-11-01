@@ -766,6 +766,14 @@ impl Taken {
         self.0.expires()
     }
 
+    /// The entry, and with it the hold this had: for the table to take it
+    /// back (`ShardMap::put_back`).
+    pub(super) fn into_entry(self) -> Entry {
+        let entry = self.0;
+        std::mem::forget(self);
+        entry
+    }
+
     /// The value, owned.
     pub fn into_value(self) -> KiviDBValue {
         let entry = self.0;
