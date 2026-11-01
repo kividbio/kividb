@@ -1018,13 +1018,18 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     let script = matches!(name, "EVAL" | "EVALSHA" | "FCALL");
     let gated = (writes_operation && name != "MIGRATE" && name != "FT.DROPINDEX") || script;
 
-    // And, while anything is listening to the write stream, a write is
-    // ordered against the other writes to the same keys, so that the stream
-    // carries them in the order the store took them. See `write_order`.
+    // And a write is ordered against the other writes to the same keys: it
+    // runs whole before or after each of them, and, while anything is
+    // listening to the write stream, the stream carries them in the order the
+    // store took them. See `write_order`. Whether anything is listening
+    // decides only whether the write is propagated, never whether it is
+    // ordered: a command that reads a key and writes it back under separate
+    // locks of its shard (`PFADD`, `HINCRBY` on a new key, `BITFIELD`, the
+    // `*STORE` commands) lost updates without it (#271).
     //
     // A write its master sent is already in order: the stream is one
     // connection, applied by one task.
-    let ordered = gated && !ctx.apply_replication && replication::write_is_observed(ctx);
+    let ordered = gated && !ctx.apply_replication;
 
     // Every command runs inside the command gate; a script — read-only or
     // not — and a flush that has to be ordered take it alone. So does
@@ -1110,7 +1115,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         // command takes the order of its own keys.
         let _evicting = crate::write_gate::enter();
         let limit = crate::RUNTIME_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed);
-        let in_order = ordered || (!gated && replication::write_is_observed(ctx));
+        let in_order = ordered || (!gated && !ctx.apply_replication);
         if limit != 0 && !crate::eviction::make_room(ctx, limit, in_order) && needs_room {
             log_throttled!(
                 60,

@@ -26,9 +26,14 @@
 // script, which may touch keys it did not declare, take the write gate
 // exclusively instead ([`write_gate::enter_exclusive`]).
 //
-// Nothing is taken when nobody is listening — no replica, no backlog, no AOF,
-// no backup: with one observer of the dataset there is no second order to
-// disagree with.
+// It is taken when nobody is listening too — no replica, no backlog, no AOF,
+// no backup. There is then no second order to disagree with, but a write
+// must still run whole before or after every other write to its keys, and
+// not every command does all of its reading and writing under one hold of
+// its shard's lock: `PFADD` read the registers under one and wrote them
+// back under another, and two of them at once lost elements (#271). Holding
+// the order of a key says nothing about propagating the write: whether
+// anything is listening decides that, separately (`write_is_observed`).
 
 use parking_lot::{Mutex, MutexGuard};
 use std::cell::Cell;
