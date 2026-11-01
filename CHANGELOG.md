@@ -44,6 +44,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`CONFIG GET threads` gives the `--threads` value.** It gave an empty
+  reply, though `CONFIG SET threads` was refused as a setting that cannot
+  change at runtime. `CONFIG SET` with a name and no value to pair with it
+  (`CONFIG SET replicaof <host> <port>`, say) now gets Redis 8.10's
+  `ERR syntax error` instead of a wrong-number-of-arguments error (#257).
+
 - **`expired` comes before the event of a write that makes the key
   again.** When the background sweep, or another client's read, deleted a
   key past its time, its `expired` notification was published after the
