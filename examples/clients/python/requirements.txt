@@ -1,0 +1,6 @@
+# Dependencies for the Python client examples (quickstart.py and vector_search.py).
+redis==8.1.0
+
+# redis-py's search helpers (used by vector_search.py) rely on typing.Self,
+# which is only in the standard library from Python 3.11 onward.
+typing_extensions>=4.16.0 ; python_version < "3.11"
