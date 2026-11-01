@@ -557,7 +557,9 @@ class TestExpiryReplication:
         """EXPIRE on primary → replica also sees the TTL."""
         self.p.set("ex:key", "v")
         self.p.expire("ex:key", 60)
-        assert _poll(lambda: self.r.exists("ex:key") == 1)
+        # The SET can reach the replica before the EXPIRE: wait for the TTL.
+        assert _poll(lambda: self.r.ttl("ex:key") > 0, timeout=10.0), \
+            f"EXPIRE did not reach the replica (TTL {self.r.ttl('ex:key')})"
         ttl = self.r.ttl("ex:key")
         assert 50 <= ttl <= 60, f"Replica TTL should be ~60 s, got {ttl}"
 
@@ -565,7 +567,9 @@ class TestExpiryReplication:
         """PEXPIRE on primary → replica has the millisecond TTL."""
         self.p.set("px:key", "v")
         self.p.pexpire("px:key", 5000)
-        assert _poll(lambda: self.r.exists("px:key") == 1)
+        # The SET can reach the replica before the PEXPIRE: wait for the TTL.
+        assert _poll(lambda: self.r.pttl("px:key") > 0, timeout=10.0), \
+            f"PEXPIRE did not reach the replica (PTTL {self.r.pttl('px:key')})"
         pttl = self.r.pttl("px:key")
         assert 3000 <= pttl <= 5500, f"Replica PTTL should be ~5 000 ms, got {pttl}"
 
@@ -592,7 +596,9 @@ class TestExpiryReplication:
         self.p.set("eat:key", "v")
         future_ts = int(time.time()) + 60
         self.p.expireat("eat:key", future_ts)
-        assert _poll(lambda: self.r.exists("eat:key") == 1)
+        # The SET can reach the replica before the EXPIREAT: wait for the TTL.
+        assert _poll(lambda: self.r.ttl("eat:key") > 0, timeout=10.0), \
+            f"EXPIREAT did not reach the replica (TTL {self.r.ttl('eat:key')})"
         ttl = self.r.ttl("eat:key")
         assert 50 <= ttl <= 65, f"EXPIREAT TTL on replica should be ~60 s, got {ttl}"
 
