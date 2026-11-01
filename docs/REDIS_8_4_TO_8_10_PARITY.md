@@ -350,9 +350,10 @@ Beyond the report:
 * `OBJECT IDLETIME` is `0` under `noeviction` and the policies that do not go
   by use: keys are watched only when a policy needs it, so that the default
   costs a command nothing. Redis always tracks one of idle time or frequency.
-* A replica expires keys by its own clock rather than waiting for its
-  master's `DEL`. Both hold the same absolute expiry times, so they agree to
-  within their clocks.
+* A replica waits for its master's `DEL` of a key that expires, as in Redis,
+  except under a KiviDB master older than 1.1.3, which sends none: there it
+  expires keys by its own clock, as every replica did before 1.1.3. Both hold
+  the same absolute expiry times, so they agree to within their clocks.
 * A replica does not enforce `maxmemory` on what its master sends it (Redis's
   `replica-ignore-maxmemory yes`, which cannot be turned off here).
 * On a JSON index, a NUMERIC path that selects several numbers indexes the

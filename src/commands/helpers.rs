@@ -299,7 +299,7 @@ pub fn active_expire_cycle(
 ) -> bool {
     // A replica expires nothing itself: its master's `DEL`s say what has
     // gone (see `expiry`). Its clients are told a key past its time is not
-    // there all the same.
+    // there all the same. Unless its master sends no `DEL`s (before 1.1.3).
     if target.is_some_and(crate::expiry::Target::on_replica) {
         return false;
     }
@@ -394,6 +394,36 @@ fn expire_pass(
 /// their `DEL`s are propagated.
 const TOLD_BATCH: usize = 64;
 
+/// Delete every key of `store` whose time to live ended before `before`
+/// (milliseconds since the Unix epoch), propagating nothing; returns how
+/// many went. What a replica does once, at a partial resync with a master
+/// that sends the deletion of every key it expires, for the keys no master
+/// will send one of: those that went past their time under a master that
+/// sent none (`ReplState::expiry_sweep_owed`, #231). A key whose hash tag a
+/// script holds is left, as by the sweep, for that master's deletion.
+pub fn expire_keys_due_before(store: &Store, index_store: &IndexStore, before: u64) -> usize {
+    let mut deleted = 0;
+    for db in 0..store.len() {
+        for shard in 0..store[db].len() {
+            if store[db][shard].holds_no_ttl() {
+                continue;
+            }
+            loop {
+                let (due, _) = read_lock!(store[db][shard]).due(before, ACTIVE_EXPIRE_BATCH);
+                let full = due.len() == ACTIVE_EXPIRE_BATCH;
+                let gone = expire_batch(store, index_store, db, shard, &due, before, None);
+                deleted += gone;
+                // A batch of which nothing went (all held) would be found
+                // again: go on to the next shard.
+                if !full || gone == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    deleted
+}
+
 /// Whether more than [`ACTIVE_EXPIRE_STALE_PERCENT`] of the `seen` keys
 /// were `due`: a cycle whose time ran out with this true is behind.
 fn stale(seen: usize, due: usize) -> bool {
@@ -401,7 +431,8 @@ fn stale(seen: usize, due: usize) -> bool {
 }
 
 /// Delete the keys of `batch`, all in shard `shard` of database `db`, that
-/// are still past their time, under one lock of the shard. A key given a new
+/// are still past their time, under one lock of the shard; returns how many
+/// went. A key given a new
 /// time meanwhile, or a new value without one, is left alone. With `told`,
 /// the `DEL` of each key deleted is propagated, as a write's record is:
 /// holding the write gate and the keys' order from before they go.
@@ -425,7 +456,7 @@ fn expire_batch(
     batch: &[Key],
     now: u64,
     told: Option<&crate::expiry::Target>,
-) {
+) -> usize {
     // In the order a command takes them: the command gate, the write gate,
     // the keys' tags' locks, the keys' order.
     let _command = crate::command_gate::enter();
@@ -444,14 +475,14 @@ fn expire_batch(
         _ => batch.iter().collect(),
     };
     if batch.is_empty() {
-        return;
+        return 0;
     }
     let ordered = told.map(|_| crate::expiry::order(db, batch.iter().map(|k| k.as_bytes())));
     // Writes were paused, for a handoff say, while this waited for the
     // gate: a `DEL` now would come after the cut the handoff took. The
     // keys go once the pause is over.
     if ordered.is_some() && crate::pause::expiry_deferred() {
-        return;
+        return 0;
     }
     let mut gone: Vec<&Key> = Vec::with_capacity(batch.len());
     let mut freed: Vec<store::Taken> = Vec::with_capacity(batch.len());
@@ -474,6 +505,7 @@ fn expire_batch(
     drop(ordered);
     // Freed outside the lock.
     drop(freed);
+    let count = gone.len();
     for key in gone {
         crate::stats::record_expired();
         crate::stats::EXPIRED_KEYS_ACTIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -482,6 +514,7 @@ fn expire_batch(
         crate::tracking::expired(store, key);
         crate::vector::maybe_unindex(index_store, db, key);
     }
+    count
 }
 
 /// How often each expiry thread looks for tables to shrink.
@@ -748,7 +781,8 @@ pub fn take_key(store: &Store, db: usize, key: &str) -> Option<KiviDBValue> {
 /// On a master something reads the write stream of, the key's `DEL` is
 /// propagated, ordered as a write to the key is. A replica deletes nothing:
 /// it answers whether the key is past its time, and leaves it for its
-/// master's `DEL` (see `expiry`).
+/// master's `DEL` (see `expiry`). Unless that master sends none (before
+/// 1.1.3): then the replica deletes the key, and tells no one.
 #[inline]
 pub fn delete_key_if_expired(store: &Store, db: usize, key: &str) -> bool {
     // Loading, or applying the master's stream: a key's time does not make

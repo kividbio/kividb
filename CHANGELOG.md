@@ -84,6 +84,37 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `dump.kdb.clean`, is left beside the final snapshot), restarts go on as
   before.
 
+- **A replica of a KiviDB master older than 1.1.3 no longer keeps the keys
+  that master expires.** Since 1.1.3 a replica does not expire keys by its
+  own clock: it waits for the `DEL` (or `UNLINK`) its master sends for each
+  key it expires, so that the two cannot come apart. A 1.1.2 or older master
+  sends none, so a newer replica following it (as in the recommended
+  upgrade order, replicas first) kept every key the master expired: unseen
+  by reads, but in memory, and still there after the master was upgraded
+  if the replica went on by a partial resync. Ten keys of `PX 1000` left a
+  1.1.2 master at one key and its replica at eleven, for good. A replica now
+  asks its master which release it is (it already did, for `FT.DROPINDEX
+  DD`): under a master that sends no deletions (KiviDB 1.1.2 and before,
+  and 1.2.0-rc1 and -rc2, cut before the fix reached 1.2) it expires keys
+  itself, deleting them locally and propagating nothing, as every replica
+  did before 1.1.3. A master now says in `INFO server` that it sends them
+  (`kividb_expired_keys_propagated:1`); 1.1.3 and later 1.1 releases are
+  known by their version; a master that is not KiviDB (Redis, Valkey) sends
+  them; and one whose `INFO` cannot be read (refused to the replication user
+  by an ACL, say) is taken to send them, as 1.1.3 took every master: a
+  replica that waits for deletions that never come keeps keys that read as
+  gone, while one that also deletes keys under a master that sends them can
+  come apart from it. And when a replica is continued by a master that
+  sends deletions (a partial resync) while its dataset may hold keys left
+  by one that did not (it has followed such a master, or loaded its dataset
+  at startup), it first deletes the keys whose time ended before that
+  master started, before applying anything of its stream; a key that
+  expired later is that master's to delete. Only the replica's own clock is
+  read, against the master's `uptime_in_seconds`. Under a master that sends
+  deletions nothing changes: no key expires while a dataset is loaded or
+  the master's stream applied, and the replica deletes none itself.
+  Fixes #231.
+
 - **`FT.DROPINDEX index DD` reaches replicas and the AOF as the documents
   it deleted.** The command was sent on as typed, and each replica, and an
   AOF replayed at startup, ran `DD` again and deleted whatever its own copy

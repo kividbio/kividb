@@ -586,7 +586,7 @@ async fn run_replication_session(
         "INFO server",
     )
     .await?;
-    let mut master_version = None;
+    let mut master_info = None;
     if let Some(len) = head.strip_prefix('$').and_then(|n| n.parse::<usize>().ok()) {
         let mut body = vec![0u8; len + 2];
         guarded(
@@ -597,17 +597,44 @@ async fn run_replication_session(
             "INFO server",
         )
         .await?;
-        master_version = String::from_utf8_lossy(&body)
-            .lines()
-            .find_map(|line| line.strip_prefix("kividb_version:"))
-            .map(|version| version.trim().to_string());
+        master_info = Some(String::from_utf8_lossy(&body).into_owned());
     }
+    let master_version = master_info.as_deref().and_then(|info| {
+        info.lines()
+            .find_map(|line| line.strip_prefix("kividb_version:"))
+            .map(|version| version.trim().to_string())
+    });
     repl_state.master_dd_deletes.store(
         master_version
             .as_deref()
             .is_some_and(crate::replication::dd_deleted_by),
         std::sync::atomic::Ordering::Relaxed,
     );
+    // Whether the master sends a `DEL` for every key it expires (KiviDB
+    // since 1.1.3, Redis always). One that does not (1.1.2 and before) is
+    // followed as replicas followed every master before 1.1.3: this node
+    // expires keys by its own clock, and deletes them here only (a replica
+    // propagates nothing). Otherwise none it expired would ever go (#231).
+    let propagates = crate::replication::expiry_propagated_by(master_info.as_deref());
+    let master_uptime = master_info
+        .as_deref()
+        .and_then(crate::replication::uptime_in);
+    if !propagates {
+        log_info!(
+            "Replication: The master (KiviDB {}) does not send the deletion of the keys it \
+             expires: this replica expires keys itself while it follows it",
+            master_version.as_deref().unwrap_or("?")
+        );
+        repl_state.expiry_sweep_owed.store(true, Ordering::Relaxed);
+    } else if master_info.is_none() {
+        log_info!(
+            "Replication: The master did not answer INFO server: it is taken to send the \
+             deletion of every key it expires, and this replica expires none itself"
+        );
+    }
+    repl_state
+        .master_propagates_expiry
+        .store(propagates, Ordering::Relaxed);
 
     // ── Phase 4: PSYNC ───────────────────────────────────────────────────
     // If this node's dataset is a known position in a master's stream — it
@@ -778,6 +805,46 @@ async fn run_replication_session(
             "Replication: Partial resync: continuing from offset {} — no dataset transfer",
             point.offset
         );
+        // This dataset may hold keys that went past their time under a
+        // master that sent no `DEL`s (a release before 1.1.3, followed by
+        // this node or by the one that wrote what it loaded at startup):
+        // this master, which does send them, will never send theirs. Before
+        // anything of its stream is applied (its writes find the keys as
+        // they are here), the keys whose time ended before this master
+        // started are deleted. A later one is its to expire: it was alive
+        // at its start, and its `DEL` comes in the stream. Only this node's
+        // clock is read, against the master's uptime: no clock of the
+        // master's. The uptime is whole seconds, rounded down: a second
+        // more is taken off.
+        if propagates && repl_state.expiry_sweep_owed.load(Ordering::Relaxed) {
+            match master_uptime {
+                Some(uptime) => {
+                    let before = crate::commands::helpers::now_ms()
+                        .saturating_sub(uptime.saturating_add(1).saturating_mul(1000));
+                    let (store, index_store) = (Arc::clone(store), Arc::clone(index_store));
+                    let deleted = tokio::task::spawn_blocking(move || {
+                        crate::commands::helpers::expire_keys_due_before(
+                            &store,
+                            &index_store,
+                            before,
+                        )
+                    })
+                    .await
+                    .unwrap_or(0);
+                    if deleted > 0 {
+                        log_info!(
+                            "Replication: Deleted {deleted} keys that expired before the master \
+                             started, which no master would have sent the deletion of"
+                        );
+                    }
+                    repl_state.expiry_sweep_owed.store(false, Ordering::Relaxed);
+                }
+                None => log_info!(
+                    "Replication: The master did not say how long it has been up: keys \
+                     already past their time are left for its deletions"
+                ),
+            }
+        }
     } else {
         if tok.len() < 3 || cmd0 != "FULLRESYNC" {
             return Err(SessionError::Link(format!(
@@ -991,6 +1058,11 @@ async fn run_replication_session(
             db: 0,
         }));
         repl_state.set_stream_origin(repl_state.cluster_master_node());
+        // Every key in it that this master expires is sent as a `DEL`, if
+        // it sends them at all: nothing is left for a sweep.
+        if propagates {
+            repl_state.expiry_sweep_owed.store(false, Ordering::Relaxed);
+        }
         // The dataset is the master's from here on; a promotion now finds it
         // whole and stops this session at its next look at the epoch.
         drop(commit);
@@ -1804,8 +1876,14 @@ impl ReplicationApplyEnv {
 
         // A write the master made, or one the AOF holds, is applied to the
         // keys as they were when it was made: none of them has expired here
-        // that the master has not said so of, by a `DEL` further on.
-        let _hold = crate::expiry::hold();
+        // that the master has not said so of, by a `DEL` further on. A
+        // master that sends no such `DEL`s (before 1.1.3) expired keys by
+        // its clock alone, and its writes are applied as replicas applied
+        // them then: to a key past its time here, as to no key.
+        let _hold = repl_state
+            .master_propagates_expiry
+            .load(Ordering::Relaxed)
+            .then(crate::expiry::hold);
         let out = execute_command(Ctx {
             cmd: cmd_refs,
             store,
