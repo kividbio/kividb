@@ -142,20 +142,48 @@ fn pairs_reply<'a>(
     out
 }
 
-fn get_or_create_zset(ctx: &mut Ctx, key: &str) -> Result<Arc<RwLock<SortedSetInner>>, Vec<u8>> {
-    let db_ref = &ctx.store[*ctx.selected_db];
-    let shard = store::get_shard(db_ref, key);
+/// Write the sorted set at `key` with `write`; the set is made if there is
+/// none, with what `write` puts in it. `Err` is the WRONGTYPE reply.
+///
+/// All of it with the key's shard held: for reading when the set is there,
+/// which keeps a command that empties it (`ZREM`, `ZPOPMIN`) from taking it
+/// out of the keyspace meanwhile; for writing when it is made, and then
+/// made whole, never empty. Made empty, then let go of and written, it was
+/// taken for one a `ZREM` had emptied, removed, and the members went into a
+/// set no longer in the keyspace (#271). Nor is a set left empty: `ZADD XX`
+/// of a key that is not there makes nothing.
+fn write_zset<R>(
+    ctx: &Ctx,
+    key: &str,
+    mut write: impl FnMut(&mut SortedSetInner) -> R,
+) -> Result<R, Vec<u8>> {
+    let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
+    match read_lock!(shard).get(key) {
+        Some(ValueRef::SortedSet(zs)) => return Ok(write(&mut zs.write())),
+        Some(_) => {
+            return Err(resp_error(
+                "WRONGTYPE Operation against a key holding the wrong kind of value",
+            ));
+        }
+        None => {}
+    }
     let mut map = write_lock!(shard);
-
+    // Looked for again: it may have been made since.
     match map.get(key) {
-        Some(ValueRef::SortedSet(zs)) => Ok(Arc::clone(zs)),
+        Some(ValueRef::SortedSet(zs)) => Ok(write(&mut zs.write())),
         Some(_) => Err(resp_error(
             "WRONGTYPE Operation against a key holding the wrong kind of value",
         )),
         None => {
-            let zs = Arc::new(RwLock::new(SortedSetInner::new()));
-            map.insert(Key::from(key), KiviDBValue::SortedSet(Arc::clone(&zs)));
-            Ok(zs)
+            let mut zs = SortedSetInner::new();
+            let out = write(&mut zs);
+            if !zs.is_empty() {
+                map.insert(
+                    Key::from(key),
+                    KiviDBValue::SortedSet(Arc::new(RwLock::new(zs))),
+                );
+            }
+            Ok(out)
         }
     }
 }
@@ -647,73 +675,71 @@ fn zadd(ctx: &mut Ctx) -> Vec<u8> {
         return resp_error("ERR syntax error");
     }
 
-    let zs = match get_or_create_zset(ctx, &key) {
-        Ok(z) => z,
-        Err(e) => return e,
-    };
+    let written = write_zset(ctx, &key, |inner| {
+        if flag_incr
+            && let Some((incr, member)) = pairs.first()
+            && (inner.members.get(member.as_ref()).copied().unwrap_or(0.0) + incr).is_nan()
+        {
+            return Err(resp_error("ERR resulting score is not a number (NaN)"));
+        }
+        let mut added = 0i64;
+        let mut changed = 0i64;
+        let mut last_score: Option<f64> = None; // used for INCR mode
+        for (score, member) in pairs.drain(..) {
+            let existing = inner.members.get(member.as_ref()).copied();
 
-    let mut inner = zs.write();
-    if flag_incr
-        && let Some((incr, member)) = pairs.first()
-        && (inner.members.get(member.as_ref()).copied().unwrap_or(0.0) + incr).is_nan()
-    {
-        return resp_error("ERR resulting score is not a number (NaN)");
-    }
-    let mut added = 0i64;
-    let mut changed = 0i64;
-    let mut last_score: Option<f64> = None; // used for INCR mode
+            let final_score = if flag_incr {
+                // INCR: add to existing score (or treat as 0 if not present)
+                existing.unwrap_or(0.0) + score
+            } else {
+                score
+            };
 
-    for (score, member) in pairs {
-        let existing = inner.members.get(member.as_ref()).copied();
-
-        let final_score = if flag_incr {
-            // INCR: add to existing score (or treat as 0 if not present)
-            existing.unwrap_or(0.0) + score
-        } else {
-            score
-        };
-
-        match existing {
-            None => {
-                // Member doesn't exist
-                if flag_xx {
-                    // XX: skip, don't add
-                    continue;
-                }
-                // Every member goes into the set; a client blocked on the
-                // key is woken afterwards and pops for itself (see
-                // `blocking::wait_for_keys`).
-                inner.insert(member, final_score);
-                added += 1;
-                changed += 1;
-                last_score = Some(final_score);
-            }
-            Some(old_score) => {
-                // Member exists
-                if flag_nx {
-                    // NX: skip, don't update
-                    continue;
-                }
-                // GT/LT gating
-                if flag_gt && final_score <= old_score {
-                    continue;
-                }
-                if flag_lt && final_score >= old_score {
-                    continue;
-                }
-
-                // (Any difference: two scores a hair apart are two
-                // scores.)
-                if final_score != old_score {
+            match existing {
+                None => {
+                    // Member doesn't exist
+                    if flag_xx {
+                        // XX: skip, don't add
+                        continue;
+                    }
+                    // Every member goes into the set; a client blocked on the
+                    // key is woken afterwards and pops for itself (see
+                    // `blocking::wait_for_keys`).
                     inner.insert(member, final_score);
+                    added += 1;
                     changed += 1;
+                    last_score = Some(final_score);
                 }
-                last_score = Some(final_score);
+                Some(old_score) => {
+                    // Member exists
+                    if flag_nx {
+                        // NX: skip, don't update
+                        continue;
+                    }
+                    // GT/LT gating
+                    if flag_gt && final_score <= old_score {
+                        continue;
+                    }
+                    if flag_lt && final_score >= old_score {
+                        continue;
+                    }
+
+                    // (Any difference: two scores a hair apart are two
+                    // scores.)
+                    if final_score != old_score {
+                        inner.insert(member, final_score);
+                        changed += 1;
+                    }
+                    last_score = Some(final_score);
+                }
             }
         }
-    }
-
-    drop(inner);
+        Ok((added, changed, last_score))
+    });
+    let (added, changed, last_score) = match written {
+        Ok(Ok(written)) => written,
+        Err(e) | Ok(Err(e)) => return e,
+    };
     if changed > 0 {
         let event = if flag_incr { "zincr" } else { "zadd" };
         notify(ctx.pubsub, *ctx.selected_db, KS_SORTED_SET, event, &key);
@@ -1184,20 +1210,20 @@ fn zincrby(ctx: &mut Ctx) -> Vec<u8> {
     };
     let member: ZMember = Arc::from(cmd[3]);
 
-    let zs = match get_or_create_zset(ctx, &key) {
-        Ok(z) => z,
-        Err(e) => return e,
-    };
-
     let resp = reply_resp(ctx);
-    let mut inner = zs.write();
-    let old = inner.members.get(member.as_ref()).copied().unwrap_or(0.0);
-    let new_score = old + incr;
-    if new_score.is_nan() {
-        return resp_error("ERR resulting score is not a number (NaN)");
+    let written = write_zset(ctx, &key, |inner| {
+        let old = inner.members.get(member.as_ref()).copied().unwrap_or(0.0);
+        let new_score = old + incr;
+        if new_score.is_nan() {
+            return Err(resp_error("ERR resulting score is not a number (NaN)"));
+        }
+        inner.insert(Arc::clone(&member), new_score);
+        Ok(new_score)
+    });
+    match written {
+        Ok(Ok(new_score)) => score_reply(resp, new_score),
+        Err(e) | Ok(Err(e)) => e,
     }
-    inner.insert(member, new_score);
-    score_reply(resp, new_score)
 }
 
 fn zrem(ctx: &mut Ctx) -> Vec<u8> {

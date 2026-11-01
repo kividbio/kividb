@@ -134,6 +134,11 @@ pub fn sweep(store: &Store, index_store: &IndexStore) {
         let mut next: Option<Instant> = None;
         let mut expired: Vec<String> = Vec::new();
         let mut emptied = false;
+        // Ordered against the writes to the key, as a command is (#271): an
+        // `HSET` holds the hash between finding it and writing to it, and a
+        // hash this emptied and removed in between took that field with it.
+        let command = crate::command_gate::enter();
+        let order = crate::write_order::lock_keys(db, std::iter::once(key.as_bytes()));
         if let Some(db_ref) = store.get(db) {
             let hash = match crate::store::get_shard(db_ref, &key)
                 .read()
@@ -176,6 +181,8 @@ pub fn sweep(store: &Store, index_store: &IndexStore) {
             }
             emptied = removed;
         }
+        drop(order);
+        drop(command);
         // Fields went: the indexes that cover the hash are brought up to
         // date with what it holds now. Also when none was found here to
         // expire: a read that came first dropped them (and left the indexes

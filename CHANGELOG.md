@@ -120,6 +120,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a disk that keeps up), and the documentation no longer says that a killed
   process loses nothing whatever the disk does.
 
+- **Concurrent writes to one key no longer lose updates when nothing
+  observes the write stream** (#271; reported and analysed by
+  @Parikalp-Bhardwaj). With
+  the AOF off and no replica, nothing ordered two writes to the same key,
+  and a command that reads a key and writes it back under separate holds of
+  its shard's lock could lose another's write: 50 clients adding 100,000
+  distinct elements with `PFADD` ended with a different count every run.
+  The same held for `PFMERGE`, `HINCRBY`/`HINCRBYFLOAT` on a new hash,
+  `BITFIELD`, `BITOP`, `GETEX`, `RESTORE`, `RENAME`/`RENAMENX`, `COPY`,
+  `SMOVE`, the `*STORE` commands and `SORT ... STORE` with their keys in one
+  shard, and `SADD`, `HSET`, `ZADD`, `GEOADD`, `VADD` and `LPUSHX` racing a
+  command that emptied and removed the key. Every write from a client now
+  holds the order of its keys, as it already did with the AOF on or a
+  replica attached; so do the active and lazy expiry of keys, eviction and
+  the expiry of hash fields. It still propagates nothing unless something
+  is listening. `SET`, `INCR` and the like, `LPUSH`/`RPUSH`, `SADD`, `ZADD`,
+  `ZINCRBY`, `PFADD` and (with no search index defined) `HSET`, `HMSET`,
+  `HSETNX`, `HINCRBY` and `HINCRBYFLOAT` read and write their one key under
+  one hold of its shard's lock, and take its order shared while nothing is
+  listening, so one hot key still takes as many of them a second as before;
+  `SADD`, `HSET`, `ZADD` and their kin now write the collection with its
+  shard held, and make a new one with its members rather than empty, and
+  `PFADD` writes its registers back only over the value it read them from.
 - **A replica no longer keeps a key its master deleted at an `EXPIRE` or
   `PEXPIRE`.** `PEXPIRE k 1` read the clock twice, for the key's new time
   and to see whether that time had already come, and about once in 650
