@@ -3,7 +3,7 @@ use crate::commands::helpers::{
     ERR_INVALID_EXPIRE_PEXPIRE_CMD, ERR_INVALID_EXPIRE_PEXPIREAT_CMD, ERR_VALUE_NOT_INTEGER,
     ExpireModifierFlags, absolute_when_ms_from_pexpire_ms, delete_key, delete_key_if_expired,
     expire_modifier_allows_set, expire_on_read, expiry_at_after, expiry_unix_millis,
-    expiry_unix_secs, from_unix_ms, get_expiry, glob_match, is_expired, lazy_expire_on_read,
+    from_unix_ms, get_expiry, glob_match, is_expired, lazy_expire_on_read,
     parse_bytes_as_i128, parse_expire_modifier_flags, parse_utf8, set_expiry,
     system_time_from_unix_millis_i128, take_key, ttl_remaining_secs_ceil,
 };
@@ -546,14 +546,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(n) => n,
                 None => return Some(resp_error(ERR_VALUE_NOT_INTEGER)),
             };
-            if unix_secs < 0 {
-                return Some(resp_error("ERR invalid expire time in EXPIREAT"));
-            }
-            let unix_secs_u64 = match u64::try_from(unix_secs) {
-                Ok(n) => n,
-                Err(_) => return Some(resp_error("ERR invalid expire time in EXPIREAT")),
+            let unix_ms = match unix_secs.checked_mul(1000) {
+                Some(ms) => ms,
+                None => return Some(resp_error("ERR invalid expire time in EXPIREAT")),
             };
-            let new_exp = expiry_unix_secs(unix_secs_u64);
+            let new_exp = match system_time_from_unix_millis_i128(unix_ms) {
+                Some(t) => t,
+                None => return Some(resp_error("ERR invalid expire time in EXPIREAT")),
+            };
             let now = crate::script_clock::wall_system_time_now();
             Some(apply_expire(ctx, key, new_exp, new_exp <= now, &flags))
         }
