@@ -44,6 +44,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A key a command leaves where it was keeps its LFU count.** `GETDEL` of
+  a key of another type took the key out, saw its type, and put it back as
+  a new key: its time to live was kept, but under an LFU policy its access
+  count started again at 5 (#221). `MOVE` to a database that already has
+  the key, and `RENAME` of a key to itself, did the same. Each now looks
+  at the key and leaves it as it is, counting the lookup as a use, as
+  Redis does. A key `MOVE` does move keeps its count and its idle time, as
+  its object does in Redis; it used to start afresh.
+
 - **HNSW vectors written after a checkpoint are found again after a crash.**
   A checkpoint (`BGREWRITEAOF`, the automatic AOF rewrite, or `SAVE` /
   `BGSAVE` with the AOF on) writes `dump.kdb` with the HNSW graphs, and

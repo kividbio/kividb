@@ -759,8 +759,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let mut map = write_lock!(shard);
-            match map.remove(key) {
-                Some(taken) if matches!(taken.value(), ValueRef::String(_)) => {
+            // A key of another type is left as it is, with its time to live
+            // and its LFU count (#221): looked at, not taken out and put back.
+            match map.remove_if(key, |value| matches!(value, ValueRef::String(_))) {
+                store::Removal::Taken(taken) => {
                     drop(map);
                     let ValueRef::String(v) = taken.value() else {
                         unreachable!()
@@ -769,17 +771,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "del", key);
                     Some(resp_bulk(&v))
                 }
-                Some(other) => {
-                    // put it back — we peeked the wrong type — with its
-                    // time to live
-                    let expires = other.expires();
-                    map.insert_expiring(Key::from(key), other.into_value(), expires);
+                store::Removal::Kept => {
+                    drop(map);
                     crate::stats::record_miss();
                     Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
                     ))
                 }
-                None => {
+                store::Removal::Absent => {
                     crate::stats::record_miss();
                     Some(resp_null_bulk())
                 }

@@ -258,6 +258,16 @@ pub enum Written {
     Replaced(Taken),
 }
 
+/// What [`ShardMap::remove_if`] did with a key.
+pub enum Removal {
+    /// It was taken out: its entry, best dropped once the shard is unlocked.
+    Taken(Taken),
+    /// It is there, and was left as it was.
+    Kept,
+    /// There is no such key.
+    Absent,
+}
+
 impl Written {
     /// The old entry, if the key had one that is not its entry now.
     #[inline]
@@ -970,6 +980,82 @@ impl ShardMap {
                 Some(unsafe { Taken::new(entry) })
             }
             Err(_) => None,
+        }
+    }
+
+    /// Take `key` out if `take` says so of its value. If it says no, the
+    /// key is left as it was, its time to live and its access word with it,
+    /// and the lookup is a use of the key: what a `GETDEL` of a key of
+    /// another type does. One probe either way. Past its time or not, as
+    /// [`ShardMap::remove`].
+    ///
+    /// Taking the key out and putting it back, as `GETDEL` did, made it a
+    /// new entry: an LFU count of 5, whatever it had been (#221).
+    #[inline]
+    pub fn remove_if(&mut self, key: &str, take: impl FnOnce(ValueRef<'_>) -> bool) -> Removal {
+        let key = key.as_bytes();
+        let hash = self.hash_of(key);
+        let map = self.id();
+        match self
+            .table
+            .find_entry(hash, |s| s.may_be(hash) && s.entry().has_key(key))
+        {
+            Ok(at) => {
+                let entry = at.get().entry();
+                if !take(entry.value()) {
+                    used(entry, hash, map);
+                    return Removal::Kept;
+                }
+                let entry = at.remove().0.entry();
+                if entry.has_ttl() {
+                    ttl_take(&mut self.ttl, entry);
+                }
+                // SAFETY: the table's hold goes to the caller.
+                Removal::Taken(unsafe { Taken::new(entry) })
+            }
+            Err(_) => Removal::Absent,
+        }
+    }
+
+    /// Put an entry [`ShardMap::remove`] took, from this table or another
+    /// database's, under its key here: the entry itself, so that the key's
+    /// value, time to live and access word are what they were, as Redis
+    /// moves a key's object (`MOVE`). A key here past its time is written
+    /// over, and expired as a write expires it; that entry is given back,
+    /// best dropped once the shard is unlocked. A live key is left alone,
+    /// and `taken` is given back instead.
+    pub fn put_back(&mut self, taken: Taken) -> Result<Option<Taken>, Taken> {
+        let hash = self.hash_of(taken.key().as_bytes());
+        let now = &self.now;
+        let hasher = &self.hash;
+        let list = &mut self.ttl;
+        let over = &mut self.written_over;
+        let key = taken.key().as_bytes();
+        match self.table.entry(
+            hash,
+            |s| s.may_be(hash) && s.entry().has_key(key),
+            |s| hasher.hash_one(s.entry().key()),
+        ) {
+            hashbrown::hash_table::Entry::Occupied(mut at) => {
+                let old = at.get().entry();
+                if !expired(old, now) {
+                    return Err(taken);
+                }
+                written_over_expired(over, key);
+                let entry = taken.into_entry();
+                *at.get_mut() = Slot::new(entry, hash);
+                ttl_replaced(list, old, entry);
+                // SAFETY: the table's hold on the old entry goes to the caller.
+                Ok(Some(unsafe { Taken::new(old) }))
+            }
+            hashbrown::hash_table::Entry::Vacant(place) => {
+                let entry = taken.into_entry();
+                place.insert(Slot::new(entry, hash));
+                if entry.has_ttl() {
+                    ttl_push(list, entry);
+                }
+                Ok(None)
+            }
         }
     }
 
