@@ -438,6 +438,103 @@ fn test_expire_family_missing_key() {
     );
 }
 
+// A time that deletes the key (a TTL of zero or less, a moment that has
+// come) is weighed against NX / XX / GT / LT first, as Redis does (#270).
+// A condition that fails answers 0 and leaves the key and its TTL as they
+// were; one that holds deletes the key. No TTL counts as an infinite one.
+#[test]
+fn test_expire_deleting_time_checks_the_condition_first() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    // (has a 100 s TTL, command and its arguments after the key, answer)
+    let cases: &[(bool, &[&str], i64)] = &[
+        // The issue's table.
+        (true, &["EXPIRE", "0", "NX"], 0),
+        (true, &["EXPIRE", "-1", "NX"], 0),
+        (true, &["EXPIREAT", "1", "NX"], 0),
+        (false, &["PEXPIREAT", "1", "XX"], 0),
+        (true, &["PEXPIRE", "0", "GT"], 0),
+        // Conditions that hold: the key goes.
+        (true, &["EXPIRE", "0", "LT"], 1),
+        (false, &["PEXPIREAT", "1", "LT"], 1),
+        (false, &["EXPIRE", "0", "NX"], 1),
+        (true, &["PEXPIRE", "0", "XX"], 1),
+        (true, &["PEXPIREAT", "1", "XX"], 1),
+        (true, &["EXPIRE", "-1", "LT"], 1),
+        (false, &["PEXPIRE", "-5", "LT"], 1),
+        (false, &["EXPIREAT", "1", "NX"], 1),
+        (true, &["EXPIREAT", "1"], 1),
+        (false, &["EXPIRE", "0"], 1),
+        // GT needs a TTL, and a later deadline than it; LT a sooner one.
+        (true, &["EXPIRE", "0", "GT"], 0),
+        (false, &["EXPIREAT", "1", "GT"], 0),
+        (false, &["PEXPIRE", "0", "GT"], 0),
+        (false, &["PEXPIRE", "0", "XX"], 0),
+        (true, &["PEXPIREAT", "1", "NX"], 0),
+    ];
+    for (i, (with_ttl, args, want)) in cases.iter().enumerate() {
+        let key = format!("k{i}");
+        if *with_ttl {
+            assert!(c.cmds(&["SET", &key, "v", "EX", "100"]).is_ok());
+        } else {
+            assert!(c.cmds(&["SET", &key, "v"]).is_ok());
+        }
+        let mut cmd = vec![args[0], key.as_str()];
+        cmd.extend_from_slice(&args[1..]);
+        assert_eq!(c.cmds(&cmd).as_int(), *want, "{cmd:?}");
+        let exists = c.cmds(&["EXISTS", &key]).as_int();
+        let ttl = c.cmds(&["TTL", &key]).as_int();
+        if *want == 1 {
+            assert_eq!((exists, ttl), (0, -2), "{cmd:?} left the key");
+        } else if *with_ttl {
+            assert_eq!(exists, 1, "{cmd:?} deleted the key");
+            assert!((99..=100).contains(&ttl), "{cmd:?} changed the TTL: {ttl}");
+        } else {
+            assert_eq!((exists, ttl), (1, -1), "{cmd:?} changed the key");
+        }
+    }
+}
+
+// The options are all read, and checked against each other, before anything
+// is done: EXPIREAT and PEXPIREAT read only the first, and refused an unknown
+// one after a moment that had come had deleted the key.
+#[test]
+fn test_expire_invalid_options_error_before_deleting() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    const NX_AND: &str = "ERR NX and XX, GT or LT options at the same time are not compatible";
+    const GT_AND_LT: &str = "ERR GT and LT options at the same time are not compatible";
+    let cases: &[(&[&str], &str)] = &[
+        (&["EXPIRE", "0", "NX", "XX"], NX_AND),
+        (&["PEXPIRE", "0", "GT", "LT"], GT_AND_LT),
+        (&["EXPIREAT", "1", "NX", "GT"], NX_AND),
+        (&["EXPIREAT", "1", "GT", "LT"], GT_AND_LT),
+        (&["PEXPIREAT", "1", "LT", "NX"], NX_AND),
+        (&["PEXPIREAT", "1", "XX", "GT", "LT"], GT_AND_LT),
+        (&["EXPIRE", "0", "FOO"], "ERR Unsupported option FOO"),
+        (&["PEXPIRE", "0", "NX", "bar"], "ERR Unsupported option bar"),
+        (
+            &["EXPIREAT", "1", "XX", "FOO"],
+            "ERR Unsupported option FOO",
+        ),
+        (&["PEXPIREAT", "1", "FOO"], "ERR Unsupported option FOO"),
+    ];
+    for (i, (args, want)) in cases.iter().enumerate() {
+        let key = format!("k{i}");
+        assert!(c.cmds(&["SET", &key, "v", "EX", "100"]).is_ok());
+        let mut cmd = vec![args[0], key.as_str()];
+        cmd.extend_from_slice(&args[1..]);
+        assert_eq!(c.cmds(&cmd).error_msg(), *want, "{cmd:?}");
+        assert_eq!(c.cmds(&["EXISTS", &key]).as_int(), 1, "{cmd:?}");
+        let ttl = c.cmds(&["TTL", &key]).as_int();
+        assert!((99..=100).contains(&ttl), "{cmd:?} changed the TTL: {ttl}");
+    }
+}
+
 // RENAME: basic rename
 //   SET src "hello"
 //   RENAME src dst  → OK

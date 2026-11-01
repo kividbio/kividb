@@ -54,6 +54,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   only a negative time to live now deletes the key at once; a positive one
   that has already run out by then expires the key as any other, with its
   `DEL`. `EXPIRE` had the same race, over a whole second.
+- **`EXPIRE`, `PEXPIRE`, `EXPIREAT` and `PEXPIREAT` check `NX`, `XX`, `GT`
+  and `LT` before a time that deletes the key (#270).** A time to live of
+  `0`, or a moment that had already come, deleted the key and answered `1`
+  whatever the condition said: `EXPIRE k 0 NX` deleted a key that had a time
+  to live. As in Redis 8.10, the condition is now weighed first (no time to
+  live counting as an infinite one); if it fails, the command answers `0`,
+  leaves the key and its time to live as they were, and sends nothing to
+  replicas or the AOF. `EXPIREAT` and `PEXPIREAT` read only their first
+  option, so `NX XX` or `GT LT` went through with the second one ignored,
+  and an unknown option was refused only after the key had been deleted;
+  they now read every option and refuse these with Redis's errors before
+  doing anything. They are now sent, as `EXPIRE` is, as the `PEXPIREAT` or
+  `DEL` they came to. (Reported by @Parikalp-Bhardwaj.)
 - **`CONFIG GET threads` gives the `--threads` value.** It gave an empty
   reply, though `CONFIG SET threads` was refused as a setting that cannot
   change at runtime. `CONFIG SET` with a name and no value to pair with it

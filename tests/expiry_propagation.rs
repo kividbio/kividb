@@ -1060,6 +1060,54 @@ fn a_move_or_copy_that_moved_nothing_is_not_propagated() {
     });
 }
 
+/// An `EXPIRE` family command whose NX / XX / GT / LT condition failed
+/// answers 0, leaves the key, and sends nothing, even when its time would
+/// have deleted the key (#270); `EXPIREAT` and `PEXPIREAT` were sent as they
+/// came. One whose condition held and whose time deletes the key is sent as
+/// its `DEL`.
+#[test]
+fn a_refused_conditional_expire_is_not_propagated() {
+    let master = Server::start(&["--aof"]);
+    let mut m = master.conn();
+    assert_eq!(m.cmd(&["SET", "kept", "v", "EX", "100"]).s(), "OK");
+    assert_eq!(m.cmd(&["SET", "plain", "v"]).s(), "OK");
+    for refused in [
+        &["EXPIRE", "kept", "0", "NX"][..],
+        &["EXPIRE", "kept", "-1", "NX"],
+        &["PEXPIRE", "kept", "0", "GT"],
+        &["EXPIREAT", "kept", "1", "NX"],
+        &["PEXPIREAT", "kept", "1", "NX"],
+        &["EXPIRE", "kept", "500", "LT"],
+        &["PEXPIREAT", "plain", "1", "XX"],
+        &["EXPIREAT", "plain", "1", "GT"],
+        &["EXPIREAT", "plain", "4102444800", "XX"],
+        &["EXPIREAT", "missing", "1"],
+    ] {
+        assert_eq!(m.cmd(refused).i(), 0, "{refused:?}");
+    }
+    assert_eq!(m.cmd(&["EXISTS", "kept", "plain"]).i(), 2);
+    assert_eq!(m.cmd(&["SET", "aof-mark", "1"]).s(), "OK");
+    wait_until("the AOF to have everything", 20, || {
+        position(&master.aof(), b"$8\r\naof-mark\r\n").is_some()
+    });
+    let aof = master.aof();
+    for name in ["EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT"] {
+        let bulk = format!("${}\r\n{name}\r\n", name.len());
+        assert_eq!(position(&aof, bulk.as_bytes()), None, "a {name} was logged");
+    }
+    assert_eq!(deletions(&aof, "kept"), 0);
+    assert_eq!(deletions(&aof, "plain"), 0);
+
+    // Held: deleted, and logged as deleted.
+    assert_eq!(m.cmd(&["EXPIRE", "kept", "0", "LT"]).i(), 1);
+    assert_eq!(m.cmd(&["PEXPIREAT", "plain", "1", "LT"]).i(), 1);
+    assert_eq!(m.cmd(&["EXISTS", "kept", "plain"]).i(), 0);
+    wait_until("the deletions to be logged", 20, || {
+        let aof = master.aof();
+        deletions(&aof, "kept") == 1 && deletions(&aof, "plain") == 1
+    });
+}
+
 // ── Expiry, the write gate and hash tags: no deadlock ─────────────────────────
 //
 // What a write holds, it takes in one order: the write gate (whose shared

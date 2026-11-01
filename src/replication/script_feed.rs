@@ -101,7 +101,7 @@ pub fn commands_for_propagation(
     };
     match name {
         "SPOP" => spop_feed(cmd, resp),
-        "EXPIRE" | "PEXPIRE" => expire_feed(ctx, cmd, resp),
+        "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" => expire_feed(ctx, cmd, resp),
         // A TTL given as "this long from now" means something else to whoever
         // runs the command later — a replica a moment behind, or an AOF
         // replayed after a restart, where every TTL would start over. These
@@ -542,8 +542,14 @@ fn restore_feed(cmd: &[&[u8]]) -> Vec<Vec<Vec<u8>>> {
     vec![out]
 }
 
-/// `EXPIRE key seconds` / `PEXPIRE key ms` → `PEXPIREAT key at`, or `DEL key`
-/// when the TTL was not in the future and the key went at once.
+/// `EXPIRE key seconds` / `PEXPIRE key ms` / `EXPIREAT key secs` /
+/// `PEXPIREAT key ms` → `PEXPIREAT key at`, or `DEL key` when the key went at
+/// once (a TTL of zero or less, a moment that had come).
+///
+/// An answer of 0 sends nothing: no such key, or a NX/XX/GT/LT condition
+/// that did not hold, which leaves the key as it was even when the time asked
+/// for would have deleted it (#270). `EXPIREAT` and `PEXPIREAT` were sent as
+/// they came, a refused one included.
 fn expire_feed(ctx: &Ctx<'_>, cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
     if cmd.len() < 3 {
         return Vec::new();
@@ -551,16 +557,12 @@ fn expire_feed(ctx: &Ctx<'_>, cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
     let Some(key) = parse_utf8(cmd[1]) else {
         return Vec::new();
     };
-    let Some(ttl) = integer_arg(cmd[2]) else {
-        return Vec::new();
-    };
-    // 0: no such key, or a NX/XX/GT/LT condition that did not hold.
     if parse_resp_integer(resp) != Some(1) {
         return Vec::new();
     }
 
     // Redis: a TTL of zero or less deletes the key.
-    if ttl <= 0 {
+    if integer_arg(cmd[2]).is_some_and(|ttl| ttl <= 0) {
         return vec![vec![b"DEL".to_vec(), cmd[1].to_vec()]];
     }
 

@@ -1,7 +1,7 @@
 use crate::commands::ctx::Ctx;
 use crate::commands::helpers::{
     ERR_INVALID_EXPIRE_PEXPIRE_CMD, ERR_INVALID_EXPIRE_PEXPIREAT_CMD, ERR_VALUE_NOT_INTEGER,
-    absolute_when_ms_from_pexpire_ms, delete_key, delete_key_if_expired,
+    ExpireModifierFlags, absolute_when_ms_from_pexpire_ms, delete_key, delete_key_if_expired,
     expire_modifier_allows_set, expire_on_read, expiry_at_after, expiry_unix_millis,
     expiry_unix_secs, from_unix_ms, get_expiry, glob_match, is_expired, lazy_expire_on_read,
     parse_bytes_as_i128, parse_expire_modifier_flags, parse_utf8, set_expiry,
@@ -106,6 +106,45 @@ fn encoding_of(value: ValueRef<'_>) -> &'static str {
         ValueRef::Array(_) => "sliced-array",
         _ => "raw",
     }
+}
+
+/// The end of `EXPIRE`, `PEXPIRE`, `EXPIREAT` and `PEXPIREAT`, once each has
+/// read its arguments: `new_abs` is the deadline asked for, and `deletes`
+/// whether it is one that deletes the key now (a time to live of zero or
+/// less, a moment that has come).
+///
+/// The `NX` / `XX` / `GT` / `LT` condition is weighed first, as in Redis.
+/// The deleting deadline was handled ahead of it, so `EXPIRE k 0 NX` on a
+/// key with a time to live deleted it and answered 1, where Redis answers 0
+/// and leaves the key as it was (#270). An answer of 0 propagates nothing
+/// (`script_feed::expire_feed`); a deletion goes as a `DEL`.
+pub(crate) fn apply_expire(
+    ctx: &Ctx,
+    key: &str,
+    new_abs: SystemTime,
+    deletes: bool,
+    flags: &ExpireModifierFlags,
+) -> Vec<u8> {
+    let db = &ctx.store[*ctx.selected_db];
+    let shard = store::get_shard(db, key);
+    if !read_lock!(shard).contains_key(key) {
+        return resp_integer(0);
+    }
+    let current = get_expiry(ctx.store, *ctx.selected_db, key);
+    if !expire_modifier_allows_set(flags, current, new_abs) {
+        return resp_integer(0);
+    }
+    if deletes {
+        let removed = delete_key(ctx.store, *ctx.selected_db, key);
+        if removed {
+            crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
+            crate::vector::maybe_request_compaction(ctx.index_store, ctx.compaction_tx, key);
+        }
+        return resp_integer(if removed { 1 } else { 0 });
+    }
+    set_expiry(ctx.store, *ctx.selected_db, key, new_abs);
+    notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "expire", key);
+    resp_integer(1)
 }
 
 pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
@@ -457,34 +496,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(k) => k,
                 None => return Some(resp_error("ERR must be valid UTF-8")),
             };
-            let ms = match parse_bytes_as_i128(cmd[2]) {
-                Some(m) => m,
-                None => return Some(resp_error(ERR_VALUE_NOT_INTEGER)),
-            };
+            // The options are read before the time, as in Redis.
             let flags = match parse_expire_modifier_flags(cmd.as_slice(), 3) {
                 Ok(f) => f,
                 Err(msg) => return Some(resp_error(&msg)),
             };
-
-            let db = &ctx.store[*ctx.selected_db];
-            let shard = store::get_shard(db, key);
-            if !read_lock!(shard).contains_key(key) {
-                return Some(resp_integer(0));
-            }
-
-            if ms == 0 {
-                let removed = delete_key(ctx.store, *ctx.selected_db, key);
-                if removed {
-                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
-                    crate::vector::maybe_request_compaction(
-                        ctx.index_store,
-                        ctx.compaction_tx,
-                        key,
-                    );
-                }
-                return Some(resp_integer(if removed { 1 } else { 0 }));
-            }
-
+            let ms = match parse_bytes_as_i128(cmd[2]) {
+                Some(m) => m,
+                None => return Some(resp_error(ERR_VALUE_NOT_INTEGER)),
+            };
+            // The clock is read once, here.
             let when_ms = match absolute_when_ms_from_pexpire_ms(ms) {
                 Ok(w) => w,
                 Err(e) => return Some(resp_error(e)),
@@ -493,33 +514,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(t) => t,
                 None => return Some(resp_error(ERR_INVALID_EXPIRE_PEXPIRE_CMD)),
             };
-
-            let current = get_expiry(ctx.store, *ctx.selected_db, key);
-
-            if !expire_modifier_allows_set(&flags, current, new_exp) {
-                return Some(resp_integer(0));
-            }
-
-            // Only a negative time to live deletes the key here (see
-            // `EXPIRE`). `PEXPIRE k 1` found the clock a millisecond on, as
-            // it does about once in 650 calls, and deleted the key with
-            // nothing propagated: the replica kept it for good.
-            if ms < 0 {
-                let removed = delete_key(ctx.store, *ctx.selected_db, key);
-                if removed {
-                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
-                    crate::vector::maybe_request_compaction(
-                        ctx.index_store,
-                        ctx.compaction_tx,
-                        key,
-                    );
-                }
-                return Some(resp_integer(if removed { 1 } else { 0 }));
-            }
-
-            set_expiry(ctx.store, *ctx.selected_db, key, new_exp);
-            notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "expire", key);
-            Some(resp_integer(1))
+            // Only a time to live of zero or less deletes the key here, as
+            // `expire_feed` propagates it. `PEXPIRE k 1` found the clock a
+            // millisecond on, as it does about once in 650 calls, and deleted
+            // the key with nothing propagated: the replica kept it for good.
+            // A positive one goes the way every expired key goes, with its
+            // `DEL`.
+            Some(apply_expire(ctx, key, new_exp, ms <= 0, &flags))
         }
 
         // ── EXPIREAT ──────────────────────────────────────────────────────────────────
@@ -534,6 +535,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(k) => k,
                 None => return Some(resp_error("ERR must be valid UTF-8")),
             };
+            // Every option, and checked against the others, before anything
+            // is touched: only `cmd[3]` was read, and an unknown one was
+            // refused after a moment that had come had deleted the key.
+            let flags = match parse_expire_modifier_flags(cmd.as_slice(), 3) {
+                Ok(f) => f,
+                Err(msg) => return Some(resp_error(&msg)),
+            };
             let unix_secs = match parse_bytes_as_i128(cmd[2]) {
                 Some(n) => n,
                 None => return Some(resp_error(ERR_VALUE_NOT_INTEGER)),
@@ -545,51 +553,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Ok(n) => n,
                 Err(_) => return Some(resp_error("ERR invalid expire time in EXPIREAT")),
             };
-            let flag = cmd
-                .get(3)
-                .and_then(|b| std::str::from_utf8(b).ok())
-                .map(|s| s.to_ascii_uppercase());
-
-            let db = &ctx.store[*ctx.selected_db];
-            let shard = store::get_shard(db, key);
-            if !read_lock!(shard).contains_key(key) {
-                return Some(resp_integer(0));
-            }
-
             let new_exp = expiry_unix_secs(unix_secs_u64);
             let now = crate::script_clock::wall_system_time_now();
-            if new_exp <= now {
-                let removed = delete_key(ctx.store, *ctx.selected_db, key);
-                if removed {
-                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
-                    crate::vector::maybe_request_compaction(
-                        ctx.index_store,
-                        ctx.compaction_tx,
-                        key,
-                    );
-                }
-                return Some(resp_integer(if removed { 1 } else { 0 }));
-            }
-
-            if let Some(ref f) = flag {
-                let current = get_expiry(ctx.store, *ctx.selected_db, key);
-                let should_set = match f.as_str() {
-                    "NX" => current.is_none(),
-                    "XX" => current.is_some(),
-                    // No time to live is an infinite one: nothing is
-                    // greater, and anything is less.
-                    "GT" => current.is_some_and(|c| new_exp > c),
-                    "LT" => current.is_none_or(|c| new_exp < c),
-                    _ => return Some(resp_error("ERR Unsupported option")),
-                };
-                if !should_set {
-                    return Some(resp_integer(0));
-                }
-            }
-
-            set_expiry(ctx.store, *ctx.selected_db, key, new_exp);
-            notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "expire", key);
-            Some(resp_integer(1))
+            Some(apply_expire(ctx, key, new_exp, new_exp <= now, &flags))
         }
 
         // ── PEXPIREAT ─────────────────────────────────────────────────────────────────
@@ -604,6 +570,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(k) => k,
                 None => return Some(resp_error("ERR must be valid UTF-8")),
             };
+            // As `EXPIREAT`.
+            let flags = match parse_expire_modifier_flags(cmd.as_slice(), 3) {
+                Ok(f) => f,
+                Err(msg) => return Some(resp_error(&msg)),
+            };
             let unix_ms = match parse_bytes_as_i128(cmd[2]) {
                 Some(n) => n,
                 None => return Some(resp_error(ERR_VALUE_NOT_INTEGER)),
@@ -612,50 +583,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(t) => t,
                 None => return Some(resp_error(ERR_INVALID_EXPIRE_PEXPIREAT_CMD)),
             };
-            let flag = cmd
-                .get(3)
-                .and_then(|b| std::str::from_utf8(b).ok())
-                .map(|s| s.to_ascii_uppercase());
-
-            let db = &ctx.store[*ctx.selected_db];
-            let shard = store::get_shard(db, key);
-            if !read_lock!(shard).contains_key(key) {
-                return Some(resp_integer(0));
-            }
-
             let now = crate::script_clock::wall_system_time_now();
-            if new_exp <= now {
-                let removed = delete_key(ctx.store, *ctx.selected_db, key);
-                if removed {
-                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
-                    crate::vector::maybe_request_compaction(
-                        ctx.index_store,
-                        ctx.compaction_tx,
-                        key,
-                    );
-                }
-                return Some(resp_integer(if removed { 1 } else { 0 }));
-            }
-
-            if let Some(ref f) = flag {
-                let current = get_expiry(ctx.store, *ctx.selected_db, key);
-                let should_set = match f.as_str() {
-                    "NX" => current.is_none(),
-                    "XX" => current.is_some(),
-                    // No time to live is an infinite one: nothing is
-                    // greater, and anything is less.
-                    "GT" => current.is_some_and(|c| new_exp > c),
-                    "LT" => current.is_none_or(|c| new_exp < c),
-                    _ => return Some(resp_error("ERR Unsupported option")),
-                };
-                if !should_set {
-                    return Some(resp_integer(0));
-                }
-            }
-
-            set_expiry(ctx.store, *ctx.selected_db, key, new_exp);
-            notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "expire", key);
-            Some(resp_integer(1))
+            Some(apply_expire(ctx, key, new_exp, new_exp <= now, &flags))
         }
 
         // ── PTTL ──────────────────────────────────────────────────────────────────────
