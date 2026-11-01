@@ -1392,3 +1392,125 @@ fn test_vsim_filter_reduce_and_quantization() {
         .expect("quant-type");
     assert_eq!(info[at + 1].as_str(), "f32");
 }
+
+/// #235: `VADD` took a `DISTANCE` it did not know as COSINE and skipped any
+/// option it did not know. The errors are those Redis 8.10.2 gives for the
+/// same commands (it has no `DISTANCE`: that one is KiviDB's own).
+#[test]
+fn vadd_refuses_what_it_does_not_know() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let err = |c: &mut Conn, args: &[&str]| match c.cmds(args) {
+        RespValue::Error(e) => e,
+        other => panic!("{args:?}: {other:?}"),
+    };
+    let v = ["VALUES", "2", "1", "2", "e"];
+    let vadd = |key: &'static str, tail: &[&'static str]| {
+        let mut args = vec!["VADD", key];
+        args.extend_from_slice(&v);
+        args.extend_from_slice(tail);
+        args
+    };
+
+    for (tail, want) in [
+        (
+            &["DISTANCE", "FOO"][..],
+            "ERR invalid DISTANCE: use COSINE, L2 or IP",
+        ),
+        (&["DISTANCE"][..], "ERR invalid option after element"),
+        (&["METRIC", "IP"][..], "ERR invalid option after element"),
+        (&["FOO"][..], "ERR invalid option after element"),
+        (&["CAS", "FOO"][..], "ERR invalid option after element"),
+        (&["M"][..], "ERR invalid option after element"),
+        (&["EF"][..], "ERR invalid option after element"),
+        (&["SETATTR"][..], "ERR invalid option after element"),
+        (&["M", "3"][..], "ERR invalid M"),
+        (&["M", "4097"][..], "ERR invalid M"),
+        (&["M", "+8"][..], "ERR invalid M"),
+        (&["M", "abc"][..], "ERR invalid M"),
+        (&["EF", "0"][..], "ERR invalid EF"),
+        (&["EF", "1000001"][..], "ERR invalid EF"),
+        (&["EF", "010"][..], "ERR invalid EF"),
+    ] {
+        assert_eq!(err(&mut c, &vadd("bad", tail)), want, "{tail:?}");
+    }
+    for args in [
+        &[
+            "VADD", "bad", "DISTANCE", "FOO", "VALUES", "2", "1", "2", "e",
+        ][..],
+        &[
+            "VADD", "bad", "DISTANCE", "IP", "FOO", "VALUES", "2", "1", "2", "e",
+        ][..],
+    ] {
+        assert!(err(&mut c, args).starts_with("ERR invalid "), "{args:?}");
+    }
+    for args in [
+        &["VADD", "bad", "FOO", "VALUES", "2", "1", "2", "e"][..],
+        &["VADD", "bad", "VALUES", "0", "e"][..],
+        &["VADD", "bad", "VALUES", "abc", "1", "2", "e"][..],
+        &["VADD", "bad", "VALUES", "2", "1", "x", "e"][..],
+        &["VADD", "bad", "VALUES", "2", "nan", "2", "e"][..],
+        &["VADD", "bad", "FP32", "abc", "e"][..],
+    ] {
+        assert_eq!(
+            err(&mut c, args),
+            "ERR invalid vector specification",
+            "{args:?}"
+        );
+    }
+    // Nothing of the above made the key.
+    assert_eq!(c.cmds(&["EXISTS", "bad"]).as_int(), 0);
+    // An option is checked before the key's type, as in Redis.
+    c.cmds(&["SET", "s", "x"]);
+    assert_eq!(
+        err(&mut c, &vadd("s", &["FOO"])),
+        "ERR invalid option after element"
+    );
+
+    // What is valid still is, in any case, last of each winning.
+    assert_eq!(c.cmds(&vadd("ok1", &["M", "4", "EF", "1"])).as_int(), 1);
+    assert_eq!(
+        c.cmds(&vadd("ok2", &["m", "4096", "ef", "1000000", "cas", "q8"]))
+            .as_int(),
+        1
+    );
+    assert_eq!(
+        c.cmds(&vadd(
+            "ok3",
+            &["SETATTR", "{\"a\":1}", "SETATTR", "{\"b\":1}"]
+        ))
+        .as_int(),
+        1
+    );
+    assert_eq!(c.cmds(&["VGETATTR", "ok3", "e"]).as_str(), "{\"b\":1}");
+
+    // `DISTANCE`, before the vector or after the element; once a set has
+    // one, another is refused and none means the set's.
+    assert_eq!(c.cmds(&vadd("l2", &["DISTANCE", "l2"])).as_int(), 1);
+    assert_eq!(
+        c.cmds(&["VADD", "l2", "DISTANCE", "L2", "VALUES", "2", "3", "4", "f"])
+            .as_int(),
+        1
+    );
+    assert_eq!(
+        c.cmds(&["VADD", "l2", "VALUES", "2", "5", "6", "g"])
+            .as_int(),
+        1
+    );
+    assert_eq!(
+        err(&mut c, &vadd("l2", &["DISTANCE", "IP"])),
+        "ERR asked distance mismatch with existing vector set"
+    );
+    assert_eq!(
+        err(&mut c, &vadd("l2", &["DISTANCE", "COSINE"])),
+        "ERR asked distance mismatch with existing vector set"
+    );
+    assert_eq!(
+        err(&mut c, &["VADD", "l2", "VALUES", "3", "1", "2", "3", "h"]),
+        "ERR Vector dimension mismatch - got 3 but set has 2"
+    );
+    assert_eq!(c.cmds(&["VCARD", "l2"]).as_int(), 3);
+    assert_eq!(c.cmds(&vadd("ip", &["DISTANCE", "IP"])).as_int(), 1);
+    assert_eq!(c.cmds(&vadd("cos", &["DISTANCE", "COSINE"])).as_int(), 1);
+}

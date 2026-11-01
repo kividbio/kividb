@@ -131,6 +131,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the length decides which words of a document are indexed with a stem,
   not what a query looks for, in Redis as here.
 
+- **`VADD` refuses what it does not know (#235).** A `DISTANCE` it did not
+  know was taken as COSINE, and an option it did not know, or one missing
+  its value, was skipped. Now, as Redis 8.10 answers: `ERR invalid option
+  after element`; `ERR invalid M` for an `M` outside 4 to 4096 and `ERR
+  invalid EF` for an `EF` outside 1 to 1,000,000 (they were not checked);
+  and `ERR invalid vector specification` for a vector given wrong, which
+  includes `VALUES 0` and a NaN, both of which used to make a set; a
+  vector of another dimension than the set's is refused in Redis's words
+  (`ERR Vector dimension mismatch - got 3 but set has 2`).
+  `DISTANCE COSINE | L2 | IP`, before the vector or after the element, is
+  KiviDB's own: Redis 8.10's vector sets are cosine only and refuse the
+  word. An unknown value is `ERR invalid DISTANCE: use COSINE, L2 or IP`,
+  and one other than an existing set's is `ERR asked distance mismatch
+  with existing vector set`, as Redis refuses a quantization the set was
+  not made with (it was ignored; leaving `DISTANCE` out still means the
+  set's own).
+
 ## [1.2.0]
 
 See [docs/releases/v1.2.0.md](docs/releases/v1.2.0.md) for what to check before upgrading.
@@ -806,7 +823,8 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   angles scored 0 here and 0.5 in Redis, and opposite ones -1 and 0. The
   order of the results was always the same. A threshold an application
   sets on the score (`score > 0.8`) now means what it means on Redis.
-  Sets made with KiviDB's own `METRIC IP` or `METRIC L2` keep their scores.
+  Sets made with KiviDB's own `DISTANCE IP` or `DISTANCE L2` keep their
+  scores.
 
 - **Three small ones (#173):**
   - `DEBUG POPULATE` replied `OK` and made nothing. It makes its keys now,

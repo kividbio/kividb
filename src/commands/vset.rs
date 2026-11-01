@@ -41,13 +41,17 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /// Get or create a VectorSet at `key` with a given dimension.
-/// Returns Err(resp bytes) on type mismatch or dim mismatch.
+/// Returns Err(resp bytes) on type mismatch or dim mismatch, or when
+/// `asked` names a `DISTANCE` other than the existing set's.
 fn get_or_create_vset(
     ctx: &mut Ctx,
     key: &str,
     dim: usize,
-    metric: crate::vector::DistanceMetric,
+    asked: Option<crate::vector::DistanceMetric>,
 ) -> Result<Arc<RwLock<VectorSetInner>>, Vec<u8>> {
+    let metric = asked
+        .clone()
+        .unwrap_or(crate::vector::DistanceMetric::Cosine);
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
     let mut map = write_lock!(shard);
@@ -56,12 +60,20 @@ fn get_or_create_vset(
         Some(ValueRef::VectorSet(vs)) => {
             let inner = vs.read();
             if inner.dim != dim {
+                // Redis's words.
                 return Err(resp_error(&format!(
-                    "ERR vector dimension mismatch: index has dim {}, got {}",
-                    inner.dim, dim
+                    "ERR Vector dimension mismatch - got {} but set has {}",
+                    dim, inner.dim
                 )));
             }
-            // Metric mismatch on existing key: Redis ignores it silently, so do we
+            // A `DISTANCE` the set was not made with is refused, as Redis
+            // refuses a quantization the set was not made with. One not
+            // given takes the set's.
+            if asked.as_ref().is_some_and(|m| *m != inner.metric) {
+                return Err(resp_error(
+                    "ERR asked distance mismatch with existing vector set",
+                ));
+            }
             Ok(Arc::clone(vs))
         }
         Some(_) => Err(resp_error(
@@ -73,6 +85,17 @@ fn get_or_create_vset(
             Ok(vs)
         }
     }
+}
+
+/// An integer written as Redis reads one: digits with an optional `-`, no
+/// `+`, no leading zero (`010` and `+8` are not numbers to Redis).
+fn strict_integer(arg: &[u8]) -> Option<i64> {
+    let digits = arg.strip_prefix(b"-").unwrap_or(arg);
+    let leading_zero = digits.len() > 1 && digits[0] == b'0';
+    if digits.is_empty() || leading_zero || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(arg).ok()?.parse().ok()
 }
 
 /// Parse a VALUES num v1 v2 ... segment into Vec<f32>.
@@ -103,7 +126,10 @@ fn parse_values_vector(args: &[&[u8]], start: usize) -> Result<(Vec<f32>, usize)
 // ── VADD ──────────────────────────────────────────────────────────────────────
 //
 // VADD key [REDUCE dim] (FP32 | VALUES num) vector element
-//      [NOQUANT | Q8 | BIN] [EF n] [SETATTR attrs] [M n]
+//      [CAS] [NOQUANT | Q8 | BIN] [EF n] [SETATTR attrs] [M n]
+//
+// and KiviDB's own `DISTANCE COSINE | L2 | IP` (before the vector, or among
+// the options), which Redis 8.10 does not have: its sets are cosine only.
 //
 // Redis uses HNSW internally for VectorSets. We store vectors in
 // VectorSetInner.entries and do brute-force VSIM (same trade-off as FLAT).
@@ -145,7 +171,15 @@ fn vadd(ctx: &mut Ctx) -> Option<Vec<u8>> {
         ));
     }
 
-    let mut parsed_metric = crate::vector::DistanceMetric::Cosine;
+    // `DISTANCE` is KiviDB's own (Redis's vector sets are cosine only): it
+    // may come before the vector or among the options after the element. A
+    // value that names no metric is refused; it was taken as COSINE.
+    let mut parsed_metric: Option<crate::vector::DistanceMetric> = None;
+    let metric_of = |arg: Option<&&[u8]>| {
+        arg.and_then(|b| std::str::from_utf8(b).ok())
+            .and_then(crate::vector::DistanceMetric::metric_from_str)
+            .ok_or_else(|| resp_error("ERR invalid DISTANCE: use COSINE, L2 or IP"))
+    };
 
     if cmd
         .get(i)
@@ -153,18 +187,20 @@ fn vadd(ctx: &mut Ctx) -> Option<Vec<u8>> {
         .map(|s| s.eq_ignore_ascii_case("DISTANCE"))
         .unwrap_or(false)
     {
-        i += 1; // skip "DISTANCE"
-        if let Some(metric_str) = cmd.get(i).and_then(|b| std::str::from_utf8(b).ok()) {
-            parsed_metric = crate::vector::DistanceMetric::metric_from_str(metric_str)
-                .unwrap_or(crate::vector::DistanceMetric::Cosine);
-            i += 1; // skip the metric value
+        match metric_of(cmd.get(i + 1)) {
+            Ok(metric) => parsed_metric = Some(metric),
+            Err(e) => return Some(e),
         }
+        i += 2;
     }
+
+    // What Redis answers for anything wrong in how the vector is given.
+    let bad_vector = || Some(resp_error("ERR invalid vector specification"));
 
     // Next token must be FP32 or VALUES
     let encoding = match cmd.get(i).and_then(|b| std::str::from_utf8(b).ok()) {
         Some(s) => s.to_ascii_uppercase(),
-        None => return Some(resp_error("ERR expected FP32 or VALUES")),
+        None => return bad_vector(),
     };
     i += 1;
 
@@ -173,13 +209,12 @@ fn vadd(ctx: &mut Ctx) -> Option<Vec<u8>> {
             // Next arg is the raw binary blob
             let blob = match cmd.get(i) {
                 Some(b) => b,
-                None => return Some(resp_error("ERR missing FP32 blob")),
+                None => return bad_vector(),
             };
             // We don't know dim yet — infer from blob length
-            if blob.len() % 4 != 0 {
-                return Some(resp_error("ERR FP32 blob length must be a multiple of 4"));
+            if blob.is_empty() || blob.len() % 4 != 0 {
+                return bad_vector();
             }
-            let _dim = blob.len() / 4;
             let v: Vec<f32> = blob
                 .as_chunks::<4>()
                 .0
@@ -189,59 +224,67 @@ fn vadd(ctx: &mut Ctx) -> Option<Vec<u8>> {
             (v, i + 1)
         }
         "VALUES" => match parse_values_vector(cmd, i) {
-            Ok((v, n)) => (v, n),
-            Err(e) => return Some(e),
+            Ok((v, n)) if !v.is_empty() => (v, n),
+            _ => return bad_vector(),
         },
-        _ => return Some(resp_error("ERR expected FP32 or VALUES after key")),
+        _ => return bad_vector(),
     };
     i = next_i;
+    if vec.iter().any(|x| x.is_nan()) {
+        return bad_vector();
+    }
 
     let dim = vec.len();
 
     // Next: element name
     let element = match cmd.get(i).and_then(|b| std::str::from_utf8(b).ok()) {
         Some(s) => s.to_string(),
-        None => return Some(resp_error("ERR missing element name")),
+        None => {
+            return Some(resp_error(
+                "ERR wrong number of arguments for 'vadd' command",
+            ));
+        }
     };
     i += 1;
 
+    // The options after the element, checked as Redis checks them: an
+    // option it does not know, or one missing its value, is an error, and
+    // so is an `M` or `EF` out of Redis's range. They were skipped.
+    let invalid_option = || Some(resp_error("ERR invalid option after element"));
     while i < cmd.len() {
-        let tok = match std::str::from_utf8(cmd[i]) {
-            Ok(s) => s.to_ascii_uppercase(),
-            Err(_) => {
-                i += 1;
-                continue;
-            }
-        };
+        let tok = String::from_utf8_lossy(cmd[i]).to_ascii_uppercase();
+        let value = cmd.get(i + 1);
         match tok.as_str() {
             // Kept at full precision whichever is asked for: `VINFO` says
             // so (`f32`).
             "NOQUANT" | "Q8" | "BIN" | "CAS" => {
                 i += 1;
+                continue;
             }
+            _ if value.is_none() => return invalid_option(),
             "EF" | "M" => {
-                i += 2;
-            } // skip value
+                let (lo, hi) = if tok == "EF" {
+                    (1, 1_000_000)
+                } else {
+                    (4, 4096)
+                };
+                if !value
+                    .and_then(|v| strict_integer(v))
+                    .is_some_and(|n| (lo..=hi).contains(&n))
+                {
+                    return Some(resp_error(&format!("ERR invalid {tok}")));
+                }
+            }
             "SETATTR" => {
-                i += 1;
-                if let Some(a) = cmd.get(i).and_then(|b| std::str::from_utf8(b).ok()) {
-                    attrs = Some(a.to_string());
-                }
-                i += 1;
+                attrs = value.map(|a| String::from_utf8_lossy(a).into_owned());
             }
-            "DISTANCE" => {
-                i += 1;
-                if let Some(metric_str) = cmd.get(i).and_then(|b| std::str::from_utf8(b).ok()) {
-                    // Store metric_str for later — we'll use it when creating the vset
-                    parsed_metric = crate::vector::DistanceMetric::metric_from_str(metric_str)
-                        .unwrap_or(crate::vector::DistanceMetric::Cosine);
-                }
-                i += 1;
-            }
-            _ => {
-                i += 1;
-            }
+            "DISTANCE" => match metric_of(value) {
+                Ok(metric) => parsed_metric = Some(metric),
+                Err(e) => return Some(e),
+            },
+            _ => return invalid_option(),
         }
+        i += 2;
     }
 
     // Get or create the VectorSet
