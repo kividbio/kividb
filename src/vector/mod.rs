@@ -2267,7 +2267,7 @@ fn unindex_from(def: &IndexDef, key: &str) {
 
 static INDEX_STORES: RwLock<Vec<(usize, IndexStore)>> = RwLock::new(Vec::new());
 
-fn store_id(store: &crate::store::Store) -> usize {
+pub(crate) fn store_id(store: &crate::store::Store) -> usize {
     Arc::as_ptr(store) as *const () as usize
 }
 
@@ -2279,12 +2279,8 @@ pub fn register_index_store(store: &crate::store::Store, index_store: &IndexStor
     stores.push((id, Arc::clone(index_store)));
 }
 
-/// `key` of database `db` expired and was deleted by a read.
-pub fn unindex_expired(store: &crate::store::Store, db: usize, key: &str) {
-    unindex_expired_in(store_id(store), db, key);
-}
-
-/// [`unindex_expired`], for the store at address `id`.
+/// `key` of database `db` of the store at address `id` ([`store_id`])
+/// expired and was deleted: out of its indexes too.
 pub fn unindex_expired_in(id: usize, db: usize, key: &str) {
     let index_store = INDEX_STORES
         .read()
@@ -2293,6 +2289,97 @@ pub fn unindex_expired_in(id: usize, db: usize, key: &str) {
         .map(|(_, index_store)| Arc::clone(index_store));
     if let Some(index_store) = index_store {
         maybe_unindex(&index_store, db, key);
+    }
+}
+
+// ── Keys on their way out of the indexes ─────────────────────────────────────
+//
+// An expiry takes a key out of the store under its shard's lock, and out of
+// its indexes once that lock is let go of: taken out under it, a vector would
+// wait there for a KNN query's hold of the graph, and every write to the
+// shard behind it. In between, the key is gone from the store and its
+// document still in the postings. A count read off the postings (FT.SEARCH
+// ... LIMIT 0 0) leaves out the keys past their time that nothing has deleted
+// yet, found in the shards' lists of keys with a time to live; a key the
+// expiry had taken was in no list, and counted (#249). So the expiry marks
+// the key leaving before it lets go of the shard, and unmarks it once the
+// key has left its indexes (its postings' removal applied, or queued for
+// whoever takes their lock next); the count leaves out the keys marked too.
+//
+// Only where the key's database has an index: elsewhere nothing is marked.
+// The marks' lock is taken last, with nothing waited for under it.
+
+/// Keys marked leaving: the store's address ([`store_id`]), the database,
+/// the key.
+static LEAVING: parking_lot::Mutex<Vec<(usize, usize, Box<str>)>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// Whether `index_store` has an index of database `db`: whether a key of it
+/// that expires is marked leaving ([`mark_leaving`]).
+pub fn has_index_of(index_store: &IndexStore, db: usize) -> bool {
+    index_store.read().values().any(|def| def.db_index == db)
+}
+
+/// The index store of the store at address `id` ([`store_id`]), if it has an
+/// index of database `db`.
+pub fn indexes_of(id: usize, db: usize) -> Option<IndexStore> {
+    let index_store = INDEX_STORES
+        .read()
+        .iter()
+        .find(|(other, _)| *other == id)
+        .map(|(_, index_store)| Arc::clone(index_store))?;
+    has_index_of(&index_store, db).then_some(index_store)
+}
+
+/// `key` of database `db` of the store at address `id` is gone from the
+/// store and not yet from its indexes: under the shard's lock that took it.
+pub fn mark_leaving(id: usize, db: usize, key: &str) {
+    LEAVING.lock().push((id, db, key.into()));
+}
+
+/// `key` has left its indexes: what [`mark_leaving`] marked, unmarked.
+pub fn unmark_leaving(id: usize, db: usize, key: &str) {
+    let mut leaving = LEAVING.lock();
+    if let Some(at) = leaving
+        .iter()
+        .position(|(i, d, k)| *i == id && *d == db && **k == *key)
+    {
+        leaving.swap_remove(at);
+    }
+}
+
+/// The keys of database `db` of the store at address `id` marked leaving.
+pub fn leaving(id: usize, db: usize) -> Vec<Box<str>> {
+    LEAVING
+        .lock()
+        .iter()
+        .filter(|(i, d, _)| *i == id && *d == db)
+        .map(|(_, _, key)| key.clone())
+        .collect()
+}
+
+#[cfg(test)]
+mod leaving_tests {
+    use super::*;
+
+    #[test]
+    fn a_key_is_leaving_from_its_mark_to_its_unmark() {
+        // An address no store has.
+        let id = usize::MAX - 249;
+        assert!(leaving(id, 0).is_empty());
+        mark_leaving(id, 0, "a");
+        mark_leaving(id, 0, "b");
+        mark_leaving(id, 1, "a");
+        let mut keys = leaving(id, 0);
+        keys.sort();
+        assert_eq!(keys, vec![Box::from("a"), Box::from("b")]);
+        unmark_leaving(id, 0, "a");
+        assert_eq!(leaving(id, 0), vec![Box::from("b")]);
+        assert_eq!(leaving(id, 1), vec![Box::from("a")]);
+        unmark_leaving(id, 0, "b");
+        unmark_leaving(id, 1, "a");
+        assert!(leaving(id, 0).is_empty());
+        assert!(leaving(id, 1).is_empty());
     }
 }
 
