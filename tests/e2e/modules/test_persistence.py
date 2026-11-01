@@ -44,10 +44,8 @@ _IS_REDIS = any(name in os.path.basename(KIVI_BINARY)
                 for name in ("redis-stack-server", "redis-server"))
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
+# Outside the ephemeral range, and never the same port twice (#262).
+from utils.helpers import free_port as _free_port  # noqa: E402
 
 
 def _wait_port(port: int, timeout: float = 30.0) -> bool:
