@@ -2359,9 +2359,20 @@ fn a_write_while_migrate_is_on_the_wire_is_not_lost() {
     }
     let (src_id, dst_id) = (src.id(), dst.id());
 
-    let tag = key_in(ranges[0].0..=ranges[0].1, "race");
-    let slot = slot_of(&tag).to_string();
-    let k = |name: &str| format!("{{{tag}}}:{name}");
+    // Keys of one slot without a hash tag: a build with Lua locks a tagged
+    // key's tag for the whole of a command that names it
+    // (`lua-parallel-scripts`), MIGRATE's round trip included, and the
+    // writes below would wait for it.
+    let names = ["a", "counter", "c", "ttl"];
+    let first = key_in(ranges[0].0..=ranges[0].1, "race");
+    let slot_number = slot_of(&first);
+    let keys: Vec<String> = (0..)
+        .map(|i| format!("race:{i}"))
+        .filter(|key| slot_of(key) == slot_number)
+        .take(names.len())
+        .collect();
+    let slot = slot_number.to_string();
+    let k = |name: &str| keys[names.iter().position(|n| *n == name).unwrap()].clone();
     let mut s = src.conn();
     for name in ["a", "counter", "c", "ttl"] {
         assert!(s.cmd(&["SET", &k(name), "1"]).is_ok());
