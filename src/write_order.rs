@@ -111,6 +111,34 @@ pub fn lock_keys<'a>(db: usize, keys: impl Iterator<Item = &'a [u8]>) -> OrderGu
     }
 }
 
+/// [`lock_keys`] for keys of several databases, each `(db, key)`: for a
+/// write that puts a key in another database than the one it names it in
+/// (`MOVE`, `COPY ... DB`). Its record is then ordered against the writes to
+/// the key in either database, the expiry of the key where it went among
+/// them: one that took the key there before the `MOVE` was queued sent its
+/// `DEL` ahead of the `MOVE`, and the replica, and a replay of the AOF, kept
+/// the key there for good.
+pub fn lock_keys_in<'a>(keys: impl Iterator<Item = (usize, &'a [u8])>) -> OrderGuard {
+    if HELD.with(|h| h.get()) {
+        return OrderGuard {
+            _one: None,
+            _stripes: Vec::new(),
+            outermost: false,
+            _not_send: PhantomData,
+        };
+    }
+    HELD.with(|h| h.set(true));
+    let mut stripes: Vec<usize> = keys.map(|(db, key)| stripe_of(db, key)).collect();
+    stripes.sort_unstable();
+    stripes.dedup();
+    OrderGuard {
+        _one: None,
+        _stripes: stripes.into_iter().map(|i| STRIPE[i].lock()).collect(),
+        outermost: true,
+        _not_send: PhantomData,
+    }
+}
+
 /// Mark this thread as ordered without taking any stripe — for a write that
 /// holds the write gate exclusively, and so has no other write to be ordered
 /// against. Writes nested inside it then take nothing either.
@@ -142,6 +170,23 @@ mod tests {
         });
         std::thread::sleep(Duration::from_millis(100));
         assert!(!entered.load(Ordering::SeqCst), "the second write got in");
+        drop(guard);
+        other.join().unwrap();
+        assert!(entered.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_write_to_a_key_in_two_databases_orders_both() {
+        let guard = lock_keys_in([(0, b"m".as_slice()), (3, b"m".as_slice())].into_iter());
+        let entered = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&entered);
+        // An expiry of the key in database 3.
+        let other = std::thread::spawn(move || {
+            let _guard = lock_keys(3, [b"m".as_slice()].into_iter());
+            flag.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!entered.load(Ordering::SeqCst), "the expiry got in");
         drop(guard);
         other.join().unwrap();
         assert!(entered.load(Ordering::SeqCst));
