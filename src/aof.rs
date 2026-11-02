@@ -3126,6 +3126,89 @@ mod past_deadline_replay_tests {
         assert_eq!(list_len(&store, "l"), 2);
     }
 
+    /// The field of a hash, its value and whether it has a deadline, past
+    /// its time or not.
+    fn field(store: &Store, key: &str, field: &str) -> (Option<Vec<u8>>, Option<bool>) {
+        let shard = crate::store::get_shard(&store[0], key);
+        let map = shard.read();
+        match map.peek_expiring(key) {
+            Some((ValueRef::HashEx(h), _)) => {
+                let h = h.read();
+                (
+                    h.fields.get(field).map(|v| v.to_vec()),
+                    h.expiries.get(field).map(|_| h.is_field_expired(field)),
+                )
+            }
+            Some((ValueRef::Hash(h), _)) => (h.read().get(field).map(|v| v.to_vec()), None),
+            _ => (None, None),
+        }
+    }
+
+    /// `HPEXPIREAT h t FIELDS 1 g` and an `HINCRBY h g 1` made while `g`
+    /// lived, `t` gone: the replay deleted `g` at the `HPEXPIREAT`, and the
+    /// `HINCRBY` made it again, `1` with no deadline, for good. So with
+    /// `HSETEX ... PXAT t` and `HGETEX ... PXAT t`. Now `g` keeps its deadline
+    /// and the increment, and is past its time once the replay is over. An
+    /// `HSET` after it takes the deadline away, as it did on the master.
+    #[test]
+    fn a_field_deadline_that_has_passed_is_set_and_the_writes_after_it_go_into_the_field() {
+        let past = (now_ms() - 5_000).to_string();
+        let store = replayed(&[
+            vec!["HSET", "h", "keep", "1", "g", "5", "f", "v0"],
+            vec!["HPEXPIREAT", "h", &past, "FIELDS", "2", "g", "f"],
+            vec!["HINCRBY", "h", "g", "1"],
+            vec!["HSET", "h", "f", "v1"],
+            vec!["HSETEX", "x", "PXAT", &past, "FIELDS", "1", "n", "1.5"],
+            vec!["HINCRBYFLOAT", "x", "n", "1"],
+            vec!["HSET", "y", "keep", "1", "m", "7"],
+            vec!["HGETEX", "y", "PXAT", &past, "FIELDS", "1", "m"],
+            vec!["HINCRBY", "y", "m", "1"],
+        ]);
+        assert_eq!(field(&store, "h", "g"), (Some(b"6".to_vec()), Some(true)));
+        assert_eq!(field(&store, "h", "f").0, Some(b"v1".to_vec()));
+        assert_eq!(
+            field(&store, "h", "f").1,
+            None,
+            "HSET took f's deadline away"
+        );
+        assert_eq!(field(&store, "h", "keep"), (Some(b"1".to_vec()), None));
+        assert_eq!(field(&store, "x", "n"), (Some(b"2.5".to_vec()), Some(true)));
+        assert_eq!(field(&store, "y", "m"), (Some(b"8".to_vec()), Some(true)));
+        // Outside the replay the field is past its time, and a sweep of the
+        // hash takes it.
+        for (key, gone) in [("h", "g"), ("x", "n"), ("y", "m")] {
+            let shard = crate::store::get_shard(&store[0], key);
+            let map = shard.read();
+            if let Some((ValueRef::HashEx(h), _)) = map.peek_expiring(key) {
+                let mut h = h.write();
+                assert_eq!(h.sweep_expired(), 1, "{key}");
+                assert!(!h.fields.contains_key(gone), "{key}");
+            } else {
+                panic!("{key} is not a hash with field deadlines");
+            }
+        }
+    }
+
+    /// Outside a replay a field deadline that has passed still deletes the
+    /// field on the spot.
+    #[test]
+    fn outside_a_replay_a_field_deadline_that_has_passed_deletes_the_field() {
+        let mut inner = crate::types::HashInner::new();
+        inner
+            .fields
+            .insert("g".to_string(), std::sync::Arc::from(&b"5"[..]));
+        inner
+            .expiries
+            .insert("g".to_string(), std::time::Instant::now());
+        {
+            let _replay = crate::expiry::replay();
+            assert!(!inner.is_field_expired("g"));
+            assert_eq!(inner.sweep_expired(), 0);
+        }
+        assert!(inner.is_field_expired("g"));
+        assert_eq!(inner.sweep_expired(), 1);
+    }
+
     /// A `DEL` in the log still deletes: what the master expired is said
     /// by it, and a write after it makes a new key, as on the master.
     #[test]

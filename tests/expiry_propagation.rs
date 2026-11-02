@@ -724,6 +724,48 @@ fn a_write_after_a_deadline_leaves_an_empty_database_after_a_restart() {
     }
 }
 
+/// The same of a hash field: `HPEXPIRE h 1200 FIELDS 1 g`, an `HINCRBY h g
+/// 1` while `g` lived, killed and restarted after the deadline. The replay
+/// deleted `g` at its `HPEXPIREAT` and the `HINCRBY` made it again, `1`
+/// with no deadline, for good. An `HSET` of a field after its deadline
+/// takes the deadline away (on the master too): that field stays.
+#[test]
+fn a_write_after_a_field_deadline_does_not_bring_the_field_back_after_a_restart() {
+    let mut server = Server::start(&["--aof"]);
+    let mut c = server.conn();
+    assert_eq!(
+        c.cmd(&["HSET", "h", "keep", "1", "g", "5", "f", "v0"]).i(),
+        3
+    );
+    assert_eq!(
+        c.cmd(&["HPEXPIRE", "h", "1200", "FIELDS", "2", "g", "f"]),
+        V::Arr(vec![V::Int(1), V::Int(1)])
+    );
+    assert_eq!(c.cmd(&["HINCRBY", "h", "g", "1"]).i(), 6);
+    assert_eq!(c.cmd(&["HSET", "h", "f", "v1"]).i(), 0);
+    assert_eq!(c.cmd(&["HSET", "live", "g", "5"]).i(), 1);
+    assert_eq!(
+        c.cmd(&["HPEXPIRE", "live", "3600000", "FIELDS", "1", "g"]),
+        V::Arr(vec![V::Int(1)])
+    );
+    assert_eq!(c.cmd(&["HINCRBY", "live", "g", "1"]).i(), 6);
+    wait_until("the writes to reach the AOF", 10, || {
+        count(&server.aof(), b"HINCRBY") >= 2
+    });
+    server.kill();
+    std::thread::sleep(Duration::from_millis(1500));
+    server.restart();
+    let mut c = server.conn();
+    assert_eq!(c.cmd(&["HGET", "h", "g"]), V::Nil, "g came back");
+    assert_eq!(c.cmd(&["HGET", "h", "f"]).s(), "v1");
+    assert_eq!(c.cmd(&["HGET", "h", "keep"]).s(), "1");
+    wait_until("the field past its time to go", 20, || {
+        c.cmd(&["HLEN", "h"]).i() == 2
+    });
+    assert_eq!(c.cmd(&["HGET", "live", "g"]).s(), "6");
+    assert!(c.cmd(&["HPTTL", "live", "FIELDS", "1", "g"]).arr()[0].i() > 0);
+}
+
 /// Active expiry in the middle of a script: the script is one step, and a
 /// key it set comes due, by the clock, while it runs. The sweep used to take
 /// the key out under the script, whose `INCR` then made it again, `1` with
