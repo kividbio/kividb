@@ -480,6 +480,11 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **`INFO stats` counts rejected connections** (#254, by
+  [@de-ep](https://github.com/de-ep)). `rejected_connections` stayed at 0:
+  a connection turned away at `maxclients` was refused and logged, but not
+  counted.
+
 - **KiviDB builds on FreeBSD again** (#288, reported by
   [@osokin](https://github.com/osokin), who maintains the FreeBSD port).
   Raising the open-file limit used `div_ceil` on `rlim_t`, which is
