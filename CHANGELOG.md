@@ -206,6 +206,20 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Changed
 
+- **`SORT` and `SORT_RO`: a `BY` pattern with a `*` and a `GET` pattern
+  other than `#` need read access to every key,** as in Redis. They read
+  keys named by the sorted elements; a user whose ACL names some keys gets
+  `ERR BY option of SORT denied due to insufficient ACL permissions.` (or
+  `GET option ...`). `GET #` and a `BY` with no `*` read no other key and
+  are allowed. `SORT ... STORE` needs only read access to the key it sorts
+  and write access to the destination, so a `%R~*` user can sort.
+- **`SLOWLOG` and `MONITOR` show credentials as `(redacted)`,** as in
+  Redis: the rules of `ACL SETUSER`, what follows `AUTH`/`AUTH2` in
+  `MIGRATE`, and the value of `requirepass`, `masterauth`, `primaryauth`,
+  `cluster-bus-secret`, `tls-key-file-pass` and `tls-client-key-file-pass`
+  in `CONFIG SET`. The server log's line for `CONFIG SET` hides the same
+  settings.
+
 - **HNSW vector search is about 1.3 times as fast, and vector ingest about
   twice as fast.** A search of a 1536-dimension graph spent most of its
   time waiting for vectors to come from memory: each node's vector was an
@@ -465,6 +479,12 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   does.
 
 ### Fixed
+
+- **The ACL checks the keys `SORT`, `GEORADIUS` and `XREADGROUP` use.**
+  `SORT` writes to the destination of its last `STORE`, and `GEORADIUS` and
+  `GEORADIUSBYMEMBER` to that of their last `STORE` or `STOREDIST`; the
+  first was the one checked. An `XREADGROUP` whose group or consumer was
+  named `STREAMS` had the wrong arguments taken for its streams.
 
 - **A `MIGRATE` no longer stops a `--io-model tokio` server's other
   clients while it waits.** One of tokio's worker threads at a time polls
