@@ -918,10 +918,7 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
         .or_else(|| config_set_global(&param, value))
         .unwrap_or_else(|| config_set_other(ctx, &param, value));
     if reply.starts_with(b"+") {
-        let secret = matches!(
-            param.as_str(),
-            "requirepass" | "masterauth" | "tls-key-file-pass"
-        );
+        let secret = crate::slowlog::SECRET_SETTINGS.contains(&param.as_str());
         log_info!(
             "CONFIG SET {param} {}",
             if secret { "(hidden)" } else { value }
