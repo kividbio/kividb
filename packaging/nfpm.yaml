@@ -11,6 +11,12 @@ scripts:
   preinstall: ./packaging/scripts/preinstall.sh
   postinstall: ./packaging/scripts/postinstall.sh
   preremove: ./packaging/scripts/preremove.sh
+# The pre-install script makes the kividb user with groupadd and useradd,
+# which minimal RPM-based images such as amazonlinux:2023 leave out.
+overrides:
+  rpm:
+    depends:
+      - shadow-utils
 contents:
   - src: ./target/release/kividb
     dst: /usr/bin/kividb

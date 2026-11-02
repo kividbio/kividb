@@ -480,6 +480,22 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **The `.rpm` package depends on `shadow-utils`.** Its pre-install script
+  makes the `kividb` user and group with `groupadd` and `useradd`, but the
+  package did not say it needed them, so on a minimal image without them
+  (`amazonlinux:2023`, for one) the install failed in that script. `dnf`
+  now installs `shadow-utils` with it.
+
+- **Hashes loaded from `dump.kdb` are deleted when their fields expire**
+  (#302, by [@ShryukGrandhi](https://github.com/ShryukGrandhi)). After a
+  restart that loaded the dump, a hash whose fields all expired later stayed
+  in the keyspace, empty: `EXISTS` 1, `HLEN` 0, counted by `DBSIZE` and
+  returned by `SCAN`, where a replica that had not restarted had deleted it.
+  The background sweep only looks at the hashes it knows to have field TTLs,
+  and it made that list before the dump was loaded. It now makes it again
+  once the data is loaded. A restart that replayed the AOF was not affected.
+  In 1.1.x too.
+
 - **A second engine in a data directory waits for the first to exit**
   (#303). Two engines in one directory read and write the same files. One
   started while the other was stopping, as a replacement pod can be on the
