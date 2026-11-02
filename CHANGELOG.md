@@ -480,6 +480,20 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **A second engine in a data directory waits for the first to exit**
+  (#303). Two engines in one directory read and write the same files. One
+  started while the other was stopping, as a replacement pod can be on the
+  same volume after a forced delete, loaded the dump the other was about to
+  replace. It then compared the replication point saved beside the dump
+  with the newer dump on disk, took it for the point of what it had loaded,
+  and carried on the other one's stream with the older data: its replicas
+  dropped theirs for it, and acknowledged writes were lost. An engine now
+  holds an exclusive lock on `kividb.lock` in its data directory from
+  before it reads anything there until it exits. Another one started there
+  logs that the directory is in use and waits until it is free. And a saved
+  replication point, or a clean-exit marker, is used only if it was written
+  for the very bytes that were loaded.
+
 - **`EXPIREAT` with a negative timestamp deletes the key,** as Redis does
   (by [@huong8373tt-beep](https://github.com/huong8373tt-beep)). It was
   refused with `ERR invalid expire time`; a time before the epoch is a time

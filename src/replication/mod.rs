@@ -1189,10 +1189,13 @@ pub fn note_clean_exit() {
     }
 }
 
-/// Whether the previous process stopped cleanly with the `dump.kdb` that is
-/// here now. The marker is removed — durably, before anything is served —
-/// so that a crash later in this process is not taken for a clean stop.
-pub fn take_clean_exit_marker() -> bool {
+/// Whether the previous process stopped cleanly with the `dump.kdb` this
+/// process loaded: `loaded` is the fingerprint of the bytes that were read
+/// ([`load_dump`]), not of the file there now, which another process may
+/// have replaced since (#303). The marker is removed — durably, before
+/// anything is served — so that a crash later in this process is not taken
+/// for a clean stop.
+pub fn take_clean_exit_marker(loaded: Option<DumpFingerprint>) -> bool {
     let Ok(text) = std::fs::read_to_string(CLEAN_EXIT_PATH) else {
         return false;
     };
@@ -1206,27 +1209,131 @@ pub fn take_clean_exit_marker() -> bool {
     }
     let len: Option<u64> = lines.next().and_then(|l| l.parse().ok());
     let hash: Option<u64> = lines.next().and_then(|l| l.parse().ok());
-    matches!((len, hash, dump_fingerprint("dump.kdb")), (Some(l), Some(h), Ok((dl, dh))) if l == dl && h == dh)
+    matches!((len, hash, loaded), (Some(l), Some(h), Some((dl, dh))) if l == dl && h == dh)
 }
 
 /// Where a save leaves the resync point of the dataset it wrote.
 pub const RESYNC_PATH: &str = "dump.kdb.repl";
 const RESYNC_MAGIC: &str = "kividb-resync 1";
 
-/// Enough of `dump.kdb` to tell whether it is still the file a resync point
-/// was written for: its length, and a hash of its first and last 64 KiB.
-fn dump_fingerprint(path: &str) -> std::io::Result<(u64, u64)> {
+/// A dump's length, and a hash of its first and last 64 KiB: enough to tell
+/// whether a dump is the one a resync point or a clean-exit marker was
+/// written for.
+pub type DumpFingerprint = (u64, u64);
+
+/// How much of each end of a dump its fingerprint hashes.
+const FINGERPRINT_EDGE: usize = 64 * 1024;
+
+/// The fingerprint of a dump `len` bytes long, from its first
+/// [`FINGERPRINT_EDGE`] bytes and the last ones after those, up to as many
+/// again. Both [`dump_fingerprint`] and [`FingerprintReader`] end here.
+fn fingerprint(len: u64, head: &[u8], tail: &[u8]) -> DumpFingerprint {
+    let mut sample = Vec::with_capacity(head.len() + tail.len());
+    sample.extend_from_slice(head);
+    sample.extend_from_slice(tail);
+    (len, xxhash_rust::xxh3::xxh3_64(&sample))
+}
+
+/// The fingerprint of the file at `path` as it is now.
+fn dump_fingerprint(path: &str) -> std::io::Result<DumpFingerprint> {
     use std::io::{Read, Seek, SeekFrom};
-    const EDGE: u64 = 64 * 1024;
+    const EDGE: u64 = FINGERPRINT_EDGE as u64;
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
-    let mut sample = Vec::with_capacity((2 * EDGE) as usize);
-    (&mut file).take(EDGE).read_to_end(&mut sample)?;
+    let mut head = Vec::with_capacity(FINGERPRINT_EDGE);
+    (&mut file).take(EDGE).read_to_end(&mut head)?;
+    let mut tail = Vec::new();
     if len > EDGE {
         file.seek(SeekFrom::Start(len - EDGE.min(len - EDGE)))?;
-        file.read_to_end(&mut sample)?;
+        file.read_to_end(&mut tail)?;
     }
-    Ok((len, xxhash_rust::xxh3::xxh3_64(&sample)))
+    Ok(fingerprint(len, &head, &tail))
+}
+
+/// A reader that takes the fingerprint of what is read through it.
+///
+/// The dump is loaded through one, so that what was loaded is what a saved
+/// point is compared with. Compared with the file on disk instead, a point
+/// saved for a newer dump, written by another process after this one had
+/// read the older one, was taken for the point of the older (#303).
+pub struct FingerprintReader<R> {
+    inner: R,
+    len: u64,
+    head: Vec<u8>,
+    /// The last bytes read after the head, at most [`FINGERPRINT_EDGE`]: a
+    /// ring once full, its oldest byte at `tail_at`.
+    tail: Vec<u8>,
+    tail_at: usize,
+}
+
+impl<R: std::io::Read> FingerprintReader<R> {
+    pub fn new(inner: R) -> Self {
+        FingerprintReader {
+            inner,
+            len: 0,
+            head: Vec::with_capacity(FINGERPRINT_EDGE),
+            tail: Vec::with_capacity(FINGERPRINT_EDGE),
+            tail_at: 0,
+        }
+    }
+
+    fn note(&mut self, mut bytes: &[u8]) {
+        self.len += bytes.len() as u64;
+        if self.head.len() < FINGERPRINT_EDGE {
+            let take = (FINGERPRINT_EDGE - self.head.len()).min(bytes.len());
+            self.head.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+        }
+        if bytes.len() >= FINGERPRINT_EDGE {
+            self.tail.clear();
+            self.tail
+                .extend_from_slice(&bytes[bytes.len() - FINGERPRINT_EDGE..]);
+            self.tail_at = 0;
+            return;
+        }
+        if self.tail.len() < FINGERPRINT_EDGE {
+            let take = (FINGERPRINT_EDGE - self.tail.len()).min(bytes.len());
+            self.tail.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+        }
+        while !bytes.is_empty() {
+            let take = (FINGERPRINT_EDGE - self.tail_at).min(bytes.len());
+            self.tail[self.tail_at..self.tail_at + take].copy_from_slice(&bytes[..take]);
+            self.tail_at = (self.tail_at + take) % FINGERPRINT_EDGE;
+            bytes = &bytes[take..];
+        }
+    }
+
+    /// Read the rest, to the end, and give the fingerprint of everything.
+    pub fn finish(mut self) -> std::io::Result<DumpFingerprint> {
+        std::io::copy(&mut self, &mut std::io::sink())?;
+        let (newer, older) = self.tail.split_at(self.tail_at);
+        let mut tail = Vec::with_capacity(self.tail.len());
+        tail.extend_from_slice(older);
+        tail.extend_from_slice(newer);
+        Ok(fingerprint(self.len, &self.head, &tail))
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for FingerprintReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.note(&buf[..n]);
+        Ok(n)
+    }
+}
+
+/// Load the dump at `path`, as `snapshot::load_snapshot` does, with the
+/// fingerprint of the bytes that were loaded.
+pub fn load_dump(
+    path: &str,
+) -> std::io::Result<(crate::snapshot::LoadedSnapshot, DumpFingerprint)> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(FingerprintReader::new(file));
+    let loaded = crate::snapshot::load_snapshot_from(&mut reader)?;
+    // What the buffer holds beyond what was parsed has been fingerprinted.
+    let fingerprint = reader.into_inner().finish()?;
+    Ok((loaded, fingerprint))
 }
 
 /// Write the dataset to disk — `dump.kdb`, and with the AOF on, the log reset
@@ -1319,24 +1426,26 @@ pub fn save_dataset(
     Ok(())
 }
 
-/// The resync point saved beside `dump.kdb`, if that dump is still the one it
-/// was saved for. The caller must also know that the dataset in memory is
+/// The resync point saved beside `dump.kdb`, if it was saved for the dump
+/// this process loaded, `loaded` being that dump's fingerprint
+/// ([`load_dump`]). The caller must also know that the dataset in memory is
 /// that dump and nothing more — see `aof::LocalRecovery::exact_dump`.
-pub fn load_saved_resync_point() -> Option<ResyncPoint> {
-    saved_point().and_then(|(point, master)| (!master).then_some(point))
+pub fn load_saved_resync_point(loaded: DumpFingerprint) -> Option<ResyncPoint> {
+    saved_point(RESYNC_PATH, loaded, false)
 }
 
-/// The point a master saved at a clean shutdown, if the dump beside it is
-/// still the one it was saved for: its replication id and offset. Same
-/// caveat as [`load_saved_resync_point`].
-pub fn load_saved_master_point() -> Option<(String, u64)> {
-    saved_point().and_then(|(point, master)| master.then_some((point.repl_id, point.offset)))
+/// The point a master saved at a clean shutdown, if it was saved for the
+/// dump this process loaded: its replication id and offset. Same caveat as
+/// [`load_saved_resync_point`].
+pub fn load_saved_master_point(loaded: DumpFingerprint) -> Option<(String, u64)> {
+    saved_point(RESYNC_PATH, loaded, true).map(|point| (point.repl_id, point.offset))
 }
 
-/// The saved point, and whether a master saved it (a file without the role
-/// is a replica's, from before masters saved theirs).
-fn saved_point() -> Option<(ResyncPoint, bool)> {
-    let text = std::fs::read_to_string(RESYNC_PATH).ok()?;
+/// The point saved at `path` by a master (`master`) or a replica (a file
+/// without the role is a replica's, from before masters saved theirs), if
+/// it was saved for the dump whose fingerprint is `loaded`.
+fn saved_point(path: &str, loaded: DumpFingerprint, master: bool) -> Option<ResyncPoint> {
+    let text = std::fs::read_to_string(path).ok()?;
     let mut lines = text.lines();
     if lines.next()? != RESYNC_MAGIC {
         return None;
@@ -1346,18 +1455,101 @@ fn saved_point() -> Option<(ResyncPoint, bool)> {
     let db: usize = lines.next()?.parse().ok()?;
     let len: u64 = lines.next()?.parse().ok()?;
     let hash: u64 = lines.next()?.parse().ok()?;
-    let master = lines.next() == Some("master");
-    if repl_id.len() != 40 || dump_fingerprint("dump.kdb").ok()? != (len, hash) {
+    if (lines.next() == Some("master")) != master || repl_id.len() != 40 {
         return None;
     }
-    Some((
-        ResyncPoint {
-            repl_id,
-            offset,
-            db,
-        },
-        master,
-    ))
+    if loaded != (len, hash) {
+        log_info!(
+            "Replication: {path} was saved for another dump than the one loaded — \
+             not continuing from it"
+        );
+        return None;
+    }
+    Some(ResyncPoint {
+        repl_id,
+        offset,
+        db,
+    })
+}
+
+#[cfg(test)]
+mod dump_fingerprint_tests {
+    use super::*;
+    use std::io::Read;
+
+    /// The fingerprint taken while reading is the one taken of the file,
+    /// however the reads are cut up and wherever the reader stops.
+    #[test]
+    fn the_fingerprint_of_what_was_read_is_the_fingerprint_of_the_file() {
+        const EDGE: usize = FINGERPRINT_EDGE;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.kdb");
+        let path = path.to_str().unwrap();
+        for len in [
+            0,
+            1,
+            1000,
+            EDGE - 1,
+            EDGE,
+            EDGE + 1,
+            2 * EDGE - 1,
+            2 * EDGE,
+            2 * EDGE + 1,
+            5 * EDGE + 12_345,
+        ] {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 7 % 251) as u8).collect();
+            std::fs::write(path, &bytes).unwrap();
+            let expected = dump_fingerprint(path).unwrap();
+            for chunk in [1, 7, 4096, EDGE - 1, EDGE, EDGE + 3, 3 * EDGE] {
+                for stop in [0, len / 3, len] {
+                    let mut reader = FingerprintReader::new(&bytes[..]);
+                    let mut buf = vec![0u8; chunk];
+                    let mut read = 0;
+                    while read < stop {
+                        let want = chunk.min(stop - read);
+                        let n = reader.read(&mut buf[..want]).unwrap();
+                        assert!(n > 0);
+                        read += n;
+                    }
+                    assert_eq!(
+                        reader.finish().unwrap(),
+                        expected,
+                        "length {len}, reads of {chunk}, stopped at {stop}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A point saved for a later dump than the one loaded is not used,
+    /// though it matches the dump on disk (#303).
+    #[test]
+    fn a_saved_point_is_used_only_for_the_dump_that_was_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let dump = dir.path().join("dump.kdb");
+        let dump = dump.to_str().unwrap();
+        let point = dir.path().join("dump.kdb.repl");
+        let point = point.to_str().unwrap();
+
+        std::fs::write(dump, vec![1u8; 100_000]).unwrap();
+        let older = FingerprintReader::new(std::fs::File::open(dump).unwrap())
+            .finish()
+            .unwrap();
+        // Another process saves a newer dump, and its point beside it.
+        std::fs::write(dump, vec![2u8; 150_000]).unwrap();
+        let (len, hash) = dump_fingerprint(dump).unwrap();
+        let repl_id = "a".repeat(40);
+        std::fs::write(
+            point,
+            format!("{RESYNC_MAGIC}\n{repl_id}\n4242\n0\n{len}\n{hash}\nmaster\n"),
+        )
+        .unwrap();
+
+        assert!(saved_point(point, older, true).is_none());
+        assert!(saved_point(point, (len, hash), false).is_none());
+        let saved = saved_point(point, (len, hash), true).unwrap();
+        assert_eq!((saved.repl_id, saved.offset), (repl_id, 4242));
+    }
 }
 
 /// `repl-diskless-load`: whether a replica drops its dataset before loading a

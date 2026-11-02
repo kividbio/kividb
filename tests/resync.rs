@@ -1054,6 +1054,46 @@ fn a_full_sync_cut_off_part_way_costs_the_replica_nothing() {
 /// connections were arriving: each one let an accept worker notice the
 /// shutdown flag, and once they all had, `main` returned.
 #[cfg(unix)]
+/// A second engine started in a running one's data directory waits for the
+/// first to exit before it reads anything there (#303). It used to load the
+/// dump the first was about to replace and could then carry on the first
+/// one's replication stream with the older data. Now what it loads is the
+/// first one's final save, everything that was acknowledged.
+#[test]
+fn a_second_engine_in_the_same_directory_waits_for_the_first() {
+    let mut first = Server::start(&["--aof"]);
+    let mut c = first.conn();
+    write_batch(&mut c, 0, 100);
+    assert!(c.cmd(&["SAVE"]).ok());
+
+    let port = free_port();
+    let mut second = kividb(&first.dir, port, &["--aof".to_string()]);
+    wait_until("the second engine to wait for the directory", || {
+        first.log().contains("is in use by another process")
+    });
+    assert!(
+        TcpStream::connect(("127.0.0.1", port)).is_err(),
+        "the second engine started while the first had the directory:\n{}",
+        first.log()
+    );
+
+    // Written after the second engine started: in neither the dump nor the
+    // log it would have read then.
+    write_batch(&mut c, 1, 100);
+    let keys = c.cmd(&["DBSIZE"]).i();
+    let counter = c.cmd(&["GET", "counter"]);
+    drop(c);
+    first.shutdown();
+
+    let mut c = Conn::connect(port);
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), keys, "{}", first.log());
+    assert_eq!(c.cmd(&["GET", "counter"]), counter);
+    assert!(first.log().contains("The data directory is free"));
+    drop(c);
+    let _ = second.kill();
+    let _ = second.wait();
+}
+
 #[test]
 fn sigterm_waits_for_the_final_snapshot() {
     // The default I/O model, which on Linux is the one this was seen with.

@@ -371,6 +371,7 @@ fn test_config_rewrite_with_configfile() {
     let mut server = std::process::Command::new(
         std::env::var("CARGO_BIN_EXE_kividb").unwrap_or_else(|_| "target/debug/kividb".into()),
     )
+    .current_dir(tempfile::tempdir().unwrap().keep())
     .args([
         "--port",
         &port.to_string(),
@@ -535,6 +536,7 @@ fn test_config_rewrite_keeps_the_file_mode() {
         let mut server = std::process::Command::new(
             std::env::var("CARGO_BIN_EXE_kividb").unwrap_or_else(|_| "target/debug/kividb".into()),
         )
+        .current_dir(tempfile::tempdir().unwrap().keep())
         .args([
             "--port",
             &port.to_string(),

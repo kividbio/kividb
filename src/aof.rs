@@ -2020,6 +2020,9 @@ pub struct LocalRecovery {
     /// file was replayed on top of it. Only then does a resync point saved
     /// beside the dump describe what was loaded.
     pub exact_dump: bool,
+    /// The fingerprint of the `dump.kdb` that was loaded, if one was: what a
+    /// point or marker saved beside it must match (#303).
+    pub dump_fingerprint: Option<crate::replication::DumpFingerprint>,
 }
 
 /// Load `dump.kdb` (or `dump.rdb`) first, then replay the AOF on top.
@@ -2050,6 +2053,7 @@ pub fn recover_local(
         index_names: Vec::new(),
         hnsw_loaded: false,
         exact_dump: false,
+        dump_fingerprint: None,
     };
 
     // `preload-file`: load exactly this, and nothing else. An operator who
@@ -2087,9 +2091,10 @@ pub fn recover_local(
 
     if kdb_path.exists() {
         log_info!("Found dump.kdb — loading native snapshot");
-        match crate::snapshot::load_snapshot("dump.kdb") {
-            Ok(loaded) => {
+        match crate::replication::load_dump("dump.kdb") {
+            Ok((loaded, fingerprint)) => {
                 recovery.exact_dump = true;
+                recovery.dump_fingerprint = Some(fingerprint);
                 let crate::snapshot::LoadedSnapshot {
                     dbs,
                     index_schemas,

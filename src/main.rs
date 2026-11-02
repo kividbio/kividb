@@ -375,6 +375,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "none".to_string()
         }
     );
+    // One engine to a data directory, before anything in it is read.
+    lock_data_dir();
     // io_uring's workers hold open files of their own, kept from clients.
     #[cfg(target_os = "linux")]
     let uring = match config.io_model {
@@ -424,6 +426,75 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// The file in the data directory that a running engine holds locked.
+const DATA_DIR_LOCK: &str = "kividb.lock";
+
+/// Take the data directory — the working directory by now — for this
+/// process, waiting while another process has it.
+///
+/// Two engines in one directory read and write the same files. A second one
+/// started while the first was stopping, as a replacement container can be
+/// on the same volume, loaded the dump the first was about to replace, then
+/// carried on the first one's replication stream from where that stopped,
+/// and its replicas dropped their data for the older copy (#303). The lock
+/// is an exclusive `flock` (`LockFileEx` on Windows) held until the process
+/// exits, when the system releases it however the process ends. The other
+/// process is usually on its way out, so this waits for it rather than
+/// giving up.
+fn lock_data_dir() {
+    static HELD: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(DATA_DIR_LOCK)
+    {
+        Ok(file) => file,
+        Err(e) => {
+            log_warn!(
+                "Can't open {DATA_DIR_LOCK} in the data directory ({e}): starting without the \
+                 lock that keeps a second process out of it"
+            );
+            return;
+        }
+    };
+    let waiting_since = Instant::now();
+    let mut told: Option<Instant> = None;
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if told.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(5)) {
+                    let dir = std::env::current_dir()
+                        .map(|dir| dir.display().to_string())
+                        .unwrap_or_else(|_| ".".into());
+                    log_warn!(
+                        "The data directory {dir} is in use by another process (it holds \
+                         {DATA_DIR_LOCK}): waiting for it to be free ({}s so far)",
+                        waiting_since.elapsed().as_secs()
+                    );
+                    told = Some(Instant::now());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                log_warn!(
+                    "Can't lock {DATA_DIR_LOCK} ({e}): starting without the lock that keeps a \
+                     second process out of the data directory"
+                );
+                return;
+            }
+        }
+    }
+    if told.is_some() {
+        log_info!(
+            "The data directory is free after {:.1}s: starting",
+            waiting_since.elapsed().as_secs_f64()
+        );
+    }
+    let _ = HELD.set(file);
 }
 
 /// Walk keys to populate TEXT / inverted / FLAT data and HNSW graphs. A graph
@@ -764,7 +835,8 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
         // may hold the data, has taken over or said it holds nothing.
         if config.cluster_enabled {
             crate::replication::CLEAN_EXIT_MARKER.store(true, std::sync::atomic::Ordering::Relaxed);
-            let stopped_cleanly = crate::replication::take_clean_exit_marker();
+            let stopped_cleanly =
+                crate::replication::take_clean_exit_marker(loaded.dump_fingerprint);
             let keys: usize = store
                 .iter()
                 .flat_map(|db| db.iter())
@@ -778,7 +850,9 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
         // A node that was a replica when it was last saved, and has loaded
         // exactly that save, can ask its master to continue from there.
         if loaded.exact_dump
-            && let Some(point) = crate::replication::load_saved_resync_point()
+            && let Some(point) = loaded
+                .dump_fingerprint
+                .and_then(crate::replication::load_saved_resync_point)
         {
             log_info!(
                 "Replication: Loaded dataset is offset {} of {} — a partial resync will be asked for",
@@ -792,7 +866,9 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
         } else if loaded.exact_dump
             && config.replicaof_addr().is_none()
             && cluster_state.my_master_id().is_none()
-            && let Some((repl_id, offset)) = crate::replication::load_saved_master_point()
+            && let Some((repl_id, offset)) = loaded
+                .dump_fingerprint
+                .and_then(crate::replication::load_saved_master_point)
         {
             // And a master stopped cleanly carries on its stream, so that
             // its replicas need not be sent everything again.
@@ -1564,7 +1640,8 @@ async fn async_main_tokio(
         // may hold the data, has taken over or said it holds nothing.
         if config.cluster_enabled {
             crate::replication::CLEAN_EXIT_MARKER.store(true, std::sync::atomic::Ordering::Relaxed);
-            let stopped_cleanly = crate::replication::take_clean_exit_marker();
+            let stopped_cleanly =
+                crate::replication::take_clean_exit_marker(loaded.dump_fingerprint);
             let keys: usize = store
                 .iter()
                 .flat_map(|db| db.iter())
@@ -1578,7 +1655,9 @@ async fn async_main_tokio(
         // A node that was a replica when it was last saved, and has loaded
         // exactly that save, can ask its master to continue from there.
         if loaded.exact_dump
-            && let Some(point) = crate::replication::load_saved_resync_point()
+            && let Some(point) = loaded
+                .dump_fingerprint
+                .and_then(crate::replication::load_saved_resync_point)
         {
             log_info!(
                 "Replication: Loaded dataset is offset {} of {} — a partial resync will be asked for",
@@ -1592,7 +1671,9 @@ async fn async_main_tokio(
         } else if loaded.exact_dump
             && config.replicaof_addr().is_none()
             && cluster_state.my_master_id().is_none()
-            && let Some((repl_id, offset)) = crate::replication::load_saved_master_point()
+            && let Some((repl_id, offset)) = loaded
+                .dump_fingerprint
+                .and_then(crate::replication::load_saved_master_point)
         {
             // And a master stopped cleanly carries on its stream, so that
             // its replicas need not be sent everything again.
