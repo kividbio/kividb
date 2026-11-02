@@ -480,6 +480,12 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **`EXPIREAT` with a negative timestamp deletes the key,** as Redis does
+  (by [@huong8373tt-beep](https://github.com/huong8373tt-beep)). It was
+  refused with `ERR invalid expire time`; a time before the epoch is a time
+  that has passed, and goes through the same condition check (`NX`, `XX`,
+  `GT`, `LT`) and deletion as any other.
+
 - **A key that expired while the server was down stays gone after AOF
   replay.** Replaying a time to live that had passed by then (`EXPIRE`,
   `PEXPIREAT` and the rest) deleted the key there and then, and a write to
