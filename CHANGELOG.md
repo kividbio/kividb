@@ -480,6 +480,16 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **A key that expired while the server was down stays gone after AOF
+  replay.** Replaying a time to live that had passed by then (`EXPIRE`,
+  `PEXPIREAT` and the rest) deleted the key there and then, and a write to
+  it later in the log made a new one, with no time to live and only the
+  writes after it: `HSET h f0 v0`, `PEXPIRE h 2000`, `HSET h f1 v1`, a
+  crash, and a restart three seconds later left `h` as `{f1}` for good. As
+  in Redis, a deadline replayed after it has passed now sets the key's time,
+  the writes after it go to that key, and it expires once loading is done.
+  Field deadlines (`HPEXPIRE`, `HSETEX`, `HGETEX`) the same. In 1.1.x too.
+
 - **`INFO stats` counts rejected connections** (#254, by
   [@de-ep](https://github.com/de-ep)). `rejected_connections` stayed at 0:
   a connection turned away at `maxclients` was refused and logged, but not
