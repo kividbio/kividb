@@ -1289,6 +1289,25 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 i += 1;
             }
 
+            // A `BY` pattern with a `*`, and a `GET` pattern other than `#`,
+            // read keys named by the elements. As in Redis, they need read
+            // access to every key. A `BY` with no `*` reads no key: it only
+            // skips the sort.
+            let by_reads_keys = by_pattern.as_deref().is_some_and(|p| p.contains('*'));
+            let get_reads_keys = get_patterns.iter().any(|p| p != "#");
+            if by_reads_keys || get_reads_keys {
+                let acl = ctx.acl_store.read();
+                let restricted = acl
+                    .get(ctx.authenticated_user)
+                    .is_some_and(|user| !user.reads_all_keys());
+                if restricted {
+                    let option = if by_reads_keys { "BY" } else { "GET" };
+                    return Some(resp_error(&format!(
+                        "ERR {option} option of SORT denied due to insufficient ACL permissions."
+                    )));
+                }
+            }
+
             // ── Collect elements ───────────────────────────────────────────────
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);

@@ -2143,3 +2143,196 @@ fn acl_genpass_gives_a_digit_per_four_bits() {
     }
     assert_eq!(c.cmds(&["ACL", "GENPASS"]).as_str().len(), 64);
 }
+
+/// `SORT` and `SORT_RO` read keys of their own through a `BY` pattern with a
+/// `*` and a `GET` pattern other than `#`, named by the list's elements. A
+/// user who may read only some keys is refused them, as in Redis; one who may
+/// read every key is not, and `GET #` and a `BY` with no `*` read nothing.
+#[test]
+fn sort_patterns_need_read_access_to_every_key() {
+    let port = free_port();
+    start_server(port);
+    let mut admin = Conn::connect(port);
+    assert!(admin.cmds(&["SET", "other:s", "value-s"]).is_ok());
+    admin.cmds(&["HSET", "other:h", "field", "value-h"]);
+    admin.cmds(&["SET", "app:w", "1"]);
+    assert!(
+        admin
+            .cmds(&["ACL", "SETUSER", "app", "on", ">apppass", "+@all", "~app:*"])
+            .is_ok()
+    );
+    assert!(
+        admin
+            .cmds(&[
+                "ACL",
+                "SETUSER",
+                "reader",
+                "on",
+                ">readpass",
+                "+@all",
+                "%R~*"
+            ])
+            .is_ok()
+    );
+
+    let mut app = Conn::connect(port);
+    assert!(app.cmds(&["AUTH", "app", "apppass"]).is_ok());
+    app.cmds(&["RPUSH", "app:list", "other:s"]);
+    app.cmds(&["RPUSH", "app:hashes", "other:h"]);
+
+    for command in ["SORT", "SORT_RO"] {
+        let reply = app.cmds(&[command, "app:list", "BY", "nosort", "GET", "*"]);
+        assert!(
+            reply.error_str().contains("GET option of SORT denied"),
+            "{command} GET *: {reply:?}"
+        );
+        let reply = app.cmds(&[command, "app:hashes", "BY", "nosort", "GET", "*->field"]);
+        assert!(
+            reply.error_str().contains("GET option of SORT denied"),
+            "{command} GET *->field: {reply:?}"
+        );
+        let reply = app.cmds(&[command, "app:list", "BY", "*"]);
+        assert!(
+            reply.error_str().contains("BY option of SORT denied"),
+            "{command} BY *: {reply:?}"
+        );
+        // Nothing but the list itself is read.
+        let reply = app.cmds(&[command, "app:list", "BY", "nosort", "GET", "#"]);
+        assert_eq!(reply.as_array().len(), 1, "{command} GET #: {reply:?}");
+        let reply = app.cmds(&[command, "app:list", "BY", "constant", "ALPHA"]);
+        assert_eq!(
+            reply.as_array().len(),
+            1,
+            "{command} BY constant: {reply:?}"
+        );
+    }
+
+    let mut reader = Conn::connect(port);
+    assert!(reader.cmds(&["AUTH", "reader", "readpass"]).is_ok());
+    let reply = reader.cmds(&["SORT", "app:list", "BY", "nosort", "GET", "*"]);
+    assert_eq!(
+        reply.as_array().len(),
+        1,
+        "a user who may read every key: {reply:?}"
+    );
+    assert_eq!(reply.as_array()[0].as_str(), "value-s");
+}
+
+/// `SORT` and `GEORADIUS` write to the destination of their last `STORE`, and
+/// an `XREADGROUP` group or consumer may be named `STREAMS`: the ACL checks the
+/// keys the command really uses, not the first word that looks like one.
+#[test]
+fn the_keys_checked_are_the_keys_used() {
+    let port = free_port();
+    start_server(port);
+    let mut admin = Conn::connect(port);
+    admin.cmds(&["SET", "other:s", "value"]);
+    admin.cmds(&["XADD", "other:stream", "*", "f", "value"]);
+    assert!(
+        admin
+            .cmds(&["XGROUP", "CREATE", "other:stream", "g", "0"])
+            .is_ok()
+    );
+    assert!(
+        admin
+            .cmds(&[
+                "ACL", "SETUSER", "app", "on", ">apppass", "+@all", "~app:*", "~STREAMS"
+            ])
+            .is_ok()
+    );
+    let mut app = Conn::connect(port);
+    assert!(app.cmds(&["AUTH", "app", "apppass"]).is_ok());
+    app.cmds(&["RPUSH", "app:list", "a"]);
+    app.cmds(&["GEOADD", "app:geo", "13.361389", "38.115556", "palermo"]);
+
+    let attempts: &[&[&str]] = &[
+        &[
+            "SORT",
+            "app:list",
+            "ALPHA",
+            "STORE",
+            "app:ok",
+            "STORE",
+            "other:s",
+        ],
+        &[
+            "SORT",
+            "app:list",
+            "GET",
+            "#",
+            "STORE",
+            "app:ok",
+            "STORE",
+            "other:s",
+        ],
+        &[
+            "GEORADIUS",
+            "app:geo",
+            "15",
+            "37",
+            "500",
+            "km",
+            "STORE",
+            "app:ok",
+            "STORE",
+            "other:s",
+        ],
+        &[
+            "GEORADIUS",
+            "app:geo",
+            "15",
+            "37",
+            "500",
+            "km",
+            "STOREDIST",
+            "app:ok",
+            "STOREDIST",
+            "other:s",
+        ],
+        &[
+            "GEORADIUSBYMEMBER",
+            "app:geo",
+            "palermo",
+            "500",
+            "km",
+            "STORE",
+            "app:ok",
+            "STORE",
+            "other:s",
+        ],
+        &[
+            "XREADGROUP",
+            "GROUP",
+            "g",
+            "STREAMS",
+            "STREAMS",
+            "other:stream",
+            ">",
+        ],
+    ];
+    for attempt in attempts {
+        let reply = app.cmds(attempt);
+        assert!(
+            reply.error_str().starts_with("NOPERM"),
+            "{attempt:?}: {reply:?}"
+        );
+    }
+    assert_eq!(admin.cmds(&["GET", "other:s"]).as_str(), "value");
+
+    // The keys of their own are still theirs.
+    let reply = app.cmds(&[
+        "SORT", "app:list", "ALPHA", "STORE", "app:x", "STORE", "app:y",
+    ]);
+    assert_eq!(reply.as_int(), 1, "{reply:?}");
+    let reply = app.cmds(&[
+        "GEORADIUS",
+        "app:geo",
+        "15",
+        "37",
+        "500",
+        "km",
+        "STORE",
+        "app:x",
+    ]);
+    assert_eq!(reply.as_int(), 1, "{reply:?}");
+}
