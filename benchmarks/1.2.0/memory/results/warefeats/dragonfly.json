@@ -1,0 +1,491 @@
+{
+  "generatedAt": "2026-11-01T23:00:22.361Z",
+  "smoke": false,
+  "sessionCount": 1,
+  "resultCount": 5,
+  "failureCount": 0,
+  "results": [
+    {
+      "label": "dragonfly/memory-load",
+      "engine": "dragonfly",
+      "workload": "memory-load",
+      "opsPerSec": 0,
+      "p50Ms": 0,
+      "p99Ms": 0,
+      "p999Ms": 0,
+      "samplesOpsPerSec": [
+        0
+      ],
+      "samplesP99Ms": [
+        0
+      ],
+      "samplesClientCpuPct": [
+        0.3
+      ],
+      "engineStats": {
+        "rssMb": 0,
+        "usedMemoryMb": 140.934814453125,
+        "usedMemoryRssMb": 196.2890625,
+        "keyCount": 1000000,
+        "hitRatio": 0
+      },
+      "config": {
+        "engineImage": "docker.dragonflydb.io/dragonflydb/dragonfly:v2.0.2",
+        "serverVersion": "df-v2.0.2",
+        "maxmemoryBytes": 17179869184,
+        "threads": 32,
+        "memtierThreads": 1,
+        "memtierClients": 1,
+        "totalConnections": 1,
+        "memtierVersion": "2.5.1",
+        "cloudMode": true
+      },
+      "metrics": {
+        "usedMemoryDeltaMb": {
+          "value": 132.31,
+          "unit": "MB",
+          "label": "Used memory (delta)"
+        },
+        "rssDeltaMb": {
+          "value": 130.82,
+          "unit": "MB",
+          "label": "RSS (delta)"
+        },
+        "baselineUsedMb": {
+          "value": 8.63,
+          "unit": "MB",
+          "label": "Baseline used memory"
+        },
+        "baselineRssMb": {
+          "value": 65.47,
+          "unit": "MB",
+          "label": "Baseline RSS"
+        },
+        "keyCount": {
+          "value": 1000000,
+          "unit": "keys",
+          "label": "Key count"
+        },
+        "bytesPerKeyRss": {
+          "value": 137.2,
+          "unit": "B/key",
+          "label": "Memory per key (RSS)"
+        },
+        "bytesPerKeyUsed": {
+          "value": 138.7,
+          "unit": "B/key",
+          "label": "Memory per key (used_memory)"
+        },
+        "absoluteRssMb": {
+          "value": 196.29,
+          "unit": "MB",
+          "label": "RSS after the first load (absolute)"
+        },
+        "absoluteUsedMb": {
+          "value": 140.93,
+          "unit": "MB",
+          "label": "Used memory after the first load (absolute)"
+        },
+        "rssDeltaSecondMb": {
+          "value": 140.64,
+          "unit": "MB",
+          "label": "RSS (delta, second load)"
+        },
+        "usedMemoryDeltaSecondMb": {
+          "value": 140.31,
+          "unit": "MB",
+          "label": "Used memory (delta, second load)"
+        },
+        "keyCountSecond": {
+          "value": 1000000,
+          "unit": "keys",
+          "label": "Key count (second load)"
+        },
+        "bytesPerKeyRssSecond": {
+          "value": 147.5,
+          "unit": "B/key",
+          "label": "Memory per key (RSS, second load)"
+        },
+        "bytesPerKeyUsedSecond": {
+          "value": 147.1,
+          "unit": "B/key",
+          "label": "Memory per key (used_memory, second load)"
+        },
+        "clientCpu": {
+          "value": 0.3,
+          "unit": "%",
+          "label": "Client CPU"
+        }
+      }
+    },
+    {
+      "label": "dragonfly/set-get-small",
+      "engine": "dragonfly",
+      "workload": "set-get-small",
+      "opsPerSec": 871102.29,
+      "p50Ms": 0.207,
+      "p99Ms": 0.407,
+      "p999Ms": 0.655,
+      "samplesOpsPerSec": [
+        873553.62,
+        862044.57,
+        861262.93,
+        868650.96,
+        884072.11,
+        858339.19,
+        867455.38,
+        884827.44,
+        875101.7,
+        876451.61
+      ],
+      "samplesP99Ms": [
+        0.399,
+        0.399,
+        0.407,
+        0.407,
+        0.391,
+        0.407,
+        0.415,
+        0.399,
+        0.407,
+        0.407
+      ],
+      "samplesClientCpuPct": [
+        41,
+        35.4,
+        39,
+        36.2,
+        42,
+        37.2,
+        40.3,
+        37.4,
+        36.8,
+        39.5
+      ],
+      "engineStats": {
+        "rssMb": 0,
+        "usedMemoryMb": 16.256591796875,
+        "usedMemoryRssMb": 77.94921875,
+        "keyCount": 100000,
+        "hitRatio": 1
+      },
+      "config": {
+        "engineImage": "docker.dragonflydb.io/dragonflydb/dragonfly:v2.0.2",
+        "serverVersion": "df-v2.0.2",
+        "maxmemoryBytes": 17179869184,
+        "threads": 32,
+        "memtierThreads": 25,
+        "memtierClients": 8,
+        "totalConnections": 200,
+        "memtierVersion": "2.5.1",
+        "cloudMode": true
+      },
+      "metrics": {
+        "throughput": {
+          "value": 871102.29,
+          "unit": "ops/s",
+          "label": "Throughput"
+        },
+        "kbPerSec": {
+          "value": 120238.92,
+          "unit": "KB/s",
+          "label": "Bandwidth"
+        },
+        "hitRatio": {
+          "value": 100,
+          "unit": "%",
+          "label": "Hit ratio"
+        },
+        "clientCpu": {
+          "value": 38.5,
+          "unit": "%",
+          "label": "Client CPU"
+        }
+      }
+    },
+    {
+      "label": "dragonfly/set-get-large",
+      "engine": "dragonfly",
+      "workload": "set-get-large",
+      "opsPerSec": 322248.595,
+      "p50Ms": 0.623,
+      "p99Ms": 1.027,
+      "p999Ms": 1.539,
+      "samplesOpsPerSec": [
+        322309.25,
+        322248.53,
+        322792.84,
+        322267.3,
+        322479.1,
+        320894.11,
+        322141.03,
+        321342.66,
+        322248.66,
+        321668.64
+      ],
+      "samplesP99Ms": [
+        1.031,
+        1.015,
+        0.983,
+        0.999,
+        1.047,
+        1.031,
+        1.023,
+        1.031,
+        1.135,
+        0.991
+      ],
+      "samplesClientCpuPct": [
+        29.3,
+        21.4,
+        23.5,
+        29.8,
+        27,
+        20.2,
+        24.9,
+        30.2,
+        21.1,
+        22.7
+      ],
+      "engineStats": {
+        "rssMb": 0,
+        "usedMemoryMb": 399.252197265625,
+        "usedMemoryRssMb": 490.78125,
+        "keyCount": 40000,
+        "hitRatio": 1
+      },
+      "config": {
+        "engineImage": "docker.dragonflydb.io/dragonflydb/dragonfly:v2.0.2",
+        "serverVersion": "df-v2.0.2",
+        "maxmemoryBytes": 17179869184,
+        "threads": 32,
+        "memtierThreads": 25,
+        "memtierClients": 8,
+        "totalConnections": 200,
+        "memtierVersion": "2.5.1",
+        "cloudMode": true
+      },
+      "metrics": {
+        "throughput": {
+          "value": 322248.595,
+          "unit": "ops/s",
+          "label": "Throughput"
+        },
+        "kbPerSec": {
+          "value": 3236073.65,
+          "unit": "KB/s",
+          "label": "Bandwidth"
+        },
+        "hitRatio": {
+          "value": 100,
+          "unit": "%",
+          "label": "Hit ratio"
+        },
+        "clientCpu": {
+          "value": 25,
+          "unit": "%",
+          "label": "Client CPU"
+        }
+      }
+    },
+    {
+      "label": "dragonfly/pipeline-30",
+      "engine": "dragonfly",
+      "workload": "pipeline-30",
+      "opsPerSec": 8076230.445,
+      "p50Ms": 0.659,
+      "p99Ms": 1.539,
+      "p999Ms": 3.543,
+      "samplesOpsPerSec": [
+        8142029.55,
+        7936678.03,
+        7987855.77,
+        8107734.04,
+        7944654.07,
+        8077530.06,
+        7978951.83,
+        8117752.84,
+        8074930.83,
+        8078813.93
+      ],
+      "samplesP99Ms": [
+        1.535,
+        1.575,
+        1.583,
+        1.527,
+        1.575,
+        1.527,
+        1.567,
+        1.543,
+        1.511,
+        1.519
+      ],
+      "samplesClientCpuPct": [
+        33.4,
+        33.5,
+        34.5,
+        31.8,
+        34.7,
+        32,
+        34.4,
+        34.9,
+        32.6,
+        32.3
+      ],
+      "engineStats": {
+        "rssMb": 0,
+        "usedMemoryMb": 16.256591796875,
+        "usedMemoryRssMb": 96.578125,
+        "keyCount": 100000,
+        "hitRatio": 1
+      },
+      "config": {
+        "engineImage": "docker.dragonflydb.io/dragonflydb/dragonfly:v2.0.2",
+        "serverVersion": "df-v2.0.2",
+        "maxmemoryBytes": 17179869184,
+        "threads": 32,
+        "memtierThreads": 25,
+        "memtierClients": 8,
+        "totalConnections": 200,
+        "memtierVersion": "2.5.1",
+        "cloudMode": true
+      },
+      "metrics": {
+        "throughput": {
+          "value": 8076230.445,
+          "unit": "ops/s",
+          "label": "Throughput"
+        },
+        "kbPerSec": {
+          "value": 1114768.025,
+          "unit": "KB/s",
+          "label": "Bandwidth"
+        },
+        "hitRatio": {
+          "value": 100,
+          "unit": "%",
+          "label": "Hit ratio"
+        },
+        "clientCpu": {
+          "value": 33.4,
+          "unit": "%",
+          "label": "Client CPU"
+        }
+      }
+    },
+    {
+      "label": "dragonfly/memory-load-random",
+      "engine": "dragonfly",
+      "workload": "memory-load-random",
+      "opsPerSec": 0,
+      "p50Ms": 0,
+      "p99Ms": 0,
+      "p999Ms": 0,
+      "samplesOpsPerSec": [
+        0
+      ],
+      "samplesP99Ms": [
+        0
+      ],
+      "samplesClientCpuPct": [
+        0.3
+      ],
+      "engineStats": {
+        "rssMb": 0,
+        "usedMemoryMb": 156.193603515625,
+        "usedMemoryRssMb": 212.00390625,
+        "keyCount": 1000000,
+        "hitRatio": 0
+      },
+      "config": {
+        "engineImage": "docker.dragonflydb.io/dragonflydb/dragonfly:v2.0.2",
+        "serverVersion": "df-v2.0.2",
+        "maxmemoryBytes": 17179869184,
+        "threads": 32,
+        "memtierThreads": 1,
+        "memtierClients": 1,
+        "totalConnections": 1,
+        "memtierVersion": "2.5.1",
+        "cloudMode": true
+      },
+      "metrics": {
+        "usedMemoryDeltaMb": {
+          "value": 147.57,
+          "unit": "MB",
+          "label": "Used memory (delta)"
+        },
+        "rssDeltaMb": {
+          "value": 146.14,
+          "unit": "MB",
+          "label": "RSS (delta)"
+        },
+        "baselineUsedMb": {
+          "value": 8.63,
+          "unit": "MB",
+          "label": "Baseline used memory"
+        },
+        "baselineRssMb": {
+          "value": 65.87,
+          "unit": "MB",
+          "label": "Baseline RSS"
+        },
+        "keyCount": {
+          "value": 1000000,
+          "unit": "keys",
+          "label": "Key count"
+        },
+        "bytesPerKeyRss": {
+          "value": 153.2,
+          "unit": "B/key",
+          "label": "Memory per key (RSS)"
+        },
+        "bytesPerKeyUsed": {
+          "value": 154.7,
+          "unit": "B/key",
+          "label": "Memory per key (used_memory)"
+        },
+        "absoluteRssMb": {
+          "value": 212,
+          "unit": "MB",
+          "label": "RSS after the first load (absolute)"
+        },
+        "absoluteUsedMb": {
+          "value": 156.19,
+          "unit": "MB",
+          "label": "Used memory after the first load (absolute)"
+        },
+        "rssDeltaSecondMb": {
+          "value": 155.44,
+          "unit": "MB",
+          "label": "RSS (delta, second load)"
+        },
+        "usedMemoryDeltaSecondMb": {
+          "value": 155.57,
+          "unit": "MB",
+          "label": "Used memory (delta, second load)"
+        },
+        "keyCountSecond": {
+          "value": 1000000,
+          "unit": "keys",
+          "label": "Key count (second load)"
+        },
+        "bytesPerKeyRssSecond": {
+          "value": 163,
+          "unit": "B/key",
+          "label": "Memory per key (RSS, second load)"
+        },
+        "bytesPerKeyUsedSecond": {
+          "value": 163.1,
+          "unit": "B/key",
+          "label": "Memory per key (used_memory, second load)"
+        },
+        "clientCpu": {
+          "value": 0.3,
+          "unit": "%",
+          "label": "Client CPU"
+        }
+      }
+    }
+  ],
+  "failures": []
+}

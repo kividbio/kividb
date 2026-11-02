@@ -1,0 +1,491 @@
+{
+  "generatedAt": "2026-11-01T22:41:57.106Z",
+  "smoke": false,
+  "sessionCount": 1,
+  "resultCount": 5,
+  "failureCount": 0,
+  "results": [
+    {
+      "label": "valkey/memory-load",
+      "engine": "valkey",
+      "workload": "memory-load",
+      "opsPerSec": 0,
+      "p50Ms": 0,
+      "p99Ms": 0,
+      "p999Ms": 0,
+      "samplesOpsPerSec": [
+        0
+      ],
+      "samplesP99Ms": [
+        0
+      ],
+      "samplesClientCpuPct": [
+        0.3
+      ],
+      "engineStats": {
+        "rssMb": 0,
+        "usedMemoryMb": 160.35871124267578,
+        "usedMemoryRssMb": 175.27734375,
+        "keyCount": 1000000,
+        "hitRatio": 0
+      },
+      "config": {
+        "engineImage": "valkey/valkey:9.1.3",
+        "serverVersion": "9.1.3",
+        "maxmemoryBytes": 17179869184,
+        "threads": 1,
+        "memtierThreads": 1,
+        "memtierClients": 1,
+        "totalConnections": 1,
+        "memtierVersion": "2.5.1",
+        "cloudMode": true
+      },
+      "metrics": {
+        "usedMemoryDeltaMb": {
+          "value": 159.39,
+          "unit": "MB",
+          "label": "Used memory (delta)"
+        },
+        "rssDeltaMb": {
+          "value": 162.36,
+          "unit": "MB",
+          "label": "RSS (delta)"
+        },
+        "baselineUsedMb": {
+          "value": 0.97,
+          "unit": "MB",
+          "label": "Baseline used memory"
+        },
+        "baselineRssMb": {
+          "value": 12.91,
+          "unit": "MB",
+          "label": "Baseline RSS"
+        },
+        "keyCount": {
+          "value": 1000000,
+          "unit": "keys",
+          "label": "Key count"
+        },
+        "bytesPerKeyRss": {
+          "value": 170.3,
+          "unit": "B/key",
+          "label": "Memory per key (RSS)"
+        },
+        "bytesPerKeyUsed": {
+          "value": 167.1,
+          "unit": "B/key",
+          "label": "Memory per key (used_memory)"
+        },
+        "absoluteRssMb": {
+          "value": 175.28,
+          "unit": "MB",
+          "label": "RSS after the first load (absolute)"
+        },
+        "absoluteUsedMb": {
+          "value": 160.36,
+          "unit": "MB",
+          "label": "Used memory after the first load (absolute)"
+        },
+        "rssDeltaSecondMb": {
+          "value": 164.66,
+          "unit": "MB",
+          "label": "RSS (delta, second load)"
+        },
+        "usedMemoryDeltaSecondMb": {
+          "value": 161.6,
+          "unit": "MB",
+          "label": "Used memory (delta, second load)"
+        },
+        "keyCountSecond": {
+          "value": 1000000,
+          "unit": "keys",
+          "label": "Key count (second load)"
+        },
+        "bytesPerKeyRssSecond": {
+          "value": 172.7,
+          "unit": "B/key",
+          "label": "Memory per key (RSS, second load)"
+        },
+        "bytesPerKeyUsedSecond": {
+          "value": 169.4,
+          "unit": "B/key",
+          "label": "Memory per key (used_memory, second load)"
+        },
+        "clientCpu": {
+          "value": 0.3,
+          "unit": "%",
+          "label": "Client CPU"
+        }
+      }
+    },
+    {
+      "label": "valkey/set-get-small",
+      "engine": "valkey",
+      "workload": "set-get-small",
+      "opsPerSec": 161806.32,
+      "p50Ms": 1.223,
+      "p99Ms": 1.839,
+      "p999Ms": 2.103,
+      "samplesOpsPerSec": [
+        162523.87,
+        161120.85,
+        161929.99,
+        161981.47,
+        161113.38,
+        162286.55,
+        162419.07,
+        161023.73,
+        161682.65,
+        161402.15
+      ],
+      "samplesP99Ms": [
+        1.831,
+        1.839,
+        1.839,
+        1.855,
+        1.839,
+        1.839,
+        1.823,
+        1.839,
+        1.863,
+        1.823
+      ],
+      "samplesClientCpuPct": [
+        9.2,
+        10,
+        10,
+        9.4,
+        9.4,
+        10.1,
+        9.9,
+        10.2,
+        10.3,
+        10.4
+      ],
+      "engineStats": {
+        "rssMb": 0,
+        "usedMemoryMb": 14.453468322753906,
+        "usedMemoryRssMb": 36.44140625,
+        "keyCount": 100000,
+        "hitRatio": 1
+      },
+      "config": {
+        "engineImage": "valkey/valkey:9.1.3",
+        "serverVersion": "9.1.3",
+        "maxmemoryBytes": 17179869184,
+        "threads": 1,
+        "memtierThreads": 25,
+        "memtierClients": 8,
+        "totalConnections": 200,
+        "memtierVersion": "2.5.1",
+        "cloudMode": true
+      },
+      "metrics": {
+        "throughput": {
+          "value": 161806.32,
+          "unit": "ops/s",
+          "label": "Throughput"
+        },
+        "kbPerSec": {
+          "value": 22334.235,
+          "unit": "KB/s",
+          "label": "Bandwidth"
+        },
+        "hitRatio": {
+          "value": 100,
+          "unit": "%",
+          "label": "Hit ratio"
+        },
+        "clientCpu": {
+          "value": 9.9,
+          "unit": "%",
+          "label": "Client CPU"
+        }
+      }
+    },
+    {
+      "label": "valkey/set-get-large",
+      "engine": "valkey",
+      "workload": "set-get-large",
+      "opsPerSec": 85525.535,
+      "p50Ms": 2.103,
+      "p99Ms": 4.079,
+      "p999Ms": 4.463,
+      "samplesOpsPerSec": [
+        85130.44,
+        84482.26,
+        84496.15,
+        84731.52,
+        85920.63,
+        85979.1,
+        83825.3,
+        86646.22,
+        93485.89,
+        92366.45
+      ],
+      "samplesP99Ms": [
+        4.079,
+        4.127,
+        4.127,
+        4.127,
+        4.015,
+        4.079,
+        4.191,
+        4.031,
+        3.567,
+        3.615
+      ],
+      "samplesClientCpuPct": [
+        7.7,
+        7.4,
+        7.8,
+        7.5,
+        7.6,
+        8.2,
+        8,
+        8.5,
+        9.1,
+        8.8
+      ],
+      "engineStats": {
+        "rssMb": 0,
+        "usedMemoryMb": 471.5037384033203,
+        "usedMemoryRssMb": 494.984375,
+        "keyCount": 40000,
+        "hitRatio": 1
+      },
+      "config": {
+        "engineImage": "valkey/valkey:9.1.3",
+        "serverVersion": "9.1.3",
+        "maxmemoryBytes": 17179869184,
+        "threads": 1,
+        "memtierThreads": 25,
+        "memtierClients": 8,
+        "totalConnections": 200,
+        "memtierVersion": "2.5.1",
+        "cloudMode": true
+      },
+      "metrics": {
+        "throughput": {
+          "value": 85525.535,
+          "unit": "ops/s",
+          "label": "Throughput"
+        },
+        "kbPerSec": {
+          "value": 858861.52,
+          "unit": "KB/s",
+          "label": "Bandwidth"
+        },
+        "hitRatio": {
+          "value": 100,
+          "unit": "%",
+          "label": "Hit ratio"
+        },
+        "clientCpu": {
+          "value": 8.1,
+          "unit": "%",
+          "label": "Client CPU"
+        }
+      }
+    },
+    {
+      "label": "valkey/pipeline-30",
+      "engine": "valkey",
+      "workload": "pipeline-30",
+      "opsPerSec": 1557586.38,
+      "p50Ms": 3.847,
+      "p99Ms": 8.383,
+      "p999Ms": 9.119,
+      "samplesOpsPerSec": [
+        1567434,
+        1562384.29,
+        1556751.92,
+        1558420.84,
+        1507206.99,
+        1551502.76,
+        1568795.78,
+        1593800.73,
+        1554557.08,
+        1480617.28
+      ],
+      "samplesP99Ms": [
+        8.511,
+        8.255,
+        8.575,
+        8.319,
+        8.959,
+        8.383,
+        8.383,
+        8.191,
+        8.255,
+        9.791
+      ],
+      "samplesClientCpuPct": [
+        6.3,
+        6.5,
+        6,
+        6.2,
+        6.1,
+        6.4,
+        6.2,
+        6.3,
+        6.4,
+        6.1
+      ],
+      "engineStats": {
+        "rssMb": 0,
+        "usedMemoryMb": 14.453468322753906,
+        "usedMemoryRssMb": 32.67578125,
+        "keyCount": 100000,
+        "hitRatio": 1
+      },
+      "config": {
+        "engineImage": "valkey/valkey:9.1.3",
+        "serverVersion": "9.1.3",
+        "maxmemoryBytes": 17179869184,
+        "threads": 1,
+        "memtierThreads": 25,
+        "memtierClients": 8,
+        "totalConnections": 200,
+        "memtierVersion": "2.5.1",
+        "cloudMode": true
+      },
+      "metrics": {
+        "throughput": {
+          "value": 1557586.38,
+          "unit": "ops/s",
+          "label": "Throughput"
+        },
+        "kbPerSec": {
+          "value": 214994.88,
+          "unit": "KB/s",
+          "label": "Bandwidth"
+        },
+        "hitRatio": {
+          "value": 100,
+          "unit": "%",
+          "label": "Hit ratio"
+        },
+        "clientCpu": {
+          "value": 6.3,
+          "unit": "%",
+          "label": "Client CPU"
+        }
+      }
+    },
+    {
+      "label": "valkey/memory-load-random",
+      "engine": "valkey",
+      "workload": "memory-load-random",
+      "opsPerSec": 0,
+      "p50Ms": 0,
+      "p99Ms": 0,
+      "p999Ms": 0,
+      "samplesOpsPerSec": [
+        0
+      ],
+      "samplesP99Ms": [
+        0
+      ],
+      "samplesClientCpuPct": [
+        0.3
+      ],
+      "engineStats": {
+        "rssMb": 0,
+        "usedMemoryMb": 160.34284210205078,
+        "usedMemoryRssMb": 174.9140625,
+        "keyCount": 1000000,
+        "hitRatio": 0
+      },
+      "config": {
+        "engineImage": "valkey/valkey:9.1.3",
+        "serverVersion": "9.1.3",
+        "maxmemoryBytes": 17179869184,
+        "threads": 1,
+        "memtierThreads": 1,
+        "memtierClients": 1,
+        "totalConnections": 1,
+        "memtierVersion": "2.5.1",
+        "cloudMode": true
+      },
+      "metrics": {
+        "usedMemoryDeltaMb": {
+          "value": 159.37,
+          "unit": "MB",
+          "label": "Used memory (delta)"
+        },
+        "rssDeltaMb": {
+          "value": 162.11,
+          "unit": "MB",
+          "label": "RSS (delta)"
+        },
+        "baselineUsedMb": {
+          "value": 0.97,
+          "unit": "MB",
+          "label": "Baseline used memory"
+        },
+        "baselineRssMb": {
+          "value": 12.81,
+          "unit": "MB",
+          "label": "Baseline RSS"
+        },
+        "keyCount": {
+          "value": 1000000,
+          "unit": "keys",
+          "label": "Key count"
+        },
+        "bytesPerKeyRss": {
+          "value": 170,
+          "unit": "B/key",
+          "label": "Memory per key (RSS)"
+        },
+        "bytesPerKeyUsed": {
+          "value": 167.1,
+          "unit": "B/key",
+          "label": "Memory per key (used_memory)"
+        },
+        "absoluteRssMb": {
+          "value": 174.91,
+          "unit": "MB",
+          "label": "RSS after the first load (absolute)"
+        },
+        "absoluteUsedMb": {
+          "value": 160.34,
+          "unit": "MB",
+          "label": "Used memory after the first load (absolute)"
+        },
+        "rssDeltaSecondMb": {
+          "value": 164.86,
+          "unit": "MB",
+          "label": "RSS (delta, second load)"
+        },
+        "usedMemoryDeltaSecondMb": {
+          "value": 161.61,
+          "unit": "MB",
+          "label": "Used memory (delta, second load)"
+        },
+        "keyCountSecond": {
+          "value": 1000000,
+          "unit": "keys",
+          "label": "Key count (second load)"
+        },
+        "bytesPerKeyRssSecond": {
+          "value": 172.9,
+          "unit": "B/key",
+          "label": "Memory per key (RSS, second load)"
+        },
+        "bytesPerKeyUsedSecond": {
+          "value": 169.5,
+          "unit": "B/key",
+          "label": "Memory per key (used_memory, second load)"
+        },
+        "clientCpu": {
+          "value": 0.3,
+          "unit": "%",
+          "label": "Client CPU"
+        }
+      }
+    }
+  ],
+  "failures": []
+}

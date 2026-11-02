@@ -1,0 +1,491 @@
+{
+  "generatedAt": "2026-11-01T23:47:37.655Z",
+  "smoke": false,
+  "sessionCount": 1,
+  "resultCount": 5,
+  "failureCount": 0,
+  "results": [
+    {
+      "label": "kividb/memory-load",
+      "engine": "kividb",
+      "workload": "memory-load",
+      "opsPerSec": 0,
+      "p50Ms": 0,
+      "p99Ms": 0,
+      "p999Ms": 0,
+      "samplesOpsPerSec": [
+        0
+      ],
+      "samplesP99Ms": [
+        0
+      ],
+      "samplesClientCpuPct": [
+        0.2
+      ],
+      "engineStats": {
+        "rssMb": 0,
+        "usedMemoryMb": 142.8303165435791,
+        "usedMemoryRssMb": 158.7109375,
+        "keyCount": 1000000,
+        "hitRatio": 0
+      },
+      "config": {
+        "engineImage": "kividb/kividb:v1.2.0-rc4",
+        "serverVersion": "1.2.0-rc4",
+        "maxmemoryBytes": 17179869184,
+        "threads": 0,
+        "memtierThreads": 1,
+        "memtierClients": 1,
+        "totalConnections": 1,
+        "memtierVersion": "2.5.1",
+        "cloudMode": true
+      },
+      "metrics": {
+        "usedMemoryDeltaMb": {
+          "value": 140.08,
+          "unit": "MB",
+          "label": "Used memory (delta)"
+        },
+        "rssDeltaMb": {
+          "value": 142.14,
+          "unit": "MB",
+          "label": "RSS (delta)"
+        },
+        "baselineUsedMb": {
+          "value": 2.75,
+          "unit": "MB",
+          "label": "Baseline used memory"
+        },
+        "baselineRssMb": {
+          "value": 16.57,
+          "unit": "MB",
+          "label": "Baseline RSS"
+        },
+        "keyCount": {
+          "value": 1000000,
+          "unit": "keys",
+          "label": "Key count"
+        },
+        "bytesPerKeyRss": {
+          "value": 149,
+          "unit": "B/key",
+          "label": "Memory per key (RSS)"
+        },
+        "bytesPerKeyUsed": {
+          "value": 146.9,
+          "unit": "B/key",
+          "label": "Memory per key (used_memory)"
+        },
+        "absoluteRssMb": {
+          "value": 158.71,
+          "unit": "MB",
+          "label": "RSS after the first load (absolute)"
+        },
+        "absoluteUsedMb": {
+          "value": 142.83,
+          "unit": "MB",
+          "label": "Used memory after the first load (absolute)"
+        },
+        "rssDeltaSecondMb": {
+          "value": 140.08,
+          "unit": "MB",
+          "label": "RSS (delta, second load)"
+        },
+        "usedMemoryDeltaSecondMb": {
+          "value": 140.07,
+          "unit": "MB",
+          "label": "Used memory (delta, second load)"
+        },
+        "keyCountSecond": {
+          "value": 1000000,
+          "unit": "keys",
+          "label": "Key count (second load)"
+        },
+        "bytesPerKeyRssSecond": {
+          "value": 146.9,
+          "unit": "B/key",
+          "label": "Memory per key (RSS, second load)"
+        },
+        "bytesPerKeyUsedSecond": {
+          "value": 146.9,
+          "unit": "B/key",
+          "label": "Memory per key (used_memory, second load)"
+        },
+        "clientCpu": {
+          "value": 0.2,
+          "unit": "%",
+          "label": "Client CPU"
+        }
+      }
+    },
+    {
+      "label": "kividb/set-get-small",
+      "engine": "kividb",
+      "workload": "set-get-small",
+      "opsPerSec": 952032.0349999999,
+      "p50Ms": 0.199,
+      "p99Ms": 0.383,
+      "p999Ms": 0.535,
+      "samplesOpsPerSec": [
+        945469.1,
+        973345.24,
+        949652.71,
+        933039.85,
+        954411.36,
+        943520.4,
+        1018823.52,
+        968818.01,
+        956896.19,
+        931461.54
+      ],
+      "samplesP99Ms": [
+        0.383,
+        0.383,
+        0.383,
+        0.391,
+        0.383,
+        0.383,
+        0.375,
+        0.383,
+        0.383,
+        0.383
+      ],
+      "samplesClientCpuPct": [
+        38.3,
+        39.7,
+        43.5,
+        38.1,
+        39.1,
+        37,
+        38.9,
+        42.9,
+        38.6,
+        37.8
+      ],
+      "engineStats": {
+        "rssMb": 0,
+        "usedMemoryMb": 16.39850616455078,
+        "usedMemoryRssMb": 38.90625,
+        "keyCount": 100000,
+        "hitRatio": 1
+      },
+      "config": {
+        "engineImage": "kividb/kividb:v1.2.0-rc4",
+        "serverVersion": "1.2.0-rc4",
+        "maxmemoryBytes": 17179869184,
+        "threads": 0,
+        "memtierThreads": 25,
+        "memtierClients": 8,
+        "totalConnections": 200,
+        "memtierVersion": "2.5.1",
+        "cloudMode": true
+      },
+      "metrics": {
+        "throughput": {
+          "value": 952032.0349999999,
+          "unit": "ops/s",
+          "label": "Throughput"
+        },
+        "kbPerSec": {
+          "value": 131409.76,
+          "unit": "KB/s",
+          "label": "Bandwidth"
+        },
+        "hitRatio": {
+          "value": 100,
+          "unit": "%",
+          "label": "Hit ratio"
+        },
+        "clientCpu": {
+          "value": 39.4,
+          "unit": "%",
+          "label": "Client CPU"
+        }
+      }
+    },
+    {
+      "label": "kividb/set-get-large",
+      "engine": "kividb",
+      "workload": "set-get-large",
+      "opsPerSec": 321116.56000000006,
+      "p50Ms": 0.623,
+      "p99Ms": 1.191,
+      "p999Ms": 1.327,
+      "samplesOpsPerSec": [
+        321447.55,
+        321514.12,
+        320950.59,
+        321296.87,
+        320418.87,
+        321448.54,
+        319944.47,
+        321282.53,
+        320511.94,
+        320558.46
+      ],
+      "samplesP99Ms": [
+        1.215,
+        1.247,
+        1.023,
+        1.055,
+        1.023,
+        1.199,
+        1.183,
+        1.223,
+        1.015,
+        1.207
+      ],
+      "samplesClientCpuPct": [
+        30.3,
+        23.5,
+        24.9,
+        26.7,
+        25,
+        28.7,
+        20.6,
+        27.9,
+        23.2,
+        22.6
+      ],
+      "engineStats": {
+        "rssMb": 0,
+        "usedMemoryMb": 396.4077682495117,
+        "usedMemoryRssMb": 799.3515625,
+        "keyCount": 40000,
+        "hitRatio": 1
+      },
+      "config": {
+        "engineImage": "kividb/kividb:v1.2.0-rc4",
+        "serverVersion": "1.2.0-rc4",
+        "maxmemoryBytes": 17179869184,
+        "threads": 0,
+        "memtierThreads": 25,
+        "memtierClients": 8,
+        "totalConnections": 200,
+        "memtierVersion": "2.5.1",
+        "cloudMode": true
+      },
+      "metrics": {
+        "throughput": {
+          "value": 321116.56000000006,
+          "unit": "ops/s",
+          "label": "Throughput"
+        },
+        "kbPerSec": {
+          "value": 3224705.5149999997,
+          "unit": "KB/s",
+          "label": "Bandwidth"
+        },
+        "hitRatio": {
+          "value": 100,
+          "unit": "%",
+          "label": "Hit ratio"
+        },
+        "clientCpu": {
+          "value": 25.3,
+          "unit": "%",
+          "label": "Client CPU"
+        }
+      }
+    },
+    {
+      "label": "kividb/pipeline-30",
+      "engine": "kividb",
+      "workload": "pipeline-30",
+      "opsPerSec": 14649783.245000001,
+      "p50Ms": 0.359,
+      "p99Ms": 0.787,
+      "p999Ms": 1.039,
+      "samplesOpsPerSec": [
+        14667151.95,
+        14627704.2,
+        14614158.69,
+        14587343.98,
+        14609084.66,
+        14633995.3,
+        14738636.6,
+        14665571.19,
+        14724734.75,
+        14760732.76
+      ],
+      "samplesP99Ms": [
+        0.807,
+        0.783,
+        0.799,
+        0.799,
+        0.791,
+        0.783,
+        0.783,
+        0.807,
+        0.767,
+        0.775
+      ],
+      "samplesClientCpuPct": [
+        56.8,
+        57.3,
+        56.8,
+        56.8,
+        62.6,
+        57,
+        63.5,
+        56.7,
+        58.1,
+        55.3
+      ],
+      "engineStats": {
+        "rssMb": 0,
+        "usedMemoryMb": 16.418163299560547,
+        "usedMemoryRssMb": 44.7421875,
+        "keyCount": 100000,
+        "hitRatio": 1
+      },
+      "config": {
+        "engineImage": "kividb/kividb:v1.2.0-rc4",
+        "serverVersion": "1.2.0-rc4",
+        "maxmemoryBytes": 17179869184,
+        "threads": 0,
+        "memtierThreads": 25,
+        "memtierClients": 8,
+        "totalConnections": 200,
+        "memtierVersion": "2.5.1",
+        "cloudMode": true
+      },
+      "metrics": {
+        "throughput": {
+          "value": 14649783.245000001,
+          "unit": "ops/s",
+          "label": "Throughput"
+        },
+        "kbPerSec": {
+          "value": 2022120.225,
+          "unit": "KB/s",
+          "label": "Bandwidth"
+        },
+        "hitRatio": {
+          "value": 100,
+          "unit": "%",
+          "label": "Hit ratio"
+        },
+        "clientCpu": {
+          "value": 58.1,
+          "unit": "%",
+          "label": "Client CPU"
+        }
+      }
+    },
+    {
+      "label": "kividb/memory-load-random",
+      "engine": "kividb",
+      "workload": "memory-load-random",
+      "opsPerSec": 0,
+      "p50Ms": 0,
+      "p99Ms": 0,
+      "p999Ms": 0,
+      "samplesOpsPerSec": [
+        0
+      ],
+      "samplesP99Ms": [
+        0
+      ],
+      "samplesClientCpuPct": [
+        0.3
+      ],
+      "engineStats": {
+        "rssMb": 0,
+        "usedMemoryMb": 142.82901191711426,
+        "usedMemoryRssMb": 158.73046875,
+        "keyCount": 1000000,
+        "hitRatio": 0
+      },
+      "config": {
+        "engineImage": "kividb/kividb:v1.2.0-rc4",
+        "serverVersion": "1.2.0-rc4",
+        "maxmemoryBytes": 17179869184,
+        "threads": 0,
+        "memtierThreads": 1,
+        "memtierClients": 1,
+        "totalConnections": 1,
+        "memtierVersion": "2.5.1",
+        "cloudMode": true
+      },
+      "metrics": {
+        "usedMemoryDeltaMb": {
+          "value": 140.08,
+          "unit": "MB",
+          "label": "Used memory (delta)"
+        },
+        "rssDeltaMb": {
+          "value": 142.29,
+          "unit": "MB",
+          "label": "RSS (delta)"
+        },
+        "baselineUsedMb": {
+          "value": 2.75,
+          "unit": "MB",
+          "label": "Baseline used memory"
+        },
+        "baselineRssMb": {
+          "value": 16.45,
+          "unit": "MB",
+          "label": "Baseline RSS"
+        },
+        "keyCount": {
+          "value": 1000000,
+          "unit": "keys",
+          "label": "Key count"
+        },
+        "bytesPerKeyRss": {
+          "value": 149.2,
+          "unit": "B/key",
+          "label": "Memory per key (RSS)"
+        },
+        "bytesPerKeyUsed": {
+          "value": 146.9,
+          "unit": "B/key",
+          "label": "Memory per key (used_memory)"
+        },
+        "absoluteRssMb": {
+          "value": 158.73,
+          "unit": "MB",
+          "label": "RSS after the first load (absolute)"
+        },
+        "absoluteUsedMb": {
+          "value": 142.83,
+          "unit": "MB",
+          "label": "Used memory after the first load (absolute)"
+        },
+        "rssDeltaSecondMb": {
+          "value": 139.96,
+          "unit": "MB",
+          "label": "RSS (delta, second load)"
+        },
+        "usedMemoryDeltaSecondMb": {
+          "value": 140.07,
+          "unit": "MB",
+          "label": "Used memory (delta, second load)"
+        },
+        "keyCountSecond": {
+          "value": 1000000,
+          "unit": "keys",
+          "label": "Key count (second load)"
+        },
+        "bytesPerKeyRssSecond": {
+          "value": 146.8,
+          "unit": "B/key",
+          "label": "Memory per key (RSS, second load)"
+        },
+        "bytesPerKeyUsedSecond": {
+          "value": 146.9,
+          "unit": "B/key",
+          "label": "Memory per key (used_memory, second load)"
+        },
+        "clientCpu": {
+          "value": 0.3,
+          "unit": "%",
+          "label": "Client CPU"
+        }
+      }
+    }
+  ],
+  "failures": []
+}

@@ -1,0 +1,7 @@
+WARNING: Consider upgrading security for your workloads using Azure Trusted Launch VMs. To know more about Trusted Launch, please visit https://aka.ms/TrustedLaunch.
+ResourceGroup      PowerState    PublicIpAddress    Fqdns    PrivateIpAddress    MacAddress         Location
+-----------------  ------------  -----------------  -------  ------------------  -----------------  -------------
+kividb-rc4-memory  VM running    20.215.49.180               10.31.0.4           E4-FA-DE-17-C0-C1  polandcentral
+ERROR: (InvalidScheduleLocation) The schedule should be created in location polandcentral.
+Code: InvalidScheduleLocation
+Message: The schedule should be created in location polandcentral.

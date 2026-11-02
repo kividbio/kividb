@@ -1,0 +1,25 @@
+# Persistence
+loading:0
+async_loading:0
+aof_enabled:1
+rdb_last_save_time:1793592723
+rdb_changes_since_last_save:62312
+rdb_bgsave_in_progress:0
+rdb_saves:1
+rdb_last_bgsave_time_sec:1793592723
+rdb_last_bgsave_status:ok
+rdb_last_cow_size:0
+backup_in_progress:0
+aof_rewrite_in_progress:0
+aof_rewrite_scheduled:0
+aof_last_rewrite_time_sec:-1
+aof_last_rewrite_time_ms:-1
+aof_last_bgrewrite_status:ok
+aof_current_size:9891269685
+aof_base_size:9837463911
+aof_lost_records:0
+aof_last_write_status:ok
+aof_last_cow_size:0
+module_fork_in_progress:0
+module_fork_last_cow_size:0
+
