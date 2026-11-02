@@ -756,6 +756,9 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
             &compaction_tx,
             &repl_state,
         );
+        // The expiry task started watching before anything was loaded: the
+        // hashes with field TTLs are the ones just loaded.
+        crate::field_expiry::rescan(&store);
         // A cluster master killed with no AOF has only what it last saved,
         // if anything: it serves none of its slots until its replica, which
         // may hold the data, has taken over or said it holds nothing.
@@ -1553,6 +1556,9 @@ async fn async_main_tokio(
             &compaction_tx,
             &repl_state,
         );
+        // The expiry task started watching before anything was loaded: the
+        // hashes with field TTLs are the ones just loaded.
+        crate::field_expiry::rescan(&store);
         // A cluster master killed with no AOF has only what it last saved,
         // if anything: it serves none of its slots until its replica, which
         // may hold the data, has taken over or said it holds nothing.
