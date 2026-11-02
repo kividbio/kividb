@@ -484,7 +484,11 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   [@osokin](https://github.com/osokin), who maintains the FreeBSD port).
   Raising the open-file limit used `div_ceil` on `rlim_t`, which is
   unsigned on Linux and macOS but signed on FreeBSD, where `div_ceil` is
-  not stable, so 1.1.3 did not compile there.
+  not stable, so 1.1.3 did not compile there. Two more came out of the
+  same difference: an open-file limit at or below what the server keeps
+  for itself left room for every client instead of none, and
+  `used_memory_rss` was 0 (`INFO memory`, `MEMORY STATS`). Checked on
+  FreeBSD 14.4 with every feature set.
 
 - **The ACL checks the keys `SORT`, `GEORADIUS` and `XREADGROUP` use.**
   `SORT` writes to the destination of its last `STORE`, and `GEORADIUS` and
