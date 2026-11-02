@@ -1,6 +1,6 @@
 === tarball-default-amd64 (bin /home/azureuser/rc-bin/x-default/kividb/kividb, variant default) ===
 PASS: starts and answers PING with PONG
-PASS: --version says 1.2.0-rc4 (kividb 1.2.0-rc4)
+PASS: --version says 1.2.0-rc7 (kividb 1.2.0-rc7)
 PASS: INFO kividb_version
 PASS: INFO has # Server
 PASS: INFO has # Clients
@@ -34,7 +34,7 @@ PASS: set SCARD
 PASS: zset ZADD
 PASS: zset ZRANGE WITHSCORES
 PASS: zset ZSCORE
-PASS: stream XADD (1793573773379-0)
+PASS: stream XADD (1793650169669-0)
 PASS: stream XLEN
 PASS: hll PFADD
 PASS: hll PFCOUNT
@@ -52,7 +52,7 @@ PASS: FT.SEARCH tag
 PASS: no Lua in this variant: EVAL refused
 PASS: no TLS in this variant: --tls-port refused at start
 PASS: CONFIG GET appendonly
-/home/azureuser/smoke/harness/smoke_artifact.sh: line 80: 65596 Killed                  ( cd "$DATA" && exec "$REF" --protected-mode no --port "$PORT" --dir "$DATA" --aof $(args_for "$CERTS") >> "$WORK/server.log" 2>&1 )
+/home/azureuser/src/benchmarks/1.2.0/smoke/harness/smoke_artifact.sh: line 80: 18102 Killed                  ( cd "$DATA" && exec "$REF" --protected-mode no --port "$PORT" --dir "$DATA" --aof $(args_for "$CERTS") >> "$WORK/server.log" 2>&1 )
 PASS: restarts after kill -9
 PASS: kill -9 + AOF replay: DBSIZE back (20019)
 PASS: kill -9 + AOF replay: every checked value back
@@ -60,3 +60,4 @@ PASS: restarts after a clean shutdown
 PASS: clean shutdown + snapshot load: every checked value back
 PASS: INFO still says version after restarts
 RESULT tarball-default-amd64 59 0 
+/home/azureuser/src/benchmarks/1.2.0/smoke/harness/smoke_artifact.sh: line 85: 18442 Killed                  ( cd "$DATA" && exec "$REF" --protected-mode no --port "$PORT" --dir "$DATA" --aof $(args_for "$CERTS") >> "$WORK/server.log" 2>&1 )

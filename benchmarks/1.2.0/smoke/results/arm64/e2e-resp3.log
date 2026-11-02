@@ -46,4 +46,4 @@ modules/test_strings.py ................................................ [ 89%]
 modules/test_transactions.py .................................           [ 96%]
 modules/test_vector_search.py .......................................... [100%]
 
-========== 1171 passed, 65 skipped, 2 deselected in 86.48s (0:01:26) ===========
+========== 1171 passed, 65 skipped, 2 deselected in 85.97s (0:01:25) ===========

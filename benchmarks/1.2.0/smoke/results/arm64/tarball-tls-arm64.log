@@ -1,6 +1,6 @@
 === tarball-tls-arm64 (bin /home/azureuser/rc-bin/x-tls/kividb/kividb, variant tls) ===
 PASS: starts and answers PING with PONG
-PASS: --version says 1.2.0-rc4 (kividb 1.2.0-rc4)
+PASS: --version says 1.2.0-rc7 (kividb 1.2.0-rc7)
 PASS: INFO kividb_version
 PASS: INFO has # Server
 PASS: INFO has # Clients
@@ -34,7 +34,7 @@ PASS: set SCARD
 PASS: zset ZADD
 PASS: zset ZRANGE WITHSCORES
 PASS: zset ZSCORE
-PASS: stream XADD (1793573778564-0)
+PASS: stream XADD (1793650177392-0)
 PASS: stream XLEN
 PASS: hll PFADD
 PASS: hll PFCOUNT
@@ -55,7 +55,7 @@ PASS: TLS SET/GET
 PASS: TLS without a client certificate refused
 PASS: TLS INFO tls_port
 PASS: CONFIG GET appendonly
-/home/azureuser/smoke/harness/smoke_artifact.sh: line 80: 43854 Killed                  ( cd "$DATA" && exec "$REF" --protected-mode no --port "$PORT" --dir "$DATA" --aof $(args_for "$CERTS") >> "$WORK/server.log" 2>&1 )
+/home/azureuser/src/benchmarks/1.2.0/smoke/harness/smoke_artifact.sh: line 80: 18945 Killed                  ( cd "$DATA" && exec "$REF" --protected-mode no --port "$PORT" --dir "$DATA" --aof $(args_for "$CERTS") >> "$WORK/server.log" 2>&1 )
 PASS: restarts after kill -9
 PASS: kill -9 + AOF replay: DBSIZE back (20020)
 PASS: kill -9 + AOF replay: every checked value back
@@ -63,3 +63,4 @@ PASS: restarts after a clean shutdown
 PASS: clean shutdown + snapshot load: every checked value back
 PASS: INFO still says version after restarts
 RESULT tarball-tls-arm64 62 0 
+/home/azureuser/src/benchmarks/1.2.0/smoke/harness/smoke_artifact.sh: line 85: 19301 Killed                  ( cd "$DATA" && exec "$REF" --protected-mode no --port "$PORT" --dir "$DATA" --aof $(args_for "$CERTS") >> "$WORK/server.log" 2>&1 )

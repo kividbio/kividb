@@ -1,0 +1,25 @@
+Updating and loading repositories:
+ Fedora 41 - x86_64 - Updates           100% | 945.9 KiB/s |  11.3 MiB |  00m12s
+ Fedora 41 openh264 (From Cisco) - x86_ 100% | 501.0   B/s |   5.8 KiB |  00m12s
+ Fedora 41 - x86_64                     100% |   2.3 MiB/s |  35.5 MiB |  00m15s
+Repositories loaded.
+Total size of inbound packages is 6 MiB. Need to download 0 B.
+After this operation, 15 MiB extra will be used (install 15 MiB, remove 0 B).
+Running transaction
+Package Arch   Version     Repository        Size
+Installing:
+ kividb x86_64 1.2.0~rc7-1 @commandline  15.5 MiB
+
+Transaction Summary:
+ Installing:         1 package
+
+[1/3] Verify package files              100% | 200.0   B/s |   1.0   B |  00m00s
+[2/3] Prepare transaction               100% |   9.0   B/s |   1.0   B |  00m00s
+>>> Running %pre scriptlet: kividb-0:1.2.0~rc7-1.x86_64                         
+>>> Finished %pre scriptlet: kividb-0:1.2.0~rc7-1.x86_64                        
+>>> Scriptlet output:                                                           
+>>> useradd: Warning: missing or non-executable shell '/usr/sbin/nologin'       
+>>>                                                                             
+[3/3] Installing kividb-0:1.2.0~rc7-1.x 100% |  17.2 MiB/s |  15.5 MiB |  00m01s
+Warning: skipped OpenPGP checks for 1 package from repository: @commandline
+Complete!

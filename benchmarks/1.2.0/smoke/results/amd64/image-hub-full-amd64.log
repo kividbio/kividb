@@ -1,6 +1,6 @@
-=== image-hub-full-amd64 (image docker.io/kividb/kividb:v1.2.0-rc4-full, variant full) ===
+=== image-hub-full-amd64 (image docker.io/kividb/kividb:v1.2.0-rc7-full, variant full) ===
 PASS: starts and answers PING with PONG
-PASS: --version says 1.2.0-rc4 (kividb 1.2.0-rc4)
+PASS: --version says 1.2.0-rc7 (kividb 1.2.0-rc7)
 PASS: INFO kividb_version
 PASS: INFO has # Server
 PASS: INFO has # Clients
@@ -34,7 +34,7 @@ PASS: set SCARD
 PASS: zset ZADD
 PASS: zset ZRANGE WITHSCORES
 PASS: zset ZSCORE
-PASS: stream XADD (1793573742861-0)
+PASS: stream XADD (1793650139133-0)
 PASS: stream XLEN
 PASS: hll PFADD
 PASS: hll PFCOUNT

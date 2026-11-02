@@ -1,0 +1,33 @@
+Amazon Linux 2023 repository                     35 MB/s |  84 MB     00:02    
+Last metadata expiration check: 0:00:15 ago on Mon Nov  2 20:17:16 2026.
+Dependencies resolved.
+================================================================================
+ Package        Architecture   Version               Repository            Size
+================================================================================
+Installing:
+ kividb         x86_64         1.2.0~rc7-1           @commandline         6.0 M
+
+Transaction Summary
+================================================================================
+Install  1 Package
+
+Total size: 6.0 M
+Installed size: 15 M
+Downloading Packages:
+Running transaction check
+Transaction check succeeded.
+Running transaction test
+Transaction test succeeded.
+Running transaction
+  Preparing        :                                                        1/1 
+  Running scriptlet: kividb-1.2.0~rc7-1.x86_64                              1/1 
+/var/tmp/rpm-tmp.X9wUke: line 7: groupadd: command not found
+error: %prein(kividb-1.2.0~rc7-1.x86_64) scriptlet failed, exit status 127
+
+Error in PREIN scriptlet in rpm package kividb
+  Verifying        : kividb-1.2.0~rc7-1.x86_64                              1/1Error: Transaction failed
+ 
+
+Failed:
+  kividb-1.2.0~rc7-1.x86_64                                                     
+

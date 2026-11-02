@@ -1,9 +1,18 @@
-=== rpm-amd64 (rpm /home/azureuser/rc-bin/v1.2.0-rc4/kividb.x86_64.rpm, variant default) ===
+=== rpm-amd64 (rpm /home/azureuser/rc-bin/v1.2.0-rc7/kividb.x86_64.rpm, variant default) ===
+Unable to find image 'amazonlinux:2023' locally
+2023: Pulling from library/amazonlinux
+da3e7a9e0d7c: Pulling fs layer
+da3e7a9e0d7c: Download complete
+ff74ac6f42a1: Download complete
+716ced900b99: Download complete
+da3e7a9e0d7c: Pull complete
+Digest: sha256:c04a1012acc483977f61f7f91c28624a39a621e56a59781319a75dec528be9b6
+Status: Downloaded newer image for amazonlinux:2023
 NOTE: rpm does not install on the minimal amazonlinux:2023 image (no shadow-utils; the package does not require it): Error in PREIN scriptlet in rpm package kividb
 PASS: rpm: dnf install on Amazon Linux 2023 (with shadow-utils, as on a full host)
 PASS: rpm: /usr/bin/kividb and the kividb user exist
 PASS: starts and answers PING with PONG
-PASS: --version says 1.2.0-rc4 (kividb 1.2.0-rc4)
+PASS: --version says 1.2.0-rc7 (kividb 1.2.0-rc7)
 PASS: INFO kividb_version
 PASS: INFO has # Server
 PASS: INFO has # Clients
@@ -37,7 +46,7 @@ PASS: set SCARD
 PASS: zset ZADD
 PASS: zset ZRANGE WITHSCORES
 PASS: zset ZSCORE
-PASS: stream XADD (1793573819489-0)
+PASS: stream XADD (1793650219505-0)
 PASS: stream XLEN
 PASS: hll PFADD
 PASS: hll PFCOUNT

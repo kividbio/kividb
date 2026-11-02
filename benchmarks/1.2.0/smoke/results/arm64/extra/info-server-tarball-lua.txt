@@ -1,0 +1,25 @@
+# Server
+redis_version:8.10.0
+redis_git_sha1:00000000
+redis_git_dirty:0
+redis_build_id:120-rc7
+redis_mode:standalone
+arch_bits:64
+kividb_version:1.2.0-rc7
+kividb_expired_keys_propagated:1
+os:linux aarch64
+tcp_port:6381
+process_id:46596
+run_id:00000000267c7e2e00000000dead08eb267cc82a
+uptime_in_seconds:0
+uptime_in_days:0
+hz:10
+configured_hz:10
+multiplexing_api:io_uring
+atomicvar_api:atomic-builtin
+gcc_version:0.0.0
+config_file:
+slowlog_log_slower_than:-1
+slowlog_max_len:128
+executable:/tmp/tmp.fc4Sfd2EiH/kividb/kividb
+

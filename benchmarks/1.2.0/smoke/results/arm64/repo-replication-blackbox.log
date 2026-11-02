@@ -1,4 +1,4 @@
-=== testing image: ghcr.io/kividbio/kividb:v1.2.0-rc4 ===
+=== testing image: ghcr.io/kividbio/kividb:v1.2.0-rc7 ===
 === starting master-a, master-b, replica ===
 
 === baseline: SET on master-a, REPLICAOF replica -> master-a ===
@@ -30,6 +30,6 @@ PASS: REPLICAOF NO ONE issued on replica
 PASS: role:master after REPLICAOF NO ONE
 PASS: promotion clears the recorded master (master_host absent)
 
-=== summary: 19 passed, 0 failed (image: ghcr.io/kividbio/kividb:v1.2.0-rc4) ===
+=== summary: 19 passed, 0 failed (image: ghcr.io/kividbio/kividb:v1.2.0-rc7) ===
 
 === tearing down ===
