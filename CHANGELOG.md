@@ -20,6 +20,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   loaded. A name that is not a command is omitted, as Redis omits it. Arity
   and key positions stay on `COMMAND` / `COMMAND INFO`.
 
+### Changed
+
+- **`key-access-tracking` is `yes` by default** (#21). Every key entry's header
+  now keeps the 32-bit access word in place, so keeping the LRU clock or LFU
+  count under every policy costs no extra memory. `OBJECT IDLETIME` and
+  `RESTORE ... IDLETIME` work under `noeviction` by default as in Redis, and
+  metadata inspection commands (`TTL`, `TYPE`, `EXISTS`, `OBJECT`, `DUMP`,
+  `MEMORY`) leave a key's idle time untouched.
+
 ## [1.2.0]
 
 See [docs/releases/v1.2.0.md](docs/releases/v1.2.0.md) for what to check before upgrading.

@@ -709,14 +709,20 @@ fn key_access_tracking_keeps_idle_time_under_noeviction() {
         other => panic!("{other:?}"),
     };
     assert_eq!(get(&mut c, "maxmemory-policy"), "noeviction");
-    assert_eq!(get(&mut c, "key-access-tracking"), "no");
+    assert_eq!(get(&mut c, "key-access-tracking"), "yes");
     assert!(c.cmd(&["SET", "untracked", "bar"]).ok());
     std::thread::sleep(Duration::from_millis(1100));
-    assert_eq!(c.cmd(&["OBJECT", "IDLETIME", "untracked"]).i(), 0);
+    assert!(c.cmd(&["OBJECT", "IDLETIME", "untracked"]).i() >= 1);
     assert!(
         c.cmd(&["CONFIG", "SET", "key-access-tracking", "maybe"])
             .is_err()
     );
+
+    assert!(c.cmd(&["CONFIG", "SET", "key-access-tracking", "no"]).ok());
+    assert_eq!(get(&mut c, "key-access-tracking"), "no");
+    assert!(c.cmd(&["SET", "no_tracking", "bar"]).ok());
+    std::thread::sleep(Duration::from_millis(1100));
+    assert_eq!(c.cmd(&["OBJECT", "IDLETIME", "no_tracking"]).i(), 0);
 
     assert!(c.cmd(&["CONFIG", "SET", "key-access-tracking", "yes"]).ok());
     assert_eq!(get(&mut c, "key-access-tracking"), "yes");
@@ -727,8 +733,13 @@ fn key_access_tracking_keeps_idle_time_under_noeviction() {
         assert!(!c.cmd(&[command, "foo"]).is_err(), "{command}");
     }
     c.cmd(&["OBJECT", "ENCODING", "foo"]);
+    let _ = c.dump("foo");
+    c.cmd(&["MEMORY", "USAGE", "foo"]);
     let idle = c.cmd(&["OBJECT", "IDLETIME", "foo"]).i();
-    assert!(idle >= 2, "idle {idle} after TTL, TYPE, EXISTS and OBJECT");
+    assert!(
+        idle >= 2,
+        "idle {idle} after TTL, TYPE, EXISTS, DUMP, MEMORY and OBJECT"
+    );
 
     assert_eq!(c.cmd(&["TOUCH", "foo"]).i(), 1);
     assert!(
@@ -740,6 +751,13 @@ fn key_access_tracking_keeps_idle_time_under_noeviction() {
         c.cmd(&["OBJECT", "IDLETIME", "other"]).i() < 2,
         "GET uses it"
     );
+
+    // RESTORE ... IDLETIME sets idle time under the default noeviction policy.
+    let payload = c.dump("foo");
+    c.cmd(&["DEL", "foo"]);
+    assert!(c.restore("foo", &payload, &["IDLETIME", "1000"]).ok());
+    let idle = c.cmd(&["OBJECT", "IDLETIME", "foo"]).i();
+    assert!((1000..=1010).contains(&idle), "restored idle {idle}");
 }
 
 /// `CONFIG SET maxmemory-policy` between the LRU and LFU kinds at runtime:

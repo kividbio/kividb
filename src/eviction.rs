@@ -132,10 +132,10 @@ enum Track {
 }
 
 static POLICY: AtomicU8 = AtomicU8::new(Policy::NoEviction as u8);
-static RECORDING: AtomicBool = AtomicBool::new(false);
-static TRACK: AtomicU8 = AtomicU8::new(Track::Off as u8);
+static RECORDING: AtomicBool = AtomicBool::new(true);
+static TRACK: AtomicU8 = AtomicU8::new(Track::Used as u8);
 /// `key-access-tracking`: record use whatever the policy.
-static TRACK_ALWAYS: AtomicBool = AtomicBool::new(false);
+static TRACK_ALWAYS: AtomicBool = AtomicBool::new(true);
 static SAMPLES: AtomicUsize = AtomicUsize::new(5);
 static LFU_LOG_FACTOR: AtomicU32 = AtomicU32::new(10);
 static LFU_DECAY_MINUTES: AtomicU32 = AtomicU32::new(1);
@@ -177,10 +177,9 @@ pub fn set_policy(policy: Policy) {
 
 /// `key-access-tracking`: whether a key's use is recorded under every
 /// policy, so that `OBJECT IDLETIME` and `FREQ` report it under
-/// `noeviction` too, as Redis does (#21). Off by default: recording costs
-/// every command a second lookup of each of its keys, under its shard's read
-/// lock (it costs a key nothing: the word is in every entry anyway). Under
-/// an LRU or LFU policy it is recorded either way.
+/// `noeviction` too, as Redis does (#21). On by default:
+/// the access word is in each entry's header. Under an LRU or LFU policy
+/// it is recorded either way.
 pub fn key_access_tracking() -> bool {
     TRACK_ALWAYS.load(Ordering::Relaxed)
 }

@@ -1129,7 +1129,7 @@ fn run_command(ctx: &mut Ctx, name: &str) -> Vec<u8> {
     if crate::eviction::recording()
         && !matches!(
             name,
-            "OBJECT" | "TYPE" | "TTL" | "PTTL" | "EXPIRETIME" | "PEXPIRETIME" | "EXISTS" | "DEBUG"
+            "OBJECT" | "TYPE" | "TTL" | "PTTL" | "EXPIRETIME" | "PEXPIRETIME" | "EXISTS" | "DEBUG" | "DUMP" | "MEMORY"
             // Records its own use, with what IDLETIME or FREQ said.
             | "RESTORE"
         )
