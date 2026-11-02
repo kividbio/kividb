@@ -1,0 +1,2 @@
+1793578302.968331577 kill -9 master (aof-ack-after-write no)
+1793578308.253058231 master restarted

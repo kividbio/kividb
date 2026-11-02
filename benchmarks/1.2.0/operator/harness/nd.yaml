@@ -1,0 +1,15 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: {name: nd, namespace: e2e}
+spec:
+  selector: {matchLabels: {app: nd}}
+  template:
+    metadata: {labels: {app: nd}}
+    spec:
+      hostPID: true
+      tolerations: [{operator: Exists}]
+      containers:
+        - name: d
+          image: ubuntu:24.04
+          command: ["sleep", "infinity"]
+          securityContext: {privileged: true}

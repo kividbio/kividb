@@ -1,0 +1,6 @@
+1793587855.596385680 kill -9 master as checkpoint 1 starts
+1793587859.801750772 master restarted
+1793587870.037917043 kill -9 master as checkpoint 2 starts
+1793587874.460874972 master restarted
+1793587894.693690095 kill -9 master as checkpoint 3 starts
+1793587899.856873830 master restarted

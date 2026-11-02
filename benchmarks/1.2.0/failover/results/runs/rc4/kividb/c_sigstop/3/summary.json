@@ -1,0 +1,37 @@
+{
+ "mode": "cluster",
+ "writers": 16,
+ "duration_s": 80.0,
+ "acked": 667659,
+ "unacked_errors": 32,
+ "lost_acked": 0,
+ "wrong_value": 0,
+ "wait_n": 0,
+ "wait_acked": 0,
+ "wait_acked_lost": 0,
+ "lost_ack_time_first": null,
+ "lost_ack_time_last": null,
+ "lost_sample": [],
+ "events": [
+  [
+   20.28,
+   "SIGSTOP master 10.40.1.9:7001"
+  ],
+  [
+   50.563,
+   "SIGCONT master"
+  ]
+ ],
+ "recovery": {
+  "event_t": 20.28,
+  "pre_event_ok_per_100ms_median": 962,
+  "first_error_t": 22.3,
+  "last_error_t": 26.5,
+  "writes_below_80pct_from_t": 20.200000000000003,
+  "throughput_back_t": 27.6,
+  "recovery_s": 7.32
+ },
+ "error_kinds": {
+  "TimeoutError:Timeout": 32
+ }
+}

@@ -1,0 +1,6 @@
+manager:
+  image: {repository: ACR.azurecr.io/kividb-operator, tag: "0.7.0-eefe65d", pullPolicy: Always}
+agent:
+  image: {repository: ACR.azurecr.io/kividb-operator-agent, tag: "0.7.0-eefe65d", pullPolicy: Always}
+gui:
+  image: {repository: ACR.azurecr.io/kividb-operator-gui, tag: "0.7.0-eefe65d", pullPolicy: Always}

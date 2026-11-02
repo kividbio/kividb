@@ -1,0 +1,38 @@
+{
+ "mode": "standalone",
+ "writers": 16,
+ "duration_s": 60.0,
+ "acked": 574722,
+ "unacked_errors": 3821,
+ "lost_acked": 0,
+ "wrong_value": 0,
+ "wait_n": 0,
+ "wait_acked": 0,
+ "wait_acked_lost": 0,
+ "lost_ack_time_first": null,
+ "lost_ack_time_last": null,
+ "lost_sample": [],
+ "events": [
+  [
+   20.29,
+   "kill -9 master (aof-ack-after-write no)"
+  ],
+  [
+   25.574,
+   "master restarted"
+  ]
+ ],
+ "recovery": {
+  "event_t": 20.29,
+  "pre_event_ok_per_100ms_median": 1026,
+  "first_error_t": 20.200000000000003,
+  "last_error_t": 25.5,
+  "writes_below_80pct_from_t": 20.3,
+  "throughput_back_t": 25.700000000000003,
+  "recovery_s": 5.41
+ },
+ "error_kinds": {
+  "ConnectionError:Connection": 1,
+  "ConnectionError:Error": 3820
+ }
+}
