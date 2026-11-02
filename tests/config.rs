@@ -1174,8 +1174,39 @@ fn latency_percentiles_refuse_what_is_not_a_list_of_numbers() {
     }
     assert_eq!(get(&mut c), "25 75", "a refused value is not kept");
 
-    for good in ["0 100", "1e1", "", "50 99 99.9"] {
+    for good in ["0 100", "", "50 99 99.9"] {
         assert!(set(&mut c, good).is_ok(), "{good:?}");
         assert_eq!(get(&mut c), good);
     }
+
+    // Numbers are read as Redis's `string2d` (`strtod`) reads them, C
+    // hexadecimal floats included, and `CONFIG GET` shows each as `%f` with
+    // trailing zeros trimmed, as Redis does.
+    for (good, shown) in [
+        ("1e1", "10"),
+        ("0x10", "16"),
+        ("0X1p-1 0x1.8p1", "0.5 3"),
+        ("+50.0 99.90", "50 99.9"),
+        ("0x0 0e0 0.000", "0 0 0"),
+    ] {
+        assert!(set(&mut c, good).is_ok(), "{good:?}");
+        assert_eq!(get(&mut c), shown, "{good:?}");
+    }
+    // Too small for a double (strtod's ERANGE with a zero result), or not
+    // all of the word a number, is refused as Redis refuses it.
+    for bad in ["1e-400", "0x1p-1100", "0x", "0x1g", "50 ", "0x10 abc"] {
+        let reply = set(&mut c, bad);
+        assert!(
+            matches!(&reply, RespValue::Error(e) if e == invalid),
+            "{bad:?}: {reply:?}"
+        );
+    }
+    // Hexadecimal that is out of range is refused for its range.
+    let reply = set(&mut c, "0x65");
+    assert!(
+        matches!(&reply, RespValue::Error(e) if e == range),
+        "0x65: {reply:?}"
+    );
+    assert_eq!(get(&mut c), "0 0 0", "a refused value is not kept");
+    assert!(set(&mut c, "50 99 99.9").is_ok());
 }

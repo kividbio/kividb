@@ -1939,6 +1939,15 @@ mod config_file_tests {
         assert_eq!(now().as_deref(), Some("0 100"));
         load("latency-tracking-info-percentiles \"50 99 99.9\"\n").unwrap();
         assert_eq!(now().as_deref(), Some("50 99 99.9"));
+        load("latency-tracking-info-percentiles 0x10 0x1p-1\n").unwrap();
+        assert_eq!(now().as_deref(), Some("16 0.5"));
+        for bad in ["0x65", "1e-400", "0x1g"] {
+            let err = load(&format!("latency-tracking-info-percentiles {bad}\n")).unwrap_err();
+            assert!(
+                err.contains("latency-tracking-info-percentiles"),
+                "{bad}: {err}"
+            );
+        }
         load("latency-tracking-info-percentiles 50 99 99.9\n").unwrap();
         assert_eq!(now().as_deref(), Some("50 99 99.9"));
     }
