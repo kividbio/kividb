@@ -697,6 +697,7 @@ fn write_queued(
     let mut wrote = false;
     let mut released = false;
     let mut barriers = Vec::new();
+    let mut drained = 0usize;
     loop {
         let mut batch = Vec::new();
         let mark = match first.take() {
@@ -717,15 +718,23 @@ fn write_queued(
         // here, not on the next pass: what no reply waits for (a replica's
         // stream) may have no next pass but the second's sync, and one batch
         // a second fell behind 40 MB/s of writes, with the queue, and the
-        // turn-over of a checkpoint behind it, growing without end.
+        // turn-over of a checkpoint behind it, growing without end. Not for
+        // ever, though: with writes coming faster than the disk takes them
+        // the queue never empties, and whoever holds the log would keep it,
+        // the second's sync waiting behind. Past a budget, the writer thread
+        // is woken to go on, and the sync gets its turn.
         let more_queued = batch.len() >= MAX_AOF_BATCH_BYTES;
+        drained += batch.len();
         wrote |= !batch.is_empty();
         write_batch(file, &batch);
         released |= !barriers.is_empty();
         release_barriers(&mut barriers);
         let Some(generation) = mark else {
             if more_queued {
-                continue;
+                if drained < MAX_AOF_PASS_BYTES {
+                    continue;
+                }
+                QUEUED.notify_one();
             }
             return (wrote, released);
         };
@@ -961,6 +970,10 @@ fn sync_dir() -> std::io::Result<()> {
 /// single write. Capped so one burst cannot hand the kernel an arbitrarily
 /// large buffer; whatever is left stays queued and goes out on the next pass.
 const MAX_AOF_BATCH_BYTES: usize = 4 * 1024 * 1024;
+
+/// How much one pass over the queue writes, at most, before it lets the log
+/// go (see [`write_queued`]): about a second of a fast disk's writes.
+const MAX_AOF_PASS_BYTES: usize = 64 * 1024 * 1024;
 
 /// How long the writer stays away from its queue after a write. It adds this
 /// much, at most, to how long a record written under load waits to reach
@@ -2877,6 +2890,33 @@ mod backlog_tests {
         assert!(wrote);
         assert!(!released);
         assert!(rx.try_recv().is_err(), "nothing is left queued");
+        let len = std::fs::metadata(&path).expect("metadata").len();
+        assert_eq!(len, (records * record.len()) as u64);
+    }
+
+    /// One pass lets the log go after its budget, so that a queue fed
+    /// faster than the disk takes it does not keep the second's sync out;
+    /// the rest goes on the next.
+    #[test]
+    fn a_pass_stops_at_its_budget_and_the_next_takes_the_rest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("appendonly.aof");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("open");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let record = vec![b'x'; MAX_AOF_BATCH_BYTES];
+        let records = MAX_AOF_PASS_BYTES / record.len() + 3;
+        for _ in 0..records {
+            tx.send(record.clone()).expect("send");
+        }
+        write_queued(&mut file, &mut rx, None);
+        let len = std::fs::metadata(&path).expect("metadata").len();
+        assert_eq!(len, MAX_AOF_PASS_BYTES as u64, "one pass writes its budget");
+        write_queued(&mut file, &mut rx, None);
+        assert!(rx.try_recv().is_err(), "the next pass takes the rest");
         let len = std::fs::metadata(&path).expect("metadata").len();
         assert_eq!(len, (records * record.len()) as u64);
     }
