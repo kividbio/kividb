@@ -180,6 +180,10 @@ pub fn definite(mut reply: Vec<u8>) -> Vec<u8> {
 
 const DEFINITE: u8 = 0x01;
 
+/// How long a reply waits on the clients its command woke. See
+/// [`BlockingSlot::settle`].
+const WOKEN_BOUND: Duration = Duration::from_millis(100);
+
 /// What a resumed blocking command was handed: the key that fired and the value
 /// delivered through the handoff, or `None` if the wait timed out.
 ///
@@ -215,12 +219,19 @@ pub struct BlockingSlot {
     /// True while the current dispatch *is* a resume. Guards against a handler
     /// that parks again after being resumed, which would spin the loop forever.
     in_resume: bool,
+    /// Held from the end of a wait until this client has looked at its keys
+    /// and either replied or waited again: whoever woke it is holding its own
+    /// reply until then. See [`crate::wait_table::take_woken`].
+    looked: Vec<oneshot::Sender<()>>,
+    /// The clients the last dispatch woke. See [`settle`](Self::settle).
+    woken: Vec<oneshot::Receiver<()>>,
 }
 
 impl BlockingSlot {
     /// Prepare the slot for the next dispatch and hand out the borrow that
     /// goes into `Ctx`.
     pub fn prime(&mut self) -> &mut BlockingCtl {
+        crate::wait_table::collect_woken();
         self.ctl.awaitable = true;
         self.ctl.parked = None;
         match self.pending.take() {
@@ -239,8 +250,44 @@ impl BlockingSlot {
     }
 
     /// Take the wait a handler parked during the dispatch just completed.
+    ///
+    /// Called straight after every dispatch and before anything is awaited:
+    /// what it woke is in a thread-local, which another connection on this
+    /// thread would overwrite.
     pub fn take_parked(&mut self) -> Option<BlockingWait> {
-        self.ctl.parked.take()
+        self.woken = crate::wait_table::take_woken();
+        let parked = self.ctl.parked.take();
+        if let Some(wait) = &parked {
+            // It looked, found nothing and waits again: release whoever woke
+            // it, and whoever has since — or they would wait out this wait.
+            self.looked.clear();
+            if let Some(BlockState::Queued { ticket, .. } | BlockState::GroupRead { ticket, .. }) =
+                &wait.state
+            {
+                ticket.take_looked();
+            }
+        }
+        parked
+    }
+
+    /// Wait for the clients the last dispatch woke to have looked at their
+    /// keys, so its reply comes after their pops, as in Redis (#42). Then
+    /// release whoever woke this one: a chain (`BRPOPLPUSH a b` woken by a
+    /// push to `a`, whose push to `b` wakes `BRPOPLPUSH b c`) is all done
+    /// before the first push replies, as in Redis.
+    ///
+    /// Bounded: a woken client cannot always look at once — a paused server
+    /// holds its resume dispatch, and `CLIENT KILL` or a timeout can take it
+    /// away mid-flight. At the bound this reply goes out without waiting any
+    /// longer, as every reply did before this change, and that client's pop
+    /// lands after it. A hundred milliseconds is far longer than a dispatch,
+    /// which only has to finish what it was already running, and far shorter
+    /// than any `CLIENT PAUSE` someone would set.
+    pub async fn settle(&mut self) {
+        for woken in self.woken.drain(..) {
+            let _ = tokio::time::timeout(WOKEN_BOUND, woken).await;
+        }
+        self.looked.clear();
     }
 
     /// Whether the dispatch just completed was a resume.
@@ -261,6 +308,11 @@ impl BlockingSlot {
 
     /// Store what the wait produced, for the resume dispatch to pick up.
     pub fn set_pending(&mut self, delivery: Delivery, state: Option<BlockState>) {
+        if let Some(BlockState::Queued { ticket, .. } | BlockState::GroupRead { ticket, .. }) =
+            &state
+        {
+            self.looked = ticket.take_looked();
+        }
         self.pending = Some((delivery, state));
     }
 }
@@ -706,6 +758,30 @@ mod tests {
 
     /// Every registration being cancelled must not hang a `timeout 0` wait
     /// forever with no way out.
+    /// A woken client that never looks at its keys — paused, killed, or gone —
+    /// must not hold the reply past the bound.
+    #[test]
+    fn a_woken_client_that_never_looks_holds_the_reply_only_to_the_bound() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Held, never sent: woken, and never looked.
+        let (_keep, rx) = oneshot::channel();
+        let mut slot = BlockingSlot {
+            woken: vec![rx],
+            ..Default::default()
+        };
+        let started = Instant::now();
+        rt.block_on(slot.settle());
+        let waited = started.elapsed();
+        assert!(waited >= WOKEN_BOUND, "gave up early: {waited:?}");
+        assert!(
+            waited < WOKEN_BOUND * 5,
+            "waited past the bound: {waited:?}"
+        );
+    }
+
     #[test]
     fn all_senders_dropped_resolves_rather_than_hanging() {
         let (tx, rx) = oneshot::channel::<Value>();

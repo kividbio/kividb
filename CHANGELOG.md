@@ -44,6 +44,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A write that wakes a blocked client replies after that client has been
+  served (#42).** The woken client is answered on its own task, so its
+  `BLPOP` could land after the `LPUSH` that woke it had already replied — a
+  moment later, and later still on a busy machine. A client that counted
+  `rdb_changes_since_last_save` around such a push, as Redis's
+  `BLPOP/BLMOVE should increase dirty` does, sometimes saw one change more
+  than it expected, and `LLEN` sent right behind the push could still see the
+  element. Redis serves the clients a command unblocks before that command
+  replies, and so does KiviDB now, for a chain of them too (Redis's
+  `Circular BRPOPLPUSH`, which failed the same way). The Redis 8.0 suite's
+  `unit/type/list` ran 300 times each way on a loaded 2-thread server: nine
+  failures before, none after.
+
 - **Writes during a snapshot no longer evict keys that fit under
   `maxmemory` (#284).** A snapshot (`BGSAVE`, `SAVE`, an AOF rewrite, a
   replica's full sync, a backup) captures the dataset at one instant and

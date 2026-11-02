@@ -890,6 +890,8 @@ where
                         }
                     }
 
+                    // Its reply comes after the pops of the clients it woke (#42).
+                    blocking_slot.settle().await;
                     if interrupted.unblocked_with_error {
                         interrupted.unblocked_with_error = false;
                         response = crate::commands::blocking::UNBLOCKED.to_vec();
@@ -968,6 +970,8 @@ where
                     }
                 }
 
+                // Its reply comes after the pops of the clients it woke (#42).
+                blocking_slot.settle().await;
                 if interrupted.unblocked_with_error {
                     interrupted.unblocked_with_error = false;
                     response = crate::commands::blocking::UNBLOCKED.to_vec();
