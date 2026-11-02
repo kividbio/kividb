@@ -466,6 +466,15 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **A server whose AOF ends in zeros after a power loss starts again.**
+  A power loss can leave the log's last, unsynced, writes on disk as zeros:
+  the file system recorded the file's new length before its data (ext4
+  does). Recovery read the zeros as a damaged record and refused to start,
+  where the cut-off tail of a record is loaded up to it. Zeros to the end
+  of the file are now the same: the whole records before them are loaded
+  and the file is cut where they start. Zeros with records after them are
+  still damage, and the server still stops on them. In 1.1.x too.
+
 - **A replica with the AOF on no longer runs out of memory under sustained
   writes.** Since replies wait for their writes to reach the AOF, a
   connection writes its own records to the file before it replies, and the

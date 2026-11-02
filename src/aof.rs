@@ -1686,6 +1686,21 @@ fn classify_tail(rest: &[u8]) -> Tail {
         }
     }
 
+    // Zeros to the end of the file: what a power loss leaves where the last
+    // writes were. The file system recorded the file's new length, and the
+    // data never reached the disk (ext4 commits the size first). Those
+    // writes were never synced, so cut off with whatever record they end;
+    // a server refused to start over them. Zeros with anything after them
+    // are not a tail: a hole in the middle of the log is damage.
+    let end = rest.iter().rposition(|&b| b != 0).map_or(0, |last| last + 1);
+    if end < rest.len() {
+        return if end == 0 {
+            Tail::Truncated
+        } else {
+            classify_tail(&rest[..end])
+        };
+    }
+
     if rest.first() != Some(&b'*') {
         return Tail::Corrupt;
     }
@@ -2509,6 +2524,42 @@ mod replay_parse_tests {
         ] {
             assert_eq!(classify_tail(damaged), Tail::Corrupt, "{damaged:?}");
         }
+    }
+
+    /// A power loss leaves zeros where the last, unsynced, writes were: the
+    /// file's length reached the disk and its data did not. That is a
+    /// truncation, after a whole record or in the middle of one; zeros with
+    /// something after them are a hole, and damage.
+    #[test]
+    fn zeros_to_the_end_of_the_file_are_a_truncation() {
+        let whole = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$5\r\nvalue\r\n";
+        assert_eq!(classify_tail(&[0u8; 316]), Tail::Truncated);
+        for cut in 1..whole.len() {
+            let mut torn = whole[..cut].to_vec();
+            torn.extend_from_slice(&[0u8; 64]);
+            assert_eq!(classify_tail(&torn), Tail::Truncated, "cut at {cut}");
+        }
+        let mut hole = vec![0u8; 64];
+        hole.extend_from_slice(whole);
+        assert_eq!(classify_tail(&hole), Tail::Corrupt);
+        let mut damaged = b"not a record".to_vec();
+        damaged.extend_from_slice(&[0u8; 64]);
+        assert_eq!(classify_tail(&damaged), Tail::Corrupt);
+    }
+
+    /// Replayed, a log ending in zeros loads every whole record and is cut
+    /// where the zeros start.
+    #[test]
+    fn a_log_ending_in_zeros_is_cut_where_they_start() {
+        let mut buf = enc(&["SET", "a", "1"]);
+        buf.extend_from_slice(&enc(&["SET", "b", "2"]));
+        let valid = buf.len();
+        buf.extend_from_slice(b"*3\r\n$3\r\nSE");
+        buf.extend_from_slice(&[0u8; 4096]);
+        let (commands, consumed) = parse_aof_commands(&buf);
+        assert_eq!(commands.len(), 2);
+        assert_eq!(consumed, valid);
+        assert_eq!(classify_tail(&buf[consumed..]), Tail::Truncated);
     }
 
     fn enc(parts: &[&str]) -> Vec<u8> {
