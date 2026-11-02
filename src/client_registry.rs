@@ -806,6 +806,7 @@ pub fn admit(registry: &ClientRegistry) -> Option<Slot> {
     let max = MAX_CLIENTS.load(Ordering::Relaxed);
     let slot = ClientRegistryInner::admit_up_to(registry, max);
     if slot.is_none() {
+        crate::stats::REJECTED_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
         crate::log_throttled!(
             10,
             crate::loglevel::WARN,

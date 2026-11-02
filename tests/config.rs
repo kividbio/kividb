@@ -992,6 +992,36 @@ fn turned_away(port: u16) -> bool {
     reply == "-ERR max number of clients reached\r\n"
 }
 
+// A connection turned away at maxclients is counted in INFO stats rejected_connections.
+#[cfg(unix)]
+#[test]
+fn stats_are_updated_when_connection_is_turned_away() {
+    let server = start_with_open_files(40, 100, "io-model tokio\nthreads 1\nmaxclients 1");
+
+    let mut conn = Conn::connect(server.port);
+    assert_eq!(maxclients(&mut conn), "1");
+
+    let rejected = |conn: &mut Conn| -> u64 {
+        conn.cmds(&["INFO", "stats"])
+            .as_str()
+            .lines()
+            .find_map(|line| line.strip_prefix("rejected_connections:"))
+            .expect("rejected_connections in INFO stats")
+            .parse()
+            .unwrap()
+    };
+
+    let before = rejected(&mut conn);
+    assert!(turned_away(server.port));
+    let after = rejected(&mut conn);
+
+    assert_eq!(
+        after,
+        before + 1,
+        "rejected_connections should increase by one"
+    );
+}
+
 #[cfg(unix)]
 fn maxclients(c: &mut Conn) -> String {
     c.cmds(&["CONFIG", "GET", "maxclients"]).as_array()[1]
