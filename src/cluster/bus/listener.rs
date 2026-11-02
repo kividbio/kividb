@@ -531,10 +531,16 @@ fn upsert_node(
         // way, each having dialled the other's old one; they kept those
         // for ever, each seeing the other as failed, and a shard left
         // without a master the cluster could see went down with it.
+        // So does one we have not heard from since we started, whose
+        // address is still nodes.conf's: the start grace otherwise keeps
+        // it unsuspected for two node timeouts, and the moment it ends
+        // our suspicion and a peer's report from before the node came
+        // back make a quorum, and a healthy master is failed over.
         let suspect = NodeFlags::PFAIL | NodeFlags::FAIL;
+        let unconfirmed = !direct_contact && state.unconfirmed_addresses.read().contains(&id);
         let moved = !direct_contact
             && !ip.is_empty()
-            && entry.flags.intersects(suspect)
+            && (entry.flags.intersects(suspect) || unconfirmed)
             && !flags.intersects(suspect | NodeFlags::NOADDR)
             && (entry.ip != ip
                 || entry.client_port != client_port
@@ -575,6 +581,7 @@ fn upsert_node(
         if direct_contact {
             entry.pong_received_ms = now_ms();
             entry.flags.remove(NodeFlags::PFAIL);
+            state.unconfirmed_addresses.write().remove(&id);
         } else if is_new {
             // Give a node we have only heard about a full timeout before
             // suspecting it, the same grace a freshly met one gets.
@@ -920,6 +927,26 @@ mod tests {
             node.flags.contains(NodeFlags::PFAIL),
             "only a reply from the node itself clears our suspicion"
         );
+    }
+
+    /// After a restart, a peer we have not heard from yet has the address
+    /// nodes.conf gave it, which may be stale: a healthy relay's address
+    /// replaces it at once, before the start grace would let us suspect it.
+    #[test]
+    fn after_a_restart_a_peer_not_yet_heard_from_takes_a_healthy_relays_address() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        let (a, b) = (generate_node_id(), generate_node_id());
+        process_message(&cs, meet(a), peer());
+        let known = gossip_of(b, "10.0.0.8", 7002, NodeFlags::MASTER);
+        process_message(&cs, ping(a, NodeFlags::MASTER, vec![known]), peer());
+        cs.start_the_clock_on_peers();
+
+        let moved = gossip_of(b, "10.0.0.88", 7002, NodeFlags::MASTER);
+        process_message(&cs, ping(a, NodeFlags::MASTER, vec![moved]), peer());
+        let nodes = cs.nodes.read();
+        let node = nodes.get(&b).unwrap();
+        assert_eq!(node.ip, "10.0.0.88");
+        assert!(!node.flags.intersects(NodeFlags::PFAIL | NodeFlags::FAIL));
     }
 
     /// A node we reach keeps the address it gives itself, whatever a third

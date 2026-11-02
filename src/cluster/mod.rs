@@ -224,6 +224,10 @@ pub struct ClusterState {
     /// "Reporter believes reportee is failing as of timestamp."
     /// Reports older than 2*node_timeout are discarded as stale.
     pub failure_reports: RwLock<AHashMap<NodeId, AHashMap<NodeId, u64>>>,
+    /// Peers whose address is still the one nodes.conf gave us: none of
+    /// them has reached us since this process started. A node that moved
+    /// while we were down is only reachable at an address a peer relays.
+    pub(crate) unconfirmed_addresses: RwLock<ahash::AHashSet<NodeId>>,
     /// The epoch at which we last cast a FAILOVER_AUTH_ACK. Prevents voting
     /// twice in the same epoch — a key safety property of the Raft-like
     /// election. Persisted to nodes.conf.
@@ -322,6 +326,7 @@ impl ClusterState {
             config_path,
             node_timeout_ms,
             failure_reports: RwLock::new(AHashMap::new()),
+            unconfirmed_addresses: RwLock::new(ahash::AHashSet::new()),
             last_vote_epoch: AtomicU64::new(last_vote_epoch),
             election: parking_lot::Mutex::new(None),
             election_pending: AtomicBool::new(false),
@@ -576,6 +581,7 @@ impl ClusterState {
     fn start_the_clock_on_peers(&self) {
         let now = now_ms() + self.node_timeout_ms;
         let me = self.myself();
+        let mut unconfirmed = ahash::AHashSet::new();
         for node in self.nodes.write().values_mut() {
             if node.id == me {
                 continue;
@@ -583,7 +589,9 @@ impl ClusterState {
             node.ping_sent_ms = 0;
             node.pong_received_ms = now;
             node.flags.remove(NodeFlags::PFAIL);
+            unconfirmed.insert(node.id);
         }
+        *self.unconfirmed_addresses.write() = unconfirmed;
         self.failure_reports.write().clear();
     }
 
