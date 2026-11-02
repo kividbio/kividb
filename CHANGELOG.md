@@ -480,6 +480,12 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **KiviDB builds on FreeBSD again** (#288, reported by
+  [@osokin](https://github.com/osokin), who maintains the FreeBSD port).
+  Raising the open-file limit used `div_ceil` on `rlim_t`, which is
+  unsigned on Linux and macOS but signed on FreeBSD, where `div_ceil` is
+  not stable, so 1.1.3 did not compile there.
+
 - **The ACL checks the keys `SORT`, `GEORADIUS` and `XREADGROUP` use.**
   `SORT` writes to the destination of its last `STORE`, and `GEORADIUS` and
   `GEORADIUSBYMEMBER` to that of their last `STORE` or `STOREDIST`; the

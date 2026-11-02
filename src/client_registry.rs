@@ -733,7 +733,10 @@ pub fn clients_that_fit(max: usize) -> std::io::Result<usize> {
     // whatever the hard limit says.
     let (mut soft, mut high) = (limit.rlim_cur, wanted.min(limit.rlim_max));
     while soft < high {
-        let next = soft + (high - soft).div_ceil(2);
+        // Half the gap, rounded up. Not `div_ceil`: `rlim_t` is signed on
+        // FreeBSD, where `div_ceil` is not stable (#288).
+        let gap = high - soft;
+        let next = soft + gap / 2 + gap % 2;
         let raised = libc::rlimit {
             rlim_cur: next,
             rlim_max: limit.rlim_max,
