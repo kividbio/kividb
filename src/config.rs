@@ -1921,6 +1921,15 @@ mod config_file_tests {
                 "{bad}: {err}"
             );
         }
+        // The unquoted form, its words joined with a space as Redis does.
+        for bad in ["50 abc", "50 101"] {
+            let err = load(&format!("latency-tracking-info-percentiles {bad}\n")).unwrap_err();
+            assert!(
+                err.contains("latency-tracking-info-percentiles"),
+                "{bad}: {err}"
+            );
+        }
+        load("latency-tracking-info-percentiles 50 99 99.9\n").unwrap();
         load("latency-tracking-info-percentiles \"50 99 99.9\"\n").unwrap();
         load("latency-tracking-info-percentiles \"\"\n").unwrap();
     }

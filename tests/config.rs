@@ -1134,3 +1134,48 @@ fn maxclients_leaves_room_for_what_the_io_model_holds() {
         );
     }
 }
+
+/// `latency-tracking-info-percentiles` takes a space-separated list of
+/// numbers between 0 and 100, or an empty list, and refuses anything else
+/// with Redis 8.10's reply (#255). Kept out of `slowlog_latency.rs`, whose
+/// servers share this process-wide setting with `INFO latencystats`.
+#[test]
+fn latency_percentiles_refuse_what_is_not_a_list_of_numbers() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let set =
+        |c: &mut Conn, v: &str| c.cmds(&["CONFIG", "SET", "latency-tracking-info-percentiles", v]);
+    let get = |c: &mut Conn| {
+        let reply = c.cmds(&["CONFIG", "GET", "latency-tracking-info-percentiles"]);
+        reply.as_array()[1].as_str().to_string()
+    };
+    let invalid = "ERR CONFIG SET failed (possibly related to argument \
+                   'latency-tracking-info-percentiles') - Invalid \
+                   latency-tracking-info-percentiles parameters";
+    let range = "ERR CONFIG SET failed (possibly related to argument \
+                 'latency-tracking-info-percentiles') - latency-tracking-info-percentiles \
+                 parameters should sit between [0.0,100.0]";
+
+    assert!(set(&mut c, "25 75").is_ok());
+    for bad in ["abc", "50 abc", "nan", " 50", "50  99"] {
+        let reply = set(&mut c, bad);
+        assert!(
+            matches!(&reply, RespValue::Error(e) if e == invalid),
+            "{bad:?}: {reply:?}"
+        );
+    }
+    for bad in ["101", "-1", "50 100.5", "inf"] {
+        let reply = set(&mut c, bad);
+        assert!(
+            matches!(&reply, RespValue::Error(e) if e == range),
+            "{bad:?}: {reply:?}"
+        );
+    }
+    assert_eq!(get(&mut c), "25 75", "a refused value is not kept");
+
+    for good in ["0 100", "1e1", "", "50 99 99.9"] {
+        assert!(set(&mut c, good).is_ok(), "{good:?}");
+        assert_eq!(get(&mut c), good);
+    }
+}
