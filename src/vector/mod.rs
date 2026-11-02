@@ -388,6 +388,14 @@ impl IndexDef {
             a.push(words.len().to_string());
             a.extend(words.iter().cloned());
         }
+        if self.default_score != 1.0 {
+            a.push("SCORE".into());
+            a.push(self.default_score.to_string());
+        }
+        if let Some(field) = &self.score_field {
+            a.push("SCORE_FIELD".into());
+            a.push(field.clone());
+        }
         a.push("SCHEMA".into());
         for field in &self.fields {
             a.push(field.name.clone());
@@ -655,6 +663,12 @@ pub struct IndexDef {
     pub synonyms: SynonymGroups,
     /// `LANGUAGE` and `LANGUAGE_FIELD`: what TEXT fields are stemmed in.
     pub language: stem::LanguageOptions,
+    /// `SCORE`: the score a document has when `SCORE_FIELD` names no field
+    /// it holds, and when the index names no field at all.
+    pub default_score: f64,
+    /// `SCORE_FIELD`: the document field whose number multiplies its
+    /// relevance. A document without it scores [`IndexDef::default_score`].
+    pub score_field: Option<String>,
     /// With `LANGUAGE_FIELD`: the documents whose words were stemmed in a
     /// language other than the index's, and that language. For a write of
     /// some fields of a hash that leaves its language field as it was.
@@ -937,6 +951,8 @@ pub fn set_alias(store: &mut AHashMap<String, IndexDef>, alias: &str, index: &In
         stopwords: None,
         synonyms: Default::default(),
         language: Default::default(),
+        default_score: 1.0,
+        score_field: None,
     }
     .into_def();
     store.insert(alias.to_string(), marker);
@@ -993,6 +1009,10 @@ pub struct IndexSchema {
     pub synonyms: SynonymGroups,
     /// See [`IndexDef::language`].
     pub language: stem::LanguageOptions,
+    /// See [`IndexDef::default_score`].
+    pub default_score: f64,
+    /// See [`IndexDef::score_field`].
+    pub score_field: Option<String>,
 }
 
 impl IndexSchema {
@@ -1022,6 +1042,8 @@ impl IndexSchema {
             stopwords: self.stopwords.map(Arc::new),
             synonyms: self.synonyms,
             language: self.language,
+            default_score: self.default_score,
+            score_field: self.score_field,
             doc_languages: Arc::new(RwLock::new(AHashMap::new())),
             text: Arc::new(RwLock::new(text::TextIndex::new())),
             postings,
@@ -1141,6 +1163,8 @@ pub fn rebuild_indexes(index_store: &IndexStore, store: &crate::store::Store) {
                 stopwords: def.stopwords.as_deref().cloned(),
                 synonyms: def.synonyms.clone(),
                 language: def.language.clone(),
+                default_score: def.default_score,
+                score_field: def.score_field.clone(),
             }
             .into_def();
             indexes.insert(name, fresh.clone());
@@ -1790,7 +1814,20 @@ pub enum DocFields<'a> {
     Hash(parking_lot::RwLockReadGuard<'a, Fields>),
     /// A hash some of whose fields have a TTL.
     HashEx(parking_lot::RwLockReadGuard<'a, crate::types::HashInner>),
-    Json(Fields),
+    Json {
+        fields: Fields,
+        doc: parking_lot::RwLockReadGuard<'a, serde_json::Value>,
+    },
+}
+
+impl DocFields<'_> {
+    /// The document itself, for a JSON document.
+    pub fn json(&self) -> Option<&serde_json::Value> {
+        match self {
+            DocFields::Json { doc, .. } => Some(doc),
+            _ => None,
+        }
+    }
 }
 
 impl std::ops::Deref for DocFields<'_> {
@@ -1799,7 +1836,7 @@ impl std::ops::Deref for DocFields<'_> {
         match self {
             DocFields::Hash(fields) => fields,
             DocFields::HashEx(hash) => &hash.fields,
-            DocFields::Json(fields) => fields,
+            DocFields::Json { fields, .. } => fields,
         }
     }
 }
@@ -1829,7 +1866,11 @@ pub fn doc_fields<'a>(
             Some(DocFields::HashEx(hash.read()))
         }
         (IndexOn::Json, crate::store::ValueRef::Json(doc)) => {
-            Some(DocFields::Json(project_json(schema, &doc.read())))
+            let doc = doc.read();
+            Some(DocFields::Json {
+                fields: project_json(schema, &doc),
+                doc,
+            })
         }
         _ => None,
     }
@@ -1939,6 +1980,16 @@ fn json_field_bytes(
             Some(Arc::from(bytes))
         }
     }
+}
+
+/// The number at `path` in a JSON document, as `SCORE_FIELD` reads it.
+pub(crate) fn json_score_field_bytes(path: &str, doc: &serde_json::Value) -> Option<Arc<[u8]>> {
+    let query = json_path(path)?;
+    let values = query.values(doc);
+    let serde_json::Value::Number(number) = values.first()?.as_ref() else {
+        return None;
+    };
+    Some(Arc::from(number.to_string().into_bytes()))
 }
 
 /// What `FT.SEARCH … RETURN` shows for `path` of a JSON document: a string
@@ -3874,6 +3925,8 @@ mod flush_index_tests {
             stopwords: None,
             synonyms: Default::default(),
             language: Default::default(),
+            default_score: 1.0,
+            score_field: None,
         }
         .into_def();
         let graph = match def.indexes.get("vec") {
@@ -3894,6 +3947,37 @@ mod flush_index_tests {
     }
 
     #[test]
+    fn create_args_carries_score_and_score_field() {
+        let def = IndexSchema {
+            name: "idx".into(),
+            db_index: 0,
+            on: IndexOn::Hash,
+            prefixes: vec!["s:".into()],
+            fields: vec![SchemaField {
+                name: "title".into(),
+                field_type: FieldType::Text,
+                options: FieldOptions::default(),
+            }],
+            aliases: Vec::new(),
+            stopwords: None,
+            synonyms: Default::default(),
+            language: Default::default(),
+            default_score: 0.5,
+            score_field: Some("rank".into()),
+        }
+        .into_def();
+        let args: Vec<String> = def
+            .create_args()
+            .into_iter()
+            .map(|a| String::from_utf8(a).unwrap())
+            .collect();
+        let at = |word: &str| args.iter().position(|a| a == word).unwrap();
+        assert_eq!(args[at("SCORE") + 1], "0.5");
+        assert_eq!(args[at("SCORE_FIELD") + 1], "rank");
+        assert!(at("SCORE_FIELD") < at("SCHEMA"));
+    }
+
+    #[test]
     fn drop_indexes_for_db_keeps_other_dbs() {
         let store = new_index_store();
         let mk = |name: &str, db: usize| {
@@ -3911,6 +3995,8 @@ mod flush_index_tests {
                 stopwords: None,
                 synonyms: Default::default(),
                 language: Default::default(),
+                default_score: 1.0,
+                score_field: None,
             }
             .into_def()
         };
@@ -3942,6 +4028,8 @@ mod alias_tests {
             stopwords: None,
             synonyms: Default::default(),
             language: Default::default(),
+            default_score: 1.0,
+            score_field: None,
         }
         .into_def()
     }
@@ -4002,6 +4090,8 @@ mod alias_tests {
             stopwords: None,
             synonyms: Default::default(),
             language: Default::default(),
+            default_score: 1.0,
+            score_field: None,
         };
         register_index_schemas(&store, &[schema], &Default::default());
         let g = store.read();

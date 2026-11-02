@@ -278,6 +278,8 @@ fn create(ctx: &mut Ctx) -> Result<(), String> {
     let mut prefixes: Vec<String> = Vec::new();
     let mut stopwords: Option<Vec<String>> = None;
     let mut language = crate::vector::stem::LanguageOptions::default();
+    let mut default_score = 1.0;
+    let mut score_field = None;
     let mut skip_initial_scan = false;
     let mut schema_found = false;
     let mut i = 2usize;
@@ -351,9 +353,35 @@ fn create(ctx: &mut Ctx) -> Result<(), String> {
                 language.field = Some(field.to_string());
                 i += 2;
             }
-            // Ranking and storage hints with no counterpart here. They
-            // change no result a query can see.
-            "SCORE" | "SCORE_FIELD" | "PAYLOAD_FIELD" | "TEMPORARY" => {
+            "SCORE" => {
+                let raw = cmd
+                    .get(i + 1)
+                    .map(|a| text(a))
+                    .ok_or_else(|| "Bad arguments for SCORE: expected a value".to_string())?;
+                let score = raw
+                    .trim_matches(|c: char| c.is_ascii_whitespace())
+                    .parse::<f64>()
+                    .map_err(|_| "Invalid score".to_string())?;
+                if score > 1.0 || score < 0.0 {
+                    return Err("Invalid score".into());
+                }
+                default_score = score;
+                i += 2;
+            }
+            "SCORE_FIELD" => {
+                score_field = Some(
+                    cmd.get(i + 1)
+                        .map(|a| text(a))
+                        .ok_or_else(|| {
+                            "Bad arguments for SCORE_FIELD: expected a value".to_string()
+                        })?
+                        .to_string(),
+                );
+                i += 2;
+            }
+            // Storage hints with no counterpart here. They change no result
+            // a query can see.
+            "PAYLOAD_FIELD" | "TEMPORARY" => {
                 if cmd.get(i + 1).is_none() {
                     return Err(format!("Bad arguments for {word}: expected a value"));
                 }
@@ -390,6 +418,8 @@ fn create(ctx: &mut Ctx) -> Result<(), String> {
         stopwords,
         synonyms: Default::default(),
         language,
+        default_score,
+        score_field,
     }
     .into_def();
 
@@ -503,25 +533,25 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
     };
     put("index_name", resp_bulk_str(&def.name));
     put("index_options", resp_array(vec![]));
-    put(
-        "index_definition",
-        resp_map_for(
-            resp,
-            vec![
-                resp_bulk_str("key_type"),
-                resp_bulk_str(match def.on {
-                    IndexOn::Hash => "HASH",
-                    IndexOn::Json => "JSON",
-                }),
-                resp_bulk_str("prefixes"),
-                resp_array(def.prefixes.iter().map(|p| resp_bulk_str(p)).collect()),
-            ]
-            .into_iter()
-            .chain(language_definition(&def.language))
-            .chain([resp_bulk_str("default_score"), resp_bulk_str("1")])
-            .collect(),
-        ),
-    );
+    let mut definition = vec![
+        resp_bulk_str("key_type"),
+        resp_bulk_str(match def.on {
+            IndexOn::Hash => "HASH",
+            IndexOn::Json => "JSON",
+        }),
+        resp_bulk_str("prefixes"),
+        resp_array(def.prefixes.iter().map(|p| resp_bulk_str(p)).collect()),
+    ];
+    definition.extend(language_definition(&def.language));
+    if def.default_score != 0.0 {
+        definition.push(resp_bulk_str("default_score"));
+        definition.push(resp_bulk_str(&score_text(def.default_score)));
+    }
+    if let Some(field) = &def.score_field {
+        definition.push(resp_bulk_str("score_field"));
+        definition.push(resp_bulk_str(field));
+    }
+    put("index_definition", resp_map_for(resp, definition));
     put(
         "attributes",
         resp_array(
@@ -1127,8 +1157,9 @@ pub(crate) fn relevance(
     key: &str,
     fields: &Fields,
     scoring: &crate::vector::score::Scoring,
+    json: Option<&serde_json::Value>,
 ) -> f64 {
-    scoring.score(def, key, fields)
+    scoring.score(def, key, fields, json)
 }
 
 /// Every document of the index that the filter accepts. In no particular
@@ -1156,10 +1187,10 @@ pub(crate) fn filter_search_scored(
     let scoring = crate::vector::score::Scoring::new(def, filter, scorer);
     let range = filter.vector_range();
     let mut out: Vec<Match> = Vec::new();
-    let timed_out = filter_each(ctx, def, filter, only, deadline, |key, fields| {
+    let timed_out = filter_each(ctx, def, filter, only, deadline, |key, fields, json| {
         out.push(Match {
             key: key.to_string(),
-            score: relevance(def, key, fields, &scoring),
+            score: relevance(def, key, fields, &scoring, json),
             distance: range.and_then(|clause| filter::range_distance(clause, fields)),
         });
     });
@@ -1179,7 +1210,7 @@ pub(crate) fn filter_each(
     filter: &Filter,
     only: Option<&AHashSet<String>>,
     deadline: Option<Instant>,
-    mut accept: impl FnMut(&str, &Fields),
+    mut accept: impl FnMut(&str, &Fields, Option<&serde_json::Value>),
 ) -> bool {
     let db = &ctx.store[*ctx.selected_db];
     let mut timed_out = false;
@@ -1192,18 +1223,18 @@ pub(crate) fn filter_each(
             if deadline_due(deadline, &mut seen) {
                 return true;
             }
-            with_doc(db, def, &key, |fields, _| {
+            with_doc(db, def, &key, |fields, json| {
                 if plan.exact || filter::eval(filter, fields) {
-                    accept(&key, fields);
+                    accept(&key, fields, json);
                 }
             });
         }
         return false;
     }
 
-    let mut consider = |key: &str, fields: &Fields| {
+    let mut consider = |key: &str, fields: &Fields, json: Option<&serde_json::Value>| {
         if filter::eval(filter, fields) {
-            accept(key, fields);
+            accept(key, fields, json);
         }
     };
 
@@ -1271,9 +1302,9 @@ pub(crate) fn filter_each(
                 if !covers(def, key) {
                     continue;
                 }
-                with_doc(db, def, key, |fields, _| {
+                with_doc(db, def, key, |fields, json| {
                     if *matches || filter::eval(filter, fields) {
-                        accept(key, fields);
+                        accept(key, fields, json);
                     }
                 });
             }
@@ -1284,7 +1315,8 @@ pub(crate) fn filter_each(
                     return;
                 }
                 if let Some(fields) = crate::vector::doc_fields(&def.on, &def.fields, value) {
-                    consider(key, &fields);
+                    let json = fields.json();
+                    consider(key, &fields, json);
                 }
             });
         }
@@ -1424,6 +1456,9 @@ fn every_match_scores_the_same(
             _ => false,
         }
     }
+    if def.score_field.is_some() && scorer != Scorer::Hamming {
+        return false;
+    }
     let lengths = def.text_fields().next().is_some();
     match scorer {
         Scorer::DocScore | Scorer::Hamming => true,
@@ -1448,6 +1483,12 @@ fn page_from_postings(
     let scorer = args
         .scorer
         .unwrap_or_else(crate::vector::score::Scorer::default_scorer);
+    if args.withscores
+        && def.score_field.is_some()
+        && scorer != crate::vector::score::Scorer::Hamming
+    {
+        return None;
+    }
     let (order, numeric) = match &args.sortby {
         // Only the count (LIMIT 0 0): no order to keep.
         None if args.count == 0 || every_match_scores_the_same(def, filter, scorer) => {
@@ -1567,7 +1608,7 @@ fn page_from_postings(
     let scoring = crate::vector::score::Scoring::new(def, filter, scorer);
     let mut page = Vec::with_capacity(picked.len());
     for (key, number) in picked {
-        let hit = with_doc(db, def, &key, |fields, _| {
+        let hit = with_doc(db, def, &key, |fields, json| {
             if !filter::eval(filter, fields) {
                 return None;
             }
@@ -1588,7 +1629,7 @@ fn page_from_postings(
             };
             Some(Hit {
                 key: key.to_string(),
-                score: relevance(def, &key, fields, &scoring),
+                score: relevance(def, &key, fields, &scoring, json),
                 extras: Vec::new(),
                 sort_key,
             })
@@ -1994,6 +2035,40 @@ pub(crate) fn number_text(value: f64) -> String {
     }
 }
 
+pub(crate) fn score_text(value: f64) -> String {
+    const INTEGER_BOUND: f64 = (i64::MAX / 2) as f64;
+    if value.is_nan() {
+        "nan".to_string()
+    } else if value == 0.0 && value.is_sign_negative() {
+        "-0".to_string()
+    } else if !value.is_finite() {
+        value.to_string()
+    } else if value == value.trunc() && value.abs() <= INTEGER_BOUND {
+        format!("{}", value as i64)
+    } else {
+        let scientific = format!("{value:e}");
+        let Some((coefficient, exponent)) = scientific.split_once('e') else {
+            return number_text(value);
+        };
+        let Ok(exponent) = exponent.parse::<i32>() else {
+            return number_text(value);
+        };
+        let digits = coefficient.bytes().filter(u8::is_ascii_digit).count() as i32;
+        let k = exponent - (digits - 1);
+        let scientific = if k >= 0 {
+            exponent >= digits + 7
+        } else {
+            k <= -7 && exponent.abs() >= 4
+        };
+        if scientific && exponent != 0 {
+            let sign = if exponent >= 0 { "+" } else { "" };
+            format!("{coefficient}e{sign}{exponent}")
+        } else {
+            number_text(value)
+        }
+    }
+}
+
 pub(crate) fn distance_text(distance: f32) -> String {
     if distance == 0.0 {
         "0".to_string()
@@ -2195,7 +2270,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                     &filter,
                     args.inkeys.as_ref(),
                     deadline,
-                    |key, _| scorer.offer(key),
+                    |key, _, _| scorer.offer(key),
                 );
                 scorer.nearest()
             };
@@ -2262,6 +2337,13 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
     // of the way through a migration is not counted twice.
     if ctx.cluster.enabled {
         hits.retain(|hit| crate::cluster::search::serves(ctx.cluster, &hit.key));
+    }
+    let scores_matter = shard
+        .then(|| crate::cluster::search::scores_matter(&ctx.cmd))
+        .flatten()
+        .unwrap_or_else(|| args.withscores || (args.sortby.is_none() && args.count > 0));
+    if scores_matter {
+        hits.retain(|hit| hit.score != f64::NEG_INFINITY);
     }
 
     // ── SORTBY ───────────────────────────────────────────────────────────────
@@ -2438,6 +2520,15 @@ struct PageHit {
     fields: Vec<(String, Vec<u8>)>,
 }
 
+fn resp3_score(value: f64) -> Vec<u8> {
+    let text = score_text(value);
+    let mut out = Vec::with_capacity(text.len() + 3);
+    out.push(b',');
+    out.extend_from_slice(text.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
 /// The reply to FT.SEARCH for `page`, of `total` matches.
 fn encode_page(
     resp: u8,
@@ -2462,7 +2553,7 @@ fn encode_page(
                 let mut entry = vec![resp_bulk_str("id"), resp_bulk_str(&hit.key)];
                 if args.withscores {
                     entry.push(resp_bulk_str("score"));
-                    entry.push(resp_double_for(3, hit.score));
+                    entry.push(resp3_score(hit.score));
                 }
                 if args.withsortkeys {
                     entry.push(resp_bulk_str("sortkey"));
@@ -2509,7 +2600,7 @@ fn encode_page(
     for hit in page {
         out.push(resp_bulk_str(&hit.key));
         if args.withscores {
-            out.push(resp_bulk_str(&number_text(hit.score)));
+            out.push(resp_bulk_str(&score_text(hit.score)));
         }
         if args.withpayloads {
             out.push(resp_null_bulk());
@@ -2564,6 +2655,10 @@ fn coordinate(
     shard_cmd.push(b"LIMIT".to_vec());
     shard_cmd.push(b"0".to_vec());
     shard_cmd.push((args.offset + args.count).to_string().into_bytes());
+    crate::cluster::search::ask_for_scores_matter(
+        &mut shard_cmd,
+        args.withscores || (args.sortby.is_none() && args.count > 0),
+    );
     crate::cluster::search::ask_for_timeout_flag(&mut shard_cmd);
 
     // This node's part, then the others'.
@@ -2793,6 +2888,47 @@ mod tests {
         let cmd: Vec<&[u8]> = cmd.iter().map(|w| w.as_bytes()).collect();
         let mut i = 0;
         parse_schema_fields(&cmd, &mut i)
+    }
+
+    #[test]
+    fn score_text_matches_redis_number_formatting() {
+        assert_eq!(score_text(f64::from(0.1f32)), "0.10000000149011612");
+        assert_eq!(score_text(0.1), "0.1");
+        assert_eq!(score_text(0.0001), "0.0001");
+        assert_eq!(score_text(f64::from(0.0001f32)), "9.999999747378752e-5");
+        assert_eq!(score_text(0.0009999), "9.999e-4");
+        assert_eq!(score_text(0.00001), "0.00001");
+        assert_eq!(score_text(0.000001), "0.000001");
+        assert_eq!(score_text(1e-7), "1e-7");
+        assert_eq!(score_text(123456.789), "123456.789");
+        assert_eq!(score_text(f64::from(123_456.79_f32)), "1.234567890625e+5");
+        assert_eq!(score_text(f64::from(1e-45f32)), "1.401298464324817e-45");
+        assert_eq!(score_text(f64::from(3.4e38f32)), "3.3999999521443642e+38");
+        assert_eq!(score_text(f64::from(9e18f32)), "9000000202358129000");
+        assert_eq!(score_text(f64::from(1e19f32)), "9999999980506448000");
+        assert_eq!(score_text(f64::from(1e23f32)), "99999997781963080000000");
+        assert_eq!(score_text(f64::from(1e24f32)), "1.0000000138484279e+24");
+        assert_eq!(
+            score_text(f64::from(1.0000001e23f32)),
+            "100000006789162340000000"
+        );
+        assert_eq!(
+            score_text(f64::from(9.999999e23f32)),
+            "9.999998697332398e+23"
+        );
+        assert_eq!(
+            score_text(f64::from(1.2345678e23f32)),
+            "1.234567802683402e+23"
+        );
+        assert_eq!(
+            score_text(f64::from(1.234_567_9e23_f32)),
+            "123456789275539450000000"
+        );
+        assert_eq!(score_text(0.0), "0");
+        assert_eq!(score_text(-0.0), "-0");
+        assert_eq!(score_text(f64::INFINITY), "inf");
+        assert_eq!(score_text(f64::NEG_INFINITY), "-inf");
+        assert_eq!(score_text(f64::NAN), "nan");
     }
 
     /// The five schemas of the LiteLLM report: each was refused.

@@ -87,6 +87,13 @@ impl V {
         ids.sort();
         ids
     }
+    /// The (id, score) pairs of an FT.SEARCH . WITHSCORES NOCONTENT reply.
+    fn scores(&self) -> Vec<(String, f64)> {
+        self.arr()[1..]
+            .chunks(2)
+            .map(|pair| (pair[0].s().to_string(), pair[1].s().parse().unwrap()))
+            .collect()
+    }
     /// A flat `[name, value, …]` array as pairs.
     fn pairs(&self) -> Vec<(String, String)> {
         self.arr()
@@ -1774,6 +1781,287 @@ fn a_json_index_finds_documents_by_their_paths() {
     let info = c.cmd(&["FT.INFO", "j1"]);
     assert_eq!(info.get("num_docs").i(), 3);
     assert_eq!(info.get("index_definition").get("key_type").s(), "JSON");
+}
+
+/// `SCORE_FIELD` reads a JSON path that the schema need not name.
+#[test]
+fn a_json_score_field_need_not_be_in_the_schema() {
+    let mut c = conn();
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "jsc",
+            "ON",
+            "JSON",
+            "PREFIX",
+            "1",
+            "jsc:",
+            "SCORE_FIELD",
+            "$.rank",
+            "SCORE",
+            "0.25",
+            "SCHEMA",
+            "$.title",
+            "AS",
+            "title",
+            "TEXT",
+        ])
+        .ok()
+    );
+    for (id, doc) in [
+        ("4", r#"{"title":"hello","rank":4}"#),
+        ("2", r#"{"title":"hello","rank":2}"#),
+        ("text", r#"{"title":"hello","rank":"2"}"#),
+        ("missing", r#"{"title":"hello"}"#),
+        ("null", r#"{"title":"hello","rank":null}"#),
+        ("array", r#"{"title":"hello","rank":[3,7]}"#),
+        ("object", r#"{"title":"hello","rank":{"n":3}}"#),
+    ] {
+        let reply = c.cmd(&["JSON.SET", &format!("jsc:{id}"), "$", doc]);
+        assert!(reply.ok(), "{reply:?}");
+    }
+    let reply = c.cmd(&[
+        "FT.SEARCH",
+        "jsc",
+        "hello",
+        "SCORER",
+        "DOCSCORE",
+        "WITHSCORES",
+        "NOCONTENT",
+    ]);
+    let mut got: Vec<(String, f64)> = reply.arr()[1..]
+        .chunks(2)
+        .map(|pair| (pair[0].s().to_string(), pair[1].s().parse().unwrap()))
+        .collect();
+    got.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        got,
+        [
+            ("jsc:2".to_string(), 2.0),
+            ("jsc:4".to_string(), 4.0),
+            ("jsc:array".to_string(), 0.25),
+            ("jsc:missing".to_string(), 0.25),
+            ("jsc:null".to_string(), 0.25),
+            ("jsc:object".to_string(), 0.25),
+            ("jsc:text".to_string(), 0.25),
+        ]
+    );
+
+    let reply = c.cmd(&["FT.AGGREGATE", "jsc", "hello", "LOAD", "*"]);
+    for row in &reply.arr()[1..] {
+        assert_eq!(
+            row.pairs()
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["title"],
+            "{row:?}"
+        );
+    }
+    c.cmd(&["FT.DROPINDEX", "jsc", "DD"]);
+}
+
+/// A JSON `SCORE_FIELD` reads the number in the document, not what the
+/// schema projects that path into.
+#[test]
+fn a_json_score_field_ignores_the_schema_projection() {
+    let mut c = conn();
+    for (index, field_type, raw) in [
+        ("jn", "NUMERIC", "[3,7]"),
+        ("jx", "TEXT", "\"2\""),
+        ("jg", "TAG", "\"2\""),
+    ] {
+        let prefix = format!("{index}:");
+        let reply = c.cmd(&[
+            "FT.CREATE",
+            index,
+            "ON",
+            "JSON",
+            "PREFIX",
+            "1",
+            &prefix,
+            "SCORE_FIELD",
+            "$.rank",
+            "SCORE",
+            "0.25",
+            "SCHEMA",
+            "$.rank",
+            "AS",
+            "rank",
+            field_type,
+        ]);
+        assert!(reply.ok(), "{index}: {reply:?}");
+        let key = format!("{index}:1");
+        let doc = format!(r#"{{"rank":{raw}}}"#);
+        assert!(c.cmd(&["JSON.SET", &key, "$", &doc]).ok());
+        assert_eq!(
+            c.cmd(&[
+                "FT.SEARCH",
+                index,
+                "*",
+                "SCORER",
+                "DOCSCORE",
+                "WITHSCORES",
+                "NOCONTENT",
+            ])
+            .scores(),
+            [(key, 0.25)],
+            "{index}"
+        );
+        let reply = c.cmd(&[
+            "FT.AGGREGATE",
+            index,
+            "*",
+            "SCORER",
+            "DOCSCORE",
+            "ADDSCORES",
+        ]);
+        assert_eq!(
+            reply.arr()[1]
+                .pairs()
+                .iter()
+                .find(|(name, _)| name == "__score")
+                .map(|(_, score)| score.as_str()),
+            Some("0.25"),
+            "{index}"
+        );
+        c.cmd(&["FT.DROPINDEX", index, "DD"]);
+    }
+}
+
+/// `SCORE_FIELD` reads the path it names, not the field the schema aliases
+/// it to.
+#[test]
+fn a_json_score_field_is_not_resolved_through_a_schema_alias() {
+    let mut c = conn();
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "jsa",
+            "ON",
+            "JSON",
+            "PREFIX",
+            "1",
+            "jsa:",
+            "SCORE_FIELD",
+            "salias",
+            "SCORE",
+            "0.25",
+            "SCHEMA",
+            "$.rank",
+            "AS",
+            "salias",
+            "NUMERIC",
+        ])
+        .ok()
+    );
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "jsp",
+            "ON",
+            "JSON",
+            "PREFIX",
+            "1",
+            "jsp:",
+            "SCORE_FIELD",
+            "$.rank",
+            "SCORE",
+            "0.25",
+            "SCHEMA",
+            "$.rank",
+            "AS",
+            "salias",
+            "NUMERIC",
+        ])
+        .ok()
+    );
+    assert!(c.cmd(&["JSON.SET", "jsa:1", "$", r#"{"rank":2}"#]).ok());
+    assert!(c.cmd(&["JSON.SET", "jsp:1", "$", r#"{"rank":2}"#]).ok());
+
+    assert_eq!(
+        c.cmd(&[
+            "FT.SEARCH",
+            "jsa",
+            "*",
+            "SCORER",
+            "DOCSCORE",
+            "WITHSCORES",
+            "NOCONTENT",
+        ])
+        .scores(),
+        [("jsa:1".to_string(), 0.25)]
+    );
+    assert_eq!(
+        c.cmd(&[
+            "FT.SEARCH",
+            "jsp",
+            "*",
+            "SCORER",
+            "DOCSCORE",
+            "WITHSCORES",
+            "NOCONTENT",
+        ])
+        .scores(),
+        [("jsp:1".to_string(), 2.0)]
+    );
+    c.cmd(&["FT.DROPINDEX", "jsa", "DD"]);
+    c.cmd(&["FT.DROPINDEX", "jsp", "DD"]);
+}
+
+/// A negative zero document score is a negative zero in both protocols.
+#[test]
+fn a_negative_zero_score_is_written_as_negative_zero() {
+    let mut c = conn();
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "nz",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "nz:",
+            "SCORE_FIELD",
+            "rank",
+            "SCHEMA",
+            "title",
+            "TEXT",
+        ])
+        .ok()
+    );
+    assert!(matches!(
+        c.cmd(&["HSET", "nz:1", "title", "hello", "rank", "-0"]),
+        V::Int(2)
+    ));
+    let reply = c.cmd(&[
+        "FT.SEARCH",
+        "nz",
+        "hello",
+        "SCORER",
+        "DOCSCORE",
+        "WITHSCORES",
+        "NOCONTENT",
+    ]);
+    let score = reply.scores()[0].1;
+    assert!(score == 0.0 && score.is_sign_negative());
+
+    let mut c3 = conn();
+    assert!(matches!(c3.cmd(&["HELLO", "3"]), V::Map(_)));
+    let reply = c3.cmd(&[
+        "FT.SEARCH",
+        "nz",
+        "hello",
+        "SCORER",
+        "DOCSCORE",
+        "WITHSCORES",
+        "NOCONTENT",
+    ]);
+    let result = &reply.get("results").arr()[0];
+    assert!(
+        matches!(result.get("score"), V::Double(score) if *score == 0.0 && score.is_sign_negative())
+    );
+    c3.cmd(&["FT.DROPINDEX", "nz", "DD"]);
 }
 
 /// A JSON document is returned whole under `$`; `RETURN` picks paths out of
