@@ -44,6 +44,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A replica with the AOF on no longer runs out of memory under sustained
+  writes.** Since replies wait for their writes to reach the AOF, a
+  connection writes its own records to the file before it replies, and the
+  AOF's writer thread is no longer woken for each one. A replica's records
+  come from its master's stream, with no reply to write them: they waited
+  for the writer's once-a-second sync, which wrote 4 MB and stopped. At
+  40 MB/s of writes the queue grew by over a gigabyte a minute, until the
+  replica was killed for memory, and its checkpoints, queued behind it,
+  took minutes. The replica now wakes the writer after each batch it
+  applies, and the writer empties the queue each time. Introduced in
+  1.2.0-rc1; 1.1.x is not affected.
+
 - **Writes during a snapshot no longer evict keys that fit under
   `maxmemory` (#284).** A snapshot (`BGSAVE`, `SAVE`, an AOF rewrite, a
   replica's full sync, a backup) captures the dataset at one instant and
