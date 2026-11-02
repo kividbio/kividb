@@ -252,6 +252,12 @@ pub fn route_named(
         // We are importing this slot. A client that was sent here with -ASK
         // says so with ASKING; anyone else is sent to the slot's owner.
         (_, Some(MigrationState::Importing { src_id })) => {
+            // MIGRATE runs here too, as in Redis while a slot is open:
+            // `redis-cli --cluster fix` moves the keys of a node it set
+            // importing back to the slot's owner with it (#295).
+            if name == "MIGRATE" {
+                return RouteDecision::OwnedSlot(first_slot);
+            }
             if !asking_flag {
                 return moved_to(&src_id);
             }
@@ -573,6 +579,30 @@ mod tests {
             });
             assert!(matches!(decision, RouteDecision::OwnedSlot(_)));
         }
+    }
+
+    /// On a node importing the slot, MIGRATE runs here as well, as in Redis,
+    /// for `redis-cli --cluster fix` (#295). Anything else without ASKING
+    /// is still sent to the slot's owner.
+    #[test]
+    fn migrate_runs_on_a_node_importing_the_slot() {
+        let cs = full_cluster();
+        let src = crate::cluster::generate_node_id();
+        let mut s = crate::cluster::ClusterNode::new(src, "10.0.0.6".into(), 7001, 17001);
+        s.flags |= crate::cluster::NodeFlags::MASTER;
+        cs.nodes.write().insert(src, s);
+        let slot = key_hash_slot(b"{t}a");
+        cs.slots.write()[slot as usize] = Some(src);
+        cs.set_importing(slot, src).unwrap();
+
+        let migrate = make_cmd(&[
+            "MIGRATE", "10.0.0.6", "7001", "", "0", "1000", "KEYS", "{t}a", "{t}b",
+        ]);
+        let decision = route_command(&cmd_slices(&migrate), &cs, false, false, |_| true);
+        assert!(matches!(decision, RouteDecision::OwnedSlot(_)));
+        let get = make_cmd(&["GET", "{t}a"]);
+        let decision = route_command(&cmd_slices(&get), &cs, false, false, |_| true);
+        assert!(matches!(decision, RouteDecision::Moved { .. }));
     }
 
     #[test]

@@ -636,10 +636,9 @@ fn cmd_delslots(state: &ClusterState, cmd: &[&[u8]]) -> Vec<u8> {
             }
         }
     }
-    for s in &slots {
-        if let Err(e) = state.release_slot(*s) {
-            return resp_error(&format!("ERR {e}"));
-        }
+    // All or nothing, as in Redis.
+    if let Err(e) = state.release_slots(&slots) {
+        return resp_error(&format!("ERR {e}"));
     }
     if let Err(e) = state.save_to_disk() {
         return resp_error(&format!(
@@ -718,10 +717,19 @@ fn cmd_delslotsrange(state: &ClusterState, cmd: &[&[u8]]) -> Vec<u8> {
         ranges.push((start, end));
         i += 2;
     }
+    // Every range is checked before any slot is released, as in Redis.
+    let mut slots: Vec<u16> = Vec::new();
+    let mut seen = vec![false; crate::cluster::CLUSTER_SLOTS];
     for (start, end) in ranges {
-        if let Err(e) = state.release_slot_range(start, end) {
-            return resp_error(&format!("ERR {e}"));
+        for s in start..=end {
+            if std::mem::replace(&mut seen[s as usize], true) {
+                return resp_error(&format!("ERR Slot {s} specified multiple times"));
+            }
+            slots.push(s);
         }
+    }
+    if let Err(e) = state.release_slots(&slots) {
+        return resp_error(&format!("ERR {e}"));
     }
     if let Err(e) = state.save_to_disk() {
         return resp_error(&format!(

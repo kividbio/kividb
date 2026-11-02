@@ -494,6 +494,26 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   replication point, or a clean-exit marker, is used only if it was written
   for the very bytes that were loaded.
 
+- **`CLUSTER DELSLOTS` removes a slot whoever owns it, and `redis-cli
+  --cluster fix` can close an interrupted reshard** (#295, with thanks to
+  [@saikishore222](https://github.com/saikishore222)). `DELSLOTS` and
+  `DELSLOTSRANGE` refused a slot another node owned (`ERR Slot 15 is owned
+  by another node`). Redis removes it from the node's own view whoever owns
+  it, and `redis-cli --cluster fix` relies on that: closing a slot left
+  open by a `redis-cli --cluster reshard` that stopped part way, it deletes
+  the slot on the node that was importing it, sets it importing from the
+  owner it picked, and moves the keys back there. On KiviDB it stopped at
+  the `DELSLOTS`, and the keys already moved stayed on a node no client was
+  sent to for them: acknowledged writes read as missing until the slot was
+  closed by hand. Now any assigned slot is removed, with its `IMPORTING`
+  state; only one that is unassigned already is refused
+  (`ERR Slot N is already unassigned`), and a command with one such slot
+  changes nothing; for two seconds after, a peer's claim does not take the
+  slot back, so the `ADDSLOTS` fix sends next in the same transaction finds
+  it free. And `MIGRATE` runs on a node importing the slot too, as in Redis
+  while a slot is open: fix moves the keys back with it, and was sent
+  `MOVED` instead.
+
 - **`EXPIREAT` with a negative timestamp deletes the key,** as Redis does
   (by [@huong8373tt-beep](https://github.com/huong8373tt-beep)). It was
   refused with `ERR invalid expire time`; a time before the epoch is a time

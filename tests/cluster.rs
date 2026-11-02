@@ -2311,6 +2311,111 @@ fn migrate_moves_a_slot_with_every_type_and_ttl() {
     );
 }
 
+/// A slot left open by a reshard that stopped part way, with keys on both
+/// sides, is closed by the commands `redis-cli --cluster fix` sends, and
+/// every key reads back (#295). Fix picks the node with the most keys as
+/// the owner and, on the other, deletes the slot (`DELSLOTS`), gives it to
+/// the owner, sets it importing from there and moves its keys back. That
+/// `DELSLOTS` was refused, for a slot another node owned, and the keys
+/// already moved were left where no client was sent for them.
+#[test]
+fn redis_cli_cluster_fix_closes_an_interrupted_reshard() {
+    let (nodes, ranges) = form_cluster(2);
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let (a_id, b_id) = (a.id(), b.id());
+    let tag = key_in(ranges[0].0..=ranges[0].1, "fix");
+    let slot = slot_of(&tag).to_string();
+    let keys: Vec<String> = (0..30).map(|i| format!("{{{tag}}}:{i}")).collect();
+    let mut ca = a.conn();
+    let mut cb = b.conn();
+    for key in &keys {
+        assert!(ca.cmd(&["SET", key, &format!("v-{key}")]).is_ok());
+    }
+
+    // The reshard: the slot opened on both sides, and 12 of the 30 keys
+    // moved before it stopped.
+    assert!(
+        cb.cmd(&["CLUSTER", "SETSLOT", &slot, "IMPORTING", &a_id])
+            .is_ok()
+    );
+    assert!(
+        ca.cmd(&["CLUSTER", "SETSLOT", &slot, "MIGRATING", &b_id])
+            .is_ok()
+    );
+    let a_port = a.port.to_string();
+    let b_port = b.port.to_string();
+    let mut migrate: Vec<&str> = vec!["MIGRATE", "127.0.0.1", &b_port, "", "0", "5000", "KEYS"];
+    migrate.extend(keys[..12].iter().map(String::as_str));
+    assert!(ca.cmd(&migrate).is_ok());
+    assert_eq!(ca.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 18);
+    assert_eq!(cb.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 12);
+
+    // `--cluster fix`, as redis-cli 7.2 sends it (clusterManagerFixOpenSlot):
+    // the node with the most keys, `a`, is the owner.
+    assert!(ca.cmd(&["CLUSTER", "SETSLOT", &slot, "STABLE"]).is_ok());
+    assert!(ca.cmd(&["MULTI"]).is_ok());
+    ca.cmd(&["CLUSTER", "DELSLOTS", &slot]);
+    ca.cmd(&["CLUSTER", "ADDSLOTS", &slot]);
+    ca.cmd(&["CLUSTER", "BUMPEPOCH"]);
+    let exec = ca.cmd(&["EXEC"]);
+    assert!(exec.array()[1].is_ok(), "ADDSLOTS on the owner: {exec:?}");
+    // On the other node, which holds keys of the slot.
+    let reply = cb.cmd(&["CLUSTER", "DELSLOTS", &slot]);
+    assert!(
+        reply.is_ok(),
+        "DELSLOTS of a slot another node owns: {reply:?}"
+    );
+    assert!(
+        cb.cmd(&["CLUSTER", "SETSLOT", &slot, "NODE", &a_id])
+            .is_ok()
+    );
+    assert!(
+        cb.cmd(&["CLUSTER", "SETSLOT", &slot, "IMPORTING", &a_id])
+            .is_ok()
+    );
+    // "Case 2": its keys go to the owner, then the slot is closed there.
+    loop {
+        let batch = cb.cmd(&["CLUSTER", "GETKEYSINSLOT", &slot, "10"]);
+        let batch: Vec<String> = batch.array().iter().map(Resp::text).collect();
+        if batch.is_empty() {
+            break;
+        }
+        let mut migrate: Vec<&str> = vec!["MIGRATE", "127.0.0.1", &a_port, "", "0", "5000", "KEYS"];
+        migrate.extend(batch.iter().map(String::as_str));
+        let reply = cb.cmd(&migrate);
+        assert!(reply.is_ok(), "MIGRATE back to the owner: {reply:?}");
+    }
+    assert!(cb.cmd(&["CLUSTER", "SETSLOT", &slot, "STABLE"]).is_ok());
+    assert!(
+        cb.cmd(&["CLUSTER", "SETSLOT", &slot, "NODE", &a_id])
+            .is_ok()
+    );
+
+    // Every key reads back, from the owner, and the other node sends
+    // clients there.
+    for key in &keys {
+        assert_eq!(ca.cmd(&["GET", key]).text(), format!("v-{key}"), "{key}");
+    }
+    assert_eq!(ca.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 30);
+    let reply = cb.cmd(&["GET", &keys[0]]);
+    assert!(
+        reply
+            .err()
+            .is_some_and(|e| e.starts_with(&format!("MOVED {slot} 127.0.0.1:{a_port}"))),
+        "{reply:?}"
+    );
+    wait_until(
+        "both nodes to agree the slot is closed",
+        Duration::from_secs(10),
+        || {
+            [a, b].iter().all(|n| {
+                let nodes = n.conn().cmd(&["CLUSTER", "NODES"]).text();
+                !nodes.contains('[') && n.cluster_info("cluster_state") == "ok"
+            })
+        },
+    );
+}
+
 /// Run `args` (a `MIGRATE`) on `node`, started with the failpoint
 /// `migrate-before-delete`, and run `meanwhile` while it is stopped there:
 /// after the destination has confirmed the keys, before the source deletes
