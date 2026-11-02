@@ -5,7 +5,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ── Minimal RESP client ───────────────────────────────────────────────────────
 
@@ -634,6 +634,59 @@ fn test_woken_client_pops_before_the_push_replies() {
         "LLEN ran before the BLPOP popped"
     );
     assert_eq!(h.join().unwrap().as_array()[1].as_str(), "a");
+}
+
+/// A push whose woken client cannot look at once — it was killed, unblocked,
+/// or is still working through a pipeline of its own — still replies, and soon.
+#[test]
+fn test_a_woken_client_that_cannot_look_does_not_hold_the_push() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let push_ms = |c: &mut Conn, key: &str| {
+        let started = Instant::now();
+        c.cmds(&["LPUSH", key, "v"]);
+        started.elapsed().as_millis()
+    };
+
+    // Killed while blocked: its registration goes with it.
+    let mut victim = Conn::connect(port);
+    let id = victim.cmds(&["CLIENT", "ID"]).as_int().to_string();
+    victim
+        .stream
+        .write_all(b"*3\r\n$5\r\nBLPOP\r\n$2\r\nk1\r\n$1\r\n0\r\n")
+        .unwrap();
+    wait_for_blocked_clients(port, 1);
+    c.cmds(&["CLIENT", "KILL", "ID", &id]);
+    assert!(push_ms(&mut c, "k1") < 900, "a killed waiter held the push");
+
+    // Unblocked with an error, which it is told instead of a value.
+    let mut victim = Conn::connect(port);
+    let id = victim.cmds(&["CLIENT", "ID"]).as_int().to_string();
+    victim
+        .stream
+        .write_all(b"*3\r\n$5\r\nBLPOP\r\n$2\r\nk2\r\n$1\r\n0\r\n")
+        .unwrap();
+    wait_for_blocked_clients(port, 1);
+    c.cmds(&["CLIENT", "UNBLOCK", &id, "ERROR"]);
+    assert!(
+        push_ms(&mut c, "k2") < 900,
+        "an unblocked waiter held the push"
+    );
+
+    // Far behind a pipeline of its own: 200 commands are queued behind its
+    // BLPOP. The push waits for the pop, not for those.
+    let mut victim = Conn::connect(port);
+    let mut packet = b"*3\r\n$5\r\nBLPOP\r\n$2\r\nk3\r\n$1\r\n0\r\n".to_vec();
+    for _ in 0..200 {
+        packet.extend_from_slice(b"*2\r\n$3\r\nGET\r\n$1\r\nq\r\n");
+    }
+    victim.stream.write_all(&packet).unwrap();
+    wait_for_blocked_clients(port, 1);
+    assert!(
+        push_ms(&mut c, "k3") < 900,
+        "a pipelined waiter held the push"
+    );
 }
 
 // Manual test scenario:
