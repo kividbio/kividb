@@ -1692,7 +1692,10 @@ fn classify_tail(rest: &[u8]) -> Tail {
     // writes were never synced, so cut off with whatever record they end;
     // a server refused to start over them. Zeros with anything after them
     // are not a tail: a hole in the middle of the log is damage.
-    let end = rest.iter().rposition(|&b| b != 0).map_or(0, |last| last + 1);
+    let end = rest
+        .iter()
+        .rposition(|&b| b != 0)
+        .map_or(0, |last| last + 1);
     if end < rest.len() {
         return if end == 0 {
             Tail::Truncated
