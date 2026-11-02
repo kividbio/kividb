@@ -4,8 +4,8 @@ import csv
 import sys
 
 rows = list(csv.DictReader(open(sys.argv[1])))
-engines = sys.argv[2:] or ["kividb-rc4", "kividb-1.1.3", "redis", "redis-cluster", "valkey", "dragonfly"]
-NAMES = {"kividb-rc4": "KiviDB rc4", "kividb-1.1.3": "KiviDB 1.1.3", "redis": "Redis 8.10.3",
+engines = sys.argv[2:] or ["kividb-cand", "kividb-1.1.3", "redis", "redis-cluster", "valkey", "dragonfly"]
+NAMES = {"kividb-cand": "KiviDB 1.2.0 (75482abb)", "kividb-rc4": "KiviDB rc4", "kividb-1.1.3": "KiviDB 1.1.3", "redis": "Redis 8.10.3",
          "redis-cluster": "Redis Cluster x16", "valkey": "Valkey 9.1.3", "dragonfly": "Dragonfly 2.0.2",
          "kvrocks": "kvrocks 2.17.0"}
 CMDS = ["LPUSH", "LPOP", "LRANGE_100", "HSET", "HGET", "HGETALL", "SADD", "SISMEMBER", "ZADD", "ZRANGE", "INCR"]
@@ -21,7 +21,7 @@ def fmt(x):
 for v in ["100", "2048"]:
     for p in ["1", "16"]:
         print(f"\n#### {'100 B' if v == '100' else '2 KB'} values, pipeline {p}\n")
-        print("ops/s: median of 3 runs (spread = (max-min)/median). Latency: p50 / p99 / p99.9 in ms. "
+        print("ops/s: median of 9 runs (3 rounds) for KiviDB 1.2.0, of 3 for the others (spread = (max-min)/median). Latency: p50 / p99 / p99.9 in ms. "
               "`*` = best ops/s in the row.\n")
         print("| command | " + " | ".join(NAMES[e] for e in engines) + " |")
         print("|---|" + "---|" * len(engines))

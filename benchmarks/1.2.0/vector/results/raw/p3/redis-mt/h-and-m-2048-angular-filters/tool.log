@@ -1,20 +1,104 @@
-1793577649.481 RUN ./vector-db-benchmark --host 10.90.1.4 --engines-file redis-engine.json --engines redis-m16-ef128 --skip-search --datasets h-and-m-2048-angular-filters --skip-if-exists false 
-1793577649.489 vector-db-benchmark 0.2.0 (git d22d44e8b46009a800a59e952710166ece2e38a1)
-1793577649.491 Found 1 datasets, 1 engines
-1793577649.493 
-1793577649.495 ============================================================
-1793577649.497 Running experiment (1/1): redis-m16-ef128 - h-and-m-2048-angular-filters
-1793577649.499 ============================================================
-1793577649.501 Experiment stage: Configure
-1793577649.503 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 128}
-1793577649.504 Experiment stage: Upload
-1793577649.506 Reading dataset from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
-1793577651.204 Read 105100 vectors (2048d) in 1.708s (61549 vectors/sec)
-1793577651.208 Starting upload with 16 threads, batch size 64...
-1793577664.296 Upload time: 13.092s (8028 records/sec)
-1793577664.298 Indexing complete (num_docs=105100/105100, indexing=false, percent_indexed=1.00, state=absent) in 0.0s
-1793577664.300 Index time: 0.002s, Total time (read+upload+index): 14.801s
-1793577664.510 Results saved to: "/home/ubuntu/vdbx/results/redis-m16-ef128-h-and-m-2048-angular-filters-upload-0-105100-2026-11-02-00-01-04.json"
-1793577664.515 Experiment stage: Cleanup (deleting index and data)
-1793577665.001 Experiment stage: Done
-1793577665.066 EXIT 0
+1793640876.863 RUN ./vector-db-benchmark --host 10.90.1.4 --engines-file redis-engine.json --engines redis-m16-ef128 --datasets h-and-m-2048-angular-filters --skip-if-exists false 
+1793640876.871 vector-db-benchmark 0.2.0 (git d22d44e8b46009a800a59e952710166ece2e38a1)
+1793640876.873 Found 1 datasets, 1 engines
+1793640876.875 
+1793640876.876 ============================================================
+1793640876.878 Running experiment (1/1): redis-m16-ef128 - h-and-m-2048-angular-filters
+1793640876.880 ============================================================
+1793640876.882 Experiment stage: Configure
+1793640876.883 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 128}
+1793640876.885 Experiment stage: Upload
+1793640876.887 Reading dataset from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793640878.568 Read 105100 vectors (2048d) in 1.689s (62209 vectors/sec)
+1793640878.570 Starting upload with 16 threads, batch size 64...
+1793640891.685 Upload time: 13.118s (8012 records/sec)
+1793640891.687 Indexing complete (num_docs=105100/105100, indexing=false, percent_indexed=1.00, state=absent) in 0.0s
+1793640891.689 Index time: 0.001s, Total time (read+upload+index): 14.809s
+1793640891.902 Results saved to: "/home/azureuser/vdbx/results/redis-m16-ef128-h-and-m-2048-angular-filters-upload-0-105100-2026-11-02-17-34-51.json"
+1793640893.533 Experiment stage: Search
+1793640893.534 	Running search 0: ef=64, parallel=1
+1793640893.537 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793640970.690 	  rep 1/3: QPS 132.9
+1793640970.692 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793641047.831 	  rep 2/3: QPS 132.9
+1793641047.833 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793641125.159 	  rep 3/3: QPS 132.6
+1793641125.161 	→ QPS: 132.9, Recall: 0.9986, Precision@returned: 0.9986, MRR: 0.9989, NDCG: 0.9986 (best of reps)
+1793641125.162 	Running search 1: ef=128, parallel=1
+1793641125.164 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793641202.451 	  rep 1/3: QPS 132.6
+1793641202.452 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793641279.814 	  rep 2/3: QPS 132.5
+1793641279.816 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793641357.053 	  rep 3/3: QPS 132.7
+1793641357.055 	→ QPS: 132.7, Recall: 0.9986, Precision@returned: 0.9986, MRR: 0.9989, NDCG: 0.9986 (best of reps)
+1793641357.057 	Running search 2: ef=256, parallel=1
+1793641357.059 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793641434.399 	  rep 1/3: QPS 132.5
+1793641434.401 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793641511.665 	  rep 2/3: QPS 132.6
+1793641511.667 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793641589.029 	  rep 3/3: QPS 132.5
+1793641589.031 	→ QPS: 132.6, Recall: 0.9986, Precision@returned: 0.9986, MRR: 0.9989, NDCG: 0.9986 (best of reps)
+1793641589.033 	Running search 3: ef=128, parallel=16
+1793641589.035 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793641596.476 	  rep 1/3: QPS 1792.6
+1793641596.477 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793641603.916 	  rep 2/3: QPS 1794.9
+1793641603.917 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793641611.348 	  rep 3/3: QPS 1798.0
+1793641611.349 	→ QPS: 1798.0, Recall: 0.9986, Precision@returned: 0.9986, MRR: 0.9989, NDCG: 0.9986 (best of reps)
+1793641611.351 	Running search 4: ef=128, parallel=100
+1793641611.353 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793641618.711 	  rep 1/3: QPS 1835.1
+1793641618.713 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793641626.062 	  rep 2/3: QPS 1843.7
+1793641626.064 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793641633.389 	  rep 3/3: QPS 1846.8
+1793641633.391 	→ QPS: 1846.8, Recall: 0.9986, Precision@returned: 0.9986, MRR: 0.9989, NDCG: 0.9986 (best of reps)
+1793641633.408 	Results saved to: "/home/azureuser/vdbx/results/redis-m16-ef128-h-and-m-2048-angular-filters-search-0-77264-2026-11-02-17-47-13.json"
+1793641633.423 	Results saved to: "/home/azureuser/vdbx/results/redis-m16-ef128-h-and-m-2048-angular-filters-search-1-77264-2026-11-02-17-47-13.json"
+1793641633.437 	Results saved to: "/home/azureuser/vdbx/results/redis-m16-ef128-h-and-m-2048-angular-filters-search-2-77264-2026-11-02-17-47-13.json"
+1793641633.451 	Results saved to: "/home/azureuser/vdbx/results/redis-m16-ef128-h-and-m-2048-angular-filters-search-3-77264-2026-11-02-17-47-13.json"
+1793641633.465 	Results saved to: "/home/azureuser/vdbx/results/redis-m16-ef128-h-and-m-2048-angular-filters-search-4-77264-2026-11-02-17-47-13.json"
+1793641633.467 
+1793641633.468 ⚠ CONCURRENCY / CPU SATURATION WARNINGS (results below may be untrustworthy):
+1793641633.470   - throughput saturated: ef=128 parallel 16→100 gained only 3% QPS while p95 rose 91% — higher concurrency is not paying off
+1793641633.472 
+1793641633.474 -----------------------------------------------------------------------------------------------
+1793641633.476 Recall     Precision  MRR      NDCG     QPS        P50 (ms)     P90 (ms)     P95 (ms)    
+1793641633.478 -----------------------------------------------------------------------------------------------
+1793641633.479 0.9986     0.9986     0.9989   0.9986   1846.8     50.149       74.157       89.916      
+1793641633.481 
+1793641633.483 
+1793641633.485 QPS vs Precision Trade-off - redis-m16-ef128 - h-and-m-2048-angular-filters (up and to the right is better):
+1793641633.487 
+1793641633.488     1847 │●                                                           
+1793641633.490     1679 │                                                            
+1793641633.492     1511 │                                                            
+1793641633.494     1343 │                                                            
+1793641633.496     1175 │                                                            
+1793641633.498     1007 │                                                            
+1793641633.500      839 │                                                            
+1793641633.501      672 │                                                            
+1793641633.503      504 │                                                            
+1793641633.505      336 │                                                            
+1793641633.507      168 │                                                            
+1793641633.509        0 │                                                            
+1793641633.511          └────────────────────────────────────────────────────────────
+1793641633.513           0.999          1.002          1.005          1.009          
+1793641633.515         Precision (0.0 = 0%, 1.0 = 100%)
+1793641633.517 
+1793641633.519 THROUGHPUT vs CONCURRENCY (saturation curve):
+1793641633.521   ef=128 — peak 1846.8 QPS @ parallel 100 (still climbing at top of swept range — sweep higher to find the knee)
+1793641633.522     parallel         QPS     p50 ms     p90 ms     p95 ms     p99 ms    sat?
+1793641633.524            1       132.7      2.842     20.628     39.325     47.094       -
+1793641633.526           16      1798.0      3.310     24.230     47.045     55.979       -
+1793641633.528          100      1846.8     50.149     74.157     89.916    107.313       -
+1793641633.530 
+1793641633.532 ================================================================================
+1793641633.534 Results saved to:  /home/azureuser/vdbx/results
+1793641633.536 Summary saved to:  /home/azureuser/vdbx/results/redis-m16-ef128-h-and-m-2048-angular-filters-summary.json
+1793641633.538 Experiment stage: Cleanup (deleting index and data)
+1793641633.950 Experiment stage: Done
+1793641634.018 EXIT 0

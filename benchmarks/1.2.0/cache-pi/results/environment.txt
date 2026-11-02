@@ -9,7 +9,8 @@ Model name:                              Neoverse-N1
 L2 cache:                                4 MiB (4 instances)
 L3 cache:                                32 MiB (1 instance)
                total        used        free      shared  buff/cache   available
-Mem:            7911         564        6564           3         963        7346
+Mem:            7911        1532        5616           3         944        6379
+Ubuntu 24.04.5 LTS
 client environment (c1):
 7.0.0-1017-azure
 4

@@ -22,7 +22,8 @@ FREQ=${FREQ:-499} SECS=${SECS:-10} MINW=${MINW:-0.3} FG=${FG:-$HOME/FlameGraph}
 WORKLOADS=${WORKLOADS:-"get set"} PIPES=${PIPES:-"1 16"}
 HERE=$(cd "$(dirname "$0")" && pwd)
 source "$HERE/engines.sh"
-OUT=~/out/profiling/$ENGINE ROUT=out/profiling/$ENGINE
+RUN=${RUN:-$ENGINE} # output name; RUN=<engine>-r2 for a second round
+OUT=~/out/profiling/$RUN ROUT=out/profiling/$RUN
 mkdir -p "$OUT"; ssh "$CLI" "mkdir -p $ROUT"
 HZ=$(getconf CLK_TCK)
 

@@ -1,0 +1,20 @@
+1793646301.745 RUN ./vector-db-benchmark --host 10.90.1.4 --engines-file kividb-engine.json --parallels 100 --skip-search --datasets glove-25-angular --skip-if-exists false 
+1793646301.753 vector-db-benchmark v0.1.0
+1793646301.755 Found 1 datasets, 1 engines
+1793646301.756 
+1793646301.758 ============================================================
+1793646301.760 Running experiment (1/1): kividb-glove25 - glove-25-angular
+1793646301.762 ============================================================
+1793646301.764 Experiment stage: Configure
+1793646301.765 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 256}
+1793646301.767 Experiment stage: Upload
+1793646301.769 Reading dataset from /home/azureuser/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793646301.963 Read 1183514 vectors (25d) in 0.205s (5764892 vectors/sec)
+1793646301.965 Starting upload with 100 threads, batch size 64...
+1793646334.299 Upload time: 32.337s (36600 records/sec)
+1793646334.385 Indexing complete: 1183514 docs in 0.1s
+1793646334.386 Index time: 0.085s, Total time (read+upload+index): 32.627s
+1793646334.521 Results saved to: "/home/azureuser/vdb/results/kividb-glove25-glove-25-angular-upload-0-1183514-2026-11-02-19-05-34.json"
+1793646334.764 Experiment stage: Cleanup (deleting index and data)
+1793646340.219 Experiment stage: Done
+1793646340.235 EXIT 0

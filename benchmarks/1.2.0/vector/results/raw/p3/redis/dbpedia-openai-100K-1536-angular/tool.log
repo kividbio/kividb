@@ -1,20 +1,106 @@
-1793577939.828 RUN ./vector-db-benchmark --host 10.90.1.4 --engines-file redis-engine.json --engines redis-m16-ef128 --skip-search --datasets dbpedia-openai-100K-1536-angular --skip-if-exists false 
-1793577939.836 vector-db-benchmark 0.2.0 (git d22d44e8b46009a800a59e952710166ece2e38a1)
-1793577939.838 Found 1 datasets, 1 engines
-1793577939.840 
-1793577939.841 ============================================================
-1793577939.843 Running experiment (1/1): redis-m16-ef128 - dbpedia-openai-100K-1536-angular
-1793577939.845 ============================================================
-1793577939.847 Experiment stage: Configure
-1793577939.849 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 128}
-1793577939.850 Experiment stage: Upload
-1793577939.852 Reading dataset from /home/ubuntu/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
-1793577940.518 Read 100000 vectors (1536d) in 0.676s (147900 vectors/sec)
-1793577940.520 Starting upload with 16 threads, batch size 64...
-1793577950.490 Upload time: 9.972s (10028 records/sec)
-1793577950.492 Indexing complete (num_docs=100000/100000, indexing=false, percent_indexed=1.00, state=absent) in 0.0s
-1793577950.494 Index time: 0.001s, Total time (read+upload+index): 10.650s
-1793577950.539 Results saved to: "/home/ubuntu/vdbx/results/redis-m16-ef128-dbpedia-openai-100K-1536-angular-upload-0-100000-2026-11-02-00-05-50.json"
-1793577950.543 Experiment stage: Cleanup (deleting index and data)
-1793577950.717 Experiment stage: Done
-1793577950.719 EXIT 0
+1793642738.117 RUN ./vector-db-benchmark --host 10.90.1.4 --engines-file redis-engine.json --engines redis-m16-ef128 --datasets dbpedia-openai-100K-1536-angular --skip-if-exists false 
+1793642738.124 vector-db-benchmark 0.2.0 (git d22d44e8b46009a800a59e952710166ece2e38a1)
+1793642738.126 Found 1 datasets, 1 engines
+1793642738.128 
+1793642738.129 ============================================================
+1793642738.131 Running experiment (1/1): redis-m16-ef128 - dbpedia-openai-100K-1536-angular
+1793642738.133 ============================================================
+1793642738.135 Experiment stage: Configure
+1793642738.137 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 128}
+1793642738.138 Experiment stage: Upload
+1793642738.140 Reading dataset from /home/azureuser/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793642738.847 Read 100000 vectors (1536d) in 0.717s (139484 vectors/sec)
+1793642738.849 Starting upload with 16 threads, batch size 64...
+1793642748.937 Upload time: 10.090s (9910 records/sec)
+1793642748.939 Indexing complete (num_docs=100000/100000, indexing=false, percent_indexed=1.00, state=absent) in 0.0s
+1793642748.941 Index time: 0.001s, Total time (read+upload+index): 10.808s
+1793642748.993 Results saved to: "/home/azureuser/vdbx/results/redis-m16-ef128-dbpedia-openai-100K-1536-angular-upload-0-100000-2026-11-02-18-05-48.json"
+1793642749.652 Experiment stage: Search
+1793642749.653 	Running search 0: ef=64, parallel=1
+1793642749.655 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793642755.855 	  rep 1/3: QPS 904.7
+1793642755.856 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793642762.067 	  rep 2/3: QPS 902.2
+1793642762.069 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793642768.251 	  rep 3/3: QPS 906.6
+1793642768.253 	→ QPS: 906.6, Recall: 0.9556, Precision@returned: 0.9556, MRR: 0.9960, NDCG: 0.9692 (best of reps)
+1793642768.255 	Running search 1: ef=128, parallel=1
+1793642768.257 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793642777.401 	  rep 1/3: QPS 589.5
+1793642777.403 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793642786.554 	  rep 2/3: QPS 589.4
+1793642786.556 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793642795.736 	  rep 3/3: QPS 587.4
+1793642795.738 	→ QPS: 589.5, Recall: 0.9795, Precision@returned: 0.9795, MRR: 0.9978, NDCG: 0.9857 (best of reps)
+1793642795.739 	Running search 2: ef=256, parallel=1
+1793642795.741 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793642810.313 	  rep 1/3: QPS 359.6
+1793642810.315 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793642824.911 	  rep 2/3: QPS 359.0
+1793642824.913 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793642839.491 	  rep 3/3: QPS 359.5
+1793642839.492 	→ QPS: 359.6, Recall: 0.9913, Precision@returned: 0.9913, MRR: 0.9998, NDCG: 0.9942 (best of reps)
+1793642839.494 	Running search 3: ef=128, parallel=16
+1793642839.496 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793642840.821 	  rep 1/3: QPS 7583.8
+1793642840.823 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793642842.151 	  rep 2/3: QPS 7586.2
+1793642842.152 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793642843.478 	  rep 3/3: QPS 7618.9
+1793642843.479 	→ QPS: 7618.9, Recall: 0.9795, Precision@returned: 0.9795, MRR: 0.9978, NDCG: 0.9857 (best of reps)
+1793642843.481 	Running search 4: ef=128, parallel=100
+1793642843.483 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793642844.763 	  rep 1/3: QPS 8240.5
+1793642844.765 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793642846.051 	  rep 2/3: QPS 8215.2
+1793642846.052 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793642847.335 	  rep 3/3: QPS 8272.8
+1793642847.337 	→ QPS: 8272.8, Recall: 0.9795, Precision@returned: 0.9795, MRR: 0.9978, NDCG: 0.9857 (best of reps)
+1793642847.342 	Results saved to: "/home/azureuser/vdbx/results/redis-m16-ef128-dbpedia-openai-100K-1536-angular-search-0-83240-2026-11-02-18-07-27.json"
+1793642847.346 	Results saved to: "/home/azureuser/vdbx/results/redis-m16-ef128-dbpedia-openai-100K-1536-angular-search-1-83240-2026-11-02-18-07-27.json"
+1793642847.350 	Results saved to: "/home/azureuser/vdbx/results/redis-m16-ef128-dbpedia-openai-100K-1536-angular-search-2-83240-2026-11-02-18-07-27.json"
+1793642847.354 	Results saved to: "/home/azureuser/vdbx/results/redis-m16-ef128-dbpedia-openai-100K-1536-angular-search-3-83240-2026-11-02-18-07-27.json"
+1793642847.358 	Results saved to: "/home/azureuser/vdbx/results/redis-m16-ef128-dbpedia-openai-100K-1536-angular-search-4-83240-2026-11-02-18-07-27.json"
+1793642847.359 
+1793642847.361 ⚠ CONCURRENCY / CPU SATURATION WARNINGS (results below may be untrustworthy):
+1793642847.363   - throughput saturated: ef=128 parallel 16→100 gained only 9% QPS while p95 rose 403% — higher concurrency is not paying off
+1793642847.365 
+1793642847.366 -----------------------------------------------------------------------------------------------
+1793642847.368 Recall     Precision  MRR      NDCG     QPS        P50 (ms)     P90 (ms)     P95 (ms)    
+1793642847.370 -----------------------------------------------------------------------------------------------
+1793642847.372 0.9913     0.9913     0.9998   0.9942   359.6      2.829        3.284        3.390       
+1793642847.374 0.9795     0.9795     0.9978   0.9857   8272.8     12.016       12.585       12.784      
+1793642847.375 0.9556     0.9556     0.9960   0.9692   906.6      1.103        1.261        1.311       
+1793642847.377 
+1793642847.379 
+1793642847.381 QPS vs Precision Trade-off - redis-m16-ef128 - dbpedia-openai-100K-1536-angular (up and to the right is better):
+1793642847.382 
+1793642847.384     8273 │                                       ●                    
+1793642847.386     7521 │                                                            
+1793642847.388     6769 │                                                            
+1793642847.390     6017 │                                                            
+1793642847.391     5265 │                                                            
+1793642847.393     4512 │                                                            
+1793642847.395     3760 │                                                            
+1793642847.397     3008 │                                                            
+1793642847.399     2256 │                                                            
+1793642847.401     1504 │                                                            
+1793642847.402      752 │●                                                           
+1793642847.404        0 │                                                           ●
+1793642847.406          └────────────────────────────────────────────────────────────
+1793642847.408           0.956          0.967          0.979          0.991          
+1793642847.410         Precision (0.0 = 0%, 1.0 = 100%)
+1793642847.411 
+1793642847.413 THROUGHPUT vs CONCURRENCY (saturation curve):
+1793642847.415   ef=128 — peak 8272.8 QPS @ parallel 100 (still climbing at top of swept range — sweep higher to find the knee)
+1793642847.417     parallel         QPS     p50 ms     p90 ms     p95 ms     p99 ms    sat?
+1793642847.419            1       589.5      1.712      1.976      2.039      2.181       -
+1793642847.420           16      7618.9      2.115      2.445      2.540      2.718       -
+1793642847.422          100      8272.8     12.016     12.585     12.784     13.173       -
+1793642847.424 
+1793642847.426 ================================================================================
+1793642847.427 Results saved to:  /home/azureuser/vdbx/results
+1793642847.429 Summary saved to:  /home/azureuser/vdbx/results/redis-m16-ef128-dbpedia-openai-100K-1536-angular-summary.json
+1793642847.431 Experiment stage: Cleanup (deleting index and data)
+1793642847.536 Experiment stage: Done
+1793642847.544 EXIT 0

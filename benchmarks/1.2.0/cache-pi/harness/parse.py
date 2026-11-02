@@ -2,7 +2,8 @@
 """parse.py <results-dir> -- one CSV row per run (results/runs.csv) and a median/spread summary
 (results/summary.csv) from the client's bench-<tag>.log and the server's final-<tag>.txt.
 
-Tags are <engine>_<lfu|lru>_<F|S>_<rep>: F = the reporter's -benchtime=33554432x, S = 8388608x.
+Tags are <engine>_<lfu|lru>_<F|S|P|D|X>_<rep>: F = the reporter's -benchtime=33554432x, S = 8388608x
+(P = profiled, D = diagnostic sampler, X = extra candidate/rc4 rounds, rep 1a/1b; all 8388608x).
 Like the reporter, per_memory_hit_rate and hit/s/mem are scaled by 1 GiB / the server's VmHWM
 (the client cannot read a remote VmHWM and prints 0 kB)."""
 import csv, os, re, statistics, sys
@@ -22,7 +23,7 @@ for fn in sorted(os.listdir(RAW)):
     b = open(os.path.join(RAW, fn)).read()
     fpath = os.path.join(RAW, f"final-{tag}.txt")
     f = open(fpath).read() if os.path.exists(fpath) else ""
-    r = dict(tag=tag, engine=engine, policy="allkeys-" + pol, length=length, rep=int(rep))
+    r = dict(tag=tag, engine=engine, policy="allkeys-" + pol, length=length, rep=int(rep) if rep.isdigit() else rep)
     r["pair"] = (re.search(r"pair: (\S+)", b) or [None, ""])[1]
     r["exit"] = (re.search(r"exit=(\d+)", b) or [None, ""])[1]
     r["errors"] = b.count("got error")
@@ -70,7 +71,7 @@ cols = ["tag", "engine", "policy", "length", "rep", "pair", "status", "exit", "e
 with open(os.path.join(D, "runs.csv"), "w", newline="\n") as fh:
     w = csv.DictWriter(fh, cols, extrasaction="ignore", lineterminator="\n")
     w.writeheader()
-    for r in sorted(rows, key=lambda r: (r["length"], r["policy"], r["engine"], r["rep"])):
+    for r in sorted(rows, key=lambda r: (r["length"], r["policy"], r["engine"], str(r["rep"]))):
         w.writerow(r)
 
 metrics = ["hit_rate", "per_mem_hit_rate", "vmhwm_kb", "gets_per_s", "hits_per_s", "hit_per_s_mem",

@@ -4,10 +4,9 @@ import csv, os, statistics, sys
 
 R = sys.argv[1]
 rows = [r for r in csv.DictReader(open(os.path.join(R, "runs.csv"))) if r.get("gets")]
-ORDER = ["kividb-rc4", "kividb-master", "kividb-1.1.3", "kividb-48280b7", "redis-8.10.3", "redis-6bf6224"]
-NAME = {"kividb-rc4": "KiviDB 1.2.0-rc4", "kividb-master": "KiviDB master 348cc2d (dry run)",
-        "kividb-1.1.3": "KiviDB 1.1.3", "kividb-48280b7": "KiviDB 48280b7 (1.2.0-rc2, reporter's)",
-        "redis-8.10.3": "Redis 8.10.3", "redis-6bf6224": "Redis unstable 6bf6224 (reporter's)"}
+ORDER = ["kividb-75482ab", "kividb-rc4", "kividb-1.1.3", "redis-8.10.3", "redis-6bf6224"]
+NAME = {"kividb-75482ab": "KiviDB 1.2.0 candidate 75482ab", "kividb-rc4": "KiviDB 1.2.0-rc4",
+        "kividb-1.1.3": "KiviDB 1.1.3", "redis-8.10.3": "Redis 8.10.3", "redis-6bf6224": "Redis unstable 6bf6224 (reporter's)"}
 LEN = {"F": "33,554,432 GETs (the reporter's -benchtime)", "S": "8,388,608 GETs"}
 
 

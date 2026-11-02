@@ -3,7 +3,9 @@
 RAW_DIR/<engine>/<label>.json are memtier_benchmark JSON outputs (labels
 <cmd>-<V>-p<P>-r<R>, or incr-p<P>-r<R>), RAW_DIR/<engine>/server-cpu.csv the
 server's CPU seconds per run and RAW_DIR/<engine>/memory.csv the RSS after
-loading each group. Writes OUT_DIR/runs.csv (one row per measured run),
+loading each group. A folder <engine>-r<N> is round N of that engine (the
+same matrix run again later in the session): its runs count as the engine's,
+with round = N in runs.csv. Writes OUT_DIR/runs.csv (one row per measured run),
 OUT_DIR/summary.csv (median of the repeats, with min and max) and
 OUT_DIR/memory.csv.
 """
@@ -15,6 +17,7 @@ import statistics
 import sys
 
 RAW, OUT = sys.argv[1], sys.argv[2]
+ROUND = re.compile(r"^(?P<e>.+)-r(?P<n>\d+)$")
 LABEL = re.compile(r"^(?P<cmd>[a-z0-9]+?)(?:-(?P<v>\d+))?-p(?P<p>\d+)-r(?P<r>\d+)$")
 
 
@@ -31,8 +34,10 @@ def load_cpu(path):
 
 runs = []
 memory = []
-for engine in sorted(os.listdir(RAW)):
-    d = os.path.join(RAW, engine)
+for folder in sorted(os.listdir(RAW)):
+    d = os.path.join(RAW, folder)
+    rm = ROUND.match(folder)
+    engine, rnd = (rm["e"], int(rm["n"])) if rm else (folder, 1)
     if not os.path.isdir(d):
         continue
     cpu = load_cpu(os.path.join(d, "server-cpu.csv"))
@@ -66,6 +71,7 @@ for engine in sorted(os.listdir(RAW)):
             "command": m["cmd"].upper().replace("LRANGE100", "LRANGE_100"),
             "value_bytes": m["v"] or "",
             "pipeline": int(m["p"]),
+            "round": rnd,
             "repeat": int(m["r"]),
             "requests": t.get("Count", 0),
             "ops_per_sec": round(t.get("Ops/sec", 0.0)),

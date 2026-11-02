@@ -22,8 +22,8 @@ plt.rcParams.update({
 })
 RES, OUT = sys.argv[1], sys.argv[2]
 os.makedirs(OUT, exist_ok=True)
-NAMES = {"kividb-rc4-fp": "KiviDB 1.2.0-rc4", "kividb-1.1.3-fp": "KiviDB 1.1.3", "redis": "Redis 8.10.3 (io-threads 8)"}
-COLORS = {"kividb-rc4-fp": "#0072B2", "kividb-1.1.3-fp": "#56B4E9", "redis": "#D55E00"}
+NAMES = {"kividb-cand-fp": "KiviDB 1.2.0", "kividb-rc4-fp": "KiviDB 1.2.0-rc4", "kividb-1.1.3-fp": "KiviDB 1.1.3", "redis": "Redis 8.10.3 (io-threads 8)"}
+COLORS = {"kividb-cand-fp": "#0072B2", "kividb-rc4-fp": "#56B4E9", "kividb-1.1.3-fp": "#56B4E9", "redis": "#D55E00"}
 
 # Categories: one sequential-ish neutral set (identity of a category, not of an engine).
 CATS = [
@@ -39,7 +39,7 @@ CATS = [
 ]
 
 split = list(csv.DictReader(open(os.path.join(RES, "cpu-split.csv"))))
-order = [(e, w) for e in ["kividb-rc4-fp", "kividb-1.1.3-fp", "redis"] for w in ["get-p1", "get-p16", "set-p1", "set-p16"]
+order = [(e, w) for e in ["kividb-cand-fp", "kividb-1.1.3-fp", "redis"] for w in ["get-p1", "get-p16", "set-p1", "set-p16"]
          if any(r["engine"] == e and r["workload"] == w for r in split)]
 if order:
     fig, ax = plt.subplots(figsize=(12, 0.5 * len(order) + 2.2))
@@ -75,15 +75,17 @@ if order:
 cg = os.path.join(RES, "callgrind-table.csv")
 if os.path.exists(cg):
     rows = list(csv.DictReader(open(cg)))
-    tags = [k for k in rows[0].keys() if k != "workload"]
-    tcol = {"v113": "#56B4E9", "rc4": "#0072B2", "redis-8.10.3": "#D55E00"}
-    tname = {"v113": "KiviDB 1.1.3", "rc4": "KiviDB 1.2.0-rc4", "redis-8.10.3": "Redis 8.10.3"}
-    rows = [r for r in rows if all(r.get(t) for t in tags)]
+    tags = [k for k in ["v113", "cand", "redis-8.10.3"] if k in rows[0]]  # rc4 is in vs-rc4 charts only
+    tcol = {"v113": "#56B4E9", "cand": "#0072B2", "redis-8.10.3": "#D55E00"}
+    tname = {"v113": "KiviDB 1.1.3", "cand": "KiviDB 1.2.0 (75482abb)", "redis-8.10.3": "Redis 8.10.3"}
+    rows = [r for r in rows if all(r.get(t) for t in tags[:2])]
+    for r in rows:
+        r.setdefault("redis-8.10.3", "")
     fig, ax = plt.subplots(figsize=(12, 4.6))
     w = 0.8 / len(tags)
     for j, t in enumerate(tags):
         xs = [i + (j - (len(tags) - 1) / 2) * w for i in range(len(rows))]
-        hs = [float(r[t]) for r in rows]
+        hs = [float(r[t] or 0) for r in rows]
         ax.bar(xs, hs, width=w * 0.92, color=tcol.get(t, "#999999"), label=tname.get(t, t))
     ax.set_xticks(range(len(rows)))
     ax.set_xticklabels([r["workload"].replace("MIX-100", "MIX-100 (SET+GET)") for r in rows], fontsize=8, rotation=20)
@@ -100,7 +102,7 @@ print("charts in", OUT)
 # per-thread CPU at pipeline 16: is one thread the ceiling?
 for wl in ["get-p16", "set-p16"]:
     series = []
-    for e in ["kividb-rc4-fp", "redis"]:
+    for e in ["kividb-cand-fp", "redis"]:
         p = os.path.join(RES, e, f"{wl}.threads.csv")
         if not os.path.exists(p):
             continue
@@ -113,7 +115,7 @@ for wl in ["get-p16", "set-p16"]:
         xs = list(range(len(rows)))
         ax.bar(xs, [float(r["cores"]) for r in rows], color=COLORS[e], width=0.75)
         ax.set_xticks(xs)
-        ax.set_xticklabels([r["thread"].replace("kividb-rc4-fp", "worker").replace("redis-server", "main")
+        ax.set_xticklabels([r["thread"].replace("kividb-cand-fp", "worker").replace("redis-server", "main")
                             for r in rows], rotation=60, fontsize=7)
         ax.axhline(1.0, color="#222222", linewidth=0.8, linestyle="--")
         ax.set_ylim(0, 1.1)

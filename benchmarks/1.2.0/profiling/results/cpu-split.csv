@@ -1,145 +1,361 @@
 engine,workload,category,samples,share_pct,us_per_op,total_us_per_op,no_stack_pct
-kividb-1.1.3-fp,get-p1,"kernel: thread sleep/wake (futex, scheduler)",8875751432,6.3,0.721,11.353,0.0
-kividb-1.1.3-fp,get-p1,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",107388776696,76.8,8.722,11.353,0.0
-kividb-1.1.3-fp,get-p1,memory allocation,386773544,0.3,0.031,11.353,0.0
-kividb-1.1.3-fp,get-p1,locks and atomics,84168336,0.1,0.007,11.353,0.0
-kividb-1.1.3-fp,get-p1,parsing requests,1192384760,0.9,0.097,11.353,0.0
-kividb-1.1.3-fp,get-p1,building replies,264529056,0.2,0.021,11.353,0.0
-kividb-1.1.3-fp,get-p1,"command execution (lookup, read/write the value)",10983967848,7.9,0.892,11.353,0.0
-kividb-1.1.3-fp,get-p1,event loop and connection handling (user space),10603206328,7.6,0.861,11.353,0.0
-kividb-1.1.3-fp,get-p1,other user space,0,0.0,0.0,11.353,0.0
-kividb-1.1.3-fp,get-p16,"kernel: thread sleep/wake (futex, scheduler)",11907815536,8.9,0.182,2.055,0.0
-kividb-1.1.3-fp,get-p16,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",54080159888,40.3,0.829,2.055,0.0
-kividb-1.1.3-fp,get-p16,memory allocation,1797595176,1.3,0.028,2.055,0.0
-kividb-1.1.3-fp,get-p16,locks and atomics,82164328,0.1,0.001,2.055,0.0
-kividb-1.1.3-fp,get-p16,parsing requests,5336673304,4.0,0.082,2.055,0.0
-kividb-1.1.3-fp,get-p16,building replies,1320641272,1.0,0.02,2.055,0.0
-kividb-1.1.3-fp,get-p16,"command execution (lookup, read/write the value)",48573145904,36.2,0.744,2.055,0.0
-kividb-1.1.3-fp,get-p16,event loop and connection handling (user space),11024048008,8.2,0.169,2.055,0.0
-kividb-1.1.3-fp,get-p16,other user space,0,0.0,0.0,2.055,0.0
-kividb-1.1.3-fp,set-p1,"kernel: thread sleep/wake (futex, scheduler)",9452905736,6.8,0.772,11.36,0.0
-kividb-1.1.3-fp,set-p1,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",106066131416,76.2,8.658,11.36,0.0
-kividb-1.1.3-fp,set-p1,memory allocation,492985968,0.4,0.04,11.36,0.0
-kividb-1.1.3-fp,set-p1,locks and atomics,122244488,0.1,0.01,11.36,0.0
-kividb-1.1.3-fp,set-p1,parsing requests,1472945880,1.1,0.12,11.36,0.0
-kividb-1.1.3-fp,set-p1,building replies,158316632,0.1,0.013,11.36,0.0
-kividb-1.1.3-fp,set-p1,"command execution (lookup, read/write the value)",11116232376,8.0,0.907,11.36,0.0
-kividb-1.1.3-fp,set-p1,event loop and connection handling (user space),10280561040,7.4,0.839,11.36,0.0
-kividb-1.1.3-fp,set-p1,other user space,0,0.0,0.0,11.36,0.0
-kividb-1.1.3-fp,set-p16,"kernel: thread sleep/wake (futex, scheduler)",14174348584,10.8,0.248,2.289,0.0
-kividb-1.1.3-fp,set-p16,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",50460921440,38.5,0.882,2.289,0.0
-kividb-1.1.3-fp,set-p16,memory allocation,2150300584,1.6,0.038,2.289,0.0
-kividb-1.1.3-fp,set-p16,locks and atomics,438877752,0.3,0.008,2.289,0.0
-kividb-1.1.3-fp,set-p16,parsing requests,5705410776,4.4,0.1,2.289,0.0
-kividb-1.1.3-fp,set-p16,building replies,645290576,0.5,0.011,2.289,0.0
-kividb-1.1.3-fp,set-p16,"command execution (lookup, read/write the value)",47621242104,36.4,0.832,2.289,0.0
-kividb-1.1.3-fp,set-p16,event loop and connection handling (user space),9809619160,7.5,0.171,2.289,0.0
-kividb-1.1.3-fp,set-p16,other user space,0,0.0,0.0,2.289,0.0
-kividb-rc4,get-p1,"kernel: thread sleep/wake (futex, scheduler)",9432865656,6.7,0.752,11.141,0.0
-kividb-rc4,get-p1,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",108943886904,77.9,8.683,11.141,0.0
-kividb-rc4,get-p1,memory allocation,410821640,0.3,0.033,11.141,0.0
-kividb-rc4,get-p1,locks and atomics,1012024040,0.7,0.081,11.141,0.0
-kividb-rc4,get-p1,parsing requests,867735464,0.6,0.069,11.141,0.0
-kividb-rc4,get-p1,building replies,246492984,0.2,0.02,11.141,0.0
-kividb-rc4,get-p1,"command execution (lookup, read/write the value)",7697394728,5.5,0.614,11.141,0.0
-kividb-rc4,get-p1,event loop and connection handling (user space),9382765456,6.7,0.748,11.141,0.0
-kividb-rc4,get-p1,other user space,1785571128,1.3,0.142,11.141,0.0
-kividb-rc4,get-p16,"kernel: thread sleep/wake (futex, scheduler)",11699398704,9.1,0.173,1.909,0.0
-kividb-rc4,get-p16,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",56977955456,44.2,0.843,1.909,0.0
-kividb-rc4,get-p16,memory allocation,1935871728,1.5,0.029,1.909,0.0
-kividb-rc4,get-p16,locks and atomics,4709418800,3.6,0.07,1.909,0.0
-kividb-rc4,get-p16,parsing requests,3036072120,2.4,0.045,1.909,0.0
-kividb-rc4,get-p16,building replies,1182364720,0.9,0.017,1.909,0.0
-kividb-rc4,get-p16,"command execution (lookup, read/write the value)",32304608960,25.0,0.478,1.909,0.0
-kividb-rc4,get-p16,event loop and connection handling (user space),10126252424,7.8,0.15,1.909,0.0
-kividb-rc4,get-p16,other user space,7056112168,5.5,0.104,1.909,0.0
-kividb-rc4,set-p1,"kernel: thread sleep/wake (futex, scheduler)",9366733392,6.7,0.766,11.371,0.0
-kividb-rc4,set-p1,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",104897794752,75.4,8.577,11.371,0.0
-kividb-rc4,set-p1,memory allocation,390781560,0.3,0.032,11.371,0.0
-kividb-rc4,set-p1,locks and atomics,288577152,0.2,0.024,11.371,0.0
-kividb-rc4,set-p1,parsing requests,995991976,0.7,0.081,11.371,0.0
-kividb-rc4,set-p1,building replies,160320640,0.1,0.013,11.371,0.0
-kividb-rc4,set-p1,"command execution (lookup, read/write the value)",9745490904,7.0,0.797,11.371,0.0
-kividb-rc4,set-p1,event loop and connection handling (user space),9659318560,6.9,0.79,11.371,0.0
-kividb-rc4,set-p1,other user space,3567134240,2.6,0.292,11.371,0.0
-kividb-rc4,set-p16,"kernel: thread sleep/wake (futex, scheduler)",13420841576,10.4,0.248,2.383,0.0
-kividb-rc4,set-p16,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",46559117864,36.0,0.859,2.383,0.0
-kividb-rc4,set-p16,memory allocation,1763527040,1.4,0.033,2.383,0.0
-kividb-rc4,set-p16,locks and atomics,985971936,0.8,0.018,2.383,0.0
-kividb-rc4,set-p16,parsing requests,3593186344,2.8,0.066,2.383,0.0
-kividb-rc4,set-p16,building replies,973947888,0.8,0.018,2.383,0.0
-kividb-rc4,set-p16,"command execution (lookup, read/write the value)",39661322328,30.7,0.731,2.383,0.0
-kividb-rc4,set-p16,event loop and connection handling (user space),9168336600,7.1,0.169,2.383,0.0
-kividb-rc4,set-p16,other user space,13086172240,10.1,0.241,2.383,0.0
-kividb-rc4-fp,get-p1,"kernel: thread sleep/wake (futex, scheduler)",8202404744,5.9,0.659,11.228,0.0
-kividb-rc4-fp,get-p1,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",109340680488,78.2,8.779,11.228,0.0
-kividb-rc4-fp,get-p1,memory allocation,386773544,0.3,0.031,11.228,0.0
-kividb-rc4-fp,get-p1,locks and atomics,1038076144,0.7,0.083,11.228,0.0
-kividb-rc4-fp,get-p1,parsing requests,1084168328,0.8,0.087,11.228,0.0
-kividb-rc4-fp,get-p1,building replies,254509016,0.2,0.02,11.228,0.0
-kividb-rc4-fp,get-p1,"command execution (lookup, read/write the value)",8783567064,6.3,0.705,11.228,0.0
-kividb-rc4-fp,get-p1,event loop and connection handling (user space),10757514944,7.7,0.864,11.228,0.0
-kividb-rc4-fp,get-p1,other user space,0,0.0,0.0,11.228,0.0
-kividb-rc4-fp,get-p16,"kernel: thread sleep/wake (futex, scheduler)",12268536976,9.3,0.181,1.952,0.0
-kividb-rc4-fp,get-p16,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",59204408344,44.7,0.873,1.952,0.0
-kividb-rc4-fp,get-p16,memory allocation,1931863712,1.5,0.028,1.952,0.0
-kividb-rc4-fp,get-p16,locks and atomics,5186372704,3.9,0.076,1.952,0.0
-kividb-rc4-fp,get-p16,parsing requests,4933867696,3.7,0.073,1.952,0.0
-kividb-rc4-fp,get-p16,building replies,1527054096,1.2,0.023,1.952,0.0
-kividb-rc4-fp,get-p16,"command execution (lookup, read/write the value)",36569137984,27.6,0.539,1.952,0.0
-kividb-rc4-fp,get-p16,event loop and connection handling (user space),10827655224,8.2,0.16,1.952,0.0
-kividb-rc4-fp,get-p16,other user space,0,0.0,0.0,1.952,0.0
-kividb-rc4-fp,set-p1,"kernel: thread sleep/wake (futex, scheduler)",8775551032,6.3,0.753,11.936,0.0
-kividb-rc4-fp,set-p1,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",104402804776,75.1,8.959,11.936,0.0
-kividb-rc4-fp,set-p1,memory allocation,402805608,0.3,0.035,11.936,0.0
-kividb-rc4-fp,set-p1,locks and atomics,214428856,0.2,0.018,11.936,0.0
-kividb-rc4-fp,set-p1,parsing requests,1238476944,0.9,0.106,11.936,0.0
-kividb-rc4-fp,set-p1,building replies,150300600,0.1,0.013,11.936,0.0
-kividb-rc4-fp,set-p1,"command execution (lookup, read/write the value)",13080160216,9.4,1.122,11.936,0.0
-kividb-rc4-fp,set-p1,event loop and connection handling (user space),10831663240,7.8,0.929,11.936,0.0
-kividb-rc4-fp,set-p1,other user space,0,0.0,0.0,11.936,0.0
-kividb-rc4-fp,set-p16,"kernel: thread sleep/wake (futex, scheduler)",13747494880,10.6,0.252,2.369,0.0
-kividb-rc4-fp,set-p16,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",46535069768,36.0,0.854,2.369,0.0
-kividb-rc4-fp,set-p16,memory allocation,1629258504,1.3,0.03,2.369,0.0
-kividb-rc4-fp,set-p16,locks and atomics,973947888,0.8,0.018,2.369,0.0
-kividb-rc4-fp,set-p16,parsing requests,4995991944,3.9,0.092,2.369,0.0
-kividb-rc4-fp,set-p16,building replies,617234464,0.5,0.011,2.369,0.0
-kividb-rc4-fp,set-p16,"command execution (lookup, read/write the value)",51478957504,39.9,0.944,2.369,0.0
-kividb-rc4-fp,set-p16,event loop and connection handling (user space),9180360648,7.1,0.168,2.369,0.0
-kividb-rc4-fp,set-p16,other user space,0,0.0,0.0,2.369,0.0
-redis,get-p1,"kernel: thread sleep/wake (futex, scheduler)",4515030024,5.9,0.55,9.305,0.0
-redis,get-p1,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",51274548688,67.1,6.247,9.305,0.0
-redis,get-p1,memory allocation,569138272,0.7,0.069,9.305,0.0
-redis,get-p1,locks and atomics,310621240,0.4,0.038,9.305,0.0
-redis,get-p1,parsing requests,1623246480,2.1,0.198,9.305,0.0
-redis,get-p1,building replies,793587168,1.0,0.097,9.305,0.0
-redis,get-p1,"command execution (lookup, read/write the value)",4116232432,5.4,0.501,9.305,0.0
-redis,get-p1,event loop and connection handling (user space),13166332560,17.2,1.604,9.305,0.0
-redis,get-p1,other user space,8016032,0.0,0.001,9.305,0.0
-redis,get-p16,"kernel: thread sleep/wake (futex, scheduler)",2525050080,7.5,0.139,1.858,0.0
-redis,get-p16,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",12408817536,36.7,0.682,1.858,0.0
-redis,get-p16,memory allocation,965931856,2.9,0.053,1.858,0.0
-redis,get-p16,locks and atomics,308617232,0.9,0.017,1.858,0.0
-redis,get-p16,parsing requests,2068136256,6.1,0.114,1.858,0.0
-redis,get-p16,building replies,827655304,2.4,0.046,1.858,0.0
-redis,get-p16,"command execution (lookup, read/write the value)",7014028000,20.8,0.386,1.858,0.0
-redis,get-p16,event loop and connection handling (user space),7665330600,22.7,0.421,1.858,0.0
-redis,get-p16,other user space,10020040,0.0,0.001,1.858,0.0
-redis,set-p1,"kernel: thread sleep/wake (futex, scheduler)",5154308576,7.2,0.694,9.712,0.0
-redis,set-p1,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",46841682992,65.0,6.311,9.712,0.0
-redis,set-p1,memory allocation,713426848,1.0,0.096,9.712,0.0
-redis,set-p1,locks and atomics,264529056,0.4,0.036,9.712,0.0
-redis,set-p1,parsing requests,1697394776,2.4,0.229,9.712,0.0
-redis,set-p1,building replies,370741480,0.5,0.05,9.712,0.0
-redis,set-p1,"command execution (lookup, read/write the value)",6200400752,8.6,0.835,9.712,0.0
-redis,set-p1,event loop and connection handling (user space),10829659232,15.0,1.459,9.712,0.0
-redis,set-p1,other user space,16032064,0.0,0.002,9.712,0.0
-redis,set-p16,"kernel: thread sleep/wake (futex, scheduler)",5454909776,14.4,0.447,3.099,0.0
-redis,set-p16,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",11048096104,29.2,0.906,3.099,0.0
-redis,set-p16,memory allocation,1096192376,2.9,0.09,3.099,0.0
-redis,set-p16,locks and atomics,957915824,2.5,0.079,3.099,0.0
-redis,set-p16,parsing requests,2034068120,5.4,0.167,3.099,0.0
-redis,set-p16,building replies,320641280,0.8,0.026,3.099,0.0
-redis,set-p16,"command execution (lookup, read/write the value)",9024048024,23.9,0.74,3.099,0.0
-redis,set-p16,event loop and connection handling (user space),7833667272,20.7,0.642,3.099,0.0
-redis,set-p16,other user space,18036072,0.0,0.001,3.099,0.0
+kividb-1.1.3-fp,get-p1,"kernel: thread sleep/wake (futex, scheduler)",10436873664,7.5,0.837,11.214,0.0
+kividb-1.1.3-fp,get-p1,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",106887774696,76.4,8.571,11.214,0.0
+kividb-1.1.3-fp,get-p1,memory allocation,362725448,0.3,0.029,11.214,0.0
+kividb-1.1.3-fp,get-p1,locks and atomics,106212424,0.1,0.009,11.214,0.0
+kividb-1.1.3-fp,get-p1,parsing requests,1030060112,0.7,0.083,11.214,0.0
+kividb-1.1.3-fp,get-p1,building replies,262525048,0.2,0.021,11.214,0.0
+kividb-1.1.3-fp,get-p1,"command execution (lookup, read/write the value)",10815631176,7.7,0.867,11.214,0.0
+kividb-1.1.3-fp,get-p1,event loop and connection handling (user space),9943887696,7.1,0.797,11.214,0.0
+kividb-1.1.3-fp,get-p1,other user space,0,0.0,0.0,11.214,0.0
+kividb-1.1.3-fp,get-p16,"kernel: thread sleep/wake (futex, scheduler)",12026052008,8.9,0.183,2.054,0.0
+kividb-1.1.3-fp,get-p16,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",54146292152,40.0,0.823,2.054,0.0
+kividb-1.1.3-fp,get-p16,memory allocation,1865731448,1.4,0.028,2.054,0.0
+kividb-1.1.3-fp,get-p16,locks and atomics,90180360,0.1,0.001,2.054,0.0
+kividb-1.1.3-fp,get-p16,parsing requests,4428857680,3.3,0.067,2.054,0.0
+kividb-1.1.3-fp,get-p16,building replies,1368737464,1.0,0.021,2.054,0.0
+kividb-1.1.3-fp,get-p16,"command execution (lookup, read/write the value)",51032063720,37.7,0.775,2.054,0.0
+kividb-1.1.3-fp,get-p16,event loop and connection handling (user space),10242484888,7.6,0.156,2.054,0.0
+kividb-1.1.3-fp,get-p16,other user space,0,0.0,0.0,2.054,0.0
+kividb-1.1.3-fp,set-p1,"kernel: thread sleep/wake (futex, scheduler)",9380761448,6.7,0.767,11.377,0.0
+kividb-1.1.3-fp,set-p1,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",106270540232,76.3,8.684,11.377,0.0
+kividb-1.1.3-fp,set-p1,memory allocation,511022040,0.4,0.042,11.377,0.0
+kividb-1.1.3-fp,set-p1,locks and atomics,142284568,0.1,0.012,11.377,0.0
+kividb-1.1.3-fp,set-p1,parsing requests,1274549088,0.9,0.104,11.377,0.0
+kividb-1.1.3-fp,set-p1,building replies,114228456,0.1,0.009,11.377,0.0
+kividb-1.1.3-fp,set-p1,"command execution (lookup, read/write the value)",11236472856,8.1,0.918,11.377,0.0
+kividb-1.1.3-fp,set-p1,event loop and connection handling (user space),10288577072,7.4,0.841,11.377,0.0
+kividb-1.1.3-fp,set-p1,other user space,0,0.0,0.0,11.377,0.0
+kividb-1.1.3-fp,set-p16,"kernel: thread sleep/wake (futex, scheduler)",14010019928,10.7,0.246,2.308,0.0
+kividb-1.1.3-fp,set-p16,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",51711422432,39.4,0.91,2.308,0.0
+kividb-1.1.3-fp,set-p16,memory allocation,2144288560,1.6,0.038,2.308,0.0
+kividb-1.1.3-fp,set-p16,locks and atomics,450901800,0.3,0.008,2.308,0.0
+kividb-1.1.3-fp,set-p16,parsing requests,5282565088,4.0,0.093,2.308,0.0
+kividb-1.1.3-fp,set-p16,building replies,661322640,0.5,0.012,2.308,0.0
+kividb-1.1.3-fp,set-p16,"command execution (lookup, read/write the value)",47653306232,36.3,0.838,2.308,0.0
+kividb-1.1.3-fp,set-p16,event loop and connection handling (user space),9306613152,7.1,0.164,2.308,0.0
+kividb-1.1.3-fp,set-p16,other user space,0,0.0,0.0,2.308,0.0
+kividb-cand-fp,get-p1,"kernel: thread sleep/wake (futex, scheduler)",8605210352,6.2,0.694,11.275,0.0
+kividb-cand-fp,get-p1,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",108787574280,77.8,8.769,11.275,0.0
+kividb-cand-fp,get-p1,memory allocation,356713424,0.3,0.029,11.275,0.0
+kividb-cand-fp,get-p1,locks and atomics,939879752,0.7,0.076,11.275,0.0
+kividb-cand-fp,get-p1,parsing requests,983967928,0.7,0.079,11.275,0.0
+kividb-cand-fp,get-p1,building replies,296593184,0.2,0.024,11.275,0.0
+kividb-cand-fp,get-p1,"command execution (lookup, read/write the value)",9160320568,6.5,0.738,11.275,0.0
+kividb-cand-fp,get-p1,event loop and connection handling (user space),10747494904,7.7,0.866,11.275,0.0
+kividb-cand-fp,get-p1,other user space,0,0.0,0.0,11.275,0.0
+kividb-cand-fp,get-p16,"kernel: thread sleep/wake (futex, scheduler)",12212424752,9.2,0.181,1.971,0.0
+kividb-cand-fp,get-p16,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",56771542632,42.6,0.839,1.971,0.0
+kividb-cand-fp,get-p16,memory allocation,1851703392,1.4,0.027,1.971,0.0
+kividb-cand-fp,get-p16,locks and atomics,4915831624,3.7,0.073,1.971,0.0
+kividb-cand-fp,get-p16,parsing requests,4677354672,3.5,0.069,1.971,0.0
+kividb-cand-fp,get-p16,building replies,1422845680,1.1,0.021,1.971,0.0
+kividb-cand-fp,get-p16,"command execution (lookup, read/write the value)",39755510704,29.8,0.588,1.971,0.0
+kividb-cand-fp,get-p16,event loop and connection handling (user space),11747494896,8.8,0.174,1.971,0.0
+kividb-cand-fp,get-p16,other user space,0,0.0,0.0,1.971,0.0
+kividb-cand-fp,set-p1,"kernel: thread sleep/wake (futex, scheduler)",9557114152,6.9,0.782,11.376,0.0
+kividb-cand-fp,set-p1,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",103965931032,74.7,8.502,11.376,0.0
+kividb-cand-fp,set-p1,memory allocation,496993984,0.4,0.041,11.376,0.0
+kividb-cand-fp,set-p1,locks and atomics,292585168,0.2,0.024,11.376,0.0
+kividb-cand-fp,set-p1,parsing requests,1152304600,0.8,0.094,11.376,0.0
+kividb-cand-fp,set-p1,building replies,156312624,0.1,0.013,11.376,0.0
+kividb-cand-fp,set-p1,"command execution (lookup, read/write the value)",12881763424,9.3,1.053,11.376,0.0
+kividb-cand-fp,set-p1,event loop and connection handling (user space),10599198312,7.6,0.867,11.376,0.0
+kividb-cand-fp,set-p1,other user space,0,0.0,0.0,11.376,0.0
+kividb-cand-fp,set-p16,"kernel: thread sleep/wake (futex, scheduler)",12446893688,9.5,0.228,2.412,0.0
+kividb-cand-fp,set-p16,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",48486973560,36.9,0.89,2.412,0.0
+kividb-cand-fp,set-p16,memory allocation,1591182352,1.2,0.029,2.412,0.0
+kividb-cand-fp,set-p16,locks and atomics,1098196384,0.8,0.02,2.412,0.0
+kividb-cand-fp,set-p16,parsing requests,5172344648,3.9,0.095,2.412,0.0
+kividb-cand-fp,set-p16,building replies,549098192,0.4,0.01,2.412,0.0
+kividb-cand-fp,set-p16,"command execution (lookup, read/write the value)",52108216016,39.6,0.956,2.412,0.0
+kividb-cand-fp,set-p16,event loop and connection handling (user space),10026052024,7.6,0.184,2.412,0.0
+kividb-cand-fp,set-p16,other user space,0,0.0,0.0,2.412,0.0
+kividb-cand-r1,get-p1,"kernel: thread sleep/wake (futex, scheduler)",10056112144,7.2,0.804,11.185,0.0
+kividb-cand-r1,get-p1,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",108046091320,77.3,8.642,11.185,0.0
+kividb-cand-r1,get-p1,memory allocation,338677352,0.2,0.027,11.185,0.0
+kividb-cand-r1,get-p1,locks and atomics,1026052096,0.7,0.082,11.185,0.0
+kividb-cand-r1,get-p1,parsing requests,873747488,0.6,0.07,11.185,0.0
+kividb-cand-r1,get-p1,building replies,266533064,0.2,0.021,11.185,0.0
+kividb-cand-r1,get-p1,"command execution (lookup, read/write the value)",8082164264,5.8,0.646,11.185,0.0
+kividb-cand-r1,get-p1,event loop and connection handling (user space),9450901728,6.8,0.756,11.185,0.0
+kividb-cand-r1,get-p1,other user space,1705410808,1.2,0.136,11.185,0.0
+kividb-cand-r1,get-p16,"kernel: thread sleep/wake (futex, scheduler)",12150300504,9.2,0.181,1.967,0.0
+kividb-cand-r1,get-p16,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",55517033624,41.9,0.825,1.967,0.0
+kividb-cand-r1,get-p16,memory allocation,2244488960,1.7,0.033,1.967,0.0
+kividb-cand-r1,get-p16,locks and atomics,4873747456,3.7,0.072,1.967,0.0
+kividb-cand-r1,get-p16,parsing requests,3124248472,2.4,0.046,1.967,0.0
+kividb-cand-r1,get-p16,building replies,1454909808,1.1,0.022,1.967,0.0
+kividb-cand-r1,get-p16,"command execution (lookup, read/write the value)",34715430584,26.2,0.516,1.967,0.0
+kividb-cand-r1,get-p16,event loop and connection handling (user space),10857715344,8.2,0.161,1.967,0.0
+kividb-cand-r1,get-p16,other user space,7444889720,5.6,0.111,1.967,0.0
+kividb-cand-r1,set-p1,"kernel: thread sleep/wake (futex, scheduler)",9541082088,6.9,0.785,11.437,0.0
+kividb-cand-r1,set-p1,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",104523045256,75.2,8.596,11.437,0.0
+kividb-cand-r1,set-p1,memory allocation,386773544,0.3,0.032,11.437,0.0
+kividb-cand-r1,set-p1,locks and atomics,404809616,0.3,0.033,11.437,0.0
+kividb-cand-r1,set-p1,parsing requests,1132264520,0.8,0.093,11.437,0.0
+kividb-cand-r1,set-p1,building replies,100200400,0.1,0.008,11.437,0.0
+kividb-cand-r1,set-p1,"command execution (lookup, read/write the value)",10292585088,7.4,0.846,11.437,0.0
+kividb-cand-r1,set-p1,event loop and connection handling (user space),9334669264,6.7,0.768,11.437,0.0
+kividb-cand-r1,set-p1,other user space,3356713400,2.4,0.276,11.437,0.0
+kividb-cand-r1,set-p16,"kernel: thread sleep/wake (futex, scheduler)",12949899696,9.9,0.238,2.405,0.0
+kividb-cand-r1,set-p16,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",48695390392,37.2,0.894,2.405,0.0
+kividb-cand-r1,set-p16,memory allocation,1637274536,1.2,0.03,2.405,0.0
+kividb-cand-r1,set-p16,locks and atomics,955911816,0.7,0.018,2.405,0.0
+kividb-cand-r1,set-p16,parsing requests,3458917808,2.6,0.063,2.405,0.0
+kividb-cand-r1,set-p16,building replies,627254504,0.5,0.012,2.405,0.0
+kividb-cand-r1,set-p16,"command execution (lookup, read/write the value)",41082164000,31.4,0.754,2.405,0.0
+kividb-cand-r1,set-p16,event loop and connection handling (user space),8474949832,6.5,0.156,2.405,0.0
+kividb-cand-r1,set-p16,other user space,13154308512,10.0,0.241,2.405,0.0
+kividb-cand-r2,get-p1,"kernel: thread sleep/wake (futex, scheduler)",9218436800,6.6,0.738,11.185,0.0
+kividb-cand-r2,get-p1,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",108168335808,77.4,8.656,11.185,0.0
+kividb-cand-r2,get-p1,memory allocation,386773544,0.3,0.031,11.185,0.0
+kividb-cand-r2,get-p1,locks and atomics,1016032056,0.7,0.081,11.185,0.0
+kividb-cand-r2,get-p1,parsing requests,753507008,0.5,0.06,11.185,0.0
+kividb-cand-r2,get-p1,building replies,230460920,0.2,0.018,11.185,0.0
+kividb-cand-r2,get-p1,"command execution (lookup, read/write the value)",8102204344,5.8,0.648,11.185,0.0
+kividb-cand-r2,get-p1,event loop and connection handling (user space),10014027976,7.2,0.801,11.185,0.0
+kividb-cand-r2,get-p1,other user space,1887775536,1.4,0.151,11.185,0.0
+kividb-cand-r2,get-p16,"kernel: thread sleep/wake (futex, scheduler)",12016031968,9.1,0.179,1.968,0.0
+kividb-cand-r2,get-p16,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",55947895344,42.2,0.831,1.968,0.0
+kividb-cand-r2,get-p16,memory allocation,2070140264,1.6,0.031,1.968,0.0
+kividb-cand-r2,get-p16,locks and atomics,4903807576,3.7,0.073,1.968,0.0
+kividb-cand-r2,get-p16,parsing requests,3022044064,2.3,0.045,1.968,0.0
+kividb-cand-r2,get-p16,building replies,1212424840,0.9,0.018,1.968,0.0
+kividb-cand-r2,get-p16,"command execution (lookup, read/write the value)",36020039792,27.2,0.535,1.968,0.0
+kividb-cand-r2,get-p16,event loop and connection handling (user space),10466933784,7.9,0.156,1.968,0.0
+kividb-cand-r2,get-p16,other user space,6795591128,5.1,0.101,1.968,0.0
+kividb-cand-r2,set-p1,"kernel: thread sleep/wake (futex, scheduler)",9707414752,7.0,0.8,11.459,0.0
+kividb-cand-r2,set-p1,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",104186371912,74.9,8.587,11.459,0.0
+kividb-cand-r2,set-p1,memory allocation,366733464,0.3,0.03,11.459,0.0
+kividb-cand-r2,set-p1,locks and atomics,262525048,0.2,0.022,11.459,0.0
+kividb-cand-r2,set-p1,parsing requests,877755504,0.6,0.072,11.459,0.0
+kividb-cand-r2,set-p1,building replies,108216432,0.1,0.009,11.459,0.0
+kividb-cand-r2,set-p1,"command execution (lookup, read/write the value)",10192384688,7.3,0.84,11.459,0.0
+kividb-cand-r2,set-p1,event loop and connection handling (user space),9791583088,7.0,0.807,11.459,0.0
+kividb-cand-r2,set-p1,other user space,3539078128,2.5,0.292,11.459,0.0
+kividb-cand-r2,set-p16,"kernel: thread sleep/wake (futex, scheduler)",12951903704,9.8,0.238,2.43,0.0
+kividb-cand-r2,set-p16,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",47691382384,36.1,0.877,2.43,0.0
+kividb-cand-r2,set-p16,memory allocation,2182364712,1.7,0.04,2.43,0.0
+kividb-cand-r2,set-p16,locks and atomics,893787568,0.7,0.016,2.43,0.0
+kividb-cand-r2,set-p16,parsing requests,3503005984,2.7,0.064,2.43,0.0
+kividb-cand-r2,set-p16,building replies,1326653296,1.0,0.024,2.43,0.0
+kividb-cand-r2,set-p16,"command execution (lookup, read/write the value)",41322644960,31.3,0.76,2.43,0.0
+kividb-cand-r2,set-p16,event loop and connection handling (user space),9246492912,7.0,0.17,2.43,0.0
+kividb-cand-r2,set-p16,other user space,13058116128,9.9,0.24,2.43,0.0
+kividb-cand-r3,get-p1,"kernel: thread sleep/wake (futex, scheduler)",9414829584,6.7,0.755,11.22,0.0
+kividb-cand-r3,get-p1,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",108236472080,77.4,8.684,11.22,0.0
+kividb-cand-r3,get-p1,memory allocation,332665328,0.2,0.027,11.22,0.0
+kividb-cand-r3,get-p1,locks and atomics,939879752,0.7,0.075,11.22,0.0
+kividb-cand-r3,get-p1,parsing requests,925851696,0.7,0.074,11.22,0.0
+kividb-cand-r3,get-p1,building replies,200400800,0.1,0.016,11.22,0.0
+kividb-cand-r3,get-p1,"command execution (lookup, read/write the value)",7947895728,5.7,0.638,11.22,0.0
+kividb-cand-r3,get-p1,event loop and connection handling (user space),10056112144,7.2,0.807,11.22,0.0
+kividb-cand-r3,get-p1,other user space,1797595176,1.3,0.144,11.22,0.0
+kividb-cand-r3,get-p16,"kernel: thread sleep/wake (futex, scheduler)",11915831568,9.0,0.177,1.968,0.0
+kividb-cand-r3,get-p16,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",56376753056,42.7,0.84,1.968,0.0
+kividb-cand-r3,get-p16,memory allocation,2004008000,1.5,0.03,1.968,0.0
+kividb-cand-r3,get-p16,locks and atomics,4655310584,3.5,0.069,1.968,0.0
+kividb-cand-r3,get-p16,parsing requests,3242484944,2.5,0.048,1.968,0.0
+kividb-cand-r3,get-p16,building replies,1559118224,1.2,0.023,1.968,0.0
+kividb-cand-r3,get-p16,"command execution (lookup, read/write the value)",34354709144,26.0,0.512,1.968,0.0
+kividb-cand-r3,get-p16,event loop and connection handling (user space),10691382680,8.1,0.159,1.968,0.0
+kividb-cand-r3,get-p16,other user space,7352705352,5.6,0.109,1.968,0.0
+kividb-cand-r3,set-p1,"kernel: thread sleep/wake (futex, scheduler)",9609218360,6.9,0.794,11.484,0.0
+kividb-cand-r3,set-p1,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",104238476120,75.0,8.609,11.484,0.0
+kividb-cand-r3,set-p1,memory allocation,344689376,0.2,0.028,11.484,0.0
+kividb-cand-r3,set-p1,locks and atomics,220440880,0.2,0.018,11.484,0.0
+kividb-cand-r3,set-p1,parsing requests,993987968,0.7,0.082,11.484,0.0
+kividb-cand-r3,set-p1,building replies,94188376,0.1,0.008,11.484,0.0
+kividb-cand-r3,set-p1,"command execution (lookup, read/write the value)",10232464848,7.4,0.845,11.484,0.0
+kividb-cand-r3,set-p1,event loop and connection handling (user space),9939879680,7.1,0.821,11.484,0.0
+kividb-cand-r3,set-p1,other user space,3378757488,2.4,0.279,11.484,0.0
+kividb-cand-r3,set-p16,"kernel: thread sleep/wake (futex, scheduler)",12889779456,9.8,0.235,2.409,0.0
+kividb-cand-r3,set-p16,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",48919839288,37.1,0.893,2.409,0.0
+kividb-cand-r3,set-p16,memory allocation,1621242472,1.2,0.03,2.409,0.0
+kividb-cand-r3,set-p16,locks and atomics,947895784,0.7,0.017,2.409,0.0
+kividb-cand-r3,set-p16,parsing requests,3579158288,2.7,0.065,2.409,0.0
+kividb-cand-r3,set-p16,building replies,543086168,0.4,0.01,2.409,0.0
+kividb-cand-r3,set-p16,"command execution (lookup, read/write the value)",41338677024,31.3,0.754,2.409,0.0
+kividb-cand-r3,set-p16,event loop and connection handling (user space),9184368664,7.0,0.168,2.409,0.0
+kividb-cand-r3,set-p16,other user space,12971943784,9.8,0.237,2.409,0.0
+kividb-rc4-fp,get-p1,"kernel: thread sleep/wake (futex, scheduler)",9228456840,6.6,0.736,11.153,0.0
+kividb-rc4-fp,get-p1,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",107861722584,77.1,8.602,11.153,0.0
+kividb-rc4-fp,get-p1,memory allocation,342685368,0.2,0.027,11.153,0.0
+kividb-rc4-fp,get-p1,locks and atomics,969939872,0.7,0.077,11.153,0.0
+kividb-rc4-fp,get-p1,parsing requests,1070140272,0.8,0.085,11.153,0.0
+kividb-rc4-fp,get-p1,building replies,290581160,0.2,0.023,11.153,0.0
+kividb-rc4-fp,get-p1,"command execution (lookup, read/write the value)",9102204336,6.5,0.726,11.153,0.0
+kividb-rc4-fp,get-p1,event loop and connection handling (user space),10985971856,7.9,0.876,11.153,0.0
+kividb-rc4-fp,get-p1,other user space,0,0.0,0.0,11.153,0.0
+kividb-rc4-fp,get-p16,"kernel: thread sleep/wake (futex, scheduler)",12236472848,9.2,0.182,1.979,0.0
+kividb-rc4-fp,get-p16,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",57078155856,42.8,0.847,1.979,0.0
+kividb-rc4-fp,get-p16,memory allocation,1737474936,1.3,0.026,1.979,0.0
+kividb-rc4-fp,get-p16,locks and atomics,4917835632,3.7,0.073,1.979,0.0
+kividb-rc4-fp,get-p16,parsing requests,4757514992,3.6,0.071,1.979,0.0
+kividb-rc4-fp,get-p16,building replies,1525050088,1.1,0.023,1.979,0.0
+kividb-rc4-fp,get-p16,"command execution (lookup, read/write the value)",39386773232,29.5,0.585,1.979,0.0
+kividb-rc4-fp,get-p16,event loop and connection handling (user space),11663326560,8.7,0.173,1.979,0.0
+kividb-rc4-fp,get-p16,other user space,0,0.0,0.0,1.979,0.0
+kividb-rc4-fp,set-p1,"kernel: thread sleep/wake (futex, scheduler)",8971943816,6.4,0.738,11.438,0.0
+kividb-rc4-fp,set-p1,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",104527053272,75.1,8.594,11.438,0.0
+kividb-rc4-fp,set-p1,memory allocation,398797592,0.3,0.033,11.438,0.0
+kividb-rc4-fp,set-p1,locks and atomics,298597192,0.2,0.025,11.438,0.0
+kividb-rc4-fp,set-p1,parsing requests,1342685360,1.0,0.11,11.438,0.0
+kividb-rc4-fp,set-p1,building replies,264529056,0.2,0.022,11.438,0.0
+kividb-rc4-fp,set-p1,"command execution (lookup, read/write the value)",12627254408,9.1,1.038,11.438,0.0
+kividb-rc4-fp,set-p1,event loop and connection handling (user space),10679358632,7.7,0.878,11.438,0.0
+kividb-rc4-fp,set-p1,other user space,0,0.0,0.0,11.438,0.0
+kividb-rc4-fp,set-p16,"kernel: thread sleep/wake (futex, scheduler)",12731462824,9.7,0.237,2.439,0.0
+kividb-rc4-fp,set-p16,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",48034067752,36.6,0.894,2.439,0.0
+kividb-rc4-fp,set-p16,memory allocation,1513026040,1.2,0.028,2.439,0.0
+kividb-rc4-fp,set-p16,locks and atomics,987975944,0.8,0.018,2.439,0.0
+kividb-rc4-fp,set-p16,parsing requests,5028056072,3.8,0.094,2.439,0.0
+kividb-rc4-fp,set-p16,building replies,581162320,0.4,0.011,2.439,0.0
+kividb-rc4-fp,set-p16,"command execution (lookup, read/write the value)",52585169920,40.1,0.978,2.439,0.0
+kividb-rc4-fp,set-p16,event loop and connection handling (user space),9625250424,7.3,0.179,2.439,0.0
+kividb-rc4-fp,set-p16,other user space,0,0.0,0.0,2.439,0.0
+kividb-rc4-r1,get-p1,"kernel: thread sleep/wake (futex, scheduler)",9272545016,6.6,0.741,11.184,0.0
+kividb-rc4-r1,get-p1,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",108513025184,77.6,8.675,11.184,0.0
+kividb-rc4-r1,get-p1,memory allocation,360721440,0.3,0.029,11.184,0.0
+kividb-rc4-r1,get-p1,locks and atomics,1092184360,0.8,0.087,11.184,0.0
+kividb-rc4-r1,get-p1,parsing requests,749498992,0.5,0.06,11.184,0.0
+kividb-rc4-r1,get-p1,building replies,214428856,0.2,0.017,11.184,0.0
+kividb-rc4-r1,get-p1,"command execution (lookup, read/write the value)",8116232400,5.8,0.649,11.184,0.0
+kividb-rc4-r1,get-p1,event loop and connection handling (user space),9723446816,7.0,0.777,11.184,0.0
+kividb-rc4-r1,get-p1,other user space,1851703392,1.3,0.148,11.184,0.0
+kividb-rc4-r1,get-p16,"kernel: thread sleep/wake (futex, scheduler)",12302605112,9.3,0.183,1.958,0.0
+kividb-rc4-r1,get-p16,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",56941883312,43.2,0.846,1.958,0.0
+kividb-rc4-r1,get-p16,memory allocation,1767535056,1.3,0.026,1.958,0.0
+kividb-rc4-r1,get-p16,locks and atomics,4637274512,3.5,0.069,1.958,0.0
+kividb-rc4-r1,get-p16,parsing requests,3054108192,2.3,0.045,1.958,0.0
+kividb-rc4-r1,get-p16,building replies,1112224440,0.8,0.017,1.958,0.0
+kividb-rc4-r1,get-p16,"command execution (lookup, read/write the value)",35154308336,26.7,0.522,1.958,0.0
+kividb-rc4-r1,get-p16,event loop and connection handling (user space),10110220360,7.7,0.15,1.958,0.0
+kividb-rc4-r1,get-p16,other user space,6751502952,5.1,0.1,1.958,0.0
+kividb-rc4-r1,set-p1,"kernel: thread sleep/wake (futex, scheduler)",8705410752,6.3,0.72,11.501,0.0
+kividb-rc4-r1,set-p1,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",104837674512,75.4,8.669,11.501,0.0
+kividb-rc4-r1,set-p1,memory allocation,585170336,0.4,0.048,11.501,0.0
+kividb-rc4-r1,set-p1,locks and atomics,226452904,0.2,0.019,11.501,0.0
+kividb-rc4-r1,set-p1,parsing requests,917835664,0.7,0.076,11.501,0.0
+kividb-rc4-r1,set-p1,building replies,120240480,0.1,0.01,11.501,0.0
+kividb-rc4-r1,set-p1,"command execution (lookup, read/write the value)",10472945808,7.5,0.866,11.501,0.0
+kividb-rc4-r1,set-p1,event loop and connection handling (user space),9783567056,7.0,0.809,11.501,0.0
+kividb-rc4-r1,set-p1,other user space,3436873720,2.5,0.284,11.501,0.0
+kividb-rc4-r1,set-p16,"kernel: thread sleep/wake (futex, scheduler)",12406813528,9.4,0.231,2.451,0.0
+kividb-rc4-r1,set-p16,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",47951903424,36.4,0.893,2.451,0.0
+kividb-rc4-r1,set-p16,memory allocation,1607214416,1.2,0.03,2.451,0.0
+kividb-rc4-r1,set-p16,locks and atomics,1060120232,0.8,0.02,2.451,0.0
+kividb-rc4-r1,set-p16,parsing requests,4046092152,3.1,0.075,2.451,0.0
+kividb-rc4-r1,set-p16,building replies,575150296,0.4,0.011,2.451,0.0
+kividb-rc4-r1,set-p16,"command execution (lookup, read/write the value)",42214428520,32.1,0.786,2.451,0.0
+kividb-rc4-r1,set-p16,event loop and connection handling (user space),8472945824,6.4,0.158,2.451,0.0
+kividb-rc4-r1,set-p16,other user space,13236472840,10.1,0.247,2.451,0.0
+kividb-rc4-r2,get-p1,"kernel: thread sleep/wake (futex, scheduler)",9300601128,6.7,0.749,11.266,0.0
+kividb-rc4-r2,get-p1,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",108376752640,77.5,8.732,11.266,0.0
+kividb-rc4-r2,get-p1,memory allocation,352705408,0.3,0.028,11.266,0.0
+kividb-rc4-r2,get-p1,locks and atomics,947895784,0.7,0.076,11.266,0.0
+kividb-rc4-r2,get-p1,parsing requests,793587168,0.6,0.064,11.266,0.0
+kividb-rc4-r2,get-p1,building replies,188376752,0.1,0.015,11.266,0.0
+kividb-rc4-r2,get-p1,"command execution (lookup, read/write the value)",8488977888,6.1,0.684,11.266,0.0
+kividb-rc4-r2,get-p1,event loop and connection handling (user space),9521042008,6.8,0.767,11.266,0.0
+kividb-rc4-r2,get-p1,other user space,1861723432,1.3,0.15,11.266,0.0
+kividb-rc4-r2,get-p16,"kernel: thread sleep/wake (futex, scheduler)",12060120144,9.1,0.179,1.969,0.0
+kividb-rc4-r2,get-p16,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",56160320192,42.4,0.834,1.969,0.0
+kividb-rc4-r2,get-p16,memory allocation,1875751488,1.4,0.028,1.969,0.0
+kividb-rc4-r2,get-p16,locks and atomics,4729458880,3.6,0.07,1.969,0.0
+kividb-rc4-r2,get-p16,parsing requests,3104208392,2.3,0.046,1.969,0.0
+kividb-rc4-r2,get-p16,building replies,1100200392,0.8,0.016,1.969,0.0
+kividb-rc4-r2,get-p16,"command execution (lookup, read/write the value)",35957915544,27.1,0.534,1.969,0.0
+kividb-rc4-r2,get-p16,event loop and connection handling (user space),10252504928,7.7,0.152,1.969,0.0
+kividb-rc4-r2,get-p16,other user space,7354709360,5.5,0.109,1.969,0.0
+kividb-rc4-r2,set-p1,"kernel: thread sleep/wake (futex, scheduler)",9961923768,7.2,0.821,11.458,0.0
+kividb-rc4-r2,set-p1,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",104074147464,74.9,8.579,11.458,0.0
+kividb-rc4-r2,set-p1,memory allocation,338677352,0.2,0.028,11.458,0.0
+kividb-rc4-r2,set-p1,locks and atomics,264529056,0.2,0.022,11.458,0.0
+kividb-rc4-r2,set-p1,parsing requests,879759512,0.6,0.073,11.458,0.0
+kividb-rc4-r2,set-p1,building replies,138276552,0.1,0.011,11.458,0.0
+kividb-rc4-r2,set-p1,"command execution (lookup, read/write the value)",10228456832,7.4,0.843,11.458,0.0
+kividb-rc4-r2,set-p1,event loop and connection handling (user space),9583166256,6.9,0.79,11.458,0.0
+kividb-rc4-r2,set-p1,other user space,3531062096,2.5,0.291,11.458,0.0
+kividb-rc4-r2,set-p16,"kernel: thread sleep/wake (futex, scheduler)",12807615128,9.7,0.237,2.434,0.0
+kividb-rc4-r2,set-p16,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",48312624864,36.7,0.893,2.434,0.0
+kividb-rc4-r2,set-p16,memory allocation,1743486960,1.3,0.032,2.434,0.0
+kividb-rc4-r2,set-p16,locks and atomics,999999992,0.8,0.018,2.434,0.0
+kividb-rc4-r2,set-p16,parsing requests,3835671312,2.9,0.071,2.434,0.0
+kividb-rc4-r2,set-p16,building replies,545090176,0.4,0.01,2.434,0.0
+kividb-rc4-r2,set-p16,"command execution (lookup, read/write the value)",42072143952,32.0,0.778,2.434,0.0
+kividb-rc4-r2,set-p16,event loop and connection handling (user space),8280561056,6.3,0.153,2.434,0.0
+kividb-rc4-r2,set-p16,other user space,13018035968,9.9,0.241,2.434,0.0
+kividb-rc4-r3,get-p1,"kernel: thread sleep/wake (futex, scheduler)",9304609144,6.7,0.744,11.181,0.0
+kividb-rc4-r3,get-p1,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",108278556248,77.5,8.662,11.181,0.0
+kividb-rc4-r3,get-p1,memory allocation,364729456,0.3,0.029,11.181,0.0
+kividb-rc4-r3,get-p1,locks and atomics,939879752,0.7,0.075,11.181,0.0
+kividb-rc4-r3,get-p1,parsing requests,817635264,0.6,0.065,11.181,0.0
+kividb-rc4-r3,get-p1,building replies,186372744,0.1,0.015,11.181,0.0
+kividb-rc4-r3,get-p1,"command execution (lookup, read/write the value)",8368737408,6.0,0.67,11.181,0.0
+kividb-rc4-r3,get-p1,event loop and connection handling (user space),9673346616,6.9,0.774,11.181,0.0
+kividb-rc4-r3,get-p1,other user space,1825651288,1.3,0.146,11.181,0.0
+kividb-rc4-r3,get-p16,"kernel: thread sleep/wake (futex, scheduler)",12232464832,9.2,0.181,1.963,0.0
+kividb-rc4-r3,get-p16,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",56947895336,43.0,0.845,1.963,0.0
+kividb-rc4-r3,get-p16,memory allocation,1869739464,1.4,0.028,1.963,0.0
+kividb-rc4-r3,get-p16,locks and atomics,4769539040,3.6,0.071,1.963,0.0
+kividb-rc4-r3,get-p16,parsing requests,3426853680,2.6,0.051,1.963,0.0
+kividb-rc4-r3,get-p16,building replies,1046092176,0.8,0.016,1.963,0.0
+kividb-rc4-r3,get-p16,"command execution (lookup, read/write the value)",34785570864,26.3,0.516,1.963,0.0
+kividb-rc4-r3,get-p16,event loop and connection handling (user space),10332665248,7.8,0.153,1.963,0.0
+kividb-rc4-r3,get-p16,other user space,6919839624,5.2,0.103,1.963,0.0
+kividb-rc4-r3,set-p1,"kernel: thread sleep/wake (futex, scheduler)",9907815552,7.1,0.82,11.502,0.0
+kividb-rc4-r3,set-p1,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",104216432032,75.0,8.622,11.502,0.0
+kividb-rc4-r3,set-p1,memory allocation,356713424,0.3,0.03,11.502,0.0
+kividb-rc4-r3,set-p1,locks and atomics,244488976,0.2,0.02,11.502,0.0
+kividb-rc4-r3,set-p1,parsing requests,977955904,0.7,0.081,11.502,0.0
+kividb-rc4-r3,set-p1,building replies,120240480,0.1,0.01,11.502,0.0
+kividb-rc4-r3,set-p1,"command execution (lookup, read/write the value)",10290581080,7.4,0.851,11.502,0.0
+kividb-rc4-r3,set-p1,event loop and connection handling (user space),9480961848,6.8,0.784,11.502,0.0
+kividb-rc4-r3,set-p1,other user space,3426853680,2.5,0.284,11.502,0.0
+kividb-rc4-r3,set-p16,"kernel: thread sleep/wake (futex, scheduler)",12687374648,9.7,0.235,2.437,0.0
+kividb-rc4-r3,set-p16,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",48366733080,36.8,0.897,2.437,0.0
+kividb-rc4-r3,set-p16,memory allocation,1569138264,1.2,0.029,2.437,0.0
+kividb-rc4-r3,set-p16,locks and atomics,933867728,0.7,0.017,2.437,0.0
+kividb-rc4-r3,set-p16,parsing requests,3985971912,3.0,0.074,2.437,0.0
+kividb-rc4-r3,set-p16,building replies,559118232,0.4,0.01,2.437,0.0
+kividb-rc4-r3,set-p16,"command execution (lookup, read/write the value)",41563125920,31.6,0.77,2.437,0.0
+kividb-rc4-r3,set-p16,event loop and connection handling (user space),8474949832,6.4,0.157,2.437,0.0
+kividb-rc4-r3,set-p16,other user space,13328657208,10.1,0.247,2.437,0.0
+redis,get-p1,"kernel: thread sleep/wake (futex, scheduler)",4641282528,6.1,0.561,9.187,0.0
+redis,get-p1,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",50316632864,66.2,6.078,9.187,0.0
+redis,get-p1,memory allocation,617234464,0.8,0.075,9.187,0.0
+redis,get-p1,locks and atomics,302605208,0.4,0.037,9.187,0.0
+redis,get-p1,parsing requests,1835671328,2.4,0.222,9.187,0.0
+redis,get-p1,building replies,761523040,1.0,0.092,9.187,0.0
+redis,get-p1,"command execution (lookup, read/write the value)",4136272512,5.4,0.5,9.187,0.0
+redis,get-p1,event loop and connection handling (user space),13424849592,17.7,1.622,9.187,0.0
+redis,get-p1,other user space,18036072,0.0,0.002,9.187,0.0
+redis,get-p16,"kernel: thread sleep/wake (futex, scheduler)",2595190360,7.5,0.141,1.884,0.0
+redis,get-p16,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",13010019936,37.6,0.709,1.884,0.0
+redis,get-p16,memory allocation,1002004000,2.9,0.055,1.884,0.0
+redis,get-p16,locks and atomics,336673344,1.0,0.018,1.884,0.0
+redis,get-p16,parsing requests,2008016016,5.8,0.109,1.884,0.0
+redis,get-p16,building replies,755511016,2.2,0.041,1.884,0.0
+redis,get-p16,"command execution (lookup, read/write the value)",7074148240,20.5,0.385,1.884,0.0
+redis,get-p16,event loop and connection handling (user space),7777555048,22.5,0.424,1.884,0.0
+redis,get-p16,other user space,16032064,0.0,0.001,1.884,0.0
+redis,set-p1,"kernel: thread sleep/wake (futex, scheduler)",5250500960,7.1,0.661,9.292,0.0
+redis,set-p1,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",47941883384,65.0,6.039,9.292,0.0
+redis,set-p1,memory allocation,813627248,1.1,0.102,9.292,0.0
+redis,set-p1,locks and atomics,278557112,0.4,0.035,9.292,0.0
+redis,set-p1,parsing requests,1803607200,2.4,0.227,9.292,0.0
+redis,set-p1,building replies,208416832,0.3,0.026,9.292,0.0
+redis,set-p1,"command execution (lookup, read/write the value)",6346693336,8.6,0.799,9.292,0.0
+redis,set-p1,event loop and connection handling (user space),11116232376,15.1,1.4,9.292,0.0
+redis,set-p1,other user space,12024048,0.0,0.002,9.292,0.0
+redis,set-p16,"kernel: thread sleep/wake (futex, scheduler)",8470941816,17.5,0.591,3.379,0.0
+redis,set-p16,"kernel: network I/O (syscalls, io_uring, TCP, softirq)",14785571024,30.5,1.032,3.379,0.0
+redis,set-p16,memory allocation,1358717424,2.8,0.095,3.379,0.0
+redis,set-p16,locks and atomics,1424849688,2.9,0.099,3.379,0.0
+redis,set-p16,parsing requests,2402805592,5.0,0.168,3.379,0.0
+redis,set-p16,building replies,176352704,0.4,0.012,3.379,0.0
+redis,set-p16,"command execution (lookup, read/write the value)",9224448824,19.1,0.644,3.379,0.0
+redis,set-p16,event loop and connection handling (user space),10547094104,21.8,0.736,3.379,0.0
+redis,set-p16,other user space,8016032,0.0,0.001,3.379,0.0

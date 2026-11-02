@@ -19,13 +19,15 @@ plt.rcParams.update({
 RES, OUT = sys.argv[1], sys.argv[2]
 os.makedirs(OUT, exist_ok=True)
 
-COLORS = {"kividb-rc4": "#0072B2", "kividb-1.1.3": "#56B4E9", "redis": "#D55E00", "redis-cluster": "#E69F00",
+KV = os.environ.get("KV", "kividb-cand")  # the KiviDB build the charts are about
+KV_NAME = os.environ.get("KV_NAME", "KiviDB 1.2.0 (75482abb)")
+COLORS = {KV: "#0072B2", "kividb-1.1.3": "#56B4E9", "redis": "#D55E00", "redis-cluster": "#E69F00",
           "valkey": "#009E73", "dragonfly": "#CC79A7", "kvrocks": "#F0E442"}
 EDGES = {"kvrocks": "#8a7f00"}
-NAMES = {"kividb-rc4": "KiviDB 1.2.0-rc4", "kividb-1.1.3": "KiviDB 1.1.3", "redis": "Redis 8.10.3",
+NAMES = {KV: KV_NAME, "kividb-1.1.3": "KiviDB 1.1.3", "redis": "Redis 8.10.3",
          "redis-cluster": "Redis 8.10.3 Cluster (16 shards)", "valkey": "Valkey 9.1.3", "dragonfly": "Dragonfly 2.0.2",
          "kvrocks": "kvrocks 2.17.0"}
-INMEM = ["kividb-rc4", "kividb-1.1.3", "redis", "redis-cluster", "valkey", "dragonfly"]
+INMEM = [KV, "kividb-1.1.3", "redis", "redis-cluster", "valkey", "dragonfly"]
 CMDS = ["LPUSH", "LPOP", "LRANGE_100", "HSET", "HGET", "HGETALL", "SADD", "SISMEMBER", "ZADD", "ZRANGE", "INCR"]
 
 rows = list(csv.DictReader(open(os.path.join(RES, "summary.csv"))))
@@ -89,19 +91,19 @@ def leader_title(engines, v, p, what):
     best_other = []
     for c in cmds:
         vals = {e: float(cell(e, c, v, p)["ops_per_sec_median"]) for e in engines if cell(e, c, v, p)}
-        if not vals or "kividb-rc4" not in vals:
+        if not vals or KV not in vals:
             continue
         others_max = max([x for e, x in vals.items() if not e.startswith("kividb")], default=0)
-        if vals["kividb-rc4"] >= others_max:
+        if vals[KV] >= others_max:
             wins += 1
         others = [x for e, x in vals.items() if not e.startswith("kividb")]
         if others:
-            best_other.append(vals["kividb-rc4"] / max(others))
+            best_other.append(vals[KV] / max(others))
     if not best_other:
         return what
     lo, hi = min(best_other), max(best_other)
-    return (f"{what}: KiviDB rc4 is ahead of the other engines on {wins} of {len(cmds)} commands "
-            f"\n({lo:.2f}x to {hi:.2f}x the best of them; median of 3 runs, whiskers min-max)")
+    return (f"{what}: KiviDB is ahead of the other engines on {wins} of {len(cmds)} commands "
+            f"\n({lo:.2f}x to {hi:.2f}x the best of them; median of 9 runs for KiviDB, 3 for the others; whiskers min-max)")
 
 
 for v in ["100", "2048"]:
@@ -111,10 +113,10 @@ for v in ["100", "2048"]:
              leader_title(INMEM, v, p, f"{vb} values, pipeline {p}"), "M ops/s")
         grid(INMEM, v, p, "p99_ms", f"p99-{v}B-p{p}.svg",
              f"p99 latency, {vb} values, pipeline {p}, lower is better" + ("; the Redis Cluster rows include a saturated client" if p == 16 else ""), "p99 ms", scale=1)
-    # kvrocks: its own class (disk-backed), against KiviDB rc4 and Redis
+    # kvrocks: its own class (disk-backed), against KiviDB and Redis
     for p in [1, 16]:
         vb = "100 B" if v == "100" else "2 KB"
-        grid(["kividb-rc4", "redis", "kvrocks"], v, p, "ops_per_sec_median", f"kvrocks-{v}B-p{p}.svg",
+        grid([KV, "redis", "kvrocks"], v, p, "ops_per_sec_median", f"kvrocks-{v}B-p{p}.svg",
              f"kvrocks (RocksDB on local NVMe, a disk-backed store) vs in-memory engines, {vb}, pipeline {p}",
              "M ops/s")
 
@@ -149,7 +151,7 @@ if mem:
         ax.set_ylim(bottom=0)
     h, lab = axes[0].get_legend_handles_labels()
     fig.legend(h, lab, loc="lower center", ncol=4, frameon=False)
-    fig.suptitle("Memory after loading: KiviDB needs the least with 2 KB values, but 1.8x Redis for 100 B hash fields", x=0.01, ha="left",
+    fig.suptitle(os.environ.get("MEM_TITLE", "Memory after loading each data type"), x=0.01, ha="left",
                  fontsize=13)
     fig.tight_layout(rect=(0, 0.1, 1, 0.94))
     fig.savefig(os.path.join(OUT, "memory-by-type.svg"))

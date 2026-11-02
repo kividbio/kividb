@@ -1,40 +1,40 @@
 engine: redis-8.10.3
-redis 8.10.3 1a2574ce1551d3de6e0b4a56756c0fdbc6659e4f 2026-10-26T19:37:04+08:00; make -j BUILD_TLS=yes; gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0; binary sha256 4167d8e814f8a9042cae22a65dc0ff1092cea3d3f6e6a75b9cdcdd6fb0d3e0e0; --version: Redis server v=8.10.3 sha=1a2574ce:0 malloc=jemalloc-5.3.0 bits=64 build=a8f725710acae998
+redis 8.10.3 1a2574ce1551d3de6e0b4a56756c0fdbc6659e4f 2026-10-26T19:37:04+08:00; make -j BUILD_TLS=yes; gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0; binary sha256 718addcc1657c9f7b21d19fb8846b429f80fcc2ebd56eaf2bde6d057f9e73990; --version: Redis server v=8.10.3 sha=1a2574ce:0 malloc=jemalloc-5.3.0 bits=64 build=263d5d09a8ff5185
 launch: taskset -c 1 ./server --protected-mode no --appendonly no --save  --maxmemory 1073741824 --maxclients 24 --maxmemory-policy allkeys-lfu --port 6379
 cmdline:./server *:6379                                                                                                                        
-pid 6603's current affinity list: 1
+pid 5370's current affinity list: 1
 kernel: 7.0.0-1017-azure
 CPU(s):                                  4
 Model name:                              Neoverse-N1
 L2 cache:                                4 MiB (4 instances)
 L3 cache:                                32 MiB (1 instance)
                total        used        free      shared  buff/cache   available
-Mem:            7911         487        6678           3         926        7424
+Mem:            7911         551        6593           3         946        7359
 --- /proc status
 VmPeak:	 1377600 kB
-VmHWM:	 1082904 kB
-VmRSS:	 1082904 kB
-RssAnon:	 1074572 kB
+VmHWM:	 1082584 kB
+VmRSS:	 1082584 kB
+RssAnon:	 1074252 kB
 --- cpu ticks (utime stime, CLK_TCK=100) and process age
-stat: 36657 85874
-age_s:    1269
+stat: 36732 84257
+age_s:    1272
 --- INFO memory
 # Memory
-used_memory:1073691880
+used_memory:1073692080
 used_memory_human:1023.95M
-used_memory_rss:1108819968
+used_memory_rss:1108467712
 used_memory_rss_human:1.03G
 used_memory_peak:1073741816
 used_memory_peak_human:1024.00M
-used_memory_peak_time:1793575157
+used_memory_peak_time:1793628893
 used_memory_peak_perc:100.00%
-used_memory_overhead:72886056
+used_memory_overhead:72870952
 used_memory_startup:551888
-used_memory_dataset:1000805824
+used_memory_dataset:1000821128
 used_memory_dataset_perc:93.26%
-allocator_allocated:1076094736
-allocator_active:1083535360
-allocator_resident:1103114240
+allocator_allocated:1076047176
+allocator_active:1083265024
+allocator_resident:1102839808
 allocator_muzzy:0
 total_system_memory:8295800832
 total_system_memory_human:7.73G
@@ -56,13 +56,13 @@ maxmemory:1073741824
 maxmemory_human:1.00G
 maxmemory_policy:allkeys-lfu
 allocator_frag_ratio:1.01
-allocator_frag_bytes:7424688
+allocator_frag_bytes:7201912
 allocator_rss_ratio:1.02
-allocator_rss_bytes:19578880
+allocator_rss_bytes:19574784
 rss_overhead_ratio:1.01
-rss_overhead_bytes:5705728
+rss_overhead_bytes:5627904
 mem_fragmentation_ratio:1.03
-mem_fragmentation_bytes:35146360
+mem_fragmentation_bytes:34793904
 mem_not_counted_for_evict:0
 mem_replication_backlog:0
 mem_total_replication_buffers:0
@@ -84,14 +84,14 @@ lazyfreed_objects:0
 --- INFO stats
 # Stats
 total_connections_received:30
-total_commands_processed:93650320
-instantaneous_ops_per_sec:49912
-total_net_input_bytes:18174640902
-total_net_output_bytes:21309355108
+total_commands_processed:93657570
+instantaneous_ops_per_sec:43948
+total_net_input_bytes:18178857184
+total_net_output_bytes:21305575190
 total_net_repl_input_bytes:0
 total_net_repl_output_bytes:0
-instantaneous_input_kbps:9424.98
-instantaneous_output_kbps:11147.33
+instantaneous_input_kbps:8283.24
+instantaneous_output_kbps:9817.00
 instantaneous_input_repl_kbps:0.00
 instantaneous_output_repl_kbps:0.00
 rejected_connections:126
@@ -104,14 +104,14 @@ expired_keys:0
 expired_keys_active:0
 expired_stale_perc:0.00
 expired_time_cap_reached_count:0
-expire_cycle_cpu_milliseconds:13
-evicted_keys:24807346
+expire_cycle_cpu_milliseconds:14
+evicted_keys:24815063
 evicted_clients:0
 evicted_scripts:0
 total_eviction_exceeded_time:0
 current_eviction_exceeded_time:0
-keyspace_hits:40567485
-keyspace_misses:26541379
+keyspace_hits:40560235
+keyspace_misses:26548629
 pubsub_channels:0
 pubsub_patterns:0
 pubsubshard_channels:0
@@ -129,10 +129,10 @@ tracking_total_keys:0
 tracking_total_items:0
 tracking_total_prefixes:0
 unexpected_error_replies:0
-total_error_replies:18
+total_error_replies:1
 dump_payload_sanitizations:0
-total_reads_processed:93650344
-total_writes_processed:93650314
+total_reads_processed:93657577
+total_writes_processed:93657547
 io_threaded_reads_processed:0
 io_threaded_writes_processed:0
 io_threaded_total_prefetch_batches:0
@@ -141,15 +141,15 @@ client_query_buffer_limit_disconnections:0
 client_output_buffer_limit_disconnections:0
 reply_buffer_shrinks:24
 reply_buffer_expands:0
-eventloop_cycles:17907440
-eventloop_duration_sum:1145106506
-eventloop_duration_cmd_sum:100457012
-instantaneous_eventloop_cycles_per_sec:8854
-instantaneous_eventloop_duration_usec:86
-eventloop_cycles_with_clients_processing:17907150
-total_client_processing_events:93650315
-avg_pipeline_length_sum:93650339
-avg_pipeline_length_cnt:93650315
+eventloop_cycles:22626954
+eventloop_duration_sum:1124437241
+eventloop_duration_cmd_sum:105720197
+instantaneous_eventloop_cycles_per_sec:10540
+instantaneous_eventloop_duration_usec:78
+eventloop_cycles_with_clients_processing:22626581
+total_client_processing_events:93657548
+avg_pipeline_length_sum:93657572
+avg_pipeline_length_cnt:93657548
 avg_pipeline_length:1.00
 slowlog_commands_count:0
 slowlog_commands_time_ms_max:0.00
@@ -163,15 +163,15 @@ acl_access_denied_channel:0
 acl_access_denied_tls_cert:0
 --- INFO keyspace
 # Keyspace
-db0:keys=1734017,expires=0,avg_ttl=0,subexpiry=0
-1734017
+db0:keys=1733545,expires=0,avg_ttl=0,subexpiry=0
+1733545
 --- server.log tail
-6603:C 01 Nov 2026 23:17:53.222 # WARNING Memory overcommit must be enabled! Without it, a background save or replication may fail under low memory condition. Being disabled, it can also cause failures without low memory condition, see https://github.com/jemalloc/jemalloc/issues/1328. To fix this issue add 'vm.overcommit_memory = 1' to /etc/sysctl.conf and then reboot or run the command 'sysctl vm.overcommit_memory=1' for this to take effect.
-6603:C 01 Nov 2026 23:17:53.223 * oO0OoO0OoO0Oo Redis is starting oO0OoO0OoO0Oo
-6603:C 01 Nov 2026 23:17:53.223 * Redis version=8.10.3, bits=64, commit=1a2574ce, modified=0, pid=6603, just started
-6603:C 01 Nov 2026 23:17:53.223 * Configuration loaded
-6603:M 01 Nov 2026 23:17:53.223 * monotonic clock: ARM CNTVCT @ 25 ticks/us
-6603:M 01 Nov 2026 23:17:53.224 * Running mode=standalone, port=6379.
-6603:M 01 Nov 2026 23:17:53.224 * Server initialized
-6603:M 01 Nov 2026 23:17:53.224 * Ready to accept connections tcp
-6603:M 01 Nov 2026 23:17:53.224 # WARNING: Redis does not require authentication and is not protected by network restrictions. Redis will accept connections from any IP address on any network interface.
+5370:C 02 Nov 2026 14:13:29.980 # WARNING Memory overcommit must be enabled! Without it, a background save or replication may fail under low memory condition. Being disabled, it can also cause failures without low memory condition, see https://github.com/jemalloc/jemalloc/issues/1328. To fix this issue add 'vm.overcommit_memory = 1' to /etc/sysctl.conf and then reboot or run the command 'sysctl vm.overcommit_memory=1' for this to take effect.
+5370:C 02 Nov 2026 14:13:29.981 * oO0OoO0OoO0Oo Redis is starting oO0OoO0OoO0Oo
+5370:C 02 Nov 2026 14:13:29.982 * Redis version=8.10.3, bits=64, commit=1a2574ce, modified=0, pid=5370, just started
+5370:C 02 Nov 2026 14:13:29.982 * Configuration loaded
+5370:M 02 Nov 2026 14:13:29.982 * monotonic clock: ARM CNTVCT @ 25 ticks/us
+5370:M 02 Nov 2026 14:13:29.983 * Running mode=standalone, port=6379.
+5370:M 02 Nov 2026 14:13:29.983 * Server initialized
+5370:M 02 Nov 2026 14:13:29.983 * Ready to accept connections tcp
+5370:M 02 Nov 2026 14:13:29.983 # WARNING: Redis does not require authentication and is not protected by network restrictions. Redis will accept connections from any IP address on any network interface.

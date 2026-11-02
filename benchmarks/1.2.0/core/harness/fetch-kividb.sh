@@ -3,6 +3,8 @@
 #
 #   fetch-kividb.sh <git ref> <name> [release|build]
 #
+# <git ref> is a tag, a branch, or a full 40-character commit hash (always
+# built: commits have no release assets).
 # release: the default-variant arm64 binary from the GitHub release of <ref>
 # build:   clone <ref> and build it as release.yml builds arm64
 #          (cargo build --release, RUSTFLAGS="-C target-feature=+lse")
@@ -12,6 +14,17 @@ set -euo pipefail
 REF=${1:?git ref}; NAME=${2:?name}; HOW=${3:-auto}
 REPO=https://github.com/kividbio/kividb
 mkdir -p ~/bin ~/src && cd ~/src
+if [[ $REF =~ ^[0-9a-f]{40}$ ]]; then
+  rm -rf "kividb-$NAME" && mkdir "kividb-$NAME" && cd "kividb-$NAME"
+  git init -q && git fetch -q --depth 1 "$REPO" "$REF" && git checkout -q FETCH_HEAD
+  commit=$(git rev-parse HEAD)
+  RUSTFLAGS="-C target-feature=+lse" ~/.cargo/bin/cargo build --release > ~/src/build-$NAME.log 2>&1
+  install -m 0755 target/release/kividb ~/bin/kividb-"$NAME"
+  echo "ref=$REF commit=$commit from=source cargo build --release RUSTFLAGS=-C target-feature=+lse rustc=$(~/.cargo/bin/rustc --version)" > ~/bin/kividb-"$NAME".source
+  cat ~/bin/kividb-"$NAME".source
+  ~/bin/kividb-"$NAME" --version
+  exit 0
+fi
 commit=$(git ls-remote "$REPO" "refs/tags/$REF^{}" "refs/tags/$REF" "refs/heads/$REF" | head -1 | cut -f1)
 url="$REPO/releases/download/$REF/kividb-linux-aarch64.tar.gz"
 if [ "$HOW" != build ] && curl -fsSL "$url" -o "k-$NAME.tgz" 2>/dev/null; then

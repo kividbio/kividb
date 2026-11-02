@@ -1,31 +1,31 @@
-DEL rc4 4541
-GET-100-TTL rc4 3483
-SET-100-TTL rc4 5719
-INCR-TTL rc4 4233
-DEL-TTL rc4 5177
-GET-100-LRU rc4 3749
-SET-100-LRU rc4 4671
-INCR-LRU rc4 4503
-DEL-LRU rc4 4904
-GET-100-LFU rc4 3949
-SET-100-LFU rc4 5050
-INCR-LFU rc4 4776
+DEL rc4 4474
+GET-100-TTL rc4 3401
+SET-100-TTL rc4 5658
+INCR-TTL rc4 4146
+DEL-TTL rc4 5126
+GET-100-LRU rc4 3687
+SET-100-LRU rc4 4621
+INCR-LRU rc4 4430
+DEL-LRU rc4 4818
+GET-100-LFU rc4 3897
+SET-100-LFU rc4 4966
+INCR-LFU rc4 4721
 workload            v113           rc4
-GET-100             3292          3380     +2.7%
-SET-100             4007          4321     +7.8%
-GET-1K              3887          3913     +0.7%
-SET-1K              4123          4449     +7.9%
-MIX-100             7327          7713     +5.3%
-INCR                4360          4150     -4.8%
-DEL                 4080          4541    +11.3%
-GET-100-TTL          3637          3483     -4.2%
-SET-100-TTL          6134          5719     -6.8%
-INCR-TTL            4587          4233     -7.7%
-DEL-TTL             5495          5177     -5.8%
-GET-100-LRU          3756          3749     -0.2%
-SET-100-LRU          4525          4671     +3.2%
-INCR-LRU            4800          4503     -6.2%
-DEL-LRU             4678          4904     +4.8%
-GET-100-LFU          3761          3949     +5.0%
-SET-100-LFU          4506          5050    +12.1%
-INCR-LFU            4791          4776     -0.3%
+GET-100             3250          3333     +2.6%
+SET-100             3947          4267     +8.1%
+GET-1K              3837          3852     +0.4%
+SET-1K              4041          4384     +8.5%
+MIX-100             7218          7625     +5.6%
+INCR                4319          4083     -5.5%
+DEL                 4038          4474    +10.8%
+GET-100-TTL          3560          3401     -4.5%
+SET-100-TTL          5996          5658     -5.6%
+INCR-TTL            4560          4146     -9.1%
+DEL-TTL             5002          5126     +2.5%
+GET-100-LRU          3705          3687     -0.5%
+SET-100-LRU          4436          4621     +4.2%
+INCR-LRU            4746          4430     -6.7%
+DEL-LRU             4630          4818     +4.1%
+GET-100-LFU          3709          3897     +5.1%
+SET-100-LFU          4438          4966    +11.9%
+INCR-LFU            4743          4721     -0.5%

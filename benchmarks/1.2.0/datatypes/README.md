@@ -8,29 +8,38 @@ Asked on Hacker News ([Show HN: KiviDB](https://news.ycombinator.com/item?id=501
 > **syepes:** How does this compare and benchmark with https://github.com/apache/kvrocks
 
 This suite measures eleven commands on five data types, with 100-byte and 2-KB values, at pipeline 1
-and 16, against KiviDB 1.2.0-rc4, KiviDB 1.1.3, Redis 8.10.3 (io-threads), Redis 8.10.3 Cluster
-(16 shards), Valkey 9.1.3 (io-threads) and Dragonfly 2.0.2. Apache kvrocks 2.17.0 is in a separate
-table: it keeps its data in RocksDB on disk, so it is a different class of store, and the comparison
-says how far apart the classes are, not which is "better".
+and 16, against KiviDB 1.2.0 (release branch at `75482abb`, the code that ships as 1.2.0), KiviDB 1.1.3,
+Redis 8.10.3 (io-threads), Redis 8.10.3 Cluster (16 shards), Valkey 9.1.3 (io-threads) and
+Dragonfly 2.0.2. Apache kvrocks 2.17.0 is in a separate table: it keeps its data in RocksDB on disk,
+so it is a different class of store, and the comparison says how far apart the classes are, not
+which is "better". Every number here is from one session on 2026-11-02, on the same two VMs; the
+same session ran 1.2.0-rc4 alongside the candidate as a regression check
+([Against 1.2.0-rc4](#against-120-rc4)).
 
 **Short version.**
 
-- **100-byte values, pipeline 16:** KiviDB 1.2.0-rc4 ran every list, hash, set, sorted-set and
-  counter command at 4.0-6.8M ops/s, 3.6-5.7x Redis 8.10.3 (io-threads 8), 3.9-7.0x Valkey 9.1.3
-  (io-threads 6) and 1.26-2.0x Dragonfly 2.0.2, with p99 of 0.53-0.75 ms. Redis Cluster with 16
-  shards came within 15% on most rows and was ahead on HSET and INCR, with the client saturated.
+- **100-byte values, pipeline 16:** KiviDB 1.2.0 ran every list, hash, set, sorted-set and counter
+  command at 4.2-6.6M ops/s, 3.7-6.0x Redis 8.10.3 (io-threads 8), 3.8-6.7x Valkey 9.1.3
+  (io-threads 6) and 1.3-2.0x Dragonfly 2.0.2, with p99 of 0.52-0.71 ms. Redis Cluster with 16
+  shards was within 10% on LPUSH, HGET and SISMEMBER, ahead on HSET (+32%), INCR (+14%) and LPOP,
+  and behind on SADD and ZADD, with the client saturated.
 - **2 KB values:** the network decides. Every fast engine fills the server's 12.5 Gbit/s egress on
-  reads; on writes, measured for 20 s, KiviDB and Dragonfly tie (1.37M HSETs a second, 2.8 GB/s in)
-  at 2.5x Redis and Valkey.
-- **Pipeline 1, 100 B:** KiviDB answered fastest (p50 0.41 ms) and served 1.05-1.27M ops/s on every
-  command, ahead of every single-endpoint engine (LRANGE_100, capped by the network, is a tie).
+  reads, and the 2 KB writes at pipeline 16 arrive faster than the client VM can send for long;
+  measured for 20 s, KiviDB and Dragonfly tie (1.37M HSETs a second, 2.8 GB/s in) at 2.4-2.5x Redis
+  and Valkey. In the short matrix runs Dragonfly reads 3-15% higher on five 2 KB pipeline-16 rows
+  (LPUSH, LPOP, SADD, SISMEMBER, ZADD), all above what the client VM can send for long.
+- **Pipeline 1, 100 B:** KiviDB answered fastest of the single-endpoint engines (p50 0.41-0.49 ms) and served 1.04-1.26M ops/s on
+  every command, ahead of every single-endpoint engine (LRANGE_100, capped by the network, is a tie).
 - **Where KiviDB loses:** memory for small hash fields (1.8x Redis for 100-byte fields; it uses the
   least of all at 2 KB); p99 on the network-capped HGETALL/ZRANGE rows; and a **tail-latency stall
-  on LPOP** at pipeline 16 (p99.9 up to 77 ms, worst request 155 ms) that 1.1.3 has too.
-- **kvrocks** (disk-backed) wrote at a tenth of KiviDB's rate, read from its cache at about Redis's
-  rate, and held a fraction of the memory.
-- **rc4 against 1.1.3:** the same within noise, except SISMEMBER at pipeline 16 and SADD at 2 KB,
-  pipeline 1 (-7% each).
+  on LPOP** at pipeline 16 (p99.9 50-78 ms once lists have drained, worst request 98-168 ms) that
+  rc4 and 1.1.3 have too.
+- **kvrocks** (disk-backed) wrote at 6-20% of KiviDB's rate, read from its cache at
+  about Redis's rate, and held a fraction of the memory.
+- **Against rc4:** no regression. On all 42 rows the candidate is within the run-to-run spread of
+  rc4 (median differences -2.2% to +5.9%, plus one +17% row inside a 42% spread), with three
+  alternating rounds each; CPU per request and instructions per command match too
+  ([profiling](../profiling/#against-120-rc4)).
 
 ## Hardware and placement
 
@@ -43,18 +52,20 @@ says how far apart the classes are, not which is "better".
 | OS | Ubuntu 24.04.5, kernel 7.0.0-1017-azure | same |
 | network | accelerated networking; Azure caps a D16ds_v5's **egress** at 12.5 Gbit/s | 24 Gbit/s egress |
 
-Region koreacentral, availability zone 1, both VMs in one proximity placement group and one VNet.
-One engine runs on the server at a time, alone, on all 16 vCPUs; nothing else runs there (Docker
-is installed for the engines that ship as images, which also means netfilter conntrack is active
-for every engine alike). The client is three times the server's size so that it is not the limit:
-memtier_benchmark reports its own threads' CPU, and the busiest single-endpoint run used 56% of them (see
-`client_cpu_pct_max` in `results/summary.csv`).
+Region koreacentral, availability zone 1, both VMs in one proximity placement group and one VNet
+(the same sizes, region, zone and kernel as the rc4 run). One engine runs on the server at a time,
+alone, on all 16 vCPUs; nothing else runs there (Docker is installed for the engines that ship as
+images, which also means netfilter conntrack is active for every engine alike). The client is three
+times the server's size so that it is not the limit: memtier_benchmark reports its own threads'
+CPU, and the busiest single-endpoint run used 58% of them (see `client_cpu_pct_max` in
+`results/summary.csv`).
 
 ## Engines and flags
 
 | engine | version | how it ran | flags |
 |---|---|---|---|
-| KiviDB | 1.2.0-rc4 (`a6b1bf38`) | release binary `kividb-linux-x86_64` from the release workflow of the tag | defaults (14 worker threads = vCPUs - 2, io_uring), `--protected-mode no`, `save ""` |
+| KiviDB | 1.2.0 (`75482abb` on `release/1.2.0`, reports `1.2.0-rc6` until rc7 is tagged) | built on the server VM: `harness/build.sh` (`cargo build --release`: the shipped profile, LTO fat, default features), rustc 1.99.1 | defaults (14 worker threads = vCPUs - 2, io_uring), `--protected-mode no`, `save ""` |
+| KiviDB | 1.2.0-rc4 (`a6b1bf38`), for the regression check only | built the same way on the same VM | same |
 | KiviDB | 1.1.3 | release binary from the GitHub release | same |
 | Redis | 8.10.3 | built from source (`make`, jemalloc) | `--io-threads 8 --save "" --appendonly no` |
 | Redis Cluster | 8.10.3 | 16 primaries, one per vCPU, each pinned with `taskset`, no replicas | `--cluster-enabled yes --save "" --appendonly no`, no io-threads |
@@ -64,9 +75,9 @@ memtier_benchmark reports its own threads' CPU, and the busiest single-endpoint 
 
 **io-threads.** Redis's and Valkey's own guidance is to leave a core or two to the main thread and
 to measure. `harness/iothreads-sweep.sh` ran HGET, HGETALL and HSET at 100 B, pipeline 1 and 16,
-with 4, 6, 8 and 12 I/O threads ([results](results/iothreads-sweep.csv)). Redis was best overall with 8
+with 4, 6, 8 and 12 I/O threads, in the rc4 session on the same VM types ([results](results/iothreads-sweep.csv)). Redis was best overall with 8
 (the best at pipeline 1, within 8% of the best at pipeline 16); Valkey with 6 (with 8 or 12, its HGETALL at
-pipeline 16 fell to half). The matrix uses those.
+pipeline 16 fell to half). The matrix uses those; the sweep was not repeated.
 
 ## Workload
 
@@ -89,6 +100,12 @@ V is 100 bytes or 2048 bytes. SADD and ZADD insert a new random member every tim
 `--random-data` changes the value on every request), so those sets grow during the three runs,
 and later runs are a little slower than the first: their spread is wider than the read rows'.
 That is the same for every engine.
+
+**Rounds.** The KiviDB builds ran the whole matrix three times each, alternating with each other
+and with the competitors, so that drift over the session hits both builds alike:
+1.2.0, rc4, 1.1.3, Redis, rc4, 1.2.0, Valkey, Dragonfly, 1.2.0, rc4, Redis Cluster, kvrocks
+(`harness/session.sh`). KiviDB 1.2.0's numbers are therefore the median of 9 runs (3 rounds x 3
+runs, each round loading afresh), the others' of 3. Memory was measured in the first round.
 
 Connections: 32 memtier threads with 16 connections each (512) at pipeline 1, and 32 x 4 (128,
 so 2,048 requests in flight) at pipeline 16. In cluster mode memtier opens those per shard.
@@ -113,8 +130,9 @@ waits behind the 15 before it.
 
 ## Results
 
-Each chart has one panel per command (its own y scale); bars are the median of three runs and the
-whiskers the min and max. The tables below them have every number, with p50 / p99 / p99.9.
+Each chart has one panel per command (its own y scale); bars are the median of the runs (9 for
+KiviDB 1.2.0, 3 for the others) and the whiskers the min and max. The tables below them have every
+number, with p50 / p99 / p99.9.
 
 ![100 B, pipeline 16](charts/throughput-100B-p16.svg)
 
@@ -133,142 +151,146 @@ p99 latency: [100 B p16](charts/p99-100B-p16.svg), [100 B p1](charts/p99-100B-p1
 
 #### 100 B values, pipeline 1
 
-ops/s: median of 3 runs (spread = (max-min)/median). Latency: p50 / p99 / p99.9 in ms. `*` = best ops/s in the row.
+ops/s: median of 9 runs (3 rounds) for KiviDB 1.2.0, of 3 for the others (spread = (max-min)/median). Latency: p50 / p99 / p99.9 in ms. `*` = best ops/s in the row.
 
-| command | KiviDB rc4 | KiviDB 1.1.3 | Redis 8.10.3 | Redis Cluster x16 | Valkey 9.1.3 | Dragonfly 2.0.2 |
+| command | KiviDB 1.2.0 (75482abb) | KiviDB 1.1.3 | Redis 8.10.3 | Redis Cluster x16 | Valkey 9.1.3 | Dragonfly 2.0.2 |
 |---|---|---|---|---|---|---|
-| LPUSH | 1.23M (1.1%)<br>0.41 / 0.68 / 1.63 | 1.24M (0.9%)<br>0.41 / 0.68 / 1.76 | 531k (3.6%)<br>0.96 / 1.57 / 3.12 | *1.49M* (4.1%)<br>0.49 / 2.96 / 4.48 | 515k (2.4%)<br>0.98 / 1.39 / 3.10 | 1.05M (2.3%)<br>0.48 / 0.85 / 4.61 |
-| LPOP | 1.24M (0.8%)<br>0.41 / 0.67 / 1.83 | 1.25M (1.2%)<br>0.41 / 0.68 / 2.01 | 487k (2.6%)<br>1.05 / 1.61 / 3.31 | *1.30M* (55.6%)<br>0.44 / 1.85 / 3.04 | 464k (24.5%)<br>1.09 / 1.70 / 3.34 | 1.01M (0.7%)<br>0.51 / 0.79 / 2.03 |
-| LRANGE_100 | 150k (16.9%)<br>0.95 / 9.15 / 11.13 | 150k (2.9%)<br>0.94 / 9.15 / 11.01 | 146k (1.2%)<br>3.28 / 7.33 / 8.26 | *174k* (2.6%)<br>8.51 / 20.48 / 229.38 | 150k (5.2%)<br>2.98 / 7.52 / 8.32 | 148k (0.4%)<br>1.73 / 8.64 / 10.49 |
-| HSET | 1.21M (0.5%)<br>0.42 / 0.69 / 1.57 | 1.21M (1.0%)<br>0.41 / 0.69 / 1.93 | 627k (1.8%)<br>0.81 / 1.46 / 2.94 | *1.43M* (22.2%)<br>0.57 / 2.56 / 3.84 | 606k (3.1%)<br>0.83 / 1.22 / 3.09 | 1.06M (0.9%)<br>0.49 / 0.74 / 2.03 |
-| HGET | 1.26M (1.3%)<br>0.41 / 0.67 / 1.67 | *1.26M* (2.8%)<br>0.41 / 0.67 / 2.00 | 756k (3.7%)<br>0.66 / 1.26 / 2.46 | 1.13M (6.4%)<br>0.41 / 6.82 / 10.62 | 628k (3.6%)<br>0.79 / 1.29 / 2.73 | 1.11M (3.0%)<br>0.46 / 0.73 / 2.13 |
-| HGETALL | 1.05M (3.3%)<br>0.47 / 0.78 / 1.92 | *1.08M* (1.9%)<br>0.47 / 0.78 / 1.83 | 437k (2.5%)<br>1.16 / 1.67 / 3.74 | 805k (7.9%)<br>0.45 / 7.74 / 12.03 | 230k (3.9%)<br>2.16 / 2.86 / 4.77 | 828k (0.8%)<br>0.61 / 0.94 / 2.30 |
-| SADD | 1.21M (6.4%)<br>0.41 / 0.67 / 1.61 | 1.23M (4.1%)<br>0.41 / 0.67 / 2.10 | 592k (21.4%)<br>0.85 / 1.50 / 2.67 | *1.41M* (43.3%)<br>0.53 / 2.69 / 4.16 | 611k (13.8%)<br>0.82 / 1.42 / 2.62 | 1.05M (5.6%)<br>0.46 / 0.75 / 1.94 |
-| SISMEMBER | *1.27M* (0.9%)<br>0.41 / 0.66 / 1.81 | 1.26M (1.1%)<br>0.41 / 0.67 / 1.57 | 715k (1.3%)<br>0.70 / 1.32 / 2.61 | 1.11M (5.6%)<br>0.41 / 7.17 / 11.20 | 636k (0.8%)<br>0.80 / 1.14 / 2.62 | 1.15M (2.3%)<br>0.44 / 0.70 / 1.70 |
-| ZADD | 1.18M (7.9%)<br>0.42 / 0.69 / 1.70 | *1.18M* (8.0%)<br>0.42 / 0.70 / 1.81 | 472k (50.2%)<br>1.09 / 1.58 / 3.10 | 1.07M (22.6%)<br>0.69 / 7.42 / 10.69 | 549k (42.8%)<br>0.91 / 1.31 / 3.10 | 965k (1.3%)<br>0.54 / 0.81 / 2.19 |
-| ZRANGE | *1.06M* (0.9%)<br>0.48 / 0.76 / 1.86 | 1.06M (1.4%)<br>0.47 / 0.78 / 2.24 | 362k (0.5%)<br>1.40 / 1.84 / 3.68 | 865k (5.5%)<br>0.47 / 7.90 / 12.48 | 382k (1.5%)<br>1.33 / 1.70 / 3.26 | 791k (0.8%)<br>0.65 / 0.97 / 2.83 |
-| INCR | 1.26M (2.8%)<br>0.41 / 0.67 / 1.94 | 1.25M (2.8%)<br>0.41 / 0.66 / 1.70 | 862k (2.7%)<br>0.57 / 1.13 / 2.38 | *1.32M* (32.5%)<br>0.55 / 2.35 / 3.25 | 649k (4.4%)<br>0.78 / 1.16 / 2.86 | 1.12M (1.3%)<br>0.45 / 0.73 / 2.46 |
+| LPUSH | 1.22M (3.3%)<br>0.41 / 0.68 / 1.37 | *1.23M* (2.3%)<br>0.41 / 0.75 / 2.25 | 498k (3.1%)<br>1.02 / 1.51 / 2.61 | 1.05M (55.2%)<br>0.54 / 1.97 / 3.54 | 512k (4.3%)<br>0.99 / 1.47 / 3.20 | 1.05M (5.9%)<br>0.49 / 0.79 / 2.40 |
+| LPOP | 1.22M (2.1%)<br>0.41 / 0.69 / 1.62 | *1.23M* (0.9%)<br>0.41 / 0.69 / 2.04 | 445k (4.8%)<br>1.14 / 1.66 / 2.80 | 978k (28.6%)<br>0.44 / 2.00 / 2.86 | 463k (6.1%)<br>1.09 / 1.58 / 3.26 | 990k (2.8%)<br>0.53 / 0.78 / 1.92 |
+| LRANGE_100 | 159k (13.9%)<br>0.96 / 9.28 / 10.88 | 155k (8.5%)<br>0.97 / 9.28 / 10.94 | 151k (5.2%)<br>3.33 / 7.29 / 8.38 | *179k* (9.1%)<br>9.28 / 30.34 / 230.40 | 148k (3.0%)<br>2.90 / 7.74 / 8.89 | 148k (3.1%)<br>1.70 / 8.77 / 10.62 |
+| HSET | 1.18M (2.1%)<br>0.42 / 0.69 / 1.54 | *1.21M* (1.6%)<br>0.41 / 0.68 / 1.42 | 615k (2.6%)<br>0.81 / 1.50 / 3.21 | 1.15M (39.1%)<br>0.48 / 1.76 / 2.42 | 580k (2.5%)<br>0.86 / 1.29 / 2.64 | 1.03M (2.7%)<br>0.49 / 0.76 / 1.47 |
+| HGET | 1.23M (3.1%)<br>0.41 / 0.69 / 1.40 | *1.25M* (0.7%)<br>0.41 / 0.69 / 1.59 | 645k (0.9%)<br>0.78 / 1.42 / 3.02 | 1.04M (3.8%)<br>0.39 / 6.56 / 10.56 | 629k (1.0%)<br>0.81 / 1.14 / 2.29 | 1.09M (2.5%)<br>0.46 / 0.81 / 2.53 |
+| HGETALL | 1.05M (2.5%)<br>0.48 / 0.77 / 1.62 | *1.06M* (1.2%)<br>0.48 / 0.73 / 1.36 | 410k (3.0%)<br>1.24 / 1.69 / 2.99 | 731k (11.5%)<br>0.25 / 6.94 / 11.52 | 222k (6.5%)<br>2.25 / 2.90 / 3.57 | 825k (5.9%)<br>0.62 / 0.92 / 2.08 |
+| SADD | 1.22M (6.1%)<br>0.41 / 0.68 / 1.53 | *1.22M* (4.3%)<br>0.41 / 0.67 / 1.53 | 559k (22.2%)<br>0.92 / 1.51 / 3.29 | 1.20M (3.8%)<br>0.65 / 3.81 / 6.21 | 600k (15.0%)<br>0.84 / 1.22 / 2.54 | 1.07M (5.5%)<br>0.48 / 0.74 / 2.08 |
+| SISMEMBER | 1.23M (2.6%)<br>0.41 / 0.68 / 1.56 | *1.26M* (2.5%)<br>0.41 / 0.65 / 1.46 | 691k (1.5%)<br>0.73 / 1.35 / 2.77 | 1.10M (11.6%)<br>0.34 / 6.50 / 10.43 | 625k (1.7%)<br>0.81 / 1.27 / 2.93 | 1.13M (1.4%)<br>0.45 / 0.73 / 2.02 |
+| ZADD | *1.16M* (9.3%)<br>0.43 / 0.69 / 1.53 | 1.16M (8.6%)<br>0.42 / 0.73 / 2.14 | 455k (51.8%)<br>1.13 / 1.60 / 3.33 | 1.15M (38.4%)<br>0.55 / 2.33 / 3.97 | 536k (46.1%)<br>0.94 / 1.67 / 2.58 | 946k (4.0%)<br>0.54 / 0.81 / 1.70 |
+| ZRANGE | 1.04M (3.5%)<br>0.49 / 0.81 / 1.87 | *1.05M* (1.3%)<br>0.48 / 0.78 / 1.78 | 355k (2.2%)<br>1.43 / 1.86 / 3.69 | 834k (7.7%)<br>0.51 / 8.00 / 12.48 | 379k (4.1%)<br>1.34 / 1.70 / 3.13 | 773k (1.1%)<br>0.66 / 0.97 / 2.04 |
+| INCR | *1.26M* (3.4%)<br>0.41 / 0.72 / 2.14 | 1.25M (2.1%)<br>0.41 / 0.70 / 2.11 | 877k (1.8%)<br>0.57 / 1.10 / 2.17 | 1.22M (36.8%)<br>0.40 / 1.71 / 2.58 | 648k (1.7%)<br>0.78 / 1.11 / 2.24 | 1.11M (3.1%)<br>0.46 / 0.71 / 1.61 |
 
 #### 100 B values, pipeline 16
 
-ops/s: median of 3 runs (spread = (max-min)/median). Latency: p50 / p99 / p99.9 in ms. `*` = best ops/s in the row.
+ops/s: median of 9 runs (3 rounds) for KiviDB 1.2.0, of 3 for the others (spread = (max-min)/median). Latency: p50 / p99 / p99.9 in ms. `*` = best ops/s in the row.
 
-| command | KiviDB rc4 | KiviDB 1.1.3 | Redis 8.10.3 | Redis Cluster x16 | Valkey 9.1.3 | Dragonfly 2.0.2 |
+| command | KiviDB 1.2.0 (75482abb) | KiviDB 1.1.3 | Redis 8.10.3 | Redis Cluster x16 | Valkey 9.1.3 | Dragonfly 2.0.2 |
 |---|---|---|---|---|---|---|
-| LPUSH | 4.92M (8.3%)<br>0.41 / 0.75 / 1.39 | *5.22M* (11.9%)<br>0.38 / 0.73 / 1.81 | 864k (3.5%)<br>2.35 / 4.58 / 5.47 | 4.29M (7.2%)<br>4.03 / 10.81 / 13.44 | 701k (7.8%)<br>2.91 / 3.33 / 4.83 | 3.16M (3.1%)<br>0.63 / 1.30 / 2.40 |
-| LPOP | 4.00M (40.2%)<br>0.33 / 0.68 / 46.08 | *5.82M* (31.9%)<br>0.30 / 0.58 / 16.19 | 765k (2.4%)<br>2.64 / 3.66 / 5.95 | 4.03M (28.3%)<br>4.96 / 10.81 / 13.57 | 698k (4.9%)<br>2.90 / 3.76 / 4.58 | 3.18M (5.5%)<br>0.66 / 1.05 / 1.95 |
-| LRANGE_100 | 178k (28.4%)<br>10.30 / 40.19 / 60.16 | *205k* (37.7%)<br>10.24 / 40.19 / 60.93 | 147k (2.4%)<br>13.44 / 29.44 / 40.19 | 146k (1.7%)<br>50.69 / 442.37 / 630.78 | 134k (1.2%)<br>15.17 / 22.53 / 27.65 | 166k (15.5%)<br>10.30 / 39.68 / 59.39 |
-| HSET | 4.77M (1.1%)<br>0.41 / 0.73 / 1.56 | 4.72M (4.1%)<br>0.41 / 0.69 / 1.29 | 1.04M (3.3%)<br>1.95 / 3.79 / 4.70 | *5.29M* (2.8%)<br>3.79 / 8.57 / 10.81 | 876k (2.7%)<br>2.33 / 2.62 / 4.70 | 3.32M (3.8%)<br>0.60 / 0.97 / 1.76 |
-| HGET | *6.20M* (5.8%)<br>0.34 / 0.58 / 0.97 | 5.98M (10.7%)<br>0.32 / 0.57 / 1.14 | 1.24M (1.5%)<br>1.63 / 2.48 / 3.90 | 5.32M (6.2%)<br>4.42 / 8.10 / 9.41 | 1.09M (3.8%)<br>1.87 / 2.21 / 3.58 | 3.66M (3.8%)<br>0.55 / 0.85 / 1.98 |
-| HGETALL | 1.39M (1.4%)<br>0.75 / 6.46 / 7.01 | *1.40M* (13.2%)<br>0.72 / 6.56 / 7.13 | 591k (3.2%)<br>3.50 / 4.13 / 5.63 | 1.36M (5.5%)<br>10.49 / 39.94 / 73.73 | 352k (0.3%)<br>5.82 / 6.53 / 8.77 | 1.40M (4.2%)<br>1.39 / 3.21 / 3.95 |
-| SADD | 5.23M (22.5%)<br>0.38 / 0.66 / 1.25 | *5.44M* (4.6%)<br>0.35 / 0.61 / 1.05 | 1.06M (29.1%)<br>1.91 / 3.73 / 4.64 | 3.91M (35.7%)<br>4.42 / 11.33 / 13.70 | 934k (25.7%)<br>2.06 / 3.31 / 4.51 | 3.26M (15.2%)<br>0.59 / 0.97 / 2.13 |
-| SISMEMBER | 5.36M (4.1%)<br>0.34 / 0.60 / 1.02 | *5.78M* (3.5%)<br>0.33 / 0.57 / 0.94 | 1.14M (4.2%)<br>1.78 / 3.47 / 3.94 | 4.89M (11.0%)<br>4.80 / 8.45 / 10.18 | 1.07M (5.4%)<br>1.91 / 2.14 / 4.03 | 4.11M (3.3%)<br>0.49 / 0.90 / 2.14 |
-| ZADD | 4.65M (30.9%)<br>0.42 / 0.69 / 1.19 | *4.66M* (32.2%)<br>0.41 / 0.73 / 1.45 | 832k (64.4%)<br>2.40 / 4.74 / 5.70 | 2.04M (11.2%)<br>10.75 / 24.57 / 28.80 | 749k (61.0%)<br>2.64 / 3.66 / 4.80 | 2.31M (11.7%)<br>0.83 / 1.88 / 3.73 |
-| ZRANGE | *1.38M* (1.7%)<br>0.77 / 6.40 / 6.91 | 1.33M (2.0%)<br>0.74 / 6.46 / 6.97 | 489k (3.1%)<br>4.45 / 5.31 / 7.13 | 1.36M (2.7%)<br>10.75 / 40.19 / 80.38 | 480k (0.6%)<br>4.25 / 4.83 / 7.17 | 1.38M (4.1%)<br>1.45 / 2.99 / 4.13 |
-| INCR | 6.76M (7.4%)<br>0.29 / 0.53 / 1.11 | 6.37M (4.1%)<br>0.29 / 0.55 / 1.03 | 1.87M (1.7%)<br>1.09 / 1.39 / 2.85 | *7.24M* (44.8%)<br>2.65 / 6.27 / 7.58 | 1.73M (1.5%)<br>1.17 / 1.41 / 2.69 | 4.42M (3.3%)<br>0.45 / 0.73 / 2.00 |
+| LPUSH | 4.77M (7.3%)<br>0.41 / 0.71 / 1.20 | *5.13M* (4.8%)<br>0.39 / 0.69 / 1.47 | 817k (7.9%)<br>2.50 / 4.96 / 5.63 | 4.68M (10.1%)<br>3.85 / 10.05 / 12.22 | 712k (4.9%)<br>2.88 / 3.21 / 4.86 | 3.26M (3.9%)<br>0.66 / 1.22 / 2.11 |
+| LPOP | 4.15M (31.5%)<br>0.34 / 0.62 / 49.66 | 5.10M (25.1%)<br>0.32 / 0.56 / 25.09 | 689k (2.2%)<br>2.93 / 4.03 / 6.24 | *5.33M* (14.0%)<br>3.57 / 10.05 / 12.61 | 638k (6.9%)<br>3.18 / 4.16 / 5.18 | 3.06M (2.9%)<br>0.67 / 1.04 / 1.46 |
+| LRANGE_100 | 151k (13.4%)<br>10.37 / 39.94 / 59.39 | *154k* (2.5%)<br>10.30 / 40.19 / 60.16 | 149k (3.3%)<br>13.63 / 29.57 / 40.70 | 144k (1.9%)<br>49.66 / 421.89 / 581.63 | 137k (3.7%)<br>14.85 / 21.38 / 26.11 | 149k (3.5%)<br>10.43 / 39.42 / 50.43 |
+| HSET | 4.39M (15.6%)<br>0.44 / 0.69 / 1.01 | 4.68M (4.4%)<br>0.42 / 0.69 / 1.38 | 974k (4.6%)<br>2.08 / 4.16 / 4.96 | *5.80M* (38.2%)<br>3.77 / 8.03 / 9.79 | 832k (2.0%)<br>2.46 / 2.64 / 4.01 | 3.32M (4.8%)<br>0.61 / 1.00 / 1.97 |
+| HGET | 5.62M (6.1%)<br>0.35 / 0.57 / 0.98 | *5.72M* (3.5%)<br>0.34 / 0.55 / 0.92 | 1.00M (3.9%)<br>2.03 / 2.83 / 4.38 | 5.35M (31.1%)<br>4.29 / 7.74 / 9.02 | 1.03M (0.7%)<br>1.99 / 2.29 / 3.31 | 3.53M (4.1%)<br>0.56 / 0.85 / 1.41 |
+| HGETALL | 1.37M (4.4%)<br>0.75 / 6.46 / 7.01 | 1.37M (2.1%)<br>0.74 / 6.53 / 7.07 | 553k (0.8%)<br>3.73 / 5.47 / 6.62 | 1.34M (4.2%)<br>10.49 / 40.19 / 75.78 | 338k (1.7%)<br>6.08 / 6.56 / 6.88 | *1.40M* (2.6%)<br>1.41 / 3.15 / 3.76 |
+| SADD | 5.31M (23.8%)<br>0.38 / 0.66 / 1.03 | *5.61M* (18.5%)<br>0.36 / 0.60 / 0.99 | 1.00M (26.1%)<br>2.02 / 4.13 / 5.18 | 3.84M (9.8%)<br>4.32 / 8.77 / 10.43 | 892k (25.8%)<br>2.16 / 3.39 / 4.42 | 3.29M (6.9%)<br>0.61 / 1.02 / 2.73 |
+| SISMEMBER | 5.56M (11.0%)<br>0.35 / 0.60 / 0.90 | *5.66M* (4.3%)<br>0.34 / 0.59 / 1.24 | 1.13M (5.2%)<br>1.79 / 3.63 / 4.01 | 5.29M (8.6%)<br>4.38 / 7.87 / 9.28 | 1.07M (4.4%)<br>1.91 / 2.13 / 3.25 | 3.95M (1.6%)<br>0.49 / 0.85 / 1.94 |
+| ZADD | *4.37M* (40.8%)<br>0.45 / 0.69 / 1.13 | 4.36M (31.1%)<br>0.44 / 0.77 / 2.11 | 802k (61.8%)<br>2.53 / 5.05 / 6.08 | 1.97M (4.7%)<br>9.92 / 23.55 / 27.39 | 770k (61.7%)<br>2.61 / 3.55 / 3.94 | 2.23M (6.5%)<br>0.88 / 1.65 / 2.27 |
+| ZRANGE | *1.36M* (7.3%)<br>0.78 / 6.37 / 7.04 | 1.36M (2.5%)<br>0.75 / 6.43 / 7.07 | 461k (3.2%)<br>4.74 / 5.60 / 7.65 | 1.36M (1.0%)<br>10.69 / 40.19 / 73.73 | 435k (4.0%)<br>4.74 / 5.21 / 6.11 | 1.35M (2.3%)<br>1.46 / 2.91 / 4.08 |
+| INCR | 6.56M (9.6%)<br>0.29 / 0.52 / 1.04 | 6.08M (2.9%)<br>0.30 / 0.60 / 1.70 | 1.79M (2.3%)<br>1.13 / 1.52 / 2.91 | *7.51M* (4.0%)<br>2.43 / 5.98 / 7.33 | 1.71M (3.8%)<br>1.19 / 1.42 / 2.17 | 4.56M (2.5%)<br>0.46 / 0.69 / 1.29 |
 
 #### 2 KB values, pipeline 1
 
-ops/s: median of 3 runs (spread = (max-min)/median). Latency: p50 / p99 / p99.9 in ms. `*` = best ops/s in the row.
+ops/s: median of 9 runs (3 rounds) for KiviDB 1.2.0, of 3 for the others (spread = (max-min)/median). Latency: p50 / p99 / p99.9 in ms. `*` = best ops/s in the row.
 
-| command | KiviDB rc4 | KiviDB 1.1.3 | Redis 8.10.3 | Redis Cluster x16 | Valkey 9.1.3 | Dragonfly 2.0.2 |
+| command | KiviDB 1.2.0 (75482abb) | KiviDB 1.1.3 | Redis 8.10.3 | Redis Cluster x16 | Valkey 9.1.3 | Dragonfly 2.0.2 |
 |---|---|---|---|---|---|---|
-| LPUSH | *850k* (3.3%)<br>0.59 / 1.05 / 2.22 | 848k (0.3%)<br>0.58 / 0.99 / 2.42 | 276k (1.5%)<br>1.85 / 2.35 / 4.58 | 398k (68.5%)<br>0.46 / 2.75 / 4.89 | 280k (5.2%)<br>1.81 / 2.21 / 3.82 | 772k (1.6%)<br>0.65 / 1.38 / 2.35 |
-| LPOP | *812k* (1.9%)<br>0.59 / 2.14 / 2.70 | 811k (4.0%)<br>0.58 / 2.21 / 2.94 | 364k (4.9%)<br>1.38 / 2.06 / 3.58 | 365k (27.6%)<br>0.54 / 2.70 / 4.29 | 375k (9.7%)<br>1.36 / 1.98 / 3.54 | 715k (1.4%)<br>0.70 / 1.14 / 2.58 |
-| LRANGE_100 | *8k* (8.0%)<br>59.65 / 190.46 / 290.81 | 8k (6.2%)<br>59.39 / 189.44 / 290.81 | 8k (5.1%)<br>59.65 / 182.27 / 311.30 | 8k (6.7%)<br>190.46 / 1064.96 / 1777.66 | 8k (5.1%)<br>50.94 / 201.73 / 339.97 | 8k (7.4%)<br>59.65 / 190.46 / 319.49 |
-| HSET | 829k (1.8%)<br>0.60 / 1.01 / 2.17 | 840k (0.7%)<br>0.59 / 1.01 / 2.30 | 392k (2.3%)<br>1.29 / 1.73 / 3.44 | *868k* (17.8%)<br>0.46 / 3.21 / 5.15 | 412k (1.4%)<br>1.22 / 1.69 / 3.36 | 779k (5.5%)<br>0.66 / 1.09 / 2.50 |
-| HGET | 754k (0.4%)<br>0.54 / 3.04 / 3.49 | 755k (1.1%)<br>0.54 / 3.06 / 3.42 | 503k (0.5%)<br>1.00 / 1.75 / 3.01 | *812k* (8.7%)<br>0.75 / 9.73 / 14.02 | 505k (2.6%)<br>1.01 / 1.41 / 2.69 | 759k (1.9%)<br>0.61 / 2.22 / 3.23 |
-| HGETALL | 80k (1.4%)<br>8.26 / 19.33 / 220.16 | 80k (7.2%)<br>8.26 / 19.33 / 221.18 | 79k (2.1%)<br>7.10 / 18.05 / 220.16 | *85k* (17.3%)<br>11.01 / 229.38 / 309.25 | 71k (8.3%)<br>7.07 / 9.02 / 9.73 | 82k (7.7%)<br>8.45 / 19.33 / 220.16 |
-| SADD | 883k (11.2%)<br>0.55 / 0.95 / 2.51 | *952k* (11.9%)<br>0.55 / 0.94 / 1.81 | 323k (48.6%)<br>1.57 / 2.11 / 4.00 | 365k (66.3%)<br>0.48 / 3.55 / 5.95 | 335k (48.2%)<br>1.42 / 2.78 / 4.67 | 817k (8.1%)<br>0.63 / 1.07 / 2.10 |
-| SISMEMBER | 920k (0.6%)<br>0.55 / 0.89 / 1.80 | *951k* (2.9%)<br>0.55 / 0.91 / 2.16 | 375k (2.9%)<br>1.35 / 1.80 / 3.68 | 751k (7.2%)<br>0.36 / 9.92 / 17.15 | 397k (2.6%)<br>1.27 / 1.71 / 3.76 | 831k (3.7%)<br>0.61 / 1.03 / 2.16 |
-| ZADD | *885k* (14.5%)<br>0.57 / 0.97 / 2.77 | 881k (14.9%)<br>0.57 / 0.97 / 2.48 | 293k (55.0%)<br>1.71 / 2.43 / 4.42 | 409k (27.7%)<br>0.53 / 3.44 / 4.74 | 316k (52.5%)<br>1.57 / 2.16 / 3.62 | 752k (2.1%)<br>0.69 / 1.16 / 2.37 |
-| ZRANGE | 79k (4.9%)<br>7.78 / 19.33 / 221.18 | 80k (2.2%)<br>8.32 / 19.33 / 221.18 | 81k (5.6%)<br>7.13 / 17.92 / 220.16 | *85k* (10.6%)<br>10.81 / 229.38 / 311.30 | 78k (3.3%)<br>6.40 / 17.41 / 220.16 | 78k (1.8%)<br>8.32 / 19.20 / 220.16 |
+| LPUSH | 821k (4.2%)<br>0.62 / 1.02 / 2.17 | *845k* (2.0%)<br>0.60 / 1.00 / 2.46 | 263k (1.7%)<br>1.94 / 2.42 / 4.35 | 439k (66.8%)<br>0.52 / 3.18 / 4.42 | 271k (1.3%)<br>1.89 / 2.25 / 3.21 | 763k (2.8%)<br>0.66 / 1.37 / 2.59 |
+| LPOP | 808k (10.8%)<br>0.60 / 1.95 / 2.77 | *813k* (1.9%)<br>0.59 / 2.19 / 2.67 | 346k (3.4%)<br>1.48 / 2.11 / 3.82 | 231k (42.3%)<br>0.50 / 2.21 / 4.13 | 355k (7.2%)<br>1.43 / 2.00 / 2.83 | 710k (2.3%)<br>0.71 / 1.11 / 2.08 |
+| LRANGE_100 | 8k (10.1%)<br>59.65 / 181.25 / 301.06 | 8k (2.0%)<br>59.65 / 181.25 / 321.54 | 8k (2.9%)<br>59.65 / 181.25 / 311.30 | 8k (1.3%)<br>175.10 / 933.89 / 1605.63 | 8k (2.7%)<br>58.88 / 200.70 / 335.87 | *9k* (4.1%)<br>59.65 / 189.44 / 313.34 |
+| HSET | 824k (3.0%)<br>0.61 / 1.01 / 1.98 | *830k* (2.2%)<br>0.60 / 1.07 / 2.80 | 392k (1.2%)<br>1.30 / 1.70 / 2.98 | 586k (52.1%)<br>0.46 / 2.32 / 3.97 | 406k (4.1%)<br>1.25 / 1.66 / 2.98 | 767k (3.7%)<br>0.68 / 1.05 / 1.73 |
+| HGET | *759k* (1.8%)<br>0.55 / 2.99 / 3.38 | 750k (0.6%)<br>0.55 / 2.94 / 3.36 | 461k (1.9%)<br>1.09 / 1.88 / 3.89 | 752k (9.3%)<br>0.26 / 7.90 / 12.99 | 491k (2.1%)<br>1.05 / 1.43 / 3.15 | 753k (1.7%)<br>0.61 / 2.25 / 2.88 |
+| HGETALL | 79k (8.6%)<br>7.58 / 19.33 / 221.18 | 79k (1.4%)<br>8.32 / 19.33 / 221.18 | 79k (3.6%)<br>6.97 / 18.43 / 220.16 | *85k* (14.9%)<br>10.11 / 220.16 / 280.57 | 71k (7.0%)<br>7.07 / 9.21 / 10.05 | 80k (4.5%)<br>8.51 / 19.20 / 220.16 |
+| SADD | 904k (12.9%)<br>0.57 / 0.96 / 1.92 | *907k* (11.4%)<br>0.56 / 0.89 / 1.65 | 321k (49.0%)<br>1.57 / 2.16 / 3.71 | 322k (32.0%)<br>0.47 / 3.42 / 4.67 | 345k (43.7%)<br>1.42 / 2.21 / 2.99 | 792k (7.3%)<br>0.66 / 1.04 / 1.98 |
+| SISMEMBER | 920k (5.4%)<br>0.56 / 0.90 / 1.80 | *924k* (1.9%)<br>0.55 / 0.94 / 2.04 | 373k (5.5%)<br>1.37 / 1.76 / 3.04 | 674k (15.4%)<br>0.28 / 9.66 / 15.74 | 389k (2.9%)<br>1.30 / 1.70 / 2.80 | 817k (2.5%)<br>0.61 / 1.01 / 2.29 |
+| ZADD | 846k (16.8%)<br>0.58 / 1.11 / 2.53 | *865k* (16.0%)<br>0.57 / 0.96 / 1.81 | 282k (58.6%)<br>1.79 / 2.40 / 3.60 | 299k (42.3%)<br>0.49 / 3.58 / 4.58 | 314k (52.0%)<br>1.59 / 2.16 / 3.41 | 723k (2.2%)<br>0.69 / 1.14 / 2.06 |
+| ZRANGE | 78k (14.5%)<br>7.07 / 19.33 / 221.18 | 79k (2.2%)<br>7.90 / 19.33 / 221.18 | 79k (3.2%)<br>6.91 / 18.05 / 220.16 | *92k* (7.3%)<br>10.30 / 221.18 / 270.33 | 79k (2.4%)<br>6.14 / 18.05 / 220.16 | 77k (1.9%)<br>8.38 / 19.20 / 220.16 |
 
 #### 2 KB values, pipeline 16
 
-ops/s: median of 3 runs (spread = (max-min)/median). Latency: p50 / p99 / p99.9 in ms. `*` = best ops/s in the row.
+ops/s: median of 9 runs (3 rounds) for KiviDB 1.2.0, of 3 for the others (spread = (max-min)/median). Latency: p50 / p99 / p99.9 in ms. `*` = best ops/s in the row.
 
-| command | KiviDB rc4 | KiviDB 1.1.3 | Redis 8.10.3 | Redis Cluster x16 | Valkey 9.1.3 | Dragonfly 2.0.2 |
+| command | KiviDB 1.2.0 (75482abb) | KiviDB 1.1.3 | Redis 8.10.3 | Redis Cluster x16 | Valkey 9.1.3 | Dragonfly 2.0.2 |
 |---|---|---|---|---|---|---|
-| LPUSH | 1.40M (12.9%)<br>1.38 / 3.47 / 4.61 | 1.44M (12.0%)<br>1.43 / 3.44 / 4.64 | 401k (1.3%)<br>5.44 / 6.08 / 7.71 | 1.18M (53.3%)<br>5.05 / 19.71 / 27.77 | 383k (4.4%)<br>5.95 / 6.69 / 8.96 | *1.75M* (18.8%)<br>1.05 / 3.29 / 5.63 |
-| LPOP | 812k (2.2%)<br>1.20 / 7.97 / 8.57 | 821k (2.6%)<br>1.17 / 8.06 / 8.77 | 505k (6.4%)<br>4.77 / 7.01 / 7.65 | *949k* (15.0%)<br>9.98 / 49.15 / 80.89 | 468k (0.8%)<br>4.29 / 6.11 / 6.43 | 885k (5.5%)<br>1.40 / 7.33 / 9.54 |
-| LRANGE_100 | 8k (66.7%)<br>250.88 / 491.52 / 581.63 | 8k (31.2%)<br>250.88 / 491.52 / 589.82 | 8k (10.4%)<br>250.88 / 501.76 / 581.63 | 8k (36.3%)<br>794.62 / 1712.13 / 1982.46 | *9k* (14.0%)<br>241.66 / 522.24 / 663.55 | 8k (1.9%)<br>250.88 / 491.52 / 602.11 |
-| HSET | 1.47M (3.0%)<br>0.90 / 5.47 / 6.37 | 1.48M (1.7%)<br>0.90 / 5.47 / 6.33 | 593k (6.1%)<br>3.66 / 4.01 / 6.91 | *2.05M* (29.1%)<br>8.03 / 20.99 / 33.79 | 575k (4.0%)<br>3.95 / 4.51 / 6.88 | 1.53M (4.5%)<br>0.99 / 4.96 / 6.05 |
-| HGET | 785k (4.1%)<br>0.79 / 8.77 / 9.66 | 779k (4.0%)<br>0.78 / 8.83 / 9.79 | 663k (8.4%)<br>3.28 / 3.92 / 5.60 | *792k* (20.3%)<br>10.88 / 80.89 / 219.13 | 654k (1.7%)<br>3.13 / 3.66 / 6.30 | 783k (3.7%)<br>1.12 / 7.97 / 8.70 |
-| HGETALL | 81k (6.6%)<br>20.35 / 79.36 / 110.59 | 81k (5.6%)<br>20.48 / 79.87 / 110.59 | *110k* (23.8%)<br>20.09 / 79.87 / 119.81 | 75k (2.2%)<br>119.81 / 774.14 / 991.23 | 94k (31.4%)<br>20.61 / 79.36 / 110.59 | 91k (47.3%)<br>20.35 / 79.36 / 110.59 |
-| SADD | 1.65M (0.7%)<br>0.67 / 6.50 / 6.94 | 1.70M (12.5%)<br>0.63 / 6.69 / 7.36 | 336k (49.6%)<br>6.27 / 7.71 / 9.41 | 1.37M (19.8%)<br>6.43 / 23.81 / 48.38 | 482k (49.7%)<br>4.51 / 7.04 / 8.89 | *1.82M* (9.7%)<br>0.88 / 4.83 / 5.66 |
-| SISMEMBER | 1.62M (18.1%)<br>0.61 / 6.82 / 7.55 | *1.63M* (4.7%)<br>0.61 / 6.91 / 7.93 | 526k (0.4%)<br>4.09 / 4.45 / 6.97 | 1.49M (3.8%)<br>10.24 / 40.45 / 61.44 | 550k (3.1%)<br>4.13 / 4.86 / 7.13 | 1.57M (9.3%)<br>0.91 / 5.21 / 6.24 |
-| ZADD | 1.67M (9.7%)<br>0.71 / 6.24 / 6.82 | *1.67M* (5.1%)<br>0.71 / 6.11 / 6.72 | 310k (72.4%)<br>6.88 / 9.02 / 10.88 | 1.23M (18.8%)<br>9.66 / 27.26 / 59.65 | 439k (66.7%)<br>5.02 / 6.17 / 8.19 | 1.56M (14.2%)<br>1.22 / 2.99 / 4.64 |
-| ZRANGE | *90k* (51.1%)<br>20.48 / 79.36 / 109.57 | 82k (5.4%)<br>20.48 / 79.36 / 110.08 | 79k (3.1%)<br>20.35 / 79.36 / 110.59 | 75k (1.1%)<br>111.10 / 774.14 / 991.23 | 81k (22.1%)<br>20.86 / 71.17 / 100.35 | 82k (50.1%)<br>20.22 / 79.36 / 111.10 |
+| LPUSH | 1.51M (42.3%)<br>1.44 / 3.46 / 4.45 | 1.19M (5.5%)<br>1.54 / 3.60 / 5.70 | 375k (5.0%)<br>5.76 / 6.17 / 8.06 | 1.51M (6.6%)<br>5.41 / 18.43 / 29.05 | 379k (5.7%)<br>6.01 / 6.50 / 8.64 | *1.74M* (6.0%)<br>1.09 / 3.15 / 4.19 |
+| LPOP | 813k (4.2%)<br>1.22 / 7.97 / 8.64 | 818k (1.3%)<br>1.17 / 8.06 / 8.77 | 445k (4.6%)<br>5.15 / 7.74 / 8.64 | *981k* (5.6%)<br>9.92 / 49.66 / 81.92 | 430k (1.1%)<br>4.58 / 7.33 / 7.65 | 833k (4.2%)<br>1.46 / 7.20 / 8.10 |
+| LRANGE_100 | 8k (7.1%)<br>260.10 / 481.28 / 561.15 | 8k (3.3%)<br>260.10 / 481.28 / 573.44 | 8k (5.0%)<br>260.10 / 481.28 / 540.67 | *8k* (7.9%)<br>802.82 / 1777.66 / 2162.69 | 8k (5.2%)<br>261.12 / 481.28 / 552.96 | 8k (1.9%)<br>260.10 / 481.28 / 561.15 |
+| HSET | 1.47M (3.2%)<br>0.94 / 5.21 / 5.63 | 1.50M (3.2%)<br>0.90 / 5.44 / 5.92 | 554k (3.5%)<br>3.89 / 4.19 / 5.44 | *1.99M* (25.5%)<br>7.36 / 20.61 / 31.23 | 568k (2.8%)<br>4.03 / 5.05 / 5.86 | 1.51M (3.3%)<br>1.02 / 4.54 / 5.18 |
+| HGET | 764k (8.8%)<br>0.78 / 8.83 / 9.86 | 760k (0.7%)<br>0.78 / 8.77 / 9.66 | 600k (5.5%)<br>3.84 / 4.58 / 5.63 | 747k (18.6%)<br>10.56 / 80.38 / 219.13 | 613k (1.5%)<br>3.34 / 3.82 / 4.64 | *792k* (4.4%)<br>1.10 / 8.26 / 9.02 |
+| HGETALL | 78k (5.8%)<br>20.61 / 79.87 / 110.08 | 77k (4.6%)<br>20.61 / 78.85 / 103.42 | 78k (0.9%)<br>20.35 / 79.87 / 110.08 | 75k (0.2%)<br>111.10 / 790.53 / 1007.62 | 79k (2.3%)<br>25.47 / 69.63 / 99.33 | *79k* (1.3%)<br>20.61 / 78.85 / 109.57 |
+| SADD | 1.65M (6.0%)<br>0.68 / 6.40 / 6.82 | 1.69M (8.3%)<br>0.66 / 6.53 / 6.88 | 331k (55.3%)<br>6.37 / 7.93 / 8.32 | 1.16M (27.3%)<br>7.90 / 20.61 / 37.89 | 464k (56.2%)<br>4.51 / 7.07 / 8.96 | *1.73M* (0.8%)<br>1.00 / 4.58 / 5.12 |
+| SISMEMBER | 1.52M (8.4%)<br>0.67 / 6.43 / 6.82 | 1.50M (1.6%)<br>0.66 / 6.56 / 6.97 | 514k (6.2%)<br>4.19 / 4.51 / 6.01 | 1.54M (4.0%)<br>9.92 / 40.19 / 60.93 | 529k (3.2%)<br>4.32 / 4.61 / 5.76 | *1.68M* (12.1%)<br>0.90 / 5.28 / 5.95 |
+| ZADD | 1.65M (10.4%)<br>0.75 / 5.98 / 6.33 | 1.60M (1.2%)<br>0.74 / 6.01 / 6.46 | 299k (74.8%)<br>7.07 / 8.89 / 9.98 | 979k (39.7%)<br>9.47 / 28.03 / 49.92 | 427k (66.0%)<br>5.15 / 7.17 / 7.84 | *1.71M* (11.5%)<br>1.18 / 2.38 / 5.05 |
+| ZRANGE | 78k (9.7%)<br>20.61 / 79.36 / 109.57 | *81k* (8.8%)<br>20.48 / 79.87 / 110.08 | 78k (6.9%)<br>20.48 / 79.87 / 110.59 | 74k (0.9%)<br>119.81 / 761.86 / 974.85 | 79k (4.0%)<br>20.61 / 79.36 / 110.08 | 81k (9.7%)<br>20.48 / 79.87 / 110.59 |
 
 ## Findings
 
-**100-byte values, pipeline 16 (the server is the limit).** KiviDB rc4 runs the list, hash, set,
-sorted-set and counter commands at 4.0-6.8M ops/s: 3.6-5.7x Redis 8.10.3 with 8 I/O threads, 3.9-7.0x
-Valkey 9.1.3 with 6, and 1.26-2.0x Dragonfly 2.0.2, with p99 between 0.53 and 0.75 ms where Redis
-is at 1.4-4.7 ms. Two rows are not engine-bound: HGETALL and `ZRANGE 0 9 WITHSCORES`
-return ten 100-byte values (about 1.3 KB), and at 1.4M replies a second every fast engine is at the
-server's 12.5 Gbit/s egress cap (KiviDB, Dragonfly and Redis Cluster all at 1.36-1.40M). There
-KiviDB's p99 (6.4 ms) is higher than Redis's (4.1-5.3 ms at 0.5-0.6M ops/s): its requests queue at
-the NIC instead of in the server.
+**100-byte values, pipeline 16 (the server is the limit).** KiviDB 1.2.0 runs the list, hash, set,
+sorted-set and counter commands at 4.2-6.6M ops/s: 3.7-6.0x Redis 8.10.3 with 8 I/O threads,
+3.8-6.7x Valkey 9.1.3 with 6, and 1.3-2.0x Dragonfly 2.0.2, with p99 between 0.52 and 0.71 ms where
+Redis is at 1.5-5.1 ms. Two rows are not engine-bound: HGETALL and `ZRANGE 0 9 WITHSCORES` return
+ten 100-byte values (about 1.3 KB), and at 1.4M replies a second every fast engine is at the
+server's 12.5 Gbit/s egress cap (KiviDB, Dragonfly and Redis Cluster all at 1.34-1.40M; Dragonfly's
+1.40M HGETALL against KiviDB's 1.37M is inside the spread). There KiviDB's p99 (6.4-6.5 ms) is
+higher than Redis's (5.5-5.6 ms at 0.46-0.55M ops/s) and Dragonfly's (2.9-3.2 ms at the same rate as
+KiviDB): its requests queue at the NIC instead of in the server.
 
-**Redis Cluster with 16 shards** is the fair multi-core Redis: at pipeline 16 it is within 15% of
-KiviDB on most rows and ahead on HSET (5.29M vs 4.77M) and INCR (7.24M vs 6.76M); KiviDB is ahead on
-ZADD (4.65M vs 2.04M), SADD (5.23M vs 3.91M) and LRANGE. **These cluster rows are client-bound**:
-memtier's threads were 83-95% busy (cluster mode makes the client route every key and keep 16
-connections per client), so the cluster's capacity is higher than shown. We had no quota left for
-a second client VM in the region.
+**Redis Cluster with 16 shards** is the fair multi-core Redis. At pipeline 16 it is within 10% of
+KiviDB on LPUSH, HGET, SISMEMBER, HGETALL and ZRANGE, ahead on HSET (5.80M vs 4.39M), INCR (7.51M vs
+6.56M) and LPOP (5.33M vs 4.15M, where KiviDB's runs are hit by the stall below), and behind on SADD
+(3.84M vs 5.31M) and ZADD (1.97M vs 4.37M). Its HSET lead is larger than in the rc4 run (5.29M vs
+4.77M then): KiviDB's HSET read 4.39M today (15.6% spread over 9 runs) and rc4 read 4.42M in the
+same session, so the gap is today's measurement, not the code. **These cluster rows are
+client-bound**: memtier's threads were 80-94% busy on most of them (cluster mode makes the client
+route every key and keep 16 connections per client), so the cluster's capacity is higher than
+shown. We had no quota left for a second client VM in the region.
 
 **Pipeline 1.** With 512 connections each waiting for its reply, every engine is bounded by
-connections / latency: KiviDB answered in 0.41 ms at the median and reached 1.05-1.27M ops/s on
-every command (10.5-11 of 16 vCPUs busy), Dragonfly 0.79-1.15M at 0.45-0.49 ms, Redis 0.36-0.86M,
-Valkey 0.23-0.65M. Redis Cluster shows higher pipeline-1 numbers on some rows (LPUSH 1.49M, HSET
-1.43M) because memtier's cluster mode keeps one request in flight per shard connection, sixteen
-times as many as against one endpoint; its p99 is 2.4-6.8 ms against KiviDB's 0.67-0.69 ms.
+connections / latency: KiviDB answered in 0.41-0.49 ms at the median and reached 1.04-1.26M ops/s on
+every command, Dragonfly 0.77-1.13M at 0.45-0.66 ms, Redis 0.36-0.88M, Valkey 0.22-0.65M. Redis
+Cluster's pipeline-1 numbers are close to KiviDB's on some rows (SADD 1.20M, INCR 1.22M) because
+memtier's cluster mode keeps one request in flight per shard connection, sixteen times as many as
+against one endpoint, and it is ahead on LRANGE_100 (179k vs 159k); its p99 is 1.7-8.0 ms against
+KiviDB's 0.68-0.81 ms.
 
-**2 KB values.** Replies of 2 KB or more cap at the server's egress bandwidth: HGET at 750-800k
+**2 KB values.** Replies of 2 KB or more cap at the server's egress bandwidth: HGET at 750-790k
 ops/s (1.6 GB/s) for KiviDB, Dragonfly and Redis Cluster, HGETALL and ZRANGE (20 KB replies) at
 ~80k, LRANGE_100 (200 KB) at ~8k for every engine, including Redis. Those rows measure the VM's
-network, not the engines; Redis HGETALL at pipeline 16 (110k) is ahead of everything there, inside
-its own 24% spread. Requests of 2 KB (writes) come in on the server's ingress, which Azure does not
-cap the same way: KiviDB writes LPUSH, HSET, SADD and ZADD at 1.4-1.7M ops/s at pipeline 16, 2.5-5.4x
-Redis and Valkey. Dragonfly is ahead of KiviDB on 2 KB LPUSH (1.75M vs 1.40M), HSET (1.53M vs 1.47M),
-SADD (1.82M vs 1.65M) and LPOP (885k vs 812k). Those runs are short (1.5M-3M requests, under 2 s
-for the fast engines), so
+network, not the engines. Requests of 2 KB (writes, and SISMEMBER's 2 KB member) come in on the
+server's ingress: KiviDB runs LPUSH, HSET, SADD, ZADD and SISMEMBER at 1.47-1.65M ops/s at pipeline
+16, 2.6-5.5x Redis and Valkey. In these short runs (1.5M-3M requests, 1-2 s for the fast engines)
+Dragonfly is ahead of KiviDB on LPUSH (1.74M vs 1.51M), SADD (1.73M vs 1.65M), SISMEMBER (1.68M vs
+1.52M), ZADD (1.71M vs 1.65M) and LPOP (833k vs 813k); in the rc4 run KiviDB was ahead on SISMEMBER
+and ZADD. All of those exceed what the client VM's 24 Gbit/s egress carries for long (1.6M x 2 KB =
+3.3 GB/s; the sustained limit is 2.8 GB/s): they measure the burst allowance of the moment.
 `harness/sustained-2k.sh` re-ran HSET and HGET on the 2 KB hashes for 20 s each
-([results](results/sustained-2k.txt)). Measured that way KiviDB and Dragonfly tie: 1.37M HSETs a
-second at pipeline 16 (2.8 GB/s coming in: the client VM's 24 Gbit/s egress) and 725k HGETs
-(1.48 GB/s going out: the server's 12.5 Gbit/s cap), where Redis did 0.54M / 0.61M and Valkey
-0.55M / 0.63M. At pipeline 1, HSET 814k (KiviDB) against 770k (Dragonfly), HGET 717k against 716k.
-Dragonfly's lead in the short runs was the burst allowance; with 2 KB values both are past what
-this network carries, and KiviDB 1.1.3 measures the same as rc4.
+([results](results/sustained-2k.txt)). Measured that way KiviDB 1.2.0, rc4, 1.1.3 and Dragonfly tie:
+1.37M HSETs a second at pipeline 16 (2.8 GB/s coming in: the client VM's egress) and 725k HGETs (1.48
+GB/s going out: the server's 12.5 Gbit/s cap), where Redis did 0.58M / 0.63M and Valkey 0.55M /
+0.61M. At pipeline 1, HSET 810k (KiviDB 1.2.0) against 766k (Dragonfly), HGET 716k against 716k.
 
-**Tail latency, the one bad row: LPOP at pipeline 16.** KiviDB's LPOP at 100 B, pipeline 16 had
-p99.9 of 68 ms and 46 ms in two of three runs (4.0M ops/s median, 40% spread), where every other
-100 B pipeline-16 row that the network does not cap stayed under 1.6 ms. `harness/lpop-tail.sh`
-reproduces it on its own (40M
-LPUSHes on 10,000 lists, then 12M LPOPs at pipeline 16, three times):
-on the suite's VMs, the first LPOP run is clean (p99.9 1.4-1.9 ms) but the second and third,
-with the lists partly drained, have p99.9 of 48-77 ms and a worst request of 91-155 ms, and
-throughput falls from 5.5M to 4.1M ops/s ([results](results/lpop-tail.txt)). It is the same with
-`activedefrag no`, so it is not the compactor, and KiviDB 1.1.3 does the same (worst request
-133-140 ms on a second VM pair), so it is not a regression. On that second pair, under the same
-repro (at their lower rates), Redis's worst request took 10-14 ms and Dragonfly's 23-32 ms. During
-the stalls the server makes no madvise,
-munmap or brk calls (`harness/lpop-syscalls.sh`); a scheduler trace shows workers running 50-68 ms
-without a switch (`harness/lpop-offcpu.sh`); and `perf` during a stalled run
-(`harness/lpop-perf.sh`, [flamegraph](raw/lpop-perf/kividb-rc4-lpop-p16.svg)) puts 7% of the
-server's CPU in glibc's `malloc_consolidate` and 14% under `free`. Our reading, not yet proven:
+**Tail latency, the one bad row: LPOP at pipeline 16.** KiviDB's LPOP at 100 B, pipeline 16 has
+p99.9 of 50 ms (median of 9 runs; 4.15M ops/s median, 32% spread), where every other 100 B
+pipeline-16 row that the network does not cap stays under 1.3 ms. It is unchanged from rc4 (p99.9
+46 ms, 47% spread, in the same session) and 1.1.3 has it too. `harness/lpop-tail.sh` reproduces it on
+its own (40M LPUSHes on 10,000 lists, then 12M LPOPs at pipeline 16, three times), run twice for
+each build, alternating ([results](results/lpop-tail.txt)): the first LPOP run is clean (p99.9
+0.83-0.90 ms) but the second and third, with the lists partly drained, have p99.9 of 50-78 ms
+(1.2.0) and 49-75 ms (rc4) and a worst request of 98-138 ms (1.2.0) and 91-111 ms (rc4); throughput
+falls from 5.5-5.7M to 4.2-4.8M ops/s. Even the clean first runs have one request of 135-168 ms
+(rc4: 140-141 ms). The rc4 run showed it is the same with `activedefrag no` (not
+the compactor), that 1.1.3 does the same, that Redis's worst request under the same repro is
+10-14 ms and Dragonfly's 23-32 ms, that the server makes no madvise, munmap or brk calls during the
+stalls (`harness/lpop-syscalls.sh`), and that workers run 50-68 ms without a switch
+(`harness/lpop-offcpu.sh`). `perf` during a stalled run of 1.2.0 (`harness/lpop-perf.sh`,
+[flamegraph](raw/lpop-perf/kividb-cand-lpop-p16.svg)) puts 7.2% of the server's CPU in glibc's
+`malloc_consolidate` and 13.4% under `free` (rc4: 7.2% and 13.7%). Our reading, not yet proven:
 freeing millions of 100-byte list elements makes glibc consolidate its fast bins in one long pass
-on a worker, and that worker's connections wait for it. Repro: `harness/lpop-tail.sh kividb-rc4`.
+on a worker, and that worker's connections wait for it. Repro: `harness/lpop-tail.sh kividb-cand`.
 
-**KiviDB 1.2.0-rc4 against 1.1.3.** Within run-to-run noise on most rows (median differences of
-0-6%, spreads of 1-12%). The rows where rc4 is lower by more than its spread: SISMEMBER 100 B
-pipeline 16 (5.36M vs 5.78M, -7%), SADD 2 KB pipeline 1 (883k vs 952k, -7%) and LPOP 100 B
-pipeline 16 (4.00M vs 5.82M, but both runs are wrecked by the tail above, spreads 32-40%). rc4 is
-higher on HGET (+4%) and INCR (+6%) at pipeline 16. The single-thread instruction counts in the
-[profiling suite](../profiling/) show where writes got dearer: SET is 7.8% more instructions in rc4,
-mostly the write-order bookkeeping (`keyspec::key_positions`) added for #271.
+**KiviDB 1.2.0 against 1.1.3.** Within run-to-run noise on every row (no row lower by more than
+the spread). The medians are lower by 6-7% on two writes at 100 B, pipeline 16: LPUSH (4.77M vs
+5.13M) and HSET (4.39M vs 4.68M), and by 19% on LPOP at pipeline 16 (4.15M vs 5.10M, both wrecked by
+the tail above, spreads 25-32%); higher by 8% on INCR at pipeline 16 (6.56M vs 6.08M). The
+single-thread instruction counts in the [profiling suite](../profiling/) show where writes got
+dearer between 1.1.3 and 1.2.0: SET is 8.3% more instructions, mostly the write-order bookkeeping
+(`keyspec::key_positions`, `write_order::lock_keys`) added for #271 in rc4; 1.2.0 adds nothing to it.
 
 **Memory after loading** (RSS minus the empty server, a fresh server per data type;
 `results/memory.csv`):
@@ -276,22 +298,99 @@ mostly the write-order bookkeeping (`keyspec::key_positions`) added for #271.
 | MiB | 100k hashes x 10 fields, 100 B | 100k sets x 10, 100 B | 100k zsets x 10, 100 B | hashes, 2 KB | sets, 2 KB | zsets, 2 KB |
 |---|---|---|---|---|---|---|
 | raw values | 95 | 95 | 95 | 1953 | 1953 | 1953 |
-| KiviDB 1.2.0-rc4 | **253** | 176 | 218 | **2115** | **2037** | **2071** |
-| KiviDB 1.1.3 | 252 | 175 | 217 | 2114 | 2036 | 2070 |
-| Redis 8.10.3 | 141 | 146 | 250 | 2518 | 2504 | 2560 |
-| Valkey 9.1.3 | 134 | 139 | 245 | 2504 | 2493 | 2550 |
-| Dragonfly 2.0.2 | 142 | **128** | **158** | 2577 | 2564 | 2599 |
-| Redis Cluster (16 shards, sum) | 143 | 146 | 250 | 2518 | 2505 | 2561 |
-| kvrocks 2.17.0: RSS + data on disk | 88 + 277 | 105 + 255 | 131 + 460 | 66 + 2884 | 509 + 2695 | 278 + 5873 |
+| KiviDB 1.2.0 | **253** | 175 | 218 | **2115** | **2037** | **2071** |
+| KiviDB 1.1.3 | 253 | 175 | 218 | 2114 | 2036 | 2070 |
+| Redis 8.10.3 | 141 | 146 | 250 | 2517 | 2504 | 2560 |
+| Valkey 9.1.3 | 140 | 139 | 245 | 2504 | 2493 | 2550 |
+| Dragonfly 2.0.2 | 142 | **129** | **159** | 2577 | 2562 | 2599 |
+| Redis Cluster (16 shards, sum) | 143 | 146 | 250 | 2518 | 2505 | 2560 |
+| kvrocks 2.17.0: RSS + data on disk | 84 + 281 | 95 + 259 | 128 + 464 | 68 + 2871 | 456 + 2675 | 308 + 5844 |
 
-With 2 KB values KiviDB needs the least memory of the in-memory engines, 16-19% less than Redis,
-Valkey and Dragonfly: about 8% over the raw bytes, where the others round each 2 KB allocation up
-to a larger size class. With small values it loses on hashes: 253 MiB for a million 100-byte
-fields, 1.8x Redis (141) and Dragonfly (142), about 160 bytes of overhead per field against
-Redis's 48; sets are 1.2x Redis, sorted sets are smaller than Redis's (218 vs 250) and larger than
-Dragonfly's (158). rc4 and 1.1.3 use the same memory for all six (whatever 1.2 changed in how
-entries are stored did not reach the fields inside these types). kvrocks keeps a small resident set (its block cache
-fills on reads) and puts 1.3-3x the raw bytes on disk right after loading, before compaction.
+With 2 KB values KiviDB needs the least memory of the in-memory engines, 15-20% less than Redis,
+Valkey and Dragonfly: 4-8% over the raw bytes, where the others round each 2 KB allocation up to a
+larger size class. With small values it loses on hashes: 253 MiB for a million 100-byte fields,
+1.8x Redis (141) and Dragonfly (142), about 165 bytes of overhead per field against Redis's 48; sets
+are 1.2x Redis, sorted sets are smaller than Redis's (218 vs 250) and larger than Dragonfly's
+(159). 1.2.0, rc4 (within 1 MiB, `raw/kividb-rc4/memory.csv`) and 1.1.3 use the same memory for all
+six (whatever 1.2 changed in how entries are stored did not reach the fields inside these types).
+kvrocks keeps a small resident set (its block cache fills on reads) and puts 1.4-4.9x the raw bytes
+on disk right after loading, before compaction.
+
+## Against 1.2.0-rc4
+
+The candidate and rc4 (`v1.2.0-rc4`, `a6b1bf38`) were built the same way on the same server and
+each ran the full matrix three times, alternating (1.2.0 first in rounds 1 and 3, rc4 first in
+round 2), so every row has 9 runs per build. A row counts as a regression when the candidate's
+median is below rc4's by more than the larger of the two builds' spreads ((max-min)/median over
+the 9 runs) (`harness/vs_rc4.py`, `results/vs-rc4.csv`).
+
+![1.2.0 against rc4](charts/vs-rc4.svg)
+
+**No row is a regression.** 41 of the 42 rows are within -2.2% and +5.9% of rc4. Round by round
+(the "per round" column: the candidate's median of that round against rc4's), 108 of the 126
+comparisons are within 3%, and the largest drops (-8.3% and -8.5%) are on network-capped rows
+(LRANGE_100 at pipeline 16, HGETALL at 2 KB) whose 9-run spreads are 9-21%. The one larger difference is in the candidate's
+favour and is not a claim: LPUSH at 2 KB, pipeline 16 read +17% (+21 to +29% in each round), but its
+runs last about a second and are ingress-burst-bound (see 2 KB above), with spreads of 20-42%.
+Latency agrees: the candidate's p99 is at most 0.14 ms above rc4's on any row that the network does
+not cap (ZADD at 2 KB, pipeline 1: 1.11 vs 0.97 ms, a growing-set row with a 16% spread), and LPOP's
+p99.9 tail (49.7 vs 46.1 ms) is the same stall in both. The [profiling suite](../profiling/#against-120-rc4)
+finds the same from below: CPU per request within 1.1% of rc4 at pipeline 1 and 16 (release
+binaries, three alternating rounds) and instructions per command within 0.5% on 16 of 18
+callgrind workloads (DEL and DEL-TTL, the other two, are within their own repeat noise).
+
+| values, pipeline | command | KiviDB 1.2.0 (75482abb) | KiviDB 1.2.0-rc4 | change | per round | p99 1.2.0 / rc4 (ms) | p99.9 1.2.0 / rc4 (ms) | verdict |
+|---|---|---|---|---|---|---|---|---|
+| 100 B, p1 | LPUSH | 1.22M (3.3%) | 1.21M (3.4%) | +0.8% | +0.5 +0.9 +0.6 | 0.68 / 0.69 | 1.37 / 1.85 | same |
+| 100 B, p1 | LPOP | 1.22M (2.1%) | 1.22M (3.9%) | +0.3% | -0.2 +0.7 +0.9 | 0.69 / 0.67 | 1.62 / 1.55 | same |
+| 100 B, p1 | LRANGE_100 | 159k (13.9%) | 153k (9.7%) | +3.9% | +2.5 +5.0 +1.7 | 9.28 / 9.15 | 10.88 / 10.88 | same |
+| 100 B, p1 | HSET | 1.18M (2.1%) | 1.19M (4.7%) | -0.6% | +1.3 -0.5 -0.9 | 0.69 / 0.69 | 1.54 / 1.61 | same |
+| 100 B, p1 | HGET | 1.23M (3.1%) | 1.24M (4.3%) | -0.7% | -0.3 -1.2 -0.3 | 0.69 / 0.66 | 1.40 / 1.38 | same |
+| 100 B, p1 | HGETALL | 1.05M (2.5%) | 1.05M (2.8%) | -0.3% | -1.5 +0.3 -0.3 | 0.77 / 0.74 | 1.62 / 1.39 | same |
+| 100 B, p1 | SADD | 1.22M (6.1%) | 1.21M (5.5%) | +0.7% | +1.0 +1.1 +0.7 | 0.68 / 0.69 | 1.53 / 1.66 | same |
+| 100 B, p1 | SISMEMBER | 1.23M (2.6%) | 1.23M (4.2%) | -0.2% | -0.5 +0.1 -1.5 | 0.68 / 0.66 | 1.56 / 1.57 | same |
+| 100 B, p1 | ZADD | 1.16M (9.3%) | 1.16M (8.4%) | +0.5% | +1.5 +0.2 -1.0 | 0.69 / 0.75 | 1.53 / 1.74 | same |
+| 100 B, p1 | ZRANGE | 1.04M (3.5%) | 1.04M (4.8%) | -0.2% | +0.4 -1.7 -1.0 | 0.81 / 0.78 | 1.87 / 1.63 | same |
+| 100 B, p1 | INCR | 1.26M (3.4%) | 1.26M (1.8%) | -0.0% | +0.2 -0.0 -0.2 | 0.72 / 0.69 | 2.14 / 1.49 | same |
+| 100 B, p16 | LPUSH | 4.77M (7.3%) | 4.74M (8.1%) | +0.6% | +0.2 +0.5 +2.0 | 0.71 / 0.73 | 1.20 / 1.32 | same |
+| 100 B, p16 | LPOP | 4.15M (31.5%) | 4.00M (47.0%) | +3.6% | +1.8 +0.8 +3.6 | 0.62 / 0.59 | 49.66 / 46.08 | same |
+| 100 B, p16 | LRANGE_100 | 151k (13.4%) | 153k (21.0%) | -1.2% | +1.4 -8.3 +2.3 | 39.94 / 39.94 | 59.39 / 59.90 | same |
+| 100 B, p16 | HSET | 4.39M (15.6%) | 4.42M (6.8%) | -0.8% | +1.2 +1.0 -0.8 | 0.69 / 0.70 | 1.01 / 1.09 | same |
+| 100 B, p16 | HGET | 5.62M (6.1%) | 5.63M (9.4%) | -0.2% | +2.3 +0.4 -1.9 | 0.57 / 0.57 | 0.98 / 0.97 | same |
+| 100 B, p16 | HGETALL | 1.37M (4.4%) | 1.37M (4.2%) | +0.3% | +0.4 +1.2 +0.1 | 6.46 / 6.46 | 7.01 / 7.07 | same |
+| 100 B, p16 | SADD | 5.31M (23.8%) | 5.01M (21.6%) | +5.9% | +6.2 -1.2 +3.9 | 0.66 / 0.65 | 1.03 / 1.08 | same |
+| 100 B, p16 | SISMEMBER | 5.56M (11.0%) | 5.53M (8.8%) | +0.4% | +2.1 +3.2 -0.3 | 0.60 / 0.60 | 0.90 / 0.98 | same |
+| 100 B, p16 | ZADD | 4.37M (40.8%) | 4.47M (35.5%) | -2.2% | +0.3 -5.4 -0.8 | 0.69 / 0.72 | 1.13 / 1.44 | same |
+| 100 B, p16 | ZRANGE | 1.36M (7.3%) | 1.35M (4.2%) | +1.0% | +4.0 +1.2 -1.4 | 6.37 / 6.37 | 7.04 / 7.04 | same |
+| 100 B, p16 | INCR | 6.56M (9.6%) | 6.51M (9.0%) | +0.8% | +1.0 +3.0 -2.2 | 0.52 / 0.52 | 1.04 / 0.82 | same |
+| 2 KB, p1 | LPUSH | 821k (4.2%) | 826k (4.6%) | -0.6% | -1.0 -0.4 -1.1 | 1.02 / 1.01 | 2.17 / 2.05 | same |
+| 2 KB, p1 | LPOP | 808k (10.8%) | 811k (1.7%) | -0.4% | -0.2 -1.0 +0.4 | 1.95 / 1.98 | 2.77 / 2.61 | same |
+| 2 KB, p1 | LRANGE_100 | 8k (10.1%) | 8k (5.8%) | +0.0% | +1.8 +0.0 -1.7 | 181.25 / 180.22 | 301.06 / 301.06 | same |
+| 2 KB, p1 | HSET | 824k (3.0%) | 820k (5.5%) | +0.4% | -0.2 -0.2 +0.6 | 1.01 / 1.01 | 1.98 / 2.17 | same |
+| 2 KB, p1 | HGET | 759k (1.8%) | 755k (2.1%) | +0.5% | +0.5 +0.9 -0.1 | 2.99 / 2.98 | 3.38 / 3.57 | same |
+| 2 KB, p1 | HGETALL | 79k (8.6%) | 79k (11.3%) | -0.4% | +2.9 +0.7 -8.5 | 19.33 / 19.33 | 221.18 / 221.18 | same |
+| 2 KB, p1 | SADD | 904k (12.9%) | 893k (12.2%) | +1.1% | +2.0 +1.1 -2.0 | 0.96 / 1.01 | 1.92 / 2.29 | same |
+| 2 KB, p1 | SISMEMBER | 920k (5.4%) | 912k (4.1%) | +0.8% | +1.8 -2.1 +1.0 | 0.90 / 0.97 | 1.80 / 2.43 | same |
+| 2 KB, p1 | ZADD | 846k (16.8%) | 842k (15.6%) | +0.5% | -1.0 +0.5 -1.7 | 1.11 / 0.97 | 2.53 / 2.16 | same |
+| 2 KB, p1 | ZRANGE | 78k (14.5%) | 80k (6.1%) | -1.6% | -1.1 -2.2 -2.0 | 19.33 / 19.33 | 221.18 / 221.18 | same |
+| 2 KB, p16 | LPUSH | 1.51M (42.3%) | 1.28M (20.0%) | +17.3% | +22.6 +28.8 +21.4 | 3.46 / 3.66 | 4.45 / 4.35 | same |
+| 2 KB, p16 | LPOP | 813k (4.2%) | 816k (6.4%) | -0.5% | -0.5 -3.3 -0.2 | 7.97 / 7.97 | 8.64 / 8.64 | same |
+| 2 KB, p16 | LRANGE_100 | 8k (7.1%) | 8k (8.4%) | +0.8% | -0.9 +2.8 -3.3 | 481.28 / 481.28 | 561.15 / 561.15 | same |
+| 2 KB, p16 | HSET | 1.47M (3.2%) | 1.47M (4.5%) | -0.2% | -0.5 -2.2 +0.9 | 5.21 / 5.18 | 5.63 / 5.66 | same |
+| 2 KB, p16 | HGET | 764k (8.8%) | 769k (6.8%) | -0.6% | -3.7 -1.1 +2.7 | 8.83 / 8.83 | 9.86 / 9.79 | same |
+| 2 KB, p16 | HGETALL | 78k (5.8%) | 78k (10.1%) | -0.3% | +0.9 -1.6 +0.1 | 79.87 / 79.87 | 110.08 / 110.08 | same |
+| 2 KB, p16 | SADD | 1.65M (6.0%) | 1.65M (7.8%) | +0.3% | +2.7 -3.1 +3.3 | 6.40 / 6.30 | 6.82 / 6.75 | same |
+| 2 KB, p16 | SISMEMBER | 1.52M (8.4%) | 1.52M (8.5%) | -0.4% | -0.0 +0.5 -2.5 | 6.43 / 6.43 | 6.82 / 6.88 | same |
+| 2 KB, p16 | ZADD | 1.65M (10.4%) | 1.64M (9.4%) | +0.1% | +1.9 +1.6 -3.2 | 5.98 / 5.92 | 6.33 / 6.30 | same |
+| 2 KB, p16 | ZRANGE | 78k (9.7%) | 79k (6.6%) | -0.3% | +0.1 -2.6 +2.9 | 79.36 / 79.87 | 109.57 / 110.08 | same |
+
+What changed between rc4 and `75482abb` (SORT/SORT_RO key access and ACL keyspecs, SLOWLOG/MONITOR
+redaction with a fast path, the AOF writer's wake-ups and batch draining, AOF replay of expired keys,
+cluster gossip addresses, MIGRATE on tokio, a slab-generation check in compaction, FreeBSD-only
+code, `INFO stats rejected_connections`) is mostly off this suite's command path (no AOF, no
+replicas, no cluster bus, no SORT). What could reach it (the redaction fast path, the ACL keyspec
+changes) shows no measurable cost here or in the per-function callgrind counts, where
+`keyspec::key_positions` and `write_order::lock_keys` cost the same instructions in both builds.
 
 ## Apache kvrocks (a disk-backed store: a different class)
 
@@ -306,104 +405,108 @@ Two things to keep in mind when reading the numbers. Each data set here (at most
 kvrocks' 4 GB block cache, so its **reads are served from memory**: this is kvrocks at its best,
 not a data set larger than RAM, which is the reason to run it. And its shorter runs end sooner,
 which makes the network-capped rows (2 KB reads, LRANGE) read a little higher than the others'
-(see the burst note above), so kvrocks' wins on HGETALL/ZRANGE/LRANGE at 2 KB are not real wins.
+(see the burst note above), so kvrocks' wins on HGET/HGETALL/ZRANGE/LRANGE at 2 KB are not real wins.
 
 ![kvrocks vs KiviDB and Redis, 100 B, pipeline 16](charts/kvrocks-100B-p16.svg)
 
-
 #### 100 B values, pipeline 1
 
-ops/s: median of 3 runs (spread = (max-min)/median). Latency: p50 / p99 / p99.9 in ms. `*` = best ops/s in the row.
+ops/s: median of 9 runs (3 rounds) for KiviDB 1.2.0, of 3 for the others (spread = (max-min)/median). Latency: p50 / p99 / p99.9 in ms. `*` = best ops/s in the row.
 
-| command | KiviDB rc4 | Redis 8.10.3 | kvrocks 2.17.0 |
+| command | KiviDB 1.2.0 (75482abb) | Redis 8.10.3 | kvrocks 2.17.0 |
 |---|---|---|---|
-| LPUSH | *1.23M* (1.1%)<br>0.41 / 0.68 / 1.63 | 531k (3.6%)<br>0.96 / 1.57 / 3.12 | 277k (10.1%)<br>1.70 / 4.25 / 7.10 |
-| LPOP | *1.24M* (0.8%)<br>0.41 / 0.67 / 1.83 | 487k (2.6%)<br>1.05 / 1.61 / 3.31 | 156k (3.8%)<br>3.25 / 7.29 / 9.02 |
-| LRANGE_100 | 150k (16.9%)<br>0.95 / 9.15 / 11.13 | 146k (1.2%)<br>3.28 / 7.33 / 8.26 | *165k* (16.3%)<br>3.06 / 6.72 / 11.84 |
-| HSET | *1.21M* (0.5%)<br>0.42 / 0.69 / 1.57 | 627k (1.8%)<br>0.81 / 1.46 / 2.94 | 279k (11.2%)<br>1.60 / 4.89 / 6.72 |
-| HGET | *1.26M* (1.3%)<br>0.41 / 0.67 / 1.67 | 756k (3.7%)<br>0.66 / 1.26 / 2.46 | 640k (0.9%)<br>0.78 / 1.70 / 2.90 |
-| HGETALL | *1.05M* (3.3%)<br>0.47 / 0.78 / 1.92 | 437k (2.5%)<br>1.16 / 1.67 / 3.74 | 427k (6.7%)<br>1.14 / 2.45 / 3.18 |
-| SADD | *1.21M* (6.4%)<br>0.41 / 0.67 / 1.61 | 592k (21.4%)<br>0.85 / 1.50 / 2.67 | 509k (49.2%)<br>0.97 / 2.14 / 3.98 |
-| SISMEMBER | *1.27M* (0.9%)<br>0.41 / 0.66 / 1.81 | 715k (1.3%)<br>0.70 / 1.32 / 2.61 | 612k (0.9%)<br>0.83 / 1.81 / 2.93 |
-| ZADD | *1.18M* (7.9%)<br>0.42 / 0.69 / 1.70 | 472k (50.2%)<br>1.09 / 1.58 / 3.10 | 508k (55.6%)<br>0.98 / 2.17 / 3.34 |
-| ZRANGE | *1.06M* (0.9%)<br>0.48 / 0.76 / 1.86 | 362k (0.5%)<br>1.40 / 1.84 / 3.68 | 313k (3.9%)<br>1.57 / 3.26 / 4.58 |
-| INCR | *1.26M* (2.8%)<br>0.41 / 0.67 / 1.94 | 862k (2.7%)<br>0.57 / 1.13 / 2.38 | 344k (17.8%)<br>1.41 / 3.42 / 5.25 |
+| LPUSH | *1.22M* (3.3%)<br>0.41 / 0.68 / 1.37 | 498k (3.1%)<br>1.02 / 1.51 / 2.61 | 213k (29.6%)<br>1.78 / 6.94 / 7.87 |
+| LPOP | *1.22M* (2.1%)<br>0.41 / 0.69 / 1.62 | 445k (4.8%)<br>1.14 / 1.66 / 2.80 | 162k (35.1%)<br>3.25 / 6.94 / 8.38 |
+| LRANGE_100 | *159k* (13.9%)<br>0.96 / 9.28 / 10.88 | 151k (5.2%)<br>3.33 / 7.29 / 8.38 | 130k (7.6%)<br>3.84 / 7.07 / 7.68 |
+| HSET | *1.18M* (2.1%)<br>0.42 / 0.69 / 1.54 | 615k (2.6%)<br>0.81 / 1.50 / 3.21 | 282k (8.7%)<br>1.60 / 4.86 / 6.62 |
+| HGET | *1.23M* (3.1%)<br>0.41 / 0.69 / 1.40 | 645k (0.9%)<br>0.78 / 1.42 / 3.02 | 642k (3.2%)<br>0.78 / 1.71 / 2.69 |
+| HGETALL | *1.05M* (2.5%)<br>0.48 / 0.77 / 1.62 | 410k (3.0%)<br>1.24 / 1.69 / 2.99 | 436k (1.4%)<br>1.16 / 2.40 / 3.04 |
+| SADD | *1.22M* (6.1%)<br>0.41 / 0.68 / 1.53 | 559k (22.2%)<br>0.92 / 1.51 / 3.29 | 506k (48.6%)<br>0.99 / 2.11 / 3.58 |
+| SISMEMBER | *1.23M* (2.6%)<br>0.41 / 0.68 / 1.56 | 691k (1.5%)<br>0.73 / 1.35 / 2.77 | 573k (4.1%)<br>0.85 / 1.90 / 2.13 |
+| ZADD | *1.16M* (9.3%)<br>0.43 / 0.69 / 1.53 | 455k (51.8%)<br>1.13 / 1.60 / 3.33 | 494k (57.5%)<br>1.04 / 2.22 / 3.17 |
+| ZRANGE | *1.04M* (3.5%)<br>0.49 / 0.81 / 1.87 | 355k (2.2%)<br>1.43 / 1.86 / 3.69 | 310k (6.6%)<br>1.65 / 2.99 / 3.65 |
+| INCR | *1.26M* (3.4%)<br>0.41 / 0.72 / 2.14 | 877k (1.8%)<br>0.57 / 1.10 / 2.17 | 334k (6.2%)<br>1.43 / 3.57 / 5.21 |
 
 #### 100 B values, pipeline 16
 
-ops/s: median of 3 runs (spread = (max-min)/median). Latency: p50 / p99 / p99.9 in ms. `*` = best ops/s in the row.
+ops/s: median of 9 runs (3 rounds) for KiviDB 1.2.0, of 3 for the others (spread = (max-min)/median). Latency: p50 / p99 / p99.9 in ms. `*` = best ops/s in the row.
 
-| command | KiviDB rc4 | Redis 8.10.3 | kvrocks 2.17.0 |
+| command | KiviDB 1.2.0 (75482abb) | Redis 8.10.3 | kvrocks 2.17.0 |
 |---|---|---|---|
-| LPUSH | *4.92M* (8.3%)<br>0.41 / 0.75 / 1.39 | 864k (3.5%)<br>2.35 / 4.58 / 5.47 | 378k (25.5%)<br>4.80 / 11.71 / 20.35 |
-| LPOP | *4.00M* (40.2%)<br>0.33 / 0.68 / 46.08 | 765k (2.4%)<br>2.64 / 3.66 / 5.95 | 314k (8.4%)<br>6.05 / 15.04 / 18.56 |
-| LRANGE_100 | 178k (28.4%)<br>10.30 / 40.19 / 60.16 | 147k (2.4%)<br>13.44 / 29.44 / 40.19 | *196k* (5.2%)<br>11.07 / 18.56 / 27.90 |
-| HSET | *4.77M* (1.1%)<br>0.41 / 0.73 / 1.56 | 1.04M (3.3%)<br>1.95 / 3.79 / 4.70 | 433k (24.0%)<br>4.13 / 10.81 / 13.38 |
-| HGET | *6.20M* (5.8%)<br>0.34 / 0.58 / 0.97 | 1.24M (1.5%)<br>1.63 / 2.48 / 3.90 | 1.50M (26.4%)<br>1.44 / 2.14 / 3.36 |
-| HGETALL | *1.39M* (1.4%)<br>0.75 / 6.46 / 7.01 | 591k (3.2%)<br>3.50 / 4.13 / 5.63 | 725k (23.1%)<br>3.02 / 6.30 / 8.38 |
-| SADD | *5.23M* (22.5%)<br>0.38 / 0.66 / 1.25 | 1.06M (29.1%)<br>1.91 / 3.73 / 4.64 | 790k (81.2%)<br>2.51 / 4.70 / 5.76 |
-| SISMEMBER | *5.36M* (4.1%)<br>0.34 / 0.60 / 1.02 | 1.14M (4.2%)<br>1.78 / 3.47 / 3.94 | 1.22M (33.5%)<br>1.64 / 3.20 / 3.87 |
-| ZADD | *4.65M* (30.9%)<br>0.42 / 0.69 / 1.19 | 832k (64.4%)<br>2.40 / 4.74 / 5.70 | 762k (65.2%)<br>2.61 / 5.05 / 6.37 |
-| ZRANGE | *1.38M* (1.7%)<br>0.77 / 6.40 / 6.91 | 489k (3.1%)<br>4.45 / 5.31 / 7.13 | 432k (31.4%)<br>4.42 / 7.90 / 9.92 |
-| INCR | *6.76M* (7.4%)<br>0.29 / 0.53 / 1.11 | 1.87M (1.7%)<br>1.09 / 1.39 / 2.85 | 579k (21.7%)<br>3.18 / 8.51 / 10.30 |
+| LPUSH | *4.77M* (7.3%)<br>0.41 / 0.71 / 1.20 | 817k (7.9%)<br>2.50 / 4.96 / 5.63 | 382k (13.6%)<br>4.80 / 12.73 / 14.97 |
+| LPOP | *4.15M* (31.5%)<br>0.34 / 0.62 / 49.66 | 689k (2.2%)<br>2.93 / 4.03 / 6.24 | 275k (10.8%)<br>6.24 / 17.54 / 20.48 |
+| LRANGE_100 | *151k* (13.4%)<br>10.37 / 39.94 / 59.39 | 149k (3.3%)<br>13.63 / 29.57 / 40.70 | 127k (12.5%)<br>14.02 / 26.50 / 36.86 |
+| HSET | *4.39M* (15.6%)<br>0.44 / 0.69 / 1.01 | 974k (4.6%)<br>2.08 / 4.16 / 4.96 | 459k (5.9%)<br>4.00 / 10.37 / 12.54 |
+| HGET | *5.62M* (6.1%)<br>0.35 / 0.57 / 0.98 | 1.00M (3.9%)<br>2.03 / 2.83 / 4.38 | 1.48M (19.2%)<br>1.48 / 2.33 / 2.83 |
+| HGETALL | *1.37M* (4.4%)<br>0.75 / 6.46 / 7.01 | 553k (0.8%)<br>3.73 / 5.47 / 6.62 | 623k (15.9%)<br>3.02 / 6.30 / 6.85 |
+| SADD | *5.31M* (23.8%)<br>0.38 / 0.66 / 1.03 | 1.00M (26.1%)<br>2.02 / 4.13 / 5.18 | 747k (64.9%)<br>2.43 / 4.61 / 5.57 |
+| SISMEMBER | *5.56M* (11.0%)<br>0.35 / 0.60 / 0.90 | 1.13M (5.2%)<br>1.79 / 3.63 / 4.01 | 1.10M (16.1%)<br>1.81 / 2.91 / 3.34 |
+| ZADD | *4.37M* (40.8%)<br>0.45 / 0.69 / 1.13 | 802k (61.8%)<br>2.53 / 5.05 / 6.08 | 856k (75.9%)<br>2.53 / 6.05 / 11.58 |
+| ZRANGE | *1.36M* (7.3%)<br>0.78 / 6.37 / 7.04 | 461k (3.2%)<br>4.74 / 5.60 / 7.65 | 451k (9.1%)<br>4.70 / 8.38 / 8.64 |
+| INCR | *6.56M* (9.6%)<br>0.29 / 0.52 / 1.04 | 1.79M (2.3%)<br>1.13 / 1.52 / 2.91 | 623k (14.1%)<br>3.36 / 7.93 / 9.41 |
 
 #### 2 KB values, pipeline 1
 
-ops/s: median of 3 runs (spread = (max-min)/median). Latency: p50 / p99 / p99.9 in ms. `*` = best ops/s in the row.
+ops/s: median of 9 runs (3 rounds) for KiviDB 1.2.0, of 3 for the others (spread = (max-min)/median). Latency: p50 / p99 / p99.9 in ms. `*` = best ops/s in the row.
 
-| command | KiviDB rc4 | Redis 8.10.3 | kvrocks 2.17.0 |
+| command | KiviDB 1.2.0 (75482abb) | Redis 8.10.3 | kvrocks 2.17.0 |
 |---|---|---|---|
-| LPUSH | *850k* (3.3%)<br>0.59 / 1.05 / 2.22 | 276k (1.5%)<br>1.85 / 2.35 / 4.58 | 90k (10.5%)<br>5.82 / 11.58 / 13.82 |
-| LPOP | *812k* (1.9%)<br>0.59 / 2.14 / 2.70 | 364k (4.9%)<br>1.38 / 2.06 / 3.58 | 217k (16.2%)<br>2.24 / 5.70 / 8.45 |
-| LRANGE_100 | *8k* (8.0%)<br>59.65 / 190.46 / 290.81 | 8k (5.1%)<br>59.65 / 182.27 / 311.30 | 8k (2.2%)<br>58.62 / 190.46 / 290.81 |
-| HSET | *829k* (1.8%)<br>0.60 / 1.01 / 2.17 | 392k (2.3%)<br>1.29 / 1.73 / 3.44 | 86k (5.0%)<br>5.89 / 11.26 / 13.82 |
-| HGET | *754k* (0.4%)<br>0.54 / 3.04 / 3.49 | 503k (0.5%)<br>1.00 / 1.75 / 3.01 | 479k (11.3%)<br>1.01 / 2.33 / 5.09 |
-| HGETALL | 80k (1.4%)<br>8.26 / 19.33 / 220.16 | 79k (2.1%)<br>7.10 / 18.05 / 220.16 | *93k* (3.8%)<br>3.38 / 17.02 / 20.61 |
-| SADD | *883k* (11.2%)<br>0.55 / 0.95 / 2.51 | 323k (48.6%)<br>1.57 / 2.11 / 4.00 | 324k (77.4%)<br>1.39 / 5.02 / 7.13 |
-| SISMEMBER | *920k* (0.6%)<br>0.55 / 0.89 / 1.80 | 375k (2.9%)<br>1.35 / 1.80 / 3.68 | 422k (12.0%)<br>1.18 / 2.51 / 4.19 |
-| ZADD | *885k* (14.5%)<br>0.57 / 0.97 / 2.77 | 293k (55.0%)<br>1.71 / 2.43 / 4.42 | 284k (92.4%)<br>1.44 / 5.50 / 7.71 |
-| ZRANGE | 79k (4.9%)<br>7.78 / 19.33 / 221.18 | 81k (5.6%)<br>7.13 / 17.92 / 220.16 | *94k* (6.5%)<br>4.13 / 10.75 / 20.73 |
+| LPUSH | *821k* (4.2%)<br>0.62 / 1.02 / 2.17 | 263k (1.7%)<br>1.94 / 2.42 / 4.35 | 85k (7.1%)<br>5.92 / 10.81 / 12.16 |
+| LPOP | *808k* (10.8%)<br>0.60 / 1.95 / 2.77 | 346k (3.4%)<br>1.48 / 2.11 / 3.82 | 220k (33.6%)<br>2.19 / 5.63 / 8.51 |
+| LRANGE_100 | *8k* (10.1%)<br>59.65 / 181.25 / 301.06 | 8k (2.9%)<br>59.65 / 181.25 / 311.30 | 8k (1.8%)<br>59.39 / 181.25 / 290.81 |
+| HSET | *824k* (3.0%)<br>0.61 / 1.01 / 1.98 | 392k (1.2%)<br>1.30 / 1.70 / 2.98 | 87k (1.7%)<br>5.76 / 11.58 / 13.95 |
+| HGET | *759k* (1.8%)<br>0.55 / 2.99 / 3.38 | 461k (1.9%)<br>1.09 / 1.88 / 3.89 | 485k (2.7%)<br>1.02 / 2.32 / 4.06 |
+| HGETALL | 79k (8.6%)<br>7.58 / 19.33 / 221.18 | 79k (3.6%)<br>6.97 / 18.43 / 220.16 | *99k* (3.0%)<br>3.31 / 17.28 / 214.01 |
+| SADD | *904k* (12.9%)<br>0.57 / 0.96 / 1.92 | 321k (49.0%)<br>1.57 / 2.16 / 3.71 | 320k (74.1%)<br>1.36 / 4.86 / 7.13 |
+| SISMEMBER | *920k* (5.4%)<br>0.56 / 0.90 / 1.80 | 373k (5.5%)<br>1.37 / 1.76 / 3.04 | 427k (9.8%)<br>1.16 / 2.43 / 3.26 |
+| ZADD | *846k* (16.8%)<br>0.58 / 1.11 / 2.53 | 282k (58.6%)<br>1.79 / 2.40 / 3.60 | 332k (81.4%)<br>1.52 / 2.99 / 4.64 |
+| ZRANGE | 78k (14.5%)<br>7.07 / 19.33 / 221.18 | 79k (3.2%)<br>6.91 / 18.05 / 220.16 | *98k* (5.1%)<br>4.19 / 11.20 / 20.22 |
 
 #### 2 KB values, pipeline 16
 
-ops/s: median of 3 runs (spread = (max-min)/median). Latency: p50 / p99 / p99.9 in ms. `*` = best ops/s in the row.
+ops/s: median of 9 runs (3 rounds) for KiviDB 1.2.0, of 3 for the others (spread = (max-min)/median). Latency: p50 / p99 / p99.9 in ms. `*` = best ops/s in the row.
 
-| command | KiviDB rc4 | Redis 8.10.3 | kvrocks 2.17.0 |
+| command | KiviDB 1.2.0 (75482abb) | Redis 8.10.3 | kvrocks 2.17.0 |
 |---|---|---|---|
-| LPUSH | *1.40M* (12.9%)<br>1.38 / 3.47 / 4.61 | 401k (1.3%)<br>5.44 / 6.08 / 7.71 | 106k (31.8%)<br>15.29 / 47.62 / 69.63 |
-| LPOP | *812k* (2.2%)<br>1.20 / 7.97 / 8.57 | 505k (6.4%)<br>4.77 / 7.01 / 7.65 | 258k (10.9%)<br>7.55 / 21.50 / 27.77 |
-| LRANGE_100 | 8k (66.7%)<br>250.88 / 491.52 / 581.63 | 8k (10.4%)<br>250.88 / 501.76 / 581.63 | *11k* (23.3%)<br>190.46 / 430.08 / 501.76 |
-| HSET | *1.47M* (3.0%)<br>0.90 / 5.47 / 6.37 | 593k (6.1%)<br>3.66 / 4.01 / 6.91 | 130k (12.1%)<br>13.50 / 44.03 / 49.92 |
-| HGET | 785k (4.1%)<br>0.79 / 8.77 / 9.66 | 663k (8.4%)<br>3.28 / 3.92 / 5.60 | *847k* (10.6%)<br>2.17 / 4.80 / 6.72 |
-| HGETALL | 81k (6.6%)<br>20.35 / 79.36 / 110.59 | *110k* (23.8%)<br>20.09 / 79.87 / 119.81 | 96k (10.2%)<br>19.33 / 70.14 / 109.57 |
-| SADD | *1.65M* (0.7%)<br>0.67 / 6.50 / 6.94 | 336k (49.6%)<br>6.27 / 7.71 / 9.41 | 440k (88.2%)<br>4.67 / 12.22 / 15.68 |
-| SISMEMBER | *1.62M* (18.1%)<br>0.61 / 6.82 / 7.55 | 526k (0.4%)<br>4.09 / 4.45 / 6.97 | 523k (9.1%)<br>3.44 / 5.98 / 7.58 |
-| ZADD | *1.67M* (9.7%)<br>0.71 / 6.24 / 6.82 | 310k (72.4%)<br>6.88 / 9.02 / 10.88 | 445k (81.7%)<br>4.74 / 12.35 / 16.51 |
-| ZRANGE | 90k (51.1%)<br>20.48 / 79.36 / 109.57 | 79k (3.1%)<br>20.35 / 79.36 / 110.59 | *115k* (21.8%)<br>19.20 / 69.63 / 100.86 |
+| LPUSH | *1.51M* (42.3%)<br>1.44 / 3.46 / 4.45 | 375k (5.0%)<br>5.76 / 6.17 / 8.06 | 94k (30.3%)<br>19.84 / 55.30 / 78.33 |
+| LPOP | *813k* (4.2%)<br>1.22 / 7.97 / 8.64 | 445k (4.6%)<br>5.15 / 7.74 / 8.64 | 301k (22.0%)<br>6.05 / 16.89 / 24.96 |
+| LRANGE_100 | 8k (7.1%)<br>260.10 / 481.28 / 561.15 | 8k (5.0%)<br>260.10 / 481.28 / 540.67 | *9k* (68.0%)<br>182.27 / 430.08 / 491.52 |
+| HSET | *1.47M* (3.2%)<br>0.94 / 5.21 / 5.63 | 554k (3.5%)<br>3.89 / 4.19 / 5.44 | 145k (2.2%)<br>13.18 / 39.42 / 44.03 |
+| HGET | 764k (8.8%)<br>0.78 / 8.83 / 9.86 | 600k (5.5%)<br>3.84 / 4.58 / 5.63 | *891k* (16.5%)<br>2.21 / 4.45 / 5.76 |
+| HGETALL | 78k (5.8%)<br>20.61 / 79.87 / 110.08 | 78k (0.9%)<br>20.35 / 79.87 / 110.08 | *96k* (6.4%)<br>19.58 / 70.14 / 90.62 |
+| SADD | *1.65M* (6.0%)<br>0.68 / 6.40 / 6.82 | 331k (55.3%)<br>6.37 / 7.93 / 8.32 | 374k (92.1%)<br>4.48 / 12.93 / 18.05 |
+| SISMEMBER | *1.52M* (8.4%)<br>0.67 / 6.43 / 6.82 | 514k (6.2%)<br>4.19 / 4.51 / 6.01 | 573k (8.0%)<br>3.58 / 5.73 / 6.27 |
+| ZADD | *1.65M* (10.4%)<br>0.75 / 5.98 / 6.33 | 299k (74.8%)<br>7.07 / 8.89 / 9.98 | 307k (111.1%)<br>5.18 / 17.28 / 21.63 |
+| ZRANGE | 78k (9.7%)<br>20.61 / 79.36 / 109.57 | 78k (6.9%)<br>20.48 / 79.87 / 110.59 | *91k* (26.7%)<br>19.33 / 69.63 / 90.62 |
 
 **What it shows.** Writes are where the classes differ: kvrocks did 0.16-0.51M writes a second at
-pipeline 1 and 0.31-0.79M at pipeline 16 with 100-byte values, and 86-130k with 2 KB values
-(HSET, LPUSH), a tenth of KiviDB's and a fifth to a half of single-threaded Redis's. Reads from its
-cache are close to Redis: HGET 640k / 1.50M, SISMEMBER 612k / 1.22M (pipeline 1 / 16), and its
-p99 at pipeline 16 is 2-15 ms against KiviDB's 0.5-0.8 ms. Its memory is a fraction of the
-in-memory engines' (66-509 MiB resident against ~2 GB), with 1.3-3x the raw data on disk. If the
-data set is larger than memory and the workload tolerates millisecond writes, kvrocks is the
-cheaper store; if it fits in memory, any of the in-memory engines here is several times faster.
+pipeline 1 and 0.28-0.86M at pipeline 16 with 100-byte values, and 85-145k with 2 KB values
+(HSET, LPUSH): 6-20% of KiviDB's rate, and from a quarter of single-threaded Redis's (2 KB LPUSH
+and HSET at pipeline 16) to about the same (SADD, ZADD).
+Reads from its cache are close to Redis: HGET 642k / 1.48M, SISMEMBER 573k / 1.10M (pipeline 1 /
+16), and its p99 at pipeline 16 is 2.3-17.5 ms against KiviDB's 0.5-0.7 ms. Its memory is a
+fraction of the in-memory engines' (68-456 MiB resident against ~2 GB), with 1.4-4.9x the raw data
+on disk. If the data set is larger than memory and the workload tolerates millisecond writes, kvrocks
+is the cheaper store; if it fits in memory, any of the in-memory engines here is several times
+faster.
 
 ## Caveats
 
 - **One client VM.** It was three times the server's size and was not the limit against any single
-  endpoint (memtier's threads at most 56% busy), but in cluster mode against Redis Cluster it was
-  (83-95%): the Redis Cluster pipeline-16 rows are lower bounds.
+  endpoint (memtier's threads at most 58% busy), but in cluster mode against Redis Cluster it was
+  (80-94% on most pipeline-16 rows): the Redis Cluster pipeline-16 rows are lower bounds.
 - **The network caps reads of 2 KB values, LRANGE_100, and the 100 B HGETALL/ZRANGE rows at
-  pipeline 16**, at the D16ds_v5's 12.5 Gbit/s egress. Those rows say "every fast engine fills the
-  NIC", not which is faster. Short runs can read above the sustained cap (Azure lets bursts
-  through), which is why a few of those rows wobble and kvrocks' quarter-length runs read high.
+  pipeline 16**, at the D16ds_v5's 12.5 Gbit/s egress, and the 2 KB writes at pipeline 16 at the
+  client's egress. Those rows say "every fast engine fills the NIC", not which is faster. Short runs
+  can read above the sustained cap (Azure lets bursts through), which is why a few of those rows
+  wobble and kvrocks' quarter-length runs read high.
 - **SADD and ZADD grow their sets** during the three measured runs, so their spread is wider
   (later runs insert into bigger sets); the same requests in the same order of sizes for every
   engine.
 - **Pipeline 1 is a latency test as much as a throughput test**: 512 connections, one request each
   in flight; the engine that answers fastest serves the most.
+- **KiviDB 1.2.0 has 9 runs per row, the competitors 3**: its spreads cover more of the session's
+  drift, so they are wider than a 3-run spread would be.
 - **Docker's netfilter rules** (conntrack) were active on the server for every engine, including
   the ones not in containers. They cost every engine the same per packet.
 - **Valkey, Dragonfly and kvrocks ran in their official images** with host networking; Redis and
@@ -412,7 +515,7 @@ cheaper store; if it fits in memory, any of the in-memory engines here is severa
 
 ## Reproduce
 
-Everything is in `harness/`; nothing depends on this laptop.
+Everything is in `harness/`; nothing depends on any one machine.
 
 ```sh
 # 1. Two VMs in one proximity placement group (Azure CLI; SSH from your IP only, auto-shutdown)
@@ -421,29 +524,41 @@ RG=my-rg REGION=koreacentral bash harness/infra/up.sh <your-ip> ~/.ssh/id_rsa.pu
 bash harness/infra/setup-srv.sh      # server: Redis 8.10.3 from source, images, KiviDB 1.1.3, perf, FlameGraph
 bash harness/infra/setup-cli.sh      # client: memtier_benchmark 2.5.2
 #    the server needs passwordless ssh to the client (the scripts run memtier there over ssh)
-# 3. KiviDB 1.2.0-rc4: the kividb-linux-x86_64 release artifact, as ~/bin/kividb-rc4
-#    (or: bash harness/build.sh rc4 v1.2.0-rc4)
-# 4. On the server
+# 3. The KiviDB builds, on the server
+bash harness/build.sh cand 75482abb         # -> ~/bin/kividb-cand
+bash harness/build.sh rc4 v1.2.0-rc4        # -> ~/bin/kividb-rc4
+# 4. On the server: the whole session in order (matrix in alternating rounds, the 2 KB
+#    re-check, the LPOP tail repro, then the profiling suite's runs)
+bash harness/session.sh
+#    or by hand:
 bash harness/iothreads-sweep.sh                     # picks io-threads for Redis and Valkey
-bash harness/run-all.sh kividb-rc4 kividb-1.1.3 redis valkey dragonfly redis-cluster kvrocks
-bash harness/sustained-2k.sh kividb-rc4 dragonfly redis valkey kividb-1.1.3
-bash harness/lpop-tail.sh kividb-rc4               # the LPOP tail repro
+bash harness/run-all.sh kividb-cand kividb-rc4 kividb-1.1.3 redis kividb-rc4:kividb-rc4-r2 \
+  kividb-cand:kividb-cand-r2 valkey dragonfly kividb-cand:kividb-cand-r3 kividb-rc4:kividb-rc4-r3 \
+  redis-cluster kvrocks
+bash harness/sustained-2k.sh kividb-cand kividb-rc4 dragonfly redis valkey kividb-1.1.3
+DEFRAG=yes bash harness/lpop-tail.sh kividb-cand   # the LPOP tail repro
 python3 harness/summarize.py ~/out/datatypes results
 python3 harness/charts.py results charts
 python3 harness/tables.py results/summary.csv
+python3 harness/vs_rc4.py results charts            # the regression table and chart
 ```
 
 `CLI=<client private IP>` (default 10.0.0.5) and `PORT` (7001) can be set in the environment.
-The whole matrix takes about 2.5 hours on these VMs (kvrocks and the Redis engines take longest).
+A `SPEC` of `ENGINE:ENGINE-rN` in `run-all.sh` is round N of that engine: its own output folder,
+no memory pass. The matrix takes about 3 hours 10 minutes on these VMs with the six KiviDB rounds
+(the Redis engines and Valkey take longest).
 
 ## Files
 
 - `results/summary.csv`: one row per engine, command, value size and pipeline: median ops/s of the
-  three runs, min, max, spread, median p50/p99/p99.9 (ms), client CPU (max), server cores used
-  (CPU seconds of the server processes over the wall time of the run, ssh start-up included, so a
-  little low). `rx_MBps`/`tx_MBps` are memtier's own figures, which in 2.5.2 print the total in both.
-- `results/runs.csv`: every measured run.
+  runs (9 for KiviDB 1.2.0 and rc4, 3 for the others), min, max, spread, median p50/p99/p99.9 (ms),
+  client CPU (max), server cores used (CPU seconds of the server processes over the wall time of
+  the run, ssh start-up included, so a little low). `rx_MBps`/`tx_MBps` are memtier's own figures,
+  which in 2.5.2 print the total in both.
+- `results/runs.csv`: every measured run, with its round.
+- `results/vs-rc4.csv`, `results/vs-rc4.md`: the regression check against rc4.
 - `results/memory.csv`: RSS (and kvrocks' data directory) after loading each group into a fresh server.
-- `results/iothreads-sweep.csv`: the io-threads sweep for Redis and Valkey.
+- `results/iothreads-sweep.csv`: the io-threads sweep for Redis and Valkey (rc4 session).
 - `results/sustained-2k.txt`, `results/lpop-tail.txt`: the two follow-up checks.
-- `raw/<engine>/`: memtier's text reports for every run (tarred), server CPU per run, versions.
+- `raw/<engine>/`, `raw/<engine>-r<N>/`: memtier's text reports for every run (tarred), server CPU
+  per run, versions, memory (first round). `raw/lpop-perf/`: the LPOP stall profile.

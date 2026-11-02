@@ -5,6 +5,7 @@
 #   engine.sh start <engine> [port]     engine.sh stop
 #
 # Engines (binaries from setup-server.sh / fetch-kividb.sh):
+#   kividb-cand    ~/bin/kividb-cand     KiviDB 1.2.0 candidate (release/1.2.0 at 75482abb), default variant
 #   kividb-rc4     ~/bin/kividb-rc4      KiviDB 1.2.0-rc4, default variant
 #   kividb-113     ~/bin/kividb-1.1.3    KiviDB 1.1.3, default variant
 #   kividb-master  ~/bin/kividb-master   dry runs only
@@ -23,7 +24,7 @@ BIN=$HOME/bin
 RUN=$HOME/run
 LOGS=$HOME/logs
 mkdir -p "$LOGS"
-NAMES=(kividb-rc4 kividb-1.1.3 kividb-master redis-server dragonfly valkey-server GarnetServer)
+NAMES=(kividb-cand kividb-rc4 kividb-1.1.3 kividb-master redis-server dragonfly valkey-server GarnetServer)
 
 stop() {
   for n in "${NAMES[@]}"; do pkill -KILL -x "$n" 2>/dev/null || true; done
@@ -62,7 +63,7 @@ wait_for() {
 launch() { nohup "$@" > "$LOGS/$ENGINE.log" 2>&1 & }
 
 case $ENGINE in
-  kividb-rc4|kividb-113|kividb-master)
+  kividb-cand|kividb-rc4|kividb-113|kividb-master)
     b=$BIN/kividb-${ENGINE#kividb-}; [ "$ENGINE" = kividb-113 ] && b=$BIN/kividb-1.1.3
     cmd=("$b" --port "$PORT" --bind 0.0.0.0)
     record "$("$b" --version 2>&1 | head -1)" "${cmd[@]}"

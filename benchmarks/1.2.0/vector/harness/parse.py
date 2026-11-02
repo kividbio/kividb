@@ -103,6 +103,7 @@ def search_json(results_dir):
             k: res.get(k) for k in ("rps", "p50_time", "p95_time", "p99_time", "mean_time",
                                     "mean_recall", "client_saturated", "client_cpu_cores_used", "total_time")
         }
+        found[(int(ef), int(par))]["p999_ms"] = (res.get("latency_hdr") or {}).get("p999_ms")
     return found
 
 
@@ -184,6 +185,7 @@ def main(raw, out_path):
                 "p50_ms": (j.get("p50_time") or 0) * 1000 or None,
                 "p95_ms": (j.get("p95_time") or 0) * 1000 or None,
                 "p99_ms": (j.get("p99_time") or 0) * 1000 or None,
+                "p999_ms": j.get("p999_ms"),
                 "client_saturated": j.get("client_saturated"),
                 "client_cpu_cores": j.get("client_cpu_cores_used"),
             })

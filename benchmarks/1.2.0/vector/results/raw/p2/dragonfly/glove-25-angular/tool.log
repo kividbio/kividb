@@ -1,20 +1,87 @@
-1793576285.911 RUN ./vector-db-benchmark --host 10.90.1.4 --engines-file dragonfly-engine.json --parallels 100 --skip-search --datasets glove-25-angular --skip-if-exists false 
-1793576285.918 vector-db-benchmark v0.1.0
-1793576285.920 Found 1 datasets, 1 engines
-1793576285.922 
-1793576285.924 ============================================================
-1793576285.925 Running experiment (1/1): dragonfly-glove25 - glove-25-angular
-1793576285.927 ============================================================
-1793576285.929 Experiment stage: Configure
-1793576285.931 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 256}
-1793576286.158 Experiment stage: Upload
-1793576286.160 Reading dataset from /home/ubuntu/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
-1793576286.339 Read 1183514 vectors (25d) in 0.180s (6561602 vectors/sec)
-1793576286.341 Starting upload with 100 threads, batch size 64...
-1793576313.818 Upload time: 27.479s (43069 records/sec)
-1793576313.820 Indexing complete: 1183514 docs in 0.0s
-1793576313.822 Index time: 0.002s, Total time (read+upload+index): 27.662s
-1793576313.870 Results saved to: "/home/ubuntu/vdb/results/dragonfly-glove25-glove-25-angular-upload-0-1183514-2026-11-01-23-38-33.json"
-1793576313.872 Experiment stage: Cleanup (deleting index and data)
-1793576316.435 Experiment stage: Done
-1793576316.445 EXIT 0
+1793637591.570 RUN ./vector-db-benchmark --host 10.90.1.4 --engines-file dragonfly-engine.json --parallels 100 --datasets glove-25-angular --skip-if-exists false 
+1793637591.578 vector-db-benchmark v0.1.0
+1793637591.580 Found 1 datasets, 1 engines
+1793637591.581 
+1793637591.583 ============================================================
+1793637591.585 Running experiment (1/1): dragonfly-glove25 - glove-25-angular
+1793637591.587 ============================================================
+1793637591.589 Experiment stage: Configure
+1793637591.590 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 256}
+1793637591.822 Experiment stage: Upload
+1793637591.824 Reading dataset from /home/azureuser/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793637592.028 Read 1183514 vectors (25d) in 0.206s (5752335 vectors/sec)
+1793637592.030 Starting upload with 100 threads, batch size 64...
+1793637619.821 Upload time: 27.793s (42583 records/sec)
+1793637619.823 Indexing complete: 1183514 docs in 0.0s
+1793637619.825 Index time: 0.002s, Total time (read+upload+index): 28.001s
+1793637619.879 Results saved to: "/home/azureuser/vdb/results/dragonfly-glove25-glove-25-angular-upload-0-1183514-2026-11-02-16-40-19.json"
+1793637619.881 Experiment stage: Search
+1793637619.882 	Running search 0: ef=64, parallel=100
+1793637619.884 	Reading queries from /home/azureuser/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793637620.288 	  rep 1/3: QPS 25582.2
+1793637620.290 	Reading queries from /home/azureuser/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793637620.699 	  rep 2/3: QPS 25454.6
+1793637620.701 	Reading queries from /home/azureuser/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793637621.104 	  rep 3/3: QPS 25851.1
+1793637621.106 	→ QPS: 25851.1, Recall: 0.9116, Precision: 0.9116, MRR: 1.0000, NDCG: 0.9353 (best of reps)
+1793637621.108 	Running search 1: ef=128, parallel=100
+1793637621.110 	Reading queries from /home/azureuser/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793637621.535 	  rep 1/3: QPS 24319.3
+1793637621.537 	Reading queries from /home/azureuser/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793637621.955 	  rep 2/3: QPS 24977.2
+1793637621.957 	Reading queries from /home/azureuser/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793637622.374 	  rep 3/3: QPS 25023.0
+1793637622.375 	→ QPS: 25023.0, Recall: 0.9366, Precision: 0.9366, MRR: 1.0000, NDCG: 0.9538 (best of reps)
+1793637622.377 	Running search 2: ef=256, parallel=100
+1793637622.379 	Reading queries from /home/azureuser/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793637622.857 	  rep 1/3: QPS 21533.4
+1793637622.859 	Reading queries from /home/azureuser/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793637623.356 	  rep 2/3: QPS 20840.3
+1793637623.358 	Reading queries from /home/azureuser/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793637623.858 	  rep 3/3: QPS 20774.3
+1793637623.860 	→ QPS: 21533.4, Recall: 0.9791, Precision: 0.9791, MRR: 1.0000, NDCG: 0.9849 (best of reps)
+1793637623.862 	Running search 3: ef=512, parallel=100
+1793637623.864 	Reading queries from /home/azureuser/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793637624.531 	  rep 1/3: QPS 15324.7
+1793637624.533 	Reading queries from /home/azureuser/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793637625.202 	  rep 2/3: QPS 15400.0
+1793637625.204 	Reading queries from /home/azureuser/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793637625.867 	  rep 3/3: QPS 15528.0
+1793637625.869 	→ QPS: 15528.0, Recall: 0.9951, Precision: 0.9951, MRR: 1.0000, NDCG: 0.9965 (best of reps)
+1793637625.871 	Results saved to: "/home/azureuser/vdb/results/dragonfly-glove25-glove-25-angular-search-0-60955-2026-11-02-16-40-25.json"
+1793637625.873 	Results saved to: "/home/azureuser/vdb/results/dragonfly-glove25-glove-25-angular-search-1-60955-2026-11-02-16-40-25.json"
+1793637625.874 	Results saved to: "/home/azureuser/vdb/results/dragonfly-glove25-glove-25-angular-search-2-60955-2026-11-02-16-40-25.json"
+1793637625.876 	Results saved to: "/home/azureuser/vdb/results/dragonfly-glove25-glove-25-angular-search-3-60955-2026-11-02-16-40-25.json"
+1793637625.878 ----------------------------------------------------------------------------------
+1793637625.880 Recall     Precision  MRR      NDCG     QPS        P50 (ms)     P95 (ms)    
+1793637625.882 ----------------------------------------------------------------------------------
+1793637625.884 0.9951     0.9951     1.0000   0.9965   15528.0    6.170        8.865       
+1793637625.885 0.9791     0.9791     1.0000   0.9849   21533.4    4.438        6.468       
+1793637625.887 0.9366     0.9366     1.0000   0.9538   25023.0    3.895        5.519       
+1793637625.889 0.9116     0.9116     1.0000   0.9353   25851.1    3.721        5.515       
+1793637625.891 
+1793637625.892 
+1793637625.894 QPS vs Precision Trade-off - dragonfly-glove25 - glove-25-angular (up and to the right is better):
+1793637625.896 
+1793637625.898    25851 │●                 ●                                         
+1793637625.899    23501 │                                                            
+1793637625.901    21151 │                                                ●           
+1793637625.903    18801 │                                                            
+1793637625.905    16451 │                                                           ●
+1793637625.907    14101 │                                                            
+1793637625.909    11750 │                                                            
+1793637625.910     9400 │                                                            
+1793637625.912     7050 │                                                            
+1793637625.914     4700 │                                                            
+1793637625.916     2350 │                                                            
+1793637625.918        0 │                                                            
+1793637625.919          └────────────────────────────────────────────────────────────
+1793637625.921           0.912          0.939          0.967          0.995          
+1793637625.923         Precision (0.0 = 0%, 1.0 = 100%)
+1793637625.925 
+1793637625.927 ================================================================================
+1793637625.929 Results saved to:  /home/azureuser/vdb/results
+1793637625.930 Summary saved to:  /home/azureuser/vdb/results/dragonfly-glove25-glove-25-angular-summary.json
+1793637625.932 Experiment stage: Cleanup (deleting index and data)
+1793637628.430 Experiment stage: Done
+1793637628.447 EXIT 0

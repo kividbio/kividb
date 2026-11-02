@@ -1,85 +1,85 @@
-=== 1793570975 22:09:35
-VmHWM:	   10984 kB
-VmRSS:	   10984 kB
+=== 1793633487 15:31:27
+VmHWM:	   10976 kB
+VmRSS:	   10976 kB
 Threads:	6
-used_memory:590976
-used_memory_rss:11153408
+used_memory:615664
+used_memory_rss:11145216
 maxmemory:1073741824
-mem_fragmentation_ratio:20.20
-total_commands_processed:1
+mem_fragmentation_ratio:20.19
+total_commands_processed:2
 instantaneous_ops_per_sec:0
 evicted_keys:0
 keyspace_hits:0
 keyspace_misses:0
 0
 stat: 0 0
-=== 1793571005 22:10:05
-VmHWM:	  402248 kB
-VmRSS:	  402248 kB
+=== 1793633517 15:31:57
+VmHWM:	  402176 kB
+VmRSS:	  402176 kB
 Threads:	6
 ERR max number of clients reached
 
-stat: 627 1695
-=== 1793571035 22:10:35
-VmHWM:	  821324 kB
-VmRSS:	  821324 kB
+stat: 622 1747
+=== 1793633547 15:32:27
+VmHWM:	  818072 kB
+VmRSS:	  818072 kB
 Threads:	6
 ERR max number of clients reached
 
-stat: 1386 3724
-=== 1793571065 22:11:05
-VmHWM:	 1077116 kB
-VmRSS:	 1077116 kB
+stat: 1368 3836
+=== 1793633577 15:32:57
+VmHWM:	 1076936 kB
+VmRSS:	 1076936 kB
 Threads:	6
 ERR max number of clients reached
 
-stat: 2172 5731
-=== 1793571095 22:11:35
-VmHWM:	 1080440 kB
-VmRSS:	 1080440 kB
+stat: 2157 5876
+=== 1793633607 15:33:27
+VmHWM:	 1080288 kB
+VmRSS:	 1080288 kB
 Threads:	6
 ERR max number of clients reached
 
-stat: 3058 7649
-=== 1793571125 22:12:05
-VmHWM:	 1081612 kB
-VmRSS:	 1081612 kB
+stat: 3031 7860
+=== 1793633637 15:33:57
+VmHWM:	 1081520 kB
+VmRSS:	 1081520 kB
 Threads:	6
 ERR max number of clients reached
 
-stat: 3943 9573
-=== 1793571155 22:12:35
-VmHWM:	 1081988 kB
-VmRSS:	 1081988 kB
+stat: 3916 9827
+=== 1793633667 15:34:27
+VmHWM:	 1081964 kB
+VmRSS:	 1081964 kB
 Threads:	6
 ERR max number of clients reached
 
-stat: 4801 11435
-=== 1793571185 22:13:05
-VmHWM:	 1082180 kB
-VmRSS:	 1082180 kB
+stat: 4768 11743
+=== 1793633697 15:34:57
+VmHWM:	 1082168 kB
+VmRSS:	 1082168 kB
 Threads:	6
 ERR max number of clients reached
 
-stat: 5677 13366
-=== 1793571215 22:13:35
-VmHWM:	 1082252 kB
-VmRSS:	 1082252 kB
+stat: 5637 13731
+=== 1793633727 15:35:27
+VmHWM:	 1082228 kB
+VmRSS:	 1082228 kB
 Threads:	6
 ERR max number of clients reached
 
-stat: 6555 15304
-=== 1793571245 22:14:05
-VmHWM:	 1082292 kB
-VmRSS:	 1082292 kB
+stat: 6494 15730
+=== 1793633757 15:35:57
+VmHWM:	 1082244 kB
+VmRSS:	 1082244 kB
 Threads:	6
 ERR max number of clients reached
 
-stat: 7423 17253
-=== 1793571275 22:14:35
-VmHWM:	 1082352 kB
-VmRSS:	 1082352 kB
+stat: 7380 17702
+=== 1793633787 15:36:27
+VmHWM:	 1082276 kB
+VmRSS:	 1082276 kB
 Threads:	6
 ERR max number of clients reached
 
-stat: 8316 19176
+stat: 8255 19681

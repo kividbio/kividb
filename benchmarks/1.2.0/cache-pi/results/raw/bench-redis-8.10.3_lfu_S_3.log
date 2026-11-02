@@ -1,35 +1,35 @@
-cmd: taskset -c 1,2,3 ./bench.test -test.run=^$ -test.bench=^BenchmarkRedis$ -test.benchtime=8388608x -test.timeout=0 true 1073741824 1024 8 1 0 10.30.1.13
-pair: c3 -> 10.30.1.13
-Sun Nov  1 22:09:34 UTC 2026
+cmd: taskset -c 1,2,3 ./bench.test -test.run=^$ -test.bench=^BenchmarkRedis$ -test.benchtime=8388608x -test.timeout=0 true 1073741824 1024 8 1 0 10.30.1.16
+pair: c6 -> 10.30.1.16
+Mon Nov  2 14:21:32 UTC 2026
 goos: linux
 goarch: arm64
 pkg: github.com/imchuncai/umem-cache-benchmark
 BenchmarkRedis-3   	
 ======================================================================
-server:  2097152    warmup:  8388608    get:  8388608    hit:  5090927
-VmHWM:       0 kB   hit_rate: 60.69%    per_memory_hit_rate: 60.69%
-P1:  77 us  P50: 398 us  P90: 770 us  P99: 1507 us  P99.9: 3143 us
-161.009s	    output:   83 Mb/s   input:  131 Mb/s
+server:  2097152    warmup:  8388608    get:  8388608    hit:  5093188
+VmHWM:       0 kB   hit_rate: 60.72%    per_memory_hit_rate: 60.72%
+P1:  86 us  P50: 395 us  P90: 725 us  P99: 1074 us  P99.9: 2384 us
+156.101s	    output:   85 Mb/s   input:  135 Mb/s
 ======================================================================
- 8388608	     19194 ns/op	     31619 hit/s/mem
+ 8388608	     18609 ns/op	     32628 hit/s/mem
 PASS
-	Command being timed: "timeout 4h taskset -c 1,2,3 /home/azureuser/bench.test -test.run=^$ -test.bench=^BenchmarkRedis$ -test.benchtime=8388608x -test.timeout=0 true 1073741824 1024 8 1 0 10.30.1.13"
-	User time (seconds): 379.82
-	System time (seconds): 428.27
-	Percent of CPU this job got: 248%
-	Elapsed (wall clock) time (h:mm:ss or m:ss): 5:24.80
+	Command being timed: "timeout 4h taskset -c 1,2,3 /home/azureuser/bench.test -test.run=^$ -test.bench=^BenchmarkRedis$ -test.benchtime=8388608x -test.timeout=0 true 1073741824 1024 8 1 0 10.30.1.16"
+	User time (seconds): 340.10
+	System time (seconds): 395.87
+	Percent of CPU this job got: 233%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 5:15.73
 	Average shared text size (kbytes): 0
 	Average unshared data size (kbytes): 0
 	Average stack size (kbytes): 0
 	Average total size (kbytes): 0
-	Maximum resident set size (kbytes): 621380
+	Maximum resident set size (kbytes): 621476
 	Average resident set size (kbytes): 0
-	Major (requiring I/O) page faults: 2
-	Minor (reclaiming a frame) page faults: 399380
-	Voluntary context switches: 990880
-	Involuntary context switches: 862320
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 279984
+	Voluntary context switches: 3599603
+	Involuntary context switches: 1175363
 	Swaps: 0
-	File system inputs: 272
+	File system inputs: 0
 	File system outputs: 8
 	Socket messages sent: 0
 	Socket messages received: 0
@@ -37,4 +37,4 @@ PASS
 	Page size (bytes): 4096
 	Exit status: 0
 exit=0
-Sun Nov  1 22:14:58 UTC 2026
+Mon Nov  2 14:26:48 UTC 2026

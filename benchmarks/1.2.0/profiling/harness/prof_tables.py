@@ -8,9 +8,12 @@ import os
 import sys
 
 RES = sys.argv[1]
-NAMES = {"kividb-rc4-fp": "KiviDB rc4", "kividb-1.1.3-fp": "KiviDB 1.1.3", "redis": "Redis 8.10.3",
-         "kividb-rc4": "KiviDB rc4, release binary"}
-ORDER = ["kividb-rc4-fp", "redis", "kividb-1.1.3-fp", "kividb-rc4"]
+NAMES = {"kividb-cand-fp": "KiviDB 1.2.0", "kividb-rc4-fp": "KiviDB rc4", "kividb-1.1.3-fp": "KiviDB 1.1.3",
+         "redis": "Redis 8.10.3"}
+for _r in (1, 2, 3):
+    NAMES[f"kividb-cand-r{_r}"] = f"KiviDB 1.2.0, release binary, round {_r}"
+    NAMES[f"kividb-rc4-r{_r}"] = f"KiviDB rc4, release binary, round {_r}"
+ORDER = ["kividb-cand-fp", "redis", "kividb-1.1.3-fp", "kividb-rc4-fp"]
 WL = ["get-p1", "get-p16", "set-p1", "set-p16"]
 
 
@@ -33,7 +36,7 @@ for e in ORDER:
             th.sort(key=lambda t: -float(t["cores"]))
             if th:
                 busy = [t for t in th if float(t["cores"]) >= 0.05]
-                busiest = (f"{th[0]['thread'].replace('kividb-rc4-fp', 'worker').replace('kividb-1.1.3-fp', 'worker').replace('kividb-rc4', 'worker')}"
+                busiest = (f"{'worker' if th[0]['thread'].startswith('kividb') else th[0]['thread']}"
                            f" {float(th[0]['cores']):.2f} cores; {len(busy)} threads busy, "
                            f"{sum(float(t['cores']) for t in busy):.1f} cores in all")
         print(f"| {NAMES[e]}, {wname(tag)} | {float(r['ops_per_sec']) / 1e6:.2f}M | {float(r['total_us_per_op']):.2f} | "
@@ -48,7 +51,7 @@ if os.path.exists(sp):
         if r["category"] not in cats:
             cats.append(r["category"])
     short = {c: c.split(" (")[0] for c in cats}
-    keys = [(e, w) for e in ["kividb-rc4-fp", "redis", "kividb-1.1.3-fp"] for w in WL
+    keys = [(e, w) for e in ["kividb-cand-fp", "redis", "kividb-1.1.3-fp", "kividb-rc4-fp"] for w in WL
             if any(r["engine"] == e and r["workload"] == w for r in rows)]
     print("| microseconds of CPU per request | " + " | ".join(f"{NAMES[e]}<br>{wname(w)}" for e, w in keys) + " |")
     print("|---|" + "---|" * len(keys))
@@ -68,10 +71,9 @@ print("=== cg")
 cg = os.path.join(RES, "callgrind-table.csv")
 if os.path.exists(cg):
     rows = list(csv.DictReader(open(cg)))
-    print("| workload | KiviDB 1.1.3 | KiviDB 1.2.0-rc4 | rc4 vs 1.1.3 | Redis 8.10.3 | rc4 vs Redis |")
-    print("|---|---|---|---|---|---|")
+    print("| workload | KiviDB 1.1.3 | KiviDB 1.2.0-rc4 | KiviDB 1.2.0 (75482abb) | 1.2.0 vs rc4 | 1.2.0 vs 1.1.3 | Redis 8.10.3 | 1.2.0 vs Redis |")
+    print("|---|---|---|---|---|---|---|---|")
+    pct = lambda x, y: f"{(int(x) - int(y)) * 100.0 / int(y):+.1f}%" if x and y else "-"
     for r in rows:
-        a, b, c = r.get("v113", ""), r.get("rc4", ""), r.get("redis-8.10.3", "")
-        d1 = f"{(int(b) - int(a)) * 100.0 / int(a):+.1f}%" if a and b else ""
-        d2 = f"{(int(b) - int(c)) * 100.0 / int(c):+.1f}%" if b and c else "-"
-        print(f"| {r['workload']} | {a} | {b} | {d1} | {c or '-'} | {d2} |")
+        a, b, n, c = r.get("v113", ""), r.get("rc4", ""), r.get("cand", ""), r.get("redis-8.10.3", "")
+        print(f"| {r['workload']} | {a} | {b} | {n} | {pct(n, b)} | {pct(n, a)} | {c or '-'} | {pct(n, c)} |")

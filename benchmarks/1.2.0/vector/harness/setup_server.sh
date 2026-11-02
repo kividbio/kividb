@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Server: Redis 8.10.2 (query engine module from the redis apt package, the
-# vector-benchmark.yml pin), Dragonfly v2.0.2 native arm64, and a Rust
-# toolchain to build KiviDB tags the way vector-benchmark.yml does
-# (cargo build --release, default features, RUSTFLAGS=-C target-feature=+lse).
+# vector-benchmark.yml pin) and Dragonfly v2.0.2 native arm64. KiviDB is built
+# on a separate builder VM with build_kividb.sh and copied to ~/bins/<name>/,
+# so nothing compiles on the server.
 set -euo pipefail
 REDIS_DEB="${REDIS_DEB:-6:8.10.2-1rl1~jammy1}"
 DRAGONFLY_VERSION="${DRAGONFLY_VERSION:-v2.0.2}"
 export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update -qq
-sudo apt-get install -y -qq ca-certificates curl gnupg lsb-release build-essential cmake clang pkg-config git sysstat
+sudo apt-get install -y -qq ca-certificates curl gnupg lsb-release git sysstat linux-tools-common "linux-tools-$(uname -r)" || \
+  sudo apt-get install -y -qq ca-certificates curl gnupg lsb-release git sysstat
 curl -fsSL https://packages.redis.io/gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
 echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg arch=arm64] https://packages.redis.io/deb $(lsb_release -cs) main" \
   | sudo tee /etc/apt/sources.list.d/redis.list
@@ -22,7 +23,4 @@ wget -q "https://github.com/dragonflydb/dragonfly/releases/download/${DRAGONFLY_
 tar -xzf df.tgz && chmod +x dragonfly-aarch64 && rm -f df.tgz
 ./dragonfly-aarch64 --version | head -2
 redis-server --version
-if ! command -v cargo >/dev/null; then
-  curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null
-fi
 echo SETUP-SERVER-OK

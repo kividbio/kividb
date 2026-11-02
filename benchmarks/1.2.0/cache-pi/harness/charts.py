@@ -17,12 +17,15 @@ plt.rcParams.update({"svg.fonttype": "none", "font.family": "DejaVu Sans", "font
 
 # fixed engine colours from the shared brief; older builds of the same engine are hatched
 ENG = [  # key, label, colour, hatch
-    ("kividb-rc4", "KiviDB 1.2.0-rc4", "#0072B2", ""),
+    ("kividb-75482ab", "KiviDB 1.2.0\n(candidate 75482ab)", "#0072B2", ""),
     ("kividb-1.1.3", "KiviDB 1.1.3", "#56B4E9", ""),
-    ("kividb-48280b7", "KiviDB 48280b7\n(=1.2.0-rc2, reporter's)", "#56B4E9", "///"),
     ("redis-8.10.3", "Redis 8.10.3", "#D55E00", ""),
     ("redis-6bf6224", "Redis unstable 6bf6224\n(reporter's)", "#D55E00", "///"),
+    ("kividb-rc4", "KiviDB 1.2.0-rc4", "#56B4E9", ""),  # regression chart only
 ]
+CAND, RC4 = "kividb-75482ab", "kividb-rc4"
+S_ENG = {CAND, "kividb-1.1.3", "redis-8.10.3"}  # the engines run at the quarter length
+F_ENG = {CAND, "redis-8.10.3", "redis-6bf6224"}
 POL = ["allkeys-lfu", "allkeys-lru"]
 rows = [r for r in csv.DictReader(open(os.path.join(R, "runs.csv"))) if r.get("gets")]
 
@@ -136,36 +139,81 @@ def hitrate(fname, length, title, engines=None):
     plt.close(fig)
 
 
+def paired(fname, title):
+    """candidate GETs/s / rc4 GETs/s for every run of the two on the same VM pair, back to back"""
+    by = {}
+    for r in rows:
+        if r["engine"] in (CAND, RC4) and r["length"] in ("F", "X"):
+            key = (r["length"], r["policy"], r["pair"].split()[0], r["rep"].rstrip("ab"), r["rep"][-1:] if r["length"] == "X" else "")
+            by.setdefault(key, {})[r["engine"]] = float(r["gets_per_s"])
+    groups = [("F", "allkeys-lfu", "allkeys-lfu, 33,554,432 GETs"), ("F", "allkeys-lru", "allkeys-lru, 33,554,432 GETs"),
+              ("X", "allkeys-lfu", "allkeys-lfu, 8,388,608 GETs (extra rounds)")]
+    fig, ax = plt.subplots(figsize=(10, 2.9))
+    for i, (L, pol, label) in enumerate(groups):
+        v = [d[CAND] / d[RC4] for k, d in by.items() if k[0] == L and k[1] == pol and CAND in d and RC4 in d]
+        if not v:
+            continue
+        ax.scatter(v, [i] * len(v), s=36, color="#0072B2", edgecolor="white", lw=0.6, zorder=3)
+        med = statistics.median(v)
+        ax.plot([med, med], [i - 0.28, i + 0.28], color="#222", lw=2, zorder=4)
+        ax.annotate(f"median {med:.3f} ({len(v)} paired runs)", (max(v), i), xytext=(8, 0), textcoords="offset points",
+                    va="center", fontsize=8.5, color="#222")
+    ax.axvline(1.0, color="#56B4E9", lw=2, zorder=1)
+    ax.text(1.0, len(groups) - 0.45, " rc4 = 1.0", color="#222", fontsize=8.5, va="bottom")
+    ax.set_yticks(range(len(groups)))
+    ax.set_yticklabels([g[2] for g in groups], fontsize=8.5)
+    ax.set_ylim(-0.6, len(groups) - 0.2)
+    ax.invert_yaxis()
+    ax.set_xlim(0.95, 1.05)
+    ax.xaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda x, _: f"{x:.2f}"))
+    ax.grid(axis="x", color="#ddd", lw=0.6, zorder=0)
+    ax.set_xlabel("candidate GETs/s divided by rc4 GETs/s on the same VM pair (dots: one pair of runs each; bar: median)", fontsize=9)
+    fig.suptitle(title, fontsize=12, x=0.01, ha="left")
+    fig.tight_layout()
+    fig.savefig(os.path.join(C, fname))
+    plt.close(fig)
+
+
 def diag(fname, title):
     """diag-<engine>.log from diag-sampler.sh: epoch, total commands, connected clients, max idle s, pid"""
-    series = [("kividb-1.1.3", "KiviDB 1.1.3", "#56B4E9"), ("kividb-rc4", "KiviDB 1.2.0-rc4", "#0072B2")]
-    fig, axes = plt.subplots(2, 1, figsize=(10, 5.4), sharex=True, gridspec_kw={"height_ratios": [2, 1]})
+    series = [("kividb-1.1.3", "KiviDB 1.1.3", "#56B4E9"), (CAND, "KiviDB 1.2.0 (candidate 75482ab)", "#0072B2")]
+    fig, axes = plt.subplots(3, 1, figsize=(10, 7.2), sharex=True, gridspec_kw={"height_ratios": [2, 1.4, 1]})
     for k, label, col in series:
         p = os.path.join(R, "raw", f"diag-{k}.log")
         if not os.path.exists(p):
             continue
-        pts = []
+        pts, na = [], []
         for line in open(p):
             f = line.split()
-            if len(f) >= 4 and f[3] != "NA" and f[1] != "NA":
+            if len(f) < 4:
+                continue
+            if f[1] == "NA":
+                na.append(float(f[0]))  # the sampler's own INFO got no answer within 2 s
+            elif f[3] != "NA" and f[1] != "NA":
                 pts.append((float(f[0]), int(f[1]), int(f[2]), int(f[3])))
+        na = [x for x in na if pts[0][0] < x < pts[-1][0]]  # not before the start or after the stop
         t0 = pts[0][0]
         t = [(x[0] - t0) / 60 for x in pts]
-        axes[0].plot(t, [x[3] for x in pts], color=col, lw=2, label=label)
-        axes[1].plot(t, [x[2] - 1 for x in pts], color=col, lw=2, label=label)  # minus the sampler itself
-        if k == "kividb-1.1.3":
-            peak = max(range(len(pts)), key=lambda i: pts[i][3])
-            axes[0].annotate(f"one connection unanswered for {pts[peak][3]} s\nwhile others are served; then the "
-                             "client times out\nand drops its connections", (t[peak], pts[peak][3]),
-                             xytext=(25, -10), textcoords="offset points", fontsize=8, color="#222",
-                             arrowprops=dict(arrowstyle="-", color="#666", lw=0.8))
-    axes[0].set_ylabel("longest wait of any\nconnection, s (CLIENT LIST idle)")
-    axes[1].set_ylabel("client connections")
-    axes[1].set_xlabel("minutes since the server started (warmup, then the measured 8,388,608 GETs)")
+        rate = [(b[1] - a[1]) / (b[0] - a[0]) for a, b in zip(pts, pts[1:])]
+        axes[0].plot(t[1:], rate, color=col, lw=1.2, label=label)
+        if na:
+            axes[0].plot([(x - t0) / 60 for x in na], [800] * len(na), ls="", marker="|", ms=10, mew=1.5, color="#D55E00",
+                         label=f"{label}: sampler's INFO unanswered for 2 s ({len(na)}x)")
+        axes[1].plot(t, [x[3] for x in pts], color=col, lw=2, label=label)
+        axes[2].plot(t, [x[2] - 1 for x in pts], color=col, lw=2, label=label)  # minus the sampler itself
+    axes[0].set_yscale("log")
+    axes[0].set_ylim(500, 300000)
+    axes[0].yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda x, _: f"{x:,.0f}"))
+    axes[0].set_ylabel("commands/s\n(INFO, log scale)")
+    axes[1].set_ylabel("longest wait of any\nconnection, s (CLIENT LIST idle)")
+    axes[2].set_ylabel("client connections")
+    axes[2].set_xlabel("minutes since the server started (warmup, then the measured 8,388,608 GETs)")
     for ax in axes:
         ax.grid(axis="y", color="#ddd", lw=0.6)
+    for ax in axes[1:]:
         ax.set_ylim(bottom=0)
-    axes[0].legend(loc="upper right", frameon=False, fontsize=8.5)
+    axes[1].set_ylim(top=max(5, axes[1].get_ylim()[1]))
+    axes[0].legend(loc="lower right", frameon=False, fontsize=8)
     fig.suptitle(title, fontsize=11.5, x=0.01, ha="left")
     fig.tight_layout()
     fig.savefig(os.path.join(C, fname))
@@ -175,14 +223,19 @@ def diag(fname, title):
 if __name__ == "__main__":
     T = dict(l.split("=", 1) for l in sys.argv[3:])  # optional title overrides key=text
     bars("hits-per-s.svg", "hits_per_s", "S",
-         T.get("hits", "rc4 serves 7-8x the hits/s of 1.1.3 and about 8% fewer than Redis 8 (8,388,608 GETs per run)"),
-         "hits per second (median of 3 runs; whiskers min-max)")
+         T.get("hits", "1.2.0 serves about 8x the hits/s of 1.1.3 (8,388,608 GETs per run)"),
+         "hits per second (median of 3 runs; whiskers min-max)", engines=S_ENG)
     bars("hits-per-s-full.svg", "hits_per_s", "F",
-         T.get("hitsfull", "At the reporter's full length (33,554,432 GETs) rc4 is 6-8% behind Redis 8 on hits/s"),
-         "hits per second (median of 3 runs; whiskers min-max)", engines={"kividb-rc4", "redis-8.10.3", "redis-6bf6224"})
-    bars("vmhwm.svg", "vmhwm_kb", "S", T.get("mem", "rc4 peaks within 2% of the 1 GiB limit, like Redis; 1.1.3 and 48280b7 overshoot by 20-30%"),
-         "VmHWM, MiB", scale=1 / 1024, vline=(1024, "maxmemory"))
-    hitrate("hit-rate.svg", "S", T.get("hitrate", "rc4 hit rate matches Redis; 1.1.3 and 48280b7 lose it per byte of RAM (8,388,608 GETs)"))
-    latency("latency.svg", "S", T.get("lat", "rc4 latency tracks Redis 8; old builds are 5-10x slower (8,388,608 GETs)"))
+         T.get("hitsfull", "At the reporter's full length (33,554,432 GETs), 1.2.0 against Redis on hits/s"),
+         "hits per second (median of 3 runs; whiskers min-max)", engines=F_ENG)
+    bars("vmhwm.svg", "vmhwm_kb", "S", T.get("mem", "1.2.0 peaks close to the 1 GiB limit, like Redis; 1.1.3 overshoots by 20-30%"),
+         "VmHWM, MiB", scale=1 / 1024, vline=(1024, "maxmemory"), engines=S_ENG)
+    hitrate("hit-rate.svg", "S", T.get("hitrate", "1.2.0 hit rate matches Redis; 1.1.3 loses it per byte of RAM (8,388,608 GETs)"),
+            engines=S_ENG)
+    latency("latency.svg", "F", T.get("lat", "1.2.0 latency against Redis (33,554,432 GETs)"), engines=F_ENG)
+    bars("vs-rc4.svg", "gets_per_s", "F",
+         T.get("rc4", "1.2.0 candidate against rc4, same VM pairs (33,554,432 GETs per run)"),
+         "GETs per second (median of 3 runs; whiskers min-max)", engines={CAND, RC4})
+    paired("vs-rc4-paired.svg", T.get("paired", "1.2.0 candidate against rc4, run by run on the same VM pair"))
     print("charts written to", C)
-    diag("connection-idle.svg", T.get("diag", "KiviDB 1.1.3 starves some connections under this load; 1.2.0-rc4 does not"))
+    diag("connection-idle.svg", T.get("diag", "Under this load KiviDB 1.1.3 stalls for seconds at a time and the client drops its connections; 1.2.0 does not"))

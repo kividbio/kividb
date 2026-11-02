@@ -1,22 +1,104 @@
-1793578671.825 RUN ./vector-db-benchmark --host 10.90.1.4 --engines-file kividb-engine.json --engines kividb-m16-ef128 --skip-search --datasets dbpedia-openai-1M-1536-angular --skip-if-exists false 
-1793578671.832 vector-db-benchmark 0.2.0 (git d22d44e8b46009a800a59e952710166ece2e38a1)
-1793578671.834 Found 1 datasets, 1 engines
-1793578671.836 
-1793578671.837 ============================================================
-1793578671.839 Running experiment (1/1): kividb-m16-ef128 - dbpedia-openai-1M-1536-angular
-1793578671.841 ============================================================
-1793578671.843 Experiment stage: Configure
-1793578671.844 KiviDB server: `INFO server` reported `kividb_version:1.2.0-rc4`
-1793578671.846 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 128}
-1793578671.848 Experiment stage: Upload
-1793578671.850 Reading dataset from /home/ubuntu/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
-1793578671.852 WARNING: dataset 'dbpedia-openai-1M-1536-angular' declares vector_count 1000000 but its corpus holds only 999000 vectors. Benchmarks will run over the 999000 vectors that exist; fix vector_count in datasets/datasets.json (it is what --list-datasets reports).
-1793578681.492 Read 999000 vectors (1536d) in 9.654s (103478 vectors/sec)
-1793578681.494 Starting upload with 16 threads, batch size 64...
-1793578900.463 Upload time: 218.971s (4562 records/sec)
-1793578900.531 Indexing complete (algorithm=hnsw, num_docs=Some(999000), hnsw_live_count=Some(999000)/999000, compaction_in_progress=false) in 0.1s
-1793578900.533 Index time: 0.068s, Total time (read+upload+index): 228.694s
-1793578901.035 Results saved to: "/home/ubuntu/vdbx/results/kividb-m16-ef128-dbpedia-openai-1M-1536-angular-upload-0-999000-2026-11-02-00-21-41.json"
-1793578901.255 Experiment stage: Cleanup (deleting index and data)
-1793578906.702 Experiment stage: Done
-1793578906.705 EXIT 0
+1793644149.512 RUN ./vector-db-benchmark --host 10.90.1.4 --engines-file kividb-engine.json --engines kividb-m16-ef128 --datasets dbpedia-openai-1M-1536-angular --skip-if-exists false 
+1793644149.520 vector-db-benchmark 0.2.0 (git d22d44e8b46009a800a59e952710166ece2e38a1)
+1793644149.522 Found 1 datasets, 1 engines
+1793644149.524 
+1793644149.526 ============================================================
+1793644149.527 Running experiment (1/1): kividb-m16-ef128 - dbpedia-openai-1M-1536-angular
+1793644149.529 ============================================================
+1793644149.531 Experiment stage: Configure
+1793644149.533 KiviDB server: `INFO server` reported `kividb_version:1.2.0-rc4`
+1793644149.535 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 128}
+1793644149.537 Experiment stage: Upload
+1793644149.538 Reading dataset from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793644149.540 WARNING: dataset 'dbpedia-openai-1M-1536-angular' declares vector_count 1000000 but its corpus holds only 999000 vectors. Benchmarks will run over the 999000 vectors that exist; fix vector_count in datasets/datasets.json (it is what --list-datasets reports).
+1793644159.430 Read 999000 vectors (1536d) in 9.905s (100861 vectors/sec)
+1793644159.433 Starting upload with 16 threads, batch size 64...
+1793644380.286 Upload time: 220.856s (4523 records/sec)
+1793644380.354 Indexing complete (algorithm=hnsw, num_docs=Some(999000), hnsw_live_count=Some(999000)/999000, compaction_in_progress=false) in 0.1s
+1793644380.355 Index time: 0.068s, Total time (read+upload+index): 230.829s
+1793644380.858 Results saved to: "/home/azureuser/vdbx/results/kividb-m16-ef128-dbpedia-openai-1M-1536-angular-upload-0-999000-2026-11-02-18-33-00.json"
+1793644380.868 Experiment stage: Search
+1793644380.870 	Running search 0: ef=64, parallel=1
+1793644380.935 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793644383.552 	  rep 1/3: QPS 383.8
+1793644383.619 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793644386.097 	  rep 2/3: QPS 405.3
+1793644386.164 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793644388.672 	  rep 3/3: QPS 400.9
+1793644388.673 	→ QPS: 405.3, Recall: 0.9460, Precision@returned: 0.9460, MRR: 1.0000, NDCG: 0.9608 (best of reps)
+1793644388.675 	Running search 1: ef=128, parallel=1
+1793644388.739 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793644391.640 	  rep 1/3: QPS 346.1
+1793644391.707 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793644394.606 	  rep 2/3: QPS 346.3
+1793644394.672 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793644397.663 	  rep 3/3: QPS 335.7
+1793644397.664 	→ QPS: 346.3, Recall: 0.9604, Precision@returned: 0.9604, MRR: 1.0000, NDCG: 0.9713 (best of reps)
+1793644397.666 	Running search 2: ef=256, parallel=1
+1793644397.729 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793644402.336 	  rep 1/3: QPS 217.6
+1793644402.403 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793644406.881 	  rep 2/3: QPS 223.9
+1793644406.947 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793644411.626 	  rep 3/3: QPS 214.3
+1793644411.628 	→ QPS: 223.9, Recall: 0.9827, Precision@returned: 0.9827, MRR: 1.0000, NDCG: 0.9875 (best of reps)
+1793644411.630 	Running search 3: ef=128, parallel=16
+1793644411.696 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793644411.936 	  rep 1/3: QPS 4399.8
+1793644412.004 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793644412.242 	  rep 2/3: QPS 4470.7
+1793644412.308 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793644412.569 	  rep 3/3: QPS 4060.5
+1793644412.571 	→ QPS: 4470.7, Recall: 0.9604, Precision@returned: 0.9604, MRR: 1.0000, NDCG: 0.9713 (best of reps)
+1793644412.573 	Running search 4: ef=128, parallel=100
+1793644412.635 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793644412.822 	  rep 1/3: QPS 6342.0
+1793644412.891 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793644413.068 	  rep 2/3: QPS 6329.8
+1793644413.136 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793644413.313 	  rep 3/3: QPS 6346.5
+1793644413.315 	→ QPS: 6346.5, Recall: 0.9604, Precision@returned: 0.9604, MRR: 1.0000, NDCG: 0.9713 (best of reps)
+1793644413.532 	Results saved to: "/home/azureuser/vdbx/results/kividb-m16-ef128-dbpedia-openai-1M-1536-angular-search-0-96426-2026-11-02-18-33-33.json"
+1793644413.537 	Results saved to: "/home/azureuser/vdbx/results/kividb-m16-ef128-dbpedia-openai-1M-1536-angular-search-1-96426-2026-11-02-18-33-33.json"
+1793644413.543 	Results saved to: "/home/azureuser/vdbx/results/kividb-m16-ef128-dbpedia-openai-1M-1536-angular-search-2-96426-2026-11-02-18-33-33.json"
+1793644413.548 	Results saved to: "/home/azureuser/vdbx/results/kividb-m16-ef128-dbpedia-openai-1M-1536-angular-search-3-96426-2026-11-02-18-33-33.json"
+1793644413.554 	Results saved to: "/home/azureuser/vdbx/results/kividb-m16-ef128-dbpedia-openai-1M-1536-angular-search-4-96426-2026-11-02-18-33-33.json"
+1793644413.556 -----------------------------------------------------------------------------------------------
+1793644413.558 Recall     Precision  MRR      NDCG     QPS        P50 (ms)     P90 (ms)     P95 (ms)    
+1793644413.560 -----------------------------------------------------------------------------------------------
+1793644413.561 0.9827     0.9827     1.0000   0.9875   223.9      4.553        5.635        5.881       
+1793644413.563 0.9604     0.9604     1.0000   0.9713   6346.5     14.582       19.445       20.520      
+1793644413.565 0.9460     0.9460     1.0000   0.9608   405.3      2.531        2.958        3.017       
+1793644413.567 
+1793644413.569 
+1793644413.571 QPS vs Precision Trade-off - kividb-m16-ef128 - dbpedia-openai-1M-1536-angular (up and to the right is better):
+1793644413.572 
+1793644413.574     6346 │                       ●                                    
+1793644413.576     5770 │                                                            
+1793644413.578     5193 │                                                            
+1793644413.580     4616 │                                                            
+1793644413.582     4039 │                                                            
+1793644413.584     3462 │                                                            
+1793644413.586     2885 │                                                            
+1793644413.587     2308 │                                                            
+1793644413.589     1731 │                                                            
+1793644413.591     1154 │                                                            
+1793644413.593      577 │●                                                           
+1793644413.595        0 │                                                           ●
+1793644413.597          └────────────────────────────────────────────────────────────
+1793644413.598           0.946          0.958          0.970          0.983          
+1793644413.600         Precision (0.0 = 0%, 1.0 = 100%)
+1793644413.602 
+1793644413.604 THROUGHPUT vs CONCURRENCY (saturation curve):
+1793644413.606   ef=128 — peak 6346.5 QPS @ parallel 100 (still climbing at top of swept range — sweep higher to find the knee)
+1793644413.608     parallel         QPS     p50 ms     p90 ms     p95 ms     p99 ms    sat?
+1793644413.609            1       346.3      2.963      3.508      3.581      3.790       -
+1793644413.611           16      4470.7      3.635      4.311      4.464      4.678       -
+1793644413.613          100      6346.5     14.582     19.445     20.520     22.171       -
+1793644413.615 
+1793644413.617 ================================================================================
+1793644413.619 Results saved to:  /home/azureuser/vdbx/results
+1793644413.620 Summary saved to:  /home/azureuser/vdbx/results/kividb-m16-ef128-dbpedia-openai-1M-1536-angular-summary.json
+1793644413.622 Experiment stage: Cleanup (deleting index and data)
+1793644418.981 Experiment stage: Done
+1793644418.988 EXIT 0

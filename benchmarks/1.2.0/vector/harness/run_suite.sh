@@ -6,7 +6,7 @@
 # client's CPU is recorded (mpstat) so a client-bound row is visible.
 #
 # Usage: SERVER_IP=10.90.1.4 PASS=p1 MODE=full|upload \
-#        DATASETS="..." ENGINES="kividb-rc4 kividb-rc3 redis redis-mt dragonfly" \
+#        DATASETS="..." ENGINES="kividb-cand kividb-rc4 redis redis-mt dragonfly" \
 #        EXTRA_ARGS="" run_suite.sh
 #   MODE=upload adds --skip-search (ingest-only repeat).
 set -u
@@ -14,9 +14,9 @@ SERVER_IP=${SERVER_IP:?}
 PASS=${PASS:?}
 MODE=${MODE:-full}
 DATASETS=${DATASETS:-h-and-m-2048-angular-filters dbpedia-openai-100K-1536-angular glove-25-angular}
-ENGINES=${ENGINES:-kividb-rc4 kividb-rc3 redis redis-mt dragonfly}
+ENGINES=${ENGINES:-kividb-cand kividb-rc4 redis redis-mt dragonfly}
 EXTRA_ARGS=${EXTRA_ARGS:-}
-SSH="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 -o ServerAliveInterval=30 ubuntu@$SERVER_IP"
+SSH="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 -o ServerAliveInterval=30 ${VM_USER:-azureuser}@$SERVER_IP"
 OUT=~/out/$PASS
 mkdir -p $OUT
 LOG=$OUT/suite.log
@@ -56,7 +56,7 @@ for ds in $DATASETS; do
     sleep 3   # trailing samples
     echo "exit=$rc $ds $e $(date -u +%T)" >> $LOG
     $SSH "bash ~/server_ctl.sh stop $e" >> $LOG 2>&1
-    scp -q -o StrictHostKeyChecking=no ubuntu@$SERVER_IP:/tmp/mem-$PASS-$e-$ds.csv $d/mem.csv
+    scp -q -o StrictHostKeyChecking=no ${VM_USER:-azureuser}@$SERVER_IP:/tmp/mem-$PASS-$e-$ds.csv $d/mem.csv
   done
 done
 echo "SUITE DONE $PASS $(date -u +%T)" >> $LOG

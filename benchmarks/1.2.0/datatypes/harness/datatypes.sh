@@ -25,7 +25,7 @@
 # connection its own key and value sequence (without it all connections walk
 # the same random keys in step and SADD/ZADD repeat each other's members).
 #
-# Output: ~/out/datatypes/ENGINE/*.json (memtier), server-cpu.csv,
+# Output: ~/out/datatypes/RUN/*.json (memtier; RUN defaults to ENGINE), server-cpu.csv,
 # memory.csv (RSS after loading each group), versions.txt
 set -u
 ENGINE=$1
@@ -35,7 +35,8 @@ NSCALE=${NSCALE:-1} SIZES=${SIZES:-"100 2048"} GROUPS_=${GROUPS_:-"hash set zset
 ONLY_P=${ONLY_P:-"1 16"}
 HERE=$(cd "$(dirname "$0")" && pwd)
 source "$HERE/engines.sh"
-OUT=~/out/datatypes/$ENGINE ROUT=out/datatypes/$ENGINE
+RUN=${RUN:-$ENGINE} # output name; a later round of the same engine runs as RUN=<engine>-r2 ...
+OUT=~/out/datatypes/$RUN ROUT=out/datatypes/$RUN
 mkdir -p "$OUT"; ssh "$CLI" "mkdir -p $ROUT"
 CLUSTER=""; [ "$ENGINE" = redis-cluster ] && CLUSTER="--cluster-mode"
 [ "$ENGINE" = kvrocks ] && NSCALE=${NSCALE_KVROCKS:-4}

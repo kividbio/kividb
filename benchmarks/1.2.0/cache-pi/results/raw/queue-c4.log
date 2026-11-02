@@ -1,17 +1,21 @@
-2026-11-01T22:09:31 start redis-8.10.3_lru_S_1 redis-8.10.3 allkeys-lru 8388608
-2026-11-01T22:14:51 done redis-8.10.3_lru_S_1
-2026-11-01T22:14:51 start kividb-1.1.3_lru_S_1 kividb-1.1.3 allkeys-lru 8388608
-2026-11-01T22:38:37 done kividb-1.1.3_lru_S_1
-2026-11-01T22:38:37 start redis-6bf6224_lfu_F_1 redis-6bf6224 allkeys-lfu 33554432
-2026-11-01T22:59:28 done redis-6bf6224_lfu_F_1
-2026-11-01T22:59:28 start kividb-rc4_lru_F_1 kividb-rc4 allkeys-lru 33554432
-2026-11-01T23:22:15 done kividb-rc4_lru_F_1
-2026-11-01T23:22:15 start kividb-rc4_lru_S_1 kividb-rc4 allkeys-lru 8388608
-2026-11-01T23:28:08 done kividb-rc4_lru_S_1
-2026-11-01T23:28:08 start kividb-48280b7_lfu_S_1 kividb-48280b7 allkeys-lfu 8388608
-2026-11-01T23:52:37 done kividb-48280b7_lfu_S_1
-2026-11-01T23:52:37 start redis-6bf6224_lfu_S_1 redis-6bf6224 allkeys-lfu 8388608
-2026-11-01T23:57:51 done redis-6bf6224_lfu_S_1
-2026-11-01T23:57:51 start redis-8.10.3_lru_F_1 redis-8.10.3 allkeys-lru 33554432
-2026-11-02T00:18:45 done redis-8.10.3_lru_F_1
+2026-11-02T13:50:57 start kividb-1.1.3_lfu_S_1 kividb-1.1.3 allkeys-lfu 8388608
+2026-11-02T14:15:43 done kividb-1.1.3_lfu_S_1
+2026-11-02T14:15:43 start redis-8.10.3_lfu_P_1 redis-8.10.3 allkeys-lfu 8388608
+2026-11-02T14:21:18 done redis-8.10.3_lfu_P_1
+2026-11-02T14:21:18 start kividb-75482ab_lfu_P_1 kividb-75482ab allkeys-lfu 8388608
+2026-11-02T14:27:01 done kividb-75482ab_lfu_P_1
+2026-11-02T14:27:01 start kividb-rc4_lfu_P_1 kividb-rc4 allkeys-lfu 8388608
+2026-11-02T14:32:42 done kividb-rc4_lfu_P_1
+2026-11-02T14:32:42 start redis-8.10.3_lfu_S_1 redis-8.10.3 allkeys-lfu 8388608
+2026-11-02T14:38:16 done redis-8.10.3_lfu_S_1
+2026-11-02T14:38:17 start kividb-75482ab_lfu_S_1 kividb-75482ab allkeys-lfu 8388608
+2026-11-02T14:43:54 done kividb-75482ab_lfu_S_1
+2026-11-02T14:43:54 start kividb-1.1.3_lru_S_1 kividb-1.1.3 allkeys-lru 8388608
+2026-11-02T15:07:44 done kividb-1.1.3_lru_S_1
+2026-11-02T15:07:45 start kividb-75482ab_lru_S_1 kividb-75482ab allkeys-lru 8388608
+2026-11-02T15:13:33 done kividb-75482ab_lru_S_1
+2026-11-02T15:13:33 start redis-8.10.3_lru_S_1 redis-8.10.3 allkeys-lru 8388608
+2026-11-02T15:19:04 done redis-8.10.3_lru_S_1
+2026-11-02T15:19:04 start redis-6bf6224_lru_F_1 redis-6bf6224 allkeys-lru 33554432
+2026-11-02T15:39:30 done redis-6bf6224_lru_F_1
 stopped

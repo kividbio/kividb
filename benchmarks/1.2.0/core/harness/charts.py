@@ -7,6 +7,7 @@ One idea per chart; fixed engine colours shared by every 1.2.0 suite.
 """
 import csv
 import math
+import statistics
 import os
 import sys
 
@@ -26,8 +27,11 @@ plt.rcParams.update({
 ROOT, OUT = sys.argv[1], sys.argv[2]
 os.makedirs(OUT, exist_ok=True)
 
+CAND = "kividb-cand"
+CAND_LABEL = os.environ.get("CAND_LABEL", "KiviDB 1.2.0 (75482ab)")
 ENGINES = [  # key prefix, label, colour
-    ("kividb-rc4", "KiviDB 1.2.0-rc4", "#0072B2"),
+    (CAND, CAND_LABEL, "#0072B2"),
+    ("kividb-rc4", "KiviDB 1.2.0-rc4", "#56B4E9"),  # regression chart only
     ("kividb-113", "KiviDB 1.1.3", "#56B4E9"),
     ("redis-cluster", "Redis 8.10.3 Cluster (32 shards)", "#E69F00"),
     ("redis", "Redis 8.10.3 (io-threads {io})", "#D55E00"),
@@ -35,12 +39,15 @@ ENGINES = [  # key prefix, label, colour
     ("dragonfly", "Dragonfly 2.0.2", "#CC79A7"),
     ("garnet", "Garnet 2.2.5", "#999999"),
 ]
-ORDER = ["kividb-rc4", "kividb-113", "redis", "redis-cluster", "valkey", "dragonfly", "garnet"]
-MAIN = os.environ.get("MAIN_ENGINES", "").split()  # e.g. "kividb-rc4 kividb-113 redis@8 ..."
+ORDER = [CAND, "kividb-113", "redis", "redis-cluster", "valkey", "dragonfly", "garnet"]
+MAIN = os.environ.get("MAIN_ENGINES", "").split()  # e.g. "kividb-cand kividb-113 redis@24 ..."
 
 rows = list(csv.DictReader(open(os.path.join(ROOT, "summary.csv"))))
 data = {(r["engine"], r["size"], r["scenario"]): r for r in rows}
-engines = MAIN or sorted({r["engine"] for r in rows}, key=lambda e: ORDER.index(e.split("@")[0]) if e.split("@")[0] in ORDER else 99)
+runs = list(csv.DictReader(open(os.path.join(ROOT, "runs.csv"))))
+# rc4 is only in the regression chart, not in the main charts.
+engines = MAIN or sorted({r["engine"] for r in rows if r["engine"] != "kividb-rc4"},
+                         key=lambda e: ORDER.index(e.split("@")[0]) if e.split("@")[0] in ORDER else 99)
 
 
 def style(engine):
@@ -117,24 +124,24 @@ def short(e):
 
 
 def vs(size, sc):
-    """'0.97x Garnet 2.2.5': KiviDB rc4 against the fastest other engine."""
-    k = get("kividb-rc4", size, sc)
+    """'0.97x Garnet 2.2.5': the KiviDB candidate against the fastest other engine."""
+    k = get(CAND, size, sc)
     b, be = best_other(size, sc)
     return f"{k / b:.2f}x {short(be)}" if k and b else "n/a"
 
 
 for size in ("100", "1024", "2048"):
     p16 = [get(e, size, "get_p16") for e in engines if get(e, size, "get_p16")]
-    if "nic" in limited("kividb-rc4", size, "get_p16"):
+    if "nic" in limited(CAND, size, "get_p16"):
         t = (f"{SIZE_NAME[size]} values: at pipeline 16 the fast engines all hit the server's 16 Gbps NIC "
              f"(~{max(p16) / 1e6:.2f}M GET/s)")
     else:
-        t = (f"{SIZE_NAME[size]} values, pipeline 16: KiviDB rc4 GET is {vs(size, 'get_p16')}, "
+        t = (f"{SIZE_NAME[size]} values, pipeline 16: KiviDB 1.2.0 GET is {vs(size, 'get_p16')}, "
              f"SET is {vs(size, 'set_p16')}")
     grouped(WL, size, t, f"throughput-{size}.svg")
 
 mk = [("mget10_p1", "MGET of 10 keys\npipeline 1"), ("mset10_p1", "MSET of 10 keys\npipeline 1")]
-grouped(mk, "100", f"10-key commands: KiviDB rc4 MGET is {vs('100', 'mget10_p1')}, "
+grouped(mk, "100", f"10-key commands: KiviDB 1.2.0 MGET is {vs('100', 'mget10_p1')}, "
         f"MSET only {vs('100', 'mset10_p1')} (commands/s)",
         "multikey.svg", [e for e in engines if e != "redis-cluster"])
 
@@ -164,7 +171,6 @@ for size in ("100", "1024", "2048"):
                plt.Line2D([], [], marker="D", ls="", color="#555555", mec="#222222", label="p99 (labelled)"),
                plt.Line2D([], [], marker="|", ls="", color="#222222", ms=10, label="p99.9")]
     fig.legend(handles=handles, loc="lower center", ncol=3, frameon=False, bbox_to_anchor=(0.5, -0.08))
-    k99, b99 = get("kividb-rc4", size, "get_p16", "p99_ms"), None
     fig.suptitle(f"{SIZE_NAME[size]} values: request latency at each engine's own throughput (p50, p99, p99.9)",
                  x=0.01, ha="left", fontsize=12, fontweight="bold")
     fig.tight_layout()
@@ -200,33 +206,56 @@ ax.set_title("Batching is where the multi-threaded engines pull away: GET throug
              loc="left", fontsize=11, fontweight="bold")
 save(fig, "pipeline-depth.svg")
 
-# 1.1.3 against rc4.
-scs = [(s, sc) for s in ("100", "1024", "2048") for sc, _ in WL] + [("100", "mget10_p1"), ("100", "mset10_p1")]
-pairs = [(s, sc, get("kividb-113", s, sc), get("kividb-rc4", s, sc)) for s, sc in scs]
-pairs = [p for p in pairs if p[2] and p[3]]
+
+# The candidate against 1.2.0-rc4: every round of each, as % of rc4's median.
+SCS = [(s, sc) for s in ("100", "1024", "2048") for sc, _ in WL] + [("100", "mget10_p1"), ("100", "mset10_p1")]
+
+
+def per_round(e, s, sc, k):
+    return [float(r[k]) for r in runs if r["engine"] == e and r["size"] == s and r["scenario"] == sc
+            and r.get(k, "") not in ("", None) and not r.get("error")]
+
+
+def scen_name(s, sc):
+    op, p = sc.split("_p")
+    return f"{SIZE_NAME[s]} {op.upper().replace('10', ' 10')}, p{p}"
+
+
+pairs = [(s, sc) for s, sc in SCS if get("kividb-rc4", s, sc) and get(CAND, s, sc)]
+CLIP = float(os.environ.get("REGRESSION_CLIP", "104"))  # % of rc4's median
 if pairs:
-    fig, ax = plt.subplots(figsize=(8.5, 0.32 * len(pairs) + 1.4))
+    fig, axes = plt.subplots(1, 2, figsize=(11, 0.34 * len(pairs) + 1.8), sharey=True)
     ys = list(range(len(pairs)))[::-1]
-    ch = [round(100 * (n / o - 1), 1) + 0.0 for _, _, o, n in pairs]
-    # Slower beyond run-to-run noise: rc4's best round below 1.1.3's worst.
-    beyond = [get("kividb-rc4", s, sc, "ops_max") < get("kividb-113", s, sc, "ops_min") for s, sc, _, _ in pairs]
-    ax.barh(ys, ch, color=["#0072B2" if c >= 0 else "#56B4E9" for c in ch], height=0.65,
-            hatch=["///" if b else None for b in beyond], edgecolor="white")
-    for y, c, b, (s, sc, o, n) in zip(ys, ch, beyond, pairs):
-        ax.text(max(c, 0) + 0.4, y,
-                f"{c:+.1f}%  ({o / 1e6:.2f}M -> {n / 1e6:.2f}M){'  outside run-to-run spread' if b else ''}",
-                va="center", ha="left", fontsize=8)
-    ax.axvline(0, color="#444444", lw=1)
-    ax.set_yticks(ys, [f"{SIZE_NAME[s]} {sc.replace('_p', ' p').upper().replace(' P', ', pipeline ')}" for s, sc, _, _ in pairs])
-    lo, hi = min(ch + [0]), max(ch + [0])
-    pad = max(hi - lo, 10) * 0.6
-    ax.set_xlim(lo - (pad if lo < 0 else 2), hi + pad)
-    ax.set_xlabel("change in median throughput, 1.2.0-rc4 vs 1.1.3 (%)")
-    ax.grid(axis="y", visible=False)
-    slow = [(p, c) for p, c, b in zip(pairs, ch, beyond) if b]
-    note = ("; slower beyond the spread: " + ", ".join(
-        f"{SIZE_NAME[p[0]]} {p[1].split('_')[0].upper()} p{p[1].split('_p')[1]} {c:+.1f}%" for p, c in slow)
-        if slow else "; nothing slower beyond the spread")
-    ax.set_title(f"KiviDB 1.2.0-rc4 vs 1.1.3, interleaved rounds{note}",
-                 loc="left", fontsize=11, fontweight="bold")
-    save(fig, "regression-113-vs-rc4.svg")
+    slow = []
+    for ax, key, lab in ((axes[0], "ops", "throughput, % of rc4 median (higher is better)"),
+                         (axes[1], "p99_ms", "p99 latency, % of rc4 median (lower is better)")):
+        for y, (s, sc) in zip(ys, pairs):
+            base = statistics.median(per_round("kividb-rc4", s, sc, key))
+            for e, dy, c in (("kividb-rc4", 0.16, "#56B4E9"), (CAND, -0.16, "#0072B2")):
+                v = [100 * x / base for x in per_round(e, s, sc, key)]
+                # A round far outside the axis (the 1 KB GET p16 NIC burst, see the README's
+                # caveats) is drawn at the edge with its value written next to it.
+                clip = CLIP if key == "ops" else float("inf")
+                for x in [x for x in v if x > clip]:
+                    ax.annotate(f"one round at {x:.0f}% (NIC burst) →", (clip, y + dy), xytext=(0, 3),
+                                textcoords="offset points", ha="right", va="bottom", fontsize=7, color=c)
+                v = [min(x, clip) for x in v]
+                ax.plot([min(v), max(v)], [y + dy, y + dy], color=c, lw=2, solid_capstyle="round")
+                ax.plot(v, [y + dy] * len(v), "|", color=c, ms=7)
+                ax.plot(statistics.median(v), y + dy, "o", color=c, ms=6, mec="white", mew=1)
+            if key == "ops":
+                cv, rv = per_round(CAND, s, sc, key), per_round("kividb-rc4", s, sc, key)
+                if max(cv) < min(rv):
+                    slow.append(f"{scen_name(s, sc)} {100 * (statistics.median(cv) / statistics.median(rv) - 1):+.1f}%")
+        ax.axvline(100, color="#444444", lw=1)
+        ax.set_xlabel(lab)
+        ax.grid(axis="y", visible=False)
+    axes[0].set_yticks(ys, [scen_name(s, sc) for s, sc in pairs])
+    handles = [plt.Line2D([], [], marker="o", color=c, lw=2, mec="white", label=l)
+               for l, c in (("KiviDB 1.2.0-rc4", "#56B4E9"), (CAND_LABEL, "#0072B2"))]
+    fig.legend(handles=handles, loc="lower center", ncol=2, frameon=False, bbox_to_anchor=(0.5, -0.04))
+    note = ("slower beyond the run-to-run spread: " + ", ".join(slow)) if slow else "nothing slower beyond the run-to-run spread"
+    fig.suptitle(f"KiviDB 1.2.0 vs 1.2.0-rc4, alternating rounds (dot: median, ticks: each round)\n{note}",
+                 x=0.01, ha="left", fontsize=11, fontweight="bold")
+    fig.tight_layout()
+    save(fig, "regression-rc4-vs-1.2.0.svg")
