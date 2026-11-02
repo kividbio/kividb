@@ -711,7 +711,13 @@ fn reserved_fds() -> usize {
 #[cfg(unix)]
 fn clients_for(soft: libc::rlim_t, max: usize, reserved: usize) -> usize {
     let reserved = libc::rlim_t::try_from(reserved).unwrap_or(libc::RLIM_INFINITY);
-    usize::try_from(soft.saturating_sub(reserved)).map_or(max, |n| n.min(max))
+    // Not `saturating_sub` alone: `rlim_t` is signed on FreeBSD, where it
+    // goes below zero, and the conversion below then fails and gives `max`
+    // (#288).
+    if soft <= reserved {
+        return 0;
+    }
+    usize::try_from(soft - reserved).map_or(max, |n| n.min(max))
 }
 
 /// Raises the soft open-file limit toward what `max` clients need, never past
