@@ -118,6 +118,14 @@ fn encoding_of(value: ValueRef<'_>) -> &'static str {
 /// key with a time to live deleted it and answered 1, where Redis answers 0
 /// and leaves the key as it was (#270). An answer of 0 propagates nothing
 /// (`script_feed::expire_feed`); a deletion goes as a `DEL`.
+///
+/// While the AOF is replayed (`expiry::replaying`) a moment that has come
+/// deletes nothing: it is set, as Redis sets it while it loads. The log's
+/// `PEXPIREAT k t` was written while `t` was ahead, and the writes after it
+/// were made to the key that had it: deleted here, the replayed `HSET k …`
+/// that followed made a new key of what came after, with no time to live,
+/// for good. Set, the key keeps its deadline, the writes go into it, and
+/// expiry takes it out once the load is done, with its `DEL` logged.
 pub(crate) fn apply_expire(
     ctx: &Ctx,
     key: &str,
@@ -125,6 +133,7 @@ pub(crate) fn apply_expire(
     deletes: bool,
     flags: &ExpireModifierFlags,
 ) -> Vec<u8> {
+    let deletes = deletes && !crate::expiry::replaying();
     let db = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db, key);
     if !read_lock!(shard).contains_key(key) {

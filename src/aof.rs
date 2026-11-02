@@ -1847,8 +1847,11 @@ pub fn replay_aof(
     // replayed after `t` as an INCR of a missing key, `1` with no time to
     // live, for good. The preamble's keys too, past their time or not. And no key is
     // swept meanwhile, by the expiry threads, which run from before the load.
+    // Nor does a `PEXPIREAT` whose moment has come delete its key: it sets
+    // it, and the writes after it go into the key (`expiry::replay`).
     let _hold = crate::expiry::hold();
     let _loading = crate::expiry::Loading::start();
+    let _replay = crate::expiry::replay();
     let buf = std::fs::read(path)?;
     let mut stats = ReplayStats {
         bytes: buf.len() as u64,
@@ -2973,5 +2976,168 @@ mod backlog_tests {
         assert!(rx.try_recv().is_err(), "the next pass takes the rest");
         let len = std::fs::metadata(&path).expect("metadata").len();
         assert_eq!(len, (records * record.len()) as u64);
+    }
+}
+
+/// A deadline the log gave a key, or a hash field, and the writes made to
+/// it after that while it lived: replayed once the deadline has passed.
+#[cfg(test)]
+mod past_deadline_replay_tests {
+    use super::*;
+    use crate::commands::helpers::{delete_key_if_expired, is_expired, now_ms};
+    use crate::store::{Store, ValueRef};
+
+    fn record(parts: &[&str]) -> Vec<u8> {
+        let parts: Vec<Vec<u8>> = parts.iter().map(|p| p.as_bytes().to_vec()).collect();
+        crate::resp::write::encode_resp_command(&parts)
+    }
+
+    /// `records`, written to an AOF and replayed into a new store.
+    fn replayed(records: &[Vec<&str>]) -> Store {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("appendonly.aof");
+        let log: Vec<u8> = records.iter().flat_map(|r| record(r)).collect();
+        std::fs::write(&path, log).expect("write");
+        let store = crate::store::new_store(1);
+        let index_store = crate::vector::new_index_store();
+        let dict_store = crate::vector::new_dict_store();
+        let wait_table = std::sync::Arc::new(crate::wait_table::WaitTable::new());
+        let ts_index = crate::store::new_ts_index();
+        let config = std::sync::Arc::new(crate::config::Config::default());
+        let (compaction_tx, _compaction_rx) = crate::vector::new_compaction_channel();
+        let repl_state = std::sync::Arc::new(crate::replication::ReplState::new_master());
+        let stats = replay_aof(
+            &path.to_string_lossy(),
+            &store,
+            &index_store,
+            &dict_store,
+            &wait_table,
+            &ts_index,
+            &config,
+            &compaction_tx,
+            &repl_state,
+            false,
+        )
+        .expect("replay");
+        assert_eq!(stats.errors, 0, "every record applied");
+        store
+    }
+
+    fn expires(store: &Store, key: &str) -> Option<u64> {
+        crate::store::get_shard(&store[0], key).read().expires(key)
+    }
+
+    fn hash_fields(store: &Store, key: &str) -> Vec<String> {
+        let shard = crate::store::get_shard(&store[0], key);
+        let map = shard.read();
+        let mut fields: Vec<String> = match map.peek_expiring(key) {
+            Some((ValueRef::Hash(h), _)) => h.read().keys().cloned().collect(),
+            Some((ValueRef::HashEx(h), _)) => h.read().fields.keys().cloned().collect(),
+            other => panic!(
+                "{key} is not a hash: {:?}",
+                other.map(|(v, _)| v.type_name())
+            ),
+        };
+        fields.sort();
+        fields
+    }
+
+    fn string(store: &Store, key: &str) -> Vec<u8> {
+        let shard = crate::store::get_shard(&store[0], key);
+        let map = shard.read();
+        match map.peek_expiring(key) {
+            Some((ValueRef::String(b), _)) => b.to_vec(),
+            _ => panic!("{key} is not a string"),
+        }
+    }
+
+    fn list_len(store: &Store, key: &str) -> usize {
+        let shard = crate::store::get_shard(&store[0], key);
+        let map = shard.read();
+        match map.peek_expiring(key) {
+            Some((ValueRef::List(l), _)) => l.read().len(),
+            _ => panic!("{key} is not a list"),
+        }
+    }
+
+    /// `HSET h f0 v0`, `PEXPIREAT h t`, `HSET h f1 v1`, `t` gone: the
+    /// replay deleted `h` at its `PEXPIREAT`, and the `HSET` made it again
+    /// of `f1` alone, with no time to live, for good. The same of a string
+    /// and a list. Now each keeps its deadline and every write, and is past
+    /// its time once the replay is over.
+    #[test]
+    fn a_deadline_that_has_passed_is_set_and_the_writes_after_it_go_into_the_key() {
+        let past = (now_ms() - 5_000).to_string();
+        let store = replayed(&[
+            vec!["SELECT", "0"],
+            vec!["HSET", "h", "f0", "v0"],
+            vec!["PEXPIREAT", "h", &past],
+            vec!["HSET", "h", "f1", "v1"],
+            vec!["SET", "s", "v"],
+            vec!["PEXPIREAT", "s", &past],
+            vec!["APPEND", "s", "x"],
+            vec!["RPUSH", "l", "a"],
+            vec!["PEXPIREAT", "l", &past],
+            vec!["RPUSH", "l", "b"],
+        ]);
+        let at: u64 = past.parse().unwrap();
+        for key in ["h", "s", "l"] {
+            assert_eq!(expires(&store, key), Some(at), "{key} kept its deadline");
+            assert!(is_expired(&store, 0, key), "{key} is past it");
+        }
+        assert_eq!(hash_fields(&store, "h"), ["f0", "f1"]);
+        assert_eq!(string(&store, "s"), b"vx");
+        assert_eq!(list_len(&store, "l"), 2);
+        // And it goes the way any key past its time goes.
+        for key in ["h", "s", "l"] {
+            assert!(delete_key_if_expired(&store, 0, key), "{key}");
+            assert_eq!(expires(&store, key), None);
+            assert!(
+                crate::store::get_shard(&store[0], key)
+                    .read()
+                    .peek_expiring(key)
+                    .is_none()
+            );
+        }
+    }
+
+    /// The same with a deadline still ahead: kept, with every write.
+    #[test]
+    fn a_deadline_still_ahead_is_kept_with_every_write() {
+        let ahead = (now_ms() + 3_600_000).to_string();
+        let store = replayed(&[
+            vec!["HSET", "h", "f0", "v0"],
+            vec!["PEXPIREAT", "h", &ahead],
+            vec!["HSET", "h", "f1", "v1"],
+            vec!["SET", "s", "v"],
+            vec!["PEXPIREAT", "s", &ahead],
+            vec!["APPEND", "s", "x"],
+            vec!["RPUSH", "l", "a"],
+            vec!["PEXPIREAT", "l", &ahead],
+            vec!["RPUSH", "l", "b"],
+        ]);
+        let at: u64 = ahead.parse().unwrap();
+        for key in ["h", "s", "l"] {
+            assert_eq!(expires(&store, key), Some(at), "{key}");
+            assert!(!is_expired(&store, 0, key), "{key}");
+        }
+        assert_eq!(hash_fields(&store, "h"), ["f0", "f1"]);
+        assert_eq!(string(&store, "s"), b"vx");
+        assert_eq!(list_len(&store, "l"), 2);
+    }
+
+    /// A `DEL` in the log still deletes: what the master expired is said
+    /// by it, and a write after it makes a new key, as on the master.
+    #[test]
+    fn a_del_after_the_deadline_still_deletes() {
+        let past = (now_ms() - 5_000).to_string();
+        let store = replayed(&[
+            vec!["HSET", "h", "f0", "v0"],
+            vec!["PEXPIREAT", "h", &past],
+            vec!["UNLINK", "h"],
+            vec!["HSET", "h", "f1", "v1"],
+        ]);
+        assert_eq!(expires(&store, "h"), None);
+        assert_eq!(hash_fields(&store, "h"), ["f1"]);
     }
 }
