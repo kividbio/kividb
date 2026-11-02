@@ -466,6 +466,14 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **A `MIGRATE` no longer stops a `--io-model tokio` server's other
+  clients while it waits.** One of tokio's worker threads at a time polls
+  every socket; a `MIGRATE` that arrived on an idle connection ran on that
+  worker, and while it waited for the destination nothing else was read,
+  accepted or timed, on any connection. It now hands that worker's place
+  to another thread first. io_uring, the default on Linux, was not affected.
+  In 1.1.x too.
+
 - **A server whose AOF ends in zeros after a power loss starts again.**
   A power loss can leave the log's last, unsynced, writes on disk as zeros:
   the file system recorded the file's new length before its data (ext4
