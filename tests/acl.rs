@@ -2247,23 +2247,10 @@ fn the_keys_checked_are_the_keys_used() {
 
     let attempts: &[&[&str]] = &[
         &[
-            "SORT",
-            "app:list",
-            "ALPHA",
-            "STORE",
-            "app:ok",
-            "STORE",
-            "other:s",
+            "SORT", "app:list", "ALPHA", "STORE", "app:ok", "STORE", "other:s",
         ],
         &[
-            "SORT",
-            "app:list",
-            "GET",
-            "#",
-            "STORE",
-            "app:ok",
-            "STORE",
-            "other:s",
+            "SORT", "app:list", "GET", "#", "STORE", "app:ok", "STORE", "other:s",
         ],
         &[
             "GEORADIUS",
