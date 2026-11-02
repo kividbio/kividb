@@ -56,6 +56,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   applies, and the writer empties the queue each time. Introduced in
   1.2.0-rc1; 1.1.x is not affected.
 
+- **Cluster nodes that move together find each other again.** A node
+  took a peer's address from the peer itself, or from another node's
+  gossip only when it had none. Two nodes restarted at once with new
+  addresses, as pods rescheduled together are, each kept dialling the
+  other's old one and never heard from the other directly: each saw the
+  other as failed for ever. After a rolling restart of an operator-run
+  sharded cluster, a shard answered `CLUSTERDOWN` for seven minutes, until
+  a manual `CLUSTER MEET`. A node now takes the address another node
+  gossips for a peer it cannot reach, when that node can reach it. In
+  1.1.x too.
+
 - **Writes during a snapshot no longer evict keys that fit under
   `maxmemory` (#284).** A snapshot (`BGSAVE`, `SAVE`, an AOF rewrite, a
   replica's full sync, a backup) captures the dataset at one instant and
