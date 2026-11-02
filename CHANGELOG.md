@@ -64,8 +64,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   other as failed for ever. After a rolling restart of an operator-run
   sharded cluster, a shard answered `CLUSTERDOWN` for seven minutes, until
   a manual `CLUSTER MEET`. A node now takes the address another node
-  gossips for a peer it cannot reach, when that node can reach it. In
-  1.1.x too.
+  gossips for a peer it cannot reach, or has not heard from since it
+  started, when that node can reach it; two masters moved together find
+  each other in 2 s, and a healthy one is no longer failed over when the
+  restart grace ends. In 1.1.x too.
 
 - **Writes during a snapshot no longer evict keys that fit under
   `maxmemory` (#284).** A snapshot (`BGSAVE`, `SAVE`, an AOF rewrite, a
