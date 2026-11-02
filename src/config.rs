@@ -1929,9 +1929,18 @@ mod config_file_tests {
                 "{bad}: {err}"
             );
         }
-        load("latency-tracking-info-percentiles 50 99 99.9\n").unwrap();
-        load("latency-tracking-info-percentiles \"50 99 99.9\"\n").unwrap();
+        // What is accepted is what `CONFIG GET` then shows. Ends on the
+        // default, as other tests read this process-wide setting.
+        let now =
+            || crate::commands::server::remembered_config("latency-tracking-info-percentiles");
         load("latency-tracking-info-percentiles \"\"\n").unwrap();
+        assert_eq!(now().as_deref(), Some(""));
+        load("latency-tracking-info-percentiles 0 100\n").unwrap();
+        assert_eq!(now().as_deref(), Some("0 100"));
+        load("latency-tracking-info-percentiles \"50 99 99.9\"\n").unwrap();
+        assert_eq!(now().as_deref(), Some("50 99 99.9"));
+        load("latency-tracking-info-percentiles 50 99 99.9\n").unwrap();
+        assert_eq!(now().as_deref(), Some("50 99 99.9"));
     }
 
     #[test]
