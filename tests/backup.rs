@@ -806,7 +806,7 @@ fn a_backup_from_before_a_restart_can_be_listed_and_cleaned_up() {
 /// restart (#150).
 #[test]
 fn a_sealed_backup_from_before_a_restart_still_runs_out() {
-    let mut server = Server::start(&["--backup-sealed-ttl", "3"]);
+    let mut server = Server::start(&["--backup-sealed-ttl", "10"]);
     let mut c = server.conn();
     assert!(c.cmd(&["BACKUP", "START"]).ok());
     wait_for_state(&mut c, "incrementing");
@@ -814,7 +814,7 @@ fn a_sealed_backup_from_before_a_restart_still_runs_out() {
     drop(c);
     server.child.kill().unwrap();
     server.child.wait().unwrap();
-    server.child = kividb(&server.dir, server.port, &["--backup-sealed-ttl", "3"])
+    server.child = kividb(&server.dir, server.port, &["--backup-sealed-ttl", "10"])
         .stderr(Stdio::null())
         .spawn()
         .expect("could not restart kividb");
