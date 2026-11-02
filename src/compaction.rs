@@ -200,21 +200,25 @@ fn compact_shard(shard: &Shard, regions: &[usize], pacer: &mut Pacer) {
         at += looked;
         for chunk in moving.chunks(MOVES_PER_HOLD) {
             let mut old = Vec::with_capacity(chunk.len());
-            {
-                let mut map = shard.write();
-                for (i, &index) in chunk.iter().enumerate() {
-                    if let Some(&next) = chunk.get(i + 1) {
-                        map.prefetch_bucket(next);
+            let mut map = shard.write();
+            for (i, &index) in chunk.iter().enumerate() {
+                if let Some(&next) = chunk.get(i + 1) {
+                    map.prefetch_bucket(next);
+                }
+                match map.relocate_at(index, regions) {
+                    Relocated::Moved(was) => old.push(was),
+                    Relocated::Held => {
+                        MISSES.fetch_add(1, Ordering::Relaxed);
                     }
-                    match map.relocate_at(index, regions) {
-                        Relocated::Moved(was) => old.push(was),
-                        Relocated::Held => {
-                            MISSES.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Relocated::Stays => {}
-                    }
+                    Relocated::Stays => {}
                 }
             }
+            // This thread takes the shard again at once, for the next
+            // hold or the next batch, and without a sleep between batches
+            // until a quantum is worked (#240): a client parked waiting
+            // for the shard is handed it, where a plain unlock let this
+            // thread take it back first, over and over for the quantum.
+            map.unlock_fair();
             HITS.fetch_add(old.len() as u64, Ordering::Relaxed);
             // Freed with the shard unlocked: a slab that empties is given back
             // to the kernel, a system call.

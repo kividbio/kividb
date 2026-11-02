@@ -132,6 +132,34 @@ impl Conn {
     }
 }
 
+/// Whether nothing has `port`, asked with a socket that is bound and never
+/// listens (see `tests/array.rs`).
+fn port_is_free(port: u16) -> bool {
+    let Ok(probe) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None) else {
+        return false;
+    };
+    #[cfg(unix)]
+    let _ = probe.set_reuse_address(true);
+    probe
+        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
+        .is_ok()
+}
+
+/// A free port outside the range the system hands out to outgoing
+/// connections: other test binaries run beside this one.
+fn free_port() -> u16 {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    loop {
+        let step = NEXT.fetch_add(1, Ordering::Relaxed);
+        let from = (std::process::id() as u16).wrapping_mul(41);
+        let port = 10_000 + from.wrapping_add(step) % 20_000;
+        if port_is_free(port) {
+            return port;
+        }
+    }
+}
+
 fn start_server(port: u16) {
     thread::spawn(move || {
         kividb::run_for_test(kividb::config::Config {
@@ -159,7 +187,7 @@ fn deleted(i: usize) -> bool {
 
 #[test]
 fn switched_off_mid_pass_it_stops_soon_and_every_value_reads_back() {
-    let port = 16_952;
+    let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
     c.ok(&["CONFIG", "SET", "activedefrag", "no"]);

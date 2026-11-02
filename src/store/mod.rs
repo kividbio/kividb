@@ -109,6 +109,25 @@ impl std::ops::DerefMut for ShardWrite<'_> {
 impl Drop for ShardWrite<'_> {
     #[inline(always)]
     fn drop(&mut self) {
+        self.release(false);
+    }
+}
+
+impl ShardWrite<'_> {
+    /// Let go of the shard as dropping the lock does, but give it straight
+    /// to a thread parked waiting for it, if there is one, instead of
+    /// leaving it to whoever takes it first. For a thread that takes the
+    /// same shard again at once, as active defrag does between its batches
+    /// (#240): with a plain unlock it gets the lock back before a waiting
+    /// client is woken. With nobody waiting it costs what a plain unlock
+    /// does.
+    #[inline]
+    pub fn unlock_fair(self) {
+        std::mem::ManuallyDrop::new(self).release(true);
+    }
+
+    #[inline(always)]
+    fn release(&mut self, fair: bool) {
         // Before the lock is released. Its line is this thread's already:
         // the lock's word is beside it.
         self.map.unpin_now();
@@ -121,24 +140,37 @@ impl Drop for ShardWrite<'_> {
             self.lock.keys.store(keys, Ordering::Release);
         }
         if self.map.wrote_over_expired() {
-            return self.unlock_and_announce();
+            return self.unlock_and_announce(fair);
         }
-        // SAFETY: dropped once, here; `map` is not used after.
-        unsafe { std::mem::ManuallyDrop::drop(&mut self.map) };
+        // SAFETY: released once, here; `map` is not used after.
+        unsafe { self.unlock(fair) };
     }
-}
 
-impl ShardWrite<'_> {
+    /// # Safety
+    /// Once, and `map` is not used after.
+    #[inline(always)]
+    unsafe fn unlock(&mut self, fair: bool) {
+        if fair {
+            // SAFETY: the caller's.
+            let map = unsafe { std::mem::ManuallyDrop::take(&mut self.map) };
+            parking_lot::RwLockWriteGuard::unlock_fair(map);
+        } else {
+            // SAFETY: the caller's.
+            unsafe { std::mem::ManuallyDrop::drop(&mut self.map) };
+        }
+    }
+
     /// Let go of the shard, then expire the keys past their time that
     /// writes under the lock put new values over: their events, watches,
     /// caches and indexes, and their `DEL` propagated, all before the
     /// write's own (`expiry::written_over`).
     #[cold]
     #[inline(never)]
-    fn unlock_and_announce(&mut self) {
+    fn unlock_and_announce(&mut self, fair: bool) {
         let keys = self.map.take_written_over();
-        // SAFETY: dropped once, here, from `drop`; `map` is not used after.
-        unsafe { std::mem::ManuallyDrop::drop(&mut self.map) };
+        // SAFETY: released once, here, from `release`; `map` is not used
+        // after.
+        unsafe { self.unlock(fair) };
         if let Some(&(store, db)) = self.lock.place.get() {
             crate::expiry::written_over(store, db, &keys);
         }
@@ -783,5 +815,28 @@ mod shard_lock_tests {
         assert!(!cell.holds_no_keys());
         assert!(other.holds_no_keys());
         assert_eq!(cell.read().ttl_len(), 1);
+    }
+
+    /// A fair unlock leaves the counts as dropping the lock does, on both
+    /// ways out (a write over a key past its time takes the second), and
+    /// lets go of the lock.
+    #[test]
+    fn a_fair_unlock_leaves_what_a_drop_does() {
+        let cell = ShardLock::default();
+        let mut map = cell.write();
+        map.insert_expiring("a", s(), Some(u64::MAX / 2));
+        map.unlock_fair();
+        assert_eq!(cell.ttl_count(), 1);
+        assert!(!cell.holds_no_keys());
+        assert!(cell.map.try_write().is_some());
+
+        cell.write().insert_expiring("d", s(), Some(1));
+        assert_eq!(cell.ttl_count(), 2);
+        let mut map = cell.write();
+        map.insert("d", s());
+        map.unlock_fair();
+        assert_eq!(cell.ttl_count(), 1);
+        assert_eq!(cell.read().expires("d"), None);
+        assert!(cell.map.try_write().is_some());
     }
 }
