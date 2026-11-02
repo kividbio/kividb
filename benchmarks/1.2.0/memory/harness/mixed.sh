@@ -1,6 +1,6 @@
 #!/bin/bash
 # Memory over time under a mixed workload (HN: kingcauchy). Client-side driver.
-#   mixed.sh <engine> [seconds=1200] [keys=10000000]
+#   [R=<round>] mixed.sh <engine> [seconds=1200] [keys=10000000]
 # Fresh engine, no persistence. Load <keys> keys of 100 B, then for <seconds> run, at a fixed 150,000 ops/s
 # (100 connections x 1,500/s, pipeline 1, the same offered load for every engine):
 #   80% GET / 20% SET, uniformly random keys over the whole keyspace,
@@ -10,7 +10,7 @@
 set -uo pipefail
 . "$(dirname "$0")/lib.sh"
 E=$1; SECS=${2:-1200}; N=${3:-10000000}
-RUN=mixed-$E
+RUN=mixed-$E${R:+-$R}
 srv /opt/mem/eng.sh stop
 srv /opt/mem/eng.sh start "$E" plain | tee "$OUT/$RUN.engine.txt"
 srv /opt/mem/mon.sh start "$RUN"

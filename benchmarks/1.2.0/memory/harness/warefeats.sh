@@ -2,8 +2,8 @@
 # Runs the warefeats/kv-stores harness (pinned a324d29) unchanged, as its .github/workflows/kv-bench-cloud.yml
 # "Run benchmark" step does, with ssh to the engine VM in place of AWS SSM. Client-side.
 #   warefeats.sh <engine-ip> <memtier-threads> <smoke|full> <variant...>
-# Variants: redis valkey dragonfly kividb-1.1.3 kividb-rc4 (anything after a further dash is a rerun label,
-# e.g. kividb-rc4-run2). Each variant runs the full matrix on a fresh engine, then the random-bytes memory
+# Variants: redis valkey dragonfly kividb-1.1.3 kividb-cand kividb-rc4 (anything after a further dash is a rerun
+# label, e.g. kividb-rc4-run2). Each variant runs the full matrix on a fresh engine, then the random-bytes memory
 # cell on another fresh engine. The engine compose files are warefeats' own (compose/cloud-*.yml); only the
 # KiviDB image is swapped per variant.
 set -uo pipefail
@@ -13,12 +13,14 @@ OUT=/var/tmp/wf; mkdir -p $OUT
 ENG="ssh -i $HOME/.ssh/id_mem -o StrictHostKeyChecking=no -o ServerAliveInterval=30 azureuser@$ENGINE_IP"
 SMOKE_FLAG=""; [ "$MATRIX" = smoke ] && SMOKE_FLAG="--smoke"
 RC4_IMG=$($ENG cat /var/tmp/kividb-rc4-image)
+CAND_IMG=$($ENG cat /var/tmp/kividb-cand-image)
 ENGINE_THREADS=$($ENG nproc)
 
 for V in $VARIANTS; do
   case $V in
     kividb-1.1.3*) ENGINE=kividb; IMG=kividb/kividb:v1.1.3 ;;
     kividb-rc4*) ENGINE=kividb; IMG=$RC4_IMG ;;
+    kividb-cand*) ENGINE=kividb; IMG=$CAND_IMG ;;
     *) ENGINE=${V%%-*}; IMG=$(grep -m1 '^\s*image:' /opt/bench/compose/docker-compose.${ENGINE}.yml | awk '{print $2}') ;;
   esac
   COMPOSE="-f compose/docker-compose.${ENGINE}.yml -f compose/cloud-overlay.yml -f compose/cloud-${ENGINE}.yml"

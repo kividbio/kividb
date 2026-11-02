@@ -19,6 +19,8 @@ Columns:
   evicted, expired  INFO stats evicted_keys, expired_keys
   not_counted_mb  mem_not_counted_for_evict
   info_ms         how long INFO took to answer (a stalled server shows here); -1 = no answer within 2 s
+  slab_mb, slab_live_mb   KiviDB: INFO value_slab_bytes / value_slab_live_bytes (slab memory, and what is in it)
+  defrag_running, defrag_hits   active_defrag_running, active_defrag_hits
 Stops when the file /var/tmp/mem/sampler.stop appears or the main PID exits.
 """
 import os, socket, sys, time
@@ -87,7 +89,16 @@ def procs():
 
 
 MB = 1024 * 1024
-cols = "t,anon_mb,file_mb,rss_main_mb,rss_all_mb,nproc,used_mb,keys,bgsave,aofrw,evicted,expired,not_counted_mb,info_ms"
+
+
+def mb(d, k):
+    try:
+        return f"{int(d[k]) / MB:.1f}"
+    except (KeyError, ValueError):
+        return ""
+
+
+cols = "t,anon_mb,file_mb,rss_main_mb,rss_all_mb,nproc,used_mb,keys,bgsave,aofrw,evicted,expired,not_counted_mb,info_ms,slab_mb,slab_live_mb,defrag_running,defrag_hits"
 new = not os.path.exists(out)
 with open(out, "a", buffering=1) as f:
     if new:
@@ -112,7 +123,9 @@ with open(out, "a", buffering=1) as f:
                f"{rss_main:.1f}", f"{rss_all:.1f}", str(len(ps)),
                f"{used:.1f}" if used != "" else "", str(keys), bgsave, aofrw,
                d.get("evicted_keys", ""), d.get("expired_keys", ""),
-               f"{nc:.1f}" if nc != "" else "", f"{ims:.1f}"]
+               f"{nc:.1f}" if nc != "" else "", f"{ims:.1f}",
+               mb(d, "value_slab_bytes"), mb(d, "value_slab_live_bytes"),
+               d.get("active_defrag_running", ""), d.get("active_defrag_hits", "")]
         f.write(",".join(row) + "\n")
         nxt += interval
         time.sleep(max(0.0, nxt - time.time()))

@@ -20,5 +20,5 @@ for spec in mem-srv2:Standard_E32ds_v6:10.31.0.4 mem-cli2:Standard_D16ls_v6:10.3
     --public-ip-sku Standard --accelerated-networking true --ppg mem-ppg2 \
     --os-disk-size-gb 128 --storage-sku Premium_LRS -o table
   # backstop; not offered in every region (polandcentral has none), the RG is deleted at the end anyway
-  az vm auto-shutdown -g "$RG" -n "$N" -l "$LOC" --time "$(date -u -d "+8 hours" +%H%M)" -o none || true
+  az vm auto-shutdown -g "$RG" -n "$N" -l "$LOC" --time "$(date -u -d "+14 hours" +%H%M)" -o none || true
 done

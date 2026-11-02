@@ -1,6 +1,6 @@
 #!/bin/bash
 # Memory and write latency during a snapshot and an AOF rewrite (HN: porker, romange). Client-side driver.
-#   snapshot.sh <engine> [keys=30000000] [value-bytes=1024]
+#   [R=<round>] [WIN=420 PRE=60] snapshot.sh <engine> [keys=30000000] [value-bytes=1024]
 # Engine with persistence on (AOF on for KiviDB/Redis/Valkey, automatic rewrites off; Dragonfly has no AOF).
 # Load <keys> keys, then two windows of 420 s each under a steady write load of 100,000 SET/s
 # (100 connections x 1,000/s, pipeline 1, uniformly random overwrites of the loaded keys, same value size):
@@ -11,7 +11,7 @@
 set -uo pipefail
 . "$(dirname "$0")/lib.sh"
 E=$1; N=${2:-30000000}; V=${3:-1024}
-RUN=snap-$E
+RUN=snap-$E${R:+-$R}
 WIN=${WIN:-420}; PRE=${PRE:-60}
 srv /opt/mem/eng.sh stop
 srv /opt/mem/eng.sh start "$E" persist | tee "$OUT/$RUN.engine.txt"

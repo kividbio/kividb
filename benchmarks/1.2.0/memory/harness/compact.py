@@ -21,7 +21,7 @@ def strip(o):
 
 for name in sorted(os.listdir(src)):
     p = os.path.join(src, name)
-    if not os.path.isfile(p) or name in ("queue.txt", "done.txt") or name.endswith(".sampler.log"):
+    if not os.path.isfile(p) or name in ("queue.txt", "done.txt") or name.endswith(".sampler.log") or name.endswith(".resp"):
         continue
     q = os.path.join(dst, name)
     if name.endswith(".json"):

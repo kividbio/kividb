@@ -1,0 +1,361 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 93K of event 'task-clock:ppp'
+# Event count (approx.): 93600600507
+#
+# Overhead  Command        Shared Object      Symbol                                                                                                                                                                                                                                                             
+# ........  .............  .................  ...................................................................................................................................................................................................................................................................
+#
+    11.05%  kividb         [kernel.kallsyms]  [k] _raw_spin_unlock_irqrestore
+            |
+            ---_raw_spin_unlock_irqrestore
+               |          
+               |--7.86%--try_to_wake_up
+               |          wake_up_q
+               |          futex_wake
+               |          do_futex
+               |          __x64_sys_futex
+               |          x64_sys_call
+               |          do_syscall_64
+               |          entry_SYSCALL_64_after_hwframe
+               |          |          
+               |           --7.78%--syscall
+               |                     |          
+               |                      --6.62%--0x5ee470cbf160
+               |                                0x1
+               |          
+                --1.65%--__wake_up_sync_key
+                          sock_def_readable
+                          tcp_data_ready
+                          tcp_rcv_established
+                          tcp_v4_do_rcv
+                          tcp_v4_rcv
+                          ip_protocol_deliver_rcu
+                          ip_local_deliver_finish
+                          ip_local_deliver
+                          ip_sublist_rcv_finish
+                          ip_list_rcv_finish
+                          ip_sublist_rcv
+                          ip_list_rcv
+                          __netif_receive_skb_list_core
+                          netif_receive_skb_list_internal
+                          __napi_poll
+                          net_rx_action
+                          handle_softirqs
+                          |          
+                           --1.53%--__irq_exit_rcu
+                                     irq_exit_rcu
+                                     |          
+                                      --1.53%--common_interrupt
+                                                asm_common_interrupt
+
+     9.62%  kividb         [kernel.kallsyms]  [k] finish_task_switch.isra.0
+            |
+            ---finish_task_switch.isra.0
+               |          
+                --9.62%--__schedule
+                          schedule
+                          |          
+                          |--5.05%--futex_do_wait
+                          |          __futex_wait
+                          |          futex_wait
+                          |          do_futex
+                          |          __x64_sys_futex
+                          |          x64_sys_call
+                          |          do_syscall_64
+                          |          entry_SYSCALL_64_after_hwframe
+                          |          |          
+                          |           --5.02%--syscall
+                          |          
+                           --4.56%--schedule_hrtimeout_range_clock
+                                     schedule_hrtimeout_range
+                                     ep_poll
+                                     do_epoll_wait
+                                     __x64_sys_epoll_wait
+                                     x64_sys_call
+                                     do_syscall_64
+                                     entry_SYSCALL_64_after_hwframe
+                                     epoll_wait
+
+     5.88%  kividb         [kernel.kallsyms]  [k] _raw_spin_unlock_irq
+            |
+            ---_raw_spin_unlock_irq
+               |          
+                --4.91%--eventfd_write
+                          vfs_write
+                          ksys_write
+                          __x64_sys_write
+                          x64_sys_call
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          write
+
+     2.20%  kividb         kividb             [.] kividb::aof::written::{{closure}}
+            |
+            ---kividb::aof::written::{{closure}}
+               |          
+                --1.42%--0x5ee470cbf160
+                          0x1
+
+     2.14%  kividb         kividb             [.] kividb::server_uring::handle_client::{{closure}}
+            |
+            ---kividb::server_uring::handle_client::{{closure}}
+
+     1.76%  kividb         kividb             [.] kividb::store::shard_map::ShardMap::set_str_expiring
+            |
+            ---kividb::store::shard_map::ShardMap::set_str_expiring
+
+     1.70%  kividb         [kernel.kallsyms]  [k] handle_softirqs
+            |
+            ---handle_softirqs
+               |          
+                --1.69%--__irq_exit_rcu
+                          irq_exit_rcu
+                          |          
+                           --1.63%--common_interrupt
+                                     asm_common_interrupt
+
+     1.43%  kividb         [kernel.kallsyms]  [k] __raw_callee_save___pv_queued_spin_unlock
+            |
+            ---__raw_callee_save___pv_queued_spin_unlock
+               |          
+                --1.00%--_raw_spin_unlock
+                          |          
+                           --0.71%--sch_direct_xmit
+                                     |          
+                                      --0.71%--__dev_xmit_skb
+                                                __dev_queue_xmit
+                                                |          
+                                                 --0.67%--netvsc_xmit
+                                                           netvsc_start_xmit
+                                                           xmit_one.constprop.0
+                                                           dev_hard_start_xmit
+                                                           sch_direct_xmit
+                                                           |          
+                                                            --0.65%--__dev_xmit_skb
+                                                                      __dev_queue_xmit
+                                                                      neigh_hh_output
+                                                                      ip_finish_output2
+                                                                      __ip_finish_output
+                                                                      ip_finish_output
+                                                                      ip_output
+                                                                      ip_local_out
+                                                                      __ip_queue_xmit
+                                                                      ip_queue_xmit
+                                                                      __tcp_transmit_skb
+                                                                      tcp_write_xmit
+                                                                      __tcp_push_pending_frames
+                                                                      tcp_push
+                                                                      tcp_sendmsg_locked
+                                                                      tcp_sendmsg
+                                                                      inet_sendmsg
+                                                                      sock_write_iter
+                                                                      io_write
+                                                                      __io_issue_sqe
+                                                                      io_issue_sqe
+                                                                      io_submit_sqe
+                                                                      io_submit_sqes
+                                                                      __do_sys_io_uring_enter
+                                                                      __x64_sys_io_uring_enter
+                                                                      x64_sys_call
+                                                                      do_syscall_64
+                                                                      entry_SYSCALL_64_after_hwframe
+                                                                      syscall
+                                                                      0x1
+
+     1.24%  kividb         kividb             [.] parking_lot::raw_mutex::RawMutex::lock_slow
+            |
+            ---parking_lot::raw_mutex::RawMutex::lock_slow
+
+     1.20%  kividb         [kernel.kallsyms]  [k] do_syscall_64
+            |
+            ---do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               |          
+                --0.63%--syscall
+
+     1.11%  kividb         libc.so.6          [.] syscall
+            |
+            ---syscall
+
+     0.98%  kividb         kividb             [.] tokio::task::local::LocalSet::run_until::{{closure}}
+            |
+            ---tokio::task::local::LocalSet::run_until::{{closure}}
+
+     0.90%  kividb         [kernel.kallsyms]  [k] aa_file_perm
+            |
+            ---aa_file_perm
+               |          
+                --0.88%--apparmor_file_permission
+                          security_file_permission
+                          rw_verify_area
+
+     0.88%  kividb         libc.so.6          [.] malloc
+            |
+            ---malloc
+
+     0.84%  kividb         kividb             [.] kividb::commands::handler::run_command
+            |
+            ---kividb::commands::handler::run_command
+
+     0.81%  kividb         libc.so.6          [.] epoll_wait
+            |
+            ---epoll_wait
+
+     0.80%  kividb         libc.so.6          [.] cfree
+            |
+            ---cfree
+
+     0.79%  kividb         [kernel.kallsyms]  [k] mana_start_xmit
+            |
+            ---mana_start_xmit
+               |          
+                --0.75%--xmit_one.constprop.0
+                          dev_hard_start_xmit
+                          sch_direct_xmit
+                          __dev_xmit_skb
+                          __dev_queue_xmit
+                          netvsc_xmit
+                          netvsc_start_xmit
+                          xmit_one.constprop.0
+                          dev_hard_start_xmit
+                          sch_direct_xmit
+                          |          
+                           --0.74%--__dev_xmit_skb
+                                     __dev_queue_xmit
+                                     neigh_hh_output
+                                     ip_finish_output2
+                                     __ip_finish_output
+                                     ip_finish_output
+                                     ip_output
+                                     ip_local_out
+                                     __ip_queue_xmit
+                                     ip_queue_xmit
+                                     __tcp_transmit_skb
+                                     tcp_write_xmit
+                                     __tcp_push_pending_frames
+                                     tcp_push
+                                     tcp_sendmsg_locked
+                                     tcp_sendmsg
+                                     inet_sendmsg
+                                     sock_write_iter
+                                     io_write
+                                     __io_issue_sqe
+                                     io_issue_sqe
+                                     io_submit_sqe
+                                     io_submit_sqes
+                                     __do_sys_io_uring_enter
+                                     __x64_sys_io_uring_enter
+                                     x64_sys_call
+                                     do_syscall_64
+                                     entry_SYSCALL_64_after_hwframe
+                                     syscall
+                                     0x1
+
+     0.78%  kividb         kividb             [.] tokio::sync::notify::NotifiedProject::poll_notified
+            |
+            ---tokio::sync::notify::NotifiedProject::poll_notified
+
+     0.73%  kividb         kividb             [.] tokio::process::imp::GlobalOrphanQueue::reap_orphans
+            |
+            ---tokio::process::imp::GlobalOrphanQueue::reap_orphans
+
+     0.73%  kividb         [kernel.kallsyms]  [k] _raw_spin_lock
+            |
+            ---_raw_spin_lock
+
+     0.72%  kividb         kividb             [.] core::ptr::drop_in_place<kividb::store::ShardWrite>
+            |
+            ---core::ptr::drop_in_place<kividb::store::ShardWrite>
+               0
+
+     0.70%  kividb         [vdso]             [.] 0x000000000000099a
+            |
+            ---0x7bd5b036c99a
+               clock_gettime
+
+     0.68%  kividb         kividb             [.] tokio::task::local::Shared::schedule
+            |
+            ---tokio::task::local::Shared::schedule
+
+     0.65%  kividb         [kernel.kallsyms]  [k] _copy_to_iter
+            |
+            ---_copy_to_iter
+               |          
+                --0.64%--simple_copy_to_iter
+                          __skb_datagram_iter
+                          skb_copy_datagram_iter
+                          tcp_recvmsg_locked
+                          tcp_recvmsg
+                          inet_recvmsg
+                          sock_recvmsg
+                          sock_read_iter
+                          __io_read
+                          io_read
+                          __io_issue_sqe
+                          io_issue_sqe
+                          |          
+                           --0.57%--io_req_task_submit
+                                     io_poll_task_func
+                                     io_handle_tw_list
+                                     tctx_task_work_run
+                                     tctx_task_work
+                                     task_work_run
+                                     get_signal
+                                     arch_do_signal_or_restart
+                                     |          
+                                      --0.53%--exit_to_user_mode_loop
+                                                do_syscall_64
+                                                entry_SYSCALL_64_after_hwframe
+
+     0.63%  kividb         kividb             [.] parking_lot::raw_mutex::RawMutex::unlock_slow
+            |
+            ---parking_lot::raw_mutex::RawMutex::unlock_slow
+
+     0.61%  kividb         [kernel.kallsyms]  [k] __dev_xmit_skb
+            |
+            ---__dev_xmit_skb
+               |          
+                --0.60%--__dev_queue_xmit
+
+     0.56%  kividb         [kernel.kallsyms]  [k] __schedule
+            |
+            ---__schedule
+               |          
+                --0.55%--schedule
+
+     0.55%  kividb         kividb             [.] kividb::commands::strings::handle
+            |
+            ---kividb::commands::strings::handle
+
+     0.55%  kividb         kividb             [.] kividb::aof::write_queued
+            |
+            ---kividb::aof::write_queued
+
+     0.54%  kividb         kividb             [.] <tokio::sync::mpsc::unbounded::UnboundedSender<alloc::vec::Vec<u8>> as kividb::commands::ctx::AofSender>::send_aof
+            |
+            ---<tokio::sync::mpsc::unbounded::UnboundedSender<alloc::vec::Vec<u8>> as kividb::commands::ctx::AofSender>::send_aof
+
+     0.52%  kividb         [kernel.kallsyms]  [k] __fget_files
+            |
+            ---__fget_files
+
+     0.52%  kividb         [kernel.kallsyms]  [k] _raw_spin_lock_bh
+            |
+            ---_raw_spin_lock_bh
+
+     0.51%  kividb         [kernel.kallsyms]  [k] __nf_conntrack_find_get
+            |
+            ---__nf_conntrack_find_get
+               |          
+                --0.50%--resolve_normal_ct
+                          nf_conntrack_in
+
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

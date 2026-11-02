@@ -1,433 +1,808 @@
-### 2026-11-01T22:10:00Z start: ./warefeats.sh 10.30.0.4 25 full redis valkey dragonfly kividb-1.1.3 > /var/tmp/wf-competitors.log 2>&1
-### 2026-11-01T23:16:09Z end (exit 0): ./warefeats.sh 10.30.0.4 25 full redis valkey dragonfly kividb-1.1.3 > /var/tmp/wf-competitors.log 2>&1
-### 2026-11-01T23:16:09Z start: ./warefeats.sh 10.30.0.4 25 full kividb-rc4 kividb-rc4-run2 > /var/tmp/wf-rc4.log 2>&1
-### 2026-11-01T23:47:41Z end (exit 0): ./warefeats.sh 10.30.0.4 25 full kividb-rc4 kividb-rc4-run2 > /var/tmp/wf-rc4.log 2>&1
-### 2026-11-01T23:47:41Z start: ./growth.sh kividb-rc4 100 1000000,5000000,10000000,25000000,50000000
-kividb-rc4 plain kividb/kividb:v1.2.0-rc4 redis_version:8.10.0 kividb_version:1.2.0-rc4 
+### 2026-11-02T14:00:02Z start: ./warefeats.sh 10.30.0.4 25 full kividb-cand kividb-rc4 > /var/tmp/wf-r1.log 2>&1
+### 2026-11-02T14:30:33Z end (exit 0): ./warefeats.sh 10.30.0.4 25 full kividb-cand kividb-rc4 > /var/tmp/wf-r1.log 2>&1
+### 2026-11-02T14:30:33Z start: R=r1 ./growth.sh kividb-cand 100 1000000,5000000,10000000,25000000,50000000
+kividb-cand plain kividb/kividb:build-75482abbb258 redis_version:8.10.0 kividb_version:1.2.0-rc6 
 [--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
-sampler started for growth-kividb-rc4-100-random (pid 48564, /sys/fs/cgroup/system.slice/docker-2919e8d3bcdeb74bcbb3a34d3b37828bd3d95db982274c158b89ec7c7c3e29e6.scope)
-[23:47:50] growth-kividb-rc4-100-random start
-[23:47:50] growth-kividb-rc4-100-random load-to-1000000
-[23:47:51] growth-kividb-rc4-100-random loaded-1000000
-  1000000 keys: RSS 162.9 MB (153.9 B/key) used 142.9 MB (146.9 B/key) keys 1000000
-[23:48:01] growth-kividb-rc4-100-random load-to-5000000
-[23:48:03] growth-kividb-rc4-100-random loaded-5000000
-  5000000 keys: RSS 715.4 MB (146.7 B/key) used 685.2 MB (143.1 B/key) keys 5000000
-[23:48:13] growth-kividb-rc4-100-random load-to-10000000
-[23:48:16] growth-kividb-rc4-100-random loaded-10000000
-  10000000 keys: RSS 1399.4 MB (145.0 B/key) used 1367.6 MB (143.1 B/key) keys 10000000
-[23:48:26] growth-kividb-rc4-100-random load-to-25000000
-[23:48:29] growth-kividb-rc4-100-random loaded-25000000
-  25000000 keys: RSS 3379.0 MB (141.1 B/key) used 3342.6 MB (140.1 B/key) keys 25000000
-[23:48:40] growth-kividb-rc4-100-random load-to-50000000
-[23:48:46] growth-kividb-rc4-100-random loaded-50000000
-  50000000 keys: RSS 6725.1 MB (140.7 B/key) used 6682.4 MB (140.1 B/key) keys 50000000
-[23:48:57] growth-kividb-rc4-100-random end
-### 2026-11-01T23:49:00Z end (exit 0): ./growth.sh kividb-rc4 100 1000000,5000000,10000000,25000000,50000000
-### 2026-11-01T23:49:00Z start: ./growth.sh kividb-rc4 1024 1000000,5000000,10000000,25000000,50000000
-kividb-rc4 plain kividb/kividb:v1.2.0-rc4 redis_version:8.10.0 kividb_version:1.2.0-rc4 
+sampler started for growth-kividb-cand-100-random-r1 (pid 14398, /sys/fs/cgroup/system.slice/docker-c548a3e94c9895b9cf6dc958fa07a44042ac1fae1811249c0038bb68a6049abc.scope)
+[14:30:42] growth-kividb-cand-100-random-r1 start
+[14:30:42] growth-kividb-cand-100-random-r1 load-to-1000000
+[14:30:43] growth-kividb-cand-100-random-r1 loaded-1000000
+  1000000 keys: RSS 163.3 MB (154.1 B/key) used 142.9 MB (146.9 B/key) keys 1000000
+[14:30:54] growth-kividb-cand-100-random-r1 load-to-5000000
+[14:30:55] growth-kividb-cand-100-random-r1 loaded-5000000
+  5000000 keys: RSS 714.5 MB (146.4 B/key) used 685.2 MB (143.1 B/key) keys 5000000
+[14:31:05] growth-kividb-cand-100-random-r1 load-to-10000000
+[14:31:06] growth-kividb-cand-100-random-r1 loaded-10000000
+  10000000 keys: RSS 1401.2 MB (145.2 B/key) used 1367.6 MB (143.1 B/key) keys 10000000
+[14:31:17] growth-kividb-cand-100-random-r1 load-to-25000000
+[14:31:20] growth-kividb-cand-100-random-r1 loaded-25000000
+  25000000 keys: RSS 3381.2 MB (141.1 B/key) used 3342.6 MB (140.1 B/key) keys 25000000
+[14:31:30] growth-kividb-cand-100-random-r1 load-to-50000000
+[14:31:36] growth-kividb-cand-100-random-r1 loaded-50000000
+  50000000 keys: RSS 6727.3 MB (140.7 B/key) used 6682.4 MB (140.1 B/key) keys 50000000
+[14:31:46] growth-kividb-cand-100-random-r1 end
+### 2026-11-02T14:31:50Z end (exit 0): R=r1 ./growth.sh kividb-cand 100 1000000,5000000,10000000,25000000,50000000
+### 2026-11-02T14:31:50Z start: R=r1 ./growth.sh kividb-rc4 100 1000000,5000000,10000000,25000000,50000000
+kividb-rc4 plain kividb/kividb:build-a6b1bf388582 redis_version:8.10.0 kividb_version:1.2.0-rc4 
 [--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
-sampler started for growth-kividb-rc4-1024-random (pid 49470, /sys/fs/cgroup/system.slice/docker-eedb2e78cc677a71729586d3e4596523f697ce6f43ede30ef421f0797d463af2.scope)
-[23:49:09] growth-kividb-rc4-1024-random start
-[23:49:09] growth-kividb-rc4-1024-random load-to-1000000
-[23:49:10] growth-kividb-rc4-1024-random loaded-1000000
-  1000000 keys: RSS 1051.6 MB (1085.7 B/key) used 1027.9 MB (1074.9 B/key) keys 1000000
-[23:49:21] growth-kividb-rc4-1024-random load-to-5000000
-[23:49:23] growth-kividb-rc4-1024-random loaded-5000000
-  5000000 keys: RSS 5156.4 MB (1078.0 B/key) used 5110.3 MB (1071.1 B/key) keys 5000000
-[23:49:33] growth-kividb-rc4-1024-random load-to-10000000
-[23:49:36] growth-kividb-rc4-1024-random loaded-10000000
+sampler started for growth-kividb-rc4-100-random-r1 (pid 15277, /sys/fs/cgroup/system.slice/docker-4c70aeaf3a60f088fe34028965dd777fec3af414448885a4c34d4f3cc6b0eeed.scope)
+[14:31:58] growth-kividb-rc4-100-random-r1 start
+[14:31:58] growth-kividb-rc4-100-random-r1 load-to-1000000
+[14:32:00] growth-kividb-rc4-100-random-r1 loaded-1000000
+  1000000 keys: RSS 163.0 MB (153.6 B/key) used 142.9 MB (146.9 B/key) keys 1000000
+[14:32:10] growth-kividb-rc4-100-random-r1 load-to-5000000
+[14:32:11] growth-kividb-rc4-100-random-r1 loaded-5000000
+  5000000 keys: RSS 714.1 MB (146.3 B/key) used 685.2 MB (143.1 B/key) keys 5000000
+[14:32:22] growth-kividb-rc4-100-random-r1 load-to-10000000
+[14:32:23] growth-kividb-rc4-100-random-r1 loaded-10000000
+  10000000 keys: RSS 1400.8 MB (145.2 B/key) used 1367.6 MB (143.1 B/key) keys 10000000
+[14:32:33] growth-kividb-rc4-100-random-r1 load-to-25000000
+[14:32:37] growth-kividb-rc4-100-random-r1 loaded-25000000
+  25000000 keys: RSS 3379.8 MB (141.1 B/key) used 3342.6 MB (140.1 B/key) keys 25000000
+[14:32:47] growth-kividb-rc4-100-random-r1 load-to-50000000
+[14:32:53] growth-kividb-rc4-100-random-r1 loaded-50000000
+  50000000 keys: RSS 6726.0 MB (140.7 B/key) used 6682.4 MB (140.1 B/key) keys 50000000
+[14:33:03] growth-kividb-rc4-100-random-r1 end
+### 2026-11-02T14:33:06Z end (exit 0): R=r1 ./growth.sh kividb-rc4 100 1000000,5000000,10000000,25000000,50000000
+### 2026-11-02T14:33:06Z start: R=r1 ./growth.sh kividb-cand 1024 1000000,5000000,10000000,25000000,50000000
+kividb-cand plain kividb/kividb:build-75482abbb258 redis_version:8.10.0 kividb_version:1.2.0-rc6 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+sampler started for growth-kividb-cand-1024-random-r1 (pid 16154, /sys/fs/cgroup/system.slice/docker-c6a6e32a3078c1ab87e472b83f73bae5d9d23369ca60c09908327b5e9080f833.scope)
+[14:33:14] growth-kividb-cand-1024-random-r1 start
+[14:33:15] growth-kividb-cand-1024-random-r1 load-to-1000000
+[14:33:16] growth-kividb-cand-1024-random-r1 loaded-1000000
+  1000000 keys: RSS 1051.9 MB (1085.7 B/key) used 1027.9 MB (1074.9 B/key) keys 1000000
+[14:33:26] growth-kividb-cand-1024-random-r1 load-to-5000000
+[14:33:29] growth-kividb-cand-1024-random-r1 loaded-5000000
+  5000000 keys: RSS 5155.0 MB (1077.6 B/key) used 5110.3 MB (1071.1 B/key) keys 5000000
+[14:33:39] growth-kividb-cand-1024-random-r1 load-to-10000000
+[14:33:41] growth-kividb-cand-1024-random-r1 loaded-10000000
   10000000 keys: RSS 10280.0 MB (1076.2 B/key) used 10217.7 MB (1071.1 B/key) keys 10000000
-[23:49:46] growth-kividb-rc4-1024-random load-to-25000000
-[23:49:52] growth-kividb-rc4-1024-random loaded-25000000
-  25000000 keys: RSS 25576.1 MB (1072.1 B/key) used 25468.0 MB (1068.1 B/key) keys 25000000
-[23:50:02] growth-kividb-rc4-1024-random load-to-50000000
-[23:50:11] growth-kividb-rc4-1024-random loaded-50000000
-  50000000 keys: RSS 51117.4 MB (1071.7 B/key) used 50933.1 MB (1068.1 B/key) keys 50000000
-[23:50:22] growth-kividb-rc4-1024-random end
-### 2026-11-01T23:50:26Z end (exit 0): ./growth.sh kividb-rc4 1024 1000000,5000000,10000000,25000000,50000000
-### 2026-11-01T23:50:26Z start: ./snapshot.sh kividb-rc4
-Could not connect to Redis at 127.0.0.1:6379: Connection refused
-sampler started for snap-kividb-rc4 (pid 0, /sys/fs/cgroup/system.slice/docker-5afde0b4f46b5d25e5d6934223062fe63e912bed525fb044e4bd77873255f637.scope)
-[23:51:36] snap-kividb-rc4 load
-[23:51:42] snap-kividb-rc4 loaded
-[23:52:12] snap-kividb-rc4 bgsave-window-start
-[23:53:12] snap-kividb-rc4 bgsave-issued
-Could not connect to Redis at 10.30.0.4:6379: Connection refused
-[23:53:13] snap-kividb-rc4 bgsave-done
-Could not connect to Redis at 10.30.0.4:6379: Connection refused
-[23:53:13] snap-kividb-rc4 bgsave-window-end
-[23:53:33] snap-kividb-rc4 aofrw-window-start
-[23:54:33] snap-kividb-rc4 aofrw-issued
-Could not connect to Redis at 10.30.0.4:6379: Connection refused
-[23:54:35] snap-kividb-rc4 aofrw-done
-Could not connect to Redis at 10.30.0.4:6379: Connection refused
-[23:54:35] snap-kividb-rc4 aofrw-window-end
-[23:54:56] snap-kividb-rc4 end
-### 2026-11-01T23:54:59Z end (exit 0): ./snapshot.sh kividb-rc4
-### 2026-11-01T23:54:59Z start: ./evict.sh kividb-rc4
-kividb-rc4 plain kividb/kividb:v1.2.0-rc4 redis_version:8.10.0 kividb_version:1.2.0-rc4 
+[14:33:52] growth-kividb-cand-1024-random-r1 load-to-25000000
+[14:33:58] growth-kividb-cand-1024-random-r1 loaded-25000000
+  25000000 keys: RSS 25576.5 MB (1072.1 B/key) used 25468.0 MB (1068.1 B/key) keys 25000000
+[14:34:09] growth-kividb-cand-1024-random-r1 load-to-50000000
+[14:34:19] growth-kividb-cand-1024-random-r1 loaded-50000000
+  50000000 keys: RSS 51118.3 MB (1071.7 B/key) used 50933.1 MB (1068.1 B/key) keys 50000000
+[14:34:29] growth-kividb-cand-1024-random-r1 end
+### 2026-11-02T14:34:34Z end (exit 0): R=r1 ./growth.sh kividb-cand 1024 1000000,5000000,10000000,25000000,50000000
+### 2026-11-02T14:34:34Z start: R=r1 ./growth.sh kividb-rc4 1024 1000000,5000000,10000000,25000000,50000000
+kividb-rc4 plain kividb/kividb:build-a6b1bf388582 redis_version:8.10.0 kividb_version:1.2.0-rc4 
 [--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
-sampler started for evict-kividb-rc4 (pid 51335, /sys/fs/cgroup/system.slice/docker-7598b93b0b5ed019d8e92ae2687b9f7cf1d91172977e0aca3208792ce5de88cf.scope)
-[23:55:08] evict-kividb-rc4 load
-[23:55:12] evict-kividb-rc4 loaded
+sampler started for growth-kividb-rc4-1024-random-r1 (pid 17026, /sys/fs/cgroup/system.slice/docker-ba05d29cac7089aa3b2fb2a7a5921607040876d137a3918b2b10b741860c8280.scope)
+[14:34:42] growth-kividb-rc4-1024-random-r1 start
+[14:34:43] growth-kividb-rc4-1024-random-r1 load-to-1000000
+[14:34:44] growth-kividb-rc4-1024-random-r1 loaded-1000000
+  1000000 keys: RSS 1052.2 MB (1086.1 B/key) used 1027.9 MB (1074.9 B/key) keys 1000000
+[14:34:55] growth-kividb-rc4-1024-random-r1 load-to-5000000
+[14:34:57] growth-kividb-rc4-1024-random-r1 loaded-5000000
+  5000000 keys: RSS 5156.5 MB (1078.0 B/key) used 5110.3 MB (1071.1 B/key) keys 5000000
+[14:35:07] growth-kividb-rc4-1024-random-r1 load-to-10000000
+[14:35:10] growth-kividb-rc4-1024-random-r1 loaded-10000000
+  10000000 keys: RSS 10281.7 MB (1076.4 B/key) used 10217.7 MB (1071.1 B/key) keys 10000000
+[14:35:20] growth-kividb-rc4-1024-random-r1 load-to-25000000
+[14:35:26] growth-kividb-rc4-1024-random-r1 loaded-25000000
+  25000000 keys: RSS 25578.4 MB (1072.1 B/key) used 25468.0 MB (1068.1 B/key) keys 25000000
+[14:35:36] growth-kividb-rc4-1024-random-r1 load-to-50000000
+[14:35:47] growth-kividb-rc4-1024-random-r1 loaded-50000000
+  50000000 keys: RSS 51119.5 MB (1071.7 B/key) used 50933.1 MB (1068.1 B/key) keys 50000000
+[14:35:57] growth-kividb-rc4-1024-random-r1 end
+### 2026-11-02T14:36:02Z end (exit 0): R=r1 ./growth.sh kividb-rc4 1024 1000000,5000000,10000000,25000000,50000000
+### 2026-11-02T14:36:02Z start: R=r1 WIN=300 PRE=30 ./snapshot.sh kividb-cand
+kividb-cand persist kividb/kividb:build-75482abbb258 redis_version:8.10.0 kividb_version:1.2.0-rc6 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data --aof --aof-rewrite-percentage 0]
+sampler started for snap-kividb-cand-r1 (pid 17913, /sys/fs/cgroup/system.slice/docker-06e50abd1d59e2736ef9cda3e18243f9bfb553c4cea4f4ab0d5b2f0dd70c87d7.scope)
+[14:36:10] snap-kividb-cand-r1 load
+[14:36:41] snap-kividb-cand-r1 loaded
+[14:37:11] snap-kividb-cand-r1 bgsave-window-start
+[14:37:41] snap-kividb-cand-r1 bgsave-issued
+Background saving started
+[14:38:51] snap-kividb-cand-r1 bgsave-done
+[14:42:11] snap-kividb-cand-r1 bgsave-window-end
+[14:42:31] snap-kividb-cand-r1 aofrw-window-start
+[14:43:01] snap-kividb-cand-r1 aofrw-issued
+Background append only file rewriting started
+[14:44:14] snap-kividb-cand-r1 aofrw-done
+[14:47:32] snap-kividb-cand-r1 aofrw-window-end
+[14:47:52] snap-kividb-cand-r1 end
+### 2026-11-02T14:47:59Z end (exit 0): R=r1 WIN=300 PRE=30 ./snapshot.sh kividb-cand
+### 2026-11-02T14:47:59Z start: R=r1 WIN=300 PRE=30 ./snapshot.sh kividb-rc4
+kividb-rc4 persist kividb/kividb:build-a6b1bf388582 redis_version:8.10.0 kividb_version:1.2.0-rc4 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data --aof --aof-rewrite-percentage 0]
+sampler started for snap-kividb-rc4-r1 (pid 18670, /sys/fs/cgroup/system.slice/docker-74f4d0c87f3530774bc60c2fcc0eb1534619a2a522f9154f6aca8ab8f2e25d51.scope)
+[14:48:07] snap-kividb-rc4-r1 load
+[14:48:37] snap-kividb-rc4-r1 loaded
+[14:49:07] snap-kividb-rc4-r1 bgsave-window-start
+[14:49:37] snap-kividb-rc4-r1 bgsave-issued
+Background saving started
+[14:50:48] snap-kividb-rc4-r1 bgsave-done
+[14:54:07] snap-kividb-rc4-r1 bgsave-window-end
+[14:54:27] snap-kividb-rc4-r1 aofrw-window-start
+[14:54:57] snap-kividb-rc4-r1 aofrw-issued
+Background append only file rewriting started
+[14:56:10] snap-kividb-rc4-r1 aofrw-done
+[14:59:28] snap-kividb-rc4-r1 aofrw-window-end
+[14:59:48] snap-kividb-rc4-r1 end
+### 2026-11-02T14:59:55Z end (exit 0): R=r1 WIN=300 PRE=30 ./snapshot.sh kividb-rc4
+### 2026-11-02T14:59:55Z start: R=r1 ./evict.sh kividb-cand
+kividb-cand plain kividb/kividb:build-75482abbb258 redis_version:8.10.0 kividb_version:1.2.0-rc6 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+sampler started for evict-kividb-cand-r1 (pid 19553, /sys/fs/cgroup/system.slice/docker-12c9025e23a554b49b6cc28ca074c36fee15c975b3bbbd6472b2eb20ce79a25c.scope)
+[15:00:04] evict-kividb-cand-r1 load
+[15:00:08] evict-kividb-cand-r1 loaded
+OK
+OK
+used_memory=10714043253 maxmemory=11785447578
+evicted_keys:0
+dbsize_before=10000000
+[15:00:28] evict-kividb-cand-r1 writes-start
+[15:01:28] evict-kividb-cand-r1 bgsave-issued
+Background saving started
+[15:01:47] evict-kividb-cand-r1 bgsave-done
+[15:05:29] evict-kividb-cand-r1 writes-end
+dbsize_after=10000000
+evicted_keys:0
+used_memory:10716189797
+maxmemory:11785447578
+mem_not_counted_for_evict:0
+[15:05:34] evict-kividb-cand-r1 end
+### 2026-11-02T15:05:37Z end (exit 0): R=r1 ./evict.sh kividb-cand
+### 2026-11-02T15:05:37Z start: R=r1 ./evict.sh kividb-rc4
+kividb-rc4 plain kividb/kividb:build-a6b1bf388582 redis_version:8.10.0 kividb_version:1.2.0-rc4 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+sampler started for evict-kividb-rc4-r1 (pid 20220, /sys/fs/cgroup/system.slice/docker-9a323e0154006591be641b1b6c7cb35446379fe33dcf80331695ebd7ac9d0dca.scope)
+[15:05:46] evict-kividb-rc4-r1 load
+[15:05:50] evict-kividb-rc4-r1 loaded
+OK
+OK
+used_memory=10714043637 maxmemory=11785448000
+evicted_keys:0
+dbsize_before=10000000
+[15:06:10] evict-kividb-rc4-r1 writes-start
+[15:07:10] evict-kividb-rc4-r1 bgsave-issued
+Background saving started
+[15:07:30] evict-kividb-rc4-r1 bgsave-done
+[15:11:11] evict-kividb-rc4-r1 writes-end
+dbsize_after=10000000
+evicted_keys:0
+used_memory:10716192545
+maxmemory:11785448000
+mem_not_counted_for_evict:0
+[15:11:16] evict-kividb-rc4-r1 end
+### 2026-11-02T15:11:19Z end (exit 0): R=r1 ./evict.sh kividb-rc4
+### 2026-11-02T15:11:19Z start: ./warefeats.sh 10.30.0.4 25 full redis valkey dragonfly kividb-1.1.3 > /var/tmp/wf-comp.log 2>&1
+### 2026-11-02T16:15:24Z end (exit 0): ./warefeats.sh 10.30.0.4 25 full redis valkey dragonfly kividb-1.1.3 > /var/tmp/wf-comp.log 2>&1
+### 2026-11-02T16:15:24Z start: R=r1 ./growth.sh redis 100 1000000,5000000,10000000,25000000,50000000
+redis plain redis:8.10.3 redis_version:8.10.3 
+[redis-server --port 6379 --bind 0.0.0.0 --protected-mode no --io-threads 8 --dir /data --save  --appendonly no]
+sampler started for growth-redis-100-random-r1 (pid 53309, /sys/fs/cgroup/system.slice/docker-fe8e8add413d4662e2a10bd4ed44980e35c7a93cd5e6172b7b5dc87715903d74.scope)
+[16:15:32] growth-redis-100-random-r1 start
+[16:15:32] growth-redis-100-random-r1 load-to-1000000
+[16:15:33] growth-redis-100-random-r1 loaded-1000000
+  1000000 keys: RSS 187.5 MB (170.5 B/key) used 160.2 MB (165.4 B/key) keys 1000000
+[16:15:44] growth-redis-100-random-r1 load-to-5000000
+[16:15:48] growth-redis-100-random-r1 loaded-5000000
+  5000000 keys: RSS 880.0 MB (179.3 B/key) used 847.2 MB (177.1 B/key) keys 5000000
+[16:15:58] growth-redis-100-random-r1 load-to-10000000
+[16:16:04] growth-redis-100-random-r1 loaded-10000000
+  10000000 keys: RSS 1731.9 MB (179.0 B/key) used 1693.6 MB (177.3 B/key) keys 10000000
+[16:16:14] growth-redis-100-random-r1 load-to-25000000
+[16:16:30] growth-redis-100-random-r1 loaded-25000000
+  25000000 keys: RSS 4185.0 MB (174.5 B/key) used 4129.4 MB (173.1 B/key) keys 25000000
+[16:16:41] growth-redis-100-random-r1 load-to-50000000
+[16:17:08] growth-redis-100-random-r1 loaded-50000000
+  50000000 keys: RSS 8342.8 MB (174.4 B/key) used 8258.1 MB (173.1 B/key) keys 50000000
+[16:17:19] growth-redis-100-random-r1 end
+### 2026-11-02T16:17:22Z end (exit 0): R=r1 ./growth.sh redis 100 1000000,5000000,10000000,25000000,50000000
+### 2026-11-02T16:17:22Z start: R=r1 ./growth.sh valkey 100 1000000,5000000,10000000,25000000,50000000
+valkey plain valkey/valkey:9.1.3 redis_version:7.2.4 valkey_version:9.1.3 
+[valkey-server --port 6379 --bind 0.0.0.0 --protected-mode no --io-threads 8 --dir /data --save  --appendonly no]
+sampler started for growth-valkey-100-random-r1 (pid 54183, /sys/fs/cgroup/system.slice/docker-765cc4eb33d5f8eed939957577b994fb075faf9ab2bc0b7ad65d7278e6985467.scope)
+[16:17:30] growth-valkey-100-random-r1 start
+[16:17:30] growth-valkey-100-random-r1 load-to-1000000
+[16:17:32] growth-valkey-100-random-r1 loaded-1000000
+  1000000 keys: RSS 1.4 MB (0.0 B/key) used 161.0 MB (167.0 B/key) keys 1000000
+[16:17:43] growth-valkey-100-random-r1 load-to-5000000
+[16:17:47] growth-valkey-100-random-r1 loaded-5000000
+  5000000 keys: RSS 1.4 MB (0.0 B/key) used 795.3 MB (166.4 B/key) keys 5000000
+[16:17:57] growth-valkey-100-random-r1 load-to-10000000
+[16:18:03] growth-valkey-100-random-r1 loaded-10000000
+  10000000 keys: RSS 1.4 MB (0.0 B/key) used 1591.2 MB (166.7 B/key) keys 10000000
+[16:18:13] growth-valkey-100-random-r1 load-to-25000000
+[16:18:25] growth-valkey-100-random-r1 loaded-25000000
+  25000000 keys: RSS 1.4 MB (0.0 B/key) used 3944.4 MB (165.4 B/key) keys 25000000
+[16:18:36] growth-valkey-100-random-r1 load-to-50000000
+[16:18:57] growth-valkey-100-random-r1 loaded-50000000
+  50000000 keys: RSS 1.4 MB (0.0 B/key) used 7889.4 MB (165.4 B/key) keys 50000000
+[16:19:08] growth-valkey-100-random-r1 end
+### 2026-11-02T16:19:11Z end (exit 0): R=r1 ./growth.sh valkey 100 1000000,5000000,10000000,25000000,50000000
+### 2026-11-02T16:19:11Z start: R=r1 ./growth.sh dragonfly 100 1000000,5000000,10000000,25000000,50000000
+dragonfly plain docker.dragonflydb.io/dragonflydb/dragonfly:v2.0.2 redis_version:7.4.0 dragonfly_version:df-v2.0.2 
+[dragonfly --logtostderr --port 6379 --proactor_threads 32 --dir /data --dbfilename ]
+sampler started for growth-dragonfly-100-random-r1 (pid 55052, /sys/fs/cgroup/system.slice/docker-5128c0c984712e70aacc5662d9d5a1fb9b258fcf1df817abf1a24b96754293c4.scope)
+[16:19:19] growth-dragonfly-100-random-r1 start
+[16:19:19] growth-dragonfly-100-random-r1 load-to-1000000
+[16:19:21] growth-dragonfly-100-random-r1 loaded-1000000
+  1000000 keys: RSS 1.3 MB (0.0 B/key) used 156.2 MB (154.8 B/key) keys 1000000
+[16:19:31] growth-dragonfly-100-random-r1 load-to-5000000
+[16:19:32] growth-dragonfly-100-random-r1 loaded-5000000
+  5000000 keys: RSS 1.3 MB (0.0 B/key) used 714.5 MB (148.0 B/key) keys 5000000
+[16:19:43] growth-dragonfly-100-random-r1 load-to-10000000
+[16:19:45] growth-dragonfly-100-random-r1 loaded-10000000
+  10000000 keys: RSS 1.3 MB (0.0 B/key) used 1428.3 MB (148.9 B/key) keys 10000000
+[16:19:55] growth-dragonfly-100-random-r1 load-to-25000000
+[16:20:00] growth-dragonfly-100-random-r1 loaded-25000000
+  25000000 keys: RSS 1.3 MB (0.0 B/key) used 3333.0 MB (139.4 B/key) keys 25000000
+[16:20:10] growth-dragonfly-100-random-r1 load-to-50000000
+[16:20:17] growth-dragonfly-100-random-r1 loaded-50000000
+  50000000 keys: RSS 1.3 MB (0.0 B/key) used 6666.4 MB (139.6 B/key) keys 50000000
+[16:20:27] growth-dragonfly-100-random-r1 end
+### 2026-11-02T16:20:30Z end (exit 0): R=r1 ./growth.sh dragonfly 100 1000000,5000000,10000000,25000000,50000000
+### 2026-11-02T16:20:30Z start: R=r1 ./growth.sh kividb-1.1.3 100 1000000,5000000,10000000,25000000,50000000
+kividb-1.1.3 plain kividb/kividb:v1.1.3 redis_version:8.10.0 kividb_version:1.1.3 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+sampler started for growth-kividb-1.1.3-100-random-r1 (pid 56039, /sys/fs/cgroup/system.slice/docker-48f5db7c5526ff0f82dd5fe08434084b1b0f1b4e2595adfabe4cafdbc24a20f8.scope)
+[16:20:38] growth-kividb-1.1.3-100-random-r1 start
+[16:20:38] growth-kividb-1.1.3-100-random-r1 load-to-1000000
+[16:20:40] growth-kividb-1.1.3-100-random-r1 loaded-1000000
+  1000000 keys: RSS 224.3 MB (219.6 B/key) used 187.9 MB (194.1 B/key) keys 1000000
+[16:20:50] growth-kividb-1.1.3-100-random-r1 load-to-5000000
+[16:20:51] growth-kividb-1.1.3-100-random-r1 loaded-5000000
+  5000000 keys: RSS 956.9 MB (197.6 B/key) used 845.9 MB (176.8 B/key) keys 5000000
+[16:21:02] growth-kividb-1.1.3-100-random-r1 load-to-10000000
+[16:21:03] growth-kividb-1.1.3-100-random-r1 loaded-10000000
+  10000000 keys: RSS 1894.9 MB (197.1 B/key) used 1688.9 MB (176.8 B/key) keys 10000000
+[16:21:14] growth-kividb-1.1.3-100-random-r1 load-to-25000000
+[16:21:17] growth-kividb-1.1.3-100-random-r1 loaded-25000000
+  25000000 keys: RSS 4381.7 MB (183.2 B/key) used 3889.8 MB (163.0 B/key) keys 25000000
+[16:21:27] growth-kividb-1.1.3-100-random-r1 load-to-50000000
+[16:21:33] growth-kividb-1.1.3-100-random-r1 loaded-50000000
+  50000000 keys: RSS 8745.3 MB (183.1 B/key) used 7776.7 MB (163.0 B/key) keys 50000000
+[16:21:43] growth-kividb-1.1.3-100-random-r1 end
+### 2026-11-02T16:21:46Z end (exit 0): R=r1 ./growth.sh kividb-1.1.3 100 1000000,5000000,10000000,25000000,50000000
+### 2026-11-02T16:21:46Z start: R=r1 ./growth.sh redis 1024 1000000,5000000,10000000,25000000,50000000
+redis plain redis:8.10.3 redis_version:8.10.3 
+[redis-server --port 6379 --bind 0.0.0.0 --protected-mode no --io-threads 8 --dir /data --save  --appendonly no]
+sampler started for growth-redis-1024-random-r1 (pid 56923, /sys/fs/cgroup/system.slice/docker-8c774eecd124735d1d04b22adefa345fb553bf16d3f4f3663502ac75bd594f22.scope)
+[16:21:55] growth-redis-1024-random-r1 start
+[16:21:55] growth-redis-1024-random-r1 load-to-1000000
+[16:21:56] growth-redis-1024-random-r1 loaded-1000000
+  1000000 keys: RSS 1310.2 MB (1347.6 B/key) used 1274.1 MB (1333.4 B/key) keys 1000000
+[16:22:06] growth-redis-1024-random-r1 load-to-5000000
+[16:22:12] growth-redis-1024-random-r1 loaded-5000000
+  5000000 keys: RSS 6495.1 MB (1356.9 B/key) used 6416.6 MB (1345.1 B/key) keys 5000000
+[16:22:22] growth-redis-1024-random-r1 load-to-10000000
+[16:22:29] growth-redis-1024-random-r1 loaded-10000000
+  10000000 keys: RSS 12963.3 MB (1356.7 B/key) used 12832.6 MB (1345.3 B/key) keys 10000000
+[16:22:39] growth-redis-1024-random-r1 load-to-25000000
+[16:22:57] growth-redis-1024-random-r1 loaded-25000000
+  25000000 keys: RSS 32264.5 MB (1352.2 B/key) used 31976.8 MB (1341.1 B/key) keys 25000000
+[16:23:08] growth-redis-1024-random-r1 load-to-50000000
+[16:23:40] growth-redis-1024-random-r1 loaded-50000000
+  50000000 keys: RSS 64502.7 MB (1352.2 B/key) used 63952.7 MB (1341.1 B/key) keys 50000000
+[16:23:51] growth-redis-1024-random-r1 end
+### 2026-11-02T16:23:56Z end (exit 0): R=r1 ./growth.sh redis 1024 1000000,5000000,10000000,25000000,50000000
+### 2026-11-02T16:23:56Z start: R=r1 ./growth.sh valkey 1024 1000000,5000000,10000000,25000000,50000000
+valkey plain valkey/valkey:9.1.3 redis_version:7.2.4 valkey_version:9.1.3 
+[valkey-server --port 6379 --bind 0.0.0.0 --protected-mode no --io-threads 8 --dir /data --save  --appendonly no]
+sampler started for growth-valkey-1024-random-r1 (pid 57804, /sys/fs/cgroup/system.slice/docker-c7401cd150578a64516eeab6c7a4eda0b67b08e7e5bf5bcbcfc043b28dc52337.scope)
+[16:24:04] growth-valkey-1024-random-r1 start
+[16:24:04] growth-valkey-1024-random-r1 load-to-1000000
+[16:24:07] growth-valkey-1024-random-r1 loaded-1000000
+  1000000 keys: RSS 1.5 MB (0.0 B/key) used 1276.4 MB (1336.6 B/key) keys 1000000
+[16:24:17] growth-valkey-1024-random-r1 load-to-5000000
+[16:24:21] growth-valkey-1024-random-r1 loaded-5000000
+  5000000 keys: RSS 1.5 MB (0.0 B/key) used 6366.3 MB (1334.8 B/key) keys 5000000
+[16:24:31] growth-valkey-1024-random-r1 load-to-10000000
+[16:24:37] growth-valkey-1024-random-r1 loaded-10000000
+  10000000 keys: RSS 1.5 MB (0.0 B/key) used 12731.6 MB (1334.8 B/key) keys 10000000
+[16:24:47] growth-valkey-1024-random-r1 load-to-25000000
+[16:25:01] growth-valkey-1024-random-r1 loaded-25000000
+  25000000 keys: RSS 1.5 MB (0.0 B/key) used 31793.2 MB (1333.4 B/key) keys 25000000
+[16:25:12] growth-valkey-1024-random-r1 load-to-50000000
+[16:25:37] growth-valkey-1024-random-r1 loaded-50000000
+  50000000 keys: RSS 1.5 MB (0.0 B/key) used 63585.5 MB (1333.4 B/key) keys 50000000
+[16:25:47] growth-valkey-1024-random-r1 end
+### 2026-11-02T16:25:52Z end (exit 0): R=r1 ./growth.sh valkey 1024 1000000,5000000,10000000,25000000,50000000
+### 2026-11-02T16:25:52Z start: R=r1 ./growth.sh dragonfly 1024 1000000,5000000,10000000,25000000,50000000
+dragonfly plain docker.dragonflydb.io/dragonflydb/dragonfly:v2.0.2 redis_version:7.4.0 dragonfly_version:df-v2.0.2 
+[dragonfly --logtostderr --port 6379 --proactor_threads 32 --dir /data --dbfilename ]
+sampler started for growth-dragonfly-1024-random-r1 (pid 58668, /sys/fs/cgroup/system.slice/docker-d8270c78b47eb46c39c07167c15365436c126994923e3ea6e28581f724135211.scope)
+[16:26:00] growth-dragonfly-1024-random-r1 start
+[16:26:00] growth-dragonfly-1024-random-r1 load-to-1000000
+[16:26:02] growth-dragonfly-1024-random-r1 loaded-1000000
+  1000000 keys: RSS 1.3 MB (0.0 B/key) used 1041.2 MB (1082.8 B/key) keys 1000000
+[16:26:12] growth-dragonfly-1024-random-r1 load-to-5000000
+[16:26:14] growth-dragonfly-1024-random-r1 loaded-5000000
+  5000000 keys: RSS 1.3 MB (0.0 B/key) used 5139.5 MB (1076.0 B/key) keys 5000000
+[16:26:25] growth-dragonfly-1024-random-r1 load-to-10000000
+[16:26:27] growth-dragonfly-1024-random-r1 loaded-10000000
+  10000000 keys: RSS 1.3 MB (0.0 B/key) used 10278.4 MB (1076.9 B/key) keys 10000000
+[16:26:37] growth-dragonfly-1024-random-r1 load-to-25000000
+[16:26:44] growth-dragonfly-1024-random-r1 loaded-25000000
+  25000000 keys: RSS 1.3 MB (0.0 B/key) used 25458.8 MB (1067.5 B/key) keys 25000000
+[16:26:54] growth-dragonfly-1024-random-r1 load-to-50000000
+[16:27:04] growth-dragonfly-1024-random-r1 loaded-50000000
+  50000000 keys: RSS 1.3 MB (0.0 B/key) used 50916.9 MB (1067.6 B/key) keys 50000000
+[16:27:15] growth-dragonfly-1024-random-r1 end
+### 2026-11-02T16:27:18Z end (exit 0): R=r1 ./growth.sh dragonfly 1024 1000000,5000000,10000000,25000000,50000000
+### 2026-11-02T16:27:18Z start: R=r1 ./growth.sh kividb-1.1.3 1024 1000000,5000000,10000000,25000000,50000000
+kividb-1.1.3 plain kividb/kividb:v1.1.3 redis_version:8.10.0 kividb_version:1.1.3 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+sampler started for growth-kividb-1.1.3-1024-random-r1 (pid 59653, /sys/fs/cgroup/system.slice/docker-67012f7d5370c680995f5c0680833461e9c63830f64a0fe901cfd8d0c9fb15e7.scope)
+[16:27:27] growth-kividb-1.1.3-1024-random-r1 start
+[16:27:27] growth-kividb-1.1.3-1024-random-r1 load-to-1000000
+[16:27:29] growth-kividb-1.1.3-1024-random-r1 loaded-1000000
+  1000000 keys: RSS 1095.3 MB (1132.5 B/key) used 1069.1 MB (1118.1 B/key) keys 1000000
+[16:27:39] growth-kividb-1.1.3-1024-random-r1 load-to-5000000
+[16:27:41] growth-kividb-1.1.3-1024-random-r1 loaded-5000000
+  5000000 keys: RSS 5307.1 MB (1109.8 B/key) used 5251.9 MB (1100.8 B/key) keys 5000000
+[16:27:51] growth-kividb-1.1.3-1024-random-r1 load-to-10000000
+[16:27:55] growth-kividb-1.1.3-1024-random-r1 loaded-10000000
+  10000000 keys: RSS 10594.0 MB (1109.3 B/key) used 10500.8 MB (1100.8 B/key) keys 10000000
+[16:28:05] growth-kividb-1.1.3-1024-random-r1 load-to-25000000
+[16:28:13] growth-kividb-1.1.3-1024-random-r1 loaded-25000000
+  25000000 keys: RSS 26127.4 MB (1095.2 B/key) used 25919.7 MB (1087.0 B/key) keys 25000000
+[16:28:24] growth-kividb-1.1.3-1024-random-r1 load-to-50000000
+[16:28:37] growth-kividb-1.1.3-1024-random-r1 loaded-50000000
+  50000000 keys: RSS 52235.2 MB (1095.1 B/key) used 51836.5 MB (1087.0 B/key) keys 50000000
+[16:28:48] growth-kividb-1.1.3-1024-random-r1 end
+### 2026-11-02T16:28:52Z end (exit 0): R=r1 ./growth.sh kividb-1.1.3 1024 1000000,5000000,10000000,25000000,50000000
+### 2026-11-02T16:28:52Z start: R=r1 WIN=300 PRE=30 ./snapshot.sh redis
+redis persist redis:8.10.3 redis_version:8.10.3 
+[redis-server --port 6379 --bind 0.0.0.0 --protected-mode no --io-threads 8 --dir /data --save  --appendonly yes --auto-aof-rewrite-percentage 0]
+sampler started for snap-redis-r1 (pid 60541, /sys/fs/cgroup/system.slice/docker-6797a616f3fe6976154c02fa1e6d90a80a7a3d46c752c1691ebf73c7bddbe3b6.scope)
+[16:29:00] snap-redis-r1 load
+[16:30:34] snap-redis-r1 loaded
+[16:31:04] snap-redis-r1 bgsave-window-start
+[16:31:34] snap-redis-r1 bgsave-issued
+Background saving started
+[16:34:29] snap-redis-r1 bgsave-done
+[16:36:04] snap-redis-r1 bgsave-window-end
+[16:36:24] snap-redis-r1 aofrw-window-start
+[16:36:54] snap-redis-r1 aofrw-issued
+Background append only file rewriting started
+[16:39:52] snap-redis-r1 aofrw-done
+[16:41:25] snap-redis-r1 aofrw-window-end
+[16:41:45] snap-redis-r1 end
+### 2026-11-02T16:41:53Z end (exit 0): R=r1 WIN=300 PRE=30 ./snapshot.sh redis
+### 2026-11-02T16:41:53Z start: R=r1 WIN=300 PRE=30 ./snapshot.sh valkey
+valkey persist valkey/valkey:9.1.3 redis_version:7.2.4 valkey_version:9.1.3 
+[valkey-server --port 6379 --bind 0.0.0.0 --protected-mode no --io-threads 8 --dir /data --save  --appendonly yes --auto-aof-rewrite-percentage 0]
+sampler started for snap-valkey-r1 (pid 61237, /sys/fs/cgroup/system.slice/docker-98a2d7de3ec8d91c09aaadd8b0080d4f94d42eee06bd05ba835cf7368828eb7b.scope)
+[16:42:01] snap-valkey-r1 load
+[16:43:30] snap-valkey-r1 loaded
+[16:44:00] snap-valkey-r1 bgsave-window-start
+[16:44:30] snap-valkey-r1 bgsave-issued
+Background saving started
+[16:47:16] snap-valkey-r1 bgsave-done
+[16:49:01] snap-valkey-r1 bgsave-window-end
+[16:49:21] snap-valkey-r1 aofrw-window-start
+[16:49:51] snap-valkey-r1 aofrw-issued
+Background append only file rewriting started
+[16:52:43] snap-valkey-r1 aofrw-done
+[16:54:21] snap-valkey-r1 aofrw-window-end
+[16:54:42] snap-valkey-r1 end
+### 2026-11-02T16:54:49Z end (exit 0): R=r1 WIN=300 PRE=30 ./snapshot.sh valkey
+### 2026-11-02T16:54:49Z start: R=r1 WIN=300 PRE=30 ./snapshot.sh dragonfly
+dragonfly persist docker.dragonflydb.io/dragonflydb/dragonfly:v2.0.2 redis_version:7.4.0 dragonfly_version:df-v2.0.2 
+[dragonfly --logtostderr --port 6379 --proactor_threads 32 --dir /data --dbfilename dump]
+sampler started for snap-dragonfly-r1 (pid 61920, /sys/fs/cgroup/system.slice/docker-db6d3841af2787faecaf836aba884f67c07657439fca863d190e8661a6569b4a.scope)
+[16:54:58] snap-dragonfly-r1 load
+[16:55:10] snap-dragonfly-r1 loaded
+[16:55:40] snap-dragonfly-r1 bgsave-window-start
+[16:56:10] snap-dragonfly-r1 bgsave-issued
+OK
+[16:57:05] snap-dragonfly-r1 bgsave-done
+[17:00:41] snap-dragonfly-r1 bgsave-window-end
+[17:01:01] snap-dragonfly-r1 end
+### 2026-11-02T17:01:04Z end (exit 0): R=r1 WIN=300 PRE=30 ./snapshot.sh dragonfly
+### 2026-11-02T17:01:04Z start: R=r1 WIN=300 PRE=30 ./snapshot.sh kividb-1.1.3
+kividb-1.1.3 persist kividb/kividb:v1.1.3 redis_version:8.10.0 kividb_version:1.1.3 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data --aof --aof-rewrite-percentage 0]
+sampler started for snap-kividb-1.1.3-r1 (pid 63115, /sys/fs/cgroup/system.slice/docker-b2bbdae46f1ffd7c1fb8c4707ac3c868a206aab58df56f1cf383a919f165cdb8.scope)
+[17:01:13] snap-kividb-1.1.3-r1 load
+[17:01:42] snap-kividb-1.1.3-r1 loaded
+[17:02:12] snap-kividb-1.1.3-r1 bgsave-window-start
+[17:02:42] snap-kividb-1.1.3-r1 bgsave-issued
+Background saving started
+[17:04:20] snap-kividb-1.1.3-r1 bgsave-done
+[17:07:13] snap-kividb-1.1.3-r1 bgsave-window-end
+[17:07:33] snap-kividb-1.1.3-r1 aofrw-window-start
+[17:08:03] snap-kividb-1.1.3-r1 aofrw-issued
+Background append only file rewriting started
+[17:09:24] snap-kividb-1.1.3-r1 aofrw-done
+[17:12:33] snap-kividb-1.1.3-r1 aofrw-window-end
+[17:12:54] snap-kividb-1.1.3-r1 end
+### 2026-11-02T17:13:01Z end (exit 0): R=r1 WIN=300 PRE=30 ./snapshot.sh kividb-1.1.3
+### 2026-11-02T17:13:01Z start: R=r1 ./evict.sh kividb-1.1.3
+kividb-1.1.3 plain kividb/kividb:v1.1.3 redis_version:8.10.0 kividb_version:1.1.3 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+sampler started for evict-kividb-1.1.3-r1 (pid 63882, /sys/fs/cgroup/system.slice/docker-f7b9391423e26e426f94e8cbd627ff003ff0081d22710be26d541c5015ceba7f.scope)
+[17:13:09] evict-kividb-1.1.3-r1 load
+[17:13:16] evict-kividb-1.1.3-r1 loaded
+OK
+OK
+used_memory=11010900787 maxmemory=12111990865
+evicted_keys:0
+dbsize_before=10000000
+[17:13:36] evict-kividb-1.1.3-r1 writes-start
+[17:14:36] evict-kividb-1.1.3-r1 bgsave-issued
+Background saving started
+[17:15:11] evict-kividb-1.1.3-r1 bgsave-done
+[17:18:36] evict-kividb-1.1.3-r1 writes-end
+dbsize_after=8789704
+evicted_keys:11055716
+used_memory:10181367487
+maxmemory:12111990865
+mem_not_counted_for_evict:0
+[17:18:41] evict-kividb-1.1.3-r1 end
+### 2026-11-02T17:18:45Z end (exit 0): R=r1 ./evict.sh kividb-1.1.3
+### 2026-11-02T17:18:45Z start: R=r1 ./evict.sh redis
+redis plain redis:8.10.3 redis_version:8.10.3 
+[redis-server --port 6379 --bind 0.0.0.0 --protected-mode no --io-threads 8 --dir /data --save  --appendonly no]
+sampler started for evict-redis-r1 (pid 64521, /sys/fs/cgroup/system.slice/docker-960a3244b9c50eb8c0e234259259dbb1275c5a5208f659f5169db5091e1bf15b.scope)
+[17:18:54] evict-redis-r1 load
+[17:19:04] evict-redis-r1 loaded
+OK
+OK
+used_memory=13455091656 maxmemory=14800600821
+evicted_keys:0
+dbsize_before=10000000
+[17:19:24] evict-redis-r1 writes-start
+[17:20:24] evict-redis-r1 bgsave-issued
+Background saving started
+[17:21:13] evict-redis-r1 bgsave-done
+[17:24:24] evict-redis-r1 writes-end
+dbsize_after=10000000
+evicted_keys:0
+used_memory:13375767456
+maxmemory:14800600821
+mem_not_counted_for_evict:0
+[17:24:29] evict-redis-r1 end
+### 2026-11-02T17:24:34Z end (exit 0): R=r1 ./evict.sh redis
+### 2026-11-02T17:24:34Z start: ./warefeats.sh 10.30.0.4 25 full kividb-rc4-run2 kividb-cand-run2 > /var/tmp/wf-r2.log 2>&1
+### 2026-11-02T17:54:41Z end (exit 0): ./warefeats.sh 10.30.0.4 25 full kividb-rc4-run2 kividb-cand-run2 > /var/tmp/wf-r2.log 2>&1
+### 2026-11-02T17:54:41Z start: R=r2 ./growth.sh kividb-rc4 100 1000000,5000000,10000000,25000000,50000000
+kividb-rc4 plain kividb/kividb:build-a6b1bf388582 redis_version:8.10.0 kividb_version:1.2.0-rc4 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+sampler started for growth-kividb-rc4-100-random-r2 (pid 68035, /sys/fs/cgroup/system.slice/docker-034f7988896670f9f3af8e64e4ea302880846d64f8fbe2bd5cda1ce3a5373f13.scope)
+[17:54:49] growth-kividb-rc4-100-random-r2 start
+[17:54:49] growth-kividb-rc4-100-random-r2 load-to-1000000
+[17:54:50] growth-kividb-rc4-100-random-r2 loaded-1000000
+  1000000 keys: RSS 163.8 MB (154.4 B/key) used 142.9 MB (146.9 B/key) keys 1000000
+[17:55:01] growth-kividb-rc4-100-random-r2 load-to-5000000
+[17:55:02] growth-kividb-rc4-100-random-r2 loaded-5000000
+  5000000 keys: RSS 713.6 MB (146.2 B/key) used 685.2 MB (143.1 B/key) keys 5000000
+[17:55:12] growth-kividb-rc4-100-random-r2 load-to-10000000
+[17:55:14] growth-kividb-rc4-100-random-r2 loaded-10000000
+  10000000 keys: RSS 1397.6 MB (144.8 B/key) used 1367.6 MB (143.1 B/key) keys 10000000
+[17:55:24] growth-kividb-rc4-100-random-r2 load-to-25000000
+[17:55:27] growth-kividb-rc4-100-random-r2 loaded-25000000
+  25000000 keys: RSS 3377.2 MB (141.0 B/key) used 3342.6 MB (140.1 B/key) keys 25000000
+[17:55:38] growth-kividb-rc4-100-random-r2 load-to-50000000
+[17:55:43] growth-kividb-rc4-100-random-r2 loaded-50000000
+  50000000 keys: RSS 6723.4 MB (140.7 B/key) used 6682.4 MB (140.1 B/key) keys 50000000
+[17:55:54] growth-kividb-rc4-100-random-r2 end
+### 2026-11-02T17:55:57Z end (exit 0): R=r2 ./growth.sh kividb-rc4 100 1000000,5000000,10000000,25000000,50000000
+### 2026-11-02T17:55:57Z start: R=r2 ./growth.sh kividb-cand 100 1000000,5000000,10000000,25000000,50000000
+kividb-cand plain kividb/kividb:build-75482abbb258 redis_version:8.10.0 kividb_version:1.2.0-rc6 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+sampler started for growth-kividb-cand-100-random-r2 (pid 68937, /sys/fs/cgroup/system.slice/docker-f6c409d3902799328b223a2454ba32ab54c5dabf225acace26b96563c925f926.scope)
+[17:56:05] growth-kividb-cand-100-random-r2 start
+[17:56:05] growth-kividb-cand-100-random-r2 load-to-1000000
+[17:56:07] growth-kividb-cand-100-random-r2 loaded-1000000
+  1000000 keys: RSS 163.2 MB (153.8 B/key) used 142.9 MB (146.9 B/key) keys 1000000
+[17:56:17] growth-kividb-cand-100-random-r2 load-to-5000000
+[17:56:18] growth-kividb-cand-100-random-r2 loaded-5000000
+  5000000 keys: RSS 715.9 MB (146.7 B/key) used 685.2 MB (143.1 B/key) keys 5000000
+[17:56:29] growth-kividb-cand-100-random-r2 load-to-10000000
+[17:56:30] growth-kividb-cand-100-random-r2 loaded-10000000
+  10000000 keys: RSS 1399.6 MB (145.0 B/key) used 1367.6 MB (143.1 B/key) keys 10000000
+[17:56:40] growth-kividb-cand-100-random-r2 load-to-25000000
+[17:56:44] growth-kividb-cand-100-random-r2 loaded-25000000
+  25000000 keys: RSS 3379.2 MB (141.0 B/key) used 3342.6 MB (140.1 B/key) keys 25000000
+[17:56:54] growth-kividb-cand-100-random-r2 load-to-50000000
+[17:57:00] growth-kividb-cand-100-random-r2 loaded-50000000
+  50000000 keys: RSS 6725.2 MB (140.7 B/key) used 6682.4 MB (140.1 B/key) keys 50000000
+[17:57:10] growth-kividb-cand-100-random-r2 end
+### 2026-11-02T17:57:13Z end (exit 0): R=r2 ./growth.sh kividb-cand 100 1000000,5000000,10000000,25000000,50000000
+### 2026-11-02T17:57:13Z start: R=r2 ./growth.sh kividb-rc4 1024 1000000,5000000,10000000,25000000,50000000
+kividb-rc4 plain kividb/kividb:build-a6b1bf388582 redis_version:8.10.0 kividb_version:1.2.0-rc4 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+sampler started for growth-kividb-rc4-1024-random-r2 (pid 69827, /sys/fs/cgroup/system.slice/docker-e79223573528b3d5081b6eca6f7fa41571ff6470920bfafe1793777ddc5a82df.scope)
+[17:57:21] growth-kividb-rc4-1024-random-r2 start
+[17:57:22] growth-kividb-rc4-1024-random-r2 load-to-1000000
+[17:57:23] growth-kividb-rc4-1024-random-r2 loaded-1000000
+  1000000 keys: RSS 1052.2 MB (1086.1 B/key) used 1027.9 MB (1074.9 B/key) keys 1000000
+[17:57:33] growth-kividb-rc4-1024-random-r2 load-to-5000000
+[17:57:36] growth-kividb-rc4-1024-random-r2 loaded-5000000
+  5000000 keys: RSS 5154.0 MB (1077.4 B/key) used 5110.3 MB (1071.1 B/key) keys 5000000
+[17:57:46] growth-kividb-rc4-1024-random-r2 load-to-10000000
+[17:57:48] growth-kividb-rc4-1024-random-r2 loaded-10000000
+  10000000 keys: RSS 10278.0 MB (1076.0 B/key) used 10217.7 MB (1071.1 B/key) keys 10000000
+[17:57:59] growth-kividb-rc4-1024-random-r2 load-to-25000000
+[17:58:05] growth-kividb-rc4-1024-random-r2 loaded-25000000
+  25000000 keys: RSS 25573.8 MB (1072.0 B/key) used 25468.0 MB (1068.1 B/key) keys 25000000
+[17:58:16] growth-kividb-rc4-1024-random-r2 load-to-50000000
+[17:58:26] growth-kividb-rc4-1024-random-r2 loaded-50000000
+  50000000 keys: RSS 51115.9 MB (1071.6 B/key) used 50933.1 MB (1068.1 B/key) keys 50000000
+[17:58:36] growth-kividb-rc4-1024-random-r2 end
+### 2026-11-02T17:58:41Z end (exit 0): R=r2 ./growth.sh kividb-rc4 1024 1000000,5000000,10000000,25000000,50000000
+### 2026-11-02T17:58:41Z start: R=r2 ./growth.sh kividb-cand 1024 1000000,5000000,10000000,25000000,50000000
+kividb-cand plain kividb/kividb:build-75482abbb258 redis_version:8.10.0 kividb_version:1.2.0-rc6 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+sampler started for growth-kividb-cand-1024-random-r2 (pid 70711, /sys/fs/cgroup/system.slice/docker-4af452adeb84d0e440ecbe489201d2558a6a4b232d77e783594762bbe9ae6e82.scope)
+[17:58:49] growth-kividb-cand-1024-random-r2 start
+[17:58:49] growth-kividb-cand-1024-random-r2 load-to-1000000
+[17:58:51] growth-kividb-cand-1024-random-r2 loaded-1000000
+  1000000 keys: RSS 1051.7 MB (1085.6 B/key) used 1027.9 MB (1074.9 B/key) keys 1000000
+[17:59:01] growth-kividb-cand-1024-random-r2 load-to-5000000
+[17:59:04] growth-kividb-cand-1024-random-r2 loaded-5000000
+  5000000 keys: RSS 5154.5 MB (1077.5 B/key) used 5110.3 MB (1071.1 B/key) keys 5000000
+[17:59:14] growth-kividb-cand-1024-random-r2 load-to-10000000
+[17:59:16] growth-kividb-cand-1024-random-r2 loaded-10000000
+  10000000 keys: RSS 10277.5 MB (1076.0 B/key) used 10217.7 MB (1071.1 B/key) keys 10000000
+[17:59:27] growth-kividb-cand-1024-random-r2 load-to-25000000
+[17:59:33] growth-kividb-cand-1024-random-r2 loaded-25000000
+  25000000 keys: RSS 25573.9 MB (1072.0 B/key) used 25468.0 MB (1068.1 B/key) keys 25000000
+[17:59:43] growth-kividb-cand-1024-random-r2 load-to-50000000
+[17:59:54] growth-kividb-cand-1024-random-r2 loaded-50000000
+  50000000 keys: RSS 51115.4 MB (1071.6 B/key) used 50933.1 MB (1068.1 B/key) keys 50000000
+[18:00:04] growth-kividb-cand-1024-random-r2 end
+### 2026-11-02T18:00:09Z end (exit 0): R=r2 ./growth.sh kividb-cand 1024 1000000,5000000,10000000,25000000,50000000
+### 2026-11-02T18:00:09Z start: R=r2 WIN=300 PRE=30 ./snapshot.sh kividb-rc4
+kividb-rc4 persist kividb/kividb:build-a6b1bf388582 redis_version:8.10.0 kividb_version:1.2.0-rc4 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data --aof --aof-rewrite-percentage 0]
+sampler started for snap-kividb-rc4-r2 (pid 71611, /sys/fs/cgroup/system.slice/docker-b6b2f42ab9a32bf78d923e1d719ca8a71325e64fd0423bbbd0f843a593898799.scope)
+[18:00:17] snap-kividb-rc4-r2 load
+[18:00:46] snap-kividb-rc4-r2 loaded
+[18:01:16] snap-kividb-rc4-r2 bgsave-window-start
+[18:01:46] snap-kividb-rc4-r2 bgsave-issued
+Background saving started
+[18:02:57] snap-kividb-rc4-r2 bgsave-done
+[18:06:16] snap-kividb-rc4-r2 bgsave-window-end
+[18:06:36] snap-kividb-rc4-r2 aofrw-window-start
+[18:07:06] snap-kividb-rc4-r2 aofrw-issued
+Background append only file rewriting started
+[18:08:19] snap-kividb-rc4-r2 aofrw-done
+[18:11:38] snap-kividb-rc4-r2 aofrw-window-end
+[18:11:58] snap-kividb-rc4-r2 end
+### 2026-11-02T18:12:05Z end (exit 0): R=r2 WIN=300 PRE=30 ./snapshot.sh kividb-rc4
+### 2026-11-02T18:12:05Z start: R=r2 WIN=300 PRE=30 ./snapshot.sh kividb-cand
+kividb-cand persist kividb/kividb:build-75482abbb258 redis_version:8.10.0 kividb_version:1.2.0-rc6 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data --aof --aof-rewrite-percentage 0]
+sampler started for snap-kividb-cand-r2 (pid 72433, /sys/fs/cgroup/system.slice/docker-e1467db2ecb89fdb74259ba051f1a284e55952ac1f8fe07e648c0a83ee8a865a.scope)
+[18:12:13] snap-kividb-cand-r2 load
+[18:12:42] snap-kividb-cand-r2 loaded
+[18:13:12] snap-kividb-cand-r2 bgsave-window-start
+[18:13:42] snap-kividb-cand-r2 bgsave-issued
+Background saving started
+[18:14:52] snap-kividb-cand-r2 bgsave-done
+[18:18:12] snap-kividb-cand-r2 bgsave-window-end
+[18:18:32] snap-kividb-cand-r2 aofrw-window-start
+[18:19:02] snap-kividb-cand-r2 aofrw-issued
+Background append only file rewriting started
+[18:20:14] snap-kividb-cand-r2 aofrw-done
+[18:23:33] snap-kividb-cand-r2 aofrw-window-end
+[18:23:54] snap-kividb-cand-r2 end
+### 2026-11-02T18:24:00Z end (exit 0): R=r2 WIN=300 PRE=30 ./snapshot.sh kividb-cand
+### 2026-11-02T18:24:00Z start: R=r2 ./evict.sh kividb-rc4
+kividb-rc4 plain kividb/kividb:build-a6b1bf388582 redis_version:8.10.0 kividb_version:1.2.0-rc4 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+sampler started for evict-kividb-rc4-r2 (pid 73216, /sys/fs/cgroup/system.slice/docker-b1401722b1eed8f20f21dfa9f16373df7777a58e32d7c9105dac052d48217a44.scope)
+[18:24:09] evict-kividb-rc4-r2 load
+[18:24:13] evict-kividb-rc4-r2 loaded
 OK
 OK
 used_memory=10714042245 maxmemory=11785446469
 evicted_keys:0
 dbsize_before=10000000
-[23:55:32] evict-kividb-rc4 writes-start
-[23:56:32] evict-kividb-rc4 bgsave-issued
+[18:24:33] evict-kividb-rc4-r2 writes-start
+[18:25:33] evict-kividb-rc4-r2 bgsave-issued
 Background saving started
-[23:56:52] evict-kividb-rc4 bgsave-done
-[00:00:33] evict-kividb-rc4 writes-end
+[18:25:52] evict-kividb-rc4-r2 bgsave-done
+[18:29:34] evict-kividb-rc4-r2 writes-end
 dbsize_after=10000000
 evicted_keys:0
-used_memory:10714157801
+used_memory:10716191957
 maxmemory:11785446469
 mem_not_counted_for_evict:0
-[00:00:38] evict-kividb-rc4 end
-### 2026-11-02T00:00:42Z end (exit 0): ./evict.sh kividb-rc4
-### 2026-11-02T00:00:42Z start: ./growth.sh redis 100 1000000,5000000,10000000,25000000,50000000
-redis plain redis:8.10.3 redis_version:8.10.3 
-[redis-server --port 6379 --bind 0.0.0.0 --protected-mode no --io-threads 8 --dir /data --save  --appendonly no]
-sampler started for growth-redis-100-random (pid 52139, /sys/fs/cgroup/system.slice/docker-3a76f641823f5b143fcf96faf76a49ffbc7d47eda8f2824c5cfdd39164706006.scope)
-[00:00:50] growth-redis-100-random start
-[00:00:51] growth-redis-100-random load-to-1000000
-[00:00:52] growth-redis-100-random loaded-1000000
-  1000000 keys: RSS 187.4 MB (170.2 B/key) used 160.2 MB (165.4 B/key) keys 1000000
-[00:01:02] growth-redis-100-random load-to-5000000
-[00:01:08] growth-redis-100-random loaded-5000000
-  5000000 keys: RSS 880.2 MB (179.3 B/key) used 847.7 MB (177.3 B/key) keys 5000000
-[00:01:18] growth-redis-100-random load-to-10000000
-[00:01:25] growth-redis-100-random loaded-10000000
-  10000000 keys: RSS 1732.4 MB (179.0 B/key) used 1694.2 MB (177.4 B/key) keys 10000000
-[00:01:36] growth-redis-100-random load-to-25000000
-[00:01:56] growth-redis-100-random loaded-25000000
-  25000000 keys: RSS 4185.4 MB (174.5 B/key) used 4130.1 MB (173.1 B/key) keys 25000000
-[00:02:07] growth-redis-100-random load-to-50000000
-[00:02:41] growth-redis-100-random loaded-50000000
-  50000000 keys: RSS 8343.1 MB (174.4 B/key) used 8258.8 MB (173.1 B/key) keys 50000000
-[00:02:52] growth-redis-100-random end
-### 2026-11-02T00:02:55Z end (exit 0): ./growth.sh redis 100 1000000,5000000,10000000,25000000,50000000
-### 2026-11-02T00:02:55Z start: ./growth.sh valkey 100 1000000,5000000,10000000,25000000,50000000
-valkey plain valkey/valkey:9.1.3 redis_version:7.2.4 valkey_version:9.1.3 
-[valkey-server --port 6379 --bind 0.0.0.0 --protected-mode no --io-threads 8 --dir /data --save  --appendonly no]
-sampler started for growth-valkey-100-random (pid 53054, /sys/fs/cgroup/system.slice/docker-4964c983a4fbe6eb46c57430d583b633ed03baa1b7cc02be519aa21227d5b436.scope)
-[00:03:04] growth-valkey-100-random start
-[00:03:04] growth-valkey-100-random load-to-1000000
-[00:03:05] growth-valkey-100-random loaded-1000000
-  1000000 keys: RSS 1.3 MB (0.0 B/key) used 161.0 MB (167.0 B/key) keys 1000000
-[00:03:16] growth-valkey-100-random load-to-5000000
-[00:03:20] growth-valkey-100-random loaded-5000000
-  5000000 keys: RSS 1.3 MB (0.0 B/key) used 795.3 MB (166.4 B/key) keys 5000000
-[00:03:31] growth-valkey-100-random load-to-10000000
-[00:03:37] growth-valkey-100-random loaded-10000000
-  10000000 keys: RSS 1.3 MB (0.0 B/key) used 1591.2 MB (166.7 B/key) keys 10000000
-[00:03:47] growth-valkey-100-random load-to-25000000
-[00:04:03] growth-valkey-100-random loaded-25000000
-  25000000 keys: RSS 1.3 MB (0.0 B/key) used 3944.4 MB (165.4 B/key) keys 25000000
-[00:04:13] growth-valkey-100-random load-to-50000000
-[00:04:40] growth-valkey-100-random loaded-50000000
-  50000000 keys: RSS 1.3 MB (0.0 B/key) used 7889.3 MB (165.4 B/key) keys 50000000
-[00:04:51] growth-valkey-100-random end
-### 2026-11-02T00:04:54Z end (exit 0): ./growth.sh valkey 100 1000000,5000000,10000000,25000000,50000000
-### 2026-11-02T00:04:54Z start: ./growth.sh dragonfly 100 1000000,5000000,10000000,25000000,50000000
-dragonfly plain docker.dragonflydb.io/dragonflydb/dragonfly:v2.0.2 redis_version:7.4.0 dragonfly_version:df-v2.0.2 
-[dragonfly --logtostderr --port 6379 --proactor_threads 32 --dir /data --dbfilename ]
-sampler started for growth-dragonfly-100-random (pid 53940, /sys/fs/cgroup/system.slice/docker-70fe4170997ca51b817ce711fa7936851494a595a9cf069e40438f653da238e9.scope)
-[00:05:03] growth-dragonfly-100-random start
-[00:05:03] growth-dragonfly-100-random load-to-1000000
-[00:05:05] growth-dragonfly-100-random loaded-1000000
-  1000000 keys: RSS 1.3 MB (0.0 B/key) used 156.2 MB (154.8 B/key) keys 1000000
-[00:05:15] growth-dragonfly-100-random load-to-5000000
-[00:05:16] growth-dragonfly-100-random loaded-5000000
-  5000000 keys: RSS 1.3 MB (0.0 B/key) used 714.5 MB (148.0 B/key) keys 5000000
-[00:05:27] growth-dragonfly-100-random load-to-10000000
-[00:05:29] growth-dragonfly-100-random loaded-10000000
-  10000000 keys: RSS 1.3 MB (0.0 B/key) used 1428.3 MB (148.9 B/key) keys 10000000
-[00:05:39] growth-dragonfly-100-random load-to-25000000
-[00:05:44] growth-dragonfly-100-random loaded-25000000
-  25000000 keys: RSS 1.3 MB (0.0 B/key) used 3332.9 MB (139.4 B/key) keys 25000000
-[00:05:54] growth-dragonfly-100-random load-to-50000000
-[00:06:02] growth-dragonfly-100-random loaded-50000000
-  50000000 keys: RSS 1.3 MB (0.0 B/key) used 6666.4 MB (139.6 B/key) keys 50000000
-[00:06:12] growth-dragonfly-100-random end
-### 2026-11-02T00:06:15Z end (exit 0): ./growth.sh dragonfly 100 1000000,5000000,10000000,25000000,50000000
-### 2026-11-02T00:06:15Z start: ./growth.sh kividb-1.1.3 100 1000000,5000000,10000000,25000000,50000000
-kividb-1.1.3 plain kividb/kividb:v1.1.3 redis_version:8.10.0 kividb_version:1.1.3 
+[18:29:39] evict-kividb-rc4-r2 end
+### 2026-11-02T18:29:42Z end (exit 0): R=r2 ./evict.sh kividb-rc4
+### 2026-11-02T18:29:42Z start: R=r2 ./evict.sh kividb-cand
+kividb-cand plain kividb/kividb:build-75482abbb258 redis_version:8.10.0 kividb_version:1.2.0-rc6 
 [--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
-sampler started for growth-kividb-1.1.3-100-random (pid 54939, /sys/fs/cgroup/system.slice/docker-720fcc505bba797324883ec241974a0cc8ced3f8273c17bde66951ce8fe7d180.scope)
-[00:06:24] growth-kividb-1.1.3-100-random start
-[00:06:24] growth-kividb-1.1.3-100-random load-to-1000000
-[00:06:26] growth-kividb-1.1.3-100-random loaded-1000000
-  1000000 keys: RSS 225.6 MB (220.5 B/key) used 187.9 MB (194.1 B/key) keys 1000000
-[00:06:36] growth-kividb-1.1.3-100-random load-to-5000000
-[00:06:37] growth-kividb-1.1.3-100-random loaded-5000000
-  5000000 keys: RSS 957.1 MB (197.5 B/key) used 845.9 MB (176.8 B/key) keys 5000000
-[00:06:48] growth-kividb-1.1.3-100-random load-to-10000000
-[00:06:50] growth-kividb-1.1.3-100-random loaded-10000000
-  10000000 keys: RSS 1895.2 MB (197.1 B/key) used 1688.9 MB (176.8 B/key) keys 10000000
-[00:07:01] growth-kividb-1.1.3-100-random load-to-25000000
-[00:07:05] growth-kividb-1.1.3-100-random loaded-25000000
-  25000000 keys: RSS 4381.9 MB (183.1 B/key) used 3889.8 MB (163.0 B/key) keys 25000000
-[00:07:15] growth-kividb-1.1.3-100-random load-to-50000000
-[00:07:20] growth-kividb-1.1.3-100-random loaded-50000000
-  50000000 keys: RSS 8745.7 MB (183.1 B/key) used 7776.7 MB (163.0 B/key) keys 50000000
-[00:07:30] growth-kividb-1.1.3-100-random end
-### 2026-11-02T00:07:34Z end (exit 0): ./growth.sh kividb-1.1.3 100 1000000,5000000,10000000,25000000,50000000
-### 2026-11-02T00:07:34Z start: ./growth.sh redis 1024 1000000,5000000,10000000,25000000,50000000
-redis plain redis:8.10.3 redis_version:8.10.3 
-[redis-server --port 6379 --bind 0.0.0.0 --protected-mode no --io-threads 8 --dir /data --save  --appendonly no]
-sampler started for growth-redis-1024-random (pid 55850, /sys/fs/cgroup/system.slice/docker-82040edef4ee6aa71cda26d58bc7044c35e3fb08d822494258919ad51a058de3.scope)
-[00:07:43] growth-redis-1024-random start
-[00:07:43] growth-redis-1024-random load-to-1000000
-[00:07:44] growth-redis-1024-random loaded-1000000
-  1000000 keys: RSS 1314.0 MB (1351.8 B/key) used 1274.1 MB (1333.4 B/key) keys 1000000
-[00:07:54] growth-redis-1024-random load-to-5000000
-[00:08:01] growth-redis-1024-random loaded-5000000
-  5000000 keys: RSS 6495.2 MB (1356.9 B/key) used 6417.1 MB (1345.2 B/key) keys 5000000
-[00:08:12] growth-redis-1024-random load-to-10000000
-[00:08:20] growth-redis-1024-random loaded-10000000
-  10000000 keys: RSS 12963.6 MB (1356.7 B/key) used 12833.1 MB (1345.4 B/key) keys 10000000
-[00:08:30] growth-redis-1024-random load-to-25000000
-[00:08:57] growth-redis-1024-random loaded-25000000
-  25000000 keys: RSS 32264.7 MB (1352.2 B/key) used 31977.3 MB (1341.1 B/key) keys 25000000
-[00:09:07] growth-redis-1024-random load-to-50000000
-[00:09:51] growth-redis-1024-random loaded-50000000
-  50000000 keys: RSS 64502.9 MB (1352.2 B/key) used 63953.2 MB (1341.1 B/key) keys 50000000
-[00:10:02] growth-redis-1024-random end
-### 2026-11-02T00:10:07Z end (exit 0): ./growth.sh redis 1024 1000000,5000000,10000000,25000000,50000000
-### 2026-11-02T00:10:07Z start: ./growth.sh valkey 1024 1000000,5000000,10000000,25000000,50000000
-valkey plain valkey/valkey:9.1.3 redis_version:7.2.4 valkey_version:9.1.3 
-[valkey-server --port 6379 --bind 0.0.0.0 --protected-mode no --io-threads 8 --dir /data --save  --appendonly no]
-sampler started for growth-valkey-1024-random (pid 56747, /sys/fs/cgroup/system.slice/docker-6d8b4cd5d9c55b258c4f3501c1b2878cc452e6d8cc1f3e6183dcc3b8729f7c2a.scope)
-[00:10:16] growth-valkey-1024-random start
-[00:10:16] growth-valkey-1024-random load-to-1000000
-[00:10:18] growth-valkey-1024-random loaded-1000000
-  1000000 keys: RSS 1.4 MB (0.0 B/key) used 1276.4 MB (1336.6 B/key) keys 1000000
-[00:10:29] growth-valkey-1024-random load-to-5000000
-[00:10:34] growth-valkey-1024-random loaded-5000000
-  5000000 keys: RSS 1.4 MB (0.0 B/key) used 6366.3 MB (1334.8 B/key) keys 5000000
-[00:10:44] growth-valkey-1024-random load-to-10000000
-[00:10:51] growth-valkey-1024-random loaded-10000000
-  10000000 keys: RSS 1.4 MB (0.0 B/key) used 12731.6 MB (1334.8 B/key) keys 10000000
-[00:11:01] growth-valkey-1024-random load-to-25000000
-[00:11:18] growth-valkey-1024-random loaded-25000000
-  25000000 keys: RSS 1.4 MB (0.0 B/key) used 31793.2 MB (1333.4 B/key) keys 25000000
-[00:11:29] growth-valkey-1024-random load-to-50000000
-[00:11:59] growth-valkey-1024-random loaded-50000000
-  50000000 keys: RSS 1.4 MB (0.0 B/key) used 63585.5 MB (1333.4 B/key) keys 50000000
-[00:12:10] growth-valkey-1024-random end
-### 2026-11-02T00:12:15Z end (exit 0): ./growth.sh valkey 1024 1000000,5000000,10000000,25000000,50000000
-### 2026-11-02T00:12:15Z start: ./growth.sh dragonfly 1024 1000000,5000000,10000000,25000000,50000000
-dragonfly plain docker.dragonflydb.io/dragonflydb/dragonfly:v2.0.2 redis_version:7.4.0 dragonfly_version:df-v2.0.2 
-[dragonfly --logtostderr --port 6379 --proactor_threads 32 --dir /data --dbfilename ]
-sampler started for growth-dragonfly-1024-random (pid 57630, /sys/fs/cgroup/system.slice/docker-bb66634973efa4800f54c7b09b98674511e6bdb668f327c98d4778da3e2a43be.scope)
-[00:12:23] growth-dragonfly-1024-random start
-[00:12:24] growth-dragonfly-1024-random load-to-1000000
-[00:12:25] growth-dragonfly-1024-random loaded-1000000
-  1000000 keys: RSS 1.3 MB (0.0 B/key) used 1041.2 MB (1082.8 B/key) keys 1000000
-[00:12:36] growth-dragonfly-1024-random load-to-5000000
-[00:12:38] growth-dragonfly-1024-random loaded-5000000
-  5000000 keys: RSS 1.3 MB (0.0 B/key) used 5139.5 MB (1076.0 B/key) keys 5000000
-[00:12:48] growth-dragonfly-1024-random load-to-10000000
-[00:12:52] growth-dragonfly-1024-random loaded-10000000
-  10000000 keys: RSS 1.3 MB (0.0 B/key) used 10278.4 MB (1076.9 B/key) keys 10000000
-[00:13:02] growth-dragonfly-1024-random load-to-25000000
-[00:13:10] growth-dragonfly-1024-random loaded-25000000
-  25000000 keys: RSS 1.3 MB (0.0 B/key) used 25458.5 MB (1067.4 B/key) keys 25000000
-[00:13:21] growth-dragonfly-1024-random load-to-50000000
-[00:13:33] growth-dragonfly-1024-random loaded-50000000
-  50000000 keys: RSS 1.3 MB (0.0 B/key) used 50916.8 MB (1067.6 B/key) keys 50000000
-[00:13:44] growth-dragonfly-1024-random end
-### 2026-11-02T00:13:47Z end (exit 0): ./growth.sh dragonfly 1024 1000000,5000000,10000000,25000000,50000000
-### 2026-11-02T00:13:47Z start: ./growth.sh kividb-1.1.3 1024 1000000,5000000,10000000,25000000,50000000
-kividb-1.1.3 plain kividb/kividb:v1.1.3 redis_version:8.10.0 kividb_version:1.1.3 
-[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
-sampler started for growth-kividb-1.1.3-1024-random (pid 58646, /sys/fs/cgroup/system.slice/docker-06eaa5d082838435b9ceeeeb11fe5abe0cdef80ebf731dd66bca40d8879a17a2.scope)
-[00:13:56] growth-kividb-1.1.3-1024-random start
-[00:13:56] growth-kividb-1.1.3-1024-random load-to-1000000
-[00:13:57] growth-kividb-1.1.3-1024-random loaded-1000000
-  1000000 keys: RSS 1093.2 MB (1130.5 B/key) used 1069.1 MB (1118.1 B/key) keys 1000000
-[00:14:08] growth-kividb-1.1.3-1024-random load-to-5000000
-[00:14:11] growth-kividb-1.1.3-1024-random loaded-5000000
-  5000000 keys: RSS 5306.5 MB (1109.7 B/key) used 5251.9 MB (1100.8 B/key) keys 5000000
-[00:14:21] growth-kividb-1.1.3-1024-random load-to-10000000
-[00:14:25] growth-kividb-1.1.3-1024-random loaded-10000000
-  10000000 keys: RSS 10593.6 MB (1109.2 B/key) used 10500.8 MB (1100.8 B/key) keys 10000000
-[00:14:35] growth-kividb-1.1.3-1024-random load-to-25000000
-[00:14:43] growth-kividb-1.1.3-1024-random loaded-25000000
-  25000000 keys: RSS 26127.1 MB (1095.2 B/key) used 25919.7 MB (1087.0 B/key) keys 25000000
-[00:14:54] growth-kividb-1.1.3-1024-random load-to-50000000
-[00:15:09] growth-kividb-1.1.3-1024-random loaded-50000000
-  50000000 keys: RSS 52235.1 MB (1095.1 B/key) used 51836.5 MB (1087.0 B/key) keys 50000000
-[00:15:19] growth-kividb-1.1.3-1024-random end
-### 2026-11-02T00:15:23Z end (exit 0): ./growth.sh kividb-1.1.3 1024 1000000,5000000,10000000,25000000,50000000
-### 2026-11-02T00:15:23Z start: ./snapshot.sh redis
-redis persist redis:8.10.3 redis_version:8.10.3 
-[redis-server --port 6379 --bind 0.0.0.0 --protected-mode no --io-threads 8 --dir /data --save  --appendonly yes --auto-aof-rewrite-percentage 0]
-sampler started for snap-redis (pid 59538, /sys/fs/cgroup/system.slice/docker-e8ea63bc007e331f955aec4a95a6cde3784ab8efd296523aaa775aa9c9d434de.scope)
-[00:15:32] snap-redis load
-[00:17:30] snap-redis loaded
-[00:18:00] snap-redis bgsave-window-start
-[00:19:00] snap-redis bgsave-issued
-Background saving started
-[00:22:02] snap-redis bgsave-done
-[00:25:00] snap-redis bgsave-window-end
-[00:25:20] snap-redis aofrw-window-start
-[00:26:20] snap-redis aofrw-issued
-Background append only file rewriting started
-[00:29:21] snap-redis aofrw-done
-[00:32:21] snap-redis aofrw-window-end
-[00:32:41] snap-redis end
-### 2026-11-02T00:32:46Z end (exit 0): ./snapshot.sh redis
-### 2026-11-02T00:32:46Z start: ./snapshot.sh valkey
-valkey persist valkey/valkey:9.1.3 redis_version:7.2.4 valkey_version:9.1.3 
-[valkey-server --port 6379 --bind 0.0.0.0 --protected-mode no --io-threads 8 --dir /data --save  --appendonly yes --auto-aof-rewrite-percentage 0]
-sampler started for snap-valkey (pid 60280, /sys/fs/cgroup/system.slice/docker-73bae63395aaaea10f75071008c29edb2ccd58b813d80be190877b190f5d18d5.scope)
-[00:32:55] snap-valkey load
-[00:34:37] snap-valkey loaded
-[00:35:07] snap-valkey bgsave-window-start
-[00:36:07] snap-valkey bgsave-issued
-Background saving started
-[00:38:57] snap-valkey bgsave-done
-[00:42:07] snap-valkey bgsave-window-end
-[00:42:28] snap-valkey aofrw-window-start
-[00:43:28] snap-valkey aofrw-issued
-Background append only file rewriting started
-[00:46:15] snap-valkey aofrw-done
-[00:49:28] snap-valkey aofrw-window-end
-[00:49:49] snap-valkey end
-### 2026-11-02T00:49:53Z end (exit 0): ./snapshot.sh valkey
-### 2026-11-02T00:49:53Z start: ./snapshot.sh dragonfly
-dragonfly persist docker.dragonflydb.io/dragonflydb/dragonfly:v2.0.2 redis_version:7.4.0 dragonfly_version:df-v2.0.2 
-[dragonfly --logtostderr --port 6379 --proactor_threads 32 --dir /data --dbfilename dump]
-sampler started for snap-dragonfly (pid 60981, /sys/fs/cgroup/system.slice/docker-82fc83ef2d5ef5a230d7253b79ff63f766147f839b45686f194f4944bf87f243.scope)
-[00:50:02] snap-dragonfly load
-[00:50:17] snap-dragonfly loaded
-[00:50:47] snap-dragonfly bgsave-window-start
-[00:51:47] snap-dragonfly bgsave-issued
-OK
-[00:52:43] snap-dragonfly bgsave-done
-[00:57:48] snap-dragonfly bgsave-window-end
-[00:58:08] snap-dragonfly end
-### 2026-11-02T00:58:12Z end (exit 0): ./snapshot.sh dragonfly
-### 2026-11-02T00:58:12Z start: ./snapshot.sh kividb-1.1.3
-Could not connect to Redis at 127.0.0.1:6379: Connection refused
-sampler started for snap-kividb-1.1.3 (pid 0, /sys/fs/cgroup/system.slice/docker-306b7bdf3158a82da3b4955b357c69b8b5f3cb5854055df003fd1bc46b3bd634.scope)
-[00:59:21] snap-kividb-1.1.3 load
-[00:59:28] snap-kividb-1.1.3 loaded
-[00:59:58] snap-kividb-1.1.3 bgsave-window-start
-[01:00:58] snap-kividb-1.1.3 bgsave-issued
-Could not connect to Redis at 10.30.0.4:6379: Connection refused
-[01:00:59] snap-kividb-1.1.3 bgsave-done
-Could not connect to Redis at 10.30.0.4:6379: Connection refused
-[01:00:59] snap-kividb-1.1.3 bgsave-window-end
-[01:01:19] snap-kividb-1.1.3 aofrw-window-start
-[01:02:19] snap-kividb-1.1.3 aofrw-issued
-Could not connect to Redis at 10.30.0.4:6379: Connection refused
-[01:02:21] snap-kividb-1.1.3 aofrw-done
-Could not connect to Redis at 10.30.0.4:6379: Connection refused
-[01:02:21] snap-kividb-1.1.3 aofrw-window-end
-[01:02:41] snap-kividb-1.1.3 end
-### 2026-11-02T01:02:44Z end (exit 0): ./snapshot.sh kividb-1.1.3
-### 2026-11-02T01:02:44Z start: ./evict.sh kividb-1.1.3
-kividb-1.1.3 plain kividb/kividb:v1.1.3 redis_version:8.10.0 kividb_version:1.1.3 
-[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
-sampler started for evict-kividb-1.1.3 (pid 63323, /sys/fs/cgroup/system.slice/docker-1dbb4cadce228fb66aad1569a4980841d2b68a568ab3917640ed1e9649e3bf0e.scope)
-[01:02:53] evict-kividb-1.1.3 load
-[01:03:00] evict-kividb-1.1.3 loaded
+sampler started for evict-kividb-cand-r2 (pid 73874, /sys/fs/cgroup/system.slice/docker-518d846343528c600e4d00deb3642bcc88b00bb859ebbbf894154cf58e84a22b.scope)
+[18:29:51] evict-kividb-cand-r2 load
+[18:29:55] evict-kividb-cand-r2 loaded
 OK
 OK
-used_memory=11010901411 maxmemory=12111991552
+used_memory=10714044333 maxmemory=11785448766
 evicted_keys:0
 dbsize_before=10000000
-[01:03:20] evict-kividb-1.1.3 writes-start
-[01:04:20] evict-kividb-1.1.3 bgsave-issued
+[18:30:15] evict-kividb-cand-r2 writes-start
+[18:31:15] evict-kividb-cand-r2 bgsave-issued
 Background saving started
-[01:05:00] evict-kividb-1.1.3 bgsave-done
-[01:08:20] evict-kividb-1.1.3 writes-end
-dbsize_after=9992201
-evicted_keys:7984
-used_memory:11016024355
-maxmemory:12111991552
-mem_not_counted_for_evict:0
-[01:08:25] evict-kividb-1.1.3 end
-### 2026-11-02T01:08:30Z end (exit 0): ./evict.sh kividb-1.1.3
-### 2026-11-02T01:08:30Z start: ./evict.sh redis
-redis plain redis:8.10.3 redis_version:8.10.3 
-[redis-server --port 6379 --bind 0.0.0.0 --protected-mode no --io-threads 8 --dir /data --save  --appendonly no]
-sampler started for evict-redis (pid 63977, /sys/fs/cgroup/system.slice/docker-a3075d867b0221deac31db0c1de0a0c0a9ddf99f6875f773460f2baa33d12790.scope)
-[01:08:38] evict-redis load
-[01:08:55] evict-redis loaded
-OK
-OK
-used_memory=13455983256 maxmemory=14801581581
-evicted_keys:0
-dbsize_before=10000000
-[01:09:15] evict-redis writes-start
-[01:10:15] evict-redis bgsave-issued
-Background saving started
-[01:11:05] evict-redis bgsave-done
-[01:14:15] evict-redis writes-end
+[18:31:34] evict-kividb-cand-r2 bgsave-done
+[18:35:16] evict-kividb-cand-r2 writes-end
 dbsize_after=10000000
 evicted_keys:0
-used_memory:13375767968
-maxmemory:14801581581
+used_memory:10716190257
+maxmemory:11785448766
 mem_not_counted_for_evict:0
-[01:14:20] evict-redis end
-### 2026-11-02T01:14:24Z end (exit 0): ./evict.sh redis
-### 2026-11-02T03:30:58Z start: ./mixed.sh kividb-rc4
-kividb-rc4 plain kividb/kividb:v1.2.0-rc4 redis_version:8.10.0 kividb_version:1.2.0-rc4 
+[18:35:21] evict-kividb-cand-r2 end
+### 2026-11-02T18:35:24Z end (exit 0): R=r2 ./evict.sh kividb-cand
+### 2026-11-02T18:35:24Z start: ./warefeats.sh 10.30.0.4 25 full kividb-cand-run3 kividb-rc4-run3 > /var/tmp/wf-r3.log 2>&1
+### 2026-11-02T19:05:58Z end (exit 0): ./warefeats.sh 10.30.0.4 25 full kividb-cand-run3 kividb-rc4-run3 > /var/tmp/wf-r3.log 2>&1
+### 2026-11-02T19:05:58Z start: R=r3 ./growth.sh kividb-cand 100 1000000,5000000,10000000,25000000,50000000
+kividb-cand plain kividb/kividb:build-75482abbb258 redis_version:8.10.0 kividb_version:1.2.0-rc6 
 [--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
-sampler started for mixed-kividb-rc4 (pid 65279, /sys/fs/cgroup/system.slice/docker-6d4ac48de942db590c2b2b2b8e36f7be198daea6aa706c382e8220fc57c255d7.scope)
-[03:31:07] mixed-kividb-rc4 load
-[03:31:10] mixed-kividb-rc4 loaded
-[03:31:40] mixed-kividb-rc4 mixed-start
-[03:51:40] mixed-kividb-rc4 mixed-end
-[03:52:10] mixed-kividb-rc4 end
-### 2026-11-02T03:52:14Z end (exit 0): ./mixed.sh kividb-rc4
-### 2026-11-02T03:52:14Z start: ./snapshot.sh kividb-rc4 # rerun with --aof
-kividb-rc4 persist kividb/kividb:v1.2.0-rc4 redis_version:8.10.0 kividb_version:1.2.0-rc4 
+sampler started for growth-kividb-cand-100-random-r3 (pid 77467, /sys/fs/cgroup/system.slice/docker-b75c7721e01854d1173b3cea2c57957f85d20b6bfd91e28a73d2e0fbf7cefe58.scope)
+[19:06:06] growth-kividb-cand-100-random-r3 start
+[19:06:06] growth-kividb-cand-100-random-r3 load-to-1000000
+[19:06:07] growth-kividb-cand-100-random-r3 loaded-1000000
+  1000000 keys: RSS 162.7 MB (153.3 B/key) used 142.9 MB (146.9 B/key) keys 1000000
+[19:06:18] growth-kividb-cand-100-random-r3 load-to-5000000
+[19:06:19] growth-kividb-cand-100-random-r3 loaded-5000000
+  5000000 keys: RSS 714.8 MB (146.4 B/key) used 685.2 MB (143.1 B/key) keys 5000000
+[19:06:29] growth-kividb-cand-100-random-r3 load-to-10000000
+[19:06:31] growth-kividb-cand-100-random-r3 loaded-10000000
+  10000000 keys: RSS 1400.6 MB (145.1 B/key) used 1367.6 MB (143.1 B/key) keys 10000000
+[19:06:41] growth-kividb-cand-100-random-r3 load-to-25000000
+[19:06:44] growth-kividb-cand-100-random-r3 loaded-25000000
+  25000000 keys: RSS 3379.4 MB (141.1 B/key) used 3342.6 MB (140.1 B/key) keys 25000000
+[19:06:54] growth-kividb-cand-100-random-r3 load-to-50000000
+[19:07:00] growth-kividb-cand-100-random-r3 loaded-50000000
+  50000000 keys: RSS 6725.6 MB (140.7 B/key) used 6682.4 MB (140.1 B/key) keys 50000000
+[19:07:11] growth-kividb-cand-100-random-r3 end
+### 2026-11-02T19:07:14Z end (exit 0): R=r3 ./growth.sh kividb-cand 100 1000000,5000000,10000000,25000000,50000000
+### 2026-11-02T19:07:14Z start: R=r3 ./growth.sh kividb-rc4 100 1000000,5000000,10000000,25000000,50000000
+kividb-rc4 plain kividb/kividb:build-a6b1bf388582 redis_version:8.10.0 kividb_version:1.2.0-rc4 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+sampler started for growth-kividb-rc4-100-random-r3 (pid 78357, /sys/fs/cgroup/system.slice/docker-e2d65b943b10fc254003b4ca5de058c74152f514074363822802c54f384324db.scope)
+[19:07:22] growth-kividb-rc4-100-random-r3 start
+[19:07:22] growth-kividb-rc4-100-random-r3 load-to-1000000
+[19:07:24] growth-kividb-rc4-100-random-r3 loaded-1000000
+  1000000 keys: RSS 162.9 MB (153.5 B/key) used 142.9 MB (146.9 B/key) keys 1000000
+[19:07:34] growth-kividb-rc4-100-random-r3 load-to-5000000
+[19:07:35] growth-kividb-rc4-100-random-r3 loaded-5000000
+  5000000 keys: RSS 714.9 MB (146.5 B/key) used 685.2 MB (143.1 B/key) keys 5000000
+[19:07:46] growth-kividb-rc4-100-random-r3 load-to-10000000
+[19:07:47] growth-kividb-rc4-100-random-r3 loaded-10000000
+  10000000 keys: RSS 1398.1 MB (144.9 B/key) used 1367.6 MB (143.1 B/key) keys 10000000
+[19:07:57] growth-kividb-rc4-100-random-r3 load-to-25000000
+[19:08:01] growth-kividb-rc4-100-random-r3 loaded-25000000
+  25000000 keys: RSS 3377.7 MB (141.0 B/key) used 3342.6 MB (140.1 B/key) keys 25000000
+[19:08:11] growth-kividb-rc4-100-random-r3 load-to-50000000
+[19:08:17] growth-kividb-rc4-100-random-r3 loaded-50000000
+  50000000 keys: RSS 6724.9 MB (140.7 B/key) used 6682.4 MB (140.1 B/key) keys 50000000
+[19:08:27] growth-kividb-rc4-100-random-r3 end
+### 2026-11-02T19:08:30Z end (exit 0): R=r3 ./growth.sh kividb-rc4 100 1000000,5000000,10000000,25000000,50000000
+### 2026-11-02T19:08:30Z start: R=r3 ./growth.sh kividb-cand 1024 1000000,5000000,10000000,25000000,50000000
+kividb-cand plain kividb/kividb:build-75482abbb258 redis_version:8.10.0 kividb_version:1.2.0-rc6 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+sampler started for growth-kividb-cand-1024-random-r3 (pid 79244, /sys/fs/cgroup/system.slice/docker-3b67a66474750ca7936d0a11f972326304a032cd64789cda2d9c41122d945442.scope)
+[19:08:38] growth-kividb-cand-1024-random-r3 start
+[19:08:39] growth-kividb-cand-1024-random-r3 load-to-1000000
+[19:08:40] growth-kividb-cand-1024-random-r3 loaded-1000000
+  1000000 keys: RSS 1052.2 MB (1086.1 B/key) used 1027.9 MB (1074.9 B/key) keys 1000000
+[19:08:50] growth-kividb-cand-1024-random-r3 load-to-5000000
+[19:08:53] growth-kividb-cand-1024-random-r3 loaded-5000000
+  5000000 keys: RSS 5156.6 MB (1078.0 B/key) used 5110.3 MB (1071.1 B/key) keys 5000000
+[19:09:03] growth-kividb-cand-1024-random-r3 load-to-10000000
+[19:09:05] growth-kividb-cand-1024-random-r3 loaded-10000000
+  10000000 keys: RSS 10280.2 MB (1076.2 B/key) used 10217.7 MB (1071.1 B/key) keys 10000000
+[19:09:16] growth-kividb-cand-1024-random-r3 load-to-25000000
+[19:09:22] growth-kividb-cand-1024-random-r3 loaded-25000000
+  25000000 keys: RSS 25576.3 MB (1072.1 B/key) used 25468.0 MB (1068.1 B/key) keys 25000000
+[19:09:33] growth-kividb-cand-1024-random-r3 load-to-50000000
+[19:09:43] growth-kividb-cand-1024-random-r3 loaded-50000000
+  50000000 keys: RSS 51117.7 MB (1071.7 B/key) used 50933.1 MB (1068.1 B/key) keys 50000000
+[19:09:53] growth-kividb-cand-1024-random-r3 end
+### 2026-11-02T19:09:58Z end (exit 0): R=r3 ./growth.sh kividb-cand 1024 1000000,5000000,10000000,25000000,50000000
+### 2026-11-02T19:09:58Z start: R=r3 ./growth.sh kividb-rc4 1024 1000000,5000000,10000000,25000000,50000000
+kividb-rc4 plain kividb/kividb:build-a6b1bf388582 redis_version:8.10.0 kividb_version:1.2.0-rc4 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+sampler started for growth-kividb-rc4-1024-random-r3 (pid 80133, /sys/fs/cgroup/system.slice/docker-687c5da3d73ebcb68f3eeef4be68eb3829cef6c06fa09a4b55dfe88464aeaf9e.scope)
+[19:10:06] growth-kividb-rc4-1024-random-r3 start
+[19:10:06] growth-kividb-rc4-1024-random-r3 load-to-1000000
+[19:10:08] growth-kividb-rc4-1024-random-r3 loaded-1000000
+  1000000 keys: RSS 1052.0 MB (1085.9 B/key) used 1027.9 MB (1074.9 B/key) keys 1000000
+[19:10:19] growth-kividb-rc4-1024-random-r3 load-to-5000000
+[19:10:21] growth-kividb-rc4-1024-random-r3 loaded-5000000
+  5000000 keys: RSS 5154.8 MB (1077.6 B/key) used 5110.3 MB (1071.1 B/key) keys 5000000
+[19:10:31] growth-kividb-rc4-1024-random-r3 load-to-10000000
+[19:10:34] growth-kividb-rc4-1024-random-r3 loaded-10000000
+  10000000 keys: RSS 10280.1 MB (1076.2 B/key) used 10217.7 MB (1071.1 B/key) keys 10000000
+[19:10:44] growth-kividb-rc4-1024-random-r3 load-to-25000000
+[19:10:50] growth-kividb-rc4-1024-random-r3 loaded-25000000
+  25000000 keys: RSS 25577.4 MB (1072.1 B/key) used 25468.0 MB (1068.1 B/key) keys 25000000
+[19:11:00] growth-kividb-rc4-1024-random-r3 load-to-50000000
+[19:11:11] growth-kividb-rc4-1024-random-r3 loaded-50000000
+  50000000 keys: RSS 51118.9 MB (1071.7 B/key) used 50933.1 MB (1068.1 B/key) keys 50000000
+[19:11:21] growth-kividb-rc4-1024-random-r3 end
+### 2026-11-02T19:11:26Z end (exit 0): R=r3 ./growth.sh kividb-rc4 1024 1000000,5000000,10000000,25000000,50000000
+### 2026-11-02T19:11:26Z start: R=r3 WIN=300 PRE=30 ./snapshot.sh kividb-cand
+kividb-cand persist kividb/kividb:build-75482abbb258 redis_version:8.10.0 kividb_version:1.2.0-rc6 
 [--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data --aof --aof-rewrite-percentage 0]
-sampler started for snap-kividb-rc4 (pid 66249, /sys/fs/cgroup/system.slice/docker-9039cddbd8705e99ce15d81be5039f825ddae64feb9c3bfdfe5a48816b535c27.scope)
-[03:52:23] snap-kividb-rc4 load
-[03:53:01] snap-kividb-rc4 loaded
-[03:53:31] snap-kividb-rc4 bgsave-window-start
-[03:54:31] snap-kividb-rc4 bgsave-issued
+sampler started for snap-kividb-cand-r3 (pid 81038, /sys/fs/cgroup/system.slice/docker-e539ecf019d41d1cad8c00b81a0c38cf0a2de5be50695054d6ddaae04e281491.scope)
+[19:11:34] snap-kividb-cand-r3 load
+[19:12:03] snap-kividb-cand-r3 loaded
+[19:12:33] snap-kividb-cand-r3 bgsave-window-start
+[19:13:03] snap-kividb-cand-r3 bgsave-issued
 Background saving started
-[03:55:47] snap-kividb-rc4 bgsave-done
-[04:00:32] snap-kividb-rc4 bgsave-window-end
-[04:00:52] snap-kividb-rc4 aofrw-window-start
-[04:01:52] snap-kividb-rc4 aofrw-issued
+[19:14:13] snap-kividb-cand-r3 bgsave-done
+[19:17:33] snap-kividb-cand-r3 bgsave-window-end
+[19:17:53] snap-kividb-cand-r3 aofrw-window-start
+[19:18:23] snap-kividb-cand-r3 aofrw-issued
 Background append only file rewriting started
-[04:03:10] snap-kividb-rc4 aofrw-done
-[04:07:52] snap-kividb-rc4 aofrw-window-end
-[04:08:13] snap-kividb-rc4 end
-### 2026-11-02T04:08:21Z end (exit 0): ./snapshot.sh kividb-rc4 # rerun with --aof
-### 2026-11-02T04:08:21Z start: ./snapshot.sh kividb-1.1.3 # rerun with --aof
-kividb-1.1.3 persist kividb/kividb:v1.1.3 redis_version:8.10.0 kividb_version:1.1.3 
+[19:19:35] snap-kividb-cand-r3 aofrw-done
+[19:22:54] snap-kividb-cand-r3 aofrw-window-end
+[19:23:14] snap-kividb-cand-r3 end
+### 2026-11-02T19:23:21Z end (exit 0): R=r3 WIN=300 PRE=30 ./snapshot.sh kividb-cand
+### 2026-11-02T19:23:21Z start: R=r3 WIN=300 PRE=30 ./snapshot.sh kividb-rc4
+kividb-rc4 persist kividb/kividb:build-a6b1bf388582 redis_version:8.10.0 kividb_version:1.2.0-rc4 
 [--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data --aof --aof-rewrite-percentage 0]
-sampler started for snap-kividb-1.1.3 (pid 67105, /sys/fs/cgroup/system.slice/docker-6bf6650e4177fd87de1bf4b59d0e5aee70d2ec3d0356ceb35acbf7abda05e094.scope)
-[04:08:30] snap-kividb-1.1.3 load
-[04:09:01] snap-kividb-1.1.3 loaded
-[04:09:31] snap-kividb-1.1.3 bgsave-window-start
-[04:10:31] snap-kividb-1.1.3 bgsave-issued
+sampler started for snap-kividb-rc4-r3 (pid 81882, /sys/fs/cgroup/system.slice/docker-d802d7a035bdb0eabcfdc68e00b413a8ccbb116ec5f4d8e040cd89f79911ac66.scope)
+[19:23:29] snap-kividb-rc4-r3 load
+[19:23:58] snap-kividb-rc4-r3 loaded
+[19:24:28] snap-kividb-rc4-r3 bgsave-window-start
+[19:24:58] snap-kividb-rc4-r3 bgsave-issued
 Background saving started
-[04:12:04] snap-kividb-1.1.3 bgsave-done
-[04:16:31] snap-kividb-1.1.3 bgsave-window-end
-[04:16:51] snap-kividb-1.1.3 aofrw-window-start
-[04:17:51] snap-kividb-1.1.3 aofrw-issued
+[19:26:08] snap-kividb-rc4-r3 bgsave-done
+[19:29:28] snap-kividb-rc4-r3 bgsave-window-end
+[19:29:48] snap-kividb-rc4-r3 aofrw-window-start
+[19:30:18] snap-kividb-rc4-r3 aofrw-issued
 Background append only file rewriting started
-[04:19:19] snap-kividb-1.1.3 aofrw-done
-[04:23:52] snap-kividb-1.1.3 aofrw-window-end
-[04:24:13] snap-kividb-1.1.3 end
-### 2026-11-02T04:24:21Z end (exit 0): ./snapshot.sh kividb-1.1.3 # rerun with --aof
-### 2026-11-02T04:24:21Z start: ./mixed.sh dragonfly
-dragonfly plain docker.dragonflydb.io/dragonflydb/dragonfly:v2.0.2 redis_version:7.4.0 dragonfly_version:df-v2.0.2 
-[dragonfly --logtostderr --port 6379 --proactor_threads 32 --dir /data --dbfilename ]
-sampler started for mixed-dragonfly (pid 67919, /sys/fs/cgroup/system.slice/docker-74e0dfd19e3281e10bf66bb0a2675d7ea775a09e09d7e34fdb3d13fc0d171f72.scope)
-[04:24:30] mixed-dragonfly load
-[04:24:33] mixed-dragonfly loaded
-[04:25:03] mixed-dragonfly mixed-start
+[19:31:31] snap-kividb-rc4-r3 aofrw-done
+[19:34:49] snap-kividb-rc4-r3 aofrw-window-end
+[19:35:09] snap-kividb-rc4-r3 end
+### 2026-11-02T19:35:16Z end (exit 0): R=r3 WIN=300 PRE=30 ./snapshot.sh kividb-rc4
+### 2026-11-02T19:35:16Z start: R=r3 ./evict.sh kividb-cand
+kividb-cand plain kividb/kividb:build-75482abbb258 redis_version:8.10.0 kividb_version:1.2.0-rc6 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+sampler started for evict-kividb-cand-r3 (pid 82721, /sys/fs/cgroup/system.slice/docker-50e2f5ad5824207388440b31c2e6f710365045f2e853506209abecb185b898a6.scope)
+[19:35:25] evict-kividb-cand-r3 load
+[19:35:29] evict-kividb-cand-r3 loaded
+OK
+OK
+used_memory=10714042317 maxmemory=11785446548
+evicted_keys:0
+dbsize_before=10000000
+[19:35:49] evict-kividb-cand-r3 writes-start
+[19:36:49] evict-kividb-cand-r3 bgsave-issued
+Background saving started
+[19:37:08] evict-kividb-cand-r3 bgsave-done
+[19:40:50] evict-kividb-cand-r3 writes-end
+dbsize_after=10000000
+evicted_keys:0
+used_memory:10716189357
+maxmemory:11785446548
+mem_not_counted_for_evict:0
+[19:40:55] evict-kividb-cand-r3 end
+### 2026-11-02T19:40:58Z end (exit 0): R=r3 ./evict.sh kividb-cand
+### 2026-11-02T19:40:58Z start: R=r3 ./evict.sh kividb-rc4
+kividb-rc4 plain kividb/kividb:build-a6b1bf388582 redis_version:8.10.0 kividb_version:1.2.0-rc4 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+sampler started for evict-kividb-rc4-r3 (pid 83816, /sys/fs/cgroup/system.slice/docker-e232cbb10d57fb238362f58563270973d6f2f4e2efa809e91b23368ebcab06e4.scope)
+[19:41:07] evict-kividb-rc4-r3 load
+[19:41:11] evict-kividb-rc4-r3 loaded
+OK
+OK
+used_memory=10714043181 maxmemory=11785447499
+evicted_keys:0
+dbsize_before=10000000
+[19:41:31] evict-kividb-rc4-r3 writes-start
+[19:42:31] evict-kividb-rc4-r3 bgsave-issued
+Background saving started
+[19:42:51] evict-kividb-rc4-r3 bgsave-done
+[19:46:32] evict-kividb-rc4-r3 writes-end
+dbsize_after=10000000
+evicted_keys:0
+used_memory:10716191957
+maxmemory:11785447499
+mem_not_counted_for_evict:0
+[19:46:37] evict-kividb-rc4-r3 end
+### 2026-11-02T19:46:40Z end (exit 0): R=r3 ./evict.sh kividb-rc4
+STOP 2026-11-02T19:46:41Z

@@ -19,7 +19,7 @@ for spec in mem-srv:Standard_E32ds_v7:10.30.0.4 mem-cli:Standard_D32ls_v7:10.30.
     --ssh-key-values "$KEY" --vnet-name mem-vnet --subnet s --nsg mem-nsg --private-ip-address "$IP" \
     --public-ip-sku Standard --accelerated-networking true --ppg mem-ppg \
     --os-disk-size-gb 128 --storage-sku Premium_LRS -o table
-  # backstop: shut down 9 hours from now even if teardown is forgotten
-  az vm auto-shutdown -g "$RG" -n "$N" --time "$(date -u -d '+9 hours' +%H%M)" -o none
+  # backstop: shut down 14 hours from now even if teardown is forgotten
+  az vm auto-shutdown -g "$RG" -n "$N" --time "$(date -u -d '+14 hours' +%H%M)" -o none
 done
 az vm list-ip-addresses -g "$RG" -o table

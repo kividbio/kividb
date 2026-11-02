@@ -1,6 +1,6 @@
 #!/bin/bash
 # maxmemory + snapshot: does a snapshot under a write load make the engine evict keys that fit? (issue #284)
-#   evict.sh <engine> [keys=10000000] [value-bytes=1024] [headroom-pct=10]
+#   [R=<round>] evict.sh <engine> [keys=10000000] [value-bytes=1024] [headroom-pct=10]
 # Load <keys> keys with no limit, then set maxmemory to used_memory + <headroom-pct>% with allkeys-lru,
 # and run 100,000 SET/s of same-size overwrites (nothing grows) for 300 s with BGSAVE at +60 s.
 # No AOF (as in the issue's report); the snapshot goes to the data directory.
@@ -8,7 +8,7 @@
 set -uo pipefail
 . "$(dirname "$0")/lib.sh"
 E=$1; N=${2:-10000000}; V=${3:-1024}; H=${4:-10}
-RUN=evict-$E
+RUN=evict-$E${R:+-$R}
 srv /opt/mem/eng.sh stop
 srv /opt/mem/eng.sh start "$E" plain | tee "$OUT/$RUN.engine.txt"
 srv /opt/mem/mon.sh start "$RUN"

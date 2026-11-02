@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-11-01T22:26:04.857Z",
+  "generatedAt": "2026-11-02T15:26:46.153Z",
   "smoke": false,
   "sessionCount": 1,
   "resultCount": 5,
@@ -24,8 +24,8 @@
       ],
       "engineStats": {
         "rssMb": 0,
-        "usedMemoryMb": 159.06678009033203,
-        "usedMemoryRssMb": 182.36328125,
+        "usedMemoryMb": 159.06806182861328,
+        "usedMemoryRssMb": 182.453125,
         "keyCount": 1000000,
         "hitRatio": 0
       },
@@ -42,12 +42,12 @@
       },
       "metrics": {
         "usedMemoryDeltaMb": {
-          "value": 157.66,
+          "value": 157.67,
           "unit": "MB",
           "label": "Used memory (delta)"
         },
         "rssDeltaMb": {
-          "value": 158.02,
+          "value": 158.55,
           "unit": "MB",
           "label": "RSS (delta)"
         },
@@ -57,7 +57,7 @@
           "label": "Baseline used memory"
         },
         "baselineRssMb": {
-          "value": 24.35,
+          "value": 23.9,
           "unit": "MB",
           "label": "Baseline RSS"
         },
@@ -67,7 +67,7 @@
           "label": "Key count"
         },
         "bytesPerKeyRss": {
-          "value": 165.7,
+          "value": 166.3,
           "unit": "B/key",
           "label": "Memory per key (RSS)"
         },
@@ -77,7 +77,7 @@
           "label": "Memory per key (used_memory)"
         },
         "absoluteRssMb": {
-          "value": 182.36,
+          "value": 182.45,
           "unit": "MB",
           "label": "RSS after the first load (absolute)"
         },
@@ -87,12 +87,12 @@
           "label": "Used memory after the first load (absolute)"
         },
         "rssDeltaSecondMb": {
-          "value": 158.73,
+          "value": 158.55,
           "unit": "MB",
           "label": "RSS (delta, second load)"
         },
         "usedMemoryDeltaSecondMb": {
-          "value": 158.39,
+          "value": 158.38,
           "unit": "MB",
           "label": "Used memory (delta, second load)"
         },
@@ -102,7 +102,7 @@
           "label": "Key count (second load)"
         },
         "bytesPerKeyRssSecond": {
-          "value": 166.4,
+          "value": 166.3,
           "unit": "B/key",
           "label": "Memory per key (RSS, second load)"
         },
@@ -122,50 +122,50 @@
       "label": "redis/set-get-small",
       "engine": "redis",
       "workload": "set-get-small",
-      "opsPerSec": 161209.19,
-      "p50Ms": 1.223,
-      "p99Ms": 1.859,
-      "p999Ms": 2.159,
+      "opsPerSec": 176721.58500000002,
+      "p50Ms": 1.115,
+      "p99Ms": 1.623,
+      "p999Ms": 1.827,
       "samplesOpsPerSec": [
-        158856.84,
-        165522.5,
-        165159.66,
-        165415.23,
-        158042.26,
-        156932.06,
-        163030.45,
-        161521.66,
-        159352.8,
-        160896.72
+        177852.52,
+        177310.85,
+        177900.77,
+        177666.02,
+        176007.7,
+        176917.63,
+        175714.09,
+        176525.54,
+        175690.44,
+        176104.27
       ],
       "samplesP99Ms": [
-        1.887,
-        1.799,
-        1.799,
-        1.799,
-        1.943,
-        2.015,
-        1.823,
-        1.855,
-        1.863,
-        1.863
+        1.623,
+        1.615,
+        1.639,
+        1.631,
+        1.623,
+        1.623,
+        1.623,
+        1.631,
+        1.615,
+        1.647
       ],
       "samplesClientCpuPct": [
-        10.7,
+        10.5,
+        10.5,
+        11.2,
         9.2,
         10.4,
-        9.2,
-        10.2,
-        9.7,
-        9.7,
-        9.1,
-        8.8,
-        9.4
+        10.7,
+        10,
+        10.4,
+        10.1,
+        10.6
       ],
       "engineStats": {
         "rssMb": 0,
-        "usedMemoryMb": 16.598602294921875,
-        "usedMemoryRssMb": 41.71484375,
+        "usedMemoryMb": 16.597640991210938,
+        "usedMemoryRssMb": 41.1875,
         "keyCount": 100000,
         "hitRatio": 1
       },
@@ -182,12 +182,12 @@
       },
       "metrics": {
         "throughput": {
-          "value": 161209.19,
+          "value": 176721.58500000002,
           "unit": "ops/s",
           "label": "Throughput"
         },
         "kbPerSec": {
-          "value": 22251.805,
+          "value": 24393.004999999997,
           "unit": "KB/s",
           "label": "Bandwidth"
         },
@@ -197,7 +197,7 @@
           "label": "Hit ratio"
         },
         "clientCpu": {
-          "value": 9.6,
+          "value": 10.4,
           "unit": "%",
           "label": "Client CPU"
         }
@@ -207,50 +207,50 @@
       "label": "redis/set-get-large",
       "engine": "redis",
       "workload": "set-get-large",
-      "opsPerSec": 83939.795,
-      "p50Ms": 2.135,
-      "p99Ms": 4.191,
-      "p999Ms": 4.591,
+      "opsPerSec": 118855.965,
+      "p50Ms": 1.679,
+      "p99Ms": 2.543,
+      "p999Ms": 2.767,
       "samplesOpsPerSec": [
-        84394.08,
-        83586.78,
-        84872.05,
-        83696.95,
-        84182.64,
-        85624.51,
-        87023.48,
-        82008.67,
-        80690.75,
-        82738.12
+        119407.45,
+        118059.31,
+        118749.09,
+        119231.89,
+        118715.23,
+        118971.25,
+        118962.84,
+        119147.78,
+        118428.94,
+        118456.61
       ],
       "samplesP99Ms": [
-        4.159,
-        4.223,
-        4.095,
-        4.223,
-        4.159,
-        4.063,
-        3.967,
-        4.319,
-        4.383,
-        4.255
+        2.511,
+        2.559,
+        2.543,
+        2.543,
+        2.543,
+        2.543,
+        2.527,
+        2.527,
+        2.559,
+        2.543
       ],
       "samplesClientCpuPct": [
-        8,
-        7.6,
-        7.8,
-        7.9,
-        8.2,
-        8.2,
-        8.4,
-        8.1,
-        7.9,
-        8.4
+        14.4,
+        13.5,
+        14.6,
+        14.3,
+        13.6,
+        13.4,
+        14,
+        14.6,
+        13.7,
+        13.8
       ],
       "engineStats": {
         "rssMb": 0,
-        "usedMemoryMb": 472.03141021728516,
-        "usedMemoryRssMb": 503.1875,
+        "usedMemoryMb": 472.02942657470703,
+        "usedMemoryRssMb": 505.41015625,
         "keyCount": 40000,
         "hitRatio": 1
       },
@@ -267,12 +267,12 @@
       },
       "metrics": {
         "throughput": {
-          "value": 83939.795,
+          "value": 118855.965,
           "unit": "ops/s",
           "label": "Throughput"
         },
         "kbPerSec": {
-          "value": 842937.3049999999,
+          "value": 1193571.23,
           "unit": "KB/s",
           "label": "Bandwidth"
         },
@@ -282,7 +282,7 @@
           "label": "Hit ratio"
         },
         "clientCpu": {
-          "value": 8.1,
+          "value": 14,
           "unit": "%",
           "label": "Client CPU"
         }
@@ -292,50 +292,50 @@
       "label": "redis/pipeline-30",
       "engine": "redis",
       "workload": "pipeline-30",
-      "opsPerSec": 1504429.2650000001,
-      "p50Ms": 3.391,
-      "p99Ms": 9.471,
-      "p999Ms": 10.623,
+      "opsPerSec": 1604362.065,
+      "p50Ms": 3.695,
+      "p99Ms": 7.9990000000000006,
+      "p999Ms": 8.959,
       "samplesOpsPerSec": [
-        1492252.12,
-        1485044.36,
-        1499671.59,
-        1502980.17,
-        1455941.68,
-        1505878.36,
-        1513745.86,
-        1508823.35,
-        1510235.32,
-        1506508.48
+        1601852.31,
+        1592555.88,
+        1633734.6,
+        1699403.79,
+        1685675.61,
+        1682720.23,
+        1587161.82,
+        1606871.82,
+        1588556.85,
+        1582140.16
       ],
       "samplesP99Ms": [
-        9.471,
-        9.535,
-        9.471,
-        9.471,
-        9.919,
-        9.471,
-        9.343,
-        9.279,
-        9.535,
-        9.471
+        7.967,
+        8.031,
+        7.519,
+        7.071,
+        7.199,
+        7.263,
+        8.063,
+        8.319,
+        8.191,
+        8.319
       ],
       "samplesClientCpuPct": [
-        6.3,
-        6.1,
-        6.1,
-        6.3,
         6,
-        6.3,
-        6.3,
-        6.4,
         6.2,
+        6.1,
+        5.7,
+        6.1,
+        5.5,
+        6.3,
+        6.3,
+        6.1,
         6.3
       ],
       "engineStats": {
         "rssMb": 0,
-        "usedMemoryMb": 16.598907470703125,
-        "usedMemoryRssMb": 45.0546875,
+        "usedMemoryMb": 16.597946166992188,
+        "usedMemoryRssMb": 44.68359375,
         "keyCount": 100000,
         "hitRatio": 1
       },
@@ -352,12 +352,12 @@
       },
       "metrics": {
         "throughput": {
-          "value": 1504429.2650000001,
+          "value": 1604362.065,
           "unit": "ops/s",
           "label": "Throughput"
         },
         "kbPerSec": {
-          "value": 207657.56,
+          "value": 221451.41999999998,
           "unit": "KB/s",
           "label": "Bandwidth"
         },
@@ -367,7 +367,7 @@
           "label": "Hit ratio"
         },
         "clientCpu": {
-          "value": 6.2,
+          "value": 6.1,
           "unit": "%",
           "label": "Client CPU"
         }
@@ -392,8 +392,8 @@
       ],
       "engineStats": {
         "rssMb": 0,
-        "usedMemoryMb": 159.05902862548828,
-        "usedMemoryRssMb": 182.3984375,
+        "usedMemoryMb": 159.0694351196289,
+        "usedMemoryRssMb": 182.9609375,
         "keyCount": 1000000,
         "hitRatio": 0
       },
@@ -410,12 +410,12 @@
       },
       "metrics": {
         "usedMemoryDeltaMb": {
-          "value": 157.66,
+          "value": 157.67,
           "unit": "MB",
           "label": "Used memory (delta)"
         },
         "rssDeltaMb": {
-          "value": 157.76,
+          "value": 158.27,
           "unit": "MB",
           "label": "RSS (delta)"
         },
@@ -425,7 +425,7 @@
           "label": "Baseline used memory"
         },
         "baselineRssMb": {
-          "value": 24.64,
+          "value": 24.7,
           "unit": "MB",
           "label": "Baseline RSS"
         },
@@ -435,7 +435,7 @@
           "label": "Key count"
         },
         "bytesPerKeyRss": {
-          "value": 165.4,
+          "value": 166,
           "unit": "B/key",
           "label": "Memory per key (RSS)"
         },
@@ -445,22 +445,22 @@
           "label": "Memory per key (used_memory)"
         },
         "absoluteRssMb": {
-          "value": 182.4,
+          "value": 182.96,
           "unit": "MB",
           "label": "RSS after the first load (absolute)"
         },
         "absoluteUsedMb": {
-          "value": 159.06,
+          "value": 159.07,
           "unit": "MB",
           "label": "Used memory after the first load (absolute)"
         },
         "rssDeltaSecondMb": {
-          "value": 159,
+          "value": 159.49,
           "unit": "MB",
           "label": "RSS (delta, second load)"
         },
         "usedMemoryDeltaSecondMb": {
-          "value": 158.39,
+          "value": 158.38,
           "unit": "MB",
           "label": "Used memory (delta, second load)"
         },
@@ -470,7 +470,7 @@
           "label": "Key count (second load)"
         },
         "bytesPerKeyRssSecond": {
-          "value": 166.7,
+          "value": 167.2,
           "unit": "B/key",
           "label": "Memory per key (RSS, second load)"
         },
