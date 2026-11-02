@@ -1534,7 +1534,33 @@ pub fn handle_migrate(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
     if name != "MIGRATE" {
         return None;
     }
-    Some(migrate(ctx))
+    Some(off_the_runtime(|| migrate(ctx)))
+}
+
+/// Run `f`, which blocks this thread on the network for up to `MIGRATE`'s
+/// timeout, without keeping a tokio worker from the rest of the server.
+///
+/// With `--io-model tokio`, commands run on the runtime's worker threads, and
+/// one of the idle workers at a time polls the sockets and the timers for all
+/// of them. A worker that the poll itself woke, with one task to run, wakes no
+/// other: if that task is a `MIGRATE`, which then waits on the destination,
+/// nothing polls the sockets until it is done. No other client is accepted or
+/// read from, no timer fires, a replica's link is not served — for as long as
+/// the `MIGRATE` waits. It does not need to hold anything to stop a write to
+/// the key it is moving (#274): the write is never read. `block_in_place`
+/// hands this worker's place, the polling with it, to another thread first.
+///
+/// Only on a multi-threaded runtime. An io_uring worker runs a current-thread
+/// runtime of its own (tokio-uring), which has no other thread to hand its
+/// place to (`block_in_place` panics there): `f` just runs, as before, and
+/// waits with that worker's connections only.
+fn off_the_runtime<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
 }
 
 /// One key on its way out: name, serialised value, absolute expiry (0 = none).

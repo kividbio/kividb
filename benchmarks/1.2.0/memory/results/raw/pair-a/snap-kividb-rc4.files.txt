@@ -1,0 +1,6 @@
+total 68124780
+drwxrwxrwx 2 dnsmasq   root             4096 Nov  2 04:03 .
+drwxr-xr-x 4 root      root             4096 Nov  1 22:01 ..
+-rw-r--r-- 1 azureuser azureuser 38300861305 Nov  2 04:07 appendonly.aof
+-rw-r--r-- 1 azureuser azureuser 31458888973 Nov  2 04:03 dump.kdb
+-rw-r--r-- 1 azureuser azureuser          24 Nov  2 04:03 dump.kdb.gen

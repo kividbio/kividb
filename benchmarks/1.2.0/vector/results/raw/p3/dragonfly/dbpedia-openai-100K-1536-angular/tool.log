@@ -1,0 +1,20 @@
+1793578079.856 RUN ./vector-db-benchmark --host 10.90.1.4 --engines-file dragonfly-engine.json --engines dragonfly-m16-ef128 --skip-search --datasets dbpedia-openai-100K-1536-angular --skip-if-exists false 
+1793578079.863 vector-db-benchmark 0.2.0 (git d22d44e8b46009a800a59e952710166ece2e38a1)
+1793578079.865 Found 1 datasets, 1 engines
+1793578079.867 
+1793578079.869 ============================================================
+1793578079.870 Running experiment (1/1): dragonfly-m16-ef128 - dbpedia-openai-100K-1536-angular
+1793578079.872 ============================================================
+1793578079.874 Experiment stage: Configure
+1793578079.876 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 128}
+1793578080.109 Experiment stage: Upload
+1793578080.111 Reading dataset from /home/ubuntu/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793578080.779 Read 100000 vectors (1536d) in 0.669s (149368 vectors/sec)
+1793578080.782 Starting upload with 16 threads, batch size 64...
+1793578090.013 Upload time: 9.234s (10830 records/sec)
+1793578090.014 Indexing complete (num_docs=100000/100000, indexing=false, percent_indexed=1.00, state=absent) in 0.0s
+1793578090.016 Index time: 0.002s, Total time (read+upload+index): 9.905s
+1793578090.031 Results saved to: "/home/ubuntu/vdbx/results/dragonfly-m16-ef128-dbpedia-openai-100K-1536-angular-upload-0-100000-2026-11-02-00-08-10.json"
+1793578090.033 Experiment stage: Cleanup (deleting index and data)
+1793578090.531 Experiment stage: Done
+1793578090.565 EXIT 0

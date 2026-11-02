@@ -1,0 +1,3 @@
+aof_last_rewrite_time_sec:1
+aof_last_rewrite_time_ms:1007
+aof_acks_before_write:0

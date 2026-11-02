@@ -1,0 +1,92 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 29K of event 'armv8_pmuv3_0/cycles/P'
+# Event count (approx.): 80707217751
+#
+# Overhead  Command          Shared Object      Symbol
+# ........  ...............  .................  ........................................................................................................................................................
+#
+     5.70%  server           server             [.] kividb::eviction::make_room
+     3.06%  server           server             [.] kividb::server_uring::handle_client::{closure#0}
+     2.93%  server           [kernel.kallsyms]  [k] handle_softirqs
+     2.00%  server           [kernel.kallsyms]  [k] _raw_spin_lock
+     1.90%  server           [kernel.kallsyms]  [k] __nf_conntrack_find_get
+     1.65%  server           server             [.] <hashbrown::raw::RawTable<kividb::store::entry::Slot>>::find::<<kividb::store::shard_map::ShardMap>::find::{closure#0}>
+     1.63%  server           server             [.] kividb::commands::handler::run_command
+     1.49%  server           [kernel.kallsyms]  [k] exit_to_user_mode_loop
+     1.30%  server           [kernel.kallsyms]  [k] tcp_recvmsg_locked
+     1.25%  server           [kernel.kallsyms]  [k] _raw_spin_unlock_irqrestore
+     1.11%  server           server             [.] <tokio_uring::net::tcp::stream::TcpStream>::write_all::<alloc::vec::Vec<u8>>::{closure#0}
+     1.04%  server           [kernel.kallsyms]  [k] mlx5e_poll_tx_cq
+     0.94%  server           server             [.] kividb::commands::strings::handle
+     0.94%  server           [kernel.kallsyms]  [k] _raw_spin_lock_bh
+     0.93%  server           [kernel.kallsyms]  [k] kmem_cache_alloc_node_noprof
+     0.91%  server           [kernel.kallsyms]  [k] __pi_memset_generic
+     0.90%  server           [kernel.kallsyms]  [k] mlx5e_napi_poll
+     0.89%  server           [kernel.kallsyms]  [k] nf_conntrack_tcp_packet
+     0.89%  server           [kernel.kallsyms]  [k] __tcp_transmit_skb
+     0.85%  server           [kernel.kallsyms]  [k] __arch_copy_to_user
+     0.80%  server           [kernel.kallsyms]  [k] skb_attempt_defer_free
+     0.76%  server           [kernel.kallsyms]  [k] tcp_sendmsg_locked
+     0.70%  server           [kernel.kallsyms]  [k] nft_do_chain
+     0.67%  server           [kernel.kallsyms]  [k] aa_inet_msg_perm
+     0.63%  server           [kernel.kallsyms]  [k] fget
+     0.61%  server           [kernel.kallsyms]  [k] check_heap_object
+     0.59%  server           [kernel.kallsyms]  [k] io_req_io_end
+     0.57%  server           server             [.] <rand_core::block::BlockRng<rand::rngs::adapter::reseeding::ReseedingCore<rand_chacha::chacha::ChaCha12Core, rand_core::os::OsRng>>>::generate_and_s
+     0.56%  server           [kernel.kallsyms]  [k] __arch_copy_from_user
+     0.55%  server           [kernel.kallsyms]  [k] aa_file_perm
+     0.55%  server           server             [.] kividb::value_slab::alloc
+     0.53%  server           libc.so.6          [.] malloc
+     0.51%  server           [kernel.kallsyms]  [k] ip_finish_output2
+     0.48%  server           [kernel.kallsyms]  [k] tcp_recvmsg
+     0.47%  server           server             [.] __aarch64_cas8_acq_rel
+     0.46%  server           server             [.] __aarch64_cas8_acq
+     0.46%  server           [kernel.kallsyms]  [k] el0_svc
+     0.46%  server           [kernel.kallsyms]  [k] __dev_xmit_skb
+     0.44%  server           server             [.] kividb::resp::parse::parse_multibulk
+     0.42%  server           [kernel.kallsyms]  [k] __ip_queue_xmit
+     0.42%  server           [kernel.kallsyms]  [k] tcp_in_window
+     0.42%  server           [kernel.kallsyms]  [k] validate_xmit_skb
+     0.41%  server           [kernel.kallsyms]  [k] mlx5e_rx_cq_process_basic_cqe_comp
+     0.40%  server           [kernel.kallsyms]  [k] io_arm_apoll
+     0.39%  server           [kernel.kallsyms]  [k] io_free_batch_list
+     0.38%  server           [kernel.kallsyms]  [k] fput
+     0.38%  server           [kernel.kallsyms]  [k] tcp_rcv_space_adjust
+     0.38%  server           [kernel.kallsyms]  [k] mod_memcg_state
+     0.37%  server           [kernel.kallsyms]  [k] io_file_get_flags
+     0.37%  server           [kernel.kallsyms]  [k] __local_bh_enable_ip
+     0.37%  server           [kernel.kallsyms]  [k] tcp_release_cb
+     0.37%  server           [kernel.kallsyms]  [k] nf_hook_slow
+     0.36%  server           server             [.] kividb::commands::handler::write_side_effects
+     0.36%  server           libc.so.6          [.] memcmp
+     0.36%  server           [kernel.kallsyms]  [k] tcp_event_new_data_sent
+     0.36%  server           [kernel.kallsyms]  [k] __alloc_skb
+     0.36%  server           [kernel.kallsyms]  [k] arch_counter_get_cntvct
+     0.35%  server           server             [.] __aarch64_ldadd8_relax
+     0.34%  server           [kernel.kallsyms]  [k] apparmor_socket_recvmsg
+     0.34%  server           server             [.] kividb::run_uring::{closure#8}::{closure#0}::{closure#0}::{closure#0}::{closure#2}::{closure#0}
+     0.34%  server           [kernel.kallsyms]  [k] mlx5e_txwqe_build_eseg_csum
+     0.34%  server           server             [.] __aarch64_cas1_acq
+     0.33%  server           server             [.] <tokio::task::local::LocalSet>::run_until::<core::future::poll_fn::PollFn<<tokio_uring::runtime::Runtime>::block_on<kividb::run_uring::{closure#8}::
+     0.33%  server           [kernel.kallsyms]  [k] io_init_req
+     0.32%  server           [kernel.kallsyms]  [k] memblock_is_map_memory
+     0.32%  server           [kernel.kallsyms]  [k] nf_conntrack_in
+     0.32%  server           [kernel.kallsyms]  [k] __dev_queue_xmit
+     0.32%  server           server             [.] kividb::value_slab::free
+     0.32%  server           [vdso]             [.] 0x0000000000000584
+     0.31%  server           server             [.] __aarch64_ldadd8_rel
+     0.31%  server           server             [.] tokio::runtime::task::raw::poll::<kividb::run_uring::{closure#8}::{closure#0}::{closure#0}::{closure#0}::{closure#2}::{closure#0}, alloc::sync::Arc<
+     0.31%  server           server             [.] kividb::cmdstats::record
+     0.30%  server           server             [.] tokio::runtime::task::waker::wake_by_val
+     0.30%  server           [kernel.kallsyms]  [k] mlx5e_xmit
+     0.30%  server           [kernel.kallsyms]  [k] mlx5e_txwqe_complete
+     0.30%  server           [kernel.kallsyms]  [k] io_submit_sqes
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

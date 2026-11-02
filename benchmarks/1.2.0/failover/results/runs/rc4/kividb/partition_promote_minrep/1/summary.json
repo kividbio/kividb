@@ -1,0 +1,62 @@
+{
+ "mode": "standalone",
+ "writers": 16,
+ "duration_s": 70.0,
+ "acked": 726333,
+ "unacked_errors": 1324,
+ "lost_acked": 30915,
+ "wrong_value": 0,
+ "wait_n": 0,
+ "wait_acked": 0,
+ "wait_acked_lost": 0,
+ "lost_ack_time_first": 20.299,
+ "lost_ack_time_last": 23.297,
+ "lost_sample": [
+  "ack:0:12798",
+  "ack:0:12799",
+  "ack:0:12800",
+  "ack:0:12801",
+  "ack:0:12802",
+  "ack:0:12803",
+  "ack:0:12804",
+  "ack:0:12805",
+  "ack:0:12806",
+  "ack:0:12807",
+  "ack:0:12808",
+  "ack:0:12809",
+  "ack:0:12810",
+  "ack:0:12811",
+  "ack:0:12812",
+  "ack:0:12813",
+  "ack:0:12814",
+  "ack:0:12815",
+  "ack:0:12816",
+  "ack:0:12817"
+ ],
+ "events": [
+  [
+   20.313,
+   "partition master <-> replica"
+  ],
+  [
+   25.011,
+   "replica promoted, clients moved"
+  ],
+  [
+   35.317,
+   "healed, old master demoted"
+  ]
+ ],
+ "recovery": {
+  "event_t": 20.313,
+  "pre_event_ok_per_100ms_median": 1011,
+  "first_error_t": 23.200000000000003,
+  "last_error_t": 25.0,
+  "writes_below_80pct_from_t": 23.3,
+  "throughput_back_t": 25.1,
+  "recovery_s": 4.79
+ },
+ "error_kinds": {
+  "ResponseError:NOREPLICAS": 1324
+ }
+}

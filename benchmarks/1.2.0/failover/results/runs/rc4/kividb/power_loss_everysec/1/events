@@ -1,0 +1,5 @@
+1793585411.751924100 VM powered off (appendfsync everysec)
+1793585437.442396344 VM back up
+1793585448.254353549 server restarted
+1793585458.512361816 server refused to start: cannot be loaded: bad file format at byte offset 26557611 of 26558005 
+1793585458.770829878 AOF cut at byte 26557611 (where the zero-filled tail starts); restarted

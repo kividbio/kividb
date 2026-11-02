@@ -524,8 +524,28 @@ fn upsert_node(
             .entry(id)
             .or_insert_with(|| ClusterNode::new(id, ip.clone(), client_port, cluster_port));
         // What a node says about its own address beats what a third party
-        // relays, which may be stale. A relayed address only fills a gap.
-        if direct_contact || is_new || entry.ip.is_empty() {
+        // relays, which may be stale. A relayed address only fills a gap,
+        // or replaces one we cannot reach the node at, from a node that
+        // can: the node has moved. Two nodes restarted together with new
+        // addresses (pods rescheduled) can only learn each other's this
+        // way, each having dialled the other's old one; they kept those
+        // for ever, each seeing the other as failed, and a shard left
+        // without a master the cluster could see went down with it.
+        // So does one we have not heard from since we started, whose
+        // address is still nodes.conf's: the start grace otherwise keeps
+        // it unsuspected for two node timeouts, and the moment it ends
+        // our suspicion and a peer's report from before the node came
+        // back make a quorum, and a healthy master is failed over.
+        let suspect = NodeFlags::PFAIL | NodeFlags::FAIL;
+        let unconfirmed = !direct_contact && state.unconfirmed_addresses.read().contains(&id);
+        let moved = !direct_contact
+            && !ip.is_empty()
+            && (entry.flags.intersects(suspect) || unconfirmed)
+            && !flags.intersects(suspect | NodeFlags::NOADDR)
+            && (entry.ip != ip
+                || entry.client_port != client_port
+                || entry.cluster_port != cluster_port);
+        if direct_contact || is_new || entry.ip.is_empty() || moved {
             if !ip.is_empty() {
                 entry.ip = ip;
             }
@@ -561,6 +581,7 @@ fn upsert_node(
         if direct_contact {
             entry.pong_received_ms = now_ms();
             entry.flags.remove(NodeFlags::PFAIL);
+            state.unconfirmed_addresses.write().remove(&id);
         } else if is_new {
             // Give a node we have only heard about a full timeout before
             // suspecting it, the same grace a freshly met one gets.
@@ -862,6 +883,98 @@ mod tests {
         );
         drop(nodes);
         assert_eq!(cs.failure_report_count(b), 1);
+    }
+
+    fn gossip_of(id: NodeId, ip: &str, port: u16, flags: NodeFlags) -> GossipEntry {
+        GossipEntry {
+            hostname: String::new(),
+            announced_client_port: 0,
+            id,
+            ip: ip.into(),
+            client_port: port,
+            cluster_port: port + 10000,
+            config_epoch: 0,
+            flags,
+            master_id: None,
+        }
+    }
+
+    /// A node we cannot reach, relayed at a new address by one that can
+    /// reach it, has moved: we dial it there. Two pods restarted together
+    /// with new IPs otherwise kept each other's old ones for ever.
+    #[test]
+    fn a_node_we_cannot_reach_takes_the_address_a_healthy_relay_gives() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        let (a, b) = (generate_node_id(), generate_node_id());
+        process_message(&cs, meet(a), peer());
+        process_message(
+            &cs,
+            ping(
+                a,
+                NodeFlags::MASTER,
+                vec![gossip_of(b, "10.0.0.8", 7002, NodeFlags::MASTER)],
+            ),
+            peer(),
+        );
+        cs.nodes.write().get_mut(&b).unwrap().flags |= NodeFlags::PFAIL;
+
+        let moved = gossip_of(b, "10.0.0.88", 7002, NodeFlags::MASTER);
+        process_message(&cs, ping(a, NodeFlags::MASTER, vec![moved]), peer());
+        let nodes = cs.nodes.read();
+        let node = nodes.get(&b).unwrap();
+        assert_eq!(node.ip, "10.0.0.88");
+        assert!(
+            node.flags.contains(NodeFlags::PFAIL),
+            "only a reply from the node itself clears our suspicion"
+        );
+    }
+
+    /// After a restart, a peer we have not heard from yet has the address
+    /// nodes.conf gave it, which may be stale: a healthy relay's address
+    /// replaces it at once, before the start grace would let us suspect it.
+    #[test]
+    fn after_a_restart_a_peer_not_yet_heard_from_takes_a_healthy_relays_address() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        let (a, b) = (generate_node_id(), generate_node_id());
+        process_message(&cs, meet(a), peer());
+        let known = gossip_of(b, "10.0.0.8", 7002, NodeFlags::MASTER);
+        process_message(&cs, ping(a, NodeFlags::MASTER, vec![known]), peer());
+        cs.start_the_clock_on_peers();
+
+        let moved = gossip_of(b, "10.0.0.88", 7002, NodeFlags::MASTER);
+        process_message(&cs, ping(a, NodeFlags::MASTER, vec![moved]), peer());
+        let nodes = cs.nodes.read();
+        let node = nodes.get(&b).unwrap();
+        assert_eq!(node.ip, "10.0.0.88");
+        assert!(!node.flags.intersects(NodeFlags::PFAIL | NodeFlags::FAIL));
+    }
+
+    /// A node we reach keeps the address it gives itself, whatever a third
+    /// party says; and one the relay cannot reach either keeps the one we
+    /// have.
+    #[test]
+    fn a_relayed_address_does_not_replace_a_reachable_one_or_come_from_a_suspect() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        let (a, b) = (generate_node_id(), generate_node_id());
+        process_message(&cs, meet(a), peer());
+        process_message(
+            &cs,
+            ping(
+                a,
+                NodeFlags::MASTER,
+                vec![gossip_of(b, "10.0.0.8", 7002, NodeFlags::MASTER)],
+            ),
+            peer(),
+        );
+
+        let stale = gossip_of(b, "10.0.0.99", 7002, NodeFlags::MASTER);
+        process_message(&cs, ping(a, NodeFlags::MASTER, vec![stale]), peer());
+        assert_eq!(cs.nodes.read().get(&b).unwrap().ip, "10.0.0.8");
+
+        cs.nodes.write().get_mut(&b).unwrap().flags |= NodeFlags::PFAIL;
+        let suspect = gossip_of(b, "10.0.0.99", 7002, NodeFlags::MASTER | NodeFlags::PFAIL);
+        process_message(&cs, ping(a, NodeFlags::MASTER, vec![suspect]), peer());
+        assert_eq!(cs.nodes.read().get(&b).unwrap().ip, "10.0.0.8");
     }
 
     /// A replica's suspicion is not a vote.

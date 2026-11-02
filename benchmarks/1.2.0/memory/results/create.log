@@ -1,0 +1,16 @@
+Selecting "northeurope" may reduce your costs.\u202fThe region you've selected may cost more for the same services. You can disable this message in the future with the command "az config set core.display_region_identified=false". Learn more at https://go.microsoft.com/fwlink/?linkid=222571 
+
+WARNING: Consider upgrading security for your workloads using Azure Trusted Launch VMs. To know more about Trusted Launch, please visit https://aka.ms/TrustedLaunch.
+ResourceGroup      PowerState    PublicIpAddress    Fqdns    PrivateIpAddress    MacAddress         Location
+-----------------  ------------  -----------------  -------  ------------------  -----------------  ------------------
+kividb-rc4-memory  VM running    20.218.100.185              10.30.0.4           7C-ED-8D-24-1D-C6  germanywestcentral
+Selecting "northeurope" may reduce your costs.\u202fThe region you've selected may cost more for the same services. You can disable this message in the future with the command "az config set core.display_region_identified=false". Learn more at https://go.microsoft.com/fwlink/?linkid=222571 
+
+WARNING: Consider upgrading security for your workloads using Azure Trusted Launch VMs. To know more about Trusted Launch, please visit https://aka.ms/TrustedLaunch.
+ResourceGroup      PowerState    PublicIpAddress    Fqdns    PrivateIpAddress    MacAddress         Location
+-----------------  ------------  -----------------  -------  ------------------  -----------------  ------------------
+kividb-rc4-memory  VM running    20.52.223.108               10.30.0.5           7C-ED-8D-23-8D-26  germanywestcentral
+VirtualMachine    PublicIPAddresses    PrivateIPAddresses
+----------------  -------------------  --------------------
+mem-cli           20.52.223.108        10.30.0.5
+mem-srv           20.218.100.185       10.30.0.4

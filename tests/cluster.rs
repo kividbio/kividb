@@ -2315,6 +2315,13 @@ fn migrate_moves_a_slot_with_every_type_and_ttl() {
 /// `migrate-before-delete`, and run `meanwhile` while it is stopped there:
 /// after the destination has confirmed the keys, before the source deletes
 /// them. `hit` is which time the node reaches the failpoint (from 1).
+///
+/// `MIGRATE` is sent a moment after connecting, once the node has found
+/// nothing to read on the new connection and is waiting for it: the
+/// `MIGRATE` then reaches the node the way it does on a busy machine, through
+/// the worker polling the sockets, which then runs it. That worker used to
+/// keep the polling for as long as the `MIGRATE` waited, and the write
+/// meanwhile was never read; sent at once, it was only now and then.
 fn migrate_with_writes_meanwhile(
     node: &Node,
     args: &[String],
@@ -2325,7 +2332,9 @@ fn migrate_with_writes_meanwhile(
     let args = args.to_vec();
     let migrate = std::thread::spawn(move || {
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        Conn::connect(port).cmd(&refs)
+        let mut conn = Conn::connect(port);
+        std::thread::sleep(Duration::from_millis(100));
+        conn.cmd(&refs)
     });
     let failpoint = node
         .dir

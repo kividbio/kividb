@@ -1,0 +1,33 @@
+WAIT 1 200 after every SET, N concurrent writers, 10 s each (harness/waitprobe.py).
+Master on ops-fo1, one replica on ops-fo2 (Azure D4s_v5, same proximity placement group), client on ops-foc.
+KiviDB 1.2.0-rc4 (a6b1bf38) release binary; Redis 8.10.3 (official image binary, io-threads 2).
+"->0" = WAIT answered 0 replicas; "->1" = answered 1. INFO replication on the master right after the io_uring run: slave0 state=online, lag=0.
+
+KiviDB rc4, master io_uring (Linux default), replica io_uring
+  writers=1   ->1: 37469 times, ms p50 0.14 p99 0.18 max 3.93
+  writers=4   ->0: 108 times, ms p50 200.59 p99 201.12 max 201.27
+              ->1: 3454 times, ms p50 0.35 p99 200.42 max 201.13
+  writers=16  ->0: 406 times, ms p50 201.84 p99 400.96 max 404.84
+              ->1: 1552 times, ms p50 1.17 p99 201.56 max 401.34
+
+KiviDB rc4, master io_uring, replica tokio
+  writers=16  ->0: 425 times, ms p50 202.07 p99 206.67 max 403.48
+              ->1: 1570 times, ms p50 1.17 p99 200.17 max 203.75
+
+KiviDB rc4, master tokio, replica io_uring
+  writers=16  ->1: 60809 times, ms p50 1.66 p99 4.67 max 14.83
+
+KiviDB rc4, master tokio, replica tokio
+  writers=4   ->1: 35491 times, ms p50 0.23 p99 3.12 max 9.04
+  writers=16  ->1: 61447 times, ms p50 1.59 p99 4.72 max 15.47
+
+Redis 8.10.3
+  writers=4   ->1: 33493 times, ms p50 0.40 p99 1.02 max 101.40
+  writers=16  ->1: 70399 times, ms p50 0.90 p99 4.27 max 9.81
+  (writers=1 ran while the replica was still finishing its first sync and is left out.)
+
+Not a regression: the same on 1.1.3 (master and replica on one D4s_v5, 127.0.0.1, io_uring, 16 writers, 10 s):
+  kividb 1.1.3     ->0: 438 times, ms p50 201.85 p99 401.01 max 402.68
+                   ->1: 1020 times, ms p50 1.06 p99 201.20 max 400.78
+  kividb 1.2.0-rc4 ->0: 383 times, ms p50 201.76 p99 400.65 max 401.21
+                   ->1: 1109 times, ms p50 1.11 p99 202.19 max 400.98

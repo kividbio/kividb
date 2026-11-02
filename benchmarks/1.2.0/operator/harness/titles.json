@@ -1,0 +1,209 @@
+{
+ "P1": {
+  "engine": "1.1.3",
+  "loader": "loader-rep-g1",
+  "what": "operator upgrade 0.6.1 -> master (replicated)",
+  "title": "Operator upgrade 0.6.1 -> 0.7.0 (master) under load: one switchover, 2 s of refused writes, nothing lost"
+ },
+ "reshard-up-113": {
+  "engine": "1.1.3",
+  "loader": "loader-shd",
+  "what": "reshard 3 -> 4 shards",
+  "title": "1.1.3: adding a 4th shard under load, no failed write"
+ },
+ "reshard-down-113": {
+  "engine": "1.1.3",
+  "loader": "loader-shd",
+  "what": "reshard 4 -> 3 shards",
+  "title": "1.1.3: removing the 4th shard under load, no failed write"
+ },
+ "restart-113": {
+  "engine": "1.1.3",
+  "loader": "loader-shd",
+  "what": "rolling restart (KividbDbOps)",
+  "title": "1.1.3: rolling restart, one CLUSTER FAILOVER per shard, no failed write"
+ },
+ "failover-113": {
+  "engine": "1.1.3",
+  "loader": "loader-shd",
+  "what": "CLUSTER FAILOVER of every master",
+  "title": "1.1.3: CLUSTER FAILOVER of every shard master, no failed write"
+ },
+ "sigstop-113": {
+  "engine": "1.1.3",
+  "loader": "loader-shd",
+  "what": "SIGSTOP of a shard master",
+  "title": "1.1.3: a hung shard master; its shard's writes fail for ~13 s until the replica takes over"
+ },
+ "sigkill-113": {
+  "engine": "1.1.3",
+  "loader": "loader-shd",
+  "what": "SIGKILL of a shard master's engine",
+  "title": "1.1.3: kill -9 of a shard master's engine; ~6 s of failed writes"
+ },
+ "forcedel-113": {
+  "engine": "1.1.3",
+  "loader": "loader-shd",
+  "what": "force delete of a shard master pod",
+  "title": "1.1.3: force-deleting a shard master lost 120,162 acknowledged writes",
+  "note": "AOF of a promoted node held none of its writes"
+ },
+ "delete-113": {
+  "engine": "1.1.3",
+  "loader": "loader-shd",
+  "what": "graceful delete of a shard master",
+  "title": "1.1.3: deleting a shard master pod hands over first, no failed write"
+ },
+ "drain-113": {
+  "engine": "1.1.3",
+  "loader": "loader-shd",
+  "what": "drain of a shard master's node",
+  "title": "1.1.3: draining a node with a shard master and a replica; ~6 s of failed writes"
+ },
+ "drain-113-rep": {
+  "engine": "1.1.3",
+  "loader": "loader-rep",
+  "what": "drain (replicated cluster)",
+  "title": "1.1.3: the replicated cluster during the same drain, no failed write"
+ },
+ "rep-sigstop-113": {
+  "engine": "1.1.3",
+  "loader": "loader-rep",
+  "what": "SIGSTOP of the replicated master",
+  "title": "1.1.3: a hung replicated master; writes refused ~45 s until the operator fails over"
+ },
+ "rep-forcedel-113": {
+  "engine": "1.1.3",
+  "loader": "loader-rep",
+  "what": "force delete of the replicated master",
+  "title": "1.1.3: force-deleting the replicated master; writes refused ~38 s"
+ },
+ "upgrade-rep": {
+  "engine": "1.2.0-rc4",
+  "loader": "loader-rep",
+  "what": "engine upgrade 1.1.3 -> 1.2.0-rc4 (replicated)",
+  "title": "Replicated cluster upgraded 1.1.3 -> 1.2.0-rc4 under load: no failed write"
+ },
+ "upgrade-shd": {
+  "engine": "1.2.0-rc4",
+  "loader": "loader-shd",
+  "what": "engine upgrade 1.1.3 -> 1.2.0-rc4 (sharded)",
+  "title": "Sharded cluster upgraded 1.1.3 -> 1.2.0-rc4 under load: no failed write"
+ },
+ "restart-rc4": {
+  "engine": "1.2.0-rc4",
+  "loader": "loader-shd",
+  "what": "rolling restart (KividbDbOps)",
+  "title": "1.2.0-rc4: rolling restart; 1,013 SETs timed out while replicas restarted (1.1.3: none)"
+ },
+ "failover-rc4": {
+  "engine": "1.2.0-rc4",
+  "loader": "loader-shd",
+  "what": "CLUSTER FAILOVER of every master",
+  "title": "1.2.0-rc4: CLUSTER FAILOVER of every shard master, no failed write"
+ },
+ "sigstop-rc4": {
+  "engine": "1.2.0-rc4",
+  "loader": "loader-shd",
+  "what": "SIGSTOP of a shard master",
+  "title": "1.2.0-rc4: a hung shard master; its shard's writes fail for ~14 s until the replica takes over"
+ },
+ "sigkill-rc4": {
+  "engine": "1.2.0-rc4",
+  "loader": "loader-shd",
+  "what": "SIGKILL of a shard master's engine",
+  "title": "1.2.0-rc4: kill -9 of a shard master; back from its AOF, clients told \"?\" for 4 s"
+ },
+ "forcedel-rc4": {
+  "engine": "1.2.0-rc4",
+  "loader": "loader-shd",
+  "what": "force delete of a shard master pod",
+  "title": "1.2.0-rc4: force-deleting a shard master; ~10 s of failed writes, nothing lost"
+ },
+ "delete-rc4": {
+  "engine": "1.2.0-rc4",
+  "loader": "loader-shd",
+  "what": "graceful delete of a shard master",
+  "title": "1.2.0-rc4: after the handover the new master saw the cluster as down; shard 1 out until a manual CLUSTER MEET",
+  "note": "then shard down 7 min until a manual CLUSTER MEET"
+ },
+ "drain-rc4": {
+  "engine": "1.2.0-rc4",
+  "loader": "loader-shd",
+  "what": "drain of a shard master's node",
+  "title": "1.2.0-rc4: draining a node with a shard master; two ~6 s windows of failed writes"
+ },
+ "drain-rc4-rep": {
+  "engine": "1.2.0-rc4",
+  "loader": "loader-rep",
+  "what": "drain (replicated cluster)",
+  "title": "1.2.0-rc4: the replicated cluster during the same drain, no failed write"
+ },
+ "reshard-up-rc4": {
+  "engine": "1.2.0-rc4",
+  "loader": "loader-shd",
+  "what": "reshard 3 -> 4 shards",
+  "title": "1.2.0-rc4: adding a 4th shard under load, no failed write"
+ },
+ "reshard-down-rc4": {
+  "engine": "1.2.0-rc4",
+  "loader": "loader-shd",
+  "what": "reshard 4 -> 3 shards",
+  "title": "1.2.0-rc4: removing the 4th shard under load, no failed write"
+ },
+ "repdel-rc4": {
+  "engine": "1.2.0-rc4",
+  "loader": "loader-shd",
+  "what": "graceful delete of a shard replica",
+  "title": "1.2.0-rc4: deleting a shard's replica pod, no failed write"
+ },
+ "repdel2-rc4": {
+  "engine": "1.2.0-rc4",
+  "loader": "loader-shd",
+  "what": "graceful delete of a shard replica (2)",
+  "title": "1.2.0-rc4: deleting another shard's replica pod, no failed write"
+ },
+ "rep-sigstop-rc4": {
+  "engine": "1.2.0-rc4",
+  "loader": "loader-rep",
+  "what": "SIGSTOP of the replicated master",
+  "title": "1.2.0-rc4: a hung replicated master; writes refused ~50 s until the operator fails over"
+ },
+ "rep-forcedel-rc4": {
+  "engine": "1.2.0-rc4",
+  "loader": "loader-rep",
+  "what": "force delete of the replicated master",
+  "title": "1.2.0-rc4: force-deleting the replicated master; writes refused ~11 s"
+ },
+ "rep-restart-rc4": {
+  "engine": "1.2.0-rc4",
+  "loader": "loader-rep",
+  "what": "rolling restart (replicated)",
+  "title": "1.2.0-rc4: rolling restart of the replicated cluster, no failed write"
+ },
+ "bulk-rc4": {
+  "engine": "1.2.0-rc4",
+  "loader": "loader-shd",
+  "what": "bulk load 2.5 M x 1 KB SETs",
+  "title": "1.2.0-rc4: the loader during a 2.5 M x 1 KB bulk load (~1 M SET/s for 2.5 s)"
+ },
+ "reshard-bulk-up-rc4": {
+  "engine": "1.2.0-rc4",
+  "loader": "loader-shd",
+  "what": "reshard 3 -> 4 after bulk load",
+  "title": "1.2.0-rc4: adding a 4th shard after a 2.5 M x 1 KB bulk load, no failed write",
+  "note": "the window runs to 00:21 because the script waited on a finished backup pod; the move took 57 s"
+ },
+ "reshard-bulk-down-rc4": {
+  "engine": "1.2.0-rc4",
+  "loader": "loader-shd",
+  "what": "reshard 4 -> 3 after bulk load",
+  "title": "1.2.0-rc4: removing the 4th shard again, no failed write"
+ },
+ "split-outage-rc4": {
+  "engine": "1.2.0-rc4",
+  "loader": "loader-shd",
+  "what": "CLUSTER FAILOVER on both nodes of a stale-address pair",
+  "title": "1.2.0-rc4: CLUSTER FAILOVER on the two nodes that held each other's old address; one election lost, 5 s of failed writes, the split healed"
+ }
+}

@@ -1,0 +1,8 @@
+ghcr.io/kividbio/kividb:v1.2.0-rc4	sha256:06ae4b822d25c7e2ba33e328e202d42a15d4b25f735258ca1d282e908180b55b	linux/amd64 unknown/unknown linux/arm64 unknown/unknown 
+docker.io/kividb/kividb:v1.2.0-rc4	sha256:06ae4b822d25c7e2ba33e328e202d42a15d4b25f735258ca1d282e908180b55b	linux/amd64 unknown/unknown linux/arm64 unknown/unknown 
+ghcr.io/kividbio/kividb:v1.2.0-rc4-lua	sha256:b9282101a482e014bff7107f52c91f5898a76a091af019d5137252ef051de199	linux/amd64 unknown/unknown linux/arm64 unknown/unknown 
+docker.io/kividb/kividb:v1.2.0-rc4-lua	sha256:b9282101a482e014bff7107f52c91f5898a76a091af019d5137252ef051de199	linux/amd64 unknown/unknown linux/arm64 unknown/unknown 
+ghcr.io/kividbio/kividb:v1.2.0-rc4-tls	sha256:56cbc67996f67022741368645052bea9ebcb7daabc6841f3588fd4e78f2e2266	linux/amd64 unknown/unknown linux/arm64 unknown/unknown 
+docker.io/kividb/kividb:v1.2.0-rc4-tls	sha256:56cbc67996f67022741368645052bea9ebcb7daabc6841f3588fd4e78f2e2266	linux/amd64 unknown/unknown linux/arm64 unknown/unknown 
+ghcr.io/kividbio/kividb:v1.2.0-rc4-full	sha256:1eaf2428612d8f2a30e6a7d45f57aefd11cf0c5b5fc7912ac46902b60c87cefa	linux/amd64 unknown/unknown linux/arm64 unknown/unknown 
+docker.io/kividb/kividb:v1.2.0-rc4-full	sha256:1eaf2428612d8f2a30e6a7d45f57aefd11cf0c5b5fc7912ac46902b60c87cefa	linux/amd64 unknown/unknown linux/arm64 unknown/unknown 

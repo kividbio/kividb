@@ -1,0 +1,21 @@
+1793575758.297 RUN ./vector-db-benchmark --host 10.90.1.4 --engines-file kividb-engine.json --engines kividb-m16-ef128 --skip-search --datasets h-and-m-2048-angular-filters --skip-if-exists false 
+1793575758.305 vector-db-benchmark 0.2.0 (git d22d44e8b46009a800a59e952710166ece2e38a1)
+1793575758.306 Found 1 datasets, 1 engines
+1793575758.308 
+1793575758.310 ============================================================
+1793575758.312 Running experiment (1/1): kividb-m16-ef128 - h-and-m-2048-angular-filters
+1793575758.314 ============================================================
+1793575758.315 Experiment stage: Configure
+1793575758.317 KiviDB server: `INFO server` reported `kividb_version:1.2.0-rc4`
+1793575758.319 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 128}
+1793575758.321 Experiment stage: Upload
+1793575758.322 Reading dataset from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793575760.021 Read 105100 vectors (2048d) in 1.710s (61459 vectors/sec)
+1793575760.024 Starting upload with 16 threads, batch size 64...
+1793575774.727 Upload time: 14.706s (7147 records/sec)
+1793575774.738 Indexing complete (algorithm=hnsw, num_docs=Some(105100), hnsw_live_count=Some(105100)/105100, compaction_in_progress=false) in 0.0s
+1793575774.740 Index time: 0.012s, Total time (read+upload+index): 16.428s
+1793575774.959 Results saved to: "/home/ubuntu/vdbx/results/kividb-m16-ef128-h-and-m-2048-angular-filters-upload-0-105100-2026-11-01-23-29-34.json"
+1793575774.983 Experiment stage: Cleanup (deleting index and data)
+1793575776.484 Experiment stage: Done
+1793575776.549 EXIT 0

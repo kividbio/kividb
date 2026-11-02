@@ -1,0 +1,20 @@
+  - args:
+    - --configfile
+    - /etc/kividb/kividb.conf
+    - --cluster-announce-ip
+--
+    image: ghcr.io/kividbio/kividb:v1.2.0-rc4
+    imagePullPolicy: IfNotPresent
+    lifecycle:
+      preStop:
+--
+  - args:
+    - serve
+    env:
+    - name: KIVIDB_ADDR
+--
+    image: ACR.azurecr.io/kividb-operator-agent:0.7.0-eefe65d
+    imagePullPolicy: IfNotPresent
+    lifecycle:
+      preStop:
+--

@@ -1,0 +1,18 @@
+status:
+  completionTime: "2026-11-02T00:12:29Z"
+  durationMs: 4045
+  objectKey: e2e/shd/20261102T001222Z/manifest.json
+  phase: Succeeded
+  shards:
+  - index: 0
+    sizeBytes: 13815639
+    sourcePod: shd-0-1
+  - index: 1
+    sizeBytes: 13649332
+    sourcePod: shd-1-1
+  - index: 2
+    sizeBytes: 12942981
+    sourcePod: shd-2-1
+  sizeBytes: 40407952
+  sourceRole: master
+  startTime: "2026-11-02T00:12:21Z"

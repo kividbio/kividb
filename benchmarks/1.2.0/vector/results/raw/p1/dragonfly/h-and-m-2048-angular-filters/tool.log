@@ -1,0 +1,100 @@
+1793572402.480 RUN ./vector-db-benchmark --host 10.90.1.4 --engines-file dragonfly-engine.json --engines dragonfly-m16-ef128 --datasets h-and-m-2048-angular-filters --skip-if-exists false 
+1793572402.488 vector-db-benchmark 0.2.0 (git d22d44e8b46009a800a59e952710166ece2e38a1)
+1793572402.490 Found 1 datasets, 1 engines
+1793572402.491 
+1793572402.493 ============================================================
+1793572402.495 Running experiment (1/1): dragonfly-m16-ef128 - h-and-m-2048-angular-filters
+1793572402.496 ============================================================
+1793572402.498 Experiment stage: Configure
+1793572402.500 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 128}
+1793572402.732 Experiment stage: Upload
+1793572402.734 Reading dataset from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793572404.441 Read 105100 vectors (2048d) in 1.708s (61521 vectors/sec)
+1793572404.444 Starting upload with 16 threads, batch size 64...
+1793572414.066 Upload time: 9.625s (10919 records/sec)
+1793572414.068 Indexing complete (num_docs=105100/105100, indexing=false, percent_indexed=1.00, state=absent) in 0.0s
+1793572414.070 Index time: 0.002s, Total time (read+upload+index): 11.336s
+1793572414.282 Results saved to: "/home/ubuntu/vdbx/results/dragonfly-m16-ef128-h-and-m-2048-angular-filters-upload-0-105100-2026-11-01-22-33-34.json"
+1793572415.922 Experiment stage: Search
+1793572415.924 	Running search 0: ef=64, parallel=1
+1793572415.926 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793572467.905 	  rep 1/3: QPS 199.7
+1793572467.907 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793572520.538 	  rep 2/3: QPS 197.1
+1793572520.540 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793572572.308 	  rep 3/3: QPS 200.5
+1793572572.310 	→ QPS: 200.5, Recall: 0.9975, Precision@returned: 0.9975, MRR: 0.9989, NDCG: 0.9979 (best of reps)
+1793572572.311 	Running search 1: ef=128, parallel=1
+1793572572.313 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793572631.043 	  rep 1/3: QPS 175.9
+1793572631.045 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793572689.825 	  rep 2/3: QPS 175.8
+1793572689.827 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793572748.542 	  rep 3/3: QPS 176.0
+1793572748.543 	→ QPS: 176.0, Recall: 0.9981, Precision@returned: 0.9981, MRR: 0.9989, NDCG: 0.9983 (best of reps)
+1793572748.545 	Running search 2: ef=256, parallel=1
+1793572748.547 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793572818.292 	  rep 1/3: QPS 147.4
+1793572818.294 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793572886.855 	  rep 2/3: QPS 150.0
+1793572886.857 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793572955.477 	  rep 3/3: QPS 149.9
+1793572955.479 	→ QPS: 150.0, Recall: 0.9983, Precision@returned: 0.9983, MRR: 0.9989, NDCG: 0.9984 (best of reps)
+1793572955.481 	Running search 3: ef=128, parallel=16
+1793572955.482 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793572984.075 	  rep 1/3: QPS 374.7
+1793572984.077 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793573012.212 	  rep 2/3: QPS 381.8
+1793573012.214 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793573040.143 	  rep 3/3: QPS 384.2
+1793573040.144 	→ QPS: 384.2, Recall: 0.9981, Precision@returned: 0.9981, MRR: 0.9989, NDCG: 0.9983 (best of reps)
+1793573040.146 	Running search 4: ef=128, parallel=100
+1793573040.148 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793573055.083 	  rep 1/3: QPS 770.1
+1793573055.085 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793573070.263 	  rep 2/3: QPS 755.9
+1793573070.265 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793573085.343 	  rep 3/3: QPS 761.9
+1793573085.346 	→ QPS: 770.1, Recall: 0.9981, Precision@returned: 0.9981, MRR: 0.9989, NDCG: 0.9983 (best of reps)
+1793573085.362 	Results saved to: "/home/ubuntu/vdbx/results/dragonfly-m16-ef128-h-and-m-2048-angular-filters-search-0-29703-2026-11-01-22-44-45.json"
+1793573085.376 	Results saved to: "/home/ubuntu/vdbx/results/dragonfly-m16-ef128-h-and-m-2048-angular-filters-search-1-29703-2026-11-01-22-44-45.json"
+1793573085.391 	Results saved to: "/home/ubuntu/vdbx/results/dragonfly-m16-ef128-h-and-m-2048-angular-filters-search-2-29703-2026-11-01-22-44-45.json"
+1793573085.405 	Results saved to: "/home/ubuntu/vdbx/results/dragonfly-m16-ef128-h-and-m-2048-angular-filters-search-3-29703-2026-11-01-22-44-45.json"
+1793573085.420 	Results saved to: "/home/ubuntu/vdbx/results/dragonfly-m16-ef128-h-and-m-2048-angular-filters-search-4-29703-2026-11-01-22-44-45.json"
+1793573085.421 -----------------------------------------------------------------------------------------------
+1793573085.423 Recall     Precision  MRR      NDCG     QPS        P50 (ms)     P90 (ms)     P95 (ms)    
+1793573085.425 -----------------------------------------------------------------------------------------------
+1793573085.427 0.9981     0.9981     0.9989   0.9983   770.1      122.230      197.341      232.287     
+1793573085.429 
+1793573085.430 
+1793573085.432 QPS vs Precision Trade-off - dragonfly-m16-ef128 - h-and-m-2048-angular-filters (up and to the right is better):
+1793573085.434 
+1793573085.435      770 │●                                                           
+1793573085.437      700 │                                                            
+1793573085.439      630 │                                                            
+1793573085.441      560 │                                                            
+1793573085.442      490 │                                                            
+1793573085.444      420 │                                                            
+1793573085.446      350 │                                                            
+1793573085.448      280 │                                                            
+1793573085.450      210 │                                                            
+1793573085.451      140 │                                                            
+1793573085.453       70 │                                                            
+1793573085.455        0 │                                                            
+1793573085.457          └────────────────────────────────────────────────────────────
+1793573085.459           0.998          1.001          1.005          1.008          
+1793573085.460         Precision (0.0 = 0%, 1.0 = 100%)
+1793573085.462 
+1793573085.464 THROUGHPUT vs CONCURRENCY (saturation curve):
+1793573085.466   ef=128 — peak 770.1 QPS @ parallel 100 (still climbing at top of swept range — sweep higher to find the knee)
+1793573085.467     parallel         QPS     p50 ms     p90 ms     p95 ms     p99 ms    sat?
+1793573085.469            1       176.0      3.498     11.058     14.079     38.173       -
+1793573085.471           16       384.2     31.564     87.047    112.644    142.368       -
+1793573085.473          100       770.1    122.230    197.341    232.287    279.931       -
+1793573085.474 
+1793573085.476 ================================================================================
+1793573085.478 Results saved to:  /home/ubuntu/vdbx/results
+1793573085.480 Summary saved to:  /home/ubuntu/vdbx/results/dragonfly-m16-ef128-h-and-m-2048-angular-filters-summary.json
+1793573085.481 Experiment stage: Cleanup (deleting index and data)
+1793573086.272 Experiment stage: Done
+1793573086.339 EXIT 0

@@ -1,0 +1,102 @@
+1793573472.021 RUN ./vector-db-benchmark --host 10.90.1.4 --engines-file dragonfly-engine.json --engines dragonfly-m16-ef128 --datasets dbpedia-openai-100K-1536-angular --skip-if-exists false 
+1793573472.028 vector-db-benchmark 0.2.0 (git d22d44e8b46009a800a59e952710166ece2e38a1)
+1793573472.030 Found 1 datasets, 1 engines
+1793573472.032 
+1793573472.034 ============================================================
+1793573472.036 Running experiment (1/1): dragonfly-m16-ef128 - dbpedia-openai-100K-1536-angular
+1793573472.037 ============================================================
+1793573472.039 Experiment stage: Configure
+1793573472.041 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 128}
+1793573472.268 Experiment stage: Upload
+1793573472.270 Reading dataset from /home/ubuntu/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793573472.942 Read 100000 vectors (1536d) in 0.674s (148355 vectors/sec)
+1793573472.944 Starting upload with 16 threads, batch size 64...
+1793573482.136 Upload time: 9.195s (10876 records/sec)
+1793573482.138 Indexing complete (num_docs=100000/100000, indexing=false, percent_indexed=1.00, state=absent) in 0.0s
+1793573482.140 Index time: 0.002s, Total time (read+upload+index): 9.871s
+1793573482.154 Results saved to: "/home/ubuntu/vdbx/results/dragonfly-m16-ef128-dbpedia-openai-100K-1536-angular-upload-0-100000-2026-11-01-22-51-22.json"
+1793573482.786 Experiment stage: Search
+1793573482.788 	Running search 0: ef=64, parallel=1
+1793573482.790 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793573490.332 	  rep 1/3: QPS 726.3
+1793573490.334 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793573497.925 	  rep 2/3: QPS 721.4
+1793573497.926 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793573505.467 	  rep 3/3: QPS 726.4
+1793573505.469 	→ QPS: 726.4, Recall: 0.9547, Precision@returned: 0.9547, MRR: 0.9958, NDCG: 0.9683 (best of reps)
+1793573505.471 	Running search 1: ef=128, parallel=1
+1793573505.473 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793573516.704 	  rep 1/3: QPS 472.8
+1793573516.706 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793573527.995 	  rep 2/3: QPS 470.4
+1793573527.997 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793573539.099 	  rep 3/3: QPS 478.8
+1793573539.101 	→ QPS: 478.8, Recall: 0.9802, Precision@returned: 0.9802, MRR: 0.9986, NDCG: 0.9864 (best of reps)
+1793573539.102 	Running search 2: ef=256, parallel=1
+1793573539.104 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793573556.720 	  rep 1/3: QPS 294.9
+1793573556.722 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793573574.448 	  rep 2/3: QPS 293.0
+1793573574.450 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793573591.892 	  rep 3/3: QPS 297.9
+1793573591.894 	→ QPS: 297.9, Recall: 0.9915, Precision@returned: 0.9915, MRR: 0.9998, NDCG: 0.9943 (best of reps)
+1793573591.895 	Running search 3: ef=128, parallel=16
+1793573591.897 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793573593.598 	  rep 1/3: QPS 4790.4
+1793573593.600 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793573595.299 	  rep 2/3: QPS 4813.5
+1793573595.301 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793573597.011 	  rep 3/3: QPS 4781.8
+1793573597.013 	→ QPS: 4813.5, Recall: 0.9802, Precision@returned: 0.9802, MRR: 0.9986, NDCG: 0.9864 (best of reps)
+1793573597.014 	Running search 4: ef=128, parallel=100
+1793573597.016 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793573598.197 	  rep 1/3: QPS 9629.7
+1793573598.199 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793573599.403 	  rep 2/3: QPS 9326.2
+1793573599.405 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793573600.591 	  rep 3/3: QPS 9595.0
+1793573600.593 	→ QPS: 9629.7, Recall: 0.9802, Precision@returned: 0.9802, MRR: 0.9986, NDCG: 0.9864 (best of reps)
+1793573600.598 	Results saved to: "/home/ubuntu/vdbx/results/dragonfly-m16-ef128-dbpedia-openai-100K-1536-angular-search-0-34638-2026-11-01-22-53-20.json"
+1793573600.601 	Results saved to: "/home/ubuntu/vdbx/results/dragonfly-m16-ef128-dbpedia-openai-100K-1536-angular-search-1-34638-2026-11-01-22-53-20.json"
+1793573600.605 	Results saved to: "/home/ubuntu/vdbx/results/dragonfly-m16-ef128-dbpedia-openai-100K-1536-angular-search-2-34638-2026-11-01-22-53-20.json"
+1793573600.609 	Results saved to: "/home/ubuntu/vdbx/results/dragonfly-m16-ef128-dbpedia-openai-100K-1536-angular-search-3-34638-2026-11-01-22-53-20.json"
+1793573600.612 	Results saved to: "/home/ubuntu/vdbx/results/dragonfly-m16-ef128-dbpedia-openai-100K-1536-angular-search-4-34638-2026-11-01-22-53-20.json"
+1793573600.614 -----------------------------------------------------------------------------------------------
+1793573600.616 Recall     Precision  MRR      NDCG     QPS        P50 (ms)     P90 (ms)     P95 (ms)    
+1793573600.618 -----------------------------------------------------------------------------------------------
+1793573600.620 0.9915     0.9915     0.9998   0.9943   297.9      3.408        4.014        4.165       
+1793573600.621 0.9802     0.9802     0.9986   0.9864   9629.7     9.956        13.181       14.316      
+1793573600.623 0.9547     0.9547     0.9958   0.9683   726.4      1.373        1.582        1.654       
+1793573600.625 
+1793573600.627 
+1793573600.629 QPS vs Precision Trade-off - dragonfly-m16-ef128 - dbpedia-openai-100K-1536-angular (up and to the right is better):
+1793573600.630 
+1793573600.632     9630 │                                         ●                  
+1793573600.634     8754 │                                                            
+1793573600.636     7879 │                                                            
+1793573600.638     7003 │                                                            
+1793573600.640     6128 │                                                            
+1793573600.641     5253 │                                                            
+1793573600.643     4377 │                                                            
+1793573600.645     3502 │                                                            
+1793573600.647     2626 │                                                            
+1793573600.649     1751 │                                                            
+1793573600.650      875 │●                                                           
+1793573600.652        0 │                                                           ●
+1793573600.654          └────────────────────────────────────────────────────────────
+1793573600.656           0.955          0.967          0.979          0.991          
+1793573600.657         Precision (0.0 = 0%, 1.0 = 100%)
+1793573600.659 
+1793573600.661 THROUGHPUT vs CONCURRENCY (saturation curve):
+1793573600.663   ef=128 — peak 9629.7 QPS @ parallel 100 (still climbing at top of swept range — sweep higher to find the knee)
+1793573600.665     parallel         QPS     p50 ms     p90 ms     p95 ms     p99 ms    sat?
+1793573600.667            1       478.8      2.116      2.458      2.540      2.768       -
+1793573600.668           16      4813.5      3.289      3.519      3.652      4.225       -
+1793573600.670          100      9629.7      9.956     13.181     14.316     17.239       -
+1793573600.672 
+1793573600.674 ================================================================================
+1793573600.676 Results saved to:  /home/ubuntu/vdbx/results
+1793573600.678 Summary saved to:  /home/ubuntu/vdbx/results/dragonfly-m16-ef128-dbpedia-openai-100K-1536-angular-summary.json
+1793573600.680 Experiment stage: Cleanup (deleting index and data)
+1793573601.121 Experiment stage: Done
+1793573601.155 EXIT 0

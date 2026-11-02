@@ -1,0 +1,20 @@
+1793577724.163 RUN ./vector-db-benchmark --host 10.90.1.4 --engines-file dragonfly-engine.json --engines dragonfly-m16-ef128 --skip-search --datasets h-and-m-2048-angular-filters --skip-if-exists false 
+1793577724.171 vector-db-benchmark 0.2.0 (git d22d44e8b46009a800a59e952710166ece2e38a1)
+1793577724.173 Found 1 datasets, 1 engines
+1793577724.174 
+1793577724.176 ============================================================
+1793577724.178 Running experiment (1/1): dragonfly-m16-ef128 - h-and-m-2048-angular-filters
+1793577724.180 ============================================================
+1793577724.181 Experiment stage: Configure
+1793577724.183 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 128}
+1793577724.416 Experiment stage: Upload
+1793577724.418 Reading dataset from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793577726.115 Read 105100 vectors (2048d) in 1.698s (61885 vectors/sec)
+1793577726.118 Starting upload with 16 threads, batch size 64...
+1793577735.770 Upload time: 9.655s (10885 records/sec)
+1793577735.773 Indexing complete (num_docs=105100/105100, indexing=false, percent_indexed=1.00, state=absent) in 0.0s
+1793577735.775 Index time: 0.003s, Total time (read+upload+index): 11.357s
+1793577735.985 Results saved to: "/home/ubuntu/vdbx/results/dragonfly-m16-ef128-h-and-m-2048-angular-filters-upload-0-105100-2026-11-02-00-02-15.json"
+1793577735.987 Experiment stage: Cleanup (deleting index and data)
+1793577736.830 Experiment stage: Done
+1793577736.894 EXIT 0

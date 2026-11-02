@@ -1,0 +1,2 @@
+repo verify-published.sh exit=0 16 PASS / 0 FAIL
+repo replication_blackbox.sh exit=0 19 PASS / 0 FAIL

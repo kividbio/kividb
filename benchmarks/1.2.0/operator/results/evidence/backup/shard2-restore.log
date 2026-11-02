@@ -1,0 +1,3 @@
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+2026-11-02T00:12:41.644Z 1 [INFO] Loaded 1839847 keys from snapshot (0 with a TTL)

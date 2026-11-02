@@ -1,0 +1,3 @@
+2026-11-02T02:10:37.810Z 1508 [INFO] Found appendonly.aof — recovering from the append-only file
+2026-11-02T02:10:37.923Z 1508 [FATAL] appendonly.aof cannot be loaded: bad file format at byte offset 26557611 of 26558005 — what follows is not a command record
+2026-11-02T02:10:37.923Z 1508 [FATAL] Refusing to start with an empty dataset in place of one that could not be loaded. Fix the file (or its permissions), or move it out of the working directory to start empty on purpose.

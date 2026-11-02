@@ -1,0 +1,26 @@
+total 72112
+-rw-rw-r-- 1 azureuser azureuser    1133 Nov  1 22:56 SHA256SUMS.txt
+-rw-rw-r-- 1 azureuser azureuser 6375788 Nov  1 22:56 kividb-full-linux-aarch64.tar.gz
+-rw-rw-r-- 1 azureuser azureuser 6754633 Nov  1 22:56 kividb-full-linux-x86_64.tar.gz
+-rw-rw-r-- 1 azureuser azureuser 5650590 Nov  1 22:56 kividb-linux-aarch64.tar.gz
+-rw-rw-r-- 1 azureuser azureuser 5984367 Nov  1 22:56 kividb-linux-x86_64.tar.gz
+-rw-rw-r-- 1 azureuser azureuser 6139453 Nov  1 22:56 kividb-lua-linux-aarch64.tar.gz
+-rw-rw-r-- 1 azureuser azureuser 6508269 Nov  1 22:56 kividb-lua-linux-x86_64.tar.gz
+-rw-rw-r-- 1 azureuser azureuser 5890006 Nov  1 22:56 kividb-tls-linux-aarch64.tar.gz
+-rw-rw-r-- 1 azureuser azureuser 6229222 Nov  1 22:56 kividb-tls-linux-x86_64.tar.gz
+-rw-rw-r-- 1 azureuser azureuser 5979119 Nov  1 22:56 kividb.aarch64.rpm
+-rw-rw-r-- 1 azureuser azureuser 6329252 Nov  1 22:56 kividb.x86_64.rpm
+-rw-rw-r-- 1 azureuser azureuser 6102546 Nov  1 22:56 kividb_amd64.deb
+-rw-rw-r-- 1 azureuser azureuser 5874074 Nov  1 22:56 kividb_arm64.deb
+./kividb-full-linux-aarch64.tar.gz: OK
+./kividb-lua-linux-aarch64.tar.gz: OK
+./kividb-linux-aarch64.tar.gz: OK
+./kividb-linux-x86_64.tar.gz: OK
+./kividb-full-linux-x86_64.tar.gz: OK
+./kividb-tls-linux-x86_64.tar.gz: OK
+./kividb.aarch64.rpm: OK
+./kividb.x86_64.rpm: OK
+./kividb-lua-linux-x86_64.tar.gz: OK
+./kividb-tls-linux-aarch64.tar.gz: OK
+./kividb_arm64.deb: OK
+./kividb_amd64.deb: OK

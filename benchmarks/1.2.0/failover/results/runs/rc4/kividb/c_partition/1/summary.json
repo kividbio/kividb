@@ -1,0 +1,58 @@
+{
+ "mode": "cluster",
+ "writers": 16,
+ "duration_s": 70.0,
+ "acked": 492729,
+ "unacked_errors": 419,
+ "lost_acked": 14176,
+ "wrong_value": 0,
+ "wait_n": 0,
+ "wait_acked": 0,
+ "wait_acked_lost": 0,
+ "lost_ack_time_first": 20.291,
+ "lost_ack_time_last": 40.715,
+ "lost_sample": [
+  "ack:0:11686",
+  "ack:0:11691",
+  "ack:0:11694",
+  "ack:0:11695",
+  "ack:0:11698",
+  "ack:0:11699",
+  "ack:0:11701",
+  "ack:0:11705",
+  "ack:0:11709",
+  "ack:0:11712",
+  "ack:0:11716",
+  "ack:0:11723",
+  "ack:0:11727",
+  "ack:0:11730",
+  "ack:0:11734",
+  "ack:0:11738",
+  "ack:0:11740",
+  "ack:0:11741",
+  "ack:0:11744",
+  "ack:0:11745"
+ ],
+ "events": [
+  [
+   20.592,
+   "partition: 10.40.1.9 cut off from the other servers"
+  ],
+  [
+   40.591,
+   "partition healed"
+  ]
+ ],
+ "recovery": {
+  "event_t": 20.592,
+  "pre_event_ok_per_100ms_median": 924,
+  "first_error_t": 25.700000000000003,
+  "last_error_t": 40.6,
+  "writes_below_80pct_from_t": 22.200000000000003,
+  "throughput_back_t": 22.3,
+  "recovery_s": 1.71
+ },
+ "error_kinds": {
+  "ClusterDownError:The": 419
+ }
+}

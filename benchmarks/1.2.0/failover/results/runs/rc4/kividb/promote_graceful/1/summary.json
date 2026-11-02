@@ -1,0 +1,37 @@
+{
+ "mode": "standalone",
+ "writers": 16,
+ "duration_s": 60.0,
+ "acked": 640739,
+ "unacked_errors": 21,
+ "lost_acked": 0,
+ "wrong_value": 0,
+ "wait_n": 0,
+ "wait_acked": 0,
+ "wait_acked_lost": 0,
+ "lost_ack_time_first": null,
+ "lost_ack_time_last": null,
+ "lost_sample": [],
+ "events": [
+  [
+   20.007,
+   "switchover start (CLIENT PAUSE WRITE on master)"
+  ],
+  [
+   20.037,
+   "replica promoted, clients moved, old master demoted"
+  ]
+ ],
+ "recovery": {
+  "event_t": 20.007,
+  "pre_event_ok_per_100ms_median": 1087,
+  "first_error_t": 20.0,
+  "last_error_t": 20.0,
+  "writes_below_80pct_from_t": 20.0,
+  "throughput_back_t": 20.1,
+  "recovery_s": 0.09
+ },
+ "error_kinds": {
+  "ReadOnlyError:You": 21
+ }
+}

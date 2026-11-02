@@ -1,0 +1,16 @@
+USER-SUPPLIED VALUES:
+agent:
+  image:
+    pullPolicy: Always
+    repository: ACR.azurecr.io/kividb-operator-agent
+    tag: 0.7.0-eefe65d
+gui:
+  image:
+    pullPolicy: Always
+    repository: ACR.azurecr.io/kividb-operator-gui
+    tag: 0.7.0-eefe65d
+manager:
+  image:
+    pullPolicy: Always
+    repository: ACR.azurecr.io/kividb-operator
+    tag: 0.7.0-eefe65d

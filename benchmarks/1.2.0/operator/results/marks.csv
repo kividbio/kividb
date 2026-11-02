@@ -1,0 +1,204 @@
+scenario,unix,label
+rep,1793569711,apply
+rep,1793569741,Running
+P1,1793569830,CRDs applied
+P1,1793569833,helm upgrade
+P1,1793569856,new manager up
+P1,1793569947,rollout done
+S1,1793570030,shd Running
+R0,1793570088,DbOps restart created
+R0,1793570231,DbOps Completed
+F0,1793570302,FAILOVER shd-0-0
+F0,1793570329,FAILOVER shd-1-0
+F0,1793570356,FAILOVER shd-2-0
+X0,1793570452,SIGSTOP shd-1-0
+X0,1793570610,shd-1-0 container restarted
+X0,1793570629,shd-1-0 Ready
+K0,1793570687,SIGKILL shd-0-0
+K0,1793570701,shd-0-0 Ready
+D0,1793570757,force delete shd-2-0
+D0,1793570772,shd-2-0 Ready
+loaders,1793570934,"recreated pinned to vmss000003, prefix g2"
+N0,1793570972,drain vmss000001
+N0,1793571013,drained
+N0,1793571020,all kividb pods Ready
+G0,1793571119,delete shd-1-0
+G0,1793571123,old shd-1-0 gone
+G0,1793571154,shd-1-0 Ready
+M0up,1793571422,spec.shards=4
+M0up,1793571458,RebalanceCompleted
+M0up,1793571460,Running with 8 pods
+M0down,1793571516,spec.shards=3
+M0down,1793571522,RebalanceCompleted
+M0down,1793571524,Running with 6 pods
+XR0,1793571928,SIGSTOP rep-0
+XR0,1793572083,rep-0 container restarted
+XR0,1793572102,rep-0 Ready
+DR0,1793572169,force delete rep-1
+DR0,1793572214,rep-1 Ready
+loaders,1793572671,v5 open-loop prefix g3
+restart-113,1793572722,DbOps restart
+restart-113,1793572726,DbOps Completed
+failover-113,1793572798,FAILOVER shd-0-1
+failover-113,1793572824,FAILOVER shd-1-0
+failover-113,1793572854,FAILOVER shd-2-1
+sigstop-113,1793572920,SIGSTOP shd-1-0
+sigstop-113,1793573076,shd-1-0 container restarted
+sigstop-113,1793573094,shd-1-0 Ready
+sigkill-113,1793573145,SIGKILL shd-0-1
+sigkill-113,1793573159,shd-0-1 Ready
+forcedel-113,1793573210,force delete shd-2-1
+forcedel-113,1793573225,shd-2-1 Ready
+delete-113,1793573275,delete shd-1-1
+delete-113,1793573278,old shd-1-1 gone
+delete-113,1793573316,shd-1-1 Ready
+drain-113,1793573369,drain vmss000000
+drain-113,1793573392,drained
+drain-113,1793573431,all kividb pods Ready
+loaders,1793573440,v6 open-loop 5 s deadline prefix g4
+reshard-up-113,1793573487,spec.shards=4
+reshard-up-113,1793573525,Running with 8 pods
+reshard-down-113,1793573738,spec.shards=3
+reshard-down-113,1793573749,RebalanceCompleted
+reshard-down-113,1793573751,Running with 6 pods
+restart-113,1793573801,DbOps restart
+restart-113,1793573989,DbOps Completed
+failover-113,1793574039,FAILOVER shd-0-0
+failover-113,1793574066,FAILOVER shd-1-0
+failover-113,1793574095,FAILOVER shd-2-1
+sigstop-113,1793574163,SIGSTOP shd-1-0
+sigstop-113,1793574315,shd-1-0 container restarted
+sigstop-113,1793574334,shd-1-0 Ready
+sigkill-113,1793574385,SIGKILL shd-0-0
+sigkill-113,1793574405,shd-0-0 Ready
+forcedel-113,1793574457,force delete shd-2-1
+forcedel-113,1793574471,shd-2-1 Ready
+delete-113,1793574523,delete shd-1-1
+delete-113,1793574526,old shd-1-1 gone
+delete-113,1793574545,shd-1-1 Ready
+drain-113,1793574598,drain vmss000003
+drain-113,1793574601,drained
+drain-113,1793574602,all kividb pods Ready
+rep-sigstop-113,1793574668,SIGSTOP rep-1
+rep-sigstop-113,1793574821,rep-1 container restarted
+rep-sigstop-113,1793574839,rep-1 Ready
+rep-forcedel-113,1793574892,force delete rep-0
+rep-forcedel-113,1793574936,rep-0 Ready
+drain-113,1793575006,drain vmss000002
+drain-113,1793575031,drained
+drain-113,1793575070,all kividb pods Ready
+upgrade-rep,1793575140,spec.image -> v1.2.0-rc4
+upgrade-rep,1793575247,"all 3 pods on v1.2.0-rc4, Running"
+upgrade-shd,1793575299,spec.image -> v1.2.0-rc4
+upgrade-shd,1793575455,"all 6 pods on v1.2.0-rc4, Running"
+restart-rc4,1793575519,DbOps restart
+restart-rc4,1793575665,DbOps Completed
+failover-rc4,1793575723,FAILOVER shd-0-1
+failover-rc4,1793575749,FAILOVER shd-1-0
+failover-rc4,1793575779,FAILOVER shd-2-1
+sigstop-rc4,1793575850,SIGSTOP shd-1-0
+sigstop-rc4,1793576005,shd-1-0 container restarted
+sigstop-rc4,1793576024,shd-1-0 Ready
+sigkill-rc4,1793576076,SIGKILL shd-0-1
+sigkill-rc4,1793576088,shd-0-1 Ready
+forcedel-rc4,1793576141,force delete force
+forcedel-rc4,1793576541,force Ready
+delete-rc4,1793576597,delete shd-1-1
+delete-rc4,1793576600,old shd-1-1 gone
+delete-rc4,1793576619,shd-1-1 Ready
+delete-rc4,1793577032,still split: shd-1-0 cluster_state fail; CLUSTER MEET shd-2-1 from shd-1-0
+delete-rc4,1793577036,after CLUSTER MEET
+drain-rc4,1793577118,drain vmss000002
+drain-rc4,1793577144,drained
+drain-rc4,1793577182,all kividb pods Ready
+reshard-up-rc4,1793577263,spec.shards=4
+drain-rc4,1793577269,split again (shd-1-0 <-> shd-2-1 stale IPs); CLUSTER MEET both ways
+reshard-up-rc4,1793577305,RebalanceCompleted
+reshard-up-rc4,1793577307,Running with 8 pods
+reshard-down-rc4,1793577369,spec.shards=3
+reshard-down-rc4,1793577380,RebalanceCompleted
+reshard-down-rc4,1793577382,Running with 6 pods
+forcedel-rc4,1793577443,force delete shd-2-0
+forcedel-rc4,1793577482,shd-2-0 Ready
+repdel-rc4,1793577545,delete replica shd-0-0
+repdel-rc4,1793577580,shd-0-0 Ready
+repdel2-rc4,1793577643,delete replica shd-2-0
+repdel2-rc4,1793577667,shd-2-0 Ready
+rep-sigstop-rc4,1793577728,SIGSTOP rep-0
+rep-sigstop-rc4,1793577880,rep-0 container restarted
+rep-sigstop-rc4,1793577899,rep-0 Ready
+rep-forcedel-rc4,1793577957,force delete rep-1
+rep-forcedel-rc4,1793577973,rep-1 Ready
+rep-restart-rc4,1793578034,DbOps restart
+rep-restart-rc4,1793578170,DbOps Completed
+backup,1793578217,rep: loader stopped
+backup,1793578238,rep: rep-bk-054018 complete
+backup,1793578307,rep: rep-restored Running after 66 s
+backup,1793578339,rep: loader started
+backup,1793578339,shd: loader stopped
+backup,1793578350,shd: shd-bk-054221 complete
+backup,1793578378,shd: loader started
+BULK,1793578395,start 2500000
+BULK,1793578399,done
+reshard-bulk-up-rc4,1793578467,spec.shards=4
+reshard-bulk-up-rc4,1793578524,RebalanceCompleted
+reshard-bulk-up-rc4,1793578856,Running with 8 pods
+reshard-bulk-down-rc4,1793578925,spec.shards=3
+reshard-bulk-down-rc4,1793578952,RebalanceCompleted
+reshard-bulk-down-rc4,1793578961,Running with 6 pods
+split-repro-rc4,1793579030,try 1: delete shd-0-0 and shd-1-0 together
+split-repro-rc4,1793579076,try 1: SPLIT reproduced
+split-outage-rc4,1793579392,CLUSTER FAILOVER on shd-0-0 and shd-1-0 (the two nodes with stale addresses of each other)
+P1,1793569912,op: Switchover
+reshard-up-113,1793573489,op: RebalanceStarted
+reshard-up-113,1793573519,op: RebalanceCompleted
+reshard-down-113,1793573739,op: RebalanceStarted
+reshard-down-113,1793573745,op: RebalanceCompleted
+restart-113,1793573899,op: ShardSwitchover (shard 0)
+restart-113,1793573925,op: ShardSwitchover (shard 1)
+restart-113,1793573965,op: ShardSwitchover (shard 2)
+failover-113,1793574042,op: ShardFailover (shard 0)
+failover-113,1793574069,op: ShardFailover (shard 1)
+failover-113,1793574098,op: ShardFailover (shard 2)
+sigstop-113,1793574183,op: ShardFailover (shard 1)
+delete-113,1793574524,op: ShardSwitchover
+rep-sigstop-113,1793574715,op: Failover
+rep-forcedel-113,1793574930,op: Failover
+drain-113,1793575010,op: ShardSwitchover
+drain-113-rep,1793575010,op: ShardSwitchover
+drain-113,1793575010,op: ShardSwitchover (shard 2)
+drain-113-rep,1793575010,op: ShardSwitchover (shard 2)
+drain-113,1793575035,op: ShardSwitchover (shard 1)
+drain-113-rep,1793575035,op: ShardSwitchover (shard 1)
+upgrade-rep,1793575213,op: Switchover
+upgrade-shd,1793575391,op: ShardSwitchover
+upgrade-shd,1793575415,op: ShardSwitchover
+upgrade-shd,1793575415,op: ShardSwitchover (shard 1)
+upgrade-shd,1793575433,op: ShardSwitchover
+upgrade-shd,1793575433,op: ShardSwitchover (shard 0)
+restart-rc4,1793575592,op: ShardSwitchover
+restart-rc4,1793575592,op: ShardSwitchover (shard 0)
+restart-rc4,1793575617,op: ShardSwitchover (shard 1)
+restart-rc4,1793575643,op: ShardSwitchover
+restart-rc4,1793575643,op: ShardSwitchover (shard 2)
+failover-rc4,1793575725,op: ShardFailover (shard 0)
+failover-rc4,1793575752,op: ShardFailover (shard 1)
+failover-rc4,1793575782,op: ShardFailover (shard 2)
+sigstop-rc4,1793575865,op: ShardFailover (shard 1)
+delete-rc4,1793576598,op: ShardSwitchover (shard 1)
+drain-rc4,1793577122,op: ShardSwitchover (shard 2)
+drain-rc4-rep,1793577122,op: ShardSwitchover (shard 2)
+drain-rc4,1793577148,op: ShardSwitchover (shard 1)
+drain-rc4-rep,1793577148,op: ShardSwitchover (shard 1)
+reshard-up-rc4,1793577265,op: RebalanceStarted
+reshard-up-rc4,1793577302,op: RebalanceCompleted
+reshard-down-rc4,1793577371,op: RebalanceStarted
+reshard-down-rc4,1793577379,op: RebalanceCompleted
+forcedel-rc4,1793577451,op: ShardFailover (shard 2)
+rep-sigstop-rc4,1793577780,op: Failover
+rep-restart-rc4,1793578136,op: Switchover
+reshard-bulk-up-rc4,1793578468,op: RebalanceStarted
+reshard-bulk-up-rc4,1793578521,op: RebalanceCompleted
+reshard-bulk-down-rc4,1793578927,op: RebalanceStarted
+reshard-bulk-down-rc4,1793578947,op: RebalanceCompleted
+split-outage-rc4,1793579393,op: ShardFailover (shard 0)

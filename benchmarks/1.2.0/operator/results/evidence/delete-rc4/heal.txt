@@ -1,0 +1,18 @@
+cluster_state:fail
+OK
+== shd-1-0.shd-1
+cluster_state:ok
+10.244.1.66:6380@16380,shd-2-1.shd-2-headless.e2e.svc master 10923-16383
+10.244.3.62:6380@16380,shd-1-1.shd-1-headless.e2e.svc slave 
+10.244.1.83:6380@16380,shd-1-0.shd-1-headless.e2e.svc myself,master 5462-10922
+10.244.2.246:6380@16380,shd-0-0.shd-0-headless.e2e.svc slave 
+10.244.0.11:6380@16380,shd-2-0.shd-2-headless.e2e.svc slave 
+10.244.3.103:6380@16380,shd-0-1.shd-0-headless.e2e.svc master 0-5461
+== shd-2-1.shd-2
+cluster_state:ok
+10.244.1.66:6380@16380,shd-2-1.shd-2-headless.e2e.svc myself,master 10923-16383
+10.244.3.62:6380@16380,shd-1-1.shd-1-headless.e2e.svc slave 
+10.244.1.83:6380@16380,shd-1-0.shd-1-headless.e2e.svc master 5462-10922
+10.244.2.246:6380@16380,shd-0-0.shd-0-headless.e2e.svc slave 
+10.244.0.11:6380@16380,shd-2-0.shd-2-headless.e2e.svc slave 
+10.244.3.103:6380@16380,shd-0-1.shd-0-headless.e2e.svc master 0-5461

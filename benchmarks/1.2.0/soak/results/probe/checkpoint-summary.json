@@ -1,0 +1,22 @@
+{
+ "kividb-default": {
+  "checkpoints_in_180s": 17,
+  "p99_ms_median": 0.52,
+  "p999_ms_median": 1.53,
+  "p999_ms_max": 101.4,
+  "max_ms": 209.2,
+  "seconds_with_p999_over_10ms": 34,
+  "seconds_with_p999_over_30ms": 31,
+  "seconds_with_max_over_50ms": 23
+ },
+ "redis": {
+  "checkpoints_in_180s": 17,
+  "p99_ms_median": 0.52,
+  "p999_ms_median": 1.35,
+  "p999_ms_max": 99.2,
+  "max_ms": 205.6,
+  "seconds_with_p999_over_10ms": 20,
+  "seconds_with_p999_over_30ms": 6,
+  "seconds_with_max_over_50ms": 1
+ }
+}

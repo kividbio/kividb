@@ -311,12 +311,26 @@ static QUEUED: std::sync::LazyLock<tokio::sync::Notify> =
 /// connection that sent the record writes it before it replies (see
 /// [`written`]), and woken, the thread took the lock first and left the
 /// connection waiting to be woken in turn — a quarter of the writes a
-/// second. What no reply waits for (an expiry's delete, a replica's stream)
-/// is written with the next connection's, or by the writer's next sync, a
-/// second at most.
+/// second. What no reply waits for (an expiry's delete) is written with the
+/// next connection's, or by the writer's next sync, a second at most. A
+/// replica's stream has no connection's to go with: its applier wakes the
+/// writer itself, once a batch ([`stream_applied`]).
 #[inline]
 pub fn records_queued() {
     if !acks_wait() {
+        QUEUED.notify_one();
+    }
+}
+
+/// A replica has applied a batch of its master's stream. Its records have no
+/// reply waiting for them to write them, and a read-only replica takes no
+/// writes of its own whose replies would: the writer thread writes them. Left to the
+/// writer's sync once a second, a replica under sustained writes fell behind
+/// its master, its queue (and with it its memory) grew by the second, and
+/// its checkpoints, queued behind the backlog, did not finish for minutes.
+#[inline]
+pub fn stream_applied() {
+    if WRITER_RUNNING.load(Ordering::Acquire) {
         QUEUED.notify_one();
     }
 }
@@ -683,6 +697,7 @@ fn write_queued(
     let mut wrote = false;
     let mut released = false;
     let mut barriers = Vec::new();
+    let mut drained = 0usize;
     loop {
         let mut batch = Vec::new();
         let mark = match first.take() {
@@ -699,11 +714,28 @@ fn write_queued(
             },
             None => drain_into(&mut batch, rx, &mut barriers),
         };
+        // A batch that stopped at the cap left more queued. Going on with it
+        // here, not on the next pass: what no reply waits for (a replica's
+        // stream) may have no next pass but the second's sync, and one batch
+        // a second fell behind 40 MB/s of writes, with the queue, and the
+        // turn-over of a checkpoint behind it, growing without end. Not for
+        // ever, though: with writes coming faster than the disk takes them
+        // the queue never empties, and whoever holds the log would keep it,
+        // the second's sync waiting behind. Past a budget, the writer thread
+        // is woken to go on, and the sync gets its turn.
+        let more_queued = batch.len() >= MAX_AOF_BATCH_BYTES;
+        drained += batch.len();
         wrote |= !batch.is_empty();
         write_batch(file, &batch);
         released |= !barriers.is_empty();
         release_barriers(&mut barriers);
         let Some(generation) = mark else {
+            if more_queued {
+                if drained < MAX_AOF_PASS_BYTES {
+                    continue;
+                }
+                QUEUED.notify_one();
+            }
             return (wrote, released);
         };
         let result = perform_turn_over(file);
@@ -938,6 +970,10 @@ fn sync_dir() -> std::io::Result<()> {
 /// single write. Capped so one burst cannot hand the kernel an arbitrarily
 /// large buffer; whatever is left stays queued and goes out on the next pass.
 const MAX_AOF_BATCH_BYTES: usize = 4 * 1024 * 1024;
+
+/// How much one pass over the queue writes, at most, before it lets the log
+/// go (see [`write_queued`]): about a second of a fast disk's writes.
+const MAX_AOF_PASS_BYTES: usize = 64 * 1024 * 1024;
 
 /// How long the writer stays away from its queue after a write. It adds this
 /// much, at most, to how long a record written under load waits to reach
@@ -1648,6 +1684,24 @@ fn classify_tail(rest: &[u8]) -> Tail {
                 }
             }
         }
+    }
+
+    // Zeros to the end of the file: what a power loss leaves where the last
+    // writes were. The file system recorded the file's new length, and the
+    // data never reached the disk (ext4 commits the size first). Those
+    // writes were never synced, so cut off with whatever record they end;
+    // a server refused to start over them. Zeros with anything after them
+    // are not a tail: a hole in the middle of the log is damage.
+    let end = rest
+        .iter()
+        .rposition(|&b| b != 0)
+        .map_or(0, |last| last + 1);
+    if end < rest.len() {
+        return if end == 0 {
+            Tail::Truncated
+        } else {
+            classify_tail(&rest[..end])
+        };
     }
 
     if rest.first() != Some(&b'*') {
@@ -2475,6 +2529,42 @@ mod replay_parse_tests {
         }
     }
 
+    /// A power loss leaves zeros where the last, unsynced, writes were: the
+    /// file's length reached the disk and its data did not. That is a
+    /// truncation, after a whole record or in the middle of one; zeros with
+    /// something after them are a hole, and damage.
+    #[test]
+    fn zeros_to_the_end_of_the_file_are_a_truncation() {
+        let whole = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$5\r\nvalue\r\n";
+        assert_eq!(classify_tail(&[0u8; 316]), Tail::Truncated);
+        for cut in 1..whole.len() {
+            let mut torn = whole[..cut].to_vec();
+            torn.extend_from_slice(&[0u8; 64]);
+            assert_eq!(classify_tail(&torn), Tail::Truncated, "cut at {cut}");
+        }
+        let mut hole = vec![0u8; 64];
+        hole.extend_from_slice(whole);
+        assert_eq!(classify_tail(&hole), Tail::Corrupt);
+        let mut damaged = b"not a record".to_vec();
+        damaged.extend_from_slice(&[0u8; 64]);
+        assert_eq!(classify_tail(&damaged), Tail::Corrupt);
+    }
+
+    /// Replayed, a log ending in zeros loads every whole record and is cut
+    /// where the zeros start.
+    #[test]
+    fn a_log_ending_in_zeros_is_cut_where_they_start() {
+        let mut buf = enc(&["SET", "a", "1"]);
+        buf.extend_from_slice(&enc(&["SET", "b", "2"]));
+        let valid = buf.len();
+        buf.extend_from_slice(b"*3\r\n$3\r\nSE");
+        buf.extend_from_slice(&[0u8; 4096]);
+        let (commands, consumed) = parse_aof_commands(&buf);
+        assert_eq!(commands.len(), 2);
+        assert_eq!(consumed, valid);
+        assert_eq!(classify_tail(&buf[consumed..]), Tail::Truncated);
+    }
+
     fn enc(parts: &[&str]) -> Vec<u8> {
         let mut v = format!("*{}\r\n", parts.len()).into_bytes();
         for p in parts {
@@ -2825,5 +2915,63 @@ mod record_group_tests {
         // A script that writes nothing queues nothing.
         drop(RecordGroup::begin(&sent));
         assert_eq!(sent.0.lock().len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod backlog_tests {
+    use super::*;
+
+    /// A queue holding more than one batch is written whole in one call: a
+    /// replica's stream, with no reply to write it, has only the writer's
+    /// passes, and one batch a pass fell behind sustained writes.
+    #[test]
+    fn everything_queued_is_written_not_one_batch_of_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("appendonly.aof");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("open");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let record = vec![b'x'; 64 * 1024];
+        let records = 3 * MAX_AOF_BATCH_BYTES / record.len() + 7;
+        for _ in 0..records {
+            tx.send(record.clone()).expect("send");
+        }
+        let (wrote, released) = write_queued(&mut file, &mut rx, None);
+        assert!(wrote);
+        assert!(!released);
+        assert!(rx.try_recv().is_err(), "nothing is left queued");
+        let len = std::fs::metadata(&path).expect("metadata").len();
+        assert_eq!(len, (records * record.len()) as u64);
+    }
+
+    /// One pass lets the log go after its budget, so that a queue fed
+    /// faster than the disk takes it does not keep the second's sync out;
+    /// the rest goes on the next.
+    #[test]
+    fn a_pass_stops_at_its_budget_and_the_next_takes_the_rest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("appendonly.aof");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("open");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let record = vec![b'x'; MAX_AOF_BATCH_BYTES];
+        let records = MAX_AOF_PASS_BYTES / record.len() + 3;
+        for _ in 0..records {
+            tx.send(record.clone()).expect("send");
+        }
+        write_queued(&mut file, &mut rx, None);
+        let len = std::fs::metadata(&path).expect("metadata").len();
+        assert_eq!(len, MAX_AOF_PASS_BYTES as u64, "one pass writes its budget");
+        write_queued(&mut file, &mut rx, None);
+        assert!(rx.try_recv().is_err(), "the next pass takes the rest");
+        let len = std::fs::metadata(&path).expect("metadata").len();
+        assert_eq!(len, (records * record.len()) as u64);
     }
 }

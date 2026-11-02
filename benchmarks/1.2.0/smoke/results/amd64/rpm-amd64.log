@@ -1,0 +1,63 @@
+=== rpm-amd64 (rpm /home/azureuser/rc-bin/v1.2.0-rc4/kividb.x86_64.rpm, variant default) ===
+NOTE: rpm does not install on the minimal amazonlinux:2023 image (no shadow-utils; the package does not require it): Error in PREIN scriptlet in rpm package kividb
+PASS: rpm: dnf install on Amazon Linux 2023 (with shadow-utils, as on a full host)
+PASS: rpm: /usr/bin/kividb and the kividb user exist
+PASS: starts and answers PING with PONG
+PASS: --version says 1.2.0-rc4 (kividb 1.2.0-rc4)
+PASS: INFO kividb_version
+PASS: INFO has # Server
+PASS: INFO has # Clients
+PASS: INFO has # Memory
+PASS: INFO has # Persistence
+PASS: INFO has # Stats
+PASS: INFO has # Replication
+PASS: INFO has # CPU
+PASS: INFO has # Keyspace
+PASS: INFO aof_enabled
+PASS: INFO role
+PASS: string SET
+PASS: string GET
+PASS: string APPEND
+PASS: string INCRBY
+PASS: string MSET/MGET
+PASS: string 1 MB value
+PASS: expiry SET EX
+PASS: expiry TTL (100)
+PASS: expiry key gone after PX 200
+PASS: hash HSET
+PASS: hash HGET
+PASS: hash HINCRBY
+PASS: hash HLEN
+PASS: list RPUSH
+PASS: list LRANGE
+PASS: list LPOP
+PASS: set SADD
+PASS: set SISMEMBER
+PASS: set SCARD
+PASS: zset ZADD
+PASS: zset ZRANGE WITHSCORES
+PASS: zset ZSCORE
+PASS: stream XADD (1793573819489-0)
+PASS: stream XLEN
+PASS: hll PFADD
+PASS: hll PFCOUNT
+PASS: bitmap BITCOUNT
+PASS: geo GEODIST km
+PASS: json JSON.SET
+PASS: json JSON.GET
+PASS: transaction MULTI/EXEC
+PASS: vector set VADD
+PASS: vector set VSIM
+PASS: FT.CREATE
+PASS: FT.SEARCH text
+PASS: FT.SEARCH numeric
+PASS: FT.SEARCH tag
+PASS: no Lua in this variant: EVAL refused
+PASS: CONFIG GET appendonly
+PASS: restarts after kill -9
+PASS: kill -9 + AOF replay: DBSIZE back (20019)
+PASS: kill -9 + AOF replay: every checked value back
+PASS: restarts after a clean shutdown
+PASS: clean shutdown + snapshot load: every checked value back
+PASS: INFO still says version after restarts
+RESULT rpm-amd64 60 0 

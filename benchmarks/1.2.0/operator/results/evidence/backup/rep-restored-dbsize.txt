@@ -1,0 +1,4 @@
+rep-restored-0 6389882
+rep-restored-1 0
+rep-restored-0 6389882 role:master 
+rep-restored-1 6389882 role:slave master_link_status:up master_sync_in_progress:0 

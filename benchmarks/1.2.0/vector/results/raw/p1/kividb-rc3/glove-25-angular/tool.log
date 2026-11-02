@@ -1,0 +1,87 @@
+1793573615.258 RUN ./vector-db-benchmark --host 10.90.1.4 --engines-file kividb-engine.json --parallels 100 --datasets glove-25-angular --skip-if-exists false 
+1793573615.265 vector-db-benchmark v0.1.0
+1793573615.267 Found 1 datasets, 1 engines
+1793573615.269 
+1793573615.271 ============================================================
+1793573615.273 Running experiment (1/1): kividb-glove25 - glove-25-angular
+1793573615.275 ============================================================
+1793573615.276 Experiment stage: Configure
+1793573615.278 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 256}
+1793573615.280 Experiment stage: Upload
+1793573615.282 Reading dataset from /home/ubuntu/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793573615.458 Read 1183514 vectors (25d) in 0.188s (6299485 vectors/sec)
+1793573615.460 Starting upload with 100 threads, batch size 64...
+1793573644.294 Upload time: 28.836s (41043 records/sec)
+1793573644.379 Indexing complete: 1183514 docs in 0.1s
+1793573644.380 Index time: 0.085s, Total time (read+upload+index): 29.109s
+1793573644.507 Results saved to: "/home/ubuntu/vdb/results/kividb-glove25-glove-25-angular-upload-0-1183514-2026-11-01-22-54-04.json"
+1793573644.509 Experiment stage: Search
+1793573644.511 	Running search 0: ef=64, parallel=100
+1793573644.592 	Reading queries from /home/ubuntu/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793573644.867 	  rep 1/3: QPS 38655.4
+1793573644.952 	Reading queries from /home/ubuntu/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793573645.224 	  rep 2/3: QPS 39056.4
+1793573645.309 	Reading queries from /home/ubuntu/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793573645.581 	  rep 3/3: QPS 39033.7
+1793573645.583 	→ QPS: 39056.4, Recall: 0.9478, Precision: 0.9478, MRR: 1.0000, NDCG: 0.9621 (best of reps)
+1793573645.585 	Running search 1: ef=128, parallel=100
+1793573645.668 	Reading queries from /home/ubuntu/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793573645.971 	  rep 1/3: QPS 34930.2
+1793573646.057 	Reading queries from /home/ubuntu/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793573646.361 	  rep 2/3: QPS 34800.8
+1793573646.445 	Reading queries from /home/ubuntu/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793573646.751 	  rep 3/3: QPS 34552.0
+1793573646.753 	→ QPS: 34930.2, Recall: 0.9646, Precision: 0.9646, MRR: 1.0000, NDCG: 0.9743 (best of reps)
+1793573646.755 	Running search 2: ef=256, parallel=100
+1793573646.833 	Reading queries from /home/ubuntu/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793573647.268 	  rep 1/3: QPS 23980.9
+1793573647.354 	Reading queries from /home/ubuntu/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793573647.788 	  rep 2/3: QPS 24021.4
+1793573647.870 	Reading queries from /home/ubuntu/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793573648.308 	  rep 3/3: QPS 23956.1
+1793573648.310 	→ QPS: 24021.4, Recall: 0.9908, Precision: 0.9908, MRR: 1.0000, NDCG: 0.9934 (best of reps)
+1793573648.312 	Running search 3: ef=512, parallel=100
+1793573648.391 	Reading queries from /home/ubuntu/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793573649.061 	  rep 1/3: QPS 15399.0
+1793573649.147 	Reading queries from /home/ubuntu/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793573649.821 	  rep 2/3: QPS 15300.0
+1793573649.904 	Reading queries from /home/ubuntu/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793573650.579 	  rep 3/3: QPS 15285.3
+1793573650.581 	→ QPS: 15399.0, Recall: 0.9983, Precision: 0.9983, MRR: 1.0000, NDCG: 0.9988 (best of reps)
+1793573650.824 	Results saved to: "/home/ubuntu/vdb/results/kividb-glove25-glove-25-angular-search-0-35571-2026-11-01-22-54-10.json"
+1793573650.826 	Results saved to: "/home/ubuntu/vdb/results/kividb-glove25-glove-25-angular-search-1-35571-2026-11-01-22-54-10.json"
+1793573650.828 	Results saved to: "/home/ubuntu/vdb/results/kividb-glove25-glove-25-angular-search-2-35571-2026-11-01-22-54-10.json"
+1793573650.830 	Results saved to: "/home/ubuntu/vdb/results/kividb-glove25-glove-25-angular-search-3-35571-2026-11-01-22-54-10.json"
+1793573650.832 ----------------------------------------------------------------------------------
+1793573650.834 Recall     Precision  MRR      NDCG     QPS        P50 (ms)     P95 (ms)    
+1793573650.835 ----------------------------------------------------------------------------------
+1793573650.837 0.9983     0.9983     1.0000   0.9988   15399.0    6.142        8.508       
+1793573650.839 0.9908     0.9908     1.0000   0.9934   24021.4    3.916        5.343       
+1793573650.841 0.9646     0.9646     1.0000   0.9743   34930.2    2.659        3.659       
+1793573650.843 0.9478     0.9478     1.0000   0.9621   39056.4    2.397        3.288       
+1793573650.844 
+1793573650.846 
+1793573650.848 QPS vs Precision Trade-off - kividb-glove25 - glove-25-angular (up and to the right is better):
+1793573650.849 
+1793573650.851    39056 │●                                                           
+1793573650.853    35506 │                    ●                                       
+1793573650.855    31955 │                                                            
+1793573650.856    28405 │                                                            
+1793573650.858    24854 │                                                  ●         
+1793573650.861    21303 │                                                            
+1793573650.862    17753 │                                                            
+1793573650.864    14202 │                                                           ●
+1793573650.866    10652 │                                                            
+1793573650.868     7101 │                                                            
+1793573650.870     3551 │                                                            
+1793573650.872        0 │                                                            
+1793573650.874          └────────────────────────────────────────────────────────────
+1793573650.876           0.948          0.965          0.981          0.998          
+1793573650.877         Precision (0.0 = 0%, 1.0 = 100%)
+1793573650.879 
+1793573650.881 ================================================================================
+1793573650.883 Results saved to:  /home/ubuntu/vdb/results
+1793573650.885 Summary saved to:  /home/ubuntu/vdb/results/kividb-glove25-glove-25-angular-summary.json
+1793573650.887 Experiment stage: Cleanup (deleting index and data)
+1793573656.116 Experiment stage: Done
+1793573656.126 EXIT 0

@@ -1,0 +1,60 @@
+--------------------------------------------------------------------------------
+Profile data file '/tmp/cgr/out.1' (creator: callgrind-3.19.0)
+--------------------------------------------------------------------------------
+I1 cache: 
+D1 cache: 
+LL cache: 
+Timerange: Basic block 0 - 71961948
+Trigger: dump
+Profiled target:  /tmp/redis-8.10.3/src/redis-server --port 6410 --bind 127.0.0.1 --save  --appendonly no --set-proc-title no (PID 6796, part 1)
+Events recorded:  Ir
+Events shown:     Ir
+Event sort order: Ir
+Thresholds:       99
+Include dirs:     
+User annotated:   
+Auto-annotation:  on
+
+--------------------------------------------------------------------------------
+Ir                   
+--------------------------------------------------------------------------------
+321,742,717 (100.0%)  PROGRAM TOTALS
+
+--------------------------------------------------------------------------------
+Ir                   file:function
+--------------------------------------------------------------------------------
+26,232,203 ( 8.15%)  /tmp/redis-8.10.3/src/networking.c:processInputBuffer [/tmp/redis-8.10.3/src/redis-server]
+17,340,542 ( 5.39%)  /tmp/redis-8.10.3/src/server.c:call [/tmp/redis-8.10.3/src/redis-server]
+12,989,160 ( 4.04%)  /tmp/redis-8.10.3/src/siphash.c:siphash [/tmp/redis-8.10.3/src/redis-server]
+12,858,521 ( 4.00%)  /tmp/redis-8.10.3/src/memory_prefetch.c:dictPrefetcherRun.lto_priv.0 [/tmp/redis-8.10.3/src/redis-server]
+ 9,491,571 ( 2.95%)  /tmp/redis-8.10.3/src/networking.c:resetClientInternal.lto_priv.0 [/tmp/redis-8.10.3/src/redis-server]
+ 9,180,320 ( 2.85%)  /tmp/redis-8.10.3/src/server.c:processCommand [/tmp/redis-8.10.3/src/redis-server]
+ 8,880,205 ( 2.76%)  /tmp/redis-8.10.3/src/util.c:string2ll.part.0 [/tmp/redis-8.10.3/src/redis-server]
+ 8,820,539 ( 2.74%)  /tmp/redis-8.10.3/src/zmalloc.c:zmalloc_usable [/tmp/redis-8.10.3/src/redis-server]
+ 8,067,382 ( 2.51%)  /tmp/redis-8.10.3/src/db.c:dbSetValue.lto_priv.0 [/tmp/redis-8.10.3/src/redis-server]
+ 7,787,127 ( 2.42%)  /tmp/redis-8.10.3/src/sds.c:sdsnewplacement [/tmp/redis-8.10.3/src/redis-server]
+ 6,477,498 ( 2.01%)  /tmp/redis-8.10.3/src/dict.c:dictFindLinkInternal.lto_priv.0 [/tmp/redis-8.10.3/src/redis-server]
+ 5,085,192 ( 1.58%)  /tmp/redis-8.10.3/src/sds.h:processInputBuffer
+ 5,040,186 ( 1.57%)  /tmp/redis-8.10.3/src/object.c:createStringObject [/tmp/redis-8.10.3/src/redis-server]
+ 5,024,480 ( 1.56%)  /tmp/redis-8.10.3/src/object.c:decrRefCount.part.0 [/tmp/redis-8.10.3/src/redis-server]
+ 4,673,316 ( 1.45%)  /tmp/redis-8.10.3/src/t_string.c:setGenericCommand [/tmp/redis-8.10.3/src/redis-server]
+ 4,362,176 ( 1.36%)  /tmp/redis-8.10.3/src/db.c:setKeyByLink [/tmp/redis-8.10.3/src/redis-server]
+ 4,200,140 ( 1.31%)  /tmp/redis-8.10.3/src/db.c:preprocessCommand
+ 4,083,888 ( 1.27%)  /tmp/redis-8.10.3/src/server.c:preprocessCommand [/tmp/redis-8.10.3/src/redis-server]
+ 3,746,380 ( 1.16%)  /tmp/redis-8.10.3/src/memory_prefetch.c:prefetchCommands [/tmp/redis-8.10.3/src/redis-server]
+ 3,733,049 ( 1.16%)  ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:__memcpy_avx_unaligned_erms [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 3,660,126 ( 1.14%)  /tmp/redis-8.10.3/src/object.c:resetClientInternal.lto_priv.0
+ 3,568,808 ( 1.11%)  /tmp/redis-8.10.3/src/db.c:lookupKey.constprop.1 [/tmp/redis-8.10.3/src/redis-server]
+ 3,420,058 ( 1.06%)  /tmp/redis-8.10.3/src/db.c:getKeysFromCommandWithSpecs [/tmp/redis-8.10.3/src/redis-server]
+ 3,318,839 ( 1.03%)  /tmp/redis-8.10.3/src/memory_prefetch.c:addCommandToBatch [/tmp/redis-8.10.3/src/redis-server]
+ 3,240,108 ( 1.01%)  ./string/../sysdeps/x86_64/multiarch/memchr-avx2.S:__memchr_avx2 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 2,885,414 ( 0.90%)  /tmp/redis-8.10.3/src/module.c:moduleNotifyKeyUnlink [/tmp/redis-8.10.3/src/redis-server]
+ 2,880,000 ( 0.90%)  /tmp/redis-8.10.3/src/notify.c:notifyKeyspaceEventImpl.lto_priv.0 [/tmp/redis-8.10.3/src/redis-server]
+ 2,640,072 ( 0.82%)  /tmp/redis-8.10.3/src/sds.c:_sdsnewlen.constprop.0 [/tmp/redis-8.10.3/src/redis-server]
+ 2,580,602 ( 0.80%)  /tmp/redis-8.10.3/src/networking.c:_addReplyToBufferOrList.part.0 [/tmp/redis-8.10.3/src/redis-server]
+ 2,580,000 ( 0.80%)  /tmp/redis-8.10.3/src/object.c:tryObjectEncodingEx [/tmp/redis-8.10.3/src/redis-server]
+ 2,523,671 ( 0.78%)  /tmp/redis-8.10.3/src/sds.h:dictSdsCompareKV
+ 2,466,560 ( 0.77%)  /tmp/redis-8.10.3/src/zmalloc.c:zmalloc [/tmp/redis-8.10.3/src/redis-server]
+ 2,400,280 ( 0.75%)  ./string/../sysdeps/x86_64/multiarch/strcmp-avx2.S:__strcasecmp_avx2 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 2,377,720 ( 0.74%)  /tmp/redis-8.10.3/src/object.c:decrRefCount [/tmp/redis-8.10.3/src/redis-server]
+ 2,280,000 ( 0.71%)  /tmp/redis-8.10.3/src/db.c:setGetKeys [/tmp/redis-8.10.3/src/redis-server]

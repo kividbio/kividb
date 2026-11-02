@@ -1,0 +1,22 @@
+1793576330.239 RUN ./vector-db-benchmark --host 10.90.1.4 --engines-file kividb-engine.json --engines kividb-m16-ef128 --skip-search --datasets dbpedia-openai-1M-1536-angular --skip-if-exists false 
+1793576330.246 vector-db-benchmark 0.2.0 (git d22d44e8b46009a800a59e952710166ece2e38a1)
+1793576330.248 Found 1 datasets, 1 engines
+1793576330.250 
+1793576330.251 ============================================================
+1793576330.253 Running experiment (1/1): kividb-m16-ef128 - dbpedia-openai-1M-1536-angular
+1793576330.255 ============================================================
+1793576330.257 Experiment stage: Configure
+1793576330.258 KiviDB server: `INFO server` reported `kividb_version:1.2.0-rc4`
+1793576330.260 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 128}
+1793576330.262 Experiment stage: Upload
+1793576330.264 Reading dataset from /home/ubuntu/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793576330.266 WARNING: dataset 'dbpedia-openai-1M-1536-angular' declares vector_count 1000000 but its corpus holds only 999000 vectors. Benchmarks will run over the 999000 vectors that exist; fix vector_count in datasets/datasets.json (it is what --list-datasets reports).
+1793576339.944 Read 999000 vectors (1536d) in 9.692s (103071 vectors/sec)
+1793576339.947 Starting upload with 16 threads, batch size 64...
+1793576559.809 Upload time: 219.866s (4544 records/sec)
+1793576559.879 Indexing complete (algorithm=hnsw, num_docs=Some(999000), hnsw_live_count=Some(999000)/999000, compaction_in_progress=false) in 0.1s
+1793576559.881 Index time: 0.070s, Total time (read+upload+index): 229.628s
+1793576560.380 Results saved to: "/home/ubuntu/vdbx/results/kividb-m16-ef128-dbpedia-openai-1M-1536-angular-upload-0-999000-2026-11-01-23-42-40.json"
+1793576560.591 Experiment stage: Cleanup (deleting index and data)
+1793576565.873 Experiment stage: Done
+1793576565.877 EXIT 0

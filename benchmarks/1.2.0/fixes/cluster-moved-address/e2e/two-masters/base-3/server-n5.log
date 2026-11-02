@@ -1,0 +1,85 @@
+
+===== start at 0.73s on 10.99.0.15
+2026-11-02T01:19:09.962Z 34808 [WARN] cluster bus port 17000 is not authenticated: any host that can reach it can join this cluster. Set cluster-bus-secret, or restrict the port to cluster members at the network layer.
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc4 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc4
+  * Mode           : cluster
+  * OS             : linux x86_64
+  * Memory         : 31GiB available
+  * CPUs           : 3 cores detected
+  * Listening on   : 0.0.0.0:7000
+  * Cluster bus    : 0.0.0.0:17000
+  * Node timeout   : 5000ms
+  * Node ID        : (printed after cluster init)
+  * Worker threads : 3
+  * AOF            : disabled
+  * Persistence    : KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-02T01:19:10.008Z 34808 [INFO] KiviDB 1.2.0-rc4 starting: pid 34808, default build, config file '/clm/n5/kividb.conf'
+2026-11-02T01:19:10.008Z 34808 [INFO] I/O model      : io_uring
+2026-11-02T01:19:10.020Z 34808 [INFO] Cluster: Node ID        : 93afe19a45b167fac9b514a759b98ca0366dbfba
+2026-11-02T01:19:10.020Z 34808 [INFO] Cluster: Bus port       : 17000
+2026-11-02T01:19:10.020Z 34808 [INFO] Shards per DB  : 32
+2026-11-02T01:19:10.020Z 34808 [INFO] I/O model      : io_uring
+2026-11-02T01:19:10.021Z 34808 [INFO] Cluster: Bus listener bound on 0.0.0.0:17000
+2026-11-02T01:19:10.021Z 34808 [INFO] Cluster: Heartbeat loop started (interval 1s)
+2026-11-02T01:19:10.021Z 34808 [INFO] Cluster: Failure detection started (interval 100ms, node_timeout 5000ms)
+2026-11-02T01:19:10.021Z 34808 [INFO] Ready to accept connections on 0.0.0.0:7000
+2026-11-02T01:19:10.114Z 34808 [INFO] Cluster: Learned own address from an outgoing link: 10.99.0.15
+2026-11-02T01:19:11.024Z 34808 [INFO] Cluster: config epoch collision with ffac69f445f58abf71555bab57c4b1a3d6b14dc0 — moved to 3
+2026-11-02T01:19:11.999Z 34808 [INFO] Cluster: config epoch collision with b86e449290e161ac4f93f5e6a90fbda7337975c4 — moved to 4
+2026-11-02T01:19:13.106Z 34808 [INFO] Replication: Connecting to master 10.99.0.12:7000...
+2026-11-02T01:19:13.107Z 34808 [INFO] Replication: Full resync from 1eeffc3b1f981ccdebcf0ae3e52766727859a7eb offset=0
+2026-11-02T01:19:13.107Z 34808 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-02T01:19:13.108Z 34808 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:19:13.108Z 34808 [INFO] Replication: Synced with 10.99.0.12:7000. Entering command stream.
+2026-11-02T01:19:33.144Z 34808 [WARN] Replication: Master closed the connection — reconnecting
+2026-11-02T01:19:34.150Z 34808 [INFO] Replication: Connecting to master 10.99.0.12:7000...
+2026-11-02T01:19:44.322Z 34808 [INFO] Cluster: Replication target is now 10.99.0.22:7000 — re-pointing
+2026-11-02T01:19:44.327Z 34808 [INFO] Replication: Connecting to master 10.99.0.22:7000...
+2026-11-02T01:19:44.329Z 34808 [INFO] Replication: This dataset is the master's at the start of its stream 27ae09b3761113ae5c47b9a4ac53399e6112c2a5 — asking to be continued from there
+2026-11-02T01:19:44.330Z 34808 [INFO] Replication: Partial resync: continuing from offset 0 — no dataset transfer
+2026-11-02T01:19:44.330Z 34808 [INFO] Replication: Synced with 10.99.0.22:7000. Entering command stream.
+2026-11-02T01:19:44.407Z 34808 [INFO] Replication: Replication session for 10.99.0.12:7000 superseded — stopping replication client
+2026-11-02T01:19:44.410Z 34808 [INFO] Replication: Backlog restarted at offset 0 (it ended at 20795)
+2026-11-02T01:19:53.287Z 34808 [WARN] Cluster: Node 5b880541b088b92e6e3397c7c0497ece68ad8d12 marked FAIL (reported by abe8ee9c18f6e27a90f5546fb1779d5fdaf60d31)
+2026-11-02T01:19:54.026Z 34808 [INFO] Cluster: Node 5b880541b088b92e6e3397c7c0497ece68ad8d12 is reachable again — clearing FAIL
+2026-11-02T01:22:43.702Z 34808 [INFO] SIGTERM received — shutting down gracefully
+2026-11-02T01:22:43.702Z 34808 [INFO] Writing final snapshot...
+2026-11-02T01:22:43.710Z 34808 [INFO] Snapshot saved  → /clm/n5/dump.kdb (16 databases)
+2026-11-02T01:22:43.710Z 34808 [INFO] Goodbye.

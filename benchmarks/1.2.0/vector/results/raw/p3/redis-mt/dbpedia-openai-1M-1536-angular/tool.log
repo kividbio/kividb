@@ -1,0 +1,22 @@
+1793579509.042 RUN ./vector-db-benchmark --host 10.90.1.4 --engines-file redis-engine.json --engines redis-m16-ef128 --skip-search --datasets dbpedia-openai-1M-1536-angular --skip-if-exists false 
+1793579509.049 vector-db-benchmark 0.2.0 (git d22d44e8b46009a800a59e952710166ece2e38a1)
+1793579509.051 Found 1 datasets, 1 engines
+1793579509.053 
+1793579509.055 ============================================================
+1793579509.056 Running experiment (1/1): redis-m16-ef128 - dbpedia-openai-1M-1536-angular
+1793579509.058 ============================================================
+1793579509.060 Experiment stage: Configure
+1793579509.062 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 128}
+1793579509.063 Experiment stage: Upload
+1793579509.065 Reading dataset from /home/ubuntu/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793579509.067 WARNING: dataset 'dbpedia-openai-1M-1536-angular' declares vector_count 1000000 but its corpus holds only 999000 vectors. Benchmarks will run over the 999000 vectors that exist; fix vector_count in datasets/datasets.json (it is what --list-datasets reports).
+1793579509.069 WARNING: dataset 'dbpedia-openai-1M-1536-angular' declares vector_count 1000000 but its corpus holds only 999000 vectors. Benchmarks will run over the 999000 vectors that exist; fix vector_count in datasets/datasets.json (it is what --list-datasets reports).
+1793579518.691 Read 999000 vectors (1536d) in 9.635s (103682 vectors/sec)
+1793579518.692 Starting upload with 16 threads, batch size 64...
+1793579699.962 Upload time: 181.272s (5511 records/sec)
+1793579699.964 Indexing complete (num_docs=999000/999000, indexing=false, percent_indexed=1.00, state=absent) in 0.0s
+1793579699.966 Index time: 0.001s, Total time (read+upload+index): 190.908s
+1793579700.397 Results saved to: "/home/ubuntu/vdbx/results/redis-m16-ef128-dbpedia-openai-1M-1536-angular-upload-0-999000-2026-11-02-00-35-00.json"
+1793579700.401 Experiment stage: Cleanup (deleting index and data)
+1793579702.435 Experiment stage: Done
+1793579702.438 EXIT 0

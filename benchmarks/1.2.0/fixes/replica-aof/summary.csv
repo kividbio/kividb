@@ -1,0 +1,5 @@
+run,samples,replica_used_first_MB,replica_used_max_MB,replica_used_last_MB,master_used_last_MB,rewrite_in_progress_samples,replica_checkpoints_done,replica_checkpoint_s_median,replica_checkpoint_s_max,replica_checkpoint_open_at_end,master_checkpoints_done,master_checkpoint_s_median,lag_bytes_median,lag_bytes_max,load_ops_per_s_median
+rc4-aof,24,520,7066,7066,945,20/24,1,155.48,155.48,True,23,0.8,1722,49236,100000
+fixed-aof,24,214,936,902,1036,1/24,23,0.7,0.73,False,23,0.78,814,34458,100000
+fixed-noaof,24,339,902,902,1037,0/24,0,,,False,23,0.8,1965,43709,100000
+fixed-aof-15m,90,224,996,909,952,6/90,85,0.71,0.79,False,84,0.82,1826,58458,100000

@@ -1,0 +1,35 @@
+=== testing image: ghcr.io/kividbio/kividb:v1.2.0-rc4 ===
+=== starting master-a, master-b, replica ===
+
+=== baseline: SET on master-a, REPLICAOF replica -> master-a ===
+PASS: SET probe=1 on master-a
+PASS: REPLICAOF master-a issued on replica
+PASS: replica master_link_status:up against master-a
+PASS: replica reports LIVE master_host (not boot config)
+PASS: SET on master-a propagated to replica
+
+=== the regression scenario: re-point replica from master-a to master-b, without ever leaving role:slave ===
+PASS: REPLICAOF master-b issued on replica
+PASS: replica INFO now reports master-b (live target, not stale)
+PASS: replica stayed role:slave throughout the re-point
+PASS: SET probe2=2 on master-b
+PASS: SET on master-b propagated to replica (new link is live)
+
+=== the actual bug: the OLD replication task against master-a must have exited, not kept running ===
+PASS: stale task disconnected from master-a (connected_slaves:0)
+PASS: master-b sees exactly one replica, not a duplicate registration
+
+=== repeated REPLICAOF to the already-current master is a no-op, not a fresh resync ===
+PASS: repeated REPLICAOF master-b stays OK
+PASS: repeated REPLICAOF master-b stays OK
+PASS: repeated REPLICAOF master-b stays OK
+PASS: link stays up across repeated identical REPLICAOF calls
+
+=== REPLICAOF NO ONE promotes and clears the reported master ===
+PASS: REPLICAOF NO ONE issued on replica
+PASS: role:master after REPLICAOF NO ONE
+PASS: promotion clears the recorded master (master_host absent)
+
+=== summary: 19 passed, 0 failed (image: ghcr.io/kividbio/kividb:v1.2.0-rc4) ===
+
+=== tearing down ===

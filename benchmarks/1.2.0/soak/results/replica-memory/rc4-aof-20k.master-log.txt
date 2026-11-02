@@ -1,0 +1,5 @@
+2026-11-02T00:31:37.505Z 62923 [INFO] AOF: rebased onto dump.kdb (generation 25) — log is now the delta
+2026-11-02T00:31:47.505Z 62923 [INFO] AOF: auto-checkpoint: 326.37 MB is 100%+ above the 33.76 MB baseline — folding into dump.kdb
+2026-11-02T00:31:48.678Z 62923 [INFO] AOF: rebased onto dump.kdb (generation 26) — log is now the delta
+2026-11-02T00:31:58.678Z 62923 [INFO] AOF: auto-checkpoint: 331.04 MB is 100%+ above the 34.77 MB baseline — folding into dump.kdb
+2026-11-02T00:31:59.857Z 62923 [INFO] AOF: rebased onto dump.kdb (generation 27) — log is now the delta

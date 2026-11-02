@@ -1,0 +1,12 @@
+2026-11-01T23:11:55.085Z 1 [INFO] Replication: Promoted to master via REPLICAOF NO ONE
+2026-11-01T23:11:55.169Z 1 [INFO] Replication: Command stream from 10.244.0.42:6380 superseded (epoch 1) — dropping connection
+2026-11-01T23:11:55.169Z 1 [INFO] Replication: Replication session for 10.244.0.42:6380 superseded — stopping replication client
+2026-11-01T23:11:55.232Z 1 [INFO] Replication: Backlog restarted at offset 152415745 (it ended at 0)
+2026-11-01T23:11:55.232Z 1 [INFO] Replication: Channel replica registered: 10.244.1.199:49558
+2026-11-01T23:11:55.574Z 1 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub
+2026-11-01T23:13:46.517Z 1 [INFO] Replication: Channel replica registered: 10.244.0.42:33176
+2026-11-01T23:13:46.866Z 1 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub
+2026-11-01T23:14:53.663Z 1 [INFO] SIGTERM received — shutting down gracefully
+2026-11-01T23:14:53.663Z 1 [INFO] Writing final snapshot...
+2026-11-01T23:14:55.526Z 1 [INFO] AOF: rebased onto dump.kdb (generation 4) — log is now the delta
+2026-11-01T23:14:55.526Z 1 [INFO] Goodbye.

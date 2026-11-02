@@ -1,0 +1,103 @@
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+2026-11-01T23:25:53.842Z 1 [INFO] KiviDB 1.2.0-rc4 starting: pid 1, default build, config file '/etc/kividb/kividb.conf'
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc4 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc4
+  * Mode           : cluster
+  * OS             : linux x86_64
+  * Memory         : 15GiB available
+  * CPUs           : 4 cores detected
+  * Listening on   : 0.0.0.0:6380
+  * Cluster bus    : 0.0.0.0:16380
+  * Node timeout   : 5000ms
+  * Node ID        : (printed after cluster init)
+  * Worker threads : 2
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : /etc/kividb/acl/users.acl
+
+2026-11-01T23:25:53.842Z 1 [INFO] I/O model      : io_uring
+2026-11-01T23:25:53.849Z 1 [INFO] ACL file loaded: /etc/kividb/acl/users.acl
+2026-11-01T23:25:53.849Z 1 [INFO] Cluster: Node ID        : c2bba9ce7583025e1e52557edc9dffdf8827b2aa
+2026-11-01T23:25:53.849Z 1 [INFO] Cluster: Bus port       : 16380
+2026-11-01T23:25:53.849Z 1 [INFO] Shards per DB  : 32
+2026-11-01T23:25:53.849Z 1 [INFO] I/O model      : io_uring
+2026-11-01T23:25:53.849Z 1 [INFO] Found dump.kdb — loading native snapshot
+2026-11-01T23:25:54.937Z 1 [INFO] Loaded 1369553 keys from snapshot (0 with a TTL)
+2026-11-01T23:25:54.943Z 1 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+2026-11-01T23:25:54.946Z 1 [INFO] Replication: Loaded dataset is offset 85376433 of baccaa66ccb1804b4d0d4c05fcafa807d729e36d — a partial resync will be asked for
+2026-11-01T23:25:54.946Z 1 [INFO] Cluster: Restored replica role of master e46a08ae89d2cdb5fa74beb1715432d92de992d7 → restarting replication client
+2026-11-01T23:25:54.946Z 1 [INFO] Cluster: Bus listener bound on 0.0.0.0:16380
+2026-11-01T23:25:54.946Z 1 [INFO] Cluster: Heartbeat loop started (interval 1s)
+2026-11-01T23:25:54.946Z 1 [INFO] Cluster: Failure detection started (interval 100ms, node_timeout 5000ms)
+2026-11-01T23:25:54.946Z 1 [INFO] Replication: Connecting to master 10.244.1.16:6380...
+2026-11-01T23:25:54.946Z 1 [INFO] Ready to accept connections on 0.0.0.0:6380
+2026-11-01T23:25:54.949Z 1 [INFO] Replication: Partial resync: continuing from offset 85376433 — no dataset transfer
+2026-11-01T23:25:54.949Z 1 [INFO] Replication: Synced with 10.244.1.16:6380. Entering command stream.
+2026-11-01T23:26:04.832Z 1 [INFO] CONFIG SET cluster-announce-hostname shd-1-1.shd-1-headless.e2e.svc
+2026-11-01T23:26:11.516Z 1 [WARN] Cluster: Node eb1ae7633be84d663adc38704cab562828a1483f marked FAIL (reported by fad063987c7a012d1f95933969c5aafcdcc228d2)
+2026-11-01T23:26:19.744Z 1 [INFO] Cluster: Node eb1ae7633be84d663adc38704cab562828a1483f is reachable again — clearing FAIL
+2026-11-01T23:26:41.631Z 1 [WARN] Cluster: Node fad063987c7a012d1f95933969c5aafcdcc228d2 marked FAIL (reported by e46a08ae89d2cdb5fa74beb1715432d92de992d7)
+2026-11-01T23:26:47.032Z 1 [INFO] Cluster: Node fad063987c7a012d1f95933969c5aafcdcc228d2 is reachable again — clearing FAIL
+2026-11-01T23:26:56.631Z 1 [INFO] Cluster: Manual failover: starting election at epoch 48 to replace e46a08ae89d2cdb5fa74beb1715432d92de992d7
+2026-11-01T23:26:56.648Z 1 [INFO] Cluster: Won election at epoch 48 (2 votes, quorum 2)
+2026-11-01T23:26:56.653Z 1 [INFO] Replication: Promoted; the stream baccaa66ccb1804b4d0d4c05fcafa807d729e36d goes on as 015c4eb295fb7c1375030298724b6cc8ea9baaf3 from offset 86145552 — its replicas can be continued
+2026-11-01T23:26:56.654Z 1 [INFO] Cluster: Vote from 12921ba0547672f08374c76be8537262ab47d13f for epoch 48 not counted: the election here is over
+2026-11-01T23:26:56.660Z 1 [INFO] Replication: Channel replica registered: 10.244.1.16:42294
+2026-11-01T23:26:56.803Z 1 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub
+2026-11-01T23:26:56.821Z 1 [INFO] Replication: Command stream from 10.244.1.16:6380 superseded (epoch 1) — dropping connection
+2026-11-01T23:26:56.821Z 1 [INFO] Replication: Replication session for 10.244.1.16:6380 superseded — stopping replication client
+2026-11-01T23:27:01.992Z 1 [INFO] Replication: uring: replica disconnected
+2026-11-01T23:27:06.783Z 1 [WARN] Cluster: Node e46a08ae89d2cdb5fa74beb1715432d92de992d7 marked FAIL (reported by e78261d088e3ec01b23062e77b6c459304bea3da)
+2026-11-01T23:27:11.208Z 1 [INFO] Replication: Partial resync for 10.244.1.83:43284: continuing from offset 86198631 (113778 bytes of backlog)
+2026-11-01T23:27:12.217Z 1 [INFO] Cluster: Node e46a08ae89d2cdb5fa74beb1715432d92de992d7 is reachable again — clearing FAIL
+2026-11-01T23:27:22.153Z 1 [INFO] Cluster: Voted for eb1ae7633be84d663adc38704cab562828a1483f to take over from 12921ba0547672f08374c76be8537262ab47d13f at epoch 49 (manual failover)
+2026-11-01T23:27:32.048Z 1 [WARN] Cluster: Node 12921ba0547672f08374c76be8537262ab47d13f marked FAIL by quorum
+2026-11-01T23:27:32.174Z 1 [INFO] Cluster: Node 12921ba0547672f08374c76be8537262ab47d13f is reachable again — clearing FAIL
+2026-11-01T23:28:45.390Z 1 [INFO] Cluster: Voted for fad063987c7a012d1f95933969c5aafcdcc228d2 to take over from e78261d088e3ec01b23062e77b6c459304bea3da at epoch 50 (manual failover)
+2026-11-01T23:29:12.047Z 1 [INFO] Cluster: Manual failover requested by e46a08ae89d2cdb5fa74beb1715432d92de992d7 — writes paused, replica must reach offset 87558482
+2026-11-01T23:29:12.053Z 1 [INFO] Cluster: Voted for e46a08ae89d2cdb5fa74beb1715432d92de992d7 to take over from c2bba9ce7583025e1e52557edc9dffdf8827b2aa at epoch 51 (manual failover)
+2026-11-01T23:29:12.113Z 1 [INFO] Cluster: Slots of this shard are now owned by e46a08ae89d2cdb5fa74beb1715432d92de992d7 — following it as a replica
+2026-11-01T23:29:12.114Z 1 [INFO] Replication: Connecting to master 10.244.1.83:6380...
+2026-11-01T23:29:12.114Z 1 [INFO] Replication: Replica 10.244.1.83:43284 disconnected: this node is now a replica itself
+2026-11-01T23:29:12.114Z 1 [INFO] Replication: uring: replica disconnected
+2026-11-01T23:29:12.255Z 1 [INFO] Replication: Full resync from ec42480992a604aa8a095425b88baa28ea575321 offset=87558611
+2026-11-01T23:29:12.255Z 1 [INFO] Replication: Receiving full-sync payload (34740115 bytes)...
+2026-11-01T23:29:12.447Z 1 [WARN] Replication: Dropped the 1420290 local keys before loading 1420293 from the master
+2026-11-01T23:29:13.525Z 1 [INFO] Replication: Full sync loaded: 1420293 keys (0 with a TTL), replacing 1420290 local keys
+2026-11-01T23:29:13.561Z 1 [INFO] Replication: AOF is on — rebasing it onto the synced dataset
+2026-11-01T23:29:13.939Z 1 [INFO] AOF: rebased onto dump.kdb (generation 18) — log is now the delta
+2026-11-01T23:29:13.939Z 1 [INFO] Replication: Synced with 10.244.1.83:6380. Entering command stream.
+2026-11-01T23:29:13.940Z 1 [INFO] Replication: Backlog restarted at offset 87558611 (it ended at 87558482)

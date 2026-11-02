@@ -1,0 +1,35 @@
+{
+ "mode": "standalone",
+ "writers": 16,
+ "duration_s": 80.0,
+ "acked": 853371,
+ "unacked_errors": 0,
+ "lost_acked": 0,
+ "wrong_value": 0,
+ "wait_n": 0,
+ "wait_acked": 0,
+ "wait_acked_lost": 0,
+ "lost_ack_time_first": null,
+ "lost_ack_time_last": null,
+ "lost_sample": [],
+ "events": [
+  [
+   20.33,
+   "partition master <-> replica"
+  ],
+  [
+   50.316,
+   "partition healed"
+  ]
+ ],
+ "recovery": {
+  "event_t": 20.33,
+  "pre_event_ok_per_100ms_median": 1040,
+  "first_error_t": null,
+  "last_error_t": null,
+  "writes_below_80pct_from_t": 49.6,
+  "throughput_back_t": 49.800000000000004,
+  "recovery_s": 29.47
+ },
+ "error_kinds": {}
+}

@@ -1,0 +1,21 @@
+1793575909.711 RUN ./vector-db-benchmark --host 10.90.1.4 --engines-file kividb-engine.json --engines kividb-m16-ef128 --skip-search --datasets dbpedia-openai-100K-1536-angular --skip-if-exists false 
+1793575909.718 vector-db-benchmark 0.2.0 (git d22d44e8b46009a800a59e952710166ece2e38a1)
+1793575909.720 Found 1 datasets, 1 engines
+1793575909.722 
+1793575909.724 ============================================================
+1793575909.725 Running experiment (1/1): kividb-m16-ef128 - dbpedia-openai-100K-1536-angular
+1793575909.727 ============================================================
+1793575909.729 Experiment stage: Configure
+1793575909.731 KiviDB server: `INFO server` reported `kividb_version:1.2.0-rc4`
+1793575909.733 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 128}
+1793575909.735 Experiment stage: Upload
+1793575909.736 Reading dataset from /home/ubuntu/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793575910.402 Read 100000 vectors (1536d) in 0.678s (147550 vectors/sec)
+1793575910.404 Starting upload with 16 threads, batch size 64...
+1793575921.950 Upload time: 11.549s (8659 records/sec)
+1793575921.958 Indexing complete (algorithm=hnsw, num_docs=Some(100000), hnsw_live_count=Some(100000)/100000, compaction_in_progress=false) in 0.0s
+1793575921.960 Index time: 0.008s, Total time (read+upload+index): 12.234s
+1793575922.011 Results saved to: "/home/ubuntu/vdbx/results/kividb-m16-ef128-dbpedia-openai-100K-1536-angular-upload-0-100000-2026-11-01-23-32-02.json"
+1793575922.028 Experiment stage: Cleanup (deleting index and data)
+1793575922.448 Experiment stage: Done
+1793575922.450 EXIT 0

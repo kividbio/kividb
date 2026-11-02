@@ -1,0 +1,4 @@
+2026-11-02T00:00:44.847Z 1 [INFO] Replication: uring: replica disconnected
+2026-11-02T00:00:49.716Z 1 [WARN] Cluster: Node eb1ae7633be84d663adc38704cab562828a1483f marked FAIL (reported by fad063987c7a012d1f95933969c5aafcdcc228d2)
+2026-11-02T00:00:54.152Z 1 [INFO] Replication: Partial resync for 10.244.1.131:36546: continuing from offset 101480423 (116186 bytes of backlog)
+2026-11-02T00:00:55.157Z 1 [INFO] Cluster: Node eb1ae7633be84d663adc38704cab562828a1483f is reachable again — clearing FAIL

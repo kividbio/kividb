@@ -1,0 +1,56 @@
+{
+ "mode": "standalone",
+ "writers": 16,
+ "duration_s": 60.0,
+ "acked": 640300,
+ "unacked_errors": 0,
+ "lost_acked": 319,
+ "wrong_value": 0,
+ "wait_n": 0,
+ "wait_acked": 0,
+ "wait_acked_lost": 0,
+ "lost_ack_time_first": 20.009,
+ "lost_ack_time_last": 20.057,
+ "lost_sample": [
+  "ack:0:13489",
+  "ack:0:13490",
+  "ack:0:13491",
+  "ack:0:13492",
+  "ack:0:13493",
+  "ack:0:13494",
+  "ack:0:13495",
+  "ack:0:13496",
+  "ack:0:13497",
+  "ack:0:13498",
+  "ack:0:13499",
+  "ack:0:13500",
+  "ack:0:13501",
+  "ack:0:13502",
+  "ack:0:13503",
+  "ack:0:13504",
+  "ack:0:13505",
+  "ack:0:13506",
+  "ack:0:13507",
+  "ack:1:13257"
+ ],
+ "events": [
+  [
+   20.011,
+   "REPLICAOF NO ONE on replica, clients moved"
+  ],
+  [
+   22.011,
+   "old master demoted"
+  ]
+ ],
+ "recovery": {
+  "event_t": 20.011,
+  "pre_event_ok_per_100ms_median": 1132,
+  "first_error_t": null,
+  "last_error_t": null,
+  "writes_below_80pct_from_t": 25.6,
+  "throughput_back_t": 25.700000000000003,
+  "recovery_s": 5.69
+ },
+ "error_kinds": {}
+}

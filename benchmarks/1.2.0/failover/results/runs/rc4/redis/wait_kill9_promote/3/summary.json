@@ -1,0 +1,38 @@
+{
+ "mode": "standalone",
+ "writers": 16,
+ "duration_s": 60.0,
+ "acked": 112104,
+ "unacked_errors": 527,
+ "lost_acked": 0,
+ "wrong_value": 0,
+ "wait_n": 1,
+ "wait_acked": 109762,
+ "wait_acked_lost": 0,
+ "lost_ack_time_first": null,
+ "lost_ack_time_last": null,
+ "lost_sample": [],
+ "events": [
+  [
+   20.285,
+   "kill -9 master"
+  ],
+  [
+   21.01,
+   "replica promoted, clients moved"
+  ]
+ ],
+ "recovery": {
+  "event_t": 20.285,
+  "pre_event_ok_per_100ms_median": 547,
+  "first_error_t": 20.200000000000003,
+  "last_error_t": 21.0,
+  "writes_below_80pct_from_t": 20.200000000000003,
+  "throughput_back_t": null,
+  "recovery_s": null
+ },
+ "error_kinds": {
+  "ConnectionError:Connection": 2,
+  "ConnectionError:Error": 525
+ }
+}

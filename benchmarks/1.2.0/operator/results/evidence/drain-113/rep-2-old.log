@@ -1,0 +1,4 @@
+2026-11-01T23:16:49.137Z 1 [INFO] SIGTERM received — shutting down gracefully
+2026-11-01T23:16:49.137Z 1 [INFO] Writing final snapshot...
+2026-11-01T23:16:51.035Z 1 [INFO] AOF: rebased onto dump.kdb (generation 8) — log is now the delta
+2026-11-01T23:16:51.036Z 1 [INFO] Goodbye.

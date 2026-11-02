@@ -1,0 +1,38 @@
+diff --git a/src/cluster/bus/listener.rs b/src/cluster/bus/listener.rs
+index 769a22d..5e50b4b 100644
+--- a/src/cluster/bus/listener.rs
++++ b/src/cluster/bus/listener.rs
+@@ -900,7 +900,15 @@ mod tests {
+         let cs = ClusterState::new_enabled(None, 15000);
+         let (a, b) = (generate_node_id(), generate_node_id());
+         process_message(&cs, meet(a), peer());
+-        process_message(&cs, ping(a, NodeFlags::MASTER, vec![gossip_of(b, "10.0.0.8", 7002, NodeFlags::MASTER)]), peer());
++        process_message(
++            &cs,
++            ping(
++                a,
++                NodeFlags::MASTER,
++                vec![gossip_of(b, "10.0.0.8", 7002, NodeFlags::MASTER)],
++            ),
++            peer(),
++        );
+         cs.nodes.write().get_mut(&b).unwrap().flags |= NodeFlags::PFAIL;
+ 
+         let moved = gossip_of(b, "10.0.0.88", 7002, NodeFlags::MASTER);
+@@ -922,7 +930,15 @@ mod tests {
+         let cs = ClusterState::new_enabled(None, 15000);
+         let (a, b) = (generate_node_id(), generate_node_id());
+         process_message(&cs, meet(a), peer());
+-        process_message(&cs, ping(a, NodeFlags::MASTER, vec![gossip_of(b, "10.0.0.8", 7002, NodeFlags::MASTER)]), peer());
++        process_message(
++            &cs,
++            ping(
++                a,
++                NodeFlags::MASTER,
++                vec![gossip_of(b, "10.0.0.8", 7002, NodeFlags::MASTER)],
++            ),
++            peer(),
++        );
+ 
+         let stale = gossip_of(b, "10.0.0.99", 7002, NodeFlags::MASTER);
+         process_message(&cs, ping(a, NodeFlags::MASTER, vec![stale]), peer());

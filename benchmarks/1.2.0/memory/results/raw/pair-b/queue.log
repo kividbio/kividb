@@ -1,0 +1,27 @@
+### 2026-11-02T03:33:22Z start: SRV=10.31.0.4 ./mixed.sh valkey
+valkey plain valkey/valkey:9.1.3 redis_version:7.2.4 valkey_version:9.1.3 
+[valkey-server --port 6379 --bind 0.0.0.0 --protected-mode no --io-threads 8 --dir /data --save  --appendonly no]
+sampler started for mixed-valkey (pid 48255, /sys/fs/cgroup/system.slice/docker-c668833db84a67cf1dc9c58c01b2dee62a582d2ae2946fe1dfc0cedb30a97d3f.scope)
+[03:33:30] mixed-valkey load
+[03:33:39] mixed-valkey loaded
+[03:34:09] mixed-valkey mixed-start
+[03:54:09] mixed-valkey mixed-end
+[03:54:39] mixed-valkey end
+### 2026-11-02T03:54:43Z end (exit 0): SRV=10.31.0.4 ./mixed.sh valkey
+### 2026-11-02T03:54:43Z start: SRV=10.31.0.4 ./mixed.sh kividb-rc4
+kividb-rc4 plain kividb/kividb:v1.2.0-rc4 redis_version:8.10.0 kividb_version:1.2.0-rc4 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+sampler started for mixed-kividb-rc4 (pid 49573, /sys/fs/cgroup/system.slice/docker-7c264619b5b3bc43760b2af4cbb87c2225f2b9cf36b17de2a800ec5913fd42dc.scope)
+[03:54:51] mixed-kividb-rc4 load
+[03:54:53] mixed-kividb-rc4 loaded
+[03:55:23] mixed-kividb-rc4 mixed-start
+[04:15:24] mixed-kividb-rc4 mixed-end
+[04:15:54] mixed-kividb-rc4 end
+### 2026-11-02T04:15:57Z end (exit 0): SRV=10.31.0.4 ./mixed.sh kividb-rc4
+### 2026-11-02T04:15:57Z start: SRV=10.31.0.4 ./mixed.sh redis
+redis plain redis:8.10.3 redis_version:8.10.3 
+[redis-server --port 6379 --bind 0.0.0.0 --protected-mode no --io-threads 8 --dir /data --save  --appendonly no]
+sampler started for mixed-redis (pid 50300, /sys/fs/cgroup/system.slice/docker-71f962f754e6e01a7cdf5dc698fe404576672ddca510967fa7affe62b27a5733.scope)
+[04:16:06] mixed-redis load
+[04:16:15] mixed-redis loaded
+[04:16:45] mixed-redis mixed-start

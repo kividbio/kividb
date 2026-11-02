@@ -1,0 +1,20 @@
+1793575853.623 RUN ./vector-db-benchmark --host 10.90.1.4 --engines-file redis-engine.json --engines redis-m16-ef128 --skip-search --datasets h-and-m-2048-angular-filters --skip-if-exists false 
+1793575853.630 vector-db-benchmark 0.2.0 (git d22d44e8b46009a800a59e952710166ece2e38a1)
+1793575853.632 Found 1 datasets, 1 engines
+1793575853.634 
+1793575853.636 ============================================================
+1793575853.637 Running experiment (1/1): redis-m16-ef128 - h-and-m-2048-angular-filters
+1793575853.639 ============================================================
+1793575853.641 Experiment stage: Configure
+1793575853.643 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 128}
+1793575853.645 Experiment stage: Upload
+1793575853.647 Reading dataset from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793575855.320 Read 105100 vectors (2048d) in 1.682s (62468 vectors/sec)
+1793575855.323 Starting upload with 16 threads, batch size 64...
+1793575868.466 Upload time: 13.147s (7994 records/sec)
+1793575868.468 Indexing complete (num_docs=105100/105100, indexing=false, percent_indexed=1.00, state=absent) in 0.0s
+1793575868.470 Index time: 0.002s, Total time (read+upload+index): 14.831s
+1793575868.681 Results saved to: "/home/ubuntu/vdbx/results/redis-m16-ef128-h-and-m-2048-angular-filters-upload-0-105100-2026-11-01-23-31-08.json"
+1793575868.685 Experiment stage: Cleanup (deleting index and data)
+1793575869.173 Experiment stage: Done
+1793575869.238 EXIT 0

@@ -1,0 +1,7 @@
+[Sun Nov  1 23:11:58 2026] kividb invoked oom-killer: gfp_mask=0x140cca(GFP_HIGHUSER_MOVABLE|__GFP_COMP), order=0, oom_score_adj=0
+[Sun Nov  1 23:11:58 2026]  oom_kill_process+0xd7/0x250
+[Sun Nov  1 23:11:58 2026]  ? oom_evaluate_task+0x105/0x200
+[Sun Nov  1 23:11:58 2026]  __alloc_pages_may_oom+0x109/0x1d0
+[Sun Nov  1 23:11:58 2026] [  pid  ]   uid  tgid total_vm      rss rss_anon rss_file rss_shmem pgtables_bytes swapents oom_score_adj name
+[Sun Nov  1 23:11:58 2026] oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=user.slice,mems_allowed=0,global_oom,task_memcg=/user.slice/user-1000.slice/session-31.scope,task=kividb,pid=17436,uid=1000
+[Sun Nov  1 23:11:58 2026] Out of memory: Killed process 17436 (kividb) total-vm:34097292kB, anon-rss:32095208kB, file-rss:2516kB, shmem-rss:0kB, UID:1000 pgtables:63692kB oom_score_adj:0

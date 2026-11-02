@@ -1,0 +1,114 @@
+engine: kividb-48280b7
+kividb 48280b7a11f6aac236473272d1f49f6539640cd4 48280b7a11f6aac236473272d1f49f6539640cd4 2026-10-29T04:37:36+05:30; cargo build --release --features tls; rustc 1.99.1 (58cf8f9c3 2026-10-13); binary sha256 ec8805169aeadcee77d33fc2e4fba3d4ba0d24f279c3a6108449cad0a38b933b; --version: kividb 1.2.0-rc2
+launch: taskset -c 1 ./server --port 6379 --threads 1 --maxmemory 1073741824 --maxmemory-policy allkeys-lfu --loglevel nothing --update-check no --protected-mode no
+cmdline:./server --port 6379 --threads 1 --maxmemory 1073741824 --maxmemory-policy allkeys-lfu --loglevel nothing --update-check no --protected-mode no 
+pid 7171's current affinity list: 1
+kernel: 7.0.0-1017-azure
+CPU(s):                                  4
+Model name:                              Neoverse-N1
+L2 cache:                                4 MiB (4 instances)
+L3 cache:                                32 MiB (1 instance)
+               total        used        free      shared  buff/cache   available
+Mem:            7911         474        6698           3         918        7436
+--- /proc status
+VmPeak:	 2142124 kB
+VmHWM:	 1313796 kB
+VmRSS:	 1313796 kB
+RssAnon:	 1306048 kB
+--- cpu ticks (utime stime, CLK_TCK=100) and process age
+stat: 115200 24530
+age_s:    1408
+--- INFO memory
+# Memory
+used_memory:1069833671
+used_memory_human:1020.27M
+used_memory_rss:1345327104
+value_slab_bytes:261750784
+value_slab_live_bytes:196675504
+used_memory_rss_human:1.25G
+used_memory_peak:1095238079
+used_memory_peak_human:1.02G
+used_memory_peak_perc:97.68%
+used_memory_overhead:63348
+used_memory_startup:63348
+used_memory_dataset:1069770323
+used_memory_dataset_perc:99.99%
+used_memory_lua:0
+used_memory_vm_eval:0
+used_memory_scripts_eval:0
+used_memory_vm_functions:0
+used_memory_vm_total:0
+number_of_cached_scripts:0
+allocator_allocated:1069833671
+allocator_active:1345327104
+allocator_resident:1345327104
+maxmemory:1073741824
+maxmemory_human:1.00G
+maxmemory_policy:allkeys-lfu
+mem_fragmentation_ratio:1.2575
+mem_fragmentation_bytes:275493433
+mem_not_counted_for_evict:0
+mem_replication_backlog:0
+mem_clients_slaves:0
+mem_clients_normal:0
+mem_aof_buffer:0
+active_defrag_running:0
+active_defrag_hits:0
+active_defrag_misses:0
+lazyfree_pending_objects:0
+lazyfreed_objects:0
+
+--- INFO stats
+# Stats
+total_connections_received:456
+total_commands_processed:23975784
+instantaneous_ops_per_sec:10683
+sync_full:0
+sync_partial_ok:0
+sync_partial_err:0
+total_net_input_bytes:4857357204
+total_net_output_bytes:5049431138
+instantaneous_input_kbps:2156.84
+instantaneous_output_kbps:2137.85
+rejected_connections:0
+total_reads_processed:23975784
+total_writes_processed:23975783
+keyspace_hits:9579839
+keyspace_misses:7197576
+expired_keys:0
+expired_subkeys:0
+expired_keys_active:0
+evicted_keys:5752472
+evicted_scripts:0
+slowlog_commands_count:0
+slowlog_commands_time_ms_sum:0.00
+slowlog_commands_time_ms_max:0.00
+total_error_replies:11
+migrate_cached_sockets:0
+
+--- INFO keyspace
+# Keyspace
+db0:keys=1445015,expires=0,avg_ttl=0
+
+1445015
+--- server.log tail
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc2 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc2
+  * Mode           : standalone
+  * OS             : linux aarch64
+  * Memory         : 7GiB available
+  * CPUs           : 1 cores detected
+  * Listening on   : 0.0.0.0:6379
+  * Worker threads : 1
+  * AOF            : disabled
+  * Persistence    : KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+

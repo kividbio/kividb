@@ -1,0 +1,8 @@
+2026-11-02T00:09:45.994Z 41582 [INFO] Replication: Connecting to master 10.40.1.4:6379...
+2026-11-02T00:09:46.008Z 41582 [INFO] Replication: Full resync from 8569f51ba92a3bd060a03f80903bbd34982a6d6a offset=1000531
+2026-11-02T00:09:46.008Z 41582 [INFO] Replication: Receiving full-sync payload (603819 bytes)...
+2026-11-02T00:09:46.012Z 41582 [INFO] Replication: Full sync loaded: 5886 keys (25 with a TTL), replacing 0 local keys
+2026-11-02T00:09:46.012Z 41582 [INFO] Replication: AOF is on — rebasing it onto the synced dataset
+2026-11-02T00:09:46.016Z 41582 [INFO] AOF: rebased onto dump.kdb (generation 1) — log is now the delta
+2026-11-02T00:09:46.017Z 41582 [INFO] Replication: Synced with 10.40.1.4:6379. Entering command stream.
+2026-11-02T00:10:05.994Z 41582 [INFO] AOF: auto-checkpoint: 76.10 MB is 100%+ above the 0.00 MB baseline — folding into dump.kdb

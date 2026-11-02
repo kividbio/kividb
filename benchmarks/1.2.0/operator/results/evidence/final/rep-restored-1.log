@@ -1,0 +1,16 @@
+2026-11-02T00:11:18.990Z 1 [INFO] KiviDB 1.2.0-rc4 starting: pid 1, default build, config file '/etc/kividb/kividb.conf'
+2026-11-02T00:11:18.990Z 1 [INFO] I/O model      : io_uring
+2026-11-02T00:11:18.990Z 1 [INFO] ACL file loaded: /etc/kividb/acl/users.acl
+2026-11-02T00:11:18.990Z 1 [INFO] Shards per DB  : 32
+2026-11-02T00:11:18.990Z 1 [INFO] I/O model      : io_uring
+2026-11-02T00:11:18.990Z 1 [INFO] Ready to accept connections on 0.0.0.0:6380
+2026-11-02T00:11:44.558Z 1 [INFO] CONFIG SET masteruser default
+2026-11-02T00:11:44.558Z 1 [INFO] CONFIG SET masterauth (hidden)
+2026-11-02T00:11:44.558Z 1 [INFO] Replication: Connecting to master 10.244.1.97:6380...
+2026-11-02T00:11:45.316Z 1 [INFO] Replication: Full resync from d25871f0301f4fc35d47c5f4bbeebfc9cba5b67a offset=0
+2026-11-02T00:11:45.316Z 1 [INFO] Replication: Receiving full-sync payload (159227216 bytes)...
+2026-11-02T00:11:51.702Z 1 [INFO] Replication: Full sync loaded: 6389882 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T00:11:51.712Z 1 [INFO] Replication: AOF is on — rebasing it onto the synced dataset
+2026-11-02T00:11:51.822Z 1 [INFO] AOF: the checkpoint held writes for 100 ms
+2026-11-02T00:11:53.447Z 1 [INFO] AOF: rebased onto dump.kdb (generation 1) — log is now the delta
+2026-11-02T00:11:53.447Z 1 [INFO] Replication: Synced with 10.244.1.97:6380. Entering command stream.

@@ -1,0 +1,39 @@
+   Compiling rustls v0.23.45
+   Compiling log v0.4.29
+   Compiling rustls-pemfile v2.2.0
+   Compiling tokio-rustls v0.26.4
+   Compiling kividb v1.2.0-rc4 (/mnt/src)
+    Finished `release` profile [optimized] target(s) in 4m 21s
+     Running tests/tls_replication.rs (/mnt/target/release/deps/tls_replication-2e3ae9810d1bd580)
+
+running 2 tests
+2026-11-02T01:18:07.504Z 28123 [INFO] TLS listener   : 127.0.0.1:27511
+2026-11-02T01:18:07.555Z 28123 [INFO] Replication: Connecting to master 127.0.0.1:27511...
+2026-11-02T01:18:07.555Z 28123 [INFO] TLS listener   : 127.0.0.1:27512
+2026-11-02T01:18:07.586Z 28123 [INFO] Replication: Channel replica registered: 127.0.0.1:45082
+2026-11-02T01:18:07.587Z 28123 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:18:07.587Z 28123 [INFO] Replication: Full resync from cee0d4dfd53fc38007a560b23134dbb7822521da offset=0
+2026-11-02T01:18:07.587Z 28123 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-02T01:18:07.588Z 28123 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:18:07.588Z 28123 [INFO] Replication: Synced with 127.0.0.1:27511. Entering command stream.
+2026-11-02T01:18:07.605Z 28123 [INFO] CONFIG SET tls-replication no
+test a_tls_only_replica_replicates_a_tls_only_master ... ok
+2026-11-02T01:18:07.607Z 28123 [INFO] TLS listener   : 127.0.0.1:27514
+2026-11-02T01:18:07.707Z 28123 [WARN] TLS: CONFIG SET tls-replication: cannot open '': No such file or directory (os error 2)
+2026-11-02T01:18:07.707Z 28123 [INFO] CONFIG SET tls-cert-file /tmp/.tmpDfnpMN/node.crt
+2026-11-02T01:18:07.707Z 28123 [INFO] CONFIG SET tls-key-file /tmp/.tmpDfnpMN/node.key
+2026-11-02T01:18:07.707Z 28123 [INFO] CONFIG SET tls-ca-cert-file /tmp/.tmpDfnpMN/ca.crt
+2026-11-02T01:18:07.707Z 28123 [INFO] TLS: certificates loaded again
+2026-11-02T01:18:07.707Z 28123 [INFO] CONFIG SET tls-replication yes
+2026-11-02T01:18:07.707Z 28123 [INFO] Replication: Connecting to master 127.0.0.1:27514...
+2026-11-02T01:18:07.715Z 28123 [INFO] Replication: Channel replica registered: 127.0.0.1:34444
+2026-11-02T01:18:07.716Z 28123 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:18:07.716Z 28123 [INFO] Replication: Full resync from 678c5ac51992d11056d17eb3c7ac01e20c04cca9 offset=0
+2026-11-02T01:18:07.716Z 28123 [INFO] Replication: Receiving full-sync payload (87 bytes)...
+2026-11-02T01:18:07.717Z 28123 [INFO] Replication: Full sync loaded: 1 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:18:07.718Z 28123 [INFO] Replication: Synced with 127.0.0.1:27514. Entering command stream.
+2026-11-02T01:18:07.809Z 28123 [INFO] CONFIG SET tls-replication no
+test tls_replication_is_turned_on_at_runtime ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+

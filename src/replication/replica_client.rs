@@ -1382,6 +1382,11 @@ async fn run_replication_session(
             }
         }
 
+        // Its records to this node's AOF: no reply waits to write them.
+        if applied_commands {
+            crate::aof::stream_applied();
+        }
+
         // REPLCONF ACK — heartbeat ~1 Hz when idle; **immediate** after applying commands so the
         // master can unblock WAIT without waiting for more replication traffic (otherwise we sit in
         // `read()` forever after the last propagating write and never hit the timer).

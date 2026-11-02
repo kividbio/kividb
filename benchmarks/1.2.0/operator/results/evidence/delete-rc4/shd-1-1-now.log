@@ -1,0 +1,73 @@
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc4 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc4
+  * Mode           : cluster
+  * OS             : linux x86_64
+  * Memory         : 15GiB available
+  * CPUs           : 4 cores detected
+  * Listening on   : 0.0.0.0:6380
+  * Cluster bus    : 0.0.0.0:16380
+  * Node timeout   : 5000ms
+  * Node ID        : (printed after cluster init)
+  * Worker threads : 2
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : /etc/kividb/acl/users.acl
+
+2026-11-01T23:43:24.838Z 1 [INFO] KiviDB 1.2.0-rc4 starting: pid 1, default build, config file '/etc/kividb/kividb.conf'
+2026-11-01T23:43:24.838Z 1 [INFO] I/O model      : io_uring
+2026-11-01T23:43:24.848Z 1 [INFO] ACL file loaded: /etc/kividb/acl/users.acl
+2026-11-01T23:43:24.848Z 1 [INFO] Cluster: Node ID        : c2bba9ce7583025e1e52557edc9dffdf8827b2aa
+2026-11-01T23:43:24.848Z 1 [INFO] Cluster: Bus port       : 16380
+2026-11-01T23:43:24.848Z 1 [INFO] Shards per DB  : 32
+2026-11-01T23:43:24.848Z 1 [INFO] I/O model      : io_uring
+2026-11-01T23:43:24.848Z 1 [INFO] Found dump.kdb — loading native snapshot
+2026-11-01T23:43:26.275Z 1 [INFO] Loaded 1628564 keys from snapshot (0 with a TTL)
+2026-11-01T23:43:26.276Z 1 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+2026-11-01T23:43:26.279Z 1 [INFO] Cluster: Restored replica role of master e46a08ae89d2cdb5fa74beb1715432d92de992d7 → restarting replication client
+2026-11-01T23:43:26.279Z 1 [INFO] Cluster: Bus listener bound on 0.0.0.0:16380
+2026-11-01T23:43:26.279Z 1 [INFO] Cluster: Heartbeat loop started (interval 1s)
+2026-11-01T23:43:26.279Z 1 [INFO] Cluster: Failure detection started (interval 100ms, node_timeout 5000ms)
+2026-11-01T23:43:26.279Z 1 [INFO] Replication: Connecting to master 10.244.1.83:6380...
+2026-11-01T23:43:26.279Z 1 [INFO] Ready to accept connections on 0.0.0.0:6380
+2026-11-01T23:43:26.505Z 1 [INFO] Replication: Full resync from fae41cbadb0d528cbcaac6181082a51936289369 offset=96515257
+2026-11-01T23:43:26.505Z 1 [INFO] Replication: Receiving full-sync payload (40155161 bytes)...
+2026-11-01T23:43:26.733Z 1 [WARN] Replication: Dropped the 1628564 local keys before loading 1628564 from the master
+2026-11-01T23:43:27.939Z 1 [INFO] Replication: Full sync loaded: 1628564 keys (0 with a TTL), replacing 1628564 local keys
+2026-11-01T23:43:27.995Z 1 [INFO] Replication: AOF is on — rebasing it onto the synced dataset
+2026-11-01T23:43:28.431Z 1 [INFO] AOF: rebased onto dump.kdb (generation 20) — log is now the delta
+2026-11-01T23:43:28.431Z 1 [INFO] Replication: Synced with 10.244.1.83:6380. Entering command stream.
+2026-11-01T23:43:35.810Z 1 [INFO] CONFIG SET cluster-announce-hostname shd-1-1.shd-1-headless.e2e.svc

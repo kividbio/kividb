@@ -1,0 +1,64 @@
+2026-11-01T23:43:24.838Z 1 [INFO] KiviDB 1.2.0-rc4 starting: pid 1, default build, config file '/etc/kividb/kividb.conf'
+2026-11-01T23:43:24.838Z 1 [INFO] I/O model      : io_uring
+2026-11-01T23:43:24.848Z 1 [INFO] ACL file loaded: /etc/kividb/acl/users.acl
+2026-11-01T23:43:24.848Z 1 [INFO] Cluster: Node ID        : c2bba9ce7583025e1e52557edc9dffdf8827b2aa
+2026-11-01T23:43:24.848Z 1 [INFO] Cluster: Bus port       : 16380
+2026-11-01T23:43:24.848Z 1 [INFO] Shards per DB  : 32
+2026-11-01T23:43:24.848Z 1 [INFO] I/O model      : io_uring
+2026-11-01T23:43:24.848Z 1 [INFO] Found dump.kdb — loading native snapshot
+2026-11-01T23:43:26.275Z 1 [INFO] Loaded 1628564 keys from snapshot (0 with a TTL)
+2026-11-01T23:43:26.276Z 1 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+2026-11-01T23:43:26.279Z 1 [INFO] Cluster: Restored replica role of master e46a08ae89d2cdb5fa74beb1715432d92de992d7 → restarting replication client
+2026-11-01T23:43:26.279Z 1 [INFO] Cluster: Bus listener bound on 0.0.0.0:16380
+2026-11-01T23:43:26.279Z 1 [INFO] Cluster: Heartbeat loop started (interval 1s)
+2026-11-01T23:43:26.279Z 1 [INFO] Cluster: Failure detection started (interval 100ms, node_timeout 5000ms)
+2026-11-01T23:43:26.279Z 1 [INFO] Replication: Connecting to master 10.244.1.83:6380...
+2026-11-01T23:43:26.279Z 1 [INFO] Ready to accept connections on 0.0.0.0:6380
+2026-11-01T23:43:26.505Z 1 [INFO] Replication: Full resync from fae41cbadb0d528cbcaac6181082a51936289369 offset=96515257
+2026-11-01T23:43:26.505Z 1 [INFO] Replication: Receiving full-sync payload (40155161 bytes)...
+2026-11-01T23:43:26.733Z 1 [WARN] Replication: Dropped the 1628564 local keys before loading 1628564 from the master
+2026-11-01T23:43:27.939Z 1 [INFO] Replication: Full sync loaded: 1628564 keys (0 with a TTL), replacing 1628564 local keys
+2026-11-01T23:43:27.995Z 1 [INFO] Replication: AOF is on — rebasing it onto the synced dataset
+2026-11-01T23:43:28.431Z 1 [INFO] AOF: rebased onto dump.kdb (generation 20) — log is now the delta
+2026-11-01T23:43:28.431Z 1 [INFO] Replication: Synced with 10.244.1.83:6380. Entering command stream.
+2026-11-01T23:43:35.810Z 1 [INFO] CONFIG SET cluster-announce-hostname shd-1-1.shd-1-headless.e2e.svc
+2026-11-01T23:52:01.991Z 1 [INFO] Cluster: Manual failover: starting election at epoch 55 to replace e46a08ae89d2cdb5fa74beb1715432d92de992d7
+2026-11-01T23:52:02.979Z 1 [INFO] Cluster: Election: 12921ba0547672f08374c76be8537262ab47d13f gave no vote at epoch 55: no answer
+2026-11-01T23:52:06.995Z 1 [INFO] Cluster: Election: e46a08ae89d2cdb5fa74beb1715432d92de992d7 gave no vote at epoch 55: no answer
+2026-11-01T23:52:06.995Z 1 [INFO] Cluster: Election: fad063987c7a012d1f95933969c5aafcdcc228d2 gave no vote at epoch 55: no answer
+2026-11-01T23:52:07.081Z 1 [WARN] Cluster: Manual failover abandoned: the election at epoch 55 was not won in time (0 of 2 votes)
+2026-11-01T23:52:07.842Z 1 [WARN] Cluster: Node 12921ba0547672f08374c76be8537262ab47d13f marked FAIL (reported by eb1ae7633be84d663adc38704cab562828a1483f)
+2026-11-01T23:52:22.517Z 1 [WARN] Replication: Master closed the connection — reconnecting
+2026-11-01T23:52:23.523Z 1 [INFO] Replication: Connecting to master 10.244.1.83:6380...
+2026-11-01T23:52:27.380Z 1 [WARN] Cluster: Node e46a08ae89d2cdb5fa74beb1715432d92de992d7 marked FAIL by quorum
+2026-11-01T23:52:28.090Z 1 [WARN] Cluster: Starting election for epoch 56 (failed master: e46a08ae89d2cdb5fa74beb1715432d92de992d7)
+2026-11-01T23:52:28.180Z 1 [INFO] Cluster: Won election at epoch 56 (2 votes, quorum 2)
+2026-11-01T23:52:28.185Z 1 [INFO] Replication: Promoted; the stream fae41cbadb0d528cbcaac6181082a51936289369 goes on as 65444a058ac79e8ea7900a43a4cd63cf5ef92f1b from offset 97299067 — its replicas can be continued
+2026-11-01T23:52:28.352Z 1 [INFO] Replication: Replication session for 10.244.1.83:6380 superseded — stopping replication client
+2026-11-01T23:52:30.680Z 1 [INFO] Cluster: Node 12921ba0547672f08374c76be8537262ab47d13f is reachable again — clearing FAIL
+2026-11-01T23:52:53.301Z 1 [INFO] Cluster: Node e46a08ae89d2cdb5fa74beb1715432d92de992d7 is reachable again — clearing FAIL
+2026-11-01T23:52:53.304Z 1 [INFO] Replication: Channel replica registered: 10.244.0.37:60910
+2026-11-01T23:52:53.475Z 1 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub
+2026-11-01T23:54:58.764Z 1 [INFO] Cluster: handover of slots 9558-10922: writes paused 2 ms (in-flight writes 0,          last of the stream 0, the destination's takeover 1)
+2026-11-01T23:54:59.048Z 1 [INFO] Cluster: Slots 9558-10922 migrated to fd5f1049eee8cc6374217f80a4b9ce2be4040625 (writes paused 195 ms)
+2026-11-01T23:56:15.898Z 1 [INFO] Cluster: Slots 9558-10922 imported from fd5f1049eee8cc6374217f80a4b9ce2be4040625 (taken over in 1 ms)
+2026-11-01T23:57:30.381Z 1 [WARN] Cluster: Node eb1ae7633be84d663adc38704cab562828a1483f marked FAIL by quorum
+2026-11-01T23:57:31.218Z 1 [INFO] Cluster: Voted for 12921ba0547672f08374c76be8537262ab47d13f to take over from eb1ae7633be84d663adc38704cab562828a1483f at epoch 63
+2026-11-01T23:57:51.421Z 1 [INFO] Cluster: Node eb1ae7633be84d663adc38704cab562828a1483f is reachable again — clearing FAIL
+2026-11-01T23:59:12.313Z 1 [WARN] Cluster: Node e78261d088e3ec01b23062e77b6c459304bea3da marked FAIL (reported by fad063987c7a012d1f95933969c5aafcdcc228d2)
+2026-11-01T23:59:32.084Z 1 [INFO] Cluster: Node e78261d088e3ec01b23062e77b6c459304bea3da is reachable again — clearing FAIL
+2026-11-02T00:00:49.713Z 1 [WARN] Cluster: Node eb1ae7633be84d663adc38704cab562828a1483f marked FAIL (reported by fad063987c7a012d1f95933969c5aafcdcc228d2)
+2026-11-02T00:00:55.149Z 1 [INFO] Cluster: Node eb1ae7633be84d663adc38704cab562828a1483f is reachable again — clearing FAIL
+2026-11-02T00:12:22.723Z 1 [INFO] AOF: rebased onto dump.kdb (generation 21) — log is now the delta
+2026-11-02T00:13:16.295Z 1 [INFO] AOF: auto-checkpoint: 97.09 MB is 100%+ above the 0.00 MB baseline — folding into dump.kdb
+2026-11-02T00:13:24.479Z 1 [INFO] AOF: rebased onto dump.kdb (generation 22) — log is now the delta
+2026-11-02T00:15:12.366Z 1 [INFO] Cluster: handover of slots 9558-10922: writes paused 93 ms (in-flight writes 0,          last of the stream 0, the destination's takeover 93)
+2026-11-02T00:15:12.878Z 1 [INFO] Cluster: deleted 469988 key(s) in 1365 slot(s) owned by another node
+2026-11-02T00:15:12.879Z 1 [INFO] Cluster: Slots 9558-10922 migrated to df7947d90cabfb1dde0c68449af5f24d1b1eeea6 (writes paused 528 ms)
+2026-11-02T00:22:20.014Z 1 [INFO] Cluster: Slots 9558-10922 imported from df7947d90cabfb1dde0c68449af5f24d1b1eeea6 (taken over in 2 ms)
+2026-11-02T00:24:01.023Z 1 [INFO] Replication: uring: replica disconnected
+2026-11-02T00:24:05.713Z 1 [WARN] Cluster: Node e46a08ae89d2cdb5fa74beb1715432d92de992d7 marked FAIL (reported by fad063987c7a012d1f95933969c5aafcdcc228d2)
+2026-11-02T00:24:09.713Z 1 [WARN] Cluster: Node e78261d088e3ec01b23062e77b6c459304bea3da marked FAIL (reported by fad063987c7a012d1f95933969c5aafcdcc228d2)
+2026-11-02T00:24:12.081Z 1 [INFO] Replication: Partial resync for 10.244.0.18:58548: continuing from offset 1203147071 (238320 bytes of backlog)
+2026-11-02T00:24:13.094Z 1 [INFO] Cluster: Node e46a08ae89d2cdb5fa74beb1715432d92de992d7 is reachable again — clearing FAIL
+2026-11-02T00:24:26.865Z 1 [INFO] Cluster: Node e78261d088e3ec01b23062e77b6c459304bea3da is reachable again — clearing FAIL

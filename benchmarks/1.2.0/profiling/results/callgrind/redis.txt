@@ -1,0 +1,8 @@
+GET-100 redis-8.10.3 4140
+SET-100 redis-8.10.3 5362
+GET-1K redis-8.10.3 4259
+SET-1K redis-8.10.3 5496
+MIX-100 redis-8.10.3 9562
+INCR redis-8.10.3 4495
+DEL redis-8.10.3 4490
+GET-100-TTL redis-8.10.3 4173

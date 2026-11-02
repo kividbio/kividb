@@ -1,0 +1,49 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.2.0, pluggy-1.7.0
+rootdir: /home/azureuser/src/tests/e2e
+configfile: pytest.ini
+plugins: timeout-2.4.0, xdist-3.8.0
+timeout: 120.0s
+timeout method: signal
+timeout func_only: False
+collected 1238 items / 2 deselected / 1236 selected
+
+modules/test_acid.py ............................                        [  2%]
+modules/test_acl.py .................................................... [  6%]
+.......                                                                  [  7%]
+modules/test_aggregate_hello_kill.py ................................    [  9%]
+modules/test_cluster.py ssssssssssssssssssssssssssssssssssssssssssssssss [ 13%]
+ssss                                                                     [ 13%]
+modules/test_commands.py ............................................... [ 17%]
+...............................................                          [ 21%]
+modules/test_expiry.py ................................................. [ 25%]
+..........                                                               [ 26%]
+modules/test_fulltext_search.py ...............................          [ 28%]
+modules/test_generics_server.py .......s...........ssss......ss......... [ 31%]
+..sss............................                                        [ 34%]
+modules/test_hashes.py ................................................. [ 38%]
+...............                                                          [ 39%]
+modules/test_json_ts_geo.py ............................................ [ 43%]
+                                                                         [ 43%]
+modules/test_lists.py .................................................. [ 47%]
+....................................                                     [ 50%]
+modules/test_memory.py .........................s..                      [ 52%]
+modules/test_persistence.py ..................................           [ 55%]
+modules/test_pubsub.py ...............                                   [ 56%]
+modules/test_replication.py ............................................ [ 60%]
+.............                                                            [ 61%]
+modules/test_replication_ops.py ..................                       [ 62%]
+modules/test_sets.py ................................................... [ 66%]
+................                                                         [ 68%]
+modules/test_slowlog_latency.py ........................................ [ 71%]
+........ss.........                                                      [ 72%]
+modules/test_sorted_sets.py ............................................ [ 76%]
+.........................................................                [ 80%]
+modules/test_streams.py ................................................ [ 84%]
+..........                                                               [ 85%]
+modules/test_strings.py ................................................ [ 89%]
+......................................................                   [ 93%]
+modules/test_transactions.py .................................           [ 96%]
+modules/test_vector_search.py .......................................... [100%]
+
+========== 1171 passed, 65 skipped, 2 deselected in 86.48s (0:01:26) ===========

@@ -1,0 +1,17 @@
+# Persistence
+current_snapshot_perc:0
+current_save_keys_processed:0
+current_save_keys_total:0
+last_success_save:1793580707
+last_saved_file:/data/dump-summary.dfs
+last_success_save_duration_sec:55
+loading:0
+saving:0
+current_save_duration_sec:0
+rdb_string:30000000
+rdb_changes_since_last_success_save:74000
+rdb_bgsave_in_progress:0
+rdb_last_bgsave_status:ok
+last_failed_save:0
+last_error:
+last_failed_save_duration_sec:0

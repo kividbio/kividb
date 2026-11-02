@@ -1,0 +1,39 @@
+{
+ "mode": "standalone",
+ "writers": 16,
+ "duration_s": 60.0,
+ "acked": 304420,
+ "unacked_errors": 3695,
+ "lost_acked": 0,
+ "wrong_value": 0,
+ "wait_n": 0,
+ "wait_acked": 0,
+ "wait_acked_lost": 0,
+ "lost_ack_time_first": null,
+ "lost_ack_time_last": null,
+ "lost_sample": [],
+ "events": [
+  [
+   20.263,
+   "kill -9 master (appendfsync always)"
+  ],
+  [
+   25.39,
+   "master restarted"
+  ]
+ ],
+ "recovery": {
+  "event_t": 20.263,
+  "pre_event_ok_per_100ms_median": 552,
+  "first_error_t": 20.200000000000003,
+  "last_error_t": 25.3,
+  "writes_below_80pct_from_t": 20.200000000000003,
+  "throughput_back_t": 25.400000000000002,
+  "recovery_s": 5.14
+ },
+ "error_kinds": {
+  "ConnectionError:Connection": 16,
+  "ConnectionError:Error": 3616,
+  "BusyLoadingError:Redis": 63
+ }
+}

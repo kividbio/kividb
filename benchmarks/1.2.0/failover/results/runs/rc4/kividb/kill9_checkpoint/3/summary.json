@@ -1,0 +1,55 @@
+{
+ "mode": "standalone",
+ "writers": 16,
+ "duration_s": 90.0,
+ "acked": 757541,
+ "unacked_errors": 9048,
+ "lost_acked": 0,
+ "wrong_value": 0,
+ "wait_n": 0,
+ "wait_acked": 0,
+ "wait_acked_lost": 0,
+ "lost_ack_time_first": null,
+ "lost_ack_time_last": null,
+ "lost_sample": [],
+ "events": [
+  [
+   20.75,
+   "kill -9 master as checkpoint 1 starts"
+  ],
+  [
+   24.754,
+   "master restarted"
+  ],
+  [
+   47.89,
+   "kill -9 master as checkpoint 2 starts"
+  ],
+  [
+   52.63,
+   "master restarted"
+  ],
+  [
+   62.799,
+   "kill -9 master as checkpoint 3 starts"
+  ],
+  [
+   67.651,
+   "master restarted"
+  ]
+ ],
+ "recovery": {
+  "event_t": 20.75,
+  "pre_event_ok_per_100ms_median": 1049,
+  "first_error_t": 20.700000000000003,
+  "last_error_t": 78.60000000000001,
+  "writes_below_80pct_from_t": 20.700000000000003,
+  "throughput_back_t": 24.700000000000003,
+  "recovery_s": 3.95
+ },
+ "error_kinds": {
+  "ConnectionError:Error": 9014,
+  "ConnectionError:Connection": 18,
+  "TimeoutError:Timeout": 16
+ }
+}

@@ -1,0 +1,7 @@
+2026-11-02T00:29:53.618Z 1 [INFO] Cluster: Manual failover: starting election at epoch 70 to replace fad063987c7a012d1f95933969c5aafcdcc228d2
+2026-11-02T00:29:53.664Z 1 [INFO] Cluster: Won election at epoch 70 (3 votes, quorum 2)
+2026-11-02T00:29:53.668Z 1 [INFO] Replication: Promoted; the stream c9e34455b56a853d9a6ee7a7bea80e52762de4bc goes on as 65c39bd9a07c05a914604057c9ed82006de17b49 from offset 1139798955 — its replicas can be continued
+2026-11-02T00:29:53.679Z 1 [INFO] Replication: Channel replica registered: 10.244.3.103:45742
+2026-11-02T00:29:53.810Z 1 [INFO] Replication: Command stream from 10.244.3.103:6380 superseded (epoch 1) — dropping connection
+2026-11-02T00:29:53.810Z 1 [INFO] Replication: Replication session for 10.244.3.103:6380 superseded — stopping replication client
+2026-11-02T00:29:54.681Z 1 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub

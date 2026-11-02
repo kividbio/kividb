@@ -1,0 +1,60 @@
+cmd: taskset -c 1,2,3 ./bench.test -test.run=^$ -test.bench=^BenchmarkRedis$ -test.benchtime=8388608x -test.timeout=0 true 1073741824 1024 8 1 0 10.30.1.17
+pair: c7 -> 10.30.1.17
+Sun Nov  1 23:46:42 UTC 2026
+goos: linux
+goarch: arm64
+pkg: github.com/imchuncai/umem-cache-benchmark
+BenchmarkRedis-3   	
+======================================================================
+server:  2097152    warmup:  8388608    get:  8388608    hit:  4684847
+VmHWM:       0 kB   hit_rate: 55.85%    per_memory_hit_rate: 55.85%
+P1: 127 us  P50: 3041 us  P90: 6182 us  P99: 8986 us  P99.9: 9999 us
+1340.081s	    output:   11 Mb/s   input:   15 Mb/s
+======================================================================
+--- FAIL: BenchmarkRedis-3
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+FAIL
+Command exited with non-zero status 1
+	Command being timed: "timeout 4h taskset -c 1,2,3 /home/azureuser/bench.test -test.run=^$ -test.bench=^BenchmarkRedis$ -test.benchtime=8388608x -test.timeout=0 true 1073741824 1024 8 1 0 10.30.1.17"
+	User time (seconds): 464.27
+	System time (seconds): 541.05
+	Percent of CPU this job got: 46%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 35:57.87
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 626348
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 411975
+	Voluntary context switches: 12668684
+	Involuntary context switches: 1120805
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 8
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 1
+exit=1
+Mon Nov  2 00:22:40 UTC 2026

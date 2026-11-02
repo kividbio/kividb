@@ -1,0 +1,37 @@
+{
+ "mode": "standalone",
+ "writers": 16,
+ "duration_s": 60.0,
+ "acked": 577176,
+ "unacked_errors": 3781,
+ "lost_acked": 0,
+ "wrong_value": 0,
+ "wait_n": 0,
+ "wait_acked": 0,
+ "wait_acked_lost": 0,
+ "lost_ack_time_first": null,
+ "lost_ack_time_last": null,
+ "lost_sample": [],
+ "events": [
+  [
+   20.288,
+   "kill -9 master (appendfsync always)"
+  ],
+  [
+   25.576,
+   "master restarted"
+  ]
+ ],
+ "recovery": {
+  "event_t": 20.288,
+  "pre_event_ok_per_100ms_median": 1010,
+  "first_error_t": 20.200000000000003,
+  "last_error_t": 25.5,
+  "writes_below_80pct_from_t": 20.3,
+  "throughput_back_t": 25.6,
+  "recovery_s": 5.31
+ },
+ "error_kinds": {
+  "ConnectionError:Error": 3781
+ }
+}
