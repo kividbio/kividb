@@ -17,6 +17,42 @@ pub(crate) type Value = Arc<[u8]>;
 pub struct Ticket {
     /// Lower is earlier.
     id: u64,
+    /// Woken and not yet told the waker it has looked. See [`take_woken`].
+    looked: Mutex<Vec<oneshot::Sender<()>>>,
+}
+
+impl Ticket {
+    /// This client has looked at its keys since it was woken: dropping these
+    /// releases whoever woke it. See [`take_woken`].
+    pub fn take_looked(&self) -> Vec<oneshot::Sender<()>> {
+        std::mem::take(&mut *self.looked.lock())
+    }
+}
+
+thread_local! {
+    static WOKEN: std::cell::RefCell<Option<Vec<oneshot::Receiver<()>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Note the clients the command about to run on this thread wakes from a
+/// line, for [`take_woken`]. Only a connection does: a wake from anywhere
+/// else (a script's own thread) is not collected, so nothing piles up there.
+#[inline]
+pub fn collect_woken() {
+    WOKEN.with(|woken| *woken.borrow_mut() = Some(Vec::new()));
+}
+
+/// The clients the command since [`collect_woken`] woke, each resolving once
+/// that client has looked at its keys. Redis serves the clients a command
+/// unblocks before that command replies, so a `BLPOP` an `LPUSH` woke has
+/// popped — and been counted in `rdb_changes_since_last_save` — by the time
+/// the `LPUSH` reply arrives (#42). The connection holds its replies until
+/// these resolve.
+#[inline]
+pub fn take_woken() -> Vec<oneshot::Receiver<()>> {
+    WOKEN
+        .with(|woken| woken.borrow_mut().take())
+        .unwrap_or_default()
 }
 
 /// One client in the line for a key.
@@ -94,6 +130,7 @@ impl WaitTable {
     pub fn new_ticket(&self) -> Arc<Ticket> {
         Arc::new(Ticket {
             id: self.next_ticket.fetch_add(1, Ordering::Relaxed),
+            looked: Mutex::new(Vec::new()),
         })
     }
 
@@ -220,8 +257,16 @@ impl WaitTable {
             .fetch_sub(before - queue.len(), Ordering::Relaxed);
         if let Some(next) = queue.iter_mut().find(|queued| queued.id > after)
             && let Some(tx) = next.tx.take()
+            && tx.send(Arc::from([].as_slice())).is_ok()
+            && let Some(ticket) = next.alive.upgrade()
         {
-            let _ = tx.send(Arc::from([].as_slice()));
+            WOKEN.with(|woken| {
+                if let Some(woken) = woken.borrow_mut().as_mut() {
+                    let (looked, rx) = oneshot::channel();
+                    ticket.looked.lock().push(looked);
+                    woken.push(rx);
+                }
+            });
         }
         if queue.is_empty() {
             queues.remove(key);

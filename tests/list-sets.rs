@@ -612,6 +612,30 @@ fn test_blpop_fifo_ordering() {
     assert_eq!(r2.as_array()[1].as_str(), "second");
 }
 
+/// A push that wakes a blocked client is answered after that client has
+/// popped, as in Redis (#42): sent in one packet behind the push, `LLEN` sees
+/// the list empty. The change count is not asserted here — it is one counter
+/// per process, so the other servers in this test binary share it.
+#[test]
+fn test_woken_client_pops_before_the_push_replies() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let h = thread::spawn(move || Conn::connect(port).cmds(&["BLPOP", "k", "5"]));
+    wait_for_blocked_clients(port, 1);
+    c.stream
+        .write_all(b"*3\r\n$5\r\nLPUSH\r\n$1\r\nk\r\n$1\r\na\r\n*2\r\n$4\r\nLLEN\r\n$1\r\nk\r\n")
+        .unwrap();
+    assert_eq!(c.read_value().as_int(), 1);
+    assert_eq!(
+        c.read_value().as_int(),
+        0,
+        "LLEN ran before the BLPOP popped"
+    );
+    assert_eq!(h.join().unwrap().as_array()[1].as_str(), "a");
+}
+
 // Manual test scenario:
 //   WRONGTYPE: RPUSH on a key that holds a string
 #[test]

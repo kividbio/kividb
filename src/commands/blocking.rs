@@ -215,12 +215,19 @@ pub struct BlockingSlot {
     /// True while the current dispatch *is* a resume. Guards against a handler
     /// that parks again after being resumed, which would spin the loop forever.
     in_resume: bool,
+    /// Held from the end of a wait until this client has looked at its keys
+    /// and either replied or waited again: whoever woke it is holding its own
+    /// reply until then. See [`crate::wait_table::take_woken`].
+    looked: Vec<oneshot::Sender<()>>,
+    /// The clients the last dispatch woke. See [`settle`](Self::settle).
+    woken: Vec<oneshot::Receiver<()>>,
 }
 
 impl BlockingSlot {
     /// Prepare the slot for the next dispatch and hand out the borrow that
     /// goes into `Ctx`.
     pub fn prime(&mut self) -> &mut BlockingCtl {
+        crate::wait_table::collect_woken();
         self.ctl.awaitable = true;
         self.ctl.parked = None;
         match self.pending.take() {
@@ -239,8 +246,36 @@ impl BlockingSlot {
     }
 
     /// Take the wait a handler parked during the dispatch just completed.
+    ///
+    /// Called straight after every dispatch and before anything is awaited:
+    /// what it woke is in a thread-local, which another connection on this
+    /// thread would overwrite.
     pub fn take_parked(&mut self) -> Option<BlockingWait> {
-        self.ctl.parked.take()
+        self.woken = crate::wait_table::take_woken();
+        let parked = self.ctl.parked.take();
+        if let Some(wait) = &parked {
+            // It looked, found nothing and waits again: release whoever woke
+            // it, and whoever has since — or they would wait out this wait.
+            self.looked.clear();
+            if let Some(BlockState::Queued { ticket, .. } | BlockState::GroupRead { ticket, .. }) =
+                &wait.state
+            {
+                ticket.take_looked();
+            }
+        }
+        parked
+    }
+
+    /// Wait for the clients the last dispatch woke to have looked at their
+    /// keys, so its reply comes after their pops, as in Redis (#42). Then
+    /// release whoever woke this one: a chain (`BRPOPLPUSH a b` woken by a
+    /// push to `a`, whose push to `b` wakes `BRPOPLPUSH b c`) is all done
+    /// before the first push replies, as in Redis.
+    pub async fn settle(&mut self) {
+        for woken in self.woken.drain(..) {
+            let _ = woken.await;
+        }
+        self.looked.clear();
     }
 
     /// Whether the dispatch just completed was a resume.
@@ -261,6 +296,11 @@ impl BlockingSlot {
 
     /// Store what the wait produced, for the resume dispatch to pick up.
     pub fn set_pending(&mut self, delivery: Delivery, state: Option<BlockState>) {
+        if let Some(BlockState::Queued { ticket, .. } | BlockState::GroupRead { ticket, .. }) =
+            &state
+        {
+            self.looked = ticket.take_looked();
+        }
         self.pending = Some((delivery, state));
     }
 }
