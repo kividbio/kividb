@@ -88,6 +88,15 @@ pub const SECRET_SETTINGS: &[&str] = &[
 pub fn redact<A: AsRef<[u8]>>(cmd: &[A]) -> Option<Vec<Vec<u8>>> {
     let arg = |i: usize| cmd.get(i).map(AsRef::as_ref);
     let is = |i: usize, word: &str| arg(i).is_some_and(|a| a.eq_ignore_ascii_case(word.as_bytes()));
+    // Nearly every command logged is none of these: it costs a look at its
+    // name, and nothing is allocated for it, which matters when every
+    // command is logged (`slowlog-log-slower-than 0`).
+    if !["AUTH", "HELLO", "MIGRATE", "ACL", "CONFIG"]
+        .iter()
+        .any(|name| is(0, name))
+    {
+        return None;
+    }
     let mut secret = vec![false; cmd.len()];
     let mut mark = |from: usize, count: usize| {
         for flag in secret.iter_mut().skip(from).take(count) {
