@@ -311,12 +311,26 @@ static QUEUED: std::sync::LazyLock<tokio::sync::Notify> =
 /// connection that sent the record writes it before it replies (see
 /// [`written`]), and woken, the thread took the lock first and left the
 /// connection waiting to be woken in turn — a quarter of the writes a
-/// second. What no reply waits for (an expiry's delete, a replica's stream)
-/// is written with the next connection's, or by the writer's next sync, a
-/// second at most.
+/// second. What no reply waits for (an expiry's delete) is written with the
+/// next connection's, or by the writer's next sync, a second at most. A
+/// replica's stream has no connection's to go with: its applier wakes the
+/// writer itself, once a batch ([`stream_applied`]).
 #[inline]
 pub fn records_queued() {
     if !acks_wait() {
+        QUEUED.notify_one();
+    }
+}
+
+/// A replica has applied a batch of its master's stream. Its records have no
+/// reply waiting for them to write them, and a read-only replica takes no
+/// writes of its own whose replies would: the writer thread writes them. Left to the
+/// writer's sync once a second, a replica under sustained writes fell behind
+/// its master, its queue (and with it its memory) grew by the second, and
+/// its checkpoints, queued behind the backlog, did not finish for minutes.
+#[inline]
+pub fn stream_applied() {
+    if WRITER_RUNNING.load(Ordering::Acquire) {
         QUEUED.notify_one();
     }
 }
@@ -699,11 +713,20 @@ fn write_queued(
             },
             None => drain_into(&mut batch, rx, &mut barriers),
         };
+        // A batch that stopped at the cap left more queued. Going on with it
+        // here, not on the next pass: what no reply waits for (a replica's
+        // stream) may have no next pass but the second's sync, and one batch
+        // a second fell behind 40 MB/s of writes, with the queue, and the
+        // turn-over of a checkpoint behind it, growing without end.
+        let more_queued = batch.len() >= MAX_AOF_BATCH_BYTES;
         wrote |= !batch.is_empty();
         write_batch(file, &batch);
         released |= !barriers.is_empty();
         release_barriers(&mut barriers);
         let Some(generation) = mark else {
+            if more_queued {
+                continue;
+            }
             return (wrote, released);
         };
         let result = perform_turn_over(file);
@@ -2825,5 +2848,36 @@ mod record_group_tests {
         // A script that writes nothing queues nothing.
         drop(RecordGroup::begin(&sent));
         assert_eq!(sent.0.lock().len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod backlog_tests {
+    use super::*;
+
+    /// A queue holding more than one batch is written whole in one call: a
+    /// replica's stream, with no reply to write it, has only the writer's
+    /// passes, and one batch a pass fell behind sustained writes.
+    #[test]
+    fn everything_queued_is_written_not_one_batch_of_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("appendonly.aof");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("open");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let record = vec![b'x'; 64 * 1024];
+        let records = 3 * MAX_AOF_BATCH_BYTES / record.len() + 7;
+        for _ in 0..records {
+            tx.send(record.clone()).expect("send");
+        }
+        let (wrote, released) = write_queued(&mut file, &mut rx, None);
+        assert!(wrote);
+        assert!(!released);
+        assert!(rx.try_recv().is_err(), "nothing is left queued");
+        let len = std::fs::metadata(&path).expect("metadata").len();
+        assert_eq!(len, (records * record.len()) as u64);
     }
 }
