@@ -37,11 +37,12 @@ The fixes made after rc4 for problems these runs found are verified in [fixes/](
 
 ## Fixes made after rc4
 
-The runs found three problems in rc4. They are fixed in 1.2.0, and each fix is verified against rc4 here:
+The runs, and CI on the release, found four problems in rc4. They are fixed in 1.2.0, and each fix is verified against rc4 here:
 
 - [fixes/replica-aof](fixes/replica-aof/README.md): a replica with the AOF on ran out of memory under sustained writes (since 1.2.0-rc1).
 - [fixes/cluster-moved-address](fixes/cluster-moved-address/README.md): cluster nodes that moved together kept each other's old addresses (in 1.1.x too).
 - An AOF ending in zeros after a power loss stopped the server from starting (in 1.1.x too): see [failover](failover/README.md).
+- [fixes/migrate-tokio-stall](fixes/migrate-tokio-stall/README.md): with `--io-model tokio`, a `MIGRATE` waiting on its destination could stop the server reading any other connection (in 1.1.x too).
 
 ## Hardware
 

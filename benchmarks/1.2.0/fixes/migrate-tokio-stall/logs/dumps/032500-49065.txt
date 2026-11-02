@@ -1,0 +1,126 @@
+failpoint: /tmp/.tmpeaCpDq/failpoint.migrate-before-delete.2 (age 8s)
+exe: /home/azureuser/rc4/target/debug/kividb
+cmdline: /home/azureuser/rc4/target/debug/kividb --port 13625 --bind 127.0.0.1 --io-model tokio --threads 2 --cluster-enabled yes --cluster-node-timeout 2000 --configfile kividb.conf 
+
+== per-thread name / state / wchan
+49065 kividb S futex_do_wait
+49066 tokio-rt-worker S futex_do_wait
+49067 tokio-rt-worker S hrtimer_nanosleep
+49068 kividb-pubsub-l S hrtimer_nanosleep
+49069 kividb S hrtimer_nanosleep
+49070 kividb S hrtimer_nanosleep
+49071 kividb S hrtimer_nanosleep
+49072 kividb S hrtimer_nanosleep
+49073 kividb S hrtimer_nanosleep
+49074 kividb-defrag S hrtimer_nanosleep
+49094 hnsw-compaction S futex_do_wait
+49095 kividb S hrtimer_nanosleep
+49096 kividb S ep_poll
+49097 kividb-nodes-co S futex_do_wait
+49098 kividb-cluster- S ep_poll
+49100 kividb-bus-watc S hrtimer_nanosleep
+49256 tokio-rt-worker S futex_do_wait
+
+== sockets of this process (Recv-Q > 0 means unread data)
+LISTEN    0      128        127.0.0.1:23625      0.0.0.0:*     users:(("kividb",pid=49065,fd=13))                                           
+LISTEN    1      128        127.0.0.1:13625      0.0.0.0:*     users:(("kividb",pid=49065,fd=20),("kividb",pid=49065,fd=19))                
+ESTAB     0      385        127.0.0.1:60796    127.0.0.1:23626 users:(("kividb",pid=49065,fd=21))                                           
+ESTAB     0      0          127.0.0.1:38286    127.0.0.1:13626 users:(("kividb",pid=49065,fd=28))                                           
+ESTAB     0      0          127.0.0.1:23625    127.0.0.1:35794 users:(("kividb",pid=49065,fd=25))                                           
+ESTAB     0      0          127.0.0.1:23625    127.0.0.1:35786 users:(("kividb",pid=49065,fd=22))                                           
+ESTAB     0      0          127.0.0.1:13625    127.0.0.1:47864 users:(("kividb",pid=49065,fd=27))                                           
+ESTAB     288    0          127.0.0.1:13625    127.0.0.1:47670 users:(("kividb",pid=49065,fd=23))                                           
+ESTAB     0      0          127.0.0.1:13625    127.0.0.1:47830 users:(("kividb",pid=49065,fd=26))                                           
+ESTAB     0      385        127.0.0.1:35132    127.0.0.1:23627 users:(("kividb",pid=49065,fd=24))                                           
+
+== listening sockets (Recv-Q = accept queue length)
+LISTEN 0      128        127.0.0.1:23625      0.0.0.0:*    users:(("kividb",pid=49065,fd=13))                           
+LISTEN 1      128        127.0.0.1:13625      0.0.0.0:*    users:(("kividb",pid=49065,fd=20),("kividb",pid=49065,fd=19))
+
+== gdb: thread apply all bt
+[New LWP 49256]
+[New LWP 49100]
+[New LWP 49098]
+[New LWP 49097]
+[New LWP 49096]
+[New LWP 49095]
+[New LWP 49094]
+[New LWP 49074]
+[New LWP 49073]
+[New LWP 49072]
+[New LWP 49071]
+[New LWP 49070]
+[New LWP 49069]
+[New LWP 49068]
+[New LWP 49067]
+[New LWP 49066]
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+
+warning: 38	../sysdeps/unix/sysv/linux/x86_64/syscall.S: No such file or directory
+warning: Missing auto-load script at offset 0 in section .debug_gdb_scripts
+of file /home/azureuser/rc4/target/debug/kividb.
+Use `info auto-load python-scripts [REGEXP]' to list them.
+
+Thread 17 (Thread 0x701d381ff6c0 (LWP 49066) "tokio-rt-worker"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x00005a8505edd361 in parking_lot_core::thread_parker::imp::ThreadParker::futex_wait (self=0x701d381ff668, ts=...) at /home/azureuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parking_lot_core-0.9.12/src/thread_parker/linux.rs:112
+#2  0x00005a8505edea7c in parking_lot_core::thread_parker::imp::{impl#0}::park (self=0x701d381ff668) at /home/azureuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parking_lot_core-0.9.12/src/thread_parker/linux.rs:66
+#3  0x00005a8505ee717d in parking_lot_core::parking_lot::park::{closure#0}<parking_lot::condvar::{impl#1}::wait_until_internal::{closure_env#0}, parking_lot::condvar::{impl#1}::wait_until_internal::{closure_env#1}, parking_lot::condvar::{impl#1}::wait_until_internal::{closure_env#2}> (thread_data=0x701d381ff648) at /home/azureuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parking_lot_core-0.9.12/src/parking_lot.rs:635
+#4  0x00005a8505ee49de in parking_lot_core::parking_lot::with_thread_data<parking_lot_core::parking_lot::ParkResult, parking_lot_core::parking_lot::park::{closure_env#0}<parking_lot::condvar::{impl#1}::wait_until_internal::{closure_env#0}, parking_lot::condvar::{impl#1}::wait_until_internal::{closure_env#1}, parking_lot::condvar::{impl#1}::wait_until_internal::{closure_env#2}>> (f=...) at /home/azureuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parking_lot_core-0.9.12/src/parking_lot.rs:207
+#5  parking_lot_core::parking_lot::park<parking_lot::condvar::{impl#1}::wait_until_internal::{closure_env#0}, parking_lot::condvar::{impl#1}::wait_until_internal::{closure_env#1}, parking_lot::condvar::{impl#1}::wait_until_internal::{closure_env#2}> (key=99527869866432, validate=..., before_sleep=..., timed_out=..., park_token=..., timeout=...) at /home/azureuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parking_lot_core-0.9.12/src/parking_lot.rs:600
+#6  0x00005a8505eea1fa in parking_lot::condvar::Condvar::wait_until_internal (self=0x5a85235421c0, mutex=0x5a85235421c8, timeout=...) at src/condvar.rs:334
+#7  0x00005a8505e5d052 in parking_lot::condvar::Condvar::wait<()> (self=0x5a85235421c0, mutex_guard=0x701d381fc6c8) at /home/azureuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parking_lot-0.12.5/src/condvar.rs:256
+#8  0x00005a8505ebde8c in tokio::loom::std::parking_lot::Condvar::wait<()> (self=0x5a85235421c0, guard=...) at src/loom/std/parking_lot.rs:161
+#9  0x00005a8505e6780b in tokio::runtime::scheduler::multi_thread::park::Inner::park_condvar (self=0x5a85235421b0, duration=...) at src/runtime/scheduler/multi_thread/park.rs:189
+#10 0x00005a8505e6805d in tokio::runtime::scheduler::multi_thread::park::Inner::park (self=0x5a85235421b0, handle=0x5a8523555868) at src/runtime/scheduler/multi_thread/park.rs:133
+#11 0x00005a8505e65ec4 in tokio::runtime::scheduler::multi_thread::park::Parker::park (self=0x701d381fcb98, handle=0x5a8523555868) at src/runtime/scheduler/multi_thread/park.rs:70
+#12 0x00005a8505e57bf4 in tokio::runtime::scheduler::multi_thread::worker::Context::park_internal (self=0x701d381fd140, core=0x5a852353f820, duration=...) at src/runtime/scheduler/multi_thread/worker.rs:836
+#13 0x00005a8505e58f43 in tokio::runtime::scheduler::multi_thread::worker::Context::park (self=0x701d381fd140, core=0x5a852353f820) at src/runtime/scheduler/multi_thread/worker.rs:784
+#14 0x00005a8505e58941 in tokio::runtime::scheduler::multi_thread::worker::Context::run (self=0x701d381fd140, core=0x5a852353f820) at src/runtime/scheduler/multi_thread/worker.rs:589
+#15 0x00005a8505e4f7f9 in tokio::runtime::scheduler::multi_thread::worker::run::{closure#0}::{closure#0} () at src/runtime/scheduler/multi_thread/worker.rs:536
+#16 0x00005a8505ebd790 in tokio::runtime::context::scoped::Scoped<tokio::runtime::scheduler::Context>::set<tokio::runtime::scheduler::Context, tokio::runtime::scheduler::multi_thread::worker::run::{closure#0}::{closure_env#0}, ()> (self=0x701d381fee48, t=0x701d381fd138, f=...) at src/runtime/context/scoped.rs:40
+#17 0x00005a8505e9584b in tokio::runtime::context::set_scheduler::{closure#0}<(), tokio::runtime::scheduler::multi_thread::worker::run::{closure#0}::{closure_env#0}> (c=0x701d381fee20) at src/runtime/context.rs:176
+#18 0x00005a8505e817c8 in std::thread::local::LocalKey<tokio::runtime::context::Context>::try_with<tokio::runtime::context::Context, tokio::runtime::context::set_scheduler::{closure_env#0}<(), tokio::runtime::scheduler::multi_thread::worker::run::{closure#0}::{closure_env#0}>, ()> (self=0x5a8506054f58, f=...) at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/thread/local.rs:463
+#19 0x00005a8505e8137f in std::thread::local::LocalKey<tokio::runtime::context::Context>::with<tokio::runtime::context::Context, tokio::runtime::context::set_scheduler::{closure_env#0}<(), tokio::runtime::scheduler::multi_thread::worker::run::{closure#0}::{closure_env#0}>, ()> (self=0x5a8506054f58, f=<error reading variable: Cannot access memory at address 0x80>) at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/thread/local.rs:427
+#20 0x00005a8505e94294 in tokio::runtime::context::set_scheduler<(), tokio::runtime::scheduler::multi_thread::worker::run::{closure#0}::{closure_env#0}> (v=0x701d381fd138, f=...) at src/runtime/context.rs:176
+#21 0x00005a8505e50c29 in tokio::runtime::scheduler::multi_thread::worker::run::{closure#0} () at src/runtime/scheduler/multi_thread/worker.rs:531
+#22 0x00005a8505e6d9ef in tokio::runtime::context::runtime::enter_runtime<tokio::runtime::scheduler::multi_thread::worker::run::{closure_env#0}, ()> (handle=0x701d381fd348, allow_block_in_place=true, f=...) at src/runtime/context/runtime.rs:65
+#23 0x00005a8505e5a911 in tokio::runtime::scheduler::multi_thread::worker::run (worker=...) at src/runtime/scheduler/multi_thread/worker.rs:523
+#24 0x00005a8505e4f9ab in tokio::runtime::scheduler::multi_thread::worker::{impl#0}::launch::{closure#0} () at src/runtime/scheduler/multi_thread/worker.rs:489
+#25 0x00005a8505eac4cb in tokio::runtime::blocking::task::{impl#2}::poll<tokio::runtime::scheduler::multi_thread::worker::{impl#0}::launch::{closure_env#0}, ()> (self=..., _cx=0x701d381fd4b0) at src/runtime/blocking/task.rs:42
+#26 0x00005a8505e4ac3c in tokio::runtime::task::core::{impl#6}::poll::{closure#0}<tokio::runtime::blocking::task::BlockingTask<tokio::runtime::scheduler::multi_thread::worker::{impl#0}::launch::{closure_env#0}>, tokio::runtime::blocking::schedule::BlockingSchedule> (ptr=0x5a8523555a48) at src/runtime/task/core.rs:375
+#27 0x00005a8505e4d52e in tokio::loom::std::unsafe_cell::UnsafeCell<tokio::runtime::task::core::Stage<tokio::runtime::blocking::task::BlockingTask<tokio::runtime::scheduler::multi_thread::worker::{impl#0}::launch::{closure_env#0}>>>::with_mut<tokio::runtime::task::core::Stage<tokio::runtime::blocking::task::BlockingTask<tokio::runtime::scheduler::multi_thread::worker::{impl#0}::launch::{closure_env#0}>>, core::task::poll::Poll<()>, tokio::runtime::task::core::{impl#6}::poll::{closure_env#0}<tokio::runtime::blocking::task::BlockingTask<tokio::runtime::scheduler::multi_thread::worker::{impl#0}::launch::{closure_env#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>> (self=0x5a8523555a48, f=...) at src/loom/std/unsafe_cell.rs:16
+#28 tokio::runtime::task::core::Core<tokio::runtime::blocking::task::BlockingTask<tokio::runtime::scheduler::multi_thread::worker::{impl#0}::launch::{closure_env#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>::poll<tokio::runtime::blocking::task::BlockingTask<tokio::runtime::scheduler::multi_thread::worker::{impl#0}::launch::{closure_env#0}>, tokio::runtime::blocking::schedule::BlockingSchedule> (self=0x5a8523555a20, cx=<error reading variable: Cannot access memory at address 0x90>) at src/runtime/task/core.rs:364
+#29 0x00005a8505e47afe in tokio::runtime::task::harness::poll_future::{closure#0}<tokio::runtime::blocking::task::BlockingTask<tokio::runtime::scheduler::multi_thread::worker::{impl#0}::launch::{closure_env#0}>, tokio::runtime::blocking::schedule::BlockingSchedule> () at src/runtime/task/harness.rs:535
+#30 0x00005a8505ec4901 in core::panic::unwind_safe::{impl#23}::call_once<core::task::poll::Poll<()>, tokio::runtime::task::harness::poll_future::{closure_env#0}<tokio::runtime::blocking::task::BlockingTask<tokio::runtime::scheduler::multi_thread::worker::{impl#0}::launch::{closure_env#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>> (self=...) at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/panic/unwind_safe.rs:275
+#31 0x00005a8505e8314b in std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<tokio::runtime::task::harness::poll_future::{closure_env#0}<tokio::runtime::blocking::task::BlockingTask<tokio::runtime::scheduler::multi_thread::worker::{impl#0}::launch::{closure_env#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>>, core::task::poll::Poll<()>> (data=0x701d381fd5c8) at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panicking.rs:576
+#32 0x00005a8505e7272b in __rust_try ()
+#33 0x00005a8505e6d286 in std::panicking::catch_unwind<core::task::poll::Poll<()>, core::panic::unwind_safe::AssertUnwindSafe<tokio::runtime::task::harness::poll_future::{closure_env#0}<tokio::runtime::blocking::task::BlockingTask<tokio::runtime::scheduler::multi_thread::worker::{impl#0}::launch::{closure_env#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>>> (f=...) at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panicking.rs:544
+#34 std::panic::catch_unwind<core::panic::unwind_safe::AssertUnwindSafe<tokio::runtime::task::harness::poll_future::{closure_env#0}<tokio::runtime::blocking::task::BlockingTask<tokio::runtime::scheduler::multi_thread::worker::{impl#0}::launch::{closure_env#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>>, core::task::poll::Poll<()>> (f=...) at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panic.rs:359
+#35 0x00005a8505e472e0 in tokio::runtime::task::harness::poll_future<tokio::runtime::blocking::task::BlockingTask<tokio::runtime::scheduler::multi_thread::worker::{impl#0}::launch::{closure_env#0}>, tokio::runtime::blocking::schedule::BlockingSchedule> (core=0x5a8523555a20, cx=...) at src/runtime/task/harness.rs:523
+#36 0x00005a8505e490a9 in tokio::runtime::task::harness::Harness<tokio::runtime::blocking::task::BlockingTask<tokio::runtime::scheduler::multi_thread::worker::{impl#0}::launch::{closure_env#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>::poll_inner<tokio::runtime::blocking::task::BlockingTask<tokio::runtime::scheduler::multi_thread::worker::{impl#0}::launch::{closure_env#0}>, tokio::runtime::blocking::schedule::BlockingSchedule> (self=0x701d381fd850) at src/runtime/task/harness.rs:210
+#37 0x00005a8505e49367 in tokio::runtime::task::harness::Harness<tokio::runtime::blocking::task::BlockingTask<tokio::runtime::scheduler::multi_thread::worker::{impl#0}::launch::{closure_env#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>::poll<tokio::runtime::blocking::task::BlockingTask<tokio::runtime::scheduler::multi_thread::worker::{impl#0}::launch::{closure_env#0}>, tokio::runtime::blocking::schedule::BlockingSchedule> (self=...) at src/runtime/task/harness.rs:155
+#38 0x00005a8505e642ed in tokio::runtime::task::raw::poll<tokio::runtime::blocking::task::BlockingTask<tokio::runtime::scheduler::multi_thread::worker::{impl#0}::launch::{closure_env#0}>, tokio::runtime::blocking::schedule::BlockingSchedule> (ptr=...) at src/runtime/task/raw.rs:337
+#39 0x00005a8505e69997 in tokio::runtime::task::raw::RawTask::poll (self=...) at src/runtime/task/raw.rs:267
+#40 0x00005a8505ebaec7 in tokio::runtime::task::UnownedTask<tokio::runtime::blocking::schedule::BlockingSchedule>::run<tokio::runtime::blocking::schedule::BlockingSchedule> (self=...) at src/runtime/task/mod.rs:547
+#41 0x00005a8505ea94c7 in tokio::runtime::blocking::pool::Task::run (self=...) at src/runtime/blocking/pool.rs:161
+#42 0x00005a8505eab160 in tokio::runtime::blocking::pool::Inner::run (self=0x5a8523541ac0, worker_thread_id=0) at src/runtime/blocking/pool.rs:518
+#43 0x00005a8505ea8f94 in tokio::runtime::blocking::pool::{impl#6}::spawn_thread::{closure#0} () at src/runtime/blocking/pool.rs:474
+#44 0x00005a8505e8b246 in std::sys::backtrace::__rust_begin_short_backtrace<tokio::runtime::blocking::pool::{impl#6}::spawn_thread::{closure_env#0}, ()> (f=...) at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/sys/backtrace.rs:166
+#45 0x00005a8505e96782 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<tokio::runtime::blocking::pool::{impl#6}::spawn_thread::{closure_env#0}, ()> () at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/thread/lifecycle.rs:70
+#46 0x00005a8505ec49e1 in core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<tokio::runtime::blocking::pool::{impl#6}::spawn_thread::{closure_env#0}, ()>> (self=...) at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/panic/unwind_safe.rs:275
+#47 0x00005a8505e83286 in std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<tokio::runtime::blocking::pool::{impl#6}::spawn_thread::{closure_env#0}, ()>>, ()> (data=0x701d381fde50) at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panicking.rs:576
+#48 0x00005a8505e9a90b in __rust_try ()
+#49 0x00005a8505e96444 in std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<tokio::runtime::blocking::pool::{impl#6}::spawn_thread::{closure_env#0}, ()>>> (f=<error reading variable: Cannot access memory at address 0x701d381fdda8>) at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panicking.rs:544
+#50 std::panic::catch_unwind<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<tokio::runtime::blocking::pool::{impl#6}::spawn_thread::{closure_env#0}, ()>>, ()> (f=<error reading variable: Cannot access memory at address 0x701d381fdde0>) at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/panic.rs:359
+#51 std::thread::lifecycle::spawn_unchecked::{closure#1}<tokio::runtime::blocking::pool::{impl#6}::spawn_thread::{closure_env#0}, ()> () at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/thread/lifecycle.rs:68
+#52 0x00005a8505eb44ef in core::ops::function::FnOnce::call_once<std::thread::lifecycle::spawn_unchecked::{closure_env#1}<tokio::runtime::blocking::pool::{impl#6}::spawn_thread::{closure_env#0}, ()>, ()> () at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/ops/function.rs:250
+#53 0x00005a8505f220a9 in alloc::boxed::{impl#31}::call_once<(), (dyn core::ops::function::FnOnce<(), Output=()> + core::marker::Send), alloc::alloc::Global> () at library/alloc/src/boxed.rs:2320
+#54 std::sys::thread::unix::{impl#2}::new::thread_start () at library/std/src/sys/thread/unix.rs:123
+Backtrace stopped: Cannot access memory at address 0x701d381fdfc8
+
+Thread 16 (Thread 0x701d37ffe6c0 (LWP 49067) "tokio-rt-worker"):
+Couldn't get registers: No such process.
+[Inferior 1 (process 49065) detached]
