@@ -1,0 +1,1 @@
+started redis-8.10.3 allkeys-lfu pid 9413

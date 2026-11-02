@@ -1,0 +1,6 @@
+shd-0-0 cluster_state:ok shd-1-0@stale-ip 
+shd-0-1 cluster_state:ok 
+shd-1-0 cluster_state:ok shd-0-0@stale-ip shd-0-0:slave,fail 
+shd-1-1 cluster_state:ok 
+shd-2-0 cluster_state:ok 
+shd-2-1 cluster_state:ok 

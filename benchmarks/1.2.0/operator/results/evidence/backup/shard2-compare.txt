@@ -1,0 +1,4 @@
+restored dbsize 1839847
+sampled 300 values vs live cluster, mismatches 0
+11050
+16340

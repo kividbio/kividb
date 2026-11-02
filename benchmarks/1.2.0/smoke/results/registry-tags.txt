@@ -1,0 +1,16 @@
+docker.io/kividb/kividb:latest sha256:5677cfc55fc4a26f247f0ea38dce2cb02237bf27de875f5c362f095aa6a8318d
+docker.io/kividb/kividb:1.2 ERROR: docker.io/kividb/kividb:1.2: not found
+docker.io/kividb/kividb:1.1 sha256:5677cfc55fc4a26f247f0ea38dce2cb02237bf27de875f5c362f095aa6a8318d
+docker.io/kividb/kividb:v1.1.3 sha256:5677cfc55fc4a26f247f0ea38dce2cb02237bf27de875f5c362f095aa6a8318d
+docker.io/kividb/kividb:v1.2.0-rc4-amd64 ERROR: docker.io/kividb/kividb:v1.2.0-rc4-amd64: not found
+ghcr.io/kividbio/kividb:latest sha256:5677cfc55fc4a26f247f0ea38dce2cb02237bf27de875f5c362f095aa6a8318d
+ghcr.io/kividbio/kividb:1.2 ERROR: ghcr.io/kividbio/kividb:1.2: not found
+ghcr.io/kividbio/kividb:1.1 sha256:5677cfc55fc4a26f247f0ea38dce2cb02237bf27de875f5c362f095aa6a8318d
+ghcr.io/kividbio/kividb:v1.1.3 sha256:5677cfc55fc4a26f247f0ea38dce2cb02237bf27de875f5c362f095aa6a8318d
+ghcr.io/kividbio/kividb:v1.2.0-rc4-amd64 sha256:a97b3a85886b7347b75565076879f5207df2a74af2c9cd53edd36180b8bd4502
+latest
+v1.1.3
+v1.2.0-rc4
+v1.2.0-rc4-full
+v1.2.0-rc4-lua
+v1.2.0-rc4-tls

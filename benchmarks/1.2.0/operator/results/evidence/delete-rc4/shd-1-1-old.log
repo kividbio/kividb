@@ -1,0 +1,13 @@
+2026-11-01T23:43:17.938Z 1 [INFO] Cluster: Manual failover requested by e46a08ae89d2cdb5fa74beb1715432d92de992d7 — writes paused, replica must reach offset 96515257
+2026-11-01T23:43:17.939Z 1 [INFO] Cluster: Voted for e46a08ae89d2cdb5fa74beb1715432d92de992d7 to take over from c2bba9ce7583025e1e52557edc9dffdf8827b2aa at epoch 54 (manual failover)
+2026-11-01T23:43:18.024Z 1 [INFO] Cluster: Slots of this shard are now owned by e46a08ae89d2cdb5fa74beb1715432d92de992d7 — following it as a replica
+2026-11-01T23:43:18.024Z 1 [INFO] Replication: Replica 10.244.1.83:50318 disconnected: this node is now a replica itself
+2026-11-01T23:43:18.024Z 1 [INFO] Replication: uring: replica disconnected
+2026-11-01T23:43:18.024Z 1 [INFO] Replication: Connecting to master 10.244.1.83:6380...
+2026-11-01T23:43:18.086Z 1 [INFO] SIGTERM received — shutting down gracefully
+2026-11-01T23:43:18.086Z 1 [INFO] Writing final snapshot...
+2026-11-01T23:43:18.260Z 1 [INFO] Replication: Full resync from fae41cbadb0d528cbcaac6181082a51936289369 offset=96515257
+2026-11-01T23:43:18.260Z 1 [INFO] Replication: Receiving full-sync payload (40155161 bytes)...
+2026-11-01T23:43:18.477Z 1 [WARN] Replication: Dropped the 1628564 local keys before loading 1628564 from the master
+2026-11-01T23:43:18.552Z 1 [INFO] AOF: rebased onto dump.kdb (generation 19) — log is now the delta
+2026-11-01T23:43:18.552Z 1 [INFO] Goodbye.

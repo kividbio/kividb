@@ -1,0 +1,10 @@
+perf record -F 999 -g -p <server pid> -- sleep 30, 190 s into a 8,388,608x allkeys-lfu run (measured phase), on pair 3.
+First block: KiviDB 1.2.0-rc4. Second block: Redis 8.10.3. Share of server cycles by object.
+    66.91%  [kernel.kallsyms]
+    29.70%  server           
+     2.56%  libc.so.6        
+     0.83%  [vdso]           
+    67.93%  [kernel.kallsyms]
+    26.96%  server           
+     4.76%  libc.so.6        
+     0.36%  [vdso]           

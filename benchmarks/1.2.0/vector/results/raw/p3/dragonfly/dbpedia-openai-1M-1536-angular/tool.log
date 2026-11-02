@@ -1,0 +1,21 @@
+1793579761.528 RUN ./vector-db-benchmark --host 10.90.1.4 --engines-file dragonfly-engine.json --engines dragonfly-m16-ef128 --skip-search --datasets dbpedia-openai-1M-1536-angular --skip-if-exists false 
+1793579761.536 vector-db-benchmark 0.2.0 (git d22d44e8b46009a800a59e952710166ece2e38a1)
+1793579761.537 Found 1 datasets, 1 engines
+1793579761.539 
+1793579761.541 ============================================================
+1793579761.543 Running experiment (1/1): dragonfly-m16-ef128 - dbpedia-openai-1M-1536-angular
+1793579761.545 ============================================================
+1793579761.547 Experiment stage: Configure
+1793579761.548 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 128}
+1793579761.777 Experiment stage: Upload
+1793579761.779 Reading dataset from /home/ubuntu/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793579761.781 WARNING: dataset 'dbpedia-openai-1M-1536-angular' declares vector_count 1000000 but its corpus holds only 999000 vectors. Benchmarks will run over the 999000 vectors that exist; fix vector_count in datasets/datasets.json (it is what --list-datasets reports).
+1793579771.407 Read 999000 vectors (1536d) in 9.630s (103737 vectors/sec)
+1793579771.409 Starting upload with 16 threads, batch size 64...
+1793579917.530 Upload time: 146.123s (6837 records/sec)
+1793579917.532 Indexing complete (num_docs=999000/999000, indexing=false, percent_indexed=1.00, state=absent) in 0.0s
+1793579917.534 Index time: 0.002s, Total time (read+upload+index): 155.755s
+1793579917.970 Results saved to: "/home/ubuntu/vdbx/results/dragonfly-m16-ef128-dbpedia-openai-1M-1536-angular-upload-0-999000-2026-11-02-00-38-37.json"
+1793579917.973 Experiment stage: Cleanup (deleting index and data)
+1793579922.866 Experiment stage: Done
+1793579922.869 EXIT 0

@@ -1,0 +1,77 @@
+                                                                                     
+2026-11-01T23:27:09.764Z 1 [INFO] KiviDB 1.2.0-rc4 starting: pid 1, default build, config file '/etc/kividb/kividb.conf'
+2026-11-01T23:27:09.764Z 1 [INFO] I/O model      : io_uring
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc4 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc4
+  * Mode           : cluster
+  * OS             : linux x86_64
+  * Memory         : 15GiB available
+  * CPUs           : 4 cores detected
+  * Listening on   : 0.0.0.0:6380
+  * Cluster bus    : 0.0.0.0:16380
+  * Node timeout   : 5000ms
+  * Node ID        : (printed after cluster init)
+  * Worker threads : 2
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : /etc/kividb/acl/users.acl
+
+2026-11-01T23:27:09.774Z 1 [INFO] ACL file loaded: /etc/kividb/acl/users.acl
+2026-11-01T23:27:09.774Z 1 [INFO] Cluster: Node ID        : e46a08ae89d2cdb5fa74beb1715432d92de992d7
+2026-11-01T23:27:09.775Z 1 [INFO] Cluster: Bus port       : 16380
+2026-11-01T23:27:09.775Z 1 [INFO] Shards per DB  : 32
+2026-11-01T23:27:09.775Z 1 [INFO] I/O model      : io_uring
+2026-11-01T23:27:09.775Z 1 [INFO] Found dump.kdb — loading native snapshot
+2026-11-01T23:27:11.203Z 1 [INFO] Loaded 1388670 keys from snapshot (0 with a TTL)
+2026-11-01T23:27:11.204Z 1 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+2026-11-01T23:27:11.207Z 1 [INFO] Replication: Loaded dataset is offset 86198631 of 015c4eb295fb7c1375030298724b6cc8ea9baaf3 — a partial resync will be asked for
+2026-11-01T23:27:11.207Z 1 [INFO] Cluster: Restored replica role of master c2bba9ce7583025e1e52557edc9dffdf8827b2aa → restarting replication client
+2026-11-01T23:27:11.207Z 1 [INFO] Cluster: Bus listener bound on 0.0.0.0:16380
+2026-11-01T23:27:11.207Z 1 [INFO] Cluster: Heartbeat loop started (interval 1s)
+2026-11-01T23:27:11.207Z 1 [INFO] Cluster: Failure detection started (interval 100ms, node_timeout 5000ms)
+2026-11-01T23:27:11.207Z 1 [INFO] Replication: Connecting to master 10.244.3.78:6380...
+2026-11-01T23:27:11.207Z 1 [INFO] Ready to accept connections on 0.0.0.0:6380
+2026-11-01T23:27:11.208Z 1 [INFO] Replication: Partial resync: continuing from offset 86198631 — no dataset transfer
+2026-11-01T23:27:11.209Z 1 [INFO] Replication: Synced with 10.244.3.78:6380. Entering command stream.
+2026-11-01T23:27:20.462Z 1 [INFO] CONFIG SET cluster-announce-hostname shd-1-0.shd-1-headless.e2e.svc
+2026-11-01T23:27:32.050Z 1 [WARN] Cluster: Node 12921ba0547672f08374c76be8537262ab47d13f marked FAIL (reported by c2bba9ce7583025e1e52557edc9dffdf8827b2aa)
+2026-11-01T23:29:12.047Z 1 [INFO] Cluster: Manual failover: starting election at epoch 51 to replace c2bba9ce7583025e1e52557edc9dffdf8827b2aa
+2026-11-01T23:29:12.108Z 1 [INFO] Cluster: Won election at epoch 51 (3 votes, quorum 2)
+2026-11-01T23:29:12.112Z 1 [INFO] Replication: Promoted; the stream 015c4eb295fb7c1375030298724b6cc8ea9baaf3 goes on as ec42480992a604aa8a095425b88baa28ea575321 from offset 87558482 — its replicas can be continued
+2026-11-01T23:29:12.117Z 1 [INFO] Replication: Channel replica registered: 10.244.3.78:60436
+2026-11-01T23:29:12.244Z 1 [INFO] Replication: Command stream from 10.244.3.78:6380 superseded (epoch 1) — dropping connection
+2026-11-01T23:29:12.244Z 1 [INFO] Replication: Replication session for 10.244.3.78:6380 superseded — stopping replication client
+2026-11-01T23:29:12.272Z 1 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub

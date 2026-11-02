@@ -1,0 +1,16 @@
+harness (client):
+6d774921824a7ef2ce39f597cef5c2b72e983d24 Fri Oct 23 08:23:12 2026 +0800 Update Umem-cache client
+go version go1.25.3 linux/arm64
+
+server environment (s1):
+kernel: 7.0.0-1017-azure
+CPU(s):                                  4
+Model name:                              Neoverse-N1
+L2 cache:                                4 MiB (4 instances)
+L3 cache:                                32 MiB (1 instance)
+               total        used        free      shared  buff/cache   available
+Mem:            7911         564        6564           3         963        7346
+client environment (c1):
+7.0.0-1017-azure
+4
+Model name:                              Neoverse-N1

@@ -1,0 +1,140 @@
+== 00:00:29.451
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101314286,lag=0 master_repl_offset:101314286 
+== 00:00:29.985
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101320650,lag=0 master_repl_offset:101320650 
+== 00:00:30.522
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101326240,lag=0 master_repl_offset:101326240 
+== 00:00:31.035
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101331844,lag=0 master_repl_offset:101331844 
+== 00:00:31.544
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101338208,lag=0 master_repl_offset:101338208 
+== 00:00:32.054
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101343669,lag=0 master_repl_offset:101343669 
+== 00:00:32.561
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101349431,lag=0 master_repl_offset:101349431 
+== 00:00:33.076
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101355107,lag=0 master_repl_offset:101355107 
+== 00:00:33.583
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101361256,lag=0 master_repl_offset:101361256 
+== 00:00:34.122
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101366846,lag=0 master_repl_offset:101366846 
+== 00:00:34.637
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101373296,lag=0 master_repl_offset:101373296 
+== 00:00:35.151
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101379187,lag=0 master_repl_offset:101379187 
+== 00:00:35.681
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101385336,lag=0 master_repl_offset:101385336 
+== 00:00:36.189
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101391313,lag=0 master_repl_offset:101391313 
+== 00:00:36.716
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101397333,lag=0 master_repl_offset:101397333 
+== 00:00:37.223
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101403267,lag=0 master_repl_offset:101403267 
+== 00:00:37.746
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101409115,lag=0 master_repl_offset:101409115 
+== 00:00:38.254
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101415608,lag=0 master_repl_offset:101415608 
+== 00:00:38.764
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101421413,lag=0 master_repl_offset:101421413 
+== 00:00:39.292
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101427605,lag=0 master_repl_offset:101427605 
+== 00:00:39.823
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101433238,lag=0 master_repl_offset:101433238 
+== 00:00:40.331
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101439172,lag=0 master_repl_offset:101439172 
+== 00:00:40.852
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101444762,lag=0 master_repl_offset:101444762 
+== 00:00:41.363
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101450868,lag=0 master_repl_offset:101450868 
+== 00:00:41.883
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101456759,lag=0 master_repl_offset:101456759 
+== 00:00:42.416
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101462578,lag=0 master_repl_offset:101462578 
+== 00:00:42.929
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101468555,lag=0 master_repl_offset:101468555 
+== 00:00:43.456
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101474188,lag=0 master_repl_offset:101474188 
+== 00:00:43.963
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101479778,lag=0 master_repl_offset:101479778 
+== 00:00:44.481
+connected_slaves:1 slave0:ip=10.244.1.155,port=6380,state=online,offset=101480423,lag=0 master_repl_offset:101485927 
+== 00:00:44.994
+connected_slaves:0 master_repl_offset:101492162 
+== 00:00:45.511
+connected_slaves:0 master_repl_offset:101497494 
+== 00:00:46.018
+connected_slaves:0 master_repl_offset:101503342 
+== 00:00:46.538
+connected_slaves:0 master_repl_offset:101509749 
+== 00:00:47.049
+connected_slaves:0 master_repl_offset:101515210 
+== 00:00:47.557
+connected_slaves:0 master_repl_offset:101521187 
+== 00:00:48.067
+connected_slaves:0 master_repl_offset:101527422 
+== 00:00:48.602
+connected_slaves:0 master_repl_offset:101533313 
+== 00:00:49.118
+connected_slaves:0 master_repl_offset:101539247 
+== 00:00:49.631
+connected_slaves:0 master_repl_offset:101544837 
+== 00:00:50.136
+connected_slaves:0 master_repl_offset:101550857 
+== 00:00:50.647
+connected_slaves:0 master_repl_offset:101556791 
+== 00:00:51.158
+connected_slaves:0 master_repl_offset:101562768 
+== 00:00:51.671
+connected_slaves:0 master_repl_offset:101568186 
+== 00:00:52.187
+connected_slaves:0 master_repl_offset:101574292 
+== 00:00:52.700
+connected_slaves:0 master_repl_offset:101580269 
+== 00:00:53.215
+connected_slaves:0 master_repl_offset:101586332 
+== 00:00:53.733
+connected_slaves:0 master_repl_offset:101592352 
+== 00:00:54.243
+connected_slaves:1 slave0:ip=10.244.1.131,port=6380,state=online,offset=101598008,lag=0 master_repl_offset:101598008 
+== 00:00:54.756
+connected_slaves:1 slave0:ip=10.244.1.131,port=6380,state=online,offset=101603856,lag=0 master_repl_offset:101603856 
+== 00:00:55.278
+connected_slaves:1 slave0:ip=10.244.1.131,port=6380,state=online,offset=101609675,lag=0 master_repl_offset:101609675 
+== 00:00:55.786
+connected_slaves:1 slave0:ip=10.244.1.131,port=6380,state=online,offset=101615910,lag=0 master_repl_offset:101615910 
+== 00:00:56.298
+connected_slaves:1 slave0:ip=10.244.1.131,port=6380,state=online,offset=101621973,lag=0 master_repl_offset:101621973 
+== 00:00:56.823
+connected_slaves:1 slave0:ip=10.244.1.131,port=6380,state=online,offset=101627778,lag=0 master_repl_offset:101627778 
+== 00:00:57.340
+connected_slaves:1 slave0:ip=10.244.1.131,port=6380,state=online,offset=101633798,lag=0 master_repl_offset:101633798 
+== 00:00:57.853
+connected_slaves:1 slave0:ip=10.244.1.131,port=6380,state=online,offset=101639603,lag=0 master_repl_offset:101639603 
+== 00:00:58.361
+connected_slaves:1 slave0:ip=10.244.1.131,port=6380,state=online,offset=101645752,lag=0 master_repl_offset:101645752 
+== 00:00:58.887
+connected_slaves:1 slave0:ip=10.244.1.131,port=6380,state=online,offset=101651471,lag=0 master_repl_offset:101651471 
+== 00:00:59.392
+connected_slaves:1 slave0:ip=10.244.1.131,port=6380,state=online,offset=101657534,lag=0 master_repl_offset:101657534 
+== 00:00:59.903
+connected_slaves:1 slave0:ip=10.244.1.131,port=6380,state=online,offset=101663296,lag=0 master_repl_offset:101663296 
+== 00:01:00.417
+connected_slaves:1 slave0:ip=10.244.1.131,port=6380,state=online,offset=101669273,lag=0 master_repl_offset:101669273 
+== 00:01:00.936
+connected_slaves:1 slave0:ip=10.244.1.131,port=6380,state=online,offset=101675250,lag=0 master_repl_offset:101675250 
+== 00:01:01.451
+connected_slaves:1 slave0:ip=10.244.1.131,port=6380,state=online,offset=101680969,lag=0 master_repl_offset:101680969 
+== 00:01:01.958
+connected_slaves:1 slave0:ip=10.244.1.131,port=6380,state=online,offset=101686731,lag=0 master_repl_offset:101686731 
+== 00:01:02.474
+connected_slaves:1 slave0:ip=10.244.1.131,port=6380,state=online,offset=101692622,lag=0 master_repl_offset:101692622 
+== 00:01:02.992
+connected_slaves:1 slave0:ip=10.244.1.131,port=6380,state=online,offset=101698900,lag=0 master_repl_offset:101698900 
+== 00:01:03.516
+connected_slaves:1 slave0:ip=10.244.1.131,port=6380,state=online,offset=101704920,lag=0 master_repl_offset:101704920 
+== 00:01:04.048
+connected_slaves:1 slave0:ip=10.244.1.131,port=6380,state=online,offset=101710381,lag=0 master_repl_offset:101710381 
+== 00:01:04.568
+connected_slaves:1 slave0:ip=10.244.1.131,port=6380,state=online,offset=101716659,lag=0 master_repl_offset:101716659 
+== 00:01:05.084
+connected_slaves:1 slave0:ip=10.244.1.131,port=6380,state=online,offset=101722650,lag=0 master_repl_offset:101722650 

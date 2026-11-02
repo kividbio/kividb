@@ -1,0 +1,28 @@
+2026-11-02T00:00:52.372Z 1 [INFO] KiviDB 1.2.0-rc4 starting: pid 1, default build, config file '/etc/kividb/kividb.conf'
+2026-11-02T00:00:52.372Z 1 [INFO] I/O model      : io_uring
+2026-11-02T00:00:52.388Z 1 [INFO] ACL file loaded: /etc/kividb/acl/users.acl
+2026-11-02T00:00:52.388Z 1 [INFO] Cluster: Node ID        : eb1ae7633be84d663adc38704cab562828a1483f
+2026-11-02T00:00:52.388Z 1 [INFO] Cluster: Bus port       : 16380
+2026-11-02T00:00:52.388Z 1 [INFO] Shards per DB  : 32
+2026-11-02T00:00:52.388Z 1 [INFO] I/O model      : io_uring
+2026-11-02T00:00:52.388Z 1 [INFO] Found dump.kdb — loading native snapshot
+2026-11-02T00:00:54.137Z 1 [INFO] Loaded 1658687 keys from snapshot (0 with a TTL)
+2026-11-02T00:00:54.138Z 1 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+2026-11-02T00:00:54.145Z 1 [INFO] Replication: Loaded dataset is offset 101480423 of 6a4af30c1c3807617ab0451a98b6070809e71168 — a partial resync will be asked for
+2026-11-02T00:00:54.146Z 1 [INFO] Cluster: Restored replica role of master 12921ba0547672f08374c76be8537262ab47d13f → restarting replication client
+2026-11-02T00:00:54.146Z 1 [INFO] Cluster: Bus listener bound on 0.0.0.0:16380
+2026-11-02T00:00:54.146Z 1 [INFO] Cluster: Heartbeat loop started (interval 1s)
+2026-11-02T00:00:54.146Z 1 [INFO] Cluster: Failure detection started (interval 100ms, node_timeout 5000ms)
+2026-11-02T00:00:54.146Z 1 [INFO] Replication: Connecting to master 10.244.2.78:6380...
+2026-11-02T00:00:54.146Z 1 [INFO] Ready to accept connections on 0.0.0.0:6380
+2026-11-02T00:00:54.152Z 1 [INFO] Replication: Partial resync: continuing from offset 101480423 — no dataset transfer
+2026-11-02T00:00:54.152Z 1 [INFO] Replication: Synced with 10.244.2.78:6380. Entering command stream.
+2026-11-02T00:01:02.551Z 1 [INFO] CONFIG SET cluster-announce-hostname shd-2-0.shd-2-headless.e2e.svc
+2026-11-02T00:13:34.151Z 1 [INFO] AOF: auto-checkpoint: 83.62 MB is 100%+ above the 0.00 MB baseline — folding into dump.kdb
+2026-11-02T00:17:54.194Z 1 [INFO] AOF: rebased onto dump.kdb (generation 19) — log is now the delta
+2026-11-02T00:22:34.196Z 1 [INFO] AOF: auto-checkpoint: 66.48 MB is 100%+ above the 16.45 MB baseline — folding into dump.kdb
+2026-11-02T00:23:56.915Z 1 [INFO] AOF: rebased onto dump.kdb (generation 20) — log is now the delta
+2026-11-02T00:24:05.722Z 1 [WARN] Cluster: Node e46a08ae89d2cdb5fa74beb1715432d92de992d7 marked FAIL (reported by fad063987c7a012d1f95933969c5aafcdcc228d2)
+2026-11-02T00:24:09.713Z 1 [WARN] Cluster: Node e78261d088e3ec01b23062e77b6c459304bea3da marked FAIL (reported by fad063987c7a012d1f95933969c5aafcdcc228d2)
+2026-11-02T00:24:13.093Z 1 [INFO] Cluster: Node e46a08ae89d2cdb5fa74beb1715432d92de992d7 is reachable again — clearing FAIL
+2026-11-02T00:24:26.865Z 1 [INFO] Cluster: Node e78261d088e3ec01b23062e77b6c459304bea3da is reachable again — clearing FAIL

@@ -1,0 +1,62 @@
+cmd: taskset -c 1,2,3 ./bench.test -test.run=^$ -test.bench=^BenchmarkRedis$ -test.benchtime=8388608x -test.timeout=0 true 1073741824 1024 8 1 0 10.30.1.11
+pair: c1 -> 10.30.1.11
+Sun Nov  1 22:14:48 UTC 2026
+goos: linux
+goarch: arm64
+pkg: github.com/imchuncai/umem-cache-benchmark
+BenchmarkRedis-3   	
+======================================================================
+server:  2097152    warmup:  8388608    get:  8388608    hit:  4680210
+VmHWM:       0 kB   hit_rate: 55.79%    per_memory_hit_rate: 55.79%
+P1: 132 us  P50: 3377 us  P90: 6273 us  P99: 8353 us  P99.9: 9999 us
+1334.231s	    output:   11 Mb/s   input:   15 Mb/s
+======================================================================
+--- FAIL: BenchmarkRedis-3
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+FAIL
+Command exited with non-zero status 1
+	Command being timed: "timeout 4h taskset -c 1,2,3 /home/azureuser/bench.test -test.run=^$ -test.bench=^BenchmarkRedis$ -test.benchtime=8388608x -test.timeout=0 true 1073741824 1024 8 1 0 10.30.1.11"
+	User time (seconds): 526.62
+	System time (seconds): 586.73
+	Percent of CPU this job got: 49%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 37:10.03
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 623868
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 282570
+	Voluntary context switches: 15583917
+	Involuntary context switches: 1142064
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 8
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 1
+exit=1
+Sun Nov  1 22:51:58 UTC 2026

@@ -1,0 +1,101 @@
+1793570417.394 RUN ./vector-db-benchmark --host 10.90.1.4 --engines-file kividb-engine.json --engines kividb-m16-ef128 --datasets h-and-m-2048-angular-filters --skip-if-exists false 
+1793570417.402 vector-db-benchmark 0.2.0 (git d22d44e8b46009a800a59e952710166ece2e38a1)
+1793570417.404 Found 1 datasets, 1 engines
+1793570417.406 
+1793570417.408 ============================================================
+1793570417.410 Running experiment (1/1): kividb-m16-ef128 - h-and-m-2048-angular-filters
+1793570417.412 ============================================================
+1793570417.413 Experiment stage: Configure
+1793570417.415 KiviDB server: `INFO server` reported `kividb_version:1.2.0-rc3`
+1793570417.417 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 128}
+1793570417.419 Experiment stage: Upload
+1793570417.421 Reading dataset from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793570419.091 Read 105100 vectors (2048d) in 1.683s (62447 vectors/sec)
+1793570419.094 Starting upload with 16 threads, batch size 64...
+1793570433.708 Upload time: 14.618s (7190 records/sec)
+1793570433.720 Indexing complete (algorithm=hnsw, num_docs=Some(105100), hnsw_live_count=Some(105100)/105100, compaction_in_progress=false) in 0.0s
+1793570433.721 Index time: 0.011s, Total time (read+upload+index): 16.312s
+1793570433.941 Results saved to: "/home/ubuntu/vdbx/results/kividb-m16-ef128-h-and-m-2048-angular-filters-upload-0-105100-2026-11-01-22-00-33.json"
+1793570435.588 Experiment stage: Search
+1793570435.590 	Running search 0: ef=64, parallel=1
+1793570435.612 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793570471.646 	  rep 1/3: QPS 292.9
+1793570471.668 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793570508.301 	  rep 2/3: QPS 287.8
+1793570508.323 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793570544.542 	  rep 3/3: QPS 291.2
+1793570544.544 	→ QPS: 292.9, Recall: 0.9983, Precision@returned: 0.9983, MRR: 0.9989, NDCG: 0.9984 (best of reps)
+1793570544.545 	Running search 1: ef=128, parallel=1
+1793570544.564 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793570586.069 	  rep 1/3: QPS 252.4
+1793570586.091 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793570628.263 	  rep 2/3: QPS 248.2
+1793570628.285 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793570669.957 	  rep 3/3: QPS 251.3
+1793570669.958 	→ QPS: 252.4, Recall: 0.9984, Precision@returned: 0.9984, MRR: 0.9989, NDCG: 0.9985 (best of reps)
+1793570669.960 	Running search 2: ef=256, parallel=1
+1793570669.979 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793570718.847 	  rep 1/3: QPS 212.9
+1793570718.869 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793570766.056 	  rep 2/3: QPS 220.8
+1793570766.078 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793570813.773 	  rep 3/3: QPS 218.3
+1793570813.774 	→ QPS: 220.8, Recall: 0.9985, Precision@returned: 0.9985, MRR: 0.9989, NDCG: 0.9986 (best of reps)
+1793570813.776 	Running search 3: ef=128, parallel=16
+1793570813.795 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793570818.843 	  rep 1/3: QPS 3157.1
+1793570818.865 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793570823.922 	  rep 2/3: QPS 3152.1
+1793570823.944 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793570829.005 	  rep 3/3: QPS 3144.4
+1793570829.007 	→ QPS: 3157.1, Recall: 0.9984, Precision@returned: 0.9984, MRR: 0.9989, NDCG: 0.9985 (best of reps)
+1793570829.009 	Running search 4: ef=128, parallel=100
+1793570829.027 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793570833.140 	  rep 1/3: QPS 4570.3
+1793570833.161 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793570837.281 	  rep 2/3: QPS 4557.3
+1793570837.304 	Reading queries from /home/ubuntu/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793570841.425 	  rep 3/3: QPS 4544.4
+1793570841.426 	→ QPS: 4570.3, Recall: 0.9984, Precision@returned: 0.9984, MRR: 0.9989, NDCG: 0.9985 (best of reps)
+1793570841.465 	Results saved to: "/home/ubuntu/vdbx/results/kividb-m16-ef128-h-and-m-2048-angular-filters-search-0-24511-2026-11-01-22-07-21.json"
+1793570841.479 	Results saved to: "/home/ubuntu/vdbx/results/kividb-m16-ef128-h-and-m-2048-angular-filters-search-1-24511-2026-11-01-22-07-21.json"
+1793570841.493 	Results saved to: "/home/ubuntu/vdbx/results/kividb-m16-ef128-h-and-m-2048-angular-filters-search-2-24511-2026-11-01-22-07-21.json"
+1793570841.508 	Results saved to: "/home/ubuntu/vdbx/results/kividb-m16-ef128-h-and-m-2048-angular-filters-search-3-24511-2026-11-01-22-07-21.json"
+1793570841.522 	Results saved to: "/home/ubuntu/vdbx/results/kividb-m16-ef128-h-and-m-2048-angular-filters-search-4-24511-2026-11-01-22-07-21.json"
+1793570841.524 -----------------------------------------------------------------------------------------------
+1793570841.526 Recall     Precision  MRR      NDCG     QPS        P50 (ms)     P90 (ms)     P95 (ms)    
+1793570841.527 -----------------------------------------------------------------------------------------------
+1793570841.529 0.9984     0.9984     0.9989   0.9985   4570.3     17.665       41.304       51.023      
+1793570841.531 
+1793570841.533 
+1793570841.535 QPS vs Precision Trade-off - kividb-m16-ef128 - h-and-m-2048-angular-filters (up and to the right is better):
+1793570841.536 
+1793570841.538     4570 │●                                                           
+1793570841.540     4155 │                                                            
+1793570841.542     3739 │                                                            
+1793570841.544     3324 │                                                            
+1793570841.545     2908 │                                                            
+1793570841.547     2493 │                                                            
+1793570841.549     2077 │                                                            
+1793570841.551     1662 │                                                            
+1793570841.553     1246 │                                                            
+1793570841.554      831 │                                                            
+1793570841.556      415 │                                                            
+1793570841.558        0 │                                                            
+1793570841.560          └────────────────────────────────────────────────────────────
+1793570841.561           0.998          1.002          1.005          1.008          
+1793570841.563         Precision (0.0 = 0%, 1.0 = 100%)
+1793570841.565 
+1793570841.566 THROUGHPUT vs CONCURRENCY (saturation curve):
+1793570841.568   ef=128 — peak 4570.3 QPS @ parallel 100 (still climbing at top of swept range — sweep higher to find the knee)
+1793570841.570     parallel         QPS     p50 ms     p90 ms     p95 ms     p99 ms    sat?
+1793570841.572            1       252.4      2.385      9.772     14.896     16.558       -
+1793570841.574           16      3157.1      3.015     12.396     19.132     21.551       -
+1793570841.575          100      4570.3     17.665     41.304     51.023     84.405       -
+1793570841.577 
+1793570841.579 ================================================================================
+1793570841.581 Results saved to:  /home/ubuntu/vdbx/results
+1793570841.582 Summary saved to:  /home/ubuntu/vdbx/results/kividb-m16-ef128-h-and-m-2048-angular-filters-summary.json
+1793570841.584 Experiment stage: Cleanup (deleting index and data)
+1793570842.938 Experiment stage: Done
+1793570843.004 EXIT 0

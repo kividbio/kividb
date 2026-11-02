@@ -1,0 +1,21 @@
+kividb-rc4 hset p1 814455 ops/s 1668 MB/s p50 0.615 p99 1.007 p99.9 2.303
+kividb-rc4 hset p16 1373756 ops/s 2813 MB/s p50 0.919 p99 5.407 p99.9 5.919
+kividb-rc4 hget p1 716664 ops/s 1468 MB/s p50 0.559 p99 3.087 p99.9 3.519
+kividb-rc4 hget p16 725159 ops/s 1485 MB/s p50 0.767 p99 9.151 p99.9 10.239
+dragonfly hset p1 770057 ops/s 1577 MB/s p50 0.671 p99 1.079 p99.9 2.895
+dragonfly hset p16 1373105 ops/s 2812 MB/s p50 1.007 p99 5.055 p99.9 6.271
+dragonfly hget p1 716179 ops/s 1467 MB/s p50 0.623 p99 2.271 p99.9 5.887
+dragonfly hget p16 724587 ops/s 1484 MB/s p50 1.215 p99 8.095 p99.9 9.983
+redis hset p1 399997 ops/s 819 MB/s p50 1.271 p99 1.759 p99.9 3.839
+redis hset p16 543528 ops/s 1113 MB/s p50 3.935 p99 4.671 p99.9 6.079
+redis hget p1 465545 ops/s 953 MB/s p50 1.079 p99 1.799 p99.9 3.535
+redis hget p16 605954 ops/s 1241 MB/s p50 3.663 p99 4.287 p99.9 5.663
+valkey hset p1 420253 ops/s 861 MB/s p50 1.183 p99 1.991 p99.9 3.935
+valkey hset p16 553748 ops/s 1134 MB/s p50 4.127 p99 4.511 p99.9 6.943
+valkey hget p1 493513 ops/s 1011 MB/s p50 1.023 p99 1.423 p99.9 3.183
+valkey hget p16 627554 ops/s 1285 MB/s p50 3.263 p99 3.727 p99.9 5.215
+kividb-1.1.3 hset p1 834067 ops/s 1708 MB/s p50 0.599 p99 0.983 p99.9 2.383
+kividb-1.1.3 hset p16 1373803 ops/s 2814 MB/s p50 0.887 p99 5.631 p99.9 6.303
+kividb-1.1.3 hget p1 716345 ops/s 1467 MB/s p50 0.551 p99 3.135 p99.9 3.567
+kividb-1.1.3 hget p16 724932 ops/s 1485 MB/s p50 0.783 p99 8.831 p99.9 9.919
+SUSTAINED-DONE

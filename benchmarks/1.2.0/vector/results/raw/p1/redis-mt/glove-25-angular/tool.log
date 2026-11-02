@@ -1,0 +1,87 @@
+1793573754.104 RUN ./vector-db-benchmark --host 10.90.1.4 --engines-file redis-engine.json --parallels 100 --datasets glove-25-angular --skip-if-exists false 
+1793573754.111 vector-db-benchmark v0.1.0
+1793573754.113 Found 1 datasets, 1 engines
+1793573754.115 
+1793573754.117 ============================================================
+1793573754.119 Running experiment (1/1): redis-glove25 - glove-25-angular
+1793573754.121 ============================================================
+1793573754.123 Experiment stage: Configure
+1793573754.124 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 256}
+1793573754.126 Experiment stage: Upload
+1793573754.128 Reading dataset from /home/ubuntu/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793573754.305 Read 1183514 vectors (25d) in 0.187s (6318299 vectors/sec)
+1793573754.307 Starting upload with 100 threads, batch size 64...
+1793573814.046 Upload time: 59.741s (19811 records/sec)
+1793573814.048 Indexing complete: 1183514 docs in 0.0s
+1793573814.050 Index time: 0.001s, Total time (read+upload+index): 59.930s
+1793573814.095 Results saved to: "/home/ubuntu/vdb/results/redis-glove25-glove-25-angular-upload-0-1183514-2026-11-01-22-56-54.json"
+1793573814.097 Experiment stage: Search
+1793573814.099 	Running search 0: ef=64, parallel=100
+1793573814.101 	Reading queries from /home/ubuntu/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793573814.589 	  rep 1/3: QPS 21153.6
+1793573814.591 	Reading queries from /home/ubuntu/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793573815.073 	  rep 2/3: QPS 21598.6
+1793573815.075 	Reading queries from /home/ubuntu/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793573815.556 	  rep 3/3: QPS 21623.6
+1793573815.558 	→ QPS: 21623.6, Recall: 0.9117, Precision: 0.9117, MRR: 1.0000, NDCG: 0.9354 (best of reps)
+1793573815.560 	Running search 1: ef=128, parallel=100
+1793573815.562 	Reading queries from /home/ubuntu/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793573816.089 	  rep 1/3: QPS 19617.6
+1793573816.091 	Reading queries from /home/ubuntu/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793573816.618 	  rep 2/3: QPS 19728.0
+1793573816.620 	Reading queries from /home/ubuntu/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793573817.144 	  rep 3/3: QPS 19842.0
+1793573817.146 	→ QPS: 19842.0, Recall: 0.9367, Precision: 0.9367, MRR: 1.0000, NDCG: 0.9539 (best of reps)
+1793573817.148 	Running search 2: ef=256, parallel=100
+1793573817.150 	Reading queries from /home/ubuntu/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793573817.881 	  rep 1/3: QPS 13994.3
+1793573817.883 	Reading queries from /home/ubuntu/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793573818.615 	  rep 2/3: QPS 14033.1
+1793573818.617 	Reading queries from /home/ubuntu/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793573819.358 	  rep 3/3: QPS 13874.2
+1793573819.360 	→ QPS: 14033.1, Recall: 0.9790, Precision: 0.9790, MRR: 1.0000, NDCG: 0.9848 (best of reps)
+1793573819.362 	Running search 3: ef=512, parallel=100
+1793573819.364 	Reading queries from /home/ubuntu/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793573820.490 	  rep 1/3: QPS 9015.8
+1793573820.492 	Reading queries from /home/ubuntu/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793573821.623 	  rep 2/3: QPS 9011.8
+1793573821.624 	Reading queries from /home/ubuntu/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793573822.756 	  rep 3/3: QPS 9010.0
+1793573822.758 	→ QPS: 9015.8, Recall: 0.9951, Precision: 0.9951, MRR: 1.0000, NDCG: 0.9965 (best of reps)
+1793573822.760 	Results saved to: "/home/ubuntu/vdb/results/redis-glove25-glove-25-angular-search-0-39076-2026-11-01-22-57-02.json"
+1793573822.762 	Results saved to: "/home/ubuntu/vdb/results/redis-glove25-glove-25-angular-search-1-39076-2026-11-01-22-57-02.json"
+1793573822.764 	Results saved to: "/home/ubuntu/vdb/results/redis-glove25-glove-25-angular-search-2-39076-2026-11-01-22-57-02.json"
+1793573822.766 	Results saved to: "/home/ubuntu/vdb/results/redis-glove25-glove-25-angular-search-3-39076-2026-11-01-22-57-02.json"
+1793573822.767 ----------------------------------------------------------------------------------
+1793573822.769 Recall     Precision  MRR      NDCG     QPS        P50 (ms)     P95 (ms)    
+1793573822.771 ----------------------------------------------------------------------------------
+1793573822.773 0.9951     0.9951     1.0000   0.9965   9015.8     11.033       11.551      
+1793573822.774 0.9790     0.9790     1.0000   0.9848   14033.1    7.060        7.510       
+1793573822.776 0.9367     0.9367     1.0000   0.9539   19842.0    4.925        5.900       
+1793573822.778 0.9117     0.9117     1.0000   0.9354   21623.6    4.479        5.615       
+1793573822.780 
+1793573822.781 
+1793573822.783 QPS vs Precision Trade-off - redis-glove25 - glove-25-angular (up and to the right is better):
+1793573822.785 
+1793573822.787    21624 │●                                                           
+1793573822.789    19658 │                  ●                                         
+1793573822.790    17692 │                                                            
+1793573822.792    15726 │                                                            
+1793573822.794    13760 │                                                ●           
+1793573822.796    11795 │                                                            
+1793573822.798     9829 │                                                           ●
+1793573822.799     7863 │                                                            
+1793573822.801     5897 │                                                            
+1793573822.803     3932 │                                                            
+1793573822.805     1966 │                                                            
+1793573822.806        0 │                                                            
+1793573822.808          └────────────────────────────────────────────────────────────
+1793573822.810           0.912          0.940          0.967          0.995          
+1793573822.812         Precision (0.0 = 0%, 1.0 = 100%)
+1793573822.813 
+1793573822.815 ================================================================================
+1793573822.817 Results saved to:  /home/ubuntu/vdb/results
+1793573822.819 Summary saved to:  /home/ubuntu/vdb/results/redis-glove25-glove-25-angular-summary.json
+1793573822.820 Experiment stage: Cleanup (deleting index and data)
+1793573824.730 Experiment stage: Done
+1793573824.741 EXIT 0

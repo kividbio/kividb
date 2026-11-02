@@ -1,0 +1,74 @@
+    Finished `release` profile [optimized] target(s) in 0.05s
+     Running unittests src/lib.rs (/mnt/target/release/deps/kividb-e6843cfc0771adb4)
+
+running 59 tests
+2026-11-02T01:07:29.190Z 27273 [INFO] Replication: Backlog restarted at offset 500 (it ended at 108)
+test replication::backlog_tests::diskless_load_spellings ... ok
+test replication::backlog_tests::psync_arguments ... ok
+test replication::backlog_tests::the_backlog_keeps_only_its_capacity ... ok
+test replication::backlog_tests::the_backlog_serves_what_follows_an_offset_while_it_still_has_it ... ok
+test replication::dd_version_tests::only_1_2_and_later_deleted_the_documents_of_dd ... ok
+test replication::expiry_version_tests::masters_from_1_1_3_send_their_expired_keys_as_deletions ... ok
+test replication::expiry_version_tests::a_master_that_is_not_kividb_or_does_not_say_is_taken_to_send_them ... ok
+test replication::replica_client::full_sync_guard_tests::a_master_that_lost_its_stream_is_held_to_the_ratio ... ok
+test replication::replica_client::full_sync_guard_tests::an_empty_master_is_refused_when_the_replica_holds_data ... ok
+test commands::handler::replica_loading_gate_tests::apply_replication_bypasses_loading_gate_for_stream_applier ... ok
+test replication::replica_client::full_sync_guard_tests::empty_mode_only_refuses_a_keyless_master ... ok
+test replication::replica_client::full_sync_guard_tests::nothing_local_means_nothing_to_protect ... ok
+test replication::replica_client::full_sync_guard_tests::off_accepts_everything ... ok
+test replication::replica_client::full_sync_guard_tests::shrink_mode_refuses_below_the_ratio ... ok
+test replication::replica_client::slave_upstream_guard_tests::a_superseded_task_cannot_claim_the_link ... ok
+test replication::replica_client::slave_upstream_guard_tests::connecting_and_syncing_are_not_up ... ok
+test replication::replica_client::stream_transaction_tests::a_command_that_is_not_multi_is_not_a_transaction ... ok
+test replication::replica_client::stream_transaction_tests::a_transaction_is_whole_only_once_its_exec_is_there ... ok
+test replication::replica_client::slave_upstream_guard_tests::drop_marks_the_link_down_when_still_the_current_generation ... ok
+test replication::replication_invariants_tests::become_master_supersedes_running_replica_task ... ok
+test replication::replica_client::stream_transaction_tests::an_empty_transaction_is_whole_and_applies_nothing ... ok
+test replication::replica_client::full_sync_guard_tests::keys_already_expired_are_kept_for_the_masters_del ... ok
+2026-11-02T01:07:29.192Z 27273 [INFO] Replication: Channel replica registered: test-replica
+2026-11-02T01:07:29.192Z 27273 [INFO] Replication: Channel replica registered: test-replica
+test replication::replica_client::slave_upstream_guard_tests::stale_guard_drop_does_not_clobber_a_newer_generations_link_state ... ok
+test replication::replication_invariants_tests::array_write_commands_are_replicated ... ok
+test replication::replication_invariants_tests::hub_register_channel_increments_connected_replicas ... ok
+test replication::replication_invariants_tests::is_already_following_matches_only_the_current_target ... ok
+test replication::replication_invariants_tests::hub_second_deregister_is_idempotent_for_counter ... ok
+2026-11-02T01:07:29.193Z 27273 [INFO] Replication: Channel replica registered: test-replica
+test replication::replication_invariants_tests::is_write_command_matches_reference ... ok
+2026-11-02T01:07:29.193Z 27273 [WARN] Replication: Channel replica test-replica disconnected (hub send failed)
+2026-11-02T01:07:29.193Z 27273 [INFO] Replication: Channel replica registered: slow-replica
+2026-11-02T01:07:29.193Z 27273 [WARN] Replication: Channel replica slow-replica exceeded backlog limit (150 > 100 bytes) — evicting
+test replication::replica_client::full_sync_guard_tests::payload_round_trip_keeps_keys_and_ttls ... ok
+test replication::replica_client::full_sync_guard_tests::a_corrupt_payload_is_an_error_not_an_empty_dataset ... ok
+test replication::replication_invariants_tests::common_reads_are_not_write_commands ... ok
+test replication::replication_invariants_tests::link_is_up_only_when_connected ... ok
+test replication::replication_invariants_tests::georadius_is_a_write_only_with_store ... ok
+2026-11-02T01:07:29.194Z 27273 [INFO] Replication: Channel replica registered: late-replica
+test replication::replication_invariants_tests::pfdebug_is_a_write_only_when_it_rewrites ... ok
+test replication::replication_invariants_tests::previously_unpropagated_writes_are_now_writes ... ok
+test replication::replication_invariants_tests::repl_ping_is_one_complete_resp_command ... ok
+test replication::replication_invariants_tests::replica_progress_measures_delivery_from_its_own_base ... ok
+test replication::replication_invariants_tests::hub_propagate_drops_replica_when_channel_closed ... ok
+test replication::replication_invariants_tests::repoint_between_masters_supersedes_without_role_change ... ok
+test replication::replication_invariants_tests::hub_propagate_evicts_replica_exceeding_backlog_limit ... ok
+test replication::replication_invariants_tests::begin_replication_epoch_supersedes_previous_claim ... ok
+test replication::replication_invariants_tests::select_is_propagated_but_allowed_on_a_replica ... ok
+test replication::replication_invariants_tests::slave_loading_whitelist_allows_ping_not_get ... ok
+test replication::replication_invariants_tests::wait_targets_ignore_writes_the_replica_was_never_sent ... ok
+test replication::script_feed::tests::incrbyfloat_is_rewritten_to_an_absolute_set ... ok
+test replication::script_feed::tests::spop_miss_propagates_nothing ... ok
+test replication::script_feed::tests::time_series_clock_timestamps_are_pinned ... ok
+test replication::script_feed::tests::xadd_auto_id_is_rewritten_to_the_assigned_id ... ok
+test replication::script_feed::tests::xadd_explicit_id_passes_through_unchanged ... ok
+test replication::script_feed::tests::spop_is_rewritten_to_srem_of_the_actual_members ... ok
+test replication::script_feed::tests::xadd_id_index_matches_executor ... ok
+test replication::script_feed::tests::xadd_partial_auto_id_is_rewritten ... ok
+test replication::script_feed::tests::xadd_that_added_nothing_propagates_nothing ... ok
+test replication::script_feed::tests::xadd_with_an_approximate_trim_is_sent_as_what_the_handler_recorded ... ok
+test replication::script_feed::tests::xadd_rewrite_lands_after_options ... ok
+test replication::script_feed::tests::blocking_moves_propagate_as_their_non_blocking_forms ... ok
+test replication::replica_client::repl_apply_env_tests::replication_apply_env_reuses_scaffold_for_many_writes ... ok
+test replication::digest::tests::a_hyperloglogs_cached_count_is_not_part_of_the_fingerprint ... ok
+test replication::digest::tests::the_fingerprint_follows_the_data_not_its_order ... ok
+
+test result: ok. 59 passed; 0 failed; 0 ignored; 0 measured; 552 filtered out; finished in 0.01s
+

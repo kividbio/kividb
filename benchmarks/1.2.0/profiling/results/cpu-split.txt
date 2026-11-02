@@ -1,0 +1,164 @@
+
+kividb-1.1.3-fp get-p1: 11.353 us/request, no call chain in 0.0% of samples
+     6.3%  0.721 us  kernel: thread sleep/wake (futex, scheduler)
+    76.8%  8.722 us  kernel: network I/O (syscalls, io_uring, TCP, softirq)
+     0.3%  0.031 us  memory allocation
+     0.1%  0.007 us  locks and atomics
+     0.9%  0.097 us  parsing requests
+     0.2%  0.021 us  building replies
+     7.9%  0.892 us  command execution (lookup, read/write the value)
+     7.6%  0.861 us  event loop and connection handling (user space)
+
+kividb-1.1.3-fp get-p16: 2.055 us/request, no call chain in 0.0% of samples
+     8.9%  0.182 us  kernel: thread sleep/wake (futex, scheduler)
+    40.3%  0.829 us  kernel: network I/O (syscalls, io_uring, TCP, softirq)
+     1.3%  0.028 us  memory allocation
+     0.1%  0.001 us  locks and atomics
+     4.0%  0.082 us  parsing requests
+     1.0%   0.02 us  building replies
+    36.2%  0.744 us  command execution (lookup, read/write the value)
+     8.2%  0.169 us  event loop and connection handling (user space)
+
+kividb-1.1.3-fp set-p1: 11.36 us/request, no call chain in 0.0% of samples
+     6.8%  0.772 us  kernel: thread sleep/wake (futex, scheduler)
+    76.2%  8.658 us  kernel: network I/O (syscalls, io_uring, TCP, softirq)
+     0.4%   0.04 us  memory allocation
+     0.1%   0.01 us  locks and atomics
+     1.1%   0.12 us  parsing requests
+     0.1%  0.013 us  building replies
+     8.0%  0.907 us  command execution (lookup, read/write the value)
+     7.4%  0.839 us  event loop and connection handling (user space)
+
+kividb-1.1.3-fp set-p16: 2.289 us/request, no call chain in 0.0% of samples
+    10.8%  0.248 us  kernel: thread sleep/wake (futex, scheduler)
+    38.5%  0.882 us  kernel: network I/O (syscalls, io_uring, TCP, softirq)
+     1.6%  0.038 us  memory allocation
+     0.3%  0.008 us  locks and atomics
+     4.4%    0.1 us  parsing requests
+     0.5%  0.011 us  building replies
+    36.4%  0.832 us  command execution (lookup, read/write the value)
+     7.5%  0.171 us  event loop and connection handling (user space)
+
+kividb-rc4 get-p1: 11.141 us/request, no call chain in 0.0% of samples
+     6.7%  0.752 us  kernel: thread sleep/wake (futex, scheduler)
+    77.9%  8.683 us  kernel: network I/O (syscalls, io_uring, TCP, softirq)
+     0.3%  0.033 us  memory allocation
+     0.7%  0.081 us  locks and atomics
+     0.6%  0.069 us  parsing requests
+     0.2%   0.02 us  building replies
+     5.5%  0.614 us  command execution (lookup, read/write the value)
+     6.7%  0.748 us  event loop and connection handling (user space)
+     1.3%  0.142 us  other user space
+
+kividb-rc4 get-p16: 1.909 us/request, no call chain in 0.0% of samples
+     9.1%  0.173 us  kernel: thread sleep/wake (futex, scheduler)
+    44.2%  0.843 us  kernel: network I/O (syscalls, io_uring, TCP, softirq)
+     1.5%  0.029 us  memory allocation
+     3.6%   0.07 us  locks and atomics
+     2.4%  0.045 us  parsing requests
+     0.9%  0.017 us  building replies
+    25.0%  0.478 us  command execution (lookup, read/write the value)
+     7.8%   0.15 us  event loop and connection handling (user space)
+     5.5%  0.104 us  other user space
+
+kividb-rc4 set-p1: 11.371 us/request, no call chain in 0.0% of samples
+     6.7%  0.766 us  kernel: thread sleep/wake (futex, scheduler)
+    75.4%  8.577 us  kernel: network I/O (syscalls, io_uring, TCP, softirq)
+     0.3%  0.032 us  memory allocation
+     0.2%  0.024 us  locks and atomics
+     0.7%  0.081 us  parsing requests
+     0.1%  0.013 us  building replies
+     7.0%  0.797 us  command execution (lookup, read/write the value)
+     6.9%   0.79 us  event loop and connection handling (user space)
+     2.6%  0.292 us  other user space
+
+kividb-rc4 set-p16: 2.383 us/request, no call chain in 0.0% of samples
+    10.4%  0.248 us  kernel: thread sleep/wake (futex, scheduler)
+    36.0%  0.859 us  kernel: network I/O (syscalls, io_uring, TCP, softirq)
+     1.4%  0.033 us  memory allocation
+     0.8%  0.018 us  locks and atomics
+     2.8%  0.066 us  parsing requests
+     0.8%  0.018 us  building replies
+    30.7%  0.731 us  command execution (lookup, read/write the value)
+     7.1%  0.169 us  event loop and connection handling (user space)
+    10.1%  0.241 us  other user space
+
+kividb-rc4-fp get-p1: 11.228 us/request, no call chain in 0.0% of samples
+     5.9%  0.659 us  kernel: thread sleep/wake (futex, scheduler)
+    78.2%  8.779 us  kernel: network I/O (syscalls, io_uring, TCP, softirq)
+     0.3%  0.031 us  memory allocation
+     0.7%  0.083 us  locks and atomics
+     0.8%  0.087 us  parsing requests
+     0.2%   0.02 us  building replies
+     6.3%  0.705 us  command execution (lookup, read/write the value)
+     7.7%  0.864 us  event loop and connection handling (user space)
+
+kividb-rc4-fp get-p16: 1.952 us/request, no call chain in 0.0% of samples
+     9.3%  0.181 us  kernel: thread sleep/wake (futex, scheduler)
+    44.7%  0.873 us  kernel: network I/O (syscalls, io_uring, TCP, softirq)
+     1.5%  0.028 us  memory allocation
+     3.9%  0.076 us  locks and atomics
+     3.7%  0.073 us  parsing requests
+     1.2%  0.023 us  building replies
+    27.6%  0.539 us  command execution (lookup, read/write the value)
+     8.2%   0.16 us  event loop and connection handling (user space)
+
+kividb-rc4-fp set-p1: 11.936 us/request, no call chain in 0.0% of samples
+     6.3%  0.753 us  kernel: thread sleep/wake (futex, scheduler)
+    75.1%  8.959 us  kernel: network I/O (syscalls, io_uring, TCP, softirq)
+     0.3%  0.035 us  memory allocation
+     0.2%  0.018 us  locks and atomics
+     0.9%  0.106 us  parsing requests
+     0.1%  0.013 us  building replies
+     9.4%  1.122 us  command execution (lookup, read/write the value)
+     7.8%  0.929 us  event loop and connection handling (user space)
+
+kividb-rc4-fp set-p16: 2.369 us/request, no call chain in 0.0% of samples
+    10.6%  0.252 us  kernel: thread sleep/wake (futex, scheduler)
+    36.0%  0.854 us  kernel: network I/O (syscalls, io_uring, TCP, softirq)
+     1.3%   0.03 us  memory allocation
+     0.8%  0.018 us  locks and atomics
+     3.9%  0.092 us  parsing requests
+     0.5%  0.011 us  building replies
+    39.9%  0.944 us  command execution (lookup, read/write the value)
+     7.1%  0.168 us  event loop and connection handling (user space)
+
+redis get-p1: 9.305 us/request, no call chain in 0.0% of samples
+     5.9%   0.55 us  kernel: thread sleep/wake (futex, scheduler)
+    67.1%  6.247 us  kernel: network I/O (syscalls, io_uring, TCP, softirq)
+     0.7%  0.069 us  memory allocation
+     0.4%  0.038 us  locks and atomics
+     2.1%  0.198 us  parsing requests
+     1.0%  0.097 us  building replies
+     5.4%  0.501 us  command execution (lookup, read/write the value)
+    17.2%  1.604 us  event loop and connection handling (user space)
+
+redis get-p16: 1.858 us/request, no call chain in 0.0% of samples
+     7.5%  0.139 us  kernel: thread sleep/wake (futex, scheduler)
+    36.7%  0.682 us  kernel: network I/O (syscalls, io_uring, TCP, softirq)
+     2.9%  0.053 us  memory allocation
+     0.9%  0.017 us  locks and atomics
+     6.1%  0.114 us  parsing requests
+     2.4%  0.046 us  building replies
+    20.8%  0.386 us  command execution (lookup, read/write the value)
+    22.7%  0.421 us  event loop and connection handling (user space)
+
+redis set-p1: 9.712 us/request, no call chain in 0.0% of samples
+     7.2%  0.694 us  kernel: thread sleep/wake (futex, scheduler)
+    65.0%  6.311 us  kernel: network I/O (syscalls, io_uring, TCP, softirq)
+     1.0%  0.096 us  memory allocation
+     0.4%  0.036 us  locks and atomics
+     2.4%  0.229 us  parsing requests
+     0.5%   0.05 us  building replies
+     8.6%  0.835 us  command execution (lookup, read/write the value)
+    15.0%  1.459 us  event loop and connection handling (user space)
+
+redis set-p16: 3.099 us/request, no call chain in 0.0% of samples
+    14.4%  0.447 us  kernel: thread sleep/wake (futex, scheduler)
+    29.2%  0.906 us  kernel: network I/O (syscalls, io_uring, TCP, softirq)
+     2.9%   0.09 us  memory allocation
+     2.5%  0.079 us  locks and atomics
+     5.4%  0.167 us  parsing requests
+     0.8%  0.026 us  building replies
+    23.9%   0.74 us  command execution (lookup, read/write the value)
+    20.7%  0.642 us  event loop and connection handling (user space)

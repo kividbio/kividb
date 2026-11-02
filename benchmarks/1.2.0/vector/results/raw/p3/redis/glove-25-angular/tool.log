@@ -1,0 +1,20 @@
+1793578339.772 RUN ./vector-db-benchmark --host 10.90.1.4 --engines-file redis-engine.json --parallels 100 --skip-search --datasets glove-25-angular --skip-if-exists false 
+1793578339.779 vector-db-benchmark v0.1.0
+1793578339.781 Found 1 datasets, 1 engines
+1793578339.783 
+1793578339.784 ============================================================
+1793578339.786 Running experiment (1/1): redis-glove25 - glove-25-angular
+1793578339.788 ============================================================
+1793578339.790 Experiment stage: Configure
+1793578339.792 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 256}
+1793578339.794 Experiment stage: Upload
+1793578339.796 Reading dataset from /home/ubuntu/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793578339.972 Read 1183514 vectors (25d) in 0.187s (6315550 vectors/sec)
+1793578339.974 Starting upload with 100 threads, batch size 64...
+1793578399.960 Upload time: 59.988s (19729 records/sec)
+1793578399.962 Indexing complete: 1183514 docs in 0.0s
+1793578399.964 Index time: 0.001s, Total time (read+upload+index): 60.177s
+1793578400.010 Results saved to: "/home/ubuntu/vdb/results/redis-glove25-glove-25-angular-upload-0-1183514-2026-11-02-00-13-20.json"
+1793578400.013 Experiment stage: Cleanup (deleting index and data)
+1793578401.949 Experiment stage: Done
+1793578401.960 EXIT 0

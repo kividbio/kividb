@@ -1,0 +1,104 @@
+1793574406.973 RUN ./vector-db-benchmark --host 10.90.1.4 --engines-file redis-engine.json --engines redis-m16-ef128 --datasets dbpedia-openai-1M-1536-angular --skip-if-exists false 
+1793574406.980 vector-db-benchmark 0.2.0 (git d22d44e8b46009a800a59e952710166ece2e38a1)
+1793574406.982 Found 1 datasets, 1 engines
+1793574406.984 
+1793574406.986 ============================================================
+1793574406.987 Running experiment (1/1): redis-m16-ef128 - dbpedia-openai-1M-1536-angular
+1793574406.989 ============================================================
+1793574406.991 Experiment stage: Configure
+1793574406.993 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 128}
+1793574406.995 Experiment stage: Upload
+1793574406.996 Reading dataset from /home/ubuntu/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793574406.998 WARNING: dataset 'dbpedia-openai-1M-1536-angular' declares vector_count 1000000 but its corpus holds only 999000 vectors. Benchmarks will run over the 999000 vectors that exist; fix vector_count in datasets/datasets.json (it is what --list-datasets reports).
+1793574407.000 WARNING: dataset 'dbpedia-openai-1M-1536-angular' declares vector_count 1000000 but its corpus holds only 999000 vectors. Benchmarks will run over the 999000 vectors that exist; fix vector_count in datasets/datasets.json (it is what --list-datasets reports).
+1793574416.684 Read 999000 vectors (1536d) in 9.697s (103026 vectors/sec)
+1793574416.686 Starting upload with 16 threads, batch size 64...
+1793574596.650 Upload time: 179.966s (5551 records/sec)
+1793574596.652 Indexing complete (num_docs=999000/999000, indexing=false, percent_indexed=1.00, state=absent) in 0.0s
+1793574596.653 Index time: 0.001s, Total time (read+upload+index): 189.664s
+1793574597.087 Results saved to: "/home/ubuntu/vdbx/results/redis-m16-ef128-dbpedia-openai-1M-1536-angular-upload-0-999000-2026-11-01-23-09-57.json"
+1793574597.099 Experiment stage: Search
+1793574597.100 	Running search 0: ef=64, parallel=1
+1793574597.102 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793574599.669 	  rep 1/3: QPS 390.9
+1793574599.671 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793574602.207 	  rep 2/3: QPS 395.8
+1793574602.209 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793574604.745 	  rep 3/3: QPS 396.0
+1793574604.747 	→ QPS: 396.0, Recall: 0.9172, Precision@returned: 0.9172, MRR: 1.0000, NDCG: 0.9395 (best of reps)
+1793574604.748 	Running search 1: ef=128, parallel=1
+1793574604.750 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793574607.642 	  rep 1/3: QPS 346.6
+1793574607.644 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793574610.517 	  rep 2/3: QPS 349.3
+1793574610.519 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793574613.426 	  rep 3/3: QPS 345.2
+1793574613.428 	→ QPS: 349.3, Recall: 0.9390, Precision@returned: 0.9390, MRR: 1.0000, NDCG: 0.9556 (best of reps)
+1793574613.429 	Running search 2: ef=256, parallel=1
+1793574613.431 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793574617.753 	  rep 1/3: QPS 231.8
+1793574617.755 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793574622.074 	  rep 2/3: QPS 232.1
+1793574622.076 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793574626.399 	  rep 3/3: QPS 231.9
+1793574626.401 	→ QPS: 232.1, Recall: 0.9724, Precision@returned: 0.9724, MRR: 1.0000, NDCG: 0.9800 (best of reps)
+1793574626.403 	Running search 3: ef=128, parallel=16
+1793574626.405 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793574626.622 	  rep 1/3: QPS 4767.7
+1793574626.624 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793574626.841 	  rep 2/3: QPS 4828.9
+1793574626.843 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793574627.060 	  rep 3/3: QPS 4830.1
+1793574627.062 	→ QPS: 4830.1, Recall: 0.9390, Precision@returned: 0.9390, MRR: 1.0000, NDCG: 0.9556 (best of reps)
+1793574627.064 	Running search 4: ef=128, parallel=100
+1793574627.066 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793574627.266 	  rep 1/3: QPS 5408.5
+1793574627.268 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793574627.473 	  rep 2/3: QPS 5373.2
+1793574627.475 	Reading queries from /home/ubuntu/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793574627.679 	  rep 3/3: QPS 5399.8
+1793574627.681 	→ QPS: 5408.5, Recall: 0.9390, Precision@returned: 0.9390, MRR: 1.0000, NDCG: 0.9556 (best of reps)
+1793574627.689 	Results saved to: "/home/ubuntu/vdbx/results/redis-m16-ef128-dbpedia-openai-1M-1536-angular-search-0-45245-2026-11-01-23-10-27.json"
+1793574627.695 	Results saved to: "/home/ubuntu/vdbx/results/redis-m16-ef128-dbpedia-openai-1M-1536-angular-search-1-45245-2026-11-01-23-10-27.json"
+1793574627.701 	Results saved to: "/home/ubuntu/vdbx/results/redis-m16-ef128-dbpedia-openai-1M-1536-angular-search-2-45245-2026-11-01-23-10-27.json"
+1793574627.706 	Results saved to: "/home/ubuntu/vdbx/results/redis-m16-ef128-dbpedia-openai-1M-1536-angular-search-3-45245-2026-11-01-23-10-27.json"
+1793574627.712 	Results saved to: "/home/ubuntu/vdbx/results/redis-m16-ef128-dbpedia-openai-1M-1536-angular-search-4-45245-2026-11-01-23-10-27.json"
+1793574627.714 -----------------------------------------------------------------------------------------------
+1793574627.716 Recall     Precision  MRR      NDCG     QPS        P50 (ms)     P90 (ms)     P95 (ms)    
+1793574627.718 -----------------------------------------------------------------------------------------------
+1793574627.720 0.9724     0.9724     1.0000   0.9800   232.1      4.344        5.130        5.313       
+1793574627.721 0.9390     0.9390     1.0000   0.9556   5408.5     17.980       18.924       19.199      
+1793574627.723 0.9172     0.9172     1.0000   0.9395   396.0      2.549        2.842        2.946       
+1793574627.725 
+1793574627.727 
+1793574627.728 QPS vs Precision Trade-off - redis-m16-ef128 - dbpedia-openai-1M-1536-angular (up and to the right is better):
+1793574627.730 
+1793574627.732     5408 │                       ●                                    
+1793574627.734     4917 │                                                            
+1793574627.735     4425 │                                                            
+1793574627.737     3933 │                                                            
+1793574627.739     3442 │                                                            
+1793574627.741     2950 │                                                            
+1793574627.743     2458 │                                                            
+1793574627.744     1967 │                                                            
+1793574627.746     1475 │                                                            
+1793574627.748      983 │                                                            
+1793574627.750      492 │●                                                           
+1793574627.752        0 │                                                           ●
+1793574627.753          └────────────────────────────────────────────────────────────
+1793574627.755           0.917          0.936          0.954          0.972          
+1793574627.757         Precision (0.0 = 0%, 1.0 = 100%)
+1793574627.759 
+1793574627.761 THROUGHPUT vs CONCURRENCY (saturation curve):
+1793574627.763   ef=128 — peak 5408.5 QPS @ parallel 100 (still climbing at top of swept range — sweep higher to find the knee)
+1793574627.765     parallel         QPS     p50 ms     p90 ms     p95 ms     p99 ms    sat?
+1793574627.766            1       349.3      2.864      3.264      3.385      3.595       -
+1793574627.768           16      4830.1      3.294      3.806      3.937      4.458       -
+1793574627.770          100      5408.5     17.980     18.924     19.199     19.752       -
+1793574627.772 
+1793574627.774 ================================================================================
+1793574627.775 Results saved to:  /home/ubuntu/vdbx/results
+1793574627.777 Summary saved to:  /home/ubuntu/vdbx/results/redis-m16-ef128-dbpedia-openai-1M-1536-angular-summary.json
+1793574627.779 Experiment stage: Cleanup (deleting index and data)
+1793574629.734 Experiment stage: Done
+1793574629.740 EXIT 0

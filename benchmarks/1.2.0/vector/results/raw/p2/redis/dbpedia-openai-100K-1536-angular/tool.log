@@ -1,0 +1,20 @@
+1793575962.978 RUN ./vector-db-benchmark --host 10.90.1.4 --engines-file redis-engine.json --engines redis-m16-ef128 --skip-search --datasets dbpedia-openai-100K-1536-angular --skip-if-exists false 
+1793575962.985 vector-db-benchmark 0.2.0 (git d22d44e8b46009a800a59e952710166ece2e38a1)
+1793575962.987 Found 1 datasets, 1 engines
+1793575962.989 
+1793575962.991 ============================================================
+1793575962.993 Running experiment (1/1): redis-m16-ef128 - dbpedia-openai-100K-1536-angular
+1793575962.995 ============================================================
+1793575962.996 Experiment stage: Configure
+1793575962.998 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 128}
+1793575963.000 Experiment stage: Upload
+1793575963.002 Reading dataset from /home/ubuntu/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793575963.669 Read 100000 vectors (1536d) in 0.677s (147671 vectors/sec)
+1793575963.672 Starting upload with 16 threads, batch size 64...
+1793575973.638 Upload time: 9.969s (10031 records/sec)
+1793575973.640 Indexing complete (num_docs=100000/100000, indexing=false, percent_indexed=1.00, state=absent) in 0.0s
+1793575973.642 Index time: 0.001s, Total time (read+upload+index): 10.647s
+1793575973.687 Results saved to: "/home/ubuntu/vdbx/results/redis-m16-ef128-dbpedia-openai-100K-1536-angular-upload-0-100000-2026-11-01-23-32-53.json"
+1793575973.691 Experiment stage: Cleanup (deleting index and data)
+1793575973.872 Experiment stage: Done
+1793575973.874 EXIT 0

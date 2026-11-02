@@ -1,0 +1,95 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 28K of event 'armv8_pmuv3_0/cycles/P'
+# Event count (approx.): 78740387243
+#
+# Overhead  Command          Shared Object      Symbol
+# ........  ...............  .................  .....................................................
+#
+     3.01%  server           [kernel.kallsyms]  [k] handle_softirqs
+     2.37%  server           [kernel.kallsyms]  [k] __nf_conntrack_find_get
+     2.26%  server           server             [.] dictFindLinkInternal.lto_priv.0
+     2.24%  server           [kernel.kallsyms]  [k] el0_svc
+     1.87%  server           [kernel.kallsyms]  [k] _raw_spin_lock
+     1.73%  server           server             [.] dictGetSomeKeys
+     1.37%  server           [kernel.kallsyms]  [k] nf_conntrack_tcp_packet
+     1.30%  server           server             [.] kvGetKey
+     1.26%  server           server             [.] processInputBuffer
+     1.13%  server           [kernel.kallsyms]  [k] _raw_spin_lock_bh
+     1.09%  server           [kernel.kallsyms]  [k] nft_do_chain
+     1.06%  server           server             [.] evictionPoolPopulate
+     1.03%  server           server             [.] readQueryFromClient
+     1.01%  server           [kernel.kallsyms]  [k] kmem_cache_alloc_node_noprof
+     1.00%  server           [kernel.kallsyms]  [k] __pi_memset_generic
+     0.97%  server           [kernel.kallsyms]  [k] mlx5e_poll_tx_cq
+     0.95%  server           [kernel.kallsyms]  [k] mlx5e_napi_poll
+     0.91%  server           [kernel.kallsyms]  [k] __arch_copy_to_user
+     0.90%  server           server             [.] call
+     0.86%  server           [kernel.kallsyms]  [k] __tcp_transmit_skb
+     0.86%  server           [kernel.kallsyms]  [k] skb_attempt_defer_free
+     0.83%  server           [kernel.kallsyms]  [k] nf_conntrack_in
+     0.82%  server           server             [.] processCommand
+     0.81%  server           [kernel.kallsyms]  [k] tcp_sendmsg_locked
+     0.81%  server           [kernel.kallsyms]  [k] tcp_recvmsg_locked
+     0.81%  server           [kernel.kallsyms]  [k] tcp_in_window
+     0.76%  server           [kernel.kallsyms]  [k] _raw_spin_unlock_irqrestore
+     0.76%  server           [kernel.kallsyms]  [k] aa_inet_msg_perm
+     0.74%  server           server             [.] writeToClient
+     0.72%  server           [kernel.kallsyms]  [k] sock_poll
+     0.69%  server           [kernel.kallsyms]  [k] epi_fget.isra.0
+     0.60%  server           [kernel.kallsyms]  [k] __alloc_skb
+     0.58%  server           [kernel.kallsyms]  [k] __fget_files
+     0.58%  server           libc.so.6          [.] write
+     0.57%  server           server             [.] stringObjectLen
+     0.57%  server           [kernel.kallsyms]  [k] mlx5e_txwqe_build_dsegs
+     0.56%  server           libc.so.6          [.] read
+     0.56%  server           [kernel.kallsyms]  [k] vfs_read
+     0.55%  server           [kernel.kallsyms]  [k] get_random_u16
+     0.55%  server           [kernel.kallsyms]  [k] arch_counter_get_cntvct
+     0.54%  server           server             [.] __aarch64_ldadd8_relax
+     0.53%  server           server             [.] performEvictions
+     0.52%  server           [kernel.kallsyms]  [k] mlx5e_xmit
+     0.51%  server           [kernel.kallsyms]  [k] ip_finish_output2
+     0.49%  server           server             [.] addReplyBulk
+     0.49%  server           [kernel.kallsyms]  [k] check_heap_object
+     0.48%  server           server             [.] zmalloc_usable
+     0.48%  server           server             [.] handleClientsWithPendingWrites
+     0.48%  server           [kernel.kallsyms]  [k] vfs_write
+     0.48%  server           [kernel.kallsyms]  [k] ep_send_events
+     0.47%  server           [kernel.kallsyms]  [k] aa_file_perm
+     0.45%  server           [kernel.kallsyms]  [k] __dev_xmit_skb
+     0.45%  server           [kernel.kallsyms]  [k] __local_bh_enable_ip
+     0.45%  server           server             [.] zfree.part.0
+     0.45%  server           [kernel.kallsyms]  [k] nf_hook_slow
+     0.44%  server           server             [.] updateClientMemUsageAndBucket
+     0.44%  server           [kernel.kallsyms]  [k] tcp_rcv_space_adjust
+     0.43%  server           [kernel.kallsyms]  [k] mlx5e_accel_tx_begin
+     0.43%  server           server             [.] preprocessCommand
+     0.42%  server           server             [.] resetClientInternal.lto_priv.0
+     0.41%  server           server             [.] beforeSleep
+     0.41%  server           [kernel.kallsyms]  [k] tcp_poll
+     0.41%  server           [kernel.kallsyms]  [k] mod_memcg_state
+     0.39%  server           [kernel.kallsyms]  [k] validate_xmit_skb
+     0.39%  server           [kernel.kallsyms]  [k] __arch_copy_from_user
+     0.39%  server           [kernel.kallsyms]  [k] tcp_current_mss
+     0.38%  server           [kernel.kallsyms]  [k] fput
+     0.38%  server           [kernel.kallsyms]  [k] mlx5e_rx_cq_process_basic_cqe_comp
+     0.36%  server           [kernel.kallsyms]  [k] tcp_event_new_data_sent
+     0.36%  server           [kernel.kallsyms]  [k] nf_confirm
+     0.35%  server           [kernel.kallsyms]  [k] memblock_is_map_memory
+     0.35%  server           [kernel.kallsyms]  [k] __ip_queue_xmit
+     0.34%  server           server             [.] sdsnewplacement
+     0.33%  server           [kernel.kallsyms]  [k] nf_ct_get_tuple
+     0.33%  server           [kernel.kallsyms]  [k] __dev_queue_xmit
+     0.33%  server           [kernel.kallsyms]  [k] begin_current_label_crit_section
+     0.31%  server           server             [.] aeMain
+     0.31%  server           [kernel.kallsyms]  [k] dma_direct_map_phys
+     0.30%  server           [kernel.kallsyms]  [k] __siphash_unaligned
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

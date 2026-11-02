@@ -1,0 +1,19 @@
+    Finished `release` profile [optimized] target(s) in 0.05s
+     Running tests/resync.rs (/mnt/target/release/deps/resync-e44925e73ceb9a0b)
+
+running 12 tests
+test a_replica_that_was_written_to_resyncs_in_full ... ok
+test a_full_resync_replaces_the_local_dataset_in_either_load_mode ... ok
+test an_outage_longer_than_the_backlog_ends_in_a_full_resync ... ok
+test a_cleanly_restarted_replica_continues_instead_of_resyncing ... ok
+test a_killed_replica_with_an_aof_resyncs_in_full ... ok
+test sigterm_waits_for_the_final_snapshot ... ok
+test a_replica_continued_by_a_promoted_master_gets_every_write_after_its_next_resync ... ok
+test a_dropped_link_is_resumed_with_a_partial_resync ... ok
+test a_cleanly_restarted_master_continues_its_replicas ... ok
+test a_full_sync_cut_off_part_way_costs_the_replica_nothing ... ok
+test a_killed_master_continues_a_replica_that_holds_the_same_data ... ok
+test partial_resyncs_under_load_lose_and_repeat_nothing ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.91s
+

@@ -1,0 +1,57 @@
+2026-11-01T23:34:41.415Z 1 [INFO] KiviDB 1.2.0-rc4 starting: pid 1, default build, config file '/etc/kividb/kividb.conf'
+2026-11-01T23:34:41.415Z 1 [INFO] I/O model      : io_uring
+2026-11-01T23:34:41.421Z 1 [INFO] ACL file loaded: /etc/kividb/acl/users.acl
+2026-11-01T23:34:41.421Z 1 [INFO] Cluster: Node ID        : fad063987c7a012d1f95933969c5aafcdcc228d2
+2026-11-01T23:34:41.421Z 1 [INFO] Cluster: Bus port       : 16380
+2026-11-01T23:34:41.421Z 1 [INFO] Shards per DB  : 32
+2026-11-01T23:34:41.421Z 1 [INFO] I/O model      : io_uring
+2026-11-01T23:34:41.421Z 1 [INFO] Found dump.kdb — loading native snapshot
+2026-11-01T23:34:42.506Z 1 [INFO] Loaded 1389513 keys from snapshot (0 with a TTL)
+2026-11-01T23:34:42.506Z 1 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+2026-11-01T23:34:42.506Z 1 [INFO] Found appendonly.aof — recovering from the append-only file
+2026-11-01T23:34:42.566Z 1 [INFO] AOF replay: 119287 commands, 1508796 keys, 4.89 MB in 0.06s
+2026-11-01T23:34:42.611Z 1 [INFO] Replication: dataset fingerprinted in 45 ms — a replica that holds the same data will be continued rather than sent it
+2026-11-01T23:34:42.612Z 1 [INFO] Cluster: Bus listener bound on 0.0.0.0:16380
+2026-11-01T23:34:42.612Z 1 [INFO] Cluster: Heartbeat loop started (interval 1s)
+2026-11-01T23:34:42.612Z 1 [INFO] Cluster: Failure detection started (interval 100ms, node_timeout 5000ms)
+2026-11-01T23:34:42.612Z 1 [INFO] Ready to accept connections on 0.0.0.0:6380
+2026-11-01T23:34:42.785Z 1 [INFO] Replication: Partial resync for 10.244.2.246:58922: continuing from offset 0 (9827 bytes of backlog)
+2026-11-01T23:34:47.138Z 1 [INFO] CONFIG SET cluster-announce-hostname shd-0-1.shd-0-headless.e2e.svc
+2026-11-01T23:43:17.941Z 1 [INFO] Cluster: Voted for e46a08ae89d2cdb5fa74beb1715432d92de992d7 to take over from c2bba9ce7583025e1e52557edc9dffdf8827b2aa at epoch 54 (manual failover)
+2026-11-01T23:43:23.273Z 1 [WARN] Cluster: Node c2bba9ce7583025e1e52557edc9dffdf8827b2aa marked FAIL (reported by 12921ba0547672f08374c76be8537262ab47d13f)
+2026-11-01T23:43:27.282Z 1 [INFO] Cluster: Node c2bba9ce7583025e1e52557edc9dffdf8827b2aa is reachable again — clearing FAIL
+2026-11-01T23:52:01.988Z 1 [INFO] Cluster: Voted for eb1ae7633be84d663adc38704cab562828a1483f to take over from 12921ba0547672f08374c76be8537262ab47d13f at epoch 55 (manual failover)
+2026-11-01T23:52:07.842Z 1 [WARN] Cluster: Node 12921ba0547672f08374c76be8537262ab47d13f marked FAIL (reported by eb1ae7633be84d663adc38704cab562828a1483f)
+2026-11-01T23:52:27.381Z 1 [WARN] Cluster: Node e46a08ae89d2cdb5fa74beb1715432d92de992d7 marked FAIL (reported by c2bba9ce7583025e1e52557edc9dffdf8827b2aa)
+2026-11-01T23:52:28.090Z 1 [INFO] Cluster: Voted for c2bba9ce7583025e1e52557edc9dffdf8827b2aa to take over from e46a08ae89d2cdb5fa74beb1715432d92de992d7 at epoch 56
+2026-11-01T23:52:30.680Z 1 [INFO] Cluster: Node 12921ba0547672f08374c76be8537262ab47d13f is reachable again — clearing FAIL
+2026-11-01T23:52:53.301Z 1 [INFO] Cluster: Node e46a08ae89d2cdb5fa74beb1715432d92de992d7 is reachable again — clearing FAIL
+2026-11-01T23:54:56.197Z 1 [INFO] Cluster: handover of slots 4096-5461: writes paused 2 ms (in-flight writes 0,          last of the stream 0, the destination's takeover 2)
+2026-11-01T23:54:56.506Z 1 [INFO] Cluster: Slots 4096-5461 migrated to fd5f1049eee8cc6374217f80a4b9ce2be4040625 (writes paused 223 ms)
+2026-11-01T23:56:13.454Z 1 [INFO] Cluster: Slots 4096-5461 imported from fd5f1049eee8cc6374217f80a4b9ce2be4040625 (taken over in 2 ms)
+2026-11-01T23:57:30.381Z 1 [WARN] Cluster: Node eb1ae7633be84d663adc38704cab562828a1483f marked FAIL (reported by c2bba9ce7583025e1e52557edc9dffdf8827b2aa)
+2026-11-01T23:57:31.218Z 1 [INFO] Cluster: Voted for 12921ba0547672f08374c76be8537262ab47d13f to take over from eb1ae7633be84d663adc38704cab562828a1483f at epoch 63
+2026-11-01T23:57:51.424Z 1 [INFO] Cluster: Node eb1ae7633be84d663adc38704cab562828a1483f is reachable again — clearing FAIL
+2026-11-01T23:59:07.195Z 1 [INFO] Replication: uring: replica disconnected
+2026-11-01T23:59:12.313Z 1 [WARN] Cluster: Node e78261d088e3ec01b23062e77b6c459304bea3da marked FAIL by quorum
+2026-11-01T23:59:31.140Z 1 [INFO] Replication: Channel replica registered: 10.244.1.35:41714
+2026-11-01T23:59:31.313Z 1 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub
+2026-11-01T23:59:32.084Z 1 [INFO] Cluster: Node e78261d088e3ec01b23062e77b6c459304bea3da is reachable again — clearing FAIL
+2026-11-02T00:00:49.713Z 1 [WARN] Cluster: Node eb1ae7633be84d663adc38704cab562828a1483f marked FAIL by quorum
+2026-11-02T00:00:55.149Z 1 [INFO] Cluster: Node eb1ae7633be84d663adc38704cab562828a1483f is reachable again — clearing FAIL
+2026-11-02T00:12:22.760Z 1 [INFO] AOF: rebased onto dump.kdb (generation 14) — log is now the delta
+2026-11-02T00:13:22.627Z 1 [INFO] AOF: auto-checkpoint: 770.77 MB is 100%+ above the 0.00 MB baseline — folding into dump.kdb
+2026-11-02T00:13:40.136Z 1 [INFO] AOF: rebased onto dump.kdb (generation 15) — log is now the delta
+2026-11-02T00:15:05.055Z 1 [INFO] Cluster: handover of slots 4096-5461: writes paused 2 ms (in-flight writes 0,          last of the stream 0, the destination's takeover 2)
+2026-11-02T00:15:05.625Z 1 [INFO] Cluster: Slots 4096-5461 migrated to df7947d90cabfb1dde0c68449af5f24d1b1eeea6 (writes paused 449 ms)
+2026-11-02T00:22:10.139Z 1 [INFO] AOF: auto-checkpoint: 87.29 MB is 100%+ above the 0.19 MB baseline — folding into dump.kdb
+2026-11-02T00:22:13.828Z 1 [INFO] Cluster: slow nodes.conf save: 0 ms for the lock, 352 ms in all
+2026-11-02T00:22:13.828Z 1 [INFO] Cluster: slow takeover, ms at each step: [("epoch", 0), ("nodes", 0), ("slots", 0), ("refresh", 0), ("save", 352)]
+2026-11-02T00:22:13.828Z 1 [INFO] Cluster: Slots 4096-5461 imported from df7947d90cabfb1dde0c68449af5f24d1b1eeea6 (taken over in 353 ms)
+2026-11-02T00:22:22.599Z 1 [INFO] AOF: rebased onto dump.kdb (generation 16) — log is now the delta
+2026-11-02T00:24:05.079Z 1 [INFO] Replication: uring: replica disconnected
+2026-11-02T00:24:05.713Z 1 [WARN] Cluster: Node e46a08ae89d2cdb5fa74beb1715432d92de992d7 marked FAIL by quorum
+2026-11-02T00:24:09.713Z 1 [WARN] Cluster: Node e78261d088e3ec01b23062e77b6c459304bea3da marked FAIL by quorum
+2026-11-02T00:24:13.094Z 1 [INFO] Cluster: Node e46a08ae89d2cdb5fa74beb1715432d92de992d7 is reachable again — clearing FAIL
+2026-11-02T00:24:25.875Z 1 [INFO] Replication: Partial resync for 10.244.1.9:38746: continuing from offset 1138489722 (402508 bytes of backlog)
+2026-11-02T00:24:26.875Z 1 [INFO] Cluster: Node e78261d088e3ec01b23062e77b6c459304bea3da is reachable again — clearing FAIL

@@ -1,0 +1,7 @@
+redis-8.10.3_lfu_S_1 redis-8.10.3 allkeys-lfu 8388608
+kividb-1.1.3_lfu_S_1 kividb-1.1.3 allkeys-lfu 8388608
+kividb-rc4_lfu_F_1 kividb-rc4 allkeys-lfu 33554432
+kividb-rc4_lfu_S_1 kividb-rc4 allkeys-lfu 8388608
+redis-8.10.3_lfu_F_1 redis-8.10.3 allkeys-lfu 33554432
+redis-6bf6224_lru_F_1 redis-6bf6224 allkeys-lru 33554432
+redis-6bf6224_lru_S_1 redis-6bf6224 allkeys-lru 8388608

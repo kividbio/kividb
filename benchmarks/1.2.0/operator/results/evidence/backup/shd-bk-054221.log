@@ -1,0 +1,1 @@
+backup ok: run=20261102T001222Z manifest=e2e/shd/20261102T001222Z/manifest.json shards=3 size=40407952B duration=4045ms pruned-runs=0

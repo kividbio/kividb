@@ -1,0 +1,5 @@
+2026-11-01T23:52:01.647Z 1 [INFO] SIGTERM received — shutting down gracefully
+2026-11-01T23:52:01.647Z 1 [INFO] Writing final snapshot...
+2026-11-01T23:52:01.764Z 1 [INFO] AOF: the checkpoint held writes for 105 ms
+2026-11-01T23:52:04.326Z 1 [INFO] AOF: rebased onto dump.kdb (generation 13) — log is now the delta
+2026-11-01T23:52:04.326Z 1 [INFO] Goodbye.
