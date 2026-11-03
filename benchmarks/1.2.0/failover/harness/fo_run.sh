@@ -181,6 +181,7 @@ power_loss_always|power_loss_everysec)  # the master's VM is powered off (no OS 
   for _ in $(seq 1 1200); do [ -f "$OUT/power-back" ] && break; sleep 0.5; done
   for _ in $(seq 1 120); do sx "$FO1" true 2>/dev/null && break; sleep 1; done
   ev "VM back up"
+  sx "$FO1" "bash aoftail.sh" > "$OUT/aof-before-restart.txt" 2>&1   # rc7 run: the torn tail as found
   n "$FO1" restart 6379 >/dev/null; ev "server restarted"
   sleep 10
   if ! rc "$M" PING | grep -q PONG; then

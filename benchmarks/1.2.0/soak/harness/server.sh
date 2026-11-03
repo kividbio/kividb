@@ -7,8 +7,8 @@ D=/mnt/kv
 ENGINE=${ENGINE:-kividb}
 case $1 in
 start-master|start-replica)
-  pkill -f '[s]ampler.sh'; pkill -9 -f '[/]opt/kv/kividb|[/]opt/kv113/kividb|[/]opt/kvrc3/kividb'; pkill -9 -f '[/]opt/redis/redis-server'
-  for _ in $(seq 1 120); do pgrep -f '[/]opt/kv/kividb|[/]opt/kv113/kividb|[/]opt/kvrc3/kividb|[/]opt/redis/redis-server' >/dev/null || break; sleep 0.5; done
+  pkill -f '[s]ampler.sh'; pkill -9 -f '[/]opt/kv/kividb|[/]opt/kv113/kividb|[/]opt/kvrc3/kividb|[/]opt/kvrc6/kividb'; pkill -9 -f '[/]opt/redis/redis-server'
+  for _ in $(seq 1 120); do pgrep -f '[/]opt/kv/kividb|[/]opt/kv113/kividb|[/]opt/kvrc3/kividb|[/]opt/kvrc6/kividb|[/]opt/redis/redis-server' >/dev/null || break; sleep 0.5; done
   for _ in $(seq 1 120); do ss -ltn | grep -q ':6379 ' || break; sleep 0.5; done
   rm -rf "$D"; mkdir -p "$D"
   {
@@ -22,8 +22,10 @@ start-master|start-replica)
     redis)     cmd=(/opt/redis/redis-server "$D/node.conf") ;;
     kividb113) cmd=(/opt/kv113/kividb --configfile "$D/node.conf") ;;   # 1.1.3 release binary, for regression rows
     kividbrc3) cmd=(/opt/kvrc3/kividb --configfile "$D/node.conf") ;;   # 1.2.0-rc3 release binary
+    kividbrc6) cmd=(/opt/kvrc6/kividb --configfile "$D/node.conf") ;;   # 1.2.0-rc6 release binary (rc7 soak A/B)
     *)         cmd=(/opt/kv/kividb --configfile "$D/node.conf") ;;
   esac
+  echo "${cmd[*]}" > "$D/cmd"   # rc7 soak: the command line, for a restart by hand
   (cd "$D" && exec nohup "${cmd[@]}" >> "$D/server.log" 2>&1 < /dev/null) &
   echo $! > "$D/pid"
   for _ in $(seq 1 100); do redis-cli -p 6379 PING 2>/dev/null | grep -q PONG && break; sleep 0.2; done
@@ -32,5 +34,5 @@ start-master|start-replica)
   nohup bash "$HOME/sampler.sh" 6379 "$D/pid" "$HOME/samples-$role.csv" 10 > /dev/null 2>&1 < /dev/null &
   echo "started $ENGINE $role pid $(cat "$D/pid")"
   ;;
-stop) pkill -f '[s]ampler.sh'; redis-cli -p 6379 SHUTDOWN >/dev/null 2>&1; sleep 2; pkill -9 -f '[/]opt/kv/kividb|[/]opt/kv113/kividb|[/]opt/kvrc3/kividb|[/]opt/redis/redis-server' ;;
+stop) pkill -f '[s]ampler.sh'; redis-cli -p 6379 SHUTDOWN >/dev/null 2>&1; sleep 2; pkill -9 -f '[/]opt/kv/kividb|[/]opt/kv113/kividb|[/]opt/kvrc3/kividb|[/]opt/kvrc6/kividb|[/]opt/redis/redis-server' ;;
 esac

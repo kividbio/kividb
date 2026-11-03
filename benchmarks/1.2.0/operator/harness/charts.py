@@ -42,7 +42,7 @@ plt.rcParams.update({
 KIVIDB = "#0072B2"
 ERR = "#333333"
 EVENT = "#7a7a7a"
-SUMMARY_TITLE = os.environ.get("SUMMARY_TITLE", "Write impact per scenario, 1.1.3 vs 1.2.0-rc4")
+SUMMARY_TITLE = os.environ.get("SUMMARY_TITLE", "Operator e2e on AKS: write impact per scenario, 1.2.0-rc7 (rc4 run alongside where it ran)")
 
 
 def load_marks(path):
@@ -120,42 +120,43 @@ def timeline_chart(res, out, sc, marks):
 
 
 def summary_charts(res, out):
-    """Grouped bars: impact seconds per kind of scenario, 1.1.3 vs 1.2.0-rc4."""
+    """Bars: impact seconds per scenario on 1.2.0-rc7, next to the same scenario's rc4 run when there is one
+    (RC4_SUMMARY: the rc4 run's results/summary.csv). Lost writes are written in red."""
     path = os.path.join(res, "summary.csv")
     if not os.path.exists(path):
         return
     rows = list(csv.DictReader(open(path, newline="")))
-    colors = {"1.1.3": "#56B4E9", "1.2.0-rc4": KIVIDB}
-    whats = []
-    for r in rows:
-        if r["what"] and r["what"] not in whats:
-            whats.append(r["what"])
-    val = {(r["what"], r["engine"]): r for r in rows}
-    fig, ax = plt.subplots(figsize=(10, 0.55 * len(whats) + 1.6))
+    rc4 = {}
+    if os.environ.get("RC4_SUMMARY") and os.path.exists(os.environ["RC4_SUMMARY"]):
+        rc4 = {r["scenario"]: r for r in csv.DictReader(open(os.environ["RC4_SUMMARY"], newline=""))}
+    colors = {"1.2.0-rc4": "#56B4E9", "1.2.0-rc7": KIVIDB}
+    fig, ax = plt.subplots(figsize=(11, 0.62 * len(rows) + 1.8))
     h = 0.38
-    top = 0
-    for k, w in enumerate(whats):
-        y = len(whats) - 1 - k
-        for j, eng in enumerate(["1.1.3", "1.2.0-rc4"]):
-            r = val.get((w, eng))
-            if r is None:
-                continue
-            yy = y + (h / 2 if j == 0 else -h / 2)
-            v = float(r["impact_s"])
-            top = max(top, v)
+    top = max([float(r["impact_s"]) for r in rows] + [float(r["impact_s"]) for r in rc4.values()] + [1])
+    for k, r in enumerate(rows):
+        y = len(rows) - 1 - k
+        old = rc4.get(r["scenario"].replace("rc7", "rc4"))
+        pairs = [("1.2.0-rc7", r)] + ([("1.2.0-rc4", old)] if old else [])
+        for j, (eng, rr) in enumerate(pairs):
+            yy = y + (h / 2 if j == 0 and old else (-h / 2 if old else 0))
+            v = float(rr["impact_s"])
             ax.barh(yy, v, height=h * 0.92, color=colors[eng], label=eng)
-            note = f" ({r['note']})" if r.get("note") else ""
-            ax.text(v + 0.4, yy, f"{v:g} s, {int(r['errors']):,} failed, {int(r['lost']):,} lost{note}", va="center", fontsize=8)
-    ax.set_yticks(range(len(whats)))
-    ax.set_yticklabels(list(reversed(whats)), fontsize=9)
-    ax.set_xlim(0, top * 1.9 + 1)
+            lost = int(rr["lost"])
+            ax.text(v + top * 0.01, yy, f"{v:g} s, {int(rr['errors']):,} failed" + (", " if lost else ", 0 lost"),
+                    va="center", fontsize=8)
+            if lost:
+                ax.annotate(f"{lost:,} LOST", xy=(v + top * 0.01, yy), xytext=(118, 0), textcoords="offset points",
+                            va="center", fontsize=8, color="#D55E00", fontweight="bold")
+    ax.set_yticks(range(len(rows)))
+    ax.set_yticklabels([f"{r['scenario']}: {r['what']}"[:70] for r in reversed(rows)], fontsize=8)
+    ax.set_xlim(0, top * 1.8 + 1)
     ax.set_xlabel("seconds of write impact seen by the loader (failed SETs or < 50% of normal rate)")
     ax.grid(axis="y", visible=False)
     hs, ls = ax.get_legend_handles_labels()
     seen = {}
     for hh, ll in zip(hs, ls):
         seen.setdefault(ll, hh)
-    ax.legend(seen.values(), seen.keys(), loc="upper left", bbox_to_anchor=(1.0, 1.0), frameon=False)
+    ax.legend(seen.values(), seen.keys(), loc="lower right", frameon=False)
     fig.suptitle(SUMMARY_TITLE, x=0.01, ha="left", fontsize=12, fontweight="bold")
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(os.path.join(out, "summary-impact.svg"))

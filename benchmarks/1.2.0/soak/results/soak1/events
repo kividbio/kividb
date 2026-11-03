@@ -1,0 +1,24 @@
+1793654982.807017671 master-restart-start sigterm 10.70.1.4 keys=2121465 sync_full=1 sync_partial_ok=0
+1793654986.845067632 master-restart-exited after 4.03 s
+1793654987.093555939 master-restart-started
+1793654992.449848045 master-restart-serving after 5.34 s keys=2113425
+1793655006.490053152 master-restart-replica-linked after 14.00 s sync_full=1 sync_partial_ok=0
+1793655373.531769712 replica-sync-loop 21 evictions since the restart; CONFIG SET repl-replica-max-backlog-bytes 1073741824 on the master: ERR CONFIG SET failed (possibly related to argument 'repl-replica-max-backlog-bytes') - can't set immutable config
+1793656782.080066407 replica-kill9-start 10.70.1.8 keys=2525974
+1793656782.616196512 replica-kill9-killed
+1793656802.905122156 replica-kill9-started
+1793656809.786263303 replica-kill9-serving after 6.87 s
+1793656823.183495179 replica-kill9-linked after 13.35 s sync_full=99 sync_partial_ok=0 keys=2535894
+1793656823.186622050 events-done
+1793659602.356383610 restart-check replica REPLICAOF NO ONE: OK
+1793659605.396176637 restart-check before: master keys=2747621 expires=702934 persistent=2044687 | replica keys=2747449 expires=702934 persistent=2044515
+1793660019.661650344 restart-check compare before: {"dbsize_a": 2747621, "dbsize_b": 2747449, "scanned_a": 2747621, "scanned_b": 2747449, "compared": 2747621, "differ_first_pass": 172, "differ_after_recheck": 172, "expiring_at_compare": 0, "real_differences": 172, "sample": ["wl:hx:6:5064", "wl:hx:1:5067", "wl:hx:3:5066", "wl:hx:3:5070", "wl:hx:4:5078", "wl:hx:6:5065", "wl:hx:5:5079", "wl:hx:4:5061", "wl:hx:2:5074", "wl:hx:4:5076", "wl:hx:6:5073", "wl:hx:6:5062", "wl:hx:2:5077", "wl:hx:4:5072", "wl:hx:0:5065", "wl:hx:6:5079", "wl:hx:6:5068", "wl:hx:3:5072", "wl:hx:7:5059", "wl:hx:5:5064"], "seconds": 413.4}
+1793660022.166274721 restart-check master: kill -9 44690
+1793660031.829395435 restart-check master: serving again after 8.39 s; keys=2747449 expires=702934 persistent=2044515
+1793660439.613165744 restart-check compare restarted master vs untouched replica: {"dbsize_a": 2747449, "dbsize_b": 2747449, "scanned_a": 2747449, "scanned_b": 2747449, "compared": 2747449, "differ_first_pass": 0, "differ_after_recheck": 0, "expiring_at_compare": 0, "real_differences": 0, "sample": [], "seconds": 406.7}
+1793660462.908626014 restart-check write log on the restarted master: {"node": "master-after-kill9", "acked": 5623474, "unknown": 8, "bad": 0, "checked_keys_ok": 4921541}
+1793660465.395981440 restart-check replica: kill -9 63511
+1793660475.440822628 restart-check replica: serving again after 8.77 s; keys=2747449 expires=702934 persistent=2044515
+1793660882.897503091 restart-check compare both restarted: {"dbsize_a": 2747449, "dbsize_b": 2747449, "scanned_a": 2747449, "scanned_b": 2747449, "compared": 2747449, "differ_first_pass": 0, "differ_after_recheck": 0, "expiring_at_compare": 0, "real_differences": 0, "sample": [], "seconds": 406.4}
+1793660907.091082265 restart-check write log on the restarted replica: {"node": "replica-after-kill9", "acked": 5623474, "unknown": 8, "bad": 0, "checked_keys_ok": 4921541}
+1793660907.125067977 restart-check after: master keys=2747449 expires=702934 persistent=2044515 | replica keys=2747449 expires=702934 persistent=2044515

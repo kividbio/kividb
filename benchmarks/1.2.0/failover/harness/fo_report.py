@@ -33,7 +33,7 @@ plt.rcParams.update({
     "grid.linewidth": 0.8, "axes.spines.top": False, "axes.spines.right": False,
 })
 COL = {"kividb": "#0072B2", "redis": "#D55E00"}
-NAME = {"kividb": "KiviDB 1.2.0-rc4", "redis": "Redis 8.10.3"}
+NAME = {"kividb": "KiviDB 1.2.0-rc7", "redis": "Redis 8.10.3"}
 
 SCEN = [
     ("promote_graceful", "Planned switchover (pause, wait, promote, move clients)"),

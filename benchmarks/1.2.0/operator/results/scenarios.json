@@ -1,308 +1,317 @@
 [
  {
-  "id": "P1",
-  "title": "Operator upgrade 0.6.1 -> 0.7.0 (master) under load: one switchover, 2 s of refused writes, nothing lost",
-  "subtitle": "",
-  "loader": "loader-rep-g1",
-  "t0": 1793569802,
-  "t1": 1793569964,
-  "t0s": "21:50:02"
- },
- {
-  "id": "reshard-up-113",
-  "title": "1.1.3: adding a 4th shard under load, no failed write",
-  "subtitle": "",
-  "loader": "loader-shd",
-  "t0": 1793573472,
-  "t1": 1793573546,
-  "t0s": "22:51:12"
- },
- {
-  "id": "reshard-down-113",
-  "title": "1.1.3: removing the 4th shard under load, no failed write",
-  "subtitle": "",
-  "loader": "loader-shd",
-  "t0": 1793573723,
-  "t1": 1793573774,
-  "t0s": "22:55:23"
- },
- {
-  "id": "restart-113",
-  "title": "1.1.3: rolling restart, one CLUSTER FAILOVER per shard, no failed write",
-  "subtitle": "",
-  "loader": "loader-shd",
-  "t0": 1793573786,
-  "t1": 1793574009,
-  "t0s": "22:56:26"
- },
- {
-  "id": "failover-113",
-  "title": "1.1.3: CLUSTER FAILOVER of every shard master, no failed write",
-  "subtitle": "",
-  "loader": "loader-shd",
-  "t0": 1793574020,
-  "t1": 1793574134,
-  "t0s": "23:00:20"
- },
- {
-  "id": "sigstop-113",
-  "title": "1.1.3: a hung shard master; its shard's writes fail for ~13 s until the replica takes over",
-  "subtitle": "",
-  "loader": "loader-shd",
-  "t0": 1793574147,
-  "t1": 1793574354,
-  "t0s": "23:02:27"
- },
- {
-  "id": "sigkill-113",
-  "title": "1.1.3: kill -9 of a shard master's engine; ~6 s of failed writes",
-  "subtitle": "",
-  "loader": "loader-shd",
-  "t0": 1793574370,
-  "t1": 1793574426,
-  "t0s": "23:06:10"
- },
- {
-  "id": "forcedel-113",
-  "title": "1.1.3: force-deleting a shard master lost 120,162 acknowledged writes",
-  "subtitle": "",
-  "loader": "loader-shd",
-  "t0": 1793574441,
-  "t1": 1793574492,
-  "t0s": "23:07:21"
- },
- {
-  "id": "delete-113",
-  "title": "1.1.3: deleting a shard master pod hands over first, no failed write",
-  "subtitle": "",
-  "loader": "loader-shd",
-  "t0": 1793574507,
-  "t1": 1793574565,
-  "t0s": "23:08:27"
- },
- {
-  "id": "rep-sigstop-113",
-  "title": "1.1.3: a hung replicated master; writes refused ~45 s until the operator fails over",
-  "subtitle": "",
-  "loader": "loader-rep",
-  "t0": 1793574653,
-  "t1": 1793574860,
-  "t0s": "23:10:53"
- },
- {
-  "id": "rep-forcedel-113",
-  "title": "1.1.3: force-deleting the replicated master; writes refused ~38 s",
-  "subtitle": "",
-  "loader": "loader-rep",
-  "t0": 1793574877,
-  "t1": 1793574956,
-  "t0s": "23:14:37"
- },
- {
-  "id": "drain-113",
-  "title": "1.1.3: draining a node with a shard master and a replica; ~6 s of failed writes",
-  "subtitle": "",
-  "loader": "loader-shd",
-  "t0": 1793574991,
-  "t1": 1793575092,
-  "t0s": "23:16:31"
- },
- {
-  "id": "drain-113-rep",
-  "title": "1.1.3: the replicated cluster during the same drain, no failed write",
-  "subtitle": "",
-  "loader": "loader-rep",
-  "t0": 1793574991,
-  "t1": 1793575106,
-  "t0s": "23:16:31"
- },
- {
   "id": "upgrade-rep",
-  "title": "Replicated cluster upgraded 1.1.3 -> 1.2.0-rc4 under load: no failed write",
+  "title": "rc7: engine upgrade 1.1.3 -> 1.2.0-rc7 of the replicated cluster, one switchover, no failed write",
   "subtitle": "",
   "loader": "loader-rep",
-  "t0": 1793575125,
-  "t1": 1793575267,
-  "t0s": "23:18:45"
+  "t0": 1793650865,
+  "t1": 1793650968,
+  "t0s": "20:21:05"
  },
  {
   "id": "upgrade-shd",
-  "title": "Sharded cluster upgraded 1.1.3 -> 1.2.0-rc4 under load: no failed write",
+  "title": "rc7: engine upgrade 1.1.3 -> 1.2.0-rc7 of the sharded cluster, one CLUSTER FAILOVER per shard, no failed write",
   "subtitle": "",
   "loader": "loader-shd",
-  "t0": 1793575284,
-  "t1": 1793575475,
-  "t0s": "23:21:24"
+  "t0": 1793650981,
+  "t1": 1793651143,
+  "t0s": "20:23:01"
  },
  {
-  "id": "restart-rc4",
-  "title": "1.2.0-rc4: rolling restart; 1,013 SETs timed out while replicas restarted (1.1.3: none)",
+  "id": "restart-rc7",
+  "title": "rc7: rolling restart (KividbDbOps) of the sharded cluster, no failed write (rc4: 1,013)",
   "subtitle": "",
   "loader": "loader-shd",
-  "t0": 1793575504,
-  "t1": 1793575685,
-  "t0s": "23:25:04"
+  "t0": 1793651192,
+  "t1": 1793651377,
+  "t0s": "20:26:32"
  },
  {
-  "id": "failover-rc4",
-  "title": "1.2.0-rc4: CLUSTER FAILOVER of every shard master, no failed write",
+  "id": "failover-rc7",
+  "title": "rc7: CLUSTER FAILOVER on every replica in turn, no failed write",
   "subtitle": "",
   "loader": "loader-shd",
-  "t0": 1793575701,
-  "t1": 1793575818,
-  "t0s": "23:28:21"
+  "t0": 1793651395,
+  "t1": 1793651518,
+  "t0s": "20:29:55"
  },
  {
-  "id": "sigstop-rc4",
-  "title": "1.2.0-rc4: a hung shard master; its shard's writes fail for ~14 s until the replica takes over",
+  "id": "sigstop-rc7",
+  "title": "rc7: shard master hung (SIGSTOP): replica elected, 10 s of failed writes to one shard, nothing lost",
   "subtitle": "",
   "loader": "loader-shd",
-  "t0": 1793575835,
-  "t1": 1793576044,
-  "t0s": "23:30:35"
+  "t0": 1793651539,
+  "t1": 1793651744,
+  "t0s": "20:32:19"
  },
  {
-  "id": "sigkill-rc4",
-  "title": "1.2.0-rc4: kill -9 of a shard master; back from its AOF, clients told \"?\" for 4 s",
+  "id": "sigkill-rc7",
+  "title": "rc7: shard master's engine killed (kill -9), back from its AOF in place, no failed write",
   "subtitle": "",
   "loader": "loader-shd",
-  "t0": 1793576066,
-  "t1": 1793576109,
-  "t0s": "23:34:26"
+  "t0": 1793651770,
+  "t1": 1793651814,
+  "t0s": "20:36:10"
  },
  {
-  "id": "delete-rc4",
-  "title": "1.2.0-rc4: after the handover the new master saw the cluster as down; shard 1 out until a manual CLUSTER MEET",
+  "id": "forcedel-rc7",
+  "title": "rc7: shard master force-deleted: replacement started on the same node beside the old engine, 121,939 acked writes LOST",
   "subtitle": "",
   "loader": "loader-shd",
-  "t0": 1793576582,
-  "t1": 1793576639,
-  "t0s": "23:43:02"
+  "t0": 1793651841,
+  "t1": 1793651887,
+  "t0s": "20:37:21"
  },
  {
-  "id": "drain-rc4",
-  "title": "1.2.0-rc4: draining a node with a shard master; two ~6 s windows of failed writes",
+  "id": "delete-rc7",
+  "title": "rc7: graceful delete of a shard master, handover first, no failed write",
   "subtitle": "",
   "loader": "loader-shd",
-  "t0": 1793577103,
-  "t1": 1793577203,
-  "t0s": "23:51:43"
+  "t0": 1793651913,
+  "t1": 1793651966,
+  "t0s": "20:38:33"
  },
  {
-  "id": "drain-rc4-rep",
-  "title": "1.2.0-rc4: the replicated cluster during the same drain, no failed write",
+  "id": "drain-rc7",
+  "title": "rc7: drain of a node with a shard master and a replica, no failed write",
+  "subtitle": "",
+  "loader": "loader-shd",
+  "t0": 1793651997,
+  "t1": 1793652427,
+  "t0s": "20:39:57"
+ },
+ {
+  "id": "drain-rc7-rep",
+  "title": "rc7: same drain seen by the replicated cluster (its master was on the node): 2 s of refused connections",
   "subtitle": "",
   "loader": "loader-rep",
-  "t0": 1793577103,
-  "t1": 1793577221,
-  "t0s": "23:51:43"
+  "t0": 1793651997,
+  "t1": 1793652454,
+  "t0s": "20:39:57"
  },
  {
-  "id": "reshard-up-rc4",
-  "title": "1.2.0-rc4: adding a 4th shard under load, no failed write",
+  "id": "fx-force1",
+  "title": "force-delete repro, force delete of a master, replacement on another node",
+  "subtitle": "",
+  "loader": "loader-fx",
+  "t0": 1793652459,
+  "t1": 1793652524,
+  "t0s": "20:47:39"
+ },
+ {
+  "id": "fx-force2",
+  "title": "force-delete repro, force delete, replacement on the same node, 1 GB/shard",
+  "subtitle": "",
+  "loader": "loader-fx",
+  "t0": 1793652612,
+  "t1": 1793652675,
+  "t0s": "20:50:12"
+ },
+ {
+  "id": "repdel-rc7",
+  "title": "rc7: graceful delete of a shard's replica, no failed write",
   "subtitle": "",
   "loader": "loader-shd",
-  "t0": 1793577248,
-  "t1": 1793577330,
-  "t0s": "23:54:08"
+  "t0": 1793652707,
+  "t1": 1793652778,
+  "t0s": "20:51:47"
  },
  {
-  "id": "reshard-down-rc4",
-  "title": "1.2.0-rc4: removing the 4th shard under load, no failed write",
+  "id": "reshard-up-rc7",
+  "title": "rc7: 3 -> 4 shards under load in 42 s, no failed write",
   "subtitle": "",
   "loader": "loader-shd",
-  "t0": 1793577354,
-  "t1": 1793577405,
-  "t0s": "23:55:54"
+  "t0": 1793652809,
+  "t1": 1793652891,
+  "t0s": "20:53:29"
  },
  {
-  "id": "forcedel-rc4",
-  "title": "1.2.0-rc4: force-deleting a shard master; ~10 s of failed writes, nothing lost",
+  "id": "fx-loss1",
+  "title": "force-delete repro, same-node force delete, small dataset, try 1",
+  "subtitle": "",
+  "loader": "loader-fx",
+  "t0": 1793652847,
+  "t1": 1793652910,
+  "t0s": "20:54:07"
+ },
+ {
+  "id": "reshard-down-rc7",
+  "title": "rc7: 4 -> 3 shards under load in 11 s, no failed write",
   "subtitle": "",
   "loader": "loader-shd",
-  "t0": 1793577433,
-  "t1": 1793577502,
-  "t0s": "23:57:13"
+  "t0": 1793652927,
+  "t1": 1793652979,
+  "t0s": "20:55:27"
  },
  {
-  "id": "repdel-rc4",
-  "title": "1.2.0-rc4: deleting a shard's replica pod, no failed write",
-  "subtitle": "",
-  "loader": "loader-shd",
-  "t0": 1793577530,
-  "t1": 1793577601,
-  "t0s": "23:58:50"
- },
- {
-  "id": "repdel2-rc4",
-  "title": "1.2.0-rc4: deleting another shard's replica pod, no failed write",
-  "subtitle": "",
-  "loader": "loader-shd",
-  "t0": 1793577628,
-  "t1": 1793577687,
-  "t0s": "00:00:28"
- },
- {
-  "id": "rep-sigstop-rc4",
-  "title": "1.2.0-rc4: a hung replicated master; writes refused ~50 s until the operator fails over",
+  "id": "rep-sigstop-rc7",
+  "title": "rc7: replicated master hung (SIGSTOP): operator failover after ~50 s, nothing lost",
   "subtitle": "",
   "loader": "loader-rep",
-  "t0": 1793577713,
-  "t1": 1793577919,
-  "t0s": "00:01:53"
+  "t0": 1793653015,
+  "t1": 1793653228,
+  "t0s": "20:56:55"
  },
  {
-  "id": "rep-forcedel-rc4",
-  "title": "1.2.0-rc4: force-deleting the replicated master; writes refused ~11 s",
+  "id": "fx-loss2",
+  "title": "force-delete repro, same-node force delete, try 2 (target was a replica)",
+  "subtitle": "",
+  "loader": "loader-fx",
+  "t0": 1793653020,
+  "t1": 1793653083,
+  "t0s": "20:57:00"
+ },
+ {
+  "id": "fx-loss3",
+  "title": "force-delete repro, same-node force delete, try 3",
+  "subtitle": "",
+  "loader": "loader-fx",
+  "t0": 1793653194,
+  "t1": 1793653256,
+  "t0s": "20:59:54"
+ },
+ {
+  "id": "rep-sigkill-rc7",
+  "title": "rc7: replicated master's engine killed, restarts in place, 9 s of refused writes, nothing lost",
   "subtitle": "",
   "loader": "loader-rep",
-  "t0": 1793577947,
-  "t1": 1793577993,
-  "t0s": "00:05:47"
+  "t0": 1793653268,
+  "t1": 1793653314,
+  "t0s": "21:01:08"
  },
  {
-  "id": "rep-restart-rc4",
-  "title": "1.2.0-rc4: rolling restart of the replicated cluster, no failed write",
+  "id": "rep-forcedel-rc7",
+  "title": "rc7: replicated master force-deleted, replacement re-attached the volume on another node (29 s), nothing lost",
   "subtitle": "",
   "loader": "loader-rep",
-  "t0": 1793578019,
-  "t1": 1793578190,
-  "t0s": "00:06:59"
+  "t0": 1793653354,
+  "t1": 1793653417,
+  "t0s": "21:02:34"
  },
  {
-  "id": "bulk-rc4",
-  "title": "1.2.0-rc4: the loader during a 2.5 M x 1 KB bulk load (~1 M SET/s for 2.5 s)",
+  "id": "fx-loss4",
+  "title": "force-delete repro, same-node force delete, try 4",
   "subtitle": "",
-  "loader": "loader-shd",
-  "t0": 1793578379,
-  "t1": 1793578429,
-  "t0s": "00:12:59"
+  "loader": "loader-fx",
+  "t0": 1793653368,
+  "t1": 1793653431,
+  "t0s": "21:02:48"
  },
  {
-  "id": "reshard-bulk-up-rc4",
-  "title": "1.2.0-rc4: adding a 4th shard after a 2.5 M x 1 KB bulk load, no failed write",
+  "id": "rep-restart-rc7",
+  "title": "rc7: rolling restart of the replicated cluster, no failed write",
   "subtitle": "",
-  "loader": "loader-shd",
-  "t0": 1793578452,
-  "t1": 1793578879,
-  "t0s": "00:14:12"
+  "loader": "loader-rep",
+  "t0": 1793653459,
+  "t1": 1793653590,
+  "t0s": "21:04:19"
  },
  {
-  "id": "reshard-bulk-down-rc4",
-  "title": "1.2.0-rc4: removing the 4th shard again, no failed write",
+  "id": "fx-graceful",
+  "title": "force-delete repro, graceful delete of a master, replacement on the same node",
   "subtitle": "",
-  "loader": "loader-shd",
-  "t0": 1793578910,
-  "t1": 1793578984,
-  "t0s": "00:21:50"
+  "loader": "loader-fx",
+  "t0": 1793653476,
+  "t1": 1793653538,
+  "t0s": "21:04:36"
  },
  {
-  "id": "split-outage-rc4",
-  "title": "1.2.0-rc4: CLUSTER FAILOVER on the two nodes that held each other's old address; one election lost, 5 s of failed writes, the split healed",
+  "id": "dbq-rc7",
+  "title": "#40: two restarts of one cluster at once run one after the other, never two pods down",
+  "subtitle": "",
+  "loader": "loader-rep",
+  "t0": 1793653652,
+  "t1": 1793653882,
+  "t0s": "21:07:32"
+ },
+ {
+  "id": "holdback-rc7",
+  "title": "#36: a missing configRef holds back the writes, not the failover: master replaced in 48 s",
+  "subtitle": "",
+  "loader": "loader-rep",
+  "t0": 1793653924,
+  "t1": 1793654151,
+  "t0s": "21:12:04"
+ },
+ {
+  "id": "fblock-rc7",
+  "title": "#35: FailoverBlocked held for 2 min 44 s while the only replica was empty; master back with its data",
+  "subtitle": "",
+  "loader": "loader-fb",
+  "t0": 1793654217,
+  "t1": 1793654436,
+  "t0s": "21:16:57"
+ },
+ {
+  "id": "guard-yes",
+  "title": "#42 guard, rc7 + aof-ack-after-write yes: the restarted master (new pod, new stream) is kept, nothing lost",
+  "subtitle": "",
+  "loader": "loader-g-yes",
+  "t0": 1793654469,
+  "t1": 1793654710,
+  "t0s": "21:21:09"
+ },
+ {
+  "id": "guard-no",
+  "title": "#42 guard, rc7 + aof-ack-after-write no: MasterRestartedBehind, failover to the replica, nothing lost",
+  "subtitle": "",
+  "loader": "loader-g-no",
+  "t0": 1793654744,
+  "t1": 1793654989,
+  "t0s": "21:25:44"
+ },
+ {
+  "id": "guard-113",
+  "title": "#42 guard, engine 1.1.3 (equal key counts): MasterRestartedBehind, failover, nothing lost",
+  "subtitle": "",
+  "loader": "loader-g-113",
+  "t0": 1793655024,
+  "t1": 1793655258,
+  "t0s": "21:30:24"
+ },
+ {
+  "id": "guard-bad",
+  "title": "#42 guard, version 1.2.0_rc7 (unparsable): fails closed, failover, nothing lost",
+  "subtitle": "",
+  "loader": "loader-g-bad",
+  "t0": 1793655295,
+  "t1": 1793655513,
+  "t0s": "21:34:55"
+ },
+ {
+  "id": "guard-yes-opup",
+  "title": "#42 guard, rc7 + yes, operator running: master back in 21 s and kept, nothing lost",
+  "subtitle": "",
+  "loader": "loader-g-yes",
+  "t0": 1793655553,
+  "t1": 1793655775,
+  "t0s": "21:39:13"
+ },
+ {
+  "id": "shrink-a-rc7",
+  "title": "#38: shrink whose status went back to mid-move: operator finishes again in 28 s",
   "subtitle": "",
   "loader": "loader-shd",
-  "t0": 1793579376,
-  "t1": 1793579442,
-  "t0s": "00:29:36"
+  "t0": 1793655810,
+  "t1": 1793655952,
+  "t0s": "21:43:30"
+ },
+ {
+  "id": "shrink-b-rc7",
+  "title": "#38: lost shrink finish + spec.shards raised back to 4: re-created shard gets its master and slots in 59 s",
+  "subtitle": "",
+  "loader": "loader-shd",
+  "t0": 1793656007,
+  "t1": 1793656206,
+  "t0s": "21:46:47"
+ },
+ {
+  "id": "reshard-down2-rc7",
+  "title": "rc7: 4 -> 3 shards under load after the shrink tests",
+  "subtitle": "",
+  "loader": "loader-shd",
+  "t0": 1793656267,
+  "t1": 1793656327,
+  "t0s": "21:51:07"
  }
 ]

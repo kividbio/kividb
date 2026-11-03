@@ -7,7 +7,7 @@ PWR=$(k get secret rep-pw -o jsonpath='{.data.password}' | base64 -d); PWS=$(k g
 r() { k exec cli -- redis-cli -h $1 -p 6380 --user default --pass $2 --no-auth-warning "${@:3}"; }
 mark "backup rep: loader stopped"; q loader-rep /stop
 J=rep-bk-$(date +%H%M%S); k create job $J --from=cronjob/rep-backup; k wait --for=condition=complete job/$J --timeout=300s
-k logs job/$J | tail -3 | tee "$E/$J.log"; mark "backup rep: $J complete"
+k logs job/$J | tail -3 | tee "$E/$J.log"; mark "backup rep: $J complete"; echo $J > "$D/rep-snap"
 M=$(mp rep); r $M.rep-headless.e2e.svc $PWR dbsize | tee "$E/rep-source-dbsize.txt"
 k get kividbsnapshot -o wide | tee "$E/snapshots-rep.txt"
 sed "s|IMAGE|$ENG|; s|SNAP|$J|" > "$D/rep-restored.yaml" <<'Y'

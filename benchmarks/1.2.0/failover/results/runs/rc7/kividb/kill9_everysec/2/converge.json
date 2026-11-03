@@ -1,0 +1,13 @@
+{
+ "dbsize_a": 632696,
+ "dbsize_b": 632696,
+ "scanned_a": 632696,
+ "scanned_b": 632696,
+ "compared": 632696,
+ "differ_first_pass": 0,
+ "differ_after_recheck": 0,
+ "expiring_at_compare": 0,
+ "real_differences": 0,
+ "sample": [],
+ "seconds": 34.2
+}

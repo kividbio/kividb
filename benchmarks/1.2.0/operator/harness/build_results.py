@@ -21,7 +21,7 @@ import time
 
 OPERATOR_REASONS = {"Switchover", "Failover", "ShardFailover", "MasterRestartedEmpty",
                     "MasterRestartedEmptyResolved", "RebalanceStarted", "RebalanceCompleted",
-                    "PasswordChanged"}
+                    "PasswordChanged", "MasterRestartedBehind", "FailoverBlocked", "BootstrapWaiting", "BootstrapSkipped"}
 
 
 def operator_events(path):

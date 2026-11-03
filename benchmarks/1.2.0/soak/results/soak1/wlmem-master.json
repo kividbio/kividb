@@ -1,0 +1,14 @@
+{
+ "used_memory": 1432200668,
+ "used_memory_rss": 1946271744,
+ "keys": {
+  "wl": 1648534,
+  "mix": 1098915
+ },
+ "wl_memory_usage_mean_bytes": 182.2,
+ "wl_estimated_bytes": 300444471,
+ "wl_sampled": 82426,
+ "mix_memory_usage_mean_bytes": 699.5,
+ "mix_estimated_bytes": 768729770,
+ "mix_sampled": 54822
+}

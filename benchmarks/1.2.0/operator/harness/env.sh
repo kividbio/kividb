@@ -1,6 +1,6 @@
 export D="${D:-$(pwd)/work}"   # run directory: kubeconfig, logs, res/, evidence/
-export KUBECONFIG="$D/kubeconfig" MSYS_NO_PATHCONV=1 A=${A:?set A to your ACR login server} RG=kividb-rc4-aks OPC=${OPC:-eefe65d}
-export ENG=${ENG:-ghcr.io/kividbio/kividb:v1.2.0-rc4}
+export KUBECONFIG="$D/kubeconfig" MSYS_NO_PATHCONV=1 A=${A:?set A to your ACR login server} RG=${RG:-kividb-rc7-aks} OPC=${OPC:-afc6f49}
+export ENG=${ENG:-ghcr.io/kividbio/kividb:v1.2.0-rc7}
 k() { kubectl -n e2e "$@"; }
 q() { kubectl -n e2e exec curl -- curl -s -m 900 "http://$1.e2e.svc:8080$2"; }
 ts() { date -u +%H:%M:%S; }
@@ -29,3 +29,12 @@ drainable_master() { local m; for m in $(masters | awk '{print $1}'); do n=$(k g
 smaster() { local i m; for i in 1 2 3 4 5 6; do m=$(masters | awk -v s="shd-$1-" 'index($1,s)==1 {print $1}'); [ -n "$m" ] && { echo $m; return; }; sleep 3; done; }
 # views: every sharded node's cluster_state and the peers it holds as failed or at an address that is not the pod's
 views() { k exec cli -- sh -c 'P=$(cat /tmp/pw-shd); for h in $(getent hosts $(for s in 0 1 2 3; do for r in 0 1; do echo shd-$s-$r.shd-$s-headless.e2e.svc; done; done) 2>/dev/null | awk "{print \$2}"); do st=$(timeout 2 redis-cli -h $h -p 6380 --user default --pass $P --no-auth-warning cluster info | tr -d "\r" | grep cluster_state); bad=$(timeout 2 redis-cli -h $h -p 6380 --user default --pass $P --no-auth-warning cluster nodes | while read id addr fl rest; do ip=${addr%%:*}; hn=${addr##*,}; real=$(getent hosts $hn | cut -d" " -f1); [ -n "$real" ] && [ "$real" != "$ip" ] && echo -n "${hn%%.*}@stale-ip "; case $fl in *fail*) echo -n "${hn%%.*}:$fl ";; esac; done); echo "${h%%.*} $st $bad"; done'; }
+# evsince <unix>: captured Events since a time
+evsince() { awk -v t="$(date -u -d @$1 +%Y-%m-%dT%H:%M:%SZ)" '$1 >= t' "$D/events.log"; }
+# cond <cluster> <condition type>: a condition's status/reason/message
+cond() { k get kividbcluster $1 -o jsonpath="{.status.conditions[?(@.type=='$2')].status}/{.status.conditions[?(@.type=='$2')].reason}/{.status.conditions[?(@.type=='$2')].message}"; }
+# rinfo <cluster>: role, stream, offset, keys, version, AOF settings of every pod of a replicated cluster (rinfo.sh in the cli pod)
+rinfo() { k exec cli -- sh /tmp/rinfo.sh $1; }
+# cpcli: copy the monitor scripts into the cli pod and store the passwords there
+cpcli() { local H="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; for f in rinfo.sh mon.sh monshd.sh pingall.sh repcheck.sh; do k exec -i cli -- sh -c "cat > /tmp/$f" < "$H/$f"; done
+  k exec cli -- sh -c 'echo pw-one-1111 > /tmp/pw; echo shd-pw-1111 > /tmp/pw-shd'; }

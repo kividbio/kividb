@@ -1,0 +1,17 @@
+2026-11-02T21:04:49.994589402Z 2026-11-02T21:04:49.994Z 1 [INFO] Cluster: Manual failover requested by e61f64e7a646285a37e4429e04ce040289179c94 — writes paused, replica must reach offset 5377901
+2026-11-02T21:04:49.997691521Z 2026-11-02T21:04:49.997Z 1 [INFO] Cluster: Voted for e61f64e7a646285a37e4429e04ce040289179c94 to take over from aa605ae1ca33483a81379163a46dc8d2bc83525d at epoch 9 (manual failover)
+2026-11-02T21:04:50.041418047Z 2026-11-02T21:04:50.040Z 1 [INFO] Cluster: Slots of this shard are now owned by e61f64e7a646285a37e4429e04ce040289179c94 — following it as a replica
+2026-11-02T21:04:50.043815598Z 2026-11-02T21:04:50.043Z 1 [INFO] Replication: Connecting to master 10.244.3.84:6380...
+2026-11-02T21:04:50.045738809Z 2026-11-02T21:04:50.045Z 1 [INFO] Replication: Replica 10.244.3.84:60714 disconnected: this node is now a replica itself
+2026-11-02T21:04:50.046506022Z 2026-11-02T21:04:50.046Z 1 [INFO] Replication: uring: replica disconnected
+2026-11-02T21:04:50.057598414Z 2026-11-02T21:04:50.057Z 1 [INFO] Replication: Full resync from 26cd650448894c530561e4db0ddeed566288cd23 offset=5378061
+2026-11-02T21:04:50.057682369Z 2026-11-02T21:04:50.057Z 1 [INFO] Replication: Receiving full-sync payload (4003982 bytes)...
+2026-11-02T21:04:50.106223336Z 2026-11-02T21:04:50.106Z 1 [WARN] Replication: Dropped the 169912 local keys before loading 169916 from the master
+2026-11-02T21:04:50.220124449Z 2026-11-02T21:04:50.220Z 1 [INFO] Replication: Full sync loaded: 169916 keys (0 with a TTL), replacing 169912 local keys
+2026-11-02T21:04:50.222092125Z 2026-11-02T21:04:50.222Z 1 [INFO] Replication: AOF is on — rebasing it onto the synced dataset
+2026-11-02T21:04:50.250901478Z 2026-11-02T21:04:50.249Z 1 [INFO] SIGTERM received — shutting down gracefully
+2026-11-02T21:04:50.250918659Z 2026-11-02T21:04:50.249Z 1 [INFO] Writing final snapshot...
+2026-11-02T21:04:50.260082453Z 2026-11-02T21:04:50.259Z 1 [INFO] AOF: rebased onto dump.kdb (generation 8) — log is now the delta
+2026-11-02T21:04:50.344095996Z 2026-11-02T21:04:50.344Z 1 [INFO] AOF: rebased onto dump.kdb (generation 9) — log is now the delta
+2026-11-02T21:04:50.344372930Z 2026-11-02T21:04:50.344Z 1 [INFO] Replication: Synced with 10.244.3.84:6380. Entering command stream.
+2026-11-02T21:04:50.344384682Z 2026-11-02T21:04:50.344Z 1 [INFO] Goodbye.

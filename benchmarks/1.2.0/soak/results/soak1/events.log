@@ -1,0 +1,11 @@
+21:29:42 master-restart-start sigterm 10.70.1.4 keys=2121465 sync_full=1 sync_partial_ok=0
+21:29:46 master-restart-exited after 4.03 s
+21:29:47 master-restart-started
+21:29:52 master-restart-serving after 5.34 s keys=2113425
+21:30:06 master-restart-replica-linked after 14.00 s sync_full=1 sync_partial_ok=0
+21:59:42 replica-kill9-start 10.70.1.8 keys=2525974
+21:59:42 replica-kill9-killed
+22:00:02 replica-kill9-started
+22:00:09 replica-kill9-serving after 6.87 s
+22:00:23 replica-kill9-linked after 13.35 s sync_full=99 sync_partial_ok=0 keys=2535894
+22:00:23 events-done

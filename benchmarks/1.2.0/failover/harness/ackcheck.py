@@ -239,6 +239,9 @@ def main():
                    "err_kinds": shared.err_kinds, "t0_wall": wall0},
                   open(os.path.join(args.out, "acked.json"), "w"))
     missing, wrong = verify(args, per_writer)
+    json.dump({"missing": [(w, s, round(ack_time.get((w, s), -1), 3)) for w, s in missing],
+               "wrong": [(w, s, round(ack_time.get((w, s), -1), 3)) for w, s in wrong]},
+              open(os.path.join(args.out, "lost.json"), "w"))
     wset = {(w, s) for w in wait_acked for s in wait_acked[w]}
     wait_lost = [m for m in missing + wrong if m in wset]
 

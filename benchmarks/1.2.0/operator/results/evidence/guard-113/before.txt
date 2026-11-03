@@ -1,0 +1,4 @@
+master g-113-0 ip 10.244.0.149
+g-113-0 kividb_version:1.1.3 run_id:000000002d70f44a00000000deadbeee2d70f44b keys=1609464 role:master master_replid:94088036cbc88df5026d8e2f7b44138a83e71e52 master_repl_offset:65990601 aof_enabled:1  ack=[ ]
+g-113-1 kividb_version:1.1.3 run_id:000000000fe0932400000000deadbeee0fe09325 keys=1609492 role:slave master_host:10.244.0.149 master_link_status:up aof_enabled:1  ack=[ ]
+--- new pod Ready, operator opdown 21:31:22

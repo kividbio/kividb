@@ -1,0 +1,75 @@
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc6 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc6
+  * Mode           : standalone
+  * OS             : linux x86_64
+  * Memory         : 15GiB available
+  * CPUs           : 4 cores detected
+  * Listening on   : 0.0.0.0:6379
+  * Worker threads : 2
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-03T00:32:12.738Z 258752 [INFO] KiviDB 1.2.0-rc6 starting: pid 258752, default build, config file '/mnt/kv/node.conf'
+2026-11-03T00:32:12.738Z 258752 [INFO] I/O model      : io_uring
+2026-11-03T00:32:12.739Z 258752 [INFO] Shards per DB  : 32
+2026-11-03T00:32:12.739Z 258752 [INFO] I/O model      : io_uring
+2026-11-03T00:32:12.739Z 258752 [INFO] Replication: Connecting to master 10.70.1.14:6379...
+2026-11-03T00:32:12.739Z 258752 [INFO] Ready to accept connections on 0.0.0.0:6379
+2026-11-03T00:32:12.749Z 258752 [INFO] Replication: Full resync from 3652f9bd30bb54ebea303390d608c8e10a0315c0 offset=0
+2026-11-03T00:32:12.749Z 258752 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-03T00:32:12.749Z 258752 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-03T00:32:12.749Z 258752 [INFO] Replication: AOF is on — rebasing it onto the synced dataset
+2026-11-03T00:32:12.752Z 258752 [INFO] AOF: rebased onto dump.kdb (generation 1) — log is now the delta
+2026-11-03T00:32:12.752Z 258752 [INFO] Replication: Synced with 10.70.1.14:6379. Entering command stream.
+2026-11-03T00:32:22.739Z 258752 [INFO] AOF: auto-checkpoint: 146.74 MB is 100%+ above the 0.00 MB baseline — folding into dump.kdb
+2026-11-03T00:32:23.333Z 258752 [INFO] AOF: rebased onto dump.kdb (generation 2) — log is now the delta
+2026-11-03T00:32:33.333Z 258752 [INFO] AOF: auto-checkpoint: 80.74 MB is 100%+ above the 4.24 MB baseline — folding into dump.kdb
+2026-11-03T00:32:34.152Z 258752 [INFO] AOF: rebased onto dump.kdb (generation 3) — log is now the delta
+2026-11-03T00:32:44.152Z 258752 [INFO] AOF: auto-checkpoint: 82.14 MB is 100%+ above the 6.54 MB baseline — folding into dump.kdb
+2026-11-03T00:32:45.162Z 258752 [INFO] AOF: rebased onto dump.kdb (generation 4) — log is now the delta
+2026-11-03T00:32:55.162Z 258752 [INFO] AOF: auto-checkpoint: 83.95 MB is 100%+ above the 7.21 MB baseline — folding into dump.kdb
+2026-11-03T00:32:56.326Z 258752 [INFO] AOF: rebased onto dump.kdb (generation 5) — log is now the delta
+2026-11-03T00:33:06.326Z 258752 [INFO] AOF: auto-checkpoint: 85.40 MB is 100%+ above the 9.21 MB baseline — folding into dump.kdb
+2026-11-03T00:33:07.627Z 258752 [INFO] AOF: rebased onto dump.kdb (generation 6) — log is now the delta
+2026-11-03T00:33:17.627Z 258752 [INFO] AOF: auto-checkpoint: 69.81 MB is 100%+ above the 10.52 MB baseline — folding into dump.kdb
+2026-11-03T00:33:18.988Z 258752 [INFO] AOF: rebased onto dump.kdb (generation 7) — log is now the delta
+2026-11-03T00:33:48.366Z 258752 [WARN] Replication: Master closed the connection — reconnecting
+2026-11-03T00:33:49.371Z 258752 [INFO] Replication: Connecting to master 10.70.1.14:6379...
+2026-11-03T00:33:49.379Z 258752 [WARN] Replication: Replication link to 10.70.1.14:6379 failed: connect: Connection refused (os error 111) — retrying every 1s
+2026-11-03T00:33:51.400Z 258752 [INFO] Replication: Partial resync: continuing from offset 575485315 — no dataset transfer
+2026-11-03T00:33:51.400Z 258752 [INFO] Replication: Synced with 10.70.1.14:6379. Entering command stream.

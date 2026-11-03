@@ -1,0 +1,2 @@
+max pods down at once: 1
+21:07:53 rep-q1-023732=Running rep-q2-023732=Pending down=1 | rep-q2-023732: Queued=True:waiting for KividbDbOps rep-q1-023732 of cluster rep to finish; 

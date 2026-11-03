@@ -1,0 +1,18 @@
+== kv: kividb 1.2.0-rc7
+none: h1:exists=0,hlen=0,type=none h2:exists=0,hlen=0,type=none h3:exists=1,hlen=1,type=hash dbsize=1
+term-early: h1:exists=1,hlen=0,type=hash h2:exists=1,hlen=0,type=hash h3:exists=1,hlen=1,type=hash dbsize=3
+kill9-early: h1:exists=0,hlen=0,type=none h2:exists=0,hlen=0,type=none h3:exists=1,hlen=1,type=hash dbsize=1
+term-late: h1:exists=0,hlen=0,type=none h2:exists=0,hlen=0,type=none h3:exists=1,hlen=1,type=hash dbsize=1
+kill9-late: h1:exists=0,hlen=0,type=none h2:exists=0,hlen=0,type=none h3:exists=1,hlen=1,type=hash dbsize=1
+== v1.2.0-rc6: kividb 1.2.0-rc6
+none: h1:exists=0,hlen=0,type=none h2:exists=0,hlen=0,type=none h3:exists=1,hlen=1,type=hash dbsize=1
+term-early: h1:exists=1,hlen=0,type=hash h2:exists=1,hlen=0,type=hash h3:exists=1,hlen=1,type=hash dbsize=3
+kill9-early: h1:exists=0,hlen=0,type=none h2:exists=0,hlen=0,type=none h3:exists=1,hlen=1,type=hash dbsize=1
+term-late: h1:exists=0,hlen=0,type=none h2:exists=0,hlen=0,type=none h3:exists=1,hlen=1,type=hash dbsize=1
+kill9-late: h1:exists=0,hlen=0,type=none h2:exists=0,hlen=0,type=none h3:exists=1,hlen=1,type=hash dbsize=1
+== v1.2.0-rc5: kividb 1.2.0-rc5
+none: h1:exists=0,hlen=0,type=none h2:exists=0,hlen=0,type=none h3:exists=1,hlen=1,type=hash dbsize=1
+term-early: h1:exists=1,hlen=0,type=hash h2:exists=1,hlen=0,type=hash h3:exists=1,hlen=1,type=hash dbsize=3
+kill9-early: h1:exists=0,hlen=0,type=none h2:exists=0,hlen=0,type=none h3:exists=1,hlen=1,type=hash dbsize=1
+term-late: h1:exists=0,hlen=0,type=none h2:exists=0,hlen=0,type=none h3:exists=1,hlen=1,type=hash dbsize=1
+kill9-late: h1:exists=0,hlen=0,type=none h2:exists=0,hlen=0,type=none h3:exists=1,hlen=1,type=hash dbsize=1

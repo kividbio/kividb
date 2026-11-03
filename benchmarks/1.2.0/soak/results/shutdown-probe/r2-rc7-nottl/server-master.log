@@ -1,0 +1,598 @@
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc7 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc7
+  * Mode           : standalone
+  * OS             : linux x86_64
+  * Memory         : 15GiB available
+  * CPUs           : 4 cores detected
+  * Listening on   : 0.0.0.0:6379
+  * Worker threads : 2
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-03T00:35:59.178Z 9859 [INFO] KiviDB 1.2.0-rc7 starting: pid 9859, default build, config file '/mnt/kv/node.conf'
+2026-11-03T00:35:59.178Z 9859 [INFO] I/O model      : io_uring
+2026-11-03T00:35:59.179Z 9859 [INFO] Shards per DB  : 32
+2026-11-03T00:35:59.179Z 9859 [INFO] I/O model      : io_uring
+2026-11-03T00:35:59.180Z 9859 [INFO] Ready to accept connections on 0.0.0.0:6379
+2026-11-03T00:35:59.180Z 9859 [VERBOSE] Client id=1 connected from 127.0.0.1:53804
+2026-11-03T00:35:59.180Z 9859 [VERBOSE] Client id=1 (127.0.0.1:53804) disconnected after 0.0s
+2026-11-03T00:35:59.183Z 9859 [VERBOSE] Client id=2 connected from 127.0.0.1:53818
+2026-11-03T00:35:59.184Z 9859 [VERBOSE] Client id=2 (127.0.0.1:53818) disconnected after 0.0s
+2026-11-03T00:35:59.197Z 9859 [VERBOSE] Client id=3 connected from 127.0.0.1:53834
+2026-11-03T00:35:59.198Z 9859 [VERBOSE] Client id=3 (127.0.0.1:53834) disconnected after 0.0s
+2026-11-03T00:35:59.742Z 9859 [VERBOSE] Client id=4 connected from 10.70.1.13:52810
+2026-11-03T00:35:59.743Z 9859 [INFO] Replication: Channel replica registered: 10.70.1.13:52810
+2026-11-03T00:35:59.744Z 9859 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub
+2026-11-03T00:36:01.750Z 9859 [VERBOSE] Client id=5 connected from 10.70.1.13:52846
+2026-11-03T00:36:01.750Z 9859 [VERBOSE] Client id=6 connected from 10.70.1.13:52852
+2026-11-03T00:36:01.750Z 9859 [VERBOSE] Client id=7 connected from 10.70.1.13:52880
+2026-11-03T00:36:01.750Z 9859 [VERBOSE] Client id=8 connected from 10.70.1.13:52874
+2026-11-03T00:36:01.750Z 9859 [VERBOSE] Client id=9 connected from 10.70.1.13:52814
+2026-11-03T00:36:01.750Z 9859 [VERBOSE] Client id=10 connected from 10.70.1.13:52908
+2026-11-03T00:36:01.750Z 9859 [VERBOSE] Client id=11 connected from 10.70.1.13:52888
+2026-11-03T00:36:01.750Z 9859 [VERBOSE] Client id=12 connected from 10.70.1.13:52866
+2026-11-03T00:36:01.750Z 9859 [VERBOSE] Client id=13 connected from 10.70.1.13:52904
+2026-11-03T00:36:01.750Z 9859 [VERBOSE] Client id=14 connected from 10.70.1.13:52816
+2026-11-03T00:36:01.750Z 9859 [VERBOSE] Client id=15 connected from 10.70.1.13:52990
+2026-11-03T00:36:01.750Z 9859 [VERBOSE] Client id=16 connected from 10.70.1.13:52966
+2026-11-03T00:36:01.750Z 9859 [VERBOSE] Client id=17 connected from 10.70.1.13:53012
+2026-11-03T00:36:01.750Z 9859 [VERBOSE] Client id=18 connected from 10.70.1.13:52930
+2026-11-03T00:36:01.750Z 9859 [VERBOSE] Client id=19 connected from 10.70.1.13:52924
+2026-11-03T00:36:01.750Z 9859 [VERBOSE] Client id=20 connected from 10.70.1.13:52978
+2026-11-03T00:36:01.750Z 9859 [VERBOSE] Client id=21 connected from 10.70.1.13:53014
+2026-11-03T00:36:01.750Z 9859 [VERBOSE] Client id=22 connected from 10.70.1.13:52950
+2026-11-03T00:36:01.750Z 9859 [VERBOSE] Client id=23 connected from 10.70.1.13:53026
+2026-11-03T00:36:01.750Z 9859 [VERBOSE] Client id=24 connected from 10.70.1.13:52936
+2026-11-03T00:36:01.751Z 9859 [VERBOSE] Client id=25 connected from 10.70.1.13:52980
+2026-11-03T00:36:01.751Z 9859 [VERBOSE] Client id=26 connected from 10.70.1.13:52996
+2026-11-03T00:36:01.751Z 9859 [VERBOSE] Client id=27 connected from 10.70.1.13:53034
+2026-11-03T00:36:01.751Z 9859 [VERBOSE] Client id=28 connected from 10.70.1.13:53044
+2026-11-03T00:36:01.751Z 9859 [VERBOSE] Client id=29 connected from 10.70.1.13:53046
+2026-11-03T00:36:01.751Z 9859 [VERBOSE] Client id=30 connected from 10.70.1.13:53060
+2026-11-03T00:36:01.751Z 9859 [VERBOSE] Client id=31 connected from 10.70.1.13:53052
+2026-11-03T00:36:01.751Z 9859 [VERBOSE] Client id=32 connected from 10.70.1.13:53066
+2026-11-03T00:36:01.751Z 9859 [VERBOSE] Client id=33 connected from 10.70.1.13:53082
+2026-11-03T00:36:01.751Z 9859 [VERBOSE] Client id=34 connected from 10.70.1.13:53080
+2026-11-03T00:36:01.751Z 9859 [VERBOSE] Client id=35 connected from 10.70.1.13:53096
+2026-11-03T00:36:01.751Z 9859 [VERBOSE] Client id=36 connected from 10.70.1.13:53100
+2026-11-03T00:36:01.751Z 9859 [VERBOSE] Client id=37 connected from 10.70.1.13:53102
+2026-11-03T00:36:01.752Z 9859 [VERBOSE] Client id=38 connected from 10.70.1.13:53106
+2026-11-03T00:36:01.752Z 9859 [VERBOSE] Client id=39 connected from 10.70.1.13:53124
+2026-11-03T00:36:01.752Z 9859 [VERBOSE] Client id=40 connected from 10.70.1.13:53120
+2026-11-03T00:36:01.752Z 9859 [VERBOSE] Client id=41 connected from 10.70.1.13:53138
+2026-11-03T00:36:01.754Z 9859 [VERBOSE] Client id=42 connected from 10.70.1.13:53112
+2026-11-03T00:36:01.754Z 9859 [VERBOSE] Client id=43 connected from 10.70.1.13:53142
+2026-11-03T00:36:01.754Z 9859 [VERBOSE] Client id=44 connected from 10.70.1.13:53140
+2026-11-03T00:36:01.760Z 9859 [VERBOSE] Client id=45 connected from 10.70.1.13:53304
+2026-11-03T00:36:01.762Z 9859 [VERBOSE] Client id=46 connected from 10.70.1.13:53204
+2026-11-03T00:36:01.763Z 9859 [VERBOSE] Client id=47 connected from 10.70.1.13:53202
+2026-11-03T00:36:01.764Z 9859 [VERBOSE] Client id=48 connected from 10.70.1.13:53280
+2026-11-03T00:36:01.764Z 9859 [VERBOSE] Client id=49 connected from 10.70.1.13:53242
+2026-11-03T00:36:01.766Z 9859 [VERBOSE] Client id=50 connected from 10.70.1.13:53152
+2026-11-03T00:36:01.767Z 9859 [VERBOSE] Client id=51 connected from 10.70.1.13:53326
+2026-11-03T00:36:01.768Z 9859 [VERBOSE] Client id=52 connected from 10.70.1.13:53248
+2026-11-03T00:36:01.768Z 9859 [VERBOSE] Client id=53 connected from 10.70.1.13:53350
+2026-11-03T00:36:01.770Z 9859 [VERBOSE] Client id=54 connected from 10.70.1.13:53288
+2026-11-03T00:36:01.772Z 9859 [VERBOSE] Client id=55 connected from 10.70.1.13:53196
+2026-11-03T00:36:01.772Z 9859 [VERBOSE] Client id=56 connected from 10.70.1.13:53272
+2026-11-03T00:36:01.774Z 9859 [VERBOSE] Client id=57 connected from 10.70.1.13:53218
+2026-11-03T00:36:01.774Z 9859 [VERBOSE] Client id=58 connected from 10.70.1.13:53314
+2026-11-03T00:36:01.776Z 9859 [VERBOSE] Client id=59 connected from 10.70.1.13:53164
+2026-11-03T00:36:01.776Z 9859 [VERBOSE] Client id=60 connected from 10.70.1.13:53354
+2026-11-03T00:36:01.777Z 9859 [VERBOSE] Client id=61 connected from 10.70.1.13:53230
+2026-11-03T00:36:01.780Z 9859 [VERBOSE] Client id=62 connected from 10.70.1.13:53258
+2026-11-03T00:36:01.783Z 9859 [VERBOSE] Client id=63 connected from 10.70.1.13:53334
+2026-11-03T00:36:01.785Z 9859 [VERBOSE] Client id=64 connected from 10.70.1.13:53316
+2026-11-03T00:36:01.788Z 9859 [VERBOSE] Client id=65 connected from 10.70.1.13:53186
+2026-11-03T00:36:01.790Z 9859 [VERBOSE] Client id=66 connected from 10.70.1.13:53172
+2026-11-03T00:36:01.793Z 9859 [VERBOSE] Client id=67 connected from 10.70.1.13:53160
+2026-11-03T00:36:01.794Z 9859 [VERBOSE] Client id=68 connected from 10.70.1.13:53348
+2026-11-03T00:36:02.316Z 9859 [VERBOSE] Client id=9 (10.70.1.13:52814) disconnected after 0.6s
+2026-11-03T00:36:02.316Z 9859 [VERBOSE] Client id=22 (10.70.1.13:52950) disconnected after 0.6s
+2026-11-03T00:36:02.316Z 9859 [VERBOSE] Client id=12 (10.70.1.13:52866) disconnected after 0.6s
+2026-11-03T00:36:02.316Z 9859 [VERBOSE] Client id=52 (10.70.1.13:53248) disconnected after 0.5s
+2026-11-03T00:36:02.316Z 9859 [VERBOSE] Client id=8 (10.70.1.13:52874) disconnected after 0.6s
+2026-11-03T00:36:02.316Z 9859 [VERBOSE] Client id=25 (10.70.1.13:52980) disconnected after 0.6s
+2026-11-03T00:36:02.336Z 9859 [VERBOSE] Client id=14 (10.70.1.13:52816) disconnected after 0.6s
+2026-11-03T00:36:02.336Z 9859 [VERBOSE] Client id=24 (10.70.1.13:52936) disconnected after 0.6s
+2026-11-03T00:36:02.336Z 9859 [VERBOSE] Client id=63 (10.70.1.13:53334) disconnected after 0.6s
+2026-11-03T00:36:02.336Z 9859 [VERBOSE] Client id=38 (10.70.1.13:53106) disconnected after 0.6s
+2026-11-03T00:36:02.336Z 9859 [VERBOSE] Client id=50 (10.70.1.13:53152) disconnected after 0.6s
+2026-11-03T00:36:02.336Z 9859 [VERBOSE] Client id=60 (10.70.1.13:53354) disconnected after 0.6s
+2026-11-03T00:36:02.336Z 9859 [VERBOSE] Client id=18 (10.70.1.13:52930) disconnected after 0.6s
+2026-11-03T00:36:02.336Z 9859 [VERBOSE] Client id=11 (10.70.1.13:52888) disconnected after 0.6s
+2026-11-03T00:36:02.336Z 9859 [VERBOSE] Client id=57 (10.70.1.13:53218) disconnected after 0.6s
+2026-11-03T00:36:02.336Z 9859 [VERBOSE] Client id=58 (10.70.1.13:53314) disconnected after 0.6s
+2026-11-03T00:36:02.336Z 9859 [VERBOSE] Client id=30 (10.70.1.13:53060) disconnected after 0.6s
+2026-11-03T00:36:02.336Z 9859 [VERBOSE] Client id=27 (10.70.1.13:53034) disconnected after 0.6s
+2026-11-03T00:36:02.336Z 9859 [VERBOSE] Client id=48 (10.70.1.13:53280) disconnected after 0.6s
+2026-11-03T00:36:02.336Z 9859 [VERBOSE] Client id=54 (10.70.1.13:53288) disconnected after 0.6s
+2026-11-03T00:36:02.336Z 9859 [VERBOSE] Client id=6 (10.70.1.13:52852) disconnected after 0.6s
+2026-11-03T00:36:02.337Z 9859 [VERBOSE] Client id=15 (10.70.1.13:52990) disconnected after 0.6s
+2026-11-03T00:36:02.337Z 9859 [VERBOSE] Client id=56 (10.70.1.13:53272) disconnected after 0.6s
+2026-11-03T00:36:02.337Z 9859 [VERBOSE] Client id=49 (10.70.1.13:53242) disconnected after 0.6s
+2026-11-03T00:36:02.337Z 9859 [VERBOSE] Client id=62 (10.70.1.13:53258) disconnected after 0.6s
+2026-11-03T00:36:02.337Z 9859 [VERBOSE] Client id=5 (10.70.1.13:52846) disconnected after 0.6s
+2026-11-03T00:36:02.337Z 9859 [VERBOSE] Client id=64 (10.70.1.13:53316) disconnected after 0.6s
+2026-11-03T00:36:02.337Z 9859 [VERBOSE] Client id=61 (10.70.1.13:53230) disconnected after 0.6s
+2026-11-03T00:36:02.337Z 9859 [VERBOSE] Client id=68 (10.70.1.13:53348) disconnected after 0.5s
+2026-11-03T00:36:02.337Z 9859 [VERBOSE] Client id=36 (10.70.1.13:53100) disconnected after 0.6s
+2026-11-03T00:36:02.355Z 9859 [VERBOSE] Client id=41 (10.70.1.13:53138) disconnected after 0.6s
+2026-11-03T00:36:02.355Z 9859 [VERBOSE] Client id=33 (10.70.1.13:53082) disconnected after 0.6s
+2026-11-03T00:36:02.355Z 9859 [VERBOSE] Client id=37 (10.70.1.13:53102) disconnected after 0.6s
+2026-11-03T00:36:02.355Z 9859 [VERBOSE] Client id=67 (10.70.1.13:53160) disconnected after 0.6s
+2026-11-03T00:36:02.355Z 9859 [VERBOSE] Client id=45 (10.70.1.13:53304) disconnected after 0.6s
+2026-11-03T00:36:02.355Z 9859 [VERBOSE] Client id=16 (10.70.1.13:52966) disconnected after 0.6s
+2026-11-03T00:36:02.356Z 9859 [VERBOSE] Client id=39 (10.70.1.13:53124) disconnected after 0.6s
+2026-11-03T00:36:02.356Z 9859 [VERBOSE] Client id=42 (10.70.1.13:53112) disconnected after 0.6s
+2026-11-03T00:36:02.356Z 9859 [VERBOSE] Client id=17 (10.70.1.13:53012) disconnected after 0.6s
+2026-11-03T00:36:02.356Z 9859 [VERBOSE] Client id=53 (10.70.1.13:53350) disconnected after 0.6s
+2026-11-03T00:36:02.356Z 9859 [VERBOSE] Client id=28 (10.70.1.13:53044) disconnected after 0.6s
+2026-11-03T00:36:02.356Z 9859 [VERBOSE] Client id=32 (10.70.1.13:53066) disconnected after 0.6s
+2026-11-03T00:36:02.356Z 9859 [VERBOSE] Client id=31 (10.70.1.13:53052) disconnected after 0.6s
+2026-11-03T00:36:02.356Z 9859 [VERBOSE] Client id=23 (10.70.1.13:53026) disconnected after 0.6s
+2026-11-03T00:36:02.356Z 9859 [VERBOSE] Client id=21 (10.70.1.13:53014) disconnected after 0.6s
+2026-11-03T00:36:02.356Z 9859 [VERBOSE] Client id=19 (10.70.1.13:52924) disconnected after 0.6s
+2026-11-03T00:36:02.370Z 9859 [VERBOSE] Client id=66 (10.70.1.13:53172) disconnected after 0.6s
+2026-11-03T00:36:02.370Z 9859 [VERBOSE] Client id=46 (10.70.1.13:53204) disconnected after 0.6s
+2026-11-03T00:36:02.370Z 9859 [VERBOSE] Client id=55 (10.70.1.13:53196) disconnected after 0.6s
+2026-11-03T00:36:02.370Z 9859 [VERBOSE] Client id=59 (10.70.1.13:53164) disconnected after 0.6s
+2026-11-03T00:36:02.370Z 9859 [VERBOSE] Client id=47 (10.70.1.13:53202) disconnected after 0.6s
+2026-11-03T00:36:02.370Z 9859 [VERBOSE] Client id=43 (10.70.1.13:53142) disconnected after 0.6s
+2026-11-03T00:36:02.370Z 9859 [VERBOSE] Client id=65 (10.70.1.13:53186) disconnected after 0.6s
+2026-11-03T00:36:02.370Z 9859 [VERBOSE] Client id=51 (10.70.1.13:53326) disconnected after 0.6s
+2026-11-03T00:36:02.370Z 9859 [VERBOSE] Client id=44 (10.70.1.13:53140) disconnected after 0.6s
+2026-11-03T00:36:02.370Z 9859 [VERBOSE] Client id=40 (10.70.1.13:53120) disconnected after 0.6s
+2026-11-03T00:36:02.370Z 9859 [VERBOSE] Client id=35 (10.70.1.13:53096) disconnected after 0.6s
+2026-11-03T00:36:02.370Z 9859 [VERBOSE] Client id=29 (10.70.1.13:53046) disconnected after 0.6s
+2026-11-03T00:36:02.370Z 9859 [VERBOSE] Client id=26 (10.70.1.13:52996) disconnected after 0.6s
+2026-11-03T00:36:02.370Z 9859 [VERBOSE] Client id=10 (10.70.1.13:52908) disconnected after 0.6s
+2026-11-03T00:36:02.370Z 9859 [VERBOSE] Client id=13 (10.70.1.13:52904) disconnected after 0.6s
+2026-11-03T00:36:02.370Z 9859 [VERBOSE] Client id=7 (10.70.1.13:52880) disconnected after 0.6s
+2026-11-03T00:36:02.370Z 9859 [VERBOSE] Client id=34 (10.70.1.13:53080) disconnected after 0.6s
+2026-11-03T00:36:02.370Z 9859 [VERBOSE] Client id=20 (10.70.1.13:52978) disconnected after 0.6s
+2026-11-03T00:36:02.379Z 9859 [VERBOSE] Client id=69 connected from 10.70.1.13:53618
+2026-11-03T00:36:02.379Z 9859 [VERBOSE] Client id=70 connected from 10.70.1.13:53566
+2026-11-03T00:36:02.379Z 9859 [VERBOSE] Client id=71 connected from 10.70.1.13:53662
+2026-11-03T00:36:02.379Z 9859 [VERBOSE] Client id=72 connected from 10.70.1.13:53552
+2026-11-03T00:36:02.379Z 9859 [VERBOSE] Client id=73 connected from 10.70.1.13:53414
+2026-11-03T00:36:02.379Z 9859 [VERBOSE] Client id=74 connected from 10.70.1.13:53482
+2026-11-03T00:36:02.379Z 9859 [VERBOSE] Client id=75 connected from 10.70.1.13:53688
+2026-11-03T00:36:02.379Z 9859 [VERBOSE] Client id=76 connected from 10.70.1.13:53458
+2026-11-03T00:36:02.379Z 9859 [VERBOSE] Client id=77 connected from 10.70.1.13:53530
+2026-11-03T00:36:02.379Z 9859 [VERBOSE] Client id=78 connected from 10.70.1.13:53388
+2026-11-03T00:36:02.380Z 9859 [VERBOSE] Client id=79 connected from 10.70.1.13:53372
+2026-11-03T00:36:02.380Z 9859 [VERBOSE] Client id=80 connected from 10.70.1.13:53650
+2026-11-03T00:36:02.380Z 9859 [VERBOSE] Client id=81 connected from 10.70.1.13:53430
+2026-11-03T00:36:02.380Z 9859 [VERBOSE] Client id=83 connected from 10.70.1.13:53592
+2026-11-03T00:36:02.380Z 9859 [VERBOSE] Client id=82 connected from 10.70.1.13:53612
+2026-11-03T00:36:02.380Z 9859 [VERBOSE] Client id=84 connected from 10.70.1.13:53564
+2026-11-03T00:36:02.380Z 9859 [VERBOSE] Client id=85 connected from 10.70.1.13:53738
+2026-11-03T00:36:02.380Z 9859 [VERBOSE] Client id=86 connected from 10.70.1.13:53536
+2026-11-03T00:36:02.380Z 9859 [VERBOSE] Client id=87 connected from 10.70.1.13:53672
+2026-11-03T00:36:02.380Z 9859 [INFO] Replication: Channel replica registered: 10.70.1.13:53530
+2026-11-03T00:36:02.380Z 9859 [VERBOSE] Client id=88 connected from 10.70.1.13:53510
+2026-11-03T00:36:02.380Z 9859 [VERBOSE] Client id=89 connected from 10.70.1.13:53732
+2026-11-03T00:36:02.380Z 9859 [VERBOSE] Client id=90 connected from 10.70.1.13:53608
+2026-11-03T00:36:02.386Z 9859 [VERBOSE] Client id=91 connected from 10.70.1.13:53800
+2026-11-03T00:36:02.386Z 9859 [VERBOSE] Client id=92 connected from 10.70.1.13:53462
+2026-11-03T00:36:02.386Z 9859 [VERBOSE] Client id=93 connected from 10.70.1.13:53762
+2026-11-03T00:36:02.386Z 9859 [VERBOSE] Client id=94 connected from 10.70.1.13:53422
+2026-11-03T00:36:02.386Z 9859 [VERBOSE] Client id=95 connected from 10.70.1.13:53824
+2026-11-03T00:36:02.387Z 9859 [VERBOSE] Client id=96 connected from 10.70.1.13:53702
+2026-11-03T00:36:02.387Z 9859 [VERBOSE] Client id=97 connected from 10.70.1.13:53568
+2026-11-03T00:36:02.387Z 9859 [VERBOSE] Client id=98 connected from 10.70.1.13:53488
+2026-11-03T00:36:02.387Z 9859 [VERBOSE] Client id=99 connected from 10.70.1.13:53716
+2026-11-03T00:36:02.387Z 9859 [VERBOSE] Client id=100 connected from 10.70.1.13:53586
+2026-11-03T00:36:02.387Z 9859 [VERBOSE] Client id=101 connected from 10.70.1.13:53770
+2026-11-03T00:36:02.387Z 9859 [VERBOSE] Client id=102 connected from 10.70.1.13:53520
+2026-11-03T00:36:02.387Z 9859 [VERBOSE] Client id=103 connected from 10.70.1.13:53896
+2026-11-03T00:36:02.387Z 9859 [VERBOSE] Client id=104 connected from 10.70.1.13:53748
+2026-11-03T00:36:02.387Z 9859 [VERBOSE] Client id=105 connected from 10.70.1.13:53932
+2026-11-03T00:36:02.387Z 9859 [VERBOSE] Client id=106 connected from 10.70.1.13:53864
+2026-11-03T00:36:02.387Z 9859 [VERBOSE] Client id=107 connected from 10.70.1.13:53908
+2026-11-03T00:36:02.387Z 9859 [VERBOSE] Client id=108 connected from 10.70.1.13:53746
+2026-11-03T00:36:02.388Z 9859 [VERBOSE] Client id=109 connected from 10.70.1.13:53924
+2026-11-03T00:36:02.388Z 9859 [VERBOSE] Client id=110 connected from 10.70.1.13:53880
+2026-11-03T00:36:02.388Z 9859 [VERBOSE] Client id=111 connected from 10.70.1.13:53996
+2026-11-03T00:36:02.388Z 9859 [VERBOSE] Client id=112 connected from 10.70.1.13:54028
+2026-11-03T00:36:02.388Z 9859 [VERBOSE] Client id=113 connected from 10.70.1.13:53808
+2026-11-03T00:36:02.388Z 9859 [VERBOSE] Client id=114 connected from 10.70.1.13:53832
+2026-11-03T00:36:02.388Z 9859 [VERBOSE] Client id=115 connected from 10.70.1.13:53400
+2026-11-03T00:36:02.388Z 9859 [VERBOSE] Client id=116 connected from 10.70.1.13:53556
+2026-11-03T00:36:02.388Z 9859 [VERBOSE] Client id=117 connected from 10.70.1.13:53830
+2026-11-03T00:36:02.388Z 9859 [VERBOSE] Client id=118 connected from 10.70.1.13:53570
+2026-11-03T00:36:02.388Z 9859 [VERBOSE] Client id=119 connected from 10.70.1.13:53624
+2026-11-03T00:36:02.388Z 9859 [VERBOSE] Client id=120 connected from 10.70.1.13:53918
+2026-11-03T00:36:02.388Z 9859 [VERBOSE] Client id=121 connected from 10.70.1.13:53640
+2026-11-03T00:36:02.388Z 9859 [VERBOSE] Client id=122 connected from 10.70.1.13:53786
+2026-11-03T00:36:02.388Z 9859 [VERBOSE] Client id=123 connected from 10.70.1.13:53966
+2026-11-03T00:36:02.388Z 9859 [VERBOSE] Client id=124 connected from 10.70.1.13:53744
+2026-11-03T00:36:02.389Z 9859 [VERBOSE] Client id=125 connected from 10.70.1.13:54016
+2026-11-03T00:36:02.389Z 9859 [VERBOSE] Client id=126 connected from 10.70.1.13:53700
+2026-11-03T00:36:02.389Z 9859 [VERBOSE] Client id=127 connected from 10.70.1.13:53848
+2026-11-03T00:36:02.389Z 9859 [VERBOSE] Client id=128 connected from 10.70.1.13:53990
+2026-11-03T00:36:02.389Z 9859 [VERBOSE] Client id=129 connected from 10.70.1.13:53954
+2026-11-03T00:36:02.389Z 9859 [VERBOSE] Client id=130 connected from 10.70.1.13:54086
+2026-11-03T00:36:02.389Z 9859 [VERBOSE] Client id=131 connected from 10.70.1.13:54042
+2026-11-03T00:36:02.389Z 9859 [VERBOSE] Client id=132 connected from 10.70.1.13:54100
+2026-11-03T00:36:02.389Z 9859 [VERBOSE] Client id=133 connected from 10.70.1.13:53974
+2026-11-03T00:36:02.389Z 9859 [VERBOSE] Client id=134 connected from 10.70.1.13:54000
+2026-11-03T00:36:02.389Z 9859 [VERBOSE] Client id=135 connected from 10.70.1.13:54108
+2026-11-03T00:36:02.389Z 9859 [VERBOSE] Client id=136 connected from 10.70.1.13:54062
+2026-11-03T00:36:02.390Z 9859 [VERBOSE] Client id=137 connected from 10.70.1.13:54048
+2026-11-03T00:36:02.390Z 9859 [VERBOSE] Client id=138 connected from 10.70.1.13:53504
+2026-11-03T00:36:02.390Z 9859 [VERBOSE] Client id=139 connected from 10.70.1.13:53446
+2026-11-03T00:36:02.390Z 9859 [VERBOSE] Client id=140 connected from 10.70.1.13:53472
+2026-11-03T00:36:02.390Z 9859 [VERBOSE] Client id=141 connected from 10.70.1.13:53490
+2026-11-03T00:36:02.390Z 9859 [VERBOSE] Client id=142 connected from 10.70.1.13:54196
+2026-11-03T00:36:02.390Z 9859 [VERBOSE] Client id=143 connected from 10.70.1.13:53682
+2026-11-03T00:36:02.390Z 9859 [VERBOSE] Client id=144 connected from 10.70.1.13:54150
+2026-11-03T00:36:02.390Z 9859 [VERBOSE] Client id=145 connected from 10.70.1.13:53370
+2026-11-03T00:36:02.391Z 9859 [VERBOSE] Client id=146 connected from 10.70.1.13:53780
+2026-11-03T00:36:02.391Z 9859 [VERBOSE] Client id=147 connected from 10.70.1.13:53940
+2026-11-03T00:36:02.391Z 9859 [VERBOSE] Client id=148 connected from 10.70.1.13:53886
+2026-11-03T00:36:02.391Z 9859 [VERBOSE] Client id=149 connected from 10.70.1.13:54060
+2026-11-03T00:36:02.391Z 9859 [VERBOSE] Client id=150 connected from 10.70.1.13:54078
+2026-11-03T00:36:02.391Z 9859 [VERBOSE] Client id=151 connected from 10.70.1.13:54066
+2026-11-03T00:36:02.391Z 9859 [VERBOSE] Client id=152 connected from 10.70.1.13:54114
+2026-11-03T00:36:02.391Z 9859 [VERBOSE] Client id=153 connected from 10.70.1.13:54138
+2026-11-03T00:36:02.391Z 9859 [VERBOSE] Client id=154 connected from 10.70.1.13:54124
+2026-11-03T00:36:02.391Z 9859 [VERBOSE] Client id=155 connected from 10.70.1.13:54166
+2026-11-03T00:36:02.391Z 9859 [VERBOSE] Client id=156 connected from 10.70.1.13:54180
+2026-11-03T00:36:02.391Z 9859 [VERBOSE] Client id=157 connected from 10.70.1.13:54164
+2026-11-03T00:36:02.391Z 9859 [VERBOSE] Client id=158 connected from 10.70.1.13:54194
+2026-11-03T00:36:02.391Z 9859 [VERBOSE] Client id=159 connected from 10.70.1.13:54208
+2026-11-03T00:36:02.391Z 9859 [VERBOSE] Client id=160 connected from 10.70.1.13:54222
+2026-11-03T00:36:02.391Z 9859 [VERBOSE] Client id=161 connected from 10.70.1.13:54226
+2026-11-03T00:36:02.391Z 9859 [VERBOSE] Client id=162 connected from 10.70.1.13:54234
+2026-11-03T00:36:02.394Z 9859 [VERBOSE] Client id=163 connected from 10.70.1.13:54254
+2026-11-03T00:36:02.394Z 9859 [VERBOSE] Client id=164 connected from 10.70.1.13:54248
+2026-11-03T00:36:02.394Z 9859 [VERBOSE] Client id=165 connected from 10.70.1.13:54260
+2026-11-03T00:36:02.396Z 9859 [VERBOSE] Client id=166 connected from 10.70.1.13:54266
+2026-11-03T00:36:02.396Z 9859 [VERBOSE] Client id=167 connected from 10.70.1.13:54256
+2026-11-03T00:36:02.396Z 9859 [VERBOSE] Client id=168 connected from 10.70.1.13:54282
+2026-11-03T00:36:02.398Z 9859 [VERBOSE] Client id=169 connected from 10.70.1.13:54288
+2026-11-03T00:36:02.399Z 9859 [VERBOSE] Client id=170 connected from 10.70.1.13:54308
+2026-11-03T00:36:02.403Z 9859 [VERBOSE] Client id=171 connected from 10.70.1.13:54336
+2026-11-03T00:36:02.403Z 9859 [VERBOSE] Client id=172 connected from 10.70.1.13:54316
+2026-11-03T00:36:02.405Z 9859 [VERBOSE] Client id=173 connected from 10.70.1.13:54312
+2026-11-03T00:36:02.406Z 9859 [VERBOSE] Client id=174 connected from 10.70.1.13:54356
+2026-11-03T00:36:02.407Z 9859 [VERBOSE] Client id=175 connected from 10.70.1.13:54292
+2026-11-03T00:36:02.407Z 9859 [VERBOSE] Client id=176 connected from 10.70.1.13:54352
+2026-11-03T00:36:02.408Z 9859 [VERBOSE] Client id=177 connected from 10.70.1.13:54372
+2026-11-03T00:36:02.413Z 9859 [VERBOSE] Client id=178 connected from 10.70.1.13:54322
+2026-11-03T00:36:02.414Z 9859 [VERBOSE] Client id=179 connected from 10.70.1.13:54376
+2026-11-03T00:36:02.419Z 9859 [VERBOSE] Client id=180 connected from 10.70.1.13:54402
+2026-11-03T00:36:02.421Z 9859 [VERBOSE] Client id=182 connected from 10.70.1.13:54406
+2026-11-03T00:36:02.421Z 9859 [VERBOSE] Client id=181 connected from 10.70.1.13:54392
+2026-11-03T00:36:02.427Z 9859 [VERBOSE] Client id=184 connected from 10.70.1.13:54434
+2026-11-03T00:36:02.427Z 9859 [VERBOSE] Client id=183 connected from 10.70.1.13:54462
+2026-11-03T00:36:02.427Z 9859 [VERBOSE] Client id=185 connected from 10.70.1.13:54418
+2026-11-03T00:36:02.428Z 9859 [VERBOSE] Client id=186 connected from 10.70.1.13:54472
+2026-11-03T00:36:02.429Z 9859 [VERBOSE] Client id=187 connected from 10.70.1.13:54446
+2026-11-03T00:36:02.433Z 9859 [VERBOSE] Client id=188 connected from 10.70.1.13:54480
+2026-11-03T00:36:02.438Z 9859 [VERBOSE] Client id=189 connected from 10.70.1.13:54492
+2026-11-03T00:36:02.439Z 9859 [VERBOSE] Client id=190 connected from 10.70.1.13:54504
+2026-11-03T00:36:02.441Z 9859 [VERBOSE] Client id=191 connected from 10.70.1.13:54490
+2026-11-03T00:36:02.455Z 9859 [VERBOSE] Client id=192 connected from 10.70.1.13:54510
+2026-11-03T00:36:02.456Z 9859 [VERBOSE] Client id=193 connected from 10.70.1.13:54528
+2026-11-03T00:36:02.457Z 9859 [VERBOSE] Client id=194 connected from 10.70.1.13:54536
+2026-11-03T00:36:02.468Z 9859 [VERBOSE] Client id=195 connected from 10.70.1.13:54520
+2026-11-03T00:36:02.477Z 9859 [VERBOSE] Client id=196 connected from 10.70.1.13:54554
+2026-11-03T00:36:02.484Z 9859 [VERBOSE] Client id=197 connected from 10.70.1.13:54542
+2026-11-03T00:36:02.562Z 9859 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub
+2026-11-03T00:36:09.180Z 9859 [INFO] AOF: auto-checkpoint: 143.00 MB is 100%+ above the 0.00 MB baseline — folding into dump.kdb
+2026-11-03T00:36:09.261Z 9859 [VERBOSE] Client id=198 connected from 127.0.0.1:47188
+2026-11-03T00:36:09.274Z 9859 [VERBOSE] Client id=198 (127.0.0.1:47188) disconnected after 0.0s
+2026-11-03T00:36:09.749Z 9859 [INFO] AOF: rebased onto dump.kdb (generation 1) — log is now the delta
+2026-11-03T00:36:19.356Z 9859 [VERBOSE] Client id=199 connected from 127.0.0.1:43436
+2026-11-03T00:36:19.374Z 9859 [VERBOSE] Client id=199 (127.0.0.1:43436) disconnected after 0.0s
+2026-11-03T00:36:19.749Z 9859 [INFO] AOF: auto-checkpoint: 80.52 MB is 100%+ above the 4.12 MB baseline — folding into dump.kdb
+2026-11-03T00:36:20.524Z 9859 [INFO] AOF: rebased onto dump.kdb (generation 2) — log is now the delta
+2026-11-03T00:36:29.456Z 9859 [VERBOSE] Client id=200 connected from 127.0.0.1:38120
+2026-11-03T00:36:29.475Z 9859 [VERBOSE] Client id=200 (127.0.0.1:38120) disconnected after 0.0s
+2026-11-03T00:36:30.524Z 9859 [INFO] AOF: auto-checkpoint: 81.64 MB is 100%+ above the 5.86 MB baseline — folding into dump.kdb
+2026-11-03T00:36:31.499Z 9859 [INFO] AOF: rebased onto dump.kdb (generation 3) — log is now the delta
+2026-11-03T00:36:37.723Z 9859 [WARN] Replication: Channel replica 10.70.1.13:53530 exceeded backlog limit (268439127 > 268435456 bytes) — evicting
+2026-11-03T00:36:39.562Z 9859 [VERBOSE] Client id=201 connected from 127.0.0.1:52950
+2026-11-03T00:36:39.582Z 9859 [VERBOSE] Client id=201 (127.0.0.1:52950) disconnected after 0.0s
+2026-11-03T00:36:41.499Z 9859 [INFO] AOF: auto-checkpoint: 83.67 MB is 100%+ above the 7.36 MB baseline — folding into dump.kdb
+2026-11-03T00:36:42.636Z 9859 [INFO] AOF: rebased onto dump.kdb (generation 4) — log is now the delta
+2026-11-03T00:36:49.666Z 9859 [VERBOSE] Client id=202 connected from 127.0.0.1:52702
+2026-11-03T00:36:49.688Z 9859 [VERBOSE] Client id=202 (127.0.0.1:52702) disconnected after 0.0s
+2026-11-03T00:36:52.636Z 9859 [INFO] AOF: auto-checkpoint: 85.22 MB is 100%+ above the 9.05 MB baseline — folding into dump.kdb
+2026-11-03T00:36:53.915Z 9859 [INFO] AOF: rebased onto dump.kdb (generation 5) — log is now the delta
+2026-11-03T00:36:59.768Z 9859 [VERBOSE] Client id=203 connected from 127.0.0.1:40292
+2026-11-03T00:36:59.790Z 9859 [VERBOSE] Client id=203 (127.0.0.1:40292) disconnected after 0.0s
+2026-11-03T00:37:02.382Z 9859 [VERBOSE] Client id=196 (10.70.1.13:54554) disconnected after 59.9s
+2026-11-03T00:37:02.382Z 9859 [VERBOSE] Client id=197 (10.70.1.13:54542) disconnected after 59.9s
+2026-11-03T00:37:02.382Z 9859 [VERBOSE] Client id=194 (10.70.1.13:54536) disconnected after 59.9s
+2026-11-03T00:37:02.382Z 9859 [VERBOSE] Client id=193 (10.70.1.13:54528) disconnected after 59.9s
+2026-11-03T00:37:02.382Z 9859 [VERBOSE] Client id=195 (10.70.1.13:54520) disconnected after 59.9s
+2026-11-03T00:37:02.382Z 9859 [VERBOSE] Client id=192 (10.70.1.13:54510) disconnected after 59.9s
+2026-11-03T00:37:02.382Z 9859 [VERBOSE] Client id=190 (10.70.1.13:54504) disconnected after 59.9s
+2026-11-03T00:37:02.382Z 9859 [VERBOSE] Client id=188 (10.70.1.13:54480) disconnected after 59.9s
+2026-11-03T00:37:02.382Z 9859 [VERBOSE] Client id=189 (10.70.1.13:54492) disconnected after 59.9s
+2026-11-03T00:37:02.382Z 9859 [VERBOSE] Client id=183 (10.70.1.13:54462) disconnected after 60.0s
+2026-11-03T00:37:02.382Z 9859 [VERBOSE] Client id=186 (10.70.1.13:54472) disconnected after 60.0s
+2026-11-03T00:37:02.382Z 9859 [VERBOSE] Client id=191 (10.70.1.13:54490) disconnected after 59.9s
+2026-11-03T00:37:02.382Z 9859 [VERBOSE] Client id=187 (10.70.1.13:54446) disconnected after 60.0s
+2026-11-03T00:37:02.382Z 9859 [VERBOSE] Client id=185 (10.70.1.13:54418) disconnected after 60.0s
+2026-11-03T00:37:02.382Z 9859 [VERBOSE] Client id=184 (10.70.1.13:54434) disconnected after 60.0s
+2026-11-03T00:37:02.382Z 9859 [VERBOSE] Client id=177 (10.70.1.13:54372) disconnected after 60.0s
+2026-11-03T00:37:02.382Z 9859 [VERBOSE] Client id=182 (10.70.1.13:54406) disconnected after 60.0s
+2026-11-03T00:37:02.382Z 9859 [VERBOSE] Client id=180 (10.70.1.13:54402) disconnected after 60.0s
+2026-11-03T00:37:02.382Z 9859 [VERBOSE] Client id=179 (10.70.1.13:54376) disconnected after 60.0s
+2026-11-03T00:37:02.382Z 9859 [VERBOSE] Client id=181 (10.70.1.13:54392) disconnected after 60.0s
+2026-11-03T00:37:02.382Z 9859 [VERBOSE] Client id=176 (10.70.1.13:54352) disconnected after 60.0s
+2026-11-03T00:37:02.382Z 9859 [VERBOSE] Client id=174 (10.70.1.13:54356) disconnected after 60.0s
+2026-11-03T00:37:02.382Z 9859 [VERBOSE] Client id=171 (10.70.1.13:54336) disconnected after 60.0s
+2026-11-03T00:37:02.382Z 9859 [VERBOSE] Client id=178 (10.70.1.13:54322) disconnected after 60.0s
+2026-11-03T00:37:02.382Z 9859 [VERBOSE] Client id=173 (10.70.1.13:54312) disconnected after 60.0s
+2026-11-03T00:37:02.382Z 9859 [VERBOSE] Client id=172 (10.70.1.13:54316) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=168 (10.70.1.13:54282) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=170 (10.70.1.13:54308) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=167 (10.70.1.13:54256) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=169 (10.70.1.13:54288) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=161 (10.70.1.13:54226) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=164 (10.70.1.13:54248) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=159 (10.70.1.13:54208) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=162 (10.70.1.13:54234) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=142 (10.70.1.13:54196) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=155 (10.70.1.13:54166) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=165 (10.70.1.13:54260) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=144 (10.70.1.13:54150) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=157 (10.70.1.13:54164) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=175 (10.70.1.13:54292) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=166 (10.70.1.13:54266) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=153 (10.70.1.13:54138) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=163 (10.70.1.13:54254) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=135 (10.70.1.13:54108) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=132 (10.70.1.13:54100) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=160 (10.70.1.13:54222) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=130 (10.70.1.13:54086) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=156 (10.70.1.13:54180) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=136 (10.70.1.13:54062) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=158 (10.70.1.13:54194) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=151 (10.70.1.13:54066) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=154 (10.70.1.13:54124) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=149 (10.70.1.13:54060) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=152 (10.70.1.13:54114) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=112 (10.70.1.13:54028) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=150 (10.70.1.13:54078) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=111 (10.70.1.13:53996) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=131 (10.70.1.13:54042) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=129 (10.70.1.13:53954) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=137 (10.70.1.13:54048) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=125 (10.70.1.13:54016) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=134 (10.70.1.13:54000) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=105 (10.70.1.13:53932) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=128 (10.70.1.13:53990) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=147 (10.70.1.13:53940) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=123 (10.70.1.13:53966) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=103 (10.70.1.13:53896) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=133 (10.70.1.13:53974) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=107 (10.70.1.13:53908) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=120 (10.70.1.13:53918) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=127 (10.70.1.13:53848) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=148 (10.70.1.13:53886) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=95 (10.70.1.13:53824) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=110 (10.70.1.13:53880) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=106 (10.70.1.13:53864) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=114 (10.70.1.13:53832) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=117 (10.70.1.13:53830) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=113 (10.70.1.13:53808) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=93 (10.70.1.13:53762) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=108 (10.70.1.13:53746) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=146 (10.70.1.13:53780) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=85 (10.70.1.13:53738) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=104 (10.70.1.13:53748) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=89 (10.70.1.13:53732) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=101 (10.70.1.13:53770) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=122 (10.70.1.13:53786) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=91 (10.70.1.13:53800) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=124 (10.70.1.13:53744) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=99 (10.70.1.13:53716) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=96 (10.70.1.13:53702) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=75 (10.70.1.13:53688) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=109 (10.70.1.13:53924) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=87 (10.70.1.13:53672) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=71 (10.70.1.13:53662) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=121 (10.70.1.13:53640) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=69 (10.70.1.13:53618) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=83 (10.70.1.13:53592) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=90 (10.70.1.13:53608) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=118 (10.70.1.13:53570) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=84 (10.70.1.13:53564) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=116 (10.70.1.13:53556) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=86 (10.70.1.13:53536) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=88 (10.70.1.13:53510) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=141 (10.70.1.13:53490) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=74 (10.70.1.13:53482) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=139 (10.70.1.13:53446) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=81 (10.70.1.13:53430) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=115 (10.70.1.13:53400) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=126 (10.70.1.13:53700) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=143 (10.70.1.13:53682) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=80 (10.70.1.13:53650) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=119 (10.70.1.13:53624) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=82 (10.70.1.13:53612) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=100 (10.70.1.13:53586) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=97 (10.70.1.13:53568) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=70 (10.70.1.13:53566) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=72 (10.70.1.13:53552) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=102 (10.70.1.13:53520) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=138 (10.70.1.13:53504) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=98 (10.70.1.13:53488) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=140 (10.70.1.13:53472) disconnected after 60.0s
+2026-11-03T00:37:02.383Z 9859 [VERBOSE] Client id=92 (10.70.1.13:53462) disconnected after 60.0s
+2026-11-03T00:37:02.384Z 9859 [VERBOSE] Client id=76 (10.70.1.13:53458) disconnected after 60.0s
+2026-11-03T00:37:02.384Z 9859 [VERBOSE] Client id=94 (10.70.1.13:53422) disconnected after 60.0s
+2026-11-03T00:37:02.384Z 9859 [VERBOSE] Client id=78 (10.70.1.13:53388) disconnected after 60.0s
+2026-11-03T00:37:02.384Z 9859 [VERBOSE] Client id=73 (10.70.1.13:53414) disconnected after 60.0s
+2026-11-03T00:37:02.384Z 9859 [VERBOSE] Client id=79 (10.70.1.13:53372) disconnected after 60.0s
+2026-11-03T00:37:02.384Z 9859 [VERBOSE] Client id=145 (10.70.1.13:53370) disconnected after 60.0s
+2026-11-03T00:37:03.915Z 9859 [INFO] AOF: auto-checkpoint: 74.68 MB is 100%+ above the 10.24 MB baseline — folding into dump.kdb
+2026-11-03T00:37:05.258Z 9859 [INFO] AOF: rebased onto dump.kdb (generation 6) — log is now the delta
+2026-11-03T00:37:09.866Z 9859 [VERBOSE] Client id=204 connected from 127.0.0.1:33348
+2026-11-03T00:37:09.887Z 9859 [VERBOSE] Client id=204 (127.0.0.1:33348) disconnected after 0.0s
+2026-11-03T00:37:19.944Z 9859 [VERBOSE] Client id=205 connected from 127.0.0.1:58728
+2026-11-03T00:37:19.965Z 9859 [VERBOSE] Client id=205 (127.0.0.1:58728) disconnected after 0.0s
+2026-11-03T00:37:30.022Z 9859 [VERBOSE] Client id=206 connected from 127.0.0.1:56270
+2026-11-03T00:37:30.043Z 9859 [VERBOSE] Client id=206 (127.0.0.1:56270) disconnected after 0.0s
+2026-11-03T00:37:32.390Z 9859 [VERBOSE] Client id=207 connected from 10.70.1.13:47814
+2026-11-03T00:37:32.391Z 9859 [VERBOSE] Client id=207 (10.70.1.13:47814) disconnected after 0.0s
+2026-11-03T00:37:32.406Z 9859 [VERBOSE] Client id=208 connected from 10.70.1.13:47828
+2026-11-03T00:37:32.407Z 9859 [VERBOSE] Client id=208 (10.70.1.13:47828) disconnected after 0.0s
+2026-11-03T00:37:32.411Z 9859 [VERBOSE] Client id=209 connected from 10.70.1.13:47840
+2026-11-03T00:37:32.412Z 9859 [VERBOSE] Client id=209 (10.70.1.13:47840) disconnected after 0.0s
+2026-11-03T00:37:32.423Z 9859 [VERBOSE] Client id=210 connected from 10.70.1.13:47846
+2026-11-03T00:37:32.423Z 9859 [VERBOSE] Client id=210 (10.70.1.13:47846) disconnected after 0.0s
+2026-11-03T00:37:32.542Z 9859 [VERBOSE] Client id=211 connected from 10.70.1.13:47860
+2026-11-03T00:37:32.542Z 9859 [VERBOSE] Client id=211 (10.70.1.13:47860) disconnected after 0.0s
+2026-11-03T00:37:32.656Z 9859 [VERBOSE] Client id=212 connected from 10.70.1.13:47874
+2026-11-03T00:37:32.657Z 9859 [VERBOSE] Client id=212 (10.70.1.13:47874) disconnected after 0.0s
+2026-11-03T00:37:32.771Z 9859 [VERBOSE] Client id=213 connected from 10.70.1.13:47886
+2026-11-03T00:37:32.771Z 9859 [VERBOSE] Client id=213 (10.70.1.13:47886) disconnected after 0.0s
+2026-11-03T00:37:32.886Z 9859 [VERBOSE] Client id=214 connected from 10.70.1.13:47902
+2026-11-03T00:37:32.887Z 9859 [VERBOSE] Client id=214 (10.70.1.13:47902) disconnected after 0.0s
+2026-11-03T00:37:33.000Z 9859 [VERBOSE] Client id=215 connected from 10.70.1.13:41768
+2026-11-03T00:37:33.000Z 9859 [VERBOSE] Client id=215 (10.70.1.13:41768) disconnected after 0.0s
+2026-11-03T00:37:33.117Z 9859 [VERBOSE] Client id=216 connected from 10.70.1.13:41782
+2026-11-03T00:37:33.118Z 9859 [VERBOSE] Client id=216 (10.70.1.13:41782) disconnected after 0.0s
+2026-11-03T00:37:33.235Z 9859 [VERBOSE] Client id=217 connected from 10.70.1.13:41784
+2026-11-03T00:37:33.236Z 9859 [VERBOSE] Client id=217 (10.70.1.13:41784) disconnected after 0.0s
+2026-11-03T00:37:33.353Z 9859 [VERBOSE] Client id=218 connected from 10.70.1.13:41796
+2026-11-03T00:37:33.353Z 9859 [VERBOSE] Client id=218 (10.70.1.13:41796) disconnected after 0.0s
+2026-11-03T00:37:33.469Z 9859 [VERBOSE] Client id=219 connected from 10.70.1.13:41808
+2026-11-03T00:37:33.470Z 9859 [VERBOSE] Client id=219 (10.70.1.13:41808) disconnected after 0.0s
+2026-11-03T00:37:33.585Z 9859 [VERBOSE] Client id=220 connected from 10.70.1.13:41812
+2026-11-03T00:37:33.585Z 9859 [VERBOSE] Client id=220 (10.70.1.13:41812) disconnected after 0.0s
+2026-11-03T00:37:33.698Z 9859 [VERBOSE] Client id=221 connected from 10.70.1.13:41818
+2026-11-03T00:37:33.698Z 9859 [VERBOSE] Client id=221 (10.70.1.13:41818) disconnected after 0.0s
+2026-11-03T00:37:33.818Z 9859 [VERBOSE] Client id=222 connected from 10.70.1.13:41828
+2026-11-03T00:37:33.818Z 9859 [VERBOSE] Client id=222 (10.70.1.13:41828) disconnected after 0.0s
+2026-11-03T00:37:33.895Z 9859 [INFO] SIGTERM received — shutting down gracefully
+2026-11-03T00:37:33.895Z 9859 [INFO] Writing final snapshot...
+2026-11-03T00:37:35.230Z 9859 [INFO] AOF: rebased onto dump.kdb (generation 7) — log is now the delta
+2026-11-03T00:37:35.230Z 9859 [INFO] Goodbye.
+=== restart 2026-11-03T00:37:36Z
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc7 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc7
+  * Mode           : standalone
+  * OS             : linux x86_64
+  * Memory         : 15GiB available
+  * CPUs           : 4 cores detected
+  * Listening on   : 0.0.0.0:6379
+  * Worker threads : 2
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-03T00:37:36.522Z 10996 [INFO] KiviDB 1.2.0-rc7 starting: pid 10996, default build, config file '/mnt/kv/node.conf'
+2026-11-03T00:37:36.522Z 10996 [INFO] I/O model      : io_uring
+2026-11-03T00:37:36.523Z 10996 [INFO] Shards per DB  : 32
+2026-11-03T00:37:36.523Z 10996 [INFO] I/O model      : io_uring
+2026-11-03T00:37:36.523Z 10996 [INFO] Found dump.kdb — loading native snapshot
+2026-11-03T00:37:38.137Z 10996 [INFO] Loaded 453198 keys from snapshot (0 with a TTL)
+2026-11-03T00:37:38.137Z 10996 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+2026-11-03T00:37:38.139Z 10996 [INFO] Replication: Loaded dataset is offset 575482483 of this node's stream 4c385c75f72877ced74f51fb5504c7608f6c2b2f — replicas stopped cleanly with it can be continued
+2026-11-03T00:37:38.140Z 10996 [INFO] Ready to accept connections on 0.0.0.0:6379
+2026-11-03T00:37:38.207Z 10996 [VERBOSE] Client id=1 connected from 10.70.1.13:42436
+2026-11-03T00:37:38.208Z 10996 [VERBOSE] Client id=1 (10.70.1.13:42436) disconnected after 0.0s
+2026-11-03T00:37:38.292Z 10996 [VERBOSE] Client id=2 connected from 10.70.1.13:42448
+2026-11-03T00:37:38.293Z 10996 [INFO] Replication: Partial resync for 10.70.1.13:42448: continuing from offset 575482483 (0 bytes of backlog)
+2026-11-03T00:37:38.320Z 10996 [VERBOSE] Client id=3 connected from 10.70.1.13:42456
+2026-11-03T00:37:38.321Z 10996 [VERBOSE] Client id=3 (10.70.1.13:42456) disconnected after 0.0s
+2026-11-03T00:37:38.437Z 10996 [VERBOSE] Client id=4 connected from 10.70.1.13:42462
+2026-11-03T00:37:38.437Z 10996 [VERBOSE] Client id=4 (10.70.1.13:42462) disconnected after 0.0s
+2026-11-03T00:37:38.552Z 10996 [VERBOSE] Client id=5 connected from 10.70.1.13:42464
+2026-11-03T00:37:38.552Z 10996 [VERBOSE] Client id=5 (10.70.1.13:42464) disconnected after 0.0s
+2026-11-03T00:37:38.667Z 10996 [VERBOSE] Client id=6 connected from 10.70.1.13:42472
+2026-11-03T00:37:38.668Z 10996 [VERBOSE] Client id=6 (10.70.1.13:42472) disconnected after 0.0s
+2026-11-03T00:37:38.785Z 10996 [VERBOSE] Client id=7 connected from 10.70.1.13:42488
+2026-11-03T00:37:38.786Z 10996 [VERBOSE] Client id=7 (10.70.1.13:42488) disconnected after 0.0s
+2026-11-03T00:37:38.902Z 10996 [VERBOSE] Client id=8 connected from 10.70.1.13:42502
+2026-11-03T00:37:38.903Z 10996 [VERBOSE] Client id=8 (10.70.1.13:42502) disconnected after 0.0s
+2026-11-03T00:37:39.020Z 10996 [VERBOSE] Client id=9 connected from 10.70.1.13:42516
+2026-11-03T00:37:39.020Z 10996 [VERBOSE] Client id=9 (10.70.1.13:42516) disconnected after 0.0s
+2026-11-03T00:37:39.140Z 10996 [VERBOSE] Client id=10 connected from 10.70.1.13:42528
+2026-11-03T00:37:39.140Z 10996 [VERBOSE] Client id=10 (10.70.1.13:42528) disconnected after 0.0s
+2026-11-03T00:37:39.265Z 10996 [VERBOSE] Client id=11 connected from 10.70.1.13:42536
+2026-11-03T00:37:39.265Z 10996 [VERBOSE] Client id=11 (10.70.1.13:42536) disconnected after 0.0s
+2026-11-03T00:37:39.380Z 10996 [VERBOSE] Client id=12 connected from 10.70.1.13:42542
+2026-11-03T00:37:39.381Z 10996 [VERBOSE] Client id=12 (10.70.1.13:42542) disconnected after 0.0s
+2026-11-03T00:37:40.101Z 10996 [VERBOSE] Client id=13 connected from 127.0.0.1:52094
+2026-11-03T00:37:40.120Z 10996 [VERBOSE] Client id=13 (127.0.0.1:52094) disconnected after 0.0s
+2026-11-03T00:37:50.177Z 10996 [VERBOSE] Client id=14 connected from 127.0.0.1:34692
+2026-11-03T00:37:50.195Z 10996 [VERBOSE] Client id=14 (127.0.0.1:34692) disconnected after 0.0s

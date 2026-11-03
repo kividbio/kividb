@@ -1,0 +1,68 @@
+2026-11-02T20:37:33.347Z 1 [INFO] KiviDB 1.2.0-rc7 starting: pid 1, default build, config file '/etc/kividb/kividb.conf'
+2026-11-02T20:37:33.348Z 1 [INFO] I/O model      : io_uring
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc7 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc7
+  * Mode           : cluster
+  * OS             : linux x86_64
+  * Memory         : 15GiB available
+  * CPUs           : 4 cores detected
+  * Listening on   : 0.0.0.0:6380
+  * Cluster bus    : 0.0.0.0:16380
+  * Node timeout   : 5000ms
+  * Node ID        : (printed after cluster init)
+  * Worker threads : 2
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : /etc/kividb/acl/users.acl
+
+2026-11-02T20:37:33.357Z 1 [INFO] ACL file loaded: /etc/kividb/acl/users.acl
+2026-11-02T20:37:33.358Z 1 [INFO] Cluster: Node ID        : 025ecbf714617b2988d6cc9043cf65b8aa254982
+2026-11-02T20:37:33.358Z 1 [INFO] Cluster: Bus port       : 16380
+2026-11-02T20:37:33.358Z 1 [INFO] Shards per DB  : 32
+2026-11-02T20:37:33.358Z 1 [INFO] I/O model      : io_uring
+2026-11-02T20:37:33.358Z 1 [INFO] Found dump.kdb — loading native snapshot
+2026-11-02T20:37:33.497Z 1 [INFO] Loaded 166496 keys from snapshot (0 with a TTL)
+2026-11-02T20:37:33.497Z 1 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+2026-11-02T20:37:33.505Z 1 [INFO] Replication: Loaded dataset is offset 11465248 of this node's stream 07c8502f6f939437da5185d2dde9c81b8a584add — replicas stopped cleanly with it can be continued
+2026-11-02T20:37:33.505Z 1 [INFO] Cluster: Bus listener bound on 0.0.0.0:16380
+2026-11-02T20:37:33.505Z 1 [INFO] Cluster: Heartbeat loop started (interval 1s)
+2026-11-02T20:37:33.505Z 1 [INFO] Cluster: Failure detection started (interval 100ms, node_timeout 5000ms)
+2026-11-02T20:37:33.506Z 1 [INFO] Ready to accept connections on 0.0.0.0:6380
+2026-11-02T20:37:34.622Z 1 [INFO] Replication: Channel replica registered: 10.244.1.80:48542
+2026-11-02T20:37:34.637Z 1 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub
+2026-11-02T20:37:44.132Z 1 [INFO] CONFIG SET cluster-announce-hostname shd-2-1.shd-2-headless.e2e.svc
+2026-11-02T20:38:50.455Z 1 [INFO] Cluster: Voted for a1ef059d3573dcf6bc7596e3032a5c28277d3b44 to take over from 74c05250af0b705a50e8932ed6ee8cfca95dc8fe at epoch 15 (manual failover)

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # sampler.sh <port> <pid-file> <out.csv> [interval_s]
 # Every interval (10 s): process RSS and CPU, INFO memory / replication / persistence / keyspace of the server on this host.
+# rc7 soak copy: also value slab bytes / live bytes, the replica link, loading, expired keys and fields, AOF rewrite state.
 set -u
 PORT=$1 PIDF=$2 OUT=$3 IV=${4:-10}
-echo "ts,rss_kb,cpu_pct,used_memory,used_memory_rss,keys,expires,master_repl_offset,replica_offset,replica_lag_bytes,role,aof_size,aof_acks_before_write,aof_rewrites,connected_slaves,sync_full,sync_partial_ok" > "$OUT"
+echo "ts,rss_kb,cpu_pct,used_memory,used_memory_rss,keys,expires,master_repl_offset,replica_offset,replica_lag_bytes,role,aof_size,aof_acks_before_write,aof_rewrites,connected_slaves,sync_full,sync_partial_ok,value_slab_bytes,value_slab_live_bytes,master_link_status,loading,expired_keys,expired_fields,aof_rewrite_in_progress,mem_fragmentation_ratio,aof_lost_records,aof_last_write_status" > "$OUT"
 f() { echo "$INFO" | awk -F: -v k="$1" '$1==k{print $2; exit}'; }
 prev_cpu=0 prev_t=0
 HZ=$(getconf CLK_TCK)
@@ -28,6 +29,6 @@ while :; do
   fi
   lag=""
   [ -n "$moff" ] && [ -n "$roff" ] && lag=$((moff - roff))
-  echo "$now,$rss,$cpu,$(f used_memory),$(f used_memory_rss),${ks:-,},$moff,$roff,$lag,$role,$(f aof_current_size),$(f aof_acks_before_write),$(f aof_rewrites),$(f connected_slaves),$(f sync_full),$(f sync_partial_ok)" >> "$OUT"
+  echo "$now,$rss,$cpu,$(f used_memory),$(f used_memory_rss),${ks:-,},$moff,$roff,$lag,$role,$(f aof_current_size),$(f aof_acks_before_write),$(f aof_rewrites),$(f connected_slaves),$(f sync_full),$(f sync_partial_ok),$(f value_slab_bytes),$(f value_slab_live_bytes),$(f master_link_status),$(f loading),$(f expired_keys),$(f expired_subkeys),$(f aof_rewrite_in_progress),$(f mem_fragmentation_ratio),$(f aof_lost_records),$(f aof_last_write_status)" >> "$OUT"
   sleep "$IV"
 done

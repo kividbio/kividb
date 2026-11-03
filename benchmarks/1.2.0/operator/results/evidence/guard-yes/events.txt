@@ -1,0 +1,16 @@
+2026-11-02T21:21:31Z   Normal    Killing                  g-yes-1                         Stopping container kividb
+2026-11-02T21:21:31Z   Normal    Killing                  g-yes-1                         Stopping container agent
+2026-11-02T21:21:31Z   Normal    SuccessfulCreate         g-yes                           Create Pod g-yes-1 in StatefulSet g-yes successful
+2026-11-02T21:21:31Z   Normal    Scheduled                g-yes-1                         Successfully assigned e2e/g-yes-1 to aks-nodepool1-15662409-vmss000002
+2026-11-02T21:21:31Z   Warning   FailedAttachVolume       g-yes-1                         Waiting for detach for volume "pvc-b86df386-5c4b-4788-8e68-91fcc64560e7" Volume is already exclusively attached to one node, waiting on detach before it can be attached to another node
+2026-11-02T21:21:32Z   Warning   Unhealthy                g-yes-1                         Readiness probe failed: Get "http://10.244.0.23:8081/readyz": EOF
+2026-11-02T21:21:32Z   Warning   Unhealthy                g-yes-1                         Liveness probe failed: Get "http://10.244.0.23:8081/livez": EOF
+2026-11-02T21:21:32Z   Warning   FailedPreStopHook        g-yes-1                         PreStopHook failed
+2026-11-02T21:21:32Z   Warning   FailedPreStopHook        g-yes-1                         PreStopHook failed
+2026-11-02T21:21:56Z   Normal    SuccessfulAttachVolume   g-yes-1                         AttachVolume.Attach succeeded for volume "pvc-b86df386-5c4b-4788-8e68-91fcc64560e7" 
+2026-11-02T21:21:56Z   Normal    Pulled                   g-yes-1                         Container image "ghcr.io/kividbio/kividb:v1.2.0-rc7" already present on machine and can be accessed by the pod
+2026-11-02T21:21:56Z   Normal    Created                  g-yes-1                         Container created
+2026-11-02T21:21:56Z   Normal    Started                  g-yes-1                         Container started
+2026-11-02T21:21:56Z   Normal    Pulled                   g-yes-1                         Container image "ACR.azurecr.io/kividb-operator-agent:0.7.0-afc6f49" already present on machine and can be accessed by the pod
+2026-11-02T21:21:56Z   Normal    Created                  g-yes-1                         Container created
+2026-11-02T21:21:56Z   Normal    Started                  g-yes-1                         Container started
