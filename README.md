@@ -60,6 +60,12 @@ As of October 2026. Something out of date or wrong? Please [open an issue](https
 
 ## Performance
 
+<a href="assets/benchmarks/1.2.0/kividb-1.2.0-benchmarks.mp4">
+  <img src="assets/benchmarks/1.2.0/kividb-1.2.0-benchmarks.webp" alt="KiviDB 1.2.0 against Garnet, Dragonfly, Redis, Redis Cluster and Valkey: throughput, latency, MSET, memory, snapshots and vector search" width="720">
+</a>
+
+*KiviDB 1.2.0 against Garnet, Dragonfly, Redis, Redis Cluster and Valkey. Click for the full-resolution video.*
+
 KiviDB 1.2.0 was measured in November 2026 on Azure VMs against Redis 8.10, Redis Cluster,
 Valkey 9.1, Dragonfly 2.0, Garnet 2.2 and kvrocks 2.17, each on the same machines in the same
 hour, with p50/p99/p99.9 latency from two load generators.
@@ -82,13 +88,57 @@ Where KiviDB loses: Garnet is faster on `SET` at pipeline 16 and on `MSET`; Redi
 values; Redis ingests vectors faster and serves 3-9% more cache reads a second. These are
 cloud VMs, so absolute numbers are lower than on the bare-metal machines below.
 
+<details>
+<summary>The charts</summary>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/1.2.0/throughput-pipelined-dark.png">
+  <img src="assets/benchmarks/1.2.0/throughput-pipelined-light.png" alt="Throughput at pipeline 16, GET and SET, 100-byte values" width="720">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/1.2.0/throughput-unpipelined-dark.png">
+  <img src="assets/benchmarks/1.2.0/throughput-unpipelined-light.png" alt="Throughput without pipelining, GET and SET" width="720">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/1.2.0/latency-p99-pipelined-dark.png">
+  <img src="assets/benchmarks/1.2.0/latency-p99-pipelined-light.png" alt="p99 latency at pipeline 16" width="720">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/1.2.0/mset-dark.png">
+  <img src="assets/benchmarks/1.2.0/mset-light.png" alt="MSET of 10 keys" width="720">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/1.2.0/memory-per-key-dark.png">
+  <img src="assets/benchmarks/1.2.0/memory-per-key-light.png" alt="Memory per key, 50M keys of 100 bytes" width="720">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/1.2.0/snapshot-memory-dark.png">
+  <img src="assets/benchmarks/1.2.0/snapshot-memory-light.png" alt="Memory added by BGSAVE under writes" width="720">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/1.2.0/vector-qps-recall-dark.png">
+  <img src="assets/benchmarks/1.2.0/vector-qps-recall-light.png" alt="Vector search: queries per second against recall" width="720">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/1.2.0/vector-filtered-dark.png">
+  <img src="assets/benchmarks/1.2.0/vector-filtered-light.png" alt="Filtered vector search, 100 clients" width="720">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/1.2.0/vector-ingest-dark.png">
+  <img src="assets/benchmarks/1.2.0/vector-ingest-light.png" alt="Vector ingest and index build" width="720">
+</picture>
+
+</details>
+
 ### Earlier runs: KiviDB 1.1 on bare metal
-
-<a href="assets/benchmarks/kividb-benchmarks.mp4">
-  <img src="assets/benchmarks/kividb-benchmarks.webp" alt="KiviDB benchmarks: throughput, latency, vector search and vector ingest" width="720">
-</a>
-
-*KiviDB 1.1.0: throughput, latency, vector search and vector ingest. Click for the full-resolution video.*
 
 The figures in this section are from one session in October 2026 on AWS Graviton3 bare metal: the
 server on a `c7gn.metal` (64 vCPU), confined to 32 cores, and the load generator on a
