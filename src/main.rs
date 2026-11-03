@@ -765,7 +765,6 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     // just like the AOF writer, so it never competes with the io_uring workers.
     let hub_tx = {
         let repl_state_hub = Arc::clone(&repl_state);
-        let max_backlog_bytes = config.repl_replica_max_backlog_bytes;
         let (tx, rx) = std::sync::mpsc::sync_channel::<crate::replication::HubTx>(1);
         std::thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread()
@@ -773,7 +772,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                 .build()
                 .unwrap()
                 .block_on(async move {
-                    let hub_tx = start_hub(repl_state_hub, max_backlog_bytes);
+                    let hub_tx = start_hub(repl_state_hub);
                     tx.send(hub_tx).unwrap();
                     // Keep this runtime alive forever — the hub task lives here
                     std::future::pending::<()>().await;
@@ -1588,10 +1587,7 @@ async fn async_main_tokio(
     // handed this channel directly. See `aof::install_global_aof_sender`.
     aof::install_global_aof_sender(Box::new(aof_tx.clone()));
     let repl_state = Arc::new(ReplState::from_config(&config));
-    let hub_tx = start_hub(
-        Arc::clone(&repl_state),
-        config.repl_replica_max_backlog_bytes,
-    );
+    let hub_tx = start_hub(Arc::clone(&repl_state));
     crate::stats::spawn_instantaneous_ops_sampler();
     let latency = crate::latency::new_latency_tracker();
     crate::commands::helpers::spawn_active_expire_task(

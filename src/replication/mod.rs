@@ -177,6 +177,12 @@ pub struct ReplState {
     /// (0 = keep the backlog for ever).
     pub backlog_size: AtomicU64,
     pub backlog_ttl_secs: AtomicU64,
+    /// `repl-replica-max-backlog-bytes`: the most the master queues for a
+    /// replica that is streaming before it drops it; and
+    /// `repl-replica-sync-max-backlog-bytes`, the most it queues for one
+    /// during its full sync (#305). See [`start_hub`].
+    pub replica_max_backlog_bytes: AtomicU64,
+    pub replica_sync_max_backlog_bytes: AtomicU64,
     /// Master side: what `INFO` reports about the backlog. Written by the hub.
     pub backlog_first_offset: AtomicU64,
     pub backlog_histlen: AtomicU64,
@@ -381,6 +387,10 @@ pub struct ReplicaProgress {
     /// Where the replica is between asking for a sync and following the
     /// stream ([`ReplicaState`] as a `u8`).
     state: AtomicU8,
+    /// The bytes queued for it and not yet taken by its forwarder, shared
+    /// with the hub (`HubMsg::RegisterChannel::pending_bytes`). Set once the
+    /// hub feeds it.
+    queue: std::sync::OnceLock<Arc<AtomicU64>>,
 }
 
 impl ReplicaProgress {
@@ -391,7 +401,16 @@ impl ReplicaProgress {
             acked: AtomicU64::new(base),
             last_ack_ms: AtomicU64::new(unix_ms()),
             state: AtomicU8::new(ReplicaState::WaitBgsave as u8),
+            queue: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Bytes queued for this replica that its connection has not taken yet:
+    /// `queued` in `INFO replication`.
+    pub fn queued(&self) -> u64 {
+        self.queue
+            .get()
+            .map_or(0, |queue| queue.load(Ordering::Relaxed))
     }
 
     pub fn state(&self) -> ReplicaState {
@@ -474,6 +493,8 @@ impl ReplState {
             backlog_active: AtomicBool::new(false),
             backlog_size: AtomicU64::new(1024 * 1024),
             backlog_ttl_secs: AtomicU64::new(3600),
+            replica_max_backlog_bytes: AtomicU64::new(256 * 1024 * 1024),
+            replica_sync_max_backlog_bytes: AtomicU64::new(1024 * 1024 * 1024),
             backlog_first_offset: AtomicU64::new(0),
             backlog_histlen: AtomicU64::new(0),
             sync_full: AtomicU64::new(0),
@@ -690,6 +711,13 @@ impl ReplState {
         state
             .backlog_ttl_secs
             .store(config.repl_backlog_ttl, Ordering::Relaxed);
+        state
+            .replica_max_backlog_bytes
+            .store(config.repl_replica_max_backlog_bytes, Ordering::Relaxed);
+        state.replica_sync_max_backlog_bytes.store(
+            config.repl_replica_sync_max_backlog_bytes,
+            Ordering::Relaxed,
+        );
         state.hll_write_redis.store(
             config.hll_write_format.eq_ignore_ascii_case("redis"),
             Ordering::Relaxed,
@@ -1955,11 +1983,26 @@ pub type HubTx = mpsc::UnboundedSender<HubMsg>;
 /// Spawn the replication hub task. Returns the sender used to
 /// register replicas and to propagate write commands.
 ///
-/// `max_replica_backlog_bytes` bounds how much unflushed data the hub will queue for
-/// any single replica (see [`HubMsg::RegisterChannel::pending_bytes`]). A replica that
-/// can't keep up — slow network, stalled disk, wedged process — gets disconnected once
-/// its queue crosses this line instead of growing the master's memory without bound.
-pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx {
+/// `repl-replica-max-backlog-bytes` (`ReplState::replica_max_backlog_bytes`)
+/// bounds how much unflushed data the hub will queue for any single replica
+/// (see [`HubMsg::RegisterChannel::pending_bytes`]). A replica that can't keep
+/// up — slow network, stalled disk, wedged process — gets disconnected once its
+/// queue crosses this line instead of growing the master's memory without
+/// bound.
+///
+/// A replica in a full sync has its own, larger bound,
+/// `repl-replica-sync-max-backlog-bytes` (#305). Everything written while its
+/// dataset is sent and loaded waits in its queue: it reads nothing of the
+/// stream until it has loaded, and has it all to read then. Held to the
+/// streaming limit, a large dataset under heavy writes never synced: the queue
+/// passed the limit before the load was done, the replica was dropped, and the
+/// sync began again, for as long as the writes lasted. The sync's bound holds
+/// from the cut until the replica, having loaded the dataset and acknowledged
+/// it, has drained its queue to a quarter of the streaming limit; the
+/// streaming limit holds from then on. Both are read for each write, so `CONFIG SET` changes
+/// them for replicas already attached. The master logs how far each
+/// replica's queue went during its sync.
+pub fn start_hub(state: Arc<ReplState>) -> HubTx {
     let (hub_tx, mut hub_rx) = mpsc::unbounded_channel::<HubMsg>();
     let _ = state.hub.set(hub_tx.downgrade());
     // For the heartbeat, which the hub sends to itself. Weak, so that the hub
@@ -2107,6 +2150,7 @@ pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx
                             offset,
                         );
                         progress.set_state(ReplicaState::Online);
+                        let _ = progress.queue.set(Arc::clone(&registration.pending_bytes));
                         let missed_len = missed.len() as u64;
                         let delivered = missed.is_empty() || {
                             registration
@@ -2131,6 +2175,8 @@ pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx
                             tx: registration.tx,
                             pending_bytes: registration.pending_bytes,
                             progress,
+                            syncing: false,
+                            peak: missed_len,
                         });
                         if reply.send(Ok(())).is_err() {
                             // The connection went away while it was asking.
@@ -2173,7 +2219,17 @@ pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx
 
                 HubMsg::Deregister(replica_id) => {
                     // Tear down registration (client disconnect / rollback).
-                    channel_replicas.retain(|r| r.id != replica_id);
+                    channel_replicas.retain(|r| {
+                        if r.id == replica_id && r.syncing {
+                            log_info!(
+                                "Replication: Replica {} left during its full sync; its queue \
+                                 peaked at {} bytes",
+                                r.addr,
+                                r.peak
+                            );
+                        }
+                        r.id != replica_id
+                    });
                     forget_replica(&state, replica_id);
                 }
                 HubMsg::DropReplicas => {
@@ -2247,12 +2303,17 @@ pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx
                     // then. Done here for registrations that did not come
                     // through it.
                     let progress = state.register_replica(replica_id, peer_ip, peer_port, base);
+                    let _ = progress.queue.set(Arc::clone(&pending_bytes));
                     channel_replicas.push(ChannelReplica {
                         id: replica_id,
                         addr: addr.clone(),
                         tx,
                         pending_bytes,
                         progress,
+                        // In its full sync until it has loaded the dataset
+                        // and drained what was queued meanwhile.
+                        syncing: true,
+                        peak: 0,
                     });
                     log_info!("Replication: Channel replica registered: {addr}");
                 }
@@ -2287,7 +2348,13 @@ pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx
                     // but capped in bytes below so a replica that never catches up can't hold
                     // an unbounded amount of undelivered data in master memory).
                     let mut alive_channels = Vec::with_capacity(channel_replicas.len());
-                    for replica in channel_replicas.drain(..) {
+                    // Read for each write, so that `CONFIG SET` applies at once.
+                    let streaming_limit = state.replica_max_backlog_bytes.load(Ordering::Relaxed);
+                    let sync_limit = state
+                        .replica_sync_max_backlog_bytes
+                        .load(Ordering::Relaxed)
+                        .max(streaming_limit);
+                    for mut replica in channel_replicas.drain(..) {
                         // Account for the payload *before* handing it over. The
                         // forwarder subtracts as soon as it has the payload, and
                         // it runs on another thread: counting afterwards let it
@@ -2311,7 +2378,13 @@ pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx
                             .sent
                             .fetch_add(payload.len() as u64, Ordering::Relaxed);
 
-                        if now_pending > max_replica_backlog_bytes {
+                        replica.peak = replica.peak.max(now_pending);
+                        let limit = if replica.syncing {
+                            sync_limit
+                        } else {
+                            streaming_limit
+                        };
+                        if now_pending > limit {
                             // Replica isn't draining its queue fast enough — evict rather than
                             // let the backlog grow without bound. Dropping `tx` here (by not
                             // pushing it back into `channel_replicas`) closes its forwarder's
@@ -2321,10 +2394,36 @@ pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx
                             forget_replica(&state, replica.id);
                             log_warn!(
                                 "Replication: Channel replica {} exceeded backlog limit \
-                                 ({now_pending} > {max_replica_backlog_bytes} bytes) — evicting",
-                                replica.addr
+                                 ({now_pending} > {limit} bytes{}) — evicting",
+                                replica.addr,
+                                if replica.syncing {
+                                    ", repl-replica-sync-max-backlog-bytes, during its full sync"
+                                } else {
+                                    ""
+                                }
                             );
                             continue;
+                        }
+                        // The sync is over once the replica has loaded the
+                        // dataset (it acknowledges only then) and drained
+                        // its queue to a quarter of the streaming limit.
+                        // Not at the limit itself: a replica still draining
+                        // dips under it and climbs back over it as it
+                        // pauses (its own AOF checkpoint holds its applier
+                        // for a second or two), and was dropped moments
+                        // after its sync had ended.
+                        if replica.syncing
+                            && now_pending <= streaming_limit / 4
+                            && replica.progress.state() == ReplicaState::Online
+                        {
+                            replica.syncing = false;
+                            log_info!(
+                                "Replication: Replica {} is streaming: its queue peaked at {} \
+                                 bytes during the full sync (repl-replica-sync-max-backlog-bytes \
+                                 {sync_limit}, repl-replica-max-backlog-bytes {streaming_limit})",
+                                replica.addr,
+                                replica.peak
+                            );
                         }
 
                         alive_channels.push(replica);
@@ -2502,6 +2601,11 @@ struct ChannelReplica {
     tx: mpsc::UnboundedSender<ReplPayload>,
     pending_bytes: Arc<AtomicU64>,
     progress: Arc<ReplicaProgress>,
+    /// In its full sync: held to `repl-replica-sync-max-backlog-bytes`
+    /// rather than `repl-replica-max-backlog-bytes`. See [`start_hub`].
+    syncing: bool,
+    /// The most that has been queued for it at once.
+    peak: u64,
 }
 
 /// Drop every trace of a replica from the shared state. Idempotent: the
@@ -3724,8 +3828,6 @@ mod replication_invariants_tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    const TEST_MAX_BACKLOG_BYTES: u64 = 256 * 1024 * 1024;
-
     async fn await_connected(state: &ReplState, want: i64) {
         for _ in 0..5000 {
             if state.connected_replicas.load(Ordering::Relaxed) == want {
@@ -3743,7 +3845,7 @@ mod replication_invariants_tests {
     #[tokio::test]
     async fn hub_register_channel_increments_connected_replicas() {
         let state = Arc::new(ReplState::new_master());
-        let hub = start_hub(Arc::clone(&state), TEST_MAX_BACKLOG_BYTES);
+        let hub = start_hub(Arc::clone(&state));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ReplPayload>();
 
         hub.send(HubMsg::RegisterChannel {
@@ -3766,7 +3868,7 @@ mod replication_invariants_tests {
     #[tokio::test]
     async fn hub_second_deregister_is_idempotent_for_counter() {
         let state = Arc::new(ReplState::new_master());
-        let hub = start_hub(Arc::clone(&state), TEST_MAX_BACKLOG_BYTES);
+        let hub = start_hub(Arc::clone(&state));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ReplPayload>();
 
         hub.send(HubMsg::RegisterChannel {
@@ -3795,7 +3897,7 @@ mod replication_invariants_tests {
     #[tokio::test]
     async fn hub_propagate_drops_replica_when_channel_closed() {
         let state = Arc::new(ReplState::new_master());
-        let hub = start_hub(Arc::clone(&state), TEST_MAX_BACKLOG_BYTES);
+        let hub = start_hub(Arc::clone(&state));
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ReplPayload>();
 
         hub.send(HubMsg::RegisterChannel {
@@ -3827,7 +3929,14 @@ mod replication_invariants_tests {
     async fn hub_propagate_evicts_replica_exceeding_backlog_limit() {
         let state = Arc::new(ReplState::new_master());
         const TINY_LIMIT: u64 = 100; // bytes
-        let hub = start_hub(Arc::clone(&state), TINY_LIMIT);
+        // Both limits: the replica is registered as in a full sync.
+        state
+            .replica_max_backlog_bytes
+            .store(TINY_LIMIT, Ordering::Relaxed);
+        state
+            .replica_sync_max_backlog_bytes
+            .store(TINY_LIMIT, Ordering::Relaxed);
+        let hub = start_hub(Arc::clone(&state));
         // Receiver is never drained — simulates a replica that can't keep up.
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ReplPayload>();
 
@@ -3854,6 +3963,104 @@ mod replication_invariants_tests {
             state.replica_acks.lock().get(&9004).is_none(),
             "evicted replica's ACK row should be removed"
         );
+    }
+
+    async fn barrier(hub: &super::HubTx) {
+        let (done, wait) = tokio::sync::oneshot::channel();
+        hub.send(HubMsg::Barrier(done)).unwrap();
+        wait.await.unwrap();
+    }
+
+    fn register_syncing(hub: &super::HubTx, id: u64, pending: &Arc<AtomicU64>) -> ReplRx {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ReplPayload>();
+        hub.send(HubMsg::RegisterChannel {
+            addr: format!("replica-{id}"),
+            peer_ip: "127.0.0.1".into(),
+            peer_port: id as u16,
+            tx,
+            replica_id: id,
+            pending_bytes: Arc::clone(pending),
+            base: 0,
+        })
+        .unwrap();
+        rx
+    }
+
+    type ReplRx = tokio::sync::mpsc::UnboundedReceiver<ReplPayload>;
+
+    /// A replica in its full sync reads nothing of the stream until it has
+    /// loaded the dataset, so what is written meanwhile waits in its queue:
+    /// it is held to `repl-replica-sync-max-backlog-bytes`, not to the
+    /// streaming limit (#305). Once it has acknowledged the dataset and
+    /// drained its queue, the streaming limit holds.
+    #[tokio::test]
+    async fn a_full_sync_has_its_own_queue_limit_until_the_replica_streams() {
+        let state = Arc::new(ReplState::new_master());
+        state
+            .replica_max_backlog_bytes
+            .store(100, Ordering::Relaxed);
+        state
+            .replica_sync_max_backlog_bytes
+            .store(1000, Ordering::Relaxed);
+        let hub = start_hub(Arc::clone(&state));
+        let pending = Arc::new(AtomicU64::new(0));
+        let mut rx = register_syncing(&hub, 9005, &pending);
+        await_connected(&state, 1).await;
+
+        // 500 bytes while it loads: over the streaming limit, under the sync's.
+        for _ in 0..10 {
+            propagate(&hub, vec![0u8; 50]);
+        }
+        barrier(&hub).await;
+        assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 1);
+        assert_eq!(state.replica(9005).unwrap().queued(), 500);
+
+        // Loaded and acknowledged; its connection takes what was queued.
+        hub.send(HubMsg::AckOffset {
+            replica_id: 9005,
+            offset: 0,
+        })
+        .unwrap();
+        while rx.try_recv().is_ok() {}
+        pending.store(0, Ordering::Relaxed);
+        // The next write finds it streaming (its queue is a quarter of the
+        // streaming limit or less)...
+        propagate(&hub, vec![0u8; 20]);
+        barrier(&hub).await;
+        assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 1);
+        // ...and from then on the streaming limit holds.
+        for _ in 0..3 {
+            propagate(&hub, vec![0u8; 50]);
+        }
+        await_connected(&state, 0).await;
+    }
+
+    /// The sync's allowance is a bound too: the master's memory stays bounded
+    /// for a replica that never finishes loading.
+    #[tokio::test]
+    async fn a_full_sync_past_its_queue_limit_is_dropped() {
+        let state = Arc::new(ReplState::new_master());
+        state
+            .replica_max_backlog_bytes
+            .store(100, Ordering::Relaxed);
+        state
+            .replica_sync_max_backlog_bytes
+            .store(1000, Ordering::Relaxed);
+        let hub = start_hub(Arc::clone(&state));
+        let pending = Arc::new(AtomicU64::new(0));
+        let _rx = register_syncing(&hub, 9006, &pending);
+        await_connected(&state, 1).await;
+        for _ in 0..19 {
+            propagate(&hub, vec![0u8; 50]);
+        }
+        barrier(&hub).await;
+        assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 1);
+        // `CONFIG SET` applies to a replica already attached.
+        state
+            .replica_sync_max_backlog_bytes
+            .store(500, Ordering::Relaxed);
+        propagate(&hub, vec![0u8; 50]);
+        await_connected(&state, 0).await;
     }
 
     #[test]
@@ -4168,7 +4375,7 @@ mod replication_invariants_tests {
     #[tokio::test]
     async fn wait_targets_ignore_writes_the_replica_was_never_sent() {
         let state = Arc::new(ReplState::new_master());
-        let hub = start_hub(Arc::clone(&state), TEST_MAX_BACKLOG_BYTES);
+        let hub = start_hub(Arc::clone(&state));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ReplPayload>();
 
         // FULLRESYNC announced offset 0, then 500 bytes of writes happened

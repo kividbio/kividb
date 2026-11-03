@@ -480,6 +480,23 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **A full sync of a large dataset under heavy writes completes** (#305).
+  A replica reads nothing of the write stream while it receives and loads
+  the dataset, so the master queues everything written meanwhile, and it
+  dropped the replica once that queue passed
+  `repl-replica-max-backlog-bytes` (256 MB). With 3.4M keys under 100k
+  writes a second, the queue passed it before every load was done, and the
+  sync began again for as long as the writes lasted (13 syncs in the
+  1.2.0-rc7 soak, none finished). A full sync now has its own bound,
+  `repl-replica-sync-max-backlog-bytes` (default 1 GB), from the cut until
+  the replica has loaded the dataset and drained its queue to a quarter of
+  `repl-replica-max-backlog-bytes`; the streaming limit holds from then
+  on. Both can be changed with `CONFIG SET` (the streaming limit could
+  not), and apply at once to the replicas attached. The master logs how far
+  each replica's queue went during its sync, and `INFO replication` shows
+  what is queued for each replica (`queued=` on its `slaveN` line). In
+  1.1.x too.
+
 - **A master stopped cleanly continues its replicas after the restart**
   (#306). A master saves where its write stream stands at the cut of its
   final save, and continues a replica after the restart only if the

@@ -118,10 +118,7 @@ async fn server_tokio(
     // handed this channel directly. See `aof::install_global_aof_sender`.
     aof::install_global_aof_sender(Box::new(aof_tx.clone()));
     let repl_state = Arc::new(ReplState::from_config(&config));
-    let hub_tx = start_hub(
-        Arc::clone(&repl_state),
-        config.repl_replica_max_backlog_bytes,
-    );
+    let hub_tx = start_hub(Arc::clone(&repl_state));
     crate::stats::spawn_instantaneous_ops_sampler();
     let latency = crate::latency::new_latency_tracker();
     crate::commands::helpers::spawn_active_expire_task(

@@ -328,9 +328,18 @@ pub struct Config {
     /// Max bytes a master will queue for a single replica that isn't keeping up
     /// (analogous to Redis's `client-output-buffer-limit slave <hard-limit>`).
     /// Once exceeded the replica is disconnected — it must full-resync to catch
-    /// back up — rather than letting the queue grow without bound.
+    /// back up — rather than letting the queue grow without bound. Settable at
+    /// runtime.
     #[arg(long, default_value_t = 268_435_456)]
     pub repl_replica_max_backlog_bytes: u64,
+
+    /// Max bytes a master will queue for a replica during its full sync, from
+    /// the cut until the replica has loaded the dataset and drained its queue
+    /// to a quarter of `repl-replica-max-backlog-bytes`. The replica reads nothing of the
+    /// stream while it loads, so everything written meanwhile waits in the
+    /// queue (#305). The larger of the two applies. Settable at runtime.
+    #[arg(long, default_value_t = 1_073_741_824)]
+    pub repl_replica_sync_max_backlog_bytes: u64,
 
     /// Bytes of the write stream a master keeps for replicas that reconnect
     /// (Redis `repl-backlog-size`). A replica that was away for less than
@@ -584,6 +593,7 @@ impl Default for Config {
             update_check_url: crate::update_check::DEFAULT_URL.into(),
             notify_keyspace_events: String::new(),
             repl_replica_max_backlog_bytes: 268_435_456,
+            repl_replica_sync_max_backlog_bytes: 1_073_741_824,
             repl_backlog_size: 1024 * 1024,
             repl_backlog_ttl: 3600,
             repl_diskless_load: "disabled".into(),
@@ -703,6 +713,7 @@ impl Config {
             update_check_url: crate::update_check::DEFAULT_URL.into(),
             notify_keyspace_events: String::new(),
             repl_replica_max_backlog_bytes: 268_435_456,
+            repl_replica_sync_max_backlog_bytes: 1_073_741_824,
             repl_backlog_size: 1024 * 1024,
             repl_backlog_ttl: 3600,
             repl_diskless_load: "disabled".into(),
@@ -1075,6 +1086,10 @@ impl Config {
         out.push_str(&format!(
             "repl-replica-max-backlog-bytes {}\n",
             self.repl_replica_max_backlog_bytes
+        ));
+        out.push_str(&format!(
+            "repl-replica-sync-max-backlog-bytes {}\n",
+            self.repl_replica_sync_max_backlog_bytes
         ));
         if !self.masterauth.is_empty() {
             out.push_str(&format!("masterauth {}\n", quote(&self.masterauth)));
@@ -1512,6 +1527,12 @@ impl Config {
             ),
             "repl-replica-max-backlog-bytes" => {
                 set!(repl_replica_max_backlog_bytes, parse_memory(key, one()?)?)
+            }
+            "repl-replica-sync-max-backlog-bytes" => {
+                set!(
+                    repl_replica_sync_max_backlog_bytes,
+                    parse_memory(key, one()?)?
+                )
             }
             "repl-backlog-size" => set!(repl_backlog_size, parse_memory(key, one()?)?),
             "repl-backlog-ttl" => set!(repl_backlog_ttl, number(key, one()?)?),
@@ -2167,6 +2188,7 @@ mod config_file_tests {
             cluster-require-full-coverage no\ncluster-replica-validity-factor 1\n\
             cluster-slot-migration-handoff-max-lag-bytes 1\n\
             cluster-slot-migration-write-pause-timeout 1\nrepl-replica-max-backlog-bytes 1\n\
+            repl-replica-sync-max-backlog-bytes 1\n\
             masterauth a\nmasteruser u\nrepl-timeout 1\nshutdown-timeout 1\n\
             repl-ping-replica-period 1\n\
             min-replicas-to-write 1\nmin-replicas-max-lag 1\n\

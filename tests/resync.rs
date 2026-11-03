@@ -272,6 +272,9 @@ struct Relay {
     /// While set, nothing is carried from the master, and the connections
     /// stay open: the replica is connected, and receives nothing.
     paused: Arc<AtomicBool>,
+    /// A connection that has carried this many bytes from the master
+    /// pauses the relay. `u64::MAX`: none does.
+    pause_at: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Relay {
@@ -282,11 +285,13 @@ impl Relay {
         let live: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
         let budget = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
         let paused = Arc::new(AtomicBool::new(false));
-        let (open_bg, live_bg, budget_bg, paused_bg) = (
+        let pause_at = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let (open_bg, live_bg, budget_bg, paused_bg, pause_at_bg) = (
             Arc::clone(&open),
             Arc::clone(&live),
             Arc::clone(&budget),
             Arc::clone(&paused),
+            Arc::clone(&pause_at),
         );
         std::thread::spawn(move || {
             for client in listener.incoming().flatten() {
@@ -314,6 +319,7 @@ impl Relay {
                         (upstream.try_clone().unwrap(), client.try_clone().unwrap());
                     let budget = budget_bg.load(Ordering::SeqCst);
                     let paused = Arc::clone(&paused_bg);
+                    let pause_at = Arc::clone(&pause_at_bg);
                     std::thread::spawn(move || {
                         let mut carried = 0u64;
                         let mut buf = [0u8; 16 * 1024];
@@ -333,6 +339,9 @@ impl Relay {
                             if carried >= budget {
                                 break;
                             }
+                            if carried >= pause_at.load(Ordering::SeqCst) {
+                                paused.store(true, Ordering::SeqCst);
+                            }
                         }
                         let _ = to.shutdown(Shutdown::Both);
                         let _ = from.shutdown(Shutdown::Both);
@@ -348,7 +357,15 @@ impl Relay {
             live,
             budget,
             paused,
+            pause_at,
         }
+    }
+
+    /// Pause, as [`Self::pause`] does, once a connection has carried this
+    /// many bytes from the master: in the middle of a full sync's payload,
+    /// for one larger than that.
+    fn pause_after(&self, bytes: u64) {
+        self.pause_at.store(bytes, Ordering::SeqCst);
     }
 
     /// Carry nothing more from the master until [`Self::resume`], with the
@@ -358,6 +375,7 @@ impl Relay {
     }
 
     fn resume(&self) {
+        self.pause_at.store(u64::MAX, Ordering::SeqCst);
         self.paused.store(false, Ordering::SeqCst);
     }
 
@@ -716,6 +734,117 @@ fn a_shutdown_waits_for_a_silent_replica_no_longer_than_shutdown_timeout() {
         master.log()
     );
     relay.resume();
+}
+
+/// `queued=` of the master's `slave0` line, or `None` while it has none.
+fn queued(master: &mut Conn) -> Option<u64> {
+    let info = master.cmd(&["INFO", "replication"]);
+    let row = info
+        .s()
+        .lines()
+        .find(|l| l.starts_with("slave0:"))?
+        .to_string();
+    row.split(',')
+        .find_map(|kv| kv.strip_prefix("queued="))
+        .map(|n| n.trim().parse().unwrap())
+}
+
+/// A master whose replica's full sync is held up by `pause_after`, with
+/// 20 MB in its dataset and `repl-replica-max-backlog-bytes` 1 MB; and 4 MB
+/// written while the replica can read nothing.
+fn full_sync_with_writes_queued(sync_limit: &str) -> (Server, Relay, Server) {
+    let master = Server::start(&["--repl-replica-max-backlog-bytes", "1048576"]);
+    let mut m = master.conn();
+    assert!(
+        m.cmd(&[
+            "CONFIG",
+            "SET",
+            "repl-replica-sync-max-backlog-bytes",
+            sync_limit
+        ])
+        .ok()
+    );
+    let value = "v".repeat(1000);
+    for i in 0..20_000 {
+        assert!(m.cmd(&["SET", &format!("base:{i}"), &value]).ok());
+    }
+    let relay = Relay::to(master.port);
+    // The handshake goes through, and the payload stops part-way.
+    relay.pause_after(64 * 1024);
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &relay.port.to_string()]);
+    wait_until("the master to register its replica", || {
+        queued(&mut m).is_some()
+    });
+    for i in 0..4_000 {
+        assert!(m.cmd(&["SET", &format!("during:{i}"), &value]).ok());
+    }
+    assert!(m.cmd(&["INCR", "counter"]).i() > 0);
+    (master, relay, replica)
+}
+
+/// A full sync completes even though what is written while the replica
+/// receives and loads the dataset is more than `repl-replica-max-backlog-bytes`
+/// (#305): the replica reads nothing of the stream until it has loaded, and
+/// the sync has an allowance of its own, `repl-replica-sync-max-backlog-bytes`.
+/// It used to be dropped at the streaming limit and start again, for as long
+/// as the writes lasted. Both limits can be changed at runtime, and `INFO`
+/// shows what is queued for each replica.
+#[test]
+fn a_full_sync_has_room_for_the_writes_made_while_it_loads() {
+    let (master, relay, replica) = full_sync_with_writes_queued("64mb");
+    let mut m = master.conn();
+    assert_eq!(
+        m.cmd(&["CONFIG", "GET", "repl-replica-sync-max-backlog-bytes"])
+            .arr()[1]
+            .s(),
+        "67108864"
+    );
+    assert_eq!(
+        m.cmd(&["CONFIG", "GET", "repl-replica-max-backlog-bytes"])
+            .arr()[1]
+            .s(),
+        "1048576"
+    );
+    let waiting = queued(&mut m).unwrap();
+    assert!(waiting > 1024 * 1024, "queued={waiting}");
+
+    relay.resume();
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    assert_same_dataset(&mut m, &mut r);
+    assert_eq!(m.stat("sync_full"), 1, "{}", master.log());
+    // The queue's peak is logged once the replica streams, at the next write.
+    assert!(m.cmd(&["INCR", "counter"]).i() > 0);
+    wait_until("the master to log the sync's queue peak", || {
+        master.log().contains("is streaming: its queue peaked at")
+    });
+    assert!(!master.log().contains("exceeded backlog limit"));
+    assert!(
+        m.cmd(&["CONFIG", "SET", "repl-replica-max-backlog-bytes", "2mb"])
+            .ok()
+    );
+    assert_eq!(
+        m.cmd(&["CONFIG", "GET", "repl-replica-max-backlog-bytes"])
+            .arr()[1]
+            .s(),
+        "2097152"
+    );
+}
+
+/// The sync's allowance is a bound: past it the replica is dropped, as a
+/// streaming one is past its own, and the master's memory stays bounded.
+#[test]
+fn a_full_sync_past_its_own_queue_limit_is_dropped_and_tried_again() {
+    let (master, relay, replica) = full_sync_with_writes_queued("1mb");
+    let mut m = master.conn();
+    wait_until("the master to drop the replica", || {
+        master.log().contains("during its full sync) — evicting")
+    });
+    relay.resume();
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    assert_same_dataset(&mut m, &mut r);
+    assert!(m.stat("sync_full") >= 2, "{}", master.log());
 }
 
 /// A master killed outright and started from its AOF knows nothing of where

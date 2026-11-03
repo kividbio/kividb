@@ -771,13 +771,7 @@ fn config_set_refuses_unknown_and_startup_only_settings() {
     );
     assert_eq!(get(&mut c, "bogus-name"), None);
 
-    for name in [
-        "threads",
-        "io-model",
-        "aof",
-        "repl-replica-max-backlog-bytes",
-        "backupdirname",
-    ] {
+    for name in ["threads", "io-model", "aof", "backupdirname"] {
         let reply = c.cmds(&["CONFIG", "SET", name, "1000"]);
         assert!(
             matches!(&reply, RespValue::Error(e) if e == &format!(
@@ -787,20 +781,22 @@ fn config_set_refuses_unknown_and_startup_only_settings() {
             "{name}: {reply:?}"
         );
     }
-    assert_eq!(
-        get(&mut c, "repl-replica-max-backlog-bytes").as_deref(),
-        Some("268435456")
-    );
+    assert_eq!(get(&mut c, "backupdirname").as_deref(), Some("backupdir"));
     // To what it already is, is no change.
     assert!(
-        c.cmds(&[
-            "CONFIG",
-            "SET",
-            "repl-replica-max-backlog-bytes",
-            "268435456"
-        ])
-        .is_ok()
+        c.cmds(&["CONFIG", "SET", "backupdirname", "backupdir"])
+            .is_ok()
     );
+    // The replicas' queue limits can be changed (#305).
+    for name in [
+        "repl-replica-max-backlog-bytes",
+        "repl-replica-sync-max-backlog-bytes",
+    ] {
+        assert!(c.cmds(&["CONFIG", "SET", name, "512mb"]).is_ok(), "{name}");
+        assert_eq!(get(&mut c, name).as_deref(), Some("536870912"), "{name}");
+        let reply = c.cmds(&["CONFIG", "SET", name, "0"]);
+        assert!(reply.is_error(), "{name}: {reply:?}");
+    }
     // One refused takes the others back with it.
     let reply = c.cmds(&["CONFIG", "SET", "hz", "20", "bogus-name", "1"]);
     assert!(reply.is_error(), "{reply:?}");
