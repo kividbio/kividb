@@ -5463,6 +5463,29 @@ fn script_cmd(ctx: &mut Ctx) -> Vec<u8> {
         },
         "KILL" => kill_running(false),
         "DEBUG" => resp_simple("OK"),
+        "HELP" if ctx.cmd.len() == 2 => crate::commands::server::help(
+            "SCRIPT",
+            &[
+                (
+                    "DEBUG (YES|SYNC|NO)",
+                    "Set the debug mode for subsequent scripts executed.",
+                ),
+                (
+                    "EXISTS <sha1> [<sha1> ...]",
+                    "Return information about the existence of the scripts in the script cache.",
+                ),
+                (
+                    "FLUSH [ASYNC|SYNC]",
+                    "Flush the Lua scripts cache and reset the scripting VM.",
+                ),
+                ("KILL", "Kill the currently executing Lua script."),
+                (
+                    "LOAD <script>",
+                    "Load a script into the scripts cache without executing it.",
+                ),
+                ("RESET", "Reset the Lua scripting VMs (EVAL and functions)."),
+            ],
+        ),
         _ => resp_error(&format!(
             "ERR unknown subcommand '{}' for SCRIPT",
             sub.to_lowercase()

@@ -2049,3 +2049,25 @@ fn a_script_may_not_run_noscript_commands() {
     assert_eq!(c.cmds(&["PING"]), RespValue::SimpleStr("PONG".into()));
     assert!(c.cmds(&["CLIENT", "GETNAME"]).is_nil());
 }
+
+/// `SCRIPT HELP` lists the subcommands, as `FUNCTION HELP` does; it was an
+/// unknown subcommand (#256).
+#[test]
+fn test_script_help_lists_subcommands() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let RespValue::Array(lines) = c.cmds(&["SCRIPT", "HELP"]) else {
+        panic!("SCRIPT HELP did not reply with an array");
+    };
+    let lines: Vec<&str> = lines.iter().map(|line| line.as_str()).collect();
+    assert!(lines[0].starts_with("SCRIPT <subcommand>"), "{lines:?}");
+    for sub in ["LOAD <script>", "EXISTS <sha1>", "FLUSH", "KILL", "HELP"] {
+        assert!(
+            lines.iter().any(|line| line.starts_with(sub)),
+            "{sub} missing: {lines:?}"
+        );
+    }
+}
