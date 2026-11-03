@@ -29,6 +29,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A key-by-key reshard under load could lose acknowledged writes (#331).**
+  A write was routed ("is the key here?") before it entered the write gate.
+  If a whole `MIGRATE` of its key ran in between, the write then ran on the
+  source, on a key that had left, and made it again. The client got a wrong
+  reply, later writes went to a copy no client was routed to, and the
+  reshard stopped on `BUSYKEY`. Finishing it dropped the source's copy, or
+  `MIGRATE ... REPLACE` overwrote the destination's value with it: either
+  way, acknowledged writes were lost. A write now checks inside the gate
+  whether keys have left the node, or a slot has changed state, since it
+  was routed. If so, it is routed again there and sent on with `-ASK`. The
+  same holds for `EXEC` and for scripts. Ordinary commands still pay one
+  atomic load. `CLUSTER MIGRATION IMPORT` was not affected.
+- **`MIGRATE` no longer answers `TRYAGAIN` for an unchanged hash whose field
+  is about to expire (#332).** The check that a moved hash was not written
+  meanwhile compared the server's fields by the monotonic clock and the
+  payload's fields by a time rounded down by up to 2 ms. In a field's last
+  2 ms, an unchanged hash looked written, and `redis-cli --cluster reshard`
+  stopped. No data was lost. Both sides are now compared by one clock and
+  one rule: a field within 5 ms of its time may be missing on either side.
 - **`SCRIPT HELP` lists the `SCRIPT` subcommands, as in Redis.** It was an
   unknown subcommand (#256).
 
