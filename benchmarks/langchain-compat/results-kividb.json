@@ -1,0 +1,211 @@
+{
+  "label": "kividb",
+  "url": "redis://127.0.0.1:6380",
+  "redis_version": "8.10.0",
+  "langchain_redis": "0.2.6",
+  "counts": {
+    "PASS": 33,
+    "WARN": 0,
+    "FAIL": 0
+  },
+  "checks": [
+    {
+      "check": "connection: PING",
+      "status": "PASS",
+      "detail": true,
+      "ms": 0
+    },
+    {
+      "check": "vectorstore [FLAT]: FT.CREATE and add_texts",
+      "status": "PASS",
+      "detail": "",
+      "ms": 6
+    },
+    {
+      "check": "vectorstore [FLAT]: nearest neighbour is the query itself",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "vectorstore [FLAT]: scores ascend, exact match near 0",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vectorstore [FLAT]: metadata comes back",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vectorstore [FLAT]: tag filter",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vectorstore [FLAT]: numeric filter",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "vectorstore [FLAT]: tag and numeric filter together",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vectorstore [FLAT]: as_retriever",
+      "status": "PASS",
+      "detail": "",
+      "ms": 3
+    },
+    {
+      "check": "vectorstore [FLAT]: max marginal relevance",
+      "status": "PASS",
+      "detail": "",
+      "ms": 3
+    },
+    {
+      "check": "vectorstore [FLAT]: add then delete",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2
+    },
+    {
+      "check": "vectorstore [FLAT]: get_by_ids",
+      "status": "PASS",
+      "detail": "",
+      "ms": 3
+    },
+    {
+      "check": "vectorstore [FLAT]: from_existing_index",
+      "status": "PASS",
+      "detail": "",
+      "ms": 4
+    },
+    {
+      "check": "vectorstore [HNSW]: FT.CREATE and add_texts",
+      "status": "PASS",
+      "detail": "",
+      "ms": 6
+    },
+    {
+      "check": "vectorstore [HNSW]: nearest neighbour is the query itself",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "vectorstore [HNSW]: scores ascend, exact match near 0",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "vectorstore [HNSW]: metadata comes back",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "vectorstore [HNSW]: tag filter",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "vectorstore [HNSW]: numeric filter",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "vectorstore [HNSW]: tag and numeric filter together",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "vectorstore [HNSW]: as_retriever",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "vectorstore [HNSW]: max marginal relevance",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "vectorstore [HNSW]: add then delete",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2
+    },
+    {
+      "check": "vectorstore [HNSW]: get_by_ids",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2
+    },
+    {
+      "check": "vectorstore [HNSW]: from_existing_index",
+      "status": "PASS",
+      "detail": "",
+      "ms": 4
+    },
+    {
+      "check": "llm cache: update then lookup",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "llm cache: another model does not hit",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "llm cache: clear",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "semantic cache: update then a close prompt hits",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "semantic cache: an exact prompt hits",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "semantic cache: a far prompt misses",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "chat history: messages read back in order",
+      "status": "PASS",
+      "detail": "",
+      "ms": 3
+    },
+    {
+      "check": "chat history: clear",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2
+    }
+  ]
+}
