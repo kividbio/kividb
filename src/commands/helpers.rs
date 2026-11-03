@@ -609,7 +609,8 @@ pub fn spawn_active_expire_task(
     // Where the keys it expires are told (see `expiry`).
     crate::expiry::register(&store, repl_state, hub_tx);
     crate::vector::register_index_store(&store, &index_store);
-    // Whatever was loaded at startup that has field TTLs.
+    // Whatever the store already holds that has field TTLs. At startup that
+    // is nothing yet: the dataset is loaded after this, and rescanned then.
     crate::field_expiry::rescan(&store);
     let parts = expiry_threads();
     for part in 0..parts {
