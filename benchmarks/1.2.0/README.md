@@ -4,9 +4,12 @@ Everything measured for the 1.2.0 release, on Azure VMs and AKS, from 2026-11-01
 
 - **The full benchmark runs** used commit `75482abb`, the code of 1.2.0-rc7, against Redis, Redis Cluster, Valkey, Dragonfly, Garnet and kvrocks.
 - **Every suite was then rerun** on 1.2.0-rc8 (`082dab3d`), alternating with rc7 on the same VMs, in each suite's `rc8/` folder.
-- **The core strings ran again** on 1.2.0-rc10 (`39bfacd2`), the code that ships as 1.2.0, in `core/rc10/`.
+- **Every suite ran once more** on 1.2.0-rc10 (`39bfacd2`), the code that ships as 1.2.0, alternating with rc8 on the same VMs, in each suite's `rc10/` folder.
 
-rc9 and rc10 changed only replication, cluster and shutdown code, plus `MIGRATE`. rc10's instruction counts per command are rc9's to within 0.05%, and its throughput is rc8's.
+rc9 and rc10 changed only replication, cluster and shutdown code, plus `MIGRATE`. In the rc10 round:
+- every suite is level with rc8, and bytes per key are identical: the 64 MB `repl-backlog-size` is never allocated without a replica;
+- instructions per command in KiviDB's own code are within 0.4%;
+- the #202 cache test under `allkeys-lru` leans about 1% lower on two VM pairs, inside the 0.98-1.02 that pairs of identical code measure in that suite.
 
 Each folder holds the harness that produced its numbers, the raw results, the charts, and a README. The README gives the hardware, the exact versions and flags of every engine, how to run it again, and what the numbers mean. Where KiviDB loses, the README says so and why.
 

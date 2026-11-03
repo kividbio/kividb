@@ -1,0 +1,26 @@
+Writing results to stdout
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   4.653s  (user 2.186s, sys 2.467s)
+  Wall time:        1.485s
+  Cores used:       3.133   (avg 39.1% across 8 worker threads)
+  Peak utilization: 322.7%
+setting requests to 31250
+8         Threads
+8         Connections per thread
+31250     Requests per client
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      1393192.31          ---          ---         1.46123         1.41500         2.51100         7.00700   1459102.88 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    1393192.31         0.00         0.00         1.46123         1.41500         2.51100         7.00700   1459102.88 
