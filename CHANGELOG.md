@@ -480,6 +480,15 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **A replica stopped in the middle of a full sync keeps its last good
+  dump.** Its shutdown saved whatever it held, which in a full sync is part
+  of the master's dataset or, with the default `repl-diskless-load`,
+  nothing: a replica stopped while loading wrote a dump with 0 keys over its
+  last good one, and its disk held no data until the next sync was done
+  (seen in the 1.2.0-rc8 Kubernetes run). While a full sync is replacing
+  the dataset, the final save is now skipped, with a warning: `dump.kdb`
+  and its resync point stay as they were, and the next start syncs again.
+
 - **A master handed over by `CLUSTER FAILOVER` is continued by its
   successor.** After a manual failover (the Kubernetes operator's graceful
   handover), the old master became a replica of the promoted one and was

@@ -137,6 +137,8 @@ struct Server {
     dir: PathBuf,
     child: Child,
     args: Vec<String>,
+    /// Environment of its own, for the test hooks.
+    env: Vec<(String, String)>,
 }
 
 /// Whether nothing has `port`. It is asked with a socket that is bound and
@@ -176,6 +178,10 @@ fn free_port() -> u16 {
 }
 
 fn kividb(dir: &Path, port: u16, extra: &[String]) -> Child {
+    kividb_with(dir, port, extra, &[])
+}
+
+fn kividb_with(dir: &Path, port: u16, extra: &[String], env: &[(String, String)]) -> Child {
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -196,6 +202,7 @@ fn kividb(dir: &Path, port: u16, extra: &[String]) -> Child {
             "kividb.conf",
         ])
         .args(extra)
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(log)
@@ -205,15 +212,24 @@ fn kividb(dir: &Path, port: u16, extra: &[String]) -> Child {
 
 impl Server {
     fn start(extra: &[&str]) -> Self {
+        Self::start_with_env(extra, &[])
+    }
+
+    fn start_with_env(extra: &[&str], env: &[(&str, &str)]) -> Self {
         let dir = tempfile::tempdir().unwrap().keep();
         let port = free_port();
         let args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
-        let child = kividb(&dir, port, &args);
+        let env: Vec<(String, String)> = env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let child = kividb_with(&dir, port, &args, &env);
         let server = Server {
             port,
             dir,
             child,
             args,
+            env,
         };
         assert_eq!(server.conn().cmd(&["PING"]).s(), "PONG");
         server
@@ -244,7 +260,7 @@ impl Server {
     }
 
     fn restart(&mut self) {
-        self.child = kividb(&self.dir, self.port, &self.args);
+        self.child = kividb_with(&self.dir, self.port, &self.args, &self.env);
         assert_eq!(self.conn().cmd(&["PING"]).s(), "PONG");
     }
 }
@@ -845,6 +861,65 @@ fn a_full_sync_past_its_own_queue_limit_is_dropped_and_tried_again() {
     wait_link_up(&mut r);
     assert_same_dataset(&mut m, &mut r);
     assert!(m.stat("sync_full") >= 2, "{}", master.log());
+}
+
+/// A replica stopped in the middle of a full sync, with its dataset dropped
+/// and the master's not yet loaded, does not save that over its last good
+/// dump: `dump.kdb` and its resync point stay as they were, and the next
+/// start syncs again. It used to write a dump of what it held then, empty
+/// or in part, and a restart loaded that.
+#[cfg(unix)]
+#[test]
+fn a_replica_stopped_during_a_full_sync_keeps_its_last_good_dump() {
+    // 16 KiB of backlog: the replica's restart cannot be continued.
+    let master = Server::start(&["--repl-backlog-size", "16384"]);
+    let port = master.port.to_string();
+    let mut replica = Server::start_with_env(
+        &["--replicaof", "127.0.0.1", &port],
+        &[("KIVIDB_TEST_FULL_SYNC_LOAD_DELAY_MS", "4000")],
+    );
+    let mut m = master.conn();
+    write_batch(&mut m, 0, 200);
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    assert_same_dataset(&mut m, &mut r);
+    drop(r);
+    replica.shutdown();
+    let good = std::fs::read(replica.dir.join("dump.kdb")).unwrap();
+    let point = std::fs::read(replica.dir.join("dump.kdb.repl")).unwrap();
+
+    write_batch(&mut m, 1, 400); // more than the backlog holds
+    replica.restart();
+    let mut r = replica.conn();
+    wait_until("the replica to be loading the full sync", || {
+        r.info("replication", "master_sync_in_progress") == "1"
+    });
+    let pid = replica.child.id().to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while replica.child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the replica did not exit");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        replica.log().contains("the final save is skipped"),
+        "{}",
+        replica.log()
+    );
+    assert!(std::fs::read(replica.dir.join("dump.kdb")).unwrap() == good);
+    assert!(std::fs::read(replica.dir.join("dump.kdb.repl")).unwrap() == point);
+
+    // Started again, it syncs again.
+    replica.restart();
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    assert_same_dataset(&mut m, &mut r);
 }
 
 /// A master killed outright and started from its AOF knows nothing of where
@@ -1549,6 +1624,7 @@ fn function_libraries_load_from_a_redis_dump_rdb() {
         child: kividb(&dir, port, &[]),
         dir,
         args: Vec::new(),
+        env: Vec::new(),
     };
     let mut c = server.conn();
     assert_eq!(

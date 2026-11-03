@@ -2715,6 +2715,31 @@ pub fn end_stream_for_shutdown(state: &ReplState) {
     drop(crate::write_gate::cut());
 }
 
+/// Shutdown, just before the final save: the dataset may be saved, and stays
+/// as it is until the save is done (while the guard lives); or `None`, while
+/// a full sync is replacing this replica's dataset. Its dataset is then the
+/// master's in part, or nothing at all (the default `repl-diskless-load`
+/// drops the old one first), and a save would write that over the last good
+/// `dump.kdb`, which the next start would load. The caller skips the save:
+/// the last dump and its resync point stay, and the next start syncs again.
+/// The guard is the lock a full sync holds from before it touches the
+/// dataset until the master's is in place, waited for briefly: other
+/// holders let go of it at once.
+pub fn dataset_for_final_save(state: &ReplState) -> Option<parking_lot::MutexGuard<'_, ()>> {
+    if state.slave_sync_in_progress.load(Ordering::SeqCst) {
+        return None;
+    }
+    let settled = state
+        .dataset_commit
+        .try_lock_for(std::time::Duration::from_secs(1))?;
+    (!state.slave_sync_in_progress.load(Ordering::SeqCst)).then_some(settled)
+}
+
+/// What a shutdown logs when [`dataset_for_final_save`] says no.
+pub const FINAL_SAVE_SKIPPED: &str = "Shutdown: this replica is in the middle of a full sync, and \
+     its dataset is only part of the master's: the final save is skipped, so that dump.kdb (and \
+     its resync point) stays the last good one. The next start syncs again";
+
 /// How long clients stay paused for a shutdown: until the process exits.
 const SHUTDOWN_PAUSE_MS: i64 = 100 * 365 * 24 * 3600 * 1000;
 

@@ -1014,6 +1014,14 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                             deadline,
                         );
                     }
+                    // Not over the last good dump with a dataset a full
+                    // sync is still replacing.
+                    let Some(_settled) =
+                        crate::replication::dataset_for_final_save(&signal_repl_state)
+                    else {
+                        log_warn!("{}", crate::replication::FINAL_SAVE_SKIPPED);
+                        std::process::exit(0);
+                    };
                     log_info!("Writing final snapshot...");
                     // With the replica's position in its master's stream
                     // beside it, so that the restart can ask to continue.
@@ -2202,6 +2210,12 @@ async fn async_main_tokio(
             if m != mode::NOW {
                 crate::replication::report_replicas_at_shutdown(&repl_c, &hub_c, started, deadline);
             }
+            // Not over the last good dump with a dataset a full sync is
+            // still replacing.
+            let Some(_settled) = crate::replication::dataset_for_final_save(&repl_c) else {
+                log_warn!("{}", crate::replication::FINAL_SAVE_SKIPPED);
+                std::process::exit(0);
+            };
             let saved = crate::replication::save_dataset(&store_c, &index_c, &repl_c);
             std::mem::forget(_no_more_commands);
             saved

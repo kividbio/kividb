@@ -1001,6 +1001,9 @@ async fn run_replication_session(
                     "Replication: Dropped the {local_keys} local keys before loading {incoming_keys} \
                      from the master"
                 );
+                if let Some(delay) = test_load_delay() {
+                    std::thread::sleep(delay);
+                }
                 load_full_sync_payload(&rdb_bytes, config.databases)?
             }
             None => {
@@ -1500,6 +1503,20 @@ fn transaction_at(buf: &[u8], scanned: &mut usize) -> StreamTransaction {
         }
     }
     StreamTransaction::Whole(whole)
+}
+
+/// For the tests of a replica stopped in the middle of a full sync, and
+/// never set otherwise: `KIVIDB_TEST_FULL_SYNC_LOAD_DELAY_MS`, how long a
+/// replica waits between dropping its dataset and loading the master's.
+fn test_load_delay() -> Option<Duration> {
+    static DELAY: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *DELAY.get_or_init(|| {
+        let ms: u64 = std::env::var("KIVIDB_TEST_FULL_SYNC_LOAD_DELAY_MS")
+            .ok()?
+            .parse()
+            .ok()?;
+        Some(Duration::from_millis(ms))
+    })
 }
 
 /// Holds `slave_sync_in_progress` for as long as it lives.
