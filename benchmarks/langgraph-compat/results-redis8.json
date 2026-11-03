@@ -1,0 +1,152 @@
+{
+  "label": "redis8",
+  "url": "redis://127.0.0.1:6399",
+  "redis_version": "8.10.3",
+  "langgraph_checkpoint_redis": "0.6.0",
+  "langgraph": "1.2.19",
+  "counts": {
+    "PASS": 23,
+    "WARN": 0,
+    "FAIL": 0
+  },
+  "checks": [
+    {
+      "check": "connection: PING",
+      "status": "PASS",
+      "detail": true,
+      "ms": 0
+    },
+    {
+      "check": "checkpointer: setup creates its indexes",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2
+    },
+    {
+      "check": "checkpointer: state persists across invocations of a thread",
+      "status": "PASS",
+      "detail": "",
+      "ms": 20
+    },
+    {
+      "check": "checkpointer: get_state returns the latest values",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "checkpointer: history lists checkpoints, newest first",
+      "status": "PASS",
+      "detail": "",
+      "ms": 3
+    },
+    {
+      "check": "checkpointer: another thread starts empty",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "checkpointer: update_state writes a new checkpoint",
+      "status": "PASS",
+      "detail": "",
+      "ms": 9
+    },
+    {
+      "check": "checkpointer: interrupt and resume (pending writes)",
+      "status": "PASS",
+      "detail": "",
+      "ms": 9
+    },
+    {
+      "check": "checkpointer: list filters on metadata and honours limit",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "checkpointer: delete_thread",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2
+    },
+    {
+      "check": "shallow checkpointer: keeps only the latest checkpoint",
+      "status": "PASS",
+      "detail": "",
+      "ms": 15
+    },
+    {
+      "check": "async checkpointer: ainvoke persists, aget_state, adelete_thread",
+      "status": "PASS",
+      "detail": "",
+      "ms": 22
+    },
+    {
+      "check": "store: put and get",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "store: a missing key is None",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "store: put again replaces the value",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "store: search by namespace prefix",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "store: search with a filter",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "store: list_namespaces",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "store: delete",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "store: put with a ttl sets an expiry",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "store (vector): semantic search finds the closest note",
+      "status": "PASS",
+      "detail": "",
+      "ms": 60
+    },
+    {
+      "check": "store (vector): semantic search with a filter",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "store (vector): limit is honoured",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    }
+  ]
+}
