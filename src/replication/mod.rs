@@ -505,7 +505,7 @@ impl ReplState {
             full_sync_guard_ratio: AtomicU64::new(50),
             master_credentials: RwLock::new((String::new(), String::new())),
             backlog_active: AtomicBool::new(false),
-            backlog_size: AtomicU64::new(1024 * 1024),
+            backlog_size: AtomicU64::new(64 * 1024 * 1024),
             backlog_ttl_secs: AtomicU64::new(3600),
             replica_max_backlog_bytes: AtomicU64::new(256 * 1024 * 1024),
             replica_sync_max_backlog_bytes: AtomicU64::new(1024 * 1024 * 1024),

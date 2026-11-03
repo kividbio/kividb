@@ -563,7 +563,14 @@ fn allkeys_lfu_keeps_a_read_set_under_a_stream_of_new_keys() {
 /// like any other deletion.
 #[test]
 fn evictions_reach_replicas() {
-    let master = Server::start(&["--maxmemory-policy", "allkeys-random"]);
+    // The backlog Redis keeps by default: it is counted in what is in use,
+    // and the 64 MB KiviDB keeps would not fit under the limit below.
+    let master = Server::start(&[
+        "--maxmemory-policy",
+        "allkeys-random",
+        "--repl-backlog-size",
+        "1048576",
+    ]);
     let replica = Server::start(&[]);
     let (mut m, mut r) = (master.conn(), replica.conn());
     assert!(
@@ -1376,7 +1383,13 @@ fn writes_during_an_aof_rewrite_evict_nothing_that_fits() {
 /// connected, over the limit for good.
 #[test]
 fn writes_during_a_full_sync_evict_nothing_that_fits() {
-    let master = Server::start_holding_snapshots(&["--maxmemory-policy", "allkeys-lru"]);
+    // A backlog that fits under the limit (see `evictions_reach_replicas`).
+    let master = Server::start_holding_snapshots(&[
+        "--maxmemory-policy",
+        "allkeys-lru",
+        "--repl-backlog-size",
+        "1048576",
+    ]);
     let replica = Server::start(&[]);
     let (mut m, mut r) = (master.conn(), replica.conn());
     let limit = m.fill_to_the_limit();

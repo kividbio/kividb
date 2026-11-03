@@ -206,6 +206,17 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Changed
 
+- **`repl-backlog-size` is 64 MB by default** (it was 1 MB, as in Redis).
+  At 100k writes a second 1 MB lasts a fraction of a second, less than a
+  replica takes to reconnect after its master restarts, so the replica was
+  sent the whole dataset (three of three clean restarts in the 1.2.0-rc9
+  tests). The backlog is kept only from a replica's first sync, or a
+  promotion, until `repl-backlog-ttl` after the last replica has gone: a
+  server that never has a replica keeps none of it. With replicas it counts
+  in `used_memory` and against `maxmemory`, as it does in Redis, and a
+  replica's queue may then grow to it before the replica is dropped: on a
+  master with a `maxmemory` of tens of megabytes, set it back to `1mb`.
+
 - **`SORT` and `SORT_RO`: a `BY` pattern with a `*` and a `GET` pattern
   other than `#` need read access to every key,** as in Redis. They read
   keys named by the sorted elements; a user whose ACL names some keys gets

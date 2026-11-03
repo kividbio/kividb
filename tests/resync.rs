@@ -769,7 +769,15 @@ fn queued(master: &mut Conn) -> Option<u64> {
 /// 20 MB in its dataset and `repl-replica-max-backlog-bytes` 1 MB; and 4 MB
 /// written while the replica can read nothing.
 fn full_sync_with_writes_queued(sync_limit: &str) -> (Server, Relay, Server) {
-    let master = Server::start(&["--repl-replica-max-backlog-bytes", "1048576"]);
+    // A backlog smaller than the queue the sync is allowed: it is the larger
+    // of the two that applies, and a replica dropped from its sync is then
+    // sent the dataset again.
+    let master = Server::start(&[
+        "--repl-replica-max-backlog-bytes",
+        "1048576",
+        "--repl-backlog-size",
+        "1048576",
+    ]);
     let mut m = master.conn();
     assert!(
         m.cmd(&[

@@ -344,7 +344,13 @@ pub struct Config {
     /// Bytes of the write stream a master keeps for replicas that reconnect
     /// (Redis `repl-backlog-size`). A replica that was away for less than
     /// this much writing is brought up to date without a full resync.
-    #[arg(long, default_value_t = 1024 * 1024)]
+    ///
+    /// 64 MB, a few seconds of heavy writing; Redis's default is 1 MB, a
+    /// fraction of a second at 100,000 writes a second, less than a replica
+    /// takes to reconnect after its master restarts. Kept only from a
+    /// replica's first sync (or a promotion) until `repl-backlog-ttl` after
+    /// the last replica has gone: a server that never had one keeps none.
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
     pub repl_backlog_size: u64,
 
     /// Seconds a master with no replicas keeps that backlog before releasing
@@ -594,7 +600,7 @@ impl Default for Config {
             notify_keyspace_events: String::new(),
             repl_replica_max_backlog_bytes: 268_435_456,
             repl_replica_sync_max_backlog_bytes: 1_073_741_824,
-            repl_backlog_size: 1024 * 1024,
+            repl_backlog_size: 64 * 1024 * 1024,
             repl_backlog_ttl: 3600,
             repl_diskless_load: "disabled".into(),
             masterauth: String::new(),
@@ -714,7 +720,7 @@ impl Config {
             notify_keyspace_events: String::new(),
             repl_replica_max_backlog_bytes: 268_435_456,
             repl_replica_sync_max_backlog_bytes: 1_073_741_824,
-            repl_backlog_size: 1024 * 1024,
+            repl_backlog_size: 64 * 1024 * 1024,
             repl_backlog_ttl: 3600,
             repl_diskless_load: "disabled".into(),
             masterauth: String::new(),
