@@ -1,0 +1,12 @@
+round,load,result,exit_s,last_log_line
+1,under load,exited,0.90,2026-11-03T08:14:13.188Z 43122 [INFO] Goodbye.
+2,under load,HUNG,31.26,2026-11-03T08:14:27.184Z 44711 [INFO] AOF: rebased onto dump.kdb (generation 6) — log is now the delta
+3,under load,HUNG,31.22,2026-11-03T08:15:15.196Z 47607 [INFO] Writing final snapshot...
+4,under load,HUNG,31.20,2026-11-03T08:16:03.892Z 50437 [INFO] Writing final snapshot...
+5,under load,exited,1.16,2026-11-03T08:16:54.023Z 53280 [INFO] Goodbye.
+6,under load,exited,1.21,2026-11-03T08:17:11.571Z 54317 [INFO] Goodbye.
+7,under load,exited,1.20,2026-11-03T08:17:29.388Z 55285 [INFO] Goodbye.
+8,under load,exited,1.26,2026-11-03T08:17:46.679Z 56322 [INFO] Goodbye.
+9,under load,exited,1.26,2026-11-03T08:18:04.566Z 57283 [INFO] Goodbye.
+10,under load,HUNG,31.19,2026-11-03T08:18:29.431Z 58321 [INFO] AOF: auto-checkpoint: 65.22 MB is 100%+ above the 19.61 MB baseline — folding into dump.kdb
+11,load stopped,exited,1.13,2026-11-03T08:19:11.870Z 61239 [INFO] Goodbye.

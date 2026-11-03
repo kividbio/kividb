@@ -1,0 +1,12 @@
+2026-11-03T07:29:10.228134659Z 2026-11-03T07:29:10.228Z 1 [INFO] Cluster: Voted for 2e4fa5855bcbaa3f27f095f776b037e66709991e to take over from 0400792f2f4c129d42e926ec8e9dd114d031d450 at epoch 12 (manual failover)
+2026-11-03T07:29:35.583786299Z 2026-11-03T07:29:35.583Z 1 [INFO] Cluster: Voted for 5fa5aeae1d47a536fc02cc0f8172fcbc3a485933 to take over from 91c7de14cffd8b51a9959a87ccaf1432f2de05a7 at epoch 13 (manual failover)
+2026-11-03T07:30:00.869648503Z 2026-11-03T07:30:00.869Z 1 [INFO] Cluster: Manual failover requested by cc71136b847ed9ab626bc92af2add3fd463b6b30 — writes paused, replica must reach offset 5304231
+2026-11-03T07:30:00.870971943Z 2026-11-03T07:30:00.870Z 1 [INFO] Cluster: Voted for cc71136b847ed9ab626bc92af2add3fd463b6b30 to take over from 5268afb5aecadead861d06e88aaa154a767b28d2 at epoch 14 (manual failover)
+2026-11-03T07:30:00.976868373Z 2026-11-03T07:30:00.976Z 1 [INFO] Cluster: Slots of this shard are now owned by cc71136b847ed9ab626bc92af2add3fd463b6b30 — following it as a replica
+2026-11-03T07:30:00.976893687Z 2026-11-03T07:30:00.976Z 1 [INFO] Replication: This node's dataset is offset 5304231 of its own stream dbedecdef75c3ac8bcf93fdc0e8376589aaa8887: a master that continues that stream can continue this node
+2026-11-03T07:30:00.977100285Z 2026-11-03T07:30:00.976Z 1 [INFO] Replication: Connecting to master <ip>:6380...
+2026-11-03T07:30:00.977543966Z 2026-11-03T07:30:00.977Z 1 [INFO] Replication: Replica <ip>:54148 disconnected: this node is now a replica itself
+2026-11-03T07:30:00.977718725Z 2026-11-03T07:30:00.977Z 1 [INFO] Replication: uring: replica disconnected
+2026-11-03T07:30:00.980062567Z 2026-11-03T07:30:00.979Z 1 [INFO] Replication: The master continues dbedecdef75c3ac8bcf93fdc0e8376589aaa8887 as 4e255bc321514222adf491b06d412ee6cd52c883
+2026-11-03T07:30:00.980078867Z 2026-11-03T07:30:00.980Z 1 [INFO] Replication: Partial resync: continuing from offset 5304231 — no dataset transfer
+2026-11-03T07:30:00.980608602Z 2026-11-03T07:30:00.980Z 1 [INFO] Replication: Synced with <ip>:6380. Entering command stream.

@@ -1,0 +1,5 @@
+2026-11-03T07:40:04.103793602Z 2026-11-03T07:40:04.103Z 1 [INFO] SIGTERM received — shutting down gracefully
+2026-11-03T07:40:04.113733784Z 2026-11-03T07:40:04.113Z 1 [INFO] Replication: Shutdown: replica <ip>:6380 has the whole stream, to offset 11186505 (10 ms); it can be continued after the restart
+2026-11-03T07:40:04.113758378Z 2026-11-03T07:40:04.113Z 1 [INFO] Writing final snapshot...
+2026-11-03T07:40:04.204738960Z 2026-11-03T07:40:04.204Z 1 [INFO] AOF: rebased onto dump.kdb (generation 5) — log is now the delta
+2026-11-03T07:40:04.204893634Z 2026-11-03T07:40:04.204Z 1 [INFO] Goodbye.

@@ -1,0 +1,7 @@
+082dab3d8929c180bccf993835e28992ea054fb5 2026-11-03 07:11:16 +0530 CI: the replication check's replica runs in a directory of its own
+version = "1.2.0-rc8"
+build seconds 335
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+cargo 1.99.1 (5f94df478 2026-08-27)
+kividb 1.2.0-rc8
+684e71afb1192a3c9f34ea74c603c32e994987701729d9c013835cc5dd75c80a  kb-rc8/kividb

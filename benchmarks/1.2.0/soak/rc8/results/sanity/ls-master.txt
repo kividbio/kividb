@@ -1,0 +1,11 @@
+total 836692
+drwxrwxr-x 2 azureuser azureuser      4096 Nov  3 05:37 .
+drwxr-xr-x 5 azureuser root           4096 Nov  3 05:17 ..
+-rw-rw-r-- 1 azureuser azureuser   5376219 Nov  3 05:41 appendonly.aof
+-rw-rw-r-- 1 azureuser azureuser        46 Nov  3 05:17 cmd
+-rw-rw-r-- 1 azureuser azureuser 851332970 Nov  3 05:37 dump.kdb
+-rw-rw-r-- 1 azureuser azureuser        24 Nov  3 05:37 dump.kdb.gen
+-rw-rw-r-- 1 azureuser azureuser         0 Nov  3 05:17 kividb.lock
+-rw-rw-r-- 1 azureuser azureuser       105 Nov  3 05:17 node.conf
+-rw-rw-r-- 1 azureuser azureuser         5 Nov  3 05:17 pid
+-rw-rw-r-- 1 azureuser azureuser     28402 Nov  3 05:37 server.log

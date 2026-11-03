@@ -1,0 +1,14 @@
+engine 1.2.0-rc9 from kividb 4a47644e: sha256:064c6a73db002923af824284c8c011bb7c0d601c816747397f281f087ccbde4b
+engine 1.2.0-rc8 from kividb 082dab3d: sha256:e3e09e5dfc110bdaf501f9eadb8e13b07246584fdd98c9e9785a438746a3745d
+  Run ID: cu3 was successful after 2m6s
+  Run ID: cu4 was successful after 6m7s
+  Run ID: cu2 was successful after 6m13s
+  Run ID: cu5 was successful after 2m37s
+  Run ID: cu1 was successful after 1m7s
+  Run ID: cu6 was successful after 3m17s
+b-agent: Run ID: cu3 was successful after 2m6s
+b-engine-rc8: Run ID: cu4 was successful after 6m7s
+b-engine-rc9: Run ID: cu2 was successful after 6m13s
+b-gui: Run ID: cu5 was successful after 2m37s
+b-loader: Run ID: cu1 was successful after 1m7s
+b-manager: Run ID: cu6 was successful after 3m17s

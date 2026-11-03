@@ -1,0 +1,10 @@
+BEGIN forcedel1 07:36:51
+forcedel1 cordoned all nodes but vmss000002 07:37:03
+forcedel1 force delete shd-0-0 07:37:03
+pod "shd-0-0" force deleted from e2e namespace
+forcedel1 new shd-0-0 on vmss000002, nodes uncordoned 07:37:06
+forcedel1 shd-0-0 Ready 07:37:18
+END forcedel1 07:38:46
+acked 777457 errors 4172 win ['07:37:03-07:37:19:4172'] slow 400 ['07:37:23.852 598ms ok=true', '07:37:19.042 5419ms ok=false', '07:37:23.882 581ms ok=true', '07:37:22.452 2020ms ok=true', '07:37:23.891 600ms ok=true', '07:37:23.121 1383ms ok=true', '07:37:23.692 820ms ok=true', '07:37:19.532 4981ms ok=true']
+errkinds Counter({'context deadline exceeded': 30})
+checked 778118 missing 0 wrong 0 readErr 0 bySec {} dbsize 778118 ex {}

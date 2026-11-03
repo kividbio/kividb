@@ -1,0 +1,42 @@
+>>> Performing Cluster Check (using node 10.80.1.8:7001)
+M: 5e84742cd41da6b89c1f98be2f8bf1fdc35afc3b 10.80.1.8:7001
+   slots:[5461-10922] (5462 slots) master
+   1 additional replica(s)
+S: 009e55cb39a9455d1cd4d20a486a8c10b13aef9c 10.80.1.8:7002
+   slots: (0 slots) slave
+   replicates 995d6d75a259c993c5b0ae137ed2703ff6cff88c
+S: 379e7c66b385cdda896090c1ff891bbaced8296e 10.80.1.9:7002
+   slots: (0 slots) slave
+   replicates edf44ebed6ce18aefdc8df9b0c66bbdc7bc6c6cb
+M: 995d6d75a259c993c5b0ae137ed2703ff6cff88c 10.80.1.9:7001
+   slots:[0-5460] (5461 slots) master
+   1 additional replica(s)
+S: dace016cae1789ce0271af18da915f0c6b6faf70 10.80.1.5:7002
+   slots: (0 slots) slave
+   replicates 5e84742cd41da6b89c1f98be2f8bf1fdc35afc3b
+M: edf44ebed6ce18aefdc8df9b0c66bbdc7bc6c6cb 10.80.1.5:7001
+   slots:[10923-16383] (5461 slots) master
+   1 additional replica(s)
+[OK] All nodes agree about slots configuration.
+>>> Check for open slots...
+>>> Check slots coverage...
+[OK] All 16384 slots covered.
+
+Ready to move 2 slots.
+  Source nodes:
+    M: 5e84742cd41da6b89c1f98be2f8bf1fdc35afc3b 10.80.1.8:7001
+       slots:[5461-10922] (5462 slots) master
+       1 additional replica(s)
+  Destination node:
+    M: edf44ebed6ce18aefdc8df9b0c66bbdc7bc6c6cb 10.80.1.5:7001
+       slots:[10923-16383] (5461 slots) master
+       1 additional replica(s)
+  Resharding plan:
+    Moving slot 5461 from 5e84742cd41da6b89c1f98be2f8bf1fdc35afc3b
+    Moving slot 5462 from 5e84742cd41da6b89c1f98be2f8bf1fdc35afc3b
+Moving slot 5461 from 10.80.1.8:7001 to 10.80.1.5:7001: .................................................................................................................
+Moving slot 5462 from 10.80.1.8:7001 to 10.80.1.5:7001: ........................................
+Node 10.80.1.8:7001 replied with error:
+TRYAGAIN a key was written while being migrated, and kept here: 'hf:5143'. The copies sent to 10.80.1.5:7001 were deleted there; MIGRATE them again
+
+clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:5143'. The copies sent to 10.80.1.5:7001 were deleted there; MIGRATE them again

@@ -1,0 +1,100 @@
+{
+ "time": 1793685878.0293086,
+ "keys_on_importing_node": [
+  "ow:{t10790}:7:1",
+  "z:11111",
+  "{tx2504}:l"
+ ],
+ "detail": {
+  "ow:{t10790}:7:1": {
+   "owner_10.80.1.5:7002": {
+    "type": "string",
+    "len": null,
+    "head": "7:502024"
+   },
+   "importing_10.80.1.5:7001": {
+    "type": "string",
+    "len": null,
+    "head": "7:495356"
+   }
+  },
+  "z:11111": {
+   "owner_10.80.1.5:7002": {
+    "type": "zset",
+    "len": 21,
+    "head": [
+     [
+      "m63",
+      0.0
+     ],
+     [
+      "m199",
+      3.0
+     ],
+     [
+      "m196",
+      5.0
+     ],
+     [
+      "m115",
+      6.0
+     ],
+     [
+      "m13",
+      6.0
+     ]
+    ]
+   },
+   "importing_10.80.1.5:7001": {
+    "type": "zset",
+    "len": 65,
+    "head": [
+     [
+      "m169",
+      0.0
+     ],
+     [
+      "m177",
+      0.0
+     ],
+     [
+      "m28",
+      0.0
+     ],
+     [
+      "m100",
+      1.0
+     ],
+     [
+      "m141",
+      2.0
+     ]
+    ]
+   }
+  },
+  "{tx2504}:l": {
+   "owner_10.80.1.5:7002": {
+    "type": "list",
+    "len": 17,
+    "head": [
+     "CDEFGHIJKLMNOPQRSTUVWXYZabcd",
+     "CDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklm",
+     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnop",
+     "LMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456",
+     "jklmnopqrstuvwxyz01234567"
+    ]
+   },
+   "importing_10.80.1.5:7001": {
+    "type": "list",
+    "len": 50,
+    "head": [
+     "DEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx",
+     "z0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+     "uvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUV",
+     "123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnop",
+     "jklmnopqrstuvwxyz0123456789AB"
+    ]
+   }
+  }
+ }
+}
