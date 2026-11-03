@@ -859,14 +859,20 @@ fn a_single_snapshot_can_be_preloaded() {
 /// is deleted when they do, like one written since: the sweep watches it.
 #[test]
 fn hashes_loaded_from_a_snapshot_lose_their_expired_fields_and_go() {
+    // Long enough that the restart below finishes before the fields are due,
+    // on a slow runner too; the wait after it counts from when they were set.
+    const TTL_MS: u64 = 10_000;
+    let ttl = TTL_MS.to_string();
+    let ttl = ttl.as_str();
     let mut server = Server::start(&[]);
     let mut c = server.conn();
+    let set_at = std::time::Instant::now();
     c.cmd(&["HSET", "h1", "f1", "v1"]);
-    c.cmd(&["HPEXPIRE", "h1", "3000", "FIELDS", "1", "f1"]);
+    c.cmd(&["HPEXPIRE", "h1", ttl, "FIELDS", "1", "f1"]);
     c.cmd(&["HSET", "h2", "f1", "v1", "f2", "v2"]);
-    c.cmd(&["HPEXPIRE", "h2", "3000", "FIELDS", "2", "f1", "f2"]);
+    c.cmd(&["HPEXPIRE", "h2", ttl, "FIELDS", "2", "f1", "f2"]);
     c.cmd(&["HSET", "h3", "f1", "v1", "f2", "v2"]);
-    c.cmd(&["HPEXPIRE", "h3", "3000", "FIELDS", "1", "f1"]);
+    c.cmd(&["HPEXPIRE", "h3", ttl, "FIELDS", "1", "f1"]);
     assert!(c.cmd(&["SAVE"]).ok());
     drop(c);
     server.child.kill().unwrap();
@@ -877,8 +883,14 @@ fn hashes_loaded_from_a_snapshot_lose_their_expired_fields_and_go() {
         .expect("could not restart kividb");
 
     let mut c = server.conn();
+    assert!(
+        set_at.elapsed() < Duration::from_millis(TTL_MS),
+        "the restart took longer than the fields' TTL"
+    );
     assert_eq!(c.cmd(&["DBSIZE"]).i(), 3);
-    std::thread::sleep(Duration::from_millis(4500));
+    // Past the deadline, plus time for the background sweep (10 a second).
+    let due = Duration::from_millis(TTL_MS + 1_500);
+    std::thread::sleep(due.saturating_sub(set_at.elapsed()));
     assert_eq!(c.cmd(&["DBSIZE"]).i(), 1);
     assert_eq!(c.cmd(&["HLEN", "h3"]).i(), 1);
 }
