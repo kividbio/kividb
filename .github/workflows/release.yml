@@ -12,8 +12,6 @@ on:
 
 permissions:
   contents: write
-  # A stable release opens an Announcements discussion (Publish GitHub Release).
-  discussions: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -815,9 +813,10 @@ jobs:
           prerelease: false
           generate_release_notes: false
           body_path: release-body.md
-          # Announced in Discussions (Announcements), with the release notes
-          # as the post and a link both ways.
-          discussion_category_name: Announcements
+          # No discussion_category_name: GitHub refuses to open a discussion in
+          # Announcements with this token ("Discussion could not be created"),
+          # which failed v1.2.0's publish job after the release was made and
+          # skipped homebrew-tap-update. A maintainer posts the announcement.
           files: |
             release-assets/*
         env:
