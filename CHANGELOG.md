@@ -524,6 +524,12 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   can write the keys here, and says so in the `TRYAGAIN`: they can be moved
   again without `REPLACE`.
 
+- **`DEBUG DIGEST-VALUE` returns a digest of each value**, as Redis does:
+  40 hex digits a key, the same for equal values on any node, and 40 zeros
+  for a key that is not there. It answered `OK`, and `redis-cli --cluster
+  fix`, which compares the two copies of a key it finds on two nodes with
+  it, failed an assertion and stopped half-way.
+
 - **`EXPIREAT` with a negative timestamp deletes the key,** as Redis does
   (by [@huong8373tt-beep](https://github.com/huong8373tt-beep)). It was
   refused with `ERR invalid expire time`; a time before the epoch is a time

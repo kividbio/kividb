@@ -82,6 +82,20 @@ fn value_digest(h: &mut Xxh3, value: crate::store::ValueRef<'_>) {
     }
 }
 
+/// `DEBUG DIGEST-VALUE`: a digest of one value, 40 hex digits as Redis's are
+/// (Redis's are SHA-1), the same for equal values on any node and whatever
+/// order their members are stored in. Only the value: not the key, nor its
+/// time to live.
+///
+/// `redis-cli --cluster fix` compares a key's two copies with it when it
+/// finds the key on two nodes, and answered `OK` it failed an assertion and
+/// stopped half-way (#295).
+pub fn value_hex(value: ValueRef<'_>) -> String {
+    let mut h = Xxh3::new();
+    value_digest(&mut h, value);
+    format!("{:040x}", h.digest128())
+}
+
 /// The fingerprint of the dataset. Call with nothing writing to it: at
 /// startup, or on a replica between syncs.
 pub fn dataset_digest(store: &crate::store::Store) -> u64 {
@@ -137,6 +151,29 @@ pub fn dataset_digest(store: &crate::store::Store) -> u64 {
 mod tests {
     use super::*;
     use crate::types::KiviDBValue;
+
+    /// Equal values have one digest on any node, whatever their members'
+    /// order; different values have different ones.
+    #[test]
+    fn a_values_digest_follows_the_value() {
+        let a = crate::store::new_store(1);
+        let b = crate::store::new_store(1);
+        let set = |store: &crate::store::Store, k: &str, v: &str| {
+            crate::write_lock!(crate::store::get_shard(&store[0], k)).insert_str(k, v.as_bytes());
+        };
+        set(&a, "k", "one");
+        set(&b, "k", "one");
+        set(&b, "other", "two");
+        let hex = |store: &crate::store::Store, k: &str| {
+            let shard = crate::store::get_shard(&store[0], k);
+            let map = crate::read_lock!(shard);
+            value_hex(map.get(k).unwrap())
+        };
+        assert_eq!(hex(&a, "k"), hex(&b, "k"));
+        assert_ne!(hex(&b, "k"), hex(&b, "other"));
+        assert_eq!(hex(&a, "k").len(), 40);
+        assert!(hex(&a, "k").bytes().all(|c| c.is_ascii_hexdigit()));
+    }
 
     #[test]
     fn the_fingerprint_follows_the_data_not_its_order() {
