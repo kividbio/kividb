@@ -7,6 +7,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Source archives are small again.** The tarball GitHub makes of the
+  1.2.0 tag is 70 MB, against 4.5 MB for 1.1.3: the raw results of the
+  1.2.0 benchmarks under `benchmarks/1.2.0/` went into it (#319).
+  `.gitattributes` now marks them `export-ignore`, so `git archive` and
+  GitHub's tarballs and zips leave out the raw results, logs and charts
+  under `benchmarks/<release>/`, and the README's benchmark images and
+  video under `assets/benchmarks/`. The benchmark READMEs, harnesses and
+  summary tables stay in. Nothing is removed from the repository, and
+  nothing that builds or tests KiviDB is left out. An archive of the
+  tree today is 3.7 MB. The 1.2.0 archive stays as it is.
+
 ## [1.2.0] - 2026-11-03
 
 See [docs/releases/v1.2.0.md](docs/releases/v1.2.0.md) for what to check before upgrading.

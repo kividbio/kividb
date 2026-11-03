@@ -13,6 +13,8 @@ rc9 and rc10 changed only replication, cluster and shutdown code, plus `MIGRATE`
 
 Each folder holds the harness that produced its numbers, the raw results, the charts, and a README. The README gives the hardware, the exact versions and flags of every engine, how to run it again, and what the numbers mean. Where KiviDB loses, the README says so and why.
 
+The raw results, logs and charts are in the repository, but not in source archives of later releases (the tarballs and zips GitHub makes of a tag): `.gitattributes` leaves them out there, and keeps the READMEs, the harnesses and the summary tables. Browse them here on GitHub.
+
 Many of these were asked for in the [Hacker News thread](https://news.ycombinator.com/item?id=50152541) on the launch. [The table below](#questions-from-the-thread) links each question to its answer. The problems these runs found, and how each was fixed, are [at the end](#what-the-runs-found).
 
 ## Suites
