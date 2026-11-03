@@ -63,7 +63,7 @@ fn encoding_of(value: ValueRef<'_>) -> &'static str {
         ValueRef::Set(set) => {
             let set = set.read();
             let integers = set.iter().all(|member| {
-                std::str::from_utf8(member)
+                std::str::from_utf8(&member)
                     .ok()
                     .and_then(|text| text.parse::<i64>().ok())
                     .is_some_and(|n| n.to_string().as_bytes() == &member[..])
@@ -1298,7 +1298,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let mut elements: Vec<Arc<[u8]>> = match map.get(key) {
                 None => vec![], // ← don't return, just give empty vec
                 Some(ValueRef::List(l)) => l.read().iter().cloned().collect(),
-                Some(ValueRef::Set(s)) => s.read().iter().cloned().collect(),
+                Some(ValueRef::Set(s)) => s.read().iter().map(|m| m.to_shared()).collect(),
                 Some(ValueRef::SortedSet(z)) => {
                     z.read().by_score.keys().map(|(_, m)| m.clone()).collect()
                 }

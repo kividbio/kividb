@@ -55,10 +55,9 @@ fn value_digest(h: &mut Xxh3, value: crate::store::ValueRef<'_>) {
         }
         ValueRef::Set(set) => {
             h.update(b"S");
-            let sum = set
-                .read()
-                .iter()
-                .fold(0u64, |sum, member| sum.wrapping_add(xxh3_64(member)));
+            let mut sum = 0u64;
+            set.read()
+                .for_each(|member| sum = sum.wrapping_add(xxh3_64(member)));
             h.update(&sum.to_le_bytes());
         }
         ValueRef::SortedSet(zset) => {

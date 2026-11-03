@@ -338,9 +338,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     buf.push(if reply_resp(ctx) >= 3 { b'~' } else { b'*' });
                     buf.extend_from_slice(inner.len().to_string().as_bytes());
                     buf.extend_from_slice(b"\r\n");
-                    for v in inner.iter() {
-                        write_bulk(&mut buf, v);
-                    }
+                    inner.for_each(|v| write_bulk(&mut buf, v));
                     crate::stats::record_hit();
                     Some(buf)
                 }
@@ -515,7 +513,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     crate::stats::record_hit();
                     match count {
                         None => Some(match inner.random(&mut rng) {
-                            Some(member) => resp_bulk(member),
+                            Some(member) => resp_bulk(&member),
                             None => resp_null_bulk(),
                         }),
                         // A count: that many distinct members, or all of them.
@@ -532,7 +530,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             let mut items: Vec<Vec<u8>> = Vec::new();
                             for _ in 0..n.unsigned_abs() {
                                 match inner.random(&mut rng) {
-                                    Some(member) => items.push(resp_bulk(member)),
+                                    Some(member) => items.push(resp_bulk(&member)),
                                     None => break,
                                 }
                             }
@@ -827,7 +825,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let (page, next_cursor) = crate::commands::helpers::scan_page(
                         inner
                             .iter()
-                            .map(|m| (crate::commands::helpers::scan_position(m), m)),
+                            .map(|m| (crate::commands::helpers::scan_position(&m), m)),
                         cursor,
                         count,
                         inner.len(),
@@ -843,7 +841,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                                 )
                             })
                         })
-                        .map(|m| resp_bulk(m))
+                        .map(|m| resp_bulk(&m))
                         .collect();
 
                     crate::stats::record_hit();

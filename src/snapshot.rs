@@ -539,9 +539,13 @@ pub fn write_kdb_entry(
             w.write_all(&[TAG_SET])?;
             let inner = arc.read();
             w.write_all(&(inner.len() as u32).to_le_bytes())?;
-            for member in inner.iter() {
-                write_bytes(w, member)?;
-            }
+            let mut written = Ok(());
+            inner.for_each(|member| {
+                if written.is_ok() {
+                    written = write_bytes(w, member);
+                }
+            });
+            written?;
         }
 
         ValueRef::SortedSet(arc) => {
@@ -4311,9 +4315,13 @@ pub fn serialize_value(value: &KiviDBValue, out: &mut Vec<u8>) -> std::io::Resul
             out.write_all(&[TAG_SET])?;
             let inner = arc.read();
             out.write_all(&(inner.len() as u32).to_le_bytes())?;
-            for member in inner.iter() {
-                write_bytes_vec(out, member)?;
-            }
+            let mut written = Ok(());
+            inner.for_each(|member| {
+                if written.is_ok() {
+                    written = write_bytes_vec(out, member);
+                }
+            });
+            written?;
         }
         KiviDBValue::SortedSet(arc) => {
             out.write_all(&[TAG_SORTEDSET])?;

@@ -98,7 +98,7 @@ fn union_card(sets: &[Option<Set>], limit: usize) -> usize {
     let mut seen: crate::member_set::MemberSet = crate::member_set::MemberSet::new();
     for set in sets {
         for member in set.read().iter() {
-            if seen.insert(Arc::clone(member)) && limit > 0 && seen.len() >= limit {
+            if seen.insert(member.to_shared()) && limit > 0 && seen.len() >= limit {
                 return limit;
             }
         }
@@ -127,7 +127,7 @@ fn diff_card(sets: &[Option<Set>], limit: usize) -> usize {
     let others: Vec<_> = others.iter().map(|s| s.read()).collect();
     let mut count = 0usize;
     for member in first.iter() {
-        if others.iter().all(|other| !other.contains(member)) {
+        if others.iter().all(|other| !other.contains(&member)) {
             count += 1;
             if limit > 0 && count >= limit {
                 return limit;
