@@ -371,6 +371,14 @@ pub struct Config {
     #[arg(long, default_value_t = 60)]
     pub repl_timeout: u64,
 
+    /// Seconds a master that is shutting down waits for its replicas to
+    /// acknowledge the end of its write stream before it saves and exits
+    /// (Redis `shutdown-timeout`). A replica that has it all is continued
+    /// after the restart instead of being sent the whole dataset. 0 does not
+    /// wait; nor does `SHUTDOWN NOW` or `NOSAVE`.
+    #[arg(long, default_value_t = 10)]
+    pub shutdown_timeout: u64,
+
     /// Refuse writes while fewer than this many replicas are good: online,
     /// and heard from within `min-replicas-max-lag` seconds (Redis
     /// `min-replicas-to-write`). 0 is off. A master cut off from its
@@ -582,6 +590,7 @@ impl Default for Config {
             masterauth: String::new(),
             masteruser: String::new(),
             repl_timeout: 60,
+            shutdown_timeout: 10,
             min_replicas_to_write: 0,
             min_replicas_max_lag: 10,
             repl_ping_replica_period: 10,
@@ -700,6 +709,7 @@ impl Config {
             masterauth: String::new(),
             masteruser: String::new(),
             repl_timeout: 60,
+            shutdown_timeout: 10,
             min_replicas_to_write: 0,
             min_replicas_max_lag: 10,
             repl_ping_replica_period: 10,
@@ -1083,6 +1093,7 @@ impl Config {
         out.push_str(&format!("repl-diskless-load {}\n", self.repl_diskless_load));
         out.push_str(&format!("hll-write-format {}\n", self.hll_write_format));
         out.push_str(&format!("repl-timeout {}\n", self.repl_timeout));
+        out.push_str(&format!("shutdown-timeout {}\n", self.shutdown_timeout));
         out.push_str(&format!(
             "min-replicas-to-write {}\n",
             self.min_replicas_to_write
@@ -1517,6 +1528,7 @@ impl Config {
             "masterauth" | "primaryauth" => set!(masterauth, one()?.to_string()),
             "masteruser" | "primaryuser" => set!(masteruser, one()?.to_string()),
             "repl-timeout" => set!(repl_timeout, number(key, one()?)?),
+            "shutdown-timeout" => set!(shutdown_timeout, number(key, one()?)?),
             "min-replicas-to-write" | "min-slaves-to-write" => {
                 set!(min_replicas_to_write, number(key, one()?)?)
             }
@@ -2155,7 +2167,8 @@ mod config_file_tests {
             cluster-require-full-coverage no\ncluster-replica-validity-factor 1\n\
             cluster-slot-migration-handoff-max-lag-bytes 1\n\
             cluster-slot-migration-write-pause-timeout 1\nrepl-replica-max-backlog-bytes 1\n\
-            masterauth a\nmasteruser u\nrepl-timeout 1\nrepl-ping-replica-period 1\n\
+            masterauth a\nmasteruser u\nrepl-timeout 1\nshutdown-timeout 1\n\
+            repl-ping-replica-period 1\n\
             min-replicas-to-write 1\nmin-replicas-max-lag 1\n\
             repl-backlog-size 1mb\nrepl-backlog-ttl 1\nrepl-diskless-load swapdb\n\
             hll-write-format redis\n\

@@ -269,6 +269,9 @@ struct Relay {
     /// How many bytes a connection may carry from the master before it is
     /// cut. `u64::MAX`: as many as it likes.
     budget: Arc<std::sync::atomic::AtomicU64>,
+    /// While set, nothing is carried from the master, and the connections
+    /// stay open: the replica is connected, and receives nothing.
+    paused: Arc<AtomicBool>,
 }
 
 impl Relay {
@@ -278,8 +281,13 @@ impl Relay {
         let open = Arc::new(AtomicBool::new(true));
         let live: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
         let budget = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
-        let (open_bg, live_bg, budget_bg) =
-            (Arc::clone(&open), Arc::clone(&live), Arc::clone(&budget));
+        let paused = Arc::new(AtomicBool::new(false));
+        let (open_bg, live_bg, budget_bg, paused_bg) = (
+            Arc::clone(&open),
+            Arc::clone(&live),
+            Arc::clone(&budget),
+            Arc::clone(&paused),
+        );
         std::thread::spawn(move || {
             for client in listener.incoming().flatten() {
                 if !open_bg.load(Ordering::SeqCst) {
@@ -305,10 +313,14 @@ impl Relay {
                     let (mut from, mut to) =
                         (upstream.try_clone().unwrap(), client.try_clone().unwrap());
                     let budget = budget_bg.load(Ordering::SeqCst);
+                    let paused = Arc::clone(&paused_bg);
                     std::thread::spawn(move || {
                         let mut carried = 0u64;
                         let mut buf = [0u8; 16 * 1024];
                         loop {
+                            while paused.load(Ordering::SeqCst) {
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
                             let n = match from.read(&mut buf) {
                                 Ok(0) | Err(_) => break,
                                 Ok(n) => n,
@@ -335,7 +347,18 @@ impl Relay {
             open,
             live,
             budget,
+            paused,
         }
+    }
+
+    /// Carry nothing more from the master until [`Self::resume`], with the
+    /// connections left open.
+    fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+    }
+
+    fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
     }
 
     /// From now on, cut each new connection once it has carried this many
@@ -576,6 +599,123 @@ fn a_cleanly_restarted_master_continues_its_replicas() {
     wait_link_up(&mut r);
     assert_same_dataset(&mut m, &mut r);
     assert_eq!(m.stat("sync_full"), 0);
+}
+
+/// Writes up to the moment of the shutdown, keys and hash fields expiring
+/// through it, and a replica `PING` every second: a master stopped cleanly
+/// still continues its replica (#306). Its final save records the offset at
+/// its cut, and the replica used to end a few bytes away from it: behind,
+/// by writes and expiries not yet delivered when the process exited, or
+/// ahead, by a `PING` or a `DEL` written after the cut. Either way the
+/// restarted master sent it the whole dataset again.
+#[test]
+fn a_master_stopped_under_writes_with_keys_expiring_continues_its_replica() {
+    let mut master = Server::start(&["--aof", "--repl-ping-replica-period", "1"]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port, "--aof"]);
+    let mut r = replica.conn();
+    for round in 0..3 {
+        let mut m = master.conn();
+        write_batch(&mut m, round, 30);
+        wait_link_up(&mut r);
+        // Keys and fields that expire around the shutdown, and writes until
+        // it starts: no time for the replica to have them all.
+        for i in 0..200 {
+            let ttl = (50 + 7 * i).to_string();
+            assert!(
+                m.cmd(&["SET", &format!("ttl:{round}:{i}"), "v", "PX", &ttl])
+                    .ok()
+            );
+            let hash = format!("h:{round}:{}", i % 20);
+            let field = format!("f{i}");
+            m.cmd(&["HSET", &hash, &field, "v"]);
+            m.cmd(&["HPEXPIRE", &hash, &ttl, "FIELDS", "1", &field]);
+            m.cmd(&["INCR", "counter"]);
+        }
+        drop(m);
+        master.shutdown();
+        let log = master.log();
+        assert!(
+            log.matches("has the whole stream").count() > round,
+            "round {round}: the master did not see its replica take the whole stream:\n{log}"
+        );
+        master.restart();
+        let mut m = master.conn();
+        wait_link_up(&mut r);
+        assert_eq!(
+            m.stat("sync_full"),
+            0,
+            "round {round}: the replica was sent the dataset again:\n{}\n{}",
+            master.log(),
+            replica.log()
+        );
+        assert_eq!(m.stat("sync_partial_ok"), 1, "round {round}");
+        // Every key and field with a TTL has gone by now, on both sides.
+        std::thread::sleep(Duration::from_millis(2000));
+        assert_same_dataset(&mut m, &mut r);
+    }
+}
+
+/// The shutdown's wait for its replicas lasts at most `shutdown-timeout`,
+/// and `SHUTDOWN NOW` does not wait at all.
+#[test]
+fn a_shutdown_waits_for_a_silent_replica_no_longer_than_shutdown_timeout() {
+    let mut master = Server::start(&["--aof"]);
+    let relay = Relay::to(master.port);
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &relay.port.to_string()]);
+    let (mut m, mut r) = (master.conn(), replica.conn());
+    assert_eq!(
+        m.cmd(&["CONFIG", "GET", "shutdown-timeout"]).arr()[1].s(),
+        "10"
+    );
+    write_batch(&mut m, 0, 20);
+    wait_link_up(&mut r);
+    assert_same_dataset(&mut m, &mut r);
+
+    // Connected, and receiving nothing: it never acknowledges what follows.
+    relay.pause();
+    write_batch(&mut m, 1, 20);
+    let started = Instant::now();
+    let _ = m.writer.write_all(b"*2\r\n$8\r\nSHUTDOWN\r\n$3\r\nNOW\r\n");
+    while master.child.try_wait().unwrap().is_none() {
+        assert!(started.elapsed() < Duration::from_secs(20), "no exit");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let now_took = started.elapsed();
+    assert!(
+        now_took < Duration::from_secs(5),
+        "SHUTDOWN NOW waited {now_took:?}"
+    );
+    assert!(!master.log().contains("did not acknowledge"));
+
+    relay.resume();
+    master.restart();
+    let mut m = master.conn();
+    wait_link_up(&mut r);
+    assert_same_dataset(&mut m, &mut r);
+    assert!(m.cmd(&["CONFIG", "SET", "shutdown-timeout", "2"]).ok());
+    assert_eq!(
+        m.cmd(&["CONFIG", "GET", "shutdown-timeout"]).arr()[1].s(),
+        "2"
+    );
+    relay.pause();
+    write_batch(&mut m, 2, 20);
+    drop(m);
+    let started = Instant::now();
+    master.shutdown();
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_secs(2) && took < Duration::from_secs(10),
+        "the shutdown took {took:?}"
+    );
+    assert!(
+        master
+            .log()
+            .contains("did not acknowledge the end of the stream"),
+        "{}",
+        master.log()
+    );
+    relay.resume();
 }
 
 /// A master killed outright and started from its AOF knows nothing of where

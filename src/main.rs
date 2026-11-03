@@ -915,6 +915,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     let signal_snapshot_store = Arc::clone(&store);
     let signal_snapshot_index_store = Arc::clone(&index_store);
     let signal_repl_state = Arc::clone(&repl_state);
+    let signal_hub_tx = hub_tx.clone();
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -980,7 +981,21 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                 let m = crate::shutdown::SHUTDOWN_MODE.load(Ordering::Relaxed);
 
                 if m != crate::shutdown::mode::NOSAVE {
-                    log_info!("Writing final snapshot...");
+                    // Before the gate below: the clients are paused, the
+                    // write stream ends here, and the replicas are given the
+                    // time to receive all of it, so that the restart can
+                    // continue them from the offset saved below (#306). The
+                    // worker threads go on serving the replicas meanwhile.
+                    // `SHUTDOWN NOW` does not wait.
+                    let started = std::time::Instant::now();
+                    let deadline = if m != crate::shutdown::mode::NOW {
+                        crate::replication::drain_replicas_for_shutdown(
+                            &signal_repl_state,
+                            &signal_hub_tx,
+                        )
+                    } else {
+                        started
+                    };
                     // No command runs from here to the exit: the snapshot is
                     // cut at one moment (#148), and a write a connection
                     // already open made after that moment was acknowledged
@@ -991,6 +1006,16 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                     // the gate again before `process::exit` below, and the
                     // writes that ran in between were acknowledged and lost.
                     std::mem::forget(crate::command_gate::enter_alone());
+                    crate::replication::end_stream_for_shutdown(&signal_repl_state);
+                    if m != crate::shutdown::mode::NOW {
+                        crate::replication::report_replicas_at_shutdown(
+                            &signal_repl_state,
+                            &signal_hub_tx,
+                            started,
+                            deadline,
+                        );
+                    }
+                    log_info!("Writing final snapshot...");
                     // With the replica's position in its master's stream
                     // beside it, so that the restart can ask to continue.
                     let result = crate::replication::save_dataset(
@@ -1274,7 +1299,14 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                         }
 
                         loop {
+                            // Shutting down: accept nothing more, and keep
+                            // serving the connections this worker has until
+                            // the process ends. Returning ended this worker's
+                            // runtime and every connection on it, a replica's
+                            // among them, before the shutdown had sent that
+                            // replica the end of the stream (#306).
                             if shutdown.load(Ordering::Relaxed) {
+                                std::future::pending::<()>().await;
                                 return;
                             }
 
@@ -1305,6 +1337,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                             if shutdown.load(Ordering::Relaxed) {
+                                std::future::pending::<()>().await;
                                 return;
                             }
 
@@ -2151,6 +2184,7 @@ async fn async_main_tokio(
         let store_c = Arc::clone(&snapshot_store);
         let index_c = Arc::clone(&snapshot_index_store);
         let repl_c = Arc::clone(&snapshot_repl_state);
+        let hub_c = hub_tx.clone();
         // With the replica's position in its master's stream beside it, so
         // that the restart can ask to continue.
         let result = tokio::task::spawn_blocking(move || {
@@ -2158,7 +2192,20 @@ async fn async_main_tokio(
             // the connections already open keep running, and a write one
             // made after the snapshot's cut was acknowledged and then lost.
             // The guard is this thread's, and is never let go.
+            // First the clients are paused, the stream ends and the
+            // replicas are given the time to receive it all, as on io_uring
+            // above (#306).
+            let started = std::time::Instant::now();
+            let deadline = if m != mode::NOW {
+                crate::replication::drain_replicas_for_shutdown(&repl_c, &hub_c)
+            } else {
+                started
+            };
             let _no_more_commands = crate::command_gate::enter_alone();
+            crate::replication::end_stream_for_shutdown(&repl_c);
+            if m != mode::NOW {
+                crate::replication::report_replicas_at_shutdown(&repl_c, &hub_c, started, deadline);
+            }
             let saved = crate::replication::save_dataset(&store_c, &index_c, &repl_c);
             std::mem::forget(_no_more_commands);
             saved

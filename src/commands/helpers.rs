@@ -633,7 +633,14 @@ pub fn spawn_active_expire_task(
                 // keys and fields that come due meanwhile go once the pause
                 // is over. Nor while a dataset is being loaded: the load
                 // says what is gone, by the `DEL`s in it (`expiry::Loading`).
-                if crate::pause::expiry_deferred() || crate::expiry::loading() {
+                // Nor once a shutdown has ended the write stream: the keys
+                // that come due go after the restart.
+                if crate::pause::expiry_deferred()
+                    || crate::expiry::loading()
+                    || target
+                        .as_ref()
+                        .is_some_and(crate::expiry::Target::stream_closed)
+                {
                     continue;
                 }
                 let started = std::time::Instant::now();

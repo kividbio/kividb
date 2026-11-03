@@ -144,6 +144,13 @@ pub struct ReplState {
     /// runs several servers in one process and they need independent values.
     pub repl_timeout_secs: AtomicU64,
     pub repl_ping_period_secs: AtomicU64,
+    /// `shutdown-timeout`: how long a master that is shutting down waits for
+    /// its replicas to acknowledge the end of its stream.
+    pub shutdown_timeout_secs: AtomicU64,
+    /// Set by a shutdown once no command runs: nothing more goes into the
+    /// write stream, not even the replica `PING` or a key that expires. See
+    /// [`end_stream_for_shutdown`].
+    pub stream_closed: AtomicBool,
     /// `hll-write-format`: whether new HyperLogLog values use Redis's dense
     /// encoding and hash space, or the legacy KiviDB one. Per server rather
     /// than process-wide: the test harness runs several servers in one
@@ -456,6 +463,8 @@ impl ReplState {
             last_sync_refusal: RwLock::new(None),
             repl_timeout_secs: AtomicU64::new(60),
             repl_ping_period_secs: AtomicU64::new(10),
+            shutdown_timeout_secs: AtomicU64::new(10),
+            stream_closed: AtomicBool::new(false),
             hll_write_redis: AtomicBool::new(false),
             min_replicas_to_write: AtomicU32::new(0),
             min_replicas_max_lag: AtomicU64::new(10),
@@ -657,6 +666,9 @@ impl ReplState {
         state
             .repl_ping_period_secs
             .store(config.repl_ping_replica_period, Ordering::Relaxed);
+        state
+            .shutdown_timeout_secs
+            .store(config.shutdown_timeout, Ordering::Relaxed);
         state
             .min_replicas_to_write
             .store(config.min_replicas_to_write, Ordering::Relaxed);
@@ -2036,8 +2048,17 @@ pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx
                     // And queued, not handled here and now, for the same
                     // reason: its place in the stream has to be its place in
                     // the queue, relative to a registration made at a cut.
+                    //
+                    // None once a shutdown has ended the stream: the offset
+                    // it saves is the last byte its replicas are sent. Looked
+                    // at inside the gate, which the shutdown cycles after it
+                    // sets the flag, so that a PING is either wholly before
+                    // the end or not sent.
                     {
                         let _gate = crate::write_gate::enter();
+                        if state.stream_closed.load(Ordering::SeqCst) {
+                            continue;
+                        }
                         state
                             .repl_offset
                             .fetch_add(REPL_PING.len() as u64, Ordering::Relaxed);
@@ -2119,6 +2140,16 @@ pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx
                         }
                     }
                     None => {
+                        if backlog.valid {
+                            log_info!(
+                                "Replication: Partial resync not possible for {}: offset {offset} \
+                                 is not in the backlog, which holds offsets {} to {} \
+                                 (repl-backlog-size) — sending the dataset",
+                                registration.addr,
+                                backlog.start() + 1,
+                                backlog.end
+                            );
+                        }
                         state.sync_partial_err.fetch_add(1, Ordering::Relaxed);
                         let _ = reply.send(Err(registration));
                     }
@@ -2485,6 +2516,128 @@ fn forget_replica(state: &ReplState, replica_id: u64) {
     if state.replica_acks.lock().remove(&replica_id).is_some() {
         // Pairs with fetch_add on successful RegisterChannel in the hub task.
         state.connected_replicas.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Shutdown: end the write stream here. A master restarted from its final
+/// save carries its stream on from the offset that save records, and
+/// continues a replica only if that replica stopped at exactly that offset
+/// (#306). Called once no command runs or can start (the clients are paused,
+/// or the command gate is held alone); the sweeps of expired keys and fields
+/// wait while clients are paused, and enter the command gate. What is left is
+/// the replica `PING`, which the hub writes on its own. It looks at this flag
+/// inside the write gate: cycling the gate after setting it waits for one
+/// that was being written, and for any write still in flight, so every
+/// `PING` is either wholly in the stream before the end or never sent. The
+/// sweeps look at the flag too.
+pub fn end_stream_for_shutdown(state: &ReplState) {
+    state.stream_closed.store(true, Ordering::SeqCst);
+    drop(crate::write_gate::cut());
+}
+
+/// How long clients stay paused for a shutdown: until the process exits.
+const SHUTDOWN_PAUSE_MS: i64 = 100 * 365 * 24 * 3600 * 1000;
+
+/// Shutdown, before the command gate is taken: pause every client, end the
+/// stream ([`end_stream_for_shutdown`]) and wait, for at most
+/// `shutdown-timeout`, until every streaming replica has acknowledged all it
+/// has been sent. Returns when the wait ends, for [`report_replicas_at_shutdown`].
+///
+/// Clients are paused rather than held at the command gate for the wait: a
+/// command that waits at the gate holds its worker thread, and on io_uring
+/// that is every connection on the worker, the replica's among them, so the
+/// replica was sent nothing more and the wait always ran out. A paused client
+/// waits without holding its thread (`pause::gate`), as in Redis, which pauses
+/// its clients while a shutdown waits for the replicas. No command starts
+/// again before the exit: the pause has no end, and the caller then holds the
+/// command gate alone. Blocking: called from the thread that then saves.
+pub fn drain_replicas_for_shutdown(state: &ReplState, hub_tx: &HubTx) -> std::time::Instant {
+    crate::pause::set_pause(SHUTDOWN_PAUSE_MS, false);
+    end_stream_for_shutdown(state);
+    let timeout =
+        std::time::Duration::from_secs(state.shutdown_timeout_secs.load(Ordering::Relaxed));
+    let deadline = std::time::Instant::now() + timeout;
+    wait_for_replicas_until(state, hub_tx, deadline);
+    deadline
+}
+
+/// Shutdown, with the command gate held alone, just before the save: wait
+/// what is left of `shutdown-timeout` for a write that was past the pause's
+/// check when the pause began and has only now been queued (rare), and say
+/// which replicas have the whole stream. One that has is continued from the
+/// final save after the restart; one that has not, or that was still being
+/// sent the dataset, gets the dataset again.
+pub fn report_replicas_at_shutdown(
+    state: &ReplState,
+    hub_tx: &HubTx,
+    started: std::time::Instant,
+    deadline: std::time::Instant,
+) {
+    if state.is_slave() || state.shutdown_timeout_secs.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    wait_for_replicas_until(state, hub_tx, deadline);
+    let waited = started.elapsed().as_millis();
+    for (addr, p) in replicas_at_shutdown(state) {
+        let sent = p.sent.load(Ordering::Relaxed);
+        let end = p.base + sent;
+        if p.state() != ReplicaState::Online {
+            log_warn!(
+                "Replication: Shutdown: replica {addr} was still being sent the dataset ({}); it \
+                 will be sent it again after the restart",
+                p.state().as_str()
+            );
+        } else if p.delivered() >= sent {
+            log_info!(
+                "Replication: Shutdown: replica {addr} has the whole stream, to offset {end} \
+                 ({waited} ms); it can be continued after the restart"
+            );
+        } else {
+            log_warn!(
+                "Replication: Shutdown: replica {addr} did not acknowledge the end of the stream \
+                 within shutdown-timeout ({} s): it is at offset {} of {end}; it will be sent \
+                 the dataset after the restart",
+                state.shutdown_timeout_secs.load(Ordering::Relaxed),
+                p.acked.load(Ordering::Relaxed)
+            );
+        }
+    }
+}
+
+/// Every registered replica and its progress, by address.
+fn replicas_at_shutdown(state: &ReplState) -> Vec<(String, Arc<ReplicaProgress>)> {
+    let peers = state.replica_peers.lock().clone();
+    let progress = state.replica_progress.lock();
+    peers
+        .into_iter()
+        .filter_map(|(id, ip, port)| Some((format!("{ip}:{port}"), Arc::clone(progress.get(&id)?))))
+        .collect()
+}
+
+/// Until `deadline`, or until every streaming replica has acknowledged all it
+/// has been sent. A hub barrier first: once the hub has answered, everything
+/// written before has been handed to the replicas' queues.
+fn wait_for_replicas_until(state: &ReplState, hub_tx: &HubTx, deadline: std::time::Instant) {
+    if state.is_slave() || state.replica_progress.lock().is_empty() {
+        return;
+    }
+    let pause = std::time::Duration::from_millis(5);
+    let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+    if hub_tx.send(HubMsg::Barrier(done_tx)).is_ok() {
+        while matches!(
+            done_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ) && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(pause);
+        }
+    }
+    while std::time::Instant::now() < deadline
+        && replicas_at_shutdown(state).iter().any(|(_, p)| {
+            p.state() == ReplicaState::Online && p.delivered() < p.sent.load(Ordering::Relaxed)
+        })
+    {
+        std::thread::sleep(pause);
     }
 }
 

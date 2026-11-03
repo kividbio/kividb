@@ -480,6 +480,23 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **A master stopped cleanly continues its replicas after the restart**
+  (#306). A master saves where its write stream stands at the cut of its
+  final save, and continues a replica after the restart only if the
+  replica stopped at exactly that point. It did not wait for its replicas:
+  writes and expired keys not yet delivered when the process exited left a
+  replica behind, and a replica `PING` or the `DEL` of a key that expired
+  after the cut left it ahead, so the restarted master sent it the whole
+  dataset (12 of 18 restarts in the 1.2.0-rc7 soak). Once no command runs,
+  the shutdown now ends the stream (no more `PING`s, no more expiry),
+  waits until every streaming replica has acknowledged all of it, and only
+  then saves. It waits at most `shutdown-timeout` seconds (Redis's name and
+  default, 10, settable with `CONFIG SET`); `SHUTDOWN NOW` and `NOSAVE` do
+  not wait. The log says which replicas have the whole stream and which do
+  not. On io_uring, a worker that accepted a connection as the shutdown
+  began no longer drops the connections it serves before the exit. In
+  1.1.x too.
+
 - **The `.rpm` package depends on `shadow-utils`.** Its pre-install script
   makes the `kividb` user and group with `groupadd` and `useradd`, but the
   package did not say it needed them, so on a minimal image without them

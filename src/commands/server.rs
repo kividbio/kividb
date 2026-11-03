@@ -73,6 +73,10 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
             rs.repl_ping_period_secs.load(Relaxed).to_string(),
         ),
         (
+            "shutdown-timeout",
+            rs.shutdown_timeout_secs.load(Relaxed).to_string(),
+        ),
+        (
             "replica-full-sync-guard",
             rs.full_sync_guard().as_str().to_string(),
         ),
@@ -633,6 +637,19 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                 _ => Some(resp_error(
                     "ERR CONFIG SET failed (possibly related to argument \
                                  'repl-timeout') - argument must be a positive integer",
+                )),
+            },
+            // Read when a shutdown begins to wait for the replicas.
+            "shutdown-timeout" => match value.parse::<u64>() {
+                Ok(v) if v <= i32::MAX as u64 => {
+                    ctx.repl_state
+                        .shutdown_timeout_secs
+                        .store(v, std::sync::atomic::Ordering::Relaxed);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument \
+                                 'shutdown-timeout') - argument must be between 0 and 2147483647 inclusive",
                 )),
             },
             "repl-ping-replica-period" | "repl-ping-slave-period" => match value.parse::<u64>() {

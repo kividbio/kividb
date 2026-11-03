@@ -95,6 +95,15 @@ impl Target {
                     > 0)
     }
 
+    /// A shutdown has ended this node's write stream: the background sweeps
+    /// expire nothing more (`replication::end_stream_for_shutdown`).
+    #[inline]
+    pub fn stream_closed(&self) -> bool {
+        self.repl_state
+            .stream_closed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// `keys`, which this master has just expired in database `db`, as a
     /// `DEL` (or `UNLINK`) each to replicas, taps and the AOF. Inside a
     /// transaction or a script, among its writes. The caller holds what
