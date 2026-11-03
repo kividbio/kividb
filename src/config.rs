@@ -2160,6 +2160,54 @@ mod config_file_tests {
         );
     }
 
+    /// `latency-tracking-info-percentiles` is read as Redis reads it (#255).
+    /// The inputs through "1e1" were each run against Redis 8.10.3, and what
+    /// it answered is what is asserted; `0x` and `--5` are not numbers to any
+    /// `strtod`.
+    #[test]
+    fn latency_percentiles_are_read_as_redis_reads_them() {
+        use crate::commands::server::parse_latency_percentiles as parse;
+        let not_numbers = Err("Invalid latency-tracking-info-percentiles parameters");
+        let out_of_range =
+            Err("latency-tracking-info-percentiles parameters should sit between [0.0,100.0]");
+        assert_eq!(parse(""), Ok(vec![]));
+        assert_eq!(parse("50 99 99.9"), Ok(vec![50.0, 99.0, 99.9]));
+        assert_eq!(parse("0"), Ok(vec![0.0]));
+        assert_eq!(parse("100"), Ok(vec![100.0]));
+        assert_eq!(parse("0x10"), Ok(vec![16.0]));
+        assert_eq!(parse("1e1"), Ok(vec![10.0]));
+        for bad in ["abc", "50 abc", " 50", "50 ", "50  99", "nan", "0x", "--5"] {
+            assert_eq!(parse(bad), not_numbers, "{bad:?}");
+        }
+        for bad in ["101", "-1", "inf"] {
+            assert_eq!(parse(bad), out_of_range, "{bad:?}");
+        }
+    }
+
+    /// The file refuses what `CONFIG SET` refuses, with the same words (#255).
+    /// A value that is valid is only the one it already is: other tests of
+    /// this process go by it. (A double space cannot be tried here: the file
+    /// splits a line into words.)
+    #[test]
+    fn latency_tracking_info_percentiles_are_checked_in_the_file() {
+        let (_, warnings) = load("latency-tracking-info-percentiles 50 99 99.9\n").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        for bad in ["abc", "50 abc", "nan"] {
+            let err = load(&format!("latency-tracking-info-percentiles {bad}\n")).unwrap_err();
+            assert!(
+                err.contains("Invalid latency-tracking-info-percentiles parameters"),
+                "{bad}: {err}"
+            );
+        }
+        for bad in ["101", "-1", "inf"] {
+            let err = load(&format!("latency-tracking-info-percentiles {bad}\n")).unwrap_err();
+            assert!(
+                err.contains("should sit between [0.0,100.0]"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
     #[test]
     fn redis_directives_with_no_effect_are_reported_and_not_fatal() {
         let (_, warnings) = load("save 900 1\ntcp-keepalive 300\nappendfsync always\n").unwrap();
