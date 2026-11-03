@@ -19,6 +19,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   summary tables stay in. Nothing is removed from the repository, and
   nothing that builds or tests KiviDB is left out. An archive of the
   tree today is 3.7 MB. The 1.2.0 archive stays as it is.
+- **Every release has a source tag, `X.Y.Z-src`.** Ports and packages
+  that fetch GitHub's source tarball by tag can use it for every release.
+  `1.1.0-src` to `1.2.0-src` are on each release's code plus the
+  `.gitattributes` above, so their tarballs are 1.8 to 3.6 MB; they build
+  the same server as the `v` tag. The release workflow now pushes
+  `X.Y.Z-src` on the release's own commit. A `-src` tag is not a
+  separate release.
 
 ## [1.2.0] - 2026-11-03
 
