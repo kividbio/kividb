@@ -4,7 +4,8 @@ KiviDB implements a Redis-compatible command surface over the RESP protocol.
 Commands are grouped by type. All commands are case-insensitive.
 
 `HELP` lists the subcommands of `CLIENT`, `COMMAND`, `CONFIG`, `FUNCTION`,
-`MEMORY`, `MODULE`, `OBJECT`, `PUBSUB` and `SLOWLOG` (for example `CLIENT HELP`).
+`MEMORY`, `MODULE`, `OBJECT`, `PUBSUB`, `SCRIPT` and `SLOWLOG` (for example
+`CLIENT HELP`).
 
 Connect using any Redis-compatible client on port `6380` (default):
 ```bash

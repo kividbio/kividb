@@ -7,6 +7,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`SCRIPT HELP` lists the `SCRIPT` subcommands, as in Redis.** It was an
+  unknown subcommand (#256).
+
 ## [1.2.0] - 2026-11-03
 
 See [docs/releases/v1.2.0.md](docs/releases/v1.2.0.md) for what to check before upgrading.
