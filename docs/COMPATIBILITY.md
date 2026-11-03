@@ -39,6 +39,9 @@ other files:
 - LangGraph's Redis checkpointer and store (`langgraph-checkpoint-redis`):
   [benchmarks/langgraph-compat/REPORT.md](../benchmarks/langgraph-compat/REPORT.md) and
   [docs/integrations/langgraph.md](integrations/langgraph.md).
+- LlamaIndex's Redis vector store, document store, index store and key-value store:
+  [benchmarks/llamaindex-compat/REPORT.md](../benchmarks/llamaindex-compat/REPORT.md) and
+  [docs/integrations/llamaindex.md](integrations/llamaindex.md).
 - `redis-py` throughout the end-to-end tests (`tests/e2e/`).
 
 ## Differences you may notice
