@@ -1,0 +1,7 @@
+    digest: sha256:d7fc7de78bb8c1469933aeecbf801314d30d7d6e9f0578bba4cfa285bfa37fe6
+Run ID: cu1 was successful after 6m31s
+manager: Run ID: cu5 was successful after 3m30s
+agent: Run ID: cu6 was successful after 2m5s
+gui: Run ID: cu3 was successful after 2m50s
+loader: Run ID: cu4 was successful after 1m11s
+fakes3: Run ID: cu2 was successful after 1m8s
