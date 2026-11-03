@@ -900,6 +900,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
             if let Some(refusal) = decision.refusal() {
                 return refusal;
             }
+            crate::cluster::routing::stall_for_test(name, ctx.cmd.as_slice());
         }
     }
 

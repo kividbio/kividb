@@ -155,7 +155,70 @@ pub fn exec_refusal(caller: &Caller, queue: &[Vec<Vec<u8>>]) -> Option<Vec<u8>> 
             }
         }
     }
+    if test_stall_keys().is_some() {
+        for queued in queue {
+            let cmd: Vec<&[u8]> = queued.iter().map(|arg| arg.as_slice()).collect();
+            if let Some(first) = cmd.first() {
+                let name = String::from_utf8_lossy(first).to_ascii_uppercase();
+                stall_for_test(&name, &cmd);
+            }
+        }
+    }
     None
+}
+
+// ── For the tests of a command routed before its keys moved (#331) ──────────
+
+/// `KIVIDB_TEST_STALL_KEYS`, never set otherwise: keys, separated by commas.
+/// A command routed here that names one of them waits, once it has been
+/// routed, at the failpoint `routed` (`aof::failpoint`, which
+/// `KIVIDB_TEST_FAILPOINTS` has to name too), as a command can be held up
+/// between its routing and the write gate on a busy machine while a
+/// `MIGRATE` runs. So does `EXEC`, for the commands it has queued. Not
+/// `MIGRATE` itself, which moves them. Read once; called in cluster mode
+/// only, where it costs a load and a branch.
+pub fn stall_for_test(name: &str, cmd: &[&[u8]]) {
+    if let Some(keys) = test_stall_keys() {
+        stall_if_named(keys, name, cmd);
+    }
+}
+
+fn test_stall_keys() -> Option<&'static [Vec<u8>]> {
+    static KEYS: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
+    let keys = KEYS.get_or_init(|| {
+        std::env::var("KIVIDB_TEST_STALL_KEYS")
+            .map(|list| {
+                list.split(',')
+                    .filter(|key| !key.is_empty())
+                    .map(|key| key.as_bytes().to_vec())
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    (!keys.is_empty()).then_some(keys.as_slice())
+}
+
+#[cold]
+#[inline(never)]
+fn stall_if_named(keys: &[Vec<u8>], name: &str, cmd: &[&[u8]]) {
+    let named = key_positions(name, cmd)
+        .iter()
+        .any(|pos| keys.iter().any(|key| key.as_slice() == cmd[pos]));
+    if name == "MIGRATE" || !named {
+        return;
+    }
+    // Leaving the worker's other tasks to another thread of the
+    // multi-threaded runtime, as `pause::wait_out_handoff` does: the test's
+    // `MIGRATE` comes on a connection of its own.
+    let stall = || crate::aof::failpoint("routed");
+    let on_multi_thread_runtime = tokio::runtime::Handle::try_current().is_ok_and(|runtime| {
+        runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+    });
+    if on_multi_thread_runtime {
+        tokio::task::block_in_place(stall);
+    } else {
+        stall();
+    }
 }
 
 /// Compute the routing decision for a command.
