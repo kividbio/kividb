@@ -1,0 +1,32 @@
+Json file ~/results/garnet/r1/d100/set_p16.c1.json created...
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 5%,   1 secs] 15 threads 10 conns:     4630501 ops, 4628714 (avg: 4628714) ops/sec, 652.82MB/sec (avg: 652.82MB/sec),  0.51 (avg:  0.51) msec latency[RUN #1 10%,   2 secs] 15 threads 10 conns:     9477811 ops, 4846476 (avg: 4737583) ops/sec, 683.54MB/sec (avg: 668.18MB/sec),  0.49 (avg:  0.50) msec latency[RUN #1 15%,   3 secs] 15 threads 10 conns:    14240305 ops, 4761817 (avg: 4745661) ops/sec, 671.60MB/sec (avg: 669.32MB/sec),  0.50 (avg:  0.50) msec latency[RUN #1 20%,   4 secs] 15 threads 10 conns:    19154087 ops, 4913094 (avg: 4787516) ops/sec, 692.93MB/sec (avg: 675.22MB/sec),  0.48 (avg:  0.49) msec latency[RUN #1 25%,   5 secs] 15 threads 10 conns:    23988704 ops, 4829874 (avg: 4795993) ops/sec, 681.19MB/sec (avg: 676.42MB/sec),  0.49 (avg:  0.49) msec latency[RUN #1 30%,   6 secs] 15 threads 10 conns:    28846975 ops, 4857537 (avg: 4806248) ops/sec, 685.10MB/sec (avg: 677.86MB/sec),  0.49 (avg:  0.49) msec latency[RUN #1 35%,   7 secs] 15 threads 10 conns:    33724412 ops, 4876759 (avg: 4816319) ops/sec, 687.81MB/sec (avg: 679.28MB/sec),  0.48 (avg:  0.49) msec latency[RUN #1 40%,   8 secs] 15 threads 10 conns:    38610313 ops, 4884992 (avg: 4824903) ops/sec, 688.97MB/sec (avg: 680.49MB/sec),  0.48 (avg:  0.49) msec latency[RUN #1 45%,   9 secs] 15 threads 10 conns:    43434169 ops, 4822327 (avg: 4824616) ops/sec, 680.13MB/sec (avg: 680.45MB/sec),  0.49 (avg:  0.49) msec latency[RUN #1 50%,  10 secs] 15 threads 10 conns:    48241809 ops, 4806164 (avg: 4822771) ops/sec, 677.85MB/sec (avg: 680.19MB/sec),  0.49 (avg:  0.49) msec latency[RUN #1 55%,  11 secs] 15 threads 10 conns:    53089835 ops, 4847284 (avg: 4824999) ops/sec, 683.65MB/sec (avg: 680.51MB/sec),  0.49 (avg:  0.49) msec latency[RUN #1 60%,  12 secs] 15 threads 10 conns:    57892784 ops, 4802094 (avg: 4823091) ops/sec, 677.28MB/sec (avg: 680.24MB/sec),  0.49 (avg:  0.49) msec latency[RUN #1 65%,  13 secs] 15 threads 10 conns:    62682802 ops, 4787724 (avg: 4820370) ops/sec, 675.25MB/sec (avg: 679.85MB/sec),  0.49 (avg:  0.49) msec latency[RUN #1 70%,  14 secs] 15 threads 10 conns:    67478544 ops, 4794246 (avg: 4818504) ops/sec, 676.17MB/sec (avg: 679.59MB/sec),  0.49 (avg:  0.49) msec latency[RUN #1 75%,  15 secs] 15 threads 10 conns:    72328273 ops, 4848226 (avg: 4820485) ops/sec, 683.78MB/sec (avg: 679.87MB/sec),  0.49 (avg:  0.49) msec latency[RUN #1 80%,  16 secs] 15 threads 10 conns:    77208291 ops, 4879251 (avg: 4824158) ops/sec, 688.16MB/sec (avg: 680.39MB/sec),  0.48 (avg:  0.49) msec latency[RUN #1 85%,  17 secs] 15 threads 10 conns:    81953673 ops, 4744694 (avg: 4819484) ops/sec, 669.18MB/sec (avg: 679.73MB/sec),  0.50 (avg:  0.49) msec latency[RUN #1 90%,  18 secs] 15 threads 10 conns:    86793839 ops, 4839401 (avg: 4820590) ops/sec, 682.54MB/sec (avg: 679.89MB/sec),  0.49 (avg:  0.49) msec latency[RUN #1 95%,  19 secs] 15 threads 10 conns:    91605067 ops, 4810092 (avg: 4820038) ops/sec, 678.40MB/sec (avg: 679.81MB/sec),  0.49 (avg:  0.49) msec latency[RUN #1 100%,  20 secs]  0 threads 10 conns:    96385928 ops, 4810092 (avg: 4819063) ops/sec, 678.40MB/sec (avg: 679.67MB/sec),  0.49 (avg:  0.49) msec latency
+
+Writing Full Run command HDR latency histogram results to ~/results/garnet/r1/d100/set_p16.c1_FULL_RUN_1.txt...
+Writing Full Run command HDR latency histogram results in HistogramLogProcessor format to ~/results/garnet/r1/d100/set_p16.c1_FULL_RUN_1.hgrm...
+Writing SET command HDR latency histogram results to ~/results/garnet/r1/d100/set_p16.c1_SET_command_run_1.txt...
+Writing SET command HDR latency histogram results in HistogramLogProcessor format to ~/results/garnet/r1/d100/set_p16.c1_SET_command_run_1.hgrm...
+
+CPU Utilization Summary
+  Total CPU time:   257.429s  (user 126.102s, sys 131.326s)
+  Wall time:        20.002s
+  Cores used:       12.870   (avg 85.8% across 15 worker threads)
+  Peak utilization: 1307.5%
+Saving JSON output file: ~/results/garnet/r1/d100/set_p16.c1.json
+Json file closed.
+15        Threads
+10        Connections per thread
+20        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      4819080.51          ---          ---         0.49126         0.40700         2.41500         4.41500    695984.56 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    4819080.51         0.00         0.00         0.49126         0.40700         2.41500         4.41500    695984.56 
+rc=0

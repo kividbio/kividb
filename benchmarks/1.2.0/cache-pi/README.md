@@ -1,5 +1,7 @@
 # KiviDB as a cache on a small arm64 box (issue #202, rerun for 1.2.0)
 
+> **Rechecked on 1.2.0-rc8**, the code that ships as 1.2.0 ([rc8/](rc8/README.md)): GETs/s, hit rate, peak memory and tails level with rc7, and the comparisons with Redis held, with one LRU pair 8.3% behind Redis (rc7 9.3% on the same pair).
+
 ## What this answers
 
 On Hacker News, [imchuncai asked](https://news.ycombinator.com/item?id=50300421) about

@@ -1,0 +1,30 @@
+Json file /tmp/r/mset10_p1.c2.json created...
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 5%,   1 secs] 15 threads 40 conns:      399549 ops,  398673 (avg:  398673) ops/sec, 501.45MB/sec (avg: 501.45MB/sec),  1.50 (avg:  1.50) msec latency[RUN #1 10%,   2 secs] 15 threads 40 conns:      799996 ops,  400350 (avg:  399510) ops/sec, 503.56MB/sec (avg: 502.50MB/sec),  1.50 (avg:  1.50) msec latency[RUN #1 15%,   3 secs] 15 threads 40 conns:     1209447 ops,  409359 (avg:  402791) ops/sec, 514.89MB/sec (avg: 506.63MB/sec),  1.46 (avg:  1.49) msec latency[RUN #1 20%,   4 secs] 15 threads 40 conns:     1612223 ops,  402687 (avg:  402765) ops/sec, 506.50MB/sec (avg: 506.59MB/sec),  1.49 (avg:  1.49) msec latency[RUN #1 25%,   5 secs] 15 threads 40 conns:     2017573 ops,  405255 (avg:  403263) ops/sec, 509.73MB/sec (avg: 507.22MB/sec),  1.48 (avg:  1.48) msec latency[RUN #1 30%,   6 secs] 15 threads 40 conns:     2424535 ops,  406856 (avg:  403862) ops/sec, 511.74MB/sec (avg: 507.97MB/sec),  1.47 (avg:  1.48) msec latency[RUN #1 35%,   7 secs] 15 threads 40 conns:     2831163 ops,  406531 (avg:  404243) ops/sec, 511.33MB/sec (avg: 508.45MB/sec),  1.47 (avg:  1.48) msec latency[RUN #1 40%,   8 secs] 15 threads 40 conns:     3241733 ops,  410473 (avg:  405021) ops/sec, 516.29MB/sec (avg: 509.43MB/sec),  1.46 (avg:  1.48) msec latency[RUN #1 45%,   9 secs] 15 threads 40 conns:     3650957 ops,  409125 (avg:  405477) ops/sec, 514.59MB/sec (avg: 510.01MB/sec),  1.46 (avg:  1.48) msec latency[RUN #1 50%,  10 secs] 15 threads 40 conns:     4057777 ops,  406717 (avg:  405601) ops/sec, 511.57MB/sec (avg: 510.16MB/sec),  1.48 (avg:  1.48) msec latency[RUN #1 55%,  11 secs] 15 threads 40 conns:     4463983 ops,  406110 (avg:  405647) ops/sec, 510.80MB/sec (avg: 510.22MB/sec),  1.47 (avg:  1.48) msec latency[RUN #1 60%,  12 secs] 15 threads 40 conns:     4864056 ops,  399883 (avg:  405167) ops/sec, 502.97MB/sec (avg: 509.62MB/sec),  1.50 (avg:  1.48) msec latency[RUN #1 65%,  13 secs] 15 threads 40 conns:     5259082 ops,  394741 (avg:  404365) ops/sec, 496.50MB/sec (avg: 508.61MB/sec),  1.52 (avg:  1.48) msec latency[RUN #1 70%,  14 secs] 15 threads 40 conns:     5659584 ops,  400400 (avg:  404082) ops/sec, 503.62MB/sec (avg: 508.25MB/sec),  1.50 (avg:  1.48) msec latency[RUN #1 75%,  15 secs] 15 threads 40 conns:     6068086 ops,  408423 (avg:  404371) ops/sec, 513.71MB/sec (avg: 508.61MB/sec),  1.47 (avg:  1.48) msec latency[RUN #1 80%,  16 secs] 15 threads 40 conns:     6468716 ops,  400233 (avg:  404112) ops/sec, 503.41MB/sec (avg: 508.29MB/sec),  1.50 (avg:  1.48) msec latency[RUN #1 85%,  17 secs] 15 threads 40 conns:     6870681 ops,  401868 (avg:  403980) ops/sec, 505.46MB/sec (avg: 508.12MB/sec),  1.49 (avg:  1.48) msec latency[RUN #1 90%,  18 secs] 15 threads 40 conns:     7276612 ops,  405835 (avg:  404083) ops/sec, 510.46MB/sec (avg: 508.25MB/sec),  1.48 (avg:  1.48) msec latency[RUN #1 95%,  19 secs] 15 threads 40 conns:     7689678 ops,  412896 (avg:  404547) ops/sec, 519.34MB/sec (avg: 508.84MB/sec),  1.45 (avg:  1.48) msec latency[RUN #1 100%,  20 secs] 15 threads 40 conns:     8129136 ops,  440782 (avg:  406353) ops/sec, 554.41MB/sec (avg: 511.11MB/sec),  1.36 (avg:  1.47) msec latency[RUN #1 100%,  20 secs]  0 threads 40 conns:     8129217 ops,  440782 (avg:  406355) ops/sec, 554.41MB/sec (avg: 511.11MB/sec),  1.36 (avg:  1.47) msec latency
+
+Writing Full Run command HDR latency histogram results to /tmp/r/mset10_p1.c2_FULL_RUN_1.txt...
+Writing Full Run command HDR latency histogram results in HistogramLogProcessor format to /tmp/r/mset10_p1.c2_FULL_RUN_1.hgrm...
+Writing MSET command HDR latency histogram results to /tmp/r/mset10_p1.c2_MSET_command_run_1.txt...
+Writing MSET command HDR latency histogram results in HistogramLogProcessor format to /tmp/r/mset10_p1.c2_MSET_command_run_1.hgrm...
+
+CPU Utilization Summary
+  Total CPU time:   238.312s  (user 99.520s, sys 138.792s)
+  Wall time:        20.012s
+  Cores used:       11.909   (avg 79.4% across 15 worker threads)
+  Peak utilization: 1252.5%
+Saving JSON output file: /tmp/r/mset10_p1.c2.json
+Json file closed.
+15        Threads
+40        Connections per thread
+20        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Msets      406356.60         0.00         0.00         1.47488         0.86300         7.83900        12.47900    523378.11 
+Totals     406356.60         0.00         0.00         1.47488         0.86300         7.83900        12.47900   1046756.23 
+rc=0

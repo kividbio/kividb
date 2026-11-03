@@ -1,5 +1,7 @@
 # Profiling: is it I/O batching or faster command execution?
 
+> **Rechecked on 1.2.0-rc8**, the code that ships as 1.2.0 ([rc8/](rc8/README.md)): instructions per command are within 0.2% of rc7 on every workload, and still 19-20% fewer than Redis's for GET and SET.
+
 Asked on Hacker News ([Show HN: KiviDB](https://news.ycombinator.com/item?id=50152541)):
 
 > **AtalantaDB:** Have you looked into whether the advantage of your DB stems primarily from more

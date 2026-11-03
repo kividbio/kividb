@@ -1,0 +1,197 @@
+{
+  "engine": "kividb-m16-ef128",
+  "dataset": "h-and-m-2048-angular-filters",
+  "metrics_schema_version": 2,
+  "metrics_definitions": {
+    "mean_precision_at_returned": "hits / |deduped results kept (<= top)|",
+    "mean_recall": "hits / |valid, deduped ground-truth ids in expected[:top]|",
+    "precision_summary": "keyed by mean_precision_at_returned buckets",
+    "upstream_qdrant_mean_precisions": "len(ids & expected[:top]) / top — never emitted under that key here"
+  },
+  "engine_params": {
+    "schema_version": 1,
+    "phase": "run",
+    "invocation": {
+      "host": "SERVER_IP",
+      "engines_file": "kividb-engine.json",
+      "allow_partial_configs": false,
+      "allow_partial_corpus": false,
+      "dump_raw_latencies": false,
+      "dump_results": null,
+      "upload_reader": "auto",
+      "exit_on_error": true,
+      "fail_on_dropped_queries": false,
+      "keep_data": false,
+      "reset_between_configs": false,
+      "skip_if_exists": false,
+      "skip_search": false,
+      "skip_upload": false,
+      "skip_vector_index": false,
+      "repetitions": 3,
+      "warmup_seconds": 0.0,
+      "configurations_dir": "~/vdbx/experiments/configurations",
+      "results_dir": "~/vdbx/results"
+    },
+    "declared": {
+      "collection_params": {
+        "hnsw_config": {
+          "M": 16,
+          "EF_CONSTRUCTION": 128
+        }
+      },
+      "upload_params": {
+        "parallel": 16,
+        "batch_size": 64
+      }
+    },
+    "effective": {
+      "INDEXING_WAIT_SECS": 610,
+      "KIVIDB_INDEX_NAME": "idx",
+      "KIVIDB_INDEX_NAME_EXACT": false,
+      "KIVIDB_PORT": 6380,
+      "KIVIDB_QUERY_TIMEOUT": 60000,
+      "indexing_wait_phase": "upload_tail",
+      "upload_batch_size": 64,
+      "upload_parallel": 16
+    },
+    "env": {
+      "INDEXING_WAIT_SECS": null,
+      "KIVIDB_AUTH": null,
+      "KIVIDB_INDEX_NAME": null,
+      "KIVIDB_INDEX_NAME_EXACT": null,
+      "KIVIDB_PORT": "6380",
+      "KIVIDB_QUERY_TIMEOUT": null,
+      "KIVIDB_UPLOAD_BATCH_SIZE": null,
+      "KIVIDB_UPLOAD_PARALLEL": null,
+      "KIVIDB_USER": null
+    },
+    "overridden": [],
+    "ignored_declared_keys": {
+      "exhaustive": false,
+      "covers": "hnsw_config keys serde could not type, plus the CI-asserted KNOWN_UNREAD inventory for this engine",
+      "keys": []
+    }
+  },
+  "search_results": [
+    {
+      "search_id": 0,
+      "ef": "128",
+      "parallel": 1,
+      "mean_precision_at_returned": 0.9984385714285717,
+      "mean_recall": 0.9984385714285717,
+      "recall_p10": 1.0,
+      "mean_mrr": 0.9988744246031745,
+      "mean_ndcg": 0.9985076759329601,
+      "rps": 246.3873379090271,
+      "mean_time": 0.004051481727899986,
+      "p50_time": 0.0024328559999999997,
+      "p90_time": 0.010012377000000001,
+      "p95_time": 0.015230490149999998,
+      "p99_time": 0.01716631620000001,
+      "client_saturated": false,
+      "saturation_reason": "",
+      "oversubscribed": false,
+      "available_cores": 16,
+      "client_cpu_cores_used": 0.06809814143913287,
+      "calibration": null
+    },
+    {
+      "search_id": 1,
+      "ef": "128",
+      "parallel": 16,
+      "mean_precision_at_returned": 0.9984385714285713,
+      "mean_recall": 0.9984385714285713,
+      "recall_p10": 1.0,
+      "mean_mrr": 0.9988744246031747,
+      "mean_ndcg": 0.9985076759329596,
+      "rps": 3078.6190199379084,
+      "mean_time": 0.0051738835159000195,
+      "p50_time": 0.003083996,
+      "p90_time": 0.0127484489,
+      "p95_time": 0.01964788095,
+      "p99_time": 0.02225212179000001,
+      "client_saturated": false,
+      "saturation_reason": "",
+      "oversubscribed": false,
+      "available_cores": 16,
+      "client_cpu_cores_used": 0.5411192214111922,
+      "calibration": null
+    },
+    {
+      "search_id": 2,
+      "ef": "128",
+      "parallel": 100,
+      "mean_precision_at_returned": 0.9984385714285708,
+      "mean_recall": 0.9984385714285708,
+      "recall_p10": 1.0,
+      "mean_mrr": 0.9988744246031743,
+      "mean_ndcg": 0.9985076759329602,
+      "rps": 4501.088174525005,
+      "mean_time": 0.0220452023856,
+      "p50_time": 0.018354693,
+      "p90_time": 0.041177891099999996,
+      "p95_time": 0.050508373999999995,
+      "p99_time": 0.08362370740000001,
+      "client_saturated": false,
+      "saturation_reason": "parallel=100 > 16 cores (advisory)",
+      "oversubscribed": true,
+      "available_cores": 16,
+      "client_cpu_cores_used": 0.6919703614093452,
+      "calibration": null
+    }
+  ],
+  "precision_summary": {
+    "0.9975": {
+      "QPS": 4501.1,
+      "P50 (ms)": 18.355,
+      "P90 (ms)": 41.178,
+      "P95 (ms)": 50.508,
+      "recall": 0.9984,
+      "mrr": 0.9989,
+      "ndcg": 0.9985
+    }
+  },
+  "concurrency_curve": [
+    {
+      "ef": "128",
+      "max_qps": 4501.1,
+      "max_qps_parallel": 100,
+      "knee_parallel": null,
+      "points": [
+        {
+          "parallel": 1,
+          "qps": 246.4,
+          "p50_ms": 2.433,
+          "p90_ms": 10.012,
+          "p95_ms": 15.23,
+          "p99_ms": 17.166,
+          "recall": 0.9984,
+          "client_saturated": false
+        },
+        {
+          "parallel": 16,
+          "qps": 3078.6,
+          "p50_ms": 3.084,
+          "p90_ms": 12.748,
+          "p95_ms": 19.648,
+          "p99_ms": 22.252,
+          "recall": 0.9984,
+          "client_saturated": false
+        },
+        {
+          "parallel": 100,
+          "qps": 4501.1,
+          "p50_ms": 18.355,
+          "p90_ms": 41.178,
+          "p95_ms": 50.508,
+          "p99_ms": 83.624,
+          "recall": 0.9984,
+          "client_saturated": false
+        }
+      ]
+    }
+  ],
+  "uncalibrated_configs": [],
+  "skipped_config_files": [],
+  "rejected_experiments": []
+}

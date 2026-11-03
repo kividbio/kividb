@@ -1,5 +1,7 @@
 # Core string benchmark: KiviDB 1.2.0 against Redis, Redis Cluster, Valkey, Dragonfly and Garnet
 
+> **Rechecked on 1.2.0-rc8**, the code that ships as 1.2.0 ([rc8/](rc8/README.md)): no row slower than rc7, and **MSET of 10 keys 3.3 times as fast** (172K to 569K commands/s, p99 9.6 to 2.9 ms), level with Dragonfly and at 0.71 of Garnet. The competitors' numbers held within -4% to +6%.
+
 GET and SET at 100 B, 1 KB and 2 KB, with and without pipelining, plus MGET and MSET
 of 10 keys. Seven engines ran one at a time on the same 32-vCPU arm64 server, measured
 from two load generators at once. Every row has at least three rounds and p50 / p99 / p99.9.
@@ -26,7 +28,7 @@ The run answers these points from the [Show HN thread](https://news.ycombinator.
 - **Without pipelining**, KiviDB (1.73M GET) and Dragonfly (1.65M) both use up our two load generators (95% CPU), so those rows are a floor, not a ceiling. Garnet does 1.05M with a high tail: p99 6.4 ms against about 1 ms for KiviDB and Dragonfly.
 - **1 KB and 2 KB values**: with pipelining, every fast engine stops at the same rate, the server's 16 Gbps NIC: ~1.87M GET/s at 1 KB and ~0.94M at 2 KB. These rows compare latency and CPU, not throughput. (In one 1 KB round the NIC briefly carried twice that, and KiviDB served 3.36M GET/s; see [Caveats](#caveats).)
 - **MGET of 10 keys**: KiviDB leads at 1.16M commands/s (11.6M keys/s), against Garnet 0.79M and Dragonfly 0.64M; KiviDB's row is client-bound.
-- **MSET of 10 keys is KiviDB's clear loss**: 166K commands/s against Garnet 761K (4.6×) and Dragonfly 557K (3.4×). It is about level with Redis (150K). See [MSET](#mset-of-10-keys-a-clear-loss).
+- **MSET of 10 keys was KiviDB's clear loss** in this run: 166K commands/s against Garnet 761K (4.6×) and Dragonfly 557K (3.4×), about level with Redis (150K). See [MSET](#mset-of-10-keys-a-clear-loss). **1.2.0-rc8 fixes it:** 569K, level with Dragonfly (561K) and 0.71 of Garnet (800K) in the [rc8 round](rc8/README.md).
 - **1.2.0 against 1.2.0-rc4** (six alternating rounds each, same machines, same session): **no regression.**
   - All 14 rows are inside the run-to-run spread. Medians are −0.5% to +0.7%, and p99 moved by at most 0.15 ms.
   - Server CPU profiles of the two builds under load are the same, function by function. See [Against 1.2.0-rc4](#against-120-rc4).
@@ -296,6 +298,8 @@ The regression check for the code that ships. 1.2.0 (`75482ab`) and rc4 alternat
 - **Without pipelining**: Dragonfly and KiviDB are level, and both rows are limited by our load generators. The README's bare-metal run, with a 64-vCPU load generator, measured 3.07M for KiviDB and 3.35M for Dragonfly at this depth.
 
 ### MSET of 10 keys: a clear loss
+
+**Fixed in 1.2.0-rc8.** A profile showed the workers asleep 75% of the time, waiting on shard locks (40%) and write-order stripes (35%), each held only a few microseconds: an MSET took its shards one by one and slept on a busy one while it held the others. rc8 never waits for a shard while it holds another, spins briefly before it sleeps, and takes the write-order stripes shared when nothing reads the write stream. MSET of 10 keys went from 172K to 569K commands/s at 1,200 connections, p99 from 9.6 to 2.9 ms, with single-key GET and SET unchanged ([rc8 round](rc8/README.md)). The analysis below is of the build before the fix.
 
 | | MSET 10 keys, commands/s | server CPU busy | p99 |
 |---|---:|---:|---:|

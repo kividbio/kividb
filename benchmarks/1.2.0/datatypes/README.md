@@ -1,5 +1,7 @@
 # Data types at 100 B and 2 KB: lists, hashes, sets, sorted sets, counters
 
+> **Rechecked on 1.2.0-rc8**, the code that ships as 1.2.0 ([rc8/](rc8/README.md)): all 42 rows within the run-to-run spread of rc7, and the comparisons with Redis, Valkey and Dragonfly held. Redis Cluster's lead on HSET and INCR was smaller in that round (+9% and +3%), with the client again the limit, so its rows are lower bounds.
+
 Asked on Hacker News ([Show HN: KiviDB](https://news.ycombinator.com/item?id=50152541)):
 
 > **edoceo:** Could you add Valkey to the benchmark? Curious about different key-types too, like list and hash.

@@ -1,0 +1,57 @@
+1793676811.812 RUN ./vector-db-benchmark --host SERVER_IP --engines-file dragonfly-engine.json --engines dragonfly-m16-ef128 --datasets h-and-m-2048-angular-filters --skip-if-exists false --parallels 100
+1793676811.820 vector-db-benchmark 0.2.0 (git d22d44e8b46009a800a59e952710166ece2e38a1)
+1793676811.821 Found 1 datasets, 1 engines
+1793676811.823 
+1793676811.825 ============================================================
+1793676811.827 Running experiment (1/1): dragonfly-m16-ef128 - h-and-m-2048-angular-filters
+1793676811.828 ============================================================
+1793676811.830 Experiment stage: Configure
+1793676811.832 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 128}
+1793676812.061 Experiment stage: Upload
+1793676812.063 Reading dataset from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793676813.763 Read 105100 vectors (2048d) in 1.701s (61779 vectors/sec)
+1793676813.766 Starting upload with 16 threads, batch size 64...
+1793676823.522 Upload time: 9.759s (10770 records/sec)
+1793676823.523 Indexing complete (num_docs=105100/105100, indexing=false, percent_indexed=1.00, state=absent) in 0.0s
+1793676823.525 Index time: 0.002s, Total time (read+upload+index): 11.462s
+1793676823.735 Results saved to: "/home/azureuser/vdbx/results/dragonfly-m16-ef128-h-and-m-2048-angular-filters-upload-0-105100-2026-11-03-03-33-43.json"
+1793676825.362 Experiment stage: Search
+1793676825.363 	Running search 2: ef=128, parallel=100
+1793676825.365 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793676839.966 	  rep 1/3: QPS 790.2
+1793676839.968 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793676854.359 	  rep 2/3: QPS 804.8
+1793676854.361 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793676868.869 	  rep 3/3: QPS 796.0
+1793676868.871 	→ QPS: 804.8, Recall: 0.9981, Precision@returned: 0.9981, MRR: 0.9989, NDCG: 0.9982 (best of reps)
+1793676868.887 	Results saved to: "/home/azureuser/vdbx/results/dragonfly-m16-ef128-h-and-m-2048-angular-filters-search-2-32628-2026-11-03-03-34-28.json"
+1793676868.888 -----------------------------------------------------------------------------------------------
+1793676868.890 Recall     Precision  MRR      NDCG     QPS        P50 (ms)     P90 (ms)     P95 (ms)    
+1793676868.892 -----------------------------------------------------------------------------------------------
+1793676868.894 0.9981     0.9981     0.9989   0.9982   804.8      118.303      196.319      220.554     
+1793676868.896 
+1793676868.898 
+1793676868.900 QPS vs Precision Trade-off - dragonfly-m16-ef128 - h-and-m-2048-angular-filters (up and to the right is better):
+1793676868.901 
+1793676868.903      805 │●                                                           
+1793676868.905      732 │                                                            
+1793676868.907      658 │                                                            
+1793676868.909      585 │                                                            
+1793676868.911      512 │                                                            
+1793676868.913      439 │                                                            
+1793676868.915      366 │                                                            
+1793676868.916      293 │                                                            
+1793676868.918      219 │                                                            
+1793676868.920      146 │                                                            
+1793676868.922       73 │                                                            
+1793676868.924        0 │                                                            
+1793676868.926          └────────────────────────────────────────────────────────────
+1793676868.927           0.998          1.001          1.005          1.008          
+1793676868.929         Precision (0.0 = 0%, 1.0 = 100%)
+1793676868.931 
+1793676868.933 ================================================================================
+1793676868.935 Results saved to:  /home/azureuser/vdbx/results
+1793676868.937 Summary saved to:  /home/azureuser/vdbx/results/dragonfly-m16-ef128-h-and-m-2048-angular-filters-summary.json
+1793676868.938 Experiment stage: Cleanup (deleting index and data)
+1793676869.727 Experiment stage: Done
+1793676869.794 EXIT 0

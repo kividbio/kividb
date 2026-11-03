@@ -1,5 +1,7 @@
 # Vector search: KiviDB 1.2.0 vs Redis 8.10.2 vs Dragonfly 2.0.2
 
+> **Rechecked on 1.2.0-rc8**, the code that ships as 1.2.0 ([rc8/](rc8/README.md)): every search point and ingest time within rc7's run-to-run spread, recall within 0.0008, and the comparisons with Redis and Dragonfly held.
+
 KiviDB 1.2.0 against Redis 8.10.2 (with its built-in query engine) and Dragonfly 2.0.2, on four
 public datasets, with
 [redis/vector-db-benchmark](https://github.com/redis/vector-db-benchmark). Each run reports

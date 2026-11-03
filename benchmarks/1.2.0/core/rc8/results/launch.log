@@ -1,0 +1,22 @@
+2026-11-03T02:47:29Z  kividb-rc8  [kividb 1.2.0-rc8]
+    ~/bin/kividb-rc8 --port 6379 --bind 0.0.0.0
+2026-11-03T02:54:33Z  kividb-rc7  [kividb 1.2.0-rc7]
+    ~/bin/kividb-rc7 --port 6379 --bind 0.0.0.0
+2026-11-03T03:01:38Z  kividb-rc7  [kividb 1.2.0-rc7]
+    ~/bin/kividb-rc7 --port 6379 --bind 0.0.0.0
+2026-11-03T03:08:41Z  kividb-rc8  [kividb 1.2.0-rc8]
+    ~/bin/kividb-rc8 --port 6379 --bind 0.0.0.0
+2026-11-03T03:15:44Z  garnet  [Garnet v2.2.5]
+    ~/garnet/GarnetServer --port 6379 --bind 0.0.0.0 --index 1g --memory 64g
+2026-11-03T03:17:36Z  dragonfly  [dragonfly v2.0.2-8ce4bbb106586057fbd85f71ed353c60d0d5bf87]
+    ~/bin/dragonfly --port 6379 --bind 0.0.0.0 --dbfilename  --logtostderr
+2026-11-03T03:19:18Z  redis  [Redis server v=8.10.3 sha=00000000:1 malloc=jemalloc-5.3.0 bits=64 build=7fec7ff4b6c82936]
+    ~/bin/redis-server --port 6379 --bind 0.0.0.0 --protected-mode no --save  --appendonly no --io-threads 24
+2026-11-03T03:21:11Z  kividb-rc8  [kividb 1.2.0-rc8]
+    ~/bin/kividb-rc8 --port 6379 --bind 0.0.0.0
+2026-11-03T03:24:41Z  kividb-rc7  [kividb 1.2.0-rc7]
+    ~/bin/kividb-rc7 --port 6379 --bind 0.0.0.0
+2026-11-03T03:28:12Z  kividb-rc7  [kividb 1.2.0-rc7]
+    ~/bin/kividb-rc7 --port 6379 --bind 0.0.0.0
+2026-11-03T03:31:42Z  kividb-rc8  [kividb 1.2.0-rc8]
+    ~/bin/kividb-rc8 --port 6379 --bind 0.0.0.0

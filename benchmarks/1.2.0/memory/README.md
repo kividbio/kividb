@@ -1,5 +1,7 @@
 # Memory: bytes per key, memory over time, snapshots, active defrag (KiviDB 1.2.0)
 
+> **Rechecked on 1.2.0-rc8**, the code that ships as 1.2.0 ([rc8/](rc8/README.md)): bytes per key, growth to 50M keys, mixed load, eviction during a snapshot, active defrag and AOF-on writes are level with rc7, and the comparisons held. A `BGSAVE` took 1.6% longer (and added 1.8% more memory, in proportion) in both rounds on other VMs; rc8 changes nothing on the save path and its CPU per write and profile are rc7's, so this is not put down to rc8.
+
 Measured on the 1.2.0 release candidate, branch `release/1.2.0` at commit **75482abb** (`--version` 1.2.0-rc6
 until rc7 is tagged), against **1.2.0-rc4** (a6b1bf38) and the same competitors as before, all in one session on
 2026-11-02, on the same machines.

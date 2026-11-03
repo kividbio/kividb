@@ -1,0 +1,32 @@
+Json file ~/results/dragonfly/r1/d100/warmup/warm.c1.json created...
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 20%,   1 secs] 15 threads 10 conns:     3101154 ops, 3099498 (avg: 3099498) ops/sec, 422.37MB/sec (avg: 422.37MB/sec),  0.76 (avg:  0.76) msec latency[RUN #1 40%,   2 secs] 15 threads 10 conns:     5946621 ops, 2845034 (avg: 2972291) ops/sec, 387.69MB/sec (avg: 405.03MB/sec),  0.83 (avg:  0.80) msec latency[RUN #1 60%,   3 secs] 15 threads 10 conns:     8817715 ops, 2870580 (avg: 2938391) ops/sec, 391.17MB/sec (avg: 400.41MB/sec),  0.83 (avg:  0.81) msec latency[RUN #1 80%,   4 secs] 15 threads 10 conns:    11666836 ops, 2848366 (avg: 2915885) ops/sec, 388.14MB/sec (avg: 397.35MB/sec),  0.83 (avg:  0.81) msec latency[RUN #1 100%,   5 secs] 15 threads 10 conns:    14494704 ops, 2828402 (avg: 2898395) ops/sec, 385.42MB/sec (avg: 394.96MB/sec),  0.84 (avg:  0.82) msec latency[RUN #1 100%,   5 secs]  0 threads 10 conns:    14495538 ops, 2828402 (avg: 2898482) ops/sec, 385.42MB/sec (avg: 394.97MB/sec),  0.84 (avg:  0.82) msec latency
+
+Writing Full Run command HDR latency histogram results to ~/results/dragonfly/r1/d100/warmup/warm.c1_FULL_RUN_1.txt...
+Writing Full Run command HDR latency histogram results in HistogramLogProcessor format to ~/results/dragonfly/r1/d100/warmup/warm.c1_FULL_RUN_1.hgrm...
+Writing GET command HDR latency histogram results to ~/results/dragonfly/r1/d100/warmup/warm.c1_GET_command_run_1.txt...
+Writing GET command HDR latency histogram results in HistogramLogProcessor format to ~/results/dragonfly/r1/d100/warmup/warm.c1_GET_command_run_1.hgrm...
+
+CPU Utilization Summary
+  Total CPU time:   42.654s  (user 18.619s, sys 24.035s)
+  Wall time:        5.003s
+  Cores used:       8.526   (avg 56.8% across 15 worker threads)
+  Peak utilization: 920.8%
+Saving JSON output file: ~/results/dragonfly/r1/d100/warmup/warm.c1.json
+Json file closed.
+15        Threads
+10        Connections per thread
+5         Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets            0.00          ---          ---             ---             ---             ---             ---         0.00 
+Gets      2898574.84   2898574.84         0.00         0.81839         0.80700         1.39900         2.84700    404466.81 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    2898574.84   2898574.84         0.00         0.81839         0.80700         1.39900         2.84700    404466.81 
+rc=0

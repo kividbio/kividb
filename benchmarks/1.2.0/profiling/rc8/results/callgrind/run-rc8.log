@@ -1,0 +1,31 @@
+DEL rc8 4482
+GET-100-TTL rc8 3412
+SET-100-TTL rc8 5660
+INCR-TTL rc8 4152
+DEL-TTL rc8 5400
+GET-100-LRU rc8 3695
+SET-100-LRU rc8 4626
+INCR-LRU rc8 4427
+DEL-LRU rc8 4820
+GET-100-LFU rc8 3905
+SET-100-LFU rc8 4963
+INCR-LFU rc8 4728
+workload             rc7           rc8
+GET-100             3338          3342     +0.1%
+SET-100             4268          4270     +0.0%
+GET-1K              3853          3859     +0.2%
+SET-1K              4392          4389     -0.1%
+MIX-100             7640          7638     -0.0%
+INCR                4090          4089     -0.0%
+DEL                 4490          4482     -0.2%
+GET-100-TTL          3416          3412     -0.1%
+SET-100-TTL          5675          5660     -0.3%
+INCR-TTL            4161          4152     -0.2%
+DEL-TTL             5416          5400     -0.3%
+GET-100-LRU          3689          3695     +0.2%
+SET-100-LRU          4632          4626     -0.1%
+INCR-LRU            4437          4427     -0.2%
+DEL-LRU             4837          4820     -0.4%
+GET-100-LFU          3900          3905     +0.1%
+SET-100-LFU          4969          4963     -0.1%
+INCR-LFU            4732          4728     -0.1%
