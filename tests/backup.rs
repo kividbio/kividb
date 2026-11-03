@@ -855,6 +855,34 @@ fn a_single_snapshot_can_be_preloaded() {
     assert_eq!(restored.conn().cmd(&["GET", "from-snapshot"]).s(), "yes");
 }
 
+/// A hash loaded from `dump.kdb` whose fields all expire after the restart
+/// is deleted when they do, like one written since: the sweep watches it.
+#[test]
+fn hashes_loaded_from_a_snapshot_lose_their_expired_fields_and_go() {
+    let mut server = Server::start(&[]);
+    let mut c = server.conn();
+    c.cmd(&["HSET", "h1", "f1", "v1"]);
+    c.cmd(&["HPEXPIRE", "h1", "3000", "FIELDS", "1", "f1"]);
+    c.cmd(&["HSET", "h2", "f1", "v1", "f2", "v2"]);
+    c.cmd(&["HPEXPIRE", "h2", "3000", "FIELDS", "2", "f1", "f2"]);
+    c.cmd(&["HSET", "h3", "f1", "v1", "f2", "v2"]);
+    c.cmd(&["HPEXPIRE", "h3", "3000", "FIELDS", "1", "f1"]);
+    assert!(c.cmd(&["SAVE"]).ok());
+    drop(c);
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    server.child = kividb(&server.dir, server.port, &[])
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("could not restart kividb");
+
+    let mut c = server.conn();
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 3);
+    std::thread::sleep(Duration::from_millis(4500));
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 1);
+    assert_eq!(c.cmd(&["HLEN", "h3"]).i(), 1);
+}
+
 // ── AOF replay ────────────────────────────────────────────────────────────────
 
 /// Writes that give a TTL as "this long from now", in every spelling, and the
