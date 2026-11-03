@@ -36,6 +36,9 @@ other files:
 - LangChain's Redis integration (`langchain-redis`): vector store, LLM and semantic cache, chat history:
   [benchmarks/langchain-compat/REPORT.md](../benchmarks/langchain-compat/REPORT.md) and
   [docs/integrations/langchain.md](integrations/langchain.md).
+- LangGraph's Redis checkpointer and store (`langgraph-checkpoint-redis`):
+  [benchmarks/langgraph-compat/REPORT.md](../benchmarks/langgraph-compat/REPORT.md) and
+  [docs/integrations/langgraph.md](integrations/langgraph.md).
 - `redis-py` throughout the end-to-end tests (`tests/e2e/`).
 
 ## Differences you may notice
