@@ -480,6 +480,21 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **A master handed over by `CLUSTER FAILOVER` is continued by its
+  successor.** After a manual failover (the Kubernetes operator's graceful
+  handover), the old master became a replica of the promoted one and was
+  sent the whole dataset. A master that became a replica kept no record of
+  where its own stream stood, so it could only ask for everything; and the
+  replica `PING` went on during the failover's write pause, taking the old
+  master's offset past the point its replica was promoted at. A master that
+  becomes a replica now keeps where its stream stands, read with no write
+  half-way, as where its dataset stands, and the promoted replica, which
+  carries that stream on, continues it from there (as Redis does with a
+  demoted master's own stream). No replica `PING` is written while writes
+  are paused, as in Redis; expiry already waited. A write the node makes
+  of its own afterwards, or any difference in offset, still means a full
+  sync. In 1.1.x too.
+
 - **A cluster replica in a full sync does not stand for election.** A
   replica measured its data's age from the moment its link to the master
   went down, and the link counts as up from the end of each load. A replica

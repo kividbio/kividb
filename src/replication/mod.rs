@@ -1102,6 +1102,40 @@ impl ReplState {
 
     #[inline]
     pub fn become_slave(&self) {
+        // A master's dataset is its own write stream up to where that stream
+        // stands, read where no write is half-way. Kept as where this node
+        // stands, a master that continues the stream — its replica, promoted
+        // in a failover — continues this node from there instead of sending
+        // it everything (as Redis keeps a demoted master's stream as its
+        // cached master). Only while the stream counted every write
+        // (`feeds_hub`); a write of this node's own after it clears it
+        // (`note_local_write`). The new master continues it only if it read
+        // exactly this far: a byte more here, and it sends the dataset.
+        let was_master = !self.slave_mode.load(Ordering::Acquire);
+        let _cut = if was_master {
+            crate::write_gate::cut()
+        } else {
+            None
+        };
+        if was_master && self.feeds_hub() {
+            let offset = self.repl_offset.load(Ordering::Relaxed);
+            if offset > 0 {
+                let db = match self.repl_stream_last_db.load(Ordering::Relaxed) {
+                    u64::MAX => 0,
+                    db => db as usize,
+                };
+                let repl_id = self.repl_id();
+                log_info!(
+                    "Replication: This node's dataset is offset {offset} of its own stream \
+                     {repl_id}: a master that continues that stream can continue this node"
+                );
+                self.set_resync_point(Some(ResyncPoint {
+                    repl_id,
+                    offset,
+                    db,
+                }));
+            }
+        }
         self.slave_mode.store(true, Ordering::Release);
         *self.role.write() = "slave".into();
         // Its own replicas would get nothing from here on: a replica does
@@ -2135,7 +2169,13 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                     // the end or not sent.
                     {
                         let _gate = crate::write_gate::enter();
-                        if state.stream_closed.load(Ordering::SeqCst) {
+                        // Nor while writes are paused (a manual failover's
+                        // handoff, `CLIENT PAUSE`), as in Redis: a replica
+                        // promoted at the offset it was told to reach must
+                        // find this node there when it follows it.
+                        if state.stream_closed.load(Ordering::SeqCst)
+                            || crate::pause::expiry_deferred()
+                        {
                             continue;
                         }
                         state
@@ -4455,6 +4495,29 @@ mod replication_invariants_tests {
         hub.send(HubMsg::Barrier(done_tx)).unwrap();
         done_rx.await.unwrap();
         assert_eq!(ReplState::count_reached(&targets), 1);
+    }
+
+    /// A master that becomes a replica keeps where its own stream stands as
+    /// where its dataset stands: its replica, promoted, continues it from
+    /// there. Not when the stream did not count every write.
+    #[test]
+    fn a_demoted_master_keeps_its_own_stream_position() {
+        let s = ReplState::new_master();
+        s.backlog_active.store(true, Ordering::Relaxed);
+        s.repl_offset.store(1234, Ordering::Relaxed);
+        let id = s.repl_id();
+        s.become_slave();
+        let point = s.resync_point.lock().clone().expect("a resync point");
+        assert_eq!((point.repl_id.as_str(), point.offset), (id.as_str(), 1234));
+        assert_ne!(s.repl_id(), id);
+        // Already a replica: a re-point keeps what it has.
+        s.become_slave();
+        assert_eq!(s.resync_point.lock().as_ref().map(|p| p.offset), Some(1234));
+
+        let quiet = ReplState::new_master();
+        quiet.repl_offset.store(99, Ordering::Relaxed);
+        quiet.become_slave();
+        assert!(quiet.resync_point.lock().is_none());
     }
 
     /// Link state drives both `ROLE` and `master_link_status`; "up" must mean
