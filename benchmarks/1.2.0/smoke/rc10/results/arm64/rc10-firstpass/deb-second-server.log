@@ -1,0 +1,59 @@
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc10 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc10
+  * Mode           : standalone
+  * OS             : linux aarch64
+  * Memory         : 15GiB available
+  * CPUs           : 4 cores detected
+  * Listening on   : 127.0.0.1:6399
+  * Worker threads : 2
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-03T14:35:29.371Z 8835 [INFO] KiviDB 1.2.0-rc10 starting: pid 8835, default build, config file '/etc/kividb/kividb.conf'
+2026-11-03T14:35:29.371Z 8835 [INFO] I/O model      : io_uring
+2026-11-03T14:35:29.372Z 8835 [INFO] Shards per DB  : 32
+2026-11-03T14:35:29.372Z 8835 [INFO] I/O model      : io_uring
+2026-11-03T14:35:29.372Z 8835 [INFO] Found dump.kdb — loading native snapshot
+2026-11-03T14:35:29.388Z 8835 [INFO] Loaded 20000 keys from snapshot (0 with a TTL)
+2026-11-03T14:35:29.388Z 8835 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+2026-11-03T14:35:29.391Z 8835 [INFO] Replication: dataset fingerprinted in 2 ms — a replica that holds the same data will be continued rather than sent it
+2026-11-03T14:35:29.392Z 8835 [INFO] Ready to accept connections on 127.0.0.1:6399
+2026-11-03T14:35:35.352Z 8835 [INFO] SHUTDOWN command received — shutting down
+2026-11-03T14:35:35.352Z 8835 [INFO] Writing final snapshot...
+2026-11-03T14:35:35.378Z 8835 [INFO] AOF: rebased onto dump.kdb (generation 5) — log is now the delta
+2026-11-03T14:35:35.379Z 8835 [INFO] Goodbye.

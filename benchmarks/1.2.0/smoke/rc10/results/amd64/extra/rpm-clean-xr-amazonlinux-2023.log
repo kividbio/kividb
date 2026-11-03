@@ -1,0 +1,47 @@
+Amazon Linux 2023 repository                     38 MB/s |  87 MB     00:02    
+Last metadata expiration check: 0:00:15 ago on Tue Nov  3 14:47:27 2026.
+Dependencies resolved.
+================================================================================
+ Package          Arch       Version                     Repository        Size
+================================================================================
+Installing:
+ kividb           x86_64     1.2.0~rc10-1                @commandline     6.1 M
+Installing dependencies:
+ libsemanage      x86_64     3.4-5.amzn2023.0.2          amazonlinux      121 k
+ shadow-utils     x86_64     2:4.9-12.amzn2023.0.4       amazonlinux      1.1 M
+
+Transaction Summary
+================================================================================
+Install  3 Packages
+
+Total size: 7.3 M
+Total download size: 1.2 M
+Installed size: 20 M
+Downloading Packages:
+(1/2): libsemanage-3.4-5.amzn2023.0.2.x86_64.rp 5.3 MB/s | 121 kB     00:00    
+(2/2): shadow-utils-4.9-12.amzn2023.0.4.x86_64.  23 MB/s | 1.1 MB     00:00    
+--------------------------------------------------------------------------------
+Total                                           956 kB/s | 1.2 MB     00:01     
+Running transaction check
+Transaction check succeeded.
+Running transaction test
+Transaction test succeeded.
+Running transaction
+  Preparing        :                                                        1/1 
+  Installing       : libsemanage-3.4-5.amzn2023.0.2.x86_64                  1/3 
+  Installing       : shadow-utils-2:4.9-12.amzn2023.0.4.x86_64              2/3 
+  Running scriptlet: kividb-1.2.0~rc10-1.x86_64                             3/3 
+useradd: Warning: missing or non-executable shell '/usr/sbin/nologin'
+
+  Installing       : kividb-1.2.0~rc10-1.x86_64                             3/3 
+  Running scriptlet: kividb-1.2.0~rc10-1.x86_64                             3/3 
+  Verifying        : libsemanage-3.4-5.amzn2023.0.2.x86_64                  1/3 
+  Verifying        : shadow-utils-2:4.9-12.amzn2023.0.4.x86_64              2/3 
+  Verifying        : kividb-1.2.0~rc10-1.x86_64                             3/3 
+
+Installed:
+  kividb-1.2.0~rc10-1.x86_64                                                    
+  libsemanage-3.4-5.amzn2023.0.2.x86_64                                         
+  shadow-utils-2:4.9-12.amzn2023.0.4.x86_64                                     
+
+Complete!

@@ -1,0 +1,2 @@
+RESULT rc10-amd64 100 1
+FAIL: deb: a restart had to wait for the lock -- Nov 03 14:35:29 smk-x kividb[8931]: 2026-11-03T14:35:29.319Z 8931 [WARN] The data directory /var/lib/kividb is in use by another process (it holds kividb.lock): waiting for it to be free (0s so far)

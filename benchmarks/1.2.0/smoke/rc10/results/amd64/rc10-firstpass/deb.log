@@ -1,0 +1,38 @@
+PASS: deb: dpkg -i
+PASS: deb: unit active and serving after install
+PASS: deb: CONFIG GET repl-backlog-size = 67108864 (64 MB)
+PASS: deb: CONFIG GET shutdown-timeout = 10
+PASS: deb: /var/lib/kividb/kividb.lock exists (kividb 644)
+INFO: deb: 20000 keys loaded
+PASS: deb: systemctl restart #1 returned in 0.06s, serving
+PASS: deb: systemctl restart #2 returned in 0.06s, serving
+PASS: deb: systemctl restart #3 returned in 0.05s, serving
+Job for kividb.service failed.
+See "systemctl status kividb.service" and "journalctl -xeu kividb.service" for details.
+FAIL: deb: systemctl restart #4 hung or failed -- exit 1 after 0.05s
+Job for kividb.service failed.
+See "systemctl status kividb.service" and "journalctl -xeu kividb.service" for details.
+FAIL: deb: systemctl restart #5 hung or failed -- exit 1 after 0.02s
+FAIL: deb: keys across restarts -- 20000 -> 
+PASS: deb: no restart waited for the lock (journal has no in-use line)
+PASS: deb: systemctl stop in 0.01s, unit inactive (start-limit-hit)
+Job for kividb.service failed.
+See "systemctl status kividb.service" and "journalctl -xeu kividb.service" for details.
+FAIL: deb: start after stop -- 
+FAIL: deb: no restart after SIGKILL -- Nov 03 14:34:39 smk-x systemd[1]: Failed to start kividb.service - KiviDB in-memory database.
+Nov 03 14:34:39 smk-x systemd[1]: kividb.service: Start request repeated too quickly.
+Nov 03 14:34:39 smk-x systemd[1]: kividb.service: Failed with result 'start-limit-hit'.
+Nov 03 14:34:39 smk-x systemd[1]: Failed to start kividb.service - KiviDB in-memory database.
+FAIL: deb: keys after SIGKILL -- 20000 -> 
+FAIL: deb: second server did not log in-use -- 2026-11-03T14:35:26.336Z 8831 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+2026-11-03T14:35:26.339Z 8831 [INFO] Replication: dataset fingerprinted in 2 ms — a replica that holds the same data will be continued rather than sent it
+2026-11-03T14:35:26.339Z 8831 [INFO] Ready to accept connections on 127.0.0.1:6399
+FAIL: deb: the second server serves while the unit holds the dir -- 
+FAIL: deb: the unit stopped serving -- 
+PASS: deb: systemctl stop (0.01s) lets the waiting server take over
+FAIL: deb: no 'free after' line -- 
+PASS: deb: the hand-started server has the 20000 keys
+PASS: deb: the unit waits while the hand-started server holds the dir (active)
+PASS: deb: the unit comes up once the hand-started server exits
+PASS: deb: the unit's journal logs the wait
+PASS: deb: purge stops it

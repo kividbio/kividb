@@ -1,0 +1,108 @@
+=== rc10 checks v1.2.0-rc10 on amd64 ===
+PASS: tarball-default: --version has 1.2.0-rc10
+PASS: tarball-default: CONFIG GET repl-backlog-size = 67108864 (64 MB)
+PASS: tarball-default: CONFIG GET shutdown-timeout = 10
+PASS: tarball-default: a second server in the same dir logs [The data directory <dir>/data is in use by another process (it holds kividb.lock): waiting for it to be free]
+PASS: tarball-default: the second server does not serve while it waits
+PASS: tarball-default: the second server keeps waiting (still running after 3 s)
+PASS: tarball-default: after SHUTDOWN of the first, the second starts serving in 0.39s
+PASS: tarball-default: it logs [The data directory is free after 3.2s: starting]
+PASS: tarball-default: the second server has the first one's 20000 keys
+PASS: tarball-default: a third server waits while the second holds the dir
+PASS: tarball-default: after kill -9 of the holder, the waiting server takes over
+PASS: tarball-default: and has the 20000 keys (AOF replay)
+PASS: tarball-default: kividb.lock is in the data directory
+PASS: tarball-lua: --version has 1.2.0-rc10
+PASS: tarball-lua: CONFIG GET repl-backlog-size = 67108864 (64 MB)
+PASS: tarball-lua: CONFIG GET shutdown-timeout = 10
+PASS: tarball-tls: --version has 1.2.0-rc10
+PASS: tarball-tls: CONFIG GET repl-backlog-size = 67108864 (64 MB)
+PASS: tarball-tls: CONFIG GET shutdown-timeout = 10
+PASS: tarball-full: --version has 1.2.0-rc10
+PASS: tarball-full: CONFIG GET repl-backlog-size = 67108864 (64 MB)
+PASS: tarball-full: CONFIG GET shutdown-timeout = 10
+PASS: image-ghcr-default: CONFIG GET repl-backlog-size = 67108864 (64 MB)
+PASS: image-ghcr-default: CONFIG GET shutdown-timeout = 10
+PASS: image-ghcr-lua: CONFIG GET repl-backlog-size = 67108864 (64 MB)
+PASS: image-ghcr-lua: CONFIG GET shutdown-timeout = 10
+PASS: image-ghcr-tls: CONFIG GET repl-backlog-size = 67108864 (64 MB)
+PASS: image-ghcr-tls: CONFIG GET shutdown-timeout = 10
+PASS: image-ghcr-full: CONFIG GET repl-backlog-size = 67108864 (64 MB)
+PASS: image-ghcr-full: CONFIG GET shutdown-timeout = 10
+PASS: image-hub-default: CONFIG GET repl-backlog-size = 67108864 (64 MB)
+PASS: image-hub-default: CONFIG GET shutdown-timeout = 10
+PASS: image-hub-lua: CONFIG GET repl-backlog-size = 67108864 (64 MB)
+PASS: image-hub-lua: CONFIG GET shutdown-timeout = 10
+PASS: image-hub-tls: CONFIG GET repl-backlog-size = 67108864 (64 MB)
+PASS: image-hub-tls: CONFIG GET shutdown-timeout = 10
+PASS: image-hub-full: CONFIG GET repl-backlog-size = 67108864 (64 MB)
+PASS: image-hub-full: CONFIG GET shutdown-timeout = 10
+PASS: image: a second container on the same volume logs [The data directory /home/kividb is in use by another process (it holds kividb.lock): waiting for it to be free]
+PASS: image: the second container does not serve while it waits
+PASS: image: docker stop of the holder took 0.26s, exit code 0 (not killed at the 10 s grace)
+PASS: image: the second container takes over after the first stops
+PASS: image: and has the first one's 20000 keys
+PASS: image: docker restart, back in 0.64s
+PASS: deb: dpkg -i
+PASS: deb: unit active and serving after install
+PASS: deb: CONFIG GET repl-backlog-size = 67108864 (64 MB)
+PASS: deb: CONFIG GET shutdown-timeout = 10
+PASS: deb: /var/lib/kividb/kividb.lock exists (kividb 644)
+INFO: deb: 20000 keys loaded
+PASS: deb: systemctl restart #1 returned in 0.05s, serving
+PASS: deb: systemctl restart #2 returned in 0.05s, serving
+PASS: deb: systemctl restart #3 returned in 0.05s, serving
+PASS: deb: systemctl restart #4 returned in 0.06s, serving
+PASS: deb: systemctl restart #5 returned in 0.06s, serving
+PASS: deb: 20000 keys kept across 5 restarts
+PASS: deb: no restart waited for the lock (journal has no in-use line)
+PASS: deb: systemctl stop in 0.05s, unit inactive (success)
+PASS: deb: systemctl start again, serving
+PASS: deb: after SIGKILL, Restart=on-failure brings it back (lock released)
+PASS: deb: 20000 keys after SIGKILL + restart
+PASS: deb: a second server started by hand logs [The data directory /var/lib/kividb is in use by another process (it holds kividb.lock): waiting for it to be free]
+PASS: deb: the second server does not serve while it waits
+PASS: deb: the unit keeps serving meanwhile
+PASS: deb: systemctl stop (0.05s) lets the waiting server take over
+PASS: deb: it logs [The data directory is free after 3.1s: starting]
+PASS: deb: the hand-started server has the 20000 keys
+PASS: deb: the unit waits while the hand-started server holds the dir (active)
+PASS: deb: the unit comes up once the hand-started server exits
+PASS: deb: the unit's journal logs the wait
+PASS: deb: purge stops it
+PASS: rpm: dnf install under systemd (ubi9-init)
+PASS: rpm: unit active and serving after install
+PASS: rpm: CONFIG GET repl-backlog-size = 67108864 (64 MB)
+PASS: rpm: CONFIG GET shutdown-timeout = 10
+PASS: rpm: /var/lib/kividb/kividb.lock exists (kividb 644)
+INFO: rpm: 20000 keys loaded
+PASS: rpm: systemctl restart #1 returned in 0.08s, serving
+PASS: rpm: systemctl restart #2 returned in 0.08s, serving
+PASS: rpm: systemctl restart #3 returned in 0.08s, serving
+PASS: rpm: systemctl restart #4 returned in 0.07s, serving
+PASS: rpm: systemctl restart #5 returned in 0.07s, serving
+PASS: rpm: 20000 keys kept across 5 restarts
+PASS: rpm: no restart waited for the lock (journal has no in-use line)
+PASS: rpm: systemctl stop in 0.07s, unit inactive (success)
+PASS: rpm: systemctl start again, serving
+PASS: rpm: after SIGKILL, Restart=on-failure brings it back (lock released)
+PASS: rpm: 20000 keys after SIGKILL + restart
+PASS: rpm: a second server started by hand logs [The data directory /var/lib/kividb is in use by another process (it holds kividb.lock): waiting for it to be free]
+PASS: rpm: the second server does not serve while it waits
+PASS: rpm: the unit keeps serving meanwhile
+PASS: rpm: systemctl stop (0.08s) lets the waiting server take over
+PASS: rpm: it logs [The data directory is free after 3.2s: starting]
+PASS: rpm: the hand-started server has the 20000 keys
+PASS: rpm: the unit waits while the hand-started server holds the dir (active)
+PASS: rpm: the unit comes up once the hand-started server exits
+PASS: rpm: the unit's journal logs the wait
+PASS: rpm: dnf remove stops it
+INFO: useradd before install: absent
+INFO: rpm -qpR: shadow-utils 
+PASS: rpm: declares shadow-utils
+PASS: rpm: dnf install on clean amazonlinux:2023 (kividb-1.2.0~rc10-1.x86_64 shadow-utils-4.9-12.amzn2023.0.4.x86_64 )
+PASS: rpm: the kividb user exists (kividb:x:999:999:KiviDB:/var/lib/kividb:/usr/sbin/nologin)
+PASS: rpm: /usr/bin/kividb --version [kividb 1.2.0-rc10]
+PASS: rpm: the installed server runs as kividb on amazonlinux:2023 and answers PING
+RESULT rc10-amd64 101 0
+RC10-DONE

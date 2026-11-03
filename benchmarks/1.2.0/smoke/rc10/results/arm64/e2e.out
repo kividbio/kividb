@@ -1,0 +1,5 @@
+kividb 1.2.0-rc10
+Connection to 127.0.0.1 6380 port [tcp/*] succeeded!
+RESP2 exit=0 ========== 1171 passed, 65 skipped, 2 deselected in 86.50s (0:01:26) ===========
+Connection to 127.0.0.1 6380 port [tcp/*] succeeded!
+RESP3 exit=0 ========== 1171 passed, 65 skipped, 2 deselected in 85.12s (0:01:25) ===========

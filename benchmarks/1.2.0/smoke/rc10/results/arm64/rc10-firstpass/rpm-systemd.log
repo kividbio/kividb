@@ -1,0 +1,46 @@
+Unable to find image 'registry.access.redhat.com/ubi9/ubi-init:latest' locally
+latest: Pulling from ubi9/ubi-init
+c3b679815045: Pulling fs layer
+e84ca6eccdfe: Pulling fs layer
+c3b679815045: Download complete
+e84ca6eccdfe: Download complete
+e84ca6eccdfe: Pull complete
+c3b679815045: Pull complete
+Digest: sha256:9e8e38e836eca107b342cdab68c60e587b765f36fce46e7483c28013bb0cdde0
+Status: Downloaded newer image for registry.access.redhat.com/ubi9/ubi-init:latest
+PASS: rpm: dnf install under systemd (ubi9-init)
+PASS: rpm: unit active and serving after install
+PASS: rpm: CONFIG GET repl-backlog-size = 67108864 (64 MB)
+PASS: rpm: CONFIG GET shutdown-timeout = 10
+PASS: rpm: /var/lib/kividb/kividb.lock exists (kividb 644)
+INFO: rpm: 20000 keys loaded
+PASS: rpm: systemctl restart #1 returned in 0.08s, serving
+PASS: rpm: systemctl restart #2 returned in 0.08s, serving
+PASS: rpm: systemctl restart #3 returned in 0.08s, serving
+PASS: rpm: systemctl restart #4 returned in 0.09s, serving
+Job for kividb.service failed.
+See "systemctl status kividb.service" and "journalctl -xeu kividb.service" for details.
+FAIL: rpm: systemctl restart #5 hung or failed -- exit 1 after 0.08s
+FAIL: rpm: keys across restarts -- 20000 -> 
+PASS: rpm: no restart waited for the lock (journal has no in-use line)
+PASS: rpm: systemctl stop in 0.04s, unit inactive (start-limit-hit)
+Job for kividb.service failed.
+See "systemctl status kividb.service" and "journalctl -xeu kividb.service" for details.
+FAIL: rpm: start after stop -- 
+FAIL: rpm: no restart after SIGKILL -- Nov 03 14:35:52 smk-a systemd[1]: Failed to start KiviDB in-memory database.
+Nov 03 14:35:52 smk-a systemd[1]: kividb.service: Start request repeated too quickly.
+Nov 03 14:35:52 smk-a systemd[1]: kividb.service: Failed with result 'start-limit-hit'.
+Nov 03 14:35:52 smk-a systemd[1]: Failed to start KiviDB in-memory database.
+FAIL: rpm: keys after SIGKILL -- 20000 -> 
+FAIL: rpm: second server did not log in-use -- 2026-11-03T14:36:39.224Z 664 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+2026-11-03T14:36:39.228Z 664 [INFO] Replication: dataset fingerprinted in 3 ms — a replica that holds the same data will be continued rather than sent it
+2026-11-03T14:36:39.228Z 664 [INFO] Ready to accept connections on 127.0.0.1:6399
+FAIL: rpm: the second server serves while the unit holds the dir -- 
+FAIL: rpm: the unit stopped serving -- 
+PASS: rpm: systemctl stop (0.04s) lets the waiting server take over
+FAIL: rpm: no 'free after' line -- 
+PASS: rpm: the hand-started server has the 20000 keys
+PASS: rpm: the unit waits while the hand-started server holds the dir (active)
+PASS: rpm: the unit comes up once the hand-started server exits
+PASS: rpm: the unit's journal logs the wait
+PASS: rpm: dnf remove stops it
