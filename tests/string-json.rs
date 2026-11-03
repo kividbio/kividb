@@ -169,11 +169,15 @@ fn free_port() -> u16 {
 }
 
 fn start_server(port: u16) {
+    start_server_with_threads(port, 2);
+}
+
+fn start_server_with_threads(port: u16, threads: usize) {
     thread::spawn(move || {
         let config = kividb::config::Config {
             port,
             bind: "127.0.0.1".to_string(),
-            threads: 2,
+            threads,
             aof: false,
             databases: 16,
             maxmemory: 0,
@@ -2235,6 +2239,96 @@ fn mset_and_mget_are_each_one_step() {
         writer.join().unwrap();
     }
     assert!(seen > 10, "only {seen} reads saw anything");
+}
+
+/// `MSET` is one step for readers of single keys too, while other `MSET`s
+/// keep its shards busy: once a client has seen one of its keys at a round,
+/// no key it reads after that is at an earlier one. The noise writers'
+/// keys share shards with the counted ones, so the counted `MSET` keeps
+/// finding a shard busy, letting go of what it took and trying again.
+#[test]
+fn mset_is_one_step_while_its_shards_are_busy() {
+    let port = free_port();
+    start_server_with_threads(port, 8);
+    let keys = many_keys("counted");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut threads = Vec::new();
+    {
+        let (keys, stop) = (keys.clone(), std::sync::Arc::clone(&stop));
+        threads.push(std::thread::spawn(move || {
+            let mut c = Conn::connect(port);
+            let mut round = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                round += 1;
+                let value = round.to_string();
+                let mut args = vec!["MSET"];
+                for key in &keys {
+                    args.push(key);
+                    args.push(&value);
+                }
+                assert_eq!(c.cmds(&args).as_str(), "OK");
+            }
+        }));
+    }
+    for w in 0..4 {
+        let stop = std::sync::Arc::clone(&stop);
+        threads.push(std::thread::spawn(move || {
+            let mut c = Conn::connect(port);
+            let noise = many_keys(&format!("noise{w}"));
+            let mut round = 0usize;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                round += 1;
+                let value = round.to_string();
+                let mut args = vec!["MSET"];
+                for key in noise.iter().skip(round % 3).step_by(2) {
+                    args.push(key);
+                    args.push(&value);
+                }
+                assert_eq!(c.cmds(&args).as_str(), "OK");
+            }
+        }));
+    }
+    let readers: Vec<_> = (0..3)
+        .map(|r| {
+            let keys = keys.clone();
+            std::thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                let mut highest = 0u64;
+                let mut reads = 0u64;
+                let started = std::time::Instant::now();
+                let mut at = r;
+                while started.elapsed() < std::time::Duration::from_millis(2000) {
+                    // Round the keys in a different order from each reader.
+                    at = (at + 7) % keys.len();
+                    let got = c.cmds(&["GET", &keys[at]]);
+                    if got.is_nil() {
+                        assert_eq!(highest, 0, "{} gone after round {highest}", keys[at]);
+                        continue;
+                    }
+                    let round: u64 = got.as_str().parse().unwrap();
+                    assert!(
+                        round >= highest,
+                        "{} at round {round} after a key at round {highest}: part of an MSET",
+                        keys[at]
+                    );
+                    highest = round;
+                    reads += 1;
+                }
+                (highest, reads)
+            })
+        })
+        .collect();
+    let seen: Vec<(u64, u64)> = readers.into_iter().map(|r| r.join().unwrap()).collect();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    for (highest, reads) in seen {
+        assert!(
+            highest > 10 && reads > 100,
+            "round {highest}, {reads} reads"
+        );
+    }
 }
 
 /// Of several clients that `MSETNX` the same keys at once, one is told it

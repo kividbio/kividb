@@ -556,6 +556,20 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   fix`, which compares the two copies of a key it finds on two nodes with
   it, failed an assertion and stopped half-way.
 
+- **`MSET` and `MSETNX` of keys in many shards no longer queue behind
+  each other: about 3.4x faster at 1,200 connections.** Each took the locks
+  of its keys' shards one after another, waiting for each while it held
+  those it already had, and the next `MSET` that wanted one of those waited
+  behind it in turn: 170K `MSET`s of 10 keys a second on 32 vCPUs, with the
+  server 30% busy and the other clients of a waiting thread held up too. An
+  `MSET` now never waits for a shard while it holds another: it lets go,
+  waits for the busy one alone (spinning up to 50 µs first) and tries again.
+  And while nothing reads the write stream, it holds its keys' write order
+  shared, as `SET` does. 579K `MSET`s of 10 keys a second, p99 9.7 → 2.8 ms;
+  `GET`s beside them 158K → 451K a second. Each `MSET` still writes all its
+  keys at once, so nothing sees part of one. Single-key commands are
+  unchanged.
+
 - **`EXPIREAT` with a negative timestamp deletes the key,** as Redis does
   (by [@huong8373tt-beep](https://github.com/huong8373tt-beep)). It was
   refused with `ERR invalid expire time`; a time before the epoch is a time

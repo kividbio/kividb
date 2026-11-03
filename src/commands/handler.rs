@@ -452,6 +452,14 @@ fn writes_keys_of_several_shards(ctx: &Ctx, name: &str, cmd0: &[u8]) -> bool {
     first.is_none() || shards.any(|shard| shard != first)
 }
 
+/// The order of the keys of an `MSET` or `MSETNX`, held shared (see
+/// `write_order::lock_keys_shared`). Out of line: not on the way of the
+/// one-key writes, which go through the same `run_command`.
+#[inline(never)]
+fn order_of_pairs_shared(ctx: &Ctx) -> crate::write_order::OrderGuard {
+    crate::write_order::lock_keys_shared(*ctx.selected_db, ctx.cmd[1..].iter().step_by(2).copied())
+}
+
 fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     // Re-derive cmd0/name from ctx.cmd in case parts were modified (XREAD BLOCK stripping).
     let cmd0 = ctx.cmd[0];
@@ -1168,6 +1176,13 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
             *ctx.selected_db,
             ctx.cmd[1],
         ))
+    } else if ordered && matches!(name, "MSET" | "MSETNX") && !replication::write_is_observed(ctx) {
+        // Each key's order shared: both write every key under all of their
+        // shards' locks at once (`WriteShards`), so the shards order them
+        // against each other and against the writes above; see
+        // `write_order::lock_keys_shared`. Whole while anything reads the
+        // write stream, as every other write is.
+        Some(order_of_pairs_shared(ctx))
     } else if ordered {
         let keys = crate::keyspec::key_positions(name, &ctx.cmd);
         let here = *ctx.selected_db;
