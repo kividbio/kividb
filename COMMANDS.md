@@ -1071,11 +1071,16 @@ when a quorum of masters concur via gossip, the flag escalates to `FAIL`
 When a master fails, its replicas do not race blindly: each asks the others
 how far it has read, and waits an extra second for every one that has read
 further, so the most up-to-date replica normally stands first and wins, as in
-Redis. A replica whose link to its master has been down for longer than
+Redis. A replica in a full sync, from the transfer until it has loaded the
+dataset and streamed since, never stands: it may hold part of the master's
+data, or none of it, and the slots stay down until the master is back. A
+replica that was last in step with its master (streaming, with everything it
+had been sent applied) longer ago than
 `cluster-node-timeout × cluster-replica-validity-factor` plus
-`repl-ping-replica-period` does not stand at all: its data is too old to take
-over with (`cluster-replica-validity-factor 0` lets it stand anyway).
-`CLUSTER FAILOVER` is not subject to either.
+`repl-ping-replica-period`, or not at all since it started, does not stand
+either: its data is too old to take over with
+(`cluster-replica-validity-factor 0` lets it stand anyway). The log says why
+a replica does not stand. `CLUSTER FAILOVER` is not subject to either.
 
 A master that comes back after it has been replaced finds its slots claimed at
 a higher epoch and becomes a replica of the node that took them. While a slot
@@ -1174,7 +1179,7 @@ deletes the keys it holds for that slot, as Redis does.
 | `--cluster-node-timeout <ms>` | `15000` | PFAIL threshold. Lower values detect faster, increase false positives under jitter. |
 | `--cluster-config-file <path>` | `nodes.conf` | Where the topology is persisted. |
 | `--cluster-require-full-coverage yes\|no` | `yes` | Stop serving keyed commands while any slot is unassigned or its owner has failed. |
-| `--cluster-replica-validity-factor <n>` | `10` | A replica out of touch with its master for longer than this many node timeouts (plus `repl-ping-replica-period`) does not stand for election when the master fails. `0`: always stand. Settable at runtime. |
+| `--cluster-replica-validity-factor <n>` | `10` | A replica last in step with its master longer ago than this many node timeouts (plus `repl-ping-replica-period`), or not since it started, does not stand for election when the master fails. `0`: stand whatever the age. A replica in a full sync never stands. Settable at runtime. |
 | `--cluster-announce-ip <addr>` | (observed) | The address this node tells the cluster to reach it on — for NAT, containers and Kubernetes. |
 | `--cluster-announce-port <port>` / `--cluster-announce-bus-port <port>` | client port / +10000 | The ports announced with it. |
 | `--cluster-announce-client-port <port>` | `0` (the client port) | The port *clients* are told: in `MOVED`/`ASK` and `CLUSTER SLOTS`, `SHARDS` and `NODES`. Nodes keep reaching each other at the client port. For a NodePort, or a load balancer that maps ports. Settable at runtime. |

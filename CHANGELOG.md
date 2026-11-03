@@ -480,6 +480,21 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **A cluster replica in a full sync does not stand for election.** A
+  replica measured its data's age from the moment its link to the master
+  went down, and the link counts as up from the end of each load. A replica
+  whose full sync kept starting over (#305) therefore always looked fresh,
+  and one in the middle of a sync, holding part of the dataset or, with the
+  default `repl-diskless-load`, none of it, could take over a master that
+  failed then and lose everything it did not have. A replica now stands
+  only once it has loaded its last full sync and streamed since, whatever
+  `cluster-replica-validity-factor` says, and its data's age counts from
+  the last moment it was streaming with all its master had sent applied.
+  One that has not been in step with its master since it started does not
+  stand unless the factor is 0, as in Redis. The validity-factor rule holds
+  on top, and the log says why a replica does not stand. A failed master's
+  slots then stay down until it comes back, or an operator fails over.
+
 - **A full sync of a large dataset under heavy writes completes** (#305).
   A replica reads nothing of the write stream while it receives and loads
   the dataset, so the master queues everything written meanwhile, and it

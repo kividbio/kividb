@@ -340,6 +340,16 @@ async fn check_election(
                     state.election_pending.store(false, Ordering::SeqCst);
                     return;
                 }
+                // And still fit to stand: a full sync may have begun in the
+                // delay.
+                if let Some(why) = too_stale_to_stand(&state, &repl_state) {
+                    log_warn!(
+                        "Cluster: Not standing for election for failed master {}: {why}",
+                        node_id_str(&master_id)
+                    );
+                    state.election_pending.store(false, Ordering::SeqCst);
+                    return;
+                }
 
                 let epoch = state.start_election(master_id, false, None);
                 state.election_pending.store(false, Ordering::SeqCst);
@@ -406,28 +416,66 @@ async fn check_election(
 /// every 10 s; the check runs every 100 ms).
 static LAST_STALE_LOG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Why this replica's data is too old for it to stand for election, if it
-/// is: its link to the master has been down longer than
-/// `node timeout × cluster-replica-validity-factor + repl-ping-replica-period`,
-/// counting from when the master stopped answering (Redis's rule). A factor
-/// of 0 means always stand.
+/// Why this replica may not stand for election, if it may not; see
+/// [`stand_refusal`].
 fn too_stale_to_stand(
     state: &ClusterState,
     repl_state: &crate::replication::ReplState,
 ) -> Option<String> {
-    let factor = state.replica_validity_factor();
-    if factor == 0 || repl_state.slave_link_up.load(Ordering::Acquire) {
+    stand_refusal(
+        repl_state.full_sync_unfinished.load(Ordering::SeqCst),
+        repl_state.in_step_ms.load(Ordering::Relaxed),
+        now_ms_local(),
+        state.node_timeout_ms,
+        repl_state.repl_ping_period_secs.load(Ordering::Relaxed) * 1000,
+        state.replica_validity_factor(),
+    )
+}
+
+/// Why a replica may not stand for election to replace its failed master,
+/// if it may not.
+///
+/// * It is in a full sync: from the `+FULLRESYNC` until it has loaded the
+///   dataset and streamed since (`full_sync_unfinished`). Meanwhile it may
+///   hold part of the master's dataset or, with the default
+///   `repl-diskless-load`, none of it. Whatever the validity factor: it
+///   would take the slots and lose everything it does not have.
+/// * Its data is too old (Redis's rule): older than
+///   `node timeout × cluster-replica-validity-factor + repl-ping-replica-period`.
+///   Its age counts from `in_step_ms`, the last moment it was streaming
+///   with all the master had sent applied, not from the last time its link
+///   came up: a replica whose full sync starts over and over has its link
+///   come up after each load and is never caught up. 0, never since it
+///   started, is too old. A factor of 0 lets it stand whatever its age.
+fn stand_refusal(
+    full_sync_unfinished: bool,
+    in_step_ms: u64,
+    now_ms: u64,
+    node_timeout_ms: u64,
+    ping_period_ms: u64,
+    factor: u64,
+) -> Option<String> {
+    if full_sync_unfinished {
+        return Some(
+            "it has not finished loading its last full sync from the master and streamed since: \
+             it may hold part of the master's data, or none of it"
+                .to_string(),
+        );
+    }
+    if factor == 0 {
         return None;
     }
-    let down_since = repl_state.master_link_down_since_ms.load(Ordering::Relaxed);
-    if down_since == 0 {
-        return None;
+    if in_step_ms == 0 {
+        return Some(format!(
+            "it has not been in step with its master since it started, so the age of its data \
+             is not known (cluster-replica-validity-factor {factor}; 0 lets it stand)"
+        ));
     }
-    let ping_period_ms = repl_state.repl_ping_period_secs.load(Ordering::Relaxed) * 1000;
-    let down_for = now_ms_local().saturating_sub(down_since);
-    data_too_old(down_for, state.node_timeout_ms, ping_period_ms, factor).map(|(age, limit)| {
+    let age = now_ms.saturating_sub(in_step_ms);
+    data_too_old(age, node_timeout_ms, ping_period_ms, factor).map(|(age, limit)| {
         format!(
-            "its data is {} s old, more than the {} s cluster-replica-validity-factor {factor} allows",
+            "its data is {} s old, counted from when it was last in step with its master, more \
+             than the {} s cluster-replica-validity-factor {factor} allows",
             age / 1000,
             limit / 1000
         )
@@ -1010,7 +1058,7 @@ fn now_ms_local() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Answer, data_too_old, still_owner};
+    use super::{Answer, data_too_old, stand_refusal, still_owner};
     use crate::cluster::node::{NODE_ID_ZERO, NodeId};
 
     fn id(n: u8) -> NodeId {
@@ -1086,5 +1134,35 @@ mod tests {
             data_too_old(21_000, timeout, ping, 1),
             Some((16_000, 15_000))
         );
+    }
+
+    #[test]
+    fn a_replica_stands_only_once_its_full_sync_is_loaded_and_streamed() {
+        let (timeout, ping, now) = (5_000, 10_000, 1_000_000_000);
+        // In step a moment ago: stands, whatever the factor.
+        for factor in [0, 1, 10] {
+            assert_eq!(
+                stand_refusal(false, now - 100, now, timeout, ping, factor),
+                None
+            );
+        }
+        // In a full sync, receiving or loading: never, not even with
+        // factor 0. It may hold part of the data or none.
+        for factor in [0, 1, 10] {
+            let why = stand_refusal(true, 0, now, timeout, ping, factor).unwrap();
+            assert!(why.contains("full sync"), "{why}");
+        }
+        // Age counts from the last moment in step, however recently the
+        // link came up: a sync that keeps starting over is old data.
+        let why = stand_refusal(false, now - 65_001, now, timeout, ping, 10).unwrap();
+        assert!(why.contains("60 s old"), "{why}");
+        assert_eq!(
+            stand_refusal(false, now - 65_000, now, timeout, ping, 10),
+            None
+        );
+        // Never in step since it started: its data's age is not known.
+        assert!(stand_refusal(false, 0, now, timeout, ping, 10).is_some());
+        // Factor 0 lets such a replica stand, as in Redis.
+        assert_eq!(stand_refusal(false, 0, now, timeout, ping, 0), None);
     }
 }

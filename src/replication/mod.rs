@@ -135,6 +135,18 @@ pub struct ReplState {
     pub master_last_io_ms: AtomicU64,
     /// Replica side: Unix ms at which the link last went down, 0 while it is up.
     pub master_link_down_since_ms: AtomicU64,
+    /// Replica side: Unix ms of the last moment this replica was streaming
+    /// from its master with everything it had been sent applied; 0 if it has
+    /// not been since it started or since its last full sync began. Its
+    /// data's age, for the cluster's election, counts from here, not from
+    /// the last time the link came up: a replica whose full sync starts over
+    /// and over has its link come up after every load, and was never caught
+    /// up (see `cluster::bus::heartbeat::stand_refusal`).
+    pub in_step_ms: AtomicU64,
+    /// Replica side: a full sync has begun to replace this node's dataset,
+    /// and the replica has not streamed since it loaded it. Until then it
+    /// may hold part of the master's dataset, or none of it.
+    pub full_sync_unfinished: AtomicBool,
     /// Replica side: full resyncs refused by the dataset guard, and why the
     /// most recent one was refused. See `replica_client::guard_full_sync`.
     pub full_syncs_refused: AtomicU64,
@@ -478,6 +490,8 @@ impl ReplState {
             slave_link_state: AtomicU8::new(LinkState::Connect as u8),
             master_last_io_ms: AtomicU64::new(0),
             master_link_down_since_ms: AtomicU64::new(0),
+            in_step_ms: AtomicU64::new(0),
+            full_sync_unfinished: AtomicBool::new(false),
             full_syncs_refused: AtomicU64::new(0),
             last_sync_refusal: RwLock::new(None),
             repl_timeout_secs: AtomicU64::new(60),
@@ -818,6 +832,24 @@ impl ReplState {
         }
     }
 
+    /// Replica side: a full sync from the master has begun. Until the
+    /// replica has loaded it and streamed since, it does not stand for
+    /// election ([`Self::full_sync_unfinished`]).
+    pub fn note_full_sync_started(&self) {
+        self.full_sync_unfinished.store(true, Ordering::SeqCst);
+        self.in_step_ms.store(0, Ordering::SeqCst);
+    }
+
+    /// Replica side: streaming, with everything the master has sent so far
+    /// applied ([`Self::in_step_ms`]).
+    #[inline]
+    pub fn note_in_step(&self) {
+        self.in_step_ms.store(unix_ms(), Ordering::Relaxed);
+        if self.full_sync_unfinished.load(Ordering::Relaxed) {
+            self.full_sync_unfinished.store(false, Ordering::SeqCst);
+        }
+    }
+
     /// Record that bytes just arrived from the master.
     #[inline]
     pub fn note_master_io(&self) {
@@ -1009,6 +1041,10 @@ impl ReplState {
             .store(LinkState::Connect as u8, Ordering::Release);
         self.slave_sync_in_progress.store(false, Ordering::Release);
         self.master_link_down_since_ms.store(0, Ordering::Relaxed);
+        // As a replica again, it is in step with its next master only once
+        // it has streamed from it.
+        self.in_step_ms.store(0, Ordering::Relaxed);
+        self.full_sync_unfinished.store(false, Ordering::SeqCst);
         *self.last_sync_refusal.write() = None;
         // A master's dataset is its own from here on.
         self.set_resync_point(None);

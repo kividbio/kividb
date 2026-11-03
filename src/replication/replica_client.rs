@@ -862,6 +862,10 @@ async fn run_replication_session(
             log_info!("Replication: Full resync from {master_repl_id} offset={master_offset}");
         }
         upstream.mark_syncing();
+        // From here until it has loaded the payload and streamed, this node
+        // does not stand for election: it may soon hold part of the
+        // master's dataset, or none of it.
+        repl_state.note_full_sync_started();
         // The node this replica was following until a moment ago (within
         // `repl-timeout`), now under a replication id whose stream does not
         // continue the one this dataset is a position in: it restarted
@@ -1217,6 +1221,10 @@ async fn run_replication_session(
             return Ok(SessionEnd::Superseded);
         }
 
+        // Whether this turn found the socket drained: the read came back with
+        // less than it could hold, or with nothing for a while. Once what was
+        // read is applied, the replica has all the master has sent so far.
+        let mut drained = false;
         if !pending_input {
             let inner = reader.get_mut();
             // `AsyncReadExt::read` is cancel-safe for a TcpStream — on the timeout
@@ -1238,8 +1246,10 @@ async fn run_replication_session(
                     last_io = Instant::now();
                     repl_state.note_master_io();
                     pending_input = true;
+                    drained = n < temp.len();
                 }
                 None => {
+                    drained = true;
                     let timeout = repl_state.repl_timeout();
                     if heartbeats_seen && last_io.elapsed() > timeout {
                         return Err(SessionError::Link(format!(
@@ -1385,6 +1395,10 @@ async fn run_replication_session(
         // Its records to this node's AOF: no reply waits to write them.
         if applied_commands {
             crate::aof::stream_applied();
+        }
+        // In step with the master: its data's age counts from here.
+        if drained {
+            repl_state.note_in_step();
         }
 
         // REPLCONF ACK — heartbeat ~1 Hz when idle; **immediate** after applying commands so the
