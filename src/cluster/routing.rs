@@ -68,6 +68,40 @@ impl RouteDecision {
     }
 }
 
+/// When and how a command was routed in a cluster: what a write compares
+/// inside the write gate, to tell whether its keys may have left since it
+/// was routed (`pause::writes_must_check`, #331). `Default` for a command
+/// that was not routed.
+#[derive(Clone, Copy, Default)]
+pub struct Routed {
+    at: u64,
+    asking: bool,
+}
+
+impl Routed {
+    /// Now, before the command's keys are looked for, for a client that had
+    /// sent `ASKING` or not.
+    #[inline]
+    pub fn now(asking: bool) -> Self {
+        Routed {
+            at: crate::pause::routes_now(),
+            asking,
+        }
+    }
+
+    /// What `pause::routes_now` said.
+    #[inline]
+    pub fn at(self) -> u64 {
+        self.at
+    }
+
+    /// Whether the client had sent `ASKING`: the command is routed again
+    /// as it was routed the first time.
+    pub fn asking(self) -> bool {
+        self.asking
+    }
+}
+
 /// Who is asking, and where the keys would be: what a routing decision made
 /// outside the command dispatcher needs.
 pub struct Caller<'a> {
@@ -130,11 +164,75 @@ pub fn queue_refusal(caller: &Caller, cmd: &[&[u8]]) -> Option<Vec<u8>> {
 /// Slots can change hands between a command being queued and EXEC, so every
 /// command is routed again; and the commands of one transaction must all
 /// address one slot, as the keys of one command must.
-pub fn exec_refusal(caller: &Caller, queue: &[Vec<Vec<u8>>]) -> Option<Vec<u8>> {
+///
+/// `routed` is set to when it was routed: inside its gates, `EXEC` asks
+/// [`exec_refusal_in_gate`] whether its keys have moved since.
+pub fn exec_refusal(
+    caller: &Caller,
+    queue: &[Vec<Vec<u8>>],
+    routed: &mut Routed,
+) -> Option<Vec<u8>> {
     if !caller.cluster.enabled {
         return None;
     }
     let asking = caller.take_asking();
+    *routed = Routed::now(asking);
+    if let Some(refusal) = route_queue(caller, queue, asking) {
+        return Some(refusal);
+    }
+    if test_stall_keys().is_some() {
+        for queued in queue {
+            let cmd: Vec<&[u8]> = queued.iter().map(|arg| arg.as_slice()).collect();
+            if let Some(first) = cmd.first() {
+                let name = String::from_utf8_lossy(first).to_ascii_uppercase();
+                stall_for_test(&name, &cmd);
+            }
+        }
+    }
+    None
+}
+
+/// Inside `EXEC`'s gates, why its transaction may not run after all, routed
+/// by [`exec_refusal`] as `routed`:
+/// - a `MIGRATE` is moving one of its keys (`key_moves`): it cannot wait for
+///   it, holding every other command back, nor run, writing a key the
+///   `MIGRATE` is about to delete. It is given up whole with `TRYAGAIN`, as
+///   Redis answers a command whose keys are being moved; the client's retry
+///   is sent on with `-ASK`;
+/// - its keys have left here, or a slot has changed state, since it was
+///   routed: it is routed again, here, and answered as whoever has them now
+///   would answer it. It used to run here, on keys that had left, and make
+///   them again (#331).
+///
+/// One load when neither is so.
+#[inline]
+pub fn exec_refusal_in_gate(
+    caller: &Caller,
+    queue: &[Vec<Vec<u8>>],
+    routed: Routed,
+) -> Option<Vec<u8>> {
+    if !crate::pause::writes_must_check(routed.at) {
+        return None;
+    }
+    exec_refusal_again(caller, queue, routed)
+}
+
+#[cold]
+#[inline(never)]
+fn exec_refusal_again(caller: &Caller, queue: &[Vec<Vec<u8>>], routed: Routed) -> Option<Vec<u8>> {
+    if crate::pause::keys_moving() && crate::key_moves::queue_names_a_moving_key(caller.db, queue) {
+        return Some(b"-TRYAGAIN a key of the transaction is being migrated\r\n".to_vec());
+    }
+    if caller.cluster.enabled && crate::pause::routes_moved_since(routed.at) {
+        return route_queue(caller, queue, routed.asking);
+    }
+    None
+}
+
+/// Route every command of `queue`, for a client that had sent `ASKING` or
+/// not: the refusal of the first that may not run here, or of commands that
+/// address more than one slot.
+fn route_queue(caller: &Caller, queue: &[Vec<Vec<u8>>], asking: bool) -> Option<Vec<u8>> {
     let mut slot: Option<u16> = None;
     for queued in queue {
         let cmd: Vec<&[u8]> = queued.iter().map(|arg| arg.as_slice()).collect();
@@ -152,15 +250,6 @@ pub fn exec_refusal(caller: &Caller, queue: &[Vec<Vec<u8>>]) -> Option<Vec<u8>> 
                 if let Some(refusal) = other.refusal() {
                     return Some(refusal);
                 }
-            }
-        }
-    }
-    if test_stall_keys().is_some() {
-        for queued in queue {
-            let cmd: Vec<&[u8]> = queued.iter().map(|arg| arg.as_slice()).collect();
-            if let Some(first) = cmd.first() {
-                let name = String::from_utf8_lossy(first).to_ascii_uppercase();
-                stall_for_test(&name, &cmd);
             }
         }
     }

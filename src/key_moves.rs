@@ -24,6 +24,13 @@
 // that looked before the flag was set is still running, `MIGRATE` waits
 // for the writes in the gate once the flag is up (`write_gate::cut`), before
 // it reads anything. See `commands::cluster::hold_while_moving`.
+//
+// A write routed before the keys were marked, and held up until after the
+// `MIGRATE` let go of them, sees neither: it is not in the gate for the cut
+// to wait for, and the flag is down again. It used to run here on a key that
+// had left (#331). The `MIGRATE` counts the move in the same flag
+// (`pause::routes_moved`), and the write, which took the count before it was
+// routed, is routed again inside the gate.
 
 use parking_lot::{Condvar, Mutex};
 use std::time::Duration;

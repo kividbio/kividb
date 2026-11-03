@@ -1456,6 +1456,8 @@ pub async fn handle_client(
                     for (db, key) in &tx.watched_keys {
                         commands::helpers::lazy_expire_key(&store, *db, key);
                     }
+                    // When it was routed, for the check inside its gates.
+                    let mut routed = crate::cluster::routing::Routed::default();
                     let refusal = if !tx.active {
                         None
                     } else if let Some(busy) =
@@ -1479,6 +1481,7 @@ pub async fn handle_client(
                                 db: selected_db,
                             },
                             &tx.queue,
+                            &mut routed,
                         )
                     };
                     if !tx.active {
@@ -1512,15 +1515,23 @@ pub async fn handle_client(
                             &hub_tx,
                             &aof_tx,
                         );
-                        // A `MIGRATE` is moving one of its keys (`key_moves`):
-                        // it cannot wait for it, holding every other command
-                        // back, nor run, writing a key the `MIGRATE` is about
-                        // to delete. It is given up whole with `TRYAGAIN`, as
-                        // Redis answers a command whose keys are being moved;
-                        // the client's retry is sent on with `-ASK`.
-                        let moving = crate::pause::writes_must_check()
-                            && crate::key_moves::queue_names_a_moving_key(selected_db, &tx.queue);
-                        if moving || dirty_flag.load(std::sync::atomic::Ordering::Acquire) {
+                        // A `MIGRATE` is moving one of its keys, or its keys
+                        // have left since it was routed (#331): it is given up
+                        // whole. See `routing::exec_refusal_in_gate`.
+                        let refused = crate::cluster::routing::exec_refusal_in_gate(
+                            &crate::cluster::routing::Caller {
+                                cluster: &cluster_state,
+                                registry: &client_registry,
+                                client_id,
+                                store: &store,
+                                db: selected_db,
+                            },
+                            &tx.queue,
+                            routed,
+                        );
+                        if refused.is_some()
+                            || dirty_flag.load(std::sync::atomic::Ordering::Acquire)
+                        {
                             watch_registry.as_ref().unwatch_all(
                                 &tx.watched_keys
                                     .iter()
@@ -1533,8 +1544,8 @@ pub async fn handle_client(
                             // array is not guaranteed to be recognized as null by a strict RESP3
                             // parser (redis-py's, e.g., parses it as an empty array instead),
                             // which breaks WATCH-abort detection for RESP3 clients entirely.
-                            if moving {
-                                b"-TRYAGAIN a key of the transaction is being migrated\r\n".to_vec()
+                            if let Some(refusal) = refused {
+                                refusal
                             } else if resp_version == 3 {
                                 crate::resp::write::resp_null_resp3()
                             } else {

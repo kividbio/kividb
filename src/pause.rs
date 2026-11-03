@@ -1,5 +1,5 @@
 // src/pause.rs
-use std::sync::atomic::{AtomicI64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 /// Global pause expiry in Unix milliseconds.
 /// 0 = not paused. Positive = writes are paused until this timestamp.
@@ -49,12 +49,27 @@ static PAUSE_MODE_WRITE_ONLY: std::sync::atomic::AtomicBool =
 /// The same flag, a second bit of it, is up while a `MIGRATE` holds keys
 /// here ([`KEYS_MOVING`], see `key_moves`): one load still tells a write
 /// whether it has anything to look at ([`writes_must_check`]).
-static HANDOFF: AtomicU8 = AtomicU8::new(0);
+///
+/// Above those two bits, in a cluster, it counts the times keys have left
+/// this node or a slot here has changed state ([`routes_moved`]): a
+/// `MIGRATE` deleted what it moved, or `CLUSTER SETSLOT` ran. A command is
+/// routed ("is its key here?") before it enters the write gate, and a whole
+/// `MIGRATE` of its key can run in between. It then ran here, on a key that
+/// had left, and made it again (#331). So a command routed in a cluster
+/// takes the count before it looks for its keys ([`routes_now`]), and a
+/// write compares the whole flag with that inside the gate: the same one
+/// load, against its own number instead of 0. Outside a cluster the count
+/// stays 0.
+static HANDOFF: AtomicU64 = AtomicU64::new(0);
 
 /// [`HANDOFF`]: a handoff's pause is in force.
-const HANDOFF_PAUSE: u8 = 1;
+const HANDOFF_PAUSE: u64 = 1;
 /// [`HANDOFF`]: a `MIGRATE` is moving keys (`key_moves`).
-const KEYS_MOVING: u8 = 2;
+const KEYS_MOVING: u64 = 2;
+/// [`HANDOFF`]: one more time keys left here or a slot changed state.
+const ROUTES_MOVED: u64 = 4;
+/// [`HANDOFF`]: the bits below the count.
+const BITS: u64 = ROUTES_MOVED - 1;
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -252,11 +267,42 @@ pub fn handoff() -> bool {
 }
 
 /// Whether a write that has just entered the write gate has anything to
-/// look at: a handoff ([`handoff`]), or a `MIGRATE` moving keys
-/// (`key_moves::names_a_moving_key`). One atomic load when neither is.
+/// look at: a handoff ([`handoff`]), a `MIGRATE` moving keys
+/// (`key_moves::names_a_moving_key`), or keys that left here, or a slot
+/// that changed state, since the write was routed. `routed` is what
+/// [`routes_now`] said before it was routed; 0 if it was not, outside a
+/// cluster, where the count stays 0. One atomic load when none of these is
+/// so.
 #[inline]
-pub fn writes_must_check() -> bool {
-    HANDOFF.load(Ordering::Acquire) != 0
+pub fn writes_must_check(routed: u64) -> bool {
+    HANDOFF.load(Ordering::Acquire) != routed
+}
+
+/// Whether a `MIGRATE` holds keys here (`key_moves`).
+#[inline]
+pub fn keys_moving() -> bool {
+    HANDOFF.load(Ordering::Acquire) & KEYS_MOVING != 0
+}
+
+/// How many times keys have left here or a slot has changed state (see
+/// [`HANDOFF`]). Taken by a command in a cluster before it looks for its
+/// keys: whatever moves them after this, it sees in the write gate.
+#[inline]
+pub fn routes_now() -> u64 {
+    HANDOFF.load(Ordering::Acquire) & !BITS
+}
+
+/// Whether keys have left here, or a slot has changed state, since
+/// [`routes_now`] said `routed`.
+pub fn routes_moved_since(routed: u64) -> bool {
+    routes_now() != routed
+}
+
+/// Keys have left this node, or a slot here has changed state: a write
+/// routed before this, and not yet in the write gate, is routed again there
+/// (#331). In a cluster only.
+pub(crate) fn routes_moved() {
+    HANDOFF.fetch_add(ROUTES_MOVED, Ordering::SeqCst);
 }
 
 /// `MIGRATE` holds keys here, or no longer does (`key_moves`, under its

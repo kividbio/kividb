@@ -1186,6 +1186,12 @@ fn cmd_readwrite(ctx: &mut Ctx) -> Vec<u8> {
 
 // ── CLUSTER SETSLOT slot <IMPORTING node-id | MIGRATING node-id | NODE node-id | STABLE> ──
 
+/// A slot here has changed state (`SETSLOT`): a write routed before, and not
+/// yet in the write gate, is routed again there (#331).
+fn slot_changed_state() {
+    crate::pause::routes_moved();
+}
+
 fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
     let cmd = &ctx.cmd;
     if let Some(err) = require_cluster_mode(ctx.cluster) {
@@ -1217,6 +1223,13 @@ fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
             if let Err(e) = ctx.cluster.set_migrating(slot, dest) {
                 return resp_error(&format!("ERR {e}"));
             }
+            slot_changed_state();
+            // And the writes already in the gate are waited for. A write
+            // that found its key missing from the slot before it was
+            // migrating, and makes it here, is done before this answers: the
+            // `CLUSTER GETKEYSINSLOT` that comes next finds the key. One that
+            // had not reached the gate is sent on with `-ASK`.
+            drop(crate::write_gate::cut());
             let _ = ctx.cluster.save_to_disk();
             resp_simple("OK")
         }
@@ -1233,6 +1246,7 @@ fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
             if let Err(e) = ctx.cluster.set_importing(slot, src) {
                 return resp_error(&format!("ERR {e}"));
             }
+            slot_changed_state();
             let _ = ctx.cluster.save_to_disk();
             resp_simple("OK")
         }
@@ -1243,6 +1257,7 @@ fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
                 );
             }
             ctx.cluster.clear_migration(slot);
+            slot_changed_state();
             let _ = ctx.cluster.save_to_disk();
             resp_simple("OK")
         }
@@ -1271,6 +1286,7 @@ fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
             if let Err(e) = ctx.cluster.finalize_slot(slot, new_owner) {
                 return resp_error(&format!("ERR {e}"));
             }
+            slot_changed_state();
             let _ = ctx.cluster.save_to_disk();
             resp_simple("OK")
         }
@@ -1984,6 +2000,11 @@ fn delete_moved<'a>(ctx: &Ctx, db: usize, moved: &[&'a Outgoing], held: bool) ->
                 }
             }
         }
+    }
+    // A write routed here before these keys left, and not yet in the write
+    // gate, is routed again there (#331).
+    if del.len() > 1 && ctx.cluster.enabled {
+        crate::pause::routes_moved();
     }
     crate::aof::failpoint("migrate-deleted");
     if del.len() > 1 && crate::replication::write_is_observed(ctx) {

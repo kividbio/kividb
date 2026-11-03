@@ -841,6 +841,42 @@ fn used_on_error(ctx: &Ctx, name: &str) {
     }
 }
 
+/// The routing of [`run_command`], again, for a write inside the write gate
+/// that was routed as `routed`, if its keys may have left since: a
+/// `MIGRATE` deleted them here, or a slot changed state
+/// (`pause::routes_moved`). `None` if it may run here (#331).
+#[cold]
+#[inline(never)]
+fn routed_again_in_gate(
+    ctx: &Ctx,
+    name: &str,
+    routed: crate::cluster::routing::Routed,
+) -> Option<Vec<u8>> {
+    if !ctx.cluster.enabled
+        || ctx.bypass_cluster_check
+        || !crate::pause::routes_moved_since(routed.at())
+    {
+        return None;
+    }
+    let store = ctx.store;
+    let db = *ctx.selected_db;
+    let registry = ctx.client_registry;
+    let client_id = ctx.client_id;
+    crate::cluster::routing::route_named(
+        name,
+        ctx.cmd.as_slice(),
+        ctx.cluster,
+        routed.asking(),
+        || registry.get_readonly(client_id),
+        |key| {
+            std::str::from_utf8(key).is_ok_and(|key| {
+                crate::read_lock!(crate::store::get_shard(&store[db], key)).contains_key(key)
+            })
+        },
+    )
+    .refusal()
+}
+
 /// [`execute_command`], once the command's name is known; it started at
 /// `started`.
 fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8> {
@@ -856,6 +892,10 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // Decide whether this command can run on this node. In standalone mode
     // or when bypass_cluster_check is true (replica applier), this is a
     // single boolean check and passes through.
+    //
+    // When it was routed, for a write to compare inside the write gate:
+    // its keys may have left meanwhile (#331).
+    let mut routed = crate::cluster::routing::Routed::default();
     {
         use crate::cluster::routing::route_named;
         // Standalone-mode fast path: skip every cluster-related check entirely.
@@ -870,6 +910,9 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
             }
             // Pull asking flag from client registry.
             let asking_flag = ctx.client_registry.get_asking(ctx.client_id);
+            // Before the keys are looked for: anything that moves them from
+            // here after this, the write sees in the gate.
+            routed = crate::cluster::routing::Routed::now(asking_flag);
             // has_key_locally: bind to the store/db combination via closure.
             let store_for_check = ctx.store;
             let db = *ctx.selected_db;
@@ -1102,11 +1145,21 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // write to one of them waits until it has gone, or stayed, and is then
     // answered as the slot's state says — `-ASK` for a key that left. A
     // write to other keys goes on.
-    while gated && !nested && !ctx.apply_replication && crate::pause::writes_must_check() {
+    //
+    // And it finds that keys have left here, or a slot has changed state,
+    // since this write was routed: a whole `MIGRATE` of its key may have run
+    // between its routing and the gate. It is routed again, here in the
+    // gate, where nothing moves its keys before it is done (#331).
+    while gated && !nested && !ctx.apply_replication && crate::pause::writes_must_check(routed.at())
+    {
         let handoff = crate::pause::handoff();
         if !handoff
-            && !crate::key_moves::names_a_moving_key(*ctx.selected_db, name, ctx.cmd.as_slice())
+            && !(crate::pause::keys_moving()
+                && crate::key_moves::names_a_moving_key(*ctx.selected_db, name, ctx.cmd.as_slice()))
         {
+            if let Some(refusal) = routed_again_in_gate(ctx, name, routed) {
+                return refusal;
+            }
             break;
         }
         _write_gate = None;
@@ -1115,6 +1168,8 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         } else {
             crate::key_moves::wait_until_moved(*ctx.selected_db, name, ctx.cmd.as_slice());
         }
+        // Before its keys are looked for below, as before its first routing.
+        routed = crate::cluster::routing::Routed::now(false);
         if ctx.cluster.enabled {
             let store = ctx.store;
             let db = *ctx.selected_db;

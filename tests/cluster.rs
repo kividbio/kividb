@@ -430,9 +430,17 @@ fn form_cluster(masters: usize) -> (Vec<Node>, Vec<(u16, u16)>) {
 
 /// [`form_cluster`], each node's process given `env` as well.
 fn form_cluster_with_env(masters: usize, env: &[(&str, &str)]) -> (Vec<Node>, Vec<(u16, u16)>) {
-    let nodes: Vec<Node> = (0..masters)
-        .map(|_| Node::start_with_env(&[], env))
-        .collect();
+    form_cluster_of(
+        (0..masters)
+            .map(|_| Node::start_with_env(&[], env))
+            .collect(),
+    )
+}
+
+/// [`form_cluster`], of nodes already started: each its share of the slots,
+/// in order.
+fn form_cluster_of(nodes: Vec<Node>) -> (Vec<Node>, Vec<(u16, u16)>) {
+    let masters = nodes.len();
     let per = 16384 / masters;
     let mut ranges = Vec::new();
     for (i, node) in nodes.iter().enumerate() {
@@ -2575,6 +2583,132 @@ fn a_write_while_migrate_is_on_the_wire_waits_for_it_and_is_not_lost() {
     assert_eq!(d.cmd(&["GET", &k("a")]).text(), "1");
     assert_eq!(d.cmd(&["GET", &k("c")]).text(), "1");
     assert!(d.cmd(&["PTTL", &k("ttl")]).int() > 400_000);
+}
+
+/// A write routed here while its key was here, and held up before the write
+/// gate while a whole `MIGRATE` of that key ran (marked, cut, sent, deleted
+/// here, let go of), is sent on with `-ASK` once it reaches the gate. It
+/// used to run here, on a key that had left, and make it again: a wrong
+/// reply, and a copy the cluster no longer routes to, whose writes were
+/// lost when the reshard finished (#331). The same for a transaction and a
+/// script. The source's commands wait at the failpoint `routed` once they
+/// have been routed (`KIVIDB_TEST_STALL_KEYS`), as one can on a busy
+/// machine.
+#[test]
+fn a_write_routed_before_its_key_moved_is_sent_on_not_run_here() {
+    // Three keys of one slot of the source's half, without a hash tag (see
+    // above).
+    let first = key_in(0..=8191, "routed");
+    let slot_number = slot_of(&first);
+    let keys: Vec<String> = (0..)
+        .map(|i| format!("routed:{i}"))
+        .filter(|key| slot_of(key) == slot_number)
+        .take(3)
+        .collect();
+    let stall_keys = keys.join(",");
+    let env = [
+        ("KIVIDB_TEST_FAILPOINTS", "routed"),
+        ("KIVIDB_TEST_STALL_KEYS", stall_keys.as_str()),
+    ];
+    let (nodes, ranges) = form_cluster_of(vec![Node::start_with_env(&[], &env), Node::start(&[])]);
+    assert_eq!(ranges[0], (0, 8191));
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let (src_id, dst_id) = (src.id(), dst.id());
+    let slot = slot_number.to_string();
+    let port = dst.port.to_string();
+    let ask = format!("ASK {slot} 127.0.0.1:{}", dst.port);
+
+    // Commands on one connection to the source, in the background: the
+    // reply to the last.
+    let in_background = |commands: &[&[&str]]| {
+        let commands: Vec<Vec<String>> = commands
+            .iter()
+            .map(|args| args.iter().map(|a| a.to_string()).collect())
+            .collect();
+        let port = src.port;
+        std::thread::spawn(move || {
+            let mut conn = Conn::connect(port);
+            let mut last = None;
+            for args in &commands {
+                let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                last = Some(conn.cmd(&refs));
+            }
+            last.unwrap()
+        })
+    };
+    let mut hit = 0;
+    let held = |reached: &mut u32| {
+        *reached += 1;
+        let failpoint = src.dir.join(format!("failpoint.routed.{reached}"));
+        wait_until(
+            "the command to be routed and held",
+            Duration::from_secs(10),
+            || failpoint.exists(),
+        );
+        failpoint
+    };
+
+    let set = in_background(&[&["MSET", &keys[0], "5", &keys[1], "5", &keys[2], "5"]]);
+    std::fs::remove_file(held(&mut hit)).unwrap();
+    assert!(set.join().unwrap().is_ok());
+    let reply = dst
+        .conn()
+        .cmd(&["CLUSTER", "SETSLOT", &slot, "IMPORTING", &src_id]);
+    assert!(reply.is_ok(), "SETSLOT IMPORTING: {reply:?}");
+    let reply = src
+        .conn()
+        .cmd(&["CLUSTER", "SETSLOT", &slot, "MIGRATING", &dst_id]);
+    assert!(reply.is_ok(), "SETSLOT MIGRATING: {reply:?}");
+
+    // `commands` routed here, then `key` moved whole while they wait, then
+    // let go of: the reply to the last of them.
+    let mut routed_then_moved = |commands: &[&[&str]], key: &str| {
+        let write = in_background(commands);
+        let failpoint = held(&mut hit);
+        let reply = src
+            .conn()
+            .cmd(&["MIGRATE", "127.0.0.1", &port, key, "0", "5000"]);
+        assert!(reply.is_ok(), "MIGRATE: {reply:?}");
+        std::fs::remove_file(failpoint).unwrap();
+        write.join().unwrap()
+    };
+
+    let reply = routed_then_moved(&[&["INCR", &keys[0]]], &keys[0]);
+    assert!(
+        reply.err().is_some_and(|e| e.starts_with(&ask)),
+        "the write is sent on: {reply:?}"
+    );
+    let reply = routed_then_moved(&[&["MULTI"], &["SET", &keys[1], "7"], &["EXEC"]], &keys[1]);
+    assert!(
+        reply.err().is_some_and(|e| e.starts_with(&ask)),
+        "the transaction is sent on: {reply:?}"
+    );
+    #[cfg(feature = "lua")]
+    {
+        let script = "return redis.call('SET', KEYS[1], ARGV[1])";
+        let reply = routed_then_moved(&[&["EVAL", script, "1", &keys[2], "9"]], &keys[2]);
+        assert!(
+            reply.err().is_some_and(|e| e.starts_with(&ask)),
+            "the script is sent on: {reply:?}"
+        );
+    }
+    let moved = &keys[..if cfg!(feature = "lua") { 3 } else { 2 }];
+
+    // Nothing was made again here, and the destination has each key as it
+    // was sent.
+    let left = (keys.len() - moved.len()) as i64;
+    assert_eq!(
+        src.conn().cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(),
+        left
+    );
+    let mut d = dst.conn();
+    for key in moved {
+        assert!(d.cmd(&["ASKING"]).is_ok());
+        assert_eq!(d.cmd(&["GET", key]).text(), "5", "{key}");
+    }
+    // Where the client's retry goes.
+    assert!(d.cmd(&["ASKING"]).is_ok());
+    assert_eq!(d.cmd(&["INCR", &keys[0]]).int(), 6);
 }
 
 /// Clients write to every key of a slot, without a pause, while `MIGRATE`
