@@ -508,9 +508,9 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   closed by hand. Now any assigned slot is removed, with its `IMPORTING`
   state; only one that is unassigned already is refused
   (`ERR Slot N is already unassigned`), and a command with one such slot
-  changes nothing; for two seconds after, a peer's claim does not take the
-  slot back, so the `ADDSLOTS` fix sends next in the same transaction finds
-  it free. And `MIGRATE` runs on a node importing the slot too, as in Redis
+  changes nothing; for five seconds after, a peer's claim does not take
+  the slot back, so the `ADDSLOTS` fix sends next in the same transaction
+  finds it free. And `MIGRATE` runs on a node importing the slot too, as in Redis
   while a slot is open: fix moves the keys back with it, and was sent
   `MOVED` instead.
 
@@ -523,6 +523,16 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   deletes those copies at the destination before it answers, while nothing
   can write the keys here, and says so in the `TRYAGAIN`: they can be moved
   again without `REPLACE`.
+
+- **A slot moved by `redis-cli --cluster reshard` is no longer lost.** Now
+  and then, after a reshard in one direction and then the other, a slot
+  ended up served by no node, and the next reshard or `--cluster fix`
+  stopped at `Not all 16384 slots are covered`. Reshard gives a slot to its
+  target with `SETSLOT NODE`, then tells the source; a heartbeat the source
+  sent just before still claimed the slot, at an epoch the target's could
+  be below, and the target gave the slot up to it. A slot assigned with
+  `SETSLOT NODE`, or removed with `DELSLOTS`, now keeps that assignment for
+  five seconds whatever a peer claims.
 
 - **`DEBUG DIGEST-VALUE` returns a digest of each value**, as Redis does:
   40 hex digits a key, the same for equal values on any node, and 40 zeros
