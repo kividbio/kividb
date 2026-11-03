@@ -1,6 +1,6 @@
 # KiviDB 1.2.0 benchmarks and tests
 
-Everything measured for the 1.2.0 release, on Azure VMs and AKS, from 2026-11-01 to 2026-11-03.
+Everything measured for the 1.2.0 release, on Azure VMs and AKS, from 2026-11-01 to 2026-11-03. **[REPORT.md](REPORT.md) has every number and every comparison in one file.**
 
 - **The full benchmark runs** used commit `75482abb`, the code of 1.2.0-rc7, against Redis, Redis Cluster, Valkey, Dragonfly, Garnet and kvrocks.
 - **Every suite was then rerun** on 1.2.0-rc8 (`082dab3d`), alternating with rc7 on the same VMs, in each suite's `rc8/` folder.
@@ -12,6 +12,8 @@ rc9 and rc10 changed only replication, cluster and shutdown code, plus `MIGRATE`
 - the #202 cache test under `allkeys-lru` leans about 1% lower on two VM pairs, inside the 0.98-1.02 that pairs of identical code measure in that suite.
 
 Each folder holds the harness that produced its numbers, the raw results, the charts, and a README. The README gives the hardware, the exact versions and flags of every engine, how to run it again, and what the numbers mean. Where KiviDB loses, the README says so and why.
+
+The raw results, logs and charts are in the repository, but not in source archives of later releases (the tarballs and zips GitHub makes of a tag): `.gitattributes` leaves them out there, and keeps the READMEs, the harnesses and the summary tables. Browse them here on GitHub.
 
 Many of these were asked for in the [Hacker News thread](https://news.ycombinator.com/item?id=50152541) on the launch. [The table below](#questions-from-the-thread) links each question to its answer. The problems these runs found, and how each was fixed, are [at the end](#what-the-runs-found).
 
