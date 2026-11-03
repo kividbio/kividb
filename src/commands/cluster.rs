@@ -1908,27 +1908,52 @@ fn hold_while_moving(db: usize, keys: &[&[u8]]) -> Option<MoveHold> {
     })
 }
 
+/// How near its time a hash's field may be and still be on one side only of
+/// [`same_hash_but_for_expired_fields`], and how far apart its two times may
+/// be. The payload's copy of a field's time is up to 2 ms early (the dump
+/// rounds it down to the millisecond twice), the decoder reads it back
+/// against a clock rounded down to the millisecond, and the two sides are
+/// read a moment apart.
+const FIELD_TIME_SLACK: std::time::Duration = std::time::Duration::from_millis(5);
+
 /// Whether `value`, a hash, holds what `payload` held but for fields whose
 /// time has run out since: a read (`HGETALL`) drops those, and that is no
-/// write. `restore_payload` drops the ones whose time is up from the
-/// payload's copy; the fields of `value` that are due are left out here.
+/// write.
+///
+/// A field that is due, or nearly, may be on either side alone: the decoder
+/// drops the payload's fields whose time is up, by a time that is up to 2 ms
+/// early, and here a field is due by the monotonic clock. Compared field by
+/// field with each side's own rule, an unchanged hash with a field in its
+/// last 2 ms looked written, and `MIGRATE` answered `TRYAGAIN` (#332). So
+/// the two sides are compared by one clock and one rule: every field that is
+/// not within [`FIELD_TIME_SLACK`] of its time, on either side, is on the
+/// other side too, with the same value and a time (or none) that agrees.
 fn same_hash_but_for_expired_fields(value: &crate::types::KiviDBValue, payload: &[u8]) -> bool {
-    use crate::types::KiviDBValue;
+    use crate::types::{HashInner, KiviDBValue};
+    use std::time::Instant;
     let (KiviDBValue::HashEx(now), Some(KiviDBValue::HashEx(then))) =
         (value, crate::snapshot::restore_payload(payload))
     else {
         return false;
     };
     let (now, then) = (now.read(), then.read());
-    let live: Vec<(&String, &std::sync::Arc<[u8]>)> = now
-        .fields
-        .iter()
-        .filter(|(field, _)| !now.is_field_expired(field))
-        .collect();
-    live.len() == then.fields.len()
-        && live
-            .iter()
-            .all(|(field, val)| then.fields.get(field.as_str()) == Some(*val))
+    // The decoder has turned the payload's times into `Instant`s.
+    let soon = Instant::now() + FIELD_TIME_SLACK;
+    let same_time = |a: Option<&Instant>, b: Option<&Instant>| match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.max(b).duration_since(*a.min(b)) <= FIELD_TIME_SLACK,
+        _ => false,
+    };
+    // Every field of `a` not about to go is in `b`, the same.
+    let held_by = |a: &HashInner, b: &HashInner| {
+        a.fields.iter().all(|(field, val)| {
+            let time = a.expiries.get(field);
+            time.is_some_and(|time| *time <= soon)
+                || (b.fields.get(field.as_str()) == Some(val)
+                    && same_time(time, b.expiries.get(field)))
+        })
+    };
+    held_by(&now, &then) && held_by(&then, &now)
 }
 
 /// Delete the keys the destination has confirmed, each only if it still
@@ -2379,4 +2404,81 @@ fn compute_key_counts_per_slot(ctx: &Ctx) -> std::collections::HashMap<u16, u64>
         }
     }
     counts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{HashInner, KiviDBValue};
+    use std::time::{Duration, Instant};
+
+    /// A hash of `(field, value, time)`.
+    fn hash(fields: &[(&str, &str, Option<Instant>)]) -> KiviDBValue {
+        let mut inner = HashInner::new();
+        for (field, value, time) in fields {
+            inner
+                .fields
+                .insert(field.to_string(), std::sync::Arc::from(value.as_bytes()));
+            if let Some(time) = time {
+                inner.expiries.insert(field.to_string(), *time);
+            }
+        }
+        KiviDBValue::HashEx(std::sync::Arc::new(parking_lot::RwLock::new(inner)))
+    }
+
+    fn payload(value: &KiviDBValue) -> Vec<u8> {
+        crate::snapshot::dump_payload(value).unwrap()
+    }
+
+    /// A field a few milliseconds from its time: the payload's copy of the
+    /// time was rounded down past now, and the decoder drops the field,
+    /// while here it is still live. The hash is unchanged (#332).
+    #[test]
+    fn a_hash_whose_field_is_about_to_expire_is_unchanged() {
+        let now = Instant::now();
+        let later = now + Duration::from_secs(3600);
+        let sent = payload(&hash(&[
+            ("kept", "1", None),
+            ("timed", "2", Some(later)),
+            ("brief", "3", Some(now - Duration::from_millis(1))),
+        ]));
+        let here = hash(&[
+            ("kept", "1", None),
+            ("timed", "2", Some(later)),
+            ("brief", "3", Some(now + Duration::from_millis(3))),
+        ]);
+        assert!(same_hash_but_for_expired_fields(&here, &sent));
+        // And the other way round: the field is gone here, and still in the
+        // payload, a moment from its time.
+        let sent = payload(&hash(&[
+            ("kept", "1", None),
+            ("brief", "3", Some(now + Duration::from_millis(3))),
+        ]));
+        let here = hash(&[("kept", "1", None)]);
+        assert!(same_hash_but_for_expired_fields(&here, &sent));
+    }
+
+    /// A field written, added, deleted or given another time, away from
+    /// the edge, is a write.
+    #[test]
+    fn a_hash_written_while_it_travelled_is_not_the_same() {
+        let later = Instant::now() + Duration::from_secs(3600);
+        let sent = payload(&hash(&[("a", "1", None), ("b", "2", Some(later))]));
+        for here in [
+            hash(&[("a", "9", None), ("b", "2", Some(later))]),
+            hash(&[("a", "1", None), ("b", "9", Some(later))]),
+            hash(&[("a", "1", None), ("b", "2", Some(later)), ("c", "3", None)]),
+            hash(&[("a", "1", None)]),
+            hash(&[("a", "1", None), ("b", "2", None)]),
+            hash(&[("a", "1", Some(later)), ("b", "2", Some(later))]),
+            hash(&[
+                ("a", "1", None),
+                ("b", "2", Some(later + Duration::from_secs(1))),
+            ]),
+        ] {
+            assert!(!same_hash_but_for_expired_fields(&here, &sent));
+        }
+        let here = hash(&[("a", "1", None), ("b", "2", Some(later))]);
+        assert!(same_hash_but_for_expired_fields(&here, &sent));
+    }
 }
