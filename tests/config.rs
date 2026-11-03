@@ -856,6 +856,7 @@ fn config_set_latency_tracking_info_percentiles_refuses_what_redis_refuses() {
         ("50 ", not_numbers),
         ("50  99", not_numbers),
         ("nan", not_numbers),
+        ("1e-400", not_numbers),
         ("inf", out_of_range),
     ] {
         match c.cmds(&["CONFIG", "SET", key, value]) {
@@ -870,9 +871,21 @@ fn config_set_latency_tracking_info_percentiles_refuses_what_redis_refuses() {
             "{value:?} changed what was there"
         );
     }
-    for value in ["", "50 99 99.9", "0", "100", "0x10", "1e1"] {
+    for (value, reads_back) in [
+        ("", ""),
+        ("50 99 99.9", "50 99 99.9"),
+        ("0", "0"),
+        ("100", "100"),
+        ("0x10", "16"),
+        ("1e1", "10"),
+        ("50.0 99.90", "50 99.9"),
+        ("99.9999999", "100"),
+        ("-0", "-0"),
+        ("1e-310", "0"),
+    ] {
         let reply = c.cmds(&["CONFIG", "SET", key, value]);
         assert!(reply.is_ok(), "{value:?}: {reply:?}");
+        assert_eq!(get(&mut c), reads_back, "{value:?}");
     }
     // Put back what other tests of this process go by.
     assert!(c.cmds(&["CONFIG", "SET", key, "50 99 99.9"]).is_ok());

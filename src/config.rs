@@ -2176,12 +2176,31 @@ mod config_file_tests {
         assert_eq!(parse("100"), Ok(vec![100.0]));
         assert_eq!(parse("0x10"), Ok(vec![16.0]));
         assert_eq!(parse("1e1"), Ok(vec![10.0]));
-        for bad in ["abc", "50 abc", " 50", "50 ", "50  99", "nan", "0x", "--5"] {
+        for bad in [
+            "abc", "50 abc", " 50", "50 ", "50  99", "nan", "0x", "--5", "1e-400",
+        ] {
             assert_eq!(parse(bad), not_numbers, "{bad:?}");
         }
         for bad in ["101", "-1", "inf"] {
             assert_eq!(parse(bad), out_of_range, "{bad:?}");
         }
+    }
+
+    /// What `CONFIG GET` gives back is the numbers as Redis writes them: `%f`,
+    /// trailing zeros trimmed (#255).
+    #[test]
+    fn latency_percentiles_read_back_as_redis_writes_them() {
+        use crate::commands::server::format_latency_percentiles as text;
+        assert_eq!(text(&[]), "");
+        assert_eq!(text(&[50.0, 99.0, 99.9]), "50 99 99.9");
+        assert_eq!(text(&[16.0, 10.0]), "16 10");
+        assert_eq!(text(&[0.0, 100.0]), "0 100");
+        assert_eq!(text(&[50.0, 99.9]), "50 99.9");
+        // Rounded as `%f` rounds, and a negative zero keeps its sign
+        // (what Redis 8.10.3 read back for `99.9999999`, `-0` and `1e-310`).
+        assert_eq!(text(&[99.9999999]), "100");
+        assert_eq!(text(&[-0.0]), "-0");
+        assert_eq!(text(&[1e-310]), "0");
     }
 
     /// The file refuses what `CONFIG SET` refuses, with the same words (#255).

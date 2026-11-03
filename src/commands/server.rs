@@ -1007,10 +1007,33 @@ fn parse_percentile(word: &str) -> Option<f64> {
             {
                 return None;
             }
+            // An underflow to zero ("1e-400") is refused too, as `string2d`
+            // refuses it: a nonzero digit before the exponent, and zero.
+            let mantissa = digits.split(['e', 'E']).next().unwrap_or_default();
+            if value == 0.0 && mantissa.bytes().any(|b| (b'1'..=b'9').contains(&b)) {
+                return None;
+            }
             value
         }
     };
     Some(if negative { -magnitude } else { magnitude })
+}
+
+/// A list of percentiles as Redis's `CONFIG GET` writes it: each number with
+/// `%f` (six decimals), then the trailing zeros and a trailing `.` taken off,
+/// so `50.0` reads back as `50` and `99.90` as `99.9`.
+pub(crate) fn format_latency_percentiles(percentiles: &[f64]) -> String {
+    percentiles
+        .iter()
+        .map(|p| {
+            let fixed = format!("{p:.6}");
+            fixed
+                .trim_end_matches('0')
+                .trim_end_matches('.')
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The percentiles of a `latency-tracking-info-percentiles` value: numbers
@@ -1172,10 +1195,12 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
             // Redis's message when not. The configuration file goes through
             // here too.
             "latency-tracking-info-percentiles" => match parse_latency_percentiles(value) {
-                Ok(_) => {
+                Ok(percentiles) => {
+                    // Remembered as Redis's `CONFIG GET` gives it back, not as
+                    // given: `0x10 1e1` reads back as `16 10`.
                     REMEMBERED_CONFIG
                         .lock()
-                        .insert(param.clone(), value.to_string());
+                        .insert(param.clone(), format_latency_percentiles(&percentiles));
                     Some(resp_simple("OK"))
                 }
                 Err(why) => Some(resp_error(&format!(
