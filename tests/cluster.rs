@@ -2454,15 +2454,23 @@ fn migrate_with_writes_meanwhile(
     migrate.join().unwrap()
 }
 
-/// A write to a key while `MIGRATE` has it on the wire is not lost (#274).
-/// `MIGRATE` holds no lock across the round trip to the destination, and a
-/// write in that time was acknowledged here and then deleted along with the
-/// key: the destination had the value from before it. Now a key that does
-/// not hold what was sent is kept, `MIGRATE` answers `TRYAGAIN`, and only
-/// the keys it did delete are deleted on its replicas. Moving the key again
-/// with `REPLACE` takes the write along.
+/// One command on a connection of its own, in the background.
+fn command_in_background(port: u16, args: &[&str]) -> std::thread::JoinHandle<Resp> {
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    std::thread::spawn(move || {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        Conn::connect(port).cmd(&refs)
+    })
+}
+
+/// A write to a key while `MIGRATE` has it on the wire is not lost (#274),
+/// and does not make the `MIGRATE` fail either (#295): it waits until the
+/// key has moved, and is then sent on with `-ASK`, as in Redis, where
+/// `MIGRATE` blocks the server for its round trip. Before, the write was
+/// applied here and `MIGRATE` answered `TRYAGAIN`, which stops
+/// `redis-cli --cluster reshard`. The replicas delete what was moved.
 #[test]
-fn a_write_while_migrate_is_on_the_wire_is_not_lost() {
+fn a_write_while_migrate_is_on_the_wire_waits_for_it_and_is_not_lost() {
     let env = [("KIVIDB_TEST_FAILPOINTS", "migrate-before-delete")];
     let (nodes, ranges) = form_cluster_with_env(2, &env);
     let (src, dst) = (&nodes[0], &nodes[1]);
@@ -2475,8 +2483,7 @@ fn a_write_while_migrate_is_on_the_wire_is_not_lost() {
 
     // Keys of one slot without a hash tag: a build with Lua locks a tagged
     // key's tag for the whole of a command that names it
-    // (`lua-parallel-scripts`), MIGRATE's round trip included, and the
-    // writes below would wait for it.
+    // (`lua-parallel-scripts`), MIGRATE's round trip included.
     let names = ["a", "counter", "c", "ttl"];
     let first = key_in(ranges[0].0..=ranges[0].1, "race");
     let slot_number = slot_of(&first);
@@ -2488,7 +2495,7 @@ fn a_write_while_migrate_is_on_the_wire_is_not_lost() {
     let slot = slot_number.to_string();
     let k = |name: &str| keys[names.iter().position(|n| *n == name).unwrap()].clone();
     let mut s = src.conn();
-    for name in ["a", "counter", "c", "ttl"] {
+    for name in names {
         assert!(s.cmd(&["SET", &k(name), "1"]).is_ok());
     }
     let reply = dst
@@ -2500,67 +2507,62 @@ fn a_write_while_migrate_is_on_the_wire_is_not_lost() {
             .is_ok()
     );
     let port = dst.port.to_string();
-    let migrate = |extra: &[&str], keys: &[&str]| -> Vec<String> {
-        let mut args: Vec<String> = ["MIGRATE", "127.0.0.1", &port, "", "0", "5000"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        args.extend(extra.iter().map(|s| s.to_string()));
-        args.push("KEYS".to_string());
-        args.extend(keys.iter().map(|n| k(n)));
-        args
-    };
-
-    // The KEYS form: `counter` is written meanwhile, `a` and `c` are not.
-    let reply =
-        migrate_with_writes_meanwhile(src, &migrate(&[], &["a", "counter", "c"]), 1, || {
-            assert_eq!(src.conn().cmd(&["INCR", &k("counter")]).int(), 2);
-        });
-    let error = reply.err().unwrap_or_else(|| panic!("MIGRATE: {reply:?}"));
-    assert!(error.starts_with("TRYAGAIN"), "{error}");
-    assert!(error.contains(&k("counter")), "{error}");
-    // The acknowledged INCR is here; the keys that were not written are gone.
-    assert_eq!(s.cmd(&["GET", &k("counter")]).text(), "2");
-    assert_eq!(s.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 2);
-    // And the older copy sent of `counter` is gone from the destination:
-    // the newest, here, is the only one (#295).
-    assert!(error.contains("deleted there"), "{error}");
+    let ask = format!("ASK {slot} 127.0.0.1:{}", dst.port);
     let mut d = dst.conn();
-    assert_eq!(d.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 2);
-    assert!(d.cmd(&["ASKING"]).is_ok());
-    assert_eq!(d.cmd(&["EXISTS", &k("counter")]).int(), 0);
 
-    // The key form: a new time to live is a write too.
-    let mut args: Vec<String> = ["MIGRATE", "127.0.0.1", &port, &k("ttl"), "0", "5000"]
+    // The KEYS form: `counter` is written while the keys travel.
+    let mut args: Vec<String> = ["MIGRATE", "127.0.0.1", &port, "", "0", "5000", "KEYS"]
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let reply = migrate_with_writes_meanwhile(src, &args, 2, || {
-        assert_eq!(src.conn().cmd(&["PEXPIRE", &k("ttl"), "500000"]).int(), 1);
+    args.extend(["a", "counter", "c"].iter().map(|n| k(n)));
+    let mut write = None;
+    let reply = migrate_with_writes_meanwhile(src, &args, 1, || {
+        let incr = command_in_background(src.port, &["INCR", &k("counter")]);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!incr.is_finished(), "the write waits for the move");
+        write = Some(incr);
     });
+    assert!(reply.is_ok(), "MIGRATE: {reply:?}");
+    let reply = write.unwrap().join().unwrap();
     assert!(
-        reply.err().is_some_and(|e| e.starts_with("TRYAGAIN")),
-        "{reply:?}"
+        reply.err().is_some_and(|e| e.starts_with(&ask)),
+        "the write is sent on: {reply:?}"
     );
-    assert!(s.cmd(&["PTTL", &k("ttl")]).int() > 400_000);
-    assert_eq!(d.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 2);
+    // Where a cluster client sends it.
+    assert!(d.cmd(&["ASKING"]).is_ok());
+    assert_eq!(d.cmd(&["INCR", &k("counter")]).int(), 2);
+    assert_eq!(s.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 1);
+    assert_eq!(d.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 3);
 
-    // The replica deleted what its master deleted, and nothing else.
+    // The key form: a new time to live is a write too.
+    let args: Vec<String> = ["MIGRATE", "127.0.0.1", &port, &k("ttl"), "0", "5000"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let mut write = None;
+    let reply = migrate_with_writes_meanwhile(src, &args, 2, || {
+        let pexpire = command_in_background(src.port, &["PEXPIRE", &k("ttl"), "500000"]);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!pexpire.is_finished(), "the write waits for the move");
+        write = Some(pexpire);
+    });
+    assert!(reply.is_ok(), "MIGRATE: {reply:?}");
+    let reply = write.unwrap().join().unwrap();
+    assert!(
+        reply.err().is_some_and(|e| e.starts_with(&ask)),
+        "the write is sent on: {reply:?}"
+    );
+    assert!(d.cmd(&["ASKING"]).is_ok());
+    assert_eq!(d.cmd(&["PEXPIRE", &k("ttl"), "500000"]).int(), 1);
+    assert_eq!(s.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 0);
+
+    // The replica deleted what its master moved.
     assert_eq!(s.cmd(&["WAIT", "1", "10000"]).int(), 1);
     let mut r = replica.conn();
     assert!(r.cmd(&["READONLY"]).is_ok());
-    assert_eq!(r.cmd(&["GET", &k("counter")]).text(), "2");
-    assert!(r.cmd(&["PTTL", &k("ttl")]).int() > 400_000);
-    assert_eq!(r.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 2);
+    assert_eq!(r.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 0);
 
-    // Moved again (REPLACE is not needed any more, and does no harm), the
-    // keys arrive as they are now.
-    args.push("REPLACE".to_string());
-    let reply = migrate_with_writes_meanwhile(src, &args, 3, || {});
-    assert!(reply.is_ok(), "MIGRATE: {reply:?}");
-    let reply = migrate_with_writes_meanwhile(src, &migrate(&["REPLACE"], &["counter"]), 4, || {});
-    assert!(reply.is_ok(), "MIGRATE: {reply:?}");
-    assert_eq!(s.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 0);
     for node in [dst, src] {
         assert!(
             node.conn()
@@ -2571,9 +2573,167 @@ fn a_write_while_migrate_is_on_the_wire_is_not_lost() {
     let mut d = dst.conn();
     assert_eq!(d.cmd(&["GET", &k("counter")]).text(), "2");
     assert_eq!(d.cmd(&["GET", &k("a")]).text(), "1");
+    assert_eq!(d.cmd(&["GET", &k("c")]).text(), "1");
     assert!(d.cmd(&["PTTL", &k("ttl")]).int() > 400_000);
-    assert_eq!(s.cmd(&["WAIT", "1", "10000"]).int(), 1);
-    assert_eq!(r.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 0);
+}
+
+/// Clients write to every key of a slot, without a pause, while `MIGRATE`
+/// moves the keys a few at a time: every `MIGRATE` succeeds — none answers
+/// `TRYAGAIN` — and the destination holds every write a client was told
+/// had succeeded, to counters, lists and hashes (#295). A write to a key
+/// that has left is sent on with `-ASK`, and the client follows it there.
+#[test]
+fn migrate_under_writes_to_its_keys_succeeds_and_keeps_every_write() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (nodes, ranges) = form_cluster(2);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let (src_id, dst_id) = (src.id(), dst.id());
+
+    // Without a hash tag, as above.
+    let first = key_in(ranges[0].0..=ranges[0].1, "busy");
+    let slot_number = slot_of(&first);
+    let keys: Vec<String> = (0..)
+        .map(|i| format!("busy:{i}"))
+        .filter(|key| slot_of(key) == slot_number)
+        .take(48)
+        .collect();
+    let slot = slot_number.to_string();
+    let mut s = src.conn();
+    // A counter, a list and a hash in turn, each with something in it; the
+    // hashes also with a field whose time runs out as they move, which a
+    // read (`HGETALL`, below) drops: not a write, and no reason for
+    // `TRYAGAIN`.
+    for (i, key) in keys.iter().enumerate() {
+        let reply = match i % 3 {
+            0 => s.cmd(&["SET", key, "0"]),
+            1 => s.cmd(&["RPUSH", key, "first"]),
+            _ => s.cmd(&["HSET", key, "first", "1", "brief", "1"]),
+        };
+        assert!(reply.err().is_none(), "{reply:?}");
+        if i % 3 == 2 {
+            let ms = (300 + 20 * i).to_string();
+            let reply = s.cmd(&["HPEXPIRE", key, &ms, "FIELDS", "1", "brief"]);
+            assert_eq!(reply.array()[0].int(), 1, "{reply:?}");
+        }
+    }
+    assert!(
+        dst.conn()
+            .cmd(&["CLUSTER", "SETSLOT", &slot, "IMPORTING", &src_id])
+            .is_ok()
+    );
+    assert!(
+        s.cmd(&["CLUSTER", "SETSLOT", &slot, "MIGRATING", &dst_id])
+            .is_ok()
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let ask = format!("ASK {slot} ");
+    let writers: Vec<_> = (0..4)
+        .map(|w| {
+            let mine: Vec<(usize, String)> = keys
+                .iter()
+                .cloned()
+                .enumerate()
+                .filter(|(i, _)| i % 4 == w)
+                .collect();
+            let (stop, ask) = (Arc::clone(&stop), ask.clone());
+            let (src_port, dst_port) = (src.port, dst.port);
+            std::thread::spawn(move || {
+                let mut here = Conn::connect(src_port);
+                let mut there = Conn::connect(dst_port);
+                let mut acked = vec![0u64; mine.len()];
+                let mut n = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    for (at, (i, key)) in mine.iter().enumerate() {
+                        n += 1;
+                        let field = format!("w{w}:{n}");
+                        let args: Vec<&str> = match i % 3 {
+                            0 => vec!["INCR", key.as_str()],
+                            1 => vec!["RPUSH", key.as_str(), field.as_str()],
+                            _ => vec!["HSET", key.as_str(), field.as_str(), "1"],
+                        };
+                        let mut reply = here.cmd(&args);
+                        if reply.err().is_some_and(|e| e.starts_with(&ask)) {
+                            assert!(there.cmd(&["ASKING"]).is_ok());
+                            reply = there.cmd(&args);
+                        }
+                        assert!(reply.err().is_none(), "{args:?}: {reply:?}");
+                        acked[at] += 1;
+                        if i % 3 == 2 {
+                            let reply = here.cmd(&["HGETALL", key]);
+                            assert!(reply.err().is_none_or(|e| e.starts_with(&ask)), "{reply:?}");
+                        }
+                    }
+                }
+                mine.into_iter()
+                    .map(|(i, _)| i)
+                    .zip(acked)
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect();
+
+    // The keys go four at a time, as redis-cli moves them (in batches).
+    std::thread::sleep(Duration::from_millis(200));
+    let port = dst.port.to_string();
+    let mut batches = 0;
+    loop {
+        let batch = s.cmd(&["CLUSTER", "GETKEYSINSLOT", &slot, "4"]);
+        let batch: Vec<String> = batch.array().iter().map(Resp::text).collect();
+        if batch.is_empty() {
+            break;
+        }
+        let mut args: Vec<&str> = vec!["MIGRATE", "127.0.0.1", &port, "", "0", "5000", "KEYS"];
+        args.extend(batch.iter().map(String::as_str));
+        let reply = s.cmd(&args);
+        assert!(reply.is_ok(), "MIGRATE under writes: {reply:?}");
+        batches += 1;
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(batches >= 12, "{batches} batches");
+    std::thread::sleep(Duration::from_millis(200));
+    stop.store(true, Ordering::Relaxed);
+    let mut acked = vec![0u64; keys.len()];
+    for writer in writers {
+        for (i, count) in writer.join().unwrap() {
+            acked[i] = count;
+        }
+    }
+
+    for node in [dst, src] {
+        assert!(
+            node.conn()
+                .cmd(&["CLUSTER", "SETSLOT", &slot, "NODE", &dst_id])
+                .is_ok()
+        );
+    }
+    // Past the last `brief` field's time.
+    std::thread::sleep(Duration::from_millis(1300));
+    let mut d = dst.conn();
+    assert_eq!(
+        d.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(),
+        keys.len() as i64
+    );
+    for (i, key) in keys.iter().enumerate() {
+        assert!(acked[i] > 0, "{key} was written");
+        let (held, written) = match i % 3 {
+            0 => (
+                d.cmd(&["GET", key]).text().parse::<u64>().unwrap(),
+                acked[i],
+            ),
+            1 => (d.cmd(&["LLEN", key]).int() as u64, acked[i] + 1),
+            // `brief` has gone by now (and `HGETALL` drops what is due).
+            _ => (
+                d.cmd(&["HGETALL", key]).array().len() as u64 / 2,
+                acked[i] + 1,
+            ),
+        };
+        assert_eq!(
+            held, written,
+            "{key}: acknowledged writes at the destination"
+        );
+    }
 }
 
 /// A write that comes right after `MIGRATE` has deleted a key reaches the

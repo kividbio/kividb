@@ -480,6 +480,32 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **Writes to the keys `MIGRATE` is moving wait for it, instead of making
+  it answer `TRYAGAIN`** (#295). Since #274, a key written during
+  `MIGRATE`'s round trip to the destination was kept here and `MIGRATE`
+  answered `TRYAGAIN`. `redis-cli --cluster reshard` stops on that, and
+  under sustained writes `redis-cli --cluster fix` could not close the slot
+  it left open: clients re-created keys on the owner from empty, fix found
+  two different copies and gave up, and acknowledged keys could not be read
+  (or a list or hash showed only what was written after) until the slot was
+  closed by hand. Now, from before `MIGRATE` reads a batch until the
+  destination has confirmed it and the keys are deleted here, a write to
+  one of those keys waits, as in Redis, where `MIGRATE` blocks the server
+  for the round trip, and is then sent on with `-ASK`. Writes to other keys
+  go on. Ordinary commands do no more than before: a write already looks
+  at one flag inside the write gate, for handoffs, and `MIGRATE` raises the
+  same flag; `EXEC` looks at it too. A transaction naming one of the keys
+  is refused with `TRYAGAIN`, which clients retry, since its commands run
+  alone and cannot wait. Checkpoints and full syncs wait for the round
+  trip, each step of which is bounded by `MIGRATE`'s timeout. `MIGRATE`
+  still answers `TRYAGAIN` if a key changed all the same: a script wrote a
+  key it did not declare, or the key is hash-tagged in a build with Lua and
+  `lua-parallel-scripts` on, whose writes wait behind the tag's lock
+  instead. `CLUSTER MIGRATION IMPORT` is unchanged.
+  And a hash field whose time ran out just as `MIGRATE` (or `DUMP`) read
+  it no longer arrives without its expiry, to live on for good: `RESTORE`
+  drops it, as loading `dump.kdb` does.
+
 - **A replica stopped in the middle of a full sync keeps its last good
   dump.** Its shutdown saved whatever it held, which in a full sync is part
   of the master's dataset or, with the default `repl-diskless-load`,

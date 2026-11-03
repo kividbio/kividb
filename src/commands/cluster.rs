@@ -1554,9 +1554,10 @@ pub fn handle_migrate(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 /// other: if that task is a `MIGRATE`, which then waits on the destination,
 /// nothing polls the sockets until it is done. No other client is accepted or
 /// read from, no timer fires, a replica's link is not served — for as long as
-/// the `MIGRATE` waits. It does not need to hold anything to stop a write to
-/// the key it is moving (#274): the write is never read. `block_in_place`
-/// hands this worker's place, the polling with it, to another thread first.
+/// the `MIGRATE` waits. A write to a key it is moving must reach the server
+/// and wait for it (#274, see [`hold_while_moving`]), not go unread.
+/// `block_in_place` hands this worker's place, the polling with it, to
+/// another thread first.
 ///
 /// Only on a multi-threaded runtime. An io_uring worker runs a current-thread
 /// runtime of its own (tokio-uring), which has no other thread to hand its
@@ -1659,8 +1660,16 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
         keys.push(cmd[3]);
     }
 
-    // ── Serialise what exists ────────────────────────────────────────────
     let db = *ctx.selected_db;
+    // From before the keys are read until they are deleted here, writes to
+    // them wait (#295). Not for `COPY`, which deletes nothing.
+    let _holding = if copy {
+        None
+    } else {
+        hold_while_moving(db, &keys)
+    };
+
+    // ── Serialise what exists ────────────────────────────────────────────
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -1806,7 +1815,7 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
 
     // ── Delete what the destination confirmed ────────────────────────────
     crate::aof::failpoint("migrate-before-delete");
-    let not_deleted = delete_moved(ctx, db, &moved);
+    let not_deleted = delete_moved(ctx, db, &moved, _holding.is_some());
     // The copies sent of the keys kept here are older than they are: they
     // are taken back, so that the newest, here, is the only one (#295).
     let taken_back = !not_deleted.kept.is_empty()
@@ -1829,28 +1838,106 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
     }
 }
 
+/// What [`migrate`] holds from before it reads its keys until it has
+/// deleted them here, so that nothing writes them meanwhile (#295). Let go
+/// of in this order: the keys' write order and the write gate, then the
+/// keys' mark (the writes that waited for them go on, and find them gone).
+struct MoveHold {
+    _order: crate::write_order::OrderGuard,
+    _gate: crate::write_gate::WriteGuard,
+    _marked: crate::key_moves::Marked,
+}
+
+/// Hold `keys`, of database `db`, for a `MIGRATE` that will delete them:
+/// - **the keys' mark** (`key_moves`): a write that enters the write gate
+///   after this, to one of them, steps out and waits (`run_command`); a
+///   transaction that does is refused with `TRYAGAIN` (its commands run
+///   alone, and cannot wait);
+/// - then a wait for every write already in the gate (`write_gate::cut`,
+///   let go of at once), the ones that looked before the mark among them;
+/// - **the write gate and the keys' write order, whole**: an expiry, an
+///   eviction or the field-expiry sweep waits for the move too.
+///
+/// Not the command gate: a transaction or a script waiting to run alone
+/// holds back every command that comes after it, and with one in the
+/// queue at each round trip a node being resharded did little else.
+///
+/// Writes to other keys go on, but for the instant of the cut and a key
+/// that shares a stripe of the write order. A cut (a checkpoint, a full
+/// sync, a handoff) waits for the move: for as long as the destination
+/// takes to answer, each step at most `MIGRATE`'s timeout. A real handoff
+/// under way is waited out first, as a write waits it out.
+///
+/// What a script writes to a key it did not declare is not held back: the
+/// keys are deleted only if they still hold what was sent, and kept with
+/// `TRYAGAIN` otherwise, as before. Nothing is held, and `None` returned,
+/// from inside a transaction or a script (nothing runs beside them), or
+/// when this thread is in the write gate already (the lock of a key's hash
+/// tag, with `lua-parallel-scripts`).
+fn hold_while_moving(db: usize, keys: &[&[u8]]) -> Option<MoveHold> {
+    if crate::command_gate::alone_on_this_thread() || crate::write_gate::held_by_this_thread() {
+        return None;
+    }
+    while crate::pause::handoff() {
+        crate::pause::wait_out_handoff();
+    }
+    let marked = crate::key_moves::mark(db, keys.iter().map(|key| key.to_vec()).collect());
+    drop(crate::write_gate::cut());
+    let gate = crate::write_gate::enter();
+    let order = crate::write_order::lock_keys(db, keys.iter().copied());
+    Some(MoveHold {
+        _order: order,
+        _gate: gate,
+        _marked: marked,
+    })
+}
+
+/// Whether `value`, a hash, holds what `payload` held but for fields whose
+/// time has run out since: a read (`HGETALL`) drops those, and that is no
+/// write. `restore_payload` drops the ones whose time is up from the
+/// payload's copy; the fields of `value` that are due are left out here.
+fn same_hash_but_for_expired_fields(value: &crate::types::KiviDBValue, payload: &[u8]) -> bool {
+    use crate::types::KiviDBValue;
+    let (KiviDBValue::HashEx(now), Some(KiviDBValue::HashEx(then))) =
+        (value, crate::snapshot::restore_payload(payload))
+    else {
+        return false;
+    };
+    let (now, then) = (now.read(), then.read());
+    let live: Vec<(&String, &std::sync::Arc<[u8]>)> = now
+        .fields
+        .iter()
+        .filter(|(field, _)| !now.is_field_expired(field))
+        .collect();
+    live.len() == then.fields.len()
+        && live
+            .iter()
+            .all(|(field, val)| then.fields.get(field.as_str()) == Some(*val))
+}
+
 /// Delete the keys the destination has confirmed, each only if it still
 /// holds what was sent: the same value, and the same time to live (#274).
 ///
-/// `MIGRATE` holds no lock while the keys travel (it can wait on the network
-/// for as long as its timeout), so a key can be written in the meantime. The
-/// write is acknowledged here, and the destination has the value from before
-/// it: deleting the key would lose an acknowledged write. Such a key is kept,
-/// and returned, for `MIGRATE` to fail with: the slot then still holds it
-/// here, its newest value, and moving it again (with `REPLACE`, since the
-/// destination has a copy) takes the write along. A key gone meanwhile is
+/// [`hold_while_moving`] keeps the writes of clients off the keys while
+/// they travel (`held`). Where it holds nothing (see there), or a script
+/// writes a key it did not declare, a key can be written in the meantime: the write is acknowledged here, and
+/// the destination has the value from before it, so deleting the key would
+/// lose an acknowledged write. Such a key is kept, and returned, for
+/// `MIGRATE` to fail with: the slot then still holds it here, its newest
+/// value, and moving it again takes the write along. A key gone meanwhile is
 /// returned too, unless it went because its time was up: the destination's
 /// copy has the same absolute time, and is gone there as well.
 ///
 /// The deletions are one write, as far as a full sync, a checkpoint and the
 /// other writes to these keys are concerned: under the write gate and the
-/// keys' write order, held for the deletions only, never across the network.
+/// keys' write order (held since the keys were read, by [`hold_while_moving`],
+/// or else taken here for the deletions only).
 /// They are sent to replicas and the AOF as one `DEL` of exactly the keys
 /// deleted, before the order is let go of. (`MIGRATE`'s reply used to be
 /// propagated as a `DEL` of every key it named, deleted or not: one written
 /// meanwhile, or made meanwhile by a write to a key the dump had not found,
 /// was deleted on every replica and kept here.)
-fn delete_moved<'a>(ctx: &Ctx, db: usize, moved: &[&'a Outgoing]) -> NotDeleted<'a> {
+fn delete_moved<'a>(ctx: &Ctx, db: usize, moved: &[&'a Outgoing], held: bool) -> NotDeleted<'a> {
     let nested = crate::write_gate::held_by_this_thread();
     let mut gate = crate::write_gate::enter();
     while !nested && !ctx.apply_replication && crate::pause::handoff() {
@@ -1872,10 +1959,14 @@ fn delete_moved<'a>(ctx: &Ctx, db: usize, moved: &[&'a Outgoing]) -> NotDeleted<
         let removal = {
             let mut map = crate::write_lock!(shard);
             let expires_at_ms = map.expires(key).unwrap_or(0);
+            // Held, it may still not dump as it did: a read (`HGETALL`)
+            // drops a hash's fields whose time is up, which the
+            // destination's copy drops too, at the same absolute time.
             map.remove_if(key, |value| {
+                let value = value.to_value();
                 expires_at_ms == item.expires_at_ms
-                    && crate::snapshot::dump_payload(&value.to_value())
-                        .is_ok_and(|now| now == item.payload)
+                    && (crate::snapshot::dump_payload(&value).is_ok_and(|now| now == item.payload)
+                        || (held && same_hash_but_for_expired_fields(&value, &item.payload)))
             })
         };
         match removal {

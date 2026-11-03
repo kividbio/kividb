@@ -1324,7 +1324,15 @@ where
                             &hub_tx,
                             &aof_tx,
                         );
-                        if dirty_flag.load(std::sync::atomic::Ordering::Acquire) {
+                        // A `MIGRATE` is moving one of its keys (`key_moves`):
+                        // it cannot wait for it, holding every other command
+                        // back, nor run, writing a key the `MIGRATE` is about
+                        // to delete. It is given up whole with `TRYAGAIN`, as
+                        // Redis answers a command whose keys are being moved;
+                        // the client's retry is sent on with `-ASK`.
+                        let moving = crate::pause::writes_must_check()
+                            && crate::key_moves::queue_names_a_moving_key(selected_db, &tx.queue);
+                        if moving || dirty_flag.load(std::sync::atomic::Ordering::Acquire) {
                             watch_registry.as_ref().unwatch_all(
                                 &tx.watched_keys
                                     .iter()
@@ -1337,7 +1345,9 @@ where
                             // array is not guaranteed to be recognized as null by a strict RESP3
                             // parser (redis-py's, e.g., parses it as an empty array instead),
                             // which breaks WATCH-abort detection for RESP3 clients entirely.
-                            if resp_version == 3 {
+                            if moving {
+                                b"-TRYAGAIN a key of the transaction is being migrated\r\n".to_vec()
+                            } else if resp_version == 3 {
                                 crate::resp::write::resp_null_resp3()
                             } else {
                                 crate::resp::write::resp_null_array()

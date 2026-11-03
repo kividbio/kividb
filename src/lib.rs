@@ -13,6 +13,7 @@ pub mod config;
 pub mod eviction;
 pub mod expiry;
 pub mod field_expiry;
+pub mod key_moves;
 pub mod latency;
 pub mod lazyfree;
 pub mod listen;

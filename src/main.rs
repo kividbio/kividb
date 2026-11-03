@@ -24,6 +24,7 @@ mod config;
 pub mod eviction;
 pub mod expiry;
 pub mod field_expiry;
+pub mod key_moves;
 pub mod keyspace_events;
 pub mod keyspec;
 pub mod latency;

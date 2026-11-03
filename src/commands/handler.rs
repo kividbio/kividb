@@ -1015,9 +1015,10 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // a time, and a cut in the middle of one would be a cut in the middle of
     // something that is supposed to be atomic.
     //
-    // MIGRATE is deliberately not gated. It blocks on the network for up to
-    // its timeout, which would stall every write behind a cut, and it needs no
-    // protection: it propagates as an idempotent `DEL`.
+    // MIGRATE is deliberately not gated here. It blocks on the network for up
+    // to its timeout, and takes what it needs itself, for no longer than it
+    // must (`commands::cluster::hold_while_moving`); it propagates as an
+    // idempotent `DEL`.
     //
     // Nor is FT.DROPINDEX here: with `DD` it may delete millions of documents,
     // and it takes the gate, and the order of their keys, a few at a time
@@ -1095,17 +1096,42 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // paused writes, and this one got past the pause before it was set. It
     // must not run behind the handoff's back (see `pause::HANDOFF`): out of
     // the gate, wait, and then answer as whoever owns the key now would.
-    while gated && !nested && !ctx.apply_replication && crate::pause::handoff() {
+    //
+    // The same one load finds a `MIGRATE` holding keys here (`key_moves`): a
+    // write to one of them waits until it has gone, or stayed, and is then
+    // answered as the slot's state says — `-ASK` for a key that left. A
+    // write to other keys goes on.
+    while gated && !nested && !ctx.apply_replication && crate::pause::writes_must_check() {
+        let handoff = crate::pause::handoff();
+        if !handoff
+            && !crate::key_moves::names_a_moving_key(*ctx.selected_db, name, ctx.cmd.as_slice())
+        {
+            break;
+        }
         _write_gate = None;
-        crate::pause::wait_out_handoff();
+        if handoff {
+            crate::pause::wait_out_handoff();
+        } else {
+            crate::key_moves::wait_until_moved(*ctx.selected_db, name, ctx.cmd.as_slice());
+        }
         if ctx.cluster.enabled {
+            let store = ctx.store;
+            let db = *ctx.selected_db;
             let decision = crate::cluster::routing::route_named(
                 name,
                 ctx.cmd.as_slice(),
                 ctx.cluster,
                 false,
                 || false,
-                |_| true,
+                // After a handoff, whoever owns the slot; after a move, also
+                // whether the key is still here.
+                |key| {
+                    handoff
+                        || std::str::from_utf8(key).is_ok_and(|key| {
+                            crate::read_lock!(crate::store::get_shard(&store[db], key))
+                                .contains_key(key)
+                        })
+                },
             );
             if let Some(refusal) = decision.refusal() {
                 return refusal;
