@@ -54,6 +54,7 @@ from redisvl.query.filter import Num, Tag
 
 DIM = 64
 results = []
+PREFIXES = []  # every random name used, so what carries it can be removed
 
 CORPUS = [
     ("the cat sat on the warm mat", {"category": "animals", "year": 2020}),
@@ -117,7 +118,31 @@ def run_group(title, fn, *args):
 
 
 def unique(prefix):
-    return f"{prefix}_{uuid.uuid4().hex[:8]}"
+    name = f"{prefix}_{uuid.uuid4().hex[:8]}"
+    PREFIXES.append(name)
+    return name
+
+
+def indexes(r):
+    """The names of the search indexes, or none if the server cannot list them."""
+    try:
+        return {i.decode() if isinstance(i, bytes) else i for i in r.execute_command("FT._LIST")}
+    except Exception:  # noqa
+        return set()
+
+
+def cleanup(r, before):
+    """Drop the indexes created since `before`, with their documents, then any key that has one of
+    this run's random names in it. RedisSemanticCache names its index "<name>:<prefix>", so the
+    names a check passes to drop() are not the index's own; this finds it by what is new."""
+    for idx in indexes(r) - before:
+        try:
+            r.execute_command("FT.DROPINDEX", idx, "DD")
+        except Exception:  # noqa
+            pass
+    for name in PREFIXES:
+        for key in r.scan_iter(match=f"*{name}*", count=500):
+            r.delete(key)
 
 
 def drop(r, index, prefix):
@@ -317,6 +342,7 @@ def main():
     version = info.get("redis_version", "?")
     print(f"server {args.label} at {args.url} (redis_version {version})")
     check("connection: PING", lambda: r.ping() or "")
+    start = indexes(r)
 
     cleanups = []
     for algorithm in ("FLAT", "HNSW"):
@@ -327,6 +353,7 @@ def main():
     for done in cleanups:
         if done:
             drop(r, *done)
+    cleanup(r, start)
 
     counts = {s: sum(1 for x in results if x["status"] == s) for s in ("PASS", "WARN", "FAIL")}
     print(f"\n{args.label}: {counts['PASS']} PASS, {counts['WARN']} WARN, {counts['FAIL']} FAIL "
