@@ -1,6 +1,6 @@
 # KiviDB 1.2.0 benchmarks and tests
 
-Everything measured for the 1.2.0 release, on Azure VMs and AKS, from 2026-11-01 to 2026-11-03.
+Everything measured for the 1.2.0 release, on Azure VMs and AKS, from 2026-11-01 to 2026-11-03. **[REPORT.md](REPORT.md) has every number and every comparison in one file.**
 
 - **The full benchmark runs** used commit `75482abb`, the code of 1.2.0-rc7, against Redis, Redis Cluster, Valkey, Dragonfly, Garnet and kvrocks.
 - **Every suite was then rerun** on 1.2.0-rc8 (`082dab3d`), alternating with rc7 on the same VMs, in each suite's `rc8/` folder.
