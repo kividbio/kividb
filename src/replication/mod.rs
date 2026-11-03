@@ -1465,6 +1465,16 @@ pub fn save_dataset(
     // The replica's applier is between commands, and stays there until the
     // save is done: the point read here is the dataset written below.
     let _applying = repl_state.apply_lock.lock();
+    save_dataset_with(&turn, store, index_store, repl_state)
+}
+
+/// [`save_dataset`], with the checkpoint turn and the applier's lock held.
+fn save_dataset_with(
+    turn: &crate::aof::CheckpointTurn,
+    store: &crate::store::Store,
+    index_store: &crate::vector::IndexStore,
+    repl_state: &ReplState,
+) -> std::io::Result<()> {
     // First, so that a save that fails half-way cannot leave an old point
     // beside a new dump.
     let _ = std::fs::remove_file(RESYNC_PATH);
@@ -1474,7 +1484,7 @@ pub fn save_dataset(
     // instant the dataset is captured: no write is half-way then.
     let mut master_point: Option<(String, u64)> = None;
     if crate::aof::AOF_ENABLED.load(Ordering::Relaxed) {
-        crate::aof::checkpoint_noting(&turn, store, index_store, &mut || {
+        crate::aof::checkpoint_noting(turn, store, index_store, &mut || {
             if !repl_state.is_slave() && repl_state.feeds_hub() {
                 master_point = Some((
                     repl_state.repl_id(),
@@ -1532,7 +1542,6 @@ pub fn save_dataset(
     }
     crate::stats::RDB_SAVES.fetch_add(1, Ordering::Relaxed);
     crate::stats::record_save();
-    drop(turn);
     Ok(())
 }
 
@@ -2733,6 +2742,65 @@ pub fn dataset_for_final_save(state: &ReplState) -> Option<parking_lot::MutexGua
         .dataset_commit
         .try_lock_for(std::time::Duration::from_secs(1))?;
     (!state.slave_sync_in_progress.load(Ordering::SeqCst)).then_some(settled)
+}
+
+/// What a shutdown holds from when it closes the command gate to the exit:
+/// the gate, alone, and what its final save takes ([`hold_for_final_save`]).
+/// Never let go of: a gate opened again before the exit let writes run that
+/// were acknowledged and lost with the process.
+pub struct FinalSaveHold<'a> {
+    _alone: crate::command_gate::AloneGuard,
+    _applying: parking_lot::MutexGuard<'a, ()>,
+    turn: crate::aof::CheckpointTurn,
+}
+
+/// Shutdown: close the command gate for the final save, having taken first
+/// what the save takes — the checkpoint turn, then the replica applier's
+/// lock, the order [`save_dataset`] takes them in.
+///
+/// The applier holds its lock while it runs a command of its master's
+/// stream, and the command enters the command gate. A shutdown that closed
+/// the gate first and then waited in the save for that lock waited for
+/// ever: the applier, holding the lock, waited at the closed gate (#308).
+/// Taken first, the lock waits for the command the applier is running, and
+/// the applier applies nothing more.
+///
+/// A command already running that itself waits for the turn or the lock
+/// (`SAVE`, a promotion) would keep the gate from closing behind them: if it
+/// does not close in a moment, both are let go of, so that the command can
+/// finish, and taken again. Clients are paused by then, so no new command
+/// starts meanwhile.
+pub fn hold_for_final_save(state: &ReplState) -> std::io::Result<FinalSaveHold<'_>> {
+    use std::time::{Duration, Instant};
+    loop {
+        let turn = crate::aof::checkpoint_turn()?;
+        let applying = state.apply_lock.lock();
+        let deadline = Instant::now() + Duration::from_millis(50);
+        if let Some(alone) =
+            crate::command_gate::enter_alone_unless(Duration::from_millis(5), || {
+                Instant::now() >= deadline
+            })
+        {
+            return Ok(FinalSaveHold {
+                _alone: alone,
+                _applying: applying,
+                turn,
+            });
+        }
+        drop(applying);
+        drop(turn);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// [`save_dataset`] for a shutdown, under its [`hold_for_final_save`].
+pub fn save_dataset_held(
+    hold: &FinalSaveHold<'_>,
+    store: &crate::store::Store,
+    index_store: &crate::vector::IndexStore,
+    repl_state: &ReplState,
+) -> std::io::Result<()> {
+    save_dataset_with(&hold.turn, store, index_store, repl_state)
 }
 
 /// What a shutdown logs when [`dataset_for_final_save`] says no.

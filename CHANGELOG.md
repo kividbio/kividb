@@ -480,6 +480,17 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Fixed
 
+- **A replica stopped with SIGTERM under writes exits** (#308). Its
+  shutdown closed the command gate and then, in the final save, waited for
+  the lock the replica's stream applier holds while it runs a command; the
+  applier, holding that lock, waited at the closed gate. About a third of
+  clean stops of a replica under load never ended, so a Kubernetes pod stop
+  or a rolling restart waited out its grace period and killed the replica,
+  with no final save. The shutdown now takes what the save takes (the
+  checkpoint turn, then the applier's lock) before it closes the gate. It
+  still waits for its replicas first, and a replica in the middle of a full
+  sync still keeps its last good dump. Seen in 1.2.0-rc8 and rc9.
+
 - **Writes to the keys `MIGRATE` is moving wait for it, instead of making
   it answer `TRYAGAIN`** (#295). Since #274, a key written during
   `MIGRATE`'s round trip to the destination was kept here and `MIGRATE`

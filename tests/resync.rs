@@ -1532,6 +1532,101 @@ fn sigterm_waits_for_the_final_snapshot() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A replica stopped with SIGTERM while its master writes to it, keys
+/// expiring among the writes, exits with its final save (#308). Its shutdown
+/// closed the command gate and then waited for the lock its applier holds
+/// while it runs a command of the stream; the applier, holding it, waited at
+/// the closed gate. A third of such stops under load never ended.
+#[cfg(unix)]
+#[test]
+fn a_replica_stopped_under_writes_exits_with_its_final_save() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let master = Server::start(&[]);
+    let port = master.port.to_string();
+    let stop = Arc::new(AtomicBool::new(false));
+    let writers: Vec<_> = (0..4)
+        .map(|w| {
+            let (stop, port) = (Arc::clone(&stop), master.port);
+            std::thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                let mut n = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    // A pipeline of 50: keys that expire in 20 ms, counters
+                    // and hashes.
+                    let mut buf = Vec::new();
+                    for _ in 0..50 {
+                        n += 1;
+                        let (key, cmd): (String, Vec<String>) = match n % 3 {
+                            0 => (
+                                format!("x:{w}:{n}"),
+                                vec![
+                                    "SET".into(),
+                                    String::new(),
+                                    "v".into(),
+                                    "PX".into(),
+                                    "20".into(),
+                                ],
+                            ),
+                            1 => (
+                                format!("c:{w}:{}", n % 100),
+                                vec!["INCR".into(), String::new()],
+                            ),
+                            _ => (
+                                format!("h:{w}:{}", n % 100),
+                                vec!["HSET".into(), String::new(), format!("f{n}"), "v".into()],
+                            ),
+                        };
+                        buf.extend_from_slice(format!("*{}\r\n", cmd.len()).as_bytes());
+                        for (i, arg) in cmd.iter().enumerate() {
+                            let arg = if i == 1 { &key } else { arg };
+                            buf.extend_from_slice(
+                                format!("${}\r\n{arg}\r\n", arg.len()).as_bytes(),
+                            );
+                        }
+                    }
+                    if c.writer.write_all(&buf).is_err() {
+                        return;
+                    }
+                    for _ in 0..50 {
+                        c.read();
+                    }
+                }
+            })
+        })
+        .collect();
+
+    for round in 0..5 {
+        let mut replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+        let mut r = replica.conn();
+        wait_link_up(&mut r);
+        drop(r);
+        std::thread::sleep(Duration::from_millis(500));
+        unsafe {
+            libc::kill(replica.child.id() as libc::pid_t, libc::SIGTERM);
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while replica.child.try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "round {round}: the replica did not exit after SIGTERM:\n{}",
+                replica.log()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let log = replica.log();
+        assert!(
+            log.to_lowercase().contains("writing final snapshot") && log.contains("Goodbye."),
+            "round {round}: no final save:\n{log}"
+        );
+        assert!(replica.dir.join("dump.kdb.repl").exists(), "round {round}");
+    }
+    stop.store(true, Ordering::Relaxed);
+    for w in writers {
+        w.join().unwrap();
+    }
+}
+
 /// A library loaded with `FUNCTION LOAD` is part of the dataset, which Redis
 /// keeps in its RDB file and AOF. KiviDB's snapshot had no place for one, so
 /// each save dropped every library: `SAVE` and a restart, `SHUTDOWN` with the

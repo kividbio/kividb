@@ -1005,7 +1005,16 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                     // binding: one dropped at the end of this block opened
                     // the gate again before `process::exit` below, and the
                     // writes that ran in between were acknowledged and lost.
-                    std::mem::forget(crate::command_gate::enter_alone());
+                    // What the final save takes is taken before the gate:
+                    // a replica's applier holds it while it waits at the
+                    // gate (#308).
+                    let hold = match crate::replication::hold_for_final_save(&signal_repl_state) {
+                        Ok(hold) => hold,
+                        Err(e) => {
+                            log_error!("Final snapshot failed: {e}");
+                            std::process::exit(1);
+                        }
+                    };
                     crate::replication::end_stream_for_shutdown(&signal_repl_state);
                     if m != crate::shutdown::mode::NOW {
                         crate::replication::report_replicas_at_shutdown(
@@ -1026,7 +1035,8 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                     log_info!("Writing final snapshot...");
                     // With the replica's position in its master's stream
                     // beside it, so that the restart can ask to continue.
-                    let result = crate::replication::save_dataset(
+                    let result = crate::replication::save_dataset_held(
+                        &hold,
                         &signal_snapshot_store,
                         &signal_snapshot_index_store,
                         &signal_repl_state,
@@ -1045,6 +1055,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                         std::process::exit(1);
                     }
                     log_info!("Goodbye.");
+                    std::mem::forget(hold);
                 } else {
                     log_info!("SHUTDOWN NOSAVE — skipping snapshot. Goodbye.");
                 }
@@ -2206,7 +2217,9 @@ async fn async_main_tokio(
             } else {
                 started
             };
-            let _no_more_commands = crate::command_gate::enter_alone();
+            // What the final save takes is taken before the gate, as on
+            // io_uring above (#308).
+            let hold = crate::replication::hold_for_final_save(&repl_c)?;
             crate::replication::end_stream_for_shutdown(&repl_c);
             if m != mode::NOW {
                 crate::replication::report_replicas_at_shutdown(&repl_c, &hub_c, started, deadline);
@@ -2217,8 +2230,8 @@ async fn async_main_tokio(
                 log_warn!("{}", crate::replication::FINAL_SAVE_SKIPPED);
                 std::process::exit(0);
             };
-            let saved = crate::replication::save_dataset(&store_c, &index_c, &repl_c);
-            std::mem::forget(_no_more_commands);
+            let saved = crate::replication::save_dataset_held(&hold, &store_c, &index_c, &repl_c);
+            std::mem::forget(hold);
             saved
         })
         .await;
