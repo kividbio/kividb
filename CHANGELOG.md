@@ -32,6 +32,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`SCRIPT HELP` lists the `SCRIPT` subcommands, as in Redis.** It was an
   unknown subcommand (#256).
 
+### Fixed
+
+- **`CONFIG SET latency-tracking-info-percentiles` refuses what Redis refuses
+  (#255).** It took any value, `abc` included, and `INFO latencystats` then
+  dropped the words it could not read. A word that is not a number, and a number
+  outside 0 to 100, are now refused with Redis's messages, by `CONFIG SET` and by
+  the configuration file; an empty list is still allowed. Hexadecimal (`0x10`)
+  and exponent (`1e1`) forms are read as Redis reads them, and `CONFIG GET`
+  gives the numbers back as Redis writes them (`0x10 1e1` reads back as `16 10`).
+
 ## [1.2.0] - 2026-11-03
 
 See [docs/releases/v1.2.0.md](docs/releases/v1.2.0.md) for what to check before upgrading.

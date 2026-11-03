@@ -826,6 +826,71 @@ fn config_set_refuses_unknown_and_startup_only_settings() {
     );
 }
 
+/// `CONFIG SET latency-tracking-info-percentiles` takes what Redis takes and
+/// refuses what it refuses, with its words (#255). Each reply below is what
+/// Redis 8.10.3 answered; a refused value leaves what was there.
+#[test]
+fn config_set_latency_tracking_info_percentiles_refuses_what_redis_refuses() {
+    let _turn = maxmemory_turn();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let key = "latency-tracking-info-percentiles";
+    let get = |c: &mut Conn| {
+        c.cmds(&["CONFIG", "GET", key]).as_array()[1]
+            .as_str()
+            .to_string()
+    };
+    let refused = format!("ERR CONFIG SET failed (possibly related to argument '{key}') - ");
+    let not_numbers = "Invalid latency-tracking-info-percentiles parameters";
+    let out_of_range =
+        "latency-tracking-info-percentiles parameters should sit between [0.0,100.0]";
+
+    assert_eq!(get(&mut c), "50 99 99.9");
+    for (value, why) in [
+        ("abc", not_numbers),
+        ("50 abc", not_numbers),
+        ("101", out_of_range),
+        ("-1", out_of_range),
+        (" 50", not_numbers),
+        ("50 ", not_numbers),
+        ("50  99", not_numbers),
+        ("nan", not_numbers),
+        ("1e-400", not_numbers),
+        ("inf", out_of_range),
+    ] {
+        match c.cmds(&["CONFIG", "SET", key, value]) {
+            RespValue::Error(message) => {
+                assert_eq!(message, format!("{refused}{why}"), "{value:?}")
+            }
+            other => panic!("{value:?} was not refused: {other:?}"),
+        }
+        assert_eq!(
+            get(&mut c),
+            "50 99 99.9",
+            "{value:?} changed what was there"
+        );
+    }
+    for (value, reads_back) in [
+        ("", ""),
+        ("50 99 99.9", "50 99 99.9"),
+        ("0", "0"),
+        ("100", "100"),
+        ("0x10", "16"),
+        ("1e1", "10"),
+        ("50.0 99.90", "50 99.9"),
+        ("99.9999999", "100"),
+        ("-0", "-0"),
+        ("1e-310", "0"),
+    ] {
+        let reply = c.cmds(&["CONFIG", "SET", key, value]);
+        assert!(reply.is_ok(), "{value:?}: {reply:?}");
+        assert_eq!(get(&mut c), reads_back, "{value:?}");
+    }
+    // Put back what other tests of this process go by.
+    assert!(c.cmds(&["CONFIG", "SET", key, "50 99 99.9"]).is_ok());
+}
+
 #[test]
 fn config_set_cluster_settings_take_effect_or_are_refused() {
     let _turn = maxmemory_turn();

@@ -967,6 +967,96 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
     reply
 }
 
+/// What `CONFIG SET latency-tracking-info-percentiles` refuses a value with
+/// (#255). Redis's two messages, word for word: clients and tests compare
+/// them.
+const PERCENTILES_NOT_NUMBERS: &str = "Invalid latency-tracking-info-percentiles parameters";
+const PERCENTILES_OUT_OF_RANGE: &str =
+    "latency-tracking-info-percentiles parameters should sit between [0.0,100.0]";
+
+/// One percentile as Redis reads it (with `strtod`): a decimal, with or
+/// without an exponent (`99.9`, `1e1`), `inf`, or a hexadecimal integer
+/// (`0x10`). Anything else is not a number, and neither is NaN or a value
+/// too large for a double (`1e999`). A hexadecimal fraction or exponent
+/// (`0x1p3`) is not read.
+fn parse_percentile(word: &str) -> Option<f64> {
+    let (negative, digits) = match word.as_bytes().first()? {
+        b'-' => (true, &word[1..]),
+        b'+' => (false, &word[1..]),
+        _ => (false, word),
+    };
+    let magnitude = match digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        Some(hex) if !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            hex.bytes().fold(0.0, |sum, b| {
+                sum * 16.0 + (b as char).to_digit(16).map_or(0.0, f64::from)
+            })
+        }
+        Some(_) => return None,
+        None => {
+            // A second sign ("--5", "+-5") is not a number, though Rust's
+            // parser would take one more.
+            if digits.starts_with(['+', '-']) {
+                return None;
+            }
+            let value: f64 = digits.parse().ok()?;
+            if value.is_nan()
+                || (value.is_infinite() && !digits.to_ascii_lowercase().contains("inf"))
+            {
+                return None;
+            }
+            // An underflow to zero ("1e-400") is refused too, as `string2d`
+            // refuses it: a nonzero digit before the exponent, and zero.
+            let mantissa = digits.split(['e', 'E']).next().unwrap_or_default();
+            if value == 0.0 && mantissa.bytes().any(|b| (b'1'..=b'9').contains(&b)) {
+                return None;
+            }
+            value
+        }
+    };
+    Some(if negative { -magnitude } else { magnitude })
+}
+
+/// A list of percentiles as Redis's `CONFIG GET` writes it: each number with
+/// `%f` (six decimals), then the trailing zeros and a trailing `.` taken off,
+/// so `50.0` reads back as `50` and `99.90` as `99.9`.
+pub(crate) fn format_latency_percentiles(percentiles: &[f64]) -> String {
+    percentiles
+        .iter()
+        .map(|p| {
+            let fixed = format!("{p:.6}");
+            fixed
+                .trim_end_matches('0')
+                .trim_end_matches('.')
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The percentiles of a `latency-tracking-info-percentiles` value: numbers
+/// from 0 to 100 between single spaces, or nothing at all. The words are
+/// checked in order, each for being a number and then for its range, as in
+/// Redis, so an extra space (an empty word) is a word that is not a number.
+pub(crate) fn parse_latency_percentiles(value: &str) -> Result<Vec<f64>, &'static str> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    value
+        .split(' ')
+        .map(|word| {
+            let percentile = parse_percentile(word).ok_or(PERCENTILES_NOT_NUMBERS)?;
+            if (0.0..=100.0).contains(&percentile) {
+                Ok(percentile)
+            } else {
+                Err(PERCENTILES_OUT_OF_RANGE)
+            }
+        })
+        .collect()
+}
+
 /// `CONFIG SET` of a setting that is the server's as a whole, not of a
 /// connection, a store or the replication: what a line of the configuration
 /// file with it does too (#142). `None`: not one of these.
@@ -1099,6 +1189,23 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                 _ => Some(resp_error(
                     "ERR argument must be between 0 and 9223372036854775807 inclusive",
                 )),
+            },
+            // The percentiles `INFO latencystats` reports (#255): remembered
+            // when they are numbers from 0 to 100 (or none), refused with
+            // Redis's message when not. The configuration file goes through
+            // here too.
+            "latency-tracking-info-percentiles" => match parse_latency_percentiles(value) {
+                Ok(percentiles) => {
+                    // Remembered as Redis's `CONFIG GET` gives it back, not as
+                    // given: `0x10 1e1` reads back as `16 10`.
+                    REMEMBERED_CONFIG
+                        .lock()
+                        .insert(param.clone(), format_latency_percentiles(&percentiles));
+                    Some(resp_simple("OK"))
+                }
+                Err(why) => Some(resp_error(&format!(
+                    "ERR CONFIG SET failed (possibly related to argument '{param}') - {why}"
+                ))),
             },
             "stream-node-max-bytes" => match memory_size(value) {
                 Some(v) if v <= i64::MAX as usize => {
@@ -3916,11 +4023,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 && remembered_config("latency-tracking").as_deref() != Some("no")
             {
                 out.push_str("# Latencystats\r\n");
-                let percentiles: Vec<f64> = remembered_config("latency-tracking-info-percentiles")
-                    .unwrap_or_default()
-                    .split_whitespace()
-                    .filter_map(|p| p.parse().ok())
-                    .collect();
+                let percentiles: Vec<f64> = parse_latency_percentiles(
+                    &remembered_config("latency-tracking-info-percentiles").unwrap_or_default(),
+                )
+                .unwrap_or_default();
                 for (name, totals) in crate::cmdstats::totals() {
                     let line: Vec<String> = percentiles
                         .iter()
