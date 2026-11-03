@@ -1,0 +1,15 @@
+{
+ "keys_acked": 32768,
+ "acked_writes": 6172947,
+ "failed_writes": 364,
+ "error_kinds": {
+  "ConnectionError:Error": 363,
+  "ClusterDownError:The": 1
+ },
+ "ok": 32768,
+ "missing": 0,
+ "stale": 0,
+ "other": 0,
+ "ok_unknown_later": 0,
+ "bad_by_slot": {}
+}

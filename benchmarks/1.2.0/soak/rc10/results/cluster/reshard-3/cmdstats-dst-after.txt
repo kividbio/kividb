@@ -1,0 +1,6 @@
+cmdstat_asking:calls=68189,usec=376263,usec_per_call=5.52,rejected_calls=0,failed_calls=0
+cmdstat_cluster|info:calls=2692,usec=1628515,usec_per_call=604.95,rejected_calls=0,failed_calls=0
+cmdstat_cluster|nodes:calls=28,usec=8910,usec_per_call=318.21,rejected_calls=0,failed_calls=0
+cmdstat_cluster|setslot:calls=384,usec=592430,usec_per_call=1542.79,rejected_calls=0,failed_calls=0
+cmdstat_cluster|slots:calls=2339,usec=757023,usec_per_call=323.65,rejected_calls=0,failed_calls=0
+cmdstat_restore:calls=67079,usec=800299,usec_per_call=11.93,rejected_calls=0,failed_calls=0

@@ -1,0 +1,212 @@
+11:47:29 failover-start slot=3000 master=10.81.1.11:7001 replica=10.81.1.12:7002
+11:47:29 failover-reply OK
+11:47:30 failover-promoted 10.81.1.12:7002 after 0.02 s
+11:47:30 failover-old-master-replica 10.81.1.11:7001 after 0.02 s
+11:47:30 failover-end cluster-ok after 0.14 s
+11:47:36 failover-resync 10.81.1.11:7001 partial=1 full=0 lines: 2026-11-03T11:47:29.894Z 17723 [INFO] Replication: Partial resync: continuing from offset 5185980766 — no dataset transfer|
+11:53:29 sigterm-start round 1 slot=8000 replica=10.81.1.13:7002 master=10.81.1.12:7001: master_link_status:up master_sync_in_progress:0 slave_repl_offset:8204384655 
+11:53:31 sigterm-exit round 1 10.81.1.13:7002 result=exited after 1.10 s final-save=yes (writing-final-snapshot=1 goodbye=1 error-lines=0 skip-lines=0)
+restarted :7002 pid 38628
+11:53:34 sigterm-restarted 10.81.1.13:7002
+11:53:35 sigterm-rejoined 10.81.1.13:7002 as replica after 0.01 s
+11:53:35 sigterm-end cluster-ok after 0.15 s
+11:53:40 sigterm-resync 10.81.1.13:7002 partial=1 full=0 lines: 2026-11-03T11:53:34.794Z 38628 [INFO] Replication: Partial resync: continuing from offset 8213501804 — no dataset transfer|
+11:59:28 kill9-start slot=8000 master=10.81.1.12:7001 replica=10.81.1.13:7002
+11:59:29 kill9-killed 10.81.1.12:7001
+11:59:34 kill9-promoted 10.81.1.13:7002 after 5.20 s
+restarted :7001 pid 45248
+11:59:57 kill9-restarted 10.81.1.12:7001
+12:00:04 kill9-rejoined 10.81.1.12:7001 as replica after 6.72 s
+12:00:05 kill9-end cluster-ok after 0.18 s
+12:00:10 kill9-resync 10.81.1.12:7001 partial=0 full=1 lines: 2026-11-03T11:59:59.183Z 45248 [INFO] Replication: Full resync from 33e7d9a20357edb0d0526767628c27f23e972e51 offset=11251606235|2026-11-03T12:00:03.836Z 45248 [INFO] Replication: Full sync loaded: 1161122 keys (70431 with a TTL), replacing 1149159 local keys|
+12:07:44 reshard-start round 1 src-shard=3000 dst-shard=8000: 128 slots (0-127) from 10.81.1.12:7002 (c31f74c6dbf6db03ea64518a7e6e45ef2dcbfe33, 1422052 keys) to 10.81.1.13:7002 (059a799d344c0df3629a80c4c2d0e02c0615c014) with plain redis-cli
+12:20:13 reshard-end round 1 exit=0 after 748.66 s: slots begun=128, TRYAGAIN=0, ERR=0: 
+CLUSTER GETKEYSINSLOT: n=4241 median=155815us max=341496us
+MIGRATE: n=642 median=12829us max=45427us
+CLUSTER SETSLOT: n=125 median=295616us max=334100us
+SET: n=114 median=13879us max=52919us
+INFO: n=73 median=51906us max=56015us
+HSET: n=43 median=12553us max=51829us
+LPUSH: n=25 median=15080us max=52791us
+GET: n=25 median=26551us max=52996us
+SADD: n=17 median=13239us max=49435us
+INCRBY: n=13 median=12573us max=50758us
+ZADD: n=12 median=14042us max=51013us
+ZINCRBY: n=8 median=12778us max=43993us
+EXPIRE: n=7 median=12839us max=49925us
+SREM: n=6 median=27330us max=54452us
+DEL: n=5 median=18090us max=54523us
+SCARD: n=3 median=24369us max=49695us
+RPOP: n=3 median=12478us max=50930us
+HTTL: n=2 median=49915us max=49915us
+HGET: n=2 median=51469us max=51469us
+LRANGE: n=2 median=47995us max=47995us
+ZRANGEBYSCORE: n=2 median=49335us max=49335us
+ZREVRANGE: n=1 median=11072us max=11072us
+LTRIM: n=1 median=50332us max=50332us
+HGETALL: n=1 median=12323us max=12323us
+HEXPIRE: n=1 median=12164us max=12164us
+INFO: n=74 median=42004us max=57592us
+SET: n=47 median=23116us max=40802us
+GET: n=7 median=22216us max=42966us
+HSET: n=3 median=28289us max=31893us
+ZREVRANGE: n=1 median=32080us max=32080us
+ASKING: n=1 median=41451us max=41451us
+LRANGE: n=1 median=38887us max=38887us
+HGET: n=1 median=24698us max=24698us
+SISMEMBER: n=1 median=31719us max=31719us
+INCRBY: n=1 median=32512us max=32512us
+CLUSTER SETSLOT: n=1 median=23176us max=23176us
+SADD: n=1 median=37740us max=37740us
+12:20:15 reshard-check round 1: open-on-source=[] open-slots-lines=0 covered=1 err-lines=0 moved-slots=128
+12:20:25 reshard-done round 1 cluster-ok after 0.16 s
+12:20:26 sigterm-start round 2 slot=13000 replica=10.81.1.11:7002 master=10.81.1.13:7001: master_link_status:up master_sync_in_progress:0 slave_repl_offset:16506103989 
+12:20:28 sigterm-exit round 2 10.81.1.11:7002 result=exited after 1.25 s final-save=yes (writing-final-snapshot=1 goodbye=1 error-lines=0 skip-lines=0)
+restarted :7002 pid 68352
+12:20:32 sigterm-restarted 10.81.1.11:7002
+12:20:38 sigterm-rejoined 10.81.1.11:7002 as replica after 5.91 s
+12:20:39 sigterm-end cluster-ok after 0.21 s
+12:20:44 sigterm-resync 10.81.1.11:7002 partial=0 full=1 lines: 2026-11-03T12:20:32.734Z 68352 [INFO] Replication: Full resync from ca0b8ef0e48aa39c392646089f1829e5448e9c58 offset=16622223591|2026-11-03T12:20:37.066Z 68352 [INFO] Replication: Full sync loaded: 1491831 keys (55697 with a TTL), replacing 1483926 local keys|
+12:27:29 import-start round 1 CLUSTER MIGRATION IMPORT 10923 11422 on 10.81.1.12:7002 (c31f74c6dbf6db03ea64518a7e6e45ef2dcbfe33, 1702844 keys), source 10.81.1.13:7001 (2f30ca5dc1a5d8e2efd90afa668cbc23b0617867, 1743450 keys)
+12:27:29 import-id 493a4ebe43dbff05712272437d5da9dc428dc07c
+12:27:34 import-done round 1 in 4.80 s: id 493a4ebe43dbff05712272437d5da9dc428dc07c slots 10923-11422 source 2f30ca5dc1a5d8e2efd90afa668cbc23b0617867 dest c31f74c6dbf6db03ea64518a7e6e45ef2dcbfe33 operation import state completed last_error  retries 0 create_time 1793708849189 start_time 1793708849189 end_time 1793708853649 write_pause_ms 0 capture_pause_ms 0
+12:27:34 import-keys source 1653605 dest 1864698
+12:27:34 import-end cluster-ok after 0.19 s
+12:33:29 sigterm-start round 3 slot=3000 replica=10.81.1.11:7001 master=10.81.1.12:7002: master_link_status:up master_sync_in_progress:0 slave_repl_offset:28644566714 
+12:33:31 sigterm-exit round 3 10.81.1.11:7001 result=exited after 1.53 s final-save=yes (writing-final-snapshot=1 goodbye=1 error-lines=0 skip-lines=0)
+restarted :7001 pid 84756
+12:33:36 sigterm-restarted 10.81.1.11:7001
+12:33:37 sigterm-rejoined 10.81.1.11:7001 as replica after 0.01 s
+12:33:38 sigterm-end cluster-ok after 0.78 s
+12:33:43 sigterm-resync 10.81.1.11:7001 partial=1 full=0 lines: 2026-11-03T12:33:37.018Z 84756 [INFO] Replication: Partial resync: continuing from offset 28652688807 — no dataset transfer|
+12:39:28 kill9-start slot=3000 master=10.81.1.12:7002 replica=10.81.1.11:7001
+12:39:29 kill9-killed 10.81.1.12:7002
+12:39:34 kill9-promoted 10.81.1.11:7001 after 5.55 s
+restarted :7002 pid 91762
+12:40:00 kill9-restarted 10.81.1.12:7002
+12:40:08 kill9-rejoined 10.81.1.12:7002 as replica after 7.72 s
+12:40:08 kill9-end cluster-ok after 0.19 s
+12:40:14 kill9-resync 10.81.1.12:7002 partial=0 full=1 lines: 2026-11-03T12:40:01.567Z 91762 [INFO] Replication: Full resync from 37daebace8ea15580851b7c3bfb15846ed40c10b offset=31951652785|2026-11-03T12:40:06.889Z 91762 [INFO] Replication: Full sync loaded: 2259399 keys (76406 with a TTL), replacing 2242583 local keys|
+12:45:44 reshard-start round 2 src-shard=13000 dst-shard=8000: 128 slots (11423-11550) from 10.81.1.13:7001 (2f30ca5dc1a5d8e2efd90afa668cbc23b0617867, 2097713 keys) to 10.81.1.13:7002 (059a799d344c0df3629a80c4c2d0e02c0615c014) with plain redis-cli
+13:07:41 reshard-end round 2 exit=0 after 1317.15 s: slots begun=128, TRYAGAIN=0, ERR=0: 
+CLUSTER GETKEYSINSLOT: n=4262 median=195815us max=379430us
+SET: n=1890 median=196639us max=379412us
+GET: n=1243 median=204154us max=404183us
+HSET: n=488 median=193763us max=371276us
+LPUSH: n=276 median=206587us max=371445us
+HGET: n=160 median=157969us max=380743us
+ZADD: n=158 median=193790us max=382004us
+SADD: n=158 median=179681us max=368401us
+INCRBY: n=147 median=201410us max=371535us
+LTRIM: n=131 median=184368us max=368117us
+LRANGE: n=127 median=218018us max=369035us
+HGETALL: n=105 median=211625us max=370489us
+ZINCRBY: n=99 median=195798us max=378237us
+EXPIRE: n=90 median=199067us max=372583us
+INFO: n=86 median=59810us max=428150us
+CLUSTER SETSLOT: n=85 median=366554us max=406320us
+SISMEMBER: n=74 median=170061us max=364930us
+SCARD: n=68 median=196475us max=364176us
+ZREVRANGE: n=65 median=187309us max=369830us
+SREM: n=58 median=172182us max=361702us
+HTTL: n=55 median=196653us max=369175us
+HEXPIRE: n=49 median=205293us max=367671us
+ZRANGEBYSCORE: n=45 median=198354us max=369483us
+RPOP: n=37 median=177050us max=367689us
+DEL: n=27 median=237884us max=370428us
+MIGRATE: n=16 median=45684us max=71493us
+CLUSTER INFO: n=1 median=308306us max=308306us
+INFO: n=130 median=66385us max=85484us
+SET: n=52 median=33266us max=52431us
+GET: n=14 median=49691us max=72661us
+HSET: n=6 median=68692us max=69726us
+LPUSH: n=3 median=52342us max=69734us
+ZADD: n=2 median=50772us max=50772us
+CLUSTER SETSLOT: n=2 median=17540us max=17540us
+HGETALL: n=2 median=73486us max=73486us
+LRANGE: n=2 median=62014us max=62014us
+INCRBY: n=2 median=56643us max=56643us
+ZINCRBY: n=1 median=45185us max=45185us
+HGET: n=1 median=15652us max=15652us
+EXPIRE: n=1 median=29459us max=29459us
+HTTL: n=1 median=33232us max=33232us
+ASKING: n=1 median=55909us max=55909us
+SADD: n=1 median=24789us max=24789us
+SCARD: n=1 median=24856us max=24856us
+13:07:43 reshard-check round 2: open-on-source=[] open-slots-lines=0 covered=1 err-lines=0 moved-slots=128
+13:07:54 reshard-done round 2 cluster-ok after 0.19 s
+13:07:54 failover-start slot=13000 master=10.81.1.13:7001 replica=10.81.1.11:7002
+13:07:55 failover-reply OK
+13:07:55 failover-promoted 10.81.1.11:7002 after 0.04 s
+13:07:56 failover-old-master-replica 10.81.1.13:7001 after 0.02 s
+13:07:56 failover-end cluster-ok after 0.27 s
+13:08:02 failover-resync 10.81.1.13:7001 partial=1 full=0 lines: 2026-11-03T13:07:55.452Z 18446 [INFO] Replication: Partial resync: continuing from offset 34671011003 — no dataset transfer|
+13:08:03 import-start round 2 CLUSTER MIGRATION IMPORT 5461 5960 on 10.81.1.11:7002 (67ed7e44d9d3ef14635a698a119f6d8daa97ff03, 2135720 keys), source 10.81.1.13:7002 (059a799d344c0df3629a80c4c2d0e02c0615c014, 2542722 keys)
+13:08:03 import-id 65c980e19acf975995d03d9a9047a6d19fd112a8
+13:08:10 import-done round 2 in 6.90 s: id 65c980e19acf975995d03d9a9047a6d19fd112a8 slots 5461-5960 source 059a799d344c0df3629a80c4c2d0e02c0615c014 dest 67ed7e44d9d3ef14635a698a119f6d8daa97ff03 operation import state completed last_error  retries 0 create_time 1793711283440 start_time 1793711283440 end_time 1793711289986 write_pause_ms 0 capture_pause_ms 0 
+13:08:10 import-keys source 2453398 dest 2365176
+13:08:10 import-end cluster-ok after 0.17 s
+13:09:44 reshard-start round 3 src-shard=8000 dst-shard=3000: 128 slots (0-127) from 10.81.1.13:7002 (059a799d344c0df3629a80c4c2d0e02c0615c014, 2405032 keys) to 10.81.1.11:7001 (f59b08e7ce1c2788279c95116cae0b3c85baa1ca) with plain redis-cli
+13:36:53 reshard-end round 3 exit=0 after 1628.60 s: slots begun=128, TRYAGAIN=0, ERR=0: 
+CLUSTER GETKEYSINSLOT: n=6801 median=219856us max=458968us
+MIGRATE: n=1131 median=14036us max=83860us
+SET: n=281 median=16760us max=72072us
+INFO: n=159 median=65246us max=73643us
+CLUSTER SETSLOT: n=126 median=415114us max=431506us
+HSET: n=82 median=15613us max=65412us
+GET: n=81 median=20826us max=72093us
+LPUSH: n=58 median=17737us max=65089us
+SADD: n=39 median=13426us max=58061us
+ZADD: n=32 median=13966us max=65019us
+INCRBY: n=27 median=15364us max=65724us
+DEL: n=13 median=14616us max=61053us
+SREM: n=9 median=11487us max=62450us
+ZINCRBY: n=8 median=12916us max=21765us
+LRANGE: n=6 median=24988us max=63586us
+HGET: n=6 median=13438us max=65288us
+SISMEMBER: n=5 median=56086us max=62645us
+EXPIRE: n=5 median=15262us max=16185us
+ZREVRANGE: n=4 median=59288us max=61084us
+RPOP: n=4 median=50022us max=62719us
+SCARD: n=4 median=60710us max=61503us
+ROLE: n=3 median=63407us max=64491us
+LTRIM: n=3 median=21994us max=61906us
+ZRANGEBYSCORE: n=2 median=65200us max=65200us
+HGETALL: n=2 median=51379us max=51379us
+HTTL: n=1 median=24381us max=24381us
+CLUSTER INFO: n=1 median=62000us max=62000us
+HEXPIRE: n=1 median=14258us max=14258us
+INFO: n=161 median=74028us max=80183us
+SET: n=84 median=27384us max=72861us
+GET: n=11 median=67484us max=76642us
+LPUSH: n=3 median=68391us max=69587us
+ZINCRBY: n=3 median=59322us max=67473us
+RPOP: n=2 median=72048us max=72048us
+HSET: n=2 median=21830us max=21830us
+SADD: n=2 median=51272us max=51272us
+HGET: n=1 median=76584us max=76584us
+ZREVRANGE: n=1 median=36175us max=36175us
+HGETALL: n=1 median=72735us max=72735us
+LRANGE: n=1 median=68640us max=68640us
+EXPIRE: n=1 median=18709us max=18709us
+CLUSTER SETSLOT: n=1 median=25155us max=25155us
+INCRBY: n=1 median=26722us max=26722us
+HTTL: n=1 median=50284us max=50284us
+13:36:55 reshard-check round 3: open-on-source=[] open-slots-lines=0 covered=1 err-lines=0 moved-slots=128
+13:37:05 reshard-done round 3 cluster-ok after 0.20 s
+13:37:06 sigterm-start round 4 slot=8000 replica=10.81.1.12:7001 master=10.81.1.13:7002: master_link_status:up master_sync_in_progress:0 slave_repl_offset:39366566913 
+13:37:09 sigterm-exit round 4 10.81.1.12:7001 result=exited after 1.37 s final-save=yes (writing-final-snapshot=1 goodbye=1 error-lines=0 skip-lines=0)
+restarted :7001 pid 150832
+13:37:14 sigterm-restarted 10.81.1.12:7001
+13:37:21 sigterm-rejoined 10.81.1.12:7001 as replica after 6.69 s
+13:37:22 sigterm-end cluster-ok after 0.20 s
+13:37:27 sigterm-resync 10.81.1.12:7001 partial=0 full=1 lines: 2026-11-03T13:37:15.426Z 150832 [INFO] Replication: Full resync from 33e7d9a20357edb0d0526767628c27f23e972e51 offset=39515622035|2026-11-03T13:37:20.707Z 150832 [INFO] Replication: Full sync loaded: 2451232 keys (52180 with a TTL), replacing 2440520 local keys|
+13:37:28 kill9-start slot=13000 master=10.81.1.11:7002 replica=10.81.1.13:7001
+13:37:29 kill9-killed 10.81.1.11:7002
+13:37:35 kill9-promoted 10.81.1.13:7001 after 5.90 s
+restarted :7002 pid 152245
+13:38:01 kill9-restarted 10.81.1.11:7002
+13:38:11 kill9-rejoined 10.81.1.11:7002 as replica after 9.38 s
+13:38:11 kill9-end cluster-ok after 0.23 s
+13:38:17 kill9-resync 10.81.1.11:7002 partial=0 full=1 lines: 2026-11-03T13:38:02.184Z 152245 [INFO] Replication: Full resync from 025c800a136c476fe4a9579c28564895dd2bbf3e offset=38452507765|2026-11-03T13:38:10.086Z 152245 [INFO] Replication: Full sync loaded: 2590398 keys (60246 with a TTL), replacing 2571461 local keys|
+13:38:17 events-done

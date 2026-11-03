@@ -1,0 +1,7 @@
+=== sigterm-4 2026-11-03T13:37:07.029Z
+2026-11-03T13:37:07.299Z 45248 [INFO] Replication: No replica for 3600s — replication backlog released
+2026-11-03T13:37:07.422Z 45248 [INFO] SIGTERM received — shutting down gracefully
+2026-11-03T13:37:07.423Z 45248 [INFO] Writing final snapshot...
+2026-11-03T13:37:08.300Z 45248 [INFO] Replication: No replica for 3600s — replication backlog released
+2026-11-03T13:37:08.320Z 45248 [INFO] AOF: rebased onto dump.kdb (generation 359) — log is now the delta
+2026-11-03T13:37:08.320Z 45248 [INFO] Goodbye.

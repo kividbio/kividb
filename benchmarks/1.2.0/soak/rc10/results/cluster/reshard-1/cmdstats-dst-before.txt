@@ -1,0 +1,3 @@
+cmdstat_cluster|info:calls=728,usec=519437,usec_per_call=713.51,rejected_calls=0,failed_calls=0
+cmdstat_cluster|nodes:calls=3,usec=768,usec_per_call=256.00,rejected_calls=0,failed_calls=0
+cmdstat_cluster|slots:calls=487,usec=133708,usec_per_call=274.55,rejected_calls=0,failed_calls=0
