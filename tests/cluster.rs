@@ -2590,20 +2590,20 @@ fn a_write_while_migrate_is_on_the_wire_waits_for_it_and_is_not_lost() {
 /// here, let go of), is sent on with `-ASK` once it reaches the gate. It
 /// used to run here, on a key that had left, and make it again: a wrong
 /// reply, and a copy the cluster no longer routes to, whose writes were
-/// lost when the reshard finished (#331). The same for a transaction and a
-/// script. The source's commands wait at the failpoint `routed` once they
-/// have been routed (`KIVIDB_TEST_STALL_KEYS`), as one can on a busy
-/// machine.
+/// lost when the reshard finished (#331). The same for a transaction, watched
+/// or not, and a script. The source's commands wait at the failpoint `routed`
+/// once they have been routed (`KIVIDB_TEST_STALL_KEYS`), as one can on a
+/// busy machine.
 #[test]
 fn a_write_routed_before_its_key_moved_is_sent_on_not_run_here() {
-    // Three keys of one slot of the source's half, without a hash tag (see
+    // Four keys of one slot of the source's half, without a hash tag (see
     // above).
     let first = key_in(0..=8191, "routed");
     let slot_number = slot_of(&first);
     let keys: Vec<String> = (0..)
         .map(|i| format!("routed:{i}"))
         .filter(|key| slot_of(key) == slot_number)
-        .take(3)
+        .take(4)
         .collect();
     let stall_keys = keys.join(",");
     let env = [
@@ -2648,7 +2648,9 @@ fn a_write_routed_before_its_key_moved_is_sent_on_not_run_here() {
         failpoint
     };
 
-    let set = in_background(&[&["MSET", &keys[0], "5", &keys[1], "5", &keys[2], "5"]]);
+    let set = in_background(&[&[
+        "MSET", &keys[0], "5", &keys[1], "5", &keys[2], "5", &keys[3], "5",
+    ]]);
     std::fs::remove_file(held(&mut hit)).unwrap();
     assert!(set.join().unwrap().is_ok());
     let reply = dst
@@ -2683,16 +2685,32 @@ fn a_write_routed_before_its_key_moved_is_sent_on_not_run_here() {
         reply.err().is_some_and(|e| e.starts_with(&ask)),
         "the transaction is sent on: {reply:?}"
     );
+    // A watched transaction of plain SETs takes a path of its own, which does
+    // not route its commands again. It watches a key that stays: the move of
+    // a watched key would abort it anyway.
+    let reply = routed_then_moved(
+        &[
+            &["WATCH", &keys[3]],
+            &["MULTI"],
+            &["SET", &keys[2], "7"],
+            &["EXEC"],
+        ],
+        &keys[2],
+    );
+    assert!(
+        reply.err().is_some_and(|e| e.starts_with(&ask)),
+        "the watched transaction is sent on: {reply:?}"
+    );
     #[cfg(feature = "lua")]
     {
         let script = "return redis.call('SET', KEYS[1], ARGV[1])";
-        let reply = routed_then_moved(&[&["EVAL", script, "1", &keys[2], "9"]], &keys[2]);
+        let reply = routed_then_moved(&[&["EVAL", script, "1", &keys[3], "9"]], &keys[3]);
         assert!(
             reply.err().is_some_and(|e| e.starts_with(&ask)),
             "the script is sent on: {reply:?}"
         );
     }
-    let moved = &keys[..if cfg!(feature = "lua") { 3 } else { 2 }];
+    let moved = &keys[..if cfg!(feature = "lua") { 4 } else { 3 }];
 
     // Nothing was made again here, and the destination has each key as it
     // was sent.
