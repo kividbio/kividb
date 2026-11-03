@@ -514,6 +514,16 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   while a slot is open: fix moves the keys back with it, and was sent
   `MOVED` instead.
 
+- **A key written while `MIGRATE` moves it is on one node only** (#295).
+  `MIGRATE` keeps such a key, with the write, and answers `TRYAGAIN` (#274),
+  but the destination kept the older copy it had been sent, so the key was
+  on both nodes. `redis-cli --cluster fix`, closing the slot the stopped
+  reshard left open, then found it on both and, if it picked the
+  destination as the slot's owner, served the older value. `MIGRATE` now
+  deletes those copies at the destination before it answers, while nothing
+  can write the keys here, and says so in the `TRYAGAIN`: they can be moved
+  again without `REPLACE`.
+
 - **`EXPIREAT` with a negative timestamp deletes the key,** as Redis does
   (by [@huong8373tt-beep](https://github.com/huong8373tt-beep)). It was
   refused with `ERR invalid expire time`; a time before the epoch is a time

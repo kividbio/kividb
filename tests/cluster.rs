@@ -2522,6 +2522,13 @@ fn a_write_while_migrate_is_on_the_wire_is_not_lost() {
     // The acknowledged INCR is here; the keys that were not written are gone.
     assert_eq!(s.cmd(&["GET", &k("counter")]).text(), "2");
     assert_eq!(s.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 2);
+    // And the older copy sent of `counter` is gone from the destination:
+    // the newest, here, is the only one (#295).
+    assert!(error.contains("deleted there"), "{error}");
+    let mut d = dst.conn();
+    assert_eq!(d.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 2);
+    assert!(d.cmd(&["ASKING"]).is_ok());
+    assert_eq!(d.cmd(&["EXISTS", &k("counter")]).int(), 0);
 
     // The key form: a new time to live is a write too.
     let mut args: Vec<String> = ["MIGRATE", "127.0.0.1", &port, &k("ttl"), "0", "5000"]
@@ -2536,6 +2543,7 @@ fn a_write_while_migrate_is_on_the_wire_is_not_lost() {
         "{reply:?}"
     );
     assert!(s.cmd(&["PTTL", &k("ttl")]).int() > 400_000);
+    assert_eq!(d.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 2);
 
     // The replica deleted what its master deleted, and nothing else.
     assert_eq!(s.cmd(&["WAIT", "1", "10000"]).int(), 1);
@@ -2545,7 +2553,7 @@ fn a_write_while_migrate_is_on_the_wire_is_not_lost() {
     assert!(r.cmd(&["PTTL", &k("ttl")]).int() > 400_000);
     assert_eq!(r.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 2);
 
-    // Moved again, with REPLACE (the destination has the older copy), the
+    // Moved again (REPLACE is not needed any more, and does no harm), the
     // keys arrive as they are now.
     args.push("REPLACE".to_string());
     let reply = migrate_with_writes_meanwhile(src, &args, 3, || {});

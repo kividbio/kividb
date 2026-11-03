@@ -1806,9 +1806,22 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
 
     // ── Delete what the destination confirmed ────────────────────────────
     crate::aof::failpoint("migrate-before-delete");
-    let written = delete_moved(ctx, db, &moved);
+    let not_deleted = delete_moved(ctx, db, &moved);
+    // The copies sent of the keys kept here are older than they are: they
+    // are taken back, so that the newest, here, is the only one (#295).
+    let taken_back = !not_deleted.kept.is_empty()
+        && only_here(ctx, &not_deleted.kept)
+        && take_back_copies(&mut reader, &not_deleted.kept);
+    let written: Vec<&str> = not_deleted
+        .kept
+        .iter()
+        .chain(&not_deleted.gone)
+        .copied()
+        .collect();
+    // Their order, held until the copies are gone, is let go of.
+    drop(not_deleted);
     if failure.is_none() && !written.is_empty() {
-        failure = Some(written_while_moving(&written, &addr));
+        failure = Some(written_while_moving(&written, &addr, taken_back));
     }
     match failure {
         None => resp_simple("OK"),
@@ -1837,7 +1850,7 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
 /// propagated as a `DEL` of every key it named, deleted or not: one written
 /// meanwhile, or made meanwhile by a write to a key the dump had not found,
 /// was deleted on every replica and kept here.)
-fn delete_moved<'a>(ctx: &Ctx, db: usize, moved: &[&'a Outgoing]) -> Vec<&'a str> {
+fn delete_moved<'a>(ctx: &Ctx, db: usize, moved: &[&'a Outgoing]) -> NotDeleted<'a> {
     let nested = crate::write_gate::held_by_this_thread();
     let mut gate = crate::write_gate::enter();
     while !nested && !ctx.apply_replication && crate::pause::handoff() {
@@ -1845,13 +1858,14 @@ fn delete_moved<'a>(ctx: &Ctx, db: usize, moved: &[&'a Outgoing]) -> Vec<&'a str
         crate::pause::wait_out_handoff();
         gate = crate::write_gate::enter();
     }
-    let _order = crate::write_order::lock_keys(db, moved.iter().map(|item| item.key.as_bytes()));
+    let order = crate::write_order::lock_keys(db, moved.iter().map(|item| item.key.as_bytes()));
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let mut del: Vec<Vec<u8>> = vec![b"DEL".to_vec()];
-    let mut written: Vec<&'a str> = Vec::new();
+    let mut kept: Vec<&'a str> = Vec::new();
+    let mut gone: Vec<&'a str> = Vec::new();
     for item in moved {
         let key = item.key.as_str();
         let shard = crate::store::get_shard(&ctx.store[db], key);
@@ -1871,11 +1885,11 @@ fn delete_moved<'a>(ctx: &Ctx, db: usize, moved: &[&'a Outgoing]) -> Vec<&'a str
                 crate::vector::maybe_unindex(ctx.index_store, db, key);
                 del.push(key.as_bytes().to_vec());
             }
-            crate::store::Removal::Kept => written.push(key),
+            crate::store::Removal::Kept => kept.push(key),
             crate::store::Removal::Absent => {
                 let expired = item.expires_at_ms != 0 && item.expires_at_ms <= now_ms;
                 if !expired {
-                    written.push(key);
+                    gone.push(key);
                 }
             }
         }
@@ -1885,7 +1899,82 @@ fn delete_moved<'a>(ctx: &Ctx, db: usize, moved: &[&'a Outgoing]) -> Vec<&'a str
         crate::replication::replicate_one_write(ctx, &del);
     }
     drop(gate);
-    written
+    NotDeleted {
+        kept,
+        gone,
+        _order: order,
+    }
+}
+
+/// What [`delete_moved`] left here.
+struct NotDeleted<'a> {
+    /// Keys written while they travelled: here, with their newest value.
+    kept: Vec<&'a str>,
+    /// Keys that went from here meanwhile, other than by their time running
+    /// out.
+    gone: Vec<&'a str>,
+    /// The order of the keys, still held: nothing writes them here, or
+    /// deletes them, until it is let go of (see [`take_back_copies`]).
+    _order: crate::write_order::OrderGuard,
+}
+
+/// Whether nobody can have written `keys` at the destination since they
+/// were read here, so that the copies this `MIGRATE` sent are the only
+/// thing there under those names: this node owns their slot, so clients are
+/// sent here for them, and they have been here all along, so no client was
+/// sent on with `-ASK` (a node migrating a slot sends a client on only for
+/// a key it does not hold). Their order, held since, keeps it so: a key
+/// deleted here, and then written by a client sent on to the destination,
+/// would otherwise be deleted there by [`take_back_copies`].
+///
+/// Not when this node does not own the slot (a tool moving keys "cold" from
+/// a node that is not the owner, which clients do not reach anyway), and
+/// not outside cluster mode, where clients may write at the destination
+/// directly.
+fn only_here(ctx: &Ctx, keys: &[&str]) -> bool {
+    ctx.cluster.enabled
+        && keys.iter().all(|key| {
+            ctx.cluster
+                .owns_slot(crate::cluster::key_hash_slot(key.as_bytes()))
+        })
+}
+
+/// Delete at the destination the copies of `keys` that this `MIGRATE` sent,
+/// on the connection it sent them on (authenticated, the database selected).
+/// Each `DEL` goes after `ASKING`, as the `RESTORE` did. Whether every reply
+/// came back: a copy that could not be deleted stays, older than the key
+/// here, as it always did before.
+///
+/// Without this, a key written while it travelled (#274) was on both nodes:
+/// the newest value here and an older one there. `redis-cli --cluster fix`,
+/// closing a slot left open, then found it on both, and, when it picked the
+/// destination as the slot's owner, the older value was the one served
+/// (#295).
+fn take_back_copies(
+    reader: &mut std::io::BufReader<Box<dyn crate::node_tls::ReadWrite>>,
+    keys: &[&str],
+) -> bool {
+    use std::io::Write;
+    let mut pipeline = Vec::new();
+    for key in keys {
+        pipeline.extend_from_slice(&crate::resp::write::encode_resp_command(&[
+            b"ASKING".to_vec()
+        ]));
+        pipeline.extend_from_slice(&crate::resp::write::encode_resp_command(&[
+            b"DEL".to_vec(),
+            key.as_bytes().to_vec(),
+        ]));
+    }
+    let sock = reader.get_mut();
+    if sock
+        .write_all(&pipeline)
+        .and_then(|()| sock.flush())
+        .is_err()
+    {
+        return false;
+    }
+    // ASKING's reply and DEL's count; an error from either is still a reply.
+    (0..keys.len() * 2).all(|_| read_status_reply(reader).is_ok())
 }
 
 /// The error `MIGRATE` answers with when keys it moved were written while
@@ -1897,7 +1986,7 @@ fn delete_moved<'a>(ctx: &Ctx, db: usize, moved: &[&'a Outgoing]) -> Vec<&'a str
 /// keys as though the slot were empty here; run again (with `REPLACE`, or
 /// `--cluster-replace`, as the destination holds a copy) it takes the keys
 /// along with their writes.
-fn written_while_moving(keys: &[&str], addr: &str) -> String {
+fn written_while_moving(keys: &[&str], addr: &str, taken_back: bool) -> String {
     const SHOWN: usize = 5;
     let mut names = keys
         .iter()
@@ -1908,9 +1997,13 @@ fn written_while_moving(keys: &[&str], addr: &str) -> String {
     if keys.len() > SHOWN {
         names.push_str(&format!(" and {} more", keys.len() - SHOWN));
     }
+    let copies = if taken_back {
+        format!("The copies sent to {addr} were deleted there; MIGRATE them again")
+    } else {
+        format!("The copy sent to {addr} may be older; MIGRATE them again with REPLACE")
+    };
     format!(
-        "TRYAGAIN {} written while being migrated, and kept here: {names}. The copy sent \
-         to {addr} may be older; MIGRATE them again with REPLACE",
+        "TRYAGAIN {} written while being migrated, and kept here: {names}. {copies}",
         if keys.len() == 1 {
             "a key was"
         } else {
