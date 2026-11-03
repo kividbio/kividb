@@ -1,0 +1,14 @@
+2026-11-03T07:53:53Z   Normal    Killing                  g-no-0                         Stopping container kividb
+2026-11-03T07:53:53Z   Normal    Killing                  g-no-0                         Stopping container agent
+2026-11-03T07:53:53Z   Normal    SuccessfulCreate         g-no                           Create Pod g-no-0 in StatefulSet g-no successful
+2026-11-03T07:53:53Z   Normal    Scheduled                g-no-0                         Successfully assigned e2e/g-no-0 to aks-nodepool1-63764748-vmss000001
+2026-11-03T07:53:53Z   Warning   FailedAttachVolume       g-no-0                         Waiting for detach for volume "pvc-e904dd71-16ed-4c31-9fa3-6f4894747d9d" Volume is already exclusively attached to one node, waiting on detach before it can be attached to another node
+2026-11-03T07:54:20Z   Normal    SuccessfulAttachVolume   g-no-0                         AttachVolume.Attach succeeded for volume "pvc-e904dd71-16ed-4c31-9fa3-6f4894747d9d" 
+2026-11-03T07:54:20Z   Normal    Pulled                   g-no-0                         Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:54:21Z   Normal    Created                  g-no-0                         Container created
+2026-11-03T07:54:21Z   Normal    Started                  g-no-0                         Container started
+2026-11-03T07:54:21Z   Normal    Pulled                   g-no-0                         Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:54:21Z   Normal    Created                  g-no-0                         Container created
+2026-11-03T07:54:21Z   Normal    Started                  g-no-0                         Container started
+2026-11-03T07:54:54Z   Warning   MasterRestartedBehind    g-no                           g-no-0 restarted and came back as the master at replication offset 0, behind the 30927443 it had reached and behind g-no-1 (offset 30995297), which holds writes it lost; failing over rather than resyncing the replicas from its older data
+2026-11-03T07:54:54Z   Warning   Failover                 g-no                           master g-no-0 restarted behind its replicas; promoted g-no-1

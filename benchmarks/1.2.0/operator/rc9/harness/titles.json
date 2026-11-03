@@ -1,0 +1,80 @@
+{
+ "upgrade-shd": {
+  "engine": "rc9",
+  "loader": "loader-shd",
+  "what": "engine upgrade 1.2.0-rc8 -> 1.2.0-rc9 (sharded)",
+  "title": "rc9: engine upgrade 1.2.0-rc8 -> 1.2.0-rc9 (sharded)"
+ },
+ "restart-rc9": {
+  "engine": "rc9",
+  "loader": "loader-shd",
+  "what": "rolling restart (KividbDbOps), sharded",
+  "title": "rc9: rolling restart (KividbDbOps), sharded"
+ },
+ "failover-rc9": {
+  "engine": "rc9",
+  "loader": "loader-shd",
+  "what": "CLUSTER FAILOVER on every shard's replica in turn",
+  "title": "rc9: CLUSTER FAILOVER on every shard's replica in turn"
+ },
+ "graceful1": {
+  "engine": "rc9",
+  "loader": "loader-shd",
+  "what": "graceful delete of a shard master, same node, try 1",
+  "title": "rc9: graceful delete of a shard master, same node, try 1"
+ },
+ "graceful2": {
+  "engine": "rc9",
+  "loader": "loader-shd",
+  "what": "graceful delete of a shard master, same node, try 2",
+  "title": "rc9: graceful delete of a shard master, same node, try 2"
+ },
+ "forcedel1": {
+  "engine": "rc9",
+  "loader": "loader-shd",
+  "what": "same-node force delete of a shard master (#303), try 1",
+  "title": "rc9: same-node force delete of a shard master (#303), try 1"
+ },
+ "forcedel2": {
+  "engine": "rc9",
+  "loader": "loader-shd",
+  "what": "same-node force delete of a shard master (#303), try 2",
+  "title": "rc9: same-node force delete of a shard master (#303), try 2"
+ },
+ "forcedel3": {
+  "engine": "rc9",
+  "loader": "loader-shd",
+  "what": "same-node force delete of a shard master (#303), try 3",
+  "title": "rc9: same-node force delete of a shard master (#303), try 3"
+ },
+ "sigkill-rc9": {
+  "engine": "rc9",
+  "loader": "loader-shd",
+  "what": "kill -9 of a shard master's engine, restarts in place",
+  "title": "rc9: kill -9 of a shard master's engine, restarts in place"
+ },
+ "reshard-up-rc9": {
+  "engine": "rc9",
+  "loader": "loader-shd",
+  "what": "spec.shards 3 -> 4 under load",
+  "title": "rc9: spec.shards 3 -> 4 under load"
+ },
+ "reshard-down-rc9": {
+  "engine": "rc9",
+  "loader": "loader-shd",
+  "what": "spec.shards 4 -> 3 under load",
+  "title": "rc9: spec.shards 4 -> 3 under load"
+ },
+ "guard-yes": {
+  "engine": "rc9",
+  "loader": "loader-g-yes",
+  "what": "#42 guard: rc9, aof-ack-after-write yes",
+  "title": "rc9: #42 guard: rc9, aof-ack-after-write yes"
+ },
+ "guard-no": {
+  "engine": "rc9",
+  "loader": "loader-g-no",
+  "what": "#42 guard: rc9, aof-ack-after-write no",
+  "title": "rc9: #42 guard: rc9, aof-ack-after-write no"
+ }
+}

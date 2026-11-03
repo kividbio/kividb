@@ -1,0 +1,2 @@
+clippy default: exit 0
+clippy lua,tls: exit 0

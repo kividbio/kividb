@@ -1,0 +1,4051 @@
+=== kividb-rc10 (kividb/kividb:build-39bfacd231bb) 2026-11-03T15:49:26Z ===
+ Container kv-kividb-engine-1  Creating
+ engine Published ports are discarded when using host network mode 
+ Container kv-kividb-engine-1  Created
+ Container kv-kividb-engine-1  Starting
+ Container kv-kividb-engine-1  Started
+ Container kv-kividb-engine-1  Waiting
+ Container kv-kividb-engine-1  Healthy
+
+KV-stores benchmark — FULL (5 sessions across 1 engines)
+
+
+> kividb
+  cloud mode: skipping compose up
+  workload: memory-load (1000000 keys × 100B)
+    baseline: 2.75MB used, 16.06MB RSS
+Json file /tmp/memtier-1793720968736/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   10.662s  (user 2.927s, sys 7.736s)
+  Wall time:        112.519s
+  Cores used:       0.095   (avg 9.5% across 1 worker threads)
+  Peak utilization: 11.8%
+Saving JSON output file: /tmp/memtier-1793720968736/result.json
+Json file closed.
+1         Threads
+1         Connections per thread
+1000000   Requests per client
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets         8887.43          ---          ---         0.11215         0.11900         0.16700         0.33500      1274.87 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals       8887.43         0.00         0.00         0.11215         0.11900         0.16700         0.33500      1274.87 
+Json file /tmp/memtier-1793721082163/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   9.553s  (user 2.737s, sys 6.817s)
+  Wall time:        108.107s
+  Cores used:       0.088   (avg 8.8% across 1 worker threads)
+  Peak utilization: 11.2%
+Saving JSON output file: /tmp/memtier-1793721082163/result.json
+Json file closed.
+1         Threads
+1         Connections per thread
+1000000   Requests per client
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets         9250.62          ---          ---         0.10762         0.10300         0.15900         0.30300      1337.00 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals       9250.62         0.00         0.00         0.10762         0.10300         0.15900         0.30300      1337.00 
+    → 1000000 keys, delta 140.08MB used / 142.07MB RSS, 149 B/key (RSS); second load 154.8 B/key (RSS); 158.13MB RSS after the first
+  workload: set-get-small (2 warmup + 10 measured)
+    preloading 100000 keys (100B each)...
+Writing results to stdout
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   0.050s  (user 0.040s, sys 0.010s)
+  Wall time:        0.270s
+  Cores used:       0.184   (avg 18.1% across 1 worker threads)
+  Peak utilization: 0.0%
+1         Threads
+1         Connections per thread
+100000    Requests per client
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       381822.21          ---          ---         0.25178         0.23100         0.55900         0.61500     54398.05 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     381822.21         0.00         0.00         0.25178         0.23100         0.55900         0.61500     54398.05 
+    warmup 1/2
+Json file /tmp/memtier-1793721193116/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   155.863s  (user 32.742s, sys 123.121s)
+  Wall time:        10.002s
+  Cores used:       15.583   (avg 62.3% across 25 worker threads)
+  Peak utilization: 1667.3%
+Saving JSON output file: /tmp/memtier-1793721193116/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       126177.59          ---          ---         0.14514         0.13500         0.31900         0.51900     17976.46 
+Gets      1261668.62   1261668.62         0.00         0.14387         0.13500         0.31100         0.49500    173589.06 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    1387846.21   1261668.62         0.00         0.14398         0.13500         0.31900         0.49500    191565.52 
+    warmup 2/2
+Json file /tmp/memtier-1793721203461/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   165.796s  (user 33.920s, sys 131.876s)
+  Wall time:        10.001s
+  Cores used:       16.577   (avg 66.3% across 25 worker threads)
+  Peak utilization: 1700.8%
+Saving JSON output file: /tmp/memtier-1793721203461/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       131612.65          ---          ---         0.13903         0.12700         0.30300         0.37500     18750.79 
+Gets      1316023.17   1316023.17         0.00         0.13790         0.12700         0.29500         0.36700    181067.54 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    1447635.81   1316023.17         0.00         0.13801         0.12700         0.29500         0.36700    199818.33 
+    measured 1/10
+Json file /tmp/memtier-1793721213801/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   145.816s  (user 30.789s, sys 115.027s)
+  Wall time:        10.001s
+  Cores used:       14.580   (avg 58.3% across 25 worker threads)
+  Peak utilization: 1516.2%
+Saving JSON output file: /tmp/memtier-1793721213801/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       119928.87          ---          ---         0.15238         0.15100         0.32700         0.38300     17086.21 
+Gets      1199190.87   1199190.87         0.00         0.15140         0.15100         0.32700         0.38300    164992.95 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    1319119.74   1199190.87         0.00         0.15149         0.15100         0.32700         0.38300    182079.16 
+    measured 2/10
+Json file /tmp/memtier-1793721224140/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   131.010s  (user 29.116s, sys 101.894s)
+  Wall time:        10.001s
+  Cores used:       13.099   (avg 52.4% across 25 worker threads)
+  Peak utilization: 1506.3%
+Saving JSON output file: /tmp/memtier-1793721224140/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       111625.76          ---          ---         0.16359         0.16700         0.34300         0.38300     15903.26 
+Gets      1116162.70   1116162.70         0.00         0.16270         0.16700         0.33500         0.38300    153569.34 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    1227788.46   1116162.70         0.00         0.16278         0.16700         0.34300         0.38300    169472.60 
+    measured 3/10
+Json file /tmp/memtier-1793721234483/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   155.461s  (user 32.843s, sys 122.618s)
+  Wall time:        10.001s
+  Cores used:       15.544   (avg 62.2% across 25 worker threads)
+  Peak utilization: 1637.8%
+Saving JSON output file: /tmp/memtier-1793721234483/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       125441.86          ---          ---         0.14577         0.13500         0.31100         0.37500     17871.64 
+Gets      1254319.60   1254319.60         0.00         0.14471         0.13500         0.31100         0.37500    172577.97 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    1379761.46   1254319.60         0.00         0.14480         0.13500         0.31100         0.37500    190449.61 
+    measured 4/10
+Json file /tmp/memtier-1793721244835/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   127.895s  (user 28.846s, sys 99.049s)
+  Wall time:        10.001s
+  Cores used:       12.788   (avg 51.2% across 25 worker threads)
+  Peak utilization: 1409.3%
+Saving JSON output file: /tmp/memtier-1793721244835/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       109149.73          ---          ---         0.16733         0.17500         0.34300         0.38300     15550.50 
+Gets      1091391.44   1091391.44         0.00         0.16640         0.17500         0.34300         0.38300    150161.21 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    1200541.18   1091391.44         0.00         0.16649         0.17500         0.34300         0.38300    165711.71 
+    measured 5/10
+Json file /tmp/memtier-1793721255192/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   145.974s  (user 31.335s, sys 114.639s)
+  Wall time:        10.001s
+  Cores used:       14.596   (avg 58.4% across 25 worker threads)
+  Peak utilization: 1570.7%
+Saving JSON output file: /tmp/memtier-1793721255192/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       121392.24          ---          ---         0.15063         0.15100         0.32700         0.38300     17294.72 
+Gets      1213824.54   1213824.54         0.00         0.14957         0.15100         0.32700         0.37500    167006.35 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    1335216.79   1213824.54         0.00         0.14967         0.15100         0.32700         0.37500    184301.07 
+    measured 6/10
+Json file /tmp/memtier-1793721265547/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   161.709s  (user 33.099s, sys 128.610s)
+  Wall time:        10.001s
+  Cores used:       16.169   (avg 64.7% across 25 worker threads)
+  Peak utilization: 1648.8%
+Saving JSON output file: /tmp/memtier-1793721265547/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       129747.09          ---          ---         0.14102         0.13500         0.29500         0.36700     18485.01 
+Gets      1297370.27   1297370.27         0.00         0.13990         0.12700         0.29500         0.36700    178501.16 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    1427117.35   1297370.27         0.00         0.14000         0.12700         0.29500         0.36700    196986.16 
+    measured 7/10
+Json file /tmp/memtier-1793721275886/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   151.434s  (user 31.821s, sys 119.613s)
+  Wall time:        10.001s
+  Cores used:       15.141   (avg 60.6% across 25 worker threads)
+  Peak utilization: 1542.2%
+Saving JSON output file: /tmp/memtier-1793721275886/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       124198.50          ---          ---         0.14724         0.14300         0.31100         0.36700     17694.50 
+Gets      1241885.44   1241885.44         0.00         0.14617         0.14300         0.31100         0.36700    170867.12 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    1366083.94   1241885.44         0.00         0.14626         0.14300         0.31100         0.36700    188561.61 
+    measured 8/10
+Json file /tmp/memtier-1793721286249/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   147.625s  (user 32.180s, sys 115.445s)
+  Wall time:        10.001s
+  Cores used:       14.761   (avg 59.0% across 25 worker threads)
+  Peak utilization: 1596.0%
+Saving JSON output file: /tmp/memtier-1793721286249/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       120774.04          ---          ---         0.15140         0.15100         0.32700         0.37500     17206.59 
+Gets      1207637.46   1207637.46         0.00         0.15033         0.15100         0.32700         0.37500    166155.14 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    1328411.49   1207637.46         0.00         0.15042         0.15100         0.32700         0.37500    183361.73 
+    measured 9/10
+Json file /tmp/memtier-1793721296582/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   129.402s  (user 29.167s, sys 100.235s)
+  Wall time:        10.004s
+  Cores used:       12.934   (avg 51.7% across 25 worker threads)
+  Peak utilization: 1373.2%
+Saving JSON output file: /tmp/memtier-1793721296582/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       110335.66          ---          ---         0.16551         0.17500         0.34300         0.38300     15719.48 
+Gets      1103253.63   1103253.63         0.00         0.16460         0.17500         0.34300         0.38300    151793.24 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    1213589.30   1103253.63         0.00         0.16468         0.17500         0.34300         0.38300    167512.71 
+    measured 10/10
+Json file /tmp/memtier-1793721307950/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   134.166s  (user 29.900s, sys 104.266s)
+  Wall time:        10.001s
+  Cores used:       13.415   (avg 53.7% across 25 worker threads)
+  Peak utilization: 1423.3%
+Saving JSON output file: /tmp/memtier-1793721307950/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       112871.81          ---          ---         0.16188         0.15900         0.34300         0.45500     16080.81 
+Gets      1128618.36   1128618.36         0.00         0.16089         0.15100         0.34300         0.43900    155283.10 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    1241490.17   1128618.36         0.00         0.16098         0.15100         0.34300         0.44700    171363.91 
+    → 1323766 ops/s, p50=0.151ms, p99=0.327ms, hit ratio=100%, client CPU=52%
+  workload: set-get-large (2 warmup + 10 measured)
+    preloading 40000 keys (10240B each)...
+Writing results to stdout
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   0.115s  (user 0.043s, sys 0.072s)
+  Wall time:        0.349s
+  Cores used:       0.329   (avg 32.6% across 1 worker threads)
+  Peak utilization: 0.0%
+1         Threads
+1         Connections per thread
+40000     Requests per client
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       115452.44          ---          ---         0.86353         0.87100         1.18300         2.79900   1159904.94 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     115452.44         0.00         0.00         0.86353         0.87100         1.18300         2.79900   1159904.94 
+    warmup 1/2
+Json file /tmp/memtier-1793721319673/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   53.424s  (user 11.676s, sys 41.749s)
+  Wall time:        10.001s
+  Cores used:       5.342   (avg 21.4% across 25 worker threads)
+  Peak utilization: 546.9%
+Saving JSON output file: /tmp/memtier-1793721319673/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets        29188.11          ---          ---         0.61061         0.59100         0.99900         1.19900    293241.40 
+Gets       291780.02    291780.02         0.00         0.62433         0.60700         1.02300         1.20700   2929973.68 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     320968.14    291780.02         0.00         0.62308         0.60700         1.01500         1.20700   3223215.08 
+    warmup 2/2
+Json file /tmp/memtier-1793721330043/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   52.496s  (user 12.191s, sys 40.305s)
+  Wall time:        10.001s
+  Cores used:       5.249   (avg 21.0% across 25 worker threads)
+  Peak utilization: 541.9%
+Saving JSON output file: /tmp/memtier-1793721330043/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets        29196.21          ---          ---         0.60831         0.59100         0.99900         1.19100    293322.74 
+Gets       291869.39    291869.39         0.00         0.62438         0.60700         1.02300         1.20700   2930871.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     321065.60    291869.39         0.00         0.62292         0.60700         1.02300         1.20700   3224193.73 
+    measured 1/10
+Json file /tmp/memtier-1793721340389/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   52.233s  (user 11.631s, sys 40.602s)
+  Wall time:        10.001s
+  Cores used:       5.222   (avg 20.9% across 25 worker threads)
+  Peak utilization: 531.3%
+Saving JSON output file: /tmp/memtier-1793721340389/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets        29195.89          ---          ---         0.60632         0.59100         1.18300         1.36700    293319.57 
+Gets       291867.55    291867.55         0.00         0.62456         0.60700         1.19900         1.37500   2930852.46 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     321063.44    291867.55         0.00         0.62290         0.60700         1.19900         1.37500   3224172.03 
+    measured 2/10
+Json file /tmp/memtier-1793721350746/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   53.565s  (user 12.278s, sys 41.287s)
+  Wall time:        10.002s
+  Cores used:       5.356   (avg 21.4% across 25 worker threads)
+  Peak utilization: 545.1%
+Saving JSON output file: /tmp/memtier-1793721350746/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets        29195.75          ---          ---         0.60978         0.59100         1.18300         1.24700    293318.12 
+Gets       291853.19    291853.19         0.00         0.62426         0.60700         1.19100         1.25500   2930708.38 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     321048.94    291853.19         0.00         0.62294         0.60700         1.19100         1.25500   3224026.50 
+    measured 3/10
+Json file /tmp/memtier-1793721361118/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   52.775s  (user 11.292s, sys 41.483s)
+  Wall time:        10.001s
+  Cores used:       5.277   (avg 21.1% across 25 worker threads)
+  Peak utilization: 542.3%
+Saving JSON output file: /tmp/memtier-1793721361118/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets        29203.02          ---          ---         0.60758         0.59100         1.17500         1.21500    293391.16 
+Gets       291929.00    291929.00         0.00         0.62430         0.60700         1.19100         1.23900   2931469.60 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     321132.02    291929.00         0.00         0.62278         0.60700         1.18300         1.23900   3224860.76 
+    measured 4/10
+Json file /tmp/memtier-1793721371505/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   52.310s  (user 11.650s, sys 40.660s)
+  Wall time:        10.001s
+  Cores used:       5.230   (avg 20.9% across 25 worker threads)
+  Peak utilization: 531.7%
+Saving JSON output file: /tmp/memtier-1793721371505/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets        29195.53          ---          ---         0.60717         0.59100         1.15900         1.20700    293315.90 
+Gets       291859.09    291859.09         0.00         0.62450         0.60700         1.17500         1.23100   2930767.58 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     321054.62    291859.09         0.00         0.62292         0.60700         1.16700         1.23100   3224083.47 
+    measured 5/10
+Json file /tmp/memtier-1793721381880/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   52.050s  (user 11.416s, sys 40.634s)
+  Wall time:        10.001s
+  Cores used:       5.204   (avg 20.8% across 25 worker threads)
+  Peak utilization: 533.6%
+Saving JSON output file: /tmp/memtier-1793721381880/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets        29097.41          ---          ---         0.60969         0.59100         0.99100         1.17500    292330.18 
+Gets       290859.46    290859.46         0.00         0.62661         0.60700         1.00700         1.18300   2920729.59 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     319956.87    290859.46         0.00         0.62507         0.60700         1.00700         1.18300   3213059.77 
+    measured 6/10
+Json file /tmp/memtier-1793721392241/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   54.717s  (user 12.346s, sys 42.371s)
+  Wall time:        10.001s
+  Cores used:       5.471   (avg 21.9% across 25 worker threads)
+  Peak utilization: 565.9%
+Saving JSON output file: /tmp/memtier-1793721392241/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets        29156.98          ---          ---         0.61095         0.59900         1.02300         1.20700    292928.65 
+Gets       291470.33    291470.33         0.00         0.62502         0.61500         1.03900         1.22300   2926863.73 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     320627.31    291470.33         0.00         0.62374         0.60700         1.03900         1.22300   3219792.38 
+    measured 7/10
+Json file /tmp/memtier-1793721402591/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   53.124s  (user 12.206s, sys 40.917s)
+  Wall time:        10.001s
+  Cores used:       5.312   (avg 21.2% across 25 worker threads)
+  Peak utilization: 546.3%
+Saving JSON output file: /tmp/memtier-1793721402591/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets        29190.63          ---          ---         0.60869         0.59100         1.00700         1.20700    293266.73 
+Gets       291818.84    291818.84         0.00         0.62445         0.61500         1.03100         1.22300   2930363.45 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     321009.48    291818.84         0.00         0.62302         0.60700         1.03100         1.22300   3223630.18 
+    measured 8/10
+Json file /tmp/memtier-1793721412947/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   53.993s  (user 11.754s, sys 42.240s)
+  Wall time:        10.001s
+  Cores used:       5.399   (avg 21.6% across 25 worker threads)
+  Peak utilization: 546.9%
+Saving JSON output file: /tmp/memtier-1793721412947/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets        29167.42          ---          ---         0.60933         0.59100         0.99900         1.19900    293033.53 
+Gets       291577.33    291577.33         0.00         0.62495         0.60700         1.01500         1.21500   2927938.24 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     320744.75    291577.33         0.00         0.62353         0.60700         1.01500         1.21500   3220971.76 
+    measured 9/10
+Json file /tmp/memtier-1793721423312/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   54.165s  (user 12.569s, sys 41.597s)
+  Wall time:        10.001s
+  Cores used:       5.416   (avg 21.7% across 25 worker threads)
+  Peak utilization: 552.1%
+Saving JSON output file: /tmp/memtier-1793721423312/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets        29131.74          ---          ---         0.61119         0.59900         0.99100         1.18300    292675.08 
+Gets       291217.25    291217.25         0.00         0.62560         0.61500         1.00700         1.19900   2924322.37 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     320348.99    291217.25         0.00         0.62429         0.60700         1.00700         1.19900   3216997.45 
+    measured 10/10
+Json file /tmp/memtier-1793721433673/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   53.808s  (user 11.768s, sys 42.040s)
+  Wall time:        10.001s
+  Cores used:       5.380   (avg 21.5% across 25 worker threads)
+  Peak utilization: 547.9%
+Saving JSON output file: /tmp/memtier-1793721433673/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets        29162.73          ---          ---         0.60973         0.59100         0.99900         1.21500    292986.39 
+Gets       291527.59    291527.59         0.00         0.62504         0.60700         1.01500         1.22300   2927438.82 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     320690.32    291527.59         0.00         0.62364         0.60700         1.01500         1.22300   3220425.21 
+    → 320877 ops/s, p50=0.607ms, p99=1.035ms, hit ratio=100%, client CPU=23.9%
+  workload: pipeline-30 (2 warmup + 10 measured)
+    preloading 100000 keys (100B each)...
+Writing results to stdout
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   0.050s  (user 0.042s, sys 0.008s)
+  Wall time:        0.219s
+  Cores used:       0.228   (avg 22.5% across 1 worker threads)
+  Peak utilization: 0.0%
+1         Threads
+1         Connections per thread
+100000    Requests per client
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       459660.22          ---          ---         0.20817         0.19100         0.54300         0.59100     65487.60 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     459660.22         0.00         0.00         0.20817         0.19100         0.54300         0.59100     65487.60 
+    warmup 1/2
+Json file /tmp/memtier-1793721445473/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   204.706s  (user 137.536s, sys 67.169s)
+  Wall time:        10.001s
+  Cores used:       20.468   (avg 81.9% across 25 worker threads)
+  Peak utilization: 2112.0%
+Saving JSON output file: /tmp/memtier-1793721445473/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      1590058.76          ---          ---         0.32815         0.31100         0.63900         0.75900    226534.81 
+Gets     15900488.49  15900488.49         0.00         0.32812         0.31100         0.63900         0.75900   2187698.09 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals   17490547.25  15900488.49         0.00         0.32812         0.31100         0.63900         0.75900   2414232.91 
+    warmup 2/2
+Json file /tmp/memtier-1793721455828/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   192.352s  (user 128.842s, sys 63.510s)
+  Wall time:        10.001s
+  Cores used:       19.233   (avg 76.9% across 25 worker threads)
+  Peak utilization: 1976.4%
+Saving JSON output file: /tmp/memtier-1793721455828/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      1564337.35          ---          ---         0.33497         0.31900         0.65500         0.75900    222870.33 
+Gets     15643275.54  15643275.54         0.00         0.33494         0.31900         0.65500         0.75900   2152308.93 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals   17207612.89  15643275.54         0.00         0.33494         0.31900         0.65500         0.75900   2375179.26 
+    measured 1/10
+Json file /tmp/memtier-1793721466194/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   204.403s  (user 136.903s, sys 67.500s)
+  Wall time:        10.001s
+  Cores used:       20.438   (avg 81.8% across 25 worker threads)
+  Peak utilization: 2103.2%
+Saving JSON output file: /tmp/memtier-1793721466194/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      1639553.88          ---          ---         0.31873         0.31100         0.63100         0.74300    233586.43 
+Gets     16395436.55  16395436.55         0.00         0.31869         0.31100         0.63100         0.74300   2255796.34 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals   18034990.43  16395436.55         0.00         0.31870         0.31100         0.63100         0.74300   2489382.76 
+    measured 2/10
+Json file /tmp/memtier-1793721476531/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   201.130s  (user 136.263s, sys 64.866s)
+  Wall time:        10.001s
+  Cores used:       20.110   (avg 80.4% across 25 worker threads)
+  Peak utilization: 2037.7%
+Saving JSON output file: /tmp/memtier-1793721476531/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      1584190.09          ---          ---         0.32970         0.31900         0.63900         0.73500    225698.71 
+Gets     15841797.80  15841797.80         0.00         0.32966         0.31900         0.63900         0.73500   2179622.98 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals   17425987.89  15841797.80         0.00         0.32966         0.31900         0.63900         0.73500   2405321.69 
+    measured 3/10
+Json file /tmp/memtier-1793721486881/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   205.753s  (user 140.495s, sys 65.258s)
+  Wall time:        10.002s
+  Cores used:       20.570   (avg 82.3% across 25 worker threads)
+  Peak utilization: 2122.8%
+Saving JSON output file: /tmp/memtier-1793721486881/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      1610110.01          ---          ---         0.32380         0.31100         0.63100         0.74300    229391.58 
+Gets     16100995.73  16100995.73         0.00         0.32377         0.31100         0.63100         0.74300   2215285.21 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals   17711105.74  16100995.73         0.00         0.32377         0.31100         0.63100         0.74300   2444676.79 
+    measured 4/10
+Json file /tmp/memtier-1793721498259/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   207.403s  (user 141.612s, sys 65.792s)
+  Wall time:        10.001s
+  Cores used:       20.738   (avg 83.0% across 25 worker threads)
+  Peak utilization: 2120.6%
+Saving JSON output file: /tmp/memtier-1793721498259/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      1601648.11          ---          ---         0.32503         0.31100         0.63900         0.75900    228185.95 
+Gets     16016381.88  16016381.88         0.00         0.32498         0.31100         0.63900         0.75900   2203643.41 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals   17618029.98  16016381.88         0.00         0.32499         0.31100         0.63900         0.75900   2431829.36 
+    measured 5/10
+Json file /tmp/memtier-1793721508636/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   204.965s  (user 142.283s, sys 62.682s)
+  Wall time:        10.001s
+  Cores used:       20.494   (avg 82.0% across 25 worker threads)
+  Peak utilization: 2075.3%
+Saving JSON output file: /tmp/memtier-1793721508636/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      1617693.51          ---          ---         0.32194         0.31900         0.63900         0.73500    230471.91 
+Gets     16176828.38  16176828.38         0.00         0.32191         0.31900         0.63900         0.73500   2225718.78 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals   17794521.88  16176828.38         0.00         0.32191         0.31900         0.63900         0.73500   2456190.69 
+    measured 6/10
+Json file /tmp/memtier-1793721518974/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   208.514s  (user 144.412s, sys 64.102s)
+  Wall time:        10.001s
+  Cores used:       20.849   (avg 83.4% across 25 worker threads)
+  Peak utilization: 2137.5%
+Saving JSON output file: /tmp/memtier-1793721518974/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      1608989.08          ---          ---         0.32339         0.31100         0.63900         0.75100    229231.85 
+Gets     16089792.49  16089792.49         0.00         0.32333         0.31100         0.63900         0.75100   2213743.71 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals   17698781.57  16089792.49         0.00         0.32334         0.31100         0.63900         0.75100   2442975.56 
+    measured 7/10
+Json file /tmp/memtier-1793721529343/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   204.672s  (user 139.701s, sys 64.971s)
+  Wall time:        10.001s
+  Cores used:       20.464   (avg 81.9% across 25 worker threads)
+  Peak utilization: 2093.6%
+Saving JSON output file: /tmp/memtier-1793721529343/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      1624289.61          ---          ---         0.32095         0.31100         0.63900         0.74300    231411.64 
+Gets     16242797.41  16242797.41         0.00         0.32092         0.31100         0.63900         0.74300   2234795.27 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals   17867087.03  16242797.41         0.00         0.32092         0.31100         0.63900         0.74300   2466206.92 
+    measured 8/10
+Json file /tmp/memtier-1793721539680/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   198.695s  (user 133.855s, sys 64.840s)
+  Wall time:        10.001s
+  Cores used:       19.867   (avg 79.5% across 25 worker threads)
+  Peak utilization: 2033.9%
+Saving JSON output file: /tmp/memtier-1793721539680/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      1610631.58          ---          ---         0.32476         0.31900         0.63900         0.75100    229465.82 
+Gets     16106221.60  16106221.60         0.00         0.32472         0.31900         0.63900         0.74300   2216004.17 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals   17716853.18  16106221.60         0.00         0.32473         0.31900         0.63900         0.75100   2445469.99 
+    measured 9/10
+Json file /tmp/memtier-1793721550021/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   209.701s  (user 145.674s, sys 64.028s)
+  Wall time:        10.001s
+  Cores used:       20.968   (avg 83.9% across 25 worker threads)
+  Peak utilization: 2145.9%
+Saving JSON output file: /tmp/memtier-1793721550021/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      1582121.68          ---          ---         0.32814         0.31100         0.64700         0.75900    225404.07 
+Gets     15821119.88  15821119.88         0.00         0.32810         0.31100         0.64700         0.75900   2176777.95 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals   17403241.56  15821119.88         0.00         0.32811         0.31100         0.64700         0.75900   2402182.02 
+    measured 10/10
+Json file /tmp/memtier-1793721560359/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   204.485s  (user 139.409s, sys 65.076s)
+  Wall time:        10.001s
+  Cores used:       20.446   (avg 81.8% across 25 worker threads)
+  Peak utilization: 2075.8%
+Saving JSON output file: /tmp/memtier-1793721560359/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      1592329.35          ---          ---         0.32728         0.31100         0.64700         0.75100    226858.32 
+Gets     15923196.27  15923196.27         0.00         0.32723         0.31100         0.64700         0.75100   2190822.43 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals   17515525.62  15923196.27         0.00         0.32724         0.31100         0.64700         0.75100   2417680.75 
+    → 17704944 ops/s, p50=0.311ms, p99=0.639ms, hit ratio=100%, client CPU=66.2%
+  deferring memory-load-random: it needs a fresh engine, which the cloud workflow starts for it in a later invocation
+  cloud mode: skipping compose down
+  saved (4 results so far)
+
+done — 4 results, 0 failures
+ Container kv-kividb-engine-1  Stopping
+ Container kv-kividb-engine-1  Stopped
+ Container kv-kividb-engine-1  Removing
+ Container kv-kividb-engine-1  Removed
+--- kividb-rc10 random-bytes memory cell 2026-11-03T15:59:31Z ---
+ Container kv-kividb-engine-1  Creating
+ engine Published ports are discarded when using host network mode 
+ Container kv-kividb-engine-1  Created
+ Container kv-kividb-engine-1  Starting
+ Container kv-kividb-engine-1  Started
+ Container kv-kividb-engine-1  Waiting
+ Container kv-kividb-engine-1  Healthy
+
+KV-stores benchmark — FULL (1 sessions across 1 engines)
+
+
+> kividb
+  cloud mode: skipping compose up
+  workload: memory-load-random (1000000 keys × 100B, random bytes)
+    baseline: 2.75MB used, 16.46MB RSS
+Json file /tmp/memtier-1793721573449/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   10.756s  (user 3.096s, sys 7.660s)
+  Wall time:        118.807s
+  Cores used:       0.091   (avg 9.0% across 1 worker threads)
+  Peak utilization: 11.2%
+1         Threads
+1         Connections per thread
+1000000   Requests per client
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets         8417.09          ---          ---         0.11822         0.11900         0.16700         0.32700      1207.40 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals       8417.09         0.00         0.00         0.11822         0.11900         0.16700         0.32700      1207.40 
+Saving JSON output file: /tmp/memtier-1793721573449/result.json
+Json file closed.
+Json file /tmp/memtier-1793721692857/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   10.303s  (user 2.863s, sys 7.440s)
+  Wall time:        112.964s
+  Cores used:       0.091   (avg 9.1% across 1 worker threads)
+  Peak utilization: 11.2%
+Saving JSON output file: /tmp/memtier-1793721692857/result.json
+Json file closed.
+1         Threads
+1         Connections per thread
+1000000   Requests per client
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets         8852.39          ---          ---         0.11279         0.11900         0.15900         0.33500      1279.45 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals       8852.39         0.00         0.00         0.11279         0.11900         0.15900         0.33500      1279.45 
+    → 1000000 keys, delta 140.08MB used / 142.22MB RSS, 149.1 B/key (RSS); second load 147.5 B/key (RSS); 158.68MB RSS after the first
+  cloud mode: skipping compose down
+  saved (5 results so far)
+
+done — 5 results, 0 failures
+ Container kv-kividb-engine-1  Stopping
+ Container kv-kividb-engine-1  Stopped
+ Container kv-kividb-engine-1  Removing
+ Container kv-kividb-engine-1  Removed
+=== kividb-rc8 (kividb/kividb:build-082dab3d8929) 2026-11-03T16:03:29Z ===
+ Container kv-kividb-engine-1  Creating
+ engine Published ports are discarded when using host network mode 
+ Container kv-kividb-engine-1  Created
+ Container kv-kividb-engine-1  Starting
+ Container kv-kividb-engine-1  Started
+ Container kv-kividb-engine-1  Waiting
+ Container kv-kividb-engine-1  Healthy
+
+KV-stores benchmark — FULL (5 sessions across 1 engines)
+
+
+> kividb
+  cloud mode: skipping compose up
+  workload: memory-load (1000000 keys × 100B)
+    baseline: 2.75MB used, 16.13MB RSS
+Json file /tmp/memtier-1793721811037/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   10.887s  (user 2.930s, sys 7.957s)
+  Wall time:        113.112s
+  Cores used:       0.096   (avg 9.6% across 1 worker threads)
+  Peak utilization: 11.4%
+Saving JSON output file: /tmp/memtier-1793721811037/result.json
+Json file closed.
+1         Threads
+1         Connections per thread
+1000000   Requests per client
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets         8840.88          ---          ---         0.11265         0.11900         0.26300         0.34300      1268.19 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals       8840.88         0.00         0.00         0.11265         0.11900         0.26300         0.34300      1268.19 
+Json file /tmp/memtier-1793721925469/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   10.868s  (user 2.973s, sys 7.895s)
+  Wall time:        115.107s
+  Cores used:       0.094   (avg 9.4% across 1 worker threads)
+  Peak utilization: 10.9%
+Saving JSON output file: /tmp/memtier-1793721925469/result.json
+Json file closed.
+1         Threads
+1         Connections per thread
+1000000   Requests per client
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets         8687.63          ---          ---         0.11447         0.11900         0.15900         0.32700      1255.63 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals       8687.63         0.00         0.00         0.11447         0.11900         0.15900         0.32700      1255.63 
+    → 1000000 keys, delta 140.08MB used / 142.32MB RSS, 149.2 B/key (RSS); second load 146.7 B/key (RSS); 158.45MB RSS after the first
+  workload: set-get-small (2 warmup + 10 measured)
+    preloading 100000 keys (100B each)...
+Writing results to stdout
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   0.049s  (user 0.043s, sys 0.006s)
+  Wall time:        0.323s
+  Cores used:       0.152   (avg 15.2% across 1 worker threads)
+  Peak utilization: 0.0%
+1         Threads
+1         Connections per thread
+100000    Requests per client
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       310481.87          ---          ---         0.31291         0.28700         0.60700         0.63900     44234.22 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     310481.87         0.00         0.00         0.31291         0.28700         0.60700         0.63900     44234.22 
+    warmup 1/2
+Json file /tmp/memtier-1793722043424/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   161.145s  (user 33.403s, sys 127.741s)
+  Wall time:        10.002s
+  Cores used:       16.112   (avg 64.4% across 25 worker threads)
+  Peak utilization: 1664.3%
+Saving JSON output file: /tmp/memtier-1793722043424/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       128685.22          ---          ---         0.14309         0.12700         0.33500         0.47100     18333.72 
+Gets      1286743.76   1286743.76         0.00         0.14096         0.12700         0.33500         0.44700    177039.05 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    1415428.97   1286743.76         0.00         0.14115         0.12700         0.33500         0.45500    195372.77 
+    warmup 2/2
+Json file /tmp/memtier-1793722053752/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   148.068s  (user 31.586s, sys 116.482s)
+  Wall time:        10.001s
+  Cores used:       14.805   (avg 59.2% across 25 worker threads)
+  Peak utilization: 1502.2%
+Saving JSON output file: /tmp/memtier-1793722053752/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       121291.31          ---          ---         0.15073         0.14300         0.32700         0.41500     17280.30 
+Gets      1212816.25   1212816.25         0.00         0.14970         0.14300         0.32700         0.41500    166867.59 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    1334107.57   1212816.25         0.00         0.14980         0.14300         0.32700         0.41500    184147.89 
+    measured 1/10
+Json file /tmp/memtier-1793722064102/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   143.057s  (user 31.552s, sys 111.505s)
+  Wall time:        10.001s
+  Cores used:       14.304   (avg 57.2% across 25 worker threads)
+  Peak utilization: 1507.2%
+Saving JSON output file: /tmp/memtier-1793722064102/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       118927.72          ---          ---         0.15365         0.15900         0.32700         0.37500     16943.56 
+Gets      1189173.16   1189173.16         0.00         0.15268         0.15900         0.32700         0.37500    163614.69 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    1308100.88   1189173.16         0.00         0.15277         0.15900         0.32700         0.37500    180558.25 
+    measured 2/10
+Json file /tmp/memtier-1793722074458/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   158.973s  (user 33.174s, sys 125.799s)
+  Wall time:        10.001s
+  Cores used:       15.895   (avg 63.6% across 25 worker threads)
+  Peak utilization: 1685.4%
+Saving JSON output file: /tmp/memtier-1793722074458/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       128220.71          ---          ---         0.14263         0.13500         0.31100         0.37500     18267.55 
+Gets      1282106.90   1282106.90         0.00         0.14158         0.13500         0.31100         0.37500    176401.08 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    1410327.61   1282106.90         0.00         0.14167         0.13500         0.31100         0.37500    194668.63 
+    measured 3/10
+Json file /tmp/memtier-1793722084804/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   139.767s  (user 30.682s, sys 109.085s)
+  Wall time:        10.001s
+  Cores used:       13.975   (avg 55.9% across 25 worker threads)
+  Peak utilization: 1575.7%
+Saving JSON output file: /tmp/memtier-1793722084804/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       117284.15          ---          ---         0.15578         0.16700         0.33500         0.38300     16709.40 
+Gets      1172737.94   1172737.94         0.00         0.15483         0.15900         0.33500         0.38300    161353.36 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    1290022.09   1172737.94         0.00         0.15491         0.15900         0.33500         0.38300    178062.76 
+    measured 4/10
+Json file /tmp/memtier-1793722095158/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   160.807s  (user 33.272s, sys 127.535s)
+  Wall time:        10.001s
+  Cores used:       16.078   (avg 64.3% across 25 worker threads)
+  Peak utilization: 1649.3%
+Saving JSON output file: /tmp/memtier-1793722095158/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       129422.81          ---          ---         0.14135         0.13500         0.31100         0.37500     18438.79 
+Gets      1294132.71   1294132.71         0.00         0.14026         0.12700         0.30300         0.37500    178055.64 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    1423555.52   1294132.71         0.00         0.14036         0.12700         0.30300         0.37500    196494.44 
+    measured 5/10
+Json file /tmp/memtier-1793722105511/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   150.157s  (user 32.554s, sys 117.603s)
+  Wall time:        10.001s
+  Cores used:       15.014   (avg 60.1% across 25 worker threads)
+  Peak utilization: 1555.3%
+Saving JSON output file: /tmp/memtier-1793722105511/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       123169.25          ---          ---         0.14843         0.14300         0.32700         0.38300     17547.86 
+Gets      1231588.98   1231588.98         0.00         0.14739         0.14300         0.32700         0.38300    169450.56 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    1354758.23   1231588.98         0.00         0.14749         0.14300         0.32700         0.38300    186998.42 
+    measured 6/10
+Json file /tmp/memtier-1793722115855/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   153.761s  (user 32.476s, sys 121.284s)
+  Wall time:        10.001s
+  Cores used:       15.374   (avg 61.5% across 25 worker threads)
+  Peak utilization: 1595.9%
+Saving JSON output file: /tmp/memtier-1793722115855/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       124576.01          ---          ---         0.14676         0.14300         0.31900         0.38300     17748.29 
+Gets      1245655.87   1245655.87         0.00         0.14573         0.13500         0.31900         0.38300    171385.93 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    1370231.87   1245655.87         0.00         0.14582         0.13500         0.31900         0.38300    189134.22 
+    measured 7/10
+Json file /tmp/memtier-1793722126199/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   156.650s  (user 33.163s, sys 123.487s)
+  Wall time:        10.001s
+  Cores used:       15.663   (avg 62.6% across 25 worker threads)
+  Peak utilization: 1595.3%
+Saving JSON output file: /tmp/memtier-1793722126199/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       126244.86          ---          ---         0.14484         0.13500         0.31900         0.38300     17986.02 
+Gets      1262345.49   1262345.49         0.00         0.14378         0.13500         0.31900         0.37500    173682.19 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    1388590.34   1262345.49         0.00         0.14388         0.13500         0.31900         0.37500    191668.21 
+    measured 8/10
+Json file /tmp/memtier-1793722136546/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   152.501s  (user 32.148s, sys 120.353s)
+  Wall time:        10.003s
+  Cores used:       15.246   (avg 61.0% across 25 worker threads)
+  Peak utilization: 1557.8%
+Saving JSON output file: /tmp/memtier-1793722136546/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       123851.84          ---          ---         0.14764         0.14300         0.32700         0.39900     17645.13 
+Gets      1238417.63   1238417.63         0.00         0.14658         0.14300         0.31900         0.39100    170390.04 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    1362269.47   1238417.63         0.00         0.14668         0.14300         0.31900         0.39100    188035.17 
+    measured 9/10
+Json file /tmp/memtier-1793722147929/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   131.862s  (user 29.306s, sys 102.556s)
+  Wall time:        10.001s
+  Cores used:       13.185   (avg 52.7% across 25 worker threads)
+  Peak utilization: 1390.2%
+Saving JSON output file: /tmp/memtier-1793722147929/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       110488.82          ---          ---         0.16531         0.15900         0.35100         0.47900     15741.29 
+Gets      1104790.24   1104790.24         0.00         0.16437         0.15900         0.35100         0.47100    152004.69 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    1215279.07   1104790.24         0.00         0.16445         0.15900         0.35100         0.47100    167745.98 
+    measured 10/10
+Json file /tmp/memtier-1793722158292/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   138.093s  (user 30.071s, sys 108.023s)
+  Wall time:        10.001s
+  Cores used:       13.808   (avg 55.2% across 25 worker threads)
+  Peak utilization: 1419.5%
+Saving JSON output file: /tmp/memtier-1793722158292/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       116526.26          ---          ---         0.15679         0.16700         0.33500         0.38300     16601.44 
+Gets      1165169.53   1165169.53         0.00         0.15584         0.15900         0.33500         0.37500    160312.03 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    1281695.79   1165169.53         0.00         0.15593         0.16700         0.33500         0.37500    176913.47 
+    → 1358514 ops/s, p50=0.143ms, p99=0.323ms, hit ratio=100%, client CPU=53.4%
+  workload: set-get-large (2 warmup + 10 measured)
+    preloading 40000 keys (10240B each)...
+Writing results to stdout
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   0.106s  (user 0.033s, sys 0.073s)
+  Wall time:        0.354s
+  Cores used:       0.299   (avg 29.6% across 1 worker threads)
+  Peak utilization: 0.0%
+1         Threads
+1         Connections per thread
+40000     Requests per client
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       113107.78          ---          ---         0.88072         0.91100         1.20700         2.59100   1136349.01 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     113107.78         0.00         0.00         0.88072         0.91100         1.20700         2.59100   1136349.01 
+    warmup 1/2
+Json file /tmp/memtier-1793722170036/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   52.421s  (user 11.373s, sys 41.048s)
+  Wall time:        10.008s
+  Cores used:       5.238   (avg 21.0% across 25 worker threads)
+  Peak utilization: 535.8%
+Saving JSON output file: /tmp/memtier-1793722170036/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets        29166.97          ---          ---         0.61012         0.59100         0.99900         1.18300    293029.02 
+Gets       291573.33    291573.33         0.00         0.62489         0.61500         1.01500         1.19900   2927898.02 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     320740.30    291573.33         0.00         0.62355         0.61500         1.01500         1.19100   3220927.03 
+    warmup 2/2
+Json file /tmp/memtier-1793722181406/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   53.212s  (user 12.789s, sys 40.423s)
+  Wall time:        10.001s
+  Cores used:       5.320   (avg 21.3% across 25 worker threads)
+  Peak utilization: 544.2%
+Saving JSON output file: /tmp/memtier-1793722181406/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets        29159.53          ---          ---         0.60995         0.59100         1.12700         1.21500    292954.23 
+Gets       291493.39    291493.39         0.00         0.62507         0.60700         1.14300         1.23100   2927095.33 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     320652.92    291493.39         0.00         0.62370         0.60700         1.14300         1.22300   3220049.57 
+    measured 1/10
+Json file /tmp/memtier-1793722191790/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   55.701s  (user 12.330s, sys 43.371s)
+  Wall time:        10.001s
+  Cores used:       5.569   (avg 22.3% across 25 worker threads)
+  Peak utilization: 564.7%
+Saving JSON output file: /tmp/memtier-1793722191790/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets        29129.01          ---          ---         0.61227         0.59900         1.11100         1.23100    292647.58 
+Gets       291185.56    291185.56         0.00         0.62555         0.61500         1.13500         1.24700   2924004.22 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     320314.57    291185.56         0.00         0.62434         0.60700         1.13500         1.24700   3216651.80 
+    measured 2/10
+Json file /tmp/memtier-1793722202159/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   52.655s  (user 12.066s, sys 40.589s)
+  Wall time:        10.001s
+  Cores used:       5.265   (avg 21.1% across 25 worker threads)
+  Peak utilization: 536.0%
+Saving JSON output file: /tmp/memtier-1793722202159/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets        29156.09          ---          ---         0.60972         0.58300         1.23100         1.47100    292919.68 
+Gets       291461.61    291461.61         0.00         0.62519         0.60700         1.25500         1.48700   2926776.22 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     320617.70    291461.61         0.00         0.62378         0.59900         1.24700         1.47900   3219695.91 
+    measured 3/10
+Json file /tmp/memtier-1793722212522/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   55.137s  (user 12.252s, sys 42.885s)
+  Wall time:        10.001s
+  Cores used:       5.513   (avg 22.0% across 25 worker threads)
+  Peak utilization: 559.8%
+Saving JSON output file: /tmp/memtier-1793722212522/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets        29149.48          ---          ---         0.61047         0.59900         1.01500         1.21500    292853.24 
+Gets       291390.77    291390.77         0.00         0.62526         0.61500         1.05500         1.23100   2926064.89 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     320540.25    291390.77         0.00         0.62391         0.60700         1.04700         1.23100   3218918.13 
+    measured 4/10
+Json file /tmp/memtier-1793722222883/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   54.050s  (user 12.423s, sys 41.627s)
+  Wall time:        10.001s
+  Cores used:       5.404   (avg 21.6% across 25 worker threads)
+  Peak utilization: 549.8%
+Saving JSON output file: /tmp/memtier-1793722222883/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets        29175.54          ---          ---         0.61073         0.59100         1.04700         1.20700    293115.11 
+Gets       291648.63    291648.63         0.00         0.62464         0.60700         1.09500         1.22300   2928654.31 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     320824.18    291648.63         0.00         0.62337         0.60700         1.09500         1.22300   3221769.42 
+    measured 5/10
+Json file /tmp/memtier-1793722233241/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   53.684s  (user 11.792s, sys 41.892s)
+  Wall time:        10.001s
+  Cores used:       5.368   (avg 21.5% across 25 worker threads)
+  Peak utilization: 548.7%
+Saving JSON output file: /tmp/memtier-1793722233241/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets        29162.46          ---          ---         0.60936         0.59100         1.01500         1.22300    292983.69 
+Gets       291517.61    291517.61         0.00         0.62509         0.60700         1.03900         1.23900   2927338.58 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     320680.07    291517.61         0.00         0.62366         0.60700         1.03100         1.23900   3220322.26 
+    measured 6/10
+Json file /tmp/memtier-1793722243590/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   54.306s  (user 12.384s, sys 41.922s)
+  Wall time:        10.001s
+  Cores used:       5.430   (avg 21.7% across 25 worker threads)
+  Peak utilization: 553.1%
+Saving JSON output file: /tmp/memtier-1793722243590/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets        29153.51          ---          ---         0.61116         0.59100         1.19900         1.39100    292893.75 
+Gets       291435.89    291435.89         0.00         0.62507         0.60700         1.21500         1.40700   2926517.93 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     320589.40    291435.89         0.00         0.62381         0.60700         1.21500         1.40700   3219411.67 
+    measured 7/10
+Json file /tmp/memtier-1793722253941/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   52.741s  (user 11.423s, sys 41.318s)
+  Wall time:        10.001s
+  Cores used:       5.273   (avg 21.1% across 25 worker threads)
+  Peak utilization: 544.8%
+Saving JSON output file: /tmp/memtier-1793722253941/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets        29099.45          ---          ---         0.61045         0.59100         1.10300         1.20700    292350.66 
+Gets       290899.13    290899.13         0.00         0.62645         0.60700         1.12700         1.22300   2921127.95 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     319998.58    290899.13         0.00         0.62499         0.60700         1.12700         1.22300   3213478.62 
+    measured 8/10
+Json file /tmp/memtier-1793722264295/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   52.410s  (user 11.496s, sys 40.914s)
+  Wall time:        10.002s
+  Cores used:       5.240   (avg 21.0% across 25 worker threads)
+  Peak utilization: 535.4%
+Saving JSON output file: /tmp/memtier-1793722264295/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets        29200.15          ---          ---         0.60755         0.58300         1.18300         1.23900    293362.34 
+Gets       291895.22    291895.22         0.00         0.62440         0.60700         1.19900         1.26300   2931130.42 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     321095.37    291895.22         0.00         0.62287         0.59900         1.19900         1.26300   3224492.76 
+    measured 9/10
+Json file /tmp/memtier-1793722274643/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   53.036s  (user 11.690s, sys 41.347s)
+  Wall time:        10.004s
+  Cores used:       5.302   (avg 21.2% across 25 worker threads)
+  Peak utilization: 541.1%
+Saving JSON output file: /tmp/memtier-1793722274643/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets        29159.79          ---          ---         0.60896         0.59100         1.01500         1.21500    292956.85 
+Gets       291490.20    291490.20         0.00         0.62520         0.60700         1.03900         1.23100   2927063.28 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     320649.99    291490.20         0.00         0.62372         0.60700         1.03900         1.23100   3220020.13 
+    measured 10/10
+Json file /tmp/memtier-1793722286023/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   54.597s  (user 12.017s, sys 42.579s)
+  Wall time:        10.001s
+  Cores used:       5.459   (avg 21.8% across 25 worker threads)
+  Peak utilization: 558.8%
+Saving JSON output file: /tmp/memtier-1793722286023/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets        29140.69          ---          ---         0.61098         0.59100         0.99900         1.19900    292764.98 
+Gets       291303.61    291303.61         0.00         0.62541         0.60700         1.01500         1.21500   2925189.66 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     320444.30    291303.61         0.00         0.62410         0.60700         1.01500         1.21500   3217954.65 
+    → 320604 ops/s, p50=0.607ms, p99=1.111ms, hit ratio=100%, client CPU=23.1%
+  workload: pipeline-30 (2 warmup + 10 measured)
+    preloading 100000 keys (100B each)...
+Writing results to stdout
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   0.050s  (user 0.044s, sys 0.006s)
+  Wall time:        0.290s
+  Cores used:       0.173   (avg 17.0% across 1 worker threads)
+  Peak utilization: 0.0%
+1         Threads
+1         Connections per thread
+100000    Requests per client
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       345478.04          ---          ---         0.27897         0.27100         0.54300         0.56700     49220.11 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     345478.04         0.00         0.00         0.27897         0.27100         0.54300         0.56700     49220.11 
+    warmup 1/2
+Json file /tmp/memtier-1793722297826/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   205.387s  (user 136.073s, sys 69.314s)
+  Wall time:        10.001s
+  Cores used:       20.536   (avg 82.1% across 25 worker threads)
+  Peak utilization: 2098.4%
+Saving JSON output file: /tmp/memtier-1793722297826/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      1629641.12          ---          ---         0.32073         0.31100         0.63100         0.74300    232174.09 
+Gets     16296316.12  16296316.12         0.00         0.32070         0.31100         0.63100         0.74300   2242158.57 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals   17925957.24  16296316.12         0.00         0.32070         0.31100         0.63100         0.74300   2474332.66 
+    warmup 2/2
+Json file /tmp/memtier-1793722308180/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   198.616s  (user 134.569s, sys 64.047s)
+  Wall time:        10.002s
+  Cores used:       19.858   (avg 79.4% across 25 worker threads)
+  Peak utilization: 2039.9%
+Saving JSON output file: /tmp/memtier-1793722308180/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      1612748.70          ---          ---         0.32419         0.31100         0.63900         0.73500    229767.46 
+Gets     16127378.49  16127378.49         0.00         0.32415         0.31100         0.63900         0.73500   2218915.04 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals   17740127.19  16127378.49         0.00         0.32415         0.31100         0.63900         0.73500   2448682.49 
+    measured 1/10
+Json file /tmp/memtier-1793722319579/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   212.026s  (user 145.289s, sys 66.737s)
+  Wall time:        10.001s
+  Cores used:       21.200   (avg 84.8% across 25 worker threads)
+  Peak utilization: 2160.7%
+Saving JSON output file: /tmp/memtier-1793722319579/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      1576610.45          ---          ---         0.32948         0.31100         0.63900         0.76700    224618.82 
+Gets     15765999.45  15765999.45         0.00         0.32944         0.31100         0.63900         0.76700   2169194.21 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals   17342609.90  15765999.45         0.00         0.32945         0.31100         0.63900         0.76700   2393813.03 
+    measured 2/10
+Json file /tmp/memtier-1793722329914/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   195.124s  (user 131.957s, sys 63.166s)
+  Wall time:        10.001s
+  Cores used:       19.510   (avg 78.0% across 25 worker threads)
+  Peak utilization: 1993.7%
+Saving JSON output file: /tmp/memtier-1793722329914/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      1602062.51          ---          ---         0.32678         0.31900         0.63900         0.75900    228245.04 
+Gets     16020521.20  16020521.20         0.00         0.32674         0.31900         0.63900         0.75900   2204212.92 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals   17622583.71  16020521.20         0.00         0.32675         0.31900         0.63900         0.75900   2432457.97 
+    measured 3/10
+Json file /tmp/memtier-1793722340253/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   198.755s  (user 133.259s, sys 65.496s)
+  Wall time:        10.001s
+  Cores used:       19.873   (avg 79.5% across 25 worker threads)
+  Peak utilization: 2018.2%
+Saving JSON output file: /tmp/memtier-1793722340253/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      1619762.21          ---          ---         0.32295         0.31900         0.63900         0.73500    230766.70 
+Gets     16197521.77  16197521.77         0.00         0.32291         0.31900         0.63900         0.73500   2228565.90 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals   17817283.98  16197521.77         0.00         0.32291         0.31900         0.63900         0.73500   2459332.60 
+    measured 4/10
+Json file /tmp/memtier-1793722350596/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   200.437s  (user 135.952s, sys 64.486s)
+  Wall time:        10.001s
+  Cores used:       20.041   (avg 80.2% across 25 worker threads)
+  Peak utilization: 2086.3%
+Saving JSON output file: /tmp/memtier-1793722350596/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      1609977.90          ---          ---         0.32433         0.31900         0.65500         0.75100    229372.65 
+Gets     16099684.96  16099684.96         0.00         0.32430         0.31900         0.65500         0.75100   2215104.76 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals   17709662.86  16099684.96         0.00         0.32430         0.31900         0.65500         0.75100   2444477.41 
+    measured 5/10
+Json file /tmp/memtier-1793722360922/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   208.710s  (user 141.950s, sys 66.760s)
+  Wall time:        10.001s
+  Cores used:       20.869   (avg 83.5% across 25 worker threads)
+  Peak utilization: 2143.4%
+Saving JSON output file: /tmp/memtier-1793722360922/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      1576543.46          ---          ---         0.32996         0.31100         0.64700         0.77500    224609.33 
+Gets     15765334.43  15765334.43         0.00         0.32991         0.31100         0.64700         0.77500   2169102.60 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals   17341877.89  15765334.43         0.00         0.32992         0.31100         0.64700         0.77500   2393711.93 
+    measured 6/10
+Json file /tmp/memtier-1793722371275/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   203.741s  (user 136.718s, sys 67.022s)
+  Wall time:        10.001s
+  Cores used:       20.372   (avg 81.5% across 25 worker threads)
+  Peak utilization: 2093.4%
+Saving JSON output file: /tmp/memtier-1793722371275/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      1632300.48          ---          ---         0.32007         0.31100         0.63900         0.74300    232552.95 
+Gets     16322913.93  16322913.93         0.00         0.32003         0.31100         0.63900         0.74300   2245818.22 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals   17955214.41  16322913.93         0.00         0.32003         0.31100         0.63900         0.74300   2478371.18 
+    measured 7/10
+Json file /tmp/memtier-1793722381624/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   202.916s  (user 136.193s, sys 66.722s)
+  Wall time:        10.001s
+  Cores used:       20.289   (avg 81.2% across 25 worker threads)
+  Peak utilization: 2132.1%
+Saving JSON output file: /tmp/memtier-1793722381624/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      1632102.06          ---          ---         0.32013         0.31100         0.63900         0.73500    232524.75 
+Gets     16320921.69  16320921.69         0.00         0.32009         0.31100         0.63900         0.73500   2245544.16 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals   17953023.75  16320921.69         0.00         0.32009         0.31100         0.63900         0.73500   2478068.91 
+    measured 8/10
+Json file /tmp/memtier-1793722391973/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   207.097s  (user 138.826s, sys 68.272s)
+  Wall time:        10.001s
+  Cores used:       20.707   (avg 82.8% across 25 worker threads)
+  Peak utilization: 2121.9%
+Saving JSON output file: /tmp/memtier-1793722391973/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      1588651.70          ---          ---         0.32853         0.31100         0.63100         0.73500    226334.35 
+Gets     15886412.35  15886412.35         0.00         0.32848         0.31100         0.63100         0.73500   2185761.40 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals   17475064.06  15886412.35         0.00         0.32848         0.31100         0.63100         0.73500   2412095.75 
+    measured 9/10
+Json file /tmp/memtier-1793722402321/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   209.023s  (user 141.037s, sys 67.986s)
+  Wall time:        10.001s
+  Cores used:       20.900   (avg 83.6% across 25 worker threads)
+  Peak utilization: 2165.4%
+Saving JSON output file: /tmp/memtier-1793722402321/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      1610527.69          ---          ---         0.32362         0.31100         0.63100         0.74300    229451.02 
+Gets     16105166.14  16105166.14         0.00         0.32358         0.31100         0.63100         0.74300   2215858.95 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals   17715693.83  16105166.14         0.00         0.32358         0.31100         0.63100         0.74300   2445309.97 
+    measured 10/10
+Json file /tmp/memtier-1793722412662/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   206.307s  (user 142.081s, sys 64.226s)
+  Wall time:        10.001s
+  Cores used:       20.628   (avg 82.5% across 25 worker threads)
+  Peak utilization: 2123.9%
+Saving JSON output file: /tmp/memtier-1793722412662/result.json
+Json file closed.
+25        Threads
+8         Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      1579338.51          ---          ---         0.32938         0.31900         0.64700         0.75100    225007.51 
+Gets     15793287.01  15793287.01         0.00         0.32933         0.31900         0.64700         0.75100   2172948.45 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals   17372625.52  15793287.01         0.00         0.32933         0.31900         0.64700         0.75100   2397955.95 
+    → 17666123 ops/s, p50=0.311ms, p99=0.639ms, hit ratio=100%, client CPU=66.4%
+  deferring memory-load-random: it needs a fresh engine, which the cloud workflow starts for it in a later invocation
+  cloud mode: skipping compose down
+  saved (4 results so far)
+
+done — 4 results, 0 failures
+ Container kv-kividb-engine-1  Stopping
+ Container kv-kividb-engine-1  Stopped
+ Container kv-kividb-engine-1  Removing
+ Container kv-kividb-engine-1  Removed
+--- kividb-rc8 random-bytes memory cell 2026-11-03T16:13:44Z ---
+ Container kv-kividb-engine-1  Creating
+ engine Published ports are discarded when using host network mode 
+ Container kv-kividb-engine-1  Created
+ Container kv-kividb-engine-1  Starting
+ Container kv-kividb-engine-1  Started
+ Container kv-kividb-engine-1  Waiting
+ Container kv-kividb-engine-1  Healthy
+
+KV-stores benchmark — FULL (1 sessions across 1 engines)
+
+
+> kividb
+  cloud mode: skipping compose up
+  workload: memory-load-random (1000000 keys × 100B, random bytes)
+    baseline: 2.75MB used, 16.21MB RSS
+Json file /tmp/memtier-1793722425768/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   10.249s  (user 2.853s, sys 7.396s)
+  Wall time:        109.293s
+  Cores used:       0.094   (avg 9.4% across 1 worker threads)
+  Peak utilization: 11.5%
+Saving JSON output file: /tmp/memtier-1793722425768/result.json
+Json file closed.
+1         Threads
+1         Connections per thread
+1000000   Requests per client
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets         9149.73          ---          ---         0.10891         0.11900         0.16700         0.32700      1312.49 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals       9149.73         0.00         0.00         0.10891         0.11900         0.16700         0.32700      1312.49 
+Json file /tmp/memtier-1793722536191/result.json created...
+Writing results to stdout
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   10.480s  (user 2.926s, sys 7.554s)
+  Wall time:        113.752s
+  Cores used:       0.092   (avg 9.2% across 1 worker threads)
+  Peak utilization: 10.9%
+Saving JSON output file: /tmp/memtier-1793722536191/result.json
+Json file closed.
+1         Threads
+1         Connections per thread
+1000000   Requests per client
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets         8791.11          ---          ---         0.11340         0.11900         0.27900         0.34300      1270.59 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals       8791.11         0.00         0.00         0.11340         0.11900         0.27900         0.34300      1270.59 
+    → 1000000 keys, delta 140.08MB used / 142.27MB RSS, 149.2 B/key (RSS); second load 146.7 B/key (RSS); 158.48MB RSS after the first
+  cloud mode: skipping compose down
+  saved (5 results so far)
+
+done — 5 results, 0 failures
+ Container kv-kividb-engine-1  Stopping
+ Container kv-kividb-engine-1  Stopped
+ Container kv-kividb-engine-1  Removing
+ Container kv-kividb-engine-1  Removed
+ALL DONE 2026-11-03T16:17:33Z

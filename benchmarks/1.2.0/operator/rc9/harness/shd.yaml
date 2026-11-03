@@ -1,0 +1,21 @@
+# shd: the sharded cluster (3 x (1 master + 1 replica)), created on rc8 and upgraded to rc9 under load
+apiVersion: v1
+kind: Secret
+metadata: {name: shd-pw, namespace: e2e}
+stringData: {password: "shd-pw-1111"}
+---
+apiVersion: kividb.io/v1alpha1
+kind: KividbAclConfig
+metadata: {name: shd-acl, namespace: e2e}
+spec:
+  requirePassSecretRef: {name: shd-pw, key: password}
+---
+apiVersion: kividb.io/v1alpha1
+kind: KividbCluster
+metadata: {name: shd, namespace: e2e}
+spec:
+  shards: 3
+  replicas: 1
+  image: "ACR.azurecr.io/kividb:1.2.0-rc8"
+  storage: {size: 10Gi}
+  aclConfigRef: {name: shd-acl}

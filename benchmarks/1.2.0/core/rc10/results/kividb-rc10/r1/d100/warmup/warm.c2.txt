@@ -1,0 +1,38 @@
+Json file /tmp/r/warm.c2.json created...
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 20%,   1 secs] 15 threads 10 conns:     5396571 ops, 5387745 (avg: 5387745) ops/sec, 734.19MB/sec (avg: 734.19MB/sec),  0.44 (avg:  0.44) msec latency[RUN #1 40%,   2 secs] 15 threads 10 conns:    10872926 ops, 5475533 (avg: 5431607) ops/sec, 746.15MB/sec (avg: 740.16MB/sec),  0.43 (avg:  0.43) msec latency
+warning: high CPU on thread 4: 95.0% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 7: 95.1% of a core (threshold 95.0%) - results may be unreliable
+[RUN #1 60%,   3 secs] 15 threads 10 conns:    16329032 ops, 5455222 (avg: 5439475) ops/sec, 743.38MB/sec (avg: 741.23MB/sec),  0.43 (avg:  0.43) msec latency
+warning: high CPU on thread 1: 95.5% of a core (threshold 95.0%) - results may be unreliable
+[RUN #1 80%,   4 secs] 15 threads 10 conns:    21769817 ops, 5439876 (avg: 5439575) ops/sec, 741.29MB/sec (avg: 741.25MB/sec),  0.43 (avg:  0.43) msec latency[RUN #1 100%,   5 secs]  1 threads 10 conns:    27407328 ops, 5439876 (avg: 5480478) ops/sec, 741.29MB/sec (avg: 746.82MB/sec),  0.43 (avg:  0.43) msec latency[RUN #1 100%,   5 secs]  0 threads 10 conns:    27407328 ops, 5439876 (avg: 5480478) ops/sec, 741.29MB/sec (avg: 746.82MB/sec),  0.43 (avg:  0.43) msec latency
+
+Writing Full Run command HDR latency histogram results to /tmp/r/warm.c2_FULL_RUN_1.txt...
+Writing Full Run command HDR latency histogram results in HistogramLogProcessor format to /tmp/r/warm.c2_FULL_RUN_1.hgrm...
+Writing GET command HDR latency histogram results to /tmp/r/warm.c2_GET_command_run_1.txt...
+Writing GET command HDR latency histogram results in HistogramLogProcessor format to /tmp/r/warm.c2_GET_command_run_1.hgrm...
+
+CPU Utilization Summary
+  Total CPU time:   69.260s  (user 31.672s, sys 37.588s)
+  Wall time:        5.002s
+  Cores used:       13.846   (avg 92.3% across 15 worker threads)
+  Peak utilization: 1385.1%
+Saving JSON output file: /tmp/r/warm.c2.json
+Json file closed.
+15        Threads
+10        Connections per thread
+5         Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets            0.00          ---          ---             ---             ---             ---             ---         0.00 
+Gets      5480699.40   5480699.40         0.00         0.42891         0.42300         0.72700         1.23900    764776.01 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    5480699.40   5480699.40         0.00         0.42891         0.42300         0.72700         1.23900    764776.01 
+rc=0

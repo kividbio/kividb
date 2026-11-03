@@ -806,7 +806,7 @@ fn a_backup_from_before_a_restart_can_be_listed_and_cleaned_up() {
 /// restart (#150).
 #[test]
 fn a_sealed_backup_from_before_a_restart_still_runs_out() {
-    let mut server = Server::start(&["--backup-sealed-ttl", "3"]);
+    let mut server = Server::start(&["--backup-sealed-ttl", "10"]);
     let mut c = server.conn();
     assert!(c.cmd(&["BACKUP", "START"]).ok());
     wait_for_state(&mut c, "incrementing");
@@ -814,7 +814,7 @@ fn a_sealed_backup_from_before_a_restart_still_runs_out() {
     drop(c);
     server.child.kill().unwrap();
     server.child.wait().unwrap();
-    server.child = kividb(&server.dir, server.port, &["--backup-sealed-ttl", "3"])
+    server.child = kividb(&server.dir, server.port, &["--backup-sealed-ttl", "10"])
         .stderr(Stdio::null())
         .spawn()
         .expect("could not restart kividb");
@@ -853,6 +853,46 @@ fn a_single_snapshot_can_be_preloaded() {
     let preload = format!("rdb:{}", source.dir.join("dump.kdb").display());
     let restored = Server::start(&["--preload-file", &preload]);
     assert_eq!(restored.conn().cmd(&["GET", "from-snapshot"]).s(), "yes");
+}
+
+/// A hash loaded from `dump.kdb` whose fields all expire after the restart
+/// is deleted when they do, like one written since: the sweep watches it.
+#[test]
+fn hashes_loaded_from_a_snapshot_lose_their_expired_fields_and_go() {
+    // Long enough that the restart below finishes before the fields are due,
+    // on a slow runner too; the wait after it counts from when they were set.
+    const TTL_MS: u64 = 10_000;
+    let ttl = TTL_MS.to_string();
+    let ttl = ttl.as_str();
+    let mut server = Server::start(&[]);
+    let mut c = server.conn();
+    let set_at = std::time::Instant::now();
+    c.cmd(&["HSET", "h1", "f1", "v1"]);
+    c.cmd(&["HPEXPIRE", "h1", ttl, "FIELDS", "1", "f1"]);
+    c.cmd(&["HSET", "h2", "f1", "v1", "f2", "v2"]);
+    c.cmd(&["HPEXPIRE", "h2", ttl, "FIELDS", "2", "f1", "f2"]);
+    c.cmd(&["HSET", "h3", "f1", "v1", "f2", "v2"]);
+    c.cmd(&["HPEXPIRE", "h3", ttl, "FIELDS", "1", "f1"]);
+    assert!(c.cmd(&["SAVE"]).ok());
+    drop(c);
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    server.child = kividb(&server.dir, server.port, &[])
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("could not restart kividb");
+
+    let mut c = server.conn();
+    assert!(
+        set_at.elapsed() < Duration::from_millis(TTL_MS),
+        "the restart took longer than the fields' TTL"
+    );
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 3);
+    // Past the deadline, plus time for the background sweep (10 a second).
+    let due = Duration::from_millis(TTL_MS + 1_500);
+    std::thread::sleep(due.saturating_sub(set_at.elapsed()));
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 1);
+    assert_eq!(c.cmd(&["HLEN", "h3"]).i(), 1);
 }
 
 // ── AOF replay ────────────────────────────────────────────────────────────────

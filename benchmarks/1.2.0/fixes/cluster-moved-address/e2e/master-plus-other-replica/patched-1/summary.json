@@ -1,0 +1,109 @@
+{
+ "label": "patched",
+ "scenario": "master-plus-other-replica",
+ "rep": "1",
+ "node_timeout_ms": 5000,
+ "down_s": 10.0,
+ "moving": [
+  "n1",
+  "n5"
+ ],
+ "new_ips": {
+  "n1": "10.99.0.21",
+  "n5": "10.99.0.25"
+ },
+ "restart_after_kill_s": 10.02,
+ "moved_views_converged_s": 11.48,
+ "all_views_and_state_ok_s": 11.48,
+ "cluster_state_ok_everywhere_s": 0.48,
+ "flaps_after_restart": 0,
+ "per_observer_moved_view_ok_s": {
+  "n1": 11.48,
+  "n2": 10.98,
+  "n3": 1.48,
+  "n4": 1.48,
+  "n5": 11.48,
+  "n6": 1.48
+ },
+ "observed_after_restart_s": 26.49,
+ "writes_failed_after_kill": 34,
+ "writes_clusterdown_after_kill": 6,
+ "writes_attempted_after_kill": 6093,
+ "last_failed_write_s_after_kill": 11,
+ "last_clusterdown_s_after_kill": 7,
+ "failed_seconds_after_restart": 1,
+ "clusterdown_seconds": 2,
+ "clusterdown_from": [
+  "10.99.0.12",
+  "10.99.0.13"
+ ],
+ "other_errors": [],
+ "address_sequences": {
+  "n1->n1": [
+   "127.0.0.1",
+   "10.99.0.21"
+  ],
+  "n1->n5": [
+   "10.99.0.15",
+   "10.99.0.25"
+  ],
+  "n2->n1": [
+   "10.99.0.11",
+   "10.99.0.21"
+  ],
+  "n2->n5": [
+   "10.99.0.15",
+   "10.99.0.25"
+  ],
+  "n3->n1": [
+   "10.99.0.11",
+   "10.99.0.21"
+  ],
+  "n3->n5": [
+   "10.99.0.15",
+   "10.99.0.25"
+  ],
+  "n4->n1": [
+   "10.99.0.11",
+   "10.99.0.21"
+  ],
+  "n4->n5": [
+   "10.99.0.15",
+   "10.99.0.25"
+  ],
+  "n5->n1": [
+   "10.99.0.11",
+   "10.99.0.21"
+  ],
+  "n5->n5": [
+   "127.0.0.1",
+   "10.99.0.25"
+  ],
+  "n6->n1": [
+   "10.99.0.11",
+   "10.99.0.21"
+  ],
+  "n6->n5": [
+   "10.99.0.15",
+   "10.99.0.25"
+  ]
+ },
+ "events": [
+  [
+   3.873,
+   "cluster formed {'n1': '572a825678d5d81fd1f1940e52587e654f8ac451', 'n2': '5b31caad7457f7631b5d6a728a50fccc9728847a', 'n3': '7db1b51410bf450dfa880bb9f1f17debd4e6303e', 'n4': 'dc47e8add88ae6a8be4e397168ea43c754132822', 'n5': 'f3d90d55f4efa71f9ee5dab267dbee8ae47db3ed', 'n6': 'ba4403f175ea243a1768b448e081409e2c0ca67c'}"
+  ],
+  [
+   23.875,
+   "stop ['n1', 'n5']"
+  ],
+  [
+   23.969,
+   "re-IP {'n1': '10.99.0.21', 'n5': '10.99.0.25'}"
+  ],
+  [
+   33.896,
+   "restarted ['n1', 'n5']"
+  ]
+ ]
+}

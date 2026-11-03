@@ -1,0 +1,68 @@
+2026-11-03T07:56:35.721Z 76216 [WARN] cluster bus port 17002 is not authenticated: any host that can reach it can join this cluster. Set cluster-bus-secret, or restrict the port to cluster members at the network layer.
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc9 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc9
+  * Mode           : cluster
+  * OS             : linux x86_64
+  * Memory         : 31GiB available
+  * CPUs           : 8 cores detected
+  * Listening on   : 0.0.0.0:7002
+  * Cluster bus    : 0.0.0.0:17002
+  * Node timeout   : 5000ms
+  * Node ID        : (printed after cluster init)
+  * Worker threads : 6
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-03T07:56:35.721Z 76216 [INFO] KiviDB 1.2.0-rc9 starting: pid 76216, default build, config file '/data/7002/node.conf'
+2026-11-03T07:56:35.721Z 76216 [INFO] I/O model      : io_uring
+2026-11-03T07:56:35.731Z 76216 [INFO] Cluster: Node ID        : aab46bdebcb5122be380969cb4c5418360d5b9ae
+2026-11-03T07:56:35.731Z 76216 [INFO] Cluster: Bus port       : 17002
+2026-11-03T07:56:35.731Z 76216 [INFO] Shards per DB  : 64
+2026-11-03T07:56:35.731Z 76216 [INFO] I/O model      : io_uring
+2026-11-03T07:56:35.731Z 76216 [INFO] Cluster: Bus listener bound on 0.0.0.0:17002
+2026-11-03T07:56:35.731Z 76216 [INFO] Cluster: Heartbeat loop started (interval 1s)
+2026-11-03T07:56:35.731Z 76216 [INFO] Cluster: Failure detection started (interval 100ms, node_timeout 5000ms)
+2026-11-03T07:56:35.731Z 76216 [INFO] Ready to accept connections on 0.0.0.0:7002
+2026-11-03T07:56:43.996Z 76216 [INFO] Cluster: Learned own address from an outgoing link: 10.91.1.11
+2026-11-03T07:56:46.011Z 76216 [INFO] Replication: Connecting to master 10.91.1.13:7001...
+2026-11-03T07:56:46.015Z 76216 [INFO] Replication: Full resync from 06ab1b67e2e3b29c747c7488b5658bba9fd620dd offset=0
+2026-11-03T07:56:46.015Z 76216 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-03T07:56:46.016Z 76216 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-03T07:56:46.016Z 76216 [INFO] Replication: AOF is on — rebasing it onto the synced dataset
+2026-11-03T07:56:46.036Z 76216 [INFO] AOF: rebased onto dump.kdb (generation 1) — log is now the delta
+2026-11-03T07:56:46.037Z 76216 [INFO] Replication: Synced with 10.91.1.13:7001. Entering command stream.

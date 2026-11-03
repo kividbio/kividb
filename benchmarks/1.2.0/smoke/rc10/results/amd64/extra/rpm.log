@@ -1,0 +1,17 @@
+PASS: rpm: installs on clean amazonlinux:2023 (/usr/bin/dnf; useradd present before: no)
+PASS: rpm: installs on clean rockylinux/rockylinux:9 (/usr/bin/dnf; useradd present before: yes)
+PASS: rpm: installs on clean almalinux:9 (/usr/bin/dnf; useradd present before: yes)
+PASS: rpm: installs on clean fedora:41 (/usr/bin/dnf; useradd present before: yes)
+PASS: rpm: installs on clean registry.access.redhat.com/ubi9/ubi (/usr/bin/dnf; useradd present before: yes)
+PASS: rpm: installs on clean registry.access.redhat.com/ubi9/ubi-minimal (/usr/bin/microdnf; useradd present before: yes)
+INFO: rpm -qpR (declared requirements): shadow-utils 
+INFO: systemd in container: running
+PASS: rpm: dnf install under systemd (ubi9-init)
+PASS: rpm: postinstall enabled+started the unit, PING on 6380
+PASS: rpm: unit enabled
+PASS: rpm: MainPID runs as user kividb
+PASS: rpm: INFO server kividb_version 1.2.0-rc10
+PASS: rpm: PING/SET/GET
+PASS: rpm: EVAL refused cleanly [ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-rc10-lua, or a kividb-lua release file)], connection still serves
+PASS: rpm-amd64 plain redis-benchmark: 6 tests (	104712	104821	115340	106157	96805	95328 )
+PASS: rpm: dnf remove stops the service

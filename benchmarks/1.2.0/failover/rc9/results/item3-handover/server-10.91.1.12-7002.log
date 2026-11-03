@@ -1,0 +1,155 @@
+2026-11-03T07:56:36.732Z 76702 [WARN] cluster bus port 17002 is not authenticated: any host that can reach it can join this cluster. Set cluster-bus-secret, or restrict the port to cluster members at the network layer.
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc9 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc9
+  * Mode           : cluster
+  * OS             : linux x86_64
+  * Memory         : 31GiB available
+  * CPUs           : 8 cores detected
+  * Listening on   : 0.0.0.0:7002
+  * Cluster bus    : 0.0.0.0:17002
+  * Node timeout   : 5000ms
+  * Node ID        : (printed after cluster init)
+  * Worker threads : 6
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-03T07:56:36.732Z 76702 [INFO] KiviDB 1.2.0-rc9 starting: pid 76702, default build, config file '/data/7002/node.conf'
+2026-11-03T07:56:36.732Z 76702 [INFO] I/O model      : io_uring
+2026-11-03T07:56:36.742Z 76702 [INFO] Cluster: Node ID        : 4a52399711849e87855b040896742b2156720cd6
+2026-11-03T07:56:36.742Z 76702 [INFO] Cluster: Bus port       : 17002
+2026-11-03T07:56:36.742Z 76702 [INFO] Shards per DB  : 64
+2026-11-03T07:56:36.742Z 76702 [INFO] I/O model      : io_uring
+2026-11-03T07:56:36.742Z 76702 [INFO] Cluster: Bus listener bound on 0.0.0.0:17002
+2026-11-03T07:56:36.742Z 76702 [INFO] Cluster: Heartbeat loop started (interval 1s)
+2026-11-03T07:56:36.742Z 76702 [INFO] Cluster: Failure detection started (interval 100ms, node_timeout 5000ms)
+2026-11-03T07:56:36.742Z 76702 [INFO] Ready to accept connections on 0.0.0.0:7002
+2026-11-03T07:56:41.932Z 76702 [INFO] Cluster: Learned own address from an outgoing link: 10.91.1.12
+2026-11-03T07:56:42.941Z 76702 [INFO] Replication: Connecting to master 10.91.1.11:7001...
+2026-11-03T07:56:42.945Z 76702 [INFO] Replication: Full resync from d76e3446fc367edd427814ae63ff02a75969b9cb offset=0
+2026-11-03T07:56:42.945Z 76702 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-03T07:56:42.945Z 76702 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-03T07:56:42.945Z 76702 [INFO] Replication: AOF is on — rebasing it onto the synced dataset
+2026-11-03T07:56:42.964Z 76702 [INFO] AOF: rebased onto dump.kdb (generation 1) — log is now the delta
+2026-11-03T07:56:42.965Z 76702 [INFO] Replication: Synced with 10.91.1.11:7001. Entering command stream.
+2026-11-03T07:56:56.653Z 76702 [INFO] Cluster: Manual failover: starting election at epoch 4 to replace dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9
+2026-11-03T07:56:56.744Z 76702 [INFO] Cluster: Won election at epoch 4 (3 votes, quorum 2)
+2026-11-03T07:56:56.755Z 76702 [INFO] Replication: Promoted; the stream d76e3446fc367edd427814ae63ff02a75969b9cb goes on as 2c9e7db32db674418f6e7c17be0aa638bea3e89e from offset 40642300 — its replicas can be continued
+2026-11-03T07:56:56.760Z 76702 [INFO] Replication: Partial resync for 10.91.1.11:35698: continuing from offset 40642300 (77280 bytes of backlog)
+2026-11-03T07:56:56.853Z 76702 [INFO] Replication: Command stream from 10.91.1.11:7001 superseded (epoch 1) — dropping connection
+2026-11-03T07:56:56.853Z 76702 [INFO] Replication: Replication session for 10.91.1.11:7001 superseded — stopping replication client
+=== round 2
+2026-11-03T07:57:02.307Z 76702 [INFO] Cluster: Manual failover requested by dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 — writes paused, replica must reach offset 48953887
+2026-11-03T07:57:02.308Z 76702 [INFO] Cluster: Voted for dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 to take over from 4a52399711849e87855b040896742b2156720cd6 at epoch 5 (manual failover)
+2026-11-03T07:57:02.330Z 76702 [INFO] Cluster: Slots of this shard are now owned by dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 — following it as a replica
+2026-11-03T07:57:02.330Z 76702 [INFO] Replication: This node's dataset is offset 48953887 of its own stream 2c9e7db32db674418f6e7c17be0aa638bea3e89e: a master that continues that stream can continue this node
+2026-11-03T07:57:02.330Z 76702 [INFO] Replication: Replica 10.91.1.11:35698 disconnected: this node is now a replica itself
+2026-11-03T07:57:02.330Z 76702 [INFO] Replication: uring: replica disconnected
+2026-11-03T07:57:02.330Z 76702 [INFO] Replication: Connecting to master 10.91.1.11:7001...
+2026-11-03T07:57:02.332Z 76702 [INFO] Replication: The master continues 2c9e7db32db674418f6e7c17be0aa638bea3e89e as a2f3a2a5c7a94451daec5b5c0b1e21957568f3b3
+2026-11-03T07:57:02.332Z 76702 [INFO] Replication: Partial resync: continuing from offset 48953887 — no dataset transfer
+2026-11-03T07:57:02.332Z 76702 [INFO] Replication: Synced with 10.91.1.11:7001. Entering command stream.
+2026-11-03T07:57:07.968Z 76702 [INFO] Cluster: Manual failover: starting election at epoch 6 to replace dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9
+2026-11-03T07:57:08.044Z 76702 [INFO] Cluster: Won election at epoch 6 (3 votes, quorum 2)
+2026-11-03T07:57:08.049Z 76702 [INFO] Replication: Promoted; the stream a2f3a2a5c7a94451daec5b5c0b1e21957568f3b3 goes on as 815ddbc78310f3bdb2c4568ed38fbd0d67a7266b from offset 57215192 — its replicas can be continued
+2026-11-03T07:57:08.052Z 76702 [INFO] Replication: Partial resync for 10.91.1.11:38874: continuing from offset 57215192 (0 bytes of backlog)
+2026-11-03T07:57:08.169Z 76702 [INFO] Replication: Command stream from 10.91.1.11:7001 superseded (epoch 3) — dropping connection
+2026-11-03T07:57:08.169Z 76702 [INFO] Replication: Replication session for 10.91.1.11:7001 superseded — stopping replication client
+=== round 4
+2026-11-03T07:57:13.979Z 76702 [INFO] Cluster: Manual failover requested by dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 — writes paused, replica must reach offset 65759753
+2026-11-03T07:57:13.980Z 76702 [INFO] Cluster: Voted for dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 to take over from 4a52399711849e87855b040896742b2156720cd6 at epoch 7 (manual failover)
+2026-11-03T07:57:14.032Z 76702 [INFO] Cluster: Slots of this shard are now owned by dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 — following it as a replica
+2026-11-03T07:57:14.032Z 76702 [INFO] Replication: This node's dataset is offset 65759753 of its own stream 815ddbc78310f3bdb2c4568ed38fbd0d67a7266b: a master that continues that stream can continue this node
+2026-11-03T07:57:14.032Z 76702 [INFO] Replication: Replica 10.91.1.11:38874 disconnected: this node is now a replica itself
+2026-11-03T07:57:14.032Z 76702 [INFO] Replication: uring: replica disconnected
+2026-11-03T07:57:14.032Z 76702 [INFO] Replication: Connecting to master 10.91.1.11:7001...
+2026-11-03T07:57:14.034Z 76702 [INFO] Replication: The master continues 815ddbc78310f3bdb2c4568ed38fbd0d67a7266b as d497fec93e4af64a970b1f0a3b38a3f9cbb962e1
+2026-11-03T07:57:14.034Z 76702 [INFO] Replication: Partial resync: continuing from offset 65759753 — no dataset transfer
+2026-11-03T07:57:14.034Z 76702 [INFO] Replication: Synced with 10.91.1.11:7001. Entering command stream.
+2026-11-03T07:57:16.742Z 76702 [INFO] AOF: auto-checkpoint: 66.40 MB is 100%+ above the 0.00 MB baseline — folding into dump.kdb
+2026-11-03T07:57:16.928Z 76702 [INFO] AOF: rebased onto dump.kdb (generation 2) — log is now the delta
+2026-11-03T07:57:19.640Z 76702 [INFO] Cluster: Manual failover: starting election at epoch 8 to replace dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9
+2026-11-03T07:57:19.744Z 76702 [INFO] Cluster: Won election at epoch 8 (3 votes, quorum 2)
+2026-11-03T07:57:19.758Z 76702 [INFO] Replication: Promoted; the stream d497fec93e4af64a970b1f0a3b38a3f9cbb962e1 goes on as 6c67f898ca0a680326f926df149bb128a0d3fc91 from offset 73892705 — its replicas can be continued
+2026-11-03T07:57:19.761Z 76702 [INFO] Replication: Partial resync for 10.91.1.11:34400: continuing from offset 73892705 (0 bytes of backlog)
+2026-11-03T07:57:19.840Z 76702 [INFO] Replication: Command stream from 10.91.1.11:7001 superseded (epoch 5) — dropping connection
+2026-11-03T07:57:19.840Z 76702 [INFO] Replication: Replication session for 10.91.1.11:7001 superseded — stopping replication client
+=== round 6
+2026-11-03T07:57:25.420Z 76702 [INFO] Cluster: Manual failover requested by dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 — writes paused, replica must reach offset 82253406
+2026-11-03T07:57:25.421Z 76702 [INFO] Cluster: Voted for dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 to take over from 4a52399711849e87855b040896742b2156720cd6 at epoch 9 (manual failover)
+2026-11-03T07:57:25.530Z 76702 [INFO] Cluster: Slots of this shard are now owned by dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 — following it as a replica
+2026-11-03T07:57:25.530Z 76702 [INFO] Replication: This node's dataset is offset 82253406 of its own stream 6c67f898ca0a680326f926df149bb128a0d3fc91: a master that continues that stream can continue this node
+2026-11-03T07:57:25.530Z 76702 [INFO] Replication: Replica 10.91.1.11:34400 disconnected: this node is now a replica itself
+2026-11-03T07:57:25.530Z 76702 [INFO] Replication: uring: replica disconnected
+2026-11-03T07:57:25.530Z 76702 [INFO] Replication: Connecting to master 10.91.1.11:7001...
+2026-11-03T07:57:25.532Z 76702 [INFO] Replication: The master continues 6c67f898ca0a680326f926df149bb128a0d3fc91 as e9ba5b01b778d94de3848d8882b2b139e64d535f
+2026-11-03T07:57:25.532Z 76702 [INFO] Replication: Partial resync: continuing from offset 82253406 — no dataset transfer
+2026-11-03T07:57:25.532Z 76702 [INFO] Replication: Synced with 10.91.1.11:7001. Entering command stream.
+2026-11-03T07:57:31.520Z 76702 [INFO] Cluster: Manual failover: starting election at epoch 10 to replace dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9
+2026-11-03T07:57:31.543Z 76702 [INFO] Cluster: Won election at epoch 10 (3 votes, quorum 2)
+2026-11-03T07:57:31.548Z 76702 [INFO] Replication: Promoted; the stream e9ba5b01b778d94de3848d8882b2b139e64d535f goes on as c62737ea80e3c72b16fcc9a69886f94364e0382c from offset 90881752 — its replicas can be continued
+2026-11-03T07:57:31.551Z 76702 [INFO] Replication: Partial resync for 10.91.1.11:41928: continuing from offset 90881752 (0 bytes of backlog)
+2026-11-03T07:57:31.721Z 76702 [INFO] Replication: Command stream from 10.91.1.11:7001 superseded (epoch 7) — dropping connection
+2026-11-03T07:57:31.721Z 76702 [INFO] Replication: Replication session for 10.91.1.11:7001 superseded — stopping replication client
+=== round 8
+2026-11-03T07:57:37.204Z 76702 [INFO] Cluster: Manual failover requested by dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 — writes paused, replica must reach offset 99290497
+2026-11-03T07:57:37.207Z 76702 [INFO] Cluster: Voted for dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 to take over from 4a52399711849e87855b040896742b2156720cd6 at epoch 11 (manual failover)
+2026-11-03T07:57:37.229Z 76702 [INFO] Cluster: Slots of this shard are now owned by dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 — following it as a replica
+2026-11-03T07:57:37.229Z 76702 [INFO] Replication: This node's dataset is offset 99290497 of its own stream c62737ea80e3c72b16fcc9a69886f94364e0382c: a master that continues that stream can continue this node
+2026-11-03T07:57:37.229Z 76702 [INFO] Replication: Replica 10.91.1.11:41928 disconnected: this node is now a replica itself
+2026-11-03T07:57:37.229Z 76702 [INFO] Replication: uring: replica disconnected
+2026-11-03T07:57:37.229Z 76702 [INFO] Replication: Connecting to master 10.91.1.11:7001...
+2026-11-03T07:57:37.231Z 76702 [INFO] Replication: The master continues c62737ea80e3c72b16fcc9a69886f94364e0382c as 6bf6a944bd3d22ec7565c6c882dd1b862f8ae2b1
+2026-11-03T07:57:37.231Z 76702 [INFO] Replication: Partial resync: continuing from offset 99290497 — no dataset transfer
+2026-11-03T07:57:37.231Z 76702 [INFO] Replication: Synced with 10.91.1.11:7001. Entering command stream.
+2026-11-03T07:57:42.874Z 76702 [INFO] Cluster: Manual failover: starting election at epoch 12 to replace dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9
+2026-11-03T07:57:42.944Z 76702 [INFO] Cluster: Won election at epoch 12 (3 votes, quorum 2)
+2026-11-03T07:57:42.949Z 76702 [INFO] Replication: Promoted; the stream 6bf6a944bd3d22ec7565c6c882dd1b862f8ae2b1 goes on as a3dec99d2f2ebfac2c6cf63e5267704791ff2b71 from offset 107304222 — its replicas can be continued
+2026-11-03T07:57:42.953Z 76702 [INFO] Replication: Partial resync for 10.91.1.11:47172: continuing from offset 107304222 (0 bytes of backlog)
+2026-11-03T07:57:43.075Z 76702 [INFO] Replication: Command stream from 10.91.1.11:7001 superseded (epoch 9) — dropping connection
+2026-11-03T07:57:43.075Z 76702 [INFO] Replication: Replication session for 10.91.1.11:7001 superseded — stopping replication client
+=== round 10
+2026-11-03T07:57:48.533Z 76702 [INFO] Cluster: Manual failover requested by dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 — writes paused, replica must reach offset 115580785
+2026-11-03T07:57:48.534Z 76702 [INFO] Cluster: Voted for dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 to take over from 4a52399711849e87855b040896742b2156720cd6 at epoch 13 (manual failover)
+2026-11-03T07:57:48.634Z 76702 [INFO] Cluster: Slots of this shard are now owned by dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 — following it as a replica
+2026-11-03T07:57:48.634Z 76702 [INFO] Replication: This node's dataset is offset 115580785 of its own stream a3dec99d2f2ebfac2c6cf63e5267704791ff2b71: a master that continues that stream can continue this node
+2026-11-03T07:57:48.634Z 76702 [INFO] Replication: Replica 10.91.1.11:47172 disconnected: this node is now a replica itself
+2026-11-03T07:57:48.634Z 76702 [INFO] Replication: uring: replica disconnected
+2026-11-03T07:57:48.634Z 76702 [INFO] Replication: Connecting to master 10.91.1.11:7001...
+2026-11-03T07:57:48.640Z 76702 [INFO] Replication: The master continues a3dec99d2f2ebfac2c6cf63e5267704791ff2b71 as d15bd2199b4a2708a437d1d3e660bb2f58fb55a8
+2026-11-03T07:57:48.640Z 76702 [INFO] Replication: Partial resync: continuing from offset 115580785 — no dataset transfer
+2026-11-03T07:57:48.640Z 76702 [INFO] Replication: Synced with 10.91.1.11:7001. Entering command stream.

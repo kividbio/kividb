@@ -1,0 +1,4 @@
+keys before restart: master 2427262 replica 2427215
+master exited after 3.26 s; last master offset seen 6679391540; replica offset after the exit 6680322984; replica minus master: 931444 bytes
+after the restart (1 s samples, 357): final sync_full=22 sync_partial_ok=0; link-down samples=278; last link-down at 367 s after the start
+master log: evictions=22

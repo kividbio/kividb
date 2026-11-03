@@ -1,0 +1,12 @@
+1,1.77,5.1,0,1,partial,has the whole stream, to offset 1876599463 (10 ms)
+2,1.40,5.1,0,1,partial,has the whole stream, to offset 2776398326 (10 ms)
+3,1.77,5.1,0,1,partial,has the whole stream, to offset 3595627076 (10 ms)
+4,1.30,5.1,0,1,partial,has the whole stream, to offset 4394025466 (10 ms)
+5,2.38,5.1,0,1,partial,has the whole stream, to offset 5190586962 (10 ms)
+6,2.18,5.1,0,1,partial,has the whole stream, to offset 5974982216 (67 ms)
+7,2.45,5.1,0,1,partial,has the whole stream, to offset 6768510893 (10 ms)
+8,1.30,5.1,0,1,partial,has the whole stream, to offset 7557095235 (10 ms)
+9,2.53,5.1,0,1,partial,has the whole stream, to offset 8350038522 (10 ms)
+10,1.30,5.1,0,1,partial,has the whole stream, to offset 9134085566 (26 ms)
+kividb: 10 partial of 10; soakgen errors 11820
+R306-DONE kividb

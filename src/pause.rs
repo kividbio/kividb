@@ -1,5 +1,5 @@
 // src/pause.rs
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, AtomicUsize, Ordering};
 
 /// Global pause expiry in Unix milliseconds.
 /// 0 = not paused. Positive = writes are paused until this timestamp.
@@ -45,7 +45,16 @@ static PAUSE_MODE_WRITE_ONLY: std::sync::atomic::AtomicBool =
 /// Not set for `CLIENT PAUSE`: nothing is handed over, so a write that slips
 /// past it is merely a moment late in being paused, and waiting for it in
 /// the gate would hold a worker thread for as long as the client asked.
-static HANDOFF: AtomicBool = AtomicBool::new(false);
+///
+/// The same flag, a second bit of it, is up while a `MIGRATE` holds keys
+/// here ([`KEYS_MOVING`], see `key_moves`): one load still tells a write
+/// whether it has anything to look at ([`writes_must_check`]).
+static HANDOFF: AtomicU8 = AtomicU8::new(0);
+
+/// [`HANDOFF`]: a handoff's pause is in force.
+const HANDOFF_PAUSE: u8 = 1;
+/// [`HANDOFF`]: a `MIGRATE` is moving keys (`key_moves`).
+const KEYS_MOVING: u8 = 2;
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -67,7 +76,7 @@ pub fn active() -> Option<bool> {
             .is_ok()
         {
             // A handoff that ran out of time is over, like its pause.
-            HANDOFF.store(false, Ordering::Release);
+            HANDOFF.fetch_and(!HANDOFF_PAUSE, Ordering::Release);
         }
         return None;
     }
@@ -112,7 +121,7 @@ pub fn clear_pause() {
     if held && HELD.load(Ordering::SeqCst) == 0 {
         let _ = PAUSE_UNTIL_MS.compare_exchange(ENDING, 0, Ordering::SeqCst, Ordering::SeqCst);
     }
-    HANDOFF.store(false, Ordering::Release);
+    HANDOFF.fetch_and(!HANDOFF_PAUSE, Ordering::Release);
     CHANGED.notify_waiters();
 }
 
@@ -215,7 +224,7 @@ impl Drop for Ran {
 pub fn set_handoff_pause(duration_ms: i64) {
     // The flag first, and before the caller's cut: a write that enters the
     // gate after that cut is certain to see it.
-    HANDOFF.store(true, Ordering::SeqCst);
+    HANDOFF.fetch_or(HANDOFF_PAUSE, Ordering::SeqCst);
     set_pause(duration_ms, true);
 }
 
@@ -239,7 +248,26 @@ pub fn hold_writes() {
 /// again: a handoff is under way. One atomic load when none is.
 #[inline]
 pub fn handoff() -> bool {
-    HANDOFF.load(Ordering::Acquire) && active().is_some()
+    HANDOFF.load(Ordering::Acquire) & HANDOFF_PAUSE != 0 && active().is_some()
+}
+
+/// Whether a write that has just entered the write gate has anything to
+/// look at: a handoff ([`handoff`]), or a `MIGRATE` moving keys
+/// (`key_moves::names_a_moving_key`). One atomic load when neither is.
+#[inline]
+pub fn writes_must_check() -> bool {
+    HANDOFF.load(Ordering::Acquire) != 0
+}
+
+/// `MIGRATE` holds keys here, or no longer does (`key_moves`, under its
+/// lock). Before `MIGRATE` waits out the writes in the gate: a write that
+/// enters the gate after that is certain to see it.
+pub(crate) fn set_keys_moving(on: bool) {
+    if on {
+        HANDOFF.fetch_or(KEYS_MOVING, Ordering::SeqCst);
+    } else {
+        HANDOFF.fetch_and(!KEYS_MOVING, Ordering::SeqCst);
+    }
 }
 
 /// Wait for the handoff to end. Called by a write command, outside the write

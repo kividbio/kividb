@@ -33,6 +33,11 @@ pub use node::{
 pub use routing::{RouteDecision, clusterdown_error, crossslot_error, moved_error, route_command};
 pub use slot::{CLUSTER_SLOTS, crc16, key_hash_slot};
 
+/// How long a slot assigned or removed here by `SETSLOT NODE` or `DELSLOTS`
+/// keeps that assignment whatever a peer claims, unless another command
+/// changes it (see `ClusterState::note_by_hand`).
+pub const BY_HAND_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 use ahash::AHashMap;
 use parking_lot::RwLock;
 use std::path::PathBuf;
@@ -224,6 +229,10 @@ pub struct ClusterState {
     /// "Reporter believes reportee is failing as of timestamp."
     /// Reports older than 2*node_timeout are discarded as stale.
     pub failure_reports: RwLock<AHashMap<NodeId, AHashMap<NodeId, u64>>>,
+    /// Peers whose address is still the one nodes.conf gave us: none of
+    /// them has reached us since this process started. A node that moved
+    /// while we were down is only reachable at an address a peer relays.
+    pub(crate) unconfirmed_addresses: RwLock<ahash::AHashSet<NodeId>>,
     /// The epoch at which we last cast a FAILOVER_AUTH_ACK. Prevents voting
     /// twice in the same epoch — a key safety property of the Raft-like
     /// election. Persisted to nodes.conf.
@@ -238,6 +247,12 @@ pub struct ClusterState {
     pub migrations: RwLock<AHashMap<u16, MigrationState>>,
     /// Atomic slot migrations (`CLUSTER MIGRATION`), running and recent.
     pub slot_migrations: migration::Registry,
+    /// Slots assigned with `SETSLOT NODE` or removed with `DELSLOTS` here,
+    /// and when: for
+    /// [`BY_HAND_GRACE`] a peer's claim does not change them (see
+    /// [`Self::note_by_hand`]). Taken after `slots` and `migrations`, and
+    /// nothing is taken while it is held.
+    pub by_hand: parking_lot::Mutex<AHashMap<u16, std::time::Instant>>,
     /// Nodes removed with `CLUSTER FORGET`, and until when (Unix ms) they are
     /// refused re-admission.
     pub forgotten: RwLock<AHashMap<NodeId, u64>>,
@@ -322,11 +337,13 @@ impl ClusterState {
             config_path,
             node_timeout_ms,
             failure_reports: RwLock::new(AHashMap::new()),
+            unconfirmed_addresses: RwLock::new(ahash::AHashSet::new()),
             last_vote_epoch: AtomicU64::new(last_vote_epoch),
             election: parking_lot::Mutex::new(None),
             election_pending: AtomicBool::new(false),
             migrations: RwLock::new(AHashMap::new()),
             slot_migrations: migration::Registry::default(),
+            by_hand: parking_lot::Mutex::new(AHashMap::new()),
             forgotten: RwLock::new(AHashMap::new()),
             last_vote_for: parking_lot::Mutex::new(AHashMap::new()),
             hooks: std::sync::OnceLock::new(),
@@ -576,6 +593,7 @@ impl ClusterState {
     fn start_the_clock_on_peers(&self) {
         let now = now_ms() + self.node_timeout_ms;
         let me = self.myself();
+        let mut unconfirmed = ahash::AHashSet::new();
         for node in self.nodes.write().values_mut() {
             if node.id == me {
                 continue;
@@ -583,7 +601,9 @@ impl ClusterState {
             node.ping_sent_ms = 0;
             node.pong_received_ms = now;
             node.flags.remove(NodeFlags::PFAIL);
+            unconfirmed.insert(node.id);
         }
+        *self.unconfirmed_addresses.write() = unconfirmed;
         self.failure_reports.write().clear();
     }
 
@@ -1210,22 +1230,85 @@ impl ClusterState {
         Ok(())
     }
 
-    /// Release a slot we own. Errors if the slot isn't currently owned by us.
+    /// Remove a slot from this node's view of the cluster: CLUSTER DELSLOTS.
+    /// See [`Self::release_slots`].
     pub fn release_slot(&self, slot: u16) -> Result<(), String> {
+        self.release_slots(&[slot]).map(|_| ())
+    }
+
+    /// Remove `list` from this node's view of the cluster, whoever owns each
+    /// slot, as Redis's DELSLOTS does. Errors if one of them is unassigned
+    /// here already, and then changes none.
+    ///
+    /// Only this node's view changes. The owner's next claim of a slot it
+    /// still holds wins it back here, unless ADDSLOTS or SETSLOT gives it to
+    /// another node first. That is how `redis-cli --cluster fix` closes a slot
+    /// an interrupted reshard left open: it picks one owner, and on each other
+    /// node that has keys in the slot, deletes the slot and sets it importing
+    /// from that owner, before moving the keys there. A node refused a slot
+    /// another node owned, and the keys already moved stayed where no client
+    /// was sent for them (#295). An IMPORTING state of the slot goes with
+    /// it, as in Redis: the node is no longer taking the slot from anyone.
+    ///
+    /// For [`BY_HAND_GRACE`] after, a peer's claim of the slot does not take
+    /// it back (see [`Self::note_by_hand`]). Fix sends `MULTI`, `DELSLOTS`, `ADDSLOTS`, `BUMPEPOCH`,
+    /// `EXEC` to the owner it picks. In Redis nothing comes between the
+    /// commands of a transaction; here the cluster bus applies claims on a
+    /// thread of its own, and DELSLOTS saves `nodes.conf` before ADDSLOTS
+    /// runs: the old owner's claim, arriving in that moment, took the slot
+    /// back, and ADDSLOTS failed with `Slot N is already busy`.
+    pub fn release_slots(&self, list: &[u16]) -> Result<usize, String> {
         if !self.enabled {
             return Err("This instance has cluster support disabled".into());
         }
-        if slot as usize >= CLUSTER_SLOTS {
+        if let Some(slot) = list.iter().find(|&&s| s as usize >= CLUSTER_SLOTS) {
             return Err(format!("Invalid slot {slot}"));
         }
+        // `slots` before `migrations`, as everywhere (see `ClusterState`).
         let mut slots = self.slots.write();
-        match slots[slot as usize] {
-            Some(owner) if owner == self.myself() => {
-                slots[slot as usize] = None;
-                Ok(())
+        if let Some(slot) = list.iter().find(|&&s| slots[s as usize].is_none()) {
+            return Err(format!("Slot {slot} is already unassigned"));
+        }
+        let mut migrations = self.migrations.write();
+        for &slot in list {
+            slots[slot as usize] = None;
+            if matches!(
+                migrations.get(&slot),
+                Some(MigrationState::Importing { .. })
+            ) {
+                migrations.remove(&slot);
             }
-            Some(_) => Err(format!("Slot {slot} is owned by another node")),
-            None => Err(format!("Slot {slot} is already unassigned")),
+        }
+        self.note_by_hand(list.iter().copied());
+        Ok(list.len())
+    }
+
+    /// Note that `slots` were just assigned (`SETSLOT NODE`) or removed
+    /// (`DELSLOTS`) here: for [`BY_HAND_GRACE`],
+    /// [`Self::apply_peer_slot_claims`] leaves them as they are.
+    ///
+    /// Not `ADDSLOTS`: that is how a cluster is first laid out, and a
+    /// failover straight after must not wait.
+    ///
+    /// A peer's claim can be older than the command. `redis-cli --cluster
+    /// reshard` moves a slot with `SETSLOT NODE` to the target, then the
+    /// source, then the others. A heartbeat the source sent just before its
+    /// `SETSLOT` still claims the slot, at the source's epoch. Heartbeats go
+    /// once a second, so the target's own new epoch, taken from the highest
+    /// it has heard of, can be below the source's latest, after the source
+    /// was itself the target of the previous reshard. That claim then took
+    /// the slot from the target, which no longer claimed it, while the
+    /// source had given it away: no node served it, and the next reshard or
+    /// fix found `Not all 16384 slots are covered`. The same claim arriving
+    /// between fix's `DELSLOTS` and `ADDSLOTS` failed the `ADDSLOTS` ("Slot
+    /// N is already busy"). After the grace the claim is gone, and claims
+    /// are weighed by epoch as before.
+    fn note_by_hand(&self, slots: impl IntoIterator<Item = u16>) {
+        let mut by_hand = self.by_hand.lock();
+        let now = std::time::Instant::now();
+        by_hand.retain(|_, at| now.duration_since(*at) < BY_HAND_GRACE);
+        for slot in slots {
+            by_hand.insert(slot, now);
         }
     }
 
@@ -1258,7 +1341,7 @@ impl ClusterState {
         Ok((end - start + 1) as usize)
     }
 
-    /// Release a contiguous range. Atomic in the same sense.
+    /// Release a contiguous range: [`Self::release_slots`], all or nothing.
     pub fn release_slot_range(&self, start: u16, end: u16) -> Result<usize, String> {
         if !self.enabled {
             return Err("This instance has cluster support disabled".into());
@@ -1266,21 +1349,7 @@ impl ClusterState {
         if start > end {
             return Err(format!("Invalid range {start}-{end}"));
         }
-        if (end as usize) >= CLUSTER_SLOTS {
-            return Err(format!("Invalid slot {end}"));
-        }
-        let mut slots = self.slots.write();
-        for i in start..=end {
-            match slots[i as usize] {
-                Some(owner) if owner == self.myself() => {}
-                Some(_) => return Err(format!("Slot {i} is owned by another node")),
-                None => return Err(format!("Slot {i} is already unassigned")),
-            }
-        }
-        for i in start..=end {
-            slots[i as usize] = None;
-        }
-        Ok((end - start + 1) as usize)
+        self.release_slots(&(start..=end).collect::<Vec<u16>>())
     }
 
     /// Wipe all slot ownership records on this node. Used by FLUSHSLOTS.
@@ -1417,10 +1486,18 @@ impl ClusterState {
             // waited for good.
             let mut slots = self.slots.write();
             let migrations = self.migrations.read();
+            let by_hand = self.by_hand.lock();
             for claim in claims {
                 for slot in claim.start..=claim.end {
                     let i = slot as usize;
                     if i >= CLUSTER_SLOTS || slots[i] == Some(owner_id) {
+                        continue;
+                    }
+                    // Just assigned or removed here by hand: see `note_by_hand`.
+                    if by_hand
+                        .get(&slot)
+                        .is_some_and(|at| at.elapsed() < BY_HAND_GRACE)
+                    {
                         continue;
                     }
                     // A slot we are importing is ours to finalise with
@@ -2181,6 +2258,7 @@ impl ClusterState {
         }
         self.slots.write()[slot as usize] = Some(new_owner);
         self.migrations.write().remove(&slot);
+        self.note_by_hand([slot]);
         Ok(())
     }
 
@@ -2585,6 +2663,92 @@ mod tests {
         let b = add_master(&cs, 10923..=16383);
         cs.refresh_state();
         (cs, a, b)
+    }
+
+    // ── DELSLOTS ─────────────────────────────────────────────────────────
+
+    /// A slot just given to a node by `SETSLOT NODE` keeps its owner for a
+    /// moment whatever a peer claims: the old owner's last heartbeat, sent
+    /// before its own `SETSLOT`, can claim it at a higher epoch than the new
+    /// owner's. That claim used to take the slot from the new owner, and no
+    /// node served it. Afterwards, claims are weighed by epoch as before.
+    #[test]
+    fn a_slot_set_by_hand_is_not_taken_by_an_older_claim() {
+        let (cs, a, _b) = three_master_cluster();
+        let me = cs.myself();
+        // `a` had slot 5461 and is a reshard's source; this node, the target,
+        // has just been given it.
+        cs.finalize_slot(5461, me).unwrap();
+        let stale = [crate::cluster::bus::SlotClaim {
+            start: 5461,
+            end: 5461,
+            epoch: 1_000_000,
+        }];
+        cs.apply_peer_slot_claims(a, &stale);
+        assert_eq!(cs.slot_owner(5461), Some(me));
+
+        let past = std::time::Instant::now()
+            .checked_sub(BY_HAND_GRACE * 2)
+            .unwrap();
+        for at in cs.by_hand.lock().values_mut() {
+            *at = past;
+        }
+        cs.apply_peer_slot_claims(a, &stale);
+        assert_eq!(cs.slot_owner(5461), Some(a));
+    }
+
+    /// DELSLOTS clears a slot from this node's view whoever owns it, and
+    /// with it the slot's IMPORTING state, as in Redis (#295). Only a slot that
+    /// is unassigned here already is refused, and then nothing changes.
+    #[test]
+    fn delslots_clears_a_slot_whoever_owns_it() {
+        let (cs, a, b) = three_master_cluster();
+        // Another node's slot, open here as an interrupted reshard leaves it.
+        cs.set_importing(5461, a).unwrap();
+        cs.release_slot(5461).unwrap();
+        assert_eq!(cs.slot_owner(5461), None);
+        assert_eq!(cs.migration_state(5461), None);
+        assert_eq!(
+            cs.release_slot(5461).unwrap_err(),
+            "Slot 5461 is already unassigned"
+        );
+
+        // All or nothing.
+        assert_eq!(
+            cs.release_slot_range(5460, 5462).unwrap_err(),
+            "Slot 5461 is already unassigned"
+        );
+        assert_eq!(
+            cs.release_slots(&[10923, 5461]).unwrap_err(),
+            "Slot 5461 is already unassigned"
+        );
+        assert_eq!(cs.slot_owner(5460), Some(cs.myself()));
+        assert_eq!(cs.slot_owner(5462), Some(a));
+        assert_eq!(cs.slot_owner(10923), Some(b));
+        assert_eq!(cs.release_slot_range(5462, 5470), Ok(9));
+        assert_eq!(cs.slot_owner(5470), None);
+
+        // The owner's own claim does not take them back at once: the
+        // ADDSLOTS that follows in `redis-cli --cluster fix`'s transaction
+        // must find them free.
+        let claim = [crate::cluster::bus::SlotClaim {
+            start: 5461,
+            end: 5470,
+            epoch: 1,
+        }];
+        cs.apply_peer_slot_claims(a, &claim);
+        assert_eq!(cs.slot_owner(5461), None);
+        assert!(cs.claim_slot(5461).is_ok());
+        assert_eq!(cs.slot_owner(5461), Some(cs.myself()));
+        // After the grace, the owner's claim wins the rest back.
+        let past = std::time::Instant::now()
+            .checked_sub(BY_HAND_GRACE * 2)
+            .unwrap();
+        for at in cs.by_hand.lock().values_mut() {
+            *at = past;
+        }
+        cs.apply_peer_slot_claims(a, &claim);
+        assert!((5462..=5470).all(|s| cs.slot_owner(s) == Some(a)));
     }
 
     // ── Quorum ───────────────────────────────────────────────────────────

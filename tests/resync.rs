@@ -137,6 +137,8 @@ struct Server {
     dir: PathBuf,
     child: Child,
     args: Vec<String>,
+    /// Environment of its own, for the test hooks.
+    env: Vec<(String, String)>,
 }
 
 /// Whether nothing has `port`. It is asked with a socket that is bound and
@@ -176,6 +178,10 @@ fn free_port() -> u16 {
 }
 
 fn kividb(dir: &Path, port: u16, extra: &[String]) -> Child {
+    kividb_with(dir, port, extra, &[])
+}
+
+fn kividb_with(dir: &Path, port: u16, extra: &[String], env: &[(String, String)]) -> Child {
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -196,6 +202,7 @@ fn kividb(dir: &Path, port: u16, extra: &[String]) -> Child {
             "kividb.conf",
         ])
         .args(extra)
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(log)
@@ -205,15 +212,24 @@ fn kividb(dir: &Path, port: u16, extra: &[String]) -> Child {
 
 impl Server {
     fn start(extra: &[&str]) -> Self {
+        Self::start_with_env(extra, &[])
+    }
+
+    fn start_with_env(extra: &[&str], env: &[(&str, &str)]) -> Self {
         let dir = tempfile::tempdir().unwrap().keep();
         let port = free_port();
         let args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
-        let child = kividb(&dir, port, &args);
+        let env: Vec<(String, String)> = env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let child = kividb_with(&dir, port, &args, &env);
         let server = Server {
             port,
             dir,
             child,
             args,
+            env,
         };
         assert_eq!(server.conn().cmd(&["PING"]).s(), "PONG");
         server
@@ -244,7 +260,7 @@ impl Server {
     }
 
     fn restart(&mut self) {
-        self.child = kividb(&self.dir, self.port, &self.args);
+        self.child = kividb_with(&self.dir, self.port, &self.args, &self.env);
         assert_eq!(self.conn().cmd(&["PING"]).s(), "PONG");
     }
 }
@@ -269,6 +285,12 @@ struct Relay {
     /// How many bytes a connection may carry from the master before it is
     /// cut. `u64::MAX`: as many as it likes.
     budget: Arc<std::sync::atomic::AtomicU64>,
+    /// While set, nothing is carried from the master, and the connections
+    /// stay open: the replica is connected, and receives nothing.
+    paused: Arc<AtomicBool>,
+    /// A connection that has carried this many bytes from the master
+    /// pauses the relay. `u64::MAX`: none does.
+    pause_at: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Relay {
@@ -278,8 +300,15 @@ impl Relay {
         let open = Arc::new(AtomicBool::new(true));
         let live: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
         let budget = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
-        let (open_bg, live_bg, budget_bg) =
-            (Arc::clone(&open), Arc::clone(&live), Arc::clone(&budget));
+        let paused = Arc::new(AtomicBool::new(false));
+        let pause_at = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let (open_bg, live_bg, budget_bg, paused_bg, pause_at_bg) = (
+            Arc::clone(&open),
+            Arc::clone(&live),
+            Arc::clone(&budget),
+            Arc::clone(&paused),
+            Arc::clone(&pause_at),
+        );
         std::thread::spawn(move || {
             for client in listener.incoming().flatten() {
                 if !open_bg.load(Ordering::SeqCst) {
@@ -305,10 +334,15 @@ impl Relay {
                     let (mut from, mut to) =
                         (upstream.try_clone().unwrap(), client.try_clone().unwrap());
                     let budget = budget_bg.load(Ordering::SeqCst);
+                    let paused = Arc::clone(&paused_bg);
+                    let pause_at = Arc::clone(&pause_at_bg);
                     std::thread::spawn(move || {
                         let mut carried = 0u64;
                         let mut buf = [0u8; 16 * 1024];
                         loop {
+                            while paused.load(Ordering::SeqCst) {
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
                             let n = match from.read(&mut buf) {
                                 Ok(0) | Err(_) => break,
                                 Ok(n) => n,
@@ -320,6 +354,9 @@ impl Relay {
                             carried += allowed as u64;
                             if carried >= budget {
                                 break;
+                            }
+                            if carried >= pause_at.load(Ordering::SeqCst) {
+                                paused.store(true, Ordering::SeqCst);
                             }
                         }
                         let _ = to.shutdown(Shutdown::Both);
@@ -335,7 +372,27 @@ impl Relay {
             open,
             live,
             budget,
+            paused,
+            pause_at,
         }
+    }
+
+    /// Pause, as [`Self::pause`] does, once a connection has carried this
+    /// many bytes from the master: in the middle of a full sync's payload,
+    /// for one larger than that.
+    fn pause_after(&self, bytes: u64) {
+        self.pause_at.store(bytes, Ordering::SeqCst);
+    }
+
+    /// Carry nothing more from the master until [`Self::resume`], with the
+    /// connections left open.
+    fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+    }
+
+    fn resume(&self) {
+        self.pause_at.store(u64::MAX, Ordering::SeqCst);
+        self.paused.store(false, Ordering::SeqCst);
     }
 
     /// From now on, cut each new connection once it has carried this many
@@ -576,6 +633,301 @@ fn a_cleanly_restarted_master_continues_its_replicas() {
     wait_link_up(&mut r);
     assert_same_dataset(&mut m, &mut r);
     assert_eq!(m.stat("sync_full"), 0);
+}
+
+/// Writes up to the moment of the shutdown, keys and hash fields expiring
+/// through it, and a replica `PING` every second: a master stopped cleanly
+/// still continues its replica (#306). Its final save records the offset at
+/// its cut, and the replica used to end a few bytes away from it: behind,
+/// by writes and expiries not yet delivered when the process exited, or
+/// ahead, by a `PING` or a `DEL` written after the cut. Either way the
+/// restarted master sent it the whole dataset again.
+#[test]
+fn a_master_stopped_under_writes_with_keys_expiring_continues_its_replica() {
+    let mut master = Server::start(&["--aof", "--repl-ping-replica-period", "1"]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port, "--aof"]);
+    let mut r = replica.conn();
+    for round in 0..3 {
+        let mut m = master.conn();
+        write_batch(&mut m, round, 30);
+        wait_link_up(&mut r);
+        // Keys and fields that expire around the shutdown, and writes until
+        // it starts: no time for the replica to have them all.
+        for i in 0..200 {
+            let ttl = (50 + 7 * i).to_string();
+            assert!(
+                m.cmd(&["SET", &format!("ttl:{round}:{i}"), "v", "PX", &ttl])
+                    .ok()
+            );
+            let hash = format!("h:{round}:{}", i % 20);
+            let field = format!("f{i}");
+            m.cmd(&["HSET", &hash, &field, "v"]);
+            m.cmd(&["HPEXPIRE", &hash, &ttl, "FIELDS", "1", &field]);
+            m.cmd(&["INCR", "counter"]);
+        }
+        drop(m);
+        master.shutdown();
+        let log = master.log();
+        assert!(
+            log.matches("has the whole stream").count() > round,
+            "round {round}: the master did not see its replica take the whole stream:\n{log}"
+        );
+        master.restart();
+        let mut m = master.conn();
+        wait_link_up(&mut r);
+        assert_eq!(
+            m.stat("sync_full"),
+            0,
+            "round {round}: the replica was sent the dataset again:\n{}\n{}",
+            master.log(),
+            replica.log()
+        );
+        assert_eq!(m.stat("sync_partial_ok"), 1, "round {round}");
+        // Every key and field with a TTL has gone by now, on both sides.
+        std::thread::sleep(Duration::from_millis(2000));
+        assert_same_dataset(&mut m, &mut r);
+    }
+}
+
+/// The shutdown's wait for its replicas lasts at most `shutdown-timeout`,
+/// and `SHUTDOWN NOW` does not wait at all.
+#[test]
+fn a_shutdown_waits_for_a_silent_replica_no_longer_than_shutdown_timeout() {
+    let mut master = Server::start(&["--aof"]);
+    let relay = Relay::to(master.port);
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &relay.port.to_string()]);
+    let (mut m, mut r) = (master.conn(), replica.conn());
+    assert_eq!(
+        m.cmd(&["CONFIG", "GET", "shutdown-timeout"]).arr()[1].s(),
+        "10"
+    );
+    write_batch(&mut m, 0, 20);
+    wait_link_up(&mut r);
+    assert_same_dataset(&mut m, &mut r);
+
+    // Connected, and receiving nothing: it never acknowledges what follows.
+    relay.pause();
+    write_batch(&mut m, 1, 20);
+    let started = Instant::now();
+    let _ = m.writer.write_all(b"*2\r\n$8\r\nSHUTDOWN\r\n$3\r\nNOW\r\n");
+    while master.child.try_wait().unwrap().is_none() {
+        assert!(started.elapsed() < Duration::from_secs(20), "no exit");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let now_took = started.elapsed();
+    assert!(
+        now_took < Duration::from_secs(5),
+        "SHUTDOWN NOW waited {now_took:?}"
+    );
+    assert!(!master.log().contains("did not acknowledge"));
+
+    relay.resume();
+    master.restart();
+    let mut m = master.conn();
+    wait_link_up(&mut r);
+    assert_same_dataset(&mut m, &mut r);
+    assert!(m.cmd(&["CONFIG", "SET", "shutdown-timeout", "2"]).ok());
+    assert_eq!(
+        m.cmd(&["CONFIG", "GET", "shutdown-timeout"]).arr()[1].s(),
+        "2"
+    );
+    relay.pause();
+    write_batch(&mut m, 2, 20);
+    drop(m);
+    let started = Instant::now();
+    master.shutdown();
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_secs(2) && took < Duration::from_secs(10),
+        "the shutdown took {took:?}"
+    );
+    assert!(
+        master
+            .log()
+            .contains("did not acknowledge the end of the stream"),
+        "{}",
+        master.log()
+    );
+    relay.resume();
+}
+
+/// `queued=` of the master's `slave0` line, or `None` while it has none.
+fn queued(master: &mut Conn) -> Option<u64> {
+    let info = master.cmd(&["INFO", "replication"]);
+    let row = info
+        .s()
+        .lines()
+        .find(|l| l.starts_with("slave0:"))?
+        .to_string();
+    row.split(',')
+        .find_map(|kv| kv.strip_prefix("queued="))
+        .map(|n| n.trim().parse().unwrap())
+}
+
+/// A master whose replica's full sync is held up by `pause_after`, with
+/// 20 MB in its dataset and `repl-replica-max-backlog-bytes` 1 MB; and 4 MB
+/// written while the replica can read nothing.
+fn full_sync_with_writes_queued(sync_limit: &str) -> (Server, Relay, Server) {
+    // A backlog smaller than the queue the sync is allowed: it is the larger
+    // of the two that applies, and a replica dropped from its sync is then
+    // sent the dataset again.
+    let master = Server::start(&[
+        "--repl-replica-max-backlog-bytes",
+        "1048576",
+        "--repl-backlog-size",
+        "1048576",
+    ]);
+    let mut m = master.conn();
+    assert!(
+        m.cmd(&[
+            "CONFIG",
+            "SET",
+            "repl-replica-sync-max-backlog-bytes",
+            sync_limit
+        ])
+        .ok()
+    );
+    let value = "v".repeat(1000);
+    for i in 0..20_000 {
+        assert!(m.cmd(&["SET", &format!("base:{i}"), &value]).ok());
+    }
+    let relay = Relay::to(master.port);
+    // The handshake goes through, and the payload stops part-way.
+    relay.pause_after(64 * 1024);
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &relay.port.to_string()]);
+    wait_until("the master to register its replica", || {
+        queued(&mut m).is_some()
+    });
+    for i in 0..4_000 {
+        assert!(m.cmd(&["SET", &format!("during:{i}"), &value]).ok());
+    }
+    assert!(m.cmd(&["INCR", "counter"]).i() > 0);
+    (master, relay, replica)
+}
+
+/// A full sync completes even though what is written while the replica
+/// receives and loads the dataset is more than `repl-replica-max-backlog-bytes`
+/// (#305): the replica reads nothing of the stream until it has loaded, and
+/// the sync has an allowance of its own, `repl-replica-sync-max-backlog-bytes`.
+/// It used to be dropped at the streaming limit and start again, for as long
+/// as the writes lasted. Both limits can be changed at runtime, and `INFO`
+/// shows what is queued for each replica.
+#[test]
+fn a_full_sync_has_room_for_the_writes_made_while_it_loads() {
+    let (master, relay, replica) = full_sync_with_writes_queued("64mb");
+    let mut m = master.conn();
+    assert_eq!(
+        m.cmd(&["CONFIG", "GET", "repl-replica-sync-max-backlog-bytes"])
+            .arr()[1]
+            .s(),
+        "67108864"
+    );
+    assert_eq!(
+        m.cmd(&["CONFIG", "GET", "repl-replica-max-backlog-bytes"])
+            .arr()[1]
+            .s(),
+        "1048576"
+    );
+    let waiting = queued(&mut m).unwrap();
+    assert!(waiting > 1024 * 1024, "queued={waiting}");
+
+    relay.resume();
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    assert_same_dataset(&mut m, &mut r);
+    assert_eq!(m.stat("sync_full"), 1, "{}", master.log());
+    // The queue's peak is logged once the replica streams, at the next write.
+    assert!(m.cmd(&["INCR", "counter"]).i() > 0);
+    wait_until("the master to log the sync's queue peak", || {
+        master.log().contains("is streaming: its queue peaked at")
+    });
+    assert!(!master.log().contains("exceeded backlog limit"));
+    assert!(
+        m.cmd(&["CONFIG", "SET", "repl-replica-max-backlog-bytes", "2mb"])
+            .ok()
+    );
+    assert_eq!(
+        m.cmd(&["CONFIG", "GET", "repl-replica-max-backlog-bytes"])
+            .arr()[1]
+            .s(),
+        "2097152"
+    );
+}
+
+/// The sync's allowance is a bound: past it the replica is dropped, as a
+/// streaming one is past its own, and the master's memory stays bounded.
+#[test]
+fn a_full_sync_past_its_own_queue_limit_is_dropped_and_tried_again() {
+    let (master, relay, replica) = full_sync_with_writes_queued("1mb");
+    let mut m = master.conn();
+    wait_until("the master to drop the replica", || {
+        master.log().contains("during its full sync) — evicting")
+    });
+    relay.resume();
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    assert_same_dataset(&mut m, &mut r);
+    assert!(m.stat("sync_full") >= 2, "{}", master.log());
+}
+
+/// A replica stopped in the middle of a full sync, with its dataset dropped
+/// and the master's not yet loaded, does not save that over its last good
+/// dump: `dump.kdb` and its resync point stay as they were, and the next
+/// start syncs again. It used to write a dump of what it held then, empty
+/// or in part, and a restart loaded that.
+#[cfg(unix)]
+#[test]
+fn a_replica_stopped_during_a_full_sync_keeps_its_last_good_dump() {
+    // 16 KiB of backlog: the replica's restart cannot be continued.
+    let master = Server::start(&["--repl-backlog-size", "16384"]);
+    let port = master.port.to_string();
+    let mut replica = Server::start_with_env(
+        &["--replicaof", "127.0.0.1", &port],
+        &[("KIVIDB_TEST_FULL_SYNC_LOAD_DELAY_MS", "4000")],
+    );
+    let mut m = master.conn();
+    write_batch(&mut m, 0, 200);
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    assert_same_dataset(&mut m, &mut r);
+    drop(r);
+    replica.shutdown();
+    let good = std::fs::read(replica.dir.join("dump.kdb")).unwrap();
+    let point = std::fs::read(replica.dir.join("dump.kdb.repl")).unwrap();
+
+    write_batch(&mut m, 1, 400); // more than the backlog holds
+    replica.restart();
+    let mut r = replica.conn();
+    wait_until("the replica to be loading the full sync", || {
+        r.info("replication", "master_sync_in_progress") == "1"
+    });
+    let pid = replica.child.id().to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while replica.child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the replica did not exit");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        replica.log().contains("the final save is skipped"),
+        "{}",
+        replica.log()
+    );
+    assert!(std::fs::read(replica.dir.join("dump.kdb")).unwrap() == good);
+    assert!(std::fs::read(replica.dir.join("dump.kdb.repl")).unwrap() == point);
+
+    // Started again, it syncs again.
+    replica.restart();
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    assert_same_dataset(&mut m, &mut r);
 }
 
 /// A master killed outright and started from its AOF knows nothing of where
@@ -1054,6 +1406,46 @@ fn a_full_sync_cut_off_part_way_costs_the_replica_nothing() {
 /// connections were arriving: each one let an accept worker notice the
 /// shutdown flag, and once they all had, `main` returned.
 #[cfg(unix)]
+/// A second engine started in a running one's data directory waits for the
+/// first to exit before it reads anything there (#303). It used to load the
+/// dump the first was about to replace and could then carry on the first
+/// one's replication stream with the older data. Now what it loads is the
+/// first one's final save, everything that was acknowledged.
+#[test]
+fn a_second_engine_in_the_same_directory_waits_for_the_first() {
+    let mut first = Server::start(&["--aof"]);
+    let mut c = first.conn();
+    write_batch(&mut c, 0, 100);
+    assert!(c.cmd(&["SAVE"]).ok());
+
+    let port = free_port();
+    let mut second = kividb(&first.dir, port, &["--aof".to_string()]);
+    wait_until("the second engine to wait for the directory", || {
+        first.log().contains("is in use by another process")
+    });
+    assert!(
+        TcpStream::connect(("127.0.0.1", port)).is_err(),
+        "the second engine started while the first had the directory:\n{}",
+        first.log()
+    );
+
+    // Written after the second engine started: in neither the dump nor the
+    // log it would have read then.
+    write_batch(&mut c, 1, 100);
+    let keys = c.cmd(&["DBSIZE"]).i();
+    let counter = c.cmd(&["GET", "counter"]);
+    drop(c);
+    first.shutdown();
+
+    let mut c = Conn::connect(port);
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), keys, "{}", first.log());
+    assert_eq!(c.cmd(&["GET", "counter"]), counter);
+    assert!(first.log().contains("The data directory is free"));
+    drop(c);
+    let _ = second.kill();
+    let _ = second.wait();
+}
+
 #[test]
 fn sigterm_waits_for_the_final_snapshot() {
     // The default I/O model, which on Linux is the one this was seen with.
@@ -1148,6 +1540,101 @@ fn sigterm_waits_for_the_final_snapshot() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A replica stopped with SIGTERM while its master writes to it, keys
+/// expiring among the writes, exits with its final save (#308). Its shutdown
+/// closed the command gate and then waited for the lock its applier holds
+/// while it runs a command of the stream; the applier, holding it, waited at
+/// the closed gate. A third of such stops under load never ended.
+#[cfg(unix)]
+#[test]
+fn a_replica_stopped_under_writes_exits_with_its_final_save() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let master = Server::start(&[]);
+    let port = master.port.to_string();
+    let stop = Arc::new(AtomicBool::new(false));
+    let writers: Vec<_> = (0..4)
+        .map(|w| {
+            let (stop, port) = (Arc::clone(&stop), master.port);
+            std::thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                let mut n = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    // A pipeline of 50: keys that expire in 20 ms, counters
+                    // and hashes.
+                    let mut buf = Vec::new();
+                    for _ in 0..50 {
+                        n += 1;
+                        let (key, cmd): (String, Vec<String>) = match n % 3 {
+                            0 => (
+                                format!("x:{w}:{n}"),
+                                vec![
+                                    "SET".into(),
+                                    String::new(),
+                                    "v".into(),
+                                    "PX".into(),
+                                    "20".into(),
+                                ],
+                            ),
+                            1 => (
+                                format!("c:{w}:{}", n % 100),
+                                vec!["INCR".into(), String::new()],
+                            ),
+                            _ => (
+                                format!("h:{w}:{}", n % 100),
+                                vec!["HSET".into(), String::new(), format!("f{n}"), "v".into()],
+                            ),
+                        };
+                        buf.extend_from_slice(format!("*{}\r\n", cmd.len()).as_bytes());
+                        for (i, arg) in cmd.iter().enumerate() {
+                            let arg = if i == 1 { &key } else { arg };
+                            buf.extend_from_slice(
+                                format!("${}\r\n{arg}\r\n", arg.len()).as_bytes(),
+                            );
+                        }
+                    }
+                    if c.writer.write_all(&buf).is_err() {
+                        return;
+                    }
+                    for _ in 0..50 {
+                        c.read();
+                    }
+                }
+            })
+        })
+        .collect();
+
+    for round in 0..5 {
+        let mut replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+        let mut r = replica.conn();
+        wait_link_up(&mut r);
+        drop(r);
+        std::thread::sleep(Duration::from_millis(500));
+        unsafe {
+            libc::kill(replica.child.id() as libc::pid_t, libc::SIGTERM);
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while replica.child.try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "round {round}: the replica did not exit after SIGTERM:\n{}",
+                replica.log()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let log = replica.log();
+        assert!(
+            log.to_lowercase().contains("writing final snapshot") && log.contains("Goodbye."),
+            "round {round}: no final save:\n{log}"
+        );
+        assert!(replica.dir.join("dump.kdb.repl").exists(), "round {round}");
+    }
+    stop.store(true, Ordering::Relaxed);
+    for w in writers {
+        w.join().unwrap();
+    }
+}
+
 /// A library loaded with `FUNCTION LOAD` is part of the dataset, which Redis
 /// keeps in its RDB file and AOF. KiviDB's snapshot had no place for one, so
 /// each save dropped every library: `SAVE` and a restart, `SHUTDOWN` with the
@@ -1240,6 +1727,7 @@ fn function_libraries_load_from_a_redis_dump_rdb() {
         child: kividb(&dir, port, &[]),
         dir,
         args: Vec::new(),
+        env: Vec::new(),
     };
     let mut c = server.conn();
     assert_eq!(

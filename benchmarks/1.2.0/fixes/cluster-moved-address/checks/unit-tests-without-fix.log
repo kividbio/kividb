@@ -1,0 +1,26 @@
+   Compiling kividb v1.2.0-rc4 (/home/azureuser/testsonly)
+    Finished `release` profile [optimized] target(s) in 3m 15s
+     Running unittests src/lib.rs (/home/azureuser/tgt-patched/release/deps/kividb-e6843cfc0771adb4)
+
+running 2 tests
+test cluster::bus::listener::tests::a_relayed_address_does_not_replace_a_reachable_one_or_come_from_a_suspect ... ok
+test cluster::bus::listener::tests::a_node_we_cannot_reach_takes_the_address_a_healthy_relay_gives ... FAILED
+
+failures:
+
+---- cluster::bus::listener::tests::a_node_we_cannot_reach_takes_the_address_a_healthy_relay_gives stdout ----
+
+thread 'cluster::bus::listener::tests::a_node_we_cannot_reach_takes_the_address_a_healthy_relay_gives' (43018) panicked at src/cluster/bus/listener.rs:919:9:
+assertion `left == right` failed
+  left: "10.0.0.8"
+ right: "10.0.0.88"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    cluster::bus::listener::tests::a_node_we_cannot_reach_takes_the_address_a_healthy_relay_gives
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 610 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`
+exit 101

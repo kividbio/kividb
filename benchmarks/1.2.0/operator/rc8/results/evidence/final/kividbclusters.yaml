@@ -1,0 +1,451 @@
+apiVersion: v1
+items:
+- apiVersion: kividb.io/v1alpha1
+  kind: KividbCluster
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"kividb.io/v1alpha1","kind":"KividbCluster","metadata":{"annotations":{},"name":"g-113","namespace":"e2e"},"spec":{"aclConfigRef":{"name":"rep-acl"},"image":"ghcr.io/kividbio/kividb:v1.1.3","replicas":1,"storage":{"size":"2Gi"}}}
+    creationTimestamp: "2026-11-03T05:36:57Z"
+    generation: 1
+    name: g-113
+    namespace: e2e
+    resourceVersion: "37072"
+    uid: 004dcf31-0056-45d6-99a0-4282a158e841
+  spec:
+    aclConfigRef:
+      name: rep-acl
+    image: ghcr.io/kividbio/kividb:v1.1.3
+    port: 6380
+    replicas: 1
+    storage:
+      size: 2Gi
+    variant: standard
+  status:
+    conditions:
+    - lastTransitionTime: "2026-11-03T05:36:58Z"
+      message: 'appendonly yes, appendfsync everysec: a pod that restarts, however
+        it stopped, reloads its data from its volume'
+      observedGeneration: 1
+      reason: AppendOnlyFile
+      status: "True"
+      type: Persistence
+    - lastTransitionTime: "2026-11-03T06:01:22Z"
+      message: master=g-113-1, 2 pod(s) ready
+      observedGeneration: 1
+      reason: AllPodsReady
+      status: "True"
+      type: Ready
+    lastFailoverTime: "2026-11-03T06:01:21Z"
+    masterPod: g-113-1
+    observedGeneration: 1
+    phase: Running
+    pods:
+    - incarnation: 9f9a38f5-007c-4003-9eeb-fe24fe9dc166/0
+      keys: 699683
+      name: g-113-0
+      ready: true
+      replicationOffset: 27767522
+      role: replica
+      runID: 0000000017cfa50000000000deadbeee17cfa501
+      synced: true
+    - incarnation: ea15c27a-21a4-4099-a2a3-35f76d3d71ab/0
+      keys: 699683
+      name: g-113-1
+      ready: true
+      replID: 13da55201bdeb953d8ed08cbe31d75a783c17f4a
+      replicationOffset: 27767522
+      role: master
+      runID: 000000000f18c61000000000deadbeee0f18c611
+      synced: true
+- apiVersion: kividb.io/v1alpha1
+  kind: KividbCluster
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"kividb.io/v1alpha1","kind":"KividbCluster","metadata":{"annotations":{},"name":"g-no","namespace":"e2e"},"spec":{"aclConfigRef":{"name":"rep-acl"},"configRef":{"name":"ack-no"},"image":"<registry>.azurecr.io/kividb:1.2.0-rc8","replicas":1,"storage":{"size":"2Gi"}}}
+    creationTimestamp: "2026-11-03T05:36:57Z"
+    generation: 1
+    name: g-no
+    namespace: e2e
+    resourceVersion: "37100"
+    uid: 1d928c5b-9216-428f-9eb1-0c9e59d70191
+  spec:
+    aclConfigRef:
+      name: rep-acl
+    configRef:
+      name: ack-no
+    image: <registry>.azurecr.io/kividb:1.2.0-rc8
+    port: 6380
+    replicas: 1
+    storage:
+      size: 2Gi
+    variant: standard
+  status:
+    conditions:
+    - lastTransitionTime: "2026-11-03T05:36:57Z"
+      message: 'appendonly yes, appendfsync everysec: a pod that restarts, however
+        it stopped, reloads its data from its volume'
+      observedGeneration: 1
+      reason: AppendOnlyFile
+      status: "True"
+      type: Persistence
+    - lastTransitionTime: "2026-11-03T05:57:27Z"
+      message: master=g-no-0, 2 pod(s) ready
+      observedGeneration: 1
+      reason: AllPodsReady
+      status: "True"
+      type: Ready
+    lastFailoverTime: "2026-11-03T05:57:26Z"
+    masterPod: g-no-0
+    observedGeneration: 1
+    phase: Running
+    pods:
+    - incarnation: 59c32788-dbab-4f76-95a5-e09e0f9d1405/0
+      keys: 693011
+      name: g-no-0
+      ready: true
+      replID: 76456cce7552fa9fad38a9127e6c98a4f323d7af
+      replicationOffset: 27500674
+      role: master
+      runID: 000000000d8f302900000000deadbeee0d8f3028
+      synced: true
+    - incarnation: ca69af82-9bab-4d65-836f-757849685d9f/0
+      keys: 693011
+      name: g-no-1
+      ready: true
+      replicationOffset: 27500674
+      role: replica
+      runID: 00000000146bae9000000000deadbeee146bae91
+      synced: true
+- apiVersion: kividb.io/v1alpha1
+  kind: KividbCluster
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"kividb.io/v1alpha1","kind":"KividbCluster","metadata":{"annotations":{},"name":"g-yes","namespace":"e2e"},"spec":{"aclConfigRef":{"name":"rep-acl"},"image":"<registry>.azurecr.io/kividb:1.2.0-rc8","replicas":1,"storage":{"size":"2Gi"}}}
+    creationTimestamp: "2026-11-03T05:36:57Z"
+    generation: 1
+    name: g-yes
+    namespace: e2e
+    resourceVersion: "37109"
+    uid: a2f5d942-0a5d-496e-b518-3ba0931190bc
+  spec:
+    aclConfigRef:
+      name: rep-acl
+    image: <registry>.azurecr.io/kividb:1.2.0-rc8
+    port: 6380
+    replicas: 1
+    storage:
+      size: 2Gi
+    variant: standard
+  status:
+    conditions:
+    - lastTransitionTime: "2026-11-03T05:36:57Z"
+      message: 'appendonly yes, appendfsync everysec: a pod that restarts, however
+        it stopped, reloads its data from its volume'
+      observedGeneration: 1
+      reason: AppendOnlyFile
+      status: "True"
+      type: Persistence
+    - lastTransitionTime: "2026-11-03T05:45:56Z"
+      message: master=g-yes-0, 2 pod(s) ready
+      observedGeneration: 1
+      reason: AllPodsReady
+      status: "True"
+      type: Ready
+    masterPod: g-yes-0
+    observedGeneration: 1
+    phase: Running
+    pods:
+    - incarnation: d9c7c4c4-5eab-4eb7-8296-241c1c7269f6/0
+      keys: 693084
+      name: g-yes-0
+      ready: true
+      replID: f23cd897404c440c5315758344f449c16df92dc7
+      replicationOffset: 13482799
+      role: master
+      runID: 000000002d1480d900000000deadbeee2d1480d8
+      synced: true
+    - incarnation: 740e930d-5e98-482f-b8da-5af143bd10ed/0
+      keys: 693084
+      name: g-yes-1
+      ready: true
+      replicationOffset: 13482799
+      role: replica
+      runID: 0000000003ce404e00000000deadbeee03ce404f
+      synced: true
+- apiVersion: kividb.io/v1alpha1
+  kind: KividbCluster
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"kividb.io/v1alpha1","kind":"KividbCluster","metadata":{"annotations":{},"name":"rep","namespace":"e2e"},"spec":{"aclConfigRef":{"name":"rep-acl"},"image":"ghcr.io/kividbio/kividb:v1.1.3","replicas":2,"snapshotConfigRef":{"name":"snap"},"storage":{"size":"5Gi"}}}
+    creationTimestamp: "2026-11-03T05:08:00Z"
+    generation: 2
+    name: rep
+    namespace: e2e
+    resourceVersion: "37122"
+    uid: 3f483e07-fe99-42aa-aae6-24902977bf75
+  spec:
+    aclConfigRef:
+      name: rep-acl
+    image: <registry>.azurecr.io/kividb:1.2.0-rc8
+    port: 6380
+    replicas: 2
+    snapshotConfigRef:
+      name: snap
+    storage:
+      size: 5Gi
+    variant: standard
+  status:
+    conditions:
+    - lastTransitionTime: "2026-11-03T05:08:00Z"
+      message: 'appendonly yes, appendfsync everysec: a pod that restarts, however
+        it stopped, reloads its data from its volume'
+      observedGeneration: 2
+      reason: AppendOnlyFile
+      status: "True"
+      type: Persistence
+    - lastTransitionTime: "2026-11-03T05:45:47Z"
+      message: master=rep-0, 3 pod(s) ready
+      observedGeneration: 2
+      reason: AllPodsReady
+      status: "True"
+      type: Ready
+    lastFailoverTime: "2026-11-03T05:11:07Z"
+    masterPod: rep-0
+    observedGeneration: 2
+    phase: Running
+    pods:
+    - incarnation: dbc4c9ed-005a-474c-9832-fb7735f7ac70/0
+      keys: 2646956
+      name: rep-0
+      ready: true
+      replID: 5b5b5443ae350dac3912df9f5be9162b1d229259
+      replicationOffset: 110601873
+      role: master
+      runID: 000000003464bf1900000000deadbeee3464bf18
+      synced: true
+    - incarnation: d3a7a1f2-f283-472c-91f2-caee802c839a/0
+      keys: 2646956
+      name: rep-1
+      ready: true
+      replicationOffset: 110601873
+      role: replica
+      runID: 0000000018a896e900000000deadbeee18a896e8
+      synced: true
+    - incarnation: ff878152-56f7-4d9f-8bd5-6a895b128636/0
+      keys: 2646956
+      name: rep-2
+      ready: true
+      replicationOffset: 110601873
+      role: replica
+      runID: 000000000dea4a1400000000deadbeee0dea4a15
+      synced: true
+- apiVersion: kividb.io/v1alpha1
+  kind: KividbCluster
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"kividb.io/v1alpha1","kind":"KividbCluster","metadata":{"annotations":{},"name":"rep-restored","namespace":"e2e"},"spec":{"aclConfigRef":{"name":"rep-acl"},"bootstrapFromSnapshot":{"snapshotRef":{"name":"rep-bk-113350"}},"image":"<registry>.azurecr.io/kividb:1.2.0-rc8","replicas":1,"storage":{"size":"5Gi"}}}
+    creationTimestamp: "2026-11-03T06:04:03Z"
+    generation: 1
+    name: rep-restored
+    namespace: e2e
+    resourceVersion: "37102"
+    uid: 643242d7-817b-471d-897b-011fdee21a54
+  spec:
+    aclConfigRef:
+      name: rep-acl
+    bootstrapFromSnapshot:
+      snapshotRef:
+        name: rep-bk-113350
+    image: <registry>.azurecr.io/kividb:1.2.0-rc8
+    port: 6380
+    replicas: 1
+    storage:
+      size: 5Gi
+    variant: standard
+  status:
+    bootstrap:
+      completed: true
+      completionTime: "2026-11-03T06:04:20Z"
+      message: PVC seeded from snapshot
+      phase: Completed
+      snapshotName: rep-bk-113350
+    conditions:
+    - lastTransitionTime: "2026-11-03T06:04:20Z"
+      message: 'appendonly yes, appendfsync everysec: a pod that restarts, however
+        it stopped, reloads its data from its volume'
+      observedGeneration: 1
+      reason: AppendOnlyFile
+      status: "True"
+      type: Persistence
+    - lastTransitionTime: "2026-11-03T06:04:45Z"
+      message: master=rep-restored-0, 2 pod(s) ready
+      observedGeneration: 1
+      reason: AllPodsReady
+      status: "True"
+      type: Ready
+    masterPod: rep-restored-0
+    observedGeneration: 1
+    phase: Running
+    pods:
+    - incarnation: df2c2cde-a940-4020-8945-0275bd0f8513/0
+      keys: 2602804
+      name: rep-restored-0
+      ready: true
+      replID: 2bca1d55e220f3bdec31232253d6132f1161079f
+      replicationOffset: 294
+      role: master
+      runID: 000000001b6d629e00000000deadbeee1b6d629f
+      synced: true
+    - incarnation: 40efd023-0bed-41e8-8a30-eb1363eae90f/0
+      keys: 2602804
+      name: rep-restored-1
+      ready: true
+      replicationOffset: 294
+      role: replica
+      runID: 000000000cb62fb000000000deadbeee0cb62fb1
+      synced: true
+- apiVersion: kividb.io/v1alpha1
+  kind: KividbCluster
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"kividb.io/v1alpha1","kind":"KividbCluster","metadata":{"annotations":{},"name":"shd","namespace":"e2e"},"spec":{"aclConfigRef":{"name":"shd-acl"},"image":"ghcr.io/kividbio/kividb:v1.1.3","replicas":1,"shards":3,"snapshotConfigRef":{"name":"snap"},"storage":{"size":"20Gi"}}}
+    creationTimestamp: "2026-11-03T05:08:01Z"
+    generation: 4
+    name: shd
+    namespace: e2e
+    resourceVersion: "37097"
+    uid: 5e041e6d-94f5-49ea-8c83-9c616d4e2353
+  spec:
+    aclConfigRef:
+      name: shd-acl
+    image: <registry>.azurecr.io/kividb:1.2.0-rc8
+    port: 6380
+    replicas: 1
+    shards: 3
+    snapshotConfigRef:
+      name: snap
+    storage:
+      size: 20Gi
+    variant: standard
+  status:
+    cluster:
+      currentEpoch: 22
+      knownNodes: 6
+      shards: 3
+      slotsAssigned: 16384
+      state: ok
+    conditions:
+    - lastTransitionTime: "2026-11-03T05:08:01Z"
+      message: 'appendonly yes, appendfsync everysec: a pod that restarts, however
+        it stopped, reloads its data from its volume'
+      observedGeneration: 4
+      reason: AppendOnlyFile
+      status: "True"
+      type: Persistence
+    - lastTransitionTime: "2026-11-03T05:50:58Z"
+      message: 3 shards, all 16384 slots served, 6 pods ready
+      observedGeneration: 4
+      reason: ClusterOK
+      status: "True"
+      type: Ready
+    lastFailoverTime: "2026-11-03T05:42:31Z"
+    observedGeneration: 4
+    phase: Running
+    pods:
+    - incarnation: 4a1fabc5-4621-4f8e-ae70-0d06bcccfff9/0
+      keys: 868240
+      name: shd-0-0
+      nodeID: dc5356dd1ec2e4af1b6ad7a4ae580fb43b03b065
+      ready: true
+      replicationOffset: 28937491
+      role: master
+      runID: 000000001266c43900000000deadbeee1266c438
+      shard: 0
+      synced: true
+    - incarnation: 2ce78a25-3056-459f-8cc9-ee68e85ceb51/0
+      keys: 868240
+      name: shd-0-1
+      nodeID: 208c74f5a0d7e51f89759dbb315177ebc6c51285
+      ready: true
+      replicationOffset: 28937491
+      role: replica
+      runID: 000000002ac8989900000000deadbeee2ac89898
+      shard: 0
+      synced: true
+    - incarnation: 88f52f06-c273-4cb5-9960-ee36fa06212c/0
+      keys: 868218
+      name: shd-1-0
+      nodeID: ea8ee547e082c0d5c9f0cf6b73bb86437f8abf1d
+      ready: true
+      replicationOffset: 51332976
+      role: replica
+      runID: 00000000311406ad00000000deadbeee311406ac
+      shard: 1
+      synced: true
+    - incarnation: 18248605-f1b1-48c5-8409-f397bb8165da/0
+      keys: 868218
+      name: shd-1-1
+      nodeID: 2ed8ade27b808f1ca7b9ecf88e3ff303eff0171d
+      ready: true
+      replicationOffset: 51332976
+      role: master
+      runID: 0000000006df2dd500000000deadbeee06df2dd4
+      shard: 1
+      synced: true
+    - incarnation: 7f2d04dd-dc68-4f8b-b643-ffb781ef18aa/0
+      keys: 867998
+      name: shd-2-0
+      nodeID: 9bf148287702747f220e26f0fc966e366ce65857
+      ready: true
+      replicationOffset: 51334683
+      role: replica
+      runID: 00000000250d4d1200000000deadbeee250d4d13
+      shard: 2
+      synced: true
+    - incarnation: 45c1d313-dffa-4eab-928d-8285db16bfdc/0
+      keys: 867998
+      name: shd-2-1
+      nodeID: 91ab935d5954589565537517d8c2ce75c5107b2b
+      ready: true
+      replicationOffset: 51334683
+      role: master
+      runID: 000000000706375d00000000deadbeee0706375c
+      shard: 2
+      synced: true
+    shards:
+    - index: 0
+      masterNodeID: dc5356dd1ec2e4af1b6ad7a4ae580fb43b03b065
+      masterPod: shd-0-0
+      pods:
+      - shd-0-0
+      - shd-0-1
+      readyPods: 2
+      slots:
+      - 0-5461
+    - index: 1
+      masterNodeID: 2ed8ade27b808f1ca7b9ecf88e3ff303eff0171d
+      masterPod: shd-1-1
+      pods:
+      - shd-1-0
+      - shd-1-1
+      readyPods: 2
+      slots:
+      - 5462-10922
+    - index: 2
+      masterNodeID: 91ab935d5954589565537517d8c2ce75c5107b2b
+      masterPod: shd-2-1
+      pods:
+      - shd-2-0
+      - shd-2-1
+      readyPods: 2
+      slots:
+      - 10923-16383
+kind: List
+metadata:
+  resourceVersion: ""

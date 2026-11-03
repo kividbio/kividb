@@ -1,0 +1,42 @@
+[    3.91] cluster formed {'n1': '628ff6caf113bf853b6db21a0b2eca06d3fec4ff', 'n2': '4447a99d37e61013831c18d61ec97dad4d1f43e1', 'n3': '4ccf4eca5a6645704939376ba5af851c48d50157', 'n4': '5847cb6c3a32757576776b5a7139a7d0e60efe99', 'n5': 'aa90325fca6c56a2a246ba360cf49f38883abd43', 'n6': '5c2808f4f875d45d278da8b8f1ef4c5b9f9ef8b2'}
+[   23.91] stop ['n1', 'n2']
+[   24.02] re-IP {'n1': '10.99.0.21', 'n2': '10.99.0.22'}
+[   33.95] restarted ['n1', 'n2']
+[   36.95] stop ['n1', 'n2']
+[   37.05] re-IP {'n1': '10.99.0.31', 'n2': '10.99.0.32'}
+[   38.95] restarted ['n1', 'n2']
+{
+ "label": "patched",
+ "scenario": "rapid-move-two-masters",
+ "rep": "1",
+ "node_timeout_ms": 5000,
+ "down_s": 10.0,
+ "moving": [
+  "n1",
+  "n2"
+ ],
+ "new_ips": {
+  "n1": "10.99.0.31",
+  "n2": "10.99.0.32"
+ },
+ "restart_after_kill_s": 15.04,
+ "moved_views_converged_s": 11.46,
+ "all_views_and_state_ok_s": 11.46,
+ "cluster_state_ok_everywhere_s": 0.46,
+ "flaps_after_restart": 0,
+ "per_observer_moved_view_ok_s": {
+  "n1": 11.46,
+  "n2": 11.46,
+  "n3": 1.46,
+  "n4": 1.46,
+  "n5": 1.46,
+  "n6": 1.46
+ },
+ "observed_after_restart_s": 26.47,
+ "writes_failed_after_kill": 85,
+ "writes_clusterdown_after_kill": 11,
+ "writes_attempted_after_kill": 5286,
+ "last_failed_write_s_after_kill": 25,
+ "last_clusterdown_s_after_kill": 11,
+ "failed_seconds_after_restart": 7
+}

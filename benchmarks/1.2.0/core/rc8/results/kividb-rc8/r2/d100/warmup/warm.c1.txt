@@ -1,0 +1,42 @@
+Json file ~/results/kividb-rc8/r2/d100/warmup/warm.c1.json created...
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 20%,   1 secs] 15 threads 10 conns:     5161831 ops, 5156004 (avg: 5156004) ops/sec, 702.61MB/sec (avg: 702.61MB/sec),  0.46 (avg:  0.46) msec latency
+warning: high CPU on thread 0: 95.5% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 2: 95.4% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 6: 95.2% of a core (threshold 95.0%) - results may be unreliable
+[RUN #1 40%,   2 secs] 15 threads 10 conns:    10276174 ops, 5113310 (avg: 5134667) ops/sec, 696.79MB/sec (avg: 699.70MB/sec),  0.46 (avg:  0.46) msec latency
+warning: high CPU on thread 11: 96.3% of a core (threshold 95.0%) - results may be unreliable
+[RUN #1 60%,   3 secs] 15 threads 10 conns:    15335376 ops, 5058352 (avg: 5109237) ops/sec, 689.30MB/sec (avg: 696.23MB/sec),  0.46 (avg:  0.46) msec latency[RUN #1 80%,   4 secs] 15 threads 10 conns:    20445237 ops, 5108691 (avg: 5109100) ops/sec, 696.16MB/sec (avg: 696.21MB/sec),  0.46 (avg:  0.46) msec latency
+warning: high CPU on thread 13: 95.1% of a core (threshold 95.0%) - results may be unreliable
+[RUN #1 100%,   5 secs]  6 threads 10 conns:    25541168 ops, 5108691 (avg: 5107351) ops/sec, 696.16MB/sec (avg: 695.98MB/sec),  0.46 (avg:  0.46) msec latency[RUN #1 100%,   5 secs]  0 threads 10 conns:    25541648 ops, 5108691 (avg: 5107393) ops/sec, 696.16MB/sec (avg: 695.98MB/sec),  0.46 (avg:  0.46) msec latency
+
+Writing Full Run command HDR latency histogram results to ~/results/kividb-rc8/r2/d100/warmup/warm.c1_FULL_RUN_1.txt...
+Writing Full Run command HDR latency histogram results in HistogramLogProcessor format to ~/results/kividb-rc8/r2/d100/warmup/warm.c1_FULL_RUN_1.hgrm...
+Writing GET command HDR latency histogram results to ~/results/kividb-rc8/r2/d100/warmup/warm.c1_GET_command_run_1.txt...
+Writing GET command HDR latency histogram results in HistogramLogProcessor format to ~/results/kividb-rc8/r2/d100/warmup/warm.c1_GET_command_run_1.hgrm...
+
+CPU Utilization Summary
+  Total CPU time:   69.856s  (user 30.293s, sys 39.563s)
+  Wall time:        5.003s
+  Cores used:       13.962   (avg 93.1% across 15 worker threads)
+  Peak utilization: 1408.2%
+Saving JSON output file: ~/results/kividb-rc8/r2/d100/warmup/warm.c1.json
+Json file closed.
+15        Threads
+10        Connections per thread
+5         Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets            0.00          ---          ---             ---             ---             ---             ---         0.00 
+Gets      5107485.84   5107485.84         0.00         0.46039         0.45500         0.80700         1.43900    712697.94 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    5107485.84   5107485.84         0.00         0.46039         0.45500         0.80700         1.43900    712697.94 
+rc=0

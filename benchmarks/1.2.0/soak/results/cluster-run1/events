@@ -1,0 +1,65 @@
+1793652287.018389305 failover-start slot=3000 master=10.70.1.9:7001 replica=10.70.1.10:7002
+1793652287.033212079 failover-reply OK
+1793652287.278842657 failover-promoted 10.70.1.10:7002 after 0.04 s
+1793652290.863046034 failover-old-master-replica 10.70.1.9:7001 after 3.34 s
+1793652291.282163248 failover-end cluster-ok after 0.18 s
+1793653006.247546923 kill9-start slot=8000 master=10.70.1.10:7001 replica=10.70.1.7:7002
+1793653006.957390644 kill9-killed 10.70.1.10:7001
+1793653013.168588676 kill9-promoted 10.70.1.7:7002 after 6.05 s
+1793653035.720183571 kill9-restarted 10.70.1.10:7001
+1793653041.957294046 kill9-rejoined 10.70.1.10:7001 as replica after 6.06 s
+1793653042.410181271 kill9-end cluster-ok after 0.19 s
+1793653786.827642663 reshard-start 10 slots from 10.70.1.10:7002 (fc4237d6cc855948547eae5ed0e07b98775336e1, 1562280 keys) to 10.70.1.7:7002 (52f8aeda20c4eeb8be6af705f0923a58eb244534) with redis-cli
+1793653787.306668066 reshard-attempt 1 exit=1 after 0.47 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:9565'. The copy sent to 10.70.1.7:7002 may be older; MIGRATE them again with REPLACE
+1793653789.106065046 reshard-repair slot 0: {"slot": 0, "src_keys_before": 272, "dst_keys_before": 52, "importing": "OK", "migrating": "OK", "error": "a key was written while being migrated, and kept here: 'hf:9565'. The copy sent to 10.70.1.7:7002 may be older; MIGRATE them again with REPLACE", "migrated": 0, "tryagain": 0, "setslot_node": {"10.70.1.7:7002": "OK", "10.70.1.10:7002": "error: Can't assign hashslot 0 to a different node while I still hold keys for this hash slot.", "10.70.1.9:7001": "OK", "10.70.1.10:7001": "OK", "10.70.1.7:7001": "OK", "10.70.1.9:7002": "OK"}, "src_keys_after": 173, "dst_keys_after": 151, "seconds": 1.28
+1793653789.867805208 reshard-attempt 2 exit=1 after 3.03 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:10261'. The copy sent to 10.70.1.7:7002 may be older; MIGRATE them again with REPLACE
+1793653791.871211032 reshard-repair slot 1: {"slot": 1, "src_keys_before": 194, "dst_keys_before": 80, "importing": "OK", "migrating": "OK", "error": "keys were written while being migrated, and kept here: 'hf:10261', 'hf:15513'. The copy sent to 10.70.1.7:7002 may be older; MIGRATE them again with REPLACE", "migrated": 0, "tryagain": 0, "setslot_node": {"10.70.1.7:7002": "OK", "10.70.1.10:7002": "error: Can't assign hashslot 1 to a different node while I still hold keys for this hash slot.", "10.70.1.9:7001": "OK", "10.70.1.10:7001": "OK", "10.70.1.7:7001": "OK", "10.70.1.9:7002": "OK"}, "src_keys_after": 0, "dst_keys_after": 179, "sec
+1793653792.948587391 reshard-attempt 3 exit=1 after 6.11 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:9388'. The copy sent to 10.70.1.7:7002 may be older; MIGRATE them again with REPLACE
+1793653794.918910483 reshard-repair slot 2: {"slot": 2, "src_keys_before": 161, "dst_keys_before": 121, "importing": "OK", "migrating": "OK", "error": "a key was written while being migrated, and kept here: 'hf:9388'. The copy sent to 10.70.1.7:7002 may be older; MIGRATE them again with REPLACE", "migrated": 0, "tryagain": 0, "setslot_node": {"10.70.1.7:7002": "OK", "10.70.1.10:7002": "OK", "10.70.1.9:7001": "OK", "10.70.1.10:7001": "OK", "10.70.1.7:7001": "OK", "10.70.1.9:7002": "OK"}, "src_keys_after": 0, "dst_keys_after": 220, "seconds": 1.38}
+1793653795.350735847 reshard-attempt 4 exit=1 after 8.51 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:2797'. The copy sent to 10.70.1.7:7002 may be older; MIGRATE them again with REPLACE
+1793653797.373269589 reshard-repair slot 3: {"slot": 3, "src_keys_before": 259, "dst_keys_before": 10, "importing": "OK", "migrating": "OK", "error": "a key was written while being migrated, and kept here: 'hf:267'. The copy sent to 10.70.1.7:7002 may be older; MIGRATE them again with REPLACE", "migrated": 0, "tryagain": 0, "setslot_node": {"10.70.1.7:7002": "OK", "10.70.1.10:7002": "error: Can't assign hashslot 3 to a different node while I still hold keys for this hash slot.", "10.70.1.9:7001": "OK", "10.70.1.10:7001": "OK", "10.70.1.7:7001": "OK", "10.70.1.9:7002": "OK"}, "src_keys_after": 160, "dst_keys_after": 109, "seconds": 1.37}
+1793653797.841883316 reshard-attempt 5 exit=1 after 11.00 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:19105'. The copy sent to 10.70.1.7:7002 may be older; MIGRATE them again with REPLACE
+1793653799.724550255 reshard-repair slot 4: {"slot": 4, "src_keys_before": 280, "dst_keys_before": 20, "importing": "OK", "migrating": "OK", "error": "a key was written while being migrated, and kept here: 'hf:19105'. The copy sent to 10.70.1.7:7002 may be older; MIGRATE them again with REPLACE", "migrated": 0, "tryagain": 0, "setslot_node": {"10.70.1.7:7002": "OK", "10.70.1.10:7002": "error: Can't assign hashslot 4 to a different node while I still hold keys for this hash slot.", "10.70.1.9:7001": "OK", "10.70.1.10:7001": "OK", "10.70.1.7:7001": "OK", "10.70.1.9:7002": "OK"}, "src_keys_after": 181, "dst_keys_after": 119, "seconds": 1.2
+1793653801.270551704 reshard-attempt 6 exit=1 after 14.43 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:17268'. The copy sent to 10.70.1.7:7002 may be older; MIGRATE them again with REPLACE
+1793653803.387555598 reshard-repair slot 5: {"slot": 5, "src_keys_before": 136, "dst_keys_before": 163, "importing": "OK", "migrating": "OK", "error": "keys were written while being migrated, and kept here: 'hf:17268', 'hf:5173'. The copy sent to 10.70.1.7:7002 may be older; MIGRATE them again with REPLACE", "migrated": 0, "tryagain": 0, "setslot_node": {"10.70.1.7:7002": "OK", "10.70.1.10:7002": "error: Can't assign hashslot 5 to a different node while I still hold keys for this hash slot.", "10.70.1.9:7001": "OK", "10.70.1.10:7001": "OK", "10.70.1.7:7001": "OK", "10.70.1.9:7002": "OK"}, "src_keys_after": 38, "dst_keys_after": 262, "se
+1793653810.323883747 reshard-attempt 7 exit=1 after 23.48 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:17485'. The copy sent to 10.70.1.7:7002 may be older; MIGRATE them again with REPLACE
+1793653812.603089551 reshard-repair slot 7: {"slot": 7, "src_keys_before": 84, "dst_keys_before": 189, "importing": "OK", "migrating": "OK", "error": "a key was written while being migrated, and kept here: 'hf:17485'. The copy sent to 10.70.1.7:7002 may be older; MIGRATE them again with REPLACE", "migrated": 0, "tryagain": 0, "setslot_node": {"10.70.1.7:7002": "OK", "10.70.1.10:7002": "error: Can't assign hashslot 7 to a different node while I still hold keys for this hash slot.", "10.70.1.9:7001": "OK", "10.70.1.10:7001": "OK", "10.70.1.7:7001": "OK", "10.70.1.9:7002": "OK"}, "src_keys_after": 0, "dst_keys_after": 272, "seconds": 1.61}
+1793653814.370063471 events-driver-stopped (slotfix bug: TRYAGAIN not recognised; repairing slots by hand)
+1793653899.874953900 reshard-repair slot 8 (by hand, fixed slotfix.py): {"slot": 8, "src_keys_before": 213, "dst_keys_before": 72, "importing": "OK", "migrating": "OK", "migrated": 114, "tryagain": 1, "setslot_node": {"10.70.1.7:7002": "OK", "10.70.1.10:7002": "OK", "10.70.1.9:7001": "OK", "10.70.1.10:7001": "OK", "10.70.1.7:7001": "OK", "10.70.1.9:7002": "OK"}, "src_keys_after": 0, "dst_keys_after": 285, "seconds": 2.66}
+1793653913.107315780 events-driver-restarted with the rest of the schedule
+1793654686.527780075 import-start CLUSTER MIGRATION IMPORT 10923 11422 on 10.70.1.10:7002 (fc4237d6cc855948547eae5ed0e07b98775336e1, 2021153 keys), source 10.70.1.7:7001 (b571f2f65eb12e58face40b14d2e78aa87d75711, 2024606 keys)
+1793654686.555066455 import-id 181617fa7903274d32ad8f65efc6a9e4002c86b3
+1793654690.215575024 import-done in 3.65 s: id 181617fa7903274d32ad8f65efc6a9e4002c86b3 slots 10923-11422 source b571f2f65eb12e58face40b14d2e78aa87d75711 dest fc4237d6cc855948547eae5ed0e07b98775336e1 operation import state completed last_error  retries 0 create_time 1793654686552 start_time 1793654686553 end_time 1793654689724 write_pause_ms 0 capture_pause_ms 0
+1793654690.235607367 import-keys source 1889972 dest 2208570
+1793654690.632800848 import-end cluster-ok after 0.16 s
+1793655406.721171180 kill9-start slot=3000 master=10.70.1.10:7002 replica=10.70.1.9:7001
+1793655407.386292819 kill9-killed 10.70.1.10:7002
+1793655413.122934414 kill9-promoted 10.70.1.9:7001 after 5.58 s
+1793655437.782659238 kill9-restarted 10.70.1.10:7002
+1793655446.348459552 kill9-rejoined 10.70.1.10:7002 as replica after 8.39 s
+1793655446.797220913 kill9-end cluster-ok after 0.17 s
+1793656186.978470751 failover-start slot=13000 master=10.70.1.7:7001 replica=10.70.1.9:7002
+1793656186.988703137 failover-reply OK
+1793656187.220770086 failover-promoted 10.70.1.9:7002 after 0.02 s
+1793656195.438013574 failover-old-master-replica 10.70.1.7:7001 after 8.00 s
+1793656195.809236785 failover-end cluster-ok after 0.13 s
+1793656786.715506373 import-start CLUSTER MIGRATION IMPORT 5461 5960 on 10.70.1.9:7002 (19462581ea100c47276a75458bcaaee87bda5098, 2833659 keys), source 10.70.1.7:7002 (52f8aeda20c4eeb8be6af705f0923a58eb244534, 3124302 keys)
+1793656786.727952500 import-id d8d59c271c1a712c8aa2fb80cb3d78f8252325f3
+1793656791.936656686 import-done in 5.20 s: id d8d59c271c1a712c8aa2fb80cb3d78f8252325f3 slots 5461-5960 source 52f8aeda20c4eeb8be6af705f0923a58eb244534 dest 19462581ea100c47276a75458bcaaee87bda5098 operation import state completed last_error  retries 0 create_time 1793656786725 start_time 1793656786725 end_time 1793656791737 write_pause_ms 0 capture_pause_ms 0 
+1793656791.956727156 import-keys source 3065250 dest 3121756
+1793656792.335433227 import-end cluster-ok after 0.15 s
+1793657387.181309881 reshard-start 5 slots from 10.70.1.9:7002 (19462581ea100c47276a75458bcaaee87bda5098, 3431713 keys) to 10.70.1.9:7001 (9f8a4b92c1338b6be0d4eee4e049710391dac8f6) with redis-cli
+1793657406.775300078 reshard-attempt 1 exit=1 after 19.58 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:5143'. The copy sent to 10.70.1.9:7001 may be older; MIGRATE them again with REPLACE
+1793657463.770868479 reshard-repair slot 5462: {"slot": 5462, "src_keys_before": 525, "dst_keys_before": 249, "importing": "OK", "migrating": "OK", "migrated": 1, "tryagain": 96, "setslot_node": {"10.70.1.9:7001": "OK", "10.70.1.9:7002": "OK", "10.70.1.10:7001": "OK", "10.70.1.7:7001": "OK", "10.70.1.10:7002": "OK", "10.70.1.7:7002": "OK"}, "src_keys_after": 0, "dst_keys_after": 772, "seconds": 56.37}
+1793657476.724713488 reshard-attempt 2 exit=1 after 89.53 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:19135'. The copy sent to 10.70.1.9:7001 may be older; MIGRATE them again with REPLACE
+1793657496.420118549 reshard-repair slot 5463: {"slot": 5463, "src_keys_before": 61, "dst_keys_before": 480, "importing": "OK", "migrating": "OK", "migrated": 1, "tryagain": 26, "setslot_node": {"10.70.1.9:7001": "OK", "10.70.1.9:7002": "OK", "10.70.1.10:7001": "OK", "10.70.1.7:7001": "OK", "10.70.1.10:7002": "OK", "10.70.1.7:7002": "OK"}, "src_keys_after": 0, "dst_keys_after": 541, "seconds": 19.06}
+1793657533.504141946 reshard-attempt 3 exit=0 after 146.31 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:19135'. The copy sent to 10.70.1.9:7001 may be older; MIGRATE them again with REPLACE
+1793657534.125163494 reshard-done in 146.93 s: 5 slots moved in 3 redis-cli runs, slots begun=5
+1793657534.585188660 reshard-end cluster-ok after 0.16 s
+1793658287.012407813 kill9-start slot=13000 master=10.70.1.9:7002 replica=10.70.1.7:7001
+1793658287.660894776 kill9-killed 10.70.1.9:7002
+1793658293.645445364 kill9-promoted 10.70.1.7:7001 after 5.83 s
+1793658322.882371901 kill9-restarted 10.70.1.9:7002
+1793658336.035961460 kill9-rejoined 10.70.1.9:7002 as replica after 12.86 s
+1793658336.442643461 kill9-end cluster-ok after 0.14 s
+1793658336.458046200 events-done

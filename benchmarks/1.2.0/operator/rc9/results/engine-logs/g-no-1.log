@@ -1,0 +1,7 @@
+2026-11-03T07:53:53.857723663Z 2026-11-03T07:53:53.857Z 1 [WARN] Replication: Replication link to <ip>:6380 failed: Connection reset by peer (os error 104) — retrying every 1s
+2026-11-03T07:54:54.042284423Z 2026-11-03T07:54:54.042Z 1 [INFO] Replication: Promoted; the stream 4c941fc436dedbb0096380205497ceee211410b2 goes on as 5ef8950f4c55cf2f6e53ce44f8abf67fa2aa546d from offset 30995297 — its replicas can be continued
+2026-11-03T07:54:54.042321862Z 2026-11-03T07:54:54.042Z 1 [INFO] Replication: Promoted to master via REPLICAOF NO ONE
+2026-11-03T07:54:54.050076579Z 2026-11-03T07:54:54.049Z 1 [INFO] Replication: Superseded during reconnect backoff — stopping
+2026-11-03T07:54:54.096244538Z 2026-11-03T07:54:54.096Z 1 [INFO] Replication: Channel replica registered: <ip>:39674
+2026-11-03T07:54:54.168221282Z 2026-11-03T07:54:54.168Z 1 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub
+2026-11-03T07:54:55.689272978Z 2026-11-03T07:54:55.689Z 1 [INFO] Replication: Replica <ip>:39674 is streaming: its queue peaked at 23 bytes during the full sync (repl-replica-sync-max-backlog-bytes 1073741824, repl-replica-max-backlog-bytes 268435456)

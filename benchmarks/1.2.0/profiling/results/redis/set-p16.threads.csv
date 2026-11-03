@@ -1,0 +1,16 @@
+tid,thread,cores
+120565,redis-server,1.010
+120577,io_thd_6,1.001
+120578,io_thd_7,1.000
+120574,io_thd_3,0.734
+120575,io_thd_4,0.535
+120572,io_thd_1,0.513
+120573,io_thd_2,0.454
+120576,io_thd_5,0.300
+120596,jemalloc_bg_thd,0.000
+120595,jemalloc_bg_thd,0.000
+120580,jemalloc_bg_thd,0.000
+120579,jemalloc_bg_thd,0.000
+120571,bio_lazy_free,0.000
+120570,bio_aof,0.000
+120569,bio_close_file,0.000

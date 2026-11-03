@@ -1,0 +1,73 @@
+== kividb-cand-commit
+75482abbb258bafe84c0e9d05fc1c904abb19cfd 2026-11-02T18:45:19+05:30 Compaction: a slab is chosen only if it is still the one measured
+== kividb-rc4-commit
+a6b1bf388582dd6b343b34471864145c97dab74d 2026-11-02T04:05:52+05:30 Merge pull request #287 from kividbio/release/1.2.0-rc4
+== kividb-cand-version
+kividb 1.2.0-rc6
+== kividb-rc4-version
+kividb 1.2.0-rc4
+== engine-images.txt
+REPOSITORY                                    TAG                  DIGEST                                                                    IMAGE ID       CREATED         SIZE
+kividb/kividb                                 build-a6b1bf388582   sha256:3715e52f8d4adce35f79d758eaf94a2e029d0c91395de7016eb5b732f2711cfd   3715e52f8d4a   2 seconds ago   47.5MB
+kividb/kividb                                 build-75482abbb258   sha256:4bf81ea5fdfa002fc6e91a8b1ffc76628ac851a97f9397b95e183a76023b55b5   4bf81ea5fdfa   3 minutes ago   47.5MB
+kividb/kividb                                 v1.1.3               sha256:5677cfc55fc4a26f247f0ea38dce2cb02237bf27de875f5c362f095aa6a8318d   5677cfc55fc4   40 hours ago    44.5MB
+redis                                         8.10.3               sha256:de1068af6f552240dfab67bcc9bfef99bfc60f776bb4580ef077ea4c8c97e848   de1068af6f55   5 days ago      213MB
+valkey/valkey                                 9.1.3                sha256:3add1a336a920ea54770a001ab6feb3da5fceea96a40373a3a2cd469b815f0b7   3add1a336a92   6 days ago      174MB
+docker.dragonflydb.io/dragonflydb/dragonfly   v2.0.2               sha256:061f00b201b58e12f974e4e96c761a881ee1c05e9d8ee967466a604b7299753b   061f00b201b5   3 weeks ago     188MB
+== kernel.txt
+Linux mem-srv2 7.0.0-1017-azure #17~24.04.1-Ubuntu SMP PREEMPT Thu Sep 24 18:46:57 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+== lscpu.txt
+Architecture:                            x86_64
+CPU op-mode(s):                          32-bit, 64-bit
+Address sizes:                           48 bits physical, 57 bits virtual
+Byte Order:                              Little Endian
+CPU(s):                                  32
+On-line CPU(s) list:                     0-31
+Vendor ID:                               GenuineIntel
+BIOS Vendor ID:                          Intel(R) Corporation
+Model name:                              INTEL(R) XEON(R) PLATINUM 8573C
+BIOS Model name:                         INTEL(R) XEON(R) PLATINUM 8573C None CPU @ 2.3GHz
+BIOS CPU family:                         179
+CPU family:                              6
+Model:                                   207
+Thread(s) per core:                      2
+Core(s) per socket:                      16
+Socket(s):                               1
+Stepping:                                2
+CPU(s) scaling MHz:                      157%
+CPU max MHz:                             2300.0000
+CPU min MHz:                             800.0000
+BogoMIPS:                                4599.99
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology tsc_reliable nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq vmx ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch tpr_shadow ept vpid ept_ad fsgsbase tsc_adjust bmi1 hle avx2 smep bmi2 erms invpcid rtm avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves user_shstk avx_vnni avx512_bf16 vnmi avx512vbmi umip waitpkg avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq la57 rdpid cldemote movdiri movdir64b fsrm serialize tsxldtrk ibt amx_bf16 avx512_fp16 amx_tile amx_int8 arch_capabilities
+Virtualization:                          VT-x
+Hypervisor vendor:                       Microsoft
+Virtualization type:                     full
+L1d cache:                               768 KiB (16 instances)
+L1i cache:                               512 KiB (16 instances)
+L2 cache:                                32 MiB (16 instances)
+L3 cache:                                260 MiB (1 instance)
+NUMA node(s):                            1
+NUMA node0 CPU(s):                       0-31
+Vulnerability Gather data sampling:      Not affected
+Vulnerability Ghostwrite:                Not affected
+Vulnerability Indirect target selection: Mitigation; Aligned branch/return thunks
+Vulnerability Itlb multihit:             Not affected
+Vulnerability L1tf:                      Not affected
+Vulnerability Mds:                       Not affected
+Vulnerability Meltdown:                  Not affected
+Vulnerability Mmio stale data:           Not affected
+Vulnerability Old microcode:             Not affected
+Vulnerability Reg file data sampling:    Not affected
+Vulnerability Retbleed:                  Vulnerable
+Vulnerability Spec rstack overflow:      Not affected
+Vulnerability Spec store bypass:         Vulnerable
+Vulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:                Mitigation; Retpolines; STIBP disabled; RSB filling; PBRSB-eIBRS Not affected; BHI Retpoline
+Vulnerability Srbds:                     Not affected
+Vulnerability Tsa:                       Not affected
+Vulnerability Tsx async abort:           Not affected
+Vulnerability Vmscape:                   Not affected
+== free.txt
+               total        used        free      shared  buff/cache   available
+Mem:             251           3         245           0           4         248
+Swap:              0           0           0

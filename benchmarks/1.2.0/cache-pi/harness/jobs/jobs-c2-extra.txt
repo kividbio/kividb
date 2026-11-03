@@ -1,0 +1,4 @@
+kividb-rc4_lfu_X_2a kividb-rc4 allkeys-lfu 8388608
+kividb-75482ab_lfu_X_2a kividb-75482ab allkeys-lfu 8388608
+kividb-75482ab_lfu_X_2b kividb-75482ab allkeys-lfu 8388608
+kividb-rc4_lfu_X_2b kividb-rc4 allkeys-lfu 8388608

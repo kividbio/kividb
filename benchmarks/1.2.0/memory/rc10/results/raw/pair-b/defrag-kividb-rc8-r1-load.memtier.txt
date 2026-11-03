@@ -1,0 +1,50 @@
+Writing results to stdout
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   6.541s  (user 4.324s, sys 2.218s)
+  Wall time:        0.990s
+  Cores used:       6.606   (avg 82.5% across 8 worker threads)
+  Peak utilization: 0.0%
+setting requests to 78125
+8         Threads
+8         Connections per thread
+78125     Requests per client
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      5161279.67          ---          ---         0.35300         0.32700         1.07100         4.12700    744846.13 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    5161279.67         0.00         0.00         0.35300         0.32700         1.07100         4.12700    744846.13 
+Writing results to stdout
+
+
+
+
+
+CPU Utilization Summary
+  Total CPU time:   0.106s  (user 0.073s, sys 0.033s)
+  Wall time:        0.073s
+  Cores used:       1.446   (avg 71.7% across 2 worker threads)
+  Peak utilization: 0.0%
+setting requests to 12500
+2         Threads
+4         Connections per thread
+12500     Requests per client
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      1577884.37          ---          ---         0.16308         0.15900         0.23900         0.30300    221703.48 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    1577884.37         0.00         0.00         0.16308         0.15900         0.23900         0.30300    221703.48 

@@ -371,6 +371,7 @@ fn test_config_rewrite_with_configfile() {
     let mut server = std::process::Command::new(
         std::env::var("CARGO_BIN_EXE_kividb").unwrap_or_else(|_| "target/debug/kividb".into()),
     )
+    .current_dir(tempfile::tempdir().unwrap().keep())
     .args([
         "--port",
         &port.to_string(),
@@ -535,6 +536,7 @@ fn test_config_rewrite_keeps_the_file_mode() {
         let mut server = std::process::Command::new(
             std::env::var("CARGO_BIN_EXE_kividb").unwrap_or_else(|_| "target/debug/kividb".into()),
         )
+        .current_dir(tempfile::tempdir().unwrap().keep())
         .args([
             "--port",
             &port.to_string(),
@@ -769,13 +771,7 @@ fn config_set_refuses_unknown_and_startup_only_settings() {
     );
     assert_eq!(get(&mut c, "bogus-name"), None);
 
-    for name in [
-        "threads",
-        "io-model",
-        "aof",
-        "repl-replica-max-backlog-bytes",
-        "backupdirname",
-    ] {
+    for name in ["threads", "io-model", "aof", "backupdirname"] {
         let reply = c.cmds(&["CONFIG", "SET", name, "1000"]);
         assert!(
             matches!(&reply, RespValue::Error(e) if e == &format!(
@@ -785,20 +781,22 @@ fn config_set_refuses_unknown_and_startup_only_settings() {
             "{name}: {reply:?}"
         );
     }
-    assert_eq!(
-        get(&mut c, "repl-replica-max-backlog-bytes").as_deref(),
-        Some("268435456")
-    );
+    assert_eq!(get(&mut c, "backupdirname").as_deref(), Some("backupdir"));
     // To what it already is, is no change.
     assert!(
-        c.cmds(&[
-            "CONFIG",
-            "SET",
-            "repl-replica-max-backlog-bytes",
-            "268435456"
-        ])
-        .is_ok()
+        c.cmds(&["CONFIG", "SET", "backupdirname", "backupdir"])
+            .is_ok()
     );
+    // The replicas' queue limits can be changed (#305).
+    for name in [
+        "repl-replica-max-backlog-bytes",
+        "repl-replica-sync-max-backlog-bytes",
+    ] {
+        assert!(c.cmds(&["CONFIG", "SET", name, "512mb"]).is_ok(), "{name}");
+        assert_eq!(get(&mut c, name).as_deref(), Some("536870912"), "{name}");
+        let reply = c.cmds(&["CONFIG", "SET", name, "0"]);
+        assert!(reply.is_error(), "{name}: {reply:?}");
+    }
     // One refused takes the others back with it.
     let reply = c.cmds(&["CONFIG", "SET", "hz", "20", "bogus-name", "1"]);
     assert!(reply.is_error(), "{reply:?}");
@@ -990,6 +988,36 @@ fn turned_away(port: u16) -> bool {
     let mut reply = String::new();
     extra.read_to_string(&mut reply).unwrap();
     reply == "-ERR max number of clients reached\r\n"
+}
+
+// A connection turned away at maxclients is counted in INFO stats rejected_connections.
+#[cfg(unix)]
+#[test]
+fn stats_are_updated_when_connection_is_turned_away() {
+    let server = start_with_open_files(40, 100, "io-model tokio\nthreads 1\nmaxclients 1");
+
+    let mut conn = Conn::connect(server.port);
+    assert_eq!(maxclients(&mut conn), "1");
+
+    let rejected = |conn: &mut Conn| -> u64 {
+        conn.cmds(&["INFO", "stats"])
+            .as_str()
+            .lines()
+            .find_map(|line| line.strip_prefix("rejected_connections:"))
+            .expect("rejected_connections in INFO stats")
+            .parse()
+            .unwrap()
+    };
+
+    let before = rejected(&mut conn);
+    assert!(turned_away(server.port));
+    let after = rejected(&mut conn);
+
+    assert_eq!(
+        after,
+        before + 1,
+        "rejected_connections should increase by one"
+    );
 }
 
 #[cfg(unix)]

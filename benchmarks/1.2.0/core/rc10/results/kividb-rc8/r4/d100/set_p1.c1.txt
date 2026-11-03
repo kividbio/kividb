@@ -1,0 +1,77 @@
+Json file /home/azureuser/results-extra/kividb-rc8/r4/d100/set_p1.c1.json created...
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 5%,   1 secs] 15 threads 40 conns:      830812 ops,  830659 (avg:  830659) ops/sec, 117.15MB/sec (avg: 117.15MB/sec),  0.72 (avg:  0.72) msec latency
+warning: high CPU on thread 0: 98.8% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 1: 99.7% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 2: 99.8% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 3: 99.8% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 4: 99.8% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 5: 99.8% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 6: 99.8% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 7: 99.9% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 8: 99.9% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 9: 99.8% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 10: 99.6% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 11: 99.9% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 12: 99.9% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 13: 99.8% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 14: 98.7% of a core (threshold 95.0%) - results may be unreliable
+[RUN #1 10%,   2 secs] 15 threads 40 conns:     1665413 ops,  834361 (avg:  832510) ops/sec, 117.68MB/sec (avg: 117.42MB/sec),  0.72 (avg:  0.72) msec latency[RUN #1 15%,   3 secs] 15 threads 40 conns:     2491658 ops,  826064 (avg:  830361) ops/sec, 116.51MB/sec (avg: 117.11MB/sec),  0.72 (avg:  0.72) msec latency[RUN #1 20%,   4 secs] 15 threads 40 conns:     3325837 ops,  833749 (avg:  831208) ops/sec, 117.59MB/sec (avg: 117.23MB/sec),  0.72 (avg:  0.72) msec latency[RUN #1 25%,   5 secs] 15 threads 40 conns:     4164744 ops,  838724 (avg:  832711) ops/sec, 118.29MB/sec (avg: 117.44MB/sec),  0.71 (avg:  0.72) msec latency[RUN #1 30%,   6 secs] 15 threads 40 conns:     4995497 ops,  830117 (avg:  832279) ops/sec, 117.08MB/sec (avg: 117.38MB/sec),  0.72 (avg:  0.72) msec latency[RUN #1 35%,   7 secs] 15 threads 40 conns:     5823272 ops,  827610 (avg:  831612) ops/sec, 116.72MB/sec (avg: 117.29MB/sec),  0.72 (avg:  0.72) msec latency[RUN #1 40%,   8 secs] 15 threads 40 conns:     6666566 ops,  843089 (avg:  833046) ops/sec, 118.91MB/sec (avg: 117.49MB/sec),  0.71 (avg:  0.72) msec latency[RUN #1 45%,   9 secs] 15 threads 40 conns:     7510933 ops,  844180 (avg:  834283) ops/sec, 119.06MB/sec (avg: 117.67MB/sec),  0.71 (avg:  0.72) msec latency[RUN #1 50%,  10 secs] 15 threads 40 conns:     8346008 ops,  834781 (avg:  834333) ops/sec, 117.74MB/sec (avg: 117.67MB/sec),  0.72 (avg:  0.72) msec latency[RUN #1 55%,  11 secs] 15 threads 40 conns:     9170105 ops,  823260 (avg:  833326) ops/sec, 116.11MB/sec (avg: 117.53MB/sec),  0.73 (avg:  0.72) msec latency[RUN #1 60%,  12 secs] 15 threads 40 conns:    10007812 ops,  837448 (avg:  833669) ops/sec, 118.11MB/sec (avg: 117.58MB/sec),  0.71 (avg:  0.72) msec latency[RUN #1 65%,  13 secs] 15 threads 40 conns:    10838434 ops,  830381 (avg:  833416) ops/sec, 117.12MB/sec (avg: 117.54MB/sec),  0.72 (avg:  0.72) msec latency[RUN #1 70%,  14 secs] 15 threads 40 conns:    11654462 ops,  815859 (avg:  832162) ops/sec, 115.07MB/sec (avg: 117.37MB/sec),  0.73 (avg:  0.72) msec latency[RUN #1 75%,  15 secs] 15 threads 40 conns:    12469764 ops,  815117 (avg:  831026) ops/sec, 114.96MB/sec (avg: 117.21MB/sec),  0.73 (avg:  0.72) msec latency[RUN #1 80%,  16 secs] 15 threads 40 conns:    13292389 ops,  822458 (avg:  830491) ops/sec, 116.00MB/sec (avg: 117.13MB/sec),  0.73 (avg:  0.72) msec latency[RUN #1 85%,  17 secs] 15 threads 40 conns:    14107403 ops,  814408 (avg:  829544) ops/sec, 114.86MB/sec (avg: 117.00MB/sec),  0.74 (avg:  0.72) msec latency[RUN #1 90%,  18 secs] 15 threads 40 conns:    14927471 ops,  819867 (avg:  829007) ops/sec, 115.63MB/sec (avg: 116.92MB/sec),  0.73 (avg:  0.72) msec latency[RUN #1 95%,  19 secs] 15 threads 40 conns:    15736764 ops,  809113 (avg:  827960) ops/sec, 114.12MB/sec (avg: 116.77MB/sec),  0.74 (avg:  0.72) msec latency[RUN #1 100%,  20 secs] 13 threads 40 conns:    16555464 ops,  809113 (avg:  827630) ops/sec, 114.12MB/sec (avg: 116.73MB/sec),  0.74 (avg:  0.72) msec latency[RUN #1 100%,  20 secs]  0 threads 40 conns:    16555504 ops,  809113 (avg:  827630) ops/sec, 114.12MB/sec (avg: 116.73MB/sec),  0.74 (avg:  0.72) msec latency
+
+Writing Full Run command HDR latency histogram results to /home/azureuser/results-extra/kividb-rc8/r4/d100/set_p1.c1_FULL_RUN_1.txt...
+Writing Full Run command HDR latency histogram results in HistogramLogProcessor format to /home/azureuser/results-extra/kividb-rc8/r4/d100/set_p1.c1_FULL_RUN_1.hgrm...
+Writing SET command HDR latency histogram results to /home/azureuser/results-extra/kividb-rc8/r4/d100/set_p1.c1_SET_command_run_1.txt...
+Writing SET command HDR latency histogram results in HistogramLogProcessor format to /home/azureuser/results-extra/kividb-rc8/r4/d100/set_p1.c1_SET_command_run_1.hgrm...
+
+CPU Utilization Summary
+  Total CPU time:   299.768s  (user 79.188s, sys 220.580s)
+  Wall time:        20.008s
+  Cores used:       14.982   (avg 99.9% across 15 worker threads)
+  Peak utilization: 1498.9%
+warning: thread 0 averaged 99.8% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 1 averaged 99.9% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 2 averaged 99.9% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 3 averaged 99.9% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 4 averaged 99.9% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 5 averaged 99.9% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 6 averaged 99.9% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 7 averaged 99.9% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 8 averaged 99.8% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 9 averaged 99.9% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 10 averaged 99.8% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 11 averaged 99.9% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 12 averaged 99.8% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 13 averaged 99.9% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 14 averaged 99.9% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+Saving JSON output file: /home/azureuser/results-extra/kividb-rc8/r4/d100/set_p1.c1.json
+Json file closed.
+15        Threads
+40        Connections per thread
+20        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       827634.75          ---          ---         0.72388         0.71100         1.07900         2.04700    119529.19 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     827634.75         0.00         0.00         0.72388         0.71100         1.07900         2.04700    119529.19 
+rc=0

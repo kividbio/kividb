@@ -1,0 +1,28 @@
+10.81.1.12:7002 (1290b4e8...) -> 792883 keys | 5833 slots | 1 slaves.
+10.81.1.11:7002 (4e016f60...) -> 673898 keys | 4961 slots | 1 slaves.
+10.81.1.12:7001 (5e667a35...) -> 768284 keys | 5590 slots | 1 slaves.
+[OK] 2235065 keys in 3 masters.
+136.42 keys per slot on average.
+>>> Performing Cluster Check (using node 10.81.1.11:7001)
+S: d4c4464d2d48fae9c38e255f6810953c6cf7814d 10.81.1.11:7001
+   slots: (0 slots) slave
+   replicates 1290b4e8473f13983f2dc4013f2f2233a8201537
+M: 1290b4e8473f13983f2dc4013f2f2233a8201537 10.81.1.12:7002
+   slots:[128-5460],[10923-11422] (5833 slots) master
+   1 additional replica(s)
+S: 2df4f63cef491483ac6b4d74bfdd147ed86cb567 10.81.1.13:7001
+   slots: (0 slots) slave
+   replicates 4e016f60d915b85f51ecf07e95471bcd5ed1f588
+M: 4e016f60d915b85f51ecf07e95471bcd5ed1f588 10.81.1.11:7002
+   slots:[11423-16383] (4961 slots) master
+   1 additional replica(s)
+S: 582b3c6cbea1c791d1e20cfa6b64772358585bfd 10.81.1.13:7002
+   slots: (0 slots) slave
+   replicates 5e667a35db409fe9cdc699204b094d5992dd564c
+M: 5e667a35db409fe9cdc699204b094d5992dd564c 10.81.1.12:7001
+   slots:[0-127],[5461-10922] (5590 slots) master
+   1 additional replica(s)
+[OK] All nodes agree about slots configuration.
+>>> Check for open slots...
+>>> Check slots coverage...
+[OK] All 16384 slots covered.

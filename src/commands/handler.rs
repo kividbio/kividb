@@ -452,6 +452,14 @@ fn writes_keys_of_several_shards(ctx: &Ctx, name: &str, cmd0: &[u8]) -> bool {
     first.is_none() || shards.any(|shard| shard != first)
 }
 
+/// The order of the keys of an `MSET` or `MSETNX`, held shared (see
+/// `write_order::lock_keys_shared`). Out of line: not on the way of the
+/// one-key writes, which go through the same `run_command`.
+#[inline(never)]
+fn order_of_pairs_shared(ctx: &Ctx) -> crate::write_order::OrderGuard {
+    crate::write_order::lock_keys_shared(*ctx.selected_db, ctx.cmd[1..].iter().step_by(2).copied())
+}
+
 fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     // Re-derive cmd0/name from ctx.cmd in case parts were modified (XREAD BLOCK stripping).
     let cmd0 = ctx.cmd[0];
@@ -1007,9 +1015,10 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // a time, and a cut in the middle of one would be a cut in the middle of
     // something that is supposed to be atomic.
     //
-    // MIGRATE is deliberately not gated. It blocks on the network for up to
-    // its timeout, which would stall every write behind a cut, and it needs no
-    // protection: it propagates as an idempotent `DEL`.
+    // MIGRATE is deliberately not gated here. It blocks on the network for up
+    // to its timeout, and takes what it needs itself, for no longer than it
+    // must (`commands::cluster::hold_while_moving`); it propagates as an
+    // idempotent `DEL`.
     //
     // Nor is FT.DROPINDEX here: with `DD` it may delete millions of documents,
     // and it takes the gate, and the order of their keys, a few at a time
@@ -1087,17 +1096,42 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // paused writes, and this one got past the pause before it was set. It
     // must not run behind the handoff's back (see `pause::HANDOFF`): out of
     // the gate, wait, and then answer as whoever owns the key now would.
-    while gated && !nested && !ctx.apply_replication && crate::pause::handoff() {
+    //
+    // The same one load finds a `MIGRATE` holding keys here (`key_moves`): a
+    // write to one of them waits until it has gone, or stayed, and is then
+    // answered as the slot's state says — `-ASK` for a key that left. A
+    // write to other keys goes on.
+    while gated && !nested && !ctx.apply_replication && crate::pause::writes_must_check() {
+        let handoff = crate::pause::handoff();
+        if !handoff
+            && !crate::key_moves::names_a_moving_key(*ctx.selected_db, name, ctx.cmd.as_slice())
+        {
+            break;
+        }
         _write_gate = None;
-        crate::pause::wait_out_handoff();
+        if handoff {
+            crate::pause::wait_out_handoff();
+        } else {
+            crate::key_moves::wait_until_moved(*ctx.selected_db, name, ctx.cmd.as_slice());
+        }
         if ctx.cluster.enabled {
+            let store = ctx.store;
+            let db = *ctx.selected_db;
             let decision = crate::cluster::routing::route_named(
                 name,
                 ctx.cmd.as_slice(),
                 ctx.cluster,
                 false,
                 || false,
-                |_| true,
+                // After a handoff, whoever owns the slot; after a move, also
+                // whether the key is still here.
+                |key| {
+                    handoff
+                        || std::str::from_utf8(key).is_ok_and(|key| {
+                            crate::read_lock!(crate::store::get_shard(&store[db], key))
+                                .contains_key(key)
+                        })
+                },
             );
             if let Some(refusal) = decision.refusal() {
                 return refusal;
@@ -1168,6 +1202,13 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
             *ctx.selected_db,
             ctx.cmd[1],
         ))
+    } else if ordered && matches!(name, "MSET" | "MSETNX") && !replication::write_is_observed(ctx) {
+        // Each key's order shared: both write every key under all of their
+        // shards' locks at once (`WriteShards`), so the shards order them
+        // against each other and against the writes above; see
+        // `write_order::lock_keys_shared`. Whole while anything reads the
+        // write stream, as every other write is.
+        Some(order_of_pairs_shared(ctx))
     } else if ordered {
         let keys = crate::keyspec::key_positions(name, &ctx.cmd);
         let here = *ctx.selected_db;

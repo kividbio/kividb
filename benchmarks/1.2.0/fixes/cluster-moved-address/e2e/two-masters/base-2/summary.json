@@ -1,0 +1,101 @@
+{
+ "label": "base",
+ "scenario": "two-masters",
+ "rep": "2",
+ "node_timeout_ms": 5000,
+ "down_s": 10.0,
+ "moving": [
+  "n1",
+  "n2"
+ ],
+ "new_ips": {
+  "n1": "10.99.0.21",
+  "n2": "10.99.0.22"
+ },
+ "restart_after_kill_s": 10.03,
+ "moved_views_converged_s": null,
+ "all_views_and_state_ok_s": null,
+ "cluster_state_ok_everywhere_s": 10.97,
+ "flaps_after_restart": 0,
+ "per_observer_moved_view_ok_s": {
+  "n1": null,
+  "n2": null,
+  "n3": 11.47,
+  "n4": 10.97,
+  "n5": 10.97,
+  "n6": 10.97
+ },
+ "observed_after_restart_s": 180.01,
+ "writes_failed_after_kill": 204,
+ "writes_clusterdown_after_kill": 116,
+ "writes_attempted_after_kill": 33547,
+ "last_failed_write_s_after_kill": 184,
+ "last_clusterdown_s_after_kill": 21,
+ "failed_seconds_after_restart": 37,
+ "clusterdown_seconds": 7,
+ "clusterdown_from": [
+  "10.99.0.13",
+  "10.99.0.22"
+ ],
+ "other_errors": [],
+ "address_sequences": {
+  "n1->n1": [
+   "127.0.0.1",
+   "10.99.0.21"
+  ],
+  "n2->n2": [
+   "127.0.0.1",
+   "10.99.0.22"
+  ],
+  "n3->n1": [
+   "10.99.0.11",
+   "10.99.0.21"
+  ],
+  "n3->n2": [
+   "10.99.0.12",
+   "10.99.0.22"
+  ],
+  "n4->n1": [
+   "10.99.0.11",
+   "10.99.0.21"
+  ],
+  "n4->n2": [
+   "10.99.0.12",
+   "10.99.0.22"
+  ],
+  "n5->n1": [
+   "10.99.0.11",
+   "10.99.0.21"
+  ],
+  "n5->n2": [
+   "10.99.0.12",
+   "10.99.0.22"
+  ],
+  "n6->n1": [
+   "10.99.0.11",
+   "10.99.0.21"
+  ],
+  "n6->n2": [
+   "10.99.0.12",
+   "10.99.0.22"
+  ]
+ },
+ "events": [
+  [
+   3.905,
+   "cluster formed {'n1': '2e508333f9568441d71884a3d88bb8daeb407f19', 'n2': '6ab284ce7f9ae3fa1389f632ac6d9bd24441d77f', 'n3': '75ad4acefea3bd8e117b955bfcd9ca1eee608f74', 'n4': '9e4152e28b1342b84439241e68621c0455a73017', 'n5': '344f557d7f2f961cb4bf17eead01b8411caa4fea', 'n6': '9fd92022630070465c406a99aca494d08d082c86'}"
+  ],
+  [
+   23.906,
+   "stop ['n1', 'n2']"
+  ],
+  [
+   24.012,
+   "re-IP {'n1': '10.99.0.21', 'n2': '10.99.0.22'}"
+  ],
+  [
+   33.939,
+   "restarted ['n1', 'n2']"
+  ]
+ ]
+}

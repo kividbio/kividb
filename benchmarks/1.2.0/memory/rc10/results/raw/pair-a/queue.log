@@ -1,0 +1,246 @@
+### 2026-11-03T15:49:25Z start: ./warefeats.sh engine-a 25 full kividb-rc10 kividb-rc8 > /var/tmp/wf-r1.log 2>&1
+### 2026-11-03T16:17:33Z end (exit 0): ./warefeats.sh engine-a 25 full kividb-rc10 kividb-rc8 > /var/tmp/wf-r1.log 2>&1
+### 2026-11-03T16:17:33Z start: R=r1 ./growth.sh kividb-rc10 100 1000000,5000000,10000000,25000000,50000000
+kividb-rc10 plain kividb/kividb:build-39bfacd231bb redis_version:8.10.0 kividb_version:1.2.0-rc10 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+backlog: repl-backlog-size=67108864 role:master connected_slaves:0 repl_backlog_active:0 repl_backlog_size:67108864 repl_backlog_histlen:0 
+sampler started for growth-kividb-rc10-100-random-r1 (pid 15028, /sys/fs/cgroup/system.slice/docker-1f1e6fa3ac3929728518967c153c55551d33e6f49fd40ffc7c29af3735f0739e.scope)
+[16:17:41] growth-kividb-rc10-100-random-r1 start
+[16:17:41] growth-kividb-rc10-100-random-r1 load-to-1000000
+[16:17:43] growth-kividb-rc10-100-random-r1 loaded-1000000
+  1000000 keys: RSS 162.5 MB (153.0 B/key) used 142.9 MB (146.9 B/key) keys 1000000
+[16:17:53] growth-kividb-rc10-100-random-r1 load-to-5000000
+[16:17:55] growth-kividb-rc10-100-random-r1 loaded-5000000
+  5000000 keys: RSS 715.9 MB (146.7 B/key) used 685.2 MB (143.1 B/key) keys 5000000
+[16:18:05] growth-kividb-rc10-100-random-r1 load-to-10000000
+[16:18:06] growth-kividb-rc10-100-random-r1 loaded-10000000
+  10000000 keys: RSS 1398.4 MB (144.9 B/key) used 1367.6 MB (143.1 B/key) keys 10000000
+[16:18:16] growth-kividb-rc10-100-random-r1 load-to-25000000
+[16:18:20] growth-kividb-rc10-100-random-r1 loaded-25000000
+  25000000 keys: RSS 3377.4 MB (141.0 B/key) used 3342.6 MB (140.1 B/key) keys 25000000
+[16:18:30] growth-kividb-rc10-100-random-r1 load-to-50000000
+[16:18:35] growth-kividb-rc10-100-random-r1 loaded-50000000
+  50000000 keys: RSS 6723.5 MB (140.7 B/key) used 6682.4 MB (140.1 B/key) keys 50000000
+[16:18:46] growth-kividb-rc10-100-random-r1 end
+### 2026-11-03T16:18:50Z end (exit 0): R=r1 ./growth.sh kividb-rc10 100 1000000,5000000,10000000,25000000,50000000
+### 2026-11-03T16:18:50Z start: R=r1 ./growth.sh kividb-rc8 100 1000000,5000000,10000000,25000000,50000000
+kividb-rc8 plain kividb/kividb:build-082dab3d8929 redis_version:8.10.0 kividb_version:1.2.0-rc8 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+backlog: repl-backlog-size=1048576 role:master connected_slaves:0 repl_backlog_active:0 repl_backlog_size:1048576 repl_backlog_histlen:0 
+sampler started for growth-kividb-rc8-100-random-r1 (pid 15915, /sys/fs/cgroup/system.slice/docker-7b1f975a1572330c97298485747819f8eaa7530df9968e3ed97e108d829f2b75.scope)
+[16:18:58] growth-kividb-rc8-100-random-r1 start
+[16:18:58] growth-kividb-rc8-100-random-r1 load-to-1000000
+[16:18:59] growth-kividb-rc8-100-random-r1 loaded-1000000
+  1000000 keys: RSS 162.9 MB (153.3 B/key) used 142.9 MB (146.9 B/key) keys 1000000
+[16:19:10] growth-kividb-rc8-100-random-r1 load-to-5000000
+[16:19:11] growth-kividb-rc8-100-random-r1 loaded-5000000
+  5000000 keys: RSS 714.2 MB (146.3 B/key) used 685.2 MB (143.1 B/key) keys 5000000
+[16:19:21] growth-kividb-rc8-100-random-r1 load-to-10000000
+[16:19:23] growth-kividb-rc8-100-random-r1 loaded-10000000
+  10000000 keys: RSS 1397.8 MB (144.8 B/key) used 1367.6 MB (143.1 B/key) keys 10000000
+[16:19:33] growth-kividb-rc8-100-random-r1 load-to-25000000
+[16:19:36] growth-kividb-rc8-100-random-r1 loaded-25000000
+  25000000 keys: RSS 3377.3 MB (141.0 B/key) used 3342.6 MB (140.1 B/key) keys 25000000
+[16:19:47] growth-kividb-rc8-100-random-r1 load-to-50000000
+[16:19:51] growth-kividb-rc8-100-random-r1 loaded-50000000
+  50000000 keys: RSS 6723.3 MB (140.6 B/key) used 6682.4 MB (140.1 B/key) keys 50000000
+[16:20:02] growth-kividb-rc8-100-random-r1 end
+### 2026-11-03T16:20:05Z end (exit 0): R=r1 ./growth.sh kividb-rc8 100 1000000,5000000,10000000,25000000,50000000
+### 2026-11-03T16:20:05Z start: R=r1 ./growth.sh kividb-rc8 1024 1000000,5000000,10000000,25000000,50000000
+kividb-rc8 plain kividb/kividb:build-082dab3d8929 redis_version:8.10.0 kividb_version:1.2.0-rc8 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+backlog: repl-backlog-size=1048576 role:master connected_slaves:0 repl_backlog_active:0 repl_backlog_size:1048576 repl_backlog_histlen:0 
+sampler started for growth-kividb-rc8-1024-random-r1 (pid 16803, /sys/fs/cgroup/system.slice/docker-e873b577d02eaecd77b79d4e8a2f4e31b52afc8be4a8f46f48eb274229d21876.scope)
+[16:20:13] growth-kividb-rc8-1024-random-r1 start
+[16:20:13] growth-kividb-rc8-1024-random-r1 load-to-1000000
+[16:20:15] growth-kividb-rc8-1024-random-r1 loaded-1000000
+  1000000 keys: RSS 1052.2 MB (1085.9 B/key) used 1027.9 MB (1074.9 B/key) keys 1000000
+[16:20:25] growth-kividb-rc8-1024-random-r1 load-to-5000000
+[16:20:27] growth-kividb-rc8-1024-random-r1 loaded-5000000
+  5000000 keys: RSS 5154.6 MB (1077.5 B/key) used 5110.3 MB (1071.1 B/key) keys 5000000
+[16:20:38] growth-kividb-rc8-1024-random-r1 load-to-10000000
+[16:20:40] growth-kividb-rc8-1024-random-r1 loaded-10000000
+  10000000 keys: RSS 10279.2 MB (1076.1 B/key) used 10217.7 MB (1071.1 B/key) keys 10000000
+[16:20:51] growth-kividb-rc8-1024-random-r1 load-to-25000000
+[16:20:57] growth-kividb-rc8-1024-random-r1 loaded-25000000
+  25000000 keys: RSS 25575.3 MB (1072.0 B/key) used 25468.0 MB (1068.1 B/key) keys 25000000
+[16:21:07] growth-kividb-rc8-1024-random-r1 load-to-50000000
+[16:21:18] growth-kividb-rc8-1024-random-r1 loaded-50000000
+  50000000 keys: RSS 51116.6 MB (1071.6 B/key) used 50933.1 MB (1068.1 B/key) keys 50000000
+[16:21:28] growth-kividb-rc8-1024-random-r1 end
+### 2026-11-03T16:21:32Z end (exit 0): R=r1 ./growth.sh kividb-rc8 1024 1000000,5000000,10000000,25000000,50000000
+### 2026-11-03T16:21:32Z start: R=r1 ./growth.sh kividb-rc10 1024 1000000,5000000,10000000,25000000,50000000
+kividb-rc10 plain kividb/kividb:build-39bfacd231bb redis_version:8.10.0 kividb_version:1.2.0-rc10 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+backlog: repl-backlog-size=67108864 role:master connected_slaves:0 repl_backlog_active:0 repl_backlog_size:67108864 repl_backlog_histlen:0 
+sampler started for growth-kividb-rc10-1024-random-r1 (pid 17692, /sys/fs/cgroup/system.slice/docker-8196e179c87a7afb917f0b3ee99aa5d4f32a259493902ef0b81654ea6a1267d3.scope)
+[16:21:41] growth-kividb-rc10-1024-random-r1 start
+[16:21:41] growth-kividb-rc10-1024-random-r1 load-to-1000000
+[16:21:42] growth-kividb-rc10-1024-random-r1 loaded-1000000
+  1000000 keys: RSS 1051.6 MB (1085.2 B/key) used 1027.9 MB (1074.9 B/key) keys 1000000
+[16:21:53] growth-kividb-rc10-1024-random-r1 load-to-5000000
+[16:21:55] growth-kividb-rc10-1024-random-r1 loaded-5000000
+  5000000 keys: RSS 5156.7 MB (1077.9 B/key) used 5110.3 MB (1071.1 B/key) keys 5000000
+[16:22:06] growth-kividb-rc10-1024-random-r1 load-to-10000000
+[16:22:08] growth-kividb-rc10-1024-random-r1 loaded-10000000
+  10000000 keys: RSS 10279.9 MB (1076.2 B/key) used 10217.7 MB (1071.1 B/key) keys 10000000
+[16:22:18] growth-kividb-rc10-1024-random-r1 load-to-25000000
+[16:22:25] growth-kividb-rc10-1024-random-r1 loaded-25000000
+  25000000 keys: RSS 25576.0 MB (1072.0 B/key) used 25468.0 MB (1068.1 B/key) keys 25000000
+[16:22:35] growth-kividb-rc10-1024-random-r1 load-to-50000000
+[16:22:45] growth-kividb-rc10-1024-random-r1 loaded-50000000
+  50000000 keys: RSS 51117.6 MB (1071.7 B/key) used 50933.1 MB (1068.1 B/key) keys 50000000
+[16:22:56] growth-kividb-rc10-1024-random-r1 end
+### 2026-11-03T16:23:00Z end (exit 0): R=r1 ./growth.sh kividb-rc10 1024 1000000,5000000,10000000,25000000,50000000
+### 2026-11-03T16:23:00Z start: R=r1 WIN=300 PRE=30 ./snapshot.sh kividb-rc10
+kividb-rc10 persist kividb/kividb:build-39bfacd231bb redis_version:8.10.0 kividb_version:1.2.0-rc10 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data --aof --aof-rewrite-percentage 0]
+backlog: repl-backlog-size=67108864 role:master connected_slaves:0 repl_backlog_active:0 repl_backlog_size:67108864 repl_backlog_histlen:0 
+sampler started for snap-kividb-rc10-r1 (pid 18587, /sys/fs/cgroup/system.slice/docker-27a1cc300dd35f8dbe337a83c47404841a3a49494cae34d4da142e9de3f3258f.scope)
+[16:23:09] snap-kividb-rc10-r1 load
+[16:23:38] snap-kividb-rc10-r1 loaded
+[16:24:08] snap-kividb-rc10-r1 bgsave-window-start
+[16:24:38] snap-kividb-rc10-r1 bgsave-issued
+Background saving started
+[16:26:00] snap-kividb-rc10-r1 bgsave-done
+[16:29:09] snap-kividb-rc10-r1 bgsave-window-end
+[16:29:29] snap-kividb-rc10-r1 aofrw-window-start
+[16:29:59] snap-kividb-rc10-r1 aofrw-issued
+Background append only file rewriting started
+[16:31:22] snap-kividb-rc10-r1 aofrw-done
+[16:34:29] snap-kividb-rc10-r1 aofrw-window-end
+[16:34:50] snap-kividb-rc10-r1 end
+### 2026-11-03T16:34:56Z end (exit 0): R=r1 WIN=300 PRE=30 ./snapshot.sh kividb-rc10
+### 2026-11-03T16:34:56Z start: R=r1 WIN=300 PRE=30 ./snapshot.sh kividb-rc8
+kividb-rc8 persist kividb/kividb:build-082dab3d8929 redis_version:8.10.0 kividb_version:1.2.0-rc8 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data --aof --aof-rewrite-percentage 0]
+backlog: repl-backlog-size=1048576 role:master connected_slaves:0 repl_backlog_active:0 repl_backlog_size:1048576 repl_backlog_histlen:0 
+sampler started for snap-kividb-rc8-r1 (pid 19355, /sys/fs/cgroup/system.slice/docker-33dec041f893241a2a1ee041d74467f807649d1a0be4d7f1bdaa56524806a2f6.scope)
+[16:35:05] snap-kividb-rc8-r1 load
+[16:35:35] snap-kividb-rc8-r1 loaded
+[16:36:05] snap-kividb-rc8-r1 bgsave-window-start
+[16:36:35] snap-kividb-rc8-r1 bgsave-issued
+Background saving started
+[16:37:57] snap-kividb-rc8-r1 bgsave-done
+[16:41:06] snap-kividb-rc8-r1 bgsave-window-end
+[16:41:26] snap-kividb-rc8-r1 aofrw-window-start
+[16:41:56] snap-kividb-rc8-r1 aofrw-issued
+Background append only file rewriting started
+[16:43:20] snap-kividb-rc8-r1 aofrw-done
+[16:46:26] snap-kividb-rc8-r1 aofrw-window-end
+[16:46:47] snap-kividb-rc8-r1 end
+### 2026-11-03T16:46:54Z end (exit 0): R=r1 WIN=300 PRE=30 ./snapshot.sh kividb-rc8
+### 2026-11-03T16:46:54Z start: R=r1 ./evict.sh kividb-rc8
+kividb-rc8 plain kividb/kividb:build-082dab3d8929 redis_version:8.10.0 kividb_version:1.2.0-rc8 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+backlog: repl-backlog-size=1048576 role:master connected_slaves:0 repl_backlog_active:0 repl_backlog_size:1048576 repl_backlog_histlen:0 
+sampler started for evict-kividb-rc8-r1 (pid 20245, /sys/fs/cgroup/system.slice/docker-f5b1bf26242fc60c018c2f1aaad4dff53a5542c3544d3adea9f4c73ed000e540.scope)
+[16:47:02] evict-kividb-rc8-r1 load
+[16:47:06] evict-kividb-rc8-r1 loaded
+OK
+OK
+used_memory=10714044024 maxmemory=11785448426
+evicted_keys:0
+dbsize_before=10000000
+[16:47:26] evict-kividb-rc8-r1 writes-start
+[16:48:26] evict-kividb-rc8-r1 bgsave-issued
+Background saving started
+[16:48:49] evict-kividb-rc8-r1 bgsave-done
+[16:52:27] evict-kividb-rc8-r1 writes-end
+dbsize_after=10000000
+evicted_keys:0
+used_memory:10716193556
+maxmemory:11785448426
+mem_not_counted_for_evict:0
+[16:52:32] evict-kividb-rc8-r1 end
+### 2026-11-03T16:52:35Z end (exit 0): R=r1 ./evict.sh kividb-rc8
+### 2026-11-03T16:52:35Z start: R=r1 ./evict.sh kividb-rc10
+kividb-rc10 plain kividb/kividb:build-39bfacd231bb redis_version:8.10.0 kividb_version:1.2.0-rc10 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+backlog: repl-backlog-size=67108864 role:master connected_slaves:0 repl_backlog_active:0 repl_backlog_size:67108864 repl_backlog_histlen:0 
+sampler started for evict-kividb-rc10-r1 (pid 20985, /sys/fs/cgroup/system.slice/docker-c050e472153499436f8a6dd4115b273b203678187d417a2fa2305f74f93e05e5.scope)
+[16:52:44] evict-kividb-rc10-r1 load
+[16:52:48] evict-kividb-rc10-r1 loaded
+OK
+OK
+used_memory=10714044874 maxmemory=11785449361
+evicted_keys:0
+dbsize_before=10000000
+[16:53:08] evict-kividb-rc10-r1 writes-start
+[16:54:08] evict-kividb-rc10-r1 bgsave-issued
+Background saving started
+[16:54:30] evict-kividb-rc10-r1 bgsave-done
+[16:58:09] evict-kividb-rc10-r1 writes-end
+dbsize_after=10000000
+evicted_keys:0
+used_memory:10716148330
+maxmemory:11785449361
+mem_not_counted_for_evict:0
+[16:58:14] evict-kividb-rc10-r1 end
+### 2026-11-03T16:58:17Z end (exit 0): R=r1 ./evict.sh kividb-rc10
+### 2026-11-03T16:58:17Z start: R=r2 ./growth.sh kividb-rc8 100 1000000,5000000,10000000,25000000,50000000
+kividb-rc8 plain kividb/kividb:build-082dab3d8929 redis_version:8.10.0 kividb_version:1.2.0-rc8 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+backlog: repl-backlog-size=1048576 role:master connected_slaves:0 repl_backlog_active:0 repl_backlog_size:1048576 repl_backlog_histlen:0 
+sampler started for growth-kividb-rc8-100-random-r2 (pid 21653, /sys/fs/cgroup/system.slice/docker-57864a01f44c6a502a0a9e719e78aada711721f61514be5d72d77d17a3c4d9b9.scope)
+[16:58:26] growth-kividb-rc8-100-random-r2 start
+[16:58:26] growth-kividb-rc8-100-random-r2 load-to-1000000
+[16:58:27] growth-kividb-rc8-100-random-r2 loaded-1000000
+  1000000 keys: RSS 163.3 MB (153.6 B/key) used 142.9 MB (146.9 B/key) keys 1000000
+[16:58:38] growth-kividb-rc8-100-random-r2 load-to-5000000
+[16:58:39] growth-kividb-rc8-100-random-r2 loaded-5000000
+  5000000 keys: RSS 714.9 MB (146.4 B/key) used 685.2 MB (143.1 B/key) keys 5000000
+[16:58:49] growth-kividb-rc8-100-random-r2 load-to-10000000
+[16:58:51] growth-kividb-rc8-100-random-r2 loaded-10000000
+  10000000 keys: RSS 1398.6 MB (144.9 B/key) used 1367.6 MB (143.1 B/key) keys 10000000
+[16:59:01] growth-kividb-rc8-100-random-r2 load-to-25000000
+[16:59:04] growth-kividb-rc8-100-random-r2 loaded-25000000
+  25000000 keys: RSS 3378.8 MB (141.0 B/key) used 3342.6 MB (140.1 B/key) keys 25000000
+[16:59:15] growth-kividb-rc8-100-random-r2 load-to-50000000
+[16:59:20] growth-kividb-rc8-100-random-r2 loaded-50000000
+  50000000 keys: RSS 6724.9 MB (140.7 B/key) used 6682.4 MB (140.1 B/key) keys 50000000
+[16:59:31] growth-kividb-rc8-100-random-r2 end
+### 2026-11-03T16:59:34Z end (exit 0): R=r2 ./growth.sh kividb-rc8 100 1000000,5000000,10000000,25000000,50000000
+### 2026-11-03T16:59:34Z start: R=r2 ./growth.sh kividb-rc10 100 1000000,5000000,10000000,25000000,50000000
+kividb-rc10 plain kividb/kividb:build-39bfacd231bb redis_version:8.10.0 kividb_version:1.2.0-rc10 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+backlog: repl-backlog-size=67108864 role:master connected_slaves:0 repl_backlog_active:0 repl_backlog_size:67108864 repl_backlog_histlen:0 
+sampler started for growth-kividb-rc10-100-random-r2 (pid 22559, /sys/fs/cgroup/system.slice/docker-cd74e2b91ae9b3ee67e999dde7b256412d0d9d40bece65b2824b3e495c075be6.scope)
+[16:59:42] growth-kividb-rc10-100-random-r2 start
+[16:59:42] growth-kividb-rc10-100-random-r2 load-to-1000000
+[16:59:44] growth-kividb-rc10-100-random-r2 loaded-1000000
+  1000000 keys: RSS 163.4 MB (153.9 B/key) used 142.9 MB (146.9 B/key) keys 1000000
+[16:59:54] growth-kividb-rc10-100-random-r2 load-to-5000000
+[16:59:55] growth-kividb-rc10-100-random-r2 loaded-5000000
+  5000000 keys: RSS 714.1 MB (146.3 B/key) used 685.2 MB (143.1 B/key) keys 5000000
+[17:00:06] growth-kividb-rc10-100-random-r2 load-to-10000000
+[17:00:07] growth-kividb-rc10-100-random-r2 loaded-10000000
+  10000000 keys: RSS 1398.7 MB (144.9 B/key) used 1367.6 MB (143.1 B/key) keys 10000000
+[17:00:18] growth-kividb-rc10-100-random-r2 load-to-25000000
+[17:00:21] growth-kividb-rc10-100-random-r2 loaded-25000000
+  25000000 keys: RSS 3377.8 MB (141.0 B/key) used 3342.6 MB (140.1 B/key) keys 25000000
+[17:00:31] growth-kividb-rc10-100-random-r2 load-to-50000000
+[17:00:36] growth-kividb-rc10-100-random-r2 loaded-50000000
+  50000000 keys: RSS 6724.0 MB (140.7 B/key) used 6682.4 MB (140.1 B/key) keys 50000000
+[17:00:46] growth-kividb-rc10-100-random-r2 end
+### 2026-11-03T17:00:49Z end (exit 0): R=r2 ./growth.sh kividb-rc10 100 1000000,5000000,10000000,25000000,50000000
+### 2026-11-03T17:00:49Z start: R=r2 WIN=300 PRE=30 ./snapshot.sh kividb-rc8
+kividb-rc8 persist kividb/kividb:build-082dab3d8929 redis_version:8.10.0 kividb_version:1.2.0-rc8 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data --aof --aof-rewrite-percentage 0]
+backlog: repl-backlog-size=1048576 role:master connected_slaves:0 repl_backlog_active:0 repl_backlog_size:1048576 repl_backlog_histlen:0 
+sampler started for snap-kividb-rc8-r2 (pid 23457, /sys/fs/cgroup/system.slice/docker-939f157069fd22f63f66f2b9d35de9a4213a4d6d80fdd4511df54e7de3c7737c.scope)
+[17:00:57] snap-kividb-rc8-r2 load
+[17:01:27] snap-kividb-rc8-r2 loaded
+[17:01:57] snap-kividb-rc8-r2 bgsave-window-start
+[17:02:27] snap-kividb-rc8-r2 bgsave-issued
+Background saving started
+[17:03:49] snap-kividb-rc8-r2 bgsave-done
+[17:06:57] snap-kividb-rc8-r2 bgsave-window-end
+[17:07:17] snap-kividb-rc8-r2 aofrw-window-start
+[17:07:47] snap-kividb-rc8-r2 aofrw-issued
+Background append only file rewriting started
+[17:09:11] snap-kividb-rc8-r2 aofrw-done
+[17:12:18] snap-kividb-rc8-r2 aofrw-window-end
+[17:12:39] snap-kividb-rc8-r2 end
+### 2026-11-03T17:12:45Z end (exit 0): R=r2 WIN=300 PRE=30 ./snapshot.sh kividb-rc8
+STOP 2026-11-03T17:12:45Z

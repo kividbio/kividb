@@ -1,0 +1,38 @@
+NAME                            READY   STATUS      RESTARTS      AGE     IP             NODE                                NOMINATED NODE   READINESS GATES
+cli                             1/1     Running     0             109m    10.244.2.67    aks-nodepool1-15662409-vmss000003   <none>           <none>
+curl                            1/1     Running     0             109m    10.244.2.4     aks-nodepool1-15662409-vmss000003   <none>           <none>
+fb-0                            2/2     Running     1 (46m ago)   105m    10.244.1.176   aks-nodepool1-15662409-vmss000001   <none>           <none>
+fb-1                            2/2     Running     1 (49m ago)   85m     10.244.0.177   aks-nodepool1-15662409-vmss000000   <none>           <none>
+g-113-0                         2/2     Running     0             35m     10.244.3.150   aks-nodepool1-15662409-vmss000002   <none>           <none>
+g-113-1                         2/2     Running     0             105m    10.244.1.226   aks-nodepool1-15662409-vmss000001   <none>           <none>
+g-bad-0                         2/2     Running     0             85m     10.244.1.62    aks-nodepool1-15662409-vmss000001   <none>           <none>
+g-bad-1                         2/2     Running     0             31m     10.244.0.101   aks-nodepool1-15662409-vmss000000   <none>           <none>
+g-no-0                          2/2     Running     0             105m    10.244.1.244   aks-nodepool1-15662409-vmss000001   <none>           <none>
+g-no-1                          2/2     Running     0             40m     10.244.3.101   aks-nodepool1-15662409-vmss000002   <none>           <none>
+g-yes-0                         2/2     Running     0             105m    10.244.1.101   aks-nodepool1-15662409-vmss000001   <none>           <none>
+g-yes-1                         2/2     Running     0             26m     10.244.3.98    aks-nodepool1-15662409-vmss000002   <none>           <none>
+loader-fb-6f54df6459-hd4fh      1/1     Running     0             103m    10.244.2.223   aks-nodepool1-15662409-vmss000003   <none>           <none>
+loader-g-113-5cb7c5b497-fdhlq   1/1     Running     0             103m    10.244.2.32    aks-nodepool1-15662409-vmss000003   <none>           <none>
+loader-g-bad-56566c5fc-qsqr9    1/1     Running     0             103m    10.244.2.65    aks-nodepool1-15662409-vmss000003   <none>           <none>
+loader-g-no-68d8c4d49-mmvzl     1/1     Running     0             103m    10.244.2.183   aks-nodepool1-15662409-vmss000003   <none>           <none>
+loader-g-yes-6cc675b4cc-9qz7k   1/1     Running     0             103m    10.244.2.31    aks-nodepool1-15662409-vmss000003   <none>           <none>
+loader-rep-5d989c958f-8gqm2     1/1     Running     0             108m    10.244.2.143   aks-nodepool1-15662409-vmss000003   <none>           <none>
+loader-shd-5bc5766c4c-z5cv7     1/1     Running     0             108m    10.244.2.21    aks-nodepool1-15662409-vmss000003   <none>           <none>
+nd-74b52                        1/1     Running     0             109m    10.244.0.61    aks-nodepool1-15662409-vmss000000   <none>           <none>
+nd-mj4jl                        1/1     Running     0             109m    10.244.2.94    aks-nodepool1-15662409-vmss000003   <none>           <none>
+nd-qz7zk                        1/1     Running     0             109m    10.244.1.210   aks-nodepool1-15662409-vmss000001   <none>           <none>
+nd-s6jg5                        1/1     Running     0             109m    10.244.3.157   aks-nodepool1-15662409-vmss000002   <none>           <none>
+rep-0                           2/2     Running     0             55m     10.244.3.34    aks-nodepool1-15662409-vmss000002   <none>           <none>
+rep-1                           2/2     Running     1 (51m ago)   57m     10.244.0.203   aks-nodepool1-15662409-vmss000000   <none>           <none>
+rep-2                           2/2     Running     0             56m     10.244.1.2     aks-nodepool1-15662409-vmss000001   <none>           <none>
+rep-bk-032310-hd8hg             0/1     Completed   0             13m     10.244.0.100   aks-nodepool1-15662409-vmss000000   <none>           <none>
+rep-restored-bootstrap-ln4ch    0/1     Error       0             8m41s   10.244.0.18    aks-nodepool1-15662409-vmss000000   <none>           <none>
+rep-restored-bootstrap-rjv2c    0/1     Error       0             8m54s   10.244.0.119   aks-nodepool1-15662409-vmss000000   <none>           <none>
+s3-847cfc5999-fssqn             1/1     Running     0             110m    10.244.2.63    aks-nodepool1-15662409-vmss000003   <none>           <none>
+shd-0-0                         2/2     Running     0             74m     10.244.3.192   aks-nodepool1-15662409-vmss000002   <none>           <none>
+shd-0-1                         2/2     Running     1 (90m ago)   98m     10.244.2.228   aks-nodepool1-15662409-vmss000003   <none>           <none>
+shd-1-0                         2/2     Running     0             75m     10.244.0.197   aks-nodepool1-15662409-vmss000000   <none>           <none>
+shd-1-1                         2/2     Running     1 (91m ago)   97m     10.244.0.141   aks-nodepool1-15662409-vmss000000   <none>           <none>
+shd-2-0                         2/2     Running     0             98m     10.244.1.80    aks-nodepool1-15662409-vmss000001   <none>           <none>
+shd-2-1                         2/2     Running     0             85m     10.244.2.194   aks-nodepool1-15662409-vmss000003   <none>           <none>
+shd-bk-032435-tcr72             0/1     Completed   0             11m     10.244.0.131   aks-nodepool1-15662409-vmss000000   <none>           <none>

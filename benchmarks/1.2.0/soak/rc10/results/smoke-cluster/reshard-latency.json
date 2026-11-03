@@ -1,0 +1,138 @@
+[
+ {
+  "round": 1,
+  "src_shard": "3000",
+  "dst_shard": "8000",
+  "exit": 0,
+  "seconds": 106.1,
+  "source_baseline_60s": {
+   "ops": 30000,
+   "errors": 0,
+   "p50_us": 709,
+   "p99_us": 3131,
+   "p999_us": 32057,
+   "worst_us": 61892
+  },
+  "source": {
+   "ops": 53028,
+   "errors": 0,
+   "p50_us": 41256,
+   "p99_us": 828638,
+   "p999_us": 1142140,
+   "worst_us": 1315090
+  },
+  "source_service": {
+   "ops": 53028,
+   "errors": 0,
+   "p50_us": 1404,
+   "p99_us": 73085,
+   "p999_us": 79103,
+   "worst_us": 113426
+  },
+  "source_service_baseline_60s": {
+   "ops": 30000,
+   "errors": 0,
+   "p50_us": 705,
+   "p99_us": 1888,
+   "p999_us": 31646,
+   "worst_us": 61892
+  },
+  "source_1s": {
+   "seconds": 107,
+   "p99_us_median_1s": 532991,
+   "p99_us_worst_1s": 1255423,
+   "seconds_with_stall": 107,
+   "max_stalled_conns": 8
+  },
+  "destination": {
+   "ops": 53029,
+   "errors": 0,
+   "p50_us": 696,
+   "p99_us": 3506,
+   "p999_us": 18546,
+   "worst_us": 38988
+  },
+  "destination_1s": {
+   "seconds": 107,
+   "p99_us_median_1s": 3115,
+   "p99_us_worst_1s": 28991,
+   "seconds_with_stall": 0,
+   "max_stalled_conns": 0
+  },
+  "third_shard": {
+   "ops": 53028,
+   "errors": 0,
+   "p50_us": 739,
+   "p99_us": 3238,
+   "p999_us": 16091,
+   "worst_us": 36846
+  },
+  "third_shard_1s": {
+   "seconds": 107,
+   "p99_us_median_1s": 2905,
+   "p99_us_worst_1s": 25007,
+   "seconds_with_stall": 0,
+   "max_stalled_conns": 0
+  },
+  "mixed": {
+   "ops_per_s_median": 23250,
+   "p99_us_median_1s": 33193983,
+   "max_us": 67108863,
+   "errors": 2
+  },
+  "cmd_source": {
+   "cluster|getkeysinslot": {
+    "calls": 2262,
+    "mean_us": 38204.4
+   },
+   "cluster|info": {
+    "calls": 88,
+    "mean_us": 837.5
+   },
+   "cluster|nodes": {
+    "calls": 2,
+    "mean_us": 317.0
+   },
+   "cluster|setslot": {
+    "calls": 256,
+    "mean_us": 35666.1
+   },
+   "cluster|slots": {
+    "calls": 294,
+    "mean_us": 641.3
+   },
+   "migrate": {
+    "calls": 2134,
+    "mean_us": 1254.4
+   }
+  },
+  "cmd_destination": {
+   "asking": {
+    "calls": 21009,
+    "mean_us": 6.2
+   },
+   "cluster|info": {
+    "calls": 88,
+    "mean_us": 563.6
+   },
+   "cluster|nodes": {
+    "calls": 2,
+    "mean_us": 359.5
+   },
+   "cluster|setslot": {
+    "calls": 256,
+    "mean_us": 1939.6
+   },
+   "cluster|slots": {
+    "calls": 255,
+    "mean_us": 358.8
+   },
+   "restore": {
+    "calls": 20783,
+    "mean_us": 15.5
+   }
+  },
+  "slowlog_source": {},
+  "slowlog_destination": {}
+ }
+]

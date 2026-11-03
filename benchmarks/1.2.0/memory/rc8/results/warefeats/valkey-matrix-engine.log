@@ -1,0 +1,10 @@
+engine-1  | 7:M 03 Nov 2026 04:09:52.157 # WARNING Memory overcommit must be enabled! Without it, a background save or replication may fail under low memory condition. Being disabled, it can also cause failures without low memory condition, see https://github.com/jemalloc/jemalloc/issues/1328. To fix this issue add 'vm.overcommit_memory = 1' to /etc/sysctl.conf and then reboot or run the command 'sysctl vm.overcommit_memory=1' for this to take effect.
+engine-1  | 7:M 03 Nov 2026 04:09:52.157 * oO0OoO0OoO0Oo Valkey is starting oO0OoO0OoO0Oo
+engine-1  | 7:M 03 Nov 2026 04:09:52.157 * Valkey version=9.1.3, bits=64, commit=00000000, modified=0, pid=7, just started
+engine-1  | 7:M 03 Nov 2026 04:09:52.157 * Configuration loaded
+engine-1  | 7:M 03 Nov 2026 04:09:52.158 * Increased maximum number of open files to 10032 (it was originally set to 1024).
+engine-1  | 7:M 03 Nov 2026 04:09:52.188 * monotonic clock: X86 TSC @ 2600.31 ticks/us
+engine-1  | 7:M 03 Nov 2026 04:09:52.188 * Running mode=standalone, port=6379.
+engine-1  | 7:M 03 Nov 2026 04:09:52.190 * Static Module 'lua' successfully loaded
+engine-1  | 7:M 03 Nov 2026 04:09:52.190 * Server initialized
+engine-1  | 7:M 03 Nov 2026 04:09:52.190 * Ready to accept connections tcp

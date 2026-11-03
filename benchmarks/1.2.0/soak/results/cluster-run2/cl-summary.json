@@ -1,0 +1,797 @@
+{
+ "soak_minutes": 120.0,
+ "ops_total": 719999733,
+ "errors_total": 4754,
+ "ops_per_s_median": 100000.0,
+ "p50_us_median_of_1s": 169.0,
+ "p99_us_median_of_1s": 8679.0,
+ "p999_us_median_of_1s": 23735.0,
+ "max_us": 67108863.0,
+ "error_kinds_total": {
+  "read": 46,
+  "dial": 4572,
+  "CLUSTERDOWN": 3,
+  "MOVED": 126,
+  "ASK": 6,
+  "EOF": 1
+ },
+ "events_raw": [
+  [
+   "10.0 min",
+   "failover-start slot=3000 master=10.70.1.9:7001 replica=10.70.1.10:7002"
+  ],
+  [
+   "10.0 min",
+   "failover-reply OK"
+  ],
+  [
+   "10.0 min",
+   "failover-promoted 10.70.1.10:7002 after 0.02 s"
+  ],
+  [
+   "10.1 min",
+   "failover-old-master-replica 10.70.1.9:7001 after 3.36 s"
+  ],
+  [
+   "10.1 min",
+   "failover-end cluster-ok after 0.12 s"
+  ],
+  [
+   "22.0 min",
+   "kill9-start slot=8000 master=10.70.1.10:7001 replica=10.70.1.7:7002"
+  ],
+  [
+   "22.0 min",
+   "kill9-killed 10.70.1.10:7001"
+  ],
+  [
+   "22.1 min",
+   "kill9-promoted 10.70.1.7:7002 after 6.28 s"
+  ],
+  [
+   "22.5 min",
+   "kill9-restarted 10.70.1.10:7001"
+  ],
+  [
+   "22.6 min",
+   "kill9-rejoined 10.70.1.10:7001 as replica after 5.57 s"
+  ],
+  [
+   "22.6 min",
+   "kill9-end cluster-ok after 0.19 s"
+  ],
+  [
+   "35.0 min",
+   "reshard-start 10 slots from 10.70.1.10:7002 (4f80c960cc0e9437b748f6aa93e2b24d111e33dd, 1562599 keys) to 10.70.1.7:7002 (39c17443e5977c09633deed1396120841beae3a9) with redis-cli"
+  ],
+  [
+   "35.0 min",
+   "reshard-attempt 1 exit=1 after 0.45 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:9565'. The copy sent to 10.70.1.7:7002 may be older; MIGRATE them again with REPLACE"
+  ],
+  [
+   "35.1 min",
+   "reshard-repair slot 0: {\"slot\": 0, \"src_keys_before\": 274, \"dst_keys_before\": 50, \"importing\": \"OK\", \"migrating\": \"OK\", \"migrated\": 175, \"tryagain\": 1, \"setslot_node\": {\"10.70.1.7:7002\": \"OK\", \"10.70.1.10:7002\": \"OK\", \"10.70.1.9:7001\": \"OK\", \"10.70.1.10:7001\": \"OK\", \"10.70.1.7:7001\": \"OK\", \"10.70.1.9:7002\": \"OK\"}, \"src_keys_after\": 0, \"dst_keys_after\": 323, \"seconds\": 2.34}"
+  ],
+  [
+   "35.1 min",
+   "reshard-attempt 2 exit=1 after 4.11 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:10261'. The copy sent to 10.70.1.7:7002 may be older; MIGRATE them again with REPLACE"
+  ],
+  [
+   "35.2 min",
+   "reshard-repair slot 1: {\"slot\": 1, \"src_keys_before\": 204, \"dst_keys_before\": 70, \"importing\": \"OK\", \"migrating\": \"OK\", \"migrated\": 1, \"tryagain\": 18, \"setslot_node\": {\"10.70.1.7:7002\": \"OK\", \"10.70.1.10:7002\": \"OK\", \"10.70.1.9:7001\": \"OK\", \"10.70.1.10:7001\": \"OK\", \"10.70.1.7:7001\": \"OK\", \"10.70.1.9:7002\": \"OK\"}, \"src_keys_after\": 0, \"dst_keys_after\": 273, \"seconds\": 6.17}"
+  ],
+  [
+   "35.2 min",
+   "reshard-attempt 3 exit=1 after 11.37 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:14904'. The copy sent to 10.70.1.7:7002 may be older; MIGRATE them again with REPLACE"
+  ],
+  [
+   "35.4 min",
+   "reshard-repair slot 2: {\"slot\": 2, \"src_keys_before\": 262, \"dst_keys_before\": 20, \"importing\": \"OK\", \"migrating\": \"OK\", \"migrated\": 1, \"tryagain\": 30, \"setslot_node\": {\"10.70.1.7:7002\": \"OK\", \"10.70.1.10:7002\": \"OK\", \"10.70.1.9:7001\": \"OK\", \"10.70.1.10:7001\": \"OK\", \"10.70.1.7:7001\": \"OK\", \"10.70.1.9:7002\": \"OK\"}, \"src_keys_after\": 0, \"dst_keys_after\": 280, \"seconds\": 9.39}"
+  ],
+  [
+   "35.4 min",
+   "reshard-attempt 4 exit=1 after 21.85 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:2797'. The copy sent to 10.70.1.7:7002 may be older; MIGRATE them again with REPLACE"
+  ],
+  [
+   "35.4 min",
+   "reshard-repair slot 3: {\"slot\": 3, \"src_keys_before\": 259, \"dst_keys_before\": 10, \"importing\": \"OK\", \"migrating\": \"OK\", \"migrated\": 101, \"tryagain\": 3, \"setslot_node\": {\"10.70.1.7:7002\": \"OK\", \"10.70.1.10:7002\": \"OK\", \"10.70.1.9:7001\": \"OK\", \"10.70.1.10:7001\": \"OK\", \"10.70.1.7:7001\": \"OK\", \"10.70.1.9:7002\": \"OK\"}, \"src_keys_after\": 0, \"dst_keys_after\": 268, \"seconds\": 2.79}"
+  ],
+  [
+   "35.4 min",
+   "reshard-attempt 5 exit=1 after 25.63 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:19105'. The copy sent to 10.70.1.7:7002 may be older; MIGRATE them again with REPLACE"
+  ],
+  [
+   "35.5 min",
+   "reshard-repair slot 4: {\"slot\": 4, \"src_keys_before\": 281, \"dst_keys_before\": 20, \"importing\": \"OK\", \"migrating\": \"OK\", \"migrated\": 1, \"tryagain\": 10, \"setslot_node\": {\"10.70.1.7:7002\": \"OK\", \"10.70.1.10:7002\": \"OK\", \"10.70.1.9:7001\": \"OK\", \"10.70.1.10:7001\": \"OK\", \"10.70.1.7:7001\": \"OK\", \"10.70.1.9:7002\": \"OK\"}, \"src_keys_after\": 0, \"dst_keys_after\": 300, \"seconds\": 4.24}"
+  ],
+  [
+   "35.5 min",
+   "reshard-attempt 6 exit=1 after 31.64 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'z:18275'. The copy sent to 10.70.1.7:7002 may be older; MIGRATE them again with REPLACE"
+  ],
+  [
+   "35.6 min",
+   "reshard-repair slot 5: {\"slot\": 5, \"src_keys_before\": 169, \"dst_keys_before\": 130, \"importing\": \"OK\", \"migrating\": \"OK\", \"migrated\": 2, \"tryagain\": 3, \"setslot_node\": {\"10.70.1.7:7002\": \"OK\", \"10.70.1.10:7002\": \"OK\", \"10.70.1.9:7001\": \"OK\", \"10.70.1.10:7001\": \"OK\", \"10.70.1.7:7001\": \"OK\", \"10.70.1.9:7002\": \"OK\"}, \"src_keys_after\": 0, \"dst_keys_after\": 298, \"seconds\": 2.64}"
+  ],
+  [
+   "35.6 min",
+   "reshard-attempt 7 exit=1 after 37.28 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'st:18910'. The copy sent to 10.70.1.7:7002 may be older; MIGRATE them again with REPLACE"
+  ],
+  [
+   "35.7 min",
+   "reshard-repair slot 6: {\"slot\": 6, \"src_keys_before\": 77, \"dst_keys_before\": 221, \"importing\": \"OK\", \"migrating\": \"OK\", \"migrated\": 77, \"tryagain\": 0, \"setslot_node\": {\"10.70.1.7:7002\": \"OK\", \"10.70.1.10:7002\": \"OK\", \"10.70.1.9:7001\": \"OK\", \"10.70.1.10:7001\": \"OK\", \"10.70.1.7:7001\": \"OK\", \"10.70.1.9:7002\": \"OK\"}, \"src_keys_after\": 0, \"dst_keys_after\": 297, \"seconds\": 1.77}"
+  ],
+  [
+   "35.7 min",
+   "reshard-attempt 8 exit=1 after 42.00 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:17485'. The copy sent to 10.70.1.7:7002 may be older; MIGRATE them again with REPLACE"
+  ],
+  [
+   "35.8 min",
+   "reshard-repair slot 7: {\"slot\": 7, \"src_keys_before\": 81, \"dst_keys_before\": 190, \"importing\": \"OK\", \"migrating\": \"OK\", \"migrated\": 1, \"tryagain\": 6, \"setslot_node\": {\"10.70.1.7:7002\": \"OK\", \"10.70.1.10:7002\": \"OK\", \"10.70.1.9:7001\": \"OK\", \"10.70.1.10:7001\": \"OK\", \"10.70.1.7:7001\": \"OK\", \"10.70.1.9:7002\": \"OK\"}, \"src_keys_after\": 0, \"dst_keys_after\": 270, \"seconds\": 3.5}"
+  ],
+  [
+   "35.8 min",
+   "reshard-attempt 9 exit=1 after 46.71 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:10997'. The copy sent to 10.70.1.7:7002 may be older; MIGRATE them again with REPLACE"
+  ],
+  [
+   "35.8 min",
+   "reshard-repair slot 8: {\"slot\": 8, \"src_keys_before\": 256, \"dst_keys_before\": 30, \"importing\": \"OK\", \"migrating\": \"OK\", \"migrated\": 1, \"tryagain\": 5, \"setslot_node\": {\"10.70.1.7:7002\": \"OK\", \"10.70.1.10:7002\": \"OK\", \"10.70.1.9:7001\": \"OK\", \"10.70.1.10:7001\": \"OK\", \"10.70.1.7:7001\": \"OK\", \"10.70.1.9:7002\": \"OK\"}, \"src_keys_after\": 0, \"dst_keys_after\": 284, \"seconds\": 3.02}"
+  ],
+  [
+   "35.9 min",
+   "reshard-attempt 10 exit=1 after 51.09 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:3076'. The copy sent to 10.70.1.7:7002 may be older; MIGRATE them again with REPLACE"
+  ],
+  [
+   "36.2 min",
+   "reshard-repair slot 9: {\"slot\": 9, \"src_keys_before\": 194, \"dst_keys_before\": 70, \"importing\": \"OK\", \"migrating\": \"OK\", \"migrated\": 1, \"tryagain\": 61, \"setslot_node\": {\"10.70.1.7:7002\": \"OK\", \"10.70.1.10:7002\": \"OK\", \"10.70.1.9:7001\": \"OK\", \"10.70.1.10:7001\": \"OK\", \"10.70.1.7:7001\": \"OK\", \"10.70.1.9:7002\": \"OK\"}, \"src_keys_after\": 0, \"dst_keys_after\": 264, \"seconds\": 17.01}"
+  ],
+  [
+   "36.2 min",
+   "reshard-done in 69.16 s: 10 slots moved in 10 redis-cli runs, slots begun=10"
+  ],
+  [
+   "36.2 min",
+   "reshard-end cluster-ok after 0.26 s"
+  ],
+  [
+   "50.0 min",
+   "import-start CLUSTER MIGRATION IMPORT 10923 11422 on 10.70.1.10:7002 (4f80c960cc0e9437b748f6aa93e2b24d111e33dd, 2008165 keys), source 10.70.1.7:7001 (164cefbbcc5cbc37cb8fbc84f679d180899c452a, 2011900 keys)"
+  ],
+  [
+   "50.0 min",
+   "import-id 7bd5d0b1a6b820b6df10116f15bcb558f7b02b32"
+  ],
+  [
+   "50.1 min",
+   "import-done in 3.65 s: id 7bd5d0b1a6b820b6df10116f15bcb558f7b02b32 slots 10923-11422 source 164cefbbcc5cbc37cb8fbc84f679d180899c452a dest 4f80c960cc0e9437b748f6aa93e2b24d111e33dd operation import state completed last_error  retries 0 create_time 1793664744064 start_time 1793664744064 end_time 1793664747283 write_pause_ms 0 capture_pause_ms 0"
+  ],
+  [
+   "50.1 min",
+   "import-keys source 1884049 dest 2194489"
+  ],
+  [
+   "50.1 min",
+   "import-end cluster-ok after 0.13 s"
+  ],
+  [
+   "62.0 min",
+   "kill9-start slot=3000 master=10.70.1.10:7002 replica=10.70.1.9:7001"
+  ],
+  [
+   "62.0 min",
+   "kill9-killed 10.70.1.10:7002"
+  ],
+  [
+   "62.1 min",
+   "kill9-promoted 10.70.1.9:7001 after 5.68 s"
+  ],
+  [
+   "62.5 min",
+   "kill9-restarted 10.70.1.10:7002"
+  ],
+  [
+   "62.6 min",
+   "kill9-rejoined 10.70.1.10:7002 as replica after 6.84 s"
+  ],
+  [
+   "62.6 min",
+   "kill9-end cluster-ok after 0.19 s"
+  ],
+  [
+   "75.0 min",
+   "failover-start slot=13000 master=10.70.1.7:7001 replica=10.70.1.9:7002"
+  ],
+  [
+   "75.0 min",
+   "failover-reply OK"
+  ],
+  [
+   "75.0 min",
+   "failover-promoted 10.70.1.9:7002 after 0.04 s"
+  ],
+  [
+   "75.1 min",
+   "failover-old-master-replica 10.70.1.7:7001 after 7.63 s"
+  ],
+  [
+   "75.1 min",
+   "failover-end cluster-ok after 0.14 s"
+  ],
+  [
+   "85.0 min",
+   "import-start CLUSTER MIGRATION IMPORT 5461 5960 on 10.70.1.9:7002 (079a0420cba100b1ec81d919b89997ebde9511ea, 2822720 keys), source 10.70.1.7:7002 (39c17443e5977c09633deed1396120841beae3a9, 3113334 keys)"
+  ],
+  [
+   "85.0 min",
+   "import-id 5de3ea5a940244e2e91b25a44d43c7d3649965dd"
+  ],
+  [
+   "85.1 min",
+   "import-done in 5.21 s: id 5de3ea5a940244e2e91b25a44d43c7d3649965dd slots 5461-5960 source 39c17443e5977c09633deed1396120841beae3a9 dest 079a0420cba100b1ec81d919b89997ebde9511ea operation import state completed last_error  retries 0 create_time 1793666844207 start_time 1793666844207 end_time 1793666849310 write_pause_ms 0 capture_pause_ms 0"
+  ],
+  [
+   "85.1 min",
+   "import-keys source 3075072 dest 3109675"
+  ],
+  [
+   "85.1 min",
+   "import-end cluster-ok after 0.14 s"
+  ],
+  [
+   "95.0 min",
+   "reshard-start 5 slots from 10.70.1.9:7002 (079a0420cba100b1ec81d919b89997ebde9511ea, 3419273 keys) to 10.70.1.9:7001 (1736f14270fdfee5f99d05246b9bb13f6479070f) with redis-cli"
+  ],
+  [
+   "95.3 min",
+   "reshard-attempt 1 exit=1 after 19.03 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:5143'. The copy sent to 10.70.1.9:7001 may be older; MIGRATE them again with REPLACE"
+  ],
+  [
+   "96.4 min",
+   "reshard-repair slot 5462: {\"slot\": 5462, \"src_keys_before\": 522, \"dst_keys_before\": 250, \"importing\": \"OK\", \"migrating\": \"OK\", \"migrated\": 1, \"tryagain\": 106, \"setslot_node\": {\"10.70.1.9:7001\": \"OK\", \"10.70.1.9:7002\": \"OK\", \"10.70.1.10:7001\": \"OK\", \"10.70.1.7:7001\": \"OK\", \"10.70.1.10:7002\": \"OK\", \"10.70.1.7:7002\": \"OK\"}, \"src_keys_after\": 0, \"dst_keys_after\": 770, \"seconds\": 63.68}"
+  ],
+  [
+   "96.4 min",
+   "reshard-attempt 2 exit=1 after 85.01 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 's:248801'. The copy sent to 10.70.1.9:7001 may be older; MIGRATE them again with REPLACE"
+  ],
+  [
+   "96.5 min",
+   "reshard-repair slot 5463: {\"slot\": 5463, \"src_keys_before\": 393, \"dst_keys_before\": 141, \"importing\": \"OK\", \"migrating\": \"OK\", \"migrated\": 301, \"tryagain\": 1, \"setslot_node\": {\"10.70.1.9:7001\": \"OK\", \"10.70.1.9:7002\": \"OK\", \"10.70.1.10:7001\": \"OK\", \"10.70.1.7:7001\": \"OK\", \"10.70.1.10:7002\": \"OK\", \"10.70.1.7:7002\": \"OK\"}, \"src_keys_after\": 0, \"dst_keys_after\": 533, \"seconds\": 6.27}"
+  ],
+  [
+   "96.9 min",
+   "reshard-attempt 3 exit=1 after 113.29 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:15838'. The copy sent to 10.70.1.9:7001 may be older; MIGRATE them again with REPLACE"
+  ],
+  [
+   "97.0 min",
+   "reshard-repair slot 5465: {\"slot\": 5465, \"src_keys_before\": 412, \"dst_keys_before\": 141, \"importing\": \"OK\", \"migrating\": \"OK\", \"migrated\": 1, \"tryagain\": 5, \"setslot_node\": {\"10.70.1.9:7001\": \"OK\", \"10.70.1.9:7002\": \"OK\", \"10.70.1.10:7001\": \"OK\", \"10.70.1.7:7001\": \"OK\", \"10.70.1.10:7002\": \"OK\", \"10.70.1.7:7002\": \"OK\"}, \"src_keys_after\": 0, \"dst_keys_after\": 552, \"seconds\": 6.89}"
+  ],
+  [
+   "97.0 min",
+   "reshard-done in 121.16 s: 5 slots moved in 3 redis-cli runs, slots begun=5"
+  ],
+  [
+   "97.0 min",
+   "reshard-end cluster-ok after 0.18 s"
+  ],
+  [
+   "110.0 min",
+   "kill9-start slot=13000 master=10.70.1.9:7002 replica=10.70.1.7:7001"
+  ],
+  [
+   "110.0 min",
+   "kill9-killed 10.70.1.9:7002"
+  ],
+  [
+   "110.1 min",
+   "kill9-promoted 10.70.1.7:7001 after 6.22 s"
+  ],
+  [
+   "110.6 min",
+   "kill9-restarted 10.70.1.9:7002"
+  ],
+  [
+   "110.8 min",
+   "kill9-rejoined 10.70.1.9:7002 as replica after 13.47 s"
+  ],
+  [
+   "110.8 min",
+   "kill9-end cluster-ok after 0.25 s"
+  ],
+  [
+   "110.8 min",
+   "events-done"
+  ]
+ ],
+ "ack": {
+  "writers": 16,
+  "acked": 11056954,
+  "unacked_errors": 691,
+  "lost_acked": 0,
+  "wrong_value": 0,
+  "lost_ack_time_first": null,
+  "lost_ack_time_last": null,
+  "error_kinds": {
+   "ConnectionError:Error": 647,
+   "ClusterDownError:The": 44
+  }
+ },
+ "events": [
+  {
+   "event": "failover",
+   "at_min": 10.0,
+   "detail": "failover-start slot=3000 master=10.70.1.9:7001 replica=10.70.1.10:7002",
+   "timings_s": {
+    "failover-promoted": "0.02",
+    "failover-old-master-replica": "3.36",
+    "failover-end": "0.12"
+   },
+   "duration_to_cluster_ok_s": 4.2,
+   "soakgen_ops_in_window": 3399982,
+   "soakgen_errors": 0,
+   "soakgen_error_kinds": {},
+   "soakgen_error_seconds": 0,
+   "soakgen_first_last_error_s_after_start": null,
+   "ackcheck_errors": 0,
+   "ackcheck_first_last_error_s_after_start": null,
+   "cluster_state_not_ok_per_node": {},
+   "p999_ms_worst_1s": 52.7,
+   "lost_acked_in_window": 0
+  },
+  {
+   "event": "kill9",
+   "at_min": 22.0,
+   "detail": "kill9-start slot=8000 master=10.70.1.10:7001 replica=10.70.1.7:7002",
+   "timings_s": {
+    "kill9-promoted": "6.28",
+    "kill9-rejoined": "5.57",
+    "kill9-end": "0.19"
+   },
+   "duration_to_cluster_ok_s": 35.6,
+   "soakgen_ops_in_window": 6599994,
+   "soakgen_errors": 1541,
+   "soakgen_error_kinds": {
+    "read": 16,
+    "dial": 1476,
+    "CLUSTERDOWN": 1,
+    "MOVED": 48
+   },
+   "soakgen_error_seconds": 31,
+   "soakgen_first_last_error_s_after_start": [
+    1.4,
+    31.4
+   ],
+   "ackcheck_errors": 276,
+   "ackcheck_first_last_error_s_after_start": [
+    0.7,
+    7.3
+   ],
+   "cluster_state_not_ok_per_node": {
+    "10.70.1.9:7001": [
+     6.7,
+     6.7,
+     1
+    ],
+    "10.70.1.10:7001": [
+     1.0,
+     28.3,
+     25
+    ],
+    "10.70.1.7:7001": [
+     6.7,
+     6.7,
+     1
+    ],
+    "10.70.1.9:7002": [
+     6.7,
+     6.7,
+     1
+    ],
+    "10.70.1.10:7002": [
+     6.7,
+     6.7,
+     1
+    ],
+    "10.70.1.7:7002": [
+     6.8,
+     6.8,
+     1
+    ]
+   },
+   "p999_ms_worst_1s": 30523.4,
+   "lost_acked_in_window": 0
+  },
+  {
+   "event": "reshard",
+   "at_min": 35.0,
+   "detail": "reshard-start 10 slots from 10.70.1.10:7002 (4f80c960cc0e9437b748f6aa93e2b24d111e33dd, 1562599 keys) to 10.70.1.7:7002 (39c17443e5977c09633deed1396120841beae3a9) with redis-cli",
+   "timings_s": {
+    "reshard-attempt": "51.09",
+    "reshard-end": "0.26"
+   },
+   "duration_to_cluster_ok_s": 69.8,
+   "soakgen_ops_in_window": 9999999,
+   "soakgen_errors": 4,
+   "soakgen_error_kinds": {
+    "ASK": 4
+   },
+   "soakgen_error_seconds": 4,
+   "soakgen_first_last_error_s_after_start": [
+    32.4,
+    58.4
+   ],
+   "ackcheck_errors": 0,
+   "ackcheck_first_last_error_s_after_start": null,
+   "cluster_state_not_ok_per_node": {},
+   "p999_ms_worst_1s": 39354.4,
+   "lost_acked_in_window": 0
+  },
+  {
+   "event": "import",
+   "at_min": 50.0,
+   "detail": "import-start CLUSTER MIGRATION IMPORT 10923 11422 on 10.70.1.10:7002 (4f80c960cc0e9437b748f6aa93e2b24d111e33dd, 2008165 keys), source 10.70.1.7:7001 (164cefbbcc5cbc37cb8fbc84f679d180899c452a, 2011900 keys)",
+   "timings_s": {
+    "import-end": "0.13"
+   },
+   "duration_to_cluster_ok_s": 4.1,
+   "soakgen_ops_in_window": 3400003,
+   "soakgen_errors": 0,
+   "soakgen_error_kinds": {},
+   "soakgen_error_seconds": 0,
+   "soakgen_first_last_error_s_after_start": null,
+   "ackcheck_errors": 0,
+   "ackcheck_first_last_error_s_after_start": null,
+   "cluster_state_not_ok_per_node": {},
+   "p999_ms_worst_1s": 374.3,
+   "lost_acked_in_window": 0
+  },
+  {
+   "event": "kill9",
+   "at_min": 62.0,
+   "detail": "kill9-start slot=3000 master=10.70.1.10:7002 replica=10.70.1.9:7001",
+   "timings_s": {
+    "kill9-promoted": "5.68",
+    "kill9-rejoined": "6.84",
+    "kill9-end": "0.19"
+   },
+   "duration_to_cluster_ok_s": 38.5,
+   "soakgen_ops_in_window": 6800000,
+   "soakgen_errors": 1573,
+   "soakgen_error_kinds": {
+    "read": 16,
+    "dial": 1508,
+    "MOVED": 49
+   },
+   "soakgen_error_seconds": 32,
+   "soakgen_first_last_error_s_after_start": [
+    1.7,
+    32.7
+   ],
+   "ackcheck_errors": 219,
+   "ackcheck_first_last_error_s_after_start": [
+    0.8,
+    6.6
+   ],
+   "cluster_state_not_ok_per_node": {
+    "10.70.1.9:7001": [
+     6.0,
+     6.0,
+     1
+    ],
+    "10.70.1.10:7001": [
+     6.1,
+     6.1,
+     1
+    ],
+    "10.70.1.7:7001": [
+     6.1,
+     6.1,
+     1
+    ],
+    "10.70.1.9:7002": [
+     6.1,
+     6.1,
+     1
+    ],
+    "10.70.1.10:7002": [
+     1.6,
+     30.3,
+     26
+    ],
+    "10.70.1.7:7002": [
+     6.2,
+     6.2,
+     1
+    ]
+   },
+   "p999_ms_worst_1s": 32063.5,
+   "lost_acked_in_window": 0
+  },
+  {
+   "event": "failover",
+   "at_min": 75.0,
+   "detail": "failover-start slot=13000 master=10.70.1.7:7001 replica=10.70.1.9:7002",
+   "timings_s": {
+    "failover-promoted": "0.04",
+    "failover-old-master-replica": "7.63",
+    "failover-end": "0.14"
+   },
+   "duration_to_cluster_ok_s": 8.5,
+   "soakgen_ops_in_window": 3893211,
+   "soakgen_errors": 0,
+   "soakgen_error_kinds": {},
+   "soakgen_error_seconds": 0,
+   "soakgen_first_last_error_s_after_start": null,
+   "ackcheck_errors": 0,
+   "ackcheck_first_last_error_s_after_start": null,
+   "cluster_state_not_ok_per_node": {},
+   "p999_ms_worst_1s": 128.6,
+   "lost_acked_in_window": 0
+  },
+  {
+   "event": "import",
+   "at_min": 85.0,
+   "detail": "import-start CLUSTER MIGRATION IMPORT 5461 5960 on 10.70.1.9:7002 (079a0420cba100b1ec81d919b89997ebde9511ea, 2822720 keys), source 10.70.1.7:7002 (39c17443e5977c09633deed1396120841beae3a9, 3113334 keys)",
+   "timings_s": {
+    "import-end": "0.14"
+   },
+   "duration_to_cluster_ok_s": 5.6,
+   "soakgen_ops_in_window": 3500003,
+   "soakgen_errors": 0,
+   "soakgen_error_kinds": {},
+   "soakgen_error_seconds": 0,
+   "soakgen_first_last_error_s_after_start": null,
+   "ackcheck_errors": 0,
+   "ackcheck_first_last_error_s_after_start": null,
+   "cluster_state_not_ok_per_node": {},
+   "p999_ms_worst_1s": 568.3,
+   "lost_acked_in_window": 0
+  },
+  {
+   "event": "reshard",
+   "at_min": 95.0,
+   "detail": "reshard-start 5 slots from 10.70.1.9:7002 (079a0420cba100b1ec81d919b89997ebde9511ea, 3419273 keys) to 10.70.1.9:7001 (1736f14270fdfee5f99d05246b9bb13f6479070f) with redis-cli",
+   "timings_s": {
+    "reshard-attempt": "113.29",
+    "reshard-end": "0.18"
+   },
+   "duration_to_cluster_ok_s": 121.7,
+   "soakgen_ops_in_window": 8387112,
+   "soakgen_errors": 2,
+   "soakgen_error_kinds": {
+    "ASK": 2
+   },
+   "soakgen_error_seconds": 2,
+   "soakgen_first_last_error_s_after_start": [
+    12.2,
+    30.2
+   ],
+   "ackcheck_errors": 0,
+   "ackcheck_first_last_error_s_after_start": null,
+   "cluster_state_not_ok_per_node": {},
+   "p999_ms_worst_1s": 67108.9,
+   "lost_acked_in_window": 0
+  },
+  {
+   "event": "kill9",
+   "at_min": 110.0,
+   "detail": "kill9-start slot=13000 master=10.70.1.9:7002 replica=10.70.1.7:7001",
+   "timings_s": {
+    "kill9-promoted": "6.22",
+    "kill9-rejoined": "13.47",
+    "kill9-end": "0.25"
+   },
+   "duration_to_cluster_ok_s": 48.7,
+   "soakgen_ops_in_window": 7799998,
+   "soakgen_errors": 1634,
+   "soakgen_error_kinds": {
+    "read": 14,
+    "dial": 1588,
+    "CLUSTERDOWN": 2,
+    "EOF": 1,
+    "MOVED": 29
+   },
+   "soakgen_error_seconds": 35,
+   "soakgen_first_last_error_s_after_start": [
+    0.9,
+    35.9
+   ],
+   "ackcheck_errors": 196,
+   "ackcheck_first_last_error_s_after_start": [
+    0.8,
+    7.5
+   ],
+   "cluster_state_not_ok_per_node": {
+    "10.70.1.9:7001": [
+     6.4,
+     6.4,
+     1
+    ],
+    "10.70.1.10:7001": [
+     6.5,
+     6.5,
+     1
+    ],
+    "10.70.1.7:7001": [
+     6.5,
+     6.5,
+     1
+    ],
+    "10.70.1.9:7002": [
+     0.8,
+     34.0,
+     30
+    ],
+    "10.70.1.10:7002": [
+     6.5,
+     6.5,
+     1
+    ],
+    "10.70.1.7:7002": [
+     6.5,
+     6.5,
+     1
+    ]
+   },
+   "p999_ms_worst_1s": 35192.8,
+   "lost_acked_in_window": 0
+  }
+ ],
+ "lost_outside_event_windows": 0,
+ "lost_outside_sample": [],
+ "compare": {
+  "shard-13000.out": [
+   "{\"dbsize_a\": 4047801, \"dbsize_b\": 4047801, \"scanned_a\": 4047801, \"scanned_b\": 4047801, \"compared\": 4047801, \"differ_first_pass\": 0, \"differ_after_recheck\": 0, \"expiring_at_compare\": 0, \"real_differences\": 0, \"sample\": [], \"seconds\": 890.4}"
+  ],
+  "shard-3000.out": [
+   "{\"dbsize_a\": 4419241, \"dbsize_b\": 4419241, \"scanned_a\": 4419241, \"scanned_b\": 4419241, \"compared\": 4419241, \"differ_first_pass\": 0, \"differ_after_recheck\": 0, \"expiring_at_compare\": 0, \"real_differences\": 0, \"sample\": [], \"seconds\": 1047.0}"
+  ],
+  "shard-8000.out": [
+   "{\"dbsize_a\": 3688822, \"dbsize_b\": 3688822, \"scanned_a\": 3688822, \"scanned_b\": 3688822, \"compared\": 3688822, \"differ_first_pass\": 0, \"differ_after_recheck\": 0, \"expiring_at_compare\": 0, \"real_differences\": 0, \"sample\": [], \"seconds\": 734.8}"
+  ]
+ },
+ "compare_offsets": [
+  "shard of slot 3000: master 10.70.1.9:7001 replica 10.70.1.10:7002 offsets 63781915340 63781915340",
+  "shard of slot 8000: master 10.70.1.7:7002 replica 10.70.1.10:7001 offsets 58836010932 58836010932",
+  "shard of slot 13000: master 10.70.1.7:7001 replica 10.70.1.9:7002 offsets 58912191354 58912191354"
+ ],
+ "check_end": [
+  "[OK] 12155864 keys in 3 masters.",
+  "[OK] All nodes agree about slots configuration.",
+  "[OK] All 16384 slots covered."
+ ],
+ "memory": {
+  "c2:7001": {
+   "used_gb_min": 0.449,
+   "used_gb_max": 0.79,
+   "used_gb_end": 0.715,
+   "rss_gb_max": 1.155,
+   "rss_gb_end": 1.149,
+   "rss_gb_at_10min": 0.671,
+   "slab_gb_end": 0.428,
+   "slab_live_gb_end": 0.386,
+   "roles_seen": [
+    "master",
+    "slave"
+   ],
+   "keys_at_10min": 773681,
+   "keys_end": 3764549,
+   "used_bytes_per_key_at_10min": 584,
+   "used_bytes_per_key_end": 190
+  },
+  "c2:7002": {
+   "used_gb_min": 0.451,
+   "used_gb_max": 0.926,
+   "used_gb_end": 0.837,
+   "rss_gb_max": 1.22,
+   "rss_gb_end": 1.22,
+   "rss_gb_at_10min": 0.708,
+   "slab_gb_end": 0.482,
+   "slab_live_gb_end": 0.453,
+   "roles_seen": [
+    "master",
+    "slave"
+   ],
+   "keys_at_10min": 773454,
+   "keys_end": 4511989,
+   "used_bytes_per_key_at_10min": 583,
+   "used_bytes_per_key_end": 186
+  },
+  "c3:7001": {
+   "used_gb_min": 0.451,
+   "used_gb_max": 0.915,
+   "used_gb_end": 0.79,
+   "rss_gb_max": 1.561,
+   "rss_gb_end": 1.534,
+   "rss_gb_at_10min": 0.608,
+   "slab_gb_end": 0.443,
+   "slab_live_gb_end": 0.417,
+   "roles_seen": [
+    "master",
+    "slave"
+   ],
+   "keys_at_10min": 773395,
+   "keys_end": 4129582,
+   "used_bytes_per_key_at_10min": 583,
+   "used_bytes_per_key_end": 191
+  },
+  "c3:7002": {
+   "used_gb_min": 0.428,
+   "used_gb_max": 0.845,
+   "used_gb_end": 0.736,
+   "rss_gb_max": 1.436,
+   "rss_gb_end": 1.428,
+   "rss_gb_at_10min": 0.652,
+   "slab_gb_end": 0.42,
+   "slab_live_gb_end": 0.381,
+   "roles_seen": [
+    "master",
+    "slave"
+   ],
+   "keys_at_10min": 773819,
+   "keys_end": 3762551,
+   "used_bytes_per_key_at_10min": 553,
+   "used_bytes_per_key_end": 196
+  },
+  "c1:7001": {
+   "used_gb_min": 0.436,
+   "used_gb_max": 0.947,
+   "used_gb_end": 0.857,
+   "rss_gb_max": 1.647,
+   "rss_gb_end": 1.62,
+   "rss_gb_at_10min": 0.621,
+   "slab_gb_end": 0.48,
+   "slab_live_gb_end": 0.455,
+   "roles_seen": [
+    "master",
+    "slave"
+   ],
+   "keys_at_10min": 773384,
+   "keys_end": 4507722,
+   "used_bytes_per_key_at_10min": 577,
+   "used_bytes_per_key_end": 190
+  },
+  "c1:7002": {
+   "used_gb_min": 0.428,
+   "used_gb_max": 1.473,
+   "used_gb_end": 0.762,
+   "rss_gb_max": 1.72,
+   "rss_gb_end": 1.145,
+   "rss_gb_at_10min": 0.637,
+   "slab_gb_end": 0.448,
+   "slab_live_gb_end": 0.422,
+   "roles_seen": [
+    "master",
+    "slave"
+   ],
+   "keys_at_10min": 773199,
+   "keys_end": 4129207,
+   "used_bytes_per_key_at_10min": 553,
+   "used_bytes_per_key_end": 184
+  }
+ },
+ "server_log_error_lines": {
+  "server-10.70.1.10-7001.log": {
+   "count": 0,
+   "first": []
+  },
+  "server-10.70.1.10-7002.log": {
+   "count": 0,
+   "first": []
+  },
+  "server-10.70.1.7-7001.log": {
+   "count": 0,
+   "first": []
+  },
+  "server-10.70.1.7-7002.log": {
+   "count": 0,
+   "first": []
+  },
+  "server-10.70.1.9-7001.log": {
+   "count": 0,
+   "first": []
+  },
+  "server-10.70.1.9-7002.log": {
+   "count": 0,
+   "first": []
+  }
+ }
+}

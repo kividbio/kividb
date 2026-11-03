@@ -1,0 +1,2 @@
+started kividb master pid 50525
+started kividb replica pid 48991

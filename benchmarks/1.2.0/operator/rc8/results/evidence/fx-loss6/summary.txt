@@ -1,0 +1,12 @@
+lines with two engines for fx-2-1: 3
+2026-11-03T05:33:03.883493596Z 2026-11-03T05:33:03.882Z 1 [INFO] SIGTERM received — shutting down gracefully
+2026-11-03T05:33:03.883579310Z 2026-11-03T05:33:03.882Z 1 [INFO] Writing final snapshot...
+2026-11-03T05:33:03.997199018Z 2026-11-03T05:33:03.997Z 1 [INFO] AOF: rebased onto dump.kdb (generation 6) — log is now the delta
+2026-11-03T05:33:03.948976843Z 2026-11-03T05:33:03.948Z 1 [WARN] The data directory /data is in use by another process (it holds kividb.lock): waiting for it to be free (0s so far)
+2026-11-03T05:33:03.949076168Z   * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+2026-11-03T05:33:04.049120795Z 2026-11-03T05:33:04.049Z 1 [INFO] The data directory is free after 0.1s: starting
+2026-11-03T05:33:04.057142552Z 2026-11-03T05:33:04.057Z 1 [INFO] Found dump.kdb — loading native snapshot
+2026-11-03T05:33:04.435685293Z 2026-11-03T05:33:04.435Z 1 [INFO] Loaded 358848 keys from snapshot (0 with a TTL)
+2026-11-03T05:33:04.435711997Z 2026-11-03T05:33:04.435Z 1 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+2026-11-03T05:33:04.443889959Z 2026-11-03T05:33:04.443Z 1 [INFO] Replication: Loaded dataset is offset 14379235 of this node's stream b55e1f427adeb1b07de5d56beecd183812bf60cd — replicas stopped cleanly with it can be continued
+2026-11-03T05:33:05.516985486Z 2026-11-03T05:33:05.516Z 1 [INFO] Replication: Partial resync for 10.244.0.149:36306: continuing from offset 14379235 (0 bytes of backlog)

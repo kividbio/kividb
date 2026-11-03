@@ -1,0 +1,13 @@
+replica r4 fixed P16 rps=967055.69
+replica r4 rc4 P16 rps=967180.38
+replica r5 rc4 P16 rps=999333.75
+replica r5 fixed P16 rps=991244.00
+replica r6 fixed P16 rps=967086.81
+replica r6 rc4 P16 rps=967118.00
+replica r7 rc4 P16 rps=951716.25
+replica r7 fixed P16 rps=983090.81
+replica r8 fixed P16 rps=983026.44
+replica r8 rc4 P16 rps=982929.81
+replica r9 rc4 P16 rps=991080.25
+replica r9 fixed P16 rps=999333.75
+TPUT-DONE

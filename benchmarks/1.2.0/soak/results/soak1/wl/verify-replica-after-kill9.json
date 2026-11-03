@@ -1,0 +1,108 @@
+{
+ "node": "replica-after-kill9",
+ "checked_at_s": 9202.5,
+ "per_kind": {
+  "str": {
+   "acked": 702936,
+   "unknown": 0,
+   "ok": 702936,
+   "bad": 0
+  },
+  "str_ttl": {
+   "acked": 702934,
+   "unknown": 2,
+   "ok": 702934,
+   "bad": 0
+  },
+  "str_expired": {
+   "acked": 702934,
+   "unknown": 2,
+   "ok": 702934,
+   "bad": 0
+  },
+  "hash": {
+   "acked": 702936,
+   "unknown": 0,
+   "ok": 702936,
+   "bad": 0
+  },
+  "hash_field_ttl": {
+   "acked": 702936,
+   "unknown": 0,
+   "ok": 702936,
+   "bad": 0
+  },
+  "hash_field_expired": {
+   "acked": 702934,
+   "unknown": 1,
+   "ok": 702934,
+   "bad": 0
+  },
+  "multi_l_s_z_incr": {
+   "acked": 702931,
+   "unknown": 3,
+   "ok": 702931,
+   "bad": 0
+  },
+  "overwrite": {
+   "acked": 702933,
+   "unknown": 0,
+   "ok": 1000,
+   "bad": 0
+  }
+ },
+ "problems": [],
+ "counters": {
+  "0": {
+   "value": 87877,
+   "acked": 87877,
+   "acked_plus_unknown": 87877,
+   "ok": true
+  },
+  "1": {
+   "value": 87887,
+   "acked": 87887,
+   "acked_plus_unknown": 87888,
+   "ok": true
+  },
+  "2": {
+   "value": 87906,
+   "acked": 87906,
+   "acked_plus_unknown": 87906,
+   "ok": true
+  },
+  "3": {
+   "value": 87884,
+   "acked": 87884,
+   "acked_plus_unknown": 87884,
+   "ok": true
+  },
+  "4": {
+   "value": 87888,
+   "acked": 87888,
+   "acked_plus_unknown": 87889,
+   "ok": true
+  },
+  "5": {
+   "value": 87882,
+   "acked": 87882,
+   "acked_plus_unknown": 87883,
+   "ok": true
+  },
+  "6": {
+   "value": 87719,
+   "acked": 87719,
+   "acked_plus_unknown": 87719,
+   "ok": true
+  },
+  "7": {
+   "value": 87888,
+   "acked": 87888,
+   "acked_plus_unknown": 87888,
+   "ok": true
+  }
+ },
+ "acked_total": 5623474,
+ "unknown_total": 8,
+ "bad_total": 0
+}

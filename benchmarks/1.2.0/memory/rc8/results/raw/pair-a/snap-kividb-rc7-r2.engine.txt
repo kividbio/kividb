@@ -1,0 +1,2 @@
+kividb-rc7 persist kividb/kividb:build-598b74d20ec0 redis_version:8.10.0 kividb_version:1.2.0-rc7 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data --aof --aof-rewrite-percentage 0]

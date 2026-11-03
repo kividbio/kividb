@@ -1,0 +1,180 @@
+=== 1793637787 16:43:07
+VmHWM:	    9308 kB
+VmRSS:	    9308 kB
+Threads:	14
+used_memory:1311903
+used_memory_rss:10797056
+maxmemory:1073741824
+mem_fragmentation_ratio:8.2301
+total_commands_processed:3
+instantaneous_ops_per_sec:0
+keyspace_hits:0
+keyspace_misses:0
+evicted_keys:0
+0
+stat: 0 0
+=== 1793637817 16:43:37
+VmHWM:	  352884 kB
+VmRSS:	  352884 kB
+Threads:	14
+used_memory:352695914
+used_memory_rss:361410560
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0247
+total_commands_processed:1844740
+instantaneous_ops_per_sec:74439
+keyspace_hits:619592
+keyspace_misses:612547
+evicted_keys:0
+612650
+stat: 595 1879
+=== 1793637847 16:44:07
+VmHWM:	  724476 kB
+VmRSS:	  724476 kB
+Threads:	14
+used_memory:730942122
+used_memory_rss:741937152
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0150
+total_commands_processed:4065923
+instantaneous_ops_per_sec:74344
+keyspace_hits:1504804
+keyspace_misses:1280529
+evicted_keys:0
+1280632
+stat: 1303 4132
+=== 1793637877 16:44:37
+VmHWM:	 1064180 kB
+VmRSS:	 1064180 kB
+Threads:	14
+used_memory:1073741338
+used_memory_rss:1089720320
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0149
+total_commands_processed:6257826
+instantaneous_ops_per_sec:69496
+keyspace_hits:2434978
+keyspace_misses:1911394
+evicted_keys:43270
+1868092
+stat: 2053 6343
+=== 1793637907 16:45:07
+VmHWM:	 1066532 kB
+VmRSS:	 1066532 kB
+Threads:	14
+used_memory:1073741722
+used_memory_rss:1092128768
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0171
+total_commands_processed:8367585
+instantaneous_ops_per_sec:68924
+keyspace_hits:3352159
+keyspace_misses:2507682
+evicted_keys:639849
+1867810
+stat: 3002 8366
+=== 1793637937 16:45:37
+VmHWM:	 1068068 kB
+VmRSS:	 1068068 kB
+Threads:	14
+used_memory:1073741482
+used_memory_rss:1093701632
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0186
+total_commands_processed:10477933
+instantaneous_ops_per_sec:70362
+keyspace_hits:4271813
+keyspace_misses:3103026
+evicted_keys:1234758
+1868269
+stat: 3947 10395
+=== 1793637967 16:46:07
+VmHWM:	 1068952 kB
+VmRSS:	 1068952 kB
+Threads:	14
+used_memory:1073740938
+used_memory_rss:1094606848
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0194
+total_commands_processed:12525690
+instantaneous_ops_per_sec:70604
+keyspace_hits:5166001
+keyspace_misses:3679807
+evicted_keys:1810964
+1868829
+stat: 4849 12374
+=== 1793637997 16:46:37
+VmHWM:	 1069484 kB
+VmRSS:	 1069484 kB
+Threads:	14
+used_memory:1073741530
+used_memory_rss:1095151616
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0199
+total_commands_processed:14636748
+instantaneous_ops_per_sec:69582
+keyspace_hits:6091151
+keyspace_misses:4272762
+evicted_keys:2404312
+1868450
+stat: 5776 14421
+=== 1793638027 16:47:07
+VmHWM:	 1070124 kB
+VmRSS:	 1070124 kB
+Threads:	14
+used_memory:1073741130
+used_memory_rss:1095806976
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0206
+total_commands_processed:16746936
+instantaneous_ops_per_sec:70236
+keyspace_hits:7015335
+keyspace_misses:4865763
+evicted_keys:2998408
+1867337
+stat: 6690 16481
+=== 1793638057 16:47:37
+VmHWM:	 1070768 kB
+VmRSS:	 1070768 kB
+Threads:	14
+used_memory:1073741370
+used_memory_rss:1096466432
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0212
+total_commands_processed:18857181
+instantaneous_ops_per_sec:71749
+keyspace_hits:7940961
+keyspace_misses:5458070
+evicted_keys:3591035
+1867016
+stat: 7623 18521
+=== 1793638087 16:48:07
+VmHWM:	 1071152 kB
+VmRSS:	 1071152 kB
+Threads:	14
+used_memory:1073741418
+used_memory_rss:1096859648
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0215
+total_commands_processed:20968846
+instantaneous_ops_per_sec:71886
+keyspace_hits:8867004
+keyspace_misses:6050882
+evicted_keys:4183534
+1867328
+stat: 8551 20568
+=== 1793638117 16:48:37
+VmHWM:	 1071344 kB
+VmRSS:	 1071344 kB
+Threads:	14
+used_memory:1073741674
+used_memory_rss:1097056256
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0217
+total_commands_processed:23081180
+instantaneous_ops_per_sec:70143
+keyspace_hits:9793820
+keyspace_misses:6643637
+evicted_keys:4775585
+1868040
+stat: 9482 22610

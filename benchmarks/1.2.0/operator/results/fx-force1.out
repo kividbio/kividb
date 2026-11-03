@@ -1,0 +1,9 @@
+BEGIN fx-force1 20:47:39
+fx-force1 force delete fx-0-0 20:47:49
+pod "fx-0-0" force deleted from e2e namespace
+fx-force1 fx-0-0 Ready 20:48:23
+lines with two engines for fx-0-0: 0
+END fx-force1 20:48:55
+acked 73832 errors 262834 win ['20:41:44-20:47:10:260337', '20:47:50-20:48:00:2497'] slow 400 ['20:48:04.019 1268ms ok=true', '20:48:00.829 4459ms ok=true', '20:48:03.190 2099ms ok=true', '20:48:02.639 2650ms ok=true', '20:48:00.629 4660ms ok=true', '20:48:01.299 3990ms ok=true', '20:48:00.529 4760ms ok=true', '20:48:01.709 3580ms ok=true']
+errkinds Counter({'context deadline exceeded': 30})
+checked 75136 missing 0 wrong 0 readErr 0 bySec {} dbsize 75136 ex {}

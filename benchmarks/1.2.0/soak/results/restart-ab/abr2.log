@@ -1,0 +1,7 @@
+r1-rc7: loaded=2591767062 replica_at_drop=2591764963 behind=2099 partial=0 full=2 sync_full=2 sync_partial_ok=0
+r1-rc6: loaded=2591974266 replica_at_drop=2591974266 behind=0 partial=0 full=1 sync_full=1 sync_partial_ok=0
+r2-rc7: loaded=2591724514 replica_at_drop=2591722892 behind=1622 partial=0 full=2 sync_full=2 sync_partial_ok=0
+r2-rc6: loaded=2591540743 replica_at_drop=2591539408 behind=1335 partial=0 full=2 sync_full=2 sync_partial_ok=0
+r3-rc7: loaded=2592410828 replica_at_drop=2592410716 behind=112 partial=0 full=2 sync_full=2 sync_partial_ok=0
+r3-rc6: loaded=2592399031 replica_at_drop=2592399031 behind=0 partial=0 full=2 sync_full=2 sync_partial_ok=0
+ABR2-DONE

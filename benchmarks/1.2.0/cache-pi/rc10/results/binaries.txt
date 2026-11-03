@@ -1,0 +1,6 @@
+kividb 39bfacd2 39bfacd231bb294d390448eacfe0e243d365ebe8 2026-11-03T16:37:32+05:30; cargo build --release --features tls; rustc 1.99.1 (58cf8f9c3 2026-10-13); binary sha256 eaee9421f1699cb360466ef935dbc8047ac4faf0b7c00bdfae8e0b82cc9970a4; --version: kividb 1.2.0-rc10
+kividb 082dab3d 082dab3d8929c180bccf993835e28992ea054fb5 2026-11-03T07:11:16+05:30; cargo build --release --features tls; rustc 1.99.1 (58cf8f9c3 2026-10-13); binary sha256 ebd13efe191f358a78996dbe7a6267990f67ade5a076368de414c2ee534569cd; --version: kividb 1.2.0-rc8
+
+pair 3 rebuild (fresh builder, same commands):
+kividb 39bfacd2 39bfacd231bb294d390448eacfe0e243d365ebe8 2026-11-03T16:37:32+05:30; cargo build --release --features tls; rustc 1.99.1 (58cf8f9c3 2026-10-13); binary sha256 eaee9421f1699cb360466ef935dbc8047ac4faf0b7c00bdfae8e0b82cc9970a4; --version: kividb 1.2.0-rc10
+kividb 082dab3d 082dab3d8929c180bccf993835e28992ea054fb5 2026-11-03T07:11:16+05:30; cargo build --release --features tls; rustc 1.99.1 (58cf8f9c3 2026-10-13); binary sha256 ebd13efe191f358a78996dbe7a6267990f67ade5a076368de414c2ee534569cd; --version: kividb 1.2.0-rc8

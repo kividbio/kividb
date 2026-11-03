@@ -1,0 +1,10 @@
+ref=4a47644e53b8cf261df10309d919f2c19ebadef0 commit=4a47644e53b8cf261df10309d919f2c19ebadef0 from=source cargo build --release RUSTFLAGS=-C target-feature=+lse rustc=rustc 1.99.1 (58cf8f9c3 2026-10-13)
+kividb 1.2.0-rc9
+02282dfc30d81600bd9f68e6757d2da5fb5d9ccedd35bf467d5a602d49e4fb46  bin/kividb-rc9
+ref=082dab3d8929c180bccf993835e28992ea054fb5 commit=082dab3d8929c180bccf993835e28992ea054fb5 from=source cargo build --release RUSTFLAGS=-C target-feature=+lse rustc=rustc 1.99.1 (58cf8f9c3 2026-10-13)
+kividb 1.2.0-rc8
+ef2208fd547bb06348560dc1f0bce48302debc098e16de58ff37431bbbcf1260  bin/kividb-rc8
+SRV-BUILD-DONE
+7.0.0-1017-azure
+Model name:                              Neoverse-N1
+memtier_benchmark v=2.5.2 sha=f3ff1793:0 bits=64 libevent=2.1.12-stable openssl=OpenSSL 3.0.13 30 Jan 2024 prometheus=yes

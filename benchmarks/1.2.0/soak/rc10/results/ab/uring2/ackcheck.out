@@ -1,0 +1,3 @@
+/home/azureuser/ackcheck.py:61: DeprecationWarning: Call to '__init__' function with deprecated usage of input argument/s 'cluster_error_retry_attempts'. (Please configure the 'retry' object instead) -- Deprecated since version 6.0.0.
+  return RedisCluster(startup_nodes=nodes, socket_timeout=timeout, socket_connect_timeout=timeout,
+{"acked": 707571, "lost_acked": 0, "wrong_value": 0, "wait_acked": 0, "wait_acked_lost": 0, "unacked_errors": 0, "recovery": {"event_t": 195.485, "pre_event_ok_per_100ms_median": 160, "first_error_t": null, "last_error_t": null, "writes_below_80pct_from_t": 195.8, "throughput_back_t": 196.60000000000002, "recovery_s": 1.12}}

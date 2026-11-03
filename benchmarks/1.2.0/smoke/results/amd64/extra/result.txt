@@ -1,0 +1,3 @@
+RESULT extra-amd64 143 2
+FAIL: rpm: install on clean amazonlinux:2023 (no shadow-utils; package does not require it) -- /var/tmp/rpm-tmp.X9wUke: line 7: groupadd: command not found
+FAIL: rpm: install on clean registry.access.redhat.com/ubi9/ubi-minimal -- Downloading metadata...

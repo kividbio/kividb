@@ -1,0 +1,27 @@
+{"level":"info","ts":"2026-11-03T07:54:37Z","msg":"starting kividb-operator manager"}
+{"level":"info","ts":"2026-11-03T07:54:37Z","logger":"controller-runtime.metrics","msg":"Starting metrics server"}
+I1103 07:54:37.604370       1 leaderelection.go:254] attempting to acquire leader lease kividb-system/kividb-operator-leader.kividb.io...
+{"level":"info","ts":"2026-11-03T07:54:37Z","logger":"controller-runtime.metrics","msg":"Serving metrics server","bindAddress":":8080","secure":false}
+{"level":"info","ts":"2026-11-03T07:54:37Z","msg":"starting server","name":"health probe","addr":"[::]:8081"}
+I1103 07:54:53.481823       1 leaderelection.go:268] successfully acquired lease kividb-system/kividb-operator-leader.kividb.io
+{"level":"info","ts":"2026-11-03T07:54:53Z","msg":"Starting EventSource","controller":"kividbcluster","controllerGroup":"kividb.io","controllerKind":"KividbCluster","source":"kind source: *v1alpha1.KividbCluster"}
+{"level":"info","ts":"2026-11-03T07:54:53Z","msg":"Starting EventSource","controller":"kividbcluster","controllerGroup":"kividb.io","controllerKind":"KividbCluster","source":"kind source: *v1.StatefulSet"}
+{"level":"info","ts":"2026-11-03T07:54:53Z","msg":"Starting EventSource","controller":"kividbcluster","controllerGroup":"kividb.io","controllerKind":"KividbCluster","source":"kind source: *v1.Service"}
+{"level":"info","ts":"2026-11-03T07:54:53Z","msg":"Starting EventSource","controller":"kividbcluster","controllerGroup":"kividb.io","controllerKind":"KividbCluster","source":"kind source: *v1.ConfigMap"}
+{"level":"info","ts":"2026-11-03T07:54:53Z","msg":"Starting EventSource","controller":"kividbcluster","controllerGroup":"kividb.io","controllerKind":"KividbCluster","source":"kind source: *v1.Secret"}
+{"level":"info","ts":"2026-11-03T07:54:53Z","msg":"Starting EventSource","controller":"kividbcluster","controllerGroup":"kividb.io","controllerKind":"KividbCluster","source":"kind source: *v1.PodDisruptionBudget"}
+{"level":"info","ts":"2026-11-03T07:54:53Z","msg":"Starting EventSource","controller":"kividbcluster","controllerGroup":"kividb.io","controllerKind":"KividbCluster","source":"kind source: *v1.CronJob"}
+{"level":"info","ts":"2026-11-03T07:54:53Z","msg":"Starting EventSource","controller":"kividbcluster","controllerGroup":"kividb.io","controllerKind":"KividbCluster","source":"kind source: *v1.Pod"}
+{"level":"info","ts":"2026-11-03T07:54:53Z","msg":"Starting EventSource","controller":"kividbcluster","controllerGroup":"kividb.io","controllerKind":"KividbCluster","source":"kind source: *v1.Service"}
+{"level":"info","ts":"2026-11-03T07:54:53Z","msg":"Starting EventSource","controller":"kividbcluster","controllerGroup":"kividb.io","controllerKind":"KividbCluster","source":"kind source: *v1alpha1.KividbConfig"}
+{"level":"info","ts":"2026-11-03T07:54:53Z","msg":"Starting EventSource","controller":"kividbcluster","controllerGroup":"kividb.io","controllerKind":"KividbCluster","source":"kind source: *v1alpha1.KividbAclConfig"}
+{"level":"info","ts":"2026-11-03T07:54:53Z","msg":"Starting EventSource","controller":"kividbcluster","controllerGroup":"kividb.io","controllerKind":"KividbCluster","source":"kind source: *v1alpha1.KividbSnapshotConfig"}
+{"level":"info","ts":"2026-11-03T07:54:53Z","msg":"Starting EventSource","controller":"kividbcluster","controllerGroup":"kividb.io","controllerKind":"KividbCluster","source":"kind source: *v1.Secret"}
+{"level":"info","ts":"2026-11-03T07:54:53Z","msg":"Starting Controller","controller":"kividbcluster","controllerGroup":"kividb.io","controllerKind":"KividbCluster"}
+{"level":"info","ts":"2026-11-03T07:54:53Z","msg":"Starting EventSource","controller":"kividbdbops","controllerGroup":"kividb.io","controllerKind":"KividbDbOps","source":"kind source: *v1alpha1.KividbDbOps"}
+{"level":"info","ts":"2026-11-03T07:54:53Z","msg":"Starting Controller","controller":"kividbdbops","controllerGroup":"kividb.io","controllerKind":"KividbDbOps"}
+{"level":"info","ts":"2026-11-03T07:54:53Z","msg":"Starting workers","controller":"kividbdbops","controllerGroup":"kividb.io","controllerKind":"KividbDbOps","worker count":1}
+{"level":"info","ts":"2026-11-03T07:54:53Z","msg":"Starting workers","controller":"kividbcluster","controllerGroup":"kividb.io","controllerKind":"KividbCluster","worker count":1}
+{"level":"info","ts":"2026-11-03T07:54:54Z","msg":"the master restarted behind its replicas; failing over to the replica that holds the most","controller":"kividbcluster","controllerGroup":"kividb.io","controllerKind":"KividbCluster","KividbCluster":{"name":"g-no","namespace":"e2e"},"namespace":"e2e","name":"g-no","reconcileID":"016801cf-f867-443a-ab25-348a35fce972","pod":"g-no-0","masterOffset":0,"lastSeenOffset":30927443,"replica":"g-no-1","replicaOffset":30995297}
+{"level":"info","ts":"2026-11-03T07:54:54Z","msg":"promoting pod to master","controller":"kividbcluster","controllerGroup":"kividb.io","controllerKind":"KividbCluster","KividbCluster":{"name":"g-no","namespace":"e2e"},"namespace":"e2e","name":"g-no","reconcileID":"016801cf-f867-443a-ab25-348a35fce972","pod":"g-no-1","reason":"failover"}
+{"level":"info","ts":"2026-11-03T07:54:54Z","msg":"ACL file reloaded","controller":"kividbcluster","controllerGroup":"kividb.io","controllerKind":"KividbCluster","KividbCluster":{"name":"g-no","namespace":"e2e"},"namespace":"e2e","name":"g-no","reconcileID":"016801cf-f867-443a-ab25-348a35fce972","pod":"g-no-0","generation":"1"}

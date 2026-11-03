@@ -73,6 +73,10 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
             rs.repl_ping_period_secs.load(Relaxed).to_string(),
         ),
         (
+            "shutdown-timeout",
+            rs.shutdown_timeout_secs.load(Relaxed).to_string(),
+        ),
+        (
             "replica-full-sync-guard",
             rs.full_sync_guard().as_str().to_string(),
         ),
@@ -92,7 +96,11 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
         ),
         (
             "repl-replica-max-backlog-bytes",
-            ctx.config.repl_replica_max_backlog_bytes.to_string(),
+            rs.replica_max_backlog_bytes.load(Relaxed).to_string(),
+        ),
+        (
+            "repl-replica-sync-max-backlog-bytes",
+            rs.replica_sync_max_backlog_bytes.load(Relaxed).to_string(),
         ),
         ("cluster-enabled", yes_no(ctx.config.cluster_enabled)),
         (
@@ -635,6 +643,38 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                                  'repl-timeout') - argument must be a positive integer",
                 )),
             },
+            // Read for each write the hub queues: a change applies to the
+            // replicas already attached (#305).
+            "repl-replica-max-backlog-bytes" | "repl-replica-sync-max-backlog-bytes" => {
+                match memory_size(value) {
+                    Some(bytes) if bytes > 0 && bytes <= i64::MAX as usize => {
+                        let limit = if param == "repl-replica-max-backlog-bytes" {
+                            &ctx.repl_state.replica_max_backlog_bytes
+                        } else {
+                            &ctx.repl_state.replica_sync_max_backlog_bytes
+                        };
+                        limit.store(bytes as u64, Ordering::Relaxed);
+                        Some(resp_simple("OK"))
+                    }
+                    _ => Some(resp_error(&format!(
+                        "ERR CONFIG SET failed (possibly related to argument '{param}') - \
+                         argument must be a memory value of at least 1 byte"
+                    ))),
+                }
+            }
+            // Read when a shutdown begins to wait for the replicas.
+            "shutdown-timeout" => match value.parse::<u64>() {
+                Ok(v) if v <= i32::MAX as u64 => {
+                    ctx.repl_state
+                        .shutdown_timeout_secs
+                        .store(v, std::sync::atomic::Ordering::Relaxed);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument \
+                                 'shutdown-timeout') - argument must be between 0 and 2147483647 inclusive",
+                )),
+            },
             "repl-ping-replica-period" | "repl-ping-slave-period" => match value.parse::<u64>() {
                 Ok(v) => {
                     ctx.repl_state
@@ -918,10 +958,7 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
         .or_else(|| config_set_global(&param, value))
         .unwrap_or_else(|| config_set_other(ctx, &param, value));
     if reply.starts_with(b"+") {
-        let secret = matches!(
-            param.as_str(),
-            "requirepass" | "masterauth" | "tls-key-file-pass"
-        );
+        let secret = crate::slowlog::SECRET_SETTINGS.contains(&param.as_str());
         log_info!(
             "CONFIG SET {param} {}",
             if secret { "(hidden)" } else { value }
@@ -1913,7 +1950,7 @@ fn count_flushed_in_place(flushed: &crate::store::Flushed) {
 fn replica_rows(
     repl_state: &crate::replication::ReplState,
     master_offset: u64,
-) -> Vec<(String, u16, u64, u64, &'static str)> {
+) -> Vec<(String, u16, u64, u64, &'static str, u64)> {
     let mut peers: Vec<(u64, String, u16)> = repl_state.replica_peers.lock().clone();
     peers.sort_by_key(|(id, _, _)| *id);
     let progress = repl_state.replica_progress.lock();
@@ -1926,8 +1963,9 @@ fn replica_rows(
                 master_offset.saturating_sub(p.behind_bytes()),
                 p.lag_secs(),
                 p.state().as_str(),
+                p.queued(),
             ),
-            None => (ip, port, 0, 0, "wait_bgsave"),
+            None => (ip, port, 0, 0, "wait_bgsave", 0),
         })
         .collect()
 }
@@ -3938,11 +3976,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     // sent, online once the replica has loaded it and
                     // acknowledged. (It used to read `online` from the moment
                     // the replica connected.)
-                    for (idx, (ip, port, slave_off, lag, state)) in
+                    // `queued` (KiviDB's): the bytes of the stream waiting
+                    // to be sent to it.
+                    for (idx, (ip, port, slave_off, lag, state, queued)) in
                         replica_rows(ctx.repl_state, offset).iter().enumerate()
                     {
                         out.push_str(&format!(
-                            "slave{idx}:ip={ip},port={port},state={state},offset={slave_off},lag={lag}\r\n"
+                            "slave{idx}:ip={ip},port={port},state={state},offset={slave_off},lag={lag},queued={queued}\r\n"
                         ));
                     }
                     let load = |v: &std::sync::atomic::AtomicU64| {
@@ -4821,7 +4861,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 // master: ["master", repl_offset, [[ip, port, offset], ...]]
                 let replicas = replica_rows(ctx.repl_state, offset)
                     .into_iter()
-                    .map(|(ip, port, slave_off, _lag, _state)| {
+                    .map(|(ip, port, slave_off, _lag, _state, _queued)| {
                         resp_array(vec![
                             resp_bulk_str(&ip),
                             resp_bulk_str(&port.to_string()),

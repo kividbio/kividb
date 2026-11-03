@@ -723,11 +723,13 @@ impl HashInner {
 
     /// True when the field has an expiry that has already elapsed.
     /// False if no expiry is set, or the expiry is still in the future,
-    /// or the field doesn't exist.
+    /// or the field doesn't exist. Never while this thread replays the AOF
+    /// (`expiry::replaying`): the log's writes to the field were made while
+    /// it lived.
     #[inline]
     pub fn is_field_expired(&self, field: &str) -> bool {
         match self.expiries.get(field) {
-            Some(exp) => std::time::Instant::now() >= *exp,
+            Some(exp) => std::time::Instant::now() >= *exp && !crate::expiry::replaying(),
             None => false,
         }
     }
@@ -757,7 +759,7 @@ impl HashInner {
     /// caller gets a clean view in one pass under a single lock.
     /// Returns the number of fields evicted.
     pub fn sweep_expired(&mut self) -> usize {
-        if self.expiries.is_empty() {
+        if self.expiries.is_empty() || crate::expiry::replaying() {
             return 0;
         }
         let now = std::time::Instant::now();

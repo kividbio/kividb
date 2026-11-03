@@ -1,0 +1,76 @@
+scenario,unix,label
+install:,1793690417,CRDs + helm install 0c0fb6e
+install:,1793690436,operator Available after 19 s
+create:,1793690444,"shd on rc8, g-yes/g-no on rc9"
+create:,1793690479,all Running after 35 s
+upgrade-shd,1793690575,spec.image -> 1.2.0-rc9
+upgrade-shd,1793690702,"all 6 pods on 1.2.0-rc9, Running"
+restart-rc9,1793690757,DbOps restart
+restart-rc9,1793690894,DbOps Completed
+failover-rc9,1793690949,FAILOVER shd-0-1
+failover-rc9,1793690974,FAILOVER shd-1-1
+failover-rc9,1793690999,FAILOVER shd-2-1
+graceful,1793691086,try 1: shd-0-1
+graceful1,1793691100,cordoned all nodes but vmss000003
+graceful1,1793691100,graceful delete shd-0-1
+graceful1,1793691104,"new shd-0-1 on vmss000003, nodes uncordoned"
+graceful1,1793691116,shd-0-1 Ready
+graceful,1793691229,try 2: shd-1-1
+graceful2,1793691243,cordoned all nodes but vmss000000
+graceful2,1793691244,graceful delete shd-1-1
+graceful2,1793691248,"new shd-1-1 on vmss000000, nodes uncordoned"
+graceful2,1793691260,shd-1-1 Ready
+forcedel,1793691378,try 1: BGSAVE on shd-0-0
+forcedel1,1793691423,cordoned all nodes but vmss000002
+forcedel1,1793691423,force delete shd-0-0
+forcedel1,1793691426,"new shd-0-0 on vmss000002, nodes uncordoned"
+forcedel1,1793691438,shd-0-0 Ready
+forcedel,1793691558,try 2: BGSAVE on shd-1-0
+forcedel2,1793691603,cordoned all nodes but vmss000003
+forcedel2,1793691603,force delete shd-1-0
+forcedel2,1793691606,"new shd-1-0 on vmss000003, nodes uncordoned"
+forcedel2,1793691617,shd-1-0 Ready
+forcedel,1793691738,try 3: BGSAVE on shd-2-1
+forcedel3,1793691783,cordoned all nodes but vmss000002
+forcedel3,1793691783,force delete shd-2-1
+forcedel3,1793691786,"new shd-2-1 on vmss000002, nodes uncordoned"
+forcedel3,1793691797,shd-2-1 Ready
+sigkill-rc9,1793691910,SIGKILL shd-0-0
+sigkill-rc9,1793691925,shd-0-0 Ready
+reshard-up-rc9,1793691994,spec.shards=4
+reshard-up-rc9,1793692026,RebalanceCompleted
+reshard-up-rc9,1793692027,Running with 8 pods
+reshard-down-rc9,1793692098,spec.shards=3
+reshard-down-rc9,1793692109,RebalanceCompleted
+reshard-down-rc9,1793692110,Running with 6 pods
+guard-yes,1793692192,operator scaled to 0
+guard-yes,1793692195,SIGSTOP + force delete + SIGKILL g-yes-1 (pid 14994)
+guard-yes,1793692237,new g-yes-1 Ready (<ip>)
+guard-yes,1793692239,operator scaled to 1
+guard-yes,1793692382,master after: g-yes-1
+guard-yes,1793692385,verdict KEPT
+guard-no,1793692429,operator scaled to 0
+guard-no,1793692432,SIGSTOP + force delete + SIGKILL g-no-0 (pid 14032)
+guard-no,1793692474,new g-no-0 Ready (<ip>)
+guard-no,1793692475,operator scaled to 1
+guard-no,1793692617,master after: g-no-1
+guard-no,1793692620,verdict FAILED_OVER
+final,1793692669,read-back
+upgrade-shd,1793690635,op: ShardSwitchover (shard 2)
+upgrade-shd,1793690655,op: ShardSwitchover (shard 1)
+upgrade-shd,1793690675,op: ShardSwitchover (shard 0)
+restart-rc9,1793690819,op: ShardSwitchover (shard 0)
+restart-rc9,1793690844,op: ShardSwitchover
+restart-rc9,1793690864,op: ShardSwitchover
+failover-rc9,1793690951,op: ShardFailover (shard 0)
+failover-rc9,1793690976,op: ShardFailover (shard 1)
+failover-rc9,1793691001,op: ShardFailover (shard 2)
+graceful1,1793691101,op: ShardSwitchover
+graceful1,1793691101,op: ShardSwitchover (shard 0)
+graceful2,1793691244,op: ShardSwitchover (shard 1)
+reshard-up-rc9,1793691995,op: RebalanceStarted
+reshard-up-rc9,1793692024,op: RebalanceCompleted
+reshard-down-rc9,1793692100,op: RebalanceStarted
+reshard-down-rc9,1793692103,op: RebalanceCompleted
+guard-no,1793692494,op: Failover
+guard-no,1793692494,op: MasterRestartedBehind

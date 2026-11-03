@@ -1,0 +1,3 @@
+1793656345.135126343 partition master <-> replica
+1793656349.817594827 replica promoted, clients moved
+1793656360.125222023 healed, old master demoted

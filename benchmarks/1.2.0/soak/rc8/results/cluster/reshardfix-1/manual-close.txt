@@ -1,0 +1,13 @@
+2026-11-03T06:05:05Z
+SETSLOT 0 STABLE on 10.80.1.5:7001 (importing, 3 stale keys)
+OK
+owner 10.80.1.5:7002 state:
+e76a3a1003cb9a2aa3b865cf6d98807bcaad5167 10.80.1.5:7002@17002 myself,master - 0 0 18 connected 0-9 5461-10922
+10.80.1.9:7001 0 - replica
+10.80.1.8:7001 435 - replica
+10.80.1.5:7001 3 - master
+10.80.1.9:7002 3 - replica
+10.80.1.8:7002 0 - master
+10.80.1.5:7002 434 owner master
+>>> Check for open slots...
+[OK] All 16384 slots covered.

@@ -228,6 +228,91 @@ fn rest(cmd: &[&[u8]], first: usize) -> Keys {
 }
 
 /// Position of an option keyword at or after `from`, case-insensitively.
+/// `XREAD` / `XREADGROUP ... STREAMS key [key ...] id [id ...]`. The
+/// `STREAMS` that counts is the option, found as the commands' parsers find
+/// it: an `XREADGROUP` group or consumer may be named `STREAMS` too.
+fn streams_keys(name: &str, cmd: &[&[u8]]) -> Keys {
+    let mut i = if name == "XREADGROUP" && cmd.len() > 1 && cmd[1].eq_ignore_ascii_case(b"GROUP") {
+        4
+    } else {
+        1
+    };
+    let streams = loop {
+        let Some(arg) = cmd.get(i) else {
+            return Keys::None;
+        };
+        if arg.eq_ignore_ascii_case(b"STREAMS") {
+            break i;
+        }
+        let takes_argument = [
+            b"COUNT".as_slice(),
+            b"BLOCK",
+            b"MAXCOUNT",
+            b"MAXSIZE",
+            b"CLAIM",
+        ]
+        .iter()
+        .any(|option| arg.eq_ignore_ascii_case(option));
+        i += if takes_argument { 2 } else { 1 };
+    };
+    let n = (cmd.len() - streams - 1) / 2;
+    if n == 0 {
+        Keys::None
+    } else {
+        Keys::Range {
+            first: streams + 1,
+            last: streams + n,
+            step: 1,
+        }
+    }
+}
+
+/// `SORT key [...] [STORE destination]`. SORT writes to the destination of
+/// its last `STORE`, and an argument of `BY` or `GET` may be spelt `STORE`:
+/// the destination is found as SORT's own parser finds it.
+fn sort_keys(cmd: &[&[u8]]) -> Keys {
+    let mut destination = None;
+    let mut i = 2;
+    while i < cmd.len() {
+        let option = cmd[i];
+        if option.eq_ignore_ascii_case(b"LIMIT") {
+            i += 2;
+        } else if option.eq_ignore_ascii_case(b"BY") || option.eq_ignore_ascii_case(b"GET") {
+            i += 1;
+        } else if option.eq_ignore_ascii_case(b"STORE") {
+            if i + 1 < cmd.len() {
+                destination = Some(i + 1);
+            }
+            i += 1;
+        }
+        i += 1;
+    }
+    match destination {
+        Some(at) => Keys::Two(1, at),
+        None => Keys::One(1),
+    }
+}
+
+/// `GEORADIUS key ... [STORE key] [STOREDIST key]`. The command writes to the
+/// key after its last `STORE` or `STOREDIST`, so the key after each of them
+/// is one.
+fn geo_radius_keys(name: &str, cmd: &[&[u8]]) -> Keys {
+    let options = if name == "GEORADIUSBYMEMBER" { 5 } else { 6 };
+    let mut keys = vec![1];
+    for (at, arg) in cmd.iter().enumerate().skip(options) {
+        if at + 1 < cmd.len()
+            && (arg.eq_ignore_ascii_case(b"STORE") || arg.eq_ignore_ascii_case(b"STOREDIST"))
+        {
+            keys.push(at + 1);
+        }
+    }
+    if keys.len() == 1 {
+        Keys::One(1)
+    } else {
+        Keys::List(keys)
+    }
+}
+
 fn find_option(cmd: &[&[u8]], from: usize, option: &[u8]) -> Option<usize> {
     cmd.iter()
         .enumerate()
@@ -860,36 +945,9 @@ pub fn key_positions(name: &str, cmd: &[&[u8]]) -> Keys {
             _ => One(1),
         },
         Shape::AfterOperation => rest(cmd, 2),
-        Shape::Streams => match find_option(cmd, 1, b"STREAMS") {
-            Some(pos) => {
-                let n = (cmd.len() - pos - 1) / 2;
-                if n == 0 {
-                    None
-                } else {
-                    Range {
-                        first: pos + 1,
-                        last: pos + n,
-                        step: 1,
-                    }
-                }
-            }
-            Option::None => None,
-        },
-        Shape::Sort => match find_option(cmd, 2, b"STORE") {
-            Some(pos) if pos + 1 < cmd.len() => Two(1, pos + 1),
-            _ => One(1),
-        },
-        Shape::GeoRadius => {
-            let mut keys = vec![1];
-            for option in [b"STORE".as_slice(), b"STOREDIST".as_slice()] {
-                if let Some(pos) = find_option(cmd, 2, option)
-                    && pos + 1 < cmd.len()
-                {
-                    keys.push(pos + 1);
-                }
-            }
-            if keys.len() == 1 { One(1) } else { List(keys) }
-        }
+        Shape::Streams => streams_keys(name, cmd),
+        Shape::Sort => sort_keys(cmd),
+        Shape::GeoRadius => geo_radius_keys(name, cmd),
         Shape::Migrate => {
             if cmd.len() < 6 {
                 None
@@ -1082,38 +1140,11 @@ mod tests {
             // BITOP operation destkey key [key ...]
             "BITOP" => rest(cmd, 2),
             // XREAD / XREADGROUP ... STREAMS key [key ...] id [id ...]
-            "XREAD" | "XREADGROUP" => match find_option(cmd, 1, b"STREAMS") {
-                Some(pos) => {
-                    let n = (cmd.len() - pos - 1) / 2;
-                    if n == 0 {
-                        None
-                    } else {
-                        Range {
-                            first: pos + 1,
-                            last: pos + n,
-                            step: 1,
-                        }
-                    }
-                }
-                Option::None => None,
-            },
+            "XREAD" | "XREADGROUP" => streams_keys(name, cmd),
             // SORT key [...] [STORE destination]
-            "SORT" => match find_option(cmd, 2, b"STORE") {
-                Some(pos) if pos + 1 < cmd.len() => Two(1, pos + 1),
-                _ => One(1),
-            },
+            "SORT" => sort_keys(cmd),
             // GEORADIUS key ... [STORE key] [STOREDIST key]
-            "GEORADIUS" | "GEORADIUSBYMEMBER" => {
-                let mut keys = vec![1];
-                for option in [b"STORE".as_slice(), b"STOREDIST".as_slice()] {
-                    if let Some(pos) = find_option(cmd, 2, option)
-                        && pos + 1 < cmd.len()
-                    {
-                        keys.push(pos + 1);
-                    }
-                }
-                if keys.len() == 1 { One(1) } else { List(keys) }
-            }
+            "GEORADIUS" | "GEORADIUSBYMEMBER" => geo_radius_keys(name, cmd),
             // MIGRATE host port key|"" db timeout [...] [KEYS key [key ...]]
             "MIGRATE" => {
                 if cmd.len() < 6 {
@@ -1378,6 +1409,61 @@ mod tests {
         );
         assert_eq!(keys(&["SORT", "k", "STORE", "dest"]), ["k", "dest"]);
         assert_eq!(keys(&["SORT", "k", "LIMIT", "0", "1"]), ["k"]);
+        // The destination is that of the last STORE, as SORT reads it.
+        assert_eq!(keys(&["SORT", "k", "STORE", "a", "STORE", "b"]), ["k", "b"]);
+        assert_eq!(
+            keys(&["SORT", "k", "GET", "STORE", "STORE", "d"]),
+            ["k", "d"]
+        );
+        assert_eq!(keys(&["SORT", "k", "BY", "STORE", "ALPHA"]), ["k"]);
+        assert_eq!(
+            keys(&[
+                "GEORADIUS",
+                "k",
+                "0",
+                "0",
+                "1",
+                "km",
+                "STORE",
+                "a",
+                "STORE",
+                "b"
+            ]),
+            ["k", "a", "b"]
+        );
+        assert_eq!(
+            keys(&[
+                "GEORADIUSBYMEMBER",
+                "k",
+                "m",
+                "1",
+                "km",
+                "STOREDIST",
+                "a",
+                "STORE",
+                "b"
+            ]),
+            ["k", "a", "b"]
+        );
+        // A group or consumer named STREAMS is not the option.
+        assert_eq!(
+            keys(&["XREADGROUP", "GROUP", "g", "STREAMS", "STREAMS", "s1", ">"]),
+            ["s1"]
+        );
+        assert_eq!(
+            keys(&[
+                "XREADGROUP",
+                "GROUP",
+                "STREAMS",
+                "c",
+                "COUNT",
+                "1",
+                "STREAMS",
+                "s1",
+                ">"
+            ]),
+            ["s1"]
+        );
         assert_eq!(
             keys(&["GEORADIUS", "k", "0", "0", "1", "km", "STORE", "d"]),
             ["k", "d"]

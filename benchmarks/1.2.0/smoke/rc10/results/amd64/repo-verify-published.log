@@ -1,0 +1,162 @@
+=== generating self-signed TLS cert ===
+.+.+......+...+........+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*....+........+...+.........+.+.....+...............+.............+..............+.+.....+....+...+..+......+.......+..+...+....+...+............+.....+....+..+..........+...+.........+........+...+.......+.....+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*.............+.+.....+...+........................+.+.....+.+.........+.........+...+..+.............+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+.+.....+.......+...+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*..+........+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*....+.....+.+..+....+.........+............+...+..+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+-----
+generated certs/server.crt + certs/server.key
+
+=== pulling all 4 published image variants for ghcr.io/kividbio/kividb:v1.2.0-rc10(-tls|-lua|-full) ===
+ kividb-full Pulling 
+ kividb-lua Pulling 
+ runner Pulling 
+ kividb-default Pulling 
+ kividb-tls Pulling 
+ kividb-tls Pulled 
+ kividb-default Pulled 
+ kividb-full Pulled 
+ kividb-lua Pulled 
+ 1ea868e596ec Pulling fs layer 
+ e25d07126ba7 Pulling fs layer 
+ ae75cb664c8f Pulling fs layer 
+ 759efa4719c9 Pulling fs layer 
+ 4f4fb700ef54 Pulling fs layer 
+ cef7ad5a05c6 Pulling fs layer 
+ a239ec2b8fe1 Pulling fs layer 
+ 4f4fb700ef54 Already exists 
+ e25d07126ba7 Download complete 
+ ae75cb664c8f Download complete 
+ 759efa4719c9 Download complete 
+ a239ec2b8fe1 Downloading [==================================================>]     950B/950B
+ 1ea868e596ec Downloading [================>                                  ]  4.194MB/12.42MB
+ 759efa4719c9 Extracting 1 s
+ 1ea868e596ec Downloading [==================================================>]  12.42MB/12.42MB
+ a239ec2b8fe1 Download complete 
+ 759efa4719c9 Extracting 1 s
+ 1ea868e596ec Download complete 
+ cef7ad5a05c6 Download complete 
+ 759efa4719c9 Extracting 1 s
+ 759efa4719c9 Extracting 1 s
+ 759efa4719c9 Pull complete 
+ a239ec2b8fe1 Pull complete 
+ cef7ad5a05c6 Extracting 1 s
+ 1ea868e596ec Extracting 1 s
+ cef7ad5a05c6 Pull complete 
+ b5e4a0ae9c7c Download complete 
+ 4d584b19579f Download complete 
+ 1ea868e596ec Extracting 1 s
+ ae75cb664c8f Pull complete 
+ 1ea868e596ec Pull complete 
+ 4f4fb700ef54 Pull complete 
+ e25d07126ba7 Pull complete 
+ runner Pulled 
+
+=== starting services ===
+ kividb-lua Pulling 
+ kividb-default Pulling 
+ kividb-full Pulling 
+ kividb-tls Pulling 
+ kividb-default Pulled 
+ kividb-full Pulled 
+ kividb-tls Pulled 
+ kividb-lua Pulled 
+ Network verify_default  Creating
+ Network verify_default  Created
+ Container verify-kividb-full-1  Creating
+ Container verify-kividb-lua-1  Creating
+ Container verify-kividb-default-1  Creating
+ Container verify-kividb-tls-1  Creating
+ Container verify-kividb-tls-1  Created
+ Container verify-kividb-lua-1  Created
+ Container verify-kividb-full-1  Created
+ Container verify-kividb-default-1  Created
+ Container verify-kividb-tls-1  Starting
+ Container verify-kividb-default-1  Starting
+ Container verify-kividb-full-1  Starting
+ Container verify-kividb-lua-1  Starting
+ Container verify-kividb-full-1  Started
+ Container verify-kividb-tls-1  Started
+ Container verify-kividb-default-1  Started
+ Container verify-kividb-lua-1  Started
+
+=== running checks (see run-checks.sh) ===
+ kividb-lua Pulling 
+ kividb-full Pulling 
+ kividb-default Pulling 
+ kividb-tls Pulling 
+ kividb-lua Pulled 
+ kividb-default Pulled 
+ kividb-full Pulled 
+ kividb-tls Pulled 
+ Container verify-kividb-full-1  Running
+ Container verify-kividb-lua-1  Running
+ Container verify-kividb-default-1  Running
+ Container verify-kividb-tls-1  Running
+ kividb-lua Pulling 
+ kividb-full Pulling 
+ kividb-default Pulling 
+ kividb-tls Pulling 
+ kividb-full Pulled 
+ kividb-default Pulled 
+ kividb-lua Pulled 
+ kividb-tls Pulled 
+=== waiting for services ===
+
+=== Docker image variants must actually have the right features compiled in ===
+PASS: kividb-default (no tls feature): TLS handshake on tls-port should FAIL
+PASS: kividb-lua (no tls feature): TLS handshake on tls-port should FAIL
+Terminated
+PASS: kividb-tls (tls feature): TLS handshake on tls-port should SUCCEED
+Terminated
+PASS: kividb-full (tls,lua features): TLS handshake on tls-port should SUCCEED
+PASS: kividb-default (no lua feature): EVAL should be rejected
+PASS: kividb-tls (no lua feature): EVAL should be rejected
+PASS: kividb-lua (lua feature): EVAL should succeed
+PASS: kividb-full (lua,tls features): EVAL should succeed
+
+=== command ACL rules must be enforced live, not just via ACL DRYRUN ===
+PASS: noflusher (+@all -flushall -flushdb): SET should succeed
+PASS: noflusher (+@all -flushall -flushdb): FLUSHALL should be denied (NOPERM)
+PASS: noflusher (+@all -flushall -flushdb): FLUSHDB should be denied (NOPERM)
+
+=== PING must require auth when requirepass/ACL is set ===
+PASS: unauthenticated PING should be denied (NOAUTH)
+
+=== readonly template (§5): -@write blocks writes, reads still work ===
+PASS: analyst (readonly): GET should NOT be denied
+PASS: analyst (readonly): SET should be denied (NOPERM)
+
+=== load check: enforcement path holds up under redis-benchmark ===
+--- unrestricted 'default' user (RESTRICTED_CMD_CLIENTS stays 0 here) ---
+ SET: rps=0.0 (overall: -nan) avg_msec=-nan (overall: -nan)                                                           SET: rps=93681.3 (overall: 93681.3) avg_msec=0.292 (overall: 0.292)                                                                    SET: rps=93648.0 (overall: 93664.7) avg_msec=0.282 (overall: 0.287)                                                                    SET: 92936.80 requests per second, p50=0.263 msec
+ GET: rps=73656.0 (overall: 92070.0) avg_msec=0.290 (overall: 0.290)                                                                    GET: rps=85502.0 (overall: 88414.6) avg_msec=0.301 (overall: 0.296)                                                                    GET: 87565.68 requests per second, p50=0.303 msec
+
+--- restricted 'analyst' user (readonly; command-check now active) ---
+ GET: rps=0.0 (overall: -nan) avg_msec=-nan (overall: -nan)                                                           GET: rps=106517.9 (overall: 106517.9) avg_msec=0.455 (overall: 0.455)                                                                      GET: 105932.20 requests per second, p50=0.455 msec
+
+
+=== summary: 14 passed, 0 failed ===
+
+=== a build without TLS must refuse --tls-port ===
+PASS: kividb-default (no tls feature): refuses to start with --tls-port
+PASS: kividb-lua (no tls feature): refuses to start with --tls-port
+
+ALL CHECKS PASSED (published: ghcr.io/kividbio/kividb:v1.2.0-rc10)
+
+=== tearing down ===
+ Container verify-kividb-default-1  Stopping
+ Container verify-kividb-tls-1  Stopping
+ Container verify-kividb-lua-1  Stopping
+ Container verify-kividb-full-1  Stopping
+ Container verify-kividb-tls-1  Stopped
+ Container verify-kividb-tls-1  Removing
+ Container verify-kividb-tls-1  Removed
+ Container verify-kividb-full-1  Stopped
+ Container verify-kividb-full-1  Removing
+ Container verify-kividb-full-1  Removed
+ Container verify-kividb-lua-1  Stopped
+ Container verify-kividb-lua-1  Removing
+ Container verify-kividb-default-1  Stopped
+ Container verify-kividb-default-1  Removing
+ Container verify-kividb-lua-1  Removed
+ Container verify-kividb-default-1  Removed
+ Network verify_default  Removing
+ Network verify_default  Removed

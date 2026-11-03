@@ -1,0 +1,4 @@
+2026-11-03T03:19:18Z  redis  [Redis server v=8.10.3 sha=00000000:1 malloc=jemalloc-5.3.0 bits=64 build=7fec7ff4b6c82936]
+    ~/bin/redis-server --port 6379 --bind 0.0.0.0 --protected-mode no --save  --appendonly no --io-threads 24
+up: redis
+stopped

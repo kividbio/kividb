@@ -1,0 +1,21 @@
+02:56:08 binaries: kividb 1.2.0-rc8 / kividb 1.2.0-rc7
+02:56:08 START kividb-rc8
+03:07:59 kividb-rc8 ALL-DONE
+03:07:59 START kividb-rc7
+03:19:48 kividb-rc7 ALL-DONE
+03:19:48 START redis
+03:31:21 redis ALL-DONE
+03:31:21 START dragonfly
+03:35:43 dragonfly ALL-DONE
+03:35:43 START kividb-rc7-r2
+03:47:31 kividb-rc7 ALL-DONE
+03:47:31 START kividb-rc8-r2
+03:59:19 kividb-rc8 ALL-DONE
+03:59:19 START valkey
+04:11:10 valkey ALL-DONE
+04:11:10 START redis-cluster
+04:15:29 redis-cluster ALL-DONE
+04:15:29 matrix done
+04:15:52 lpop-tail done
+636 runs, 128 cells, 0 memory rows
+04:15:52 MASTER-DONE

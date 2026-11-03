@@ -1,0 +1,31 @@
+engine-1  | I20261103 04:13:31.697764     7 init.cc:144] dragonfly running in opt mode.
+engine-1  | I20261103 04:13:31.698021     7 dfly_main.cc:1108] Starting dragonfly df-v2.0.2-8ce4bbb106586057fbd85f71ed353c60d0d5bf87
+engine-1  |                    .--::--.                   
+engine-1  |    :+*=:          =@@@@@@@@=          :+*+:   
+engine-1  |   %@@@@@@%*=.     =@@@@@@@@-     .=*%@@@@@@#  
+engine-1  |   @@@@@@@@@@@@#+-. .%@@@@#. .-+#@@@@@@@@@@@%  
+engine-1  |   -@@@@@@@@@@@@@@@@*:#@@#:*@@@@@@@@@@@@@@@@-  
+engine-1  |     :+*********####-%@%%@%-####********++.    
+engine-1  |    .%@@@@@@@@@@@@@%:@@@@@@:@@@@@@@@@@@@@@%    
+engine-1  |    .@@@@@@@@%*+-:   =@@@@=  .:-+*%@@@@@@@%.   
+engine-1  |      =*+-:           ###*          .:-+*=     
+engine-1  |                      %@@%                     
+engine-1  |                      *@@*                     
+engine-1  |                      +@@=                     
+engine-1  |                      :##:                     
+engine-1  |                      :@@:                     
+engine-1  |                       @@                      
+engine-1  |                       ..                      
+engine-1  | * Logs will be written to the first available of the following paths:
+engine-1  | /tmp/dragonfly.*
+engine-1  | ./dragonfly.*
+engine-1  | * For the available flags type dragonfly [--help | --helpfull]
+engine-1  | * Documentation can be found at: https://www.dragonflydb.io/docs
+engine-1  | I20261103 04:13:31.705295     7 dfly_main.cc:1158] Using proactor_threads=32 (overriding cgroup-derived 0)
+engine-1  | I20261103 04:13:31.705317     7 dfly_main.cc:1190] Max memory limit is: 16.00GiB
+engine-1  | I20261103 04:13:31.706245    13 uring_proactor.cc:263] IORing with 1024 entries, allocated 98368 bytes, cq_entries is 2048
+engine-1  | I20261103 04:13:31.720108     7 proactor_pool.cc:186] Running 32 io threads
+engine-1  | I20261103 04:13:31.758496    12 dragonfly_listener.cc:159] SSL version: OpenSSL 3.4.5 7 Apr 2026
+engine-1  | I20261103 04:13:31.761468     7 dragonfly_connection.cc:917] Shared RESP V2 read buffer disabled
+engine-1  | I20261103 04:13:31.783330     7 server_family.cc:1217] Host OS: Linux 7.0.0-1017-azure x86_64 with 32 threads
+engine-1  | I20261103 04:13:31.797423    13 listener_interface.cc:102] sock[67] AcceptServer - listening on 0.0.0.0:6379

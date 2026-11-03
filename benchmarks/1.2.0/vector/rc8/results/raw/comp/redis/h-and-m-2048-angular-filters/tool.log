@@ -1,0 +1,57 @@
+1793676756.091 RUN ./vector-db-benchmark --host SERVER_IP --engines-file redis-engine.json --engines redis-m16-ef128 --datasets h-and-m-2048-angular-filters --skip-if-exists false --parallels 100
+1793676756.099 vector-db-benchmark 0.2.0 (git d22d44e8b46009a800a59e952710166ece2e38a1)
+1793676756.101 Found 1 datasets, 1 engines
+1793676756.103 
+1793676756.104 ============================================================
+1793676756.106 Running experiment (1/1): redis-m16-ef128 - h-and-m-2048-angular-filters
+1793676756.108 ============================================================
+1793676756.110 Experiment stage: Configure
+1793676756.112 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 128}
+1793676756.114 Experiment stage: Upload
+1793676756.116 Reading dataset from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793676757.812 Read 105100 vectors (2048d) in 1.707s (61576 vectors/sec)
+1793676757.814 Starting upload with 16 threads, batch size 64...
+1793676772.670 Upload time: 14.858s (7074 records/sec)
+1793676772.672 Indexing complete (num_docs=105100/105100, indexing=false, percent_indexed=1.00, state=absent) in 0.0s
+1793676772.674 Index time: 0.002s, Total time (read+upload+index): 16.566s
+1793676772.888 Results saved to: "/home/azureuser/vdbx/results/redis-m16-ef128-h-and-m-2048-angular-filters-upload-0-105100-2026-11-03-03-32-52.json"
+1793676774.526 Experiment stage: Search
+1793676774.528 	Running search 2: ef=128, parallel=100
+1793676774.530 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793676782.033 	  rep 1/3: QPS 1798.0
+1793676782.035 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793676789.534 	  rep 2/3: QPS 1793.3
+1793676789.536 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793676797.102 	  rep 3/3: QPS 1774.3
+1793676797.104 	→ QPS: 1798.0, Recall: 0.9986, Precision@returned: 0.9986, MRR: 0.9989, NDCG: 0.9986 (best of reps)
+1793676797.123 	Results saved to: "/home/azureuser/vdbx/results/redis-m16-ef128-h-and-m-2048-angular-filters-search-2-32014-2026-11-03-03-33-17.json"
+1793676797.125 -----------------------------------------------------------------------------------------------
+1793676797.126 Recall     Precision  MRR      NDCG     QPS        P50 (ms)     P90 (ms)     P95 (ms)    
+1793676797.128 -----------------------------------------------------------------------------------------------
+1793676797.130 0.9986     0.9986     0.9989   0.9986   1798.0     51.495       76.118       92.649      
+1793676797.132 
+1793676797.133 
+1793676797.135 QPS vs Precision Trade-off - redis-m16-ef128 - h-and-m-2048-angular-filters (up and to the right is better):
+1793676797.137 
+1793676797.139     1798 │●                                                           
+1793676797.141     1635 │                                                            
+1793676797.142     1471 │                                                            
+1793676797.144     1308 │                                                            
+1793676797.146     1144 │                                                            
+1793676797.148      981 │                                                            
+1793676797.149      817 │                                                            
+1793676797.151      654 │                                                            
+1793676797.153      490 │                                                            
+1793676797.155      327 │                                                            
+1793676797.157      163 │                                                            
+1793676797.159        0 │                                                            
+1793676797.160          └────────────────────────────────────────────────────────────
+1793676797.162           0.999          1.002          1.005          1.009          
+1793676797.164         Precision (0.0 = 0%, 1.0 = 100%)
+1793676797.166 
+1793676797.167 ================================================================================
+1793676797.169 Results saved to:  /home/azureuser/vdbx/results
+1793676797.171 Summary saved to:  /home/azureuser/vdbx/results/redis-m16-ef128-h-and-m-2048-angular-filters-summary.json
+1793676797.173 Experiment stage: Cleanup (deleting index and data)
+1793676797.632 Experiment stage: Done
+1793676797.699 EXIT 0

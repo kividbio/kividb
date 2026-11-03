@@ -1,0 +1,9 @@
+fmt: exit 1
+build: exit 0
+lib cluster: exit 0
+test result: ok. 108 passed; 0 failed; 0 ignored; 0 measured; 505 filtered out; finished in 0.01s
+clippy: exit 0
+tests/cluster.rs: exit 0
+test result: ok. 49 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 45.38s
+PROPOSAL-DONE
+fmt (final patch): exit 0
