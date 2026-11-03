@@ -430,6 +430,268 @@ fn changing_the_limit_while_running() {
     assert_eq!(c.cmd(&["SMEMBERS", "s"]).members(), sorted(&want));
 }
 
+fn encoding(c: &mut Conn, key: &str) -> String {
+    String::from_utf8(c.cmd(&["OBJECT", "ENCODING", key]).bulk()).unwrap()
+}
+
+fn info(c: &mut Conn, field: &str) -> i64 {
+    let text = String::from_utf8(c.cmd(&["INFO", "all"]).bulk()).unwrap();
+    let line = text.lines().find(|l| l.starts_with(&format!("{field}:")));
+    line.unwrap().split(':').nth(1).unwrap().parse().unwrap()
+}
+
+fn ints(range: std::ops::Range<i64>) -> Vec<String> {
+    range.map(|i| i.to_string()).collect()
+}
+
+/// `intset` exactly while the members are kept as the array; a table is never
+/// called one, whatever its members or the limit.
+#[test]
+fn object_encoding_is_the_form_kept() {
+    let dir = temp_dir("encoding");
+    let server = Server::start(&dir, &[]);
+    let mut c = server.conn();
+
+    c.sadd("small", &ints(0..10));
+    assert_eq!(encoding(&mut c, "small"), "intset");
+    c.sadd("words", &["a".to_string(), "b".to_string()]);
+    assert_eq!(encoding(&mut c, "words"), "listpack");
+
+    // Converted by a non-integer, and still a table once it is gone.
+    c.cmd(&["SADD", "small", "x"]);
+    assert_eq!(encoding(&mut c, "small"), "listpack");
+    c.cmd(&["SREM", "small", "x"]);
+    assert_eq!(encoding(&mut c, "small"), "listpack");
+
+    // Converted by size: the encoding a table of that size has.
+    c.sadd("full", &ints(0..DEFAULT as i64));
+    assert_eq!(encoding(&mut c, "full"), "intset");
+    c.cmd(&["SADD", "full", &DEFAULT.to_string()]);
+    assert_eq!(encoding(&mut c, "full"), "listpack");
+    c.sadd("full", &ints(0..200));
+    assert_eq!(encoding(&mut c, "full"), "hashtable");
+
+    // A lower limit leaves an array an array until its next new member.
+    set_limit(&mut c, 1000);
+    c.sadd("big", &ints(0..600));
+    assert_eq!(encoding(&mut c, "big"), "intset");
+    set_limit(&mut c, 64);
+    assert_eq!(encoding(&mut c, "big"), "intset");
+    c.cmd(&["SADD", "big", "600"]);
+    assert_eq!(encoding(&mut c, "big"), "hashtable");
+    set_limit(&mut c, 1000);
+    c.cmd(&["SREM", "big", "600"]);
+    assert_eq!(encoding(&mut c, "big"), "hashtable");
+
+    // With no arrays, a set of integers is a table from the start.
+    set_limit(&mut c, 0);
+    c.sadd("none", &ints(0..10));
+    assert_eq!(encoding(&mut c, "none"), "listpack");
+}
+
+/// Every member there throughout comes back exactly once from a scan that
+/// spans the change of form: the cursor is a position by each member's own
+/// bytes, which the change leaves alone.
+#[test]
+fn sscan_across_the_change_of_form() {
+    let dir = temp_dir("sscan");
+    let server = Server::start(&dir, &[]);
+    let mut c = server.conn();
+    // Over 512 integers: paged, as Redis pages such a set.
+    set_limit(&mut c, 1000);
+    let members = ints(0..600);
+    c.sadd("s", &members);
+    assert_eq!(encoding(&mut c, "s"), "intset");
+
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    let mut cursor = "0".to_string();
+    let mut pages = 0;
+    loop {
+        let reply = c.cmd(&["SSCAN", "s", &cursor, "COUNT", "50"]);
+        let Resp::Array(parts) = reply else { panic!() };
+        cursor = String::from_utf8(parts[0].bulk()).unwrap();
+        let Resp::Array(page) = &parts[1] else {
+            panic!()
+        };
+        seen.extend(page.iter().map(Resp::bulk));
+        pages += 1;
+        if pages == 3 {
+            assert_ne!(cursor, "0", "the scan has to span the change");
+            c.cmd(&["SADD", "s", "x"]);
+            assert_eq!(encoding(&mut c, "s"), "hashtable");
+        }
+        if cursor == "0" {
+            break;
+        }
+    }
+    assert!(pages > 3);
+    seen.retain(|m| m != b"x");
+    seen.sort();
+    assert_eq!(seen, sorted(&members), "each member exactly once");
+
+    // A small array comes back whole, as an intset does from Redis.
+    c.sadd("t", &ints(0..20));
+    let Resp::Array(parts) = c.cmd(&["SSCAN", "t", "0", "COUNT", "2"]) else {
+        panic!()
+    };
+    assert_eq!(parts[0].bulk(), b"0");
+    assert_eq!(parts[1].members(), sorted(&ints(0..20)));
+}
+
+#[test]
+fn spop_and_srandmember_counts() {
+    let dir = temp_dir("random");
+    let server = Server::start(&dir, &[]);
+    let mut c = server.conn();
+    let members = ints(-5..15);
+    c.sadd("s", &members);
+    let all = sorted(&members);
+
+    // SRANDMEMBER: distinct up to the size with a positive count; exactly as
+    // many as asked with a negative one, repeats allowed.
+    for n in [1, 7, 20, 25] {
+        let got = c.cmd(&["SRANDMEMBER", "s", &n.to_string()]).members();
+        let mut distinct = got.clone();
+        distinct.dedup();
+        assert_eq!(got.len(), n.min(20), "{n}");
+        assert_eq!(distinct, got, "{n}: distinct");
+        assert!(got.iter().all(|m| all.contains(m)));
+    }
+    let got = c.cmd(&["SRANDMEMBER", "s", "-200"]).members();
+    assert_eq!(got.len(), 200);
+    assert!(got.iter().all(|m| all.contains(m)));
+    let mut distinct = got.clone();
+    distinct.dedup();
+    assert!(distinct.len() < got.len(), "200 of 20 repeat some");
+    assert_eq!(c.cmd(&["SRANDMEMBER", "s", "0"]), Resp::Array(vec![]));
+    assert_eq!(c.cmd(&["SMEMBERS", "s"]).members(), all, "left as it was");
+    assert_eq!(encoding(&mut c, "s"), "intset");
+
+    // SPOP: distinct members, taken out; a negative count is an error.
+    assert!(matches!(c.cmd(&["SPOP", "s", "-1"]), Resp::Error(_)));
+    assert_eq!(c.cmd(&["SPOP", "s", "0"]), Resp::Array(vec![]));
+    let mut popped = c.cmd(&["SPOP", "s", "6"]).members();
+    let mut distinct = popped.clone();
+    distinct.dedup();
+    assert_eq!((popped.len(), distinct.len()), (6, 6));
+    assert_eq!(c.cmd(&["SCARD", "s"]).int(), 14);
+    assert_eq!(encoding(&mut c, "s"), "intset");
+    for m in &popped {
+        assert_eq!(c.raw(&[b"SISMEMBER", b"s", m]).int(), 0);
+    }
+    popped.extend(c.cmd(&["SPOP", "s", "100"]).members());
+    popped.sort();
+    assert_eq!(popped, all);
+    assert_eq!(c.cmd(&["EXISTS", "s"]).int(), 0);
+}
+
+/// SMOVE between the two forms, and into an array it turns into a table.
+#[test]
+fn smove_between_the_forms() {
+    let dir = temp_dir("smove");
+    let server = Server::start(&dir, &[]);
+    let mut c = server.conn();
+    c.sadd("ints", &ints(0..5));
+    c.sadd("words", &["a".to_string(), "7".to_string()]);
+
+    // Array to table, and table to array, as integers.
+    assert_eq!(c.cmd(&["SMOVE", "ints", "words", "3"]).int(), 1);
+    assert_eq!(c.cmd(&["SMOVE", "words", "ints", "7"]).int(), 1);
+    assert_eq!(
+        c.cmd(&["SMEMBERS", "ints"]).members(),
+        sorted(
+            &ints(0..8)
+                .into_iter()
+                .filter(|m| m != "3" && m != "5" && m != "6")
+                .collect::<Vec<_>>()
+        )
+    );
+    assert_eq!(encoding(&mut c, "ints"), "intset");
+    assert_eq!(
+        c.cmd(&["SMEMBERS", "words"]).members(),
+        sorted(&["a".to_string(), "3".to_string()])
+    );
+
+    // A non-integer turns the destination into a table.
+    assert_eq!(c.cmd(&["SMOVE", "words", "ints", "a"]).int(), 1);
+    assert_eq!(encoding(&mut c, "ints"), "listpack");
+    assert_eq!(c.cmd(&["SISMEMBER", "ints", "a"]).int(), 1);
+    assert_eq!(c.cmd(&["SISMEMBER", "words", "a"]).int(), 0);
+
+    // One member past the destination's limit turns it too; one it has
+    // already only leaves the source.
+    c.sadd("full", &ints(0..DEFAULT as i64));
+    c.sadd(
+        "from",
+        &ints(0..2)
+            .into_iter()
+            .chain([DEFAULT.to_string()])
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(c.cmd(&["SMOVE", "from", "full", "1"]).int(), 1);
+    assert_eq!(encoding(&mut c, "full"), "intset");
+    assert_eq!(c.cmd(&["SISMEMBER", "from", "1"]).int(), 0);
+    assert_eq!(
+        c.cmd(&["SMOVE", "from", "full", &DEFAULT.to_string()])
+            .int(),
+        1
+    );
+    assert_eq!(encoding(&mut c, "full"), "listpack");
+    assert_eq!(c.cmd(&["SCARD", "full"]).int(), DEFAULT as i64 + 1);
+    assert_eq!(c.cmd(&["SMEMBERS", "from"]).members(), sorted(&ints(0..1)));
+    assert_eq!(encoding(&mut c, "from"), "intset");
+}
+
+/// Under `maxmemory`, the arrays are counted at their size: about as many fit
+/// as `MEMORY USAGE` says, and a key evicted leaves nothing behind.
+#[test]
+fn eviction_counts_the_arrays() {
+    let dir = temp_dir("evict");
+    let server = Server::start(&dir, &[]);
+    let mut c = server.conn();
+    c.cmd(&["CONFIG", "SET", "maxmemory-policy", "allkeys-random"]);
+    let members = ints(10_000_000..10_000_000 + DEFAULT as i64);
+    c.sadd("probe", &members);
+    let each = usage(&mut c, "probe");
+    c.cmd(&["DEL", "probe"]);
+
+    let room: i64 = 1 << 20;
+    let limit = info(&mut c, "used_memory") + room;
+    c.cmd(&["CONFIG", "SET", "maxmemory", &limit.to_string()]);
+    let keys = 3 * room / each;
+    for i in 0..keys {
+        c.sadd(&format!("k{i}"), &members);
+    }
+    c.cmd(&["CONFIG", "SET", "maxmemory", "0"]);
+
+    assert!(info(&mut c, "evicted_keys") > 0);
+    let mut kept = Vec::new();
+    for i in 0..keys {
+        let key = format!("k{i}");
+        if c.cmd(&["EXISTS", &key]).int() == 1 {
+            kept.push(key);
+        }
+    }
+    // Kept at their real size: counted as tables, a tenth as many would fit.
+    let fitted = kept.len() as i64 * each;
+    assert!(
+        fitted > room / 2 && fitted < room * 3 / 2,
+        "{} of {each} bytes in {room}",
+        kept.len()
+    );
+    for key in kept.iter().step_by(25) {
+        assert_eq!(c.cmd(&["SCARD", key]).int(), DEFAULT as i64);
+        assert_eq!(encoding(&mut c, key), "intset");
+    }
+    let gone = (0..keys)
+        .map(|i| format!("k{i}"))
+        .find(|k| !kept.contains(k))
+        .unwrap();
+    assert_eq!(c.cmd(&["SADD", &gone, "1"]).int(), 1);
+    assert_eq!(c.cmd(&["SMEMBERS", &gone]).members(), sorted(&ints(1..2)));
+    assert_eq!(encoding(&mut c, &gone), "intset");
+}
+
 /// The members to persist: in the array, past its limit, mixed, at the ends.
 fn persisted(c: &mut Conn) -> Vec<(String, Vec<String>)> {
     let sets = vec![

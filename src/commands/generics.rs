@@ -30,12 +30,40 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// say. Clients rely on it — BullMQ's dependency pagination expects a small
 /// set in one page.
 pub(crate) fn scans_whole(value: ValueRef<'_>) -> bool {
-    matches!(encoding_of(value), "intset" | "listpack" | "listpackex")
+    match value {
+        // By its members, not the form it is kept in (#297): paging stays as it was.
+        ValueRef::Set(set) => matches!(set_encoding_by_members(&set.read()), "intset" | "listpack"),
+        _ => matches!(encoding_of(value), "listpack" | "listpackex"),
+    }
 }
 
+/// The encoding Redis, at its default limits, would give a set of these members.
+fn set_encoding_by_members(set: &crate::member_set::MemberSet) -> &'static str {
+    let integers = set.iter().all(|member| {
+        std::str::from_utf8(&member)
+            .ok()
+            .and_then(|text| text.parse::<i64>().ok())
+            .is_some_and(|n| n.to_string().as_bytes() == &member[..])
+    });
+    if integers && set.len() <= 512 {
+        "intset"
+    } else {
+        table_set_encoding(set)
+    }
+}
+
+fn table_set_encoding(set: &crate::member_set::MemberSet) -> &'static str {
+    if set.len() <= 128 && set.iter().all(|member| member.len() <= SMALL) {
+        "listpack"
+    } else {
+        "hashtable"
+    }
+}
+
+/// An entry of a compact structure is at most this long.
+const SMALL: usize = 64;
+
 fn encoding_of(value: ValueRef<'_>) -> &'static str {
-    // An entry of a compact structure is at most this long.
-    const SMALL: usize = 64;
     match value {
         ValueRef::String(bytes) => {
             let integer = bytes.len() <= 20
@@ -62,18 +90,11 @@ fn encoding_of(value: ValueRef<'_>) -> &'static str {
         }
         ValueRef::Set(set) => {
             let set = set.read();
-            let integers = set.iter().all(|member| {
-                std::str::from_utf8(&member)
-                    .ok()
-                    .and_then(|text| text.parse::<i64>().ok())
-                    .is_some_and(|n| n.to_string().as_bytes() == &member[..])
-            });
-            if integers && set.len() <= 512 {
+            // The form it is really kept in (#297); a table is never `intset`.
+            if set.is_compact() {
                 "intset"
-            } else if set.len() <= 128 && set.iter().all(|member| member.len() <= SMALL) {
-                "listpack"
             } else {
-                "hashtable"
+                table_set_encoding(&set)
             }
         }
         ValueRef::SortedSet(zset) => {
