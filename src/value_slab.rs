@@ -281,6 +281,13 @@ thread_local! {
 static NOBODY: u8 = 0;
 
 /// A block of class `class`'s size, aligned to sixteen bytes.
+///
+/// Must not panic (#358, #370): the active defrag thread lives on after a
+/// panic in a pass, with its own slabs, and allocates again. A panic here
+/// half way through a change of a slab's hands or lists would leave that
+/// thread, or the lists, believing what is no longer so: two values given
+/// the same block. Nothing in it panics but on a broken invariant, and a
+/// failed allocation aborts.
 pub fn alloc(class: usize) -> NonNull<u8> {
     debug_assert!(class < CLASSES);
     let block = MINE
@@ -319,6 +326,13 @@ pub fn alloc(class: usize) -> NonNull<u8> {
 ///
 /// # Safety
 /// `block` came from `alloc(class)`, and is not used again.
+///
+/// Must not panic (#358, #370): the active defrag thread lives on after a
+/// panic in a pass, with its own slabs, and allocates again. A panic here
+/// half way through a change of a slab's hands or lists would leave that
+/// thread, or the lists, believing what is no longer so: two values given
+/// the same block. Nothing in it panics but on a broken invariant, and a
+/// failed allocation aborts.
 pub unsafe fn free(block: NonNull<u8>, class: usize) {
     crate::memory_use::note(-(block_size(class) as isize));
     let block = block.as_ptr();
@@ -416,6 +430,13 @@ unsafe fn take(slab: &Slab, class: usize) -> Option<*mut u8> {
 ///
 /// # Safety
 /// The calling thread owns `slab`, of class `class`.
+///
+/// Must not panic (#358, #370): the active defrag thread lives on after a
+/// panic in a pass, with its own slabs, and allocates again. A panic here
+/// half way through a change of a slab's hands or lists would leave that
+/// thread, or the lists, believing what is no longer so: two values given
+/// the same block. Nothing in it panics but on a broken invariant, and a
+/// failed allocation aborts.
 unsafe fn let_go(slab: &Slab, class: usize) {
     let pending = std::mem::take(unsafe { &mut *slab.pending.get() });
     slab.live.fetch_add(pending, Ordering::AcqRel);
@@ -428,6 +449,13 @@ unsafe fn let_go(slab: &Slab, class: usize) {
 
 /// Put `slab`, which nobody owns, where its fill says: in its class's list
 /// if it has room, back to the system if it holds nothing.
+///
+/// Must not panic (#358, #370): the active defrag thread lives on after a
+/// panic in a pass, with its own slabs, and allocates again. A panic here
+/// half way through a change of a slab's hands or lists would leave that
+/// thread, or the lists, believing what is no longer so: two values given
+/// the same block. Nothing in it panics but on a broken invariant, and a
+/// failed allocation aborts.
 fn settle(mut partial: parking_lot::MutexGuard<'_, Vec<SlabPtr>>, slab: &Slab, class: usize) {
     let state = slab.state.load(Ordering::Relaxed);
     if state != FULL && state != PARTIAL && state != EVACUATING {
@@ -465,6 +493,13 @@ fn unlist(partial: &mut Vec<SlabPtr>, slab: &Slab) {
 
 /// A slab of class `class` with room, owned by `owner`: one from the
 /// class's list, or an empty one.
+///
+/// Must not panic (#358, #370): the active defrag thread lives on after a
+/// panic in a pass, with its own slabs, and allocates again. A panic here
+/// half way through a change of a slab's hands or lists would leave that
+/// thread, or the lists, believing what is no longer so: two values given
+/// the same block. Nothing in it panics but on a broken invariant, and a
+/// failed allocation aborts.
 fn acquire(class: usize, owner: usize) -> *const Slab {
     if let Some(SlabPtr(slab)) = PARTIAL_SLABS[class].lock().pop() {
         // SAFETY: a header lives as long as the process.
@@ -690,8 +725,28 @@ pub fn finish_evacuation() {
         }
         s.state.store(FULL, Ordering::Relaxed);
         settle(list, s, class);
+        // For tests: putting back that panics with this slab put back and
+        // the rest still on the list.
+        fault_in_finish();
     }
 }
+
+/// For tests: how many of the next calls of [`finish_evacuation`] panic,
+/// each once it has put one slab back.
+#[cfg(test)]
+pub(crate) static FAULTS_IN_FINISH: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(test)]
+fn fault_in_finish() {
+    if FAULTS_IN_FINISH.load(Ordering::Relaxed) > 0 {
+        FAULTS_IN_FINISH.fetch_sub(1, Ordering::Relaxed);
+        panic!("injected fault putting back the slabs being emptied");
+    }
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn fault_in_finish() {}
 
 /// The regions taken so far, in order of address: for [`is_evacuating`].
 pub fn regions_snapshot() -> Vec<usize> {
