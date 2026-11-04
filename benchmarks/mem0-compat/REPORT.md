@@ -10,7 +10,7 @@ No check differs between the two.
 
 | | |
 |---|---|
-| KiviDB | `8.10.0` as the server reports it, built from `master` at `2ed7df2` (release 1.2.0) |
+| KiviDB | `8.10.0` as the server reports it, built from `master` at `2ed7df2` (1.2.0 plus two unrelated fixes) |
 | Reference | Redis `8.10.3` (the `redis:8` image) |
 | `mem0ai` | `2.2.1` |
 | `redisvl` / `redis-py` | `0.26.0` / `5.3.1`, what `pip install "mem0ai[vector-stores]"` resolves to (see below) |
@@ -117,8 +117,8 @@ pip install -r requirements.txt
 python mem0_kividb_compat.py --url redis://127.0.0.1:6380 --label kividb
 
 # Reference
-docker run -d --rm --name redis-ref -p 6399:6379 redis:8
-python mem0_kividb_compat.py --url redis://127.0.0.1:6399 --label redis8
+docker run -d --rm --name redis-ref -p 6390:6379 redis:8
+python mem0_kividb_compat.py --url redis://127.0.0.1:6390 --label redis8
 ```
 
 Run it on a throwaway machine, not a laptop: it creates and drops indexes with random names. After a run,
