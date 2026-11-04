@@ -1062,8 +1062,20 @@ fn nodes_announce_hostnames_and_clients_can_be_sent_by_them() {
     );
 
     // Remembered over a restart, before any peer has been heard from again;
-    // its own, as Redis, from its config file.
+    // its own, as Redis, from its config file. The peers' hostnames are
+    // remembered once nodes.conf has them: a thread of their own saves it,
+    // some time after they were learnt, and on a busy machine that was after
+    // the kill below. The node then came back without them (#338).
     assert!(nodes[2].conn().cmd(&["CONFIG", "REWRITE"]).is_ok());
+    let conf = nodes[2].dir.join("nodes.conf");
+    wait_until(
+        "node 2 to save the hostnames it learnt",
+        Duration::from_secs(15),
+        || {
+            let saved = std::fs::read_to_string(&conf).unwrap_or_default();
+            (0..2).all(|i| saved.contains(&format!(",{} ", host(i))))
+        },
+    );
     nodes[2].restart();
     let text = nodes[2].conn().cmd(&["CLUSTER", "NODES"]).text();
     assert!(text.contains(&format!(",{} ", host(0))), "{text}");
