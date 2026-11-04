@@ -544,6 +544,9 @@ fn keep_aside(path: &str) -> std::io::Result<Option<String>> {
     let suffix = format!(".{path}");
     for (kept, kept_len) in kept_logs() {
         if kept_len == len && kept.ends_with(&suffix) && same_bytes(path, &kept).unwrap_or(false) {
+            // Synced first: a copy stopped between its write and its sync
+            // reads whole from the page cache, but may not be on disk.
+            std::fs::File::open(&kept)?.sync_all()?;
             return Ok(Some(kept));
         }
     }
