@@ -38,7 +38,9 @@ NOTE: the stub embedding is a hashed bag of words. It proves the wiring (index c
 filters), not semantic quality.
 
 Everything it creates has a random prefix and is removed at the end, including the indexes the
-library creates, which are found by comparing FT._LIST before and after.
+library creates. Every index the harness makes is named with one of those random names, so only an
+index that appeared during the run and has such a name is dropped (with its documents): one that
+another client made on the same server meanwhile is left alone.
 """
 import argparse
 import asyncio
@@ -151,9 +153,12 @@ def indexes(r):
 
 
 def cleanup(r, before):
-    """Drop the indexes created since `before`, with their documents, then any key that has
-    one of this run's random names in it."""
+    """Drop this run's indexes, with their documents, then any key that has one of this run's
+    random names in it. Every index the harness makes is named with one of those names, so an
+    index another client made during the run is left alone."""
     for idx in indexes(r) - before:
+        if not any(prefix in idx for prefix in PREFIXES):
+            continue
         try:
             r.execute_command("FT.DROPINDEX", idx, "DD")
         except Exception:  # noqa
