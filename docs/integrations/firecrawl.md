@@ -22,9 +22,16 @@ Postgres for the NuQ queue, RabbitMQ, the local test site):
   on either (an artefact of the Docker network alias the test site was served under), so the harness took
   the pages from a crawl; the other 6 checks pass on both.
 
-The harness and raw results are in [`benchmarks/firecrawl-compat`](../../benchmarks/firecrawl-compat/)
-([KiviDB](../../benchmarks/firecrawl-compat/results-kividb.json),
-[Redis 8](../../benchmarks/firecrawl-compat/results-redis8.json)).
+Then again at `v2.11.162`, the tag Firecrawl's self-hosting guide pins, once on each server: the suite
+passes 365 tests on KiviDB and 364 on Redis 8. One test fails on both because the test setup has no parse
+upload secret (`PARSE_UPLOAD_REF_SECRET_MISSING`), and on Redis a map redirect test failed once. The jobs
+with the restart pass 7 of 7 on both.
+
+The harness and raw results are in [`benchmarks/firecrawl-compat`](../../benchmarks/firecrawl-compat/):
+`v2.11.0` ([KiviDB](../../benchmarks/firecrawl-compat/results-kividb.json),
+[Redis 8](../../benchmarks/firecrawl-compat/results-redis8.json)), `v2.11.162`
+([KiviDB](../../benchmarks/firecrawl-compat/results-kividb-v2.11.162.json),
+[Redis 8](../../benchmarks/firecrawl-compat/results-redis8-v2.11.162.json)).
 
 ## Run it with Firecrawl's docker compose
 

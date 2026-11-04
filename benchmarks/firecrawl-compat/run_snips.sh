@@ -14,7 +14,11 @@
 # FC is a checkout of firecrawl/firecrawl at v2.11.0 with the CI's build steps done: the native lib
 # (apps/api/native: pnpm install), the Go html-to-markdown lib, `pnpm install --frozen-lockfile
 # --ignore-scripts` in apps/api and the test site installed and built. EXTRA_CMD, if set, runs
-# under the same harness after the suite (firecrawl_e2e.py uses it).
+# under the same harness after the suite (firecrawl_e2e.py uses it). At v2.11.162 the native install
+# also needs FoundationDB's client library (foundationdb-clients 7.3.63, as their CI installs it).
+#
+# Later tags' CI (v2.11.162) also sets TEST_API_KEY=test and TEST_TEAM_ID=bypass, without which most
+# test files there fail to load; pass them in the environment for those tags.
 #
 # Writes junit-<label>.xml and commandstats-<label>.txt next to this script.
 set -euo pipefail
