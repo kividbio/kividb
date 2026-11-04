@@ -41,7 +41,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   nothing more and acknowledged nothing, its master dropped it, and it could
   not shut down. The replica now enters the gate before taking its lock,
   alone for a write that needs it, as it already did for a transaction, and
-  so does the final save at shutdown.
+  so does the final save at shutdown. A write from the master now also waits
+  for a script on the replica that has run past its time limit, as a
+  transaction from the master did; it was refused with `BUSY`, logged, and
+  not applied, and the replica's data went its own way.
 - **A panic in active defrag no longer stops it silently (#358, #370).**
   Active defrag runs on a thread of its own, and release builds unwind on a
   panic. Had anything in a pass panicked, that thread alone would have

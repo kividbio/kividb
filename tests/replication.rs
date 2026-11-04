@@ -57,6 +57,13 @@ impl Conn {
         self.cmd(&refs)
     }
 
+    /// The connection, with `timeout` to wait for each reply.
+    #[cfg(feature = "lua")]
+    fn with_read_timeout(self, timeout: Duration) -> Self {
+        self.stream.set_read_timeout(Some(timeout)).unwrap();
+        self
+    }
+
     fn read_value(&mut self) -> RespValue {
         let mut line = String::new();
         self.reader.read_line(&mut line).unwrap();
@@ -828,12 +835,28 @@ fn wait_link_up(c: &mut Conn) {
 /// connection's 5 s to answer.
 #[test]
 fn a_replica_saves_while_it_applies_writes_of_two_shards() {
+    saves_beside_writes_of_two_shards(IoModel::Tokio);
+}
+
+/// [`a_replica_saves_while_it_applies_writes_of_two_shards`], the replica
+/// on io_uring, which takes the gate on a loop of its own.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_replica_on_io_uring_saves_while_it_applies_writes_of_two_shards() {
+    saves_beside_writes_of_two_shards(IoModel::Uring);
+}
+
+fn saves_beside_writes_of_two_shards(io_model: IoModel) {
     let master = spawn_server(Config::default());
     let dir = tempfile::tempdir().unwrap();
-    let replica = spawn_server(Config {
-        dir: dir.path().to_string_lossy().into_owned(),
-        ..replica_of(master)
-    });
+    let replica = spawn_server_with(
+        Config {
+            dir: dir.path().to_string_lossy().into_owned(),
+            ..replica_of(master)
+        },
+        2,
+        io_model,
+    );
     let mut r = Conn::connect(replica);
     wait_link_up(&mut r);
     let mut m = Conn::connect(master);
@@ -882,12 +905,13 @@ fn a_replica_saves_while_it_applies_writes_of_two_shards() {
 fn a_replica_saves_while_it_applies_writes_and_runs_scripts() {
     let master = spawn_server(Config::default());
     let dir = tempfile::tempdir().unwrap();
-    let replica = spawn_server_with_threads(
+    let replica = spawn_server_with(
         Config {
             dir: dir.path().to_string_lossy().into_owned(),
             ..replica_of(master)
         },
         8,
+        IoModel::Tokio,
     );
     // Nothing is asked of the replica until its applier has its slot: the
     // link is seen from the master.
@@ -917,7 +941,8 @@ fn a_replica_saves_while_it_applies_writes_and_runs_scripts() {
     let clients: Vec<_> = (0..8)
         .map(|i| {
             thread::spawn(move || {
-                let mut c = Conn::connect(replica);
+                // A `SAVE` has 30 s: a slow disk is not a deadlock.
+                let mut c = Conn::connect(replica).with_read_timeout(Duration::from_secs(30));
                 let mut done = 0u64;
                 while Instant::now() < until {
                     if i % 2 == 0 {
@@ -946,15 +971,14 @@ fn a_replica_saves_while_it_applies_writes_and_runs_scripts() {
     );
 }
 
-/// [`spawn_server`], with `threads` worker threads.
-#[cfg(feature = "lua")]
-fn spawn_server_with_threads(mut config: Config, threads: usize) -> u16 {
+/// [`spawn_server`], with `threads` worker threads and `io_model`.
+fn spawn_server_with(mut config: Config, threads: usize, io_model: IoModel) -> u16 {
     let port = free_port();
     config.port = port;
     config.bind = "127.0.0.1".to_string();
     config.threads = threads;
     config.loglevel = "error".to_string();
-    config.io_model = IoModel::Tokio;
+    config.io_model = io_model;
     config.configfile = "./kividb.conf".to_string();
     thread::spawn(move || kividb::run_for_test(config));
     for _ in 0..100 {

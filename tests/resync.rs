@@ -452,9 +452,17 @@ fn write_batch(master: &mut Conn, round: usize, count: usize) {
 /// The same data on both sides — compared through commands whose answers
 /// depend on every write having been applied exactly once.
 fn assert_same_dataset(master: &mut Conn, replica: &mut Conn) {
-    let offset = master.info("replication", "master_repl_offset");
+    // At least as far as the master was: its heartbeats go on adding to its
+    // offset, and the replica can step past this one between two looks.
+    let offset: u64 = master
+        .info("replication", "master_repl_offset")
+        .parse()
+        .unwrap();
     wait_until("the replica to catch up", || {
-        replica.info("replication", "slave_repl_offset") == offset
+        replica
+            .info("replication", "slave_repl_offset")
+            .parse::<u64>()
+            .is_ok_and(|applied| applied >= offset)
     });
     for probe in [
         &["GET", "counter"][..],
