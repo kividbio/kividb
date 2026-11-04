@@ -1500,3 +1500,254 @@ fn a_log_made_at_a_start_with_the_aof_on_has_a_header() {
         );
     }
 }
+
+// ── Logs added to after a save with the AOF off (#359) ───────────────────────
+
+/// `INCR <key>` as the log holds it.
+fn incr_record(key: &str) -> Vec<u8> {
+    format!("*2\r\n$4\r\nINCR\r\n${}\r\n{key}\r\n", key.len()).into_bytes()
+}
+
+/// The save number in `dump.kdb.gen`, and whether it marks the dump as one
+/// no log goes with.
+fn saved_number(dir: &Path) -> (u64, bool) {
+    let saved = std::fs::read(dir.join("dump.kdb.gen")).unwrap();
+    (
+        u64::from_le_bytes(saved[0..8].try_into().unwrap()),
+        saved.get(24) == Some(&1),
+    )
+}
+
+/// A save with the AOF off and no log in `dir`: `dump.kdb.gen` marks the
+/// dump as one no log goes with. 1.2.0, started on that directory with the
+/// AOF on, made a log with no header on top of the dump, added acknowledged
+/// writes to it, and was killed before any checkpoint. Recovery took the
+/// log for one older than the dump: those writes were left out, and were
+/// only in the copy kept aside. The log has been added to since the save,
+/// so it goes on from the dump: it is replayed, whole, as 1.2.0 replayed it.
+#[test]
+fn a_log_with_no_header_made_after_a_save_with_the_aof_off_is_replayed() {
+    for &io in io_models() {
+        let mut server = Server::start(io, "");
+        server.kill();
+        std::fs::remove_file(server.dir.join("appendonly.aof")).unwrap();
+        server.aof = false;
+        let mut c = server.restart();
+        assert!(c.cmd(&["SET", "in-dump", "1"]).ok());
+        assert_eq!(c.cmd(&["INCR", "n"]).i(), 1);
+        assert!(c.cmd(&["SAVE"]).ok());
+        drop(c);
+        server.kill();
+        assert!(!server.dir.join("appendonly.aof").exists(), "{io}");
+        assert!(saved_number(&server.dir).1, "{io}: the dump is not marked");
+
+        // What 1.2.0 made of it: a log with no header, of writes on top of
+        // the dump, each acknowledged.
+        let mut log = set_record("acked-on-1.2.0", "1");
+        log.extend_from_slice(&incr_record("n"));
+        std::fs::write(server.dir.join("appendonly.aof"), &log).unwrap();
+
+        server.aof = true;
+        let mut c = server.restart();
+        assert_eq!(
+            c.cmd(&["GET", "acked-on-1.2.0"]),
+            V::Str("1".into()),
+            "{io}: the writes made on top of the dump were left out"
+        );
+        assert_eq!(c.cmd(&["GET", "n"]).s(), "2", "{io}");
+        assert_eq!(c.cmd(&["GET", "in-dump"]).s(), "1", "{io}");
+
+        // And the log goes on: what is written next is kept too.
+        assert!(c.cmd(&["SET", "after", "1"]).ok());
+        durable(&mut c);
+        drop(c);
+        server.kill();
+        let mut c = server.restart();
+        assert_eq!(c.cmd(&["GET", "acked-on-1.2.0"]).s(), "1", "{io}");
+        assert_eq!(c.cmd(&["GET", "n"]).s(), "2", "{io}");
+        assert_eq!(c.cmd(&["GET", "after"]).s(), "1", "{io}");
+    }
+}
+
+/// A log with no header that was there at a save with the AOF off, and is
+/// as it was then, is older than the dump: still left out, kept aside, and
+/// counted in `INFO persistence` until it is removed.
+#[test]
+fn a_log_with_no_header_as_it_was_at_a_save_with_the_aof_off_is_left_out() {
+    for &io in io_models() {
+        let mut server = Server::start(io, "");
+        server.kill();
+        let log = set_record("older", "1");
+        std::fs::write(server.dir.join("appendonly.aof"), &log).unwrap();
+        server.aof = false;
+        let mut c = server.restart();
+        assert!(c.cmd(&["SET", "in-dump", "1"]).ok());
+        assert!(c.cmd(&["SAVE"]).ok());
+        drop(c);
+        server.kill();
+
+        server.aof = true;
+        let mut c = server.restart();
+        assert_eq!(c.cmd(&["GET", "in-dump"]).s(), "1", "{io}");
+        assert_eq!(
+            c.cmd(&["GET", "older"]),
+            V::Nil,
+            "{io}: a log older than the dump was replayed over it"
+        );
+        let kept = kept_aside(&server.dir);
+        assert_eq!(kept.len(), 1, "{io}: {kept:?}");
+        assert_eq!(kept[0].1, log, "{io}");
+        assert_eq!(info_field(&mut c, "aof_superseded_files"), "1", "{io}");
+        assert_eq!(
+            info_field(&mut c, "aof_superseded_bytes"),
+            log.len().to_string(),
+            "{io}"
+        );
+        std::fs::remove_file(server.dir.join(&kept[0].0)).unwrap();
+        assert_eq!(info_field(&mut c, "aof_superseded_files"), "0", "{io}");
+        assert_eq!(info_field(&mut c, "aof_superseded_bytes"), "0", "{io}");
+    }
+}
+
+/// 1.2.0 leaves out a log whose save number is older than the dump's, and
+/// then adds to it. Started with the AOF on after a save with the AOF off, it
+/// did that to the log the save left alone, and was killed before any
+/// checkpoint: alone, or part-way through one, with the log moved to
+/// `appendonly.aof.prev` and a new log after it. What was added goes on from
+/// the dump, and is replayed; what the log held before the save, which the
+/// dump holds, is not.
+#[test]
+fn an_older_log_added_to_after_a_save_with_the_aof_off_replays_what_was_added() {
+    for &io in io_models() {
+        for left in ["log", "old log and log"] {
+            let mut server = Server::start(io, "");
+            let mut c = server.conn();
+            assert!(c.cmd(&["SET", "a", "1"]).ok());
+            assert!(c.cmd(&["SAVE"]).ok());
+            assert_eq!(c.cmd(&["INCR", "n"]).i(), 1);
+            durable(&mut c);
+            assert!(c.cmd(&["CONFIG", "SET", "appendonly", "no"]).ok());
+            assert!(c.cmd(&["SAVE"]).ok());
+            drop(c);
+            server.kill();
+            let (number, marked) = saved_number(&server.dir);
+            assert!(marked, "{io}");
+            let mut log = std::fs::read(server.dir.join("appendonly.aof")).unwrap();
+            assert!(holds(&log, b"INCR"), "{io}: {log:?}");
+
+            // 1.2.0 on it, with the AOF on: n was 1 in the dump; it served 2.
+            log.extend_from_slice(&incr_record("n"));
+            log.extend_from_slice(&set_record("acked-on-1.2.0", "1"));
+            if left == "log" {
+                std::fs::write(server.dir.join("appendonly.aof"), &log).unwrap();
+            } else {
+                std::fs::write(server.dir.join("appendonly.aof.prev"), &log).unwrap();
+                let mut new = delta_header(number + 1);
+                new.extend_from_slice(&set_record("acked-after-the-cut", "1"));
+                std::fs::write(server.dir.join("appendonly.aof"), &new).unwrap();
+            }
+
+            server.aof = true;
+            let mut c = server.restart();
+            assert_eq!(
+                c.cmd(&["GET", "acked-on-1.2.0"]),
+                V::Str("1".into()),
+                "{io}, {left}: what was added was left out"
+            );
+            assert_eq!(
+                c.cmd(&["GET", "n"]).s(),
+                "2",
+                "{io}, {left}: the records from before the save were replayed too"
+            );
+            assert_eq!(c.cmd(&["GET", "a"]).s(), "1", "{io}, {left}");
+            if left != "log" {
+                assert_eq!(
+                    c.cmd(&["GET", "acked-after-the-cut"]),
+                    V::Str("1".into()),
+                    "{io}, {left}"
+                );
+            }
+            assert!(
+                kept_aside(&server.dir)
+                    .iter()
+                    .any(|(_, bytes)| *bytes == log),
+                "{io}, {left}: the old log was not kept aside whole"
+            );
+
+            // It goes on from the dump: what is written next is kept, and
+            // nothing is replayed twice.
+            assert_eq!(c.cmd(&["INCR", "n"]).i(), 3);
+            durable(&mut c);
+            drop(c);
+            server.kill();
+            let mut c = server.restart();
+            assert_eq!(c.cmd(&["GET", "n"]).s(), "3", "{io}, {left}");
+            assert_eq!(c.cmd(&["GET", "acked-on-1.2.0"]).s(), "1", "{io}, {left}");
+        }
+    }
+}
+
+/// Stopped after it puts its save number in place and before it puts its
+/// dump in place, a checkpoint leaves a number that does not describe the
+/// dump there: recovery replays the old log and the new one on the old dump,
+/// and a save with the AOF off is as if it had not run. The directory is
+/// synced between the two renames, so a power cut, too, can leave only this
+/// order, not the dump renamed without its number (#359).
+#[test]
+fn a_checkpoint_stopped_between_its_number_and_its_dump_loses_nothing() {
+    for &io in io_models() {
+        for aof_at_save in [true, false] {
+            let mut server = Server::start(io, "dump-installing");
+            let mut c = server.conn();
+            assert!(c.cmd(&["SET", "before", "1"]).ok());
+            send(&mut c, &["SAVE"]);
+            server.pass("dump-installing.1");
+            assert!(c.read().ok());
+            assert!(c.cmd(&["SET", "in-log", "1"]).ok());
+            durable(&mut c);
+            if aof_at_save {
+                // In the background: a `SAVE` holds the server.
+                assert_eq!(c.cmd(&["BGREWRITEAOF"]).s(), STARTED);
+            } else {
+                assert!(c.cmd(&["CONFIG", "SET", "appendonly", "no"]).ok());
+                send(&mut c, &["SAVE"]);
+            }
+            assert!(
+                server.reached("dump-installing.2", LONG),
+                "{io}, aof {aof_at_save}"
+            );
+            if aof_at_save {
+                // After the cut: in the new log.
+                let mut w = server.conn();
+                assert!(w.cmd(&["SET", "during", "1"]).ok());
+                durable(&mut w);
+            }
+            drop(c);
+            server.kill();
+
+            server.failpoints.clear();
+            let mut c = server.restart();
+            assert_eq!(
+                c.cmd(&["GET", "before"]).s(),
+                "1",
+                "{io}, aof {aof_at_save}"
+            );
+            assert_eq!(
+                c.cmd(&["GET", "in-log"]),
+                V::Str("1".into()),
+                "{io}, aof {aof_at_save}: an acknowledged write was lost"
+            );
+            if aof_at_save {
+                assert_eq!(
+                    c.cmd(&["GET", "during"]),
+                    V::Str("1".into()),
+                    "{io}: a write after the cut was lost"
+                );
+            }
+            assert!(
+                kept_aside(&server.dir).is_empty(),
+                "{io}, aof {aof_at_save}"
+            );
+        }
+    }
+}
