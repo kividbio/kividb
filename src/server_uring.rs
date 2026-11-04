@@ -334,9 +334,10 @@ async fn park_blocking_uring(
         // the wait on this loop — a submitted read cannot be taken back — so
         // the socket is watched instead: a client that has gone (or been
         // killed, which shuts the socket down) must not be left in line for
-        // an element nobody will receive. See `peer_gone`.
-        let gone = peer_gone(fd);
-        tokio::pin!(gone);
+        // an element nobody will receive. See `peer_gone`. Boxed, as the
+        // waits of `unless_gone` are, and for the same reason.
+        let mut gone: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> =
+            Box::pin(peer_gone(fd));
         let mut unblockable = true;
         loop {
             tokio::select! {
@@ -457,15 +458,23 @@ async fn peer_gone(fd: std::os::fd::RawFd) {
 /// then. For what a connection waits on that is not a blocking command —
 /// `WAIT`, `WAITAOF`, a pause — which a client that has gone must not be
 /// left in, nor have its command run after it.
-async fn unless_gone<T>(
-    wait: impl std::future::Future<Output = T>,
+///
+/// Boxed, so that it is polled out of line: the connection's own future,
+/// which every command goes through, is compiled as it was without it. Kept
+/// in it, it cost a pipelined SET about half a percent more instructions
+/// with fat LTO, in code that command never runs. The allocation is made
+/// only while a pause is on, or for `WAIT`/`WAITAOF`.
+fn unless_gone<'a, T: 'a>(
+    wait: impl std::future::Future<Output = T> + 'a,
     fd: std::os::fd::RawFd,
-) -> Option<T> {
-    tokio::select! {
-        biased;
-        done = wait => Some(done),
-        () = peer_gone(fd) => None,
-    }
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<T>> + 'a>> {
+    Box::pin(async move {
+        tokio::select! {
+            biased;
+            done = wait => Some(done),
+            () = peer_gone(fd) => None,
+        }
+    })
 }
 
 fn needs_slow_path(cmd0: &[u8]) -> bool {

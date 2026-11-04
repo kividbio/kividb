@@ -220,27 +220,33 @@ fn gone_by_now<R: tokio::io::AsyncRead + Unpin>(
 /// waits that are not a blocking command's (which watches the same way, in
 /// `park_blocking`): `WAIT`, `WAITAOF`, a pause, which a client that has
 /// gone must not be left in, nor have its command run after it.
-async fn until_gone<R: tokio::io::AsyncRead + Unpin>(
-    reader: &mut R,
-    carried: &mut Vec<u8>,
-    kill_rx: &mut crate::client_registry::KillRx,
-    activity: &crate::client_registry::Activity,
-) {
-    let mut temp = [0u8; 4096];
-    loop {
-        tokio::select! {
-            read = reader.read(&mut temp) => match read {
-                Ok(n) if n > 0 => {
-                    crate::stats::TOTAL_NET_INPUT_BYTES.fetch_add(n as u64, Ordering::Relaxed);
-                    crate::stats::record_read();
-                    carried.extend_from_slice(&temp[..n]);
-                    activity.touch();
-                }
-                _ => return,
-            },
-            _ = &mut *kill_rx => return,
+///
+/// Boxed, so that it is polled out of line, as `server_uring::unless_gone`
+/// is: the connection's own future, which every command goes through, is
+/// compiled as it was without it.
+fn until_gone<'a, R: tokio::io::AsyncRead + Unpin + Send>(
+    reader: &'a mut R,
+    carried: &'a mut Vec<u8>,
+    kill_rx: &'a mut crate::client_registry::KillRx,
+    activity: &'a crate::client_registry::Activity,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        let mut temp = [0u8; 4096];
+        loop {
+            tokio::select! {
+                read = reader.read(&mut temp) => match read {
+                    Ok(n) if n > 0 => {
+                        crate::stats::TOTAL_NET_INPUT_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+                        crate::stats::record_read();
+                        carried.extend_from_slice(&temp[..n]);
+                        activity.touch();
+                    }
+                    _ => return,
+                },
+                _ = &mut *kill_rx => return,
+            }
         }
-    }
+    })
 }
 
 /// What a connection lends its parked command: the means of noticing that
