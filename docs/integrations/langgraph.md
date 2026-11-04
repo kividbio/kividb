@@ -66,5 +66,4 @@ Pass an `index` with an embedding model to search it by meaning.
   Redis 8 as well.
 - Scale is not tested: the harness uses a few threads and a handful of checkpoints, not many threads,
   long histories or large states.
-- Mem0 is not covered yet. See [#33](https://github.com/kividbio/kividb/issues/33). LlamaIndex has its own
-  [page](llamaindex.md).
+- LlamaIndex and Mem0 have their own pages: [LlamaIndex](llamaindex.md), [Mem0](mem0.md).

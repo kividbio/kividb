@@ -42,6 +42,9 @@ other files:
 - LlamaIndex's Redis vector store, document store, index store and key-value store:
   [benchmarks/llamaindex-compat/REPORT.md](../benchmarks/llamaindex-compat/REPORT.md) and
   [docs/integrations/llamaindex.md](integrations/llamaindex.md).
+- Mem0's Redis vector store and the `Memory` API on top of it:
+  [benchmarks/mem0-compat/REPORT.md](../benchmarks/mem0-compat/REPORT.md) and
+  [docs/integrations/mem0.md](integrations/mem0.md).
 - `redis-py` throughout the end-to-end tests (`tests/e2e/`).
 
 ## Differences you may notice

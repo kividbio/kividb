@@ -97,4 +97,4 @@ and key-value stores work the same way: `RedisDocumentStore.from_redis_client(cl
 - `RedisVectorStore.clear()` raises `NotImplementedError` in the library, on Redis 8 as well. Use
   `delete_index()`.
 - Scale is not tested: the harness uses a handful of nodes, and reports no timing or recall.
-- Mem0 is not covered yet. See [#33](https://github.com/kividbio/kividb/issues/33).
+- Mem0 has its own [page](mem0.md).
