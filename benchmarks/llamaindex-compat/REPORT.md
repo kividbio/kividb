@@ -10,7 +10,7 @@ No check differs between the two.
 
 | | |
 |---|---|
-| KiviDB | `8.10.0` as the server reports it, built from `master` at `2ed7df2` (release 1.2.0) |
+| KiviDB | `8.10.0` as the server reports it, built from `master` at `2ed7df2` (1.2.0 plus two unrelated fixes) |
 | Reference | Redis `8.10.3` (the `redis:8` image) |
 | `llama-index-core` | `0.14.25` |
 | `llama-index-vector-stores-redis` | `0.9.0` |
@@ -164,10 +164,12 @@ pip install -r requirements.txt
 python llamaindex_kividb_compat.py --url redis://127.0.0.1:6380 --label kividb
 
 # Reference
-docker run -d --rm --name redis-ref -p 6399:6379 redis:8
-python llamaindex_kividb_compat.py --url redis://127.0.0.1:6399 --label redis8
+docker run -d --rm --name redis-ref -p 6390:6379 redis:8
+python llamaindex_kividb_compat.py --url redis://127.0.0.1:6390 --label redis8
 ```
 
 Run it on a throwaway machine, not a laptop: it creates and drops indexes with random names. It removes
-everything it created, including the indexes the library makes (found by comparing `FT._LIST` before and
-after). After a run, `FT._LIST` is empty and `DBSIZE` is 0 on both servers.
+everything it created, including the indexes the library makes. Every index the harness makes is named
+with one of its random names, so it drops only the ones that appeared during the run and have such a
+name, and leaves alone an index another client made meanwhile. After a run, `FT._LIST` is empty and
+`DBSIZE` is 0 on both servers (on a server nothing else is using).
