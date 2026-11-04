@@ -1507,13 +1507,20 @@ fn save_dataset_with(
             std::process::id(),
             TMP_SEQ.fetch_add(1, Ordering::Relaxed)
         );
+        // With a save number of its own, as a checkpoint's: put in place
+        // without one, the dump kept the number of the log beside it, and a
+        // start with the AOF on replayed that log over it (#354).
+        let generation = crate::aof::next_generation();
         if let Err(e) = frozen
             .write_file(&tmp)
-            .and_then(|()| std::fs::rename(&tmp, "dump.kdb"))
+            .and_then(|()| crate::aof::install_dump(&tmp, generation, true))
         {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
+        // The open log no longer goes on from it (#350); none on disk goes
+        // with it (#354).
+        crate::aof::dump_saved_without_log();
         // As the writer this replaced said it: operators and tests look for it.
         let shown = std::env::current_dir()
             .map(|dir| dir.join("dump.kdb"))

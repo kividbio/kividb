@@ -279,8 +279,26 @@ fn run_backup(handles: Handles, seq: u64, dir: PathBuf, tap: u64) {
     let _ = done_tx.send(outcome);
 }
 
+/// Whether `dir` is the data directory. A backup's files and the server's
+/// own share their prefix (`appendonly.aof.`): `BACKUP CLEANUP`, and a
+/// failed backup's removal, would delete `appendonly.aof.prev` and the
+/// notes of a turn-over with them.
+fn is_data_dir(dir: &Path) -> bool {
+    match (std::fs::canonicalize(dir), std::fs::canonicalize(".")) {
+        (Ok(dir), Ok(data)) => dir == data,
+        _ => false,
+    }
+}
+
 fn start(ctx: &Ctx) -> Vec<u8> {
     let dir = PathBuf::from(&ctx.config.backupdirname);
+    if is_data_dir(&dir) {
+        return resp_error(&format!(
+            "ERR the backup directory '{}' is the data directory: set backupdirname to a \
+             directory of its own",
+            dir.display()
+        ));
+    }
     let mut backup = BACKUP.lock();
     match backup.phase {
         Phase::Idle => {}
@@ -432,6 +450,9 @@ fn remove_after(seq: u64, wait: std::time::Duration) {
 #[allow(dead_code)]
 pub(crate) fn recover(config: &crate::config::Config) {
     let dir = PathBuf::from(&config.backupdirname);
+    if is_data_dir(&dir) {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
     };
@@ -528,6 +549,7 @@ fn abort(ctx: &Ctx) -> Vec<u8> {
 /// else someone put in the directory since `BACKUP START` is left alone.
 fn remove_files(backup: &mut Backup) {
     if !backup.dir.as_os_str().is_empty()
+        && !is_data_dir(&backup.dir)
         && let Ok(entries) = std::fs::read_dir(&backup.dir)
     {
         for entry in entries.flatten() {

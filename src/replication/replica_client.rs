@@ -989,6 +989,7 @@ async fn run_replication_session(
                     let _cut = crate::write_gate::cut();
                     let empty = store::new_store(config.databases);
                     store::swap_kv_with_staging(store, &empty);
+                    crate::aof::log_superseded();
                     index_store.write().clear();
                     dict_store.write().clear();
                     crate::store::rebuild_ts_label_index(store, ts_index);
@@ -1026,6 +1027,8 @@ async fn run_replication_session(
             // local AOF record cannot straddle it.
             let _cut = crate::write_gate::cut();
             store::swap_kv_with_staging(store, &staged.store);
+            // The open log is of the dataset this replaced (#350).
+            crate::aof::log_superseded();
             index_store.write().clear();
             dict_store.write().clear();
             crate::store::rebuild_ts_label_index(store, ts_index);

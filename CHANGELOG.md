@@ -29,6 +29,48 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A restart with the AOF on after a save with it off applied writes
+  twice (#354).** A save with the AOF off (`SAVE`, `BGSAVE`, the save at
+  `SHUTDOWN`) wrote a new `dump.kdb` but left `dump.kdb.gen`, its save
+  number, as it was. The log beside it still read as going on from the dump,
+  and a start with `appendonly yes` replayed it over the newer data: an
+  `INCR` made with the AOF on was applied a second time, and values changed
+  or keys deleted with the AOF off came back. No crash was needed. A save
+  with the AOF off now gives its dump a save number of its own, past every
+  log's, and marks it as one no log goes with; it still leaves the AOF's
+  files alone. Recovery replays a log only over the dump it goes on from, by
+  the dump's fingerprint as well as the number. A data directory left this
+  way by 1.2.0 is recognised: the old log is not replayed, the dump that was
+  loaded is given a save number, and the log starts again on it. A log that
+  is not replayed is never deleted: it is kept aside in `dir`, as
+  `superseded.<time>.<n>.appendonly.aof` (or `.appendonly.aof.prev`), with a
+  warning that says how to apply its writes, and every start lists the ones
+  still there. The server never removes them. A new log made at a start
+  with the AOF on now has a header, so its age is always known; a log with
+  no header, made by 1.2.0, beside a dump saved by 1.2.0 with the AOF off
+  cannot be told apart, and is replayed as before.
+- **The AOF turned on at runtime starts a new log (#350).** `CONFIG SET
+  appendonly yes` appended to whatever `appendonly.aof` was there: one left
+  by an earlier run with the AOF on, or the one kept through `appendonly no`
+  after the dataset had moved on without it (a save with the AOF off, or a
+  replica's full sync). The checkpoint that follows kept all of it as
+  `appendonly.aof.prev` until its snapshot was on disk, and a crash in
+  between replayed those old writes on the next start: overwritten values,
+  and keys deleted since, could come back. The log now starts empty,
+  written in full under another name before it takes the log's. The old
+  logs are kept aside first, never deleted, as above. A log kept open through
+  `appendonly no` is still kept when nothing has moved on without it, so a
+  crash during the enable does not lose what was written while the AOF was
+  on. A `CONFIG SET appendonly no` that comes while the AOF is being turned
+  on now makes the enable answer an error, not OK. Starting with
+  `appendonly yes` still loads and appends to the existing log. After a
+  replica's full sync with the AOF off, a crash before the enable's
+  checkpoint has finished restarts from the `dump.kdb` saved before the
+  sync, plus what was logged after the enable: the replica then syncs again
+  from its master.
+- **`BACKUP START` refuses a `backupdirname` that is the data directory.**
+  A backup's files share the `appendonly.aof.` prefix with the server's own,
+  and `BACKUP CLEANUP` would have deleted `appendonly.aof.prev` with them.
 - **With `appendonly no`, no `appendonly.aof` is made or needed (#47).**
   Every start created an empty `appendonly.aof` in `dir`, AOF on or off,
   and a server that could not create it (a read-only data directory, the

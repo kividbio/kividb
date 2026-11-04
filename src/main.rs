@@ -1081,12 +1081,13 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     aof::install_global_aof_sender(Box::new(aof_tx.clone()));
     // The keys active expiry deletes are logged from here on.
     drop(starting);
+    let aof_writer = aof::start_aof_writer(tokio_rx);
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
-            .block_on(aof::start_aof_writer(tokio_rx))
+            .block_on(aof_writer)
     });
 
     // Whether or not the AOF is on now: `CONFIG SET appendonly yes` turns
@@ -1777,12 +1778,13 @@ async fn async_main_tokio(
         config.aof_rewrite_percentage,
         config.aof_rewrite_min_size,
     );
+    let aof_writer = aof::start_aof_writer(aof_rx);
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
-            .block_on(aof::start_aof_writer(aof_rx))
+            .block_on(aof_writer)
     });
 
     // Replica client — runs on its own thread and runtime (see
