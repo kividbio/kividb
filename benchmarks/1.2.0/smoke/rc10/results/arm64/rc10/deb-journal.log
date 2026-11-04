@@ -1,0 +1,537 @@
+Nov 03 14:54:26 smk-a kividb[71034]: 2026-11-03T14:54:26.099Z 71034 [INFO] SIGTERM received — shutting down gracefully
+Nov 03 14:54:26 smk-a kividb[71034]: 2026-11-03T14:54:26.099Z 71034 [INFO] Writing final snapshot...
+Nov 03 14:54:26 smk-a systemd[1]: Stopping kividb.service - KiviDB in-memory database...
+Nov 03 14:54:26 smk-a kividb[71034]: 2026-11-03T14:54:26.106Z 71034 [INFO] Snapshot saved  → /var/lib/kividb/dump.kdb (16 databases)
+Nov 03 14:54:26 smk-a kividb[71034]: 2026-11-03T14:54:26.106Z 71034 [INFO] Goodbye.
+Nov 03 14:54:26 smk-a systemd[1]: kividb.service: Deactivated successfully.
+Nov 03 14:54:26 smk-a systemd[1]: Stopped kividb.service - KiviDB in-memory database.
+Nov 03 14:54:26 smk-a systemd[1]: Started kividb.service - KiviDB in-memory database.
+Nov 03 14:54:26 smk-a kividb[71092]:                                                                                      
+Nov 03 14:54:26 smk-a kividb[71092]:                                                                                                     
+Nov 03 14:54:26 smk-a kividb[71092]:                                                    :::.
+Nov 03 14:54:26 smk-a kividb[71092]:                                 .:-==-:.       :#%@%%%@%%=
+Nov 03 14:54:26 smk-a kividb[71092]:                           -*@@%%%######%%%%%=:%%+:::::::=%%:
+Nov 03 14:54:26 smk-a kividb[71092]:                       :*%%#+-::::::::::::::=*%#:::::::::::#%.
+Nov 03 14:54:26 smk-a kividb[71092]:                     +%%*::::::::::::::::::::::::::::%@%-::+%#.
+Nov 03 14:54:26 smk-a kividb[71092]:                   =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.
+Nov 03 14:54:26 smk-a kividb[71092]:                 .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗
+Nov 03 14:54:26 smk-a kividb[71092]:                -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+Nov 03 14:54:26 smk-a kividb[71092]:               .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+Nov 03 14:54:26 smk-a kividb[71092]:               +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+Nov 03 14:54:26 smk-a kividb[71092]:               %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+Nov 03 14:54:26 smk-a kividb[71092]:               @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝
+Nov 03 14:54:26 smk-a kividb[71092]:               %%:::::::::::::::::::::::::::::+%@%-                          .
+Nov 03 14:54:26 smk-a kividb[71092]:               =@*::::::::::::::::::::::::::*%@@*
+Nov 03 14:54:26 smk-a kividb[71092]:                *@*::::=+:::::::::::::::-*%@@%%:
+Nov 03 14:54:26 smk-a kividb[71092]:                 *@#-:##::::::::::-=+*%@@@@%*.
+Nov 03 14:54:26 smk-a kividb[71092]:                  :#@%@*::::::*%@@@%%@@@%*:
+Nov 03 14:54:26 smk-a kividb[71092]:                    .*%%=:::*%%%%%%%@@%+
+Nov 03 14:54:26 smk-a kividb[71092]:                      .#@@@%*-   .#%@*.
+Nov 03 14:54:26 smk-a kividb[71092]:                       .#@*        :%@%:
+Nov 03 14:54:26 smk-a kividb[71092]:                         %@*         =%@#
+Nov 03 14:54:26 smk-a kividb[71092]:                          #@#          +%%+
+Nov 03 14:54:26 smk-a kividb[71092]:                           *%%+:...     .*@%*:....
+Nov 03 14:54:26 smk-a kividb[71092]:                        *%%%%%%%@%%%%+ %%%%%%%@@%%%%-
+Nov 03 14:54:26 smk-a kividb[71092]:                                .+-            :+.
+Nov 03 14:54:26 smk-a kividb[71092]:                                                                                                     
+Nov 03 14:54:26 smk-a kividb[71092]:     
+Nov 03 14:54:26 smk-a kividb[71092]:   KiviDB v1.2.0-rc10 - A fast Redis®-compatible store written in Rust
+Nov 03 14:54:26 smk-a kividb[71092]:   https://kividb.io
+Nov 03 14:54:26 smk-a kividb[71092]:   Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+Nov 03 14:54:26 smk-a kividb[71092]:   * Version        : 1.2.0-rc10
+Nov 03 14:54:26 smk-a kividb[71092]:   * Mode           : standalone
+Nov 03 14:54:26 smk-a kividb[71092]:   * OS             : linux aarch64
+Nov 03 14:54:26 smk-a kividb[71092]:   * Memory         : 15GiB available
+Nov 03 14:54:26 smk-a kividb[71092]:   * CPUs           : 4 cores detected
+Nov 03 14:54:26 smk-a kividb[71092]:   * Listening on   : 127.0.0.1:6380
+Nov 03 14:54:26 smk-a kividb[71092]:   * Worker threads : 2
+Nov 03 14:54:26 smk-a kividb[71092]:   * AOF            : enabled
+Nov 03 14:54:26 smk-a kividb[71092]:   * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+Nov 03 14:54:26 smk-a kividb[71092]:   * Databases      : 16
+Nov 03 14:54:26 smk-a kividb[71092]:   * ACL file       : none
+Nov 03 14:54:26 smk-a kividb[71092]: 2026-11-03T14:54:26.136Z 71092 [INFO] KiviDB 1.2.0-rc10 starting: pid 71092, default build, config file '/etc/kividb/kividb.conf'
+Nov 03 14:54:26 smk-a kividb[71092]: 2026-11-03T14:54:26.136Z 71092 [INFO] I/O model      : io_uring
+Nov 03 14:54:26 smk-a kividb[71092]: 2026-11-03T14:54:26.137Z 71092 [INFO] Shards per DB  : 32
+Nov 03 14:54:26 smk-a kividb[71092]: 2026-11-03T14:54:26.137Z 71092 [INFO] I/O model      : io_uring
+Nov 03 14:54:26 smk-a kividb[71092]: 2026-11-03T14:54:26.137Z 71092 [INFO] Found dump.kdb — loading native snapshot
+Nov 03 14:54:26 smk-a kividb[71092]: 2026-11-03T14:54:26.137Z 71092 [INFO] Loaded 0 keys from snapshot (0 with a TTL)
+Nov 03 14:54:26 smk-a kividb[71092]: 2026-11-03T14:54:26.137Z 71092 [INFO] Ready to accept connections on 127.0.0.1:6380
+Nov 03 14:54:29 smk-a kividb[71092]: 2026-11-03T14:54:29.732Z 71092 [INFO] SIGTERM received — shutting down gracefully
+Nov 03 14:54:29 smk-a kividb[71092]: 2026-11-03T14:54:29.732Z 71092 [INFO] Writing final snapshot...
+Nov 03 14:54:29 smk-a systemd[1]: Stopping kividb.service - KiviDB in-memory database...
+Nov 03 14:54:29 smk-a kividb[71092]: 2026-11-03T14:54:29.759Z 71092 [INFO] AOF: rebased onto dump.kdb (generation 1) — log is now the delta
+Nov 03 14:54:29 smk-a kividb[71092]: 2026-11-03T14:54:29.759Z 71092 [INFO] Goodbye.
+Nov 03 14:54:29 smk-a systemd[1]: kividb.service: Deactivated successfully.
+Nov 03 14:54:29 smk-a systemd[1]: Stopped kividb.service - KiviDB in-memory database.
+Nov 03 14:54:29 smk-a systemd[1]: Started kividb.service - KiviDB in-memory database.
+Nov 03 14:54:29 smk-a kividb[71138]:                                                                                      
+Nov 03 14:54:29 smk-a kividb[71138]:                                                                                                     
+Nov 03 14:54:29 smk-a kividb[71138]:                                                    :::.
+Nov 03 14:54:29 smk-a kividb[71138]:                                 .:-==-:.       :#%@%%%@%%=
+Nov 03 14:54:29 smk-a kividb[71138]:                           -*@@%%%######%%%%%=:%%+:::::::=%%:
+Nov 03 14:54:29 smk-a kividb[71138]:                       :*%%#+-::::::::::::::=*%#:::::::::::#%.
+Nov 03 14:54:29 smk-a kividb[71138]:                     +%%*::::::::::::::::::::::::::::%@%-::+%#.
+Nov 03 14:54:29 smk-a kividb[71138]:                   =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.
+Nov 03 14:54:29 smk-a kividb[71138]:                 .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗
+Nov 03 14:54:29 smk-a kividb[71138]:                -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+Nov 03 14:54:29 smk-a kividb[71138]:               .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+Nov 03 14:54:29 smk-a kividb[71138]:               +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+Nov 03 14:54:29 smk-a kividb[71138]:               %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+Nov 03 14:54:29 smk-a kividb[71138]:               @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝
+Nov 03 14:54:29 smk-a kividb[71138]:               %%:::::::::::::::::::::::::::::+%@%-                          .
+Nov 03 14:54:29 smk-a kividb[71138]:               =@*::::::::::::::::::::::::::*%@@*
+Nov 03 14:54:29 smk-a kividb[71138]:                *@*::::=+:::::::::::::::-*%@@%%:
+Nov 03 14:54:29 smk-a kividb[71138]:                 *@#-:##::::::::::-=+*%@@@@%*.
+Nov 03 14:54:29 smk-a kividb[71138]:                  :#@%@*::::::*%@@@%%@@@%*:
+Nov 03 14:54:29 smk-a kividb[71138]:                    .*%%=:::*%%%%%%%@@%+
+Nov 03 14:54:29 smk-a kividb[71138]:                      .#@@@%*-   .#%@*.
+Nov 03 14:54:29 smk-a kividb[71138]:                       .#@*        :%@%:
+Nov 03 14:54:29 smk-a kividb[71138]:                         %@*         =%@#
+Nov 03 14:54:29 smk-a kividb[71138]:                          #@#          +%%+
+Nov 03 14:54:29 smk-a kividb[71138]:                           *%%+:...     .*@%*:....
+Nov 03 14:54:29 smk-a kividb[71138]:                        *%%%%%%%@%%%%+ %%%%%%%@@%%%%-
+Nov 03 14:54:29 smk-a kividb[71138]:                                .+-            :+.
+Nov 03 14:54:29 smk-a kividb[71138]:                                                                                                     
+Nov 03 14:54:29 smk-a kividb[71138]:     
+Nov 03 14:54:29 smk-a kividb[71138]:   KiviDB v1.2.0-rc10 - A fast Redis®-compatible store written in Rust
+Nov 03 14:54:29 smk-a kividb[71138]:   https://kividb.io
+Nov 03 14:54:29 smk-a kividb[71138]:   Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+Nov 03 14:54:29 smk-a kividb[71138]:   * Version        : 1.2.0-rc10
+Nov 03 14:54:29 smk-a kividb[71138]:   * Mode           : standalone
+Nov 03 14:54:29 smk-a kividb[71138]:   * OS             : linux aarch64
+Nov 03 14:54:29 smk-a kividb[71138]:   * Memory         : 15GiB available
+Nov 03 14:54:29 smk-a kividb[71138]:   * CPUs           : 4 cores detected
+Nov 03 14:54:29 smk-a kividb[71138]:   * Listening on   : 127.0.0.1:6380
+Nov 03 14:54:29 smk-a kividb[71138]:   * Worker threads : 2
+Nov 03 14:54:29 smk-a kividb[71138]:   * AOF            : enabled
+Nov 03 14:54:29 smk-a kividb[71138]:   * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+Nov 03 14:54:29 smk-a kividb[71138]:   * Databases      : 16
+Nov 03 14:54:29 smk-a kividb[71138]:   * ACL file       : none
+Nov 03 14:54:29 smk-a kividb[71138]: 2026-11-03T14:54:29.790Z 71138 [INFO] KiviDB 1.2.0-rc10 starting: pid 71138, default build, config file '/etc/kividb/kividb.conf'
+Nov 03 14:54:29 smk-a kividb[71138]: 2026-11-03T14:54:29.790Z 71138 [INFO] I/O model      : io_uring
+Nov 03 14:54:29 smk-a kividb[71138]: 2026-11-03T14:54:29.791Z 71138 [INFO] Shards per DB  : 32
+Nov 03 14:54:29 smk-a kividb[71138]: 2026-11-03T14:54:29.791Z 71138 [INFO] I/O model      : io_uring
+Nov 03 14:54:29 smk-a kividb[71138]: 2026-11-03T14:54:29.791Z 71138 [INFO] Found dump.kdb — loading native snapshot
+Nov 03 14:54:29 smk-a kividb[71138]: 2026-11-03T14:54:29.807Z 71138 [INFO] Loaded 19999 keys from snapshot (0 with a TTL)
+Nov 03 14:54:29 smk-a kividb[71138]: 2026-11-03T14:54:29.807Z 71138 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+Nov 03 14:54:29 smk-a kividb[71138]: 2026-11-03T14:54:29.810Z 71138 [INFO] Replication: dataset fingerprinted in 2 ms — a replica that holds the same data will be continued rather than sent it
+Nov 03 14:54:29 smk-a kividb[71138]: 2026-11-03T14:54:29.810Z 71138 [INFO] Ready to accept connections on 127.0.0.1:6380
+Nov 03 14:54:33 smk-a kividb[71138]: 2026-11-03T14:54:33.054Z 71138 [INFO] SIGTERM received — shutting down gracefully
+Nov 03 14:54:33 smk-a kividb[71138]: 2026-11-03T14:54:33.054Z 71138 [INFO] Writing final snapshot...
+Nov 03 14:54:33 smk-a systemd[1]: Stopping kividb.service - KiviDB in-memory database...
+Nov 03 14:54:33 smk-a kividb[71138]: 2026-11-03T14:54:33.083Z 71138 [INFO] AOF: rebased onto dump.kdb (generation 2) — log is now the delta
+Nov 03 14:54:33 smk-a kividb[71138]: 2026-11-03T14:54:33.083Z 71138 [INFO] Goodbye.
+Nov 03 14:54:33 smk-a systemd[1]: kividb.service: Deactivated successfully.
+Nov 03 14:54:33 smk-a systemd[1]: Stopped kividb.service - KiviDB in-memory database.
+Nov 03 14:54:33 smk-a systemd[1]: Started kividb.service - KiviDB in-memory database.
+Nov 03 14:54:33 smk-a kividb[71296]:                                                                                      
+Nov 03 14:54:33 smk-a kividb[71296]:                                                                                                     
+Nov 03 14:54:33 smk-a kividb[71296]:                                                    :::.
+Nov 03 14:54:33 smk-a kividb[71296]:                                 .:-==-:.       :#%@%%%@%%=
+Nov 03 14:54:33 smk-a kividb[71296]:                           -*@@%%%######%%%%%=:%%+:::::::=%%:
+Nov 03 14:54:33 smk-a kividb[71296]:                       :*%%#+-::::::::::::::=*%#:::::::::::#%.
+Nov 03 14:54:33 smk-a kividb[71296]:                     +%%*::::::::::::::::::::::::::::%@%-::+%#.
+Nov 03 14:54:33 smk-a kividb[71296]:                   =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.
+Nov 03 14:54:33 smk-a kividb[71296]:                 .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗
+Nov 03 14:54:33 smk-a kividb[71296]:                -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+Nov 03 14:54:33 smk-a kividb[71296]:               .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+Nov 03 14:54:33 smk-a kividb[71296]:               +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+Nov 03 14:54:33 smk-a kividb[71296]:               %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+Nov 03 14:54:33 smk-a kividb[71296]:               @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝
+Nov 03 14:54:33 smk-a kividb[71296]:               %%:::::::::::::::::::::::::::::+%@%-                          .
+Nov 03 14:54:33 smk-a kividb[71296]:               =@*::::::::::::::::::::::::::*%@@*
+Nov 03 14:54:33 smk-a kividb[71296]:                *@*::::=+:::::::::::::::-*%@@%%:
+Nov 03 14:54:33 smk-a kividb[71296]:                 *@#-:##::::::::::-=+*%@@@@%*.
+Nov 03 14:54:33 smk-a kividb[71296]:                  :#@%@*::::::*%@@@%%@@@%*:
+Nov 03 14:54:33 smk-a kividb[71296]:                    .*%%=:::*%%%%%%%@@%+
+Nov 03 14:54:33 smk-a kividb[71296]:                      .#@@@%*-   .#%@*.
+Nov 03 14:54:33 smk-a kividb[71296]:                       .#@*        :%@%:
+Nov 03 14:54:33 smk-a kividb[71296]:                         %@*         =%@#
+Nov 03 14:54:33 smk-a kividb[71296]:                          #@#          +%%+
+Nov 03 14:54:33 smk-a kividb[71296]:                           *%%+:...     .*@%*:....
+Nov 03 14:54:33 smk-a kividb[71296]:                        *%%%%%%%@%%%%+ %%%%%%%@@%%%%-
+Nov 03 14:54:33 smk-a kividb[71296]:                                .+-            :+.
+Nov 03 14:54:33 smk-a kividb[71296]:                                                                                                     
+Nov 03 14:54:33 smk-a kividb[71296]:     
+Nov 03 14:54:33 smk-a kividb[71296]:   KiviDB v1.2.0-rc10 - A fast Redis®-compatible store written in Rust
+Nov 03 14:54:33 smk-a kividb[71296]:   https://kividb.io
+Nov 03 14:54:33 smk-a kividb[71296]:   Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+Nov 03 14:54:33 smk-a kividb[71296]:   * Version        : 1.2.0-rc10
+Nov 03 14:54:33 smk-a kividb[71296]:   * Mode           : standalone
+Nov 03 14:54:33 smk-a kividb[71296]:   * OS             : linux aarch64
+Nov 03 14:54:33 smk-a kividb[71296]:   * Memory         : 15GiB available
+Nov 03 14:54:33 smk-a kividb[71296]:   * CPUs           : 4 cores detected
+Nov 03 14:54:33 smk-a kividb[71296]:   * Listening on   : 127.0.0.1:6380
+Nov 03 14:54:33 smk-a kividb[71296]:   * Worker threads : 2
+Nov 03 14:54:33 smk-a kividb[71296]:   * AOF            : enabled
+Nov 03 14:54:33 smk-a kividb[71296]:   * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+Nov 03 14:54:33 smk-a kividb[71296]:   * Databases      : 16
+Nov 03 14:54:33 smk-a kividb[71296]:   * ACL file       : none
+Nov 03 14:54:33 smk-a kividb[71296]: 2026-11-03T14:54:33.117Z 71296 [INFO] KiviDB 1.2.0-rc10 starting: pid 71296, default build, config file '/etc/kividb/kividb.conf'
+Nov 03 14:54:33 smk-a kividb[71296]: 2026-11-03T14:54:33.117Z 71296 [INFO] I/O model      : io_uring
+Nov 03 14:54:33 smk-a kividb[71296]: 2026-11-03T14:54:33.119Z 71296 [INFO] Shards per DB  : 32
+Nov 03 14:54:33 smk-a kividb[71296]: 2026-11-03T14:54:33.119Z 71296 [INFO] I/O model      : io_uring
+Nov 03 14:54:33 smk-a kividb[71296]: 2026-11-03T14:54:33.119Z 71296 [INFO] Found dump.kdb — loading native snapshot
+Nov 03 14:54:33 smk-a kividb[71296]: 2026-11-03T14:54:33.135Z 71296 [INFO] Loaded 19999 keys from snapshot (0 with a TTL)
+Nov 03 14:54:33 smk-a kividb[71296]: 2026-11-03T14:54:33.135Z 71296 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+Nov 03 14:54:33 smk-a kividb[71296]: 2026-11-03T14:54:33.138Z 71296 [INFO] Replication: dataset fingerprinted in 3 ms — a replica that holds the same data will be continued rather than sent it
+Nov 03 14:54:33 smk-a kividb[71296]: 2026-11-03T14:54:33.139Z 71296 [INFO] Ready to accept connections on 127.0.0.1:6380
+Nov 03 14:54:36 smk-a kividb[71296]: 2026-11-03T14:54:36.382Z 71296 [INFO] SIGTERM received — shutting down gracefully
+Nov 03 14:54:36 smk-a kividb[71296]: 2026-11-03T14:54:36.382Z 71296 [INFO] Writing final snapshot...
+Nov 03 14:54:36 smk-a systemd[1]: Stopping kividb.service - KiviDB in-memory database...
+Nov 03 14:54:36 smk-a kividb[71296]: 2026-11-03T14:54:36.410Z 71296 [INFO] AOF: rebased onto dump.kdb (generation 3) — log is now the delta
+Nov 03 14:54:36 smk-a kividb[71296]: 2026-11-03T14:54:36.410Z 71296 [INFO] Goodbye.
+Nov 03 14:54:36 smk-a systemd[1]: kividb.service: Deactivated successfully.
+Nov 03 14:54:36 smk-a systemd[1]: Stopped kividb.service - KiviDB in-memory database.
+Nov 03 14:54:36 smk-a systemd[1]: Started kividb.service - KiviDB in-memory database.
+Nov 03 14:54:36 smk-a kividb[71405]:                                                                                      
+Nov 03 14:54:36 smk-a kividb[71405]:                                                                                                     
+Nov 03 14:54:36 smk-a kividb[71405]:                                                    :::.
+Nov 03 14:54:36 smk-a kividb[71405]:                                 .:-==-:.       :#%@%%%@%%=
+Nov 03 14:54:36 smk-a kividb[71405]:                           -*@@%%%######%%%%%=:%%+:::::::=%%:
+Nov 03 14:54:36 smk-a kividb[71405]:                       :*%%#+-::::::::::::::=*%#:::::::::::#%.
+Nov 03 14:54:36 smk-a kividb[71405]:                     +%%*::::::::::::::::::::::::::::%@%-::+%#.
+Nov 03 14:54:36 smk-a kividb[71405]:                   =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.
+Nov 03 14:54:36 smk-a kividb[71405]:                 .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗
+Nov 03 14:54:36 smk-a kividb[71405]:                -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+Nov 03 14:54:36 smk-a kividb[71405]:               .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+Nov 03 14:54:36 smk-a kividb[71405]:               +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+Nov 03 14:54:36 smk-a kividb[71405]:               %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+Nov 03 14:54:36 smk-a kividb[71405]:               @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝
+Nov 03 14:54:36 smk-a kividb[71405]:               %%:::::::::::::::::::::::::::::+%@%-                          .
+Nov 03 14:54:36 smk-a kividb[71405]:               =@*::::::::::::::::::::::::::*%@@*
+Nov 03 14:54:36 smk-a kividb[71405]:                *@*::::=+:::::::::::::::-*%@@%%:
+Nov 03 14:54:36 smk-a kividb[71405]:                 *@#-:##::::::::::-=+*%@@@@%*.
+Nov 03 14:54:36 smk-a kividb[71405]:                  :#@%@*::::::*%@@@%%@@@%*:
+Nov 03 14:54:36 smk-a kividb[71405]:                    .*%%=:::*%%%%%%%@@%+
+Nov 03 14:54:36 smk-a kividb[71405]:                      .#@@@%*-   .#%@*.
+Nov 03 14:54:36 smk-a kividb[71405]:                       .#@*        :%@%:
+Nov 03 14:54:36 smk-a kividb[71405]:                         %@*         =%@#
+Nov 03 14:54:36 smk-a kividb[71405]:                          #@#          +%%+
+Nov 03 14:54:36 smk-a kividb[71405]:                           *%%+:...     .*@%*:....
+Nov 03 14:54:36 smk-a kividb[71405]:                        *%%%%%%%@%%%%+ %%%%%%%@@%%%%-
+Nov 03 14:54:36 smk-a kividb[71405]:                                .+-            :+.
+Nov 03 14:54:36 smk-a kividb[71405]:                                                                                                     
+Nov 03 14:54:36 smk-a kividb[71405]:     
+Nov 03 14:54:36 smk-a kividb[71405]:   KiviDB v1.2.0-rc10 - A fast Redis®-compatible store written in Rust
+Nov 03 14:54:36 smk-a kividb[71405]:   https://kividb.io
+Nov 03 14:54:36 smk-a kividb[71405]:   Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+Nov 03 14:54:36 smk-a kividb[71405]:   * Version        : 1.2.0-rc10
+Nov 03 14:54:36 smk-a kividb[71405]:   * Mode           : standalone
+Nov 03 14:54:36 smk-a kividb[71405]:   * OS             : linux aarch64
+Nov 03 14:54:36 smk-a kividb[71405]:   * Memory         : 15GiB available
+Nov 03 14:54:36 smk-a kividb[71405]:   * CPUs           : 4 cores detected
+Nov 03 14:54:36 smk-a kividb[71405]:   * Listening on   : 127.0.0.1:6380
+Nov 03 14:54:36 smk-a kividb[71405]:   * Worker threads : 2
+Nov 03 14:54:36 smk-a kividb[71405]:   * AOF            : enabled
+Nov 03 14:54:36 smk-a kividb[71405]:   * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+Nov 03 14:54:36 smk-a kividb[71405]:   * Databases      : 16
+Nov 03 14:54:36 smk-a kividb[71405]:   * ACL file       : none
+Nov 03 14:54:36 smk-a kividb[71405]: 2026-11-03T14:54:36.441Z 71405 [INFO] KiviDB 1.2.0-rc10 starting: pid 71405, default build, config file '/etc/kividb/kividb.conf'
+Nov 03 14:54:36 smk-a kividb[71405]: 2026-11-03T14:54:36.441Z 71405 [INFO] I/O model      : io_uring
+Nov 03 14:54:36 smk-a kividb[71405]: 2026-11-03T14:54:36.442Z 71405 [INFO] Shards per DB  : 32
+Nov 03 14:54:36 smk-a kividb[71405]: 2026-11-03T14:54:36.442Z 71405 [INFO] I/O model      : io_uring
+Nov 03 14:54:36 smk-a kividb[71405]: 2026-11-03T14:54:36.442Z 71405 [INFO] Found dump.kdb — loading native snapshot
+Nov 03 14:54:36 smk-a kividb[71405]: 2026-11-03T14:54:36.457Z 71405 [INFO] Loaded 19999 keys from snapshot (0 with a TTL)
+Nov 03 14:54:36 smk-a kividb[71405]: 2026-11-03T14:54:36.457Z 71405 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+Nov 03 14:54:36 smk-a kividb[71405]: 2026-11-03T14:54:36.461Z 71405 [INFO] Replication: dataset fingerprinted in 3 ms — a replica that holds the same data will be continued rather than sent it
+Nov 03 14:54:36 smk-a kividb[71405]: 2026-11-03T14:54:36.461Z 71405 [INFO] Ready to accept connections on 127.0.0.1:6380
+Nov 03 14:54:39 smk-a kividb[71405]: 2026-11-03T14:54:39.706Z 71405 [INFO] SIGTERM received — shutting down gracefully
+Nov 03 14:54:39 smk-a kividb[71405]: 2026-11-03T14:54:39.707Z 71405 [INFO] Writing final snapshot...
+Nov 03 14:54:39 smk-a systemd[1]: Stopping kividb.service - KiviDB in-memory database...
+Nov 03 14:54:39 smk-a kividb[71405]: 2026-11-03T14:54:39.734Z 71405 [INFO] AOF: rebased onto dump.kdb (generation 4) — log is now the delta
+Nov 03 14:54:39 smk-a kividb[71405]: 2026-11-03T14:54:39.734Z 71405 [INFO] Goodbye.
+Nov 03 14:54:39 smk-a systemd[1]: kividb.service: Deactivated successfully.
+Nov 03 14:54:39 smk-a systemd[1]: Stopped kividb.service - KiviDB in-memory database.
+Nov 03 14:54:39 smk-a systemd[1]: Started kividb.service - KiviDB in-memory database.
+Nov 03 14:54:39 smk-a kividb[71514]:                                                                                      
+Nov 03 14:54:39 smk-a kividb[71514]:                                                                                                     
+Nov 03 14:54:39 smk-a kividb[71514]:                                                    :::.
+Nov 03 14:54:39 smk-a kividb[71514]:                                 .:-==-:.       :#%@%%%@%%=
+Nov 03 14:54:39 smk-a kividb[71514]:                           -*@@%%%######%%%%%=:%%+:::::::=%%:
+Nov 03 14:54:39 smk-a kividb[71514]:                       :*%%#+-::::::::::::::=*%#:::::::::::#%.
+Nov 03 14:54:39 smk-a kividb[71514]:                     +%%*::::::::::::::::::::::::::::%@%-::+%#.
+Nov 03 14:54:39 smk-a kividb[71514]:                   =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.
+Nov 03 14:54:39 smk-a kividb[71514]:                 .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗
+Nov 03 14:54:39 smk-a kividb[71514]:                -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+Nov 03 14:54:39 smk-a kividb[71514]:               .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+Nov 03 14:54:39 smk-a kividb[71514]:               +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+Nov 03 14:54:39 smk-a kividb[71514]:               %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+Nov 03 14:54:39 smk-a kividb[71514]:               @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝
+Nov 03 14:54:39 smk-a kividb[71514]:               %%:::::::::::::::::::::::::::::+%@%-                          .
+Nov 03 14:54:39 smk-a kividb[71514]:               =@*::::::::::::::::::::::::::*%@@*
+Nov 03 14:54:39 smk-a kividb[71514]:                *@*::::=+:::::::::::::::-*%@@%%:
+Nov 03 14:54:39 smk-a kividb[71514]:                 *@#-:##::::::::::-=+*%@@@@%*.
+Nov 03 14:54:39 smk-a kividb[71514]:                  :#@%@*::::::*%@@@%%@@@%*:
+Nov 03 14:54:39 smk-a kividb[71514]:                    .*%%=:::*%%%%%%%@@%+
+Nov 03 14:54:39 smk-a kividb[71514]:                      .#@@@%*-   .#%@*.
+Nov 03 14:54:39 smk-a kividb[71514]:                       .#@*        :%@%:
+Nov 03 14:54:39 smk-a kividb[71514]:                         %@*         =%@#
+Nov 03 14:54:39 smk-a kividb[71514]:                          #@#          +%%+
+Nov 03 14:54:39 smk-a kividb[71514]:                           *%%+:...     .*@%*:....
+Nov 03 14:54:39 smk-a kividb[71514]:                        *%%%%%%%@%%%%+ %%%%%%%@@%%%%-
+Nov 03 14:54:39 smk-a kividb[71514]:                                .+-            :+.
+Nov 03 14:54:39 smk-a kividb[71514]:                                                                                                     
+Nov 03 14:54:39 smk-a kividb[71514]:     
+Nov 03 14:54:39 smk-a kividb[71514]:   KiviDB v1.2.0-rc10 - A fast Redis®-compatible store written in Rust
+Nov 03 14:54:39 smk-a kividb[71514]:   https://kividb.io
+Nov 03 14:54:39 smk-a kividb[71514]:   Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+Nov 03 14:54:39 smk-a kividb[71514]:   * Version        : 1.2.0-rc10
+Nov 03 14:54:39 smk-a kividb[71514]:   * Mode           : standalone
+Nov 03 14:54:39 smk-a kividb[71514]:   * OS             : linux aarch64
+Nov 03 14:54:39 smk-a kividb[71514]:   * Memory         : 15GiB available
+Nov 03 14:54:39 smk-a kividb[71514]:   * CPUs           : 4 cores detected
+Nov 03 14:54:39 smk-a kividb[71514]:   * Listening on   : 127.0.0.1:6380
+Nov 03 14:54:39 smk-a kividb[71514]:   * Worker threads : 2
+Nov 03 14:54:39 smk-a kividb[71514]:   * AOF            : enabled
+Nov 03 14:54:39 smk-a kividb[71514]:   * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+Nov 03 14:54:39 smk-a kividb[71514]:   * Databases      : 16
+Nov 03 14:54:39 smk-a kividb[71514]:   * ACL file       : none
+Nov 03 14:54:39 smk-a kividb[71514]: 2026-11-03T14:54:39.765Z 71514 [INFO] KiviDB 1.2.0-rc10 starting: pid 71514, default build, config file '/etc/kividb/kividb.conf'
+Nov 03 14:54:39 smk-a kividb[71514]: 2026-11-03T14:54:39.765Z 71514 [INFO] I/O model      : io_uring
+Nov 03 14:54:39 smk-a kividb[71514]: 2026-11-03T14:54:39.766Z 71514 [INFO] Shards per DB  : 32
+Nov 03 14:54:39 smk-a kividb[71514]: 2026-11-03T14:54:39.766Z 71514 [INFO] I/O model      : io_uring
+Nov 03 14:54:39 smk-a kividb[71514]: 2026-11-03T14:54:39.766Z 71514 [INFO] Found dump.kdb — loading native snapshot
+Nov 03 14:54:39 smk-a kividb[71514]: 2026-11-03T14:54:39.783Z 71514 [INFO] Loaded 19999 keys from snapshot (0 with a TTL)
+Nov 03 14:54:39 smk-a kividb[71514]: 2026-11-03T14:54:39.783Z 71514 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+Nov 03 14:54:39 smk-a kividb[71514]: 2026-11-03T14:54:39.786Z 71514 [INFO] Replication: dataset fingerprinted in 2 ms — a replica that holds the same data will be continued rather than sent it
+Nov 03 14:54:39 smk-a kividb[71514]: 2026-11-03T14:54:39.787Z 71514 [INFO] Ready to accept connections on 127.0.0.1:6380
+Nov 03 14:54:43 smk-a kividb[71514]: 2026-11-03T14:54:43.031Z 71514 [INFO] SIGTERM received — shutting down gracefully
+Nov 03 14:54:43 smk-a kividb[71514]: 2026-11-03T14:54:43.032Z 71514 [INFO] Writing final snapshot...
+Nov 03 14:54:43 smk-a systemd[1]: Stopping kividb.service - KiviDB in-memory database...
+Nov 03 14:54:43 smk-a kividb[71514]: 2026-11-03T14:54:43.063Z 71514 [INFO] AOF: rebased onto dump.kdb (generation 5) — log is now the delta
+Nov 03 14:54:43 smk-a kividb[71514]: 2026-11-03T14:54:43.063Z 71514 [INFO] Goodbye.
+Nov 03 14:54:43 smk-a systemd[1]: kividb.service: Deactivated successfully.
+Nov 03 14:54:43 smk-a systemd[1]: Stopped kividb.service - KiviDB in-memory database.
+Nov 03 14:54:43 smk-a systemd[1]: Started kividb.service - KiviDB in-memory database.
+Nov 03 14:54:43 smk-a kividb[71672]:                                                                                      
+Nov 03 14:54:43 smk-a kividb[71672]:                                                                                                     
+Nov 03 14:54:43 smk-a kividb[71672]:                                                    :::.
+Nov 03 14:54:43 smk-a kividb[71672]:                                 .:-==-:.       :#%@%%%@%%=
+Nov 03 14:54:43 smk-a kividb[71672]:                           -*@@%%%######%%%%%=:%%+:::::::=%%:
+Nov 03 14:54:43 smk-a kividb[71672]:                       :*%%#+-::::::::::::::=*%#:::::::::::#%.
+Nov 03 14:54:43 smk-a kividb[71672]:                     +%%*::::::::::::::::::::::::::::%@%-::+%#.
+Nov 03 14:54:43 smk-a kividb[71672]:                   =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.
+Nov 03 14:54:43 smk-a kividb[71672]:                 .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗
+Nov 03 14:54:43 smk-a kividb[71672]:                -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+Nov 03 14:54:43 smk-a kividb[71672]:               .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+Nov 03 14:54:43 smk-a kividb[71672]:               +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+Nov 03 14:54:43 smk-a kividb[71672]:               %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+Nov 03 14:54:43 smk-a kividb[71672]:               @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝
+Nov 03 14:54:43 smk-a kividb[71672]:               %%:::::::::::::::::::::::::::::+%@%-                          .
+Nov 03 14:54:43 smk-a kividb[71672]:               =@*::::::::::::::::::::::::::*%@@*
+Nov 03 14:54:43 smk-a kividb[71672]:                *@*::::=+:::::::::::::::-*%@@%%:
+Nov 03 14:54:43 smk-a kividb[71672]:                 *@#-:##::::::::::-=+*%@@@@%*.
+Nov 03 14:54:43 smk-a kividb[71672]:                  :#@%@*::::::*%@@@%%@@@%*:
+Nov 03 14:54:43 smk-a kividb[71672]:                    .*%%=:::*%%%%%%%@@%+
+Nov 03 14:54:43 smk-a kividb[71672]:                      .#@@@%*-   .#%@*.
+Nov 03 14:54:43 smk-a kividb[71672]:                       .#@*        :%@%:
+Nov 03 14:54:43 smk-a kividb[71672]:                         %@*         =%@#
+Nov 03 14:54:43 smk-a kividb[71672]:                          #@#          +%%+
+Nov 03 14:54:43 smk-a kividb[71672]:                           *%%+:...     .*@%*:....
+Nov 03 14:54:43 smk-a kividb[71672]:                        *%%%%%%%@%%%%+ %%%%%%%@@%%%%-
+Nov 03 14:54:43 smk-a kividb[71672]:                                .+-            :+.
+Nov 03 14:54:43 smk-a kividb[71672]:                                                                                                     
+Nov 03 14:54:43 smk-a kividb[71672]:     
+Nov 03 14:54:43 smk-a kividb[71672]:   KiviDB v1.2.0-rc10 - A fast Redis®-compatible store written in Rust
+Nov 03 14:54:43 smk-a kividb[71672]:   https://kividb.io
+Nov 03 14:54:43 smk-a kividb[71672]:   Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+Nov 03 14:54:43 smk-a kividb[71672]:   * Version        : 1.2.0-rc10
+Nov 03 14:54:43 smk-a kividb[71672]:   * Mode           : standalone
+Nov 03 14:54:43 smk-a kividb[71672]:   * OS             : linux aarch64
+Nov 03 14:54:43 smk-a kividb[71672]:   * Memory         : 15GiB available
+Nov 03 14:54:43 smk-a kividb[71672]:   * CPUs           : 4 cores detected
+Nov 03 14:54:43 smk-a kividb[71672]:   * Listening on   : 127.0.0.1:6380
+Nov 03 14:54:43 smk-a kividb[71672]:   * Worker threads : 2
+Nov 03 14:54:43 smk-a kividb[71672]:   * AOF            : enabled
+Nov 03 14:54:43 smk-a kividb[71672]:   * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+Nov 03 14:54:43 smk-a kividb[71672]:   * Databases      : 16
+Nov 03 14:54:43 smk-a kividb[71672]:   * ACL file       : none
+Nov 03 14:54:43 smk-a kividb[71672]: 2026-11-03T14:54:43.095Z 71672 [INFO] KiviDB 1.2.0-rc10 starting: pid 71672, default build, config file '/etc/kividb/kividb.conf'
+Nov 03 14:54:43 smk-a kividb[71672]: 2026-11-03T14:54:43.095Z 71672 [INFO] I/O model      : io_uring
+Nov 03 14:54:43 smk-a kividb[71672]: 2026-11-03T14:54:43.096Z 71672 [INFO] Shards per DB  : 32
+Nov 03 14:54:43 smk-a kividb[71672]: 2026-11-03T14:54:43.096Z 71672 [INFO] I/O model      : io_uring
+Nov 03 14:54:43 smk-a kividb[71672]: 2026-11-03T14:54:43.096Z 71672 [INFO] Found dump.kdb — loading native snapshot
+Nov 03 14:54:43 smk-a kividb[71672]: 2026-11-03T14:54:43.111Z 71672 [INFO] Loaded 19999 keys from snapshot (0 with a TTL)
+Nov 03 14:54:43 smk-a kividb[71672]: 2026-11-03T14:54:43.111Z 71672 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+Nov 03 14:54:43 smk-a kividb[71672]: 2026-11-03T14:54:43.115Z 71672 [INFO] Replication: dataset fingerprinted in 2 ms — a replica that holds the same data will be continued rather than sent it
+Nov 03 14:54:43 smk-a kividb[71672]: 2026-11-03T14:54:43.115Z 71672 [INFO] Ready to accept connections on 127.0.0.1:6380
+Nov 03 14:54:43 smk-a kividb[71672]: 2026-11-03T14:54:43.380Z 71672 [INFO] SIGTERM received — shutting down gracefully
+Nov 03 14:54:43 smk-a kividb[71672]: 2026-11-03T14:54:43.380Z 71672 [INFO] Writing final snapshot...
+Nov 03 14:54:43 smk-a systemd[1]: Stopping kividb.service - KiviDB in-memory database...
+Nov 03 14:54:43 smk-a kividb[71672]: 2026-11-03T14:54:43.407Z 71672 [INFO] AOF: rebased onto dump.kdb (generation 6) — log is now the delta
+Nov 03 14:54:43 smk-a kividb[71672]: 2026-11-03T14:54:43.407Z 71672 [INFO] Goodbye.
+Nov 03 14:54:43 smk-a systemd[1]: kividb.service: Deactivated successfully.
+Nov 03 14:54:43 smk-a systemd[1]: Stopped kividb.service - KiviDB in-memory database.
+Nov 03 14:54:46 smk-a systemd[1]: Started kividb.service - KiviDB in-memory database.
+Nov 03 14:54:46 smk-a kividb[71797]:                                                                                      
+Nov 03 14:54:46 smk-a kividb[71797]:                                                                                                     
+Nov 03 14:54:46 smk-a kividb[71797]:                                                    :::.
+Nov 03 14:54:46 smk-a kividb[71797]:                                 .:-==-:.       :#%@%%%@%%=
+Nov 03 14:54:46 smk-a kividb[71797]:                           -*@@%%%######%%%%%=:%%+:::::::=%%:
+Nov 03 14:54:46 smk-a kividb[71797]:                       :*%%#+-::::::::::::::=*%#:::::::::::#%.
+Nov 03 14:54:46 smk-a kividb[71797]:                     +%%*::::::::::::::::::::::::::::%@%-::+%#.
+Nov 03 14:54:46 smk-a kividb[71797]:                   =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.
+Nov 03 14:54:46 smk-a kividb[71797]:                 .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗
+Nov 03 14:54:46 smk-a kividb[71797]:                -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+Nov 03 14:54:46 smk-a kividb[71797]:               .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+Nov 03 14:54:46 smk-a kividb[71797]:               +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+Nov 03 14:54:46 smk-a kividb[71797]:               %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+Nov 03 14:54:46 smk-a kividb[71797]:               @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝
+Nov 03 14:54:46 smk-a kividb[71797]:               %%:::::::::::::::::::::::::::::+%@%-                          .
+Nov 03 14:54:46 smk-a kividb[71797]:               =@*::::::::::::::::::::::::::*%@@*
+Nov 03 14:54:46 smk-a kividb[71797]:                *@*::::=+:::::::::::::::-*%@@%%:
+Nov 03 14:54:46 smk-a kividb[71797]:                 *@#-:##::::::::::-=+*%@@@@%*.
+Nov 03 14:54:46 smk-a kividb[71797]:                  :#@%@*::::::*%@@@%%@@@%*:
+Nov 03 14:54:46 smk-a kividb[71797]:                    .*%%=:::*%%%%%%%@@%+
+Nov 03 14:54:46 smk-a kividb[71797]:                      .#@@@%*-   .#%@*.
+Nov 03 14:54:46 smk-a kividb[71797]:                       .#@*        :%@%:
+Nov 03 14:54:46 smk-a kividb[71797]:                         %@*         =%@#
+Nov 03 14:54:46 smk-a kividb[71797]:                          #@#          +%%+
+Nov 03 14:54:46 smk-a kividb[71797]:                           *%%+:...     .*@%*:....
+Nov 03 14:54:46 smk-a kividb[71797]:                        *%%%%%%%@%%%%+ %%%%%%%@@%%%%-
+Nov 03 14:54:46 smk-a kividb[71797]:                                .+-            :+.
+Nov 03 14:54:46 smk-a kividb[71797]:                                                                                                     
+Nov 03 14:54:46 smk-a kividb[71797]:     
+Nov 03 14:54:46 smk-a kividb[71797]:   KiviDB v1.2.0-rc10 - A fast Redis®-compatible store written in Rust
+Nov 03 14:54:46 smk-a kividb[71797]:   https://kividb.io
+Nov 03 14:54:46 smk-a kividb[71797]:   Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+Nov 03 14:54:46 smk-a kividb[71797]:   * Version        : 1.2.0-rc10
+Nov 03 14:54:46 smk-a kividb[71797]:   * Mode           : standalone
+Nov 03 14:54:46 smk-a kividb[71797]:   * OS             : linux aarch64
+Nov 03 14:54:46 smk-a kividb[71797]:   * Memory         : 15GiB available
+Nov 03 14:54:46 smk-a kividb[71797]:   * CPUs           : 4 cores detected
+Nov 03 14:54:46 smk-a kividb[71797]:   * Listening on   : 127.0.0.1:6380
+Nov 03 14:54:46 smk-a kividb[71797]:   * Worker threads : 2
+Nov 03 14:54:46 smk-a kividb[71797]:   * AOF            : enabled
+Nov 03 14:54:46 smk-a kividb[71797]:   * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+Nov 03 14:54:46 smk-a kividb[71797]:   * Databases      : 16
+Nov 03 14:54:46 smk-a kividb[71797]:   * ACL file       : none
+Nov 03 14:54:46 smk-a kividb[71797]: 2026-11-03T14:54:46.504Z 71797 [INFO] KiviDB 1.2.0-rc10 starting: pid 71797, default build, config file '/etc/kividb/kividb.conf'
+Nov 03 14:54:46 smk-a kividb[71797]: 2026-11-03T14:54:46.504Z 71797 [INFO] I/O model      : io_uring
+Nov 03 14:54:46 smk-a kividb[71797]: 2026-11-03T14:54:46.505Z 71797 [INFO] Shards per DB  : 32
+Nov 03 14:54:46 smk-a kividb[71797]: 2026-11-03T14:54:46.505Z 71797 [INFO] I/O model      : io_uring
+Nov 03 14:54:46 smk-a kividb[71797]: 2026-11-03T14:54:46.505Z 71797 [INFO] Found dump.kdb — loading native snapshot
+Nov 03 14:54:46 smk-a kividb[71797]: 2026-11-03T14:54:46.521Z 71797 [INFO] Loaded 19999 keys from snapshot (0 with a TTL)
+Nov 03 14:54:46 smk-a kividb[71797]: 2026-11-03T14:54:46.521Z 71797 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+Nov 03 14:54:46 smk-a kividb[71797]: 2026-11-03T14:54:46.524Z 71797 [INFO] Replication: dataset fingerprinted in 2 ms — a replica that holds the same data will be continued rather than sent it
+Nov 03 14:54:46 smk-a kividb[71797]: 2026-11-03T14:54:46.524Z 71797 [INFO] Ready to accept connections on 127.0.0.1:6380
+Nov 03 14:54:49 smk-a systemd[1]: kividb.service: Sent signal SIGKILL to main process 71797 (kividb) on client request.
+Nov 03 14:54:49 smk-a systemd[1]: kividb.service: Main process exited, code=killed, status=9/KILL
+Nov 03 14:54:49 smk-a systemd[1]: kividb.service: Failed with result 'signal'.
+Nov 03 14:54:51 smk-a systemd[1]: kividb.service: Scheduled restart job, restart counter is at 1.
+Nov 03 14:54:51 smk-a systemd[1]: Started kividb.service - KiviDB in-memory database.
+Nov 03 14:54:51 smk-a kividb[71965]:                                                                                      
+Nov 03 14:54:51 smk-a kividb[71965]:                                                                                                     
+Nov 03 14:54:51 smk-a kividb[71965]:                                                    :::.
+Nov 03 14:54:51 smk-a kividb[71965]:                                 .:-==-:.       :#%@%%%@%%=
+Nov 03 14:54:51 smk-a kividb[71965]:                           -*@@%%%######%%%%%=:%%+:::::::=%%:
+Nov 03 14:54:51 smk-a kividb[71965]:                       :*%%#+-::::::::::::::=*%#:::::::::::#%.
+Nov 03 14:54:51 smk-a kividb[71965]:                     +%%*::::::::::::::::::::::::::::%@%-::+%#.
+Nov 03 14:54:51 smk-a kividb[71965]:                   =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.
+Nov 03 14:54:51 smk-a kividb[71965]:                 .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗
+Nov 03 14:54:51 smk-a kividb[71965]:                -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+Nov 03 14:54:51 smk-a kividb[71965]:               .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+Nov 03 14:54:51 smk-a kividb[71965]:               +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+Nov 03 14:54:51 smk-a kividb[71965]:               %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+Nov 03 14:54:51 smk-a kividb[71965]:               @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝
+Nov 03 14:54:51 smk-a kividb[71965]:               %%:::::::::::::::::::::::::::::+%@%-                          .
+Nov 03 14:54:51 smk-a kividb[71965]:               =@*::::::::::::::::::::::::::*%@@*
+Nov 03 14:54:51 smk-a kividb[71965]:                *@*::::=+:::::::::::::::-*%@@%%:
+Nov 03 14:54:51 smk-a kividb[71965]:                 *@#-:##::::::::::-=+*%@@@@%*.
+Nov 03 14:54:51 smk-a kividb[71965]:                  :#@%@*::::::*%@@@%%@@@%*:
+Nov 03 14:54:51 smk-a kividb[71965]:                    .*%%=:::*%%%%%%%@@%+
+Nov 03 14:54:51 smk-a kividb[71965]:                      .#@@@%*-   .#%@*.
+Nov 03 14:54:51 smk-a kividb[71965]:                       .#@*        :%@%:
+Nov 03 14:54:51 smk-a kividb[71965]:                         %@*         =%@#
+Nov 03 14:54:51 smk-a kividb[71965]:                          #@#          +%%+
+Nov 03 14:54:51 smk-a kividb[71965]:                           *%%+:...     .*@%*:....
+Nov 03 14:54:51 smk-a kividb[71965]:                        *%%%%%%%@%%%%+ %%%%%%%@@%%%%-
+Nov 03 14:54:51 smk-a kividb[71965]:                                .+-            :+.
+Nov 03 14:54:51 smk-a kividb[71965]:                                                                                                     
+Nov 03 14:54:51 smk-a kividb[71965]:     
+Nov 03 14:54:51 smk-a kividb[71965]:   KiviDB v1.2.0-rc10 - A fast Redis®-compatible store written in Rust
+Nov 03 14:54:51 smk-a kividb[71965]:   https://kividb.io
+Nov 03 14:54:51 smk-a kividb[71965]:   Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+Nov 03 14:54:51 smk-a kividb[71965]:   * Version        : 1.2.0-rc10
+Nov 03 14:54:51 smk-a kividb[71965]:   * Mode           : standalone
+Nov 03 14:54:51 smk-a kividb[71965]:   * OS             : linux aarch64
+Nov 03 14:54:51 smk-a kividb[71965]:   * Memory         : 15GiB available
+Nov 03 14:54:51 smk-a kividb[71965]:   * CPUs           : 4 cores detected
+Nov 03 14:54:51 smk-a kividb[71965]:   * Listening on   : 127.0.0.1:6380
+Nov 03 14:54:51 smk-a kividb[71965]:   * Worker threads : 2
+Nov 03 14:54:51 smk-a kividb[71965]:   * AOF            : enabled
+Nov 03 14:54:51 smk-a kividb[71965]:   * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+Nov 03 14:54:51 smk-a kividb[71965]:   * Databases      : 16
+Nov 03 14:54:51 smk-a kividb[71965]:   * ACL file       : none
+Nov 03 14:54:51 smk-a kividb[71965]: 2026-11-03T14:54:51.828Z 71965 [INFO] KiviDB 1.2.0-rc10 starting: pid 71965, default build, config file '/etc/kividb/kividb.conf'
+Nov 03 14:54:51 smk-a kividb[71965]: 2026-11-03T14:54:51.828Z 71965 [INFO] I/O model      : io_uring
+Nov 03 14:54:51 smk-a kividb[71965]: 2026-11-03T14:54:51.829Z 71965 [INFO] Shards per DB  : 32
+Nov 03 14:54:51 smk-a kividb[71965]: 2026-11-03T14:54:51.829Z 71965 [INFO] I/O model      : io_uring
+Nov 03 14:54:51 smk-a kividb[71965]: 2026-11-03T14:54:51.829Z 71965 [INFO] Found dump.kdb — loading native snapshot
+Nov 03 14:54:51 smk-a kividb[71965]: 2026-11-03T14:54:51.845Z 71965 [INFO] Loaded 19999 keys from snapshot (0 with a TTL)
+Nov 03 14:54:51 smk-a kividb[71965]: 2026-11-03T14:54:51.845Z 71965 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+Nov 03 14:54:51 smk-a kividb[71965]: 2026-11-03T14:54:51.848Z 71965 [INFO] Replication: dataset fingerprinted in 2 ms — a replica that holds the same data will be continued rather than sent it
+Nov 03 14:54:51 smk-a kividb[71965]: 2026-11-03T14:54:51.848Z 71965 [INFO] Ready to accept connections on 127.0.0.1:6380
+Nov 03 14:54:55 smk-a kividb[71965]: 2026-11-03T14:54:55.128Z 71965 [INFO] SIGTERM received — shutting down gracefully
+Nov 03 14:54:55 smk-a kividb[71965]: 2026-11-03T14:54:55.128Z 71965 [INFO] Writing final snapshot...
+Nov 03 14:54:55 smk-a systemd[1]: Stopping kividb.service - KiviDB in-memory database...
+Nov 03 14:54:55 smk-a kividb[71965]: 2026-11-03T14:54:55.162Z 71965 [INFO] AOF: rebased onto dump.kdb (generation 7) — log is now the delta
+Nov 03 14:54:55 smk-a kividb[71965]: 2026-11-03T14:54:55.162Z 71965 [INFO] Goodbye.
+Nov 03 14:54:55 smk-a systemd[1]: kividb.service: Deactivated successfully.
+Nov 03 14:54:55 smk-a systemd[1]: Stopped kividb.service - KiviDB in-memory database.
+Nov 03 14:54:55 smk-a systemd[1]: Started kividb.service - KiviDB in-memory database.
+Nov 03 14:54:55 smk-a kividb[72177]:                                                                                      
+Nov 03 14:54:55 smk-a kividb[72177]:                                                                                                     
+Nov 03 14:54:55 smk-a kividb[72177]:                                                    :::.
+Nov 03 14:54:55 smk-a kividb[72177]:                                 .:-==-:.       :#%@%%%@%%=
+Nov 03 14:54:55 smk-a kividb[72177]:                           -*@@%%%######%%%%%=:%%+:::::::=%%:
+Nov 03 14:54:55 smk-a kividb[72177]:                       :*%%#+-::::::::::::::=*%#:::::::::::#%.
+Nov 03 14:54:55 smk-a kividb[72177]:                     +%%*::::::::::::::::::::::::::::%@%-::+%#.
+Nov 03 14:54:55 smk-a kividb[72177]:                   =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.
+Nov 03 14:54:55 smk-a kividb[72177]:                 .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗
+Nov 03 14:54:55 smk-a kividb[72177]:                -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+Nov 03 14:54:55 smk-a kividb[72177]:               .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+Nov 03 14:54:55 smk-a kividb[72177]:               +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+Nov 03 14:54:55 smk-a kividb[72177]:               %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+Nov 03 14:54:55 smk-a kividb[72177]:               @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝
+Nov 03 14:54:55 smk-a kividb[72177]:               %%:::::::::::::::::::::::::::::+%@%-                          .
+Nov 03 14:54:55 smk-a kividb[72177]:               =@*::::::::::::::::::::::::::*%@@*
+Nov 03 14:54:55 smk-a kividb[72177]:                *@*::::=+:::::::::::::::-*%@@%%:
+Nov 03 14:54:55 smk-a kividb[72177]:                 *@#-:##::::::::::-=+*%@@@@%*.
+Nov 03 14:54:55 smk-a kividb[72177]:                  :#@%@*::::::*%@@@%%@@@%*:
+Nov 03 14:54:55 smk-a kividb[72177]:                    .*%%=:::*%%%%%%%@@%+
+Nov 03 14:54:55 smk-a kividb[72177]:                      .#@@@%*-   .#%@*.
+Nov 03 14:54:55 smk-a kividb[72177]:                       .#@*        :%@%:
+Nov 03 14:54:55 smk-a kividb[72177]:                         %@*         =%@#
+Nov 03 14:54:55 smk-a kividb[72177]:                          #@#          +%%+
+Nov 03 14:54:55 smk-a kividb[72177]:                           *%%+:...     .*@%*:....
+Nov 03 14:54:55 smk-a kividb[72177]:                        *%%%%%%%@%%%%+ %%%%%%%@@%%%%-
+Nov 03 14:54:55 smk-a kividb[72177]:                                .+-            :+.
+Nov 03 14:54:55 smk-a kividb[72177]:                                                                                                     
+Nov 03 14:54:55 smk-a kividb[72177]:     
+Nov 03 14:54:55 smk-a kividb[72177]:   KiviDB v1.2.0-rc10 - A fast Redis®-compatible store written in Rust
+Nov 03 14:54:55 smk-a kividb[72177]:   https://kividb.io
+Nov 03 14:54:55 smk-a kividb[72177]:   Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+Nov 03 14:54:55 smk-a kividb[72177]:   * Version        : 1.2.0-rc10
+Nov 03 14:54:55 smk-a kividb[72177]:   * Mode           : standalone
+Nov 03 14:54:55 smk-a kividb[72177]:   * OS             : linux aarch64
+Nov 03 14:54:55 smk-a kividb[72177]:   * Memory         : 15GiB available
+Nov 03 14:54:55 smk-a kividb[72177]:   * CPUs           : 4 cores detected
+Nov 03 14:54:55 smk-a kividb[72177]:   * Listening on   : 127.0.0.1:6380
+Nov 03 14:54:55 smk-a kividb[72177]:   * Worker threads : 2
+Nov 03 14:54:55 smk-a kividb[72177]:   * AOF            : enabled
+Nov 03 14:54:55 smk-a kividb[72177]:   * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+Nov 03 14:54:55 smk-a kividb[72177]:   * Databases      : 16
+Nov 03 14:54:55 smk-a kividb[72177]:   * ACL file       : none
+Nov 03 14:54:55 smk-a kividb[72177]: 2026-11-03T14:54:55.503Z 72177 [INFO] KiviDB 1.2.0-rc10 starting: pid 72177, default build, config file '/etc/kividb/kividb.conf'
+Nov 03 14:54:55 smk-a kividb[72177]: 2026-11-03T14:54:55.503Z 72177 [WARN] The data directory /var/lib/kividb is in use by another process (it holds kividb.lock): waiting for it to be free (0s so far)
+Nov 03 14:54:58 smk-a kividb[72177]: 2026-11-03T14:54:58.606Z 72177 [INFO] The data directory is free after 3.1s: starting
+Nov 03 14:54:58 smk-a kividb[72177]: 2026-11-03T14:54:58.607Z 72177 [INFO] I/O model      : io_uring
+Nov 03 14:54:58 smk-a kividb[72177]: 2026-11-03T14:54:58.608Z 72177 [INFO] Shards per DB  : 32
+Nov 03 14:54:58 smk-a kividb[72177]: 2026-11-03T14:54:58.608Z 72177 [INFO] I/O model      : io_uring
+Nov 03 14:54:58 smk-a kividb[72177]: 2026-11-03T14:54:58.608Z 72177 [INFO] Found dump.kdb — loading native snapshot
+Nov 03 14:54:58 smk-a kividb[72177]: 2026-11-03T14:54:58.624Z 72177 [INFO] Loaded 19999 keys from snapshot (0 with a TTL)
+Nov 03 14:54:58 smk-a kividb[72177]: 2026-11-03T14:54:58.624Z 72177 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+Nov 03 14:54:58 smk-a kividb[72177]: 2026-11-03T14:54:58.627Z 72177 [INFO] Replication: dataset fingerprinted in 2 ms — a replica that holds the same data will be continued rather than sent it
+Nov 03 14:54:58 smk-a kividb[72177]: 2026-11-03T14:54:58.628Z 72177 [INFO] Ready to accept connections on 127.0.0.1:6380

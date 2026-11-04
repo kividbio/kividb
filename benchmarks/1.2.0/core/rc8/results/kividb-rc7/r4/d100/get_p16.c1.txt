@@ -1,0 +1,42 @@
+Json file ~/results/kividb-rc7/r4/d100/get_p16.c1.json created...
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 5%,   1 secs] 15 threads 10 conns:     5200259 ops, 5192527 (avg: 5192527) ops/sec, 707.58MB/sec (avg: 707.58MB/sec),  0.45 (avg:  0.45) msec latency
+warning: high CPU on thread 11: 96.2% of a core (threshold 95.0%) - results may be unreliable
+[RUN #1 10%,   2 secs] 15 threads 10 conns:    10362348 ops, 5160303 (avg: 5176424) ops/sec, 703.19MB/sec (avg: 705.39MB/sec),  0.46 (avg:  0.45) msec latency[RUN #1 15%,   3 secs] 15 threads 10 conns:    15523949 ops, 5160073 (avg: 5170976) ops/sec, 703.16MB/sec (avg: 704.65MB/sec),  0.46 (avg:  0.45) msec latency[RUN #1 20%,   4 secs] 15 threads 10 conns:    20597912 ops, 5072131 (avg: 5146271) ops/sec, 691.18MB/sec (avg: 701.28MB/sec),  0.46 (avg:  0.46) msec latency[RUN #1 25%,   5 secs] 15 threads 10 conns:    25663205 ops, 5061830 (avg: 5129382) ops/sec, 689.77MB/sec (avg: 698.98MB/sec),  0.46 (avg:  0.46) msec latency[RUN #1 30%,   6 secs] 15 threads 10 conns:    30805740 ops, 5140257 (avg: 5131195) ops/sec, 700.46MB/sec (avg: 699.22MB/sec),  0.46 (avg:  0.46) msec latency
+warning: high CPU on thread 0: 95.5% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 8: 95.5% of a core (threshold 95.0%) - results may be unreliable
+[RUN #1 35%,   7 secs] 15 threads 10 conns:    35967252 ops, 5159675 (avg: 5135262) ops/sec, 703.11MB/sec (avg: 699.78MB/sec),  0.46 (avg:  0.46) msec latency[RUN #1 40%,   8 secs] 15 threads 10 conns:    41077590 ops, 5109387 (avg: 5132029) ops/sec, 696.25MB/sec (avg: 699.34MB/sec),  0.46 (avg:  0.46) msec latency[RUN #1 45%,   9 secs] 15 threads 10 conns:    46244673 ops, 5163938 (avg: 5135575) ops/sec, 703.69MB/sec (avg: 699.82MB/sec),  0.45 (avg:  0.46) msec latency[RUN #1 50%,  10 secs] 15 threads 10 conns:    51428478 ops, 5179568 (avg: 5139975) ops/sec, 705.81MB/sec (avg: 700.42MB/sec),  0.45 (avg:  0.46) msec latency
+warning: high CPU on thread 2: 95.2% of a core (threshold 95.0%) - results may be unreliable
+[RUN #1 55%,  11 secs] 15 threads 10 conns:    56564203 ops, 5134893 (avg: 5139513) ops/sec, 699.73MB/sec (avg: 700.36MB/sec),  0.46 (avg:  0.46) msec latency[RUN #1 60%,  12 secs] 15 threads 10 conns:    61664973 ops, 5099974 (avg: 5136219) ops/sec, 694.97MB/sec (avg: 699.91MB/sec),  0.46 (avg:  0.46) msec latency
+warning: high CPU on thread 12: 95.1% of a core (threshold 95.0%) - results may be unreliable
+[RUN #1 65%,  13 secs] 15 threads 10 conns:    66820373 ops, 5154343 (avg: 5137613) ops/sec, 702.38MB/sec (avg: 700.10MB/sec),  0.46 (avg:  0.46) msec latency[RUN #1 70%,  14 secs] 15 threads 10 conns:    71971601 ops, 5150300 (avg: 5138519) ops/sec, 701.83MB/sec (avg: 700.22MB/sec),  0.46 (avg:  0.46) msec latency[RUN #1 75%,  15 secs] 15 threads 10 conns:    77100971 ops, 5128139 (avg: 5137827) ops/sec, 698.81MB/sec (avg: 700.13MB/sec),  0.46 (avg:  0.46) msec latency[RUN #1 80%,  16 secs] 15 threads 10 conns:    82272738 ops, 5167958 (avg: 5139711) ops/sec, 704.24MB/sec (avg: 700.39MB/sec),  0.45 (avg:  0.46) msec latency[RUN #1 85%,  17 secs] 15 threads 10 conns:    87452704 ops, 5179033 (avg: 5142023) ops/sec, 705.74MB/sec (avg: 700.70MB/sec),  0.45 (avg:  0.46) msec latency[RUN #1 90%,  18 secs] 15 threads 10 conns:    92577090 ops, 5123135 (avg: 5140974) ops/sec, 698.13MB/sec (avg: 700.56MB/sec),  0.46 (avg:  0.46) msec latency[RUN #1 95%,  19 secs] 15 threads 10 conns:    97673611 ops, 5095563 (avg: 5138585) ops/sec, 694.37MB/sec (avg: 700.23MB/sec),  0.46 (avg:  0.46) msec latency[RUN #1 100%,  20 secs]  0 threads 10 conns:   102727472 ops, 5095563 (avg: 5136124) ops/sec, 694.37MB/sec (avg: 699.90MB/sec),  0.46 (avg:  0.46) msec latency
+
+Writing Full Run command HDR latency histogram results to ~/results/kividb-rc7/r4/d100/get_p16.c1_FULL_RUN_1.txt...
+Writing Full Run command HDR latency histogram results in HistogramLogProcessor format to ~/results/kividb-rc7/r4/d100/get_p16.c1_FULL_RUN_1.hgrm...
+Writing GET command HDR latency histogram results to ~/results/kividb-rc7/r4/d100/get_p16.c1_GET_command_run_1.txt...
+Writing GET command HDR latency histogram results in HistogramLogProcessor format to ~/results/kividb-rc7/r4/d100/get_p16.c1_GET_command_run_1.hgrm...
+
+CPU Utilization Summary
+  Total CPU time:   276.118s  (user 119.097s, sys 157.020s)
+  Wall time:        20.002s
+  Cores used:       13.804   (avg 92.0% across 15 worker threads)
+  Peak utilization: 1402.0%
+Saving JSON output file: ~/results/kividb-rc7/r4/d100/get_p16.c1.json
+Json file closed.
+15        Threads
+10        Connections per thread
+20        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets            0.00          ---          ---             ---             ---             ---             ---         0.00 
+Gets      5136182.28   5136182.28         0.00         0.45787         0.44700         0.81500         1.37500    716702.12 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    5136182.28   5136182.28         0.00         0.45787         0.44700         0.81500         1.37500    716702.12 
+rc=0

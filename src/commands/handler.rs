@@ -452,6 +452,14 @@ fn writes_keys_of_several_shards(ctx: &Ctx, name: &str, cmd0: &[u8]) -> bool {
     first.is_none() || shards.any(|shard| shard != first)
 }
 
+/// The order of the keys of an `MSET` or `MSETNX`, held shared (see
+/// `write_order::lock_keys_shared`). Out of line: not on the way of the
+/// one-key writes, which go through the same `run_command`.
+#[inline(never)]
+fn order_of_pairs_shared(ctx: &Ctx) -> crate::write_order::OrderGuard {
+    crate::write_order::lock_keys_shared(*ctx.selected_db, ctx.cmd[1..].iter().step_by(2).copied())
+}
+
 fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     // Re-derive cmd0/name from ctx.cmd in case parts were modified (XREAD BLOCK stripping).
     let cmd0 = ctx.cmd[0];
@@ -833,6 +841,42 @@ fn used_on_error(ctx: &Ctx, name: &str) {
     }
 }
 
+/// The routing of [`run_command`], again, for a write inside the write gate
+/// that was routed as `routed`, if its keys may have left since: a
+/// `MIGRATE` deleted them here, or a slot changed state
+/// (`pause::routes_moved`). `None` if it may run here (#331).
+#[cold]
+#[inline(never)]
+fn routed_again_in_gate(
+    ctx: &Ctx,
+    name: &str,
+    routed: crate::cluster::routing::Routed,
+) -> Option<Vec<u8>> {
+    if !ctx.cluster.enabled
+        || ctx.bypass_cluster_check
+        || !crate::pause::routes_moved_since(routed.at())
+    {
+        return None;
+    }
+    let store = ctx.store;
+    let db = *ctx.selected_db;
+    let registry = ctx.client_registry;
+    let client_id = ctx.client_id;
+    crate::cluster::routing::route_named(
+        name,
+        ctx.cmd.as_slice(),
+        ctx.cluster,
+        routed.asking(),
+        || registry.get_readonly(client_id),
+        |key| {
+            std::str::from_utf8(key).is_ok_and(|key| {
+                crate::read_lock!(crate::store::get_shard(&store[db], key)).contains_key(key)
+            })
+        },
+    )
+    .refusal()
+}
+
 /// [`execute_command`], once the command's name is known; it started at
 /// `started`.
 fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8> {
@@ -843,11 +887,23 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     }
     let cmd0 = &ctx.cmd[0];
 
+    // [`ReplState::is_slave`] is a relaxed atomic load — avoid `role()` here (it allocates).
+    // Taken before the command is routed, as everything it is checked
+    // against below may be: a write that passed these checks while this
+    // node was a master can be held up before the write gate while the node
+    // becomes a replica. The gate routes it again (#331, #337); so does the
+    // test hook that holds it there (`routing::stall_for_test`).
+    let repl_is_slave = ctx.repl_state.is_slave();
+
     // ── Cluster routing check ────────────────────────────────────────
     //
     // Decide whether this command can run on this node. In standalone mode
     // or when bypass_cluster_check is true (replica applier), this is a
     // single boolean check and passes through.
+    //
+    // When it was routed, for a write to compare inside the write gate:
+    // its keys may have left meanwhile (#331).
+    let mut routed = crate::cluster::routing::Routed::default();
     {
         use crate::cluster::routing::route_named;
         // Standalone-mode fast path: skip every cluster-related check entirely.
@@ -862,6 +918,9 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
             }
             // Pull asking flag from client registry.
             let asking_flag = ctx.client_registry.get_asking(ctx.client_id);
+            // Before the keys are looked for: anything that moves them from
+            // here after this, the write sees in the gate.
+            routed = crate::cluster::routing::Routed::now(asking_flag);
             // has_key_locally: bind to the store/db combination via closure.
             let store_for_check = ctx.store;
             let db = *ctx.selected_db;
@@ -892,6 +951,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
             if let Some(refusal) = decision.refusal() {
                 return refusal;
             }
+            crate::cluster::routing::stall_for_test(name, ctx.cmd.as_slice());
         }
     }
 
@@ -901,9 +961,6 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
             "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
         );
     }
-
-    // [`ReplState::is_slave`] is a relaxed atomic load — avoid `role()` here (it allocates).
-    let repl_is_slave = ctx.repl_state.is_slave();
 
     // Masters skip `is_write_command` entirely here — hot path for standalone read benchmarks.
     if repl_is_slave
@@ -1007,9 +1064,10 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // a time, and a cut in the middle of one would be a cut in the middle of
     // something that is supposed to be atomic.
     //
-    // MIGRATE is deliberately not gated. It blocks on the network for up to
-    // its timeout, which would stall every write behind a cut, and it needs no
-    // protection: it propagates as an idempotent `DEL`.
+    // MIGRATE is deliberately not gated here. It blocks on the network for up
+    // to its timeout, and takes what it needs itself, for no longer than it
+    // must (`commands::cluster::hold_while_moving`); it propagates as an
+    // idempotent `DEL`.
     //
     // Nor is FT.DROPINDEX here: with `DD` it may delete millions of documents,
     // and it takes the gate, and the order of their keys, a few at a time
@@ -1087,17 +1145,54 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // paused writes, and this one got past the pause before it was set. It
     // must not run behind the handoff's back (see `pause::HANDOFF`): out of
     // the gate, wait, and then answer as whoever owns the key now would.
-    while gated && !nested && !ctx.apply_replication && crate::pause::handoff() {
+    //
+    // The same one load finds a `MIGRATE` holding keys here (`key_moves`): a
+    // write to one of them waits until it has gone, or stayed, and is then
+    // answered as the slot's state says — `-ASK` for a key that left. A
+    // write to other keys goes on.
+    //
+    // And it finds that keys have left here, or a slot has changed state,
+    // since this write was routed: a whole `MIGRATE` of its key may have run
+    // between its routing and the gate. It is routed again, here in the
+    // gate, where nothing moves its keys before it is done (#331).
+    while gated && !nested && !ctx.apply_replication && crate::pause::writes_must_check(routed.at())
+    {
+        let handoff = crate::pause::handoff();
+        if !handoff
+            && !(crate::pause::keys_moving()
+                && crate::key_moves::names_a_moving_key(*ctx.selected_db, name, ctx.cmd.as_slice()))
+        {
+            if let Some(refusal) = routed_again_in_gate(ctx, name, routed) {
+                return refusal;
+            }
+            break;
+        }
         _write_gate = None;
-        crate::pause::wait_out_handoff();
+        if handoff {
+            crate::pause::wait_out_handoff();
+        } else {
+            crate::key_moves::wait_until_moved(*ctx.selected_db, name, ctx.cmd.as_slice());
+        }
+        // Before its keys are looked for below, as before its first routing.
+        routed = crate::cluster::routing::Routed::now(false);
         if ctx.cluster.enabled {
+            let store = ctx.store;
+            let db = *ctx.selected_db;
             let decision = crate::cluster::routing::route_named(
                 name,
                 ctx.cmd.as_slice(),
                 ctx.cluster,
                 false,
                 || false,
-                |_| true,
+                // After a handoff, whoever owns the slot; after a move, also
+                // whether the key is still here.
+                |key| {
+                    handoff
+                        || std::str::from_utf8(key).is_ok_and(|key| {
+                            crate::read_lock!(crate::store::get_shard(&store[db], key))
+                                .contains_key(key)
+                        })
+                },
             );
             if let Some(refusal) = decision.refusal() {
                 return refusal;
@@ -1168,6 +1263,13 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
             *ctx.selected_db,
             ctx.cmd[1],
         ))
+    } else if ordered && matches!(name, "MSET" | "MSETNX") && !replication::write_is_observed(ctx) {
+        // Each key's order shared: both write every key under all of their
+        // shards' locks at once (`WriteShards`), so the shards order them
+        // against each other and against the writes above; see
+        // `write_order::lock_keys_shared`. Whole while anything reads the
+        // write stream, as every other write is.
+        Some(order_of_pairs_shared(ctx))
     } else if ordered {
         let keys = crate::keyspec::key_positions(name, &ctx.cmd);
         let here = *ctx.selected_db;

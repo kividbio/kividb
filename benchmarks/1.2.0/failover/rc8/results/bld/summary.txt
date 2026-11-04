@@ -1,0 +1,61 @@
+05:11:18 binary: kividb 1.2.0-rc8; a9ea83cbb399ec8e921442caf59ea1a9a4fa8f2e65f561366cddd7d268299cd2  /opt/kv/kividb
+05:11:43 == expire_replay
+      2 rc8 after restart: h type=none ttl=-2 hlen=0 fields=, | s type=none ttl=-2 val= | l type=none ttl=-2 len=0 | dbsize=0
+05:11:43 == field_replay
+      2 rc8 after restart: hf f=v1 fttl=-1  | hg g= gttl=-2  hlen=1
+05:11:43 == expire_more
+      2 rc8 after restart 1: x1=0 x2=0 x3=0 x4=0 keep_ttl_s=3597 keep_len=2 hq_fields=keep, dbsize=2
+      2 rc8 after restart 2: x1=0 x2=0 x3=0 x4=0 keep_ttl_s=3594 keep_len=2 hq_fields=keep, dbsize=3
+      2 rc8 deletion records in the AOF: 4
+05:11:43 EXPIRE-DONE
+/home/azureuser/fo/harness/r303load.sh: line 92: 10407 Killed                  ( cd $W/a && exec $BIN --port 7101 --bind 127.0.0.1 --configfile $W/kividb.conf > $W/b.log 2>&1 )
+/home/azureuser/fo/harness/r303load.sh: line 92: 10832 Killed                  ( cd $W/a && exec $BIN --port 7101 --bind 127.0.0.1 --configfile $W/kividb.conf > $W/b.log 2>&1 )
+/home/azureuser/fo/harness/r303load.sh: line 92: 11267 Killed                  ( cd $W/a && exec $BIN --port 7101 --bind 127.0.0.1 --configfile $W/kividb.conf > $W/b.log 2>&1 )
+/home/azureuser/fo/harness/r303load.sh: line 92: 11678 Killed                  ( cd $W/a && exec $BIN --port 7101 --bind 127.0.0.1 --configfile $W/kividb.conf > $W/b.log 2>&1 )
+/home/azureuser/fo/harness/r303load.sh: line 92: 12132 Killed                  ( cd $W/a && exec $BIN --port 7101 --bind 127.0.0.1 --configfile $W/kividb.conf > $W/b.log 2>&1 )
+/home/azureuser/fo/harness/r303load.sh: line 92: 12431 Killed                  ( cd $W/a && exec $BIN --port 7101 --bind 127.0.0.1 --configfile $W/kividb.conf > $W/b.log 2>&1 )
+/home/azureuser/fo/harness/r303load.sh: line 92: 12924 Killed                  ( cd $W/a && exec $BIN --port 7101 --bind 127.0.0.1 --configfile $W/kividb.conf > $W/b.log 2>&1 )
+/home/azureuser/fo/harness/r303load.sh: line 92: 13432 Killed                  ( cd $W/a && exec $BIN --port 7101 --bind 127.0.0.1 --configfile $W/kividb.conf > $W/b.log 2>&1 )
+05:17:15 R303-DONE
+05:17:17 probe delay0.2 rep1: delay=0.2 stalls=0/10
+05:17:17 probe delay0 rep1: delay=0.0 stalls=0/10
+05:17:50 slowdst rep1: delay=0.2 hold=3.0 timeout_ms=5000 stalled_trials=0/10
+05:18:00 tryagain rep1:
+tokio none: INCR during MIGRATE=2 | reply=[TRYAGAIN a key was written while being migrated, and kept here: 'k:2'. The copies sent to 127.0.0.1:7601 were deleted there; MIGRATE them again] | source value=2 | EXISTS at destination after TRYAGAIN=0 | MIGRATE again (no REPLACE)=OK | destination value=2 | source EXISTS after=ASK 6101 127.0.0.1:7601 -> FAIL
+/home/azureuser/fo/harness/migtry.sh: line 10: 14051 Killed                  ( cd $W/a && KIVIDB_TEST_FAILPOINTS=migrate-before-delete exec $BIN --port 7600 --bind 127.0.0.1 --cluster-enabled yes --io-model $model > log 2>&1 )
+/home/azureuser/fo/harness/migtry.sh: line 10: 14052 Killed                  ( cd $W/b && exec $BIN --port 7601 --bind 127.0.0.1 --cluster-enabled yes --io-model $model $extra > log 2>&1 )
+tokio AUTH: INCR during MIGRATE=2 | reply=[TRYAGAIN a key was written while being migrated, and kept here: 'k:2'. The copies sent to 127.0.0.1:7601 were deleted there; MIGRATE them again] | source value=2 | EXISTS at destination after TRYAGAIN=0 | MIGRATE again (no REPLACE)=OK | destination value=2 | source EXISTS after=ASK 6101 127.0.0.1:7601 -> FAIL
+/home/azureuser/fo/harness/migtry.sh: line 10: 14210 Killed                  ( cd $W/a && KIVIDB_TEST_FAILPOINTS=migrate-before-delete exec $BIN --port 7600 --bind 127.0.0.1 --cluster-enabled yes --io-model $model > log 2>&1 )
+/home/azureuser/fo/harness/migtry.sh: line 10: 14211 Killed                  ( cd $W/b && exec $BIN --port 7601 --bind 127.0.0.1 --cluster-enabled yes --io-model $model $extra > log 2>&1 )
+tokio AUTH2: INCR during MIGRATE=2 | reply=[TRYAGAIN a key was written while being migrated, and kept here: 'k:2'. The copies sent to 127.0.0.1:7601 were deleted there; MIGRATE them again] | source value=2 | EXISTS at destination after TRYAGAIN=0 | MIGRATE again (no REPLACE)=OK | destination value=2 | source EXISTS after=ASK 6101 127.0.0.1:7601 -> FAIL
+/home/azureuser/fo/harness/migtry.sh: line 10: 14414 Killed                  ( cd $W/a && KIVIDB_TEST_FAILPOINTS=migrate-before-delete exec $BIN --port 7600 --bind 127.0.0.1 --cluster-enabled yes --io-model $model > log 2>&1 )
+/home/azureuser/fo/harness/migtry.sh: line 10: 14415 Killed                  ( cd $W/b && exec $BIN --port 7601 --bind 127.0.0.1 --cluster-enabled yes --io-model $model $extra > log 2>&1 )
+uring none: INCR during MIGRATE=2 | reply=[TRYAGAIN a key was written while being migrated, and kept here: 'k:2'. The copies sent to 127.0.0.1:7601 were deleted there; MIGRATE them again] | source value=2 | EXISTS at destination after TRYAGAIN=0 | MIGRATE again (no REPLACE)=OK | destination value=2 | source EXISTS after=ASK 6101 127.0.0.1:7601 -> FAIL
+/home/azureuser/fo/harness/migtry.sh: line 10: 14572 Killed                  ( cd $W/a && KIVIDB_TEST_FAILPOINTS=migrate-before-delete exec $BIN --port 7600 --bind 127.0.0.1 --cluster-enabled yes --io-model $model > log 2>&1 )
+/home/azureuser/fo/harness/migtry.sh: line 10: 14573 Killed                  ( cd $W/b && exec $BIN --port 7601 --bind 127.0.0.1 --cluster-enabled yes --io-model $model $extra > log 2>&1 )
+uring AUTH: INCR during MIGRATE=2 | reply=[TRYAGAIN a key was written while being migrated, and kept here: 'k:2'. The copies sent to 127.0.0.1:7601 were deleted there; MIGRATE them again] | source value=2 | EXISTS at destination after TRYAGAIN=0 | MIGRATE again (no REPLACE)=OK | destination value=2 | source EXISTS after=ASK 6101 127.0.0.1:7601 -> FAIL
+/home/azureuser/fo/harness/migtry.sh: line 10: 14733 Killed                  ( cd $W/a && KIVIDB_TEST_FAILPOINTS=migrate-before-delete exec $BIN --port 7600 --bind 127.0.0.1 --cluster-enabled yes --io-model $model > log 2>&1 )
+/home/azureuser/fo/harness/migtry.sh: line 10: 14734 Killed                  ( cd $W/b && exec $BIN --port 7601 --bind 127.0.0.1 --cluster-enabled yes --io-model $model $extra > log 2>&1 )
+uring AUTH2: INCR during MIGRATE=2 | reply=[TRYAGAIN a key was written while being migrated, and kept here: 'k:2'. The copies sent to 127.0.0.1:7601 were deleted there; MIGRATE them again] | source value=2 | EXISTS at destination after TRYAGAIN=0 | MIGRATE again (no REPLACE)=OK | destination value=2 | source EXISTS after=ASK 6101 127.0.0.1:7601 -> FAIL
+05:18:02 probe delay0.2 rep2: delay=0.2 stalls=0/10
+05:18:02 probe delay0 rep2: delay=0.0 stalls=0/10
+05:18:35 slowdst rep2: delay=0.2 hold=3.0 timeout_ms=5000 stalled_trials=0/10
+05:18:45 tryagain rep2:
+tokio none: INCR during MIGRATE=2 | reply=[TRYAGAIN a key was written while being migrated, and kept here: 'k:2'. The copies sent to 127.0.0.1:7601 were deleted there; MIGRATE them again] | source value=2 | EXISTS at destination after TRYAGAIN=0 | MIGRATE again (no REPLACE)=OK | destination value=2 | source EXISTS after=ASK 6101 127.0.0.1:7601 -> FAIL
+/home/azureuser/fo/harness/migtry.sh: line 10: 15328 Killed                  ( cd $W/a && KIVIDB_TEST_FAILPOINTS=migrate-before-delete exec $BIN --port 7600 --bind 127.0.0.1 --cluster-enabled yes --io-model $model > log 2>&1 )
+/home/azureuser/fo/harness/migtry.sh: line 10: 15329 Killed                  ( cd $W/b && exec $BIN --port 7601 --bind 127.0.0.1 --cluster-enabled yes --io-model $model $extra > log 2>&1 )
+tokio AUTH: INCR during MIGRATE=2 | reply=[TRYAGAIN a key was written while being migrated, and kept here: 'k:2'. The copies sent to 127.0.0.1:7601 were deleted there; MIGRATE them again] | source value=2 | EXISTS at destination after TRYAGAIN=0 | MIGRATE again (no REPLACE)=OK | destination value=2 | source EXISTS after=ASK 6101 127.0.0.1:7601 -> FAIL
+/home/azureuser/fo/harness/migtry.sh: line 10: 15542 Killed                  ( cd $W/a && KIVIDB_TEST_FAILPOINTS=migrate-before-delete exec $BIN --port 7600 --bind 127.0.0.1 --cluster-enabled yes --io-model $model > log 2>&1 )
+/home/azureuser/fo/harness/migtry.sh: line 10: 15543 Killed                  ( cd $W/b && exec $BIN --port 7601 --bind 127.0.0.1 --cluster-enabled yes --io-model $model $extra > log 2>&1 )
+tokio AUTH2: INCR during MIGRATE=2 | reply=[TRYAGAIN a key was written while being migrated, and kept here: 'k:2'. The copies sent to 127.0.0.1:7601 were deleted there; MIGRATE them again] | source value=2 | EXISTS at destination after TRYAGAIN=0 | MIGRATE again (no REPLACE)=OK | destination value=2 | source EXISTS after=ASK 6101 127.0.0.1:7601 -> FAIL
+/home/azureuser/fo/harness/migtry.sh: line 10: 15701 Killed                  ( cd $W/a && KIVIDB_TEST_FAILPOINTS=migrate-before-delete exec $BIN --port 7600 --bind 127.0.0.1 --cluster-enabled yes --io-model $model > log 2>&1 )
+/home/azureuser/fo/harness/migtry.sh: line 10: 15702 Killed                  ( cd $W/b && exec $BIN --port 7601 --bind 127.0.0.1 --cluster-enabled yes --io-model $model $extra > log 2>&1 )
+uring none: INCR during MIGRATE=2 | reply=[TRYAGAIN a key was written while being migrated, and kept here: 'k:2'. The copies sent to 127.0.0.1:7601 were deleted there; MIGRATE them again] | source value=2 | EXISTS at destination after TRYAGAIN=0 | MIGRATE again (no REPLACE)=OK | destination value=2 | source EXISTS after=ASK 6101 127.0.0.1:7601 -> FAIL
+/home/azureuser/fo/harness/migtry.sh: line 10: 15859 Killed                  ( cd $W/a && KIVIDB_TEST_FAILPOINTS=migrate-before-delete exec $BIN --port 7600 --bind 127.0.0.1 --cluster-enabled yes --io-model $model > log 2>&1 )
+/home/azureuser/fo/harness/migtry.sh: line 10: 15860 Killed                  ( cd $W/b && exec $BIN --port 7601 --bind 127.0.0.1 --cluster-enabled yes --io-model $model $extra > log 2>&1 )
+uring AUTH: INCR during MIGRATE=2 | reply=[TRYAGAIN a key was written while being migrated, and kept here: 'k:2'. The copies sent to 127.0.0.1:7601 were deleted there; MIGRATE them again] | source value=2 | EXISTS at destination after TRYAGAIN=0 | MIGRATE again (no REPLACE)=OK | destination value=2 | source EXISTS after=ASK 6101 127.0.0.1:7601 -> FAIL
+/home/azureuser/fo/harness/migtry.sh: line 10: 16020 Killed                  ( cd $W/a && KIVIDB_TEST_FAILPOINTS=migrate-before-delete exec $BIN --port 7600 --bind 127.0.0.1 --cluster-enabled yes --io-model $model > log 2>&1 )
+/home/azureuser/fo/harness/migtry.sh: line 10: 16021 Killed                  ( cd $W/b && exec $BIN --port 7601 --bind 127.0.0.1 --cluster-enabled yes --io-model $model $extra > log 2>&1 )
+uring AUTH2: INCR during MIGRATE=2 | reply=[TRYAGAIN a key was written while being migrated, and kept here: 'k:2'. The copies sent to 127.0.0.1:7601 were deleted there; MIGRATE them again] | source value=2 | EXISTS at destination after TRYAGAIN=0 | MIGRATE again (no REPLACE)=OK | destination value=2 | source EXISTS after=ASK 6101 127.0.0.1:7601 -> FAIL
+05:18:45 MIGRATE-DONE
+05:18:45 ALL-DONE

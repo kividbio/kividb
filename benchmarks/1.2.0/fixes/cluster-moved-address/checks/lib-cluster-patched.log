@@ -1,0 +1,146 @@
+   Compiling powerfmt v0.2.0
+   Compiling ring v0.17.14
+   Compiling num-conv v0.2.1
+   Compiling time-core v0.1.8
+   Compiling rustix v1.1.4
+   Compiling base64 v0.22.1
+   Compiling bitflags v2.11.0
+   Compiling deranged v0.5.8
+   Compiling linux-raw-sys v0.12.1
+   Compiling tokio v1.50.0
+   Compiling pem v3.0.6
+   Compiling fastrand v2.4.1
+   Compiling time v0.3.47
+   Compiling yasna v0.5.2
+   Compiling tempfile v3.27.0
+   Compiling tokio-uring v0.5.0
+   Compiling rcgen v0.13.2
+   Compiling kividb v1.2.0-rc4 (/home/azureuser/patched)
+    Finished `release` profile [optimized] target(s) in 3m 30s
+     Running unittests src/lib.rs (/home/azureuser/tgt-patched/release/deps/kividb-e6843cfc0771adb4)
+
+running 107 tests
+test cluster::bus::auth::tests::hmac_is_hmac_sha256 ... ok
+test cluster::bus::auth::tests::a_proof_depends_on_the_secret_and_the_nonce ... ok
+test cluster::bus::heartbeat::tests::a_master_is_sure_of_its_slots_once_a_majority_and_its_replicas_say_so ... ok
+test cluster::bus::heartbeat::tests::a_replica_too_long_without_its_master_does_not_stand ... ok
+2026-11-02T01:08:03.775Z 21587 [INFO] Cluster: Slots of this shard are now owned by d8e2be4ba8e3186a57db4ec1e1bede93c03e258e — following it as a replica
+test cluster::bus::auth::tests::only_a_node_with_the_secret_gets_through ... ok
+test cluster::bus::listener::tests::a_forgotten_node_is_not_readmitted_by_ping_or_gossip ... ok
+test cluster::bus::listener::tests::a_master_that_lost_all_its_slots_becomes_a_replica_of_the_new_owner ... ok
+test cluster::bus::listener::tests::a_node_we_cannot_reach_takes_the_address_a_healthy_relay_gives ... ok
+test cluster::bus::listener::tests::a_master_that_keeps_some_slots_stays_a_master ... ok
+test cluster::bus::listener::tests::claims_for_unowned_slots_are_accepted_at_epoch_zero ... ok
+test cluster::bus::listener::tests::a_relayed_address_does_not_replace_a_reachable_one_or_come_from_a_suspect ... ok
+test cluster::bus::listener::tests::empty_sender_address_falls_back_to_the_observed_one ... ok
+test cluster::bus::listener::tests::hard_reset_rejects_an_in_flight_heartbeat_from_the_old_cluster ... ok
+test cluster::bus::listener::tests::failure_reports_from_replicas_do_not_count ... ok
+test cluster::bus::listener::tests::ping_from_an_unknown_node_does_not_add_it ... ok
+test cluster::bus::listener::tests::gossiped_failure_flags_are_reports_not_verdicts ... ok
+test cluster::bus::message::tests::a_header_line_that_never_ends_trips_the_buffer_limit ... ok
+test cluster::bus::message::tests::an_absurd_bulk_length_is_rejected_without_overflow ... ok
+test cluster::bus::message::tests::an_absurd_element_count_is_rejected_not_allocated ... ok
+test cluster::bus::listener::tests::suspect_nodes_are_always_gossiped ... ok
+test cluster::bus::message::tests::announced_client_ports_travel_in_the_flags ... ok
+test cluster::bus::message::tests::fail_round_trip ... ok
+test cluster::bus::message::tests::failover_auth_ack_round_trip ... ok
+test cluster::bus::message::tests::failover_auth_request_round_trip ... ok
+test cluster::bus::message::tests::forced_auth_request_round_trip ... ok
+test cluster::bus::message::tests::garbage_is_an_error_and_never_a_panic ... ok
+test cluster::bus::message::tests::hostnames_travel_where_older_nodes_ignore_them ... ok
+test cluster::bus::message::tests::manual_failover_handshake_round_trip ... ok
+test cluster::bus::message::tests::deep_nesting_is_rejected_without_recursing ... ok
+test cluster::bus::message::tests::offset_query_and_answer_round_trip ... ok
+test cluster::bus::message::tests::meet_round_trip ... ok
+test cluster::bus::message::tests::partial_buffer_returns_none ... ok
+test cluster::bus::message::tests::ping_with_empty_gossip ... ok
+test cluster::bus::message::tests::ping_with_gossip_entries ... ok
+test cluster::bus::message::tests::ping_with_multiple_gossip_entries ... ok
+test cluster::bus::message::tests::ping_with_slot_claims_round_trip ... ok
+test cluster::ddl::tests::a_repeat_is_not_a_failure ... ok
+test cluster::ddl::tests::replies_of_every_shape_are_read_whole ... ok
+test cluster::bus::message::tests::publish_round_trip_is_binary_safe ... ok
+test cluster::migration::tests::a_retried_task_replaces_its_failed_record ... ok
+test cluster::migration::tests::a_fenced_attempt_takes_nothing_over_and_a_takeover_cannot_be_fenced ... ok
+test cluster::migration::tests::a_slot_is_in_one_running_task_at_a_time ... ok
+test cluster::migration::tests::cancel_targets_running_tasks ... ok
+test cluster::migration::tests::only_writes_to_the_migrating_slots_are_forwarded ... ok
+test cluster::migration::tests::slot_ranges_are_pairs_in_range_and_disjoint ... ok
+test cluster::node::tests::generate_returns_valid_id ... ok
+test cluster::node::tests::generated_ids_differ ... ok
+test cluster::node::tests::parse_invalid_hex ... ok
+test cluster::node::tests::parse_invalid_length ... ok
+test cluster::node::tests::parse_uppercase_normalizes ... ok
+test cluster::node::tests::parse_valid_id ... ok
+test cluster::persist::tests::missing_file_returns_none ... ok
+test cluster::persist::tests::slot_range_compaction ... ok
+test cluster::routing::tests::crossslot_detection ... ok
+test cluster::bus::listener::tests::gossip_gets_round_to_every_node ... ok
+test cluster::routing::tests::failed_owner_means_cluster_down ... ok
+test cluster::routing::tests::keyless_command_passthrough ... ok
+test cluster::routing::tests::hash_tag_keeps_keys_together ... ok
+test cluster::routing::tests::partial_coverage_is_cluster_down_unless_allowed ... ok
+test cluster::routing::tests::passthrough_when_bypassed ... ok
+test cluster::routing::tests::migrating_slot_with_split_keys_is_tryagain ... ok
+test cluster::routing::tests::owned_slot ... ok
+test cluster::routing::tests::passthrough_when_disabled ... ok
+test cluster::routing::tests::unassigned_slot ... ok
+test cluster::search::tests::a_reply_without_the_flag_is_one_that_did_not_time_out ... ok
+test cluster::routing::tests::slot_is_computed_from_the_key_not_the_first_argument ... ok
+test cluster::search::tests::only_a_coordinator_that_asks_is_told_whether_a_part_timed_out ... ok
+test cluster::routing::tests::replica_serves_reads_for_its_masters_slots_only_after_readonly ... ok
+test cluster::search::tests::replies_are_read_whole_and_rows_survive_the_trip ... ok
+test cluster::slot::tests::different_keys_usually_different_slots ... ok
+test cluster::slot::tests::empty_key_hashes_to_zero ... ok
+test cluster::slot::tests::empty_tag_does_not_collocate ... ok
+test cluster::slot::tests::hash_tag_basic ... ok
+test cluster::slot::tests::hash_tags_collocate ... ok
+test cluster::slot::tests::key_hash_slot_canonical_foo ... ok
+test cluster::slot::tests::slot_is_always_in_range ... ok
+test cluster::tests::a_candidate_must_be_a_replica_of_the_master_it_wants_to_replace ... ok
+2026-11-02T01:08:03.782Z 21587 [INFO] Cluster: Node a5e4b87e0c539af3a2a52d55eb3ac0b5cbd008ae is reachable again — clearing FAIL
+2026-11-02T01:08:03.782Z 21587 [INFO] Cluster: Node ba3d6731c45beb58ccc86cb0987450124e7a2769 is reachable again — clearing FAIL
+2026-11-02T01:08:03.782Z 21587 [INFO] Cluster: Node c5d36bb0d87e56afb2cd74df18e4d2d054d3567a is reachable again — clearing FAIL
+test cluster::tests::a_failed_slot_owner_is_only_cleared_after_the_failover_window ... ok
+test cluster::tests::a_failed_replica_is_cleared_as_soon_as_it_is_heard_from ... ok
+test cluster::tests::a_failed_master_that_lost_its_slots_is_cleared_at_once ... ok
+2026-11-02T01:08:03.782Z 21587 [WARN] Cluster: This master came back without its dataset (0 keys loaded; no AOF, and no snapshot from a clean shutdown). It serves none of its slots until a replica that holds them takes over, or its replicas answer that they hold nothing either
+2026-11-02T01:08:03.783Z 21587 [WARN] Cluster: This master came back without its dataset (0 keys loaded; no AOF, and no snapshot from a clean shutdown), and has no replica that could hold it: serving what it has
+2026-11-02T01:08:03.783Z 21587 [INFO] Cluster: Replica 10.0.0.2:7001 holds nothing of this master's lost dataset; waiting for 1 more
+2026-11-02T01:08:03.783Z 21587 [WARN] Cluster: This master came back without its dataset (0 keys loaded; no AOF, and no snapshot from a clean shutdown). It serves none of its slots until a replica that holds them takes over, or its replicas answer that they hold nothing either
+2026-11-02T01:08:03.783Z 21587 [INFO] Cluster: Replica 10.0.0.2:7001 holds nothing of this master's lost dataset; waiting for 1 more
+2026-11-02T01:08:03.783Z 21587 [WARN] Cluster: Lost-dataset fence lifted: its replicas hold nothing of it either
+test cluster::tests::a_master_back_without_its_dataset_is_fenced_until_its_replicas_answer ... ok
+2026-11-02T01:08:03.783Z 21587 [WARN] Cluster: Lost-dataset fence lifted: every replica of it has failed: none can take over
+test cluster::tests::a_master_back_without_its_dataset_or_reachable_replicas_serves ... ok
+test cluster::tests::a_replica_does_not_count_its_own_suspicion ... ok
+test cluster::tests::a_node_is_failed_once_a_majority_of_masters_agree ... ok
+test cluster::tests::a_second_replica_of_the_same_master_is_not_voted_for_straight_away ... ok
+test cluster::tests::announce_settings_override_the_bind_address_and_ports ... ok
+test cluster::tests::disabled_state_owns_everything ... ok
+test cluster::tests::enabled_state_owns_nothing_initially ... ok
+test cluster::tests::a_vote_requires_a_failed_master_unless_the_failover_is_manual ... ok
+test cluster::tests::a_two_master_cluster_cannot_fail_a_node_from_one_side ... ok
+test cluster::tests::forgetting_a_node_releases_its_slots_and_bans_it ... ok
+test cluster::tests::hard_reset_assigns_a_new_node_id ... ok
+test cluster::tests::full_coverage_means_ok ... ok
+test cluster::tests::only_slot_owning_masters_vote ... ok
+test cluster::tests::one_vote_per_epoch_and_never_for_a_stale_epoch ... ok
+test cluster::tests::losing_sight_of_a_majority_of_masters_takes_the_cluster_down ... ok
+test cluster::tests::reports_alone_do_not_fail_a_node_we_can_reach ... ok
+test cluster::tests::slot_assignment_round_trip ... ok
+test cluster::tests::quorums_are_a_majority_of_all_slot_owning_masters ... ok
+2026-11-02T01:08:03.787Z 21587 [INFO] Cluster: Learned own address from an outgoing link: 10.1.2.3
+test cluster::tests::wildcard_bind_advertises_no_address_until_one_is_learned ... ok
+test commands::command_docs::tests::cluster_slaves_carries_doc_flags ... ok
+test commands::hotkeys::tests::slots_need_cluster_mode_and_are_validated ... ok
+test config::validate_tests::cluster_mode_warns_about_the_open_bus_and_can_refuse ... ok
+test config::validate_tests::replicaof_is_rejected_in_cluster_mode ... ok
+2026-11-02T01:08:03.787Z 21587 [WARN] Cluster: This master came back without its dataset (0 keys loaded; no AOF, and no snapshot from a clean shutdown). It serves none of its slots until a replica that holds them takes over, or its replicas answer that they hold nothing either
+2026-11-02T01:08:03.787Z 21587 [WARN] Cluster: Lost-dataset fence lifted: it serves no slots any more
+test cluster::tests::the_fence_falls_with_the_slots ... ok
+test cluster::persist::tests::round_trip_empty_master ... ok
+test cluster::persist::tests::round_trip_with_slots ... ok
+
+test result: ok. 107 passed; 0 failed; 0 ignored; 0 measured; 505 filtered out; finished in 0.03s
+

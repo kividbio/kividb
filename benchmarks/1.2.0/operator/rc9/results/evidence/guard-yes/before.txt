@@ -1,0 +1,4 @@
+master g-yes-1 ip <ip>
+g-yes-0 kividb_version:1.2.0-rc9 run_id:000000002f9049ec00000000deadbeee2f9049ed keys=677452 role:slave master_host:<ip> master_link_status:up aof_enabled:1  ack=[aof-ack-after-write yes ]
+g-yes-1 kividb_version:1.2.0-rc9 run_id:0000000036d9717200000000deadbeee36d97173 keys=677520 role:master master_replid:8638662be82dd9cf827898ed61dfe4266ea60465 master_repl_offset:26881093 aof_enabled:1  ack=[aof-ack-after-write yes ]
+--- new pod Ready, operator opdown 07:50:37

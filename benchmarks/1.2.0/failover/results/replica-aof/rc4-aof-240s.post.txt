@@ -1,0 +1,36 @@
+== load stopped 20:51:51
+0s master_repl_offset=6520419887 replica_offset=6520419887 lag=0
+== replica INFO persistence
+aof_enabled:1
+rdb_bgsave_in_progress:0
+aof_rewrite_in_progress:1
+aof_rewrite_scheduled:0
+aof_last_rewrite_time_sec:155
+aof_last_rewrite_time_ms:155622
+aof_last_bgrewrite_status:ok
+aof_current_size:306807899
+aof_base_size:4194632
+aof_lost_records:0
+aof_last_write_status:ok
+aof_acks_before_write:0
+aof_last_cow_size:0
+== replica INFO server
+redis_version:8.10.0
+kividb_version:1.2.0-rc4
+== DBSIZE master 1279290 replica 1279290
+== AOF/data files master
+6618683	/mnt/kv/appendonly.aof
+736840571	/mnt/kv/dump.kdb
+24	/mnt/kv/dump.kdb.gen
+105	/mnt/kv/node.conf
+6	/mnt/kv/pid
+9885	/mnt/kv/server.log
+== AOF/data files replica
+306807899	/mnt/kv/appendonly.aof
+16	/mnt/kv/appendonly.aof.rewrite.tmp
+519501328	/mnt/kv/dump.kdb
+24	/mnt/kv/dump.kdb.gen
+93	/mnt/kv/dump.kdb.repl
+130	/mnt/kv/node.conf
+6	/mnt/kv/pid
+5291	/mnt/kv/server.log

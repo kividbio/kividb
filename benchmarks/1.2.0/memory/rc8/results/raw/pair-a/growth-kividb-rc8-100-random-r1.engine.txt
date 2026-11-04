@@ -1,0 +1,2 @@
+kividb-rc8 plain kividb/kividb:build-082dab3d8929 redis_version:8.10.0 kividb_version:1.2.0-rc8 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]

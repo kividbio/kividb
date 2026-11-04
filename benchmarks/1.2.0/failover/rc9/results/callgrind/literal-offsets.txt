@@ -1,0 +1,6 @@
+rc8 literal at 0x10e654, page offset 0x654:   ACLCONFI        
+rc9 literal at 0x10ebec, page offset 0xbec:   ACLCONFI        
+rc8 literal at 0x111415, page offset 0x415:   BACKUPTa        
+rc9 literal at 0x111ae7, page offset 0xae7:   BACKUPTa        
+rc8 literal at 0x10e631, page offset 0x631:   CLIENTUN        
+rc9 literal at 0x10ebc9, page offset 0xbc9:   CLIENTUN        

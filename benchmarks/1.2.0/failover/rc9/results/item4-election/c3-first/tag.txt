@@ -1,0 +1,2 @@
+tag {a0} slot 3656
+shard A keys 2955187, used_memory 942.92M

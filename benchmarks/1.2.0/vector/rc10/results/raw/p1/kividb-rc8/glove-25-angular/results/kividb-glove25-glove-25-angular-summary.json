@@ -1,0 +1,37 @@
+{
+  "engine": "kividb-glove25",
+  "dataset": "glove-25-angular",
+  "search_results": [
+    {
+      "search_id": 0,
+      "ef": "128",
+      "parallel": 100,
+      "mean_precisions": 0.9647389999999426,
+      "mean_recall": 0.9647389999999426,
+      "recall_p10": 0.9,
+      "mean_mrr": 1.0,
+      "mean_ndcg": 0.9744640832878316,
+      "rps": 33406.529042857976,
+      "mean_time": 0.002926449382499995,
+      "p50_time": 0.0027632335,
+      "p95_time": 0.0038436789999999996,
+      "p99_time": 0.004088808010000001,
+      "client_saturated": false,
+      "saturation_reason": "parallel=100 > 16 cores (advisory)",
+      "oversubscribed": true,
+      "available_cores": 16,
+      "client_cpu_cores_used": 6.948012232415902
+    }
+  ],
+  "precision_summary": {
+    "0.96": {
+      "QPS": 33406.5,
+      "P50 (ms)": 2.763,
+      "P95 (ms)": 3.844,
+      "recall": 0.9647,
+      "mrr": 1.0,
+      "ndcg": 0.9745
+    }
+  },
+  "concurrency_curve": []
+}

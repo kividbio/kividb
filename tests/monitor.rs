@@ -67,7 +67,10 @@ fn wait_for_server(port: u16) -> bool {
 }
 
 fn spawn_server(port: u16) -> std::process::Child {
+    // A directory of its own: one engine to a data directory.
+    let dir = tempfile::tempdir().unwrap().keep();
     std::process::Command::new(kividb_bin())
+        .current_dir(dir)
         .args(["--port", &port.to_string(), "--loglevel", "error"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

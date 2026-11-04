@@ -1,0 +1,96 @@
+install: CRDs + helm install 0c0fb6e 07:20:17 1793690417
+install: operator Available after 19 s 07:20:36 1793690436
+create: shd on rc8, g-yes/g-no on rc9 07:20:44 1793690444
+create: all Running after 35 s 07:21:19 1793690479
+BEGIN upgrade-shd 07:22:40 1793690560
+upgrade-shd spec.image -> 1.2.0-rc9 07:22:55 1793690575
+upgrade-shd all 6 pods on 1.2.0-rc9, Running 07:25:02 1793690702
+STOP upgrade-shd 07:25:22 1793690722
+END upgrade-shd 07:25:29 1793690729
+BEGIN restart-rc9 07:25:41 1793690741
+restart-rc9 DbOps restart 07:25:57 1793690757
+restart-rc9 DbOps Completed 07:28:14 1793690894
+STOP restart-rc9 07:28:34 1793690914
+END restart-rc9 07:28:45 1793690925
+BEGIN failover-rc9 07:28:50 1793690930
+failover-rc9 FAILOVER shd-0-1 07:29:09 1793690949
+failover-rc9 FAILOVER shd-1-1 07:29:34 1793690974
+failover-rc9 FAILOVER shd-2-1 07:29:59 1793690999
+STOP failover-rc9 07:30:42 1793691042
+END failover-rc9 07:30:51 1793691051
+graceful try 1: shd-0-1 07:31:26 1793691086
+BEGIN graceful1 07:31:28 1793691088
+graceful1 cordoned all nodes but vmss000003 07:31:40 1793691100
+graceful1 graceful delete shd-0-1 07:31:40 1793691100
+graceful1 new shd-0-1 on vmss000003, nodes uncordoned 07:31:44 1793691104
+graceful1 shd-0-1 Ready 07:31:56 1793691116
+STOP graceful1 07:33:05 1793691185
+END graceful1 07:33:18 1793691198
+graceful try 2: shd-1-1 07:33:49 1793691229
+BEGIN graceful2 07:33:52 1793691232
+graceful2 cordoned all nodes but vmss000000 07:34:03 1793691243
+graceful2 graceful delete shd-1-1 07:34:03 1793691244
+graceful2 new shd-1-1 on vmss000000, nodes uncordoned 07:34:08 1793691248
+graceful2 shd-1-1 Ready 07:34:20 1793691260
+STOP graceful2 07:35:29 1793691329
+END graceful2 07:35:46 1793691346
+forcedel try 1: BGSAVE on shd-0-0 07:36:18 1793691378
+BEGIN forcedel1 07:36:51 1793691411
+forcedel1 cordoned all nodes but vmss000002 07:37:03 1793691423
+forcedel1 force delete shd-0-0 07:37:03 1793691423
+forcedel1 new shd-0-0 on vmss000002, nodes uncordoned 07:37:06 1793691426
+forcedel1 shd-0-0 Ready 07:37:18 1793691438
+STOP forcedel1 07:38:28 1793691508
+END forcedel1 07:38:46 1793691526
+forcedel try 2: BGSAVE on shd-1-0 07:39:18 1793691558
+BEGIN forcedel2 07:39:51 1793691591
+forcedel2 cordoned all nodes but vmss000003 07:40:03 1793691603
+forcedel2 force delete shd-1-0 07:40:03 1793691603
+forcedel2 new shd-1-0 on vmss000003, nodes uncordoned 07:40:06 1793691606
+forcedel2 shd-1-0 Ready 07:40:17 1793691617
+STOP forcedel2 07:41:28 1793691688
+END forcedel2 07:41:47 1793691707
+forcedel try 3: BGSAVE on shd-2-1 07:42:18 1793691738
+BEGIN forcedel3 07:42:51 1793691771
+forcedel3 cordoned all nodes but vmss000002 07:43:03 1793691783
+forcedel3 force delete shd-2-1 07:43:03 1793691783
+forcedel3 new shd-2-1 on vmss000002, nodes uncordoned 07:43:06 1793691786
+forcedel3 shd-2-1 Ready 07:43:17 1793691797
+STOP forcedel3 07:44:28 1793691868
+END forcedel3 07:44:52 1793691892
+BEGIN sigkill-rc9 07:45:00 1793691900
+sigkill-rc9 SIGKILL shd-0-0 07:45:10 1793691910
+sigkill-rc9 shd-0-0 Ready 07:45:25 1793691925
+STOP sigkill-rc9 07:45:46 1793691946
+END sigkill-rc9 07:46:12 1793691972
+BEGIN reshard-up-rc9 07:46:19 1793691979
+reshard-up-rc9 spec.shards=4 07:46:34 1793691994
+reshard-up-rc9 RebalanceCompleted 07:47:06 1793692026
+reshard-up-rc9 Running with 8 pods 07:47:07 1793692027
+STOP reshard-up-rc9 07:47:30 1793692050
+END reshard-up-rc9 07:47:57 1793692077
+BEGIN reshard-down-rc9 07:48:03 1793692083
+reshard-down-rc9 spec.shards=3 07:48:18 1793692098
+reshard-down-rc9 RebalanceCompleted 07:48:29 1793692109
+reshard-down-rc9 Running with 6 pods 07:48:30 1793692110
+STOP reshard-down-rc9 07:48:51 1793692131
+END reshard-down-rc9 07:49:20 1793692160
+BEGIN guard-yes 07:49:37 1793692177
+guard-yes operator scaled to 0 07:49:52 1793692192
+guard-yes SIGSTOP + force delete + SIGKILL g-yes-1 (pid 14994) 07:49:55 1793692195
+guard-yes new g-yes-1 Ready (<ip>) 07:50:37 1793692237
+guard-yes operator scaled to 1 07:50:38 1793692239
+guard-yes master after: g-yes-1 07:53:02 1793692382
+guard-yes verdict KEPT 07:53:05 1793692385
+STOP guard-yes 07:53:15 1793692395
+END guard-yes 07:53:30 1793692410
+BEGIN guard-no 07:53:34 1793692414
+guard-no operator scaled to 0 07:53:49 1793692429
+guard-no SIGSTOP + force delete + SIGKILL g-no-0 (pid 14032) 07:53:52 1793692432
+guard-no new g-no-0 Ready (<ip>) 07:54:34 1793692474
+guard-no operator scaled to 1 07:54:35 1793692475
+guard-no master after: g-no-1 07:56:57 1793692617
+guard-no verdict FAILED_OVER 07:57:00 1793692620
+STOP guard-no 07:57:10 1793692630
+END guard-no 07:57:26 1793692646
+final read-back 07:57:49 1793692669

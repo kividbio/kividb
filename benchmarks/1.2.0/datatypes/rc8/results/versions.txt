@@ -1,0 +1,20 @@
+# builds
+stable-x86_64-unknown-linux-gnu (active, default)
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+cargo 1.99.1 (5f94df478 2026-08-27)
+BUILT rc8 082dab3d8929c180bccf993835e28992ea054fb5 kividb 1.2.0-rc8 RUSTFLAGS=
+BUILT rc7 598b74d20ec04de5a0ff74001324907562806c3c kividb 1.2.0-rc7 RUSTFLAGS=
+598b74d20ec04de5a0ff74001324907562806c3c
+082dab3d8929c180bccf993835e28992ea054fb5
+a9ea83cbb399ec8e921442caf59ea1a9a4fa8f2e65f561366cddd7d268299cd2  ~/bin/kividb-rc8
+9df033f5191ad06c10750b94ca398c0e041f8d73787a05b04a7b3bb8e8909992  ~/bin/kividb-rc7
+BUILD-DONE
+
+# competitors
+Redis server v=8.10.3 sha=00000000:1 malloc=jemalloc-5.3.0 bits=64 build=a250dcd4967d2ef9
+valkey/valkey:9.1.3 3add1a336a92
+docker.dragonflydb.io/dragonflydb/dragonfly:v2.0.2 061f00b201b5
+memtier_benchmark v=2.5.2 sha=f3ff1793:0 bits=64 libevent=2.1.12-stable openssl=OpenSSL 3.0.13 30 Jan 2024 prometheus=yes
+7.0.0-1017-azure
+Model name:                              Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz
+16

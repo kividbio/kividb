@@ -1,0 +1,4 @@
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+cargo 1.99.1 (5f94df478 2026-08-27)
+valgrind-3.19.0
+redis-benchmark 7.0.15

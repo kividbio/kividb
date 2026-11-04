@@ -1,0 +1,23 @@
+built rc8 (082dab3d, lto=fat) in 311 s
+-rwxr-xr-x 2 root root 87851584 Nov  3 15:43 /target/perf-rc8/release/kividb
+e5dce0a6308abffe8924c698ad295b2dfb28da3c6eead29f424e2d474e28890a  /target/perf-rc8/release/kividb
+kividb 1.2.0-rc8
+GET-100 rc8 3335
+SET-100 rc8 4280
+GET-1K rc8 3847
+SET-1K rc8 4380
+MIX-100 rc8 7621
+INCR rc8 4075
+DEL rc8 4475
+GET-100-TTL rc8 3395
+SET-100-TTL rc8 5643
+INCR-TTL rc8 4131
+DEL-TTL rc8 5018
+GET-100-LRU rc8 3687
+SET-100-LRU rc8 4619
+INCR-LRU rc8 4424
+DEL-LRU rc8 4814
+GET-100-LFU rc8 3898
+SET-100-LFU rc8 4961
+INCR-LFU rc8 4715
+done

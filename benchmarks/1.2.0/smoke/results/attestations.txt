@@ -1,0 +1,31 @@
+## sha256sum -c SHA256SUMS.txt
+./kividb.aarch64.rpm: OK
+./kividb_amd64.deb: OK
+./kividb-linux-x86_64.tar.gz: OK
+./kividb-tls-linux-aarch64.tar.gz: OK
+./kividb-tls-linux-x86_64.tar.gz: OK
+./kividb-lua-linux-aarch64.tar.gz: OK
+./kividb_arm64.deb: OK
+./kividb-full-linux-aarch64.tar.gz: OK
+./kividb-lua-linux-x86_64.tar.gz: OK
+./kividb-linux-aarch64.tar.gz: OK
+./kividb-full-linux-x86_64.tar.gz: OK
+./kividb.x86_64.rpm: OK
+
+## gh attestation verify (subject, exit, ref, commit, run)
+kividb-full-linux-aarch64.tar.gz	exit=0	refs/tags/v1.2.0-rc7 598b74d20ec0 runs/41509100399/attempts/1
+kividb-full-linux-x86_64.tar.gz	exit=0	refs/tags/v1.2.0-rc7 598b74d20ec0 runs/41509100399/attempts/1
+kividb-linux-aarch64.tar.gz	exit=0	refs/tags/v1.2.0-rc7 598b74d20ec0 runs/41509100399/attempts/1
+kividb-linux-x86_64.tar.gz	exit=0	refs/tags/v1.2.0-rc7 598b74d20ec0 runs/41509100399/attempts/1
+kividb-lua-linux-aarch64.tar.gz	exit=0	refs/tags/v1.2.0-rc7 598b74d20ec0 runs/41509100399/attempts/1
+kividb-lua-linux-x86_64.tar.gz	exit=0	refs/tags/v1.2.0-rc7 598b74d20ec0 runs/41509100399/attempts/1
+kividb-tls-linux-aarch64.tar.gz	exit=0	refs/tags/v1.2.0-rc7 598b74d20ec0 runs/41509100399/attempts/1
+kividb-tls-linux-x86_64.tar.gz	exit=0	refs/tags/v1.2.0-rc7 598b74d20ec0 runs/41509100399/attempts/1
+kividb.aarch64.rpm	exit=0	refs/tags/v1.2.0-rc7 598b74d20ec0 runs/41509100399/attempts/1
+kividb.x86_64.rpm	exit=0	refs/tags/v1.2.0-rc7 598b74d20ec0 runs/41509100399/attempts/1
+kividb_amd64.deb	exit=0	refs/tags/v1.2.0-rc7 598b74d20ec0 runs/41509100399/attempts/1
+kividb_arm64.deb	exit=0	refs/tags/v1.2.0-rc7 598b74d20ec0 runs/41509100399/attempts/1
+oci://ghcr.io/kividbio/kividb:v1.2.0-rc7	exit=0	refs/tags/v1.2.0-rc7 598b74d20ec0 runs/41509100399/attempts/1
+oci://ghcr.io/kividbio/kividb:v1.2.0-rc7-lua	exit=0	refs/tags/v1.2.0-rc7 598b74d20ec0 runs/41509100399/attempts/1
+oci://ghcr.io/kividbio/kividb:v1.2.0-rc7-tls	exit=0	refs/tags/v1.2.0-rc7 598b74d20ec0 runs/41509100399/attempts/1
+oci://ghcr.io/kividbio/kividb:v1.2.0-rc7-full	exit=0	refs/tags/v1.2.0-rc7 598b74d20ec0 runs/41509100399/attempts/1

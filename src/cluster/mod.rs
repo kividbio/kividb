@@ -33,6 +33,11 @@ pub use node::{
 pub use routing::{RouteDecision, clusterdown_error, crossslot_error, moved_error, route_command};
 pub use slot::{CLUSTER_SLOTS, crc16, key_hash_slot};
 
+/// How long a slot assigned or removed here by `SETSLOT NODE` or `DELSLOTS`
+/// keeps that assignment whatever a peer claims, unless another command
+/// changes it (see `ClusterState::note_by_hand`).
+pub const BY_HAND_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 use ahash::AHashMap;
 use parking_lot::RwLock;
 use std::path::PathBuf;
@@ -201,9 +206,10 @@ pub struct LostDataset {
 /// The locks below are `parking_lot` locks: a reader queues behind a waiting
 /// writer, so a thread must never take a lock it already holds, read or
 /// write, and a guard must not be kept across an `.await`. Where one thread
-/// holds several, it takes them in this order and no other: `forgotten`,
-/// `save_lock`, `failure_reports`, `nodes`, `slots`, `migrations`, `myself`.
-/// `held_writes` is only ever held alone.
+/// holds several, it takes them in this order and no other: `handoff_holds`,
+/// `forgotten`, `save_lock`, `failure_reports`, `nodes`, `slots`,
+/// `migrations`, `myself`. `held_writes` is held alone, or under
+/// `handoff_holds`.
 /// A temporary guard (`self.nodes.read().get(..)`) is held to the end of
 /// its statement, or of the `match` / `if let` / `for` it heads.
 pub struct ClusterState {
@@ -224,6 +230,10 @@ pub struct ClusterState {
     /// "Reporter believes reportee is failing as of timestamp."
     /// Reports older than 2*node_timeout are discarded as stale.
     pub failure_reports: RwLock<AHashMap<NodeId, AHashMap<NodeId, u64>>>,
+    /// Peers whose address is still the one nodes.conf gave us: none of
+    /// them has reached us since this process started. A node that moved
+    /// while we were down is only reachable at an address a peer relays.
+    pub(crate) unconfirmed_addresses: RwLock<ahash::AHashSet<NodeId>>,
     /// The epoch at which we last cast a FAILOVER_AUTH_ACK. Prevents voting
     /// twice in the same epoch — a key safety property of the Raft-like
     /// election. Persisted to nodes.conf.
@@ -238,6 +248,12 @@ pub struct ClusterState {
     pub migrations: RwLock<AHashMap<u16, MigrationState>>,
     /// Atomic slot migrations (`CLUSTER MIGRATION`), running and recent.
     pub slot_migrations: migration::Registry,
+    /// Slots assigned with `SETSLOT NODE` or removed with `DELSLOTS` here,
+    /// and when: for
+    /// [`BY_HAND_GRACE`] a peer's claim does not change them (see
+    /// [`Self::note_by_hand`]). Taken after `slots` and `migrations`, and
+    /// nothing is taken while it is held.
+    pub by_hand: parking_lot::Mutex<AHashMap<u16, std::time::Instant>>,
     /// Nodes removed with `CLUSTER FORGET`, and until when (Unix ms) they are
     /// refused re-admission.
     pub forgotten: RwLock<AHashMap<NodeId, u64>>,
@@ -263,6 +279,11 @@ pub struct ClusterState {
     /// Writes this master holds until it has made sure it still owns its
     /// slots. See [`Self::hold_writes_until_confirmed`].
     held_writes: parking_lot::Mutex<Option<HeldWrites>>,
+    /// How many atomic slot migrations away from this node hold writes for
+    /// their handoff ([`Self::hold_writes_for_handoff`]). Writes are let go
+    /// when neither they nor [`Self::held_writes`] hold them any more;
+    /// whichever of the two ends last lets them go, under this lock.
+    handoff_holds: parking_lot::Mutex<u32>,
     /// This master serves none of its slots, having been told it was marked
     /// FAIL, until it has made sure it still owns them
     /// ([`Self::note_marked_failed`]).
@@ -322,11 +343,13 @@ impl ClusterState {
             config_path,
             node_timeout_ms,
             failure_reports: RwLock::new(AHashMap::new()),
+            unconfirmed_addresses: RwLock::new(ahash::AHashSet::new()),
             last_vote_epoch: AtomicU64::new(last_vote_epoch),
             election: parking_lot::Mutex::new(None),
             election_pending: AtomicBool::new(false),
             migrations: RwLock::new(AHashMap::new()),
             slot_migrations: migration::Registry::default(),
+            by_hand: parking_lot::Mutex::new(AHashMap::new()),
             forgotten: RwLock::new(AHashMap::new()),
             last_vote_for: parking_lot::Mutex::new(AHashMap::new()),
             hooks: std::sync::OnceLock::new(),
@@ -335,6 +358,7 @@ impl ClusterState {
             serving: AtomicBool::new(false),
             lost: LostDataset::default(),
             held_writes: parking_lot::Mutex::new(None),
+            handoff_holds: parking_lot::Mutex::new(0),
             marked_failed: AtomicBool::new(false),
             require_full_coverage: AtomicBool::new(true),
             replica_validity_factor: AtomicU64::new(10),
@@ -576,6 +600,7 @@ impl ClusterState {
     fn start_the_clock_on_peers(&self) {
         let now = now_ms() + self.node_timeout_ms;
         let me = self.myself();
+        let mut unconfirmed = ahash::AHashSet::new();
         for node in self.nodes.write().values_mut() {
             if node.id == me {
                 continue;
@@ -583,7 +608,9 @@ impl ClusterState {
             node.ping_sent_ms = 0;
             node.pong_received_ms = now;
             node.flags.remove(NodeFlags::PFAIL);
+            unconfirmed.insert(node.id);
         }
+        *self.unconfirmed_addresses.write() = unconfirmed;
         self.failure_reports.write().clear();
     }
 
@@ -648,12 +675,17 @@ impl ClusterState {
     /// `announce_*` are `cluster-announce-ip` / `-port` / `-bus-port`; empty
     /// and zero mean "not set". With no announce IP and a wildcard bind there
     /// is no address to advertise: `0.0.0.0` is not somewhere a peer can
-    /// connect to. The entry falls back to loopback — right for a
-    /// single-machine cluster — and is flagged as a guess, which has two
-    /// effects: outgoing bus messages carry an empty address so each peer
-    /// records the one it actually sees us on, and the guess is replaced with
-    /// the real interface address the first time we reach a peer that is not
-    /// on this machine (see [`Self::learn_self_ip`]).
+    /// connect to. The entry keeps the address it had learnt in an earlier
+    /// run, from nodes.conf, as Redis does, or else falls back to loopback —
+    /// right for a single-machine cluster — and is flagged as a guess, which
+    /// has two effects: outgoing bus messages carry an empty address so each
+    /// peer records the one it actually sees us on, and the guess is replaced
+    /// with the real interface address the first time we reach a peer that
+    /// is not on this machine (see [`Self::learn_self_ip`]).
+    ///
+    /// A restart used to start from loopback whatever nodes.conf said, so a
+    /// node restarted in place gave `127.0.0.1` as its own address in
+    /// `CLUSTER SLOTS` until it next reached a peer, and saved it (#307).
     ///
     /// It used to advertise the loopback guess as fact. Every node of a
     /// multi-host cluster bound to `0.0.0.0` — the default, and the norm in
@@ -673,7 +705,16 @@ impl ClusterState {
         } else if !wildcard {
             (bind.to_string(), false)
         } else {
-            ("127.0.0.1".to_string(), true)
+            let learnt = self
+                .nodes
+                .read()
+                .get(&self.myself())
+                .map(|me| me.ip.clone())
+                .filter(|ip| {
+                    ip.parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| !ip.is_loopback() && !ip.is_unspecified())
+                });
+            (learnt.unwrap_or_else(|| "127.0.0.1".to_string()), true)
         };
         self.self_ip_is_guess.store(guess, Ordering::Relaxed);
         let announced_client = if announce_port != 0 {
@@ -954,10 +995,12 @@ impl ClusterState {
         let fenced = self.fence_holds() || self.marked_failed.load(Ordering::Relaxed);
         let ok = ok && !fenced;
         self.state_ok.store(ok, Ordering::Relaxed);
-        self.serving.store(
-            !fenced && (ok || !self.require_full_coverage.load(Ordering::Relaxed)),
-            Ordering::Relaxed,
-        );
+        let serving = !fenced && (ok || !self.require_full_coverage.load(Ordering::Relaxed));
+        if self.serving.swap(serving, Ordering::Relaxed) && !serving {
+            // A write routed while this node served, and not yet in the write
+            // gate, is routed again there, and refused (#337).
+            crate::pause::routes_moved();
+        }
     }
 
     // ── A master back without its dataset ────────────────────────────────────
@@ -1210,22 +1253,89 @@ impl ClusterState {
         Ok(())
     }
 
-    /// Release a slot we own. Errors if the slot isn't currently owned by us.
+    /// Remove a slot from this node's view of the cluster: CLUSTER DELSLOTS.
+    /// See [`Self::release_slots`].
     pub fn release_slot(&self, slot: u16) -> Result<(), String> {
+        self.release_slots(&[slot]).map(|_| ())
+    }
+
+    /// Remove `list` from this node's view of the cluster, whoever owns each
+    /// slot, as Redis's DELSLOTS does. Errors if one of them is unassigned
+    /// here already, and then changes none.
+    ///
+    /// Only this node's view changes. The owner's next claim of a slot it
+    /// still holds wins it back here, unless ADDSLOTS or SETSLOT gives it to
+    /// another node first. That is how `redis-cli --cluster fix` closes a slot
+    /// an interrupted reshard left open: it picks one owner, and on each other
+    /// node that has keys in the slot, deletes the slot and sets it importing
+    /// from that owner, before moving the keys there. A node refused a slot
+    /// another node owned, and the keys already moved stayed where no client
+    /// was sent for them (#295). An IMPORTING state of the slot goes with
+    /// it, as in Redis: the node is no longer taking the slot from anyone.
+    ///
+    /// For [`BY_HAND_GRACE`] after, a peer's claim of the slot does not take
+    /// it back (see [`Self::note_by_hand`]). Fix sends `MULTI`, `DELSLOTS`, `ADDSLOTS`, `BUMPEPOCH`,
+    /// `EXEC` to the owner it picks. In Redis nothing comes between the
+    /// commands of a transaction; here the cluster bus applies claims on a
+    /// thread of its own, and DELSLOTS saves `nodes.conf` before ADDSLOTS
+    /// runs: the old owner's claim, arriving in that moment, took the slot
+    /// back, and ADDSLOTS failed with `Slot N is already busy`.
+    pub fn release_slots(&self, list: &[u16]) -> Result<usize, String> {
         if !self.enabled {
             return Err("This instance has cluster support disabled".into());
         }
-        if slot as usize >= CLUSTER_SLOTS {
+        if let Some(slot) = list.iter().find(|&&s| s as usize >= CLUSTER_SLOTS) {
             return Err(format!("Invalid slot {slot}"));
         }
+        // `slots` before `migrations`, as everywhere (see `ClusterState`).
         let mut slots = self.slots.write();
-        match slots[slot as usize] {
-            Some(owner) if owner == self.myself() => {
-                slots[slot as usize] = None;
-                Ok(())
+        if let Some(slot) = list.iter().find(|&&s| slots[s as usize].is_none()) {
+            return Err(format!("Slot {slot} is already unassigned"));
+        }
+        let mut migrations = self.migrations.write();
+        for &slot in list {
+            slots[slot as usize] = None;
+            if matches!(
+                migrations.get(&slot),
+                Some(MigrationState::Importing { .. })
+            ) {
+                migrations.remove(&slot);
             }
-            Some(_) => Err(format!("Slot {slot} is owned by another node")),
-            None => Err(format!("Slot {slot} is already unassigned")),
+        }
+        // A write routed here before this, and not yet in the write gate, is
+        // routed again there: it used to run, on a slot this node no longer
+        // serves (#337).
+        crate::pause::routes_moved();
+        self.note_by_hand(list.iter().copied());
+        Ok(list.len())
+    }
+
+    /// Note that `slots` were just assigned (`SETSLOT NODE`) or removed
+    /// (`DELSLOTS`) here: for [`BY_HAND_GRACE`],
+    /// [`Self::apply_peer_slot_claims`] leaves them as they are.
+    ///
+    /// Not `ADDSLOTS`: that is how a cluster is first laid out, and a
+    /// failover straight after must not wait.
+    ///
+    /// A peer's claim can be older than the command. `redis-cli --cluster
+    /// reshard` moves a slot with `SETSLOT NODE` to the target, then the
+    /// source, then the others. A heartbeat the source sent just before its
+    /// `SETSLOT` still claims the slot, at the source's epoch. Heartbeats go
+    /// once a second, so the target's own new epoch, taken from the highest
+    /// it has heard of, can be below the source's latest, after the source
+    /// was itself the target of the previous reshard. That claim then took
+    /// the slot from the target, which no longer claimed it, while the
+    /// source had given it away: no node served it, and the next reshard or
+    /// fix found `Not all 16384 slots are covered`. The same claim arriving
+    /// between fix's `DELSLOTS` and `ADDSLOTS` failed the `ADDSLOTS` ("Slot
+    /// N is already busy"). After the grace the claim is gone, and claims
+    /// are weighed by epoch as before.
+    fn note_by_hand(&self, slots: impl IntoIterator<Item = u16>) {
+        let mut by_hand = self.by_hand.lock();
+        let now = std::time::Instant::now();
+        by_hand.retain(|_, at| now.duration_since(*at) < BY_HAND_GRACE);
+        for slot in slots {
+            by_hand.insert(slot, now);
         }
     }
 
@@ -1258,7 +1368,7 @@ impl ClusterState {
         Ok((end - start + 1) as usize)
     }
 
-    /// Release a contiguous range. Atomic in the same sense.
+    /// Release a contiguous range: [`Self::release_slots`], all or nothing.
     pub fn release_slot_range(&self, start: u16, end: u16) -> Result<usize, String> {
         if !self.enabled {
             return Err("This instance has cluster support disabled".into());
@@ -1266,21 +1376,7 @@ impl ClusterState {
         if start > end {
             return Err(format!("Invalid range {start}-{end}"));
         }
-        if (end as usize) >= CLUSTER_SLOTS {
-            return Err(format!("Invalid slot {end}"));
-        }
-        let mut slots = self.slots.write();
-        for i in start..=end {
-            match slots[i as usize] {
-                Some(owner) if owner == self.myself() => {}
-                Some(_) => return Err(format!("Slot {i} is owned by another node")),
-                None => return Err(format!("Slot {i} is already unassigned")),
-            }
-        }
-        for i in start..=end {
-            slots[i as usize] = None;
-        }
-        Ok((end - start + 1) as usize)
+        self.release_slots(&(start..=end).collect::<Vec<u16>>())
     }
 
     /// Wipe all slot ownership records on this node. Used by FLUSHSLOTS.
@@ -1294,6 +1390,8 @@ impl ClusterState {
         for s in slots.iter_mut() {
             *s = None;
         }
+        // As for DELSLOTS (`release_slots`).
+        crate::pause::routes_moved();
     }
 
     /// Set our own node's config_epoch. Used by SET-CONFIG-EPOCH (only
@@ -1417,10 +1515,18 @@ impl ClusterState {
             // waited for good.
             let mut slots = self.slots.write();
             let migrations = self.migrations.read();
+            let by_hand = self.by_hand.lock();
             for claim in claims {
                 for slot in claim.start..=claim.end {
                     let i = slot as usize;
                     if i >= CLUSTER_SLOTS || slots[i] == Some(owner_id) {
+                        continue;
+                    }
+                    // Just assigned or removed here by hand: see `note_by_hand`.
+                    if by_hand
+                        .get(&slot)
+                        .is_some_and(|at| at.elapsed() < BY_HAND_GRACE)
+                    {
                         continue;
                     }
                     // A slot we are importing is ours to finalise with
@@ -1448,6 +1554,18 @@ impl ClusterState {
                     }
                 }
             }
+        }
+        if shard_lost_slots || !lost.is_empty() {
+            // A write routed here before this, and not yet in the write gate,
+            // is routed again there (#337). Before the keys of the slots are
+            // dropped, and before a handoff's pause is ended below
+            // (`follow_new_master`): that is a change of the same flag, so a
+            // write that finds the pause over finds this too. In an atomic
+            // slot migration that drains this node, the destination's claim
+            // can come before its answer to the `TAKEOVER`; a write held
+            // between its routing and the gate then ran here once the pause
+            // ended, and was lost with the resync.
+            crate::pause::routes_moved();
         }
         if !changed {
             return;
@@ -1497,7 +1615,9 @@ impl ClusterState {
         self.election_pending.store(false, Ordering::SeqCst);
         // If we were holding writes, for a manual failover or until we knew
         // whether we still owned our slots, the answer is in: let them go, to
-        // be answered with a redirect to the new master.
+        // be answered with a redirect to the new master. (The caller has
+        // moved the routes: a write held between its routing and the gate is
+        // routed again there.)
         *self.held_writes.lock() = None;
         crate::pause::clear_pause();
         if self.marked_failed.swap(false, Ordering::Relaxed) {
@@ -2181,15 +2301,26 @@ impl ClusterState {
         }
         self.slots.write()[slot as usize] = Some(new_owner);
         self.migrations.write().remove(&slot);
+        self.note_by_hand([slot]);
         Ok(())
     }
 
     /// Take ownership of `slots` at the end of an atomic migration to this
     /// node. One new epoch covers them all, so the claim wins over the
     /// previous owner's wherever the two meet.
+    ///
+    /// Saved in the cluster config before anything else sees it: a client
+    /// is not served the slots, nor do they go out in this node's claims,
+    /// until the config says they are this node's. They used to be taken
+    /// first and saved after; when the save failed, the destination of a
+    /// migration gave them back, having served writes to them meanwhile,
+    /// lost when it gave them back, and its claim could have reached the
+    /// source in that time, which then dropped its keys of them, and owned
+    /// them in nobody's view (#337). Not saved, nothing changes.
     pub fn take_over_slots(&self, slots: impl Iterator<Item = u16>) -> std::io::Result<()> {
         let t = std::time::Instant::now();
         let mut steps: Vec<(&str, u128)> = Vec::new();
+        let slots: Vec<u16> = slots.collect();
         let me = self.myself();
         let new_epoch = self.bump_epoch();
         steps.push(("epoch", t.elapsed().as_millis()));
@@ -2199,19 +2330,19 @@ impl ClusterState {
             node.config_epoch = new_epoch;
         }
         steps.push(("nodes", t.elapsed().as_millis()));
-        {
+        let saved = persist::save_from_state_then(self, &slots, || {
             let mut owners = self.slots.write();
             let mut migrations = self.migrations.write();
-            for slot in slots {
+            for &slot in &slots {
                 owners[slot as usize] = Some(me);
                 migrations.remove(&slot);
             }
-        }
-        steps.push(("slots", t.elapsed().as_millis()));
-        self.refresh_state();
-        steps.push(("refresh", t.elapsed().as_millis()));
-        let saved = persist::save_from_state(self);
+        });
         steps.push(("save", t.elapsed().as_millis()));
+        if saved.is_ok() {
+            self.refresh_state();
+            steps.push(("refresh", t.elapsed().as_millis()));
+        }
         if t.elapsed() > std::time::Duration::from_millis(100) {
             log_info!("Cluster: slow takeover, ms at each step: {steps:?}");
         }
@@ -2229,6 +2360,11 @@ impl ClusterState {
                 migrations.remove(&slot);
             }
         }
+        // A write routed here before this, and held up before the write gate
+        // until the handoff lets writes go, is routed again there (#331).
+        // Before the caller ends the handoff's pause: that is a change of the
+        // same flag, so a write that finds the pause over finds this too.
+        crate::pause::routes_moved();
         // The caller saves, once writes are no longer paused.
         self.refresh_state();
     }
@@ -2254,6 +2390,9 @@ impl ClusterState {
     /// was lost.
     pub fn hold_writes_until_confirmed(&self, reason: HoldReason, ask_from_ms: u64) {
         let pause = reason == HoldReason::ManualFailover;
+        // Not to be let go by a handoff that ends in between (see
+        // `end_handoff_hold`).
+        let _holds = self.handoff_holds.lock();
         if pause {
             crate::pause::hold_writes();
         } else {
@@ -2286,7 +2425,14 @@ impl ClusterState {
     }
 
     /// Let the writes held go, if they are held, and log `why`.
+    ///
+    /// Not while an atomic slot migration away from this node holds them
+    /// for its handoff as well ([`Self::hold_writes_for_handoff`]): that
+    /// lets them go when it ends. A manual failover that ended in the middle
+    /// of one let them go, and what was written then was not sent to the
+    /// destination, and was lost with the slots (#337).
     pub fn release_held_writes(&self, why: &str) {
+        let holds = self.handoff_holds.lock();
         let Some(held) = self.held_writes.lock().take() else {
             return;
         };
@@ -2299,7 +2445,28 @@ impl ClusterState {
         if self.marked_failed.swap(false, Ordering::Relaxed) {
             self.refresh_state();
         }
-        if held.paused && crate::pause::handoff() {
+        if held.paused && *holds == 0 && crate::pause::handoff() {
+            crate::pause::clear_pause();
+        }
+    }
+
+    /// Hold writes for the handoff of an atomic slot migration away from
+    /// this node, until [`Self::end_handoff_hold`]. See `migration::migrate_out`.
+    pub(crate) fn hold_writes_for_handoff(&self) {
+        let mut holds = self.handoff_holds.lock();
+        *holds += 1;
+        crate::pause::hold_writes();
+    }
+
+    /// A handoff that [`Self::hold_writes_for_handoff`] held writes for has
+    /// ended, however it ended: let them go, unless they have been let go
+    /// already (`CLIENT UNPAUSE`, or this master's replica took its slots
+    /// over), or another handoff or a manual failover (#242) still holds
+    /// them, which lets them go itself.
+    pub(crate) fn end_handoff_hold(&self) {
+        let mut holds = self.handoff_holds.lock();
+        *holds = holds.saturating_sub(1);
+        if *holds == 0 && crate::pause::handoff() && !self.writes_held() {
             crate::pause::clear_pause();
         }
     }
@@ -2432,6 +2599,8 @@ impl ClusterState {
                 *s = None;
             }
         }
+        // As for DELSLOTS (`release_slots`).
+        crate::pause::routes_moved();
         // Clear peer table — keep only ourselves.
         {
             let mut nodes = self.nodes.write();
@@ -2585,6 +2754,196 @@ mod tests {
         let b = add_master(&cs, 10923..=16383);
         cs.refresh_state();
         (cs, a, b)
+    }
+
+    // ── A write routed before a slot left (#331, #337) ───────────────────
+
+    /// Each way this node stops serving a slot moves its routes: a write
+    /// routed before, and not yet in the write gate, is routed again there.
+    /// DELSLOTS, DELSLOTSRANGE, FLUSHSLOTS, a reset, and this node no longer
+    /// serving (marked FAIL here). They did not, and such a write ran.
+    /// (The count is the process's: another test can only move it further.)
+    #[test]
+    fn every_way_a_slot_leaves_this_node_moves_its_routes() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        cs.claim_slot_range(0, 16383).unwrap();
+        cs.refresh_state();
+        assert!(cs.is_serving());
+        let moved = |what: &str, change: &dyn Fn()| {
+            let routed = crate::pause::routes_now();
+            change();
+            assert!(
+                crate::pause::routes_moved_since(routed),
+                "{what} did not move the routes"
+            );
+        };
+        moved("DELSLOTS", &|| {
+            cs.release_slots(&[5]).unwrap();
+        });
+        moved("DELSLOTSRANGE", &|| {
+            cs.release_slot_range(10, 20).unwrap();
+        });
+        moved("a node no longer serving", &|| {
+            cs.hold_writes_until_confirmed(HoldReason::MarkedFailed, now_ms() + 60_000);
+            assert!(!cs.is_serving());
+        });
+        moved("FLUSHSLOTS", &|| cs.flush_slots());
+        cs.claim_slot_range(0, 100).unwrap();
+        moved("CLUSTER RESET", &|| cs.soft_reset());
+    }
+
+    /// Slots taken over at the end of a migration are not this node's, nor
+    /// claimed by it, until the cluster config says they are. When the
+    /// config could not be saved, they used to be served and claimed in the
+    /// meantime, and then given back (#337).
+    #[test]
+    fn slots_taken_over_are_not_taken_until_they_are_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-yet").join("nodes.conf");
+        let cs = ClusterState::new_enabled(Some(path.clone()), 15000);
+        let me = cs.myself();
+        let other = add_master(&cs, 0..=99);
+        assert!(cs.take_over_slots(0..=99).is_err());
+        assert_eq!(cs.slot_owner(0), Some(other));
+        assert_eq!(cs.slot_owner(99), Some(other));
+        assert!(cs.my_slot_claims().is_empty());
+
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        cs.take_over_slots(0..=99).unwrap();
+        assert_eq!(cs.slot_owner(0), Some(me));
+        assert_eq!(cs.my_slot_claims().len(), 1);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let mine = saved
+            .lines()
+            .find(|l| l.contains("myself"))
+            .expect("this node's line");
+        assert!(mine.ends_with(" 0-99"), "{mine}");
+    }
+
+    /// A manual failover that ends while an atomic slot migration's handoff
+    /// holds writes leaves them held; the handoff lets them go when it ends.
+    /// And the other way round. The failover used to let them go in the
+    /// middle of the handoff (#337).
+    #[test]
+    fn writes_are_let_go_when_the_last_hold_on_them_ends() {
+        let _pause = crate::pause::TEST_LOCK.lock();
+        crate::pause::clear_pause();
+        let cs = ClusterState::new_enabled(None, 15000);
+        let ask = now_ms() + 60_000;
+
+        cs.hold_writes_for_handoff();
+        cs.hold_writes_until_confirmed(HoldReason::ManualFailover, ask);
+        cs.release_held_writes("the test");
+        assert!(
+            crate::pause::handoff(),
+            "a failover let a handoff's writes go"
+        );
+        cs.end_handoff_hold();
+        assert!(!crate::pause::handoff());
+
+        cs.hold_writes_until_confirmed(HoldReason::ManualFailover, ask);
+        cs.hold_writes_for_handoff();
+        cs.end_handoff_hold();
+        assert!(
+            crate::pause::handoff(),
+            "a handoff let a failover's writes go"
+        );
+        cs.release_held_writes("the test");
+        assert!(!crate::pause::handoff());
+
+        // Two handoffs at once: the second to end lets them go.
+        cs.hold_writes_for_handoff();
+        cs.hold_writes_for_handoff();
+        cs.end_handoff_hold();
+        assert!(crate::pause::handoff());
+        cs.end_handoff_hold();
+        assert!(!crate::pause::handoff());
+    }
+
+    // ── DELSLOTS ─────────────────────────────────────────────────────────
+
+    /// A slot just given to a node by `SETSLOT NODE` keeps its owner for a
+    /// moment whatever a peer claims: the old owner's last heartbeat, sent
+    /// before its own `SETSLOT`, can claim it at a higher epoch than the new
+    /// owner's. That claim used to take the slot from the new owner, and no
+    /// node served it. Afterwards, claims are weighed by epoch as before.
+    #[test]
+    fn a_slot_set_by_hand_is_not_taken_by_an_older_claim() {
+        let (cs, a, _b) = three_master_cluster();
+        let me = cs.myself();
+        // `a` had slot 5461 and is a reshard's source; this node, the target,
+        // has just been given it.
+        cs.finalize_slot(5461, me).unwrap();
+        let stale = [crate::cluster::bus::SlotClaim {
+            start: 5461,
+            end: 5461,
+            epoch: 1_000_000,
+        }];
+        cs.apply_peer_slot_claims(a, &stale);
+        assert_eq!(cs.slot_owner(5461), Some(me));
+
+        let past = std::time::Instant::now()
+            .checked_sub(BY_HAND_GRACE * 2)
+            .unwrap();
+        for at in cs.by_hand.lock().values_mut() {
+            *at = past;
+        }
+        cs.apply_peer_slot_claims(a, &stale);
+        assert_eq!(cs.slot_owner(5461), Some(a));
+    }
+
+    /// DELSLOTS clears a slot from this node's view whoever owns it, and
+    /// with it the slot's IMPORTING state, as in Redis (#295). Only a slot that
+    /// is unassigned here already is refused, and then nothing changes.
+    #[test]
+    fn delslots_clears_a_slot_whoever_owns_it() {
+        let (cs, a, b) = three_master_cluster();
+        // Another node's slot, open here as an interrupted reshard leaves it.
+        cs.set_importing(5461, a).unwrap();
+        cs.release_slot(5461).unwrap();
+        assert_eq!(cs.slot_owner(5461), None);
+        assert_eq!(cs.migration_state(5461), None);
+        assert_eq!(
+            cs.release_slot(5461).unwrap_err(),
+            "Slot 5461 is already unassigned"
+        );
+
+        // All or nothing.
+        assert_eq!(
+            cs.release_slot_range(5460, 5462).unwrap_err(),
+            "Slot 5461 is already unassigned"
+        );
+        assert_eq!(
+            cs.release_slots(&[10923, 5461]).unwrap_err(),
+            "Slot 5461 is already unassigned"
+        );
+        assert_eq!(cs.slot_owner(5460), Some(cs.myself()));
+        assert_eq!(cs.slot_owner(5462), Some(a));
+        assert_eq!(cs.slot_owner(10923), Some(b));
+        assert_eq!(cs.release_slot_range(5462, 5470), Ok(9));
+        assert_eq!(cs.slot_owner(5470), None);
+
+        // The owner's own claim does not take them back at once: the
+        // ADDSLOTS that follows in `redis-cli --cluster fix`'s transaction
+        // must find them free.
+        let claim = [crate::cluster::bus::SlotClaim {
+            start: 5461,
+            end: 5470,
+            epoch: 1,
+        }];
+        cs.apply_peer_slot_claims(a, &claim);
+        assert_eq!(cs.slot_owner(5461), None);
+        assert!(cs.claim_slot(5461).is_ok());
+        assert_eq!(cs.slot_owner(5461), Some(cs.myself()));
+        // After the grace, the owner's claim wins the rest back.
+        let past = std::time::Instant::now()
+            .checked_sub(BY_HAND_GRACE * 2)
+            .unwrap();
+        for at in cs.by_hand.lock().values_mut() {
+            *at = past;
+        }
+        cs.apply_peer_slot_claims(a, &claim);
+        assert!((5462..=5470).all(|s| cs.slot_owner(s) == Some(a)));
     }
 
     // ── Quorum ───────────────────────────────────────────────────────────

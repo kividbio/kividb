@@ -1,0 +1,12 @@
+tag {a0}; A keys 299544
+round 1: CLUSTER FAILOVER on 10.91.1.12:7002 -> OK; swapped in 0.1 s; demoted 10.91.1.11:7001 resync: partial [This node's dataset is offset 40642300;Partial resync: continuing from offset 40642300;]
+round 2: CLUSTER FAILOVER on 10.91.1.11:7001 -> OK; swapped in 0.1 s; demoted 10.91.1.12:7002 resync: partial [This node's dataset is offset 48953887;Partial resync: continuing from offset 48953887;]
+round 3: CLUSTER FAILOVER on 10.91.1.12:7002 -> OK; swapped in 0.1 s; demoted 10.91.1.11:7001 resync: partial [This node's dataset is offset 57215192;Partial resync: continuing from offset 57215192;]
+round 4: CLUSTER FAILOVER on 10.91.1.11:7001 -> OK; swapped in 0.1 s; demoted 10.91.1.12:7002 resync: partial [This node's dataset is offset 65759753;Partial resync: continuing from offset 65759753;]
+round 5: CLUSTER FAILOVER on 10.91.1.12:7002 -> OK; swapped in 0.2 s; demoted 10.91.1.11:7001 resync: partial [This node's dataset is offset 73892705;Partial resync: continuing from offset 73892705;]
+round 6: CLUSTER FAILOVER on 10.91.1.11:7001 -> OK; swapped in 0.1 s; demoted 10.91.1.12:7002 resync: partial [This node's dataset is offset 82253406;Partial resync: continuing from offset 82253406;]
+round 7: CLUSTER FAILOVER on 10.91.1.12:7002 -> OK; swapped in 0.1 s; demoted 10.91.1.11:7001 resync: partial [This node's dataset is offset 90881752;Partial resync: continuing from offset 90881752;]
+round 8: CLUSTER FAILOVER on 10.91.1.11:7001 -> OK; swapped in 0.1 s; demoted 10.91.1.12:7002 resync: partial [This node's dataset is offset 99290497;Partial resync: continuing from offset 99290497;]
+round 9: CLUSTER FAILOVER on 10.91.1.12:7002 -> OK; swapped in 0.1 s; demoted 10.91.1.11:7001 resync: partial [This node's dataset is offset 107304222;Partial resync: continuing from offset 107304222;]
+round 10: CLUSTER FAILOVER on 10.91.1.11:7001 -> OK; swapped in 0.1 s; demoted 10.91.1.12:7002 resync: partial [This node's dataset is offset 115580785;Partial resync: continuing from offset 115580785;]
+kividb: 10 partial of 10

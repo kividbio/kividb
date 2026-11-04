@@ -1,0 +1,60 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 29K of event 'armv8_pmuv3_0/cycles/P'
+# Event count (approx.): 81455579556
+#
+# Overhead  Command          Shared Object      Symbol                                               
+# ........  ...............  .................  .....................................................
+#
+     2.47%  server           [kernel.kallsyms]  [k] handle_softirqs
+     2.34%  server           [nf_conntrack]     [k] __nf_conntrack_find_get
+     2.18%  server           server             [.] dictFindLinkInternal.lto_priv.0
+     2.15%  server           [kernel.kallsyms]  [k] el0_svc
+     1.87%  server           [kernel.kallsyms]  [k] _raw_spin_lock
+     1.77%  server           server             [.] dictGetSomeKeys
+     1.46%  server           [nf_conntrack]     [k] nf_conntrack_tcp_packet
+     1.35%  server           server             [.] kvGetKey
+     1.21%  server           [nf_tables]        [k] nft_do_chain
+     1.20%  server           server             [.] processInputBuffer
+     1.17%  server           [kernel.kallsyms]  [k] _raw_spin_lock_bh
+     1.09%  server           server             [.] evictionPoolPopulate
+     1.03%  server           [mlx5_core]        [k] mlx5e_poll_tx_cq
+     1.03%  server           server             [.] readQueryFromClient
+     1.02%  server           [nf_conntrack]     [k] tcp_in_window
+     1.00%  server           server             [.] writeToClient
+     0.98%  server           [kernel.kallsyms]  [k] __tcp_transmit_skb
+     0.96%  server           [kernel.kallsyms]  [k] __pi_memset_generic
+     0.95%  server           [kernel.kallsyms]  [k] kmem_cache_alloc_node_noprof
+     0.93%  server           [kernel.kallsyms]  [k] __arch_copy_to_user
+     0.85%  server           [nf_conntrack]     [k] nf_conntrack_in
+     0.84%  server           server             [.] call
+     0.83%  server           [kernel.kallsyms]  [k] _raw_spin_unlock_irqrestore
+     0.81%  server           [kernel.kallsyms]  [k] tcp_recvmsg_locked
+     0.80%  server           [kernel.kallsyms]  [k] tcp_sendmsg_locked
+     0.77%  server           server             [.] processCommand
+     0.76%  server           [mlx5_core]        [k] mlx5e_napi_poll
+     0.72%  server           [kernel.kallsyms]  [k] skb_attempt_defer_free
+     0.71%  server           [kernel.kallsyms]  [k] sock_poll
+     0.65%  server           [kernel.kallsyms]  [k] __fget_files
+     0.62%  server           [kernel.kallsyms]  [k] aa_inet_msg_perm
+     0.61%  server           [kernel.kallsyms]  [k] epi_fget.isra.0
+     0.61%  server           [kernel.kallsyms]  [k] check_heap_object
+     0.60%  server           [kernel.kallsyms]  [k] ep_send_events
+     0.57%  server           server             [.] zmalloc_usable
+     0.56%  server           [kernel.kallsyms]  [k] vfs_read
+     0.56%  server           [mlx5_core]        [k] mlx5e_rx_cq_process_basic_cqe_comp
+     0.55%  server           [kernel.kallsyms]  [k] __local_bh_enable_ip
+     0.54%  server           server             [.] __aarch64_ldadd8_relax
+     0.54%  server           server             [.] handleClientsWithPendingWrites
+     0.54%  server           [kernel.kallsyms]  [k] mod_memcg_state
+     0.53%  server           [kernel.kallsyms]  [k] __alloc_skb
+     0.53%  server           [kernel.kallsyms]  [k] get_random_u16
+     0.52%  server           server             [.] performEvictions
+     0.52%  server           server             [.] stringObjectLen
+     0.51%  server           server             [.] updateClientMemUsageAndBucket
+     0.51%  server           [mlx5_core]        [k] mlx5e_accel_tx_begin
+     0.50%  server           [kernel.kallsyms]  [k] ip_finish_output2
+     0.49%  server           server             [.] addReplyBulk

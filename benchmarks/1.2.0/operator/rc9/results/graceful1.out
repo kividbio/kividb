@@ -1,0 +1,10 @@
+BEGIN graceful1 07:31:28
+graceful1 cordoned all nodes but vmss000003 07:31:40
+graceful1 graceful delete shd-0-1 07:31:40
+pod "shd-0-1" deleted from e2e namespace
+graceful1 new shd-0-1 on vmss000003, nodes uncordoned 07:31:44
+graceful1 shd-0-1 Ready 07:31:56
+END graceful1 07:33:18
+acked 544704 errors 0 win [] slow 0 []
+errkinds Counter()
+checked 545314 missing 0 wrong 0 readErr 0 bySec {} dbsize 545314 ex {}

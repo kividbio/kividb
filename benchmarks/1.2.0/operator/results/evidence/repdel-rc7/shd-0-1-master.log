@@ -1,0 +1,7 @@
+2026-11-02T20:52:03.449Z 1 [INFO] Replication: uring: replica disconnected
+2026-11-02T20:52:08.188Z 1 [WARN] Cluster: Node 658d508fcd7ceeadc945fbc4dd70d038ef30ebd1 marked FAIL (reported by a1ef059d3573dcf6bc7596e3032a5c28277d3b44)
+2026-11-02T20:52:27.621Z 1 [INFO] Replication: Partial resync for 10.244.3.192:59222: continuing from offset 9750612 (279285 bytes of backlog)
+2026-11-02T20:52:28.621Z 1 [INFO] Cluster: Node 658d508fcd7ceeadc945fbc4dd70d038ef30ebd1 is reachable again — clearing FAIL
+2026-11-02T20:54:16.226Z 1 [INFO] Cluster: handover of slots 4096-5461: writes paused 3 ms (in-flight writes 0,          last of the stream 0, the destination's takeover 3)
+2026-11-02T20:54:16.342Z 1 [INFO] Cluster: Slots 4096-5461 migrated to c9b43c92410f411229b099979d2b9ae58a0e5834 (writes paused 78 ms)
+2026-11-02T20:55:45.140Z 1 [INFO] Cluster: Slots 4096-5461 imported from c9b43c92410f411229b099979d2b9ae58a0e5834 (taken over in 3 ms)

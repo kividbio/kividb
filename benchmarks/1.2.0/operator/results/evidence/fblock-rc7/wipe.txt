@@ -1,0 +1,9 @@
+total 44596
+drwxrwsr-x 3 root   ubuntu     4096 Nov  2 20:41 .
+drwxr-xr-x 1 root   root       4096 Nov  2 20:40 ..
+-rw-r--r-- 1 ubuntu ubuntu 35678222 Nov  2 21:17 appendonly.aof
+-rw-r--r-- 1 ubuntu ubuntu  9948298 Nov  2 20:41 dump.kdb
+-rw-r--r-- 1 ubuntu ubuntu       24 Nov  2 20:41 dump.kdb.gen
+-rw-r--r-- 1 ubuntu ubuntu      105 Nov  2 20:41 dump.kdb.repl
+drwxrws--- 2 root   ubuntu    16384 Nov  2 20:21 lost+found
+wiped

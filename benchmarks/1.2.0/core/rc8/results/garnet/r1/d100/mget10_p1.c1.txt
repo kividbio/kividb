@@ -1,0 +1,30 @@
+Json file ~/results/garnet/r1/d100/mget10_p1.c1.json created...
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 5%,   1 secs] 15 threads 40 conns:      414805 ops,  413915 (avg:  413915) ops/sec, 520.62MB/sec (avg: 520.62MB/sec),  1.44 (avg:  1.44) msec latency[RUN #1 10%,   2 secs] 15 threads 40 conns:      815945 ops,  401050 (avg:  407489) ops/sec, 504.44MB/sec (avg: 512.54MB/sec),  1.49 (avg:  1.47) msec latency[RUN #1 15%,   3 secs] 15 threads 40 conns:     1220189 ops,  404146 (avg:  406375) ops/sec, 508.33MB/sec (avg: 511.13MB/sec),  1.48 (avg:  1.47) msec latency[RUN #1 20%,   4 secs] 15 threads 40 conns:     1630676 ops,  410389 (avg:  407378) ops/sec, 516.18MB/sec (avg: 512.40MB/sec),  1.46 (avg:  1.47) msec latency[RUN #1 25%,   5 secs] 15 threads 40 conns:     2045280 ops,  413956 (avg:  408695) ops/sec, 520.67MB/sec (avg: 514.05MB/sec),  1.44 (avg:  1.46) msec latency[RUN #1 30%,   6 secs] 15 threads 40 conns:     2455846 ops,  410267 (avg:  408957) ops/sec, 516.03MB/sec (avg: 514.38MB/sec),  1.46 (avg:  1.46) msec latency[RUN #1 35%,   7 secs] 15 threads 40 conns:     2864904 ops,  408960 (avg:  408957) ops/sec, 514.39MB/sec (avg: 514.38MB/sec),  1.46 (avg:  1.46) msec latency[RUN #1 40%,   8 secs] 15 threads 40 conns:     3273352 ops,  408352 (avg:  408881) ops/sec, 513.62MB/sec (avg: 514.29MB/sec),  1.46 (avg:  1.46) msec latency[RUN #1 45%,   9 secs] 15 threads 40 conns:     3690722 ops,  417277 (avg:  409814) ops/sec, 524.85MB/sec (avg: 515.46MB/sec),  1.43 (avg:  1.46) msec latency[RUN #1 50%,  10 secs] 15 threads 40 conns:     4111054 ops,  420242 (avg:  410856) ops/sec, 528.58MB/sec (avg: 516.77MB/sec),  1.42 (avg:  1.46) msec latency[RUN #1 55%,  11 secs] 15 threads 40 conns:     4519677 ops,  408162 (avg:  410611) ops/sec, 513.38MB/sec (avg: 516.46MB/sec),  1.47 (avg:  1.46) msec latency[RUN #1 60%,  12 secs] 15 threads 40 conns:     4938276 ops,  418499 (avg:  411268) ops/sec, 526.38MB/sec (avg: 517.29MB/sec),  1.43 (avg:  1.45) msec latency[RUN #1 65%,  13 secs] 15 threads 40 conns:     5344960 ops,  406587 (avg:  410908) ops/sec, 511.40MB/sec (avg: 516.84MB/sec),  1.47 (avg:  1.46) msec latency[RUN #1 70%,  14 secs] 15 threads 40 conns:     5752702 ops,  407636 (avg:  410675) ops/sec, 512.72MB/sec (avg: 516.54MB/sec),  1.47 (avg:  1.46) msec latency[RUN #1 75%,  15 secs] 15 threads 40 conns:     6168092 ops,  415287 (avg:  410982) ops/sec, 522.34MB/sec (avg: 516.93MB/sec),  1.44 (avg:  1.46) msec latency[RUN #1 80%,  16 secs] 15 threads 40 conns:     6580653 ops,  412468 (avg:  411075) ops/sec, 518.80MB/sec (avg: 517.05MB/sec),  1.45 (avg:  1.45) msec latency[RUN #1 85%,  17 secs] 15 threads 40 conns:     6994684 ops,  413879 (avg:  411240) ops/sec, 520.57MB/sec (avg: 517.25MB/sec),  1.45 (avg:  1.45) msec latency[RUN #1 90%,  18 secs] 15 threads 40 conns:     7397776 ops,  402985 (avg:  410781) ops/sec, 506.87MB/sec (avg: 516.68MB/sec),  1.48 (avg:  1.46) msec latency[RUN #1 95%,  19 secs] 15 threads 40 conns:     7812115 ops,  414231 (avg:  410963) ops/sec, 521.02MB/sec (avg: 516.91MB/sec),  1.44 (avg:  1.46) msec latency[RUN #1 100%,  20 secs] 15 threads 40 conns:     8228183 ops,  417730 (avg:  411300) ops/sec, 525.42MB/sec (avg: 517.33MB/sec),  1.43 (avg:  1.45) msec latency[RUN #1 100%,  20 secs]  0 threads 40 conns:     8228216 ops,  417730 (avg:  411301) ops/sec, 525.42MB/sec (avg: 517.33MB/sec),  1.43 (avg:  1.45) msec latency
+
+Writing Full Run command HDR latency histogram results to ~/results/garnet/r1/d100/mget10_p1.c1_FULL_RUN_1.txt...
+Writing Full Run command HDR latency histogram results in HistogramLogProcessor format to ~/results/garnet/r1/d100/mget10_p1.c1_FULL_RUN_1.hgrm...
+Writing MGET command HDR latency histogram results to ~/results/garnet/r1/d100/mget10_p1.c1_MGET_command_run_1.txt...
+Writing MGET command HDR latency histogram results in HistogramLogProcessor format to ~/results/garnet/r1/d100/mget10_p1.c1_MGET_command_run_1.hgrm...
+
+CPU Utilization Summary
+  Total CPU time:   251.877s  (user 95.122s, sys 156.755s)
+  Wall time:        20.012s
+  Cores used:       12.586   (avg 83.9% across 15 worker threads)
+  Peak utilization: 1277.3%
+Saving JSON output file: ~/results/garnet/r1/d100/mget10_p1.c1.json
+Json file closed.
+15        Threads
+40        Connections per thread
+20        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Mgets      411302.30   4113022.98         0.00         1.45470         0.83100         7.87100        12.41500    529748.05 
+Totals     411302.30   4113022.98         0.00         1.45470         0.83100         7.87100        12.41500   1059496.11 
+rc=0

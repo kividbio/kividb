@@ -1,0 +1,5 @@
+1793714036.380368869 reshard-start round 1 src-shard=3000 dst-shard=8000: 128 slots (0-127) from 10.81.1.11:7001 (8a05d5514d657a04eec0dfbb1c9d07c457183c5f, 566737 keys) to 10.81.1.12:7001 (702fb397ca13fc1b03281acdd41e4dc9bb2d9722) with plain redis-cli
+1793714142.735327498 reshard-end round 1 exit=0 after 106.32 s: slots begun=128, TRYAGAIN=0, ERR=0: 
+1793714144.437074705 reshard-check round 1: open-on-source=[] open-slots-lines=0 covered=1 err-lines=0 moved-slots=128
+1793714155.056887310 reshard-done round 1 cluster-ok after 0.20 s
+1793714155.264408254 events-done

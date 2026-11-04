@@ -1,0 +1,10 @@
+cmdstat_cluster|addslots:calls=1,usec=1472,usec_per_call=1472.00,rejected_calls=0,failed_calls=0
+cmdstat_cluster|getkeysinslot:calls=6404,usec=1228793207,usec_per_call=191879.01,rejected_calls=0,failed_calls=0
+cmdstat_cluster|info:calls=4240,usec=3416497,usec_per_call=805.78,rejected_calls=0,failed_calls=0
+cmdstat_cluster|meet:calls=1,usec=22,usec_per_call=22.00,rejected_calls=0,failed_calls=0
+cmdstat_cluster|nodes:calls=23,usec=7422,usec_per_call=322.70,rejected_calls=0,failed_calls=0
+cmdstat_cluster|set-config-epoch:calls=1,usec=628,usec_per_call=628.00,rejected_calls=0,failed_calls=0
+cmdstat_cluster|setslot:calls=384,usec=46919395,usec_per_call=122185.92,rejected_calls=0,failed_calls=0
+cmdstat_cluster|slots:calls=3444,usec=1297467,usec_per_call=376.73,rejected_calls=0,failed_calls=0
+cmdstat_cluster|syncslots:calls=1,usec=103,usec_per_call=103.00,rejected_calls=0,failed_calls=0
+cmdstat_migrate:calls=6276,usec=8976332,usec_per_call=1430.26,rejected_calls=0,failed_calls=0,slowlog_count=26,slowlog_time_ms_sum=1114,slowlog_time_ms_max=72

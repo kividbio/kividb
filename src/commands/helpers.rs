@@ -609,7 +609,8 @@ pub fn spawn_active_expire_task(
     // Where the keys it expires are told (see `expiry`).
     crate::expiry::register(&store, repl_state, hub_tx);
     crate::vector::register_index_store(&store, &index_store);
-    // Whatever was loaded at startup that has field TTLs.
+    // Whatever the store already holds that has field TTLs. At startup that
+    // is nothing yet: the dataset is loaded after this, and rescanned then.
     crate::field_expiry::rescan(&store);
     let parts = expiry_threads();
     for part in 0..parts {
@@ -632,7 +633,14 @@ pub fn spawn_active_expire_task(
                 // keys and fields that come due meanwhile go once the pause
                 // is over. Nor while a dataset is being loaded: the load
                 // says what is gone, by the `DEL`s in it (`expiry::Loading`).
-                if crate::pause::expiry_deferred() || crate::expiry::loading() {
+                // Nor once a shutdown has ended the write stream: the keys
+                // that come due go after the restart.
+                if crate::pause::expiry_deferred()
+                    || crate::expiry::loading()
+                    || target
+                        .as_ref()
+                        .is_some_and(crate::expiry::Target::stream_closed)
+                {
                     continue;
                 }
                 let started = std::time::Instant::now();

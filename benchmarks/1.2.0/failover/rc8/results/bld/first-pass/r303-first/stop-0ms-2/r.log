@@ -1,0 +1,65 @@
+2026-11-03T05:14:30.285Z 12006 [WARN] /tmp/r303l/kividb.conf: line 1: 'save' is accepted but has no effect: KiviDB does not snapshot on a schedule — use `appendonly yes`, or BGSAVE
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc8 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc8
+  * Mode           : standalone
+  * OS             : linux x86_64
+  * Memory         : 62GiB available
+  * CPUs           : 16 cores detected
+  * Listening on   : 127.0.0.1:7200
+  * Worker threads : 14
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-03T05:14:30.334Z 12006 [INFO] KiviDB 1.2.0-rc8 starting: pid 12006, default build, config file '/tmp/r303l/kividb.conf'
+2026-11-03T05:14:30.334Z 12006 [INFO] I/O model      : io_uring
+2026-11-03T05:14:30.335Z 12006 [INFO] Shards per DB  : 128
+2026-11-03T05:14:30.335Z 12006 [INFO] I/O model      : io_uring
+2026-11-03T05:14:30.336Z 12006 [INFO] Replication: Connecting to master 127.0.0.1:7100...
+2026-11-03T05:14:30.336Z 12006 [INFO] Ready to accept connections on 127.0.0.1:7200
+2026-11-03T05:14:30.337Z 12006 [INFO] Replication: Full resync from c5df190e3f8d248d67c1a8bd8cd63744eeb298bb offset=0
+2026-11-03T05:14:30.337Z 12006 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-03T05:14:30.338Z 12006 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-03T05:14:30.338Z 12006 [INFO] Replication: AOF is on — rebasing it onto the synced dataset
+2026-11-03T05:14:30.362Z 12006 [INFO] AOF: rebased onto dump.kdb (generation 1) — log is now the delta
+2026-11-03T05:14:30.363Z 12006 [INFO] Replication: Synced with 127.0.0.1:7100. Entering command stream.
+2026-11-03T05:14:40.115Z 12006 [WARN] Replication: Master closed the connection — reconnecting
+2026-11-03T05:14:41.120Z 12006 [INFO] Replication: Connecting to master 127.0.0.1:7100...
+2026-11-03T05:14:41.121Z 12006 [WARN] Replication: Replication link to 127.0.0.1:7100 failed: connect: Connection refused (os error 111) — retrying every 1s
+2026-11-03T05:15:05.409Z 12006 [INFO] Replication: Connecting to master 127.0.0.1:7101...
+2026-11-03T05:15:05.410Z 12006 [INFO] Replication: Partial resync: continuing from offset 48105841 — no dataset transfer
+2026-11-03T05:15:05.410Z 12006 [INFO] Replication: Synced with 127.0.0.1:7101. Entering command stream.

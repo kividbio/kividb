@@ -1,0 +1,11 @@
+trial 1: PING NOT answered after 3.004s; MIGRATE replied b'+OK\r\n'
+trial 2: PING NOT answered after 3.003s; MIGRATE replied b'+OK\r\n'
+trial 3: PING NOT answered after 3.003s; MIGRATE replied b'+OK\r\n'
+trial 4: PING NOT answered after 3.004s; MIGRATE replied b'+OK\r\n'
+trial 5: PING NOT answered after 3.003s; MIGRATE replied b'+OK\r\n'
+trial 6: PING NOT answered after 3.003s; MIGRATE replied b'+OK\r\n'
+trial 7: PING NOT answered after 3.004s; MIGRATE replied b'+OK\r\n'
+trial 8: PING NOT answered after 3.003s; MIGRATE replied b'+OK\r\n'
+trial 9: PING NOT answered after 3.003s; MIGRATE replied b'+OK\r\n'
+trial 10: PING NOT answered after 3.004s; MIGRATE replied b'+OK\r\n'
+delay=0.2 stalls=10/10

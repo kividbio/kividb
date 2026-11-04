@@ -29,7 +29,8 @@ pub fn record_lost_aof_record() {
 /// Runtime AOF toggle. Set by CONFIG SET appendonly.
 /// The AOF writer task is always running — this flag gates whether
 /// commands are sent to it. Flipping to false drains the channel
-/// naturally; flipping to true immediately starts routing writes.
+/// naturally; flipping to true immediately starts routing writes, so
+/// the log is opened first (see [`open_log`]).
 pub static AOF_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 // ── Preamble framing ─────────────────────────────────────────────────────────
@@ -300,6 +301,39 @@ struct Log {
 
 static LOG: parking_lot::Mutex<Option<Log>> = parking_lot::const_mutex(None);
 
+/// The queue, while no log is open: the AOF has been off since the start.
+/// See [`open_log`].
+static UNOPENED: parking_lot::Mutex<Option<mpsc::UnboundedReceiver<Vec<u8>>>> =
+    parking_lot::const_mutex(None);
+
+/// Open the log, if it is not open yet: `CONFIG SET appendonly yes` on a
+/// server started with the AOF off. Call before the flag goes up, so that a
+/// record logged once it is up has a file to go to. A file that cannot be
+/// opened is an error for the caller, not an exit: the AOF stays off.
+pub fn open_log() -> std::io::Result<()> {
+    let mut log = LOG.lock();
+    if log.is_some() {
+        return Ok(());
+    }
+    let mut unopened = UNOPENED.lock();
+    let Some(rx) = unopened.take() else {
+        return Err(std::io::Error::other("the AOF writer has not started yet"));
+    };
+    match open_aof() {
+        Ok(file) => {
+            *log = Some(Log { rx, file });
+            Ok(())
+        }
+        Err(e) => {
+            *unopened = Some(rx);
+            Err(std::io::Error::new(
+                e.kind(),
+                format!("{AOF_PATH} cannot be opened for appending: {e}"),
+            ))
+        }
+    }
+}
+
 /// Wakes the writer thread: a record or a barrier has been queued. Kept as a
 /// permit if it is busy, so nothing queued is left behind.
 static QUEUED: std::sync::LazyLock<tokio::sync::Notify> =
@@ -311,12 +345,26 @@ static QUEUED: std::sync::LazyLock<tokio::sync::Notify> =
 /// connection that sent the record writes it before it replies (see
 /// [`written`]), and woken, the thread took the lock first and left the
 /// connection waiting to be woken in turn — a quarter of the writes a
-/// second. What no reply waits for (an expiry's delete, a replica's stream)
-/// is written with the next connection's, or by the writer's next sync, a
-/// second at most.
+/// second. What no reply waits for (an expiry's delete) is written with the
+/// next connection's, or by the writer's next sync, a second at most. A
+/// replica's stream has no connection's to go with: its applier wakes the
+/// writer itself, once a batch ([`stream_applied`]).
 #[inline]
 pub fn records_queued() {
     if !acks_wait() {
+        QUEUED.notify_one();
+    }
+}
+
+/// A replica has applied a batch of its master's stream. Its records have no
+/// reply waiting for them to write them, and a read-only replica takes no
+/// writes of its own whose replies would: the writer thread writes them. Left to the
+/// writer's sync once a second, a replica under sustained writes fell behind
+/// its master, its queue (and with it its memory) grew by the second, and
+/// its checkpoints, queued behind the backlog, did not finish for minutes.
+#[inline]
+pub fn stream_applied() {
+    if WRITER_RUNNING.load(Ordering::Acquire) {
         QUEUED.notify_one();
     }
 }
@@ -560,15 +608,26 @@ pub async fn start_aof_writer(rx: mpsc::UnboundedReceiver<Vec<u8>>) {
     let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel::<()>(1);
     let _ = FLUSH_TX.set(flush_tx);
 
-    // A server asked to keep an append-only file that cannot open one must
-    // not run: it would accept writes and keep none of them. (This used to be
-    // a panic in this task alone — the server carried on, serving, with
-    // nothing being logged.)
-    let file = match open_aof() {
-        Ok(file) => file,
-        Err(e) => fatal_persistence(&format!("{AOF_PATH} cannot be opened for appending: {e}")),
-    };
-    *LOG.lock() = Some(Log { rx, file });
+    if AOF_ENABLED.load(Ordering::Relaxed) {
+        // A server asked to keep an append-only file that cannot open one must
+        // not run: it would accept writes and keep none of them. (This used to be
+        // a panic in this task alone — the server carried on, serving, with
+        // nothing being logged.)
+        let file = match open_aof() {
+            Ok(file) => file,
+            Err(e) => fatal_persistence(&format!("{AOF_PATH} cannot be opened for appending: {e}")),
+        };
+        *LOG.lock() = Some(Log { rx, file });
+        *UNOPENED.lock() = None;
+    } else {
+        // With the AOF off, no file is opened or needed until `CONFIG SET
+        // appendonly yes` (see [`open_log`]). Opened whatever the setting, it
+        // was made in every data directory, and one that could not be written
+        // stopped a server that was never going to write it (#47).
+        let mut log = LOG.lock();
+        *log = None;
+        *UNOPENED.lock() = Some(rx);
+    }
     WRITER_RUNNING.store(true, Ordering::Release);
 
     // Whatever survived startup (an AOF that was just replayed, or nothing) is
@@ -683,6 +742,7 @@ fn write_queued(
     let mut wrote = false;
     let mut released = false;
     let mut barriers = Vec::new();
+    let mut drained = 0usize;
     loop {
         let mut batch = Vec::new();
         let mark = match first.take() {
@@ -699,11 +759,28 @@ fn write_queued(
             },
             None => drain_into(&mut batch, rx, &mut barriers),
         };
+        // A batch that stopped at the cap left more queued. Going on with it
+        // here, not on the next pass: what no reply waits for (a replica's
+        // stream) may have no next pass but the second's sync, and one batch
+        // a second fell behind 40 MB/s of writes, with the queue, and the
+        // turn-over of a checkpoint behind it, growing without end. Not for
+        // ever, though: with writes coming faster than the disk takes them
+        // the queue never empties, and whoever holds the log would keep it,
+        // the second's sync waiting behind. Past a budget, the writer thread
+        // is woken to go on, and the sync gets its turn.
+        let more_queued = batch.len() >= MAX_AOF_BATCH_BYTES;
+        drained += batch.len();
         wrote |= !batch.is_empty();
         write_batch(file, &batch);
         released |= !barriers.is_empty();
         release_barriers(&mut barriers);
         let Some(generation) = mark else {
+            if more_queued {
+                if drained < MAX_AOF_PASS_BYTES {
+                    continue;
+                }
+                QUEUED.notify_one();
+            }
             return (wrote, released);
         };
         let result = perform_turn_over(file);
@@ -938,6 +1015,10 @@ fn sync_dir() -> std::io::Result<()> {
 /// single write. Capped so one burst cannot hand the kernel an arbitrarily
 /// large buffer; whatever is left stays queued and goes out on the next pass.
 const MAX_AOF_BATCH_BYTES: usize = 4 * 1024 * 1024;
+
+/// How much one pass over the queue writes, at most, before it lets the log
+/// go (see [`write_queued`]): about a second of a fast disk's writes.
+const MAX_AOF_PASS_BYTES: usize = 64 * 1024 * 1024;
 
 /// How long the writer stays away from its queue after a write. It adds this
 /// much, at most, to how long a record written under load waits to reach
@@ -1650,6 +1731,24 @@ fn classify_tail(rest: &[u8]) -> Tail {
         }
     }
 
+    // Zeros to the end of the file: what a power loss leaves where the last
+    // writes were. The file system recorded the file's new length, and the
+    // data never reached the disk (ext4 commits the size first). Those
+    // writes were never synced, so cut off with whatever record they end;
+    // a server refused to start over them. Zeros with anything after them
+    // are not a tail: a hole in the middle of the log is damage.
+    let end = rest
+        .iter()
+        .rposition(|&b| b != 0)
+        .map_or(0, |last| last + 1);
+    if end < rest.len() {
+        return if end == 0 {
+            Tail::Truncated
+        } else {
+            classify_tail(&rest[..end])
+        };
+    }
+
     if rest.first() != Some(&b'*') {
         return Tail::Corrupt;
     }
@@ -1793,8 +1892,11 @@ pub fn replay_aof(
     // replayed after `t` as an INCR of a missing key, `1` with no time to
     // live, for good. The preamble's keys too, past their time or not. And no key is
     // swept meanwhile, by the expiry threads, which run from before the load.
+    // Nor does a `PEXPIREAT` whose moment has come delete its key: it sets
+    // it, and the writes after it go into the key (`expiry::replay`).
     let _hold = crate::expiry::hold();
     let _loading = crate::expiry::Loading::start();
+    let _replay = crate::expiry::replay();
     let buf = std::fs::read(path)?;
     let mut stats = ReplayStats {
         bytes: buf.len() as u64,
@@ -1963,6 +2065,9 @@ pub struct LocalRecovery {
     /// file was replayed on top of it. Only then does a resync point saved
     /// beside the dump describe what was loaded.
     pub exact_dump: bool,
+    /// The fingerprint of the `dump.kdb` that was loaded, if one was: what a
+    /// point or marker saved beside it must match (#303).
+    pub dump_fingerprint: Option<crate::replication::DumpFingerprint>,
 }
 
 /// Load `dump.kdb` (or `dump.rdb`) first, then replay the AOF on top.
@@ -1993,6 +2098,7 @@ pub fn recover_local(
         index_names: Vec::new(),
         hnsw_loaded: false,
         exact_dump: false,
+        dump_fingerprint: None,
     };
 
     // `preload-file`: load exactly this, and nothing else. An operator who
@@ -2030,9 +2136,10 @@ pub fn recover_local(
 
     if kdb_path.exists() {
         log_info!("Found dump.kdb — loading native snapshot");
-        match crate::snapshot::load_snapshot("dump.kdb") {
-            Ok(loaded) => {
+        match crate::replication::load_dump("dump.kdb") {
+            Ok((loaded, fingerprint)) => {
                 recovery.exact_dump = true;
+                recovery.dump_fingerprint = Some(fingerprint);
                 let crate::snapshot::LoadedSnapshot {
                     dbs,
                     index_schemas,
@@ -2475,6 +2582,42 @@ mod replay_parse_tests {
         }
     }
 
+    /// A power loss leaves zeros where the last, unsynced, writes were: the
+    /// file's length reached the disk and its data did not. That is a
+    /// truncation, after a whole record or in the middle of one; zeros with
+    /// something after them are a hole, and damage.
+    #[test]
+    fn zeros_to_the_end_of_the_file_are_a_truncation() {
+        let whole = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$5\r\nvalue\r\n";
+        assert_eq!(classify_tail(&[0u8; 316]), Tail::Truncated);
+        for cut in 1..whole.len() {
+            let mut torn = whole[..cut].to_vec();
+            torn.extend_from_slice(&[0u8; 64]);
+            assert_eq!(classify_tail(&torn), Tail::Truncated, "cut at {cut}");
+        }
+        let mut hole = vec![0u8; 64];
+        hole.extend_from_slice(whole);
+        assert_eq!(classify_tail(&hole), Tail::Corrupt);
+        let mut damaged = b"not a record".to_vec();
+        damaged.extend_from_slice(&[0u8; 64]);
+        assert_eq!(classify_tail(&damaged), Tail::Corrupt);
+    }
+
+    /// Replayed, a log ending in zeros loads every whole record and is cut
+    /// where the zeros start.
+    #[test]
+    fn a_log_ending_in_zeros_is_cut_where_they_start() {
+        let mut buf = enc(&["SET", "a", "1"]);
+        buf.extend_from_slice(&enc(&["SET", "b", "2"]));
+        let valid = buf.len();
+        buf.extend_from_slice(b"*3\r\n$3\r\nSE");
+        buf.extend_from_slice(&[0u8; 4096]);
+        let (commands, consumed) = parse_aof_commands(&buf);
+        assert_eq!(commands.len(), 2);
+        assert_eq!(consumed, valid);
+        assert_eq!(classify_tail(&buf[consumed..]), Tail::Truncated);
+    }
+
     fn enc(parts: &[&str]) -> Vec<u8> {
         let mut v = format!("*{}\r\n", parts.len()).into_bytes();
         for p in parts {
@@ -2825,5 +2968,309 @@ mod record_group_tests {
         // A script that writes nothing queues nothing.
         drop(RecordGroup::begin(&sent));
         assert_eq!(sent.0.lock().len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod backlog_tests {
+    use super::*;
+
+    /// A queue holding more than one batch is written whole in one call: a
+    /// replica's stream, with no reply to write it, has only the writer's
+    /// passes, and one batch a pass fell behind sustained writes.
+    #[test]
+    fn everything_queued_is_written_not_one_batch_of_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("appendonly.aof");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("open");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let record = vec![b'x'; 64 * 1024];
+        let records = 3 * MAX_AOF_BATCH_BYTES / record.len() + 7;
+        for _ in 0..records {
+            tx.send(record.clone()).expect("send");
+        }
+        let (wrote, released) = write_queued(&mut file, &mut rx, None);
+        assert!(wrote);
+        assert!(!released);
+        assert!(rx.try_recv().is_err(), "nothing is left queued");
+        let len = std::fs::metadata(&path).expect("metadata").len();
+        assert_eq!(len, (records * record.len()) as u64);
+    }
+
+    /// One pass lets the log go after its budget, so that a queue fed
+    /// faster than the disk takes it does not keep the second's sync out;
+    /// the rest goes on the next.
+    #[test]
+    fn a_pass_stops_at_its_budget_and_the_next_takes_the_rest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("appendonly.aof");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("open");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let record = vec![b'x'; MAX_AOF_BATCH_BYTES];
+        let records = MAX_AOF_PASS_BYTES / record.len() + 3;
+        for _ in 0..records {
+            tx.send(record.clone()).expect("send");
+        }
+        write_queued(&mut file, &mut rx, None);
+        let len = std::fs::metadata(&path).expect("metadata").len();
+        assert_eq!(len, MAX_AOF_PASS_BYTES as u64, "one pass writes its budget");
+        write_queued(&mut file, &mut rx, None);
+        assert!(rx.try_recv().is_err(), "the next pass takes the rest");
+        let len = std::fs::metadata(&path).expect("metadata").len();
+        assert_eq!(len, (records * record.len()) as u64);
+    }
+}
+
+/// A deadline the log gave a key, or a hash field, and the writes made to
+/// it after that while it lived: replayed once the deadline has passed.
+#[cfg(test)]
+mod past_deadline_replay_tests {
+    use super::*;
+    use crate::commands::helpers::{delete_key_if_expired, is_expired, now_ms};
+    use crate::store::{Store, ValueRef};
+
+    fn record(parts: &[&str]) -> Vec<u8> {
+        let parts: Vec<Vec<u8>> = parts.iter().map(|p| p.as_bytes().to_vec()).collect();
+        crate::resp::write::encode_resp_command(&parts)
+    }
+
+    /// `records`, written to an AOF and replayed into a new store.
+    fn replayed(records: &[Vec<&str>]) -> Store {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("appendonly.aof");
+        let log: Vec<u8> = records.iter().flat_map(|r| record(r)).collect();
+        std::fs::write(&path, log).expect("write");
+        let store = crate::store::new_store(1);
+        let index_store = crate::vector::new_index_store();
+        let dict_store = crate::vector::new_dict_store();
+        let wait_table = std::sync::Arc::new(crate::wait_table::WaitTable::new());
+        let ts_index = crate::store::new_ts_index();
+        let config = std::sync::Arc::new(crate::config::Config::default());
+        let (compaction_tx, _compaction_rx) = crate::vector::new_compaction_channel();
+        let repl_state = std::sync::Arc::new(crate::replication::ReplState::new_master());
+        let stats = replay_aof(
+            &path.to_string_lossy(),
+            &store,
+            &index_store,
+            &dict_store,
+            &wait_table,
+            &ts_index,
+            &config,
+            &compaction_tx,
+            &repl_state,
+            false,
+        )
+        .expect("replay");
+        assert_eq!(stats.errors, 0, "every record applied");
+        store
+    }
+
+    fn expires(store: &Store, key: &str) -> Option<u64> {
+        crate::store::get_shard(&store[0], key).read().expires(key)
+    }
+
+    fn hash_fields(store: &Store, key: &str) -> Vec<String> {
+        let shard = crate::store::get_shard(&store[0], key);
+        let map = shard.read();
+        let mut fields: Vec<String> = match map.peek_expiring(key) {
+            Some((ValueRef::Hash(h), _)) => h.read().keys().cloned().collect(),
+            Some((ValueRef::HashEx(h), _)) => h.read().fields.keys().cloned().collect(),
+            other => panic!(
+                "{key} is not a hash: {:?}",
+                other.map(|(v, _)| v.type_name())
+            ),
+        };
+        fields.sort();
+        fields
+    }
+
+    fn string(store: &Store, key: &str) -> Vec<u8> {
+        let shard = crate::store::get_shard(&store[0], key);
+        let map = shard.read();
+        match map.peek_expiring(key) {
+            Some((ValueRef::String(b), _)) => b.to_vec(),
+            _ => panic!("{key} is not a string"),
+        }
+    }
+
+    fn list_len(store: &Store, key: &str) -> usize {
+        let shard = crate::store::get_shard(&store[0], key);
+        let map = shard.read();
+        match map.peek_expiring(key) {
+            Some((ValueRef::List(l), _)) => l.read().len(),
+            _ => panic!("{key} is not a list"),
+        }
+    }
+
+    /// `HSET h f0 v0`, `PEXPIREAT h t`, `HSET h f1 v1`, `t` gone: the
+    /// replay deleted `h` at its `PEXPIREAT`, and the `HSET` made it again
+    /// of `f1` alone, with no time to live, for good. The same of a string
+    /// and a list. Now each keeps its deadline and every write, and is past
+    /// its time once the replay is over.
+    #[test]
+    fn a_deadline_that_has_passed_is_set_and_the_writes_after_it_go_into_the_key() {
+        let past = (now_ms() - 5_000).to_string();
+        let store = replayed(&[
+            vec!["SELECT", "0"],
+            vec!["HSET", "h", "f0", "v0"],
+            vec!["PEXPIREAT", "h", &past],
+            vec!["HSET", "h", "f1", "v1"],
+            vec!["SET", "s", "v"],
+            vec!["PEXPIREAT", "s", &past],
+            vec!["APPEND", "s", "x"],
+            vec!["RPUSH", "l", "a"],
+            vec!["PEXPIREAT", "l", &past],
+            vec!["RPUSH", "l", "b"],
+        ]);
+        let at: u64 = past.parse().unwrap();
+        for key in ["h", "s", "l"] {
+            assert_eq!(expires(&store, key), Some(at), "{key} kept its deadline");
+            assert!(is_expired(&store, 0, key), "{key} is past it");
+        }
+        assert_eq!(hash_fields(&store, "h"), ["f0", "f1"]);
+        assert_eq!(string(&store, "s"), b"vx");
+        assert_eq!(list_len(&store, "l"), 2);
+        // And it goes the way any key past its time goes.
+        for key in ["h", "s", "l"] {
+            assert!(delete_key_if_expired(&store, 0, key), "{key}");
+            assert_eq!(expires(&store, key), None);
+            assert!(
+                crate::store::get_shard(&store[0], key)
+                    .read()
+                    .peek_expiring(key)
+                    .is_none()
+            );
+        }
+    }
+
+    /// The same with a deadline still ahead: kept, with every write.
+    #[test]
+    fn a_deadline_still_ahead_is_kept_with_every_write() {
+        let ahead = (now_ms() + 3_600_000).to_string();
+        let store = replayed(&[
+            vec!["HSET", "h", "f0", "v0"],
+            vec!["PEXPIREAT", "h", &ahead],
+            vec!["HSET", "h", "f1", "v1"],
+            vec!["SET", "s", "v"],
+            vec!["PEXPIREAT", "s", &ahead],
+            vec!["APPEND", "s", "x"],
+            vec!["RPUSH", "l", "a"],
+            vec!["PEXPIREAT", "l", &ahead],
+            vec!["RPUSH", "l", "b"],
+        ]);
+        let at: u64 = ahead.parse().unwrap();
+        for key in ["h", "s", "l"] {
+            assert_eq!(expires(&store, key), Some(at), "{key}");
+            assert!(!is_expired(&store, 0, key), "{key}");
+        }
+        assert_eq!(hash_fields(&store, "h"), ["f0", "f1"]);
+        assert_eq!(string(&store, "s"), b"vx");
+        assert_eq!(list_len(&store, "l"), 2);
+    }
+
+    /// The field of a hash, its value and whether it has a deadline, past
+    /// its time or not.
+    fn field(store: &Store, key: &str, field: &str) -> (Option<Vec<u8>>, Option<bool>) {
+        let shard = crate::store::get_shard(&store[0], key);
+        let map = shard.read();
+        match map.peek_expiring(key) {
+            Some((ValueRef::HashEx(h), _)) => {
+                let h = h.read();
+                (
+                    h.fields.get(field).map(|v| v.to_vec()),
+                    h.expiries.get(field).map(|_| h.is_field_expired(field)),
+                )
+            }
+            Some((ValueRef::Hash(h), _)) => (h.read().get(field).map(|v| v.to_vec()), None),
+            _ => (None, None),
+        }
+    }
+
+    /// `HPEXPIREAT h t FIELDS 1 g` and an `HINCRBY h g 1` made while `g`
+    /// lived, `t` gone: the replay deleted `g` at the `HPEXPIREAT`, and the
+    /// `HINCRBY` made it again, `1` with no deadline, for good. So with
+    /// `HSETEX ... PXAT t` and `HGETEX ... PXAT t`. Now `g` keeps its deadline
+    /// and the increment, and is past its time once the replay is over. An
+    /// `HSET` after it takes the deadline away, as it did on the master.
+    #[test]
+    fn a_field_deadline_that_has_passed_is_set_and_the_writes_after_it_go_into_the_field() {
+        let past = (now_ms() - 5_000).to_string();
+        let store = replayed(&[
+            vec!["HSET", "h", "keep", "1", "g", "5", "f", "v0"],
+            vec!["HPEXPIREAT", "h", &past, "FIELDS", "2", "g", "f"],
+            vec!["HINCRBY", "h", "g", "1"],
+            vec!["HSET", "h", "f", "v1"],
+            vec!["HSETEX", "x", "PXAT", &past, "FIELDS", "1", "n", "1.5"],
+            vec!["HINCRBYFLOAT", "x", "n", "1"],
+            vec!["HSET", "y", "keep", "1", "m", "7"],
+            vec!["HGETEX", "y", "PXAT", &past, "FIELDS", "1", "m"],
+            vec!["HINCRBY", "y", "m", "1"],
+        ]);
+        assert_eq!(field(&store, "h", "g"), (Some(b"6".to_vec()), Some(true)));
+        assert_eq!(field(&store, "h", "f").0, Some(b"v1".to_vec()));
+        assert_eq!(
+            field(&store, "h", "f").1,
+            None,
+            "HSET took f's deadline away"
+        );
+        assert_eq!(field(&store, "h", "keep"), (Some(b"1".to_vec()), None));
+        assert_eq!(field(&store, "x", "n"), (Some(b"2.5".to_vec()), Some(true)));
+        assert_eq!(field(&store, "y", "m"), (Some(b"8".to_vec()), Some(true)));
+        // Outside the replay the field is past its time, and a sweep of the
+        // hash takes it.
+        for (key, gone) in [("h", "g"), ("x", "n"), ("y", "m")] {
+            let shard = crate::store::get_shard(&store[0], key);
+            let map = shard.read();
+            if let Some((ValueRef::HashEx(h), _)) = map.peek_expiring(key) {
+                let mut h = h.write();
+                assert_eq!(h.sweep_expired(), 1, "{key}");
+                assert!(!h.fields.contains_key(gone), "{key}");
+            } else {
+                panic!("{key} is not a hash with field deadlines");
+            }
+        }
+    }
+
+    /// Outside a replay a field deadline that has passed still deletes the
+    /// field on the spot.
+    #[test]
+    fn outside_a_replay_a_field_deadline_that_has_passed_deletes_the_field() {
+        let mut inner = crate::types::HashInner::new();
+        inner
+            .fields
+            .insert("g".to_string(), std::sync::Arc::from(&b"5"[..]));
+        inner
+            .expiries
+            .insert("g".to_string(), std::time::Instant::now());
+        {
+            let _replay = crate::expiry::replay();
+            assert!(!inner.is_field_expired("g"));
+            assert_eq!(inner.sweep_expired(), 0);
+        }
+        assert!(inner.is_field_expired("g"));
+        assert_eq!(inner.sweep_expired(), 1);
+    }
+
+    /// A `DEL` in the log still deletes: what the master expired is said
+    /// by it, and a write after it makes a new key, as on the master.
+    #[test]
+    fn a_del_after_the_deadline_still_deletes() {
+        let past = (now_ms() - 5_000).to_string();
+        let store = replayed(&[
+            vec!["HSET", "h", "f0", "v0"],
+            vec!["PEXPIREAT", "h", &past],
+            vec!["UNLINK", "h"],
+            vec!["HSET", "h", "f1", "v1"],
+        ]);
+        assert_eq!(expires(&store, "h"), None);
+        assert_eq!(hash_fields(&store, "h"), ["f1"]);
     }
 }

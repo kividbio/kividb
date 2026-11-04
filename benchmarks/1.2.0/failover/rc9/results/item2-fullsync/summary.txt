@@ -1,0 +1,1 @@
+rc9: rate 100000; keys 3830948; full syncs after the wipe 1; evictions 1; link-down samples 13; last link-down 13 s after the restart (load ran 239 s after it); last sync done 13.5 s after the restart; peak queue ~310 MiB

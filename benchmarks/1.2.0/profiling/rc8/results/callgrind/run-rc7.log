@@ -1,0 +1,31 @@
+DEL rc7 4490
+GET-100-TTL rc7 3416
+SET-100-TTL rc7 5675
+INCR-TTL rc7 4161
+DEL-TTL rc7 5416
+GET-100-LRU rc7 3689
+SET-100-LRU rc7 4632
+INCR-LRU rc7 4437
+DEL-LRU rc7 4837
+GET-100-LFU rc7 3900
+SET-100-LFU rc7 4969
+INCR-LFU rc7 4732
+workload             rc7
+GET-100             3338
+SET-100             4268
+GET-1K              3853
+SET-1K              4392
+MIX-100             7640
+INCR                4090
+DEL                 4490
+GET-100-TTL          3416
+SET-100-TTL          5675
+INCR-TTL            4161
+DEL-TTL             5416
+GET-100-LRU          3689
+SET-100-LRU          4632
+INCR-LRU            4437
+DEL-LRU             4837
+GET-100-LFU          3900
+SET-100-LFU          4969
+INCR-LFU            4732

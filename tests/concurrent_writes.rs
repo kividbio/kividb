@@ -784,7 +784,10 @@ fn hset_beside_the_field_expiry_sweep_keeps_the_new_field() {
         at_once(&server, CLIENTS, move |c, conn, _| {
             let started = Instant::now();
             let mut k = c;
-            while started.elapsed() < Duration::from_millis(250) {
+            // A client's keys take two batches; it writes them all at least
+            // once, however slow the machine. A slow first batch used to end
+            // the loop, and that client's other 50 keys were never written.
+            while started.elapsed() < Duration::from_millis(250) || k < c + 2 * 50 * CLIENTS {
                 let batch: Vec<Vec<String>> = (0..50)
                     .map(|i| args(&["HSET", &key((k + i * CLIENTS) % KEYS), "new", "v"]))
                     .collect();

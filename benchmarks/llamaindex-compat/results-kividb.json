@@ -1,0 +1,343 @@
+{
+  "label": "kividb",
+  "url": "redis://127.0.0.1:6380",
+  "redis_version": "8.10.0",
+  "llama_index_core": "0.14.25",
+  "llama_index_vector_stores_redis": "0.9.0",
+  "llama_index_storage_docstore_redis": "0.6.0",
+  "llama_index_storage_index_store_redis": "0.7.0",
+  "llama_index_storage_kvstore_redis": "0.4.1",
+  "redisvl": "0.4.1",
+  "redis_py": "5.3.1",
+  "counts": {
+    "PASS": 54,
+    "WARN": 0,
+    "FAIL": 0
+  },
+  "checks": [
+    {
+      "check": "connection: PING",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vector store (flat): add creates the index and stores the nodes",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2
+    },
+    {
+      "check": "vector store (flat): query returns the closest node first",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "vector store (flat): similarities are ordered, best first",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "vector store (flat): similarity_top_k is honoured",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "vector store (flat): filter ==",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vector store (flat): filter !=",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vector store (flat): filter > on a number",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vector store (flat): filter IN",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vector store (flat): filters combined with AND",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vector store (flat): filters combined with OR",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vector store (flat): filter on text (TEXT_MATCH)",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vector store (flat): hybrid query (vector and text)",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vector store (flat): MMR query",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vector store (flat): get_nodes by id",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vector store (flat): delete_nodes by id",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "vector store (flat): delete_nodes by filter",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "vector store (flat): delete_index",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vector store (hnsw): add creates the index and stores the nodes",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "vector store (hnsw): query returns the closest node first",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "vector store (hnsw): similarities are ordered, best first",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vector store (hnsw): similarity_top_k is honoured",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2
+    },
+    {
+      "check": "vector store (hnsw): filter ==",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vector store (hnsw): filter !=",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vector store (hnsw): filter > on a number",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vector store (hnsw): filter IN",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vector store (hnsw): filters combined with AND",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vector store (hnsw): filters combined with OR",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vector store (hnsw): filter on text (TEXT_MATCH)",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vector store (hnsw): hybrid query (vector and text)",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vector store (hnsw): MMR query",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "vector store (hnsw): get_nodes by id",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "vector store (hnsw): delete_nodes by id",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "vector store (hnsw): delete_nodes by filter",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "vector store (hnsw): delete_index",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "index: VectorStoreIndex from documents, then retrieve",
+      "status": "PASS",
+      "detail": "",
+      "ms": 78
+    },
+    {
+      "check": "index: reopen from the vector store and retrieve",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "index: delete_ref_doc removes the document's nodes",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "docstore: add and get documents",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "docstore: exists, and a missing id",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "docstore: allow_update=False refuses an existing id",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "docstore: document hashes",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "docstore: delete a document and its hash",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "docstore: nodes of a reference document, and delete_ref_doc",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "ingestion pipeline: skips an unchanged document, redoes a changed one",
+      "status": "PASS",
+      "detail": "",
+      "ms": 4
+    },
+    {
+      "check": "index store: add and get an index struct",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "index store: list index structs",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "index store: delete an index struct",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "storage: an index is saved, then loaded back from a new storage context",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2
+    },
+    {
+      "check": "kv store: put and get, and a missing key",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "kv store: put_all and get_all",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "kv store: delete reports whether the key existed",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "kv store: nested values and unicode",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "kv store: async put, get, get_all, delete",
+      "status": "PASS",
+      "detail": "",
+      "ms": 3
+    }
+  ]
+}

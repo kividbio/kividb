@@ -1428,7 +1428,10 @@ fn apply_to_hashex(
             continue;
         }
 
-        if is_past {
+        // Replaying the AOF, the field's deadline is set all the same, as
+        // Redis sets it while it loads: the log's writes to the field after
+        // it were made while it lived (`expiry::replaying`).
+        if is_past && !crate::expiry::replaying() {
             // The user gave an absolute time already in the past. Redis
             // semantics: drop the field immediately and return 2.
             inner.evict_field(f);
@@ -1864,6 +1867,14 @@ fn run_hgetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let fields = match parse_hfe_read_tail(cmd, idx) {
         Ok(f) => f,
         Err(e) => return Some(e),
+    };
+    // Replaying the AOF, a moment that has come is set (see
+    // `apply_to_hashex`).
+    let action = match action {
+        HgetexAction::SetExpiryPast if crate::expiry::replaying() => {
+            HgetexAction::SetExpiry(Instant::now())
+        }
+        other => other,
     };
 
     let db_ref = &ctx.store[*ctx.selected_db];
@@ -2325,6 +2336,11 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let ttl = match (ttl, keepttl, legacy_expiry) {
         (_, true, Some(at)) => HsetexTtl::KeepOrSet(at),
         (_, true, None) => HsetexTtl::Keep,
+        // Replaying the AOF, a moment that has come is set (see
+        // `apply_to_hashex`).
+        (Some(HsetexTtl::Past), false, _) if crate::expiry::replaying() => {
+            HsetexTtl::Set(Instant::now())
+        }
         (Some(ttl), false, _) => ttl,
         (None, false, _) => HsetexTtl::Clear,
     };

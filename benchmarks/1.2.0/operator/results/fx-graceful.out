@@ -1,0 +1,11 @@
+BEGIN fx-graceful 21:04:36
+fx-graceful cordoned all nodes but vmss000003 21:04:49
+fx-graceful graceful delete fx-0-1 21:04:49
+pod "fx-0-1" deleted from e2e namespace
+fx-graceful new fx-0-1 on vmss000003, nodes uncordoned 21:04:57
+fx-graceful fx-0-1 Ready 21:05:16
+lines with two engines for fx-0-1: 0
+END fx-graceful 21:05:54
+acked 585702 errors 0 win [] slow 0 []
+errkinds Counter()
+checked 586846 missing 0 wrong 0 readErr 0 bySec {} dbsize 589882 ex {}

@@ -1,0 +1,39 @@
+10.70.1.10:7002 (9640fb6c...) -> 575129 keys | 5489 slots | 1 slaves.
+10.70.1.7:7002 (2c3fe460...) -> 572068 keys | 5462 slots | 1 slaves.
+10.70.1.7:7001 (c9effd80...) -> 569149 keys | 5433 slots | 1 slaves.
+[OK] 1716346 keys in 3 masters.
+104.76 keys per slot on average.
+>>> Performing Cluster Check (using node 10.70.1.10:7002)
+M: 9640fb6cf7ca927ae78af9e35f36f4d268f7414e 10.70.1.10:7002
+   slots:[0-5460],[10923-10950] (5489 slots) master
+   1 additional replica(s)
+S: 108728434b75bf876698cd4a834166d2d5c55010 10.70.1.10:7001
+   slots: (0 slots) slave
+   replicates 2c3fe4602d1e82afadebcb8d77a15f993c811bb7
+M: 2c3fe4602d1e82afadebcb8d77a15f993c811bb7 10.70.1.7:7002
+   slots:[5461-10922] (5462 slots) master
+   1 additional replica(s)
+S: 39b5f08aabb3f78c62430c64e39edd9201cfa601 10.70.1.9:7002
+   slots: (0 slots) slave
+   replicates c9effd8045d7d685754324fb04c9ae83c59b7c86
+S: 9348cb92423b04df7a4db58d44f9b001b318f350 10.70.1.9:7001
+   slots: (0 slots) slave
+   replicates 9640fb6cf7ca927ae78af9e35f36f4d268f7414e
+M: c9effd8045d7d685754324fb04c9ae83c59b7c86 10.70.1.7:7001
+   slots:[10951-16383] (5433 slots) master
+   1 additional replica(s)
+[OK] All nodes agree about slots configuration.
+>>> Check for open slots...
+[WARNING] Node 10.70.1.10:7002 has slots in migrating state 0.
+[WARNING] Node 10.70.1.7:7002 has slots in importing state 0.
+[WARNING] The following slots are open: 0.
+>>> Fixing open slot 0
+*** Found keys about slot 0 in non-owner node 10.70.1.7:7002!
+Set as migrating in: 10.70.1.10:7002
+Set as importing in: 10.70.1.7:7002
+>>> No single clear owner for the slot, selecting an owner by # of keys...
+*** Configuring 10.70.1.10:7002 as the slot owner
+Node 10.70.1.7:7002 replied with error:
+ERR Slot 0 is owned by another node
+>>> Check slots coverage...
+[OK] All 16384 slots covered.

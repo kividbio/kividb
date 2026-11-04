@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Namespace
+metadata: {name: e2e}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: cli, namespace: e2e}
+spec:
+  nodeSelector: {e2e-infra: "true"}
+  containers:
+    - name: cli
+      image: redis:8
+      command: ["sleep", "infinity"]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: curl, namespace: e2e}
+spec:
+  nodeSelector: {e2e-infra: "true"}
+  containers:
+    - name: curl
+      image: curlimages/curl:8.11.1
+      command: ["sleep", "infinity"]

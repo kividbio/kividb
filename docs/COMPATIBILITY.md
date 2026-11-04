@@ -33,6 +33,18 @@ other files:
 - BullMQ's and Sidekiq's own test suites, and kill-and-restart soaks
   (`scripts/client_compat/`).
 - LiteLLM's semantic cache: [benchmarks/litellm-compat/REPORT.md](../benchmarks/litellm-compat/REPORT.md).
+- LangChain's Redis integration (`langchain-redis`): vector store, LLM and semantic cache, chat history:
+  [benchmarks/langchain-compat/REPORT.md](../benchmarks/langchain-compat/REPORT.md) and
+  [docs/integrations/langchain.md](integrations/langchain.md).
+- LangGraph's Redis checkpointer and store (`langgraph-checkpoint-redis`):
+  [benchmarks/langgraph-compat/REPORT.md](../benchmarks/langgraph-compat/REPORT.md) and
+  [docs/integrations/langgraph.md](integrations/langgraph.md).
+- LlamaIndex's Redis vector store, document store, index store and key-value store:
+  [benchmarks/llamaindex-compat/REPORT.md](../benchmarks/llamaindex-compat/REPORT.md) and
+  [docs/integrations/llamaindex.md](integrations/llamaindex.md).
+- Mem0's Redis vector store and the `Memory` API on top of it:
+  [benchmarks/mem0-compat/REPORT.md](../benchmarks/mem0-compat/REPORT.md) and
+  [docs/integrations/mem0.md](integrations/mem0.md).
 - `redis-py` throughout the end-to-end tests (`tests/e2e/`).
 
 ## Differences you may notice

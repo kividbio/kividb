@@ -1,0 +1,4 @@
+round,delay_s,sync_full_added,sync_in_progress_at_kill,loading_at_kill,exit_s,dump_kdb_same,dump_kdb_repl_same,final_save_skipped_logged,synced_again_s
+1,8,1,1,1,0.49,yes,yes,1,19.03
+2,5,1,1,1,0.48,yes,yes,1,22.53
+3,clean stop hung (load stopped)

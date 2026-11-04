@@ -1,0 +1,236 @@
+[New LWP 29297]
+[New LWP 29296]
+[New LWP 29295]
+[New LWP 29294]
+[New LWP 29293]
+[New LWP 29292]
+[New LWP 29291]
+[New LWP 29290]
+[New LWP 29289]
+[New LWP 29288]
+[New LWP 29206]
+[New LWP 29205]
+[New LWP 29204]
+[New LWP 29203]
+[New LWP 29202]
+[New LWP 29201]
+[New LWP 29200]
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+0x000076daf3098e51 in __futex_abstimed_wait_common64 (private=128, cancel=true, abstime=0x0, op=265, expected=29292, futex_word=0x76dab23ff990) at ./nptl/futex-internal.c:57
+
+warning: 57	./nptl/futex-internal.c: No such file or directory
+
+Thread 18 (Thread 0x76daf2fff6c0 (LWP 29200) "kividb-pubsub-l"):
+#0  0x000076daf30ecbdf in __GI___clock_nanosleep (clock_id=1, flags=0, req=0x76daf2ffdee0, rem=0x76daf2ffdee0) at ../sysdeps/unix/sysv/linux/clock_nanosleep.c:78
+#1  0x000055df322ee959 in std::sys::backtrace::__rust_begin_short_backtrace::<kividb::pubsub::watch_soft_limit::{closure#0}, ()> ()
+#2  0x000055df324d2b5d in <std::thread::lifecycle::spawn_unchecked<kividb::pubsub::watch_soft_limit::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0} ()
+#3  0x000055df32a5a15a in <std::sys::thread::unix::Thread>::new::thread_start ()
+#4  0x000076daf309cb84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#5  0x000076daf3129ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 17 (Thread 0x76daf2d596c0 (LWP 29201) "hnsw-compaction"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x000055df3245e5f7 in <std::sync::mpmc::array::Channel<alloc::sync::Arc<[u8]>>>::recv::{closure#1} ()
+#2  0x000055df322f0464 in std::sys::backtrace::__rust_begin_short_backtrace::<kividb::vector::spawn_compaction_worker::{closure#0}, ()> ()
+#3  0x000055df324d2d4a in <std::thread::lifecycle::spawn_unchecked<kividb::vector::spawn_compaction_worker::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0} ()
+#4  0x000055df32a5a15a in <std::sys::thread::unix::Thread>::new::thread_start ()
+#5  0x000076daf309cb84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#6  0x000076daf3129ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 16 (Thread 0x76daf2b586c0 (LWP 29202) "kividb"):
+#0  0x000076daf312a2d2 in epoll_wait (epfd=4, events=0x76dae8000ca0, maxevents=1024, timeout=896) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x000055df32a82dae in <tokio::runtime::io::driver::Driver>::turn ()
+#2  0x000055df32a82a9e in <tokio::runtime::time::Driver>::park_internal ()
+#3  0x000055df32a86e52 in <tokio::runtime::scheduler::current_thread::Context>::park_internal ()
+#4  0x000055df32a8725c in <tokio::runtime::scheduler::current_thread::Context>::park ()
+#5  0x000055df322ebbfa in std::sys::backtrace::__rust_begin_short_backtrace::<kividb::run_uring::{closure#0}, ()> ()
+#6  0x000055df324d1961 in <std::thread::lifecycle::spawn_unchecked<kividb::run_uring::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0} ()
+#7  0x000055df32a5a15a in <std::sys::thread::unix::Thread>::new::thread_start ()
+#8  0x000076daf309cb84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#9  0x000076daf3129ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 15 (Thread 0x76daf29576c0 (LWP 29203) "kividb"):
+#0  0x000076daf30ecbdf in __GI___clock_nanosleep (clock_id=1, flags=0, req=0x76daf2955f18, rem=0x76daf2955f18) at ../sysdeps/unix/sysv/linux/clock_nanosleep.c:78
+#1  0x000055df3248ad79 in kividb::stats::spawn_instantaneous_ops_sampler::{closure#0} ()
+#2  0x000055df322ee8e6 in std::sys::backtrace::__rust_begin_short_backtrace::<kividb::stats::spawn_instantaneous_ops_sampler::{closure#0}, !> ()
+#3  0x000055df32437a5b in std::thread::lifecycle::spawn_unchecked::<kividb::stats::spawn_instantaneous_ops_sampler::{closure#0}, !>::{closure#1}::{closure#0} ()
+#4  0x000055df328e76ce in <core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked<kividb::stats::spawn_instantaneous_ops_sampler::{closure#0}, !>::{closure#1}::{closure#0}> as core::ops::function::FnOnce<()>>::call_once ()
+#5  0x000055df324d29cc in <std::thread::lifecycle::spawn_unchecked<kividb::stats::spawn_instantaneous_ops_sampler::{closure#0}, !>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0} ()
+#6  0x000055df32a5a15a in <std::sys::thread::unix::Thread>::new::thread_start ()
+#7  0x000076daf309cb84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#8  0x000076daf3129ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 14 (Thread 0x76daf27566c0 (LWP 29204) "kividb"):
+#0  0x000076daf30ecbdf in __GI___clock_nanosleep (clock_id=1, flags=0, req=0x76daf2754c20, rem=0x76daf2754c20) at ../sysdeps/unix/sysv/linux/clock_nanosleep.c:78
+#1  0x000055df324b24e3 in kividb::commands::helpers::spawn_active_expire_task::{closure#1} ()
+#2  0x000055df322faa66 in std::sys::backtrace::__rust_begin_short_backtrace::<kividb::commands::helpers::spawn_active_expire_task::{closure#1}, !> ()
+#3  0x000055df32437a78 in std::thread::lifecycle::spawn_unchecked::<kividb::commands::helpers::spawn_active_expire_task::{closure#1}, !>::{closure#1}::{closure#0} ()
+#4  0x000055df328e76d6 in <core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked<kividb::commands::helpers::spawn_active_expire_task::{closure#1}, !>::{closure#1}::{closure#0}> as core::ops::function::FnOnce<()>>::call_once ()
+#5  0x000055df324d3f94 in <std::thread::lifecycle::spawn_unchecked<kividb::commands::helpers::spawn_active_expire_task::{closure#1}, !>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0} ()
+#6  0x000055df32a5a15a in <std::sys::thread::unix::Thread>::new::thread_start ()
+#7  0x000076daf309cb84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#8  0x000076daf3129ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 13 (Thread 0x76daf25556c0 (LWP 29205) "kividb"):
+#0  0x000076daf30ecbdf in __GI___clock_nanosleep (clock_id=1, flags=0, req=0x76daf2553c20, rem=0x76daf2553c20) at ../sysdeps/unix/sysv/linux/clock_nanosleep.c:78
+#1  0x000055df324b24e3 in kividb::commands::helpers::spawn_active_expire_task::{closure#1} ()
+#2  0x000055df322faa66 in std::sys::backtrace::__rust_begin_short_backtrace::<kividb::commands::helpers::spawn_active_expire_task::{closure#1}, !> ()
+#3  0x000055df32437a78 in std::thread::lifecycle::spawn_unchecked::<kividb::commands::helpers::spawn_active_expire_task::{closure#1}, !>::{closure#1}::{closure#0} ()
+#4  0x000055df328e76d6 in <core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked<kividb::commands::helpers::spawn_active_expire_task::{closure#1}, !>::{closure#1}::{closure#0}> as core::ops::function::FnOnce<()>>::call_once ()
+#5  0x000055df324d3f94 in <std::thread::lifecycle::spawn_unchecked<kividb::commands::helpers::spawn_active_expire_task::{closure#1}, !>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0} ()
+#6  0x000055df32a5a15a in <std::sys::thread::unix::Thread>::new::thread_start ()
+#7  0x000076daf309cb84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#8  0x000076daf3129ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 12 (Thread 0x76daf23546c0 (LWP 29206) "kividb-defrag"):
+#0  0x000076daf30ecbdf in __GI___clock_nanosleep (clock_id=1, flags=0, req=0x76daf2352e30, rem=0x76daf2352e30) at ../sysdeps/unix/sysv/linux/clock_nanosleep.c:78
+#1  0x000055df3245ea75 in kividb::compaction::spawn::{closure#0} ()
+#2  0x000055df322ee6a6 in std::sys::backtrace::__rust_begin_short_backtrace::<kividb::compaction::spawn::{closure#0}, !> ()
+#3  0x000055df324379c5 in std::thread::lifecycle::spawn_unchecked::<kividb::compaction::spawn::{closure#0}, !>::{closure#1}::{closure#0} ()
+#4  0x000055df328e76be in <core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked<kividb::compaction::spawn::{closure#0}, !>::{closure#1}::{closure#0}> as core::ops::function::FnOnce<()>>::call_once ()
+#5  0x000055df324d22d5 in <std::thread::lifecycle::spawn_unchecked<kividb::compaction::spawn::{closure#0}, !>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0} ()
+#6  0x000055df32a5a15a in <std::sys::thread::unix::Thread>::new::thread_start ()
+#7  0x000076daf309cb84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#8  0x000076daf3129ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 11 (Thread 0x76daf21536c0 (LWP 29288) "kividb"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x000055df329606aa in <parking_lot::raw_mutex::RawMutex>::lock_slow ()
+#2  0x000055df325bd686 in kividb::replication::save_dataset ()
+#3  0x000055df3243f631 in kividb::run_uring::{closure#4}::{closure#0} ()
+#4  0x000055df32210e58 in <tokio::runtime::scheduler::current_thread::CoreGuard>::enter::<<tokio::runtime::scheduler::current_thread::CoreGuard>::block_on<core::pin::Pin<&mut kividb::run_uring::{closure#4}::{closure#0}>>::{closure#0}, core::option::Option<!>> ()
+#5  0x000055df32211586 in <tokio::runtime::scheduler::current_thread::CoreGuard>::block_on::<core::pin::Pin<&mut kividb::run_uring::{closure#4}::{closure#0}>> ()
+#6  0x000055df32411831 in <tokio::runtime::scheduler::current_thread::CurrentThread>::block_on::<kividb::run_uring::{closure#4}::{closure#0}>::{closure#0} ()
+#7  0x000055df3237d379 in tokio::runtime::context::runtime::enter_runtime::<<tokio::runtime::scheduler::current_thread::CurrentThread>::block_on<kividb::run_uring::{closure#4}::{closure#0}>::{closure#0}, !> ()
+#8  0x000055df321db0a8 in <tokio::runtime::scheduler::current_thread::CurrentThread>::block_on::<kividb::run_uring::{closure#4}::{closure#0}> ()
+#9  0x000055df321d997d in <tokio::runtime::runtime::Runtime>::block_on_inner::<kividb::run_uring::{closure#4}::{closure#0}> ()
+#10 0x000055df321d9a19 in <tokio::runtime::runtime::Runtime>::block_on::<kividb::run_uring::{closure#4}::{closure#0}> ()
+#11 0x000055df322ec527 in std::sys::backtrace::__rust_begin_short_backtrace::<kividb::run_uring::{closure#4}, ()> ()
+#12 0x000055df324d1b85 in <std::thread::lifecycle::spawn_unchecked<kividb::run_uring::{closure#4}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0} ()
+#13 0x000055df32a5a15a in <std::sys::thread::unix::Thread>::new::thread_start ()
+#14 0x000076daf309cb84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#15 0x000076daf3129ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 10 (Thread 0x76daf03ff6c0 (LWP 29289) "kividb"):
+#0  0x000076daf312a2d2 in epoll_wait (epfd=11, events=0x76da98000ca0, maxevents=1024, timeout=943) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x000055df32a82dae in <tokio::runtime::io::driver::Driver>::turn ()
+#2  0x000055df32a82a9e in <tokio::runtime::time::Driver>::park_internal ()
+#3  0x000055df32a86e52 in <tokio::runtime::scheduler::current_thread::Context>::park_internal ()
+#4  0x000055df32a8725c in <tokio::runtime::scheduler::current_thread::Context>::park ()
+#5  0x000055df321da981 in <tokio::runtime::runtime::Runtime>::block_on::<kividb::aof::start_aof_writer::{closure#0}> ()
+#6  0x000055df322ec65b in std::sys::backtrace::__rust_begin_short_backtrace::<kividb::run_uring::{closure#5}, ()> ()
+#7  0x000055df324d1d2d in <std::thread::lifecycle::spawn_unchecked<kividb::run_uring::{closure#5}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0} ()
+#8  0x000055df32a5a15a in <std::sys::thread::unix::Thread>::new::thread_start ()
+#9  0x000076daf309cb84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#10 0x000076daf3129ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 9 (Thread 0x76dacb3ff6c0 (LWP 29290) "kividb"):
+#0  0x000076daf30ecbdf in __GI___clock_nanosleep (clock_id=1, flags=0, req=0x76dacb3fdd88, rem=0x76dacb3fdd88) at ../sysdeps/unix/sysv/linux/clock_nanosleep.c:78
+#1  0x000055df3248948f in kividb::aof::spawn_auto_rewrite_thread::{closure#0} ()
+#2  0x000055df322ee8de in std::sys::backtrace::__rust_begin_short_backtrace::<kividb::aof::spawn_auto_rewrite_thread::{closure#0}, !> ()
+#3  0x000055df32437a09 in std::thread::lifecycle::spawn_unchecked::<kividb::aof::spawn_auto_rewrite_thread::{closure#0}, !>::{closure#1}::{closure#0} ()
+#4  0x000055df328e76c6 in <core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked<kividb::aof::spawn_auto_rewrite_thread::{closure#0}, !>::{closure#1}::{closure#0}> as core::ops::function::FnOnce<()>>::call_once ()
+#5  0x000055df324d2855 in <std::thread::lifecycle::spawn_unchecked<kividb::aof::spawn_auto_rewrite_thread::{closure#0}, !>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0} ()
+#6  0x000055df32a5a15a in <std::sys::thread::unix::Thread>::new::thread_start ()
+#7  0x000076daf309cb84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#8  0x000076daf3129ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 8 (Thread 0x76dac15ff6c0 (LWP 29291) "kividb-replica"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x000055df32961e7d in <parking_lot::raw_rwlock::RawRwLock>::lock_shared_slow ()
+#2  0x000055df32220a76 in kividb::command_gate::enter_unless::<kividb::commands::handler::run_command::{closure#6}> ()
+#3  0x000055df327cec3d in kividb::commands::handler::run_command ()
+#4  0x000055df327d6319 in kividb::commands::handler::execute_command ()
+#5  0x000055df3258c94f in <kividb::replication::replica_client::ReplicationApplyEnv>::apply_command ()
+#6  0x000055df324982bd in kividb::replication::replica_client::run_replication_session::{closure#0} ()
+#7  0x000055df328da64c in <core::pin::Pin<alloc::boxed::Box<kividb::replication::replica_client::start_replica::{closure#0}>> as core::future::future::Future>::poll ()
+#8  0x000055df322ed63a in std::sys::backtrace::__rust_begin_short_backtrace::<<kividb::replication::replica_client::ReplicaStarter>::start::{closure#0}, ()> ()
+#9  0x000055df324d2101 in <std::thread::lifecycle::spawn_unchecked<<kividb::replication::replica_client::ReplicaStarter>::start::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0} ()
+#10 0x000055df32a5a15a in <std::sys::thread::unix::Thread>::new::thread_start ()
+#11 0x000076daf309cb84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#12 0x000076daf3129ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 7 (Thread 0x76dab23ff6c0 (LWP 29292) "kividb"):
+#0  0x000076daf312a2d2 in epoll_wait (epfd=25, events=0x76da8c000cc0, maxevents=1024, timeout=-1) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x000055df32a82dae in <tokio::runtime::io::driver::Driver>::turn ()
+#2  0x000055df32a82a9e in <tokio::runtime::time::Driver>::park_internal ()
+#3  0x000055df32a86e52 in <tokio::runtime::scheduler::current_thread::Context>::park_internal ()
+#4  0x000055df32a8725c in <tokio::runtime::scheduler::current_thread::Context>::park ()
+#5  0x000055df322e89a7 in std::sys::backtrace::__rust_begin_short_backtrace::<kividb::run_uring::{closure#8}::{closure#0}, ()> ()
+#6  0x000055df324d138e in <std::thread::lifecycle::spawn_unchecked<kividb::run_uring::{closure#8}::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0} ()
+#7  0x000055df32a5a15a in <std::sys::thread::unix::Thread>::new::thread_start ()
+#8  0x000076daf309cb84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#9  0x000076daf3129ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 6 (Thread 0x76dab21fe6c0 (LWP 29293) "kividb"):
+#0  0x000076daf312a2d2 in epoll_wait (epfd=29, events=0x76da80000cc0, maxevents=1024, timeout=-1) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x000055df32a82dae in <tokio::runtime::io::driver::Driver>::turn ()
+#2  0x000055df32a82a9e in <tokio::runtime::time::Driver>::park_internal ()
+#3  0x000055df32a86e52 in <tokio::runtime::scheduler::current_thread::Context>::park_internal ()
+#4  0x000055df32a8725c in <tokio::runtime::scheduler::current_thread::Context>::park ()
+#5  0x000055df322e89a7 in std::sys::backtrace::__rust_begin_short_backtrace::<kividb::run_uring::{closure#8}::{closure#0}, ()> ()
+#6  0x000055df324d138e in <std::thread::lifecycle::spawn_unchecked<kividb::run_uring::{closure#8}::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0} ()
+#7  0x000055df32a5a15a in <std::sys::thread::unix::Thread>::new::thread_start ()
+#8  0x000076daf309cb84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#9  0x000076daf3129ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 5 (Thread 0x76dab1ffd6c0 (LWP 29294) "kividb"):
+#0  0x000076daf312a2d2 in epoll_wait (epfd=35, events=0x76da84000cc0, maxevents=1024, timeout=-1) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x000055df32a82dae in <tokio::runtime::io::driver::Driver>::turn ()
+#2  0x000055df32a82a9e in <tokio::runtime::time::Driver>::park_internal ()
+#3  0x000055df32a86e52 in <tokio::runtime::scheduler::current_thread::Context>::park_internal ()
+#4  0x000055df32a8725c in <tokio::runtime::scheduler::current_thread::Context>::park ()
+#5  0x000055df322e89a7 in std::sys::backtrace::__rust_begin_short_backtrace::<kividb::run_uring::{closure#8}::{closure#0}, ()> ()
+#6  0x000055df324d138e in <std::thread::lifecycle::spawn_unchecked<kividb::run_uring::{closure#8}::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0} ()
+#7  0x000055df32a5a15a in <std::sys::thread::unix::Thread>::new::thread_start ()
+#8  0x000076daf309cb84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#9  0x000076daf3129ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 4 (Thread 0x76dab1dfc6c0 (LWP 29295) "kividb"):
+#0  0x000076daf312a2d2 in epoll_wait (epfd=51, events=0x76da78000cc0, maxevents=1024, timeout=-1) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x000055df32a82dae in <tokio::runtime::io::driver::Driver>::turn ()
+#2  0x000055df32a82a9e in <tokio::runtime::time::Driver>::park_internal ()
+#3  0x000055df32a86e52 in <tokio::runtime::scheduler::current_thread::Context>::park_internal ()
+#4  0x000055df32a8725c in <tokio::runtime::scheduler::current_thread::Context>::park ()
+#5  0x000055df322e89a7 in std::sys::backtrace::__rust_begin_short_backtrace::<kividb::run_uring::{closure#8}::{closure#0}, ()> ()
+#6  0x000055df324d138e in <std::thread::lifecycle::spawn_unchecked<kividb::run_uring::{closure#8}::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0} ()
+#7  0x000055df32a5a15a in <std::sys::thread::unix::Thread>::new::thread_start ()
+#8  0x000076daf309cb84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#9  0x000076daf3129ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 3 (Thread 0x76dab1bfb6c0 (LWP 29296) "kividb"):
+#0  0x000076daf312a2d2 in epoll_wait (epfd=54, events=0x76da7c000cc0, maxevents=1024, timeout=-1) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x000055df32a82dae in <tokio::runtime::io::driver::Driver>::turn ()
+#2  0x000055df32a82a9e in <tokio::runtime::time::Driver>::park_internal ()
+#3  0x000055df32a86e52 in <tokio::runtime::scheduler::current_thread::Context>::park_internal ()
+#4  0x000055df32a8725c in <tokio::runtime::scheduler::current_thread::Context>::park ()
+#5  0x000055df322e89a7 in std::sys::backtrace::__rust_begin_short_backtrace::<kividb::run_uring::{closure#8}::{closure#0}, ()> ()
+#6  0x000055df324d138e in <std::thread::lifecycle::spawn_unchecked<kividb::run_uring::{closure#8}::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0} ()
+#7  0x000055df32a5a15a in <std::sys::thread::unix::Thread>::new::thread_start ()
+#8  0x000076daf309cb84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#9  0x000076daf3129ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 2 (Thread 0x76dab19fa6c0 (LWP 29297) "kividb"):
+#0  0x000076daf312a2d2 in epoll_wait (epfd=43, events=0x76da70000cc0, maxevents=1024, timeout=-1) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x000055df32a82dae in <tokio::runtime::io::driver::Driver>::turn ()
+#2  0x000055df32a82a9e in <tokio::runtime::time::Driver>::park_internal ()
+#3  0x000055df32a86e52 in <tokio::runtime::scheduler::current_thread::Context>::park_internal ()
+#4  0x000055df32a8725c in <tokio::runtime::scheduler::current_thread::Context>::park ()
+#5  0x000055df322e89a7 in std::sys::backtrace::__rust_begin_short_backtrace::<kividb::run_uring::{closure#8}::{closure#0}, ()> ()
+#6  0x000055df324d138e in <std::thread::lifecycle::spawn_unchecked<kividb::run_uring::{closure#8}::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0} ()
+#7  0x000055df32a5a15a in <std::sys::thread::unix::Thread>::new::thread_start ()
+#8  0x000076daf309cb84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#9  0x000076daf3129ecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 1 (Thread 0x76daf32c95c0 (LWP 29198) "kividb"):
+#0  0x000076daf3098e51 in __futex_abstimed_wait_common64 (private=128, cancel=true, abstime=0x0, op=265, expected=29292, futex_word=0x76dab23ff990) at ./nptl/futex-internal.c:57
+#1  __futex_abstimed_wait_common (cancel=true, private=128, abstime=0x0, clockid=0, expected=29292, futex_word=0x76dab23ff990) at ./nptl/futex-internal.c:87
+#2  __GI___futex_abstimed_wait_cancelable64 (futex_word=futex_word@entry=0x76dab23ff990, expected=29292, clockid=clockid@entry=0, abstime=abstime@entry=0x0, private=private@entry=128) at ./nptl/futex-internal.c:139
+#3  0x000076daf309e883 in __pthread_clockjoin_ex (threadid=130681665484480, thread_return=0x0, clockid=0, abstime=0x0, block=<optimized out>) at ./nptl/pthread_join_common.c:102
+#4  0x000055df324f12a8 in kividb::run_uring ()
+#5  0x000055df324e915b in kividb::run ()
+#6  0x000055df324ea69a in kividb::main ()
+#7  0x000055df322e3a83 in std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()> ()
+#8  0x000055df328f4eca in main ()
+[Inferior 1 (process 29198) detached]

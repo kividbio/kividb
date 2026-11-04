@@ -1,0 +1,16 @@
+PASS: ghcr.io/kividbio/kividb:v1.2.0-rc7 resolves to linux/arm64 on this host
+PASS: ghcr.io/kividbio/kividb:v1.2.0-rc7-lua resolves to linux/arm64 on this host
+PASS: ghcr.io/kividbio/kividb:v1.2.0-rc7-tls resolves to linux/arm64 on this host
+PASS: ghcr.io/kividbio/kividb:v1.2.0-rc7-full resolves to linux/arm64 on this host
+PASS: docker.io/kividb/kividb:v1.2.0-rc7 resolves to linux/arm64 on this host
+PASS: docker.io/kividb/kividb:v1.2.0-rc7-lua resolves to linux/arm64 on this host
+PASS: docker.io/kividb/kividb:v1.2.0-rc7-tls resolves to linux/arm64 on this host
+PASS: docker.io/kividb/kividb:v1.2.0-rc7-full resolves to linux/arm64 on this host
+PASS: ghcr.io/kividbio/kividb:v1.2.0-rc7-amd64 is linux/amd64 (config; binary: ELF 64-bit LSB pie executable, x86-64; no arm64 manifest)
+PASS: ghcr.io/kividbio/kividb:v1.2.0-rc7-lua-amd64 is linux/amd64 (config; binary: ELF 64-bit LSB pie executable, x86-64; no arm64 manifest)
+PASS: ghcr.io/kividbio/kividb:v1.2.0-rc7-tls-amd64 is linux/amd64 (config; binary: ELF 64-bit LSB pie executable, x86-64; no arm64 manifest)
+PASS: ghcr.io/kividbio/kividb:v1.2.0-rc7-full-amd64 is linux/amd64 (config; binary: ELF 64-bit LSB pie executable, x86-64; no arm64 manifest)
+PASS: ghcr.io/kividbio/kividb:v1.2.0-rc7-arm64 is linux/arm64 (config; binary: ELF 64-bit LSB pie executable, ARM aarch64; no amd64 manifest)
+PASS: ghcr.io/kividbio/kividb:v1.2.0-rc7-lua-arm64 is linux/arm64 (config; binary: ELF 64-bit LSB pie executable, ARM aarch64; no amd64 manifest)
+PASS: ghcr.io/kividbio/kividb:v1.2.0-rc7-tls-arm64 is linux/arm64 (config; binary: ELF 64-bit LSB pie executable, ARM aarch64; no amd64 manifest)
+PASS: ghcr.io/kividbio/kividb:v1.2.0-rc7-full-arm64 is linux/arm64 (config; binary: ELF 64-bit LSB pie executable, ARM aarch64; no amd64 manifest)

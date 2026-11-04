@@ -95,6 +95,15 @@ impl Target {
                     > 0)
     }
 
+    /// A shutdown has ended this node's write stream: the background sweeps
+    /// expire nothing more (`replication::end_stream_for_shutdown`).
+    #[inline]
+    pub fn stream_closed(&self) -> bool {
+        self.repl_state
+            .stream_closed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// `keys`, which this master has just expired in database `db`, as a
     /// `DEL` (or `UNLINK`) each to replicas, taps and the AOF. Inside a
     /// transaction or a script, among its writes. The caller holds what
@@ -267,6 +276,40 @@ pub fn loading() -> bool {
     LOADING.load(Ordering::SeqCst) > 0
 }
 
+thread_local! {
+    /// How many [`Replay`]s this thread has.
+    static REPLAYING: Cell<u32> = const { Cell::new(0) };
+}
+
+/// While this lives, this thread is replaying the AOF ([`replaying`]).
+pub struct Replay {
+    _not_send: PhantomData<*const ()>,
+}
+
+impl Drop for Replay {
+    fn drop(&mut self) {
+        REPLAYING.with(|n| n.set(n.get().saturating_sub(1)));
+    }
+}
+
+/// From now until the [`Replay`] is dropped, this thread is replaying the
+/// AOF: a moment that has come, given to a key or a field, sets its time
+/// instead of deleting it, as Redis does while it loads. The writes the log
+/// has after it were made while it lived. Nests.
+pub fn replay() -> Replay {
+    REPLAYING.with(|n| n.set(n.get() + 1));
+    Replay {
+        _not_send: PhantomData,
+    }
+}
+
+/// Whether this thread is replaying the AOF ([`replay`]). Not a replica
+/// applying its master's live stream: [`held`] says that.
+#[inline]
+pub fn replaying() -> bool {
+    REPLAYING.with(|n| n.get() > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +325,22 @@ mod tests {
         assert!(held());
         drop(outer);
         assert!(!held());
+    }
+
+    #[test]
+    fn a_replay_nests_and_is_this_threads() {
+        assert!(!replaying());
+        let outer = replay();
+        let inner = replay();
+        assert!(replaying());
+        std::thread::spawn(|| assert!(!replaying())).join().unwrap();
+        drop(inner);
+        assert!(replaying());
+        drop(outer);
+        assert!(!replaying());
+        // A hold alone (a replica applying its master's stream) is not one.
+        let _hold = hold();
+        assert!(!replaying());
     }
 
     #[test]

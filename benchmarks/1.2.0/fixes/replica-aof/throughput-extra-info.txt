@@ -1,0 +1,36 @@
+replica r4 fixed aof_current_size:385155157
+replica r4 fixed aof_acks_before_write:0
+replica r4 fixed replica used_memory:150726397
+replica r4 rc4 aof_current_size:386026144
+replica r4 rc4 aof_acks_before_write:0
+replica r4 rc4 replica used_memory:1440416943
+replica r5 rc4 aof_current_size:246578704
+replica r5 rc4 aof_acks_before_write:0
+replica r5 rc4 replica used_memory:1344242179
+replica r5 fixed aof_current_size:207413008
+replica r5 fixed aof_acks_before_write:0
+replica r5 fixed replica used_memory:151249075
+replica r6 fixed aof_current_size:358502416
+replica r6 fixed aof_acks_before_write:0
+replica r6 fixed replica used_memory:151070823
+replica r6 rc4 aof_current_size:339634960
+replica r6 rc4 aof_acks_before_write:0
+replica r6 rc4 replica used_memory:1457116435
+replica r7 rc4 aof_current_size:400926256
+replica r7 rc4 aof_acks_before_write:0
+replica r7 rc4 replica used_memory:1503468019
+replica r7 fixed aof_current_size:267053632
+replica r7 fixed aof_acks_before_write:0
+replica r7 fixed replica used_memory:150813771
+replica r8 fixed aof_current_size:267780976
+replica r8 fixed aof_acks_before_write:0
+replica r8 fixed replica used_memory:151203231
+replica r8 rc4 aof_current_size:300252688
+replica r8 rc4 aof_acks_before_write:0
+replica r8 rc4 replica used_memory:1234049271
+replica r9 rc4 aof_current_size:250218448
+replica r9 rc4 aof_acks_before_write:0
+replica r9 rc4 replica used_memory:1134746506
+replica r9 fixed aof_current_size:248191792
+replica r9 fixed aof_acks_before_write:0
+replica r9 fixed replica used_memory:150359763

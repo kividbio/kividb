@@ -1,0 +1,32 @@
+Json file /tmp/r/warm.c2.json created...
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 20%,   1 secs] 15 threads 10 conns:     5375145 ops, 5368252 (avg: 5368252) ops/sec, 731.53MB/sec (avg: 731.53MB/sec),  0.44 (avg:  0.44) msec latency[RUN #1 40%,   2 secs] 15 threads 10 conns:    10800689 ops, 5424524 (avg: 5396372) ops/sec, 739.20MB/sec (avg: 735.36MB/sec),  0.43 (avg:  0.44) msec latency[RUN #1 60%,   3 secs] 15 threads 10 conns:    16205229 ops, 5403448 (avg: 5398730) ops/sec, 736.32MB/sec (avg: 735.68MB/sec),  0.43 (avg:  0.43) msec latency[RUN #1 80%,   4 secs] 15 threads 10 conns:    21662126 ops, 5455844 (avg: 5413004) ops/sec, 743.46MB/sec (avg: 737.63MB/sec),  0.43 (avg:  0.43) msec latency[RUN #1 100%,   5 secs]  4 threads 10 conns:    27304577 ops, 5455844 (avg: 5459912) ops/sec, 743.46MB/sec (avg: 744.02MB/sec),  0.43 (avg:  0.43) msec latency[RUN #1 100%,   5 secs]  0 threads 10 conns:    27304656 ops, 5455844 (avg: 5459926) ops/sec, 743.46MB/sec (avg: 744.02MB/sec),  0.43 (avg:  0.43) msec latency
+
+Writing Full Run command HDR latency histogram results to /tmp/r/warm.c2_FULL_RUN_1.txt...
+Writing Full Run command HDR latency histogram results in HistogramLogProcessor format to /tmp/r/warm.c2_FULL_RUN_1.hgrm...
+Writing GET command HDR latency histogram results to /tmp/r/warm.c2_GET_command_run_1.txt...
+Writing GET command HDR latency histogram results in HistogramLogProcessor format to /tmp/r/warm.c2_GET_command_run_1.hgrm...
+
+CPU Utilization Summary
+  Total CPU time:   68.954s  (user 30.770s, sys 38.184s)
+  Wall time:        5.002s
+  Cores used:       13.784   (avg 91.9% across 15 worker threads)
+  Peak utilization: 1378.6%
+Saving JSON output file: /tmp/r/warm.c2.json
+Json file closed.
+15        Threads
+10        Connections per thread
+5         Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets            0.00          ---          ---             ---             ---             ---             ---         0.00 
+Gets      5460129.65   5460129.65         0.00         0.43057         0.42300         0.72700         1.19100    761905.80 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    5460129.65   5460129.65         0.00         0.43057         0.42300         0.72700         1.19100    761905.80 
+rc=0

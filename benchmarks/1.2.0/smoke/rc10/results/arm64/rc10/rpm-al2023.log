@@ -1,0 +1,7 @@
+INFO: useradd before install: absent
+INFO: rpm -qpR: shadow-utils 
+PASS: rpm: declares shadow-utils
+PASS: rpm: dnf install on clean amazonlinux:2023 (kividb-1.2.0~rc10-1.aarch64 shadow-utils-4.9-12.amzn2023.0.4.aarch64 )
+PASS: rpm: the kividb user exists (kividb:x:999:999:KiviDB:/var/lib/kividb:/usr/sbin/nologin)
+PASS: rpm: /usr/bin/kividb --version [kividb 1.2.0-rc10]
+PASS: rpm: the installed server runs as kividb on amazonlinux:2023 and answers PING

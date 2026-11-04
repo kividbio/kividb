@@ -1,0 +1,6 @@
+2026-11-03T07:40:05.572014372Z 2026-11-03T07:40:05.571Z 1 [INFO] Cluster: Replication target is now <ip>:6380 — re-pointing
+2026-11-03T07:40:05.572208720Z 2026-11-03T07:40:05.572Z 1 [INFO] Replication: Connecting to master <ip>:6380...
+2026-11-03T07:40:05.578503712Z 2026-11-03T07:40:05.578Z 1 [INFO] Replication: Partial resync: continuing from offset 11186505 — no dataset transfer
+2026-11-03T07:40:05.579388228Z 2026-11-03T07:40:05.579Z 1 [INFO] Replication: Synced with <ip>:6380. Entering command stream.
+2026-11-03T07:40:05.753755296Z 2026-11-03T07:40:05.753Z 1 [INFO] Replication: Command stream from <ip>:6380 superseded (epoch 1) — dropping connection
+2026-11-03T07:40:05.753800995Z 2026-11-03T07:40:05.753Z 1 [INFO] Replication: Replication session for <ip>:6380 superseded — stopping replication client

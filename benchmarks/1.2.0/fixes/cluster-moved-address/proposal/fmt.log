@@ -1,0 +1,20 @@
+Diff in /home/azureuser/proposal/src/cluster/bus/listener.rs:537:
+         // our suspicion and a peer's report from before the node came
+         // back make a quorum, and a healthy master is failed over.
+         let suspect = NodeFlags::PFAIL | NodeFlags::FAIL;
+-        let unconfirmed =
+-            !direct_contact && state.unconfirmed_addresses.read().contains(&id);
++        let unconfirmed = !direct_contact && state.unconfirmed_addresses.read().contains(&id);
+         let moved = !direct_contact
+             && !ip.is_empty()
+             && (entry.flags.intersects(suspect) || unconfirmed)
+Diff in /home/azureuser/proposal/src/cluster/bus/listener.rs:537:
+         // our suspicion and a peer's report from before the node came
+         // back make a quorum, and a healthy master is failed over.
+         let suspect = NodeFlags::PFAIL | NodeFlags::FAIL;
+-        let unconfirmed =
+-            !direct_contact && state.unconfirmed_addresses.read().contains(&id);
++        let unconfirmed = !direct_contact && state.unconfirmed_addresses.read().contains(&id);
+         let moved = !direct_contact
+             && !ip.is_empty()
+             && (entry.flags.intersects(suspect) || unconfirmed)

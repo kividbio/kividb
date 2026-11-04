@@ -24,6 +24,7 @@ mod config;
 pub mod eviction;
 pub mod expiry;
 pub mod field_expiry;
+pub mod key_moves;
 pub mod keyspace_events;
 pub mod keyspec;
 pub mod latency;
@@ -375,6 +376,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "none".to_string()
         }
     );
+    // One engine to a data directory, before anything in it is read.
+    lock_data_dir();
     // io_uring's workers hold open files of their own, kept from clients.
     #[cfg(target_os = "linux")]
     let uring = match config.io_model {
@@ -424,6 +427,75 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// The file in the data directory that a running engine holds locked.
+const DATA_DIR_LOCK: &str = "kividb.lock";
+
+/// Take the data directory — the working directory by now — for this
+/// process, waiting while another process has it.
+///
+/// Two engines in one directory read and write the same files. A second one
+/// started while the first was stopping, as a replacement container can be
+/// on the same volume, loaded the dump the first was about to replace, then
+/// carried on the first one's replication stream from where that stopped,
+/// and its replicas dropped their data for the older copy (#303). The lock
+/// is an exclusive `flock` (`LockFileEx` on Windows) held until the process
+/// exits, when the system releases it however the process ends. The other
+/// process is usually on its way out, so this waits for it rather than
+/// giving up.
+fn lock_data_dir() {
+    static HELD: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(DATA_DIR_LOCK)
+    {
+        Ok(file) => file,
+        Err(e) => {
+            log_warn!(
+                "Can't open {DATA_DIR_LOCK} in the data directory ({e}): starting without the \
+                 lock that keeps a second process out of it"
+            );
+            return;
+        }
+    };
+    let waiting_since = Instant::now();
+    let mut told: Option<Instant> = None;
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if told.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(5)) {
+                    let dir = std::env::current_dir()
+                        .map(|dir| dir.display().to_string())
+                        .unwrap_or_else(|_| ".".into());
+                    log_warn!(
+                        "The data directory {dir} is in use by another process (it holds \
+                         {DATA_DIR_LOCK}): waiting for it to be free ({}s so far)",
+                        waiting_since.elapsed().as_secs()
+                    );
+                    told = Some(Instant::now());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                log_warn!(
+                    "Can't lock {DATA_DIR_LOCK} ({e}): starting without the lock that keeps a \
+                     second process out of the data directory"
+                );
+                return;
+            }
+        }
+    }
+    if told.is_some() {
+        log_info!(
+            "The data directory is free after {:.1}s: starting",
+            waiting_since.elapsed().as_secs_f64()
+        );
+    }
+    let _ = HELD.set(file);
 }
 
 /// Walk keys to populate TEXT / inverted / FLAT data and HNSW graphs. A graph
@@ -694,7 +766,6 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     // just like the AOF writer, so it never competes with the io_uring workers.
     let hub_tx = {
         let repl_state_hub = Arc::clone(&repl_state);
-        let max_backlog_bytes = config.repl_replica_max_backlog_bytes;
         let (tx, rx) = std::sync::mpsc::sync_channel::<crate::replication::HubTx>(1);
         std::thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread()
@@ -702,7 +773,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                 .build()
                 .unwrap()
                 .block_on(async move {
-                    let hub_tx = start_hub(repl_state_hub, max_backlog_bytes);
+                    let hub_tx = start_hub(repl_state_hub);
                     tx.send(hub_tx).unwrap();
                     // Keep this runtime alive forever — the hub task lives here
                     std::future::pending::<()>().await;
@@ -756,12 +827,16 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
             &compaction_tx,
             &repl_state,
         );
+        // The expiry task started watching before anything was loaded: the
+        // hashes with field TTLs are the ones just loaded.
+        crate::field_expiry::rescan(&store);
         // A cluster master killed with no AOF has only what it last saved,
         // if anything: it serves none of its slots until its replica, which
         // may hold the data, has taken over or said it holds nothing.
         if config.cluster_enabled {
             crate::replication::CLEAN_EXIT_MARKER.store(true, std::sync::atomic::Ordering::Relaxed);
-            let stopped_cleanly = crate::replication::take_clean_exit_marker();
+            let stopped_cleanly =
+                crate::replication::take_clean_exit_marker(loaded.dump_fingerprint);
             let keys: usize = store
                 .iter()
                 .flat_map(|db| db.iter())
@@ -775,7 +850,9 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
         // A node that was a replica when it was last saved, and has loaded
         // exactly that save, can ask its master to continue from there.
         if loaded.exact_dump
-            && let Some(point) = crate::replication::load_saved_resync_point()
+            && let Some(point) = loaded
+                .dump_fingerprint
+                .and_then(crate::replication::load_saved_resync_point)
         {
             log_info!(
                 "Replication: Loaded dataset is offset {} of {} — a partial resync will be asked for",
@@ -789,7 +866,9 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
         } else if loaded.exact_dump
             && config.replicaof_addr().is_none()
             && cluster_state.my_master_id().is_none()
-            && let Some((repl_id, offset)) = crate::replication::load_saved_master_point()
+            && let Some((repl_id, offset)) = loaded
+                .dump_fingerprint
+                .and_then(crate::replication::load_saved_master_point)
         {
             // And a master stopped cleanly carries on its stream, so that
             // its replicas need not be sent everything again.
@@ -836,6 +915,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     let signal_snapshot_store = Arc::clone(&store);
     let signal_snapshot_index_store = Arc::clone(&index_store);
     let signal_repl_state = Arc::clone(&repl_state);
+    let signal_hub_tx = hub_tx.clone();
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -901,7 +981,21 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                 let m = crate::shutdown::SHUTDOWN_MODE.load(Ordering::Relaxed);
 
                 if m != crate::shutdown::mode::NOSAVE {
-                    log_info!("Writing final snapshot...");
+                    // Before the gate below: the clients are paused, the
+                    // write stream ends here, and the replicas are given the
+                    // time to receive all of it, so that the restart can
+                    // continue them from the offset saved below (#306). The
+                    // worker threads go on serving the replicas meanwhile.
+                    // `SHUTDOWN NOW` does not wait.
+                    let started = std::time::Instant::now();
+                    let deadline = if m != crate::shutdown::mode::NOW {
+                        crate::replication::drain_replicas_for_shutdown(
+                            &signal_repl_state,
+                            &signal_hub_tx,
+                        )
+                    } else {
+                        started
+                    };
                     // No command runs from here to the exit: the snapshot is
                     // cut at one moment (#148), and a write a connection
                     // already open made after that moment was acknowledged
@@ -911,10 +1005,38 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                     // binding: one dropped at the end of this block opened
                     // the gate again before `process::exit` below, and the
                     // writes that ran in between were acknowledged and lost.
-                    std::mem::forget(crate::command_gate::enter_alone());
+                    // What the final save takes is taken before the gate:
+                    // a replica's applier holds it while it waits at the
+                    // gate (#308).
+                    let hold = match crate::replication::hold_for_final_save(&signal_repl_state) {
+                        Ok(hold) => hold,
+                        Err(e) => {
+                            log_error!("Final snapshot failed: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+                    crate::replication::end_stream_for_shutdown(&signal_repl_state);
+                    if m != crate::shutdown::mode::NOW {
+                        crate::replication::report_replicas_at_shutdown(
+                            &signal_repl_state,
+                            &signal_hub_tx,
+                            started,
+                            deadline,
+                        );
+                    }
+                    // Not over the last good dump with a dataset a full
+                    // sync is still replacing.
+                    let Some(_settled) =
+                        crate::replication::dataset_for_final_save(&signal_repl_state)
+                    else {
+                        log_warn!("{}", crate::replication::FINAL_SAVE_SKIPPED);
+                        std::process::exit(0);
+                    };
+                    log_info!("Writing final snapshot...");
                     // With the replica's position in its master's stream
                     // beside it, so that the restart can ask to continue.
-                    let result = crate::replication::save_dataset(
+                    let result = crate::replication::save_dataset_held(
+                        &hold,
                         &signal_snapshot_store,
                         &signal_snapshot_index_store,
                         &signal_repl_state,
@@ -933,6 +1055,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                         std::process::exit(1);
                     }
                     log_info!("Goodbye.");
+                    std::mem::forget(hold);
                 } else {
                     log_info!("SHUTDOWN NOSAVE — skipping snapshot. Goodbye.");
                 }
@@ -1195,7 +1318,14 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                         }
 
                         loop {
+                            // Shutting down: accept nothing more, and keep
+                            // serving the connections this worker has until
+                            // the process ends. Returning ended this worker's
+                            // runtime and every connection on it, a replica's
+                            // among them, before the shutdown had sent that
+                            // replica the end of the stream (#306).
                             if shutdown.load(Ordering::Relaxed) {
+                                std::future::pending::<()>().await;
                                 return;
                             }
 
@@ -1226,6 +1356,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                             if shutdown.load(Ordering::Relaxed) {
+                                std::future::pending::<()>().await;
                                 return;
                             }
 
@@ -1476,10 +1607,7 @@ async fn async_main_tokio(
     // handed this channel directly. See `aof::install_global_aof_sender`.
     aof::install_global_aof_sender(Box::new(aof_tx.clone()));
     let repl_state = Arc::new(ReplState::from_config(&config));
-    let hub_tx = start_hub(
-        Arc::clone(&repl_state),
-        config.repl_replica_max_backlog_bytes,
-    );
+    let hub_tx = start_hub(Arc::clone(&repl_state));
     crate::stats::spawn_instantaneous_ops_sampler();
     let latency = crate::latency::new_latency_tracker();
     crate::commands::helpers::spawn_active_expire_task(
@@ -1553,12 +1681,16 @@ async fn async_main_tokio(
             &compaction_tx,
             &repl_state,
         );
+        // The expiry task started watching before anything was loaded: the
+        // hashes with field TTLs are the ones just loaded.
+        crate::field_expiry::rescan(&store);
         // A cluster master killed with no AOF has only what it last saved,
         // if anything: it serves none of its slots until its replica, which
         // may hold the data, has taken over or said it holds nothing.
         if config.cluster_enabled {
             crate::replication::CLEAN_EXIT_MARKER.store(true, std::sync::atomic::Ordering::Relaxed);
-            let stopped_cleanly = crate::replication::take_clean_exit_marker();
+            let stopped_cleanly =
+                crate::replication::take_clean_exit_marker(loaded.dump_fingerprint);
             let keys: usize = store
                 .iter()
                 .flat_map(|db| db.iter())
@@ -1572,7 +1704,9 @@ async fn async_main_tokio(
         // A node that was a replica when it was last saved, and has loaded
         // exactly that save, can ask its master to continue from there.
         if loaded.exact_dump
-            && let Some(point) = crate::replication::load_saved_resync_point()
+            && let Some(point) = loaded
+                .dump_fingerprint
+                .and_then(crate::replication::load_saved_resync_point)
         {
             log_info!(
                 "Replication: Loaded dataset is offset {} of {} — a partial resync will be asked for",
@@ -1586,7 +1720,9 @@ async fn async_main_tokio(
         } else if loaded.exact_dump
             && config.replicaof_addr().is_none()
             && cluster_state.my_master_id().is_none()
-            && let Some((repl_id, offset)) = crate::replication::load_saved_master_point()
+            && let Some((repl_id, offset)) = loaded
+                .dump_fingerprint
+                .and_then(crate::replication::load_saved_master_point)
         {
             // And a master stopped cleanly carries on its stream, so that
             // its replicas need not be sent everything again.
@@ -2064,6 +2200,7 @@ async fn async_main_tokio(
         let store_c = Arc::clone(&snapshot_store);
         let index_c = Arc::clone(&snapshot_index_store);
         let repl_c = Arc::clone(&snapshot_repl_state);
+        let hub_c = hub_tx.clone();
         // With the replica's position in its master's stream beside it, so
         // that the restart can ask to continue.
         let result = tokio::task::spawn_blocking(move || {
@@ -2071,9 +2208,30 @@ async fn async_main_tokio(
             // the connections already open keep running, and a write one
             // made after the snapshot's cut was acknowledged and then lost.
             // The guard is this thread's, and is never let go.
-            let _no_more_commands = crate::command_gate::enter_alone();
-            let saved = crate::replication::save_dataset(&store_c, &index_c, &repl_c);
-            std::mem::forget(_no_more_commands);
+            // First the clients are paused, the stream ends and the
+            // replicas are given the time to receive it all, as on io_uring
+            // above (#306).
+            let started = std::time::Instant::now();
+            let deadline = if m != mode::NOW {
+                crate::replication::drain_replicas_for_shutdown(&repl_c, &hub_c)
+            } else {
+                started
+            };
+            // What the final save takes is taken before the gate, as on
+            // io_uring above (#308).
+            let hold = crate::replication::hold_for_final_save(&repl_c)?;
+            crate::replication::end_stream_for_shutdown(&repl_c);
+            if m != mode::NOW {
+                crate::replication::report_replicas_at_shutdown(&repl_c, &hub_c, started, deadline);
+            }
+            // Not over the last good dump with a dataset a full sync is
+            // still replacing.
+            let Some(_settled) = crate::replication::dataset_for_final_save(&repl_c) else {
+                log_warn!("{}", crate::replication::FINAL_SAVE_SKIPPED);
+                std::process::exit(0);
+            };
+            let saved = crate::replication::save_dataset_held(&hold, &store_c, &index_c, &repl_c);
+            std::mem::forget(hold);
             saved
         })
         .await;

@@ -1,0 +1,5 @@
+2026-11-03T02:47:29Z  kividb-rc8  [kividb 1.2.0-rc8]
+    ~/bin/kividb-rc8 --port 6379 --bind 0.0.0.0
+2026-11-03T02:47:30.065Z 21487 [INFO] I/O model      : io_uring
+up: kividb-rc8
+stopped

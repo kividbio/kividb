@@ -1,0 +1,75 @@
+Json file /tmp/r/mget10_p1.c2.json created...
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 5%,   1 secs] 15 threads 40 conns:      595918 ops,  595720 (avg:  595720) ops/sec, 749.29MB/sec (avg: 749.29MB/sec),  1.00 (avg:  1.00) msec latency
+warning: high CPU on thread 0: 97.6% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 1: 99.1% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 2: 99.5% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 3: 98.1% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 4: 98.9% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 5: 98.1% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 6: 96.8% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 7: 99.2% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 8: 97.9% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 9: 98.6% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 10: 98.5% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 11: 98.3% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 12: 98.1% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 13: 98.6% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 14: 99.1% of a core (threshold 95.0%) - results may be unreliable
+[RUN #1 10%,   2 secs] 15 threads 40 conns:     1198141 ops,  601600 (avg:  598661) ops/sec, 756.69MB/sec (avg: 752.99MB/sec),  0.99 (avg:  1.00) msec latency[RUN #1 15%,   3 secs] 15 threads 40 conns:     1798992 ops,  600724 (avg:  599349) ops/sec, 755.59MB/sec (avg: 753.86MB/sec),  0.99 (avg:  1.00) msec latency[RUN #1 20%,   4 secs] 15 threads 40 conns:     2397568 ops,  598458 (avg:  599126) ops/sec, 752.74MB/sec (avg: 753.58MB/sec),  1.00 (avg:  1.00) msec latency[RUN #1 25%,   5 secs] 15 threads 40 conns:     2996549 ops,  598848 (avg:  599071) ops/sec, 753.22MB/sec (avg: 753.51MB/sec),  1.00 (avg:  1.00) msec latency[RUN #1 30%,   6 secs] 15 threads 40 conns:     3593046 ops,  596380 (avg:  598622) ops/sec, 750.12MB/sec (avg: 752.94MB/sec),  1.00 (avg:  1.00) msec latency[RUN #1 35%,   7 secs] 15 threads 40 conns:     4192887 ops,  599726 (avg:  598780) ops/sec, 754.33MB/sec (avg: 753.14MB/sec),  1.00 (avg:  1.00) msec latency[RUN #1 40%,   8 secs] 15 threads 40 conns:     4795826 ops,  602342 (avg:  599225) ops/sec, 757.62MB/sec (avg: 753.70MB/sec),  0.99 (avg:  1.00) msec latency[RUN #1 45%,   9 secs] 15 threads 40 conns:     5389305 ops,  593347 (avg:  598572) ops/sec, 746.31MB/sec (avg: 752.88MB/sec),  1.01 (avg:  1.00) msec latency[RUN #1 50%,  10 secs] 15 threads 40 conns:     5990133 ops,  600704 (avg:  598786) ops/sec, 755.56MB/sec (avg: 753.15MB/sec),  1.00 (avg:  1.00) msec latency[RUN #1 55%,  11 secs] 15 threads 40 conns:     6590789 ops,  600531 (avg:  598944) ops/sec, 755.34MB/sec (avg: 753.35MB/sec),  1.00 (avg:  1.00) msec latency[RUN #1 60%,  12 secs] 15 threads 40 conns:     7190686 ops,  599771 (avg:  599013) ops/sec, 754.39MB/sec (avg: 753.43MB/sec),  1.00 (avg:  1.00) msec latency[RUN #1 65%,  13 secs] 15 threads 40 conns:     7790888 ops,  600102 (avg:  599097) ops/sec, 754.80MB/sec (avg: 753.54MB/sec),  1.00 (avg:  1.00) msec latency[RUN #1 70%,  14 secs] 15 threads 40 conns:     8393061 ops,  601574 (avg:  599274) ops/sec, 756.65MB/sec (avg: 753.76MB/sec),  0.99 (avg:  1.00) msec latency[RUN #1 75%,  15 secs] 15 threads 40 conns:     8993976 ops,  600778 (avg:  599374) ops/sec, 755.65MB/sec (avg: 753.89MB/sec),  1.00 (avg:  1.00) msec latency[RUN #1 80%,  16 secs] 15 threads 40 conns:     9594236 ops,  600124 (avg:  599421) ops/sec, 754.83MB/sec (avg: 753.95MB/sec),  1.00 (avg:  1.00) msec latency[RUN #1 85%,  17 secs] 15 threads 40 conns:    10192148 ops,  597761 (avg:  599323) ops/sec, 751.86MB/sec (avg: 753.82MB/sec),  1.00 (avg:  1.00) msec latency[RUN #1 90%,  18 secs] 15 threads 40 conns:    10788760 ops,  596454 (avg:  599164) ops/sec, 750.21MB/sec (avg: 753.62MB/sec),  1.00 (avg:  1.00) msec latency[RUN #1 95%,  19 secs] 15 threads 40 conns:    11387142 ops,  598055 (avg:  599106) ops/sec, 752.23MB/sec (avg: 753.55MB/sec),  1.00 (avg:  1.00) msec latency[RUN #1 100%,  20 secs] 15 threads 40 conns:    11993561 ops,  607848 (avg:  599542) ops/sec, 764.55MB/sec (avg: 754.10MB/sec),  0.98 (avg:  1.00) msec latency[RUN #1 100%,  20 secs]  0 threads 40 conns:    11993744 ops,  607848 (avg:  599536) ops/sec, 764.55MB/sec (avg: 754.09MB/sec),  0.98 (avg:  1.00) msec latency
+
+Writing Full Run command HDR latency histogram results to /tmp/r/mget10_p1.c2_FULL_RUN_1.txt...
+Writing Full Run command HDR latency histogram results in HistogramLogProcessor format to /tmp/r/mget10_p1.c2_FULL_RUN_1.hgrm...
+Writing MGET command HDR latency histogram results to /tmp/r/mget10_p1.c2_MGET_command_run_1.txt...
+Writing MGET command HDR latency histogram results in HistogramLogProcessor format to /tmp/r/mget10_p1.c2_MGET_command_run_1.hgrm...
+
+CPU Utilization Summary
+  Total CPU time:   295.432s  (user 120.948s, sys 174.484s)
+  Wall time:        20.011s
+  Cores used:       14.763   (avg 98.4% across 15 worker threads)
+  Peak utilization: 1480.8%
+warning: thread 0 averaged 98.4% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 1 averaged 98.7% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 2 averaged 97.9% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 3 averaged 98.4% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 4 averaged 98.8% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 5 averaged 99.2% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 6 averaged 97.8% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 7 averaged 99.0% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 8 averaged 98.3% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 9 averaged 98.1% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 10 averaged 98.5% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 11 averaged 97.8% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 12 averaged 98.1% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 13 averaged 98.8% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 14 averaged 98.5% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+Saving JSON output file: /tmp/r/mget10_p1.c2.json
+Json file closed.
+15        Threads
+40        Connections per thread
+20        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Mgets      599536.99   5995369.86         0.00         0.99743         0.98300         1.38300         3.72700    772190.19 
+Totals     599536.99   5995369.86         0.00         0.99743         0.98300         1.38300         3.72700   1544380.39 
+rc=0

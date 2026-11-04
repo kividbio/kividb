@@ -203,3 +203,91 @@ fn many_threads_hand_values_to_each_other() {
     }
     assert_eq!(value_slab::slabs_in_use(), before);
 }
+
+/// What `a_slab_that_empties_between_the_passes_is_left_alone` does between
+/// the two passes of `plan_evacuation`.
+static BETWEEN: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+
+fn between() {
+    let step = BETWEEN.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(step) = step {
+        step();
+    }
+}
+
+/// `n` blocks of `class`, made on a thread of their own, which ends.
+fn blocks_of(class: usize, n: usize) -> Vec<usize> {
+    thread::spawn(move || {
+        (0..n)
+            .map(|_| value_slab::alloc(class).as_ptr() as usize)
+            .collect()
+    })
+    .join()
+    .unwrap()
+}
+
+fn free_block(block: usize, class: usize) {
+    // SAFETY: from `value_slab::alloc(class)`, and freed once.
+    unsafe { value_slab::free(std::ptr::NonNull::new(block as *mut u8).unwrap(), class) }
+}
+
+/// A full slab of `class`, let go of, and half of it freed, so that it is in
+/// its class's list and nothing else of the class is: its blocks still held.
+fn listed_half_full(class: usize) -> Vec<usize> {
+    let per_slab = SLAB / value_slab::block_size(class);
+    let mut blocks = blocks_of(class, per_slab + 1);
+    // The last came from a second slab, listed when its thread ended: freed,
+    // that slab empties.
+    let last = blocks.pop().unwrap();
+    assert_ne!(last & !(SLAB - 1), blocks[0] & !(SLAB - 1));
+    free_block(last, class);
+    for block in blocks.drain(..per_slab / 2) {
+        free_block(block, class);
+    }
+    blocks
+}
+
+#[test]
+fn a_slab_that_empties_between_the_passes_is_left_alone() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let before = value_slab::slabs_in_use();
+    const CLASS: usize = 20;
+    // Untouched between the passes, the slab is chosen.
+    let held = listed_half_full(CLASS);
+    let slab = held[0] & !(SLAB - 1);
+    assert_eq!(value_slab::plan_evacuation(usize::MAX), 1);
+    assert!(value_slab::is_evacuating(
+        held[0] as *const u8,
+        &value_slab::regions_snapshot()
+    ));
+    value_slab::finish_evacuation();
+    // Between the passes, it empties, another thread takes it for the same
+    // class and lets go of it, and it is listed again: the same header in
+    // the same list, but not the slab measured. It is left alone.
+    let measured = value_slab::generation_of(slab as *const u8);
+    let again = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let theirs = std::sync::Arc::clone(&again);
+    *BETWEEN.lock().unwrap() = Some(Box::new(move || {
+        for block in held {
+            free_block(block, CLASS);
+        }
+        let blocks = listed_half_full(CLASS);
+        assert_eq!(blocks[0] & !(SLAB - 1), slab, "the same slab, taken again");
+        *theirs.lock().unwrap() = blocks;
+    }));
+    *value_slab::PAUSE_BETWEEN_PASSES.lock() = Some(between);
+    let chosen = value_slab::plan_evacuation(usize::MAX);
+    *value_slab::PAUSE_BETWEEN_PASSES.lock() = None;
+    let held = std::mem::take(&mut *again.lock().unwrap());
+    assert_ne!(value_slab::generation_of(slab as *const u8), measured);
+    assert!(
+        !value_slab::is_evacuating(held[0] as *const u8, &value_slab::regions_snapshot()),
+        "a slab chosen that emptied and was listed again after it was measured"
+    );
+    assert_eq!(chosen, 0);
+    value_slab::finish_evacuation();
+    for block in held {
+        free_block(block, CLASS);
+    }
+    assert_eq!(value_slab::slabs_in_use(), before);
+}

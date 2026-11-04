@@ -1,0 +1,5 @@
+2026-11-03T11:31:55Z  kividb-rc10  [kividb 1.2.0-rc10]
+    /home/azureuser/bin/kividb-rc10 --port 6379 --bind 0.0.0.0
+2026-11-03T11:31:55.652Z 15422 [INFO] I/O model      : io_uring
+up: kividb-rc10
+stopped

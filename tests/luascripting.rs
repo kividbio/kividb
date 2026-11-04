@@ -2049,3 +2049,44 @@ fn a_script_may_not_run_noscript_commands() {
     assert_eq!(c.cmds(&["PING"]), RespValue::SimpleStr("PONG".into()));
     assert!(c.cmds(&["CLIENT", "GETNAME"]).is_nil());
 }
+
+/// `SCRIPT HELP` lists the subcommands, as `FUNCTION HELP` does; it was an
+/// unknown subcommand (#256).
+#[test]
+fn test_script_help_lists_subcommands() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let RespValue::Array(lines) = c.cmds(&["SCRIPT", "HELP"]) else {
+        panic!("SCRIPT HELP did not reply with an array");
+    };
+    let lines: Vec<&str> = lines.iter().map(|line| line.as_str()).collect();
+    assert_eq!(
+        lines,
+        [
+            "SCRIPT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+            "DEBUG (YES|SYNC|NO)",
+            "    Set the debug mode for subsequent scripts executed.",
+            "EXISTS <sha1> [<sha1> ...]",
+            "    Return information about the existence of the scripts in the script cache.",
+            "FLUSH [ASYNC|SYNC]",
+            "    Flush the Lua scripts cache. Very dangerous on replicas.",
+            "    When called without the optional mode argument, the behavior is determined by the",
+            "    lazyfree-lazy-user-flush configuration directive. Valid modes are:",
+            "    * ASYNC: Asynchronously flush the scripts cache.",
+            "    * SYNC: Synchronously flush the scripts cache.",
+            "KILL",
+            "    Kill the currently executing Lua script.",
+            "LOAD <script>",
+            "    Load a script into the scripts cache without executing it.",
+            "HELP",
+            "    Print this help.",
+        ]
+    );
+    assert_eq!(
+        c.cmds(&["SCRIPT", "HELP", "extra"]).as_error(),
+        "ERR wrong number of arguments for 'script|help' command"
+    );
+}
