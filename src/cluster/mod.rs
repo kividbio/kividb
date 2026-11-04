@@ -213,11 +213,14 @@ pub struct LostDataset {
 /// A temporary guard (`self.nodes.read().get(..)`) is held to the end of
 /// its statement, or of the `match` / `if let` / `for` it heads.
 ///
-/// None of these is taken while a store shard's lock, the index store's or
-/// the replication taps' is held: not `nodes`, `slots`, `migrations`,
-/// `myself`, the tasks of `slot_migrations` nor `slot_deletions`. A batch of
-/// a deletion of a lost slot's keys holds `slot_deletions` while it takes
-/// those (`migration::SlotDeletions`), and whatever gives this node a slot
+/// None of these is taken while a store shard's lock is held, nor the
+/// index store's, the replication taps', or one of an index's own: its
+/// postings, its HNSW graph's `key_to_id` and `nodes`, its flat vectors.
+/// Not `nodes`, `slots`, `migrations`, `myself`, the tasks of
+/// `slot_migrations` nor `slot_deletions`. A batch of a deletion of a lost
+/// slot's keys holds `slot_deletions` while it takes all of those, to
+/// delete and unindex its keys (`migration::SlotDeletions`); the postings
+/// block a writer once their queue is full. Whatever gives this node a slot
 /// holds `slots` or `migrations` while it takes `slot_deletions`: a thread
 /// holding a shard and waiting for `slots` closes the circle, and the node
 /// stops for good (#353). Code that walks the keyspace and needs the slot

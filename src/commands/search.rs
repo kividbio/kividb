@@ -1447,6 +1447,15 @@ fn page_from_postings(
     } else {
         args.offset.saturating_add(args.count)
     };
+    // The slots this node serves, read before the postings are: nothing
+    // reads the slot table with an index's lock held. A deletion of a lost
+    // slot's keys takes the postings to unindex its keys, holding what
+    // makes a slot come back wait, and that waits holding the slot table
+    // (see `ClusterState`, #353).
+    let served_slots = ctx
+        .cluster
+        .enabled
+        .then(|| crate::cluster::search::served_slots(ctx.cluster));
     let (picked, total, timed_out) = {
         // What was written since the plan is not among its ids. What was
         // queued is applied: an expiry unmarks a key once its removal is
@@ -1464,8 +1473,7 @@ fn page_from_postings(
                 ids.unset(id);
             }
         }
-        if ctx.cluster.enabled {
-            let slots = crate::cluster::search::served_slots(ctx.cluster);
+        if let Some(slots) = &served_slots {
             let mut served = Bits::new();
             for id in ids.iter() {
                 let slot = p.slot(id) as usize;

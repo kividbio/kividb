@@ -1303,11 +1303,27 @@ fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
             };
             // `command_gate::skips` lets `SETSLOT ... NODE` past the gate,
             // for the keys `NODE` to this node may delete first. To another
-            // node it takes the gate here, as every command does: the look
-            // below for keys of the slot is then not beside a transaction
-            // or a script that writes one.
+            // node it takes the gate here, as every command does, and is
+            // turned away as they are by a script past its time limit: the
+            // look below for keys of the slot is then not beside a
+            // transaction or a script that writes one.
             let _gate = if new_owner != ctx.cluster.myself() {
-                Some(crate::command_gate::enter())
+                #[cfg(feature = "lua")]
+                let overrun = crate::commands::lua::running_script_is_over_its_time_limit;
+                #[cfg(not(feature = "lua"))]
+                let overrun = || false;
+                match crate::command_gate::enter_unless(
+                    std::time::Duration::from_millis(10),
+                    overrun,
+                ) {
+                    Some(gate) => Some(gate),
+                    None => {
+                        return resp_error(
+                            "BUSY Redis is busy running a script. You can only call SCRIPT KILL \
+                             or SHUTDOWN NOSAVE.",
+                        );
+                    }
+                }
             } else {
                 None
             };

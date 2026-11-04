@@ -602,11 +602,12 @@ struct Deleted {
 #[derive(Default)]
 pub struct SlotDeletions {
     /// Held by a deletion's batch from its look to its last delete, which
-    /// lock shards, the index store and the write stream's queue meanwhile.
-    /// Whatever gives this node a slot takes it holding `slots` or
-    /// `migrations`. So nothing that holds a shard's lock, the index
-    /// store's or the taps' may take this, nor any lock of `ClusterState`
-    /// (see there): it would wait for the batch, which waits for it.
+    /// lock shards, the index store, each index's own locks (postings, an
+    /// HNSW graph's `key_to_id` and `nodes`, flat vectors) and the write
+    /// stream's queue meanwhile. Whatever gives this node a slot takes it
+    /// holding `slots` or `migrations`. So nothing that holds one of those
+    /// may take this, nor any lock of `ClusterState` (see there): it would
+    /// wait for the batch, which waits for it.
     counts: Mutex<DeletionCounts>,
 }
 
