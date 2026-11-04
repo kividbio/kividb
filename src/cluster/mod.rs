@@ -2351,13 +2351,30 @@ impl ClusterState {
     }
 
     /// Record that `slots` now belong to `new_owner`, at the end of an atomic
-    /// migration away from this node.
-    pub fn hand_over_slots(&self, slots: impl Iterator<Item = u16>, new_owner: NodeId) {
+    /// migration away from this node. Returns the ones it took from this
+    /// node: only their keys are the caller's to delete.
+    ///
+    /// A slot that is no longer this node's is left as it is. The
+    /// destination's claim can reach this node before its answer to the
+    /// `TAKEOVER`, and take the slots first (`apply_peer_slot_claims`). What
+    /// became of their keys was decided then: they were dropped with the
+    /// lost slots, or, if that left this node with no slots, it followed the
+    /// destination as a replica, and its dataset is now the destination's.
+    /// The source used to delete the keys of every slot it handed over all
+    /// the same, from its master's dataset in the second case (#348). The
+    /// claim takes a slot under `slots`, as this does, so each slot leaves
+    /// this node one way only.
+    pub fn hand_over_slots(&self, slots: impl Iterator<Item = u16>, new_owner: NodeId) -> Vec<u16> {
+        let me = self.myself();
+        let mut handed = Vec::new();
         {
             let mut owners = self.slots.write();
             let mut migrations = self.migrations.write();
             for slot in slots {
-                owners[slot as usize] = Some(new_owner);
+                if owners[slot as usize] == Some(me) {
+                    owners[slot as usize] = Some(new_owner);
+                    handed.push(slot);
+                }
                 migrations.remove(&slot);
             }
         }
@@ -2368,6 +2385,7 @@ impl ClusterState {
         crate::pause::routes_moved();
         // The caller saves, once writes are no longer paused.
         self.refresh_state();
+        handed
     }
 
     // ── Writes held until this master knows it still owns its slots ──────────
@@ -2464,10 +2482,20 @@ impl ClusterState {
     /// already (`CLIENT UNPAUSE`, or this master's replica took its slots
     /// over), or another handoff or a manual failover (#242) still holds
     /// them, which lets them go itself.
+    ///
+    /// Not a hold for a FAIL verdict (`MarkedFailed`): that one refuses
+    /// writes (`marked_failed`) and does not pause them, so it does not end
+    /// the pause when it is let go (`release_held_writes`). With one taken
+    /// during the handoff, the handoff left its pause on for the hold to end,
+    /// the hold did not, and writes waited until the pause ran out, a
+    /// century later (#349).
     pub(crate) fn end_handoff_hold(&self) {
         let mut holds = self.handoff_holds.lock();
         *holds = holds.saturating_sub(1);
-        if *holds == 0 && crate::pause::handoff() && !self.writes_held() {
+        if *holds == 0
+            && crate::pause::handoff()
+            && !self.held_writes.lock().as_ref().is_some_and(|h| h.paused)
+        {
             crate::pause::clear_pause();
         }
     }
@@ -2619,6 +2647,10 @@ impl ClusterState {
         self.migrations.write().clear();
         self.failure_reports.write().clear();
         *self.election.lock() = None;
+        // Peers are banned and the tables cleared: a heartbeat merged from
+        // here on finds the ban. Let go of before `release_held_writes`,
+        // which takes `handoff_holds`, a lock that comes before `forgotten`.
+        drop(forgotten);
         self.release_held_writes("the node was reset");
         let _ = self.save_to_disk();
     }
@@ -2859,6 +2891,76 @@ mod tests {
         assert!(crate::pause::handoff());
         cs.end_handoff_hold();
         assert!(!crate::pause::handoff());
+    }
+
+    /// A master told it has been marked FAIL holds writes by refusing them
+    /// (`MarkedFailed`), not by pausing them. Told so during an atomic slot
+    /// migration's handoff, it kept the handoff's pause on when the handoff
+    /// ended, and letting the hold go did not end it: writes waited for the
+    /// pause to run out, a century later (#349). Now the handoff ends its
+    /// pause, and the hold keeps refusing writes until it is let go. A
+    /// manual failover's hold still keeps the pause, whatever joins it.
+    #[test]
+    fn a_handoff_ends_its_pause_beside_a_hold_for_a_fail_verdict() {
+        let _pause = crate::pause::TEST_LOCK.lock();
+        crate::pause::clear_pause();
+        let cs = ClusterState::new_enabled(None, 15000);
+        let ask = now_ms() + 60_000;
+
+        cs.hold_writes_for_handoff();
+        cs.hold_writes_until_confirmed(HoldReason::MarkedFailed, ask);
+        cs.end_handoff_hold();
+        assert!(
+            !crate::pause::handoff(),
+            "a hold for a FAIL verdict kept a handoff's pause on"
+        );
+        assert!(cs.writes_held());
+        cs.release_held_writes("the test");
+        assert!(!crate::pause::handoff() && !cs.writes_held());
+
+        // The verdict first, then the handoff.
+        cs.hold_writes_until_confirmed(HoldReason::MarkedFailed, ask);
+        cs.hold_writes_for_handoff();
+        cs.release_held_writes("the test");
+        assert!(
+            crate::pause::handoff(),
+            "a hold for a FAIL verdict let a handoff's writes go"
+        );
+        cs.end_handoff_hold();
+        assert!(!crate::pause::handoff());
+
+        // A verdict joining a manual failover's hold.
+        cs.hold_writes_for_handoff();
+        cs.hold_writes_until_confirmed(HoldReason::ManualFailover, ask);
+        cs.hold_writes_until_confirmed(HoldReason::MarkedFailed, ask);
+        cs.end_handoff_hold();
+        assert!(
+            crate::pause::handoff(),
+            "a handoff let a failover's writes go"
+        );
+        cs.release_held_writes("the test");
+        assert!(!crate::pause::handoff());
+    }
+
+    /// The end of an atomic slot migration hands over only the slots that
+    /// are still this node's. One the destination's claim took first is
+    /// left to the claim, and is not among those whose keys the source
+    /// deletes (#348); nor is one this node never had.
+    #[test]
+    fn only_the_slots_still_here_are_handed_over() {
+        let (cs, a, b) = three_master_cluster();
+        let claim = [crate::cluster::bus::SlotClaim {
+            start: 100,
+            end: 100,
+            epoch: 1_000_000,
+        }];
+        cs.apply_peer_slot_claims(a, &claim);
+        assert_eq!(cs.slot_owner(100), Some(a));
+        let handed = cs.hand_over_slots([100, 101, 6000].into_iter(), b);
+        assert_eq!(handed, vec![101]);
+        assert_eq!(cs.slot_owner(100), Some(a));
+        assert_eq!(cs.slot_owner(101), Some(b));
+        assert_eq!(cs.slot_owner(6000), Some(a));
     }
 
     // ── DELSLOTS ─────────────────────────────────────────────────────────

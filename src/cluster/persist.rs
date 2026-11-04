@@ -370,24 +370,42 @@ fn topology_fingerprint(
 /// identical file a dozen times a second per node was most of this module's
 /// actual work.
 pub fn save_from_state(state: &crate::cluster::ClusterState) -> std::io::Result<()> {
-    save_from_state_then(state, &[], || {})
+    save_then(state, &[], None::<fn()>)
 }
 
 /// [`save_from_state`], with `mine` saved as this node's slots, and then,
 /// once that is saved, `publish`: the change that makes them so in
-/// `state`. Nothing is published if the save fails. `publish` runs before
-/// any other save can be made, so none is made in between that leaves the
-/// slots out (`ClusterState::take_over_slots`). It may take `slots` and
-/// `migrations`, not `save_lock` or `nodes`.
+/// `state`. Nothing is published if the save fails: the file is synced
+/// before `publish` runs, unless the sync is deferred
+/// ([`with_deferred_sync`]). `publish` runs before any other save can be
+/// made, so none is made in between that leaves the slots out
+/// (`ClusterState::take_over_slots`). It may take `slots` and `migrations`,
+/// not `save_lock` or `nodes`.
 pub fn save_from_state_then(
     state: &crate::cluster::ClusterState,
     mine: &[u16],
     publish: impl FnOnce(),
 ) -> std::io::Result<()> {
+    save_then(state, mine, Some(publish))
+}
+
+/// Sync the saved file at `path`.
+fn sync_saved(path: &Path) -> std::io::Result<()> {
+    // Opened for writing: Windows will not flush a file opened to read.
+    fs::OpenOptions::new().write(true).open(path)?.sync_all()
+}
+
+fn save_then(
+    state: &crate::cluster::ClusterState,
+    mine: &[u16],
+    publish: Option<impl FnOnce()>,
+) -> std::io::Result<()> {
     let path = match state.config_path.as_ref() {
         Some(p) => p,
         None => {
-            publish();
+            if let Some(publish) = publish {
+                publish();
+            }
             return Ok(());
         }
     };
@@ -417,14 +435,34 @@ pub fn save_from_state_then(
     };
     let fingerprint = topology_fingerprint(&nodes_snap, &slots_snap, epoch, last_vote);
     if state.last_saved_fingerprint.load(Ordering::Relaxed) == fingerprint && path.exists() {
-        publish();
+        if let Some(publish) = publish {
+            publish();
+        }
         return Ok(());
     }
     save(path, &nodes_snap, &slots_snap, epoch, last_vote)?;
-    state
-        .last_saved_fingerprint
-        .store(fingerprint, Ordering::Relaxed);
-    publish();
+    let deferred = DEFER_SYNC.with(|d| d.get());
+    // A change to publish waits for the sync, with the lock held, so that a
+    // sync that fails publishes nothing. A save with nothing to publish (the
+    // bus's) syncs after it has let go of the lock, below.
+    let synced = match publish {
+        Some(publish) => {
+            if !deferred {
+                sync_saved(path)?;
+            }
+            state
+                .last_saved_fingerprint
+                .store(fingerprint, Ordering::Relaxed);
+            publish();
+            !deferred
+        }
+        None => {
+            state
+                .last_saved_fingerprint
+                .store(fingerprint, Ordering::Relaxed);
+            false
+        }
+    };
     drop(saving);
     if asked.elapsed() > std::time::Duration::from_millis(100) {
         log_info!(
@@ -432,17 +470,16 @@ pub fn save_from_state_then(
             asked.elapsed().as_millis()
         );
     }
-    if DEFER_SYNC.with(|d| d.get()) {
+    if synced {
+        Ok(())
+    } else if deferred {
         let path = path.clone();
         std::thread::spawn(move || {
-            if let Ok(f) = fs::OpenOptions::new().write(true).open(&path) {
-                let _ = f.sync_all();
-            }
+            let _ = sync_saved(&path);
         });
         Ok(())
     } else {
-        // Opened for writing: Windows will not flush a file opened to read.
-        fs::OpenOptions::new().write(true).open(path)?.sync_all()
+        sync_saved(path)
     }
 }
 

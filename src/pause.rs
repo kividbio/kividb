@@ -91,7 +91,7 @@ pub fn active() -> Option<bool> {
             .is_ok()
         {
             // A handoff that ran out of time is over, like its pause.
-            HANDOFF.fetch_and(!HANDOFF_PAUSE, Ordering::Release);
+            end_handoff_flag();
         }
         return None;
     }
@@ -136,8 +136,28 @@ pub fn clear_pause() {
     if held && HELD.load(Ordering::SeqCst) == 0 {
         let _ = PAUSE_UNTIL_MS.compare_exchange(ENDING, 0, Ordering::SeqCst, Ordering::SeqCst);
     }
-    HANDOFF.fetch_and(!HANDOFF_PAUSE, Ordering::Release);
+    end_handoff_flag();
     CHANGED.notify_waiters();
+}
+
+/// Take the flag of a handoff's pause down, and if it was up, move the
+/// routes ([`routes_moved`]) in the same change. A write that finds the
+/// flag down then finds the routes moved too, and is routed again in the
+/// gate, however the pause ended: the handoff's end, a hold let go,
+/// `CLIENT UNPAUSE`, or its time running out. A handoff that moved slots
+/// still moves the routes itself first, before `PAUSE_UNTIL_MS` is cleared,
+/// for a write that sees the pause over with the flag still up
+/// ([`handoff_pause_in_force`]). The flag is up only in a cluster, so the
+/// count still stays 0 outside one.
+fn end_handoff_flag() {
+    let mut now = HANDOFF.load(Ordering::Relaxed);
+    while now & HANDOFF_PAUSE != 0 {
+        let ended = (now & !HANDOFF_PAUSE).wrapping_add(ROUTES_MOVED);
+        match HANDOFF.compare_exchange_weak(now, ended, Ordering::SeqCst, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(seen) => now = seen,
+        }
+    }
 }
 
 /// Woken when a pause is ended, and when the last client it held goes on.

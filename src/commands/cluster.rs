@@ -1684,6 +1684,15 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
     } else {
         hold_while_moving(db, &keys)
     };
+    // A node that has become a replica since this was routed: its keys are
+    // its master's, and deleting them once they are sent would leave it
+    // without keys its master has (#348). In the write gate, held from here
+    // until they are deleted (`hold_while_moving`, or the transaction or
+    // script this runs in), this is exact: a master becomes a replica with
+    // the gate cut.
+    if !copy && !ctx.apply_replication && ctx.repl_state.is_slave() {
+        return resp_error("READONLY You can't write against a read only replica.");
+    }
 
     // ── Serialise what exists ────────────────────────────────────────────
     let now_ms = std::time::SystemTime::now()
