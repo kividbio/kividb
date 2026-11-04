@@ -114,14 +114,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   IMPORTING` and `MIGRATE` or `ASKING` writes, imported with `CLUSTER
   MIGRATION IMPORT`, given back with `SETSLOT NODE` or `ADDSLOTS`, or
   taken over in a failover), the deletion went on, and deleted the keys
-  written to the slot since: acknowledged writes. A deletion now stops at
-  a slot once it has come back, and keeps every key written to it. An
-  import into such a slot, `SETSLOT IMPORTING` or `CLUSTER MIGRATION
-  IMPORT`, first waits for the deletion to end, as Redis deletes the keys
-  before it does anything else (`SETSLOT IMPORTING` for up to 10 seconds,
-  then imports and keeps the keys not deleted yet). A replica promoted in
-  a failover that lost some of its new slots to another master straight
-  away now drops their keys, which it used to keep, stale.
+  written to the slot since: acknowledged writes. Now a slot that comes
+  back waits for the batch under way, if any, and the deletion leaves the
+  slot from then on: every write to it here is kept, whatever command
+  makes it. `SETSLOT IMPORTING`, `SETSLOT NODE` (to the node itself),
+  `ADDSLOTS`, `ADDSLOTSRANGE` and `CLUSTER MIGRATION IMPORT` first delete
+  the old keys the node still has of the slot, as Redis has deleted them
+  before it answers, so the slot comes back without them; inside a
+  transaction those commands are refused with `TRYAGAIN` until the old keys
+  are gone. A failover leaves none: a promoted replica holds its master's
+  keys. A replica promoted in a failover that lost some of its new slots to
+  another master straight away now drops their keys, which it used to
+  keep, stale.
 - **Writes could stay paused after an atomic slot migration's handoff
   (#349).** A node told during the handoff that it had been marked failed
   holds writes until it has made sure it still owns its slots. The handoff

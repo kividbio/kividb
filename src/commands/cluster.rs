@@ -47,9 +47,9 @@ fn handle_cluster(ctx: &mut Ctx, sub: &str) -> Vec<u8> {
         "SHARDS" => return cmd_shards(state),
 
         // Mutating — require cluster mode (each handler checks via state.enabled)
-        "ADDSLOTS" => return cmd_addslots(state, &ctx.cmd),
+        "ADDSLOTS" => return cmd_addslots(ctx),
         "DELSLOTS" => return cmd_delslots(state, &ctx.cmd),
-        "ADDSLOTSRANGE" => return cmd_addslotsrange(state, &ctx.cmd),
+        "ADDSLOTSRANGE" => return cmd_addslotsrange(ctx),
         "DELSLOTSRANGE" => return cmd_delslotsrange(state, &ctx.cmd),
         "FLUSHSLOTS" => return cmd_flushslots(state),
         "BUMPEPOCH" => return cmd_bumpepoch(state),
@@ -573,7 +573,8 @@ fn require_cluster_mode(state: &ClusterState) -> Option<Vec<u8>> {
 }
 
 /// CLUSTER ADDSLOTS slot [slot ...]
-fn cmd_addslots(state: &ClusterState, cmd: &[&[u8]]) -> Vec<u8> {
+fn cmd_addslots(ctx: &mut Ctx) -> Vec<u8> {
+    let (state, cmd): (&ClusterState, &[&[u8]]) = (ctx.cluster, &ctx.cmd);
     if let Some(err) = require_cluster_mode(state) {
         return err;
     }
@@ -600,6 +601,10 @@ fn cmd_addslots(state: &ClusterState, cmd: &[&[u8]]) -> Vec<u8> {
             }
         }
     }
+    if let Some(refused) = before_slots_come(ctx, &slots, "ADDSLOTS") {
+        return refused;
+    }
+    let state: &ClusterState = ctx.cluster;
     for s in &slots {
         if let Err(e) = state.claim_slot(*s) {
             return resp_error(&format!("ERR {e}"));
@@ -649,7 +654,8 @@ fn cmd_delslots(state: &ClusterState, cmd: &[&[u8]]) -> Vec<u8> {
 }
 
 /// CLUSTER ADDSLOTSRANGE start-slot end-slot [start-slot end-slot ...]
-fn cmd_addslotsrange(state: &ClusterState, cmd: &[&[u8]]) -> Vec<u8> {
+fn cmd_addslotsrange(ctx: &mut Ctx) -> Vec<u8> {
+    let (state, cmd): (&ClusterState, &[&[u8]]) = (ctx.cluster, &ctx.cmd);
     if let Some(err) = require_cluster_mode(state) {
         return err;
     }
@@ -676,6 +682,14 @@ fn cmd_addslotsrange(state: &ClusterState, cmd: &[&[u8]]) -> Vec<u8> {
         i += 2;
     }
 
+    let slots: Vec<u16> = ranges
+        .iter()
+        .flat_map(|&(start, end)| start..=end)
+        .collect();
+    if let Some(refused) = before_slots_come(ctx, &slots, "ADDSLOTSRANGE") {
+        return refused;
+    }
+    let state: &ClusterState = ctx.cluster;
     // Apply each range. claim_slot_range is itself atomic per-range; if a
     // later range fails, earlier ones stay claimed. That matches Redis's
     // observable behavior.
@@ -1193,40 +1207,16 @@ fn slot_changed_state() {
     crate::pause::routes_moved();
 }
 
-/// How long `SETSLOT IMPORTING` waits for the keys this node had of the slot
-/// to be deleted.
-const SLOT_DELETION_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Before `slot` is imported here: wait for the deletion of the keys this
-/// node had of it, which a node that lost the slot runs on its own, to end,
-/// as Redis deletes them before it does anything else (#353). For up to
-/// [`SLOT_DELETION_WAIT`], and not inside a transaction, which holds every
-/// other write back. Imported all the same, the slot keeps the keys not
-/// deleted yet, beside every write it is given.
-fn wait_for_slot_deletion(ctx: &Ctx, slot: u16) {
-    let deletions = &ctx.cluster.slot_deletions;
-    if !deletions.running(std::iter::once(slot)) {
-        return;
-    }
-    let done = if crate::write_gate::held_by_this_thread()
-        || crate::command_gate::alone_on_this_thread()
-    {
-        false
-    } else {
-        log_info!(
-            "Cluster: SETSLOT {slot} IMPORTING waits for the keys this node is still deleting \
-             from the slot"
-        );
-        crate::cluster::migration::off_the_runtime(|| {
-            deletions.wait_for(&[slot], Some(SLOT_DELETION_WAIT), || false)
-        })
-    };
-    if !done {
-        log_warn!(
-            "Cluster: the keys this node had of slot {slot} are still being deleted; it is \
-             importing the slot all the same, and keeps those not deleted yet"
-        );
-    }
+/// Before `slots` come to this node by `what`: the keys it still had of
+/// them, if a deletion of them is under way, are deleted first
+/// (`migration::delete_before_coming`, #353). These commands do not hold
+/// the command gate for it (`command_gate::skips`). The refusal, inside a
+/// transaction, if any.
+fn before_slots_come(ctx: &Ctx, slots: &[u16], what: &str) -> Option<Vec<u8>> {
+    let env = crate::cluster::migration::Env::from_ctx(ctx);
+    crate::cluster::migration::delete_before_coming(&env, slots, what, None)
+        .err()
+        .map(|e| resp_error(&e))
 }
 
 fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
@@ -1280,7 +1270,9 @@ fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
                 Some(id) => id,
                 None => return resp_error("ERR Invalid node id"),
             };
-            wait_for_slot_deletion(ctx, slot);
+            if let Some(refused) = before_slots_come(ctx, &[slot], "SETSLOT IMPORTING") {
+                return refused;
+            }
             if let Err(e) = ctx.cluster.set_importing(slot, src) {
                 return resp_error(&format!("ERR {e}"));
             }
@@ -1320,6 +1312,11 @@ fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
                     "ERR Can't assign hashslot {slot} to a different node while I still hold \
                      keys for this hash slot."
                 ));
+            }
+            if new_owner == ctx.cluster.myself()
+                && let Some(refused) = before_slots_come(ctx, &[slot], "SETSLOT NODE")
+            {
+                return refused;
             }
             if let Err(e) = ctx.cluster.finalize_slot(slot, new_owner) {
                 return resp_error(&format!("ERR {e}"));
