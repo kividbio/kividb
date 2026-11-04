@@ -2307,6 +2307,11 @@ impl ClusterState {
                 migrations.remove(&slot);
             }
         }
+        // A write routed here before this, and held up before the write gate
+        // until the handoff lets writes go, is routed again there (#331).
+        // Before the caller ends the handoff's pause: that is a change of the
+        // same flag, so a write that finds the pause over finds this too.
+        crate::pause::routes_moved();
         // The caller saves, once writes are no longer paused.
         self.refresh_state();
     }

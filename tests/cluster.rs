@@ -3357,6 +3357,151 @@ fn a_handoff_whose_takeover_goes_unanswered(failpoint: (&str, &str)) {
     );
 }
 
+/// Commands on one connection, in the background: the reply to the last.
+fn commands_in_background(port: u16, commands: &[&[&str]]) -> std::thread::JoinHandle<Resp> {
+    let commands: Vec<Vec<String>> = commands
+        .iter()
+        .map(|args| args.iter().map(|a| a.to_string()).collect())
+        .collect();
+    std::thread::spawn(move || {
+        let mut conn = Conn::connect(port);
+        let mut last = None;
+        for args in &commands {
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            last = Some(conn.cmd(&refs));
+        }
+        last.unwrap()
+    })
+}
+
+/// The file of the `hit`th command held at the failpoint `routed` on
+/// `node`, once it is there (see `KIVIDB_TEST_STALL_KEYS`). Removing it lets
+/// the command go on.
+fn routed_and_held(node: &Node, hit: u32) -> PathBuf {
+    let failpoint = node.dir.join(format!("failpoint.routed.{hit}"));
+    wait_until(
+        "the command to be routed and held",
+        Duration::from_secs(10),
+        || failpoint.exists(),
+    );
+    failpoint
+}
+
+fn wait_import_completed(dst: &Node, task_id: &str) {
+    wait_until("the import to complete", Duration::from_secs(60), || {
+        let status = dst
+            .conn()
+            .cmd(&["CLUSTER", "MIGRATION", "STATUS", "ID", task_id]);
+        status
+            .array()
+            .first()
+            .is_some_and(|task| task_field(task, "state").text() == "completed")
+    });
+}
+
+/// A write routed here before an atomic slot migration handed its slot
+/// over, and held up before the write gate until the handoff had let writes
+/// go again, is sent on with `-MOVED`. It used to run here, on a slot the
+/// destination owned: deleted with the slot's keys, or left behind them
+/// (#331). It waits at the failpoint `routed` (`KIVIDB_TEST_STALL_KEYS`).
+#[test]
+fn a_write_routed_before_a_slot_handoff_is_sent_on_not_run_here() {
+    let key = key_in(0..=1000, "handoff");
+    let other = key_in(0..=1000, "unheld");
+    let env = [
+        ("KIVIDB_TEST_FAILPOINTS", "routed"),
+        ("KIVIDB_TEST_STALL_KEYS", key.as_str()),
+    ];
+    let (nodes, _) = form_cluster_of(vec![Node::start_with_env(&[], &env), Node::start(&[])]);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let slot = slot_of(&key).to_string();
+    let set = commands_in_background(src.port, &[&["SET", &key, "5"]]);
+    std::fs::remove_file(routed_and_held(src, 1)).unwrap();
+    assert!(set.join().unwrap().is_ok());
+
+    let incr = commands_in_background(src.port, &[&["INCR", &key]]);
+    let held = routed_and_held(src, 2);
+    let task_id = dst
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "1000"])
+        .text();
+    wait_import_completed(dst, &task_id);
+    wait_until(
+        "the source to hand the slots over and drop their keys",
+        Duration::from_secs(30),
+        || {
+            src.conn()
+                .cmd(&["GET", &other])
+                .err()
+                .is_some_and(|e| e.starts_with("MOVED"))
+                && src.conn().cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int() == 0
+        },
+    );
+    std::fs::remove_file(held).unwrap();
+    let reply = incr.join().unwrap();
+    let moved = format!("MOVED {slot} 127.0.0.1:{}", dst.port);
+    assert!(
+        reply.err().is_some_and(|e| e.starts_with(&moved)),
+        "the write is sent on: {reply:?}"
+    );
+    assert_eq!(
+        src.conn().cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(),
+        0
+    );
+    assert_eq!(dst.conn().cmd(&["GET", &key]).text(), "5");
+}
+
+/// A transaction that got past the pause before an atomic slot migration's
+/// handoff set it, and reaches its gates while the handoff holds writes, is
+/// refused with `TRYAGAIN`. It used to run: its commands, run inside it,
+/// do not look at the pause, and what it wrote missed what the handoff
+/// sent, and was deleted with the slot's keys here. The destination's
+/// `TAKEOVER` waits 1.5 s (`KIVIDB_TEST_TAKEOVER_DELAY_MS`), so the handoff
+/// holds writes for that long.
+#[test]
+fn a_transaction_that_reaches_its_gates_during_a_slot_handoff_is_refused() {
+    let key = key_in(0..=1000, "handoff");
+    let env = [
+        ("KIVIDB_TEST_FAILPOINTS", "routed"),
+        ("KIVIDB_TEST_STALL_KEYS", key.as_str()),
+    ];
+    let (nodes, _) = form_cluster_of(vec![
+        Node::start_with_env(&[], &env),
+        Node::start_with_env(&[], &[("KIVIDB_TEST_TAKEOVER_DELAY_MS", "1500")]),
+    ]);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let r = src.conn().cmd(&[
+        "CONFIG",
+        "SET",
+        "cluster-slot-migration-write-pause-timeout",
+        "10000",
+    ]);
+    assert!(r.is_ok(), "{r:?}");
+    let set = commands_in_background(src.port, &[&["SET", &key, "5"]]);
+    std::fs::remove_file(routed_and_held(src, 1)).unwrap();
+    assert!(set.join().unwrap().is_ok());
+
+    let exec = commands_in_background(src.port, &[&["MULTI"], &["INCR", &key], &["EXEC"]]);
+    let held = routed_and_held(src, 2);
+    let task_id = dst
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "1000"])
+        .text();
+    wait_until(
+        "the handoff to hold writes for the TAKEOVER",
+        Duration::from_secs(60),
+        || dst.log().contains("(test) TAKEOVER waits"),
+    );
+    std::fs::remove_file(held).unwrap();
+    let reply = exec.join().unwrap();
+    assert!(
+        reply.err().is_some_and(|e| e.starts_with("TRYAGAIN")),
+        "the transaction is refused: {reply:?}"
+    );
+    wait_import_completed(dst, &task_id);
+    assert_eq!(dst.conn().cmd(&["GET", &key]).text(), "5");
+}
+
 /// The destination gets to the `TAKEOVER` only after the source has
 /// stopped waiting for its answer, as a destination does that is too busy
 /// (#278). The source asks it, and it promises not to take the slots in
