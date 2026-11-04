@@ -1,0 +1,14 @@
+# Test-only additions for run_compose.sh: the servers' ports on the host, for the harness's CONFIG GET,
+# fixed container names for its restart, and io_uring allowed in KiviDB's container, as on a Linux
+# host. Not needed to run Firecrawl.
+services:
+  redis:
+    container_name: fc-compose-redis
+    ports:
+      - "127.0.0.1:6379:6379"
+  kividb:
+    container_name: fc-compose-kividb
+    ports:
+      - "127.0.0.1:6380:6380"
+    security_opt:
+      - seccomp=unconfined
