@@ -1,0 +1,132 @@
+{
+  "label": "kividb",
+  "url": "redis://127.0.0.1:6380",
+  "redis_version": "8.10.0",
+  "omniroute": "3.8.52",
+  "ioredis": "5.11.1",
+  "node": "v22.23.4",
+  "counts": {
+    "PASS": 13,
+    "WARN": 1,
+    "FAIL": 5
+  },
+  "checks": [
+    {
+      "check": "connection: PING",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "rate limiter: 3 requests allowed, the 4th refused with its window and reset time",
+      "status": "PASS",
+      "detail": "",
+      "ms": 3
+    },
+    {
+      "check": "rate limiter: the counter is on the server (the Lua script ran there)",
+      "status": "FAIL",
+      "detail": "Error: counter kvcompat3ee9b5e2:rl:api_key:rl-9f1682:60:29897036 is null; OmniRoute logged: [RATE_LIMITER] Redis eval failed, falling back to in-memory rate limiting: ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION ",
+      "ms": 1
+    },
+    {
+      "check": "rate limiter: another process sharing the server is refused too (shared limit)",
+      "status": "FAIL",
+      "detail": "Error: the second process was allowed: {\"allowed\":true} [RATE_LIMITER] Redis eval failed, falling back to in-memory rate limiting: ReplyError: ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua o",
+      "ms": 178
+    },
+    {
+      "check": "rate limiter: two rules; the tighter one refuses, and a refusal does not count",
+      "status": "FAIL",
+      "detail": "Error: the refused request was counted: minute counter null",
+      "ms": 1
+    },
+    {
+      "check": "API key policy: a key limited to 2 a minute gets 429 rate_limit_exceeded on the 3rd",
+      "status": "FAIL",
+      "detail": "Error: server counter null",
+      "ms": 21
+    },
+    {
+      "check": "auth cache: a validated key is cached on the server for an hour",
+      "status": "PASS",
+      "detail": "",
+      "ms": 4
+    },
+    {
+      "check": "auth cache: revoking the key removes its cache entry",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "chat: /v1/chat/completions through the gateway to a stub upstream; 3rd request is 429",
+      "status": "FAIL",
+      "detail": "Error: server counter null",
+      "ms": 846
+    },
+    {
+      "check": "quota store: consume adds the cost (INCRBYFLOAT) and peek reads it back",
+      "status": "PASS",
+      "detail": "",
+      "ms": 5
+    },
+    {
+      "check": "quota store: INCRBYFLOAT 0.1 + 0.2 is stored as 0.3, as Redis formats it",
+      "status": "WARN",
+      "detail": "Error: stored 0.30000000000000004",
+      "ms": 1
+    },
+    {
+      "check": "quota store: clear",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "circuit breaker: with REDIS_URL set, OmniRoute picks the Redis store",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "circuit breaker: failures raise the streak and back off (HSET, HGETALL, EXPIRE)",
+      "status": "PASS",
+      "detail": "",
+      "ms": 4
+    },
+    {
+      "check": "circuit breaker: a success resets it",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "circuit breaker: forbidden is kept without a TTL (PERSIST)",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2
+    },
+    {
+      "check": "semantic cache: set stores entries with a TTL; get and getByHash read them",
+      "status": "PASS",
+      "detail": "",
+      "ms": 4
+    },
+    {
+      "check": "semantic cache: nearest search, by model, by API key and above a threshold",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2
+    },
+    {
+      "check": "semantic cache: delete, deleteByModel and clear",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2
+    }
+  ],
+  "omniroute_logged": [
+    "[RATE_LIMITER] Redis eval failed, falling back to in-memory rate limiting: ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+  ]
+}

@@ -45,6 +45,15 @@ other files:
 - Mem0's Redis vector store and the `Memory` API on top of it:
   [benchmarks/mem0-compat/REPORT.md](../benchmarks/mem0-compat/REPORT.md) and
   [docs/integrations/mem0.md](integrations/mem0.md).
+- LightRAG's Redis KV and doc-status storages, with LightRAG's own contract suite:
+  [benchmarks/lightrag-compat/](../benchmarks/lightrag-compat/) and
+  [docs/integrations/lightrag.md](integrations/lightrag.md).
+- cognee's Redis cache (sessions, usage logs, the shared graph lock, which needs the `lua` build):
+  [benchmarks/cognee-compat/](../benchmarks/cognee-compat/) and
+  [docs/integrations/cognee.md](integrations/cognee.md).
+- OmniRoute's rate limiter (a Lua script, so the `lua` build), auth cache, quota store, circuit
+  breaker and semantic cache: [benchmarks/omniroute-compat/](../benchmarks/omniroute-compat/) and
+  [docs/integrations/omniroute.md](integrations/omniroute.md).
 - `redis-py` throughout the end-to-end tests (`tests/e2e/`).
 
 ## Differences you may notice

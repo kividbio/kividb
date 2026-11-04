@@ -1,0 +1,188 @@
+{
+  "label": "redis8",
+  "url": "redis://127.0.0.1:6390",
+  "redis_version": "8.10.3",
+  "lightrag_hku": "1.5.7",
+  "redis_py": "8.0.0",
+  "counts": {
+    "PASS": 29,
+    "WARN": 0,
+    "FAIL": 0
+  },
+  "checks": [
+    {
+      "check": "connection: PING",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "KV: upsert and get_by_id, with create_time and update_time",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "KV: get_by_ids keeps the order and returns None for a missing id",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "KV: filter_keys returns the ids not stored yet",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "KV: upsert over an id updates it and its update_time",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1102
+    },
+    {
+      "check": "KV: text_chunks rows get an llm_cache_list",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "KV: is_empty",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "KV: two workspaces with the same namespace do not see each other",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "KV: delete",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "KV: drop removes this namespace only",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "doc status: upsert and get_by_id",
+      "status": "PASS",
+      "detail": "",
+      "ms": 3
+    },
+    {
+      "check": "doc status: status counts, scanned and from the per-status sorted sets",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "doc status: get_docs_by_statuses",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "doc status: get_docs_by_track_id",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "doc status: paging, with a status filter and both sort directions",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "doc status: lookup by file path",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "doc status: a targeted field update moves the doc to its new status",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "doc status: delete removes the row and its index entries",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "doc status: drop leaves no key behind",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2
+    },
+    {
+      "check": "eviction guard: the default server config is accepted",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2
+    },
+    {
+      "check": "eviction guard: maxmemory with allkeys-lru is refused (CONFIG GET maxmemory*)",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "LightRAG: insert two documents; both reach PROCESSED",
+      "status": "PASS",
+      "detail": "",
+      "ms": 64
+    },
+    {
+      "check": "LightRAG: documents, chunks, doc status and LLM cache are on the server, not in local files",
+      "status": "PASS",
+      "detail": "27 keys",
+      "ms": 1
+    },
+    {
+      "check": "LightRAG: the graph holds the extracted entities",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "LightRAG: naive query answers from the stored chunks",
+      "status": "PASS",
+      "detail": "",
+      "ms": 4
+    },
+    {
+      "check": "LightRAG: hybrid query (keywords, entities, chunks)",
+      "status": "PASS",
+      "detail": "",
+      "ms": 7
+    },
+    {
+      "check": "LightRAG: the same query again is served from the LLM cache",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2
+    },
+    {
+      "check": "LightRAG: a new instance on the same workspace reads it all back",
+      "status": "PASS",
+      "detail": "",
+      "ms": 12
+    },
+    {
+      "check": "LightRAG: delete by document id",
+      "status": "PASS",
+      "detail": "",
+      "ms": 16
+    }
+  ]
+}
