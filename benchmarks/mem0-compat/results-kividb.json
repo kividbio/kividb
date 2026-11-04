@@ -1,0 +1,153 @@
+{
+  "label": "kividb",
+  "url": "redis://127.0.0.1:6380",
+  "redis_version": "8.10.0",
+  "mem0ai": "2.2.1",
+  "redisvl": "0.26.0",
+  "redis_py": "5.3.1",
+  "counts": {
+    "PASS": 23,
+    "WARN": 0,
+    "FAIL": 0
+  },
+  "checks": [
+    {
+      "check": "connection: PING",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vector store: insert creates the index and stores the memories",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2
+    },
+    {
+      "check": "vector store: search returns the closest memory first, scores ordered",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2
+    },
+    {
+      "check": "vector store: top_k is honoured",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "vector store: filter on user_id",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "vector store: filter on user_id and agent_id together",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vector store: the payload comes back whole",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vector store: get by id",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vector store: update changes the text and the vector",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "vector store: list, with a filter and with top_k",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "vector store: keyword (BM25) search",
+      "status": "PASS",
+      "detail": "",
+      "ms": 3
+    },
+    {
+      "check": "vector store: delete",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "vector store: list_cols and col_info",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "vector store: reset empties the collection",
+      "status": "PASS",
+      "detail": "",
+      "ms": 3
+    },
+    {
+      "check": "Memory: add (infer=False) stores a memory for a user",
+      "status": "PASS",
+      "detail": "",
+      "ms": 9
+    },
+    {
+      "check": "Memory: search is scoped to the user and finds the closest",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2
+    },
+    {
+      "check": "Memory: search does not return another user's memory",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "Memory: get_all for a user",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "Memory: get by id",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "Memory: update",
+      "status": "PASS",
+      "detail": "",
+      "ms": 3
+    },
+    {
+      "check": "Memory: history records the ADD and the UPDATE",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "Memory: delete",
+      "status": "PASS",
+      "detail": "",
+      "ms": 4
+    },
+    {
+      "check": "Memory: delete_all removes one user's memories only",
+      "status": "PASS",
+      "detail": "",
+      "ms": 250
+    }
+  ]
+}

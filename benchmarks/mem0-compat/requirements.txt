@@ -1,0 +1,5 @@
+# The versions the results in this folder were produced with. This is what
+# "pip install mem0ai[vector-stores]" resolves to; redisvl 0.28 or newer cannot be used (mem0 issue 7819).
+mem0ai==2.2.1
+redis==5.3.1
+redisvl==0.26.0
