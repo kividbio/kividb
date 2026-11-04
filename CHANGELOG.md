@@ -29,6 +29,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A replica could stop for good while it saved (#373).** The replica
+  entered the command gate while holding its own apply lock, which `SAVE`
+  (and a promotion, `REPLICAOF NO ONE`) waits for while holding the gate.
+  Two cases deadlocked. A write from the master that touches keys of several
+  shards (`COPY`, `RENAME`, `SMOVE`, `LMOVE` and the like, across shards)
+  takes the gate alone, and waited for the `SAVE`. And a read-only script
+  run on the replica (`EVAL_RO`, `FCALL_RO`) takes the gate alone slot by
+  slot: it waited for the `SAVE`'s slot, and the replica's next write waited
+  behind the script. In both, the replica answered no command, applied
+  nothing more and acknowledged nothing, its master dropped it, and it could
+  not shut down. The replica now enters the gate before taking its lock,
+  alone for a write that needs it, as it already did for a transaction, and
+  so does the final save at shutdown. A write from the master now also waits
+  for a script on the replica that has run past its time limit, as a
+  transaction from the master did; it was refused with `BUSY`, logged, and
+  not applied, and the replica's data went its own way.
 - **A panic in active defrag no longer stops it silently (#358, #370).**
   Active defrag runs on a thread of its own, and release builds unwind on a
   panic. Had anything in a pass panicked, that thread alone would have
@@ -309,6 +325,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   never swept on the replica, nor after a failover on the replica promoted.
   A write applied from the stream now takes the order of its keys, as a
   command does.
+- **On a replica, `FLUSHDB`, `FLUSHALL` and `SWAPDB` from the master take
+  the command gate alone, as they do on a master (#378).** They took it
+  shared, so a query on the replica could find a database half flushed, its
+  keys gone and its indexes not yet, or half swapped.
 
 ## [1.2.0] - 2026-11-03
 
