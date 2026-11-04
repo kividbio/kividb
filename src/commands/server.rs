@@ -4510,6 +4510,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "aof_acks_before_write:{}\r\n",
                     crate::aof::AOF_ACKS_BEFORE_WRITE.load(Ordering::Relaxed)
                 ));
+                // Logs kept aside (`superseded.*` in `dir`): never replayed and
+                // never removed by the server. Each may hold writes that are
+                // in no dump; an operator removes them once they are not
+                // needed, and these say whether any are left.
+                let (kept, kept_bytes) = crate::aof::kept_logs_size();
+                out.push_str(&format!(
+                    "aof_superseded_files:{kept}\r\naof_superseded_bytes:{kept_bytes}\r\n"
+                ));
                 out.push_str("aof_last_cow_size:0\r\n");
                 out.push_str("module_fork_in_progress:0\r\n");
                 out.push_str("module_fork_last_cow_size:0\r\n");

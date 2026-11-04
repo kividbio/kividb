@@ -68,6 +68,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   checkpoint has finished restarts from the `dump.kdb` saved before the
   sync, plus what was logged after the enable: the replica then syncs again
   from its master.
+- **Follow-ups to the two fixes above (#359).** A save with the AOF off
+  now also records how long `appendonly.aof` and `appendonly.aof.prev` were,
+  with a hash of their first and last bytes. A log beside that dump that
+  has been added to since, as 1.2.0 does when it is started on the
+  directory with the AOF on, is no longer left out with the writes added to
+  it: a log with no header is replayed, as 1.2.0 replayed it, and a delta
+  with an older save number is replayed from where it was at the save. The
+  directory is synced between putting the save number in place and the
+  dump, so a power cut cannot keep the new dump with the old number, which
+  left out the logs that go on from it. A copy of a log kept aside that
+  fails part way is removed, rather than left under a kept log's name.
+  `INFO persistence` has `aof_superseded_files` and `aof_superseded_bytes`,
+  the logs kept aside in `dir` and their size; docs/PERSISTENCE.md says how
+  to check and remove them, and docs/ERRORS.md lists the new messages.
 - **`BACKUP START` refuses a `backupdirname` that is the data directory.**
   A backup's files share the `appendonly.aof.` prefix with the server's own,
   and `BACKUP CLEANUP` would have deleted `appendonly.aof.prev` with them.

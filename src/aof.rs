@@ -347,13 +347,14 @@ pub fn open_log(_turn: &CheckpointTurn) -> std::io::Result<()> {
     let mut log = LOG.lock();
     if let Some(log) = log.as_mut() {
         let on_disk = DumpOnDisk::read(std::path::Path::new("dump.kdb").exists());
-        if LOG_SUPERSEDED.load(Ordering::Relaxed) || on_disk.is_newer_than(&read_head(AOF_PATH)) {
+        if LOG_SUPERSEDED.load(Ordering::Relaxed) || on_disk.age_of(AOF_PATH) != LogAge::GoesOn {
             // What is still queued goes to the old log, and the barriers in
             // it are answered. No turn-over mark is: the turn is held.
             write_queued(&mut log.file, &mut log.rx, None);
             log.file = start_new_log(
                 "no longer goes on from dump.kdb (a save with the AOF off, or a full sync, came \
                  since), and the AOF turned on starts a new log",
+                &[],
             )
             .map_err(made)?;
         }
@@ -366,6 +367,7 @@ pub fn open_log(_turn: &CheckpointTurn) -> std::io::Result<()> {
     match start_new_log(
         "was left by an earlier run and is not part of this dataset, and the AOF turned on starts \
          a new log",
+        &[],
     ) {
         Ok(file) => {
             *log = Some(Log { rx, file });
@@ -407,7 +409,11 @@ pub fn open_log(_turn: &CheckpointTurn) -> std::io::Result<()> {
 /// are kept under names of their own (see [`keep_aside`]), and the directory
 /// synced: they may hold writes that are nowhere else, and the server never
 /// deletes them. `why` says, in the warning, why the log was not kept on.
-fn start_new_log(why: &str) -> std::io::Result<std::fs::File> {
+///
+/// `added` is what the new log starts with, after its header: the records
+/// of an old log that go on from the dump (see [`LogAge::AddedToFrom`]);
+/// usually nothing.
+fn start_new_log(why: &str, added: &[u8]) -> std::io::Result<std::fs::File> {
     let mut kept = Vec::new();
     for path in [AOF_PREV_PATH, AOF_PATH] {
         if let Some(name) = keep_aside(path)? {
@@ -426,7 +432,7 @@ fn start_new_log(why: &str) -> std::io::Result<std::fs::File> {
              once it is not needed"
         );
     }
-    let file = write_new_log()?;
+    let file = write_new_log(added)?;
     remove_log_leftovers()?;
     LOG_SUPERSEDED.store(false, Ordering::Relaxed);
     Ok(file)
@@ -466,28 +472,64 @@ fn keep_aside(path: &str) -> std::io::Result<Option<String>> {
         SEQ.fetch_add(1, Ordering::Relaxed)
     );
     if std::fs::hard_link(path, &name).is_err() {
-        std::fs::copy(path, &name)?;
-        std::fs::File::open(&name)?.sync_all()?;
+        copy_synced(path, &name, |from, to| std::fs::copy(from, to))?;
     }
     Ok(Some(name))
+}
+
+/// Copy `from` to `to` with `copy` ([`std::fs::copy`], or a test's) and sync
+/// the copy. If either fails, what was copied is removed: named like a log
+/// kept aside, a partial copy was listed at every start as one, and each
+/// failed attempt left another (#359).
+fn copy_synced(
+    from: &str,
+    to: &str,
+    copy: impl FnOnce(&str, &str) -> std::io::Result<u64>,
+) -> std::io::Result<()> {
+    let copied = copy(from, to).and_then(|_| std::fs::File::open(to)?.sync_all());
+    if copied.is_err() {
+        let _ = std::fs::remove_file(to);
+    }
+    copied
+}
+
+/// The logs kept aside (see [`keep_aside`]) in the data directory, by name,
+/// with their sizes.
+fn kept_logs() -> Vec<(String, u64)> {
+    let Ok(entries) = std::fs::read_dir(".") else {
+        return Vec::new();
+    };
+    let mut kept: Vec<(String, u64)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            (name.starts_with(KEPT_PREFIX) && name.contains(AOF_PATH)).then(|| {
+                let len = entry.metadata().map_or(0, |meta| meta.len());
+                (name, len)
+            })
+        })
+        .collect();
+    kept.sort();
+    kept
+}
+
+/// How many logs kept aside are in the data directory, and their bytes:
+/// `aof_superseded_files` and `aof_superseded_bytes` in `INFO persistence`.
+/// A kept log that is a hard link to a log still in use shares its blocks
+/// with it until that log is replaced.
+pub fn kept_logs_size() -> (usize, u64) {
+    let kept = kept_logs();
+    (kept.len(), kept.iter().map(|(_, len)| len).sum())
 }
 
 /// Say, at every start, which logs kept aside are still in the data
 /// directory: the server never removes them, and they are not to pile up
 /// unnoticed.
 fn warn_of_kept_logs() {
-    let Ok(entries) = std::fs::read_dir(".") else {
-        return;
-    };
-    let mut kept: Vec<String> = entries
-        .flatten()
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.starts_with(KEPT_PREFIX) && name.contains(AOF_PATH))
-        .collect();
+    let kept: Vec<String> = kept_logs().into_iter().map(|(name, _)| name).collect();
     if kept.is_empty() {
         return;
     }
-    kept.sort();
     log_warn!(
         "AOF: {} log(s) kept aside, never replayed and never removed by the server, are in the \
          data directory: {}. Each may hold writes that are not in dump.kdb (see the warning \
@@ -497,9 +539,10 @@ fn warn_of_kept_logs() {
     );
 }
 
-/// A new log, a delta on the dump on disk with no records, written and
-/// synced under a name of its own and then given the log's.
-fn write_new_log() -> std::io::Result<std::fs::File> {
+/// A new log, a delta on the dump on disk with `added` as its records
+/// (usually none), written and synced under a name of its own and then given
+/// the log's.
+fn write_new_log(added: &[u8]) -> std::io::Result<std::fs::File> {
     use std::io::Write;
     let generation = generation_of_dump_on_disk()?;
     let tmp = format!("{AOF_PATH}.tmp");
@@ -511,6 +554,7 @@ fn write_new_log() -> std::io::Result<std::fs::File> {
             .open(&tmp)?;
         file.write_all(AOF_DELTA_MAGIC)?;
         file.write_all(&generation.to_le_bytes())?;
+        file.write_all(added)?;
         file.sync_all()?;
         std::fs::rename(&tmp, AOF_PATH)?;
         Ok(file)
@@ -534,7 +578,7 @@ fn open_log_at_start() -> std::io::Result<std::fs::File> {
         Err(e) => return Err(e),
     };
     if make {
-        return write_new_log();
+        return write_new_log(&[]);
     }
     open_aof()
 }
@@ -565,11 +609,12 @@ fn generation_of_dump_on_disk() -> std::io::Result<u64> {
     }
     let found = file_fingerprint("dump.kdb")?;
     match read_saved() {
-        Some((number, len, hash, _)) if (len, hash) == found => Ok(number),
+        Some(saved) if saved.dump == found => Ok(saved.number),
         _ => {
             let generation = next_generation();
-            // No log on disk goes with it.
-            write_saved(generation, found, true)?;
+            // No log on disk goes with it. The logs are as they are: the
+            // caller is about to replace them, and may hold the open one.
+            write_saved(generation, found, Some(logs_on_disk()?))?;
             sync_dir()?;
             log_warn!(
                 "AOF: {AOF_GEN_PATH} did not describe dump.kdb (saved with the AOF off by an \
@@ -1606,17 +1651,54 @@ fn checkpoint_inner(
 /// The length of a file and a hash of its first and last 64 KiB: enough to
 /// tell one dump from another.
 fn file_fingerprint(path: &str) -> std::io::Result<(u64, u64)> {
+    let file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    fingerprint_of_first(&file, len)
+}
+
+/// [`file_fingerprint`] of the first `len` bytes of `file`: its fingerprint
+/// when it was that long, if it has only been added to since.
+fn fingerprint_of_first(mut file: &std::fs::File, len: u64) -> std::io::Result<(u64, u64)> {
     use std::io::{Read, Seek, SeekFrom};
     const EDGE: u64 = 64 * 1024;
-    let mut file = std::fs::File::open(path)?;
-    let len = file.metadata()?.len();
     let mut sample = Vec::with_capacity((2 * EDGE) as usize);
-    (&mut file).take(EDGE).read_to_end(&mut sample)?;
+    (&mut file).take(EDGE.min(len)).read_to_end(&mut sample)?;
     if len > EDGE {
-        file.seek(SeekFrom::Start(len - EDGE.min(len - EDGE)))?;
-        file.read_to_end(&mut sample)?;
+        let from = len - EDGE.min(len - EDGE);
+        file.seek(SeekFrom::Start(from))?;
+        (&mut file).take(len - from).read_to_end(&mut sample)?;
     }
     Ok((len, xxhash_rust::xxh3::xxh3_64(&sample)))
+}
+
+/// [`file_fingerprint`] of a log; one that is not there reads as empty.
+fn log_fingerprint(path: &str) -> std::io::Result<(u64, u64)> {
+    match file_fingerprint(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok((0, xxhash_rust::xxh3::xxh3_64(&[])))
+        }
+        found => found,
+    }
+}
+
+/// `appendonly.aof` and `appendonly.aof.prev` as they are on disk now.
+fn logs_on_disk() -> std::io::Result<[(u64, u64); 2]> {
+    Ok([log_fingerprint(AOF_PATH)?, log_fingerprint(AOF_PREV_PATH)?])
+}
+
+/// The logs as a save with the AOF off leaves them, to be recorded beside
+/// its dump (see [`DumpOnDisk`]). What was queued for the open log before
+/// the AOF went off is written first, and the log synced: records of writes
+/// the dump holds, which would otherwise reach the log after it was
+/// recorded, and read as added to it since.
+fn logs_as_saved() -> std::io::Result<[(u64, u64); 2]> {
+    if let Some(log) = LOG.lock().as_mut() {
+        write_queued(&mut log.file, &mut log.rx, None);
+        // Not synced, it is shorter after a power cut than recorded: read
+        // as changed, it is replayed, as when nothing was recorded.
+        let _ = log.file.sync_data();
+    }
+    logs_on_disk()
 }
 
 /// Put the dump written to `tmp` in place as save number `generation`, with
@@ -1625,18 +1707,36 @@ fn file_fingerprint(path: &str) -> std::io::Result<(u64, u64)> {
 /// the two leaves a number that does not describe the dump there, which
 /// recovery reads as a checkpoint that did not finish. `alone`: saved with
 /// the AOF off, no log on disk goes with it.
+///
+/// The directory is synced between the two renames (#359). A power cut
+/// could otherwise keep the dump's rename and lose the number's: an old
+/// number beside a new dump, which recovery reads as a dump replaced since,
+/// and leaves out the logs that go on from it.
 pub(crate) fn install_dump(tmp: &str, generation: u64, alone: bool) -> std::io::Result<()> {
-    write_saved(generation, file_fingerprint(tmp)?, alone)?;
+    let logs = if alone { Some(logs_as_saved()?) } else { None };
+    write_saved(generation, file_fingerprint(tmp)?, logs)?;
+    sync_dir()?;
+    failpoint("dump-installing");
     std::fs::rename(tmp, "dump.kdb")?;
     // On disk before the old log goes.
     sync_dir()
 }
 
-/// Write `dump.kdb.gen`: save number `generation`, for the dump with
-/// fingerprint `(len, hash)`, and a 25th byte, 1 if no log on disk goes with
-/// that dump (`alone`). Releases before 1.2.1 read the first 24 bytes only.
-/// Synced; the directory is not.
-fn write_saved(generation: u64, (len, hash): (u64, u64), alone: bool) -> std::io::Result<()> {
+/// Write `dump.kdb.gen`, synced (the directory is not):
+///
+/// | bytes | what |
+/// |---|---|
+/// | 0..8 | save number `generation` |
+/// | 8..24 | the fingerprint of its dump, `(len, hash)` |
+/// | 24 | 1 if no log on disk goes with that dump (`logs` given), else 0 |
+/// | 25..41, 41..57 | with 1: the fingerprints of `appendonly.aof` and `appendonly.aof.prev` at that save, an absent one as empty |
+///
+/// Releases before 1.2.1 read the first 24 bytes only.
+fn write_saved(
+    generation: u64,
+    (len, hash): (u64, u64),
+    logs: Option<[(u64, u64); 2]>,
+) -> std::io::Result<()> {
     use std::io::Write;
     let gen_tmp = format!("{AOF_GEN_PATH}.tmp");
     {
@@ -1644,19 +1744,44 @@ fn write_saved(generation: u64, (len, hash): (u64, u64), alone: bool) -> std::io
         file.write_all(&generation.to_le_bytes())?;
         file.write_all(&len.to_le_bytes())?;
         file.write_all(&hash.to_le_bytes())?;
-        file.write_all(&[u8::from(alone)])?;
+        file.write_all(&[u8::from(logs.is_some())])?;
+        for (log_len, log_hash) in logs.into_iter().flatten() {
+            file.write_all(&log_len.to_le_bytes())?;
+            file.write_all(&log_hash.to_le_bytes())?;
+        }
         file.sync_all()?;
     }
     std::fs::rename(&gen_tmp, AOF_GEN_PATH)
 }
 
-/// `dump.kdb.gen`: the save number, the fingerprint of the dump it was
-/// written for, and whether no log goes with that dump.
-fn read_saved() -> Option<(u64, u64, u64, bool)> {
+/// `dump.kdb.gen` (see [`write_saved`]).
+struct Saved {
+    number: u64,
+    /// The fingerprint of the dump it was written for.
+    dump: (u64, u64),
+    /// No log on disk goes with that dump: it was saved with the AOF off.
+    alone: bool,
+    /// With `alone`, the logs as they were at that save. Not in the file of
+    /// a save made before they were recorded.
+    logs: Option<[(u64, u64); 2]>,
+}
+
+fn read_saved() -> Option<Saved> {
     let saved = std::fs::read(AOF_GEN_PATH).ok()?;
     let field = |at: usize| Some(u64::from_le_bytes(saved.get(at..at + 8)?.try_into().ok()?));
+    let pair = |at: usize| Some((field(at)?, field(at + 8)?));
     let alone = saved.get(24) == Some(&1);
-    Some((field(0)?, field(8)?, field(16)?, alone))
+    let logs = if alone {
+        pair(25).zip(pair(41)).map(|(log, prev)| [log, prev])
+    } else {
+        None
+    };
+    Some(Saved {
+        number: field(0)?,
+        dump: pair(8)?,
+        alone,
+        logs,
+    })
 }
 
 /// The first bytes of a log, enough for its header; empty if there is none.
@@ -1675,11 +1800,11 @@ fn read_head(path: &str) -> Vec<u8> {
 /// the save number on disk is the one the log goes on from, and it was
 /// written for the `dump.kdb` that is there.
 fn checkpoint_completed(log: &[u8]) -> bool {
-    let Some((number, len, hash, _)) = read_saved() else {
+    let Some(saved) = read_saved() else {
         return false;
     };
-    aof_delta_generation(log) == Some(number)
-        && file_fingerprint("dump.kdb").is_ok_and(|found| found == (len, hash))
+    aof_delta_generation(log) == Some(saved.number)
+        && file_fingerprint("dump.kdb").is_ok_and(|found| found == saved.dump)
 }
 
 /// The save number for a checkpoint or a save that has its turn: past the
@@ -1718,44 +1843,93 @@ pub(crate) fn next_generation() -> u64 {
 /// beside the old log, which goes with the dump that is there: both are
 /// replayed. A number that is a log's own while its dump is not there means
 /// that dump was replaced since: the log is older. A dump saved with the AOF
-/// off is marked as one no log on disk goes with: a log with no header (made
-/// by 1.2.0) beside it is older too. When in doubt (no number, a log with no
-/// header beside a dump not so marked), a log is replayed, as before.
+/// off is marked as one no log on disk goes with, and the logs as they were
+/// at that save are recorded beside it: a log with no header (made by 1.2.0)
+/// that is still as it was then is older too. When in doubt (no number, a
+/// log with no header beside a dump not so marked, or changed since), a log
+/// is replayed, as before.
+///
+/// A log can be added to after such a save: 1.2.0, started with the AOF on,
+/// adds to the log it finds, replaying it first if it has no header and
+/// leaving it out if its number is older (#359). What was added goes on from
+/// the dump, and is replayed: with a log with no header, the whole log, as
+/// 1.2.0 did; with an older number, only what was added.
 ///
 /// A log left out is never lost: it is kept aside (see [`keep_aside`]).
 struct DumpOnDisk {
     /// `dump.kdb` was there and was loaded.
     kdb: bool,
-    /// `dump.kdb.gen`: the save number, whether it was written for the
-    /// `dump.kdb` there, and whether no log goes with that dump.
-    saved: Option<(u64, bool, bool)>,
+    /// `dump.kdb.gen`, and whether it was written for the `dump.kdb` there.
+    saved: Option<(Saved, bool)>,
+}
+
+/// What recovery makes of a log beside the dump on disk (see [`DumpOnDisk`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogAge {
+    /// It goes on from the dump, or nothing says otherwise: replayed.
+    GoesOn,
+    /// It goes with a dump that has been replaced since: left out.
+    Older,
+    /// Older, but added to since the dump was saved with the AOF off, from
+    /// this byte on: what follows goes on from the dump.
+    AddedToFrom(u64),
 }
 
 impl DumpOnDisk {
     fn read(kdb: bool) -> Self {
-        let saved = read_saved().map(|(number, len, hash, alone)| {
-            let own = file_fingerprint("dump.kdb").is_ok_and(|found| found == (len, hash));
-            (number, own, alone)
+        let saved = read_saved().map(|saved| {
+            let own = file_fingerprint("dump.kdb").is_ok_and(|found| found == saved.dump);
+            (saved, own)
         });
         DumpOnDisk { kdb, saved }
     }
 
-    /// Whether the log (or the old log) whose first bytes are `head` is
-    /// older than the dump: it goes with a dump that has been replaced since.
-    fn is_newer_than(&self, head: &[u8]) -> bool {
-        if !self.kdb {
-            return false;
-        }
-        match (aof_delta_generation(head), self.saved) {
-            // The number is this dump's: an older log goes with an older one.
-            (Some(log), Some((number, true, _))) => log < number,
-            // No log goes with this dump: one with no header is older.
-            (None, Some((_, true, true))) => !head.is_empty(),
+    /// The log at `path` (the log, or the old log), against the dump.
+    fn age_of(&self, path: &str) -> LogAge {
+        let Some((saved, own)) = self.saved.as_ref().filter(|_| self.kdb) else {
+            return LogAge::GoesOn;
+        };
+        let head = read_head(path);
+        match (aof_delta_generation(&head), *own) {
+            // The number is this dump's: an older log goes with an older
+            // one, unless it was added to after this dump was saved.
+            (Some(log), true) if log < saved.number => match added_to_since(path, saved) {
+                Some(from) => LogAge::AddedToFrom(from),
+                None => LogAge::Older,
+            },
+            // No log goes with this dump: one with no header is older, if it
+            // is as it was when the dump was saved.
+            (None, true) if saved.alone && !head.is_empty() => {
+                let as_saved = saved.logs.is_some_and(|logs| {
+                    file_fingerprint(path).is_ok_and(|found| logs.contains(&found))
+                });
+                if as_saved {
+                    LogAge::Older
+                } else {
+                    LogAge::GoesOn
+                }
+            }
             // The number is the log's own, and its dump is gone.
-            (Some(log), Some((number, false, _))) => log == number,
-            _ => false,
+            (Some(log), false) if log == saved.number => LogAge::Older,
+            _ => LogAge::GoesOn,
         }
     }
+}
+
+/// How long the log at `path` was when the dump of `saved` was saved with
+/// the AOF off, if it has only been added to since: it is longer now, and
+/// its first bytes are those recorded at that save. Either name counts, as
+/// a checkpoint renames the log to the old log's.
+fn added_to_since(path: &str, saved: &Saved) -> Option<u64> {
+    let logs = saved.logs?;
+    let file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    logs.into_iter().find_map(|(was, hash)| {
+        let added_to = was >= AOF_DELTA_HEADER_LEN as u64
+            && was < len
+            && fingerprint_of_first(&file, was).is_ok_and(|found| found == (was, hash));
+        added_to.then_some(was)
+    })
 }
 
 fn read_generation() -> u64 {
@@ -1771,6 +1945,15 @@ fn aof_delta_generation(buf: &[u8]) -> Option<u64> {
         return None;
     }
     buf[8..16].try_into().ok().map(u64::from_le_bytes)
+}
+
+/// Where the records of a log start: after its delta header, if it has one.
+fn records_start(buf: &[u8]) -> usize {
+    if aof_delta_generation(buf).is_some() {
+        AOF_DELTA_HEADER_LEN
+    } else {
+        0
+    }
 }
 
 // ── Automatic rewrite ────────────────────────────────────────────────────────
@@ -2568,7 +2751,7 @@ pub fn recover_local(
         recover_turn_over();
     }
     if should_recover_from_aof(aof_enabled) {
-        let buf = match std::fs::read(AOF_PATH) {
+        let mut buf = match std::fs::read(AOF_PATH) {
             Ok(buf) => buf,
             Err(e) => fatal_persistence(&format!("{AOF_PATH} cannot be read: {e}")),
         };
@@ -2589,13 +2772,28 @@ pub fn recover_local(
         // snapshot reached the disk: the old log, then the new one, on top of
         // the old snapshot. One that did finish only left the old log behind.
         let mut resumed_checkpoint = false;
+        // What an older log had added to it after the dump was saved with the
+        // AOF off, and its name: it goes on from the dump (see
+        // [`LogAge::AddedToFrom`]).
+        let mut added: Option<(&str, Vec<u8>)> = None;
         if std::path::Path::new(AOF_PREV_PATH).exists() {
-            if checkpoint_completed(&buf) {
+            // None: the checkpoint that left it behind finished.
+            let prev_age = (!checkpoint_completed(&buf)).then(|| on_disk.age_of(AOF_PREV_PATH));
+            if prev_age.is_none() {
                 let _ = std::fs::remove_file(AOF_PREV_PATH);
-            } else if on_disk.is_newer_than(&read_head(AOF_PREV_PATH)) {
+            } else if prev_age == Some(LogAge::Older) {
                 // And so is the log, which goes on from it.
                 older_than_dump(&format!("{AOF_PREV_PATH} and {AOF_PATH} are"));
                 left_out = true;
+            } else if let Some(LogAge::AddedToFrom(from)) = prev_age {
+                // And the log goes on from what was added.
+                let prev = match std::fs::read(AOF_PREV_PATH) {
+                    Ok(prev) => prev,
+                    Err(e) => fatal_persistence(&format!("{AOF_PREV_PATH} cannot be read: {e}")),
+                };
+                let mut both = prev.get(from as usize..).unwrap_or_default().to_vec();
+                both.extend_from_slice(&buf[records_start(&buf)..]);
+                added = Some((AOF_PREV_PATH, both));
             } else {
                 log_warn!(
                     "AOF: a checkpoint did not finish — replaying {AOF_PREV_PATH} and then \
@@ -2626,6 +2824,7 @@ pub fn recover_local(
             (aof_delta_generation(&buf), read_generation())
             && !resumed_checkpoint
             && !left_out
+            && added.is_none()
             && dump_generation > 0
             && aof_generation > dump_generation
         {
@@ -2635,9 +2834,42 @@ pub fn recover_local(
                  made between those saves are in neither"
             ));
         }
-        if !left_out && !resumed_checkpoint && on_disk.is_newer_than(&buf) {
-            older_than_dump(&format!("{AOF_PATH} is"));
-            left_out = true;
+        if !left_out && !resumed_checkpoint && added.is_none() {
+            match on_disk.age_of(AOF_PATH) {
+                LogAge::Older => {
+                    older_than_dump(&format!("{AOF_PATH} is"));
+                    left_out = true;
+                }
+                LogAge::AddedToFrom(from) => {
+                    added = Some((
+                        AOF_PATH,
+                        buf.get(from as usize..).unwrap_or_default().to_vec(),
+                    ));
+                }
+                LogAge::GoesOn => {}
+            }
+        }
+        // The records added go on from the dump: the log starts again on it
+        // with them, and is replayed. The old logs are kept aside, whole.
+        if let Some((name, added)) = added {
+            log_warn!(
+                "AOF: {name} was added to after dump.kdb was saved with the AOF off (by an \
+                 earlier release started with the AOF on) — what was added is replayed on top of \
+                 dump.kdb; the records from before that save, which dump.kdb holds, are not"
+            );
+            if let Err(e) = start_new_log(
+                "was added to after dump.kdb was saved with the AOF off, and starts again on \
+                 dump.kdb with what was added",
+                &added,
+            ) {
+                fatal_persistence(&format!(
+                    "{AOF_PATH} cannot be started again on dump.kdb with what was added to it: {e}"
+                ));
+            }
+            buf = match std::fs::read(AOF_PATH) {
+                Ok(buf) => buf,
+                Err(e) => fatal_persistence(&format!("{AOF_PATH} cannot be read: {e}")),
+            };
         }
         if !left_out {
             if dump_loaded {
@@ -2677,7 +2909,8 @@ pub fn recover_local(
                 }
             }
         }
-        if left_out && let Err(e) = start_new_log("is older than dump.kdb and is not replayed") {
+        if left_out && let Err(e) = start_new_log("is older than dump.kdb and is not replayed", &[])
+        {
             fatal_persistence(&format!(
                 "{AOF_PATH} is older than dump.kdb and cannot be started again on it: {e}"
             ));
@@ -2947,6 +3180,67 @@ pub(crate) fn failpoint(name: &'static str) {
 /// runs.
 pub static REWRITE_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+mod kept_file_tests {
+    use super::*;
+
+    fn in_temp(name: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name).to_str().unwrap().to_string();
+        (dir, path)
+    }
+
+    /// A copy that fails part-way leaves nothing named like a kept log
+    /// behind (#359): every start listed it, and each attempt added one.
+    #[test]
+    fn a_copy_that_fails_leaves_no_partial_file() {
+        let (dir, from) = in_temp("appendonly.aof");
+        std::fs::write(&from, b"*1\r\n$4\r\nPING\r\n").unwrap();
+        let to = dir
+            .path()
+            .join("superseded.1.0.appendonly.aof")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let failed = copy_synced(&from, &to, |_, to| {
+            std::fs::write(to, b"*1\r\n$4")?;
+            Err(std::io::Error::other("disk full"))
+        });
+        assert!(failed.is_err());
+        assert!(
+            !std::path::Path::new(&to).exists(),
+            "the partial copy was left"
+        );
+        // And one that works is kept, whole.
+        copy_synced(&from, &to, |from, to| std::fs::copy(from, to)).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), std::fs::read(&from).unwrap());
+    }
+
+    /// The fingerprint of a log's first bytes is the one it had when it was
+    /// that long, at every size around the sampled edges.
+    #[test]
+    fn a_log_added_to_has_its_old_fingerprint_at_its_old_length() {
+        let (_dir, path) = in_temp("appendonly.aof");
+        let bytes: Vec<u8> = (0..300_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        for was in [0, 16, 1000, 65_536, 65_537, 131_072, 131_073, 200_000] {
+            std::fs::write(&path, &bytes[..was]).unwrap();
+            let then = file_fingerprint(&path).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            let file = std::fs::File::open(&path).unwrap();
+            assert_eq!(
+                fingerprint_of_first(&file, was as u64).unwrap(),
+                then,
+                "{was}"
+            );
+        }
+        // An absent log is recorded as an empty one.
+        std::fs::write(&path, b"").unwrap();
+        let empty = file_fingerprint(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(log_fingerprint(&path).unwrap(), empty);
+    }
+}
 
 #[cfg(test)]
 mod replay_parse_tests {
