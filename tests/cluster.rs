@@ -1079,6 +1079,7 @@ fn nodes_announce_hostnames_and_clients_can_be_sent_by_them() {
     nodes[2].restart();
     let text = nodes[2].conn().cmd(&["CLUSTER", "NODES"]).text();
     assert!(text.contains(&format!(",{} ", host(0))), "{text}");
+    assert!(text.contains(&format!(",{} ", host(1))), "{text}");
     assert!(text.contains(&format!(",{} ", host(2))), "{text}");
 }
 
