@@ -3604,6 +3604,11 @@ fn all_logs(nodes: &[&Node]) -> String {
 /// `-MOVED`. It used to run on the source, acknowledged, and was lost when
 /// the source resynced from the destination (#337). It waits at the
 /// failpoint `routed` (`KIVIDB_TEST_STALL_KEYS`).
+///
+/// The source, resynced, has the destination's keys, and keeps them when
+/// the `TAKEOVER`'s answer comes. It used to delete the keys of the slots
+/// it had handed over then, every key here, from the dataset it had just
+/// been sent (#348).
 #[test]
 fn a_write_routed_before_a_handoff_whose_claim_came_first_is_sent_on() {
     let key = key_in(0..=8191, "drained");
@@ -3627,6 +3632,17 @@ fn a_write_routed_before_a_handoff_whose_claim_came_first_is_sent_on() {
     assert!(r.is_ok(), "{r:?}");
     let slot = slot_of(&key).to_string();
     assert!(run_past_the_stall(src, 1, &["SET", &key, "5"]).is_ok());
+    // More keys, which no stall holds.
+    let others: Vec<String> = (0..)
+        .map(|i| format!("kept:{i}"))
+        .filter(|k| (ranges[0].0..=ranges[0].1).contains(&slot_of(k)))
+        .take(200)
+        .collect();
+    let sets: Vec<Vec<&str>> = others
+        .iter()
+        .map(|k| vec!["SET", k.as_str(), k.as_str()])
+        .collect();
+    assert!(src.conn().pipeline(&sets).iter().all(Resp::is_ok));
 
     let incr =
         patient_commands_in_background(src.port, Duration::from_secs(120), &[&["INCR", &key]]);
@@ -3646,6 +3662,17 @@ fn a_write_routed_before_a_handoff_whose_claim_came_first_is_sent_on() {
         "the TAKEOVER was answered before the claim came: the test missed its window\n{}",
         logs()
     );
+    // The source has the destination's dataset before the answer comes.
+    wait_until(
+        "the source to resync from the destination",
+        Duration::from_secs(30),
+        || src.log().contains("Full sync loaded"),
+    );
+    assert!(
+        !src.log().contains("handover of slots"),
+        "the TAKEOVER was answered before the source had resynced: the test missed its window\n{}",
+        logs()
+    );
     std::fs::remove_file(held).unwrap();
     let reply = incr.join().unwrap();
     let moved = format!("MOVED {slot} 127.0.0.1:{}", dst.port);
@@ -3662,6 +3689,34 @@ fn a_write_routed_before_a_handoff_whose_claim_came_first_is_sent_on() {
     );
     wait_import_completed(dst, &task_id);
     assert_eq!(dst.conn().cmd(&["GET", &key]).text(), "5");
+
+    // The source has had the TAKEOVER's answer, and is done with it.
+    wait_until(
+        "the source to finish its side of the migration",
+        Duration::from_secs(60),
+        || src.log().contains("migrated to"),
+    );
+    let keys_of = |node: &Node| {
+        let mut keys: Vec<String> = node
+            .conn()
+            .cmd(&["KEYS", "*"])
+            .array()
+            .iter()
+            .map(Resp::text)
+            .collect();
+        keys.sort();
+        keys
+    };
+    let theirs = keys_of(dst);
+    assert_eq!(theirs.len(), others.len() + 1, "{theirs:?}");
+    let ours = keys_of(src);
+    assert!(
+        ours == theirs,
+        "the source, a replica of the destination, has {} of its {} keys\n{}",
+        ours.len(),
+        theirs.len(),
+        logs()
+    );
 }
 
 /// A manual failover: the old master follows the promoted replica once it

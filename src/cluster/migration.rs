@@ -508,30 +508,72 @@ impl Peer {
 
 // ── Key helpers ──────────────────────────────────────────────────────────────
 
+/// This node's dataset as its own, a master's, when it set out to delete
+/// the keys of slots it does not serve. They are its to delete only while
+/// it still is (#348). A node that has become a replica since has its
+/// master's dataset, or is about to be given it, and those keys in it are
+/// the master's. An atomic slot migration that drained the source, whose
+/// destination's claim came before its answer to the `TAKEOVER`, had the
+/// source follow the destination, load its dataset, and then delete from it
+/// the keys it had just handed over. Promoted later, it had lost them.
+///
+/// Kept as the replication generation: a node that has been a replica
+/// since, even one promoted again, is not the master that decided.
+#[derive(Clone, Copy)]
+pub(crate) struct OwnDataset(u64);
+
+impl OwnDataset {
+    /// The dataset now, if it is this node's own; `None` on a replica.
+    pub(crate) fn now(repl_state: &ReplState) -> Option<Self> {
+        let generation = repl_state.generation();
+        (!repl_state.is_slave()).then_some(OwnDataset(generation))
+    }
+
+    /// Whether it still is. Exact in the write gate: a master becomes a
+    /// replica with the gate cut (`ReplState::become_slave`), once it has
+    /// taken a new generation (`begin_replication_epoch`), and a full sync
+    /// puts the master's dataset in place with the gate cut too.
+    fn still(self, repl_state: &ReplState) -> bool {
+        !repl_state.is_slave() && repl_state.generation() == self.0
+    }
+}
+
+/// What [`delete_keys`] did.
+struct Deleted {
+    removed: usize,
+    /// It stopped: the dataset was no longer this node's own.
+    stopped: bool,
+}
+
 /// Delete every key in `ranges` from this node, telling replicas and the AOF.
-/// Used by the source once the slots have moved, and by the destination to
-/// discard a failed import.
-fn delete_keys_in(env: &Env, ranges: &[(u16, u16)]) -> usize {
+/// Used by the destination to discard a failed import.
+fn delete_keys_in(env: &Env, ranges: &[(u16, u16)], own: OwnDataset) -> Deleted {
     delete_keys(
         &env.store,
         &env.index_store,
         &env.repl_state,
         &env.hub_tx,
         |slot| in_ranges(ranges, slot),
+        own,
     )
 }
 
-/// Delete every key whose slot `in_slots` picks, telling replicas and the AOF.
+/// Delete every key whose slot `in_slots` picks, telling replicas and the
+/// AOF, for as long as the dataset is this node's `own`.
 fn delete_keys(
     store: &crate::store::Store,
     index_store: &crate::vector::IndexStore,
     repl_state: &Arc<ReplState>,
     hub_tx: &HubTx,
     in_slots: impl Fn(u16) -> bool,
-) -> usize {
+    own: OwnDataset,
+) -> Deleted {
     let mut removed = 0usize;
     let Some(db) = store.first() else {
-        return 0;
+        return Deleted {
+            removed,
+            stopped: false,
+        };
     };
     for shard in db.iter() {
         let keys: Vec<String> = crate::read_lock!(shard)
@@ -542,6 +584,12 @@ fn delete_keys(
         for chunk in keys.chunks(128) {
             // One whole write, as far as a full sync or a backup is concerned.
             let _gate = crate::write_gate::enter();
+            if !own.still(repl_state) {
+                return Deleted {
+                    removed,
+                    stopped: true,
+                };
+            }
             let _order = crate::write_order::lock_keys(0, chunk.iter().map(|k| k.as_bytes()));
             let mut del = vec![b"DEL".to_vec()];
             for key in chunk {
@@ -556,7 +604,41 @@ fn delete_keys(
             }
         }
     }
-    removed
+    Deleted {
+        removed,
+        stopped: false,
+    }
+}
+
+/// [`delete_keys`] of the keys of `slots`.
+fn delete_keys_of_slots(
+    store: &crate::store::Store,
+    index_store: &crate::vector::IndexStore,
+    repl_state: &Arc<ReplState>,
+    hub_tx: &HubTx,
+    slots: &[u16],
+    own: OwnDataset,
+) -> Deleted {
+    let mut picked = vec![false; crate::cluster::CLUSTER_SLOTS];
+    for slot in slots {
+        picked[*slot as usize] = true;
+    }
+    delete_keys(
+        store,
+        index_store,
+        repl_state,
+        hub_tx,
+        |slot| picked[slot as usize],
+        own,
+    )
+}
+
+/// Logged when [`delete_keys`] stopped part way.
+fn log_deletion_stopped(what: &str, removed: usize) {
+    log_info!(
+        "Cluster: stopped deleting the keys of {what} after {removed}: this node has \
+         followed a master since, and its keys are the master's"
+    );
 }
 
 /// Delete the keys of slots another master has taken from this one.
@@ -568,12 +650,18 @@ fn delete_keys(
 /// memory, show up in `DBSIZE` and `KEYS`, be saved and replicated, and come
 /// back as stale data if the slot ever returned. Redis deletes them too.
 ///
-/// Runs on its own thread: the caller is handling a bus message.
+/// Runs on its own thread: the caller is handling a bus message. Only on a
+/// master, and only for as long as it is one (see [`OwnDataset`]): on a
+/// replica those keys are its master's.
 pub(crate) fn drop_lost_slots(cluster: &ClusterState, slots: Vec<u16>) {
     let Some(hooks) = cluster.hooks.get() else {
         return;
     };
     let starter = &hooks.replica_starter;
+    let own = match OwnDataset::now(&starter.repl_state) {
+        Some(own) if cluster.my_master_id().is_none() => own,
+        _ => return,
+    };
     let store = Arc::clone(&starter.store);
     let index_store = Arc::clone(&starter.index_store);
     let repl_state = Arc::clone(&starter.repl_state);
@@ -581,14 +669,12 @@ pub(crate) fn drop_lost_slots(cluster: &ClusterState, slots: Vec<u16>) {
     let spawned = std::thread::Builder::new()
         .name("kividb-lost-slots".into())
         .spawn(move || {
-            let mut lost = vec![false; crate::cluster::CLUSTER_SLOTS];
-            for slot in &slots {
-                lost[*slot as usize] = true;
-            }
-            let removed = delete_keys(&store, &index_store, &repl_state, &hub_tx, |slot| {
-                lost[slot as usize]
-            });
-            if removed > 0 {
+            let deleted =
+                delete_keys_of_slots(&store, &index_store, &repl_state, &hub_tx, &slots, own);
+            let removed = deleted.removed;
+            if deleted.stopped {
+                log_deletion_stopped("slots owned by another node", removed);
+            } else if removed > 0 {
                 log_info!(
                     "Cluster: deleted {removed} key(s) in {} slot(s) owned by another node",
                     slots.len()
@@ -932,6 +1018,9 @@ fn migrate_out(env: &Env, task: &Task) -> Result<u64, String> {
     // TAKEOVER's answer before it asks.
     let pause_timeout = write_pause_timeout_ms(&env.config).max(100);
     let paused_at = Instant::now();
+    // This node's dataset as the handoff begins: the keys of the slots it
+    // hands over are its to delete only while it still is (#348).
+    let own = OwnDataset::now(&env.repl_state);
     let pause = PauseGuard::hold(&env.cluster);
     // Counted as it goes, so that a handoff that fails part way is counted
     // too: writes were held for it all the same.
@@ -1000,8 +1089,19 @@ fn migrate_out(env: &Env, task: &Task) -> Result<u64, String> {
     // the disk busy that took seconds, all of them with writes paused. Lost
     // to a crash in between, the record is put right by the destination's
     // claim, which has the newer epoch.
-    env.cluster
-        .hand_over_slots(slots_of(&task.ranges), task.dest);
+    //
+    // Only the slots that are still this node's, and only while its dataset
+    // is its own: the destination's claim can have come first, and taken
+    // them, and made this node a replica of the destination if it left it
+    // with none (see `hand_over_slots`). Their keys are then not this
+    // node's to delete (#348).
+    let own = own.filter(|own| own.still(&env.repl_state));
+    let handed = match own {
+        Some(_) => env
+            .cluster
+            .hand_over_slots(slots_of(&task.ranges), task.dest),
+        None => Vec::new(),
+    };
     let paused_ms = capture_ms + paused_at.elapsed().as_millis() as u64;
     drop(pause);
     drop(counted);
@@ -1013,7 +1113,32 @@ fn migrate_out(env: &Env, task: &Task) -> Result<u64, String> {
         sent_ms - gate_ms,
         taken_ms - sent_ms,
     );
-    delete_keys_in(env, &task.ranges);
+    let slots = slots_of(&task.ranges).count();
+    if handed.len() < slots {
+        log_info!(
+            "Cluster: {} of slots {} had gone to {} by its claim before its answer: \
+             their keys were left to that claim (dropped with the slots, or, on a \
+             node it left with none, its new master's)",
+            slots - handed.len(),
+            ranges_text(&task.ranges),
+            super::node_id_str(&task.dest)
+        );
+    }
+    if let Some(own) = own
+        && !handed.is_empty()
+    {
+        let deleted = delete_keys_of_slots(
+            &env.store,
+            &env.index_store,
+            &env.repl_state,
+            &env.hub_tx,
+            &handed,
+            own,
+        );
+        if deleted.stopped {
+            log_deletion_stopped("the slots handed over", deleted.removed);
+        }
+    }
     Ok(paused_ms)
 }
 
@@ -1437,14 +1562,22 @@ fn import_attempt(env: &Env, task: &Task, source: NodeId) -> Option<String> {
 }
 
 /// Discard the keys of an import that did not complete — but never the keys
-/// of slots this node has come to own.
+/// of slots this node has come to own, nor any on a node that has become a
+/// replica, whose keys are its master's (see [`OwnDataset`]).
 fn delete_unowned(env: &Env, ranges: &[(u16, u16)]) {
     let unowned: Ranges = slots_of(ranges)
         .filter(|slot| !env.cluster.owns_slot(*slot))
         .map(|slot| (slot, slot))
         .collect();
-    if !unowned.is_empty() {
-        delete_keys_in(env, &unowned);
+    if unowned.is_empty() || env.cluster.my_master_id().is_some() {
+        return;
+    }
+    let Some(own) = OwnDataset::now(&env.repl_state) else {
+        return;
+    };
+    let deleted = delete_keys_in(env, &unowned, own);
+    if deleted.stopped {
+        log_deletion_stopped("an import that did not complete", deleted.removed);
     }
 }
 

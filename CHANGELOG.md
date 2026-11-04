@@ -95,6 +95,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   2 ms, an unchanged hash looked written, and `redis-cli --cluster reshard`
   stopped. No data was lost. Both sides are now compared by one clock and
   one rule: a field within 5 ms of its time may be missing on either side.
+- **A drained node could delete the keys it had moved from its new copy of
+  them (#348).** In an atomic slot migration that took every slot of the
+  source, the destination's claim could reach the source before its answer
+  to the handoff. The source then became a replica of the destination and
+  resynced from it. When the answer came, it still deleted the keys of the
+  slots it had handed over, from the dataset it had just been sent: in a
+  drain, every key. Had the destination failed then, and the source been
+  promoted, those keys were lost. The source now deletes only the keys of
+  the slots it hands over itself, and only while it is still a master. So
+  does a node that drops the keys of slots another master took, or of an
+  import that did not complete. `MIGRATE` on a node that became a replica
+  after the command was routed is refused with `READONLY`.
+- **Writes could stay paused after an atomic slot migration's handoff
+  (#349).** A node told during the handoff that it had been marked failed
+  holds writes until it has made sure it still owns its slots. The handoff
+  then left its write pause on for that hold to end, and the hold did not
+  end it: writes waited until `CLIENT UNPAUSE` or a failover. The handoff
+  now ends its pause, and the node still refuses writes until it knows its
+  slots.
 - **`SCRIPT HELP` lists the `SCRIPT` subcommands, as in Redis.** It was an
   unknown subcommand (#256).
 - **A restarted cluster node gives its own address at once (#307).** With
@@ -103,14 +122,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   it next reached a peer, about a second, its `CLUSTER SLOTS`, `SHARDS` and
   `NODES` gave `127.0.0.1` for itself. It also saved that over the address
   it had learnt. It now starts from the address in `nodes.conf`, as Redis
-  and Valkey do, and still takes the one it is next reached on. The `?`
-  for a node's hostname right after its restart is as in Redis and Valkey:
+  and Valkey do, and still takes the one it next reaches or is reached
+  on. The `?` for a node's hostname right after its restart is as in Redis
+  and Valkey:
   a node announces the `cluster-announce-hostname` of its configuration,
   so one set only with `CONFIG SET` is not announced again until it is set
   again.
-
-### Fixed
-
 - **`CONFIG SET latency-tracking-info-percentiles` refuses what Redis refuses
   (#255).** It took any value, `abc` included, and `INFO latencystats` then
   dropped the words it could not read. A word that is not a number, and a number
