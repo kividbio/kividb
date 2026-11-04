@@ -5,7 +5,7 @@ Mem0's Redis vector store run against KiviDB and against Redis 8, with the same 
 no language model is called. The store is used directly (`RedisDB`) and through Mem0's public API
 (`Memory`), not only through its own methods.
 
-**23 of 23 checks pass on KiviDB, and 23 of 23 on Redis 8.10.3.**
+**24 of 24 checks pass on KiviDB, and 24 of 24 on Redis 8.10.3.**
 No check differs between the two.
 
 | | |
@@ -16,7 +16,7 @@ No check differs between the two.
 | `redisvl` / `redis-py` | `0.26.0` / `5.3.1`, what `pip install "mem0ai[vector-stores]"` resolves to (see below) |
 | Other pins | see [`requirements.txt`](requirements.txt) |
 | Python | `3.12` |
-| Run | 2026-11-04; KiviDB started with only `--bind 127.0.0.1 --port 6380` |
+| Run | 2026-11-04; KiviDB started with only `--bind 127.0.0.1 --port 6380`; Mem0's telemetry off (`MEM0_TELEMETRY=False`) |
 
 ## Results
 
@@ -30,11 +30,12 @@ No check differs between the two.
 
 | Check | KiviDB | Redis 8 |
 |---|---|---|
-| insert creates the index and stores the memories | PASS | PASS |
+| insert creates the index and stores the 3 memories | PASS | PASS |
 | search returns the closest memory first, scores ordered | PASS | PASS |
 | top_k is honoured | PASS | PASS |
 | filter on user_id | PASS | PASS |
 | filter on user_id and agent_id together | PASS | PASS |
+| filter on run_id | PASS | PASS |
 | the payload comes back whole | PASS | PASS |
 | get by id | PASS | PASS |
 | update changes the text and the vector | PASS | PASS |
@@ -50,13 +51,14 @@ No check differs between the two.
 |---|---|---|
 | add (infer=False) stores a memory for a user | PASS | PASS |
 | search is scoped to the user and finds the closest | PASS | PASS |
-| search does not return another user's memory | PASS | PASS |
+| search does not return another user's memory (bob's own search finds it) | PASS | PASS |
 | get_all for a user | PASS | PASS |
 | get by id | PASS | PASS |
 | update | PASS | PASS |
-| history records the ADD and the UPDATE | PASS | PASS |
+| history records the ADD and the UPDATE (Mem0's local SQLite file, not the server) | PASS | PASS |
 | delete | PASS | PASS |
 | delete_all removes one user's memories only | PASS | PASS |
+
 Raw results: [`results-kividb.json`](results-kividb.json),
 [`results-redis8.json`](results-redis8.json).
 
@@ -64,8 +66,8 @@ Raw results: [`results-kividb.json`](results-kividb.json),
 
 Counted from `INFO commandstats` on KiviDB after one run: `FT.CREATE`, `FT.INFO`, `FT.SEARCH`,
 `FT.DROPINDEX`, `FT._LIST`, `HSET`, `HGETALL`, `UNLINK`, `SCAN`, `INFO`, `PING` and `CLIENT SETINFO`.
-A few of these (`PING`, `INFO`, `FT._LIST`, `SCAN`, `FT.DROPINDEX`, `DBSIZE`) are also the harness's own
-set-up, clean-up and check. Mem0 keeps its memories in hashes, and the history in a local SQLite file, not
+A few of these (`PING`, `INFO`, `FT._LIST`, `SCAN`, `FT.DROPINDEX`) are also the harness's own set-up and
+clean-up. Mem0 keeps its memories in hashes, and the history in a local SQLite file, not
 on the server.
 
 ## Which `redisvl`
@@ -108,6 +110,11 @@ against it reports 1 PASS (`PING`) and 2 FAIL, one per group, each with the erro
 (`unknown command 'FT.INFO'`), and does not crash. A group whose setup fails is one FAIL line, and the next
 group still runs.
 
+The checks that scope by user and by run also fail on wrong data, not only on a missing server: with bob's
+memory stored under another user, "search does not return another user's memory" (which first searches as
+bob) and "delete_all removes one user's memories only" report FAIL, and with the `run_id` left off the
+memory that should carry it, "filter on run_id" reports FAIL.
+
 ## Reproduce
 
 ```bash
@@ -122,5 +129,12 @@ python mem0_kividb_compat.py --url redis://127.0.0.1:6390 --label redis8
 ```
 
 Run it on a throwaway machine, not a laptop: it creates and drops indexes with random names. After a run,
-`FT._LIST` is empty and `DBSIZE` is 0 on both servers. It removes the indexes it made and the one Mem0
-makes with a fixed name (`mem0migrations`), and leaves an index that another client made meanwhile alone.
+`FT._LIST` is empty and `DBSIZE` is 0 on both servers. It removes the indexes it made and leaves an index
+that another client made meanwhile alone: a `mem0migrations` index with 8 dimensions, planted before a run on
+each server, was still there, unchanged, after it.
+
+## Telemetry
+
+The harness sets `MEM0_TELEMETRY=False` before importing Mem0. With telemetry on (the default), Mem0 2.2.1
+sends events to PostHog and also creates a `mem0migrations` index with `overwrite=True`, which would drop
+and recreate an index of that name made by another Mem0 app on the same server.

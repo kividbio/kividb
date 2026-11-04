@@ -6,7 +6,7 @@
   "redisvl": "0.26.0",
   "redis_py": "5.3.1",
   "counts": {
-    "PASS": 23,
+    "PASS": 24,
     "WARN": 0,
     "FAIL": 0
   },
@@ -18,16 +18,16 @@
       "ms": 0
     },
     {
-      "check": "vector store: insert creates the index and stores the memories",
+      "check": "vector store: insert creates the index and stores the 3 memories",
       "status": "PASS",
       "detail": "",
-      "ms": 4
+      "ms": 2
     },
     {
       "check": "vector store: search returns the closest memory first, scores ordered",
       "status": "PASS",
       "detail": "",
-      "ms": 2
+      "ms": 1
     },
     {
       "check": "vector store: top_k is honoured",
@@ -48,10 +48,16 @@
       "ms": 1
     },
     {
+      "check": "vector store: filter on run_id",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
       "check": "vector store: the payload comes back whole",
       "status": "PASS",
       "detail": "",
-      "ms": 0
+      "ms": 1
     },
     {
       "check": "vector store: get by id",
@@ -75,7 +81,7 @@
       "check": "vector store: keyword (BM25) search",
       "status": "PASS",
       "detail": "",
-      "ms": 3
+      "ms": 2
     },
     {
       "check": "vector store: delete",
@@ -93,13 +99,13 @@
       "check": "vector store: reset empties the collection",
       "status": "PASS",
       "detail": "",
-      "ms": 4
+      "ms": 3
     },
     {
       "check": "Memory: add (infer=False) stores a memory for a user",
       "status": "PASS",
       "detail": "",
-      "ms": 9
+      "ms": 7
     },
     {
       "check": "Memory: search is scoped to the user and finds the closest",
@@ -108,10 +114,10 @@
       "ms": 2
     },
     {
-      "check": "Memory: search does not return another user's memory",
+      "check": "Memory: search does not return another user's memory (bob's own search finds it)",
       "status": "PASS",
       "detail": "",
-      "ms": 1
+      "ms": 2
     },
     {
       "check": "Memory: get_all for a user",
@@ -129,10 +135,10 @@
       "check": "Memory: update",
       "status": "PASS",
       "detail": "",
-      "ms": 2
+      "ms": 3
     },
     {
-      "check": "Memory: history records the ADD and the UPDATE",
+      "check": "Memory: history records the ADD and the UPDATE (Mem0's local SQLite file, not the server)",
       "status": "PASS",
       "detail": "",
       "ms": 0
@@ -141,13 +147,13 @@
       "check": "Memory: delete",
       "status": "PASS",
       "detail": "",
-      "ms": 3
+      "ms": 2
     },
     {
       "check": "Memory: delete_all removes one user's memories only",
       "status": "PASS",
       "detail": "",
-      "ms": 234
+      "ms": 3
     }
   ]
 }

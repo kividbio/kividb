@@ -4,7 +4,7 @@ Mem0's Redis vector store works on KiviDB: the `RedisDB` store used directly, an
 it (add, search, get, update, delete, history). Point `redis_url` at KiviDB (port `6380` by default) and
 nothing else changes.
 
-**Checked:** 23 of 23 checks pass on KiviDB, the same 23 that pass on Redis 8, with `mem0ai` `2.2.1`. See the
+**Checked:** 24 of 24 checks pass on KiviDB, the same 24 that pass on Redis 8, with `mem0ai` `2.2.1`. See the
 [report](../../benchmarks/mem0-compat/REPORT.md) for each check, what it does not cover, and how to run it
 yourself.
 
@@ -23,8 +23,8 @@ attribute 'set_client'` ([mem0#7819](https://github.com/mem0ai/mem0/issues/7819)
 ## Example
 
 Mem0 normally calls a language model to pull facts out of a conversation, and an embedding model to index
-them. This example needs neither: `infer=False` stores the text as given, and a small stand-in replaces the
-embedding model, so it runs offline.
+them. This example needs neither: `infer=False` stores the text as given, a small stand-in replaces the
+embedding model, and Mem0's telemetry is turned off, so it runs offline.
 
 ```python
 import hashlib
@@ -32,6 +32,8 @@ import math
 import os
 import re
 import tempfile
+
+os.environ["MEM0_TELEMETRY"] = "False"  # before importing mem0; see the note below
 
 from mem0 import Memory
 
@@ -52,7 +54,7 @@ class HashEmbedder:
 memory = Memory.from_config({
     "vector_store": {"provider": "redis", "config": {
         "redis_url": "redis://localhost:6380",  # KiviDB, not Redis's 6379
-        "collection_name": "demo", "embedding_model_dims": DIM}},
+        "collection_name": "kividb_mem0_example", "embedding_model_dims": DIM}},
     "llm": {"provider": "openai", "config": {"api_key": "unused"}},
     "embedder": {"provider": "openai", "config": {"api_key": "unused", "embedding_dims": DIM}},
     "history_db_path": os.path.join(tempfile.mkdtemp(), "history.db"),
@@ -67,6 +69,7 @@ for hit in memory.search("hiking in the mountains", filters={"user_id": "alice"}
 
 memory.delete_all(user_id="alice")
 memory.delete_all(user_id="bob")
+memory.vector_store.delete_col()  # drop the example's index
 ```
 
 It prints (the same on KiviDB and on Redis 8):
@@ -74,6 +77,11 @@ It prints (the same on KiviDB and on Redis 8):
 ```
 'I love hiking in the mountains' (user alice)
 ```
+
+Mem0 creates the collection's index with `overwrite=True`, so use a `collection_name` that no other index on
+the server has. Telemetry is off in the example because, when it is on (the default), Mem0 also sends events
+to PostHog and creates a `mem0migrations` index the same way, replacing one of that name made by another Mem0
+app on the server.
 
 With real models, drop the `HashEmbedder` line and the `infer=False` arguments, set the `llm` and `embedder`
 sections to your providers, and set `embedding_model_dims` to the embedder's size. That path, with Mem0's own

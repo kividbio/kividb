@@ -32,10 +32,10 @@ filters), not semantic quality. Mem0's own fact extraction (infer=True) needs a 
 not exercised.
 
 Everything it creates has a random name and is removed at the end, including the indexes. Every index
-the harness makes carries one of those names, except `mem0migrations`, which Mem0 itself creates with a
-fixed name whenever a Memory is built. Only an index that appeared during the run and has one of these
-names is dropped (with its documents): one that another client made on the same server meanwhile is
-left alone.
+the harness makes carries one of those names, so only an index that appeared during the run and has such
+a name is dropped (with its documents): one that another client made on the same server meanwhile is
+left alone. Mem0's telemetry is turned off (MEM0_TELEMETRY=False), so it sends nothing and makes no index
+of its own.
 """
 import argparse
 import hashlib
@@ -53,7 +53,12 @@ from importlib.metadata import version
 
 import redis
 
-logging.disable(logging.CRITICAL)  # mem0 and its telemetry are noisy
+logging.disable(logging.CRITICAL)  # mem0 is noisy
+
+# Telemetry off, before mem0 is imported (it reads this at import). With it on, Mem0 sends events to
+# PostHog and also creates a "mem0migrations" index with overwrite=True, which would drop and recreate
+# an index of that name that another Mem0 app had made on the same server.
+os.environ["MEM0_TELEMETRY"] = "False"
 
 from mem0 import Memory  # noqa: E402
 from mem0.vector_stores.redis import RedisDB  # noqa: E402
@@ -61,9 +66,6 @@ from mem0.vector_stores.redis import RedisDB  # noqa: E402
 DIM = 64
 results = []
 PREFIXES = []  # every random name used, so its keys can be removed
-# Mem0 makes this index itself, with a fixed name, every time a Memory is created (it keeps a user id
-# for its telemetry there). It is dropped too, but only if it was not there before the run.
-LIBRARY_INDEXES = {"mem0migrations"}
 
 
 # ---------------------------------------------------------------- stub embedding model
@@ -124,10 +126,10 @@ def indexes(r):
 
 def cleanup(r, before):
     """Drop this run's indexes, with their documents, then any key that has one of this run's
-    random names in it. Every index the harness makes is named with one of those names (or is
-    Mem0's own, see LIBRARY_INDEXES), so an index another client made during the run is left alone."""
+    random names in it. Every index the harness makes is named with one of those names, so an
+    index another client made during the run is left alone."""
     for idx in indexes(r) - before:
-        if idx not in LIBRARY_INDEXES and not any(prefix in idx for prefix in PREFIXES):
+        if not any(prefix in idx for prefix in PREFIXES):
             continue
         try:
             r.execute_command("FT.DROPINDEX", idx, "DD")
@@ -140,10 +142,10 @@ def cleanup(r, before):
 
 # ---------------------------------------------------------------- the vector store, used directly
 NOW = datetime.now(timezone.utc).isoformat()
-ITEMS = [
-    ("m-cats", "I like cats and warm mats", "alice", "agent-1"),
-    ("m-rates", "interest rates rose again this quarter", "alice", "agent-2"),
-    ("m-rust", "a new rust compiler release is out", "bob", "agent-1"),
+ITEMS = [  # id, text, user, agent, run (only one memory belongs to a run)
+    ("m-cats", "I like cats and warm mats", "alice", "agent-1", "run-1"),
+    ("m-rates", "interest rates rose again this quarter", "alice", "agent-2", None),
+    ("m-rust", "a new rust compiler release is out", "bob", "agent-1", None),
 ]
 
 
@@ -151,14 +153,19 @@ def vector_store(url, r):
     name = unique("m0v")
     db = RedisDB(redis_url=url, collection_name=name, embedding_model_dims=DIM)
 
-    def payload(text, user, agent):
-        return {"data": text, "user_id": user, "agent_id": agent, "hash": hashlib.md5(text.encode()).hexdigest(),
-                "created_at": NOW, "topic": "demo"}
+    def payload(text, user, agent, run=None):
+        out = {"data": text, "user_id": user, "agent_id": agent, "hash": hashlib.md5(text.encode()).hexdigest(),
+               "created_at": NOW, "topic": "demo"}
+        if run:
+            out["run_id"] = run
+        return out
 
     def insert():
-        db.insert([embed(t) for _, t, _, _ in ITEMS], [payload(t, u, a) for _, t, u, a in ITEMS],
-                  [i for i, _, _, _ in ITEMS])
+        db.insert([embed(t) for _, t, _, _, _ in ITEMS], [payload(t, u, a, run) for _, t, u, a, run in ITEMS],
+                  [i for i, _, _, _, _ in ITEMS])
         assert name in indexes(r), f"index {name} not listed"
+        stored = sum(len(page) for page in db.list())
+        assert stored == len(ITEMS), f"{stored} memories stored, expected {len(ITEMS)}"
 
     def nearest():
         top = db.search("rates", embed("interest rates rose"), top_k=3)
@@ -179,6 +186,12 @@ def vector_store(url, r):
                                        filters={"user_id": "alice", "agent_id": "agent-2"})]
         assert got == ["m-rates"], got
 
+    def by_run():
+        got = [x.id for x in db.search("x", embed("anything"), top_k=10, filters={"run_id": "run-1"})]
+        assert got == ["m-cats"], got
+        assert db.get("m-cats").payload["run_id"] == "run-1", db.get("m-cats").payload
+        assert db.search("x", embed("anything"), top_k=10, filters={"run_id": "no-such-run"}) == []
+
     def payload_back():
         hit = db.search("x", embed("rust compiler"), top_k=1)[0]
         assert hit.id == "m-rust" and hit.payload["data"] == "a new rust compiler release is out", hit.payload
@@ -190,7 +203,7 @@ def vector_store(url, r):
         assert got.id == "m-rust" and got.payload["data"] == "a new rust compiler release is out", got
 
     def update():
-        db.update("m-cats", embed("I like dogs"), payload("I like dogs", "alice", "agent-1"))
+        db.update("m-cats", embed("I like dogs"), payload("I like dogs", "alice", "agent-1", "run-1"))
         assert db.get("m-cats").payload["data"] == "I like dogs"
         top = db.search("x", embed("I like dogs"), top_k=1)
         assert top[0].id == "m-cats", [x.id for x in top]
@@ -217,11 +230,12 @@ def vector_store(url, r):
         db.reset()
         assert sum(len(page) for page in db.list()) == 0, "memories left after reset"
 
-    check("vector store: insert creates the index and stores the memories", insert)
+    check("vector store: insert creates the index and stores the 3 memories", insert)
     check("vector store: search returns the closest memory first, scores ordered", nearest)
     check("vector store: top_k is honoured", top_k)
     check("vector store: filter on user_id", by_user)
     check("vector store: filter on user_id and agent_id together", by_two)
+    check("vector store: filter on run_id", by_run)
     check("vector store: the payload comes back whole", payload_back)
     check("vector store: get by id", get)
     check("vector store: update changes the text and the vector", update)
@@ -261,6 +275,9 @@ def memory_api(url, r):
         assert all(x["user_id"] == "alice" for x in top), top
 
     def scoped():
+        # Control: bob's own search finds his memory, so an empty result below means something.
+        own = memory.search("tea coffee", filters={"user_id": "bob"}, top_k=5)["results"]
+        assert [x["memory"] for x in own] == ["I prefer tea to coffee"], own
         got = memory.search("tea coffee", filters={"user_id": "alice"}, top_k=5)["results"]
         assert all("tea" not in x["memory"] for x in got), "another user's memory came back"
 
@@ -295,11 +312,11 @@ def memory_api(url, r):
 
     check("Memory: add (infer=False) stores a memory for a user", add)
     check("Memory: search is scoped to the user and finds the closest", search)
-    check("Memory: search does not return another user's memory", scoped)
+    check("Memory: search does not return another user's memory (bob's own search finds it)", scoped)
     check("Memory: get_all for a user", get_all)
     check("Memory: get by id", get_one)
     check("Memory: update", update)
-    check("Memory: history records the ADD and the UPDATE", history)
+    check("Memory: history records the ADD and the UPDATE (Mem0's local SQLite file, not the server)", history)
     check("Memory: delete", delete)
     check("Memory: delete_all removes one user's memories only", delete_all)
 
