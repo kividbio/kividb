@@ -17,6 +17,10 @@ Postgres for the NuQ queue, RabbitMQ, the local test site):
 - Scrape, map, batch scrape and crawl jobs against the test site, with the server restarted in the middle
   of a crawl: 7 of 7 checks pass on KiviDB and on Redis 8.10.3, and the crawl finishes with the same pages,
   none twice.
+- The same jobs on Firecrawl's own `docker-compose.yaml` (images built from `v2.11.0`) with the override
+  below, against the same stack with its own `redis` service: the same results on both. Map found no pages
+  on either (an artefact of the Docker network alias the test site was served under), so the harness took
+  the pages from a crawl; the other 6 checks pass on both.
 
 The harness and raw results are in [`benchmarks/firecrawl-compat`](../../benchmarks/firecrawl-compat/)
 ([KiviDB](../../benchmarks/firecrawl-compat/results-kividb.json),
@@ -52,7 +56,8 @@ REDIS_URL=redis://kividb:6380
 docker compose -f docker-compose.yaml -f docker-compose.kividb.yaml up -d
 ```
 
-The `redis` service still starts, because the `api` service depends on it, but nothing connects to it.
+The `redis` service still starts, because the `api` service depends on it, but nothing connects to it
+(in the test it had no client but `redis-cli`).
 `--protected-mode no` is the image's own command, which passing flags replaces; keep it or set
 `--requirepass` and put the password in `REDIS_URL`. `--aof` keeps crawl state and queued jobs across a
 KiviDB restart.
