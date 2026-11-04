@@ -1429,11 +1429,11 @@ where
                                 .map(|&i| (shard_ptrs[i], shards[i].write()))
                                 .collect();
 
-                            // During a handoff (`pause::HANDOFF`) this transaction
-                            // got past the pause before it was set: it is given up, as
-                            // if a watched key had changed, and the client's retry is
-                            // answered by whoever owns the keys then.
-                            if dirty_flag.load(Ordering::Acquire) || crate::pause::handoff() {
+                            // A handoff that set its pause before the gates were
+                            // taken has refused this transaction already
+                            // (`routing::exec_refusal_in_gate`); one set since waits
+                            // for the write gate before it takes its cut.
+                            if dirty_flag.load(Ordering::Acquire) {
                                 drop(guards);
                                 watch_registry.as_ref().unwatch_all(
                                     &tx.watched_keys
