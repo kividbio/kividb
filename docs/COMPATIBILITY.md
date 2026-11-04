@@ -63,6 +63,12 @@ other files:
 - OmniRoute's rate limiter (a Lua script, so the `lua` build), auth cache, quota store, circuit
   breaker and semantic cache: [benchmarks/omniroute-compat/](../benchmarks/omniroute-compat/) and
   [docs/integrations/omniroute.md](integrations/omniroute.md).
+- Dify's self-hosted stack (cache, Celery broker and result backend, pub/sub, locks; the `lua` build),
+  end to end and with Dify's own Redis tests: [benchmarks/dify-compat/](../benchmarks/dify-compat/) and
+  [docs/integrations/dify.md](integrations/dify.md).
+- RAGFlow's self-hosted stack (the stream task queue, cache and locks; the `lua` build), end to end:
+  [benchmarks/ragflow-compat/](../benchmarks/ragflow-compat/) and
+  [docs/integrations/ragflow.md](integrations/ragflow.md).
 - `redis-py` throughout the end-to-end tests (`tests/e2e/`).
 
 ## Differences you may notice
