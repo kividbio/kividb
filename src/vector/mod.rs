@@ -2113,6 +2113,8 @@ pub fn maybe_index(
 /// Index `fields` of the document at `key` in `def`: the words of its TEXT
 /// fields, its TAG and NUMERIC values, and its vectors.
 fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)], how: Write) {
+    #[cfg(test)]
+    crate::test_hooks::at("index_fields: fields read");
     let whole = how != Write::Fields;
 
     // ── The words of the TEXT fields written ────────────────────────────────

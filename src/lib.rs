@@ -38,6 +38,8 @@ pub mod snapshot;
 pub mod stats;
 pub mod store;
 pub mod tag_locks;
+#[cfg(test)]
+pub(crate) mod test_hooks;
 pub mod tracking;
 pub mod types;
 pub mod update_check;

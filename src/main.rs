@@ -51,6 +51,8 @@ mod snapshot;
 mod stats;
 mod store;
 pub mod tag_locks;
+#[cfg(test)]
+mod test_hooks;
 pub mod tracking;
 pub mod types;
 mod update_check;

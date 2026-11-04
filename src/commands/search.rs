@@ -1075,7 +1075,7 @@ fn plan_in(
             return None;
         }
         #[cfg(test)]
-        tests::while_the_postings_are_read();
+        crate::test_hooks::at("plan: postings read");
         let volatile: Vec<(String, u32)> = watched
             .into_iter()
             .filter(|key| only.is_none_or(|only| only.contains(key)))
@@ -1199,7 +1199,15 @@ pub(crate) fn filter_each(
 
     // The keys to look at, if they are known without reading everything: the
     // ones the caller named, or the ones the TEXT index names. Those are the
-    // matches if the TEXT index says so, and it is of this database.
+    // matches if the TEXT index says so, and it is of this database, but for
+    // the hashes with field TTLs: a read can drop a field of one before the
+    // TEXT index hears of it, and they are tried, as `plan` tries them.
+    // Which they are is read before the TEXT index is, for the reason it is
+    // read first there. They were not tried, and a TEXT field gone to a read
+    // still matched until the sweep came (#364).
+    let watched: AHashSet<String> = crate::field_expiry::watched_keys(ctx.store, *ctx.selected_db)
+        .into_iter()
+        .collect();
     let found = {
         // Every write queued so far applied (the TEXT index's part too: see
         // `postings::WithId`), and no id given back while the TEXT index's
@@ -1235,7 +1243,7 @@ pub(crate) fn filter_each(
                     continue;
                 }
                 with_doc(db, def, key, |fields, _| {
-                    if exact || filter::eval(filter, fields) {
+                    if (exact && !watched.contains(key)) || filter::eval(filter, fields) {
                         accept(key, fields);
                     }
                 });
@@ -2662,19 +2670,6 @@ fn coordinate(
 mod tests {
     use super::*;
 
-    thread_local! {
-        /// What [`plan_in`] runs on this thread while it holds the postings,
-        /// once: for a test to put a write there.
-        static WHILE_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
-            const { std::cell::RefCell::new(None) };
-    }
-
-    pub(super) fn while_the_postings_are_read() {
-        if let Some(run) = WHILE_READ.with(|w| w.borrow_mut().take()) {
-            run();
-        }
-    }
-
     /// A hash whose field went to a read, swept while a query holds the
     /// postings: the sweep's write is queued behind the query, and the hash
     /// is no longer watched by the time the query is done with them. The
@@ -2684,6 +2679,7 @@ mod tests {
     fn a_hash_swept_while_a_query_reads_the_postings_is_still_tried() {
         use crate::types::HashInner;
         let store = crate::store::new_store(1);
+        let _own = crate::field_expiry::OwnWatches::of(&store);
         let index_store = crate::vector::new_index_store();
         let def = IndexSchema {
             name: "i347".into(),
@@ -2753,8 +2749,8 @@ mod tests {
 
         // Now the sweep, with the query holding the postings.
         let (s, i) = (Arc::clone(&store), Arc::clone(&index_store));
-        WHILE_READ.with(|w| {
-            *w.borrow_mut() = Some(Box::new(move || crate::field_expiry::sweep(&s, &i)));
+        crate::test_hooks::set("plan: postings read", move || {
+            crate::field_expiry::sweep(&s, &i)
         });
         let plan = plan_in(&store, 0, &def, &filter, None).unwrap();
         assert!(
