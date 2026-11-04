@@ -394,6 +394,20 @@ fn close(
     }
 }
 
+/// Whether anything is taking the gate alone, or holds it alone: for a
+/// holder of the gate that can let go of it between steps of its work.
+#[inline]
+pub fn taker_waiting() -> bool {
+    TAKERS.load(Ordering::Relaxed) > 0
+}
+
+/// Whether the calling thread holds the gate, alone or not: then whatever
+/// it takes of it again takes nothing.
+#[inline]
+pub fn held_on_this_thread() -> bool {
+    DEPTH.with(|d| d.get() > 0)
+}
+
 /// Whether the calling thread holds the gate alone — whether what it is
 /// running is part of a transaction or a script.
 #[inline]

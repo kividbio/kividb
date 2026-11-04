@@ -2761,40 +2761,38 @@ pub struct FinalSaveHold<'a> {
     turn: crate::aof::CheckpointTurn,
 }
 
-/// Shutdown: close the command gate for the final save, having taken first
-/// what the save takes — the checkpoint turn, then the replica applier's
-/// lock, the order [`save_dataset`] takes them in.
+/// Shutdown: close the command gate for the final save, then take the
+/// replica applier's lock, which the save takes too: the checkpoint turn,
+/// the gate, the lock, as every other holder of the lock takes them.
 ///
-/// The applier holds its lock while it runs a command of its master's
-/// stream, and the command enters the command gate. A shutdown that closed
-/// the gate first and then waited in the save for that lock waited for
-/// ever: the applier, holding the lock, waited at the closed gate (#308).
-/// Taken first, the lock waits for the command the applier is running, and
-/// the applier applies nothing more.
+/// The applier takes the gate before its lock, for every turn of its
+/// master's stream (#373), so once the gate is closed it holds the lock
+/// only to publish its offset, a moment. It used to take the lock first and
+/// enter the gate inside it: a shutdown that closed the gate and then waited
+/// for the lock waited for ever (#308), and this took the lock first, then
+/// the gate, the other way round from `SAVE` and a promotion.
 ///
-/// A command already running that itself waits for the turn or the lock
-/// (`SAVE`, a promotion) would keep the gate from closing behind them: if it
-/// does not close in a moment, both are let go of, so that the command can
-/// finish, and taken again. Clients are paused by then, so no new command
-/// starts meanwhile.
+/// A command already running that itself waits for the turn (`SAVE`) would
+/// keep the gate from closing: if it does not close in a moment, the turn is
+/// let go of, so that the command can finish, and both are taken again.
+/// Clients are paused by then, so no new command starts meanwhile.
 pub fn hold_for_final_save(state: &ReplState) -> std::io::Result<FinalSaveHold<'_>> {
     use std::time::{Duration, Instant};
     loop {
         let turn = crate::aof::checkpoint_turn()?;
-        let applying = state.apply_lock.lock();
         let deadline = Instant::now() + Duration::from_millis(50);
         if let Some(alone) =
             crate::command_gate::enter_alone_unless(Duration::from_millis(5), || {
                 Instant::now() >= deadline
             })
         {
+            let applying = state.apply_lock.lock();
             return Ok(FinalSaveHold {
                 _alone: alone,
                 _applying: applying,
                 turn,
             });
         }
-        drop(applying);
         drop(turn);
         std::thread::sleep(Duration::from_millis(5));
     }

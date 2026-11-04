@@ -1303,17 +1303,40 @@ async fn run_replication_session(
             // applied and not counted: should the link drop now, it is asked
             // for again from its `MULTI` (as Redis keeps a replica's offset
             // at the `MULTI` until the `EXEC`).
+            // The command at the front takes the gate alone as it is
+            // applied (one that writes keys of several shards, a script):
+            // the turn that stopped before it found so.
+            let mut next_alone = false;
+            // What the turns have applied of `repl_buf`, let go of once they
+            // are done. Drained after each turn, it moved the rest of the
+            // buffer every time, and a stream of such commands is a turn each.
+            let mut head = 0usize;
             loop {
-                let transaction = match transaction_at(&repl_buf, &mut transaction_scanned) {
+                let transaction = match transaction_at(&repl_buf[head..], &mut transaction_scanned)
+                {
                     StreamTransaction::Whole(whole) => Some(whole),
                     StreamTransaction::Partial => break,
                     StreamTransaction::None => None,
                 };
-                // Alone before the lock below, never after: a command can
-                // hold the gate while it waits for that lock (`SAVE` does),
-                // and would wait for ever behind a transaction waiting for
-                // the gate.
-                let _alone = transaction.is_some().then(crate::command_gate::enter_alone);
+                // The gate before the lock below, never after, alone or not:
+                // a command can hold the gate while it waits for that lock
+                // (`SAVE` does, and a promotion). A transaction, or such a
+                // command, waiting for the gate alone after the lock waited
+                // for ever; so did any command waiting for its slot of the
+                // gate after the lock, behind a script taking the gate alone,
+                // slot by slot, which was waiting for the `SAVE`'s slot. The
+                // replica stopped (#373). The commands of the turn find the
+                // gate held on this thread, and take nothing more of it.
+                // A command that takes the gate alone is applied on a turn of
+                // its own, the gate taken here.
+                let alone = transaction.is_some() || std::mem::take(&mut next_alone);
+                // The master's heartbeats apply nothing, and take no gate: a
+                // turn of them alone, so that an idle link is acknowledged
+                // however long a script, or anything else holding the gate
+                // alone, takes.
+                let heartbeats = !alone && heartbeat_at(&repl_buf[head..]);
+                let _alone = alone.then(crate::command_gate::enter_alone);
+                let _gate = (!alone && !heartbeats).then(crate::command_gate::enter);
                 // The commands and the position move together: whoever holds
                 // this lock sees a dataset that is exactly the stream up to the
                 // resync point. A save takes it to record that point beside the
@@ -1347,7 +1370,8 @@ async fn run_replication_session(
                     }
                     None => {
                         let mut parse_pos = 0usize;
-                        while let Some((consumed, cmd)) = parse_resp_command(&repl_buf[parse_pos..])
+                        while let Some((consumed, cmd)) =
+                            parse_resp_command(&repl_buf[head + parse_pos..])
                         {
                             if is_named(&cmd, b"MULTI") {
                                 // Applied whole, on the next turn.
@@ -1356,22 +1380,55 @@ async fn run_replication_session(
                             if is_named(&cmd, b"PING") {
                                 // The master's heartbeat. Nothing to apply.
                                 heartbeats_seen = true;
-                            } else {
-                                apply!(cmd.iter().map(|v| v.to_vec()).collect());
+                                parse_pos += consumed;
+                                continue;
                             }
+                            if heartbeats {
+                                // The rest, on a turn with the gate.
+                                break;
+                            }
+                            // One that takes the gate alone: on the next
+                            // turn, alone, unless this is that turn; which
+                            // goes on as long as the commands want it alone,
+                            // and no further.
+                            let wants_alone =
+                                crate::commands::handler::applied_takes_the_gate_alone(
+                                    store,
+                                    selected_db,
+                                    &cmd,
+                                );
+                            if wants_alone && !alone {
+                                next_alone = true;
+                                break;
+                            }
+                            if alone && !wants_alone && parse_pos > 0 {
+                                break;
+                            }
+                            apply!(cmd.iter().map(|v| v.to_vec()).collect());
                             parse_pos += consumed;
+                            // Holding the gate shared, a turn ends when
+                            // something waits to take it alone, as the gate
+                            // was let go of between commands when each took
+                            // it: a script or `EXEC` waits for one command, not
+                            // for all the stream had buffered.
+                            if !alone && crate::command_gate::taker_waiting() {
+                                break;
+                            }
                         }
                         parse_pos
                     }
                 };
                 if parse_pos == 0 {
+                    if next_alone {
+                        continue;
+                    }
                     break;
                 }
                 applied_commands = true;
-                let read: Vec<u8> = repl_buf[..parse_pos].to_vec();
-                repl_buf.drain(0..parse_pos);
+                let read: Vec<u8> = repl_buf[head..head + parse_pos].to_vec();
+                head += parse_pos;
                 transaction_scanned = 0;
-                applied = offset - repl_buf.len() as u64;
+                applied = offset - (repl_buf.len() - head) as u64;
                 repl_state.repl_offset.store(applied, Ordering::Relaxed);
                 if let Some(point) = repl_state.resync_point.lock().as_mut() {
                     point.offset = applied;
@@ -1381,6 +1438,7 @@ async fn run_replication_session(
                 // is promoted, the master's other replicas carry on from it (#109).
                 repl_state.record_received(read, applied);
             }
+            repl_buf.drain(0..head);
             // What is left is the start of a command still arriving — or, if
             // the master sent the stream from a position that is not where
             // this replica stands, the middle of one. That never parses: the
@@ -1429,6 +1487,13 @@ fn publish_applied(repl_state: &ReplState, my_generation: u64, applied: u64) -> 
     }
     repl_state.repl_offset.store(applied, Ordering::Relaxed);
     true
+}
+
+/// Whether the stream's next command is the master's heartbeat, `PING`.
+/// A command of one word is looked at only: most are not.
+fn heartbeat_at(buf: &[u8]) -> bool {
+    buf.starts_with(b"*1\r\n")
+        && parse_resp_command(buf).is_some_and(|(_, cmd)| is_named(&cmd, b"PING"))
 }
 
 /// Whether `cmd` is the bare command `name` — `MULTI`, `EXEC`, `PING`.
