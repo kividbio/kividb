@@ -1740,3 +1740,49 @@ fn the_aof_turned_on_where_no_log_can_be_made_is_an_error_not_an_exit() {
         "the write after turning the AOF on is not in the log"
     );
 }
+
+/// Started with the AOF on and a log it cannot open, the server still
+/// exits, before it serves: it would take writes and keep none of them. The
+/// log is set up before the writer's thread is spawned now, not in it.
+#[cfg(unix)]
+#[test]
+fn the_aof_on_with_a_log_that_cannot_be_opened_still_exits() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    // A link into a directory that is not there: to recovery there is no
+    // log, and none can be made through it, for root too.
+    std::os::unix::fs::symlink(
+        dir.join("missing").join("appendonly.aof"),
+        dir.join("appendonly.aof"),
+    )
+    .unwrap();
+    let output = std::fs::File::create(dir.join("server.log")).unwrap();
+    let port = free_port();
+    let mut child = kividb(&dir, port, &["--aof"])
+        .stdout(output.try_clone().unwrap())
+        .stderr(output)
+        .spawn()
+        .expect("could not start kividb");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("kividb went on with a log it cannot open");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let said = std::fs::read_to_string(dir.join("server.log")).unwrap();
+    assert!(!status.success(), "{status}: {said}");
+    assert!(
+        said.contains("appendonly.aof cannot be opened for appending"),
+        "{said}"
+    );
+    assert!(
+        TcpStream::connect(("127.0.0.1", port)).is_err(),
+        "something listens on {port}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

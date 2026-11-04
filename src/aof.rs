@@ -31,6 +31,12 @@ pub fn record_lost_aof_record() {
 /// commands are sent to it. Flipping to false drains the channel
 /// naturally; flipping to true immediately starts routing writes, so
 /// the log is opened first (see [`open_log`]).
+///
+/// The rule: while this is on, the log is open (`LOG` holds it). It is
+/// opened before the flag first goes up, at startup or by `CONFIG SET
+/// appendonly yes`, and never closed. A checkpoint's turn-over waits for
+/// whoever holds the log to reach its mark: with no log, it would wait for
+/// ever.
 pub static AOF_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 // ── Preamble framing ─────────────────────────────────────────────────────────
@@ -306,32 +312,115 @@ static LOG: parking_lot::Mutex<Option<Log>> = parking_lot::const_mutex(None);
 static UNOPENED: parking_lot::Mutex<Option<mpsc::UnboundedReceiver<Vec<u8>>>> =
     parking_lot::const_mutex(None);
 
-/// Open the log, if it is not open yet: `CONFIG SET appendonly yes` on a
-/// server started with the AOF off. Call before the flag goes up, so that a
+/// Set when the dataset has moved on without the log kept open through
+/// `appendonly no`: a `SAVE` wrote a `dump.kdb` the log does not continue
+/// from, or a replica's full sync replaced the dataset. The log's records are
+/// then older than the dump, and the AOF turned on again starts a new log
+/// (see [`open_log`]).
+static LOG_SUPERSEDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The dataset has moved on, with the AOF off, without the log. See
+/// [`LOG_SUPERSEDED`].
+pub fn log_superseded() {
+    LOG_SUPERSEDED.store(true, Ordering::Relaxed);
+}
+
+/// Get the log ready for `CONFIG SET appendonly yes`, with the turn of the
+/// checkpoint that follows held. Call before the flag goes up, so that a
 /// record logged once it is up has a file to go to. A file that cannot be
-/// opened is an error for the caller, not an exit: the AOF stays off.
-pub fn open_log() -> std::io::Result<()> {
+/// made is an error for the caller, not an exit: the AOF stays off.
+///
+/// The log starts again, empty (see [`start_new_log`]), unless it is the one
+/// this process has had open all along and nothing has moved on without it
+/// (#350). An `appendonly.aof` left by an earlier run with the AOF on is not
+/// the dataset this process serves, and the log kept through `appendonly no`
+/// is older than a `SAVE` made since. Appended to, either became the enable's
+/// `appendonly.aof.prev`, and a crash before the enable's snapshot was on
+/// disk replayed it on top of the newer data: overwritten values, and keys
+/// deleted since, came back. Otherwise the open log is kept: with the dump it
+/// continues from, it holds what was written while the AOF was on.
+pub fn open_log(_turn: &CheckpointTurn) -> std::io::Result<()> {
+    let made = |e: std::io::Error| {
+        std::io::Error::new(e.kind(), format!("a new {AOF_PATH} cannot be made: {e}"))
+    };
     let mut log = LOG.lock();
-    if log.is_some() {
+    if let Some(log) = log.as_mut() {
+        if LOG_SUPERSEDED.load(Ordering::Relaxed) {
+            // What is still queued goes to the old log, and the barriers in
+            // it are answered. No turn-over mark is: the turn is held.
+            write_queued(&mut log.file, &mut log.rx, None);
+            log.file = start_new_log().map_err(made)?;
+            LOG_SUPERSEDED.store(false, Ordering::Relaxed);
+        }
         return Ok(());
     }
     let mut unopened = UNOPENED.lock();
     let Some(rx) = unopened.take() else {
         return Err(std::io::Error::other("the AOF writer has not started yet"));
     };
-    match open_aof() {
+    match start_new_log() {
         Ok(file) => {
             *log = Some(Log { rx, file });
+            LOG_SUPERSEDED.store(false, Ordering::Relaxed);
             Ok(())
         }
         Err(e) => {
             *unopened = Some(rx);
-            Err(std::io::Error::new(
-                e.kind(),
-                format!("{AOF_PATH} cannot be opened for appending: {e}"),
-            ))
+            Err(made(e))
         }
     }
+}
+
+/// A new, empty log in place of `appendonly.aof`, with nothing an earlier
+/// log left beside it: the log of an AOF turned on at runtime (see
+/// [`open_log`]).
+///
+/// It is a delta on the save number on disk, with no records: from here,
+/// `dump.kdb` alone is what a restart loads, and the records logged from now
+/// on go on top of it. It is written and synced under a name of its own and
+/// then takes the log's name, so a crash leaves the old log or the whole new
+/// one. Cut to nothing in place instead, a crash right after the cut left an
+/// empty log, which recovery reads as a turn-over stopped part-way: with an
+/// `appendonly.aof.prev` from an earlier run there, that was replayed in the
+/// log's place.
+///
+/// Only once the new log has the name are an old log and a turn-over's
+/// leftovers removed. Stopped in between, an `appendonly.aof.prev` from an
+/// earlier run that is still there either goes with the snapshot on disk
+/// (and recovery removes it), or is replayed over the dump on its own: what
+/// recovery would have replayed before the enable, short of the old log.
+/// Removed first, a crash in between left the old log without the records
+/// it continues from.
+fn start_new_log() -> std::io::Result<std::fs::File> {
+    use std::io::Write;
+    fn remove(path: &str) -> std::io::Result<()> {
+        match std::fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+    let tmp = format!("{AOF_PATH}.tmp");
+    let made = (|| -> std::io::Result<std::fs::File> {
+        remove(&tmp)?;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(AOF_DELTA_MAGIC)?;
+        file.write_all(&read_generation().to_le_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, AOF_PATH)?;
+        Ok(file)
+    })();
+    let file = made.inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
+    sync_dir()?;
+    for left in [AOF_PREV_PATH, TURN_OVER_APPENDING, TURN_OVER_TMP] {
+        remove(left)?;
+    }
+    sync_dir()?;
+    Ok(file)
 }
 
 /// Wakes the writer thread: a record or a barrier has been queued. Kept as a
@@ -604,8 +693,15 @@ pub fn request_flush() {
     }
 }
 
-pub async fn start_aof_writer(rx: mpsc::UnboundedReceiver<Vec<u8>>) {
-    let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel::<()>(1);
+/// Set the AOF's queue up, and with the AOF on its log, and return the
+/// writer for a thread of its own to run. Called before that thread is
+/// spawned: a `CONFIG SET appendonly yes` that came before the thread got
+/// going found no queue to open a log for ("the AOF writer has not started
+/// yet"), and a log that cannot be opened stops the server before it serves.
+pub fn start_aof_writer(
+    rx: mpsc::UnboundedReceiver<Vec<u8>>,
+) -> impl std::future::Future<Output = ()> + Send + 'static {
+    let (flush_tx, flush_rx) = tokio::sync::mpsc::channel::<()>(1);
     let _ = FLUSH_TX.set(flush_tx);
 
     if AOF_ENABLED.load(Ordering::Relaxed) {
@@ -623,9 +719,9 @@ pub async fn start_aof_writer(rx: mpsc::UnboundedReceiver<Vec<u8>>) {
         // With the AOF off, no file is opened or needed until `CONFIG SET
         // appendonly yes` (see [`open_log`]). Opened whatever the setting, it
         // was made in every data directory, and one that could not be written
-        // stopped a server that was never going to write it (#47).
-        let mut log = LOG.lock();
-        *log = None;
+        // stopped a server that was never going to write it (#47). A log
+        // already open is another server's, in a process that runs several
+        // (the tests do): left alone.
         *UNOPENED.lock() = Some(rx);
     }
     WRITER_RUNNING.store(true, Ordering::Release);
@@ -634,7 +730,12 @@ pub async fn start_aof_writer(rx: mpsc::UnboundedReceiver<Vec<u8>>) {
     // the baseline the first growth ratio is measured against. The writer opens
     // *after* recovery on every startup path, so this sees the post-replay size.
     record_base_size();
+    run_aof_writer(flush_rx)
+}
 
+/// The writer's loop: the second's sync, a sync asked for, and what is
+/// queued that no connection writes.
+async fn run_aof_writer(mut flush_rx: tokio::sync::mpsc::Receiver<()>) {
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -1121,6 +1222,13 @@ fn do_fsync() {
 /// they are no longer held, for the writer to have done it.
 fn turn_over_aof(generation: u64) -> impl FnOnce() -> std::io::Result<()> {
     let queued = if WRITER_RUNNING.load(Ordering::Acquire) {
+        // Whoever holds the log takes the mark: the AOF being on, it is open
+        // (see [`AOF_ENABLED`]). With none, nothing would take it, and the
+        // wait below would never end.
+        debug_assert!(
+            LOG.try_lock().is_none_or(|log| log.is_some()),
+            "a turn-over with no log open"
+        );
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
         TURN_OVER_WAITERS.lock().push((generation, done_tx));
         send_to_global_writer(turn_over_mark(generation));

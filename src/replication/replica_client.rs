@@ -1166,6 +1166,10 @@ async fn run_replication_session(
                  does not match its dataset — run BGREWRITEAOF before relying on it"
                 );
             }
+        } else {
+            // A log kept open through `appendonly no` is of the dataset this
+            // replaced (#350).
+            crate::aof::log_superseded();
         }
     }
 

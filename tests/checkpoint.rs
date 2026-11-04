@@ -164,8 +164,9 @@ fn io_models() -> &'static [&'static str] {
 /// Long enough for any step to be reached on a loaded machine.
 const LONG: Duration = Duration::from_secs(30);
 
-/// A server with the AOF on, in `dir`, its output appended to `server.log`.
-fn launch(dir: &Path, port: u16, io: &str, failpoints: &str) -> Child {
+/// A server in `dir`, with the AOF on if `aof`, its output appended to
+/// `server.log`.
+fn launch(dir: &Path, port: u16, io: &str, failpoints: &str, aof: bool) -> Child {
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -184,8 +185,8 @@ fn launch(dir: &Path, port: u16, io: &str, failpoints: &str) -> Child {
             "4",
             "--configfile",
             "kividb.conf",
-            "--aof",
         ])
+        .args(if aof { &["--aof"][..] } else { &[] })
         .env("KIVIDB_TEST_FAILPOINTS", failpoints)
         .stdin(Stdio::null())
         .stdout(log.try_clone().unwrap())
@@ -200,19 +201,22 @@ struct Server {
     child: Child,
     io: &'static str,
     failpoints: String,
+    /// Whether it is started with the AOF on: it is, unless a test says not.
+    aof: bool,
 }
 
 impl Server {
     fn start(io: &'static str, failpoints: &str) -> Self {
         let dir = tempfile::tempdir().unwrap().keep();
         let port = free_port();
-        let child = launch(&dir, port, io, failpoints);
+        let child = launch(&dir, port, io, failpoints, true);
         let server = Server {
             port,
             dir,
             child,
             io,
             failpoints: failpoints.to_string(),
+            aof: true,
         };
         assert_eq!(server.conn().cmd(&["PING"]).s(), "PONG");
         server
@@ -239,7 +243,7 @@ impl Server {
     }
 
     fn restart(&mut self) -> Conn {
-        self.child = launch(&self.dir, self.port, self.io, &self.failpoints);
+        self.child = launch(&self.dir, self.port, self.io, &self.failpoints, self.aof);
         self.conn()
     }
 
@@ -808,6 +812,154 @@ fn writes_go_on_while_a_turn_over_syncs_the_old_log() {
             server.kill();
             let mut c = server.restart();
             assert_eq!(c.cmd(&["DBSIZE"]).i(), 700, "{io}, checkpoint {end}");
+        }
+    }
+}
+
+// ── The AOF turned on at runtime ─────────────────────────────────────────────
+
+/// Send a command and do not wait for its reply: for one the server is held
+/// in at a step.
+fn send(c: &mut Conn, args: &[&str]) {
+    let mut buf = format!("*{}\r\n", args.len()).into_bytes();
+    for a in args {
+        buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+        buf.extend_from_slice(a.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+    }
+    c.writer.write_all(&buf).unwrap();
+}
+
+/// `CONFIG SET appendonly yes` appended to the `appendonly.aof` an earlier
+/// run with the AOF on had left, and the turn-over of the checkpoint that
+/// follows made all of it `appendonly.aof.prev`. Killed before that
+/// checkpoint's snapshot was on disk, the server replayed the earlier run's
+/// records on the next start: a value overwritten since came back, and so
+/// did a key deleted since (#350). The AOF turned on at runtime starts a new
+/// log. What was written with the AOF off and never saved is not kept, as
+/// with the AOF off.
+#[test]
+fn the_aof_turned_on_at_runtime_never_replays_an_earlier_runs_log() {
+    for &io in io_models() {
+        for saved in [true, false] {
+            // The earlier run, with the AOF on: killed with records in its
+            // log that its last snapshot does not have.
+            let mut server = Server::start(io, "");
+            let mut c = server.conn();
+            assert!(c.cmd(&["SET", "k", "in-dump"]).ok());
+            assert!(c.cmd(&["SET", "gone", "in-dump"]).ok());
+            assert!(c.cmd(&["SAVE"]).ok());
+            assert!(c.cmd(&["SET", "k", "stale"]).ok());
+            assert!(c.cmd(&["SET", "gone", "stale"]).ok());
+            durable(&mut c);
+            drop(c);
+            server.kill();
+
+            // Started again with the AOF off: the snapshot is loaded, the
+            // log is not. Changed, and turned on, the server is killed once
+            // the enable's checkpoint has turned the log over, before its
+            // snapshot is on disk.
+            server.aof = false;
+            server.failpoints = "checkpoint-turned-over".into();
+            let mut c = server.restart();
+            assert_eq!(c.cmd(&["GET", "k"]).s(), "in-dump", "{io}");
+            assert!(c.cmd(&["SET", "k", "new"]).ok());
+            assert_eq!(c.cmd(&["DEL", "gone"]).i(), 1);
+            assert!(c.cmd(&["SET", "fresh", "1"]).ok());
+            if saved {
+                assert!(c.cmd(&["SAVE"]).ok());
+            }
+            send(&mut c, &["CONFIG", "SET", "appendonly", "yes"]);
+            assert!(server.reached("checkpoint-turned-over.1", LONG), "{io}");
+            drop(c);
+            server.kill();
+
+            server.aof = true;
+            server.failpoints.clear();
+            let mut c = server.restart();
+            let (k, gone, fresh) = if saved {
+                ("new", V::Nil, V::Str("1".into()))
+            } else {
+                ("in-dump", V::Str("in-dump".into()), V::Nil)
+            };
+            assert_eq!(
+                c.cmd(&["GET", "k"]).s(),
+                k,
+                "{io}, saved {saved}: the earlier run's write came back"
+            );
+            assert_eq!(
+                c.cmd(&["GET", "gone"]),
+                gone,
+                "{io}, saved {saved}: the earlier run's write came back"
+            );
+            assert_eq!(c.cmd(&["GET", "fresh"]), fresh, "{io}, saved {saved}");
+
+            // And it goes on as usual: the next checkpoint finishes the job.
+            assert!(c.cmd(&["SET", "after", "1"]).ok());
+            assert!(c.cmd(&["SAVE"]).ok());
+            assert!(!server.dir.join("appendonly.aof.prev").exists(), "{io}");
+            durable(&mut c);
+            drop(c);
+            server.kill();
+            let mut c = server.restart();
+            assert_eq!(c.cmd(&["GET", "k"]).s(), k, "{io}, saved {saved}");
+            assert_eq!(c.cmd(&["GET", "gone"]), gone, "{io}, saved {saved}");
+            assert_eq!(c.cmd(&["GET", "after"]).s(), "1", "{io}, saved {saved}");
+        }
+    }
+}
+
+/// The same within one process: the log kept open through `appendonly no`
+/// is older than a `SAVE` made in the meantime, and was replayed on top of
+/// it after a crash during the enable. The AOF turned on again starts a new
+/// log then. With no save in between, the log is kept: what was written with
+/// the AOF on is in no snapshot, and a crash during the enable must not lose
+/// it. A write made with the AOF off and never saved is not kept, as with
+/// the AOF off.
+#[test]
+fn the_aof_turned_off_and_on_again_replays_only_what_no_snapshot_has() {
+    for &io in io_models() {
+        for saved in [true, false] {
+            let mut server = Server::start(io, "checkpoint-turned-over");
+            let mut c = server.conn();
+            assert!(c.cmd(&["SET", "k", "logged"]).ok());
+            assert!(c.cmd(&["SET", "gone", "logged"]).ok());
+            durable(&mut c);
+            assert!(c.cmd(&["CONFIG", "SET", "appendonly", "no"]).ok());
+            assert!(c.cmd(&["SET", "k", "new"]).ok());
+            assert_eq!(c.cmd(&["DEL", "gone"]).i(), 1);
+            if saved {
+                assert!(c.cmd(&["SAVE"]).ok());
+            }
+            send(&mut c, &["CONFIG", "SET", "appendonly", "yes"]);
+            assert!(server.reached("checkpoint-turned-over.1", LONG), "{io}");
+            drop(c);
+            server.kill();
+
+            server.failpoints.clear();
+            let mut c = server.restart();
+            let (k, gone) = if saved {
+                ("new", V::Nil)
+            } else {
+                ("logged", V::Str("logged".into()))
+            };
+            assert_eq!(
+                c.cmd(&["GET", "k"]).s(),
+                k,
+                "{io}, saved {saved}: the log was replayed over a newer dump, or lost"
+            );
+            assert_eq!(
+                c.cmd(&["GET", "gone"]),
+                gone,
+                "{io}, saved {saved}: the log was replayed over a newer dump, or lost"
+            );
+            assert!(c.cmd(&["SAVE"]).ok());
+            assert!(!server.dir.join("appendonly.aof.prev").exists(), "{io}");
+            drop(c);
+            server.kill();
+            let mut c = server.restart();
+            assert_eq!(c.cmd(&["GET", "k"]).s(), k, "{io}, saved {saved}");
+            assert_eq!(c.cmd(&["GET", "gone"]), gone, "{io}, saved {saved}");
         }
     }
 }

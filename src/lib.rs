@@ -177,12 +177,13 @@ async fn server_tokio(
     // occupy every worker thread and the writer would never be polled -- the
     // server would hang holding all locks. A dedicated runtime makes that
     // impossible. (The io_uring path already does this for its own reasons.)
+    let aof_writer = aof::start_aof_writer(aof_rx);
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
-            .block_on(aof::start_aof_writer(aof_rx))
+            .block_on(aof_writer)
     });
 
     // One monitor registry for the whole server. Each connection used to be

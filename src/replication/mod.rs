@@ -1514,6 +1514,9 @@ fn save_dataset_with(
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
+        // A log kept open through `appendonly no` is now older than the
+        // dump (#350).
+        crate::aof::log_superseded();
         // As the writer this replaced said it: operators and tests look for it.
         let shown = std::env::current_dir()
             .map(|dir| dir.join("dump.kdb"))

@@ -444,26 +444,43 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
             }
             "appendonly" => match value {
                 "yes" | "1" | "true" => {
-                    // A server started with the AOF off has no log open:
-                    // opened now, before the flag goes up. One that cannot
-                    // be made is an error and the AOF stays off, as in
-                    // Redis, not an exit (#47).
-                    if let Err(e) = crate::aof::open_log() {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    if crate::aof::AOF_ENABLED.load(Relaxed) {
+                        return Some(resp_simple("OK"));
+                    }
+                    // The checkpoint's turn, from before the log is made
+                    // to the end of the checkpoint: no other checkpoint, or
+                    // other enable, between the two.
+                    let turn = match crate::aof::checkpoint_turn() {
+                        Ok(turn) => turn,
+                        Err(e) => {
+                            return Some(resp_error(&format!("ERR enabling AOF failed: {e}")));
+                        }
+                    };
+                    if crate::aof::AOF_ENABLED.load(Relaxed) {
+                        return Some(resp_simple("OK"));
+                    }
+                    // The log, before the flag goes up: a new one, unless
+                    // the one kept open is still current (#350). One that
+                    // cannot be made is an error and the AOF stays off, as
+                    // in Redis, not an exit (#47).
+                    if let Err(e) = crate::aof::open_log(&turn) {
                         log_warn!("CONFIG SET appendonly yes: {e}");
                         return Some(resp_error(&format!(
                             "ERR CONFIG SET failed (possibly related to argument 'appendonly') - Unable to turn on AOF: {e}"
                         )));
                     }
-                    let was_on =
-                        crate::aof::AOF_ENABLED.swap(true, std::sync::atomic::Ordering::Relaxed);
+                    crate::aof::AOF_ENABLED.store(true, Relaxed);
                     // Redis CONFIG SET appendonly yes rewrites before
                     // OK. Returning first left a window where the next
                     // write could miss both the dump and the delta —
                     // and on io_uring the connection still carried the
                     // boot-time aof_enabled=false, so that write was
                     // never logged at all.
-                    if !was_on && let Err(e) = crate::aof::checkpoint(ctx.store, ctx.index_store) {
-                        crate::aof::AOF_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+                    if let Err(e) =
+                        crate::aof::checkpoint_noting(&turn, ctx.store, ctx.index_store, &mut || {})
+                    {
+                        crate::aof::AOF_ENABLED.store(false, Relaxed);
                         return Some(resp_error(&format!("ERR enabling AOF failed: {e}")));
                     }
                     Some(resp_simple("OK"))

@@ -29,6 +29,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The AOF turned on at runtime starts a new log (#350).** `CONFIG SET
+  appendonly yes` appended to whatever `appendonly.aof` was there: one left
+  by an earlier run with the AOF on, or the one kept through `appendonly no`
+  after a `SAVE` had written a newer `dump.kdb`. The checkpoint that follows
+  kept all of it as `appendonly.aof.prev` until its snapshot was on disk,
+  and a crash in between replayed those old writes on the next start:
+  overwritten values, and keys deleted since, could come back. The log now
+  starts empty, written in full under another name before it takes the
+  log's. A log kept open through `appendonly no` with no save since is
+  still kept, so a crash during the enable does not lose what was written
+  while the AOF was on. Starting with `appendonly yes` still loads and
+  appends to the existing log.
 - **With `appendonly no`, no `appendonly.aof` is made or needed (#47).**
   Every start created an empty `appendonly.aof` in `dir`, AOF on or off,
   and a server that could not create it (a read-only data directory, the
