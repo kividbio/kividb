@@ -29,6 +29,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **With `appendonly no`, no `appendonly.aof` is made or needed (#47).**
+  Every start created an empty `appendonly.aof` in `dir`, AOF on or off,
+  and a server that could not create it (a read-only data directory, the
+  wrong owner, a full disk) exited. With the AOF off, the log is no longer
+  opened. `CONFIG SET appendonly yes` opens it; if it cannot be created,
+  the reply is an error, as in Redis, the AOF stays off and the server
+  goes on serving. Starting with `appendonly yes` is unchanged.
 - **A reshard under load could lose acknowledged writes (#331).** A write
   was routed ("is the key here?") before it entered the write gate, and the
   key could move in between. This hit both ways of moving slots:

@@ -444,6 +444,16 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
             }
             "appendonly" => match value {
                 "yes" | "1" | "true" => {
+                    // A server started with the AOF off has no log open:
+                    // opened now, before the flag goes up. One that cannot
+                    // be made is an error and the AOF stays off, as in
+                    // Redis, not an exit (#47).
+                    if let Err(e) = crate::aof::open_log() {
+                        log_warn!("CONFIG SET appendonly yes: {e}");
+                        return Some(resp_error(&format!(
+                            "ERR CONFIG SET failed (possibly related to argument 'appendonly') - Unable to turn on AOF: {e}"
+                        )));
+                    }
                     let was_on =
                         crate::aof::AOF_ENABLED.swap(true, std::sync::atomic::Ordering::Relaxed);
                     // Redis CONFIG SET appendonly yes rewrites before
