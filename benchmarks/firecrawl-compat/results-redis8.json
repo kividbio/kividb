@@ -1,0 +1,159 @@
+{
+  "label": "redis8",
+  "server_image": "redis:8",
+  "firecrawl": "v2.11.0",
+  "suite": "pnpm harness pnpm test:snips (fetch engine, no proxy, no AI key, no search engine)",
+  "runs": [
+    {
+      "run": 1,
+      "counts": {
+        "passed": 343,
+        "failed": 0,
+        "skipped": 347
+      },
+      "failures": []
+    },
+    {
+      "run": 2,
+      "counts": {
+        "passed": 343,
+        "failed": 0,
+        "skipped": 347
+      },
+      "failures": []
+    },
+    {
+      "run": 3,
+      "counts": {
+        "passed": 343,
+        "failed": 0,
+        "skipped": 347
+      },
+      "failures": []
+    },
+    {
+      "run": 4,
+      "counts": {
+        "passed": 343,
+        "failed": 0,
+        "skipped": 347
+      },
+      "failures": []
+    },
+    {
+      "run": 5,
+      "counts": {
+        "passed": 338,
+        "failed": 5,
+        "skipped": 347
+      },
+      "failures": [
+        {
+          "test": "src/__tests__/snips/v1/batch-scrape.test.ts > Batch scrape tests > works",
+          "message": "expected 0 to be greater than 0"
+        },
+        {
+          "test": "src/__tests__/snips/v1/batch-scrape.test.ts > Batch scrape tests > sourceURL stays unnormalized",
+          "message": "expected 0 to be greater than 0"
+        },
+        {
+          "test": "src/__tests__/snips/v2/batch-scrape.test.ts > Batch scrape tests > works",
+          "message": "expected 0 to be greater than 0"
+        },
+        {
+          "test": "src/__tests__/snips/v2/batch-scrape.test.ts > Batch scrape tests > sourceURL stays unnormalized",
+          "message": "expected 0 to be greater than 0"
+        },
+        {
+          "test": "src/__tests__/snips/v2/batch-scrape.test.ts > Batch scrape tests > cancel flips batch status to cancelled immediately",
+          "message": "expected 409 to be 200 // Object.is equality"
+        }
+      ]
+    }
+  ],
+  "e2e": {
+    "counts": {
+      "PASS": 7,
+      "FAIL": 0
+    },
+    "checks": [
+      {
+        "check": "server reports maxmemory-policy noeviction (BullMQ warns otherwise)",
+        "status": "PASS",
+        "detail": "*2 $16 maxmemory-policy $10 noeviction"
+      },
+      {
+        "check": "map of the test site finds its pages",
+        "status": "PASS",
+        "detail": "HTTP 200, 19 pages"
+      },
+      {
+        "check": "40 scrapes at once all return markdown",
+        "status": "PASS",
+        "detail": "40/40"
+      },
+      {
+        "check": "batch scrape of 20 pages completes with all 20",
+        "status": "PASS",
+        "detail": "status completed, 19 documents"
+      },
+      {
+        "check": "crawl of the test site completes",
+        "status": "PASS",
+        "detail": "status completed, 19 pages (19 distinct) in 14s"
+      },
+      {
+        "check": "crawl with the server restarted 3 s in completes with the same pages, none twice",
+        "status": "PASS",
+        "detail": "restart took 0.4s; status completed, 19 pages, 0 twice, missing [], extra []"
+      },
+      {
+        "check": "scrapes still work after the restart",
+        "status": "PASS",
+        "detail": "10/10"
+      }
+    ]
+  },
+  "commands_seen": [
+    "BZPOPMIN",
+    "CLIENT|SETNAME",
+    "CONFIG|GET",
+    "DEL",
+    "EVAL",
+    "EVALSHA",
+    "EXISTS",
+    "EXPIRE",
+    "GET",
+    "HDEL",
+    "HGET",
+    "HGETALL",
+    "HINCRBY",
+    "HMGET",
+    "HMSET",
+    "HSET",
+    "INCR",
+    "INFO",
+    "LLEN",
+    "LPUSH",
+    "LRANGE",
+    "LREM",
+    "PTTL",
+    "RPOPLPUSH",
+    "SADD",
+    "SCARD",
+    "SET",
+    "SMEMBERS",
+    "SREM",
+    "XADD",
+    "XTRIM",
+    "ZADD",
+    "ZCARD",
+    "ZCOUNT",
+    "ZPOPMIN",
+    "ZRANGE",
+    "ZRANGEBYSCORE",
+    "ZREM",
+    "ZREMRANGEBYSCORE",
+    "ZREVRANGEBYSCORE"
+  ]
+}

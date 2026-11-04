@@ -1,0 +1,95 @@
+{
+  "label": "redis8-v2.11.162",
+  "server_image": "redis:8",
+  "firecrawl": "v2.11.162",
+  "suite": "pnpm harness pnpm test:snips (fetch engine, no proxy, no AI key, no search engine)",
+  "runs": [
+    {
+      "run": 1,
+      "counts": {
+        "passed": 377,
+        "failed": 2,
+        "skipped": 427
+      },
+      "failures": [
+        {
+          "test": "src/__tests__/snips/v2/map.test.ts > Map tests > handles redirects correctly",
+          "message": "expected false to be true // Object.is equality"
+        },
+        {
+          "test": "src/__tests__/snips/v2/parse.test.ts > /v2/parse > limits each team to 10 unparsed upload refs from the last 24 hours",
+          "message": "{\"success\":false,\"code\":\"PARSE_UPLOAD_REF_SECRET_MISSING\",\"error\":\"Parse upload references are not configured.\"}: expected 503 to be 200 // Object.is equality"
+        }
+      ]
+    }
+  ],
+  "e2e": {
+    "counts": {
+      "PASS": 7,
+      "FAIL": 0
+    },
+    "checks": [
+      {
+        "check": "server reports maxmemory-policy noeviction (BullMQ warns otherwise)",
+        "status": "PASS",
+        "detail": "*2 $16 maxmemory-policy $10 noeviction"
+      },
+      {
+        "check": "map of the test site finds its pages",
+        "status": "PASS",
+        "detail": "HTTP 200, 19 pages"
+      },
+      {
+        "check": "40 scrapes at once all return markdown",
+        "status": "PASS",
+        "detail": "40/40"
+      },
+      {
+        "check": "batch scrape of 20 pages completes with all 20",
+        "status": "PASS",
+        "detail": "status completed, 19 documents"
+      },
+      {
+        "check": "crawl of the test site completes",
+        "status": "PASS",
+        "detail": "status completed, 19 pages (19 distinct) in 14s"
+      },
+      {
+        "check": "crawl with the server restarted 3 s in completes with the same pages, none twice",
+        "status": "PASS",
+        "detail": "restart took 0.4s; status completed, 19 pages, 0 twice, missing [], extra []"
+      },
+      {
+        "check": "scrapes still work after the restart",
+        "status": "PASS",
+        "detail": "10/10"
+      }
+    ]
+  },
+  "commands_seen": [
+    "BZPOPMIN",
+    "CLIENT|SETNAME",
+    "CONFIG|GET",
+    "DEL",
+    "EVAL",
+    "EVALSHA",
+    "EXPIRE",
+    "GET",
+    "HMGET",
+    "INFO",
+    "PTTL",
+    "RPOPLPUSH",
+    "SADD",
+    "SCARD",
+    "SET",
+    "SMEMBERS",
+    "SREM",
+    "ZADD",
+    "ZCOUNT",
+    "ZPOPMIN",
+    "ZRANGE",
+    "ZRANGEBYSCORE",
+    "ZREM",
+    "ZREMRANGEBYSCORE"
+  ]
+}

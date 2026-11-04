@@ -1,0 +1,474 @@
+{
+  "label": "kividb",
+  "server_image": "kividb/kividb:v1.2.0-lua",
+  "server": {
+    "redis_version": "8.10.0",
+    "kividb_version": "1.2.0"
+  },
+  "n8n_image": "n8nio/n8n:2.46.6",
+  "redis_py": "5.3.1",
+  "run_at": "2026-11-04T19:43:26+00:00",
+  "counts": {
+    "PASS": 35,
+    "FAIL": 0,
+    "INFO": 3
+  },
+  "checks": [
+    {
+      "check": "health: main /healthz and /healthz/readiness answer 200",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "check": "health: both workers' /healthz/readiness answer 200",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "check": "server: maxmemory-policy as CONFIG GET reports it",
+      "status": "INFO",
+      "detail": "noeviction"
+    },
+    {
+      "check": "server: connections from n8n",
+      "status": "INFO",
+      "detail": "30 connections, named: ['bull:am9icw==']"
+    },
+    {
+      "check": "batch 1 (none): all 200 webhook calls accepted (HTTP 200)",
+      "status": "PASS",
+      "detail": "200 x 200, others: []"
+    },
+    {
+      "check": "batch 1 (none): no execution ran twice (no id reached Done twice, no id ran in two executions)",
+      "status": "PASS",
+      "detail": "Done twice: [], two executions: []"
+    },
+    {
+      "check": "batch 1 (none): every execution ended and the queue is empty",
+      "status": "PASS",
+      "detail": "200 executions in 37s: {'success': 180, 'error': 20}; queue after: {'wait': 0, 'active': 0, 'claiming': 0, 'delayed': 0, 'failed': 0, 'completed': 0}"
+    },
+    {
+      "check": "batch 1 (none): exactly 200 executions, 180 success and 20 error",
+      "status": "PASS",
+      "detail": "200 executions in 37s: {'success': 180, 'error': 20}; queue after: {'wait': 0, 'active': 0, 'claiming': 0, 'delayed': 0, 'failed': 0, 'completed': 0}"
+    },
+    {
+      "check": "batch 1 (none): each id that should succeed reached Done exactly once, each failing id never",
+      "status": "PASS",
+      "detail": "ids with Done != 1: []"
+    },
+    {
+      "check": "batch 1 (none): n8n retried: ids failing once took 2 tries, ids always failing 3",
+      "status": "PASS",
+      "detail": "tries seen: once-failing [2], always-failing [3]"
+    },
+    {
+      "check": "batch 2 (worker restart): all 200 webhook calls accepted (HTTP 200)",
+      "status": "PASS",
+      "detail": "200 x 200, others: []"
+    },
+    {
+      "check": "batch 2 (worker restart): worker 1 ready again after its restart",
+      "status": "PASS",
+      "detail": "restart took 18.0s, queue before it: {'wait': 151, 'active': 20, 'claiming': 0, 'delayed': 0, 'failed': 0, 'completed': 0}"
+    },
+    {
+      "check": "batch 2 (worker restart): no execution ran twice (no id reached Done twice, no id ran in two executions)",
+      "status": "PASS",
+      "detail": "Done twice: [], two executions: []"
+    },
+    {
+      "check": "batch 2 (worker restart): every execution ended and the queue is empty",
+      "status": "PASS",
+      "detail": "200 executions in 50s: {'success': 180, 'error': 20}; queue after: {'wait': 0, 'active': 0, 'claiming': 0, 'delayed': 0, 'failed': 0, 'completed': 0}"
+    },
+    {
+      "check": "batch 2 (worker restart): exactly 200 executions, 180 success and 20 error",
+      "status": "PASS",
+      "detail": "200 executions in 50s: {'success': 180, 'error': 20}; queue after: {'wait': 0, 'active': 0, 'claiming': 0, 'delayed': 0, 'failed': 0, 'completed': 0}"
+    },
+    {
+      "check": "batch 2 (worker restart): each id that should succeed reached Done exactly once, each failing id never",
+      "status": "PASS",
+      "detail": "ids with Done != 1: []"
+    },
+    {
+      "check": "batch 2 (worker restart): n8n retried: ids failing once took 2 tries, ids always failing 3",
+      "status": "PASS",
+      "detail": "tries seen: once-failing [2], always-failing [3]"
+    },
+    {
+      "check": "batch 3 (server restart): all 200 webhook calls accepted (HTTP 200)",
+      "status": "PASS",
+      "detail": "200 x 200, others: []"
+    },
+    {
+      "check": "batch 3 (server restart): jobs waiting in the queue were still there after the server restart",
+      "status": "PASS",
+      "detail": "before restart {'wait': 150, 'active': 20, 'claiming': 0, 'delayed': 0, 'failed': 0, 'completed': 0}, right after {'wait': 147, 'active': 20, 'claiming': 0, 'delayed': 0, 'failed': 0, 'completed': 0}, restart took 1.2s"
+    },
+    {
+      "check": "batch 3 (server restart): main and both workers ready again after the server restart",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "check": "batch 3 (server restart): no execution ran twice (no id reached Done twice, no id ran in two executions)",
+      "status": "PASS",
+      "detail": "Done twice: [], two executions: []"
+    },
+    {
+      "check": "batch 3 (server restart): every execution ended and the queue is empty",
+      "status": "PASS",
+      "detail": "200 executions in 38s: {'success': 180, 'error': 20}; queue after: {'wait': 0, 'active': 0, 'claiming': 0, 'delayed': 0, 'failed': 0, 'completed': 0}"
+    },
+    {
+      "check": "batch 3 (server restart): exactly 200 executions, 180 success and 20 error",
+      "status": "PASS",
+      "detail": "200 executions in 38s: {'success': 180, 'error': 20}; queue after: {'wait': 0, 'active': 0, 'claiming': 0, 'delayed': 0, 'failed': 0, 'completed': 0}"
+    },
+    {
+      "check": "batch 3 (server restart): each id that should succeed reached Done exactly once, each failing id never",
+      "status": "PASS",
+      "detail": "ids with Done != 1: []"
+    },
+    {
+      "check": "batch 3 (server restart): n8n retried: ids failing once took 2 tries, ids always failing 3",
+      "status": "PASS",
+      "detail": "tries seen: once-failing [2], always-failing [3]"
+    },
+    {
+      "check": "batch 4 (worker kill): all 200 webhook calls accepted (HTTP 200)",
+      "status": "PASS",
+      "detail": "200 x 200, others: []"
+    },
+    {
+      "check": "batch 4 (worker kill): worker 2 ready again after SIGKILL and start",
+      "status": "PASS",
+      "detail": "queue before the kill: {'wait': 149, 'active': 20, 'claiming': 0, 'delayed': 0, 'failed': 0, 'completed': 0}"
+    },
+    {
+      "check": "batch 4 (worker kill): no execution ran twice (no id reached Done twice, no id ran in two executions)",
+      "status": "PASS",
+      "detail": "Done twice: [], two executions: []"
+    },
+    {
+      "check": "batch 4 (worker kill): every execution ended and the queue is empty",
+      "status": "PASS",
+      "detail": "200 executions in 109s: {'success': 173, 'crashed': 10, 'error': 17}; queue after: {'wait': 0, 'active': 0, 'claiming': 0, 'delayed': 0, 'failed': 0, 'completed': 0}"
+    },
+    {
+      "check": "batch 4 (worker kill): what the kill cost",
+      "status": "INFO",
+      "detail": "200 executions in 109s: {'success': 173, 'crashed': 10, 'error': 17}; queue after: {'wait': 0, 'active': 0, 'claiming': 0, 'delayed': 0, 'failed': 0, 'completed': 0}; ids that should have succeeded but did not reach Done: 7; executions neither success nor error: 10"
+    },
+    {
+      "check": "persistence: Bull's job id counter and its keys are the same after a restart",
+      "status": "PASS",
+      "detail": "bull:jobs:id 801 -> 801, 2 bull:* keys"
+    },
+    {
+      "check": "persistence: main and both workers ready again after the idle restart",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "check": "batch 5 (none): all 200 webhook calls accepted (HTTP 200)",
+      "status": "PASS",
+      "detail": "200 x 200, others: []"
+    },
+    {
+      "check": "batch 5 (none): no execution ran twice (no id reached Done twice, no id ran in two executions)",
+      "status": "PASS",
+      "detail": "Done twice: [], two executions: []"
+    },
+    {
+      "check": "batch 5 (none): every execution ended and the queue is empty",
+      "status": "PASS",
+      "detail": "200 executions in 37s: {'success': 180, 'error': 20}; queue after: {'wait': 0, 'active': 0, 'claiming': 0, 'delayed': 0, 'failed': 0, 'completed': 0}"
+    },
+    {
+      "check": "batch 5 (none): exactly 200 executions, 180 success and 20 error",
+      "status": "PASS",
+      "detail": "200 executions in 37s: {'success': 180, 'error': 20}; queue after: {'wait': 0, 'active': 0, 'claiming': 0, 'delayed': 0, 'failed': 0, 'completed': 0}"
+    },
+    {
+      "check": "batch 5 (none): each id that should succeed reached Done exactly once, each failing id never",
+      "status": "PASS",
+      "detail": "ids with Done != 1: []"
+    },
+    {
+      "check": "batch 5 (none): n8n retried: ids failing once took 2 tries, ids always failing 3",
+      "status": "PASS",
+      "detail": "tries seen: once-failing [2], always-failing [3]"
+    }
+  ],
+  "batches": [
+    {
+      "title": "batch 1 (none)",
+      "executions": 200,
+      "statuses": {
+        "success": 180,
+        "error": 20
+      },
+      "seconds": 37.1,
+      "queue_after": {
+        "wait": 0,
+        "active": 0,
+        "claiming": 0,
+        "delayed": 0,
+        "failed": 0,
+        "completed": 0
+      }
+    },
+    {
+      "title": "batch 2 (worker restart)",
+      "executions": 200,
+      "statuses": {
+        "success": 180,
+        "error": 20
+      },
+      "seconds": 49.8,
+      "queue_after": {
+        "wait": 0,
+        "active": 0,
+        "claiming": 0,
+        "delayed": 0,
+        "failed": 0,
+        "completed": 0
+      }
+    },
+    {
+      "title": "batch 3 (server restart)",
+      "executions": 200,
+      "statuses": {
+        "success": 180,
+        "error": 20
+      },
+      "seconds": 38.0,
+      "queue_after": {
+        "wait": 0,
+        "active": 0,
+        "claiming": 0,
+        "delayed": 0,
+        "failed": 0,
+        "completed": 0
+      }
+    },
+    {
+      "title": "batch 4 (worker kill)",
+      "executions": 200,
+      "statuses": {
+        "success": 173,
+        "crashed": 10,
+        "error": 17
+      },
+      "seconds": 109.0,
+      "queue_after": {
+        "wait": 0,
+        "active": 0,
+        "claiming": 0,
+        "delayed": 0,
+        "failed": 0,
+        "completed": 0
+      }
+    },
+    {
+      "title": "batch 5 (none)",
+      "executions": 200,
+      "statuses": {
+        "success": 180,
+        "error": 20
+      },
+      "seconds": 36.9,
+      "queue_after": {
+        "wait": 0,
+        "active": 0,
+        "claiming": 0,
+        "delayed": 0,
+        "failed": 0,
+        "completed": 0
+      }
+    }
+  ],
+  "commands_seen": [
+    "BRPOPLPUSH",
+    "CLIENT|SETINFO",
+    "CLIENT|SETNAME",
+    "DEL",
+    "EVAL",
+    "EVALSHA",
+    "EXISTS",
+    "GET",
+    "HGET",
+    "HGETALL",
+    "HMSET",
+    "HSET",
+    "INCR",
+    "LINDEX",
+    "LINSERT",
+    "LLEN",
+    "LPOP",
+    "LRANGE",
+    "LREM",
+    "PING",
+    "PTTL",
+    "PUBLISH",
+    "RPOPLPUSH",
+    "RPUSH",
+    "SADD",
+    "SCAN",
+    "SET",
+    "SMEMBERS",
+    "SREM",
+    "TYPE",
+    "ZADD",
+    "ZCOUNT",
+    "ZRANGE",
+    "ZRANGEBYSCORE",
+    "ZREM"
+  ],
+  "log_tails": {},
+  "n8n_integration_tests": {
+    "counts": {
+      "passed": 21,
+      "failed": 1
+    },
+    "tests": [
+      {
+        "file": "src/scaling/__tests__/bull-idle-claim.integration.test.ts",
+        "test": "idle worker job claim (real Redis) should return a job to the queue when a blocked worker has not claimed it yet",
+        "status": "passed",
+        "failure": ""
+      },
+      {
+        "file": "src/scaling/__tests__/bull-idle-claim.integration.test.ts",
+        "test": "idle worker job claim (real Redis) should remove a job that a blocked worker has not claimed yet",
+        "status": "passed",
+        "failure": ""
+      },
+      {
+        "file": "src/scaling/__tests__/bull-idle-claim.integration.test.ts",
+        "test": "idle worker job claim (real Redis) should list a job that a blocked worker has not claimed yet as waiting",
+        "status": "passed",
+        "failure": ""
+      },
+      {
+        "file": "src/scaling/__tests__/bull-idle-claim.integration.test.ts",
+        "test": "idle worker job claim (real Redis) idle slots of one worker should make one claim for a new job",
+        "status": "passed",
+        "failure": ""
+      },
+      {
+        "file": "src/scaling/__tests__/bull-idle-claim.integration.test.ts",
+        "test": "idle worker job claim (real Redis) idle slots of one worker should give each new job to the worker that runs the fewest jobs",
+        "status": "passed",
+        "failure": ""
+      },
+      {
+        "file": "src/scaling/__tests__/bull-idle-claim.integration.test.ts",
+        "test": "idle worker job claim (real Redis) idle slots of one worker should start a burst of jobs on all idle slots",
+        "status": "passed",
+        "failure": ""
+      },
+      {
+        "file": "src/scaling/__tests__/bull-idle-claim.integration.test.ts",
+        "test": "idle worker job claim (real Redis) idle slots of one worker should stop waiting at once when the worker pauses",
+        "status": "failed",
+        "failure": "AssertionError: expected 2504 to be less than 2000\n    at /home/azureuser/w/n8n/packages/cli/src/scaling/__tests__/bull-idle-claim.integration.test.ts:221:35\n    at process.processTicksAndRejections (node:internal/process/task_queues:105:5)\n    at async file:///home/azureuser/w/n8n/node_modules/.pnpm/vitest@5.0.1_@opentelemetry+api@1.9.1_@types+node@20.19.41_@vitest+browser-playwright@5_81b5844da5"
+      },
+      {
+        "file": "src/scaling/__tests__/job-return.integration.test.ts",
+        "test": "job return on shutdown (real Redis) returns the job to the wait list so another worker completes it",
+        "status": "passed",
+        "failure": ""
+      },
+      {
+        "file": "src/scaling/__tests__/job-return.integration.test.ts",
+        "test": "job return on shutdown (real Redis) returns the job to the wait list before the current jobs of a paused worker finish",
+        "status": "passed",
+        "failure": ""
+      },
+      {
+        "file": "src/scaling/__tests__/job-return.integration.test.ts",
+        "test": "job return on shutdown (real Redis) fails the returned job once, without a retry, when the next worker throws",
+        "status": "passed",
+        "failure": ""
+      },
+      {
+        "file": "src/scaling/__tests__/job-return.integration.test.ts",
+        "test": "job return on shutdown (real Redis) runs a returned job before jobs of its priority that arrived while it was active",
+        "status": "passed",
+        "failure": ""
+      },
+      {
+        "file": "src/scaling/__tests__/job-return.integration.test.ts",
+        "test": "job return on shutdown (real Redis) runs a later job of a higher priority before a returned job",
+        "status": "passed",
+        "failure": ""
+      },
+      {
+        "file": "src/scaling/__tests__/job-return.integration.test.ts",
+        "test": "job return on shutdown (real Redis) keeps the priority of a job returned twice from drifting past the next priority",
+        "status": "passed",
+        "failure": ""
+      },
+      {
+        "file": "src/scaling/__tests__/job-return.integration.test.ts",
+        "test": "job return on shutdown (real Redis) removes the stored start time of a returned job",
+        "status": "passed",
+        "failure": ""
+      },
+      {
+        "file": "src/scaling/__tests__/job-return.integration.test.ts",
+        "test": "job return on shutdown (real Redis) locally paused worker does not fetch the next waiting job when a job completes on a paused worker",
+        "status": "passed",
+        "failure": ""
+      },
+      {
+        "file": "src/scaling/__tests__/job-return.integration.test.ts",
+        "test": "job return on shutdown (real Redis) locally paused worker returns a job fetched by a completion when the worker pauses before processing it",
+        "status": "passed",
+        "failure": ""
+      },
+      {
+        "file": "src/scaling/__tests__/job-return.integration.test.ts",
+        "test": "job return on shutdown (real Redis) locally paused worker waits for a job fetched by a completion to return before the current jobs are finished",
+        "status": "passed",
+        "failure": ""
+      },
+      {
+        "file": "src/modules/instance-registry/__tests__/instance-registry-reconciliation.task.integration.test.ts",
+        "test": "InstanceRegistryReconciliationTask across mains (real Redis) converges on one shared baseline and reports every change at least once when the registry changes while every main runs the cycle",
+        "status": "passed",
+        "failure": ""
+      },
+      {
+        "file": "src/modules/instance-registry/__tests__/instance-registry-reconciliation.task.integration.test.ts",
+        "test": "InstanceRegistryReconciliationTask across mains (real Redis) rejects the cycle and leaves the baseline untouched when Redis is unreachable",
+        "status": "passed",
+        "failure": ""
+      },
+      {
+        "file": "src/modules/instance-registry/__tests__/stale-member-cleanup.task.integration.test.ts",
+        "test": "StaleMemberCleanupTask across mains (real Redis) removes each stale member exactly once when every main runs the task at the same time",
+        "status": "passed",
+        "failure": ""
+      },
+      {
+        "file": "src/modules/instance-registry/__tests__/stale-member-cleanup.task.integration.test.ts",
+        "test": "StaleMemberCleanupTask across mains (real Redis) never removes a live member while mains register, heartbeat and unregister concurrently",
+        "status": "passed",
+        "failure": ""
+      },
+      {
+        "file": "src/modules/instance-ai/self-healing/__tests__/self-healing-trigger.service.integration.test.ts",
+        "test": "self-healing failure relay (real Redis) delivers consecutive failures to main without debounce or a worker-side start",
+        "status": "passed",
+        "failure": ""
+      }
+    ]
+  }
+}
