@@ -271,13 +271,18 @@ impl Node {
             .append(true)
             .open(self.dir.join("node.log"))
             .unwrap();
+        // Loopback, unless the test gives an address of its own.
+        let bind: &[&str] = if self.extra.iter().any(|a| a == "--bind") {
+            &[]
+        } else {
+            &["--bind", "127.0.0.1"]
+        };
         let child = Command::new(env!("CARGO_BIN_EXE_kividb"))
             .current_dir(&self.dir)
+            .args(bind)
             .args([
                 "--port",
                 &self.port.to_string(),
-                "--bind",
-                "127.0.0.1",
                 "--io-model",
                 "tokio",
                 "--threads",
@@ -1063,6 +1068,53 @@ fn nodes_announce_hostnames_and_clients_can_be_sent_by_them() {
     let text = nodes[2].conn().cmd(&["CLUSTER", "NODES"]).text();
     assert!(text.contains(&format!(",{} ", host(0))), "{text}");
     assert!(text.contains(&format!(",{} ", host(2))), "{text}");
+}
+
+/// A node bound to a wildcard address, with no `cluster-announce-ip`, keeps
+/// the address it had learnt for itself over a restart, as Redis keeps the
+/// one in nodes.conf. It used to start again from a `127.0.0.1` guess, give
+/// that as its own address in `CLUSTER SLOTS` until it next reached a peer,
+/// and save it over the one it had learnt (#307). Alone, as here, it
+/// reaches no peer, so the guess stayed.
+#[test]
+fn a_restarted_node_keeps_the_address_it_had_learnt() {
+    let mut node = Node::start(&["--bind", "0.0.0.0"]);
+    assert!(
+        node.conn()
+            .cmd(&["CLUSTER", "ADDSLOTSRANGE", "0", "16383"])
+            .is_ok()
+    );
+    let own_ip = |node: &Node| node.my_row()[1].split(':').next().unwrap().to_string();
+    assert_eq!(own_ip(&node), "127.0.0.1");
+
+    // As if it had reached a peer on another host from 10.1.2.3.
+    node.kill();
+    let conf = node.dir.join("nodes.conf");
+    let text: String = std::fs::read_to_string(&conf)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            if line.contains("myself") {
+                line.replacen("127.0.0.1:", "10.1.2.3:", 1) + "\n"
+            } else {
+                line.to_string() + "\n"
+            }
+        })
+        .collect();
+    assert!(text.contains("10.1.2.3:"), "{text}");
+    std::fs::write(&conf, text).unwrap();
+
+    node.spawn();
+    assert_eq!(own_ip(&node), "10.1.2.3", "{}", node.log());
+    let slots = node.conn().cmd(&["CLUSTER", "SLOTS"]);
+    assert_eq!(slots.array()[0].array()[2].array()[0].text(), "10.1.2.3");
+    let saved = std::fs::read_to_string(&conf).unwrap();
+    assert!(
+        saved
+            .lines()
+            .any(|l| l.contains("myself") && l.contains("10.1.2.3:")),
+        "{saved}"
+    );
 }
 
 /// `cluster-announce-client-port`: what clients are told to connect to,

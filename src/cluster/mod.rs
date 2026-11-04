@@ -668,12 +668,17 @@ impl ClusterState {
     /// `announce_*` are `cluster-announce-ip` / `-port` / `-bus-port`; empty
     /// and zero mean "not set". With no announce IP and a wildcard bind there
     /// is no address to advertise: `0.0.0.0` is not somewhere a peer can
-    /// connect to. The entry falls back to loopback — right for a
-    /// single-machine cluster — and is flagged as a guess, which has two
-    /// effects: outgoing bus messages carry an empty address so each peer
-    /// records the one it actually sees us on, and the guess is replaced with
-    /// the real interface address the first time we reach a peer that is not
-    /// on this machine (see [`Self::learn_self_ip`]).
+    /// connect to. The entry keeps the address it had learnt in an earlier
+    /// run, from nodes.conf, as Redis does, or else falls back to loopback —
+    /// right for a single-machine cluster — and is flagged as a guess, which
+    /// has two effects: outgoing bus messages carry an empty address so each
+    /// peer records the one it actually sees us on, and the guess is replaced
+    /// with the real interface address the first time we reach a peer that
+    /// is not on this machine (see [`Self::learn_self_ip`]).
+    ///
+    /// A restart used to start from loopback whatever nodes.conf said, so a
+    /// node restarted in place gave `127.0.0.1` as its own address in
+    /// `CLUSTER SLOTS` until it next reached a peer, and saved it (#307).
     ///
     /// It used to advertise the loopback guess as fact. Every node of a
     /// multi-host cluster bound to `0.0.0.0` — the default, and the norm in
@@ -693,7 +698,16 @@ impl ClusterState {
         } else if !wildcard {
             (bind.to_string(), false)
         } else {
-            ("127.0.0.1".to_string(), true)
+            let learnt = self
+                .nodes
+                .read()
+                .get(&self.myself())
+                .map(|me| me.ip.clone())
+                .filter(|ip| {
+                    ip.parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| !ip.is_loopback() && !ip.is_unspecified())
+                });
+            (learnt.unwrap_or_else(|| "127.0.0.1".to_string()), true)
         };
         self.self_ip_is_guess.store(guess, Ordering::Relaxed);
         let announced_client = if announce_port != 0 {
