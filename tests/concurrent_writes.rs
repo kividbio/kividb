@@ -288,6 +288,75 @@ fn pfadd_from_fifty_clients_keeps_every_element() {
     assert_eq!(differ, 0, "{differ} registers differ from the serial run's");
 }
 
+/// `PFMERGE dest source`, both keys in one shard, beside `PFADD`s to `dest`:
+/// the registers are the ones adding and merging one after another gives.
+/// The merge read `dest`, a `PFADD` raised a register, and the merge wrote
+/// the old registers back over it.
+#[test]
+fn pfmerge_of_one_shard_beside_pfadd_loses_no_register() {
+    let server = Server::start();
+    let keys = keys_in_shard_of("hll", "merge:", 2);
+    let (dest, source) = (keys[0].clone(), keys[1].clone());
+    const ROUNDS: usize = 20;
+    const ADDS: usize = 50;
+    const MERGES: usize = 5;
+    let member = |round: usize, i: usize| format!("member:{round}:{i}");
+
+    let mut one = server.conn();
+    let seed: Vec<Vec<String>> = (0..1000)
+        .map(|i| args(&["PFADD", &source, &format!("source:{i}")]))
+        .collect();
+    one.pipeline(&seed);
+    one.cmd(&["PFMERGE", &dest, &source]);
+
+    // One adder, so only the merge can lose an add. Nothing writes `source`,
+    // so every order of the two clients' commands gives the same registers.
+    let (d, s) = (dest.clone(), source.clone());
+    let replies = at_once(&server, 2, move |c, conn, barrier| {
+        let mut replies = Vec::new();
+        for round in 0..ROUNDS {
+            barrier.wait();
+            let batch: Vec<Vec<String>> = if c == 0 {
+                (0..ADDS)
+                    .map(|i| args(&["PFADD", &d, &member(round, i)]))
+                    .collect()
+            } else {
+                (0..MERGES).map(|_| args(&["PFMERGE", &d, &s])).collect()
+            };
+            replies.extend(conn.pipeline(&batch));
+        }
+        replies
+    });
+    let failed: Vec<&V> = replies
+        .iter()
+        .flatten()
+        .filter(|v| !matches!(v, V::Int(0 | 1)) && **v != V::Str("OK".into()))
+        .collect();
+    assert!(failed.is_empty(), "commands failed: {failed:?}");
+
+    one.cmd(&["PFMERGE", "merge:serial", &source]);
+    for round in 0..ROUNDS {
+        let batch: Vec<Vec<String>> = (0..ADDS)
+            .map(|i| args(&["PFADD", "merge:serial", &member(round, i)]))
+            .collect();
+        one.pipeline(&batch);
+    }
+    let serial = one.cmd(&["PFDEBUG", "GETREG", "merge:serial"]);
+    let concurrent = one.cmd(&["PFDEBUG", "GETREG", &dest]);
+    let (V::Arr(serial), V::Arr(concurrent)) = (serial, concurrent) else {
+        panic!("PFDEBUG GETREG did not return registers");
+    };
+    let differ: Vec<usize> = (0..serial.len())
+        .filter(|&r| serial[r] != concurrent[r])
+        .collect();
+    assert!(
+        differ.is_empty(),
+        "{} registers differ from the serial run's, e.g. {:?}",
+        differ.len(),
+        &differ[..differ.len().min(5)]
+    );
+}
+
 /// Fifty clients increment the same field of the same new hashes: each ends
 /// at fifty. Creating the hash was a separate step from finding it absent,
 /// and two increments of a new hash both answered 1.
