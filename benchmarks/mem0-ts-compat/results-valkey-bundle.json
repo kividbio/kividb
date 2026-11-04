@@ -1,0 +1,248 @@
+{
+  "label": "valkey-bundle",
+  "url": "redis://127.0.0.1:6434",
+  "redis_version": "7.2.4",
+  "mem0ai": "3.3.1",
+  "redis": "4.7.1",
+  "iovalkey": "0.3.3",
+  "counts": {
+    "PASS": 27,
+    "FAIL": 12
+  },
+  "checks": [
+    {
+      "check": "connection: PING, and MODULE LIST names the search module (RedisDB refuses to start without it)",
+      "status": "PASS",
+      "detail": "modules: json, bf, ldap, search, lua",
+      "ms": 1
+    },
+    {
+      "check": "RedisDB: initialize creates the index",
+      "status": "PASS",
+      "detail": "",
+      "ms": 4
+    },
+    {
+      "check": "RedisDB: insert stores the 3 memories",
+      "status": "FAIL",
+      "detail": "Error: Invalid query string syntax",
+      "ms": 3
+    },
+    {
+      "check": "RedisDB: search returns the closest memory first, scores ordered",
+      "status": "FAIL",
+      "detail": "Error: Index field `__vector_score` does not exist",
+      "ms": 1
+    },
+    {
+      "check": "RedisDB: topK is honoured",
+      "status": "FAIL",
+      "detail": "Error: Index field `__vector_score` does not exist",
+      "ms": 0
+    },
+    {
+      "check": "RedisDB: filter on a UUID-style user_id (hyphens escaped in the TAG query)",
+      "status": "FAIL",
+      "detail": "Error: Index field `__vector_score` does not exist",
+      "ms": 0
+    },
+    {
+      "check": "RedisDB: filter on user_id and agent_id together",
+      "status": "FAIL",
+      "detail": "Error: Index field `__vector_score` does not exist",
+      "ms": 0
+    },
+    {
+      "check": "RedisDB: filter on run_id",
+      "status": "FAIL",
+      "detail": "Error: Index field `__vector_score` does not exist",
+      "ms": 1
+    },
+    {
+      "check": "RedisDB: the payload comes back whole",
+      "status": "FAIL",
+      "detail": "Error: Index field `__vector_score` does not exist",
+      "ms": 0
+    },
+    {
+      "check": "RedisDB: get by id, and null for an id that does not exist",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "RedisDB: update changes the text and the vector",
+      "status": "FAIL",
+      "detail": "Error: Index field `__vector_score` does not exist",
+      "ms": 2
+    },
+    {
+      "check": "RedisDB: list, with a filter and with topK",
+      "status": "FAIL",
+      "detail": "Error: Invalid query string syntax",
+      "ms": 1
+    },
+    {
+      "check": "RedisDB: delete",
+      "status": "FAIL",
+      "detail": "Error: Invalid query string syntax",
+      "ms": 1
+    },
+    {
+      "check": "RedisDB: getUserId and setUserId (the SDK's telemetry id key)",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "RedisDB: deleteCol drops the index",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "ValkeyDB: initialize creates the index",
+      "status": "PASS",
+      "detail": "",
+      "ms": 27
+    },
+    {
+      "check": "ValkeyDB: insert stores the 3 memories",
+      "status": "PASS",
+      "detail": "",
+      "ms": 4
+    },
+    {
+      "check": "ValkeyDB: search returns the closest memory first, scores ordered",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "ValkeyDB: topK is honoured",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "ValkeyDB: filter on a UUID-style user_id (hyphens escaped in the TAG query)",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "ValkeyDB: filter on user_id and agent_id together",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "ValkeyDB: filter on run_id",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "ValkeyDB: the payload comes back whole",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "ValkeyDB: get by id, and null for an id that does not exist",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "ValkeyDB: update changes the text and the vector",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2
+    },
+    {
+      "check": "ValkeyDB: list, with a filter and with topK",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "ValkeyDB: delete",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "ValkeyDB: getUserId and setUserId (the SDK's telemetry id key)",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "ValkeyDB: deleteCol drops the index",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "Memory: initialize (provider \"redis\")",
+      "status": "PASS",
+      "detail": "",
+      "ms": 46
+    },
+    {
+      "check": "Memory: add (infer: false) stores a memory for a user",
+      "status": "PASS",
+      "detail": "",
+      "ms": 48
+    },
+    {
+      "check": "Memory: search is scoped to the user and finds the closest",
+      "status": "FAIL",
+      "detail": "Error: Index field `__vector_score` does not exist",
+      "ms": 4
+    },
+    {
+      "check": "Memory: search does not return another user's memory (bob's own search finds it)",
+      "status": "FAIL",
+      "detail": "Error: Index field `__vector_score` does not exist",
+      "ms": 1
+    },
+    {
+      "check": "Memory: getAll for a user",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "Memory: get by id",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "Memory: update",
+      "status": "PASS",
+      "detail": "",
+      "ms": 23
+    },
+    {
+      "check": "Memory: history records the ADD and the UPDATE (Mem0's local SQLite file, not the server)",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "Memory: delete",
+      "status": "PASS",
+      "detail": "",
+      "ms": 19
+    },
+    {
+      "check": "Memory: deleteAll removes one user's memories only",
+      "status": "PASS",
+      "detail": "",
+      "ms": 20
+    }
+  ]
+}

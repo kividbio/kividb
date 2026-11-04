@@ -1,0 +1,458 @@
+[e2e] building plugin bundles
+
+> claude-mem@15.9.0 build
+> node scripts/sync-plugin-manifests.js && node scripts/build-hooks.js && node scripts/gen-plugin-lockfile.cjs
+
+✓ Synced plugin manifests from package.json
+🔨 Building claude-mem hooks and worker service...
+
+📌 Version: 15.9.0
+
+📦 Preparing output directories...
+✓ Output directories ready
+
+📦 Generating plugin package.json...
+✓ plugin/package.json generated
+
+📋 Building React viewer...
+Building React viewer...
+npm warn deprecated @tsparticles/react@3.0.0: Please update to version 4.1.1
+npm warn deprecated @tsparticles/plugin-easing-quad@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/updater-size@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/updater-opacity@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/move-parallax@3.9.1: this package was deprecated in tsparticles v4, replaced by @tsparticles/interaction-external-parallax
+npm warn deprecated @tsparticles/plugin-rgb-color@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/interaction-external-pause@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/updater-color@3.9.1: this package was deprecated in tsparticles v4, replaced by @tsparticles/updater-paint
+npm warn deprecated @tsparticles/plugin-hsl-color@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/updater-stroke-color@3.9.1: this package was deprecated in tsparticles v4, replaced by @tsparticles/updater-paint
+npm warn deprecated @tsparticles/shape-square@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/shape-line@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/interaction-particles-attract@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/shape-star@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/shape-circle@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/shape-emoji@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/basic@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/move-base@3.9.1: this package was deprecated in tsparticles v4, replaced by @tsparticles/plugin-move
+npm warn deprecated @tsparticles/interaction-particles-collisions@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/interaction-external-push@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/interaction-external-remove@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/slim@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/shape-polygon@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/interaction-external-slow@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/updater-out-modes@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/interaction-external-bounce@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/updater-rotate@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/interaction-external-attract@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/interaction-external-grab@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/interaction-external-connect@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/updater-life@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/interaction-external-repulse@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/interaction-external-bubble@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/interaction-particles-links@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/shape-image@3.9.1: Please update to version 4.1.1
+npm warn deprecated @tsparticles/engine@3.9.1: Please update to version 4.1.1
+
+added 480 packages in 5s
+
+> my-work-wireframe@0.0.0 build
+> tsc -b && vite build
+
+(!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+  - `__dirname` (vite.config.ts:13:41). Use `import.meta.dirname` instead
+Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+vite v8.3.4 building client environment for production...
+transforming...
+✓ 2942 modules transformed.
+rendering chunks...
+computing gzip size...
+../../../plugin/ui/work-view/index.html                                                0.50 kB │ gzip:   0.31 kB
+../../../plugin/ui/work-view/assets/claude-DqipVtpa.webp                               5.02 kB
+../../../plugin/ui/work-view/assets/geist-cyrillic-ext-wght-normal-DjL33-gN.woff2      7.42 kB
+../../../plugin/ui/work-view/assets/geist-vietnamese-wght-normal-6IgcOCM7.woff2        8.00 kB
+../../../plugin/ui/work-view/assets/geist-cyrillic-wght-normal-BEAKL7Jp.woff2         15.08 kB
+../../../plugin/ui/work-view/assets/geist-latin-ext-wght-normal-DC-KSUi6.woff2        16.51 kB
+../../../plugin/ui/work-view/assets/geist-latin-wght-normal-BgDaEnEv.woff2            29.40 kB
+../../../plugin/ui/work-view/assets/on-the-go-iphone-feed-BOm9aG2q.webp               39.32 kB
+../../../plugin/ui/work-view/assets/at-home-modern-computer-JH_MTm9z.webp             87.97 kB
+../../../plugin/ui/work-view/assets/HankenGrotesk-wght-2z-3qhAN.ttf                  132.89 kB
+../../../plugin/ui/work-view/assets/setup-page-BREOBm1A.css                           31.47 kB │ gzip:   7.52 kB
+../../../plugin/ui/work-view/assets/index-1YS6gs-U.css                               132.04 kB │ gzip:  23.11 kB
+../../../plugin/ui/work-view/assets/setup-sample-BV3R5xRS.js                           5.07 kB │ gzip:   2.26 kB
+../../../plugin/ui/work-view/assets/setup-page-BFh93VLq.js                            77.72 kB │ gzip:  37.24 kB
+../../../plugin/ui/work-view/assets/index-DnAc6NqA.js                              1,070.46 kB │ gzip: 335.77 kB
+
+[plugin builtin:vite-reporter] 
+(!) Some chunks are larger than 500 kB after minification. Consider:
+- Using dynamic import() to code-split the application
+- Use build.rolldownOptions.output.codeSplitting to improve chunking: https://rolldown.rs/reference/OutputOptions.codeSplitting
+- Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.
+✓ built in 638ms
+✓ React viewer built successfully
+  - plugin/ui/viewer-bundle.js
+  - plugin/ui/viewer.html (from viewer-template.html)
+  - plugin/ui/tv.html (from src/ui/tv.html)
+  - plugin/ui/work-view/* (My Work app, Vite build of src/ui/my-work)
+  - plugin/ui/assets/fonts/* (font files)
+  - plugin/ui/icon-thick-*.svg (5 icon files)
+
+🔧 Building worker service...
+✓ worker-service built (4459.94 KB)
+⚠️  worker-service.cjs is 4459.94 KB (advisory budget 2900 KB). If this jumped unexpectedly, check whether a server-only dependency leaked into the worker bundle (see #2584).
+
+🔧 Building sqlite runtime modules...
+✓ plugin/sqlite/SessionStore.js built (198.47 KB)
+✓ plugin/sqlite/observations/files.js built (9.13 KB)
+✓ plugin/skills/request-progress/scripts/request-groups.mjs built (200.42 KB)
+
+🔧 Building server beta service...
+✓ server-service built (2223.91 KB)
+
+🔧 Building MCP server...
+✓ mcp-server built (889.94 KB)
+⚠️  mcp-server.cjs is 889.94 KB (advisory budget 600 KB). If this jumped unexpectedly, a transitive import may have pulled worker-service.ts or another heavy module into the MCP bundle (see #1645).
+
+🔧 Building context generator...
+✓ context-generator built (126.45 KB)
+
+🔧 Building transcript watcher...
+✓ transcript-watcher built (426.86 KB)
+⚠️  transcript-watcher.cjs is 426.86 KB (advisory budget 200 KB). If this jumped unexpectedly, check src/services/transcripts/processor.ts and watcher.ts for heavy imports.
+
+🔧 Building claude-mem hook launcher...
+✓ claude-mem-launcher built (8.35 KB)
+
+🔧 Building ensure-launcher self-heal...
+✓ ensure-launcher built (20.04 KB)
+
+🔧 Building NPX CLI...
+✓ npx-cli built (2020.21 KB)
+
+🔧 Building bug-report CLI...
+✓ bug-report built (1064.36 KB)
+
+🔧 Building OpenClaw plugin...
+✓ openclaw plugin built (14.61 KB)
+
+🔧 Building OpenCode plugin...
+✓ opencode plugin built (496.16 KB)
+✓ Pi memory extension built
+✓ DeepSeek Harness memory plugin built
+
+📋 Copying onboarding explainer to plugin tree...
+✓ Copied src/services/worker/onboarding-explainer.md → plugin/skills/how-it-works/onboarding-explainer.md
+
+📋 Verifying distribution files...
+✓ All required distribution files present
+
+📋 Verifying Rule A shell templates match the canonical generator...
+✓ Rule A shell templates match the canonical generator
+
+✅ All build targets compiled successfully!
+   Output: plugin/scripts/
+   - Worker: worker-service.cjs
+   - Server: server-service.cjs
+   - MCP Server: mcp-server.cjs
+   - Context Generator: context-generator.cjs
+   - Transcript Watcher: transcript-watcher.cjs
+   Output: dist/npx-cli/
+   - NPX CLI: index.js
+   Output: openclaw/dist/
+   - OpenClaw Plugin: index.js
+   Output: dist/opencode-plugin/
+   - OpenCode Plugin: index.js
+
+🔒 Generating plugin/bun.lock...
+bun install v1.3.12 (700fc117)
+
+Checked 93 installs across 96 packages (no changes) [4.00ms]
+✓ plugin/bun.lock generated
+[e2e] starting Docker stack project=cme2e-valkey run=1793822622-21993
+time="2026-11-04T20:03:57Z" level=warning msg="Docker Compose is configured to build using Bake, but buildx isn't installed"
+#0 building with "default" instance using docker driver
+
+#1 [postgres internal] load build definition from Dockerfile
+#1 transferring dockerfile: 1.60kB done
+#1 DONE 0.0s
+
+#2 [postgres internal] load metadata for docker.io/library/postgres:17-trixie
+#2 DONE 0.6s
+
+#3 [postgres internal] load .dockerignore
+#3 transferring context: 2B done
+#3 DONE 0.0s
+
+#4 [postgres internal] load build context
+#4 transferring context: 42B done
+#4 DONE 0.0s
+
+#5 [postgres 1/3] FROM docker.io/library/postgres:17-trixie@sha256:3b0cda93be7c8dba2ed484d19393d93845dc3dafb88973e248ba8e6d99d784e1
+#5 resolve docker.io/library/postgres:17-trixie@sha256:3b0cda93be7c8dba2ed484d19393d93845dc3dafb88973e248ba8e6d99d784e1 0.1s done
+#5 DONE 0.1s
+
+#6 [postgres 2/3] RUN apt-get update  && apt-get install -y --no-install-recommends       "postgresql-17-pgvector=0.8.*"       "postgresql-17-pg-textsearch=1.5.*"  && rm -rf /var/lib/apt/lists/*
+#6 CACHED
+
+#7 [postgres 3/3] COPY --chmod=755 reindex-collation.sh /usr/local/bin/reindex-collation
+#7 CACHED
+
+#8 [postgres] exporting to image
+#8 exporting layers done
+#8 exporting manifest sha256:d86466df9c91a795409bf37554a32f012c04b61255b8ec9f87e85b2dce987494 0.0s done
+#8 exporting config sha256:f579c9d39a07111464f70f62365334d9f9d2aa23811ec71e5daaba8407cc23cc 0.0s done
+#8 exporting attestation manifest sha256:fbd6ed0245bc796ea508428dab6cb1f6a433287f891108fd28471fb8853f5f4c 0.1s done
+#8 exporting manifest list sha256:e3686638220af52fad02ba317fef29bee2659a6b160d77ffec3cd8e07b2adf64
+#8 exporting manifest list sha256:e3686638220af52fad02ba317fef29bee2659a6b160d77ffec3cd8e07b2adf64 0.0s done
+#8 naming to docker.io/library/claude-mem-postgres:17 done
+#8 unpacking to docker.io/library/claude-mem-postgres:17 0.0s done
+#8 DONE 0.3s
+
+#9 [postgres] resolving provenance for metadata file
+#9 DONE 0.0s
+
+#10 [claude-mem-server internal] load build definition from Dockerfile
+#10 transferring dockerfile: 2.94kB done
+#10 DONE 0.0s
+
+#11 [claude-mem-server internal] load metadata for docker.io/library/node:20
+#11 DONE 0.6s
+
+#12 [claude-mem-server internal] load .dockerignore
+#12 transferring context: 105B done
+#12 DONE 0.0s
+
+#13 [claude-mem-server internal] load build context
+#13 DONE 0.0s
+
+#14 [claude-mem-server  1/14] FROM docker.io/library/node:20@sha256:8f693eaa7e0a8e71560c9a82b55fd54c2ae920a2ba5d2cde28bac7d1c01c9ba5
+#14 resolve docker.io/library/node:20@sha256:8f693eaa7e0a8e71560c9a82b55fd54c2ae920a2ba5d2cde28bac7d1c01c9ba5 0.1s done
+#14 DONE 0.1s
+
+#13 [claude-mem-server internal] load build context
+#13 transferring context: 21.91MB 0.2s done
+#13 DONE 0.3s
+
+#15 [claude-mem-server 12/14] COPY --chown=node:node docker/claude-mem/entrypoint.sh /usr/local/bin/claude-mem-entrypoint
+#15 CACHED
+
+#16 [claude-mem-server 10/14] RUN cd /opt/claude-mem  && node -e "import('@huggingface/transformers').then(t => t.pipeline('feature-extraction', process.argv[1], { dtype: 'fp32' }))" "Xenova/all-MiniLM-L6-v2"
+#16 CACHED
+
+#17 [claude-mem-server  2/14] RUN apt-get update  && apt-get install -y --no-install-recommends       git       curl       ca-certificates       unzip       jq       less       procps       uuid-runtime       sqlite3  && apt-get clean && rm -rf /var/lib/apt/lists/*
+#17 CACHED
+
+#18 [claude-mem-server  7/14] COPY plugin/ /opt/claude-mem/
+#18 CACHED
+
+#19 [claude-mem-server 11/14] RUN mkdir -p /home/node/.claude /home/node/.claude-mem /data/claude-mem  && chown -R node:node /home/node/.claude /home/node/.claude-mem /data/claude-mem
+#19 CACHED
+
+#20 [claude-mem-server 13/14] RUN chmod +x /usr/local/bin/claude-mem-entrypoint
+#20 CACHED
+
+#21 [claude-mem-server  3/14] RUN curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.12"  && chmod -R a+rX /usr/local/bun
+#21 CACHED
+
+#22 [claude-mem-server  5/14] RUN mkdir -p /usr/local/share/npm-global  && chown -R node:node /usr/local/share/npm-global
+#22 CACHED
+
+#23 [claude-mem-server  6/14] RUN npm install -g @anthropic-ai/claude-code@latest
+#23 CACHED
+
+#24 [claude-mem-server  9/14] RUN cd /opt/claude-mem  && ONNXRUNTIME_NODE_INSTALL_CUDA=skip npm install --omit=dev --legacy-peer-deps  && npm cache clean --force
+#24 CACHED
+
+#25 [claude-mem-server  4/14] RUN set -eux  && curl -LsSf "https://astral.sh/uv/0.11.7/install.sh" | sh  && { chmod a+rX /usr/local/bin/uv /usr/local/bin/uvx 2>/dev/null || true; }
+#25 CACHED
+
+#26 [claude-mem-server  8/14] RUN chown -R node:node /opt/claude-mem
+#26 CACHED
+
+#27 [claude-mem-server 14/14] WORKDIR /home/node
+#27 CACHED
+
+#28 [claude-mem-server] exporting to image
+#28 exporting layers done
+#28 exporting manifest sha256:90d6cdcfe6d23b5ca25a6ebf10ae1aba3b8a5fea16846c46011f09826835ef4d 0.0s done
+#28 exporting config sha256:147c7bd0fa444bb4bee2d27d9c87e601e5202609a8ea801d0c3d5b17ff46b6df
+#28 exporting config sha256:147c7bd0fa444bb4bee2d27d9c87e601e5202609a8ea801d0c3d5b17ff46b6df 0.0s done
+#28 exporting attestation manifest sha256:a5bd5dc806ffed26c2f3f404b1ee9d7ddb7a100736f88d7e47c5bfe17d801043
+#28 exporting attestation manifest sha256:a5bd5dc806ffed26c2f3f404b1ee9d7ddb7a100736f88d7e47c5bfe17d801043 0.1s done
+#28 exporting manifest list sha256:32b3682d4f5898cb08248ecea55691c6b658e251e2db16c710ef186dd93795b1 0.1s done
+#28 naming to docker.io/library/cme2e-valkey-claude-mem-server:latest
+#28 naming to docker.io/library/cme2e-valkey-claude-mem-server:latest done
+#28 unpacking to docker.io/library/cme2e-valkey-claude-mem-server:latest 0.0s done
+#28 DONE 0.3s
+
+#29 [claude-mem-server] resolving provenance for metadata file
+#29 DONE 0.0s
+
+#30 [claude-mem-worker internal] load build definition from Dockerfile
+#30 transferring dockerfile: 2.94kB done
+#30 DONE 0.0s
+
+#11 [claude-mem-worker internal] load metadata for docker.io/library/node:20
+#11 DONE 0.8s
+
+#31 [claude-mem-worker internal] load .dockerignore
+#31 transferring context: 105B done
+#31 DONE 0.0s
+
+#32 [claude-mem-worker internal] load build context
+#32 DONE 0.0s
+
+#14 [claude-mem-worker  1/14] FROM docker.io/library/node:20@sha256:8f693eaa7e0a8e71560c9a82b55fd54c2ae920a2ba5d2cde28bac7d1c01c9ba5
+#14 resolve docker.io/library/node:20@sha256:8f693eaa7e0a8e71560c9a82b55fd54c2ae920a2ba5d2cde28bac7d1c01c9ba5 0.1s done
+#14 DONE 0.1s
+
+#32 [claude-mem-worker internal] load build context
+#32 transferring context: 549.91kB 0.1s done
+#32 DONE 0.2s
+
+#23 [claude-mem-worker  6/14] RUN npm install -g @anthropic-ai/claude-code@latest
+#23 CACHED
+
+#33 [claude-mem-worker 10/14] RUN cd /opt/claude-mem  && node -e "import('@huggingface/transformers').then(t => t.pipeline('feature-extraction', process.argv[1], { dtype: 'fp32' }))" "Xenova/all-MiniLM-L6-v2"
+#33 CACHED
+
+#22 [claude-mem-worker  5/14] RUN mkdir -p /usr/local/share/npm-global  && chown -R node:node /usr/local/share/npm-global
+#22 CACHED
+
+#34 [claude-mem-worker  9/14] RUN cd /opt/claude-mem  && ONNXRUNTIME_NODE_INSTALL_CUDA=skip npm install --omit=dev --legacy-peer-deps  && npm cache clean --force
+#34 CACHED
+
+#25 [claude-mem-worker  4/14] RUN set -eux  && curl -LsSf "https://astral.sh/uv/0.11.7/install.sh" | sh  && { chmod a+rX /usr/local/bin/uv /usr/local/bin/uvx 2>/dev/null || true; }
+#25 CACHED
+
+#21 [claude-mem-worker  3/14] RUN curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.12"  && chmod -R a+rX /usr/local/bun
+#21 CACHED
+
+#35 [claude-mem-worker 13/14] RUN chmod +x /usr/local/bin/claude-mem-entrypoint
+#35 CACHED
+
+#17 [claude-mem-worker  2/14] RUN apt-get update  && apt-get install -y --no-install-recommends       git       curl       ca-certificates       unzip       jq       less       procps       uuid-runtime       sqlite3  && apt-get clean && rm -rf /var/lib/apt/lists/*
+#17 CACHED
+
+#36 [claude-mem-worker  7/14] COPY plugin/ /opt/claude-mem/
+#36 CACHED
+
+#37 [claude-mem-worker  8/14] RUN chown -R node:node /opt/claude-mem
+#37 CACHED
+
+#38 [claude-mem-worker 11/14] RUN mkdir -p /home/node/.claude /home/node/.claude-mem /data/claude-mem  && chown -R node:node /home/node/.claude /home/node/.claude-mem /data/claude-mem
+#38 CACHED
+
+#39 [claude-mem-worker 12/14] COPY --chown=node:node docker/claude-mem/entrypoint.sh /usr/local/bin/claude-mem-entrypoint
+#39 CACHED
+
+#40 [claude-mem-worker 14/14] WORKDIR /home/node
+#40 CACHED
+
+#41 [claude-mem-worker] exporting to image
+#41 exporting layers done
+#41 exporting manifest sha256:682f9672cca9de17213731e24efc31d4bbc7e0af966f6c8e7b6b5d7185dd8d22 0.0s done
+#41 exporting config sha256:33fbfa13dde7d0746db0246dab205ac3ef2df53a2c348bbe56d60d8d87fc7194
+#41 exporting config sha256:33fbfa13dde7d0746db0246dab205ac3ef2df53a2c348bbe56d60d8d87fc7194 0.0s done
+#41 exporting attestation manifest sha256:d1e9173597cd2e18b2d2e0376cb261538e9689ef30dc42cfc7fab328c043e4a9 0.1s done
+#41 exporting manifest list sha256:ce590bb3638e8905b90f01c17c81bfe464e1671762eca46ef8150703ccb97c2a
+#41 exporting manifest list sha256:ce590bb3638e8905b90f01c17c81bfe464e1671762eca46ef8150703ccb97c2a 0.0s done
+#41 naming to docker.io/library/cme2e-valkey-claude-mem-worker:latest done
+#41 unpacking to docker.io/library/cme2e-valkey-claude-mem-worker:latest 0.0s done
+#41 DONE 0.3s
+
+#42 [claude-mem-worker] resolving provenance for metadata file
+#42 DONE 0.0s
+ claude-mem-server  Built
+ claude-mem-worker  Built
+ postgres  Built
+ Network cme2e-valkey_default  Creating
+ Network cme2e-valkey_default  Created
+ Volume cme2e-valkey_claude-mem-data  Creating
+ Volume cme2e-valkey_claude-mem-data  Created
+ Volume cme2e-valkey_postgres-data  Creating
+ Volume cme2e-valkey_postgres-data  Created
+ Volume cme2e-valkey_valkey-data  Creating
+ Volume cme2e-valkey_valkey-data  Created
+ Container cme2e-valkey-postgres-1  Creating
+ Container cme2e-valkey-valkey-1  Creating
+ Container cme2e-valkey-postgres-1  Created
+ Container cme2e-valkey-postgres-collation-1  Creating
+ Container cme2e-valkey-valkey-1  Created
+ Container cme2e-valkey-postgres-collation-1  Created
+ Container cme2e-valkey-claude-mem-server-1  Creating
+ Container cme2e-valkey-claude-mem-server-1  Created
+ Container cme2e-valkey-claude-mem-worker-1  Creating
+ Container cme2e-valkey-claude-mem-worker-1  Created
+ Container cme2e-valkey-valkey-1  Starting
+ Container cme2e-valkey-postgres-1  Starting
+ Container cme2e-valkey-postgres-1  Started
+ Container cme2e-valkey-postgres-1  Waiting
+ Container cme2e-valkey-valkey-1  Started
+ Container cme2e-valkey-postgres-1  Healthy
+ Container cme2e-valkey-postgres-collation-1  Starting
+ Container cme2e-valkey-postgres-collation-1  Started
+ Container cme2e-valkey-postgres-collation-1  Waiting
+ Container cme2e-valkey-valkey-1  Waiting
+ Container cme2e-valkey-postgres-1  Waiting
+ Container cme2e-valkey-postgres-collation-1  Exited
+ Container cme2e-valkey-valkey-1  Healthy
+ Container cme2e-valkey-postgres-1  Healthy
+ Container cme2e-valkey-claude-mem-server-1  Starting
+ Container cme2e-valkey-claude-mem-server-1  Started
+ Container cme2e-valkey-postgres-collation-1  Waiting
+ Container cme2e-valkey-valkey-1  Waiting
+ Container cme2e-valkey-claude-mem-server-1  Waiting
+ Container cme2e-valkey-postgres-1  Waiting
+ Container cme2e-valkey-postgres-1  Healthy
+ Container cme2e-valkey-postgres-collation-1  Exited
+ Container cme2e-valkey-valkey-1  Healthy
+ Container cme2e-valkey-claude-mem-server-1  Healthy
+ Container cme2e-valkey-claude-mem-worker-1  Starting
+ Container cme2e-valkey-claude-mem-worker-1  Started
+[e2e] verifying no legacy worker process is running
+[e2e] no legacy worker processes detected
+[e2e] creating API keys inside server container
+[e2e] running phase1 functional paths in test container
+ Container cme2e-valkey-postgres-1  Running
+ Container cme2e-valkey-valkey-1  Running
+ Container cme2e-valkey-claude-mem-server-1  Running
+ Container cme2e-valkey-postgres-1  Waiting
+ Container cme2e-valkey-postgres-1  Healthy
+ Container cme2e-valkey-postgres-collation-1  Starting
+ Container cme2e-valkey-postgres-collation-1  Started
+ Container cme2e-valkey-valkey-1  Waiting
+ Container cme2e-valkey-postgres-1  Waiting
+ Container cme2e-valkey-postgres-collation-1  Waiting
+ Container cme2e-valkey-postgres-collation-1  Exited
+ Container cme2e-valkey-valkey-1  Healthy
+ Container cme2e-valkey-postgres-1  Healthy
+[e2e] phase1 starting (1793822622-21993)
+[e2e] phase1 passed session=d59c0649-150b-409e-81cd-28300c63e6e7 event=f4c56f6a-1f81-412e-b3c0-d00dcace378d job=d9c58c8a-2c8a-438a-abb1-25848d0256c7
+[e2e] revoking read-only key inside server container
+[e2e] restarting server container to verify persisted state and queue durability
+ Container cme2e-valkey-claude-mem-server-1  Restarting
+ Container cme2e-valkey-claude-mem-worker-1  Restarting
+ Container cme2e-valkey-claude-mem-server-1  Started
+ Container cme2e-valkey-claude-mem-worker-1  Started
+[e2e] verifying no legacy worker process is running
+[e2e] no legacy worker processes detected
+[e2e] running phase2 persistence and revoked-key checks in test container
+ Container cme2e-valkey-postgres-1  Running
+ Container cme2e-valkey-valkey-1  Running
+ Container cme2e-valkey-claude-mem-server-1  Running
+ Container cme2e-valkey-postgres-1  Waiting
+ Container cme2e-valkey-postgres-1  Healthy
+ Container cme2e-valkey-postgres-collation-1  Starting
+ Container cme2e-valkey-postgres-collation-1  Started
+ Container cme2e-valkey-valkey-1  Waiting
+ Container cme2e-valkey-postgres-1  Waiting
+ Container cme2e-valkey-postgres-collation-1  Waiting
+ Container cme2e-valkey-postgres-1  Healthy
+ Container cme2e-valkey-postgres-collation-1  Exited
+ Container cme2e-valkey-valkey-1  Healthy
+[e2e] phase2 after restart starting (1793822622-21993)
+[e2e] phase2 passed session=3351b75e-55d2-48b9-8d4c-7bb322568ece event=afc4a69e-a658-4f51-bec9-d5d46ac87cfc
+[e2e] verifying anti-pattern guards
+[e2e] verifying local-dev auth is rejected inside Docker
+[e2e] local-dev auth correctly rejected
+[e2e] Docker server beta E2E passed for run=1793822622-21993

@@ -1,0 +1,119 @@
+{
+  "label": "kividb",
+  "server": "redis_version:8.10.0 kividb_version:1.2.0",
+  "openviking": "v0.5.3",
+  "suites": {
+    "ragfs cargo test (REDIS_URL, cluster and password tests on)": {
+      "passed": 586,
+      "failed": 1,
+      "ignored": 3,
+      "not_passed": [
+        "core::mountable::tests::shutdown_reaches_cache_queuefs_through_stats_wrapper"
+      ]
+    },
+    "gateway pytest tests/gateway (standalone + 3-node cluster, ACL user)": {
+      "passed": 1163,
+      "failed": 3,
+      "errors": 31,
+      "skipped": 0,
+      "not_passed": [
+        "ERROR tests.gateway.test_storage_ports::test_expired_lease_cannot_write_or_release_new_owner[redis-cluster]",
+        "ERROR tests.gateway.test_storage_ports::test_management_order_filter_and_revision[redis-cluster]",
+        "ERROR tests.gateway.test_storage_ports::test_management_expiration_and_recreation[redis-cluster]",
+        "ERROR tests.gateway.test_storage_ports::test_management_payload_expiry_applies_without_ttl[redis-cluster]",
+        "ERROR tests.gateway.test_storage_ports::test_management_credential_and_cached_wrapper[redis-cluster]",
+        "ERROR tests.gateway.test_storage_ports::test_management_delete_user_and_account[redis-cluster-plaintext]",
+        "ERROR tests.gateway.test_storage_ports::test_management_delete_user_and_account[redis-cluster-encrypted]",
+        "ERROR tests.gateway.test_storage_ports::test_management_large_value[redis-cluster]",
+        "ERROR tests.gateway.test_storage_ports::test_redis_ttl_removes_partition_and_reverse_index[redis-cluster]",
+        "ERROR tests.gateway.test_storage_ports::test_redis_missing_credential_object_does_not_remove_index[redis-cluster]",
+        "ERROR tests.gateway.test_storage_ports::test_redis_logs_are_bounded_and_user_deletion_preserves_ttl[redis-cluster]",
+        "ERROR tests.gateway.test_storage_ports::test_redis_script_reload_and_scoped_scan[redis-cluster]",
+        "FAILED tests.gateway.test_storage_ports::test_redis_commands_beyond_pool_size_wait_for_a_connection[redis-cluster]",
+        "ERROR tests.gateway.test_storage_ports::test_redis_does_not_repeat_a_write_after_losing_its_response[redis-cluster-save]",
+        "ERROR tests.gateway.test_storage_ports::test_redis_does_not_repeat_a_write_after_losing_its_response[redis-cluster-log]",
+        "ERROR tests.gateway.test_storage_ports::test_kernel_capture_backend_contract[redis-cluster-chat]",
+        "ERROR tests.gateway.test_storage_ports::test_kernel_capture_backend_contract[redis-cluster-anthropic]",
+        "ERROR tests.gateway.test_storage_ports::test_kernel_capture_backend_contract[redis-cluster-responses]",
+        "ERROR tests.gateway.test_storage_ports::test_replay_put_if_absent_is_atomic[redis-cluster]",
+        "ERROR tests.gateway.test_storage_ports::test_replay_inheritance_and_reply_index[redis-cluster]",
+        "ERROR tests.gateway.test_storage_ports::test_state_cas_versions_and_load_snapshot[redis-cluster]",
+        "ERROR tests.gateway.test_storage_ports::test_capture_ready_zero_lease_and_release[redis-cluster]",
+        "ERROR tests.gateway.test_storage_ports::test_scope_delete_blocks_concurrent_writes[redis-cluster]",
+        "ERROR tests.gateway.test_storage_ports::test_large_kernel_value_and_load_failure_isolation[redis-cluster-plaintext]",
+        "ERROR tests.gateway.test_storage_ports::test_large_kernel_value_and_load_failure_isolation[redis-cluster-encrypted]",
+        "ERROR tests.gateway.test_storage_ports::test_redis_eviction_prunes_replies_and_loses_leases[redis-cluster]",
+        "ERROR tests.gateway.test_storage_ports::test_redis_ttl_refresh_is_throttled_and_reads_do_not_refresh[redis-cluster]",
+        "ERROR tests.gateway.test_storage_ports::test_evicted_tool_receipt_returns_unknown_without_repeating[redis-cluster-1]",
+        "ERROR tests.gateway.test_storage_ports::test_evicted_tool_receipt_returns_unknown_without_repeating[redis-cluster-2]",
+        "ERROR tests.gateway.test_storage_ports::test_redis_claim_uses_server_time_and_repairs_ready_score[redis-cluster]",
+        "ERROR tests.gateway.test_storage_ports::test_redis_scope_delete_unlinks_keys_and_keeps_tombstones[redis-cluster]",
+        "FAILED tests.gateway.test_storage_ports::test_cluster_scope_delete_scans_only_own_primaries",
+        "ERROR tests.gateway.test_storage_ports::test_replay_load_handles_many_anchors[redis-cluster]",
+        "FAILED tests.gateway.test_storage_ports::test_open_stores_shares_redis_and_reads_across_instances[redis-cluster]"
+      ]
+    },
+    "pathlock migration pytest (REDIS_URL)": {
+      "passed": 9,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "not_passed": []
+    },
+    "gateway again, ACL user with +command (kividbio/kividb#392)": {
+      "passed": 1197,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "not_passed": []
+    }
+  },
+  "expiry_scheduler": {
+    "counts": {
+      "PASS": 8,
+      "FAIL": 0
+    },
+    "checks": [
+      {
+        "check": "two runtimes start on one service name (storage, publisher, consumer)",
+        "status": "PASS",
+        "detail": "6 keys"
+      },
+      {
+        "check": "report 12 items due in 1 s, then unregister one of them",
+        "status": "PASS",
+        "detail": ""
+      },
+      {
+        "check": "every item falls due and is called back exactly once, across the two runtimes",
+        "status": "PASS",
+        "detail": "runtime a: 6 calls, runtime b: 6 calls"
+      },
+      {
+        "check": "a callback that answers RETRY is called again, then completes",
+        "status": "PASS",
+        "detail": ""
+      },
+      {
+        "check": "an unregistered item is never called back",
+        "status": "PASS",
+        "detail": ""
+      },
+      {
+        "check": "both runtimes stop cleanly",
+        "status": "PASS",
+        "detail": ""
+      },
+      {
+        "check": "a runtime reports 3 items and stops before they fall due",
+        "status": "PASS",
+        "detail": ""
+      },
+      {
+        "check": "a new runtime calls back the items the stopped one left",
+        "status": "PASS",
+        "detail": ""
+      }
+    ]
+  }
+}

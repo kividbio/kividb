@@ -1,0 +1,9 @@
+{
+  "name": "claude-mem-kividb-compat",
+  "private": true,
+  "type": "module",
+  "description": "Runs claude-mem's BullMQ server job queue against KiviDB and Redis 8",
+  "dependencies": {
+    "ioredis": "5.11.1"
+  }
+}
