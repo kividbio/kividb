@@ -72,7 +72,24 @@ from its own files, then syncs with its master.
   A delta with an older save number that has grown since that save is left
   out up to its length then, and what was added after is replayed: the log
   starts again on the snapshot with those records. Releases before 1.2.1
-  add to such a log when they are started with the AOF on.
+  add to such a log when they are started with the AOF on. The save also
+  records the save number in each log's header, so that:
+  * an `appendonly.aof.prev` that was there at the save and has grown
+    since, because a checkpoint of an earlier release added the log's
+    records to it, is replayed only from where the log's records of the
+    save end: those are checked against what was recorded, and the snapshot
+    holds them. If they do not match, `appendonly.aof.prev` is left out
+    whole, and kept aside;
+  * an `appendonly.aof` that has grown since, beside an
+    `appendonly.aof.prev` that has not, has what was added replayed.
+
+  One case is left as it was: if an earlier release has since written
+  `dump.kdb.gen` itself (a checkpoint of its own that stopped before its
+  snapshot was in place), nothing recorded at the save is left, and
+  `appendonly.aof.prev` and `appendonly.aof` are replayed whole on the
+  snapshot, as that release replays them. Records the snapshot already
+  holds can then be applied twice. Do not go back to an earlier release
+  with the AOF on after a save with the AOF off.
 * A delta whose save number is newer than the snapshot's means the two files
   are from different moments, for example copied separately with a save in
   between. The writes between those saves are in neither file, and the
@@ -111,9 +128,14 @@ name of its own, `superseded.<unix-ms>.<n>.appendonly.aof` (or
 a synced copy. The directory is synced before the log is replaced. A copy
 that fails part way is removed, so nothing partial is left under that name.
 
-A `[WARN]` names each file when it is kept, and says how to apply its
-writes, and every start lists the ones still in `dir`. The server never
-removes them, and never replays them.
+A `[WARN]` names each file when it is kept, and says whether its writes
+are in the dataset. They are when `CONFIG SET appendonly yes` keeps the log
+this server had open (it made or replayed them), and for the part of a log
+that was added to after a save with the AOF off, which was just replayed:
+the warning then says not to send them to the server, which would apply
+them twice. Otherwise it says how to apply them. Every start lists the
+kept files still in `dir`. The server never removes them, and never
+replays them.
 
 To check for them, look at `INFO persistence`:
 
@@ -123,15 +145,33 @@ To check for them, look at `INFO persistence`:
   bytes that are also in `appendonly.aof`.
 
 Or list them: `ls -l <dir>/superseded.*`. The Docker image has no shell.
-On Kubernetes, use a debug container that shares the server's processes,
-`kubectl debug -it <pod> --image=busybox --target=<container> -- sh`, and
-in it `ls -l /proc/1/root/<dir>/superseded.*` (the server is process 1 of
-its container). The files are on the pod's volume and count against its
-size.
+On Kubernetes, use a debug container that shares the server's processes:
 
-To apply a kept file's writes, send them to the server: `tail -c +17 <file>
-| redis-cli --pipe` for one that starts with `KIVIDLT1` (the first 16 bytes
-are its header), `redis-cli --pipe < <file>` for one that starts with `*`.
+```sh
+kubectl debug -it <pod> --image=busybox --target=<container> \
+  --profile=general --container=kividb-debug -- sh
+# in it (the server is process 1 of its container):
+ls -l /proc/1/root/<dir>/superseded.*
+```
+
+The server runs as uid 1000. With no `runAsUser` on the pod the debug
+container runs as root, and reading another user's `/proc/1/root` then
+needs `CAP_SYS_PTRACE`, which `--profile=general` adds. Where the cluster's
+policy refuses that, run the debug container as uid 1000 instead (with
+`--custom` and a `securityContext` of `runAsUser: 1000`). To copy a kept
+file off the pod, while that debug container runs:
+
+```sh
+kubectl exec <pod> -c kividb-debug -- cat /proc/1/root/<dir>/<file> > <file>
+```
+
+The files are on the pod's volume and count against its size.
+
+Never send a file whose warning says its writes are in the dataset. To
+apply another kept file's writes, send them to the server: `tail -c +17
+<file> | redis-cli --pipe` for one that starts with `KIVIDLT1` (the first 16
+bytes are its header), `redis-cli --pipe < <file>` for one that starts with
+`*`.
 Its records may include writes the snapshot already holds, and an `INCR` or
 `RPUSH` among those is applied again: read the file first (it is plain RESP
 after the header) and send only what is missing. Then remove the file. A
