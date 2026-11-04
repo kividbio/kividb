@@ -303,6 +303,15 @@ struct Panicked {
     put_back: Result<(), String>,
 }
 
+/// How a tick panicked.
+enum Failed {
+    /// Putting back, at its start, the slabs an earlier panic left out: no
+    /// pass ran, and none is counted.
+    PuttingBack(String),
+    /// A pass.
+    Pass(Panicked),
+}
+
 /// The ERROR line of a pass that panicked, the `in_a_row`th in a row.
 fn report(panic: &Panicked, in_a_row: u32, outcome: Outcome) -> String {
     let slabs = match &panic.put_back {
@@ -340,7 +349,14 @@ fn step(store: &Store, streak: &mut Streak) -> Duration {
             streak.in_a_row = 0;
             TICK
         }
-        Err(panic) => streak.panicked(&panic),
+        Err(Failed::PuttingBack(message)) => {
+            log_error(format!(
+                "active defrag: putting back the slabs a panic left out panicked {message}; no \
+                 pass ran, and those it did not reach are put back at the next tick"
+            ));
+            TICK
+        }
+        Err(Failed::Pass(panic)) => streak.panicked(&panic),
     }
 }
 
@@ -348,17 +364,25 @@ fn step(store: &Store, streak: &mut Streak) -> Duration {
 /// whether one ran, or how it panicked. A pass that panics leaves no slab
 /// being emptied, unless putting them back panicked too, and
 /// `active_defrag_running` at 0.
-fn pass(store: &Store) -> Result<bool, Panicked> {
+fn pass(store: &Store) -> Result<bool, Failed> {
     // Held while a panic's slabs are put back too: another store's thread
     // would otherwise start a pass, and have its own put back with them.
     let _one = ONE_AT_A_TIME.lock();
-    note_panic_locations();
+    // Slabs a panic before this one could not put back (#370): first, and on
+    // or off, so that none stays out of use while active defrag is off.
+    // Nothing to do, and one lock taken, otherwise. The hook is put in here
+    // too, where a panic is caught.
+    let put_back = in_pass(|| {
+        catch_unwind(|| {
+            note_panic_locations();
+            value_slab::finish_evacuation();
+        })
+    });
+    if let Err(panic) = put_back {
+        return Err(Failed::PuttingBack(described(panic.as_ref())));
+    }
     let ran = in_pass(|| {
         catch_unwind(AssertUnwindSafe(|| {
-            // Slabs a panic before this one could not put back (#370): first,
-            // and on or off, so that none stays out of use while active
-            // defrag is off. Nothing to do, and one lock taken, otherwise.
-            value_slab::finish_evacuation();
             let due = enabled() && wasting(ignore_bytes(), threshold_lower());
             if due {
                 compact(store);
@@ -374,7 +398,7 @@ fn pass(store: &Store) -> Result<bool, Panicked> {
         let put_back = in_pass(|| catch_unwind(value_slab::finish_evacuation))
             .map_err(|again| described(again.as_ref()));
         RUNNING.store(false, Ordering::Relaxed);
-        Panicked { message, put_back }
+        Failed::Pass(Panicked { message, put_back })
     })
 }
 
@@ -385,12 +409,17 @@ thread_local! {
     static PANIC_AT: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
-/// `f`, with this thread marked as in a pass.
+/// `f`, with this thread marked as in a pass until it returns or unwinds.
 fn in_pass<T>(f: impl FnOnce() -> T) -> T {
+    struct Out;
+    impl Drop for Out {
+        fn drop(&mut self) {
+            let _ = IN_PASS.try_with(|p| p.set(false));
+        }
+    }
     IN_PASS.with(|p| p.set(true));
-    let done = f();
-    IN_PASS.with(|p| p.set(false));
-    done
+    let _out = Out;
+    f()
 }
 
 /// From the first pass on, panics note where they happened, for the ERROR
@@ -464,17 +493,19 @@ fn compact(store: &Store) {
         // moved yet.
         fault_point(Fault::AfterPlan);
         let regions = value_slab::regions_snapshot();
-        let before = hits();
+        // Counted here, not read from `active_defrag_hits`, which a
+        // `CONFIG RESETSTAT` can set to 0 while the set runs (#370).
+        let mut moved = 0u64;
         'all: for db in store.iter() {
             for shard in db.iter() {
-                compact_shard(shard, &regions);
+                moved += compact_shard(shard, &regions);
                 if !enabled() {
                     break 'all;
                 }
             }
         }
         value_slab::finish_evacuation();
-        if hits() == before {
+        if moved == 0 {
             break;
         }
     }
@@ -494,8 +525,9 @@ impl Drop for Leftovers {
 }
 
 /// Move the values of `shard` that are in slabs being emptied, [`BATCH`]
-/// buckets at a time.
-fn compact_shard(shard: &Shard, regions: &[usize]) {
+/// buckets at a time. Returns how many moved.
+fn compact_shard(shard: &Shard, regions: &[usize]) -> u64 {
+    let mut moved = 0u64;
     // A bucket index: entries keep their buckets while others come and go;
     // only a resize moves them, and then some are looked at twice or missed
     // until the next set, which is harmless. Where walking past the first
@@ -541,11 +573,12 @@ fn compact_shard(shard: &Shard, regions: &[usize]) {
             }
             // Counted and freed with the shard unlocked: a slab that empties
             // is given back to the kernel, a system call.
+            moved += old.0.len() as u64;
             drop(old);
         }
         rest(started.elapsed());
         if at >= buckets {
-            return;
+            return moved;
         }
     }
 }
@@ -914,6 +947,54 @@ mod tests {
         assert_eq!(stepped(&store, &mut streak), TICK);
         assert!(!any_evacuating(&store));
         check(&store, &INLINE);
+    }
+
+    #[test]
+    fn a_put_back_at_the_start_of_a_tick_that_panics_is_no_pass_and_says_so() {
+        let _setup = Setup::new();
+        let store = sparse_store(&INLINE);
+        let mut streak = Streak::new();
+
+        // Slabs left out: a pass panics, and so does putting back.
+        FAULTS_AFTER_CHUNK.store(1, Ordering::Relaxed);
+        value_slab::FAULTS_IN_FINISH.store(1, Ordering::Relaxed);
+        assert_eq!(step_once(&store, &mut streak), BACKOFF);
+        let left = value_slab::evacuating_slabs();
+        assert!(left >= 2, "{left} slabs left out");
+        logged();
+
+        // Off; the next tick's putting back panics after one slab.
+        set_enabled(false);
+        let panics_before = panics();
+        value_slab::FAULTS_IN_FINISH.store(1, Ordering::Relaxed);
+        assert_eq!(step_once(&store, &mut streak), TICK);
+        assert_eq!(value_slab::FAULTS_IN_FINISH.load(Ordering::Relaxed), 0);
+        assert_eq!(panics(), panics_before, "counted as a pass that panicked");
+        assert_eq!(streak.in_a_row(), 1);
+        assert_eq!(value_slab::evacuating_slabs(), left - 1);
+        let lines = logged();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("no pass ran"), "{}", lines[0]);
+        assert!(!lines[0].contains("a pass panicked"), "{}", lines[0]);
+        assert!(!lines[0].contains("turned off while"), "{}", lines[0]);
+        assert!(
+            lines[0].contains("src/value_slab.rs:"),
+            "no place in: {}",
+            lines[0]
+        );
+
+        // The tick after puts back the rest.
+        assert_eq!(stepped(&store, &mut streak), TICK);
+        assert!(!any_evacuating(&store));
+        check(&store, &INLINE);
+    }
+
+    #[test]
+    fn a_thread_is_out_of_its_pass_once_the_pass_unwinds() {
+        let unwound = catch_unwind(|| in_pass(|| panic!("in a pass")));
+        assert!(unwound.is_err());
+        assert!(!IN_PASS.with(Cell::get), "still marked as in a pass");
+        PANIC_AT.with(|p| p.borrow_mut().take());
     }
 
     #[test]

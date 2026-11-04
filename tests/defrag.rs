@@ -221,7 +221,19 @@ fn values_move_off_half_empty_slabs_and_read_back() {
     }
     assert!(matches!(c.cmd(&["DBSIZE"]), Reply::Integer(k) if k as usize == kept));
 
-    // CONFIG RESETSTAT resets active defrag's counts too (#370).
+    // CONFIG RESETSTAT resets active defrag's counts too (#370). Turned off,
+    // and its pass over, first: a pass goes on to half the thresholds, past
+    // where the loop above stopped waiting, and a move after the reset would
+    // count.
+    c.ok(&["CONFIG", "SET", "activedefrag", "no"]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while c.info("active_defrag_running") != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "active defrag still running 30 s after it was turned off"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
     c.ok(&["CONFIG", "RESETSTAT"]);
     assert_eq!(c.info("active_defrag_hits"), 0);
     assert_eq!(c.info("active_defrag_misses"), 0);

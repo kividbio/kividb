@@ -45,8 +45,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   panic are counted in `active_defrag_hits`. After 5 passes in a row
   panic, with none ending between them, active defrag turns itself off,
   with one `ERROR` line saying that `CONFIG SET activedefrag yes` turns it
-  back on; `CONFIG GET activedefrag` then says `no`, and so does MEMORY
-  DOCTOR. Only turning it on from off starts the count afresh: a
+  back on; `CONFIG GET activedefrag` then says `no`, and MEMORY DOCTOR
+  says so when fragmentation is high. Only turning it on from off starts the count afresh: a
   `CONFIG SET activedefrag yes` sent while it is on, as a configuration
   loop does, changes nothing. Two new fields in `INFO memory`:
   `active_defrag_panics`, the passes that panicked, and
