@@ -284,8 +284,9 @@ fn route_queue(caller: &Caller, queue: &[Vec<Vec<u8>>], asking: bool) -> Option<
 /// `KIVIDB_TEST_FAILPOINTS` has to name too), as a command can be held up
 /// between its routing and the write gate on a busy machine while a
 /// `MIGRATE` runs. So does `EXEC`, for the commands it has queued. Not
-/// `MIGRATE` itself, which moves them. Read once; called in cluster mode
-/// only, where it costs a load and a branch.
+/// `MIGRATE` itself, which moves them, nor a command run inside a
+/// transaction or a script, which was routed with it. Read once; called in
+/// cluster mode only, where it costs a load and a branch.
 pub fn stall_for_test(name: &str, cmd: &[&[u8]]) {
     if let Some(keys) = test_stall_keys() {
         stall_if_named(keys, name, cmd);
@@ -313,7 +314,7 @@ fn stall_if_named(keys: &[Vec<u8>], name: &str, cmd: &[&[u8]]) {
     let named = key_positions(name, cmd)
         .iter()
         .any(|pos| keys.iter().any(|key| key.as_slice() == cmd[pos]));
-    if name == "MIGRATE" || !named {
+    if name == "MIGRATE" || !named || crate::write_gate::held_by_this_thread() {
         return;
     }
     // Leaving the worker's other tasks to another thread of the
