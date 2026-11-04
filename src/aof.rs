@@ -436,8 +436,10 @@ enum NewLogWhy {
     Older,
     /// At a start: older than `dump.kdb`, but `appendonly.aof` (and the old
     /// log, with `prev`) was added to after the dump was saved with the AOF
-    /// off, and what was added has been replayed.
-    AddedTo { prev: bool },
+    /// off, and what was added has been replayed. With `log_whole`, all of
+    /// `appendonly.aof` was: a log made, or written to, after that save
+    /// (#363).
+    AddedTo { prev: bool, log_whole: bool },
 }
 
 /// The warning for the log at `path`, kept as `name`. Whether its writes
@@ -465,7 +467,15 @@ fn kept_warning(why: NewLogWhy, path: &str, name: &str) -> String {
             "AOF: {path} was left by an earlier run and is not part of this dataset, and the AOF \
              turned on starts a new log. {kept} {apply}"
         ),
-        NewLogWhy::AddedTo { prev } if path != AOF_PREV_PATH || prev => format!(
+        NewLogWhy::AddedTo {
+            log_whole: true, ..
+        } if path == AOF_PATH => format!(
+            "AOF: {path} was written to after dump.kdb was saved with the AOF off, and the log \
+             starts again on dump.kdb with its records. {kept} All of its records have been \
+             replayed, and are in the dataset: do not send the file to the server, which would \
+             apply them twice. Remove the file once it is not needed"
+        ),
+        NewLogWhy::AddedTo { prev, .. } if path != AOF_PREV_PATH || prev => format!(
             "AOF: {path} was added to after dump.kdb was saved with the AOF off, and the log \
              starts again on dump.kdb with what was added. {kept} What was added to it since that \
              save has been replayed, and is in the dataset: do not send the file to the server, \
@@ -2006,6 +2016,30 @@ impl DumpOnDisk {
     }
 }
 
+impl DumpOnDisk {
+    /// Whether the log `buf`, which [`DumpOnDisk::age_of`] says goes on from
+    /// the dump, is replayed, on its own, beside an old log that is older
+    /// than the dump (#363). Left out with the old log, its records were only
+    /// in the copy kept aside. It is when it holds records, the dump is the
+    /// one `dump.kdb.gen` was written for, and it is a log with no header (as
+    /// without the old log, it is replayed whole), or a delta on this dump's
+    /// number, or one made after the save, when there was no log: 1.2.0
+    /// makes a delta on the next number then, for an old log with no log
+    /// beside it, and adds to it.
+    fn replayed_beside_an_older_old_log(&self, buf: &[u8]) -> bool {
+        let Some((saved, own)) = self.saved.as_ref().filter(|_| self.kdb) else {
+            return false;
+        };
+        if !*own || buf.len() <= records_start(buf) || buf.starts_with(AOF_MAGIC) {
+            return false;
+        }
+        match aof_delta_generation(buf) {
+            None => true,
+            Some(number) => number == saved.number || saved.logs.is_some_and(|logs| logs[0].0 == 0),
+        }
+    }
+}
+
 /// Where what was added to the log at `path` since the dump of `saved` was
 /// saved with the AOF off starts, if it has only been added to since: it is
 /// longer now, and its first bytes are those recorded at that save. Either
@@ -2892,27 +2926,35 @@ pub fn recover_local(
         // the old snapshot. One that did finish only left the old log behind.
         let mut resumed_checkpoint = false;
         // What an older log had added to it after the dump was saved with the
-        // AOF off, and its name: it goes on from the dump (see
-        // [`LogAge::AddedToFrom`]).
-        let mut added: Option<(&str, Vec<u8>)> = None;
+        // AOF off, its name, and whether it is all of the log: it goes on
+        // from the dump (see [`LogAge::AddedToFrom`]).
+        let mut added: Option<(&str, bool, Vec<u8>)> = None;
         if std::path::Path::new(AOF_PREV_PATH).exists() {
             // None: the checkpoint that left it behind finished.
             let prev_age = (!checkpoint_completed(&buf)).then(|| on_disk.age_of(AOF_PREV_PATH));
             if prev_age.is_none() {
                 let _ = std::fs::remove_file(AOF_PREV_PATH);
             } else if prev_age == Some(LogAge::Older) {
-                // And so is the log, which goes on from it; but what was
-                // added to the log since the dump was saved goes on from the
-                // dump. Left out with the rest, it was only in the copy kept
-                // aside (#359).
-                if let LogAge::AddedToFrom(from) = on_disk.age_of(AOF_PATH) {
-                    added = Some((
-                        AOF_PATH,
-                        buf.get(from as usize..).unwrap_or_default().to_vec(),
-                    ));
-                } else {
-                    older_than_dump(&format!("{AOF_PREV_PATH} and {AOF_PATH} are"));
-                    left_out = true;
+                // The log is judged on its own. What was added to it since
+                // the dump was saved goes on from the dump (#359), and so
+                // does a log that, alone, would be replayed (#363): left out
+                // with the old log, their records were only in the copies
+                // kept aside.
+                match on_disk.age_of(AOF_PATH) {
+                    LogAge::AddedToFrom(from) => {
+                        added = Some((
+                            AOF_PATH,
+                            false,
+                            buf.get(from as usize..).unwrap_or_default().to_vec(),
+                        ));
+                    }
+                    LogAge::GoesOn if on_disk.replayed_beside_an_older_old_log(&buf) => {
+                        added = Some((AOF_PATH, true, buf[records_start(&buf)..].to_vec()));
+                    }
+                    _ => {
+                        older_than_dump(&format!("{AOF_PREV_PATH} and {AOF_PATH} are"));
+                        left_out = true;
+                    }
                 }
             } else if let Some(LogAge::AddedToFrom(from)) = prev_age {
                 // And the log goes on from what was added.
@@ -2922,7 +2964,7 @@ pub fn recover_local(
                 };
                 let mut both = prev.get(from as usize..).unwrap_or_default().to_vec();
                 both.extend_from_slice(&buf[records_start(&buf)..]);
-                added = Some((AOF_PREV_PATH, both));
+                added = Some((AOF_PREV_PATH, true, both));
             } else {
                 log_warn!(
                     "AOF: a checkpoint did not finish — replaying {AOF_PREV_PATH} and then \
@@ -2972,6 +3014,7 @@ pub fn recover_local(
                 LogAge::AddedToFrom(from) => {
                     added = Some((
                         AOF_PATH,
+                        false,
                         buf.get(from as usize..).unwrap_or_default().to_vec(),
                     ));
                 }
@@ -2980,14 +3023,25 @@ pub fn recover_local(
         }
         // The records added go on from the dump: the log starts again on it
         // with them, and is replayed. The old logs are kept aside, whole.
-        if let Some((name, added)) = added {
-            log_warn!(
-                "AOF: {name} was added to after dump.kdb was saved with the AOF off (by an \
-                 earlier release started with the AOF on) — what was added is replayed on top of \
-                 dump.kdb; the records from before that save, which dump.kdb holds, are not"
-            );
+        if let Some((name, log_whole, added)) = added {
+            if name == AOF_PATH && log_whole {
+                log_warn!(
+                    "AOF: {AOF_PATH} was written to after dump.kdb was saved with the AOF off (by \
+                     an earlier release started with the AOF on) — it is replayed on top of \
+                     dump.kdb, all of it, as that release replayed it; {AOF_PREV_PATH}, older \
+                     than dump.kdb, is not"
+                );
+            } else {
+                log_warn!(
+                    "AOF: {name} was added to after dump.kdb was saved with the AOF off (by an \
+                     earlier release started with the AOF on) — what was added is replayed on \
+                     top of dump.kdb; the records from before that save, which dump.kdb holds, \
+                     are not"
+                );
+            }
             let why = NewLogWhy::AddedTo {
                 prev: name == AOF_PREV_PATH,
+                log_whole,
             };
             if let Err(e) = start_new_log(why, &added) {
                 fatal_persistence(&format!(
@@ -3405,12 +3459,43 @@ mod kept_warning_tests {
         let enable = kept_warning(NewLogWhy::Enable, AOF_PATH, NAME);
         assert!(enable.contains("already in the dataset"), "{enable}");
         assert!(!says_to_apply(&enable), "{enable}");
+        let added = kept_warning(
+            NewLogWhy::AddedTo {
+                prev: false,
+                log_whole: false,
+            },
+            AOF_PATH,
+            NAME,
+        );
+        assert!(added.contains("has been replayed"), "{added}");
+        assert!(!says_to_apply(&added), "{added}");
+        // All of the log replayed (#363): with the old log added to, or the
+        // log judged on its own.
         for prev in [false, true] {
-            let added = kept_warning(NewLogWhy::AddedTo { prev }, AOF_PATH, NAME);
-            assert!(added.contains("has been replayed"), "{added}");
-            assert!(!says_to_apply(&added), "{added}");
+            let whole = kept_warning(
+                NewLogWhy::AddedTo {
+                    prev,
+                    log_whole: true,
+                },
+                AOF_PATH,
+                NAME,
+            );
+            assert!(
+                whole.contains("All of its records have been replayed"),
+                "{whole}"
+            );
+            assert!(!whole.contains("was not replayed"), "{whole}");
+            assert!(!says_to_apply(&whole), "{whole}");
         }
-        let prev_added = kept_warning(NewLogWhy::AddedTo { prev: true }, AOF_PREV_PATH, NAME);
+        let prev_added = kept_warning(
+            NewLogWhy::AddedTo {
+                prev: true,
+                log_whole: true,
+            },
+            AOF_PREV_PATH,
+            NAME,
+        );
+        assert!(prev_added.contains("has been replayed"), "{prev_added}");
         assert!(!says_to_apply(&prev_added), "{prev_added}");
     }
 
@@ -3422,7 +3507,20 @@ mod kept_warning_tests {
             (NewLogWhy::Older, AOF_PREV_PATH),
             (NewLogWhy::EnableOverEarlierRun, AOF_PATH),
             // The old log beside a log added to, itself not added to.
-            (NewLogWhy::AddedTo { prev: false }, AOF_PREV_PATH),
+            (
+                NewLogWhy::AddedTo {
+                    prev: false,
+                    log_whole: false,
+                },
+                AOF_PREV_PATH,
+            ),
+            (
+                NewLogWhy::AddedTo {
+                    prev: false,
+                    log_whole: true,
+                },
+                AOF_PREV_PATH,
+            ),
         ] {
             let warning = kept_warning(why, path, NAME);
             assert!(says_to_apply(&warning), "{why:?} {path}: {warning}");
