@@ -59,7 +59,8 @@ KiviDB restart took about a second in the test, and n8n carried on without losin
   to drain instead of 84 s. Workaround until it is fixed: run KiviDB with `--io-model tokio`, which does
   not have the problem (all 22 of n8n's tests pass with it), at some cost in throughput.
 - In RESP2, `BRPOPLPUSH` and `BLMOVE` time out with `$-1` where Redis sends `*-1`
-  ([#385](https://github.com/kividbio/kividb/issues/385)). ioredis, and so n8n, reads both as `null`.
+  ([#385](https://github.com/kividbio/kividb/issues/385)) in 1.2.0; fixed in 1.2.1. ioredis, and so n8n, reads
+  both as `null`.
 
 ## Not tested
 

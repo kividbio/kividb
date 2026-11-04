@@ -328,7 +328,12 @@ pub fn park_with_state(
 ///
 /// `attempt` is the command's non-blocking form: `Some(reply)` once it has
 /// done its work (or failed), `None` while there is nothing for it. `empty`
-/// is the reply for a wait that ends with nothing.
+/// is the reply when the caller cannot wait — inside `MULTI` or a script —
+/// and there is nothing: Redis answers `BRPOPLPUSH` and `BLMOVE` there with
+/// a null bulk string and the others with a null array. A wait that ends
+/// with nothing — its timeout, or `CLIENT UNBLOCK … TIMEOUT` — is answered
+/// with a null array whatever the command, as Redis answers every blocking
+/// command that times out (#385).
 ///
 /// The command is woken by a *signal* that one of its keys was written, and
 /// then looks for itself, exactly as it looked the first time. It used to be
@@ -446,7 +451,7 @@ pub fn wait_for_keys(
         (None, Some(remaining)) if !timed_out => Err(remaining),
         (None, _) => {
             crate::stats::record_miss();
-            Ok(empty())
+            Ok(crate::resp::write::resp_null_array())
         }
     };
 
