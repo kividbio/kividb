@@ -1090,14 +1090,20 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // order of its keys (`keys_ordered`), as a command does, against the
     // field-expiry sweep, which brought a hash's postings up to date over an
     // `HSET` applied meanwhile, or dropped its watch over an `HPEXPIREAT`
-    // (#371). Only while the sweep has a hash to watch: with none, no sweep
-    // is part way through one, and the order cost every applied write 4 to 8
-    // per cent more instructions. Only that, too: it takes the gate as it did,
-    // after the applier's lock (`replica_client`), and never alone for a
+    // (#371). Not when nothing is watched and the command watches nothing
+    // either: no sweep is then part way through a hash, nor can one start on
+    // a key of this write before it is done, and the order cost every applied
+    // write 4 to 8 per cent more instructions. A command that may watch a
+    // hash (`tracks_field_ttls`) takes it whatever is watched: it watches the
+    // hash before it brings the indexes up to date with it, and a sweep could
+    // otherwise reach the hash in between, and be written over (#376). Only
+    // the order, too: it takes the gate as it did, and never alone for a
     // flush. Not while the AOF is replayed: nothing else writes then.
     let ordered = gated && !ctx.apply_replication;
-    let keys_ordered =
-        ordered || (gated && !crate::expiry::replaying() && crate::field_expiry::any_watched());
+    let keys_ordered = ordered
+        || (gated
+            && !crate::expiry::replaying()
+            && (crate::field_expiry::any_watched() || tracks_field_ttls(name)));
 
     // Every command runs inside the command gate; a script — read-only or
     // not — and a flush that has to be ordered take it alone. So does
@@ -1758,6 +1764,29 @@ fn reindex_copied(ctx: &Ctx, name: &str) {
         i += 1;
     }
     crate::vector::reindex_key(ctx.index_store, ctx.store, to, key, Write::Whole);
+}
+
+/// Whether `name` is a command that may watch a hash with field TTLs, in
+/// [`settle_written_keys`]: the first two arms there. Every write applied
+/// from the stream asks: most are told by their first letter.
+#[inline]
+fn tracks_field_ttls(name: &str) -> bool {
+    matches!(name.as_bytes().first(), Some(b'H' | b'R' | b'C' | b'M'))
+        && matches!(
+            name,
+            "HEXPIRE"
+                | "HPEXPIRE"
+                | "HEXPIREAT"
+                | "HPEXPIREAT"
+                | "HSETEX"
+                | "HGETEX"
+                | "HIMPORT"
+                | "RENAME"
+                | "RENAMENX"
+                | "RESTORE"
+                | "COPY"
+                | "MOVE"
+        )
 }
 
 /// What a write leaves to be done to the keys it named.

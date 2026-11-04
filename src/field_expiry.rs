@@ -39,8 +39,9 @@ static WATCHED_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 /// Whether any hash is watched. While none is, no sweep is part way through
 /// one: a sweep's hash stays on the list until the sweep's last write to it,
 /// done under the hash's write order, has been made ([`settle_watch`]). A
-/// write applied from the master's stream takes its keys' order only while
-/// one is (see `handler::run_command`, #371).
+/// write applied from the master's stream takes its keys' order while one
+/// is, and when it may watch one itself, which it does before its own last
+/// write to the hash (see `handler::run_command`, #371).
 #[inline]
 pub fn any_watched() -> bool {
     WATCHED_LEN.load(std::sync::atomic::Ordering::Acquire) > 0
@@ -525,40 +526,47 @@ mod tests {
         index_store: &IndexStore,
         cmd: Vec<String>,
     ) -> std::thread::JoinHandle<bool> {
-        use std::sync::atomic::Ordering::SeqCst;
         let (store, index_store) = (Arc::clone(store), Arc::clone(index_store));
         let (done, finished) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
-            let config = Arc::new(crate::config::Config::default_replica());
-            let repl_state = Arc::new(crate::replication::ReplState::new_master());
-            let dict = crate::vector::new_dict_store();
-            let wait = Arc::new(crate::wait_table::WaitTable::new());
-            let ts = crate::store::new_ts_index();
-            let (compaction_tx, _compaction_rx) = crate::vector::new_compaction_channel();
-            let env = crate::replication::replica_client::ReplicationApplyEnv::new_inert();
-            let mut db = 0usize;
-            let deferred = crate::vector::DEFER_INDEXING.load(SeqCst);
-            env.apply_command(
-                cmd.into_iter().map(String::into_bytes).collect(),
-                &store,
-                &repl_state,
-                &index_store,
-                &dict,
-                &wait,
-                &ts,
-                &config,
-                &compaction_tx,
-                &mut db,
-                &crate::watch::NoopWatchRegistry,
-                "replica:test",
-            )
-            .expect("applied");
-            let deferred = deferred || crate::vector::DEFER_INDEXING.load(SeqCst);
+            let deferred = applied(&store, &index_store, cmd);
             let _ = done.send(());
             deferred
         });
         let _ = finished.recv_timeout(Duration::from_millis(500));
         thread
+    }
+
+    /// `cmd` applied on this thread as a replica applies its master's
+    /// stream: whether indexing was deferred around it (see
+    /// [`applied_beside`]).
+    fn applied(store: &Store, index_store: &IndexStore, cmd: Vec<String>) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        let config = Arc::new(crate::config::Config::default_replica());
+        let repl_state = Arc::new(crate::replication::ReplState::new_master());
+        let dict = crate::vector::new_dict_store();
+        let wait = Arc::new(crate::wait_table::WaitTable::new());
+        let ts = crate::store::new_ts_index();
+        let (compaction_tx, _compaction_rx) = crate::vector::new_compaction_channel();
+        let env = crate::replication::replica_client::ReplicationApplyEnv::new_inert();
+        let mut db = 0usize;
+        let deferred = crate::vector::DEFER_INDEXING.load(SeqCst);
+        env.apply_command(
+            cmd.into_iter().map(String::into_bytes).collect(),
+            store,
+            &repl_state,
+            index_store,
+            &dict,
+            &wait,
+            &ts,
+            &config,
+            &compaction_tx,
+            &mut db,
+            &crate::watch::NoopWatchRegistry,
+            "replica:test",
+        )
+        .expect("applied");
+        deferred || crate::vector::DEFER_INDEXING.load(SeqCst)
     }
 
     /// On a replica: an `HSET` from the master, applied while the sweep
@@ -654,6 +662,83 @@ mod tests {
         );
     }
 
+    /// On a replica with nothing watched: an `HPEXPIREAT` from the master
+    /// watches the hash, then brings its postings up to date. A sweep that
+    /// reaches the hash in between, its field due, waits for the write, and
+    /// the postings and the watch agree when both are done (#376). Without
+    /// the write's order the sweep evicted the field and dropped the watch,
+    /// and the write then put the field back in the postings, for good.
+    /// What is shown needs nothing watched in the process when the write
+    /// starts: run alone (another test's watch makes the write take its order
+    /// anyway).
+    #[test]
+    fn a_ttl_from_the_master_that_starts_the_watching_is_ordered() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        const KEY: &str = "f376:k";
+        // Again if a replay elsewhere in the process deferred indexing.
+        for _ in 0..50 {
+            let store = crate::store::new_store(1);
+            let _own = OwnWatches::of(&store);
+            let index_store = crate::vector::new_index_store();
+            let def = hash_losing_n(&store, &index_store, "f376:", KEY);
+            // Not watched, its n with no time to live: as the master's HSET
+            // left it.
+            hash_at(&store, KEY).write().expiries.clear();
+            forget_watches(store_id(&store));
+            let sweeper = Rc::new(RefCell::new(None));
+            {
+                let (store, index_store, sweeper) = (
+                    Arc::clone(&store),
+                    Arc::clone(&index_store),
+                    Rc::clone(&sweeper),
+                );
+                crate::test_hooks::set("index_fields: fields read", move || {
+                    // n is due; the sweep, from a thread of its own.
+                    std::thread::sleep(Duration::from_millis(60));
+                    let (done, finished) = std::sync::mpsc::channel();
+                    *sweeper.borrow_mut() = Some(std::thread::spawn(move || {
+                        sweep(&store, &index_store);
+                        let _ = done.send(());
+                    }));
+                    let _ = finished.recv_timeout(Duration::from_millis(300));
+                });
+            }
+            let at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+                + 50;
+            let cmd = ["HPEXPIREAT", KEY, &at.to_string(), "FIELDS", "1", "n"]
+                .map(String::from)
+                .to_vec();
+            // Applied on this thread, where the hook is.
+            let deferred = applied(&store, &index_store, cmd);
+            crate::test_hooks::clear("index_fields: fields read");
+            let Some(sweeper) = sweeper.borrow_mut().take() else {
+                continue;
+            };
+            sweeper.join().unwrap();
+            if deferred {
+                continue;
+            }
+            // What the sweep did last stands.
+            sweep(&store, &index_store);
+            let p = def.postings.read();
+            let id = p.id(KEY).expect("still in the index");
+            let in_postings = p.range("n", 0.0, false, 10.0, false).unwrap().get(id);
+            drop(p);
+            let has_n = fields_of(&store, KEY).unwrap().contains(&"n".to_string());
+            let watched = watched_keys(&store, 0).iter().any(|key| key == KEY);
+            assert!(
+                !in_postings || has_n || watched,
+                "the postings have n, the hash has not, and nothing watches it"
+            );
+            return;
+        }
+        panic!("the write never got to the postings");
+    }
+
     #[test]
     fn due_fields_go_and_an_empty_hash_goes_with_them() {
         let store = crate::store::new_store(1);
@@ -695,11 +780,7 @@ mod tests {
         assert_eq!(watched_in(&store), 1);
 
         // After a rescan, what is there is what is watched.
-        WATCHED
-            .lock()
-            .as_mut()
-            .unwrap()
-            .retain(|(s, _, _), _| *s != store_id(&store));
+        forget_watches(store_id(&store));
         rescan(&store);
         assert_eq!(watched_in(&store), 1);
     }
