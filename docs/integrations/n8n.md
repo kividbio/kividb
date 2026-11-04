@@ -48,16 +48,17 @@ KiviDB restart took about a second in the test, and n8n carried on without losin
 
 ## Known gaps
 
-- **A worker that pauses or shuts down leaves a blocked connection behind, on io_uring**
-  ([#384](https://github.com/kividbio/kividb/issues/384)). When a Bull worker stops, it sends `QUIT` on its
-  blocking connection and then closes it. KiviDB on the io_uring I/O model (what it uses on Linux) does not
-  notice that close while the connection waits in `BRPOPLPUSH`, so the worker's shutdown takes about 2 s
-  longer, and the server keeps the wait open until it times out. If a job arrives meanwhile, that wait can
-  take it; n8n's stall check (every 30 s) then puts it back, so it runs late but is not lost. n8n's test
-  "should stop waiting at once when the worker pauses" fails because of this. In the end-to-end run no
-  execution was lost, and a killed worker cost the same 10 executions as on Redis, but the batch took 109 s
-  to drain instead of 84 s. Workaround until it is fixed: run KiviDB with `--io-model tokio`, which does
-  not have the problem (all 22 of n8n's tests pass with it), at some cost in throughput.
+- **In 1.2.0, a worker that paused or shut down left a blocked connection behind, on io_uring**
+  ([#384](https://github.com/kividbio/kividb/issues/384)); fixed in 1.2.1. When a Bull worker stops, it
+  sends `QUIT` on its blocking connection and then closes it. KiviDB 1.2.0 on the io_uring I/O model (what
+  it uses on Linux) did not notice that close while the connection waited in `BRPOPLPUSH`, so the worker's
+  shutdown took about 2 s longer, and the server kept the wait open until it timed out. If a job arrived
+  meanwhile, that wait could take it; n8n's stall check (every 30 s) then put it back, so it ran late but
+  was not lost. n8n's test "should stop waiting at once when the worker pauses" failed because of this. In
+  the end-to-end run no execution was lost, and a killed worker cost the same 10 executions as on Redis,
+  but the batch took 109 s to drain instead of 84 s. On 1.2.0, run KiviDB with `--io-model tokio`, which
+  does not have the problem (all 22 of n8n's tests pass with it), at some cost in throughput. 1.2.1 lets
+  such a connection go as soon as it closes, on both I/O models.
 - In RESP2, `BRPOPLPUSH` and `BLMOVE` time out with `$-1` where Redis sends `*-1`
   ([#385](https://github.com/kividbio/kividb/issues/385)). ioredis, and so n8n, reads both as `null`.
 

@@ -128,7 +128,18 @@ where
         let mut unblockable = true;
         loop {
             tokio::select! {
-                delivery = &mut waiting => break delivery,
+                delivery = &mut waiting => {
+                    // Woken: what it waited for may be there, for it to take
+                    // on the dispatch that resumes it. A client that has
+                    // gone in the meantime must not take it — and its end,
+                    // ready at the same moment, may not have been the arm
+                    // picked — so the socket is looked at now.
+                    if gone_by_now(waiter.reader, waiter.carried, waiter.activity) {
+                        waiter.interrupted.gone = true;
+                        break None;
+                    }
+                    break delivery;
+                }
                 // The client's side of the connection, while it waits: more
                 // commands, which wait their turn — or the end of it. A
                 // client that has gone must not be left in line for an
@@ -167,9 +178,69 @@ where
         .set_blocked(waiter.client_id, None, false);
     // However it ended, the command is dispatched again: with what it was
     // waiting for, or as if its time had run out — which is also how it
-    // leaves the line it was standing in.
-    slot.set_pending(delivery, block_state);
+    // leaves the line it was standing in — or, its client gone, only to
+    // leave that line, taking nothing.
+    if waiter.interrupted.gone {
+        slot.set_gone(block_state);
+    } else {
+        slot.set_pending(delivery, block_state);
+    }
     Ok(())
+}
+
+/// Whether the client has gone, as far as its socket says now, without
+/// waiting for anything. What it has sent is read into `carried`, as the
+/// wait reads it, up to its end if that has arrived.
+fn gone_by_now<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    carried: &mut Vec<u8>,
+    activity: &crate::client_registry::Activity,
+) -> bool {
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let mut temp = [0u8; 4096];
+    loop {
+        let mut read = tokio::io::ReadBuf::new(&mut temp);
+        match std::pin::Pin::new(&mut *reader).poll_read(&mut cx, &mut read) {
+            std::task::Poll::Pending => return false,
+            std::task::Poll::Ready(Ok(())) if !read.filled().is_empty() => {
+                let n = read.filled().len();
+                crate::stats::TOTAL_NET_INPUT_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+                crate::stats::record_read();
+                carried.extend_from_slice(read.filled());
+                activity.touch();
+            }
+            std::task::Poll::Ready(_) => return true,
+        }
+    }
+}
+
+/// Resolves once the client has gone — closed its connection, or been
+/// killed — and never while it is there. What it sends meanwhile is kept in
+/// `carried`, to be run after what the connection is waiting on. For the
+/// waits that are not a blocking command's (which watches the same way, in
+/// `park_blocking`): `WAIT`, `WAITAOF`, a pause, which a client that has
+/// gone must not be left in, nor have its command run after it.
+async fn until_gone<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    carried: &mut Vec<u8>,
+    kill_rx: &mut crate::client_registry::KillRx,
+    activity: &crate::client_registry::Activity,
+) {
+    let mut temp = [0u8; 4096];
+    loop {
+        tokio::select! {
+            read = reader.read(&mut temp) => match read {
+                Ok(n) if n > 0 => {
+                    crate::stats::TOTAL_NET_INPUT_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+                    crate::stats::record_read();
+                    carried.extend_from_slice(&temp[..n]);
+                    activity.touch();
+                }
+                _ => return,
+            },
+            _ = &mut *kill_rx => return,
+        }
+    }
 }
 
 /// What a connection lends its parked command: the means of noticing that
@@ -741,9 +812,21 @@ where
             // Must be done here, not in execute_command, because std::thread::sleep
             // inside a tokio task blocks the worker thread and prevents UNPAUSE
             // from being processed on another connection.
+            //
+            // A client that goes while its command is held is let go, and the
+            // command is not run: as in Redis, which goes on reading a client
+            // a pause holds. A blocking pop run for it once the pause ended
+            // would take an element for nobody (#384).
             let _ran =
                 if crate::pause::PAUSE_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed) != 0 {
-                    crate::pause::gate(&cmd, &tx.queue, client_id).await
+                    tokio::select! {
+                        biased;
+                        ran = crate::pause::gate(&cmd, &tx.queue, client_id) => ran,
+                        () = until_gone(&mut reader, &mut carried, &mut kill_rx, &activity) => {
+                            quit_requested = true;
+                            break;
+                        }
+                    }
                 } else {
                     None
                 };
@@ -1971,19 +2054,33 @@ where
                                 timeout_ms
                             });
 
-                        loop {
-                            let fsynced =
-                                crate::aof::AOF_FSYNCED.load(std::sync::atomic::Ordering::Relaxed);
-                            // As Redis: 1 once the write is on disk here,
-                            // whatever `numlocal` asked for.
-                            if fsynced >= target {
-                                break b"*2\r\n:1\r\n:0\r\n".to_vec();
+                        let waited = tokio::select! {
+                            biased;
+                            reply = async {
+                                loop {
+                                    let fsynced = crate::aof::AOF_FSYNCED
+                                        .load(std::sync::atomic::Ordering::Relaxed);
+                                    // As Redis: 1 once the write is on disk here,
+                                    // whatever `numlocal` asked for.
+                                    if fsynced >= target {
+                                        break b"*2\r\n:1\r\n:0\r\n".to_vec();
+                                    }
+                                    if tokio::time::Instant::now() >= deadline {
+                                        break b"*2\r\n:0\r\n:0\r\n".to_vec();
+                                    }
+                                    // Async sleep — yields to tokio scheduler, lets AOF writer task run
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                                }
+                            } => Some(reply),
+                            () = until_gone(&mut reader, &mut carried, &mut kill_rx, &activity) => None,
+                        };
+                        match waited {
+                            Some(reply) => reply,
+                            // The client has gone: there is nobody to answer.
+                            None => {
+                                quit_requested = true;
+                                break;
                             }
-                            if tokio::time::Instant::now() >= deadline {
-                                break b"*2\r\n:0\r\n:0\r\n".to_vec();
-                            }
-                            // Async sleep — yields to tokio scheduler, lets AOF writer task run
-                            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                         }
                     }
                 }
@@ -2032,15 +2129,31 @@ where
                                     timeout_ms
                                 });
 
-                            loop {
-                                let acked = crate::replication::ReplState::count_reached(&targets);
-                                if acked >= num_replicas {
-                                    break crate::resp::write::resp_integer(acked).to_vec();
+                            let waited = tokio::select! {
+                                biased;
+                                reply = async {
+                                    loop {
+                                        let acked =
+                                            crate::replication::ReplState::count_reached(&targets);
+                                        if acked >= num_replicas {
+                                            break crate::resp::write::resp_integer(acked).to_vec();
+                                        }
+                                        if tokio::time::Instant::now() >= deadline {
+                                            break crate::resp::write::resp_integer(acked).to_vec();
+                                        }
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(1))
+                                            .await;
+                                    }
+                                } => Some(reply),
+                                () = until_gone(&mut reader, &mut carried, &mut kill_rx, &activity) => None,
+                            };
+                            match waited {
+                                Some(reply) => reply,
+                                // The client has gone: there is nobody to answer.
+                                None => {
+                                    quit_requested = true;
+                                    break;
                                 }
-                                if tokio::time::Instant::now() >= deadline {
-                                    break crate::resp::write::resp_integer(acked).to_vec();
-                                }
-                                tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                             }
                         }
                     }

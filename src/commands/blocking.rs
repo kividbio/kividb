@@ -199,6 +199,9 @@ pub struct BlockingCtl {
     pub resume: Option<Delivery>,
     /// State the handler stashed at park time, returned to it on resume.
     pub state: Option<BlockState>,
+    /// Set with `resume` when the client of the command being resumed went
+    /// while it waited: see [`client_gone`]. Only read on a resume.
+    pub gone: bool,
 }
 
 /// The connection loop's end of the parking mechanism.
@@ -210,8 +213,9 @@ pub struct BlockingCtl {
 #[derive(Default)]
 pub struct BlockingSlot {
     ctl: BlockingCtl,
-    /// Delivery waiting to be handed to the resume dispatch.
-    pending: Option<(Delivery, Option<BlockState>)>,
+    /// Delivery waiting to be handed to the resume dispatch, and whether its
+    /// client has gone.
+    pending: Option<(Delivery, Option<BlockState>, bool)>,
     /// True while the current dispatch *is* a resume. Guards against a handler
     /// that parks again after being resumed, which would spin the loop forever.
     in_resume: bool,
@@ -224,10 +228,11 @@ impl BlockingSlot {
         self.ctl.awaitable = true;
         self.ctl.parked = None;
         match self.pending.take() {
-            Some((delivery, state)) => {
+            Some((delivery, state, gone)) => {
                 self.in_resume = true;
                 self.ctl.resume = Some(delivery);
                 self.ctl.state = state;
+                self.ctl.gone = gone;
             }
             None => {
                 self.in_resume = false;
@@ -261,7 +266,14 @@ impl BlockingSlot {
 
     /// Store what the wait produced, for the resume dispatch to pick up.
     pub fn set_pending(&mut self, delivery: Delivery, state: Option<BlockState>) {
-        self.pending = Some((delivery, state));
+        self.pending = Some((delivery, state, false));
+    }
+
+    /// The client went while its command waited. The command is dispatched
+    /// once more, but only to leave the line it stood in: see
+    /// [`client_gone`].
+    pub fn set_gone(&mut self, state: Option<BlockState>) {
+        self.pending = Some((None, state, true));
     }
 }
 
@@ -360,6 +372,7 @@ pub fn wait_for_keys(
     mut attempt: impl FnMut(&mut crate::commands::ctx::Ctx, &[String]) -> Option<Vec<u8>>,
     empty: impl Fn() -> Vec<u8>,
 ) -> Vec<u8> {
+    let gone = client_gone(ctx);
     let resumed = take_resume(ctx);
     let (deadline, ticket) = match take_state(ctx) {
         Some(BlockState::Queued { deadline, ticket }) => (deadline, ticket),
@@ -368,6 +381,16 @@ pub fn wait_for_keys(
             ctx.wait_table.new_ticket(),
         ),
     };
+    if gone {
+        // Nobody is there to be given anything: out of the line, taking
+        // nothing, and the turn to the client behind, which may have been
+        // this one's.
+        for key in keys {
+            ctx.wait_table.dequeue(key, &ticket);
+            ctx.wait_table.pass_on(key, &ticket);
+        }
+        return empty();
+    }
     let timed_out = matches!(resumed, Some(None));
     // The key this client was woken for, if it was.
     let woken_for: Option<String> = match &resumed {
@@ -523,6 +546,21 @@ fn has_elements(ctx: &crate::commands::ctx::Ctx, key: &str) -> bool {
 #[inline]
 pub fn take_resume(ctx: &mut crate::commands::ctx::Ctx) -> Option<Delivery> {
     ctx.blocking.as_mut().and_then(|slot| slot.resume.take())
+}
+
+/// Whether this dispatch resumes a command whose client went while it
+/// waited — closed its connection, or was killed. Asked before
+/// [`take_resume`].
+///
+/// Such a command must take nothing: what it popped, or delivered to its
+/// consumer, would be for a client that is not there to be told, and lost
+/// (#384). It leaves the line it stood in and gives the turn to the client
+/// behind it, and the connection is then closed.
+#[inline]
+pub fn client_gone(ctx: &crate::commands::ctx::Ctx) -> bool {
+    ctx.blocking
+        .as_ref()
+        .is_some_and(|slot| slot.resume.is_some() && slot.gone)
 }
 
 /// Whether this dispatch is the one that resumes a command that waited.
