@@ -122,7 +122,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the old keys the node still has of the slot, as Redis has deleted them
   before it answers, so the slot comes back without them; inside a
   transaction those commands are refused with `TRYAGAIN` until the old keys
-  are gone. A failover leaves none: a promoted replica holds its master's
+  are gone. `redis-cli --cluster fix`, which sends `DELSLOTS` and
+  `ADDSLOTS` in a transaction, can be refused so while such a deletion
+  runs; run it again once it has ended. A failover leaves none: a promoted replica holds its master's
   keys. A replica promoted in a failover that lost some of its new slots to
   another master straight away now drops their keys, which it used to
   keep, stale.

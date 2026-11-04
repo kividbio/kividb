@@ -602,8 +602,11 @@ struct Deleted {
 #[derive(Default)]
 pub struct SlotDeletions {
     /// Held by a deletion's batch from its look to its last delete, which
-    /// lock shards, the index store and the write stream's queue meanwhile:
-    /// nothing that holds one of those takes it.
+    /// lock shards, the index store and the write stream's queue meanwhile.
+    /// Whatever gives this node a slot takes it holding `slots` or
+    /// `migrations`. So nothing that holds a shard's lock, the index
+    /// store's or the taps' may take this, nor any lock of `ClusterState`
+    /// (see there): it would wait for the batch, which waits for it.
     counts: Mutex<DeletionCounts>,
 }
 
@@ -869,12 +872,6 @@ pub fn delete_before_coming(
     let Some(&first) = deleting.first() else {
         return Ok(());
     };
-    if crate::command_gate::alone_on_this_thread() || crate::write_gate::held_by_this_thread() {
-        return Err(format!(
-            "TRYAGAIN the keys this node had of slot {first} are still being deleted; \
-             send {what} again outside a transaction, or once they are"
-        ));
-    }
     let own = match OwnDataset::now(&env.repl_state) {
         Some(own) if env.cluster.my_master_id().is_none() => own,
         _ => return Ok(()),
@@ -882,6 +879,12 @@ pub fn delete_before_coming(
     let mut run = DeleteRun::begin(&env.cluster, deleting.iter().copied(), import);
     if !run.deletes_any() {
         return Ok(());
+    }
+    if crate::command_gate::alone_on_this_thread() || crate::write_gate::held_by_this_thread() {
+        return Err(format!(
+            "TRYAGAIN the keys this node had of slot {first} are still being deleted; \
+             send {what} again outside a transaction, or once they are"
+        ));
     }
     let deleted = off_the_runtime(|| {
         delete_keys(
@@ -2651,6 +2654,57 @@ mod tests {
             lost_writes, 0,
             "writes made once the slot came back were deleted"
         );
+    }
+
+    /// A batch holds the counts while it deletes, and what gives this node
+    /// a slot waits for them holding the slot table (here `ADDSLOTS` of
+    /// another slot). A walk of the keyspace that looked each key's slot up
+    /// with the key's shard locked (`CLUSTER SLOT-STATS`) then waited for
+    /// the slot table, the batch for the walk's shard, and the giving for
+    /// the batch: for good, and the node with them (#353). The walk now
+    /// reads the slot table before it locks a shard, and all three end.
+    #[test]
+    fn a_keyspace_walk_beside_a_held_batch_and_a_slot_given_does_not_deadlock() {
+        const OTHER: u16 = 9000;
+        let lost = Lost::new();
+        lost.cluster.release_slot(OTHER).unwrap();
+        let cluster = Arc::clone(&lost.cluster);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut others = Vec::new();
+            let deleted = lost.delete_held(
+                || {
+                    let cluster = Arc::clone(&lost.cluster);
+                    others.push(std::thread::spawn(move || {
+                        cluster.claim_slot(OTHER).unwrap();
+                    }));
+                    // Until the giving holds the slot table, waiting for the
+                    // batch.
+                    let until = Instant::now() + Duration::from_secs(5);
+                    while lost.cluster.slots.try_read().is_some() && Instant::now() < until {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    let (cluster, store) = (Arc::clone(&lost.cluster), Arc::clone(&lost.store));
+                    others.push(std::thread::spawn(move || {
+                        let counts =
+                            crate::commands::cluster::key_counts_per_slot(&store[0], &cluster);
+                        assert!(!counts.contains_key(&LOST));
+                    }));
+                    // Long enough for the walk to have locked a shard.
+                    std::thread::sleep(Duration::from_millis(200));
+                },
+                || {},
+            );
+            for other in others {
+                other.join().unwrap();
+            }
+            let _ = done_tx.send(deleted.removed);
+        });
+        let removed = done_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the batch, the walk and the giving waited for each other");
+        assert_eq!(removed, OLD);
+        assert!(cluster.owns_slot(OTHER));
     }
 
     /// What gives this node a slot by a command first deletes, itself, the

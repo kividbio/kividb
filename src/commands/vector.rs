@@ -647,8 +647,18 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let mut rows: Vec<Row> = Vec::new();
     let db_ref = &ctx.store[*ctx.selected_db];
     // In a cluster, only the keys of the slots this node serves: see
-    // `cluster::search`.
-    let cluster = ctx.cluster.enabled.then_some(ctx.cluster);
+    // `cluster::search`. Read before the walk: the documents are looked at
+    // with their shard locked, and the slot table is not read then (see
+    // `ClusterState`).
+    let served = ctx
+        .cluster
+        .enabled
+        .then(|| crate::cluster::search::served_slots(ctx.cluster));
+    let not_served = |key: &str| {
+        served
+            .as_deref()
+            .is_some_and(|s| !crate::cluster::search::in_served(s, key))
+    };
     let json = matches!(def.on, crate::vector::IndexOn::Json);
     let mut add_row = |key: &str, inner: &crate::vector::Fields| {
         // ── Build row ─────────────────────────────────────────────────
@@ -695,7 +705,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
                     cut = true;
                     break;
                 }
-                if cluster.is_some_and(|c| !crate::cluster::search::serves(c, &key)) {
+                if not_served(&key) {
                     continue;
                 }
                 crate::commands::search::with_doc(db_ref, &def, &key, |inner, _| {
@@ -710,7 +720,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             if !def.covers(key) {
                 return;
             }
-            if cluster.is_some_and(|c| !crate::cluster::search::serves(c, key)) {
+            if not_served(key) {
                 return;
             }
             let Some(inner) = crate::vector::doc_fields(&def.on, &def.fields, value) else {

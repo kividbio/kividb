@@ -4334,6 +4334,51 @@ fn writes_that_lock_no_key_while_a_batch_is_held_are_kept() {
     held.assert_only(&written);
 }
 
+/// A batch of the deletion held with its keys picked, the lock of what
+/// came back held with it, while `CLUSTER SLOT-STATS` walks the keyspace
+/// and `ADDSLOTS` gives this node another slot. `SLOT-STATS` looked each
+/// key's slot up with the key's shard locked: beside a batch waiting for
+/// that shard and an `ADDSLOTS` waiting for the batch with the slot table
+/// held, the three waited for each other, and the node stopped (#353). All
+/// three end, and the node serves.
+#[test]
+fn slot_stats_and_addslots_beside_a_held_batch_end() {
+    let held = a_slot_lost_with_its_deletion_held(CHECKED);
+    let loser = &held.nodes[0];
+    let mut l = loser.conn();
+    // A slot of the loser's that no one else serves after this.
+    let other = (0..=16383u16)
+        .find(|&s| {
+            s != held.slot && l.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &s.to_string()]).int() == 0
+        })
+        .unwrap()
+        .to_string();
+    let r = l.cmd(&["CLUSTER", "DELSLOTS", &other]);
+    assert!(r.is_ok(), "{r:?}");
+    let (stats, added) = std::thread::scope(|scope| {
+        let added = scope.spawn(|| loser.conn().cmd(&["CLUSTER", "ADDSLOTS", &other]));
+        let stats = scope.spawn(|| {
+            loser
+                .conn()
+                .cmd(&["CLUSTER", "SLOT-STATS", "SLOTSRANGE", "0", "16383"])
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        held.go_on();
+        (stats.join().unwrap(), added.join().unwrap())
+    });
+    assert!(added.is_ok(), "{added:?}");
+    assert!(!stats.array().is_empty(), "{stats:?}");
+    let key = (0..)
+        .map(|i| format!("after:{i}"))
+        .find(|k| slot_of(k).to_string() == other)
+        .unwrap();
+    wait_until(
+        "the node to serve the slot it was given",
+        Duration::from_secs(20),
+        || l.cmd(&["SET", &key, "v"]).is_ok(),
+    );
+}
+
 // ── Pub/Sub ───────────────────────────────────────────────────────────────────
 
 /// A message published on one node reaches a subscriber connected to another.

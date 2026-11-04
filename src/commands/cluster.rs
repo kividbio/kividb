@@ -1301,6 +1301,16 @@ fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
                 Some(id) => id,
                 None => return resp_error("ERR Invalid node id"),
             };
+            // `command_gate::skips` lets `SETSLOT ... NODE` past the gate,
+            // for the keys `NODE` to this node may delete first. To another
+            // node it takes the gate here, as every command does: the look
+            // below for keys of the slot is then not beside a transaction
+            // or a script that writes one.
+            let _gate = if new_owner != ctx.cluster.myself() {
+                Some(crate::command_gate::enter())
+            } else {
+                None
+            };
             // Handing a slot to another node while keys from it are still here
             // strands them: clients are redirected away, and the keys sit
             // unreachable until the slot comes back. Finish the migration.
@@ -2320,7 +2330,7 @@ fn cmd_slot_stats(ctx: &mut Ctx) -> Vec<u8> {
 
     // Compute key counts per slot, only for slots we own.
     // Walk every key in the selected DB once.
-    let key_counts = compute_key_counts_per_slot(ctx);
+    let key_counts = key_counts_per_slot(&ctx.store[*ctx.selected_db], ctx.cluster);
 
     let entries: Vec<(u16, u64)> = match mode.as_str() {
         "SLOTSRANGE" => {
@@ -2433,16 +2443,24 @@ fn cmd_slot_stats(ctx: &mut Ctx) -> Vec<u8> {
 ///
 /// O(N) over all keys in the DB. For a multi-million-key DB this is slow,
 /// but SLOT-STATS is an operator command, not a hot-path one — fine for now.
-fn compute_key_counts_per_slot(ctx: &Ctx) -> std::collections::HashMap<u16, u64> {
-    use crate::cluster::key_hash_slot;
-
+///
+/// The slots this node owns are read once, before any shard is locked. It
+/// used to look each key's slot up in the slot table with the key's shard
+/// locked; with a deletion of a lost slot's keys waiting for that shard,
+/// and `ADDSLOTS` waiting for the deletion's batch with the slot table
+/// held, the three waited for each other for good, and the node with them
+/// (#353; see `ClusterState`).
+pub(crate) fn key_counts_per_slot(
+    db: &crate::store::Db,
+    cluster: &ClusterState,
+) -> std::collections::HashMap<u16, u64> {
+    let owned = cluster.owned_slots();
     let mut counts: std::collections::HashMap<u16, u64> = std::collections::HashMap::new();
-    let db = &ctx.store[*ctx.selected_db];
     for shard in db.iter() {
         let map = crate::read_lock!(shard);
         for k in map.keys() {
             let slot = key_hash_slot(k.as_bytes());
-            if ctx.cluster.owns_slot(slot) {
+            if owned[slot as usize] {
                 *counts.entry(slot).or_insert(0) += 1;
             }
         }

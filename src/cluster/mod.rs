@@ -212,6 +212,16 @@ pub struct LostDataset {
 /// `slot_deletions`. `held_writes` is held alone, or under `handoff_holds`.
 /// A temporary guard (`self.nodes.read().get(..)`) is held to the end of
 /// its statement, or of the `match` / `if let` / `for` it heads.
+///
+/// None of these is taken while a store shard's lock, the index store's or
+/// the replication taps' is held: not `nodes`, `slots`, `migrations`,
+/// `myself`, the tasks of `slot_migrations` nor `slot_deletions`. A batch of
+/// a deletion of a lost slot's keys holds `slot_deletions` while it takes
+/// those (`migration::SlotDeletions`), and whatever gives this node a slot
+/// holds `slots` or `migrations` while it takes `slot_deletions`: a thread
+/// holding a shard and waiting for `slots` closes the circle, and the node
+/// stops for good (#353). Code that walks the keyspace and needs the slot
+/// table reads it once before (`owned_slots`, `search::served_slots`).
 pub struct ClusterState {
     pub enabled: bool,
     /// This node's id. Behind a lock only so `CLUSTER RESET HARD` can replace
@@ -874,6 +884,22 @@ impl ClusterState {
             Some(owner) => owner == self.myself(),
             None => false,
         }
+    }
+
+    /// Per slot, whether this node owns it (every slot, outside a
+    /// cluster), read off the slot table at once: for a walk of the
+    /// keyspace, which must not look at the slot table while it holds a
+    /// shard (see `ClusterState`).
+    pub fn owned_slots(&self) -> Vec<bool> {
+        if !self.enabled {
+            return vec![true; CLUSTER_SLOTS];
+        }
+        let me = self.myself();
+        self.slots
+            .read()
+            .iter()
+            .map(|owner| *owner == Some(me))
+            .collect()
     }
 
     /// How many slots does this node own? Used by CLUSTER INFO.

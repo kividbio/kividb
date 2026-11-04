@@ -5,7 +5,7 @@ mod array;
 pub(crate) mod backup;
 mod bitmap;
 pub mod blocking;
-mod cluster;
+pub(crate) mod cluster;
 mod command_docs;
 mod command_docs_table;
 mod connection;
