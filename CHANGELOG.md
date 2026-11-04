@@ -29,6 +29,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`ZREM` no longer scans the whole sorted set for each member it removes.**
+  Removing a member is now O(log N) instead of O(N)
+  ([#386](https://github.com/kividbio/kividb/issues/386),
+  by [@Parikalp-Bhardwaj](https://github.com/Parikalp-Bhardwaj)).
 - **A panic in active defrag no longer stops it silently (#358, #370).**
   Active defrag runs on a thread of its own, and release builds unwind on a
   panic. Had anything in a pass panicked, that thread alone would have
