@@ -260,6 +260,36 @@ fn settle_watch(id: usize, db: usize, key: &str, next: Option<Instant>, now: Ins
     }
 }
 
+/// For a test: the watches of its store, and only those. The list is keyed
+/// by a store's address, and a store freed by another test may have had the
+/// same one: what it left watched is forgotten when this is made, and what
+/// this store leaves when this is dropped.
+#[cfg(test)]
+pub(crate) struct OwnWatches(usize);
+
+#[cfg(test)]
+impl OwnWatches {
+    pub(crate) fn of(store: &Store) -> Self {
+        let id = store_id(store);
+        forget_watches(id);
+        Self(id)
+    }
+}
+
+#[cfg(test)]
+impl Drop for OwnWatches {
+    fn drop(&mut self) {
+        forget_watches(self.0);
+    }
+}
+
+#[cfg(test)]
+fn forget_watches(id: usize) {
+    if let Some(watched) = WATCHED.lock().as_mut() {
+        watched.retain(|(store, _, _), _| *store != id);
+    }
+}
+
 /// How many hashes are being watched. For tests.
 #[cfg(test)]
 fn watched_in(store: &Store) -> usize {
@@ -388,6 +418,7 @@ mod tests {
         // the sweep did not get to the postings.
         for _ in 0..50 {
             let store = crate::store::new_store(1);
+            let _own = OwnWatches::of(&store);
             let index_store = crate::vector::new_index_store();
             let def = hash_losing_n(&store, &index_store, "f364w:", KEY);
             let beside = Rc::new(RefCell::new(None));
@@ -430,6 +461,7 @@ mod tests {
         use std::rc::Rc;
         const KEY: &str = "f364t:k";
         let store = crate::store::new_store(1);
+        let _own = OwnWatches::of(&store);
         let index_store = crate::vector::new_index_store();
         hash_losing_n(&store, &index_store, "f364t:", KEY);
         let beside = Rc::new(RefCell::new(None));
@@ -465,6 +497,7 @@ mod tests {
     #[test]
     fn due_fields_go_and_an_empty_hash_goes_with_them() {
         let store = crate::store::new_store(1);
+        let _own = OwnWatches::of(&store);
         let index_store = crate::vector::new_index_store();
         let put = |key: &str, value: KiviDBValue| {
             crate::store::get_shard(&store[0], key)

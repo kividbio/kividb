@@ -2679,6 +2679,7 @@ mod tests {
     fn a_hash_swept_while_a_query_reads_the_postings_is_still_tried() {
         use crate::types::HashInner;
         let store = crate::store::new_store(1);
+        let _own = crate::field_expiry::OwnWatches::of(&store);
         let index_store = crate::vector::new_index_store();
         let def = IndexSchema {
             name: "i347".into(),
