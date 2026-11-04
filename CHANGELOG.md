@@ -63,6 +63,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   one rule: a field within 5 ms of its time may be missing on either side.
 - **`SCRIPT HELP` lists the `SCRIPT` subcommands, as in Redis.** It was an
   unknown subcommand (#256).
+- **A restarted cluster node gives its own address at once (#307).** With
+  no `cluster-announce-ip` and a wildcard `bind`, a node started again from
+  a `127.0.0.1` guess, whatever address its `nodes.conf` had for it. Until
+  it next reached a peer, about a second, its `CLUSTER SLOTS`, `SHARDS` and
+  `NODES` gave `127.0.0.1` for itself. It also saved that over the address
+  it had learnt. It now starts from the address in `nodes.conf`, as Redis
+  and Valkey do, and still takes the one it is next reached on. The `?`
+  for a node's hostname right after its restart is as in Redis and Valkey:
+  a node announces the `cluster-announce-hostname` of its configuration,
+  so one set only with `CONFIG SET` is not announced again until it is set
+  again.
 
 ### Fixed
 
