@@ -29,6 +29,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A panic in active defrag no longer stops it silently (#358).** Active
+  defrag runs on a thread of its own, and release builds unwind on a panic.
+  Had anything in a pass panicked, that thread alone would have ended: the
+  server went on, `active_defrag_running` stayed 1, the slabs the pass was
+  emptying were never used again for new values, and nothing was compacted
+  until a restart. Each pass now runs inside `catch_unwind`. A panic is
+  logged at `ERROR` with its message, the slabs the pass was emptying are
+  put back in use, and the next pass comes after 1 second, then 2, 4 and
+  8. Every value stays where its key points: a value being copied keeps
+  its old place, and the copy is freed (#356). After 5 passes in a row
+  panic, with none ending between them, active defrag turns itself off,
+  with one `ERROR` line saying that `CONFIG SET activedefrag yes` turns it
+  back on; `CONFIG GET activedefrag` then says `no`. Two new fields in
+  `INFO memory`: `active_defrag_panics`, the passes that panicked, and
+  `active_defrag_disabled_by_panics`, 1 while active defrag is off because
+  of them. Nothing changes for a pass that does not panic. Release builds
+  still unwind.
 - **A restart with the AOF on after a save with it off applied writes
   twice (#354).** A save with the AOF off (`SAVE`, `BGSAVE`, the save at
   `SHUTDOWN`) wrote a new `dump.kdb` but left `dump.kdb.gen`, its save

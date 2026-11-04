@@ -206,6 +206,9 @@ fn values_move_off_half_empty_slabs_and_read_back() {
         thread::sleep(Duration::from_millis(250));
     }
     assert!(c.info("active_defrag_hits") > 0);
+    // No pass panicked (#358): the fields are there, and at 0.
+    assert_eq!(c.info("active_defrag_panics"), 0);
+    assert_eq!(c.info("active_defrag_disabled_by_panics"), 0);
 
     // Every value that stayed reads back, and none that went does.
     for i in (0..n).step_by(7) {

@@ -1425,9 +1425,9 @@ mod tests {
     /// the moved key is then let go of as `then` says.
     fn relocation_unwinds_at(point: u8, ttl: bool, then: Then) {
         use crate::value_slab;
-        // These share their slab class: one at a time.
-        static ONE_AT_A_TIME: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-        let _one = ONE_AT_A_TIME.lock();
+        // These share their slab class, and a pass of compaction's tests
+        // would empty their slab: one at a time.
+        let _one = value_slab::EVACUATION_TESTS.lock();
         let key = |i: usize| format!("{i:0>3000}");
         let expires = ttl.then_some(u64::MAX / 2);
         // Made on a thread that ends, so that its slabs are nobody's.
