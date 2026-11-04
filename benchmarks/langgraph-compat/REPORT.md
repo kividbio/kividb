@@ -123,5 +123,7 @@ python langgraph_kividb_compat.py --url redis://127.0.0.1:6399 --label redis8
 ```
 
 Run it on a throwaway machine, not a laptop: it creates and drops indexes with random names. It removes
-everything it created, including the indexes the library makes (found by comparing `FT._LIST` before and
-after), and leaves nothing behind.
+everything it created, including the indexes the library makes. The library names each index after the
+prefix it is given, and the harness always gives it one of its random prefixes, so it drops only the
+indexes that appeared during the run and have such a name, and leaves alone an index another client made
+meanwhile. On a server nothing else is using, it leaves nothing behind.
