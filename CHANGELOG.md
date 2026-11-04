@@ -212,6 +212,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the configuration file; an empty list is still allowed. Hexadecimal (`0x10`)
   and exponent (`1e1`) forms are read as Redis reads them, and `CONFIG GET`
   gives the numbers back as Redis writes them (`0x10 1e1` reads back as `16 10`).
+- **`FT.AGGREGATE` could count a document its filter no longer matched
+  (#347).** A hash field with a time to live, dropped by a read once past
+  its time (`HGETALL`), stays in the TAG and NUMERIC postings until the
+  field-expiry sweep brings them up to date, and until then a query tries
+  that document itself. A sweep that ran while a query was reading the
+  postings queued its update behind the query, and stopped watching the
+  hash before the query looked at which hashes were watched: the query took
+  the postings' word for the document. `FT.AGGREGATE` counted it, and so
+  could `FT.SEARCH` where it answers from the postings without reading the
+  documents (`LIMIT 0 0`). A query now reads which hashes are watched
+  before it reads the postings.
 
 ## [1.2.0] - 2026-11-03
 
