@@ -723,3 +723,61 @@ pub fn regions() -> usize {
 pub fn generation_of(block: *const u8) -> u32 {
     slab_of(block).generation.load(Ordering::Relaxed)
 }
+
+/// For tests: empty only the slab `block` is in, as [`plan_evacuation`]
+/// would, until the guard is dropped, panic or not. No other slab changes,
+/// and [`finish_evacuation`] does not see it. `None` unless nobody owns the
+/// slab and it has room.
+///
+/// `block` is live, so its slab's class is the one it was given in.
+#[cfg(test)]
+pub(crate) fn evacuate_only(block: *const u8) -> Option<OnlyEvacuating> {
+    let slab = slab_of(block);
+    let class = slab.class.load(Ordering::Relaxed) as usize;
+    let mut list = PARTIAL_SLABS[class].lock();
+    if slab.state.load(Ordering::Relaxed) != PARTIAL {
+        return None;
+    }
+    unlist(&mut list, slab);
+    slab.state.store(EVACUATING, Ordering::Relaxed);
+    Some(OnlyEvacuating {
+        slab: SlabPtr(slab),
+        class,
+        generation: slab.generation.load(Ordering::Relaxed),
+    })
+}
+
+/// The slab [`evacuate_only`] chose; dropped, it is put back as
+/// [`finish_evacuation`] puts back its own.
+#[cfg(test)]
+pub(crate) struct OnlyEvacuating {
+    slab: SlabPtr,
+    class: usize,
+    generation: u32,
+}
+
+#[cfg(test)]
+impl OnlyEvacuating {
+    /// The blocks the slab holds: nobody owns it, so none is uncounted.
+    pub(crate) fn live(&self) -> usize {
+        // SAFETY: a header lives as long as the process.
+        let s = unsafe { &*self.slab.0 };
+        s.live.load(Ordering::SeqCst).max(0) as usize
+    }
+}
+
+#[cfg(test)]
+impl Drop for OnlyEvacuating {
+    fn drop(&mut self) {
+        // SAFETY: a header lives as long as the process.
+        let s = unsafe { &*self.slab.0 };
+        let list = PARTIAL_SLABS[self.class].lock();
+        if s.generation.load(Ordering::Relaxed) != self.generation
+            || s.state.load(Ordering::Relaxed) != EVACUATING
+        {
+            return;
+        }
+        s.state.store(FULL, Ordering::Relaxed);
+        settle(list, s, self.class);
+    }
+}
