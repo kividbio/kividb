@@ -85,6 +85,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   checkpoint has finished restarts from the `dump.kdb` saved before the
   sync, plus what was logged after the enable: the replica then syncs again
   from its master.
+- **A stopped turn-over's old log was deleted after a save with the AOF
+  off (#368).** A run with the AOF on killed while turning the log over
+  leaves `appendonly.aof.prev`, with the writes since the last save, and
+  the new log under a name of its own. A run with the AOF off then saved,
+  and the save took the new log's save number, which it did not count.
+  The next start with the AOF on put the new log in place, read the old
+  log as that of a checkpoint that finished, and deleted it: those
+  acknowledged writes were gone. The save number now counts the new log,
+  so the old log reads as older than the dump and is kept aside. An old
+  log removed as a finished checkpoint's beside a save with the AOF off is
+  kept aside first, and a turn-over's new log is removed only if it holds
+  nothing but its header. A log with records made after a save that had no
+  log is replayed whatever its header's number, rather than left out as
+  older.
 - **Follow-ups to the two fixes above (#359).** A save with the AOF off
   now also records how long `appendonly.aof` and `appendonly.aof.prev` were,
   with a hash of their first and last bytes. A log beside that dump that
