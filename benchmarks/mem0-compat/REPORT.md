@@ -92,7 +92,8 @@ sent, on Redis 8 as well.
   That needs a model, so it is not here. What the server sees (the same inserts, searches and updates) is
   covered.
 - **Scale is not tested.** A handful of memories, and no timing or recall figures.
-- **Not covered:** Mem0's other storage (graph stores), Redis Cluster, and the TypeScript SDK.
+- **Not covered:** Mem0's other storage (graph stores) and Redis Cluster. The TypeScript SDK has its own
+  harness in [`../mem0-ts-compat/`](../mem0-ts-compat/).
 
 ## Left out on purpose
 
