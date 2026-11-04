@@ -42,9 +42,18 @@ other files:
 - LlamaIndex's Redis vector store, document store, index store and key-value store:
   [benchmarks/llamaindex-compat/REPORT.md](../benchmarks/llamaindex-compat/REPORT.md) and
   [docs/integrations/llamaindex.md](integrations/llamaindex.md).
-- Mem0's Redis vector store and the `Memory` API on top of it:
-  [benchmarks/mem0-compat/REPORT.md](../benchmarks/mem0-compat/REPORT.md) and
+- Mem0's Redis vector store and the `Memory` API on top of it, in the Python SDK and the TypeScript SDK
+  (whose Valkey store works too):
+  [benchmarks/mem0-compat/REPORT.md](../benchmarks/mem0-compat/REPORT.md),
+  [benchmarks/mem0-ts-compat/](../benchmarks/mem0-ts-compat/) and
   [docs/integrations/mem0.md](integrations/mem0.md).
+- claude-mem's server job queue (BullMQ; the `lua` build): its own Docker E2E, and enqueue, retry,
+  failure, cancel and restarts with real workers: [benchmarks/claude-mem-compat/](../benchmarks/claude-mem-compat/)
+  and [docs/integrations/claude-mem.md](integrations/claude-mem.md).
+- OpenViking's Redis parts (the `lua` build): its RAGFS cache runtime and PathLock tests, its gateway suite
+  (standalone and cluster), and its expiry scheduler:
+  [benchmarks/openviking-compat/](../benchmarks/openviking-compat/) and
+  [docs/integrations/openviking.md](integrations/openviking.md).
 - `redis-py` throughout the end-to-end tests (`tests/e2e/`).
 
 ## Differences you may notice

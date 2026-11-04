@@ -1,0 +1,77 @@
+{
+  "label": "redis8",
+  "server": "redis_version:8.10.3",
+  "openviking": "v0.5.3",
+  "suites": {
+    "ragfs cargo test (REDIS_URL, cluster and password tests on)": {
+      "passed": 586,
+      "failed": 1,
+      "ignored": 3,
+      "not_passed": [
+        "core::mountable::tests::shutdown_reaches_cache_queuefs_through_stats_wrapper"
+      ]
+    },
+    "gateway pytest tests/gateway (standalone + 3-node cluster, ACL user)": {
+      "passed": 1197,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "not_passed": []
+    },
+    "pathlock migration pytest (REDIS_URL)": {
+      "passed": 9,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "not_passed": []
+    }
+  },
+  "expiry_scheduler": {
+    "counts": {
+      "PASS": 8,
+      "FAIL": 0
+    },
+    "checks": [
+      {
+        "check": "two runtimes start on one service name (storage, publisher, consumer)",
+        "status": "PASS",
+        "detail": "7 keys"
+      },
+      {
+        "check": "report 12 items due in 1 s, then unregister one of them",
+        "status": "PASS",
+        "detail": ""
+      },
+      {
+        "check": "every item falls due and is called back exactly once, across the two runtimes",
+        "status": "PASS",
+        "detail": "runtime a: 5 calls, runtime b: 7 calls"
+      },
+      {
+        "check": "a callback that answers RETRY is called again, then completes",
+        "status": "PASS",
+        "detail": ""
+      },
+      {
+        "check": "an unregistered item is never called back",
+        "status": "PASS",
+        "detail": ""
+      },
+      {
+        "check": "both runtimes stop cleanly",
+        "status": "PASS",
+        "detail": ""
+      },
+      {
+        "check": "a runtime reports 3 items and stops before they fall due",
+        "status": "PASS",
+        "detail": ""
+      },
+      {
+        "check": "a new runtime calls back the items the stopped one left",
+        "status": "PASS",
+        "detail": ""
+      }
+    ]
+  }
+}

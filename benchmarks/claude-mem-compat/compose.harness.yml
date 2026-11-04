@@ -1,0 +1,24 @@
+# Used by claude_mem_queue_compat.mjs only, on top of claude-mem's docker-compose.yml and
+# one of compose.kividb.yml / compose.redis8.yml / compose.valkey.yml.
+#
+# 1. The generation worker loads the stub provider (stub-provider.mjs) through claude-mem's
+#    custom-provider setting, so jobs are really generated, retried and failed without a
+#    model or an API key.
+#
+# 2. Both services get the same BullMQ key prefix. In claude-mem v15.9.0's docker-compose.yml
+#    they do not: the prefix defaults to claude_mem_<CLAUDE_MEM_WORKER_PORT>, which the server
+#    service sets (37877) and the worker service does not, so the worker falls back to
+#    claude_mem_37700 and never sees the jobs the server enqueues under claude_mem_37877. That
+#    happens with any server, the stock Valkey included (see REPORT.md); the harness sets the
+#    prefix so the queue can be tested at all.
+services:
+  claude-mem-server:
+    environment:
+      CLAUDE_MEM_QUEUE_REDIS_PREFIX: claude_mem
+  claude-mem-worker:
+    environment:
+      CLAUDE_MEM_QUEUE_REDIS_PREFIX: claude_mem
+      CLAUDE_MEM_SERVER_PROVIDER: custom
+      CLAUDE_MEM_CUSTOM_PROVIDER_MODULE: /stub/stub-provider.mjs
+    volumes:
+      - ${STUB_PROVIDER:?set STUB_PROVIDER to the absolute path of stub-provider.mjs}:/stub/stub-provider.mjs:ro

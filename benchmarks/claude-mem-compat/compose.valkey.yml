@@ -1,0 +1,7 @@
+# claude-mem's own Valkey (valkey/valkey:8-alpine, as its docker-compose.yml has it), with
+# only the port published so the harness can read it. A third column for the report: the
+# server claude-mem ships with.
+services:
+  valkey:
+    ports:
+      - "127.0.0.1:6399:6379"
