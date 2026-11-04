@@ -1,0 +1,130 @@
+{
+  "label": "kividb-lua",
+  "url": "redis://127.0.0.1:6381",
+  "redis_version": "8.10.0",
+  "omniroute": "3.8.52",
+  "ioredis": "5.11.1",
+  "node": "v22.23.4",
+  "counts": {
+    "PASS": 18,
+    "WARN": 1,
+    "FAIL": 0
+  },
+  "checks": [
+    {
+      "check": "connection: PING",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "rate limiter: 3 requests allowed, the 4th refused with its window and reset time",
+      "status": "PASS",
+      "detail": "",
+      "ms": 4
+    },
+    {
+      "check": "rate limiter: the counter is on the server (the Lua script ran there)",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "rate limiter: another process sharing the server is refused too (shared limit)",
+      "status": "PASS",
+      "detail": "",
+      "ms": 183
+    },
+    {
+      "check": "rate limiter: two rules; the tighter one refuses, and a refusal does not count",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "API key policy: a key limited to 2 a minute gets 429 rate_limit_exceeded on the 3rd",
+      "status": "PASS",
+      "detail": "",
+      "ms": 25
+    },
+    {
+      "check": "auth cache: a validated key is cached on the server for an hour",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "auth cache: revoking the key removes its cache entry",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2
+    },
+    {
+      "check": "chat: /v1/chat/completions through the gateway to a stub upstream; 3rd request is 429",
+      "status": "PASS",
+      "detail": "",
+      "ms": 843
+    },
+    {
+      "check": "quota store: consume adds the cost (INCRBYFLOAT) and peek reads it back",
+      "status": "PASS",
+      "detail": "",
+      "ms": 4
+    },
+    {
+      "check": "quota store: INCRBYFLOAT 0.1 + 0.2 is stored as 0.3, as Redis formats it",
+      "status": "WARN",
+      "detail": "Error: stored 0.30000000000000004",
+      "ms": 1
+    },
+    {
+      "check": "quota store: clear",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "circuit breaker: with REDIS_URL set, OmniRoute picks the Redis store",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "circuit breaker: failures raise the streak and back off (HSET, HGETALL, EXPIRE)",
+      "status": "PASS",
+      "detail": "",
+      "ms": 3
+    },
+    {
+      "check": "circuit breaker: a success resets it",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "circuit breaker: forbidden is kept without a TTL (PERSIST)",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "semantic cache: set stores entries with a TTL; get and getByHash read them",
+      "status": "PASS",
+      "detail": "",
+      "ms": 4
+    },
+    {
+      "check": "semantic cache: nearest search, by model, by API key and above a threshold",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "semantic cache: delete, deleteByModel and clear",
+      "status": "PASS",
+      "detail": "",
+      "ms": 3
+    }
+  ],
+  "omniroute_logged": []
+}
