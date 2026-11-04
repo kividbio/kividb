@@ -98,7 +98,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   kept aside first, and a turn-over's new log is removed only if it holds
   nothing but its header. A log with records made after a save that had no
   log is replayed whatever its header's number, rather than left out as
-  older.
+  older. An old log that the snapshot holds and that cannot be removed is
+  left in place with a warning; only one that has to be kept aside first,
+  and cannot be, stops the server, saying what to do.
 - **Follow-ups to the two fixes above (#359).** A save with the AOF off
   now also records how long `appendonly.aof` and `appendonly.aof.prev` were,
   with a hash of their first and last bytes. A log beside that dump that
