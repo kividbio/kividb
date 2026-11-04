@@ -1513,12 +1513,13 @@ fn save_dataset_with(
         let generation = crate::aof::next_generation();
         if let Err(e) = frozen
             .write_file(&tmp)
-            .and_then(|()| crate::aof::install_dump(&tmp, generation))
+            .and_then(|()| crate::aof::install_dump(&tmp, generation, true))
         {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
-        // The log beside it is older now (#350, #354).
+        // The open log no longer goes on from it (#350); none on disk goes
+        // with it (#354).
         crate::aof::dump_saved_without_log();
         // As the writer this replaced said it: operators and tests look for it.
         let shown = std::env::current_dir()

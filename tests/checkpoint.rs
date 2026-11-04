@@ -1306,3 +1306,197 @@ fn a_crash_while_a_new_log_replaces_the_old_ones_starts_and_replays_nothing_old(
         }
     }
 }
+
+// ── Logs left out are kept aside, never destroyed ────────────────────────────
+
+/// The logs kept aside in `dir` (`superseded.*`), with what is in them.
+fn kept_aside(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut kept: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.starts_with("superseded.")
+                .then(|| (name, std::fs::read(entry.path()).unwrap()))
+        })
+        .collect();
+    kept.sort();
+    kept
+}
+
+fn holds(bytes: &[u8], what: &[u8]) -> bool {
+    bytes.windows(what.len()).any(|w| w == what)
+}
+
+/// `SET <key> <value>` as the log holds it.
+fn set_record(key: &str, value: &str) -> Vec<u8> {
+    format!(
+        "*3\r\n$3\r\nSET\r\n${}\r\n{key}\r\n${}\r\n{value}\r\n",
+        key.len(),
+        value.len()
+    )
+    .into_bytes()
+}
+
+/// A run with the AOF on (a key in its dump, one in its log), then a save
+/// with the AOF off on a newer dump: what 1.2.0 left, given back as 1.2.0
+/// left it (the save number of the older dump, the log of the older run).
+/// Returns the log and the save number as they were before the save.
+fn a_dump_saved_by_1_2_0_with_the_aof_off(server: &mut Server) -> (Vec<u8>, Vec<u8>) {
+    let mut c = server.conn();
+    assert!(c.cmd(&["SET", "in-dump", "1"]).ok());
+    assert!(c.cmd(&["SAVE"]).ok());
+    assert!(c.cmd(&["SET", "in-log", "1"]).ok());
+    durable(&mut c);
+    drop(c);
+    server.kill();
+    let log = std::fs::read(server.dir.join("appendonly.aof")).unwrap();
+    let saved = std::fs::read(server.dir.join("dump.kdb.gen")).unwrap();
+    assert!(log.starts_with(b"KIVIDLT1"));
+
+    server.aof = false;
+    let mut c = server.restart();
+    assert!(c.cmd(&["SET", "newer", "1"]).ok());
+    assert!(c.cmd(&["SAVE"]).ok());
+    drop(c);
+    server.kill();
+    std::fs::write(server.dir.join("dump.kdb.gen"), &saved).unwrap();
+    (log, saved)
+}
+
+/// 1.2.0, after a save with the AOF off, was started with the AOF on: it
+/// replayed the old log over the newer dump, and went on adding to it,
+/// acknowledged writes, until it was killed. The files look like those of
+/// the save alone, and recovery leaves the log out; it was overwritten, and
+/// the writes made after the restart were gone. It is kept aside, whole.
+#[test]
+fn a_log_left_out_after_a_restart_on_1_2_0_is_kept_aside_with_its_writes() {
+    for &io in io_models() {
+        let mut server = Server::start(io, "");
+        let (mut log, _) = a_dump_saved_by_1_2_0_with_the_aof_off(&mut server);
+        log.extend_from_slice(&set_record("acked-after-restart", "1"));
+        std::fs::write(server.dir.join("appendonly.aof"), &log).unwrap();
+
+        server.aof = true;
+        let mut c = server.restart();
+        assert_eq!(c.cmd(&["GET", "newer"]).s(), "1", "{io}");
+        let kept = kept_aside(&server.dir);
+        assert!(
+            kept.iter()
+                .any(|(_, bytes)| holds(bytes, b"acked-after-restart")),
+            "{io}: the log left out was not kept: {:?}",
+            kept.iter().map(|(name, _)| name).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// 1.2.0 crashed during the checkpoint of a `CONFIG SET appendonly yes`,
+/// after a save with the AOF off: the old log, with the writes made after
+/// the enable at its end, and a new one. Recovery leaves both out; the old
+/// one was removed, and those writes with it. It is kept aside.
+#[test]
+fn an_old_log_left_out_after_a_1_2_0_enable_crashed_is_kept_aside_with_its_writes() {
+    for &io in io_models() {
+        let mut server = Server::start(io, "");
+        let (mut log, saved) = a_dump_saved_by_1_2_0_with_the_aof_off(&mut server);
+        log.extend_from_slice(&set_record("acked-after-enable", "1"));
+        std::fs::write(server.dir.join("appendonly.aof.prev"), &log).unwrap();
+        let number = u64::from_le_bytes(saved[0..8].try_into().unwrap());
+        std::fs::write(server.dir.join("appendonly.aof"), delta_header(number + 1)).unwrap();
+
+        server.aof = true;
+        let mut c = server.restart();
+        assert_eq!(c.cmd(&["GET", "newer"]).s(), "1", "{io}");
+        let kept = kept_aside(&server.dir);
+        assert!(
+            kept.iter()
+                .any(|(_, bytes)| holds(bytes, b"acked-after-enable")),
+            "{io}: the old log left out was not kept: {:?}",
+            kept.iter().map(|(name, _)| name).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// A run with the AOF on, killed: an acknowledged write is in its log and
+/// nowhere else. Started again with `appendonly no`, a `SAVE` or `SHUTDOWN`
+/// emptied that log. With the AOF off the AOF's files are left alone, as in
+/// 1.2.0 and Redis; a start with the AOF on then leaves the log out, as older
+/// than the dump, and keeps it aside, and says so at every start.
+#[test]
+fn a_save_with_the_aof_off_leaves_the_log_alone() {
+    for &io in io_models() {
+        for end in ["SAVE", "SHUTDOWN"] {
+            let mut server = Server::start(io, "");
+            let mut c = server.conn();
+            assert!(c.cmd(&["SET", "acked-in-run-1", "1"]).ok());
+            durable(&mut c);
+            drop(c);
+            server.kill();
+            let log = std::fs::read(server.dir.join("appendonly.aof")).unwrap();
+
+            server.aof = false;
+            let mut c = server.restart();
+            assert!(c.cmd(&["SET", "run-2", "1"]).ok());
+            if end == "SHUTDOWN" {
+                send(&mut c, &["SHUTDOWN"]);
+                drop(c);
+                server.wait_exit();
+            } else {
+                assert!(c.cmd(&["SAVE"]).ok());
+                drop(c);
+                server.kill();
+            }
+            assert_eq!(
+                std::fs::read(server.dir.join("appendonly.aof")).unwrap(),
+                log,
+                "{io}, {end}: a save with the AOF off changed the log"
+            );
+
+            server.aof = true;
+            let mut c = server.restart();
+            assert_eq!(c.cmd(&["GET", "run-2"]).s(), "1", "{io}, {end}");
+            assert_eq!(
+                c.cmd(&["GET", "acked-in-run-1"]),
+                V::Nil,
+                "{io}, {end}: the older log was replayed over the dump"
+            );
+            let kept = kept_aside(&server.dir);
+            assert!(
+                kept.iter()
+                    .any(|(_, bytes)| holds(bytes, b"acked-in-run-1")),
+                "{io}, {end}: the log left out was not kept"
+            );
+            drop(c);
+            server.kill();
+            let _ = server.restart();
+            let said = std::fs::read_to_string(server.dir.join("server.log")).unwrap();
+            assert!(
+                said.matches(kept[0].0.as_str()).count() >= 2,
+                "{io}, {end}: the next start did not name the kept log"
+            );
+        }
+    }
+}
+
+/// A log made at a start with the AOF on had no header: a log of an age no
+/// recovery could tell, replayed over any dump saved after it.
+#[test]
+fn a_log_made_at_a_start_with_the_aof_on_has_a_header() {
+    for &io in io_models() {
+        let mut server = Server::start(io, "");
+        let log = std::fs::read(server.dir.join("appendonly.aof")).unwrap();
+        assert!(
+            log.starts_with(b"KIVIDLT1"),
+            "{io}: a new log with no header: {log:?}"
+        );
+        // And an empty one is given one too.
+        server.kill();
+        std::fs::write(server.dir.join("appendonly.aof"), b"").unwrap();
+        let _ = server.restart();
+        let log = std::fs::read(server.dir.join("appendonly.aof")).unwrap();
+        assert!(
+            log.starts_with(b"KIVIDLT1"),
+            "{io}: an empty log was opened as it was"
+        );
+    }
+}

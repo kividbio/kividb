@@ -36,13 +36,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and a start with `appendonly yes` replayed it over the newer data: an
   `INCR` made with the AOF on was applied a second time, and values changed
   or keys deleted with the AOF off came back. No crash was needed. A save
-  with the AOF off now gives its dump a save number of its own, and starts
-  an existing `appendonly.aof` again, empty, on it. Recovery replays a log
-  only over the dump it goes on from, by the dump's fingerprint as well as
-  the number. A data directory left this way by 1.2.0 is recognised: the old
-  log is not replayed, the dump that was loaded is given a save number, and
-  the log starts again on it. A log with no header (one that never went
-  through a checkpoint) cannot be told apart, and is replayed as before.
+  with the AOF off now gives its dump a save number of its own, past every
+  log's, and marks it as one no log goes with; it still leaves the AOF's
+  files alone. Recovery replays a log only over the dump it goes on from, by
+  the dump's fingerprint as well as the number. A data directory left this
+  way by 1.2.0 is recognised: the old log is not replayed, the dump that was
+  loaded is given a save number, and the log starts again on it. A log that
+  is not replayed is never deleted: it is kept aside in `dir`, as
+  `superseded.<time>.<n>.appendonly.aof` (or `.appendonly.aof.prev`), with a
+  warning that says how to apply its writes, and every start lists the ones
+  still there. The server never removes them. A new log made at a start
+  with the AOF on now has a header, so its age is always known; a log with
+  no header, made by 1.2.0, beside a dump saved by 1.2.0 with the AOF off
+  cannot be told apart, and is replayed as before.
 - **The AOF turned on at runtime starts a new log (#350).** `CONFIG SET
   appendonly yes` appended to whatever `appendonly.aof` was there: one left
   by an earlier run with the AOF on, or the one kept through `appendonly no`
@@ -51,8 +57,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `appendonly.aof.prev` until its snapshot was on disk, and a crash in
   between replayed those old writes on the next start: overwritten values,
   and keys deleted since, could come back. The log now starts empty,
-  written in full under another name before it takes the log's, and old
-  logs left beside it are removed after that. A log kept open through
+  written in full under another name before it takes the log's. The old
+  logs are kept aside first, never deleted, as above. A log kept open through
   `appendonly no` is still kept when nothing has moved on without it, so a
   crash during the enable does not lose what was written while the AOF was
   on. A `CONFIG SET appendonly no` that comes while the AOF is being turned
