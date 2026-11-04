@@ -69,6 +69,12 @@ other files:
 - RAGFlow's self-hosted stack (the stream task queue, cache and locks; the `lua` build), end to end:
   [benchmarks/ragflow-compat/](../benchmarks/ragflow-compat/) and
   [docs/integrations/ragflow.md](integrations/ragflow.md).
+- n8n's queue mode (Bull; the `lua` build) end to end, with worker and server restarts, and n8n's own
+  Redis tests: [benchmarks/n8n-compat/](../benchmarks/n8n-compat/) and
+  [docs/integrations/n8n.md](integrations/n8n.md).
+- Self-hosted Firecrawl (BullMQ, crawl state, rate limits; the `lua` build) with its own test suite and
+  its docker compose: [benchmarks/firecrawl-compat/](../benchmarks/firecrawl-compat/) and
+  [docs/integrations/firecrawl.md](integrations/firecrawl.md).
 - `redis-py` throughout the end-to-end tests (`tests/e2e/`).
 
 ## Differences you may notice
