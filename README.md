@@ -1,7 +1,5 @@
-# KiviDB
-
 <p align="center">
-  <img src="assets/kiwi.png" alt="KiviDB" width="180">
+  <a href="https://kividb.io"><img src="assets/banner.svg" alt="KiviDB: the in-memory database for AI and real-time apps. Redis-compatible, vector search built in." width="100%"></a>
 </p>
 
 <p align="center">
