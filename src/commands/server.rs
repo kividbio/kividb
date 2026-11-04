@@ -1118,18 +1118,24 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                 )),
             },
             // The most members a set of integers keeps as an array (#297).
-            "set-max-intset-entries" => match value.parse::<i64>() {
-                Ok(limit) if limit >= 0 => {
+            // Read as Redis reads a number (`string2ll`): no `+`, no
+            // leading zero.
+            "set-max-intset-entries" => match crate::member_set::canonical_i64(value.as_bytes()) {
+                Some(limit) if limit >= 0 => {
                     crate::member_set::set_intset_max(limit as usize);
                     REMEMBERED_CONFIG
                         .lock()
                         .insert(param.clone(), limit.to_string());
                     Some(resp_simple("OK"))
                 }
-                _ => Some(resp_error(
+                Some(_) => Some(resp_error(
                     "ERR CONFIG SET failed (possibly related to argument \
                      'set-max-intset-entries') - argument must be between 0 and \
                      9223372036854775807 inclusive",
+                )),
+                None => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument \
+                     'set-max-intset-entries') - argument couldn't be parsed into an integer",
                 )),
             },
             // What the latency monitor records (#158): remembered too, for

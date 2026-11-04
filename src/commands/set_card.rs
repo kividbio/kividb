@@ -98,7 +98,7 @@ fn union_card(sets: &[Option<Set>], limit: usize) -> usize {
     let mut seen: crate::member_set::MemberSet = crate::member_set::MemberSet::new();
     for set in sets {
         for member in set.read().iter() {
-            if seen.insert(member.to_shared()) && limit > 0 && seen.len() >= limit {
+            if seen.insert_bytes(&member) && limit > 0 && seen.len() >= limit {
                 return limit;
             }
         }

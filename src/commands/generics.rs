@@ -39,13 +39,12 @@ pub(crate) fn scans_whole(value: ValueRef<'_>) -> bool {
 
 /// The encoding Redis, at its default limits, would give a set of these members.
 fn set_encoding_by_members(set: &crate::member_set::MemberSet) -> &'static str {
-    let integers = set.iter().all(|member| {
-        std::str::from_utf8(&member)
-            .ok()
-            .and_then(|text| text.parse::<i64>().ok())
-            .is_some_and(|n| n.to_string().as_bytes() == &member[..])
-    });
-    if integers && set.len() <= 512 {
+    // The length first: a big set is never walked.
+    if set.len() <= 512
+        && set
+            .iter()
+            .all(|member| crate::member_set::canonical_i64(&member).is_some())
+    {
         "intset"
     } else {
         table_set_encoding(set)

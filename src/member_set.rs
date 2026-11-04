@@ -35,6 +35,11 @@ pub const DEFAULT_INTSET_MAX: usize = 64;
 
 /// The most members a set of integers keeps as an array (#297), as
 /// `set-max-intset-entries` says. 0: no arrays.
+///
+/// Each new member moves those after it and grows the array by one, so an
+/// add costs time in proportion to the length, and loading an n-member set
+/// n^2: a large limit (a redis.conf carried over says 512) makes adds and
+/// loads slower for sets near it.
 static INTSET_MAX: AtomicUsize = AtomicUsize::new(DEFAULT_INTSET_MAX);
 
 #[inline]
@@ -44,8 +49,10 @@ pub fn intset_max() -> usize {
 
 /// Takes effect at a set's next new member. An array already longer stays
 /// one until then, and a table never turns back.
+///
+/// No more than 2^30 has effect, as in Redis (`intsetMaxEntries`).
 pub fn set_intset_max(limit: usize) {
-    INTSET_MAX.store(limit, Ordering::Relaxed);
+    INTSET_MAX.store(limit.min(1 << 30), Ordering::Relaxed);
 }
 
 /// The `i64` whose text `bytes` is, written as it would be written: the only
@@ -184,6 +191,10 @@ pub struct MemberSet {
     repr: Repr,
 }
 
+// Kept inline in every set's shared block: no bigger than the table alone
+// was, so that sets kept as the table do not grow.
+const _: () = assert!(std::mem::size_of::<MemberSet>() <= 64);
+
 #[derive(Clone)]
 enum Repr {
     Ints(Ints),
@@ -228,6 +239,15 @@ impl MemberSet {
     /// Whether the members are kept as an array of integers.
     pub fn is_compact(&self) -> bool {
         matches!(self.repr, Repr::Ints(_))
+    }
+
+    /// Where the array's members are; `None` for the table.
+    #[cfg(test)]
+    pub(crate) fn array_ptr(&self) -> Option<*const u8> {
+        match &self.repr {
+            Repr::Ints(ints) => Some(each_width!(ints, v => v.as_ptr().cast())),
+            Repr::Table(_) => None,
+        }
     }
 
     /// What the array has allocated, room to spare included; `None` for the

@@ -10,7 +10,7 @@ const DEFAULT: usize = kividb::member_set::DEFAULT_INTSET_MAX;
 const LIMITS: [usize; 6] = [0, 64, 128, 256, 512, 1000];
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -22,12 +22,33 @@ fn kividb_bin() -> String {
     })
 }
 
+/// Whether nothing has `port`, asked with a socket that is bound and never
+/// listens (as `tests/commands.rs`).
+fn port_is_free(port: u16) -> bool {
+    let Ok(probe) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None) else {
+        return false;
+    };
+    #[cfg(unix)]
+    let _ = probe.set_reuse_address(true);
+    probe
+        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
+        .is_ok()
+}
+
+/// A free port outside the range the system hands out to outgoing
+/// connections: a client dialling a server that is not listening yet could
+/// otherwise be given that port as its own end, and connect to itself.
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    loop {
+        let step = NEXT.fetch_add(1, Ordering::Relaxed);
+        let from = (std::process::id() as u16).wrapping_mul(31);
+        let port = 10_000 + from.wrapping_add(step) % 20_000;
+        if port_is_free(port) {
+            return port;
+        }
+    }
 }
 
 /// Whether the server on `port` is process `pid`, by its INFO `process_id`.
@@ -62,7 +83,8 @@ struct Server {
 
 impl Server {
     /// Tries another port when a test running alongside took this one first.
-    fn start(dir: &Path, extra: &[&str]) -> Self {
+    fn start(dir: impl AsRef<Path>, extra: &[&str]) -> Self {
+        let dir = dir.as_ref();
         for _ in 0..5 {
             let port = free_port();
             let mut child = Command::new(kividb_bin())
@@ -115,12 +137,12 @@ impl Drop for Server {
     }
 }
 
-fn temp_dir(tag: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("kividb-compact-sets-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// A directory of the test's own, removed when it is dropped.
+fn temp_dir(tag: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("kividb-compact-sets-{tag}-"))
+        .tempdir()
+        .unwrap()
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -398,9 +420,27 @@ fn changing_the_limit_while_running() {
             Resp::Bulk(DEFAULT.to_string().into_bytes()),
         ])
     );
-    for bad in ["-1", "x", "1.5", ""] {
+    // Read as Redis reads a number: `+5` and `05` are not one.
+    for (bad, why) in [
+        (
+            "-1",
+            "argument must be between 0 and 9223372036854775807 inclusive",
+        ),
+        ("x", "argument couldn't be parsed into an integer"),
+        ("1.5", "argument couldn't be parsed into an integer"),
+        ("", "argument couldn't be parsed into an integer"),
+        ("+5", "argument couldn't be parsed into an integer"),
+        ("05", "argument couldn't be parsed into an integer"),
+    ] {
         let reply = c.cmd(&["CONFIG", "SET", "set-max-intset-entries", bad]);
-        assert!(matches!(reply, Resp::Error(_)), "{bad:?}: {reply:?}");
+        assert_eq!(
+            reply,
+            Resp::Error(format!(
+                "ERR CONFIG SET failed (possibly related to argument \
+                 'set-max-intset-entries') - {why}"
+            )),
+            "{bad:?}"
+        );
     }
 
     set_limit(&mut c, 128);
@@ -642,6 +682,126 @@ fn smove_between_the_forms() {
     assert_eq!(encoding(&mut c, "from"), "intset");
 }
 
+/// A STORE into one of its own sources while that source is an array reads
+/// it whole before writing it.
+#[test]
+fn a_store_into_its_own_compact_source() {
+    let dir = temp_dir("store-self");
+    let server = Server::start(&dir, &[]);
+    let mut c = server.conn();
+    assert_eq!(c.sadd("u", &ints(-5..6)), 11);
+    assert_eq!(c.sadd("w", &["-5", "0", "3", "100"].map(String::from)), 4);
+    assert_eq!(c.sadd("t", &["3", "x"].map(String::from)), 2);
+    assert_eq!(encoding(&mut c, "u"), "intset");
+    assert_eq!(encoding(&mut c, "t"), "listpack");
+
+    assert_eq!(c.cmd(&["SINTERSTORE", "u", "u", "w"]).int(), 3);
+    assert_eq!(
+        c.cmd(&["SMEMBERS", "u"]).members(),
+        sorted(&["-5", "0", "3"].map(String::from))
+    );
+    assert_eq!(encoding(&mut c, "u"), "intset");
+
+    // Less a table's members.
+    assert_eq!(c.cmd(&["SDIFFSTORE", "u", "u", "t"]).int(), 2);
+    assert_eq!(
+        c.cmd(&["SMEMBERS", "u"]).members(),
+        sorted(&["-5", "0"].map(String::from))
+    );
+    assert_eq!(encoding(&mut c, "u"), "intset");
+
+    // And a union that brings in a string: the table.
+    assert_eq!(c.cmd(&["SUNIONSTORE", "u", "u", "t"]).int(), 4);
+    assert_eq!(
+        c.cmd(&["SMEMBERS", "u"]).members(),
+        sorted(&["-5", "0", "3", "x"].map(String::from))
+    );
+    assert_eq!(encoding(&mut c, "u"), "listpack");
+}
+
+/// `SORT` of an array, by number and `ALPHA`, gives what it gives for the same
+/// members in the table.
+#[test]
+fn sort_of_a_compact_set() {
+    let dir = temp_dir("sort");
+    let server = Server::start(&dir, &[]);
+    let mut c = server.conn();
+    let members: Vec<String> = [i64::MIN, -20, -1, 0, 2, 10, i64::MAX]
+        .iter()
+        .map(i64::to_string)
+        .collect();
+    c.sadd("a", &members);
+    set_limit(&mut c, 0);
+    c.sadd("t", &members);
+    assert_eq!(encoding(&mut c, "a"), "intset");
+    assert_eq!(encoding(&mut c, "t"), "listpack");
+
+    let texts = |reply: Resp| -> Vec<String> {
+        let Resp::Array(items) = reply else {
+            panic!("not an array: {reply:?}");
+        };
+        items
+            .iter()
+            .map(|r| String::from_utf8(r.bulk()).unwrap())
+            .collect()
+    };
+    let numeric = [
+        "-9223372036854775808",
+        "-20",
+        "-1",
+        "0",
+        "2",
+        "10",
+        "9223372036854775807",
+    ];
+    let alpha = [
+        "-1",
+        "-20",
+        "-9223372036854775808",
+        "0",
+        "10",
+        "2",
+        "9223372036854775807",
+    ];
+    let mut descending = numeric;
+    descending.reverse();
+    for (args, want) in [
+        (&[][..], &numeric),
+        (&["DESC"][..], &descending),
+        (&["ALPHA"][..], &alpha),
+    ] {
+        for key in ["a", "t"] {
+            let mut cmd = vec!["SORT", key];
+            cmd.extend_from_slice(args);
+            assert_eq!(texts(c.cmd(&cmd)), want, "{cmd:?}");
+        }
+    }
+}
+
+/// A replica can have another `set-max-intset-entries` than its master, and
+/// keep a set as the other form: the value's digest is the same in both.
+#[test]
+fn the_digest_is_the_same_in_both_forms() {
+    let dir = temp_dir("digest");
+    let server = Server::start(&dir, &[]);
+    let mut c = server.conn();
+    let members: Vec<String> = [1, 2, 3, -70_000, i64::MIN, i64::MAX]
+        .iter()
+        .map(i64::to_string)
+        .collect();
+    c.sadd("a", &members);
+    set_limit(&mut c, 0);
+    c.sadd("b", &members);
+    assert_eq!(encoding(&mut c, "a"), "intset");
+    assert_ne!(encoding(&mut c, "b"), "intset");
+    let digest = |c: &mut Conn, key: &str| c.cmd(&["DEBUG", "DIGEST-VALUE", key]);
+    let a = digest(&mut c, "a");
+    assert_eq!(a, digest(&mut c, "b"));
+    // And it is a digest of the members: one more, another digest.
+    c.cmd(&["SADD", "b", "4"]);
+    assert_ne!(a, digest(&mut c, "b"));
+}
+
 /// Under `maxmemory`, the arrays are counted at their size: about as many fit
 /// as `MEMORY USAGE` says, and a key evicted leaves nothing behind.
 #[test]
@@ -763,7 +923,7 @@ fn a_saved_set_loads_back_the_same() {
     server.stop("NOSAVE");
 
     // Loaded with no arrays at all, set in the configuration file.
-    let conf = dir.join("kividb.conf");
+    let conf = dir.path().join("kividb.conf");
     std::fs::write(&conf, "set-max-intset-entries 0\n").unwrap();
     let server = Server::start(&dir, &["--configfile", conf.to_str().unwrap()]);
     let mut c = server.conn();
