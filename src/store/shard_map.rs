@@ -1535,6 +1535,10 @@ mod tests {
     fn moving_a_sets_entry_leaves_its_array_in_place() {
         use crate::member_set::MemberSet;
         use crate::value_slab;
+        // Slab evacuation state is shared across the whole process.
+        // Serialize tests that plan or finish evacuation so they
+        // cannot take each other's slabs or affect global counts.
+        let _one = value_slab::EVACUATION_TESTS.lock();
         // A length no other test's keys have: a slab class of its own.
         let key = |i: usize| format!("{i:0>2500}");
         let members: Vec<Vec<u8>> = (-30i64..30).map(|n| n.to_string().into_bytes()).collect();

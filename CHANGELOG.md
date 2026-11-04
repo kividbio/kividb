@@ -21,8 +21,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   their formats do not change.
   - The limit is `set-max-intset-entries`, now **64** by default, where
     `CONFIG GET` said 512 (it had no effect). It can be changed with
-    `CONFIG SET` or in the configuration file, and `0` turns the arrays
-    off. A redis.conf carried over sets 512. Each new member of an array
+    `CONFIG SET` or in the configuration file. `0` disables compact arrays
+    for new members: new sets are tables, and an existing compact set stays
+    compact until its next new member is added, which turns it into the
+    table. A redis.conf carried over sets 512. Each new member of an array
     moves the members after it and grows the array by one, so large
     limits make `SADD` and loading a snapshot slower for sets near them.
   - `OBJECT ENCODING` reports the form a set is kept in: `intset` only
