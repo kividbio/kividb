@@ -2023,3 +2023,295 @@ fn a_log_made_after_a_save_with_no_log_beside_an_older_old_log_is_replayed() {
         assert_eq!(c.cmd(&["GET", "acked-on-1.2.0"]).s(), "1", "{io}");
     }
 }
+
+// ── A turn-over stopped, then a save with the AOF off (#368) ─────────────────
+
+/// A run with the AOF on, killed by a checkpoint after the log was moved
+/// aside and before the new log took its name: `appendonly.aof.prev` holds
+/// an acknowledged write (`r1`) that is in no dump, the new log is under a
+/// name of its own, and there is no log. Returns the old log.
+fn a_turn_over_stopped_after_moving_the_log_aside(server: &mut Server) -> Vec<u8> {
+    let io = server.io;
+    let mut c = server.conn();
+    assert!(c.cmd(&["SET", "a", "1"]).ok());
+    send(&mut c, &["SAVE"]);
+    server.pass("turn-over-moved-aside.1");
+    assert!(c.read().ok(), "{io}");
+    assert!(c.cmd(&["SET", "r1", "acked"]).ok());
+    durable(&mut c);
+    assert_eq!(c.cmd(&["BGREWRITEAOF"]).s(), STARTED);
+    assert!(server.reached("turn-over-moved-aside.2", LONG), "{io}");
+    drop(c);
+    server.kill();
+    let dir = &server.dir;
+    assert!(!dir.join("appendonly.aof").exists(), "{io}");
+    assert!(dir.join("appendonly.aof.rewrite.tmp").exists(), "{io}");
+    let old = std::fs::read(dir.join("appendonly.aof.prev")).unwrap();
+    assert!(holds(&old, b"r1"), "{io}");
+    server.failpoints.clear();
+    old
+}
+
+/// Then a run with the AOF off, which never loads the old log, saved; the
+/// save took the new log's save number, which it did not count. The next
+/// start with the AOF on put the new log in place, read the old log as that
+/// of a checkpoint that finished, and deleted it: `r1` was gone (#368). The
+/// old log is kept aside.
+#[test]
+fn an_old_log_left_by_a_stopped_turn_over_is_kept_after_a_save_with_the_aof_off() {
+    for &io in io_models() {
+        for end in ["SAVE", "SHUTDOWN"] {
+            let mut server = Server::start(io, "turn-over-moved-aside");
+            let old = a_turn_over_stopped_after_moving_the_log_aside(&mut server);
+            let dir = server.dir.clone();
+
+            server.aof = false;
+            let mut c = server.restart();
+            assert!(c.cmd(&["SET", "b", "1"]).ok());
+            if end == "SHUTDOWN" {
+                send(&mut c, &["SHUTDOWN"]);
+                drop(c);
+                server.wait_exit();
+            } else {
+                assert!(c.cmd(&["SAVE"]).ok());
+                drop(c);
+                server.kill();
+            }
+
+            server.aof = true;
+            let mut c = server.restart();
+            assert_eq!(c.cmd(&["GET", "b"]).s(), "1", "{io}, {end}");
+            assert_eq!(c.cmd(&["GET", "a"]).s(), "1", "{io}, {end}");
+            assert!(
+                kept_aside(&dir).iter().any(|(_, bytes)| *bytes == old),
+                "{io}, {end}: the old log, with r1, was deleted"
+            );
+            assert_ne!(
+                info_field(&mut c, "aof_superseded_files"),
+                "0",
+                "{io}, {end}"
+            );
+
+            // And the log goes on from the dump.
+            assert!(c.cmd(&["SET", "after", "1"]).ok());
+            durable(&mut c);
+            drop(c);
+            server.kill();
+            let mut c = server.restart();
+            assert_eq!(c.cmd(&["GET", "after"]).s(), "1", "{io}, {end}");
+            assert!(
+                kept_aside(&dir).iter().any(|(_, bytes)| *bytes == old),
+                "{io}, {end}"
+            );
+        }
+    }
+}
+
+/// The same, with two saves with the AOF off, and then 1.2.0 started with
+/// the AOF on: it put the turn-over's new log in place, a delta on a number
+/// below the dump's, and added an acknowledged write to it. There was no log
+/// at the save, so all of the log was written since: it is replayed, not
+/// left out as older than the dump.
+#[test]
+fn a_log_made_after_a_save_with_no_log_is_replayed_whatever_its_number() {
+    for &io in io_models() {
+        let mut server = Server::start(io, "turn-over-moved-aside");
+        let old = a_turn_over_stopped_after_moving_the_log_aside(&mut server);
+        let dir = server.dir.clone();
+
+        server.aof = false;
+        let mut c = server.restart();
+        assert!(c.cmd(&["SET", "b", "1"]).ok());
+        assert!(c.cmd(&["SAVE"]).ok());
+        assert!(c.cmd(&["SET", "b", "2"]).ok());
+        assert!(c.cmd(&["SAVE"]).ok());
+        drop(c);
+        server.kill();
+
+        // 1.2.0 on it, with the AOF on.
+        std::fs::rename(
+            dir.join("appendonly.aof.rewrite.tmp"),
+            dir.join("appendonly.aof"),
+        )
+        .unwrap();
+        let mut log = std::fs::read(dir.join("appendonly.aof")).unwrap();
+        assert_eq!(log.len(), 16, "{io}");
+        log.extend_from_slice(&set_record("acked-on-1.2.0", "1"));
+        std::fs::write(dir.join("appendonly.aof"), &log).unwrap();
+
+        server.aof = true;
+        let mut c = server.restart();
+        assert_eq!(
+            c.cmd(&["GET", "acked-on-1.2.0"]),
+            V::Str("1".into()),
+            "{io}: a log written after the save was left out as older"
+        );
+        assert_eq!(c.cmd(&["GET", "b"]).s(), "2", "{io}");
+        let kept = kept_aside(&dir);
+        assert!(
+            kept.iter().any(|(_, bytes)| *bytes == old),
+            "{io}: the old log was not kept"
+        );
+        assert!(
+            kept.iter().any(|(_, bytes)| *bytes == log),
+            "{io}: the log was not kept"
+        );
+
+        drop(c);
+        server.kill();
+        let mut c = server.restart();
+        assert_eq!(c.cmd(&["GET", "acked-on-1.2.0"]).s(), "1", "{io}");
+    }
+}
+
+// ── The old log of a checkpoint that finished, not removable (#375) ─────────
+
+/// An `appendonly.aof.prev` that cannot be removed: a directory under its
+/// name, which `remove_file` refuses on every platform.
+fn an_old_log_that_cannot_be_removed(dir: &Path) {
+    let prev = dir.join("appendonly.aof.prev");
+    std::fs::create_dir(&prev).unwrap();
+    std::fs::write(prev.join("inside"), b"*1\r\n$4\r\nPING\r\n").unwrap();
+}
+
+/// A checkpoint finished and its old log was not removed; at the next start
+/// it cannot be. The dump holds its writes, so it is left in place, with a
+/// warning: the server used to ignore this, and 1.2.1 refused to start.
+#[test]
+fn an_old_log_that_cannot_be_removed_is_left_in_place() {
+    for &io in io_models() {
+        let mut server = Server::start(io, "");
+        let mut c = server.conn();
+        assert!(c.cmd(&["SET", "k", "1"]).ok());
+        assert!(c.cmd(&["SAVE"]).ok());
+        assert!(c.cmd(&["SET", "k2", "1"]).ok());
+        durable(&mut c);
+        drop(c);
+        server.kill();
+        an_old_log_that_cannot_be_removed(&server.dir);
+
+        let mut c = server.restart();
+        assert_eq!(c.cmd(&["GET", "k"]).s(), "1", "{io}");
+        assert_eq!(c.cmd(&["GET", "k2"]).s(), "1", "{io}");
+        let said = std::fs::read_to_string(server.dir.join("server.log")).unwrap();
+        assert!(
+            said.contains(
+                "AOF: appendonly.aof.prev, left by a checkpoint that finished, could not be \
+                 removed: "
+            ),
+            "{io}: no warning"
+        );
+        assert!(
+            said.contains("it is left in place, and the next start or checkpoint removes it"),
+            "{io}"
+        );
+        assert!(server.dir.join("appendonly.aof.prev").exists(), "{io}");
+    }
+}
+
+/// The same after a save with the AOF off: the old log may hold writes the
+/// dump does not, and it cannot be kept aside, so the server does not start,
+/// and says what to do, not the generic "start empty" advice. Nothing is
+/// removed.
+#[test]
+fn an_old_log_that_cannot_be_kept_aside_stops_the_start_saying_what_to_do() {
+    for &io in io_models() {
+        let mut server = Server::start(io, "");
+        server.kill();
+        std::fs::remove_file(server.dir.join("appendonly.aof")).unwrap();
+        server.aof = false;
+        let mut c = server.restart();
+        assert!(c.cmd(&["SET", "k", "1"]).ok());
+        assert!(c.cmd(&["SAVE"]).ok());
+        drop(c);
+        server.kill();
+        assert!(saved_number(&server.dir).1, "{io}");
+
+        // A log on that dump's number, as a start with the AOF on makes.
+        server.aof = true;
+        let mut c = server.restart();
+        assert!(c.cmd(&["SET", "k2", "1"]).ok());
+        durable(&mut c);
+        drop(c);
+        server.kill();
+        let (number, _) = saved_number(&server.dir);
+        let log = std::fs::read(server.dir.join("appendonly.aof")).unwrap();
+        assert_eq!(log[..16], delta_header(number)[..], "{io}");
+        an_old_log_that_cannot_be_removed(&server.dir);
+
+        // Not `restart`: it waits for the server to answer.
+        server.child = launch(&server.dir, server.port, server.io, "", true);
+        server.wait_exit();
+        let status = server.child.wait().unwrap();
+        assert!(!status.success(), "{io}: {status:?}");
+        let said = std::fs::read_to_string(server.dir.join("server.log")).unwrap();
+        assert!(
+            said.contains(
+                "appendonly.aof.prev, left by a checkpoint that finished, cannot be kept aside: "
+            ),
+            "{io}: {said}"
+        );
+        assert!(
+            said.contains(
+                ". dump.kdb was saved with the AOF off since, and may not hold its writes, so it \
+                 is not removed without a copy. Free disk space in the data directory, or move \
+                 appendonly.aof.prev out of it, and start again"
+            ),
+            "{io}: {said}"
+        );
+        assert!(
+            !said.contains("Refusing to start with an empty dataset"),
+            "{io}: the generic advice"
+        );
+        assert!(
+            server
+                .dir
+                .join("appendonly.aof.prev")
+                .join("inside")
+                .exists(),
+            "{io}"
+        );
+        assert_eq!(
+            std::fs::read(server.dir.join("appendonly.aof")).unwrap(),
+            log,
+            "{io}"
+        );
+    }
+}
+
+/// After a save with the AOF off and a start with the AOF on, a turn-over
+/// finds an old log beside the log, on the dump's number: one of a
+/// checkpoint that finished. It may hold writes the dump does not, and it
+/// is kept aside before the turn-over removes it, the keeping done before
+/// the log is locked (#375).
+#[test]
+fn a_turn_over_keeps_a_finished_checkpoints_old_log_aside_after_a_save_with_the_aof_off() {
+    for &io in io_models() {
+        let mut server = Server::start(io, "");
+        server.kill();
+        std::fs::remove_file(server.dir.join("appendonly.aof")).unwrap();
+        server.aof = false;
+        let mut c = server.restart();
+        assert!(c.cmd(&["SET", "k", "1"]).ok());
+        assert!(c.cmd(&["SAVE"]).ok());
+        drop(c);
+        server.kill();
+
+        server.aof = true;
+        let mut c = server.restart();
+        let (number, _) = saved_number(&server.dir);
+        let mut old = delta_header(number - 1);
+        old.extend_from_slice(&set_record("only-in-the-old-log", "1"));
+        std::fs::write(server.dir.join("appendonly.aof.prev"), &old).unwrap();
+        assert_eq!(c.cmd(&["BGREWRITEAOF"]).s(), STARTED);
+        wait_idle(&mut c);
+        assert!(!server.dir.join("appendonly.aof.prev").exists(), "{io}");
+        assert!(
+            kept_aside(&server.dir)
+                .iter()
+                .any(|(_, bytes)| *bytes == old),
+            "{io}: the old log was removed without a copy"
+        );
+        assert_eq!(c.cmd(&["GET", "k"]).s(), "1", "{io}");
+    }
+}

@@ -856,6 +856,16 @@ pub(crate) fn query_terms(filter: &Filter, out: &mut AHashSet<String>) {
 /// are exact: the TEXT index holds every document's words as they are now
 /// (and no stopword, which a pattern does not match, as in Redis). A phrase
 /// gives the documents to try: it is about where the words are.
+/// Whether `filter` has a word in it that [`candidates`] reads off the TEXT
+/// index, and so may give documents as the matches without trying them.
+fn has_words(filter: &Filter) -> bool {
+    match filter {
+        Filter::Text { .. } => true,
+        Filter::And(l, r) | Filter::Or(l, r) => has_words(l) || has_words(r),
+        _ => false,
+    }
+}
+
 fn candidates(filter: &Filter, def: &IndexDef) -> Option<(Bits, bool)> {
     let numbers = |fields: &[String]| -> Vec<u16> {
         fields.iter().filter_map(|f| def.text_field(f)).collect()
@@ -1075,7 +1085,7 @@ fn plan_in(
             return None;
         }
         #[cfg(test)]
-        tests::while_the_postings_are_read();
+        crate::test_hooks::at("plan: postings read");
         let volatile: Vec<(String, u32)> = watched
             .into_iter()
             .filter(|key| only.is_none_or(|only| only.contains(key)))
@@ -1199,33 +1209,60 @@ pub(crate) fn filter_each(
 
     // The keys to look at, if they are known without reading everything: the
     // ones the caller named, or the ones the TEXT index names. Those are the
-    // matches if the TEXT index says so, and it is of this database.
-    let found = {
+    // matches if the TEXT index says so, and it is of this database, but for
+    // the hashes with field TTLs: a read can drop a field of one before the
+    // TEXT index hears of it, and they are tried, as `plan` tries them.
+    // Which they are is read before the TEXT index is, for the reason it is
+    // read first there; they were not tried, and a TEXT field gone to a read
+    // still matched until the sweep came (#364). Only for a filter with a
+    // word in it, the only kind the TEXT index answers, and turned into ids
+    // under the postings' lock, as `plan` turns them: every query that tried
+    // every document copied the whole list too, and every match was looked
+    // up in it by key (#371).
+    let watched = if has_words(filter) {
+        crate::field_expiry::watched_keys(ctx.store, *ctx.selected_db)
+    } else {
+        Vec::new()
+    };
+    // Each key, and whether it is a match on the TEXT index's word.
+    let found: Option<Vec<(Arc<str>, bool)>> = {
         // Every write queued so far applied (the TEXT index's part too: see
         // `postings::WithId`), and no id given back while the TEXT index's
         // are turned into keys. The postings, then the TEXT index.
         let p = def.postings.read();
         candidates(filter, def).map(|(ids, exact)| {
-            let keys: Vec<Arc<str>> = ids.iter().filter_map(|id| p.key(id).cloned()).collect();
-            (keys, exact && def.db_index == *ctx.selected_db)
+            let exact = exact && def.db_index == *ctx.selected_db;
+            let mut tried = Bits::new();
+            if exact {
+                for key in &watched {
+                    if let Some(id) = p.id(key) {
+                        tried.set(id);
+                    }
+                }
+            }
+            ids.iter()
+                .filter_map(|id| Some((Arc::clone(p.key(id)?), exact && !tried.get(id))))
+                .collect()
         })
     };
-    let (known, exact): (Option<Vec<Arc<str>>>, bool) = match (only, found) {
-        (Some(only), Some((found, exact))) => (
-            Some(found.into_iter().filter(|k| only.contains(&**k)).collect()),
-            exact,
+    let known: Option<Vec<(Arc<str>, bool)>> = match (only, found) {
+        (Some(only), Some(found)) => Some(
+            found
+                .into_iter()
+                .filter(|(k, _)| only.contains(&**k))
+                .collect(),
         ),
-        (Some(only), None) => (
-            Some(only.iter().map(|k| Arc::from(k.as_str())).collect()),
-            false,
+        (Some(only), None) => Some(
+            only.iter()
+                .map(|k| (Arc::from(k.as_str()), false))
+                .collect(),
         ),
-        (None, Some((found, exact))) => (Some(found), exact),
-        (None, None) => (None, false),
+        (None, found) => found,
     };
     match known {
         Some(keys) => {
             let mut seen = 0u32;
-            for key in &keys {
+            for (key, matches) in &keys {
                 let key: &str = key;
                 if deadline_due(deadline, &mut seen) {
                     timed_out = true;
@@ -1235,7 +1272,7 @@ pub(crate) fn filter_each(
                     continue;
                 }
                 with_doc(db, def, key, |fields, _| {
-                    if exact || filter::eval(filter, fields) {
+                    if *matches || filter::eval(filter, fields) {
                         accept(key, fields);
                     }
                 });
@@ -2662,19 +2699,6 @@ fn coordinate(
 mod tests {
     use super::*;
 
-    thread_local! {
-        /// What [`plan_in`] runs on this thread while it holds the postings,
-        /// once: for a test to put a write there.
-        static WHILE_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
-            const { std::cell::RefCell::new(None) };
-    }
-
-    pub(super) fn while_the_postings_are_read() {
-        if let Some(run) = WHILE_READ.with(|w| w.borrow_mut().take()) {
-            run();
-        }
-    }
-
     /// A hash whose field went to a read, swept while a query holds the
     /// postings: the sweep's write is queued behind the query, and the hash
     /// is no longer watched by the time the query is done with them. The
@@ -2684,6 +2708,7 @@ mod tests {
     fn a_hash_swept_while_a_query_reads_the_postings_is_still_tried() {
         use crate::types::HashInner;
         let store = crate::store::new_store(1);
+        let _own = crate::field_expiry::OwnWatches::of(&store);
         let index_store = crate::vector::new_index_store();
         let def = IndexSchema {
             name: "i347".into(),
@@ -2753,8 +2778,8 @@ mod tests {
 
         // Now the sweep, with the query holding the postings.
         let (s, i) = (Arc::clone(&store), Arc::clone(&index_store));
-        WHILE_READ.with(|w| {
-            *w.borrow_mut() = Some(Box::new(move || crate::field_expiry::sweep(&s, &i)));
+        crate::test_hooks::set("plan: postings read", move || {
+            crate::field_expiry::sweep(&s, &i)
         });
         let plan = plan_in(&store, 0, &def, &filter, None).unwrap();
         assert!(

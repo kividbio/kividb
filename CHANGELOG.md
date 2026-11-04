@@ -50,6 +50,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A panic in active defrag no longer stops it silently (#358).** Active
+  defrag runs on a thread of its own, and release builds unwind on a panic.
+  Had anything in a pass panicked, that thread alone would have ended: the
+  server went on, `active_defrag_running` stayed 1, the slabs the pass was
+  emptying were never used again for new values, and nothing was compacted
+  until a restart. Each pass now runs inside `catch_unwind`. A panic is
+  logged at `ERROR` with its message, the slabs the pass was emptying are
+  put back in use, and the next pass comes after 1 second, then 2, 4 and
+  8. Every value stays where its key points: a value being copied keeps
+  its old place, and the copy is freed (#356). After 5 passes in a row
+  panic, with none ending between them, active defrag turns itself off,
+  with one `ERROR` line saying that `CONFIG SET activedefrag yes` turns it
+  back on; `CONFIG GET activedefrag` then says `no`. Two new fields in
+  `INFO memory`: `active_defrag_panics`, the passes that panicked, and
+  `active_defrag_disabled_by_panics`, 1 while active defrag is off because
+  of them. Nothing changes for a pass that does not panic. Release builds
+  still unwind.
 - **A restart with the AOF on after a save with it off applied writes
   twice (#354).** A save with the AOF off (`SAVE`, `BGSAVE`, the save at
   `SHUTDOWN`) wrote a new `dump.kdb` but left `dump.kdb.gen`, its save
@@ -89,6 +106,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   checkpoint has finished restarts from the `dump.kdb` saved before the
   sync, plus what was logged after the enable: the replica then syncs again
   from its master.
+- **A stopped turn-over's old log was deleted after a save with the AOF
+  off (#368).** A run with the AOF on killed while turning the log over
+  leaves `appendonly.aof.prev`, with the writes since the last save, and
+  the new log under a name of its own. A run with the AOF off then saved,
+  and the save took the new log's save number, which it did not count.
+  The next start with the AOF on put the new log in place, read the old
+  log as that of a checkpoint that finished, and deleted it: those
+  acknowledged writes were gone. The save number now counts the new log,
+  so the old log reads as older than the dump and is kept aside. An old
+  log removed as a finished checkpoint's beside a save with the AOF off is
+  kept aside first, and a turn-over's new log is removed only if it holds
+  nothing but its header. A log with records made after a save that had no
+  log is replayed whatever its header's number, rather than left out as
+  older. An old log that the snapshot holds and that cannot be removed is
+  left in place with a warning; only one that has to be kept aside first,
+  and cannot be, stops the server, saying what to do.
 - **Follow-ups to the two fixes above (#359).** A save with the AOF off
   now also records how long `appendonly.aof` and `appendonly.aof.prev` were,
   with a hash of their first and last bytes. A log beside that dump that
@@ -249,10 +282,39 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that document itself. A sweep that ran while a query was reading the
   postings queued its update behind the query, and stopped watching the
   hash before the query looked at which hashes were watched: the query took
-  the postings' word for the document. `FT.AGGREGATE` counted it, and so
-  could `FT.SEARCH` where it answers from the postings without reading the
-  documents (`LIMIT 0 0`). A query now reads which hashes are watched
-  before it reads the postings.
+  the postings' word for the document. `FT.AGGREGATE` counted it; a count
+  of `FT.SEARCH` (`LIMIT 0 0`) could count it, and `FT.SEARCH`'s other
+  answers, `FT.HYBRID` and a KNN query with a TAG or NUMERIC filter could
+  return it. A query now reads which hashes are watched before it reads the
+  postings.
+- **The field-expiry sweep could leave a hash's postings stale, and stop
+  watching it (#364).** Three ways, each leaving queries to trust TAG,
+  NUMERIC or TEXT postings that no longer said what the hash held:
+  - The sweep brought the postings up to date after letting go of the
+    key's write order. An `HSET` that came between its reading the hash and
+    its writing them lost its fields from the postings, until the next
+    write to the key.
+  - It dropped the hash from the hashes it watches after letting go of the
+    order too. An `HPEXPIRE` that came in between was forgotten: that
+    field was never swept, no `hexpired` was published, and a hash all of
+    whose fields had expired stayed in the keyspace.
+  - A TEXT query of an index with no TAG or NUMERIC field, or with its
+    postings off (`FT.DEBUG POSTINGS … OFF`), took the TEXT index's word for
+    a hash whose TEXT field a read had dropped (`HGETALL` past its time),
+    until the sweep came, up to 100 ms later. `FT.SEARCH`, `FT.HYBRID` and
+    a KNN query with a TEXT filter returned it.
+
+  The sweep now does both under the key's write order, as a command does,
+  and such a TEXT query tries the watched hashes it finds, as other queries
+  do.
+- **On a replica, the field-expiry sweep could still leave a hash's
+  postings stale, and stop watching it (#371).** A write applied from the
+  master's stream took no write order, so the two ways above remained
+  there: an `HSET` from the master lost its fields from the replica's
+  postings, and an `HPEXPIREAT` from the master was forgotten, its field
+  never swept on the replica, nor after a failover on the replica promoted.
+  A write applied from the stream now takes the order of its keys, as a
+  command does.
 
 ## [1.2.0] - 2026-11-03
 

@@ -406,7 +406,9 @@ pub fn open_log(_turn: &CheckpointTurn) -> std::io::Result<()> {
 /// usually nothing.
 fn start_new_log(why: NewLogWhy, added: &[u8]) -> std::io::Result<std::fs::File> {
     let mut kept = Vec::new();
-    for path in [AOF_PREV_PATH, AOF_PATH] {
+    // A turn-over's new log only ever holds a header (see
+    // [`prepare_new_log`]), and is not kept then; one that holds more is.
+    for path in [AOF_PREV_PATH, AOF_PATH, TURN_OVER_TMP] {
         if let Some(name) = keep_aside(path)? {
             kept.push((path, name));
         }
@@ -415,6 +417,12 @@ fn start_new_log(why: NewLogWhy, added: &[u8]) -> std::io::Result<std::fs::File>
         sync_dir()?;
     }
     for (path, name) in &kept {
+        // Never loaded: what `why` says of the logs is not true of it.
+        let why = if *path == TURN_OVER_TMP {
+            NewLogWhy::Older
+        } else {
+            why
+        };
         log_warn!("{}", kept_warning(why, path, name));
     }
     let file = write_new_log(added)?;
@@ -440,6 +448,11 @@ enum NewLogWhy {
     /// `appendonly.aof` was: a log made, or written to, after that save
     /// (#363).
     AddedTo { prev: bool, log_whole: bool },
+    /// At a start, or a turn-over: the old log of a checkpoint that
+    /// finished, removed, with `dump.kdb.gen` that of a save with the AOF
+    /// off. Its records may be in the dump, or in the log, or in neither
+    /// (#368).
+    FinishedBesideSaveWithAofOff,
 }
 
 /// The warning for the log at `path`, kept as `name`. Whether its writes
@@ -483,6 +496,14 @@ fn kept_warning(why: NewLogWhy, path: &str, name: &str) -> String {
              dump.kdb and was not replayed: if writes from then are missing, read the file (RESP, \
              after a 16-byte header if it starts with KIVIDLT1) and send only those. Remove the \
              file once it is not needed"
+        ),
+        NewLogWhy::FinishedBesideSaveWithAofOff => format!(
+            "AOF: {path} was left by a checkpoint, beside a log that goes on from dump.kdb, and \
+             dump.kdb.gen is that of a save with the AOF off. {kept} Its records may be in \
+             dump.kdb or in the log already, or in neither: do not send the whole file to the \
+             server, which could apply writes twice. If writes from it are missing, read it \
+             (RESP, after a 16-byte header if it starts with KIVIDLT1) and send only those; \
+             remove the file once it is not needed"
         ),
         NewLogWhy::Older | NewLogWhy::AddedTo { .. } => {
             format!("AOF: {path} is older than dump.kdb and is not replayed. {kept} {apply}")
@@ -1198,6 +1219,17 @@ const TURN_OVER_APPENDING: &str = "appendonly.aof.prev.len";
 fn prepare_new_log(generation: u64) -> std::io::Result<()> {
     use std::io::Write;
     settle_turn_over()?;
+    // The old log of a checkpoint that finished is removed by the turn-over
+    // (see [`move_log_aside`]), and may have to be kept aside first: that
+    // links or copies it, and syncs the directory, so it is done here, with
+    // nothing locked (#375). The turn is held from here to the turn-over, and
+    // nothing else changes the save number, the dump or the old log: the
+    // turn-over sees what this saw.
+    FINISHED_OLD_LOG_KEPT.store(false, Ordering::Relaxed);
+    if std::path::Path::new(AOF_PREV_PATH).exists() && checkpoint_completed(&read_head(AOF_PATH)) {
+        keep_finished_old_log()?;
+        FINISHED_OLD_LOG_KEPT.store(true, Ordering::Relaxed);
+    }
     let mut fresh = std::fs::File::create(TURN_OVER_TMP)?;
     fresh.write_all(AOF_DELTA_MAGIC)?;
     fresh.write_all(&generation.to_le_bytes())?;
@@ -1232,7 +1264,17 @@ fn move_log_aside() -> std::io::Result<MovedAside> {
             // Left by a checkpoint that finished, all but removing it: what
             // it holds is in the snapshot. Added to, it would be replayed
             // on top of that snapshot, should this checkpoint not finish.
-            std::fs::remove_file(prev)?;
+            // Kept aside first if it had to be, by [`prepare_new_log`]: only
+            // removed here. Not kept when it had to be, it is not removed,
+            // and the turn-over fails with nothing lost.
+            if !FINISHED_OLD_LOG_KEPT.swap(false, Ordering::Relaxed)
+                && read_saved().is_some_and(|saved| saved.alone)
+            {
+                return Err(std::io::Error::other(format!(
+                    "{AOF_PREV_PATH}, left by a checkpoint that finished, was not kept aside"
+                )));
+            }
+            remove_if_there(AOF_PREV_PATH)?;
         }
     }
     if prev.exists() {
@@ -1337,11 +1379,53 @@ fn recover_turn_over() {
                 "{AOF_PATH} could not be put back after an interrupted checkpoint: {e}"
             ));
         }
-    } else if let Err(e) = std::fs::remove_file(TURN_OVER_TMP)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        log_warn!("AOF: {TURN_OVER_TMP} could not be removed: {e}");
+    } else {
+        // A turn-over's new log, never put in place: only ever a header (see
+        // [`prepare_new_log`]). One that holds more is kept aside first: no
+        // log is removed with records that may be nowhere else.
+        let kept = keep_aside(TURN_OVER_TMP).and_then(|kept| {
+            if let Some(name) = &kept {
+                sync_dir()?;
+                log_warn!("{}", kept_warning(NewLogWhy::Older, TURN_OVER_TMP, name));
+            }
+            Ok(kept)
+        });
+        let removed = kept.and_then(|_| remove_if_there(TURN_OVER_TMP));
+        if let Err(e) = removed {
+            log_warn!("AOF: {TURN_OVER_TMP} could not be removed: {e}");
+        }
     }
+}
+
+/// Set by [`prepare_new_log`] once the old log of a checkpoint that
+/// finished, which the turn-over removes, has been kept aside if it had to
+/// be (see [`keep_finished_old_log`]).
+static FINISHED_OLD_LOG_KEPT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Before `appendonly.aof.prev`, left by a checkpoint that finished (see
+/// [`checkpoint_completed`]), is removed: the dump holds its records, unless
+/// `dump.kdb.gen` is that of a save with the AOF off, which did not turn the
+/// log over. Then it is kept aside first (#368). A save with the AOF off
+/// that took the number of a turn-over's new log (`next_generation` did not
+/// count it) made the old log read as that of a finished checkpoint, and it
+/// was deleted with writes a run with the AOF off had never loaded. With
+/// any other `dump.kdb.gen`, nothing is done.
+fn keep_finished_old_log() -> std::io::Result<()> {
+    if read_saved().is_some_and(|saved| saved.alone)
+        && let Some(name) = keep_aside(AOF_PREV_PATH)?
+    {
+        sync_dir()?;
+        log_warn!(
+            "{}",
+            kept_warning(
+                NewLogWhy::FinishedBesideSaveWithAofOff,
+                AOF_PREV_PATH,
+                &name
+            )
+        );
+    }
+    Ok(())
 }
 
 /// Write `bytes` to `path` so that a crash leaves the old file or the whole
@@ -1913,7 +1997,10 @@ fn checkpoint_completed(log: &[u8]) -> bool {
 /// number of any log on disk, so that a new dump never shares its number
 /// with a log that does not go with it.
 pub(crate) fn next_generation() -> u64 {
-    let logs = [AOF_PATH, AOF_PREV_PATH]
+    // A turn-over's new log too, left by one that stopped: the next start
+    // with the AOF on puts it in place. A save that took its number made
+    // the old log beside it read as that of a finished checkpoint (#368).
+    let logs = [AOF_PATH, AOF_PREV_PATH, TURN_OVER_TMP]
         .into_iter()
         .filter_map(|path| aof_delta_generation(&read_head(path)))
         .max()
@@ -1993,10 +2080,16 @@ impl DumpOnDisk {
         match (aof_delta_generation(&head), *own) {
             // The number is this dump's: an older log goes with an older
             // one, unless it was added to after this dump was saved.
-            (Some(log), true) if log < saved.number => match added_to_since(path, saved) {
-                Some(from) => LogAge::AddedToFrom(from),
-                None => LogAge::Older,
-            },
+            (Some(log), true) if log < saved.number => {
+                if written_since_a_save_with_no_log(path, saved) {
+                    LogAge::AddedToFrom(AOF_DELTA_HEADER_LEN as u64)
+                } else {
+                    match added_to_since(path, saved) {
+                        Some(from) => LogAge::AddedToFrom(from),
+                        None => LogAge::Older,
+                    }
+                }
+            }
             // No log goes with this dump: one with no header is older, if it
             // is as it was when the dump was saved.
             (None, true) if saved.alone && !head.is_empty() => {
@@ -2022,10 +2115,9 @@ impl DumpOnDisk {
     /// than the dump (#363). Left out with the old log, its records were only
     /// in the copy kept aside. It is when it holds records, the dump is the
     /// one `dump.kdb.gen` was written for, and it is a log with no header (as
-    /// without the old log, it is replayed whole), or a delta on this dump's
-    /// number, or one made after the save, when there was no log: 1.2.0
-    /// makes a delta on the next number then, for an old log with no log
-    /// beside it, and adds to it.
+    /// without the old log, it is replayed whole), or one made after the
+    /// save, when there was no log: 1.2.0 makes a delta on the next number
+    /// then, for an old log with no log beside it, and adds to it.
     fn replayed_beside_an_older_old_log(&self, buf: &[u8]) -> bool {
         let Some((saved, own)) = self.saved.as_ref().filter(|_| self.kdb) else {
             return false;
@@ -2033,11 +2125,33 @@ impl DumpOnDisk {
         if !*own || buf.len() <= records_start(buf) || buf.starts_with(AOF_MAGIC) {
             return false;
         }
+        // A delta on this dump's number is never here: `checkpoint_completed`
+        // is true for it, and the old log is not judged at all. One on a
+        // number below it, made after the save, is added to (see
+        // [`written_since_a_save_with_no_log`]); this is one above it.
         match aof_delta_generation(buf) {
             None => true,
-            Some(number) => number == saved.number || saved.logs.is_some_and(|logs| logs[0].0 == 0),
+            Some(_) => saved.logs.is_some_and(|logs| logs[0].0 == 0),
         }
     }
+}
+
+/// Whether the delta at `path`, holding records, was made after the dump of
+/// `saved` was saved with the AOF off, when there was no such log: all its
+/// records were written since, whatever the number in its header. 1.2.0 puts
+/// a turn-over's new log left from before the save in place, a delta on a
+/// number below the save's, and adds to it; read as older than the dump, the
+/// log was left out with those writes.
+///
+/// Only for the log. An old log made after such a save, a delta below its
+/// number, is not reached: 1.2.0 starts a log with no header where there is
+/// none, and its turn-overs give the new log a number past the save's.
+fn written_since_a_save_with_no_log(path: &str, saved: &Saved) -> bool {
+    let Some(logs) = saved.logs.filter(|_| saved.alone && path == AOF_PATH) else {
+        return false;
+    };
+    logs[0].0 == 0
+        && std::fs::metadata(path).is_ok_and(|meta| meta.len() > AOF_DELTA_HEADER_LEN as u64)
 }
 
 /// Where what was added to the log at `path` since the dump of `saved` was
@@ -2933,7 +3047,30 @@ pub fn recover_local(
             // None: the checkpoint that left it behind finished.
             let prev_age = (!checkpoint_completed(&buf)).then(|| on_disk.age_of(AOF_PREV_PATH));
             if prev_age.is_none() {
-                let _ = std::fs::remove_file(AOF_PREV_PATH);
+                // Not left in place if it cannot be kept aside: a checkpoint
+                // would remove it later, kept or not.
+                // With a dump saved with the AOF off, the old log may hold
+                // writes it does not: it is not removed without a copy, and
+                // the server does not start without one. Otherwise the dump
+                // holds them, and an old log that cannot be removed is left
+                // in place: the next start, or the next turn-over, removes
+                // it (#375).
+                if let Err(e) = keep_finished_old_log() {
+                    log_fatal!(
+                        "{AOF_PREV_PATH}, left by a checkpoint that finished, cannot be kept \
+                         aside: {e}. dump.kdb was saved with the AOF off since, and may not hold \
+                         its writes, so it is not removed without a copy. Free disk space in the \
+                         data directory, or move {AOF_PREV_PATH} out of it, and start again"
+                    );
+                    std::process::exit(1);
+                }
+                if let Err(e) = remove_if_there(AOF_PREV_PATH) {
+                    log_warn!(
+                        "AOF: {AOF_PREV_PATH}, left by a checkpoint that finished, could not be \
+                         removed: {e} — it is left in place, and the next start or checkpoint \
+                         removes it"
+                    );
+                }
             } else if prev_age == Some(LogAge::Older) {
                 // The log is judged on its own. What was added to it since
                 // the dump was saved goes on from the dump (#359), and so
@@ -3497,6 +3634,16 @@ mod kept_warning_tests {
         );
         assert!(prev_added.contains("has been replayed"), "{prev_added}");
         assert!(!says_to_apply(&prev_added), "{prev_added}");
+    }
+
+    /// The old log of a finished checkpoint beside a save with the AOF off
+    /// may hold records the dataset has: no command to send it whole (#368).
+    #[test]
+    fn an_old_log_kept_beside_a_save_with_the_aof_off_is_not_to_be_sent_whole() {
+        let warning = kept_warning(NewLogWhy::FinishedBesideSaveWithAofOff, AOF_PREV_PATH, NAME);
+        assert!(!says_to_apply(&warning), "{warning}");
+        assert!(warning.contains("send only those"), "{warning}");
+        assert!(warning.contains(NAME), "{warning}");
     }
 
     /// One whose writes were never loaded says how to apply them.
