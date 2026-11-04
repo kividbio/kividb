@@ -181,16 +181,28 @@ pub fn sweep(store: &Store, index_store: &IndexStore) {
             }
             emptied = removed;
         }
-        drop(order);
-        drop(command);
         // Fields went: the indexes that cover the hash are brought up to
         // date with what it holds now. Also when none was found here to
         // expire: a read that came first dropped them (and left the indexes
         // as they were), and once the watch is dropped below, queries stop
-        // trying this document themselves (see `watched_keys`).
+        // trying this document themselves (see `watched_keys`). Under the
+        // key's write order, as a command brings the indexes up to date with
+        // its write. Out of it, an `HSET` that ran between this reading the
+        // hash and writing its postings was written over with what this had
+        // read, and the hash, no longer watched, was not tried again (#364).
         if !emptied {
             crate::vector::reindex_key(index_store, store, db, &key, crate::vector::Write::Refresh);
         }
+        // The watch too, as a command that gives a field a time to live
+        // tracks the hash under the order. Out of it, an `HPEXPIRE` that ran
+        // meanwhile tracked its field onto this watch, which was then
+        // dropped: the field was never swept, and queries trusted the
+        // postings for the hash from then on (#364).
+        #[cfg(test)]
+        crate::test_hooks::at("sweep: watch");
+        settle_watch(id, db, &key, next, now);
+        drop(order);
+        drop(command);
 
         if let Some(hub) = &hub {
             if !expired.is_empty() {
@@ -222,22 +234,27 @@ pub fn sweep(store: &Store, index_store: &IndexStore) {
         for _ in &expired {
             crate::stats::record_expired_subkey();
         }
+    }
+}
 
-        let mut watched = WATCHED.lock();
-        if let Some(watched) = watched.as_mut() {
-            let entry = (id, db, key);
-            match next {
-                // A field given a TTL while this ran may be due sooner than
-                // what was just worked out: keep the earlier.
-                Some(at) => {
-                    let current = watched.entry(entry).or_insert(at);
-                    if *current <= now || at < *current {
-                        *current = at;
-                    }
+/// What the sweep of `key`, which began at `now`, leaves of its watch: kept
+/// for `next`, the time its next field is due, or dropped. Under the key's
+/// write order.
+fn settle_watch(id: usize, db: usize, key: &str, next: Option<Instant>, now: Instant) {
+    let mut watched = WATCHED.lock();
+    if let Some(watched) = watched.as_mut() {
+        let entry = (id, db, key.to_string());
+        match next {
+            // Due sooner than the field this found, if a time to live was
+            // given before this took the order: keep the earlier.
+            Some(at) => {
+                let current = watched.entry(entry).or_insert(at);
+                if *current <= now || at < *current {
+                    *current = at;
                 }
-                None => {
-                    watched.remove(&entry);
-                }
+            }
+            None => {
+                watched.remove(&entry);
             }
         }
     }
@@ -282,6 +299,167 @@ mod tests {
             }
             _ => None,
         }
+    }
+
+    /// An index named `prefix` of the hashes under it, with a NUMERIC `n`,
+    /// in `index_store`; and at `key` a hash with `n = 1`, whose time to
+    /// live has just ended, and `o = x`: in the postings, and watched.
+    fn hash_losing_n(
+        store: &Store,
+        index_store: &IndexStore,
+        prefix: &str,
+        key: &str,
+    ) -> crate::vector::IndexDef {
+        use crate::vector::{FieldOptions, FieldType, IndexOn, IndexSchema, SchemaField};
+        let def = IndexSchema {
+            name: prefix.into(),
+            db_index: 0,
+            on: IndexOn::Hash,
+            prefixes: vec![prefix.into()],
+            fields: vec![SchemaField {
+                name: "n".into(),
+                field_type: FieldType::Numeric,
+                options: FieldOptions::default(),
+            }],
+            aliases: Vec::new(),
+            stopwords: None,
+            synonyms: Default::default(),
+            language: Default::default(),
+        }
+        .into_def();
+        index_store.write().insert(prefix.into(), def.clone());
+        let fields: Vec<(String, Arc<[u8]>)> = vec![
+            ("n".into(), Arc::from(&b"1"[..])),
+            ("o".into(), Arc::from(&b"x"[..])),
+        ];
+        let mut inner = HashInner::new();
+        for (name, value) in &fields {
+            inner.fields.insert(name.clone(), Arc::clone(value));
+        }
+        inner
+            .expiries
+            .insert("n".into(), Instant::now() + Duration::from_millis(1));
+        crate::store::get_shard(&store[0], key).write().insert(
+            key,
+            KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(inner))),
+        );
+        let mut p = def.postings.write();
+        p.write(key, &fields, true);
+        def.postings.done(p);
+        track_key(store, 0, key);
+        std::thread::sleep(Duration::from_millis(5));
+        def
+    }
+
+    /// `write` on a thread of its own, holding the write order of `key` as
+    /// a command does, given 300 ms to finish: it finishes if nothing holds
+    /// the order, and waits for it otherwise. The thread, to join.
+    fn write_beside(
+        key: &'static str,
+        write: impl FnOnce() + Send + 'static,
+    ) -> std::thread::JoinHandle<()> {
+        let (done, finished) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let _order = crate::write_order::lock_keys(0, std::iter::once(key.as_bytes()));
+            write();
+            let _ = done.send(());
+        });
+        let _ = finished.recv_timeout(Duration::from_millis(300));
+        thread
+    }
+
+    /// The field-TTL hash at `key` of `store`, to write to.
+    fn hash_at(store: &Store, key: &str) -> Arc<parking_lot::RwLock<HashInner>> {
+        match crate::store::get_shard(&store[0], key).read().get(key) {
+            Some(ValueRef::HashEx(hash)) => Arc::clone(hash),
+            _ => panic!("no hash with field TTLs at {key}"),
+        }
+    }
+
+    /// An `HSET` that comes while the sweep brings a hash's postings up to
+    /// date, after the sweep has read the hash's fields, waits for the
+    /// sweep, and is not written over with what the sweep read (#364).
+    #[test]
+    fn a_write_beside_the_sweep_is_not_written_over_in_the_postings() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        const KEY: &str = "f364w:k";
+        // Again if a replay elsewhere in the process deferred indexing, and
+        // the sweep did not get to the postings.
+        for _ in 0..50 {
+            let store = crate::store::new_store(1);
+            let index_store = crate::vector::new_index_store();
+            let def = hash_losing_n(&store, &index_store, "f364w:", KEY);
+            let beside = Rc::new(RefCell::new(None));
+            {
+                let (store, def, beside) = (Arc::clone(&store), def.clone(), Rc::clone(&beside));
+                crate::test_hooks::set("index_fields: fields read", move || {
+                    // HSET k n 3.
+                    *beside.borrow_mut() = Some(write_beside(KEY, move || {
+                        let three: Arc<[u8]> = Arc::from(&b"3"[..]);
+                        hash_at(&store, KEY)
+                            .write()
+                            .fields
+                            .insert("n".into(), Arc::clone(&three));
+                        def.postings
+                            .write_fields(KEY, &[("n".into(), three)], false, None);
+                    }));
+                });
+            }
+            sweep(&store, &index_store);
+            crate::test_hooks::clear("index_fields: fields read");
+            let Some(thread) = beside.borrow_mut().take() else {
+                continue;
+            };
+            thread.join().unwrap();
+            let p = def.postings.read();
+            let id = p.id(KEY).expect("still in the index");
+            let found = p.range("n", 0.0, false, 10.0, false).unwrap();
+            assert!(found.get(id), "the postings lost the n the HSET wrote");
+            return;
+        }
+        panic!("the sweep never got to the postings");
+    }
+
+    /// An `HPEXPIRE` that comes while the sweep settles a hash's watch, the
+    /// sweep having found no field left with a time to live, waits for the
+    /// sweep, and its field is watched (#364).
+    #[test]
+    fn a_ttl_given_beside_the_sweep_is_watched() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        const KEY: &str = "f364t:k";
+        let store = crate::store::new_store(1);
+        let index_store = crate::vector::new_index_store();
+        hash_losing_n(&store, &index_store, "f364t:", KEY);
+        let beside = Rc::new(RefCell::new(None));
+        {
+            let (store, beside) = (Arc::clone(&store), Rc::clone(&beside));
+            crate::test_hooks::set("sweep: watch", move || {
+                // HPEXPIRE k 60000 FIELDS 1 o.
+                *beside.borrow_mut() = Some(write_beside(KEY, move || {
+                    hash_at(&store, KEY)
+                        .write()
+                        .expiries
+                        .insert("o".into(), Instant::now() + Duration::from_secs(60));
+                    track_key(&store, 0, KEY);
+                }));
+            });
+        }
+        sweep(&store, &index_store);
+        crate::test_hooks::clear("sweep: watch");
+        beside
+            .borrow_mut()
+            .take()
+            .expect("the sweep settled the watch")
+            .join()
+            .unwrap();
+        assert_eq!(fields_of(&store, KEY).unwrap(), ["o"], "n was swept");
+        assert_eq!(
+            watched_keys(&store, 0),
+            [KEY],
+            "o has a time to live, and the hash is watched"
+        );
     }
 
     #[test]

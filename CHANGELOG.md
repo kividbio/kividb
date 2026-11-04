@@ -226,10 +226,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that document itself. A sweep that ran while a query was reading the
   postings queued its update behind the query, and stopped watching the
   hash before the query looked at which hashes were watched: the query took
-  the postings' word for the document. `FT.AGGREGATE` counted it, and so
-  could `FT.SEARCH` where it answers from the postings without reading the
-  documents (`LIMIT 0 0`). A query now reads which hashes are watched
-  before it reads the postings.
+  the postings' word for the document. `FT.AGGREGATE` counted it; a count
+  of `FT.SEARCH` (`LIMIT 0 0`) could count it, and `FT.SEARCH`'s other
+  answers, `FT.HYBRID` and a KNN query with a TAG or NUMERIC filter could
+  return it. A query now reads which hashes are watched before it reads the
+  postings.
+- **The field-expiry sweep could leave a hash's postings stale, and stop
+  watching it (#364).** Three ways, each leaving queries to trust TAG,
+  NUMERIC or TEXT postings that no longer said what the hash held:
+  - The sweep brought the postings up to date after letting go of the
+    key's write order. An `HSET` that came between its reading the hash and
+    its writing them lost its fields from the postings, until the next
+    write to the key.
+  - It dropped the hash from the hashes it watches after letting go of the
+    order too. An `HPEXPIRE` that came in between was forgotten: that
+    field was never swept, no `hexpired` was published, and a hash all of
+    whose fields had expired stayed in the keyspace.
+  - A TEXT query of an index with no TAG or NUMERIC field, or with its
+    postings off (`FT.DEBUG POSTINGS … OFF`), took the TEXT index's word for
+    a hash whose TEXT field a read had dropped (`HGETALL` past its time),
+    until the sweep came, up to 100 ms later. `FT.SEARCH` and `FT.HYBRID`
+    returned it.
+
+  The sweep now does both under the key's write order, as a command does,
+  and such a TEXT query tries the watched hashes it finds, as other queries
+  do.
 
 ## [1.2.0] - 2026-11-03
 
