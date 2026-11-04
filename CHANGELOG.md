@@ -29,6 +29,38 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A reshard under load could lose acknowledged writes (#331).** A write
+  was routed ("is the key here?") before it entered the write gate, and the
+  key could move in between. This hit both ways of moving slots:
+  - **Key by key (`MIGRATE`, `redis-cli --cluster reshard`).** If a whole
+    `MIGRATE` of the key ran in between, the write ran on the source, on a
+    key that had left, and made it again. The client got a wrong reply,
+    later writes went to a copy no client was routed to, and the reshard
+    stopped on `BUSYKEY`. Finishing it dropped the source's copy, or
+    `MIGRATE ... REPLACE` overwrote the destination's value with it.
+  - **Atomic slot migration (`CLUSTER MIGRATION IMPORT`, used by the
+    Kubernetes operator).** If the whole handoff ran in between, the write
+    ran on the source on a slot the destination now owned. It was deleted
+    with the slot's keys, or left behind them.
+
+  Either way, acknowledged writes were lost. A write now checks inside the
+  gate whether keys have left the node, or a slot has changed state, since
+  it was routed. If so, it is routed again there and sent on with `-ASK` or
+  `-MOVED`. The same holds for `EXEC` and for scripts. Ordinary commands
+  still pay one atomic load.
+- **A transaction could lose its writes during an atomic slot migration's
+  handoff.** An `EXEC` that got past the write pause just before the
+  handoff set it ran during the handoff. Its writes were not sent to the
+  destination, and were deleted with the slots. Such an `EXEC` is now
+  refused with `TRYAGAIN` if it writes. So is one that reaches its gates
+  during a manual failover's handoff.
+- **`MIGRATE` no longer answers `TRYAGAIN` for an unchanged hash whose field
+  is about to expire (#332).** The check that a moved hash was not written
+  meanwhile compared the server's fields by the monotonic clock and the
+  payload's fields by a time rounded down by up to 2 ms. In a field's last
+  2 ms, an unchanged hash looked written, and `redis-cli --cluster reshard`
+  stopped. No data was lost. Both sides are now compared by one clock and
+  one rule: a field within 5 ms of its time may be missing on either side.
 - **`SCRIPT HELP` lists the `SCRIPT` subcommands, as in Redis.** It was an
   unknown subcommand (#256).
 
