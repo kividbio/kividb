@@ -75,6 +75,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   directory with the AOF on, is no longer left out with the writes added to
   it: a log with no header is replayed, as 1.2.0 replayed it, and a delta
   with an older save number is replayed from where it was at the save. The
+  save number in each log's header is recorded too: an
+  `appendonly.aof.prev` that a 1.2.0 checkpoint added the log's records to
+  is replayed only from after those records, which the dump holds, and a
+  log added to beside an old log that was not is no longer left out with
+  it. The warning for a log kept aside says whether its writes are already
+  in the dataset, and then not to send them to the server, which would
+  apply them twice. The
   directory is synced between putting the save number in place and the
   dump, so a power cut cannot keep the new dump with the old number, which
   left out the logs that go on from it. A copy of a log kept aside that
