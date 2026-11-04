@@ -1085,9 +1085,19 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // locks of its shard (`PFADD`, `HINCRBY` on a new key, `BITFIELD`, the
     // `*STORE` commands) lost updates without it (#271).
     //
-    // A write its master sent is already in order: the stream is one
-    // connection, applied by one task.
+    // A write its master sent is in order with the others it sent: the
+    // stream is one connection, applied by one task. It still takes the
+    // order of its keys (`keys_ordered`), as a command does, against the
+    // field-expiry sweep, which brought a hash's postings up to date over an
+    // `HSET` applied meanwhile, or dropped its watch over an `HPEXPIREAT`
+    // (#371). Only while the sweep has a hash to watch: with none, no sweep
+    // is part way through one, and the order cost every applied write 4 to 8
+    // per cent more instructions. Only that, too: it takes the gate as it did,
+    // after the applier's lock (`replica_client`), and never alone for a
+    // flush. Not while the AOF is replayed: nothing else writes then.
     let ordered = gated && !ctx.apply_replication;
+    let keys_ordered =
+        ordered || (gated && !crate::expiry::replaying() && crate::field_expiry::any_watched());
 
     // Every command runs inside the command gate; a script — read-only or
     // not — and a flush that has to be ordered take it alone. So does
@@ -1254,7 +1264,10 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         // No other command is running: there is nothing to be ordered
         // against, and the writes made from inside this one take nothing.
         Some(crate::write_order::held_exclusively())
-    } else if ordered && !replication::write_is_observed(ctx) && atomic_under_its_shard(ctx, name) {
+    } else if keys_ordered
+        && !replication::write_is_observed(ctx)
+        && atomic_under_its_shard(ctx, name)
+    {
         // Its key's order shared, beside the writes like it, which the shard
         // orders (see `write_order::lock_key_shared`). Not while anything
         // reads the write stream: the stream carries the writes to a key in
@@ -1263,14 +1276,17 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
             *ctx.selected_db,
             ctx.cmd[1],
         ))
-    } else if ordered && matches!(name, "MSET" | "MSETNX") && !replication::write_is_observed(ctx) {
+    } else if keys_ordered
+        && matches!(name, "MSET" | "MSETNX")
+        && !replication::write_is_observed(ctx)
+    {
         // Each key's order shared: both write every key under all of their
         // shards' locks at once (`WriteShards`), so the shards order them
         // against each other and against the writes above; see
         // `write_order::lock_keys_shared`. Whole while anything reads the
         // write stream, as every other write is.
         Some(order_of_pairs_shared(ctx))
-    } else if ordered {
+    } else if keys_ordered {
         let keys = crate::keyspec::key_positions(name, &ctx.cmd);
         let here = *ctx.selected_db;
         match database_written_too(ctx, name) {

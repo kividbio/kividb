@@ -278,12 +278,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - A TEXT query of an index with no TAG or NUMERIC field, or with its
     postings off (`FT.DEBUG POSTINGS … OFF`), took the TEXT index's word for
     a hash whose TEXT field a read had dropped (`HGETALL` past its time),
-    until the sweep came, up to 100 ms later. `FT.SEARCH` and `FT.HYBRID`
-    returned it.
+    until the sweep came, up to 100 ms later. `FT.SEARCH`, `FT.HYBRID` and
+    a KNN query with a TEXT filter returned it.
 
   The sweep now does both under the key's write order, as a command does,
   and such a TEXT query tries the watched hashes it finds, as other queries
   do.
+- **On a replica, the field-expiry sweep could still leave a hash's
+  postings stale, and stop watching it (#371).** A write applied from the
+  master's stream took no write order, so the two ways above remained
+  there: an `HSET` from the master lost its fields from the replica's
+  postings, and an `HPEXPIREAT` from the master was forgotten, its field
+  never swept on the replica, nor after a failover on the replica promoted.
+  A write applied from the stream now takes the order of its keys, as a
+  command does.
 
 ## [1.2.0] - 2026-11-03
 
