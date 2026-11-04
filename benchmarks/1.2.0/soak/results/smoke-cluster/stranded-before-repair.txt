@@ -1,0 +1,17 @@
+ack:3:7958 owner-src=0 importing-dst=MOVED 0 10.70.1.10:7002
+ack:4:11404 owner-src=0 importing-dst=MOVED 0 10.70.1.10:7002
+ack:4:14376 owner-src=0 importing-dst=MOVED 0 10.70.1.10:7002
+ack:5:11627 owner-src=0 importing-dst=MOVED 0 10.70.1.10:7002
+ack:5:14155 owner-src=0 importing-dst=MOVED 0 10.70.1.10:7002
+ack:6:14731 owner-src=0 importing-dst=MOVED 0 10.70.1.10:7002
+ack:6:22080 owner-src=0 importing-dst=MOVED 0 10.70.1.10:7002
+ack:7:14512 owner-src=0 importing-dst=MOVED 0 10.70.1.10:7002
+ack:8:5206 owner-src=0 importing-dst=MOVED 0 10.70.1.10:7002
+ack:9:4657 owner-src=0 importing-dst=MOVED 0 10.70.1.10:7002
+ack:9:19249 owner-src=0 importing-dst=MOVED 0 10.70.1.10:7002
+ack:10:7152 owner-src=0 importing-dst=MOVED 0 10.70.1.10:7002
+ack:11:3271 owner-src=0 importing-dst=MOVED 0 10.70.1.10:7002
+ack:12:17878 owner-src=0 importing-dst=MOVED 0 10.70.1.10:7002
+ack:14:21300 owner-src=0 importing-dst=MOVED 0 10.70.1.10:7002
+ack:15:17692 owner-src=0 importing-dst=MOVED 0 10.70.1.10:7002
+ack:15:21123 owner-src=0 importing-dst=MOVED 0 10.70.1.10:7002

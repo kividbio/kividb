@@ -2,10 +2,10 @@ use crate::commands::ctx::Ctx;
 use crate::commands::helpers::{
     ERR_INVALID_EXPIRE_PEXPIRE_CMD, ERR_INVALID_EXPIRE_PEXPIREAT_CMD, ERR_VALUE_NOT_INTEGER,
     ExpireModifierFlags, absolute_when_ms_from_pexpire_ms, delete_key, delete_key_if_expired,
-    expire_modifier_allows_set, expire_on_read, expiry_at_after, expiry_unix_millis,
-    expiry_unix_secs, from_unix_ms, get_expiry, glob_match, is_expired, lazy_expire_on_read,
-    parse_bytes_as_i128, parse_expire_modifier_flags, parse_utf8, set_expiry,
-    system_time_from_unix_millis_i128, take_key, ttl_remaining_secs_ceil,
+    expire_modifier_allows_set, expire_on_read, expiry_at_after, expiry_unix_millis, from_unix_ms,
+    get_expiry, glob_match, is_expired, lazy_expire_on_read, parse_bytes_as_i128,
+    parse_expire_modifier_flags, parse_utf8, set_expiry, system_time_from_unix_millis_i128,
+    take_key, ttl_remaining_secs_ceil,
 };
 use crate::keyspace_events::{KS_GENERIC, notify};
 use crate::resp::write::*;
@@ -139,6 +139,14 @@ fn encoding_of(value: ValueRef<'_>) -> &'static str {
 /// key with a time to live deleted it and answered 1, where Redis answers 0
 /// and leaves the key as it was (#270). An answer of 0 propagates nothing
 /// (`script_feed::expire_feed`); a deletion goes as a `DEL`.
+///
+/// While the AOF is replayed (`expiry::replaying`) a moment that has come
+/// deletes nothing: it is set, as Redis sets it while it loads. The log's
+/// `PEXPIREAT k t` was written while `t` was ahead, and the writes after it
+/// were made to the key that had it: deleted here, the replayed `HSET k …`
+/// that followed made a new key of what came after, with no time to live,
+/// for good. Set, the key keeps its deadline, the writes go into it, and
+/// expiry takes it out once the load is done, with its `DEL` logged.
 pub(crate) fn apply_expire(
     ctx: &Ctx,
     key: &str,
@@ -146,6 +154,7 @@ pub(crate) fn apply_expire(
     deletes: bool,
     flags: &ExpireModifierFlags,
 ) -> Vec<u8> {
+    let deletes = deletes && !crate::expiry::replaying();
     let db = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db, key);
     if !read_lock!(shard).contains_key(key) {
@@ -567,14 +576,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(n) => n,
                 None => return Some(resp_error(ERR_VALUE_NOT_INTEGER)),
             };
-            if unix_secs < 0 {
-                return Some(resp_error("ERR invalid expire time in EXPIREAT"));
-            }
-            let unix_secs_u64 = match u64::try_from(unix_secs) {
-                Ok(n) => n,
-                Err(_) => return Some(resp_error("ERR invalid expire time in EXPIREAT")),
+            let unix_ms = match unix_secs.checked_mul(1000) {
+                Some(ms) => ms,
+                None => return Some(resp_error("ERR invalid expire time in EXPIREAT")),
             };
-            let new_exp = expiry_unix_secs(unix_secs_u64);
+            let new_exp = match system_time_from_unix_millis_i128(unix_ms) {
+                Some(t) => t,
+                None => return Some(resp_error("ERR invalid expire time in EXPIREAT")),
+            };
             let now = crate::script_clock::wall_system_time_now();
             Some(apply_expire(ctx, key, new_exp, new_exp <= now, &flags))
         }
@@ -1308,6 +1317,25 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     _ => return Some(resp_error("ERR syntax error")),
                 }
                 i += 1;
+            }
+
+            // A `BY` pattern with a `*`, and a `GET` pattern other than `#`,
+            // read keys named by the elements. As in Redis, they need read
+            // access to every key. A `BY` with no `*` reads no key: it only
+            // skips the sort.
+            let by_reads_keys = by_pattern.as_deref().is_some_and(|p| p.contains('*'));
+            let get_reads_keys = get_patterns.iter().any(|p| p != "#");
+            if by_reads_keys || get_reads_keys {
+                let acl = ctx.acl_store.read();
+                let restricted = acl
+                    .get(ctx.authenticated_user)
+                    .is_some_and(|user| !user.reads_all_keys());
+                if restricted {
+                    let option = if by_reads_keys { "BY" } else { "GET" };
+                    return Some(resp_error(&format!(
+                        "ERR {option} option of SORT denied due to insufficient ACL permissions."
+                    )));
+                }
             }
 
             // ── Collect elements ───────────────────────────────────────────────

@@ -1,0 +1,63 @@
+{
+ "round": 1,
+ "probe": "a",
+ "seconds": 748.7,
+ "conns": [
+  {
+   "conn": 0,
+   "ops": 46793,
+   "over_10ms_pct": 95.4,
+   "over_100ms_pct": 69.6,
+   "worst_ms": 2150
+  },
+  {
+   "conn": 1,
+   "ops": 46792,
+   "over_10ms_pct": 92.2,
+   "over_100ms_pct": 57.0,
+   "worst_ms": 1356
+  },
+  {
+   "conn": 2,
+   "ops": 46793,
+   "over_10ms_pct": 100.0,
+   "over_100ms_pct": 100.0,
+   "worst_ms": 568082
+  },
+  {
+   "conn": 3,
+   "ops": 46793,
+   "over_10ms_pct": 100.0,
+   "over_100ms_pct": 100.0,
+   "worst_ms": 568387
+  },
+  {
+   "conn": 4,
+   "ops": 46793,
+   "over_10ms_pct": 93.2,
+   "over_100ms_pct": 59.8,
+   "worst_ms": 1891
+  },
+  {
+   "conn": 5,
+   "ops": 46793,
+   "over_10ms_pct": 95.4,
+   "over_100ms_pct": 69.4,
+   "worst_ms": 2284
+  },
+  {
+   "conn": 6,
+   "ops": 46793,
+   "over_10ms_pct": 95.4,
+   "over_100ms_pct": 69.9,
+   "worst_ms": 2234
+  },
+  {
+   "conn": 7,
+   "ops": 46793,
+   "over_10ms_pct": 100.0,
+   "over_100ms_pct": 100.0,
+   "worst_ms": 567515
+  }
+ ]
+}

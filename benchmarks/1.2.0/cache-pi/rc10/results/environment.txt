@@ -1,0 +1,75 @@
+builder (b1, Standard_D8pls_v5):
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+cargo 1.99.1 (5f94df478 2026-08-27)
+gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+7.0.0-1017-azure
+
+harness (client):
+6d774921824a7ef2ce39f597cef5c2b72e983d24 Fri Oct 23 08:23:12 2026 +0800 Update Umem-cache client
+go version go1.25.3 linux/arm64
+
+s1 environment:
+7.0.0-1017-azure
+CPU(s):                                  4
+Model name:                              Neoverse-N1
+L2 cache:                                4 MiB (4 instances)
+L3 cache:                                32 MiB (1 instance)
+               total        used        free      shared  buff/cache   available
+Mem:            7911        1510        5728           3         851        6401
+PRETTY_NAME="Ubuntu 24.04.5 LTS"
+
+s2 environment:
+7.0.0-1017-azure
+CPU(s):                                  4
+Model name:                              Neoverse-N1
+L2 cache:                                4 MiB (4 instances)
+L3 cache:                                32 MiB (1 instance)
+               total        used        free      shared  buff/cache   available
+Mem:            7911         883        6356           3         850        7027
+PRETTY_NAME="Ubuntu 24.04.5 LTS"
+
+c1 environment:
+7.0.0-1017-azure
+CPU(s):                                  4
+Model name:                              Neoverse-N1
+L2 cache:                                4 MiB (4 instances)
+L3 cache:                                32 MiB (1 instance)
+               total        used        free      shared  buff/cache   available
+Mem:            7911        2075        4719           3        1316        5835
+PRETTY_NAME="Ubuntu 24.04.5 LTS"
+
+c2 environment:
+7.0.0-1017-azure
+CPU(s):                                  4
+Model name:                              Neoverse-N1
+L2 cache:                                4 MiB (4 instances)
+L3 cache:                                32 MiB (1 instance)
+               total        used        free      shared  buff/cache   available
+Mem:            7911        2063        4731           3        1316        5847
+PRETTY_NAME="Ubuntu 24.04.5 LTS"
+
+=== pair 3 (fresh VMs, 16:40 UTC; extra LRU round)
+builder (b1, Standard_D8pls_v5):
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+cargo 1.99.1 (5f94df478 2026-08-27)
+7.0.0-1017-azure
+
+pair 3 s1 environment:
+7.0.0-1017-azure
+CPU(s):                                  4
+Model name:                              Neoverse-N1
+L2 cache:                                4 MiB (4 instances)
+L3 cache:                                32 MiB (1 instance)
+               total        used        free      shared  buff/cache   available
+Mem:            7911         684        6555           3         850        7226
+PRETTY_NAME="Ubuntu 24.04.5 LTS"
+
+pair 3 c1 environment:
+7.0.0-1017-azure
+CPU(s):                                  4
+Model name:                              Neoverse-N1
+L2 cache:                                4 MiB (4 instances)
+L3 cache:                                32 MiB (1 instance)
+               total        used        free      shared  buff/cache   available
+Mem:            7911        2060        4735           3        1316        5851
+PRETTY_NAME="Ubuntu 24.04.5 LTS"

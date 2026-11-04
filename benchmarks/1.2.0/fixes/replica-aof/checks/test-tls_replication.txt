@@ -1,0 +1,7 @@
+    Finished `release` profile [optimized] target(s) in 0.05s
+     Running tests/tls_replication.rs (/mnt/target/release/deps/tls_replication-e418bda6518fe178)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

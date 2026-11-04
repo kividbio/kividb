@@ -806,7 +806,7 @@ fn a_backup_from_before_a_restart_can_be_listed_and_cleaned_up() {
 /// restart (#150).
 #[test]
 fn a_sealed_backup_from_before_a_restart_still_runs_out() {
-    let mut server = Server::start(&["--backup-sealed-ttl", "3"]);
+    let mut server = Server::start(&["--backup-sealed-ttl", "10"]);
     let mut c = server.conn();
     assert!(c.cmd(&["BACKUP", "START"]).ok());
     wait_for_state(&mut c, "incrementing");
@@ -814,7 +814,7 @@ fn a_sealed_backup_from_before_a_restart_still_runs_out() {
     drop(c);
     server.child.kill().unwrap();
     server.child.wait().unwrap();
-    server.child = kividb(&server.dir, server.port, &["--backup-sealed-ttl", "3"])
+    server.child = kividb(&server.dir, server.port, &["--backup-sealed-ttl", "10"])
         .stderr(Stdio::null())
         .spawn()
         .expect("could not restart kividb");
@@ -853,6 +853,46 @@ fn a_single_snapshot_can_be_preloaded() {
     let preload = format!("rdb:{}", source.dir.join("dump.kdb").display());
     let restored = Server::start(&["--preload-file", &preload]);
     assert_eq!(restored.conn().cmd(&["GET", "from-snapshot"]).s(), "yes");
+}
+
+/// A hash loaded from `dump.kdb` whose fields all expire after the restart
+/// is deleted when they do, like one written since: the sweep watches it.
+#[test]
+fn hashes_loaded_from_a_snapshot_lose_their_expired_fields_and_go() {
+    // Long enough that the restart below finishes before the fields are due,
+    // on a slow runner too; the wait after it counts from when they were set.
+    const TTL_MS: u64 = 10_000;
+    let ttl = TTL_MS.to_string();
+    let ttl = ttl.as_str();
+    let mut server = Server::start(&[]);
+    let mut c = server.conn();
+    let set_at = std::time::Instant::now();
+    c.cmd(&["HSET", "h1", "f1", "v1"]);
+    c.cmd(&["HPEXPIRE", "h1", ttl, "FIELDS", "1", "f1"]);
+    c.cmd(&["HSET", "h2", "f1", "v1", "f2", "v2"]);
+    c.cmd(&["HPEXPIRE", "h2", ttl, "FIELDS", "2", "f1", "f2"]);
+    c.cmd(&["HSET", "h3", "f1", "v1", "f2", "v2"]);
+    c.cmd(&["HPEXPIRE", "h3", ttl, "FIELDS", "1", "f1"]);
+    assert!(c.cmd(&["SAVE"]).ok());
+    drop(c);
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    server.child = kividb(&server.dir, server.port, &[])
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("could not restart kividb");
+
+    let mut c = server.conn();
+    assert!(
+        set_at.elapsed() < Duration::from_millis(TTL_MS),
+        "the restart took longer than the fields' TTL"
+    );
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 3);
+    // Past the deadline, plus time for the background sweep (10 a second).
+    let due = Duration::from_millis(TTL_MS + 1_500);
+    std::thread::sleep(due.saturating_sub(set_at.elapsed()));
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 1);
+    assert_eq!(c.cmd(&["HLEN", "h3"]).i(), 1);
 }
 
 // ── AOF replay ────────────────────────────────────────────────────────────────
@@ -1572,4 +1612,193 @@ fn a_script_past_its_time_limit_is_busy_and_can_be_killed() {
     // is told BUSY.
     let reply = c.cmd(&["EVAL", "return redis.call('GET', KEYS[1])", "1", "k"]);
     assert_eq!(reply.s(), "v");
+}
+
+// ── The AOF off: no file made, and none needed (#47) ─────────────────────────
+
+/// Start a server in `dir`, prepared by the test, and wait for it to listen.
+/// One that exits instead fails the test with what it said.
+fn start_in(dir: &Path, extra: &[&str]) -> Server {
+    let port = free_port();
+    let mut child = kividb(dir, port, extra)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("could not start kividb");
+    let mut stderr = child.stderr.take().unwrap();
+    let said = std::thread::spawn(move || {
+        let mut said = String::new();
+        let _ = stderr.read_to_string(&mut said);
+        said
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!(
+                "kividb exited ({status}) instead of starting: {}",
+                said.join().unwrap()
+            );
+        }
+        assert!(Instant::now() < deadline, "kividb never listened on {port}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Server {
+        port,
+        dir: dir.to_path_buf(),
+        child,
+    }
+}
+
+/// Make `dir` read-only, or writable again. A no-op off unix, and for root,
+/// which writes anyway: the tests that need a failure also put a directory
+/// where the log would go.
+fn set_read_only(dir: &Path, read_only: bool) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if read_only { 0o555 } else { 0o755 };
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    #[cfg(not(unix))]
+    let _ = (dir, read_only);
+}
+
+/// With `appendonly no`, a server makes no `appendonly.aof`, and starts in a
+/// data directory it cannot write to: the wrong owner, a full disk, a
+/// hardened systemd unit. Every start used to create the log, and one that
+/// could not stopped the server.
+#[test]
+fn the_aof_off_makes_no_log_and_starts_in_a_read_only_directory() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    set_read_only(&dir, true);
+    let server = start_in(&dir, &[]);
+    let mut c = server.conn();
+    assert!(c.cmd(&["SET", "k", "v"]).ok());
+    assert_eq!(c.cmd(&["GET", "k"]).s(), "v");
+    assert_eq!(
+        c.cmd(&["CONFIG", "GET", "appendonly"]).strings(),
+        ["appendonly", "no"]
+    );
+    set_read_only(&dir, false);
+    assert!(
+        !dir.join("appendonly.aof").exists(),
+        "appendonly.aof was made with the AOF off"
+    );
+}
+
+/// The AOF turned on with `CONFIG SET` makes its log then, and keeps what
+/// was written before and after across a restart that loads it.
+#[test]
+fn the_aof_turned_on_at_runtime_keeps_the_writes_across_a_restart() {
+    let mut server = Server::start(&[]);
+    let aof = server.dir.join("appendonly.aof");
+    let mut c = server.conn();
+    assert!(c.cmd(&["SET", "before", "1"]).ok());
+    assert!(!aof.exists(), "appendonly.aof was made with the AOF off");
+    assert!(c.cmd(&["CONFIG", "SET", "appendonly", "yes"]).ok());
+    assert!(aof.exists(), "CONFIG SET appendonly yes made no log");
+    assert!(c.cmd(&["SET", "after", "2"]).ok());
+    drop(c);
+    // Killed: what is kept is what the log and the snapshot hold.
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    let mut c = restart_with_aof(&mut server);
+    assert_eq!(c.cmd(&["GET", "before"]).s(), "1");
+    assert_eq!(c.cmd(&["GET", "after"]).s(), "2");
+}
+
+/// Turned on where its log cannot be made, the AOF is an error reply, as in
+/// Redis, not an exit: it stays off, the server goes on serving, and it can
+/// be turned on once the log can be made.
+#[test]
+fn the_aof_turned_on_where_no_log_can_be_made_is_an_error_not_an_exit() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    // A directory where the log would go fails the open for root too.
+    let blocker = dir.join("appendonly.aof");
+    std::fs::create_dir(&blocker).unwrap();
+    set_read_only(&dir, true);
+    let server = start_in(&dir, &[]);
+    let mut c = server.conn();
+    let reply = c.cmd(&["CONFIG", "SET", "appendonly", "yes"]);
+    assert!(
+        reply.is_err() && reply.s().contains("Unable to turn on AOF"),
+        "{reply:?}"
+    );
+    assert_eq!(
+        c.cmd(&["CONFIG", "GET", "appendonly"]).strings(),
+        ["appendonly", "no"]
+    );
+    assert!(c.cmd(&["SET", "k", "v"]).ok());
+    assert_eq!(c.cmd(&["GET", "k"]).s(), "v");
+
+    set_read_only(&dir, false);
+    std::fs::remove_dir(&blocker).unwrap();
+    assert!(c.cmd(&["CONFIG", "SET", "appendonly", "yes"]).ok());
+    assert!(c.cmd(&["SET", "logged", "1"]).ok());
+    let log = std::fs::read(&blocker).unwrap();
+    assert!(
+        log.windows(6).any(|w| w == b"logged"),
+        "the write after turning the AOF on is not in the log"
+    );
+}
+
+/// Started with the AOF on and a log it cannot open, the server still
+/// exits, before it serves: it would take writes and keep none of them. The
+/// log is set up before the writer's thread is spawned now, not in it.
+#[cfg(unix)]
+#[test]
+fn the_aof_on_with_a_log_that_cannot_be_opened_still_exits() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    // A link into a directory that is not there: to recovery there is no
+    // log, and none can be made through it, for root too.
+    std::os::unix::fs::symlink(
+        dir.join("missing").join("appendonly.aof"),
+        dir.join("appendonly.aof"),
+    )
+    .unwrap();
+    let output = std::fs::File::create(dir.join("server.log")).unwrap();
+    let port = free_port();
+    let mut child = kividb(&dir, port, &["--aof"])
+        .stdout(output.try_clone().unwrap())
+        .stderr(output)
+        .spawn()
+        .expect("could not start kividb");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("kividb went on with a log it cannot open");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let said = std::fs::read_to_string(dir.join("server.log")).unwrap();
+    assert!(!status.success(), "{status}: {said}");
+    assert!(
+        said.contains("appendonly.aof cannot be opened for appending"),
+        "{said}"
+    );
+    assert!(
+        TcpStream::connect(("127.0.0.1", port)).is_err(),
+        "something listens on {port}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A backup into the data directory would share its files' prefix with the
+/// server's own, and `BACKUP CLEANUP` would delete `appendonly.aof.prev` with
+/// them. It is refused.
+#[test]
+fn a_backup_into_the_data_directory_is_refused() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    std::fs::write(dir.join("kividb.conf"), "backupdirname .\n").unwrap();
+    let server = start_in(&dir, &[]);
+    let mut c = server.conn();
+    let reply = c.cmd(&["BACKUP", "START"]);
+    assert!(
+        matches!(&reply, V::Err(e) if e.contains("is the data directory")),
+        "{reply:?}"
+    );
 }

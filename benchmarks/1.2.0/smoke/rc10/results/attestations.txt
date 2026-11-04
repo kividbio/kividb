@@ -1,0 +1,31 @@
+## sha256sum -c SHA256SUMS.txt
+./kividb-linux-x86_64.tar.gz: OK
+./kividb_arm64.deb: OK
+./kividb-lua-linux-aarch64.tar.gz: OK
+./kividb-linux-aarch64.tar.gz: OK
+./kividb-tls-linux-aarch64.tar.gz: OK
+./kividb_amd64.deb: OK
+./kividb.x86_64.rpm: OK
+./kividb-tls-linux-x86_64.tar.gz: OK
+./kividb-full-linux-aarch64.tar.gz: OK
+./kividb-lua-linux-x86_64.tar.gz: OK
+./kividb.aarch64.rpm: OK
+./kividb-full-linux-x86_64.tar.gz: OK
+
+## gh attestation verify (subject, exit, ref, commit, run)
+kividb-full-linux-aarch64.tar.gz	exit=0	refs/tags/v1.2.0-rc10 39bfacd231bb runs/41650715612/attempts/1
+kividb-full-linux-x86_64.tar.gz	exit=0	refs/tags/v1.2.0-rc10 39bfacd231bb runs/41650715612/attempts/1
+kividb-linux-aarch64.tar.gz	exit=0	refs/tags/v1.2.0-rc10 39bfacd231bb runs/41650715612/attempts/1
+kividb-linux-x86_64.tar.gz	exit=0	refs/tags/v1.2.0-rc10 39bfacd231bb runs/41650715612/attempts/1
+kividb-lua-linux-aarch64.tar.gz	exit=0	refs/tags/v1.2.0-rc10 39bfacd231bb runs/41650715612/attempts/1
+kividb-lua-linux-x86_64.tar.gz	exit=0	refs/tags/v1.2.0-rc10 39bfacd231bb runs/41650715612/attempts/1
+kividb-tls-linux-aarch64.tar.gz	exit=0	refs/tags/v1.2.0-rc10 39bfacd231bb runs/41650715612/attempts/1
+kividb-tls-linux-x86_64.tar.gz	exit=0	refs/tags/v1.2.0-rc10 39bfacd231bb runs/41650715612/attempts/1
+kividb.aarch64.rpm	exit=0	refs/tags/v1.2.0-rc10 39bfacd231bb runs/41650715612/attempts/1
+kividb.x86_64.rpm	exit=0	refs/tags/v1.2.0-rc10 39bfacd231bb runs/41650715612/attempts/1
+kividb_amd64.deb	exit=0	refs/tags/v1.2.0-rc10 39bfacd231bb runs/41650715612/attempts/1
+kividb_arm64.deb	exit=0	refs/tags/v1.2.0-rc10 39bfacd231bb runs/41650715612/attempts/1
+oci://ghcr.io/kividbio/kividb:v1.2.0-rc10	exit=0	refs/tags/v1.2.0-rc10 39bfacd231bb runs/41650715612/attempts/1
+oci://ghcr.io/kividbio/kividb:v1.2.0-rc10-lua	exit=0	refs/tags/v1.2.0-rc10 39bfacd231bb runs/41650715612/attempts/1
+oci://ghcr.io/kividbio/kividb:v1.2.0-rc10-tls	exit=0	refs/tags/v1.2.0-rc10 39bfacd231bb runs/41650715612/attempts/1
+oci://ghcr.io/kividbio/kividb:v1.2.0-rc10-full	exit=0	refs/tags/v1.2.0-rc10 39bfacd231bb runs/41650715612/attempts/1

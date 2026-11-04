@@ -1,0 +1,2 @@
+before SIGTERM: master offset 575480931 replica offset 575480931 expired_keys 0 expires 0
+r2-rc6-nottl: loaded=575480931 replica_at_drop=575480945 behind=-14 partial=0 full=1

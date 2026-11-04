@@ -1,0 +1,13 @@
+1,under load,exited,0.90,2026-11-03T08:19:49.952Z 62603 [INFO] Goodbye.
+2,under load,HUNG,31.18,2026-11-03T08:20:03.852Z 64265 [INFO] Writing final snapshot...
+3,under load,HUNG,31.24,2026-11-03T08:20:51.889Z 67155 [INFO] Writing final snapshot...
+4,under load,exited,1.15,2026-11-03T08:21:40.967Z 69994 [INFO] Goodbye.
+5,under load,exited,1.15,2026-11-03T08:21:57.966Z 70948 [INFO] Goodbye.
+6,under load,exited,1.15,2026-11-03T08:22:14.675Z 71911 [INFO] Goodbye.
+7,under load,HUNG,31.15,2026-11-03T08:22:30.619Z 72864 [INFO] Writing final snapshot...
+8,under load,exited,1.21,2026-11-03T08:23:20.926Z 75807 [INFO] Goodbye.
+9,under load,exited,1.15,2026-11-03T08:23:38.173Z 76763 [INFO] Goodbye.
+10,under load,exited,1.20,2026-11-03T08:23:55.422Z 77796 [INFO] Goodbye.
+11,load stopped,exited,1.12,2026-11-03T08:24:12.813Z 78753 [INFO] Goodbye.
+kividb: 3 of 10 clean stops under load hung; control (load stopped): exited
+RS-DONE kividb

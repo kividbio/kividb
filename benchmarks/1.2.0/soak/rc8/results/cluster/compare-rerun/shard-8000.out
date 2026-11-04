@@ -1,0 +1,1 @@
+{"dbsize_a": 3639706, "dbsize_b": 3639706, "scanned_a": 3639706, "scanned_b": 3639706, "compared": 3639706, "differ_first_pass": 0, "differ_after_recheck": 0, "expiring_at_compare": 0, "hash_field_expiring": 0, "hash_settled_on_field_recheck": 0, "not_owned_keys_a_b": [22, 22], "real_differences": 0, "sample": [], "seconds": 706.2}

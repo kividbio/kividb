@@ -1,0 +1,2 @@
+{"run": "1", "acked": 3402046, "lost_acked": 1329, "wrong_value": 0, "last_ack_before_cut_t": 33.015, "first_ack_after_restart_t": 60.149, "acks_stopped_for_s": 27.1, "lost_window_s": 0.121, "lost_acked_after_restart": 0, "lost_are_each_writers_last_writes": true}
+{"run": "2", "acked": 3382614, "lost_acked": 0, "wrong_value": 0, "last_ack_before_cut_t": 34.361, "first_ack_after_restart_t": 62.111, "acks_stopped_for_s": 27.7, "lost_window_s": 0.0, "lost_acked_after_restart": 0, "lost_are_each_writers_last_writes": true}

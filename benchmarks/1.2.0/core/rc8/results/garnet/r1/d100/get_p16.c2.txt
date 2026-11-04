@@ -1,0 +1,54 @@
+Json file /tmp/r/get_p16.c2.json created...
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 5%,   1 secs] 15 threads 10 conns:     5464128 ops, 5456063 (avg: 5456063) ops/sec, 743.50MB/sec (avg: 743.50MB/sec),  0.43 (avg:  0.43) msec latency
+warning: high CPU on thread 4: 96.0% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 11: 95.3% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 13: 95.3% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 14: 95.0% of a core (threshold 95.0%) - results may be unreliable
+[RUN #1 10%,   2 secs] 15 threads 10 conns:    11003476 ops, 5536994 (avg: 5496508) ops/sec, 754.52MB/sec (avg: 749.01MB/sec),  0.42 (avg:  0.43) msec latency[RUN #1 15%,   3 secs] 15 threads 10 conns:    16547415 ops, 5542110 (avg: 5511702) ops/sec, 755.22MB/sec (avg: 751.08MB/sec),  0.42 (avg:  0.43) msec latency[RUN #1 20%,   4 secs] 15 threads 10 conns:    21969266 ops, 5417987 (avg: 5488274) ops/sec, 738.31MB/sec (avg: 747.88MB/sec),  0.43 (avg:  0.43) msec latency[RUN #1 25%,   5 secs] 15 threads 10 conns:    27400803 ops, 5430456 (avg: 5476715) ops/sec, 740.00MB/sec (avg: 746.31MB/sec),  0.43 (avg:  0.43) msec latency[RUN #1 30%,   6 secs] 15 threads 10 conns:    32800228 ops, 5398523 (avg: 5463688) ops/sec, 735.65MB/sec (avg: 744.53MB/sec),  0.43 (avg:  0.43) msec latency[RUN #1 35%,   7 secs] 15 threads 10 conns:    38367843 ops, 5566501 (avg: 5478371) ops/sec, 758.54MB/sec (avg: 746.53MB/sec),  0.42 (avg:  0.43) msec latency
+warning: high CPU on thread 5: 95.2% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 8: 95.1% of a core (threshold 95.0%) - results may be unreliable
+[RUN #1 40%,   8 secs] 15 threads 10 conns:    43991104 ops, 5622046 (avg: 5496326) ops/sec, 766.11MB/sec (avg: 748.98MB/sec),  0.42 (avg:  0.43) msec latency
+warning: high CPU on thread 10: 95.8% of a core (threshold 95.0%) - results may be unreliable
+[RUN #1 45%,   9 secs] 15 threads 10 conns:    49593024 ops, 5597727 (avg: 5507596) ops/sec, 762.80MB/sec (avg: 750.52MB/sec),  0.42 (avg:  0.43) msec latency[RUN #1 50%,  10 secs] 15 threads 10 conns:    55127864 ops, 5533716 (avg: 5510207) ops/sec, 754.07MB/sec (avg: 750.87MB/sec),  0.42 (avg:  0.43) msec latency[RUN #1 55%,  11 secs] 15 threads 10 conns:    60775591 ops, 5646829 (avg: 5522624) ops/sec, 769.49MB/sec (avg: 752.56MB/sec),  0.42 (avg:  0.42) msec latency
+warning: high CPU on thread 7: 95.3% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 9: 95.3% of a core (threshold 95.0%) - results may be unreliable
+[RUN #1 60%,  12 secs] 15 threads 10 conns:    66370176 ops, 5593253 (avg: 5528508) ops/sec, 762.19MB/sec (avg: 753.37MB/sec),  0.42 (avg:  0.42) msec latency[RUN #1 65%,  13 secs] 15 threads 10 conns:    71969053 ops, 5597779 (avg: 5533836) ops/sec, 762.80MB/sec (avg: 754.09MB/sec),  0.42 (avg:  0.42) msec latency[RUN #1 70%,  14 secs] 15 threads 10 conns:    77556888 ops, 5586120 (avg: 5537570) ops/sec, 761.22MB/sec (avg: 754.60MB/sec),  0.42 (avg:  0.42) msec latency[RUN #1 75%,  15 secs] 15 threads 10 conns:    83229079 ops, 5662242 (avg: 5545892) ops/sec, 771.59MB/sec (avg: 755.74MB/sec),  0.41 (avg:  0.42) msec latency
+warning: high CPU on thread 2: 95.0% of a core (threshold 95.0%) - results may be unreliable
+[RUN #1 80%,  16 secs] 15 threads 10 conns:    88829305 ops, 5599380 (avg: 5549234) ops/sec, 763.02MB/sec (avg: 756.19MB/sec),  0.42 (avg:  0.42) msec latency[RUN #1 85%,  17 secs] 15 threads 10 conns:    94331484 ops, 5501430 (avg: 5546423) ops/sec, 749.68MB/sec (avg: 755.81MB/sec),  0.43 (avg:  0.42) msec latency[RUN #1 90%,  18 secs] 15 threads 10 conns:    99964157 ops, 5631389 (avg: 5551142) ops/sec, 767.39MB/sec (avg: 756.45MB/sec),  0.42 (avg:  0.42) msec latency
+warning: high CPU on thread 12: 95.7% of a core (threshold 95.0%) - results may be unreliable
+[RUN #1 95%,  19 secs] 15 threads 10 conns:   105554302 ops, 5589105 (avg: 5553140) ops/sec, 761.62MB/sec (avg: 756.72MB/sec),  0.42 (avg:  0.42) msec latency[RUN #1 100%,  20 secs]  0 threads 10 conns:   111293872 ops, 5589105 (avg: 5564428) ops/sec, 761.62MB/sec (avg: 758.26MB/sec),  0.42 (avg:  0.42) msec latency
+
+Writing Full Run command HDR latency histogram results to /tmp/r/get_p16.c2_FULL_RUN_1.txt...
+Writing Full Run command HDR latency histogram results in HistogramLogProcessor format to /tmp/r/get_p16.c2_FULL_RUN_1.hgrm...
+Writing GET command HDR latency histogram results to /tmp/r/get_p16.c2_GET_command_run_1.txt...
+Writing GET command HDR latency histogram results in HistogramLogProcessor format to /tmp/r/get_p16.c2_GET_command_run_1.hgrm...
+
+CPU Utilization Summary
+  Total CPU time:   280.748s  (user 126.320s, sys 154.428s)
+  Wall time:        20.003s
+  Cores used:       14.036   (avg 93.6% across 15 worker threads)
+  Peak utilization: 1421.4%
+Saving JSON output file: /tmp/r/get_p16.c2.json
+Json file closed.
+15        Threads
+10        Connections per thread
+20        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets            0.00          ---          ---             ---             ---             ---             ---         0.00 
+Gets      5564416.49   5564416.49         0.00         0.42215         0.39100         1.30300         2.83100    776457.80 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    5564416.49   5564416.49         0.00         0.42215         0.39100         1.30300         2.83100    776457.80 
+rc=0

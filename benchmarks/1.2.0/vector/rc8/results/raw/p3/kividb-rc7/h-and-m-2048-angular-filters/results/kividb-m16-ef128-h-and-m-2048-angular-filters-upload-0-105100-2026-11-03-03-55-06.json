@@ -1,0 +1,451 @@
+{
+  "params": {
+    "experiment": "kividb-m16-ef128",
+    "dataset": "h-and-m-2048-angular-filters",
+    "parallel": 16,
+    "batch_size": 64,
+    "engine_params": {
+      "schema_version": 1,
+      "phase": "upload",
+      "invocation": {
+        "host": "SERVER_IP",
+        "engines_file": "kividb-engine.json",
+        "allow_partial_configs": false,
+        "allow_partial_corpus": false,
+        "dump_raw_latencies": false,
+        "dump_results": null,
+        "upload_reader": "auto",
+        "exit_on_error": true,
+        "fail_on_dropped_queries": false,
+        "keep_data": false,
+        "reset_between_configs": false,
+        "skip_if_exists": false,
+        "skip_search": false,
+        "skip_upload": false,
+        "skip_vector_index": false,
+        "repetitions": 3,
+        "warmup_seconds": 0.0,
+        "configurations_dir": "~/vdbx/experiments/configurations",
+        "results_dir": "~/vdbx/results"
+      },
+      "declared": {
+        "collection_params": {
+          "hnsw_config": {
+            "M": 16,
+            "EF_CONSTRUCTION": 128
+          }
+        },
+        "upload_params": {
+          "parallel": 16,
+          "batch_size": 64
+        }
+      },
+      "effective": {
+        "INDEXING_WAIT_SECS": 610,
+        "KIVIDB_INDEX_NAME": "idx",
+        "KIVIDB_INDEX_NAME_EXACT": false,
+        "KIVIDB_PORT": 6380,
+        "indexing_wait_phase": "upload_tail",
+        "upload_batch_size": 64,
+        "upload_parallel": 16
+      },
+      "env": {
+        "INDEXING_WAIT_SECS": null,
+        "KIVIDB_AUTH": null,
+        "KIVIDB_INDEX_NAME": null,
+        "KIVIDB_INDEX_NAME_EXACT": null,
+        "KIVIDB_PORT": "6380",
+        "KIVIDB_UPLOAD_BATCH_SIZE": null,
+        "KIVIDB_UPLOAD_PARALLEL": null,
+        "KIVIDB_USER": null
+      },
+      "overridden": [],
+      "ignored_declared_keys": {
+        "exhaustive": false,
+        "covers": "hnsw_config keys serde could not type, plus the CI-asserted KNOWN_UNREAD inventory for this engine",
+        "keys": []
+      }
+    },
+    "build": {
+      "crate_version": "0.2.0",
+      "git_sha": "d22d44e8b46009a800a59e952710166ece2e38a1",
+      "git_tree": "clean",
+      "git_sha_source": "git",
+      "target": "aarch64-unknown-linux-gnu",
+      "profile": "release",
+      "features": [],
+      "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+      "openssl": "OpenSSL 3.0.2 15 Mar 2022",
+      "hdf5": "1.10.7"
+    },
+    "index_layout": "vector",
+    "index_workloads": [
+      "vector"
+    ]
+  },
+  "results": {
+    "upload_time": 15.041104274,
+    "total_time": 16.75401501,
+    "upload_count": 105100,
+    "memory_usage": {
+      "used_memory": [
+        2195042911
+      ],
+      "index_memory_bytes": null,
+      "index_info": [
+        "index_name",
+        "idx:kividb-m16-ef128",
+        "index_options",
+        [],
+        "index_definition",
+        [
+          "key_type",
+          "HASH",
+          "prefixes",
+          [
+            "kividb-m16-ef128:"
+          ],
+          "default_score",
+          "1"
+        ],
+        "attributes",
+        [
+          [
+            "identifier",
+            "vector",
+            "attribute",
+            "vector",
+            "type",
+            "VECTOR",
+            "algorithm",
+            "HNSW",
+            "data_type",
+            "FLOAT32",
+            "dim",
+            2048,
+            "distance_metric",
+            "COSINE",
+            "M",
+            16,
+            "ef_construction",
+            128
+          ],
+          [
+            "identifier",
+            "product_code",
+            "attribute",
+            "product_code",
+            "type",
+            "NUMERIC"
+          ],
+          [
+            "identifier",
+            "prod_name",
+            "attribute",
+            "prod_name",
+            "type",
+            "TAG",
+            "SEPARATOR",
+            ";"
+          ],
+          [
+            "identifier",
+            "product_type_no",
+            "attribute",
+            "product_type_no",
+            "type",
+            "NUMERIC"
+          ],
+          [
+            "identifier",
+            "product_type_name",
+            "attribute",
+            "product_type_name",
+            "type",
+            "TAG",
+            "SEPARATOR",
+            ";"
+          ],
+          [
+            "identifier",
+            "product_group_name",
+            "attribute",
+            "product_group_name",
+            "type",
+            "TAG",
+            "SEPARATOR",
+            ";"
+          ],
+          [
+            "identifier",
+            "graphical_appearance_no",
+            "attribute",
+            "graphical_appearance_no",
+            "type",
+            "NUMERIC"
+          ],
+          [
+            "identifier",
+            "graphical_appearance_name",
+            "attribute",
+            "graphical_appearance_name",
+            "type",
+            "TAG",
+            "SEPARATOR",
+            ";"
+          ],
+          [
+            "identifier",
+            "colour_group_code",
+            "attribute",
+            "colour_group_code",
+            "type",
+            "NUMERIC"
+          ],
+          [
+            "identifier",
+            "colour_group_name",
+            "attribute",
+            "colour_group_name",
+            "type",
+            "TAG",
+            "SEPARATOR",
+            ";"
+          ],
+          [
+            "identifier",
+            "perceived_colour_value_id",
+            "attribute",
+            "perceived_colour_value_id",
+            "type",
+            "NUMERIC"
+          ],
+          [
+            "identifier",
+            "perceived_colour_value_name",
+            "attribute",
+            "perceived_colour_value_name",
+            "type",
+            "TAG",
+            "SEPARATOR",
+            ";"
+          ],
+          [
+            "identifier",
+            "perceived_colour_master_id",
+            "attribute",
+            "perceived_colour_master_id",
+            "type",
+            "NUMERIC"
+          ],
+          [
+            "identifier",
+            "perceived_colour_master_name",
+            "attribute",
+            "perceived_colour_master_name",
+            "type",
+            "TAG",
+            "SEPARATOR",
+            ";"
+          ],
+          [
+            "identifier",
+            "department_no",
+            "attribute",
+            "department_no",
+            "type",
+            "NUMERIC"
+          ],
+          [
+            "identifier",
+            "department_name",
+            "attribute",
+            "department_name",
+            "type",
+            "TAG",
+            "SEPARATOR",
+            ";"
+          ],
+          [
+            "identifier",
+            "index_code",
+            "attribute",
+            "index_code",
+            "type",
+            "TAG",
+            "SEPARATOR",
+            ";"
+          ],
+          [
+            "identifier",
+            "index_name",
+            "attribute",
+            "index_name",
+            "type",
+            "TAG",
+            "SEPARATOR",
+            ";"
+          ],
+          [
+            "identifier",
+            "index_group_no",
+            "attribute",
+            "index_group_no",
+            "type",
+            "NUMERIC"
+          ],
+          [
+            "identifier",
+            "index_group_name",
+            "attribute",
+            "index_group_name",
+            "type",
+            "TAG",
+            "SEPARATOR",
+            ";"
+          ],
+          [
+            "identifier",
+            "section_no",
+            "attribute",
+            "section_no",
+            "type",
+            "NUMERIC"
+          ],
+          [
+            "identifier",
+            "section_name",
+            "attribute",
+            "section_name",
+            "type",
+            "TAG",
+            "SEPARATOR",
+            ";"
+          ],
+          [
+            "identifier",
+            "garment_group_no",
+            "attribute",
+            "garment_group_no",
+            "type",
+            "NUMERIC"
+          ],
+          [
+            "identifier",
+            "garment_group_name",
+            "attribute",
+            "garment_group_name",
+            "type",
+            "TAG",
+            "SEPARATOR",
+            ";"
+          ],
+          [
+            "identifier",
+            "detail_desc",
+            "attribute",
+            "detail_desc",
+            "type",
+            "TEXT",
+            "WEIGHT",
+            "1"
+          ]
+        ],
+        "num_docs",
+        105100,
+        "max_doc_id",
+        105100,
+        "num_terms",
+        3784,
+        "num_records",
+        2333315,
+        "text_terms_bytes",
+        460648,
+        "text_postings_bytes",
+        7913968,
+        "text_docs_bytes",
+        12302140,
+        "doc_ids",
+        105100,
+        "tag_values",
+        44558,
+        "postings_ids_bytes",
+        10125042,
+        "postings_tag_bytes",
+        48986122,
+        "postings_numeric_bytes",
+        27649264,
+        "indexing",
+        0,
+        "percent_indexed",
+        "1",
+        "hash_indexing_failures",
+        0,
+        "index_on",
+        "hash",
+        "prefixes",
+        [
+          "kividb-m16-ef128:"
+        ],
+        "num_fields",
+        "25",
+        "fields",
+        [
+          "vector (VECTOR HNSW(M=16,ef=128) DIM=2048 COSINE)",
+          "product_code (NUMERIC)",
+          "prod_name (TAG)",
+          "product_type_no (NUMERIC)",
+          "product_type_name (TAG)",
+          "product_group_name (TAG)",
+          "graphical_appearance_no (NUMERIC)",
+          "graphical_appearance_name (TAG)",
+          "colour_group_code (NUMERIC)",
+          "colour_group_name (TAG)",
+          "perceived_colour_value_id (NUMERIC)",
+          "perceived_colour_value_name (TAG)",
+          "perceived_colour_master_id (NUMERIC)",
+          "perceived_colour_master_name (TAG)",
+          "department_no (NUMERIC)",
+          "department_name (TAG)",
+          "index_code (TAG)",
+          "index_name (TAG)",
+          "index_group_no (NUMERIC)",
+          "index_group_name (TAG)",
+          "section_no (NUMERIC)",
+          "section_name (TAG)",
+          "garment_group_no (NUMERIC)",
+          "garment_group_name (TAG)",
+          "detail_desc (TEXT)"
+        ],
+        "hnsw_live_count",
+        "105100",
+        "hnsw_tombstone_count",
+        "0",
+        "hnsw_tombstone_ratio",
+        "0.0000",
+        "hnsw_compaction_in_progress",
+        "0",
+        "hnsw_indexes",
+        [
+          [
+            "field",
+            "vector",
+            "live_count",
+            "105100",
+            "tombstone_count",
+            "0",
+            "tombstone_ratio",
+            "0.0000",
+            "compaction_in_progress",
+            "0"
+          ]
+        ]
+      ]
+    },
+    "upload_reader": {
+      "reader": "memory",
+      "flag": "auto",
+      "reason": "this engine's upload has no streaming path"
+    }
+  }
+}

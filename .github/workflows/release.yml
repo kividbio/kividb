@@ -12,8 +12,6 @@ on:
 
 permissions:
   contents: write
-  # A stable release opens an Announcements discussion (Publish GitHub Release).
-  discussions: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -815,13 +813,61 @@ jobs:
           prerelease: false
           generate_release_notes: false
           body_path: release-body.md
-          # Announced in Discussions (Announcements), with the release notes
-          # as the post and a link both ways.
-          discussion_category_name: Announcements
+          # No discussion_category_name: GitHub refuses to open a discussion in
+          # Announcements with this token ("Discussion could not be created"),
+          # which failed v1.2.0's publish job after the release was made and
+          # skipped homebrew-tap-update. A maintainer posts the announcement.
           files: |
             release-assets/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── Source tag — stable releases only ───────────────────────────────────
+  #
+  # `X.Y.Z-src` on the release's commit, beside `vX.Y.Z`, so ports and
+  # packagers that fetch GitHub's source tarball by tag (the FreeBSD port,
+  # #319) find the same name for every release. 1.1.0-src to 1.2.0-src were
+  # made by hand, on the old code plus the .gitattributes that leaves the raw
+  # benchmark results out of source archives; from 1.2.1 on, the release's
+  # own commit has it. No `v`, so the tag starts no release run.
+  source-tag:
+    needs: [linux-amd64, linux-arm64, darwin, docker-manifest]
+    if: >-
+      ${{ !cancelled()
+          && !contains(github.event.inputs.tag || github.ref_name, '-')
+          && needs.linux-amd64.result == 'success'
+          && needs.linux-arm64.result == 'success'
+          && needs.docker-manifest.result == 'success'
+          && needs.darwin.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: Push X.Y.Z-src on the release's commit
+        run: |
+          set -euo pipefail
+          src="${RELEASE_TAG#v}-src"
+          commit="$(git rev-parse HEAD)"
+          # Tags are never moved: if it is there, it must already be this commit.
+          have="$(git ls-remote origin "refs/tags/${src}^{}" | cut -f1)"
+          if [ -n "${have}" ]; then
+            if [ "${have}" = "${commit}" ]; then
+              echo "${src} is already on ${commit}"
+              exit 0
+            fi
+            echo "::error::${src} exists on ${have}, not on ${RELEASE_TAG} (${commit})"
+            exit 1
+          fi
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              tag -a "${src}" "${commit}" \
+              -m "KiviDB ${RELEASE_TAG#v} source: the same commit as ${RELEASE_TAG}. Not a separate release."
+          git push origin "refs/tags/${src}"
+          echo "Pushed ${src} on ${commit}"
 
   # ── Smoke test — release candidates only ────────────────────────────────
   #

@@ -1268,6 +1268,8 @@ where
                     for (db, key) in &tx.watched_keys {
                         commands::helpers::lazy_expire_key(&store, *db, key);
                     }
+                    // When it was routed, for the check inside its gates.
+                    let mut routed = crate::cluster::routing::Routed::default();
                     let refusal = if !tx.active {
                         None
                     } else if let Some(busy) =
@@ -1291,6 +1293,7 @@ where
                                 db: selected_db,
                             },
                             &tx.queue,
+                            &mut routed,
                         )
                     };
                     if !tx.active {
@@ -1324,7 +1327,23 @@ where
                             &hub_tx,
                             &aof_tx,
                         );
-                        if dirty_flag.load(std::sync::atomic::Ordering::Acquire) {
+                        // A `MIGRATE` is moving one of its keys, or its keys
+                        // have left since it was routed (#331): it is given up
+                        // whole. See `routing::exec_refusal_in_gate`.
+                        let refused = crate::cluster::routing::exec_refusal_in_gate(
+                            &crate::cluster::routing::Caller {
+                                cluster: &cluster_state,
+                                registry: &client_registry,
+                                client_id,
+                                store: &store,
+                                db: selected_db,
+                            },
+                            &tx.queue,
+                            routed,
+                        );
+                        if refused.is_some()
+                            || dirty_flag.load(std::sync::atomic::Ordering::Acquire)
+                        {
                             watch_registry.as_ref().unwatch_all(
                                 &tx.watched_keys
                                     .iter()
@@ -1337,7 +1356,9 @@ where
                             // array is not guaranteed to be recognized as null by a strict RESP3
                             // parser (redis-py's, e.g., parses it as an empty array instead),
                             // which breaks WATCH-abort detection for RESP3 clients entirely.
-                            if resp_version == 3 {
+                            if let Some(refusal) = refused {
+                                refusal
+                            } else if resp_version == 3 {
                                 crate::resp::write::resp_null_resp3()
                             } else {
                                 crate::resp::write::resp_null_array()

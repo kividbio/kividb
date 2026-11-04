@@ -435,6 +435,9 @@ fn language_definition(language: &crate::vector::stem::LanguageOptions) -> Vec<V
 
 /// Documents the index covers: hashes, or JSON documents, under its prefixes.
 fn count_docs(db: &Db, def: &IndexDef, cluster: Option<&crate::cluster::ClusterState>) -> usize {
+    // Read before any shard is locked: not the slot table with one held
+    // (see `ClusterState`).
+    let served = cluster.map(crate::cluster::search::served_slots);
     db.iter()
         .map(|shard| {
             shard
@@ -443,7 +446,9 @@ fn count_docs(db: &Db, def: &IndexDef, cluster: Option<&crate::cluster::ClusterS
                 .filter(|(key, value)| {
                     crate::vector::is_document(&def.on, *value)
                         && covers(def, key)
-                        && cluster.is_none_or(|c| crate::cluster::search::serves(c, key))
+                        && served
+                            .as_deref()
+                            .is_none_or(|served| crate::cluster::search::in_served(served, key))
                 })
                 .count()
         })
@@ -1020,11 +1025,31 @@ pub(crate) fn plan(
     filter: &Filter,
     only: Option<&AHashSet<String>>,
 ) -> Option<Plan> {
-    let db = *ctx.selected_db;
+    plan_in(ctx.store, *ctx.selected_db, def, filter, only)
+}
+
+/// [`plan`], for database `db` of `store`.
+fn plan_in(
+    store: &crate::store::Store,
+    db: usize,
+    def: &IndexDef,
+    filter: &Filter,
+    only: Option<&AHashSet<String>>,
+) -> Option<Plan> {
     // The postings are of the index's own database's documents.
     if !def.keeps_postings() || def.db_index != db {
         return None;
     }
+    // A hash with field TTLs can lose a field to a read before the indexes
+    // hear of it: such documents are tried, whatever the postings say of
+    // them. Which ones they are is read before the postings are. The sweep
+    // that brings the postings up to date with such a hash writes to them,
+    // or queues the write for whoever takes their lock next, and only then
+    // stops watching the hash. Read after the postings, the list could miss
+    // a hash whose sweep ran in between, its write queued behind this read:
+    // the postings had it as it was, and it was not tried. FT.AGGREGATE then
+    // counted a document the filter no longer matched (#347).
+    let watched = crate::field_expiry::watched_keys(store, db);
     let (mut ids, exact, volatile) = {
         let p = def.postings.read();
         if !p.enabled() || p.unused {
@@ -1049,17 +1074,16 @@ pub(crate) fn plan(
         if !exact && ids.count() * 2 > p.len() {
             return None;
         }
-        // A hash with field TTLs can lose a field to a read before the
-        // indexes hear of it: such documents are tried, whatever the
-        // postings say of them.
-        let volatile: Vec<(String, u32)> = crate::field_expiry::watched_keys(ctx.store, db)
+        #[cfg(test)]
+        tests::while_the_postings_are_read();
+        let volatile: Vec<(String, u32)> = watched
             .into_iter()
             .filter(|key| only.is_none_or(|only| only.contains(key)))
             .filter_map(|key| p.id(&key).map(|id| (key, id)))
             .collect();
         (ids, exact, volatile)
     };
-    let store = &ctx.store[db];
+    let store = &store[db];
     let any_volatile = !volatile.is_empty();
     for (key, id) in volatile {
         if exact {
@@ -1442,6 +1466,15 @@ fn page_from_postings(
     } else {
         args.offset.saturating_add(args.count)
     };
+    // The slots this node serves, read before the postings are: nothing
+    // reads the slot table with an index's lock held. A deletion of a lost
+    // slot's keys takes the postings to unindex its keys, holding what
+    // makes a slot come back wait, and that waits holding the slot table
+    // (see `ClusterState`, #353).
+    let served_slots = ctx
+        .cluster
+        .enabled
+        .then(|| crate::cluster::search::served_slots(ctx.cluster));
     let (picked, total, timed_out) = {
         // What was written since the plan is not among its ids. What was
         // queued is applied: an expiry unmarks a key once its removal is
@@ -1459,8 +1492,7 @@ fn page_from_postings(
                 ids.unset(id);
             }
         }
-        if ctx.cluster.enabled {
-            let slots = crate::cluster::search::served_slots(ctx.cluster);
+        if let Some(slots) = &served_slots {
             let mut served = Bits::new();
             for id in ids.iter() {
                 let slot = p.slot(id) as usize;
@@ -2629,6 +2661,108 @@ fn coordinate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// What [`plan_in`] runs on this thread while it holds the postings,
+        /// once: for a test to put a write there.
+        static WHILE_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn while_the_postings_are_read() {
+        if let Some(run) = WHILE_READ.with(|w| w.borrow_mut().take()) {
+            run();
+        }
+    }
+
+    /// A hash whose field went to a read, swept while a query holds the
+    /// postings: the sweep's write is queued behind the query, and the hash
+    /// is no longer watched by the time the query is done with them. The
+    /// query still tries it, and does not take the postings' word for what
+    /// it holds (#347).
+    #[test]
+    fn a_hash_swept_while_a_query_reads_the_postings_is_still_tried() {
+        use crate::types::HashInner;
+        let store = crate::store::new_store(1);
+        let index_store = crate::vector::new_index_store();
+        let def = IndexSchema {
+            name: "i347".into(),
+            db_index: 0,
+            on: IndexOn::Hash,
+            prefixes: vec!["d347:".into()],
+            fields: vec![SchemaField {
+                name: "n".into(),
+                field_type: FieldType::Numeric,
+                options: FieldOptions::default(),
+            }],
+            aliases: Vec::new(),
+            stopwords: None,
+            synonyms: Default::default(),
+            language: Default::default(),
+        }
+        .into_def();
+        index_store.write().insert("i347".into(), def.clone());
+        // Two documents with n = 1; one's n has a time to live, about to end.
+        for key in ["d347:a", "d347:b"] {
+            let fields: Vec<(String, Arc<[u8]>)> = vec![
+                ("n".into(), Arc::from(&b"1"[..])),
+                ("o".into(), Arc::from(&b"x"[..])),
+            ];
+            let mut inner = HashInner::new();
+            for (name, value) in &fields {
+                inner.fields.insert(name.clone(), Arc::clone(value));
+            }
+            if key == "d347:b" {
+                inner
+                    .expiries
+                    .insert("n".into(), Instant::now() + Duration::from_millis(1));
+            }
+            crate::store::get_shard(&store[0], key).write().insert(
+                key,
+                KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(inner))),
+            );
+            let mut p = def.postings.write();
+            p.write(key, &fields, true);
+            def.postings.done(p);
+            crate::field_expiry::track_key(&store, 0, key);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        // A read drops the field (as HGETALL does); the indexes are not told.
+        if let Some(ValueRef::HashEx(hash)) = crate::store::get_shard(&store[0], "d347:b")
+            .read()
+            .get("d347:b")
+        {
+            assert_eq!(hash.write().sweep_expired(), 1);
+        }
+        let filter = Filter::Numeric {
+            field: "n".into(),
+            lo: f64::NEG_INFINITY,
+            lo_exclusive: false,
+            hi: 7.0,
+            hi_exclusive: true,
+        };
+        let matches = |plan: &Plan| -> Vec<String> {
+            keys_of(&def, &plan.ids)
+                .iter()
+                .map(|key| key.to_string())
+                .collect()
+        };
+        let plan = plan_in(&store, 0, &def, &filter, None).unwrap();
+        assert!(plan.exact);
+        assert_eq!(matches(&plan), ["d347:a"], "a watched hash is tried");
+
+        // Now the sweep, with the query holding the postings.
+        let (s, i) = (Arc::clone(&store), Arc::clone(&index_store));
+        WHILE_READ.with(|w| {
+            *w.borrow_mut() = Some(Box::new(move || crate::field_expiry::sweep(&s, &i)));
+        });
+        let plan = plan_in(&store, 0, &def, &filter, None).unwrap();
+        assert!(
+            crate::field_expiry::watched_keys(&store, 0).is_empty(),
+            "the sweep ran, and the hash is no longer watched"
+        );
+        assert_eq!(matches(&plan), ["d347:a"], "the swept hash was tried");
+    }
 
     fn words(cmd: &[&str]) -> Result<Vec<SchemaField>, String> {
         let cmd: Vec<&[u8]> = cmd.iter().map(|w| w.as_bytes()).collect();

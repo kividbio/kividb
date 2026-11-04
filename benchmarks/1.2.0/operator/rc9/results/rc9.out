@@ -1,0 +1,281 @@
+BEGIN upgrade-shd 07:22:40
+upgrade-shd spec.image -> 1.2.0-rc9 07:22:55
+kividbcluster.kividb.io/shd patched
+upgrade-shd all 6 pods on 1.2.0-rc9, Running 07:25:02
+END upgrade-shd 07:25:29
+acked 192720 errors 0 win [] slow 4 ['07:24:14.324 164ms ok=true', '07:24:14.304 200ms ok=true', '07:24:14.304 208ms ok=true', '07:24:14.344 172ms ok=true']
+errkinds Counter()
+checked 193264 missing 0 wrong 0 readErr 0 bySec {} dbsize 193264 ex {}
+pod/g-no-0 kividb 1.2.0-rc9
+pod/g-no-1 kividb 1.2.0-rc9
+pod/g-yes-0 kividb 1.2.0-rc9
+pod/g-yes-1 kividb 1.2.0-rc9
+pod/shd-0-0 kividb 1.2.0-rc9
+pod/shd-0-1 kividb 1.2.0-rc9
+pod/shd-1-0 kividb 1.2.0-rc9
+pod/shd-1-1 kividb 1.2.0-rc9
+pod/shd-2-0 kividb 1.2.0-rc9
+pod/shd-2-1 kividb 1.2.0-rc9
+--- views after upgrade-shd 07:25:37
+shd-0-0 cluster_state:ok 
+shd-0-1 cluster_state:ok 
+shd-1-0 cluster_state:ok 
+shd-1-1 cluster_state:ok 
+shd-2-0 cluster_state:ok 
+shd-2-1 cluster_state:ok 
+BEGIN restart-rc9 07:25:41
+restart-rc9 DbOps restart 07:25:57
+kividbdbops.kividb.io/shd-restart-rc9-125541 created
+restart-rc9 DbOps Completed 07:28:14
+END restart-rc9 07:28:45
+acked 341760 errors 0 win [] slow 25 ['07:27:43.205 159ms ok=true', '07:27:43.145 224ms ok=true', '07:27:43.175 198ms ok=true', '07:27:43.186 195ms ok=true', '07:27:43.205 181ms ok=true', '07:27:43.166 226ms ok=true', '07:27:43.136 267ms ok=true', '07:27:43.245 164ms ok=true']
+errkinds Counter()
+checked 342336 missing 0 wrong 0 readErr 0 bySec {} dbsize 342336 ex {}
+--- views after restart-rc9 07:28:45
+shd-0-0 cluster_state:ok 
+shd-0-1 cluster_state:ok 
+shd-1-0 cluster_state:ok 
+shd-1-1 cluster_state:ok 
+shd-2-0 cluster_state:ok 
+shd-2-1 cluster_state:ok 
+BEGIN failover-rc9 07:28:50
+failover-rc9 FAILOVER shd-0-1 07:29:09
+OK
+failover-rc9 FAILOVER shd-1-1 07:29:34
+OK
+failover-rc9 FAILOVER shd-2-1 07:29:59
+OK
+shd-0-0 (demoted): 1 partial, 0 full | 2026-11-03T07:29:10.307Z 1 [INFO] Replication: This node's dataset is offset 4766497 of its own stream 455eedf77567354d17fe81560fa4d9068bc0f466: a master that continues that stream can cont|2026-11-03T07:29:10.310Z 1 [INFO] Replication: The master continues 455eedf77567354d17fe81560fa4d9068bc0f466 as a8e8b1617baa45b6fd95741b0e05348a369775be|2026-11-03T07:29:10.310Z 1 [INFO] Replication: Partial resync: continuing from offset 4766497 — no dataset transfer|
+shd-2-0 (demoted): 1 partial, 0 full | 2026-11-03T07:30:00.976Z 1 [INFO] Replication: This node's dataset is offset 5304231 of its own stream dbedecdef75c3ac8bcf93fdc0e8376589aaa8887: a master that continues that stream can cont|2026-11-03T07:30:00.979Z 1 [INFO] Replication: The master continues dbedecdef75c3ac8bcf93fdc0e8376589aaa8887 as 4e255bc321514222adf491b06d412ee6cd52c883|2026-11-03T07:30:00.980Z 1 [INFO] Replication: Partial resync: continuing from offset 5304231 — no dataset transfer|
+shd-1-0 (demoted): 1 partial, 0 full | 2026-11-03T07:29:35.636Z 1 [INFO] Replication: This node's dataset is offset 5033836 of its own stream 3f477ddce8a4c0d540a14d0d8a947ac38199d127: a master that continues that stream can cont|2026-11-03T07:29:35.645Z 1 [INFO] Replication: The master continues 3f477ddce8a4c0d540a14d0d8a947ac38199d127 as fd6127a8968414c8482fe319164589cd6d92914b|2026-11-03T07:29:35.645Z 1 [INFO] Replication: Partial resync: continuing from offset 5033836 — no dataset transfer|
+shd-0-0 master -> slave sync_full+0 sync_partial_ok+0 sync_partial_err+0 
+shd-0-1 slave -> master sync_full+0 sync_partial_ok+1 sync_partial_err+0 
+shd-1-0 master -> slave sync_full+0 sync_partial_ok+0 sync_partial_err+0 
+shd-1-1 slave -> master sync_full+0 sync_partial_ok+1 sync_partial_err+0 
+shd-2-0 master -> slave sync_full+0 sync_partial_ok+0 sync_partial_err+0 
+shd-2-1 slave -> master sync_full+0 sync_partial_ok+1 sync_partial_err+0 
+TOTAL sync_full+0 sync_partial_ok+3 sync_partial_err+0
+END failover-rc9 07:30:51
+acked 436416 errors 0 win [] slow 32 ['07:30:00.876 268ms ok=true', '07:30:00.925 227ms ok=true', '07:30:00.946 213ms ok=true', '07:30:00.976 192ms ok=true', '07:30:00.985 191ms ok=true', '07:30:00.985 198ms ok=true', '07:30:00.995 210ms ok=true', '07:30:00.995 212ms ok=true']
+errkinds Counter()
+checked 436944 missing 0 wrong 0 readErr 0 bySec {} dbsize 436944 ex {}
+--- views after failover-rc9 07:30:52
+shd-0-0 cluster_state:ok 
+shd-0-1 cluster_state:ok 
+shd-1-0 cluster_state:ok 
+shd-1-1 cluster_state:ok 
+shd-2-0 cluster_state:ok 
+shd-2-1 cluster_state:ok 
+graceful try 1: shd-0-1 07:31:26
+== graceful 1 (shd-0-1)
+checked 545314 missing 0 wrong 0 readErr 0 bySec {} dbsize 545314 ex {}
+lines with two engines for shd-0-1: 0
+keys before: shd-0-1 155524 master;shd-0-0 155531 slave;  after: shd-0-1 177216 slave;shd-0-0 177221 master;
+dump.kdb sizes seen: 2070612 3742140 
+graceful try 2: shd-1-1 07:33:49
+== graceful 2 (shd-1-1)
+checked 651650 missing 0 wrong 0 readErr 0 bySec {} dbsize 651650 ex {}
+lines with two engines for shd-1-1: 0
+keys before: shd-1-1 190650 master;shd-1-0 190662 slave;  after: shd-1-1 212532 slave;shd-1-0 212536 master;
+dump.kdb sizes seen: 2231120 4583072 
+forcedel try 1: BGSAVE on shd-0-0 07:36:18
+Background saving started
+== forcedel 1 (shd-0-0)
+checked 778118 missing 0 wrong 0 readErr 0 bySec {} dbsize 778118 ex {}
+lines with two engines for shd-0-0: 3
+keys before: shd-0-0 234469 master;shd-0-1 234478 slave;  after: shd-0-0 252029 master;shd-0-1 252033 slave;
+dump.kdb sizes seen: 5347116 5635692 
+2026-11-03T07:37:04.222793411Z 2026-11-03T07:37:04.222Z 1 [WARN] The data directory /data is in use by another process (it holds kividb.lock): waiting for it to be free (0s so far)
+2026-11-03T07:37:04.272999848Z 2026-11-03T07:37:04.272Z 1 [INFO] The data directory is free after 0.1s: starting
+forcedel try 2: BGSAVE on shd-1-0 07:39:18
+Background saving started
+== forcedel 2 (shd-1-0)
+checked 907319 missing 0 wrong 0 readErr 0 bySec {} dbsize 907319 ex {}
+lines with two engines for shd-1-0: 4
+keys before: shd-1-0 278038 master;shd-1-1 278043 slave;  after: shd-1-0 298372 master;shd-1-1 298379 slave;
+dump.kdb sizes seen: 6390800 6681248 
+2026-11-03T07:40:04.129646751Z 2026-11-03T07:40:04.129Z 1 [WARN] The data directory /data is in use by another process (it holds kividb.lock): waiting for it to be free (0s so far)
+2026-11-03T07:40:04.230000699Z 2026-11-03T07:40:04.229Z 1 [INFO] The data directory is free after 0.1s: starting
+forcedel try 3: BGSAVE on shd-2-1 07:42:18
+Background saving started
+== forcedel 3 (shd-2-1)
+checked 1033371 missing 0 wrong 0 readErr 0 bySec {} dbsize 1033371 ex {}
+lines with two engines for shd-2-1: 3
+keys before: shd-2-1 321342 master;shd-2-0 321349 slave;  after: shd-2-1 338704 master;shd-2-0 338711 slave;
+dump.kdb sizes seen: 7432918 7720198 
+2026-11-03T07:43:04.195773086Z 2026-11-03T07:43:04.195Z 1 [WARN] The data directory /data is in use by another process (it holds kividb.lock): waiting for it to be free (0s so far)
+2026-11-03T07:43:04.345985370Z 2026-11-03T07:43:04.345Z 1 [INFO] The data directory is free after 0.2s: starting
+DELETES_DONE
+--- views after deletes 07:44:52
+shd-0-0 cluster_state:ok 
+shd-0-1 cluster_state:ok 
+shd-1-0 cluster_state:ok 
+shd-1-1 cluster_state:ok 
+shd-2-0 cluster_state:ok 
+shd-2-1 cluster_state:ok 
+BEGIN sigkill-rc9 07:45:00
+sigkill-rc9 SIGKILL shd-0-0 07:45:10
+command terminated with exit code 1
+shd-0-0 pid 35911 SIGKILL State: Z (zombie)
+sigkill-rc9 shd-0-0 Ready 07:45:25
+END sigkill-rc9 07:46:12
+acked 1075291 errors 1384 win ['07:45:19-07:45:25:1384'] slow 400 ['07:45:25.298 4982ms ok=true', '07:45:27.467 2813ms ok=true', '07:45:28.088 2192ms ok=true', '07:45:27.347 2933ms ok=true', '07:45:28.418 1863ms ok=true', '07:45:26.588 3693ms ok=true', '07:45:25.638 4643ms ok=true', '07:45:27.688 2593ms ok=true']
+errkinds Counter({'context deadline exceeded': 30})
+checked 1075875 missing 0 wrong 0 readErr 0 bySec {} dbsize 1075875 ex {}
+shd-0-0 0-5461  
+shd-1-0 5462-10922  
+shd-2-1 10923-16383  
+--- views after sigkill-rc9 07:46:13
+shd-0-0 cluster_state:ok 
+shd-0-1 cluster_state:ok 
+shd-1-0 cluster_state:ok 
+shd-1-1 cluster_state:ok 
+shd-2-0 cluster_state:ok 
+shd-2-1 cluster_state:ok 
+BEGIN reshard-up-rc9 07:46:19
+reshard-up-rc9 spec.shards=4 07:46:34
+kividbcluster.kividb.io/shd patched
+reshard-up-rc9 RebalanceCompleted 07:47:06
+reshard-up-rc9 Running with 8 pods 07:47:07
+cluster_state:ok
+cluster_known_nodes:8
+cluster_size:4
+END reshard-up-rc9 07:47:57
+acked 1138715 errors 0 win [] slow 0 []
+errkinds Counter()
+checked 1139275 missing 0 wrong 0 readErr 0 bySec {} dbsize 1139275 ex {}
+shd-0-0 0-4095  
+shd-3-0 4096-5461 9558-10922 15019-16383
+shd-1-0 5462-9557  
+shd-2-1 10923-15018  
+8
+--- views after reshard-up-rc9 07:47:59
+shd-0-0 cluster_state:ok 
+shd-0-1 cluster_state:ok 
+shd-1-0 cluster_state:ok 
+shd-1-1 cluster_state:ok 
+shd-2-0 cluster_state:ok 
+shd-2-1 cluster_state:ok 
+shd-3-0 cluster_state:ok 
+shd-3-1 cluster_state:ok 
+BEGIN reshard-down-rc9 07:48:03
+reshard-down-rc9 spec.shards=3 07:48:18
+kividbcluster.kividb.io/shd patched
+reshard-down-rc9 RebalanceCompleted 07:48:29
+reshard-down-rc9 Running with 6 pods 07:48:30
+cluster_state:ok
+cluster_known_nodes:6
+cluster_size:3
+END reshard-down-rc9 07:49:20
+acked 1183091 errors 0 win [] slow 0 []
+errkinds Counter()
+checked 1183723 missing 0 wrong 0 readErr 0 bySec {} dbsize 1183723 ex {}
+shd-0-0 0-5461  
+shd-1-0 5462-10922  
+shd-2-1 10923-16383  
+6
+--- views after reshard-down-rc9 07:49:22
+shd-0-0 cluster_state:ok 
+shd-0-1 cluster_state:ok 
+shd-1-0 cluster_state:ok 
+shd-1-1 cluster_state:ok 
+shd-2-0 cluster_state:ok 
+shd-2-1 cluster_state:ok 
+pod/g-no-0 kividb 1.2.0-rc9
+pod/g-no-1 kividb 1.2.0-rc9
+pod/g-yes-0 kividb 1.2.0-rc9
+pod/g-yes-1 kividb 1.2.0-rc9
+pod/shd-0-0 kividb 1.2.0-rc9
+pod/shd-0-1 kividb 1.2.0-rc9
+pod/shd-1-0 kividb 1.2.0-rc9
+pod/shd-1-1 kividb 1.2.0-rc9
+pod/shd-2-0 kividb 1.2.0-rc9
+pod/shd-2-1 kividb 1.2.0-rc9
+master g-yes-1 ip <ip>
+g-yes-0 kividb_version:1.2.0-rc9 run_id:000000002f9049ec00000000deadbeee2f9049ed keys=677452 role:slave master_host:<ip> master_link_status:up aof_enabled:1  ack=[aof-ack-after-write yes ]
+g-yes-1 kividb_version:1.2.0-rc9 run_id:0000000036d9717200000000deadbeee36d97173 keys=677520 role:master master_replid:8638662be82dd9cf827898ed61dfe4266ea60465 master_repl_offset:26881093 aof_enabled:1  ack=[aof-ack-after-write yes ]
+BEGIN guard-yes 07:49:37
+guard-yes operator scaled to 0 07:49:52
+guard-yes SIGSTOP + force delete + SIGKILL g-yes-1 (pid 14994) 07:49:55
+guard-yes new g-yes-1 Ready (<ip>) 07:50:37
+g-yes-0 kividb_version:1.2.0-rc9 run_id:000000002f9049ec00000000deadbeee2f9049ed keys=685400 role:slave master_host:<ip> master_link_status:down aof_enabled:1  ack=[aof-ack-after-write yes ]
+g-yes-1 kividb_version:1.2.0-rc9 run_id:0000000037d7d39b00000000deadbeee37d7d39a keys=685400 role:master master_replid:ee02d191633df3ceca61ead9dc38d757963b5fc6 master_repl_offset:0 aof_enabled:1  ack=[aof-ack-after-write yes ]
+guard-yes operator scaled to 1 07:50:39
+07:50:39 masterPod=g-yes-1 phase=Running
+07:50:45 masterPod=g-yes-1 phase=Running
+07:50:51 masterPod=g-yes-1 phase=Running
+07:50:57 masterPod=g-yes-1 phase=Running
+07:51:03 masterPod=g-yes-1 phase=Running
+07:51:09 masterPod=g-yes-1 phase=Running
+07:51:15 masterPod=g-yes-1 phase=Running
+07:51:20 masterPod=g-yes-1 phase=Running
+07:51:26 masterPod=g-yes-1 phase=Running
+07:51:32 masterPod=g-yes-1 phase=Running
+07:51:38 masterPod=g-yes-1 phase=Running
+07:51:44 masterPod=g-yes-1 phase=Running
+07:51:50 masterPod=g-yes-1 phase=Running
+07:51:56 masterPod=g-yes-1 phase=Running
+07:52:02 masterPod=g-yes-1 phase=Running
+07:52:07 masterPod=g-yes-1 phase=Running
+07:52:13 masterPod=g-yes-1 phase=Running
+07:52:19 masterPod=g-yes-1 phase=Running
+07:52:25 masterPod=g-yes-1 phase=Running
+07:52:32 masterPod=g-yes-1 phase=Running
+07:52:38 masterPod=g-yes-1 phase=Running
+07:52:44 masterPod=g-yes-1 phase=Running
+07:52:50 masterPod=g-yes-1 phase=Running
+07:52:55 masterPod=g-yes-1 phase=Running
+guard-yes master after: g-yes-1 07:53:02
+g-yes-0 kividb_version:1.2.0-rc9 run_id:000000002f9049ec00000000deadbeee2f9049ed keys=735526 role:slave master_host:<ip> master_link_status:up aof_enabled:1  ack=[aof-ack-after-write yes ]
+g-yes-1 kividb_version:1.2.0-rc9 run_id:0000000037d7d39b00000000deadbeee37d7d39a keys=735594 role:master master_replid:ee02d191633df3ceca61ead9dc38d757963b5fc6 master_repl_offset:2007991 aof_enabled:1  ack=[aof-ack-after-write yes ]
+guard-yes verdict KEPT (master g-yes-1 -> g-yes-1)
+guard-yes verdict KEPT 07:53:05
+END guard-yes 07:53:30
+acked 740726 errors 24770 win ['07:49:55-07:50:57:24770'] slow 400 ['07:49:55.730 5000ms ok=false', '07:49:55.730 5001ms ok=false', '07:49:55.740 5000ms ok=false', '07:49:55.740 5000ms ok=false', '07:49:55.740 5000ms ok=false', '07:49:55.740 5000ms ok=false', '07:49:55.751 5000ms ok=false', '07:49:55.751 5000ms ok=false']
+errkinds Counter({'dial tcp <ip>:6380: connect: connection refused': 30})
+checked 741022 missing 0 wrong 0 readErr 0 bySec {} dbsize 741022 ex {}
+master g-no-0 ip <ip>
+g-no-0 kividb_version:1.2.0-rc9 run_id:00000000397d9a7300000000deadbeee397d9a72 keys=772296 role:master master_replid:4c941fc436dedbb0096380205497ceee211410b2 master_repl_offset:30672389 aof_enabled:1  ack=[aof-ack-after-write no ]
+g-no-1 kividb_version:1.2.0-rc9 run_id:0000000025b2908900000000deadbeee25b29088 keys=772324 role:slave master_host:<ip> master_link_status:up aof_enabled:1  ack=[aof-ack-after-write no ]
+BEGIN guard-no 07:53:34
+guard-no operator scaled to 0 07:53:49
+guard-no SIGSTOP + force delete + SIGKILL g-no-0 (pid 14032) 07:53:52
+guard-no new g-no-0 Ready (<ip>) 07:54:34
+g-no-0 kividb_version:1.2.0-rc9 run_id:000000002f8787ca00000000deadbeee2f8787cb keys=780372 role:master master_replid:047a081dd6198da519d445c2b8bbc7868b66abbe master_repl_offset:0 aof_enabled:1  ack=[aof-ack-after-write no ]
+g-no-1 kividb_version:1.2.0-rc9 run_id:0000000025b2908900000000deadbeee25b29088 keys=780372 role:slave master_host:<ip> master_link_status:down aof_enabled:1  ack=[aof-ack-after-write no ]
+guard-no operator scaled to 1 07:54:35
+07:54:36 masterPod=g-no-0 phase=Running
+07:54:42 masterPod=g-no-0 phase=Running
+07:54:48 masterPod=g-no-0 phase=Running
+07:54:54 masterPod=g-no-0 phase=FailingOver
+07:55:00 masterPod=g-no-1 phase=Running
+07:55:06 masterPod=g-no-1 phase=Running
+07:55:11 masterPod=g-no-1 phase=Running
+07:55:17 masterPod=g-no-1 phase=Running
+07:55:23 masterPod=g-no-1 phase=Running
+07:55:29 masterPod=g-no-1 phase=Running
+07:55:35 masterPod=g-no-1 phase=Running
+07:55:41 masterPod=g-no-1 phase=Running
+07:55:46 masterPod=g-no-1 phase=Running
+07:55:52 masterPod=g-no-1 phase=Running
+07:55:58 masterPod=g-no-1 phase=Running
+07:56:04 masterPod=g-no-1 phase=Running
+07:56:10 masterPod=g-no-1 phase=Running
+07:56:16 masterPod=g-no-1 phase=Running
+07:56:22 masterPod=g-no-1 phase=Running
+07:56:28 masterPod=g-no-1 phase=Running
+07:56:33 masterPod=g-no-1 phase=Running
+07:56:39 masterPod=g-no-1 phase=Running
+07:56:45 masterPod=g-no-1 phase=Running
+07:56:51 masterPod=g-no-1 phase=Running
+guard-no master after: g-no-1 07:56:57
+g-no-0 kividb_version:1.2.0-rc9 run_id:000000002f8787ca00000000deadbeee2f8787cb keys=829324 role:slave master_host:<ip> master_link_status:up aof_enabled:1  ack=[aof-ack-after-write no ]
+g-no-1 kividb_version:1.2.0-rc9 run_id:0000000025b2908900000000deadbeee25b29088 keys=829364 role:master master_replid:5ef8950f4c55cf2f6e53ce44f8abf67fa2aa546d master_repl_offset:32955248 aof_enabled:1  ack=[aof-ack-after-write no ]
+guard-no verdict FAILED_OVER (master g-no-0 -> g-no-1)
+guard-no verdict FAILED_OVER 07:57:00
+END guard-no 07:57:26
+acked 834452 errors 25156 win ['07:53:52-07:54:55:25156'] slow 400 ['07:53:53.173 5000ms ok=false', '07:53:53.173 5000ms ok=false', '07:53:53.183 5001ms ok=false', '07:53:53.183 5001ms ok=false', '07:53:53.183 5001ms ok=false', '07:54:55.603 159ms ok=true', '07:54:55.603 178ms ok=true', '07:54:55.653 203ms ok=true']
+errkinds Counter({'dial tcp <ip>:6380: connect: connection refused': 30})
+checked 834760 missing 0 wrong 0 readErr 0 bySec {} dbsize 834760 ex {}
+RC9_DONE
+EXIT 0

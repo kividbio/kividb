@@ -1,0 +1,6 @@
+rc6 before kill:     x1=1 x2=1 x3=1 x4=1 keep_ttl_s=3600 keep_len=2 hq_fields=g,keep,q, dbsize=6
+/home/azureuser/h/expire_more.sh: line 25:  7091 Killed                  nohup $CMD >> $D/server.log 2>&1 < /dev/null
+rc6 after restart 1: x1=1 x2=1 x3=1 x4=1 keep_ttl_s=3597 keep_len=2 hq_fields=g,keep,q, dbsize=6
+/home/azureuser/h/expire_more.sh: line 28:  7161 Killed                  nohup $CMD >> $D/server.log 2>&1 < /dev/null
+rc6 after restart 2: x1=1 x2=1 x3=1 x4=1 keep_ttl_s=3594 keep_len=2 hq_fields=g,keep,q, dbsize=7
+rc6 deletion records in the AOF: 0

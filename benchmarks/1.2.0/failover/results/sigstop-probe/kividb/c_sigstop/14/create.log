@@ -1,0 +1,47 @@
+>>> Performing hash slots allocation on 6 nodes...
+Master[0] -> Slots 0 - 5460
+Master[1] -> Slots 5461 - 10922
+Master[2] -> Slots 10923 - 16383
+Adding replica fo2:7002 to fo1:7001
+Adding replica fo3:7002 to fo2:7001
+Adding replica fo1:7002 to fo3:7001
+M: ad0573b49b627e580291da54cd8780de6fe3c9f8 fo1:7001
+   slots:[0-5460] (5461 slots) master
+M: 6f26707d76b20afc793e12d25db5cef061f6ed69 fo2:7001
+   slots:[5461-10922] (5462 slots) master
+M: 81843a6471cc8d7c0a297ae660b0699501e581cc fo3:7001
+   slots:[10923-16383] (5461 slots) master
+S: 17d66bde5d8dc36143080f212fa63acdd8c71e21 fo1:7002
+   replicates 81843a6471cc8d7c0a297ae660b0699501e581cc
+S: 6a1c7afa81795926c54cc42946701e0e83614b43 fo2:7002
+   replicates ad0573b49b627e580291da54cd8780de6fe3c9f8
+S: 03f780e75ad3fc6f945e8c2eb6b59049ef5fd15a fo3:7002
+   replicates 6f26707d76b20afc793e12d25db5cef061f6ed69
+>>> Nodes configuration updated
+>>> Assign a different config epoch to each node
+>>> Sending CLUSTER MEET messages to join the cluster
+Waiting for the cluster to join
+
+>>> Performing Cluster Check (using node fo1:7001)
+M: ad0573b49b627e580291da54cd8780de6fe3c9f8 fo1:7001
+   slots:[0-5460] (5461 slots) master
+   1 additional replica(s)
+S: 03f780e75ad3fc6f945e8c2eb6b59049ef5fd15a fo3:7002
+   slots: (0 slots) slave
+   replicates 6f26707d76b20afc793e12d25db5cef061f6ed69
+S: 17d66bde5d8dc36143080f212fa63acdd8c71e21 fo1:7002
+   slots: (0 slots) slave
+   replicates 81843a6471cc8d7c0a297ae660b0699501e581cc
+S: 6a1c7afa81795926c54cc42946701e0e83614b43 fo2:7002
+   slots: (0 slots) slave
+   replicates ad0573b49b627e580291da54cd8780de6fe3c9f8
+M: 6f26707d76b20afc793e12d25db5cef061f6ed69 fo2:7001
+   slots:[5461-10922] (5462 slots) master
+   1 additional replica(s)
+M: 81843a6471cc8d7c0a297ae660b0699501e581cc fo3:7001
+   slots:[10923-16383] (5461 slots) master
+   1 additional replica(s)
+[OK] All nodes agree about slots configuration.
+>>> Check for open slots...
+>>> Check slots coverage...
+[OK] All 16384 slots covered.

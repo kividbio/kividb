@@ -1,0 +1,4 @@
+cluster_state:ok
+cluster_slots_assigned:16384
+cluster_known_nodes:8
+cluster_size:4

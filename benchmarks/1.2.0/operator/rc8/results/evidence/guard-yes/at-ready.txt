@@ -1,0 +1,2 @@
+g-yes-0 kividb_version:1.2.0-rc8 run_id:000000002d1480d900000000deadbeee2d1480d8 keys=356044 role:master master_replid:f23cd897404c440c5315758344f449c16df92dc7 master_repl_offset:0 aof_enabled:1  ack=[aof-ack-after-write yes ]
+g-yes-1 kividb_version:1.2.0-rc8 run_id:0000000003ce404e00000000deadbeee03ce404f keys=356044 role:slave master_host:10.244.3.18 master_link_status:down aof_enabled:1  ack=[aof-ack-after-write yes ]

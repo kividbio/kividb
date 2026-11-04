@@ -53,9 +53,57 @@ Then, with the AOF on and `appendonly.aof` not empty, the AOF is replayed
 **on top of that snapshot**. This applies to replicas too: a replica starts
 from its own files, then syncs with its master.
 
-* A delta whose save number is older than the snapshot's (`dump.kdb.gen`) is
-  skipped: it was already folded into the snapshot, and replaying it would
-  apply its writes twice.
+* A log is replayed only over the snapshot it goes on from. `dump.kdb.gen`
+  holds the snapshot's save number and a fingerprint of the `dump.kdb` it
+  was written for (its length and a hash of its first and last 64 KiB). A
+  delta whose save number is older than the snapshot's is **left out**: its
+  writes are already in the snapshot, and replaying it would apply them
+  twice. So is a delta whose save number is the gen file's own while the
+  fingerprint is not `dump.kdb`'s: that snapshot was replaced since, for
+  example by a save with the AOF off in an earlier release. A log that is
+  left out is not deleted: see [Logs kept aside](#logs-kept-aside).
+* A save with the AOF off (`SAVE`, `BGSAVE`, the save at `SHUTDOWN`) gives
+  its snapshot a save number past every log's, marks it as one no log goes
+  with, and records how long `appendonly.aof` and `appendonly.aof.prev` were
+  then, with a hash of their first and last bytes. It leaves the AOF's files
+  alone. A legacy log (no `KIVIDLT1` header) beside such a snapshot is left
+  out only if it is still as it was at that save. One that has grown since
+  holds writes made after the save, on top of it: it is replayed, as before.
+  A delta with an older save number that has grown since that save is left
+  out up to its length then, and what was added after is replayed: the log
+  starts again on the snapshot with those records. Releases before 1.2.1
+  add to such a log when they are started with the AOF on. The save also
+  records the save number in each log's header, so that:
+  * an `appendonly.aof.prev` that was there at the save and has grown
+    since, because a checkpoint of an earlier release added the log's
+    records to it, is replayed only from where the log's records of the
+    save end: those are checked against what was recorded, and the snapshot
+    holds them. If they do not match, `appendonly.aof.prev` is left out
+    whole, and kept aside;
+  * an `appendonly.aof` that has grown since, beside an
+    `appendonly.aof.prev` that has not, has what was added replayed.
+    Beside such an `appendonly.aof.prev`, the log is judged on its own: a
+    legacy log that has changed since the save, and a log made after the
+    save when there was none (an earlier release makes one on the next
+    save number for an `appendonly.aof.prev` with no log beside it), are
+    replayed whole, and `appendonly.aof.prev` is kept aside.
+
+  The two kinds of log are treated differently on purpose. A legacy log
+  that has grown is replayed whole, as the earlier release replayed it at
+  its start, so its records from before the save can be applied twice; it
+  has no header to say where the save was, and leaving it out would lose
+  the writes added to it. An `appendonly.aof.prev` the earlier release
+  replayed at its start is not replayed again: it is unchanged since the
+  save, its records are older than the snapshot, and nothing added to it
+  is lost by leaving it out.
+
+  One case is left as it was: if an earlier release has since written
+  `dump.kdb.gen` itself (a checkpoint of its own that stopped before its
+  snapshot was in place), nothing recorded at the save is left, and
+  `appendonly.aof.prev` and `appendonly.aof` are replayed whole on the
+  snapshot, as that release replays them. Records the snapshot already
+  holds can then be applied twice. Do not go back to an earlier release
+  with the AOF on after a save with the AOF off.
 * A delta whose save number is newer than the snapshot's means the two files
   are from different moments, for example copied separately with a save in
   between. The writes between those saves are in neither file, and the
@@ -70,10 +118,12 @@ from its own files, then syncs with its master.
 * A malformed record *before* the end makes the whole replay fail before
   anything is applied, and the server refuses to start rather than start
   with part of its data.
-* A legacy AOF (one that starts with `*` rather than `KIVIDLT1`) is still
-  replayed on top of the snapshot, with a warning: it is a full history, so
-  `INCR` or `RPUSH` can be applied twice. Run `SAVE` once the server is up
-  to rebase it.
+* A legacy AOF (one that starts with `*` rather than `KIVIDLT1`) comes only
+  from an earlier release: every log KiviDB starts now has a header. It is
+  still replayed on top of the snapshot, with a warning: it is a full
+  history, so `INCR` or `RPUSH` can be applied twice. Run `SAVE` once the
+  server is up to rebase it. Beside a snapshot saved with the AOF off, it is
+  left out instead if it has not changed since that save (above).
 
 A data file that is present but cannot be read stops the server; it does
 not start empty. [ERRORS.md](ERRORS.md) lists each of these messages and
@@ -81,6 +131,67 @@ what to do.
 
 Replay runs each command as the replica applier does, so a replayed write is
 neither sent to replicas nor appended again to the file it came from.
+
+### Logs kept aside
+
+A log that recovery leaves out, or that `CONFIG SET appendonly yes` starts
+again from, may hold acknowledged writes that are in no snapshot. It is
+never deleted. Before anything replaces it, it is kept in `dir` under a
+name of its own, `superseded.<unix-ms>.<n>.appendonly.aof` (or
+`….appendonly.aof.prev`): a hard link where the filesystem allows one, or
+a synced copy. The directory is synced before the log is replaced. A copy
+that fails part way is removed, so nothing partial is left under that name.
+
+A `[WARN]` names each file when it is kept, and says whether its writes
+are in the dataset. They are when `CONFIG SET appendonly yes` keeps the log
+this server had open (it made or replayed them), and for the part of a log
+that was added to after a save with the AOF off, which was just replayed:
+the warning then says not to send them to the server, which would apply
+them twice. Otherwise it says how to apply them. Every start lists the
+kept files still in `dir`. The server never removes them, and never
+replays them.
+
+To check for them, look at `INFO persistence`:
+
+* `aof_superseded_files`: how many are in `dir`;
+* `aof_superseded_bytes`: their size. A hard link shares its blocks with
+  the log it was made from until that log is replaced, so this can count
+  bytes that are also in `appendonly.aof`.
+
+Or list them: `ls -l <dir>/superseded.*`. The Docker image has no shell.
+On Kubernetes, use a debug container that shares the server's processes:
+
+```sh
+kubectl debug -it <pod> --image=busybox --target=<container> \
+  --profile=general --container=kividb-debug -- sh
+# in it (the server is process 1 of its container):
+ls -l /proc/1/root/<dir>/superseded.*
+```
+
+The server runs as uid 1000. With no `runAsUser` on the pod the debug
+container runs as root, and reading another user's `/proc/1/root` then
+needs `CAP_SYS_PTRACE`, which `--profile=general` adds. Where the cluster's
+policy refuses that, run the debug container as uid 1000 instead (with
+`--custom` and a `securityContext` of `runAsUser: 1000`). To copy a kept
+file off the pod, while that debug container runs:
+
+```sh
+kubectl exec <pod> -c kividb-debug -- cat /proc/1/root/<dir>/<file> > <file>
+```
+
+The files are on the pod's volume and count against its size.
+
+Never send a file whose warning says its writes are in the dataset. To
+apply another kept file's writes, send them to the server: `tail -c +17
+<file> | redis-cli --pipe` for one that starts with `KIVIDLT1` (the first 16
+bytes are its header), `redis-cli --pipe < <file>` for one that starts with
+`*`.
+Its records may include writes the snapshot already holds, and an `INCR` or
+`RPUSH` among those is applied again: read the file first (it is plain RESP
+after the header) and send only what is missing. Then remove the file. A
+file you do not need can be removed at any time, with the server running:
+`rm <dir>/superseded.*` (in a debug container as above,
+`rm /proc/1/root/<dir>/superseded.*`).
 
 ### HyperLogLogs and `hll-write-format`
 
@@ -191,6 +302,8 @@ only what happened next. Redis rewrites at this point for the same reason.
 | `aof_last_bgrewrite_status` | `err` if the last checkpoint failed. Durability is intact, but the log keeps growing. |
 | `aof_lost_records` | Non-zero means the log has a hole and can no longer reconstruct the dataset. |
 | `aof_acks_before_write` | Replies to writes sent after waiting 5 s for their records to reach the file, without them: the disk fell more than 5 s behind. A process killed then can lose those writes. 0 on a disk that keeps up (see [When a write is acknowledged](#when-a-write-is-acknowledged)). |
+| `aof_superseded_files` | Logs kept aside in `dir` (`superseded.*`), which the server never removes (see [Logs kept aside](#logs-kept-aside)). |
+| `aof_superseded_bytes` | Their size in bytes. |
 
 `rdb_last_bgsave_status` and `LASTSAVE` report snapshots, as in Redis.
 

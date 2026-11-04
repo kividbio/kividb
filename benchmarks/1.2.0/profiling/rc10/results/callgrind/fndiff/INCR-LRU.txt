@@ -1,0 +1,33 @@
+# rc8-INCR-LRU.out.gz -> rc10-INCR-LRU.out.gz: 4424.77 -> 4430.84 per command (+6.07)
+# functions with the same self cost: 213 of 311
+# self Ir per command a -> b (diff) | calls per command a -> b | object:function
+    57.98 ->     63.38 (   +5.40) |   2.975 ->   2.966 | libc.so.6:__memcmp_avx2_movbe
+     0.01 ->      4.66 (   +4.65) |   0.000 ->   0.126 | kividb:<tokio::runtime::metrics::batch::MetricsBatch>::end_processing_scheduled_tasks
+    13.15 ->      9.16 (   -4.00) |   0.000 ->   0.000 | kividb:std::sys::backtrace::__rust_begin_short_backtrace::<kividb::run_uring::{closure#8}::{closure#0}, ()>
+    29.07 ->     28.31 (   -0.76) |   0.125 ->   0.125 | kividb:<tokio::task::local::LocalSet>::run_until::<core::future::poll_fn::PollFn<<tokio_uring::runtime::Runtime>::block_on<kividb::run_uring::{closure
+     0.00 ->      0.75 (   +0.75) |   0.000 ->   0.125 | kividb:<tokio::task::coop::with_budget::ResetGuard as core::ops::drop::Drop>::drop
+    11.46 ->     11.08 (   -0.38) |   0.125 ->   0.125 | kividb:kividb::run_uring::{closure#8}::{closure#0}::{closure#0}::{closure#0}
+     1.30 ->      1.62 (   +0.32) |   0.019 ->   0.023 | kividb:kividb::value_slab::alloc
+   103.08 ->    102.83 (   -0.26) |   1.000 ->   1.000 | kividb:<hashbrown::raw::RawTable<kividb::store::entry::Slot>>::find::<<kividb::store::shard_map::ShardMap>::find::{closure#0}>
+     1.00 ->      1.25 (   +0.25) |   0.019 ->   0.023 | kividb:<kividb::store::entry::Entry>::begin
+   187.26 ->    187.05 (   -0.22) |   1.000 ->   1.000 | kividb:<kividb::store::shard_map::ShardMap>::set_str::<&str, &[u8]>
+   155.66 ->    155.46 (   -0.20) |   1.982 ->   1.977 | kividb:core::str::converts::from_utf8
+    38.57 ->     38.38 (   -0.18) |   0.981 ->   0.977 | kividb:<kividb::store::shard_map::ShardMap>::get::{closure#0}
+     0.72 ->      0.90 (   +0.18) |   0.019 ->   0.023 | kividb:<kividb::store::entry::Slot>::new
+    32.52 ->     32.37 (   -0.16) |   0.981 ->   0.977 | kividb:<i64>::from_ascii_bytes_radix_impl
+    24.57 ->     24.72 (   +0.15) |   0.000 ->   0.000 | kividb:kividb::commands::helpers::spawn_active_expire_task::{closure#1}
+   247.45 ->    247.31 (   -0.14) |   1.000 ->   1.000 | kividb:kividb::commands::strings::handle
+    11.39 ->     11.44 (   +0.05) |   0.126 ->   0.127 | kividb:<tokio::runtime::time::Driver>::park_internal
+    13.85 ->     13.90 (   +0.05) |   0.126 ->   0.127 | kividb:<tokio::runtime::scheduler::current_thread::Context>::park
+    58.55 ->     58.60 (   +0.05) |   4.028 ->   4.032 | libc.so.6:__memcpy_avx_unaligned_erms
+    10.65 ->     10.70 (   +0.05) |   0.379 ->   0.381 | kividb:<tokio::runtime::time::wheel::Wheel>::next_expiration
+    83.53 ->     83.58 (   +0.05) |   2.320 ->   2.322 | kividb:<std::sys::pal::unix::time::Timespec>::sub_timespec
+    10.10 ->     10.14 (   +0.04) |   0.126 ->   0.127 | kividb:<tokio::runtime::time::handle::Handle>::process_at_time
+     1.43 ->      1.46 (   +0.03) |   0.000 ->   0.000 | kividb:kividb::commands::server::config_rows
+    39.16 ->     39.19 (   +0.03) |   2.448 ->   2.449 | kividb:<std::sys::pal::unix::time::Timespec>::now
+     6.43 ->      6.46 (   +0.03) |   0.126 ->   0.127 | kividb:<tokio::runtime::scheduler::current_thread::Context>::park_internal
+   128.82 ->    128.84 (   +0.02) |   2.009 ->   2.009 | libc.so.6:_int_free
+    10.55 ->     10.57 (   +0.02) |   0.126 ->   0.127 | kividb:<tokio::runtime::io::driver::Driver>::turn
+     4.79 ->      4.81 (   +0.02) |   0.126 ->   0.127 | kividb:<tokio::process::imp::GlobalOrphanQueue>::reap_orphans
+     6.77 ->      6.79 (   +0.02) |   0.125 ->   0.126 | kividb:<tokio_uring::runtime::Runtime>::new::{closure#0}
+    24.48 ->     24.49 (   +0.02) |   2.448 ->   2.449 | libc.so.6:clock_gettime@@GLIBC_2.17

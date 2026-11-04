@@ -1,0 +1,5 @@
+kividb-cand p1: c1 601685.04 + c2 605951.11 ops/s
+kividb-rc4 p1: c1 608077.28 + c2 601591.67 ops/s
+kividb-cand p1: c1 613623.17 + c2 595823.19 ops/s
+kividb-rc4 p1: c1 610893.96 + c2 603044.51 ops/s
+PROFILE-DONE

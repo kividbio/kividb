@@ -1,0 +1,10 @@
+g-no-0 <acr>.azurecr.io/kividb:1.2.0-rc9 restarts=0 kividb 1.2.0-rc9
+g-no-1 <acr>.azurecr.io/kividb:1.2.0-rc9 restarts=0 kividb 1.2.0-rc9
+g-yes-0 <acr>.azurecr.io/kividb:1.2.0-rc9 restarts=0 kividb 1.2.0-rc9
+g-yes-1 <acr>.azurecr.io/kividb:1.2.0-rc9 restarts=0 kividb 1.2.0-rc9
+shd-0-0 <acr>.azurecr.io/kividb:1.2.0-rc9 restarts=1 kividb 1.2.0-rc9
+shd-0-1 <acr>.azurecr.io/kividb:1.2.0-rc9 restarts=0 kividb 1.2.0-rc9
+shd-1-0 <acr>.azurecr.io/kividb:1.2.0-rc9 restarts=0 kividb 1.2.0-rc9
+shd-1-1 <acr>.azurecr.io/kividb:1.2.0-rc9 restarts=0 kividb 1.2.0-rc9
+shd-2-0 <acr>.azurecr.io/kividb:1.2.0-rc9 restarts=0 kividb 1.2.0-rc9
+shd-2-1 <acr>.azurecr.io/kividb:1.2.0-rc9 restarts=0 kividb 1.2.0-rc9

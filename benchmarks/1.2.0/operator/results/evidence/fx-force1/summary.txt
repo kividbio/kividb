@@ -1,0 +1,12 @@
+lines with two engines for fx-0-0: 0
+2026-11-02T20:47:50.691029656Z 2026-11-02T20:47:50.690Z 1 [INFO] SIGTERM received — shutting down gracefully
+2026-11-02T20:47:50.691046460Z 2026-11-02T20:47:50.691Z 1 [INFO] Writing final snapshot...
+2026-11-02T20:47:50.722472726Z 2026-11-02T20:47:50.722Z 1 [INFO] AOF: rebased onto dump.kdb (generation 1) — log is now the delta
+2026-11-02T20:48:10.258806252Z   * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+2026-11-02T20:48:10.291152644Z 2026-11-02T20:48:10.291Z 1 [INFO] Found dump.kdb — loading native snapshot
+2026-11-02T20:48:10.310332721Z 2026-11-02T20:48:10.310Z 1 [INFO] Loaded 10856 keys from snapshot (0 with a TTL)
+2026-11-02T20:48:10.318019862Z 2026-11-02T20:48:10.317Z 1 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+2026-11-02T20:48:10.334625796Z 2026-11-02T20:48:10.334Z 1 [INFO] Replication: Loaded dataset is offset 434342 of this node's stream 255b1b9ada96a0dfed44b11c9ff752f2dbaca238 — replicas stopped cleanly with it can be continued
+2026-11-02T20:48:11.350762781Z 2026-11-02T20:48:11.350Z 1 [INFO] Replication: Full resync from 54f34221b1aed1ef83bffe84ff7a32b51525e8ae offset=554622
+2026-11-02T20:48:11.382212928Z 2026-11-02T20:48:11.382Z 1 [INFO] AOF: rebased onto dump.kdb (generation 2) — log is now the delta
+2026-11-02T20:48:11.382654286Z 2026-11-02T20:48:11.382Z 1 [INFO] Replication: Backlog restarted at offset 554622 (it ended at 434342)

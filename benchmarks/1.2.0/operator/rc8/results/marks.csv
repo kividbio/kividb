@@ -1,0 +1,113 @@
+scenario,unix,label
+install:,1793682451,CRDs + helm install 0c0fb6e
+install:,1793682470,operator Running after 19 s
+create:,1793682479,"rep, shd on 1.1.3, fx on rc7"
+create:,1793682526,rep Running shd Running fx Running after 47 s
+upgrade-rep,1793682622,spec.image -> 1.2.0-rc8
+upgrade-rep,1793682688,"all 3 pods on 1.2.0-rc8, Running"
+upgrade-shd,1793682731,spec.image -> 1.2.0-rc8
+upgrade-shd,1793682864,"all 6 pods on 1.2.0-rc8, Running"
+upgrade-fx,1793682909,spec.image -> 1.2.0-rc8
+upgrade-fx,1793683034,"all 6 pods on 1.2.0-rc8, Running"
+fxloss,1793683120,try 1: BGSAVE on fx-0-1
+fx-loss1,1793683174,cordoned all nodes but vmss000003
+fx-loss1,1793683174,force delete fx-0-1
+fx-loss1,1793683177,"new fx-0-1 on vmss000003, nodes uncordoned"
+fx-loss1,1793683189,fx-0-1 Ready
+fxloss,1793683278,try 2: BGSAVE on fx-1-1
+fx-loss2,1793683332,cordoned all nodes but vmss000001
+fx-loss2,1793683332,force delete fx-1-1
+fx-loss2,1793683335,"new fx-1-1 on vmss000001, nodes uncordoned"
+fx-loss2,1793683346,fx-1-1 Ready
+fxloss,1793683438,try 3: BGSAVE on fx-2-1
+fx-loss3,1793683491,cordoned all nodes but vmss000003
+fx-loss3,1793683491,force delete fx-2-1
+fx-loss3,1793683494,"new fx-2-1 on vmss000003, nodes uncordoned"
+fx-loss3,1793683506,fx-2-1 Ready
+fxloss,1793683599,try 4: BGSAVE on fx-0-1
+fx-loss4,1793683653,cordoned all nodes but vmss000003
+fx-loss4,1793683653,force delete fx-0-1
+fx-loss4,1793683656,"new fx-0-1 on vmss000003, nodes uncordoned"
+fx-loss4,1793683668,fx-0-1 Ready
+fxloss,1793683763,try 5: BGSAVE on fx-1-1
+fx-loss5,1793683817,cordoned all nodes but vmss000001
+fx-loss5,1793683817,force delete fx-1-1
+fx-loss5,1793683820,"new fx-1-1 on vmss000001, nodes uncordoned"
+fx-loss5,1793683832,fx-1-1 Ready
+fxloss,1793683929,try 6: BGSAVE on fx-2-1
+fx-loss6,1793683983,cordoned all nodes but vmss000003
+fx-loss6,1793683983,force delete fx-2-1
+fx-loss6,1793683985,"new fx-2-1 on vmss000003, nodes uncordoned"
+fx-loss6,1793683997,fx-2-1 Ready
+fx-graceful,1793684109,cordoned all nodes but vmss000001
+fx-graceful,1793684109,graceful delete fx-1-1
+fx-graceful,1793684115,"new fx-1-1 on vmss000001, nodes uncordoned"
+fx-graceful,1793684132,fx-1-1 Ready
+fx,1793684188,removed
+guard,1793684279,clusters and loaders created
+restart-rc8,1793684295,DbOps restart
+restart-rc8,1793684431,DbOps Completed
+failover-rc8,1793684501,FAILOVER shd-0-1
+failover-rc8,1793684525,FAILOVER shd-1-1
+failover-rc8,1793684550,FAILOVER shd-2-1
+sigkill-rc8,1793684633,SIGKILL shd-0-1
+sigkill-rc8,1793684643,shd-0-1 Ready
+drain-rc8,1793684715,drain vmss000001
+drain-rc8,1793684796,drained
+drain-rc8,1793684796,all kividb pods Ready
+reshard-up-rc8,1793684923,spec.shards=4
+reshard-up-rc8,1793684969,RebalanceCompleted
+reshard-up-rc8,1793684970,Running with 8 pods
+reshard-down-rc8,1793685047,spec.shards=3
+reshard-down-rc8,1793685063,RebalanceCompleted
+reshard-down-rc8,1793685064,Running with 6 pods
+guard-yes,1793685165,operator scaled to 0
+guard-yes,1793685169,SIGSTOP + force delete + SIGKILL g-yes-0 (pid 79478)
+guard-yes,1793685205,new g-yes-0 Ready (10.244.1.30)
+guard-yes,1793685206,operator scaled to 1
+guard-yes,1793685348,master after: g-yes-0
+guard-yes,1793685350,verdict KEPT
+guard-no,1793685387,operator scaled to 0
+guard-no,1793685390,SIGSTOP + force delete + SIGKILL g-no-1 (pid 79639)
+guard-no,1793685427,new g-no-1 Ready (10.244.1.188)
+guard-no,1793685428,operator scaled to 1
+guard-no,1793685570,master after: g-no-0
+guard-no,1793685572,verdict FAILED_OVER
+guard-113,1793685616,operator scaled to 0
+guard-113,1793685620,SIGSTOP + force delete + SIGKILL g-113-0 (pid 50606)
+guard-113,1793685662,new g-113-0 Ready (10.244.1.167)
+guard-113,1793685663,operator scaled to 1
+guard-113,1793685805,master after: g-113-1
+guard-113,1793685808,verdict FAILED_OVER
+backup,1793685829,rep: loader stopped
+backup,1793685841,rep: rep-bk-113350 complete
+backup,1793685887,rep: rep-restored Running after 44 s
+backup,1793685902,rep: loader started
+backup,1793685903,shd: loader stopped
+backup,1793685911,shd: shd-bk-113504 complete
+backup,1793685929,shd: loader started
+final,1793685956,read-back
+upgrade-rep,1793682665,op: Switchover
+upgrade-shd,1793682796,op: ShardSwitchover (shard 2)
+upgrade-shd,1793682818,op: ShardSwitchover (shard 1)
+upgrade-shd,1793682839,op: ShardSwitchover (shard 0)
+upgrade-fx,1793682972,op: ShardSwitchover (shard 2)
+upgrade-fx,1793682991,op: ShardSwitchover (shard 1)
+upgrade-fx,1793683012,op: ShardSwitchover (shard 0)
+fx-graceful,1793684111,op: ShardSwitchover (shard 1)
+restart-rc8,1793684363,op: ShardSwitchover (shard 0)
+restart-rc8,1793684387,op: ShardSwitchover (shard 1)
+restart-rc8,1793684407,op: ShardSwitchover (shard 2)
+failover-rc8,1793684502,op: ShardFailover (shard 0)
+failover-rc8,1793684527,op: ShardFailover (shard 1)
+failover-rc8,1793684551,op: ShardFailover (shard 2)
+drain-rc8,1793684718,op: ShardSwitchover (shard 0)
+drain-rc8-rep,1793684718,op: ShardSwitchover (shard 0)
+reshard-up-rc8,1793684924,op: RebalanceStarted
+reshard-up-rc8,1793684965,op: RebalanceCompleted
+reshard-down-rc8,1793685049,op: RebalanceStarted
+reshard-down-rc8,1793685058,op: RebalanceCompleted
+guard-no,1793685446,op: Failover
+guard-no,1793685446,op: MasterRestartedBehind
+guard-113,1793685681,op: Failover
+guard-113,1793685681,op: MasterRestartedBehind

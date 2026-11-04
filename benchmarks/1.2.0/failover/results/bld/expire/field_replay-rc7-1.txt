@@ -1,0 +1,11 @@
+rc7 before kill: hf f=v1 fttl=-1  | hg g=6 gttl=1983 
+/home/azureuser/h/field_replay.sh: line 15:  5712 Killed                  nohup $CMD >> $D/server.log 2>&1 < /dev/null
+rc7 after restart: hf f=v1 fttl=-1  | hg g= gttl=-2  hlen=1
+--- AOF:
+*2 $6 SELECT $1 0 
+*6 $4 HSET $2 hf $4 keep $1 1 $1 f $2 v0 
+*6 $10 HPEXPIREAT $2 hf $13 1793651274634 $6 FIELDS $1 1 $1 f 
+*4 $4 HSET $2 hf $1 f $2 v1 
+*6 $4 HSET $2 hg $4 keep $1 1 $1 g $1 5 
+*6 $10 HPEXPIREAT $2 hg $13 1793651274642 $6 FIELDS $1 1 $1 g 
+*4 $7 HINCRBY $2 hg $1 g $1 1 

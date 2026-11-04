@@ -1298,19 +1298,49 @@ impl ShardMap {
         match unsafe { entry.relocate(regions) } {
             Relocation::Stays => Relocated::Stays,
             Relocation::Held => Relocated::Held,
-            Relocation::Moved { to, left } => {
+            Relocation::Moved(moving) => {
+                let to = moving.to();
+                // What can panic runs before the store changes: unwinding
+                // then frees only the copy (`Moving`).
+                fail_point(1);
                 // The hash is not stored; the fragment is in the slot.
-                *slot = slot.moved_to(to);
+                let moved = slot.moved_to(to);
                 // The position moved with the block.
-                if to.has_ttl() {
-                    self.ttl[to.pos()] = to;
+                let listed = if to.has_ttl() {
+                    fail_point(2);
+                    let listed = &mut self.ttl[to.pos()];
+                    debug_assert!(*listed == entry);
+                    Some(listed)
+                } else {
+                    None
+                };
+                *slot = moved;
+                if let Some(listed) = listed {
+                    *listed = to;
                 }
-                Relocated::Moved(Leftover::Entry(left))
+                Relocated::Moved(Leftover::Entry(moving.done()))
             }
             Relocation::BytesMoved(old) => Relocated::Moved(Leftover::Bytes(old)),
         }
     }
 }
+
+// For tests: the point in `ShardMap::relocate_at` at which to panic.
+#[cfg(test)]
+thread_local! {
+    static FAIL_AT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn fail_point(at: u8) {
+    if FAIL_AT.with(|f| f.get()) == at {
+        panic!("injected at {at}");
+    }
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn fail_point(_: u8) {}
 
 /// Tables and lists with room for fewer keys than this are left as they
 /// are: what shrinking one would give back is not worth it.
@@ -1377,6 +1407,131 @@ mod tests {
             Some(ValueRef::String(b)) => Some(b.to_vec()),
             _ => None,
         }
+    }
+
+    /// What a relocation test does with the key once it has moved.
+    enum Then {
+        /// Drops the map, as a shard's going does.
+        DropMap,
+        /// Takes the key out.
+        Remove,
+        /// Lets its time to live end.
+        Expire,
+    }
+
+    /// A panic in `relocate_at` at `point` (1: where the slot's new address
+    /// is made, 2: where the entry's place in the TTL list is found) leaves
+    /// the store as it was, frees only the copy, and the entry moves later;
+    /// the moved key is then let go of as `then` says.
+    fn relocation_unwinds_at(point: u8, ttl: bool, then: Then) {
+        use crate::value_slab;
+        // These share their slab class: one at a time.
+        static ONE_AT_A_TIME: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        let _one = ONE_AT_A_TIME.lock();
+        let key = |i: usize| format!("{i:0>3000}");
+        let expires = ttl.then_some(u64::MAX / 2);
+        // Made on a thread that ends, so that its slabs are nobody's.
+        let mut map = std::thread::spawn(move || {
+            let mut map = ShardMap::new();
+            for i in 0..64 {
+                map.insert_str_expiring(key(i), b"v", expires);
+            }
+            map
+        })
+        .join()
+        .unwrap();
+        // One key left: its slab holds nothing else, and empties when its
+        // block is freed.
+        for i in 1..64 {
+            map.remove(&key(i));
+        }
+        let listed = |map: &ShardMap, e: Entry| {
+            if ttl {
+                map.ttl.len() == 1 && map.ttl[e.pos()] == e
+            } else {
+                map.ttl.is_empty()
+            }
+        };
+        let index = (0..map.buckets())
+            .find(|&i| map.table.get_bucket(i).is_some())
+            .unwrap();
+        let old = map.table.get_bucket(index).unwrap().entry();
+        assert_eq!(old.has_ttl(), ttl);
+        let generation = value_slab::generation_of(old.base());
+        // Only this key's slab, not every test's.
+        let evacuating = value_slab::evacuate_only(old.base()).expect("a slab nobody owns");
+        // A freed old block shows below as its slab emptying, which needs
+        // the slab to hold only this key, not another test's block too.
+        assert_eq!(evacuating.live(), 1, "the key's slab is shared");
+        let regions = value_slab::regions_snapshot();
+        assert!(map.evacuating_at(index, &regions));
+
+        FAIL_AT.with(|f| f.set(point));
+        let relocated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            map.relocate_at(index, &regions)
+        }));
+        FAIL_AT.with(|f| f.set(0));
+        assert!(relocated.is_err());
+        if value_slab::generation_of(old.base()) != generation {
+            // The store points to freed memory: never drop it.
+            std::mem::forget(map);
+            drop(evacuating);
+            panic!("the old block was freed while the store still points to it");
+        }
+        assert!(map.table.get_bucket(index).unwrap().entry() == old);
+        assert!(listed(&map, old));
+        assert_eq!(text(map.get(&key(0))), Some(b"v".to_vec()));
+        assert_eq!(map.expires(&key(0)), expires);
+
+        // Nothing was left half done: the move goes through now.
+        match map.relocate_at(index, &regions) {
+            Relocated::Moved(left) => drop(left),
+            _ => panic!("not moved"),
+        }
+        let new = map.table.get_bucket(index).unwrap().entry();
+        assert!(new != old && listed(&map, new));
+        // Its slab emptied when the old block was freed.
+        assert_ne!(value_slab::generation_of(old.base()), generation);
+        drop(evacuating);
+        assert_eq!(text(map.get(&key(0))), Some(b"v".to_vec()));
+        assert_eq!(map.expires(&key(0)), expires);
+        // Nothing else moves: the same bucket has nothing left to move.
+        assert!(matches!(map.relocate_at(index, &regions), Relocated::Stays));
+
+        // The moved key goes the usual ways, its value dropped once, from
+        // the copy.
+        match then {
+            Then::DropMap => drop(map),
+            Then::Remove => {
+                let taken = map.remove(&key(0)).expect("the key");
+                drop(taken);
+                assert!(map.is_empty() && map.ttl.is_empty());
+                assert!(map.get(&key(0)).is_none());
+                drop(map);
+            }
+            Then::Expire => {
+                let (due, _) = map.due(u64::MAX, 8);
+                assert_eq!(due.len(), 1);
+                assert!(map.remove_if_due(&key(0), u64::MAX).is_some());
+                assert!(map.is_empty() && map.ttl.is_empty());
+                drop(map);
+            }
+        }
+    }
+
+    #[test]
+    fn a_panic_making_the_moved_slot_frees_only_the_copy() {
+        relocation_unwinds_at(1, true, Then::DropMap);
+    }
+
+    #[test]
+    fn a_panic_finding_the_ttl_place_frees_only_the_copy() {
+        relocation_unwinds_at(2, true, Then::Expire);
+    }
+
+    #[test]
+    fn a_panic_moving_a_key_with_no_ttl_frees_only_the_copy() {
+        relocation_unwinds_at(1, false, Then::Remove);
     }
 
     #[test]

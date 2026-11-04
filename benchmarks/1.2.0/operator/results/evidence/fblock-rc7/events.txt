@@ -1,0 +1,7 @@
+2026-11-02T20:21:21Z   Normal    NoPods             2     No matching pods found
+2026-11-02T20:21:21Z   Normal    SuccessfulCreate   1     Create Claim data-fb-0 Pod fb-0 in StatefulSet fb success
+2026-11-02T20:21:21Z   Normal    SuccessfulCreate   1     Create Pod fb-0 in StatefulSet fb successful
+2026-11-02T20:21:21Z   Normal    SuccessfulCreate   1     Create Claim data-fb-1 Pod fb-1 in StatefulSet fb success
+2026-11-02T20:40:36Z   Normal    SuccessfulCreate   2     Create Pod fb-1 in StatefulSet fb successful
+2026-11-02T20:40:35Z   Normal    Switchover         1     moved the master role from fb-1 to fb-0 (the master pod is being deleted); writes were held on fb-1 for 58ms until fb-0 had applied everything up to offset 16324591
+2026-11-02T21:19:45Z   Warning   FailoverBlocked    20    master fb-0 is unavailable, but no ready replica holds any data (the master last reported 1293264 keys); waiting for it to return rather than promoting an empty replica. Set the kividb.io/allow-empty-failover annotation to "true" to fail over anyway.

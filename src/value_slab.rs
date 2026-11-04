@@ -247,8 +247,9 @@ static IN_USE: AtomicUsize = AtomicUsize::new(0);
 static REGIONS: AtomicUsize = AtomicUsize::new(0);
 /// Where they are.
 static REGION_LIST: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-/// The slabs compaction is emptying, each with its generation when chosen.
-static EVACUATION: Mutex<Vec<(SlabPtr, u32)>> = Mutex::new(Vec::new());
+/// The slabs compaction is emptying, each with its class and its generation
+/// when chosen.
+static EVACUATION: Mutex<Vec<(SlabPtr, usize, u32)>> = Mutex::new(Vec::new());
 
 /// A thread's slabs, one a class at most.
 struct Mine {
@@ -599,38 +600,59 @@ pub fn fill() -> Fill {
     }
 }
 
+/// For tests: called by [`plan_evacuation`] between its two passes, with no
+/// lock held, so that a test can change the slabs it measured.
+#[doc(hidden)]
+pub static PAUSE_BETWEEN_PASSES: Mutex<Option<fn()>> = Mutex::new(None);
+
 /// Choose the sparsest slabs nobody owns, holding about `budget` bytes of
 /// blocks between them, for compaction to empty: no block is handed out of
 /// them from now on. Returns how many it chose.
 pub fn plan_evacuation(budget: usize) -> usize {
-    let mut candidates: Vec<(usize, usize, SlabPtr, usize)> = Vec::new();
+    let mut candidates: Vec<(usize, usize, SlabPtr, u32, usize)> = Vec::new();
     for (class, list) in PARTIAL_SLABS.iter().enumerate() {
         for &slab in list.lock().iter() {
             // SAFETY: a header lives as long as the process.
-            let live = unsafe { &*slab.0 }.live.load(Ordering::Relaxed).max(0) as usize;
+            let s = unsafe { &*slab.0 };
+            let live = s.live.load(Ordering::Relaxed).max(0) as usize;
             let per_mille = live * 1000 / capacity(class) as usize;
-            candidates.push((per_mille, class, slab, live * block_size(class)));
+            // Under the class's lock, as every change of a listed slab's
+            // generation is.
+            let generation = s.generation.load(Ordering::Relaxed);
+            candidates.push((per_mille, class, slab, generation, live * block_size(class)));
         }
     }
     candidates.sort_unstable_by_key(|candidate| candidate.0);
+    let pause = *PAUSE_BETWEEN_PASSES.lock();
+    if let Some(pause) = pause {
+        pause();
+    }
     let mut chosen = EVACUATION.lock();
     let mut held = 0usize;
-    for (_, class, slab, bytes) in candidates {
+    for (_, class, slab, generation, bytes) in candidates {
         if held >= budget {
             break;
         }
         let mut list = PARTIAL_SLABS[class].lock();
         // SAFETY: a header lives as long as the process.
         let s = unsafe { &*slab.0 };
-        // Taken by a thread since, or emptied and another class's now.
-        if s.state.load(Ordering::Relaxed) != PARTIAL
-            || s.class.load(Ordering::Relaxed) as usize != class
+        // Still the slab measured, and still in this list. Its generation
+        // is the same only if it has not emptied since: it empties under
+        // this lock, so a later generation is seen here. And until it
+        // empties it is this class's, and is listed, taken or let go of only
+        // under this lock, so PARTIAL means it is in `list` at its `index`.
+        // A slab that emptied and was listed again, in this class or
+        // another, is not the one measured: its state and class alone do
+        // not tell, and its class, written with no lock by the thread that
+        // took it empty, may be seen late.
+        if s.generation.load(Ordering::Relaxed) != generation
+            || s.state.load(Ordering::Relaxed) != PARTIAL
         {
             continue;
         }
         unlist(&mut list, s);
         s.state.store(EVACUATING, Ordering::Relaxed);
-        chosen.push((slab, s.generation.load(Ordering::Relaxed)));
+        chosen.push((slab, class, generation));
         held += bytes;
     }
     chosen.len()
@@ -641,10 +663,12 @@ pub fn plan_evacuation(budget: usize) -> usize {
 /// their class's list, or stay out of it while too full.
 pub fn finish_evacuation() {
     let chosen = std::mem::take(&mut *EVACUATION.lock());
-    for (slab, generation) in chosen {
+    for (slab, class, generation) in chosen {
         // SAFETY: a header lives as long as the process.
         let s = unsafe { &*slab.0 };
-        let class = s.class.load(Ordering::Relaxed) as usize;
+        // The class it had when chosen, not the one it has now: one that
+        // emptied did so under this class's lock, so its generation shows
+        // it here. Its class now may be another's, seen with no lock.
         let list = PARTIAL_SLABS[class].lock();
         if s.generation.load(Ordering::Relaxed) != generation
             || s.state.load(Ordering::Relaxed) != EVACUATING
@@ -698,4 +722,62 @@ pub fn regions() -> usize {
 #[allow(dead_code)]
 pub fn generation_of(block: *const u8) -> u32 {
     slab_of(block).generation.load(Ordering::Relaxed)
+}
+
+/// For tests: empty only the slab `block` is in, as [`plan_evacuation`]
+/// would, until the guard is dropped, panic or not. No other slab changes,
+/// and [`finish_evacuation`] does not see it. `None` unless nobody owns the
+/// slab and it has room.
+///
+/// `block` is live, so its slab's class is the one it was given in.
+#[cfg(test)]
+pub(crate) fn evacuate_only(block: *const u8) -> Option<OnlyEvacuating> {
+    let slab = slab_of(block);
+    let class = slab.class.load(Ordering::Relaxed) as usize;
+    let mut list = PARTIAL_SLABS[class].lock();
+    if slab.state.load(Ordering::Relaxed) != PARTIAL {
+        return None;
+    }
+    unlist(&mut list, slab);
+    slab.state.store(EVACUATING, Ordering::Relaxed);
+    Some(OnlyEvacuating {
+        slab: SlabPtr(slab),
+        class,
+        generation: slab.generation.load(Ordering::Relaxed),
+    })
+}
+
+/// The slab [`evacuate_only`] chose; dropped, it is put back as
+/// [`finish_evacuation`] puts back its own.
+#[cfg(test)]
+pub(crate) struct OnlyEvacuating {
+    slab: SlabPtr,
+    class: usize,
+    generation: u32,
+}
+
+#[cfg(test)]
+impl OnlyEvacuating {
+    /// The blocks the slab holds: nobody owns it, so none is uncounted.
+    pub(crate) fn live(&self) -> usize {
+        // SAFETY: a header lives as long as the process.
+        let s = unsafe { &*self.slab.0 };
+        s.live.load(Ordering::SeqCst).max(0) as usize
+    }
+}
+
+#[cfg(test)]
+impl Drop for OnlyEvacuating {
+    fn drop(&mut self) {
+        // SAFETY: a header lives as long as the process.
+        let s = unsafe { &*self.slab.0 };
+        let list = PARTIAL_SLABS[self.class].lock();
+        if s.generation.load(Ordering::Relaxed) != self.generation
+            || s.state.load(Ordering::Relaxed) != EVACUATING
+        {
+            return;
+        }
+        s.state.store(FULL, Ordering::Relaxed);
+        settle(list, s, self.class);
+    }
 }

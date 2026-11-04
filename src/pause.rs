@@ -1,5 +1,5 @@
 // src/pause.rs
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 /// Global pause expiry in Unix milliseconds.
 /// 0 = not paused. Positive = writes are paused until this timestamp.
@@ -45,7 +45,31 @@ static PAUSE_MODE_WRITE_ONLY: std::sync::atomic::AtomicBool =
 /// Not set for `CLIENT PAUSE`: nothing is handed over, so a write that slips
 /// past it is merely a moment late in being paused, and waiting for it in
 /// the gate would hold a worker thread for as long as the client asked.
-static HANDOFF: AtomicBool = AtomicBool::new(false);
+///
+/// The same flag, a second bit of it, is up while a `MIGRATE` holds keys
+/// here ([`KEYS_MOVING`], see `key_moves`): one load still tells a write
+/// whether it has anything to look at ([`writes_must_check`]).
+///
+/// Above those two bits, in a cluster, it counts the times keys have left
+/// this node or a slot here has changed state ([`routes_moved`]): a
+/// `MIGRATE` deleted what it moved, or `CLUSTER SETSLOT` ran. A command is
+/// routed ("is its key here?") before it enters the write gate, and a whole
+/// `MIGRATE` of its key can run in between. It then ran here, on a key that
+/// had left, and made it again (#331). So a command routed in a cluster
+/// takes the count before it looks for its keys ([`routes_now`]), and a
+/// write compares the whole flag with that inside the gate: the same one
+/// load, against its own number instead of 0. Outside a cluster the count
+/// stays 0.
+static HANDOFF: AtomicU64 = AtomicU64::new(0);
+
+/// [`HANDOFF`]: a handoff's pause is in force.
+const HANDOFF_PAUSE: u64 = 1;
+/// [`HANDOFF`]: a `MIGRATE` is moving keys (`key_moves`).
+const KEYS_MOVING: u64 = 2;
+/// [`HANDOFF`]: one more time keys left here or a slot changed state.
+const ROUTES_MOVED: u64 = 4;
+/// [`HANDOFF`]: the bits below the count.
+const BITS: u64 = ROUTES_MOVED - 1;
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -67,7 +91,7 @@ pub fn active() -> Option<bool> {
             .is_ok()
         {
             // A handoff that ran out of time is over, like its pause.
-            HANDOFF.store(false, Ordering::Release);
+            end_handoff_flag();
         }
         return None;
     }
@@ -112,8 +136,28 @@ pub fn clear_pause() {
     if held && HELD.load(Ordering::SeqCst) == 0 {
         let _ = PAUSE_UNTIL_MS.compare_exchange(ENDING, 0, Ordering::SeqCst, Ordering::SeqCst);
     }
-    HANDOFF.store(false, Ordering::Release);
+    end_handoff_flag();
     CHANGED.notify_waiters();
+}
+
+/// Take the flag of a handoff's pause down, and if it was up, move the
+/// routes ([`routes_moved`]) in the same change. A write that finds the
+/// flag down then finds the routes moved too, and is routed again in the
+/// gate, however the pause ended: the handoff's end, a hold let go,
+/// `CLIENT UNPAUSE`, or its time running out. A handoff that moved slots
+/// still moves the routes itself first, before `PAUSE_UNTIL_MS` is cleared,
+/// for a write that sees the pause over with the flag still up
+/// ([`handoff_pause_in_force`]). The flag is up only in a cluster, so the
+/// count still stays 0 outside one.
+fn end_handoff_flag() {
+    let mut now = HANDOFF.load(Ordering::Relaxed);
+    while now & HANDOFF_PAUSE != 0 {
+        let ended = (now & !HANDOFF_PAUSE).wrapping_add(ROUTES_MOVED);
+        match HANDOFF.compare_exchange_weak(now, ended, Ordering::SeqCst, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(seen) => now = seen,
+        }
+    }
 }
 
 /// Woken when a pause is ended, and when the last client it held goes on.
@@ -215,7 +259,7 @@ impl Drop for Ran {
 pub fn set_handoff_pause(duration_ms: i64) {
     // The flag first, and before the caller's cut: a write that enters the
     // gate after that cut is certain to see it.
-    HANDOFF.store(true, Ordering::SeqCst);
+    HANDOFF.fetch_or(HANDOFF_PAUSE, Ordering::SeqCst);
     set_pause(duration_ms, true);
 }
 
@@ -239,7 +283,78 @@ pub fn hold_writes() {
 /// again: a handoff is under way. One atomic load when none is.
 #[inline]
 pub fn handoff() -> bool {
-    HANDOFF.load(Ordering::Acquire) && active().is_some()
+    HANDOFF.load(Ordering::Acquire) & HANDOFF_PAUSE != 0 && handoff_pause_in_force()
+}
+
+/// Whether the pause of a handoff whose flag a write has just seen is still
+/// in force, and then an acquire fence.
+///
+/// A handoff that ends moves the count of routes first ([`routes_moved`]),
+/// then ends the pause (`clear_pause`: `PAUSE_UNTIL_MS`, then the flag). A
+/// write can load the flag before that, still up, and then find the pause
+/// ended: [`active`] loads `PAUSE_UNTIL_MS` relaxed. The write then asks
+/// whether its routes have moved ([`routes_moved_since`]), a third load,
+/// which nothing made see the count moved before the pause ended: x86 does,
+/// aarch64 need not, and the write ran here, on a slot it had been handed
+/// away from (#337). The fence after a load that saw the pause ended makes
+/// everything done before it was ended visible. Only here, where the flag
+/// was up: an ordinary write never comes this way.
+#[cold]
+#[inline(never)]
+fn handoff_pause_in_force() -> bool {
+    let in_force = active().is_some();
+    std::sync::atomic::fence(Ordering::Acquire);
+    in_force
+}
+
+/// Whether a write that has just entered the write gate has anything to
+/// look at: a handoff ([`handoff`]), a `MIGRATE` moving keys
+/// (`key_moves::names_a_moving_key`), or keys that left here, or a slot
+/// that changed state, since the write was routed. `routed` is what
+/// [`routes_now`] said before it was routed; 0 if it was not, outside a
+/// cluster, where the count stays 0. One atomic load when none of these is
+/// so.
+#[inline]
+pub fn writes_must_check(routed: u64) -> bool {
+    HANDOFF.load(Ordering::Acquire) != routed
+}
+
+/// Whether a `MIGRATE` holds keys here (`key_moves`).
+#[inline]
+pub fn keys_moving() -> bool {
+    HANDOFF.load(Ordering::Acquire) & KEYS_MOVING != 0
+}
+
+/// How many times keys have left here or a slot has changed state (see
+/// [`HANDOFF`]). Taken by a command in a cluster before it looks for its
+/// keys: whatever moves them after this, it sees in the write gate.
+#[inline]
+pub fn routes_now() -> u64 {
+    HANDOFF.load(Ordering::Acquire) & !BITS
+}
+
+/// Whether keys have left here, or a slot has changed state, since
+/// [`routes_now`] said `routed`.
+pub fn routes_moved_since(routed: u64) -> bool {
+    routes_now() != routed
+}
+
+/// Keys have left this node, or a slot here has changed state: a write
+/// routed before this, and not yet in the write gate, is routed again there
+/// (#331). In a cluster only.
+pub(crate) fn routes_moved() {
+    HANDOFF.fetch_add(ROUTES_MOVED, Ordering::SeqCst);
+}
+
+/// `MIGRATE` holds keys here, or no longer does (`key_moves`, under its
+/// lock). Before `MIGRATE` waits out the writes in the gate: a write that
+/// enters the gate after that is certain to see it.
+pub(crate) fn set_keys_moving(on: bool) {
+    if on {
+        HANDOFF.fetch_or(KEYS_MOVING, Ordering::SeqCst);
+    } else {
+        HANDOFF.fetch_and(!KEYS_MOVING, Ordering::SeqCst);
+    }
 }
 
 /// Wait for the handoff to end. Called by a write command, outside the write
@@ -351,6 +466,10 @@ impl Drop for Held {
     }
 }
 
+/// Held by a unit test that sets or ends the pause, which is the process's.
+#[cfg(test)]
+pub(crate) static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,6 +477,7 @@ mod tests {
     // One test, because the pause is the process's.
     #[test]
     fn the_longer_and_the_wider_pause_holds() {
+        let _pause = TEST_LOCK.lock();
         clear_pause();
         assert_eq!(active(), None);
         set_pause(60_000, true);

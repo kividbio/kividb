@@ -1,0 +1,32 @@
+Json file /tmp/r/warm.c2.json created...
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 20%,   1 secs] 15 threads 10 conns:     5330095 ops, 5328166 (avg: 5328166) ops/sec, 726.07MB/sec (avg: 726.07MB/sec),  0.44 (avg:  0.44) msec latency[RUN #1 40%,   2 secs] 15 threads 10 conns:    10674761 ops, 5337401 (avg: 5332786) ops/sec, 727.32MB/sec (avg: 726.70MB/sec),  0.44 (avg:  0.44) msec latency[RUN #1 60%,   3 secs] 15 threads 10 conns:    16044913 ops, 5367623 (avg: 5344395) ops/sec, 731.44MB/sec (avg: 728.28MB/sec),  0.44 (avg:  0.44) msec latency[RUN #1 80%,   4 secs] 15 threads 10 conns:    21382969 ops, 5336551 (avg: 5342435) ops/sec, 727.21MB/sec (avg: 728.01MB/sec),  0.44 (avg:  0.44) msec latency[RUN #1 100%,   5 secs]  0 threads 10 conns:    26950556 ops, 5336551 (avg: 5389147) ops/sec, 727.21MB/sec (avg: 734.38MB/sec),  0.44 (avg:  0.44) msec latency
+
+Writing Full Run command HDR latency histogram results to /tmp/r/warm.c2_FULL_RUN_1.txt...
+Writing Full Run command HDR latency histogram results in HistogramLogProcessor format to /tmp/r/warm.c2_FULL_RUN_1.hgrm...
+Writing GET command HDR latency histogram results to /tmp/r/warm.c2_GET_command_run_1.txt...
+Writing GET command HDR latency histogram results in HistogramLogProcessor format to /tmp/r/warm.c2_GET_command_run_1.hgrm...
+
+CPU Utilization Summary
+  Total CPU time:   67.680s  (user 31.095s, sys 36.585s)
+  Wall time:        5.002s
+  Cores used:       13.530   (avg 90.2% across 15 worker threads)
+  Peak utilization: 1364.5%
+Saving JSON output file: /tmp/r/warm.c2.json
+Json file closed.
+15        Threads
+10        Connections per thread
+5         Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets            0.00          ---          ---             ---             ---             ---             ---         0.00 
+Gets      5389335.14   5389335.14         0.00         0.43623         0.43100         0.74300         1.19900    752027.21 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    5389335.14   5389335.14         0.00         0.43623         0.43100         0.74300         1.19900    752027.21 
+rc=0

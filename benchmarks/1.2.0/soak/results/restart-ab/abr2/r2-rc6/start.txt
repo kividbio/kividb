@@ -1,0 +1,2 @@
+started kividbrc6 master pid 161775
+started kividbrc6 replica pid 156934

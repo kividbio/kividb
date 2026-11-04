@@ -1,0 +1,13 @@
+kividb 1.2.0-rc8
+684e71afb1192a3c9f34ea74c603c32e994987701729d9c013835cc5dd75c80a  /opt/kv/kividb
+port 7001
+bind 0.0.0.0
+protected-mode no
+dir /data/7001
+appendonly yes
+cluster-enabled yes
+cluster-node-timeout 5000
+cluster-config-file nodes.conf
+threads 4
+appendfsync everysec
+update-check no

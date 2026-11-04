@@ -1,0 +1,11 @@
+== rep 1 (stop) 20:37:00
+WARNING: About to power off the specified VM...
+It will continue to be billed. To deallocate a VM, run: az vm deallocate.
+power_loss_everysec kividb rep1: {"acked": 3555058, "lost_acked": 3051, "wrong_value": 0, "wait_acked": 0, "wait_acked_lost": 0, "unacked_errors": 4370, "recovery": {"event_t": 30.938, "pre_event_ok_per_100ms_median": 1199, "first_error_t": 35.1, "last_error_t": 63.1, "writes_below_80pct_from_t": 33.1, "throughput_back_t": 63.2, "recovery_s": 32.26}}
+== rep 2 (stop) 20:43:04
+WARNING: About to power off the specified VM...
+It will continue to be billed. To deallocate a VM, run: az vm deallocate.
+power_loss_everysec kividb rep2: {"acked": 3542321, "lost_acked": 1842, "wrong_value": 0, "wait_acked": 0, "wait_acked_lost": 0, "unacked_errors": 4778, "recovery": {"event_t": 33.222, "pre_event_ok_per_100ms_median": 1192, "first_error_t": 38.0, "last_error_t": 65.5, "writes_below_80pct_from_t": 36.0, "throughput_back_t": 65.60000000000001, "recovery_s": 32.38}}
+== rep 3 (deallocate) 20:49:07
+power_loss_everysec kividb rep3: {"acked": 3109496, "lost_acked": 2260, "wrong_value": 0, "wait_acked": 0, "wait_acked_lost": 0, "unacked_errors": 4961, "recovery": {"event_t": 31.047, "pre_event_ok_per_100ms_median": 1202, "first_error_t": 36.0, "last_error_t": 100.7, "writes_below_80pct_from_t": 34.0, "throughput_back_t": 100.80000000000001, "recovery_s": 69.75}}
+PL-DONE 20:55:13

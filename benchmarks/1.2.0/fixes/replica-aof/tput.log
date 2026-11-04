@@ -1,0 +1,25 @@
+solo r1 rc4 P1 rps=235275.66
+solo r1 rc4 P16 rps=1363264.50
+solo r1 fixed P1 rps=230742.61
+solo r1 fixed P16 rps=1347951.12
+solo r2 fixed P1 rps=232991.61
+solo r2 fixed P16 rps=1347890.50
+solo r2 rc4 P1 rps=232982.56
+solo r2 rc4 P16 rps=1347830.00
+solo r3 rc4 P1 rps=232991.61
+solo r3 rc4 P16 rps=1318217.75
+solo r3 fixed P1 rps=230742.61
+solo r3 fixed P16 rps=1378929.88
+replica r1 rc4 P1 rps=218150.09
+replica r1 rc4 P16 rps=999433.62
+replica r1 fixed P1 rps=216192.84
+replica r1 fixed P16 rps=999400.38
+replica r2 fixed P1 rps=214262.75
+replica r2 fixed P16 rps=967149.19
+replica r2 rc4 P1 rps=216192.84
+replica r2 rc4 P16 rps=1007793.62
+replica r3 rc4 P1 rps=214270.41
+replica r3 rc4 P16 rps=982929.81
+replica r3 fixed P1 rps=214262.75
+replica r3 fixed P16 rps=944257.38
+TPUT-DONE

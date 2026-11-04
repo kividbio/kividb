@@ -1,0 +1,2 @@
+dragonfly persist docker.dragonflydb.io/dragonflydb/dragonfly:v2.0.2 redis_version:7.4.0 dragonfly_version:df-v2.0.2 
+[dragonfly --logtostderr --port 6379 --proactor_threads 32 --dir /data --dbfilename dump]

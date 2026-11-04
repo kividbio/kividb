@@ -1,0 +1,79 @@
+    image: kividb/kividb:build-598b74d20ec0
+      - seccomp=./seccomp-io-uring.json
+      memlock: -1
+engine-1  | 2026-11-03T03:11:29.378Z 1 [INFO] KiviDB 1.2.0-rc7 starting: pid 1, default build, config file none
+engine-1  |                                                                                      
+engine-1  |                                                                                                     
+engine-1  |                                                    :::.                                     
+engine-1  |                                 .:-==-:.       :#%@%%%@%%=                                  
+engine-1  |                           -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+engine-1  |                       :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+engine-1  |                     +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+engine-1  |                   =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+engine-1  |                 .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+engine-1  |                -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+engine-1  |               .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+engine-1  |               +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+engine-1  |               %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+engine-1  |               @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+engine-1  |               %%:::::::::::::::::::::::::::::+%@%-                          .               
+engine-1  |               =@*::::::::::::::::::::::::::*%@@*                                            
+engine-1  |                *@*::::=+:::::::::::::::-*%@@%%:                                             
+engine-1  |                 *@#-:##::::::::::-=+*%@@@@%*.                                               
+engine-1  |                  :#@%@*::::::*%@@@%%@@@%*:                                                  
+engine-1  |                    .*%%=:::*%%%%%%%@@%+                                                     
+engine-1  |                      .#@@@%*-   .#%@*.                                                      
+engine-1  |                       .#@*        :%@%:                                                     
+engine-1  |                         %@*         =%@#                                                    
+engine-1  |                          #@#          +%%+                                                  
+engine-1  |                           *%%+:...     .*@%*:....                                           
+engine-1  |                        *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+engine-1  |                                .+-            :+.                                           
+engine-1  |                                                                                                     
+engine-1  |     
+engine-1  |   KiviDB v1.2.0-rc7 - A fast Redis®-compatible store written in Rust
+engine-1  |   https://kividb.io
+engine-1  | 
+engine-1  |   Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+engine-1  | 
+engine-1  |   * Version        : 1.2.0-rc7
+engine-1  |   * Mode           : standalone
+engine-1  |   * OS             : linux x86_64
+engine-1  |   * Memory         : 251GiB available
+engine-1  |   * CPUs           : 32 cores detected
+engine-1  |   * Listening on   : 0.0.0.0:6379
+engine-1  |   * Worker threads : 30
+engine-1  |   * AOF            : disabled
+engine-1  |   * Persistence    : KDB snapshot (SAVE / BGSAVE)
+engine-1  |   * Databases      : 16
+engine-1  |   * ACL file       : none
+engine-1  | 
+engine-1  | 2026-11-03T03:11:29.379Z 1 [INFO] I/O model      : io_uring
+engine-1  | 2026-11-03T03:11:29.382Z 1 [INFO] Shards per DB  : 256
+engine-1  | 2026-11-03T03:11:29.382Z 1 [INFO] I/O model      : io_uring
+engine-1  | 2026-11-03T03:11:29.383Z 1 [INFO] Ready to accept connections on 0.0.0.0:6379
+# Server
+redis_version:8.10.0
+redis_git_sha1:00000000
+redis_git_dirty:0
+redis_build_id:120-rc7
+redis_mode:standalone
+arch_bits:64
+kividb_version:1.2.0-rc7
+kividb_expired_keys_propagated:1
+os:linux x86_64
+tcp_port:6379
+process_id:1
+run_id:0000000000f52e0a00000000deadbeee00f52e0b
+uptime_in_seconds:0
+uptime_in_days:0
+hz:10
+configured_hz:10
+multiplexing_api:io_uring
+atomicvar_api:atomic-builtin
+gcc_version:0.0.0
+config_file:
+slowlog_log_slower_than:-1
+slowlog_max_len:128
+executable:/usr/local/bin/kividb
+

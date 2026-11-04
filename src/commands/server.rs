@@ -73,6 +73,10 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
             rs.repl_ping_period_secs.load(Relaxed).to_string(),
         ),
         (
+            "shutdown-timeout",
+            rs.shutdown_timeout_secs.load(Relaxed).to_string(),
+        ),
+        (
             "replica-full-sync-guard",
             rs.full_sync_guard().as_str().to_string(),
         ),
@@ -92,7 +96,11 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
         ),
         (
             "repl-replica-max-backlog-bytes",
-            ctx.config.repl_replica_max_backlog_bytes.to_string(),
+            rs.replica_max_backlog_bytes.load(Relaxed).to_string(),
+        ),
+        (
+            "repl-replica-sync-max-backlog-bytes",
+            rs.replica_sync_max_backlog_bytes.load(Relaxed).to_string(),
         ),
         ("cluster-enabled", yes_no(ctx.config.cluster_enabled)),
         (
@@ -436,17 +444,53 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
             }
             "appendonly" => match value {
                 "yes" | "1" | "true" => {
-                    let was_on =
-                        crate::aof::AOF_ENABLED.swap(true, std::sync::atomic::Ordering::Relaxed);
+                    use std::sync::atomic::Ordering::Relaxed;
+                    if crate::aof::AOF_ENABLED.load(Relaxed) {
+                        return Some(resp_simple("OK"));
+                    }
+                    // The checkpoint's turn, from before the log is made
+                    // to the end of the checkpoint: no other checkpoint, or
+                    // other enable, between the two.
+                    let turn = match crate::aof::checkpoint_turn() {
+                        Ok(turn) => turn,
+                        Err(e) => {
+                            return Some(resp_error(&format!("ERR enabling AOF failed: {e}")));
+                        }
+                    };
+                    if crate::aof::AOF_ENABLED.load(Relaxed) {
+                        return Some(resp_simple("OK"));
+                    }
+                    // The log, before the flag goes up: a new one, unless
+                    // the one kept open is still current (#350). One that
+                    // cannot be made is an error and the AOF stays off, as
+                    // in Redis, not an exit (#47).
+                    if let Err(e) = crate::aof::open_log(&turn) {
+                        log_warn!("CONFIG SET appendonly yes: {e}");
+                        return Some(resp_error(&format!(
+                            "ERR CONFIG SET failed (possibly related to argument 'appendonly') - Unable to turn on AOF: {e}"
+                        )));
+                    }
+                    crate::aof::AOF_ENABLED.store(true, Relaxed);
+                    crate::aof::failpoint("aof-enabling");
                     // Redis CONFIG SET appendonly yes rewrites before
                     // OK. Returning first left a window where the next
                     // write could miss both the dump and the delta —
                     // and on io_uring the connection still carried the
                     // boot-time aof_enabled=false, so that write was
                     // never logged at all.
-                    if !was_on && let Err(e) = crate::aof::checkpoint(ctx.store, ctx.index_store) {
-                        crate::aof::AOF_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+                    if let Err(e) =
+                        crate::aof::checkpoint_noting(&turn, ctx.store, ctx.index_store, &mut || {})
+                    {
+                        crate::aof::AOF_ENABLED.store(false, Relaxed);
                         return Some(resp_error(&format!("ERR enabling AOF failed: {e}")));
+                    }
+                    // A `CONFIG SET appendonly no` took no turn, and may have
+                    // come in the meantime: then the AOF is off, and saying
+                    // OK would say otherwise.
+                    if !crate::aof::AOF_ENABLED.load(Relaxed) {
+                        return Some(resp_error(
+                            "ERR enabling AOF failed: the AOF was turned off while it was being turned on",
+                        ));
                     }
                     Some(resp_simple("OK"))
                 }
@@ -633,6 +677,38 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                 _ => Some(resp_error(
                     "ERR CONFIG SET failed (possibly related to argument \
                                  'repl-timeout') - argument must be a positive integer",
+                )),
+            },
+            // Read for each write the hub queues: a change applies to the
+            // replicas already attached (#305).
+            "repl-replica-max-backlog-bytes" | "repl-replica-sync-max-backlog-bytes" => {
+                match memory_size(value) {
+                    Some(bytes) if bytes > 0 && bytes <= i64::MAX as usize => {
+                        let limit = if param == "repl-replica-max-backlog-bytes" {
+                            &ctx.repl_state.replica_max_backlog_bytes
+                        } else {
+                            &ctx.repl_state.replica_sync_max_backlog_bytes
+                        };
+                        limit.store(bytes as u64, Ordering::Relaxed);
+                        Some(resp_simple("OK"))
+                    }
+                    _ => Some(resp_error(&format!(
+                        "ERR CONFIG SET failed (possibly related to argument '{param}') - \
+                         argument must be a memory value of at least 1 byte"
+                    ))),
+                }
+            }
+            // Read when a shutdown begins to wait for the replicas.
+            "shutdown-timeout" => match value.parse::<u64>() {
+                Ok(v) if v <= i32::MAX as u64 => {
+                    ctx.repl_state
+                        .shutdown_timeout_secs
+                        .store(v, std::sync::atomic::Ordering::Relaxed);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument \
+                                 'shutdown-timeout') - argument must be between 0 and 2147483647 inclusive",
                 )),
             },
             "repl-ping-replica-period" | "repl-ping-slave-period" => match value.parse::<u64>() {
@@ -918,16 +994,103 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
         .or_else(|| config_set_global(&param, value))
         .unwrap_or_else(|| config_set_other(ctx, &param, value));
     if reply.starts_with(b"+") {
-        let secret = matches!(
-            param.as_str(),
-            "requirepass" | "masterauth" | "tls-key-file-pass"
-        );
+        let secret = crate::slowlog::SECRET_SETTINGS.contains(&param.as_str());
         log_info!(
             "CONFIG SET {param} {}",
             if secret { "(hidden)" } else { value }
         );
     }
     reply
+}
+
+/// What `CONFIG SET latency-tracking-info-percentiles` refuses a value with
+/// (#255). Redis's two messages, word for word: clients and tests compare
+/// them.
+const PERCENTILES_NOT_NUMBERS: &str = "Invalid latency-tracking-info-percentiles parameters";
+const PERCENTILES_OUT_OF_RANGE: &str =
+    "latency-tracking-info-percentiles parameters should sit between [0.0,100.0]";
+
+/// One percentile as Redis reads it (with `strtod`): a decimal, with or
+/// without an exponent (`99.9`, `1e1`), `inf`, or a hexadecimal integer
+/// (`0x10`). Anything else is not a number, and neither is NaN or a value
+/// too large for a double (`1e999`). A hexadecimal fraction or exponent
+/// (`0x1p3`) is not read.
+fn parse_percentile(word: &str) -> Option<f64> {
+    let (negative, digits) = match word.as_bytes().first()? {
+        b'-' => (true, &word[1..]),
+        b'+' => (false, &word[1..]),
+        _ => (false, word),
+    };
+    let magnitude = match digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        Some(hex) if !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            hex.bytes().fold(0.0, |sum, b| {
+                sum * 16.0 + (b as char).to_digit(16).map_or(0.0, f64::from)
+            })
+        }
+        Some(_) => return None,
+        None => {
+            // A second sign ("--5", "+-5") is not a number, though Rust's
+            // parser would take one more.
+            if digits.starts_with(['+', '-']) {
+                return None;
+            }
+            let value: f64 = digits.parse().ok()?;
+            if value.is_nan()
+                || (value.is_infinite() && !digits.to_ascii_lowercase().contains("inf"))
+            {
+                return None;
+            }
+            // An underflow to zero ("1e-400") is refused too, as `string2d`
+            // refuses it: a nonzero digit before the exponent, and zero.
+            let mantissa = digits.split(['e', 'E']).next().unwrap_or_default();
+            if value == 0.0 && mantissa.bytes().any(|b| (b'1'..=b'9').contains(&b)) {
+                return None;
+            }
+            value
+        }
+    };
+    Some(if negative { -magnitude } else { magnitude })
+}
+
+/// A list of percentiles as Redis's `CONFIG GET` writes it: each number with
+/// `%f` (six decimals), then the trailing zeros and a trailing `.` taken off,
+/// so `50.0` reads back as `50` and `99.90` as `99.9`.
+pub(crate) fn format_latency_percentiles(percentiles: &[f64]) -> String {
+    percentiles
+        .iter()
+        .map(|p| {
+            let fixed = format!("{p:.6}");
+            fixed
+                .trim_end_matches('0')
+                .trim_end_matches('.')
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The percentiles of a `latency-tracking-info-percentiles` value: numbers
+/// from 0 to 100 between single spaces, or nothing at all. The words are
+/// checked in order, each for being a number and then for its range, as in
+/// Redis, so an extra space (an empty word) is a word that is not a number.
+pub(crate) fn parse_latency_percentiles(value: &str) -> Result<Vec<f64>, &'static str> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    value
+        .split(' ')
+        .map(|word| {
+            let percentile = parse_percentile(word).ok_or(PERCENTILES_NOT_NUMBERS)?;
+            if (0.0..=100.0).contains(&percentile) {
+                Ok(percentile)
+            } else {
+                Err(PERCENTILES_OUT_OF_RANGE)
+            }
+        })
+        .collect()
 }
 
 /// `CONFIG SET` of a setting that is the server's as a whole, not of a
@@ -1077,6 +1240,23 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                 _ => Some(resp_error(
                     "ERR argument must be between 0 and 9223372036854775807 inclusive",
                 )),
+            },
+            // The percentiles `INFO latencystats` reports (#255): remembered
+            // when they are numbers from 0 to 100 (or none), refused with
+            // Redis's message when not. The configuration file goes through
+            // here too.
+            "latency-tracking-info-percentiles" => match parse_latency_percentiles(value) {
+                Ok(percentiles) => {
+                    // Remembered as Redis's `CONFIG GET` gives it back, not as
+                    // given: `0x10 1e1` reads back as `16 10`.
+                    REMEMBERED_CONFIG
+                        .lock()
+                        .insert(param.clone(), format_latency_percentiles(&percentiles));
+                    Some(resp_simple("OK"))
+                }
+                Err(why) => Some(resp_error(&format!(
+                    "ERR CONFIG SET failed (possibly related to argument '{param}') - {why}"
+                ))),
             },
             "stream-node-max-bytes" => match memory_size(value) {
                 Some(v) if v <= i64::MAX as usize => {
@@ -1931,7 +2111,7 @@ fn count_flushed_in_place(flushed: &crate::store::Flushed) {
 fn replica_rows(
     repl_state: &crate::replication::ReplState,
     master_offset: u64,
-) -> Vec<(String, u16, u64, u64, &'static str)> {
+) -> Vec<(String, u16, u64, u64, &'static str, u64)> {
     let mut peers: Vec<(u64, String, u16)> = repl_state.replica_peers.lock().clone();
     peers.sort_by_key(|(id, _, _)| *id);
     let progress = repl_state.replica_progress.lock();
@@ -1944,8 +2124,9 @@ fn replica_rows(
                 master_offset.saturating_sub(p.behind_bytes()),
                 p.lag_secs(),
                 p.state().as_str(),
+                p.queued(),
             ),
-            None => (ip, port, 0, 0, "wait_bgsave"),
+            None => (ip, port, 0, 0, "wait_bgsave", 0),
         })
         .collect()
 }
@@ -3896,11 +4077,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 && remembered_config("latency-tracking").as_deref() != Some("no")
             {
                 out.push_str("# Latencystats\r\n");
-                let percentiles: Vec<f64> = remembered_config("latency-tracking-info-percentiles")
-                    .unwrap_or_default()
-                    .split_whitespace()
-                    .filter_map(|p| p.parse().ok())
-                    .collect();
+                let percentiles: Vec<f64> = parse_latency_percentiles(
+                    &remembered_config("latency-tracking-info-percentiles").unwrap_or_default(),
+                )
+                .unwrap_or_default();
                 for (name, totals) in crate::cmdstats::totals() {
                     let line: Vec<String> = percentiles
                         .iter()
@@ -3956,11 +4136,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     // sent, online once the replica has loaded it and
                     // acknowledged. (It used to read `online` from the moment
                     // the replica connected.)
-                    for (idx, (ip, port, slave_off, lag, state)) in
+                    // `queued` (KiviDB's): the bytes of the stream waiting
+                    // to be sent to it.
+                    for (idx, (ip, port, slave_off, lag, state, queued)) in
                         replica_rows(ctx.repl_state, offset).iter().enumerate()
                     {
                         out.push_str(&format!(
-                            "slave{idx}:ip={ip},port={port},state={state},offset={slave_off},lag={lag}\r\n"
+                            "slave{idx}:ip={ip},port={port},state={state},offset={slave_off},lag={lag},queued={queued}\r\n"
                         ));
                     }
                     let load = |v: &std::sync::atomic::AtomicU64| {
@@ -4345,6 +4527,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 out.push_str(&format!(
                     "aof_acks_before_write:{}\r\n",
                     crate::aof::AOF_ACKS_BEFORE_WRITE.load(Ordering::Relaxed)
+                ));
+                // Logs kept aside (`superseded.*` in `dir`): never replayed and
+                // never removed by the server. Each may hold writes that are
+                // in no dump; an operator removes them once they are not
+                // needed, and these say whether any are left.
+                let (kept, kept_bytes) = crate::aof::kept_logs_size();
+                out.push_str(&format!(
+                    "aof_superseded_files:{kept}\r\naof_superseded_bytes:{kept_bytes}\r\n"
                 ));
                 out.push_str("aof_last_cow_size:0\r\n");
                 out.push_str("module_fork_in_progress:0\r\n");
@@ -4839,7 +5029,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 // master: ["master", repl_offset, [[ip, port, offset], ...]]
                 let replicas = replica_rows(ctx.repl_state, offset)
                     .into_iter()
-                    .map(|(ip, port, slave_off, _lag, _state)| {
+                    .map(|(ip, port, slave_off, _lag, _state, _queued)| {
                         resp_array(vec![
                             resp_bulk_str(&ip),
                             resp_bulk_str(&port.to_string()),

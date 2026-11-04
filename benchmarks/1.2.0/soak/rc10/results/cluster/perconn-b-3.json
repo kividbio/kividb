@@ -1,0 +1,63 @@
+{
+ "round": 3,
+ "probe": "b",
+ "seconds": 1628.6,
+ "conns": [
+  {
+   "conn": 0,
+   "ops": 101789,
+   "over_10ms_pct": 98.4,
+   "over_100ms_pct": 88.1,
+   "worst_ms": 5450
+  },
+  {
+   "conn": 1,
+   "ops": 101789,
+   "over_10ms_pct": 97.6,
+   "over_100ms_pct": 83.5,
+   "worst_ms": 4235
+  },
+  {
+   "conn": 2,
+   "ops": 101790,
+   "over_10ms_pct": 97.7,
+   "over_100ms_pct": 83.6,
+   "worst_ms": 4441
+  },
+  {
+   "conn": 3,
+   "ops": 101789,
+   "over_10ms_pct": 100.0,
+   "over_100ms_pct": 100.0,
+   "worst_ms": 1366434
+  },
+  {
+   "conn": 4,
+   "ops": 101789,
+   "over_10ms_pct": 98.3,
+   "over_100ms_pct": 87.2,
+   "worst_ms": 4786
+  },
+  {
+   "conn": 5,
+   "ops": 101789,
+   "over_10ms_pct": 98.4,
+   "over_100ms_pct": 88.5,
+   "worst_ms": 6113
+  },
+  {
+   "conn": 6,
+   "ops": 101789,
+   "over_10ms_pct": 98.4,
+   "over_100ms_pct": 88.3,
+   "worst_ms": 5807
+  },
+  {
+   "conn": 7,
+   "ops": 101789,
+   "over_10ms_pct": 100.0,
+   "over_100ms_pct": 100.0,
+   "worst_ms": 1365306
+  }
+ ]
+}

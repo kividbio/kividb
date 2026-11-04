@@ -1,0 +1,122 @@
+{
+ "upgrade-rep": {
+  "engine": "rc8",
+  "loader": "loader-rep",
+  "what": "engine upgrade 1.1.3 -> 1.2.0-rc8 (replicated)",
+  "title": "rc8: engine upgrade 1.1.3 -> 1.2.0-rc8 (replicated)"
+ },
+ "upgrade-shd": {
+  "engine": "rc8",
+  "loader": "loader-shd",
+  "what": "engine upgrade 1.1.3 -> 1.2.0-rc8 (sharded)",
+  "title": "rc8: engine upgrade 1.1.3 -> 1.2.0-rc8 (sharded)"
+ },
+ "upgrade-fx": {
+  "engine": "rc8",
+  "loader": "loader-fx",
+  "what": "engine upgrade 1.2.0-rc7 -> 1.2.0-rc8 (sharded fx)",
+  "title": "rc8: engine upgrade 1.2.0-rc7 -> 1.2.0-rc8 (sharded fx)"
+ },
+ "fx-loss1": {
+  "engine": "rc8",
+  "loader": "loader-fx",
+  "what": "fx: same-node force delete of a shard master, try 1",
+  "title": "rc8: fx: same-node force delete of a shard master, try 1"
+ },
+ "fx-loss2": {
+  "engine": "rc8",
+  "loader": "loader-fx",
+  "what": "fx: same-node force delete of a shard master, try 2",
+  "title": "rc8: fx: same-node force delete of a shard master, try 2"
+ },
+ "fx-loss3": {
+  "engine": "rc8",
+  "loader": "loader-fx",
+  "what": "fx: same-node force delete of a shard master, try 3",
+  "title": "rc8: fx: same-node force delete of a shard master, try 3"
+ },
+ "fx-loss4": {
+  "engine": "rc8",
+  "loader": "loader-fx",
+  "what": "fx: same-node force delete of a shard master, try 4",
+  "title": "rc8: fx: same-node force delete of a shard master, try 4"
+ },
+ "fx-loss5": {
+  "engine": "rc8",
+  "loader": "loader-fx",
+  "what": "fx: same-node force delete of a shard master, try 5",
+  "title": "rc8: fx: same-node force delete of a shard master, try 5"
+ },
+ "fx-loss6": {
+  "engine": "rc8",
+  "loader": "loader-fx",
+  "what": "fx: same-node force delete of a shard master, try 6",
+  "title": "rc8: fx: same-node force delete of a shard master, try 6"
+ },
+ "fx-graceful": {
+  "engine": "rc8",
+  "loader": "loader-fx",
+  "what": "fx: graceful delete of a shard master, same node",
+  "title": "rc8: fx: graceful delete of a shard master, same node"
+ },
+ "restart-rc8": {
+  "engine": "rc8",
+  "loader": "loader-shd",
+  "what": "rolling restart (KividbDbOps), sharded",
+  "title": "rc8: rolling restart (KividbDbOps), sharded"
+ },
+ "failover-rc8": {
+  "engine": "rc8",
+  "loader": "loader-shd",
+  "what": "CLUSTER FAILOVER on every shard's replica in turn",
+  "title": "rc8: CLUSTER FAILOVER on every shard's replica in turn"
+ },
+ "sigkill-rc8": {
+  "engine": "rc8",
+  "loader": "loader-shd",
+  "what": "kill -9 of a shard master's engine, restarts in place",
+  "title": "rc8: kill -9 of a shard master's engine, restarts in place"
+ },
+ "drain-rc8": {
+  "engine": "rc8",
+  "loader": "loader-shd",
+  "what": "drain of a node with a shard master",
+  "title": "rc8: drain of a node with a shard master"
+ },
+ "drain-rc8-rep": {
+  "engine": "rc8",
+  "loader": "loader-rep",
+  "what": "same drain, replicated cluster",
+  "title": "rc8: same drain, replicated cluster"
+ },
+ "reshard-up-rc8": {
+  "engine": "rc8",
+  "loader": "loader-shd",
+  "what": "spec.shards 3 -> 4 under load",
+  "title": "rc8: spec.shards 3 -> 4 under load"
+ },
+ "reshard-down-rc8": {
+  "engine": "rc8",
+  "loader": "loader-shd",
+  "what": "spec.shards 4 -> 3 under load",
+  "title": "rc8: spec.shards 4 -> 3 under load"
+ },
+ "guard-yes": {
+  "engine": "rc8",
+  "loader": "loader-g-yes",
+  "what": "#42 guard: rc8, aof-ack-after-write yes",
+  "title": "rc8: #42 guard: rc8, aof-ack-after-write yes"
+ },
+ "guard-no": {
+  "engine": "rc8",
+  "loader": "loader-g-no",
+  "what": "#42 guard: rc8, aof-ack-after-write no",
+  "title": "rc8: #42 guard: rc8, aof-ack-after-write no"
+ },
+ "guard-113": {
+  "engine": "1.1.3",
+  "loader": "loader-g-113",
+  "what": "#42 guard: 1.1.3",
+  "title": "rc8: #42 guard: 1.1.3"
+ }
+}

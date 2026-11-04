@@ -1,0 +1,8 @@
+2026-11-03T07:33:55Z  kividb-rc9  [kividb 1.2.0-rc9]
+    /home/azureuser/bin/kividb-rc9 --port 6379 --bind 0.0.0.0
+2026-11-03T07:35:36Z  kividb-rc8  [kividb 1.2.0-rc8]
+    /home/azureuser/bin/kividb-rc8 --port 6379 --bind 0.0.0.0
+2026-11-03T07:37:16Z  kividb-rc8  [kividb 1.2.0-rc8]
+    /home/azureuser/bin/kividb-rc8 --port 6379 --bind 0.0.0.0
+2026-11-03T07:38:56Z  kividb-rc9  [kividb 1.2.0-rc9]
+    /home/azureuser/bin/kividb-rc9 --port 6379 --bind 0.0.0.0

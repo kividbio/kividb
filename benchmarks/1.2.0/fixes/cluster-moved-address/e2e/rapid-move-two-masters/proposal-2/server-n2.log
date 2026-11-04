@@ -1,0 +1,213 @@
+
+===== start at 0.62s on 10.99.0.12
+2026-11-02T01:52:24.400Z 80883 [WARN] cluster bus port 17000 is not authenticated: any host that can reach it can join this cluster. Set cluster-bus-secret, or restrict the port to cluster members at the network layer.
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc4 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc4
+  * Mode           : cluster
+  * OS             : linux x86_64
+  * Memory         : 31GiB available
+  * CPUs           : 3 cores detected
+  * Listening on   : 0.0.0.0:7000
+  * Cluster bus    : 0.0.0.0:17000
+  * Node timeout   : 5000ms
+  * Node ID        : (printed after cluster init)
+  * Worker threads : 3
+  * AOF            : disabled
+  * Persistence    : KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-02T01:52:24.454Z 80883 [INFO] KiviDB 1.2.0-rc4 starting: pid 80883, default build, config file '/clm/n2/kividb.conf'
+2026-11-02T01:52:24.454Z 80883 [INFO] I/O model      : io_uring
+2026-11-02T01:52:24.470Z 80883 [INFO] Cluster: Node ID        : 7281490484c8b216aa549f346a5c92ecc61266a7
+2026-11-02T01:52:24.470Z 80883 [INFO] Cluster: Bus port       : 17000
+2026-11-02T01:52:24.470Z 80883 [INFO] Shards per DB  : 32
+2026-11-02T01:52:24.470Z 80883 [INFO] I/O model      : io_uring
+2026-11-02T01:52:24.473Z 80883 [INFO] Cluster: Bus listener bound on 0.0.0.0:17000
+2026-11-02T01:52:24.473Z 80883 [INFO] Cluster: Heartbeat loop started (interval 1s)
+2026-11-02T01:52:24.473Z 80883 [INFO] Cluster: Failure detection started (interval 100ms, node_timeout 5000ms)
+2026-11-02T01:52:24.477Z 80883 [INFO] Ready to accept connections on 0.0.0.0:7000
+2026-11-02T01:52:24.651Z 80883 [INFO] Cluster: Learned own address from an outgoing link: 10.99.0.12
+2026-11-02T01:52:25.475Z 80883 [INFO] Cluster: config epoch collision with e3a786ab9cd5013ca1835400d83bb4787401e39f — moved to 2
+2026-11-02T01:52:26.476Z 80883 [INFO] Cluster: config epoch collision with e3a786ab9cd5013ca1835400d83bb4787401e39f — moved to 4
+2026-11-02T01:52:28.578Z 80883 [INFO] Replication: Channel replica registered: 10.99.0.15:57078
+2026-11-02T01:52:28.579Z 80883 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub
+2026-11-02T01:52:48.609Z 80883 [INFO] SIGTERM received — shutting down gracefully
+2026-11-02T01:52:48.609Z 80883 [INFO] Writing final snapshot...
+2026-11-02T01:52:48.614Z 80883 [INFO] Snapshot saved  → /clm/n2/dump.kdb (16 databases)
+2026-11-02T01:52:48.614Z 80883 [INFO] Goodbye.
+
+===== start at 34.86s on 10.99.0.22
+2026-11-02T01:52:58.646Z 84285 [WARN] cluster bus port 17000 is not authenticated: any host that can reach it can join this cluster. Set cluster-bus-secret, or restrict the port to cluster members at the network layer.
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc4 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc4
+  * Mode           : cluster
+  * OS             : linux x86_64
+  * Memory         : 31GiB available
+  * CPUs           : 3 cores detected
+  * Listening on   : 0.0.0.0:7000
+  * Cluster bus    : 0.0.0.0:17000
+  * Node timeout   : 5000ms
+  * Node ID        : (printed after cluster init)
+  * Worker threads : 3
+  * AOF            : disabled
+  * Persistence    : KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-02T01:52:58.718Z 84285 [INFO] KiviDB 1.2.0-rc4 starting: pid 84285, default build, config file '/clm/n2/kividb.conf'
+2026-11-02T01:52:58.718Z 84285 [INFO] I/O model      : io_uring
+2026-11-02T01:52:58.726Z 84285 [INFO] Cluster: Node ID        : 7281490484c8b216aa549f346a5c92ecc61266a7
+2026-11-02T01:52:58.726Z 84285 [INFO] Cluster: Bus port       : 17000
+2026-11-02T01:52:58.726Z 84285 [INFO] Shards per DB  : 32
+2026-11-02T01:52:58.726Z 84285 [INFO] I/O model      : io_uring
+2026-11-02T01:52:58.726Z 84285 [INFO] Found dump.kdb — loading native snapshot
+2026-11-02T01:52:58.726Z 84285 [INFO] Loaded 657 keys from snapshot (0 with a TTL)
+2026-11-02T01:52:58.740Z 84285 [INFO] Replication: dataset fingerprinted in 3 ms — a replica that holds the same data will be continued rather than sent it
+2026-11-02T01:52:58.740Z 84285 [INFO] Cluster: Bus listener bound on 0.0.0.0:17000
+2026-11-02T01:52:58.740Z 84285 [INFO] Cluster: Heartbeat loop started (interval 1s)
+2026-11-02T01:52:58.740Z 84285 [INFO] Cluster: Failure detection started (interval 100ms, node_timeout 5000ms)
+2026-11-02T01:52:58.740Z 84285 [INFO] Ready to accept connections on 0.0.0.0:7000
+2026-11-02T01:52:59.744Z 84285 [INFO] Cluster: Learned own address from an outgoing link: 10.99.0.22
+2026-11-02T01:52:59.786Z 84285 [INFO] Replication: Partial resync for 10.99.0.15:33166: continuing from offset 0 (0 bytes of backlog)
+2026-11-02T01:53:01.642Z 84285 [INFO] SIGTERM received — shutting down gracefully
+2026-11-02T01:53:01.642Z 84285 [INFO] Writing final snapshot...
+2026-11-02T01:53:01.649Z 84285 [INFO] Snapshot saved  → /clm/n2/dump.kdb (16 databases)
+2026-11-02T01:53:01.649Z 84285 [INFO] Goodbye.
+
+===== start at 39.89s on 10.99.0.32
+2026-11-02T01:53:03.668Z 84947 [WARN] cluster bus port 17000 is not authenticated: any host that can reach it can join this cluster. Set cluster-bus-secret, or restrict the port to cluster members at the network layer.
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc4 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc4
+  * Mode           : cluster
+  * OS             : linux x86_64
+  * Memory         : 31GiB available
+  * CPUs           : 3 cores detected
+  * Listening on   : 0.0.0.0:7000
+  * Cluster bus    : 0.0.0.0:17000
+  * Node timeout   : 5000ms
+  * Node ID        : (printed after cluster init)
+  * Worker threads : 3
+  * AOF            : disabled
+  * Persistence    : KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-02T01:53:03.742Z 84947 [INFO] KiviDB 1.2.0-rc4 starting: pid 84947, default build, config file '/clm/n2/kividb.conf'
+2026-11-02T01:53:03.742Z 84947 [INFO] I/O model      : io_uring
+2026-11-02T01:53:03.751Z 84947 [INFO] Cluster: Node ID        : 7281490484c8b216aa549f346a5c92ecc61266a7
+2026-11-02T01:53:03.751Z 84947 [INFO] Cluster: Bus port       : 17000
+2026-11-02T01:53:03.751Z 84947 [INFO] Shards per DB  : 32
+2026-11-02T01:53:03.751Z 84947 [INFO] I/O model      : io_uring
+2026-11-02T01:53:03.751Z 84947 [INFO] Found dump.kdb — loading native snapshot
+2026-11-02T01:53:03.751Z 84947 [INFO] Loaded 779 keys from snapshot (0 with a TTL)
+2026-11-02T01:53:03.762Z 84947 [INFO] Replication: dataset fingerprinted in 1 ms — a replica that holds the same data will be continued rather than sent it
+2026-11-02T01:53:03.762Z 84947 [INFO] Cluster: Bus listener bound on 0.0.0.0:17000
+2026-11-02T01:53:03.762Z 84947 [INFO] Cluster: Heartbeat loop started (interval 1s)
+2026-11-02T01:53:03.762Z 84947 [INFO] Cluster: Failure detection started (interval 100ms, node_timeout 5000ms)
+2026-11-02T01:53:03.762Z 84947 [INFO] Ready to accept connections on 0.0.0.0:7000
+2026-11-02T01:53:04.765Z 84947 [INFO] Cluster: Learned own address from an outgoing link: 10.99.0.32
+2026-11-02T01:53:04.782Z 84947 [INFO] Replication: Partial resync for 10.99.0.15:37428: continuing from offset 0 (0 bytes of backlog)
+2026-11-02T01:53:21.126Z 84947 [INFO] SIGTERM received — shutting down gracefully
+2026-11-02T01:53:21.126Z 84947 [INFO] Writing final snapshot...
+2026-11-02T01:53:21.136Z 84947 [INFO] Snapshot saved  → /clm/n2/dump.kdb (16 databases)
+2026-11-02T01:53:21.137Z 84947 [INFO] Goodbye.

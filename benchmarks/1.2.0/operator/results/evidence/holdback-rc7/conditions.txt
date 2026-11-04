@@ -1,0 +1,3 @@
+Ready after bad ref: False/ReconcileError/resolving configRef: KividbConfig "missing-cfg": KividbConfig.kividb.io "missing-cfg" not found
+Ready during: False/ReconcileError/resolving configRef: KividbConfig "missing-cfg": KividbConfig.kividb.io "missing-cfg" not found
+Ready after fix: True/AllPodsReady/master=rep-0, 3 pod(s) ready

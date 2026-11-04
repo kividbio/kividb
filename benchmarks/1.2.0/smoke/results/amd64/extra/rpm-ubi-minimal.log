@@ -1,0 +1,19 @@
+useradd present: /usr/sbin/useradd
+useradd: Warning: missing or non-executable shell '/usr/sbin/nologin'
+PASS: rpm -i on clean ubi9-minimal
+--- rpm -qpR (requires):
+--- rpm -qp --scripts (preinstall head):
+preinstall scriptlet (using /bin/sh):
+#!/bin/sh
+# The service user has to exist before the package manager unpacks
+# /var/lib/kividb with this owner, so it is created here and not in postinstall.
+set -e
+
+if ! getent group kividb >/dev/null; then
+    groupadd --system kividb
+fi
+
+if ! getent passwd kividb >/dev/null; then
+    # /usr/sbin/nologin is where Debian and RHEL both keep it (RHEL's /sbin is
+	package kividb-1.2.0~rc7-1.x86_64 is already installed
+PASS: rpm -i on ubi9-minimal after microdnf install shadow-utils

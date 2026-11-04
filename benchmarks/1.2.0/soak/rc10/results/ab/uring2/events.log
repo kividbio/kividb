@@ -1,0 +1,42 @@
+14:13:40 reshard-start round 1 src-shard=3000 dst-shard=8000: 128 slots (0-127) from 10.81.1.11:7001 (2471f522bfed3319855245d5f04de30a9d91c93d, 566890 keys) to 10.81.1.12:7001 (a3791535ee60934bfb07962162d5922b1142ab16) with plain redis-cli
+14:15:25 reshard-end round 1 exit=0 after 104.89 s: slots begun=128, TRYAGAIN=0, ERR=0: 
+CLUSTER GETKEYSINSLOT: n=2025 median=37446us max=73589us
+GET: n=1185 median=38618us max=72544us
+SET: n=807 median=37002us max=69909us
+HSET: n=410 median=38058us max=72760us
+MIGRATE: n=291 median=15013us max=37844us
+LPUSH: n=226 median=40771us max=61318us
+SADD: n=175 median=37252us max=60782us
+ZADD: n=169 median=39717us max=63333us
+INCRBY: n=166 median=35260us max=72748us
+HGET: n=147 median=40757us max=73608us
+LRANGE: n=134 median=36963us max=72541us
+CLUSTER SETSLOT: n=127 median=60117us max=78071us
+LTRIM: n=109 median=34678us max=61487us
+ZINCRBY: n=88 median=36723us max=78149us
+HGETALL: n=75 median=39428us max=73678us
+EXPIRE: n=69 median=38082us max=62527us
+SREM: n=69 median=36331us max=60383us
+ZREVRANGE: n=63 median=34298us max=60194us
+SISMEMBER: n=61 median=37808us max=73202us
+ZRANGEBYSCORE: n=60 median=38100us max=60773us
+SCARD: n=54 median=38461us max=60036us
+DEL: n=48 median=29602us max=59476us
+RPOP: n=36 median=29381us max=58345us
+HTTL: n=34 median=41045us max=60310us
+HEXPIRE: n=24 median=36077us max=60550us
+INFO: n=10 median=21416us max=23161us
+CLIENT SETINFO: n=1 median=13632us max=13632us
+SET: n=17 median=25310us max=32325us
+INFO: n=10 median=27876us max=39097us
+CLUSTER SETSLOT: n=6 median=19568us max=22650us
+LPUSH: n=3 median=32150us max=32171us
+HSET: n=2 median=31823us max=31823us
+SADD: n=2 median=31712us max=31712us
+GET: n=2 median=30281us max=30281us
+SREM: n=1 median=31097us max=31097us
+ZADD: n=1 median=30202us max=30202us
+HGET: n=1 median=22800us max=22800us
+14:15:27 reshard-check round 1: open-on-source=[] open-slots-lines=0 covered=1 err-lines=0 moved-slots=128
+14:15:38 reshard-done round 1 cluster-ok after 0.25 s
+14:15:38 events-done

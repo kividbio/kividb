@@ -1,0 +1,8 @@
+2026-11-02T21:55:40Z   Warning   CalculateExpectedPodCountFailed   Failed to calculate the number of expected pods: found no controllers for pod "rep-restored-0"
+2026-11-02T21:55:41Z   Warning   BootstrapSkipped                  spec.bootstrapFromSnapshot (rep-bk-032310) ignored: the cluster is already running, and bootstrap only seeds a new cluster
+2026-11-02T21:55:41Z   Normal    SuccessfulCreate                  Create Pod rep-restored-0 in StatefulSet rep-restored successful
+2026-11-02T21:55:41Z   Normal    SuccessfulCreate                  Create Pod rep-restored-1 in StatefulSet rep-restored successful
+2026-11-02T21:57:30Z   Warning   BootstrapWaiting                  spec.bootstrapFromSnapshot (rep-bk-032310) waits: StatefulSet rep-restored or its pods are left from an earlier cluster with this name, and the restore starts once they are deleted
+2026-11-02T21:57:30Z   Warning   CalculateExpectedPodCountFailed   Failed to calculate the number of expected pods: found no controllers for pod "rep-restored-1"
+2026-11-02T21:57:32Z   Warning   CalculateExpectedPodCountFailed   Failed to calculate the number of expected pods: found no controllers for pod "rep-restored-0"
+2026-11-02T21:57:32Z   Normal    NoPods                            No matching pods found

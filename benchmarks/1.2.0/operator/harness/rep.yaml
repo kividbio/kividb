@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: Secret
+metadata: {name: rep-pw, namespace: e2e}
+stringData: {password: "pw-one-1111"}
+---
+apiVersion: kividb.io/v1alpha1
+kind: KividbAclConfig
+metadata: {name: rep-acl, namespace: e2e}
+spec:
+  requirePassSecretRef: {name: rep-pw, key: password}
+---
+apiVersion: kividb.io/v1alpha1
+kind: KividbSnapshotConfig
+metadata: {name: snap, namespace: e2e}
+spec:
+  schedule: "0 0 1 1 *"
+  retention: 3
+  source: master
+  s3:
+    endpoint: http://s3.e2e.svc:9000
+    bucket: backups
+    region: us-east-1
+    pathPrefix: e2e
+    forcePathStyle: true
+    credentialsSecretRef: {name: s3-creds}
+---
+apiVersion: kividb.io/v1alpha1
+kind: KividbCluster
+metadata: {name: rep, namespace: e2e}
+spec:
+  replicas: 2
+  image: ghcr.io/kividbio/kividb:v1.1.3
+  storage: {size: 5Gi}
+  aclConfigRef: {name: rep-acl}
+  snapshotConfigRef: {name: snap}

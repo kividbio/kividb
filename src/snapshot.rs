@@ -4542,6 +4542,11 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
                 if abs_ms > unix_now_ms {
                     let delta = std::time::Duration::from_millis(abs_ms - unix_now_ms);
                     exps.insert(field, now_mono + delta);
+                } else {
+                    // Its time is up: gone, as a snapshot's load drops it.
+                    // Kept, it lost its expiry and lived on for good (a
+                    // field `MIGRATE` read just as it ran out).
+                    crate::types::hash_remove(&mut map, &field);
                 }
             }
             let inner = crate::types::HashInner {

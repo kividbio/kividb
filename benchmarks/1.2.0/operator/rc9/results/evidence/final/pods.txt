@@ -1,0 +1,20 @@
+NAME                           READY   STATUS    RESTARTS      AGE    IP             NODE                                NOMINATED NODE   READINESS GATES
+cli                            1/1     Running   0             39m    <ip>   aks-nodepool1-63764748-vmss000000   <none>           <none>
+curl                           1/1     Running   0             39m    <ip>    aks-nodepool1-63764748-vmss000000   <none>           <none>
+g-no-0                         2/2     Running   0             5m2s   <ip>   aks-nodepool1-63764748-vmss000001   <none>           <none>
+g-no-1                         2/2     Running   0             38m    <ip>   aks-nodepool1-63764748-vmss000002   <none>           <none>
+g-yes-0                        2/2     Running   0             38m    <ip>     aks-nodepool1-63764748-vmss000001   <none>           <none>
+g-yes-1                        2/2     Running   0             9m     <ip>   aks-nodepool1-63764748-vmss000003   <none>           <none>
+loader-g-no-79d7f5f4f6-6x5fp   1/1     Running   0             37m    <ip>   aks-nodepool1-63764748-vmss000000   <none>           <none>
+loader-g-yes-7b89f4-kfc4k      1/1     Running   0             37m    <ip>    aks-nodepool1-63764748-vmss000000   <none>           <none>
+loader-shd-6d79cdbb4-rxwwv     1/1     Running   0             37m    <ip>    aks-nodepool1-63764748-vmss000000   <none>           <none>
+nd-7bqf9                       1/1     Running   0             39m    <ip>   aks-nodepool1-63764748-vmss000000   <none>           <none>
+nd-85tbh                       1/1     Running   0             39m    <ip>   aks-nodepool1-63764748-vmss000003   <none>           <none>
+nd-fpvgr                       1/1     Running   0             39m    <ip>   aks-nodepool1-63764748-vmss000002   <none>           <none>
+nd-jkwft                       1/1     Running   0             39m    <ip>    aks-nodepool1-63764748-vmss000001   <none>           <none>
+shd-0-0                        2/2     Running   1 (13m ago)   21m    <ip>    aks-nodepool1-63764748-vmss000002   <none>           <none>
+shd-0-1                        2/2     Running   0             27m    <ip>     aks-nodepool1-63764748-vmss000003   <none>           <none>
+shd-1-0                        2/2     Running   0             18m    <ip>   aks-nodepool1-63764748-vmss000003   <none>           <none>
+shd-1-1                        2/2     Running   0             24m    <ip>    aks-nodepool1-63764748-vmss000000   <none>           <none>
+shd-2-0                        2/2     Running   0             32m    <ip>   aks-nodepool1-63764748-vmss000001   <none>           <none>
+shd-2-1                        2/2     Running   0             15m    <ip>   aks-nodepool1-63764748-vmss000002   <none>           <none>

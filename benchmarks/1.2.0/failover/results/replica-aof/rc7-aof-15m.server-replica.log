@@ -1,0 +1,228 @@
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc7 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc7
+  * Mode           : standalone
+  * OS             : linux x86_64
+  * Memory         : 31GiB available
+  * CPUs           : 8 cores detected
+  * Listening on   : 0.0.0.0:6379
+  * Worker threads : 6
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-02T20:30:45.517Z 2874 [INFO] KiviDB 1.2.0-rc7 starting: pid 2874, default build, config file '/mnt/kv/node.conf'
+2026-11-02T20:30:45.517Z 2874 [INFO] I/O model      : io_uring
+2026-11-02T20:30:45.519Z 2874 [INFO] Shards per DB  : 64
+2026-11-02T20:30:45.519Z 2874 [INFO] I/O model      : io_uring
+2026-11-02T20:30:45.519Z 2874 [INFO] Replication: Connecting to master sm:6379...
+2026-11-02T20:30:45.519Z 2874 [INFO] Ready to accept connections on 0.0.0.0:6379
+2026-11-02T20:30:45.523Z 2874 [INFO] Replication: Full resync from 3681ad60f8c7759b4415fe9833b2e57793b2f404 offset=0
+2026-11-02T20:30:45.523Z 2874 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-02T20:30:45.523Z 2874 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T20:30:45.523Z 2874 [INFO] Replication: AOF is on — rebasing it onto the synced dataset
+2026-11-02T20:30:45.526Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 1) — log is now the delta
+2026-11-02T20:30:45.526Z 2874 [INFO] Replication: Synced with sm:6379. Entering command stream.
+2026-11-02T20:30:55.519Z 2874 [INFO] AOF: auto-checkpoint: 443.12 MB is 100%+ above the 0.00 MB baseline — folding into dump.kdb
+2026-11-02T20:30:55.958Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 2) — log is now the delta
+2026-11-02T20:31:05.958Z 2874 [INFO] AOF: auto-checkpoint: 259.02 MB is 100%+ above the 10.86 MB baseline — folding into dump.kdb
+2026-11-02T20:31:06.443Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 3) — log is now the delta
+2026-11-02T20:31:16.443Z 2874 [INFO] AOF: auto-checkpoint: 257.77 MB is 100%+ above the 12.01 MB baseline — folding into dump.kdb
+2026-11-02T20:31:16.997Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 4) — log is now the delta
+2026-11-02T20:31:26.997Z 2874 [INFO] AOF: auto-checkpoint: 259.63 MB is 100%+ above the 14.15 MB baseline — folding into dump.kdb
+2026-11-02T20:31:27.604Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 5) — log is now the delta
+2026-11-02T20:31:37.604Z 2874 [INFO] AOF: auto-checkpoint: 260.10 MB is 100%+ above the 14.39 MB baseline — folding into dump.kdb
+2026-11-02T20:31:38.250Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 6) — log is now the delta
+2026-11-02T20:31:48.250Z 2874 [INFO] AOF: auto-checkpoint: 262.19 MB is 100%+ above the 15.61 MB baseline — folding into dump.kdb
+2026-11-02T20:31:48.902Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 7) — log is now the delta
+2026-11-02T20:31:58.902Z 2874 [INFO] AOF: auto-checkpoint: 264.17 MB is 100%+ above the 16.07 MB baseline — folding into dump.kdb
+2026-11-02T20:31:59.600Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 8) — log is now the delta
+2026-11-02T20:32:09.600Z 2874 [INFO] AOF: auto-checkpoint: 261.00 MB is 100%+ above the 17.88 MB baseline — folding into dump.kdb
+2026-11-02T20:32:10.294Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 9) — log is now the delta
+2026-11-02T20:32:20.294Z 2874 [INFO] AOF: auto-checkpoint: 258.97 MB is 100%+ above the 16.36 MB baseline — folding into dump.kdb
+2026-11-02T20:32:20.986Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 10) — log is now the delta
+2026-11-02T20:32:30.986Z 2874 [INFO] AOF: auto-checkpoint: 264.81 MB is 100%+ above the 17.14 MB baseline — folding into dump.kdb
+2026-11-02T20:32:31.698Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 11) — log is now the delta
+2026-11-02T20:32:41.698Z 2874 [INFO] AOF: auto-checkpoint: 263.43 MB is 100%+ above the 17.88 MB baseline — folding into dump.kdb
+2026-11-02T20:32:42.386Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 12) — log is now the delta
+2026-11-02T20:32:52.386Z 2874 [INFO] AOF: auto-checkpoint: 263.01 MB is 100%+ above the 16.71 MB baseline — folding into dump.kdb
+2026-11-02T20:32:53.105Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 13) — log is now the delta
+2026-11-02T20:33:03.105Z 2874 [INFO] AOF: auto-checkpoint: 265.37 MB is 100%+ above the 17.42 MB baseline — folding into dump.kdb
+2026-11-02T20:33:03.816Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 14) — log is now the delta
+2026-11-02T20:33:13.816Z 2874 [INFO] AOF: auto-checkpoint: 263.54 MB is 100%+ above the 17.55 MB baseline — folding into dump.kdb
+2026-11-02T20:33:14.554Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 15) — log is now the delta
+2026-11-02T20:33:24.554Z 2874 [INFO] AOF: auto-checkpoint: 264.32 MB is 100%+ above the 17.61 MB baseline — folding into dump.kdb
+2026-11-02T20:33:25.260Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 16) — log is now the delta
+2026-11-02T20:33:35.260Z 2874 [INFO] AOF: auto-checkpoint: 262.66 MB is 100%+ above the 16.97 MB baseline — folding into dump.kdb
+2026-11-02T20:33:35.998Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 17) — log is now the delta
+2026-11-02T20:33:45.998Z 2874 [INFO] AOF: auto-checkpoint: 266.84 MB is 100%+ above the 19.06 MB baseline — folding into dump.kdb
+2026-11-02T20:33:46.744Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 18) — log is now the delta
+2026-11-02T20:33:56.744Z 2874 [INFO] AOF: auto-checkpoint: 267.60 MB is 100%+ above the 18.84 MB baseline — folding into dump.kdb
+2026-11-02T20:33:57.452Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 19) — log is now the delta
+2026-11-02T20:34:07.452Z 2874 [INFO] AOF: auto-checkpoint: 267.53 MB is 100%+ above the 17.84 MB baseline — folding into dump.kdb
+2026-11-02T20:34:08.192Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 20) — log is now the delta
+2026-11-02T20:34:18.192Z 2874 [INFO] AOF: auto-checkpoint: 263.29 MB is 100%+ above the 19.19 MB baseline — folding into dump.kdb
+2026-11-02T20:34:18.907Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 21) — log is now the delta
+2026-11-02T20:34:28.907Z 2874 [INFO] AOF: auto-checkpoint: 261.33 MB is 100%+ above the 17.20 MB baseline — folding into dump.kdb
+2026-11-02T20:34:29.651Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 22) — log is now the delta
+2026-11-02T20:34:39.651Z 2874 [INFO] AOF: auto-checkpoint: 266.52 MB is 100%+ above the 18.64 MB baseline — folding into dump.kdb
+2026-11-02T20:34:40.358Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 23) — log is now the delta
+2026-11-02T20:34:50.358Z 2874 [INFO] AOF: auto-checkpoint: 263.43 MB is 100%+ above the 17.56 MB baseline — folding into dump.kdb
+2026-11-02T20:34:51.107Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 24) — log is now the delta
+2026-11-02T20:35:01.107Z 2874 [INFO] AOF: auto-checkpoint: 267.48 MB is 100%+ above the 17.40 MB baseline — folding into dump.kdb
+2026-11-02T20:35:01.853Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 25) — log is now the delta
+2026-11-02T20:35:11.853Z 2874 [INFO] AOF: auto-checkpoint: 269.54 MB is 100%+ above the 19.14 MB baseline — folding into dump.kdb
+2026-11-02T20:35:12.616Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 26) — log is now the delta
+2026-11-02T20:35:22.616Z 2874 [INFO] AOF: auto-checkpoint: 265.59 MB is 100%+ above the 18.71 MB baseline — folding into dump.kdb
+2026-11-02T20:35:23.341Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 27) — log is now the delta
+2026-11-02T20:35:33.341Z 2874 [INFO] AOF: auto-checkpoint: 263.35 MB is 100%+ above the 17.15 MB baseline — folding into dump.kdb
+2026-11-02T20:35:34.055Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 28) — log is now the delta
+2026-11-02T20:35:44.055Z 2874 [INFO] AOF: auto-checkpoint: 264.98 MB is 100%+ above the 18.17 MB baseline — folding into dump.kdb
+2026-11-02T20:35:44.802Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 29) — log is now the delta
+2026-11-02T20:35:54.802Z 2874 [INFO] AOF: auto-checkpoint: 265.65 MB is 100%+ above the 18.58 MB baseline — folding into dump.kdb
+2026-11-02T20:35:55.553Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 30) — log is now the delta
+2026-11-02T20:36:05.553Z 2874 [INFO] AOF: auto-checkpoint: 263.08 MB is 100%+ above the 18.68 MB baseline — folding into dump.kdb
+2026-11-02T20:36:06.296Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 31) — log is now the delta
+2026-11-02T20:36:16.296Z 2874 [INFO] AOF: auto-checkpoint: 263.54 MB is 100%+ above the 18.48 MB baseline — folding into dump.kdb
+2026-11-02T20:36:17.017Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 32) — log is now the delta
+2026-11-02T20:36:27.017Z 2874 [INFO] AOF: auto-checkpoint: 264.84 MB is 100%+ above the 18.24 MB baseline — folding into dump.kdb
+2026-11-02T20:36:27.757Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 33) — log is now the delta
+2026-11-02T20:36:37.757Z 2874 [INFO] AOF: auto-checkpoint: 265.08 MB is 100%+ above the 16.88 MB baseline — folding into dump.kdb
+2026-11-02T20:36:38.496Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 34) — log is now the delta
+2026-11-02T20:36:48.496Z 2874 [INFO] AOF: auto-checkpoint: 265.23 MB is 100%+ above the 18.31 MB baseline — folding into dump.kdb
+2026-11-02T20:36:49.214Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 35) — log is now the delta
+2026-11-02T20:36:59.214Z 2874 [INFO] AOF: auto-checkpoint: 264.57 MB is 100%+ above the 18.30 MB baseline — folding into dump.kdb
+2026-11-02T20:36:59.955Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 36) — log is now the delta
+2026-11-02T20:37:09.955Z 2874 [INFO] AOF: auto-checkpoint: 263.86 MB is 100%+ above the 18.37 MB baseline — folding into dump.kdb
+2026-11-02T20:37:10.695Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 37) — log is now the delta
+2026-11-02T20:37:20.695Z 2874 [INFO] AOF: auto-checkpoint: 267.03 MB is 100%+ above the 19.15 MB baseline — folding into dump.kdb
+2026-11-02T20:37:21.402Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 38) — log is now the delta
+2026-11-02T20:37:31.402Z 2874 [INFO] AOF: auto-checkpoint: 265.74 MB is 100%+ above the 18.11 MB baseline — folding into dump.kdb
+2026-11-02T20:37:32.150Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 39) — log is now the delta
+2026-11-02T20:37:42.150Z 2874 [INFO] AOF: auto-checkpoint: 267.09 MB is 100%+ above the 18.05 MB baseline — folding into dump.kdb
+2026-11-02T20:37:42.903Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 40) — log is now the delta
+2026-11-02T20:37:52.903Z 2874 [INFO] AOF: auto-checkpoint: 264.47 MB is 100%+ above the 17.84 MB baseline — folding into dump.kdb
+2026-11-02T20:37:53.663Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 41) — log is now the delta
+2026-11-02T20:38:03.663Z 2874 [INFO] AOF: auto-checkpoint: 264.79 MB is 100%+ above the 18.39 MB baseline — folding into dump.kdb
+2026-11-02T20:38:04.399Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 42) — log is now the delta
+2026-11-02T20:38:14.399Z 2874 [INFO] AOF: auto-checkpoint: 263.63 MB is 100%+ above the 17.15 MB baseline — folding into dump.kdb
+2026-11-02T20:38:15.154Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 43) — log is now the delta
+2026-11-02T20:38:25.154Z 2874 [INFO] AOF: auto-checkpoint: 267.58 MB is 100%+ above the 19.20 MB baseline — folding into dump.kdb
+2026-11-02T20:38:25.907Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 44) — log is now the delta
+2026-11-02T20:38:35.907Z 2874 [INFO] AOF: auto-checkpoint: 263.79 MB is 100%+ above the 17.98 MB baseline — folding into dump.kdb
+2026-11-02T20:38:36.663Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 45) — log is now the delta
+2026-11-02T20:38:46.663Z 2874 [INFO] AOF: auto-checkpoint: 266.00 MB is 100%+ above the 18.78 MB baseline — folding into dump.kdb
+2026-11-02T20:38:47.415Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 46) — log is now the delta
+2026-11-02T20:38:57.415Z 2874 [INFO] AOF: auto-checkpoint: 263.33 MB is 100%+ above the 18.53 MB baseline — folding into dump.kdb
+2026-11-02T20:38:58.163Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 47) — log is now the delta
+2026-11-02T20:39:08.163Z 2874 [INFO] AOF: auto-checkpoint: 264.53 MB is 100%+ above the 18.36 MB baseline — folding into dump.kdb
+2026-11-02T20:39:08.910Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 48) — log is now the delta
+2026-11-02T20:39:18.911Z 2874 [INFO] AOF: auto-checkpoint: 264.93 MB is 100%+ above the 18.77 MB baseline — folding into dump.kdb
+2026-11-02T20:39:19.654Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 49) — log is now the delta
+2026-11-02T20:39:29.654Z 2874 [INFO] AOF: auto-checkpoint: 262.85 MB is 100%+ above the 18.54 MB baseline — folding into dump.kdb
+2026-11-02T20:39:30.398Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 50) — log is now the delta
+2026-11-02T20:39:40.398Z 2874 [INFO] AOF: auto-checkpoint: 261.50 MB is 100%+ above the 17.79 MB baseline — folding into dump.kdb
+2026-11-02T20:39:41.157Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 51) — log is now the delta
+2026-11-02T20:39:51.157Z 2874 [INFO] AOF: auto-checkpoint: 266.15 MB is 100%+ above the 19.27 MB baseline — folding into dump.kdb
+2026-11-02T20:39:51.868Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 52) — log is now the delta
+2026-11-02T20:40:01.868Z 2874 [INFO] AOF: auto-checkpoint: 262.73 MB is 100%+ above the 17.21 MB baseline — folding into dump.kdb
+2026-11-02T20:40:02.605Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 53) — log is now the delta
+2026-11-02T20:40:12.605Z 2874 [INFO] AOF: auto-checkpoint: 265.82 MB is 100%+ above the 18.60 MB baseline — folding into dump.kdb
+2026-11-02T20:40:13.315Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 54) — log is now the delta
+2026-11-02T20:40:23.315Z 2874 [INFO] AOF: auto-checkpoint: 261.97 MB is 100%+ above the 17.52 MB baseline — folding into dump.kdb
+2026-11-02T20:40:24.073Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 55) — log is now the delta
+2026-11-02T20:40:34.073Z 2874 [INFO] AOF: auto-checkpoint: 266.73 MB is 100%+ above the 20.59 MB baseline — folding into dump.kdb
+2026-11-02T20:40:34.801Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 56) — log is now the delta
+2026-11-02T20:40:44.802Z 2874 [INFO] AOF: auto-checkpoint: 263.96 MB is 100%+ above the 19.27 MB baseline — folding into dump.kdb
+2026-11-02T20:40:45.511Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 57) — log is now the delta
+2026-11-02T20:40:55.511Z 2874 [INFO] AOF: auto-checkpoint: 263.38 MB is 100%+ above the 18.17 MB baseline — folding into dump.kdb
+2026-11-02T20:40:56.247Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 58) — log is now the delta
+2026-11-02T20:41:06.247Z 2874 [INFO] AOF: auto-checkpoint: 262.36 MB is 100%+ above the 17.74 MB baseline — folding into dump.kdb
+2026-11-02T20:41:07.001Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 59) — log is now the delta
+2026-11-02T20:41:17.001Z 2874 [INFO] AOF: auto-checkpoint: 266.73 MB is 100%+ above the 18.55 MB baseline — folding into dump.kdb
+2026-11-02T20:41:17.749Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 60) — log is now the delta
+2026-11-02T20:41:27.749Z 2874 [INFO] AOF: auto-checkpoint: 266.71 MB is 100%+ above the 19.41 MB baseline — folding into dump.kdb
+2026-11-02T20:41:28.463Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 61) — log is now the delta
+2026-11-02T20:41:38.463Z 2874 [INFO] AOF: auto-checkpoint: 265.21 MB is 100%+ above the 18.41 MB baseline — folding into dump.kdb
+2026-11-02T20:41:39.201Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 62) — log is now the delta
+2026-11-02T20:41:49.201Z 2874 [INFO] AOF: auto-checkpoint: 262.60 MB is 100%+ above the 18.24 MB baseline — folding into dump.kdb
+2026-11-02T20:41:49.905Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 63) — log is now the delta
+2026-11-02T20:41:59.905Z 2874 [INFO] AOF: auto-checkpoint: 266.09 MB is 100%+ above the 18.38 MB baseline — folding into dump.kdb
+2026-11-02T20:42:00.645Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 64) — log is now the delta
+2026-11-02T20:42:10.645Z 2874 [INFO] AOF: auto-checkpoint: 263.03 MB is 100%+ above the 18.25 MB baseline — folding into dump.kdb
+2026-11-02T20:42:11.346Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 65) — log is now the delta
+2026-11-02T20:42:21.346Z 2874 [INFO] AOF: auto-checkpoint: 265.40 MB is 100%+ above the 18.17 MB baseline — folding into dump.kdb
+2026-11-02T20:42:22.099Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 66) — log is now the delta
+2026-11-02T20:42:32.099Z 2874 [INFO] AOF: auto-checkpoint: 264.60 MB is 100%+ above the 17.21 MB baseline — folding into dump.kdb
+2026-11-02T20:42:32.852Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 67) — log is now the delta
+2026-11-02T20:42:42.852Z 2874 [INFO] AOF: auto-checkpoint: 263.79 MB is 100%+ above the 19.08 MB baseline — folding into dump.kdb
+2026-11-02T20:42:43.612Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 68) — log is now the delta
+2026-11-02T20:42:53.612Z 2874 [INFO] AOF: auto-checkpoint: 260.95 MB is 100%+ above the 18.31 MB baseline — folding into dump.kdb
+2026-11-02T20:42:54.359Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 69) — log is now the delta
+2026-11-02T20:43:04.359Z 2874 [INFO] AOF: auto-checkpoint: 264.75 MB is 100%+ above the 19.73 MB baseline — folding into dump.kdb
+2026-11-02T20:43:05.099Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 70) — log is now the delta
+2026-11-02T20:43:15.099Z 2874 [INFO] AOF: auto-checkpoint: 264.90 MB is 100%+ above the 18.15 MB baseline — folding into dump.kdb
+2026-11-02T20:43:15.853Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 71) — log is now the delta
+2026-11-02T20:43:25.853Z 2874 [INFO] AOF: auto-checkpoint: 267.96 MB is 100%+ above the 19.32 MB baseline — folding into dump.kdb
+2026-11-02T20:43:26.607Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 72) — log is now the delta
+2026-11-02T20:43:36.607Z 2874 [INFO] AOF: auto-checkpoint: 263.60 MB is 100%+ above the 18.14 MB baseline — folding into dump.kdb
+2026-11-02T20:43:37.345Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 73) — log is now the delta
+2026-11-02T20:43:47.345Z 2874 [INFO] AOF: auto-checkpoint: 265.58 MB is 100%+ above the 18.36 MB baseline — folding into dump.kdb
+2026-11-02T20:43:48.057Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 74) — log is now the delta
+2026-11-02T20:43:58.057Z 2874 [INFO] AOF: auto-checkpoint: 265.53 MB is 100%+ above the 18.44 MB baseline — folding into dump.kdb
+2026-11-02T20:43:58.798Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 75) — log is now the delta
+2026-11-02T20:44:08.798Z 2874 [INFO] AOF: auto-checkpoint: 263.80 MB is 100%+ above the 18.30 MB baseline — folding into dump.kdb
+2026-11-02T20:44:09.543Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 76) — log is now the delta
+2026-11-02T20:44:19.543Z 2874 [INFO] AOF: auto-checkpoint: 263.94 MB is 100%+ above the 19.15 MB baseline — folding into dump.kdb
+2026-11-02T20:44:20.257Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 77) — log is now the delta
+2026-11-02T20:44:30.257Z 2874 [INFO] AOF: auto-checkpoint: 262.25 MB is 100%+ above the 18.16 MB baseline — folding into dump.kdb
+2026-11-02T20:44:31.012Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 78) — log is now the delta
+2026-11-02T20:44:41.012Z 2874 [INFO] AOF: auto-checkpoint: 264.21 MB is 100%+ above the 18.88 MB baseline — folding into dump.kdb
+2026-11-02T20:44:41.756Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 79) — log is now the delta
+2026-11-02T20:44:51.756Z 2874 [INFO] AOF: auto-checkpoint: 262.88 MB is 100%+ above the 18.37 MB baseline — folding into dump.kdb
+2026-11-02T20:44:52.494Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 80) — log is now the delta
+2026-11-02T20:45:02.494Z 2874 [INFO] AOF: auto-checkpoint: 267.48 MB is 100%+ above the 18.05 MB baseline — folding into dump.kdb
+2026-11-02T20:45:03.206Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 81) — log is now the delta
+2026-11-02T20:45:13.206Z 2874 [INFO] AOF: auto-checkpoint: 265.36 MB is 100%+ above the 18.03 MB baseline — folding into dump.kdb
+2026-11-02T20:45:13.961Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 82) — log is now the delta
+2026-11-02T20:45:23.961Z 2874 [INFO] AOF: auto-checkpoint: 264.82 MB is 100%+ above the 18.39 MB baseline — folding into dump.kdb
+2026-11-02T20:45:24.695Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 83) — log is now the delta
+2026-11-02T20:45:34.695Z 2874 [INFO] AOF: auto-checkpoint: 266.37 MB is 100%+ above the 18.37 MB baseline — folding into dump.kdb
+2026-11-02T20:45:35.419Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 84) — log is now the delta
+2026-11-02T20:45:45.419Z 2874 [INFO] AOF: auto-checkpoint: 265.37 MB is 100%+ above the 18.42 MB baseline — folding into dump.kdb
+2026-11-02T20:45:46.169Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 85) — log is now the delta
+2026-11-02T20:45:56.169Z 2874 [INFO] AOF: auto-checkpoint: 109.35 MB is 100%+ above the 18.19 MB baseline — folding into dump.kdb
+2026-11-02T20:45:56.883Z 2874 [INFO] AOF: rebased onto dump.kdb (generation 86) — log is now the delta

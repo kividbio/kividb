@@ -1,0 +1,15 @@
+kividb 1.2.0-rc9
+3a869b46274260edff341681462c8f97cd60a090ea18b570bdb62fa6451ef824  /opt/kv/kividb
+port 6379
+bind 0.0.0.0
+protected-mode no
+dir /mnt/kv
+appendonly yes
+appendfsync everysec
+update-check no
+aof-ack-after-write
+yes
+appendfsync
+everysec
+repl-backlog-size
+1048576

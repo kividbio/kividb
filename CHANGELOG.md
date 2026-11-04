@@ -7,6 +7,241 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Source archives are small again.** The tarball GitHub makes of the
+  1.2.0 tag is 70 MB, against 4.5 MB for 1.1.3: the raw results of the
+  1.2.0 benchmarks under `benchmarks/1.2.0/` went into it (#319).
+  `.gitattributes` now marks them `export-ignore`, so `git archive` and
+  GitHub's tarballs and zips leave out the raw results, logs and charts
+  under `benchmarks/<release>/`, and the README's benchmark images and
+  video under `assets/benchmarks/`. The benchmark READMEs, harnesses and
+  summary tables stay in. Nothing is removed from the repository, and
+  nothing that builds or tests KiviDB is left out. An archive of the
+  tree today is 3.7 MB. The 1.2.0 archive stays as it is.
+- **Every release has a source tag, `X.Y.Z-src`.** Ports and packages
+  that fetch GitHub's source tarball by tag can use it for every release.
+  `1.1.0-src` to `1.2.0-src` are on each release's code plus the
+  `.gitattributes` above, so their tarballs are 1.8 to 3.6 MB; they build
+  the same server as the `v` tag. The release workflow now pushes
+  `X.Y.Z-src` on the release's own commit. A `-src` tag is not a
+  separate release.
+
+### Fixed
+
+- **A restart with the AOF on after a save with it off applied writes
+  twice (#354).** A save with the AOF off (`SAVE`, `BGSAVE`, the save at
+  `SHUTDOWN`) wrote a new `dump.kdb` but left `dump.kdb.gen`, its save
+  number, as it was. The log beside it still read as going on from the dump,
+  and a start with `appendonly yes` replayed it over the newer data: an
+  `INCR` made with the AOF on was applied a second time, and values changed
+  or keys deleted with the AOF off came back. No crash was needed. A save
+  with the AOF off now gives its dump a save number of its own, past every
+  log's, and marks it as one no log goes with; it still leaves the AOF's
+  files alone. Recovery replays a log only over the dump it goes on from, by
+  the dump's fingerprint as well as the number. A data directory left this
+  way by 1.2.0 is recognised: the old log is not replayed, the dump that was
+  loaded is given a save number, and the log starts again on it. A log that
+  is not replayed is never deleted: it is kept aside in `dir`, as
+  `superseded.<time>.<n>.appendonly.aof` (or `.appendonly.aof.prev`), with a
+  warning that says how to apply its writes, and every start lists the ones
+  still there. The server never removes them. A new log made at a start
+  with the AOF on now has a header, so its age is always known; a log with
+  no header, made by 1.2.0, beside a dump saved by 1.2.0 with the AOF off
+  cannot be told apart, and is replayed as before.
+- **The AOF turned on at runtime starts a new log (#350).** `CONFIG SET
+  appendonly yes` appended to whatever `appendonly.aof` was there: one left
+  by an earlier run with the AOF on, or the one kept through `appendonly no`
+  after the dataset had moved on without it (a save with the AOF off, or a
+  replica's full sync). The checkpoint that follows kept all of it as
+  `appendonly.aof.prev` until its snapshot was on disk, and a crash in
+  between replayed those old writes on the next start: overwritten values,
+  and keys deleted since, could come back. The log now starts empty,
+  written in full under another name before it takes the log's. The old
+  logs are kept aside first, never deleted, as above. A log kept open through
+  `appendonly no` is still kept when nothing has moved on without it, so a
+  crash during the enable does not lose what was written while the AOF was
+  on. A `CONFIG SET appendonly no` that comes while the AOF is being turned
+  on now makes the enable answer an error, not OK. Starting with
+  `appendonly yes` still loads and appends to the existing log. After a
+  replica's full sync with the AOF off, a crash before the enable's
+  checkpoint has finished restarts from the `dump.kdb` saved before the
+  sync, plus what was logged after the enable: the replica then syncs again
+  from its master.
+- **Follow-ups to the two fixes above (#359).** A save with the AOF off
+  now also records how long `appendonly.aof` and `appendonly.aof.prev` were,
+  with a hash of their first and last bytes. A log beside that dump that
+  has been added to since, as 1.2.0 does when it is started on the
+  directory with the AOF on, is no longer left out with the writes added to
+  it: a log with no header is replayed, as 1.2.0 replayed it, and a delta
+  with an older save number is replayed from where it was at the save. The
+  save number in each log's header is recorded too: an
+  `appendonly.aof.prev` that a 1.2.0 checkpoint added the log's records to
+  is replayed only from after those records, which the dump holds, and a
+  log added to beside an old log that was not is no longer left out with
+  it. Nor is a log beside such an old log that, on its own, is replayed: a
+  log with no header written to since the save, or one made after a save
+  that had no log (#363). The warning for a log kept aside says whether its writes are already
+  in the dataset, and then not to send them to the server, which would
+  apply them twice. The
+  directory is synced between putting the save number in place and the
+  dump, so a power cut cannot keep the new dump with the old number, which
+  left out the logs that go on from it. A copy of a log kept aside that
+  fails part way is removed, rather than left under a kept log's name.
+  `INFO persistence` has `aof_superseded_files` and `aof_superseded_bytes`,
+  the logs kept aside in `dir` and their size; docs/PERSISTENCE.md says how
+  to check and remove them, and docs/ERRORS.md lists the new messages.
+- **`BACKUP START` refuses a `backupdirname` that is the data directory.**
+  A backup's files share the `appendonly.aof.` prefix with the server's own,
+  and `BACKUP CLEANUP` would have deleted `appendonly.aof.prev` with them.
+- **With `appendonly no`, no `appendonly.aof` is made or needed (#47).**
+  Every start created an empty `appendonly.aof` in `dir`, AOF on or off,
+  and a server that could not create it (a read-only data directory, the
+  wrong owner, a full disk) exited. With the AOF off, the log is no longer
+  opened. `CONFIG SET appendonly yes` opens it; if it cannot be created,
+  the reply is an error, as in Redis, the AOF stays off and the server
+  goes on serving. Starting with `appendonly yes` is unchanged.
+- **A reshard under load could lose acknowledged writes (#331).** A write
+  was routed ("is the key here?") before it entered the write gate, and the
+  key could move in between. This hit both ways of moving slots:
+  - **Key by key (`MIGRATE`, `redis-cli --cluster reshard`).** If a whole
+    `MIGRATE` of the key ran in between, the write ran on the source, on a
+    key that had left, and made it again. The client got a wrong reply,
+    later writes went to a copy no client was routed to, and the reshard
+    stopped on `BUSYKEY`. Finishing it dropped the source's copy, or
+    `MIGRATE ... REPLACE` overwrote the destination's value with it.
+  - **Atomic slot migration (`CLUSTER MIGRATION IMPORT`, used by the
+    Kubernetes operator).** If the whole handoff ran in between, the write
+    ran on the source on a slot the destination now owned. It was deleted
+    with the slot's keys, or left behind them.
+
+  Either way, acknowledged writes were lost. A write now checks inside the
+  gate whether keys have left the node, or a slot has changed state, since
+  it was routed. If so, it is routed again there and sent on with `-ASK` or
+  `-MOVED`. The same holds for `EXEC` and for scripts. Ordinary commands
+  still pay one atomic load.
+
+  The check covers every way a slot leaves a node, not only `MIGRATE`,
+  `CLUSTER SETSLOT` and the end of an atomic slot migration (#337):
+  - **A claim heard from another node.** If an atomic slot migration took
+    every slot of the source, and the destination's claim reached the
+    source before its answer to the handoff, the source became a replica
+    of the destination and let the writes it was holding go. One of them
+    ran on the source, was acknowledged, and was lost when the source
+    resynced. The same happened to the old master of a manual failover,
+    when it followed the promoted replica.
+  - **`CLUSTER DELSLOTS`, `DELSLOTSRANGE`, `FLUSHSLOTS` and `RESET`**, and a
+    node that stops serving its slots (marked failed, or cut off from most
+    masters). A write routed just before ran on a slot the node no longer
+    served. It is now refused.
+  - **On aarch64**, a write could see the handoff's pause over without
+    seeing that the routes had moved, and run. x86 was not affected.
+
+  Two more ways an atomic slot migration could lose writes are closed:
+  - The destination took the slots before it had saved them in its cluster
+    config. If the save failed, it gave them back, and the writes it had
+    served to them were lost. If its claim had reached the source by then,
+    the source deleted its keys, and no node owned the slots. The slots are
+    now taken only once they are saved, and a failed save changes nothing.
+  - A manual failover that ended during a migration's handoff let writes go
+    while the handoff still needed them held. Those writes were not sent to
+    the destination. Writes are now let go only when the last hold on them
+    ends.
+- **A transaction could lose its writes during an atomic slot migration's
+  handoff.** An `EXEC` that got past the write pause just before the
+  handoff set it ran during the handoff. Its writes were not sent to the
+  destination, and were deleted with the slots. Such an `EXEC` is now
+  refused with `TRYAGAIN` if it writes. So is one that reaches its gates
+  during a manual failover's handoff.
+- **`MIGRATE` no longer answers `TRYAGAIN` for an unchanged hash whose field
+  is about to expire (#332).** The check that a moved hash was not written
+  meanwhile compared the server's fields by the monotonic clock and the
+  payload's fields by a time rounded down by up to 2 ms. In a field's last
+  2 ms, an unchanged hash looked written, and `redis-cli --cluster reshard`
+  stopped. No data was lost. Both sides are now compared by one clock and
+  one rule: a field within 5 ms of its time may be missing on either side.
+- **A drained node could delete the keys it had moved from its new copy of
+  them (#348).** In an atomic slot migration that took every slot of the
+  source, the destination's claim could reach the source before its answer
+  to the handoff. The source then became a replica of the destination and
+  resynced from it. When the answer came, it still deleted the keys of the
+  slots it had handed over, from the dataset it had just been sent: in a
+  drain, every key. Had the destination failed then, and the source been
+  promoted, those keys were lost. The source now deletes only the keys of
+  the slots it hands over itself, and only while it is still a master. So
+  does a node that drops the keys of slots another master took, or of an
+  import that did not complete. `MIGRATE` on a node that became a replica
+  after the command was routed is refused with `READONLY`.
+- **Keys written to a slot that came back while its old keys were being
+  deleted could be deleted too (#353).** A node that loses a slot to
+  another master deletes the keys it had of it, in batches, on its own. If
+  the slot came back before that ended (imported with `CLUSTER SETSLOT
+  IMPORTING` and `MIGRATE` or `ASKING` writes, imported with `CLUSTER
+  MIGRATION IMPORT`, given back with `SETSLOT NODE` or `ADDSLOTS`, or taken
+  over in a failover), the deletion went on, and deleted the keys written
+  to the slot since: acknowledged writes. Now a slot that comes back waits
+  for the batch under way, if any, and the deletion leaves the slot from
+  then on: every write to it here is kept, whatever command makes it.
+  `SETSLOT IMPORTING`, `SETSLOT NODE` (to the node itself), `ADDSLOTS`,
+  `ADDSLOTSRANGE` and `CLUSTER MIGRATION IMPORT` first delete the old keys
+  the node still has of the slot, as Redis has deleted them before it
+  answers, so the slot comes back without them; inside a transaction those
+  commands are refused with `TRYAGAIN` until the old keys are gone.
+  `redis-cli --cluster fix`, which sends `DELSLOTS` and `ADDSLOTS` in a
+  transaction, can be refused so while such a deletion runs; run it again
+  once it has ended. A failover leaves none: a promoted replica holds its
+  master's keys. A replica promoted in a failover that lost some of its new
+  slots to another master straight away now drops their keys, which it used
+  to keep, stale.
+- **Writes could stay paused after an atomic slot migration's handoff
+  (#349).** A node told during the handoff that it had been marked failed
+  holds writes until it has made sure it still owns its slots. The handoff
+  then left its write pause on for that hold to end, and the hold did not
+  end it: writes waited until `CLIENT UNPAUSE` or a failover. The handoff
+  now ends its pause, and the node still refuses writes until it knows its
+  slots.
+- **`SCRIPT HELP` lists the `SCRIPT` subcommands, as in Redis.** It was an
+  unknown subcommand (#256).
+- **A restarted cluster node gives its own address at once (#307).** With
+  no `cluster-announce-ip` and a wildcard `bind`, a node started again from
+  a `127.0.0.1` guess, whatever address its `nodes.conf` had for it. Until
+  it next reached a peer, about a second, its `CLUSTER SLOTS`, `SHARDS` and
+  `NODES` gave `127.0.0.1` for itself. It also saved that over the address
+  it had learnt. It now starts from the address in `nodes.conf`, as Redis
+  and Valkey do, and still takes the one it next reaches or is reached
+  on. The `?` for a node's hostname right after its restart is as in Redis
+  and Valkey:
+  a node announces the `cluster-announce-hostname` of its configuration,
+  so one set only with `CONFIG SET` is not announced again until it is set
+  again.
+- **`CONFIG SET latency-tracking-info-percentiles` refuses what Redis refuses
+  (#255).** It took any value, `abc` included, and `INFO latencystats` then
+  dropped the words it could not read. A word that is not a number, and a number
+  outside 0 to 100, are now refused with Redis's messages, by `CONFIG SET` and by
+  the configuration file; an empty list is still allowed. Hexadecimal (`0x10`)
+  and exponent (`1e1`) forms are read as Redis reads them, and `CONFIG GET`
+  gives the numbers back as Redis writes them (`0x10 1e1` reads back as `16 10`).
+- **`FT.AGGREGATE` could count a document its filter no longer matched
+  (#347).** A hash field with a time to live, dropped by a read once past
+  its time (`HGETALL`), stays in the TAG and NUMERIC postings until the
+  field-expiry sweep brings them up to date, and until then a query tries
+  that document itself. A sweep that ran while a query was reading the
+  postings queued its update behind the query, and stopped watching the
+  hash before the query looked at which hashes were watched: the query took
+  the postings' word for the document. `FT.AGGREGATE` counted it, and so
+  could `FT.SEARCH` where it answers from the postings without reading the
+  documents (`LIMIT 0 0`). A query now reads which hashes are watched
+  before it reads the postings.
+
+## [1.2.0] - 2026-11-03
+
+See [docs/releases/v1.2.0.md](docs/releases/v1.2.0.md) for what to check before upgrading.
+
+**Read before upgrading:** in scripts, `pcall` and `assert` now behave as in
+Redis. A script that reads `e.err` from an error `pcall` caught no longer
+finds it there: `e` is now the `err` itself. One that gives `assert` a table
+for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
+
 ### Added
 
 - **`COMMAND DOCS` returns documentation.** It used to answer with an empty
@@ -21,480 +256,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `group: module` and a `module` name, as Redis does with those modules
   loaded. A name that is not a command is omitted, as Redis omits it. Arity
   and key positions stay on `COMMAND` / `COMMAND INFO`.
-
-### Changed
-
-- **HNSW vector search is about 1.3 times as fast, and vector ingest about
-  twice as fast.** A search of a 1536-dimension graph spent most of its
-  time waiting for vectors to come from memory: each node's vector was an
-  allocation of its own, reached through the node, its links were locked
-  for every node expanded, and nothing was fetched ahead. The vectors, the
-  layer-0 links and a live flag now sit in blocks of fixed-size slots
-  indexed by node id (on huge pages where the kernel allows), links are
-  read without a lock, and each neighbour's vector is prefetched before it
-  is measured. A full list of links may take a few more before it is
-  pruned, instead of being pruned again for each one. On
-  dbpedia-openai-100K-1536 (M 16, EF_CONSTRUCTION 128, an 8-CPU server),
-  ef 128 went from 618 to 817 queries a second on one client and from
-  2,917 to 3,716 on sixteen, and the upload from 44.4 to 21.4 s
-  (h-and-m-2048: 58.2 to 28.0 s). Recall is the same or a little higher
-  at every ef, and the snapshot format is unchanged. A deleted vector's
-  slot is now filled by the next insert; each graph takes some 390 bytes
-  less per vector.
-
-### Fixed
-
-- **Writes during a snapshot no longer evict keys that fit under
-  `maxmemory` (#284).** A snapshot (`BGSAVE`, `SAVE`, an AOF rewrite, a
-  replica's full sync, a backup) captures the dataset at one instant and
-  writes it out after, holding each string value until it has written it.
-  A key written over, deleted or evicted meanwhile stayed allocated until
-  then, and was counted against `maxmemory`: each write over the limit
-  evicted a key, which gave nothing back, then the next, until the
-  keyspace was nearly empty. 5,000 writes of 8 KB values over keys of a
-  14,000-key dataset under a 128 MB limit, during a `BGSAVE`, left 3,324
-  keys; during an AOF rewrite 3,744; during a full sync, which also lays
-  the whole dataset out in memory for the replica, 1,121 and refused writes
-  with `OOM`. The values a snapshot still holds, what it lays out in memory
-  (its encoded collections, a full sync's or a backup's image) and what is
-  queued for replicas are now not counted against `maxmemory`, as in Redis,
-  where they are the forked child's memory or the replicas' output buffers;
-  `INFO memory` reports them as `mem_not_counted_for_evict`, which was
-  always 0. The same writes now evict nothing. Memory can exceed
-  `maxmemory` by that much while the snapshot is written, as a Redis
-  process and its child do together; the snapshot now lets each value go as
-  soon as it has written it, rather than all of them at the end. Should
-  evicting keys still give no memory back, eviction now stops once keys
-  taking twice what memory was over the limit by, and a megabyte more, have
-  gone with memory use no lower, and writes are refused with `OOM` until it
-  comes down, rather than every key going. And with `--io-model tokio` a
-  full sync's payload is no longer copied into the replica connection's
-  buffer, which kept its size, and `used_memory` over `maxmemory`, for as
-  long as the replica stayed connected. 1.1 has the same fault.
-  (Reported and analysed by @Parikalp-Bhardwaj.)
-
-- **`MIGRATE` no longer loses a write made while its keys travel (#274).**
-  `MIGRATE` without `COPY` dumped its keys, sent them, waited for the
-  destination's reply and then deleted them here, holding no lock across
-  the round trip (it can wait on the network for as long as its timeout).
-  A write to a key in that time was acknowledged, then deleted with the
-  key, and the destination had the value from before it. Now a key is
-  deleted only if it still holds what was sent, value and time to live; one
-  written meanwhile is kept, its newest value here, and `MIGRATE` answers
-  `TRYAGAIN` naming it, so that `redis-cli --cluster reshard` stops and
-  says so rather than going on as though the key had moved. Run again with
-  `REPLACE` (`--cluster-replace`), as the destination holds the older copy,
-  it moves the key with its write. The deletions, and their `DEL` to
-  replicas and the AOF, are now one write under the write gate and the
-  keys' write order, held for them only, never across the network: a `SET`
-  of a key right after its deletion used to reach replicas before the
-  `DEL`, which then deleted the key they should have kept, and a deletion
-  could fall inside a checkpoint's cut or after a failover handoff's. And
-  the `DEL` names the keys deleted only: it named every key `MIGRATE` was
-  given, so a key written meanwhile, or one the dump had not found and a
-  write made meanwhile, was deleted on every replica and kept here.
-
-- **A slot migration's handoff holds writes until the source knows where
-  the slots are (#278).** At the end of a `CLUSTER MIGRATION`, the source
-  paused writes for at most `cluster-slot-migration-write-pause-timeout`
-  (10 s), and the pause ran out by itself. If sending the last writes and
-  the destination's `TAKEOVER` took longer than that, or the `TAKEOVER`'s
-  answer was lost, the source took writes for the moving slots again
-  without sending them on; when the destination took the slots after all,
-  the source deleted its keys, and the writes it had acknowledged since
-  were lost. Now writes stay held until the source knows: the destination
-  answers the `TAKEOVER`, its claim of the slots arrives, or, asked every
-  200 ms over a connection of its own, it says it took the slots, or
-  promises that the attempt will not take them (then the source gives the
-  attempt up, takes writes again and the destination tries again; a
-  `TAKEOVER` it gets later, of that attempt or an earlier one, is
-  refused). The timeout is now how long the source waits for the answer
-  before it asks. A destination that is down cannot answer: the source
-  lets writes go without its answer only once the cluster has marked it
-  FAIL and no claim of the slots has arrived, and then claims the slots
-  again at an epoch above any the destination can have taken them at, so
-  that the destination gives them up if it comes back with them. Why
-  writes are still held is logged every 5 s, and `CLIENT UNPAUSE` lets
-  them go, as it does a master's hold for a manual failover (#242). A
-  handoff whose `TAKEOVER` is answered in time pauses writes as long as
-  before.
-
-- **A checkpoint no longer stalls writes on a slow disk (#243).** With the
-  AOF on, the checkpoint after a bulk load held `SET`s back for seconds at a
-  time on a slow cloud disk, and replies went out without their writes
-  once they had waited 5 s. Two things made every write wait for the disk.
-  The snapshot went into the page cache at memory speed and was synced at
-  the end: a gigabyte queued at the disk at once, with the file system's
-  journal behind it, and every append to the AOF needs the journal now and
-  then (its size and time). And the log was turned over, old log synced,
-  new log synced, directory synced, by whichever thread reached the
-  turn-over, holding the log's lock, often a connection's. The snapshot now
-  goes to the disk 8 MB at a time, never more than two pieces queued, and
-  leaves the page cache once it is there; the new log is written before the
-  turn-over, and the old log and the directory are synced after it, by the
-  checkpoint, with the lock let go (the new log is not synced before the old
-  one is, so that a power failure cannot keep newer writes and lose older
-  ones). On a 150 MB/s Azure Standard SSD, during a checkpoint of 5 million
-  keys under a steady `SET` load, the longest `SET` went from 2.5 s to under
-  0.4 s. On a 100 MB/s Standard HDD, after a bulk load of 2.5 million `SET`s,
-  it went from 5 s, with 42 replies sent without their writes, to under 1 s
-  and none. On a slow disk under load a checkpoint now takes longer (it
-  leaves the AOF its share of the disk); on a fast disk `SET`s and `GET`s a
-  second are unchanged.
-
-- **`INFO persistence` counts the replies sent without their writes.** A
-  reply to a write waits at most 5 s for its record to reach the AOF; when
-  the disk falls further behind than that, it is sent anyway, and a process
-  killed then can lose that write. `aof_acks_before_write` counts them (0 on
-  a disk that keeps up), and the documentation no longer says that a killed
-  process loses nothing whatever the disk does.
-
-- **Concurrent writes to one key no longer lose updates when nothing
-  observes the write stream** (#271; reported and analysed by
-  @Parikalp-Bhardwaj). With
-  the AOF off and no replica, nothing ordered two writes to the same key,
-  and a command that reads a key and writes it back under separate holds of
-  its shard's lock could lose another's write: 50 clients adding 100,000
-  distinct elements with `PFADD` ended with a different count every run.
-  The same held for `PFMERGE`, `HINCRBY`/`HINCRBYFLOAT` on a new hash,
-  `BITFIELD`, `BITOP`, `GETEX`, `RESTORE`, `RENAME`/`RENAMENX`, `COPY`,
-  `SMOVE`, the `*STORE` commands and `SORT ... STORE` with their keys in one
-  shard, and `SADD`, `HSET`, `ZADD`, `GEOADD`, `VADD` and `LPUSHX` racing a
-  command that emptied and removed the key. Every write from a client now
-  holds the order of its keys, as it already did with the AOF on or a
-  replica attached; so do the active and lazy expiry of keys, eviction and
-  the expiry of hash fields. It still propagates nothing unless something
-  is listening. `SET`, `INCR` and the like, `LPUSH`/`RPUSH`, `SADD`, `ZADD`,
-  `ZINCRBY`, `PFADD` and (with no search index defined) `HSET`, `HMSET`,
-  `HSETNX`, `HINCRBY` and `HINCRBYFLOAT` read and write their one key under
-  one hold of its shard's lock, and take its order shared while nothing is
-  listening, so one hot key still takes as many of them a second as before;
-  `SADD`, `HSET`, `ZADD` and their kin now write the collection with its
-  shard held, and make a new one with its members rather than empty, and
-  `PFADD` writes its registers back only over the value it read them from.
-- **A replica no longer keeps a key its master deleted at an `EXPIRE` or
-  `PEXPIRE`.** `PEXPIRE k 1` read the clock twice, for the key's new time
-  and to see whether that time had already come, and about once in 650
-  calls a millisecond began in between. The master then deleted the key at
-  once, answered `1`, and sent nothing to its replicas or its AOF: they kept
-  the key for good (31 keys of 20,000 in a test; under load, a key written
-  to again afterwards held a different value on the replica). As in Redis,
-  only a negative time to live now deletes the key at once; a positive one
-  that has already run out by then expires the key as any other, with its
-  `DEL`. `EXPIRE` had the same race, over a whole second.
-- **`EXPIRE`, `PEXPIRE`, `EXPIREAT` and `PEXPIREAT` check `NX`, `XX`, `GT`
-  and `LT` before a time that deletes the key (#270).** A time to live of
-  `0`, or a moment that had already come, deleted the key and answered `1`
-  whatever the condition said: `EXPIRE k 0 NX` deleted a key that had a time
-  to live. As in Redis 8.10, the condition is now weighed first (no time to
-  live counting as an infinite one); if it fails, the command answers `0`,
-  leaves the key and its time to live as they were, and sends nothing to
-  replicas or the AOF. `EXPIREAT` and `PEXPIREAT` read only their first
-  option, so `NX XX` or `GT LT` went through with the second one ignored,
-  and an unknown option was refused only after the key had been deleted;
-  they now read every option and refuse these with Redis's errors before
-  doing anything. They are now sent, as `EXPIRE` is, as the `PEXPIREAT` or
-  `DEL` they came to. (Reported by @Parikalp-Bhardwaj.)
-- **`CONFIG GET threads` gives the `--threads` value.** It gave an empty
-  reply, though `CONFIG SET threads` was refused as a setting that cannot
-  change at runtime. `CONFIG SET` with a name and no value to pair with it
-  (`CONFIG SET replicaof <host> <port>`, say) now gets Redis 8.10's
-  `ERR syntax error` instead of a wrong-number-of-arguments error (#257).
-
-- **A search's count leaves out a key the expiry is deleting.** The
-  background sweep, or a read, that deleted a key past its time took it out
-  of the search indexes only after letting go of the key's shard. An
-  `FT.SEARCH` counted from the indexes in between (a TAG or NUMERIC query,
-  `LIMIT 0 0` say) still counted the key's document. The key is now marked
-  as leaving until it is out of the indexes, and the count leaves it out
-  (#249).
-  
-- **A replica no longer keeps a key its master moved, or found expired
-  while moving.** A `MOVE` that found its key past its time answered `0`
-  but was still sent to replicas and the AOF, and the replica, which never
-  takes a key as expired while it applies its master's stream, moved the
-  key. It then kept it for good, in the database it moved it to, and later
-  kept a new key of the same name in the first. A `MOVE` or `COPY` that
-  moved nothing is no longer propagated, as in Redis. And a key that
-  expired in the database it was moved to could have its `DEL` sent before
-  the `MOVE`: `MOVE` and `COPY ... DB` are now ordered against the key in
-  both databases.
-
-- **A master that may have been failed over takes no write until it knows
-  it has not (#242).** Under load, a master slow to answer the cluster bus
-  kept acknowledging writes after its replica was promoted, and those were
-  lost: 107 `INCR`s in one run. The replica had asked to take over
-  (`CLUSTER FAILOVER`) and given the failover up when the votes came too
-  late; the cluster marked the slow master FAIL meanwhile, and the replica
-  stood again of its own accord and won. The master's 10 s hold on writes
-  for the manual failover had run out by then, and it took writes until it
-  heard of the promotion, 1.5 s later. Now the master holds writes from the
-  manual failover on until it hears that its replica took over (they are
-  then redirected with `MOVED`) or, once the 10 s are up, until a majority
-  of the masters and every replica of it have answered a `PING` without
-  holding it FAIL, each replica as its replica: no replica can be elected
-  without such a majority. A failover given up for any other reason costs
-  that one round trip more. And a master that the cluster tells it has
-  been marked FAIL (it is up, but was too slow to answer), and that has a
-  replica that could take over, serves none of its slots until it has made
-  sure of them in the same way: commands on its keys are answered
-  `-CLUSTERDOWN`, and `CLUSTER INFO` says `cluster_state:fail`. Its replicas
-  are about to stand for election. With no failover, that lasts until the
-  other nodes clear the verdict, at most twice the node timeout after they
-  reached it. Redis 8.10 answers `-CLUSTERDOWN` there too, by another
-  route: its single thread answers the bus and clients alike, and a master
-  whose messages do not get through sees the others as unreachable. A
-  KiviDB master's bus runs beside its clients and can fall behind them,
-  and it hears the others, so its own view of the cluster said nothing was
-  wrong. Redis does take writes again the moment a manual failover runs
-  out of time on its master, without asking whether it still owns its
-  slots.
-  
-- **`expired` comes before the event of a write that makes the key
-  again.** When the background sweep, or another client's read, deleted a
-  key past its time, its `expired` notification was published after the
-  key's shard was let go of. A write that came in between and made the key
-  anew (`INCR` on a counter whose window ran out, say) could have its own
-  event (`incrby`) published first, which Redis never does. `expired` is now
-  published before the shard is let go of.
-
-- **A key past its time is not counted as used.** Under an LRU or LFU
-  policy, `MGET`, a `GET` on a replica, a command refused with an error,
-  a key a command names twice, and a script's commands could bring the
-  idle time or the count of a key already past its time up to date, as if
-  it had been used: the lookup wrote the key's use before its deadline was
-  looked at. Only a live key's use is written now, and `GET` looks at the
-  time once.
-
-- **`lazyfree-lazy-expire` in a config file is applied, and said to be.**
-  1.1 accepted the directive and ignored it: `CONFIG GET` still said `yes`
-  and expired keys still reached the AOF and replicas as `UNLINK` (#232).
-  1.2 applied it, but its startup log said it had no effect, as it said of
-  `latency-tracking` and `latency-tracking-info-percentiles`, which have
-  one too; it no longer does. `lazyfree-lazy-expire`, the other
-  `lazyfree-*` settings and `latency-tracking` take only `yes` or `no`, in
-  a config file and in `CONFIG SET`, as in Redis; any value was taken.
-
-- **A script may not run what Redis does not let a script run.** Redis
-  refuses, from `EVAL` and `FCALL`, the commands its command table flags
-  `noscript`, with "This Redis command is not allowed from script":
-  `SAVE`, `BGSAVE`, `BGREWRITEAOF`, `SHUTDOWN`, `CONFIG GET` / `SET` /
-  `REWRITE`, `ACL` and `CLIENT` subcommands, `MULTI`, `EXEC`, `WATCH`, the
-  subscribe commands, `MONITOR`, `REPLICAOF`, `DEBUG`, `HELLO`, `EVAL`
-  itself and others. KiviDB refused only `CLUSTER`, `HOTKEYS` and `BACKUP`,
-  and ran the rest. A `SAVE` in a script on a replica could hang it: the
-  script held a slot of the write gate and waited for the replication
-  applier, which waited for a backup's or a full sync's cut, which waited
-  for the gate. The list is now Redis 8.10's. Of `CLUSTER`, a script may
-  run what only reads (`INFO`, `NODES`, `SLOTS`, `KEYSLOT`, ...), as in
-  Redis, but not what changes the cluster, which Redis allows: a slot's
-  handoff here waits for the writes in flight, the script among them.
-  `HOTKEYS HELP`, `BACKUP LIST` and `BACKUP STATUS` run from a script, as in
-  Redis.
-
-- **A key a command leaves where it was keeps its LFU count.** `GETDEL` of
-  a key of another type took the key out, saw its type, and put it back as
-  a new key: its time to live was kept, but under an LFU policy its access
-  count started again at 5 (#221). `MOVE` to a database that already has
-  the key, and `RENAME` of a key to itself, did the same. Each now looks
-  at the key and leaves it as it is, counting the lookup as a use, as
-  Redis does. A key `MOVE` does move keeps its count and its idle time, as
-  its object does in Redis; it used to start afresh.
-
-- **HNSW vectors written after a checkpoint are found again after a crash.**
-  A checkpoint (`BGREWRITEAOF`, the automatic AOF rewrite, or `SAVE` /
-  `BGSAVE` with the AOF on) writes `dump.kdb` with the HNSW graphs, and
-  starts the AOF over with the writes made after it. A server killed after
-  that (`kill -9`, a crash, a lost machine) came back with the graphs as the
-  snapshot had them: the vectors written since the checkpoint were in the
-  hashes and counted in `num_docs`, but no KNN query found them (none of
-  1,000 in a test), and a vector deleted or overwritten since was still
-  found under its key. A clean shutdown, which writes a fresh snapshot, did
-  not lose them. The graph from the snapshot is now brought up to date with
-  the keys at startup: vectors it holds unchanged stay as they are, the
-  others are inserted, and those of deleted keys or fields are taken out.
-  FLAT, TEXT, TAG and NUMERIC fields were rebuilt from the keys already and
-  were right. 1.1.2 and 1.1.3 have the bug; files they wrote load correctly.
-
-- **A cluster master back without its data no longer wipes its replica.**
-  With no AOF, a shard master killed outright (no final snapshot) and back
-  inside `cluster-node-timeout` kept its node id and slots from nodes.conf
-  and served them empty, so nobody failed it over. Its replica refused the
-  empty dataset only until clients had written a key to the master, and
-  then dropped every key it held and loaded those: in an AKS run, 25,939
-  acknowledged writes, and 53,271 on a second try. Now a master that
-  starts with neither an AOF nor a snapshot from a clean shutdown, and has
-  replicas, serves none of its slots (`CLUSTERDOWN`; `cluster_state:fail`
-  and `master_lost_dataset:1` on that node) and answers its replica's
-  `PSYNC` with `+LOSTDATA`. A replica holding the data takes over (an
-  election, as `CLUSTER FAILOVER FORCE`) and the old master follows it; a
-  replica holding nothing says so, and once every replica has, the master
-  serves what it has (a whole cluster restarted with no persistence: no
-  failovers). The master serves anyway once every replica has failed, or
-  when none that knows `+LOSTDATA` (an older version) has asked within
-  `max(30 s, 6 node timeouts)`. And a replica no longer drops its dataset
-  for the master it followed until a moment ago (within `repl-timeout`)
-  when that master is back under a replication id that does not continue
-  its stream and holds fewer than `replica-full-sync-guard-ratio` percent
-  of its keys, whatever the guard's mode; it takes over instead. With the
-  AOF on, or after a clean stop (`SHUTDOWN`, SIGTERM: a marker,
-  `dump.kdb.clean`, is left beside the final snapshot), restarts go on as
-  before.
-
-- **`CLUSTER FAILOVER` no longer gives up under writes for want of an answer
-  its master had ready.** With the tokio I/O model (always, for cluster
-  nodes), a write that arrived just as its master began the handover waited
-  for it on its worker thread, and the task that thread would have run next
-  waited with it: no other thread takes that one (tokio's LIFO slot). When
-  it was the replication hub, which the handover waits on to know that
-  everything has been sent to the replica, the master answered only when
-  its pause on writes ran out, 10 s later; the replica had given up after 5,
-  and the roles stayed as they were. Seen as an intermittent CI failure of
-  `manual_failover_swaps_roles_without_losing_acknowledged_writes`. Nothing
-  was lost: writes went on at the master. The write now hands the thread's
-  other tasks to another thread while it waits.
-- **A replica of a KiviDB master older than 1.1.3 no longer keeps the keys
-  that master expires.** Since 1.1.3 a replica does not expire keys by its
-  own clock: it waits for the `DEL` (or `UNLINK`) its master sends for each
-  key it expires, so that the two cannot come apart. A 1.1.2 or older master
-  sends none, so a newer replica following it (as in the recommended
-  upgrade order, replicas first) kept every key the master expired: unseen
-  by reads, but in memory, and still there after the master was upgraded
-  if the replica went on by a partial resync. Ten keys of `PX 1000` left a
-  1.1.2 master at one key and its replica at eleven, for good. A replica now
-  asks its master which release it is (it already did, for `FT.DROPINDEX
-  DD`): under a master that sends no deletions (KiviDB 1.1.2 and before,
-  and 1.2.0-rc1 and -rc2, cut before the fix reached 1.2) it expires keys
-  itself, deleting them locally and propagating nothing, as every replica
-  did before 1.1.3. A master now says in `INFO server` that it sends them
-  (`kividb_expired_keys_propagated:1`); 1.1.3 and later 1.1 releases are
-  known by their version; a master that is not KiviDB (Redis, Valkey) sends
-  them; and one whose `INFO` cannot be read (refused to the replication user
-  by an ACL, say) is taken to send them, as 1.1.3 took every master: a
-  replica that waits for deletions that never come keeps keys that read as
-  gone, while one that also deletes keys under a master that sends them can
-  come apart from it. And when a replica is continued by a master that
-  sends deletions (a partial resync) while its dataset may hold keys left
-  by one that did not (it has followed such a master, or loaded its dataset
-  at startup), it first deletes the keys whose time ended before that
-  master started, before applying anything of its stream; a key that
-  expired later is that master's to delete. Only the replica's own clock is
-  read, against the master's `uptime_in_seconds`. Under a master that sends
-  deletions nothing changes: no key expires while a dataset is loaded or
-  the master's stream applied, and the replica deletes none itself.
-  Fixes #231.
-
-- **`FT.DROPINDEX index DD` reaches replicas and the AOF as the documents
-  it deleted.** The command was sent on as typed, and each replica, and an
-  AOF replayed at startup, ran `DD` again and deleted whatever its own copy
-  of the index covered then, which need not be what the master deleted. A
-  replica could lose a document its master kept, or keep one its master
-  deleted. As in Redis 8.10, replicas and the AOF now get `DEL`s of the
-  documents deleted, and then the drop without `DD`, for HASH and JSON
-  indexes and for an index in any database (its `DEL`s are sent in it). A
-  replica writes the same to its own AOF. A `DD` sent by an older master is
-  run as that master ran it: a 1.2.0 release candidate deleted the
-  documents, 1.1 kept them (the replica asks its master which release it
-  is). A `DD` found in an AOF keeps the documents, as 1.1 did: nothing in
-  the file says which release wrote it, and keeping loses no data. An AOF
-  written by a 1.2.0 release candidate that ran `DD` brings back, on
-  replay, the documents it deleted; rewrite it (`BGREWRITEAOF`) before
-  upgrading, or delete them again after. The documents are deleted 256 at a time, each 256 a
-  write of its own sent as one `DEL`, so an index of millions of documents
-  does not hold up a replica's full sync, a checkpoint, or writes to other
-  keys while it goes; the index itself goes last, so a `DD` cut short can
-  be run again. Redis sends a `DEL` per document and the drop as
-  `_FT._DROPINDEXIFX … _FORCEKEEPDOCS`, all inside `MULTI`/`EXEC`; KiviDB
-  sends `FT.DROPINDEX index`, which a replica of an older release also
-  understands, and no `MULTI`, which for a large index would be one
-  transaction of millions of commands. `DD` of a large index takes longer
-  than it did, as each document now leaves the index before the index goes:
-  about 3 seconds a million documents rather than 1, while the replicas
-  that each took as long again afterwards now keep up as it goes.
-
-- **Checkpoints run one at a time, and a crash during one loses nothing.**
-  Overlapping checkpoints (`BGREWRITEAOF`, `SAVE`, `BGSAVE`, the automatic
-  AOF rewrite, the snapshot at shutdown) and a crash while a checkpoint
-  turned the AOF over could lose acknowledged writes or bring back deleted
-  keys. Each `BGREWRITEAOF` started a checkpoint of its own beside any
-  already running: they shared a save number, the last to finish put its
-  snapshot in place even when it was the oldest (keys deleted by a
-  `FLUSHALL` in between came back, and what was written after it was
-  lost), and each removed `appendonly.aof.prev` while another still needed
-  it. A `BGREWRITEAOF` sent every few milliseconds had hundreds of them, and
-  threads, at once, holding writes back for seconds. And a crash after
-  `appendonly.aof` was moved aside and before the new log took its name
-  left no log, so the next start replayed nothing that was written since
-  the last snapshot. Now a checkpoint has the persistence files to itself
-  from the choice of its save number until it has removed the old log;
-  `BGREWRITEAOF` asked for while one runs is served by exactly one more
-  after it, on the same thread; `SAVE` from a script while a checkpoint
-  runs answers that one is in progress rather than wait for it; the new log
-  is written before the old one is moved aside; and a start that finds
-  `appendonly.aof.prev` without a log beside it replays it.
-
-- **`FT.AGGREGATE … ADDSCORES` shows the score in every row (#234).** As
-  in Redis 8.10, each row now starts with `__score`, whatever else the
-  command loads, sorts by or computes. It showed only where a `LOAD` or a
-  `SORTBY` named `@__score`, and a plain `ADDSCORES` gave rows with no
-  fields. A `GROUPBY`'s rows have no score of their own, as before.
-  `FT.EXPLAIN` writes `NOT{`, `OPTIONAL{` and `<empty>` as Redis does
-  (it wrote `NOT {`, `OPTIONAL {` and `<EMPTY>`), `FT.EXPLAINCLI` ends
-  with Redis's empty last line, and `FT.DEBUG HELP` lists the subcommands
-  instead of answering that it is not one. A query word shorter than
-  `search-min-stem-len` is still shown, and looked for, with its stems:
-  the length decides which words of a document are indexed with a stem,
-  not what a query looks for, in Redis as here.
-
-- **`VADD` refuses what it does not know (#235).** A `DISTANCE` it did not
-  know was taken as COSINE, and an option it did not know, or one missing
-  its value, was skipped. Now, as Redis 8.10 answers: `ERR invalid option
-  after element`; `ERR invalid M` for an `M` outside 4 to 4096 and `ERR
-  invalid EF` for an `EF` outside 1 to 1,000,000 (they were not checked);
-  and `ERR invalid vector specification` for a vector given wrong, which
-  includes `VALUES 0` and a NaN, both of which used to make a set; a
-  vector of another dimension than the set's is refused in Redis's words
-  (`ERR Vector dimension mismatch - got 3 but set has 2`).
-  `DISTANCE COSINE | L2 | IP`, before the vector or after the element, is
-  KiviDB's own: Redis 8.10's vector sets are cosine only and refuse the
-  word. An unknown value is `ERR invalid DISTANCE: use COSINE, L2 or IP`,
-  and one other than an existing set's is `ERR asked distance mismatch
-  with existing vector set`, as Redis refuses a quantization the set was
-  not made with (it was ignored; leaving `DISTANCE` out still means the
-  set's own).
-
-- **An index's walks over its documents are ordered against writes to
-  them (#275).** `FT.ALTER`'s backfill of the fields it adds (vector, TEXT,
-  TAG and NUMERIC) read each document as it found it and indexed that, and
-  a write to the document meanwhile, which had indexed what it wrote, could
-  be overwritten in the index by the older copy: a search then found the
-  document by its old vector, words or tags until its next write. A hash
-  or JSON document is changed in place, under its own lock, which a walk
-  holding its shard's lock does not keep out. `FT.CREATE` looked through
-  the documents before it registered the index, so a document written in
-  between was in no index until its next write. Now `FT.CREATE` registers
-  the index first, and every walk takes each document's write order, reads
-  it as it is then and indexes that: a write falls before the read or after
-  the indexing, and indexes the document itself. (A write holds its keys'
-  order while something reads the write stream, the AOF or a replica, and
-  with #271 always.) `FT.DROPINDEX ... DD` collected the documents and
-  then deleted them, a few at a time, taking their write order only when
-  something read the write stream, and deleting whatever was there: a key
-  written meanwhile as a string, or as a hash under an `ON JSON` index,
-  was deleted, where run after that write `DD` would have kept it. It now
-  takes their order always, and deletes a key only if it is still a
-  document of the index, deciding under its shard's lock.
-
-## [1.2.0]
-
-See [docs/releases/v1.2.0.md](docs/releases/v1.2.0.md) for what to check before upgrading.
-
-**Read before upgrading:** in scripts, `pcall` and `assert` now behave as in
-Redis. A script that reads `e.err` from an error `pcall` caught no longer
-finds it there: `e` is now the `err` itself. One that gives `assert` a table
-for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
-
-### Added
 
 - **Stemming of TEXT fields, as in Redis.** A word is now found by its
   other forms: `@t:preferences` finds a document that says `I prefer
@@ -522,15 +283,32 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   TEXT index like any other, which now costs less than it did without them
   (see *Full-text search: the TEXT index holds numbers, not strings*).
 
-- **Redis-compatible HyperLogLog hash space (#62).** `PFCOUNT` now uses
+- **Redis-compatible HyperLogLog values (#62).** Redis dense and sparse
+  values are read and counted correctly, including the overlapping
+  12,304-byte case, where a valid canonical sparse body is taken as sparse
+  and anything else at that size stays legacy dense. `PFCOUNT` now uses
   Ertl's estimator for legacy keys too, so estimates can shift slightly.
-  KiviDB always writes dense HLL values; `PFADD` on a Redis sparse HLL rewrites
-  it as dense. Existing keys are not automatically converted between hash
-  formats. `hll-write-format` selects the hash space for new values and
-  defaults to `legacy`; keep it there until every node runs this release, then
-  set it to `redis` on the master and every replica. Keep the setting
-  consistent across the replication group. Existing values remain in their
-  original hash space.
+  KiviDB always writes dense HLL values (encoding 0); `PFADD` on a Redis
+  sparse HLL rewrites it as dense. `hll-write-format` selects the hash space
+  for new values: `redis`, Redis's MurmurHash64A, or `legacy`, the default.
+  It is a per-server setting, in the config file or with `CONFIG SET`
+  (persisted by `CONFIG REWRITE`), and is in place before the AOF is
+  replayed at startup. Existing keys keep the hash space they were written
+  in and are not converted: `PFADD` preserves it, and `PFMERGE` gives a new
+  destination the hash space of its sources (or the configured default when
+  it has none). Legacy and Redis HLLs use different hash spaces, so
+  `PFMERGE` and multi-key `PFCOUNT` refuse a mixture rather than
+  approximating, and a corrupt sparse value is `INVALIDOBJ Corrupted HLL
+  object detected`, not a `WRONGTYPE` error. A value that is neither format
+  is still `WRONGTYPE`. `PFDEBUG GETREG` is read-only here, unlike Redis, so
+  a diagnostic cannot change a sparse value; `TODENSE` and `RESET` replicate
+  like any other write. Rolling upgrades: keep every node on `legacy` until
+  all of them run this release, then set `hll-write-format redis` on the
+  master and every replica. A master and its replicas must agree, since
+  `PFADD` and `PFMERGE` replicate as commands and each node writes new
+  values in its own setting: a KiviDB master whose replicas are older, or a
+  replica with a different setting, is not a supported mixed-format
+  deployment.
 
 - **Signed build provenance for every release file and image.** The
   release workflow signs a GitHub artifact attestation (Sigstore, with the
@@ -671,31 +449,87 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
 
 ### Changed
 
+- **`repl-backlog-size` is 64 MB by default** (it was 1 MB, as in Redis).
+  At 100k writes a second 1 MB lasts a fraction of a second, less than a
+  replica takes to reconnect after its master restarts, so the replica was
+  sent the whole dataset (three of three clean restarts in our
+  tests). The backlog is kept only from a replica's first sync, or a
+  promotion, until `repl-backlog-ttl` after the last replica has gone: a
+  server that never has a replica keeps none of it. With replicas it counts
+  in `used_memory` and against `maxmemory`, as it does in Redis, and a
+  replica's queue may then grow to it before the replica is dropped: on a
+  master with a `maxmemory` of tens of megabytes, set it back to `1mb`.
+
+- **`SORT` and `SORT_RO`: a `BY` pattern with a `*` and a `GET` pattern
+  other than `#` need read access to every key,** as in Redis. They read
+  keys named by the sorted elements; a user whose ACL names some keys gets
+  `ERR BY option of SORT denied due to insufficient ACL permissions.` (or
+  `GET option ...`). `GET #` and a `BY` with no `*` read no other key and
+  are allowed. `SORT ... STORE` needs only read access to the key it sorts
+  and write access to the destination, so a `%R~*` user can sort.
+- **`SLOWLOG` and `MONITOR` show credentials as `(redacted)`,** as in
+  Redis: the rules of `ACL SETUSER`, what follows `AUTH`/`AUTH2` in
+  `MIGRATE`, and the value of `requirepass`, `masterauth`, `primaryauth`,
+  `cluster-bus-secret`, `tls-key-file-pass` and `tls-client-key-file-pass`
+  in `CONFIG SET`. The server log's line for `CONFIG SET` hides the same
+  settings.
+
+- **Vector search: distances in SIMD, vectors laid out for the cache, a
+  filtered KNN without copies.** Every vector distance (HNSW search and
+  insert, FLAT, the KNN step of a filtered query) was a scalar sum the
+  compiler could not vectorise. The dot product, squared L2 and cosine are
+  now AVX-512, AVX2 with FMA or NEON kernels, picked at run time, with a
+  portable eight-way sum elsewhere; no new dependency. A cosine query is
+  scaled to unit length once per search. A filtered `KNN` measures each
+  document as the filter accepts it and keeps the best `k`, instead of
+  copying every accepted key into a set and looking each up again. Results
+  are the same up to float rounding. A search of a 1536-dimension graph also
+  spent most of its time waiting for vectors to come from memory: each
+  node's vector was an allocation of its own, reached through the node, its
+  links were locked for every node expanded, and nothing was fetched ahead.
+  The vectors, the layer-0 links and a live flag now sit in blocks of
+  fixed-size slots indexed by node id (on huge pages where the kernel
+  allows), links are read without a lock, and each neighbour's vector is
+  prefetched before it is measured. A full list of links may take a few more
+  before it is pruned, instead of being pruned again for each one. A deleted
+  vector's slot is now filled by the next insert; each graph takes some 390
+  bytes less per vector. Recall is the same or a little higher at every ef,
+  and the snapshot format is unchanged. On dbpedia-openai-100K-1536
+  (redis/vector-db-benchmark, M 16, EF_CONSTRUCTION 128, an Azure D16s_v5
+  with the server on 8 CPUs; Redis 8.10.3 in brackets), the SIMD kernels
+  took ef 128 from 330 to 811 queries a second with one client (978) and
+  from 1883 to 3894 with 16 (5005), at recall 0.985 (0.980), and the upload
+  from 126 s to 29 s (14 s); h-and-m-2048 with filters uploads in 41 s
+  instead of 156 s (20 s). The slot layout then made the search about 1.3
+  times as fast again, and the upload about twice as fast: on an 8-CPU
+  server, ef 128 went from 618 to 817 queries a second on one client and
+  from 2,917 to 3,716 on sixteen, and the upload from 44.4 to 21.4 s
+  (h-and-m-2048: 58.2 to 28.0 s).
+
 - **Full-text search: the TEXT index holds numbers, not strings.** The
-  inverted index kept, for every word of every TEXT field, a set of the
-  keys of the documents holding it, each key a string of its own; the
-  forward index kept every word of every document as a string again, and
-  the vocabulary and document frequencies a third and fourth copy of each
-  word. Now each word (or stem) is kept once and known by a number, and each
+  inverted index kept, for every word of every TEXT field, a set of the keys
+  of the documents holding it, each key a string of its own; the forward
+  index kept every word of every document as a string again, and the
+  vocabulary and document frequencies a third and fourth copy of each word.
+  Now each word (or stem) is kept once and known by a number, and each
   document by the number its index gives it (the one TAG and NUMERIC
-  postings use, now given in every index with a TEXT field too): a word's
-  documents are a sorted list of numbers, or a bitmap when that is smaller,
-  and a document's words one list of numbers, in order, which is where its
-  positions come from. A query's word, stem, prefix, suffix or infix, and
-  `AND`, `OR` and `NOT` of them, are now exactly the documents the index
-  names, which are no longer read and checked one by one; a phrase still
-  is, and a fuzzy word still reads every document. On an Azure D16s_v5, a
-  million hashes of a short text (6 to 14 words) and a tag, written by 8
-  clients: the dataset takes 827 bytes a document, stems included, instead
-  of 1,944 without them in 1.1 (2,596 with stems before this change);
-  indexing takes 18.7 to 20.7 microseconds of server CPU a document instead
-  of 25 (40), and the writes finish in 7 s instead of 22 (33); a one-word
-  query matching 16,000 documents takes 20 ms instead of 34 (49), a prefix
-  27 ms instead of 36 (91), a word and a tag 0.3 ms instead of 4.2 (7.3).
-  With 100,000 texts of 60 to 200 words: 3.8 KB a document instead of 13.7
-  (21.7), 110 microseconds of CPU instead of 189 (315), a one-word query
-  17 ms instead of 87 (93). `FT.INFO` gives what the TEXT index holds in
-  `text_terms_bytes`, `text_postings_bytes` and `text_docs_bytes`.
+  postings use): a word's documents are a sorted list of numbers, or a
+  bitmap when that is smaller, and a document's words one list of numbers,
+  in order, which is where its positions come from. A query's word, stem,
+  prefix, suffix or infix, and `AND`, `OR` and `NOT` of them, are now
+  exactly the documents the index names, which are no longer read and
+  checked one by one; a phrase still is, and a fuzzy word still reads every
+  document. On an Azure D16s_v5, a million hashes of a short text (6 to 14
+  words) and a tag, written by 8 clients: the dataset takes 827 bytes a
+  document, stems included, instead of 1,944 without them in 1.1; indexing
+  takes 18.7 to 20.7 microseconds of server CPU a document instead of 25,
+  and the writes finish in 7 s instead of 22; a one-word query matching
+  16,000 documents takes 20 ms instead of 34, a prefix 27 ms instead of 36,
+  a word and a tag 0.3 ms instead of 4.2. With 100,000 texts of 60 to 200
+  words: 3.8 KB a document instead of 13.7, 110 microseconds of CPU instead
+  of 189, a one-word query 17 ms instead of 87. `FT.INFO` gives what the
+  TEXT index holds in `text_terms_bytes`, `text_postings_bytes` and
+  `text_docs_bytes`.
 
 - **Search scores are Redis's.** `WITHSCORES`, `ADDSCORES`, and the order
   of results now come out as Redis 8.10 gives them for the same data and
@@ -713,115 +547,70 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   `HAMMING`; an unknown name is an error, as in Redis. A threshold an
   application set on the old scores needs checking.
 
-- **Vector search: distances in SIMD, a filtered KNN without copies.**
-  Every vector distance (HNSW search and insert, FLAT, the KNN step of a
-  filtered query) was a scalar sum the compiler could not vectorise. The
-  dot product, squared L2 and cosine are now AVX-512, AVX2 with FMA or NEON
-  kernels, picked at run time, with a portable eight-way sum elsewhere; no
-  new dependency. A cosine query is scaled to unit length once per search.
-  A filtered `KNN` measures each document as the filter accepts it and
-  keeps the best `k`, instead of copying every accepted key into a set and
-  looking each up again. Results are the same up to float rounding. On an
-  Azure D16s_v5, server on 8 CPUs, M 16, EF_CONSTRUCTION 128
-  (redis/vector-db-benchmark; Redis 8.10.3 in brackets):
-  dbpedia-openai-100K-1536 at ef 128 goes from 330 to 811 queries a second
-  with one client (978) and from 1883 to 3894 with 16 (5005), recall 0.985
-  (0.980); its upload from 126 s to 29 s (14 s). h-and-m-2048 with filters
-  uploads in 41 s instead of 156 s (20 s); its filtered queries gain only
-  a quarter, 9.0 to 11.3 a second with one client (167) and 52 to 69 with
-  16 (964), recall 0.998 for both, because a TAG or NUMERIC filter still
-  reads every document.
-
-- **Vector and full-text search: TAG and NUMERIC fields are indexed.**
-  A TAG or NUMERIC clause in a query (`FT.SEARCH`, `FT.AGGREGATE`, the
-  filter of a `KNN`) used to be tried on every document. Each index now
-  numbers its documents and keeps, for each tag, the documents that hold it
-  (a sorted list, or a bitmap when that is smaller) and each NUMERIC field's
-  values in order; `AND`, `OR`, `NOT`, `*` and `~` of such clauses become a
+- **Vector and full-text search: TAG and NUMERIC fields are indexed, and a
+  query reads only the documents of its page.** A TAG or NUMERIC clause in a
+  query (`FT.SEARCH`, `FT.AGGREGATE`, the filter of a `KNN`) used to be
+  tried on every document, and every match was then read (fields copied, a
+  score each) to sort them and return the ten of `LIMIT 0 10`. Each index
+  now numbers its documents and keeps, for each tag, the documents that hold
+  it (a sorted list, or a bitmap when that is smaller) and each NUMERIC
+  field's values in order (a sorted list, with a small B-tree of the ones
+  written since); `AND`, `OR`, `NOT`, `*` and `~` of such clauses become a
   set of documents without reading any. A TEXT clause narrows to its
   candidates and is checked; a clause they cannot answer falls back to the
-  scan. A filtered `KNN` then measures each matching document when there are
-  few, up to `max(2000, sqrt(12 * ef * N))` of the `N` in the graph, and
-  otherwise searches the graph keeping only matching nodes, with as many
-  distances as measuring would cost and measuring when they run out (the
-  constant is where the two cost the same on dbpedia-openai-100K-1536, from
-  5% to 80% of documents, ef 64 to 256; the graph search kept the recall of
-  an unfiltered one). `HYBRID_POLICY ADHOC_BF` always measures; `BATCHES`
-  is the filtered graph search with no limit (Redis reads the graph in
-  batches; `BATCH_SIZE` is accepted). A FLAT index always measures. On an
-  Azure D16s_v5, server on 8 CPUs, M 16, EF_CONSTRUCTION 128
-  (redis/vector-db-benchmark; Redis 8.10.3 in brackets), h-and-m-2048 with
-  filters goes from 11.7 to 426 queries a second with one client at ef 128
-  (167) and from 71 to 1944 with 16 (979), recall 0.998 (0.998); its upload
-  takes 39 s as before (20 s). dbpedia-openai-100K-1536, unfiltered, is
-  unchanged: 839 a second at ef 128 (1013), recall 0.984 (0.980). A 10%
-  TAG filter over 100,000 1536-dimension vectors takes 2.8 ms instead of
-  62 (Redis 2.0 ms at recall 0.42; KiviDB's is exact). Without a vector,
-  over 200,000 hashes, `@t:{v}` matching 1% takes 0.41 ms instead of 116
-  (0.28), a 1% NUMERIC range 0.42 ms instead of 105 (0.67), a TAG and a
-  range together 0.14 ms instead of 121 (0.52); a query that matches a
-  quarter of the documents still reads each, 13.9 ms (2.1). This costs
-  memory: about 90 bytes a document for its number, and 33 to 37 for each
-  TAG or NUMERIC field it has, plus 24 bytes and the text of each distinct
-  tag; h-and-m (13 TAG and 11 NUMERIC fields) takes 2.29 GB instead of 2.19.
-  `FT.INFO` reports `doc_ids`, `tag_values` and the bytes of each kind of
-  posting. `FT.AGGREGATE` without `SORTBY` returns rows in the order of the
-  documents' numbers. `FT.DEBUG POSTINGS <index> ON|OFF` turns their use
-  off, to compare. Along the way: a key expired by a read, a key renamed,
-  and a hash overwritten by `SET` now leave the indexes (a KNN query used to
-  still return them), and a write in one database no longer touches the
-  indexes of another.
-
-- **Search: a TAG or NUMERIC query reads only the documents of its page.**
-  Since TAG and NUMERIC postings, such a query found its matches without
-  reading documents, then still read every match (fields copied, a score
-  each) to sort them and return the ten of `LIMIT 0 10`. Its page is now
-  picked from the postings, only the documents on it are read, and the
-  count is the size of the set. The order is the one it was, so replies are
-  the same: without `SORTBY`, by key (every match scores the same without a
-  word to score), read off a list of each index's documents in key order;
-  `SORTBY` a NUMERIC field, by its values in order. NUMERIC values are now
-  kept in a sorted list, with a small B-tree of the ones written since: a
-  range is read off three to four times as fast as from a B-tree of every
-  value, in less memory. Both are kept up to date by a thread of the index's
-  own, started by writes when there is work, a few steps at a time under the
+  scan. The page is then picked from the postings, only the documents on it
+  are read, and the count is the size of the set. The order is the one it
+  was, so replies are the same: without `SORTBY`, by key (every match scores
+  the same without a word to score), read off a list of each index's
+  documents in key order; `SORTBY` a NUMERIC field, by its values in order.
+  `FT.AGGREGATE` without `SORTBY` returns rows in the order of the
+  documents' numbers. A query with words to score, a vector clause, `SORTBY`
+  a TAG or TEXT field, `SORTBY` a NUMERIC field that holds NaN, or more keys
+  with a time to live than matches, still reads every match. The postings
+  and the key order are kept up to date by a thread of the index's own,
+  started by writes when there is work, a few steps at a time under the
   index's lock: no query waits on a merge or a sort of the whole index. A
   write never waits for the lock: one that finds a query or the merging
   thread holding it is queued, and the next query applies the queue before
-  it reads, so it sees every write that returned before it began. On 1
-  million documents the first query ordered by key after a load, an
-  `FT.CREATE` or a restart takes 2.6 to 3.3 ms, where sorting every key on
-  demand took 93 to 100 ms with writes to the index waiting. Four writers
-  adding documents to an index of 1 million write as fast as before postings
-  with two readers asking a page each, flat out or 200 times a second: 98,000
-  to 101,000 writes a second (p99 0.06 ms, p99.9 0.10 to 0.29 ms), where they
-  managed 82,000 to 85,000 with the readers reading every match, and 18,000
-  with the readers holding the postings' lock; the pages take 0.3 to 2.5 ms
-  (p99 7 ms). Past 1.8 million documents, a write no longer waits 150 ms
-  while the table of keys grows: the most any took, up to 2.3 million, was 7
-  ms. A query with words to score,
-  a
-  vector clause, `SORTBY` a TAG or TEXT field, `SORTBY` a NUMERIC field that
-  holds NaN, or more keys with a time to live than matches, still reads
-  every match. `FT.DEBUG PAGE <index> ON|OFF` turns this off, to compare.
-  On an Azure D16ds_v5, server on 8 CPUs, 1 million hashes, one client
-  (Redis 8.10.3 in brackets): a TAG filter matching half the documents takes
-  0.08 ms instead of 305 (50), a quarter 0.08 instead of 142 (30), 2% 0.10
-  instead of 7.6 (1.5); with `SORTBY` a NUMERIC field 0.11 instead of 752
-  (53); `LIMIT 10000 10` of half 0.13 instead of 300 (53). A NUMERIC range
-  of half takes 1.0 ms instead of 273 (51), a quarter 0.51 instead of 132
-  (25), 2% 0.12 instead of 5.6 (2.0). With 8 clients, half the documents:
-  57,000 queries a second instead of 18 (102). JSON documents are the same
-  (half: 0.09 ms instead of 906). Memory: 10 bytes a document more (its
-  place in key order, its cluster slot), and less for NUMERIC fields: 2
-  million documents took 2,416 MB instead of 2,443.
-
-- **Release candidates are no longer published as GitHub Releases.** A tag
-  such as `v1.2.0-rc1` is still built, its images are still pushed to GHCR
-  (`ghcr.io/kividbio/kividb:v1.2.0-rc1`) and smoke-tested, and its Linux
-  binaries, packages and checksums are pushed to GHCR beside them, signed:
-  `oras pull ghcr.io/kividbio/kividb-binaries:v1.2.0-rc1`. The Releases page
-  lists only releases.
+  it reads, so it sees every write that returned before it began. A filtered
+  `KNN` then measures each matching document when there are few, up to
+  `max(2000, sqrt(12 * ef * N))` of the `N` in the graph, and otherwise
+  searches the graph keeping only matching nodes, with as many distances as
+  measuring would cost and measuring when they run out (the constant is
+  where the two cost the same on dbpedia-openai-100K-1536, from 5% to 80% of
+  documents, ef 64 to 256; the graph search kept the recall of an unfiltered
+  one). `HYBRID_POLICY ADHOC_BF` always measures; `BATCHES` is the filtered
+  graph search with no limit (Redis reads the graph in batches; `BATCH_SIZE`
+  is accepted). A FLAT index always measures. On an Azure D16s_v5, server on
+  8 CPUs, M 16, EF_CONSTRUCTION 128 (redis/vector-db-benchmark; Redis 8.10.3
+  in brackets), h-and-m-2048 with filters, with distances in SIMD both
+  times, goes from 11.7 to 426 queries a second with one client at ef 128
+  (167) and from 71 to 1944 with 16 (979), recall 0.998 (0.998); its upload
+  takes 39 s as before (20 s). A 10% TAG filter over 100,000 1536-dimension
+  vectors takes 2.8 ms instead of 62 (Redis 2.0 ms at recall 0.42; KiviDB's
+  is exact). Without a vector, a TAG or NUMERIC filter matching 1% of
+  200,000 hashes took 105 to 121 ms, reading every document (Redis 0.28 to
+  0.67 ms). On an Azure D16ds_v5, server on 8 CPUs, 1 million hashes, one
+  client (Redis 8.10.3 in brackets): a TAG filter matching half the
+  documents takes 0.08 ms (50), a quarter 0.08 (30), 2% 0.10 (1.5); with
+  `SORTBY` a NUMERIC field 0.11 (53); `LIMIT 10000 10` of half 0.13 (53). A
+  NUMERIC range of half takes 1.0 ms (51), a quarter 0.51 (25), 2% 0.12
+  (2.0). With 8 clients, half the documents: 57,000 queries a second (102).
+  JSON documents are the same (half: 0.09 ms). The first query ordered by
+  key after a load, an `FT.CREATE` or a restart takes 2.6 to 3.3 ms on 1
+  million documents. Four writers adding documents to an index of 1 million,
+  with two readers asking a page each, flat out or 200 times a second, write
+  as fast as without postings: 98,000 to 101,000 writes a second (p99 0.06
+  ms, p99.9 0.10 to 0.29 ms), and the pages take 0.3 to 2.5 ms (p99 7 ms).
+  Up to 2.3 million documents, no write took more than 7 ms. This costs
+  memory: about 100 bytes a document (its number, its place in key order,
+  its cluster slot), and up to 37 for each TAG or NUMERIC field it has, plus
+  24 bytes and the text of each distinct tag; h-and-m (13 TAG and 11 NUMERIC
+  fields) takes 2.29 GB instead of 2.19. `FT.INFO` reports `doc_ids`,
+  `tag_values` and the bytes of each kind of posting. `FT.DEBUG POSTINGS
+  <index> ON|OFF` and `FT.DEBUG PAGE <index> ON|OFF` turn their use off, to
+  compare. Along the way: a hash overwritten by `SET` now leaves the indexes
+  (a KNN query used to still return it).
 
 - **Key specs come from Valkey's command files, and from KiviDB's own.**
   The key specs that `COMMAND INFO` and `COMMAND DOCS` report, and that a
@@ -862,14 +651,6 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   `lazyfree-lazy-eviction` too, and for `busy-reply-threshold` in a build
   without Lua. `CONFIG GET *` lists `latency-monitor-threshold`.
 
-- **The image has no OpenSSL.** Its base is now distroless's `base-nossl`
-  with `libgcc_s` copied in, rather than `cc`, which ships `libssl3`. KiviDB
-  never loaded it (TLS is rustls, built into the binary), but image scanners
-  reported its CVEs all the same: 12 of the 15 Trivy reported in October
-  2026, one of them high. The 3 left are Debian's `tzdata` and
-  `ca-certificates` updates, neither of which the binary reads, and go with
-  the next distroless build.
-
 - **String values take less memory (#113).** A value's block no longer
   carries the system allocator's header and rounding: 10 million keys of
   100 bytes take 1753 MB instead of 1898 MB (184 bytes a key instead of
@@ -900,34 +681,586 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   `assertion failed!`, and a table is refused with
   `bad argument #2 to 'assert' (string expected, got table)`.
 
-- **`maxclients` is enforced.** It was accepted, and shown by `CONFIG GET`
-  and `INFO`, but nothing checked it. Plaintext and TLS clients now count
-  against it, TLS ones from the start of their handshake; one more is closed,
-  a plaintext one after `ERR max number of clients reached`. The default is
-  10000, as in Redis, within the open-file limit: at startup KiviDB raises
-  the soft limit (`ulimit -n`) to `maxclients` plus what the server keeps
-  for itself (32 files, or on io_uring 40 and 8 a worker) if the hard limit
-  allows, and lowers `maxclients` to fit if it does not, with a warning.
-  `CONFIG SET maxclients` refuses a value the limit cannot hold, as Redis
-  does.
-
 ### Fixed
 
-- **Search: a missing index is reported in Redis 8's words.** Every
-  command that names an index that does not exist (`FT.INFO`, `FT.SEARCH`,
-  `FT.AGGREGATE`, `FT.PROFILE`, `FT.EXPLAIN`, `FT.EXPLAINCLI`,
-  `FT.DROPINDEX`, `FT.ALTER`, `FT.ALIASADD`, `FT.ALIASUPDATE`,
-  `FT.ALIASLIST`, `FT.TAGVALS`, `FT.SPELLCHECK`, `FT.SYNUPDATE`,
-  `FT.SYNDUMP`, `FT.CURSOR`, `FT.HYBRID`) now replies
-  `SEARCH_INDEX_NOT_FOUND Index not found: <name>`, as Redis 8.10 does.
-  `FT.INFO`, `FT.SEARCH` and a few others replied `<name>: no such index`,
-  the rest `ERR no such index`. Clients that create the index when the
-  error says "not found" failed on a new database: mem0's Valkey store
-  could not start. This is a compatibility fix, but the text changes: a
-  client that looked for `no such index` must look for `Index not found`.
-  In a cluster, a node still giving the old words is understood.
-  `FT.DROPINDEX` with anything but `DD` after the name now replies
-  `SEARCH_ARG_UNRECOGNIZED Unknown argument`, as in Redis.
+- **`MIGRATE` no longer loses a write made while its keys travel (#274,
+  #295).** `MIGRATE` without `COPY` dumped its keys, sent them, waited for
+  the destination's reply and then deleted them here, holding no lock across
+  the round trip (it can wait on the network for as long as its timeout). A
+  write to a key in that time was acknowledged, then deleted with the key,
+  and the destination had the value from before it. Now, from before
+  `MIGRATE` reads a batch until the destination has confirmed it and the
+  keys are deleted here, a write to one of those keys waits, as in Redis,
+  where `MIGRATE` blocks the server for the round trip, and is then sent on
+  with `-ASK`. Writes to other keys go on. Ordinary commands do no more than
+  before: a write already looks at one flag inside the write gate, for
+  handoffs, and `MIGRATE` raises the same flag; `EXEC` looks at it too. A
+  transaction naming one of the keys is refused with `TRYAGAIN`, which
+  clients retry, since its commands run alone and cannot wait. Checkpoints
+  and full syncs wait for the round trip, each step of which is bounded by
+  `MIGRATE`'s timeout. A key that changed all the same (a script wrote a key
+  it did not declare, or the key is hash-tagged in a build with Lua and
+  `lua-parallel-scripts` on, whose writes wait behind the tag's lock
+  instead) is kept here, with its write, and `MIGRATE` answers `TRYAGAIN`
+  naming it; the copies it sent are deleted at the destination before it
+  answers, so the key is on one node only and can be moved again without
+  `REPLACE`. A key is deleted here only if it still holds what was sent,
+  value and time to live. The deletions, and their `DEL` to replicas and the
+  AOF, are one write under the write gate and the keys' write order, never
+  held across the network: a `SET` of a key right after its deletion used to
+  reach replicas before the `DEL`, which then deleted the key they should
+  have kept, and a deletion could fall inside a checkpoint's cut or after a
+  failover handoff's. And the `DEL` names the keys deleted only: it named
+  every key `MIGRATE` was given, so a key written meanwhile, or one the dump
+  had not found and a write made meanwhile, was deleted on every replica and
+  kept here. A hash field whose time ran out just as `MIGRATE` (or `DUMP`)
+  read it no longer arrives without its expiry, to live on for good:
+  `RESTORE` drops it, as loading `dump.kdb` does. `CLUSTER MIGRATION IMPORT`
+  is unchanged.
+
+- **A replica stopped in the middle of a full sync keeps its last good
+  dump.** Its shutdown saved whatever it held, which in a full sync is part
+  of the master's dataset or, with the default `repl-diskless-load`,
+  nothing: a replica stopped while loading wrote a dump with 0 keys over its
+  last good one, and its disk held no data until the next sync was done
+  (seen in a Kubernetes test). While a full sync is replacing
+  the dataset, the final save is now skipped, with a warning: `dump.kdb`
+  and its resync point stay as they were, and the next start syncs again.
+
+- **A master handed over by `CLUSTER FAILOVER` is continued by its
+  successor.** After a manual failover (the Kubernetes operator's graceful
+  handover), the old master became a replica of the promoted one and was
+  sent the whole dataset. A master that became a replica kept no record of
+  where its own stream stood, so it could only ask for everything; and the
+  replica `PING` went on during the failover's write pause, taking the old
+  master's offset past the point its replica was promoted at. A master that
+  becomes a replica now keeps where its stream stands, read with no write
+  half-way, as where its dataset stands, and the promoted replica, which
+  carries that stream on, continues it from there (as Redis does with a
+  demoted master's own stream). No replica `PING` is written while writes
+  are paused, as in Redis; expiry already waited. A write the node makes
+  of its own afterwards, or any difference in offset, still means a full
+  sync. In 1.1.x too.
+
+- **Automatic failover elects the replica with the most data, and only one
+  in step with its master (#107).** When a master failed, each of its
+  replicas waited a random half second and stood for election, however far
+  behind it was: with two replicas, the one that had read less could win,
+  and the writes only the other had were lost. A replica in the middle of a
+  full sync, holding part of the dataset or, with the default
+  `repl-diskless-load`, none of it, could take over too, and lose everything
+  it did not have. Now each replica asks the others how far they have read
+  (a new `OFFSET` bus message; a node of an older version does not answer,
+  and is not counted) and waits an extra second for each one ahead of it, as
+  Redis does. A replica stands only once it has loaded its last full sync
+  and streamed since, and its data's age counts from the last moment it was
+  streaming with all its master had sent applied: one whose data is older
+  than `cluster-node-timeout × cluster-replica-validity-factor` plus
+  `repl-ping-replica-period` does not stand, and one that has not been in
+  step with its master since it started does not stand unless the factor is
+  0, as in Redis. `cluster-replica-validity-factor` is new (default 10; `0`
+  sets no limit on the data's age), in the config file and with `CONFIG
+  SET`. The log says why a replica does not stand. A failed master's slots
+  then stay down until it comes back, or an operator fails over. The
+  election's waiting is also out of the failure detector's loop, which it
+  held up for the length of the delay.
+
+- **A full sync of a large dataset under heavy writes completes** (#305).
+  A replica reads nothing of the write stream while it receives and loads
+  the dataset, so the master queues everything written meanwhile, and it
+  dropped the replica once that queue passed
+  `repl-replica-max-backlog-bytes` (256 MB). With 3.4M keys under 100k
+  writes a second, the queue passed it before every load was done, and the
+  sync began again for as long as the writes lasted (13 syncs in our
+  soak test, none finished). A full sync now has its own bound,
+  `repl-replica-sync-max-backlog-bytes` (default 1 GB), from the cut until
+  the replica has loaded the dataset and drained its queue to a quarter of
+  `repl-replica-max-backlog-bytes`; the streaming limit holds from then
+  on. Both can be changed with `CONFIG SET` (the streaming limit could
+  not), and apply at once to the replicas attached. The master logs how far
+  each replica's queue went during its sync, and `INFO replication` shows
+  what is queued for each replica (`queued=` on its `slaveN` line). In
+  1.1.x too.
+
+- **A master stopped cleanly continues its replicas after the restart**
+  (#306). A master saves where its write stream stands at the cut of its
+  final save, and continues a replica after the restart only if the
+  replica stopped at exactly that point. It did not wait for its replicas:
+  writes and expired keys not yet delivered when the process exited left a
+  replica behind, and a replica `PING` or the `DEL` of a key that expired
+  after the cut left it ahead, so the restarted master sent it the whole
+  dataset (12 of 18 restarts in our soak test). Once no command runs,
+  the shutdown now ends the stream (no more `PING`s, no more expiry),
+  waits until every streaming replica has acknowledged all of it, and only
+  then saves. It waits at most `shutdown-timeout` seconds (Redis's name and
+  default, 10, settable with `CONFIG SET`); `SHUTDOWN NOW` and `NOSAVE` do
+  not wait. The log says which replicas have the whole stream and which do
+  not. On io_uring, a worker that accepted a connection as the shutdown
+  began no longer drops the connections it serves before the exit. In
+  1.1.x too.
+
+- **The `.rpm` package depends on `shadow-utils`.** Its pre-install script
+  makes the `kividb` user and group with `groupadd` and `useradd`, but the
+  package did not say it needed them, so on a minimal image without them
+  (`amazonlinux:2023`, for one) the install failed in that script. `dnf`
+  now installs `shadow-utils` with it.
+
+- **Hashes loaded from `dump.kdb` are deleted when their fields expire**
+  (#302, by [@ShryukGrandhi](https://github.com/ShryukGrandhi)). After a
+  restart that loaded the dump, a hash whose fields all expired later stayed
+  in the keyspace, empty: `EXISTS` 1, `HLEN` 0, counted by `DBSIZE` and
+  returned by `SCAN`, where a replica that had not restarted had deleted it.
+  The background sweep only looks at the hashes it knows to have field TTLs,
+  and it made that list before the dump was loaded. It now makes it again
+  once the data is loaded. A restart that replayed the AOF was not affected.
+  In 1.1.x too.
+
+- **A second engine in a data directory waits for the first to exit**
+  (#303). Two engines in one directory read and write the same files. One
+  started while the other was stopping, as a replacement pod can be on the
+  same volume after a forced delete, loaded the dump the other was about to
+  replace. It then compared the replication point saved beside the dump
+  with the newer dump on disk, took it for the point of what it had loaded,
+  and carried on the other one's stream with the older data: its replicas
+  dropped theirs for it, and acknowledged writes were lost. An engine now
+  holds an exclusive lock on `kividb.lock` in its data directory from
+  before it reads anything there until it exits. Another one started there
+  logs that the directory is in use and waits until it is free. And a saved
+  replication point, or a clean-exit marker, is used only if it was written
+  for the very bytes that were loaded.
+
+- **`CLUSTER DELSLOTS` removes a slot whoever owns it, and `redis-cli
+  --cluster fix` can close an interrupted reshard** (#295, with thanks to
+  [@saikishore222](https://github.com/saikishore222)). `DELSLOTS` and
+  `DELSLOTSRANGE` refused a slot another node owned (`ERR Slot 15 is owned
+  by another node`). Redis removes it from the node's own view whoever owns
+  it, and `redis-cli --cluster fix` relies on that: closing a slot left
+  open by a `redis-cli --cluster reshard` that stopped part way, it deletes
+  the slot on the node that was importing it, sets it importing from the
+  owner it picked, and moves the keys back there. On KiviDB it stopped at
+  the `DELSLOTS`, and the keys already moved stayed on a node no client was
+  sent to for them: acknowledged writes read as missing until the slot was
+  closed by hand. Now any assigned slot is removed, with its `IMPORTING`
+  state; only one that is unassigned already is refused
+  (`ERR Slot N is already unassigned`), and a command with one such slot
+  changes nothing; for five seconds after, a peer's claim does not take
+  the slot back, so the `ADDSLOTS` fix sends next in the same transaction
+  finds it free. And `MIGRATE` runs on a node importing the slot too, as in Redis
+  while a slot is open: fix moves the keys back with it, and was sent
+  `MOVED` instead.
+
+- **A slot moved by `redis-cli --cluster reshard` is no longer lost.** Now
+  and then, after a reshard in one direction and then the other, a slot
+  ended up served by no node, and the next reshard or `--cluster fix`
+  stopped at `Not all 16384 slots are covered`. Reshard gives a slot to its
+  target with `SETSLOT NODE`, then tells the source; a heartbeat the source
+  sent just before still claimed the slot, at an epoch the target's could
+  be below, and the target gave the slot up to it. A slot assigned with
+  `SETSLOT NODE`, or removed with `DELSLOTS`, now keeps that assignment for
+  five seconds whatever a peer claims.
+
+- **`DEBUG DIGEST-VALUE` returns a digest of each value**, as Redis does:
+  40 hex digits a key, the same for equal values on any node, and 40 zeros
+  for a key that is not there. It answered `OK`, and `redis-cli --cluster
+  fix`, which compares the two copies of a key it finds on two nodes with
+  it, failed an assertion and stopped half-way.
+
+- **`MSET` and `MSETNX` of keys in many shards no longer queue behind
+  each other: more than 3x faster than 1.1.3 at 1,200 connections.** Each took the locks
+  of its keys' shards one after another, waiting for each while it held
+  those it already had, and the next `MSET` that wanted one of those waited
+  behind it in turn: 150K-170K `MSET`s of 10 keys a second on 32 vCPUs, with the
+  server 30% busy and the other clients of a waiting thread held up too. An
+  `MSET` now never waits for a shard while it holds another: it lets go,
+  waits for the busy one alone (spinning up to 50 µs first) and tries again.
+  And while nothing reads the write stream, it holds its keys' write order
+  shared, as `SET` does. 579K `MSET`s of 10 keys a second, p99 9.7 → 2.8 ms;
+  `GET`s beside them 158K → 451K a second. Each `MSET` still writes all its
+  keys at once, so nothing sees part of one. Single-key commands are
+  unchanged.
+
+- **`EXPIREAT` with a negative timestamp deletes the key,** as Redis does
+  (by [@huong8373tt-beep](https://github.com/huong8373tt-beep)). It was
+  refused with `ERR invalid expire time`; a time before the epoch is a time
+  that has passed, and goes through the same condition check (`NX`, `XX`,
+  `GT`, `LT`) and deletion as any other.
+
+- **A key that expired while the server was down stays gone after AOF
+  replay.** Replaying a time to live that had passed by then (`EXPIRE`,
+  `PEXPIREAT` and the rest) deleted the key there and then, and a write to
+  it later in the log made a new one, with no time to live and only the
+  writes after it: `HSET h f0 v0`, `PEXPIRE h 2000`, `HSET h f1 v1`, a
+  crash, and a restart three seconds later left `h` as `{f1}` for good. As
+  in Redis, a deadline replayed after it has passed now sets the key's time,
+  the writes after it go to that key, and it expires once loading is done.
+  Field deadlines (`HPEXPIRE`, `HSETEX`, `HGETEX`) the same. In 1.1.x too.
+
+- **`INFO stats` counts rejected connections** (#254, by
+  [@de-ep](https://github.com/de-ep)). `rejected_connections` stayed at 0:
+  a connection turned away at `maxclients` was refused and logged, but not
+  counted.
+
+- **KiviDB builds on FreeBSD again** (#288, reported by
+  [@osokin](https://github.com/osokin), who maintains the FreeBSD port).
+  Raising the open-file limit used `div_ceil` on `rlim_t`, which is
+  unsigned on Linux and macOS but signed on FreeBSD, where `div_ceil` is
+  not stable, so 1.1.3 did not compile there. Two more came out of the
+  same difference: an open-file limit at or below what the server keeps
+  for itself left room for every client instead of none, and
+  `used_memory_rss` was 0 (`INFO memory`, `MEMORY STATS`). Checked on
+  FreeBSD 14.4 with every feature set.
+
+- **The ACL checks the keys `SORT`, `GEORADIUS` and `XREADGROUP` use.**
+  `SORT` writes to the destination of its last `STORE`, and `GEORADIUS` and
+  `GEORADIUSBYMEMBER` to that of their last `STORE` or `STOREDIST`; the
+  first was the one checked. An `XREADGROUP` whose group or consumer was
+  named `STREAMS` had the wrong arguments taken for its streams.
+
+- **A `MIGRATE` no longer stops a `--io-model tokio` server's other
+  clients while it waits.** One of tokio's worker threads at a time polls
+  every socket; a `MIGRATE` that arrived on an idle connection ran on that
+  worker, and while it waited for the destination nothing else was read,
+  accepted or timed, on any connection. It now hands that worker's place
+  to another thread first. io_uring, the default on Linux, was not affected.
+  In 1.1.x too.
+
+- **A server whose AOF ends in zeros after a power loss starts again.**
+  A power loss can leave the log's last, unsynced, writes on disk as zeros:
+  the file system recorded the file's new length before its data (ext4
+  does). Recovery read the zeros as a damaged record and refused to start,
+  where the cut-off tail of a record is loaded up to it. Zeros to the end
+  of the file are now the same: the whole records before them are loaded
+  and the file is cut where they start. Zeros with records after them are
+  still damage, and the server still stops on them. In 1.1.x too.
+
+- **Cluster nodes that move together find each other again.** A node
+  took a peer's address from the peer itself, or from another node's
+  gossip only when it had none. Two nodes restarted at once with new
+  addresses, as pods rescheduled together are, each kept dialling the
+  other's old one and never heard from the other directly: each saw the
+  other as failed for ever. After a rolling restart of an operator-run
+  sharded cluster, a shard answered `CLUSTERDOWN` for seven minutes, until
+  a manual `CLUSTER MEET`. A node now takes the address another node
+  gossips for a peer it cannot reach, or has not heard from since it
+  started, when that node can reach it; two masters moved together find
+  each other in 2 s, and a healthy one is no longer failed over when the
+  restart grace ends. In 1.1.x too.
+
+- **Writes during a snapshot no longer evict keys that fit under
+  `maxmemory` (#284).** A snapshot (`BGSAVE`, `SAVE`, an AOF rewrite, a
+  replica's full sync, a backup) captures the dataset at one instant and
+  writes it out after, holding each string value until it has written it.
+  A key written over, deleted or evicted meanwhile stayed allocated until
+  then, and was counted against `maxmemory`: each write over the limit
+  evicted a key, which gave nothing back, then the next, until the
+  keyspace was nearly empty. 5,000 writes of 8 KB values over keys of a
+  14,000-key dataset under a 128 MB limit, during a `BGSAVE`, left 3,324
+  keys; during an AOF rewrite 3,744; during a full sync, which also lays
+  the whole dataset out in memory for the replica, 1,121 and refused writes
+  with `OOM`. The values a snapshot still holds, what it lays out in memory
+  (its encoded collections, a full sync's or a backup's image) and what is
+  queued for replicas are now not counted against `maxmemory`, as in Redis,
+  where they are the forked child's memory or the replicas' output buffers;
+  `INFO memory` reports them as `mem_not_counted_for_evict`, which was
+  always 0. The same writes now evict nothing. Memory can exceed
+  `maxmemory` by that much while the snapshot is written, as a Redis
+  process and its child do together; the snapshot now lets each value go as
+  soon as it has written it, rather than all of them at the end. Should
+  evicting keys still give no memory back, eviction now stops once keys
+  taking twice what memory was over the limit by, and a megabyte more, have
+  gone with memory use no lower, and writes are refused with `OOM` until it
+  comes down, rather than every key going. And with `--io-model tokio` a
+  full sync's payload is no longer copied into the replica connection's
+  buffer, which kept its size, and `used_memory` over `maxmemory`, for as
+  long as the replica stayed connected. 1.1 has the same fault.
+  (Reported and analysed by @Parikalp-Bhardwaj.)
+
+- **A slot migration's handoff holds writes until the source knows where
+  the slots are (#278).** At the end of a `CLUSTER MIGRATION`, the source
+  paused writes for at most `cluster-slot-migration-write-pause-timeout`
+  (10 s), and the pause ran out by itself. If sending the last writes and
+  the destination's `TAKEOVER` took longer than that, or the `TAKEOVER`'s
+  answer was lost, the source took writes for the moving slots again
+  without sending them on; when the destination took the slots after all,
+  the source deleted its keys, and the writes it had acknowledged since
+  were lost. Now writes stay held until the source knows: the destination
+  answers the `TAKEOVER`, its claim of the slots arrives, or, asked every
+  200 ms over a connection of its own, it says it took the slots, or
+  promises that the attempt will not take them (then the source gives the
+  attempt up, takes writes again and the destination tries again; a
+  `TAKEOVER` it gets later, of that attempt or an earlier one, is
+  refused). The timeout is now how long the source waits for the answer
+  before it asks. A destination that is down cannot answer: the source
+  lets writes go without its answer only once the cluster has marked it
+  FAIL and no claim of the slots has arrived, and then claims the slots
+  again at an epoch above any the destination can have taken them at, so
+  that the destination gives them up if it comes back with them. Why
+  writes are still held is logged every 5 s, and `CLIENT UNPAUSE` lets
+  them go, as it does a master's hold for a manual failover (#242). A
+  handoff whose `TAKEOVER` is answered in time pauses writes as long as
+  before.
+
+- **A checkpoint no longer stalls writes on a slow disk (#243).** With the
+  AOF on, the checkpoint after a bulk load held `SET`s back for seconds at a
+  time on a slow cloud disk. Two things made every write wait for the disk.
+  The snapshot went into the page cache at memory speed and was synced at
+  the end: a gigabyte queued at the disk at once, with the file system's
+  journal behind it, and every append to the AOF needs the journal now and
+  then (its size and time). And the log was turned over, old log synced,
+  new log synced, directory synced, by whichever thread reached the
+  turn-over, holding the log's lock. The snapshot now
+  goes to the disk 8 MB at a time, never more than two pieces queued, and
+  leaves the page cache once it is there; the new log is written before the
+  turn-over, and the old log and the directory are synced after it, by the
+  checkpoint, with the lock let go (the new log is not synced before the old
+  one is, so that a power failure cannot keep newer writes and lose older
+  ones). On a 150 MB/s Azure Standard SSD, during a checkpoint of 5 million
+  keys under a steady `SET` load, the longest `SET` went from 2.5 s to under
+  0.4 s. On a 100 MB/s Standard HDD, after a bulk load of 2.5 million `SET`s,
+  it went from 5 s to under 1 s. On a slow disk under load a checkpoint now takes longer (it
+  leaves the AOF its share of the disk); on a fast disk `SET`s and `GET`s a
+  second are unchanged.
+
+- **Concurrent writes to one key no longer lose updates when nothing
+  observes the write stream** (#271; reported and analysed by
+  @Parikalp-Bhardwaj). With
+  the AOF off and no replica, nothing ordered two writes to the same key,
+  and a command that reads a key and writes it back under separate holds of
+  its shard's lock could lose another's write: 50 clients adding 100,000
+  distinct elements with `PFADD` ended with a different count every run.
+  The same held for `PFMERGE`, `HINCRBY`/`HINCRBYFLOAT` on a new hash,
+  `BITFIELD`, `BITOP`, `GETEX`, `RESTORE`, `RENAME`/`RENAMENX`, `COPY`,
+  `SMOVE`, the `*STORE` commands and `SORT ... STORE` with their keys in one
+  shard, and `SADD`, `HSET`, `ZADD`, `GEOADD`, `VADD` and `LPUSHX` racing a
+  command that emptied and removed the key. Every write from a client now
+  holds the order of its keys, as it already did with the AOF on or a
+  replica attached; so do the active and lazy expiry of keys, eviction and
+  the expiry of hash fields. It still propagates nothing unless something
+  is listening. `SET`, `INCR` and the like, `LPUSH`/`RPUSH`, `SADD`, `ZADD`,
+  `ZINCRBY`, `PFADD` and (with no search index defined) `HSET`, `HMSET`,
+  `HSETNX`, `HINCRBY` and `HINCRBYFLOAT` read and write their one key under
+  one hold of its shard's lock, and take its order shared while nothing is
+  listening, so one hot key still takes as many of them a second as before;
+  `SADD`, `HSET`, `ZADD` and their kin now write the collection with its
+  shard held, and make a new one with its members rather than empty, and
+  `PFADD` writes its registers back only over the value it read them from.
+- **A replica no longer keeps a key its master deleted at an `EXPIRE` or
+  `PEXPIRE`.** `PEXPIRE k 1` read the clock twice, for the key's new time
+  and to see whether that time had already come, and about once in 650
+  calls a millisecond began in between. The master then deleted the key at
+  once, answered `1`, and sent nothing to its replicas or its AOF: they kept
+  the key for good (31 keys of 20,000 in a test; under load, a key written
+  to again afterwards held a different value on the replica). As in Redis,
+  only a negative time to live now deletes the key at once; a positive one
+  that has already run out by then expires the key as any other, with its
+  `DEL`. `EXPIRE` had the same race, over a whole second.
+- **`EXPIRE`, `PEXPIRE`, `EXPIREAT` and `PEXPIREAT` check `NX`, `XX`, `GT`
+  and `LT` before a time that deletes the key (#270).** A time to live of
+  `0`, or a moment that had already come, deleted the key and answered `1`
+  whatever the condition said: `EXPIRE k 0 NX` deleted a key that had a time
+  to live. As in Redis 8.10, the condition is now weighed first (no time to
+  live counting as an infinite one); if it fails, the command answers `0`,
+  leaves the key and its time to live as they were, and sends nothing to
+  replicas or the AOF. `EXPIREAT` and `PEXPIREAT` read only their first
+  option, so `NX XX` or `GT LT` went through with the second one ignored,
+  and an unknown option was refused only after the key had been deleted;
+  they now read every option and refuse these with Redis's errors before
+  doing anything. They are now sent, as `EXPIRE` is, as the `PEXPIREAT` or
+  `DEL` they came to. (Reported by @Parikalp-Bhardwaj.)
+- **`CONFIG GET threads` gives the `--threads` value.** It gave an empty
+  reply. `CONFIG SET` with a name and no value to pair with it
+  (`CONFIG SET replicaof <host> <port>`, say) now gets Redis 8.10's
+  `ERR syntax error` instead of a wrong-number-of-arguments error (#257).
+
+- **A replica no longer keeps a key its master moved, or found expired
+  while moving.** A `MOVE` that found its key past its time answered `0`
+  but was still sent to replicas and the AOF, and the replica, which never
+  takes a key as expired while it applies its master's stream, moved the
+  key. It then kept it for good, in the database it moved it to, and later
+  kept a new key of the same name in the first. A `MOVE` or `COPY` that
+  moved nothing is no longer propagated, as in Redis. And a key that
+  expired in the database it was moved to could have its `DEL` sent before
+  the `MOVE`: `MOVE` and `COPY ... DB` are now ordered against the key in
+  both databases.
+
+- **`expired` comes before the event of a write that makes the key
+  again.** When the background sweep, or another client's read, deleted a
+  key past its time, its `expired` notification was published after the
+  key's shard was let go of. A write that came in between and made the key
+  anew (`INCR` on a counter whose window ran out, say) could have its own
+  event (`incrby`) published first, which Redis never does. `expired` is now
+  published before the shard is let go of.
+
+- **A key past its time is not counted as used.** Under an LRU or LFU
+  policy, `MGET`, a `GET` on a replica, a command refused with an error,
+  a key a command names twice, and a script's commands could bring the
+  idle time or the count of a key already past its time up to date, as if
+  it had been used: the lookup wrote the key's use before its deadline was
+  looked at. Only a live key's use is written now, and `GET` looks at the
+  time once.
+
+- **`lazyfree-lazy-expire` in a config file is applied.** 1.1 accepted the
+  directive and ignored it: `CONFIG GET` still said `yes` and expired keys
+  still reached the AOF and replicas as `UNLINK` (#232). It is now applied,
+  and the startup log does not call it, `latency-tracking` or
+  `latency-tracking-info-percentiles` settings without effect.
+  `lazyfree-lazy-expire`, the other `lazyfree-*` settings and
+  `latency-tracking` take only `yes` or `no`, in a config file and in
+  `CONFIG SET`, as in Redis; any value was taken.
+
+- **A script may not run what Redis does not let a script run.** Redis
+  refuses, from `EVAL` and `FCALL`, the commands its command table flags
+  `noscript`, with "This Redis command is not allowed from script":
+  `SAVE`, `BGSAVE`, `BGREWRITEAOF`, `SHUTDOWN`, `CONFIG GET` / `SET` /
+  `REWRITE`, `ACL` and `CLIENT` subcommands, `MULTI`, `EXEC`, `WATCH`, the
+  subscribe commands, `MONITOR`, `REPLICAOF`, `DEBUG`, `HELLO`, `EVAL`
+  itself and others. KiviDB refused only `CLUSTER`, `HOTKEYS` and `BACKUP`,
+  and ran the rest. A `SAVE` in a script on a replica could hang it: the
+  script held a slot of the write gate and waited for the replication
+  applier, which waited for a backup's or a full sync's cut, which waited
+  for the gate. The list is now Redis 8.10's. Of `CLUSTER`, a script may
+  run what only reads (`INFO`, `NODES`, `SLOTS`, `KEYSLOT`, ...), as in
+  Redis, but not what changes the cluster, which Redis allows: a slot's
+  handoff here waits for the writes in flight, the script among them.
+  `HOTKEYS HELP`, `BACKUP LIST` and `BACKUP STATUS` run from a script, as in
+  Redis.
+
+- **A key a command leaves where it was keeps its LFU count.** `GETDEL` of
+  a key of another type took the key out, saw its type, and put it back as
+  a new key: its time to live was kept, but under an LFU policy its access
+  count started again at 5 (#221). `MOVE` to a database that already has
+  the key, and `RENAME` of a key to itself, did the same. Each now looks
+  at the key and leaves it as it is, counting the lookup as a use, as
+  Redis does. A key `MOVE` does move keeps its count and its idle time, as
+  its object does in Redis; it used to start afresh.
+
+- **HNSW vectors written after a checkpoint are found again after a crash.**
+  A checkpoint (`BGREWRITEAOF`, the automatic AOF rewrite, or `SAVE` /
+  `BGSAVE` with the AOF on) writes `dump.kdb` with the HNSW graphs, and
+  starts the AOF over with the writes made after it. A server killed after
+  that (`kill -9`, a crash, a lost machine) came back with the graphs as the
+  snapshot had them: the vectors written since the checkpoint were in the
+  hashes and counted in `num_docs`, but no KNN query found them (none of
+  1,000 in a test), and a vector deleted or overwritten since was still
+  found under its key. A clean shutdown, which writes a fresh snapshot, did
+  not lose them. The graph from the snapshot is now brought up to date with
+  the keys at startup: vectors it holds unchanged stay as they are, the
+  others are inserted, and those of deleted keys or fields are taken out.
+  FLAT, TEXT, TAG and NUMERIC fields were rebuilt from the keys already and
+  were right. 1.1.2 and 1.1.3 have the bug; files they wrote load correctly.
+
+- **`CLUSTER FAILOVER` under writes no longer waits for its master's pause
+  to run out.** With the tokio I/O model (always, for cluster nodes), a
+  write that arrived just as its master began the handover waited for it on
+  its worker thread, and the task that thread would have run next waited
+  with it: no other thread takes that one (tokio's LIFO slot). When it was
+  the replication hub, which the handover waits on to know that everything
+  has been sent to the replica, the master answered only when its pause on
+  writes ran out: the failover took the whole pause, with writes held all
+  that time, or, now that a replica has 5 s to take over, was given up. Seen
+  as an intermittent CI failure of
+  `manual_failover_swaps_roles_without_losing_acknowledged_writes`. Nothing
+  was lost: writes went on at the master. The write now hands the thread's
+  other tasks to another thread while it waits.
+- **A replica of a KiviDB master older than 1.1.3 no longer keeps the keys
+  that master expires.** Since 1.1.3 a replica does not expire keys by its
+  own clock: it waits for the `DEL` (or `UNLINK`) its master sends for each
+  key it expires, so that the two cannot come apart. A 1.1.2 or older master
+  sends none, so a newer replica following it (as in the recommended
+  upgrade order, replicas first) kept every key the master expired: unseen
+  by reads, but in memory, and still there after the master was upgraded
+  if the replica went on by a partial resync. Ten keys of `PX 1000` left a
+  1.1.2 master at one key and its replica at eleven, for good. A replica now
+  asks its master which release it is (it already did, for `FT.DROPINDEX
+  DD`): under a master that sends no deletions (KiviDB 1.1.2 and before) it expires keys
+  itself, deleting them locally and propagating nothing, as every replica
+  did before 1.1.3. A master now says in `INFO server` that it sends them
+  (`kividb_expired_keys_propagated:1`); 1.1.3 and later 1.1 releases are
+  known by their version; a master that is not KiviDB (Redis, Valkey) sends
+  them; and one whose `INFO` cannot be read (refused to the replication user
+  by an ACL, say) is taken to send them, as 1.1.3 took every master: a
+  replica that waits for deletions that never come keeps keys that read as
+  gone, while one that also deletes keys under a master that sends them can
+  come apart from it. And when a replica is continued by a master that
+  sends deletions (a partial resync) while its dataset may hold keys left
+  by one that did not (it has followed such a master, or loaded its dataset
+  at startup), it first deletes the keys whose time ended before that
+  master started, before applying anything of its stream; a key that
+  expired later is that master's to delete. Only the replica's own clock is
+  read, against the master's `uptime_in_seconds`. Under a master that sends
+  deletions nothing changes: no key expires while a dataset is loaded or
+  the master's stream applied, and the replica deletes none itself.
+  Fixes #231.
+
+- **`FT.DROPINDEX index DD` deletes the documents a batch at a time, and
+  only documents of the index (#275).** The documents are deleted 256 at a
+  time, each batch a write of its own sent to replicas and the AOF as one
+  `DEL`, so an index of millions of documents does not hold up a replica's
+  full sync, a checkpoint, or writes to other keys while it goes: about 3
+  seconds a million documents. Each document leaves the index as it goes,
+  and the index itself goes last, so a `DD` cut short can be run again; it
+  went first. The documents were picked before any was deleted, and whatever
+  a key held by then was deleted: a key written meanwhile as a string, or as
+  a hash under an `ON JSON` index, went too, where run after that write `DD`
+  would have kept it. `DD` now takes each document's write order, and
+  deletes a key only if it is still a document of the index, deciding under
+  its shard's lock. As in 1.1.3, replicas and the AOF get the `DEL`s and
+  then the drop without `DD`, for HASH and JSON indexes and for an index in
+  any database (its `DEL`s are sent in it); a replica writes the same to its
+  own AOF. A `DD` sent by a master of 1.1.2 or older is run as that master
+  ran it, keeping the documents (the replica asks its master which release
+  it is), and so is a `DD` found in an AOF: nothing in the file says which
+  release wrote it, and keeping loses no data. Redis sends a `DEL` per
+  document and the drop as `_FT._DROPINDEXIFX … _FORCEKEEPDOCS`, all inside
+  `MULTI`/`EXEC`; KiviDB sends `FT.DROPINDEX index`, which a replica of an
+  older release also understands, and no `MULTI`, which for a large index
+  would be one transaction of millions of commands.
+
+- **`FT.AGGREGATE … ADDSCORES` shows the score in every row (#234).** As
+  in Redis 8.10, each row now starts with `__score`, whatever else the
+  command loads, sorts by or computes. It showed only where a `LOAD` or a
+  `SORTBY` named `@__score`, and a plain `ADDSCORES` gave rows with no
+  fields. A `GROUPBY`'s rows have no score of their own, as before.
+  `FT.EXPLAIN` writes `NOT{`, `OPTIONAL{` and `<empty>` as Redis does
+  (it wrote `NOT {`, `OPTIONAL {` and `<EMPTY>`), `FT.EXPLAINCLI` ends
+  with Redis's empty last line, and `FT.DEBUG HELP` lists the subcommands
+  instead of answering that it is not one. A query word shorter than
+  `search-min-stem-len` is shown, and looked for, with its stems:
+  the length decides which words of a document are indexed with a stem,
+  not what a query looks for, in Redis as here.
+
+- **`VADD` refuses what it does not know (#235).** A `DISTANCE` it did not
+  know was taken as COSINE, and an option it did not know, or one missing
+  its value, was skipped. Now, as Redis 8.10 answers: `ERR invalid option
+  after element`; `ERR invalid M` for an `M` outside 4 to 4096 and `ERR
+  invalid EF` for an `EF` outside 1 to 1,000,000 (they were not checked);
+  and `ERR invalid vector specification` for a vector given wrong, which
+  includes `VALUES 0` and a NaN, both of which used to make a set; a
+  vector of another dimension than the set's is refused in Redis's words
+  (`ERR Vector dimension mismatch - got 3 but set has 2`).
+  `DISTANCE COSINE | L2 | IP`, before the vector or after the element, is
+  KiviDB's own: Redis 8.10's vector sets are cosine only and refuse the
+  word. An unknown value is `ERR invalid DISTANCE: use COSINE, L2 or IP`,
+  and one other than an existing set's is `ERR asked distance mismatch
+  with existing vector set`, as Redis refuses a quantization the set was
+  not made with (it was ignored; leaving `DISTANCE` out still means the
+  set's own).
+
+- **An index's walks over its documents are ordered against writes to
+  them (#275).** `FT.ALTER`'s backfill of the fields it adds (vector, TEXT,
+  TAG and NUMERIC) read each document as it found it and indexed that, and
+  a write to the document meanwhile, which had indexed what it wrote, could
+  be overwritten in the index by the older copy: a search then found the
+  document by its old vector, words or tags until its next write. A hash
+  or JSON document is changed in place, under its own lock, which a walk
+  holding its shard's lock does not keep out. `FT.CREATE` looked through
+  the documents before it registered the index, so a document written in
+  between was in no index until its next write. Now `FT.CREATE` registers
+  the index first, and every walk takes each document's write order, reads
+  it as it is then and indexes that: a write falls before the read or after
+  the indexing, and indexes the document itself. (Every write now holds its
+  keys' order: see #271.)
+
 - **After a shutdown, the port no longer takes connections nobody answers.**
   On Linux with io_uring (the default), the server's port went on accepting
   connections for a moment after the process had exited, until the kernel
@@ -965,96 +1298,17 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   past its time to live that nothing had deleted yet (the expiry cycle runs
   every 100 ms) was still counted and returned by `FT.SEARCH` and
   `FT.AGGREGATE`. It is no document now, as a read of it finds.
-- **A filtered vector search that walks the graph stops at `TIMEOUT`.**
-  With `HYBRID_POLICY BATCHES`, or under the default policy when a filter
-  matches many documents, a filtered KNN query on an HNSW index searched the
-  graph without looking at the clock: with a filter that let few documents
-  through, the search could walk the whole graph and take far longer than
-  the query's `TIMEOUT`. It now stops when the time is up, like the other
-  ways a filtered query is answered. Under `ON_TIMEOUT RETURN`, the default,
-  the reply holds the nearest documents found so far, with the timeout
-  warning in RESP3; under `ON_TIMEOUT FAIL` it is the error `Timeout limit
-  was reached`.
-
-- **Under `maxmemory`, the process holds about what it is allowed (#202).**
-  A server at its limit evicts a key for every key it writes, and the room a
-  key left in a slab of values was not used again until a quarter of that
-  slab was free: the slabs settled between three quarters full and full,
-  and the process held well over its `maxmemory`. One server thread, a
-  1 GiB limit, `allkeys-lfu`, 2 million keys of 1 KB read at random and
-  written on a miss: 1,204 MiB resident at its peak, 165 MiB of it free
-  space inside slabs; Redis 8.10 held 1,047 MiB. Near the limit (within an
-  eighth of it) a slab is now used again once a 64th of it is free: the
-  same run peaks at 1,039 MiB, 1.5% over the limit, with the same hit rate
-  and throughput. With values of 100 bytes to 16 KB and one request in ten
-  a `DEL`, the peak went from 1,112 to 1,072 MiB (Redis 1,063). Away from
-  the limit the slabs are used again at a quarter free, as before, which
-  keeps eight threads overwriting small values from contending. Nothing in
-  `INFO memory` changes meaning: `used_memory` is still what was allocated
-  (a value's block counted at its size class), `used_memory_rss` what the
-  kernel has given the process, `mem_fragmentation_ratio` the one over the
-  other, and eviction is still measured against `used_memory`; what is new
-  is that the difference between them stays small at the limit.
-
-- **An index rebuilt after an AOF replay held one vector of each HNSW
-  field.** At startup from an append-only file without a snapshot preamble,
-  the background pass that rebuilds the indexes skipped every vector after
-  the first: it asked, for each document, whether the graph had come with a
-  snapshot, and after the first insert it had vectors. A KNN query then
-  found one document. The question is now asked once per field, before the
-  pass. The bug was there since 1.0.
-
-- **On io_uring, `CONFIG SET port` opens the plaintext port, and `port 0`
-  closes it.** On the io_uring I/O model, the default on Linux, `CONFIG SET
-  port` was refused with `Unable to listen on this port: Address already in
-  use` for any port, also one nothing had used, and on a server started with
-  `--port 0`: the check that the port is free was made again before each
-  worker's socket, and the first of them made the port look taken. And
-  `CONFIG SET port 0` answered OK but left the sockets listening: each went
-  only when a connection woke its accept, and that connection was accepted
-  and never answered. Now the port is opened with a socket for each worker,
-  set as at startup, before the reply; `port 0`, or a move, shuts the old
-  sockets down before the reply, so a connection that comes after it is
-  refused, and one accepted just before is served. Connections already open
-  stay up. The tokio I/O model was not affected, nor was `tls-port`. Moving
-  the port on io_uring has failed this way since it came in 1.1.1; `port 0`
-  is new in 1.2.0. Reported by KiviDB Cloud.
-- **A replica no longer stops receiving writes after a partial resync to a
-  promoted master, while both sides report it healthy.** A replica that is
-  promoted (`CLUSTER FAILOVER`, `REPLICAOF NO ONE`) while clients write to
-  it had its old replication session notice the promotion up to 200 ms
-  later, and that session then wrote its last position over the new
-  master's offset. The writes of that moment were in the backlog, and
-  reached the replicas continued from it, but the offset no longer counted
-  them. The next full sync restarted the backlog at the shorter offset
-  (`Backlog restarted at offset X (it ended at X+N)`), and a replica that
-  had been continued before it and was later restarted was sent the stream
-  from N bytes too far on, in the middle of a command. It applied nothing
-  from then on, and kept acknowledging the offset it was stuck at:
-  `master_link_status:up`, `state=online`, `lag=0`, its offset and DBSIZE
-  frozen. Now a session that has been superseded neither applies what it
-  read after the promotion nor touches the offset. As safeguards, a master
-  refuses to continue a replica from a position where no command begins,
-  and if its offset and the stream its replicas were sent ever come apart,
-  it disconnects them and takes a new replication id, so that each resyncs
-  in full; and a replica whose stream does not read as commands resyncs in
-  full instead of waiting. The same overwrite let a replica re-pointed with
-  `REPLICAOF` apply a few writes of its old master. Found by a Kubernetes
-  test of 1.2.0-rc2: 4 of 7 partial resyncs to masters promoted by a
-  `CLUSTER FAILOVER` froze, about 150,000 keys behind.
-
-- **A master drops a replica that has gone silent, after `repl-timeout`,
-  as Redis does.** A replica whose host went away without closing the
-  connection (a terminated VM, a lost network path, a paused container)
-  stayed in `INFO replication` as `state=online`, its lag growing, and was
-  counted in `connected_slaves` until the master restarted. Now a replica
-  that is online and sends no `REPLCONF ACK` for `repl-timeout` seconds (60
-  by default) is disconnected, with `Replication: disconnecting timedout
-  replica <ip>:<port>` in the log, over plaintext and TLS alike.
-  `min-replicas-to-write` and `WAIT` were not misled: they already went by
-  each replica's last acknowledgement. Not new in 1.2.0. Reported by KiviDB
-  Cloud.
-
+- **On io_uring, `CONFIG SET port` opens the plaintext port.** On the
+  io_uring I/O model, the default on Linux, `CONFIG SET port` was refused
+  with `Unable to listen on this port: Address already in use` for any port,
+  also one nothing had used: the check that the port is free was made again
+  before each worker's socket, and the first of them made the port look
+  taken. Now the port is opened with a socket for each worker, set as at
+  startup, before the reply; a move shuts the old sockets down before the
+  reply, so a connection that comes after it is refused, and one accepted
+  just before is served. Connections already open stay up. The tokio I/O
+  model was not affected, nor was `tls-port`. Moving the port on io_uring
+  has failed this way since it came in 1.1.1. Reported by KiviDB Cloud.
 - **A graceful shutdown no longer loses writes it acknowledged.** On SIGTERM
   or `SHUTDOWN`, the server stopped accepting connections but let the ones
   already open go on running commands while it wrote its final snapshot.
@@ -1065,74 +1319,48 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   acknowledged writes. No command runs now from the start of the final
   snapshot to the exit, as in Redis; clients waiting on a reply see their
   connection close.
-- **With the AOF on, a write over TLS is answered at once again, not at
-  the next once-a-second sync.** In 1.2.0-rc1 a reply to a write waits
-  until its record is in the AOF, and the connection writes the log itself
-  to get there. TLS connections queued their records on a channel of
-  their own, which a task copied onto the writer's. When the connection
-  wrote the log, its record had often not been copied yet, and nothing
-  else wrote it until the sync. A client doing SETs one after another over
-  TLS got about one reply a second. Plaintext connections, reads and
-  `aof-ack-after-write no` were not affected. TLS connections now queue on
-  the writer's channel, as plaintext ones do. Reported by KiviDB Cloud.
-
-- **A cluster node no longer stops answering for good after a `CONFIG
-  GET`.** A node could stop answering everything, `PING` included, with
-  its CPU idle, and never recover. It was seen on nodes of a sharded
-  cluster soon after a master restarted, when an operator polls every node
-  more often. `CONFIG GET` took the read lock on the node table twice in a
-  row, and still held the first when it took the second. If the cluster bus
-  asked for the write lock in between, as it does on every heartbeat, the
-  bus waited for `CONFIG GET` and `CONFIG GET` waited behind the bus. Every
-  other command that reads the cluster's topology then queued behind them,
-  until no worker thread was left to answer anything. Now `CONFIG GET`
-  takes that lock once. While looking we found and fixed a second deadlock
-  of the same kind: a bus that took in a peer's slot claims at the moment
-  an atomic slot migration finished could deadlock with it, because the two
-  took the slot table and the migration table in opposite orders. A node
-  whose bus has not run for 10 s now logs `The cluster bus has not run
-  for N s`, and logs again when the bus runs again.
+- **A cluster node no longer deadlocks when peers' slot claims arrive as an
+  atomic slot migration finishes.** The cluster bus, taking in a peer's slot
+  claims, took the migration table and then the slot table, and the end of a
+  migration took them in the other order: the two could wait on each other
+  for good. Both now take them in one order. A node whose bus has not run
+  for 10 s now logs `The cluster bus has not run for N s`, and logs again
+  when the bus runs again.
 
 - **A manual failover no longer loses writes when its election is slow
-  (#185).** `CLUSTER FAILOVER` has the master hold writes while its replica
-  catches up and wins an election. The master held them for 5 s, and the
-  replica took over whenever it won, however late that was. Each voter syncs
-  its vote to disk before it answers, and on a busy disk that can take
+  (#185, #242).** `CLUSTER FAILOVER` has the master hold writes while its
+  replica catches up and wins an election. The master held them for 5 s, and
+  the replica took over whenever it won, however late that was. Each voter
+  syncs its vote to disk before it answers, and on a busy disk that can take
   seconds. If the election took longer than 5 s, the master started taking
-  writes again, and the ones it acknowledged after the replica took over
-  and before it heard about it were lost. That is the likely cause of the
-  63 writes one CI run lost. Now
-  the master holds writes for 10 s, and the replica has 5 s from asking to
-  catch up and win, as in Redis. If it hasn't won by then it gives the
-  failover up (`Manual failover abandoned` in its log), and the master goes
-  on as before once the pause ends. `CLUSTER FAILOVER FORCE` and `TAKEOVER`
-  are unchanged.
+  writes again, and the ones it acknowledged after the replica took over and
+  before it heard about it were lost. That is the likely cause of the 63
+  writes one CI run lost. Now the replica has 5 s from asking to catch up
+  and win, as in Redis; if it hasn't won by then it gives the failover up
+  (`Manual failover abandoned` in its log). The master holds writes until it
+  hears that its replica took over (they are then redirected with `MOVED`)
+  or, once 10 s are up, until a majority of the masters and every replica of
+  it have answered a `PING` without holding it FAIL, each replica as its
+  replica: no replica can be elected without such a majority. A failover
+  given up costs that one round trip more. And under load, a master too slow
+  to answer the cluster bus could be marked FAIL while it was up, and kept
+  acknowledging writes after its replica was promoted, until it heard of the
+  promotion; those were lost (107 `INCR`s in one run). Now a master that the
+  cluster tells it has been marked FAIL, and that has a replica that could
+  take over, serves none of its slots until it has made sure of them in the
+  same way: commands on its keys are answered `-CLUSTERDOWN`, and `CLUSTER
+  INFO` says `cluster_state:fail`. Its replicas are about to stand for
+  election. With no failover, that lasts until the other nodes clear the
+  verdict, at most twice the node timeout after they reached it. Redis 8.10
+  answers `-CLUSTERDOWN` there too, by another route: its single thread
+  answers the bus and clients alike, and a master whose messages do not get
+  through sees the others as unreachable. A KiviDB master's bus runs beside
+  its clients and can fall behind them, and it hears the others, so its own
+  view of the cluster said nothing was wrong. Redis does take writes again
+  the moment a manual failover runs out of time on its master, without
+  asking whether it still owns its slots. `CLUSTER FAILOVER FORCE` and
+  `TAKEOVER` are unchanged.
 
-- **HyperLogLog values are Redis-compatible, with a rolling-upgrade path
-  (#62).** When enabled, new values use Redis's MurmurHash64A hash space and
-  are stored dense with encoding 0. Redis dense and sparse values are read and
-  counted correctly, including the overlapping 12,304-byte case, where a
-  valid canonical sparse body is
-  taken as sparse and anything else at that size stays legacy dense.
-  Writing in Redis's hash space is opt-in: `hll-write-format` defaults to
-  `legacy` and is a per-server setting, set in the config file or with `CONFIG SET`
-  (persisted by `CONFIG REWRITE`). Existing keys keep the hash space they were
-  written in; `PFADD` preserves that hash space, and `PFMERGE` gives a new
-  destination the hash space of its sources (or the configured default when it
-  has none). Legacy and Redis HLLs use different hash spaces, so `PFMERGE`
-  and multi-key `PFCOUNT` refuse a mixture rather than approximating, and a
-  corrupt sparse value is `INVALIDOBJ Corrupted HLL object detected`, not a
-  `WRONGTYPE` error. A value that is neither format is still `WRONGTYPE`.
-  `PFDEBUG GETREG` is read-only here, unlike Redis, so a diagnostic cannot
-  change a sparse value; `TODENSE` and `RESET` replicate like any other write.
-  Rolling upgrades: keep every node on `legacy` until all of them run this
-  release, then set `hll-write-format redis` on every node — a master and
-  its replicas must agree before the switch, since `PFADD` and `PFMERGE`
-  replicate as commands and each node writes new values in its own setting.
-  Values already written stay readable after the switch, and the setting is
-  in place before the AOF is replayed at startup. A KiviDB master whose
-  replicas are older, or a replica with a different setting, is not a
-  supported mixed-format deployment.
 - **A transaction, and a script, reach replicas and the AOF as one step
   (#172).** On the master a transaction ran as one step, but its writes went
   to replicas one by one, and a replica applied them one by one: a client
@@ -1171,9 +1399,9 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   - An `LMOVE` (and `RPOPLPUSH`, `BLMOVE`, `LMOVEM`) that emptied its source
     published `del` first, and the pop before the push. It now publishes in
     Redis's order: the push, the pop, then the delete.
-  - `MEMORY DOCTOR`, finding fragmentation, said to turn on `activedefrag`,
-    which is on by default. With it on, it says that it is working through
-    it, and that `MEMORY PURGE` gives memory back at once.
+  - `MEMORY DOCTOR`, finding fragmentation, said to turn on `activedefrag`.
+    With it on, as it now is by default, it says that it is working
+    through it, and that `MEMORY PURGE` gives memory back at once.
 
 - **`XREAD BLOCK` left its registration behind when it ended without data
   (#170).** A reader that timed out, was unblocked, disconnected or was
@@ -1198,9 +1426,12 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   replies, with no thread to wake. It costs writes: on a 16-core server
   with the AOF on, 20-28% of `SET`s a second with 50 clients and
   pipelined, under 10% with one client, nothing for reads. The new setting
-  `aof-ack-after-write no` (default `yes`, also `CONFIG SET`) gives 1.1.2's
+  `aof-ack-after-write no` (default `yes`, also `CONFIG SET`) gives 1.1's
   behaviour and speed back, for those who would rather lose the last few
-  writes to a kill.
+  writes to a kill. A reply waits at most 5 s for its record: when the disk
+  falls further behind than that, it is sent anyway, and a process killed
+  then can lose that write. `INFO persistence` counts those replies in
+  `aof_acks_before_write` (0 on a disk that keeps up).
 
 - **Pub/Sub: channel names are binary-safe, and a subscriber over the soft
   limit is cut off on time (#161).** `PUBLISH` refused a channel name that
@@ -1435,8 +1666,8 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   `redis.conf` carried over starts. A name that is neither KiviDB's nor
   Redis's still stops it.
 
-- **Search: scores drifted, `DD` kept the documents, KNN was ignored in
-  `FT.AGGREGATE` (#162).**
+- **Search: scores drifted, and KNN was ignored in `FT.AGGREGATE`
+  (#162).**
   - BM25 counted every write of a TEXT field as a new document, and a
     delete took nothing away: after documents came and went, a word's
     rarity and the average length were wrong, and one document's score for
@@ -1445,8 +1676,6 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
     each document's TEXT fields contribute is now kept, and taken back out
     when a field is written again or the document goes; a delete no longer
     walks every posting list to find its words.
-  - `FT.DROPINDEX index DD` deletes the documents the index covered, as in
-    Redis; they were kept.
   - A KNN clause in `FT.AGGREGATE` (`*=>[KNN 10 @v $q AS d]`) keeps the
     nearest `k` of what the filter left, exactly, with the distance under
     its name for `LOAD`, `SORTBY` or `GROUPBY`, and in a cluster the
@@ -1580,21 +1809,6 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   `Unknown option` error, where it was taken and ignored. Other settings of
   Redis's that mean nothing here are still taken, as before.
 
-- **Automatic failover could elect the replica with the least data (#107).**
-  When a master failed, each of its replicas waited a random half second and
-  stood for election, however far behind it was: with two replicas, the one
-  that had read less could win, and the writes only the other had were lost.
-  Now each replica asks the others how far they have read (a new `OFFSET`
-  bus message; a node of an older version does not answer, and is not
-  counted) and waits an extra second for each one ahead of it, as Redis
-  does. A replica whose link to its master has been down longer than
-  `cluster-node-timeout × cluster-replica-validity-factor` plus
-  `repl-ping-replica-period` does not stand at all.
-  `cluster-replica-validity-factor` is new (default 10, `0` = always stand),
-  in the config file and with `CONFIG SET`. The election's waiting is also
-  out of the failure detector's loop, which it held up for the length of the
-  delay.
-
 - **Script commands in a build without Lua** said "Lua scripting is not
   supported by KiviDB", which BullMQ and Sidekiq users read as KiviDB not
   running their queue. `EVAL`, `EVALSHA`, `SCRIPT`, `FUNCTION` and `FCALL`
@@ -1607,6 +1821,185 @@ for its message now fails with `bad argument #2 to 'assert'`. See *Changed*.
   are 64-bit on every target now, so a 32-bit server loads a 64-bit one's
   snapshot. Nothing changes on 64-bit: the same shard for every key, the
   same snapshot bytes.
+
+## [1.1.3]
+
+A patch release of 1.1.0.
+
+**Upgrading replicas and clusters: upgrade the replicas first, then their
+master.** A 1.1.3 master that restarts with no data tells its replicas not
+to copy its empty dataset. A 1.1.2 replica does not understand that: once
+the master stops waiting, after 30 seconds, it syncs and drops its data, as
+1.1.2 did. With the replicas on 1.1.3 first, nothing is lost.
+
+### Changed
+
+- **The Docker image has no OpenSSL.** Its base is now distroless's
+  `base-nossl` with `libgcc_s` copied in, rather than `cc`, which ships
+  `libssl3`. KiviDB never loaded it (TLS is rustls, built into the binary),
+  but image scanners reported its CVEs all the same.
+
+- **`maxclients` is enforced.** `CONFIG SET` took it and `CONFIG GET` gave
+  it back, but nothing checked it, and a config file that set it did not
+  start (`unknown directive 'maxclients'`). Plaintext and TLS clients now
+  count against it, TLS ones from the start of their handshake; one more is
+  closed, a plaintext one after `ERR max number of clients reached`, as in
+  Redis. It is read from the config file, `INFO clients` gives the one in
+  effect, and lowering it leaves the clients already connected. The default
+  is 10000, as in Redis, within the open-file limit: at startup KiviDB
+  raises the soft limit (`ulimit -n`) to `maxclients` plus what the server
+  keeps for itself (32 files, or on io_uring 40 and 8 a worker) if the hard
+  limit allows, and lowers `maxclients` to fit if it does not, with a
+  warning. It does not start if not even one client fits. `CONFIG SET
+  maxclients` refuses a value the limit cannot hold, as Redis does.
+
+### Fixed
+
+- **A TLS client that does not finish its handshake no longer holds up the
+  others.** Handshakes ran one at a time in the TLS listener, so a client
+  that connected to `tls-port` and sent nothing kept every TLS client after
+  it waiting. Each handshake now runs in its connection's own task, and a
+  client that has not finished it within 10 seconds is disconnected, on both
+  I/O models. A failing accept on `tls-port` (out of file descriptors, most
+  often) is retried after 50 ms, rather than at once in a loop.
+
+- **A master drops a replica that has gone silent, after `repl-timeout`,
+  as Redis does.** A replica whose host went away without closing the
+  connection (a terminated VM, a lost network path, a paused container)
+  stayed in `INFO replication` as `state=online`, its lag growing, and was
+  counted in `connected_slaves` until the master restarted. Now a replica
+  that is online and sends no `REPLCONF ACK` for `repl-timeout` seconds (60
+  by default) is disconnected, with `Replication: disconnecting timedout
+  replica <ip>:<port>` in the log, on both I/O models and over plaintext
+  and TLS alike. A replica still loading the dataset sends no ACK and is
+  not timed out. `min-replicas-to-write` and `WAIT` were not misled: they
+  already went by each replica's last acknowledgement.
+
+- **After an AOF replay, each HNSW graph held one vector.** At startup from
+  an append-only file with no snapshot in it, the pass that rebuilds the
+  indexes skipped every vector after the first: it asked, for each
+  document, whether the graph had come with a snapshot, and after the first
+  insert the graph had vectors. An unfiltered KNN query then found one
+  document, and `FT.INFO` gave `hnsw_live_count` 1. The question is now
+  asked once per field, before the pass. The bug was there since 1.0.
+
+- **A write in one database no longer touches the indexes of another.**
+  An index belongs to the database it was created in, but a hash written or
+  deleted under the same key in any other database was applied to it: an
+  `HSET` there put its vector in the index in place of the index's own
+  document's, and added its words, and a `DEL` there took the index's
+  document out, so a KNN query no longer found it. Writes, deletions, expiry
+  and eviction now go to the indexes of their own database only.
+
+- **A key deleted on being found expired leaves the search indexes.** A
+  key read after its TTL ran out is deleted by that read, but it stayed in
+  the indexes that covered it, and a KNN query went on returning it until
+  something else deleted the key. Only a key the background expiry cycle
+  removed left them.
+
+- **`RENAME` and `RENAMENX` keep the search indexes up to date.** A
+  document renamed stayed in the indexes under its old name, and a KNN
+  query went on returning that name, while the new name was in no index.
+  Now the old name leaves the indexes and the new one is indexed whole, in
+  place of whatever the indexes held for it before, so that a document
+  renamed over another is found with its own vector and words.
+
+- **A write to a key whose time to live has passed starts a new key.** A
+  key past its time stays in memory until a read finds it or the
+  background expiry cycle comes to it, and a write that came first acted on
+  it as it was: `INCR` counted on from the old value, `RPUSH` pushed onto
+  the old list, and the key kept its old time to live, so the write was
+  deleted with the key moments after it had been acknowledged. A write now
+  finds such a key gone, as in Redis: it is expired first (counted in
+  `expired_keys`, announced as `expired`), and the write makes a new key,
+  with no time to live. `SORT ... STORE` from such a key deletes the
+  destination and returns 0, as from a missing key; it left the
+  destination as it was.
+
+- **Keys expire on replicas and in the AOF as they do on the master.** The
+  master logged and propagated nothing when a key expired, so a replica,
+  and the AOF replayed at a restart, expired keys by their own clocks: a
+  replica deleted keys while its master's writes to them were still on the
+  way, and diverged from it, and a restart after a key's time replayed a
+  write made while it lived onto a missing key, which then came back with
+  no time to live, for good. Now the master writes `UNLINK` (`DEL` with
+  `lazyfree-lazy-expire no`) to its AOF and replication stream for every
+  key it expires, whether a read, a write or the expiry cycle found it.
+  Nothing expires while the AOF or a snapshot is loaded or a master's
+  stream applied, and a replica deletes no expired key itself: its clients
+  see the key as gone until the master's `DEL` arrives, as in Redis.
+- **`FT.DROPINDEX index DD` deletes the documents, as in Redis.** `DD`
+  was ignored, and the documents of the index stayed: an application that
+  reset its search data this way (mem0's `Memory.reset()`, RedisVL's
+  `SearchIndex.delete()`) found its old documents still there. The keys the
+  index covered are now deleted, for HASH and JSON indexes alike, each with
+  a `del` keyspace event. Replicas and the AOF get `DEL`s of the documents
+  deleted and then the drop without `DD`, in Redis's order and as 1.2 sends
+  them, so a replica that got only part of it still has the index to run
+  `DD` again; a `DD` already in an AOF
+  written by an earlier 1.1, or sent by such a master, still keeps the
+  documents, as that server did. In a cluster every master deletes its own.
+  Anything else after the index name is now refused with `Unknown argument`.
+
+- **Search: a missing index is reported in Redis 8's words.** Every
+  command that names an index that does not exist (`FT.INFO`, `FT.SEARCH`,
+  `FT.AGGREGATE`, `FT.PROFILE`, `FT.EXPLAIN`, `FT.EXPLAINCLI`,
+  `FT.DROPINDEX`, `FT.ALTER`, `FT.ALIASADD`, `FT.ALIASUPDATE`,
+  `FT.ALIASLIST`, `FT.TAGVALS`, `FT.SPELLCHECK`, `FT.SYNUPDATE`,
+  `FT.SYNDUMP`, `FT.CURSOR`, `FT.HYBRID`) now replies
+  `SEARCH_INDEX_NOT_FOUND Index not found: <name>`, as Redis 8.10 does.
+  `FT.INFO`, `FT.SEARCH` and a few others replied `<name>: no such index`,
+  the rest `ERR no such index`. Clients that create the index when the
+  error says "not found" failed on a new database: mem0's Valkey store
+  could not start. This is a compatibility fix, but the text changes: a
+  client that looked for `no such index` must look for `Index not found`.
+  In a cluster, a node still giving the old words is understood.
+
+- **A cluster master back without its data no longer wipes its replica.**
+  With no AOF, a shard master killed outright (no final snapshot) and back
+  inside `cluster-node-timeout` kept its node id and slots from nodes.conf
+  and served them empty, so nobody failed it over. Its replica refused the
+  empty dataset only until clients had written a key to the master, and
+  then dropped every key it held and loaded those: in a test on 1.1.2, all
+  2,000 keys written before the kill and about 230 acknowledged after it.
+  Now a master that starts with neither an AOF nor a snapshot from a clean
+  shutdown, and has replicas, serves none of its slots (`CLUSTERDOWN`;
+  `cluster_state:fail`, and `master_lost_dataset:1` in `INFO replication`
+  on that node) and answers its replica's `PSYNC` with `+LOSTDATA`. A
+  replica holding the data takes over (an election, as `CLUSTER FAILOVER
+  FORCE`) and the old master follows it; a replica holding nothing says so,
+  and once every replica has, the master serves what it has (a whole
+  cluster restarted with no persistence: no failovers). The master serves
+  anyway once every replica has failed, or when none that knows `+LOSTDATA`
+  (1.1.2 and earlier) has asked within `max(30 s, 6 node timeouts)`. And a
+  replica no longer drops its dataset for the master it followed until a
+  moment ago (within `repl-timeout`) when that master is back under a
+  replication id that does not continue its stream and holds fewer than
+  `replica-full-sync-guard-ratio` percent (50 by default) of its keys,
+  whatever the guard's mode; it takes over instead. With the AOF on, or
+  after a clean stop (`SHUTDOWN`, SIGTERM: a marker, `dump.kdb.clean`, is
+  left beside the final snapshot), restarts go on as before.
+
+- **Checkpoints run one at a time, and a crash during one loses nothing.**
+  Overlapping checkpoints (`BGREWRITEAOF`, `SAVE`, `BGSAVE`, the automatic
+  AOF rewrite, the snapshot at shutdown) and a crash while a checkpoint
+  turned the AOF over could lose acknowledged writes or bring back deleted
+  keys. Each `BGREWRITEAOF` started a checkpoint of its own beside any
+  already running: they shared a save number, the last to finish put its
+  snapshot in place even when it was the oldest (keys deleted by a
+  `FLUSHALL` in between came back, and what was written after it was
+  lost), and each removed `appendonly.aof.prev` while another still needed
+  it. A `BGREWRITEAOF` sent every few milliseconds had hundreds of them, and
+  threads, at once, holding writes back for seconds. And a crash after
+  `appendonly.aof` was moved aside and before the new log took its name
+  left no log, so the next start replayed nothing that was written since
+  the last snapshot. Now a checkpoint has the persistence files to itself
+  from the choice of its save number until it has removed the old log;
+  `BGREWRITEAOF` asked for while one runs is served by exactly one more
+  after it, on the same thread; `SAVE` from a script while a checkpoint
+  runs answers that one is in progress rather than wait for it; the new log
+  is written before the old one is moved aside; and a start that finds
+  `appendonly.aof.prev` without a log beside it replays it.
 
 ## [1.1.2]
 

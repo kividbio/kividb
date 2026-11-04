@@ -1,0 +1,11 @@
+BEGIN fx-loss1 20:54:08
+fx-loss1 cordoned all nodes but vmss000002 20:54:21
+fx-loss1 force delete fx-0-0 20:54:21
+pod "fx-0-0" force deleted from e2e namespace
+fx-loss1 new fx-0-0 on vmss000002, nodes uncordoned 20:54:28
+fx-loss1 fx-0-0 Ready 20:54:35
+lines with two engines for fx-0-0: 3
+END fx-loss1 20:55:22
+acked 134093 errors 6819 win ['20:54:22-20:54:48:6819'] slow 400 ['20:54:48.767 4472ms ok=true', '20:54:49.767 3472ms ok=true', '20:54:49.928 3311ms ok=true', '20:54:49.298 3941ms ok=true', '20:54:51.648 1591ms ok=true', '20:54:48.888 4351ms ok=true', '20:54:49.837 3402ms ok=true', '20:54:50.817 2424ms ok=true']
+errkinds Counter({'context deadline exceeded': 30})
+checked 135357 missing 0 wrong 0 readErr 0 bySec {} dbsize 138393 ex {}

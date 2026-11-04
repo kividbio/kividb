@@ -47,9 +47,32 @@ pub fn handle(ctx: &mut Ctx) -> Option<Vec<u8>> {
             ))
         }
         "populate" => Some(populate(ctx)),
+        "digest-value" => Some(digest_value(ctx)),
         "set-active-expire" | "set-disable-deny-scripts" => Some(resp_simple("OK")),
         _ => Some(resp_simple("OK")),
     }
+}
+
+/// `DEBUG DIGEST-VALUE key [key ...]`, as Redis: for each key, a digest of
+/// its value in 40 hex digits (`replication::digest::value_hex`), or 40
+/// zeros for a key that is not there. It answered `OK`, and `redis-cli
+/// --cluster fix`, which compares the two copies of a key it finds on two
+/// nodes with it, failed an assertion and stopped half-way (#295).
+fn digest_value(ctx: &mut Ctx) -> Vec<u8> {
+    const MISSING: &str = "0000000000000000000000000000000000000000";
+    let db = *ctx.selected_db;
+    let digests = ctx.cmd[2..]
+        .iter()
+        .map(|key| {
+            let hex = std::str::from_utf8(key).ok().and_then(|key| {
+                let shard = crate::store::get_shard(&ctx.store[db], key);
+                let map = crate::read_lock!(shard);
+                map.get(key).map(crate::replication::digest::value_hex)
+            });
+            resp_bulk_str(hex.as_deref().unwrap_or(MISSING))
+        })
+        .collect();
+    resp_array(digests)
 }
 
 /// `DEBUG POPULATE count [prefix] [size]`, as Redis: `count` string keys,

@@ -1,0 +1,33 @@
+AlmaLinux 9 - AppStream                          22 MB/s |  39 MB     00:01    
+AlmaLinux 9 - BaseOS                             45 MB/s |  70 MB     00:01    
+AlmaLinux 9 - Extras                             19 kB/s |  33 kB     00:01    
+Last metadata expiration check: 0:00:01 ago on Tue Nov  3 14:50:21 2026.
+Dependencies resolved.
+================================================================================
+ Package        Architecture    Version              Repository            Size
+================================================================================
+Installing:
+ kividb         aarch64         1.2.0~rc10-1         @commandline         5.8 M
+
+Transaction Summary
+================================================================================
+Install  1 Package
+
+Total size: 5.8 M
+Installed size: 14 M
+Downloading Packages:
+Running transaction check
+Transaction check succeeded.
+Running transaction test
+Transaction test succeeded.
+Running transaction
+  Preparing        :                                                        1/1 
+  Running scriptlet: kividb-1.2.0~rc10-1.aarch64                            1/1 
+  Installing       : kividb-1.2.0~rc10-1.aarch64                            1/1 
+  Running scriptlet: kividb-1.2.0~rc10-1.aarch64                            1/1 
+  Verifying        : kividb-1.2.0~rc10-1.aarch64                            1/1 
+
+Installed:
+  kividb-1.2.0~rc10-1.aarch64                                                   
+
+Complete!

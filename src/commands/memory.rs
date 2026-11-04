@@ -399,7 +399,8 @@ pub(crate) fn read_proc_status() -> (usize, usize, usize) {
         }
         (0, 0, 0)
     }
-    #[cfg(target_os = "macos")]
+    // FreeBSD's `ps` takes the same options and also reports kilobytes.
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     {
         // ps -o rss= -p <pid> returns RSS in kilobytes
         let pid = std::process::id();
@@ -421,8 +422,8 @@ pub(crate) fn read_proc_status() -> (usize, usize, usize) {
             .unwrap_or(0)
             * 1024;
 
-        // macOS exposes no peak-RSS counter, so the tracked high-water mark is
-        // all there is.
+        // Neither exposes a peak-RSS counter, so the tracked high-water mark
+        // is all there is.
         (rss, observe_peak_rss(rss), vsize)
     }
     // Windows has no /proc and no `ps`, so this used to fall through to the
@@ -490,7 +491,12 @@ pub(crate) fn read_proc_status() -> (usize, usize, usize) {
             )
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "windows"
+    )))]
     {
         (0, 0, 0)
     }

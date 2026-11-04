@@ -1,0 +1,8 @@
+redis: 2026/11/03 13:37:30 pool.go:770: redis: connection pool: failed to dial after 5 attempts: dial tcp 10.81.1.11:7002: connect: connection refused
+redis: 2026/11/03 13:37:30 pool.go:770: redis: connection pool: failed to dial after 5 attempts: dial tcp 10.81.1.11:7002: connect: connection refused
+redis: 2026/11/03 13:37:30 pool.go:770: redis: connection pool: failed to dial after 5 attempts: dial tcp 10.81.1.11:7002: connect: connection refused
+redis: 2026/11/03 13:37:30 pool.go:770: redis: connection pool: failed to dial after 5 attempts: dial tcp 10.81.1.11:7002: connect: connection refused
+redis: 2026/11/03 13:37:30 pool.go:770: redis: connection pool: failed to dial after 5 attempts: dial tcp 10.81.1.11:7002: connect: connection refused
+redis: 2026/11/03 13:37:30 pool.go:770: redis: connection pool: failed to dial after 5 attempts: dial tcp 10.81.1.11:7002: connect: connection refused
+redis: 2026/11/03 13:37:30 pool.go:770: redis: connection pool: failed to dial after 5 attempts: dial tcp 10.81.1.11:7002: connect: connection refused
+redis: 2026/11/03 13:37:30 pool.go:770: redis: connection pool: failed to dial after 5 attempts: dial tcp 10.81.1.11:7002: connect: connection refused

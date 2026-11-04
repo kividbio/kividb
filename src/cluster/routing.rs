@@ -68,6 +68,40 @@ impl RouteDecision {
     }
 }
 
+/// When and how a command was routed in a cluster: what a write compares
+/// inside the write gate, to tell whether its keys may have left since it
+/// was routed (`pause::writes_must_check`, #331). `Default` for a command
+/// that was not routed.
+#[derive(Clone, Copy, Default)]
+pub struct Routed {
+    at: u64,
+    asking: bool,
+}
+
+impl Routed {
+    /// Now, before the command's keys are looked for, for a client that had
+    /// sent `ASKING` or not.
+    #[inline]
+    pub fn now(asking: bool) -> Self {
+        Routed {
+            at: crate::pause::routes_now(),
+            asking,
+        }
+    }
+
+    /// What `pause::routes_now` said.
+    #[inline]
+    pub fn at(self) -> u64 {
+        self.at
+    }
+
+    /// Whether the client had sent `ASKING`: the command is routed again
+    /// as it was routed the first time.
+    pub fn asking(self) -> bool {
+        self.asking
+    }
+}
+
 /// Who is asking, and where the keys would be: what a routing decision made
 /// outside the command dispatcher needs.
 pub struct Caller<'a> {
@@ -130,11 +164,97 @@ pub fn queue_refusal(caller: &Caller, cmd: &[&[u8]]) -> Option<Vec<u8>> {
 /// Slots can change hands between a command being queued and EXEC, so every
 /// command is routed again; and the commands of one transaction must all
 /// address one slot, as the keys of one command must.
-pub fn exec_refusal(caller: &Caller, queue: &[Vec<Vec<u8>>]) -> Option<Vec<u8>> {
+///
+/// `routed` is set to when it was routed: inside its gates, `EXEC` asks
+/// [`exec_refusal_in_gate`] whether its keys have moved since.
+pub fn exec_refusal(
+    caller: &Caller,
+    queue: &[Vec<Vec<u8>>],
+    routed: &mut Routed,
+) -> Option<Vec<u8>> {
     if !caller.cluster.enabled {
         return None;
     }
     let asking = caller.take_asking();
+    *routed = Routed::now(asking);
+    if let Some(refusal) = route_queue(caller, queue, asking) {
+        return Some(refusal);
+    }
+    if test_stall_keys().is_some() {
+        for queued in queue {
+            let cmd: Vec<&[u8]> = queued.iter().map(|arg| arg.as_slice()).collect();
+            if let Some(first) = cmd.first() {
+                let name = String::from_utf8_lossy(first).to_ascii_uppercase();
+                stall_for_test(&name, &cmd);
+            }
+        }
+    }
+    None
+}
+
+/// Inside `EXEC`'s gates, why its transaction may not run after all, routed
+/// by [`exec_refusal`] as `routed`:
+/// - a `MIGRATE` is moving one of its keys (`key_moves`): it cannot wait for
+///   it, holding every other command back, nor run, writing a key the
+///   `MIGRATE` is about to delete. It is given up whole with `TRYAGAIN`, as
+///   Redis answers a command whose keys are being moved; the client's retry
+///   is sent on with `-ASK`;
+/// - a handoff is under way (`pause::HANDOFF`: slots migrating away, or a
+///   manual failover), and the transaction writes: it got past the pause
+///   before the pause was set. Its writes would miss what the handoff sends
+///   on, and be lost with the slots, and it cannot wait for the handoff,
+///   holding every other command back. It is given up whole with
+///   `TRYAGAIN`; the client's retry waits out the pause and is answered by
+///   whoever owns the keys then. Its commands, run inside it, did not look;
+/// - its keys have left here, or a slot has changed state, since it was
+///   routed: it is routed again, here, and answered as whoever has them now
+///   would answer it. It used to run here, on keys that had left, and make
+///   them again (#331).
+///
+/// One load when none of these is so.
+#[inline]
+pub fn exec_refusal_in_gate(
+    caller: &Caller,
+    queue: &[Vec<Vec<u8>>],
+    routed: Routed,
+) -> Option<Vec<u8>> {
+    if !crate::pause::writes_must_check(routed.at) {
+        return None;
+    }
+    exec_refusal_again(caller, queue, routed)
+}
+
+#[cold]
+#[inline(never)]
+fn exec_refusal_again(caller: &Caller, queue: &[Vec<Vec<u8>>], routed: Routed) -> Option<Vec<u8>> {
+    if crate::pause::keys_moving() && crate::key_moves::queue_names_a_moving_key(caller.db, queue) {
+        return Some(b"-TRYAGAIN a key of the transaction is being migrated\r\n".to_vec());
+    }
+    if crate::pause::handoff() && queue.iter().any(|cmd| writes(cmd)) {
+        return Some(b"-TRYAGAIN writes are paused for a handoff\r\n".to_vec());
+    }
+    // `pause::handoff` fenced, if it saw a handoff's flag: a handoff that
+    // has ended is seen to have moved the routes, on aarch64 too (#337).
+    if caller.cluster.enabled && crate::pause::routes_moved_since(routed.at) {
+        return route_queue(caller, queue, routed.asking);
+    }
+    None
+}
+
+/// Whether the queued command `cmd` writes, or may: a script may.
+fn writes(cmd: &[Vec<u8>]) -> bool {
+    cmd.first().is_some_and(|name| {
+        crate::replication::is_write_command_bytes(name)
+            || [&b"EVAL"[..], b"EVALSHA", b"FCALL"]
+                .iter()
+                .any(|script| name.eq_ignore_ascii_case(script))
+    })
+}
+
+/// Route every command of `queue`, for a client that had sent `ASKING` or
+/// not: the refusal of the first that may not run here, or of commands that
+/// address more than one slot.
+fn route_queue(caller: &Caller, queue: &[Vec<Vec<u8>>], asking: bool) -> Option<Vec<u8>> {
     let mut slot: Option<u16> = None;
     for queued in queue {
         let cmd: Vec<&[u8]> = queued.iter().map(|arg| arg.as_slice()).collect();
@@ -156,6 +276,61 @@ pub fn exec_refusal(caller: &Caller, queue: &[Vec<Vec<u8>>]) -> Option<Vec<u8>> 
         }
     }
     None
+}
+
+// ── For the tests of a command routed before its keys moved (#331) ──────────
+
+/// `KIVIDB_TEST_STALL_KEYS`, never set otherwise: keys, separated by commas.
+/// A command routed here that names one of them waits, once it has been
+/// routed, at the failpoint `routed` (`aof::failpoint`, which
+/// `KIVIDB_TEST_FAILPOINTS` has to name too), as a command can be held up
+/// between its routing and the write gate on a busy machine while a
+/// `MIGRATE` runs. So does `EXEC`, for the commands it has queued. Not
+/// `MIGRATE` itself, which moves them, nor a command run inside a
+/// transaction or a script, which was routed with it. Read once; called in
+/// cluster mode only, where it costs a load and a branch.
+pub fn stall_for_test(name: &str, cmd: &[&[u8]]) {
+    if let Some(keys) = test_stall_keys() {
+        stall_if_named(keys, name, cmd);
+    }
+}
+
+fn test_stall_keys() -> Option<&'static [Vec<u8>]> {
+    static KEYS: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
+    let keys = KEYS.get_or_init(|| {
+        std::env::var("KIVIDB_TEST_STALL_KEYS")
+            .map(|list| {
+                list.split(',')
+                    .filter(|key| !key.is_empty())
+                    .map(|key| key.as_bytes().to_vec())
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    (!keys.is_empty()).then_some(keys.as_slice())
+}
+
+#[cold]
+#[inline(never)]
+fn stall_if_named(keys: &[Vec<u8>], name: &str, cmd: &[&[u8]]) {
+    let named = key_positions(name, cmd)
+        .iter()
+        .any(|pos| keys.iter().any(|key| key.as_slice() == cmd[pos]));
+    if name == "MIGRATE" || !named || crate::write_gate::held_by_this_thread() {
+        return;
+    }
+    // Leaving the worker's other tasks to another thread of the
+    // multi-threaded runtime, as `pause::wait_out_handoff` does: the test's
+    // `MIGRATE` comes on a connection of its own.
+    let stall = || crate::aof::failpoint("routed");
+    let on_multi_thread_runtime = tokio::runtime::Handle::try_current().is_ok_and(|runtime| {
+        runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+    });
+    if on_multi_thread_runtime {
+        tokio::task::block_in_place(stall);
+    } else {
+        stall();
+    }
 }
 
 /// Compute the routing decision for a command.
@@ -252,6 +427,12 @@ pub fn route_named(
         // We are importing this slot. A client that was sent here with -ASK
         // says so with ASKING; anyone else is sent to the slot's owner.
         (_, Some(MigrationState::Importing { src_id })) => {
+            // MIGRATE runs here too, as in Redis while a slot is open:
+            // `redis-cli --cluster fix` moves the keys of a node it set
+            // importing back to the slot's owner with it (#295).
+            if name == "MIGRATE" {
+                return RouteDecision::OwnedSlot(first_slot);
+            }
             if !asking_flag {
                 return moved_to(&src_id);
             }
@@ -573,6 +754,30 @@ mod tests {
             });
             assert!(matches!(decision, RouteDecision::OwnedSlot(_)));
         }
+    }
+
+    /// On a node importing the slot, MIGRATE runs here as well, as in Redis,
+    /// for `redis-cli --cluster fix` (#295). Anything else without ASKING
+    /// is still sent to the slot's owner.
+    #[test]
+    fn migrate_runs_on_a_node_importing_the_slot() {
+        let cs = full_cluster();
+        let src = crate::cluster::generate_node_id();
+        let mut s = crate::cluster::ClusterNode::new(src, "10.0.0.6".into(), 7001, 17001);
+        s.flags |= crate::cluster::NodeFlags::MASTER;
+        cs.nodes.write().insert(src, s);
+        let slot = key_hash_slot(b"{t}a");
+        cs.slots.write()[slot as usize] = Some(src);
+        cs.set_importing(slot, src).unwrap();
+
+        let migrate = make_cmd(&[
+            "MIGRATE", "10.0.0.6", "7001", "", "0", "1000", "KEYS", "{t}a", "{t}b",
+        ]);
+        let decision = route_command(&cmd_slices(&migrate), &cs, false, false, |_| true);
+        assert!(matches!(decision, RouteDecision::OwnedSlot(_)));
+        let get = make_cmd(&["GET", "{t}a"]);
+        let decision = route_command(&cmd_slices(&get), &cs, false, false, |_| true);
+        assert!(matches!(decision, RouteDecision::Moved { .. }));
     }
 
     #[test]

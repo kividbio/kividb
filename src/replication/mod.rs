@@ -135,6 +135,18 @@ pub struct ReplState {
     pub master_last_io_ms: AtomicU64,
     /// Replica side: Unix ms at which the link last went down, 0 while it is up.
     pub master_link_down_since_ms: AtomicU64,
+    /// Replica side: Unix ms of the last moment this replica was streaming
+    /// from its master with everything it had been sent applied; 0 if it has
+    /// not been since it started or since its last full sync began. Its
+    /// data's age, for the cluster's election, counts from here, not from
+    /// the last time the link came up: a replica whose full sync starts over
+    /// and over has its link come up after every load, and was never caught
+    /// up (see `cluster::bus::heartbeat::stand_refusal`).
+    pub in_step_ms: AtomicU64,
+    /// Replica side: a full sync has begun to replace this node's dataset,
+    /// and the replica has not streamed since it loaded it. Until then it
+    /// may hold part of the master's dataset, or none of it.
+    pub full_sync_unfinished: AtomicBool,
     /// Replica side: full resyncs refused by the dataset guard, and why the
     /// most recent one was refused. See `replica_client::guard_full_sync`.
     pub full_syncs_refused: AtomicU64,
@@ -144,6 +156,13 @@ pub struct ReplState {
     /// runs several servers in one process and they need independent values.
     pub repl_timeout_secs: AtomicU64,
     pub repl_ping_period_secs: AtomicU64,
+    /// `shutdown-timeout`: how long a master that is shutting down waits for
+    /// its replicas to acknowledge the end of its stream.
+    pub shutdown_timeout_secs: AtomicU64,
+    /// Set by a shutdown once no command runs: nothing more goes into the
+    /// write stream, not even the replica `PING` or a key that expires. See
+    /// [`end_stream_for_shutdown`].
+    pub stream_closed: AtomicBool,
     /// `hll-write-format`: whether new HyperLogLog values use Redis's dense
     /// encoding and hash space, or the legacy KiviDB one. Per server rather
     /// than process-wide: the test harness runs several servers in one
@@ -170,6 +189,12 @@ pub struct ReplState {
     /// (0 = keep the backlog for ever).
     pub backlog_size: AtomicU64,
     pub backlog_ttl_secs: AtomicU64,
+    /// `repl-replica-max-backlog-bytes`: the most the master queues for a
+    /// replica that is streaming before it drops it; and
+    /// `repl-replica-sync-max-backlog-bytes`, the most it queues for one
+    /// during its full sync (#305). See [`start_hub`].
+    pub replica_max_backlog_bytes: AtomicU64,
+    pub replica_sync_max_backlog_bytes: AtomicU64,
     /// Master side: what `INFO` reports about the backlog. Written by the hub.
     pub backlog_first_offset: AtomicU64,
     pub backlog_histlen: AtomicU64,
@@ -374,6 +399,10 @@ pub struct ReplicaProgress {
     /// Where the replica is between asking for a sync and following the
     /// stream ([`ReplicaState`] as a `u8`).
     state: AtomicU8,
+    /// The bytes queued for it and not yet taken by its forwarder, shared
+    /// with the hub (`HubMsg::RegisterChannel::pending_bytes`). Set once the
+    /// hub feeds it.
+    queue: std::sync::OnceLock<Arc<AtomicU64>>,
 }
 
 impl ReplicaProgress {
@@ -384,7 +413,16 @@ impl ReplicaProgress {
             acked: AtomicU64::new(base),
             last_ack_ms: AtomicU64::new(unix_ms()),
             state: AtomicU8::new(ReplicaState::WaitBgsave as u8),
+            queue: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Bytes queued for this replica that its connection has not taken yet:
+    /// `queued` in `INFO replication`.
+    pub fn queued(&self) -> u64 {
+        self.queue
+            .get()
+            .map_or(0, |queue| queue.load(Ordering::Relaxed))
     }
 
     pub fn state(&self) -> ReplicaState {
@@ -452,10 +490,14 @@ impl ReplState {
             slave_link_state: AtomicU8::new(LinkState::Connect as u8),
             master_last_io_ms: AtomicU64::new(0),
             master_link_down_since_ms: AtomicU64::new(0),
+            in_step_ms: AtomicU64::new(0),
+            full_sync_unfinished: AtomicBool::new(false),
             full_syncs_refused: AtomicU64::new(0),
             last_sync_refusal: RwLock::new(None),
             repl_timeout_secs: AtomicU64::new(60),
             repl_ping_period_secs: AtomicU64::new(10),
+            shutdown_timeout_secs: AtomicU64::new(10),
+            stream_closed: AtomicBool::new(false),
             hll_write_redis: AtomicBool::new(false),
             min_replicas_to_write: AtomicU32::new(0),
             min_replicas_max_lag: AtomicU64::new(10),
@@ -463,8 +505,10 @@ impl ReplState {
             full_sync_guard_ratio: AtomicU64::new(50),
             master_credentials: RwLock::new((String::new(), String::new())),
             backlog_active: AtomicBool::new(false),
-            backlog_size: AtomicU64::new(1024 * 1024),
+            backlog_size: AtomicU64::new(64 * 1024 * 1024),
             backlog_ttl_secs: AtomicU64::new(3600),
+            replica_max_backlog_bytes: AtomicU64::new(256 * 1024 * 1024),
+            replica_sync_max_backlog_bytes: AtomicU64::new(1024 * 1024 * 1024),
             backlog_first_offset: AtomicU64::new(0),
             backlog_histlen: AtomicU64::new(0),
             sync_full: AtomicU64::new(0),
@@ -658,6 +702,9 @@ impl ReplState {
             .repl_ping_period_secs
             .store(config.repl_ping_replica_period, Ordering::Relaxed);
         state
+            .shutdown_timeout_secs
+            .store(config.shutdown_timeout, Ordering::Relaxed);
+        state
             .min_replicas_to_write
             .store(config.min_replicas_to_write, Ordering::Relaxed);
         state
@@ -678,6 +725,13 @@ impl ReplState {
         state
             .backlog_ttl_secs
             .store(config.repl_backlog_ttl, Ordering::Relaxed);
+        state
+            .replica_max_backlog_bytes
+            .store(config.repl_replica_max_backlog_bytes, Ordering::Relaxed);
+        state.replica_sync_max_backlog_bytes.store(
+            config.repl_replica_sync_max_backlog_bytes,
+            Ordering::Relaxed,
+        );
         state.hll_write_redis.store(
             config.hll_write_format.eq_ignore_ascii_case("redis"),
             Ordering::Relaxed,
@@ -775,6 +829,24 @@ impl ReplState {
         } else if was_up || self.master_link_down_since_ms.load(Ordering::Relaxed) == 0 {
             self.master_link_down_since_ms
                 .store(unix_ms(), Ordering::Relaxed);
+        }
+    }
+
+    /// Replica side: a full sync from the master has begun. Until the
+    /// replica has loaded it and streamed since, it does not stand for
+    /// election ([`Self::full_sync_unfinished`]).
+    pub fn note_full_sync_started(&self) {
+        self.full_sync_unfinished.store(true, Ordering::SeqCst);
+        self.in_step_ms.store(0, Ordering::SeqCst);
+    }
+
+    /// Replica side: streaming, with everything the master has sent so far
+    /// applied ([`Self::in_step_ms`]).
+    #[inline]
+    pub fn note_in_step(&self) {
+        self.in_step_ms.store(unix_ms(), Ordering::Relaxed);
+        if self.full_sync_unfinished.load(Ordering::Relaxed) {
+            self.full_sync_unfinished.store(false, Ordering::SeqCst);
         }
     }
 
@@ -969,6 +1041,10 @@ impl ReplState {
             .store(LinkState::Connect as u8, Ordering::Release);
         self.slave_sync_in_progress.store(false, Ordering::Release);
         self.master_link_down_since_ms.store(0, Ordering::Relaxed);
+        // As a replica again, it is in step with its next master only once
+        // it has streamed from it.
+        self.in_step_ms.store(0, Ordering::Relaxed);
+        self.full_sync_unfinished.store(false, Ordering::SeqCst);
         *self.last_sync_refusal.write() = None;
         // A master's dataset is its own from here on.
         self.set_resync_point(None);
@@ -1026,6 +1102,40 @@ impl ReplState {
 
     #[inline]
     pub fn become_slave(&self) {
+        // A master's dataset is its own write stream up to where that stream
+        // stands, read where no write is half-way. Kept as where this node
+        // stands, a master that continues the stream — its replica, promoted
+        // in a failover — continues this node from there instead of sending
+        // it everything (as Redis keeps a demoted master's stream as its
+        // cached master). Only while the stream counted every write
+        // (`feeds_hub`); a write of this node's own after it clears it
+        // (`note_local_write`). The new master continues it only if it read
+        // exactly this far: a byte more here, and it sends the dataset.
+        let was_master = !self.slave_mode.load(Ordering::Acquire);
+        let _cut = if was_master {
+            crate::write_gate::cut()
+        } else {
+            None
+        };
+        if was_master && self.feeds_hub() {
+            let offset = self.repl_offset.load(Ordering::Relaxed);
+            if offset > 0 {
+                let db = match self.repl_stream_last_db.load(Ordering::Relaxed) {
+                    u64::MAX => 0,
+                    db => db as usize,
+                };
+                let repl_id = self.repl_id();
+                log_info!(
+                    "Replication: This node's dataset is offset {offset} of its own stream \
+                     {repl_id}: a master that continues that stream can continue this node"
+                );
+                self.set_resync_point(Some(ResyncPoint {
+                    repl_id,
+                    offset,
+                    db,
+                }));
+            }
+        }
         self.slave_mode.store(true, Ordering::Release);
         *self.role.write() = "slave".into();
         // Its own replicas would get nothing from here on: a replica does
@@ -1189,10 +1299,13 @@ pub fn note_clean_exit() {
     }
 }
 
-/// Whether the previous process stopped cleanly with the `dump.kdb` that is
-/// here now. The marker is removed — durably, before anything is served —
-/// so that a crash later in this process is not taken for a clean stop.
-pub fn take_clean_exit_marker() -> bool {
+/// Whether the previous process stopped cleanly with the `dump.kdb` this
+/// process loaded: `loaded` is the fingerprint of the bytes that were read
+/// ([`load_dump`]), not of the file there now, which another process may
+/// have replaced since (#303). The marker is removed — durably, before
+/// anything is served — so that a crash later in this process is not taken
+/// for a clean stop.
+pub fn take_clean_exit_marker(loaded: Option<DumpFingerprint>) -> bool {
     let Ok(text) = std::fs::read_to_string(CLEAN_EXIT_PATH) else {
         return false;
     };
@@ -1206,27 +1319,131 @@ pub fn take_clean_exit_marker() -> bool {
     }
     let len: Option<u64> = lines.next().and_then(|l| l.parse().ok());
     let hash: Option<u64> = lines.next().and_then(|l| l.parse().ok());
-    matches!((len, hash, dump_fingerprint("dump.kdb")), (Some(l), Some(h), Ok((dl, dh))) if l == dl && h == dh)
+    matches!((len, hash, loaded), (Some(l), Some(h), Some((dl, dh))) if l == dl && h == dh)
 }
 
 /// Where a save leaves the resync point of the dataset it wrote.
 pub const RESYNC_PATH: &str = "dump.kdb.repl";
 const RESYNC_MAGIC: &str = "kividb-resync 1";
 
-/// Enough of `dump.kdb` to tell whether it is still the file a resync point
-/// was written for: its length, and a hash of its first and last 64 KiB.
-fn dump_fingerprint(path: &str) -> std::io::Result<(u64, u64)> {
+/// A dump's length, and a hash of its first and last 64 KiB: enough to tell
+/// whether a dump is the one a resync point or a clean-exit marker was
+/// written for.
+pub type DumpFingerprint = (u64, u64);
+
+/// How much of each end of a dump its fingerprint hashes.
+const FINGERPRINT_EDGE: usize = 64 * 1024;
+
+/// The fingerprint of a dump `len` bytes long, from its first
+/// [`FINGERPRINT_EDGE`] bytes and the last ones after those, up to as many
+/// again. Both [`dump_fingerprint`] and [`FingerprintReader`] end here.
+fn fingerprint(len: u64, head: &[u8], tail: &[u8]) -> DumpFingerprint {
+    let mut sample = Vec::with_capacity(head.len() + tail.len());
+    sample.extend_from_slice(head);
+    sample.extend_from_slice(tail);
+    (len, xxhash_rust::xxh3::xxh3_64(&sample))
+}
+
+/// The fingerprint of the file at `path` as it is now.
+fn dump_fingerprint(path: &str) -> std::io::Result<DumpFingerprint> {
     use std::io::{Read, Seek, SeekFrom};
-    const EDGE: u64 = 64 * 1024;
+    const EDGE: u64 = FINGERPRINT_EDGE as u64;
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
-    let mut sample = Vec::with_capacity((2 * EDGE) as usize);
-    (&mut file).take(EDGE).read_to_end(&mut sample)?;
+    let mut head = Vec::with_capacity(FINGERPRINT_EDGE);
+    (&mut file).take(EDGE).read_to_end(&mut head)?;
+    let mut tail = Vec::new();
     if len > EDGE {
         file.seek(SeekFrom::Start(len - EDGE.min(len - EDGE)))?;
-        file.read_to_end(&mut sample)?;
+        file.read_to_end(&mut tail)?;
     }
-    Ok((len, xxhash_rust::xxh3::xxh3_64(&sample)))
+    Ok(fingerprint(len, &head, &tail))
+}
+
+/// A reader that takes the fingerprint of what is read through it.
+///
+/// The dump is loaded through one, so that what was loaded is what a saved
+/// point is compared with. Compared with the file on disk instead, a point
+/// saved for a newer dump, written by another process after this one had
+/// read the older one, was taken for the point of the older (#303).
+pub struct FingerprintReader<R> {
+    inner: R,
+    len: u64,
+    head: Vec<u8>,
+    /// The last bytes read after the head, at most [`FINGERPRINT_EDGE`]: a
+    /// ring once full, its oldest byte at `tail_at`.
+    tail: Vec<u8>,
+    tail_at: usize,
+}
+
+impl<R: std::io::Read> FingerprintReader<R> {
+    pub fn new(inner: R) -> Self {
+        FingerprintReader {
+            inner,
+            len: 0,
+            head: Vec::with_capacity(FINGERPRINT_EDGE),
+            tail: Vec::with_capacity(FINGERPRINT_EDGE),
+            tail_at: 0,
+        }
+    }
+
+    fn note(&mut self, mut bytes: &[u8]) {
+        self.len += bytes.len() as u64;
+        if self.head.len() < FINGERPRINT_EDGE {
+            let take = (FINGERPRINT_EDGE - self.head.len()).min(bytes.len());
+            self.head.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+        }
+        if bytes.len() >= FINGERPRINT_EDGE {
+            self.tail.clear();
+            self.tail
+                .extend_from_slice(&bytes[bytes.len() - FINGERPRINT_EDGE..]);
+            self.tail_at = 0;
+            return;
+        }
+        if self.tail.len() < FINGERPRINT_EDGE {
+            let take = (FINGERPRINT_EDGE - self.tail.len()).min(bytes.len());
+            self.tail.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+        }
+        while !bytes.is_empty() {
+            let take = (FINGERPRINT_EDGE - self.tail_at).min(bytes.len());
+            self.tail[self.tail_at..self.tail_at + take].copy_from_slice(&bytes[..take]);
+            self.tail_at = (self.tail_at + take) % FINGERPRINT_EDGE;
+            bytes = &bytes[take..];
+        }
+    }
+
+    /// Read the rest, to the end, and give the fingerprint of everything.
+    pub fn finish(mut self) -> std::io::Result<DumpFingerprint> {
+        std::io::copy(&mut self, &mut std::io::sink())?;
+        let (newer, older) = self.tail.split_at(self.tail_at);
+        let mut tail = Vec::with_capacity(self.tail.len());
+        tail.extend_from_slice(older);
+        tail.extend_from_slice(newer);
+        Ok(fingerprint(self.len, &self.head, &tail))
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for FingerprintReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.note(&buf[..n]);
+        Ok(n)
+    }
+}
+
+/// Load the dump at `path`, as `snapshot::load_snapshot` does, with the
+/// fingerprint of the bytes that were loaded.
+pub fn load_dump(
+    path: &str,
+) -> std::io::Result<(crate::snapshot::LoadedSnapshot, DumpFingerprint)> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(FingerprintReader::new(file));
+    let loaded = crate::snapshot::load_snapshot_from(&mut reader)?;
+    // What the buffer holds beyond what was parsed has been fingerprinted.
+    let fingerprint = reader.into_inner().finish()?;
+    Ok((loaded, fingerprint))
 }
 
 /// Write the dataset to disk — `dump.kdb`, and with the AOF on, the log reset
@@ -1248,6 +1465,16 @@ pub fn save_dataset(
     // The replica's applier is between commands, and stays there until the
     // save is done: the point read here is the dataset written below.
     let _applying = repl_state.apply_lock.lock();
+    save_dataset_with(&turn, store, index_store, repl_state)
+}
+
+/// [`save_dataset`], with the checkpoint turn and the applier's lock held.
+fn save_dataset_with(
+    turn: &crate::aof::CheckpointTurn,
+    store: &crate::store::Store,
+    index_store: &crate::vector::IndexStore,
+    repl_state: &ReplState,
+) -> std::io::Result<()> {
     // First, so that a save that fails half-way cannot leave an old point
     // beside a new dump.
     let _ = std::fs::remove_file(RESYNC_PATH);
@@ -1257,7 +1484,7 @@ pub fn save_dataset(
     // instant the dataset is captured: no write is half-way then.
     let mut master_point: Option<(String, u64)> = None;
     if crate::aof::AOF_ENABLED.load(Ordering::Relaxed) {
-        crate::aof::checkpoint_noting(&turn, store, index_store, &mut || {
+        crate::aof::checkpoint_noting(turn, store, index_store, &mut || {
             if !repl_state.is_slave() && repl_state.feeds_hub() {
                 master_point = Some((
                     repl_state.repl_id(),
@@ -1280,13 +1507,20 @@ pub fn save_dataset(
             std::process::id(),
             TMP_SEQ.fetch_add(1, Ordering::Relaxed)
         );
+        // With a save number of its own, as a checkpoint's: put in place
+        // without one, the dump kept the number of the log beside it, and a
+        // start with the AOF on replayed that log over it (#354).
+        let generation = crate::aof::next_generation();
         if let Err(e) = frozen
             .write_file(&tmp)
-            .and_then(|()| std::fs::rename(&tmp, "dump.kdb"))
+            .and_then(|()| crate::aof::install_dump(&tmp, generation, true))
         {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
+        // The open log no longer goes on from it (#350); none on disk goes
+        // with it (#354).
+        crate::aof::dump_saved_without_log();
         // As the writer this replaced said it: operators and tests look for it.
         let shown = std::env::current_dir()
             .map(|dir| dir.join("dump.kdb"))
@@ -1315,28 +1549,29 @@ pub fn save_dataset(
     }
     crate::stats::RDB_SAVES.fetch_add(1, Ordering::Relaxed);
     crate::stats::record_save();
-    drop(turn);
     Ok(())
 }
 
-/// The resync point saved beside `dump.kdb`, if that dump is still the one it
-/// was saved for. The caller must also know that the dataset in memory is
+/// The resync point saved beside `dump.kdb`, if it was saved for the dump
+/// this process loaded, `loaded` being that dump's fingerprint
+/// ([`load_dump`]). The caller must also know that the dataset in memory is
 /// that dump and nothing more — see `aof::LocalRecovery::exact_dump`.
-pub fn load_saved_resync_point() -> Option<ResyncPoint> {
-    saved_point().and_then(|(point, master)| (!master).then_some(point))
+pub fn load_saved_resync_point(loaded: DumpFingerprint) -> Option<ResyncPoint> {
+    saved_point(RESYNC_PATH, loaded, false)
 }
 
-/// The point a master saved at a clean shutdown, if the dump beside it is
-/// still the one it was saved for: its replication id and offset. Same
-/// caveat as [`load_saved_resync_point`].
-pub fn load_saved_master_point() -> Option<(String, u64)> {
-    saved_point().and_then(|(point, master)| master.then_some((point.repl_id, point.offset)))
+/// The point a master saved at a clean shutdown, if it was saved for the
+/// dump this process loaded: its replication id and offset. Same caveat as
+/// [`load_saved_resync_point`].
+pub fn load_saved_master_point(loaded: DumpFingerprint) -> Option<(String, u64)> {
+    saved_point(RESYNC_PATH, loaded, true).map(|point| (point.repl_id, point.offset))
 }
 
-/// The saved point, and whether a master saved it (a file without the role
-/// is a replica's, from before masters saved theirs).
-fn saved_point() -> Option<(ResyncPoint, bool)> {
-    let text = std::fs::read_to_string(RESYNC_PATH).ok()?;
+/// The point saved at `path` by a master (`master`) or a replica (a file
+/// without the role is a replica's, from before masters saved theirs), if
+/// it was saved for the dump whose fingerprint is `loaded`.
+fn saved_point(path: &str, loaded: DumpFingerprint, master: bool) -> Option<ResyncPoint> {
+    let text = std::fs::read_to_string(path).ok()?;
     let mut lines = text.lines();
     if lines.next()? != RESYNC_MAGIC {
         return None;
@@ -1346,18 +1581,101 @@ fn saved_point() -> Option<(ResyncPoint, bool)> {
     let db: usize = lines.next()?.parse().ok()?;
     let len: u64 = lines.next()?.parse().ok()?;
     let hash: u64 = lines.next()?.parse().ok()?;
-    let master = lines.next() == Some("master");
-    if repl_id.len() != 40 || dump_fingerprint("dump.kdb").ok()? != (len, hash) {
+    if (lines.next() == Some("master")) != master || repl_id.len() != 40 {
         return None;
     }
-    Some((
-        ResyncPoint {
-            repl_id,
-            offset,
-            db,
-        },
-        master,
-    ))
+    if loaded != (len, hash) {
+        log_info!(
+            "Replication: {path} was saved for another dump than the one loaded — \
+             not continuing from it"
+        );
+        return None;
+    }
+    Some(ResyncPoint {
+        repl_id,
+        offset,
+        db,
+    })
+}
+
+#[cfg(test)]
+mod dump_fingerprint_tests {
+    use super::*;
+    use std::io::Read;
+
+    /// The fingerprint taken while reading is the one taken of the file,
+    /// however the reads are cut up and wherever the reader stops.
+    #[test]
+    fn the_fingerprint_of_what_was_read_is_the_fingerprint_of_the_file() {
+        const EDGE: usize = FINGERPRINT_EDGE;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.kdb");
+        let path = path.to_str().unwrap();
+        for len in [
+            0,
+            1,
+            1000,
+            EDGE - 1,
+            EDGE,
+            EDGE + 1,
+            2 * EDGE - 1,
+            2 * EDGE,
+            2 * EDGE + 1,
+            5 * EDGE + 12_345,
+        ] {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 7 % 251) as u8).collect();
+            std::fs::write(path, &bytes).unwrap();
+            let expected = dump_fingerprint(path).unwrap();
+            for chunk in [1, 7, 4096, EDGE - 1, EDGE, EDGE + 3, 3 * EDGE] {
+                for stop in [0, len / 3, len] {
+                    let mut reader = FingerprintReader::new(&bytes[..]);
+                    let mut buf = vec![0u8; chunk];
+                    let mut read = 0;
+                    while read < stop {
+                        let want = chunk.min(stop - read);
+                        let n = reader.read(&mut buf[..want]).unwrap();
+                        assert!(n > 0);
+                        read += n;
+                    }
+                    assert_eq!(
+                        reader.finish().unwrap(),
+                        expected,
+                        "length {len}, reads of {chunk}, stopped at {stop}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A point saved for a later dump than the one loaded is not used,
+    /// though it matches the dump on disk (#303).
+    #[test]
+    fn a_saved_point_is_used_only_for_the_dump_that_was_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let dump = dir.path().join("dump.kdb");
+        let dump = dump.to_str().unwrap();
+        let point = dir.path().join("dump.kdb.repl");
+        let point = point.to_str().unwrap();
+
+        std::fs::write(dump, vec![1u8; 100_000]).unwrap();
+        let older = FingerprintReader::new(std::fs::File::open(dump).unwrap())
+            .finish()
+            .unwrap();
+        // Another process saves a newer dump, and its point beside it.
+        std::fs::write(dump, vec![2u8; 150_000]).unwrap();
+        let (len, hash) = dump_fingerprint(dump).unwrap();
+        let repl_id = "a".repeat(40);
+        std::fs::write(
+            point,
+            format!("{RESYNC_MAGIC}\n{repl_id}\n4242\n0\n{len}\n{hash}\nmaster\n"),
+        )
+        .unwrap();
+
+        assert!(saved_point(point, older, true).is_none());
+        assert!(saved_point(point, (len, hash), false).is_none());
+        let saved = saved_point(point, (len, hash), true).unwrap();
+        assert_eq!((saved.repl_id, saved.offset), (repl_id, 4242));
+    }
 }
 
 /// `repl-diskless-load`: whether a replica drops its dataset before loading a
@@ -1751,11 +2069,26 @@ pub type HubTx = mpsc::UnboundedSender<HubMsg>;
 /// Spawn the replication hub task. Returns the sender used to
 /// register replicas and to propagate write commands.
 ///
-/// `max_replica_backlog_bytes` bounds how much unflushed data the hub will queue for
-/// any single replica (see [`HubMsg::RegisterChannel::pending_bytes`]). A replica that
-/// can't keep up — slow network, stalled disk, wedged process — gets disconnected once
-/// its queue crosses this line instead of growing the master's memory without bound.
-pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx {
+/// `repl-replica-max-backlog-bytes` (`ReplState::replica_max_backlog_bytes`)
+/// bounds how much unflushed data the hub will queue for any single replica
+/// (see [`HubMsg::RegisterChannel::pending_bytes`]). A replica that can't keep
+/// up — slow network, stalled disk, wedged process — gets disconnected once its
+/// queue crosses this line instead of growing the master's memory without
+/// bound.
+///
+/// A replica in a full sync has its own, larger bound,
+/// `repl-replica-sync-max-backlog-bytes` (#305). Everything written while its
+/// dataset is sent and loaded waits in its queue: it reads nothing of the
+/// stream until it has loaded, and has it all to read then. Held to the
+/// streaming limit, a large dataset under heavy writes never synced: the queue
+/// passed the limit before the load was done, the replica was dropped, and the
+/// sync began again, for as long as the writes lasted. The sync's bound holds
+/// from the cut until the replica, having loaded the dataset and acknowledged
+/// it, has drained its queue to a quarter of the streaming limit; the
+/// streaming limit holds from then on. Both are read for each write, so `CONFIG SET` changes
+/// them for replicas already attached. The master logs how far each
+/// replica's queue went during its sync.
+pub fn start_hub(state: Arc<ReplState>) -> HubTx {
     let (hub_tx, mut hub_rx) = mpsc::unbounded_channel::<HubMsg>();
     let _ = state.hub.set(hub_tx.downgrade());
     // For the heartbeat, which the hub sends to itself. Weak, so that the hub
@@ -1844,8 +2177,23 @@ pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx
                     // And queued, not handled here and now, for the same
                     // reason: its place in the stream has to be its place in
                     // the queue, relative to a registration made at a cut.
+                    //
+                    // None once a shutdown has ended the stream: the offset
+                    // it saves is the last byte its replicas are sent. Looked
+                    // at inside the gate, which the shutdown cycles after it
+                    // sets the flag, so that a PING is either wholly before
+                    // the end or not sent.
                     {
                         let _gate = crate::write_gate::enter();
+                        // Nor while writes are paused (a manual failover's
+                        // handoff, `CLIENT PAUSE`), as in Redis: a replica
+                        // promoted at the offset it was told to reach must
+                        // find this node there when it follows it.
+                        if state.stream_closed.load(Ordering::SeqCst)
+                            || crate::pause::expiry_deferred()
+                        {
+                            continue;
+                        }
                         state
                             .repl_offset
                             .fetch_add(REPL_PING.len() as u64, Ordering::Relaxed);
@@ -1894,6 +2242,7 @@ pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx
                             offset,
                         );
                         progress.set_state(ReplicaState::Online);
+                        let _ = progress.queue.set(Arc::clone(&registration.pending_bytes));
                         let missed_len = missed.len() as u64;
                         let delivered = missed.is_empty() || {
                             registration
@@ -1918,6 +2267,8 @@ pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx
                             tx: registration.tx,
                             pending_bytes: registration.pending_bytes,
                             progress,
+                            syncing: false,
+                            peak: missed_len,
                         });
                         if reply.send(Ok(())).is_err() {
                             // The connection went away while it was asking.
@@ -1927,6 +2278,16 @@ pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx
                         }
                     }
                     None => {
+                        if backlog.valid {
+                            log_info!(
+                                "Replication: Partial resync not possible for {}: offset {offset} \
+                                 is not in the backlog, which holds offsets {} to {} \
+                                 (repl-backlog-size) — sending the dataset",
+                                registration.addr,
+                                backlog.start() + 1,
+                                backlog.end
+                            );
+                        }
                         state.sync_partial_err.fetch_add(1, Ordering::Relaxed);
                         let _ = reply.send(Err(registration));
                     }
@@ -1950,7 +2311,17 @@ pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx
 
                 HubMsg::Deregister(replica_id) => {
                     // Tear down registration (client disconnect / rollback).
-                    channel_replicas.retain(|r| r.id != replica_id);
+                    channel_replicas.retain(|r| {
+                        if r.id == replica_id && r.syncing {
+                            log_info!(
+                                "Replication: Replica {} left during its full sync; its queue \
+                                 peaked at {} bytes",
+                                r.addr,
+                                r.peak
+                            );
+                        }
+                        r.id != replica_id
+                    });
                     forget_replica(&state, replica_id);
                 }
                 HubMsg::DropReplicas => {
@@ -2024,12 +2395,17 @@ pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx
                     // then. Done here for registrations that did not come
                     // through it.
                     let progress = state.register_replica(replica_id, peer_ip, peer_port, base);
+                    let _ = progress.queue.set(Arc::clone(&pending_bytes));
                     channel_replicas.push(ChannelReplica {
                         id: replica_id,
                         addr: addr.clone(),
                         tx,
                         pending_bytes,
                         progress,
+                        // In its full sync until it has loaded the dataset
+                        // and drained what was queued meanwhile.
+                        syncing: true,
+                        peak: 0,
                     });
                     log_info!("Replication: Channel replica registered: {addr}");
                 }
@@ -2064,7 +2440,13 @@ pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx
                     // but capped in bytes below so a replica that never catches up can't hold
                     // an unbounded amount of undelivered data in master memory).
                     let mut alive_channels = Vec::with_capacity(channel_replicas.len());
-                    for replica in channel_replicas.drain(..) {
+                    // Read for each write, so that `CONFIG SET` applies at once.
+                    let streaming_limit = state.replica_max_backlog_bytes.load(Ordering::Relaxed);
+                    let sync_limit = state
+                        .replica_sync_max_backlog_bytes
+                        .load(Ordering::Relaxed)
+                        .max(streaming_limit);
+                    for mut replica in channel_replicas.drain(..) {
                         // Account for the payload *before* handing it over. The
                         // forwarder subtracts as soon as it has the payload, and
                         // it runs on another thread: counting afterwards let it
@@ -2088,7 +2470,13 @@ pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx
                             .sent
                             .fetch_add(payload.len() as u64, Ordering::Relaxed);
 
-                        if now_pending > max_replica_backlog_bytes {
+                        replica.peak = replica.peak.max(now_pending);
+                        let limit = if replica.syncing {
+                            sync_limit
+                        } else {
+                            streaming_limit
+                        };
+                        if now_pending > limit {
                             // Replica isn't draining its queue fast enough — evict rather than
                             // let the backlog grow without bound. Dropping `tx` here (by not
                             // pushing it back into `channel_replicas`) closes its forwarder's
@@ -2098,10 +2486,36 @@ pub fn start_hub(state: Arc<ReplState>, max_replica_backlog_bytes: u64) -> HubTx
                             forget_replica(&state, replica.id);
                             log_warn!(
                                 "Replication: Channel replica {} exceeded backlog limit \
-                                 ({now_pending} > {max_replica_backlog_bytes} bytes) — evicting",
-                                replica.addr
+                                 ({now_pending} > {limit} bytes{}) — evicting",
+                                replica.addr,
+                                if replica.syncing {
+                                    ", repl-replica-sync-max-backlog-bytes, during its full sync"
+                                } else {
+                                    ""
+                                }
                             );
                             continue;
+                        }
+                        // The sync is over once the replica has loaded the
+                        // dataset (it acknowledges only then) and drained
+                        // its queue to a quarter of the streaming limit.
+                        // Not at the limit itself: a replica still draining
+                        // dips under it and climbs back over it as it
+                        // pauses (its own AOF checkpoint holds its applier
+                        // for a second or two), and was dropped moments
+                        // after its sync had ended.
+                        if replica.syncing
+                            && now_pending <= streaming_limit / 4
+                            && replica.progress.state() == ReplicaState::Online
+                        {
+                            replica.syncing = false;
+                            log_info!(
+                                "Replication: Replica {} is streaming: its queue peaked at {} \
+                                 bytes during the full sync (repl-replica-sync-max-backlog-bytes \
+                                 {sync_limit}, repl-replica-max-backlog-bytes {streaming_limit})",
+                                replica.addr,
+                                replica.peak
+                            );
                         }
 
                         alive_channels.push(replica);
@@ -2279,6 +2693,11 @@ struct ChannelReplica {
     tx: mpsc::UnboundedSender<ReplPayload>,
     pending_bytes: Arc<AtomicU64>,
     progress: Arc<ReplicaProgress>,
+    /// In its full sync: held to `repl-replica-sync-max-backlog-bytes`
+    /// rather than `repl-replica-max-backlog-bytes`. See [`start_hub`].
+    syncing: bool,
+    /// The most that has been queued for it at once.
+    peak: u64,
 }
 
 /// Drop every trace of a replica from the shared state. Idempotent: the
@@ -2293,6 +2712,212 @@ fn forget_replica(state: &ReplState, replica_id: u64) {
     if state.replica_acks.lock().remove(&replica_id).is_some() {
         // Pairs with fetch_add on successful RegisterChannel in the hub task.
         state.connected_replicas.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Shutdown: end the write stream here. A master restarted from its final
+/// save carries its stream on from the offset that save records, and
+/// continues a replica only if that replica stopped at exactly that offset
+/// (#306). Called once no command runs or can start (the clients are paused,
+/// or the command gate is held alone); the sweeps of expired keys and fields
+/// wait while clients are paused, and enter the command gate. What is left is
+/// the replica `PING`, which the hub writes on its own. It looks at this flag
+/// inside the write gate: cycling the gate after setting it waits for one
+/// that was being written, and for any write still in flight, so every
+/// `PING` is either wholly in the stream before the end or never sent. The
+/// sweeps look at the flag too.
+pub fn end_stream_for_shutdown(state: &ReplState) {
+    state.stream_closed.store(true, Ordering::SeqCst);
+    drop(crate::write_gate::cut());
+}
+
+/// Shutdown, just before the final save: the dataset may be saved, and stays
+/// as it is until the save is done (while the guard lives); or `None`, while
+/// a full sync is replacing this replica's dataset. Its dataset is then the
+/// master's in part, or nothing at all (the default `repl-diskless-load`
+/// drops the old one first), and a save would write that over the last good
+/// `dump.kdb`, which the next start would load. The caller skips the save:
+/// the last dump and its resync point stay, and the next start syncs again.
+/// The guard is the lock a full sync holds from before it touches the
+/// dataset until the master's is in place, waited for briefly: other
+/// holders let go of it at once.
+pub fn dataset_for_final_save(state: &ReplState) -> Option<parking_lot::MutexGuard<'_, ()>> {
+    if state.slave_sync_in_progress.load(Ordering::SeqCst) {
+        return None;
+    }
+    let settled = state
+        .dataset_commit
+        .try_lock_for(std::time::Duration::from_secs(1))?;
+    (!state.slave_sync_in_progress.load(Ordering::SeqCst)).then_some(settled)
+}
+
+/// What a shutdown holds from when it closes the command gate to the exit:
+/// the gate, alone, and what its final save takes ([`hold_for_final_save`]).
+/// Never let go of: a gate opened again before the exit let writes run that
+/// were acknowledged and lost with the process.
+pub struct FinalSaveHold<'a> {
+    _alone: crate::command_gate::AloneGuard,
+    _applying: parking_lot::MutexGuard<'a, ()>,
+    turn: crate::aof::CheckpointTurn,
+}
+
+/// Shutdown: close the command gate for the final save, having taken first
+/// what the save takes — the checkpoint turn, then the replica applier's
+/// lock, the order [`save_dataset`] takes them in.
+///
+/// The applier holds its lock while it runs a command of its master's
+/// stream, and the command enters the command gate. A shutdown that closed
+/// the gate first and then waited in the save for that lock waited for
+/// ever: the applier, holding the lock, waited at the closed gate (#308).
+/// Taken first, the lock waits for the command the applier is running, and
+/// the applier applies nothing more.
+///
+/// A command already running that itself waits for the turn or the lock
+/// (`SAVE`, a promotion) would keep the gate from closing behind them: if it
+/// does not close in a moment, both are let go of, so that the command can
+/// finish, and taken again. Clients are paused by then, so no new command
+/// starts meanwhile.
+pub fn hold_for_final_save(state: &ReplState) -> std::io::Result<FinalSaveHold<'_>> {
+    use std::time::{Duration, Instant};
+    loop {
+        let turn = crate::aof::checkpoint_turn()?;
+        let applying = state.apply_lock.lock();
+        let deadline = Instant::now() + Duration::from_millis(50);
+        if let Some(alone) =
+            crate::command_gate::enter_alone_unless(Duration::from_millis(5), || {
+                Instant::now() >= deadline
+            })
+        {
+            return Ok(FinalSaveHold {
+                _alone: alone,
+                _applying: applying,
+                turn,
+            });
+        }
+        drop(applying);
+        drop(turn);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// [`save_dataset`] for a shutdown, under its [`hold_for_final_save`].
+pub fn save_dataset_held(
+    hold: &FinalSaveHold<'_>,
+    store: &crate::store::Store,
+    index_store: &crate::vector::IndexStore,
+    repl_state: &ReplState,
+) -> std::io::Result<()> {
+    save_dataset_with(&hold.turn, store, index_store, repl_state)
+}
+
+/// What a shutdown logs when [`dataset_for_final_save`] says no.
+pub const FINAL_SAVE_SKIPPED: &str = "Shutdown: this replica is in the middle of a full sync, and \
+     its dataset is only part of the master's: the final save is skipped, so that dump.kdb (and \
+     its resync point) stays the last good one. The next start syncs again";
+
+/// How long clients stay paused for a shutdown: until the process exits.
+const SHUTDOWN_PAUSE_MS: i64 = 100 * 365 * 24 * 3600 * 1000;
+
+/// Shutdown, before the command gate is taken: pause every client, end the
+/// stream ([`end_stream_for_shutdown`]) and wait, for at most
+/// `shutdown-timeout`, until every streaming replica has acknowledged all it
+/// has been sent. Returns when the wait ends, for [`report_replicas_at_shutdown`].
+///
+/// Clients are paused rather than held at the command gate for the wait: a
+/// command that waits at the gate holds its worker thread, and on io_uring
+/// that is every connection on the worker, the replica's among them, so the
+/// replica was sent nothing more and the wait always ran out. A paused client
+/// waits without holding its thread (`pause::gate`), as in Redis, which pauses
+/// its clients while a shutdown waits for the replicas. No command starts
+/// again before the exit: the pause has no end, and the caller then holds the
+/// command gate alone. Blocking: called from the thread that then saves.
+pub fn drain_replicas_for_shutdown(state: &ReplState, hub_tx: &HubTx) -> std::time::Instant {
+    crate::pause::set_pause(SHUTDOWN_PAUSE_MS, false);
+    end_stream_for_shutdown(state);
+    let timeout =
+        std::time::Duration::from_secs(state.shutdown_timeout_secs.load(Ordering::Relaxed));
+    let deadline = std::time::Instant::now() + timeout;
+    wait_for_replicas_until(state, hub_tx, deadline);
+    deadline
+}
+
+/// Shutdown, with the command gate held alone, just before the save: wait
+/// what is left of `shutdown-timeout` for a write that was past the pause's
+/// check when the pause began and has only now been queued (rare), and say
+/// which replicas have the whole stream. One that has is continued from the
+/// final save after the restart; one that has not, or that was still being
+/// sent the dataset, gets the dataset again.
+pub fn report_replicas_at_shutdown(
+    state: &ReplState,
+    hub_tx: &HubTx,
+    started: std::time::Instant,
+    deadline: std::time::Instant,
+) {
+    if state.is_slave() || state.shutdown_timeout_secs.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    wait_for_replicas_until(state, hub_tx, deadline);
+    let waited = started.elapsed().as_millis();
+    for (addr, p) in replicas_at_shutdown(state) {
+        let sent = p.sent.load(Ordering::Relaxed);
+        let end = p.base + sent;
+        if p.state() != ReplicaState::Online {
+            log_warn!(
+                "Replication: Shutdown: replica {addr} was still being sent the dataset ({}); it \
+                 will be sent it again after the restart",
+                p.state().as_str()
+            );
+        } else if p.delivered() >= sent {
+            log_info!(
+                "Replication: Shutdown: replica {addr} has the whole stream, to offset {end} \
+                 ({waited} ms); it can be continued after the restart"
+            );
+        } else {
+            log_warn!(
+                "Replication: Shutdown: replica {addr} did not acknowledge the end of the stream \
+                 within shutdown-timeout ({} s): it is at offset {} of {end}; it will be sent \
+                 the dataset after the restart",
+                state.shutdown_timeout_secs.load(Ordering::Relaxed),
+                p.acked.load(Ordering::Relaxed)
+            );
+        }
+    }
+}
+
+/// Every registered replica and its progress, by address.
+fn replicas_at_shutdown(state: &ReplState) -> Vec<(String, Arc<ReplicaProgress>)> {
+    let peers = state.replica_peers.lock().clone();
+    let progress = state.replica_progress.lock();
+    peers
+        .into_iter()
+        .filter_map(|(id, ip, port)| Some((format!("{ip}:{port}"), Arc::clone(progress.get(&id)?))))
+        .collect()
+}
+
+/// Until `deadline`, or until every streaming replica has acknowledged all it
+/// has been sent. A hub barrier first: once the hub has answered, everything
+/// written before has been handed to the replicas' queues.
+fn wait_for_replicas_until(state: &ReplState, hub_tx: &HubTx, deadline: std::time::Instant) {
+    if state.is_slave() || state.replica_progress.lock().is_empty() {
+        return;
+    }
+    let pause = std::time::Duration::from_millis(5);
+    let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+    if hub_tx.send(HubMsg::Barrier(done_tx)).is_ok() {
+        while matches!(
+            done_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ) && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(pause);
+        }
+    }
+    while std::time::Instant::now() < deadline
+        && replicas_at_shutdown(state).iter().any(|(_, p)| {
+            p.state() == ReplicaState::Online && p.delivered() < p.sent.load(Ordering::Relaxed)
+        })
+    {
+        std::thread::sleep(pause);
     }
 }
 
@@ -3379,8 +4004,6 @@ mod replication_invariants_tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    const TEST_MAX_BACKLOG_BYTES: u64 = 256 * 1024 * 1024;
-
     async fn await_connected(state: &ReplState, want: i64) {
         for _ in 0..5000 {
             if state.connected_replicas.load(Ordering::Relaxed) == want {
@@ -3398,7 +4021,7 @@ mod replication_invariants_tests {
     #[tokio::test]
     async fn hub_register_channel_increments_connected_replicas() {
         let state = Arc::new(ReplState::new_master());
-        let hub = start_hub(Arc::clone(&state), TEST_MAX_BACKLOG_BYTES);
+        let hub = start_hub(Arc::clone(&state));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ReplPayload>();
 
         hub.send(HubMsg::RegisterChannel {
@@ -3421,7 +4044,7 @@ mod replication_invariants_tests {
     #[tokio::test]
     async fn hub_second_deregister_is_idempotent_for_counter() {
         let state = Arc::new(ReplState::new_master());
-        let hub = start_hub(Arc::clone(&state), TEST_MAX_BACKLOG_BYTES);
+        let hub = start_hub(Arc::clone(&state));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ReplPayload>();
 
         hub.send(HubMsg::RegisterChannel {
@@ -3450,7 +4073,7 @@ mod replication_invariants_tests {
     #[tokio::test]
     async fn hub_propagate_drops_replica_when_channel_closed() {
         let state = Arc::new(ReplState::new_master());
-        let hub = start_hub(Arc::clone(&state), TEST_MAX_BACKLOG_BYTES);
+        let hub = start_hub(Arc::clone(&state));
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ReplPayload>();
 
         hub.send(HubMsg::RegisterChannel {
@@ -3482,7 +4105,14 @@ mod replication_invariants_tests {
     async fn hub_propagate_evicts_replica_exceeding_backlog_limit() {
         let state = Arc::new(ReplState::new_master());
         const TINY_LIMIT: u64 = 100; // bytes
-        let hub = start_hub(Arc::clone(&state), TINY_LIMIT);
+        // Both limits: the replica is registered as in a full sync.
+        state
+            .replica_max_backlog_bytes
+            .store(TINY_LIMIT, Ordering::Relaxed);
+        state
+            .replica_sync_max_backlog_bytes
+            .store(TINY_LIMIT, Ordering::Relaxed);
+        let hub = start_hub(Arc::clone(&state));
         // Receiver is never drained — simulates a replica that can't keep up.
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ReplPayload>();
 
@@ -3509,6 +4139,104 @@ mod replication_invariants_tests {
             state.replica_acks.lock().get(&9004).is_none(),
             "evicted replica's ACK row should be removed"
         );
+    }
+
+    async fn barrier(hub: &super::HubTx) {
+        let (done, wait) = tokio::sync::oneshot::channel();
+        hub.send(HubMsg::Barrier(done)).unwrap();
+        wait.await.unwrap();
+    }
+
+    fn register_syncing(hub: &super::HubTx, id: u64, pending: &Arc<AtomicU64>) -> ReplRx {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ReplPayload>();
+        hub.send(HubMsg::RegisterChannel {
+            addr: format!("replica-{id}"),
+            peer_ip: "127.0.0.1".into(),
+            peer_port: id as u16,
+            tx,
+            replica_id: id,
+            pending_bytes: Arc::clone(pending),
+            base: 0,
+        })
+        .unwrap();
+        rx
+    }
+
+    type ReplRx = tokio::sync::mpsc::UnboundedReceiver<ReplPayload>;
+
+    /// A replica in its full sync reads nothing of the stream until it has
+    /// loaded the dataset, so what is written meanwhile waits in its queue:
+    /// it is held to `repl-replica-sync-max-backlog-bytes`, not to the
+    /// streaming limit (#305). Once it has acknowledged the dataset and
+    /// drained its queue, the streaming limit holds.
+    #[tokio::test]
+    async fn a_full_sync_has_its_own_queue_limit_until_the_replica_streams() {
+        let state = Arc::new(ReplState::new_master());
+        state
+            .replica_max_backlog_bytes
+            .store(100, Ordering::Relaxed);
+        state
+            .replica_sync_max_backlog_bytes
+            .store(1000, Ordering::Relaxed);
+        let hub = start_hub(Arc::clone(&state));
+        let pending = Arc::new(AtomicU64::new(0));
+        let mut rx = register_syncing(&hub, 9005, &pending);
+        await_connected(&state, 1).await;
+
+        // 500 bytes while it loads: over the streaming limit, under the sync's.
+        for _ in 0..10 {
+            propagate(&hub, vec![0u8; 50]);
+        }
+        barrier(&hub).await;
+        assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 1);
+        assert_eq!(state.replica(9005).unwrap().queued(), 500);
+
+        // Loaded and acknowledged; its connection takes what was queued.
+        hub.send(HubMsg::AckOffset {
+            replica_id: 9005,
+            offset: 0,
+        })
+        .unwrap();
+        while rx.try_recv().is_ok() {}
+        pending.store(0, Ordering::Relaxed);
+        // The next write finds it streaming (its queue is a quarter of the
+        // streaming limit or less)...
+        propagate(&hub, vec![0u8; 20]);
+        barrier(&hub).await;
+        assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 1);
+        // ...and from then on the streaming limit holds.
+        for _ in 0..3 {
+            propagate(&hub, vec![0u8; 50]);
+        }
+        await_connected(&state, 0).await;
+    }
+
+    /// The sync's allowance is a bound too: the master's memory stays bounded
+    /// for a replica that never finishes loading.
+    #[tokio::test]
+    async fn a_full_sync_past_its_queue_limit_is_dropped() {
+        let state = Arc::new(ReplState::new_master());
+        state
+            .replica_max_backlog_bytes
+            .store(100, Ordering::Relaxed);
+        state
+            .replica_sync_max_backlog_bytes
+            .store(1000, Ordering::Relaxed);
+        let hub = start_hub(Arc::clone(&state));
+        let pending = Arc::new(AtomicU64::new(0));
+        let _rx = register_syncing(&hub, 9006, &pending);
+        await_connected(&state, 1).await;
+        for _ in 0..19 {
+            propagate(&hub, vec![0u8; 50]);
+        }
+        barrier(&hub).await;
+        assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 1);
+        // `CONFIG SET` applies to a replica already attached.
+        state
+            .replica_sync_max_backlog_bytes
+            .store(500, Ordering::Relaxed);
+        propagate(&hub, vec![0u8; 50]);
+        await_connected(&state, 0).await;
     }
 
     #[test]
@@ -3823,7 +4551,7 @@ mod replication_invariants_tests {
     #[tokio::test]
     async fn wait_targets_ignore_writes_the_replica_was_never_sent() {
         let state = Arc::new(ReplState::new_master());
-        let hub = start_hub(Arc::clone(&state), TEST_MAX_BACKLOG_BYTES);
+        let hub = start_hub(Arc::clone(&state));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ReplPayload>();
 
         // FULLRESYNC announced offset 0, then 500 bytes of writes happened
@@ -3867,6 +4595,29 @@ mod replication_invariants_tests {
         hub.send(HubMsg::Barrier(done_tx)).unwrap();
         done_rx.await.unwrap();
         assert_eq!(ReplState::count_reached(&targets), 1);
+    }
+
+    /// A master that becomes a replica keeps where its own stream stands as
+    /// where its dataset stands: its replica, promoted, continues it from
+    /// there. Not when the stream did not count every write.
+    #[test]
+    fn a_demoted_master_keeps_its_own_stream_position() {
+        let s = ReplState::new_master();
+        s.backlog_active.store(true, Ordering::Relaxed);
+        s.repl_offset.store(1234, Ordering::Relaxed);
+        let id = s.repl_id();
+        s.become_slave();
+        let point = s.resync_point.lock().clone().expect("a resync point");
+        assert_eq!((point.repl_id.as_str(), point.offset), (id.as_str(), 1234));
+        assert_ne!(s.repl_id(), id);
+        // Already a replica: a re-point keeps what it has.
+        s.become_slave();
+        assert_eq!(s.resync_point.lock().as_ref().map(|p| p.offset), Some(1234));
+
+        let quiet = ReplState::new_master();
+        quiet.repl_offset.store(99, Ordering::Relaxed);
+        quiet.become_slave();
+        assert!(quiet.resync_point.lock().is_none());
     }
 
     /// Link state drives both `ROLE` and `master_link_status`; "up" must mean

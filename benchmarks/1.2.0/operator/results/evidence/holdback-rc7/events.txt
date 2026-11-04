@@ -1,0 +1,17 @@
+2026-11-02T20:17:21Z   Normal    NoPods             2     No matching pods found
+2026-11-02T20:17:22Z   Normal    SuccessfulCreate   1     Create Claim data-rep-0 Pod rep-0 in StatefulSet rep success
+2026-11-02T21:10:40Z   Normal    SuccessfulCreate   6     Create Pod rep-0 in StatefulSet rep successful
+2026-11-02T20:17:22Z   Normal    SuccessfulCreate   1     Create Claim data-rep-1 Pod rep-1 in StatefulSet rep success
+2026-11-02T20:17:22Z   Normal    SuccessfulCreate   1     Create Claim data-rep-2 Pod rep-2 in StatefulSet rep success
+2026-11-02T21:10:10Z   Normal    SuccessfulCreate   5     Create Pod rep-2 in StatefulSet rep successful
+2026-11-02T21:09:20Z   Normal    SuccessfulCreate   6     Create Pod rep-1 in StatefulSet rep successful
+2026-11-02T20:21:23Z   Normal    RollingUpdate      1     replacing rep-2 to apply the updated pod template (2 more to go)
+2026-11-02T20:21:45Z   Normal    RollingUpdate      1     replacing rep-1 to apply the updated pod template (1 more to go)
+2026-11-02T20:21:58Z   Normal    Switchover         1     moved the master role from rep-0 to rep-1 (rollout); writes were held on rep-0 for 55ms until rep-1 had applied everything up to offset 6642195
+2026-11-02T20:21:59Z   Normal    RollingUpdate      1     replacing rep-0 to apply the updated pod template (0 more to go)
+2026-11-02T20:40:35Z   Normal    Switchover         1     moved the master role from rep-1 to rep-2 (the master pod is being deleted); writes were held on rep-1 for 50ms until rep-2 had applied everything up to offset 42276136
+2026-11-02T20:58:09Z   Warning   Failover           1     master rep-2 is unavailable; promoted rep-0
+2026-11-02T21:05:42Z   Normal    Switchover         1     moved the master role from rep-0 to rep-1 (step-down); writes were held on rep-0 for 53ms until rep-1 had applied everything up to offset 5194445
+2026-11-02T21:08:29Z   Normal    Switchover         1     moved the master role from rep-1 to rep-0 (step-down); writes were held on rep-1 for 55ms until rep-0 had applied everything up to offset 9814360
+2026-11-02T21:10:34Z   Normal    Switchover         1     moved the master role from rep-0 to rep-1 (step-down); writes were held on rep-0 for 52ms until rep-1 had applied everything up to offset 14107465
+2026-11-02T21:13:35Z   Warning   Failover           1     master rep-1 is unavailable; promoted rep-0

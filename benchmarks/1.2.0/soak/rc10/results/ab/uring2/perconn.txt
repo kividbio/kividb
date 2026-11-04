@@ -1,0 +1,9 @@
+probe a, round 1, 104.9 s
+conn 0: ops 6557, over 10 ms 96.2 %, over 100 ms 72.7 %, worst 1077 ms
+conn 1: ops 6557, over 10 ms 69.5 %, over 100 ms 0.8 %, worst 171 ms
+conn 2: ops 6557, over 10 ms 67.6 %, over 100 ms 0.4 %, worst 147 ms
+conn 3: ops 6557, over 10 ms 69.6 %, over 100 ms 0.8 %, worst 160 ms
+conn 4: ops 6557, over 10 ms 69.5 %, over 100 ms 1.0 %, worst 166 ms
+conn 5: ops 6557, over 10 ms 68.6 %, over 100 ms 0.4 %, worst 133 ms
+conn 6: ops 6556, over 10 ms 96.6 %, over 100 ms 71.6 %, worst 1049 ms
+conn 7: ops 6557, over 10 ms 69.9 %, over 100 ms 0.8 %, worst 175 ms

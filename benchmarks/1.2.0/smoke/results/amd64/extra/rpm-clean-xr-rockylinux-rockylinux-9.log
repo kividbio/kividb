@@ -1,0 +1,32 @@
+Rocky Linux 9 - BaseOS                           40 MB/s |  44 MB     00:01    
+Rocky Linux 9 - AppStream                        24 MB/s |  30 MB     00:01    
+Rocky Linux 9 - Extras                           23 kB/s |  17 kB     00:00    
+Dependencies resolved.
+================================================================================
+ Package        Architecture   Version               Repository            Size
+================================================================================
+Installing:
+ kividb         x86_64         1.2.0~rc7-1           @commandline         6.0 M
+
+Transaction Summary
+================================================================================
+Install  1 Package
+
+Total size: 6.0 M
+Installed size: 15 M
+Downloading Packages:
+Running transaction check
+Transaction check succeeded.
+Running transaction test
+Transaction test succeeded.
+Running transaction
+  Preparing        :                                                        1/1 
+  Running scriptlet: kividb-1.2.0~rc7-1.x86_64                              1/1 
+  Installing       : kividb-1.2.0~rc7-1.x86_64                              1/1 
+  Running scriptlet: kividb-1.2.0~rc7-1.x86_64                              1/1 
+  Verifying        : kividb-1.2.0~rc7-1.x86_64                              1/1 
+
+Installed:
+  kividb-1.2.0~rc7-1.x86_64                                                     
+
+Complete!
