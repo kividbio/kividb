@@ -31,7 +31,7 @@
 // S pushes to D over an ordinary client connection, authenticating with the
 // same credentials replication uses (`masteruser` / `masterauth`).
 
-use super::{ClusterState, NodeId, key_hash_slot};
+use super::{ClusterState, MigrationState, NodeId, key_hash_slot};
 use crate::replication::{HubTx, ReplPayload, ReplState};
 use parking_lot::Mutex;
 use std::io::{BufRead, BufReader, Write};
@@ -279,6 +279,23 @@ impl Registry {
             // takeover can begin without the task.
             None => Ok(()),
         }
+    }
+
+    /// `f` of the slot ranges of the atomic imports in progress here, but
+    /// for the one with the id `except`, with the tasks locked: none begins
+    /// or ends meanwhile.
+    fn with_imports<R>(&self, except: Option<&str>, f: impl FnOnce(&[&Ranges]) -> R) -> R {
+        let tasks = self.tasks.lock();
+        let importing: Vec<&Ranges> = tasks
+            .iter()
+            .filter(|t| {
+                t.operation == Operation::Import
+                    && t.state == TaskState::InProgress
+                    && except != Some(t.id.as_str())
+            })
+            .map(|t| &t.ranges)
+            .collect();
+        f(&importing)
     }
 
     /// Ask running tasks to stop: the one with this id, or all of them.
@@ -543,102 +560,302 @@ struct Deleted {
     removed: usize,
     /// It stopped: the dataset was no longer this node's own.
     stopped: bool,
+    /// Slots whose keys it stopped deleting, because they came back to
+    /// this node meanwhile (see [`SlotDeletions`]).
+    came_back: usize,
 }
 
-/// Delete every key in `ranges` from this node, telling replicas and the AOF.
-/// Used by the destination to discard a failed import.
-fn delete_keys_in(env: &Env, ranges: &[(u16, u16)], own: OwnDataset) -> Deleted {
-    delete_keys(
-        &env.store,
-        &env.index_store,
-        &env.repl_state,
-        &env.hub_tx,
-        |slot| in_ranges(ranges, slot),
-        own,
-    )
+// ── Deleting the keys of slots that left ─────────────────────────────────────
+
+/// The deletions of the keys of slots that have left this node, and the
+/// slots that come to it, to tell which keys a deletion may still delete
+/// (#353).
+///
+/// Such a deletion runs on its own, in batches, for as long as the keys
+/// take, and a slot can come back to this node before it ends: imported
+/// again (`CLUSTER SETSLOT IMPORTING` and `MIGRATE`, or `CLUSTER MIGRATION
+/// IMPORT`), assigned again (`SETSLOT NODE`, `ADDSLOTS`), or taken over in a
+/// failover. Keys written to it here from then on are acknowledged writes,
+/// and the deletion used to delete them with the others.
+///
+/// So whatever gives this node a slot counts it as come ([`Self::came_here`]),
+/// holding the lock of the slot table or of the migration states it
+/// changes, before a write to the slot can be routed here. A deletion notes
+/// each slot's count when it begins, and in each batch, with the batch's
+/// keys locked (`write_order`) and under the lock of the counts, deletes
+/// only the keys of slots whose count has not moved since. One look at the
+/// counts decides the batch: a write to one of its keys acknowledged before
+/// the batch locked them was routed to a slot that had come here, which the
+/// batch sees; one routed after waits for the batch, and is not deleted. A
+/// slot that has come back is left from then on, whatever becomes of it.
+///
+/// An import into a slot whose keys are still being deleted first waits for
+/// the deletion to end (see [`Self::wait_for`]), as in Redis, which deletes
+/// them before it does anything else: the keys not deleted yet would be
+/// kept, beside those the import brings.
+#[derive(Default)]
+pub struct SlotDeletions {
+    counts: Mutex<DeletionCounts>,
 }
 
-/// Delete every key whose slot `in_slots` picks, telling replicas and the
-/// AOF, for as long as the dataset is this node's `own`.
+#[derive(Default)]
+struct DeletionCounts {
+    /// Per slot, once anything has been counted: how many times it has come
+    /// to this node.
+    came: Vec<u32>,
+    /// Per slot: how many deletions of its keys are under way.
+    running: Vec<u32>,
+}
+
+impl DeletionCounts {
+    /// One entry per slot, from the first use on.
+    fn sized(&mut self) -> &mut Self {
+        if self.came.is_empty() {
+            self.came = vec![0; super::CLUSTER_SLOTS];
+            self.running = vec![0; super::CLUSTER_SLOTS];
+        }
+        self
+    }
+}
+
+impl SlotDeletions {
+    /// `slots` have come to this node: they are its own, or are being
+    /// imported into it. Called by whatever gives them, holding the lock of
+    /// what it changes, before a write to them can be routed here; for an
+    /// atomic import, before it asks the source to start.
+    pub fn came_here(&self, slots: impl IntoIterator<Item = u16>) {
+        let mut counts = self.counts.lock();
+        let counts = counts.sized();
+        for slot in slots {
+            let came = &mut counts.came[slot as usize];
+            *came = came.wrapping_add(1);
+        }
+    }
+
+    /// Whether the keys of one of `slots` are being deleted.
+    pub fn running(&self, mut slots: impl Iterator<Item = u16>) -> bool {
+        let counts = self.counts.lock();
+        !counts.running.is_empty() && slots.any(|slot| counts.running[slot as usize] > 0)
+    }
+
+    /// Wait until no deletion of the keys of `slots` is under way, for at
+    /// most `limit`, and not once `stop` says to stop. Whether none is.
+    pub fn wait_for(
+        &self,
+        slots: &[u16],
+        limit: Option<Duration>,
+        stop: impl Fn() -> bool,
+    ) -> bool {
+        let began = Instant::now();
+        loop {
+            if !self.running(slots.iter().copied()) {
+                return true;
+            }
+            if stop() || limit.is_some_and(|limit| began.elapsed() >= limit) {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// One deletion of the keys of some slots, since it began: see
+/// [`SlotDeletions`].
+struct DeleteRun {
+    deletions: Arc<SlotDeletions>,
+    /// Per slot whose keys it still deletes, how many times the slot had
+    /// come to this node when it began; `None` for the other slots.
+    seen: Vec<Option<u32>>,
+    /// How many of its slots came back to this node while it ran.
+    came_back: usize,
+}
+
+impl DeleteRun {
+    /// Begin deleting the keys of those of `slots` that are not this
+    /// node's, nor being imported into it, now. `import` is the atomic
+    /// import whose keys these are, when it is one that did not complete:
+    /// the slots of the others in progress are left out.
+    fn begin(
+        cluster: &ClusterState,
+        slots: impl IntoIterator<Item = u16>,
+        import: Option<&str>,
+    ) -> Self {
+        let me = cluster.myself();
+        let deletions = Arc::clone(&cluster.slot_deletions);
+        let mut seen = vec![None; super::CLUSTER_SLOTS];
+        // The import tasks, the slot table, the migration states, the
+        // counts: in this order (see `ClusterState`). What gives this node a
+        // slot changes one of them first, and counts it under that lock.
+        cluster.slot_migrations.with_imports(import, |importing| {
+            let owners = cluster.slots.read();
+            let migrations = cluster.migrations.read();
+            let mut counts = deletions.counts.lock();
+            let counts = counts.sized();
+            for slot in slots {
+                let i = slot as usize;
+                let here = owners[i] == Some(me)
+                    || matches!(
+                        migrations.get(&slot),
+                        Some(MigrationState::Importing { .. })
+                    )
+                    || importing.iter().any(|ranges| in_ranges(ranges, slot));
+                if here || seen[i].is_some() {
+                    continue;
+                }
+                seen[i] = Some(counts.came[i]);
+                counts.running[i] += 1;
+            }
+        });
+        DeleteRun {
+            deletions,
+            seen,
+            came_back: 0,
+        }
+    }
+
+    /// Whether it deletes any keys at all.
+    fn deletes_any(&self) -> bool {
+        self.seen.iter().any(Option::is_some)
+    }
+
+    /// Whether it still deletes the keys of `slot`.
+    fn deletes(&self, slot: u16) -> bool {
+        self.seen[slot as usize].is_some()
+    }
+
+    /// Of `keys`, locked against every other write to them, which to
+    /// delete: those of slots that have not come to this node since it
+    /// began. One look, under the lock of the counts.
+    fn still_to_delete(&mut self, keys: &[String]) -> Vec<bool> {
+        let mut counts = self.deletions.counts.lock();
+        let counts = counts.sized();
+        let mut delete = Vec::with_capacity(keys.len());
+        for key in keys {
+            let i = key_hash_slot(key.as_bytes()) as usize;
+            delete.push(match self.seen[i] {
+                Some(at) if counts.came[i] == at => true,
+                Some(_) => {
+                    self.seen[i] = None;
+                    counts.running[i] -= 1;
+                    self.came_back += 1;
+                    false
+                }
+                None => false,
+            });
+        }
+        delete
+    }
+}
+
+impl Drop for DeleteRun {
+    fn drop(&mut self) {
+        let mut counts = self.deletions.counts.lock();
+        let counts = counts.sized();
+        for (i, seen) in self.seen.iter().enumerate() {
+            if seen.is_some() {
+                counts.running[i] -= 1;
+            }
+        }
+    }
+}
+
+/// Delete the keys of the slots of `run`, telling replicas and the AOF, for
+/// as long as the dataset is this node's `own`, and of each slot for as
+/// long as it has not come back to this node. `between` is called between
+/// two batches, out of the write gate.
 fn delete_keys(
     store: &crate::store::Store,
     index_store: &crate::vector::IndexStore,
     repl_state: &Arc<ReplState>,
     hub_tx: &HubTx,
-    in_slots: impl Fn(u16) -> bool,
+    run: &mut DeleteRun,
     own: OwnDataset,
+    mut between: impl FnMut(),
 ) -> Deleted {
     let mut removed = 0usize;
     let Some(db) = store.first() else {
         return Deleted {
             removed,
             stopped: false,
+            came_back: run.came_back,
         };
     };
     for shard in db.iter() {
         let keys: Vec<String> = crate::read_lock!(shard)
             .keys()
-            .filter(|k| in_slots(key_hash_slot(k.as_bytes())))
+            .filter(|k| run.deletes(key_hash_slot(k.as_bytes())))
             .map(|k| k.to_string())
             .collect();
         for chunk in keys.chunks(128) {
-            // One whole write, as far as a full sync or a backup is concerned.
-            let _gate = crate::write_gate::enter();
-            if !own.still(repl_state) {
-                return Deleted {
-                    removed,
-                    stopped: true,
-                };
-            }
-            let _order = crate::write_order::lock_keys(0, chunk.iter().map(|k| k.as_bytes()));
-            let mut del = vec![b"DEL".to_vec()];
-            for key in chunk {
-                if crate::commands::helpers::delete_key(store, 0, key) {
-                    crate::vector::maybe_unindex(index_store, 0, key);
-                    del.push(key.as_bytes().to_vec());
-                    removed += 1;
+            {
+                // One whole write, as far as a full sync or a backup is
+                // concerned.
+                let _gate = crate::write_gate::enter();
+                if !own.still(repl_state) {
+                    return Deleted {
+                        removed,
+                        stopped: true,
+                        came_back: run.came_back,
+                    };
+                }
+                let _order = crate::write_order::lock_keys(0, chunk.iter().map(|k| k.as_bytes()));
+                // Decided with the keys locked: a write to one of them is
+                // done before, to a slot seen to have come back, or waits
+                // until they are deleted (#353).
+                let delete = run.still_to_delete(chunk);
+                let mut del = vec![b"DEL".to_vec()];
+                for (key, _) in chunk.iter().zip(delete).filter(|(_, delete)| *delete) {
+                    if crate::commands::helpers::delete_key(store, 0, key) {
+                        crate::vector::maybe_unindex(index_store, 0, key);
+                        del.push(key.as_bytes().to_vec());
+                        removed += 1;
+                    }
+                }
+                if del.len() > 1 {
+                    crate::replication::replicate_from_background(repl_state, hub_tx, 0, &del);
                 }
             }
-            if del.len() > 1 {
-                crate::replication::replicate_from_background(repl_state, hub_tx, 0, &del);
-            }
+            between();
         }
     }
     Deleted {
         removed,
         stopped: false,
+        came_back: run.came_back,
     }
 }
 
-/// [`delete_keys`] of the keys of `slots`.
-fn delete_keys_of_slots(
-    store: &crate::store::Store,
-    index_store: &crate::vector::IndexStore,
-    repl_state: &Arc<ReplState>,
-    hub_tx: &HubTx,
-    slots: &[u16],
-    own: OwnDataset,
-) -> Deleted {
-    let mut picked = vec![false; crate::cluster::CLUSTER_SLOTS];
-    for slot in slots {
-        picked[*slot as usize] = true;
+/// [`delete_keys`]' `between` outside tests: once, after the first batch,
+/// the failpoint `slot-keys-deleting` (`aof::failpoint`), at which a test
+/// holds the deletion part way.
+fn stall_once_for_test() -> impl FnMut() {
+    let mut first = true;
+    move || {
+        if std::mem::take(&mut first) {
+            crate::aof::failpoint("slot-keys-deleting");
+        }
     }
-    delete_keys(
-        store,
-        index_store,
-        repl_state,
-        hub_tx,
-        |slot| picked[slot as usize],
-        own,
-    )
 }
 
-/// Logged when [`delete_keys`] stopped part way.
-fn log_deletion_stopped(what: &str, removed: usize) {
-    log_info!(
-        "Cluster: stopped deleting the keys of {what} after {removed}: this node has \
-         followed a master since, and its keys are the master's"
-    );
+/// Logged when [`delete_keys`] stopped part way, or left slots that came
+/// back.
+fn log_deletion(what: &str, deleted: &Deleted) {
+    if deleted.stopped {
+        log_info!(
+            "Cluster: stopped deleting the keys of {what} after {}: this node has become \
+             a replica since it began, or a master afresh, and the keys it has now are \
+             not the ones it set out to delete",
+            deleted.removed
+        );
+    }
+    if deleted.came_back > 0 {
+        log_info!(
+            "Cluster: kept the keys of {} slot(s) of {what}: they came back to this node \
+             while they were being deleted, and keys written to them here since are not \
+             to be deleted",
+            deleted.came_back
+        );
+    }
 }
 
 /// Delete the keys of slots another master has taken from this one.
@@ -658,33 +875,72 @@ pub(crate) fn drop_lost_slots(cluster: &ClusterState, slots: Vec<u16>) {
         return;
     };
     let starter = &hooks.replica_starter;
-    let own = match OwnDataset::now(&starter.repl_state) {
+    let _ = start_dropping(
+        cluster,
+        &starter.store,
+        &starter.index_store,
+        &starter.repl_state,
+        &starter.hub_tx,
+        slots,
+    );
+}
+
+/// [`drop_lost_slots`], given the server's parts. The thread that deletes,
+/// or `None` when there is nothing to delete: on a replica, or with every
+/// slot back here already.
+fn start_dropping(
+    cluster: &ClusterState,
+    store: &crate::store::Store,
+    index_store: &crate::vector::IndexStore,
+    repl_state: &Arc<ReplState>,
+    hub_tx: &HubTx,
+    slots: Vec<u16>,
+) -> Option<std::thread::JoinHandle<Deleted>> {
+    let own = match OwnDataset::now(repl_state) {
         Some(own) if cluster.my_master_id().is_none() => own,
-        _ => return,
+        _ => return None,
     };
-    let store = Arc::clone(&starter.store);
-    let index_store = Arc::clone(&starter.index_store);
-    let repl_state = Arc::clone(&starter.repl_state);
-    let hub_tx = starter.hub_tx.clone();
+    // Begun here, not on its thread: an import into one of the slots waits
+    // for it from now on.
+    let mut run = DeleteRun::begin(cluster, slots.iter().copied(), None);
+    if !run.deletes_any() {
+        return None;
+    }
+    let store = Arc::clone(store);
+    let index_store = Arc::clone(index_store);
+    let repl_state = Arc::clone(repl_state);
+    let hub_tx = hub_tx.clone();
     let spawned = std::thread::Builder::new()
         .name("kividb-lost-slots".into())
         .spawn(move || {
-            let deleted =
-                delete_keys_of_slots(&store, &index_store, &repl_state, &hub_tx, &slots, own);
-            let removed = deleted.removed;
-            if deleted.stopped {
-                log_deletion_stopped("slots owned by another node", removed);
-            } else if removed > 0 {
+            let deleted = delete_keys(
+                &store,
+                &index_store,
+                &repl_state,
+                &hub_tx,
+                &mut run,
+                own,
+                stall_once_for_test(),
+            );
+            drop(run);
+            log_deletion("slots owned by another node", &deleted);
+            if !deleted.stopped && deleted.removed > 0 {
                 log_info!(
-                    "Cluster: deleted {removed} key(s) in {} slot(s) owned by another node",
+                    "Cluster: deleted {} key(s) in {} slot(s) owned by another node",
+                    deleted.removed,
                     slots.len()
                 );
             }
+            deleted
         });
-    if let Err(e) = spawned {
-        log_error!(
-            "Cluster: could not start the lost-slot cleanup thread: {e} — keys in slots now owned by another node stay here until the next restart"
-        );
+    match spawned {
+        Ok(thread) => Some(thread),
+        Err(e) => {
+            log_error!(
+                "Cluster: could not start the lost-slot cleanup thread: {e} — keys in slots now owned by another node stay here until the next restart"
+            );
+            None
+        }
     }
 }
 
@@ -1127,17 +1383,17 @@ fn migrate_out(env: &Env, task: &Task) -> Result<u64, String> {
     if let Some(own) = own
         && !handed.is_empty()
     {
-        let deleted = delete_keys_of_slots(
+        let mut run = DeleteRun::begin(&env.cluster, handed.iter().copied(), None);
+        let deleted = delete_keys(
             &env.store,
             &env.index_store,
             &env.repl_state,
             &env.hub_tx,
-            &handed,
+            &mut run,
             own,
+            stall_once_for_test(),
         );
-        if deleted.stopped {
-            log_deletion_stopped("the slots handed over", deleted.removed);
-        }
+        log_deletion("the slots handed over", &deleted);
     }
     Ok(paused_ms)
 }
@@ -1453,7 +1709,7 @@ fn run_import(env: Env, task_id: String) {
             return;
         }
         if task.cancel.load(Ordering::Relaxed) {
-            delete_unowned(&env, &task.ranges);
+            delete_unowned(&env, &task);
             registry.finish(&task_id, TaskState::Canceled, None);
             save_imports(&env.cluster);
             return;
@@ -1482,12 +1738,31 @@ fn run_import(env: Env, task_id: String) {
             t.taking_over = false;
         });
 
+        // Not while this node is still deleting the keys it had of these
+        // slots: it would keep those it had not deleted yet beside the ones
+        // the import brings (#353). Then the slots have come here, before
+        // the source is asked to send anything: a deletion of their keys
+        // begun before leaves them, and every key the import writes.
+        let slots: Vec<u16> = slots_of(&task.ranges).collect();
+        let deletions = &env.cluster.slot_deletions;
+        if deletions.running(slots.iter().copied()) {
+            log_info!(
+                "Cluster: the import of slots {} waits for the keys this node is still \
+                 deleting from them",
+                ranges_text(&task.ranges)
+            );
+            if !deletions.wait_for(&slots, None, || task.cancel.load(Ordering::Relaxed)) {
+                continue;
+            }
+        }
+        deletions.came_here(slots);
+
         let outcome = import_attempt(&env, &task, source);
         match outcome {
             // Taken over, canceled, or otherwise finished by a handler.
             None => return,
             Some(error) => {
-                delete_unowned(&env, &task.ranges);
+                delete_unowned(&env, &task);
                 registry.update(&task_id, |t| {
                     t.last_error = error;
                     t.retries += 1;
@@ -1541,7 +1816,7 @@ fn import_attempt(env: &Env, task: &Task, source: NodeId) -> Option<String> {
                     task.id.as_bytes(),
                 ]));
             }
-            delete_unowned(env, &task.ranges);
+            delete_unowned(env, task);
             registry.finish(&task.id, TaskState::Canceled, None);
             save_imports(&env.cluster);
             return None;
@@ -1562,23 +1837,30 @@ fn import_attempt(env: &Env, task: &Task, source: NodeId) -> Option<String> {
 }
 
 /// Discard the keys of an import that did not complete — but never the keys
-/// of slots this node has come to own, nor any on a node that has become a
-/// replica, whose keys are its master's (see [`OwnDataset`]).
-fn delete_unowned(env: &Env, ranges: &[(u16, u16)]) {
-    let unowned: Ranges = slots_of(ranges)
-        .filter(|slot| !env.cluster.owns_slot(*slot))
-        .map(|slot| (slot, slot))
-        .collect();
-    if unowned.is_empty() || env.cluster.my_master_id().is_some() {
+/// of slots this node has come to own or imports otherwise, nor any on a
+/// node that has become a replica, whose keys are its master's (see
+/// [`OwnDataset`]).
+fn delete_unowned(env: &Env, task: &Task) {
+    if env.cluster.my_master_id().is_some() {
         return;
     }
     let Some(own) = OwnDataset::now(&env.repl_state) else {
         return;
     };
-    let deleted = delete_keys_in(env, &unowned, own);
-    if deleted.stopped {
-        log_deletion_stopped("an import that did not complete", deleted.removed);
+    let mut run = DeleteRun::begin(&env.cluster, slots_of(&task.ranges), Some(&task.id));
+    if !run.deletes_any() {
+        return;
     }
+    let deleted = delete_keys(
+        &env.store,
+        &env.index_store,
+        &env.repl_state,
+        &env.hub_tx,
+        &mut run,
+        own,
+        || {},
+    );
+    log_deletion("an import that did not complete", &deleted);
 }
 
 /// `CLUSTER SYNCSLOTS APPLY`, on the destination: is this task expecting data?
@@ -1721,18 +2003,24 @@ fn test_failpoint(failpoint: &(&str, AtomicBool)) -> Option<Duration> {
     Some(Duration::from_millis(ms))
 }
 
-/// Sleep on a command's thread, leaving its other tasks to another worker
-/// of the multi-threaded runtime (as `pause::wait_out_handoff` does): the
-/// source's question comes on a connection of its own, and has to be
-/// answered meanwhile.
+/// Sleep on a command's thread (see [`off_the_runtime`]): the source's
+/// question comes on a connection of its own, and has to be answered
+/// meanwhile.
 fn test_sleep(delay: Duration) {
+    off_the_runtime(|| std::thread::sleep(delay));
+}
+
+/// Run `f`, which waits, on a command's thread, leaving its other tasks to
+/// another worker of the multi-threaded runtime (as
+/// `pause::wait_out_handoff` does).
+pub(crate) fn off_the_runtime<R>(f: impl FnOnce() -> R) -> R {
     let on_multi_thread_runtime = tokio::runtime::Handle::try_current().is_ok_and(|runtime| {
         runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
     });
     if on_multi_thread_runtime {
-        tokio::task::block_in_place(|| std::thread::sleep(delay));
+        tokio::task::block_in_place(f)
     } else {
-        std::thread::sleep(delay);
+        f()
     }
 }
 
@@ -1913,5 +2201,331 @@ mod tests {
         assert_eq!(registry.cancel(Some("nope")), 0);
         assert_eq!(registry.cancel(None), 1);
         assert!(registry.get("a").unwrap().cancel.load(Ordering::Relaxed));
+    }
+
+    // ── Deleting the keys of slots that left (#353) ──────────────────────
+
+    /// The slot another master has taken from this node.
+    const LOST: u16 = 1234;
+    /// How many keys this node had of it.
+    const OLD: usize = 2000;
+
+    /// A hash tag of `LOST`.
+    fn tag() -> String {
+        (0..)
+            .map(|i| format!("t{i}"))
+            .find(|t| key_hash_slot(t.as_bytes()) == LOST)
+            .unwrap()
+    }
+
+    fn old_key(i: usize) -> String {
+        format!("{{{}}}:old:{i}", tag())
+    }
+
+    fn set(store: &crate::store::Store, key: &str, value: &str) {
+        let _ = crate::store::get_shard(&store[0], key)
+            .write()
+            .insert_str(key, value);
+    }
+
+    /// A master that owned every slot and has lost `LOST`, with its `OLD`
+    /// keys of it, to `other`.
+    struct Lost {
+        cluster: Arc<ClusterState>,
+        other: NodeId,
+        store: crate::store::Store,
+        index_store: crate::vector::IndexStore,
+        repl_state: Arc<ReplState>,
+        hub_tx: HubTx,
+        _hub_rx: tokio::sync::mpsc::UnboundedReceiver<crate::replication::HubMsg>,
+    }
+
+    impl Lost {
+        fn new() -> Self {
+            let cluster = ClusterState::new_enabled(None, 15000);
+            cluster.claim_slot_range(0, 16383).unwrap();
+            let other = crate::cluster::generate_node_id();
+            let mut node = crate::cluster::ClusterNode::new(other, "10.0.0.1".into(), 7000, 17000);
+            node.flags |= crate::cluster::NodeFlags::MASTER;
+            cluster.nodes.write().insert(other, node);
+            cluster.slots.write()[LOST as usize] = Some(other);
+            let store = crate::store::new_store(1);
+            for i in 0..OLD {
+                set(&store, &old_key(i), "old");
+            }
+            let (hub_tx, _hub_rx) = tokio::sync::mpsc::unbounded_channel();
+            Lost {
+                cluster: Arc::new(cluster),
+                other,
+                store,
+                index_store: crate::vector::new_index_store(),
+                repl_state: Arc::new(ReplState::new_master()),
+                hub_tx,
+                _hub_rx,
+            }
+        }
+
+        /// Delete the keys of `LOST` as `drop_lost_slots` does, `between`
+        /// run once, after the first batch.
+        fn delete(&self, between: impl FnOnce()) -> Deleted {
+            let own = OwnDataset::now(&self.repl_state).unwrap();
+            let mut run = DeleteRun::begin(&self.cluster, [LOST], None);
+            let mut between = Some(between);
+            delete_keys(
+                &self.store,
+                &self.index_store,
+                &self.repl_state,
+                &self.hub_tx,
+                &mut run,
+                own,
+                || {
+                    if let Some(between) = between.take() {
+                        between();
+                    }
+                },
+            )
+        }
+
+        fn value(&self, key: &str) -> Option<Vec<u8>> {
+            let shard = crate::store::get_shard(&self.store[0], key);
+            match crate::read_lock!(shard).get(key)?.to_value() {
+                crate::types::KiviDBValue::String(bytes) => Some(bytes.as_slice().to_vec()),
+                _ => None,
+            }
+        }
+
+        fn old_keys_left(&self) -> usize {
+            (0..OLD)
+                .filter(|&i| self.value(&old_key(i)).is_some())
+                .count()
+        }
+
+        fn env(&self) -> Env {
+            Env {
+                store: Arc::clone(&self.store),
+                index_store: Arc::clone(&self.index_store),
+                repl_state: Arc::clone(&self.repl_state),
+                hub_tx: self.hub_tx.clone(),
+                cluster: Arc::clone(&self.cluster),
+                config: Arc::new(crate::config::Config::default()),
+            }
+        }
+    }
+
+    /// The slot coming back to this node while its keys are deleted, each
+    /// way it can, and keys written to it here then: by an import, or by
+    /// clients of the node that owns it again. The deletion went on, and
+    /// deleted them with the keys it had set out to delete (#353). It now
+    /// stops at the slot, and keeps every one of them. On its own, with
+    /// nothing coming back, it deletes them all.
+    #[test]
+    fn keys_written_to_a_slot_that_came_back_while_its_keys_were_deleted_are_kept() {
+        let lost = Lost::new();
+        let deleted = lost.delete(|| {});
+        assert_eq!((deleted.removed, deleted.came_back), (OLD, 0));
+        assert!(!deleted.stopped);
+        assert_eq!(lost.old_keys_left(), 0);
+
+        type Coming = fn(&Lost);
+        let comings: [(&str, Coming); 7] = [
+            ("SETSLOT IMPORTING", |l| {
+                l.cluster.set_importing(LOST, l.other).unwrap()
+            }),
+            ("SETSLOT NODE", |l| {
+                l.cluster.finalize_slot(LOST, l.cluster.myself()).unwrap()
+            }),
+            ("ADDSLOTS", |l| {
+                l.cluster.release_slot(LOST).unwrap();
+                l.cluster.claim_slot(LOST).unwrap();
+            }),
+            ("ADDSLOTSRANGE", |l| {
+                l.cluster.release_slot(LOST).unwrap();
+                l.cluster.claim_slot_range(LOST, LOST).unwrap();
+            }),
+            ("an atomic import's takeover", |l| {
+                l.cluster.take_over_slots([LOST].into_iter()).unwrap()
+            }),
+            ("an atomic import's start", |l| {
+                // What `run_import` says before it asks the source to start.
+                l.cluster.slot_deletions.came_here([LOST])
+            }),
+            ("a failover", |l| {
+                let _ = l.cluster.promote_self(l.other, 1_000_000);
+            }),
+        ];
+        for (how, come) in comings {
+            let lost = Lost::new();
+            let new: Vec<String> = (0..300).map(|i| format!("{{{}}}:new:{i}", tag())).collect();
+            let mut overwritten = Vec::new();
+            let deleted = lost.delete(|| {
+                come(&lost);
+                for key in &new {
+                    set(&lost.store, key, "new");
+                }
+                for key in (0..OLD).step_by(7).map(old_key) {
+                    if lost.value(&key).is_some() {
+                        set(&lost.store, &key, "new");
+                        overwritten.push(key);
+                    }
+                }
+            });
+            assert!(
+                deleted.removed > 0 && deleted.removed < OLD && !deleted.stopped,
+                "{how}: deleted {} of {OLD}",
+                deleted.removed
+            );
+            assert_eq!(deleted.came_back, 1, "{how}");
+            assert!(!overwritten.is_empty());
+            for key in new.iter().chain(&overwritten) {
+                assert_eq!(
+                    lost.value(key).as_deref(),
+                    Some(&b"new"[..]),
+                    "{how}: {key}, written after the slot came back, was deleted"
+                );
+            }
+            assert_eq!(lost.old_keys_left(), OLD - deleted.removed, "{how}");
+            assert!(!lost.cluster.slot_deletions.running([LOST].into_iter()));
+        }
+    }
+
+    /// A deletion begun while an atomic import of the slot is in progress
+    /// here leaves the slot: the import's keys are not the deletion's to
+    /// delete, but the import's own, when it does not complete. So does one
+    /// begun while the slot is being imported with `SETSLOT IMPORTING`, or
+    /// is this node's again.
+    #[test]
+    fn a_deletion_leaves_a_slot_that_is_here_when_it_begins() {
+        let lost = Lost::new();
+        lost.cluster
+            .slot_migrations
+            .add(task("in", vec![(LOST, LOST)]))
+            .unwrap();
+        assert!(!DeleteRun::begin(&lost.cluster, [LOST], None).deletes_any());
+        assert!(DeleteRun::begin(&lost.cluster, [LOST], Some("in")).deletes_any());
+        lost.cluster
+            .slot_migrations
+            .finish("in", TaskState::Failed, None);
+        assert!(DeleteRun::begin(&lost.cluster, [LOST], None).deletes_any());
+
+        lost.cluster.set_importing(LOST, lost.other).unwrap();
+        assert!(!DeleteRun::begin(&lost.cluster, [LOST], None).deletes_any());
+        lost.cluster.clear_migration(LOST);
+        lost.cluster
+            .finalize_slot(LOST, lost.cluster.myself())
+            .unwrap();
+        assert!(!DeleteRun::begin(&lost.cluster, [LOST], None).deletes_any());
+    }
+
+    /// A deletion under way counts as running for its slots until it ends,
+    /// or until the slot comes back; an import waits on that.
+    #[test]
+    fn a_deletion_is_running_until_it_ends_or_its_slot_comes_back() {
+        let lost = Lost::new();
+        let deletions = &lost.cluster.slot_deletions;
+        let run = DeleteRun::begin(&lost.cluster, [LOST], None);
+        assert!(deletions.running([LOST].into_iter()));
+        assert!(!deletions.running([LOST + 1].into_iter()));
+        assert!(!deletions.wait_for(&[LOST], Some(Duration::from_millis(30)), || false));
+        drop(run);
+        assert!(deletions.wait_for(&[LOST], Some(Duration::from_millis(30)), || false));
+
+        let lost = Lost::new();
+        let deleted = lost.delete(|| {
+            assert!(lost.cluster.slot_deletions.running([LOST].into_iter()));
+            lost.cluster.set_importing(LOST, lost.other).unwrap();
+        });
+        assert_eq!(deleted.came_back, 1);
+        assert!(!lost.cluster.slot_deletions.running([LOST].into_iter()));
+    }
+
+    /// A deletion stops at its next batch when the node has become a
+    /// replica since it began, or has been made a master afresh: the keys
+    /// it has then are a master's, or were (#348). The keys it has not
+    /// deleted yet stay.
+    #[test]
+    fn a_deletion_stops_when_the_node_becomes_a_replica_part_way() {
+        type Change = fn(&ReplState);
+        let changes: [(&str, Change); 3] = [
+            ("a replica", |r| r.become_slave()),
+            ("a replica, then promoted", |r| {
+                r.become_slave();
+                r.become_master();
+            }),
+            ("a master afresh", |r| r.become_master()),
+        ];
+        for (how, change) in changes {
+            let lost = Lost::new();
+            let deleted = lost.delete(|| change(&lost.repl_state));
+            assert!(deleted.stopped, "{how}: it did not stop");
+            assert!(
+                deleted.removed > 0 && deleted.removed < OLD,
+                "{how}: deleted {}",
+                deleted.removed
+            );
+            assert_eq!(lost.old_keys_left(), OLD - deleted.removed, "{how}");
+        }
+    }
+
+    /// The keys of slots lost to another master are not dropped on a
+    /// replica, whose keys are its master's (#348): whether the replication
+    /// layer or the cluster's view says it is one. On a master they are.
+    #[test]
+    fn lost_slots_are_dropped_on_a_master_only() {
+        let start = |lost: &Lost| {
+            start_dropping(
+                &lost.cluster,
+                &lost.store,
+                &lost.index_store,
+                &lost.repl_state,
+                &lost.hub_tx,
+                vec![LOST],
+            )
+        };
+        let lost = Lost::new();
+        lost.repl_state.become_slave();
+        assert!(start(&lost).is_none());
+        assert_eq!(lost.old_keys_left(), OLD);
+
+        let lost = Lost::new();
+        let me = lost.cluster.myself();
+        lost.cluster.nodes.write().get_mut(&me).unwrap().master_id = Some(lost.other);
+        assert!(start(&lost).is_none());
+        assert_eq!(lost.old_keys_left(), OLD);
+
+        let lost = Lost::new();
+        let deleted = start(&lost).unwrap().join().unwrap();
+        assert_eq!((deleted.removed, deleted.stopped), (OLD, false));
+        assert_eq!(lost.old_keys_left(), 0);
+        assert!(!lost.cluster.slot_deletions.running([LOST].into_iter()));
+    }
+
+    /// The keys of an import that did not complete are not deleted on a
+    /// replica (#348), whichever says it is one, nor in a slot this node
+    /// owns. On a master they are.
+    #[test]
+    fn an_import_that_did_not_complete_is_deleted_on_a_master_only() {
+        let import = task("in", vec![(LOST, LOST)]);
+        let lost = Lost::new();
+        lost.repl_state.become_slave();
+        delete_unowned(&lost.env(), &import);
+        assert_eq!(lost.old_keys_left(), OLD);
+
+        let lost = Lost::new();
+        let me = lost.cluster.myself();
+        lost.cluster.nodes.write().get_mut(&me).unwrap().master_id = Some(lost.other);
+        delete_unowned(&lost.env(), &import);
+        assert_eq!(lost.old_keys_left(), OLD);
+
+        let lost = Lost::new();
+        lost.cluster
+            .finalize_slot(LOST, lost.cluster.myself())
+            .unwrap();
+        delete_unowned(&lost.env(), &import);
+        assert_eq!(lost.old_keys_left(), OLD);
+
+        let lost = Lost::new();
+        lost.cluster.slot_migrations.add(import.clone()).unwrap();
+        delete_unowned(&lost.env(), &import);
+        assert_eq!(lost.old_keys_left(), 0);
     }
 }

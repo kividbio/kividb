@@ -1100,8 +1100,9 @@ fn cmd_failover(ctx: &mut Ctx) -> Vec<u8> {
         "takeover" => {
             // Bypass quorum entirely: bump epoch, claim slots, broadcast.
             let epoch = ctx.cluster.bump_epoch();
-            ctx.cluster.promote_self(master_id, epoch);
+            let claimed = ctx.cluster.promote_self(master_id, epoch);
             ctx.repl_state.become_master();
+            ctx.cluster.drop_slots_lost_while_promoting(&claimed);
             log_info!("Cluster: Manual TAKEOVER promoted us to master at epoch {epoch}");
             // Announce it now, not on the next heartbeat.
             let state = Arc::clone(ctx.cluster);
@@ -1192,6 +1193,42 @@ fn slot_changed_state() {
     crate::pause::routes_moved();
 }
 
+/// How long `SETSLOT IMPORTING` waits for the keys this node had of the slot
+/// to be deleted.
+const SLOT_DELETION_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Before `slot` is imported here: wait for the deletion of the keys this
+/// node had of it, which a node that lost the slot runs on its own, to end,
+/// as Redis deletes them before it does anything else (#353). For up to
+/// [`SLOT_DELETION_WAIT`], and not inside a transaction, which holds every
+/// other write back. Imported all the same, the slot keeps the keys not
+/// deleted yet, beside every write it is given.
+fn wait_for_slot_deletion(ctx: &Ctx, slot: u16) {
+    let deletions = &ctx.cluster.slot_deletions;
+    if !deletions.running(std::iter::once(slot)) {
+        return;
+    }
+    let done = if crate::write_gate::held_by_this_thread()
+        || crate::command_gate::alone_on_this_thread()
+    {
+        false
+    } else {
+        log_info!(
+            "Cluster: SETSLOT {slot} IMPORTING waits for the keys this node is still deleting \
+             from the slot"
+        );
+        crate::cluster::migration::off_the_runtime(|| {
+            deletions.wait_for(&[slot], Some(SLOT_DELETION_WAIT), || false)
+        })
+    };
+    if !done {
+        log_warn!(
+            "Cluster: the keys this node had of slot {slot} are still being deleted; it is \
+             importing the slot all the same, and keeps those not deleted yet"
+        );
+    }
+}
+
 fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
     let cmd = &ctx.cmd;
     if let Some(err) = require_cluster_mode(ctx.cluster) {
@@ -1243,6 +1280,7 @@ fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
                 Some(id) => id,
                 None => return resp_error("ERR Invalid node id"),
             };
+            wait_for_slot_deletion(ctx, slot);
             if let Err(e) = ctx.cluster.set_importing(slot, src) {
                 return resp_error(&format!("ERR {e}"));
             }
@@ -2489,5 +2527,117 @@ mod tests {
         }
         let here = hash(&[("a", "1", None), ("b", "2", Some(later))]);
         assert!(same_hash_but_for_expired_fields(&here, &sent));
+    }
+
+    /// Run `MIGRATE` with `args` as the command is run once it has been
+    /// routed, on a node with `store` and `repl_state`.
+    fn migrate_after_routing(
+        store: &crate::store::Store,
+        repl_state: &Arc<crate::replication::ReplState>,
+        args: &[&str],
+    ) -> Vec<u8> {
+        use crate::commands::ctx::NoopAofSender;
+        let lastsave = Arc::new(parking_lot::RwLock::new(0i64));
+        let (hub_tx, _hub_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = Arc::new(crate::config::Config::default());
+        let started_at = Instant::now();
+        let index_store = crate::vector::new_index_store();
+        let dict_store = crate::vector::new_dict_store();
+        let wait_table = Arc::new(crate::wait_table::WaitTable::new());
+        let ts_index = crate::store::new_ts_index();
+        let pubsub = crate::pubsub::PubSubHub::new();
+        let acl_store = crate::acl::new_acl_store("");
+        let acl_log = crate::acl::new_acl_log();
+        let slowlog = crate::slowlog::new_slowlog(u64::MAX, 0);
+        let latency = crate::latency::new_latency_tracker();
+        let (compaction_tx, _compaction_rx) = crate::vector::new_compaction_channel();
+        let cluster = Arc::new(ClusterState::new_disabled());
+        let client_registry = crate::client_registry::new_client_registry();
+        let monitor_registry = crate::monitor::new_monitor_registry();
+        let tracking_table = crate::tracking::new_tracking_table();
+        let mut selected_db = 0usize;
+        let mut ctx = Ctx {
+            cmd: args.iter().map(|a| a.as_bytes()).collect(),
+            store,
+            lastsave: &lastsave,
+            selected_db: &mut selected_db,
+            aof_tx: &NoopAofSender,
+            aof_enabled: false,
+            config: &config,
+            started_at: &started_at,
+            index_store: &index_store,
+            dict_store: &dict_store,
+            wait_table: &wait_table,
+            ts_index: &ts_index,
+            pubsub: &pubsub,
+            hub_tx: &hub_tx,
+            repl_state,
+            watch_registry: &crate::watch::NoopWatchRegistry,
+            client_id: 0,
+            client_registry: &client_registry,
+            resp: 2,
+            acl_store: &acl_store,
+            acl_log: &acl_log,
+            slowlog: &slowlog,
+            latency: &latency,
+            compaction_tx: &compaction_tx,
+            cluster: &cluster,
+            bypass_cluster_check: false,
+            apply_replication: false,
+            skip_write_side_effects: false,
+            peer_addr: "127.0.0.1:1",
+            monitor_registry: &monitor_registry,
+            authenticated_user: "default",
+            tracking_table: &tracking_table,
+            blocking: None,
+        };
+        handle_migrate(&mut ctx, "MIGRATE").unwrap()
+    }
+
+    /// `MIGRATE` on a node that has become a replica since the command was
+    /// routed is refused with `READONLY`, and sends nothing: it would have
+    /// deleted, once sent, keys its master has (#348). Its keys stay. On a
+    /// master it goes ahead, and reaches the destination.
+    #[test]
+    fn migrate_on_a_node_that_became_a_replica_after_routing_is_refused() {
+        let _pause = crate::pause::TEST_LOCK.lock();
+        crate::pause::clear_pause();
+        let destination = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        destination.set_nonblocking(true).unwrap();
+        let port = destination.local_addr().unwrap().port().to_string();
+        let store = crate::store::new_store(1);
+        let _ = crate::store::get_shard(&store[0], "moving")
+            .write()
+            .insert_str("moving", "v");
+        let has_key = || {
+            crate::read_lock!(crate::store::get_shard(&store[0], "moving")).contains_key("moving")
+        };
+        let args = ["MIGRATE", "127.0.0.1", port.as_str(), "moving", "0", "200"];
+
+        let repl_state = Arc::new(crate::replication::ReplState::new_master());
+        repl_state.become_slave();
+        let reply = migrate_after_routing(&store, &repl_state, &args);
+        assert!(
+            reply.starts_with(b"-READONLY"),
+            "{}",
+            String::from_utf8_lossy(&reply)
+        );
+        assert!(has_key());
+        assert!(
+            destination.accept().is_err(),
+            "a replica's MIGRATE reached the destination"
+        );
+
+        // On a master, it goes ahead: the destination does not answer, and
+        // the key stays.
+        let repl_state = Arc::new(crate::replication::ReplState::new_master());
+        let reply = migrate_after_routing(&store, &repl_state, &args);
+        assert!(
+            !reply.starts_with(b"-READONLY"),
+            "{}",
+            String::from_utf8_lossy(&reply)
+        );
+        assert!(destination.accept().is_ok());
+        assert!(has_key());
     }
 }

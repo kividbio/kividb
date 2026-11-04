@@ -4055,6 +4055,239 @@ fn keys_of_a_slot_lost_to_another_master_are_dropped() {
     assert!(loser.is_master());
 }
 
+// ── A slot back while its old keys are deleted (#353) ─────────────────────────
+
+/// The failpoint at which a node's deletion of the keys of slots it has lost
+/// waits, after its first batch.
+const DELETING: (&str, &str) = ("KIVIDB_TEST_FAILPOINTS", "slot-keys-deleting");
+
+/// A slot lost, and the deletion of its keys held part way.
+struct HeldDeletion {
+    nodes: Vec<Node>,
+    slot: u16,
+    /// The hash tag of the slot's keys.
+    tag: String,
+    old: Vec<String>,
+    /// The failpoint's file: removing it lets the deletion go on.
+    held: PathBuf,
+}
+
+/// Two masters. The first has lost a slot to the second, by the second's
+/// claim at a newer epoch, with 2000 keys of it, and its deletion of them is
+/// held part way.
+fn a_slot_lost_with_its_deletion_held() -> HeldDeletion {
+    let (nodes, ranges) = form_cluster_with_env(2, &[DELETING]);
+    let (loser, winner) = (&nodes[0], &nodes[1]);
+    let tag = key_in(ranges[0].0..=ranges[0].1, "back");
+    let slot = slot_of(&tag);
+    let old: Vec<String> = (0..2000).map(|i| format!("{{{tag}}}:old:{i}")).collect();
+    let sets: Vec<Vec<&str>> = old.iter().map(|k| vec!["SET", k.as_str(), "old"]).collect();
+    assert!(loser.conn().pipeline(&sets).iter().all(Resp::is_ok));
+
+    let mut w = winner.conn();
+    let bumped = w.cmd(&["CLUSTER", "BUMPEPOCH"]);
+    assert!(bumped.err().is_none(), "{bumped:?}");
+    let r = w.cmd(&[
+        "CLUSTER",
+        "SETSLOT",
+        &slot.to_string(),
+        "NODE",
+        &winner.id(),
+    ]);
+    assert!(r.is_ok(), "{r:?}");
+    let held = loser.dir.join("failpoint.slot-keys-deleting.1");
+    wait_until(
+        "the deletion of the lost slot's keys to be held part way",
+        Duration::from_secs(30),
+        || held.exists(),
+    );
+    let left = loser
+        .conn()
+        .cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot.to_string()])
+        .int();
+    assert!(
+        left > 0 && left < old.len() as i64,
+        "{left} of {} keys left",
+        old.len()
+    );
+    HeldDeletion {
+        nodes,
+        slot,
+        tag,
+        old,
+        held,
+    }
+}
+
+impl HeldDeletion {
+    /// Write to the slot on the first node, which has it back: 300 new
+    /// keys, and every seventh of the old ones again, each after `ASKING`
+    /// if `asking`. The keys whose write was acknowledged.
+    fn write(&self, conn: &mut Conn, asking: bool) -> Vec<String> {
+        let keys: Vec<String> = (0..300)
+            .map(|i| format!("{{{}}}:new:{i}", self.tag))
+            .chain(self.old.iter().step_by(7).cloned())
+            .collect();
+        let mut commands: Vec<Vec<&str>> = Vec::new();
+        for key in &keys {
+            if asking {
+                commands.push(vec!["ASKING"]);
+            }
+            commands.push(vec!["SET", key.as_str(), "new"]);
+        }
+        let replies = conn.pipeline(&commands);
+        let sets = replies
+            .iter()
+            .skip(usize::from(asking))
+            .step_by(1 + usize::from(asking));
+        let written: Vec<String> = keys
+            .iter()
+            .zip(sets)
+            .filter(|(_, reply)| reply.is_ok())
+            .map(|(key, _)| key.clone())
+            .collect();
+        assert_eq!(written.len(), keys.len(), "{replies:?}");
+        written
+    }
+
+    /// Let the deletion go on, and wait for it to end.
+    fn go_on(&self) {
+        let loser = &self.nodes[0];
+        std::fs::remove_file(&self.held).unwrap();
+        wait_until(
+            "the deletion of the lost slot's keys to end",
+            Duration::from_secs(30),
+            || loser.log().contains("slot(s) owned by another node"),
+        );
+    }
+
+    /// Every key in `written` is on the first node, as written. They used
+    /// to be deleted with the slot's old keys (#353).
+    fn assert_kept(&self, written: &[String]) {
+        let loser = &self.nodes[0];
+        let mut l = loser.conn();
+        let lost: Vec<&String> = written
+            .iter()
+            .filter(|key| !matches!(l.cmd(&["GET", key]), Resp::Bulk(value) if value == b"new"))
+            .collect();
+        assert!(
+            lost.is_empty(),
+            "{} of {} acknowledged writes to the slot were deleted, e.g. {:?}\n{}",
+            lost.len(),
+            written.len(),
+            lost.first(),
+            loser.log()
+        );
+    }
+
+    /// The slot has the keys of `written`, and none of the old ones besides:
+    /// the import waited for the deletion to end.
+    fn assert_only(&self, written: &[String]) {
+        let count = self.nodes[0]
+            .conn()
+            .cmd(&["CLUSTER", "COUNTKEYSINSLOT", &self.slot.to_string()])
+            .int();
+        assert_eq!(count, written.len() as i64);
+    }
+}
+
+/// Wait until `importing` has ended, or the first node of `held` waits for
+/// the deletion of the slot's old keys before it imports.
+fn wait_imported_or_waiting<T>(
+    held: &HeldDeletion,
+    importing: &std::thread::ScopedJoinHandle<'_, T>,
+) {
+    wait_until(
+        "the import to end, or to wait for the deletion",
+        Duration::from_secs(30),
+        || importing.is_finished() || held.nodes[0].log().contains("waits for the keys"),
+    );
+}
+
+/// A slot imported back with `SETSLOT IMPORTING` and `ASKING` writes, as
+/// `redis-cli --cluster reshard` moves one, while the keys this node had of
+/// it before it lost the slot were still being deleted. The deletion went
+/// on, and deleted the acknowledged writes with them (#353). `SETSLOT
+/// IMPORTING` now waits for it to end, as Redis deletes the keys before it
+/// answers anything else.
+#[test]
+fn keys_imported_back_with_asking_while_the_old_keys_were_deleted_are_kept() {
+    let held = a_slot_lost_with_its_deletion_held();
+    let (loser, winner) = (&held.nodes[0], &held.nodes[1]);
+    let (loser_id, winner_id) = (loser.id(), winner.id());
+    let slot = held.slot.to_string();
+    let written = std::thread::scope(|scope| {
+        let importing = scope.spawn(|| {
+            let mut l = loser.conn();
+            let r = l.cmd(&["CLUSTER", "SETSLOT", &slot, "IMPORTING", &winner_id]);
+            assert!(r.is_ok(), "{r:?}");
+            let r = winner
+                .conn()
+                .cmd(&["CLUSTER", "SETSLOT", &slot, "MIGRATING", &loser_id]);
+            assert!(r.is_ok(), "{r:?}");
+            let written = held.write(&mut l, true);
+            for node in [loser, winner] {
+                let r = node
+                    .conn()
+                    .cmd(&["CLUSTER", "SETSLOT", &slot, "NODE", &loser_id]);
+                assert!(r.is_ok(), "{r:?}");
+            }
+            written
+        });
+        wait_imported_or_waiting(&held, &importing);
+        held.go_on();
+        importing.join().unwrap()
+    });
+    held.assert_kept(&written);
+    held.assert_only(&written);
+}
+
+/// A slot imported back with `CLUSTER MIGRATION IMPORT`, and written to,
+/// while the keys this node had of it were still being deleted: the
+/// deletion deleted the writes (#353). The import now waits for it to end.
+#[test]
+fn keys_imported_back_atomically_while_the_old_keys_were_deleted_are_kept() {
+    let held = a_slot_lost_with_its_deletion_held();
+    let loser = &held.nodes[0];
+    let slot = held.slot.to_string();
+    let written = std::thread::scope(|scope| {
+        let importing = scope.spawn(|| {
+            let mut l = loser.conn();
+            let task_id = l
+                .cmd(&["CLUSTER", "MIGRATION", "IMPORT", &slot, &slot])
+                .text();
+            assert_eq!(task_id.len(), 40, "{task_id}");
+            wait_import_completed(loser, &task_id);
+            held.write(&mut l, false)
+        });
+        wait_imported_or_waiting(&held, &importing);
+        held.go_on();
+        importing.join().unwrap()
+    });
+    held.assert_kept(&written);
+    held.assert_only(&written);
+}
+
+/// A slot given back with `SETSLOT NODE` while the keys this node had of it
+/// were still being deleted, and written to: the deletion deleted the
+/// writes (#353). It now leaves the slot's keys once the slot is back.
+#[test]
+fn keys_written_to_a_slot_given_back_while_the_old_keys_were_deleted_are_kept() {
+    let held = a_slot_lost_with_its_deletion_held();
+    let (loser, winner) = (&held.nodes[0], &held.nodes[1]);
+    let loser_id = loser.id();
+    let slot = held.slot.to_string();
+    for node in [loser, winner] {
+        let r = node
+            .conn()
+            .cmd(&["CLUSTER", "SETSLOT", &slot, "NODE", &loser_id]);
+        assert!(r.is_ok(), "{r:?}");
+    }
+    let written = held.write(&mut loser.conn(), false);
+    held.go_on();
+    held.assert_kept(&written);
+}
+
 // ── Pub/Sub ───────────────────────────────────────────────────────────────────
 
 /// A message published on one node reaches a subscriber connected to another.

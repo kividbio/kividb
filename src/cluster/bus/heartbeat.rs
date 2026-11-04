@@ -555,10 +555,13 @@ async fn promote(
     old_master: NodeId,
     epoch: u64,
 ) {
-    state.promote_self(old_master, epoch);
+    let claimed = state.promote_self(old_master, epoch);
     // Flip our INFO replication role too — the cluster sees us as master,
     // repl_state needs to agree.
     repl_state.become_master();
+    // A claim of some of the slots that came in between left their keys:
+    // this node was a replica still to the replication layer.
+    state.drop_slots_lost_while_promoting(&claimed);
     state.end_election();
     // Announce the new ownership now rather than on the next heartbeat tick:
     // until the others hear it they keep redirecting clients to the old

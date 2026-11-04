@@ -107,6 +107,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   does a node that drops the keys of slots another master took, or of an
   import that did not complete. `MIGRATE` on a node that became a replica
   after the command was routed is refused with `READONLY`.
+- **Keys written to a slot that came back while its old keys were being
+  deleted could be deleted too (#353).** A node that loses a slot to
+  another master deletes the keys it had of it, in batches, on its own. If
+  the slot came back before that ended (imported with `CLUSTER SETSLOT
+  IMPORTING` and `MIGRATE` or `ASKING` writes, imported with `CLUSTER
+  MIGRATION IMPORT`, given back with `SETSLOT NODE` or `ADDSLOTS`, or
+  taken over in a failover), the deletion went on, and deleted the keys
+  written to the slot since: acknowledged writes. A deletion now stops at
+  a slot once it has come back, and keeps every key written to it. An
+  import into such a slot, `SETSLOT IMPORTING` or `CLUSTER MIGRATION
+  IMPORT`, first waits for the deletion to end, as Redis deletes the keys
+  before it does anything else (`SETSLOT IMPORTING` for up to 10 seconds,
+  then imports and keeps the keys not deleted yet). A replica promoted in
+  a failover that lost some of its new slots to another master straight
+  away now drops their keys, which it used to keep, stale.
 - **Writes could stay paused after an atomic slot migration's handoff
   (#349).** A node told during the handoff that it had been marked failed
   holds writes until it has made sure it still owns its slots. The handoff
