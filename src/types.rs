@@ -269,23 +269,14 @@ impl SortedSetInner {
 
     /// Remove a member. Returns true if it existed.
     pub fn remove(&mut self, member: &[u8]) -> bool {
-        // We need to find the member by byte slice, but our key is Arc<[u8]>.
-        // AHashMap supports heterogeneous lookup via the Borrow trait.
-        if let Some(&score) = self.members.get(member) {
-            // We need the Arc to remove from by_score — get it from members first.
-            // remove() returns the owned key, but we need it for by_score.
-            // Clone the Arc before removing (cheap — just atomic increment).
-            let arc_member: ZMember = self
-                .members
-                .iter()
-                .find(|(k, _)| k.as_ref() == member)
-                .map(|(k, _)| k.clone())
-                .unwrap();
-            self.members.remove(member);
-            self.by_score.remove(&(OrderedFloat(score), arc_member));
-            true
-        } else {
-            false
+        // Retrieve the owned key directly, avoiding a linear scan of the member map.
+        match self.members.remove_entry(member) {
+            Some((arc_member, score)) => {
+                let indexed = self.by_score.remove(&(OrderedFloat(score), arc_member));
+                debug_assert!(indexed.is_some(), "member missing from by_score");
+                true
+            }
+            None => false,
         }
     }
 
@@ -1245,5 +1236,83 @@ impl KiviDBValue {
             KiviDBValue::HashEx(_) => "hash",
             KiviDBValue::Array(_) => "array",
         }
+    }
+}
+
+#[cfg(test)]
+mod sorted_set_tests {
+    use super::*;
+
+    fn m(name: &[u8]) -> ZMember {
+        Arc::from(name)
+    }
+
+    /// `members` and `by_score` hold exactly the same (member, score) pairs.
+    /// (By value: after a score update the two keys can be different Arcs of
+    /// the same bytes, as `insert` keeps the old key in `members`.)
+    fn assert_in_sync(zs: &SortedSetInner) {
+        assert_eq!(zs.members.len(), zs.by_score.len());
+        for (score, member) in zs.by_score.keys() {
+            assert_eq!(zs.members.get(member.as_ref()), Some(&score.0));
+        }
+    }
+
+    fn order(zs: &SortedSetInner) -> Vec<(&[u8], f64)> {
+        zs.by_score.keys().map(|(s, m)| (m.as_ref(), s.0)).collect()
+    }
+
+    #[test]
+    fn remove_keeps_both_indexes_in_sync() {
+        let mut zs = SortedSetInner::new();
+        assert!(!zs.remove(b"a"), "empty set");
+        assert!(zs.insert(m(b"a"), 1.0));
+        assert!(zs.insert(m(b"b"), 2.0));
+        assert!(zs.insert(m(b"c"), 2.0)); // ties b: ordered by name
+        assert!(zs.insert(m(b"\xff\x00z"), 0.5)); // not UTF-8
+        assert_in_sync(&zs);
+
+        assert!(zs.remove(b"b"));
+        assert!(!zs.remove(b"b"), "already removed");
+        assert!(!zs.remove(b"missing"));
+        assert_in_sync(&zs);
+        assert_eq!(
+            order(&zs),
+            [(&b"\xff\x00z"[..], 0.5), (b"a", 1.0), (b"c", 2.0)]
+        );
+
+        assert!(zs.remove(b"\xff\x00z"));
+        assert_in_sync(&zs);
+        assert_eq!(order(&zs), [(&b"a"[..], 1.0), (b"c", 2.0)]);
+    }
+
+    #[test]
+    fn update_remove_and_reinsert_keep_both_indexes_in_sync() {
+        let mut zs = SortedSetInner::new();
+        zs.insert(m(b"a"), 1.0);
+        zs.insert(m(b"b"), 2.0);
+        assert!(!zs.insert(m(b"a"), 3.0), "score update is not new");
+        assert_in_sync(&zs);
+        assert_eq!(order(&zs), [(&b"b"[..], 2.0), (b"a", 3.0)]);
+
+        assert!(zs.remove(b"a"));
+        assert!(zs.insert(m(b"a"), -1.0), "reinsertion is new");
+        assert_in_sync(&zs);
+        assert_eq!(order(&zs), [(&b"a"[..], -1.0), (b"b", 2.0)]);
+
+        assert!(zs.remove(b"a"));
+        assert!(zs.remove(b"b"));
+        assert!(zs.is_empty());
+        assert!(zs.by_score.is_empty());
+    }
+
+    /// Removal drops the member's last reference: neither index keeps it.
+    #[test]
+    fn remove_releases_the_member() {
+        let mut zs = SortedSetInner::new();
+        let a = m(b"a");
+        zs.insert(Arc::clone(&a), 1.0);
+        assert_eq!(Arc::strong_count(&a), 3); // ours, members, by_score
+        assert!(zs.remove(b"a"));
+        assert_eq!(Arc::strong_count(&a), 1);
     }
 }
