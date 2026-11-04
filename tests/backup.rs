@@ -1786,3 +1786,19 @@ fn the_aof_on_with_a_log_that_cannot_be_opened_still_exits() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A backup into the data directory would share its files' prefix with the
+/// server's own, and `BACKUP CLEANUP` would delete `appendonly.aof.prev` with
+/// them. It is refused.
+#[test]
+fn a_backup_into_the_data_directory_is_refused() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    std::fs::write(dir.join("kividb.conf"), "backupdirname .\n").unwrap();
+    let server = start_in(&dir, &[]);
+    let mut c = server.conn();
+    let reply = c.cmd(&["BACKUP", "START"]);
+    assert!(
+        matches!(&reply, V::Err(e) if e.contains("is the data directory")),
+        "{reply:?}"
+    );
+}

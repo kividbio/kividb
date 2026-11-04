@@ -963,3 +963,346 @@ fn the_aof_turned_off_and_on_again_replays_only_what_no_snapshot_has() {
         }
     }
 }
+
+// ── Logs older than the dump (#354) ──────────────────────────────────────────
+
+impl Server {
+    /// Wait for the server to exit on its own (`SHUTDOWN`), and for its port.
+    fn wait_exit(&mut self) {
+        let deadline = Instant::now() + LONG;
+        while self.child.try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "{}: the server did not exit",
+                self.io
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        while !port_is_free(self.port) {
+            assert!(Instant::now() < deadline, "port {} still taken", self.port);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// A header-only delta log for save number `number`.
+fn delta_header(number: u64) -> Vec<u8> {
+    let mut header = b"KIVIDLT1".to_vec();
+    header.extend_from_slice(&number.to_le_bytes());
+    header
+}
+
+/// A save with the AOF off wrote `dump.kdb` and not its save number, so the
+/// log beside it still read as going on from it: started again with the AOF
+/// on, the server replayed the log over the newer dump. An `INCR` made with
+/// the AOF on was applied twice, and a key deleted with the AOF off came
+/// back (#354). No crash is needed: a `SHUTDOWN` saves.
+#[test]
+fn a_restart_with_the_aof_on_after_a_save_with_it_off_applies_nothing_twice() {
+    for &io in io_models() {
+        for end in ["SHUTDOWN", "SAVE"] {
+            let mut server = Server::start(io, "");
+            let mut c = server.conn();
+            assert_eq!(c.cmd(&["INCR", "x"]).i(), 1);
+            assert!(c.cmd(&["SET", "gone", "1"]).ok());
+            durable(&mut c);
+            assert!(c.cmd(&["CONFIG", "SET", "appendonly", "no"]).ok());
+            assert_eq!(c.cmd(&["DEL", "gone"]).i(), 1);
+            assert!(c.cmd(&["SET", "k", "off"]).ok());
+            if end == "SHUTDOWN" {
+                send(&mut c, &["SHUTDOWN"]);
+                drop(c);
+                server.wait_exit();
+            } else {
+                assert!(c.cmd(&["SAVE"]).ok());
+                drop(c);
+                server.kill();
+            }
+
+            let mut c = server.restart();
+            assert_eq!(
+                c.cmd(&["GET", "x"]).s(),
+                "1",
+                "{io}, {end}: the log was replayed over the newer dump"
+            );
+            assert_eq!(c.cmd(&["GET", "gone"]), V::Nil, "{io}, {end}");
+            assert_eq!(c.cmd(&["GET", "k"]).s(), "off", "{io}, {end}");
+
+            // And the log goes on from the dump.
+            assert_eq!(c.cmd(&["INCR", "x"]).i(), 2);
+            durable(&mut c);
+            drop(c);
+            server.kill();
+            let mut c = server.restart();
+            assert_eq!(c.cmd(&["GET", "x"]).s(), "2", "{io}, {end}");
+        }
+    }
+}
+
+/// What 1.2.0 left after a save with the AOF off: a newer `dump.kdb`, and
+/// beside it the save number and the log of the dump before. Recovery tells
+/// from the fingerprint that the log does not go with this dump, leaves it
+/// out, and starts the log again on the dump: what is written next is kept.
+#[test]
+fn a_log_left_beside_a_dump_saved_by_1_2_0_with_the_aof_off_is_not_replayed() {
+    for &io in io_models() {
+        let mut server = Server::start(io, "");
+        let mut c = server.conn();
+        assert_eq!(c.cmd(&["INCR", "x"]).i(), 1);
+        assert!(c.cmd(&["SAVE"]).ok());
+        assert_eq!(c.cmd(&["INCR", "x"]).i(), 2);
+        durable(&mut c);
+        drop(c);
+        server.kill();
+        let log = std::fs::read(server.dir.join("appendonly.aof")).unwrap();
+        let saved = std::fs::read(server.dir.join("dump.kdb.gen")).unwrap();
+
+        // With the AOF off: the dump is loaded, the log is not.
+        server.aof = false;
+        let mut c = server.restart();
+        assert_eq!(c.cmd(&["GET", "x"]).s(), "1", "{io}");
+        assert_eq!(c.cmd(&["INCR", "x"]).i(), 2);
+        assert!(c.cmd(&["SET", "k", "off"]).ok());
+        assert!(c.cmd(&["SAVE"]).ok());
+        drop(c);
+        server.kill();
+        // As 1.2.0's save left them: the log and the save number untouched.
+        std::fs::write(server.dir.join("appendonly.aof"), &log).unwrap();
+        std::fs::write(server.dir.join("dump.kdb.gen"), &saved).unwrap();
+
+        server.aof = true;
+        let mut c = server.restart();
+        assert_eq!(
+            c.cmd(&["GET", "x"]).s(),
+            "2",
+            "{io}: the log was replayed over the newer dump"
+        );
+        assert_eq!(c.cmd(&["GET", "k"]).s(), "off", "{io}");
+        assert_eq!(c.cmd(&["INCR", "x"]).i(), 3);
+        durable(&mut c);
+        drop(c);
+        server.kill();
+        let mut c = server.restart();
+        assert_eq!(
+            c.cmd(&["GET", "x"]).s(),
+            "3",
+            "{io}: what was written after the restart was lost"
+        );
+    }
+}
+
+/// A `BGREWRITEAOF` waiting behind a `BGSAVE` ran after `CONFIG SET
+/// appendonly no`, and saved a dump with the AOF off, the open log left
+/// beside it. Turned on again, the AOF kept that log, and a crash during the
+/// enable replayed it over the newer dump: an `INCR` twice, an overwritten
+/// value back.
+#[test]
+fn a_rewrite_that_finds_the_aof_turned_off_leaves_no_log_to_replay() {
+    for &io in io_models() {
+        let mut server = Server::start(io, "checkpoint-turned-over");
+        let mut c = server.conn();
+        assert!(c.cmd(&["SET", "k", "v1"]).ok());
+        assert_eq!(c.cmd(&["INCR", "c"]).i(), 1);
+        durable(&mut c);
+        assert_eq!(c.cmd(&["BGSAVE"]).s(), "Background saving started");
+        assert!(server.reached("checkpoint-turned-over.1", LONG), "{io}");
+        // In the log the BGSAVE's checkpoint has just started.
+        assert_eq!(c.cmd(&["INCR", "c"]).i(), 2);
+        assert!(c.cmd(&["SET", "k", "v1b"]).ok());
+        durable(&mut c);
+        // Waits for the BGSAVE's turn, then finds the AOF off.
+        assert_eq!(c.cmd(&["BGREWRITEAOF"]).s(), STARTED);
+        assert!(c.cmd(&["CONFIG", "SET", "appendonly", "no"]).ok());
+        assert!(c.cmd(&["SET", "k", "v2"]).ok());
+        server.release("checkpoint-turned-over.1");
+        server.pass("checkpoint-turned-over.2");
+        wait_idle(&mut c);
+
+        send(&mut c, &["CONFIG", "SET", "appendonly", "yes"]);
+        assert!(server.reached("checkpoint-turned-over.3", LONG), "{io}");
+        drop(c);
+        server.kill();
+        server.failpoints.clear();
+        let mut c = server.restart();
+        assert_eq!(
+            c.cmd(&["GET", "k"]).s(),
+            "v2",
+            "{io}: an older log was replayed"
+        );
+        assert_eq!(
+            c.cmd(&["GET", "c"]).s(),
+            "2",
+            "{io}: an INCR was applied twice"
+        );
+    }
+}
+
+/// A `CONFIG SET appendonly no` that came while `CONFIG SET appendonly yes`
+/// was turning the AOF on left it off, and the enable still answered OK.
+#[test]
+fn an_enable_overtaken_by_a_disable_does_not_answer_ok() {
+    for &io in io_models() {
+        let mut server = Server::start(io, "aof-enabling");
+        let mut c = server.conn();
+        assert!(c.cmd(&["CONFIG", "SET", "appendonly", "no"]).ok());
+        assert!(c.cmd(&["SET", "k", "1"]).ok());
+        // Connections are spread over the server's threads, and the enable
+        // holds its own while it waits at the step: the disable is sent on
+        // several, and one on another thread is answered.
+        let others: Vec<Conn> = (0..8).map(|_| server.conn()).collect();
+        send(&mut c, &["CONFIG", "SET", "appendonly", "yes"]);
+        assert!(server.reached("aof-enabling.1", LONG), "{io}");
+        let (answered, answers) = std::sync::mpsc::channel();
+        let disables: Vec<_> = others
+            .into_iter()
+            .map(|mut other| {
+                let answered = answered.clone();
+                std::thread::spawn(move || {
+                    let ok = other.cmd(&["CONFIG", "SET", "appendonly", "no"]).ok();
+                    let _ = answered.send(ok);
+                })
+            })
+            .collect();
+        assert_eq!(
+            answers.recv_timeout(LONG),
+            Ok(true),
+            "{io}: no disable was answered"
+        );
+        server.release("aof-enabling.1");
+        let reply = c.read();
+        assert!(
+            matches!(&reply, V::Err(e) if e.contains("turned off")),
+            "{io}: the enable answered {reply:?} with the AOF off"
+        );
+        for disable in disables {
+            disable.join().unwrap();
+        }
+        let mut other = server.conn();
+        let on = other.cmd(&["CONFIG", "GET", "appendonly"]);
+        assert_eq!(on.arr()[1].s(), "no", "{io}");
+
+        // What it saved is the dump, alone.
+        assert!(c.cmd(&["SET", "k", "2"]).ok());
+        assert!(c.cmd(&["SAVE"]).ok());
+        drop((c, other));
+        server.kill();
+        server.failpoints.clear();
+        let mut c = server.restart();
+        assert_eq!(c.cmd(&["GET", "k"]).s(), "2", "{io}");
+    }
+}
+
+/// An `appendonly.aof.prev` left by a crash during a checkpoint of an earlier
+/// run with the AOF on, still there when the AOF is turned on at runtime: the
+/// turn-over found it, took it for one still needed, and added the log to it.
+/// A crash before the enable's snapshot was on disk replayed it.
+#[test]
+fn an_old_log_left_by_an_earlier_run_is_not_replayed_after_an_enable() {
+    for &io in io_models() {
+        let mut server = Server::start(io, "");
+        let mut c = server.conn();
+        assert!(c.cmd(&["SET", "k", "in-dump"]).ok());
+        assert!(c.cmd(&["SAVE"]).ok());
+        assert!(c.cmd(&["SET", "k", "stale"]).ok());
+        durable(&mut c);
+        drop(c);
+        server.kill();
+        // Killed during a checkpoint, the log moved aside.
+        server.failpoints = "checkpoint-turned-over".into();
+        let mut c = server.restart();
+        assert_eq!(c.cmd(&["BGREWRITEAOF"]).s(), STARTED);
+        assert!(server.reached("checkpoint-turned-over.1", LONG), "{io}");
+        drop(c);
+        server.kill();
+        assert!(server.dir.join("appendonly.aof.prev").exists(), "{io}");
+        let _ = std::fs::remove_file(server.dir.join("failpoint.checkpoint-turned-over.1"));
+
+        server.aof = false;
+        let mut c = server.restart();
+        assert_eq!(c.cmd(&["GET", "k"]).s(), "in-dump", "{io}");
+        assert!(c.cmd(&["SET", "k", "new"]).ok());
+        send(&mut c, &["CONFIG", "SET", "appendonly", "yes"]);
+        assert!(server.reached("checkpoint-turned-over.1", LONG), "{io}");
+        drop(c);
+        server.kill();
+
+        server.aof = true;
+        server.failpoints.clear();
+        let mut c = server.restart();
+        assert_eq!(
+            c.cmd(&["GET", "k"]).s(),
+            "in-dump",
+            "{io}: the earlier run's old log was replayed"
+        );
+    }
+}
+
+/// Stopped while it removes what old logs left (`appendonly.aof.prev`, and a
+/// turn-over's notes), a new log must leave files the next start reads.
+/// Removed first, `appendonly.aof.prev` left the notes without it, and the
+/// next start refused to go on.
+#[test]
+fn a_crash_while_a_new_log_replaces_the_old_ones_starts_and_replays_nothing_old() {
+    for &io in io_models() {
+        for stop in 1..=3 {
+            let mut server = Server::start(io, "");
+            let mut c = server.conn();
+            assert!(c.cmd(&["SET", "k", "in-dump"]).ok());
+            assert!(c.cmd(&["SAVE"]).ok());
+            assert!(c.cmd(&["SET", "k", "stale"]).ok());
+            durable(&mut c);
+            drop(c);
+            server.kill();
+
+            // As a crash part-way through adding a log to an old one left
+            // them: the old log, the log, the new log under its own name,
+            // and the note of how long the old log was.
+            let dir = server.dir.clone();
+            let aof = dir.join("appendonly.aof");
+            let old = std::fs::read(&aof).unwrap();
+            let number = u64::from_le_bytes(old[8..16].try_into().unwrap());
+            std::fs::rename(&aof, dir.join("appendonly.aof.prev")).unwrap();
+            std::fs::write(&aof, delta_header(number + 1)).unwrap();
+            std::fs::write(
+                dir.join("appendonly.aof.prev.len"),
+                (old.len() as u64).to_le_bytes(),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("appendonly.aof.rewrite.tmp"),
+                delta_header(number + 2),
+            )
+            .unwrap();
+
+            server.aof = false;
+            server.failpoints = "new-log-removing".into();
+            let mut c = server.restart();
+            assert_eq!(c.cmd(&["GET", "k"]).s(), "in-dump", "{io}");
+            send(&mut c, &["CONFIG", "SET", "appendonly", "yes"]);
+            for hit in 1..stop {
+                server.pass(&format!("new-log-removing.{hit}"));
+            }
+            assert!(
+                server.reached(&format!("new-log-removing.{stop}"), LONG),
+                "{io}"
+            );
+            drop(c);
+            server.kill();
+
+            server.aof = true;
+            server.failpoints.clear();
+            let mut c = server.restart();
+            assert_eq!(
+                c.cmd(&["GET", "k"]).s(),
+                "in-dump",
+                "{io}, stopped at removal {stop}: an old log was replayed"
+            );
+            assert!(c.cmd(&["SET", "k", "after"]).ok());
+            durable(&mut c);
+            drop(c);
+            server.kill();
+            let mut c = server.restart();
+            assert_eq!(c.cmd(&["GET", "k"]).s(), "after", "{io}, stop {stop}");
+        }
+    }
+}

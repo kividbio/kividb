@@ -471,6 +471,7 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                         )));
                     }
                     crate::aof::AOF_ENABLED.store(true, Relaxed);
+                    crate::aof::failpoint("aof-enabling");
                     // Redis CONFIG SET appendonly yes rewrites before
                     // OK. Returning first left a window where the next
                     // write could miss both the dump and the delta —
@@ -482,6 +483,14 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     {
                         crate::aof::AOF_ENABLED.store(false, Relaxed);
                         return Some(resp_error(&format!("ERR enabling AOF failed: {e}")));
+                    }
+                    // A `CONFIG SET appendonly no` took no turn, and may have
+                    // come in the meantime: then the AOF is off, and saying
+                    // OK would say otherwise.
+                    if !crate::aof::AOF_ENABLED.load(Relaxed) {
+                        return Some(resp_error(
+                            "ERR enabling AOF failed: the AOF was turned off while it was being turned on",
+                        ));
                     }
                     Some(resp_simple("OK"))
                 }
