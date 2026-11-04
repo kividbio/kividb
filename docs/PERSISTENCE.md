@@ -82,6 +82,20 @@ from its own files, then syncs with its master.
     whole, and kept aside;
   * an `appendonly.aof` that has grown since, beside an
     `appendonly.aof.prev` that has not, has what was added replayed.
+    Beside such an `appendonly.aof.prev`, the log is judged on its own: a
+    legacy log that has changed since the save, and a log made after the
+    save when there was none (an earlier release makes one on the next
+    save number for an `appendonly.aof.prev` with no log beside it), are
+    replayed whole, and `appendonly.aof.prev` is kept aside.
+
+  The two kinds of log are treated differently on purpose. A legacy log
+  that has grown is replayed whole, as the earlier release replayed it at
+  its start, so its records from before the save can be applied twice; it
+  has no header to say where the save was, and leaving it out would lose
+  the writes added to it. An `appendonly.aof.prev` the earlier release
+  replayed at its start is not replayed again: it is unchanged since the
+  save, its records are older than the snapshot, and nothing added to it
+  is lost by leaving it out.
 
   One case is left as it was: if an earlier release has since written
   `dump.kdb.gen` itself (a checkpoint of its own that stopped before its

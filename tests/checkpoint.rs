@@ -1877,3 +1877,149 @@ fn a_log_added_to_beside_an_older_old_log_replays_what_was_added() {
         assert_eq!(c.cmd(&["GET", "acked-on-1.2.0"]).s(), "1", "{io}");
     }
 }
+
+// ── A log beside an old log older than the dump is judged on its own (#363) ──
+
+/// A log with no header beside an old log, both replayed at a start, then a
+/// save with the AOF off. 1.2.0, started with the AOF on, replayed both over
+/// the dump and added to the log, which has no header. The old log is as it
+/// was at the save, older than the dump, and the log was left out with it:
+/// the writes added were only in the copy kept aside. Judged on its own, a
+/// log with no header that has changed since the save is replayed, whole, as
+/// 1.2.0 replayed it.
+#[test]
+fn a_log_with_no_header_written_to_beside_an_older_old_log_is_replayed() {
+    for &io in io_models() {
+        let mut server = Server::start(io, "");
+        let mut c = server.conn();
+        assert!(c.cmd(&["SET", "a", "1"]).ok());
+        assert!(c.cmd(&["SAVE"]).ok());
+        assert_eq!(c.cmd(&["INCR", "n"]).i(), 1);
+        durable(&mut c);
+        drop(c);
+        server.kill();
+        let dir = server.dir.clone();
+        std::fs::rename(dir.join("appendonly.aof"), dir.join("appendonly.aof.prev")).unwrap();
+        let old = std::fs::read(dir.join("appendonly.aof.prev")).unwrap();
+        // A log of an earlier release, with no header.
+        let mut log = incr_record("m");
+        std::fs::write(dir.join("appendonly.aof"), &log).unwrap();
+
+        let mut c = server.restart();
+        assert_eq!(c.cmd(&["GET", "n"]).s(), "1", "{io}");
+        assert_eq!(c.cmd(&["GET", "m"]).s(), "1", "{io}");
+        assert!(c.cmd(&["CONFIG", "SET", "appendonly", "no"]).ok());
+        assert!(c.cmd(&["SAVE"]).ok());
+        drop(c);
+        server.kill();
+        assert!(saved_number(&dir).1, "{io}");
+        assert_eq!(std::fs::read(dir.join("appendonly.aof")).unwrap(), log);
+
+        // 1.2.0 on it, with the AOF on: it replayed the old log and the log
+        // over the dump (m was 2), then added to the log.
+        log.extend_from_slice(&incr_record("m"));
+        log.extend_from_slice(&set_record("acked-on-1.2.0", "1"));
+        std::fs::write(dir.join("appendonly.aof"), &log).unwrap();
+
+        let mut c = server.restart();
+        assert_eq!(
+            c.cmd(&["GET", "acked-on-1.2.0"]),
+            V::Str("1".into()),
+            "{io}: the log was left out with the old log"
+        );
+        assert_eq!(
+            c.cmd(&["GET", "m"]).s(),
+            "3",
+            "{io}: the log is replayed whole, as 1.2.0 replayed it"
+        );
+        assert_eq!(
+            c.cmd(&["GET", "n"]).s(),
+            "1",
+            "{io}: the old log was replayed again"
+        );
+        let kept = kept_aside(&dir);
+        assert!(
+            kept.iter().any(|(_, bytes)| *bytes == old),
+            "{io}: the old log was not kept"
+        );
+        assert!(
+            kept.iter().any(|(_, bytes)| *bytes == log),
+            "{io}: the log was not kept"
+        );
+
+        assert_eq!(c.cmd(&["INCR", "m"]).i(), 4);
+        durable(&mut c);
+        drop(c);
+        server.kill();
+        let mut c = server.restart();
+        assert_eq!(c.cmd(&["GET", "m"]).s(), "4", "{io}");
+        assert_eq!(c.cmd(&["GET", "acked-on-1.2.0"]).s(), "1", "{io}");
+    }
+}
+
+/// An old log with no log beside it (a checkpoint stopped after moving the
+/// log aside), left alone by a start with the AOF off, then a save. 1.2.0,
+/// started with the AOF on, put a new log in place, a delta on the next save
+/// number, and added acknowledged writes to it. The old log is older than the
+/// dump, and the log was left out with it. There was no log at the save, so
+/// all of the log was written since: it is replayed.
+#[test]
+fn a_log_made_after_a_save_with_no_log_beside_an_older_old_log_is_replayed() {
+    for &io in io_models() {
+        let mut server = Server::start(io, "");
+        let mut c = server.conn();
+        assert!(c.cmd(&["SET", "a", "1"]).ok());
+        assert!(c.cmd(&["SAVE"]).ok());
+        assert_eq!(c.cmd(&["INCR", "n"]).i(), 1);
+        durable(&mut c);
+        drop(c);
+        server.kill();
+        let dir = server.dir.clone();
+        std::fs::rename(dir.join("appendonly.aof"), dir.join("appendonly.aof.prev")).unwrap();
+        let old = std::fs::read(dir.join("appendonly.aof.prev")).unwrap();
+
+        server.aof = false;
+        let mut c = server.restart();
+        assert!(c.cmd(&["SET", "b", "1"]).ok());
+        assert!(c.cmd(&["SAVE"]).ok());
+        drop(c);
+        server.kill();
+        let (number, marked) = saved_number(&dir);
+        assert!(marked, "{io}");
+        assert!(!dir.join("appendonly.aof").exists(), "{io}");
+
+        // 1.2.0 on it, with the AOF on.
+        let mut log = delta_header(number + 1);
+        log.extend_from_slice(&set_record("acked-on-1.2.0", "1"));
+        log.extend_from_slice(&incr_record("m"));
+        std::fs::write(dir.join("appendonly.aof"), &log).unwrap();
+
+        server.aof = true;
+        let mut c = server.restart();
+        assert_eq!(
+            c.cmd(&["GET", "acked-on-1.2.0"]),
+            V::Str("1".into()),
+            "{io}: the log was left out with the old log"
+        );
+        assert_eq!(c.cmd(&["GET", "m"]).s(), "1", "{io}");
+        assert_eq!(c.cmd(&["GET", "b"]).s(), "1", "{io}");
+        assert_eq!(c.cmd(&["GET", "a"]).s(), "1", "{io}");
+        let kept = kept_aside(&dir);
+        assert!(
+            kept.iter().any(|(_, bytes)| *bytes == old),
+            "{io}: the old log was not kept"
+        );
+        assert!(
+            kept.iter().any(|(_, bytes)| *bytes == log),
+            "{io}: the log was not kept"
+        );
+
+        assert_eq!(c.cmd(&["INCR", "m"]).i(), 2);
+        durable(&mut c);
+        drop(c);
+        server.kill();
+        let mut c = server.restart();
+        assert_eq!(c.cmd(&["GET", "m"]).s(), "2", "{io}");
+        assert_eq!(c.cmd(&["GET", "acked-on-1.2.0"]).s(), "1", "{io}");
+    }
+}
