@@ -207,11 +207,24 @@ pub struct LostDataset {
 /// writer, so a thread must never take a lock it already holds, read or
 /// write, and a guard must not be kept across an `.await`. Where one thread
 /// holds several, it takes them in this order and no other: `handoff_holds`,
-/// `forgotten`, `save_lock`, `failure_reports`, `nodes`, `slots`,
-/// `migrations`, `myself`. `held_writes` is held alone, or under
-/// `handoff_holds`.
+/// `forgotten`, `save_lock`, the tasks of `slot_migrations`,
+/// `failure_reports`, `nodes`, `slots`, `migrations`, `myself`,
+/// `slot_deletions`. `held_writes` is held alone, or under `handoff_holds`.
 /// A temporary guard (`self.nodes.read().get(..)`) is held to the end of
 /// its statement, or of the `match` / `if let` / `for` it heads.
+///
+/// None of these is taken while a store shard's lock is held, nor the
+/// index store's, the replication taps', or one of an index's own: its
+/// postings, its HNSW graph's `key_to_id` and `nodes`, its flat vectors.
+/// Not `nodes`, `slots`, `migrations`, `myself`, the tasks of
+/// `slot_migrations` nor `slot_deletions`. A batch of a deletion of a lost
+/// slot's keys holds `slot_deletions` while it takes all of those, to
+/// delete and unindex its keys (`migration::SlotDeletions`); the postings
+/// block a writer once their queue is full. Whatever gives this node a slot
+/// holds `slots` or `migrations` while it takes `slot_deletions`: a thread
+/// holding a shard and waiting for `slots` closes the circle, and the node
+/// stops for good (#353). Code that walks the keyspace and needs the slot
+/// table reads it once before (`owned_slots`, `search::served_slots`).
 pub struct ClusterState {
     pub enabled: bool,
     /// This node's id. Behind a lock only so `CLUSTER RESET HARD` can replace
@@ -248,6 +261,13 @@ pub struct ClusterState {
     pub migrations: RwLock<AHashMap<u16, MigrationState>>,
     /// Atomic slot migrations (`CLUSTER MIGRATION`), running and recent.
     pub slot_migrations: migration::Registry,
+    /// The deletions of the keys of slots that left this node, and the
+    /// slots that come to it meanwhile. Whatever gives this node a slot,
+    /// or starts importing one into it, says so here
+    /// ([`migration::SlotDeletions::came_here`]) while it holds `slots` or
+    /// `migrations`: a deletion begun before then leaves the slot's keys,
+    /// which may be acknowledged writes from then on (#353).
+    pub slot_deletions: std::sync::Arc<migration::SlotDeletions>,
     /// Slots assigned with `SETSLOT NODE` or removed with `DELSLOTS` here,
     /// and when: for
     /// [`BY_HAND_GRACE`] a peer's claim does not change them (see
@@ -349,6 +369,7 @@ impl ClusterState {
             election_pending: AtomicBool::new(false),
             migrations: RwLock::new(AHashMap::new()),
             slot_migrations: migration::Registry::default(),
+            slot_deletions: Default::default(),
             by_hand: parking_lot::Mutex::new(AHashMap::new()),
             forgotten: RwLock::new(AHashMap::new()),
             last_vote_for: parking_lot::Mutex::new(AHashMap::new()),
@@ -868,6 +889,22 @@ impl ClusterState {
         }
     }
 
+    /// Per slot, whether this node owns it (every slot, outside a
+    /// cluster), read off the slot table at once: for a walk of the
+    /// keyspace, which must not look at the slot table while it holds a
+    /// shard (see `ClusterState`).
+    pub fn owned_slots(&self) -> Vec<bool> {
+        if !self.enabled {
+            return vec![true; CLUSTER_SLOTS];
+        }
+        let me = self.myself();
+        self.slots
+            .read()
+            .iter()
+            .map(|owner| *owner == Some(me))
+            .collect()
+    }
+
     /// How many slots does this node own? Used by CLUSTER INFO.
     pub fn my_slot_count(&self) -> usize {
         if !self.enabled {
@@ -1251,6 +1288,7 @@ impl ClusterState {
             return Err(format!("Slot {slot} is already busy"));
         }
         slots[slot as usize] = Some(self.myself());
+        self.slot_deletions.came_here([slot]);
         Ok(())
     }
 
@@ -1366,6 +1404,7 @@ impl ClusterState {
         for i in start..=end {
             slots[i as usize] = Some(self.myself());
         }
+        self.slot_deletions.came_here(start..=end);
         Ok((end - start + 1) as usize)
     }
 
@@ -2182,20 +2221,26 @@ impl ClusterState {
 
     /// Promote ourselves: become master, claim the failed master's slots,
     /// stamp our config_epoch to the election epoch, broadcast PONG.
-    /// Caller is responsible for updating repl_state.role.
-    pub fn promote_self(&self, failed_master_id: NodeId, election_epoch: u64) {
+    /// Caller is responsible for updating repl_state.role, and then for
+    /// [`Self::drop_slots_lost_while_promoting`] of the slots this returns:
+    /// the ones it claimed.
+    pub fn promote_self(&self, failed_master_id: NodeId, election_epoch: u64) -> Vec<u16> {
         if !self.enabled {
-            return;
+            return Vec::new();
         }
 
         // Phase 1: claim the failed master's slots.
+        let mut claimed = Vec::new();
         {
+            let me = self.myself();
             let mut slots = self.slots.write();
-            for s in slots.iter_mut() {
-                if matches!(*s, Some(o) if o == failed_master_id) {
-                    *s = Some(self.myself());
+            for (slot, owner) in slots.iter_mut().enumerate() {
+                if matches!(*owner, Some(o) if o == failed_master_id) {
+                    *owner = Some(me);
+                    claimed.push(slot as u16);
                 }
             }
+            self.slot_deletions.came_here(claimed.iter().copied());
         }
 
         // Phase 2: update our own node entry.
@@ -2217,6 +2262,34 @@ impl ClusterState {
 
         // Phase 3: persist (which also refreshes the serving state).
         let _ = self.save_to_disk();
+        claimed
+    }
+
+    /// Of the slots a promotion `claimed`, those another master has taken
+    /// since. See [`Self::drop_slots_lost_while_promoting`].
+    fn slots_lost_while_promoting(&self, claimed: &[u16]) -> Vec<u16> {
+        let me = self.myself();
+        let owners = self.slots.read();
+        claimed
+            .iter()
+            .copied()
+            .filter(|&slot| owners[slot as usize].is_some_and(|owner| owner != me))
+            .collect()
+    }
+
+    /// After a promotion, once the replication layer has made this node a
+    /// master too: drop the keys of the slots it `claimed` that another
+    /// master's claim has taken since. A claim between the two found this
+    /// node a master of the slots and a replica still to the replication
+    /// layer, and left their keys here (`drop_lost_slots` deletes only from
+    /// a master's own dataset); they would have stayed, stale, until a
+    /// restart. Keys of a slot removed with `DELSLOTS` are left, as
+    /// `DELSLOTS` leaves them.
+    pub fn drop_slots_lost_while_promoting(&self, claimed: &[u16]) {
+        let lost = self.slots_lost_while_promoting(claimed);
+        if !lost.is_empty() {
+            migration::drop_lost_slots(self, lost);
+        }
     }
 
     // ── Migration state (Step 7c) ─────────────────────────────────────────────
@@ -2266,9 +2339,9 @@ impl ClusterState {
                 return Err("Unknown source node".into());
             }
         }
-        self.migrations
-            .write()
-            .insert(slot, MigrationState::Importing { src_id });
+        let mut migrations = self.migrations.write();
+        migrations.insert(slot, MigrationState::Importing { src_id });
+        self.slot_deletions.came_here([slot]);
         Ok(())
     }
 
@@ -2300,7 +2373,13 @@ impl ClusterState {
                 me.config_epoch = new_epoch;
             }
         }
-        self.slots.write()[slot as usize] = Some(new_owner);
+        {
+            let mut owners = self.slots.write();
+            owners[slot as usize] = Some(new_owner);
+            if new_owner == self.myself() {
+                self.slot_deletions.came_here([slot]);
+            }
+        }
         self.migrations.write().remove(&slot);
         self.note_by_hand([slot]);
         Ok(())
@@ -2338,6 +2417,7 @@ impl ClusterState {
                 owners[slot as usize] = Some(me);
                 migrations.remove(&slot);
             }
+            self.slot_deletions.came_here(slots.iter().copied());
         });
         steps.push(("save", t.elapsed().as_millis()));
         if saved.is_ok() {
@@ -2940,6 +3020,33 @@ mod tests {
         );
         cs.release_held_writes("the test");
         assert!(!crate::pause::handoff());
+    }
+
+    /// A promotion claims the failed master's slots before the replication
+    /// layer makes the node a master. A claim of some of them by another
+    /// master in between found it a replica there, and left their keys
+    /// (`drop_lost_slots`): they are the ones dropped once it is a master.
+    /// Not the keys of a slot removed with `DELSLOTS`, which leaves them.
+    #[test]
+    fn slots_claimed_away_while_promoting_are_the_ones_dropped() {
+        let (cs, a, b) = three_master_cluster();
+        let me = cs.myself();
+        let claimed = cs.promote_self(a, 1_000);
+        assert_eq!(claimed, (5461..=10922).collect::<Vec<u16>>());
+        let claim = [crate::cluster::bus::SlotClaim {
+            start: 6000,
+            end: 6002,
+            epoch: 1_000_000,
+        }];
+        cs.apply_peer_slot_claims(b, &claim);
+        cs.release_slot(6010).unwrap();
+        assert_eq!(cs.slot_owner(6001), Some(b));
+        assert_eq!(cs.slot_owner(6003), Some(me));
+        assert_eq!(cs.slot_owner(6010), None);
+        assert_eq!(
+            cs.slots_lost_while_promoting(&claimed),
+            vec![6000, 6001, 6002]
+        );
     }
 
     /// The end of an atomic slot migration hands over only the slots that

@@ -47,9 +47,9 @@ fn handle_cluster(ctx: &mut Ctx, sub: &str) -> Vec<u8> {
         "SHARDS" => return cmd_shards(state),
 
         // Mutating — require cluster mode (each handler checks via state.enabled)
-        "ADDSLOTS" => return cmd_addslots(state, &ctx.cmd),
+        "ADDSLOTS" => return cmd_addslots(ctx),
         "DELSLOTS" => return cmd_delslots(state, &ctx.cmd),
-        "ADDSLOTSRANGE" => return cmd_addslotsrange(state, &ctx.cmd),
+        "ADDSLOTSRANGE" => return cmd_addslotsrange(ctx),
         "DELSLOTSRANGE" => return cmd_delslotsrange(state, &ctx.cmd),
         "FLUSHSLOTS" => return cmd_flushslots(state),
         "BUMPEPOCH" => return cmd_bumpepoch(state),
@@ -573,7 +573,8 @@ fn require_cluster_mode(state: &ClusterState) -> Option<Vec<u8>> {
 }
 
 /// CLUSTER ADDSLOTS slot [slot ...]
-fn cmd_addslots(state: &ClusterState, cmd: &[&[u8]]) -> Vec<u8> {
+fn cmd_addslots(ctx: &mut Ctx) -> Vec<u8> {
+    let (state, cmd): (&ClusterState, &[&[u8]]) = (ctx.cluster, &ctx.cmd);
     if let Some(err) = require_cluster_mode(state) {
         return err;
     }
@@ -600,6 +601,10 @@ fn cmd_addslots(state: &ClusterState, cmd: &[&[u8]]) -> Vec<u8> {
             }
         }
     }
+    if let Some(refused) = before_slots_come(ctx, &slots, "ADDSLOTS") {
+        return refused;
+    }
+    let state: &ClusterState = ctx.cluster;
     for s in &slots {
         if let Err(e) = state.claim_slot(*s) {
             return resp_error(&format!("ERR {e}"));
@@ -649,7 +654,8 @@ fn cmd_delslots(state: &ClusterState, cmd: &[&[u8]]) -> Vec<u8> {
 }
 
 /// CLUSTER ADDSLOTSRANGE start-slot end-slot [start-slot end-slot ...]
-fn cmd_addslotsrange(state: &ClusterState, cmd: &[&[u8]]) -> Vec<u8> {
+fn cmd_addslotsrange(ctx: &mut Ctx) -> Vec<u8> {
+    let (state, cmd): (&ClusterState, &[&[u8]]) = (ctx.cluster, &ctx.cmd);
     if let Some(err) = require_cluster_mode(state) {
         return err;
     }
@@ -676,6 +682,14 @@ fn cmd_addslotsrange(state: &ClusterState, cmd: &[&[u8]]) -> Vec<u8> {
         i += 2;
     }
 
+    let slots: Vec<u16> = ranges
+        .iter()
+        .flat_map(|&(start, end)| start..=end)
+        .collect();
+    if let Some(refused) = before_slots_come(ctx, &slots, "ADDSLOTSRANGE") {
+        return refused;
+    }
+    let state: &ClusterState = ctx.cluster;
     // Apply each range. claim_slot_range is itself atomic per-range; if a
     // later range fails, earlier ones stay claimed. That matches Redis's
     // observable behavior.
@@ -1100,8 +1114,9 @@ fn cmd_failover(ctx: &mut Ctx) -> Vec<u8> {
         "takeover" => {
             // Bypass quorum entirely: bump epoch, claim slots, broadcast.
             let epoch = ctx.cluster.bump_epoch();
-            ctx.cluster.promote_self(master_id, epoch);
+            let claimed = ctx.cluster.promote_self(master_id, epoch);
             ctx.repl_state.become_master();
+            ctx.cluster.drop_slots_lost_while_promoting(&claimed);
             log_info!("Cluster: Manual TAKEOVER promoted us to master at epoch {epoch}");
             // Announce it now, not on the next heartbeat.
             let state = Arc::clone(ctx.cluster);
@@ -1192,6 +1207,18 @@ fn slot_changed_state() {
     crate::pause::routes_moved();
 }
 
+/// Before `slots` come to this node by `what`: the keys it still had of
+/// them, if a deletion of them is under way, are deleted first
+/// (`migration::delete_before_coming`, #353). These commands do not hold
+/// the command gate for it (`command_gate::skips`). The refusal, inside a
+/// transaction, if any.
+fn before_slots_come(ctx: &Ctx, slots: &[u16], what: &str) -> Option<Vec<u8>> {
+    let env = crate::cluster::migration::Env::from_ctx(ctx);
+    crate::cluster::migration::delete_before_coming(&env, slots, what, None)
+        .err()
+        .map(|e| resp_error(&e))
+}
+
 fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
     let cmd = &ctx.cmd;
     if let Some(err) = require_cluster_mode(ctx.cluster) {
@@ -1243,6 +1270,9 @@ fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
                 Some(id) => id,
                 None => return resp_error("ERR Invalid node id"),
             };
+            if let Some(refused) = before_slots_come(ctx, &[slot], "SETSLOT IMPORTING") {
+                return refused;
+            }
             if let Err(e) = ctx.cluster.set_importing(slot, src) {
                 return resp_error(&format!("ERR {e}"));
             }
@@ -1271,6 +1301,32 @@ fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
                 Some(id) => id,
                 None => return resp_error("ERR Invalid node id"),
             };
+            // `command_gate::skips` lets `SETSLOT ... NODE` past the gate,
+            // for the keys `NODE` to this node may delete first. To another
+            // node it takes the gate here, as every command does, and is
+            // turned away as they are by a script past its time limit: the
+            // look below for keys of the slot is then not beside a
+            // transaction or a script that writes one.
+            let _gate = if new_owner != ctx.cluster.myself() {
+                #[cfg(feature = "lua")]
+                let overrun = crate::commands::lua::running_script_is_over_its_time_limit;
+                #[cfg(not(feature = "lua"))]
+                let overrun = || false;
+                match crate::command_gate::enter_unless(
+                    std::time::Duration::from_millis(10),
+                    overrun,
+                ) {
+                    Some(gate) => Some(gate),
+                    None => {
+                        return resp_error(
+                            "BUSY Redis is busy running a script. You can only call SCRIPT KILL \
+                             or SHUTDOWN NOSAVE.",
+                        );
+                    }
+                }
+            } else {
+                None
+            };
             // Handing a slot to another node while keys from it are still here
             // strands them: clients are redirected away, and the keys sit
             // unreachable until the slot comes back. Finish the migration.
@@ -1282,6 +1338,11 @@ fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
                     "ERR Can't assign hashslot {slot} to a different node while I still hold \
                      keys for this hash slot."
                 ));
+            }
+            if new_owner == ctx.cluster.myself()
+                && let Some(refused) = before_slots_come(ctx, &[slot], "SETSLOT NODE")
+            {
+                return refused;
             }
             if let Err(e) = ctx.cluster.finalize_slot(slot, new_owner) {
                 return resp_error(&format!("ERR {e}"));
@@ -2285,7 +2346,7 @@ fn cmd_slot_stats(ctx: &mut Ctx) -> Vec<u8> {
 
     // Compute key counts per slot, only for slots we own.
     // Walk every key in the selected DB once.
-    let key_counts = compute_key_counts_per_slot(ctx);
+    let key_counts = key_counts_per_slot(&ctx.store[*ctx.selected_db], ctx.cluster);
 
     let entries: Vec<(u16, u64)> = match mode.as_str() {
         "SLOTSRANGE" => {
@@ -2398,16 +2459,24 @@ fn cmd_slot_stats(ctx: &mut Ctx) -> Vec<u8> {
 ///
 /// O(N) over all keys in the DB. For a multi-million-key DB this is slow,
 /// but SLOT-STATS is an operator command, not a hot-path one — fine for now.
-fn compute_key_counts_per_slot(ctx: &Ctx) -> std::collections::HashMap<u16, u64> {
-    use crate::cluster::key_hash_slot;
-
+///
+/// The slots this node owns are read once, before any shard is locked. It
+/// used to look each key's slot up in the slot table with the key's shard
+/// locked; with a deletion of a lost slot's keys waiting for that shard,
+/// and `ADDSLOTS` waiting for the deletion's batch with the slot table
+/// held, the three waited for each other for good, and the node with them
+/// (#353; see `ClusterState`).
+pub(crate) fn key_counts_per_slot(
+    db: &crate::store::Db,
+    cluster: &ClusterState,
+) -> std::collections::HashMap<u16, u64> {
+    let owned = cluster.owned_slots();
     let mut counts: std::collections::HashMap<u16, u64> = std::collections::HashMap::new();
-    let db = &ctx.store[*ctx.selected_db];
     for shard in db.iter() {
         let map = crate::read_lock!(shard);
         for k in map.keys() {
             let slot = key_hash_slot(k.as_bytes());
-            if ctx.cluster.owns_slot(slot) {
+            if owned[slot as usize] {
                 *counts.entry(slot).or_insert(0) += 1;
             }
         }
@@ -2489,5 +2558,117 @@ mod tests {
         }
         let here = hash(&[("a", "1", None), ("b", "2", Some(later))]);
         assert!(same_hash_but_for_expired_fields(&here, &sent));
+    }
+
+    /// Run `MIGRATE` with `args` as the command is run once it has been
+    /// routed, on a node with `store` and `repl_state`.
+    fn migrate_after_routing(
+        store: &crate::store::Store,
+        repl_state: &Arc<crate::replication::ReplState>,
+        args: &[&str],
+    ) -> Vec<u8> {
+        use crate::commands::ctx::NoopAofSender;
+        let lastsave = Arc::new(parking_lot::RwLock::new(0i64));
+        let (hub_tx, _hub_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = Arc::new(crate::config::Config::default());
+        let started_at = Instant::now();
+        let index_store = crate::vector::new_index_store();
+        let dict_store = crate::vector::new_dict_store();
+        let wait_table = Arc::new(crate::wait_table::WaitTable::new());
+        let ts_index = crate::store::new_ts_index();
+        let pubsub = crate::pubsub::PubSubHub::new();
+        let acl_store = crate::acl::new_acl_store("");
+        let acl_log = crate::acl::new_acl_log();
+        let slowlog = crate::slowlog::new_slowlog(u64::MAX, 0);
+        let latency = crate::latency::new_latency_tracker();
+        let (compaction_tx, _compaction_rx) = crate::vector::new_compaction_channel();
+        let cluster = Arc::new(ClusterState::new_disabled());
+        let client_registry = crate::client_registry::new_client_registry();
+        let monitor_registry = crate::monitor::new_monitor_registry();
+        let tracking_table = crate::tracking::new_tracking_table();
+        let mut selected_db = 0usize;
+        let mut ctx = Ctx {
+            cmd: args.iter().map(|a| a.as_bytes()).collect(),
+            store,
+            lastsave: &lastsave,
+            selected_db: &mut selected_db,
+            aof_tx: &NoopAofSender,
+            aof_enabled: false,
+            config: &config,
+            started_at: &started_at,
+            index_store: &index_store,
+            dict_store: &dict_store,
+            wait_table: &wait_table,
+            ts_index: &ts_index,
+            pubsub: &pubsub,
+            hub_tx: &hub_tx,
+            repl_state,
+            watch_registry: &crate::watch::NoopWatchRegistry,
+            client_id: 0,
+            client_registry: &client_registry,
+            resp: 2,
+            acl_store: &acl_store,
+            acl_log: &acl_log,
+            slowlog: &slowlog,
+            latency: &latency,
+            compaction_tx: &compaction_tx,
+            cluster: &cluster,
+            bypass_cluster_check: false,
+            apply_replication: false,
+            skip_write_side_effects: false,
+            peer_addr: "127.0.0.1:1",
+            monitor_registry: &monitor_registry,
+            authenticated_user: "default",
+            tracking_table: &tracking_table,
+            blocking: None,
+        };
+        handle_migrate(&mut ctx, "MIGRATE").unwrap()
+    }
+
+    /// `MIGRATE` on a node that has become a replica since the command was
+    /// routed is refused with `READONLY`, and sends nothing: it would have
+    /// deleted, once sent, keys its master has (#348). Its keys stay. On a
+    /// master it goes ahead, and reaches the destination.
+    #[test]
+    fn migrate_on_a_node_that_became_a_replica_after_routing_is_refused() {
+        let _pause = crate::pause::TEST_LOCK.lock();
+        crate::pause::clear_pause();
+        let destination = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        destination.set_nonblocking(true).unwrap();
+        let port = destination.local_addr().unwrap().port().to_string();
+        let store = crate::store::new_store(1);
+        let _ = crate::store::get_shard(&store[0], "moving")
+            .write()
+            .insert_str("moving", "v");
+        let has_key = || {
+            crate::read_lock!(crate::store::get_shard(&store[0], "moving")).contains_key("moving")
+        };
+        let args = ["MIGRATE", "127.0.0.1", port.as_str(), "moving", "0", "200"];
+
+        let repl_state = Arc::new(crate::replication::ReplState::new_master());
+        repl_state.become_slave();
+        let reply = migrate_after_routing(&store, &repl_state, &args);
+        assert!(
+            reply.starts_with(b"-READONLY"),
+            "{}",
+            String::from_utf8_lossy(&reply)
+        );
+        assert!(has_key());
+        assert!(
+            destination.accept().is_err(),
+            "a replica's MIGRATE reached the destination"
+        );
+
+        // On a master, it goes ahead: the destination does not answer, and
+        // the key stays.
+        let repl_state = Arc::new(crate::replication::ReplState::new_master());
+        let reply = migrate_after_routing(&store, &repl_state, &args);
+        assert!(
+            !reply.starts_with(b"-READONLY"),
+            "{}",
+            String::from_utf8_lossy(&reply)
+        );
+        assert!(destination.accept().is_ok());
+        assert!(has_key());
     }
 }

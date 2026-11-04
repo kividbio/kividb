@@ -143,9 +143,19 @@ pub fn served_slots(cluster: &ClusterState) -> Vec<u64> {
 
 /// Whether this node answers for `key`: its slot is this node's, or, on a
 /// replica, its master's.
+///
+/// It reads the slot table: never with a shard locked (see `ClusterState`).
+/// A walk of the keyspace takes [`served_slots`] before, and asks
+/// [`in_served`].
 pub fn serves(cluster: &ClusterState, key: &str) -> bool {
     let owner = cluster.slot_owner(crate::cluster::key_hash_slot(key.as_bytes()));
     owner.is_some() && (owner == Some(cluster.myself()) || owner == cluster.my_master_id())
+}
+
+/// Whether `key`'s slot is one of `served` ([`served_slots`]).
+pub fn in_served(served: &[u64], key: &str) -> bool {
+    let slot = crate::cluster::key_hash_slot(key.as_bytes()) as usize;
+    served[slot / 64] & (1 << (slot % 64)) != 0
 }
 
 /// Whether this command came from a coordinator.
