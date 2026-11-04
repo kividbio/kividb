@@ -2023,3 +2023,143 @@ fn a_log_made_after_a_save_with_no_log_beside_an_older_old_log_is_replayed() {
         assert_eq!(c.cmd(&["GET", "acked-on-1.2.0"]).s(), "1", "{io}");
     }
 }
+
+// ── A turn-over stopped, then a save with the AOF off (#368) ─────────────────
+
+/// A run with the AOF on, killed by a checkpoint after the log was moved
+/// aside and before the new log took its name: `appendonly.aof.prev` holds
+/// an acknowledged write (`r1`) that is in no dump, the new log is under a
+/// name of its own, and there is no log. Returns the old log.
+fn a_turn_over_stopped_after_moving_the_log_aside(server: &mut Server) -> Vec<u8> {
+    let io = server.io;
+    let mut c = server.conn();
+    assert!(c.cmd(&["SET", "a", "1"]).ok());
+    send(&mut c, &["SAVE"]);
+    server.pass("turn-over-moved-aside.1");
+    assert!(c.read().ok(), "{io}");
+    assert!(c.cmd(&["SET", "r1", "acked"]).ok());
+    durable(&mut c);
+    assert_eq!(c.cmd(&["BGREWRITEAOF"]).s(), STARTED);
+    assert!(server.reached("turn-over-moved-aside.2", LONG), "{io}");
+    drop(c);
+    server.kill();
+    let dir = &server.dir;
+    assert!(!dir.join("appendonly.aof").exists(), "{io}");
+    assert!(dir.join("appendonly.aof.rewrite.tmp").exists(), "{io}");
+    let old = std::fs::read(dir.join("appendonly.aof.prev")).unwrap();
+    assert!(holds(&old, b"r1"), "{io}");
+    server.failpoints.clear();
+    old
+}
+
+/// Then a run with the AOF off, which never loads the old log, saved; the
+/// save took the new log's save number, which it did not count. The next
+/// start with the AOF on put the new log in place, read the old log as that
+/// of a checkpoint that finished, and deleted it: `r1` was gone (#368). The
+/// old log is kept aside.
+#[test]
+fn an_old_log_left_by_a_stopped_turn_over_is_kept_after_a_save_with_the_aof_off() {
+    for &io in io_models() {
+        for end in ["SAVE", "SHUTDOWN"] {
+            let mut server = Server::start(io, "turn-over-moved-aside");
+            let old = a_turn_over_stopped_after_moving_the_log_aside(&mut server);
+            let dir = server.dir.clone();
+
+            server.aof = false;
+            let mut c = server.restart();
+            assert!(c.cmd(&["SET", "b", "1"]).ok());
+            if end == "SHUTDOWN" {
+                send(&mut c, &["SHUTDOWN"]);
+                drop(c);
+                server.wait_exit();
+            } else {
+                assert!(c.cmd(&["SAVE"]).ok());
+                drop(c);
+                server.kill();
+            }
+
+            server.aof = true;
+            let mut c = server.restart();
+            assert_eq!(c.cmd(&["GET", "b"]).s(), "1", "{io}, {end}");
+            assert_eq!(c.cmd(&["GET", "a"]).s(), "1", "{io}, {end}");
+            assert!(
+                kept_aside(&dir).iter().any(|(_, bytes)| *bytes == old),
+                "{io}, {end}: the old log, with r1, was deleted"
+            );
+            assert_ne!(
+                info_field(&mut c, "aof_superseded_files"),
+                "0",
+                "{io}, {end}"
+            );
+
+            // And the log goes on from the dump.
+            assert!(c.cmd(&["SET", "after", "1"]).ok());
+            durable(&mut c);
+            drop(c);
+            server.kill();
+            let mut c = server.restart();
+            assert_eq!(c.cmd(&["GET", "after"]).s(), "1", "{io}, {end}");
+            assert!(
+                kept_aside(&dir).iter().any(|(_, bytes)| *bytes == old),
+                "{io}, {end}"
+            );
+        }
+    }
+}
+
+/// The same, with two saves with the AOF off, and then 1.2.0 started with
+/// the AOF on: it put the turn-over's new log in place, a delta on a number
+/// below the dump's, and added an acknowledged write to it. There was no log
+/// at the save, so all of the log was written since: it is replayed, not
+/// left out as older than the dump.
+#[test]
+fn a_log_made_after_a_save_with_no_log_is_replayed_whatever_its_number() {
+    for &io in io_models() {
+        let mut server = Server::start(io, "turn-over-moved-aside");
+        let old = a_turn_over_stopped_after_moving_the_log_aside(&mut server);
+        let dir = server.dir.clone();
+
+        server.aof = false;
+        let mut c = server.restart();
+        assert!(c.cmd(&["SET", "b", "1"]).ok());
+        assert!(c.cmd(&["SAVE"]).ok());
+        assert!(c.cmd(&["SET", "b", "2"]).ok());
+        assert!(c.cmd(&["SAVE"]).ok());
+        drop(c);
+        server.kill();
+
+        // 1.2.0 on it, with the AOF on.
+        std::fs::rename(
+            dir.join("appendonly.aof.rewrite.tmp"),
+            dir.join("appendonly.aof"),
+        )
+        .unwrap();
+        let mut log = std::fs::read(dir.join("appendonly.aof")).unwrap();
+        assert_eq!(log.len(), 16, "{io}");
+        log.extend_from_slice(&set_record("acked-on-1.2.0", "1"));
+        std::fs::write(dir.join("appendonly.aof"), &log).unwrap();
+
+        server.aof = true;
+        let mut c = server.restart();
+        assert_eq!(
+            c.cmd(&["GET", "acked-on-1.2.0"]),
+            V::Str("1".into()),
+            "{io}: a log written after the save was left out as older"
+        );
+        assert_eq!(c.cmd(&["GET", "b"]).s(), "2", "{io}");
+        let kept = kept_aside(&dir);
+        assert!(
+            kept.iter().any(|(_, bytes)| *bytes == old),
+            "{io}: the old log was not kept"
+        );
+        assert!(
+            kept.iter().any(|(_, bytes)| *bytes == log),
+            "{io}: the log was not kept"
+        );
+
+        drop(c);
+        server.kill();
+        let mut c = server.restart();
+        assert_eq!(c.cmd(&["GET", "acked-on-1.2.0"]).s(), "1", "{io}");
+    }
+}
