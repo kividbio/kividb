@@ -572,11 +572,36 @@ fn memory_doctor() -> Vec<u8> {
     let (rss, _, _) = read_proc_status();
     let (used, peak) = used_and_peak();
     let (frag_ratio, frag_bytes) = fragmentation(rss, used);
+    resp_bulk_str(doctor_says(
+        used,
+        peak,
+        frag_ratio,
+        frag_bytes,
+        crate::compaction::enabled(),
+        crate::compaction::off_by_panics(),
+    ))
+}
 
-    let msg = if used < 5 << 20 {
+/// What MEMORY DOCTOR says, given `used_memory`, its peak, the
+/// fragmentation, and whether active defrag is on, or turned itself off.
+fn doctor_says(
+    used: usize,
+    peak: usize,
+    frag_ratio: f64,
+    frag_bytes: i64,
+    defrag_on: bool,
+    defrag_off_by_panics: bool,
+) -> &'static str {
+    if used < 5 << 20 {
         "Hi Sam, this instance is empty or is using very little memory, my issues detector \
          can't be used in these conditions."
-    } else if frag_ratio > 1.4 && frag_bytes > 10 << 20 && crate::compaction::enabled() {
+    } else if frag_ratio > 1.4 && frag_bytes > 10 << 20 && defrag_off_by_panics {
+        // Turning it on again is not all there is to say (#370).
+        "High fragmentation: RSS fragmentation ratio above 1.4 (the process holds over 40% more \
+         than it has allocated). Active defrag turned itself off after passes that kept \
+         panicking (the ERROR lines in the log say where); CONFIG SET activedefrag yes turns it \
+         back on. MEMORY PURGE gives freed memory back to the system at once."
+    } else if frag_ratio > 1.4 && frag_bytes > 10 << 20 && defrag_on {
         // Active defrag is on (the default since 1.2): it told the reader to
         // turn it on (#173).
         "High fragmentation: RSS fragmentation ratio above 1.4 (the process holds over 40% more \
@@ -590,8 +615,7 @@ fn memory_doctor() -> Vec<u8> {
          now. The allocator keeps some of it, which shows as fragmentation."
     } else {
         "Sam, I love your taste in T-shirts, but your memory is just fine."
-    };
-    resp_bulk_str(msg)
+    }
 }
 
 /// Hand free pages back to the OS.
@@ -621,6 +645,16 @@ fn memory_malloc_stats() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::size_class;
+
+    #[test]
+    fn memory_doctor_says_when_active_defrag_turned_itself_off() {
+        let gib = 1 << 30;
+        let says = |on, by_panics| super::doctor_says(gib, gib, 1.6, 600 << 20, on, by_panics);
+        assert!(says(false, true).contains("turned itself off"));
+        assert!(says(false, true).contains("CONFIG SET activedefrag yes"));
+        assert!(says(true, false).contains("Active defrag is on"));
+        assert!(says(false, false).contains("turn on activedefrag"));
+    }
 
     #[test]
     fn size_classes_are_jemallocs() {

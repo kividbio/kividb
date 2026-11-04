@@ -220,4 +220,10 @@ fn values_move_off_half_empty_slabs_and_read_back() {
         }
     }
     assert!(matches!(c.cmd(&["DBSIZE"]), Reply::Integer(k) if k as usize == kept));
+
+    // CONFIG RESETSTAT resets active defrag's counts too (#370).
+    c.ok(&["CONFIG", "RESETSTAT"]);
+    assert_eq!(c.info("active_defrag_hits"), 0);
+    assert_eq!(c.info("active_defrag_misses"), 0);
+    assert_eq!(c.info("active_defrag_panics"), 0);
 }

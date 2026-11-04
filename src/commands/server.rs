@@ -4700,6 +4700,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     crate::stats::EXPIRED_SUBKEYS.store(0, Ordering::Relaxed);
                     crate::stats::EXPIRED_KEYS_ACTIVE.store(0, Ordering::Relaxed);
                     crate::lazyfree::reset_freed();
+                    // `active_defrag_hits`, `_misses` and `_panics`, as Redis
+                    // resets its `stat_active_defrag_*` (#370).
+                    crate::compaction::reset_stats();
                     crate::stats::REJECTED_CONNECTIONS.store(0, Ordering::Relaxed);
                     crate::stats::reset_rdb_changes();
                     crate::stats::INSTANTANEOUS_OPS.store(0, Ordering::Relaxed);
