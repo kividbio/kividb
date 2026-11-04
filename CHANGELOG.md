@@ -103,14 +103,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   it next reached a peer, about a second, its `CLUSTER SLOTS`, `SHARDS` and
   `NODES` gave `127.0.0.1` for itself. It also saved that over the address
   it had learnt. It now starts from the address in `nodes.conf`, as Redis
-  and Valkey do, and still takes the one it is next reached on. The `?`
-  for a node's hostname right after its restart is as in Redis and Valkey:
+  and Valkey do, and still takes the one it next reaches or is reached
+  on. The `?` for a node's hostname right after its restart is as in Redis
+  and Valkey:
   a node announces the `cluster-announce-hostname` of its configuration,
   so one set only with `CONFIG SET` is not announced again until it is set
   again.
-
-### Fixed
-
 - **`CONFIG SET latency-tracking-info-percentiles` refuses what Redis refuses
   (#255).** It took any value, `abc` included, and `INFO latencystats` then
   dropped the words it could not read. A word that is not a number, and a number

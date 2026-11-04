@@ -293,9 +293,9 @@ pub struct ClusterState {
     /// `cluster-replica-validity-factor`: how stale a replica's data may be
     /// for it to stand for election, in node timeouts; 0 = always stand.
     replica_validity_factor: AtomicU64,
-    /// True while our own IP is the loopback placeholder used when binding to
-    /// a wildcard address with no `cluster-announce-ip`. While set, we send an
-    /// empty address so peers record the one they observe instead.
+    /// True while our own IP is the loopback or nodes.conf guess used when
+    /// binding to a wildcard address with no `cluster-announce-ip`. While set,
+    /// we send an empty address so peers record the one they observe instead.
     self_ip_is_guess: AtomicBool,
     /// The thread that writes nodes.conf for [`Self::save_soon`].
     background_save: std::sync::OnceLock<std::sync::mpsc::SyncSender<()>>,
@@ -817,7 +817,8 @@ impl ClusterState {
     }
 
     /// We reached a peer from `local_ip`. If our own address is still the
-    /// loopback guess and this is a real interface address, adopt it.
+    /// loopback or nodes.conf guess and this is a real interface address,
+    /// adopt it.
     pub fn learn_self_ip(&self, local_ip: std::net::IpAddr) {
         if !self.self_ip_is_guess.load(Ordering::Relaxed)
             || local_ip.is_loopback()
