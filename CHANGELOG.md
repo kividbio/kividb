@@ -9,6 +9,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Small sets of integers take about a tenth of the memory (#297).** A
+  set whose members are all the canonical decimal text of an `i64` (no
+  `+`, no leading zero, no `-0`) is kept as a sorted array of 16-, 32- or
+  64-bit integers, the narrowest that holds them, instead of a hash table
+  with an allocation per member: at 64 members about 404 bytes per key
+  instead of 3,868. Adding a member that is not such an integer, or one
+  past the limit, turns the set into the table for good. Clients see the
+  same members as before: `01`, `+1` and `-0` stay strings. Snapshots, the
+  AOF, replication and `DUMP`/`RESTORE` still write members as text, so
+  their formats do not change.
+  - The limit is `set-max-intset-entries`, now **64** by default, where
+    `CONFIG GET` said 512 (it had no effect). It can be changed with
+    `CONFIG SET` or in the configuration file. `0` disables compact arrays
+    for new members: new sets are tables, and an existing compact set stays
+    compact until its next new member is added, which turns it into the
+    table. A redis.conf carried over sets 512. Each new member of an array
+    moves the members after it and grows the array by one, so large
+    limits make `SADD` and loading a snapshot slower for sets near them.
+  - `OBJECT ENCODING` reports the form a set is kept in: `intset` only
+    for the array. A set of 65 to 512 integers, which said `intset`, now
+    says `listpack` or `hashtable`.
+  - `MEMORY USAGE` counts an array at its allocated size.
+
 - **Source archives are small again.** The tarball GitHub makes of the
   1.2.0 tag is 70 MB, against 4.5 MB for 1.1.3: the raw results of the
   1.2.0 benchmarks under `benchmarks/1.2.0/` went into it (#319).

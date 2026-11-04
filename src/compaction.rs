@@ -18,6 +18,13 @@
 //! A value that something holds besides its key (a snapshot being written, a
 //! command running) is left where it is, and its slab with it.
 //!
+//! Only slab blocks move: an entry, and a string's bytes. A collection's
+//! entry holds just its `Arc`; what that points to, and everything inside it
+//! (a set's table, or its array of integers, #297), is the system
+//! allocator's and stays where it is, on purpose. Copying the entry copies
+//! the pointer, so a command holding the collection, or about to, finds it
+//! unchanged.
+//!
 //! It starts while the slabs take more than `active-defrag-threshold-lower`
 //! per cent above what is in them, and more than `active-defrag-ignore-bytes`,
 //! and stops when the waste is under half of both.

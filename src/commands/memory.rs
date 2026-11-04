@@ -156,6 +156,12 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
         ValueRef::Set(arc) => {
             let inner = arc.read();
+            // An array of integers (#297) is counted as allocated: the shared
+            // block holding the set, and the array.
+            if let Some(array) = inner.array_bytes() {
+                let block = 2 * std::mem::size_of::<usize>() + std::mem::size_of_val(&**arc);
+                return Some(resp_integer((key_overhead + block + array) as i64));
+            }
             let len = inner.len();
             let avg = if len == 0 {
                 0

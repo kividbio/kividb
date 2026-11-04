@@ -1529,6 +1529,87 @@ mod tests {
         relocation_unwinds_at(2, true, Then::Expire);
     }
 
+    /// Defrag moving a set's entry (#297) moves only the entry: the set and
+    /// its array of integers stay where they are, held once, as they were.
+    #[test]
+    fn moving_a_sets_entry_leaves_its_array_in_place() {
+        use crate::member_set::MemberSet;
+        use crate::value_slab;
+        // Slab evacuation state is shared across the whole process.
+        // Serialize tests that plan or finish evacuation so they
+        // cannot take each other's slabs or affect global counts.
+        let _one = value_slab::EVACUATION_TESTS.lock();
+        // A length no other test's keys have: a slab class of its own.
+        let key = |i: usize| format!("{i:0>2500}");
+        let members: Vec<Vec<u8>> = (-30i64..30).map(|n| n.to_string().into_bytes()).collect();
+        // Made on a thread that ends, so that its slabs are nobody's.
+        let setup = members.clone();
+        let mut map = std::thread::spawn(move || {
+            let mut map = ShardMap::new();
+            for i in 0..64 {
+                let mut set = MemberSet::new();
+                for m in &setup {
+                    set.insert_bytes(m);
+                }
+                map.insert(key(i), KiviDBValue::Set(Arc::new(RwLock::new(set))));
+            }
+            map
+        })
+        .join()
+        .unwrap();
+        for i in 1..64 {
+            map.remove(&key(i));
+        }
+        let index = (0..map.buckets())
+            .find(|&i| map.table.get_bucket(i).is_some())
+            .unwrap();
+        let old = map.table.get_bucket(index).unwrap().entry();
+        let set_at = |map: &ShardMap| match map.get(&key(0)) {
+            Some(ValueRef::Set(set)) => Arc::as_ptr(set),
+            _ => panic!("not a set"),
+        };
+        let before = set_at(&map);
+        let (array, bytes) = {
+            let Some(ValueRef::Set(set)) = map.get(&key(0)) else {
+                unreachable!()
+            };
+            let set = set.read();
+            (set.array_ptr(), set.array_bytes())
+        };
+        assert!(array.is_some(), "the test needs the array, not the table");
+
+        let evacuating = value_slab::evacuate_only(old.base()).expect("a slab nobody owns");
+        assert_eq!(evacuating.live(), 1, "the key's slab is shared");
+        let regions = value_slab::regions_snapshot();
+        assert!(map.evacuating_at(index, &regions));
+        match map.relocate_at(index, &regions) {
+            Relocated::Moved(left) => drop(left),
+            _ => panic!("not moved"),
+        }
+        drop(evacuating);
+        assert!(map.table.get_bucket(index).unwrap().entry() != old);
+
+        // The same set, at the same address, held only by its key: the copy
+        // of the entry did not drop it or take another hold.
+        assert_eq!(set_at(&map), before);
+        let Some(ValueRef::Set(set)) = map.get(&key(0)) else {
+            panic!("not a set")
+        };
+        assert_eq!(Arc::strong_count(set), 1);
+        let set = set.read();
+        assert_eq!(set.array_ptr(), array, "the array moved");
+        assert_eq!(set.array_bytes(), bytes);
+        let mut got: Vec<Vec<u8>> = set.iter().map(|m| m.to_vec()).collect();
+        got.sort();
+        let mut want = members;
+        want.sort();
+        assert_eq!(got, want);
+        drop(set);
+        // Dropped once, from the copy.
+        drop(map.remove(&key(0)).expect("the key"));
+        assert!(map.is_empty());
+    }
+
     #[test]
     fn a_panic_moving_a_key_with_no_ttl_frees_only_the_copy() {
         relocation_unwinds_at(1, false, Then::Remove);
