@@ -856,6 +856,16 @@ pub(crate) fn query_terms(filter: &Filter, out: &mut AHashSet<String>) {
 /// are exact: the TEXT index holds every document's words as they are now
 /// (and no stopword, which a pattern does not match, as in Redis). A phrase
 /// gives the documents to try: it is about where the words are.
+/// Whether `filter` has a word in it that [`candidates`] reads off the TEXT
+/// index, and so may give documents as the matches without trying them.
+fn has_words(filter: &Filter) -> bool {
+    match filter {
+        Filter::Text { .. } => true,
+        Filter::And(l, r) | Filter::Or(l, r) => has_words(l) || has_words(r),
+        _ => false,
+    }
+}
+
 fn candidates(filter: &Filter, def: &IndexDef) -> Option<(Bits, bool)> {
     let numbers = |fields: &[String]| -> Vec<u16> {
         fields.iter().filter_map(|f| def.text_field(f)).collect()
@@ -1203,37 +1213,56 @@ pub(crate) fn filter_each(
     // the hashes with field TTLs: a read can drop a field of one before the
     // TEXT index hears of it, and they are tried, as `plan` tries them.
     // Which they are is read before the TEXT index is, for the reason it is
-    // read first there. They were not tried, and a TEXT field gone to a read
-    // still matched until the sweep came (#364).
-    let watched: AHashSet<String> = crate::field_expiry::watched_keys(ctx.store, *ctx.selected_db)
-        .into_iter()
-        .collect();
-    let found = {
+    // read first there; they were not tried, and a TEXT field gone to a read
+    // still matched until the sweep came (#364). Only for a filter with a
+    // word in it, the only kind the TEXT index answers, and turned into ids
+    // under the postings' lock, as `plan` turns them: every query that tried
+    // every document copied the whole list too, and every match was looked
+    // up in it by key (#371).
+    let watched = if has_words(filter) {
+        crate::field_expiry::watched_keys(ctx.store, *ctx.selected_db)
+    } else {
+        Vec::new()
+    };
+    // Each key, and whether it is a match on the TEXT index's word.
+    let found: Option<Vec<(Arc<str>, bool)>> = {
         // Every write queued so far applied (the TEXT index's part too: see
         // `postings::WithId`), and no id given back while the TEXT index's
         // are turned into keys. The postings, then the TEXT index.
         let p = def.postings.read();
         candidates(filter, def).map(|(ids, exact)| {
-            let keys: Vec<Arc<str>> = ids.iter().filter_map(|id| p.key(id).cloned()).collect();
-            (keys, exact && def.db_index == *ctx.selected_db)
+            let exact = exact && def.db_index == *ctx.selected_db;
+            let mut tried = Bits::new();
+            if exact {
+                for key in &watched {
+                    if let Some(id) = p.id(key) {
+                        tried.set(id);
+                    }
+                }
+            }
+            ids.iter()
+                .filter_map(|id| Some((Arc::clone(p.key(id)?), exact && !tried.get(id))))
+                .collect()
         })
     };
-    let (known, exact): (Option<Vec<Arc<str>>>, bool) = match (only, found) {
-        (Some(only), Some((found, exact))) => (
-            Some(found.into_iter().filter(|k| only.contains(&**k)).collect()),
-            exact,
+    let known: Option<Vec<(Arc<str>, bool)>> = match (only, found) {
+        (Some(only), Some(found)) => Some(
+            found
+                .into_iter()
+                .filter(|(k, _)| only.contains(&**k))
+                .collect(),
         ),
-        (Some(only), None) => (
-            Some(only.iter().map(|k| Arc::from(k.as_str())).collect()),
-            false,
+        (Some(only), None) => Some(
+            only.iter()
+                .map(|k| (Arc::from(k.as_str()), false))
+                .collect(),
         ),
-        (None, Some((found, exact))) => (Some(found), exact),
-        (None, None) => (None, false),
+        (None, found) => found,
     };
     match known {
         Some(keys) => {
             let mut seen = 0u32;
-            for key in &keys {
+            for (key, matches) in &keys {
                 let key: &str = key;
                 if deadline_due(deadline, &mut seen) {
                     timed_out = true;
@@ -1243,7 +1272,7 @@ pub(crate) fn filter_each(
                     continue;
                 }
                 with_doc(db, def, key, |fields, _| {
-                    if (exact && !watched.contains(key)) || filter::eval(filter, fields) {
+                    if *matches || filter::eval(filter, fields) {
                         accept(key, fields);
                     }
                 });

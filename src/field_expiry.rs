@@ -32,6 +32,21 @@ type Entry = (usize, usize, String);
 /// The hashes to watch, each with the earliest time one of its fields is due.
 static WATCHED: Mutex<Option<AHashMap<Entry, Instant>>> = Mutex::new(None);
 
+/// How many hashes [`WATCHED`] holds, of every store: stored under its lock
+/// after each change to it (see [`any_watched`]).
+static WATCHED_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether any hash is watched. While none is, no sweep is part way through
+/// one: a sweep's hash stays on the list until the sweep's last write to it,
+/// done under the hash's write order, has been made ([`settle_watch`]). A
+/// write applied from the master's stream takes its keys' order while one
+/// is, and when it may watch one itself, which it does before its own last
+/// write to the hash (see `handler::run_command`, #371).
+#[inline]
+pub fn any_watched() -> bool {
+    WATCHED_LEN.load(std::sync::atomic::Ordering::Acquire) > 0
+}
+
 fn store_id(store: &Store) -> usize {
     std::sync::Arc::as_ptr(store) as *const () as usize
 }
@@ -39,21 +54,26 @@ fn store_id(store: &Store) -> usize {
 /// Note that the hash at `key` has a field due at `at`.
 pub fn track(store: &Store, db: usize, key: &str, at: Instant) {
     let mut watched = WATCHED.lock();
+    let watched = watched.get_or_insert_with(AHashMap::new);
     let earliest = watched
-        .get_or_insert_with(AHashMap::new)
         .entry((store_id(store), db, key.to_string()))
         .or_insert(at);
     if at < *earliest {
         *earliest = at;
     }
+    WATCHED_LEN.store(watched.len(), std::sync::atomic::Ordering::Release);
 }
 
 /// The keys of database `db` that hold a hash with field TTLs. Reading such
 /// a hash can drop a field that is past its time before the sweep gets to
 /// it, and the indexes hear of it only from the sweep: a query that answers
 /// from postings tries these documents themselves (see
-/// `commands::search::plan`).
+/// `commands::search::plan`). Every query that answers from postings asks:
+/// while no hash is watched, without the lock every one of them took.
 pub fn watched_keys(store: &Store, db: usize) -> Vec<String> {
+    if !any_watched() {
+        return Vec::new();
+    }
     let id = store_id(store);
     let watched = WATCHED.lock();
     let Some(watched) = watched.as_ref() else {
@@ -257,6 +277,7 @@ fn settle_watch(id: usize, db: usize, key: &str, next: Option<Instant>, now: Ins
                 watched.remove(&entry);
             }
         }
+        WATCHED_LEN.store(watched.len(), std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -287,6 +308,7 @@ impl Drop for OwnWatches {
 fn forget_watches(id: usize) {
     if let Some(watched) = WATCHED.lock().as_mut() {
         watched.retain(|(store, _, _), _| *store != id);
+        WATCHED_LEN.store(watched.len(), std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -494,6 +516,229 @@ mod tests {
         );
     }
 
+    /// `cmd` applied as a replica applies its master's stream, on a thread
+    /// of its own, given 500 ms to finish: it finishes if nothing holds the
+    /// order of its keys, and waits for it otherwise. The thread, to join,
+    /// which says whether indexing was deferred around the write (by a
+    /// replay elsewhere in the process), when the attempt shows nothing.
+    fn applied_beside(
+        store: &Store,
+        index_store: &IndexStore,
+        cmd: Vec<String>,
+    ) -> std::thread::JoinHandle<bool> {
+        let (store, index_store) = (Arc::clone(store), Arc::clone(index_store));
+        let (done, finished) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let deferred = applied(&store, &index_store, cmd);
+            let _ = done.send(());
+            deferred
+        });
+        let _ = finished.recv_timeout(Duration::from_millis(500));
+        thread
+    }
+
+    /// `cmd` applied on this thread as a replica applies its master's
+    /// stream: whether indexing was deferred around it (see
+    /// [`applied_beside`]).
+    fn applied(store: &Store, index_store: &IndexStore, cmd: Vec<String>) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        let config = Arc::new(crate::config::Config::default_replica());
+        let repl_state = Arc::new(crate::replication::ReplState::new_master());
+        let dict = crate::vector::new_dict_store();
+        let wait = Arc::new(crate::wait_table::WaitTable::new());
+        let ts = crate::store::new_ts_index();
+        let (compaction_tx, _compaction_rx) = crate::vector::new_compaction_channel();
+        let env = crate::replication::replica_client::ReplicationApplyEnv::new_inert();
+        let mut db = 0usize;
+        let deferred = crate::vector::DEFER_INDEXING.load(SeqCst);
+        env.apply_command(
+            cmd.into_iter().map(String::into_bytes).collect(),
+            store,
+            &repl_state,
+            index_store,
+            &dict,
+            &wait,
+            &ts,
+            &config,
+            &compaction_tx,
+            &mut db,
+            &crate::watch::NoopWatchRegistry,
+            "replica:test",
+        )
+        .expect("applied");
+        deferred || crate::vector::DEFER_INDEXING.load(SeqCst)
+    }
+
+    /// On a replica: an `HSET` from the master, applied while the sweep
+    /// brings a hash's postings up to date, after the sweep has read the
+    /// hash's fields, waits for the sweep, and is not written over (#371).
+    #[test]
+    fn a_write_from_the_master_beside_the_sweep_is_not_written_over() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        const KEY: &str = "f371w:k";
+        // Again if a replay elsewhere in the process deferred indexing.
+        for _ in 0..50 {
+            let store = crate::store::new_store(1);
+            let _own = OwnWatches::of(&store);
+            let index_store = crate::vector::new_index_store();
+            let def = hash_losing_n(&store, &index_store, "f371w:", KEY);
+            let beside = Rc::new(RefCell::new(None));
+            {
+                let (store, index_store, beside) = (
+                    Arc::clone(&store),
+                    Arc::clone(&index_store),
+                    Rc::clone(&beside),
+                );
+                crate::test_hooks::set("index_fields: fields read", move || {
+                    let cmd = ["HSET", KEY, "n", "3"].map(String::from).to_vec();
+                    *beside.borrow_mut() = Some(applied_beside(&store, &index_store, cmd));
+                });
+            }
+            sweep(&store, &index_store);
+            crate::test_hooks::clear("index_fields: fields read");
+            let Some(thread) = beside.borrow_mut().take() else {
+                continue;
+            };
+            if thread.join().unwrap() {
+                continue;
+            }
+            let p = def.postings.read();
+            let id = p.id(KEY).expect("still in the index");
+            let found = p.range("n", 0.0, false, 10.0, false).unwrap();
+            assert!(
+                found.get(id),
+                "the postings lost the n the master's HSET wrote"
+            );
+            return;
+        }
+        panic!("the sweep never got to the postings");
+    }
+
+    /// On a replica: an `HPEXPIREAT` from the master, applied while the
+    /// sweep settles a hash's watch, the sweep having found no field left
+    /// with a time to live, waits for the sweep, and its field is watched
+    /// (#371).
+    #[test]
+    fn a_ttl_from_the_master_beside_the_sweep_is_watched() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        const KEY: &str = "f371t:k";
+        let store = crate::store::new_store(1);
+        let _own = OwnWatches::of(&store);
+        let index_store = crate::vector::new_index_store();
+        hash_losing_n(&store, &index_store, "f371t:", KEY);
+        let beside = Rc::new(RefCell::new(None));
+        {
+            let (store, index_store, beside) = (
+                Arc::clone(&store),
+                Arc::clone(&index_store),
+                Rc::clone(&beside),
+            );
+            crate::test_hooks::set("sweep: watch", move || {
+                let at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis()
+                    + 60_000;
+                let cmd = ["HPEXPIREAT", KEY, &at.to_string(), "FIELDS", "1", "o"]
+                    .map(String::from)
+                    .to_vec();
+                *beside.borrow_mut() = Some(applied_beside(&store, &index_store, cmd));
+            });
+        }
+        sweep(&store, &index_store);
+        crate::test_hooks::clear("sweep: watch");
+        beside
+            .borrow_mut()
+            .take()
+            .expect("the sweep settled the watch")
+            .join()
+            .unwrap();
+        assert_eq!(fields_of(&store, KEY).unwrap(), ["o"], "n was swept");
+        assert!(
+            watched_keys(&store, 0).iter().any(|key| key == KEY),
+            "o has a time to live from the master, and the hash is watched"
+        );
+    }
+
+    /// On a replica with nothing watched: an `HPEXPIREAT` from the master
+    /// watches the hash, then brings its postings up to date. A sweep that
+    /// reaches the hash in between, its field due, waits for the write, and
+    /// the postings and the watch agree when both are done (#376). Without
+    /// the write's order the sweep evicted the field and dropped the watch,
+    /// and the write then put the field back in the postings, for good.
+    /// What is shown needs nothing watched in the process when the write
+    /// starts: run alone (another test's watch makes the write take its order
+    /// anyway).
+    #[test]
+    fn a_ttl_from_the_master_that_starts_the_watching_is_ordered() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        const KEY: &str = "f376:k";
+        // Again if a replay elsewhere in the process deferred indexing.
+        for _ in 0..50 {
+            let store = crate::store::new_store(1);
+            let _own = OwnWatches::of(&store);
+            let index_store = crate::vector::new_index_store();
+            let def = hash_losing_n(&store, &index_store, "f376:", KEY);
+            // Not watched, its n with no time to live: as the master's HSET
+            // left it.
+            hash_at(&store, KEY).write().expiries.clear();
+            forget_watches(store_id(&store));
+            let sweeper = Rc::new(RefCell::new(None));
+            {
+                let (store, index_store, sweeper) = (
+                    Arc::clone(&store),
+                    Arc::clone(&index_store),
+                    Rc::clone(&sweeper),
+                );
+                crate::test_hooks::set("index_fields: fields read", move || {
+                    // n is due; the sweep, from a thread of its own.
+                    std::thread::sleep(Duration::from_millis(60));
+                    let (done, finished) = std::sync::mpsc::channel();
+                    *sweeper.borrow_mut() = Some(std::thread::spawn(move || {
+                        sweep(&store, &index_store);
+                        let _ = done.send(());
+                    }));
+                    let _ = finished.recv_timeout(Duration::from_millis(300));
+                });
+            }
+            let at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+                + 50;
+            let cmd = ["HPEXPIREAT", KEY, &at.to_string(), "FIELDS", "1", "n"]
+                .map(String::from)
+                .to_vec();
+            // Applied on this thread, where the hook is.
+            let deferred = applied(&store, &index_store, cmd);
+            crate::test_hooks::clear("index_fields: fields read");
+            let Some(sweeper) = sweeper.borrow_mut().take() else {
+                continue;
+            };
+            sweeper.join().unwrap();
+            if deferred {
+                continue;
+            }
+            // What the sweep did last stands.
+            sweep(&store, &index_store);
+            let p = def.postings.read();
+            let id = p.id(KEY).expect("still in the index");
+            let in_postings = p.range("n", 0.0, false, 10.0, false).unwrap().get(id);
+            drop(p);
+            let has_n = fields_of(&store, KEY).unwrap().contains(&"n".to_string());
+            let watched = watched_keys(&store, 0).iter().any(|key| key == KEY);
+            assert!(
+                !in_postings || has_n || watched,
+                "the postings have n, the hash has not, and nothing watches it"
+            );
+            return;
+        }
+        panic!("the write never got to the postings");
+    }
+
     #[test]
     fn due_fields_go_and_an_empty_hash_goes_with_them() {
         let store = crate::store::new_store(1);
@@ -535,11 +780,7 @@ mod tests {
         assert_eq!(watched_in(&store), 1);
 
         // After a rescan, what is there is what is watched.
-        WATCHED
-            .lock()
-            .as_mut()
-            .unwrap()
-            .retain(|(s, _, _), _| *s != store_id(&store));
+        forget_watches(store_id(&store));
         rescan(&store);
         assert_eq!(watched_in(&store), 1);
     }
