@@ -294,6 +294,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   never swept on the replica, nor after a failover on the replica promoted.
   A write applied from the stream now takes the order of its keys, as a
   command does.
+- **`DEBUG` does what it says (#236).** `DEBUG SET-ACTIVE-EXPIRE 0` replied
+  `OK` and the background expiry went on; it now stops until
+  `SET-ACTIVE-EXPIRE 1`, and keys past their time still go when read. A
+  `DEBUG` subcommand that does not exist, or has the wrong number of
+  arguments, replied `OK`; it is now Redis's `ERR unknown subcommand or
+  wrong number of arguments`, and `DEBUG HELP` lists the subcommands.
+  `DEBUG OBJECT` gave the same line for every key, there or not; it now
+  gives the key's encoding, serialized length and last use in Redis's order
+  of fields, and `ERR no such key` for a key that is not there.
 
 ## [1.2.0] - 2026-11-03
 

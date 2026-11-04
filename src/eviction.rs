@@ -433,6 +433,10 @@ pub fn idle_seconds(word: u32) -> u64 {
     }
 }
 
+pub fn lru_bits(word: u32) -> u32 {
+    word & 0xff_ffff
+}
+
 /// The frequency count of a key with the access word `word` (`OBJECT FREQ`).
 pub fn frequency(word: u32) -> u8 {
     Access::frequency(word, clock() / 60, lfu_decay_time())

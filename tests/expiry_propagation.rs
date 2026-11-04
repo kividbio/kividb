@@ -1970,3 +1970,33 @@ fn a_replica_of_a_real_1_1_2_master_converges_and_stays_so_after_the_upgrade() {
     );
     assert_eq!(r.cmd(&["GET", "keep"]).s(), "v");
 }
+
+#[test]
+fn debug_set_active_expire_0_stops_the_sweep() {
+    let server = Server::start(&["--aof"]);
+    let mut c = server.conn();
+    assert_eq!(c.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]).s(), "OK");
+    for i in 0..5 {
+        assert_eq!(
+            c.cmd(&["SET", &format!("k:{i}"), "v", "PX", "50"]).s(),
+            "OK"
+        );
+    }
+    std::thread::sleep(Duration::from_millis(1000));
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 5);
+    assert_eq!(c.info("stats", "expired_keys_active"), "0");
+    assert!(
+        c.cmd(&["DEBUG", "OBJECT", "k:0"])
+            .s()
+            .starts_with("Value at:")
+    );
+    assert_eq!(c.cmd(&["GET", "k:0"]), V::Nil);
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 4);
+    assert!((1..5).all(|i| deletions(&server.aof(), &format!("k:{i}")) == 0));
+
+    assert_eq!(c.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "1"]).s(), "OK");
+    wait_until("the sweep to delete the rest", 10, || {
+        c.cmd(&["DBSIZE"]).i() == 0
+    });
+    assert_eq!(c.info("stats", "expired_keys_active"), "4");
+}

@@ -51,7 +51,7 @@
 use std::cell::Cell;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use parking_lot::RwLock;
 
@@ -274,6 +274,17 @@ impl Drop for Loading {
 #[inline]
 pub fn loading() -> bool {
     LOADING.load(Ordering::SeqCst) > 0
+}
+
+static ACTIVE: AtomicBool = AtomicBool::new(true);
+
+pub fn set_active(on: bool) {
+    ACTIVE.store(on, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn active() -> bool {
+    ACTIVE.load(Ordering::Relaxed)
 }
 
 thread_local! {
