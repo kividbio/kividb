@@ -3554,6 +3554,239 @@ fn a_transaction_that_reaches_its_gates_during_a_slot_handoff_is_refused() {
     assert_eq!(dst.conn().cmd(&["GET", &key]).text(), "5");
 }
 
+/// [`commands_in_background`], on a connection that waits up to
+/// `patience` for each reply: for a command held for longer than a reply
+/// is otherwise waited for.
+fn patient_commands_in_background(
+    port: u16,
+    patience: Duration,
+    commands: &[&[&str]],
+) -> std::thread::JoinHandle<Resp> {
+    let commands: Vec<Vec<String>> = commands
+        .iter()
+        .map(|args| args.iter().map(|a| a.to_string()).collect())
+        .collect();
+    std::thread::spawn(move || {
+        let mut conn = Conn::connect(port);
+        conn.stream.set_read_timeout(Some(patience)).unwrap();
+        let mut last = None;
+        for args in &commands {
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            last = Some(conn.cmd(&refs));
+        }
+        last.unwrap()
+    })
+}
+
+/// `args` on `node`, which holds a command that names one of its stalled
+/// keys at the failpoint `routed` (as its `hit`th): let it go on.
+fn run_past_the_stall(node: &Node, hit: u32, args: &[&str]) -> Resp {
+    let reply = commands_in_background(node.port, &[args]);
+    std::fs::remove_file(routed_and_held(node, hit)).unwrap();
+    reply.join().unwrap()
+}
+
+/// Every node's log, for a test that failed.
+fn all_logs(nodes: &[&Node]) -> String {
+    nodes
+        .iter()
+        .map(|n| format!("==== node {}\n{}", n.port, n.log()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// An atomic slot migration that takes every slot the source has, whose
+/// destination's claim reaches the source before its answer to the
+/// `TAKEOVER` (held back 8 s, `KIVIDB_TEST_TAKEOVER_REPLY_DELAY_MS`). The
+/// source, left with no slots, follows the destination as a replica, and
+/// that ends the handoff's pause. A write routed on the source before the
+/// handoff, and held up before the write gate until then, is sent on with
+/// `-MOVED`. It used to run on the source, acknowledged, and was lost when
+/// the source resynced from the destination (#337). It waits at the
+/// failpoint `routed` (`KIVIDB_TEST_STALL_KEYS`).
+#[test]
+fn a_write_routed_before_a_handoff_whose_claim_came_first_is_sent_on() {
+    let key = key_in(0..=8191, "drained");
+    let env = [
+        ("KIVIDB_TEST_FAILPOINTS", "routed"),
+        ("KIVIDB_TEST_STALL_KEYS", key.as_str()),
+    ];
+    let (nodes, ranges) = form_cluster_of(vec![
+        Node::start_with_env(&[], &env),
+        Node::start_with_env(&[], &[("KIVIDB_TEST_TAKEOVER_REPLY_DELAY_MS", "8000")]),
+    ]);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let logs = || all_logs(&[src, dst]);
+    // The source waits for the TAKEOVER's answer longer than it is held back.
+    let r = src.conn().cmd(&[
+        "CONFIG",
+        "SET",
+        "cluster-slot-migration-write-pause-timeout",
+        "30000",
+    ]);
+    assert!(r.is_ok(), "{r:?}");
+    let slot = slot_of(&key).to_string();
+    assert!(run_past_the_stall(src, 1, &["SET", &key, "5"]).is_ok());
+
+    let incr =
+        patient_commands_in_background(src.port, Duration::from_secs(120), &[&["INCR", &key]]);
+    let held = routed_and_held(src, 2);
+    let (start, end) = (ranges[0].0.to_string(), ranges[0].1.to_string());
+    let task_id = dst
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", &start, &end])
+        .text();
+    wait_until(
+        "the source to follow the destination, on its claim",
+        Duration::from_secs(60),
+        || src.log().contains("following it as a replica"),
+    );
+    assert!(
+        !src.log().contains("handover of slots"),
+        "the TAKEOVER was answered before the claim came: the test missed its window\n{}",
+        logs()
+    );
+    std::fs::remove_file(held).unwrap();
+    let reply = incr.join().unwrap();
+    let moved = format!("MOVED {slot} 127.0.0.1:{}", dst.port);
+    assert!(
+        reply.err().is_some_and(|e| e.starts_with(&moved)),
+        "the write is sent on: {reply:?}\n{}",
+        logs()
+    );
+    assert!(
+        dst.log()
+            .contains("(test) the TAKEOVER's reply is held back"),
+        "the failpoint was never reached\n{}",
+        logs()
+    );
+    wait_import_completed(dst, &task_id);
+    assert_eq!(dst.conn().cmd(&["GET", &key]).text(), "5");
+}
+
+/// A manual failover: the old master follows the promoted replica once it
+/// hears of its claim, and that ends the pause the failover held writes
+/// with. A write routed on the old master before the failover, and held up
+/// before the write gate until then, is sent on with `-MOVED`. It used to
+/// run on the old master, acknowledged, and was lost when it resynced from
+/// the new one (#337).
+#[test]
+fn a_write_routed_before_a_manual_failover_is_sent_on_not_run_on_the_old_master() {
+    let key = key_in(0..=5000, "failover");
+    let env = [
+        ("KIVIDB_TEST_FAILPOINTS", "routed"),
+        ("KIVIDB_TEST_STALL_KEYS", key.as_str()),
+    ];
+    let (nodes, _) = form_cluster_of(vec![
+        Node::start_with_env(&[], &env),
+        Node::start(&[]),
+        Node::start(&[]),
+    ]);
+    let replica = add_replica(&nodes, &nodes[0]);
+    let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+    wait_cluster_ok(&all, 4);
+    let master = &nodes[0];
+    let slot = slot_of(&key).to_string();
+    assert!(run_past_the_stall(master, 1, &["SET", &key, "5"]).is_ok());
+
+    let incr =
+        patient_commands_in_background(master.port, Duration::from_secs(120), &[&["INCR", &key]]);
+    let held = routed_and_held(master, 2);
+    // As `manual_failover_swaps_roles_without_losing_acknowledged_writes`:
+    // a failover given up in time, on a busy machine, is asked again.
+    let mut promoted = false;
+    for attempt in 1..=3 {
+        let reply = replica.conn().cmd(&["CLUSTER", "FAILOVER"]);
+        assert!(reply.is_ok(), "CLUSTER FAILOVER {attempt}: {reply:?}");
+        promoted = (0..150).any(|_| {
+            std::thread::sleep(Duration::from_millis(100));
+            replica.is_master()
+        });
+        if promoted {
+            break;
+        }
+    }
+    assert!(promoted, "the replica was not promoted\n{}", all_logs(&all));
+    wait_until(
+        "the old master to follow the new one, on its claim",
+        Duration::from_secs(30),
+        || master.log().contains("following it as a replica"),
+    );
+    std::fs::remove_file(held).unwrap();
+    let reply = incr.join().unwrap();
+    let moved = format!("MOVED {slot} 127.0.0.1:{}", replica.port);
+    assert!(
+        reply.err().is_some_and(|e| e.starts_with(&moved)),
+        "the write is sent on: {reply:?}\n{}",
+        all_logs(&all)
+    );
+    assert_eq!(replica.conn().cmd(&["GET", &key]).text(), "5");
+}
+
+/// A write routed here before `remove` took its slot from this node, and
+/// held up before the write gate until then, is refused: no node is
+/// serving the slot, in this one's view. It used to run, here (#337). Once
+/// `restore` gives the slot back, the key is as it was.
+fn a_write_routed_before_its_slot_was_removed(remove: &[&str], restore: &[&str]) {
+    let key = key_in(0..=16383, "removed");
+    let slot = slot_of(&key).to_string();
+    let env = [
+        ("KIVIDB_TEST_FAILPOINTS", "routed"),
+        ("KIVIDB_TEST_STALL_KEYS", key.as_str()),
+    ];
+    let (nodes, _) = form_cluster_of(vec![Node::start_with_env(&[], &env)]);
+    let node = &nodes[0];
+    let with_slot = |args: &[&str]| -> Vec<String> {
+        args.iter()
+            .map(|a| {
+                if *a == "{slot}" {
+                    slot.clone()
+                } else {
+                    a.to_string()
+                }
+            })
+            .collect()
+    };
+    assert!(run_past_the_stall(node, 1, &["SET", &key, "5"]).is_ok());
+
+    let incr = commands_in_background(node.port, &[&["INCR", &key]]);
+    let held = routed_and_held(node, 2);
+    let remove = with_slot(remove);
+    let refs: Vec<&str> = remove.iter().map(String::as_str).collect();
+    let r = node.conn().cmd(&refs);
+    assert!(r.is_ok(), "{refs:?}: {r:?}");
+    std::fs::remove_file(held).unwrap();
+    let reply = incr.join().unwrap();
+    assert!(
+        reply.err().is_some_and(|e| e.starts_with("CLUSTERDOWN")),
+        "the write is refused: {reply:?}\n{}",
+        node.log()
+    );
+
+    let restore = with_slot(restore);
+    let refs: Vec<&str> = restore.iter().map(String::as_str).collect();
+    let r = node.conn().cmd(&refs);
+    assert!(r.is_ok(), "{refs:?}: {r:?}");
+    wait_cluster_ok(&[node], 1);
+    assert_eq!(run_past_the_stall(node, 3, &["GET", &key]).text(), "5");
+}
+
+#[test]
+fn a_write_routed_before_delslots_took_its_slot_is_refused() {
+    a_write_routed_before_its_slot_was_removed(
+        &["CLUSTER", "DELSLOTS", "{slot}"],
+        &["CLUSTER", "ADDSLOTS", "{slot}"],
+    );
+}
+
+#[test]
+fn a_write_routed_before_flushslots_is_refused() {
+    a_write_routed_before_its_slot_was_removed(
+        &["CLUSTER", "FLUSHSLOTS"],
+        &["CLUSTER", "ADDSLOTSRANGE", "0", "16383"],
+    );
+}
+
 /// The destination gets to the `TAKEOVER` only after the source has
 /// stopped waiting for its answer, as a destination does that is too busy
 /// (#278). The source asks it, and it promises not to take the slots in

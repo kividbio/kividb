@@ -263,7 +263,28 @@ pub fn hold_writes() {
 /// again: a handoff is under way. One atomic load when none is.
 #[inline]
 pub fn handoff() -> bool {
-    HANDOFF.load(Ordering::Acquire) & HANDOFF_PAUSE != 0 && active().is_some()
+    HANDOFF.load(Ordering::Acquire) & HANDOFF_PAUSE != 0 && handoff_pause_in_force()
+}
+
+/// Whether the pause of a handoff whose flag a write has just seen is still
+/// in force, and then an acquire fence.
+///
+/// A handoff that ends moves the count of routes first ([`routes_moved`]),
+/// then ends the pause (`clear_pause`: `PAUSE_UNTIL_MS`, then the flag). A
+/// write can load the flag before that, still up, and then find the pause
+/// ended: [`active`] loads `PAUSE_UNTIL_MS` relaxed. The write then asks
+/// whether its routes have moved ([`routes_moved_since`]), a third load,
+/// which nothing made see the count moved before the pause ended: x86 does,
+/// aarch64 need not, and the write ran here, on a slot it had been handed
+/// away from (#337). The fence after a load that saw the pause ended makes
+/// everything done before it was ended visible. Only here, where the flag
+/// was up: an ordinary write never comes this way.
+#[cold]
+#[inline(never)]
+fn handoff_pause_in_force() -> bool {
+    let in_force = active().is_some();
+    std::sync::atomic::fence(Ordering::Acquire);
+    in_force
 }
 
 /// Whether a write that has just entered the write gate has anything to
@@ -425,6 +446,10 @@ impl Drop for Held {
     }
 }
 
+/// Held by a unit test that sets or ends the pause, which is the process's.
+#[cfg(test)]
+pub(crate) static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,6 +457,7 @@ mod tests {
     // One test, because the pause is the process's.
     #[test]
     fn the_longer_and_the_wider_pause_holds() {
+        let _pause = TEST_LOCK.lock();
         clear_pause();
         assert_eq!(active(), None);
         set_pause(60_000, true);

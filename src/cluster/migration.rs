@@ -827,17 +827,23 @@ impl Drop for TapGuard<'_> {
     }
 }
 
-/// Lets the writes held for a handoff go when it ends, however it ends:
-/// unless they have been let go already (`CLIENT UNPAUSE`, or this master's
-/// replica took its slots over), or this master holds them for a reason of
-/// its own as well (a manual failover, #242), which lets them go itself.
+/// Holds writes for a handoff, and lets them go when it ends, however it
+/// ends (`ClusterState::end_handoff_hold`): unless they have been let go
+/// already (`CLIENT UNPAUSE`, or this master's replica took its slots over),
+/// or this master holds them for a reason of its own as well (a manual
+/// failover, #242, or another handoff), which lets them go itself.
 struct PauseGuard<'a>(&'a ClusterState);
+
+impl<'a> PauseGuard<'a> {
+    fn hold(cluster: &'a ClusterState) -> Self {
+        cluster.hold_writes_for_handoff();
+        PauseGuard(cluster)
+    }
+}
 
 impl Drop for PauseGuard<'_> {
     fn drop(&mut self) {
-        if crate::pause::handoff() && !self.0.writes_held() {
-            crate::pause::clear_pause();
-        }
+        self.0.end_handoff_hold();
     }
 }
 
@@ -926,8 +932,7 @@ fn migrate_out(env: &Env, task: &Task) -> Result<u64, String> {
     // TAKEOVER's answer before it asks.
     let pause_timeout = write_pause_timeout_ms(&env.config).max(100);
     let paused_at = Instant::now();
-    crate::pause::hold_writes();
-    let pause = PauseGuard(&env.cluster);
+    let pause = PauseGuard::hold(&env.cluster);
     // Counted as it goes, so that a handoff that fails part way is counted
     // too: writes were held for it all the same.
     struct Counted<'a> {
@@ -1477,6 +1482,10 @@ pub fn take_over(cluster: &ClusterState, task_id: &str, client_id: u64) -> Resul
         test_sleep(delay);
         super::bus::heartbeat::set_test_bus_muted(false);
     }
+    if let Some(delay) = test_failpoint(&TEST_TAKEOVER_REPLY_DELAY) {
+        log_warn!("Cluster: (test) the TAKEOVER's reply is held back {delay:?}, its claim is not");
+        test_sleep(delay);
+    }
     result
 }
 
@@ -1488,12 +1497,13 @@ fn take_over_now(cluster: &ClusterState, task_id: &str, client_id: u64) -> Resul
     let started = Instant::now();
     // Saved before the source is told: it deletes its copy when told, and a
     // restart of this node with the slots not in its config would delete
-    // this one (#108). Not saved, not taken over: the slots go back to the
-    // source, which keeps serving them.
+    // this one (#108). Not saved, not taken over: the slots stay with the
+    // source, which keeps serving them. They are taken only once saved, so
+    // there is nothing to give back: no write was served to them here, and
+    // no claim of them went out (#337).
     if let Err(e) =
         super::persist::with_deferred_sync(|| cluster.take_over_slots(slots_of(&task.ranges)))
     {
-        cluster.hand_over_slots(slots_of(&task.ranges), task.source);
         cluster.slot_migrations.takeover_undone(task_id);
         log_warn!(
             "Cluster: Could not save the cluster config while taking over slots {} ({e}); \
@@ -1559,6 +1569,15 @@ static TEST_TAKEOVER_DELAY: (&str, AtomicBool) =
 /// when the reply is lost and the bus is slow.
 static TEST_TAKEOVER_LOST: (&str, AtomicBool) =
     ("KIVIDB_TEST_TAKEOVER_LOST_MS", AtomicBool::new(false));
+
+/// `KIVIDB_TEST_TAKEOVER_REPLY_DELAY_MS`, never set otherwise: the first
+/// `TAKEOVER` this node is sent takes the slots over and then waits this
+/// long before it answers, its cluster bus running meanwhile: the source
+/// hears of the takeover from this node's claim first.
+static TEST_TAKEOVER_REPLY_DELAY: (&str, AtomicBool) = (
+    "KIVIDB_TEST_TAKEOVER_REPLY_DELAY_MS",
+    AtomicBool::new(false),
+);
 
 /// The delay a failpoint asks for, the first time it is reached.
 fn test_failpoint(failpoint: &(&str, AtomicBool)) -> Option<Duration> {

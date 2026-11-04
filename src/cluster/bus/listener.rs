@@ -1019,8 +1019,12 @@ mod tests {
 
     /// The failover completes on the old master's side too: when it sees its
     /// slots claimed at a higher epoch, it steps down and follows the winner.
+    /// A write routed here before, and not yet in the write gate, is routed
+    /// again there (#337).
     #[test]
     fn a_master_that_lost_all_its_slots_becomes_a_replica_of_the_new_owner() {
+        // Following the winner ends a handoff's pause, which is the process's.
+        let _pause = crate::pause::TEST_LOCK.lock();
         let cs = ClusterState::new_enabled(None, 15000);
         let me = cs.myself();
         cs.claim_slot_range(0, 99).unwrap();
@@ -1041,7 +1045,9 @@ mod tests {
                 epoch: 5,
             }];
         }
+        let routed = crate::pause::routes_now();
         process_message(&cs, takeover, peer());
+        assert!(crate::pause::routes_moved_since(routed));
 
         assert_eq!(cs.my_slot_count(), 0);
         let nodes = cs.nodes.read();
@@ -1074,7 +1080,9 @@ mod tests {
                 epoch: 5,
             }];
         }
+        let routed = crate::pause::routes_now();
         process_message(&cs, partial, peer());
+        assert!(crate::pause::routes_moved_since(routed));
 
         assert_eq!(cs.my_slot_count(), 50);
         assert!(
