@@ -628,6 +628,11 @@ pub fn plan_evacuation(budget: usize) -> usize {
         pause();
     }
     let mut chosen = EVACUATION.lock();
+    // Room for every slab it may choose, taken before any is: between a
+    // slab's being taken out of its list and its being on `chosen`, nothing
+    // can panic, so that no slab is left being emptied that
+    // `finish_evacuation` does not see (#358).
+    chosen.reserve(candidates.len());
     let mut held = 0usize;
     for (_, class, slab, generation, bytes) in candidates {
         if held >= budget {
@@ -661,9 +666,17 @@ pub fn plan_evacuation(budget: usize) -> usize {
 /// Stop emptying the slabs [`plan_evacuation`] chose. Those that still hold
 /// something (values that something besides their key held) go back to
 /// their class's list, or stay out of it while too full.
+///
+/// Also what puts them back after a pass of compaction that panicked
+/// (#358), at whatever point it did. Each is taken off the list as it is
+/// put back, so that should this panic too, the rest are put back by the
+/// next call.
 pub fn finish_evacuation() {
-    let chosen = std::mem::take(&mut *EVACUATION.lock());
-    for (slab, class, generation) in chosen {
+    loop {
+        let next = EVACUATION.lock().pop();
+        let Some((slab, class, generation)) = next else {
+            return;
+        };
         // SAFETY: a header lives as long as the process.
         let s = unsafe { &*slab.0 };
         // The class it had when chosen, not the one it has now: one that
@@ -722,6 +735,29 @@ pub fn regions() -> usize {
 #[allow(dead_code)]
 pub fn generation_of(block: *const u8) -> u32 {
     slab_of(block).generation.load(Ordering::Relaxed)
+}
+
+/// For tests: held by a test that empties slabs, or makes them be emptied:
+/// the slabs are the process's, and one such test would take another's.
+#[cfg(test)]
+pub(crate) static EVACUATION_TESTS: Mutex<()> = Mutex::new(());
+
+/// For tests: how many slabs are being emptied.
+#[cfg(test)]
+pub(crate) fn evacuating_slabs() -> usize {
+    let regions = REGION_LIST.lock().clone();
+    regions
+        .iter()
+        .map(|&region| {
+            (1..SLABS)
+                .filter(|&index| {
+                    // SAFETY: a region's headers live as long as the process.
+                    let slab = unsafe { &*(region as *const Slab).add(index) };
+                    slab.state.load(Ordering::Relaxed) == EVACUATING
+                })
+                .count()
+        })
+        .sum()
 }
 
 /// For tests: empty only the slab `block` is in, as [`plan_evacuation`]

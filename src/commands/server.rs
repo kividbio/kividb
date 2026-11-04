@@ -4345,18 +4345,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 out.push_str(&format!("mem_clients_slaves:{clients_replicas}\r\n"));
                 out.push_str(&format!("mem_clients_normal:{clients_normal}\r\n"));
                 out.push_str("mem_aof_buffer:0\r\n");
-                out.push_str(&format!(
-                    "active_defrag_running:{}\r\n",
-                    u8::from(crate::compaction::running())
-                ));
-                out.push_str(&format!(
-                    "active_defrag_hits:{}\r\n",
-                    crate::compaction::hits()
-                ));
-                out.push_str(&format!(
-                    "active_defrag_misses:{}\r\n",
-                    crate::compaction::misses()
-                ));
+                // `active_defrag_running`, `_hits`, `_misses`, `_panics`
+                // and `_disabled_by_panics` (#358).
+                out.push_str(&crate::compaction::info());
                 out.push_str(&format!(
                     "lazyfree_pending_objects:{}\r\n",
                     crate::lazyfree::pending_objects()
