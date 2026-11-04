@@ -206,9 +206,10 @@ pub struct LostDataset {
 /// The locks below are `parking_lot` locks: a reader queues behind a waiting
 /// writer, so a thread must never take a lock it already holds, read or
 /// write, and a guard must not be kept across an `.await`. Where one thread
-/// holds several, it takes them in this order and no other: `forgotten`,
-/// `save_lock`, `failure_reports`, `nodes`, `slots`, `migrations`, `myself`.
-/// `held_writes` is only ever held alone.
+/// holds several, it takes them in this order and no other: `handoff_holds`,
+/// `forgotten`, `save_lock`, `failure_reports`, `nodes`, `slots`,
+/// `migrations`, `myself`. `held_writes` is held alone, or under
+/// `handoff_holds`.
 /// A temporary guard (`self.nodes.read().get(..)`) is held to the end of
 /// its statement, or of the `match` / `if let` / `for` it heads.
 pub struct ClusterState {
@@ -278,6 +279,11 @@ pub struct ClusterState {
     /// Writes this master holds until it has made sure it still owns its
     /// slots. See [`Self::hold_writes_until_confirmed`].
     held_writes: parking_lot::Mutex<Option<HeldWrites>>,
+    /// How many atomic slot migrations away from this node hold writes for
+    /// their handoff ([`Self::hold_writes_for_handoff`]). Writes are let go
+    /// when neither they nor [`Self::held_writes`] hold them any more;
+    /// whichever of the two ends last lets them go, under this lock.
+    handoff_holds: parking_lot::Mutex<u32>,
     /// This master serves none of its slots, having been told it was marked
     /// FAIL, until it has made sure it still owns them
     /// ([`Self::note_marked_failed`]).
@@ -352,6 +358,7 @@ impl ClusterState {
             serving: AtomicBool::new(false),
             lost: LostDataset::default(),
             held_writes: parking_lot::Mutex::new(None),
+            handoff_holds: parking_lot::Mutex::new(0),
             marked_failed: AtomicBool::new(false),
             require_full_coverage: AtomicBool::new(true),
             replica_validity_factor: AtomicU64::new(10),
@@ -974,10 +981,12 @@ impl ClusterState {
         let fenced = self.fence_holds() || self.marked_failed.load(Ordering::Relaxed);
         let ok = ok && !fenced;
         self.state_ok.store(ok, Ordering::Relaxed);
-        self.serving.store(
-            !fenced && (ok || !self.require_full_coverage.load(Ordering::Relaxed)),
-            Ordering::Relaxed,
-        );
+        let serving = !fenced && (ok || !self.require_full_coverage.load(Ordering::Relaxed));
+        if self.serving.swap(serving, Ordering::Relaxed) && !serving {
+            // A write routed while this node served, and not yet in the write
+            // gate, is routed again there, and refused (#337).
+            crate::pause::routes_moved();
+        }
     }
 
     // ── A master back without its dataset ────────────────────────────────────
@@ -1279,6 +1288,10 @@ impl ClusterState {
                 migrations.remove(&slot);
             }
         }
+        // A write routed here before this, and not yet in the write gate, is
+        // routed again there: it used to run, on a slot this node no longer
+        // serves (#337).
+        crate::pause::routes_moved();
         self.note_by_hand(list.iter().copied());
         Ok(list.len())
     }
@@ -1363,6 +1376,8 @@ impl ClusterState {
         for s in slots.iter_mut() {
             *s = None;
         }
+        // As for DELSLOTS (`release_slots`).
+        crate::pause::routes_moved();
     }
 
     /// Set our own node's config_epoch. Used by SET-CONFIG-EPOCH (only
@@ -1526,6 +1541,18 @@ impl ClusterState {
                 }
             }
         }
+        if shard_lost_slots || !lost.is_empty() {
+            // A write routed here before this, and not yet in the write gate,
+            // is routed again there (#337). Before the keys of the slots are
+            // dropped, and before a handoff's pause is ended below
+            // (`follow_new_master`): that is a change of the same flag, so a
+            // write that finds the pause over finds this too. In an atomic
+            // slot migration that drains this node, the destination's claim
+            // can come before its answer to the `TAKEOVER`; a write held
+            // between its routing and the gate then ran here once the pause
+            // ended, and was lost with the resync.
+            crate::pause::routes_moved();
+        }
         if !changed {
             return;
         }
@@ -1574,7 +1601,9 @@ impl ClusterState {
         self.election_pending.store(false, Ordering::SeqCst);
         // If we were holding writes, for a manual failover or until we knew
         // whether we still owned our slots, the answer is in: let them go, to
-        // be answered with a redirect to the new master.
+        // be answered with a redirect to the new master. (The caller has
+        // moved the routes: a write held between its routing and the gate is
+        // routed again there.)
         *self.held_writes.lock() = None;
         crate::pause::clear_pause();
         if self.marked_failed.swap(false, Ordering::Relaxed) {
@@ -2265,9 +2294,19 @@ impl ClusterState {
     /// Take ownership of `slots` at the end of an atomic migration to this
     /// node. One new epoch covers them all, so the claim wins over the
     /// previous owner's wherever the two meet.
+    ///
+    /// Saved in the cluster config before anything else sees it: a client
+    /// is not served the slots, nor do they go out in this node's claims,
+    /// until the config says they are this node's. They used to be taken
+    /// first and saved after; when the save failed, the destination of a
+    /// migration gave them back, having served writes to them meanwhile,
+    /// lost when it gave them back, and its claim could have reached the
+    /// source in that time, which then dropped its keys of them, and owned
+    /// them in nobody's view (#337). Not saved, nothing changes.
     pub fn take_over_slots(&self, slots: impl Iterator<Item = u16>) -> std::io::Result<()> {
         let t = std::time::Instant::now();
         let mut steps: Vec<(&str, u128)> = Vec::new();
+        let slots: Vec<u16> = slots.collect();
         let me = self.myself();
         let new_epoch = self.bump_epoch();
         steps.push(("epoch", t.elapsed().as_millis()));
@@ -2277,19 +2316,19 @@ impl ClusterState {
             node.config_epoch = new_epoch;
         }
         steps.push(("nodes", t.elapsed().as_millis()));
-        {
+        let saved = persist::save_from_state_then(self, &slots, || {
             let mut owners = self.slots.write();
             let mut migrations = self.migrations.write();
-            for slot in slots {
+            for &slot in &slots {
                 owners[slot as usize] = Some(me);
                 migrations.remove(&slot);
             }
-        }
-        steps.push(("slots", t.elapsed().as_millis()));
-        self.refresh_state();
-        steps.push(("refresh", t.elapsed().as_millis()));
-        let saved = persist::save_from_state(self);
+        });
         steps.push(("save", t.elapsed().as_millis()));
+        if saved.is_ok() {
+            self.refresh_state();
+            steps.push(("refresh", t.elapsed().as_millis()));
+        }
         if t.elapsed() > std::time::Duration::from_millis(100) {
             log_info!("Cluster: slow takeover, ms at each step: {steps:?}");
         }
@@ -2337,6 +2376,9 @@ impl ClusterState {
     /// was lost.
     pub fn hold_writes_until_confirmed(&self, reason: HoldReason, ask_from_ms: u64) {
         let pause = reason == HoldReason::ManualFailover;
+        // Not to be let go by a handoff that ends in between (see
+        // `end_handoff_hold`).
+        let _holds = self.handoff_holds.lock();
         if pause {
             crate::pause::hold_writes();
         } else {
@@ -2369,7 +2411,14 @@ impl ClusterState {
     }
 
     /// Let the writes held go, if they are held, and log `why`.
+    ///
+    /// Not while an atomic slot migration away from this node holds them
+    /// for its handoff as well ([`Self::hold_writes_for_handoff`]): that
+    /// lets them go when it ends. A manual failover that ended in the middle
+    /// of one let them go, and what was written then was not sent to the
+    /// destination, and was lost with the slots (#337).
     pub fn release_held_writes(&self, why: &str) {
+        let holds = self.handoff_holds.lock();
         let Some(held) = self.held_writes.lock().take() else {
             return;
         };
@@ -2382,7 +2431,28 @@ impl ClusterState {
         if self.marked_failed.swap(false, Ordering::Relaxed) {
             self.refresh_state();
         }
-        if held.paused && crate::pause::handoff() {
+        if held.paused && *holds == 0 && crate::pause::handoff() {
+            crate::pause::clear_pause();
+        }
+    }
+
+    /// Hold writes for the handoff of an atomic slot migration away from
+    /// this node, until [`Self::end_handoff_hold`]. See `migration::migrate_out`.
+    pub(crate) fn hold_writes_for_handoff(&self) {
+        let mut holds = self.handoff_holds.lock();
+        *holds += 1;
+        crate::pause::hold_writes();
+    }
+
+    /// A handoff that [`Self::hold_writes_for_handoff`] held writes for has
+    /// ended, however it ended: let them go, unless they have been let go
+    /// already (`CLIENT UNPAUSE`, or this master's replica took its slots
+    /// over), or another handoff or a manual failover (#242) still holds
+    /// them, which lets them go itself.
+    pub(crate) fn end_handoff_hold(&self) {
+        let mut holds = self.handoff_holds.lock();
+        *holds = holds.saturating_sub(1);
+        if *holds == 0 && crate::pause::handoff() && !self.writes_held() {
             crate::pause::clear_pause();
         }
     }
@@ -2515,6 +2585,8 @@ impl ClusterState {
                 *s = None;
             }
         }
+        // As for DELSLOTS (`release_slots`).
+        crate::pause::routes_moved();
         // Clear peer table — keep only ourselves.
         {
             let mut nodes = self.nodes.write();
@@ -2668,6 +2740,110 @@ mod tests {
         let b = add_master(&cs, 10923..=16383);
         cs.refresh_state();
         (cs, a, b)
+    }
+
+    // ── A write routed before a slot left (#331, #337) ───────────────────
+
+    /// Each way this node stops serving a slot moves its routes: a write
+    /// routed before, and not yet in the write gate, is routed again there.
+    /// DELSLOTS, DELSLOTSRANGE, FLUSHSLOTS, a reset, and this node no longer
+    /// serving (marked FAIL here). They did not, and such a write ran.
+    /// (The count is the process's: another test can only move it further.)
+    #[test]
+    fn every_way_a_slot_leaves_this_node_moves_its_routes() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        cs.claim_slot_range(0, 16383).unwrap();
+        cs.refresh_state();
+        assert!(cs.is_serving());
+        let moved = |what: &str, change: &dyn Fn()| {
+            let routed = crate::pause::routes_now();
+            change();
+            assert!(
+                crate::pause::routes_moved_since(routed),
+                "{what} did not move the routes"
+            );
+        };
+        moved("DELSLOTS", &|| {
+            cs.release_slots(&[5]).unwrap();
+        });
+        moved("DELSLOTSRANGE", &|| {
+            cs.release_slot_range(10, 20).unwrap();
+        });
+        moved("a node no longer serving", &|| {
+            cs.hold_writes_until_confirmed(HoldReason::MarkedFailed, now_ms() + 60_000);
+            assert!(!cs.is_serving());
+        });
+        moved("FLUSHSLOTS", &|| cs.flush_slots());
+        cs.claim_slot_range(0, 100).unwrap();
+        moved("CLUSTER RESET", &|| cs.soft_reset());
+    }
+
+    /// Slots taken over at the end of a migration are not this node's, nor
+    /// claimed by it, until the cluster config says they are. When the
+    /// config could not be saved, they used to be served and claimed in the
+    /// meantime, and then given back (#337).
+    #[test]
+    fn slots_taken_over_are_not_taken_until_they_are_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-yet").join("nodes.conf");
+        let cs = ClusterState::new_enabled(Some(path.clone()), 15000);
+        let me = cs.myself();
+        let other = add_master(&cs, 0..=99);
+        assert!(cs.take_over_slots(0..=99).is_err());
+        assert_eq!(cs.slot_owner(0), Some(other));
+        assert_eq!(cs.slot_owner(99), Some(other));
+        assert!(cs.my_slot_claims().is_empty());
+
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        cs.take_over_slots(0..=99).unwrap();
+        assert_eq!(cs.slot_owner(0), Some(me));
+        assert_eq!(cs.my_slot_claims().len(), 1);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let mine = saved
+            .lines()
+            .find(|l| l.contains("myself"))
+            .expect("this node's line");
+        assert!(mine.ends_with(" 0-99"), "{mine}");
+    }
+
+    /// A manual failover that ends while an atomic slot migration's handoff
+    /// holds writes leaves them held; the handoff lets them go when it ends.
+    /// And the other way round. The failover used to let them go in the
+    /// middle of the handoff (#337).
+    #[test]
+    fn writes_are_let_go_when_the_last_hold_on_them_ends() {
+        let _pause = crate::pause::TEST_LOCK.lock();
+        crate::pause::clear_pause();
+        let cs = ClusterState::new_enabled(None, 15000);
+        let ask = now_ms() + 60_000;
+
+        cs.hold_writes_for_handoff();
+        cs.hold_writes_until_confirmed(HoldReason::ManualFailover, ask);
+        cs.release_held_writes("the test");
+        assert!(
+            crate::pause::handoff(),
+            "a failover let a handoff's writes go"
+        );
+        cs.end_handoff_hold();
+        assert!(!crate::pause::handoff());
+
+        cs.hold_writes_until_confirmed(HoldReason::ManualFailover, ask);
+        cs.hold_writes_for_handoff();
+        cs.end_handoff_hold();
+        assert!(
+            crate::pause::handoff(),
+            "a handoff let a failover's writes go"
+        );
+        cs.release_held_writes("the test");
+        assert!(!crate::pause::handoff());
+
+        // Two handoffs at once: the second to end lets them go.
+        cs.hold_writes_for_handoff();
+        cs.hold_writes_for_handoff();
+        cs.end_handoff_hold();
+        assert!(crate::pause::handoff());
+        cs.end_handoff_hold();
+        assert!(!crate::pause::handoff());
     }
 
     // ── DELSLOTS ─────────────────────────────────────────────────────────

@@ -233,6 +233,8 @@ fn exec_refusal_again(caller: &Caller, queue: &[Vec<Vec<u8>>], routed: Routed) -
     if crate::pause::handoff() && queue.iter().any(|cmd| writes(cmd)) {
         return Some(b"-TRYAGAIN writes are paused for a handoff\r\n".to_vec());
     }
+    // `pause::handoff` fenced, if it saw a handoff's flag: a handoff that
+    // has ended is seen to have moved the routes, on aarch64 too (#337).
     if caller.cluster.enabled && crate::pause::routes_moved_since(routed.at) {
         return route_queue(caller, queue, routed.asking);
     }

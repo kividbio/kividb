@@ -48,6 +48,33 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   it was routed. If so, it is routed again there and sent on with `-ASK` or
   `-MOVED`. The same holds for `EXEC` and for scripts. Ordinary commands
   still pay one atomic load.
+
+  The check covers every way a slot leaves a node, not only `MIGRATE`,
+  `CLUSTER SETSLOT` and the end of an atomic slot migration (#337):
+  - **A claim heard from another node.** If an atomic slot migration took
+    every slot of the source, and the destination's claim reached the
+    source before its answer to the handoff, the source became a replica
+    of the destination and let the writes it was holding go. One of them
+    ran on the source, was acknowledged, and was lost when the source
+    resynced. The same happened to the old master of a manual failover,
+    when it followed the promoted replica.
+  - **`CLUSTER DELSLOTS`, `DELSLOTSRANGE`, `FLUSHSLOTS` and `RESET`**, and a
+    node that stops serving its slots (marked failed, or cut off from most
+    masters). A write routed just before ran on a slot the node no longer
+    served. It is now refused.
+  - **On aarch64**, a write could see the handoff's pause over without
+    seeing that the routes had moved, and run. x86 was not affected.
+
+  Two more ways an atomic slot migration could lose writes are closed:
+  - The destination took the slots before it had saved them in its cluster
+    config. If the save failed, it gave them back, and the writes it had
+    served to them were lost. If its claim had reached the source by then,
+    the source deleted its keys, and no node owned the slots. The slots are
+    now taken only once they are saved, and a failed save changes nothing.
+  - A manual failover that ended during a migration's handoff let writes go
+    while the handoff still needed them held. Those writes were not sent to
+    the destination. Writes are now let go only when the last hold on them
+    ends.
 - **A transaction could lose its writes during an atomic slot migration's
   handoff.** An `EXEC` that got past the write pause just before the
   handoff set it ran during the handoff. Its writes were not sent to the

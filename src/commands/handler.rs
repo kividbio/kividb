@@ -887,6 +887,14 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     }
     let cmd0 = &ctx.cmd[0];
 
+    // [`ReplState::is_slave`] is a relaxed atomic load — avoid `role()` here (it allocates).
+    // Taken before the command is routed, as everything it is checked
+    // against below may be: a write that passed these checks while this
+    // node was a master can be held up before the write gate while the node
+    // becomes a replica. The gate routes it again (#331, #337); so does the
+    // test hook that holds it there (`routing::stall_for_test`).
+    let repl_is_slave = ctx.repl_state.is_slave();
+
     // ── Cluster routing check ────────────────────────────────────────
     //
     // Decide whether this command can run on this node. In standalone mode
@@ -953,9 +961,6 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
             "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
         );
     }
-
-    // [`ReplState::is_slave`] is a relaxed atomic load — avoid `role()` here (it allocates).
-    let repl_is_slave = ctx.repl_state.is_slave();
 
     // Masters skip `is_write_command` entirely here — hot path for standalone read benchmarks.
     if repl_is_slave
