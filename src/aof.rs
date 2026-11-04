@@ -29,7 +29,8 @@ pub fn record_lost_aof_record() {
 /// Runtime AOF toggle. Set by CONFIG SET appendonly.
 /// The AOF writer task is always running — this flag gates whether
 /// commands are sent to it. Flipping to false drains the channel
-/// naturally; flipping to true immediately starts routing writes.
+/// naturally; flipping to true immediately starts routing writes, so
+/// the log is opened first (see [`open_log`]).
 pub static AOF_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 // ── Preamble framing ─────────────────────────────────────────────────────────
@@ -299,6 +300,39 @@ struct Log {
 }
 
 static LOG: parking_lot::Mutex<Option<Log>> = parking_lot::const_mutex(None);
+
+/// The queue, while no log is open: the AOF has been off since the start.
+/// See [`open_log`].
+static UNOPENED: parking_lot::Mutex<Option<mpsc::UnboundedReceiver<Vec<u8>>>> =
+    parking_lot::const_mutex(None);
+
+/// Open the log, if it is not open yet: `CONFIG SET appendonly yes` on a
+/// server started with the AOF off. Call before the flag goes up, so that a
+/// record logged once it is up has a file to go to. A file that cannot be
+/// opened is an error for the caller, not an exit: the AOF stays off.
+pub fn open_log() -> std::io::Result<()> {
+    let mut log = LOG.lock();
+    if log.is_some() {
+        return Ok(());
+    }
+    let mut unopened = UNOPENED.lock();
+    let Some(rx) = unopened.take() else {
+        return Err(std::io::Error::other("the AOF writer has not started yet"));
+    };
+    match open_aof() {
+        Ok(file) => {
+            *log = Some(Log { rx, file });
+            Ok(())
+        }
+        Err(e) => {
+            *unopened = Some(rx);
+            Err(std::io::Error::new(
+                e.kind(),
+                format!("{AOF_PATH} cannot be opened for appending: {e}"),
+            ))
+        }
+    }
+}
 
 /// Wakes the writer thread: a record or a barrier has been queued. Kept as a
 /// permit if it is busy, so nothing queued is left behind.
@@ -574,15 +608,26 @@ pub async fn start_aof_writer(rx: mpsc::UnboundedReceiver<Vec<u8>>) {
     let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel::<()>(1);
     let _ = FLUSH_TX.set(flush_tx);
 
-    // A server asked to keep an append-only file that cannot open one must
-    // not run: it would accept writes and keep none of them. (This used to be
-    // a panic in this task alone — the server carried on, serving, with
-    // nothing being logged.)
-    let file = match open_aof() {
-        Ok(file) => file,
-        Err(e) => fatal_persistence(&format!("{AOF_PATH} cannot be opened for appending: {e}")),
-    };
-    *LOG.lock() = Some(Log { rx, file });
+    if AOF_ENABLED.load(Ordering::Relaxed) {
+        // A server asked to keep an append-only file that cannot open one must
+        // not run: it would accept writes and keep none of them. (This used to be
+        // a panic in this task alone — the server carried on, serving, with
+        // nothing being logged.)
+        let file = match open_aof() {
+            Ok(file) => file,
+            Err(e) => fatal_persistence(&format!("{AOF_PATH} cannot be opened for appending: {e}")),
+        };
+        *LOG.lock() = Some(Log { rx, file });
+        *UNOPENED.lock() = None;
+    } else {
+        // With the AOF off, no file is opened or needed until `CONFIG SET
+        // appendonly yes` (see [`open_log`]). Opened whatever the setting, it
+        // was made in every data directory, and one that could not be written
+        // stopped a server that was never going to write it (#47).
+        let mut log = LOG.lock();
+        *log = None;
+        *UNOPENED.lock() = Some(rx);
+    }
     WRITER_RUNNING.store(true, Ordering::Release);
 
     // Whatever survived startup (an AOF that was just replayed, or nothing) is
