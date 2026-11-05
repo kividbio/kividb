@@ -1,0 +1,16 @@
+port 7802 RESP3 part 0: [1, None, b'3', 0]
+port 7802 RESP3 part 1: [2, None, b'3', 0]
+port 7802 RESP3 part 2: [3, None, b'3', 1]
+port 7802 RESP2 part 0: [1, None, b'3', 0]
+port 7802 RESP2 part 1: [2, None, b'3', 0]
+port 7802 RESP2 part 2: [3, None, b'3', 1]
+HELLO 3 -> b'%7\r\n$6\r\nserver\r\n$5\r\nredis\r\n$7\r\nversion\r\n' ...
+EVAL (RESP3) -> b'*4\r\n:1\r\n_\r\n$1\r\n3\r\n:0\r\n'
+port 7801 RESP3 part 0: InvalidResponse: Protocol Error: b'1'
+port 7801 RESP3 part 1: InvalidResponse: Protocol Error: b'1'
+port 7801 RESP3 part 2: InvalidResponse: Protocol Error: b'1'
+port 7801 RESP2 part 0: [1, None, b'3', 0]
+port 7801 RESP2 part 1: [2, None, b'3', 0]
+port 7801 RESP2 part 2: [3, None, b'3', 1]
+HELLO 3 -> b'%7\r\n$6\r\nserver\r\n$6\r\nkividb\r\n$7\r\nversion\r' ...
+EVAL (RESP3) -> b'*4\r\n:1\r\n$-1\r\n$1\r\n3\r\n:0\r\n'
