@@ -200,7 +200,8 @@ pub fn exec_refusal(
 ///   Redis answers a command whose keys are being moved; the client's retry
 ///   is sent on with `-ASK`;
 /// - a handoff is under way (`pause::HANDOFF`: slots migrating away, or a
-///   manual failover), and the transaction writes: it got past the pause
+///   manual failover), and the transaction may write, as `pause::holds`
+///   tells (a script declared `no-writes` does not): it got past the pause
 ///   before the pause was set. Its writes would miss what the handoff sends
 ///   on, and be lost with the slots, and it cannot wait for the handoff,
 ///   holding every other command back. It is given up whole with
@@ -230,7 +231,11 @@ fn exec_refusal_again(caller: &Caller, queue: &[Vec<Vec<u8>>], routed: Routed) -
     if crate::pause::keys_moving() && crate::key_moves::queue_names_a_moving_key(caller.db, queue) {
         return Some(b"-TRYAGAIN a key of the transaction is being migrated\r\n".to_vec());
     }
-    if crate::pause::handoff() && queue.iter().any(|cmd| writes(cmd)) {
+    if crate::pause::handoff()
+        && queue
+            .iter()
+            .any(|cmd| crate::pause::queued_may_replicate(cmd))
+    {
         return Some(b"-TRYAGAIN writes are paused for a handoff\r\n".to_vec());
     }
     // `pause::handoff` fenced, if it saw a handoff's flag: a handoff that
@@ -239,16 +244,6 @@ fn exec_refusal_again(caller: &Caller, queue: &[Vec<Vec<u8>>], routed: Routed) -
         return route_queue(caller, queue, routed.asking);
     }
     None
-}
-
-/// Whether the queued command `cmd` writes, or may: a script may.
-fn writes(cmd: &[Vec<u8>]) -> bool {
-    cmd.first().is_some_and(|name| {
-        crate::replication::is_write_command_bytes(name)
-            || [&b"EVAL"[..], b"EVALSHA", b"FCALL"]
-                .iter()
-                .any(|script| name.eq_ignore_ascii_case(script))
-    })
 }
 
 /// Route every command of `queue`, for a client that had sent `ASKING` or

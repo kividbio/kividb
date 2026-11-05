@@ -432,16 +432,21 @@ pub fn holds<Q: AsRef<[u8]>>(cmd: &[&[u8]], queued: &[Vec<Q>]) -> bool {
                 .is_some_and(|sub| sub.eq_ignore_ascii_case(b"UNPAUSE")));
     }
     if name == "EXEC" {
-        return queued.iter().any(|command| {
-            command.first().is_some_and(|cmd0| {
-                may_replicate(
-                    &String::from_utf8_lossy(cmd0.as_ref()).to_ascii_uppercase(),
-                    command.get(1).map(|arg| arg.as_ref()),
-                )
-            })
-        });
+        return queued.iter().any(|command| queued_may_replicate(command));
     }
     may_replicate(&name, cmd.get(1).copied())
+}
+
+/// Whether the queued command `command` may write: what [`holds`] holds of
+/// an `EXEC`, and what a transaction that reaches its gates during a
+/// handoff is refused for (`routing::exec_refusal_in_gate`).
+pub fn queued_may_replicate<Q: AsRef<[u8]>>(command: &[Q]) -> bool {
+    command.first().is_some_and(|cmd0| {
+        may_replicate(
+            &String::from_utf8_lossy(cmd0.as_ref()).to_ascii_uppercase(),
+            command.get(1).map(|arg| arg.as_ref()),
+        )
+    })
 }
 
 /// Whether running `name` — with `first`, its first argument — may write.

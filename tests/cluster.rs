@@ -3520,11 +3520,50 @@ fn a_write_routed_before_a_slot_handoff_is_sent_on_not_run_here() {
 /// handoff set it, and reaches its gates while the handoff holds writes, is
 /// refused with `TRYAGAIN`. It used to run: its commands, run inside it,
 /// do not look at the pause, and what it wrote missed what the handoff
-/// sent, and was deleted with the slot's keys here. The destination's
-/// `TAKEOVER` waits 1.5 s (`KIVIDB_TEST_TAKEOVER_DELAY_MS`), so the handoff
-/// holds writes for that long.
+/// sent, and was deleted with the slot's keys here.
 #[test]
 fn a_transaction_that_reaches_its_gates_during_a_slot_handoff_is_refused() {
+    let reply = exec_reaching_its_gates_during_a_slot_handoff(|key| vec![vec!["INCR", key]]);
+    assert!(
+        reply.err().is_some_and(|e| e.starts_with("TRYAGAIN")),
+        "the transaction is refused: {reply:?}"
+    );
+}
+
+/// A transaction that only reads is not refused during a handoff: it
+/// writes nothing the handoff could miss (#339).
+#[test]
+fn a_read_only_transaction_that_reaches_its_gates_during_a_slot_handoff_runs() {
+    let reply = exec_reaching_its_gates_during_a_slot_handoff(|key| vec![vec!["GET", key]]);
+    assert_eq!(reply.array()[0].text(), "5", "{reply:?}");
+}
+
+/// Nor is one whose script is declared `no-writes`, which the handoff's
+/// pause does not hold either. It was refused on every retry, for as long
+/// as the handoff lasted (#339).
+#[cfg(feature = "lua")]
+#[test]
+fn a_transaction_of_a_no_writes_script_during_a_slot_handoff_runs() {
+    let reply = exec_reaching_its_gates_during_a_slot_handoff(|key| {
+        vec![vec![
+            "EVAL",
+            "#!lua flags=no-writes\nreturn redis.call('GET', KEYS[1])",
+            "1",
+            key,
+        ]]
+    });
+    assert_eq!(reply.array()[0].text(), "5", "{reply:?}");
+}
+
+/// `MULTI`, the commands `queued` makes of a key holding "5", and `EXEC`,
+/// held up between its routing and its gates until an atomic slot
+/// migration's handoff holds writes: `EXEC`'s reply. The destination's
+/// `TAKEOVER` waits 1.5 s (`KIVIDB_TEST_TAKEOVER_DELAY_MS`), so the handoff
+/// holds writes for that long. The key is the destination's afterwards,
+/// unchanged.
+fn exec_reaching_its_gates_during_a_slot_handoff(
+    queued: impl FnOnce(&str) -> Vec<Vec<&str>>,
+) -> Resp {
     let key = key_in(0..=1000, "handoff");
     let env = [
         ("KIVIDB_TEST_FAILPOINTS", "routed"),
@@ -3546,7 +3585,11 @@ fn a_transaction_that_reaches_its_gates_during_a_slot_handoff_is_refused() {
     std::fs::remove_file(routed_and_held(src, 1)).unwrap();
     assert!(set.join().unwrap().is_ok());
 
-    let exec = commands_in_background(src.port, &[&["MULTI"], &["INCR", &key], &["EXEC"]]);
+    let mut commands = vec![vec!["MULTI"]];
+    commands.extend(queued(&key));
+    commands.push(vec!["EXEC"]);
+    let commands: Vec<&[&str]> = commands.iter().map(Vec::as_slice).collect();
+    let exec = commands_in_background(src.port, &commands);
     let held = routed_and_held(src, 2);
     let task_id = dst
         .conn()
@@ -3559,12 +3602,9 @@ fn a_transaction_that_reaches_its_gates_during_a_slot_handoff_is_refused() {
     );
     std::fs::remove_file(held).unwrap();
     let reply = exec.join().unwrap();
-    assert!(
-        reply.err().is_some_and(|e| e.starts_with("TRYAGAIN")),
-        "the transaction is refused: {reply:?}"
-    );
     wait_import_completed(dst, &task_id);
     assert_eq!(dst.conn().cmd(&["GET", &key]).text(), "5");
+    reply
 }
 
 /// [`commands_in_background`], on a connection that waits up to

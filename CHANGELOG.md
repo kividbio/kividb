@@ -252,9 +252,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A transaction could lose its writes during an atomic slot migration's
   handoff.** An `EXEC` that got past the write pause just before the
   handoff set it ran during the handoff. Its writes were not sent to the
-  destination, and were deleted with the slots. Such an `EXEC` is now
-  refused with `TRYAGAIN` if it writes. So is one that reaches its gates
-  during a manual failover's handoff.
+  destination, and were deleted with the slots. Such an `EXEC`, or one
+  that reaches its gates during a manual failover's handoff, is now
+  refused with `TRYAGAIN` if it may write, as the pause would have held
+  it. One that only reads, or whose scripts are declared `no-writes`,
+  runs (#339).
 - **`MIGRATE` no longer answers `TRYAGAIN` for an unchanged hash whose field
   is about to expire (#332).** The check that a moved hash was not written
   meanwhile compared the server's fields by the monotonic clock and the
