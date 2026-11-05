@@ -950,6 +950,13 @@ Categories (`ACL CAT`): the data types `string` `list` `set` `sortedset` `hash`
 `blocking`; `pubsub`, `scripting`, `transaction`, `connection`, `cluster`,
 `server`; and `admin` and `dangerous`.
 
+`connection` is Redis's: `AUTH`, `CLIENT`, `COMMAND`, `ECHO`, `HELLO`,
+`PING`, `QUIT`, `RESET`, `SELECT`, `READONLY`, `READWRITE`, `ASKING`, `WAIT`
+and `WAITAOF`, with all their subcommands. `cluster`, `generic` and `server`
+are KiviDB's own, after Redis's command groups; they can be granted like the
+others, and `COMMAND` leaves them out of the categories it reports, as Redis
+has no such categories.
+
 A command with subcommands can be allowed and denied per subcommand, written
 `command|subcommand`: `-client|kill`, `+config|get`. A rule naming the command
 covers all of its subcommands. `admin` and `dangerous` are per subcommand where

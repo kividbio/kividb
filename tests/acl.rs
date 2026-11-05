@@ -2323,3 +2323,128 @@ fn the_keys_checked_are_the_keys_used() {
     ]);
     assert_eq!(reply.as_int(), 1, "{reply:?}");
 }
+
+/// `@connection` holds what it holds in Redis 7.4 to 8.10 and Valkey:
+/// `COMMAND` and its subcommands, `SELECT`, `READONLY`, `READWRITE`,
+/// `ASKING`, `WAIT` and `WAITAOF` too (#392). redis-py's cluster client runs
+/// `COMMAND` as it connects; OpenViking's gateway gives its user
+/// `+@connection` for that, and every cluster connection was refused.
+#[test]
+fn test_connection_category_is_redis_s() {
+    let cat = kividb::commands::server::acl_cat_commands_pub;
+    let connection = cat("connection");
+    for command in [
+        "ASKING",
+        "AUTH",
+        "CLIENT",
+        "COMMAND",
+        "ECHO",
+        "HELLO",
+        "PING",
+        "QUIT",
+        "READONLY",
+        "READWRITE",
+        "RESET",
+        "SELECT",
+        "WAIT",
+        "WAITAOF",
+    ] {
+        assert!(connection.contains(&command), "{command}: {connection:?}");
+    }
+    // They are in no data category in Redis, nor in @read or @write.
+    for category in ["keyspace", "read", "write"] {
+        for command in ["COMMAND", "SELECT", "WAIT", "WAITAOF"] {
+            assert!(
+                !cat(category).contains(&command),
+                "{command} in @{category}"
+            );
+        }
+    }
+
+    let port = free_port();
+    start_server(port);
+    let mut admin = Conn::connect(port);
+    let r = admin.cmds(&["ACL", "SETUSER", "conn", "on", ">pw", "+@connection"]);
+    assert!(r.is_ok(), "{r:?}");
+
+    let listed: Vec<String> = admin
+        .cmds(&["ACL", "CAT", "connection"])
+        .as_array()
+        .iter()
+        .map(|v| v.as_str().to_ascii_lowercase())
+        .collect();
+    for command in [
+        "command",
+        "select",
+        "readonly",
+        "readwrite",
+        "asking",
+        "wait",
+        "waitaof",
+    ] {
+        assert!(listed.iter().any(|c| c == command), "{command}: {listed:?}");
+    }
+
+    // What COMMAND INFO reports, as Redis does.
+    let categories = |c: &mut Conn, name: &str| -> Vec<String> {
+        let reply = c.cmds(&["COMMAND", "INFO", name]);
+        let mut list: Vec<String> = reply.as_array()[0].as_array()[6]
+            .as_array()
+            .iter()
+            .map(|v| v.as_str().to_string())
+            .collect();
+        list.sort();
+        list
+    };
+    assert_eq!(categories(&mut admin, "command"), ["@connection", "@slow"]);
+    for name in ["select", "readonly", "readwrite", "asking"] {
+        assert_eq!(
+            categories(&mut admin, name),
+            ["@connection", "@fast"],
+            "{name}"
+        );
+    }
+    for name in ["wait", "waitaof"] {
+        assert_eq!(
+            categories(&mut admin, name),
+            ["@blocking", "@connection", "@slow"],
+            "{name}"
+        );
+    }
+
+    let mut user = Conn::connect(port);
+    assert!(user.cmds(&["AUTH", "conn", "pw"]).is_ok());
+    let all = user.cmds(&["COMMAND"]);
+    assert!(
+        all.as_array().len() > 300,
+        "COMMAND gave {} entries",
+        all.as_array().len()
+    );
+    assert!(user.cmds(&["COMMAND", "COUNT"]).as_int() > 300);
+    for command in [
+        vec!["COMMAND", "INFO", "get"],
+        vec!["COMMAND", "DOCS", "get"],
+        vec!["COMMAND", "LIST"],
+        vec!["COMMAND", "GETKEYS", "SET", "k", "v"],
+        vec!["COMMAND", "GETKEYSANDFLAGS", "SET", "k", "v"],
+        vec!["COMMAND", "HELP"],
+        vec!["SELECT", "1"],
+        vec!["READONLY"],
+        vec!["READWRITE"],
+        vec!["ASKING"],
+        vec!["WAIT", "0", "0"],
+        vec!["WAITAOF", "0", "0", "0"],
+    ] {
+        let reply = user.cmds(&command);
+        assert!(
+            !(reply.is_error() && reply.error_str().starts_with("NOPERM")),
+            "{command:?}: {reply:?}"
+        );
+    }
+    assert!(user.cmds(&["SELECT", "0"]).is_ok());
+    // And nothing more than the category.
+    let reply = user.cmds(&["GET", "k"]);
+    assert!(reply.error_str().starts_with("NOPERM"), "{reply:?}");
+    let reply = user.cmds(&["CONFIG", "GET", "maxmemory"]);
+    assert!(reply.error_str().starts_with("NOPERM"), "{reply:?}");
+}

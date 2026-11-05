@@ -29,6 +29,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`@connection` holds what it holds in Redis (#392).** It had only
+  `AUTH`, `CLIENT`, `ECHO`, `HELLO`, `PING`, `QUIT` and `RESET`. It now
+  also has `COMMAND` and all its subcommands, `SELECT`, `READONLY`,
+  `READWRITE`, `ASKING`, `WAIT` and `WAITAOF`, as in Redis 7.4 to 8.10 and
+  Valkey. redis-py's cluster client runs `COMMAND` when it connects, so a
+  user given `+@connection` and not `+command` (as OpenViking's gateway
+  CI sets one up) could not open a cluster connection: `NoPermissionError:
+  User ... has no permissions to run the 'command' command`. `WAIT` and
+  `WAITAOF` are no longer in `@keyspace`, `@generic` and `@read`, nor
+  `SELECT` in `@write`, where Redis does not have them (a user of
+  `+@all -@write` may now `SELECT`, as in Redis). `COMMAND INFO` now
+  reports only categories Redis has: `COMMAND` is `@slow @connection`,
+  as in Redis, not `@server @slow`. KiviDB's own `@cluster` and `@server`
+  keep the commands they had, for `ACL SETUSER` and `ACL CAT`.
 - **`ZREM` no longer scans the whole sorted set for each member it removes.**
   Removing a member is now O(log N) instead of O(N)
   ([#386](https://github.com/kividbio/kividb/issues/386),
