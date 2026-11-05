@@ -284,22 +284,53 @@ fn inside_multi_brpoplpush_and_blmove_answer_with_a_null_bulk_string() {
         for resp in [2, 3] {
             let mut c = server.conn(resp);
             assert_eq!(c.cmd(&["MULTI"]), "+OK\r\n");
+            // A timeout so short that it has passed before the command has
+            // looked at its key changes nothing: it never waited.
             for block in [
                 &["BRPOPLPUSH", "m:list", "m:dst", "0"][..],
                 &["BLMOVE", "m:list", "m:dst", "LEFT", "RIGHT", "0"],
+                &["BRPOPLPUSH", "m:list", "m:dst", "0.0000001"],
+                &["BLMOVE", "m:list", "m:dst", "LEFT", "RIGHT", "0.0000001"],
                 &["BLPOP", "m:list", "0"],
                 &["BZPOPMIN", "m:zset", "0"],
             ] {
                 assert_eq!(c.cmd(block), "+QUEUED\r\n", "{io} {block:?}");
             }
             let want = format!(
-                "*4\r\n{}{}{}{}",
+                "*6\r\n{}{}{}{}{}{}",
+                null_bulk(resp),
+                null_bulk(resp),
                 null_bulk(resp),
                 null_bulk(resp),
                 null_array(resp),
                 null_array(resp)
             );
             assert_eq!(c.cmd(&["EXEC"]), want, "{io} RESP{resp}");
+        }
+    }
+}
+
+/// In a script, too, a blocking move on an empty list cannot wait, however
+/// short its timeout, and the script is given `false` for it, as in Redis.
+/// (A null bulk string and a null array both reach Lua as `false`: this
+/// pins what the script sees, not which null it was.)
+#[cfg(feature = "lua")]
+#[test]
+fn in_a_script_a_blocking_move_on_an_empty_list_is_false() {
+    let script = "local r = redis.call(unpack(ARGV)) \
+                  if r == false then return 'false' end return r";
+    for &io in io_models() {
+        let server = Server::start(io);
+        let mut c = server.conn(2);
+        for timeout in ["0", "0.0000001", "0.001"] {
+            for call in [
+                &["BRPOPLPUSH", "s:list", "s:dst", timeout][..],
+                &["BLMOVE", "s:list", "s:dst", "LEFT", "RIGHT", timeout],
+            ] {
+                let mut args = vec!["EVAL", script, "0"];
+                args.extend_from_slice(call);
+                assert_eq!(c.cmd(&args), "$5\r\nfalse\r\n", "{io} {call:?}");
+            }
         }
     }
 }

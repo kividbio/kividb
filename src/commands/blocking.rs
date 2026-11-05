@@ -451,7 +451,16 @@ pub fn wait_for_keys(
         (None, Some(remaining)) if !timed_out => Err(remaining),
         (None, _) => {
             crate::stats::record_miss();
-            Ok(crate::resp::write::resp_null_array())
+            // A wait that ran out is answered with a null array. A caller
+            // that cannot wait (`MULTI`, a script, the replica applier) whose
+            // tiny timeout passed while it looked never waited: it gets the
+            // command's own reply, as it does below and as in Redis, which
+            // answers there by `CLIENT_DENY_BLOCKING` whatever the timeout.
+            Ok(if ctx.blocking.is_some() {
+                crate::resp::write::resp_null_array()
+            } else {
+                empty()
+            })
         }
     };
 
