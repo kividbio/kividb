@@ -674,7 +674,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             }
             row.insert(
                 "__score".to_string(),
-                crate::commands::search::score_text(score),
+                crate::commands::search::number_text(score),
             );
         }
 

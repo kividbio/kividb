@@ -94,6 +94,12 @@ impl V {
             .map(|pair| (pair[0].s().to_string(), pair[1].s().parse().unwrap()))
             .collect()
     }
+    /// Whether a flat `[name, value, …]` array has `name` set to `value`.
+    fn has(&self, name: &str, value: &str) -> bool {
+        self.arr()
+            .chunks(2)
+            .any(|p| matches!(p, [V::Str(n), V::Str(v)] if n == name && v == value))
+    }
     /// A flat `[name, value, …]` array as pairs.
     fn pairs(&self) -> Vec<(String, String)> {
         self.arr()
@@ -239,6 +245,36 @@ fn port() -> u16 {
 
 fn conn() -> Conn {
     Conn::connect(port())
+}
+
+/// The scores of `query` on `index`, by id, against what Redis gave.
+fn assert_scores(c: &mut Conn, index: &str, query: &str, extra: &[&str], want: &[(&str, f64)]) {
+    let mut args = vec![
+        "FT.SEARCH",
+        index,
+        query,
+        "WITHSCORES",
+        "NOCONTENT",
+        "DIALECT",
+        "2",
+    ];
+    args.extend_from_slice(extra);
+    let reply = c.cmd(&args);
+    let mut got = reply.scores();
+    got.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut want: Vec<(String, f64)> = want.iter().map(|(k, s)| (k.to_string(), *s)).collect();
+    want.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        got.iter().map(|g| &g.0).collect::<Vec<_>>(),
+        want.iter().map(|w| &w.0).collect::<Vec<_>>(),
+        "{query} {extra:?}: {reply:?}"
+    );
+    for ((id, g), (_, w)) in got.iter().zip(&want) {
+        assert!(
+            (g - w).abs() <= 1e-9 * w.abs().max(1.0),
+            "{query} {extra:?}: {id} scored {g}, Redis {w}"
+        );
+    }
 }
 
 /// A server of its own, so `FT.CONFIG SET ON_TIMEOUT` and a large insert do
@@ -3495,4 +3531,693 @@ fn an_aggregate_word_named_timeout_is_not_the_option() {
         .err()
         .contains("TIMEOUT")
     );
+}
+
+/// `SCORE` and `SCORE_FIELD`, by the values Redis 8.10.2 gives the same
+/// index and documents.
+#[test]
+fn score_field_multiplies_scores_as_redis_does() {
+    let mut c = conn();
+
+    for bad in ["-1", "1.1", "2", "inf", "abc"] {
+        assert_eq!(
+            c.cmd(&["FT.CREATE", "bad", "SCORE", bad, "SCHEMA", "title", "TEXT"])
+                .err(),
+            "Invalid score",
+            "SCORE {bad}"
+        );
+    }
+
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "sf",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "sf:",
+            "SCORE_FIELD",
+            "rank",
+            "SCORE",
+            "0.25",
+            "SCHEMA",
+            "title",
+            "TEXT",
+        ])
+        .ok()
+    );
+    let info = c.cmd(&["FT.INFO", "sf"]);
+    let definition = info
+        .arr()
+        .chunks(2)
+        .find(|pair| matches!(&pair[0], V::Str(k) if k == "index_definition"))
+        .map(|pair| &pair[1])
+        .unwrap();
+    assert!(definition.has("default_score", "0.25"), "{definition:?}");
+    assert!(definition.has("score_field", "rank"), "{definition:?}");
+
+    for (id, rank) in [("4", "4"), ("2.5", "2.5"), ("0.5", "0.5")] {
+        c.cmd(&["HSET", &format!("sf:{id}"), "title", "hello", "rank", rank]);
+    }
+    c.cmd(&["HSET", "sf:missing", "title", "hello"]);
+
+    let cases: [(&str, &[(&str, f64)]); 8] = [
+        (
+            "BM25STD",
+            &[
+                ("sf:4", 0.4214420626313054),
+                ("sf:2.5", 0.2634012891445659),
+                ("sf:0.5", 0.052680257828913175),
+                ("sf:missing", 0.026340128914456588),
+            ],
+        ),
+        (
+            "BM25STD.TANH",
+            &[
+                ("sf:4", 0.10497237569060779),
+                ("sf:2.5", 0.06575530560834844),
+                ("sf:0.5", 0.013169303058203206),
+                ("sf:missing", 0.00658493704878366),
+            ],
+        ),
+        (
+            "BM25",
+            &[
+                ("sf:4", 1.8181817787737895),
+                ("sf:2.5", 1.1363636117336184),
+                ("sf:0.5", 0.2272727223467237),
+                ("sf:missing", 0.11363636117336184),
+            ],
+        ),
+        (
+            "TFIDF",
+            &[
+                ("sf:4", 4.0),
+                ("sf:2.5", 2.5),
+                ("sf:0.5", 0.5),
+                ("sf:missing", 0.25),
+            ],
+        ),
+        (
+            "TFIDF.DOCNORM",
+            &[
+                ("sf:4", 4.0),
+                ("sf:2.5", 2.5),
+                ("sf:0.5", 0.5),
+                ("sf:missing", 0.25),
+            ],
+        ),
+        (
+            "DOCSCORE",
+            &[
+                ("sf:4", 4.0),
+                ("sf:2.5", 2.5),
+                ("sf:0.5", 0.5),
+                ("sf:missing", 0.25),
+            ],
+        ),
+        (
+            "DISMAX",
+            &[
+                ("sf:4", 1.0),
+                ("sf:2.5", 1.0),
+                ("sf:0.5", 1.0),
+                ("sf:missing", 1.0),
+            ],
+        ),
+        (
+            "HAMMING",
+            &[
+                ("sf:4", 0.0),
+                ("sf:2.5", 0.0),
+                ("sf:0.5", 0.0),
+                ("sf:missing", 0.0),
+            ],
+        ),
+    ];
+    for (scorer, want) in cases {
+        assert_scores(&mut c, "sf", "hello", &["SCORER", scorer], want);
+    }
+    c.cmd(&["FT.DROPINDEX", "sf", "DD"]);
+
+    // `SCORE` alone applies to every document; a field that is not a number
+    // is the default, and is not trimmed or otherwise read.
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "sfs",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "sfs:",
+            "SCORE",
+            "0.5",
+            "SCORE_FIELD",
+            "rank",
+            "SCHEMA",
+            "title",
+            "TEXT",
+        ])
+        .ok()
+    );
+    for (id, rank) in [
+        ("plain", None),
+        ("+2", Some("+2")),
+        ("-2", Some("-2")),
+        ("space", Some(" 5 ")),
+        ("text", Some("abc")),
+    ] {
+        let key = format!("sfs:{id}");
+        let mut hset = vec!["HSET", key.as_str(), "title", "hello"];
+        if let Some(rank) = rank {
+            hset.extend_from_slice(&["rank", rank]);
+        }
+        c.cmd(&hset);
+    }
+    assert_scores(
+        &mut c,
+        "sfs",
+        "hello",
+        &["SCORER", "DOCSCORE"],
+        &[
+            ("sfs:plain", 0.5),
+            ("sfs:+2", 2.0),
+            ("sfs:-2", -2.0),
+            ("sfs:space", 0.5),
+            ("sfs:text", 0.5),
+        ],
+    );
+    c.cmd(&["FT.DROPINDEX", "sfs", "DD"]);
+}
+
+/// `SCORE` without `SCORE_FIELD` applies to every document, and a field it
+/// does not name is not read.
+#[test]
+fn score_alone_applies_to_every_document() {
+    let mut c = conn();
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "so",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "so:",
+            "SCORE",
+            "0.5",
+            "SCHEMA",
+            "title",
+            "TEXT",
+        ])
+        .ok()
+    );
+    c.cmd(&["HSET", "so:1", "title", "hello", "rank", "10"]);
+    assert_scores(
+        &mut c,
+        "so",
+        "hello",
+        &["SCORER", "DOCSCORE"],
+        &[("so:1", 0.5)],
+    );
+    assert_scores(&mut c, "so", "hello", &[], &[("so:1", 0.14384103622589042)]);
+    c.cmd(&["FT.DROPINDEX", "so", "DD"]);
+}
+
+/// `SCORE` is read as a 32-bit float too, by the values Redis 8.10.2 gives
+/// the same indexes.
+#[test]
+fn a_default_score_is_read_as_a_f32() {
+    let mut c = conn();
+    for (name, score, want) in [
+        ("sd01", "0.1", 0.10000000149011612),
+        ("sd02", "0.123456789", 0.12345679104328156),
+        ("sd03", "1e-7", 1.0000000116860974e-7),
+    ] {
+        assert!(
+            c.cmd(&["FT.CREATE", name, "SCORE", score, "SCHEMA", "title", "TEXT"])
+                .ok(),
+            "SCORE {score:?}"
+        );
+        let key = format!("{name}:1");
+        c.cmd(&["HSET", &key, "title", "hello"]);
+        assert_scores(
+            &mut c,
+            name,
+            "hello",
+            &["SCORER", "DOCSCORE"],
+            &[(key.as_str(), want)],
+        );
+        c.cmd(&["FT.DROPINDEX", name, "DD"]);
+    }
+}
+
+/// `SCORE_FIELD` reads a hash field as a 32-bit float, by the values Redis
+/// 8.10.2 gives the same documents.
+#[test]
+fn a_score_field_is_read_as_a_f32() {
+    let mut c = conn();
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "sf32",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "sf32:",
+            "SCORE_FIELD",
+            "rank",
+            "SCORE",
+            "0.25",
+            "SCHEMA",
+            "title",
+            "TEXT",
+        ])
+        .ok()
+    );
+    for (id, rank) in [
+        ("a", "0.1"),
+        ("b", "123456.789"),
+        ("c", "1e-20"),
+        ("d", "1e-45"),
+        ("e", "1e-46"),
+        ("f", "3.4e38"),
+        ("g", "3.5e38"),
+    ] {
+        c.cmd(&[
+            "HSET",
+            &format!("sf32:{id}"),
+            "title",
+            "hello",
+            "rank",
+            rank,
+        ]);
+    }
+    let mut got = c
+        .cmd(&[
+            "FT.SEARCH",
+            "sf32",
+            "hello",
+            "SCORER",
+            "DOCSCORE",
+            "WITHSCORES",
+            "NOCONTENT",
+            "DIALECT",
+            "2",
+        ])
+        .scores();
+    got.sort_by(|a, b| a.0.cmp(&b.0));
+    let score = |id: &str| got.iter().find(|(name, _)| name == id).unwrap().1;
+    assert_eq!(score("sf32:a"), 0.10000000149011612);
+    assert_eq!(score("sf32:b"), 1.234567890625e+5);
+    assert_eq!(score("sf32:c"), 9.999999682655225e-21);
+    assert_eq!(score("sf32:d"), 1.401298464324817e-45);
+    assert_eq!(score("sf32:e"), 0.0);
+    assert_eq!(score("sf32:f"), 3.3999999521443642e+38);
+    assert!(score("sf32:g").is_infinite() && score("sf32:g").is_sign_positive());
+    c.cmd(&["FT.DROPINDEX", "sf32", "DD"]);
+}
+
+/// `SCORE_FIELD` reads the hash field it names; a schema alias does not
+/// redirect it.
+#[test]
+fn a_hash_score_field_is_read_by_its_raw_name() {
+    let mut c = conn();
+
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "sfa",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "sfa:",
+            "SCORE_FIELD",
+            "salias",
+            "SCORE",
+            "0.25",
+            "SCHEMA",
+            "rank",
+            "AS",
+            "salias",
+            "NUMERIC",
+        ])
+        .ok()
+    );
+    c.cmd(&["HSET", "sfa:raw", "rank", "2"]);
+    c.cmd(&["HSET", "sfa:alias", "rank", "2", "salias", "5"]);
+    assert_scores(
+        &mut c,
+        "sfa",
+        "*",
+        &["SCORER", "DOCSCORE"],
+        &[("sfa:raw", 0.25), ("sfa:alias", 5.0)],
+    );
+
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "sfr",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "sfr:",
+            "SCORE_FIELD",
+            "rank",
+            "SCORE",
+            "0.25",
+            "SCHEMA",
+            "rank",
+            "AS",
+            "salias",
+            "NUMERIC",
+        ])
+        .ok()
+    );
+    c.cmd(&["HSET", "sfr:1", "rank", "2"]);
+    assert_scores(
+        &mut c,
+        "sfr",
+        "*",
+        &["SCORER", "DOCSCORE"],
+        &[("sfr:1", 2.0)],
+    );
+    c.cmd(&["FT.DROPINDEX", "sfa", "DD"]);
+    c.cmd(&["FT.DROPINDEX", "sfr", "DD"]);
+}
+
+#[test]
+fn score_option_trims_whitespace_and_info_omits_zero() {
+    let mut c = conn();
+    for (name, score, want) in [
+        ("sw1", " 0.5 ", Some("0.5")),
+        ("sw2", " 0.5", Some("0.5")),
+        ("sw3", "0.5 ", Some("0.5")),
+        ("szero", "0", None),
+        ("snegzero", "-0", None),
+        ("sone", "1", Some("1")),
+        ("snan", "nan", Some("nan")),
+        ("ssci", "0.0000001", Some("1e-7")),
+    ] {
+        assert!(
+            c.cmd(&["FT.CREATE", name, "SCORE", score, "SCHEMA", "title", "TEXT",])
+                .ok(),
+            "SCORE {score:?}"
+        );
+        let info = c.cmd(&["FT.INFO", name]);
+        let definition = info
+            .arr()
+            .chunks(2)
+            .find(|pair| matches!(&pair[0], V::Str(k) if k == "index_definition"))
+            .map(|pair| &pair[1])
+            .unwrap();
+        match want {
+            Some(value) => assert!(
+                definition.has("default_score", value),
+                "SCORE {score:?}: {definition:?}"
+            ),
+            None => assert!(
+                !definition
+                    .arr()
+                    .chunks(2)
+                    .any(|pair| matches!(&pair[0], V::Str(k) if k == "default_score")),
+                "SCORE {score:?}: {definition:?}"
+            ),
+        }
+        c.cmd(&["FT.DROPINDEX", name, "DD"]);
+    }
+}
+
+#[test]
+fn score_field_special_values_match_redis() {
+    let mut c = conn();
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "sp",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "sp:",
+            "SCORE_FIELD",
+            "rank",
+            "SCORE",
+            "0.25",
+            "SCHEMA",
+            "title",
+            "TEXT",
+            "n",
+            "NUMERIC",
+            "SORTABLE",
+        ])
+        .ok()
+    );
+    for (id, rank) in [
+        ("a", Some("2")),
+        ("b", Some("-inf")),
+        ("c", Some("inf")),
+        ("d", None),
+        ("e", Some("nan")),
+        ("f", Some("NaN")),
+        ("g", Some("-0")),
+    ] {
+        let key = format!("sp:{id}");
+        let mut hset = vec!["HSET", key.as_str(), "title", "hello", "n", "1"];
+        if let Some(rank) = rank {
+            hset.extend_from_slice(&["rank", rank]);
+        }
+        c.cmd(&hset);
+    }
+
+    let reply = c.cmd(&[
+        "FT.SEARCH",
+        "sp",
+        "hello",
+        "SCORER",
+        "DOCSCORE",
+        "WITHSCORES",
+        "NOCONTENT",
+        "DIALECT",
+        "2",
+    ]);
+    let mut got = reply.scores();
+    got.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        got.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        ["sp:a", "sp:c", "sp:d", "sp:e", "sp:f", "sp:g"]
+    );
+    let score = |id: &str| got.iter().find(|(name, _)| name == id).unwrap().1;
+    assert_eq!(score("sp:a"), 2.0);
+    assert!(score("sp:c").is_infinite() && score("sp:c").is_sign_positive());
+    assert_eq!(score("sp:d"), 0.25);
+    assert_eq!(score("sp:e"), 0.25);
+    assert_eq!(score("sp:f"), 0.25);
+    assert!(score("sp:g") == 0.0 && score("sp:g").is_sign_negative());
+
+    assert_eq!(
+        c.cmd(&[
+            "FT.SEARCH",
+            "sp",
+            "hello",
+            "SCORER",
+            "DOCSCORE",
+            "SORTBY",
+            "n",
+            "ASC",
+            "NOCONTENT",
+            "DIALECT",
+            "2",
+        ])
+        .arr()[0]
+            .i(),
+        7
+    );
+    assert_eq!(
+        c.cmd(&[
+            "FT.SEARCH",
+            "sp",
+            "hello",
+            "SCORER",
+            "DOCSCORE",
+            "SORTBY",
+            "n",
+            "ASC",
+            "WITHSCORES",
+            "NOCONTENT",
+            "DIALECT",
+            "2",
+        ])
+        .arr()[0]
+            .i(),
+        6
+    );
+    assert_eq!(
+        c.cmd(&[
+            "FT.SEARCH",
+            "sp",
+            "hello",
+            "SCORER",
+            "DOCSCORE",
+            "LIMIT",
+            "0",
+            "0",
+            "DIALECT",
+            "2",
+        ])
+        .arr()[0]
+            .i(),
+        7
+    );
+    assert_eq!(
+        c.cmd(&[
+            "FT.SEARCH",
+            "sp",
+            "hello",
+            "SCORER",
+            "DOCSCORE",
+            "LIMIT",
+            "0",
+            "0",
+            "WITHSCORES",
+            "DIALECT",
+            "2",
+        ])
+        .arr()[0]
+            .i(),
+        6
+    );
+
+    let aggregate = |c: &mut Conn, args: &[&str]| -> i64 {
+        let mut all = vec!["FT.AGGREGATE", "sp", "hello", "SCORER", "DOCSCORE"];
+        all.extend_from_slice(args);
+        all.push("DIALECT");
+        all.push("2");
+        c.cmd(&all).arr()[0].i()
+    };
+    assert_eq!(aggregate(&mut c, &["LOAD", "1", "@n"]), 7);
+    assert_eq!(aggregate(&mut c, &["ADDSCORES", "LOAD", "1", "@n"]), 6);
+
+    let tfidf = c
+        .cmd(&[
+            "FT.SEARCH",
+            "sp",
+            "hello",
+            "SCORER",
+            "TFIDF",
+            "WITHSCORES",
+            "NOCONTENT",
+            "DIALECT",
+            "2",
+        ])
+        .scores();
+    assert!(
+        tfidf
+            .iter()
+            .any(|(id, score)| id == "sp:b" && *score == 0.0)
+    );
+    let tanh = c
+        .cmd(&[
+            "FT.SEARCH",
+            "sp",
+            "hello",
+            "SCORER",
+            "BM25STD.TANH",
+            "WITHSCORES",
+            "NOCONTENT",
+            "DIALECT",
+            "2",
+        ])
+        .scores();
+    assert!(
+        tanh.iter()
+            .any(|(id, score)| id == "sp:b" && *score == -1.0)
+    );
+    c.cmd(&["FT.DROPINDEX", "sp", "DD"]);
+}
+
+#[test]
+fn negative_document_scores_clamp_for_bm25_and_tfidf() {
+    let mut c = conn();
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "sn",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "sn:",
+            "SCORE_FIELD",
+            "rank",
+            "SCORE",
+            "0.25",
+            "SCHEMA",
+            "title",
+            "TEXT",
+        ])
+        .ok()
+    );
+    for (id, rank) in [("p", "2"), ("n", "-2"), ("z", "0"), ("m", "-inf")] {
+        c.cmd(&["HSET", &format!("sn:{id}"), "title", "hello", "rank", rank]);
+    }
+
+    let scores = |c: &mut Conn, scorer: &str| {
+        let mut got = c
+            .cmd(&[
+                "FT.SEARCH",
+                "sn",
+                "hello",
+                "SCORER",
+                scorer,
+                "WITHSCORES",
+                "NOCONTENT",
+                "DIALECT",
+                "2",
+            ])
+            .scores();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        got
+    };
+    let raw = scores(&mut c, "DOCSCORE");
+    assert_eq!(
+        raw.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        ["sn:n", "sn:p", "sn:z"]
+    );
+    assert_eq!(raw.iter().find(|(id, _)| id == "sn:n").unwrap().1, -2.0);
+
+    for scorer in ["BM25", "TFIDF"] {
+        let got = scores(&mut c, scorer);
+        assert_eq!(
+            got.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            ["sn:m", "sn:n", "sn:p", "sn:z"],
+            "{scorer}"
+        );
+        for id in ["sn:m", "sn:n", "sn:z"] {
+            let score = got.iter().find(|(name, _)| name == id).unwrap().1;
+            assert_eq!(score, 0.0, "{scorer} {id}");
+            assert!(!score.is_sign_negative(), "{scorer} {id}");
+        }
+    }
+
+    let std = scores(&mut c, "BM25STD");
+    assert_eq!(
+        std.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        ["sn:n", "sn:p", "sn:z"]
+    );
+    assert!(std.iter().find(|(id, _)| id == "sn:n").unwrap().1 < 0.0);
+
+    let tanh = scores(&mut c, "BM25STD.TANH");
+    assert_eq!(
+        tanh.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        ["sn:m", "sn:n", "sn:p", "sn:z"]
+    );
+    assert_eq!(tanh.iter().find(|(id, _)| id == "sn:m").unwrap().1, -1.0);
+
+    c.cmd(&["FT.DROPINDEX", "sn", "DD"]);
 }

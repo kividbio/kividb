@@ -5068,6 +5068,8 @@ fn a_master_added_later_is_given_the_index() {
         "price",
         "NUMERIC",
         "SORTABLE",
+        "rank",
+        "NUMERIC",
         "name",
         "TEXT",
         "SORTABLE",
@@ -5173,6 +5175,10 @@ fn a_master_added_later_is_given_the_index() {
         .cmd(&["FT.SEARCH", "idx", "hello", "NOCONTENT"]);
     assert_eq!(found.array()[0].int(), 1, "{found:?}");
 
+    // Redis drops a document whose score is -inf only when the scores are
+    // needed: a plain search does, but `SORTBY price` and `LIMIT 0 0` do not.
+    // The coordinator asks every master for scores to merge its part, but must
+    // tell them the client did not ask for them, or they drop `low` too.
     let found = nodes[4].conn().cmd(&[
         "FT.SEARCH",
         "idx",

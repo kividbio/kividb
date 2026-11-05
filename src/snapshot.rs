@@ -75,7 +75,6 @@ const KDB_LANGUAGE_MAGIC: &[u8; 8] = b"KIVILG1\0";
 /// `SCORE` and `SCORE_FIELD` of each index that sets either otherwise than
 /// the default. Last, for the same reason as the language.
 const KDB_SCORE_MAGIC: &[u8; 8] = b"KIVISR1\0";
-const KDB_SCORE_MAGIC_V2: &[u8; 8] = b"KIVISR2\0";
 
 // Field-type tags used inside the index schema section.
 const SCHEMA_FIELD_TEXT: u8 = 0;
@@ -886,7 +885,7 @@ fn write_kdb_score_section(
         return Ok(());
     }
     set.sort_by(|a, b| a.name.cmp(&b.name));
-    w.write_all(KDB_SCORE_MAGIC_V2)?;
+    w.write_all(KDB_SCORE_MAGIC)?;
     w.write_all(&(set.len() as u32).to_le_bytes())?;
     for def in set {
         write_bytes(w, def.name.as_bytes())?;
@@ -904,25 +903,6 @@ fn write_kdb_score_section(
 
 /// Body of the score section; the magic has already been consumed.
 fn read_score_section(r: &mut impl Read, schemas: &mut [IndexSchema]) -> io::Result<()> {
-    let text = |bytes: Vec<u8>| {
-        String::from_utf8(bytes)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad index score utf8"))
-    };
-    for _ in 0..read_u32_le(r)? {
-        let index = text(read_bytes(r)?)?;
-        let mut score = [0u8; 8];
-        r.read_exact(&mut score)?;
-        let field = text(read_bytes(r)?)?;
-        if let Some(schema) = schemas.iter_mut().find(|s| s.name == index) {
-            schema.default_score = f64::from_bits(u64::from_le_bytes(score));
-            schema.score_field = (!field.is_empty()).then_some(field);
-        }
-    }
-    Ok(())
-}
-
-/// Body of the version 2 score section; the magic has already been consumed.
-fn read_score_section_v2(r: &mut impl Read, schemas: &mut [IndexSchema]) -> io::Result<()> {
     let text = |bytes: Vec<u8>| {
         String::from_utf8(bytes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad index score utf8"))
@@ -1942,8 +1922,6 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
             read_language_section(&mut r, &mut index_schemas)?;
         } else if &magic == KDB_SCORE_MAGIC {
             read_score_section(&mut r, &mut index_schemas)?;
-        } else if &magic == KDB_SCORE_MAGIC_V2 {
-            read_score_section_v2(&mut r, &mut index_schemas)?;
         } else {
             break;
         }
@@ -5236,33 +5214,6 @@ mod field_option_tests {
             .insert("plain".into(), index("plain", 1.0, None));
         write_kdb_image(&mut bare, &[HashMap::new()], Some(&empty)).unwrap();
         assert!(!bare.windows(8).any(|w| w == KDB_SCORE_MAGIC));
-        assert!(!bare.windows(8).any(|w| w == KDB_SCORE_MAGIC_V2));
-    }
-
-    /// A score section written before an empty `SCORE_FIELD` was kept reads
-    /// its empty string as no field.
-    #[test]
-    fn a_legacy_score_section_reads_an_empty_field_as_none() {
-        let mut schemas = vec![IndexSchema {
-            name: "legacy".into(),
-            db_index: 0,
-            on: IndexOn::Hash,
-            prefixes: vec![],
-            fields: vec![],
-            aliases: Vec::new(),
-            stopwords: None,
-            synonyms: Default::default(),
-            language: Default::default(),
-            default_score: 1.0,
-            score_field: None,
-        }];
-        let mut section = Vec::new();
-        section.extend_from_slice(&1u32.to_le_bytes());
-        write_bytes(&mut section, b"legacy").unwrap();
-        section.extend_from_slice(&1.0f64.to_bits().to_le_bytes());
-        write_bytes(&mut section, b"").unwrap();
-        read_score_section(&mut section.as_slice(), &mut schemas).unwrap();
-        assert_eq!(schemas[0].score_field, None);
     }
 }
 

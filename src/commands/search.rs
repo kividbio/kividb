@@ -2819,6 +2819,8 @@ mod tests {
             stopwords: None,
             synonyms: Default::default(),
             language: Default::default(),
+            default_score: 1.0,
+            score_field: None,
         }
         .into_def();
         index_store.write().insert("i347".into(), def.clone());

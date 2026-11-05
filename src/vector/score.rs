@@ -424,8 +424,9 @@ impl<'q> Scoring<'q> {
     /// holds no number there. A JSON document's number is read from the
     /// document itself, not from what the schema projects of it.
     fn document_score(def: &IndexDef, doc: &dyn Doc, json: Option<&serde_json::Value>) -> f64 {
+        let default_score = f64::from(def.default_score as f32);
         let Some(field) = &def.score_field else {
-            return def.default_score;
+            return default_score;
         };
         let score = match def.on {
             super::IndexOn::Hash => doc.field_bytes(field).and_then(Self::score_from_bytes),
@@ -435,7 +436,7 @@ impl<'q> Scoring<'q> {
         };
         score
             .filter(|score| !score.is_nan())
-            .unwrap_or(def.default_score)
+            .unwrap_or(default_score)
     }
 
     fn score_from_bytes(bytes: &[u8]) -> Option<f64> {
