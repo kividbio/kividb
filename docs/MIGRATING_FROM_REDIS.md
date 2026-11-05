@@ -94,11 +94,16 @@ What the RDB reader takes from Redis:
 - **Other module data** (time series, vector sets, Bloom filters, and so on)
   is refused, and so is the whole file: KiviDB won't load part of a
   snapshot. Move those keys with `MIGRATE` instead, or recreate them.
-- **HyperLogLogs aren't usable yet.** KiviDB's HyperLogLog registers aren't
-  in Redis's layout ([#62](https://github.com/kividbio/kividb/issues/62)), so
-  a HyperLogLog copied from Redis gives wrong counts or is refused. Rebuild
-  it with `PFADD` from the source data if you can, or leave those keys on
-  Redis for now.
+- **HyperLogLogs** load and count as they did on Redis. Set
+  `hll-write-format redis` on KiviDB before you switch over: by default it
+  writes new HyperLogLogs in its own format, and `PFMERGE` or a multi-key
+  `PFCOUNT` refuses to combine those with the ones copied from Redis
+  ([PERSISTENCE.md](PERSISTENCE.md)).
+- **Key names must be valid UTF-8**
+  ([#437](https://github.com/kividbio/kividb/issues/437)). Redis keys are
+  binary-safe; a snapshot with a non-UTF-8 key name loads, but clients can't
+  write that name again ([#446](https://github.com/kividbio/kividb/issues/446)).
+  List such keys on the source before you move.
 
 ## 5. Persistence and durability
 

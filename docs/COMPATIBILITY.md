@@ -17,7 +17,7 @@ other files:
 | Area | Status |
 |---|---|
 | Protocol | RESP2 and RESP3 (`HELLO`). Redis clients, `redis-cli` and cluster-aware clients work unchanged. |
-| Core data types | Strings, lists, sets, sorted sets, hashes (with per-field TTLs), streams and consumer groups, bitmaps, geo, Pub/Sub (including sharded). HyperLogLog works, but its encoding isn't Redis's yet: see *Differences*. |
+| Core data types | Strings, lists, sets, sorted sets, hashes (with per-field TTLs), streams and consumer groups, bitmaps, geo, Pub/Sub (including sharded). HyperLogLog, which reads Redis's encoding: see *Differences*. |
 | Redis 8 data types | JSON, search and query (`FT.*`, full-text, tag, numeric and vector), time series (`TS.*`), vector sets (`V*`). All built in, nothing to load. |
 | Transactions and scripts | `MULTI`/`EXEC`/`WATCH` and scripts run as one step, as in Redis ([EXEC_ATOMICITY.md](EXEC_ATOMICITY.md)). Lua (`EVAL`, `FUNCTION`, `FCALL`) needs the `lua` or `full` build. |
 | Security | `AUTH`, ACLs (users, key and channel patterns, ACL file), protected mode, TLS in the `tls` and `full` builds. |
@@ -128,10 +128,20 @@ other files:
   binary keys, such as Stalwart Mail Server, doesn't work yet
   ([#437](https://github.com/kividbio/kividb/issues/437)). Values and
   sorted-set members are binary-safe, as in Redis.
-- HyperLogLog registers aren't in Redis's layout
-  ([#62](https://github.com/kividbio/kividb/issues/62)). `PFADD`, `PFCOUNT`
-  and `PFMERGE` work within KiviDB, but an HLL moved between Redis and KiviDB
-  (`DUMP`/`RESTORE`, an RDB, replication) gives wrong counts or is refused.
+- A HyperLogLog copied from Redis (`DUMP`/`RESTORE`, an RDB, replication)
+  loads and counts as it did on Redis. By default KiviDB writes new
+  HyperLogLogs in its own format, which Redis refuses (`INVALIDOBJ`), and
+  `PFMERGE` or a multi-key `PFCOUNT` refuses to combine the two formats. After
+  moving from Redis, set `hll-write-format redis` so new and copied
+  HyperLogLogs mix and can move back ([PERSISTENCE.md](PERSISTENCE.md)).
+- Valkey 9's RDB format (version 80, a `VALKEY080` header) isn't read yet,
+  as a file, a full sync or a `DUMP` payload
+  ([#449](https://github.com/kividbio/kividb/issues/449)). `valkey-cli --rdb`
+  from a Valkey 9 server gives a Redis-format file that KiviDB loads, unless
+  a hash has field TTLs.
+- Redis and Valkey can't read KiviDB's `DUMP` payloads or replicate from
+  KiviDB ([#450](https://github.com/kividbio/kividb/issues/450)), so moving
+  data back off KiviDB means copying it key by key.
 - `DUMP`/`RESTORE` doesn't support time series and vector sets.
 - Search: no stemming or phonetic matching (`NOSTEM` and `PHONETIC` are
   accepted and change nothing). `GEO` and `GEOSHAPE` fields, `GEOFILTER` and
