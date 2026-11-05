@@ -630,13 +630,18 @@ impl ReplState {
     ///
     /// The switch happens with the write gate closed, so that no write is
     /// already on its way without a `SELECT` when the first one with a
-    /// different database is sent.
+    /// different database is sent. A client's `SELECT` is a write, and in
+    /// the gate when it runs, where a cut is none: it makes the switch
+    /// before it enters the gate (`handler::first_select_of_another_database`,
+    /// #423), and this, when it runs, finds it made.
     pub fn note_database_selected(&self, db: usize) {
         if db == 0 || self.several_databases.load(Ordering::Relaxed) {
             return;
         }
-        // `None` inside a script, which holds the gate itself; the flag is
-        // set all the same.
+        // `None` inside a transaction or a script that holds the command
+        // gate alone, so that no other command's write is in flight; the
+        // flag is set all the same. A script beside others may not make the
+        // switch (`handler::run_from_script`).
         let _cut = crate::write_gate::cut();
         self.several_databases.store(true, Ordering::Relaxed);
     }
@@ -662,6 +667,7 @@ impl ReplState {
         } else if self.repl_stream_last_db.load(Ordering::Relaxed) != db as u64 {
             vec![select(), command]
         } else {
+            test_delay_of_a_bare_write(parts);
             vec![command]
         }
     }
@@ -1735,6 +1741,28 @@ pub fn slave_command_allowed_during_loading(name: &str) -> bool {
             | "PSUBSCRIBE"
             | "PUNSUBSCRIBE"
     )
+}
+
+/// `KIVIDB_TEST_BARE_WRITE_DELAY_MS`, never set otherwise: the first write
+/// encoded with no `SELECT` of its own, to a key whose name begins with
+/// `delayed:`, waits this long, in the write gate, before it is queued. A
+/// test's window to send another command meanwhile (#423). Unset, a load
+/// and a branch, on a write that is propagated.
+fn test_delay_of_a_bare_write(parts: &[Vec<u8>]) {
+    static DELAY: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    static TAKEN: AtomicBool = AtomicBool::new(false);
+    let delay = DELAY.get_or_init(|| {
+        std::env::var("KIVIDB_TEST_BARE_WRITE_DELAY_MS")
+            .ok()
+            .and_then(|ms| ms.parse().ok())
+            .map(std::time::Duration::from_millis)
+    });
+    if let Some(delay) = *delay
+        && parts.get(1).is_some_and(|key| key.starts_with(b"delayed:"))
+        && !TAKEN.swap(true, Ordering::Relaxed)
+    {
+        crate::cluster::migration::off_the_runtime(|| std::thread::sleep(delay));
+    }
 }
 
 /// The refusal of a write for want of good replicas, as Redis words it.
@@ -3008,7 +3036,7 @@ pub fn replicate_one_write(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>
         }
         vec![crate::resp::write::encode_resp_command(parts)]
     } else {
-        ctx.repl_state.encode_for_stream(*ctx.selected_db, parts)
+        in_db_for_stream(ctx.repl_state, *ctx.selected_db, parts).0
     };
 
     // Two cases end at this node's own AOF and go no further:
@@ -3324,7 +3352,7 @@ pub fn replicate_expired(repl_state: &ReplState, hub_tx: &HubTx, db: usize, part
     // One AOF record: a `SELECT` and the `DEL` it qualifies must not be
     // separable by a crash.
     let mut record = Vec::new();
-    let (payloads, now_in) = expired_for_stream(repl_state, db, parts);
+    let (payloads, now_in) = in_db_for_stream(repl_state, db, parts);
     for payload in payloads {
         if tapped {
             repl_state.feed_taps(&payload);
@@ -3352,8 +3380,14 @@ pub fn replicate_expired(repl_state: &ReplState, hub_tx: &HubTx, db: usize, part
         .store(now_in as u64, Ordering::Relaxed);
 }
 
-/// `parts`, the deletion of a key expired in database `db`, encoded for the
-/// write stream; and the database the stream is in after it.
+/// `parts`, a write of database `db`, encoded for the write stream; and the
+/// database the stream is in after it.
+///
+/// Written for expiry first, and as true of a key evicted, or of the
+/// documents `FT.DROPINDEX ... DD` deletes, in another database: those are
+/// written in the key's database whichever one the client has selected
+/// (`eviction`, `vector::propagate_in_db`), and were sent as a `SELECT` and
+/// the command, with the stream then taken to be there (#423).
 ///
 /// While no client has left database 0, a client's write carries no
 /// `SELECT`: whether it needs one is read from `repl_stream_last_db` before
@@ -3367,11 +3401,7 @@ pub fn replicate_expired(repl_state: &ReplState, hub_tx: &HubTx, db: usize, part
 /// keys deleted on the master stayed on its replica in 8 s of six clients
 /// writing). So the deletion goes in one piece that goes back to 0, which
 /// leaves the stream where those writes take it to be.
-fn expired_for_stream(
-    repl_state: &ReplState,
-    db: usize,
-    parts: &[Vec<u8>],
-) -> (Vec<Vec<u8>>, usize) {
+fn in_db_for_stream(repl_state: &ReplState, db: usize, parts: &[Vec<u8>]) -> (Vec<Vec<u8>>, usize) {
     if db == 0 || repl_state.several_databases.load(Ordering::Relaxed) {
         return (repl_state.encode_for_stream(db, parts), db);
     }
@@ -3423,9 +3453,17 @@ fn advance_stream_db(ctx: &crate::commands::ctx::Ctx<'_>, cmd0: &[u8], parts: &[
                 .store(db, Ordering::Relaxed);
         }
     } else {
+        // Before any client has left database 0, a write of another went in
+        // one piece that goes back to 0 (`in_db_for_stream`).
+        let db =
+            if *ctx.selected_db != 0 && !ctx.repl_state.several_databases.load(Ordering::Relaxed) {
+                0
+            } else {
+                *ctx.selected_db
+            };
         ctx.repl_state
             .repl_stream_last_db
-            .store(*ctx.selected_db as u64, Ordering::Relaxed);
+            .store(db as u64, Ordering::Relaxed);
     }
 }
 

@@ -29,6 +29,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A write in database 0 could reach replicas and the AOF in another
+  database.** Until a client selects a database other than 0, writes go out
+  with no `SELECT` of their own. The first client to select another
+  database switches every write to carrying one, and was meant to wait out
+  the writes already on their way first. It did not: a database-0 write
+  running at that moment could be sent after that client's `SELECT`, and a
+  replica, or a replay of the AOF after a restart, then applied it in the
+  other database. The first `SELECT` of a database other than 0 now waits
+  for those writes; nothing changes after it, or on a server that only uses
+  database 0. The same could happen when a key in another database, put
+  there with `MOVE`, `COPY ... DB`, `SWAPDB` or a loaded dataset, was
+  evicted, or deleted by `FT.DROPINDEX ... DD`, before any client had left
+  database 0: that deletion now goes out with a `SELECT` back to 0, as the
+  deletion of an expired key does. A script running beside others
+  (`lua-parallel-scripts`) can't make that first switch, and its `SELECT`
+  of another database is refused until a client has selected one (#423).
+
 - **`SELECT` is no longer refused or held as a write.** Past `maxmemory`
   under `noeviction` it was refused with `OOM`, a master without enough
   good replicas (`min-replicas-to-write`) refused it with `NOREPLICAS`, and

@@ -529,7 +529,7 @@ mod propagation_tests {
 
     /// While no client has left database 0 its writes carry no `SELECT`:
     /// a deletion in another database goes back to 0 in the same piece,
-    /// and leaves the stream there (`replication::expired_for_stream`).
+    /// and leaves the stream there (`replication::in_db_for_stream`).
     /// Once one has, it goes with its `SELECT`, as every write then does.
     #[test]
     fn a_key_of_another_database_is_deleted_there_and_the_stream_goes_back() {

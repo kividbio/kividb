@@ -618,6 +618,24 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
         if let Some(outside) = outside {
             return resp_error(&outside);
         }
+        // Nor may it be the first to select a database other than 0. That
+        // switches every write to carrying its own `SELECT`, and has to wait
+        // out the writes on their way without one first: a cut, which a
+        // script cannot take beside others, in the write gate. Without it, a
+        // database-0 write could be sent after the script's `SELECT`, and be
+        // applied in that database by a replica and a replay of the AOF
+        // (#423). A client's `SELECT` makes the switch, once, before its gate.
+        if name2 == "SELECT"
+            && crate::tag_locks::beside_others()
+            && let Some(db) = makes_the_switch(ctx)
+        {
+            return resp_error(&format!(
+                "ERR Script attempted to SELECT {db}, the first database other than 0 \
+                 selected on this server, while running beside other scripts under the hash \
+                 tag '{}' of its KEYS (lua-parallel-scripts)",
+                crate::tag_locks::script_tag_for_message()
+            ));
+        }
     }
 
     if read_only_script && replication::inner_command_blocked_in_readonly_script(name2, &ctx.cmd) {
@@ -1193,6 +1211,18 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     let script = matches!(name, "EVAL" | "EVALSHA" | "FCALL");
     let gated = (writes_operation && name != "MIGRATE" && name != "FT.DROPINDEX") || script;
 
+    // The first `SELECT` of a database other than 0 switches every write to
+    // carrying a `SELECT` of its own, and has to wait out the writes on
+    // their way without one first (`ReplState::note_database_selected`). A
+    // cut cannot be taken from inside the write gate, which a `SELECT`
+    // enters as a write: there it was none, a database-0 write in flight
+    // reached the stream and the AOF behind the plain `SELECT N`, and was
+    // applied in N (#423). So it is taken here, before the gate. Once only:
+    // `several_databases` stays set.
+    if gated && name == "SELECT" {
+        first_select_of_another_database(ctx);
+    }
+
     // And a write is ordered against the other writes to the same keys: it
     // runs whole before or after each of them, and, while anything is
     // listening to the write stream, the stream carries them in the order the
@@ -1630,6 +1660,32 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
 pub(crate) fn apply_write_side_effects(ctx: &Ctx, name: &str, result: &[u8]) {
     let writes_operation = replication::command_mutates_for_replication(name, &ctx.cmd);
     write_side_effects(ctx, name, result, writes_operation);
+}
+
+/// The switch to writes that carry their own `SELECT`, for a `SELECT` of
+/// a database other than 0 on a server that has never left database 0,
+/// taken before the `SELECT` enters the write gate (#423). Nothing for any
+/// other: a `SELECT 0`, one that is going to be refused, or once the switch
+/// has been made.
+#[cold]
+#[inline(never)]
+fn first_select_of_another_database(ctx: &Ctx) {
+    if let Some(db) = makes_the_switch(ctx) {
+        ctx.repl_state.note_database_selected(db);
+    }
+}
+
+/// The database a `SELECT` (`ctx.cmd`) selects if it is the one that
+/// switches the server to writes that carry their own `SELECT`: a valid
+/// `SELECT` of a database other than 0, with that switch not made yet.
+fn makes_the_switch(ctx: &Ctx) -> Option<usize> {
+    if ctx.repl_state.several_databases.load(Ordering::Relaxed) || ctx.cmd.len() != 2 {
+        return None;
+    }
+    std::str::from_utf8(ctx.cmd[1])
+        .ok()
+        .and_then(|db| db.parse::<usize>().ok())
+        .filter(|db| *db != 0 && *db < ctx.config.databases)
 }
 
 /// Whether a write's reply says it changed nothing: `SET ... NX` on a key

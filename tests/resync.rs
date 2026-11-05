@@ -194,13 +194,18 @@ fn kividb_with(dir: &Path, port: u16, extra: &[String], env: &[(String, String)]
             &port.to_string(),
             "--bind",
             "127.0.0.1",
-            "--io-model",
-            "tokio",
             "--threads",
             "4",
             "--configfile",
             "kividb.conf",
         ])
+        // The tokio loop unless a test asks for another.
+        .args(
+            (!extra.iter().any(|arg| arg == "--io-model"))
+                .then_some(["--io-model", "tokio"])
+                .into_iter()
+                .flatten(),
+        )
         .args(extra)
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::null())
@@ -1824,4 +1829,194 @@ fn function_libraries_load_from_a_redis_dump_rdb() {
         "{}",
         preloaded.log()
     );
+}
+
+/// Send a command and do not wait for its reply.
+fn send_only(c: &mut Conn, args: &[&str]) {
+    let mut buf = format!("*{}\r\n", args.len()).into_bytes();
+    for a in args {
+        buf.extend_from_slice(format!("${}\r\n{a}\r\n", a.len()).as_bytes());
+    }
+    c.writer.write_all(&buf).unwrap();
+}
+
+/// The keys of database `db`, sorted.
+fn keys_of_db(c: &mut Conn, db: &str) -> Vec<String> {
+    assert!(c.cmd(&["SELECT", db]).ok());
+    let mut keys: Vec<String> = c
+        .cmd(&["KEYS", "*"])
+        .arr()
+        .iter()
+        .map(|key| key.s().to_string())
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// A database-0 write on its way when a client first selects another
+/// database reaches the replica, and the AOF, in database 0 (#423).
+///
+/// Until a client leaves database 0, a write goes out with no `SELECT` of
+/// its own. The first `SELECT 3` switches every write to carrying one, and
+/// has to wait out the writes on their way first. It did not: its cut was
+/// taken inside the write gate, where a cut is none, so its plain
+/// `SELECT 3` went out ahead of the write, and the replica and a replay of
+/// the AOF applied that write in database 3. The test hook holds the write
+/// between being encoded and being queued.
+fn a_write_on_its_way_at_the_first_select(extra: &[&str]) {
+    let args: Vec<&str> = ["--aof"].iter().chain(extra).copied().collect();
+    let mut master = Server::start_with_env(&args, &[("KIVIDB_TEST_BARE_WRITE_DELAY_MS", "1500")]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    let mut m = master.conn();
+    assert!(m.cmd(&["SET", "first", "0"]).ok());
+
+    let mut a = master.conn();
+    let mut b = master.conn();
+    let started = Instant::now();
+    send_only(&mut b, &["SET", "delayed:j", "0"]);
+    std::thread::sleep(Duration::from_millis(300));
+    send_only(&mut a, &["SELECT", "3"]);
+    assert!(b.read().ok());
+    // It was the write held: the window was there.
+    assert!(
+        started.elapsed() >= Duration::from_millis(1000),
+        "SET delayed:j was not held ({:?})",
+        started.elapsed()
+    );
+    assert!(a.read().ok());
+    assert!(a.cmd(&["SET", "k", "3"]).ok());
+    assert!(b.cmd(&["SET", "j2", "0"]).ok());
+
+    let offset: u64 = m.info("replication", "master_repl_offset").parse().unwrap();
+    wait_until("the replica to catch up", || {
+        r.info("replication", "slave_repl_offset")
+            .parse::<u64>()
+            .is_ok_and(|applied| applied >= offset)
+    });
+    let db0 = ["delayed:j", "first", "j2"].map(String::from).to_vec();
+    assert_eq!(keys_of_db(&mut r, "3"), ["k"], "{}", replica.log());
+    assert_eq!(keys_of_db(&mut r, "0"), db0);
+
+    // From the AOF alone: every write on disk, then no final save.
+    assert_eq!(b.cmd(&["WAITAOF", "1", "0", "5000"]).arr()[0].i(), 1);
+    drop((m, a, b));
+    master.kill();
+    // An io_uring listener can outlive its process a moment.
+    wait_until("the port to be let go", || port_is_free(master.port));
+    master.restart();
+    let mut m = master.conn();
+    assert_eq!(keys_of_db(&mut m, "3"), ["k"], "{}", master.log());
+    assert_eq!(keys_of_db(&mut m, "0"), db0);
+}
+
+#[test]
+fn a_write_on_its_way_when_a_client_first_selects_another_database_stays_in_db_0() {
+    a_write_on_its_way_at_the_first_select(&[]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_write_on_its_way_when_a_client_first_selects_another_database_stays_in_db_0_on_io_uring() {
+    a_write_on_its_way_at_the_first_select(&["--io-model", "uring"]);
+}
+
+/// A key of another database evicted before any client has left database
+/// 0 leaves the stream in database 0 (#423). Such a key is there by `MOVE`
+/// (or `COPY ... DB`, `SWAPDB`, a dataset loaded) with no `SELECT` from any
+/// client. Its `DEL` was sent as `SELECT 3` and `DEL`, with the stream then
+/// taken to be in 3, so a database-0 write on its way went after it and was
+/// applied in database 3. It goes in one piece that goes back to 0 now, as
+/// the `DEL` of an expired key does.
+#[test]
+fn an_eviction_in_another_database_leaves_the_stream_in_db_0() {
+    let mut master =
+        Server::start_with_env(&["--aof"], &[("KIVIDB_TEST_BARE_WRITE_DELAY_MS", "3000")]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    let mut m = master.conn();
+    // The only key that may be evicted, in database 3.
+    assert!(m.cmd(&["SET", "k3", "v", "EX", "100000"]).ok());
+    assert_eq!(m.cmd(&["MOVE", "k3", "3"]).i(), 1);
+    assert!(m.cmd(&["SET", "first", "0"]).ok());
+    assert!(
+        m.cmd(&["CONFIG", "SET", "maxmemory-policy", "volatile-random"])
+            .ok()
+    );
+
+    let mut b = master.conn();
+    let started = Instant::now();
+    send_only(&mut b, &["SET", "delayed:j", "0"]);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(m.cmd(&["CONFIG", "SET", "maxmemory", "1"]).ok());
+    // The memory in use is looked at once a second at most.
+    std::thread::sleep(Duration::from_millis(1100));
+    assert_eq!(m.cmd(&["EXISTS", "nosuch"]).i(), 0);
+    assert!(m.cmd(&["CONFIG", "SET", "maxmemory", "0"]).ok());
+    assert_eq!(m.stat("evicted_keys"), 1, "{}", master.log());
+    assert!(b.read().ok());
+    assert!(
+        started.elapsed() >= Duration::from_millis(2000),
+        "SET delayed:j was not held ({:?})",
+        started.elapsed()
+    );
+
+    let offset: u64 = m.info("replication", "master_repl_offset").parse().unwrap();
+    wait_until("the replica to catch up", || {
+        r.info("replication", "slave_repl_offset")
+            .parse::<u64>()
+            .is_ok_and(|applied| applied >= offset)
+    });
+    let db0 = ["delayed:j", "first"].map(String::from).to_vec();
+    assert_eq!(
+        keys_of_db(&mut r, "3"),
+        Vec::<String>::new(),
+        "{}",
+        replica.log()
+    );
+    assert_eq!(keys_of_db(&mut r, "0"), db0);
+
+    assert_eq!(b.cmd(&["WAITAOF", "1", "0", "5000"]).arr()[0].i(), 1);
+    drop((m, b));
+    master.kill();
+    master.restart();
+    let mut m = master.conn();
+    assert_eq!(
+        keys_of_db(&mut m, "3"),
+        Vec::<String>::new(),
+        "{}",
+        master.log()
+    );
+    assert_eq!(keys_of_db(&mut m, "0"), db0);
+}
+
+/// A script running beside others (`lua-parallel-scripts`) may not be the
+/// first to select a database other than 0 (#423): the switch to writes
+/// that carry their own `SELECT` needs a cut, which it cannot take there.
+/// Once a client has made the switch, it may.
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_beside_others_may_not_be_the_first_to_leave_db_0() {
+    let master = Server::start(&["--aof"]);
+    let mut m = master.conn();
+    let script = "if ARGV[1] == '1' then redis.call('SELECT', 3) end \
+                  redis.call('SET', KEYS[1], ARGV[1]) return 1";
+    // Seen to be quick, it runs beside other scripts from then on.
+    for _ in 0..3 {
+        assert_eq!(m.cmd(&["EVAL", script, "1", "{t}a", "0"]), V::Int(1));
+    }
+    let refused = m.cmd(&["EVAL", script, "1", "{t}a", "1"]);
+    assert!(
+        matches!(&refused, V::Err(e) if e.contains("lua-parallel-scripts")),
+        "{refused:?}"
+    );
+    assert!(m.cmd(&["SELECT", "3"]).ok());
+    assert!(m.cmd(&["SELECT", "0"]).ok());
+    assert_eq!(m.cmd(&["EVAL", script, "1", "{t}a", "1"]), V::Int(1));
+    assert!(m.cmd(&["SELECT", "3"]).ok());
+    assert_eq!(m.cmd(&["GET", "{t}a"]), V::Str("1".into()));
 }
