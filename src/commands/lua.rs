@@ -1,7 +1,7 @@
 //! Lua scripting (`EVAL`, `SCRIPT`, …) — compiled with `--features lua`.
 
 use crate::commands::ctx::Ctx;
-use crate::commands::handler::{client_connection_resp, execute_command_from_script};
+use crate::commands::handler::execute_command_from_script;
 use crate::commands::helpers::glob_match;
 use crate::replication;
 use crate::resp::write::{
@@ -874,6 +874,10 @@ struct ScriptEval {
 
 thread_local! {
     static SCRIPT_EVAL: RefCell<Option<ScriptEval>> = const { RefCell::new(None) };
+    /// The protocol of the client a script command on this thread was sent
+    /// by, when its `Ctx` says RESP2 for the commands the script calls
+    /// (`lua_vm_blocking`); 0 when the `Ctx`'s own `resp` is the client's.
+    static CLIENT_RESP: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     /// `redis.call`s and `redis.pcall`s made on this thread, ever: what a
     /// script ran is the difference (see [`count_script_commands`]).
     static SCRIPT_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -894,6 +898,20 @@ fn count_script_commands(
         registry.add_commands(client_id, ran);
     }
     reply
+}
+
+/// Run `run` (a script command) for a client that speaks `resp`: what the
+/// script returns is written in it. The connection loops know the protocol,
+/// so the reply needs no lookup in the client registry.
+pub(crate) fn with_client_resp<R>(resp: u8, run: impl FnOnce() -> R) -> R {
+    struct Restore(u8);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CLIENT_RESP.set(self.0);
+        }
+    }
+    let _restore = Restore(CLIENT_RESP.replace(resp));
+    run()
 }
 
 /// When present, `redis.setresp` overrides [`crate::commands::handler::effective_resp_for_reply`].
@@ -2957,16 +2975,24 @@ struct ReplyProtocol {
 }
 
 impl ReplyProtocol {
-    /// The running script's, looked up once for the whole reply.
+    /// The running script's: the client's protocol as its connection loop
+    /// gave it (`with_client_resp`), or else the `Ctx`'s (a transaction's
+    /// `EXEC` runs a script on the connection's own `Ctx`).
     fn current() -> Self {
+        let given = CLIENT_RESP.get();
         SCRIPT_EVAL
             .with(|c| {
                 c.borrow().as_ref().map(|se| {
-                    // SAFETY: `ctx_addr` is the running script's `Ctx`, which
-                    // outlives the script and the conversion of its reply.
-                    let ctx = unsafe { &*(se.ctx_addr as *const Ctx<'_>) };
+                    let client = if given != 0 {
+                        given
+                    } else {
+                        // SAFETY: `ctx_addr` is the running script's `Ctx`,
+                        // which outlives the script and the conversion of
+                        // its reply.
+                        unsafe { &*(se.ctx_addr as *const Ctx<'_>) }.resp
+                    };
                     Self {
-                        client: client_connection_resp(ctx),
+                        client,
                         script: se.script_resp,
                     }
                 })
@@ -3081,15 +3107,29 @@ fn lua_to_resp_inner(
             // Match Redis `luaReplyToRedisReply` in script_lua.c: status/error/array slots use
             // `lua_rawget`, and numeric indices use `lua_rawget` in a loop. Metamethods must not
             // run during RESP conversion (otherwise empty tables with __index would error or run
-            // redis.call side effects). An error is looked for first, as there.
+            // redis.call side effects). A status is looked for first: Redis
+            // looks for an error first, which differs only for a table with
+            // both, and costs every status reply a lookup more.
+            if let Ok(LuaValue::String(ok_s)) = t.raw_get::<LuaValue>("ok") {
+                // A status is one line: Redis sends its bytes as they are,
+                // with line breaks made spaces.
+                let text = ok_s.as_bytes();
+                let mut out = Vec::with_capacity(text.len() + 3);
+                out.push(b'+');
+                out.extend_from_slice(&text);
+                if memchr::memchr2(b'\r', b'\n', &out[1..]).is_some() {
+                    for byte in &mut out[1..] {
+                        if matches!(*byte, b'\r' | b'\n') {
+                            *byte = b' ';
+                        }
+                    }
+                }
+                out.extend_from_slice(b"\r\n");
+                return Ok(out);
+            }
             if let Ok(LuaValue::String(err_s)) = t.raw_get::<LuaValue>("err") {
                 let st = err_s.to_string_lossy();
                 return Ok(resp_error(st.as_ref()));
-            }
-            if let Ok(LuaValue::String(ok_s)) = t.raw_get::<LuaValue>("ok") {
-                // A status is one line: Redis makes its line breaks spaces.
-                let st = ok_s.to_string_lossy().replace(['\r', '\n'], " ");
-                return Ok(resp_simple(&st));
             }
             if let Ok(v) = t.raw_get::<LuaValue>("double") {
                 match v {

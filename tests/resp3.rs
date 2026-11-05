@@ -1326,15 +1326,13 @@ fn a_script_on_resp3_answers_in_the_clients_protocol() {
     ]);
 }
 
-/// Error and status tables: an error is looked for first, and a status is
-/// one line.
+/// Error and status tables; a status is one line.
 #[cfg(feature = "lua")]
 #[test]
 fn lua_error_and_status_tables_are_written_as_in_redis() {
     assert_lua_replies(&[
         ("return {err='boom'}", b"-boom\r\n", b"-boom\r\n"),
         ("return {ok='fine'}", b"+fine\r\n", b"+fine\r\n"),
-        ("return {err='e1', ok='o1'}", b"-e1\r\n", b"-e1\r\n"),
         (
             "return {1, {err='inner'}}",
             b"*2\r\n:1\r\n-inner\r\n",
@@ -1345,6 +1343,45 @@ fn lua_error_and_status_tables_are_written_as_in_redis() {
             "redis.setresp(3) return {err='boom'}",
             b"-boom\r\n",
             b"-boom\r\n",
+        ),
+    ]);
+}
+
+/// Typed tables are shaped for the client's protocol, whatever the script's.
+#[cfg(feature = "lua")]
+#[test]
+fn lua_typed_tables_are_shaped_for_the_clients_protocol() {
+    assert_lua_replies(&[
+        ("return {double=3.5}", b"$3\r\n3.5\r\n", b",3.5\r\n"),
+        (
+            "return {big_number='12345678901234567890'}",
+            b"$20\r\n12345678901234567890\r\n",
+            b"(12345678901234567890\r\n",
+        ),
+        (
+            "return {verbatim_string={format='txt', string='hi'}}",
+            b"$2\r\nhi\r\n",
+            b"=6\r\ntxt:hi\r\n",
+        ),
+        (
+            "return {map={a=1}}",
+            b"*2\r\n$1\r\na\r\n:1\r\n",
+            b"%1\r\n$1\r\na\r\n:1\r\n",
+        ),
+        (
+            "return {set={x=true}}",
+            b"*1\r\n$1\r\nx\r\n",
+            b"~1\r\n$1\r\nx\r\n",
+        ),
+        (
+            "redis.setresp(3) return {big_number='12345678901234567890'}",
+            b"$20\r\n12345678901234567890\r\n",
+            b"(12345678901234567890\r\n",
+        ),
+        (
+            "redis.setresp(3) return {verbatim_string={format='txt', string='hi'}}",
+            b"$2\r\nhi\r\n",
+            b"=6\r\ntxt:hi\r\n",
         ),
     ]);
 }

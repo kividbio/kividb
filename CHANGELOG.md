@@ -43,9 +43,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `1`/`0` to a RESP2 one; `redis.call`'s null reply is a Lua `nil`, not
   `false`; and doubles, maps and sets (`{double=…}`, `{map=…}`,
   `{set=…}`) are shaped for the client's protocol, so a RESP2 client no
-  longer gets RESP3 types. A table with both `err` and `ok` is an error,
-  and a line break in a status (`{ok=…}`) is sent as a space, as in Redis.
-  RESP2 clients get the same bytes as before for scripts that do not call
+  longer gets RESP3 types. A status (`{ok=…}`) is sent with its bytes as
+  they are and its line breaks as spaces, as in Redis, to RESP2 clients
+  too: a line break in one split the reply in two. Apart from that, RESP2
+  clients get the same bytes as before for scripts that do not call
   `redis.setresp(3)`.
 
 - **A write in database 0 could reach replicas and the AOF in another

@@ -36,7 +36,7 @@ mod lua;
 pub(crate) use lua::{
     cached_script_declares_no_writes, cached_script_declares_writes, function_declares_no_writes,
     library_snapshot, lua_command_runs_long_sync_vm, restore_library_snapshot,
-    script_declares_no_writes, script_declares_writes, take_last_vm_run_us,
+    script_declares_no_writes, script_declares_writes, take_last_vm_run_us, with_client_resp,
 };
 #[cfg(not(feature = "lua"))]
 mod lua {
