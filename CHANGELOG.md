@@ -292,6 +292,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   refused with `TRYAGAIN` if it may write, as the pause would have held
   it. One that only reads, or whose scripts are declared `no-writes`,
   runs (#339).
+- **A `GEORADIUS … STORE` in a transaction could lose its write during an
+  atomic slot migration's handoff.** The write pause and the handoff
+  judged a command by its name alone, and took `GEORADIUS` and
+  `GEORADIUSBYMEMBER` with `STORE` or `STOREDIST` for reads. In a
+  transaction that reached its gates during the handoff, such a command
+  ran: what it stored was acknowledged and then deleted with the slot.
+  `CLIENT PAUSE WRITE` did not hold it either, alone or in a transaction,
+  where Redis does. A command that writes only with some of its arguments
+  is now judged by them, as replication judges it: the transaction is
+  refused with `TRYAGAIN`, and the pause holds the command. The pause now
+  also holds `MIGRATE` and `FUNCTION LOAD`, `DELETE`, `FLUSH` and
+  `RESTORE`, as Redis does, and `SCRIPT LOAD` and `FLUSH`, which KiviDB
+  sends to replicas (#407).
 - **`MIGRATE` no longer answers `TRYAGAIN` for an unchanged hash whose field
   is about to expire (#332).** The check that a moved hash was not written
   meanwhile compared the server's fields by the monotonic clock and the

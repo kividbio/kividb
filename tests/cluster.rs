@@ -3555,6 +3555,38 @@ fn a_transaction_of_a_no_writes_script_during_a_slot_handoff_runs() {
     assert_eq!(reply.array()[0].text(), "5", "{reply:?}");
 }
 
+/// Nor does a `GEORADIUS … STORE` get through, though its name is a read's
+/// (#407). The transaction was taken for one that only reads, and ran: it
+/// stored its result after the handoff's cut, was answered, and the stored
+/// key was lost with the slot. The destination keeps what it had.
+#[test]
+fn a_transaction_of_a_georadius_store_during_a_slot_handoff_is_refused() {
+    let key = key_in(0..=1000, "handoff");
+    let places = format!("{{{key}}}:places");
+    let near = format!("{{{key}}}:near");
+    let (key, places, near) = (key.as_str(), places.as_str(), near.as_str());
+    let reply = exec_on_key_reaching_its_gates_during_a_slot_handoff(
+        key,
+        &[
+            vec!["GEOADD", places, "13.361389", "38.115556", "Palermo"],
+            vec!["SET", near, "before"],
+        ],
+        &[
+            // Names the key the test holds the transaction up for.
+            vec!["GET", key],
+            vec!["GEORADIUS", places, "15", "37", "200", "km", "STORE", near],
+        ],
+        |dst| {
+            assert_eq!(dst.conn().cmd(&["GET", near]).text(), "before");
+            assert_eq!(dst.conn().cmd(&["ZCARD", places]).int(), 1);
+        },
+    );
+    assert!(
+        reply.err().is_some_and(|e| e.starts_with("TRYAGAIN")),
+        "the transaction is refused: {reply:?}"
+    );
+}
+
 /// `MULTI`, the commands `queued` makes of a key holding "5", and `EXEC`,
 /// held up between its routing and its gates until an atomic slot
 /// migration's handoff holds writes: `EXEC`'s reply. The destination's
@@ -3565,6 +3597,20 @@ fn exec_reaching_its_gates_during_a_slot_handoff(
     queued: impl FnOnce(&str) -> Vec<Vec<&str>>,
 ) -> Resp {
     let key = key_in(0..=1000, "handoff");
+    exec_on_key_reaching_its_gates_during_a_slot_handoff(&key, &[], &queued(&key), |_| {})
+}
+
+/// [`exec_reaching_its_gates_during_a_slot_handoff`], for `key` (in slots
+/// 0 to 1000), with the `setup` commands run on the source once the key
+/// holds "5", and `afterwards` given the destination once it has the slots.
+/// Only a command that names `key` itself holds `EXEC` up.
+fn exec_on_key_reaching_its_gates_during_a_slot_handoff(
+    key: &str,
+    setup: &[Vec<&str>],
+    queued: &[Vec<&str>],
+    afterwards: impl FnOnce(&Node),
+) -> Resp {
+    let key = key.to_string();
     let env = [
         ("KIVIDB_TEST_FAILPOINTS", "routed"),
         ("KIVIDB_TEST_STALL_KEYS", key.as_str()),
@@ -3584,9 +3630,13 @@ fn exec_reaching_its_gates_during_a_slot_handoff(
     let set = commands_in_background(src.port, &[&["SET", &key, "5"]]);
     std::fs::remove_file(routed_and_held(src, 1)).unwrap();
     assert!(set.join().unwrap().is_ok());
+    for args in setup {
+        let r = src.conn().cmd(args);
+        assert!(r.err().is_none(), "{args:?}: {r:?}");
+    }
 
     let mut commands = vec![vec!["MULTI"]];
-    commands.extend(queued(&key));
+    commands.extend(queued.iter().cloned());
     commands.push(vec!["EXEC"]);
     let commands: Vec<&[&str]> = commands.iter().map(Vec::as_slice).collect();
     let exec = commands_in_background(src.port, &commands);
@@ -3604,6 +3654,7 @@ fn exec_reaching_its_gates_during_a_slot_handoff(
     let reply = exec.join().unwrap();
     wait_import_completed(dst, &task_id);
     assert_eq!(dst.conn().cmd(&["GET", &key]).text(), "5");
+    afterwards(dst);
     reply
 }
 
