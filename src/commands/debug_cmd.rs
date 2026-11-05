@@ -18,7 +18,7 @@ pub fn handle(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "ERR wrong number of arguments for 'debug' command",
         ));
     }
-    let sub = std::str::from_utf8(ctx.cmd[1]).ok()?.to_ascii_lowercase();
+    let sub = String::from_utf8_lossy(ctx.cmd[1]).to_ascii_lowercase();
     match sub.as_str() {
         "sleep" => {
             let Some(secs) = parse_sleep_seconds(ctx) else {
@@ -40,17 +40,106 @@ pub fn handle(ctx: &mut Ctx) -> Option<Vec<u8>> {
             let eff = effective_resp_for_reply(ctx);
             Some(debug_protocol_reply(conn_resp, eff, &kind))
         }
-        "object" => {
-            // Minimal stub — tests only require that the command succeeds.
-            Some(resp_bulk_str(
-                "Value at:0 refcount:1 encoding:raw serializedlength:1",
-            ))
-        }
+        "object" if ctx.cmd.len() == 3 => Some(object(ctx)),
         "populate" => Some(populate(ctx)),
         "digest-value" => Some(digest_value(ctx)),
-        "set-active-expire" | "set-disable-deny-scripts" => Some(resp_simple("OK")),
-        _ => Some(resp_simple("OK")),
+        "set-active-expire" if ctx.cmd.len() == 3 => {
+            crate::expiry::set_active(atoi(ctx.cmd[2]) != 0);
+            Some(resp_simple("OK"))
+        }
+        "pause-cron" if ctx.cmd.len() == 3 => {
+            crate::expiry::set_cron_paused(atoi(ctx.cmd[2]) != 0);
+            Some(resp_simple("OK"))
+        }
+        "log" if ctx.cmd.len() == 3 => {
+            crate::log_warn!("DEBUG LOG: {}", String::from_utf8_lossy(ctx.cmd[2]));
+            Some(resp_simple("OK"))
+        }
+        "set-disable-deny-scripts" => Some(resp_simple("OK")),
+        "help" => Some(help()),
+        _ => {
+            let name = &ctx.cmd[1][..ctx.cmd[1].len().min(128)];
+            Some(resp_error(&format!(
+                "ERR unknown subcommand or wrong number of arguments for '{}'. Try DEBUG HELP.",
+                String::from_utf8_lossy(name)
+            )))
+        }
     }
+}
+
+fn help() -> Vec<u8> {
+    resp_array(
+        [
+            "DEBUG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+            "DIGEST-VALUE <key> [<key> ...]",
+            "    A digest of each key's value, or 40 zeros for a key that is not there.",
+            "LOG <message>",
+            "    Write <message> to the server log.",
+            "OBJECT <key>",
+            "    What is known of the key's value: its encoding, length and last use.",
+            "PAUSE-CRON <0|1>",
+            "    Pause or resume the background expiry, keys and hash fields.",
+            "POPULATE <count> [<prefix>] [<size>]",
+            "    Make <count> string keys, <prefix>:0 onwards (key:0 without a prefix).",
+            "PROTOCOL <type>",
+            "    Reply with a value of the given RESP type.",
+            "SET-ACTIVE-EXPIRE <0|1>",
+            "    Turn the background expiry of keys off or on. Keys still expire when read.",
+            "SET-DISABLE-DENY-SCRIPTS <0|1>",
+            "    Accepted for the Redis test suite; changes nothing.",
+            "SLEEP <seconds>",
+            "    Block this connection's worker thread for <seconds>.",
+            "HELP",
+            "    Print this help.",
+        ]
+        .iter()
+        .map(|line| resp_simple(line))
+        .collect(),
+    )
+}
+
+/// The part of a `DUMP` payload around the value: its 1-byte type, and the
+/// 2-byte version and 8-byte CRC after it. Time series and vector sets are
+/// dumped as a one-entry KDB image instead, so for them `serializedlength`
+/// includes that image's header too.
+const DUMP_FRAME: usize = 1 + 2 + 8;
+
+/// C's `atoi`, as Redis reads these flags: leading spaces, an optional sign,
+/// then digits up to the first byte that isn't one; 0 if there are none.
+fn atoi(arg: &[u8]) -> i64 {
+    let text = String::from_utf8_lossy(arg);
+    let text = text.trim_start();
+    let digits = text
+        .char_indices()
+        .find(|&(i, c)| !(c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+'))))
+        .map_or(text.len(), |(i, _)| i);
+    text[..digits].parse().unwrap_or(0)
+}
+
+fn object(ctx: &mut Ctx) -> Vec<u8> {
+    let Ok(key) = std::str::from_utf8(ctx.cmd[2]) else {
+        return resp_error("ERR no such key");
+    };
+    let db = &ctx.store[*ctx.selected_db];
+    let map = crate::read_lock!(crate::store::get_shard(db, key));
+    let Some((value, _)) = map.peek_expiring(key) else {
+        return resp_error("ERR no such key");
+    };
+    let encoding = crate::commands::generics::encoding_of(value);
+    let word = map.access(key).unwrap_or(0);
+    let value = value.to_value();
+    drop(map);
+    let length = crate::snapshot::dump_payload(&value)
+        .map_or(0, |dump| dump.len().saturating_sub(DUMP_FRAME));
+    let idle = if crate::eviction::recording() && !crate::eviction::policy().is_lfu() {
+        crate::eviction::idle_seconds(word)
+    } else {
+        0
+    };
+    resp_bulk_str(&format!(
+        "Value at:0x0 refcount:1 encoding:{encoding} serializedlength:{length} lru:{} lru_seconds_idle:{idle}",
+        crate::eviction::lru_bits(word)
+    ))
 }
 
 /// `DEBUG DIGEST-VALUE key [key ...]`, as Redis: for each key, a digest of

@@ -395,6 +395,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   never swept on the replica, nor after a failover on the replica promoted.
   A write applied from the stream now takes the order of its keys, as a
   command does.
+- **`DEBUG` does what it says** (#236, by
+  [@saikishore222](https://github.com/saikishore222)). `DEBUG
+  SET-ACTIVE-EXPIRE 0` replied `OK` and the background expiry went on; it
+  now stops, for keys and hash fields alike, until `SET-ACTIVE-EXPIRE 1`,
+  and keys past their time still go when read. `DEBUG PAUSE-CRON 1` stops
+  it too, as in Redis, where the expiry runs inside the cron. A subcommand
+  KiviDB does not have (Redis's `RELOAD`, `LOADAOF`, `CHANGE-REPL-ID`,
+  `QUICKLIST-PACKED-THRESHOLD`, …) replied `OK`, and so did one with the
+  wrong number of arguments; both are now Redis's `ERR unknown subcommand
+  or wrong number of arguments`, and `DEBUG HELP` lists what is there.
+  `DEBUG OBJECT` gave the same line for every key, there or not; it now
+  gives the key's encoding, serialized length and last use in Redis's order
+  of fields, and `ERR no such key` for a key that is not there.
 - **On a replica, `FLUSHDB`, `FLUSHALL` and `SWAPDB` from the master take
   the command gate alone, as they do on a master (#378).** They took it
   shared, so a query on the replica could find a database half flushed, its

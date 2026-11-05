@@ -33,7 +33,7 @@ pub(crate) fn scans_whole(value: ValueRef<'_>) -> bool {
     matches!(encoding_of(value), "intset" | "listpack" | "listpackex")
 }
 
-fn encoding_of(value: ValueRef<'_>) -> &'static str {
+pub(crate) fn encoding_of(value: ValueRef<'_>) -> &'static str {
     // An entry of a compact structure is at most this long.
     const SMALL: usize = 64;
     match value {

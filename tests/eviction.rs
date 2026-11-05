@@ -1406,3 +1406,24 @@ fn writes_during_a_full_sync_evict_nothing_that_fits() {
     assert_eq!(r.cmd(&["DBSIZE"]).i(), SNAPSHOT_KEYS as i64);
     assert_eq!(r.cmd(&["GET", "s0"]).s(), big_value('b'));
 }
+
+#[test]
+fn debug_object_shows_the_idle_time_and_is_not_a_use() {
+    let server = Server::start(&["--maxmemory-policy", "allkeys-lru"]);
+    let mut c = server.conn();
+    assert!(c.cmd(&["SET", "foo", "bar"]).ok());
+    let payload = c.dump("foo");
+    assert!(
+        c.restore("foo", &payload, &["REPLACE", "IDLETIME", "1000"])
+            .ok()
+    );
+    let line = c.cmd(&["DEBUG", "OBJECT", "foo"]).s().to_string();
+    let idle: i64 = line
+        .split(' ')
+        .find_map(|part| part.strip_prefix("lru_seconds_idle:"))
+        .unwrap_or_else(|| panic!("no lru_seconds_idle in {line}"))
+        .parse()
+        .unwrap();
+    assert!((1000..=1010).contains(&idle), "{line}");
+    assert!(c.cmd(&["OBJECT", "IDLETIME", "foo"]).i() >= 1000);
+}

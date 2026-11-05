@@ -566,7 +566,6 @@ impl ShardMap {
 
     /// `key`'s value and when its time to live ends, past its time or not,
     /// its use not written: what a key past its time still holds.
-    #[cfg(test)]
     pub fn peek_expiring(&self, key: &str) -> Option<(ValueRef<'_>, Option<u64>)> {
         let key = key.as_bytes();
         self.find(self.hash_of(key), key)
