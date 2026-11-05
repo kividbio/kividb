@@ -167,7 +167,18 @@ static CHANGED: tokio::sync::Notify = tokio::sync::Notify::const_new();
 /// it runs: wait for the clients an ended pause held to go on (at most
 /// 100 ms: they are a step from it), then wait while `cmd` is held (see
 /// [`holds`]). What it returns is to be kept until the command has run.
-pub async fn gate<Q: AsRef<[u8]>>(cmd: &[&[u8]], queued: &[Vec<Q>], id: u64) -> Option<Ran> {
+///
+/// `None`: the client went while its command was held — `gone`, made only
+/// then, resolved — and the command is not to run, as in Redis, which goes on
+/// reading a client a pause holds and frees it (#384). Only while it is held:
+/// a command the pause does not hold runs, though its client has gone, as a
+/// fire-and-forget `LPUSH` sent just as a pause ends runs in Redis.
+pub async fn gate<Q: AsRef<[u8]>, G: std::future::Future<Output = ()>>(
+    cmd: &[&[u8]],
+    queued: &[Vec<Q>],
+    id: u64,
+    gone: impl FnOnce() -> G,
+) -> Option<Option<Ran>> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
     while PAUSE_UNTIL_MS.load(Ordering::SeqCst) == ENDING {
         if std::time::Instant::now() >= deadline {
@@ -179,14 +190,21 @@ pub async fn gate<Q: AsRef<[u8]>>(cmd: &[&[u8]], queued: &[Vec<Q>], id: u64) -> 
         wait_for_change(|| PAUSE_UNTIL_MS.load(Ordering::SeqCst) == ENDING).await;
     }
     if !holds(cmd, queued) {
-        return None;
+        return Some(None);
     }
     let held = Held::new();
     HELD.fetch_add(1, Ordering::SeqCst);
     // Counted off however the wait ends, the connection going with it.
     let counted = Counted;
+    let gone = gone();
+    let mut gone = std::pin::pin!(gone);
     while holds(cmd, queued) {
-        wait_for_change(|| holds(cmd, queued)).await;
+        tokio::select! {
+            biased;
+            () = wait_for_change(|| holds(cmd, queued)) => {}
+            // Let go with its client; `held` and `counted` go with it.
+            () = &mut gone => return None,
+        }
     }
     drop(held);
     if PAUSE_UNTIL_MS.load(Ordering::SeqCst) == ENDING {
@@ -194,9 +212,9 @@ pub async fn gate<Q: AsRef<[u8]>>(cmd: &[&[u8]], queued: &[Vec<Q>], id: u64) -> 
         std::mem::forget(counted);
         LETTING_GO.lock().push(id);
         LETTING_GO_LEN.fetch_add(1, Ordering::SeqCst);
-        return Some(Ran(id));
+        return Some(Some(Ran(id)));
     }
-    None
+    Some(None)
 }
 
 struct Counted;

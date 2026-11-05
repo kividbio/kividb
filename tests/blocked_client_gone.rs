@@ -711,3 +711,153 @@ fn inside_multi_and_scripts_blocking_commands_do_not_wait() {
         }
     }
 }
+
+/// A client woken for an element whose command is then refused before it
+/// looks at the key passes its turn to the client behind it. Here memory is
+/// over `maxmemory` when the first client is woken (by a `RENAME`, which is
+/// let through then), so its `BRPOPLPUSH`, which may add to memory, is
+/// refused with OOM, while the `BLPOP` behind it is not. Before, the first
+/// client's place was dropped without passing the turn on: the element sat
+/// in the list with a client blocked on it, until something else wrote the
+/// key. A pause that holds the resume of a client that then closes, or
+/// `READONLY` after a failover, drop the place the same way.
+#[test]
+fn a_woken_client_refused_before_it_looks_passes_its_turn_on() {
+    for &io in io_models() {
+        let server = Server::start(io);
+        let mut ctl = server.conn();
+        assert_eq!(ctl.cmd(&["RPUSH", "o:src", "job"]), V::Int(1), "{io}");
+        let mut first = blocked_client(
+            &server,
+            &mut ctl,
+            "first",
+            &["BRPOPLPUSH", "o:wait", "o:first", "0"],
+        );
+        let mut second = server.conn();
+        second.send(&["BLPOP", "o:wait", "0"]);
+        wait_blocked(&mut ctl, 2);
+
+        for (setting, value) in [("maxmemory-policy", "noeviction"), ("maxmemory", "1")] {
+            assert_eq!(ctl.cmd(&["CONFIG", "SET", setting, value]), s("OK"), "{io}");
+        }
+        assert_eq!(ctl.cmd(&["RENAME", "o:src", "o:wait"]), s("OK"), "{io}");
+        let refused = first.read();
+        assert!(
+            matches!(&refused, V::Err(e) if e.starts_with("OOM")),
+            "{io}: {refused:?}"
+        );
+        second
+            .reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut line = String::new();
+        let got = second.reader.read_line(&mut line);
+        assert_eq!(
+            ctl.cmd(&["CONFIG", "SET", "maxmemory", "0"]),
+            s("OK"),
+            "{io}"
+        );
+        assert!(
+            got.is_ok_and(|n| n > 0),
+            "{io}: the client behind was never woken; o:wait holds {:?}",
+            ctl.cmd(&["LRANGE", "o:wait", "0", "-1"])
+        );
+        assert_eq!(second.read(), s("o:wait"), "{io}");
+        assert_eq!(second.read(), s("job"), "{io}");
+    }
+}
+
+/// A write sent just as a pause ends, by a client that closes at once — a
+/// fire-and-forget `LPUSH` from a producer — runs, as in Redis: the pause no
+/// longer holds it. While the clients the pause held go on (here a script
+/// that runs for a while), the commands that come after wait a moment at
+/// the gate, and that wait used to give up on a client that had closed, and
+/// drop its command.
+#[cfg(feature = "lua")]
+#[test]
+fn a_write_sent_as_a_pause_ends_runs_though_its_client_closes() {
+    // Pure Lua, so its length does not depend on the clock a script reads.
+    let script = "local x = 0 for i = 1, 30000000 do x = x + i end return 1";
+    for &io in io_models() {
+        let server = Server::start(io);
+        let mut ctl = server.conn();
+        let mut held = server.conn();
+        let mut producer = server.conn();
+        assert_eq!(
+            ctl.cmd(&["CLIENT", "PAUSE", "30000", "WRITE"]),
+            s("OK"),
+            "{io}"
+        );
+        held.send(&["EVAL", script, "0"]);
+        wait_blocked(&mut ctl, 1);
+        assert_eq!(ctl.cmd(&["CLIENT", "UNPAUSE"]), s("OK"), "{io}");
+        producer.send(&["LPUSH", "e:q", "job"]);
+        producer.close();
+        assert_eq!(held.read(), V::Int(1), "{io}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ctl.cmd(&["LLEN", "e:q"]) != V::Int(1) {
+            assert!(
+                Instant::now() < deadline,
+                "{io}: the LPUSH of a client that closed was dropped"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// A client that keeps sending while a pause holds its command is read
+/// into memory on the tokio loop, to be run once the pause ends; past
+/// `client-query-buffer-limit` it is closed, as Redis closes a client whose
+/// query buffer reaches the limit, and its held command is not run. It used
+/// to be read without end. (The io_uring loop does not read a client that
+/// waits.)
+#[test]
+fn a_client_that_keeps_sending_while_held_is_closed_past_the_query_buffer_limit() {
+    let server = Server::start("tokio");
+    let mut ctl = server.conn();
+    assert_eq!(
+        ctl.cmd(&["CONFIG", "SET", "client-query-buffer-limit", "1mb"]),
+        s("OK")
+    );
+    assert_eq!(ctl.cmd(&["CLIENT", "PAUSE", "30000", "WRITE"]), s("OK"));
+    let mut c = server.conn();
+    c.send(&["SET", "q:k", "v"]);
+    wait_blocked(&mut ctl, 1);
+
+    let mut writer = c.writer.try_clone().unwrap();
+    let flood = thread::spawn(move || {
+        let ping = request(&["PING"]);
+        let chunk: Vec<u8> = ping.iter().copied().cycle().take(64 * 1024).collect();
+        for _ in 0..64 {
+            if writer.write_all(&chunk).is_err() {
+                return;
+            }
+        }
+    });
+    let stream = c.reader.get_mut();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut sink = [0u8; 4096];
+    let closed = loop {
+        match stream.read(&mut sink) {
+            Ok(0) => break true,
+            Ok(_) => continue,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break false;
+            }
+            Err(_) => break true,
+        }
+    };
+    assert_eq!(ctl.cmd(&["CLIENT", "UNPAUSE"]), s("OK"));
+    drop(c);
+    let _ = flood.join();
+    assert!(closed, "a client sending 4 MB past a 1 MB limit was kept");
+    assert_eq!(ctl.cmd(&["EXISTS", "q:k"]), V::Int(0));
+}

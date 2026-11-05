@@ -48,7 +48,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `CLIENT PAUSE` holds its command, or while it waits in `WAIT` or
   `WAITAOF`, is let go too, and the held command is not run after the
   pause: a blocking pop held by a pause used to run when it ended, and
-  take an element for nobody.
+  take an element for nobody. A command the pause does not hold still
+  runs, as a fire-and-forget `LPUSH` sent as a pause ends does in Redis.
+  A client woken for an element whose command is refused before it looks
+  at the key (`OOM`, `READONLY` after a failover, a pause it then closes
+  in) now passes its turn to the client behind it; it used to keep the
+  turn, and the element waited in the list, with clients blocked on it,
+  for the next write. On the tokio I/O model, a client that keeps sending
+  while it waits is closed once what it sent passes
+  `client-query-buffer-limit`, as Redis closes one; it used to be read
+  into memory without end.
 - **A replica could stop for good while it saved (#373).** The replica
   entered the command gate while holding its own apply lock, which `SAVE`
   (and a promotion, `REPLICAOF NO ONE`) waits for while holding the gate.

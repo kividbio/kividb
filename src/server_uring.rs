@@ -291,6 +291,7 @@ async fn park_blocking_uring(
     subscriptions: Option<&crate::pubsub::Subscriptions>,
     client: (&crate::client_registry::ClientRegistry, u64),
     interrupted: &mut crate::commands::blocking::Interrupted,
+    watch: &PeerWatch,
 ) -> Result<(), Vec<u8>> {
     if slot.in_resume() && !wait.may_repark() {
         // A resumed handler parked again — it forgot its resume check. Reply as
@@ -326,7 +327,7 @@ async fn park_blocking_uring(
     let (client_registry, client_id) = client;
     let (unblock_tx, mut unblock_rx) = tokio::sync::oneshot::channel();
     client_registry.set_blocked(client_id, Some(unblock_tx), wait.has_timeout());
-    let fd = std::os::fd::AsRawFd::as_raw_fd(&**stream);
+    let fd = watch.fd;
     let delivery = {
         let waiting = wait.wait();
         tokio::pin!(waiting);
@@ -334,10 +335,8 @@ async fn park_blocking_uring(
         // the wait on this loop — a submitted read cannot be taken back — so
         // the socket is watched instead: a client that has gone (or been
         // killed, which shuts the socket down) must not be left in line for
-        // an element nobody will receive. See `peer_gone`. Boxed, as the
-        // waits of `unless_gone` are, and for the same reason.
-        let mut gone: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> =
-            Box::pin(peer_gone(fd));
+        // an element nobody will receive. See `PeerWatch`.
+        let mut gone = watch.gone();
         let mut unblockable = true;
         loop {
             tokio::select! {
@@ -403,76 +402,98 @@ fn peer_has_gone(fd: std::os::fd::RawFd) -> bool {
         && look.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
 }
 
-/// Resolves once the client at the other end of `fd` has gone (see
-/// [`peer_has_gone`]), and never while it is there, whatever it sends.
+/// A connection's watch on its client's end of the socket, for when the
+/// connection waits on something — a blocking command, `WAIT`, a pause —
+/// and does not read: see [`PeerWatch::gone`].
 ///
-/// For as long as this is awaited the socket is watched by the runtime's
-/// reactor, so its end is seen when it arrives, as Redis sees it by going on
-/// reading a blocked client; and it is looked at ten times a second as
-/// well, should the reactor not take it. Only a connection that is waiting
-/// for something does this — a blocking command, `WAIT`, a pause — so it
-/// costs nothing on the way of an ordinary command.
-async fn peer_gone(fd: std::os::fd::RawFd) {
-    struct Watched(std::os::fd::RawFd);
-    impl std::os::fd::AsRawFd for Watched {
-        fn as_raw_fd(&self) -> std::os::fd::RawFd {
-            self.0
-        }
-    }
-    // Registered for reading, which on Linux includes the peer's end of the
-    // stream (`EPOLLRDHUP`), and taken out again when this ends. Dropping it
-    // does not close the descriptor: that is the connection's.
-    let mut watched =
-        tokio::io::unix::AsyncFd::with_interest(Watched(fd), tokio::io::Interest::READABLE).ok();
-    let mut look = tokio::time::interval(std::time::Duration::from_millis(100));
-    look.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        if peer_has_gone(fd) {
-            return;
-        }
-        // Until something happens on the socket — more from the client, or
-        // its end — or the next look.
-        let still_watched = match &watched {
-            Some(socket) => tokio::select! {
-                ready = socket.readable() => match ready {
-                    Ok(mut ready) => {
-                        ready.clear_ready();
-                        true
-                    }
-                    Err(_) => false,
-                },
-                _ = look.tick() => true,
-            },
-            None => {
-                look.tick().await;
-                true
-            }
-        };
-        if !still_watched {
-            watched = None;
-        }
+/// The socket is registered with the runtime's reactor the first time the
+/// connection waits, and stays registered until the connection ends, so a
+/// wait costs no `epoll_ctl` of its own: registering and taking it out
+/// again around every wait cost a BRPOPLPUSH/LPUSH job about 7% more server
+/// CPU than doing it once. A connection that never waits is never
+/// registered. One that has waited is told of what arrives on it from then
+/// on, which the reactor takes in with the completions it is woken for.
+struct PeerWatch {
+    fd: std::os::fd::RawFd,
+    registered: std::cell::OnceCell<Option<tokio::io::unix::AsyncFd<Watched>>>,
+}
+
+/// The descriptor as `AsyncFd` holds it. Dropping it does not close it: it
+/// is the connection's.
+struct Watched(std::os::fd::RawFd);
+
+impl std::os::fd::AsRawFd for Watched {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.0
     }
 }
 
-/// `wait`, unless the client at the other end of `fd` goes first: `None`
-/// then. For what a connection waits on that is not a blocking command —
-/// `WAIT`, `WAITAOF`, a pause — which a client that has gone must not be
-/// left in, nor have its command run after it.
-///
-/// Boxed, so that it is polled out of line: the connection's own future,
-/// which every command goes through, is compiled as it was without it. Kept
-/// in it, it cost a pipelined SET about half a percent more instructions
-/// with fat LTO, in code that command never runs. The allocation is made
-/// only while a pause is on, or for `WAIT`/`WAITAOF`.
+impl PeerWatch {
+    fn new(fd: std::os::fd::RawFd) -> Self {
+        Self {
+            fd,
+            registered: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Resolves once the client has gone (see [`peer_has_gone`]), and never
+    /// while it is there, whatever it sends. Its end is seen when it
+    /// arrives, as Redis sees it by going on reading a blocked client.
+    ///
+    /// Boxed, so that it is polled out of line: the connection's own future,
+    /// which every command goes through, is compiled as it was without it.
+    /// Kept in it, these waits cost a pipelined SET about half a percent
+    /// more instructions with fat LTO, in code that command never runs.
+    fn gone(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>> {
+        Box::pin(async move {
+            // Registered for reading, which on Linux includes the peer's end
+            // of the stream (`EPOLLRDHUP`). What is already there — the end
+            // included — is reported at once, and so is anything that has
+            // arrived since an earlier wait: the socket is asked then.
+            let registered = self.registered.get_or_init(|| {
+                tokio::io::unix::AsyncFd::with_interest(
+                    Watched(self.fd),
+                    tokio::io::Interest::READABLE,
+                )
+                .ok()
+            });
+            if let Some(socket) = registered {
+                loop {
+                    let Ok(mut ready) = socket.readable().await else {
+                        break;
+                    };
+                    if peer_has_gone(self.fd) {
+                        return;
+                    }
+                    ready.clear_ready();
+                }
+            }
+            // No reactor to ask: looked at ten times a second.
+            let mut look = tokio::time::interval(std::time::Duration::from_millis(100));
+            look.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                look.tick().await;
+                if peer_has_gone(self.fd) {
+                    return;
+                }
+            }
+        })
+    }
+}
+
+/// `wait`, unless the client goes first: `None` then. For `WAIT` and
+/// `WAITAOF`, which a client that has gone must not be left in. Boxed, for
+/// the reason given at [`PeerWatch::gone`]; the allocation is made only for
+/// them.
 fn unless_gone<'a, T: 'a>(
     wait: impl std::future::Future<Output = T> + 'a,
-    fd: std::os::fd::RawFd,
+    watch: &'a PeerWatch,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<T>> + 'a>> {
     Box::pin(async move {
         tokio::select! {
             biased;
             done = wait => Some(done),
-            () = peer_gone(fd) => None,
+            () = watch.gone() => None,
         }
     })
 }
@@ -706,8 +727,10 @@ pub async fn handle_client(
     let stream = Rc::new(stream);
     let write_guard: Rc<tokio::sync::Mutex<()>> = Rc::new(tokio::sync::Mutex::new(()));
     // For seeing that the client has gone while the connection waits on
-    // something: see `peer_gone`.
-    let client_fd = std::os::fd::AsRawFd::as_raw_fd(&*stream);
+    // something. Declared after `stream`, so that it is dropped first, and
+    // the descriptor it watches is still open when it is taken out of the
+    // reactor.
+    let peer_watch = PeerWatch::new(std::os::fd::AsRawFd::as_raw_fd(&*stream));
     let push_task = {
         let stream = Rc::clone(&stream);
         let write_guard = Rc::clone(&write_guard);
@@ -1031,12 +1054,29 @@ pub async fn handle_client(
             // A client that goes while its command is held is let go, and the
             // command is not run: as in Redis, which goes on reading a client
             // a pause holds. A blocking pop run for it once the pause ended
-            // would take an element for nobody (#384).
+            // would take an element for nobody (#384). Except the dispatch
+            // that resumes a command that waited: that one runs, only to
+            // leave the line it stood in and pass the turn on, and one whose
+            // client has already gone is not held at all — it writes nothing.
+            //
+            // Boxed, and so polled out of line, for the reason given at
+            // `PeerWatch::gone`.
             let _ran = if crate::pause::PAUSE_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed)
                 != 0
+                && !(blocking_slot.resuming() && interrupted.gone)
             {
-                match unless_gone(crate::pause::gate(&cmd, &tx.queue, client_id), client_fd).await {
+                let gated: std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Option<Option<crate::pause::Ran>>> + '_>,
+                > = Box::pin(crate::pause::gate(&cmd, &tx.queue, client_id, || {
+                    peer_watch.gone()
+                }));
+                match gated.await {
                     Some(ran) => ran,
+                    None if blocking_slot.resuming() => {
+                        blocking_slot.make_gone();
+                        interrupted.gone = true;
+                        None
+                    }
                     None => {
                         quit_requested = true;
                         break;
@@ -1174,6 +1214,7 @@ pub async fn handle_client(
                             subscriptions.as_ref(),
                             (&client_registry, client_id),
                             &mut interrupted,
+                            &peer_watch,
                         )
                         .await
                         {
@@ -1247,6 +1288,7 @@ pub async fn handle_client(
                         subscriptions.as_ref(),
                         (&client_registry, client_id),
                         &mut interrupted,
+                        &peer_watch,
                     )
                     .await
                     {
@@ -2271,7 +2313,7 @@ pub async fn handle_client(
                                     tokio::task::yield_now().await;
                                 }
                             },
-                            client_fd,
+                            &peer_watch,
                         )
                         .await;
                         match waited {
@@ -2339,7 +2381,7 @@ pub async fn handle_client(
                                         tokio::task::yield_now().await; // not tokio::time::sleep
                                     }
                                 },
-                                client_fd,
+                                &peer_watch,
                             )
                             .await;
                             match waited {
@@ -2669,6 +2711,8 @@ pub async fn handle_client(
                     .get(client_id)
                     .map(|info| info.replica_listening_port)
                     .filter(|p| *p != 0);
+                // Out of the reactor while the descriptor is surely open.
+                drop(peer_watch);
                 handle_replica_connection_uring(
                     stream,
                     Arc::clone(&store),

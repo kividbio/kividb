@@ -275,6 +275,16 @@ impl BlockingSlot {
     pub fn set_gone(&mut self, state: Option<BlockState>) {
         self.pending = Some((None, state, true));
     }
+
+    /// The client went before the dispatch that resumes its command, which a
+    /// pause held: that dispatch is now only to leave the line (see
+    /// [`set_gone`](Self::set_gone)).
+    pub fn make_gone(&mut self) {
+        if let Some((delivery, _, gone)) = self.pending.as_mut() {
+            *delivery = None;
+            *gone = true;
+        }
+    }
 }
 
 /// Outcome of asking to park.
@@ -750,5 +760,189 @@ mod tests {
         drop(tx);
         let got = wait_on(vec![("k".to_string(), rx)], None);
         assert!(got.is_none());
+    }
+}
+
+/// A command resumed for a client that went while it waited, with what it
+/// was woken for there (#384): it takes nothing — the element stays, nothing
+/// is delivered to the consumer — and it passes its turn to the client
+/// behind it. Run through `execute_command`, as the connection loops run it.
+#[cfg(test)]
+mod gone_resume_tests {
+    use super::*;
+    use crate::commands::ctx::{Ctx, NoopAofSender};
+    use std::sync::Arc;
+
+    type Run<'r> = &'r dyn Fn(&[&str], Option<&mut BlockingCtl>) -> Vec<u8>;
+    /// What gives the key an element, the command, what reads the key, and
+    /// what it must read.
+    type Case<'c> = (&'c [&'c str], &'c [&'c str], &'c [&'c str], &'c [u8]);
+
+    /// A server's shared state, and `run`, which dispatches one command on it.
+    fn with_server(test: impl FnOnce(Run<'_>, &Arc<crate::wait_table::WaitTable>)) {
+        let store = crate::store::new_store(1);
+        let lastsave = Arc::new(parking_lot::RwLock::new(0i64));
+        let (hub_tx, _hub_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = Arc::new(crate::config::Config::default());
+        let started_at = Instant::now();
+        let index_store = crate::vector::new_index_store();
+        let dict_store = crate::vector::new_dict_store();
+        let wait_table = Arc::new(crate::wait_table::WaitTable::new());
+        let ts_index = crate::store::new_ts_index();
+        let pubsub = crate::pubsub::PubSubHub::new();
+        let repl_state = Arc::new(crate::replication::ReplState::new_master());
+        let acl_store = crate::acl::new_acl_store("");
+        let acl_log = crate::acl::new_acl_log();
+        let slowlog = crate::slowlog::new_slowlog(u64::MAX, 0);
+        let latency = crate::latency::new_latency_tracker();
+        let (compaction_tx, _compaction_rx) = crate::vector::new_compaction_channel();
+        let cluster = Arc::new(crate::cluster::ClusterState::new_disabled());
+        let client_registry = crate::client_registry::new_client_registry();
+        let monitor_registry = crate::monitor::new_monitor_registry();
+        let tracking_table = crate::tracking::new_tracking_table();
+        let run = |args: &[&str], blocking: Option<&mut BlockingCtl>| -> Vec<u8> {
+            let mut selected_db = 0usize;
+            crate::commands::execute_command(Ctx {
+                cmd: args.iter().map(|a| a.as_bytes()).collect(),
+                store: &store,
+                lastsave: &lastsave,
+                selected_db: &mut selected_db,
+                aof_tx: &NoopAofSender,
+                aof_enabled: false,
+                config: &config,
+                started_at: &started_at,
+                index_store: &index_store,
+                dict_store: &dict_store,
+                wait_table: &wait_table,
+                ts_index: &ts_index,
+                pubsub: &pubsub,
+                hub_tx: &hub_tx,
+                repl_state: &repl_state,
+                watch_registry: &crate::watch::NoopWatchRegistry,
+                client_id: 0,
+                client_registry: &client_registry,
+                resp: 2,
+                acl_store: &acl_store,
+                acl_log: &acl_log,
+                slowlog: &slowlog,
+                latency: &latency,
+                compaction_tx: &compaction_tx,
+                cluster: &cluster,
+                bypass_cluster_check: false,
+                apply_replication: false,
+                skip_write_side_effects: false,
+                peer_addr: "127.0.0.1:1",
+                monitor_registry: &monitor_registry,
+                authenticated_user: "default",
+                tracking_table: &tracking_table,
+                blocking,
+            })
+        };
+        test(&run, &wait_table);
+    }
+
+    #[tokio::test]
+    async fn a_list_or_zset_command_whose_client_went_takes_nothing_and_passes_the_turn() {
+        with_server(|run, wait_table| {
+            let cases: [Case<'_>; 4] = [
+                (
+                    &["RPUSH", "l1", "e"],
+                    &["BRPOPLPUSH", "l1", "d1", "0"],
+                    &["LRANGE", "l1", "0", "-1"],
+                    b"*1\r\n$1\r\ne\r\n",
+                ),
+                (
+                    &["RPUSH", "l2", "e"],
+                    &["BLMOVE", "l2", "d2", "LEFT", "RIGHT", "0"],
+                    &["LRANGE", "l2", "0", "-1"],
+                    b"*1\r\n$1\r\ne\r\n",
+                ),
+                (
+                    &["RPUSH", "l3", "e"],
+                    &["BLPOP", "l3", "0"],
+                    &["LRANGE", "l3", "0", "-1"],
+                    b"*1\r\n$1\r\ne\r\n",
+                ),
+                (
+                    &["ZADD", "z", "1", "e"],
+                    &["BZPOPMIN", "z", "0"],
+                    &["ZRANGE", "z", "0", "-1"],
+                    b"*1\r\n$1\r\ne\r\n",
+                ),
+            ];
+            for (push, block, left, want) in cases {
+                let key = block[1];
+                run(push, None);
+                // Two clients in line; the first is woken for the element,
+                // and has gone.
+                let gone = wait_table.new_ticket();
+                let behind = wait_table.new_ticket();
+                let _gone_rx = wait_table.enqueue(key, &gone);
+                let mut behind_rx = wait_table.enqueue(key, &behind);
+                wait_table.notify_signal(key);
+                assert!(behind_rx.try_recv().is_err());
+
+                let mut slot = BlockingSlot::default();
+                slot.set_gone(Some(BlockState::Queued {
+                    deadline: None,
+                    ticket: gone,
+                }));
+                run(block, Some(slot.prime()));
+                assert!(slot.take_parked().is_none(), "{block:?} waited again");
+                assert_eq!(
+                    String::from_utf8_lossy(&run(left, None)),
+                    String::from_utf8_lossy(want),
+                    "{block:?} took the element for a client that had gone"
+                );
+                assert!(
+                    behind_rx.try_recv().is_ok(),
+                    "{block:?} did not pass the turn on"
+                );
+            }
+            assert_eq!(run(&["EXISTS", "d1", "d2"], None), b":0\r\n");
+        });
+    }
+
+    #[tokio::test]
+    async fn an_xreadgroup_whose_client_went_delivers_nothing_and_passes_the_turn() {
+        with_server(|run, wait_table| {
+            run(&["XGROUP", "CREATE", "s", "g", "$", "MKSTREAM"], None);
+            run(&["XADD", "s", "*", "f", "v"], None);
+            let gone = wait_table.new_ticket();
+            let behind = wait_table.new_ticket();
+            let _gone_rx = wait_table.enqueue_reader("s", &gone);
+            let mut behind_rx = wait_table.enqueue_reader("s", &behind);
+            wait_table.notify_signal("s");
+            assert!(behind_rx.try_recv().is_err());
+
+            let mut slot = BlockingSlot::default();
+            slot.set_gone(Some(BlockState::GroupRead {
+                deadline: None,
+                ticket: gone,
+            }));
+            let reply = run(
+                &[
+                    "XREADGROUP",
+                    "GROUP",
+                    "g",
+                    "c",
+                    "BLOCK",
+                    "0",
+                    "STREAMS",
+                    "s",
+                    ">",
+                ],
+                Some(slot.prime()),
+            );
+            assert_eq!(reply, b"*-1\r\n");
+            assert!(slot.take_parked().is_none());
+            let pending = run(&["XPENDING", "s", "g"], None);
+            assert!(
+                pending.starts_with(b"*4\r\n:0\r\n"),
+                "delivered to a consumer that had gone: {}",
+                String::from_utf8_lossy(&pending)
+            );
+            assert!(behind_rx.try_recv().is_ok(), "the turn was not passed on");
+        });
     }
 }
