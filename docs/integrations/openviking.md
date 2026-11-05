@@ -22,7 +22,7 @@ The RAGFS failure is the same test on both servers, and it fails without any Red
 (`core::mountable::tests::shutdown_reaches_cache_queuefs_through_stats_wrapper`), so it says nothing about a
 server.
 
-## Known gap: `COMMAND` and `@connection` (#392)
+## `COMMAND` and `@connection` (#392), fixed in 1.2.1
 
 The gateway's CI gives its Redis user `+@connection` and no `+command`. On Redis 8 that category includes
 `COMMAND`, which redis-py's cluster client runs when it connects. KiviDB 1.2.0 leaves `COMMAND` out of
@@ -30,7 +30,11 @@ The gateway's CI gives its Redis user `+@connection` and no `+command`. On Redis
 connection fails with `NoPermissionError: User gateway has no permissions to run the 'command' command`.
 That is all 34 gateway failures. Standalone connections are not affected.
 
-**Workaround:** add `+command` to the user's ACL rules:
+KiviDB 1.2.1 fixes this: `@connection` holds what it holds in Redis (`COMMAND` and its subcommands,
+`SELECT`, `READONLY`, `READWRITE`, `ASKING`, `WAIT` and `WAITAOF` as well), and the gateway's user works
+as its CI creates it.
+
+**Workaround on 1.2.0:** add `+command` to the user's ACL rules:
 
 ```
 ACL SETUSER gateway +command

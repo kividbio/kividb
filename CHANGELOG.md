@@ -29,6 +29,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`@connection` holds what it holds in Redis (#392).** It had only
+  `AUTH`, `CLIENT`, `ECHO`, `HELLO`, `PING`, `QUIT` and `RESET`. It now
+  also has `COMMAND` and all its subcommands, `SELECT`, `READONLY`,
+  `READWRITE`, `ASKING`, `WAIT` and `WAITAOF`, as in Redis 7.0 and later
+  and Valkey. redis-py's cluster client runs `COMMAND` when it connects, so a
+  user given `+@connection` and not `+command` (as OpenViking's gateway
+  CI sets one up) could not open a cluster connection: `NoPermissionError:
+  User ... has no permissions to run the 'command' command`. `WAIT` and
+  `WAITAOF` are no longer in `@keyspace`, `@generic` and `@read`, nor
+  `SELECT` in `@write`, where Redis does not have them (a user of
+  `+@all -@write` may now `SELECT`, as in Redis). `COMMAND INFO` now
+  reports only categories Redis has: `COMMAND` is `@slow @connection`,
+  as in Redis, not `@server @slow`. KiviDB's own `@cluster` and `@server`
+  keep the commands they had, for `ACL SETUSER` and `ACL CAT`.
+
+  **Upgrade note:** ACL rules are checked when a command runs, so these
+  changes apply to existing users as soon as the server is upgraded.
+  - A user with `+@write` but not `+@connection` (or `+@all`) can no
+    longer `SELECT`. Add `+select`.
+  - A user with `+@read`, `+@keyspace` or `+@generic` but not
+    `+@connection` can no longer run `WAIT` or `WAITAOF`. Add
+    `+wait +waitaof`.
+  - A user of `+@all -@write`, or of the `readonly` shorthand, may now
+    `SELECT`, as in Redis.
+
 - **`ZREM` no longer scans the whole sorted set for each member it removes.**
   Removing a member is now O(log N) instead of O(N)
   ([#386](https://github.com/kividbio/kividb/issues/386),
