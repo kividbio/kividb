@@ -1,0 +1,5 @@
+# The reference run: RAGFlow's own `redis` service, with its command, data volume and health
+# check unchanged, on the redis:8 image instead of valkey/valkey:8.
+services:
+  redis:
+    image: ${REDIS_IMAGE:-redis:8}

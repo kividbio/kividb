@@ -1,0 +1,12 @@
+{
+  "name": "mem0-ts-kividb-compat",
+  "private": true,
+  "type": "module",
+  "description": "Runs the Mem0 TypeScript SDK's Redis and Valkey vector stores against KiviDB and Redis 8",
+  "dependencies": {
+    "better-sqlite3": "^12.6.2",
+    "iovalkey": "^0.3.3",
+    "mem0ai": "3.3.1",
+    "redis": "^4.6.13"
+  }
+}

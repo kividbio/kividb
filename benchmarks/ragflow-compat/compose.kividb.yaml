@@ -1,0 +1,28 @@
+# Replaces RAGFlow's `redis` service (Valkey 8 by default) with KiviDB. Use it on top of
+# RAGFlow's own compose file:
+#
+#   cd ragflow/docker
+#   docker compose -f docker-compose.yml -f /path/to/compose.kividb.yaml up -d
+#
+# The service keeps the name `redis` and the port 6379, so nothing else in RAGFlow's
+# configuration changes: REDIS_HOST, REDIS_PORT and REDIS_PASSWORD stay as docker/.env sets them.
+#
+# Use the `-lua` variant (see REPORT.md): RAGFlow releases its locks and rate-limits agent calls
+# with Lua scripts.
+services:
+  redis:
+    image: ${KIVIDB_IMAGE:-kividb/kividb:v1.2.0-lua}
+    # The same settings RAGFlow gives Valkey, as KiviDB flags. --requirepass also turns off
+    # protected mode, which the image's default command would otherwise do.
+    command: ["--port", "6379", "--requirepass", "${REDIS_PASSWORD}", "--maxmemory", "1gb",
+              "--maxmemory-policy", "volatile-lru", "--dir", "/home/kividb"]
+    # KiviDB runs as uid 1000; a named volume on its home directory is created writable for it.
+    volumes: !override
+      - kividb_data:/home/kividb
+    # RAGFlow's health check calls redis-cli inside the container, and KiviDB's image has no
+    # redis-cli. No RAGFlow service waits for redis to be healthy, so the check can go.
+    healthcheck:
+      disable: true
+
+volumes:
+  kividb_data:

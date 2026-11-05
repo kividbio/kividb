@@ -1,0 +1,5 @@
+# The versions the results in this folder were produced with: cognee 1.6.6 installed from its git
+# tag with its own uv.lock (uv sync --frozen with the extras its CI uses: api docs evals ollama dev
+# neo4j redis tracing postgres), which resolves to these for what the harness uses.
+cognee[redis]==1.6.6
+redis==5.3.1

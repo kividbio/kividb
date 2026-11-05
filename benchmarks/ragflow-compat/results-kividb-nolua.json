@@ -1,0 +1,314 @@
+{
+  "label": "kividb-nolua",
+  "image": "kividb/kividb:v1.2.0",
+  "redis_version": "8.10.0",
+  "ragflow": "v0.27.3",
+  "counts": {
+    "PASS": 19,
+    "FAIL": 1,
+    "WARN": 0,
+    "SKIP": 0
+  },
+  "checks": [
+    {
+      "check": "connection: PING through RAGFlow's password",
+      "status": "PASS",
+      "detail": "redis_version 8.10.0",
+      "ms": 138
+    },
+    {
+      "check": "start-up: every RAGFlow service is running",
+      "status": "PASS",
+      "detail": "5 containers",
+      "ms": 128
+    },
+    {
+      "check": "start-up: the task executors register in the server (TASKEXE)",
+      "status": "PASS",
+      "detail": "1 task executor(s) in TASKEXE",
+      "ms": 12681
+    },
+    {
+      "check": "start-up: CLIENT / INFO / CONFIG / HELLO / SELECT / AUTH sent at connect are all accepted",
+      "status": "PASS",
+      "detail": "client|setinfo x40, info x1, select x20",
+      "ms": 123
+    },
+    {
+      "check": "account: register",
+      "status": "PASS",
+      "detail": "",
+      "ms": 164
+    },
+    {
+      "check": "account: login",
+      "status": "PASS",
+      "detail": "",
+      "ms": 119
+    },
+    {
+      "check": "account: create an API token",
+      "status": "PASS",
+      "detail": "",
+      "ms": 14
+    },
+    {
+      "check": "models: add the OpenAI-API-compatible provider pointing at the stub",
+      "status": "PASS",
+      "detail": "",
+      "ms": 515
+    },
+    {
+      "check": "models: make the stub's chat and embedding models the defaults",
+      "status": "PASS",
+      "detail": "",
+      "ms": 34
+    },
+    {
+      "check": "dataset: two uploaded documents are parsed by the task executors (Redis stream)",
+      "status": "PASS",
+      "detail": "2 documents DONE",
+      "ms": 33282
+    },
+    {
+      "check": "dataset: the documents have chunks",
+      "status": "PASS",
+      "detail": "2 chunks",
+      "ms": 79
+    },
+    {
+      "check": "dataset: retrieval finds the right chunk",
+      "status": "PASS",
+      "detail": "",
+      "ms": 206
+    },
+    {
+      "check": "dataset: the task stream has its consumer group and every task is acknowledged",
+      "status": "PASS",
+      "detail": "streams {'te.1.common': ['rag_flow_svr_task_broker'], 'te.0.common': ['rag_flow_svr_task_broker']}, pending 0",
+      "ms": 623
+    },
+    {
+      "check": "chat: a completion in a session answers from the stub model",
+      "status": "PASS",
+      "detail": "",
+      "ms": 127
+    },
+    {
+      "check": "chat: a streamed completion",
+      "status": "PASS",
+      "detail": "3 events",
+      "ms": 156
+    },
+    {
+      "check": "restart: with the executors paused, 3 parse tasks wait in the stream",
+      "status": "PASS",
+      "detail": "3 tasks waiting in the stream",
+      "ms": 91039
+    },
+    {
+      "check": "restart: the server restarts and the waiting tasks are still in the stream",
+      "status": "PASS",
+      "detail": "3 still waiting",
+      "ms": 850
+    },
+    {
+      "check": "restart: the executors resume and parse every queued document",
+      "status": "PASS",
+      "detail": "3 documents DONE",
+      "ms": 2315
+    },
+    {
+      "check": "restart: retrieval finds a document parsed after the restarts",
+      "status": "PASS",
+      "detail": "",
+      "ms": 63
+    },
+    {
+      "check": "server: no command RAGFlow sent was refused (INFO commandstats)",
+      "status": "FAIL",
+      "detail": "AssertionError: cmdstat_evalsha: failed 3, rejected 0",
+      "ms": 260
+    }
+  ],
+  "commands_at_startup": {
+    "cmdstat_client|setinfo": {
+      "calls": 40,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_evalsha": {
+      "calls": 6,
+      "failed": 6,
+      "rejected": 0
+    },
+    "cmdstat_exists": {
+      "calls": 1,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_get": {
+      "calls": 11,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_info": {
+      "calls": 1,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_ping": {
+      "calls": 1,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_sadd": {
+      "calls": 1,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_select": {
+      "calls": 20,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_set": {
+      "calls": 23,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_setnx": {
+      "calls": 1,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_smembers": {
+      "calls": 6,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_xgroup|create": {
+      "calls": 2,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_xinfo|groups": {
+      "calls": 15,
+      "failed": 7,
+      "rejected": 0
+    },
+    "cmdstat_xreadgroup": {
+      "calls": 10,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_zadd": {
+      "calls": 1,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_zremrangebyscore": {
+      "calls": 1,
+      "failed": 0,
+      "rejected": 0
+    }
+  },
+  "commands_after_run": {
+    "cmdstat_client|setinfo": {
+      "calls": 28,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_decrby": {
+      "calls": 3,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_del": {
+      "calls": 3,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_evalsha": {
+      "calls": 3,
+      "failed": 3,
+      "rejected": 0
+    },
+    "cmdstat_get": {
+      "calls": 54,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_info": {
+      "calls": 2,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_ping": {
+      "calls": 1,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_scan": {
+      "calls": 2,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_select": {
+      "calls": 14,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_set": {
+      "calls": 14,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_smembers": {
+      "calls": 1,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_type": {
+      "calls": 27,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_xack": {
+      "calls": 3,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_xinfo|groups": {
+      "calls": 21,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_xrange": {
+      "calls": 2,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_xreadgroup": {
+      "calls": 16,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_zadd": {
+      "calls": 1,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_zremrangebyscore": {
+      "calls": 1,
+      "failed": 0,
+      "rejected": 0
+    }
+  },
+  "errorstats": {
+    "errorstat_ERR": {
+      "count": 3
+    }
+  },
+  "when": "2026-11-04T20:21:17+00:00"
+}

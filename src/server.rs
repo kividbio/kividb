@@ -17,11 +17,22 @@ use tokio::sync::mpsc;
 /// Hooks shared by plain TCP and TLS streams before `split`.
 pub trait PrepareIoStream {
     fn prepare_io(&mut self) -> std::io::Result<()>;
+
+    /// The socket underneath, where whether the client has gone can be asked
+    /// of the kernel (see `socket_says_gone`). Linux only; `None` elsewhere.
+    fn socket_fd(&self) -> Option<i32> {
+        None
+    }
 }
 
 impl PrepareIoStream for TcpStream {
     fn prepare_io(&mut self) -> std::io::Result<()> {
         self.set_nodelay(true)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn socket_fd(&self) -> Option<i32> {
+        Some(std::os::fd::AsRawFd::as_raw_fd(self))
     }
 }
 
@@ -30,6 +41,62 @@ impl PrepareIoStream for tokio_rustls::server::TlsStream<TcpStream> {
     fn prepare_io(&mut self) -> std::io::Result<()> {
         self.get_mut().0.set_nodelay(true)
     }
+
+    #[cfg(target_os = "linux")]
+    fn socket_fd(&self) -> Option<i32> {
+        Some(std::os::fd::AsRawFd::as_raw_fd(self.get_ref().0))
+    }
+}
+
+/// Whether the kernel says the client at the other end of `fd` has gone:
+/// closed its connection or its sending side, or reset it. Asked of `poll`,
+/// for `POLLRDHUP`, which reports the end whatever is unread before it, and
+/// which does not wait for the runtime's reactor to have taken the event in
+/// (see `server_uring::peer_has_gone`).
+#[cfg(target_os = "linux")]
+fn socket_says_gone(fd: Option<i32>) -> bool {
+    let Some(fd) = fd else {
+        return false;
+    };
+    let mut look = libc::pollfd {
+        fd,
+        events: libc::POLLRDHUP,
+        revents: 0,
+    };
+    // SAFETY: one `pollfd` that outlives the call, on a descriptor the
+    // connection holds open; a timeout of 0 returns at once.
+    let ready = unsafe { libc::poll(&mut look, 1, 0) };
+    ready > 0
+        && look.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+}
+
+#[cfg(not(target_os = "linux"))]
+fn socket_says_gone(_fd: Option<i32>) -> bool {
+    false
+}
+
+/// Whether what a waiting connection has read and not yet run has grown
+/// past `client-query-buffer-limit` (1 GB unless set): the client is then
+/// closed, as Redis closes one whose query buffer reaches the limit.
+/// Otherwise a client that kept sending while it waited — in a blocking
+/// command, a pause, `WAIT` — would be read into memory without end.
+fn carried_too_much(carried: &[u8]) -> bool {
+    // Only past a megabyte, the least the limit can be set to, is the
+    // setting looked up.
+    if carried.len() <= 1 << 20 {
+        return false;
+    }
+    let limit = crate::commands::server::remembered_config("client-query-buffer-limit")
+        .and_then(|limit| limit.parse::<usize>().ok())
+        .unwrap_or(1 << 30);
+    if carried.len() <= limit {
+        return false;
+    }
+    log_warn!(
+        "Closing a client that sent {} bytes while it waited, past client-query-buffer-limit ({limit})",
+        carried.len()
+    );
+    true
 }
 
 #[inline(always)]
@@ -128,7 +195,23 @@ where
         let mut unblockable = true;
         loop {
             tokio::select! {
-                delivery = &mut waiting => break delivery,
+                delivery = &mut waiting => {
+                    // Woken: what it waited for may be there, for it to take
+                    // on the dispatch that resumes it. A client that has
+                    // gone in the meantime must not take it — and its end,
+                    // ready at the same moment, may not have been the arm
+                    // picked — so the socket is looked at now.
+                    if gone_by_now(
+                        waiter.reader,
+                        waiter.carried,
+                        waiter.activity,
+                        waiter.socket_fd,
+                    ) {
+                        waiter.interrupted.gone = true;
+                        break None;
+                    }
+                    break delivery;
+                }
                 // The client's side of the connection, while it waits: more
                 // commands, which wait their turn — or the end of it. A
                 // client that has gone must not be left in line for an
@@ -141,6 +224,10 @@ where
                         // The client sent something while it was parked, so it
                         // is not idle: restart its idle clock.
                         waiter.activity.touch();
+                        if carried_too_much(waiter.carried) {
+                            waiter.interrupted.gone = true;
+                            break None;
+                        }
                     }
                     _ => {
                         waiter.interrupted.gone = true;
@@ -167,9 +254,89 @@ where
         .set_blocked(waiter.client_id, None, false);
     // However it ended, the command is dispatched again: with what it was
     // waiting for, or as if its time had run out — which is also how it
-    // leaves the line it was standing in.
-    slot.set_pending(delivery, block_state);
+    // leaves the line it was standing in — or, its client gone, only to
+    // leave that line, taking nothing.
+    if waiter.interrupted.gone {
+        slot.set_gone(block_state);
+    } else {
+        slot.set_pending(delivery, block_state);
+    }
     Ok(())
+}
+
+/// Whether the client has gone, as far as its socket says now, without
+/// waiting for anything: asked of the kernel where there is a socket to ask
+/// (`socket_fd`), which knows before the runtime's reactor has taken the
+/// event in; otherwise of the stream, by reading what the client has sent
+/// into `carried`, as the wait reads it, up to its end if that has arrived.
+fn gone_by_now<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    carried: &mut Vec<u8>,
+    activity: &crate::client_registry::Activity,
+    socket_fd: Option<i32>,
+) -> bool {
+    // The kernel's word, where it can be had, is enough: what the client has
+    // sent stays for the connection to read.
+    if socket_fd.is_some() {
+        return socket_says_gone(socket_fd);
+    }
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let mut temp = [0u8; 4096];
+    loop {
+        let mut read = tokio::io::ReadBuf::new(&mut temp);
+        match std::pin::Pin::new(&mut *reader).poll_read(&mut cx, &mut read) {
+            std::task::Poll::Pending => return false,
+            std::task::Poll::Ready(Ok(())) if !read.filled().is_empty() => {
+                let n = read.filled().len();
+                crate::stats::TOTAL_NET_INPUT_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+                crate::stats::record_read();
+                carried.extend_from_slice(read.filled());
+                activity.touch();
+                if carried_too_much(carried) {
+                    return true;
+                }
+            }
+            std::task::Poll::Ready(_) => return true,
+        }
+    }
+}
+
+/// Resolves once the client has gone — closed its connection, or been
+/// killed — and never while it is there. What it sends meanwhile is kept in
+/// `carried`, to be run after what the connection is waiting on. For the
+/// waits that are not a blocking command's (which watches the same way, in
+/// `park_blocking`): `WAIT`, `WAITAOF`, a pause, which a client that has
+/// gone must not be left in, nor have its command run after it.
+///
+/// Boxed, so that it is polled out of line, as `server_uring::unless_gone`
+/// is: the connection's own future, which every command goes through, is
+/// compiled as it was without it.
+fn until_gone<'a, R: tokio::io::AsyncRead + Unpin + Send>(
+    reader: &'a mut R,
+    carried: &'a mut Vec<u8>,
+    kill_rx: &'a mut crate::client_registry::KillRx,
+    activity: &'a crate::client_registry::Activity,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        let mut temp = [0u8; 4096];
+        loop {
+            tokio::select! {
+                read = reader.read(&mut temp) => match read {
+                    Ok(n) if n > 0 => {
+                        crate::stats::TOTAL_NET_INPUT_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+                        crate::stats::record_read();
+                        carried.extend_from_slice(&temp[..n]);
+                        activity.touch();
+                        if carried_too_much(carried) {
+                            return;
+                        }
+                    }
+                    _ => return,
+                },
+                _ = &mut *kill_rx => return,
+            }
+        }
+    })
 }
 
 /// What a connection lends its parked command: the means of noticing that
@@ -185,6 +352,8 @@ struct Waiter<'a, R> {
     /// The waiting connection's activity, so bytes that arrive while it waits
     /// restart its idle clock just as the main loop's reads do.
     activity: &'a crate::client_registry::Activity,
+    /// The socket underneath, if there is one to ask (see `socket_says_gone`).
+    socket_fd: Option<i32>,
 }
 
 /// A connection's buffer that has grown past this is given back once it is
@@ -435,6 +604,7 @@ where
         tracking: Arc::clone(&tracking_table),
     };
 
+    let socket_fd = stream.socket_fd();
     let (mut reader, writer) = split(stream);
     let writer = Arc::new(Mutex::new(writer));
 
@@ -741,12 +911,54 @@ where
             // Must be done here, not in execute_command, because std::thread::sleep
             // inside a tokio task blocks the worker thread and prevents UNPAUSE
             // from being processed on another connection.
-            let _ran =
-                if crate::pause::PAUSE_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed) != 0 {
-                    crate::pause::gate(&cmd, &tx.queue, client_id).await
-                } else {
-                    None
-                };
+            //
+            // A client that goes while its command is held is let go, and the
+            // command is not run: as in Redis, which goes on reading a client
+            // a pause holds. A blocking pop run for it once the pause ended
+            // would take an element for nobody (#384). Except the dispatch
+            // that resumes a command that waited: that one runs, only to
+            // leave the line it stood in and pass the turn on, and one whose
+            // client has already gone is not held at all — it writes nothing.
+            //
+            // Boxed, and so polled out of line, as `until_gone` is.
+            let _ran = if crate::pause::PAUSE_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed)
+                != 0
+                && !(blocking_slot.resuming() && interrupted.gone)
+            {
+                let gated: std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<Output = Option<Option<crate::pause::Ran>>>
+                            + Send
+                            + '_,
+                    >,
+                > = Box::pin(crate::pause::gate(&cmd, &tx.queue, client_id, || {
+                    until_gone(&mut reader, &mut carried, &mut kill_rx, &activity)
+                }));
+                match gated.await {
+                    // See the matching arm in `server_uring`: the gate may
+                    // have kept a woken resume waiting, and its client gone.
+                    Some(ran)
+                        if blocking_slot.resuming()
+                            && gone_by_now(&mut reader, &mut carried, &activity, socket_fd) =>
+                    {
+                        blocking_slot.make_gone();
+                        interrupted.gone = true;
+                        ran
+                    }
+                    Some(ran) => ran,
+                    None if blocking_slot.resuming() => {
+                        blocking_slot.make_gone();
+                        interrupted.gone = true;
+                        None
+                    }
+                    None => {
+                        quit_requested = true;
+                        break;
+                    }
+                }
+            } else {
+                None
+            };
             // ══════════════════════════════════════════════════════════════
             // FAST PATH — identical to v0.1.10: parse → execute → append.
             // Zero heap allocations for command name, zero string compares.
@@ -879,6 +1091,7 @@ where
                                 client_id,
                                 interrupted: &mut interrupted,
                                 activity: &activity,
+                                socket_fd,
                             },
                         )
                         .await
@@ -958,6 +1171,7 @@ where
                             client_id,
                             interrupted: &mut interrupted,
                             activity: &activity,
+                            socket_fd,
                         },
                     )
                     .await
@@ -1429,11 +1643,11 @@ where
                                 .map(|&i| (shard_ptrs[i], shards[i].write()))
                                 .collect();
 
-                            // During a handoff (`pause::HANDOFF`) this transaction
-                            // got past the pause before it was set: it is given up, as
-                            // if a watched key had changed, and the client's retry is
-                            // answered by whoever owns the keys then.
-                            if dirty_flag.load(Ordering::Acquire) || crate::pause::handoff() {
+                            // A handoff that set its pause before the gates were
+                            // taken has refused this transaction already
+                            // (`routing::exec_refusal_in_gate`); one set since waits
+                            // for the write gate before it takes its cut.
+                            if dirty_flag.load(Ordering::Acquire) {
                                 drop(guards);
                                 watch_registry.as_ref().unwatch_all(
                                     &tx.watched_keys
@@ -1971,19 +2185,33 @@ where
                                 timeout_ms
                             });
 
-                        loop {
-                            let fsynced =
-                                crate::aof::AOF_FSYNCED.load(std::sync::atomic::Ordering::Relaxed);
-                            // As Redis: 1 once the write is on disk here,
-                            // whatever `numlocal` asked for.
-                            if fsynced >= target {
-                                break b"*2\r\n:1\r\n:0\r\n".to_vec();
+                        let waited = tokio::select! {
+                            biased;
+                            reply = async {
+                                loop {
+                                    let fsynced = crate::aof::AOF_FSYNCED
+                                        .load(std::sync::atomic::Ordering::Relaxed);
+                                    // As Redis: 1 once the write is on disk here,
+                                    // whatever `numlocal` asked for.
+                                    if fsynced >= target {
+                                        break b"*2\r\n:1\r\n:0\r\n".to_vec();
+                                    }
+                                    if tokio::time::Instant::now() >= deadline {
+                                        break b"*2\r\n:0\r\n:0\r\n".to_vec();
+                                    }
+                                    // Async sleep — yields to tokio scheduler, lets AOF writer task run
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                                }
+                            } => Some(reply),
+                            () = until_gone(&mut reader, &mut carried, &mut kill_rx, &activity) => None,
+                        };
+                        match waited {
+                            Some(reply) => reply,
+                            // The client has gone: there is nobody to answer.
+                            None => {
+                                quit_requested = true;
+                                break;
                             }
-                            if tokio::time::Instant::now() >= deadline {
-                                break b"*2\r\n:0\r\n:0\r\n".to_vec();
-                            }
-                            // Async sleep — yields to tokio scheduler, lets AOF writer task run
-                            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                         }
                     }
                 }
@@ -2032,15 +2260,31 @@ where
                                     timeout_ms
                                 });
 
-                            loop {
-                                let acked = crate::replication::ReplState::count_reached(&targets);
-                                if acked >= num_replicas {
-                                    break crate::resp::write::resp_integer(acked).to_vec();
+                            let waited = tokio::select! {
+                                biased;
+                                reply = async {
+                                    loop {
+                                        let acked =
+                                            crate::replication::ReplState::count_reached(&targets);
+                                        if acked >= num_replicas {
+                                            break crate::resp::write::resp_integer(acked).to_vec();
+                                        }
+                                        if tokio::time::Instant::now() >= deadline {
+                                            break crate::resp::write::resp_integer(acked).to_vec();
+                                        }
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(1))
+                                            .await;
+                                    }
+                                } => Some(reply),
+                                () = until_gone(&mut reader, &mut carried, &mut kill_rx, &activity) => None,
+                            };
+                            match waited {
+                                Some(reply) => reply,
+                                // The client has gone: there is nobody to answer.
+                                None => {
+                                    quit_requested = true;
+                                    break;
                                 }
-                                if tokio::time::Instant::now() >= deadline {
-                                    break crate::resp::write::resp_integer(acked).to_vec();
-                                }
-                                tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                             }
                         }
                     }

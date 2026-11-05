@@ -422,34 +422,151 @@ fn script_key_refusal(ctx: &Ctx, name: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// Whether `ctx.cmd` is a write naming keys of more than one shard, which
-/// would be seen half done by another client without the gate alone: a
-/// `DEL` of several keys, `RENAME`, `SUNIONSTORE` and the other `*STORE`
+/// Whether `cmd` is a write naming keys of more than one shard of `db`,
+/// which would be seen half done by another client without the gate alone:
+/// a `DEL` of several keys, `RENAME`, `SUNIONSTORE` and the other `*STORE`
 /// commands, `SORT ... STORE`, `LMOVE`. In Redis every command is one step;
 /// here the shards are worked on at once (#159). `MSET` and `MSETNX` lock
 /// all their shards together, and need no more.
-fn writes_keys_of_several_shards(ctx: &Ctx, name: &str, cmd0: &[u8]) -> bool {
-    // One argument is at most one key (`DEL k`, `INCR k`): asked first, as
-    // `key_positions` is a long match on the name, and every write comes
-    // through here.
-    if ctx.cmd.len() < 3
+#[inline(never)]
+fn keys_of_several_shards(
+    store: &crate::store::Store,
+    db: usize,
+    name: &str,
+    cmd: &[&[u8]],
+    cmd0: &[u8],
+) -> bool {
+    // `key_positions` is a long match on the name: the writes that name one
+    // key are told apart first.
+    if cmd.len() < 3
         || matches!(name, "MSET" | "MSETNX")
+        || one_key_write(name)
         || !replication::is_write_command_bytes(cmd0)
     {
         return false;
     }
-    let keys = crate::keyspec::key_positions(name, &ctx.cmd);
+    let keys = crate::keyspec::key_positions(name, cmd);
     if keys.iter().nth(1).is_none() {
         return false;
     }
-    let db = &ctx.store[*ctx.selected_db];
+    let Some(db) = store.get(db) else {
+        return false;
+    };
     let mut shards = keys.iter().map(|pos| {
-        std::str::from_utf8(ctx.cmd[pos])
+        std::str::from_utf8(cmd[pos])
             .map(|key| crate::store::shard_index(db.len(), key))
             .ok()
     });
     let first = shards.next().flatten();
     first.is_none() || shards.any(|shard| shard != first)
+}
+
+/// Whether a command takes the command gate alone: the one rule, asked by
+/// [`run_command`] for a command from a client and by the replica's applier
+/// for one from the master's stream (see [`applied_takes_the_gate_alone`]).
+/// `script_alone`: a script that is not let run beside others by its tag.
+/// `gated`: a write, or a script. A flush and `SWAPDB` are not taken alone
+/// while the AOF is replayed, where nothing else runs.
+#[inline(always)]
+fn takes_the_gate_alone(
+    store: &crate::store::Store,
+    db: usize,
+    name: &str,
+    cmd: &[&[u8]],
+    script_alone: bool,
+    gated: bool,
+) -> bool {
+    script_alone
+        || (gated
+            && matches!(name, "FLUSHALL" | "FLUSHDB" | "SWAPDB")
+            && !crate::expiry::replaying())
+        || (crate::tag_locks::enabled() && crate::tag_locks::sees_the_whole_keyspace(name))
+        || crate::tag_locks::is_switch(name, cmd)
+        // One argument is at most one key (`DEL k`, `INCR k`): asked here,
+        // and the rest out of line, so that what every command runs through
+        // stays small.
+        || (cmd.len() >= 3 && keys_of_several_shards(store, db, name, cmd, cmd[0]))
+}
+
+/// The writes of one key, and so of one shard, made most: told apart by
+/// name before `key_positions`, a long match, is asked for their keys.
+#[inline]
+fn one_key_write(name: &str) -> bool {
+    matches!(
+        name,
+        "SET"
+            | "SETEX"
+            | "PSETEX"
+            | "SETNX"
+            | "GETSET"
+            | "GETDEL"
+            | "APPEND"
+            | "INCR"
+            | "DECR"
+            | "INCRBY"
+            | "DECRBY"
+            | "INCRBYFLOAT"
+            | "HSET"
+            | "HMSET"
+            | "HSETNX"
+            | "HDEL"
+            | "HINCRBY"
+            | "HINCRBYFLOAT"
+            | "LPUSH"
+            | "RPUSH"
+            | "LPOP"
+            | "RPOP"
+            | "SADD"
+            | "SREM"
+            | "ZADD"
+            | "ZREM"
+            | "ZINCRBY"
+            | "XADD"
+            | "PFADD"
+            | "PEXPIREAT"
+            | "HPEXPIREAT"
+            | "PERSIST"
+    )
+}
+
+/// Whether `cmd`, a command applied from the master's stream to database
+/// `db`, takes the command gate alone ([`takes_the_gate_alone`]). The
+/// replica's applier takes the gate first, before its own lock, as it does
+/// for a transaction. Taken after that lock, the gate waited for a `SAVE`
+/// that held it shared and was waiting for the lock: the replica answered
+/// nothing and applied nothing more (#373). A script from the stream never
+/// runs beside others. `run_command` then finds the gate held on its thread
+/// and takes nothing of it.
+pub(crate) fn applied_takes_the_gate_alone(
+    store: &crate::store::Store,
+    db: usize,
+    cmd: &[&[u8]],
+) -> bool {
+    let Some(&cmd0) = cmd.first() else {
+        return false;
+    };
+    let mut upper = [0u8; 32];
+    let owned;
+    let name: &str = if cmd0.len() <= upper.len() {
+        for (to, from) in upper.iter_mut().zip(cmd0) {
+            *to = from.to_ascii_uppercase();
+        }
+        std::str::from_utf8(&upper[..cmd0.len()]).unwrap_or("")
+    } else {
+        owned = String::from_utf8_lossy(cmd0).to_ascii_uppercase();
+        &owned
+    };
+    if one_key_write(name) || crate::command_gate::skips(name, cmd) {
+        return false;
+    }
+    // A flush and `SWAPDB` take it alone from the stream too, as from a
+    // client: a query on the replica beside one found a database half
+    // flushed, its keys gone and its indexes not yet, or half swapped (#378).
+    let script = matches!(
+        name,
+        "EVAL" | "EVALSHA" | "FCALL" | "EVAL_RO" | "EVALSHA_RO" | "FCALL_RO"
+    );
+    takes_the_gate_alone(store, db, name, cmd, script, true)
 }
 
 /// The order of the keys of an `MSET` or `MSETNX`, held shared (see
@@ -1132,17 +1249,23 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     };
     let beside_others =
         script_tag.is_some() && allowed_beside && !crate::command_gate::alone_on_this_thread();
-    // And a command that looks at keys it does not name must not find a
-    // script part-way through: it waits for all of them.
-    let whole_keyspace = tag_locks && crate::tag_locks::sees_the_whole_keyspace(name);
+    // A command that looks at keys it does not name must not find a script
+    // part-way through: it waits for all of them (`takes_the_gate_alone`).
+    // On a thread that holds the gate already, what either takes of it is
+    // nothing: the replica's applier holds it for each turn of its master's
+    // stream, alone for a command that takes it alone
+    // (`applied_takes_the_gate_alone`, #373), and EXEC and a script hold it
+    // alone for theirs.
     let gates = if crate::command_gate::skips(name, &ctx.cmd) {
         Some((None, None))
-    } else if (any_script && !beside_others)
-        || whole_keyspace
-        || crate::tag_locks::is_switch(name, &ctx.cmd)
-        || (ordered && matches!(name, "FLUSHALL" | "FLUSHDB" | "SWAPDB"))
-        || writes_keys_of_several_shards(ctx, name, cmd0)
-    {
+    } else if takes_the_gate_alone(
+        ctx.store,
+        *ctx.selected_db,
+        name,
+        &ctx.cmd,
+        any_script && !beside_others,
+        gated,
+    ) {
         crate::command_gate::enter_alone_unless(SLICE, overrun).map(|alone| (None, Some(alone)))
     } else {
         crate::command_gate::enter_unless(SLICE, overrun).map(|gate| (Some(gate), None))
@@ -2078,6 +2201,47 @@ pub(crate) fn invalidate_tracked_key(ctx: &Ctx, key: &str, by_client: bool) {
     } else {
         // Evicted to make room for the command that is about to run.
         crate::tracking::before_the_reply(invalidate);
+    }
+}
+
+#[cfg(test)]
+mod applied_gate_tests {
+    use super::applied_takes_the_gate_alone;
+
+    fn takes(cmd: &[&str]) -> bool {
+        let store = crate::store::new_store(2);
+        let cmd: Vec<&[u8]> = cmd.iter().map(|a| a.as_bytes()).collect();
+        applied_takes_the_gate_alone(&store, 0, &cmd)
+    }
+
+    /// What the replica's applier takes the gate alone for, before its own
+    /// lock (#373): what `run_command` takes it alone for from a client, but
+    /// what only a client asks for (a script beside others, by its tag). A
+    /// flush and `SWAPDB` among them (#378).
+    #[test]
+    fn the_applier_takes_the_gate_alone_as_run_command_does() {
+        assert!(!takes(&["SET", "k", "v"]));
+        assert!(!takes(&["HSET", "h", "f", "v"]));
+        assert!(!takes(&["MSET", "a", "1", "b", "2"]));
+        assert!(!takes(&["PING"]));
+        assert!(takes(&["EVAL", "return 1", "0"]));
+        assert!(takes(&["EVAL_RO", "return 1", "0"]));
+        assert!(takes(&["FLUSHDB"]));
+        assert!(takes(&["flushall", "async"]));
+        assert!(takes(&["SWAPDB", "0", "1"]));
+        // Keys of two shards, and of one.
+        let shards = crate::store::new_store(1)[0].len();
+        let of = |key: &str| crate::store::shard_index(shards, key);
+        let other = (0..)
+            .map(|i| format!("b{i}"))
+            .find(|b| of(b) != of("a"))
+            .unwrap();
+        let same = (0..)
+            .map(|i| format!("c{i}"))
+            .find(|c| of(c) == of("a"))
+            .unwrap();
+        assert!(takes(&["COPY", "a", &other, "REPLACE"]));
+        assert!(!takes(&["COPY", "a", &same, "REPLACE"]));
     }
 }
 
