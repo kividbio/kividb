@@ -40,12 +40,17 @@ impl Conn {
     }
 
     fn cmd(&mut self, args: &[&str]) -> V {
+        self.send(args);
+        self.read()
+    }
+
+    /// `args`, its reply left to read.
+    fn send(&mut self, args: &[&str]) {
         let mut buf = format!("*{}\r\n", args.len()).into_bytes();
         for arg in args {
             buf.extend_from_slice(format!("${}\r\n{arg}\r\n", arg.len()).as_bytes());
         }
         self.stream.write_all(&buf).unwrap();
-        self.read()
     }
 
     fn read(&mut self) -> V {
@@ -108,11 +113,11 @@ fn free_port() -> u16 {
     }
 }
 
-/// A pause is the process's: the tests here take turns.
-static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn serial() -> std::sync::MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+/// Held by each test: the pause, and the count of blocked clients, are the
+/// process's.
+fn one_pause_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ONE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn start_server() -> Conn {
@@ -161,7 +166,7 @@ const BLPOP: &[u8] = b"*3\r\n$5\r\nBLPOP\r\n$6\r\nnolist\r\n$1\r\n0\r\n";
 /// blocked on its key. While the pause lasts, there is nothing to unblock.
 #[test]
 fn client_unblock_after_unpause_finds_the_held_client_blocked() {
-    let _serial = serial();
+    let _one = one_pause_at_a_time();
     let mut c = start_server();
     let port = c.stream.peer_addr().unwrap().port();
     let mut held = Conn::connect(port);
@@ -213,7 +218,7 @@ fn repl_field(c: &mut Conn, field: &str) -> String {
 /// database selected.
 #[test]
 fn client_pause_write_does_not_hold_select() {
-    let _serial = serial();
+    let _one = one_pause_at_a_time();
     let mut c = start_server();
     let port = c.stream.peer_addr().unwrap().port();
     // No PING of the replicas to move the offset meanwhile.
@@ -281,4 +286,58 @@ fn client_pause_write_does_not_hold_select() {
     }
     replica.ok(&["SELECT", "0"]);
     assert_eq!(replica.cmd(&["GET", "c"]), V::Nil);
+}
+
+/// A pause of writers holds `GEORADIUS … STORE` and `GEORADIUSBYMEMBER …
+/// STOREDIST`, alone and in a transaction, as Redis does (#407). They were
+/// judged by their names, a read's, and ran: a failover that pauses writes
+/// to let its replica catch up lost what they stored.
+#[test]
+fn a_pause_of_writers_holds_georadius_store() {
+    let _one = one_pause_at_a_time();
+    let mut c = start_server();
+    let port = c.stream.peer_addr().unwrap().port();
+    let places = ["GEOADD", "places", "13.361389", "38.115556", "Palermo"];
+    assert_eq!(c.cmd(&places), V::Int(1));
+
+    // Queued before the pause, which would hold it (as Redis does).
+    let mut in_multi = Conn::connect(port);
+    in_multi.ok(&["MULTI"]);
+    let store = [
+        "GEORADIUS",
+        "places",
+        "15",
+        "37",
+        "200",
+        "km",
+        "STORE",
+        "near",
+    ];
+    assert_eq!(in_multi.cmd(&store), V::Simple("QUEUED".into()));
+
+    c.ok(&["CLIENT", "PAUSE", "100000", "WRITE"]);
+    in_multi.send(&["EXEC"]);
+    wait_blocked(&mut c, 1);
+    let mut alone = Conn::connect(port);
+    alone.send(&[
+        "GEORADIUSBYMEMBER",
+        "places",
+        "Palermo",
+        "10",
+        "km",
+        "STOREDIST",
+        "dist",
+    ]);
+    wait_blocked(&mut c, 2);
+    let mut store_alone = Conn::connect(port);
+    store_alone.send(&store);
+    wait_blocked(&mut c, 3);
+    // Held, not run: nothing is stored yet.
+    assert_eq!(c.cmd(&["EXISTS", "near", "dist"]), V::Int(0));
+
+    c.ok(&["CLIENT", "UNPAUSE"]);
+    assert_eq!(in_multi.read(), V::Array(vec![V::Int(1)]));
+    assert_eq!(alone.read(), V::Int(1));
+    assert_eq!(store_alone.read(), V::Int(1));
+    assert_eq!(c.cmd(&["EXISTS", "near", "dist"]), V::Int(2));
 }

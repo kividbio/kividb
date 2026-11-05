@@ -415,7 +415,9 @@ pub fn wait_out_handoff() {
 /// which writes nothing and is held back from the stream meanwhile,
 /// `replication::replicate_one_write`: #411), `PFCOUNT` (which
 /// may rewrite its key), `PUBLISH`, a script that has not declared itself
-/// free of writes, and an `EXEC` of a transaction holding any of those.
+/// free of writes, and an `EXEC` of a transaction holding any of those. A
+/// command that writes only with some of its arguments (`GEORADIUS …
+/// STORE`, `FUNCTION LOAD`) waits when it has them: see [`may_replicate`].
 ///
 /// A command with the wrong number of arguments is not held: it is going to
 /// be refused whenever it runs, and is refused now.
@@ -436,23 +438,39 @@ pub fn holds<Q: AsRef<[u8]>>(cmd: &[&[u8]], queued: &[Vec<Q>]) -> bool {
     if name == "EXEC" {
         return queued.iter().any(|command| queued_may_replicate(command));
     }
-    may_replicate(&name, cmd.get(1).copied())
+    may_replicate(&name, cmd)
 }
 
 /// Whether the queued command `command` may write: what [`holds`] holds of
 /// an `EXEC`, and what a transaction that reaches its gates during a
 /// handoff is refused for (`routing::exec_refusal_in_gate`).
+///
+/// Called only while writes are paused, or when `EXEC` reaches its gates
+/// during a handoff: never on a command's way through when nothing is.
 pub fn queued_may_replicate<Q: AsRef<[u8]>>(command: &[Q]) -> bool {
-    command.first().is_some_and(|cmd0| {
-        may_replicate(
-            &String::from_utf8_lossy(cmd0.as_ref()).to_ascii_uppercase(),
-            command.get(1).map(|arg| arg.as_ref()),
-        )
-    })
+    let Some(cmd0) = command.first() else {
+        return false;
+    };
+    let cmd: Vec<&[u8]> = command.iter().map(|arg| arg.as_ref()).collect();
+    may_replicate(
+        &String::from_utf8_lossy(cmd0.as_ref()).to_ascii_uppercase(),
+        &cmd,
+    )
 }
 
-/// Whether running `name` — with `first`, its first argument — may write.
-fn may_replicate(name: &str, first: Option<&[u8]>) -> bool {
+/// Whether running `cmd`, named `name`, may write: change the dataset or
+/// the replication stream.
+///
+/// A command that writes only with some of its arguments is judged by them,
+/// as replication judges it (`command_mutates_for_replication`):
+/// `GEORADIUS` and `GEORADIUSBYMEMBER` with `STORE` or `STOREDIST`, the
+/// `SCRIPT` and `FUNCTION` subcommands that change what is loaded,
+/// `PFDEBUG TODENSE`, `HIMPORT`, and `MIGRATE`, which deletes what it
+/// moves. They used to be judged by their name alone, and so were taken
+/// for reads: a `GEORADIUS … STORE` in a transaction was neither held by
+/// the pause nor refused during a handoff, ran behind the handoff's back,
+/// and its write was lost with the slot (#407).
+fn may_replicate(name: &str, cmd: &[&[u8]]) -> bool {
     #[cfg(feature = "lua")]
     let declared_read_only = |name: &str, first: &[u8]| match name {
         "EVAL" => crate::commands::script_declares_no_writes(first),
@@ -463,9 +481,14 @@ fn may_replicate(name: &str, first: Option<&[u8]>) -> bool {
     let declared_read_only = |_: &str, _: &[u8]| false;
     match name {
         "PFCOUNT" | "PUBLISH" | "SPUBLISH" => true,
-        "EVAL" | "EVALSHA" | "FCALL" => !first.is_some_and(|first| declared_read_only(name, first)),
+        // Propagated, but writes nothing (#411).
+        "SELECT" => false,
+        "EVAL" | "EVALSHA" | "FCALL" => !cmd
+            .get(1)
+            .copied()
+            .is_some_and(|first| declared_read_only(name, first)),
         "EVAL_RO" | "EVALSHA_RO" | "FCALL_RO" => false,
-        _ => crate::replication::is_data_write(name),
+        _ => crate::replication::command_mutates_for_replication(name, cmd),
     }
 }
 
@@ -533,6 +556,56 @@ mod tests {
         let writes = vec![vec![b"SET".to_vec(), b"k".to_vec(), b"v".to_vec()]];
         assert!(!holds(&[b"EXEC"], &reads));
         assert!(holds(&[b"EXEC"], &writes));
+        // A command that writes only with some of its arguments waits when
+        // it has them, alone or in a transaction (#407).
+        let georadius: &[&[u8]] = &[b"GEORADIUS", b"src", b"15", b"37", b"200", b"km"];
+        let store: &[&[u8]] = &[
+            b"GEORADIUS",
+            b"src",
+            b"15",
+            b"37",
+            b"200",
+            b"km",
+            b"STORE",
+            b"dst",
+        ];
+        let storedist: &[&[u8]] = &[
+            b"GEORADIUSBYMEMBER",
+            b"src",
+            b"m",
+            b"10",
+            b"km",
+            b"STOREDIST",
+            b"dst",
+        ];
+        assert!(!holds(georadius, none));
+        assert!(holds(store, none));
+        assert!(holds(storedist, none));
+        let queue = |cmd: &[&[u8]]| vec![cmd.iter().map(|arg| arg.to_vec()).collect::<Vec<_>>()];
+        assert!(!holds(&[b"EXEC"], &queue(georadius)));
+        assert!(holds(&[b"EXEC"], &queue(store)));
+        assert!(holds(&[b"EXEC"], &queue(storedist)));
+        assert!(holds(&[b"FUNCTION", b"LOAD", b"code"], none));
+        assert!(!holds(&[b"FUNCTION", b"LIST"], none));
+        assert!(holds(
+            &[b"MIGRATE", b"127.0.0.1", b"6379", b"k", b"0", b"1000"],
+            none
+        ));
+        // `SELECT` is propagated, but writes nothing: it is not held, alone
+        // or in a transaction, nor is a transaction refused for it during a
+        // handoff (`queued_may_replicate`, #411).
+        assert!(!holds(&[b"SELECT", b"1"], none));
+        let select_and_read = vec![
+            vec![b"SELECT".to_vec(), b"1".to_vec()],
+            vec![b"GET".to_vec(), b"k".to_vec()],
+        ];
+        assert!(!holds(&[b"EXEC"], &select_and_read));
+        assert!(!select_and_read.iter().any(|c| queued_may_replicate(c)));
+        let select_and_write = vec![
+            vec![b"SELECT".to_vec(), b"1".to_vec()],
+            vec![b"SET".to_vec(), b"k".to_vec(), b"v".to_vec()],
+        ];
+        assert!(holds(&[b"EXEC"], &select_and_write));
         clear_pause();
         assert!(!holds(&[b"SET", b"k", b"v"], none));
 
