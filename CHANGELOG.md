@@ -29,6 +29,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A Lua script's `false` is a RESP3 null to a RESP3 client (#431).** A
+  script's `false`, which is also what `redis.call` gives back for a nil
+  reply (a `GET` of a missing key), was sent as RESP2's `$-1` to a client
+  that had sent `HELLO 3`, at the top level and inside a table. Redis sends
+  RESP3's `_`. redis-py 8, which speaks RESP3 by default, refused the reply
+  with `Protocol Error: b'1'`, so every Celery 5.7 chord failed and never
+  completed unless the result backend was put on RESP2 (`?protocol=2`).
+  `EVAL`, `EVALSHA`, their `_RO` forms, `FCALL` and `FCALL_RO` now answer
+  as Redis does: under the script's default RESP2, `false` and `nil` are
+  the null of the client's protocol and `true` is `1`. Under
+  `redis.setresp(3)`, a Lua boolean is `#t`/`#f` to a RESP3 client and
+  `1`/`0` to a RESP2 one; `redis.call`'s null reply is a Lua `nil`, not
+  `false`; and doubles, maps and sets (`{double=…}`, `{map=…}`,
+  `{set=…}`) are shaped for the client's protocol, so a RESP2 client no
+  longer gets RESP3 types. A table with both `err` and `ok` is an error,
+  and a line break in a status (`{ok=…}`) is sent as a space, as in Redis.
+  RESP2 clients get the same bytes as before for scripts that do not call
+  `redis.setresp(3)`.
+
 - **A write in database 0 could reach replicas and the AOF in another
   database.** Until a client selects a database other than 0, writes go out
   with no `SELECT` of their own. The first client to select another

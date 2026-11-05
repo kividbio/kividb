@@ -81,7 +81,7 @@ other files:
   [docs/integrations/firecrawl.md](integrations/firecrawl.md).
 - Celery and kombu (broker and result backend; the `lua` build), with their own Redis integration suites
   and a real worker through a SIGKILL and server restarts. Chords need the result backend on RESP2 on
-  1.2.0 ([#431](https://github.com/kividbio/kividb/issues/431)):
+  1.2.0 ([#431](https://github.com/kividbio/kividb/issues/431), fixed in 1.2.1):
   [benchmarks/celery-compat/](../benchmarks/celery-compat/) and [docs/integrations/celery.md](integrations/celery.md).
 - Semantic Kernel's Redis vector store (Python; JSON and hash collections), with its own Redis tests:
   [benchmarks/semantic-kernel-compat/](../benchmarks/semantic-kernel-compat/) and
