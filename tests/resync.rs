@@ -1756,3 +1756,83 @@ fn function_libraries_load_from_a_redis_dump_rdb() {
         preloaded.log()
     );
 }
+
+/// Send a command and do not wait for its reply.
+fn send_only(c: &mut Conn, args: &[&str]) {
+    let mut buf = format!("*{}\r\n", args.len()).into_bytes();
+    for a in args {
+        buf.extend_from_slice(format!("${}\r\n{a}\r\n", a.len()).as_bytes());
+    }
+    c.writer.write_all(&buf).unwrap();
+}
+
+/// The keys of database `db`, sorted.
+fn keys_of_db(c: &mut Conn, db: &str) -> Vec<String> {
+    assert!(c.cmd(&["SELECT", db]).ok());
+    let mut keys: Vec<String> = c
+        .cmd(&["KEYS", "*"])
+        .arr()
+        .iter()
+        .map(|key| key.s().to_string())
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// A database-0 write on its way when a client first selects another
+/// database reaches the replica, and the AOF, in database 0 (#423).
+///
+/// Until a client leaves database 0, a write goes out with no `SELECT` of
+/// its own. The first `SELECT 3` switches every write to carrying one, and
+/// has to wait out the writes on their way first. It did not: its cut was
+/// taken inside the write gate, where a cut is none, so its plain
+/// `SELECT 3` went out ahead of the write, and the replica and a replay of
+/// the AOF applied that write in database 3. The test hook holds the write
+/// between being encoded and being queued.
+#[test]
+fn a_write_on_its_way_when_a_client_first_selects_another_database_stays_in_db_0() {
+    let mut master =
+        Server::start_with_env(&["--aof"], &[("KIVIDB_TEST_BARE_WRITE_DELAY_MS", "1500")]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    let mut m = master.conn();
+    // The first write after the replica came goes out with a `SELECT 0`;
+    // the stream is in database 0 after it, and the next is bare.
+    let started = Instant::now();
+    assert!(m.cmd(&["SET", "first", "0"]).ok());
+    assert!(
+        started.elapsed() < Duration::from_millis(1000),
+        "the first write was held: the stream was in database 0 already"
+    );
+
+    let mut a = master.conn();
+    let mut b = master.conn();
+    send_only(&mut b, &["SET", "j", "0"]);
+    std::thread::sleep(Duration::from_millis(300));
+    send_only(&mut a, &["SELECT", "3"]);
+    assert!(b.read().ok());
+    assert!(a.read().ok());
+    assert!(a.cmd(&["SET", "k", "3"]).ok());
+    assert!(b.cmd(&["SET", "j2", "0"]).ok());
+
+    let offset: u64 = m.info("replication", "master_repl_offset").parse().unwrap();
+    wait_until("the replica to catch up", || {
+        r.info("replication", "slave_repl_offset")
+            .parse::<u64>()
+            .is_ok_and(|applied| applied >= offset)
+    });
+    let db0 = ["first", "j", "j2"].map(String::from).to_vec();
+    assert_eq!(keys_of_db(&mut r, "3"), ["k"], "{}", replica.log());
+    assert_eq!(keys_of_db(&mut r, "0"), db0);
+
+    // From the AOF alone: every write on disk, then no final save.
+    assert_eq!(b.cmd(&["WAITAOF", "1", "0", "5000"]).arr()[0].i(), 1);
+    drop((m, a, b));
+    master.kill();
+    master.restart();
+    let mut m = master.conn();
+    assert_eq!(keys_of_db(&mut m, "3"), ["k"], "{}", master.log());
+    assert_eq!(keys_of_db(&mut m, "0"), db0);
+}

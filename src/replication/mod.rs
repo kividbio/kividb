@@ -630,13 +630,16 @@ impl ReplState {
     ///
     /// The switch happens with the write gate closed, so that no write is
     /// already on its way without a `SELECT` when the first one with a
-    /// different database is sent.
+    /// different database is sent. A client's `SELECT` is a write, and in
+    /// the gate when it runs, where a cut is none: it makes the switch
+    /// before it enters the gate (`handler::first_select_of_another_database`,
+    /// #423), and this, when it runs, finds it made.
     pub fn note_database_selected(&self, db: usize) {
         if db == 0 || self.several_databases.load(Ordering::Relaxed) {
             return;
         }
-        // `None` inside a script, which holds the gate itself; the flag is
-        // set all the same.
+        // `None` inside a script or a transaction, which run alone, so that
+        // no other write is in flight; the flag is set all the same.
         let _cut = crate::write_gate::cut();
         self.several_databases.store(true, Ordering::Relaxed);
     }
@@ -662,6 +665,7 @@ impl ReplState {
         } else if self.repl_stream_last_db.load(Ordering::Relaxed) != db as u64 {
             vec![select(), command]
         } else {
+            test_delay_of_a_bare_write();
             vec![command]
         }
     }
@@ -1735,6 +1739,26 @@ pub fn slave_command_allowed_during_loading(name: &str) -> bool {
             | "PSUBSCRIBE"
             | "PUNSUBSCRIBE"
     )
+}
+
+/// `KIVIDB_TEST_BARE_WRITE_DELAY_MS`, never set otherwise: the first write
+/// encoded with no `SELECT` of its own waits this long, in the write gate,
+/// before it is queued. A test's window to send another command meanwhile
+/// (#423). Unset, a load and a branch, on a write that is propagated.
+fn test_delay_of_a_bare_write() {
+    static DELAY: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    static TAKEN: AtomicBool = AtomicBool::new(false);
+    let delay = DELAY.get_or_init(|| {
+        std::env::var("KIVIDB_TEST_BARE_WRITE_DELAY_MS")
+            .ok()
+            .and_then(|ms| ms.parse().ok())
+            .map(std::time::Duration::from_millis)
+    });
+    if let Some(delay) = *delay
+        && !TAKEN.swap(true, Ordering::Relaxed)
+    {
+        crate::cluster::migration::off_the_runtime(|| std::thread::sleep(delay));
+    }
 }
 
 /// The refusal of a write for want of good replicas, as Redis words it.

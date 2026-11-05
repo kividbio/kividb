@@ -29,6 +29,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A write in database 0 could reach replicas and the AOF in another
+  database.** Until a client selects a database other than 0, writes go out
+  with no `SELECT` of their own. The first client to select another
+  database switches every write to carrying one, and was meant to wait out
+  the writes already on their way first. It did not: a database-0 write
+  running at that moment could be sent after that client's `SELECT`, and a
+  replica, or a replay of the AOF after a restart, then applied it in the
+  other database. The first `SELECT` of a database other than 0 now waits
+  for those writes; nothing changes after it, or on a server that only uses
+  database 0 (#423).
+
 - **Score-range bounds are read as Redis reads them.** `ZCOUNT`,
   `ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`, `ZREMRANGEBYSCORE`, and `ZRANGE` and
   `ZRANGESTORE` with `BYSCORE` refused an empty bound, `(` alone and a
