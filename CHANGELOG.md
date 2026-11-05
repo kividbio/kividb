@@ -34,9 +34,28 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   one, and so did loading a snapshot, the AOF's preamble, a full sync from a
   master or a Redis RDB file. Its order put the NaN above `+inf`, so
   `ZCOUNT -inf +inf` and the other unbounded score ranges counted a member
-  that `ZCARD`-based code took not to be there. As in Redis, `RESTORE` now
+  the rest of the code assumes cannot exist. As in Redis, `RESTORE` now
   replies `ERR Bad data format`, and loading fails with `Zset with NAN score
-  detected` and the key. Infinite scores load as before (#414).
+  detected` (naming the key, for a KiviDB snapshot). Infinite scores load
+  as before (#414).
+
+  **Upgrade note:** a server that refuses such a key refuses to start
+  rather than start without it, so a 1.2.0 server holding one (it can
+  only have come from a crafted `RESTORE` or snapshot) won't start after
+  the upgrade if the key is in its snapshot or AOF preamble. On 1.2.0,
+  find such keys first (`ZRANGE key 0 -1 WITHSCORES` shows `nan`) and
+  delete them before upgrading.
+
+- **Score-range bounds are read as Redis reads them.** `ZCOUNT`,
+  `ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`, `ZREMRANGEBYSCORE`, and `ZRANGE` and
+  `ZRANGESTORE` with `BYSCORE` refused an empty bound, `(` alone and a
+  number too large for a double such as `1e400`, with `ERR min or max is
+  not a float`. Redis takes an empty bound as 0, `(` as an open 0, and
+  `1e400` and `-1e400` as `+inf` and `-inf`, and so does KiviDB now. It
+  also skips space before a bound's number, as Redis does. A bound with
+  bytes that are not UTF-8 is refused as one that is not a float (`ZCOUNT`
+  said `ERR min must be UTF-8`). Scores given to `ZADD` and `ZINCRBY` are
+  read as before (#413).
 
 - **`@connection` holds what it holds in Redis (#392).** It had only
   `AUTH`, `CLIENT`, `ECHO`, `HELLO`, `PING`, `QUIT` and `RESET`. It now
