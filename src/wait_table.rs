@@ -24,7 +24,9 @@ pub(crate) type Value = Arc<[u8]>;
 pub struct Ticket {
     /// Lower is earlier.
     id: u64,
-    /// The lines it has stood in, to leave when it is dropped.
+    /// The lines it waits in, to leave when it is dropped: recorded when its
+    /// command parks (see [`Ticket::parks_in`]), so that one answered at
+    /// once costs nothing for this.
     lines: Mutex<Vec<(Line, String)>>,
     table: Weak<WaitTable>,
 }
@@ -34,6 +36,19 @@ pub struct Ticket {
 enum Line {
     Keys,
     Readers,
+}
+
+impl Ticket {
+    /// Its command parks, waiting on `keys` (`readers`: in their
+    /// `XREADGROUP` lines): what the `Drop` is to leave. Once: a command
+    /// that parks again waits on the same keys.
+    pub fn parks_in(&self, keys: &[String], readers: bool) {
+        let line = if readers { Line::Readers } else { Line::Keys };
+        let mut lines = self.lines.lock();
+        if lines.is_empty() {
+            lines.extend(keys.iter().map(|key| (line, key.clone())));
+        }
+    }
 }
 
 impl Drop for Ticket {
@@ -164,19 +179,18 @@ impl WaitTable {
     /// Stand in the line for `key` — or, already in it, stay where `ticket`
     /// says — and return the receiver this client is woken through.
     pub fn enqueue(&self, key: &str, ticket: &Arc<Ticket>) -> oneshot::Receiver<Value> {
-        self.enqueue_in(&self.queues, Line::Keys, key, ticket)
+        self.enqueue_in(&self.queues, key, ticket)
     }
 
     /// [`enqueue`](Self::enqueue), in the line of the key's `XREADGROUP`
     /// clients.
     pub fn enqueue_reader(&self, key: &str, ticket: &Arc<Ticket>) -> oneshot::Receiver<Value> {
-        self.enqueue_in(&self.reader_queues, Line::Readers, key, ticket)
+        self.enqueue_in(&self.reader_queues, key, ticket)
     }
 
     fn enqueue_in(
         &self,
         lines: &Mutex<AHashMap<String, Vec<Queued>>>,
-        line: Line,
         key: &str,
         ticket: &Arc<Ticket>,
     ) -> oneshot::Receiver<Value> {
@@ -203,12 +217,6 @@ impl WaitTable {
                     },
                 );
                 self.queued_count.fetch_add(1, Ordering::Relaxed);
-                // Remembered by the ticket, to leave when it goes. The line's
-                // lock, then the ticket's: the `Drop` takes only the first.
-                let mut stood_in = ticket.lines.lock();
-                if !stood_in.iter().any(|(l, k)| *l == line && k == key) {
-                    stood_in.push((line, key.to_string()));
-                }
             }
         }
         rx
@@ -593,9 +601,14 @@ mod signal_tests {
     fn a_woken_client_dropped_before_it_looked_passes_its_turn_on() {
         let table = Arc::new(WaitTable::new());
         for line in [Line::Keys, Line::Readers] {
-            let enqueue = |ticket: &Arc<Ticket>| match line {
-                Line::Keys => table.enqueue("k", ticket),
-                Line::Readers => table.enqueue_reader("k", ticket),
+            // Each parks, as a command that waits does.
+            let enqueue = |ticket: &Arc<Ticket>| {
+                let rx = match line {
+                    Line::Keys => table.enqueue("k", ticket),
+                    Line::Readers => table.enqueue_reader("k", ticket),
+                };
+                ticket.parks_in(&["k".to_string()], line == Line::Readers);
+                rx
             };
             let (first, second, third) =
                 (table.new_ticket(), table.new_ticket(), table.new_ticket());

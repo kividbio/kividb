@@ -1928,7 +1928,10 @@ pub fn xreadgroup(ctx: &mut Ctx) -> Vec<u8> {
         ticket: Arc::clone(&ticket),
     };
     match blocking::park_with_state(ctx, rxs, wait, Some(state)) {
-        ParkOutcome::Parked => Vec::new(),
+        ParkOutcome::Parked => {
+            ticket.parks_in(&keys, true);
+            Vec::new()
+        }
         ParkOutcome::CannotWait => {
             leave(ctx);
             resp_null_array()

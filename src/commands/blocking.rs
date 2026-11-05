@@ -245,7 +245,23 @@ impl BlockingSlot {
 
     /// Take the wait a handler parked during the dispatch just completed.
     pub fn take_parked(&mut self) -> Option<BlockingWait> {
-        self.ctl.parked.take()
+        let parked = self.ctl.parked.take();
+        if parked.is_none() && self.in_resume {
+            self.resume_over();
+        }
+        parked
+    }
+
+    /// A dispatch that resumed a command is over and did not park again:
+    /// what it carried goes now. Its handler took it if it ran; if the
+    /// command was refused before that (`OOM`, `READONLY` after a failover),
+    /// the place in line it holds goes here, and passes the turn on (see
+    /// `wait_table::Ticket`), rather than at the next command or the end of
+    /// the batch, which a `WAIT` pipelined behind it can put off for ever.
+    #[cold]
+    fn resume_over(&mut self) {
+        self.ctl.state = None;
+        self.ctl.resume = None;
     }
 
     /// Whether the dispatch just completed was a resume.
@@ -529,7 +545,10 @@ pub fn wait_for_keys(
     };
     match park_with_state(ctx, rxs, remaining, Some(state)) {
         // The reply comes from the dispatch that resumes the command.
-        ParkOutcome::Parked => Vec::new(),
+        ParkOutcome::Parked => {
+            ticket.parks_in(keys, false);
+            Vec::new()
+        }
         ParkOutcome::CannotWait => {
             for key in keys {
                 ctx.wait_table.dequeue(key, &ticket);

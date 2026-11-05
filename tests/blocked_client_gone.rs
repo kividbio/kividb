@@ -861,3 +861,100 @@ fn a_client_that_keeps_sending_while_held_is_closed_past_the_query_buffer_limit(
     assert!(closed, "a client sending 4 MB past a 1 MB limit was kept");
     assert_eq!(ctl.cmd(&["EXISTS", "q:k"]), V::Int(0));
 }
+
+/// A blocked client woken by a write that a pause held, as the pause ends,
+/// can be kept at the gate a moment after it was woken and looked at its
+/// socket: while the other clients the pause let go go on (here a script
+/// that runs for a while). If it closes then, the element must stay. The
+/// socket is looked at again once the gate lets the resume through; it used
+/// to be popped, and answered to nobody.
+#[cfg(feature = "lua")]
+#[test]
+fn a_client_woken_as_a_pause_ends_and_gone_at_the_gate_takes_nothing() {
+    let script = "local x = 0 for i = 1, 100000000 do x = x + i end return 1";
+    for &io in io_models() {
+        let server = Server::start(io);
+        let mut ctl = server.conn();
+        let woken = blocked_client(&server, &mut ctl, "woken", &["BLPOP", "g:wait", "0"]);
+        let mut slow = server.conn();
+        let mut pusher = server.conn();
+        assert_eq!(
+            ctl.cmd(&["CLIENT", "PAUSE", "30000", "WRITE"]),
+            s("OK"),
+            "{io}"
+        );
+        slow.send(&["EVAL", script, "0"]);
+        pusher.send(&["LPUSH", "g:wait", "job"]);
+        wait_blocked(&mut ctl, 3);
+        assert_eq!(ctl.cmd(&["CLIENT", "UNPAUSE"]), s("OK"), "{io}");
+        // Woken by the push the pause let go, and at the gate while the
+        // script runs: well inside the gate's tenth of a second.
+        thread::sleep(Duration::from_millis(30));
+        woken.close();
+        assert_eq!(pusher.read(), V::Int(1), "{io}");
+        assert_eq!(slow.read(), V::Int(1), "{io}");
+        assert!(leaves_within(&mut ctl, "woken", AT_ONCE), "{io}");
+        assert_eq!(
+            ctl.cmd(&["LRANGE", "g:wait", "0", "-1"]),
+            strs(&["job"]),
+            "{io}: the element went to a client that had gone"
+        );
+    }
+}
+
+/// A woken client whose resume is refused (OOM) and that has more pipelined
+/// behind it — here a `WAIT` that waits for a replica that is not there —
+/// passes its turn on at once, not when its batch of commands is over: the
+/// client behind it gets the element while the `WAIT` still waits.
+#[test]
+fn a_refused_resume_passes_its_turn_on_before_what_follows_it() {
+    for &io in io_models() {
+        let master = Server::start(io);
+        let port = master.port.to_string();
+        let _replica = Server::start_with(io, &["--replicaof", "127.0.0.1", &port]);
+        let mut ctl = master.conn();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while info_field(&mut ctl, "replication", "connected_slaves") != 1 {
+            assert!(
+                Instant::now() < deadline,
+                "{io}: the replica never connected"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(ctl.cmd(&["RPUSH", "w:src", "job"]), V::Int(1), "{io}");
+        let mut first = master.conn();
+        let mut batch = request(&["BRPOPLPUSH", "w:wait", "w:first", "0"]);
+        batch.extend(request(&["WAIT", "2", "0"]));
+        first.writer.write_all(&batch).unwrap();
+        wait_blocked(&mut ctl, 1);
+        let mut second = master.conn();
+        second.send(&["BLPOP", "w:wait", "0"]);
+        wait_blocked(&mut ctl, 2);
+
+        for (setting, value) in [("maxmemory-policy", "noeviction"), ("maxmemory", "1")] {
+            assert_eq!(ctl.cmd(&["CONFIG", "SET", setting, value]), s("OK"), "{io}");
+        }
+        assert_eq!(ctl.cmd(&["RENAME", "w:src", "w:wait"]), s("OK"), "{io}");
+        // The first client's OOM is not read: its replies go out together
+        // once its batch is done, and the WAIT in it does not end.
+        second
+            .reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut line = String::new();
+        let got = second.reader.read_line(&mut line);
+        assert_eq!(
+            ctl.cmd(&["CONFIG", "SET", "maxmemory", "0"]),
+            s("OK"),
+            "{io}"
+        );
+        assert!(
+            got.is_ok_and(|n| n > 0),
+            "{io}: the client behind was not woken while the WAIT waited; w:wait holds {:?}",
+            ctl.cmd(&["LRANGE", "w:wait", "0", "-1"])
+        );
+        assert_eq!(second.read(), s("w:wait"), "{io}");
+        assert_eq!(second.read(), s("job"), "{io}");
+    }
+}

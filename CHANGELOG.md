@@ -58,6 +58,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   while it waits is closed once what it sent passes
   `client-query-buffer-limit`, as Redis closes one; it used to be read
   into memory without end.
+- **Follow-ups to the fix above (#384).** A blocked client woken as a
+  pause ended, kept a moment at the pause gate while the clients the pause
+  let go went on, and closing then, could still be given the element: its
+  socket is now looked at again once the gate lets it through. A woken
+  client whose command is refused (`OOM`, `READONLY`) passes its turn on
+  as soon as the refusal is answered, not when the commands pipelined
+  behind it are done: a `WAIT` behind it used to keep the element from the
+  client next in line for as long as it waited. A blocking command that is
+  answered at once no longer pays for the bookkeeping of one that waits.
 - **A replica could stop for good while it saved (#373).** The replica
   entered the command gate while holding its own apply lock, which `SAVE`
   (and a promotion, `REPLICAOF NO ONE`) waits for while holding the gate.

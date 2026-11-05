@@ -1071,6 +1071,16 @@ pub async fn handle_client(
                     peer_watch.gone()
                 }));
                 match gated.await {
+                    // The gate may have kept a resume waiting after it was
+                    // woken and looked at the socket — while the clients an
+                    // ended pause let go went on — and the client may have
+                    // gone meanwhile: it is looked at again, or the element
+                    // would be popped for nobody.
+                    Some(ran) if blocking_slot.resuming() && peer_has_gone(peer_watch.fd) => {
+                        blocking_slot.make_gone();
+                        interrupted.gone = true;
+                        ran
+                    }
                     Some(ran) => ran,
                     None if blocking_slot.resuming() => {
                         blocking_slot.make_gone();
