@@ -1,13 +1,13 @@
 //! Lua scripting (`EVAL`, `SCRIPT`, …) — compiled with `--features lua`.
 
 use crate::commands::ctx::Ctx;
-use crate::commands::handler::{client_connection_resp, execute_command_from_script};
+use crate::commands::handler::execute_command_from_script;
 use crate::commands::helpers::glob_match;
 use crate::replication;
 use crate::resp::write::{
-    resp_array, resp_bignum_resp3, resp_bulk, resp_bulk_str, resp_double_bulk, resp_double_resp3,
-    resp_error, resp_integer, resp_map, resp_null_bulk, resp_null_resp3, resp_set_resp3,
-    resp_simple, resp_verbatim_resp3,
+    resp_array, resp_bignum_resp3, resp_bool_resp3, resp_bulk, resp_bulk_str, resp_double_bulk,
+    resp_double_resp3, resp_error, resp_integer, resp_map, resp_null_bulk, resp_null_for,
+    resp_set_resp3, resp_simple, resp_verbatim_resp3,
 };
 use crate::snapshot::{crc64_digest, redis_function_dump_sources};
 use mlua::prelude::*;
@@ -874,6 +874,10 @@ struct ScriptEval {
 
 thread_local! {
     static SCRIPT_EVAL: RefCell<Option<ScriptEval>> = const { RefCell::new(None) };
+    /// The protocol of the client a script command on this thread was sent
+    /// by, when its `Ctx` says RESP2 for the commands the script calls
+    /// (`lua_vm_blocking`); 0 when the `Ctx`'s own `resp` is the client's.
+    static CLIENT_RESP: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     /// `redis.call`s and `redis.pcall`s made on this thread, ever: what a
     /// script ran is the difference (see [`count_script_commands`]).
     static SCRIPT_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -894,6 +898,20 @@ fn count_script_commands(
         registry.add_commands(client_id, ran);
     }
     reply
+}
+
+/// Run `run` (a script command) for a client that speaks `resp`: what the
+/// script returns is written in it. The connection loops know the protocol,
+/// so the reply needs no lookup in the client registry.
+pub(crate) fn with_client_resp<R>(resp: u8, run: impl FnOnce() -> R) -> R {
+    struct Restore(u8);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CLIENT_RESP.set(self.0);
+        }
+    }
+    let _restore = Restore(CLIENT_RESP.replace(resp));
+    run()
 }
 
 /// When present, `redis.setresp` overrides [`crate::commands::handler::effective_resp_for_reply`].
@@ -2940,7 +2958,50 @@ fn json_to_lua(
 }
 
 fn lua_value_to_resp(lua: &Lua, val: LuaValue) -> LuaResult<Vec<u8>> {
-    lua_to_resp_inner(lua, val, 0)
+    lua_to_resp_inner(lua, val, 0, ReplyProtocol::current())
+}
+
+/// The protocols a script's reply is written in, as Redis's
+/// `luaReplyToRedisReply` writes it. Every kind of reply is shaped for the
+/// client's protocol: a null is `_` to a RESP3 client and `$-1` to a RESP2
+/// one, and so are doubles, maps and sets. The script's own protocol
+/// (`redis.setresp`) decides only what a Lua boolean is: under 2, `true` is
+/// the integer 1 and `false` is a null (#431); under 3, they are booleans,
+/// `#t`/`#f` to a RESP3 client and `:1`/`:0` to a RESP2 one.
+#[derive(Clone, Copy)]
+struct ReplyProtocol {
+    client: u8,
+    script: u8,
+}
+
+impl ReplyProtocol {
+    /// The running script's: the client's protocol as its connection loop
+    /// gave it (`with_client_resp`), or else the `Ctx`'s (a transaction's
+    /// `EXEC` runs a script on the connection's own `Ctx`).
+    fn current() -> Self {
+        let given = CLIENT_RESP.get();
+        SCRIPT_EVAL
+            .with(|c| {
+                c.borrow().as_ref().map(|se| {
+                    let client = if given != 0 {
+                        given
+                    } else {
+                        // SAFETY: `ctx_addr` is the running script's `Ctx`,
+                        // which outlives the script and the conversion of
+                        // its reply.
+                        unsafe { &*(se.ctx_addr as *const Ctx<'_>) }.resp
+                    };
+                    Self {
+                        client,
+                        script: se.script_resp,
+                    }
+                })
+            })
+            .unwrap_or(Self {
+                client: 2,
+                script: 2,
+            })
+    }
 }
 
 /// Matches Redis `luaReplyToRedisReply` nesting limits (stack / safeguard); cyclic tables must not
@@ -2976,6 +3037,7 @@ fn lua_try_encode_singleton_chain(
     lua: &Lua,
     start: LuaTable,
     depth: u32,
+    protocol: ReplyProtocol,
 ) -> LuaResult<Option<Vec<u8>>> {
     if !lua_table_is_pure_singleton_array(&start)? {
         return Ok(None);
@@ -3004,7 +3066,7 @@ fn lua_try_encode_singleton_chain(
                     return Ok(None);
                 }
                 out.extend_from_slice(b"*1\r\n");
-                let encoded = lua_to_resp_inner(lua, leaf, depth.saturating_add(1))?;
+                let encoded = lua_to_resp_inner(lua, leaf, depth.saturating_add(1), protocol)?;
                 out.extend_from_slice(&encoded);
                 return Ok(Some(out));
             }
@@ -3013,63 +3075,57 @@ fn lua_try_encode_singleton_chain(
 }
 
 #[allow(clippy::only_used_in_recursion)]
-fn lua_to_resp_inner(lua: &Lua, val: LuaValue, depth: u32) -> LuaResult<Vec<u8>> {
+fn lua_to_resp_inner(
+    lua: &Lua,
+    val: LuaValue,
+    depth: u32,
+    protocol: ReplyProtocol,
+) -> LuaResult<Vec<u8>> {
     if depth > LUA_SCRIPT_RESP_ENCODE_MAX_DEPTH {
         return Err(LuaError::RuntimeError("reached lua stack limit".into()));
     }
     let next_depth = depth.saturating_add(1);
     match val {
-        LuaNil => {
-            let eff_resp: u8 = SCRIPT_EVAL
-                .with(|c| {
-                    c.borrow().as_ref().map(|se| {
-                        if se.script_resp != 2 {
-                            se.script_resp
-                        } else {
-                            let ctx = unsafe { &*(se.ctx_addr as *const Ctx<'_>) };
-                            client_connection_resp(ctx)
-                        }
-                    })
-                })
-                .unwrap_or(2);
-            if eff_resp >= 3 {
-                Ok(resp_null_resp3())
+        LuaNil => Ok(resp_null_for(protocol.client)),
+        LuaValue::Boolean(b) => Ok(if protocol.script >= 3 {
+            if protocol.client >= 3 {
+                resp_bool_resp3(b)
             } else {
-                Ok(resp_null_bulk())
+                resp_integer(i64::from(b))
             }
-        }
-        LuaValue::Boolean(b) => {
-            if b {
-                Ok(resp_integer(1))
-            } else {
-                Ok(resp_null_bulk())
-            }
-        }
+        } else if b {
+            resp_integer(1)
+        } else {
+            resp_null_for(protocol.client)
+        }),
         LuaValue::Integer(n) => Ok(resp_integer(n)),
         LuaValue::Number(n) => Ok(resp_integer(n as i64)),
         LuaValue::String(s) => Ok(resp_bulk(s.as_bytes().as_ref())),
         LuaValue::Table(t) => {
-            // Effective RESP for nested replies: `redis.setresp` overrides the connection.
-            let eff_resp: u8 = SCRIPT_EVAL
-                .with(|c| {
-                    c.borrow().as_ref().map(|se| {
-                        if se.script_resp != 2 {
-                            se.script_resp
-                        } else {
-                            let ctx = unsafe { &*(se.ctx_addr as *const Ctx<'_>) };
-                            client_connection_resp(ctx)
-                        }
-                    })
-                })
-                .unwrap_or(2);
+            let eff_resp = protocol.client;
 
             // Match Redis `luaReplyToRedisReply` in script_lua.c: status/error/array slots use
             // `lua_rawget`, and numeric indices use `lua_rawget` in a loop. Metamethods must not
             // run during RESP conversion (otherwise empty tables with __index would error or run
-            // redis.call side effects).
+            // redis.call side effects). A status is looked for first: Redis
+            // looks for an error first, which differs only for a table with
+            // both, and costs every status reply a lookup more.
             if let Ok(LuaValue::String(ok_s)) = t.raw_get::<LuaValue>("ok") {
-                let st = ok_s.to_string_lossy();
-                return Ok(resp_simple(st.as_ref()));
+                // A status is one line: Redis sends its bytes as they are,
+                // with line breaks made spaces.
+                let text = ok_s.as_bytes();
+                let mut out = Vec::with_capacity(text.len() + 3);
+                out.push(b'+');
+                out.extend_from_slice(&text);
+                if memchr::memchr2(b'\r', b'\n', &out[1..]).is_some() {
+                    for byte in &mut out[1..] {
+                        if matches!(*byte, b'\r' | b'\n') {
+                            *byte = b' ';
+                        }
+                    }
+                }
+                out.extend_from_slice(b"\r\n");
+                return Ok(out);
             }
             if let Ok(LuaValue::String(err_s)) = t.raw_get::<LuaValue>("err") {
                 let st = err_s.to_string_lossy();
@@ -3124,14 +3180,15 @@ fn lua_to_resp_inner(lua: &Lua, val: LuaValue, depth: u32) -> LuaResult<Vec<u8>>
                 }
                 return Ok(resp_bulk_str(body.as_str()));
             }
-            if let Some(streamed) = lua_try_encode_singleton_chain(lua, t.clone(), depth)? {
+            if let Some(streamed) = lua_try_encode_singleton_chain(lua, t.clone(), depth, protocol)?
+            {
                 return Ok(streamed);
             }
             if let Ok(LuaValue::Table(set_inner)) = t.raw_get::<LuaValue>("set") {
                 let mut parts: Vec<Vec<u8>> = Vec::new();
                 for pair in set_inner.clone().pairs::<LuaValue, LuaValue>() {
                     let (k, _) = pair?;
-                    parts.push(lua_to_resp_inner(lua, k, next_depth)?);
+                    parts.push(lua_to_resp_inner(lua, k, next_depth, protocol)?);
                 }
                 if eff_resp >= 3 {
                     return Ok(resp_set_resp3(parts));
@@ -3142,8 +3199,8 @@ fn lua_to_resp_inner(lua: &Lua, val: LuaValue, depth: u32) -> LuaResult<Vec<u8>>
                 let mut chunks: Vec<Vec<u8>> = Vec::new();
                 for pair in map_inner.clone().pairs::<LuaValue, LuaValue>() {
                     let (k, v) = pair?;
-                    chunks.push(lua_to_resp_inner(lua, k, next_depth)?);
-                    chunks.push(lua_to_resp_inner(lua, v, next_depth)?);
+                    chunks.push(lua_to_resp_inner(lua, k, next_depth, protocol)?);
+                    chunks.push(lua_to_resp_inner(lua, v, next_depth, protocol)?);
                 }
                 if eff_resp >= 3 {
                     return Ok(resp_map(chunks));
@@ -3155,14 +3212,15 @@ fn lua_to_resp_inner(lua: &Lua, val: LuaValue, depth: u32) -> LuaResult<Vec<u8>>
             loop {
                 match t.raw_get::<LuaValue>(i) {
                     Ok(LuaNil) => break,
-                    Ok(v) => items.push(lua_to_resp_inner(lua, v, next_depth)?),
+                    Ok(v) => items.push(lua_to_resp_inner(lua, v, next_depth, protocol)?),
                     Err(e) => return Err(e),
                 }
                 i += 1;
             }
             Ok(resp_array(items))
         }
-        _ => Ok(resp_null_bulk()),
+        // Functions, coroutines and userdata: a null, as in Redis.
+        _ => Ok(resp_null_for(protocol.client)),
     }
 }
 
@@ -3394,6 +3452,14 @@ unsafe fn run_and_push(state: *mut mlua::ffi::lua_State) -> bool {
     if resp == 2 && unsafe { push_reply(state, &reply) } {
         return true;
     }
+    // Under `redis.setresp(3)` the script is a RESP3 client: a command's
+    // whole-reply null (`$-1`, `*-1`, which the dispatcher rewrites for a
+    // RESP3 connection) is RESP3's `_`, and so a Lua nil, not false.
+    let reply = if resp >= 3 {
+        crate::resp::write::resp3_normalize_null(reply)
+    } else {
+        reply
+    };
     set_aside(SetAside::Reply(reply));
     false
 }

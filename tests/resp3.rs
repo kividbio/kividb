@@ -1137,3 +1137,333 @@ fn messages_a_script_publishes_to_its_own_connection_come_after_its_reply() {
         "the script's reply, then the messages"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Lua script replies (#431)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// As Redis's `luaReplyToRedisReply` writes them: every kind of reply is shaped
+// for the client's protocol (a null is `_` to a RESP3 client, `$-1` to a RESP2
+// one). The script's own protocol (`redis.setresp`) decides only what a Lua
+// boolean is: under 2 (the default) `true` is `:1` and `false` a null; under 3
+// they are booleans, `#t`/`#f` to a RESP3 client and `:1`/`:0` to a RESP2 one.
+// The expected bytes are Redis 8's.
+
+/// `EVAL script 3 missing h z`, with `h` a hash `{f: v}` and `z` a sorted set
+/// `{m: 1.5}`; `missing` does not exist.
+#[cfg(feature = "lua")]
+fn eval_on(c: &mut RawConn, command: &str, script: &str) -> Vec<u8> {
+    c.raw(&[command, script, "3", "missing", "h", "z"])
+}
+
+#[cfg(feature = "lua")]
+fn lua_conns(port: u16) -> (RawConn, RawConn) {
+    let mut c2 = RawConn::connect(port);
+    c2.raw(&["DEL", "missing", "h", "z"]);
+    c2.raw(&["HSET", "h", "f", "v"]);
+    c2.raw(&["ZADD", "z", "1.5", "m"]);
+    let mut c3 = RawConn::connect(port);
+    c3.hello3();
+    (c2, c3)
+}
+
+/// Each script's reply to a RESP2 and to a RESP3 client, through `EVAL`.
+#[cfg(feature = "lua")]
+fn assert_lua_replies(cases: &[(&str, &[u8], &[u8])]) {
+    let port = free_port();
+    start_server(port);
+    let (mut c2, mut c3) = lua_conns(port);
+    for (script, resp2, resp3) in cases {
+        assert_wire!(
+            eval_on(&mut c2, "EVAL", script),
+            resp2,
+            format!("RESP2: {script}")
+        );
+        assert_wire!(
+            eval_on(&mut c3, "EVAL", script),
+            resp3,
+            format!("RESP3: {script}")
+        );
+    }
+}
+
+/// The issue's sequence: a script's `false`, and `redis.call`'s nil reply
+/// (false in Lua), at the top level and in a table. Celery 5.7's chord
+/// script returns `{readycount, totaldiff, size, claimed}` with `totaldiff`
+/// a `GET` of a key that is usually missing; redis-py 8 (RESP3) refused
+/// the `$-1` with `Protocol Error: b'1'`.
+#[cfg(feature = "lua")]
+#[test]
+fn a_lua_false_is_the_null_of_the_clients_protocol() {
+    assert_lua_replies(&[
+        (
+            "return {1, redis.call('GET', KEYS[1]), '3', 0}",
+            b"*4\r\n:1\r\n$-1\r\n$1\r\n3\r\n:0\r\n",
+            b"*4\r\n:1\r\n_\r\n$1\r\n3\r\n:0\r\n",
+        ),
+        ("return false", b"$-1\r\n", b"_\r\n"),
+        ("return redis.call('GET', KEYS[1])", b"$-1\r\n", b"_\r\n"),
+        ("return nil", b"$-1\r\n", b"_\r\n"),
+        ("return true", b":1\r\n", b":1\r\n"),
+        (
+            "return type(redis.call('GET', KEYS[1]))",
+            b"$7\r\nboolean\r\n",
+            b"$7\r\nboolean\r\n",
+        ),
+    ]);
+}
+
+/// A false anywhere in a table: deeper arrays, a map's value, a set's member.
+/// A nil ends an array, as it does in Redis.
+#[cfg(feature = "lua")]
+#[test]
+fn a_nested_lua_false_is_the_null_of_the_clients_protocol() {
+    assert_lua_replies(&[
+        (
+            "return {1, false, 2}",
+            b"*3\r\n:1\r\n$-1\r\n:2\r\n",
+            b"*3\r\n:1\r\n_\r\n:2\r\n",
+        ),
+        (
+            "return {true, false}",
+            b"*2\r\n:1\r\n$-1\r\n",
+            b"*2\r\n:1\r\n_\r\n",
+        ),
+        ("return {1, nil, 2}", b"*1\r\n:1\r\n", b"*1\r\n:1\r\n"),
+        (
+            "return {{false, {false}}, 'x'}",
+            b"*2\r\n*2\r\n$-1\r\n*1\r\n$-1\r\n$1\r\nx\r\n",
+            b"*2\r\n*2\r\n_\r\n*1\r\n_\r\n$1\r\nx\r\n",
+        ),
+        (
+            "return {map={a=false}}",
+            b"*2\r\n$1\r\na\r\n$-1\r\n",
+            b"%1\r\n$1\r\na\r\n_\r\n",
+        ),
+        (
+            "return {set={[false]=true}}",
+            b"*1\r\n$-1\r\n",
+            b"~1\r\n_\r\n",
+        ),
+        (
+            "return {1, redis.call}",
+            b"*2\r\n:1\r\n$-1\r\n",
+            b"*2\r\n:1\r\n_\r\n",
+        ),
+        (
+            "return redis.call('MGET', KEYS[1], KEYS[2])",
+            b"*2\r\n$-1\r\n$-1\r\n",
+            b"*2\r\n_\r\n_\r\n",
+        ),
+    ]);
+}
+
+/// Under `redis.setresp(3)` the script is a RESP3 client: `redis.call`'s
+/// null is a Lua nil (so it ends a table), a Lua boolean is a boolean, and
+/// the reply is still shaped for the client's protocol.
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_on_resp3_answers_in_the_clients_protocol() {
+    assert_lua_replies(&[
+        ("redis.setresp(3) return false", b":0\r\n", b"#f\r\n"),
+        ("redis.setresp(3) return true", b":1\r\n", b"#t\r\n"),
+        ("redis.setresp(3) return nil", b"$-1\r\n", b"_\r\n"),
+        (
+            "redis.setresp(3) return {true, false, 1}",
+            b"*3\r\n:1\r\n:0\r\n:1\r\n",
+            b"*3\r\n#t\r\n#f\r\n:1\r\n",
+        ),
+        (
+            "redis.setresp(3) return redis.call('GET', KEYS[1])",
+            b"$-1\r\n",
+            b"_\r\n",
+        ),
+        (
+            "redis.setresp(3) return type(redis.call('GET', KEYS[1]))",
+            b"$3\r\nnil\r\n",
+            b"$3\r\nnil\r\n",
+        ),
+        (
+            "redis.setresp(3) return {1, redis.call('GET', KEYS[1]), '3', 0}",
+            b"*1\r\n:1\r\n",
+            b"*1\r\n:1\r\n",
+        ),
+        (
+            "redis.setresp(3) return type(redis.call('LPOP', KEYS[1]))",
+            b"$3\r\nnil\r\n",
+            b"$3\r\nnil\r\n",
+        ),
+        (
+            "redis.setresp(3) return redis.call('HGETALL', KEYS[2])",
+            b"*2\r\n$1\r\nf\r\n$1\r\nv\r\n",
+            b"%1\r\n$1\r\nf\r\n$1\r\nv\r\n",
+        ),
+        (
+            "redis.setresp(3) return redis.call('ZSCORE', KEYS[3], 'm')",
+            b"$3\r\n1.5\r\n",
+            b",1.5\r\n",
+        ),
+        (
+            "redis.setresp(3) return {double=3.5}",
+            b"$3\r\n3.5\r\n",
+            b",3.5\r\n",
+        ),
+        (
+            "redis.setresp(3) return {map={a=1}}",
+            b"*2\r\n$1\r\na\r\n:1\r\n",
+            b"%1\r\n$1\r\na\r\n:1\r\n",
+        ),
+        (
+            "redis.setresp(3) return {set={x=true}}",
+            b"*1\r\n$1\r\nx\r\n",
+            b"~1\r\n$1\r\nx\r\n",
+        ),
+        (
+            "redis.setresp(3) redis.setresp(2) return {1, redis.call('GET', KEYS[1]), false}",
+            b"*3\r\n:1\r\n$-1\r\n$-1\r\n",
+            b"*3\r\n:1\r\n_\r\n_\r\n",
+        ),
+    ]);
+}
+
+/// Error and status tables; a status is one line.
+#[cfg(feature = "lua")]
+#[test]
+fn lua_error_and_status_tables_are_written_as_in_redis() {
+    assert_lua_replies(&[
+        ("return {err='boom'}", b"-boom\r\n", b"-boom\r\n"),
+        ("return {ok='fine'}", b"+fine\r\n", b"+fine\r\n"),
+        (
+            "return {1, {err='inner'}}",
+            b"*2\r\n:1\r\n-inner\r\n",
+            b"*2\r\n:1\r\n-inner\r\n",
+        ),
+        ("return {ok='a\\r\\nb'}", b"+a  b\r\n", b"+a  b\r\n"),
+        (
+            "redis.setresp(3) return {err='boom'}",
+            b"-boom\r\n",
+            b"-boom\r\n",
+        ),
+    ]);
+}
+
+/// Typed tables are shaped for the client's protocol, whatever the script's.
+#[cfg(feature = "lua")]
+#[test]
+fn lua_typed_tables_are_shaped_for_the_clients_protocol() {
+    assert_lua_replies(&[
+        ("return {double=3.5}", b"$3\r\n3.5\r\n", b",3.5\r\n"),
+        (
+            "return {big_number='12345678901234567890'}",
+            b"$20\r\n12345678901234567890\r\n",
+            b"(12345678901234567890\r\n",
+        ),
+        (
+            "return {verbatim_string={format='txt', string='hi'}}",
+            b"$2\r\nhi\r\n",
+            b"=6\r\ntxt:hi\r\n",
+        ),
+        (
+            "return {map={a=1}}",
+            b"*2\r\n$1\r\na\r\n:1\r\n",
+            b"%1\r\n$1\r\na\r\n:1\r\n",
+        ),
+        (
+            "return {set={x=true}}",
+            b"*1\r\n$1\r\nx\r\n",
+            b"~1\r\n$1\r\nx\r\n",
+        ),
+        (
+            "redis.setresp(3) return {big_number='12345678901234567890'}",
+            b"$20\r\n12345678901234567890\r\n",
+            b"(12345678901234567890\r\n",
+        ),
+        (
+            "redis.setresp(3) return {verbatim_string={format='txt', string='hi'}}",
+            b"$2\r\nhi\r\n",
+            b"=6\r\ntxt:hi\r\n",
+        ),
+    ]);
+}
+
+/// `EVAL_RO`, `EVALSHA`, `FCALL`, `FCALL_RO` and a script in a transaction
+/// go through the same conversion.
+#[cfg(feature = "lua")]
+#[test]
+fn every_way_of_running_a_script_sends_its_false_in_the_clients_protocol() {
+    let port = free_port();
+    start_server(port);
+    let (mut c2, mut c3) = lua_conns(port);
+    let table = "return {1, redis.call('GET', KEYS[1]), '3', 0}";
+    let resp2: &[u8] = b"*4\r\n:1\r\n$-1\r\n$1\r\n3\r\n:0\r\n";
+    let resp3: &[u8] = b"*4\r\n:1\r\n_\r\n$1\r\n3\r\n:0\r\n";
+
+    assert_wire!(eval_on(&mut c2, "EVAL_RO", table), resp2, "RESP2 EVAL_RO");
+    assert_wire!(eval_on(&mut c3, "EVAL_RO", table), resp3, "RESP3 EVAL_RO");
+
+    let loaded = c2.raw(&["SCRIPT", "LOAD", table]);
+    let sha = String::from_utf8_lossy(&loaded)
+        .split("\r\n")
+        .nth(1)
+        .unwrap()
+        .to_string();
+    assert_wire!(eval_on(&mut c2, "EVALSHA", &sha), resp2, "RESP2 EVALSHA");
+    assert_wire!(eval_on(&mut c3, "EVALSHA", &sha), resp3, "RESP3 EVALSHA");
+    assert_wire!(
+        eval_on(&mut c2, "EVALSHA_RO", &sha),
+        resp2,
+        "RESP2 EVALSHA_RO"
+    );
+    assert_wire!(
+        eval_on(&mut c3, "EVALSHA_RO", &sha),
+        resp3,
+        "RESP3 EVALSHA_RO"
+    );
+
+    let lib = "#!lua name=resp3_false_431\n\
+               redis.register_function('f431_table', function(k, a) return {1, redis.call('GET', k[1]), '3', 0} end)\n\
+               redis.register_function('f431_false', function(k, a) return false end)\n\
+               redis.register_function{function_name='f431_ro', callback=function(k, a) return redis.call('GET', k[1]) end, flags={'no-writes'}}\n\
+               redis.register_function('f431_s3', function(k, a) redis.setresp(3) return {true, false, redis.call('GET', k[1])} end)\n";
+    assert_wire!(
+        c2.raw(&["FUNCTION", "LOAD", "REPLACE", lib]),
+        b"$15\r\nresp3_false_431\r\n",
+        "FUNCTION LOAD"
+    );
+    for (args, want2, want3) in [
+        (["FCALL", "f431_table"], resp2, resp3),
+        (["FCALL", "f431_false"], &b"$-1\r\n"[..], &b"_\r\n"[..]),
+        (["FCALL", "f431_ro"], &b"$-1\r\n"[..], &b"_\r\n"[..]),
+        (["FCALL_RO", "f431_ro"], &b"$-1\r\n"[..], &b"_\r\n"[..]),
+        (
+            ["FCALL", "f431_s3"],
+            &b"*2\r\n:1\r\n:0\r\n"[..],
+            &b"*2\r\n#t\r\n#f\r\n"[..],
+        ),
+    ] {
+        let cmd = [args[0], args[1], "1", "missing"];
+        assert_wire!(c2.raw(&cmd), want2, format!("RESP2 {}", args.join(" ")));
+        assert_wire!(c3.raw(&cmd), want3, format!("RESP3 {}", args.join(" ")));
+    }
+    c2.raw(&["FUNCTION", "DELETE", "resp3_false_431"]);
+
+    for (c, want) in [
+        (
+            &mut c2,
+            &b"*2\r\n$-1\r\n*4\r\n:1\r\n$-1\r\n$1\r\n3\r\n:0\r\n"[..],
+        ),
+        (
+            &mut c3,
+            &b"*2\r\n_\r\n*4\r\n:1\r\n_\r\n$1\r\n3\r\n:0\r\n"[..],
+        ),
+    ] {
+        assert_wire!(c.raw(&["MULTI"]), b"+OK\r\n", "MULTI");
+        assert_wire!(
+            c.raw(&["EVAL", "return false", "0"]),
+            b"+QUEUED\r\n",
+            "queued"
+        );
+        assert_wire!(eval_on(c, "EVAL", table), b"+QUEUED\r\n", "queued");
+        assert_wire!(c.raw(&["EXEC"]), want, "EXEC of scripts");
+    }
+}

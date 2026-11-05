@@ -80,21 +80,27 @@ impl ClientExecEnv {
         owned_cmd: Vec<Vec<u8>>,
         selected_db: usize,
         aof_enabled: bool,
+        client_resp: u8,
     ) -> (Vec<u8>, usize) {
         let cmd_refs: Vec<&[u8]> = owned_cmd.iter().map(|v| v.as_slice()).collect();
-        self.run_execute_borrowed(cmd_refs, selected_db, aof_enabled)
+        self.run_execute_borrowed(cmd_refs, selected_db, aof_enabled, client_resp)
     }
 
     /// [`Self::run_execute`] on the caller's own thread, where the command
     /// can be used where it lies.
+    ///
+    /// `client_resp` is the protocol the client speaks: the command's `Ctx`
+    /// says RESP2, which is what the commands a script calls must see, so
+    /// the script's reply is shaped by this instead (`lua::with_client_resp`).
     pub(crate) fn run_execute_borrowed(
         &self,
         cmd_refs: Vec<&[u8]>,
         selected_db: usize,
         aof_enabled: bool,
+        client_resp: u8,
     ) -> (Vec<u8>, usize) {
         let mut db = selected_db;
-        let out = execute_command(Ctx {
+        let ctx = Ctx {
             cmd: cmd_refs,
             store: &self.store,
             lastsave: &self.lastsave,
@@ -113,7 +119,9 @@ impl ClientExecEnv {
             watch_registry: self.watch_registry.as_ref(),
             client_id: self.client_id,
             client_registry: &self.client_registry,
-            // Result is converted to a Lua value, never sent over the wire as-is.
+            // What the commands a script calls see: Redis runs scripts on
+            // RESP2 until `redis.setresp`. The script's reply is written in
+            // `client_resp`.
             resp: 2,
             acl_store: &self.acl_store,
             acl_log: &self.acl_log,
@@ -129,7 +137,8 @@ impl ClientExecEnv {
             authenticated_user: &self.authenticated_user,
             tracking_table: &self.tracking_table,
             blocking: None,
-        });
+        };
+        let out = crate::commands::with_client_resp(client_resp, || execute_command(ctx));
         (out, db)
     }
 }
@@ -241,6 +250,7 @@ struct Job {
     cmd: Vec<Vec<u8>>,
     db: usize,
     aof_enabled: bool,
+    client_resp: u8,
     key: u64,
 }
 
@@ -256,9 +266,9 @@ fn resp_error(message: &str) -> Vec<u8> {
 #[cfg(feature = "lua")]
 impl Job {
     fn run(self) -> Done {
-        let (key, db, aof_enabled) = (self.key, self.db, self.aof_enabled);
+        let (key, db, aof_enabled, resp) = (self.key, self.db, self.aof_enabled, self.client_resp);
         let (env, cmd) = (self.env, self.cmd);
-        ran_quick(key, db, move || env.run_execute(cmd, db, aof_enabled))
+        ran_quick(key, db, move || env.run_execute(cmd, db, aof_enabled, resp))
     }
 }
 
@@ -413,6 +423,7 @@ pub(crate) async fn run_lua_vm_blocking(
     selected_db: &mut usize,
     env: &ClientExecEnv,
     aof_enabled: bool,
+    client_resp: u8,
 ) -> (Vec<u8>, u64) {
     let key = script_key(cmd);
     let sel = *selected_db;
@@ -435,7 +446,7 @@ pub(crate) async fn run_lua_vm_blocking(
             let _turn = crate::tag_locks::script_turn(tag).await;
             crate::tag_locks::allow_next_script();
             let (resp, sel_out, elapsed_us) = ran_quick(key, sel, || {
-                env.run_execute_borrowed(cmd.to_vec(), sel, aof_enabled)
+                env.run_execute_borrowed(cmd.to_vec(), sel, aof_enabled, client_resp)
             });
             // Not left for another script if this one was turned away
             // before it got as far as asking.
@@ -448,7 +459,7 @@ pub(crate) async fn run_lua_vm_blocking(
             // where it lies.
             Some(turn) => {
                 let done = ran_quick(key, sel, || {
-                    env.run_execute_borrowed(cmd.to_vec(), sel, aof_enabled)
+                    env.run_execute_borrowed(cmd.to_vec(), sel, aof_enabled, client_resp)
                 });
                 drop(turn);
                 done
@@ -464,6 +475,7 @@ pub(crate) async fn run_lua_vm_blocking(
                     cmd: owned(),
                     db: sel,
                     aof_enabled,
+                    client_resp,
                     key,
                 };
                 let (reply, done) = tokio::sync::oneshot::channel();
@@ -480,7 +492,7 @@ pub(crate) async fn run_lua_vm_blocking(
     let env = env.clone();
     let (resp, sel_out, elapsed_us, ran_us) = tokio::task::spawn_blocking(move || {
         let t0 = std::time::Instant::now();
-        let (r, db) = env.run_execute(owned, sel, aof_enabled);
+        let (r, db) = env.run_execute(owned, sel, aof_enabled, client_resp);
         let elapsed_us = t0.elapsed().as_micros() as u64;
         (r, db, elapsed_us, crate::commands::take_last_vm_run_us())
     })
