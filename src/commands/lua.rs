@@ -941,7 +941,8 @@ pub(crate) fn script_min_replicas_gate(ctx: &Ctx<'_>, cmd0: &[u8]) -> Option<Vec
             return Some(resp_error(replication::NOREPLICAS));
         };
         // A write only by argument (GEORADIUS ... STORE, MIGRATE) counts as a
-        // write for the min-replicas gate too, judged by the whole command.
+        // write for the min-replicas gate too, judged by the whole command;
+        // `SELECT` does not (`refused_without_replicas`).
         let mut upper = [0u8; 32];
         let name = if cmd0.len() <= 32 {
             for (i, &b) in cmd0.iter().enumerate() {
@@ -951,7 +952,7 @@ pub(crate) fn script_min_replicas_gate(ctx: &Ctx<'_>, cmd0: &[u8]) -> Option<Vec
         } else {
             ""
         };
-        let is_write = replication::command_mutates_for_replication(name, ctx.cmd.as_slice());
+        let is_write = replication::refused_without_replicas(name, ctx.cmd.as_slice());
         let block = if s.had_shebang && !s.no_writes_flag {
             true
         } else {

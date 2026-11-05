@@ -2676,11 +2676,13 @@ const FAST_COMMANDS: &[&str] = &[
 /// only (#392).
 fn is_acl_write(name: &str) -> bool {
     (crate::replication::is_write_command(name) && name != "SELECT")
-        // Writes only with some arguments, but Redis flags them `write` and
-        // puts them in `@write` (not `@read`) regardless, as can-write; the
-        // per-key and runtime checks look at the arguments.
-        || matches!(name, "GEORADIUS" | "GEORADIUSBYMEMBER" | "MIGRATE")
+        || WRITES_BY_ARGUMENT.contains(&name)
 }
+
+/// Writes only with some arguments, but Redis flags them `write` and puts
+/// them in `@write` (not `@read`) regardless, as can-write; the per-key and
+/// runtime checks look at the arguments.
+const WRITES_BY_ARGUMENT: [&str; 3] = ["GEORADIUS", "GEORADIUSBYMEMBER", "MIGRATE"];
 
 /// The categories in [`ACL_CATEGORIES`] that Redis does not have. They
 /// can be granted like any other, and `COMMAND INFO` leaves them out.
@@ -3227,12 +3229,19 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
         // gate replica read-only enforcement (`replication::is_write_command`)
         // — reusing it here keeps `-@write`/`+@write` consistent with that
         // check instead of maintaining a second, independently-drifting list.
+        //
+        // Rebuilt for every rule a command is checked against, so the
+        // commands that are writes only by argument ([`is_acl_write`]) are
+        // added once rather than tested for at every entry.
         "write" => {
-            let mut cmds: Vec<&'static str> = ALL_COMMANDS
-                .iter()
-                .copied()
-                .filter(|c| is_acl_write(c))
-                .collect();
+            let mut cmds: Vec<&'static str> = Vec::with_capacity(ALL_COMMANDS.len() + 7);
+            cmds.extend(
+                ALL_COMMANDS
+                    .iter()
+                    .copied()
+                    .filter(|c| crate::replication::is_write_command(c) && *c != "SELECT"),
+            );
+            cmds.extend_from_slice(&WRITES_BY_ARGUMENT);
             // FUNCTION's loading subcommands write (the container as a whole
             // names no key, and FUNCTION LIST / DUMP / STATS read), as Redis
             // places `function|load` etc. in `@write`.
@@ -3267,10 +3276,15 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
             ]
             .iter()
             .flat_map(|cat| acl_cat_commands(cat).unwrap_or_default())
-            .filter(|c| !is_acl_write(c))
+            .filter(|c| !crate::replication::is_write_command(c))
             .collect();
             cmds.sort_unstable();
             cmds.dedup();
+            for write in WRITES_BY_ARGUMENT {
+                if let Ok(at) = cmds.binary_search(&write) {
+                    cmds.remove(at);
+                }
+            }
             cmds
         }
         _ => return None,

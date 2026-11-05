@@ -1835,6 +1835,61 @@ fn a_master_without_enough_good_replicas_refuses_writes() {
     );
 }
 
+/// What `min-replicas-to-write` refuses is judged by the arguments, as Redis
+/// judges it by the `write` flag. `GEORADIUS ... STORE` and `STOREDIST`
+/// write, and are refused, alone and in a transaction; `GEORADIUS` without
+/// them reads. `SELECT` and `SCRIPT LOAD` / `FLUSH` are propagated but are
+/// not writes: they run, alone and in a transaction, as in Redis.
+#[test]
+fn min_replicas_judges_writes_by_their_arguments() {
+    let port = free_port();
+    start_server(port);
+    let mut m = Conn::connect(port);
+    m.cmds(&["GEOADD", "src", "13.361389", "38.115556", "palermo"]);
+    assert!(
+        m.cmds(&["CONFIG", "SET", "min-replicas-to-write", "1"])
+            .is_ok()
+    );
+
+    let stored = m.cmds(&["GEORADIUS", "src", "15", "37", "200", "km", "STORE", "dst"]);
+    assert!(error_of(&stored).starts_with("NOREPLICAS"), "{stored:?}");
+    let dist = m.cmds(&[
+        "GEORADIUSBYMEMBER",
+        "src",
+        "palermo",
+        "200",
+        "km",
+        "STOREDIST",
+        "dst",
+    ]);
+    assert!(error_of(&dist).starts_with("NOREPLICAS"), "{dist:?}");
+    assert!(m.cmds(&["MULTI"]).is_ok());
+    m.cmds(&["GEORADIUS", "src", "15", "37", "200", "km", "STORE", "dst"]);
+    let exec = m.cmds(&["EXEC"]);
+    assert!(error_of(&exec).starts_with("EXECABORT"), "{exec:?}");
+    assert_eq!(m.cmds(&["EXISTS", "dst"]).as_int(), 0);
+    let read = m.cmds(&["GEORADIUS", "src", "15", "37", "200", "km"]);
+    assert_eq!(read.as_array().len(), 1, "{read:?}");
+
+    #[cfg(feature = "lua")]
+    {
+        let sha = m.cmds(&["SCRIPT", "LOAD", "return 1"]);
+        assert!(!matches!(sha, RespValue::Error(_)), "SCRIPT LOAD: {sha:?}");
+        assert_eq!(sha.as_str().len(), 40);
+        assert!(m.cmds(&["MULTI"]).is_ok());
+        m.cmds(&["SCRIPT", "LOAD", "return 2"]);
+        let exec = m.cmds(&["EXEC"]);
+        assert!(
+            !matches!(exec, RespValue::Error(_)),
+            "MULTI SCRIPT LOAD: {exec:?}"
+        );
+        assert_eq!(exec.as_array().len(), 1);
+        assert!(m.cmds(&["SCRIPT", "FLUSH"]).is_ok());
+    }
+    assert!(m.cmds(&["SELECT", "1"]).is_ok());
+    assert!(m.cmds(&["SELECT", "0"]).is_ok());
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // PROMOTION DURING A FULL SYNC
 // ═════════════════════════════════════════════════════════════════════════════

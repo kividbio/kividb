@@ -99,18 +99,22 @@ pub fn exec_refusal(
             };
             let parts: Vec<&[u8]> = queued.iter().map(Vec::as_slice).collect();
             let name = String::from_utf8_lossy(cmd0).to_ascii_uppercase();
-            crate::replication::command_mutates_for_replication(&name, &parts)
+            crate::replication::refused_without_replicas(&name, &parts)
         })
     };
+    // `no_room` asks `check_memory_limit` first; asked here, before the
+    // queue is looked at, an EXEC under the limit makes nothing per command.
     let why = if busy(cmd) {
         BUSY
-    } else if queue.iter().any(|queued| {
-        let Some(cmd0) = queued.first() else {
-            return false;
-        };
-        let parts: Vec<&[u8]> = queued.iter().map(Vec::as_slice).collect();
-        no_room(&String::from_utf8_lossy(cmd0).to_ascii_uppercase(), &parts)
-    }) {
+    } else if crate::commands::handler::check_memory_limit()
+        && queue.iter().any(|queued| {
+            let Some(cmd0) = queued.first() else {
+                return false;
+            };
+            let parts: Vec<&[u8]> = queued.iter().map(Vec::as_slice).collect();
+            no_room(&String::from_utf8_lossy(cmd0).to_ascii_uppercase(), &parts)
+        })
+    {
         OOM
     } else if repl_state.lacks_good_replicas() && writes() {
         crate::replication::NOREPLICAS

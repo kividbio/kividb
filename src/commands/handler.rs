@@ -434,14 +434,15 @@ fn keys_of_several_shards(
     db: usize,
     name: &str,
     cmd: &[&[u8]],
-    cmd0: &[u8],
 ) -> bool {
     // `key_positions` is a long match on the name: the writes that name one
     // key are told apart first.
     if cmd.len() < 3
         || matches!(name, "MSET" | "MSETNX")
         || one_key_write(name)
-        || !replication::is_write_command_bytes(cmd0)
+        // By the arguments: `GEORADIUS ... STORE` writes. (`MIGRATE` skips
+        // the gate before this is asked: `command_gate::skips`.)
+        || !replication::command_mutates_for_replication(name, cmd)
     {
         return false;
     }
@@ -485,7 +486,7 @@ fn takes_the_gate_alone(
         // One argument is at most one key (`DEL k`, `INCR k`): asked here,
         // and the rest out of line, so that what every command runs through
         // stays small.
-        || (cmd.len() >= 3 && keys_of_several_shards(store, db, name, cmd, cmd[0]))
+        || (cmd.len() >= 3 && keys_of_several_shards(store, db, name, cmd))
 }
 
 /// The writes of one key, and so of one shard, made most: told apart by
@@ -1107,7 +1108,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
             "EVAL" | "EVALSHA" | "EVAL_RO" | "EVALSHA_RO" | "FCALL" | "FCALL_RO"
         )
         && !crate::command_gate::alone_on_this_thread()
-        && replication::command_mutates_for_replication(name, &ctx.cmd)
+        && replication::refused_without_replicas(name, &ctx.cmd)
         && ctx.repl_state.lacks_good_replicas()
     {
         return resp_error(replication::NOREPLICAS);

@@ -3964,6 +3964,16 @@ pub fn command_mutates_for_replication(name: &str, cmd: &[&[u8]]) -> bool {
     }
 }
 
+/// Whether `min-replicas-to-write` refuses a command: one that changes the
+/// dataset, judged by its arguments ([`command_mutates_for_replication`]),
+/// as Redis judges it by its `write` flag. Not `SELECT` (#411) or `SCRIPT`:
+/// both are propagated, but neither is flagged a write in Redis, which runs
+/// them without good replicas.
+#[inline]
+pub fn refused_without_replicas(name: &str, cmd: &[&[u8]]) -> bool {
+    !matches!(name, "SELECT" | "SCRIPT") && command_mutates_for_replication(name, cmd)
+}
+
 /// Write commands blocked inside an `EVAL_RO` / `EVALSHA_RO` script (`redis.call`).
 #[inline]
 pub fn inner_command_blocked_in_readonly_script(name: &str, cmd: &[&[u8]]) -> bool {
