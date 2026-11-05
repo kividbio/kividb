@@ -411,7 +411,9 @@ pub fn wait_out_handoff() {
 /// With all clients paused, every command waits — but for `CLIENT UNPAUSE`,
 /// which Redis holds too: there, a pause of everything can only run out.
 /// With only writers paused, the commands that wait are the ones that may
-/// change the dataset or the replication stream: writes, `PFCOUNT` (which
+/// change the dataset or the replication stream: writes (not `SELECT`,
+/// which writes nothing and is held back from the stream meanwhile,
+/// `replication::replicate_one_write`: #411), `PFCOUNT` (which
 /// may rewrite its key), `PUBLISH`, a script that has not declared itself
 /// free of writes, and an `EXEC` of a transaction holding any of those. A
 /// command that writes only with some of its arguments (`GEORADIUS …
@@ -479,6 +481,8 @@ fn may_replicate(name: &str, cmd: &[&[u8]]) -> bool {
     let declared_read_only = |_: &str, _: &[u8]| false;
     match name {
         "PFCOUNT" | "PUBLISH" | "SPUBLISH" => true,
+        // Propagated, but writes nothing (#411).
+        "SELECT" => false,
         "EVAL" | "EVALSHA" | "FCALL" => !cmd
             .get(1)
             .copied()
@@ -587,6 +591,21 @@ mod tests {
             &[b"MIGRATE", b"127.0.0.1", b"6379", b"k", b"0", b"1000"],
             none
         ));
+        // `SELECT` is propagated, but writes nothing: it is not held, alone
+        // or in a transaction, nor is a transaction refused for it during a
+        // handoff (`queued_may_replicate`, #411).
+        assert!(!holds(&[b"SELECT", b"1"], none));
+        let select_and_read = vec![
+            vec![b"SELECT".to_vec(), b"1".to_vec()],
+            vec![b"GET".to_vec(), b"k".to_vec()],
+        ];
+        assert!(!holds(&[b"EXEC"], &select_and_read));
+        assert!(!select_and_read.iter().any(|c| queued_may_replicate(c)));
+        let select_and_write = vec![
+            vec![b"SELECT".to_vec(), b"1".to_vec()],
+            vec![b"SET".to_vec(), b"k".to_vec(), b"v".to_vec()],
+        ];
+        assert!(holds(&[b"EXEC"], &select_and_write));
         clear_pause();
         assert!(!holds(&[b"SET", b"k", b"v"], none));
 

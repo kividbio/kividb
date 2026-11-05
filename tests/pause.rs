@@ -199,6 +199,96 @@ fn client_unblock_after_unpause_finds_the_held_client_blocked() {
     assert!(started.elapsed() < Duration::from_millis(50));
 }
 
+/// The `INFO replication` field `field` of `c`.
+fn repl_field(c: &mut Conn, field: &str) -> String {
+    let V::Bulk(info) = c.cmd(&["INFO", "replication"]) else {
+        panic!("INFO is a bulk string");
+    };
+    String::from_utf8(info)
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix(&format!("{field}:")).map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// `SELECT` writes nothing, and `CLIENT PAUSE WRITE` does not hold it, as
+/// in Redis (#411): it, and a transaction that only selects and reads, are
+/// answered at once. Nor does it move the replication offset while writes
+/// are paused: a write after the pause still reaches the replica in the
+/// database selected.
+#[test]
+fn client_pause_write_does_not_hold_select() {
+    let _one = one_pause_at_a_time();
+    let mut c = start_server();
+    let port = c.stream.peer_addr().unwrap().port();
+    // No PING of the replicas to move the offset meanwhile.
+    c.ok(&["CONFIG", "SET", "repl-ping-replica-period", "3600"]);
+    let replica_port = free_port();
+    thread::spawn(move || {
+        let config = kividb::config::Config {
+            port: replica_port,
+            bind: "127.0.0.1".to_string(),
+            threads: 2,
+            databases: 16,
+            loglevel: "error".to_string(),
+            io_model: kividb::config::IoModel::Tokio,
+            replicaof: Some(vec!["127.0.0.1".to_string(), port.to_string()]),
+            replica_announced_port: replica_port,
+            configfile: "./kividb.conf".to_string(),
+            ..Default::default()
+        };
+        kividb::run_for_test(config);
+    });
+    let mut replica = Conn::connect(replica_port);
+    c.ok(&["SET", "a", "1"]);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while replica.cmd(&["GET", "a"]) != V::Bulk(b"1".to_vec()) {
+        assert!(Instant::now() < deadline, "the replica never caught up");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let mut other = Conn::connect(port);
+    let mut writer = Conn::connect(port);
+    c.ok(&["CLIENT", "PAUSE", "5000", "WRITE"]);
+    // Read once writes are paused: nothing may move it from here on.
+    let offset = repl_field(&mut c, "master_repl_offset");
+    let started = Instant::now();
+    other.ok(&["SELECT", "1"]);
+    assert_eq!(other.cmd(&["GET", "a"]), V::Nil);
+    other.ok(&["MULTI"]);
+    assert_eq!(other.cmd(&["SELECT", "2"]), V::Simple("QUEUED".into()));
+    assert_eq!(other.cmd(&["GET", "a"]), V::Simple("QUEUED".into()));
+    assert_eq!(
+        other.cmd(&["EXEC"]),
+        V::Array(vec![V::Simple("OK".into()), V::Nil])
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "SELECT was held for {:?}",
+        started.elapsed()
+    );
+    assert_eq!(repl_field(&mut c, "master_repl_offset"), offset);
+    // A write is still held.
+    writer
+        .stream
+        .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n1\r\n")
+        .unwrap();
+    wait_blocked(&mut c, 1);
+    c.ok(&["CLIENT", "UNPAUSE"]);
+    assert_eq!(writer.read(), V::Simple("OK".into()));
+
+    // In database 2, where `other` is now.
+    other.ok(&["SET", "c", "2"]);
+    replica.ok(&["SELECT", "2"]);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while replica.cmd(&["GET", "c"]) != V::Bulk(b"2".to_vec()) {
+        assert!(Instant::now() < deadline, "SET c never reached db 2");
+        thread::sleep(Duration::from_millis(20));
+    }
+    replica.ok(&["SELECT", "0"]);
+    assert_eq!(replica.cmd(&["GET", "c"]), V::Nil);
+}
+
 /// A pause of writers holds `GEORADIUS … STORE` and `GEORADIUSBYMEMBER …
 /// STOREDIST`, alone and in a transaction, as Redis does (#407). They were
 /// judged by their names, a read's, and ran: a failover that pauses writes

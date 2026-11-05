@@ -46,6 +46,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`lua-parallel-scripts`) can't make that first switch, and its `SELECT`
   of another database is refused until a client has selected one (#423).
 
+- **`SELECT` is no longer refused or held as a write.** Past `maxmemory`
+  under `noeviction` it was refused with `OOM`, a master without enough
+  good replicas (`min-replicas-to-write`) refused it with `NOREPLICAS`, and
+  `CLIENT PAUSE WRITE` held it until the pause ended, and with it a
+  transaction that only selected a database and read. `SELECT` is sent to
+  replicas and the AOF, so that they follow the switch of database, but it
+  writes nothing: as in Redis, it now runs in all three cases. While writes
+  are paused it is kept out of the replication stream and the AOF, which
+  keeps the offset still for a failover; the next write in another database
+  carries its own `SELECT` (#411).
+
 - **A sorted set with a NaN score is refused when it is restored or
   loaded.** No command makes one, but `RESTORE` of a crafted payload took
   one, and so did loading a snapshot, the AOF's preamble, a full sync from a

@@ -1116,7 +1116,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
             "EVAL" | "EVALSHA" | "EVAL_RO" | "EVALSHA_RO" | "FCALL" | "FCALL_RO"
         )
         && !crate::command_gate::alone_on_this_thread()
-        && replication::is_write_command_bytes(name.as_bytes())
+        && replication::is_data_write(name)
         && ctx.repl_state.lacks_good_replicas()
     {
         return resp_error(replication::NOREPLICAS);

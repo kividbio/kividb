@@ -2675,7 +2675,7 @@ const FAST_COMMANDS: &[&str] = &[
 /// sent it to follow the database, and Redis has it in `@fast @connection`
 /// only (#392).
 fn is_acl_write(name: &str) -> bool {
-    crate::replication::is_write_command(name) && name != "SELECT"
+    crate::replication::is_data_write(name)
 }
 
 /// The categories in [`ACL_CATEGORIES`] that Redis does not have. They
