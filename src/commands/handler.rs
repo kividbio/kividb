@@ -618,6 +618,24 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
         if let Some(outside) = outside {
             return resp_error(&outside);
         }
+        // Nor may it be the first to select a database other than 0. That
+        // switches every write to carrying its own `SELECT`, and has to wait
+        // out the writes on their way without one first: a cut, which a
+        // script cannot take beside others, in the write gate. Without it, a
+        // database-0 write could be sent after the script's `SELECT`, and be
+        // applied in that database by a replica and a replay of the AOF
+        // (#423). A client's `SELECT` makes the switch, once, before its gate.
+        if name2 == "SELECT"
+            && crate::tag_locks::beside_others()
+            && let Some(db) = makes_the_switch(ctx)
+        {
+            return resp_error(&format!(
+                "ERR Script attempted to SELECT {db}, the first database other than 0 \
+                 selected on this server, while running beside other scripts under the hash \
+                 tag '{}' of its KEYS (lua-parallel-scripts)",
+                crate::tag_locks::script_tag_for_message()
+            ));
+        }
     }
 
     if read_only_script && replication::inner_command_blocked_in_readonly_script(name2, &ctx.cmd) {
@@ -1652,15 +1670,22 @@ pub(crate) fn apply_write_side_effects(ctx: &Ctx, name: &str, result: &[u8]) {
 #[cold]
 #[inline(never)]
 fn first_select_of_another_database(ctx: &Ctx) {
-    if ctx.repl_state.several_databases.load(Ordering::Relaxed) || ctx.cmd.len() != 2 {
-        return;
-    }
-    let db = std::str::from_utf8(ctx.cmd[1])
-        .ok()
-        .and_then(|db| db.parse::<usize>().ok());
-    if let Some(db) = db.filter(|db| *db < ctx.config.databases) {
+    if let Some(db) = makes_the_switch(ctx) {
         ctx.repl_state.note_database_selected(db);
     }
+}
+
+/// The database a `SELECT` (`ctx.cmd`) selects if it is the one that
+/// switches the server to writes that carry their own `SELECT`: a valid
+/// `SELECT` of a database other than 0, with that switch not made yet.
+fn makes_the_switch(ctx: &Ctx) -> Option<usize> {
+    if ctx.repl_state.several_databases.load(Ordering::Relaxed) || ctx.cmd.len() != 2 {
+        return None;
+    }
+    std::str::from_utf8(ctx.cmd[1])
+        .ok()
+        .and_then(|db| db.parse::<usize>().ok())
+        .filter(|db| *db != 0 && *db < ctx.config.databases)
 }
 
 /// Whether a write's reply says it changed nothing: `SET ... NX` on a key

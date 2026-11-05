@@ -1789,30 +1789,29 @@ fn keys_of_db(c: &mut Conn, db: &str) -> Vec<String> {
 /// `SELECT 3` went out ahead of the write, and the replica and a replay of
 /// the AOF applied that write in database 3. The test hook holds the write
 /// between being encoded and being queued.
-#[test]
-fn a_write_on_its_way_when_a_client_first_selects_another_database_stays_in_db_0() {
-    let mut master =
-        Server::start_with_env(&["--aof"], &[("KIVIDB_TEST_BARE_WRITE_DELAY_MS", "1500")]);
+fn a_write_on_its_way_at_the_first_select(extra: &[&str]) {
+    let args: Vec<&str> = ["--aof"].iter().chain(extra).copied().collect();
+    let mut master = Server::start_with_env(&args, &[("KIVIDB_TEST_BARE_WRITE_DELAY_MS", "1500")]);
     let port = master.port.to_string();
     let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
     let mut r = replica.conn();
     wait_link_up(&mut r);
     let mut m = master.conn();
-    // The first write after the replica came goes out with a `SELECT 0`;
-    // the stream is in database 0 after it, and the next is bare.
-    let started = Instant::now();
     assert!(m.cmd(&["SET", "first", "0"]).ok());
-    assert!(
-        started.elapsed() < Duration::from_millis(1000),
-        "the first write was held: the stream was in database 0 already"
-    );
 
     let mut a = master.conn();
     let mut b = master.conn();
-    send_only(&mut b, &["SET", "j", "0"]);
+    let started = Instant::now();
+    send_only(&mut b, &["SET", "delayed:j", "0"]);
     std::thread::sleep(Duration::from_millis(300));
     send_only(&mut a, &["SELECT", "3"]);
     assert!(b.read().ok());
+    // It was the write held: the window was there.
+    assert!(
+        started.elapsed() >= Duration::from_millis(1000),
+        "SET delayed:j was not held ({:?})",
+        started.elapsed()
+    );
     assert!(a.read().ok());
     assert!(a.cmd(&["SET", "k", "3"]).ok());
     assert!(b.cmd(&["SET", "j2", "0"]).ok());
@@ -1823,7 +1822,7 @@ fn a_write_on_its_way_when_a_client_first_selects_another_database_stays_in_db_0
             .parse::<u64>()
             .is_ok_and(|applied| applied >= offset)
     });
-    let db0 = ["first", "j", "j2"].map(String::from).to_vec();
+    let db0 = ["delayed:j", "first", "j2"].map(String::from).to_vec();
     assert_eq!(keys_of_db(&mut r, "3"), ["k"], "{}", replica.log());
     assert_eq!(keys_of_db(&mut r, "0"), db0);
 
@@ -1831,8 +1830,119 @@ fn a_write_on_its_way_when_a_client_first_selects_another_database_stays_in_db_0
     assert_eq!(b.cmd(&["WAITAOF", "1", "0", "5000"]).arr()[0].i(), 1);
     drop((m, a, b));
     master.kill();
+    // An io_uring listener can outlive its process a moment.
+    wait_until("the port to be let go", || port_is_free(master.port));
     master.restart();
     let mut m = master.conn();
     assert_eq!(keys_of_db(&mut m, "3"), ["k"], "{}", master.log());
     assert_eq!(keys_of_db(&mut m, "0"), db0);
+}
+
+#[test]
+fn a_write_on_its_way_when_a_client_first_selects_another_database_stays_in_db_0() {
+    a_write_on_its_way_at_the_first_select(&[]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_write_on_its_way_when_a_client_first_selects_another_database_stays_in_db_0_on_io_uring() {
+    a_write_on_its_way_at_the_first_select(&["--io-model", "uring"]);
+}
+
+/// A key of another database evicted before any client has left database
+/// 0 leaves the stream in database 0 (#423). Such a key is there by `MOVE`
+/// (or `COPY ... DB`, `SWAPDB`, a dataset loaded) with no `SELECT` from any
+/// client. Its `DEL` was sent as `SELECT 3` and `DEL`, with the stream then
+/// taken to be in 3, so a database-0 write on its way went after it and was
+/// applied in database 3. It goes in one piece that goes back to 0 now, as
+/// the `DEL` of an expired key does.
+#[test]
+fn an_eviction_in_another_database_leaves_the_stream_in_db_0() {
+    let mut master =
+        Server::start_with_env(&["--aof"], &[("KIVIDB_TEST_BARE_WRITE_DELAY_MS", "3000")]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    let mut m = master.conn();
+    // The only key that may be evicted, in database 3.
+    assert!(m.cmd(&["SET", "k3", "v", "EX", "100000"]).ok());
+    assert_eq!(m.cmd(&["MOVE", "k3", "3"]).i(), 1);
+    assert!(m.cmd(&["SET", "first", "0"]).ok());
+    assert!(
+        m.cmd(&["CONFIG", "SET", "maxmemory-policy", "volatile-random"])
+            .ok()
+    );
+
+    let mut b = master.conn();
+    let started = Instant::now();
+    send_only(&mut b, &["SET", "delayed:j", "0"]);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(m.cmd(&["CONFIG", "SET", "maxmemory", "1"]).ok());
+    // The memory in use is looked at once a second at most.
+    std::thread::sleep(Duration::from_millis(1100));
+    assert_eq!(m.cmd(&["EXISTS", "nosuch"]).i(), 0);
+    assert!(m.cmd(&["CONFIG", "SET", "maxmemory", "0"]).ok());
+    assert_eq!(m.stat("evicted_keys"), 1, "{}", master.log());
+    assert!(b.read().ok());
+    assert!(
+        started.elapsed() >= Duration::from_millis(2000),
+        "SET delayed:j was not held ({:?})",
+        started.elapsed()
+    );
+
+    let offset: u64 = m.info("replication", "master_repl_offset").parse().unwrap();
+    wait_until("the replica to catch up", || {
+        r.info("replication", "slave_repl_offset")
+            .parse::<u64>()
+            .is_ok_and(|applied| applied >= offset)
+    });
+    let db0 = ["delayed:j", "first"].map(String::from).to_vec();
+    assert_eq!(
+        keys_of_db(&mut r, "3"),
+        Vec::<String>::new(),
+        "{}",
+        replica.log()
+    );
+    assert_eq!(keys_of_db(&mut r, "0"), db0);
+
+    assert_eq!(b.cmd(&["WAITAOF", "1", "0", "5000"]).arr()[0].i(), 1);
+    drop((m, b));
+    master.kill();
+    master.restart();
+    let mut m = master.conn();
+    assert_eq!(
+        keys_of_db(&mut m, "3"),
+        Vec::<String>::new(),
+        "{}",
+        master.log()
+    );
+    assert_eq!(keys_of_db(&mut m, "0"), db0);
+}
+
+/// A script running beside others (`lua-parallel-scripts`) may not be the
+/// first to select a database other than 0 (#423): the switch to writes
+/// that carry their own `SELECT` needs a cut, which it cannot take there.
+/// Once a client has made the switch, it may.
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_beside_others_may_not_be_the_first_to_leave_db_0() {
+    let master = Server::start(&["--aof"]);
+    let mut m = master.conn();
+    let script = "if ARGV[1] == '1' then redis.call('SELECT', 3) end \
+                  redis.call('SET', KEYS[1], ARGV[1]) return 1";
+    // Seen to be quick, it runs beside other scripts from then on.
+    for _ in 0..3 {
+        assert_eq!(m.cmd(&["EVAL", script, "1", "{t}a", "0"]), V::Int(1));
+    }
+    let refused = m.cmd(&["EVAL", script, "1", "{t}a", "1"]);
+    assert!(
+        matches!(&refused, V::Err(e) if e.contains("lua-parallel-scripts")),
+        "{refused:?}"
+    );
+    assert!(m.cmd(&["SELECT", "3"]).ok());
+    assert!(m.cmd(&["SELECT", "0"]).ok());
+    assert_eq!(m.cmd(&["EVAL", script, "1", "{t}a", "1"]), V::Int(1));
+    assert!(m.cmd(&["SELECT", "3"]).ok());
+    assert_eq!(m.cmd(&["GET", "{t}a"]), V::Str("1".into()));
 }

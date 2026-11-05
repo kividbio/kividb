@@ -38,7 +38,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   replica, or a replay of the AOF after a restart, then applied it in the
   other database. The first `SELECT` of a database other than 0 now waits
   for those writes; nothing changes after it, or on a server that only uses
-  database 0 (#423).
+  database 0. The same could happen when a key in another database, put
+  there with `MOVE`, `COPY ... DB`, `SWAPDB` or a loaded dataset, was
+  evicted, or deleted by `FT.DROPINDEX ... DD`, before any client had left
+  database 0: that deletion now goes out with a `SELECT` back to 0, as the
+  deletion of an expired key does. A script running beside others
+  (`lua-parallel-scripts`) can't make that first switch, and its `SELECT`
+  of another database is refused until a client has selected one (#423).
 
 - **A sorted set with a NaN score is refused when it is restored or
   loaded.** No command makes one, but `RESTORE` of a crafted payload took
