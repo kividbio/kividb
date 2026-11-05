@@ -1,0 +1,11 @@
+# GPTCache 0.1.44 (tag 0.1.44, installed with pip install -e .) and the older libraries its Redis tests
+# need: with current redis-py (6+), redis-om, pydantic 2 and transformers they fail the same way on Redis 8
+# and on KiviDB, for reasons in GPTCache's imports. Python 3.11.
+redis==5.2.1
+redis-om==0.3.3
+pydantic==1.10.27
+transformers==4.40.2
+onnxruntime==1.31.1
+openai==0.28.1
+numpy==2.4.6
+pytest==9.2.0
