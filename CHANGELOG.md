@@ -29,6 +29,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Score-range bounds are read as Redis reads them.** `ZCOUNT`,
+  `ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`, `ZREMRANGEBYSCORE`, and `ZRANGE` and
+  `ZRANGESTORE` with `BYSCORE` refused an empty bound, `(` alone and a
+  number too large for a double such as `1e400`, with `ERR min or max is
+  not a float`. Redis takes an empty bound as 0, `(` as an open 0, and
+  `1e400` and `-1e400` as `+inf` and `-inf`, and so does KiviDB now. It
+  also skips space before a bound's number, as Redis does. A bound with
+  bytes that are not UTF-8 is refused as one that is not a float (`ZCOUNT`
+  said `ERR min must be UTF-8`). Scores given to `ZADD` and `ZINCRBY` are
+  read as before (#413).
+
 - **`@connection` holds what it holds in Redis (#392).** It had only
   `AUTH`, `CLIENT`, `ECHO`, `HELLO`, `PING`, `QUIT` and `RESET`. It now
   also has `COMMAND` and all its subcommands, `SELECT`, `READONLY`,
