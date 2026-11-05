@@ -940,7 +940,7 @@ pub(crate) fn script_min_replicas_gate(ctx: &Ctx<'_>, cmd0: &[u8]) -> Option<Vec
         let Some(s) = b.as_ref() else {
             return Some(resp_error(replication::NOREPLICAS));
         };
-        let is_write = replication::is_write_command_bytes(cmd0);
+        let is_write = replication::is_data_write_bytes(cmd0);
         let block = if s.had_shebang && !s.no_writes_flag {
             true
         } else {

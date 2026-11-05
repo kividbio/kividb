@@ -411,7 +411,9 @@ pub fn wait_out_handoff() {
 /// With all clients paused, every command waits — but for `CLIENT UNPAUSE`,
 /// which Redis holds too: there, a pause of everything can only run out.
 /// With only writers paused, the commands that wait are the ones that may
-/// change the dataset or the replication stream: writes, `PFCOUNT` (which
+/// change the dataset or the replication stream: writes (not `SELECT`,
+/// which writes nothing and is held back from the stream meanwhile,
+/// `replication::replicate_one_write`: #411), `PFCOUNT` (which
 /// may rewrite its key), `PUBLISH`, a script that has not declared itself
 /// free of writes, and an `EXEC` of a transaction holding any of those.
 ///
@@ -463,7 +465,7 @@ fn may_replicate(name: &str, first: Option<&[u8]>) -> bool {
         "PFCOUNT" | "PUBLISH" | "SPUBLISH" => true,
         "EVAL" | "EVALSHA" | "FCALL" => !first.is_some_and(|first| declared_read_only(name, first)),
         "EVAL_RO" | "EVALSHA_RO" | "FCALL_RO" => false,
-        _ => crate::replication::is_write_command(name),
+        _ => crate::replication::is_data_write(name),
     }
 }
 

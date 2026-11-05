@@ -285,6 +285,38 @@ fn test_maxmemory_always_allowed_commands() {
     c.cmds(&["CONFIG", "SET", "maxmemory", "0"]);
 }
 
+/// `SELECT` writes nothing: past `maxmemory` under `noeviction` it runs,
+/// as in Redis, where it has no `denyoom` flag (#411). So does a
+/// transaction that only selects and reads.
+#[test]
+fn test_maxmemory_select_is_not_refused() {
+    let _lock = lock();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    assert!(
+        c.cmds(&["CONFIG", "SET", "maxmemory-policy", "noeviction"])
+            .is_ok()
+    );
+    assert!(c.cmds(&["CONFIG", "SET", "maxmemory", "1"]).is_ok());
+    thread::sleep(Duration::from_millis(1100));
+
+    let r = c.cmds(&["SET", "k", "v"]);
+    assert!(
+        r.is_error() && r.error_str().contains("OOM"),
+        "past the limit: {r:?}"
+    );
+    let r = c.cmds(&["SELECT", "1"]);
+    assert!(r.is_ok(), "SELECT: {r:?}");
+    assert!(c.cmds(&["MULTI"]).is_ok());
+    assert_eq!(c.cmds(&["SELECT", "2"]).as_str(), "QUEUED");
+    assert_eq!(c.cmds(&["GET", "k"]).as_str(), "QUEUED");
+    let exec = c.cmds(&["EXEC"]);
+    assert_eq!(exec.as_array().len(), 2, "{exec:?}");
+    assert!(exec.as_array()[0].is_ok(), "{exec:?}");
+    c.cmds(&["CONFIG", "SET", "maxmemory", "0"]);
+}
+
 /// Past `maxmemory` under `noeviction`, a new subscription is refused as a
 /// write is, as in Redis 8.10; taking one away is not.
 #[test]

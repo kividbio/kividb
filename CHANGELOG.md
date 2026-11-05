@@ -29,6 +29,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`SELECT` is no longer refused or held as a write.** Past `maxmemory`
+  under `noeviction` it was refused with `OOM`, a master without enough
+  good replicas (`min-replicas-to-write`) refused it with `NOREPLICAS`, and
+  `CLIENT PAUSE WRITE` held it until the pause ended, and with it a
+  transaction that only selected a database and read. `SELECT` is sent to
+  replicas and the AOF, so that they follow the switch of database, but it
+  writes nothing: as in Redis, it now runs in all three cases. While writes
+  are paused it is not added to the replication stream, which keeps the
+  offset still for a failover; the next write in another database carries
+  its own `SELECT` (#411).
+
 - **`@connection` holds what it holds in Redis (#392).** It had only
   `AUTH`, `CLIENT`, `ECHO`, `HELLO`, `PING`, `QUIT` and `RESET`. It now
   also has `COMMAND` and all its subcommands, `SELECT`, `READONLY`,
