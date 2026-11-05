@@ -66,7 +66,9 @@ other files:
 - Dify's self-hosted stack (cache, Celery broker and result backend, pub/sub, locks; the `lua` build),
   end to end and with Dify's own Redis tests: [benchmarks/dify-compat/](../benchmarks/dify-compat/) and
   [docs/integrations/dify.md](integrations/dify.md).
-- RAGFlow's self-hosted stack (the stream task queue, cache and locks; the `lua` build), end to end:
+- RAGFlow's self-hosted stack, end to end (the `lua` build): RAGFlow 1.0 in place of its Kvrocks
+  service (secret key, agent-run lease, locks, media cache), with RAGFlow's own Go HTTP API suite, and
+  RAGFlow 0.27 in place of its Valkey service (the stream task queue, cache and locks):
   [benchmarks/ragflow-compat/](../benchmarks/ragflow-compat/) and
   [docs/integrations/ragflow.md](integrations/ragflow.md).
 - n8n's queue mode (Bull; the `lua` build) end to end, with worker and server restarts, and n8n's own

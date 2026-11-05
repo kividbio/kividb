@@ -1,5 +1,5 @@
-# Replaces RAGFlow's `redis` service (Valkey 8 by default) with KiviDB. Use it on top of
-# RAGFlow's own compose file:
+# RAGFlow 0.27 (v0.27.3): replaces RAGFlow's `redis` service (Valkey 8 by default) with KiviDB.
+# For RAGFlow 1.0, see compose.kividb-kvrocks.yaml. Use it on top of RAGFlow's own compose file:
 #
 #   cd ragflow/docker
 #   docker compose -f docker-compose.yml -f /path/to/compose.kividb.yaml up -d
@@ -7,8 +7,8 @@
 # The service keeps the name `redis` and the port 6379, so nothing else in RAGFlow's
 # configuration changes: REDIS_HOST, REDIS_PORT and REDIS_PASSWORD stay as docker/.env sets them.
 #
-# Use the `-lua` variant (see REPORT.md): RAGFlow releases its locks and rate-limits agent calls
-# with Lua scripts.
+# Use the `-lua` variant (see docs/integrations/ragflow.md): RAGFlow releases its locks and
+# rate-limits agent calls with Lua scripts.
 services:
   redis:
     image: ${KIVIDB_IMAGE:-kividb/kividb:v1.2.0-lua}

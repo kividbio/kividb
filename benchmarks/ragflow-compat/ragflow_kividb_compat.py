@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RAGFlow <-> Redis-protocol server compatibility harness, end to end.
+RAGFlow 0.27 <-> Redis-protocol server compatibility harness, end to end (RAGFlow 1.0: ragflow1_kividb_compat.py).
 
 Drives a running RAGFlow stack (its own docker-compose, with its `redis` service replaced by KiviDB,
 by redis:8, or left as Valkey) through RAGFlow's HTTP API, the same calls its own HTTP API tests make

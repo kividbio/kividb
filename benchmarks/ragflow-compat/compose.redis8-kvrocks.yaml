@@ -1,0 +1,15 @@
+# A reference run for RAGFlow 1.0: its `kvrocks` service on redis:8 instead of Kvrocks, so the
+# harness can read Redis's own count of refused commands (Kvrocks counts calls only).
+services:
+  kvrocks:
+    image: ${REDIS_IMAGE:-redis:8}
+    entrypoint: !reset null
+    user: !reset null
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}", "--appendonly", "yes"]
+    volumes: !override
+      - redis8_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+
+volumes:
+  redis8_data:
