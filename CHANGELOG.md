@@ -329,6 +329,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the command gate alone, as they do on a master (#378).** They took it
   shared, so a query on the replica could find a database half flushed, its
   keys gone and its indexes not yet, or half swapped.
+- **`BRPOPLPUSH` and `BLMOVE` time out with a null array (#385).** In
+  RESP2 they replied `$-1` when their timeout ran out (or `CLIENT UNBLOCK
+  … TIMEOUT` ended the wait), where Redis replies `*-1`, as it does for
+  every blocking command that times out. They now reply `*-1`; RESP3 is
+  `_` as before. Inside `MULTI` or a script, where they cannot wait, they
+  still reply `$-1`, as Redis does, and so do `RPOPLPUSH` and `LMOVE` on
+  an empty list.
 
 ## [1.2.0] - 2026-11-03
 
