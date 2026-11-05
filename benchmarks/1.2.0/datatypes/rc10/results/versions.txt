@@ -1,0 +1,17 @@
+# builds
+stable-x86_64-unknown-linux-gnu (default)
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+cargo 1.99.1 (5f94df478 2026-08-27)
+BUILT rc10 39bfacd231bb294d390448eacfe0e243d365ebe8 kividb 1.2.0-rc10 RUSTFLAGS=
+BUILT rc8 082dab3d8929c180bccf993835e28992ea054fb5 kividb 1.2.0-rc8 RUSTFLAGS=
+39bfacd231bb294d390448eacfe0e243d365ebe8
+082dab3d8929c180bccf993835e28992ea054fb5
+5083e19cd56c10f776a411b124afc62be323b1daf7507cfff44834aeed4717e6  ~/bin/kividb-rc10
+a9ea83cbb399ec8e921442caf59ea1a9a4fa8f2e65f561366cddd7d268299cd2  ~/bin/kividb-rc8
+BUILD-DONE
+
+# client
+memtier_benchmark v=2.5.2 sha=f3ff1793:0 bits=64 libevent=2.1.12-stable openssl=OpenSSL 3.0.13 30 Jan 2024 prometheus=yes
+7.0.0-1017-azure
+Model name:                              Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz
+16

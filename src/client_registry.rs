@@ -711,7 +711,13 @@ fn reserved_fds() -> usize {
 #[cfg(unix)]
 fn clients_for(soft: libc::rlim_t, max: usize, reserved: usize) -> usize {
     let reserved = libc::rlim_t::try_from(reserved).unwrap_or(libc::RLIM_INFINITY);
-    usize::try_from(soft.saturating_sub(reserved)).map_or(max, |n| n.min(max))
+    // Not `saturating_sub` alone: `rlim_t` is signed on FreeBSD, where it
+    // goes below zero, and the conversion below then fails and gives `max`
+    // (#288).
+    if soft <= reserved {
+        return 0;
+    }
+    usize::try_from(soft - reserved).map_or(max, |n| n.min(max))
 }
 
 /// Raises the soft open-file limit toward what `max` clients need, never past
@@ -733,7 +739,10 @@ pub fn clients_that_fit(max: usize) -> std::io::Result<usize> {
     // whatever the hard limit says.
     let (mut soft, mut high) = (limit.rlim_cur, wanted.min(limit.rlim_max));
     while soft < high {
-        let next = soft + (high - soft).div_ceil(2);
+        // Half the gap, rounded up. Not `div_ceil`: `rlim_t` is signed on
+        // FreeBSD, where `div_ceil` is not stable (#288).
+        let gap = high - soft;
+        let next = soft + gap / 2 + gap % 2;
         let raised = libc::rlimit {
             rlim_cur: next,
             rlim_max: limit.rlim_max,
@@ -806,6 +815,7 @@ pub fn admit(registry: &ClientRegistry) -> Option<Slot> {
     let max = MAX_CLIENTS.load(Ordering::Relaxed);
     let slot = ClientRegistryInner::admit_up_to(registry, max);
     if slot.is_none() {
+        crate::stats::REJECTED_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
         crate::log_throttled!(
             10,
             crate::loglevel::WARN,

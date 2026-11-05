@@ -1,0 +1,38 @@
+14:03:49 reshard-start round 1 src-shard=3000 dst-shard=8000: 128 slots (0-127) from 10.81.1.11:7001 (1fe09c8c865a986332d985d6dbf5e06db20a724d, 567439 keys) to 10.81.1.12:7001 (2d0b7fb07425018d89a7827976f07d2bac46f68b) with plain redis-cli
+14:05:31 reshard-end round 1 exit=0 after 101.62 s: slots begun=128, TRYAGAIN=0, ERR=0: 
+CLUSTER GETKEYSINSLOT: n=2025 median=37410us max=63292us
+GET: n=571 median=37853us max=84330us
+SET: n=503 median=32695us max=63360us
+MIGRATE: n=267 median=15398us max=35430us
+HSET: n=249 median=32412us max=60866us
+CLUSTER SETSLOT: n=128 median=59751us max=84235us
+ZADD: n=123 median=34867us max=61004us
+LPUSH: n=118 median=30130us max=59141us
+INCRBY: n=95 median=33588us max=59827us
+SADD: n=92 median=29529us max=61011us
+HGET: n=89 median=33520us max=61122us
+LTRIM: n=52 median=30636us max=58999us
+ZINCRBY: n=50 median=35123us max=60247us
+LRANGE: n=45 median=34478us max=59735us
+HGETALL: n=44 median=28486us max=59045us
+EXPIRE: n=42 median=38476us max=60581us
+ZREVRANGE: n=35 median=32264us max=59798us
+ZRANGEBYSCORE: n=35 median=37849us max=59123us
+SREM: n=34 median=31560us max=61084us
+SCARD: n=31 median=39268us max=59881us
+DEL: n=28 median=35239us max=60451us
+RPOP: n=25 median=43891us max=60227us
+HEXPIRE: n=21 median=24674us max=60999us
+SISMEMBER: n=20 median=30981us max=57943us
+HTTL: n=15 median=47746us max=59304us
+INFO: n=10 median=21281us max=22625us
+CLUSTER SLOTS: n=1 median=28771us max=28771us
+INFO: n=10 median=26740us max=33004us
+SET: n=8 median=31535us max=35609us
+CLUSTER SETSLOT: n=5 median=29229us max=45903us
+GET: n=1 median=19873us max=19873us
+INCRBY: n=1 median=29064us max=29064us
+EXPIRE: n=1 median=29051us max=29051us
+14:05:33 reshard-check round 1: open-on-source=[] open-slots-lines=0 covered=1 err-lines=0 moved-slots=128
+14:05:43 reshard-done round 1 cluster-ok after 0.25 s
+14:05:44 events-done

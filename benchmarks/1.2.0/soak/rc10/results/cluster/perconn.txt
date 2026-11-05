@@ -1,0 +1,27 @@
+probe a, round 1, 748.7 s
+conn 0: ops 46793, over 10 ms 95.4 %, over 100 ms 69.6 %, worst 2150 ms
+conn 1: ops 46792, over 10 ms 92.2 %, over 100 ms 57.0 %, worst 1356 ms
+conn 2: ops 46793, over 10 ms 100.0 %, over 100 ms 100.0 %, worst 568082 ms
+conn 3: ops 46793, over 10 ms 100.0 %, over 100 ms 100.0 %, worst 568387 ms
+conn 4: ops 46793, over 10 ms 93.2 %, over 100 ms 59.8 %, worst 1891 ms
+conn 5: ops 46793, over 10 ms 95.4 %, over 100 ms 69.4 %, worst 2284 ms
+conn 6: ops 46793, over 10 ms 95.4 %, over 100 ms 69.9 %, worst 2234 ms
+conn 7: ops 46793, over 10 ms 100.0 %, over 100 ms 100.0 %, worst 567515 ms
+probe c, round 2, 1317.2 s
+conn 0: ops 82324, over 10 ms 100.0 %, over 100 ms 99.9 %, worst 565314 ms
+conn 1: ops 82323, over 10 ms 100.0 %, over 100 ms 99.9 %, worst 581349 ms
+conn 2: ops 82324, over 10 ms 100.0 %, over 100 ms 100.0 %, worst 1061763 ms
+conn 3: ops 82324, over 10 ms 100.0 %, over 100 ms 99.9 %, worst 575505 ms
+conn 4: ops 82324, over 10 ms 100.0 %, over 100 ms 99.9 %, worst 574383 ms
+conn 5: ops 82324, over 10 ms 99.5 %, over 100 ms 96.2 %, worst 11974 ms
+conn 6: ops 82324, over 10 ms 100.0 %, over 100 ms 100.0 %, worst 1063163 ms
+conn 7: ops 82324, over 10 ms 100.0 %, over 100 ms 99.9 %, worst 561370 ms
+probe b, round 3, 1628.6 s
+conn 0: ops 101789, over 10 ms 98.4 %, over 100 ms 88.1 %, worst 5450 ms
+conn 1: ops 101789, over 10 ms 97.6 %, over 100 ms 83.5 %, worst 4235 ms
+conn 2: ops 101790, over 10 ms 97.7 %, over 100 ms 83.6 %, worst 4441 ms
+conn 3: ops 101789, over 10 ms 100.0 %, over 100 ms 100.0 %, worst 1366434 ms
+conn 4: ops 101789, over 10 ms 98.3 %, over 100 ms 87.2 %, worst 4786 ms
+conn 5: ops 101789, over 10 ms 98.4 %, over 100 ms 88.5 %, worst 6113 ms
+conn 6: ops 101789, over 10 ms 98.4 %, over 100 ms 88.3 %, worst 5807 ms
+conn 7: ops 101789, over 10 ms 100.0 %, over 100 ms 100.0 %, worst 1365306 ms

@@ -1,0 +1,40 @@
+Updating Subscription Management repositories.
+Unable to read consumer identity
+
+This system is not registered with an entitlement server. You can use subscription-manager to register.
+
+Red Hat Universal Base Image 9 (RPMs) - BaseOS  2.4 MB/s | 533 kB     00:00    
+Red Hat Universal Base Image 9 (RPMs) - AppStre  23 MB/s | 2.9 MB     00:00    
+Red Hat Universal Base Image 9 (RPMs) - CodeRea 3.9 MB/s | 471 kB     00:00    
+Package procps-ng-3.3.17-14.el9.x86_64 is already installed.
+Package util-linux-2.37.4-25.el9.x86_64 is already installed.
+Dependencies resolved.
+================================================================================
+ Package        Architecture   Version               Repository            Size
+================================================================================
+Installing:
+ kividb         x86_64         1.2.0~rc10-1          @commandline         6.1 M
+
+Transaction Summary
+================================================================================
+Install  1 Package
+
+Total size: 6.1 M
+Installed size: 16 M
+Downloading Packages:
+Running transaction check
+Transaction check succeeded.
+Running transaction test
+Transaction test succeeded.
+Running transaction
+  Preparing        :                                                        1/1 
+  Running scriptlet: kividb-1.2.0~rc10-1.x86_64                             1/1 
+  Installing       : kividb-1.2.0~rc10-1.x86_64                             1/1 
+  Running scriptlet: kividb-1.2.0~rc10-1.x86_64                             1/1 
+  Verifying        : kividb-1.2.0~rc10-1.x86_64                             1/1 
+Installed products updated.
+
+Installed:
+  kividb-1.2.0~rc10-1.x86_64                                                    
+
+Complete!

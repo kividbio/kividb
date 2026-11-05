@@ -1,0 +1,22 @@
+PASS: image-ghcr-default: CONFIG GET repl-backlog-size = 67108864 (64 MB)
+PASS: image-ghcr-default: CONFIG GET shutdown-timeout = 10
+PASS: image-ghcr-lua: CONFIG GET repl-backlog-size = 67108864 (64 MB)
+PASS: image-ghcr-lua: CONFIG GET shutdown-timeout = 10
+PASS: image-ghcr-tls: CONFIG GET repl-backlog-size = 67108864 (64 MB)
+PASS: image-ghcr-tls: CONFIG GET shutdown-timeout = 10
+PASS: image-ghcr-full: CONFIG GET repl-backlog-size = 67108864 (64 MB)
+PASS: image-ghcr-full: CONFIG GET shutdown-timeout = 10
+PASS: image-hub-default: CONFIG GET repl-backlog-size = 67108864 (64 MB)
+PASS: image-hub-default: CONFIG GET shutdown-timeout = 10
+PASS: image-hub-lua: CONFIG GET repl-backlog-size = 67108864 (64 MB)
+PASS: image-hub-lua: CONFIG GET shutdown-timeout = 10
+PASS: image-hub-tls: CONFIG GET repl-backlog-size = 67108864 (64 MB)
+PASS: image-hub-tls: CONFIG GET shutdown-timeout = 10
+PASS: image-hub-full: CONFIG GET repl-backlog-size = 67108864 (64 MB)
+PASS: image-hub-full: CONFIG GET shutdown-timeout = 10
+PASS: image: a second container on the same volume logs [The data directory /home/kividb is in use by another process (it holds kividb.lock): waiting for it to be free]
+PASS: image: the second container does not serve while it waits
+PASS: image: docker stop of the holder took 0.25s, exit code 0 (not killed at the 10 s grace)
+PASS: image: the second container takes over after the first stops
+PASS: image: and has the first one's 19999 keys
+PASS: image: docker restart, back in 0.66s

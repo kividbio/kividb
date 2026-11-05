@@ -1,0 +1,129 @@
+>>> Performing Cluster Check (using node 10.70.1.9:7002)
+M: 079a0420cba100b1ec81d919b89997ebde9511ea 10.70.1.9:7002
+   slots:[5461-5960],[11423-16383] (5461 slots) master
+   1 additional replica(s)
+S: 164cefbbcc5cbc37cb8fbc84f679d180899c452a 10.70.1.7:7001
+   slots: (0 slots) slave
+   replicates 079a0420cba100b1ec81d919b89997ebde9511ea
+M: 1736f14270fdfee5f99d05246b9bb13f6479070f 10.70.1.9:7001
+   slots:[10-5460],[10923-11422] (5951 slots) master
+   1 additional replica(s)
+M: 39c17443e5977c09633deed1396120841beae3a9 10.70.1.7:7002
+   slots:[0-9],[5961-10922] (4972 slots) master
+   1 additional replica(s)
+S: 4a70915204bf0588e60809de90293cf6c74e19b5 10.70.1.10:7001
+   slots: (0 slots) slave
+   replicates 39c17443e5977c09633deed1396120841beae3a9
+S: 4f80c960cc0e9437b748f6aa93e2b24d111e33dd 10.70.1.10:7002
+   slots: (0 slots) slave
+   replicates 1736f14270fdfee5f99d05246b9bb13f6479070f
+[OK] All nodes agree about slots configuration.
+>>> Check for open slots...
+>>> Check slots coverage...
+[OK] All 16384 slots covered.
+
+Ready to move 5 slots.
+  Source nodes:
+    M: 079a0420cba100b1ec81d919b89997ebde9511ea 10.70.1.9:7002
+       slots:[5461-5960],[11423-16383] (5461 slots) master
+       1 additional replica(s)
+  Destination node:
+    M: 1736f14270fdfee5f99d05246b9bb13f6479070f 10.70.1.9:7001
+       slots:[10-5460],[10923-11422] (5951 slots) master
+       1 additional replica(s)
+  Resharding plan:
+    Moving slot 5461 from 079a0420cba100b1ec81d919b89997ebde9511ea
+    Moving slot 5462 from 079a0420cba100b1ec81d919b89997ebde9511ea
+    Moving slot 5463 from 079a0420cba100b1ec81d919b89997ebde9511ea
+    Moving slot 5464 from 079a0420cba100b1ec81d919b89997ebde9511ea
+    Moving slot 5465 from 079a0420cba100b1ec81d919b89997ebde9511ea
+Moving slot 5461 from 10.70.1.9:7002 to 10.70.1.9:7001: ......................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+Moving slot 5462 from 10.70.1.9:7002 to 10.70.1.9:7001: ................................................................................................................................................................................................................................................
+Node 10.70.1.9:7002 replied with error:
+TRYAGAIN a key was written while being migrated, and kept here: 'hf:5143'. The copy sent to 10.70.1.9:7001 may be older; MIGRATE them again with REPLACE
+
+clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:5143'. The copy sent to 10.70.1.9:7001 may be older; MIGRATE them again with REPLACE
+>>> Performing Cluster Check (using node 10.70.1.9:7002)
+M: 079a0420cba100b1ec81d919b89997ebde9511ea 10.70.1.9:7002
+   slots:[5463-5960],[11423-16383] (5459 slots) master
+   1 additional replica(s)
+S: 164cefbbcc5cbc37cb8fbc84f679d180899c452a 10.70.1.7:7001
+   slots: (0 slots) slave
+   replicates 079a0420cba100b1ec81d919b89997ebde9511ea
+M: 1736f14270fdfee5f99d05246b9bb13f6479070f 10.70.1.9:7001
+   slots:[10-5462],[10923-11422] (5953 slots) master
+   1 additional replica(s)
+M: 39c17443e5977c09633deed1396120841beae3a9 10.70.1.7:7002
+   slots:[0-9],[5961-10922] (4972 slots) master
+   1 additional replica(s)
+S: 4a70915204bf0588e60809de90293cf6c74e19b5 10.70.1.10:7001
+   slots: (0 slots) slave
+   replicates 39c17443e5977c09633deed1396120841beae3a9
+S: 4f80c960cc0e9437b748f6aa93e2b24d111e33dd 10.70.1.10:7002
+   slots: (0 slots) slave
+   replicates 1736f14270fdfee5f99d05246b9bb13f6479070f
+[OK] All nodes agree about slots configuration.
+>>> Check for open slots...
+>>> Check slots coverage...
+[OK] All 16384 slots covered.
+
+Ready to move 3 slots.
+  Source nodes:
+    M: 079a0420cba100b1ec81d919b89997ebde9511ea 10.70.1.9:7002
+       slots:[5463-5960],[11423-16383] (5459 slots) master
+       1 additional replica(s)
+  Destination node:
+    M: 1736f14270fdfee5f99d05246b9bb13f6479070f 10.70.1.9:7001
+       slots:[10-5462],[10923-11422] (5953 slots) master
+       1 additional replica(s)
+  Resharding plan:
+    Moving slot 5463 from 079a0420cba100b1ec81d919b89997ebde9511ea
+    Moving slot 5464 from 079a0420cba100b1ec81d919b89997ebde9511ea
+    Moving slot 5465 from 079a0420cba100b1ec81d919b89997ebde9511ea
+Moving slot 5463 from 10.70.1.9:7002 to 10.70.1.9:7001: ..................................................................................................................................
+Node 10.70.1.9:7002 replied with error:
+TRYAGAIN a key was written while being migrated, and kept here: 's:248801'. The copy sent to 10.70.1.9:7001 may be older; MIGRATE them again with REPLACE
+
+clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 's:248801'. The copy sent to 10.70.1.9:7001 may be older; MIGRATE them again with REPLACE
+>>> Performing Cluster Check (using node 10.70.1.9:7002)
+M: 079a0420cba100b1ec81d919b89997ebde9511ea 10.70.1.9:7002
+   slots:[5464-5960],[11423-16383] (5458 slots) master
+   1 additional replica(s)
+S: 164cefbbcc5cbc37cb8fbc84f679d180899c452a 10.70.1.7:7001
+   slots: (0 slots) slave
+   replicates 079a0420cba100b1ec81d919b89997ebde9511ea
+M: 1736f14270fdfee5f99d05246b9bb13f6479070f 10.70.1.9:7001
+   slots:[10-5463],[10923-11422] (5954 slots) master
+   1 additional replica(s)
+M: 39c17443e5977c09633deed1396120841beae3a9 10.70.1.7:7002
+   slots:[0-9],[5961-10922] (4972 slots) master
+   1 additional replica(s)
+S: 4a70915204bf0588e60809de90293cf6c74e19b5 10.70.1.10:7001
+   slots: (0 slots) slave
+   replicates 39c17443e5977c09633deed1396120841beae3a9
+S: 4f80c960cc0e9437b748f6aa93e2b24d111e33dd 10.70.1.10:7002
+   slots: (0 slots) slave
+   replicates 1736f14270fdfee5f99d05246b9bb13f6479070f
+[OK] All nodes agree about slots configuration.
+>>> Check for open slots...
+>>> Check slots coverage...
+[OK] All 16384 slots covered.
+
+Ready to move 2 slots.
+  Source nodes:
+    M: 079a0420cba100b1ec81d919b89997ebde9511ea 10.70.1.9:7002
+       slots:[5464-5960],[11423-16383] (5458 slots) master
+       1 additional replica(s)
+  Destination node:
+    M: 1736f14270fdfee5f99d05246b9bb13f6479070f 10.70.1.9:7001
+       slots:[10-5463],[10923-11422] (5954 slots) master
+       1 additional replica(s)
+  Resharding plan:
+    Moving slot 5464 from 079a0420cba100b1ec81d919b89997ebde9511ea
+    Moving slot 5465 from 079a0420cba100b1ec81d919b89997ebde9511ea
+Moving slot 5464 from 10.70.1.9:7002 to 10.70.1.9:7001: ...............................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+Moving slot 5465 from 10.70.1.9:7002 to 10.70.1.9:7001: ..................................................................................................................................
+Node 10.70.1.9:7002 replied with error:
+TRYAGAIN a key was written while being migrated, and kept here: 'hf:15838'. The copy sent to 10.70.1.9:7001 may be older; MIGRATE them again with REPLACE
+
+clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:15838'. The copy sent to 10.70.1.9:7001 may be older; MIGRATE them again with REPLACE

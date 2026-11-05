@@ -1,0 +1,14 @@
+2026-11-03T06:00:20Z   Normal    Killing                  g-113-0                         Stopping container kividb
+2026-11-03T06:00:20Z   Normal    Killing                  g-113-0                         Stopping container agent
+2026-11-03T06:00:20Z   Normal    SuccessfulCreate         g-113                           Create Pod g-113-0 in StatefulSet g-113 successful
+2026-11-03T06:00:20Z   Normal    Scheduled                g-113-0                         Successfully assigned e2e/g-113-0 to aks-nodepool1-41799577-vmss000001
+2026-11-03T06:00:20Z   Warning   FailedAttachVolume       g-113-0                         Waiting for detach for volume "pvc-f6ba0bd2-f095-4645-a825-0e7856692189" Volume is already exclusively attached to one node, waiting on detach before it can be attached to another node
+2026-11-03T06:00:47Z   Normal    SuccessfulAttachVolume   g-113-0                         AttachVolume.Attach succeeded for volume "pvc-f6ba0bd2-f095-4645-a825-0e7856692189" 
+2026-11-03T06:00:48Z   Normal    Pulled                   g-113-0                         Container image "ghcr.io/kividbio/kividb:v1.1.3" already present on machine and can be accessed by the pod
+2026-11-03T06:00:48Z   Normal    Created                  g-113-0                         Container created
+2026-11-03T06:00:48Z   Normal    Started                  g-113-0                         Container started
+2026-11-03T06:00:48Z   Normal    Pulled                   g-113-0                         Container image "<registry>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T06:00:48Z   Normal    Created                  g-113-0                         Container created
+2026-11-03T06:00:48Z   Normal    Started                  g-113-0                         Container started
+2026-11-03T06:01:21Z   Warning   MasterRestartedBehind    g-113                           g-113-0 restarted and came back as the master at replication offset 0, behind the 21152419 it had reached and behind g-113-1 (offset 21229979), which holds writes it lost; failing over rather than resyncing the replicas from its older data
+2026-11-03T06:01:21Z   Warning   Failover                 g-113                           master g-113-0 restarted behind its replicas; promoted g-113-1

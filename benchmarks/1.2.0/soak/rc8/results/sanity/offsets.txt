@@ -1,0 +1,1 @@
+offsets master=30469889734 replica=30469889734

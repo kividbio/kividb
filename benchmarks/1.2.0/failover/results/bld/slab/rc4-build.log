@@ -1,0 +1,3 @@
+   Compiling kividb v1.2.0-rc4 (/home/azureuser/rc4)
+    Finished `release` profile [optimized] target(s) in 3m 11s
+  Executable unittests src/lib.rs (/home/azureuser/target/release/deps/kividb-e6843cfc0771adb4)

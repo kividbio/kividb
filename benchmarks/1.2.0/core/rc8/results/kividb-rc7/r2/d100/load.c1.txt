@@ -1,0 +1,25 @@
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 77%,   1 secs] 15 threads 10 conns:     3843412 ops, 3836188 (avg: 3836188) ops/sec, 540.63MB/sec (avg: 540.63MB/sec),  0.62 (avg:  0.62) msec latency[RUN #1 100%,   1 secs]  0 threads 10 conns:     5000100 ops, 3836188 (avg: 3593035) ops/sec, 540.63MB/sec (avg: 506.37MB/sec),  0.62 (avg:  0.66) msec latency
+
+
+CPU Utilization Summary
+  Total CPU time:   13.740s  (user 6.471s, sys 7.269s)
+  Wall time:        1.476s
+  Cores used:       9.310   (avg 62.0% across 15 worker threads)
+  Peak utilization: 1045.2%
+setting requests to 33334
+15        Threads
+10        Connections per thread
+33334     Requests per client
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets      3678304.84          ---          ---         0.66122         0.55900         3.53500        16.76700    530831.77 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    3678304.84         0.00         0.00         0.66122         0.55900         3.53500        16.76700    530831.77 

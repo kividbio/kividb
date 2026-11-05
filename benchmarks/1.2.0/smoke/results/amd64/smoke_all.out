@@ -1,0 +1,55 @@
+ghcr.io/kividbio/kividb:v1.2.0-rc7	sha256:aa2f305f53ee79df248bdc435261947b3a10102888002b254ebbfbfd4b1112e0	linux/amd64 unknown/unknown linux/arm64 unknown/unknown 
+docker.io/kividb/kividb:v1.2.0-rc7	sha256:aa2f305f53ee79df248bdc435261947b3a10102888002b254ebbfbfd4b1112e0	linux/amd64 unknown/unknown linux/arm64 unknown/unknown 
+ghcr.io/kividbio/kividb:v1.2.0-rc7-lua	sha256:6c83bae2a6beff6fc766b1ccf4f7ab022d22ee169739fe077a22cd81f99759fe	linux/amd64 unknown/unknown linux/arm64 unknown/unknown 
+docker.io/kividb/kividb:v1.2.0-rc7-lua	sha256:6c83bae2a6beff6fc766b1ccf4f7ab022d22ee169739fe077a22cd81f99759fe	linux/amd64 unknown/unknown linux/arm64 unknown/unknown 
+ghcr.io/kividbio/kividb:v1.2.0-rc7-tls	sha256:badab69d9e849ea80794fb8251bc0f83a89a07683200ec67c764be011f033e34	linux/amd64 unknown/unknown linux/arm64 unknown/unknown 
+docker.io/kividb/kividb:v1.2.0-rc7-tls	sha256:badab69d9e849ea80794fb8251bc0f83a89a07683200ec67c764be011f033e34	linux/amd64 unknown/unknown linux/arm64 unknown/unknown 
+ghcr.io/kividbio/kividb:v1.2.0-rc7-full	sha256:721cea8f50f310e35917d2ee1be2d2347b0c8a2d0415406ddbacdc209d9013d2	linux/amd64 unknown/unknown linux/arm64 unknown/unknown 
+docker.io/kividb/kividb:v1.2.0-rc7-full	sha256:721cea8f50f310e35917d2ee1be2d2347b0c8a2d0415406ddbacdc209d9013d2	linux/amd64 unknown/unknown linux/arm64 unknown/unknown 
+image-ghcr-default-amd64 pass=59 fail=0
+image-ghcr-lua-amd64 pass=63 fail=0
+image-ghcr-tls-amd64 pass=62 fail=0
+image-ghcr-full-amd64 pass=66 fail=0
+image-hub-default-amd64 pass=59 fail=0
+image-hub-lua-amd64 pass=63 fail=0
+image-hub-tls-amd64 pass=62 fail=0
+image-hub-full-amd64 pass=66 fail=0
+image-ghcr-arch-default-amd64 pass=59 fail=0
+image-ghcr-arch-lua-amd64 pass=63 fail=0
+image-ghcr-arch-tls-amd64 pass=62 fail=0
+image-ghcr-arch-full-amd64 pass=66 fail=0
+total 72220
+-rw-rw-r-- 1 azureuser docker    1133 Nov  2 20:09 SHA256SUMS.txt
+-rw-rw-r-- 1 azureuser docker 6387090 Nov  2 20:09 kividb-full-linux-aarch64.tar.gz
+-rw-rw-r-- 1 azureuser docker 6764991 Nov  2 20:09 kividb-full-linux-x86_64.tar.gz
+-rw-rw-r-- 1 azureuser docker 5662250 Nov  2 20:09 kividb-linux-aarch64.tar.gz
+-rw-rw-r-- 1 azureuser docker 5992038 Nov  2 20:09 kividb-linux-x86_64.tar.gz
+-rw-rw-r-- 1 azureuser docker 6149187 Nov  2 20:09 kividb-lua-linux-aarch64.tar.gz
+-rw-rw-r-- 1 azureuser docker 6516758 Nov  2 20:09 kividb-lua-linux-x86_64.tar.gz
+-rw-rw-r-- 1 azureuser docker 5899975 Nov  2 20:09 kividb-tls-linux-aarch64.tar.gz
+-rw-rw-r-- 1 azureuser docker 6238967 Nov  2 20:09 kividb-tls-linux-x86_64.tar.gz
+-rw-rw-r-- 1 azureuser docker 5989580 Nov  2 20:09 kividb.aarch64.rpm
+-rw-rw-r-- 1 azureuser docker 6317184 Nov  2 20:09 kividb.x86_64.rpm
+-rw-rw-r-- 1 azureuser docker 6112822 Nov  2 20:09 kividb_amd64.deb
+-rw-rw-r-- 1 azureuser docker 5886686 Nov  2 20:09 kividb_arm64.deb
+./kividb.aarch64.rpm: OK
+./kividb_amd64.deb: OK
+./kividb-linux-x86_64.tar.gz: OK
+./kividb-tls-linux-aarch64.tar.gz: OK
+./kividb-tls-linux-x86_64.tar.gz: OK
+./kividb-lua-linux-aarch64.tar.gz: OK
+./kividb_arm64.deb: OK
+./kividb-full-linux-aarch64.tar.gz: OK
+./kividb-lua-linux-x86_64.tar.gz: OK
+./kividb-linux-aarch64.tar.gz: OK
+./kividb-full-linux-x86_64.tar.gz: OK
+./kividb.x86_64.rpm: OK
+tarball-default-amd64 pass=59 fail=0
+tarball-lua-amd64 pass=63 fail=0
+tarball-tls-amd64 pass=62 fail=0
+tarball-full-amd64 pass=66 fail=0
+deb-amd64 pass=59 fail=0
+rpm-amd64 pass=60 fail=0
+repo verify-published.sh exit=1 0 PASS / 0 FAIL
+repo replication_blackbox.sh exit=0 19 PASS / 0 FAIL
+SMOKE-ALL-DONE

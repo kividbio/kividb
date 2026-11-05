@@ -1,0 +1,30 @@
+Json file ~/results/kividb-rc7/r1/d100/mset10_p1.c1.json created...
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 5%,   1 secs] 15 threads 40 conns:      102833 ops,  102823 (avg:  102823) ops/sec, 129.33MB/sec (avg: 129.33MB/sec),  5.81 (avg:  5.81) msec latency[RUN #1 10%,   2 secs] 15 threads 40 conns:      187776 ops,   84922 (avg:   93872) ops/sec, 106.82MB/sec (avg: 118.07MB/sec),  7.06 (avg:  6.38) msec latency[RUN #1 15%,   3 secs] 15 threads 40 conns:      272672 ops,   84880 (avg:   90875) ops/sec, 106.76MB/sec (avg: 114.30MB/sec),  7.06 (avg:  6.59) msec latency[RUN #1 20%,   4 secs] 15 threads 40 conns:      358077 ops,   85385 (avg:   89502) ops/sec, 107.40MB/sec (avg: 112.58MB/sec),  7.02 (avg:  6.69) msec latency[RUN #1 25%,   5 secs] 15 threads 40 conns:      443905 ops,   85808 (avg:   88763) ops/sec, 107.93MB/sec (avg: 111.65MB/sec),  6.99 (avg:  6.75) msec latency[RUN #1 30%,   6 secs] 15 threads 40 conns:      529333 ops,   85408 (avg:   88204) ops/sec, 107.43MB/sec (avg: 110.94MB/sec),  7.02 (avg:  6.79) msec latency[RUN #1 35%,   7 secs] 15 threads 40 conns:      615621 ops,   86268 (avg:   87927) ops/sec, 108.51MB/sec (avg: 110.59MB/sec),  6.95 (avg:  6.82) msec latency[RUN #1 40%,   8 secs] 15 threads 40 conns:      700431 ops,   84788 (avg:   87535) ops/sec, 106.65MB/sec (avg: 110.10MB/sec),  7.07 (avg:  6.85) msec latency[RUN #1 45%,   9 secs] 15 threads 40 conns:      786099 ops,   85648 (avg:   87325) ops/sec, 107.73MB/sec (avg: 109.84MB/sec),  7.00 (avg:  6.86) msec latency[RUN #1 50%,  10 secs] 15 threads 40 conns:      871751 ops,   85631 (avg:   87156) ops/sec, 107.71MB/sec (avg: 109.62MB/sec),  7.00 (avg:  6.88) msec latency[RUN #1 55%,  11 secs] 15 threads 40 conns:      957540 ops,   85771 (avg:   87030) ops/sec, 107.88MB/sec (avg: 109.47MB/sec),  6.99 (avg:  6.89) msec latency[RUN #1 60%,  12 secs] 15 threads 40 conns:     1043463 ops,   85900 (avg:   86936) ops/sec, 108.05MB/sec (avg: 109.35MB/sec),  6.98 (avg:  6.90) msec latency[RUN #1 65%,  13 secs] 15 threads 40 conns:     1129728 ops,   86243 (avg:   86883) ops/sec, 108.48MB/sec (avg: 109.28MB/sec),  6.95 (avg:  6.90) msec latency[RUN #1 70%,  14 secs] 15 threads 40 conns:     1215668 ops,   85918 (avg:   86814) ops/sec, 108.07MB/sec (avg: 109.19MB/sec),  6.98 (avg:  6.91) msec latency[RUN #1 75%,  15 secs] 15 threads 40 conns:     1300945 ops,   85256 (avg:   86710) ops/sec, 107.23MB/sec (avg: 109.06MB/sec),  7.03 (avg:  6.91) msec latency[RUN #1 80%,  16 secs] 15 threads 40 conns:     1386626 ops,   85659 (avg:   86644) ops/sec, 107.74MB/sec (avg: 108.98MB/sec),  7.00 (avg:  6.92) msec latency[RUN #1 85%,  17 secs] 15 threads 40 conns:     1473172 ops,   86291 (avg:   86623) ops/sec, 108.54MB/sec (avg: 108.95MB/sec),  6.95 (avg:  6.92) msec latency[RUN #1 90%,  18 secs] 15 threads 40 conns:     1559291 ops,   86096 (avg:   86594) ops/sec, 108.29MB/sec (avg: 108.92MB/sec),  6.97 (avg:  6.92) msec latency[RUN #1 95%,  19 secs] 15 threads 40 conns:     1645341 ops,   86029 (avg:   86564) ops/sec, 108.21MB/sec (avg: 108.88MB/sec),  6.97 (avg:  6.93) msec latency[RUN #1 100%,  20 secs] 15 threads 40 conns:     1731183 ops,   86018 (avg:   86537) ops/sec, 108.19MB/sec (avg: 108.85MB/sec),  6.97 (avg:  6.93) msec latency[RUN #1 100%,  20 secs]  0 threads 40 conns:     1731402 ops,   86018 (avg:   86545) ops/sec, 108.19MB/sec (avg: 108.86MB/sec),  6.97 (avg:  6.93) msec latency
+
+Writing Full Run command HDR latency histogram results to ~/results/kividb-rc7/r1/d100/mset10_p1.c1_FULL_RUN_1.txt...
+Writing Full Run command HDR latency histogram results in HistogramLogProcessor format to ~/results/kividb-rc7/r1/d100/mset10_p1.c1_FULL_RUN_1.hgrm...
+Writing MSET command HDR latency histogram results to ~/results/kividb-rc7/r1/d100/mset10_p1.c1_MSET_command_run_1.txt...
+Writing MSET command HDR latency histogram results in HistogramLogProcessor format to ~/results/kividb-rc7/r1/d100/mset10_p1.c1_MSET_command_run_1.hgrm...
+
+CPU Utilization Summary
+  Total CPU time:   64.900s  (user 27.058s, sys 37.842s)
+  Wall time:        20.013s
+  Cores used:       3.243   (avg 21.6% across 15 worker threads)
+  Peak utilization: 375.5%
+Saving JSON output file: ~/results/kividb-rc7/r1/d100/mset10_p1.c1.json
+Json file closed.
+15        Threads
+40        Connections per thread
+20        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Msets       86542.27         0.00         0.00         6.93001         6.94300         9.59900        10.75100    111464.42 
+Totals      86542.27         0.00         0.00         6.93001         6.94300         9.59900        10.75100    222928.84 
+rc=0

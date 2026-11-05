@@ -1,0 +1,20 @@
+rep 1: sigstop_logged_t=20.274 replica_promoted_at=4867969 old_master_stream_ended_at=4868535 gap_bytes=566 old_master_aof_bytes=4867941 lost=[] 
+rep 2: sigstop_logged_t=20.588 replica_promoted_at=4961647 old_master_stream_ended_at=4962921 gap_bytes=1274 old_master_aof_bytes=4961619 lost=[] 
+rep 3: sigstop_logged_t=20.277 replica_promoted_at=4808459 old_master_stream_ended_at=4809733 gap_bytes=1274 old_master_aof_bytes=4808431 lost=[] 
+rep 4: sigstop_logged_t=20.581 replica_promoted_at=4951633 old_master_stream_ended_at=4952275 gap_bytes=642 old_master_aof_bytes=4951605 lost=[] 
+rep 5: sigstop_logged_t=20.276 replica_promoted_at=4876541 old_master_stream_ended_at=4877815 gap_bytes=1274 old_master_aof_bytes=4876513 lost=[] 
+rep 6: sigstop_logged_t=20.575 replica_promoted_at=4912281 old_master_stream_ended_at=4913555 gap_bytes=1274 old_master_aof_bytes=4912253 lost=[] 
+rep 7: sigstop_logged_t=20.279 replica_promoted_at=4701861 old_master_stream_ended_at=4702505 gap_bytes=644 old_master_aof_bytes=4701833 lost=[] 
+rep 8: sigstop_logged_t=20.576 replica_promoted_at=4889059 old_master_stream_ended_at=4890333 gap_bytes=1274 old_master_aof_bytes=4889031 lost=[] 
+rep 9: sigstop_logged_t=20.277 replica_promoted_at=4858505 old_master_stream_ended_at=4859779 gap_bytes=1274 old_master_aof_bytes=4858477 lost=[] 
+PROBE-DONE
+rep 10: sigstop_logged_t=20.568 replica_promoted_at=4915381 old_master_stream_ended_at=4916655 gap_bytes=1274 old_master_aof_bytes=4915353 lost=[] 
+rep 11: sigstop_logged_t=20.277 replica_promoted_at=4794559 old_master_stream_ended_at=4795833 gap_bytes=1274 old_master_aof_bytes=4794531 lost=[] 
+rep 12: sigstop_logged_t=20.565 replica_promoted_at=4927301 old_master_stream_ended_at=4928575 gap_bytes=1274 old_master_aof_bytes=4927273 lost=[] 
+rep 13: sigstop_logged_t=20.296 replica_promoted_at=4759899 old_master_stream_ended_at=4761173 gap_bytes=1274 old_master_aof_bytes=4759871 lost=[] 
+rep 14: sigstop_logged_t=20.589 replica_promoted_at=4937661 old_master_stream_ended_at=4938935 gap_bytes=1274 old_master_aof_bytes=4937633 lost=[] 
+rep 15: sigstop_logged_t=20.280 replica_promoted_at=4851325 old_master_stream_ended_at=4852599 gap_bytes=1274 old_master_aof_bytes=4851297 lost=[] 
+rep 16: sigstop_logged_t=20.581 replica_promoted_at=4909363 old_master_stream_ended_at=4910087 gap_bytes=724 old_master_aof_bytes=4909413 lost=[ack:6:11942@20.579]  ack:6:11942=in_old_master_aof:1
+rep 17: sigstop_logged_t=20.286 replica_promoted_at=4898547 old_master_stream_ended_at=4899821 gap_bytes=1274 old_master_aof_bytes=4898519 lost=[] 
+rep 18: sigstop_logged_t=20.595 replica_promoted_at=4893367 old_master_stream_ended_at=4894641 gap_bytes=1274 old_master_aof_bytes=4893339 lost=[] 
+PROBE-DONE

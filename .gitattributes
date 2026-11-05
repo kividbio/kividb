@@ -3,3 +3,38 @@
 scripts/client_compat/** text eol=lf
 .githooks/* text eol=lf
 scripts/ci/* text eol=lf
+
+# Source archives (git archive, and GitHub's tarballs and zips of a tag) leave
+# out what is only there to be read on GitHub. The files stay in the repository.
+# The 1.2.0 tarball was 70 MB against 4.5 MB for 1.1.3, almost all of it raw
+# benchmark results (#319).
+#
+# Benchmark results (benchmarks/<release>/): the READMEs, the harnesses and
+# the summary tables stay in; raw results, logs and charts go. The rules match
+# files by type, because a rule that matches a directory drops everything
+# under it, README and harness included, and no rule below can bring it back.
+benchmarks/[0-9]*/**/*.json export-ignore
+benchmarks/[0-9]*/**/*.jsonl export-ignore
+benchmarks/[0-9]*/**/*.csv export-ignore
+benchmarks/[0-9]*/**/*.tsv export-ignore
+benchmarks/[0-9]*/**/*.txt export-ignore
+benchmarks/[0-9]*/**/*.log export-ignore
+benchmarks/[0-9]*/**/*.err export-ignore
+benchmarks/[0-9]*/**/*.out export-ignore
+benchmarks/[0-9]*/**/*.raw export-ignore
+benchmarks/[0-9]*/**/*.cpu export-ignore
+benchmarks/[0-9]*/**/*.events export-ignore
+benchmarks/[0-9]*/**/*.start export-ignore
+benchmarks/[0-9]*/**/*.end export-ignore
+benchmarks/[0-9]*/**/*.sha256 export-ignore
+benchmarks/[0-9]*/**/*.gz export-ignore
+benchmarks/[0-9]*/**/*.tgz export-ignore
+benchmarks/[0-9]*/**/*.svg export-ignore
+benchmarks/[0-9]*/**/*.png export-ignore
+benchmarks/[0-9]*/**/*.webp export-ignore
+benchmarks/[0-9]*/**/harness/** -export-ignore
+benchmarks/[0-9]*/**/scripts/** -export-ignore
+benchmarks/[0-9]*/**/*summary*.csv -export-ignore
+
+# The README's benchmark charts and video: nothing builds or tests with them.
+assets/benchmarks export-ignore

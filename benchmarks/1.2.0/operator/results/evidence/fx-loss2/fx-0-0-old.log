@@ -1,0 +1,18 @@
+2026-11-02T20:57:14.407240554Z 2026-11-02T20:57:14.407Z 1 [INFO] Cluster: Manual failover requested by aa605ae1ca33483a81379163a46dc8d2bc83525d — writes paused, replica must reach offset 1469047
+2026-11-02T20:57:14.410867989Z 2026-11-02T20:57:14.409Z 1 [INFO] Cluster: Voted for aa605ae1ca33483a81379163a46dc8d2bc83525d to take over from e61f64e7a646285a37e4429e04ce040289179c94 at epoch 8 (manual failover)
+2026-11-02T20:57:14.515013239Z 2026-11-02T20:57:14.514Z 1 [INFO] Cluster: Slots of this shard are now owned by aa605ae1ca33483a81379163a46dc8d2bc83525d — following it as a replica
+2026-11-02T20:57:14.515688733Z 2026-11-02T20:57:14.515Z 1 [INFO] Replication: Replica 10.244.2.218:57052 disconnected: this node is now a replica itself
+2026-11-02T20:57:14.515793955Z 2026-11-02T20:57:14.515Z 1 [INFO] Replication: uring: replica disconnected
+2026-11-02T20:57:14.515876598Z 2026-11-02T20:57:14.515Z 1 [INFO] Replication: Connecting to master 10.244.2.218:6380...
+2026-11-02T20:57:14.538408528Z 2026-11-02T20:57:14.538Z 1 [INFO] Replication: Full resync from aea2c5419b733d108bde448ab391027eebe320ba offset=1469247
+2026-11-02T20:57:14.538474365Z 2026-11-02T20:57:14.538Z 1 [INFO] Replication: Receiving full-sync payload (1659110 bytes)...
+2026-11-02T20:57:14.556026939Z 2026-11-02T20:57:14.555Z 1 [WARN] Replication: Dropped the 72208 local keys before loading 72213 from the master
+2026-11-02T20:57:14.596877712Z 2026-11-02T20:57:14.596Z 1 [INFO] Replication: Full sync loaded: 72213 keys (0 with a TTL), replacing 72208 local keys
+2026-11-02T20:57:14.598364985Z 2026-11-02T20:57:14.597Z 1 [INFO] Replication: AOF is on — rebasing it onto the synced dataset
+2026-11-02T20:57:14.632934063Z 2026-11-02T20:57:14.632Z 1 [INFO] AOF: rebased onto dump.kdb (generation 7) — log is now the delta
+2026-11-02T20:57:14.633503696Z 2026-11-02T20:57:14.633Z 1 [INFO] Replication: Synced with 10.244.2.218:6380. Entering command stream.
+2026-11-02T20:57:14.633699080Z 2026-11-02T20:57:14.633Z 1 [INFO] Replication: Backlog restarted at offset 1469247 (it ended at 1469047)
+2026-11-02T20:57:14.662189565Z 2026-11-02T20:57:14.661Z 1 [INFO] SIGTERM received — shutting down gracefully
+2026-11-02T20:57:14.662203055Z 2026-11-02T20:57:14.661Z 1 [INFO] Writing final snapshot...
+2026-11-02T20:57:14.696178125Z 2026-11-02T20:57:14.696Z 1 [INFO] AOF: rebased onto dump.kdb (generation 8) — log is now the delta
+2026-11-02T20:57:14.697286996Z 2026-11-02T20:57:14.696Z 1 [INFO] Goodbye.

@@ -1,0 +1,53 @@
+{
+  "label": "kividb",
+  "url": "redis://127.0.0.1:6421",
+  "redis_version": "8.10.0",
+  "openviking": "0.5.3",
+  "redis_py": "6.4.0",
+  "counts": {
+    "PASS": 8,
+    "FAIL": 0
+  },
+  "checks": [
+    {
+      "check": "two runtimes start on one service name (storage, publisher, consumer)",
+      "status": "PASS",
+      "detail": "6 keys"
+    },
+    {
+      "check": "report 12 items due in 1 s, then unregister one of them",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "check": "every item falls due and is called back exactly once, across the two runtimes",
+      "status": "PASS",
+      "detail": "runtime a: 6 calls, runtime b: 6 calls"
+    },
+    {
+      "check": "a callback that answers RETRY is called again, then completes",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "check": "an unregistered item is never called back",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "check": "both runtimes stop cleanly",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "check": "a runtime reports 3 items and stops before they fall due",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "check": "a new runtime calls back the items the stopped one left",
+      "status": "PASS",
+      "detail": ""
+    }
+  ]
+}

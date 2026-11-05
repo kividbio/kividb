@@ -39,6 +39,7 @@ from __future__ import annotations
 import time
 import threading
 import subprocess
+import tempfile
 import os
 
 import pytest
@@ -90,6 +91,8 @@ def start_custom_server(port: int, extra_args: list[str]) -> subprocess.Popen:
         base_args = [KIVI_BINARY, "--port", str(port), "--loglevel", "error"]
     proc = subprocess.Popen(
         base_args + extra_args,
+        # A directory of its own: one engine to a data directory.
+        cwd=tempfile.mkdtemp(prefix="kividb-e2e-"),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )

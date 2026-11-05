@@ -1,0 +1,13 @@
+88988c4ae37c985a21361532d27398a508442fe6870c048b575b2e2424ec0d8b  dump.kdb
+0b5b75931c9e6ab1da4dde88c5ba744a7228477a476b590db42211a468442d63  dump.kdb.repl
+drwxr-xr-x 2 azureuser root            4096 07:46:27.206291774 .
+drwxr-xr-x 4 azureuser root            4096 07:45:54.645210530 ..
+-rw-rw-r-- 1 azureuser azureuser  191311649 07:46:33.661307868 appendonly.aof
+-rw-rw-r-- 1 azureuser azureuser         46 07:45:54.657210560 cmd
+-rw-rw-r-- 1 azureuser azureuser 1250737881 07:46:27.202291764 dump.kdb
+-rw-rw-r-- 1 azureuser azureuser         24 07:46:27.205291771 dump.kdb.gen
+-rw-rw-r-- 1 azureuser azureuser        110 07:46:10.156249214 dump.kdb.repl
+-rw-rw-r-- 1 azureuser azureuser          0 07:45:54.659210565 kividb.lock
+-rw-rw-r-- 1 azureuser azureuser        131 07:45:54.656210558 node.conf
+-rw-rw-r-- 1 azureuser azureuser          6 07:47:42.288478519 pid
+-rw-rw-r-- 1 azureuser azureuser      13200 07:48:56.732663211 server.log

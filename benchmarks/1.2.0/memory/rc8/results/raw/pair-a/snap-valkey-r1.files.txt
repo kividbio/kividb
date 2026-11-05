@@ -1,0 +1,5 @@
+total 30575108
+drwxrwxrwx 3 dnsmasq root                   4096 Nov  3 04:47 .
+drwxr-xr-x 4 root    root                   4096 Nov  3 02:47 ..
+drwx------ 2 dnsmasq systemd-journal        4096 Nov  3 04:47 appendonlydir
+-rw------- 1 dnsmasq systemd-journal 31308889002 Nov  3 04:42 dump.rdb

@@ -1,0 +1,12 @@
+{
+ "keys_acked": 16512,
+ "acked_writes": 475931,
+ "failed_writes": 0,
+ "error_kinds": {},
+ "ok": 16512,
+ "missing": 0,
+ "stale": 0,
+ "other": 0,
+ "ok_unknown_later": 0,
+ "bad_by_slot": {}
+}

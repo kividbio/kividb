@@ -1,0 +1,876 @@
+[
+ {
+  "section": "warefeats ASCII",
+  "metric": "1st M RSS B/key",
+  "better": "lower",
+  "rc8": [
+   149.1
+  ],
+  "rc7": [
+   149
+  ],
+  "digits": 1
+ },
+ {
+  "section": "warefeats ASCII",
+  "metric": "1st M used B/key",
+  "better": "lower",
+  "rc8": [
+   146.9
+  ],
+  "rc7": [
+   146.9
+  ],
+  "digits": 1
+ },
+ {
+  "section": "warefeats ASCII",
+  "metric": "2nd M RSS B/key",
+  "better": "lower",
+  "rc8": [
+   146.9
+  ],
+  "rc7": [
+   147.4
+  ],
+  "digits": 1
+ },
+ {
+  "section": "warefeats random",
+  "metric": "1st M RSS B/key",
+  "better": "lower",
+  "rc8": [
+   149.2
+  ],
+  "rc7": [
+   149.2
+  ],
+  "digits": 1
+ },
+ {
+  "section": "warefeats random",
+  "metric": "1st M used B/key",
+  "better": "lower",
+  "rc8": [
+   146.9
+  ],
+  "rc7": [
+   146.9
+  ],
+  "digits": 1
+ },
+ {
+  "section": "warefeats random",
+  "metric": "2nd M RSS B/key",
+  "better": "lower",
+  "rc8": [
+   146.7
+  ],
+  "rc7": [
+   146.7
+  ],
+  "digits": 1
+ },
+ {
+  "section": "warefeats set-get-small",
+  "metric": "ops/s",
+  "better": "higher",
+  "rc8": [
+   1310912.05
+  ],
+  "rc7": [
+   1329474.385
+  ],
+  "digits": 0
+ },
+ {
+  "section": "warefeats set-get-small",
+  "metric": "p99 ms",
+  "better": "lower",
+  "rc8": [
+   0.335
+  ],
+  "rc7": [
+   0.339
+  ],
+  "digits": 3
+ },
+ {
+  "section": "warefeats set-get-small",
+  "metric": "p99.9 ms",
+  "better": "lower",
+  "rc8": [
+   0.391
+  ],
+  "rc7": [
+   0.395
+  ],
+  "digits": 3
+ },
+ {
+  "section": "warefeats set-get-large",
+  "metric": "ops/s",
+  "better": "higher",
+  "rc8": [
+   318999.12
+  ],
+  "rc7": [
+   318937.39
+  ],
+  "digits": 0
+ },
+ {
+  "section": "warefeats set-get-large",
+  "metric": "p99 ms",
+  "better": "lower",
+  "rc8": [
+   1.195
+  ],
+  "rc7": [
+   1.195
+  ],
+  "digits": 3
+ },
+ {
+  "section": "warefeats set-get-large",
+  "metric": "p99.9 ms",
+  "better": "lower",
+  "rc8": [
+   1.275
+  ],
+  "rc7": [
+   1.287
+  ],
+  "digits": 3
+ },
+ {
+  "section": "warefeats pipeline-30",
+  "metric": "ops/s",
+  "better": "higher",
+  "rc8": [
+   17298680.299999997
+  ],
+  "rc7": [
+   17143693.354999997
+  ],
+  "digits": 0
+ },
+ {
+  "section": "warefeats pipeline-30",
+  "metric": "p99 ms",
+  "better": "lower",
+  "rc8": [
+   0.651
+  ],
+  "rc7": [
+   0.655
+  ],
+  "digits": 3
+ },
+ {
+  "section": "warefeats pipeline-30",
+  "metric": "p99.9 ms",
+  "better": "lower",
+  "rc8": [
+   0.767
+  ],
+  "rc7": [
+   0.767
+  ],
+  "digits": 3
+ },
+ {
+  "section": "growth 100 B",
+  "metric": "RSS B/key at 1M",
+  "better": "lower",
+  "rc8": [
+   153.5115264
+  ],
+  "rc7": [
+   154.140672
+  ],
+  "digits": 1
+ },
+ {
+  "section": "growth 100 B",
+  "metric": "RSS B/key at 5M",
+  "better": "lower",
+  "rc8": [
+   146.6957824
+  ],
+  "rc7": [
+   146.75869696
+  ],
+  "digits": 1
+ },
+ {
+  "section": "growth 100 B",
+  "metric": "RSS B/key at 10M",
+  "better": "lower",
+  "rc8": [
+   145.03903232000002
+  ],
+  "rc7": [
+   145.02854656
+  ],
+  "digits": 1
+ },
+ {
+  "section": "growth 100 B",
+  "metric": "RSS B/key at 25M",
+  "better": "lower",
+  "rc8": [
+   141.020889088
+  ],
+  "rc7": [
+   141.062832128
+  ],
+  "digits": 1
+ },
+ {
+  "section": "growth 100 B",
+  "metric": "RSS B/key at 50M",
+  "better": "lower",
+  "rc8": [
+   140.68324761600002
+  ],
+  "rc7": [
+   140.706316288
+  ],
+  "digits": 1
+ },
+ {
+  "section": "growth 100 B",
+  "metric": "load seconds, 50M keys",
+  "better": "lower",
+  "rc8": [
+   13.046503067016602
+  ],
+  "rc7": [
+   13.025293827056885
+  ],
+  "digits": 1
+ },
+ {
+  "section": "growth 1024 B",
+  "metric": "RSS B/key at 1M",
+  "better": "lower",
+  "rc8": [
+   1085.800448
+  ],
+  "rc7": [
+   1085.800448
+  ],
+  "digits": 1
+ },
+ {
+  "section": "growth 1024 B",
+  "metric": "RSS B/key at 5M",
+  "better": "lower",
+  "rc8": [
+   1077.7473843199998
+  ],
+  "rc7": [
+   1077.41184
+  ],
+  "digits": 1
+ },
+ {
+  "section": "growth 1024 B",
+  "metric": "RSS B/key at 10M",
+  "better": "lower",
+  "rc8": [
+   1076.10112
+  ],
+  "rc7": [
+   1076.2374348800001
+  ],
+  "digits": 1
+ },
+ {
+  "section": "growth 1024 B",
+  "metric": "RSS B/key at 25M",
+  "better": "lower",
+  "rc8": [
+   1072.0053821440001
+  ],
+  "rc7": [
+   1072.10604544
+  ],
+  "digits": 1
+ },
+ {
+  "section": "growth 1024 B",
+  "metric": "RSS B/key at 50M",
+  "better": "lower",
+  "rc8": [
+   1071.648866304
+  ],
+  "rc7": [
+   1071.699197952
+  ],
+  "digits": 1
+ },
+ {
+  "section": "growth 1024 B",
+  "metric": "load seconds, 50M keys",
+  "better": "lower",
+  "rc8": [
+   23.003093242645264
+  ],
+  "rc7": [
+   22.982524633407593
+  ],
+  "digits": 1
+ },
+ {
+  "section": "mixed 20 min",
+  "metric": "RSS at end GiB",
+  "better": "lower",
+  "rc8": [
+   3.93876953125,
+   3.928515625
+  ],
+  "rc7": [
+   3.93671875,
+   3.9310546875
+  ],
+  "digits": 2
+ },
+ {
+  "section": "mixed 20 min",
+  "metric": "RSS peak GiB",
+  "better": "lower",
+  "rc8": [
+   4.4490234375,
+   4.43564453125
+  ],
+  "rc7": [
+   4.43994140625,
+   4.4443359375
+  ],
+  "digits": 2
+ },
+ {
+  "section": "mixed 20 min",
+  "metric": "RSS/used at end",
+  "better": "lower",
+  "rc8": [
+   1.148466641988667,
+   1.1455420451633114
+  ],
+  "rc7": [
+   1.1479667388085204,
+   1.1464783116402268
+  ],
+  "digits": 2
+ },
+ {
+  "section": "mixed 20 min",
+  "metric": "GET p99 ms",
+  "better": "lower",
+  "rc8": [
+   0.455,
+   0.463
+  ],
+  "rc7": [
+   0.479,
+   0.439
+  ],
+  "digits": 2
+ },
+ {
+  "section": "mixed 20 min",
+  "metric": "GET p99.9 ms",
+  "better": "lower",
+  "rc8": [
+   0.599,
+   0.663
+  ],
+  "rc7": [
+   0.679,
+   0.615
+  ],
+  "digits": 2
+ },
+ {
+  "section": "mixed 20 min",
+  "metric": "SET p99 ms",
+  "better": "lower",
+  "rc8": [
+   0.471,
+   0.487
+  ],
+  "rc7": [
+   0.503,
+   0.463
+  ],
+  "digits": 2
+ },
+ {
+  "section": "mixed 20 min",
+  "metric": "SET p99.9 ms",
+  "better": "lower",
+  "rc8": [
+   0.711,
+   0.815
+  ],
+  "rc7": [
+   0.831,
+   0.751
+  ],
+  "digits": 2
+ },
+ {
+  "section": "snapshot BGSAVE",
+  "metric": "memory added GiB",
+  "better": "lower",
+  "rc8": [
+   3.5865234374999986,
+   3.5454101562500036
+  ],
+  "rc7": [
+   3.500585937500002,
+   3.507910156250002
+  ],
+  "digits": 2
+ },
+ {
+  "section": "snapshot BGSAVE",
+  "metric": "duration s",
+  "better": "lower",
+  "rc8": [
+   82.2881281375885,
+   82.0258162021637
+  ],
+  "rc7": [
+   80.67124891281128,
+   81.07590413093567
+  ],
+  "digits": 1
+ },
+ {
+  "section": "snapshot BGSAVE",
+  "metric": "worst write ms",
+  "better": "lower",
+  "rc8": [
+   202.809,
+   224.359
+  ],
+  "rc7": [
+   206.542,
+   206.001
+  ],
+  "digits": 0
+ },
+ {
+  "section": "snapshot BGSAVE",
+  "metric": "write p99.9 ms",
+  "better": "lower",
+  "rc8": [
+   1.847,
+   1.983
+  ],
+  "rc7": [
+   1.983,
+   1.967
+  ],
+  "digits": 2
+ },
+ {
+  "section": "snapshot BGSAVE",
+  "metric": "write p99 before ms",
+  "better": "lower",
+  "rc8": [
+   1.455,
+   1.423
+  ],
+  "rc7": [
+   1.295,
+   1.255
+  ],
+  "digits": 2
+ },
+ {
+  "section": "snapshot BGSAVE",
+  "metric": "memory 60 s after GiB",
+  "better": "lower",
+  "rc8": [
+   33.853125,
+   33.8283203125
+  ],
+  "rc7": [
+   33.77119140625,
+   33.766796875
+  ],
+  "digits": 2
+ },
+ {
+  "section": "snapshot BGREWRITEAOF",
+  "metric": "memory added GiB",
+  "better": "lower",
+  "rc8": [
+   2.3767578124999957,
+   2.424609375000003
+  ],
+  "rc7": [
+   2.319042968749997,
+   2.4763671874999957
+  ],
+  "digits": 2
+ },
+ {
+  "section": "snapshot BGREWRITEAOF",
+  "metric": "duration s",
+  "better": "lower",
+  "rc8": [
+   83.73438358306885,
+   83.08310770988464
+  ],
+  "rc7": [
+   82.12491035461426,
+   82.0455994606018
+  ],
+  "digits": 1
+ },
+ {
+  "section": "snapshot BGREWRITEAOF",
+  "metric": "worst write ms",
+  "better": "lower",
+  "rc8": [
+   217.616,
+   215.311
+  ],
+  "rc7": [
+   219.262,
+   221.479
+  ],
+  "digits": 0
+ },
+ {
+  "section": "snapshot BGREWRITEAOF",
+  "metric": "write p99.9 ms",
+  "better": "lower",
+  "rc8": [
+   1.807,
+   1.935
+  ],
+  "rc7": [
+   1.847,
+   1.951
+  ],
+  "digits": 2
+ },
+ {
+  "section": "snapshot BGREWRITEAOF",
+  "metric": "write p99 before ms",
+  "better": "lower",
+  "rc8": [
+   1.391,
+   1.295
+  ],
+  "rc7": [
+   1.263,
+   1.287
+  ],
+  "digits": 2
+ },
+ {
+  "section": "snapshot BGREWRITEAOF",
+  "metric": "memory 60 s after GiB",
+  "better": "lower",
+  "rc8": [
+   35.64296875,
+   36.22431640625
+  ],
+  "rc7": [
+   35.51904296875,
+   36.21572265625
+  ],
+  "digits": 2
+ },
+ {
+  "section": "#284 eviction",
+  "metric": "keys evicted",
+  "better": "lower",
+  "rc8": [
+   0
+  ],
+  "rc7": [
+   0
+  ],
+  "digits": 0
+ },
+ {
+  "section": "active defrag",
+  "metric": "RSS final MB",
+  "better": "lower",
+  "rc8": [
+   389.7,
+   388.3
+  ],
+  "rc7": [
+   402.1,
+   386.8
+  ],
+  "digits": 0
+ },
+ {
+  "section": "active defrag",
+  "metric": "RSS returned MB",
+  "better": "higher",
+  "rc8": [
+   333.00000000000006,
+   334.7
+  ],
+  "rc7": [
+   320.0,
+   335.3
+  ],
+  "digits": 0
+ },
+ {
+  "section": "active defrag",
+  "metric": "give-back s",
+  "better": "lower",
+  "rc8": [
+   11.86781096458435,
+   12.067456722259521
+  ],
+  "rc7": [
+   9.752045154571533,
+   12.06095290184021
+  ],
+  "digits": 1
+ },
+ {
+  "section": "active defrag",
+  "metric": "compaction s",
+  "better": "lower",
+  "rc8": [
+   13.0,
+   12.0
+  ],
+  "rc7": [
+   9.0,
+   12.0
+  ],
+  "digits": 0
+ },
+ {
+  "section": "active defrag",
+  "metric": "slab final MB",
+  "better": "lower",
+  "rc8": [
+   321.1,
+   320.8
+  ],
+  "rc7": [
+   336.1,
+   320.8
+  ],
+  "digits": 0
+ },
+ {
+  "section": "active defrag",
+  "metric": "GET p99 during compaction ms",
+  "better": "lower",
+  "rc8": [
+   0.319,
+   0.543
+  ],
+  "rc7": [
+   0.399,
+   0.575
+  ],
+  "digits": 2
+ },
+ {
+  "section": "active defrag",
+  "metric": "GET p99.9 during compaction ms",
+  "better": "lower",
+  "rc8": [
+   0.663,
+   0.743
+  ],
+  "rc7": [
+   0.543,
+   0.787
+  ],
+  "digits": 2
+ },
+ {
+  "section": "active defrag",
+  "metric": "SET p99 during compaction ms",
+  "better": "lower",
+  "rc8": [
+   0.607,
+   0.227
+  ],
+  "rc7": [
+   0.143,
+   0.199
+  ],
+  "digits": 2
+ },
+ {
+  "section": "active defrag",
+  "metric": "SET p99.9 during compaction ms",
+  "better": "lower",
+  "rc8": [
+   0.815,
+   0.255
+  ],
+  "rc7": [
+   0.191,
+   0.455
+  ],
+  "digits": 2
+ },
+ {
+  "section": "active defrag",
+  "metric": "GET p99 during / before (same run)",
+  "better": "lower",
+  "rc8": [
+   1.0,
+   0.985480943738657
+  ],
+  "rc7": [
+   1.064,
+   1.1616161616161615
+  ],
+  "digits": 2
+ },
+ {
+  "section": "active defrag",
+  "metric": "GET p99.9 during / before (same run)",
+  "better": "lower",
+  "rc8": [
+   1.0060698027314112,
+   0.9789196310935441
+  ],
+  "rc7": [
+   1.0,
+   1.0260756192959584
+  ],
+  "digits": 2
+ },
+ {
+  "section": "active defrag",
+  "metric": "SET p99 during / before (same run)",
+  "better": "lower",
+  "rc8": [
+   0.9869918699186991,
+   1.0558139534883721
+  ],
+  "rc7": [
+   1.0,
+   1.0
+  ],
+  "digits": 2
+ },
+ {
+  "section": "active defrag",
+  "metric": "SET p99.9 during / before (same run)",
+  "better": "lower",
+  "rc8": [
+   1.0681520314547837,
+   1.0323886639676114
+  ],
+  "rc7": [
+   1.0670391061452515,
+   0.9743040685224841
+  ],
+  "digits": 2
+ },
+ {
+  "section": "AOF-on writes",
+  "metric": "SET p50 ms",
+  "better": "lower",
+  "rc8": [
+   0.399,
+   0.407,
+   0.375,
+   0.399
+  ],
+  "rc7": [
+   0.351,
+   0.407,
+   0.407,
+   0.383
+  ],
+  "digits": 3
+ },
+ {
+  "section": "AOF-on writes",
+  "metric": "SET p99 ms",
+  "better": "lower",
+  "rc8": [
+   0.975,
+   1.015,
+   0.935,
+   0.991
+  ],
+  "rc7": [
+   0.903,
+   1.007,
+   0.999,
+   0.943
+  ],
+  "digits": 3
+ },
+ {
+  "section": "AOF-on writes",
+  "metric": "SET p99.9 ms",
+  "better": "lower",
+  "rc8": [
+   1.367,
+   1.991,
+   1.343,
+   2.023
+  ],
+  "rc7": [
+   1.663,
+   1.431,
+   2.015,
+   1.327
+  ],
+  "digits": 3
+ },
+ {
+  "section": "AOF-on writes",
+  "metric": "worst write ms",
+  "better": "lower",
+  "rc8": [
+   159.694,
+   100.008,
+   162.218,
+   109.118
+  ],
+  "rc7": [
+   93.959,
+   127.186,
+   108.073,
+   132.55
+  ],
+  "digits": 0
+ },
+ {
+  "section": "AOF-on writes",
+  "metric": "engine CPU s",
+  "better": "lower",
+  "rc8": [
+   564.0,
+   561.0,
+   556.0,
+   562.0
+  ],
+  "rc7": [
+   570.0,
+   564.0,
+   564.0,
+   558.0
+  ],
+  "digits": 0
+ }
+]

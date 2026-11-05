@@ -1,0 +1,12 @@
+total 294520
+-rw-rw-r-- 1 azureuser azureuser        16 1793706810 appendonly.aof
+-rw-rw-r-- 1 azureuser azureuser        28 1793705845 bin
+-rw-rw-r-- 1 azureuser azureuser 301522675 1793706810 dump.kdb
+-rw-rw-r-- 1 azureuser azureuser        50 1793706810 dump.kdb.clean
+-rw-rw-r-- 1 azureuser azureuser        24 1793706810 dump.kdb.gen
+-rw-rw-r-- 1 azureuser azureuser       108 1793706810 dump.kdb.repl
+-rw-rw-r-- 1 azureuser azureuser         0 1793705845 kividb.lock
+-rw-rw-r-- 1 azureuser azureuser       247 1793705845 node.conf
+-rw-rw-r-- 1 azureuser azureuser      4096 1793706450 nodes.conf
+-rw-rw-r-- 1 azureuser azureuser         6 1793705845 pid
+-rw-rw-r-- 1 azureuser azureuser     27241 1793706810 server.log

@@ -1,0 +1,25 @@
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 16%,   1 secs] 15 threads 10 conns:      822397 ops,  821568 (avg:  821568) ops/sec, 1.60GB/sec (avg: 1.60GB/sec),  2.90 (avg:  2.90) msec latency[RUN #1 31%,   2 secs] 15 threads 10 conns:     1536652 ops,  714162 (avg:  767889) ops/sec, 1.39GB/sec (avg: 1.50GB/sec),  3.36 (avg:  3.12) msec latency[RUN #1 45%,   3 secs] 15 threads 10 conns:     2245853 ops,  709112 (avg:  748302) ops/sec, 1.38GB/sec (avg: 1.46GB/sec),  3.38 (avg:  3.20) msec latency[RUN #1 59%,   4 secs] 15 threads 10 conns:     2951326 ops,  705372 (avg:  737572) ops/sec, 1.38GB/sec (avg: 1.44GB/sec),  3.39 (avg:  3.25) msec latency[RUN #1 72%,   5 secs] 15 threads 10 conns:     3596589 ops,  645176 (avg:  719096) ops/sec, 1.26GB/sec (avg: 1.40GB/sec),  3.71 (avg:  3.33) msec latency[RUN #1 87%,   6 secs] 15 threads 10 conns:     4370827 ops,  774114 (avg:  728264) ops/sec, 1.51GB/sec (avg: 1.42GB/sec),  3.09 (avg:  3.29) msec latency[RUN #1 100%,   6 secs]  0 threads 10 conns:     5000100 ops,  774114 (avg:  735321) ops/sec, 1.51GB/sec (avg: 1.44GB/sec),  3.09 (avg:  3.26) msec latency
+
+
+CPU Utilization Summary
+  Total CPU time:   24.414s  (user 9.470s, sys 14.944s)
+  Wall time:        6.896s
+  Cores used:       3.540   (avg 23.6% across 15 worker threads)
+  Peak utilization: 425.8%
+setting requests to 33334
+15        Threads
+10        Connections per thread
+33334     Requests per client
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       736255.45          ---          ---         3.25714         1.71100         9.21500        20.47900   1507741.88 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     736255.45         0.00         0.00         3.25714         1.71100         9.21500        20.47900   1507741.88 

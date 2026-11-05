@@ -1,0 +1,6 @@
+10.80.1.9:7001 134 owner [0->-5e84742cd41da6b89c1f98be2f8bf1fdc35afc3b] master
+10.80.1.8:7001 29 - [0-<-995d6d75a259c993c5b0ae137ed2703ff6cff88c] master
+10.80.1.5:7001 0 - master
+10.80.1.9:7002 0 - replica
+10.80.1.8:7002 134 - replica
+10.80.1.5:7002 29 - replica

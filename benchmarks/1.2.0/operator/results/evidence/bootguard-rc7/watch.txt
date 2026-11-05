@@ -1,0 +1,5 @@
+21:55:40 +3s phase= bootstrap={"message":"waiting for the StatefulSet and pods of an earlier cluster with this name to be deleted","phase":"Pending","snapshotName":"rep-bk-032310"} pods=
+21:55:47 +10s phase=Provisioning bootstrap={"completed":true,"message":"skipped: the cluster was already running","phase":"Completed","snapshotName":"rep-bk-032310"} pods=rep-restored-0:ContainerCreating rep-restored-1:Running 
+21:55:55 +18s phase=Provisioning bootstrap={"completed":true,"message":"skipped: the cluster was already running","phase":"Completed","snapshotName":"rep-bk-032310"} pods=rep-restored-0:ContainerCreating rep-restored-1:Running 
+21:56:02 +25s phase=Provisioning bootstrap={"completed":true,"message":"skipped: the cluster was already running","phase":"Completed","snapshotName":"rep-bk-032310"} pods=rep-restored-0:Running rep-restored-1:Running 
+21:56:10 +33s phase=Provisioning bootstrap={"completed":true,"message":"skipped: the cluster was already running","phase":"Completed","snapshotName":"rep-bk-032310"} pods=rep-restored-0:Running rep-restored-1:Running 

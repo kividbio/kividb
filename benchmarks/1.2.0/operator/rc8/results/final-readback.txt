@@ -1,0 +1,6 @@
+loader-rep checked 2646956 missing 0 wrong 0 readErr 0
+loader-shd checked 2604456 missing 0 wrong 0 readErr 0
+loader-g-yes checked 693084 missing 0 wrong 0 readErr 0
+loader-g-no checked 693011 missing 0 wrong 0 readErr 0
+loader-g-113 checked 699683 missing 0 wrong 0 readErr 0
+loader-fx checked 1187652 missing 0 wrong 0 readErr 0 (at fx removal)

@@ -1,0 +1,6 @@
+== kividb-rc8
+activedefrag yes: OK
+Totals    4820754.12         0.00         0.00         0.41341         0.40700         0.75100         1.71100   1333358.86 
+activedefrag=yes run 1: 5488020 ops/s p50 0.335 p99 0.575 p99.9 2.159 max 149.503 ms
+activedefrag=yes run 2: 4521264 ops/s p50 0.343 p99 0.599 p99.9 50.175 max 131.071 ms
+activedefrag=yes run 3: 4151149 ops/s p50 0.343 p99 0.639 p99.9 56.319 max 165.887 ms

@@ -1,0 +1,40 @@
+cmd: taskset -c 1,2,3 ./bench.test -test.run=^$ -test.bench=^BenchmarkRedis$ -test.benchtime=8388608x -test.timeout=0 true 1073741824 1024 8 1 0 10.30.1.14
+pair: c4 -> 10.30.1.14
+Mon Nov  2 16:43:11 UTC 2026
+goos: linux
+goarch: arm64
+pkg: github.com/imchuncai/umem-cache-benchmark
+BenchmarkRedis-3   	
+======================================================================
+server:  2097152    warmup:  8388608    get:  8388608    hit:  5113201
+VmHWM:       0 kB   hit_rate: 60.95%    per_memory_hit_rate: 60.95%
+P1: 101 us  P50: 419 us  P90: 768 us  P99: 1142 us  P99.9: 1970 us
+165.927s	    output:   80 Mb/s   input:  128 Mb/s
+======================================================================
+ 8388608	     19780 ns/op	     30816 hit/s/mem
+PASS
+	Command being timed: "timeout 4h taskset -c 1,2,3 /home/azureuser/bench.test -test.run=^$ -test.bench=^BenchmarkRedis$ -test.benchtime=8388608x -test.timeout=0 true 1073741824 1024 8 1 0 10.30.1.14"
+	User time (seconds): 369.84
+	System time (seconds): 418.89
+	Percent of CPU this job got: 236%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 5:33.09
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 621012
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 279425
+	Voluntary context switches: 3738440
+	Involuntary context switches: 1357868
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 8
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+exit=0
+Mon Nov  2 16:48:44 UTC 2026

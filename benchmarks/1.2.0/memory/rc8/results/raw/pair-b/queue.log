@@ -1,0 +1,174 @@
+### 2026-11-03T02:57:38Z start: SRV=10.31.0.4 R=r1 ./mixed.sh kividb-rc8
+Warning: Permanently added '10.31.0.4' (ED25519) to the list of known hosts.
+kividb-rc8 plain kividb/kividb:build-082dab3d8929 redis_version:8.10.0 kividb_version:1.2.0-rc8 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+sampler started for mixed-kividb-rc8-r1 (pid 12073, /sys/fs/cgroup/system.slice/docker-396f2b0701f96c4299bcb3c987599c48ec379f8618668910f55bddf3c759d539.scope)
+[02:57:47] mixed-kividb-rc8-r1 load
+[02:57:49] mixed-kividb-rc8-r1 loaded
+[02:58:19] mixed-kividb-rc8-r1 mixed-start
+[03:18:20] mixed-kividb-rc8-r1 mixed-end
+[03:18:50] mixed-kividb-rc8-r1 end
+### 2026-11-03T03:18:53Z end (exit 0): SRV=10.31.0.4 R=r1 ./mixed.sh kividb-rc8
+### 2026-11-03T03:18:53Z start: SRV=10.31.0.4 R=r1 ./mixed.sh kividb-rc7
+kividb-rc7 plain kividb/kividb:build-598b74d20ec0 redis_version:8.10.0 kividb_version:1.2.0-rc7 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+sampler started for mixed-kividb-rc7-r1 (pid 12785, /sys/fs/cgroup/system.slice/docker-86db140aca9209d4caaad0e502eac4caa0532ec3dbadaf18362d61ec47d410d3.scope)
+[03:19:02] mixed-kividb-rc7-r1 load
+[03:19:04] mixed-kividb-rc7-r1 loaded
+[03:19:34] mixed-kividb-rc7-r1 mixed-start
+[03:39:35] mixed-kividb-rc7-r1 mixed-end
+[03:40:05] mixed-kividb-rc7-r1 end
+### 2026-11-03T03:40:08Z end (exit 0): SRV=10.31.0.4 R=r1 ./mixed.sh kividb-rc7
+### 2026-11-03T03:40:08Z start: SRV=10.31.0.4 R=r1 PROBE=300 ./defrag.sh kividb-rc7
+kividb-rc7 plain kividb/kividb:build-598b74d20ec0 redis_version:8.10.0 kividb_version:1.2.0-rc7 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+sampler started for defrag-kividb-rc7-r1 (pid 13496, /sys/fs/cgroup/system.slice/docker-070b7d97e37865cd75861e7536aa55e67597bcfcecbae57ced9e270c3cd9ef32.scope)
+[03:40:19] defrag-kividb-rc7-r1 load
+[03:40:23] defrag-kividb-rc7-r1 loaded
+[03:40:43] defrag-kividb-rc7-r1 probe-start
+[03:41:43] defrag-kividb-rc7-r1 delete-start
+[03:41:44] defrag-kividb-rc7-r1 delete-done
+2600000
+[03:45:43] defrag-kividb-rc7-r1 probe-end
+[03:46:13] defrag-kividb-rc7-r1 end
+### 2026-11-03T03:46:16Z end (exit 0): SRV=10.31.0.4 R=r1 PROBE=300 ./defrag.sh kividb-rc7
+### 2026-11-03T03:46:16Z start: SRV=10.31.0.4 R=r1 PROBE=300 ./defrag.sh kividb-rc8
+kividb-rc8 plain kividb/kividb:build-082dab3d8929 redis_version:8.10.0 kividb_version:1.2.0-rc8 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+sampler started for defrag-kividb-rc8-r1 (pid 14134, /sys/fs/cgroup/system.slice/docker-a6d38534b3d4241abb8460d6e437754877b673de0b6245185484a13fae8fdd38.scope)
+[03:46:24] defrag-kividb-rc8-r1 load
+[03:46:27] defrag-kividb-rc8-r1 loaded
+[03:46:47] defrag-kividb-rc8-r1 probe-start
+[03:47:47] defrag-kividb-rc8-r1 delete-start
+[03:47:49] defrag-kividb-rc8-r1 delete-done
+2600000
+[03:51:47] defrag-kividb-rc8-r1 probe-end
+[03:52:17] defrag-kividb-rc8-r1 end
+### 2026-11-03T03:52:20Z end (exit 0): SRV=10.31.0.4 R=r1 PROBE=300 ./defrag.sh kividb-rc8
+### 2026-11-03T03:52:20Z start: SRV=10.31.0.4 R=r1 ./aoflat.sh kividb-rc8
+kividb-rc8 persist kividb/kividb:build-082dab3d8929 redis_version:8.10.0 kividb_version:1.2.0-rc8 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data --aof --aof-rewrite-percentage 0]
+sampler started for aoflat-kividb-rc8-r1 (pid 14864, /sys/fs/cgroup/system.slice/docker-7f02f5e331dd4f31fd4a8519c6d3f0856834c96ed846551afa24a4dd16dc63a5.scope)
+[03:52:29] aoflat-kividb-rc8-r1 load
+[03:52:31] aoflat-kividb-rc8-r1 loaded
+[03:53:01] aoflat-kividb-rc8-r1 writes-start
+[03:56:01] aoflat-kividb-rc8-r1 writes-end
+[03:56:02] aoflat-kividb-rc8-r1 end
+### 2026-11-03T03:56:07Z end (exit 0): SRV=10.31.0.4 R=r1 ./aoflat.sh kividb-rc8
+### 2026-11-03T03:56:07Z start: SRV=10.31.0.4 R=r1 ./aoflat.sh kividb-rc7
+kividb-rc7 persist kividb/kividb:build-598b74d20ec0 redis_version:8.10.0 kividb_version:1.2.0-rc7 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data --aof --aof-rewrite-percentage 0]
+sampler started for aoflat-kividb-rc7-r1 (pid 15601, /sys/fs/cgroup/system.slice/docker-64308d0e17acdf933a57e0e42bac0b645fd8a90af126ad0208c2fc421f7c852c.scope)
+[03:56:16] aoflat-kividb-rc7-r1 load
+[03:56:18] aoflat-kividb-rc7-r1 loaded
+[03:56:48] aoflat-kividb-rc7-r1 writes-start
+[03:59:48] aoflat-kividb-rc7-r1 writes-end
+[03:59:49] aoflat-kividb-rc7-r1 end
+### 2026-11-03T03:59:54Z end (exit 0): SRV=10.31.0.4 R=r1 ./aoflat.sh kividb-rc7
+### 2026-11-03T03:59:54Z start: SRV=10.31.0.4 R=r2 PROBE=300 ./defrag.sh kividb-rc8
+kividb-rc8 plain kividb/kividb:build-082dab3d8929 redis_version:8.10.0 kividb_version:1.2.0-rc8 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+sampler started for defrag-kividb-rc8-r2 (pid 16290, /sys/fs/cgroup/system.slice/docker-3debc331d7ba7bb812c0ab269d5b7dab17ecb5fb9418c909bda77ad5afe5bc19.scope)
+[04:00:02] defrag-kividb-rc8-r2 load
+[04:00:05] defrag-kividb-rc8-r2 loaded
+[04:00:25] defrag-kividb-rc8-r2 probe-start
+[04:01:25] defrag-kividb-rc8-r2 delete-start
+[04:01:26] defrag-kividb-rc8-r2 delete-done
+2600000
+[04:05:25] defrag-kividb-rc8-r2 probe-end
+[04:05:54] defrag-kividb-rc8-r2 end
+### 2026-11-03T04:05:58Z end (exit 0): SRV=10.31.0.4 R=r2 PROBE=300 ./defrag.sh kividb-rc8
+### 2026-11-03T04:05:58Z start: SRV=10.31.0.4 R=r2 PROBE=300 ./defrag.sh kividb-rc7
+kividb-rc7 plain kividb/kividb:build-598b74d20ec0 redis_version:8.10.0 kividb_version:1.2.0-rc7 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+sampler started for defrag-kividb-rc7-r2 (pid 16936, /sys/fs/cgroup/system.slice/docker-0ae387200409f2226df8b3d969c8b65c1c8f174aff1e62902ba96aaa552176ce.scope)
+[04:06:06] defrag-kividb-rc7-r2 load
+[04:06:10] defrag-kividb-rc7-r2 loaded
+[04:06:30] defrag-kividb-rc7-r2 probe-start
+[04:07:30] defrag-kividb-rc7-r2 delete-start
+[04:07:31] defrag-kividb-rc7-r2 delete-done
+2600000
+[04:11:30] defrag-kividb-rc7-r2 probe-end
+[04:11:59] defrag-kividb-rc7-r2 end
+### 2026-11-03T04:12:03Z end (exit 0): SRV=10.31.0.4 R=r2 PROBE=300 ./defrag.sh kividb-rc7
+### 2026-11-03T04:12:03Z start: SRV=10.31.0.4 R=r2 ./aoflat.sh kividb-rc7
+kividb-rc7 persist kividb/kividb:build-598b74d20ec0 redis_version:8.10.0 kividb_version:1.2.0-rc7 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data --aof --aof-rewrite-percentage 0]
+sampler started for aoflat-kividb-rc7-r2 (pid 17581, /sys/fs/cgroup/system.slice/docker-763f95b05e675155ff5958663484a8a34e9d55b655bf084100c977c9654af4bd.scope)
+[04:12:11] aoflat-kividb-rc7-r2 load
+[04:12:14] aoflat-kividb-rc7-r2 loaded
+[04:12:44] aoflat-kividb-rc7-r2 writes-start
+[04:15:45] aoflat-kividb-rc7-r2 writes-end
+[04:15:45] aoflat-kividb-rc7-r2 end
+### 2026-11-03T04:15:50Z end (exit 0): SRV=10.31.0.4 R=r2 ./aoflat.sh kividb-rc7
+### 2026-11-03T04:15:50Z start: SRV=10.31.0.4 R=r2 ./aoflat.sh kividb-rc8
+kividb-rc8 persist kividb/kividb:build-082dab3d8929 redis_version:8.10.0 kividb_version:1.2.0-rc8 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data --aof --aof-rewrite-percentage 0]
+sampler started for aoflat-kividb-rc8-r2 (pid 18324, /sys/fs/cgroup/system.slice/docker-7bb012d3ee50eb30169d6fab09fcfd1d08157311d5963f15a2447c7553332c97.scope)
+[04:15:59] aoflat-kividb-rc8-r2 load
+[04:16:01] aoflat-kividb-rc8-r2 loaded
+[04:16:31] aoflat-kividb-rc8-r2 writes-start
+[04:19:32] aoflat-kividb-rc8-r2 writes-end
+[04:19:33] aoflat-kividb-rc8-r2 end
+### 2026-11-03T04:19:38Z end (exit 0): SRV=10.31.0.4 R=r2 ./aoflat.sh kividb-rc8
+### 2026-11-03T04:19:38Z start: SRV=10.31.0.4 R=r2 ./mixed.sh kividb-rc7
+kividb-rc7 plain kividb/kividb:build-598b74d20ec0 redis_version:8.10.0 kividb_version:1.2.0-rc7 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+sampler started for mixed-kividb-rc7-r2 (pid 19003, /sys/fs/cgroup/system.slice/docker-aa86bb5a2d49fe5c89fec40422d4e33cc1883cfffce234af30e2b1fa348623f3.scope)
+[04:19:46] mixed-kividb-rc7-r2 load
+[04:19:48] mixed-kividb-rc7-r2 loaded
+[04:20:18] mixed-kividb-rc7-r2 mixed-start
+[04:40:19] mixed-kividb-rc7-r2 mixed-end
+[04:40:49] mixed-kividb-rc7-r2 end
+### 2026-11-03T04:40:53Z end (exit 0): SRV=10.31.0.4 R=r2 ./mixed.sh kividb-rc7
+### 2026-11-03T04:40:53Z start: SRV=10.31.0.4 R=r2 ./mixed.sh kividb-rc8
+kividb-rc8 plain kividb/kividb:build-082dab3d8929 redis_version:8.10.0 kividb_version:1.2.0-rc8 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+sampler started for mixed-kividb-rc8-r2 (pid 19717, /sys/fs/cgroup/system.slice/docker-4543a0cf01cd2d1f2b2f9e32b1a2a65150b6fbbd1aaafb87029ca2614e04c57f.scope)
+[04:41:01] mixed-kividb-rc8-r2 load
+[04:41:03] mixed-kividb-rc8-r2 loaded
+[04:41:33] mixed-kividb-rc8-r2 mixed-start
+[05:01:34] mixed-kividb-rc8-r2 mixed-end
+[05:02:04] mixed-kividb-rc8-r2 end
+### 2026-11-03T05:02:08Z end (exit 0): SRV=10.31.0.4 R=r2 ./mixed.sh kividb-rc8
+### 2026-11-03T05:02:08Z start: SRV=10.31.0.4 R=r3 ./aoflat.sh kividb-rc8
+kividb-rc8 persist kividb/kividb:build-082dab3d8929 redis_version:8.10.0 kividb_version:1.2.0-rc8 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data --aof --aof-rewrite-percentage 0]
+sampler started for aoflat-kividb-rc8-r3 (pid 20526, /sys/fs/cgroup/system.slice/docker-d3cf8b921f3be83c60addbd88149567196cf819d15417e2864c1f323b0b685b9.scope)
+[05:02:16] aoflat-kividb-rc8-r3 load
+[05:02:18] aoflat-kividb-rc8-r3 loaded
+[05:02:48] aoflat-kividb-rc8-r3 writes-start
+[05:05:49] aoflat-kividb-rc8-r3 writes-end
+[05:05:49] aoflat-kividb-rc8-r3 end
+### 2026-11-03T05:05:54Z end (exit 0): SRV=10.31.0.4 R=r3 ./aoflat.sh kividb-rc8
+### 2026-11-03T05:05:54Z start: SRV=10.31.0.4 R=r3 ./aoflat.sh kividb-rc7
+kividb-rc7 persist kividb/kividb:build-598b74d20ec0 redis_version:8.10.0 kividb_version:1.2.0-rc7 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data --aof --aof-rewrite-percentage 0]
+sampler started for aoflat-kividb-rc7-r3 (pid 21194, /sys/fs/cgroup/system.slice/docker-16b595640e988a69712c01e374080c29aa421c72ab7203a2d79d8bc35cab6545.scope)
+[05:06:03] aoflat-kividb-rc7-r3 load
+[05:06:05] aoflat-kividb-rc7-r3 loaded
+[05:06:35] aoflat-kividb-rc7-r3 writes-start
+[05:09:36] aoflat-kividb-rc7-r3 writes-end
+[05:09:37] aoflat-kividb-rc7-r3 end
+### 2026-11-03T05:09:42Z end (exit 0): SRV=10.31.0.4 R=r3 ./aoflat.sh kividb-rc7
+### 2026-11-03T05:09:42Z start: SRV=10.31.0.4 R=r4 ./aoflat.sh kividb-rc7
+kividb-rc7 persist kividb/kividb:build-598b74d20ec0 redis_version:8.10.0 kividb_version:1.2.0-rc7 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data --aof --aof-rewrite-percentage 0]
+sampler started for aoflat-kividb-rc7-r4 (pid 21867, /sys/fs/cgroup/system.slice/docker-b5a59e0725c2eebc19cb8e8809a56c4ce81f24b7f2e5105b71ee34abfb1dbc86.scope)
+[05:09:50] aoflat-kividb-rc7-r4 load
+[05:09:52] aoflat-kividb-rc7-r4 loaded
+[05:10:22] aoflat-kividb-rc7-r4 writes-start
+[05:13:23] aoflat-kividb-rc7-r4 writes-end
+[05:13:24] aoflat-kividb-rc7-r4 end
+### 2026-11-03T05:13:28Z end (exit 0): SRV=10.31.0.4 R=r4 ./aoflat.sh kividb-rc7
+### 2026-11-03T05:13:28Z start: SRV=10.31.0.4 R=r4 ./aoflat.sh kividb-rc8
+kividb-rc8 persist kividb/kividb:build-082dab3d8929 redis_version:8.10.0 kividb_version:1.2.0-rc8 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data --aof --aof-rewrite-percentage 0]
+sampler started for aoflat-kividb-rc8-r4 (pid 22547, /sys/fs/cgroup/system.slice/docker-51b84ca6c930dc745ff9d32d34821ffbaeb25ec6befb2828e7007c0922204110.scope)
+[05:13:37] aoflat-kividb-rc8-r4 load
+[05:13:39] aoflat-kividb-rc8-r4 loaded
+[05:14:09] aoflat-kividb-rc8-r4 writes-start
+[05:17:09] aoflat-kividb-rc8-r4 writes-end
+[05:17:10] aoflat-kividb-rc8-r4 end
+### 2026-11-03T05:17:15Z end (exit 0): SRV=10.31.0.4 R=r4 ./aoflat.sh kividb-rc8
+STOP 2026-11-03T05:17:15Z

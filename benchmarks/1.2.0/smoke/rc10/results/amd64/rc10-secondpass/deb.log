@@ -1,0 +1,27 @@
+PASS: deb: dpkg -i
+PASS: deb: unit active and serving after install
+PASS: deb: CONFIG GET repl-backlog-size = 67108864 (64 MB)
+PASS: deb: CONFIG GET shutdown-timeout = 10
+PASS: deb: /var/lib/kividb/kividb.lock exists (kividb 644)
+INFO: deb: 20000 keys loaded
+PASS: deb: systemctl restart #1 returned in 0.05s, serving
+PASS: deb: systemctl restart #2 returned in 0.06s, serving
+PASS: deb: systemctl restart #3 returned in 0.06s, serving
+PASS: deb: systemctl restart #4 returned in 0.05s, serving
+PASS: deb: systemctl restart #5 returned in 0.06s, serving
+PASS: deb: 20000 keys kept across 5 restarts
+FAIL: deb: a restart had to wait for the lock -- Nov 03 14:35:29 smk-x kividb[8931]: 2026-11-03T14:35:29.319Z 8931 [WARN] The data directory /var/lib/kividb is in use by another process (it holds kividb.lock): waiting for it to be free (0s so far)
+PASS: deb: systemctl stop in 0.05s, unit inactive (success)
+PASS: deb: systemctl start again, serving
+PASS: deb: after SIGKILL, Restart=on-failure brings it back (lock released)
+PASS: deb: 20000 keys after SIGKILL + restart
+PASS: deb: a second server started by hand logs [The data directory /var/lib/kividb is in use by another process (it holds kividb.lock): waiting for it to be free]
+PASS: deb: the second server does not serve while it waits
+PASS: deb: the unit keeps serving meanwhile
+PASS: deb: systemctl stop (0.05s) lets the waiting server take over
+PASS: deb: it logs [The data directory is free after 3.1s: starting]
+PASS: deb: the hand-started server has the 20000 keys
+PASS: deb: the unit waits while the hand-started server holds the dir (active)
+PASS: deb: the unit comes up once the hand-started server exits
+PASS: deb: the unit's journal logs the wait
+PASS: deb: purge stops it

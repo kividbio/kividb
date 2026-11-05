@@ -1,0 +1,102 @@
+1793683817.131382527 failover-start slot=3000 master=10.80.1.9:7001 replica=10.80.1.8:7002
+1793683817.148322081 failover-reply OK
+1793683817.398197776 failover-promoted 10.80.1.8:7002 after 0.02 s
+1793683820.789050918 failover-old-master-replica 10.80.1.9:7001 after 3.15 s
+1793683821.177219318 failover-end cluster-ok after 0.15 s
+1793684537.129272282 kill9-start slot=8000 master=10.80.1.8:7001 replica=10.80.1.5:7002
+1793684537.834108876 kill9-killed 10.80.1.8:7001
+1793684543.239013978 kill9-promoted 10.80.1.5:7002 after 5.24 s
+1793684565.902263718 kill9-restarted 10.80.1.8:7001
+1793684572.020434532 kill9-rejoined 10.80.1.8:7001 as replica after 5.89 s
+1793684572.481724225 kill9-end cluster-ok after 0.16 s
+1793685316.852506884 reshard-start 10 slots from 10.80.1.8:7002 (b00aa6a3bd6b413f37723f37da0c3b7b7b13c791, 1565272 keys) to 10.80.1.5:7002 (e76a3a1003cb9a2aa3b865cf6d98807bcaad5167) with redis-cli
+1793685317.353941536 reshard-attempt 1 exit=1 after 0.49 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:9565'. The copies sent to 10.80.1.5:7002 were deleted there; MIGRATE them again
+1793685321.123851854 reshard-repair slot 0: {"slot": 0, "src_keys_before": 272, "dst_keys_before": 49, "importing": "OK", "migrating": "OK", "migrated": 1, "tryagain": 4, "setslot_node": {"10.80.1.5:7002": "OK", "10.80.1.8:7002": "OK", "10.80.1.9:7001": "OK", "10.80.1.8:7001": "OK", "10.80.1.5:7001": "OK", "10.80.1.9:7002": "OK"}, "src_keys_after": 0, "dst_keys_after": 321, "seconds": 3.24}
+1793685321.954921864 reshard-attempt 2 exit=1 after 5.09 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:10261'. The copies sent to 10.80.1.5:7002 were deleted there; MIGRATE them again
+1793685341.596931206 reshard-repair slot 1: {"slot": 1, "src_keys_before": 195, "dst_keys_before": 79, "importing": "OK", "migrating": "OK", "migrated": 1, "tryagain": 66, "setslot_node": {"10.80.1.5:7002": "OK", "10.80.1.8:7002": "OK", "10.80.1.9:7001": "OK", "10.80.1.8:7001": "OK", "10.80.1.5:7001": "OK", "10.80.1.9:7002": "OK"}, "src_keys_after": 0, "dst_keys_after": 274, "seconds": 19.07}
+1793685342.046932379 reshard-attempt 3 exit=1 after 25.18 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:14904'. The copies sent to 10.80.1.5:7002 were deleted there; MIGRATE them again
+1793685345.400352320 reshard-repair slot 2: {"slot": 2, "src_keys_before": 260, "dst_keys_before": 19, "importing": "OK", "migrating": "OK", "migrated": 62, "tryagain": 2, "setslot_node": {"10.80.1.5:7002": "OK", "10.80.1.8:7002": "OK", "10.80.1.9:7001": "OK", "10.80.1.8:7001": "OK", "10.80.1.5:7001": "OK", "10.80.1.9:7002": "OK"}, "src_keys_after": 0, "dst_keys_after": 279, "seconds": 2.72}
+1793685345.789711879 reshard-attempt 4 exit=1 after 28.92 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:2797'. The copies sent to 10.80.1.5:7002 were deleted there; MIGRATE them again
+1793685354.659871883 reshard-repair slot 3: {"slot": 3, "src_keys_before": 260, "dst_keys_before": 9, "importing": "OK", "migrating": "OK", "migrated": 1, "tryagain": 24, "setslot_node": {"10.80.1.5:7002": "OK", "10.80.1.8:7002": "OK", "10.80.1.9:7001": "OK", "10.80.1.8:7001": "OK", "10.80.1.5:7001": "OK", "10.80.1.9:7002": "OK"}, "src_keys_after": 0, "dst_keys_after": 269, "seconds": 8.18}
+1793685355.109410979 reshard-attempt 5 exit=1 after 38.24 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:19105'. The copies sent to 10.80.1.5:7002 were deleted there; MIGRATE them again
+1793685361.711891967 reshard-repair slot 4: {"slot": 4, "src_keys_before": 280, "dst_keys_before": 19, "importing": "OK", "migrating": "OK", "migrated": 1, "tryagain": 15, "setslot_node": {"10.80.1.5:7002": "OK", "10.80.1.8:7002": "OK", "10.80.1.9:7001": "OK", "10.80.1.8:7001": "OK", "10.80.1.5:7001": "OK", "10.80.1.9:7002": "OK"}, "src_keys_after": 0, "dst_keys_after": 299, "seconds": 5.94}
+1793685363.146991555 reshard-attempt 6 exit=1 after 46.28 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:17268'. The copies sent to 10.80.1.5:7002 were deleted there; MIGRATE them again
+1793685368.952487904 reshard-repair slot 5: {"slot": 5, "src_keys_before": 139, "dst_keys_before": 159, "importing": "OK", "migrating": "OK", "migrated": 2, "tryagain": 11, "setslot_node": {"10.80.1.5:7002": "OK", "10.80.1.8:7002": "OK", "10.80.1.9:7001": "OK", "10.80.1.8:7001": "OK", "10.80.1.5:7001": "OK", "10.80.1.9:7002": "OK"}, "src_keys_after": 0, "dst_keys_after": 298, "seconds": 5.16}
+1793685375.641794554 reshard-attempt 7 exit=1 after 58.78 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:17485'. The copies sent to 10.80.1.5:7002 were deleted there; MIGRATE them again
+1793685383.077720565 reshard-repair slot 7: {"slot": 7, "src_keys_before": 81, "dst_keys_before": 189, "importing": "OK", "migrating": "OK", "migrated": 1, "tryagain": 18, "setslot_node": {"10.80.1.5:7002": "OK", "10.80.1.8:7002": "OK", "10.80.1.9:7001": "OK", "10.80.1.8:7001": "OK", "10.80.1.5:7001": "OK", "10.80.1.9:7002": "OK"}, "src_keys_after": 0, "dst_keys_after": 271, "seconds": 6.79}
+1793685383.535496771 reshard-attempt 8 exit=1 after 66.67 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:10997'. The copies sent to 10.80.1.5:7002 were deleted there; MIGRATE them again
+1793685387.411757632 reshard-repair slot 8: {"slot": 8, "src_keys_before": 255, "dst_keys_before": 29, "importing": "OK", "migrating": "OK", "migrated": 1, "tryagain": 4, "setslot_node": {"10.80.1.5:7002": "OK", "10.80.1.8:7002": "OK", "10.80.1.9:7001": "OK", "10.80.1.8:7001": "OK", "10.80.1.5:7001": "OK", "10.80.1.9:7002": "OK"}, "src_keys_after": 0, "dst_keys_after": 285, "seconds": 3.25}
+1793685388.292303458 reshard-attempt 9 exit=1 after 71.43 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:3076'. The copies sent to 10.80.1.5:7002 were deleted there; MIGRATE them again
+1793685395.112734122 reshard-repair slot 9: {"slot": 9, "src_keys_before": 183, "dst_keys_before": 79, "importing": "OK", "migrating": "OK", "migrated": 1, "tryagain": 15, "setslot_node": {"10.80.1.5:7002": "OK", "10.80.1.8:7002": "OK", "10.80.1.9:7001": "OK", "10.80.1.8:7001": "OK", "10.80.1.5:7001": "OK", "10.80.1.9:7002": "OK"}, "src_keys_after": 0, "dst_keys_after": 263, "seconds": 6.2}
+1793685395.499866950 reshard-done in 78.63 s: 10 slots moved in 9 redis-cli runs, slots begun=10
+1793685395.976118929 reshard-end cluster-ok after 0.16 s
+1793685737.154075487 reshardfix-start round 1 try 1: 5 slots (0 1 2 3 4) from 10.80.1.5:7002 (e76a3a1003cb9a2aa3b865cf6d98807bcaad5167) to 10.80.1.5:7001 (f928e7d9f5bf6b9b384cd1ced1c5b5b5dccfc1f0), plain redis-cli, hot keys on
+1793685752.540708546 reshardfix-reshard round 1 try 1 exit=1 after 15.62 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:9565'. The copies sent to 10.80.1.5:7001 were deleted there; MIGRATE them again
+1793685752.826861291 reshardfix-interrupted round 1 slot 0 by TRYAGAIN
+1793685755.436566650 reshardfix-before-fix slot 0: 10.80.1.9:7001 0 - replica;10.80.1.8:7001 345 - replica;10.80.1.5:7001 69 - [0-<-e76a3a1003cb9a2aa3b865cf6d98807bcaad5167] master;10.80.1.9:7002 69 - replica;10.80.1.8:7002 0 - master;10.80.1.5:7002 345 owner [0->-f928e7d9f5bf6b9b384cd1ced1c5b5b5dccfc1f0] master;
+1793685758.003529342 reshardfix-fix round 1 slot 0 exit=1 after 2.55 s: >>> No single clear owner for the slot, selecting an owner by # of keys... *** Configuring 10.80.1.5:7002 as the slot owner >>> Case 2: Moving all the 0 slot keys to its owner 10.80.1.5:7002 
+1793685760.795026518 reshardfix-after-fix slot 0: 10.80.1.9:7001 0 - replica;10.80.1.8:7001 407 - replica;10.80.1.5:7001 10 - [0-<-e76a3a1003cb9a2aa3b865cf6d98807bcaad5167] master;10.80.1.9:7002 10 - replica;10.80.1.8:7002 0 - master;10.80.1.5:7002 409 owner master;
+1793685760.807227989 reshardfix-check-after-fix open-slots=1 covered=1 errors=0
+1793685760.813099575 reshardfix-FIX-FAILED round 1 slot 0 (exit 1): a second fix, then slotfix.py if still open
+1793685763.665217974 reshardfix-fix2 exit=1 
+1793685794.374231350 reshardfix-end round 1 in 57.08 s, cluster-ok after 0.14 s
+1793685911.664539693 manual-close slot 0 after reshardfix round 1: SETSLOT 0 STABLE on 10.80.1.5:7001
+1793686217.496655596 import-start CLUSTER MIGRATION IMPORT 10923 11422 on 10.80.1.8:7002 (b00aa6a3bd6b413f37723f37da0c3b7b7b13c791, 1998090 keys), source 10.80.1.5:7001 (f928e7d9f5bf6b9b384cd1ced1c5b5b5dccfc1f0, 2001707 keys)
+1793686217.506365392 import-id 89cf0669755de7d379b993c108d19b4e4177d013
+1793686221.682658122 import-done in 4.17 s: id 89cf0669755de7d379b993c108d19b4e4177d013 slots 10923-11422 source f928e7d9f5bf6b9b384cd1ced1c5b5b5dccfc1f0 dest b00aa6a3bd6b413f37723f37da0c3b7b7b13c791 operation import state completed last_error  retries 0 create_time 1793686217504 start_time 1793686217504 end_time 1793686221233 write_pause_ms 0 capture_pause_ms 0
+1793686221.707195278 import-keys source 1914725 dest 2183609
+1793686222.075021092 import-end cluster-ok after 0.15 s
+1793686937.170609621 kill9-start slot=3000 master=10.80.1.8:7002 replica=10.80.1.9:7001
+1793686937.816055628 kill9-killed 10.80.1.8:7002
+1793686943.525353565 kill9-promoted 10.80.1.9:7001 after 5.54 s
+1793686968.597815962 kill9-restarted 10.80.1.8:7002
+1793686975.718376951 kill9-rejoined 10.80.1.8:7002 as replica after 6.93 s
+1793686976.154509908 kill9-end cluster-ok after 0.15 s
+1793687297.184972774 reshardfix-start round 2 try 1: 5 slots (11423 11424 11425 11426 11427) from 10.80.1.5:7001 (f928e7d9f5bf6b9b384cd1ced1c5b5b5dccfc1f0) to 10.80.1.5:7002 (e76a3a1003cb9a2aa3b865cf6d98807bcaad5167), plain redis-cli, hot keys on
+1793687337.359397548 reshardfix-reshard round 2 try 1 exit=1 after 40.41 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:664'. The copies sent to 10.80.1.5:7002 were deleted there; MIGRATE them again
+1793687337.763487876 reshardfix-interrupted round 2 slot 11424 by TRYAGAIN
+1793687341.703987361 reshardfix-before-fix slot 11424: 10.80.1.9:7001 0 - master;10.80.1.8:7001 330 - replica;10.80.1.5:7001 220 owner [11424->-e76a3a1003cb9a2aa3b865cf6d98807bcaad5167] master;10.80.1.9:7002 220 - replica;10.80.1.8:7002 0 - replica;10.80.1.5:7002 330 - [11424-<-f928e7d9f5bf6b9b384cd1ced1c5b5b5dccfc1f0] master;
+1793687345.495038834 reshardfix-fix round 2 slot 11424 exit=1 after 3.77 s: *** Configuring 10.80.1.5:7002 as the slot owner >>> Case 2: Moving all the 11424 slot keys to its owner 10.80.1.5:7002 TRYAGAIN a key was written while being migrated, and kept here: 'hf:664'. The copy sent to 10.80.1.5:7002 may be older; MIGRATE them again with REPLACE 
+1793687349.477094046 reshardfix-after-fix slot 11424: 10.80.1.9:7001 0 - master;10.80.1.8:7001 355 - replica;10.80.1.5:7001 210 - [11424-<-e76a3a1003cb9a2aa3b865cf6d98807bcaad5167] master;10.80.1.9:7002 210 - replica;10.80.1.8:7002 0 - replica;10.80.1.5:7002 370 owner master;
+1793687349.493257297 reshardfix-check-after-fix open-slots=1 covered=1 errors=0
+1793687349.496613589 reshardfix-FIX-FAILED round 2 slot 11424 (exit 1): a second fix, then slotfix.py if still open
+1793687353.928701270 reshardfix-fix2 exit=1 
+1793687384.620912378 reshardfix-end round 2 in 87.33 s, cluster-ok after 0.12 s
+1793687462.081431949 manual-close slot 11424 after reshardfix round 2: strandfix.py (MIGRATE without REPLACE of keys the owner lacks, then SETSLOT STABLE)
+1793687717.192406291 failover-start slot=13000 master=10.80.1.5:7001 replica=10.80.1.9:7002
+1793687717.203247840 failover-reply OK
+1793687717.409514371 failover-promoted 10.80.1.9:7002 after 0.03 s
+1793687728.400411623 failover-old-master-replica 10.80.1.5:7001 after 10.75 s
+1793687728.775555842 failover-end cluster-ok after 0.15 s
+1793688316.606356704 import-start CLUSTER MIGRATION IMPORT 5461 5960 on 10.80.1.9:7002 (f8f4bc441966cf102a5a92d10af1bb91ad2cdb93, 2786436 keys), source 10.80.1.5:7002 (e76a3a1003cb9a2aa3b865cf6d98807bcaad5167, 3075896 keys)
+1793688316.615917157 import-id 8f7a0c8ef8ce60a72a694abede0c24210bb93530
+1793688322.888952456 import-done in 6.26 s: id 8f7a0c8ef8ce60a72a694abede0c24210bb93530 slots 5461-5960 source e76a3a1003cb9a2aa3b865cf6d98807bcaad5167 dest f8f4bc441966cf102a5a92d10af1bb91ad2cdb93 operation import state completed last_error  retries 0 create_time 1793688316613 start_time 1793688316613 end_time 1793688322404 write_pause_ms 0 capture_pause_ms 0 
+1793688322.937287531 import-keys source 2971078 dest 3070197
+1793688323.299288647 import-end cluster-ok after 0.15 s
+1793688917.143216783 reshard-start 5 slots from 10.80.1.9:7002 (f8f4bc441966cf102a5a92d10af1bb91ad2cdb93, 3377985 keys) to 10.80.1.9:7001 (40df12b10975bb8e155997a337b459cee0de8c14) with redis-cli
+1793688936.821258641 reshard-attempt 1 exit=1 after 19.66 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:5143'. The copies sent to 10.80.1.9:7001 were deleted there; MIGRATE them again
+1793688967.808767667 reshard-repair slot 5462: {"slot": 5462, "src_keys_before": 517, "dst_keys_before": 238, "importing": "OK", "migrating": "OK", "migrated": 2, "tryagain": 47, "setslot_node": {"10.80.1.9:7001": "OK", "10.80.1.9:7002": "OK", "10.80.1.8:7001": "OK", "10.80.1.5:7001": "OK", "10.80.1.8:7002": "OK", "10.80.1.5:7002": "OK"}, "src_keys_after": 0, "dst_keys_after": 755, "seconds": 30.33}
+1793688980.894102028 reshard-attempt 2 exit=1 after 63.74 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:19135'. The copies sent to 10.80.1.9:7001 were deleted there; MIGRATE them again
+1793688993.758470035 reshard-repair slot 5463: {"slot": 5463, "src_keys_before": 57, "dst_keys_before": 472, "importing": "OK", "migrating": "OK", "migrated": 1, "tryagain": 13, "setslot_node": {"10.80.1.9:7001": "OK", "10.80.1.9:7002": "OK", "10.80.1.8:7001": "OK", "10.80.1.5:7001": "OK", "10.80.1.8:7002": "OK", "10.80.1.5:7002": "OK"}, "src_keys_after": 0, "dst_keys_after": 529, "seconds": 12.17}
+1793689015.207446366 reshard-attempt 3 exit=1 after 98.04 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:15838'. The copies sent to 10.80.1.9:7001 were deleted there; MIGRATE them again
+1793689022.338706831 reshard-repair slot 5465: {"slot": 5465, "src_keys_before": 417, "dst_keys_before": 130, "importing": "OK", "migrating": "OK", "migrated": 417, "tryagain": 0, "setslot_node": {"10.80.1.9:7001": "OK", "10.80.1.9:7002": "OK", "10.80.1.8:7001": "OK", "10.80.1.5:7001": "OK", "10.80.1.8:7002": "OK", "10.80.1.5:7002": "OK"}, "src_keys_after": 0, "dst_keys_after": 547, "seconds": 6.49}
+1793689022.577243326 reshard-done in 105.42 s: 5 slots moved in 3 redis-cli runs, slots begun=5
+1793689023.166633695 reshard-end cluster-ok after 0.26 s
+1793689337.527441267 reshardfix-start round 3 try 1: 5 slots (10 11 12 13 14) from 10.80.1.9:7001 (40df12b10975bb8e155997a337b459cee0de8c14) to 10.80.1.5:7002 (e76a3a1003cb9a2aa3b865cf6d98807bcaad5167), plain redis-cli, hot keys on
+1793689353.792121296 reshardfix-reshard round 3 try 1 exit=1 after 16.51 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:8284'. The copies sent to 10.80.1.5:7002 were deleted there; MIGRATE them again
+1793689354.244806279 reshardfix-interrupted round 3 slot 10 by TRYAGAIN
+1793689359.424669216 reshardfix-before-fix slot 10: 10.80.1.9:7001 504 owner [10->-e76a3a1003cb9a2aa3b865cf6d98807bcaad5167] master;10.80.1.8:7001 129 - replica;10.80.1.5:7001 0 - replica;10.80.1.9:7002 0 - master;10.80.1.8:7002 504 - replica;10.80.1.5:7002 130 - [10-<-40df12b10975bb8e155997a337b459cee0de8c14] master;
+1793689363.876339952 reshardfix-fix round 3 slot 10 exit=1 after 4.43 s: >>> No single clear owner for the slot, selecting an owner by # of keys... *** Configuring 10.80.1.9:7001 as the slot owner >>> Case 2: Moving all the 10 slot keys to its owner 10.80.1.9:7001 
+1793689369.312494392 reshardfix-after-fix slot 10: 10.80.1.9:7001 551 owner master;10.80.1.8:7001 92 - replica;10.80.1.5:7001 0 - replica;10.80.1.9:7002 0 - master;10.80.1.8:7002 556 - replica;10.80.1.5:7002 92 - [10-<-40df12b10975bb8e155997a337b459cee0de8c14] master;
+1793689369.327286033 reshardfix-check-after-fix open-slots=1 covered=1 errors=0
+1793689369.331617303 reshardfix-FIX-FAILED round 3 slot 10 (exit 1): a second fix, then slotfix.py if still open
+1793689374.412020388 reshardfix-fix2 exit=1 
+1793689405.157773856 reshardfix-end round 3 in 67.52 s, cluster-ok after 0.12 s
+1793689459.954227663 manual-close slot 10 after reshardfix round 3: strandfix.py
+1793689817.164178249 kill9-start slot=13000 master=10.80.1.9:7002 replica=10.80.1.5:7001
+1793689817.924605983 kill9-killed 10.80.1.9:7002
+1793689835.165403924 kill9-promoted 10.80.1.5:7001 after 17.08 s
+1793689862.470977000 kill9-restarted 10.80.1.9:7002
+1793689876.626483586 kill9-rejoined 10.80.1.9:7002 as replica after 13.96 s
+1793689877.205166669 kill9-end cluster-ok after 0.24 s
+1793689877.225888548 events-done

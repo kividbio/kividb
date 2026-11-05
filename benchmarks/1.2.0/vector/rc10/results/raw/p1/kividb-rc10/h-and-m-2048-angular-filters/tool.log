@@ -1,0 +1,86 @@
+1793720921.060 RUN ./vector-db-benchmark --host SERVER_IP --engines-file kividb-engine.json --engines kividb-m16-ef128 --datasets h-and-m-2048-angular-filters --skip-if-exists false 
+1793720921.069 vector-db-benchmark 0.2.0 (git d22d44e8b46009a800a59e952710166ece2e38a1)
+1793720921.071 Found 1 datasets, 1 engines
+1793720921.073 
+1793720921.075 ============================================================
+1793720921.076 Running experiment (1/1): kividb-m16-ef128 - h-and-m-2048-angular-filters
+1793720921.078 ============================================================
+1793720921.080 Experiment stage: Configure
+1793720921.082 KiviDB server: `INFO server` reported `kividb_version:1.2.0-rc10`
+1793720921.084 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 128}
+1793720921.086 Experiment stage: Upload
+1793720921.087 Downloading from https://storage.googleapis.com/ann-filtered-benchmark/datasets/hnm.tgz to /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793720952.380 Extracting tgz to "/home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm"...
+1793720960.687 Extraction complete.
+1793720960.851 Reading dataset from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793720962.607 Read 105100 vectors (2048d) in 1.756s (59851 vectors/sec)
+1793720962.609 Starting upload with 16 threads, batch size 64...
+1793720977.772 Upload time: 15.165s (6931 records/sec)
+1793720977.783 Indexing complete (algorithm=hnsw, num_docs=Some(105100), hnsw_live_count=Some(105100)/105100, compaction_in_progress=false) in 0.0s
+1793720977.785 Index time: 0.012s, Total time (read+upload+index): 16.932s
+1793720978.013 Results saved to: "/home/azureuser/vdbx/results/kividb-m16-ef128-h-and-m-2048-angular-filters-upload-0-105100-2026-11-03-15-49-38.json"
+1793720979.655 Experiment stage: Search
+1793720979.657 	Running search 0: ef=128, parallel=1
+1793720979.680 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793721022.587 	  rep 1/3: QPS 243.9
+1793721022.610 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793721065.800 	  rep 2/3: QPS 242.2
+1793721065.823 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793721109.108 	  rep 3/3: QPS 241.7
+1793721109.110 	→ QPS: 243.9, Recall: 0.9984, Precision@returned: 0.9984, MRR: 0.9989, NDCG: 0.9985 (best of reps)
+1793721109.112 	Running search 1: ef=128, parallel=16
+1793721109.134 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793721114.266 	  rep 1/3: QPS 3083.7
+1793721114.288 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793721119.451 	  rep 2/3: QPS 3059.0
+1793721119.473 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793721124.648 	  rep 3/3: QPS 3075.7
+1793721124.650 	→ QPS: 3083.7, Recall: 0.9984, Precision@returned: 0.9984, MRR: 0.9989, NDCG: 0.9985 (best of reps)
+1793721124.652 	Running search 2: ef=128, parallel=100
+1793721124.671 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793721128.835 	  rep 1/3: QPS 4466.6
+1793721128.857 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793721133.015 	  rep 2/3: QPS 4449.5
+1793721133.039 	Reading queries from /home/azureuser/vdbx/datasets/h-and-m-2048-angular/hnm...
+1793721137.203 	  rep 3/3: QPS 4448.1
+1793721137.205 	→ QPS: 4466.6, Recall: 0.9984, Precision@returned: 0.9984, MRR: 0.9989, NDCG: 0.9985 (best of reps)
+1793721137.244 	Results saved to: "/home/azureuser/vdbx/results/kividb-m16-ef128-h-and-m-2048-angular-filters-search-0-14832-2026-11-03-15-52-17.json"
+1793721137.259 	Results saved to: "/home/azureuser/vdbx/results/kividb-m16-ef128-h-and-m-2048-angular-filters-search-1-14832-2026-11-03-15-52-17.json"
+1793721137.274 	Results saved to: "/home/azureuser/vdbx/results/kividb-m16-ef128-h-and-m-2048-angular-filters-search-2-14832-2026-11-03-15-52-17.json"
+1793721137.276 -----------------------------------------------------------------------------------------------
+1793721137.278 Recall     Precision  MRR      NDCG     QPS        P50 (ms)     P90 (ms)     P95 (ms)    
+1793721137.280 -----------------------------------------------------------------------------------------------
+1793721137.281 0.9984     0.9984     0.9989   0.9985   4466.6     18.863       41.400       50.342      
+1793721137.283 
+1793721137.285 
+1793721137.287 QPS vs Precision Trade-off - kividb-m16-ef128 - h-and-m-2048-angular-filters (up and to the right is better):
+1793721137.289 
+1793721137.291     4467 │●                                                           
+1793721137.292     4061 │                                                            
+1793721137.294     3655 │                                                            
+1793721137.296     3248 │                                                            
+1793721137.298     2842 │                                                            
+1793721137.300     2436 │                                                            
+1793721137.301     2030 │                                                            
+1793721137.303     1624 │                                                            
+1793721137.305     1218 │                                                            
+1793721137.307      812 │                                                            
+1793721137.309      406 │                                                            
+1793721137.311        0 │                                                            
+1793721137.313          └────────────────────────────────────────────────────────────
+1793721137.315           0.998          1.002          1.005          1.008          
+1793721137.316         Precision (0.0 = 0%, 1.0 = 100%)
+1793721137.318 
+1793721137.320 THROUGHPUT vs CONCURRENCY (saturation curve):
+1793721137.322   ef=128 — peak 4466.6 QPS @ parallel 100 (still climbing at top of swept range — sweep higher to find the knee)
+1793721137.324     parallel         QPS     p50 ms     p90 ms     p95 ms     p99 ms    sat?
+1793721137.325            1       243.9      2.462     10.088     15.498     17.391       -
+1793721137.327           16      3083.7      3.089     12.693     19.652     22.428       -
+1793721137.329          100      4466.6     18.863     41.400     50.342     85.572       -
+1793721137.331 
+1793721137.333 ================================================================================
+1793721137.335 Results saved to:  /home/azureuser/vdbx/results
+1793721137.336 Summary saved to:  /home/azureuser/vdbx/results/kividb-m16-ef128-h-and-m-2048-angular-filters-summary.json
+1793721137.338 Experiment stage: Cleanup (deleting index and data)
+1793721138.782 Experiment stage: Done
+1793721138.870 EXIT 0

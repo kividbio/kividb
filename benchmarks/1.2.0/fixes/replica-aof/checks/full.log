@@ -1,0 +1,4 @@
+222226c AOF: a replica writes its stream to its log as it applies it
+tls_replication(tls) rc=0
+full rc=0
+FULL-DONE

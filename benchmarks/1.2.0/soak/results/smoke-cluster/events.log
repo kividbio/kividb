@@ -1,0 +1,21 @@
+20:13:44 failover-start slot=3000 master=10.70.1.9:7001 replica=10.70.1.10:7002
+20:13:44 failover-reply OK
+20:13:44 failover-promoted 10.70.1.10:7002 after 0.04 s
+20:13:46 failover-old-master-replica 10.70.1.9:7001 after 1.91 s
+20:13:47 failover-end cluster-ok after 0.16 s
+20:13:47 kill9-start slot=8000 master=10.70.1.10:7001 replica=10.70.1.7:7002
+20:13:48 kill9-killed 10.70.1.10:7001
+20:13:53 kill9-promoted 10.70.1.7:7002 after 5.43 s
+restarted :7001 pid 5107
+20:14:15 kill9-restarted 10.70.1.10:7001
+20:14:18 kill9-rejoined 10.70.1.10:7001 as replica after 3.21 s
+20:14:19 kill9-end cluster-ok after 0.23 s
+20:14:44 reshard-start 2 slots from 10.70.1.10:7002 (9640fb6cf7ca927ae78af9e35f36f4d268f7414e, 507564 keys) to 10.70.1.7:7002 (2c3fe4602d1e82afadebcb8d77a15f993c811bb7) with redis-cli
+20:14:44 reshard-done exit=1 in 0.10 s, slots begun=1 keys moved=0
+20:14:44 reshard-end cluster-ok after 0.16 s
+20:15:44 import-start CLUSTER MIGRATION IMPORT 10923 10950 on 10.70.1.10:7002 (9640fb6cf7ca927ae78af9e35f36f4d268f7414e, 543902 keys), source 10.70.1.7:7001 (c9effd8045d7d685754324fb04c9ae83c59b7c86, 543944 keys)
+20:15:44 import-id b6ed9a16a5beef7b3fc55dad06d970e3ffc70351
+20:15:44 import-done in 0.57 s: id b6ed9a16a5beef7b3fc55dad06d970e3ffc70351 slots 10923-10950 source c9effd8045d7d685754324fb04c9ae83c59b7c86 dest 9640fb6cf7ca927ae78af9e35f36f4d268f7414e operation import state completed last_error  retries 0 create_time 1793650544347 start_time 1793650544347 end_time 1793650544488 write_pause_ms 0 capture_pause_ms 0
+20:15:44 import-keys source 541428 dest 547084
+20:15:45 import-end cluster-ok after 0.12 s
+20:15:55 events-done

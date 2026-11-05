@@ -194,6 +194,91 @@ fn debug_populate_makes_its_keys() {
     assert!(c.cmds(&["DEBUG", "POPULATE", "many"]).is_error());
 }
 
+#[test]
+fn debug_refuses_unknown_subcommands() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let error = |reply: RespValue| match reply {
+        RespValue::Error(e) => e,
+        other => panic!("not an error: {other:?}"),
+    };
+    assert_eq!(
+        error(c.cmds(&["DEBUG", "NoSuch"])),
+        "ERR unknown subcommand or wrong number of arguments for 'NoSuch'. Try DEBUG HELP."
+    );
+    assert_eq!(
+        error(c.cmds(&["DEBUG", "OBJECT"])),
+        "ERR unknown subcommand or wrong number of arguments for 'OBJECT'. Try DEBUG HELP."
+    );
+    assert!(c.cmds(&["DEBUG", "SET-ACTIVE-EXPIRE", "1", "2"]).is_error());
+    assert!(c.cmds(&["DEBUG", "SLEEP", "0"]).is_ok());
+    assert!(c.cmds(&["DEBUG", "SET-DISABLE-DENY-SCRIPTS", "1"]).is_ok());
+    assert!(c.cmds(&["DEBUG", "LOG", "hello"]).is_ok());
+    let long = "x".repeat(200);
+    assert_eq!(
+        error(c.cmds(&["DEBUG", &long])),
+        format!(
+            "ERR unknown subcommand or wrong number of arguments for '{}'. Try DEBUG HELP.",
+            &long[..128]
+        )
+    );
+    assert!(c.cmds(&["DEBUG", "HELP"]).as_array().len() > 1);
+}
+
+#[test]
+fn debug_object_describes_the_key() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    assert_eq!(
+        c.cmds(&["DEBUG", "OBJECT", "nosuch"]),
+        RespValue::Error("ERR no such key".into())
+    );
+    c.cmds(&["SET", "short", "hello"]);
+    c.cmds(&["SET", "long", &"x".repeat(100)]);
+    c.cmds(&["SET", "number", "12345"]);
+    c.cmds(&["RPUSH", "list", "a", "b"]);
+    let field = |line: &str, name: &str| {
+        line.split(' ')
+            .find_map(|part| part.strip_prefix(&format!("{name}:")))
+            .unwrap_or_else(|| panic!("no {name} in {line}"))
+            .to_string()
+    };
+    let short = c.cmds(&["DEBUG", "OBJECT", "short"]).as_str().to_string();
+    let names: Vec<&str> = short
+        .split(' ')
+        .map(|part| part.split(':').next().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "Value",
+            "at",
+            "refcount",
+            "encoding",
+            "serializedlength",
+            "lru",
+            "lru_seconds_idle"
+        ],
+        "{short}"
+    );
+    assert_eq!(field(&short, "encoding"), "embstr");
+    for (key, encoding) in [("long", "raw"), ("number", "int"), ("list", "listpack")] {
+        let line = c.cmds(&["DEBUG", "OBJECT", key]).as_str().to_string();
+        assert_eq!(field(&line, "encoding"), encoding, "{line}");
+    }
+    let length = |c: &mut Conn, key: &str| -> usize {
+        field(
+            c.cmds(&["DEBUG", "OBJECT", key]).as_str(),
+            "serializedlength",
+        )
+        .parse()
+        .unwrap()
+    };
+    assert!(length(&mut c, "long") > length(&mut c, "short"));
+}
+
 fn start_server(port: u16) {
     thread::spawn(move || {
         let config = kividb::config::Config {

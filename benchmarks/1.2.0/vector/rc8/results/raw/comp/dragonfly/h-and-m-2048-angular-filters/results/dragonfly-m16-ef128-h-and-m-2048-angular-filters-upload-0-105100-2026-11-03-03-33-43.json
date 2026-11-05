@@ -1,0 +1,398 @@
+{
+  "params": {
+    "experiment": "dragonfly-m16-ef128",
+    "dataset": "h-and-m-2048-angular-filters",
+    "parallel": 16,
+    "batch_size": 64,
+    "engine_params": {
+      "schema_version": 1,
+      "phase": "upload",
+      "invocation": {
+        "host": "SERVER_IP",
+        "engines_file": "dragonfly-engine.json",
+        "allow_partial_configs": false,
+        "allow_partial_corpus": false,
+        "dump_raw_latencies": false,
+        "dump_results": null,
+        "upload_reader": "auto",
+        "exit_on_error": true,
+        "fail_on_dropped_queries": false,
+        "keep_data": false,
+        "reset_between_configs": false,
+        "skip_if_exists": false,
+        "skip_search": false,
+        "skip_upload": false,
+        "skip_vector_index": false,
+        "repetitions": 3,
+        "warmup_seconds": 0.0,
+        "configurations_dir": "~/vdbx/experiments/configurations",
+        "results_dir": "~/vdbx/results"
+      },
+      "declared": {
+        "collection_params": {
+          "hnsw_config": {
+            "M": 16,
+            "EF_CONSTRUCTION": 128
+          }
+        },
+        "upload_params": {
+          "parallel": 16,
+          "batch_size": 64
+        }
+      },
+      "effective": {
+        "DRAGONFLY_INDEX_NAME": "idx",
+        "DRAGONFLY_INDEX_NAME_EXACT": false,
+        "DRAGONFLY_PORT": 6382,
+        "DRAGONFLY_PROTOCOL": false,
+        "INDEXING_WAIT_SECS": 610,
+        "indexing_wait_phase": "upload_tail",
+        "upload_batch_size": 64,
+        "upload_parallel": 16
+      },
+      "env": {
+        "DRAGONFLY_AUTH": null,
+        "DRAGONFLY_INDEX_NAME": null,
+        "DRAGONFLY_INDEX_NAME_EXACT": null,
+        "DRAGONFLY_PORT": "6382",
+        "DRAGONFLY_PROTOCOL": null,
+        "DRAGONFLY_UPLOAD_BATCH_SIZE": null,
+        "DRAGONFLY_UPLOAD_PARALLEL": null,
+        "DRAGONFLY_USER": null,
+        "INDEXING_WAIT_SECS": null
+      },
+      "overridden": [],
+      "ignored_declared_keys": {
+        "exhaustive": false,
+        "covers": "hnsw_config keys serde could not type, plus the CI-asserted KNOWN_UNREAD inventory for this engine",
+        "keys": []
+      }
+    },
+    "build": {
+      "crate_version": "0.2.0",
+      "git_sha": "d22d44e8b46009a800a59e952710166ece2e38a1",
+      "git_tree": "clean",
+      "git_sha_source": "git",
+      "target": "aarch64-unknown-linux-gnu",
+      "profile": "release",
+      "features": [],
+      "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+      "openssl": "OpenSSL 3.0.2 15 Mar 2022",
+      "hdf5": "1.10.7"
+    },
+    "index_layout": "vector",
+    "index_workloads": [
+      "vector"
+    ]
+  },
+  "results": {
+    "upload_time": 9.758855516,
+    "total_time": 11.461814443,
+    "upload_count": 105100,
+    "memory_usage": {
+      "used_memory": [
+        1366820808
+      ],
+      "index_memory_bytes": null,
+      "index_info": [
+        "index_name",
+        "idx:dragonfly-m16-ef128",
+        "index_definition",
+        [
+          "key_type",
+          "HASH",
+          "prefixes",
+          [
+            "dragonfly-m16-ef128:"
+          ],
+          "default_language",
+          "english",
+          "default_score",
+          1
+        ],
+        "index_options",
+        [],
+        "attributes",
+        [
+          [
+            "identifier",
+            "perceived_colour_value_id",
+            "attribute",
+            "perceived_colour_value_id",
+            "type",
+            "NUMERIC",
+            "blocksize",
+            "10000"
+          ],
+          [
+            "identifier",
+            "department_no",
+            "attribute",
+            "department_no",
+            "type",
+            "NUMERIC",
+            "blocksize",
+            "10000"
+          ],
+          [
+            "identifier",
+            "department_name",
+            "attribute",
+            "department_name",
+            "type",
+            "TAG",
+            "SEPARATOR",
+            ";"
+          ],
+          [
+            "identifier",
+            "perceived_colour_master_name",
+            "attribute",
+            "perceived_colour_master_name",
+            "type",
+            "TAG",
+            "SEPARATOR",
+            ";"
+          ],
+          [
+            "identifier",
+            "index_code",
+            "attribute",
+            "index_code",
+            "type",
+            "TAG",
+            "SEPARATOR",
+            ";"
+          ],
+          [
+            "identifier",
+            "index_group_no",
+            "attribute",
+            "index_group_no",
+            "type",
+            "NUMERIC",
+            "blocksize",
+            "10000"
+          ],
+          [
+            "identifier",
+            "product_type_no",
+            "attribute",
+            "product_type_no",
+            "type",
+            "NUMERIC",
+            "blocksize",
+            "10000"
+          ],
+          [
+            "identifier",
+            "graphical_appearance_no",
+            "attribute",
+            "graphical_appearance_no",
+            "type",
+            "NUMERIC",
+            "blocksize",
+            "10000"
+          ],
+          [
+            "identifier",
+            "perceived_colour_master_id",
+            "attribute",
+            "perceived_colour_master_id",
+            "type",
+            "NUMERIC",
+            "blocksize",
+            "10000"
+          ],
+          [
+            "identifier",
+            "detail_desc",
+            "attribute",
+            "detail_desc",
+            "type",
+            "TEXT",
+            "WEIGHT",
+            "1.000000"
+          ],
+          [
+            "identifier",
+            "prod_name",
+            "attribute",
+            "prod_name",
+            "type",
+            "TAG",
+            "SEPARATOR",
+            ";"
+          ],
+          [
+            "identifier",
+            "garment_group_no",
+            "attribute",
+            "garment_group_no",
+            "type",
+            "NUMERIC",
+            "blocksize",
+            "10000"
+          ],
+          [
+            "identifier",
+            "graphical_appearance_name",
+            "attribute",
+            "graphical_appearance_name",
+            "type",
+            "TAG",
+            "SEPARATOR",
+            ";"
+          ],
+          [
+            "identifier",
+            "product_code",
+            "attribute",
+            "product_code",
+            "type",
+            "NUMERIC",
+            "blocksize",
+            "10000"
+          ],
+          [
+            "identifier",
+            "garment_group_name",
+            "attribute",
+            "garment_group_name",
+            "type",
+            "TAG",
+            "SEPARATOR",
+            ";"
+          ],
+          [
+            "identifier",
+            "colour_group_code",
+            "attribute",
+            "colour_group_code",
+            "type",
+            "NUMERIC",
+            "blocksize",
+            "10000"
+          ],
+          [
+            "identifier",
+            "vector",
+            "attribute",
+            "vector",
+            "type",
+            "VECTOR",
+            "algorithm",
+            "HNSW",
+            "data_type",
+            "FLOAT32",
+            "dim",
+            "2048",
+            "distance_metric",
+            "COSINE",
+            "initial_cap",
+            "1000",
+            "M",
+            "16",
+            "ef_construction",
+            "128",
+            "ef_runtime",
+            "10",
+            "epsilon",
+            "0.010000"
+          ],
+          [
+            "identifier",
+            "index_name",
+            "attribute",
+            "index_name",
+            "type",
+            "TAG",
+            "SEPARATOR",
+            ";"
+          ],
+          [
+            "identifier",
+            "product_type_name",
+            "attribute",
+            "product_type_name",
+            "type",
+            "TAG",
+            "SEPARATOR",
+            ";"
+          ],
+          [
+            "identifier",
+            "colour_group_name",
+            "attribute",
+            "colour_group_name",
+            "type",
+            "TAG",
+            "SEPARATOR",
+            ";"
+          ],
+          [
+            "identifier",
+            "perceived_colour_value_name",
+            "attribute",
+            "perceived_colour_value_name",
+            "type",
+            "TAG",
+            "SEPARATOR",
+            ";"
+          ],
+          [
+            "identifier",
+            "section_no",
+            "attribute",
+            "section_no",
+            "type",
+            "NUMERIC",
+            "blocksize",
+            "10000"
+          ],
+          [
+            "identifier",
+            "section_name",
+            "attribute",
+            "section_name",
+            "type",
+            "TAG",
+            "SEPARATOR",
+            ";"
+          ],
+          [
+            "identifier",
+            "product_group_name",
+            "attribute",
+            "product_group_name",
+            "type",
+            "TAG",
+            "SEPARATOR",
+            ";"
+          ],
+          [
+            "identifier",
+            "index_group_name",
+            "attribute",
+            "index_group_name",
+            "type",
+            "TAG",
+            "SEPARATOR",
+            ";"
+          ]
+        ],
+        "num_docs",
+        105100,
+        "indexing",
+        0,
+        "percent_indexed",
+        "1"
+      ]
+    },
+    "upload_reader": {
+      "reader": "memory",
+      "flag": "auto",
+      "reason": "this engine's upload has no streaming path"
+    }
+  }
+}

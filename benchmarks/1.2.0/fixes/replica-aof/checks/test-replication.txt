@@ -1,0 +1,371 @@
+    Finished `release` profile [optimized] target(s) in 0.05s
+     Running tests/replication.rs (/mnt/target/release/deps/replication-0f0e2644b88ffca2)
+
+running 39 tests
+2026-11-02T01:07:11.762Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:38720
+2026-11-02T01:07:11.765Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22839...
+2026-11-02T01:07:11.765Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:41920
+2026-11-02T01:07:11.765Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:11.766Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22843...
+2026-11-02T01:07:11.767Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:37374
+2026-11-02T01:07:11.767Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:11.768Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:41126
+2026-11-02T01:07:11.768Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:11.775Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:40371...
+2026-11-02T01:07:11.775Z 22845 [INFO] Replication: The master (KiviDB 1.1.2) does not send the deletion of the keys it expires: this replica expires keys itself while it follows it
+2026-11-02T01:07:11.776Z 22845 [INFO] Replication: Full resync from 0123456789012345678901234567890123456789 offset=0
+2026-11-02T01:07:11.776Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22852...
+2026-11-02T01:07:11.776Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:42927...
+2026-11-02T01:07:11.777Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:35482
+2026-11-02T01:07:11.777Z 22845 [INFO] Replication: The master did not answer INFO server: it is taken to send the deletion of every key it expires, and this replica expires none itself
+2026-11-02T01:07:11.777Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:11.777Z 22845 [INFO] Replication: Full resync from 0123456789012345678901234567890123456789 offset=0
+2026-11-02T01:07:11.777Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:43951...
+2026-11-02T01:07:11.777Z 22845 [INFO] Replication: The master (KiviDB 1.2.0-rc2) does not send the deletion of the keys it expires: this replica expires keys itself while it follows it
+2026-11-02T01:07:11.778Z 22845 [INFO] Replication: Full resync from 0123456789012345678901234567890123456789 offset=0
+2026-11-02T01:07:11.778Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:33094
+2026-11-02T01:07:11.778Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:11.778Z 22845 [INFO] Replication: Full resync from 14dd82e050fa64db05718598cb68143bad69a4b6 offset=0
+2026-11-02T01:07:11.778Z 22845 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-02T01:07:11.779Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:47136
+2026-11-02T01:07:11.779Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:11.779Z 22845 [INFO] Replication: Full resync from 3f965ad8430b9625ac585d1f9d3066ae6302c8cf offset=0
+2026-11-02T01:07:11.779Z 22845 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-02T01:07:11.779Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:11.779Z 22845 [INFO] Replication: Full resync from 23ab0bf1fa9ff97fe9951b04842148073c28d939 offset=0
+2026-11-02T01:07:11.779Z 22845 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-02T01:07:11.780Z 22845 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:11.780Z 22845 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:11.780Z 22845 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:11.780Z 22845 [INFO] Replication: Synced with 127.0.0.1:22839. Entering command stream.
+2026-11-02T01:07:11.780Z 22845 [INFO] Replication: Synced with 127.0.0.1:22843. Entering command stream.
+2026-11-02T01:07:11.781Z 22845 [INFO] Replication: Synced with 127.0.0.1:22852. Entering command stream.
+2026-11-02T01:07:11.812Z 22845 [INFO] CONFIG SET min-replicas-to-write 1
+2026-11-02T01:07:11.815Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22835...
+2026-11-02T01:07:11.815Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22847...
+2026-11-02T01:07:11.816Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:43256
+2026-11-02T01:07:11.816Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22848...
+2026-11-02T01:07:11.816Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22849...
+2026-11-02T01:07:11.817Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:11.817Z 22845 [INFO] Replication: Full resync from 2ca2330f0ef5d6d2ac069e07795e397ecce9bad5 offset=0
+2026-11-02T01:07:11.817Z 22845 [INFO] Replication: Receiving full-sync payload (87 bytes)...
+2026-11-02T01:07:11.817Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:37904
+2026-11-02T01:07:11.817Z 22845 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-02T01:07:11.817Z 22845 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-02T01:07:11.819Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:11.819Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:50856
+2026-11-02T01:07:11.819Z 22845 [INFO] Replication: Full resync from e828821697a883b12700cbb2001e7b4d8333104a offset=0
+2026-11-02T01:07:11.819Z 22845 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-02T01:07:11.819Z 22845 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-02T01:07:11.820Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:11.820Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:55628
+2026-11-02T01:07:11.820Z 22845 [INFO] Replication: Full resync from 91447e328c33ba54ee79c37812c4e102abb30e49 offset=0
+2026-11-02T01:07:11.820Z 22845 [INFO] Replication: Receiving full-sync payload (205 bytes)...
+2026-11-02T01:07:11.821Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:11.821Z 22845 [INFO] Replication: Full resync from 713079e1c280dea8c2bfd019dec1139ec1b37c23 offset=0
+2026-11-02T01:07:11.821Z 22845 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-02T01:07:11.821Z 22845 [INFO] Replication: Full sync loaded: 1 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:11.821Z 22845 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:11.821Z 22845 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:11.821Z 22845 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:11.822Z 22845 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:11.822Z 22845 [INFO] Replication: Full sync loaded: 2 keys (1 with a TTL), replacing 0 local keys
+2026-11-02T01:07:11.822Z 22845 [INFO] Replication: Synced with 127.0.0.1:22835. Entering command stream.
+2026-11-02T01:07:11.822Z 22845 [INFO] Replication: Synced with 127.0.0.1:42927. Entering command stream.
+2026-11-02T01:07:11.822Z 22845 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:11.823Z 22845 [INFO] Replication: Synced with 127.0.0.1:40371. Entering command stream.
+2026-11-02T01:07:11.823Z 22845 [INFO] Replication: Synced with 127.0.0.1:22847. Entering command stream.
+2026-11-02T01:07:11.823Z 22845 [INFO] Replication: Synced with 127.0.0.1:43951. Entering command stream.
+2026-11-02T01:07:11.823Z 22845 [INFO] Replication: Synced with 127.0.0.1:22848. Entering command stream.
+2026-11-02T01:07:11.823Z 22845 [INFO] Replication: Synced with 127.0.0.1:22849. Entering command stream.
+2026-11-02T01:07:11.823Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22851...
+2026-11-02T01:07:11.824Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:44668
+2026-11-02T01:07:11.825Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:11.825Z 22845 [INFO] Replication: Full resync from 664da05ca24eadfcf0663fb64bf959d3fac77335 offset=0
+2026-11-02T01:07:11.825Z 22845 [INFO] Replication: Receiving full-sync payload (234 bytes)...
+2026-11-02T01:07:11.826Z 22845 [INFO] Replication: Full sync loaded: 2 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:11.826Z 22845 [INFO] Replication: Rebuilding 1 search index(es) from the synced dataset
+2026-11-02T01:07:11.826Z 22845 [INFO] Replication: Synced with 127.0.0.1:22851. Entering command stream.
+test test_a_transaction_reaches_replicas_between_multi_and_exec ... ok
+test test_a_replica_of_a_1_1_master_keeps_the_documents_of_its_dd ... ok
+test test_a_replica_of_a_master_that_does_not_say_keeps_the_documents_of_its_dd ... ok
+test test_a_replica_of_a_1_2_0_candidate_deletes_the_documents_of_its_dd ... ok
+2026-11-02T01:07:11.879Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22867...
+2026-11-02T01:07:11.880Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:32784
+2026-11-02T01:07:11.881Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:11.881Z 22845 [INFO] Replication: Full resync from 4cc945a6fd3e782f999be96278fce2354295ffee offset=0
+2026-11-02T01:07:11.881Z 22845 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-02T01:07:11.881Z 22845 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:11.882Z 22845 [INFO] Replication: Synced with 127.0.0.1:22867. Entering command stream.
+2026-11-02T01:07:11.884Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22850...
+2026-11-02T01:07:11.884Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:60396
+2026-11-02T01:07:11.885Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:11.885Z 22845 [INFO] Replication: Full resync from 8f216369796a617cc5e45b2d660e7e1baf3c81aa offset=0
+2026-11-02T01:07:11.885Z 22845 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-02T01:07:11.885Z 22845 [ERROR] Replication: FULL RESYNC REFUSED from 127.0.0.1:22850: the master has no keys, and this replica holds 502. The local dataset has been kept and this replica is NOT in sync. If the master's dataset really is the one to keep, run `CONFIG SET replica-full-sync-guard off` on this replica (it retries every 10s); otherwise promote this node with `REPLICAOF NO ONE`.
+2026-11-02T01:07:11.912Z 22845 [INFO] CONFIG SET hll-write-format redis
+2026-11-02T01:07:11.913Z 22845 [INFO] CONFIG SET hll-write-format redis
+2026-11-02T01:07:11.913Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22836...
+2026-11-02T01:07:11.913Z 22845 [INFO] CONFIG SET min-replicas-to-write 2
+2026-11-02T01:07:11.913Z 22845 [INFO] CONFIG SET min-slaves-max-lag 0
+test a_master_without_enough_good_replicas_refuses_writes ... ok
+test test_full_resync_carries_key_ttls ... ok
+2026-11-02T01:07:11.917Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:40012
+2026-11-02T01:07:11.918Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:11.918Z 22845 [INFO] Replication: Full resync from d8d7ac94ee87d81f49c202c991748c69e765a6b7 offset=0
+2026-11-02T01:07:11.919Z 22845 [INFO] Replication: Receiving full-sync payload (24714 bytes)...
+2026-11-02T01:07:11.919Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22855...
+2026-11-02T01:07:11.919Z 22845 [WARN] Replication: Replication link to 127.0.0.1:22855 failed: expected +FULLRESYNC or +CONTINUE, got: -ERR this server is a replica, and KiviDB does not chain replicas: replicate from its master instead — retrying every 1s
+2026-11-02T01:07:11.920Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22869...
+2026-11-02T01:07:11.920Z 22845 [INFO] Replication: Full sync loaded: 2 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:11.920Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:51910
+2026-11-02T01:07:11.921Z 22845 [INFO] Replication: Synced with 127.0.0.1:22836. Entering command stream.
+2026-11-02T01:07:11.921Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:11.922Z 22845 [INFO] Replication: Full resync from 2338bbb1789d89139d9e56e41f43eb03abef54eb offset=0
+2026-11-02T01:07:11.922Z 22845 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+test test_full_resync_rebuilds_label_and_search_indexes ... ok
+2026-11-02T01:07:11.922Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22853...
+2026-11-02T01:07:11.922Z 22845 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:11.923Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:37204
+2026-11-02T01:07:11.923Z 22845 [INFO] Replication: Synced with 127.0.0.1:22869. Entering command stream.
+2026-11-02T01:07:11.924Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:11.924Z 22845 [INFO] Replication: Full resync from 0cdf13c95c5a17df419b9bc1529bd9854daa6305 offset=0
+2026-11-02T01:07:11.924Z 22845 [INFO] Replication: Receiving full-sync payload (97 bytes)...
+2026-11-02T01:07:11.925Z 22845 [WARN] Replication: Dropped the 50 local keys before loading 1 from the master
+2026-11-02T01:07:11.926Z 22845 [INFO] Replication: Full sync loaded: 1 keys (0 with a TTL), replacing 50 local keys
+2026-11-02T01:07:11.927Z 22845 [INFO] Replication: Synced with 127.0.0.1:22853. Entering command stream.
+2026-11-02T01:07:11.928Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22870...
+2026-11-02T01:07:11.928Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:39068
+2026-11-02T01:07:11.929Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:11.929Z 22845 [INFO] Replication: Full resync from a1c48a9980a7bbad26a3db176dc31990006ae902 offset=0
+2026-11-02T01:07:11.929Z 22845 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-02T01:07:11.930Z 22845 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:11.930Z 22845 [INFO] Replication: Synced with 127.0.0.1:22870. Entering command stream.
+2026-11-02T01:07:11.934Z 22845 [INFO] Replication: replica-full-sync-guard set to off
+2026-11-02T01:07:11.934Z 22845 [INFO] CONFIG SET replica-full-sync-guard off
+test redis_hll_replication_keeps_bytes_and_digest_in_step_including_pfdebug ... ok
+test test_info_replication_master ... ok
+2026-11-02T01:07:11.967Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:55630
+2026-11-02T01:07:11.968Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:11.968Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:37906
+2026-11-02T01:07:11.968Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:42297...
+2026-11-02T01:07:11.969Z 22845 [INFO] Replication: The master did not answer INFO server: it is taken to send the deletion of every key it expires, and this replica expires none itself
+2026-11-02T01:07:11.969Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:11.969Z 22845 [INFO] CONFIG SET repl-timeout 2
+2026-11-02T01:07:11.970Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22838...
+2026-11-02T01:07:11.970Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:32784
+2026-11-02T01:07:11.971Z 22845 [INFO] Replication: Full resync from 0123456789012345678901234567890123456789 offset=0
+2026-11-02T01:07:11.971Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:11.971Z 22845 [INFO] Replication: Full resync from 3590b691e911d55264b5a57eb7983a1837f36526 offset=0
+2026-11-02T01:07:11.971Z 22845 [INFO] Replication: Receiving full-sync payload (1466 bytes)...
+2026-11-02T01:07:11.972Z 22845 [INFO] Replication: Full sync loaded: 100 keys (0 with a TTL), replacing 0 local keys
+test test_full_resync_from_a_populated_master_replaces_local_data ... ok
+2026-11-02T01:07:11.973Z 22845 [INFO] Replication: Synced with 127.0.0.1:22838. Entering command stream.
+2026-11-02T01:07:12.011Z 22845 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-02T01:07:12.012Z 22845 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:12.013Z 22845 [INFO] Replication: Synced with 127.0.0.1:42297. Entering command stream.
+test test_replconf_accepted ... ok
+2026-11-02T01:07:12.020Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22838...
+2026-11-02T01:07:12.020Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:32800
+2026-11-02T01:07:12.022Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:12.022Z 22845 [INFO] Replication: Full resync from 3590b691e911d55264b5a57eb7983a1837f36526 offset=0
+2026-11-02T01:07:12.022Z 22845 [INFO] Replication: Receiving full-sync payload (1466 bytes)...
+test test_dropindex_dd_is_sent_as_a_del_of_each_document_then_the_drop ... ok
+2026-11-02T01:07:12.022Z 22845 [INFO] Replication: Full sync loaded: 100 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:12.023Z 22845 [INFO] Replication: Synced with 127.0.0.1:22838. Entering command stream.
+2026-11-02T01:07:12.028Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:37958
+2026-11-02T01:07:12.029Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:12.048Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22878...
+2026-11-02T01:07:12.049Z 22845 [WARN] Replication: Replication link to 127.0.0.1:22878 failed: master requires authentication — set `masterauth` (and `masteruser` for an ACL user) on this replica — retrying every 1s
+2026-11-02T01:07:12.073Z 22845 [INFO] Replication: Promoted to master via REPLICAOF NO ONE
+test test_replicaof_no_one ... ok
+test test_previously_unpropagated_writes_reach_the_replica ... ok
+2026-11-02T01:07:12.087Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:60398
+2026-11-02T01:07:12.088Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:12.089Z 22845 [WARN] Replication: Dropped the 502 local keys before loading 0 from the master
+2026-11-02T01:07:12.090Z 22845 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 502 local keys
+2026-11-02T01:07:12.091Z 22845 [INFO] Replication: Synced with 127.0.0.1:22850. Entering command stream.
+2026-11-02T01:07:12.132Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:44163...
+2026-11-02T01:07:12.132Z 22845 [INFO] Replication: The master did not answer INFO server: it is taken to send the deletion of every key it expires, and this replica expires none itself
+2026-11-02T01:07:12.132Z 22845 [INFO] Replication: Full resync from 0123456789012345678901234567890123456789 offset=0
+test test_full_resync_from_an_empty_master_is_refused ... ok
+2026-11-02T01:07:12.168Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22881...
+2026-11-02T01:07:12.169Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:39158
+2026-11-02T01:07:12.171Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22892...
+2026-11-02T01:07:12.171Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:44064
+2026-11-02T01:07:12.171Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:12.171Z 22845 [INFO] Replication: Full resync from 58359026a1b6af2bd74c06317550e1d85968047f offset=0
+2026-11-02T01:07:12.171Z 22845 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-02T01:07:12.172Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:12.172Z 22845 [INFO] Replication: Promoted; the stream 3590b691e911d55264b5a57eb7983a1837f36526 goes on as 47a6ce59121a8ca6f7a94b92689db45444bc999b from offset 0 — its replicas can be continued
+2026-11-02T01:07:12.172Z 22845 [INFO] Replication: Full resync from e3acd83d55db304b7338b04ced166905e4614568 offset=0
+2026-11-02T01:07:12.172Z 22845 [INFO] Replication: Promoted to master via REPLICAOF NO ONE
+2026-11-02T01:07:12.172Z 22845 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-02T01:07:12.172Z 22845 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:12.173Z 22845 [INFO] Replication: Receiving full-sync payload (7466 bytes)...
+2026-11-02T01:07:12.173Z 22845 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:12.174Z 22845 [INFO] Replication: Synced with 127.0.0.1:22881. Entering command stream.
+2026-11-02T01:07:12.174Z 22845 [INFO] Replication: Synced with 127.0.0.1:22892. Entering command stream.
+2026-11-02T01:07:12.174Z 22845 [INFO] Replication: Command stream from 127.0.0.1:22838 superseded (epoch 1) — dropping connection
+2026-11-02T01:07:12.174Z 22845 [INFO] Replication: Replication session for 127.0.0.1:22838 superseded — stopping replication client
+2026-11-02T01:07:12.218Z 22845 [INFO] Replication: Promoted; the stream 58359026a1b6af2bd74c06317550e1d85968047f goes on as e6d4332122ef30c225deeb702984ca2d04fdcb55 from offset 0 — its replicas can be continued
+2026-11-02T01:07:12.218Z 22845 [INFO] Replication: Promoted to master via REPLICAOF NO ONE
+test test_replicaof_no_one_clears_master_addr ... ok
+2026-11-02T01:07:12.223Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22840...
+2026-11-02T01:07:12.223Z 22845 [INFO] Replication: Partial resync for 127.0.0.1:40656: continuing from offset 0 (56 bytes of backlog)
+2026-11-02T01:07:12.223Z 22845 [INFO] Replication: The master continues 3590b691e911d55264b5a57eb7983a1837f36526 as 47a6ce59121a8ca6f7a94b92689db45444bc999b
+2026-11-02T01:07:12.223Z 22845 [INFO] Replication: Partial resync: continuing from offset 0 — no dataset transfer
+2026-11-02T01:07:12.223Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22883...
+2026-11-02T01:07:12.224Z 22845 [INFO] Replication: Synced with 127.0.0.1:22840. Entering command stream.
+2026-11-02T01:07:12.224Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:51890
+2026-11-02T01:07:12.224Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22888...
+2026-11-02T01:07:12.225Z 22845 [INFO] Replication: Command stream from 127.0.0.1:22838 superseded (epoch 1) — dropping connection
+2026-11-02T01:07:12.225Z 22845 [INFO] Replication: Replication session for 127.0.0.1:22838 superseded — stopping replication client
+2026-11-02T01:07:12.225Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:12.225Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:46072
+2026-11-02T01:07:12.225Z 22845 [INFO] Replication: Full resync from 96ac5ff036ca5b7b10bc1b5fd296403cbba996c3 offset=0
+2026-11-02T01:07:12.225Z 22845 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-02T01:07:12.226Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:12.226Z 22845 [INFO] Replication: Full resync from e8c5479ad4410bedcf757c47b06cd9b371ebb7f5 offset=0
+2026-11-02T01:07:12.226Z 22845 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-02T01:07:12.226Z 22845 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:12.228Z 22845 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:12.228Z 22845 [INFO] Replication: Synced with 127.0.0.1:22883. Entering command stream.
+2026-11-02T01:07:12.229Z 22845 [INFO] Replication: Synced with 127.0.0.1:22888. Entering command stream.
+2026-11-02T01:07:12.230Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22890...
+2026-11-02T01:07:12.231Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:48848
+2026-11-02T01:07:12.232Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:12.232Z 22845 [INFO] Replication: Full resync from eb89a98d8312f1d7b4c3a224dbd5107f83ccab0a offset=0
+2026-11-02T01:07:12.232Z 22845 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-02T01:07:12.232Z 22845 [INFO] Replication: Promoted to master via REPLICAOF NO ONE
+2026-11-02T01:07:12.233Z 22845 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:12.234Z 22845 [INFO] Replication: Synced with 127.0.0.1:22890. Entering command stream.
+test test_role_master ... ok
+2026-11-02T01:07:12.238Z 22845 [INFO] Replication: Replication session for 127.0.0.1:44163 superseded — stopping replication client
+2026-11-02T01:07:12.256Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22876...
+2026-11-02T01:07:12.256Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:40308
+2026-11-02T01:07:12.258Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:12.258Z 22845 [INFO] Replication: Full resync from 7138e8947e05a08e1babbcd145b873dbe26dc216 offset=0
+2026-11-02T01:07:12.258Z 22845 [INFO] Replication: Receiving full-sync payload (95627 bytes)...
+2026-11-02T01:07:12.261Z 22845 [INFO] Replication: Full sync loaded: 2014 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:12.262Z 22845 [INFO] Replication: Synced with 127.0.0.1:22876. Entering command stream.
+2026-11-02T01:07:12.274Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22884...
+2026-11-02T01:07:12.274Z 22845 [INFO] Replication: REPLICAOF 127.0.0.1:22888 — already following this master, no operation performed
+2026-11-02T01:07:12.274Z 22845 [INFO] Replication: REPLICAOF 127.0.0.1:22888 — already following this master, no operation performed
+2026-11-02T01:07:12.274Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:42526
+2026-11-02T01:07:12.274Z 22845 [INFO] Replication: REPLICAOF 127.0.0.1:22888 — already following this master, no operation performed
+2026-11-02T01:07:12.274Z 22845 [INFO] Replication: REPLICAOF 127.0.0.1:22888 — already following this master, no operation performed
+2026-11-02T01:07:12.275Z 22845 [INFO] Replication: REPLICAOF 127.0.0.1:22888 — already following this master, no operation performed
+test test_replicaof_same_master_is_noop ... ok
+2026-11-02T01:07:12.276Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:12.276Z 22845 [INFO] Replication: Full resync from be156ff7b736f56f620a79abe104b816008f16d7 offset=0
+2026-11-02T01:07:12.276Z 22845 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-02T01:07:12.277Z 22845 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:12.278Z 22845 [INFO] Replication: Synced with 127.0.0.1:22884. Entering command stream.
+test test_replicaof_updates_reported_master_addr ... ok
+2026-11-02T01:07:12.287Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22896...
+2026-11-02T01:07:12.288Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:36590
+2026-11-02T01:07:12.289Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:12.289Z 22845 [INFO] Replication: Full resync from 44ef94fb1dae54e17331ba9945efdc7b5e952c66 offset=0
+2026-11-02T01:07:12.289Z 22845 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-02T01:07:12.290Z 22845 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:12.291Z 22845 [INFO] Replication: Synced with 127.0.0.1:22896. Entering command stream.
+2026-11-02T01:07:12.319Z 22845 [INFO] Replication: Promoted to master via REPLICAOF NO ONE
+test test_slaveof_no_one ... ok
+test test_a_promoted_replica_continues_its_sibling ... ok
+2026-11-02T01:07:12.333Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22899...
+2026-11-02T01:07:12.334Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:53816
+2026-11-02T01:07:12.335Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:12.335Z 22845 [INFO] Replication: Full resync from 93fba01a9f86aabb242ead25039c7465e1bca40c offset=0
+2026-11-02T01:07:12.335Z 22845 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-02T01:07:12.336Z 22845 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:12.337Z 22845 [INFO] Replication: Synced with 127.0.0.1:22899. Entering command stream.
+test test_masterauth_works_with_and_without_a_password_on_the_master ... ok
+2026-11-02T01:07:12.374Z 22845 [INFO] Replication: Command stream from 127.0.0.1:22883 superseded (epoch 1) — dropping connection
+2026-11-02T01:07:12.374Z 22845 [INFO] Replication: Replication session for 127.0.0.1:22883 superseded — stopping replication client
+2026-11-02T01:07:12.375Z 22845 [INFO] Replication: Command stream from 127.0.0.1:22881 superseded (epoch 1) — dropping connection
+2026-11-02T01:07:12.375Z 22845 [INFO] Replication: Replication session for 127.0.0.1:22881 superseded — stopping replication client
+2026-11-02T01:07:12.375Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22905...
+2026-11-02T01:07:12.376Z 22845 [WARN] Replication: Replication link to 127.0.0.1:22905 failed: connect: Connection refused (os error 111) — retrying every 1s
+2026-11-02T01:07:12.376Z 22845 [INFO] Replication: Promoted to master via REPLICAOF NO ONE
+test test_unreachable_master_is_reported_down_and_replica_is_read_only_at_once ... ok
+test test_wait_no_replicas ... ok
+test test_waitaof_with_aof_enabled ... ok
+test test_a_replica_never_shows_half_a_transaction ... ok
+test test_waitaof ... ok
+2026-11-02T01:07:12.428Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22906...
+2026-11-02T01:07:12.429Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:59624
+2026-11-02T01:07:12.430Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:12.430Z 22845 [INFO] Replication: Full resync from 4f8e3040d8e6701c7e9cafa0935640f0248c8ef9 offset=0
+2026-11-02T01:07:12.430Z 22845 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-02T01:07:12.431Z 22845 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:12.432Z 22845 [INFO] Replication: Synced with 127.0.0.1:22906. Entering command stream.
+2026-11-02T01:07:12.474Z 22845 [INFO] Replication: Replica disconnected
+test test_spublish_reaches_a_replicas_subscribers ... ok
+2026-11-02T01:07:12.507Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22876...
+2026-11-02T01:07:12.507Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:40312
+2026-11-02T01:07:12.509Z 22845 [INFO] Replication: Full resync from 7138e8947e05a08e1babbcd145b873dbe26dc216 offset=523252
+2026-11-02T01:07:12.509Z 22845 [INFO] Replication: Receiving full-sync payload (141896 bytes)...
+2026-11-02T01:07:12.509Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:12.513Z 22845 [INFO] Replication: Full sync loaded: 2014 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:12.514Z 22845 [INFO] Replication: Synced with 127.0.0.1:22876. Entering command stream.
+2026-11-02T01:07:12.577Z 22845 [INFO] Replication: Superseded during reconnect backoff — stopping
+test test_replicaof_repoint_between_masters_converges ... ok
+test test_watch_on_a_replica_sees_its_masters_writes ... ok
+2026-11-02T01:07:12.758Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22876...
+2026-11-02T01:07:12.759Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:40314
+2026-11-02T01:07:12.760Z 22845 [INFO] Replication: Full resync from 7138e8947e05a08e1babbcd145b873dbe26dc216 offset=1019267
+2026-11-02T01:07:12.760Z 22845 [INFO] Replication: Receiving full-sync payload (186536 bytes)...
+2026-11-02T01:07:12.760Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:12.766Z 22845 [INFO] Replication: Full sync loaded: 2014 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:12.768Z 22845 [INFO] Replication: Synced with 127.0.0.1:22876. Entering command stream.
+test test_info_memory_reports_the_replication_backlog ... ok
+test test_replica_attached_under_write_load_matches_the_master ... ok
+test test_wait_ack_tracking ... ok
+2026-11-02T01:07:13.647Z 22845 [INFO] CONFIG SET masterauth (hidden)
+2026-11-02T01:07:13.971Z 22845 [WARN] Replication: disconnecting timedout replica 127.0.0.1:7777: no REPLCONF ACK for 2 s (repl-timeout)
+2026-11-02T01:07:13.971Z 22845 [INFO] Replication: Replica disconnected
+2026-11-02T01:07:14.023Z 22845 [WARN] Replication: Replication link to 127.0.0.1:42297 failed: no data from master for 2s (repl-timeout) — master is unreachable — retrying every 1s
+test test_replica_declares_a_silent_master_down_after_repl_timeout ... ok
+2026-11-02T01:07:14.061Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:39944
+2026-11-02T01:07:14.062Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:14.063Z 22845 [INFO] Replication: Full sync loaded: 1 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:14.064Z 22845 [INFO] Replication: Synced with 127.0.0.1:22878. Entering command stream.
+2026-11-02T01:07:14.068Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22910...
+2026-11-02T01:07:14.069Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:41268
+2026-11-02T01:07:14.070Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:14.070Z 22845 [INFO] Replication: Full resync from dfe2b04abbc062a4890f24dac884f1b30ac0a0b8 offset=0
+2026-11-02T01:07:14.070Z 22845 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-02T01:07:14.071Z 22845 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:14.072Z 22845 [INFO] Replication: Synced with 127.0.0.1:22910. Entering command stream.
+2026-11-02T01:07:14.101Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22878...
+2026-11-02T01:07:14.101Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:39946
+2026-11-02T01:07:14.102Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:14.102Z 22845 [INFO] Replication: Full resync from 7638ddd113fa7892ce4974a366340c49cf7e4c31 offset=0
+2026-11-02T01:07:14.102Z 22845 [INFO] Replication: Receiving full-sync payload (87 bytes)...
+2026-11-02T01:07:14.103Z 22845 [INFO] Replication: Full sync loaded: 1 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:14.104Z 22845 [INFO] Replication: Synced with 127.0.0.1:22878. Entering command stream.
+test test_replica_authenticates_with_masterauth ... ok
+2026-11-02T01:07:14.218Z 22845 [INFO] Replication: Replica 127.0.0.1:41268 disconnected: this node is now a replica itself
+2026-11-02T01:07:14.218Z 22845 [INFO] Replication: Replica disconnected
+2026-11-02T01:07:14.218Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22843...
+2026-11-02T01:07:14.218Z 22845 [WARN] Replication: Master closed the connection — reconnecting
+2026-11-02T01:07:14.218Z 22845 [INFO] Replication: Channel replica registered: 127.0.0.1:33098
+2026-11-02T01:07:14.220Z 22845 [INFO] Replication: Sent full RDB to replica; streaming queued writes from hub
+2026-11-02T01:07:14.220Z 22845 [INFO] Replication: Full resync from 3f965ad8430b9625ac585d1f9d3066ae6302c8cf offset=0
+2026-11-02T01:07:14.220Z 22845 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-02T01:07:14.220Z 22845 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:14.221Z 22845 [INFO] Replication: Synced with 127.0.0.1:22843. Entering command stream.
+test test_a_replica_refuses_replicas_of_its_own ... ok
+2026-11-02T01:07:15.029Z 22845 [INFO] Replication: The master did not answer INFO server: it is taken to send the deletion of every key it expires, and this replica expires none itself
+2026-11-02T01:07:15.072Z 22845 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-02T01:07:15.073Z 22845 [INFO] Replication: Synced with 127.0.0.1:42297. Entering command stream.
+2026-11-02T01:07:15.073Z 22845 [INFO] Replication: Backlog restarted at offset 0 (it ended at 14)
+2026-11-02T01:07:15.223Z 22845 [INFO] Replication: Connecting to master 127.0.0.1:22910...
+2026-11-02T01:07:15.224Z 22845 [WARN] Replication: Replication link to 127.0.0.1:22910 failed: expected +FULLRESYNC or +CONTINUE, got: -ERR this server is a replica, and KiviDB does not chain replicas: replicate from its master instead — retrying every 1s
+test test_promotion_during_a_full_sync_keeps_the_promoted_nodes_dataset ... ok
+test test_idle_link_stays_up_and_offsets_advance_on_heartbeats ... ok
+test test_a_silent_replica_is_dropped_after_repl_timeout ... ok
+
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.27s
+

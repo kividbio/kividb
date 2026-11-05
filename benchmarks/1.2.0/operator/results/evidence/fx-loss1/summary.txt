@@ -1,0 +1,10 @@
+lines with two engines for fx-0-0: 3
+2026-11-02T20:54:23.008571297Z 2026-11-02T20:54:23.008Z 1 [INFO] SIGTERM received — shutting down gracefully
+2026-11-02T20:54:23.008597682Z 2026-11-02T20:54:23.008Z 1 [INFO] Writing final snapshot...
+2026-11-02T20:54:23.035500397Z 2026-11-02T20:54:23.035Z 1 [INFO] AOF: rebased onto dump.kdb (generation 5) — log is now the delta
+2026-11-02T20:54:22.815136635Z   * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+2026-11-02T20:54:22.859340909Z 2026-11-02T20:54:22.858Z 1 [INFO] Found dump.kdb — loading native snapshot
+2026-11-02T20:54:22.868920087Z 2026-11-02T20:54:22.868Z 1 [INFO] Loaded 18564 keys from snapshot (0 with a TTL)
+2026-11-02T20:54:22.869231201Z 2026-11-02T20:54:22.869Z 1 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+2026-11-02T20:54:22.881487299Z 2026-11-02T20:54:22.881Z 1 [INFO] AOF replay: 16924 commands, 35488 keys, 0.61 MB in 0.01s
+2026-11-02T20:54:23.915194295Z 2026-11-02T20:54:23.915Z 1 [INFO] Replication: Partial resync for 10.244.2.218:57052: continuing from offset 0 (0 bytes of backlog)

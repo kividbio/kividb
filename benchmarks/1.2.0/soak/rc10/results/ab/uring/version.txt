@@ -1,0 +1,16 @@
+kividb 1.2.0-rc10
+1057a8a0adf724acb3a85fd1828d55d24a6142b96516a2605266232ec31e97e4  /opt/kv/kividb
+port 7001
+bind 0.0.0.0
+protected-mode no
+dir /data/7001
+appendonly yes
+cluster-enabled yes
+cluster-node-timeout 5000
+cluster-config-file nodes.conf
+threads 4
+appendfsync everysec
+update-check no
+slowlog-log-slower-than 10000
+slowlog-max-len 10000
+2026-11-03T13:50:34.391Z 164844 [INFO] I/O model      : io_uring

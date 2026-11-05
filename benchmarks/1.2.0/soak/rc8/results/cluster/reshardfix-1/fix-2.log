@@ -1,0 +1,50 @@
+10.80.1.5:7002 (e76a3a10...) -> 1769586 keys | 5472 slots | 1 slaves.
+10.80.1.8:7002 (b00aa6a3...) -> 1762384 keys | 5451 slots | 1 slaves.
+10.80.1.5:7001 (f928e7d9...) -> 1765292 keys | 5461 slots | 1 slaves.
+[OK] 5297262 keys in 3 masters.
+323.32 keys per slot on average.
+>>> Performing Cluster Check (using node 10.80.1.5:7002)
+M: e76a3a1003cb9a2aa3b865cf6d98807bcaad5167 10.80.1.5:7002
+   slots:[0-9],[5461-10922] (5472 slots) master
+   1 additional replica(s)
+S: 274867528c3b57317d6f96684f1b58be0e63de38 10.80.1.8:7001
+   slots: (0 slots) slave
+   replicates e76a3a1003cb9a2aa3b865cf6d98807bcaad5167
+S: 40df12b10975bb8e155997a337b459cee0de8c14 10.80.1.9:7001
+   slots: (0 slots) slave
+   replicates b00aa6a3bd6b413f37723f37da0c3b7b7b13c791
+M: b00aa6a3bd6b413f37723f37da0c3b7b7b13c791 10.80.1.8:7002
+   slots:[10-5460] (5451 slots) master
+   1 additional replica(s)
+S: f8f4bc441966cf102a5a92d10af1bb91ad2cdb93 10.80.1.9:7002
+   slots: (0 slots) slave
+   replicates f928e7d9f5bf6b9b384cd1ced1c5b5b5dccfc1f0
+M: f928e7d9f5bf6b9b384cd1ced1c5b5b5dccfc1f0 10.80.1.5:7001
+   slots:[10923-16383] (5461 slots) master
+   1 additional replica(s)
+[OK] All nodes agree about slots configuration.
+>>> Check for open slots...
+[WARNING] Node 10.80.1.5:7001 has slots in importing state 0.
+[WARNING] The following slots are open: 0.
+>>> Fixing open slot 0
+*** Found keys about slot 0 in non-owner node 10.80.1.5:7001!
+*** Found keys about slot 0 in node 10.80.1.5:7002!
+Set as importing in: 10.80.1.5:7002,10.80.1.5:7001
+>>> No single clear owner for the slot, selecting an owner by # of keys...
+*** Configuring 10.80.1.5:7002 as the slot owner
+>>> Case 2: Moving all the 0 slot keys to its owner 10.80.1.5:7002
+Moving slot 0 from 10.80.1.5:7001 to 10.80.1.5:7002: 
+*** Target key exists
+*** Checking key values on both nodes...
+*** Found 3 key(s) in both source node and target node having different values.
+    Source node: 10.80.1.5:7001
+    Target node: 10.80.1.5:7002
+    Keys(s):
+    - z:11111
+    - {tx2504}:l
+    - ow:{t10790}:7:1
+Please fix the above key(s) manually and try again or relaunch the command 
+with --cluster-replace option to force key overriding.
+
+>>> Check slots coverage...
+[OK] All 16384 slots covered.

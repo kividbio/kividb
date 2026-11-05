@@ -46,7 +46,9 @@ fn kividb_bin() -> String {
 #[test]
 fn shutdown_nosave_exits_cleanly() {
     let port = 16399u16;
+    // A directory of its own: one engine to a data directory.
     let mut server = Command::new(kividb_bin())
+        .current_dir(tempfile::tempdir().unwrap().keep())
         .args(["--port", &port.to_string()])
         .spawn()
         .expect("failed to start kividb — run `cargo build` first");
@@ -222,6 +224,7 @@ fn port_takes_no_connection_once_the_server_has_exited() {
 fn shutdown_abort_keeps_server_alive() {
     let port = 16400u16;
     let mut server = Command::new(kividb_bin())
+        .current_dir(tempfile::tempdir().unwrap().keep())
         .args(["--port", &port.to_string()])
         .spawn()
         .unwrap();

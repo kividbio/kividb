@@ -1,0 +1,17 @@
+2026-11-02T21:30:46Z   Normal    Killing                  g-113-0                         Stopping container kividb
+2026-11-02T21:30:46Z   Normal    Killing                  g-113-0                         Stopping container agent
+2026-11-02T21:30:46Z   Normal    Scheduled                g-113-0                         Successfully assigned e2e/g-113-0 to aks-nodepool1-15662409-vmss000002
+2026-11-02T21:30:46Z   Normal    SuccessfulCreate         g-113                           Create Pod g-113-0 in StatefulSet g-113 successful
+2026-11-02T21:30:47Z   Warning   FailedAttachVolume       g-113-0                         Waiting for detach for volume "pvc-abcb0d2d-d351-45b5-8534-4f99cfdc5d04" Volume is already exclusively attached to one node, waiting on detach before it can be attached to another node
+2026-11-02T21:30:47Z   Warning   Unhealthy                g-113-0                         Readiness probe failed: Get "http://10.244.0.149:8081/readyz": context deadline exceeded (Client.Timeout exceeded while awaiting headers)
+2026-11-02T21:30:47Z   Warning   FailedPreStopHook        g-113-0                         PreStopHook failed
+2026-11-02T21:30:47Z   Warning   FailedPreStopHook        g-113-0                         PreStopHook failed
+2026-11-02T21:31:09Z   Normal    SuccessfulAttachVolume   g-113-0                         AttachVolume.Attach succeeded for volume "pvc-abcb0d2d-d351-45b5-8534-4f99cfdc5d04" 
+2026-11-02T21:31:09Z   Normal    Pulled                   g-113-0                         Container image "ghcr.io/kividbio/kividb:v1.1.3" already present on machine and can be accessed by the pod
+2026-11-02T21:31:09Z   Normal    Created                  g-113-0                         Container created
+2026-11-02T21:31:10Z   Normal    Started                  g-113-0                         Container started
+2026-11-02T21:31:10Z   Normal    Pulled                   g-113-0                         Container image "ACR.azurecr.io/kividb-operator-agent:0.7.0-afc6f49" already present on machine and can be accessed by the pod
+2026-11-02T21:31:10Z   Normal    Created                  g-113-0                         Container created
+2026-11-02T21:31:10Z   Normal    Started                  g-113-0                         Container started
+2026-11-02T21:31:42Z   Warning   MasterRestartedBehind    g-113                           g-113-0 restarted and came back as the master at replication offset 0, behind the 66262690 it had reached and behind g-113-1 (offset 66386874), which holds writes it lost; failing over rather than resyncing the replicas from its older data
+2026-11-02T21:31:42Z   Warning   Failover                 g-113                           master g-113-0 restarted behind its replicas; promoted g-113-1

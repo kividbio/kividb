@@ -1,0 +1,39 @@
+{
+ "mode": "cluster",
+ "writers": 16,
+ "duration_s": 70.0,
+ "acked": 28425,
+ "unacked_errors": 330,
+ "lost_acked": 0,
+ "wrong_value": 0,
+ "wait_n": 1,
+ "wait_acked": 24028,
+ "wait_acked_lost": 0,
+ "lost_ack_time_first": null,
+ "lost_ack_time_last": null,
+ "lost_sample": [],
+ "events": [
+  [
+   20.264,
+   "kill -9 master fo1:7001"
+  ],
+  [
+   40.365,
+   "old master restarted"
+  ]
+ ],
+ "recovery": {
+  "event_t": 20.264,
+  "pre_event_ok_per_100ms_median": 20,
+  "first_error_t": 20.200000000000003,
+  "last_error_t": 26.0,
+  "writes_below_80pct_from_t": 20.200000000000003,
+  "throughput_back_t": 20.6,
+  "recovery_s": 0.34
+ },
+ "error_kinds": {
+  "ConnectionError:Connection": 8,
+  "ConnectionError:Error": 306,
+  "ClusterDownError:The": 16
+ }
+}

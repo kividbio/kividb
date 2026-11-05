@@ -328,14 +328,29 @@ pub struct Config {
     /// Max bytes a master will queue for a single replica that isn't keeping up
     /// (analogous to Redis's `client-output-buffer-limit slave <hard-limit>`).
     /// Once exceeded the replica is disconnected — it must full-resync to catch
-    /// back up — rather than letting the queue grow without bound.
+    /// back up — rather than letting the queue grow without bound. Settable at
+    /// runtime.
     #[arg(long, default_value_t = 268_435_456)]
     pub repl_replica_max_backlog_bytes: u64,
+
+    /// Max bytes a master will queue for a replica during its full sync, from
+    /// the cut until the replica has loaded the dataset and drained its queue
+    /// to a quarter of `repl-replica-max-backlog-bytes`. The replica reads nothing of the
+    /// stream while it loads, so everything written meanwhile waits in the
+    /// queue (#305). The larger of the two applies. Settable at runtime.
+    #[arg(long, default_value_t = 1_073_741_824)]
+    pub repl_replica_sync_max_backlog_bytes: u64,
 
     /// Bytes of the write stream a master keeps for replicas that reconnect
     /// (Redis `repl-backlog-size`). A replica that was away for less than
     /// this much writing is brought up to date without a full resync.
-    #[arg(long, default_value_t = 1024 * 1024)]
+    ///
+    /// 64 MB, a few seconds of heavy writing; Redis's default is 1 MB, a
+    /// fraction of a second at 100,000 writes a second, less than a replica
+    /// takes to reconnect after its master restarts. Kept only from a
+    /// replica's first sync (or a promotion) until `repl-backlog-ttl` after
+    /// the last replica has gone: a server that never had one keeps none.
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
     pub repl_backlog_size: u64,
 
     /// Seconds a master with no replicas keeps that backlog before releasing
@@ -370,6 +385,14 @@ pub struct Config {
     /// retransmission limit (~15 minutes) while reporting a healthy link.
     #[arg(long, default_value_t = 60)]
     pub repl_timeout: u64,
+
+    /// Seconds a master that is shutting down waits for its replicas to
+    /// acknowledge the end of its write stream before it saves and exits
+    /// (Redis `shutdown-timeout`). A replica that has it all is continued
+    /// after the restart instead of being sent the whole dataset. 0 does not
+    /// wait; nor does `SHUTDOWN NOW` or `NOSAVE`.
+    #[arg(long, default_value_t = 10)]
+    pub shutdown_timeout: u64,
 
     /// Refuse writes while fewer than this many replicas are good: online,
     /// and heard from within `min-replicas-max-lag` seconds (Redis
@@ -576,12 +599,14 @@ impl Default for Config {
             update_check_url: crate::update_check::DEFAULT_URL.into(),
             notify_keyspace_events: String::new(),
             repl_replica_max_backlog_bytes: 268_435_456,
-            repl_backlog_size: 1024 * 1024,
+            repl_replica_sync_max_backlog_bytes: 1_073_741_824,
+            repl_backlog_size: 64 * 1024 * 1024,
             repl_backlog_ttl: 3600,
             repl_diskless_load: "disabled".into(),
             masterauth: String::new(),
             masteruser: String::new(),
             repl_timeout: 60,
+            shutdown_timeout: 10,
             min_replicas_to_write: 0,
             min_replicas_max_lag: 10,
             repl_ping_replica_period: 10,
@@ -694,12 +719,14 @@ impl Config {
             update_check_url: crate::update_check::DEFAULT_URL.into(),
             notify_keyspace_events: String::new(),
             repl_replica_max_backlog_bytes: 268_435_456,
-            repl_backlog_size: 1024 * 1024,
+            repl_replica_sync_max_backlog_bytes: 1_073_741_824,
+            repl_backlog_size: 64 * 1024 * 1024,
             repl_backlog_ttl: 3600,
             repl_diskless_load: "disabled".into(),
             masterauth: String::new(),
             masteruser: String::new(),
             repl_timeout: 60,
+            shutdown_timeout: 10,
             min_replicas_to_write: 0,
             min_replicas_max_lag: 10,
             repl_ping_replica_period: 10,
@@ -1066,6 +1093,10 @@ impl Config {
             "repl-replica-max-backlog-bytes {}\n",
             self.repl_replica_max_backlog_bytes
         ));
+        out.push_str(&format!(
+            "repl-replica-sync-max-backlog-bytes {}\n",
+            self.repl_replica_sync_max_backlog_bytes
+        ));
         if !self.masterauth.is_empty() {
             out.push_str(&format!("masterauth {}\n", quote(&self.masterauth)));
         }
@@ -1083,6 +1114,7 @@ impl Config {
         out.push_str(&format!("repl-diskless-load {}\n", self.repl_diskless_load));
         out.push_str(&format!("hll-write-format {}\n", self.hll_write_format));
         out.push_str(&format!("repl-timeout {}\n", self.repl_timeout));
+        out.push_str(&format!("shutdown-timeout {}\n", self.shutdown_timeout));
         out.push_str(&format!(
             "min-replicas-to-write {}\n",
             self.min_replicas_to_write
@@ -1502,6 +1534,12 @@ impl Config {
             "repl-replica-max-backlog-bytes" => {
                 set!(repl_replica_max_backlog_bytes, parse_memory(key, one()?)?)
             }
+            "repl-replica-sync-max-backlog-bytes" => {
+                set!(
+                    repl_replica_sync_max_backlog_bytes,
+                    parse_memory(key, one()?)?
+                )
+            }
             "repl-backlog-size" => set!(repl_backlog_size, parse_memory(key, one()?)?),
             "repl-backlog-ttl" => set!(repl_backlog_ttl, number(key, one()?)?),
             "repl-diskless-load" => {
@@ -1517,6 +1555,7 @@ impl Config {
             "masterauth" | "primaryauth" => set!(masterauth, one()?.to_string()),
             "masteruser" | "primaryuser" => set!(masteruser, one()?.to_string()),
             "repl-timeout" => set!(repl_timeout, number(key, one()?)?),
+            "shutdown-timeout" => set!(shutdown_timeout, number(key, one()?)?),
             "min-replicas-to-write" | "min-slaves-to-write" => {
                 set!(min_replicas_to_write, number(key, one()?)?)
             }
@@ -2121,6 +2160,73 @@ mod config_file_tests {
         );
     }
 
+    /// `latency-tracking-info-percentiles` is read as Redis reads it (#255).
+    /// The inputs through "1e1" were each run against Redis 8.10.3, and what
+    /// it answered is what is asserted; `0x` and `--5` are not numbers to any
+    /// `strtod`.
+    #[test]
+    fn latency_percentiles_are_read_as_redis_reads_them() {
+        use crate::commands::server::parse_latency_percentiles as parse;
+        let not_numbers = Err("Invalid latency-tracking-info-percentiles parameters");
+        let out_of_range =
+            Err("latency-tracking-info-percentiles parameters should sit between [0.0,100.0]");
+        assert_eq!(parse(""), Ok(vec![]));
+        assert_eq!(parse("50 99 99.9"), Ok(vec![50.0, 99.0, 99.9]));
+        assert_eq!(parse("0"), Ok(vec![0.0]));
+        assert_eq!(parse("100"), Ok(vec![100.0]));
+        assert_eq!(parse("0x10"), Ok(vec![16.0]));
+        assert_eq!(parse("1e1"), Ok(vec![10.0]));
+        for bad in [
+            "abc", "50 abc", " 50", "50 ", "50  99", "nan", "0x", "--5", "1e-400",
+        ] {
+            assert_eq!(parse(bad), not_numbers, "{bad:?}");
+        }
+        for bad in ["101", "-1", "inf"] {
+            assert_eq!(parse(bad), out_of_range, "{bad:?}");
+        }
+    }
+
+    /// What `CONFIG GET` gives back is the numbers as Redis writes them: `%f`,
+    /// trailing zeros trimmed (#255).
+    #[test]
+    fn latency_percentiles_read_back_as_redis_writes_them() {
+        use crate::commands::server::format_latency_percentiles as text;
+        assert_eq!(text(&[]), "");
+        assert_eq!(text(&[50.0, 99.0, 99.9]), "50 99 99.9");
+        assert_eq!(text(&[16.0, 10.0]), "16 10");
+        assert_eq!(text(&[0.0, 100.0]), "0 100");
+        assert_eq!(text(&[50.0, 99.9]), "50 99.9");
+        // Rounded as `%f` rounds, and a negative zero keeps its sign
+        // (what Redis 8.10.3 read back for `99.9999999`, `-0` and `1e-310`).
+        assert_eq!(text(&[99.9999999]), "100");
+        assert_eq!(text(&[-0.0]), "-0");
+        assert_eq!(text(&[1e-310]), "0");
+    }
+
+    /// The file refuses what `CONFIG SET` refuses, with the same words (#255).
+    /// A value that is valid is only the one it already is: other tests of
+    /// this process go by it. (A double space cannot be tried here: the file
+    /// splits a line into words.)
+    #[test]
+    fn latency_tracking_info_percentiles_are_checked_in_the_file() {
+        let (_, warnings) = load("latency-tracking-info-percentiles 50 99 99.9\n").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        for bad in ["abc", "50 abc", "nan"] {
+            let err = load(&format!("latency-tracking-info-percentiles {bad}\n")).unwrap_err();
+            assert!(
+                err.contains("Invalid latency-tracking-info-percentiles parameters"),
+                "{bad}: {err}"
+            );
+        }
+        for bad in ["101", "-1", "inf"] {
+            let err = load(&format!("latency-tracking-info-percentiles {bad}\n")).unwrap_err();
+            assert!(
+                err.contains("should sit between [0.0,100.0]"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
     #[test]
     fn redis_directives_with_no_effect_are_reported_and_not_fatal() {
         let (_, warnings) = load("save 900 1\ntcp-keepalive 300\nappendfsync always\n").unwrap();
@@ -2155,7 +2261,9 @@ mod config_file_tests {
             cluster-require-full-coverage no\ncluster-replica-validity-factor 1\n\
             cluster-slot-migration-handoff-max-lag-bytes 1\n\
             cluster-slot-migration-write-pause-timeout 1\nrepl-replica-max-backlog-bytes 1\n\
-            masterauth a\nmasteruser u\nrepl-timeout 1\nrepl-ping-replica-period 1\n\
+            repl-replica-sync-max-backlog-bytes 1\n\
+            masterauth a\nmasteruser u\nrepl-timeout 1\nshutdown-timeout 1\n\
+            repl-ping-replica-period 1\n\
             min-replicas-to-write 1\nmin-replicas-max-lag 1\n\
             repl-backlog-size 1mb\nrepl-backlog-ttl 1\nrepl-diskless-load swapdb\n\
             hll-write-format redis\n\

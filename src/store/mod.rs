@@ -83,6 +83,10 @@ pub struct ShardLock {
     place: std::sync::OnceLock<(usize, usize)>,
 }
 
+/// How long [`ShardLock::write_after_spinning`] looks for a busy shard to
+/// come free before it sleeps on it.
+const SPIN_FOR: std::time::Duration = std::time::Duration::from_micros(50);
+
 /// The write lock of a [`ShardLock`]. It is the table, and on the way out
 /// it leaves the count of keys with a time to live where a reader can see
 /// it without the lock.
@@ -158,6 +162,45 @@ impl ShardLock {
     #[inline(always)]
     pub fn read(&self) -> parking_lot::RwLockReadGuard<'_, ShardMap> {
         self.map.read()
+    }
+
+    /// [`ShardLock::write`], if nobody holds the shard now; `None` at once
+    /// if somebody does.
+    #[inline(always)]
+    pub fn try_write(&self) -> Option<ShardWrite<'_>> {
+        let mut map = self.map.try_write()?;
+        map.pin_now();
+        Some(ShardWrite {
+            map: std::mem::ManuallyDrop::new(map),
+            lock: self,
+        })
+    }
+
+    /// [`ShardLock::write`] for a writer that holds no other shard and
+    /// found this one busy: it looks again, for up to [`SPIN_FOR`], before
+    /// it sleeps until the shard is let go of.
+    ///
+    /// A shard is held for a few microseconds at a time. A thread that goes
+    /// to sleep on it is woken some tens of microseconds after it is let go
+    /// of, and the connections it serves wait with it: `MSET`s of keys in
+    /// many shards spent more time asleep than holding them.
+    #[cold]
+    #[inline(never)]
+    pub fn write_after_spinning(&self) -> ShardWrite<'_> {
+        let started = std::time::Instant::now();
+        loop {
+            for _ in 0..32 {
+                std::hint::spin_loop();
+            }
+            if !self.map.is_locked()
+                && let Some(guard) = self.try_write()
+            {
+                return guard;
+            }
+            if started.elapsed() >= SPIN_FOR {
+                return self.write();
+            }
+        }
     }
 
     #[inline(always)]

@@ -1,0 +1,60 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 29K of event 'armv8_pmuv3_0/cycles/P'
+# Event count (approx.): 81123400267
+#
+# Overhead  Command          Shared Object      Symbol                                                                                                                                                                                                                                                            
+# ........  ...............  .................  ..................................................................................................................................................................................................................................................................
+#
+     5.71%  server           server             [.] kividb::eviction::make_room
+     3.05%  server           server             [.] kividb::server_uring::handle_client::{closure#0}
+     2.38%  server           [kernel.kallsyms]  [k] handle_softirqs
+     2.03%  server           [nf_conntrack]     [k] __nf_conntrack_find_get
+     1.79%  server           server             [.] <hashbrown::raw::RawTable<kividb::store::entry::Slot>>::find::<<kividb::store::shard_map::ShardMap>::find::{closure#0}>
+     1.59%  server           server             [.] kividb::commands::handler::run_command
+     1.57%  server           [kernel.kallsyms]  [k] _raw_spin_lock
+     1.38%  server           [kernel.kallsyms]  [k] tcp_recvmsg_locked
+     1.31%  server           [kernel.kallsyms]  [k] exit_to_user_mode_loop
+     1.27%  server           [kernel.kallsyms]  [k] _raw_spin_unlock_irqrestore
+     1.15%  server           [kernel.kallsyms]  [k] _raw_spin_lock_bh
+     1.10%  server           server             [.] <tokio_uring::net::tcp::stream::TcpStream>::write_all::<alloc::vec::Vec<u8>>::{closure#0}
+     1.04%  server           [kernel.kallsyms]  [k] __tcp_transmit_skb
+     1.04%  server           [nf_conntrack]     [k] nf_conntrack_tcp_packet
+     1.03%  server           [kernel.kallsyms]  [k] kmem_cache_alloc_node_noprof
+     1.02%  server           server             [.] kividb::commands::strings::handle
+     1.01%  server           [kernel.kallsyms]  [k] __arch_copy_to_user
+     0.97%  server           [mlx5_core]        [k] mlx5e_poll_tx_cq
+     0.90%  server           [kernel.kallsyms]  [k] __pi_memset_generic
+     0.87%  server           [kernel.kallsyms]  [k] skb_attempt_defer_free
+     0.82%  server           [kernel.kallsyms]  [k] tcp_sendmsg_locked
+     0.80%  server           [mlx5_core]        [k] mlx5e_napi_poll
+     0.78%  server           [kernel.kallsyms]  [k] fget
+     0.69%  server           server             [.] <rand_core::block::BlockRng<rand::rngs::adapter::reseeding::ReseedingCore<rand_chacha::chacha::ChaCha12Core, rand_core::os::OsRng>>>::generate_and_set
+     0.68%  server           [kernel.kallsyms]  [k] aa_inet_msg_perm
+     0.68%  server           [kernel.kallsyms]  [k] io_req_io_end
+     0.60%  server           [nf_tables]        [k] nft_do_chain
+     0.58%  server           [kernel.kallsyms]  [k] mod_memcg_state
+     0.55%  server           [kernel.kallsyms]  [k] check_heap_object
+     0.55%  server           [kernel.kallsyms]  [k] __alloc_skb
+     0.54%  server           [kernel.kallsyms]  [k] __arch_copy_from_user
+     0.52%  server           [nf_conntrack]     [k] tcp_in_window
+     0.52%  server           [kernel.kallsyms]  [k] apparmor_socket_recvmsg
+     0.51%  server           [kernel.kallsyms]  [k] __ip_queue_xmit
+     0.51%  server           [kernel.kallsyms]  [k] tcp_rcv_space_adjust
+     0.51%  server           [kernel.kallsyms]  [k] tcp_recvmsg
+     0.51%  server           [kernel.kallsyms]  [k] __dev_xmit_skb
+     0.49%  server           server             [.] kividb::value_slab::alloc
+     0.48%  server           server             [.] kividb::resp::parse::parse_multibulk
+     0.47%  server           [kernel.kallsyms]  [k] aa_file_perm
+     0.46%  server           [kernel.kallsyms]  [k] ip_finish_output2
+     0.45%  server           [kernel.kallsyms]  [k] io_arm_apoll
+     0.45%  server           server             [.] __aarch64_cas8_acq
+     0.44%  server           [kernel.kallsyms]  [k] __local_bh_enable_ip
+     0.43%  server           [nf_conntrack]     [k] nf_conntrack_in
+     0.43%  server           server             [.] kividb::value_slab::free
+     0.42%  server           [vdso]             [.] 0x0000000000000584
+     0.41%  server           [kernel.kallsyms]  [k] tcp_event_new_data_sent
+     0.41%  server           [kernel.kallsyms]  [k] validate_xmit_skb

@@ -1,0 +1,6 @@
+# The versions the results in this folder were produced with.
+langchain-redis==0.2.6
+langchain-core==1.7.4
+redisvl==0.30.0
+redis==8.1.0
+numpy==2.5.4

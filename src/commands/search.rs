@@ -278,6 +278,8 @@ fn create(ctx: &mut Ctx) -> Result<(), String> {
     let mut prefixes: Vec<String> = Vec::new();
     let mut stopwords: Option<Vec<String>> = None;
     let mut language = crate::vector::stem::LanguageOptions::default();
+    let mut default_score = 1.0;
+    let mut score_field = None;
     let mut skip_initial_scan = false;
     let mut schema_found = false;
     let mut i = 2usize;
@@ -351,9 +353,35 @@ fn create(ctx: &mut Ctx) -> Result<(), String> {
                 language.field = Some(field.to_string());
                 i += 2;
             }
-            // Ranking and storage hints with no counterpart here. They
-            // change no result a query can see.
-            "SCORE" | "SCORE_FIELD" | "PAYLOAD_FIELD" | "TEMPORARY" => {
+            "SCORE" => {
+                let raw = cmd
+                    .get(i + 1)
+                    .map(|a| text(a))
+                    .ok_or_else(|| "Bad arguments for SCORE: expected a value".to_string())?;
+                let score = raw
+                    .trim_matches(|c: char| c.is_ascii_whitespace())
+                    .parse::<f64>()
+                    .map_err(|_| "Invalid score".to_string())?;
+                if score > 1.0 || score < 0.0 {
+                    return Err("Invalid score".into());
+                }
+                default_score = score;
+                i += 2;
+            }
+            "SCORE_FIELD" => {
+                score_field = Some(
+                    cmd.get(i + 1)
+                        .map(|a| text(a))
+                        .ok_or_else(|| {
+                            "Bad arguments for SCORE_FIELD: expected a value".to_string()
+                        })?
+                        .to_string(),
+                );
+                i += 2;
+            }
+            // Storage hints with no counterpart here. They change no result
+            // a query can see.
+            "PAYLOAD_FIELD" | "TEMPORARY" => {
                 if cmd.get(i + 1).is_none() {
                     return Err(format!("Bad arguments for {word}: expected a value"));
                 }
@@ -390,6 +418,8 @@ fn create(ctx: &mut Ctx) -> Result<(), String> {
         stopwords,
         synonyms: Default::default(),
         language,
+        default_score,
+        score_field,
     }
     .into_def();
 
@@ -435,6 +465,9 @@ fn language_definition(language: &crate::vector::stem::LanguageOptions) -> Vec<V
 
 /// Documents the index covers: hashes, or JSON documents, under its prefixes.
 fn count_docs(db: &Db, def: &IndexDef, cluster: Option<&crate::cluster::ClusterState>) -> usize {
+    // Read before any shard is locked: not the slot table with one held
+    // (see `ClusterState`).
+    let served = cluster.map(crate::cluster::search::served_slots);
     db.iter()
         .map(|shard| {
             shard
@@ -443,7 +476,9 @@ fn count_docs(db: &Db, def: &IndexDef, cluster: Option<&crate::cluster::ClusterS
                 .filter(|(key, value)| {
                     crate::vector::is_document(&def.on, *value)
                         && covers(def, key)
-                        && cluster.is_none_or(|c| crate::cluster::search::serves(c, key))
+                        && served
+                            .as_deref()
+                            .is_none_or(|served| crate::cluster::search::in_served(served, key))
                 })
                 .count()
         })
@@ -498,25 +533,25 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
     };
     put("index_name", resp_bulk_str(&def.name));
     put("index_options", resp_array(vec![]));
-    put(
-        "index_definition",
-        resp_map_for(
-            resp,
-            vec![
-                resp_bulk_str("key_type"),
-                resp_bulk_str(match def.on {
-                    IndexOn::Hash => "HASH",
-                    IndexOn::Json => "JSON",
-                }),
-                resp_bulk_str("prefixes"),
-                resp_array(def.prefixes.iter().map(|p| resp_bulk_str(p)).collect()),
-            ]
-            .into_iter()
-            .chain(language_definition(&def.language))
-            .chain([resp_bulk_str("default_score"), resp_bulk_str("1")])
-            .collect(),
-        ),
-    );
+    let mut definition = vec![
+        resp_bulk_str("key_type"),
+        resp_bulk_str(match def.on {
+            IndexOn::Hash => "HASH",
+            IndexOn::Json => "JSON",
+        }),
+        resp_bulk_str("prefixes"),
+        resp_array(def.prefixes.iter().map(|p| resp_bulk_str(p)).collect()),
+    ];
+    definition.extend(language_definition(&def.language));
+    if def.default_score != 0.0 {
+        definition.push(resp_bulk_str("default_score"));
+        definition.push(resp_bulk_str(&score_text(def.default_score)));
+    }
+    if let Some(field) = &def.score_field {
+        definition.push(resp_bulk_str("score_field"));
+        definition.push(resp_bulk_str(field));
+    }
+    put("index_definition", resp_map_for(resp, definition));
     put(
         "attributes",
         resp_array(
@@ -851,6 +886,16 @@ pub(crate) fn query_terms(filter: &Filter, out: &mut AHashSet<String>) {
 /// are exact: the TEXT index holds every document's words as they are now
 /// (and no stopword, which a pattern does not match, as in Redis). A phrase
 /// gives the documents to try: it is about where the words are.
+/// Whether `filter` has a word in it that [`candidates`] reads off the TEXT
+/// index, and so may give documents as the matches without trying them.
+fn has_words(filter: &Filter) -> bool {
+    match filter {
+        Filter::Text { .. } => true,
+        Filter::And(l, r) | Filter::Or(l, r) => has_words(l) || has_words(r),
+        _ => false,
+    }
+}
+
 fn candidates(filter: &Filter, def: &IndexDef) -> Option<(Bits, bool)> {
     let numbers = |fields: &[String]| -> Vec<u16> {
         fields.iter().filter_map(|f| def.text_field(f)).collect()
@@ -1020,11 +1065,31 @@ pub(crate) fn plan(
     filter: &Filter,
     only: Option<&AHashSet<String>>,
 ) -> Option<Plan> {
-    let db = *ctx.selected_db;
+    plan_in(ctx.store, *ctx.selected_db, def, filter, only)
+}
+
+/// [`plan`], for database `db` of `store`.
+fn plan_in(
+    store: &crate::store::Store,
+    db: usize,
+    def: &IndexDef,
+    filter: &Filter,
+    only: Option<&AHashSet<String>>,
+) -> Option<Plan> {
     // The postings are of the index's own database's documents.
     if !def.keeps_postings() || def.db_index != db {
         return None;
     }
+    // A hash with field TTLs can lose a field to a read before the indexes
+    // hear of it: such documents are tried, whatever the postings say of
+    // them. Which ones they are is read before the postings are. The sweep
+    // that brings the postings up to date with such a hash writes to them,
+    // or queues the write for whoever takes their lock next, and only then
+    // stops watching the hash. Read after the postings, the list could miss
+    // a hash whose sweep ran in between, its write queued behind this read:
+    // the postings had it as it was, and it was not tried. FT.AGGREGATE then
+    // counted a document the filter no longer matched (#347).
+    let watched = crate::field_expiry::watched_keys(store, db);
     let (mut ids, exact, volatile) = {
         let p = def.postings.read();
         if !p.enabled() || p.unused {
@@ -1049,17 +1114,16 @@ pub(crate) fn plan(
         if !exact && ids.count() * 2 > p.len() {
             return None;
         }
-        // A hash with field TTLs can lose a field to a read before the
-        // indexes hear of it: such documents are tried, whatever the
-        // postings say of them.
-        let volatile: Vec<(String, u32)> = crate::field_expiry::watched_keys(ctx.store, db)
+        #[cfg(test)]
+        crate::test_hooks::at("plan: postings read");
+        let volatile: Vec<(String, u32)> = watched
             .into_iter()
             .filter(|key| only.is_none_or(|only| only.contains(key)))
             .filter_map(|key| p.id(&key).map(|id| (key, id)))
             .collect();
         (ids, exact, volatile)
     };
-    let store = &ctx.store[db];
+    let store = &store[db];
     let any_volatile = !volatile.is_empty();
     for (key, id) in volatile {
         if exact {
@@ -1093,8 +1157,9 @@ pub(crate) fn relevance(
     key: &str,
     fields: &Fields,
     scoring: &crate::vector::score::Scoring,
+    json: Option<&serde_json::Value>,
 ) -> f64 {
-    scoring.score(def, key, fields)
+    scoring.score(def, key, fields, json)
 }
 
 /// Every document of the index that the filter accepts. In no particular
@@ -1122,10 +1187,10 @@ pub(crate) fn filter_search_scored(
     let scoring = crate::vector::score::Scoring::new(def, filter, scorer);
     let range = filter.vector_range();
     let mut out: Vec<Match> = Vec::new();
-    let timed_out = filter_each(ctx, def, filter, only, deadline, |key, fields| {
+    let timed_out = filter_each(ctx, def, filter, only, deadline, |key, fields, json| {
         out.push(Match {
             key: key.to_string(),
-            score: relevance(def, key, fields, &scoring),
+            score: relevance(def, key, fields, &scoring, json),
             distance: range.and_then(|clause| filter::range_distance(clause, fields)),
         });
     });
@@ -1145,7 +1210,7 @@ pub(crate) fn filter_each(
     filter: &Filter,
     only: Option<&AHashSet<String>>,
     deadline: Option<Instant>,
-    mut accept: impl FnMut(&str, &Fields),
+    mut accept: impl FnMut(&str, &Fields, Option<&serde_json::Value>),
 ) -> bool {
     let db = &ctx.store[*ctx.selected_db];
     let mut timed_out = false;
@@ -1158,50 +1223,77 @@ pub(crate) fn filter_each(
             if deadline_due(deadline, &mut seen) {
                 return true;
             }
-            with_doc(db, def, &key, |fields, _| {
+            with_doc(db, def, &key, |fields, json| {
                 if plan.exact || filter::eval(filter, fields) {
-                    accept(&key, fields);
+                    accept(&key, fields, json);
                 }
             });
         }
         return false;
     }
 
-    let mut consider = |key: &str, fields: &Fields| {
+    let mut consider = |key: &str, fields: &Fields, json: Option<&serde_json::Value>| {
         if filter::eval(filter, fields) {
-            accept(key, fields);
+            accept(key, fields, json);
         }
     };
 
     // The keys to look at, if they are known without reading everything: the
     // ones the caller named, or the ones the TEXT index names. Those are the
-    // matches if the TEXT index says so, and it is of this database.
-    let found = {
+    // matches if the TEXT index says so, and it is of this database, but for
+    // the hashes with field TTLs: a read can drop a field of one before the
+    // TEXT index hears of it, and they are tried, as `plan` tries them.
+    // Which they are is read before the TEXT index is, for the reason it is
+    // read first there; they were not tried, and a TEXT field gone to a read
+    // still matched until the sweep came (#364). Only for a filter with a
+    // word in it, the only kind the TEXT index answers, and turned into ids
+    // under the postings' lock, as `plan` turns them: every query that tried
+    // every document copied the whole list too, and every match was looked
+    // up in it by key (#371).
+    let watched = if has_words(filter) {
+        crate::field_expiry::watched_keys(ctx.store, *ctx.selected_db)
+    } else {
+        Vec::new()
+    };
+    // Each key, and whether it is a match on the TEXT index's word.
+    let found: Option<Vec<(Arc<str>, bool)>> = {
         // Every write queued so far applied (the TEXT index's part too: see
         // `postings::WithId`), and no id given back while the TEXT index's
         // are turned into keys. The postings, then the TEXT index.
         let p = def.postings.read();
         candidates(filter, def).map(|(ids, exact)| {
-            let keys: Vec<Arc<str>> = ids.iter().filter_map(|id| p.key(id).cloned()).collect();
-            (keys, exact && def.db_index == *ctx.selected_db)
+            let exact = exact && def.db_index == *ctx.selected_db;
+            let mut tried = Bits::new();
+            if exact {
+                for key in &watched {
+                    if let Some(id) = p.id(key) {
+                        tried.set(id);
+                    }
+                }
+            }
+            ids.iter()
+                .filter_map(|id| Some((Arc::clone(p.key(id)?), exact && !tried.get(id))))
+                .collect()
         })
     };
-    let (known, exact): (Option<Vec<Arc<str>>>, bool) = match (only, found) {
-        (Some(only), Some((found, exact))) => (
-            Some(found.into_iter().filter(|k| only.contains(&**k)).collect()),
-            exact,
+    let known: Option<Vec<(Arc<str>, bool)>> = match (only, found) {
+        (Some(only), Some(found)) => Some(
+            found
+                .into_iter()
+                .filter(|(k, _)| only.contains(&**k))
+                .collect(),
         ),
-        (Some(only), None) => (
-            Some(only.iter().map(|k| Arc::from(k.as_str())).collect()),
-            false,
+        (Some(only), None) => Some(
+            only.iter()
+                .map(|k| (Arc::from(k.as_str()), false))
+                .collect(),
         ),
-        (None, Some((found, exact))) => (Some(found), exact),
-        (None, None) => (None, false),
+        (None, found) => found,
     };
     match known {
         Some(keys) => {
             let mut seen = 0u32;
-            for key in &keys {
+            for (key, matches) in &keys {
                 let key: &str = key;
                 if deadline_due(deadline, &mut seen) {
                     timed_out = true;
@@ -1210,9 +1302,9 @@ pub(crate) fn filter_each(
                 if !covers(def, key) {
                     continue;
                 }
-                with_doc(db, def, key, |fields, _| {
-                    if exact || filter::eval(filter, fields) {
-                        accept(key, fields);
+                with_doc(db, def, key, |fields, json| {
+                    if *matches || filter::eval(filter, fields) {
+                        accept(key, fields, json);
                     }
                 });
             }
@@ -1223,7 +1315,8 @@ pub(crate) fn filter_each(
                     return;
                 }
                 if let Some(fields) = crate::vector::doc_fields(&def.on, &def.fields, value) {
-                    consider(key, &fields);
+                    let json = fields.json();
+                    consider(key, &fields, json);
                 }
             });
         }
@@ -1363,6 +1456,9 @@ fn every_match_scores_the_same(
             _ => false,
         }
     }
+    if def.score_field.is_some() && scorer != Scorer::Hamming {
+        return false;
+    }
     let lengths = def.text_fields().next().is_some();
     match scorer {
         Scorer::DocScore | Scorer::Hamming => true,
@@ -1387,6 +1483,12 @@ fn page_from_postings(
     let scorer = args
         .scorer
         .unwrap_or_else(crate::vector::score::Scorer::default_scorer);
+    if args.withscores
+        && def.score_field.is_some()
+        && scorer != crate::vector::score::Scorer::Hamming
+    {
+        return None;
+    }
     let (order, numeric) = match &args.sortby {
         // Only the count (LIMIT 0 0): no order to keep.
         None if args.count == 0 || every_match_scores_the_same(def, filter, scorer) => {
@@ -1442,6 +1544,15 @@ fn page_from_postings(
     } else {
         args.offset.saturating_add(args.count)
     };
+    // The slots this node serves, read before the postings are: nothing
+    // reads the slot table with an index's lock held. A deletion of a lost
+    // slot's keys takes the postings to unindex its keys, holding what
+    // makes a slot come back wait, and that waits holding the slot table
+    // (see `ClusterState`, #353).
+    let served_slots = ctx
+        .cluster
+        .enabled
+        .then(|| crate::cluster::search::served_slots(ctx.cluster));
     let (picked, total, timed_out) = {
         // What was written since the plan is not among its ids. What was
         // queued is applied: an expiry unmarks a key once its removal is
@@ -1459,8 +1570,7 @@ fn page_from_postings(
                 ids.unset(id);
             }
         }
-        if ctx.cluster.enabled {
-            let slots = crate::cluster::search::served_slots(ctx.cluster);
+        if let Some(slots) = &served_slots {
             let mut served = Bits::new();
             for id in ids.iter() {
                 let slot = p.slot(id) as usize;
@@ -1498,7 +1608,7 @@ fn page_from_postings(
     let scoring = crate::vector::score::Scoring::new(def, filter, scorer);
     let mut page = Vec::with_capacity(picked.len());
     for (key, number) in picked {
-        let hit = with_doc(db, def, &key, |fields, _| {
+        let hit = with_doc(db, def, &key, |fields, json| {
             if !filter::eval(filter, fields) {
                 return None;
             }
@@ -1519,7 +1629,7 @@ fn page_from_postings(
             };
             Some(Hit {
                 key: key.to_string(),
-                score: relevance(def, &key, fields, &scoring),
+                score: relevance(def, &key, fields, &scoring, json),
                 extras: Vec::new(),
                 sort_key,
             })
@@ -1925,6 +2035,40 @@ pub(crate) fn number_text(value: f64) -> String {
     }
 }
 
+pub(crate) fn score_text(value: f64) -> String {
+    const INTEGER_BOUND: f64 = (i64::MAX / 2) as f64;
+    if value.is_nan() {
+        "nan".to_string()
+    } else if value == 0.0 && value.is_sign_negative() {
+        "-0".to_string()
+    } else if !value.is_finite() {
+        value.to_string()
+    } else if value == value.trunc() && value.abs() <= INTEGER_BOUND {
+        format!("{}", value as i64)
+    } else {
+        let scientific = format!("{value:e}");
+        let Some((coefficient, exponent)) = scientific.split_once('e') else {
+            return number_text(value);
+        };
+        let Ok(exponent) = exponent.parse::<i32>() else {
+            return number_text(value);
+        };
+        let digits = coefficient.bytes().filter(u8::is_ascii_digit).count() as i32;
+        let k = exponent - (digits - 1);
+        let scientific = if k >= 0 {
+            exponent >= digits + 7
+        } else {
+            k <= -7 && exponent.abs() >= 4
+        };
+        if scientific && exponent != 0 {
+            let sign = if exponent >= 0 { "+" } else { "" };
+            format!("{coefficient}e{sign}{exponent}")
+        } else {
+            number_text(value)
+        }
+    }
+}
+
 pub(crate) fn distance_text(distance: f32) -> String {
     if distance == 0.0 {
         "0".to_string()
@@ -2126,7 +2270,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                     &filter,
                     args.inkeys.as_ref(),
                     deadline,
-                    |key, _| scorer.offer(key),
+                    |key, _, _| scorer.offer(key),
                 );
                 scorer.nearest()
             };
@@ -2193,6 +2337,13 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
     // of the way through a migration is not counted twice.
     if ctx.cluster.enabled {
         hits.retain(|hit| crate::cluster::search::serves(ctx.cluster, &hit.key));
+    }
+    let scores_matter = shard
+        .then(|| crate::cluster::search::scores_matter(&ctx.cmd))
+        .flatten()
+        .unwrap_or_else(|| args.withscores || (args.sortby.is_none() && args.count > 0));
+    if scores_matter {
+        hits.retain(|hit| hit.score != f64::NEG_INFINITY);
     }
 
     // ── SORTBY ───────────────────────────────────────────────────────────────
@@ -2369,6 +2520,15 @@ struct PageHit {
     fields: Vec<(String, Vec<u8>)>,
 }
 
+fn resp3_score(value: f64) -> Vec<u8> {
+    let text = score_text(value);
+    let mut out = Vec::with_capacity(text.len() + 3);
+    out.push(b',');
+    out.extend_from_slice(text.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
 /// The reply to FT.SEARCH for `page`, of `total` matches.
 fn encode_page(
     resp: u8,
@@ -2393,7 +2553,7 @@ fn encode_page(
                 let mut entry = vec![resp_bulk_str("id"), resp_bulk_str(&hit.key)];
                 if args.withscores {
                     entry.push(resp_bulk_str("score"));
-                    entry.push(resp_double_for(3, hit.score));
+                    entry.push(resp3_score(hit.score));
                 }
                 if args.withsortkeys {
                     entry.push(resp_bulk_str("sortkey"));
@@ -2440,7 +2600,7 @@ fn encode_page(
     for hit in page {
         out.push(resp_bulk_str(&hit.key));
         if args.withscores {
-            out.push(resp_bulk_str(&number_text(hit.score)));
+            out.push(resp_bulk_str(&score_text(hit.score)));
         }
         if args.withpayloads {
             out.push(resp_null_bulk());
@@ -2495,6 +2655,10 @@ fn coordinate(
     shard_cmd.push(b"LIMIT".to_vec());
     shard_cmd.push(b"0".to_vec());
     shard_cmd.push((args.offset + args.count).to_string().into_bytes());
+    crate::cluster::search::ask_for_scores_matter(
+        &mut shard_cmd,
+        args.withscores || (args.sortby.is_none() && args.count > 0),
+    );
     crate::cluster::search::ask_for_timeout_flag(&mut shard_cmd);
 
     // This node's part, then the others'.
@@ -2630,10 +2794,143 @@ fn coordinate(
 mod tests {
     use super::*;
 
+    /// A hash whose field went to a read, swept while a query holds the
+    /// postings: the sweep's write is queued behind the query, and the hash
+    /// is no longer watched by the time the query is done with them. The
+    /// query still tries it, and does not take the postings' word for what
+    /// it holds (#347).
+    #[test]
+    fn a_hash_swept_while_a_query_reads_the_postings_is_still_tried() {
+        use crate::types::HashInner;
+        let store = crate::store::new_store(1);
+        let _own = crate::field_expiry::OwnWatches::of(&store);
+        let index_store = crate::vector::new_index_store();
+        let def = IndexSchema {
+            name: "i347".into(),
+            db_index: 0,
+            on: IndexOn::Hash,
+            prefixes: vec!["d347:".into()],
+            fields: vec![SchemaField {
+                name: "n".into(),
+                field_type: FieldType::Numeric,
+                options: FieldOptions::default(),
+            }],
+            aliases: Vec::new(),
+            stopwords: None,
+            synonyms: Default::default(),
+            language: Default::default(),
+            default_score: 1.0,
+            score_field: None,
+        }
+        .into_def();
+        index_store.write().insert("i347".into(), def.clone());
+        // Two documents with n = 1; one's n has a time to live, about to end.
+        for key in ["d347:a", "d347:b"] {
+            let fields: Vec<(String, Arc<[u8]>)> = vec![
+                ("n".into(), Arc::from(&b"1"[..])),
+                ("o".into(), Arc::from(&b"x"[..])),
+            ];
+            let mut inner = HashInner::new();
+            for (name, value) in &fields {
+                inner.fields.insert(name.clone(), Arc::clone(value));
+            }
+            if key == "d347:b" {
+                inner
+                    .expiries
+                    .insert("n".into(), Instant::now() + Duration::from_millis(1));
+            }
+            crate::store::get_shard(&store[0], key).write().insert(
+                key,
+                KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(inner))),
+            );
+            let mut p = def.postings.write();
+            p.write(key, &fields, true);
+            def.postings.done(p);
+            crate::field_expiry::track_key(&store, 0, key);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        // A read drops the field (as HGETALL does); the indexes are not told.
+        if let Some(ValueRef::HashEx(hash)) = crate::store::get_shard(&store[0], "d347:b")
+            .read()
+            .get("d347:b")
+        {
+            assert_eq!(hash.write().sweep_expired(), 1);
+        }
+        let filter = Filter::Numeric {
+            field: "n".into(),
+            lo: f64::NEG_INFINITY,
+            lo_exclusive: false,
+            hi: 7.0,
+            hi_exclusive: true,
+        };
+        let matches = |plan: &Plan| -> Vec<String> {
+            keys_of(&def, &plan.ids)
+                .iter()
+                .map(|key| key.to_string())
+                .collect()
+        };
+        let plan = plan_in(&store, 0, &def, &filter, None).unwrap();
+        assert!(plan.exact);
+        assert_eq!(matches(&plan), ["d347:a"], "a watched hash is tried");
+
+        // Now the sweep, with the query holding the postings.
+        let (s, i) = (Arc::clone(&store), Arc::clone(&index_store));
+        crate::test_hooks::set("plan: postings read", move || {
+            crate::field_expiry::sweep(&s, &i)
+        });
+        let plan = plan_in(&store, 0, &def, &filter, None).unwrap();
+        assert!(
+            crate::field_expiry::watched_keys(&store, 0).is_empty(),
+            "the sweep ran, and the hash is no longer watched"
+        );
+        assert_eq!(matches(&plan), ["d347:a"], "the swept hash was tried");
+    }
+
     fn words(cmd: &[&str]) -> Result<Vec<SchemaField>, String> {
         let cmd: Vec<&[u8]> = cmd.iter().map(|w| w.as_bytes()).collect();
         let mut i = 0;
         parse_schema_fields(&cmd, &mut i)
+    }
+
+    #[test]
+    fn score_text_matches_redis_number_formatting() {
+        assert_eq!(score_text(f64::from(0.1f32)), "0.10000000149011612");
+        assert_eq!(score_text(0.1), "0.1");
+        assert_eq!(score_text(0.0001), "0.0001");
+        assert_eq!(score_text(f64::from(0.0001f32)), "9.999999747378752e-5");
+        assert_eq!(score_text(0.0009999), "9.999e-4");
+        assert_eq!(score_text(0.00001), "0.00001");
+        assert_eq!(score_text(0.000001), "0.000001");
+        assert_eq!(score_text(1e-7), "1e-7");
+        assert_eq!(score_text(123456.789), "123456.789");
+        assert_eq!(score_text(f64::from(123_456.79_f32)), "1.234567890625e+5");
+        assert_eq!(score_text(f64::from(1e-45f32)), "1.401298464324817e-45");
+        assert_eq!(score_text(f64::from(3.4e38f32)), "3.3999999521443642e+38");
+        assert_eq!(score_text(f64::from(9e18f32)), "9000000202358129000");
+        assert_eq!(score_text(f64::from(1e19f32)), "9999999980506448000");
+        assert_eq!(score_text(f64::from(1e23f32)), "99999997781963080000000");
+        assert_eq!(score_text(f64::from(1e24f32)), "1.0000000138484279e+24");
+        assert_eq!(
+            score_text(f64::from(1.0000001e23f32)),
+            "100000006789162340000000"
+        );
+        assert_eq!(
+            score_text(f64::from(9.999999e23f32)),
+            "9.999998697332398e+23"
+        );
+        assert_eq!(
+            score_text(f64::from(1.2345678e23f32)),
+            "1.234567802683402e+23"
+        );
+        assert_eq!(
+            score_text(f64::from(1.234_567_9e23_f32)),
+            "123456789275539450000000"
+        );
+        assert_eq!(score_text(0.0), "0");
+        assert_eq!(score_text(-0.0), "-0");
+        assert_eq!(score_text(f64::INFINITY), "inf");
+        assert_eq!(score_text(f64::NEG_INFINITY), "-inf");
+        assert_eq!(score_text(f64::NAN), "nan");
     }
 
     /// The five schemas of the LiteLLM report: each was refused.

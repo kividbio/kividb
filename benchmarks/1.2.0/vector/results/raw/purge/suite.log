@@ -1,0 +1,8 @@
+== dbpedia-openai-1M-1536-angular kividb-cand start 18:48:08
+exit=0 dbpedia-openai-1M-1536-angular kividb-cand 18:52:11
+kividb-cand peak_rss_kb=12889520
+SUITE DONE purge 18:54:48
+== dbpedia-openai-1M-1536-angular kividb-rc4 start 18:54:48
+exit=0 dbpedia-openai-1M-1536-angular kividb-rc4 18:58:52
+kividb-rc4 peak_rss_kb=12890132
+SUITE DONE purge 19:01:29

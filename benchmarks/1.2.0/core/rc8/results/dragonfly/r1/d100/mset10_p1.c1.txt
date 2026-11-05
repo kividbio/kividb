@@ -1,0 +1,30 @@
+Json file ~/results/dragonfly/r1/d100/mset10_p1.c1.json created...
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 5%,   1 secs] 15 threads 40 conns:      314057 ops,  314004 (avg:  314004) ops/sec, 394.95MB/sec (avg: 394.95MB/sec),  1.91 (avg:  1.91) msec latency[RUN #1 10%,   2 secs] 15 threads 40 conns:      594031 ops,  279906 (avg:  296955) ops/sec, 352.06MB/sec (avg: 373.51MB/sec),  2.14 (avg:  2.02) msec latency[RUN #1 15%,   3 secs] 15 threads 40 conns:      874053 ops,  279965 (avg:  291291) ops/sec, 352.14MB/sec (avg: 366.38MB/sec),  2.14 (avg:  2.06) msec latency[RUN #1 20%,   4 secs] 15 threads 40 conns:     1151098 ops,  276387 (avg:  287559) ops/sec, 347.64MB/sec (avg: 361.69MB/sec),  2.17 (avg:  2.08) msec latency[RUN #1 25%,   5 secs] 15 threads 40 conns:     1429478 ops,  278312 (avg:  285710) ops/sec, 350.06MB/sec (avg: 359.36MB/sec),  2.15 (avg:  2.10) msec latency[RUN #1 30%,   6 secs] 15 threads 40 conns:     1708629 ops,  279087 (avg:  284607) ops/sec, 351.03MB/sec (avg: 357.98MB/sec),  2.15 (avg:  2.10) msec latency[RUN #1 35%,   7 secs] 15 threads 40 conns:     1988035 ops,  279343 (avg:  283855) ops/sec, 351.35MB/sec (avg: 357.03MB/sec),  2.15 (avg:  2.11) msec latency[RUN #1 40%,   8 secs] 15 threads 40 conns:     2264533 ops,  276427 (avg:  282927) ops/sec, 347.69MB/sec (avg: 355.86MB/sec),  2.17 (avg:  2.12) msec latency[RUN #1 45%,   9 secs] 15 threads 40 conns:     2542220 ops,  277617 (avg:  282337) ops/sec, 349.18MB/sec (avg: 355.12MB/sec),  2.16 (avg:  2.12) msec latency[RUN #1 50%,  10 secs] 15 threads 40 conns:     2815423 ops,  273134 (avg:  281417) ops/sec, 343.55MB/sec (avg: 353.96MB/sec),  2.19 (avg:  2.13) msec latency[RUN #1 55%,  11 secs] 15 threads 40 conns:     3090401 ops,  274908 (avg:  280825) ops/sec, 345.78MB/sec (avg: 353.22MB/sec),  2.18 (avg:  2.13) msec latency[RUN #1 60%,  12 secs] 15 threads 40 conns:     3368091 ops,  277610 (avg:  280557) ops/sec, 349.18MB/sec (avg: 352.88MB/sec),  2.16 (avg:  2.14) msec latency[RUN #1 65%,  13 secs] 15 threads 40 conns:     3645394 ops,  277238 (avg:  280302) ops/sec, 348.71MB/sec (avg: 352.56MB/sec),  2.16 (avg:  2.14) msec latency[RUN #1 70%,  14 secs] 15 threads 40 conns:     3923557 ops,  278095 (avg:  280144) ops/sec, 349.79MB/sec (avg: 352.36MB/sec),  2.15 (avg:  2.14) msec latency[RUN #1 75%,  15 secs] 15 threads 40 conns:     4202128 ops,  278505 (avg:  280035) ops/sec, 350.30MB/sec (avg: 352.23MB/sec),  2.15 (avg:  2.14) msec latency[RUN #1 80%,  16 secs] 15 threads 40 conns:     4479225 ops,  277023 (avg:  279847) ops/sec, 348.44MB/sec (avg: 351.99MB/sec),  2.16 (avg:  2.14) msec latency[RUN #1 85%,  17 secs] 15 threads 40 conns:     4754437 ops,  275147 (avg:  279570) ops/sec, 346.08MB/sec (avg: 351.64MB/sec),  2.18 (avg:  2.14) msec latency[RUN #1 90%,  18 secs] 15 threads 40 conns:     5032868 ops,  278323 (avg:  279501) ops/sec, 350.07MB/sec (avg: 351.55MB/sec),  2.15 (avg:  2.14) msec latency[RUN #1 95%,  19 secs] 15 threads 40 conns:     5312062 ops,  279128 (avg:  279481) ops/sec, 351.08MB/sec (avg: 351.53MB/sec),  2.15 (avg:  2.14) msec latency[RUN #1 100%,  20 secs] 15 threads 40 conns:     5589409 ops,  277897 (avg:  279402) ops/sec, 349.54MB/sec (avg: 351.43MB/sec),  2.16 (avg:  2.14) msec latency[RUN #1 100%,  20 secs]  0 threads 40 conns:     5589539 ops,  277897 (avg:  279405) ops/sec, 349.54MB/sec (avg: 351.43MB/sec),  2.16 (avg:  2.14) msec latency
+
+Writing Full Run command HDR latency histogram results to ~/results/dragonfly/r1/d100/mset10_p1.c1_FULL_RUN_1.txt...
+Writing Full Run command HDR latency histogram results in HistogramLogProcessor format to ~/results/dragonfly/r1/d100/mset10_p1.c1_FULL_RUN_1.hgrm...
+Writing MSET command HDR latency histogram results to ~/results/dragonfly/r1/d100/mset10_p1.c1_MSET_command_run_1.txt...
+Writing MSET command HDR latency histogram results in HistogramLogProcessor format to ~/results/dragonfly/r1/d100/mset10_p1.c1_MSET_command_run_1.hgrm...
+
+CPU Utilization Summary
+  Total CPU time:   189.311s  (user 76.752s, sys 112.558s)
+  Wall time:        20.012s
+  Cores used:       9.460   (avg 63.1% across 15 worker threads)
+  Peak utilization: 1022.8%
+Saving JSON output file: ~/results/dragonfly/r1/d100/mset10_p1.c1.json
+Json file closed.
+15        Threads
+40        Connections per thread
+20        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Msets      279407.91         0.00         0.00         2.14538         2.07900         4.41500         6.49500    359871.05 
+Totals     279407.91         0.00         0.00         2.14538         2.07900         4.41500         6.49500    719742.10 
+rc=0

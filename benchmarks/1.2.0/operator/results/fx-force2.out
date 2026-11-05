@@ -1,0 +1,11 @@
+BEGIN fx-force2 20:50:12
+fx-force2 cordoned all nodes but vmss000003 20:50:25
+fx-force2 force delete fx-0-1 20:50:25
+pod "fx-0-1" force deleted from e2e namespace
+fx-force2 new fx-0-1 on vmss000003, nodes uncordoned 20:50:32
+fx-force2 fx-0-1 Ready 20:50:39
+lines with two engines for fx-0-1: 18
+END fx-force2 20:51:27
+acked 186422 errors 2250 win ['20:50:26-20:50:35:2250'] slow 400 ['20:50:37.387 2891ms ok=true', '20:50:38.736 1542ms ok=true', '20:50:38.247 2033ms ok=true', '20:50:36.546 3733ms ok=true', '20:50:36.047 4233ms ok=true', '20:50:36.887 3394ms ok=true', '20:50:38.667 1614ms ok=true', '20:50:35.366 4915ms ok=true']
+errkinds Counter({'context deadline exceeded': 30})
+checked 187782 missing 0 wrong 0 readErr 0 bySec {} dbsize 3187692 ex {}

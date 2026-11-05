@@ -1,0 +1,12 @@
+1793714433.134178426 start 10.81.1.11:7001 sync_full=1 sync_partial_ok=0 sync_partial_err=0 
+1793714433.169323897 start 10.81.1.12:7001 sync_full=1 sync_partial_ok=0 sync_partial_err=0 
+1793714433.185187778 start 10.81.1.13:7001 sync_full=1 sync_partial_ok=0 sync_partial_err=0 
+1793714433.204661916 start 10.81.1.11:7002 sync_full=0 sync_partial_ok=0 sync_partial_err=0 
+1793714433.224969035 start 10.81.1.12:7002 sync_full=0 sync_partial_ok=0 sync_partial_err=0 
+1793714433.245779140 start 10.81.1.13:7002 sync_full=0 sync_partial_ok=0 sync_partial_err=0 
+1793714743.823241876 end 10.81.1.11:7001 sync_full=1 sync_partial_ok=0 sync_partial_err=0 
+1793714743.859495616 end 10.81.1.12:7001 sync_full=1 sync_partial_ok=0 sync_partial_err=0 
+1793714743.886436102 end 10.81.1.13:7001 sync_full=1 sync_partial_ok=0 sync_partial_err=0 
+1793714743.912118974 end 10.81.1.11:7002 sync_full=0 sync_partial_ok=0 sync_partial_err=0 
+1793714743.948800801 end 10.81.1.12:7002 sync_full=0 sync_partial_ok=0 sync_partial_err=0 
+1793714743.979925194 end 10.81.1.13:7002 sync_full=0 sync_partial_ok=0 sync_partial_err=0 

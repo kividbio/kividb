@@ -57,6 +57,13 @@ impl Conn {
         self.cmd(&refs)
     }
 
+    /// The connection, with `timeout` to wait for each reply.
+    #[cfg(feature = "lua")]
+    fn with_read_timeout(self, timeout: Duration) -> Self {
+        self.stream.set_read_timeout(Some(timeout)).unwrap();
+        self
+    }
+
     fn read_value(&mut self) -> RespValue {
         let mut line = String::new();
         self.reader.read_line(&mut line).unwrap();
@@ -818,6 +825,169 @@ fn wait_link_up(c: &mut Conn) {
     wait_until("replica link up", Duration::from_secs(10), || {
         repl_info(c, "master_link_status").as_deref() == Some("up")
     });
+}
+
+/// A replica answers a `SAVE` while it applies writes of keys of two shards
+/// from its master. Such a write takes the command gate alone. The applier
+/// took it holding its own lock, which a `SAVE` waits for inside the gate:
+/// neither went on, the replica answered nothing more and applied nothing
+/// more, and its master dropped it (#373). Each `SAVE` here has the
+/// connection's 5 s to answer.
+#[test]
+fn a_replica_saves_while_it_applies_writes_of_two_shards() {
+    saves_beside_writes_of_two_shards(IoModel::Tokio);
+}
+
+/// [`a_replica_saves_while_it_applies_writes_of_two_shards`], the replica
+/// on io_uring, which takes the gate on a loop of its own.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_replica_on_io_uring_saves_while_it_applies_writes_of_two_shards() {
+    saves_beside_writes_of_two_shards(IoModel::Uring);
+}
+
+fn saves_beside_writes_of_two_shards(io_model: IoModel) {
+    let master = spawn_server(Config::default());
+    let dir = tempfile::tempdir().unwrap();
+    let replica = spawn_server_with(
+        Config {
+            dir: dir.path().to_string_lossy().into_owned(),
+            ..replica_of(master)
+        },
+        2,
+        io_model,
+    );
+    let mut r = Conn::connect(replica);
+    wait_link_up(&mut r);
+    let mut m = Conn::connect(master);
+    assert!(m.cmds(&["SET", "a", "1"]).is_ok());
+    let until = Instant::now() + Duration::from_secs(3);
+    let writer = thread::spawn(move || {
+        let mut m = Conn::connect(master);
+        let mut copies = 0u64;
+        while Instant::now() < until {
+            let to = format!("b{}", copies % 64);
+            assert_eq!(m.cmds(&["COPY", "a", &to, "REPLACE"]), RespValue::Int(1));
+            copies += 1;
+        }
+        copies
+    });
+    let mut saves = 0u64;
+    while Instant::now() < until {
+        let reply = r.cmds(&["SAVE"]);
+        assert!(reply.is_ok(), "{reply:?}");
+        saves += 1;
+    }
+    let copies = writer.join().unwrap();
+    assert!(copies > 0 && saves > 0, "{copies} copies, {saves} saves");
+    // And the replica applied every one of them.
+    let at: u64 = repl_info(&mut m, "master_repl_offset")
+        .unwrap()
+        .parse()
+        .unwrap();
+    wait_until(
+        "the replica to apply them all",
+        Duration::from_secs(10),
+        || repl_info(&mut r, "slave_repl_offset").is_some_and(|o| o.parse::<u64>().unwrap() >= at),
+    );
+}
+
+/// A replica answers a `SAVE` while it applies its master's writes and runs a
+/// client's read-only scripts. A script takes the command gate alone, slot by
+/// slot, in the order the threads got them. It took the applier's slot, then
+/// waited for that of a `SAVE`, which was waiting for the applier's lock;
+/// and the applier, holding that lock, waited for its slot behind the script.
+/// None of the three went on (#373). The threads that run the `SAVE`s and
+/// the scripts here get their slots after the applier has its own: the
+/// replica has more of them than have run a command yet.
+#[cfg(feature = "lua")]
+#[test]
+fn a_replica_saves_while_it_applies_writes_and_runs_scripts() {
+    let master = spawn_server(Config::default());
+    let dir = tempfile::tempdir().unwrap();
+    let replica = spawn_server_with(
+        Config {
+            dir: dir.path().to_string_lossy().into_owned(),
+            ..replica_of(master)
+        },
+        8,
+        IoModel::Tokio,
+    );
+    // Nothing is asked of the replica until its applier has its slot: the
+    // link is seen from the master.
+    let mut m = Conn::connect(master);
+    wait_until("the replica online", Duration::from_secs(10), || {
+        repl_info(&mut m, "slave0").is_some_and(|s| s.contains("state=online"))
+    });
+    let until = Instant::now() + Duration::from_secs(4);
+    let writer = thread::spawn(move || {
+        let mut m = Conn::connect(master);
+        let mut sets = 0u64;
+        while Instant::now() < until {
+            let key = format!("k{}", sets % 64);
+            assert!(m.cmds(&["SET", &key, "v"]).is_ok());
+            sets += 1;
+        }
+        sets
+    });
+    // The applier at work, with its slot, before the others start.
+    wait_until(
+        "the replica to apply a write",
+        Duration::from_secs(10),
+        || repl_info(&mut m, "slave0").is_some_and(|s| !s.contains("offset=0,")),
+    );
+    thread::sleep(Duration::from_millis(200));
+    let mut r = Conn::connect(replica);
+    let clients: Vec<_> = (0..8)
+        .map(|i| {
+            thread::spawn(move || {
+                // A `SAVE` has 30 s: a slow disk is not a deadlock.
+                let mut c = Conn::connect(replica).with_read_timeout(Duration::from_secs(30));
+                let mut done = 0u64;
+                while Instant::now() < until {
+                    if i % 2 == 0 {
+                        let reply = c.cmds(&["SAVE"]);
+                        assert!(reply.is_ok(), "{reply:?}");
+                    } else {
+                        assert_eq!(c.cmds(&["EVAL_RO", "return 1", "0"]), RespValue::Int(1));
+                    }
+                    done += 1;
+                }
+                done
+            })
+        })
+        .collect();
+    let sets = writer.join().unwrap();
+    let done: Vec<u64> = clients.into_iter().map(|c| c.join().unwrap()).collect();
+    assert!(sets > 0 && done.iter().all(|&n| n > 0), "{sets} {done:?}");
+    let at: u64 = repl_info(&mut m, "master_repl_offset")
+        .unwrap()
+        .parse()
+        .unwrap();
+    wait_until(
+        "the replica to apply them all",
+        Duration::from_secs(10),
+        || repl_info(&mut r, "slave_repl_offset").is_some_and(|o| o.parse::<u64>().unwrap() >= at),
+    );
+}
+
+/// [`spawn_server`], with `threads` worker threads and `io_model`.
+fn spawn_server_with(mut config: Config, threads: usize, io_model: IoModel) -> u16 {
+    let port = free_port();
+    config.port = port;
+    config.bind = "127.0.0.1".to_string();
+    config.threads = threads;
+    config.loglevel = "error".to_string();
+    config.io_model = io_model;
+    config.configfile = "./kividb.conf".to_string();
+    thread::spawn(move || kividb::run_for_test(config));
+    for _ in 0..100 {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!("server on port {port} did not start listening within 5s");
 }
 
 /// A script runs on a replica, and only a write it makes is refused, as in

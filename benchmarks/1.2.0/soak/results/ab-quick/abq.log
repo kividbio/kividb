@@ -1,0 +1,9 @@
+20:50:49 done r1 rc7 rc7mix: median-by-p99 interval: 197 158975 182783
+20:55:52 done r1 rc6 rc7mix: median-by-p99 interval: 192 166911 362751
+21:00:55 done r1 rc6 rc6mix: median-by-p99 interval: 188 151551 187007
+21:05:57 done r1 rc7 rc6mix: median-by-p99 interval: 198 159359 185471
+21:11:00 done r2 rc7 rc7mix: median-by-p99 interval: 202 174463 193791
+21:16:02 done r2 rc6 rc7mix: median-by-p99 interval: 212 161151 186367
+21:21:05 done r2 rc6 rc6mix: median-by-p99 interval: 184 148735 185343
+21:26:08 done r2 rc7 rc6mix: median-by-p99 interval: 197 161535 179967
+ABQ-DONE

@@ -1,0 +1,5 @@
+1,1.84,11.3,1,0,full,has the whole stream, to offset 1877152833 (10 ms)
+2,1.20,11.6,1,0,full,has the whole stream, to offset 2952345901 (10 ms)
+3,1.71,11.8,1,0,full,has the whole stream, to offset 3906060319 (10 ms)
+kividb: 0 partial of 3; soakgen errors 2969
+R306-DONE kividb

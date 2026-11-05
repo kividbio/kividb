@@ -1,0 +1,109 @@
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc9 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc9
+  * Mode           : standalone
+  * OS             : linux x86_64
+  * Memory         : 31GiB available
+  * CPUs           : 8 cores detected
+  * Listening on   : 0.0.0.0:6379
+  * Worker threads : 6
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-03T08:12:34.429Z 116884 [INFO] KiviDB 1.2.0-rc9 starting: pid 116884, default build, config file '/mnt/kv/node.conf'
+2026-11-03T08:12:34.429Z 116884 [INFO] I/O model      : io_uring
+2026-11-03T08:12:34.430Z 116884 [INFO] Shards per DB  : 64
+2026-11-03T08:12:34.430Z 116884 [INFO] I/O model      : io_uring
+2026-11-03T08:12:34.430Z 116884 [INFO] Ready to accept connections on 0.0.0.0:6379
+2026-11-03T08:12:34.764Z 116884 [INFO] Replication: Channel replica registered: 10.91.1.12:39896
+2026-11-03T08:12:34.765Z 116884 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub
+2026-11-03T08:12:36.781Z 116884 [INFO] Replication: Replica 10.91.1.12:39896 is streaming: its queue peaked at 23 bytes during the full sync (repl-replica-sync-max-backlog-bytes 1073741824, repl-replica-max-backlog-bytes 268435456)
+2026-11-03T08:12:38.602Z 116884 [WARN] Replication: Channel replica 10.91.1.12:39896 exceeded backlog limit (268435662 > 268435456 bytes) — evicting
+2026-11-03T08:12:40.279Z 116884 [INFO] Replication: uring: replica disconnected
+2026-11-03T08:12:41.288Z 116884 [INFO] Replication: Partial resync not possible for 10.91.1.12:58888: offset 545693927 is not in the backlog, which holds offsets 1097221364 to 1098269939 (repl-backlog-size) — sending the dataset
+2026-11-03T08:12:41.288Z 116884 [INFO] Replication: Channel replica registered: 10.91.1.12:58888
+2026-11-03T08:12:43.181Z 116884 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub
+2026-11-03T08:12:44.430Z 116884 [INFO] AOF: auto-checkpoint: 1047.39 MB is 100%+ above the 0.00 MB baseline — folding into dump.kdb
+2026-11-03T08:12:45.665Z 116884 [INFO] AOF: rebased onto dump.kdb (generation 1) — log is now the delta
+2026-11-03T08:12:50.600Z 116884 [INFO] Replication: Replica 10.91.1.12:58888 is streaming: its queue peaked at 250 bytes during the full sync (repl-replica-sync-max-backlog-bytes 1073741824, repl-replica-max-backlog-bytes 268435456)
+2026-11-03T08:12:55.666Z 116884 [INFO] AOF: auto-checkpoint: 121.51 MB is 100%+ above the 0.00 MB baseline — folding into dump.kdb
+2026-11-03T08:12:57.692Z 116884 [INFO] AOF: rebased onto dump.kdb (generation 2) — log is now the delta
+2026-11-03T08:13:07.692Z 116884 [INFO] AOF: auto-checkpoint: 288.41 MB is 100%+ above the 48.14 MB baseline — folding into dump.kdb
+2026-11-03T08:13:09.893Z 116884 [INFO] AOF: rebased onto dump.kdb (generation 3) — log is now the delta
+2026-11-03T08:13:15.655Z 116884 [INFO] Replication: uring: replica disconnected
+2026-11-03T08:13:19.893Z 116884 [INFO] AOF: auto-checkpoint: 206.08 MB is 100%+ above the 53.91 MB baseline — folding into dump.kdb
+2026-11-03T08:13:22.130Z 116884 [INFO] AOF: rebased onto dump.kdb (generation 4) — log is now the delta
+2026-11-03T08:13:28.978Z 116884 [INFO] Replication: Partial resync not possible for 10.91.1.12:41186: offset 1678231959 is not in the backlog, which holds offsets 1971137372 to 1972185947 (repl-backlog-size) — sending the dataset
+2026-11-03T08:13:28.978Z 116884 [INFO] Replication: Channel replica registered: 10.91.1.12:41186
+2026-11-03T08:13:32.035Z 116884 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub
+2026-11-03T08:13:32.131Z 116884 [INFO] AOF: auto-checkpoint: 292.95 MB is 100%+ above the 53.13 MB baseline — folding into dump.kdb
+2026-11-03T08:13:34.387Z 116884 [INFO] AOF: rebased onto dump.kdb (generation 5) — log is now the delta
+2026-11-03T08:13:39.777Z 116884 [INFO] Replication: uring: replica disconnected
+2026-11-03T08:13:39.777Z 116884 [INFO] Replication: Replica 10.91.1.12:41186 left during its full sync; its queue peaked at 259976588 bytes
+2026-11-03T08:13:44.387Z 116884 [INFO] AOF: auto-checkpoint: 293.51 MB is 100%+ above the 53.67 MB baseline — folding into dump.kdb
+2026-11-03T08:13:46.689Z 116884 [INFO] AOF: rebased onto dump.kdb (generation 6) — log is now the delta
+2026-11-03T08:13:48.028Z 116884 [INFO] Replication: Partial resync not possible for 10.91.1.12:57444: offset 1678231959 is not in the backlog, which holds offsets 2448194628 to 2449243203 (repl-backlog-size) — sending the dataset
+2026-11-03T08:13:48.029Z 116884 [INFO] Replication: Channel replica registered: 10.91.1.12:57444
+2026-11-03T08:13:51.061Z 116884 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub
+2026-11-03T08:13:56.689Z 116884 [INFO] AOF: auto-checkpoint: 292.33 MB is 100%+ above the 54.10 MB baseline — folding into dump.kdb
+2026-11-03T08:13:59.067Z 116884 [INFO] AOF: rebased onto dump.kdb (generation 7) — log is now the delta
+2026-11-03T08:14:04.065Z 116884 [INFO] Replication: Replica 10.91.1.12:57444 is streaming: its queue peaked at 298468027 bytes during the full sync (repl-replica-sync-max-backlog-bytes 1073741824, repl-replica-max-backlog-bytes 268435456)
+2026-11-03T08:14:07.350Z 116884 [INFO] Replication: uring: replica disconnected
+2026-11-03T08:14:09.067Z 116884 [INFO] AOF: auto-checkpoint: 171.14 MB is 100%+ above the 57.26 MB baseline — folding into dump.kdb
+2026-11-03T08:14:11.354Z 116884 [INFO] AOF: rebased onto dump.kdb (generation 8) — log is now the delta
+2026-11-03T08:14:21.354Z 116884 [INFO] AOF: auto-checkpoint: 292.38 MB is 100%+ above the 53.78 MB baseline — folding into dump.kdb
+2026-11-03T08:14:22.432Z 116884 [INFO] Replication: Partial resync not possible for 10.91.1.12:38290: offset 2845241463 is not in the backlog, which holds offsets 3178100603 to 3179149178 (repl-backlog-size) — sending the dataset
+2026-11-03T08:14:22.433Z 116884 [INFO] Replication: Channel replica registered: 10.91.1.12:38290
+2026-11-03T08:14:23.683Z 116884 [INFO] AOF: rebased onto dump.kdb (generation 9) — log is now the delta
+2026-11-03T08:14:25.770Z 116884 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub
+2026-11-03T08:14:30.402Z 116884 [INFO] Replication: uring: replica disconnected
+2026-11-03T08:14:30.402Z 116884 [INFO] Replication: Replica 10.91.1.12:38290 left during its full sync; its queue peaked at 188809864 bytes
+2026-11-03T08:14:33.683Z 116884 [INFO] AOF: auto-checkpoint: 295.41 MB is 100%+ above the 57.04 MB baseline — folding into dump.kdb
+2026-11-03T08:14:36.092Z 116884 [INFO] AOF: rebased onto dump.kdb (generation 10) — log is now the delta
+2026-11-03T08:14:40.315Z 116884 [INFO] Replication: Partial resync not possible for 10.91.1.12:36490: offset 2845241463 is not in the backlog, which holds offsets 3625555775 to 3626604350 (repl-backlog-size) — sending the dataset
+2026-11-03T08:14:40.315Z 116884 [INFO] Replication: Channel replica registered: 10.91.1.12:36490
+2026-11-03T08:14:43.590Z 116884 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub
+2026-11-03T08:14:46.092Z 116884 [INFO] AOF: auto-checkpoint: 295.78 MB is 100%+ above the 57.89 MB baseline — folding into dump.kdb
+2026-11-03T08:14:48.506Z 116884 [INFO] AOF: rebased onto dump.kdb (generation 11) — log is now the delta
+2026-11-03T08:14:58.506Z 116884 [INFO] AOF: auto-checkpoint: 286.13 MB is 100%+ above the 57.40 MB baseline — folding into dump.kdb
+2026-11-03T08:14:58.903Z 116884 [INFO] Replication: Replica 10.91.1.12:36490 is streaming: its queue peaked at 344760828 bytes during the full sync (repl-replica-sync-max-backlog-bytes 1073741824, repl-replica-max-backlog-bytes 268435456)
+2026-11-03T08:15:00.181Z 116884 [INFO] AOF: rebased onto dump.kdb (generation 12) — log is now the delta
+2026-11-03T08:16:01.676Z 116884 [WARN] Replication: disconnecting timedout replica 10.91.1.12:6379: no REPLCONF ACK for 60 s (repl-timeout)
+2026-11-03T08:16:01.677Z 116884 [INFO] Replication: uring: replica disconnected
+2026-11-03T08:19:46.948Z 116884 [INFO] Replication: Channel replica registered: 10.91.1.12:46202
+2026-11-03T08:19:49.275Z 116884 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub
+2026-11-03T08:19:58.697Z 116884 [INFO] Replication: Replica 10.91.1.12:46202 is streaming: its queue peaked at 13275 bytes during the full sync (repl-replica-sync-max-backlog-bytes 1073741824, repl-replica-max-backlog-bytes 268435456)

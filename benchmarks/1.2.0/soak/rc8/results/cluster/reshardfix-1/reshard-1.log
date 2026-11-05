@@ -1,0 +1,44 @@
+>>> Performing Cluster Check (using node 10.80.1.5:7002)
+M: e76a3a1003cb9a2aa3b865cf6d98807bcaad5167 10.80.1.5:7002
+   slots:[0-9],[5461-10922] (5472 slots) master
+   1 additional replica(s)
+S: 274867528c3b57317d6f96684f1b58be0e63de38 10.80.1.8:7001
+   slots: (0 slots) slave
+   replicates e76a3a1003cb9a2aa3b865cf6d98807bcaad5167
+S: 40df12b10975bb8e155997a337b459cee0de8c14 10.80.1.9:7001
+   slots: (0 slots) slave
+   replicates b00aa6a3bd6b413f37723f37da0c3b7b7b13c791
+M: b00aa6a3bd6b413f37723f37da0c3b7b7b13c791 10.80.1.8:7002
+   slots:[10-5460] (5451 slots) master
+   1 additional replica(s)
+S: f8f4bc441966cf102a5a92d10af1bb91ad2cdb93 10.80.1.9:7002
+   slots: (0 slots) slave
+   replicates f928e7d9f5bf6b9b384cd1ced1c5b5b5dccfc1f0
+M: f928e7d9f5bf6b9b384cd1ced1c5b5b5dccfc1f0 10.80.1.5:7001
+   slots:[10923-16383] (5461 slots) master
+   1 additional replica(s)
+[OK] All nodes agree about slots configuration.
+>>> Check for open slots...
+>>> Check slots coverage...
+[OK] All 16384 slots covered.
+
+Ready to move 5 slots.
+  Source nodes:
+    M: e76a3a1003cb9a2aa3b865cf6d98807bcaad5167 10.80.1.5:7002
+       slots:[0-9],[5461-10922] (5472 slots) master
+       1 additional replica(s)
+  Destination node:
+    M: f928e7d9f5bf6b9b384cd1ced1c5b5b5dccfc1f0 10.80.1.5:7001
+       slots:[10923-16383] (5461 slots) master
+       1 additional replica(s)
+  Resharding plan:
+    Moving slot 0 from e76a3a1003cb9a2aa3b865cf6d98807bcaad5167
+    Moving slot 1 from e76a3a1003cb9a2aa3b865cf6d98807bcaad5167
+    Moving slot 2 from e76a3a1003cb9a2aa3b865cf6d98807bcaad5167
+    Moving slot 3 from e76a3a1003cb9a2aa3b865cf6d98807bcaad5167
+    Moving slot 4 from e76a3a1003cb9a2aa3b865cf6d98807bcaad5167
+Moving slot 0 from 10.80.1.5:7002 to 10.80.1.5:7001: ............................................................
+Node 10.80.1.5:7002 replied with error:
+TRYAGAIN a key was written while being migrated, and kept here: 'hf:9565'. The copies sent to 10.80.1.5:7001 were deleted there; MIGRATE them again
+
+clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:9565'. The copies sent to 10.80.1.5:7001 were deleted there; MIGRATE them again

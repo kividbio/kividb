@@ -1,0 +1,119 @@
+[
+ {
+  "id": "upgrade-shd",
+  "title": "rc9: engine upgrade 1.2.0-rc8 -> 1.2.0-rc9 (sharded)",
+  "subtitle": "",
+  "loader": "loader-shd",
+  "t0": 1793690560,
+  "t1": 1793690722,
+  "t0s": "07:22:40"
+ },
+ {
+  "id": "restart-rc9",
+  "title": "rc9: rolling restart (KividbDbOps), sharded",
+  "subtitle": "",
+  "loader": "loader-shd",
+  "t0": 1793690741,
+  "t1": 1793690914,
+  "t0s": "07:25:41"
+ },
+ {
+  "id": "failover-rc9",
+  "title": "rc9: CLUSTER FAILOVER on every shard's replica in turn",
+  "subtitle": "",
+  "loader": "loader-shd",
+  "t0": 1793690930,
+  "t1": 1793691042,
+  "t0s": "07:28:50"
+ },
+ {
+  "id": "graceful1",
+  "title": "rc9: graceful delete of a shard master, same node, try 1",
+  "subtitle": "",
+  "loader": "loader-shd",
+  "t0": 1793691088,
+  "t1": 1793691185,
+  "t0s": "07:31:28"
+ },
+ {
+  "id": "graceful2",
+  "title": "rc9: graceful delete of a shard master, same node, try 2",
+  "subtitle": "",
+  "loader": "loader-shd",
+  "t0": 1793691232,
+  "t1": 1793691329,
+  "t0s": "07:33:52"
+ },
+ {
+  "id": "forcedel1",
+  "title": "rc9: same-node force delete of a shard master (#303), try 1",
+  "subtitle": "",
+  "loader": "loader-shd",
+  "t0": 1793691411,
+  "t1": 1793691508,
+  "t0s": "07:36:51"
+ },
+ {
+  "id": "forcedel2",
+  "title": "rc9: same-node force delete of a shard master (#303), try 2",
+  "subtitle": "",
+  "loader": "loader-shd",
+  "t0": 1793691591,
+  "t1": 1793691688,
+  "t0s": "07:39:51"
+ },
+ {
+  "id": "forcedel3",
+  "title": "rc9: same-node force delete of a shard master (#303), try 3",
+  "subtitle": "",
+  "loader": "loader-shd",
+  "t0": 1793691771,
+  "t1": 1793691868,
+  "t0s": "07:42:51"
+ },
+ {
+  "id": "sigkill-rc9",
+  "title": "rc9: kill -9 of a shard master's engine, restarts in place",
+  "subtitle": "",
+  "loader": "loader-shd",
+  "t0": 1793691900,
+  "t1": 1793691946,
+  "t0s": "07:45:00"
+ },
+ {
+  "id": "reshard-up-rc9",
+  "title": "rc9: spec.shards 3 -> 4 under load",
+  "subtitle": "",
+  "loader": "loader-shd",
+  "t0": 1793691979,
+  "t1": 1793692050,
+  "t0s": "07:46:19"
+ },
+ {
+  "id": "reshard-down-rc9",
+  "title": "rc9: spec.shards 4 -> 3 under load",
+  "subtitle": "",
+  "loader": "loader-shd",
+  "t0": 1793692083,
+  "t1": 1793692131,
+  "t0s": "07:48:03"
+ },
+ {
+  "id": "guard-yes",
+  "title": "rc9: #42 guard: rc9, aof-ack-after-write yes",
+  "subtitle": "",
+  "loader": "loader-g-yes",
+  "t0": 1793692177,
+  "t1": 1793692395,
+  "t0s": "07:49:37"
+ },
+ {
+  "id": "guard-no",
+  "title": "rc9: #42 guard: rc9, aof-ack-after-write no",
+  "subtitle": "",
+  "loader": "loader-g-no",
+  "t0": 1793692414,
+  "t1": 1793692630,
+  "t0s": "07:53:34"
+ }
+]

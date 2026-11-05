@@ -1,0 +1,14 @@
+2026-11-03T07:31:40.976513111Z 2026-11-03T07:31:40.976Z 1 [INFO] Cluster: Manual failover requested by 0400792f2f4c129d42e926ec8e9dd114d031d450 — writes paused, replica must reach offset 6286370
+2026-11-03T07:31:40.978708846Z 2026-11-03T07:31:40.978Z 1 [INFO] Cluster: Voted for 0400792f2f4c129d42e926ec8e9dd114d031d450 to take over from 2e4fa5855bcbaa3f27f095f776b037e66709991e at epoch 15 (manual failover)
+2026-11-03T07:31:41.054608770Z 2026-11-03T07:31:41.054Z 1 [INFO] Cluster: Slots of this shard are now owned by 0400792f2f4c129d42e926ec8e9dd114d031d450 — following it as a replica
+2026-11-03T07:31:41.054687351Z 2026-11-03T07:31:41.054Z 1 [INFO] Replication: This node's dataset is offset 6286370 of its own stream a8e8b1617baa45b6fd95741b0e05348a369775be: a master that continues that stream can continue this node
+2026-11-03T07:31:41.055596801Z 2026-11-03T07:31:41.054Z 1 [INFO] Replication: Replica <ip>:58694 disconnected: this node is now a replica itself
+2026-11-03T07:31:41.055617838Z 2026-11-03T07:31:41.054Z 1 [INFO] Replication: uring: replica disconnected
+2026-11-03T07:31:41.055624767Z 2026-11-03T07:31:41.055Z 1 [INFO] Replication: Connecting to master <ip>:6380...
+2026-11-03T07:31:41.058729079Z 2026-11-03T07:31:41.058Z 1 [INFO] Replication: The master continues a8e8b1617baa45b6fd95741b0e05348a369775be as 666459345e1ae053b3b5b5b202ee52ea28eb278d
+2026-11-03T07:31:41.058754243Z 2026-11-03T07:31:41.058Z 1 [INFO] Replication: Partial resync: continuing from offset 6286370 — no dataset transfer
+2026-11-03T07:31:41.059258590Z 2026-11-03T07:31:41.059Z 1 [INFO] Replication: Synced with <ip>:6380. Entering command stream.
+2026-11-03T07:31:41.075389162Z 2026-11-03T07:31:41.075Z 1 [INFO] SIGTERM received — shutting down gracefully
+2026-11-03T07:31:41.075418076Z 2026-11-03T07:31:41.075Z 1 [INFO] Writing final snapshot...
+2026-11-03T07:31:41.146078278Z 2026-11-03T07:31:41.145Z 1 [INFO] AOF: rebased onto dump.kdb (generation 4) — log is now the delta
+2026-11-03T07:31:41.146291394Z 2026-11-03T07:31:41.146Z 1 [INFO] Goodbye.

@@ -1,0 +1,14 @@
+transfer: condition seen=1 0.67 s after the resync started; replica master_sync_in_progress at the kill: 0
+transfer: replica role 25 s after kill -9 of its master: slave; its keys: 0
+transfer: cluster_state:fail cluster_slots_ok:10923 cluster_slots_fail:5461 
+transfer: replica log: 2026-11-03T07:58:20.390Z 81387 [WARN] Cluster: Not standing for election for failed master 6a897d69c94447c26487529b2fbe34c0cbfbd788: it has not been in step with its master since it started, so the age of its data is not known (cluster-replica-validity-factor 10; 0 lets it stand)
+transfer: after: A master keys 3060288; B slave keys 3060288
+load: condition seen=1 1.07 s after the resync started; replica master_sync_in_progress at the kill: 1
+load: replica role 25 s after kill -9 of its master: slave; its keys: 0
+load: cluster_state:fail cluster_slots_ok:10923 cluster_slots_fail:5461 
+load: replica log: 2026-11-03T07:58:20.390Z 81387 [WARN] Cluster: Not standing for election for failed master 6a897d69c94447c26487529b2fbe34c0cbfbd788: it has not been in step with its master since it started, so the age of its data is not known (cluster-replica-validity-factor 10; 0 lets it stand)
+load: replica log: 2026-11-03T07:59:12.847Z 83628 [WARN] Cluster: Not standing for election for failed master 6a897d69c94447c26487529b2fbe34c0cbfbd788: it has not finished loading its last full sync from the master and streamed since: it may hold part of the master's data, or none of it
+load: after: A master keys 3150741; B slave keys 3150741
+failover: caught-up replica promoted after 6.28 s; keys A-before ? B now 3272839
+failover: replica log: 2026-11-03T07:59:12.847Z 83628 [WARN] Cluster: Not standing for election for failed master 6a897d69c94447c26487529b2fbe34c0cbfbd788: it has not finished loading its last full sync from the master and streamed since: it may hold part of the master's data, or none of it
+failover: replica log: 2026-11-03T08:00:06.147Z 83628 [INFO] Cluster: Won election at epoch 4 (2 votes, quorum 2)

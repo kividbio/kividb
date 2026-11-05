@@ -1,0 +1,31 @@
+DEL cand 4556
+GET-100-TTL cand 3402
+SET-100-TTL cand 5657
+INCR-TTL cand 4154
+DEL-TTL cand 5165
+GET-100-LRU cand 3687
+SET-100-LRU cand 4627
+INCR-LRU cand 4431
+DEL-LRU cand 4826
+GET-100-LFU cand 3895
+SET-100-LFU cand 4963
+INCR-LFU cand 4721
+workload            v113           rc4          cand
+GET-100             3250          3333          3339     +2.7%
+SET-100             3947          4267          4276     +8.3%
+GET-1K              3837          3852          3833     -0.1%
+SET-1K              4041          4384          4380     +8.4%
+MIX-100             7218          7625          7625     +5.6%
+INCR                4319          4083          4086     -5.4%
+DEL                 4038          4474          4556    +12.8%
+GET-100-TTL          3560          3401          3402     -4.4%
+SET-100-TTL          5996          5658          5657     -5.7%
+INCR-TTL            4560          4146          4154     -8.9%
+DEL-TTL             5002          5126          5165     +3.3%
+GET-100-LRU          3705          3687          3687     -0.5%
+SET-100-LRU          4436          4621          4627     +4.3%
+INCR-LRU            4746          4430          4431     -6.6%
+DEL-LRU             4630          4818          4826     +4.2%
+GET-100-LFU          3709          3897          3895     +5.0%
+SET-100-LFU          4438          4966          4963    +11.8%
+INCR-LFU            4743          4721          4721     -0.5%

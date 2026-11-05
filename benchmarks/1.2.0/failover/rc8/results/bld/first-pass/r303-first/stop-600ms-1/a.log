@@ -1,0 +1,59 @@
+2026-11-03T05:12:57.924Z 11108 [WARN] /tmp/r303l/kividb.conf: line 1: 'save' is accepted but has no effect: KiviDB does not snapshot on a schedule — use `appendonly yes`, or BGSAVE
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc8 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc8
+  * Mode           : standalone
+  * OS             : linux x86_64
+  * Memory         : 62GiB available
+  * CPUs           : 16 cores detected
+  * Listening on   : 127.0.0.1:7100
+  * Worker threads : 14
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-03T05:12:57.976Z 11108 [INFO] KiviDB 1.2.0-rc8 starting: pid 11108, default build, config file '/tmp/r303l/kividb.conf'
+2026-11-03T05:12:57.976Z 11108 [INFO] I/O model      : io_uring
+2026-11-03T05:12:57.978Z 11108 [INFO] Shards per DB  : 128
+2026-11-03T05:12:57.978Z 11108 [INFO] I/O model      : io_uring
+2026-11-03T05:12:57.978Z 11108 [INFO] Ready to accept connections on 127.0.0.1:7100
+2026-11-03T05:12:58.086Z 11108 [INFO] Replication: Channel replica registered: 127.0.0.1:44170
+2026-11-03T05:12:58.087Z 11108 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub
+2026-11-03T05:12:59.466Z 11108 [INFO] AOF: rebased onto dump.kdb (generation 1) — log is now the delta
+2026-11-03T05:13:08.169Z 11108 [INFO] SIGTERM received — shutting down gracefully
+2026-11-03T05:13:08.169Z 11108 [INFO] Writing final snapshot...
+2026-11-03T05:13:08.358Z 11108 [INFO] AOF: rebased onto dump.kdb (generation 2) — log is now the delta
+2026-11-03T05:13:08.358Z 11108 [INFO] Goodbye.

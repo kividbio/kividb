@@ -1,0 +1,26 @@
+FAIL: rpm: install on clean amazonlinux:2023 (no shadow-utils; package does not require it) -- /var/tmp/rpm-tmp.X9wUke: line 7: groupadd: command not found
+PASS: rpm: installs on clean rockylinux/rockylinux:9 (/usr/bin/dnf; useradd present before: yes)
+PASS: rpm: installs on clean almalinux:9 (/usr/bin/dnf; useradd present before: yes)
+PASS: rpm: installs on clean fedora:41 (/usr/bin/dnf; useradd present before: yes)
+PASS: rpm: installs on clean registry.access.redhat.com/ubi9/ubi (/usr/bin/dnf; useradd present before: yes)
+FAIL: rpm: install on clean registry.access.redhat.com/ubi9/ubi-minimal -- Downloading metadata...
+Downloading metadata...
+error: No package matches '/tmp/kividb.rpm'
+INFO: rpm -qpR (declared requirements): 
+Unable to find image 'registry.access.redhat.com/ubi9/ubi-init:latest' locally
+latest: Pulling from ubi9/ubi-init
+8905636c6019: Pulling fs layer
+8905636c6019: Download complete
+8905636c6019: Pull complete
+Digest: sha256:9e8e38e836eca107b342cdab68c60e587b765f36fce46e7483c28013bb0cdde0
+Status: Downloaded newer image for registry.access.redhat.com/ubi9/ubi-init:latest
+INFO: systemd in container: running
+PASS: rpm: dnf install under systemd (ubi9-init)
+PASS: rpm: postinstall enabled+started the unit, PING on 6380
+PASS: rpm: unit enabled
+PASS: rpm: MainPID runs as user kividb
+PASS: rpm: INFO server kividb_version 1.2.0-rc7
+PASS: rpm: PING/SET/GET
+PASS: rpm: EVAL refused cleanly [ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-rc7-lua, or a kividb-lua release file)], connection still serves
+PASS: rpm-amd64 plain redis-benchmark: 6 tests (	117647	106044	117924	106837	92506	101729 )
+PASS: rpm: dnf remove stops the service

@@ -1,0 +1,1 @@
+shard of slot 13000 (run beside the serial loop): master 10.70.1.7:7001 replica 10.70.1.9:7002 offsets 58913117883 58913117883

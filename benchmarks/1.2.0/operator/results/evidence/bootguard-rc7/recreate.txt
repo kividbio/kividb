@@ -1,0 +1,6 @@
+rep-restored keys (= snapshot) 4221213
+with extras 4222213
+data-rep-restored-0   Bound   pvc-e35afc1f-2fca-44a7-a8cb-b6956b5fddee   5Gi    RWO   default   <unset>   2m5s
+data-rep-restored-1   Bound   pvc-2c94107d-c2ee-45d4-b74d-9acab4630fef   5Gi    RWO   default   <unset>   110s
+rep-restored-0 keys 4222213 extras 1000
+rep-restored-1 keys 4222213 extras 1000

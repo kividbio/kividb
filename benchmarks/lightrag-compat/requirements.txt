@@ -1,0 +1,9 @@
+# The versions the results in this folder were produced with: LightRAG 1.5.7 installed from its
+# git tag with its own uv.lock (uv sync --frozen --extra test --extra offline-storage), which
+# resolves to these for what the harness uses.
+lightrag-hku==1.5.7
+redis==8.0.0
+numpy==2.4.4
+tiktoken==0.12.0
+nano-vectordb==0.0.4.3
+networkx==3.6.1

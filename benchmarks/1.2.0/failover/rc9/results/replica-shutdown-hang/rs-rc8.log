@@ -1,0 +1,6 @@
+1,under load,HUNG,31.15,2026-11-03T08:11:40.144Z 34333 [INFO] AOF: auto-checkpoint: 209.90 MB is 100%+ above the 11.94 MB baseline — folding into dump.kdb
+2,under load,exited,1.10,2026-11-03T08:12:27.871Z 37952 [INFO] Goodbye.
+3,under load,HUNG,31.26,2026-11-03T08:12:43.551Z 38906 [INFO] Writing final snapshot...
+4,load stopped,exited,1.07,2026-11-03T08:13:32.475Z 41751 [INFO] Goodbye.
+rc8: 2 of 3 clean stops under load hung; control (load stopped): exited
+RS-DONE rc8

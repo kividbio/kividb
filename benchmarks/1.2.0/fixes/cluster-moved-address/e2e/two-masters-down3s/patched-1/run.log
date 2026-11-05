@@ -1,0 +1,39 @@
+[    3.89] cluster formed {'n1': '61d8ea30838ed93996e008efa0fd9dd312f7a8f6', 'n2': 'e581c3f6915fbfdbd849e976f5f5b7d49550c94e', 'n3': 'f281d2e30af32ce54f68102de2609fdb8f128e7f', 'n4': 'bde988fbb4cf875df5a049ec470714ff2db4c7c5', 'n5': 'fc01adf8a233cceb7c3e6897c3b1523a5c06d038', 'n6': 'b3c1fa4f414daa17296b6f4504ba541e340cc129'}
+[   23.89] stop ['n1', 'n2']
+[   24.01] re-IP {'n1': '10.99.0.21', 'n2': '10.99.0.22'}
+[   26.92] restarted ['n1', 'n2']
+{
+ "label": "patched",
+ "scenario": "two-masters",
+ "rep": "1",
+ "node_timeout_ms": 5000,
+ "down_s": 3.0,
+ "moving": [
+  "n1",
+  "n2"
+ ],
+ "new_ips": {
+  "n1": "10.99.0.21",
+  "n2": "10.99.0.22"
+ },
+ "restart_after_kill_s": 3.03,
+ "moved_views_converged_s": 11.48,
+ "all_views_and_state_ok_s": 11.48,
+ "cluster_state_ok_everywhere_s": 0.48,
+ "flaps_after_restart": 0,
+ "per_observer_moved_view_ok_s": {
+  "n1": 11.48,
+  "n2": 11.48,
+  "n3": 1.48,
+  "n4": 1.48,
+  "n5": 1.48,
+  "n6": 1.48
+ },
+ "observed_after_restart_s": 26.48,
+ "writes_failed_after_kill": 22,
+ "writes_clusterdown_after_kill": 0,
+ "writes_attempted_after_kill": 4966,
+ "last_failed_write_s_after_kill": 13,
+ "last_clusterdown_s_after_kill": null,
+ "failed_seconds_after_restart": 6
+}

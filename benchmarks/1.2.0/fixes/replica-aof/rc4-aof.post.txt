@@ -1,0 +1,60 @@
+== load stopped 01:07:16
+0s master_repl_offset=6520454709 replica_offset=6520454709 lag=0
+== replica INFO persistence
+aof_enabled:1
+rdb_bgsave_in_progress:0
+aof_rewrite_in_progress:1
+aof_rewrite_scheduled:0
+aof_last_rewrite_time_sec:155
+aof_last_rewrite_time_ms:155475
+aof_last_bgrewrite_status:ok
+aof_current_size:306725796
+aof_base_size:4194623
+aof_lost_records:0
+aof_last_write_status:ok
+aof_acks_before_write:0
+aof_last_cow_size:0
+== DBSIZE master 1279194 replica 1279194
+== DEBUG DIGEST master OK replica OK
+== AOF/data files master
+133	/mnt/kv/appendonly.aof
+226997867	/mnt/kv/appendonly.aof.prev
+735604240	/mnt/kv/dump.kdb
+530875569	/mnt/kv/dump.kdb.9930.22.tmp
+24	/mnt/kv/dump.kdb.gen
+105	/mnt/kv/node.conf
+5	/mnt/kv/pid
+9727	/mnt/kv/server.log
+/mnt/kv:
+total 1461560
+drwxrwxr-x 2 azureuser azureuser      4096 Nov  2 01:07 .
+drwxr-xr-x 7 azureuser root           4096 Nov  2 01:03 ..
+-rw-rw-r-- 1 azureuser azureuser       133 Nov  2 01:07 appendonly.aof
+-rw-rw-r-- 1 azureuser azureuser 226997867 Nov  2 01:07 appendonly.aof.prev
+-rw-rw-r-- 1 azureuser azureuser 735604240 Nov  2 01:07 dump.kdb
+-rw-rw-r-- 1 azureuser azureuser 533987328 Nov  2 01:07 dump.kdb.9930.22.tmp
+-rw-rw-r-- 1 azureuser azureuser        24 Nov  2 01:07 dump.kdb.gen
+-rw-rw-r-- 1 azureuser azureuser       105 Nov  2 01:03 node.conf
+-rw-rw-r-- 1 azureuser azureuser         5 Nov  2 01:03 pid
+-rw-rw-r-- 1 azureuser azureuser      9727 Nov  2 01:07 server.log
+== AOF/data files replica
+306725796	/mnt/kv/appendonly.aof
+16	/mnt/kv/appendonly.aof.rewrite.tmp
+519568059	/mnt/kv/dump.kdb
+24	/mnt/kv/dump.kdb.gen
+93	/mnt/kv/dump.kdb.repl
+130	/mnt/kv/node.conf
+5	/mnt/kv/pid
+5275	/mnt/kv/server.log
+/mnt/kv:
+total 806972
+drwxrwxr-x 2 azureuser azureuser      4096 Nov  2 01:06 .
+drwxr-xr-x 4 azureuser root           4096 Nov  2 01:03 ..
+-rw-rw-r-- 1 azureuser azureuser 306725796 Nov  2 01:07 appendonly.aof
+-rw-rw-r-- 1 azureuser azureuser        16 Nov  2 01:06 appendonly.aof.rewrite.tmp
+-rw-rw-r-- 1 azureuser azureuser 519568059 Nov  2 01:06 dump.kdb
+-rw-rw-r-- 1 azureuser azureuser        24 Nov  2 01:06 dump.kdb.gen
+-rw-rw-r-- 1 azureuser azureuser        93 Nov  2 01:03 dump.kdb.repl
+-rw-rw-r-- 1 azureuser azureuser       130 Nov  2 01:03 node.conf
+-rw-rw-r-- 1 azureuser azureuser         5 Nov  2 01:03 pid
+-rw-rw-r-- 1 azureuser azureuser      5275 Nov  2 01:06 server.log

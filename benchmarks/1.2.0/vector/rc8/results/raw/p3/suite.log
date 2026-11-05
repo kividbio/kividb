@@ -1,0 +1,13 @@
+== h-and-m-2048-angular-filters kividb-rc8 start 03:51:31
+exit=0 h-and-m-2048-angular-filters kividb-rc8 03:54:37
+kividb-rc8 peak_rss_kb=2288180
+== h-and-m-2048-angular-filters kividb-rc7 start 03:54:44
+exit=0 h-and-m-2048-angular-filters kividb-rc7 03:57:50
+kividb-rc7 peak_rss_kb=2285496
+== dbpedia-openai-1M-1536-angular kividb-rc8 start 03:57:57
+exit=0 dbpedia-openai-1M-1536-angular kividb-rc8 04:02:16
+kividb-rc8 peak_rss_kb=12899408
+== dbpedia-openai-1M-1536-angular kividb-rc7 start 04:02:23
+exit=0 dbpedia-openai-1M-1536-angular kividb-rc7 04:06:42
+kividb-rc7 peak_rss_kb=12895004
+SUITE DONE p3 04:06:48

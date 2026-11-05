@@ -1,0 +1,51 @@
+engine-1  | 2026-11-03T03:21:29.981Z 1 [INFO] KiviDB 1.2.0-rc7 starting: pid 1, default build, config file none
+engine-1  | 2026-11-03T03:21:29.981Z 1 [INFO] I/O model      : io_uring
+engine-1  |                                                                                      
+engine-1  |                                                                                                     
+engine-1  |                                                    :::.                                     
+engine-1  |                                 .:-==-:.       :#%@%%%@%%=                                  
+engine-1  |                           -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+engine-1  |                       :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+engine-1  |                     +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+engine-1  |                   =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+engine-1  |                 .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+engine-1  |                -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+engine-1  |               .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+engine-1  |               +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+engine-1  |               %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+engine-1  |               @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+engine-1  |               %%:::::::::::::::::::::::::::::+%@%-                          .               
+engine-1  |               =@*::::::::::::::::::::::::::*%@@*                                            
+engine-1  |                *@*::::=+:::::::::::::::-*%@@%%:                                             
+engine-1  |                 *@#-:##::::::::::-=+*%@@@@%*.                                               
+engine-1  |                  :#@%@*::::::*%@@@%%@@@%*:                                                  
+engine-1  |                    .*%%=:::*%%%%%%%@@%+                                                     
+engine-1  |                      .#@@@%*-   .#%@*.                                                      
+engine-1  |                       .#@*        :%@%:                                                     
+engine-1  |                         %@*         =%@#                                                    
+engine-1  |                          #@#          +%%+                                                  
+engine-1  |                           *%%+:...     .*@%*:....                                           
+engine-1  |                        *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+engine-1  |                                .+-            :+.                                           
+engine-1  |                                                                                                     
+engine-1  |     
+engine-1  |   KiviDB v1.2.0-rc7 - A fast Redis®-compatible store written in Rust
+engine-1  |   https://kividb.io
+engine-1  | 
+engine-1  |   Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+engine-1  | 
+engine-1  |   * Version        : 1.2.0-rc7
+engine-1  |   * Mode           : standalone
+engine-1  |   * OS             : linux x86_64
+engine-1  |   * Memory         : 251GiB available
+engine-1  |   * CPUs           : 32 cores detected
+engine-1  |   * Listening on   : 0.0.0.0:6379
+engine-1  |   * Worker threads : 30
+engine-1  |   * AOF            : disabled
+engine-1  |   * Persistence    : KDB snapshot (SAVE / BGSAVE)
+engine-1  |   * Databases      : 16
+engine-1  |   * ACL file       : none
+engine-1  | 
+engine-1  | 2026-11-03T03:21:29.983Z 1 [INFO] Shards per DB  : 256
+engine-1  | 2026-11-03T03:21:29.983Z 1 [INFO] I/O model      : io_uring
+engine-1  | 2026-11-03T03:21:29.983Z 1 [INFO] Ready to accept connections on 0.0.0.0:6379

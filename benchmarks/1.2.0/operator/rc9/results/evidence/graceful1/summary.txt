@@ -1,0 +1,16 @@
+lines with two engines for shd-0-1: 0
+keys before: shd-0-1 155524 master;shd-0-0 155531 slave;  after: shd-0-1 177216 slave;shd-0-0 177221 master;
+dump.kdb sizes seen: 2070612 3742140 
+2026-11-03T07:31:40.976513111Z 2026-11-03T07:31:40.976Z 1 [INFO] Cluster: Manual failover requested by 0400792f2f4c129d42e926ec8e9dd114d031d450 — writes paused, replica must reach offset 6286370
+2026-11-03T07:31:41.054687351Z 2026-11-03T07:31:41.054Z 1 [INFO] Replication: This node's dataset is offset 6286370 of its own stream a8e8b1617baa45b6fd95741b0e05348a369775be: a master that continues that stream can continue this node
+2026-11-03T07:31:41.058729079Z 2026-11-03T07:31:41.058Z 1 [INFO] Replication: The master continues a8e8b1617baa45b6fd95741b0e05348a369775be as 666459345e1ae053b3b5b5b202ee52ea28eb278d
+2026-11-03T07:31:41.058754243Z 2026-11-03T07:31:41.058Z 1 [INFO] Replication: Partial resync: continuing from offset 6286370 — no dataset transfer
+2026-11-03T07:31:41.075389162Z 2026-11-03T07:31:41.075Z 1 [INFO] SIGTERM received — shutting down gracefully
+2026-11-03T07:31:41.075418076Z 2026-11-03T07:31:41.075Z 1 [INFO] Writing final snapshot...
+2026-11-03T07:31:41.146078278Z 2026-11-03T07:31:41.145Z 1 [INFO] AOF: rebased onto dump.kdb (generation 4) — log is now the delta
+2026-11-03T07:31:41.146291394Z 2026-11-03T07:31:41.146Z 1 [INFO] Goodbye.
+2026-11-03T07:31:44.019672804Z 2026-11-03T07:31:44.019Z 1 [INFO] Found dump.kdb — loading native snapshot
+2026-11-03T07:31:44.123021477Z 2026-11-03T07:31:44.122Z 1 [INFO] Loaded 159006 keys from snapshot (0 with a TTL)
+2026-11-03T07:31:44.123719556Z 2026-11-03T07:31:44.123Z 1 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+2026-11-03T07:31:44.128332241Z 2026-11-03T07:31:44.128Z 1 [INFO] Replication: Loaded dataset is offset 6287216 of 666459345e1ae053b3b5b5b202ee52ea28eb278d — a partial resync will be asked for
+2026-11-03T07:31:44.132550044Z 2026-11-03T07:31:44.132Z 1 [INFO] Replication: Partial resync: continuing from offset 6287216 — no dataset transfer

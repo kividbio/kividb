@@ -1,0 +1,7 @@
+== dbpedia-openai-1M-1536-angular kividb-rc8 start 16:32:38
+exit=0 dbpedia-openai-1M-1536-angular kividb-rc8 16:36:51
+kividb-rc8 peak_rss_kb=12888884
+== dbpedia-openai-1M-1536-angular kividb-rc10 start 16:36:58
+exit=0 dbpedia-openai-1M-1536-angular kividb-rc10 16:41:11
+kividb-rc10 peak_rss_kb=12889128
+SUITE DONE xg2 16:41:17

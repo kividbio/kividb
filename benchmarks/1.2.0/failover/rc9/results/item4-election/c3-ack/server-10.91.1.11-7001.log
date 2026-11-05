@@ -1,0 +1,203 @@
+2026-11-03T08:01:48.365Z 90215 [WARN] cluster bus port 17001 is not authenticated: any host that can reach it can join this cluster. Set cluster-bus-secret, or restrict the port to cluster members at the network layer.
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc9 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc9
+  * Mode           : cluster
+  * OS             : linux x86_64
+  * Memory         : 31GiB available
+  * CPUs           : 8 cores detected
+  * Listening on   : 0.0.0.0:7001
+  * Cluster bus    : 0.0.0.0:17001
+  * Node timeout   : 5000ms
+  * Node ID        : (printed after cluster init)
+  * Worker threads : 6
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-03T08:01:48.365Z 90215 [INFO] KiviDB 1.2.0-rc9 starting: pid 90215, default build, config file '/data/7001/node.conf'
+2026-11-03T08:01:48.365Z 90215 [INFO] I/O model      : io_uring
+2026-11-03T08:01:48.377Z 90215 [INFO] Cluster: Node ID        : f60b2eceef70d1def328f3053222a3b955b53e03
+2026-11-03T08:01:48.377Z 90215 [INFO] Cluster: Bus port       : 17001
+2026-11-03T08:01:48.377Z 90215 [INFO] Shards per DB  : 64
+2026-11-03T08:01:48.377Z 90215 [INFO] I/O model      : io_uring
+2026-11-03T08:01:48.378Z 90215 [INFO] Cluster: Bus listener bound on 0.0.0.0:17001
+2026-11-03T08:01:48.378Z 90215 [INFO] Cluster: Heartbeat loop started (interval 1s)
+2026-11-03T08:01:48.378Z 90215 [INFO] Cluster: Failure detection started (interval 100ms, node_timeout 5000ms)
+2026-11-03T08:01:48.378Z 90215 [INFO] Ready to accept connections on 0.0.0.0:7001
+2026-11-03T08:01:50.930Z 90215 [INFO] Cluster: Learned own address from an outgoing link: 10.91.1.11
+2026-11-03T08:01:55.969Z 90215 [INFO] Replication: Channel replica registered: 10.91.1.12:44698
+2026-11-03T08:01:55.970Z 90215 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub
+2026-11-03T08:01:58.379Z 90215 [INFO] Replication: Replica 10.91.1.12:44698 is streaming: its queue peaked at 14 bytes during the full sync (repl-replica-sync-max-backlog-bytes 1073741824, repl-replica-max-backlog-bytes 268435456)
+2026-11-03T08:02:04.654Z 90215 [INFO] Replication: uring: replica disconnected
+2026-11-03T08:02:04.739Z 90215 [INFO] Replication: Channel replica registered: 10.91.1.12:52504
+2026-11-03T08:02:33.942Z 92158 [WARN] cluster bus port 17001 is not authenticated: any host that can reach it can join this cluster. Set cluster-bus-secret, or restrict the port to cluster members at the network layer.
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc9 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc9
+  * Mode           : cluster
+  * OS             : linux x86_64
+  * Memory         : 31GiB available
+  * CPUs           : 8 cores detected
+  * Listening on   : 0.0.0.0:7001
+  * Cluster bus    : 0.0.0.0:17001
+  * Node timeout   : 5000ms
+  * Node ID        : (printed after cluster init)
+  * Worker threads : 6
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-03T08:02:33.942Z 92158 [INFO] KiviDB 1.2.0-rc9 starting: pid 92158, default build, config file '/data/7001/node.conf'
+2026-11-03T08:02:33.942Z 92158 [INFO] I/O model      : io_uring
+2026-11-03T08:02:33.950Z 92158 [INFO] Cluster: Node ID        : f60b2eceef70d1def328f3053222a3b955b53e03
+2026-11-03T08:02:33.950Z 92158 [INFO] Cluster: Bus port       : 17001
+2026-11-03T08:02:33.950Z 92158 [INFO] Shards per DB  : 64
+2026-11-03T08:02:33.950Z 92158 [INFO] I/O model      : io_uring
+2026-11-03T08:02:34.346Z 92158 [INFO] Found appendonly.aof — recovering from the append-only file
+2026-11-03T08:02:39.133Z 92158 [INFO] AOF replay: 3110443 commands, 3059762 keys, 711.54 MB in 4.79s
+2026-11-03T08:02:39.450Z 92158 [INFO] Replication: dataset fingerprinted in 195 ms — a replica that holds the same data will be continued rather than sent it
+2026-11-03T08:02:39.451Z 92158 [INFO] Cluster: Bus listener bound on 0.0.0.0:17001
+2026-11-03T08:02:39.451Z 92158 [INFO] Cluster: Heartbeat loop started (interval 1s)
+2026-11-03T08:02:39.451Z 92158 [INFO] Cluster: Failure detection started (interval 100ms, node_timeout 5000ms)
+2026-11-03T08:02:39.451Z 92158 [INFO] Ready to accept connections on 0.0.0.0:7001
+2026-11-03T08:02:39.492Z 92158 [INFO] Cluster: Learned own address from an outgoing link: 10.91.1.11
+2026-11-03T08:02:39.572Z 92158 [INFO] Replication: Channel replica registered: 10.91.1.12:33310
+2026-11-03T08:02:40.848Z 92158 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub
+2026-11-03T08:02:53.231Z 92158 [INFO] Replication: Replica 10.91.1.12:33310 is streaming: its queue peaked at 5206 bytes during the full sync (repl-replica-sync-max-backlog-bytes 1073741824, repl-replica-max-backlog-bytes 268435456)
+2026-11-03T08:02:55.803Z 92158 [INFO] Replication: uring: replica disconnected
+2026-11-03T08:02:55.856Z 92158 [INFO] Replication: Channel replica registered: 10.91.1.12:43826
+2026-11-03T08:02:57.361Z 92158 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub
+2026-11-03T08:03:25.329Z 94580 [WARN] cluster bus port 17001 is not authenticated: any host that can reach it can join this cluster. Set cluster-bus-secret, or restrict the port to cluster members at the network layer.
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc9 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc9
+  * Mode           : cluster
+  * OS             : linux x86_64
+  * Memory         : 31GiB available
+  * CPUs           : 8 cores detected
+  * Listening on   : 0.0.0.0:7001
+  * Cluster bus    : 0.0.0.0:17001
+  * Node timeout   : 5000ms
+  * Node ID        : (printed after cluster init)
+  * Worker threads : 6
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-03T08:03:25.329Z 94580 [INFO] KiviDB 1.2.0-rc9 starting: pid 94580, default build, config file '/data/7001/node.conf'
+2026-11-03T08:03:25.329Z 94580 [INFO] I/O model      : io_uring
+2026-11-03T08:03:25.396Z 94580 [INFO] Cluster: Node ID        : f60b2eceef70d1def328f3053222a3b955b53e03
+2026-11-03T08:03:25.396Z 94580 [INFO] Cluster: Bus port       : 17001
+2026-11-03T08:03:25.396Z 94580 [INFO] Shards per DB  : 64
+2026-11-03T08:03:25.396Z 94580 [INFO] I/O model      : io_uring
+2026-11-03T08:03:25.883Z 94580 [INFO] Found appendonly.aof — recovering from the append-only file
+2026-11-03T08:03:30.782Z 94580 [INFO] AOF replay: 3240726 commands, 3168896 keys, 717.33 MB in 4.90s
+2026-11-03T08:03:31.098Z 94580 [INFO] Replication: dataset fingerprinted in 191 ms — a replica that holds the same data will be continued rather than sent it
+2026-11-03T08:03:31.098Z 94580 [INFO] Cluster: Bus listener bound on 0.0.0.0:17001
+2026-11-03T08:03:31.098Z 94580 [INFO] Cluster: Heartbeat loop started (interval 1s)
+2026-11-03T08:03:31.098Z 94580 [INFO] Cluster: Failure detection started (interval 100ms, node_timeout 5000ms)
+2026-11-03T08:03:31.098Z 94580 [INFO] Ready to accept connections on 0.0.0.0:7001
+2026-11-03T08:03:31.392Z 94580 [INFO] Cluster: Learned own address from an outgoing link: 10.91.1.11
+2026-11-03T08:03:31.725Z 94580 [INFO] Replication: Channel replica registered: 10.91.1.12:47106
+2026-11-03T08:03:33.066Z 94580 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub
+2026-11-03T08:03:45.397Z 94580 [INFO] Replication: Replica 10.91.1.12:47106 is streaming: its queue peaked at 23602 bytes during the full sync (repl-replica-sync-max-backlog-bytes 1073741824, repl-replica-max-backlog-bytes 268435456)

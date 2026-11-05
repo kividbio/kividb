@@ -1,0 +1,25 @@
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 17%,   1 secs] 15 threads 10 conns:      836784 ops,  836484 (avg:  836484) ops/sec, 117.88MB/sec (avg: 117.88MB/sec),  2.86 (avg:  2.86) msec latency[RUN #1 30%,   2 secs] 15 threads 10 conns:     1482960 ops,  646092 (avg:  741299) ops/sec, 91.05MB/sec (avg: 104.47MB/sec),  3.71 (avg:  3.23) msec latency[RUN #1 40%,   3 secs] 15 threads 10 conns:     2007456 ops,  524419 (avg:  669011) ops/sec, 73.91MB/sec (avg: 94.28MB/sec),  4.57 (avg:  3.58) msec latency[RUN #1 51%,   4 secs] 15 threads 10 conns:     2542944 ops,  535418 (avg:  635614) ops/sec, 75.46MB/sec (avg: 89.58MB/sec),  4.48 (avg:  3.77) msec latency[RUN #1 61%,   5 secs] 15 threads 10 conns:     3073168 ops,  530155 (avg:  614523) ops/sec, 74.72MB/sec (avg: 86.60MB/sec),  4.52 (avg:  3.90) msec latency[RUN #1 72%,   6 secs] 15 threads 10 conns:     3593872 ops,  520636 (avg:  598876) ops/sec, 73.37MB/sec (avg: 84.40MB/sec),  4.60 (avg:  4.00) msec latency[RUN #1 82%,   7 secs] 15 threads 10 conns:     4117648 ops,  523703 (avg:  588137) ops/sec, 73.81MB/sec (avg: 82.89MB/sec),  4.58 (avg:  4.07) msec latency[RUN #1 93%,   8 secs] 15 threads 10 conns:     4639080 ops,  521356 (avg:  579790) ops/sec, 73.48MB/sec (avg: 81.71MB/sec),  4.60 (avg:  4.13) msec latency[RUN #1 100%,   8 secs]  0 threads 10 conns:     5000100 ops,  521356 (avg:  576563) ops/sec, 73.48MB/sec (avg: 81.26MB/sec),  4.60 (avg:  4.15) msec latency
+
+
+CPU Utilization Summary
+  Total CPU time:   14.205s  (user 7.198s, sys 7.007s)
+  Wall time:        8.867s
+  Cores used:       1.602   (avg 10.7% across 15 worker threads)
+  Peak utilization: 238.3%
+setting requests to 33334
+15        Threads
+10        Connections per thread
+33334     Requests per client
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets       578682.93          ---          ---         4.15532         4.31900         9.34300        16.51100     83512.19 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     578682.93         0.00         0.00         4.15532         4.31900         9.34300        16.51100     83512.19 

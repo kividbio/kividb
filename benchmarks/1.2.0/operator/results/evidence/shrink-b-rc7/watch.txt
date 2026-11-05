@@ -1,0 +1,4 @@
+21:48:43 +1s phase=Rebalancing pods=6 Ready=False/Rebalancing/changing from 4 to 3 shards: MovingSlots, 2 moves done, moving 1365 slots from shard 3 to 2
+21:48:57 +15s phase=Rebalancing pods=6 Ready=False/Rebalancing/changing from 4 to 3 shards: MovingSlots, 2 moves done, moving 1365 slots from shard 3 to 2
+21:49:13 +31s phase=Rebalancing pods=8 Ready=False/Rebalancing/changing from 4 to 4 shards: AddingShards, 3 moves done
+21:49:29 +47s phase=Rebalancing pods=8 Ready=False/Rebalancing/changing from 4 to 4 shards: MovingSlots, 4 moves done, moving 1365 slots from shard 1 to 3

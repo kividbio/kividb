@@ -1,0 +1,111 @@
+--------------------------------------------------------------------------------
+Profile data file 'rc9-SET-100.out' (creator: callgrind-3.22.0)
+--------------------------------------------------------------------------------
+I1 cache: 
+D1 cache: 
+LL cache: 
+Timerange: Basic block 0 - 52871915
+Trigger: dump
+Profiled target:  /target/perf-rc9/release/kividb --port 6400 --bind 127.0.0.1 --io-model uring --threads 1 --loglevel warning (PID 13777, part 1, thread 14)
+Events recorded:  Ir
+Events shown:     Ir
+Event sort order: Ir
+Thresholds:       99
+Include dirs:     
+User annotated:   
+Auto-annotation:  on
+
+--------------------------------------------------------------------------------
+Ir                   
+--------------------------------------------------------------------------------
+258,670,420 (100.0%)  PROGRAM TOTALS
+
+--------------------------------------------------------------------------------
+Ir                   file:function
+--------------------------------------------------------------------------------
+33,900,930 (13.11%)  ???:kividb::commands::handler::run_command [/target/perf-rc9/release/kividb]
+23,460,722 ( 9.07%)  ???:kividb::resp::parse::parse_multibulk [/target/perf-rc9/release/kividb]
+20,204,501 ( 7.81%)  ???:kividb::server_uring::handle_client::{closure#0} [/target/perf-rc9/release/kividb]
+14,100,224 ( 5.45%)  ???:kividb::commands::strings::handle [/target/perf-rc9/release/kividb]
+12,736,290 ( 4.92%)  ./string/../sysdeps/x86_64/multiarch/memcmp-avx2-movbe.S:__memcmp_avx2_movbe [/usr/lib/x86_64-linux-gnu/libc.so.6]
+12,420,136 ( 4.80%)  ???:core::str::converts::from_utf8 [/target/perf-rc9/release/kividb]
+11,460,428 ( 4.43%)  ???:kividb::commands::handler::execute_command [/target/perf-rc9/release/kividb]
+10,811,239 ( 4.18%)  ???:<kividb::store::shard_map::ShardMap>::set_str_expiring::<&str, &[u8]> [/target/perf-rc9/release/kividb]
+ 7,500,084 ( 2.90%)  ???:kividb::commands::handler::write_side_effects [/target/perf-rc9/release/kividb]
+ 6,521,498 ( 2.52%)  ./malloc/./malloc/malloc.c:_int_free [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 5,700,478 ( 2.20%)  ???:kividb::commands::handler::dispatch_command_handlers [/target/perf-rc9/release/kividb]
+ 5,580,550 ( 2.16%)  ???:kividb::cmdstats::record [/target/perf-rc9/release/kividb]
+ 5,248,575 ( 2.03%)  ./malloc/./malloc/malloc.c:malloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 4,800,164 ( 1.86%)  ???:memchr::arch::x86_64::memchr::memchr_raw::find_avx2 [/target/perf-rc9/release/kividb]
+ 4,406,015 ( 1.70%)  ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:__memcpy_avx_unaligned_erms [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 4,140,000 ( 1.60%)  ???:kividb::keyspec::key_positions [/target/perf-rc9/release/kividb]
+ 4,080,000 ( 1.58%)  ???:kividb::resp::write::resp_simple [/target/perf-rc9/release/kividb]
+ 3,375,144 ( 1.30%)  ???:<kividb::resp::parse::Progress>::next_request [/target/perf-rc9/release/kividb]
+ 3,374,672 ( 1.30%)  ./malloc/./malloc/malloc.c:free [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 3,300,110 ( 1.28%)  ???:<alloc::raw_vec::RawVecInner>::try_allocate_in [/target/perf-rc9/release/kividb]
+ 2,880,876 ( 1.11%)  ???:kividb::replication::is_write_command [/target/perf-rc9/release/kividb]
+ 2,836,332 ( 1.10%)  ???:<std::sys::pal::unix::time::Timespec>::sub_timespec [/target/perf-rc9/release/kividb]
+ 2,820,148 ( 1.09%)  ???:kividb::replication::is_write_command_bytes [/target/perf-rc9/release/kividb]
+ 2,820,000 ( 1.09%)  ???:kividb::commands::handler::settle_written_keys [/target/perf-rc9/release/kividb]
+ 2,760,102 ( 1.07%)  ???:<kividb::client_registry::Activity>::record [/target/perf-rc9/release/kividb]
+ 2,580,086 ( 1.00%)  ???:kividb::command_gate::enter_unless::<kividb::commands::handler::run_command::{closure#6}> [/target/perf-rc9/release/kividb]
+ 2,580,000 ( 1.00%)  ???:kividb::write_order::lock_key_shared [/target/perf-rc9/release/kividb]
+ 2,340,944 ( 0.90%)  ???:<std::sys::pal::unix::time::Timespec>::now [/target/perf-rc9/release/kividb]
+ 1,800,000 ( 0.70%)  ???:<ahash::random_state::RandomState>::hash_one::<&[u8]> [/target/perf-rc9/release/kividb]
+ 1,778,685 ( 0.69%)  ???:tokio::runtime::task::raw::poll::<tokio_uring::runtime::drive_uring_wakes::{closure#0}, alloc::sync::Arc<tokio::task::local::Shared>> [/target/perf-rc9/release/kividb]
+ 1,740,058 ( 0.67%)  ???:<kividb::commands::blocking::BlockingSlot>::prime [/target/perf-rc9/release/kividb]
+ 1,740,000 ( 0.67%)  ???:kividb::write_order::stripe_of [/target/perf-rc9/release/kividb]
+ 1,698,879 ( 0.66%)  ???:<tokio::task::local::LocalSet>::run_until::<core::future::poll_fn::PollFn<<tokio_uring::runtime::Runtime>::block_on<kividb::run_uring::{closure#8}::{closure#0}::{closure#0}::{closure#0}>::{closure#1}>>::{closure#0} [/target/perf-rc9/release/kividb]
+ 1,609,399 ( 0.62%)  ./time/../sysdeps/unix/sysv/linux/clock_gettime.c:clock_gettime@@GLIBC_2.17 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 1,500,000 ( 0.58%)  ???:kividb::commands::handler::atomic_under_its_shard [/target/perf-rc9/release/kividb]
+ 1,496,649 ( 0.58%)  ???:<tokio_uring::net::tcp::stream::TcpStream>::write_all::<alloc::vec::Vec<u8>>::{closure#0} [/target/perf-rc9/release/kividb]
+ 1,410,940 ( 0.55%)  ???:<tokio::runtime::io::scheduled_io::Readiness as core::future::future::Future>::poll [/target/perf-rc9/release/kividb]
+ 1,380,000 ( 0.53%)  ???:core::ptr::drop_glue::<kividb::store::ShardWrite> [/target/perf-rc9/release/kividb]
+ 1,380,000 ( 0.53%)  ???:core::ptr::drop_glue::<kividb::write_order::OrderGuard> [/target/perf-rc9/release/kividb]
+ 1,325,764 ( 0.51%)  ./malloc/./malloc/arena.c:free
+ 1,320,000 ( 0.51%)  ???:kividb::keyspace_events::notify [/target/perf-rc9/release/kividb]
+ 1,200,072 ( 0.46%)  ???:kividb::replication::command_mutates_for_replication [/target/perf-rc9/release/kividb]
+   878,085 ( 0.34%)  ???:<tokio::runtime::io::scheduled_io::ScheduledIo>::wake [/target/perf-rc9/release/kividb]
+   863,498 ( 0.33%)  ???:<tokio::task::local::Shared>::schedule [/target/perf-rc9/release/kividb]
+   840,000 ( 0.32%)  ???:core::ptr::drop_glue::<kividb::write_order::Stripes> [/target/perf-rc9/release/kividb]
+   826,540 ( 0.32%)  ???:<tokio::runtime::scheduler::current_thread::Context>::park [/target/perf-rc9/release/kividb]
+   728,757 ( 0.28%)  ???:<core::pin::Pin<&mut <tokio_uring::net::tcp::listener::TcpListener>::accept::{closure#0}> as core::future::future::Future>::poll [/target/perf-rc9/release/kividb]
+   705,582 ( 0.27%)  ???:tokio::runtime::task::raw::poll::<kividb::run_uring::{closure#8}::{closure#0}::{closure#0}::{closure#0}::{closure#2}::{closure#0}, alloc::sync::Arc<tokio::task::local::Shared>> [/target/perf-rc9/release/kividb]
+   676,467 ( 0.26%)  ???:<tokio::runtime::time::Driver>::park_internal [/target/perf-rc9/release/kividb]
+   664,807 ( 0.26%)  ???:kividb::run_uring::{closure#8}::{closure#0}::{closure#0}::{closure#0} [/target/perf-rc9/release/kividb]
+   631,344 ( 0.24%)  ???:<tokio::runtime::time::wheel::Wheel>::next_expiration [/target/perf-rc9/release/kividb]
+   630,876 ( 0.24%)  ???:<tokio::runtime::io::driver::Driver>::turn [/target/perf-rc9/release/kividb]
+   630,810 ( 0.24%)  ???:<kividb::listen::PortWatch>::next::{closure#0} [/target/perf-rc9/release/kividb]
+   600,020 ( 0.23%)  ???:core::ptr::drop_glue::<core::option::Option<kividb::tag_locks::ScriptGuard>> [/target/perf-rc9/release/kividb]
+   597,034 ( 0.23%)  ???:<tokio::runtime::time::handle::Handle>::process_at_time [/target/perf-rc9/release/kividb]
+   578,174 ( 0.22%)  ???:<tokio::sync::notify::NotifiedProject>::poll_notified [/target/perf-rc9/release/kividb]
+   562,920 ( 0.22%)  ???:<tokio_uring::runtime::driver::Driver>::dispatch_completions [/target/perf-rc9/release/kividb]
+   548,391 ( 0.21%)  ???:std::sys::backtrace::__rust_begin_short_backtrace::<kividb::run_uring::{closure#8}::{closure#0}, ()> [/target/perf-rc9/release/kividb]
+   540,018 ( 0.21%)  ???:core::ptr::drop_glue::<core::option::Option<kividb::tag_locks::KeysGuard>> [/target/perf-rc9/release/kividb]
+   480,328 ( 0.19%)  ???:tokio::runtime::task::waker::wake_by_val [/target/perf-rc9/release/kividb]
+   480,016 ( 0.19%)  ???:core::ptr::drop_glue::<core::option::Option<kividb::store::access::AccessScope>> [/target/perf-rc9/release/kividb]
+   405,756 ( 0.16%)  ???:<tokio_uring::runtime::Runtime>::new::{closure#0} [/target/perf-rc9/release/kividb]
+   383,295 ( 0.15%)  ???:<tokio::runtime::scheduler::current_thread::Context>::park_internal [/target/perf-rc9/release/kividb]
+   285,608 ( 0.11%)  ???:<tokio::process::imp::GlobalOrphanQueue>::reap_orphans [/target/perf-rc9/release/kividb]
+   281,325 ( 0.11%)  ???:<tokio::sync::batch_semaphore::Acquire as core::future::future::Future>::poll [/target/perf-rc9/release/kividb]
+   278,092 ( 0.11%)  ???:<tokio::runtime::metrics::batch::MetricsBatch>::end_processing_scheduled_tasks [/target/perf-rc9/release/kividb]
+   262,821 ( 0.10%)  ???:<tokio::sync::task::atomic_waker::AtomicWaker>::register_by_ref [/target/perf-rc9/release/kividb]
+   247,566 ( 0.10%)  ???:<tokio::sync::batch_semaphore::Semaphore>::add_permits_locked [/target/perf-rc9/release/kividb]
+   240,000 ( 0.09%)  ???:<kividb::watch::WatchRegistryInner as kividb::watch::WatchNotifier>::has_watchers [/target/perf-rc9/release/kividb]
+   232,792 ( 0.09%)  ???:kividb::run_uring::{closure#8}::{closure#0}::{closure#0}::{closure#0}::{closure#2}::{closure#0} [/target/perf-rc9/release/kividb]
+   225,060 ( 0.09%)  ???:<tokio::sync::mutex::Mutex<tokio::io::split::WriteHalf<tokio::net::tcp::stream::TcpStream>>>::lock::{closure#0} [/target/perf-rc9/release/kividb]
+   202,970 ( 0.08%)  ./misc/../sysdeps/unix/sysv/linux/epoll_wait.c:epoll_wait [/usr/lib/x86_64-linux-gnu/libc.so.6]
+   202,689 ( 0.08%)  ???:tokio::util::wake::wake_arc_raw::<tokio::runtime::scheduler::current_thread::Handle> [/target/perf-rc9/release/kividb]
+   195,156 ( 0.08%)  ???:<tokio_uring::runtime::driver::Ops>::insert [/target/perf-rc9/release/kividb]
+   195,156 ( 0.08%)  ???:<tokio_uring::runtime::driver::Ops>::remove [/target/perf-rc9/release/kividb]
+
+--------------------------------------------------------------------------------
+The following files chosen for auto-annotation could not be found:
+--------------------------------------------------------------------------------
+  ./malloc/./malloc/arena.c
+  ./malloc/./malloc/malloc.c
+  ./misc/../sysdeps/unix/sysv/linux/epoll_wait.c
+  ./string/../sysdeps/x86_64/multiarch/memcmp-avx2-movbe.S
+  ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S
+  ./time/../sysdeps/unix/sysv/linux/clock_gettime.c
+

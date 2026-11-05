@@ -1,0 +1,9 @@
+probe a, round 1, 101.0 s
+conn 0: ops 6311, over 10 ms 74.0 %, over 100 ms 1.1 %, worst 179 ms
+conn 1: ops 6311, over 10 ms 73.8 %, over 100 ms 1.0 %, worst 161 ms
+conn 2: ops 6311, over 10 ms 73.5 %, over 100 ms 1.0 %, worst 159 ms
+conn 3: ops 6311, over 10 ms 73.1 %, over 100 ms 1.3 %, worst 150 ms
+conn 4: ops 6311, over 10 ms 73.8 %, over 100 ms 1.0 %, worst 155 ms
+conn 5: ops 6311, over 10 ms 73.6 %, over 100 ms 0.9 %, worst 149 ms
+conn 6: ops 6311, over 10 ms 74.3 %, over 100 ms 0.7 %, worst 151 ms
+conn 7: ops 6311, over 10 ms 74.7 %, over 100 ms 1.1 %, worst 165 ms

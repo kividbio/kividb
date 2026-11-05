@@ -1,0 +1,17 @@
+engine,scenario,rep,acked,lost_acked,wrong_value,wait_acked,wait_acked_lost,unacked_errors,unavailable_s,recovery_s,replica_differences,lost_first_t,lost_last_t,first_event_t
+kividb,c_failover,1,605953,0,0,0,0,0,0.1,0.1,,,,20.019
+kividb,c_failover,2,604758,0,0,0,0,0,0.1,0.1,,,,20.01
+kividb,c_kill9,1,644974,0,0,0,0,373,6.2,6.4,,,,20.282
+kividb,c_kill9,2,642499,0,0,0,0,353,6.1,6.3,,,,20.282
+kividb,c_sigstop,1,733710,0,0,0,0,32,7.3,7.3,,,,20.294
+kividb,c_sigstop,2,733306,0,0,0,0,32,7.3,7.3,,,,20.284
+kividb,kill9_always,1,632554,0,0,0,0,3641,5.2,5.2,0,,,20.3
+kividb,kill9_always,2,632099,0,0,0,0,3702,5.3,5.3,0,,,20.292
+kividb,kill9_checkpoint,1,862984,0,0,0,0,9118,4.3,4.3,0,,,32.081
+kividb,kill9_checkpoint,2,858438,0,0,0,0,9304,4.3,4.3,0,,,31.984
+kividb,kill9_everysec,1,638323,0,0,0,0,3409,5.0,5.0,0,,,20.619
+kividb,kill9_everysec,2,636825,0,0,0,0,3437,4.9,4.9,0,,,20.675
+kividb,partition,1,926496,0,0,0,0,0,0.0,0.0,0,,,20.313
+kividb,partition,2,923565,0,0,0,0,0,0.0,0.0,0,,,20.32
+kividb,sigstop,1,582573,0,0,0,0,464,30.0,30.0,0,,,20.291
+kividb,sigstop,2,575963,0,0,0,0,464,30.0,30.0,0,,,20.289

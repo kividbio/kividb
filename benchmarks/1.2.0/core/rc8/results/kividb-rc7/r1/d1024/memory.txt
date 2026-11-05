@@ -1,0 +1,1 @@
+load_seconds=4.3 used_memory=10715426850 keys=10000000

@@ -1,0 +1,68 @@
+engine-1  | Starting Redis Server
+engine-1  | 1:C 03 Nov 2026 04:06:05.372 # WARNING Memory overcommit must be enabled! Without it, a background save or replication may fail under low memory condition. Being disabled, it can also cause failures without low memory condition, see https://github.com/jemalloc/jemalloc/issues/1328. To fix this issue add 'vm.overcommit_memory = 1' to /etc/sysctl.conf and then reboot or run the command 'sysctl vm.overcommit_memory=1' for this to take effect.
+engine-1  | 1:C 03 Nov 2026 04:06:05.372 * oO0OoO0OoO0Oo Redis is starting oO0OoO0OoO0Oo
+engine-1  | 1:C 03 Nov 2026 04:06:05.372 * Redis version=8.10.3, bits=64, commit=00000000, modified=1, pid=1, just started
+engine-1  | 1:C 03 Nov 2026 04:06:05.372 * Configuration loaded
+engine-1  | 1:M 03 Nov 2026 04:06:05.372 * Increased maximum number of open files to 10032 (it was originally set to 1024).
+engine-1  | 1:M 03 Nov 2026 04:06:05.372 * monotonic clock: POSIX clock_gettime
+engine-1  | 1:M 03 Nov 2026 04:06:05.373 * Running mode=standalone, port=6379.
+engine-1  | 1:M 03 Nov 2026 04:06:05.377 * <bf> RedisBloom version 8.10.1 (Git=unknown)
+engine-1  | 1:M 03 Nov 2026 04:06:05.377 * <bf> Registering configuration options: [
+engine-1  | 1:M 03 Nov 2026 04:06:05.377 * <bf> 	{ bf-error-rate       :      0.01 }
+engine-1  | 1:M 03 Nov 2026 04:06:05.377 * <bf> 	{ bf-initial-size     :       100 }
+engine-1  | 1:M 03 Nov 2026 04:06:05.377 * <bf> 	{ bf-expansion-factor :         2 }
+engine-1  | 1:M 03 Nov 2026 04:06:05.377 * <bf> 	{ cf-bucket-size      :         2 }
+engine-1  | 1:M 03 Nov 2026 04:06:05.377 * <bf> 	{ cf-initial-size     :      1024 }
+engine-1  | 1:M 03 Nov 2026 04:06:05.377 * <bf> 	{ cf-max-iterations   :        20 }
+engine-1  | 1:M 03 Nov 2026 04:06:05.377 * <bf> 	{ cf-expansion-factor :         1 }
+engine-1  | 1:M 03 Nov 2026 04:06:05.377 * <bf> 	{ cf-max-expansions   :        32 }
+engine-1  | 1:M 03 Nov 2026 04:06:05.377 * <bf> ]
+engine-1  | 1:M 03 Nov 2026 04:06:05.377 * Module 'bf' loaded from /usr/local/lib/redis/modules//redisbloom.so
+engine-1  | 1:M 03 Nov 2026 04:06:05.510 * <search> search-workers default: 16 (min of MAX_WORKER_THREADS=16 and CPU cores)
+engine-1  | 1:M 03 Nov 2026 04:06:05.514 * <search> Redis version found by RedisSearch : 8.10.3 - oss
+engine-1  | 1:M 03 Nov 2026 04:06:05.514 * <search> RediSearch version 8.10.1 (Git=)
+engine-1  | 1:M 03 Nov 2026 04:06:05.514 * <search> gc: ON, prefix min length: 2, min word length to stem: 4, prefix max expansions: 200, query timeout (ms): 500, timeout policy: return, oom policy: return, cursor read size: 1000, cursor max idle (ms): 300000, max doctable size: 1000000, max number of search results:  1000000, default scorer: BM25STD, 
+engine-1  | 1:M 03 Nov 2026 04:06:05.514 * <search> Initialized thread pools!
+engine-1  | 1:M 03 Nov 2026 04:06:05.514 * <search> Enabled workers threadpool of size 16
+engine-1  | 1:M 03 Nov 2026 04:06:05.525 * <search> Subscribe to config changes
+engine-1  | 1:M 03 Nov 2026 04:06:05.526 * <search> Subscribe to cluster slot migration events
+engine-1  | 1:M 03 Nov 2026 04:06:05.526 * <search> Subscribe to cluster topology change events
+engine-1  | 1:M 03 Nov 2026 04:06:05.526 * <search> Enabled role change notification
+engine-1  | 1:M 03 Nov 2026 04:06:05.526 * <search> Cluster configuration: AUTO partitions, type: 0, coordinator timeout: 0ms
+engine-1  | 1:M 03 Nov 2026 04:06:05.527 * Module 'search' loaded from /usr/local/lib/redis/modules//redisearch.so
+engine-1  | 1:M 03 Nov 2026 04:06:05.536 * <timeseries> RedisTimeSeries version 81001, git_sha=
+engine-1  | 1:M 03 Nov 2026 04:06:05.536 * <timeseries> Redis version found by RedisTimeSeries : 8.10.3 - oss
+engine-1  | 1:M 03 Nov 2026 04:06:05.536 * <timeseries> Registering configuration options: [
+engine-1  | 1:M 03 Nov 2026 04:06:05.536 * <timeseries> 	{ ts-compaction-policy   :              }
+engine-1  | 1:M 03 Nov 2026 04:06:05.536 * <timeseries> 	{ ts-num-threads         :            3 }
+engine-1  | 1:M 03 Nov 2026 04:06:05.536 * <timeseries> 	{ ts-libmr-protocol      :     INTERNAL }
+engine-1  | 1:M 03 Nov 2026 04:06:05.536 * <timeseries> 	{ ts-retention-policy    :            0 }
+engine-1  | 1:M 03 Nov 2026 04:06:05.536 * <timeseries> 	{ ts-duplicate-policy    :        block }
+engine-1  | 1:M 03 Nov 2026 04:06:05.536 * <timeseries> 	{ ts-chunk-size-bytes    :         4096 }
+engine-1  | 1:M 03 Nov 2026 04:06:05.536 * <timeseries> 	{ ts-encoding            :   compressed }
+engine-1  | 1:M 03 Nov 2026 04:06:05.536 * <timeseries> 	{ ts-ignore-max-time-diff:            0 }
+engine-1  | 1:M 03 Nov 2026 04:06:05.536 * <timeseries> 	{ ts-ignore-max-val-diff :     0.000000 }
+engine-1  | 1:M 03 Nov 2026 04:06:05.536 * <timeseries> 	{ ts-topology-events     :         true }
+engine-1  | 1:M 03 Nov 2026 04:06:05.536 * <timeseries> ]
+engine-1  | 1:M 03 Nov 2026 04:06:05.536 * <timeseries> Detected redis oss (cluster-enabled=no)
+engine-1  | 1:M 03 Nov 2026 04:06:05.536 * <timeseries> Subscribe to ASM events
+engine-1  | 1:M 03 Nov 2026 04:06:05.536 * <timeseries> Subscribe to topology changes events
+engine-1  | 1:M 03 Nov 2026 04:06:05.536 * <timeseries> Enabled diskless replication
+engine-1  | 1:M 03 Nov 2026 04:06:05.536 * Module 'timeseries' loaded from /usr/local/lib/redis/modules//redistimeseries.so
+engine-1  | 1:M 03 Nov 2026 04:06:05.575 * <ReJSON> Created new data type 'ReJSON-RL'
+engine-1  | 1:M 03 Nov 2026 04:06:05.575 * <ReJSON> version: 81000 git sha: unknown branch: unknown
+engine-1  | 1:M 03 Nov 2026 04:06:05.577 * <ReJSON> Exported RedisJSON_V1 API
+engine-1  | 1:M 03 Nov 2026 04:06:05.577 * <ReJSON> Exported RedisJSON_V2 API
+engine-1  | 1:M 03 Nov 2026 04:06:05.577 * <ReJSON> Exported RedisJSON_V3 API
+engine-1  | 1:M 03 Nov 2026 04:06:05.577 * <ReJSON> Exported RedisJSON_V4 API
+engine-1  | 1:M 03 Nov 2026 04:06:05.577 * <ReJSON> Exported RedisJSON_V5 API
+engine-1  | 1:M 03 Nov 2026 04:06:05.577 * <ReJSON> Exported RedisJSON_V6 API
+engine-1  | 1:M 03 Nov 2026 04:06:05.577 * <ReJSON> Exported RedisJSON_V7 API
+engine-1  | 1:M 03 Nov 2026 04:06:05.577 * <ReJSON> Exported RedisJSON_V8 API
+engine-1  | 1:M 03 Nov 2026 04:06:05.577 * <ReJSON> Enabled diskless replication
+engine-1  | 1:M 03 Nov 2026 04:06:05.577 * <ReJSON> Initialized shared string cache, thread safe: true.
+engine-1  | 1:M 03 Nov 2026 04:06:05.579 * Module 'ReJSON' loaded from /usr/local/lib/redis/modules//rejson.so
+engine-1  | 1:M 03 Nov 2026 04:06:05.579 * <search> Acquired RedisJSON_V8 API
+engine-1  | 1:M 03 Nov 2026 04:06:05.579 * Server initialized
+engine-1  | 1:M 03 Nov 2026 04:06:05.579 * Ready to accept connections tcp
+engine-1  | 1:M 03 Nov 2026 04:06:05.579 # WARNING: Redis does not require authentication and is not protected by network restrictions. Redis will accept connections from any IP address on any network interface.

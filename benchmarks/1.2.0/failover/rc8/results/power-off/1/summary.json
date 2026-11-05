@@ -1,0 +1,63 @@
+{
+ "mode": "standalone",
+ "writers": 16,
+ "duration_s": 330.0,
+ "acked": 3402046,
+ "unacked_errors": 2941,
+ "lost_acked": 1329,
+ "wrong_value": 0,
+ "wait_n": 0,
+ "wait_acked": 0,
+ "wait_acked_lost": 0,
+ "lost_ack_time_first": 32.894,
+ "lost_ack_time_last": 33.015,
+ "lost_sample": [
+  "ack:0:22725",
+  "ack:0:22726",
+  "ack:0:22727",
+  "ack:0:22728",
+  "ack:0:22729",
+  "ack:0:22730",
+  "ack:0:22731",
+  "ack:0:22732",
+  "ack:0:22733",
+  "ack:0:22734",
+  "ack:0:22735",
+  "ack:0:22736",
+  "ack:0:22737",
+  "ack:0:22738",
+  "ack:0:22739",
+  "ack:0:22740",
+  "ack:0:22741",
+  "ack:0:22742",
+  "ack:0:22743",
+  "ack:0:22744"
+ ],
+ "events": [
+  [
+   31.092,
+   "VM powered off (appendfsync everysec;aof-ack-after-write yes)"
+  ],
+  [
+   59.119,
+   "VM back up"
+  ],
+  [
+   60.151,
+   "server restarted"
+  ]
+ ],
+ "recovery": {
+  "event_t": 31.092,
+  "pre_event_ok_per_100ms_median": 1125,
+  "first_error_t": 35.0,
+  "last_error_t": 60.1,
+  "writes_below_80pct_from_t": 33.0,
+  "throughput_back_t": 60.2,
+  "recovery_s": 29.11
+ },
+ "error_kinds": {
+  "TimeoutError:Timeout": 176,
+  "ConnectionError:Error": 2765
+ }
+}

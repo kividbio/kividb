@@ -1,0 +1,13 @@
+solo r4 fixed P1 rps=230742.61
+solo r4 rc4 P1 rps=235275.66
+solo r5 rc4 P1 rps=232982.56
+solo r5 fixed P1 rps=230742.61
+solo r6 fixed P1 rps=230751.47
+solo r6 rc4 P1 rps=226389.47
+solo r7 rc4 P1 rps=228545.31
+solo r7 fixed P1 rps=232991.61
+solo r8 fixed P1 rps=230742.61
+solo r8 rc4 P1 rps=230751.47
+solo r9 rc4 P1 rps=230742.61
+solo r9 fixed P1 rps=230742.61
+TPUT-DONE

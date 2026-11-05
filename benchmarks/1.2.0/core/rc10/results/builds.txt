@@ -1,0 +1,12 @@
+rustc: rustc 1.99.1 (58cf8f9c3 2026-10-13)
+cargo: cargo 1.99.1 (5f94df478 2026-08-27)
+== rc10
+ref=39bfacd231bb294d390448eacfe0e243d365ebe8 commit=39bfacd231bb294d390448eacfe0e243d365ebe8 from=source cargo build --release RUSTFLAGS=-C target-feature=+lse rustc=rustc 1.99.1 (58cf8f9c3 2026-10-13)
+kividb 1.2.0-rc10
+== rc8
+ref=082dab3d8929c180bccf993835e28992ea054fb5 commit=082dab3d8929c180bccf993835e28992ea054fb5 from=source cargo build --release RUSTFLAGS=-C target-feature=+lse rustc=rustc 1.99.1 (58cf8f9c3 2026-10-13)
+kividb 1.2.0-rc8
+== sha256
+4511b0c2ec1519de39a4857d89d1a19467cec74463b23ee6c973db5cdb510635  kividb-rc10
+ef2208fd547bb06348560dc1f0bce48302debc098e16de58ff37431bbbcf1260  kividb-rc8
+BUILDS-DONE

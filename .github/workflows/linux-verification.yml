@@ -179,10 +179,14 @@ jobs:
       - name: Replication determinism (replica must converge)
         run: |
           set -euo pipefail
-          ./target/release/kividb --port 6381 --bind 127.0.0.1 \
-            --loglevel notice --io-model ${{ matrix.io_model }} \
-            --replicaof 127.0.0.1 6380 \
-            > /tmp/kividb-replica-${{ matrix.io_model }}.log 2>&1 &
+          # A directory of its own: the master holds this one's kividb.lock,
+          # and a second server in it waits for the first to exit.
+          repldir=$(mktemp -d)
+          ( cd "$repldir" && "${{ github.workspace }}/target/release/kividb" \
+              --port 6381 --bind 127.0.0.1 \
+              --loglevel notice --io-model ${{ matrix.io_model }} \
+              --replicaof 127.0.0.1 6380 \
+              > /tmp/kividb-replica-${{ matrix.io_model }}.log 2>&1 & )
           for _ in $(seq 1 60); do
             redis-cli -p 6381 ping >/dev/null 2>&1 && break
             sleep 1

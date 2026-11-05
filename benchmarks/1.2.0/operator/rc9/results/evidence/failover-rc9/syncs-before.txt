@@ -1,0 +1,7 @@
+== failover-rc9 before 07:28:49
+shd-0-0 uptime_in_seconds:161 sync_full:0 sync_partial_ok:2 sync_partial_err:0 role:master master_repl_offset:4540749 
+shd-0-1 uptime_in_seconds:102 sync_full:0 sync_partial_ok:0 sync_partial_err:0 role:slave 
+shd-1-0 uptime_in_seconds:143 sync_full:0 sync_partial_ok:2 sync_partial_err:0 role:master master_repl_offset:4540620 
+shd-1-1 uptime_in_seconds:80 sync_full:0 sync_partial_ok:0 sync_partial_err:0 role:slave 
+shd-2-0 uptime_in_seconds:122 sync_full:0 sync_partial_ok:2 sync_partial_err:0 role:master master_repl_offset:4540173 
+shd-2-1 uptime_in_seconds:49 sync_full:0 sync_partial_ok:0 sync_partial_err:0 role:slave 

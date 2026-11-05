@@ -1,0 +1,15 @@
+== h-and-m-2048-angular-filters redis start 03:32:31
+redis: io-threads 1  search-workers 16 
+exit=0 h-and-m-2048-angular-filters redis 03:33:20
+redis peak_rss_kb=2393620
+== h-and-m-2048-angular-filters dragonfly start 03:33:27
+exit=0 h-and-m-2048-angular-filters dragonfly 03:34:32
+dragonfly peak_rss_kb=1572324
+== dbpedia-openai-100K-1536-angular redis start 03:34:39
+redis: io-threads 1  search-workers 16 
+exit=0 dbpedia-openai-100K-1536-angular redis 03:35:02
+redis peak_rss_kb=1475640
+== dbpedia-openai-100K-1536-angular dragonfly start 03:35:09
+exit=0 dbpedia-openai-100K-1536-angular dragonfly 03:35:31
+dragonfly peak_rss_kb=877496
+SUITE DONE comp 03:35:38

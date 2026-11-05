@@ -1,0 +1,58 @@
+   Compiling kividb v1.2.0-rc4 (/home/azureuser/patched)
+    Finished `release` profile [optimized] target(s) in 4m 30s
+     Running tests/cluster.rs (/home/azureuser/tgt-patched/release/deps/cluster-ee64eb3c9f21acf3)
+
+running 50 tests
+test a_24_node_cluster_fails_over_and_the_old_master_rejoins ... ignored, starts 24 nodes
+test a_failed_meet_does_not_leave_a_handshake_entry ... ok
+test a_cancelled_slot_migration_leaves_the_source_intact ... ok
+test a_cluster_forms_when_only_one_node_is_introduced_to_the_rest ... ok
+test a_master_added_later_is_given_the_index ... ok
+test a_cluster_killed_whole_without_persistence_serves_again_without_failovers ... ok
+test a_master_restarted_with_its_aof_carries_on_as_before ... ok
+test a_master_back_empty_without_its_replica_serves_once_the_replica_is_down ... ok
+test a_cluster_restarted_whole_does_not_fail_anyone_over ... ok
+test a_manual_failover_that_runs_out_of_time_loses_no_acknowledged_write ... ok
+test a_master_stopped_cleanly_without_an_aof_carries_on_as_before ... ok
+test a_takeover_that_comes_after_the_write_pause_timeout_loses_no_acknowledged_write ... ok
+test a_takeover_whose_answer_is_lost_loses_no_acknowledged_write ... ok
+test a_transaction_is_routed_when_it_is_queued ... ok
+test a_timed_out_search_is_reported_across_the_cluster ... ok
+test a_master_told_it_has_been_failed_holds_writes_until_it_knows_its_slots ... ok
+test a_write_right_after_migrate_deletes_a_key_reaches_replicas_in_order ... ok
+test an_unreadable_cluster_config_file_is_fatal ... ok
+test a_write_while_migrate_is_on_the_wire_is_not_lost ... ok
+test bus_protected_mode_refuses_to_start_an_unauthenticated_bus ... ok
+test cluster_forms_and_routes_by_slot ... ok
+test atomic_slot_migration_moves_a_range_under_load ... ok
+test cluster_reset_hard_assigns_a_new_identity ... ok
+test after_a_failover_the_other_replica_is_continued_not_resynced ... ok
+test command_describes_where_each_commands_keys_are ... ok
+test cluster_replica_survives_a_restart ... ok
+test dropindex_dd_deletes_the_documents_on_every_master ... ok
+test a_master_whose_manual_failover_was_given_up_holds_writes_until_it_knows_its_slots ... ok
+test config_get_while_the_node_table_is_written_does_not_hang_the_node ... ok
+test a_master_back_empty_inside_the_node_timeout_loses_no_acknowledged_write ... ok
+test index_definitions_reach_every_master ... ok
+test forgetting_a_node_is_not_undone_by_gossip ... ok
+test failover_promotes_the_replica_and_the_old_master_rejoins_as_a_replica ... ok
+test migrate_moves_a_slot_with_every_type_and_ttl ... ok
+test keys_of_a_slot_lost_to_another_master_are_dropped ... ok
+test keys_of_an_import_cut_short_by_a_restart_are_dropped ... ok
+test manual_failover_swaps_roles_without_losing_acknowledged_writes ... ok
+test nodes_announce_a_client_port_of_their_own ... ok
+test nodes_announce_hostnames_and_clients_can_be_sent_by_them ... ok
+test nodes_talk_to_each_other_as_masteruser_with_default_limited ... ok
+test publish_reaches_subscribers_on_other_nodes ... ok
+test routing_uses_the_real_key_positions ... ok
+test searches_are_answered_from_every_master ... ok
+test replica_follows_its_master_and_serves_reads_after_readonly ... ok
+test slot_migration_refuses_what_it_cannot_do ... ok
+test ssubscribe_is_routed_by_slot ... ok
+test heartbeats_reuse_one_connection_per_peer ... ok
+test slots_taken_from_every_master_are_agreed_on_by_all ... ok
+test only_nodes_with_the_bus_secret_join ... ok
+test the_replica_that_read_further_wins_the_election ... ok
+
+test result: ok. 49 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 46.71s
+

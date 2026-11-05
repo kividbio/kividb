@@ -1,0 +1,4 @@
+shard 0: shd-0-0 slave off=1286619 n=306783; shd-0-1 master off=1286859 n=306787;
+shard 1: shd-1-0  off= n=; shd-1-1 master off=12104952 n=304432;
+shard 2: shd-2-0 slave off=12083303 n=181946; shd-2-1 master off=12083463 n=181950;
+shard 3:

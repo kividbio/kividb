@@ -1,0 +1,16 @@
+Unable to find image 'amazonlinux:2023' locally
+2023: Pulling from library/amazonlinux
+c1eee8f81fa5: Pulling fs layer
+c1eee8f81fa5: Download complete
+0c83d3d5be8d: Download complete
+e8e0d6b3a446: Download complete
+c1eee8f81fa5: Pull complete
+Digest: sha256:bb1c85fe00170acd8a653de5f68cf77c7ec67234a130b18fad7ca1de1f61e3d3
+Status: Downloaded newer image for amazonlinux:2023
+INFO: useradd before install: absent
+INFO: rpm -qpR: shadow-utils 
+PASS: rpm: declares shadow-utils
+PASS: rpm: dnf install on clean amazonlinux:2023 (kividb-1.2.0~rc10-1.aarch64 shadow-utils-4.9-12.amzn2023.0.4.aarch64 )
+PASS: rpm: the kividb user exists (kividb:x:999:999:KiviDB:/var/lib/kividb:/usr/sbin/nologin)
+PASS: rpm: /usr/bin/kividb --version [kividb 1.2.0-rc10]
+PASS: rpm: the installed server runs as kividb on amazonlinux:2023 and answers PING

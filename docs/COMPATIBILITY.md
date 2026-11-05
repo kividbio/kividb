@@ -33,6 +33,50 @@ other files:
 - BullMQ's and Sidekiq's own test suites, and kill-and-restart soaks
   (`scripts/client_compat/`).
 - LiteLLM's semantic cache: [benchmarks/litellm-compat/REPORT.md](../benchmarks/litellm-compat/REPORT.md).
+- LangChain's Redis integration (`langchain-redis`): vector store, LLM and semantic cache, chat history:
+  [benchmarks/langchain-compat/REPORT.md](../benchmarks/langchain-compat/REPORT.md) and
+  [docs/integrations/langchain.md](integrations/langchain.md).
+- LangGraph's Redis checkpointer and store (`langgraph-checkpoint-redis`):
+  [benchmarks/langgraph-compat/REPORT.md](../benchmarks/langgraph-compat/REPORT.md) and
+  [docs/integrations/langgraph.md](integrations/langgraph.md).
+- LlamaIndex's Redis vector store, document store, index store and key-value store:
+  [benchmarks/llamaindex-compat/REPORT.md](../benchmarks/llamaindex-compat/REPORT.md) and
+  [docs/integrations/llamaindex.md](integrations/llamaindex.md).
+- Mem0's Redis vector store and the `Memory` API on top of it, in the Python SDK and the TypeScript SDK
+  (whose Valkey store works too):
+  [benchmarks/mem0-compat/REPORT.md](../benchmarks/mem0-compat/REPORT.md),
+  [benchmarks/mem0-ts-compat/](../benchmarks/mem0-ts-compat/) and
+  [docs/integrations/mem0.md](integrations/mem0.md).
+- claude-mem's server job queue (BullMQ; the `lua` build): its own Docker E2E, and enqueue, retry,
+  failure, cancel and restarts with real workers: [benchmarks/claude-mem-compat/](../benchmarks/claude-mem-compat/)
+  and [docs/integrations/claude-mem.md](integrations/claude-mem.md).
+- OpenViking's Redis parts (the `lua` build): its RAGFS cache runtime and PathLock tests, its gateway suite
+  (standalone and cluster), and its expiry scheduler:
+  [benchmarks/openviking-compat/](../benchmarks/openviking-compat/) and
+  [docs/integrations/openviking.md](integrations/openviking.md).
+- LightRAG's Redis KV and doc-status storages, with LightRAG's own contract suite:
+  [benchmarks/lightrag-compat/](../benchmarks/lightrag-compat/) and
+  [docs/integrations/lightrag.md](integrations/lightrag.md).
+- cognee's Redis cache (sessions, usage logs, the shared graph lock, which needs the `lua` build):
+  [benchmarks/cognee-compat/](../benchmarks/cognee-compat/) and
+  [docs/integrations/cognee.md](integrations/cognee.md).
+- OmniRoute's rate limiter (a Lua script, so the `lua` build), auth cache, quota store, circuit
+  breaker and semantic cache: [benchmarks/omniroute-compat/](../benchmarks/omniroute-compat/) and
+  [docs/integrations/omniroute.md](integrations/omniroute.md).
+- Dify's self-hosted stack (cache, Celery broker and result backend, pub/sub, locks; the `lua` build),
+  end to end and with Dify's own Redis tests: [benchmarks/dify-compat/](../benchmarks/dify-compat/) and
+  [docs/integrations/dify.md](integrations/dify.md).
+- RAGFlow's self-hosted stack, end to end (the `lua` build): RAGFlow 1.0 in place of its Kvrocks
+  service (secret key, agent-run lease, locks, media cache), with RAGFlow's own Go HTTP API suite, and
+  RAGFlow 0.27 in place of its Valkey service (the stream task queue, cache and locks):
+  [benchmarks/ragflow-compat/](../benchmarks/ragflow-compat/) and
+  [docs/integrations/ragflow.md](integrations/ragflow.md).
+- n8n's queue mode (Bull; the `lua` build) end to end, with worker and server restarts, and n8n's own
+  Redis tests: [benchmarks/n8n-compat/](../benchmarks/n8n-compat/) and
+  [docs/integrations/n8n.md](integrations/n8n.md).
+- Self-hosted Firecrawl (BullMQ, crawl state, rate limits; the `lua` build) with its own test suite and
+  its docker compose: [benchmarks/firecrawl-compat/](../benchmarks/firecrawl-compat/) and
+  [docs/integrations/firecrawl.md](integrations/firecrawl.md).
 - `redis-py` throughout the end-to-end tests (`tests/e2e/`).
 
 ## Differences you may notice

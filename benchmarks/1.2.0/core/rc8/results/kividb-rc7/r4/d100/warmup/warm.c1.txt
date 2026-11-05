@@ -1,0 +1,32 @@
+Json file ~/results/kividb-rc7/r4/d100/warmup/warm.c1.json created...
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 20%,   1 secs] 15 threads 10 conns:     5326960 ops, 5320346 (avg: 5320346) ops/sec, 725.00MB/sec (avg: 725.00MB/sec),  0.44 (avg:  0.44) msec latency[RUN #1 40%,   2 secs] 15 threads 10 conns:    10543523 ops, 5215707 (avg: 5268055) ops/sec, 710.74MB/sec (avg: 717.88MB/sec),  0.45 (avg:  0.45) msec latency[RUN #1 60%,   3 secs] 15 threads 10 conns:    15748334 ops, 5203999 (avg: 5246711) ops/sec, 709.15MB/sec (avg: 714.97MB/sec),  0.45 (avg:  0.45) msec latency[RUN #1 80%,   4 secs] 15 threads 10 conns:    20922428 ops, 5173364 (avg: 5228379) ops/sec, 704.97MB/sec (avg: 712.47MB/sec),  0.45 (avg:  0.45) msec latency[RUN #1 100%,   5 secs]  7 threads 10 conns:    26043487 ops, 5173364 (avg: 5207752) ops/sec, 704.97MB/sec (avg: 709.66MB/sec),  0.45 (avg:  0.45) msec latency[RUN #1 100%,   5 secs]  0 threads 10 conns:    26043760 ops, 5173364 (avg: 5207739) ops/sec, 704.97MB/sec (avg: 709.66MB/sec),  0.45 (avg:  0.45) msec latency
+
+Writing Full Run command HDR latency histogram results to ~/results/kividb-rc7/r4/d100/warmup/warm.c1_FULL_RUN_1.txt...
+Writing Full Run command HDR latency histogram results in HistogramLogProcessor format to ~/results/kividb-rc7/r4/d100/warmup/warm.c1_FULL_RUN_1.hgrm...
+Writing GET command HDR latency histogram results to ~/results/kividb-rc7/r4/d100/warmup/warm.c1_GET_command_run_1.txt...
+Writing GET command HDR latency histogram results in HistogramLogProcessor format to ~/results/kividb-rc7/r4/d100/warmup/warm.c1_GET_command_run_1.hgrm...
+
+CPU Utilization Summary
+  Total CPU time:   68.299s  (user 29.561s, sys 38.738s)
+  Wall time:        5.003s
+  Cores used:       13.653   (avg 91.0% across 15 worker threads)
+  Peak utilization: 1383.1%
+Saving JSON output file: ~/results/kividb-rc7/r4/d100/warmup/warm.c1.json
+Json file closed.
+15        Threads
+10        Connections per thread
+5         Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets            0.00          ---          ---             ---             ---             ---             ---         0.00 
+Gets      5207891.66   5207891.66         0.00         0.45155         0.43900         0.81500         1.39100    726708.43 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    5207891.66   5207891.66         0.00         0.45155         0.43900         0.81500         1.39100    726708.43 
+rc=0

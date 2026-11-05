@@ -394,6 +394,13 @@ fn close(
     }
 }
 
+/// Whether anything is taking the gate alone, or holds it alone: for a
+/// holder of the gate that can let go of it between steps of its work.
+#[inline]
+pub fn taker_waiting() -> bool {
+    TAKERS.load(Ordering::Relaxed) > 0
+}
+
 /// Whether the calling thread holds the gate alone — whether what it is
 /// running is part of a transaction or a script.
 #[inline]
@@ -409,11 +416,23 @@ pub fn alone_on_this_thread() -> bool {
 ///   their timeout. Holding the gate while they do would hold up every
 ///   transaction on the server for that long, and they touch no data while
 ///   they wait.
+/// * The ones that give this node slots, which first delete the keys it
+///   still had of them if a deletion of those is under way: a pass over the
+///   keyspace, in batches of their own (`migration::delete_before_coming`).
+///   A transaction or script queued behind them would hold every other
+///   command back for that long. `SETSLOT ... NODE` to another node takes
+///   the gate in its handler, which knows which node it names.
 #[inline(always)]
 pub fn skips(name: &str, cmd: &[&[u8]]) -> bool {
     let sub = |word: &[u8]| cmd.get(1).is_some_and(|s| s.eq_ignore_ascii_case(word));
+    let arg = |at: usize, word: &[u8]| cmd.get(at).is_some_and(|s| s.eq_ignore_ascii_case(word));
     match name {
         "WAIT" | "WAITAOF" | "MIGRATE" | "SHUTDOWN" | "DEBUG" => true,
+        "CLUSTER" => {
+            sub(b"ADDSLOTS")
+                || sub(b"ADDSLOTSRANGE")
+                || (sub(b"SETSLOT") && (arg(3, b"IMPORTING") || arg(3, b"NODE")))
+        }
         "SCRIPT" => sub(b"KILL"),
         "FUNCTION" => sub(b"KILL") || sub(b"STATS"),
         _ => false,

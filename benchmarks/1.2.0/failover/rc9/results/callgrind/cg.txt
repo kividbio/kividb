@@ -1,0 +1,25 @@
+GET-100 rc8 run1 3328
+SET-100 rc8 run1 4259
+MIX-100 rc8 run1 7614
+INCR rc8 run1 4066
+DEL rc8 run1 4464
+done
+GET-100 rc9 run1 3346
+SET-100 rc9 run1 4311
+MIX-100 rc9 run1 7683
+INCR rc9 run1 4068
+DEL rc9 run1 4489
+done
+GET-100 rc8 run2 3328
+SET-100 rc8 run2 4259
+MIX-100 rc8 run2 7613
+INCR rc8 run2 4067
+DEL rc8 run2 4464
+done
+GET-100 rc9 run2 3347
+SET-100 rc9 run2 4311
+MIX-100 rc9 run2 7684
+INCR rc9 run2 4068
+DEL rc9 run2 4490
+done
+CG-DONE

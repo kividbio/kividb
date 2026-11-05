@@ -1,0 +1,3 @@
+rc7 before kill: h ttl=1978 hlen=2 | s ttl=1981 | l ttl=1986
+/home/azureuser/h/expire_replay.sh: line 15:  5483 Killed                  nohup $CMD >> $D/server.log 2>&1 < /dev/null
+rc7 after restart: h type=none ttl=-2 hlen=0 fields=, | s type=none ttl=-2 val= | l type=none ttl=-2 len=0 | dbsize=0

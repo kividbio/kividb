@@ -1,0 +1,27 @@
+# Two small replicated clusters (1 master + 1 replica, AOF on: the operator default) for the #42 AOF-master guard, on rc9.
+apiVersion: v1
+kind: Secret
+metadata: {name: rep-pw, namespace: e2e}
+stringData: {password: "pw-one-1111"}
+---
+apiVersion: kividb.io/v1alpha1
+kind: KividbAclConfig
+metadata: {name: rep-acl, namespace: e2e}
+spec:
+  requirePassSecretRef: {name: rep-pw, key: password}
+---
+apiVersion: kividb.io/v1alpha1
+kind: KividbConfig
+metadata: {name: ack-no, namespace: e2e}
+spec:
+  directives: {aof-ack-after-write: "no"}
+---
+apiVersion: kividb.io/v1alpha1
+kind: KividbCluster
+metadata: {name: g-yes, namespace: e2e}
+spec: {replicas: 1, image: "ACR.azurecr.io/kividb:1.2.0-rc9", storage: {size: 2Gi}, aclConfigRef: {name: rep-acl}}
+---
+apiVersion: kividb.io/v1alpha1
+kind: KividbCluster
+metadata: {name: g-no, namespace: e2e}
+spec: {replicas: 1, image: "ACR.azurecr.io/kividb:1.2.0-rc9", storage: {size: 2Gi}, aclConfigRef: {name: rep-acl}, configRef: {name: ack-no}}

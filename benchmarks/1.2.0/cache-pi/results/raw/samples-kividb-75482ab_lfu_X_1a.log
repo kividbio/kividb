@@ -1,0 +1,180 @@
+=== 1793637438 16:37:18
+VmHWM:	    9304 kB
+VmRSS:	    9304 kB
+Threads:	14
+used_memory:1311903
+used_memory_rss:10792960
+maxmemory:1073741824
+mem_fragmentation_ratio:8.2269
+total_commands_processed:3
+instantaneous_ops_per_sec:0
+keyspace_hits:0
+keyspace_misses:0
+evicted_keys:0
+0
+stat: 0 0
+=== 1793637468 16:37:48
+VmHWM:	  345092 kB
+VmRSS:	  345092 kB
+Threads:	14
+used_memory:344761786
+used_memory_rss:353435648
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0252
+total_commands_processed:1798418
+instantaneous_ops_per_sec:72447
+keyspace_hits:602106
+keyspace_misses:598131
+evicted_keys:0
+598234
+stat: 603 1868
+=== 1793637498 16:38:18
+VmHWM:	  704308 kB
+VmRSS:	  704308 kB
+Threads:	14
+used_memory:710411370
+used_memory_rss:721276928
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0153
+total_commands_processed:3939425
+instantaneous_ops_per_sec:71906
+keyspace_hits:1452517
+keyspace_misses:1243427
+evicted_keys:0
+1243499
+stat: 1324 4098
+=== 1793637528 16:38:48
+VmHWM:	 1058364 kB
+VmRSS:	 1058364 kB
+Threads:	14
+used_memory:1070837786
+used_memory_rss:1083813888
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0121
+total_commands_processed:6085978
+instantaneous_ops_per_sec:72681
+keyspace_hits:2360422
+keyspace_misses:1862749
+evicted_keys:0
+1862828
+stat: 2070 6312
+=== 1793637558 16:39:18
+VmHWM:	 1066924 kB
+VmRSS:	 1066924 kB
+Threads:	14
+used_memory:1073741018
+used_memory_rss:1092534272
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0175
+total_commands_processed:8130163
+instantaneous_ops_per_sec:68622
+keyspace_hits:3248847
+keyspace_misses:2440626
+evicted_keys:572616
+1867986
+stat: 2980 8369
+=== 1793637588 16:39:48
+VmHWM:	 1068128 kB
+VmRSS:	 1068128 kB
+Threads:	14
+used_memory:1073741354
+used_memory_rss:1093763072
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0186
+total_commands_processed:10182266
+instantaneous_ops_per_sec:69430
+keyspace_hits:4142279
+keyspace_misses:3019960
+evicted_keys:1152529
+1867429
+stat: 3904 10413
+=== 1793637618 16:40:18
+VmHWM:	 1068900 kB
+VmRSS:	 1068900 kB
+Threads:	14
+used_memory:1073741578
+used_memory_rss:1094553600
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0194
+total_commands_processed:12163009
+instantaneous_ops_per_sec:68211
+keyspace_hits:5006722
+keyspace_misses:3578108
+evicted_keys:1709236
+1868859
+stat: 4782 12408
+=== 1793637648 16:40:48
+VmHWM:	 1069544 kB
+VmRSS:	 1069544 kB
+Threads:	14
+used_memory:1073741722
+used_memory_rss:1095217152
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0200
+total_commands_processed:14211644
+instantaneous_ops_per_sec:67951
+keyspace_hits:5903388
+keyspace_misses:4154092
+evicted_keys:2284967
+1869099
+stat: 5692 14468
+=== 1793637678 16:41:18
+VmHWM:	 1069868 kB
+VmRSS:	 1069868 kB
+Threads:	14
+used_memory:1073741738
+used_memory_rss:1095544832
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0203
+total_commands_processed:16260051
+instantaneous_ops_per_sec:67976
+keyspace_hits:6801480
+keyspace_misses:4729249
+evicted_keys:2861332
+1867893
+stat: 6605 16524
+=== 1793637708 16:41:48
+VmHWM:	 1070512 kB
+VmRSS:	 1070512 kB
+Threads:	14
+used_memory:1073741498
+used_memory_rss:1096204288
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0209
+total_commands_processed:18312721
+instantaneous_ops_per_sec:68908
+keyspace_hits:7700429
+keyspace_misses:5306107
+evicted_keys:3438696
+1867387
+stat: 7494 18605
+=== 1793637738 16:42:18
+VmHWM:	 1070960 kB
+VmRSS:	 1070960 kB
+Threads:	14
+used_memory:1073741386
+used_memory_rss:1096663040
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0213
+total_commands_processed:20335552
+instantaneous_ops_per_sec:68675
+keyspace_hits:8586579
+keyspace_misses:5874445
+evicted_keys:4007652
+1866778
+stat: 8392 20676
+=== 1793637768 16:42:48
+VmHWM:	 1071024 kB
+VmRSS:	 1071024 kB
+Threads:	14
+used_memory:1073741274
+used_memory_rss:1096728576
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0214
+total_commands_processed:22400397
+instantaneous_ops_per_sec:68750
+keyspace_hits:9491337
+keyspace_misses:6454489
+evicted_keys:4587464
+1867007
+stat: 9294 22745

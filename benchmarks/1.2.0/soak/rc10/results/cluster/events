@@ -1,0 +1,80 @@
+1793706449.114254123 failover-start slot=3000 master=10.81.1.11:7001 replica=10.81.1.12:7002
+1793706449.835439636 failover-reply OK
+1793706450.149082921 failover-promoted 10.81.1.12:7002 after 0.02 s
+1793706450.446561211 failover-old-master-replica 10.81.1.11:7001 after 0.02 s
+1793706450.853750301 failover-end cluster-ok after 0.14 s
+1793706456.175982600 failover-resync 10.81.1.11:7001 partial=1 full=0 lines: 2026-11-03T11:47:29.894Z 17723 [INFO] Replication: Partial resync: continuing from offset 5185980766 — no dataset transfer|
+1793706809.089061716 sigterm-start round 1 slot=8000 replica=10.81.1.13:7002 master=10.81.1.12:7001: master_link_status:up master_sync_in_progress:0 slave_repl_offset:8204384655 
+1793706811.535616381 sigterm-exit round 1 10.81.1.13:7002 result=exited after 1.10 s final-save=yes (writing-final-snapshot=1 goodbye=1 error-lines=0 skip-lines=0)
+1793706814.732306347 sigterm-restarted 10.81.1.13:7002
+1793706815.005388179 sigterm-rejoined 10.81.1.13:7002 as replica after 0.01 s
+1793706815.418168854 sigterm-end cluster-ok after 0.15 s
+1793706820.749812178 sigterm-resync 10.81.1.13:7002 partial=1 full=0 lines: 2026-11-03T11:53:34.794Z 38628 [INFO] Replication: Partial resync: continuing from offset 8213501804 — no dataset transfer|
+1793707168.631693670 kill9-start slot=8000 master=10.81.1.12:7001 replica=10.81.1.13:7002
+1793707169.410316741 kill9-killed 10.81.1.12:7001
+1793707174.781844704 kill9-promoted 10.81.1.13:7002 after 5.20 s
+1793707197.820982183 kill9-restarted 10.81.1.12:7001
+1793707204.779623353 kill9-rejoined 10.81.1.12:7001 as replica after 6.72 s
+1793707205.362769703 kill9-end cluster-ok after 0.18 s
+1793707210.735542517 kill9-resync 10.81.1.12:7001 partial=0 full=1 lines: 2026-11-03T11:59:59.183Z 45248 [INFO] Replication: Full resync from 33e7d9a20357edb0d0526767628c27f23e972e51 offset=11251606235|2026-11-03T12:00:03.836Z 45248 [INFO] Replication: Full sync loaded: 1161122 keys (70431 with a TTL), replacing 1149159 local keys|
+1793707664.608655852 reshard-start round 1 src-shard=3000 dst-shard=8000: 128 slots (0-127) from 10.81.1.12:7002 (c31f74c6dbf6db03ea64518a7e6e45ef2dcbfe33, 1422052 keys) to 10.81.1.13:7002 (059a799d344c0df3629a80c4c2d0e02c0615c014) with plain redis-cli
+1793708413.293627507 reshard-end round 1 exit=0 after 748.66 s: slots begun=128, TRYAGAIN=0, ERR=0: 
+1793708415.084085850 reshard-check round 1: open-on-source=[] open-slots-lines=0 covered=1 err-lines=0 moved-slots=128
+1793708425.620920572 reshard-done round 1 cluster-ok after 0.16 s
+1793708426.046791643 sigterm-start round 2 slot=13000 replica=10.81.1.11:7002 master=10.81.1.13:7001: master_link_status:up master_sync_in_progress:0 slave_repl_offset:16506103989 
+1793708428.791649578 sigterm-exit round 2 10.81.1.11:7002 result=exited after 1.25 s final-save=yes (writing-final-snapshot=1 goodbye=1 error-lines=0 skip-lines=0)
+1793708432.286437090 sigterm-restarted 10.81.1.11:7002
+1793708438.523247336 sigterm-rejoined 10.81.1.11:7002 as replica after 5.91 s
+1793708439.128540047 sigterm-end cluster-ok after 0.21 s
+1793708444.516517086 sigterm-resync 10.81.1.11:7002 partial=0 full=1 lines: 2026-11-03T12:20:32.734Z 68352 [INFO] Replication: Full resync from ca0b8ef0e48aa39c392646089f1829e5448e9c58 offset=16622223591|2026-11-03T12:20:37.066Z 68352 [INFO] Replication: Full sync loaded: 1491831 keys (55697 with a TTL), replacing 1483926 local keys|
+1793708849.159252299 import-start round 1 CLUSTER MIGRATION IMPORT 10923 11422 on 10.81.1.12:7002 (c31f74c6dbf6db03ea64518a7e6e45ef2dcbfe33, 1702844 keys), source 10.81.1.13:7001 (2f30ca5dc1a5d8e2efd90afa668cbc23b0617867, 1743450 keys)
+1793708849.197584771 import-id 493a4ebe43dbff05712272437d5da9dc428dc07c
+1793708854.011456946 import-done round 1 in 4.80 s: id 493a4ebe43dbff05712272437d5da9dc428dc07c slots 10923-11422 source 2f30ca5dc1a5d8e2efd90afa668cbc23b0617867 dest c31f74c6dbf6db03ea64518a7e6e45ef2dcbfe33 operation import state completed last_error  retries 0 create_time 1793708849189 start_time 1793708849189 end_time 1793708853649 write_pause_ms 0 capture_pause_ms 0
+1793708854.052512388 import-keys source 1653605 dest 1864698
+1793708854.566949114 import-end cluster-ok after 0.19 s
+1793709209.053834243 sigterm-start round 3 slot=3000 replica=10.81.1.11:7001 master=10.81.1.12:7002: master_link_status:up master_sync_in_progress:0 slave_repl_offset:28644566714 
+1793709211.780651394 sigterm-exit round 3 10.81.1.11:7001 result=exited after 1.53 s final-save=yes (writing-final-snapshot=1 goodbye=1 error-lines=0 skip-lines=0)
+1793709216.995207488 sigterm-restarted 10.81.1.11:7001
+1793709217.260365957 sigterm-rejoined 10.81.1.11:7001 as replica after 0.01 s
+1793709218.298410367 sigterm-end cluster-ok after 0.78 s
+1793709223.610823219 sigterm-resync 10.81.1.11:7001 partial=1 full=0 lines: 2026-11-03T12:33:37.018Z 84756 [INFO] Replication: Partial resync: continuing from offset 28652688807 — no dataset transfer|
+1793709568.456219972 kill9-start slot=3000 master=10.81.1.12:7002 replica=10.81.1.11:7001
+1793709569.169944912 kill9-killed 10.81.1.12:7002
+1793709574.892721067 kill9-promoted 10.81.1.11:7001 after 5.55 s
+1793709600.151642057 kill9-restarted 10.81.1.12:7002
+1793709608.106476514 kill9-rejoined 10.81.1.12:7002 as replica after 7.72 s
+1793709608.648009727 kill9-end cluster-ok after 0.19 s
+1793709614.061991744 kill9-resync 10.81.1.12:7002 partial=0 full=1 lines: 2026-11-03T12:40:01.567Z 91762 [INFO] Replication: Full resync from 37daebace8ea15580851b7c3bfb15846ed40c10b offset=31951652785|2026-11-03T12:40:06.889Z 91762 [INFO] Replication: Full sync loaded: 2259399 keys (76406 with a TTL), replacing 2242583 local keys|
+1793709944.305685406 reshard-start round 2 src-shard=13000 dst-shard=8000: 128 slots (11423-11550) from 10.81.1.13:7001 (2f30ca5dc1a5d8e2efd90afa668cbc23b0617867, 2097713 keys) to 10.81.1.13:7002 (059a799d344c0df3629a80c4c2d0e02c0615c014) with plain redis-cli
+1793711261.486683752 reshard-end round 2 exit=0 after 1317.15 s: slots begun=128, TRYAGAIN=0, ERR=0: 
+1793711263.512848481 reshard-check round 2: open-on-source=[] open-slots-lines=0 covered=1 err-lines=0 moved-slots=128
+1793711274.094506334 reshard-done round 2 cluster-ok after 0.19 s
+1793711274.480130874 failover-start slot=13000 master=10.81.1.13:7001 replica=10.81.1.11:7002
+1793711275.418899341 failover-reply OK
+1793711275.776607008 failover-promoted 10.81.1.11:7002 after 0.04 s
+1793711276.276671527 failover-old-master-replica 10.81.1.13:7001 after 0.02 s
+1793711276.981452310 failover-end cluster-ok after 0.27 s
+1793711282.402815576 failover-resync 10.81.1.13:7001 partial=1 full=0 lines: 2026-11-03T13:07:55.452Z 18446 [INFO] Replication: Partial resync: continuing from offset 34671011003 — no dataset transfer|
+1793711283.414156705 import-start round 2 CLUSTER MIGRATION IMPORT 5461 5960 on 10.81.1.11:7002 (67ed7e44d9d3ef14635a698a119f6d8daa97ff03, 2135720 keys), source 10.81.1.13:7002 (059a799d344c0df3629a80c4c2d0e02c0615c014, 2542722 keys)
+1793711283.442579099 import-id 65c980e19acf975995d03d9a9047a6d19fd112a8
+1793711290.361107396 import-done round 2 in 6.90 s: id 65c980e19acf975995d03d9a9047a6d19fd112a8 slots 5461-5960 source 059a799d344c0df3629a80c4c2d0e02c0615c014 dest 67ed7e44d9d3ef14635a698a119f6d8daa97ff03 operation import state completed last_error  retries 0 create_time 1793711283440 start_time 1793711283440 end_time 1793711289986 write_pause_ms 0 capture_pause_ms 0 
+1793711290.390586017 import-keys source 2453398 dest 2365176
+1793711290.847197363 import-end cluster-ok after 0.17 s
+1793711384.617512383 reshard-start round 3 src-shard=8000 dst-shard=3000: 128 slots (0-127) from 10.81.1.13:7002 (059a799d344c0df3629a80c4c2d0e02c0615c014, 2405032 keys) to 10.81.1.11:7001 (f59b08e7ce1c2788279c95116cae0b3c85baa1ca) with plain redis-cli
+1793713013.242671945 reshard-end round 3 exit=0 after 1628.60 s: slots begun=128, TRYAGAIN=0, ERR=0: 
+1793713015.156823647 reshard-check round 3: open-on-source=[] open-slots-lines=0 covered=1 err-lines=0 moved-slots=128
+1793713025.753884576 reshard-done round 3 cluster-ok after 0.20 s
+1793713026.299689646 sigterm-start round 4 slot=8000 replica=10.81.1.12:7001 master=10.81.1.13:7002: master_link_status:up master_sync_in_progress:0 slave_repl_offset:39366566913 
+1793713029.081848707 sigterm-exit round 4 10.81.1.12:7001 result=exited after 1.37 s final-save=yes (writing-final-snapshot=1 goodbye=1 error-lines=0 skip-lines=0)
+1793713034.850925170 sigterm-restarted 10.81.1.12:7001
+1793713041.839522248 sigterm-rejoined 10.81.1.12:7001 as replica after 6.69 s
+1793713042.354628730 sigterm-end cluster-ok after 0.20 s
+1793713047.715996624 sigterm-resync 10.81.1.12:7001 partial=0 full=1 lines: 2026-11-03T13:37:15.426Z 150832 [INFO] Replication: Full resync from 33e7d9a20357edb0d0526767628c27f23e972e51 offset=39515622035|2026-11-03T13:37:20.707Z 150832 [INFO] Replication: Full sync loaded: 2451232 keys (52180 with a TTL), replacing 2440520 local keys|
+1793713048.286718199 kill9-start slot=13000 master=10.81.1.11:7002 replica=10.81.1.13:7001
+1793713049.089706056 kill9-killed 10.81.1.11:7002
+1793713055.153801150 kill9-promoted 10.81.1.13:7001 after 5.90 s
+1793713081.550258683 kill9-restarted 10.81.1.11:7002
+1793713091.194395818 kill9-rejoined 10.81.1.11:7002 as replica after 9.38 s
+1793713091.751362858 kill9-end cluster-ok after 0.23 s
+1793713097.578264116 kill9-resync 10.81.1.11:7002 partial=0 full=1 lines: 2026-11-03T13:38:02.184Z 152245 [INFO] Replication: Full resync from 025c800a136c476fe4a9579c28564895dd2bbf3e offset=38452507765|2026-11-03T13:38:10.086Z 152245 [INFO] Replication: Full sync loaded: 2590398 keys (60246 with a TTL), replacing 2571461 local keys|
+1793713097.910015875 events-done

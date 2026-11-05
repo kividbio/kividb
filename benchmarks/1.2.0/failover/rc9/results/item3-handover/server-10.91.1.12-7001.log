@@ -1,0 +1,74 @@
+2026-11-03T07:56:36.617Z 76673 [WARN] cluster bus port 17001 is not authenticated: any host that can reach it can join this cluster. Set cluster-bus-secret, or restrict the port to cluster members at the network layer.
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc9 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc9
+  * Mode           : cluster
+  * OS             : linux x86_64
+  * Memory         : 31GiB available
+  * CPUs           : 8 cores detected
+  * Listening on   : 0.0.0.0:7001
+  * Cluster bus    : 0.0.0.0:17001
+  * Node timeout   : 5000ms
+  * Node ID        : (printed after cluster init)
+  * Worker threads : 6
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-03T07:56:36.617Z 76673 [INFO] KiviDB 1.2.0-rc9 starting: pid 76673, default build, config file '/data/7001/node.conf'
+2026-11-03T07:56:36.618Z 76673 [INFO] I/O model      : io_uring
+2026-11-03T07:56:36.630Z 76673 [INFO] Cluster: Node ID        : 32c5267b9b43f96bad9d3d3106e2bbd007158350
+2026-11-03T07:56:36.630Z 76673 [INFO] Cluster: Bus port       : 17001
+2026-11-03T07:56:36.630Z 76673 [INFO] Shards per DB  : 64
+2026-11-03T07:56:36.630Z 76673 [INFO] I/O model      : io_uring
+2026-11-03T07:56:36.630Z 76673 [INFO] Cluster: Bus listener bound on 0.0.0.0:17001
+2026-11-03T07:56:36.630Z 76673 [INFO] Cluster: Heartbeat loop started (interval 1s)
+2026-11-03T07:56:36.630Z 76673 [INFO] Cluster: Failure detection started (interval 100ms, node_timeout 5000ms)
+2026-11-03T07:56:36.630Z 76673 [INFO] Ready to accept connections on 0.0.0.0:7001
+2026-11-03T07:56:37.905Z 76673 [INFO] Cluster: Learned own address from an outgoing link: 10.91.1.12
+2026-11-03T07:56:43.979Z 76673 [INFO] Replication: Channel replica registered: 10.91.1.13:60078
+2026-11-03T07:56:43.980Z 76673 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub
+2026-11-03T07:56:46.631Z 76673 [INFO] Replication: Replica 10.91.1.13:60078 is streaming: its queue peaked at 14 bytes during the full sync (repl-replica-sync-max-backlog-bytes 1073741824, repl-replica-max-backlog-bytes 268435456)
+2026-11-03T07:56:56.653Z 76673 [INFO] Cluster: Voted for 4a52399711849e87855b040896742b2156720cd6 to take over from dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 at epoch 4 (manual failover)
+2026-11-03T07:57:02.308Z 76673 [INFO] Cluster: Voted for dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 to take over from 4a52399711849e87855b040896742b2156720cd6 at epoch 5 (manual failover)
+2026-11-03T07:57:07.968Z 76673 [INFO] Cluster: Voted for 4a52399711849e87855b040896742b2156720cd6 to take over from dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 at epoch 6 (manual failover)
+2026-11-03T07:57:13.980Z 76673 [INFO] Cluster: Voted for dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 to take over from 4a52399711849e87855b040896742b2156720cd6 at epoch 7 (manual failover)
+2026-11-03T07:57:19.640Z 76673 [INFO] Cluster: Voted for 4a52399711849e87855b040896742b2156720cd6 to take over from dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 at epoch 8 (manual failover)
+2026-11-03T07:57:25.421Z 76673 [INFO] Cluster: Voted for dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 to take over from 4a52399711849e87855b040896742b2156720cd6 at epoch 9 (manual failover)
+2026-11-03T07:57:31.520Z 76673 [INFO] Cluster: Voted for 4a52399711849e87855b040896742b2156720cd6 to take over from dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 at epoch 10 (manual failover)
+2026-11-03T07:57:37.205Z 76673 [INFO] Cluster: Voted for dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 to take over from 4a52399711849e87855b040896742b2156720cd6 at epoch 11 (manual failover)
+2026-11-03T07:57:42.874Z 76673 [INFO] Cluster: Voted for 4a52399711849e87855b040896742b2156720cd6 to take over from dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 at epoch 12 (manual failover)
+2026-11-03T07:57:48.534Z 76673 [INFO] Cluster: Voted for dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 to take over from 4a52399711849e87855b040896742b2156720cd6 at epoch 13 (manual failover)

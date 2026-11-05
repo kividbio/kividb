@@ -1,0 +1,657 @@
+{
+ "soak_minutes": 120.0,
+ "events": [
+  [
+   "55.00 min",
+   "master-restart-start sigterm 10.70.1.4 keys=2121465 sync_full=1 sync_partial_ok=0"
+  ],
+  [
+   "55.07 min",
+   "master-restart-exited after 4.03 s"
+  ],
+  [
+   "55.07 min",
+   "master-restart-started"
+  ],
+  [
+   "55.16 min",
+   "master-restart-serving after 5.34 s keys=2113425"
+  ],
+  [
+   "55.40 min",
+   "master-restart-replica-linked after 14.00 s sync_full=1 sync_partial_ok=0"
+  ],
+  [
+   "61.51 min",
+   "replica-sync-loop 21 evictions since the restart; CONFIG SET repl-replica-max-backlog-bytes 1073741824 on the master: ERR CONFIG SET failed (possibly related to argument 'repl-replica-max-backlog-bytes') - can't set immutable config"
+  ],
+  [
+   "84.99 min",
+   "replica-kill9-start 10.70.1.8 keys=2525974"
+  ],
+  [
+   "85.00 min",
+   "replica-kill9-killed"
+  ],
+  [
+   "85.34 min",
+   "replica-kill9-started"
+  ],
+  [
+   "85.45 min",
+   "replica-kill9-serving after 6.87 s"
+  ],
+  [
+   "85.68 min",
+   "replica-kill9-linked after 13.35 s sync_full=99 sync_partial_ok=0 keys=2535894"
+  ],
+  [
+   "85.68 min",
+   "events-done"
+  ],
+  [
+   "131.99 min",
+   "restart-check replica REPLICAOF NO ONE: OK"
+  ],
+  [
+   "132.05 min",
+   "restart-check before: master keys=2747621 expires=702934 persistent=2044687 | replica keys=2747449 expires=702934 persistent=2044515"
+  ],
+  [
+   "138.95 min",
+   "restart-check compare before: {\"dbsize_a\": 2747621, \"dbsize_b\": 2747449, \"scanned_a\": 2747621, \"scanned_b\": 2747449, \"compared\": 2747621, \"differ_first_pass\": 172, \"differ_after_recheck\": 172, \"expiring_at_compare\": 0, \"real_differences\": 172, \"sample\": [\"wl:hx:6:5064\", \"wl:hx:1:5067\", \"wl:hx:3:5066\", \"wl:hx:3:5070\", \"wl:hx:4:5078\", \"wl:hx:6:5065\", \"wl:hx:5:5079\", \"wl:hx:4:5061\", \"wl:hx:2:5074\", \"wl:hx:4:5076\", \"wl:hx:6:5073\", \"wl:hx:6:5062\", \"wl:hx:2:5077\", \"wl:hx:4:5072\", \"wl:hx:0:5065\", \"wl:hx:6:5079\", \"wl:hx:6:5068\", \"wl:hx:3:5072\", \"wl:hx:7:5059\", \"wl:hx:5:5064\"], \"seconds\": 413.4}"
+  ],
+  [
+   "138.99 min",
+   "restart-check master: kill -9 44690"
+  ],
+  [
+   "139.15 min",
+   "restart-check master: serving again after 8.39 s; keys=2747449 expires=702934 persistent=2044515"
+  ],
+  [
+   "145.95 min",
+   "restart-check compare restarted master vs untouched replica: {\"dbsize_a\": 2747449, \"dbsize_b\": 2747449, \"scanned_a\": 2747449, \"scanned_b\": 2747449, \"compared\": 2747449, \"differ_first_pass\": 0, \"differ_after_recheck\": 0, \"expiring_at_compare\": 0, \"real_differences\": 0, \"sample\": [], \"seconds\": 406.7}"
+  ],
+  [
+   "146.34 min",
+   "restart-check write log on the restarted master: {\"node\": \"master-after-kill9\", \"acked\": 5623474, \"unknown\": 8, \"bad\": 0, \"checked_keys_ok\": 4921541}"
+  ],
+  [
+   "146.38 min",
+   "restart-check replica: kill -9 63511"
+  ],
+  [
+   "146.55 min",
+   "restart-check replica: serving again after 8.77 s; keys=2747449 expires=702934 persistent=2044515"
+  ],
+  [
+   "153.34 min",
+   "restart-check compare both restarted: {\"dbsize_a\": 2747449, \"dbsize_b\": 2747449, \"scanned_a\": 2747449, \"scanned_b\": 2747449, \"compared\": 2747449, \"differ_first_pass\": 0, \"differ_after_recheck\": 0, \"expiring_at_compare\": 0, \"real_differences\": 0, \"sample\": [], \"seconds\": 406.4}"
+  ],
+  [
+   "153.74 min",
+   "restart-check write log on the restarted replica: {\"node\": \"replica-after-kill9\", \"acked\": 5623474, \"unknown\": 8, \"bad\": 0, \"checked_keys_ok\": 4921541}"
+  ],
+  [
+   "153.74 min",
+   "restart-check after: master keys=2747449 expires=702934 persistent=2044515 | replica keys=2747449 expires=702934 persistent=2044515"
+  ]
+ ],
+ "ops_total": 719999584,
+ "errors_total": 958567,
+ "ops_per_s_median": 100000.0,
+ "ops_per_s_min_interval": 97518.0,
+ "p50_us_median": 207.5,
+ "p50_us_worst": 2969599.0,
+ "p50_us_median_outside_events": 208.0,
+ "p50_us_worst_outside_events": 239.0,
+ "p99_us_median": 104095.0,
+ "p99_us_worst": 7684095.0,
+ "p99_us_median_outside_events": 103295.0,
+ "p99_us_worst_outside_events": 341247.0,
+ "p999_us_median": 137919.0,
+ "p999_us_worst": 7819263.0,
+ "p999_us_median_outside_events": 137343.0,
+ "p999_us_worst_outside_events": 389375.0,
+ "max_us": 8716287.0,
+ "by_half_hour_median_p50_p99_p999_ms": {
+  "0-30": [
+   0.206,
+   68.287,
+   104.159
+  ],
+  "30-60": [
+   0.21,
+   97.023,
+   133.375
+  ],
+  "60-90": [
+   0.207,
+   120.287,
+   147.199
+  ],
+  "90-120": [
+   0.209,
+   142.655,
+   174.399
+  ]
+ },
+ "soakgen_error_windows": [
+  {
+   "event": "master restart (SIGTERM)",
+   "at_min": 55.0,
+   "errors": 958567,
+   "kinds": {
+    "EOF": 119,
+    "read": 16,
+    "dial": 958432
+   },
+   "first_last_s_after": [
+    9.9,
+    19.9
+   ]
+  },
+  {
+   "event": "kill -9 replica",
+   "at_min": 84.99,
+   "errors": 0,
+   "kinds": {},
+   "first_last_s_after": null
+  }
+ ],
+ "soakgen_errors_outside_events": 0,
+ "master": {
+  "used_gb_at_5min": 1.187,
+  "used_gb_at_end": 2.147,
+  "used_gb_max": 4.129,
+  "used_mib_per_h_30_to_end": 704.8,
+  "used_mib_per_h_last_hour": 646.4,
+  "used_mib_per_h_after_restart": 654.9,
+  "rss_gb_at_5min": 1.432,
+  "rss_gb_at_end": 3.526,
+  "rss_gb_max": 4.956,
+  "rss_mib_per_h_30_to_end": 1385.4,
+  "rss_mib_per_h_last_hour": 669.2,
+  "rss_mib_per_h_after_restart": 675.7,
+  "slab_gb_at_5min": 0.445,
+  "slab_gb_at_end": 0.595,
+  "slab_gb_max": 0.596,
+  "slab_mib_per_h_30_to_end": 75.2,
+  "slab_mib_per_h_last_hour": 73.5,
+  "slab_mib_per_h_after_restart": 73.9,
+  "slab_live_gb_at_5min": 0.379,
+  "slab_live_gb_at_end": 0.509,
+  "slab_live_gb_max": 0.511,
+  "slab_live_mib_per_h_30_to_end": 65.1,
+  "slab_live_mib_per_h_last_hour": 64.5,
+  "slab_live_mib_per_h_after_restart": 64.4,
+  "keys_at_5min": 1428679,
+  "keys_at_end": 2999068,
+  "cpu_median_pct": 370.0,
+  "aof_size_mb_max": 314.8,
+  "aof_size_mb_median": 152.5,
+  "aof_lost_records_max": 0,
+  "aof_last_write_status_seen": [
+   "ok"
+  ]
+ },
+ "replica": {
+  "used_gb_at_5min": 1.143,
+  "used_gb_at_end": 2.004,
+  "used_gb_max": 2.961,
+  "used_mib_per_h_30_to_end": 572.7,
+  "used_mib_per_h_last_hour": 399.5,
+  "used_mib_per_h_after_restart": 421.4,
+  "rss_gb_at_5min": 1.429,
+  "rss_gb_at_end": 2.651,
+  "rss_gb_max": 3.606,
+  "rss_mib_per_h_30_to_end": 663.2,
+  "rss_mib_per_h_last_hour": 559.4,
+  "rss_mib_per_h_after_restart": 576.8,
+  "slab_gb_at_5min": 0.424,
+  "slab_gb_at_end": 0.582,
+  "slab_gb_max": 0.588,
+  "slab_mib_per_h_30_to_end": 35.8,
+  "slab_mib_per_h_last_hour": 73.6,
+  "slab_mib_per_h_after_restart": 75.2,
+  "slab_live_gb_at_5min": 0.369,
+  "slab_live_gb_at_end": 0.5,
+  "slab_live_gb_max": 0.501,
+  "slab_live_mib_per_h_30_to_end": 18.0,
+  "slab_live_mib_per_h_last_hour": 57.3,
+  "slab_live_mib_per_h_after_restart": 62.7,
+  "keys_at_5min": 1428670,
+  "keys_at_end": 2995859,
+  "cpu_median_pct": 95.0,
+  "aof_size_mb_max": 311.3,
+  "aof_size_mb_median": 116.5,
+  "aof_lost_records_max": 0,
+  "aof_last_write_status_seen": [
+   "ok"
+  ]
+ },
+ "replica_lag_bytes": {
+  "median": 91742,
+  "max": 284583166,
+  "samples": 563
+ },
+ "replica_link_down_samples": 308,
+ "checkpoints_master": {
+  "count": 588,
+  "median_s": 2.23,
+  "p90_s": 2.53,
+  "max_s": 2.63
+ },
+ "log_warn_error_master": {
+  "count": 200,
+  "lines": [
+   "2026-11-02T21:30:04.592Z 44690 [WARN] Replication: Channel replica 10.70.1.8:51502 exceeded backlog limit (268439673 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:30:21.792Z 44690 [WARN] Replication: Channel replica 10.70.1.8:34720 exceeded backlog limit (268437764 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:30:39.130Z 44690 [WARN] Replication: Channel replica 10.70.1.8:49530 exceeded backlog limit (268439059 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:30:57.214Z 44690 [WARN] Replication: Channel replica 10.70.1.8:51336 exceeded backlog limit (268445171 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:31:13.703Z 44690 [WARN] Replication: Channel replica 10.70.1.8:37068 exceeded backlog limit (268437744 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:31:31.873Z 44690 [WARN] Replication: Channel replica 10.70.1.8:39276 exceeded backlog limit (268438672 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:31:49.344Z 44690 [WARN] Replication: Channel replica 10.70.1.8:35900 exceeded backlog limit (268449908 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:32:06.984Z 44690 [WARN] Replication: Channel replica 10.70.1.8:35412 exceeded backlog limit (268436361 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:32:24.591Z 44690 [WARN] Replication: Channel replica 10.70.1.8:42654 exceeded backlog limit (268435622 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:32:42.053Z 44690 [WARN] Replication: Channel replica 10.70.1.8:53360 exceeded backlog limit (268435482 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:32:59.694Z 44690 [WARN] Replication: Channel replica 10.70.1.8:43750 exceeded backlog limit (268438754 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:33:17.035Z 44690 [WARN] Replication: Channel replica 10.70.1.8:58160 exceeded backlog limit (268463278 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:33:34.548Z 44690 [WARN] Replication: Channel replica 10.70.1.8:35518 exceeded backlog limit (268444518 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:33:52.481Z 44690 [WARN] Replication: Channel replica 10.70.1.8:33676 exceeded backlog limit (268449741 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:34:10.075Z 44690 [WARN] Replication: Channel replica 10.70.1.8:57266 exceeded backlog limit (268443521 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:34:27.708Z 44690 [WARN] Replication: Channel replica 10.70.1.8:45532 exceeded backlog limit (268450545 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:34:45.064Z 44690 [WARN] Replication: Channel replica 10.70.1.8:46804 exceeded backlog limit (268435489 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:35:02.783Z 44690 [WARN] Replication: Channel replica 10.70.1.8:40942 exceeded backlog limit (268449771 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:35:20.638Z 44690 [WARN] Replication: Channel replica 10.70.1.8:43452 exceeded backlog limit (268439400 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:35:37.959Z 44690 [WARN] Replication: Channel replica 10.70.1.8:53040 exceeded backlog limit (268449151 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:35:55.821Z 44690 [WARN] Replication: Channel replica 10.70.1.8:37566 exceeded backlog limit (268456934 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:36:13.591Z 44690 [WARN] Replication: Channel replica 10.70.1.8:45028 exceeded backlog limit (268454345 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:36:31.420Z 44690 [WARN] Replication: Channel replica 10.70.1.8:49614 exceeded backlog limit (268435502 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:36:49.127Z 44690 [WARN] Replication: Channel replica 10.70.1.8:51526 exceeded backlog limit (268435496 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:37:07.512Z 44690 [WARN] Replication: Channel replica 10.70.1.8:54264 exceeded backlog limit (268435513 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:37:25.586Z 44690 [WARN] Replication: Channel replica 10.70.1.8:60858 exceeded backlog limit (268435557 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:37:43.520Z 44690 [WARN] Replication: Channel replica 10.70.1.8:58698 exceeded backlog limit (268435541 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:38:01.247Z 44690 [WARN] Replication: Channel replica 10.70.1.8:37226 exceeded backlog limit (268435470 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:38:18.788Z 44690 [WARN] Replication: Channel replica 10.70.1.8:57684 exceeded backlog limit (268436269 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:38:36.920Z 44690 [WARN] Replication: Channel replica 10.70.1.8:59736 exceeded backlog limit (268435712 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:38:56.043Z 44690 [WARN] Replication: Channel replica 10.70.1.8:59578 exceeded backlog limit (268436630 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:39:13.475Z 44690 [WARN] Replication: Channel replica 10.70.1.8:37244 exceeded backlog limit (268448256 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:39:32.000Z 44690 [WARN] Replication: Channel replica 10.70.1.8:51824 exceeded backlog limit (268439039 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:39:49.849Z 44690 [WARN] Replication: Channel replica 10.70.1.8:39422 exceeded backlog limit (268440042 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:40:07.948Z 44690 [WARN] Replication: Channel replica 10.70.1.8:43072 exceeded backlog limit (268435499 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:40:25.826Z 44690 [WARN] Replication: Channel replica 10.70.1.8:32982 exceeded backlog limit (268435533 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:40:43.714Z 44690 [WARN] Replication: Channel replica 10.70.1.8:50202 exceeded backlog limit (268440855 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:41:01.760Z 44690 [WARN] Replication: Channel replica 10.70.1.8:53770 exceeded backlog limit (268451537 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:41:19.898Z 44690 [WARN] Replication: Channel replica 10.70.1.8:33962 exceeded backlog limit (268447172 > 268435456 bytes) \u00e2\u20ac\u201d evicting",
+   "2026-11-02T21:41:38.016Z 44690 [WARN] Replication: Channel replica 10.70.1.8:51164 exceeded backlog limit (268435669 > 268435456 bytes) \u00e2\u20ac\u201d evicting"
+  ]
+ },
+ "checkpoints_replica": {
+  "count": 469,
+  "median_s": 2.25,
+  "p90_s": 2.55,
+  "max_s": 3.07
+ },
+ "log_warn_error_replica": {
+  "count": 205,
+  "lines": [
+   "2026-11-02T21:29:46.835Z 10832 [WARN] Replication: Replication link to 10.70.1.4:6379 failed: Connection reset by peer (os error 104) \u00e2\u20ac\u201d retrying every 1s",
+   "2026-11-02T21:29:58.769Z 10832 [WARN] Replication: Dropped the 2121634 local keys before loading 2113162 from the master",
+   "2026-11-02T21:30:15.663Z 10832 [WARN] Replication: Dropped the 2116364 local keys before loading 2119191 from the master",
+   "2026-11-02T21:30:33.144Z 10832 [WARN] Replication: Dropped the 2122448 local keys before loading 2124665 from the master",
+   "2026-11-02T21:30:50.266Z 10832 [WARN] Replication: Dropped the 2127152 local keys before loading 2129275 from the master",
+   "2026-11-02T21:31:07.502Z 10832 [WARN] Replication: Dropped the 2132164 local keys before loading 2134129 from the master",
+   "2026-11-02T21:31:25.783Z 10832 [WARN] Replication: Dropped the 2136727 local keys before loading 2138849 from the master",
+   "2026-11-02T21:31:43.269Z 10832 [WARN] Replication: Dropped the 2141585 local keys before loading 2143503 from the master",
+   "2026-11-02T21:32:00.881Z 10832 [WARN] Replication: Dropped the 2145869 local keys before loading 2147693 from the master",
+   "2026-11-02T21:32:18.463Z 10832 [WARN] Replication: Dropped the 2150350 local keys before loading 2152349 from the master",
+   "2026-11-02T21:32:36.265Z 10832 [WARN] Replication: Dropped the 2154714 local keys before loading 2156640 from the master",
+   "2026-11-02T21:32:53.702Z 10832 [WARN] Replication: Dropped the 2158917 local keys before loading 2160761 from the master",
+   "2026-11-02T21:33:11.188Z 10832 [WARN] Replication: Dropped the 2163110 local keys before loading 2164988 from the master",
+   "2026-11-02T21:33:28.828Z 10832 [WARN] Replication: Dropped the 2167293 local keys before loading 2169140 from the master",
+   "2026-11-02T21:33:46.512Z 10832 [WARN] Replication: Dropped the 2171128 local keys before loading 2173316 from the master",
+   "2026-11-02T21:34:04.250Z 10832 [WARN] Replication: Dropped the 2176074 local keys before loading 2177951 from the master",
+   "2026-11-02T21:34:21.612Z 10832 [WARN] Replication: Dropped the 2180200 local keys before loading 2182059 from the master",
+   "2026-11-02T21:34:39.234Z 10832 [WARN] Replication: Dropped the 2184034 local keys before loading 2185728 from the master",
+   "2026-11-02T21:34:56.824Z 10832 [WARN] Replication: Dropped the 2188087 local keys before loading 2189847 from the master",
+   "2026-11-02T21:35:14.584Z 10832 [WARN] Replication: Dropped the 2192122 local keys before loading 2193962 from the master",
+   "2026-11-02T21:35:31.974Z 10832 [WARN] Replication: Dropped the 2196214 local keys before loading 2197958 from the master",
+   "2026-11-02T21:35:49.932Z 10832 [WARN] Replication: Dropped the 2200166 local keys before loading 2202091 from the master",
+   "2026-11-02T21:36:07.650Z 10832 [WARN] Replication: Dropped the 2204198 local keys before loading 2206179 from the master",
+   "2026-11-02T21:36:25.560Z 10832 [WARN] Replication: Dropped the 2208119 local keys before loading 2210059 from the master",
+   "2026-11-02T21:36:43.489Z 10832 [WARN] Replication: Dropped the 2212455 local keys before loading 2214150 from the master",
+   "2026-11-02T21:37:01.326Z 10832 [WARN] Replication: Dropped the 2216680 local keys before loading 2218496 from the master",
+   "2026-11-02T21:37:19.870Z 10832 [WARN] Replication: Dropped the 2220906 local keys before loading 2222996 from the master",
+   "2026-11-02T21:37:37.669Z 10832 [WARN] Replication: Dropped the 2224990 local keys before loading 2227174 from the master",
+   "2026-11-02T21:37:55.476Z 10832 [WARN] Replication: Dropped the 2229098 local keys before loading 2230905 from the master",
+   "2026-11-02T21:38:13.253Z 10832 [WARN] Replication: Dropped the 2233276 local keys before loading 2235080 from the master",
+   "2026-11-02T21:38:31.452Z 10832 [WARN] Replication: Dropped the 2236993 local keys before loading 2239057 from the master",
+   "2026-11-02T21:38:49.671Z 10832 [WARN] Replication: Dropped the 2241296 local keys before loading 2243395 from the master",
+   "2026-11-02T21:39:07.655Z 10832 [WARN] Replication: Dropped the 2245262 local keys before loading 2247174 from the master",
+   "2026-11-02T21:39:26.110Z 10832 [WARN] Replication: Dropped the 2249271 local keys before loading 2251157 from the master",
+   "2026-11-02T21:39:44.140Z 10832 [WARN] Replication: Dropped the 2253160 local keys before loading 2255363 from the master",
+   "2026-11-02T21:40:02.004Z 10832 [WARN] Replication: Dropped the 2257365 local keys before loading 2259445 from the master",
+   "2026-11-02T21:40:20.024Z 10832 [WARN] Replication: Dropped the 2261600 local keys before loading 2263529 from the master",
+   "2026-11-02T21:40:37.931Z 10832 [WARN] Replication: Dropped the 2265634 local keys before loading 2267743 from the master",
+   "2026-11-02T21:40:56.162Z 10832 [WARN] Replication: Dropped the 2270152 local keys before loading 2272153 from the master",
+   "2026-11-02T21:41:14.195Z 10832 [WARN] Replication: Dropped the 2274137 local keys before loading 2275994 from the master"
+  ]
+ },
+ "writelog": {
+  "master-after-kill9": {
+   "acked": 5623474,
+   "unknown": 8,
+   "bad": 0,
+   "per_kind": {
+    "str": {
+     "acked": 702936,
+     "unknown": 0,
+     "ok": 702936,
+     "bad": 0
+    },
+    "str_ttl": {
+     "acked": 702934,
+     "unknown": 2,
+     "ok": 702934,
+     "bad": 0
+    },
+    "str_expired": {
+     "acked": 702934,
+     "unknown": 2,
+     "ok": 702934,
+     "bad": 0
+    },
+    "hash": {
+     "acked": 702936,
+     "unknown": 0,
+     "ok": 702936,
+     "bad": 0
+    },
+    "hash_field_ttl": {
+     "acked": 702936,
+     "unknown": 0,
+     "ok": 702936,
+     "bad": 0
+    },
+    "hash_field_expired": {
+     "acked": 702934,
+     "unknown": 1,
+     "ok": 702934,
+     "bad": 0
+    },
+    "multi_l_s_z_incr": {
+     "acked": 702931,
+     "unknown": 3,
+     "ok": 702931,
+     "bad": 0
+    },
+    "overwrite": {
+     "acked": 702933,
+     "unknown": 0,
+     "ok": 1000,
+     "bad": 0
+    }
+   },
+   "problems_sample": [],
+   "checked_at_s": 8759.3
+  },
+  "master": {
+   "acked": 5623474,
+   "unknown": 8,
+   "bad": 0,
+   "per_kind": {
+    "str": {
+     "acked": 702936,
+     "unknown": 0,
+     "ok": 702936,
+     "bad": 0
+    },
+    "str_ttl": {
+     "acked": 702934,
+     "unknown": 2,
+     "ok": 702934,
+     "bad": 0
+    },
+    "str_expired": {
+     "acked": 702934,
+     "unknown": 2,
+     "ok": 702934,
+     "bad": 0
+    },
+    "hash": {
+     "acked": 702936,
+     "unknown": 0,
+     "ok": 702936,
+     "bad": 0
+    },
+    "hash_field_ttl": {
+     "acked": 702936,
+     "unknown": 0,
+     "ok": 702936,
+     "bad": 0
+    },
+    "hash_field_expired": {
+     "acked": 702934,
+     "unknown": 1,
+     "ok": 702934,
+     "bad": 0
+    },
+    "multi_l_s_z_incr": {
+     "acked": 702931,
+     "unknown": 3,
+     "ok": 702931,
+     "bad": 0
+    },
+    "overwrite": {
+     "acked": 702933,
+     "unknown": 0,
+     "ok": 1000,
+     "bad": 0
+    }
+   },
+   "problems_sample": [],
+   "checked_at_s": 7216.8
+  },
+  "replica-after-kill9": {
+   "acked": 5623474,
+   "unknown": 8,
+   "bad": 0,
+   "per_kind": {
+    "str": {
+     "acked": 702936,
+     "unknown": 0,
+     "ok": 702936,
+     "bad": 0
+    },
+    "str_ttl": {
+     "acked": 702934,
+     "unknown": 2,
+     "ok": 702934,
+     "bad": 0
+    },
+    "str_expired": {
+     "acked": 702934,
+     "unknown": 2,
+     "ok": 702934,
+     "bad": 0
+    },
+    "hash": {
+     "acked": 702936,
+     "unknown": 0,
+     "ok": 702936,
+     "bad": 0
+    },
+    "hash_field_ttl": {
+     "acked": 702936,
+     "unknown": 0,
+     "ok": 702936,
+     "bad": 0
+    },
+    "hash_field_expired": {
+     "acked": 702934,
+     "unknown": 1,
+     "ok": 702934,
+     "bad": 0
+    },
+    "multi_l_s_z_incr": {
+     "acked": 702931,
+     "unknown": 3,
+     "ok": 702931,
+     "bad": 0
+    },
+    "overwrite": {
+     "acked": 702933,
+     "unknown": 0,
+     "ok": 1000,
+     "bad": 0
+    }
+   },
+   "problems_sample": [],
+   "checked_at_s": 9202.5
+  },
+  "replica": {
+   "acked": 5623474,
+   "unknown": 8,
+   "bad": 0,
+   "per_kind": {
+    "str": {
+     "acked": 702936,
+     "unknown": 0,
+     "ok": 702936,
+     "bad": 0
+    },
+    "str_ttl": {
+     "acked": 702934,
+     "unknown": 2,
+     "ok": 702934,
+     "bad": 0
+    },
+    "str_expired": {
+     "acked": 702934,
+     "unknown": 2,
+     "ok": 702934,
+     "bad": 0
+    },
+    "hash": {
+     "acked": 702936,
+     "unknown": 0,
+     "ok": 702936,
+     "bad": 0
+    },
+    "hash_field_ttl": {
+     "acked": 702936,
+     "unknown": 0,
+     "ok": 702936,
+     "bad": 0
+    },
+    "hash_field_expired": {
+     "acked": 702934,
+     "unknown": 1,
+     "ok": 702934,
+     "bad": 0
+    },
+    "multi_l_s_z_incr": {
+     "acked": 702931,
+     "unknown": 3,
+     "ok": 702931,
+     "bad": 0
+    },
+    "overwrite": {
+     "acked": 702933,
+     "unknown": 0,
+     "ok": 1000,
+     "bad": 0
+    }
+   },
+   "problems_sample": [],
+   "checked_at_s": 7240.6
+  }
+ },
+ "writelog_error_windows": [
+  {
+   "event": "master restart (SIGTERM)",
+   "errors": 9,
+   "first_last_s_after": [
+    5,
+    8
+   ]
+  },
+  {
+   "event": "kill -9 replica",
+   "errors": 0,
+   "first_last_s_after": null
+  }
+ ],
+ "writelog_error_kinds": {
+  "ConnectionError:Error": 8,
+  "connect:ConnectionError": 1
+ },
+ "compare_end": {
+  "dbsize_a": 2751229,
+  "dbsize_b": 2751057,
+  "scanned_a": 2948099,
+  "scanned_b": 2945469,
+  "compared": 2948099,
+  "differ_first_pass": 311,
+  "differ_after_recheck": 172,
+  "expiring_at_compare": 0,
+  "real_differences": 172,
+  "sample": [
+   "wl:hx:3:5060",
+   "wl:hx:3:5062",
+   "wl:hx:2:5072",
+   "wl:hx:7:5071",
+   "wl:hx:5:5071",
+   "wl:hx:2:5073",
+   "wl:hx:3:5068",
+   "wl:hx:3:5079",
+   "wl:hx:4:5072",
+   "wl:hx:0:5072",
+   "wl:hx:7:5070",
+   "wl:hx:0:5060",
+   "wl:hx:3:5071",
+   "wl:hx:2:5062",
+   "wl:hx:0:5062",
+   "wl:hx:6:5074",
+   "wl:hx:6:5060",
+   "wl:hx:5:5060",
+   "wl:hx:5:5074",
+   "wl:hx:5:5079"
+  ],
+  "seconds": 474.7
+ },
+ "compare_end_tail": [
+  "{\"dbsize_a\": 2751229, \"dbsize_b\": 2751057, \"scanned_a\": 2948099, \"scanned_b\": 2945469, \"compared\": 2948099, \"differ_first_pass\": 311, \"differ_after_recheck\": 172, \"expiring_at_compare\": 0, \"real_differences\": 172, \"sample\": [\"wl:hx:3:5060\", \"wl:hx:3:5062\", \"wl:hx:2:5072\", \"wl:hx:7:5071\", \"wl:hx:5:5071\", \"wl:hx:2:5073\", \"wl:hx:3:5068\", \"wl:hx:3:5079\", \"wl:hx:4:5072\", \"wl:hx:0:5072\", \"wl:hx:7:5070\", \"wl:hx:0:5060\", \"wl:hx:3:5071\", \"wl:hx:2:5062\", \"wl:hx:0:5062\", \"wl:hx:6:5074\", \"wl:hx:6:5060\", \"wl:hx:5:5060\", \"wl:hx:5:5074\", \"wl:hx:5:5079\"], \"seconds\": 474.7}"
+ ],
+ "offsets": "offsets master=181098206958 replica=181098206958",
+ "restart_steps": [
+  "22:46:42 restart-check replica REPLICAOF NO ONE: OK",
+  "22:46:45 restart-check before: master keys=2747621 expires=702934 persistent=2044687 | replica keys=2747449 expires=702934 persistent=2044515",
+  "22:53:39 restart-check compare before: {\"dbsize_a\": 2747621, \"dbsize_b\": 2747449, \"scanned_a\": 2747621, \"scanned_b\": 2747449, \"compared\": 2747621, \"differ_first_pass\": 172, \"differ_after_recheck\": 172, \"expiring_at_compare\": 0, \"real_differences\": 172, \"sample\": [\"wl:hx:6:5064\", \"wl:hx:1:5067\", \"wl:hx:3:5066\", \"wl:hx:3:5070\", \"wl:hx:4:5078\", \"wl:hx:6:5065\", \"wl:hx:5:5079\", \"wl:hx:4:5061\", \"wl:hx:2:5074\", \"wl:hx:4:5076\", \"wl:hx:6:5073\", \"wl:hx:6:5062\", \"wl:hx:2:5077\", \"wl:hx:4:5072\", \"wl:hx:0:5065\", \"wl:hx:6:5079\", \"wl:hx:6:5068\", \"wl:hx:3:5072\", \"wl:hx:7:5059\", \"wl:hx:5:5064\"], \"seconds\": 413.4}",
+  "22:53:42 restart-check master: kill -9 44690",
+  "22:53:51 restart-check master: serving again after 8.39 s; keys=2747449 expires=702934 persistent=2044515",
+  "    log:   * AOF            : enabled",
+  "    log:   * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)",
+  "    log: 2026-11-02T22:53:43.418Z 97693 [INFO] Found dump.kdb \u00e2\u20ac\u201d loading native snapshot",
+  "    log: 2026-11-02T22:53:50.324Z 97693 [INFO] Loaded 2982830 keys from snapshot (938315 with a TTL)",
+  "    log: 2026-11-02T22:53:50.352Z 97693 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)",
+  "    log: 2026-11-02T22:53:50.352Z 97693 [INFO] Found appendonly.aof \u00e2\u20ac\u201d recovering from the append-only file",
+  "    log: 2026-11-02T22:53:51.210Z 97693 [INFO] AOF replay: 235381 commands, 2747449 keys, 6.60 MB in 0.86s",
+  "23:00:39 restart-check compare restarted master vs untouched replica: {\"dbsize_a\": 2747449, \"dbsize_b\": 2747449, \"scanned_a\": 2747449, \"scanned_b\": 2747449, \"compared\": 2747449, \"differ_first_pass\": 0, \"differ_after_recheck\": 0, \"expiring_at_compare\": 0, \"real_differences\": 0, \"sample\": [], \"seconds\": 406.7}",
+  "23:01:02 restart-check write log on the restarted master: {\"node\": \"master-after-kill9\", \"acked\": 5623474, \"unknown\": 8, \"bad\": 0, \"checked_keys_ok\": 4921541}",
+  "23:01:05 restart-check replica: kill -9 63511",
+  "23:01:15 restart-check replica: serving again after 8.77 s; keys=2747449 expires=702934 persistent=2044515",
+  "    log:   * AOF            : enabled",
+  "    log:   * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)",
+  "    log: 2026-11-02T23:01:06.652Z 97752 [INFO] Found dump.kdb \u00e2\u20ac\u201d loading native snapshot",
+  "    log: 2026-11-02T23:01:13.845Z 97752 [INFO] Loaded 2965641 keys from snapshot (921126 with a TTL)",
+  "    log: 2026-11-02T23:01:13.876Z 97752 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)",
+  "    log: 2026-11-02T23:01:13.876Z 97752 [INFO] Found appendonly.aof \u00e2\u20ac\u201d recovering from the append-only file",
+  "    log: 2026-11-02T23:01:14.740Z 97752 [INFO] AOF replay: 218192 commands, 2747449 keys, 6.11 MB in 0.86s",
+  "23:08:02 restart-check compare both restarted: {\"dbsize_a\": 2747449, \"dbsize_b\": 2747449, \"scanned_a\": 2747449, \"scanned_b\": 2747449, \"compared\": 2747449, \"differ_first_pass\": 0, \"differ_after_recheck\": 0, \"expiring_at_compare\": 0, \"real_differences\": 0, \"sample\": [], \"seconds\": 406.4}",
+  "23:08:27 restart-check write log on the restarted replica: {\"node\": \"replica-after-kill9\", \"acked\": 5623474, \"unknown\": 8, \"bad\": 0, \"checked_keys_ok\": 4921541}",
+  "23:08:27 restart-check after: master keys=2747449 expires=702934 persistent=2044515 | replica keys=2747449 expires=702934 persistent=2044515"
+ ]
+}

@@ -1,0 +1,38 @@
+== load stopped 20:45:54
+0s master_repl_offset=23583903015 replica_offset=23583903015 lag=0
+== replica INFO persistence
+aof_enabled:1
+rdb_bgsave_in_progress:0
+aof_rewrite_in_progress:0
+aof_rewrite_scheduled:0
+aof_last_rewrite_time_sec:0
+aof_last_rewrite_time_ms:750
+aof_last_bgrewrite_status:ok
+aof_current_size:114622925
+aof_base_size:19070175
+aof_lost_records:0
+aof_last_write_status:ok
+aof_acks_before_write:0
+aof_last_cow_size:0
+== replica INFO server
+redis_version:8.10.0
+kividb_version:1.2.0-rc7
+== DBSIZE master 1276708 replica 1276708
+== AOF/data files master
+112247698	/mnt/kv/appendonly.aof
+739560123	/mnt/kv/dump.kdb
+24	/mnt/kv/dump.kdb.gen
+105	/mnt/kv/node.conf
+5	/mnt/kv/pid
+24289	/mnt/kv/server.log
+== AOF/data files replica
+114635612	/mnt/kv/appendonly.aof
+739605852	/mnt/kv/dump.kdb
+24	/mnt/kv/dump.kdb.gen
+93	/mnt/kv/dump.kdb.repl
+130	/mnt/kv/node.conf
+5	/mnt/kv/pid
+24810	/mnt/kv/server.log
+== compare.py
+{"dbsize_a": 1181683, "dbsize_b": 1181683, "scanned_a": 1275828, "scanned_b": 1275113, "compared": 1275828, "differ_first_pass": 95, "differ_after_recheck": 0, "expiring_at_compare": 0, "real_differences": 0, "sample": [], "seconds": 106.5}
+== DBSIZE after compare master 1181286 replica 1181276

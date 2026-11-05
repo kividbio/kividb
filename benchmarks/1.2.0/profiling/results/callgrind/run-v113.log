@@ -1,0 +1,31 @@
+DEL v113 4038
+GET-100-TTL v113 3560
+SET-100-TTL v113 5996
+INCR-TTL v113 4560
+DEL-TTL v113 5002
+GET-100-LRU v113 3705
+SET-100-LRU v113 4436
+INCR-LRU v113 4746
+DEL-LRU v113 4630
+GET-100-LFU v113 3709
+SET-100-LFU v113 4438
+INCR-LFU v113 4743
+workload            v113
+GET-100             3250
+SET-100             3947
+GET-1K              3837
+SET-1K              4041
+MIX-100             7218
+INCR                4319
+DEL                 4038
+GET-100-TTL          3560
+SET-100-TTL          5996
+INCR-TTL            4560
+DEL-TTL             5002
+GET-100-LRU          3705
+SET-100-LRU          4436
+INCR-LRU            4746
+DEL-LRU             4630
+GET-100-LFU          3709
+SET-100-LFU          4438
+INCR-LFU            4743

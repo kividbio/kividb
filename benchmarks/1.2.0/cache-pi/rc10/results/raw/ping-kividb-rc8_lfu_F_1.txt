@@ -1,0 +1,5 @@
+PING <server-private-ip> (<server-private-ip>) 56(84) bytes of data.
+
+--- <server-private-ip> ping statistics ---
+20 packets transmitted, 20 received, 0% packet loss, time 3907ms
+rtt min/avg/max/mdev = 0.487/0.906/2.585/0.557 ms

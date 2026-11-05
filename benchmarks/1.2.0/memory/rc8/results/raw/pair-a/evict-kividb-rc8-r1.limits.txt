@@ -1,0 +1,8 @@
+used_memory=10714038885 maxmemory=11785442773
+evicted_keys:0
+dbsize_before=10000000
+dbsize_after=10000000
+evicted_keys:0
+used_memory:10716184989
+maxmemory:11785442773
+mem_not_counted_for_evict:0

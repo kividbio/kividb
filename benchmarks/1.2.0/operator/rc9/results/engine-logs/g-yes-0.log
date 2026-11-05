@@ -1,0 +1,9 @@
+2026-11-03T07:49:56.457990014Z 2026-11-03T07:49:56.457Z 1 [WARN] Replication: Replication link to <ip>:6380 failed: Connection reset by peer (os error 104) — retrying every 1s
+2026-11-03T07:50:56.484863276Z 2026-11-03T07:50:56.484Z 1 [INFO] CONFIG SET masteruser default
+2026-11-03T07:50:56.484942705Z 2026-11-03T07:50:56.484Z 1 [INFO] CONFIG SET masterauth (hidden)
+2026-11-03T07:50:56.485303257Z 2026-11-03T07:50:56.485Z 1 [INFO] Replication: Connecting to master <ip>:6380...
+2026-11-03T07:50:56.499732780Z 2026-11-03T07:50:56.499Z 1 [INFO] Replication: Superseded during reconnect backoff — stopping
+2026-11-03T07:50:56.508267970Z 2026-11-03T07:50:56.508Z 1 [INFO] Replication: This dataset is the master's at the start of its stream ee02d191633df3ceca61ead9dc38d757963b5fc6 — asking to be continued from there
+2026-11-03T07:50:56.508561754Z 2026-11-03T07:50:56.508Z 1 [INFO] Replication: Partial resync: continuing from offset 0 — no dataset transfer
+2026-11-03T07:50:56.509029078Z 2026-11-03T07:50:56.508Z 1 [INFO] Replication: Synced with <ip>:6380. Entering command stream.
+2026-11-03T07:50:56.809248560Z 2026-11-03T07:50:56.808Z 1 [INFO] Replication: Backlog restarted at offset 0 (it ended at 27196081)

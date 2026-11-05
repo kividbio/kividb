@@ -1,0 +1,1188 @@
+2026-11-03T07:19:50Z   Warning   FailedScheduling         cli                            0/4 nodes are available: 4 node(s) didn't match Pod's node affinity/selector. no new claims to deallocate, preemption: 0/4 nodes are available: 4 Preemption is not helpful for scheduling.
+2026-11-03T07:19:51Z   Normal    Scheduled                cli                            Successfully assigned e2e/cli to aks-nodepool1-63764748-vmss000000
+2026-11-03T07:19:52Z   Normal    Pulling                  cli                            Pulling image "redis:8"
+2026-11-03T07:19:57Z   Normal    Pulled                   cli                            Successfully pulled image "redis:8" in 5.715s (5.715s including waiting). Image size: 55617836 bytes.
+2026-11-03T07:19:57Z   Normal    Created                  cli                            Container created
+2026-11-03T07:19:58Z   Normal    Started                  cli                            Container started
+2026-11-03T07:19:50Z   Warning   FailedScheduling         curl                           0/4 nodes are available: 4 node(s) didn't match Pod's node affinity/selector. no new claims to deallocate, preemption: 0/4 nodes are available: 4 Preemption is not helpful for scheduling.
+2026-11-03T07:19:51Z   Normal    Scheduled                curl                           Successfully assigned e2e/curl to aks-nodepool1-63764748-vmss000000
+2026-11-03T07:19:52Z   Normal    Pulling                  curl                           Pulling image "curlimages/curl:8.11.1"
+2026-11-03T07:19:56Z   Normal    Pulled                   curl                           Successfully pulled image "curlimages/curl:8.11.1" in 4.299s (4.299s including waiting). Image size: 9560620 bytes.
+2026-11-03T07:19:56Z   Normal    Created                  curl                           Container created
+2026-11-03T07:19:56Z   Normal    Started                  curl                           Container started
+2026-11-03T07:20:46Z   Normal    WaitForFirstConsumer     data-g-no-0                    waiting for first consumer to be created before binding
+2026-11-03T07:20:46Z   Normal    Provisioning             data-g-no-0                    External provisioner is provisioning volume for claim "e2e/data-g-no-0"
+2026-11-03T07:20:46Z   Normal    ExternalProvisioning     data-g-no-0                    Waiting for a volume to be created either by the external provisioner 'disk.csi.azure.com' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-11-03T07:20:46Z   Normal    ProvisioningSucceeded    data-g-no-0                    Successfully provisioned volume pvc-e904dd71-16ed-4c31-9fa3-6f4894747d9d
+2026-11-03T07:20:46Z   Normal    WaitForFirstConsumer     data-g-no-1                    waiting for first consumer to be created before binding
+2026-11-03T07:20:46Z   Normal    Provisioning             data-g-no-1                    External provisioner is provisioning volume for claim "e2e/data-g-no-1"
+2026-11-03T07:20:46Z   Normal    ExternalProvisioning     data-g-no-1                    Waiting for a volume to be created either by the external provisioner 'disk.csi.azure.com' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-11-03T07:20:47Z   Normal    ProvisioningSucceeded    data-g-no-1                    Successfully provisioned volume pvc-2f8853b2-570b-42be-ba70-228485feab30
+2026-11-03T07:20:45Z   Normal    WaitForFirstConsumer     data-g-yes-0                   waiting for first consumer to be created before binding
+2026-11-03T07:20:45Z   Normal    Provisioning             data-g-yes-0                   External provisioner is provisioning volume for claim "e2e/data-g-yes-0"
+2026-11-03T07:20:50Z   Normal    ExternalProvisioning     data-g-yes-0                   Waiting for a volume to be created either by the external provisioner 'disk.csi.azure.com' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-11-03T07:20:56Z   Normal    ProvisioningSucceeded    data-g-yes-0                   Successfully provisioned volume pvc-0bc259ae-160c-46b6-b48f-da515d814813
+2026-11-03T07:20:45Z   Normal    WaitForFirstConsumer     data-g-yes-1                   waiting for first consumer to be created before binding
+2026-11-03T07:20:45Z   Normal    Provisioning             data-g-yes-1                   External provisioner is provisioning volume for claim "e2e/data-g-yes-1"
+2026-11-03T07:20:45Z   Normal    ExternalProvisioning     data-g-yes-1                   Waiting for a volume to be created either by the external provisioner 'disk.csi.azure.com' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-11-03T07:20:48Z   Normal    ProvisioningSucceeded    data-g-yes-1                   Successfully provisioned volume pvc-018beb62-66a9-40b7-b57b-ea018f895b86
+2026-11-03T07:20:45Z   Normal    WaitForFirstConsumer     data-shd-0-0                   waiting for first consumer to be created before binding
+2026-11-03T07:20:45Z   Normal    Provisioning             data-shd-0-0                   External provisioner is provisioning volume for claim "e2e/data-shd-0-0"
+2026-11-03T07:20:50Z   Normal    ExternalProvisioning     data-shd-0-0                   Waiting for a volume to be created either by the external provisioner 'disk.csi.azure.com' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-11-03T07:20:56Z   Normal    ProvisioningSucceeded    data-shd-0-0                   Successfully provisioned volume pvc-43dcfe60-e043-4e07-845c-44de050336ff
+2026-11-03T07:20:45Z   Normal    WaitForFirstConsumer     data-shd-0-1                   waiting for first consumer to be created before binding
+2026-11-03T07:20:45Z   Normal    Provisioning             data-shd-0-1                   External provisioner is provisioning volume for claim "e2e/data-shd-0-1"
+2026-11-03T07:20:45Z   Normal    ExternalProvisioning     data-shd-0-1                   Waiting for a volume to be created either by the external provisioner 'disk.csi.azure.com' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-11-03T07:20:46Z   Normal    ProvisioningSucceeded    data-shd-0-1                   Successfully provisioned volume pvc-44d93fd6-d819-487c-9ad5-4bfc84a66d4e
+2026-11-03T07:20:45Z   Normal    WaitForFirstConsumer     data-shd-1-0                   waiting for first consumer to be created before binding
+2026-11-03T07:20:45Z   Normal    Provisioning             data-shd-1-0                   External provisioner is provisioning volume for claim "e2e/data-shd-1-0"
+2026-11-03T07:20:45Z   Normal    ExternalProvisioning     data-shd-1-0                   Waiting for a volume to be created either by the external provisioner 'disk.csi.azure.com' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-11-03T07:20:46Z   Normal    ProvisioningSucceeded    data-shd-1-0                   Successfully provisioned volume pvc-91699fee-a2b3-4640-9541-accd0f79ef55
+2026-11-03T07:20:45Z   Normal    WaitForFirstConsumer     data-shd-1-1                   waiting for first consumer to be created before binding
+2026-11-03T07:20:45Z   Normal    Provisioning             data-shd-1-1                   External provisioner is provisioning volume for claim "e2e/data-shd-1-1"
+2026-11-03T07:20:45Z   Normal    ExternalProvisioning     data-shd-1-1                   Waiting for a volume to be created either by the external provisioner 'disk.csi.azure.com' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-11-03T07:20:46Z   Normal    ProvisioningSucceeded    data-shd-1-1                   Successfully provisioned volume pvc-baa6d3a5-c30e-447b-b4f1-fe6d34f08deb
+2026-11-03T07:20:45Z   Normal    WaitForFirstConsumer     data-shd-2-0                   waiting for first consumer to be created before binding
+2026-11-03T07:20:45Z   Normal    Provisioning             data-shd-2-0                   External provisioner is provisioning volume for claim "e2e/data-shd-2-0"
+2026-11-03T07:20:50Z   Normal    ExternalProvisioning     data-shd-2-0                   Waiting for a volume to be created either by the external provisioner 'disk.csi.azure.com' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-11-03T07:20:51Z   Normal    ProvisioningSucceeded    data-shd-2-0                   Successfully provisioned volume pvc-22a8ab0b-85e1-475d-8fe9-1adc13b6c89f
+2026-11-03T07:20:45Z   Normal    WaitForFirstConsumer     data-shd-2-1                   waiting for first consumer to be created before binding
+2026-11-03T07:20:45Z   Normal    Provisioning             data-shd-2-1                   External provisioner is provisioning volume for claim "e2e/data-shd-2-1"
+2026-11-03T07:20:45Z   Normal    ExternalProvisioning     data-shd-2-1                   Waiting for a volume to be created either by the external provisioner 'disk.csi.azure.com' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-11-03T07:20:46Z   Normal    ProvisioningSucceeded    data-shd-2-1                   Successfully provisioned volume pvc-189c3fb1-ad36-4302-9739-8baa227f7af0
+2026-11-03T07:20:47Z   Normal    Scheduled                g-no-0                         Successfully assigned e2e/g-no-0 to aks-nodepool1-63764748-vmss000003
+2026-11-03T07:20:53Z   Normal    SuccessfulAttachVolume   g-no-0                         AttachVolume.Attach succeeded for volume "pvc-e904dd71-16ed-4c31-9fa3-6f4894747d9d" 
+2026-11-03T07:20:55Z   Normal    Pulling                  g-no-0                         Pulling image "<acr>.azurecr.io/kividb:1.2.0-rc9"
+2026-11-03T07:20:56Z   Normal    Pulled                   g-no-0                         Successfully pulled image "<acr>.azurecr.io/kividb:1.2.0-rc9" in 1.148s (1.148s including waiting). Image size: 12282233 bytes.
+2026-11-03T07:20:56Z   Normal    Created                  g-no-0                         Container created
+2026-11-03T07:20:56Z   Normal    Started                  g-no-0                         Container started
+2026-11-03T07:20:56Z   Normal    Pulling                  g-no-0                         Pulling image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e"
+2026-11-03T07:20:57Z   Normal    Pulled                   g-no-0                         Successfully pulled image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" in 696ms (696ms including waiting). Image size: 7952869 bytes.
+2026-11-03T07:20:57Z   Normal    Created                  g-no-0                         Container created
+2026-11-03T07:20:57Z   Normal    Started                  g-no-0                         Container started
+2026-11-03T07:20:47Z   Normal    Scheduled                g-no-1                         Successfully assigned e2e/g-no-1 to aks-nodepool1-63764748-vmss000002
+2026-11-03T07:20:54Z   Normal    SuccessfulAttachVolume   g-no-1                         AttachVolume.Attach succeeded for volume "pvc-2f8853b2-570b-42be-ba70-228485feab30" 
+2026-11-03T07:20:56Z   Normal    Pulling                  g-no-1                         Pulling image "<acr>.azurecr.io/kividb:1.2.0-rc9"
+2026-11-03T07:20:58Z   Normal    Pulled                   g-no-1                         Successfully pulled image "<acr>.azurecr.io/kividb:1.2.0-rc9" in 1.545s (1.545s including waiting). Image size: 12282233 bytes.
+2026-11-03T07:20:58Z   Normal    Created                  g-no-1                         Container created
+2026-11-03T07:20:58Z   Normal    Started                  g-no-1                         Container started
+2026-11-03T07:20:58Z   Normal    Pulling                  g-no-1                         Pulling image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e"
+2026-11-03T07:20:58Z   Normal    Pulled                   g-no-1                         Successfully pulled image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" in 545ms (545ms including waiting). Image size: 7952869 bytes.
+2026-11-03T07:20:58Z   Normal    Created                  g-no-1                         Container created
+2026-11-03T07:20:58Z   Normal    Started                  g-no-1                         Container started
+2026-11-03T07:20:46Z   Normal    NoPods                   g-no                           No matching pods found
+2026-11-03T07:20:46Z   Normal    SuccessfulCreate         g-no                           Create Claim data-g-no-0 Pod g-no-0 in StatefulSet g-no success
+2026-11-03T07:20:46Z   Normal    SuccessfulCreate         g-no                           Create Pod g-no-0 in StatefulSet g-no successful
+2026-11-03T07:20:46Z   Normal    SuccessfulCreate         g-no                           Create Claim data-g-no-1 Pod g-no-1 in StatefulSet g-no success
+2026-11-03T07:20:46Z   Normal    SuccessfulCreate         g-no                           Create Pod g-no-1 in StatefulSet g-no successful
+2026-11-03T07:20:56Z   Normal    Scheduled                g-yes-0                        Successfully assigned e2e/g-yes-0 to aks-nodepool1-63764748-vmss000001
+2026-11-03T07:21:07Z   Normal    SuccessfulAttachVolume   g-yes-0                        AttachVolume.Attach succeeded for volume "pvc-0bc259ae-160c-46b6-b48f-da515d814813" 
+2026-11-03T07:21:08Z   Normal    Pulling                  g-yes-0                        Pulling image "<acr>.azurecr.io/kividb:1.2.0-rc9"
+2026-11-03T07:21:09Z   Normal    Pulled                   g-yes-0                        Successfully pulled image "<acr>.azurecr.io/kividb:1.2.0-rc9" in 591ms (591ms including waiting). Image size: 12282233 bytes.
+2026-11-03T07:21:09Z   Normal    Created                  g-yes-0                        Container created
+2026-11-03T07:21:09Z   Normal    Started                  g-yes-0                        Container started
+2026-11-03T07:21:09Z   Normal    Pulled                   g-yes-0                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:21:09Z   Normal    Created                  g-yes-0                        Container created
+2026-11-03T07:21:09Z   Normal    Started                  g-yes-0                        Container started
+2026-11-03T07:20:48Z   Normal    Scheduled                g-yes-1                        Successfully assigned e2e/g-yes-1 to aks-nodepool1-63764748-vmss000000
+2026-11-03T07:21:01Z   Normal    SuccessfulAttachVolume   g-yes-1                        AttachVolume.Attach succeeded for volume "pvc-018beb62-66a9-40b7-b57b-ea018f895b86" 
+2026-11-03T07:21:02Z   Normal    Pulling                  g-yes-1                        Pulling image "<acr>.azurecr.io/kividb:1.2.0-rc9"
+2026-11-03T07:21:03Z   Normal    Pulled                   g-yes-1                        Successfully pulled image "<acr>.azurecr.io/kividb:1.2.0-rc9" in 608ms (608ms including waiting). Image size: 12282233 bytes.
+2026-11-03T07:21:03Z   Normal    Created                  g-yes-1                        Container created
+2026-11-03T07:21:03Z   Normal    Started                  g-yes-1                        Container started
+2026-11-03T07:21:03Z   Normal    Pulled                   g-yes-1                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:21:03Z   Normal    Created                  g-yes-1                        Container created
+2026-11-03T07:21:03Z   Normal    Started                  g-yes-1                        Container started
+2026-11-03T07:20:45Z   Normal    NoPods                   g-yes                          No matching pods found
+2026-11-03T07:20:45Z   Normal    SuccessfulCreate         g-yes                          Create Claim data-g-yes-0 Pod g-yes-0 in StatefulSet g-yes success
+2026-11-03T07:20:45Z   Normal    SuccessfulCreate         g-yes                          Create Pod g-yes-0 in StatefulSet g-yes successful
+2026-11-03T07:20:45Z   Normal    SuccessfulCreate         g-yes                          Create Claim data-g-yes-1 Pod g-yes-1 in StatefulSet g-yes success
+2026-11-03T07:20:45Z   Normal    SuccessfulCreate         g-yes                          Create Pod g-yes-1 in StatefulSet g-yes successful
+2026-11-03T07:21:20Z   Normal    Scheduled                loader-g-no-79d7f5f4f6-6x5fp   Successfully assigned e2e/loader-g-no-79d7f5f4f6-6x5fp to aks-nodepool1-63764748-vmss000000
+2026-11-03T07:21:21Z   Normal    Pulling                  loader-g-no-79d7f5f4f6-6x5fp   Pulling image "<acr>.azurecr.io/e2e-loader:6"
+2026-11-03T07:21:21Z   Normal    Pulled                   loader-g-no-79d7f5f4f6-6x5fp   Successfully pulled image "<acr>.azurecr.io/e2e-loader:6" in 392ms (392ms including waiting). Image size: 6012892 bytes.
+2026-11-03T07:21:21Z   Normal    Created                  loader-g-no-79d7f5f4f6-6x5fp   Container created
+2026-11-03T07:21:21Z   Normal    Started                  loader-g-no-79d7f5f4f6-6x5fp   Container started
+2026-11-03T07:21:20Z   Normal    SuccessfulCreate         loader-g-no-79d7f5f4f6         Created pod: loader-g-no-79d7f5f4f6-6x5fp
+2026-11-03T07:21:20Z   Normal    ScalingReplicaSet        loader-g-no                    Scaled up replica set loader-g-no-79d7f5f4f6 from 0 to 1
+2026-11-03T07:21:20Z   Normal    Scheduled                loader-g-yes-7b89f4-kfc4k      Successfully assigned e2e/loader-g-yes-7b89f4-kfc4k to aks-nodepool1-63764748-vmss000000
+2026-11-03T07:21:20Z   Normal    Pulling                  loader-g-yes-7b89f4-kfc4k      Pulling image "<acr>.azurecr.io/e2e-loader:6"
+2026-11-03T07:21:21Z   Normal    Pulled                   loader-g-yes-7b89f4-kfc4k      Successfully pulled image "<acr>.azurecr.io/e2e-loader:6" in 769ms (769ms including waiting). Image size: 6012892 bytes.
+2026-11-03T07:21:21Z   Normal    Created                  loader-g-yes-7b89f4-kfc4k      Container created
+2026-11-03T07:21:21Z   Normal    Started                  loader-g-yes-7b89f4-kfc4k      Container started
+2026-11-03T07:21:20Z   Normal    SuccessfulCreate         loader-g-yes-7b89f4            Created pod: loader-g-yes-7b89f4-kfc4k
+2026-11-03T07:21:20Z   Normal    ScalingReplicaSet        loader-g-yes                   Scaled up replica set loader-g-yes-7b89f4 from 0 to 1
+2026-11-03T07:21:19Z   Normal    Scheduled                loader-shd-6d79cdbb4-rxwwv     Successfully assigned e2e/loader-shd-6d79cdbb4-rxwwv to aks-nodepool1-63764748-vmss000000
+2026-11-03T07:21:20Z   Normal    Pulling                  loader-shd-6d79cdbb4-rxwwv     Pulling image "<acr>.azurecr.io/e2e-loader:6"
+2026-11-03T07:21:21Z   Normal    Pulled                   loader-shd-6d79cdbb4-rxwwv     Successfully pulled image "<acr>.azurecr.io/e2e-loader:6" in 1.158s (1.158s including waiting). Image size: 6012892 bytes.
+2026-11-03T07:21:21Z   Normal    Created                  loader-shd-6d79cdbb4-rxwwv     Container created
+2026-11-03T07:21:21Z   Normal    Started                  loader-shd-6d79cdbb4-rxwwv     Container started
+2026-11-03T07:21:19Z   Normal    SuccessfulCreate         loader-shd-6d79cdbb4           Created pod: loader-shd-6d79cdbb4-rxwwv
+2026-11-03T07:21:19Z   Normal    ScalingReplicaSet        loader-shd                     Scaled up replica set loader-shd-6d79cdbb4 from 0 to 1
+2026-11-03T07:19:50Z   Normal    Scheduled                nd-7bqf9                       Successfully assigned e2e/nd-7bqf9 to aks-nodepool1-63764748-vmss000000
+2026-11-03T07:19:51Z   Normal    Pulling                  nd-7bqf9                       Pulling image "ubuntu:24.04"
+2026-11-03T07:19:55Z   Normal    Pulled                   nd-7bqf9                       Successfully pulled image "ubuntu:24.04" in 4.625s (4.625s including waiting). Image size: 29776776 bytes.
+2026-11-03T07:19:55Z   Normal    Created                  nd-7bqf9                       Container created
+2026-11-03T07:19:55Z   Normal    Started                  nd-7bqf9                       Container started
+2026-11-03T07:19:50Z   Normal    Scheduled                nd-85tbh                       Successfully assigned e2e/nd-85tbh to aks-nodepool1-63764748-vmss000003
+2026-11-03T07:19:51Z   Normal    Pulling                  nd-85tbh                       Pulling image "ubuntu:24.04"
+2026-11-03T07:19:55Z   Normal    Pulled                   nd-85tbh                       Successfully pulled image "ubuntu:24.04" in 4.274s (4.274s including waiting). Image size: 29776776 bytes.
+2026-11-03T07:19:55Z   Normal    Created                  nd-85tbh                       Container created
+2026-11-03T07:19:55Z   Normal    Started                  nd-85tbh                       Container started
+2026-11-03T07:19:50Z   Normal    Scheduled                nd-fpvgr                       Successfully assigned e2e/nd-fpvgr to aks-nodepool1-63764748-vmss000002
+2026-11-03T07:19:51Z   Normal    Pulling                  nd-fpvgr                       Pulling image "ubuntu:24.04"
+2026-11-03T07:19:55Z   Normal    Pulled                   nd-fpvgr                       Successfully pulled image "ubuntu:24.04" in 4.299s (4.299s including waiting). Image size: 29776776 bytes.
+2026-11-03T07:19:55Z   Normal    Created                  nd-fpvgr                       Container created
+2026-11-03T07:19:55Z   Normal    Started                  nd-fpvgr                       Container started
+2026-11-03T07:19:50Z   Normal    Scheduled                nd-jkwft                       Successfully assigned e2e/nd-jkwft to aks-nodepool1-63764748-vmss000001
+2026-11-03T07:19:51Z   Normal    Pulling                  nd-jkwft                       Pulling image "ubuntu:24.04"
+2026-11-03T07:19:55Z   Normal    Pulled                   nd-jkwft                       Successfully pulled image "ubuntu:24.04" in 4.4s (4.4s including waiting). Image size: 29776776 bytes.
+2026-11-03T07:19:55Z   Normal    Created                  nd-jkwft                       Container created
+2026-11-03T07:19:55Z   Normal    Started                  nd-jkwft                       Container started
+2026-11-03T07:19:50Z   Normal    SuccessfulCreate         nd                             Created pod: nd-7bqf9
+2026-11-03T07:19:50Z   Normal    SuccessfulCreate         nd                             Created pod: nd-jkwft
+2026-11-03T07:19:50Z   Normal    SuccessfulCreate         nd                             Created pod: nd-85tbh
+2026-11-03T07:19:50Z   Normal    SuccessfulCreate         nd                             Created pod: nd-fpvgr
+2026-11-03T07:20:56Z   Normal    Scheduled                shd-0-0                        Successfully assigned e2e/shd-0-0 to aks-nodepool1-63764748-vmss000002
+2026-11-03T07:21:04Z   Normal    SuccessfulAttachVolume   shd-0-0                        AttachVolume.Attach succeeded for volume "pvc-43dcfe60-e043-4e07-845c-44de050336ff" 
+2026-11-03T07:21:06Z   Normal    Pulled                   shd-0-0                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc8" already present on machine and can be accessed by the pod
+2026-11-03T07:21:06Z   Normal    Created                  shd-0-0                        Container created
+2026-11-03T07:21:06Z   Normal    Started                  shd-0-0                        Container started
+2026-11-03T07:21:06Z   Normal    Pulled                   shd-0-0                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:21:06Z   Normal    Created                  shd-0-0                        Container created
+2026-11-03T07:21:06Z   Normal    Started                  shd-0-0                        Container started
+2026-11-03T07:20:47Z   Normal    Scheduled                shd-0-1                        Successfully assigned e2e/shd-0-1 to aks-nodepool1-63764748-vmss000003
+2026-11-03T07:20:54Z   Normal    SuccessfulAttachVolume   shd-0-1                        AttachVolume.Attach succeeded for volume "pvc-44d93fd6-d819-487c-9ad5-4bfc84a66d4e" 
+2026-11-03T07:20:55Z   Normal    Pulling                  shd-0-1                        Pulling image "<acr>.azurecr.io/kividb:1.2.0-rc8"
+2026-11-03T07:20:56Z   Normal    Pulled                   shd-0-1                        Successfully pulled image "<acr>.azurecr.io/kividb:1.2.0-rc8" in 336ms (336ms including waiting). Image size: 12278002 bytes.
+2026-11-03T07:20:56Z   Normal    Created                  shd-0-1                        Container created
+2026-11-03T07:20:56Z   Normal    Started                  shd-0-1                        Container started
+2026-11-03T07:20:56Z   Normal    Pulling                  shd-0-1                        Pulling image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e"
+2026-11-03T07:20:57Z   Normal    Pulled                   shd-0-1                        Successfully pulled image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" in 597ms (597ms including waiting). Image size: 7952869 bytes.
+2026-11-03T07:20:57Z   Normal    Created                  shd-0-1                        Container created
+2026-11-03T07:20:57Z   Normal    Started                  shd-0-1                        Container started
+2026-11-03T07:20:45Z   Normal    NoPods                   shd-0                          No matching pods found
+2026-11-03T07:20:45Z   Normal    SuccessfulCreate         shd-0                          Create Claim data-shd-0-0 Pod shd-0-0 in StatefulSet shd-0 success
+2026-11-03T07:20:45Z   Normal    SuccessfulCreate         shd-0                          Create Pod shd-0-0 in StatefulSet shd-0 successful
+2026-11-03T07:20:45Z   Normal    SuccessfulCreate         shd-0                          Create Claim data-shd-0-1 Pod shd-0-1 in StatefulSet shd-0 success
+2026-11-03T07:20:45Z   Normal    SuccessfulCreate         shd-0                          Create Pod shd-0-1 in StatefulSet shd-0 successful
+2026-11-03T07:20:46Z   Normal    Scheduled                shd-1-0                        Successfully assigned e2e/shd-1-0 to aks-nodepool1-63764748-vmss000003
+2026-11-03T07:20:54Z   Normal    SuccessfulAttachVolume   shd-1-0                        AttachVolume.Attach succeeded for volume "pvc-91699fee-a2b3-4640-9541-accd0f79ef55" 
+2026-11-03T07:20:55Z   Normal    Pulling                  shd-1-0                        Pulling image "<acr>.azurecr.io/kividb:1.2.0-rc8"
+2026-11-03T07:20:56Z   Normal    Pulled                   shd-1-0                        Successfully pulled image "<acr>.azurecr.io/kividb:1.2.0-rc8" in 958ms (958ms including waiting). Image size: 12278002 bytes.
+2026-11-03T07:20:56Z   Normal    Created                  shd-1-0                        Container created
+2026-11-03T07:20:56Z   Normal    Started                  shd-1-0                        Container started
+2026-11-03T07:20:56Z   Normal    Pulling                  shd-1-0                        Pulling image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e"
+2026-11-03T07:20:57Z   Normal    Pulled                   shd-1-0                        Successfully pulled image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" in 618ms (618ms including waiting). Image size: 7952869 bytes.
+2026-11-03T07:20:57Z   Normal    Created                  shd-1-0                        Container created
+2026-11-03T07:20:57Z   Normal    Started                  shd-1-0                        Container started
+2026-11-03T07:20:46Z   Normal    Scheduled                shd-1-1                        Successfully assigned e2e/shd-1-1 to aks-nodepool1-63764748-vmss000000
+2026-11-03T07:20:54Z   Normal    SuccessfulAttachVolume   shd-1-1                        AttachVolume.Attach succeeded for volume "pvc-baa6d3a5-c30e-447b-b4f1-fe6d34f08deb" 
+2026-11-03T07:20:56Z   Normal    Pulling                  shd-1-1                        Pulling image "<acr>.azurecr.io/kividb:1.2.0-rc8"
+2026-11-03T07:20:57Z   Normal    Pulled                   shd-1-1                        Successfully pulled image "<acr>.azurecr.io/kividb:1.2.0-rc8" in 1.317s (1.317s including waiting). Image size: 12278002 bytes.
+2026-11-03T07:20:57Z   Normal    Created                  shd-1-1                        Container created
+2026-11-03T07:20:57Z   Normal    Started                  shd-1-1                        Container started
+2026-11-03T07:20:57Z   Normal    Pulling                  shd-1-1                        Pulling image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e"
+2026-11-03T07:20:58Z   Normal    Pulled                   shd-1-1                        Successfully pulled image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" in 503ms (503ms including waiting). Image size: 7952869 bytes.
+2026-11-03T07:20:58Z   Normal    Created                  shd-1-1                        Container created
+2026-11-03T07:20:58Z   Normal    Started                  shd-1-1                        Container started
+2026-11-03T07:20:45Z   Normal    NoPods                   shd-1                          No matching pods found
+2026-11-03T07:20:45Z   Normal    SuccessfulCreate         shd-1                          Create Claim data-shd-1-0 Pod shd-1-0 in StatefulSet shd-1 success
+2026-11-03T07:20:45Z   Normal    SuccessfulCreate         shd-1                          Create Pod shd-1-0 in StatefulSet shd-1 successful
+2026-11-03T07:20:45Z   Normal    SuccessfulCreate         shd-1                          Create Claim data-shd-1-1 Pod shd-1-1 in StatefulSet shd-1 success
+2026-11-03T07:20:45Z   Normal    SuccessfulCreate         shd-1                          Create Pod shd-1-1 in StatefulSet shd-1 successful
+2026-11-03T07:20:51Z   Normal    Scheduled                shd-2-0                        Successfully assigned e2e/shd-2-0 to aks-nodepool1-63764748-vmss000001
+2026-11-03T07:20:59Z   Normal    SuccessfulAttachVolume   shd-2-0                        AttachVolume.Attach succeeded for volume "pvc-22a8ab0b-85e1-475d-8fe9-1adc13b6c89f" 
+2026-11-03T07:21:01Z   Normal    Pulling                  shd-2-0                        Pulling image "<acr>.azurecr.io/kividb:1.2.0-rc8"
+2026-11-03T07:21:02Z   Normal    Pulled                   shd-2-0                        Successfully pulled image "<acr>.azurecr.io/kividb:1.2.0-rc8" in 723ms (723ms including waiting). Image size: 12278002 bytes.
+2026-11-03T07:21:02Z   Normal    Created                  shd-2-0                        Container created
+2026-11-03T07:21:02Z   Normal    Started                  shd-2-0                        Container started
+2026-11-03T07:21:02Z   Normal    Pulling                  shd-2-0                        Pulling image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e"
+2026-11-03T07:21:02Z   Normal    Pulled                   shd-2-0                        Successfully pulled image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" in 523ms (523ms including waiting). Image size: 7952869 bytes.
+2026-11-03T07:21:02Z   Normal    Created                  shd-2-0                        Container created
+2026-11-03T07:21:02Z   Normal    Started                  shd-2-0                        Container started
+2026-11-03T07:20:47Z   Normal    Scheduled                shd-2-1                        Successfully assigned e2e/shd-2-1 to aks-nodepool1-63764748-vmss000002
+2026-11-03T07:20:55Z   Normal    SuccessfulAttachVolume   shd-2-1                        AttachVolume.Attach succeeded for volume "pvc-189c3fb1-ad36-4302-9739-8baa227f7af0" 
+2026-11-03T07:20:56Z   Normal    Pulling                  shd-2-1                        Pulling image "<acr>.azurecr.io/kividb:1.2.0-rc8"
+2026-11-03T07:20:58Z   Normal    Pulled                   shd-2-1                        Successfully pulled image "<acr>.azurecr.io/kividb:1.2.0-rc8" in 1.524s (1.524s including waiting). Image size: 12278002 bytes.
+2026-11-03T07:20:58Z   Normal    Created                  shd-2-1                        Container created
+2026-11-03T07:20:58Z   Normal    Started                  shd-2-1                        Container started
+2026-11-03T07:20:58Z   Normal    Pulling                  shd-2-1                        Pulling image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e"
+2026-11-03T07:20:58Z   Normal    Pulled                   shd-2-1                        Successfully pulled image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" in 569ms (569ms including waiting). Image size: 7952869 bytes.
+2026-11-03T07:20:58Z   Normal    Created                  shd-2-1                        Container created
+2026-11-03T07:20:58Z   Normal    Started                  shd-2-1                        Container started
+2026-11-03T07:20:45Z   Normal    NoPods                   shd-2                          No matching pods found
+2026-11-03T07:20:45Z   Normal    SuccessfulCreate         shd-2                          Create Claim data-shd-2-0 Pod shd-2-0 in StatefulSet shd-2 success
+2026-11-03T07:20:45Z   Normal    SuccessfulCreate         shd-2                          Create Pod shd-2-0 in StatefulSet shd-2 successful
+2026-11-03T07:20:45Z   Normal    SuccessfulCreate         shd-2                          Create Claim data-shd-2-1 Pod shd-2-1 in StatefulSet shd-2 success
+2026-11-03T07:20:45Z   Normal    SuccessfulCreate         shd-2                          Create Pod shd-2-1 in StatefulSet shd-2 successful
+2026-11-03T07:21:16Z   Normal    ClusterForming           shd                            assigned the 16384 slots across 3 shards
+2026-11-03T07:22:58Z   Normal    RollingUpdate            shd                            replacing shd-2-1 to apply the updated pod template (5 more to go)
+2026-11-03T07:22:58Z   Normal    Killing                  shd-2-1                        Stopping container kividb
+2026-11-03T07:22:58Z   Normal    Killing                  shd-2-1                        Stopping container agent
+2026-11-03T07:22:58Z   Normal    SuccessfulCreate         shd-2                          Create Pod shd-2-1 in StatefulSet shd-2 successful
+2026-11-03T07:22:58Z   Normal    Scheduled                shd-2-1                        Successfully assigned e2e/shd-2-1 to aks-nodepool1-63764748-vmss000002
+2026-11-03T07:23:03Z   Normal    Pulled                   shd-2-1                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:23:03Z   Normal    Created                  shd-2-1                        Container created
+2026-11-03T07:23:04Z   Normal    Started                  shd-2-1                        Container started
+2026-11-03T07:23:04Z   Normal    Pulled                   shd-2-1                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:23:04Z   Normal    Created                  shd-2-1                        Container created
+2026-11-03T07:23:04Z   Normal    Started                  shd-2-1                        Container started
+2026-11-03T07:23:15Z   Normal    RollingUpdate            shd                            replacing shd-1-1 to apply the updated pod template (4 more to go)
+2026-11-03T07:23:15Z   Normal    Killing                  shd-1-1                        Stopping container kividb
+2026-11-03T07:23:15Z   Normal    Killing                  shd-1-1                        Stopping container agent
+2026-11-03T07:23:16Z   Normal    SuccessfulCreate         shd-1                          Create Pod shd-1-1 in StatefulSet shd-1 successful
+2026-11-03T07:23:16Z   Normal    Scheduled                shd-1-1                        Successfully assigned e2e/shd-1-1 to aks-nodepool1-63764748-vmss000000
+2026-11-03T07:23:23Z   Normal    Pulled                   shd-1-1                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:23:23Z   Normal    Created                  shd-1-1                        Container created
+2026-11-03T07:23:23Z   Normal    Started                  shd-1-1                        Container started
+2026-11-03T07:23:23Z   Normal    Pulled                   shd-1-1                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:23:24Z   Normal    Created                  shd-1-1                        Container created
+2026-11-03T07:23:24Z   Normal    Started                  shd-1-1                        Container started
+2026-11-03T07:23:34Z   Normal    RollingUpdate            shd                            replacing shd-0-1 to apply the updated pod template (3 more to go)
+2026-11-03T07:23:34Z   Normal    Killing                  shd-0-1                        Stopping container kividb
+2026-11-03T07:23:34Z   Normal    Killing                  shd-0-1                        Stopping container agent
+2026-11-03T07:23:35Z   Normal    SuccessfulCreate         shd-0                          Create Pod shd-0-1 in StatefulSet shd-0 successful
+2026-11-03T07:23:35Z   Normal    Scheduled                shd-0-1                        Successfully assigned e2e/shd-0-1 to aks-nodepool1-63764748-vmss000003
+2026-11-03T07:23:43Z   Normal    Pulled                   shd-0-1                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:23:43Z   Normal    Created                  shd-0-1                        Container created
+2026-11-03T07:23:43Z   Normal    Started                  shd-0-1                        Container started
+2026-11-03T07:23:43Z   Normal    Pulled                   shd-0-1                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:23:43Z   Normal    Created                  shd-0-1                        Container created
+2026-11-03T07:23:43Z   Normal    Started                  shd-0-1                        Container started
+2026-11-03T07:23:54Z   Normal    ShardSwitchover          shd                            shard 2: asked shd-2-1 to take over from shd-2-0 (CLUSTER FAILOVER)
+2026-11-03T07:23:55Z   Normal    RollingUpdate            shd                            replacing shd-2-0 to apply the updated pod template (2 more to go)
+2026-11-03T07:23:55Z   Normal    ShardSwitchover          shd                            shard 2: master moved from shd-2-0 to shd-2-1, as asked
+2026-11-03T07:23:56Z   Normal    Killing                  shd-2-0                        Stopping container kividb
+2026-11-03T07:23:56Z   Normal    Killing                  shd-2-0                        Stopping container agent
+2026-11-03T07:23:57Z   Normal    SuccessfulCreate         shd-2                          Create Pod shd-2-0 in StatefulSet shd-2 successful
+2026-11-03T07:23:57Z   Normal    Scheduled                shd-2-0                        Successfully assigned e2e/shd-2-0 to aks-nodepool1-63764748-vmss000001
+2026-11-03T07:24:03Z   Normal    Pulled                   shd-2-0                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:24:03Z   Normal    Created                  shd-2-0                        Container created
+2026-11-03T07:24:03Z   Normal    Started                  shd-2-0                        Container started
+2026-11-03T07:24:03Z   Normal    Pulled                   shd-2-0                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:24:03Z   Normal    Created                  shd-2-0                        Container created
+2026-11-03T07:24:03Z   Normal    Started                  shd-2-0                        Container started
+2026-11-03T07:24:14Z   Normal    ShardSwitchover          shd                            shard 1: asked shd-1-1 to take over from shd-1-0 (CLUSTER FAILOVER)
+2026-11-03T07:24:15Z   Normal    RollingUpdate            shd                            replacing shd-1-0 to apply the updated pod template (1 more to go)
+2026-11-03T07:24:15Z   Normal    ShardSwitchover          shd                            shard 1: master moved from shd-1-0 to shd-1-1, as asked
+2026-11-03T07:24:16Z   Normal    Killing                  shd-1-0                        Stopping container kividb
+2026-11-03T07:24:16Z   Normal    Killing                  shd-1-0                        Stopping container agent
+2026-11-03T07:24:17Z   Normal    SuccessfulCreate         shd-1                          Create Pod shd-1-0 in StatefulSet shd-1 successful
+2026-11-03T07:24:17Z   Normal    Scheduled                shd-1-0                        Successfully assigned e2e/shd-1-0 to aks-nodepool1-63764748-vmss000003
+2026-11-03T07:24:23Z   Normal    Pulled                   shd-1-0                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:24:24Z   Normal    Created                  shd-1-0                        Container created
+2026-11-03T07:24:24Z   Normal    Started                  shd-1-0                        Container started
+2026-11-03T07:24:24Z   Normal    Pulled                   shd-1-0                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:24:24Z   Normal    Created                  shd-1-0                        Container created
+2026-11-03T07:24:24Z   Normal    Started                  shd-1-0                        Container started
+2026-11-03T07:24:34Z   Normal    ShardSwitchover          shd                            shard 0: asked shd-0-1 to take over from shd-0-0 (CLUSTER FAILOVER)
+2026-11-03T07:24:35Z   Normal    RollingUpdate            shd                            replacing shd-0-0 to apply the updated pod template (0 more to go)
+2026-11-03T07:24:35Z   Normal    ShardSwitchover          shd                            shard 0: master moved from shd-0-0 to shd-0-1, as asked
+2026-11-03T07:24:35Z   Normal    Killing                  shd-0-0                        Stopping container kividb
+2026-11-03T07:24:35Z   Normal    Killing                  shd-0-0                        Stopping container agent
+2026-11-03T07:24:36Z   Normal    SuccessfulCreate         shd-0                          Create Pod shd-0-0 in StatefulSet shd-0 successful
+2026-11-03T07:24:36Z   Normal    Scheduled                shd-0-0                        Successfully assigned e2e/shd-0-0 to aks-nodepool1-63764748-vmss000002
+2026-11-03T07:24:46Z   Normal    Pulled                   shd-0-0                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:24:46Z   Normal    Created                  shd-0-0                        Container created
+2026-11-03T07:24:46Z   Normal    Started                  shd-0-0                        Container started
+2026-11-03T07:24:46Z   Normal    Pulled                   shd-0-0                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:24:46Z   Normal    Created                  shd-0-0                        Container created
+2026-11-03T07:24:46Z   Normal    Started                  shd-0-0                        Container started
+2026-11-03T07:25:57Z   Normal    Killing                  shd-0-0                        Stopping container kividb
+2026-11-03T07:25:57Z   Normal    Killing                  shd-0-0                        Stopping container agent
+2026-11-03T07:25:58Z   Normal    SuccessfulCreate         shd-0                          Create Pod shd-0-0 in StatefulSet shd-0 successful
+2026-11-03T07:25:58Z   Normal    Scheduled                shd-0-0                        Successfully assigned e2e/shd-0-0 to aks-nodepool1-63764748-vmss000002
+2026-11-03T07:26:07Z   Normal    Pulled                   shd-0-0                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:26:07Z   Normal    Created                  shd-0-0                        Container created
+2026-11-03T07:26:07Z   Normal    Started                  shd-0-0                        Container started
+2026-11-03T07:26:07Z   Normal    Pulled                   shd-0-0                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:26:07Z   Normal    Created                  shd-0-0                        Container created
+2026-11-03T07:26:07Z   Normal    Started                  shd-0-0                        Container started
+2026-11-03T07:26:22Z   Normal    Killing                  shd-1-0                        Stopping container kividb
+2026-11-03T07:26:22Z   Normal    Killing                  shd-1-0                        Stopping container agent
+2026-11-03T07:26:23Z   Normal    SuccessfulCreate         shd-1                          Create Pod shd-1-0 in StatefulSet shd-1 successful
+2026-11-03T07:26:23Z   Normal    Scheduled                shd-1-0                        Successfully assigned e2e/shd-1-0 to aks-nodepool1-63764748-vmss000003
+2026-11-03T07:26:26Z   Normal    Pulled                   shd-1-0                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:26:26Z   Normal    Created                  shd-1-0                        Container created
+2026-11-03T07:26:26Z   Normal    Started                  shd-1-0                        Container started
+2026-11-03T07:26:26Z   Normal    Pulled                   shd-1-0                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:26:26Z   Normal    Created                  shd-1-0                        Container created
+2026-11-03T07:26:26Z   Normal    Started                  shd-1-0                        Container started
+2026-11-03T07:26:37Z   Normal    Killing                  shd-2-0                        Stopping container kividb
+2026-11-03T07:26:37Z   Normal    Killing                  shd-2-0                        Stopping container agent
+2026-11-03T07:26:38Z   Normal    SuccessfulCreate         shd-2                          Create Pod shd-2-0 in StatefulSet shd-2 successful
+2026-11-03T07:26:38Z   Normal    Scheduled                shd-2-0                        Successfully assigned e2e/shd-2-0 to aks-nodepool1-63764748-vmss000001
+2026-11-03T07:26:46Z   Normal    Pulled                   shd-2-0                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:26:46Z   Normal    Created                  shd-2-0                        Container created
+2026-11-03T07:26:46Z   Normal    Started                  shd-2-0                        Container started
+2026-11-03T07:26:46Z   Normal    Pulled                   shd-2-0                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:26:46Z   Normal    Created                  shd-2-0                        Container created
+2026-11-03T07:26:46Z   Normal    Started                  shd-2-0                        Container started
+2026-11-03T07:26:58Z   Normal    ShardSwitchover          shd                            shard 0: asked shd-0-0 to take over from shd-0-1 (CLUSTER FAILOVER)
+2026-11-03T07:26:59Z   Normal    ShardSwitchover          shd                            shard 0: master moved from shd-0-1 to shd-0-0, as asked
+2026-11-03T07:27:02Z   Normal    Killing                  shd-0-1                        Stopping container kividb
+2026-11-03T07:27:02Z   Normal    Killing                  shd-0-1                        Stopping container agent
+2026-11-03T07:27:03Z   Normal    SuccessfulCreate         shd-0                          Create Pod shd-0-1 in StatefulSet shd-0 successful
+2026-11-03T07:27:03Z   Normal    Scheduled                shd-0-1                        Successfully assigned e2e/shd-0-1 to aks-nodepool1-63764748-vmss000003
+2026-11-03T07:27:07Z   Normal    Pulled                   shd-0-1                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:27:07Z   Normal    Created                  shd-0-1                        Container created
+2026-11-03T07:27:07Z   Normal    Started                  shd-0-1                        Container started
+2026-11-03T07:27:07Z   Normal    Pulled                   shd-0-1                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:27:07Z   Normal    Created                  shd-0-1                        Container created
+2026-11-03T07:27:07Z   Normal    Started                  shd-0-1                        Container started
+2026-11-03T07:27:23Z   Normal    ShardSwitchover          shd                            shard 1: asked shd-1-0 to take over from shd-1-1 (CLUSTER FAILOVER)
+2026-11-03T07:27:24Z   Normal    ShardSwitchover          shd                            (combined from similar events): shard 1: master moved from shd-1-1 to shd-1-0, as asked
+2026-11-03T07:27:24Z   Normal    ShardSwitchover          shd                            (combined from similar events): shard 1: master moved from shd-1-1 to shd-1-0, as asked
+2026-11-03T07:27:27Z   Normal    Killing                  shd-1-1                        Stopping container kividb
+2026-11-03T07:27:27Z   Normal    Killing                  shd-1-1                        Stopping container agent
+2026-11-03T07:27:27Z   Normal    SuccessfulCreate         shd-1                          Create Pod shd-1-1 in StatefulSet shd-1 successful
+2026-11-03T07:27:27Z   Normal    Scheduled                shd-1-1                        Successfully assigned e2e/shd-1-1 to aks-nodepool1-63764748-vmss000000
+2026-11-03T07:27:28Z   Normal    Pulled                   shd-1-1                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:27:28Z   Normal    Created                  shd-1-1                        Container created
+2026-11-03T07:27:28Z   Normal    Started                  shd-1-1                        Container started
+2026-11-03T07:27:28Z   Normal    Pulled                   shd-1-1                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:27:28Z   Normal    Created                  shd-1-1                        Container created
+2026-11-03T07:27:28Z   Normal    Started                  shd-1-1                        Container started
+2026-11-03T07:27:43Z   Normal    ShardSwitchover          shd                            (combined from similar events): shard 2: asked shd-2-0 to take over from shd-2-1 (CLUSTER FAILOVER)
+2026-11-03T07:27:43Z   Normal    ShardSwitchover          shd                            (combined from similar events): shard 2: asked shd-2-0 to take over from shd-2-1 (CLUSTER FAILOVER)
+2026-11-03T07:27:44Z   Normal    ShardSwitchover          shd                            (combined from similar events): shard 2: master moved from shd-2-1 to shd-2-0, as asked
+2026-11-03T07:27:44Z   Normal    ShardSwitchover          shd                            (combined from similar events): shard 2: master moved from shd-2-1 to shd-2-0, as asked
+2026-11-03T07:27:47Z   Normal    Killing                  shd-2-1                        Stopping container kividb
+2026-11-03T07:27:47Z   Normal    Killing                  shd-2-1                        Stopping container agent
+2026-11-03T07:27:48Z   Normal    SuccessfulCreate         shd-2                          Create Pod shd-2-1 in StatefulSet shd-2 successful
+2026-11-03T07:27:48Z   Normal    Scheduled                shd-2-1                        Successfully assigned e2e/shd-2-1 to aks-nodepool1-63764748-vmss000002
+2026-11-03T07:27:59Z   Normal    Pulled                   shd-2-1                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:27:59Z   Normal    Created                  shd-2-1                        Container created
+2026-11-03T07:27:59Z   Normal    Started                  shd-2-1                        Container started
+2026-11-03T07:27:59Z   Normal    Pulled                   shd-2-1                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:27:59Z   Normal    Created                  shd-2-1                        Container created
+2026-11-03T07:27:59Z   Normal    Started                  shd-2-1                        Container started
+2026-11-03T07:29:11Z   Warning   ShardFailover            shd                            shard 0: master moved from shd-0-0 to shd-0-1
+2026-11-03T07:29:36Z   Warning   ShardFailover            shd                            shard 1: master moved from shd-1-0 to shd-1-1
+2026-11-03T07:30:01Z   Warning   ShardFailover            shd                            shard 2: master moved from shd-2-0 to shd-2-1
+2026-11-03T07:31:40Z   Normal    Killing                  shd-0-1                        Stopping container kividb
+2026-11-03T07:31:40Z   Normal    Killing                  shd-0-1                        Stopping container agent
+2026-11-03T07:31:40Z   Normal    ShardSwitchover          shd                            shard 0: asked shd-0-0 to take over from shd-0-1 (CLUSTER FAILOVER)
+2026-11-03T07:31:41Z   Normal    ShardSwitchover          shd                            shard 0: master moved from shd-0-1 to shd-0-0, as asked
+2026-11-03T07:31:41Z   Normal    ShardSwitchover          shd                            (combined from similar events): shard 0: master moved from shd-0-1 to shd-0-0, as asked
+2026-11-03T07:31:42Z   Normal    SuccessfulCreate         shd-0                          Create Pod shd-0-1 in StatefulSet shd-0 successful
+2026-11-03T07:31:42Z   Normal    Scheduled                shd-0-1                        Successfully assigned e2e/shd-0-1 to aks-nodepool1-63764748-vmss000003
+2026-11-03T07:31:43Z   Normal    Pulled                   shd-0-1                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:31:43Z   Normal    Created                  shd-0-1                        Container created
+2026-11-03T07:31:43Z   Normal    Started                  shd-0-1                        Container started
+2026-11-03T07:31:43Z   Normal    Pulled                   shd-0-1                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:31:43Z   Normal    Created                  shd-0-1                        Container created
+2026-11-03T07:31:43Z   Normal    Started                  shd-0-1                        Container started
+2026-11-03T07:34:03Z   Normal    Killing                  shd-1-1                        Stopping container kividb
+2026-11-03T07:34:03Z   Normal    Killing                  shd-1-1                        Stopping container agent
+2026-11-03T07:34:03Z   Normal    ShardSwitchover          shd                            (combined from similar events): shard 1: asked shd-1-0 to take over from shd-1-1 (CLUSTER FAILOVER)
+2026-11-03T07:34:03Z   Normal    ShardSwitchover          shd                            shard 1: asked shd-1-0 to take over from shd-1-1 (CLUSTER FAILOVER)
+2026-11-03T07:34:04Z   Normal    ShardSwitchover          shd                            shard 1: master moved from shd-1-1 to shd-1-0, as asked
+2026-11-03T07:34:05Z   Normal    SuccessfulCreate         shd-1                          Create Pod shd-1-1 in StatefulSet shd-1 successful
+2026-11-03T07:34:05Z   Normal    Scheduled                shd-1-1                        Successfully assigned e2e/shd-1-1 to aks-nodepool1-63764748-vmss000000
+2026-11-03T07:34:07Z   Normal    Pulled                   shd-1-1                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:34:07Z   Normal    Created                  shd-1-1                        Container created
+2026-11-03T07:34:07Z   Normal    Started                  shd-1-1                        Container started
+2026-11-03T07:34:07Z   Normal    Pulled                   shd-1-1                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:34:07Z   Normal    Created                  shd-1-1                        Container created
+2026-11-03T07:34:07Z   Normal    Started                  shd-1-1                        Container started
+2026-11-03T07:37:03Z   Normal    Killing                  shd-0-0                        Stopping container kividb
+2026-11-03T07:37:03Z   Normal    Killing                  shd-0-0                        Stopping container agent
+2026-11-03T07:37:03Z   Normal    SuccessfulCreate         shd-0                          Create Pod shd-0-0 in StatefulSet shd-0 successful
+2026-11-03T07:37:03Z   Normal    Scheduled                shd-0-0                        Successfully assigned e2e/shd-0-0 to aks-nodepool1-63764748-vmss000002
+2026-11-03T07:37:03Z   Normal    Pulled                   shd-0-0                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:37:03Z   Normal    Created                  shd-0-0                        Container created
+2026-11-03T07:37:03Z   Normal    Started                  shd-0-0                        Container started
+2026-11-03T07:37:03Z   Normal    Pulled                   shd-0-0                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:37:03Z   Normal    Created                  shd-0-0                        Container created
+2026-11-03T07:37:03Z   Normal    Started                  shd-0-0                        Container started
+2026-11-03T07:39:36Z   Warning   FailedPreStopHook        shd-0-0                        PreStopHook failed
+2026-11-03T07:39:36Z   Warning   FailedPreStopHook        shd-0-0                        PreStopHook failed
+2026-11-03T07:40:03Z   Normal    Killing                  shd-1-0                        Stopping container kividb
+2026-11-03T07:40:03Z   Normal    Killing                  shd-1-0                        Stopping container agent
+2026-11-03T07:40:03Z   Normal    SuccessfulCreate         shd-1                          Create Pod shd-1-0 in StatefulSet shd-1 successful
+2026-11-03T07:40:03Z   Normal    Scheduled                shd-1-0                        Successfully assigned e2e/shd-1-0 to aks-nodepool1-63764748-vmss000003
+2026-11-03T07:40:03Z   Normal    Pulled                   shd-1-0                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:40:03Z   Normal    Created                  shd-1-0                        Container created
+2026-11-03T07:40:03Z   Normal    Started                  shd-1-0                        Container started
+2026-11-03T07:40:03Z   Normal    Pulled                   shd-1-0                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:40:03Z   Normal    Created                  shd-1-0                        Container created
+2026-11-03T07:40:03Z   Normal    Started                  shd-1-0                        Container started
+2026-11-03T07:42:36Z   Warning   FailedPreStopHook        shd-1-0                        PreStopHook failed
+2026-11-03T07:42:36Z   Warning   FailedPreStopHook        shd-1-0                        PreStopHook failed
+2026-11-03T07:43:03Z   Normal    Killing                  shd-2-1                        Stopping container kividb
+2026-11-03T07:43:03Z   Normal    Killing                  shd-2-1                        Stopping container agent
+2026-11-03T07:43:03Z   Normal    SuccessfulCreate         shd-2                          Create Pod shd-2-1 in StatefulSet shd-2 successful
+2026-11-03T07:43:03Z   Normal    Scheduled                shd-2-1                        Successfully assigned e2e/shd-2-1 to aks-nodepool1-63764748-vmss000002
+2026-11-03T07:43:03Z   Normal    Pulled                   shd-2-1                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:43:03Z   Normal    Created                  shd-2-1                        Container created
+2026-11-03T07:43:03Z   Normal    Started                  shd-2-1                        Container started
+2026-11-03T07:43:03Z   Normal    Pulled                   shd-2-1                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:43:03Z   Normal    Created                  shd-2-1                        Container created
+2026-11-03T07:43:03Z   Normal    Started                  shd-2-1                        Container started
+2026-11-03T07:45:12Z   Normal    Pulled                   shd-0-0                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:45:12Z   Normal    Created                  shd-0-0                        Container created
+2026-11-03T07:45:12Z   Normal    Started                  shd-0-0                        Container started
+2026-11-03T07:45:36Z   Warning   FailedPreStopHook        shd-2-1                        PreStopHook failed
+2026-11-03T07:45:36Z   Warning   FailedPreStopHook        shd-2-1                        PreStopHook failed
+2026-11-03T07:46:35Z   Normal    RebalanceStarted         shd                            changing from 3 to 4 shards
+2026-11-03T07:46:35Z   Normal    NoPods                   shd-3                          No matching pods found
+2026-11-03T07:46:35Z   Normal    NoPods                   shd-3                          No matching pods found
+2026-11-03T07:46:35Z   Normal    SuccessfulCreate         shd-3                          Create Claim data-shd-3-0 Pod shd-3-0 in StatefulSet shd-3 success
+2026-11-03T07:46:35Z   Normal    WaitForFirstConsumer     data-shd-3-0                   waiting for first consumer to be created before binding
+2026-11-03T07:46:35Z   Normal    WaitForFirstConsumer     data-shd-3-0                   waiting for first consumer to be created before binding
+2026-11-03T07:46:35Z   Normal    SuccessfulCreate         shd-3                          Create Pod shd-3-0 in StatefulSet shd-3 successful
+2026-11-03T07:46:35Z   Normal    WaitForFirstConsumer     data-shd-3-1                   waiting for first consumer to be created before binding
+2026-11-03T07:46:35Z   Normal    SuccessfulCreate         shd-3                          Create Claim data-shd-3-1 Pod shd-3-1 in StatefulSet shd-3 success
+2026-11-03T07:46:35Z   Normal    Provisioning             data-shd-3-0                   External provisioner is provisioning volume for claim "e2e/data-shd-3-0"
+2026-11-03T07:46:35Z   Normal    ExternalProvisioning     data-shd-3-0                   Waiting for a volume to be created either by the external provisioner 'disk.csi.azure.com' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-11-03T07:46:35Z   Normal    SuccessfulCreate         shd-3                          Create Pod shd-3-1 in StatefulSet shd-3 successful
+2026-11-03T07:46:35Z   Normal    Provisioning             data-shd-3-1                   External provisioner is provisioning volume for claim "e2e/data-shd-3-1"
+2026-11-03T07:46:35Z   Normal    ExternalProvisioning     data-shd-3-1                   Waiting for a volume to be created either by the external provisioner 'disk.csi.azure.com' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-11-03T07:46:37Z   Normal    ProvisioningSucceeded    data-shd-3-0                   Successfully provisioned volume pvc-f87a5fd3-fec2-464c-b4ed-901c6d4f636b
+2026-11-03T07:46:37Z   Normal    ProvisioningSucceeded    data-shd-3-1                   Successfully provisioned volume pvc-92305080-ec07-4159-b4ab-37dc4e838096
+2026-11-03T07:46:37Z   Normal    Scheduled                shd-3-0                        Successfully assigned e2e/shd-3-0 to aks-nodepool1-63764748-vmss000001
+2026-11-03T07:46:37Z   Normal    Scheduled                shd-3-1                        Successfully assigned e2e/shd-3-1 to aks-nodepool1-63764748-vmss000000
+2026-11-03T07:46:47Z   Normal    SuccessfulAttachVolume   shd-3-0                        AttachVolume.Attach succeeded for volume "pvc-f87a5fd3-fec2-464c-b4ed-901c6d4f636b" 
+2026-11-03T07:46:47Z   Normal    SuccessfulAttachVolume   shd-3-1                        AttachVolume.Attach succeeded for volume "pvc-92305080-ec07-4159-b4ab-37dc4e838096" 
+2026-11-03T07:46:48Z   Normal    Pulled                   shd-3-0                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:46:48Z   Normal    Created                  shd-3-0                        Container created
+2026-11-03T07:46:48Z   Normal    Pulled                   shd-3-1                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:46:48Z   Normal    Started                  shd-3-0                        Container started
+2026-11-03T07:46:48Z   Normal    Pulled                   shd-3-0                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:46:48Z   Normal    Created                  shd-3-1                        Container created
+2026-11-03T07:46:48Z   Normal    Created                  shd-3-0                        Container created
+2026-11-03T07:46:48Z   Normal    Started                  shd-3-1                        Container started
+2026-11-03T07:46:48Z   Normal    Pulled                   shd-3-1                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:46:48Z   Normal    Started                  shd-3-0                        Container started
+2026-11-03T07:46:48Z   Normal    Created                  shd-3-1                        Container created
+2026-11-03T07:46:48Z   Normal    Started                  shd-3-1                        Container started
+2026-11-03T07:47:00Z   Normal    MovingSlots              shd                            moving 1366 slots (4096-5461) from shard 0 to shard 3
+2026-11-03T07:47:02Z   Normal    SlotsMoved               shd                            moved 1366 slots from shard 0 to shard 3
+2026-11-03T07:47:02Z   Normal    MovingSlots              shd                            moving 1365 slots (9558-10922) from shard 1 to shard 3
+2026-11-03T07:47:03Z   Normal    SlotsMoved               shd                            moved 1365 slots from shard 1 to shard 3
+2026-11-03T07:47:03Z   Normal    MovingSlots              shd                            moving 1365 slots (15019-16383) from shard 2 to shard 3
+2026-11-03T07:47:04Z   Normal    SlotsMoved               shd                            moved 1365 slots from shard 2 to shard 3
+2026-11-03T07:47:04Z   Normal    RebalanceCompleted       shd                            4 shards, 3 slot moves
+2026-11-03T07:48:20Z   Normal    RebalanceStarted         shd                            changing from 4 to 3 shards
+2026-11-03T07:48:20Z   Normal    MovingSlots              shd                            moving 1366 slots (4096-5461) from shard 3 to shard 0
+2026-11-03T07:48:21Z   Normal    SlotsMoved               shd                            moved 1366 slots from shard 3 to shard 0
+2026-11-03T07:48:21Z   Normal    MovingSlots              shd                            moving 1365 slots (9558-10922) from shard 3 to shard 1
+2026-11-03T07:48:22Z   Normal    SlotsMoved               shd                            moved 1365 slots from shard 3 to shard 1
+2026-11-03T07:48:22Z   Normal    MovingSlots              shd                            moving 1365 slots (15019-16383) from shard 3 to shard 2
+2026-11-03T07:48:23Z   Normal    SlotsMoved               shd                            moved 1365 slots from shard 3 to shard 2
+2026-11-03T07:48:23Z   Normal    Killing                  shd-3-0                        Stopping container kividb
+2026-11-03T07:48:23Z   Normal    Killing                  shd-3-0                        Stopping container agent
+2026-11-03T07:48:23Z   Normal    Killing                  shd-3-1                        Stopping container kividb
+2026-11-03T07:48:23Z   Normal    Killing                  shd-3-1                        Stopping container agent
+2026-11-03T07:48:23Z   Normal    ShardsRemoved            shd                            removed shards 3 to 3, and their volumes
+2026-11-03T07:48:23Z   Normal    RebalanceCompleted       shd                            3 shards, 3 slot moves
+2026-11-03T07:49:55Z   Normal    Killing                  g-yes-1                        Stopping container kividb
+2026-11-03T07:49:55Z   Normal    Killing                  g-yes-1                        Stopping container agent
+2026-11-03T07:49:55Z   Normal    SuccessfulCreate         g-yes                          Create Pod g-yes-1 in StatefulSet g-yes successful
+2026-11-03T07:49:55Z   Normal    Scheduled                g-yes-1                        Successfully assigned e2e/g-yes-1 to aks-nodepool1-63764748-vmss000003
+2026-11-03T07:49:55Z   Warning   FailedAttachVolume       g-yes-1                        Waiting for detach for volume "pvc-018beb62-66a9-40b7-b57b-ea018f895b86" Volume is already exclusively attached to one node, waiting on detach before it can be attached to another node
+2026-11-03T07:50:21Z   Normal    SuccessfulAttachVolume   g-yes-1                        AttachVolume.Attach succeeded for volume "pvc-018beb62-66a9-40b7-b57b-ea018f895b86" 
+2026-11-03T07:50:22Z   Normal    Pulled                   g-yes-1                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:50:22Z   Normal    Created                  g-yes-1                        Container created
+2026-11-03T07:50:22Z   Normal    Started                  g-yes-1                        Container started
+2026-11-03T07:50:22Z   Normal    Pulled                   g-yes-1                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:50:22Z   Normal    Created                  g-yes-1                        Container created
+2026-11-03T07:50:22Z   Normal    Started                  g-yes-1                        Container started
+2026-11-03T07:53:53Z   Normal    Killing                  g-no-0                         Stopping container kividb
+2026-11-03T07:53:53Z   Normal    Killing                  g-no-0                         Stopping container agent
+2026-11-03T07:53:53Z   Normal    SuccessfulCreate         g-no                           Create Pod g-no-0 in StatefulSet g-no successful
+2026-11-03T07:53:53Z   Normal    Scheduled                g-no-0                         Successfully assigned e2e/g-no-0 to aks-nodepool1-63764748-vmss000001
+2026-11-03T07:53:53Z   Warning   FailedAttachVolume       g-no-0                         Waiting for detach for volume "pvc-e904dd71-16ed-4c31-9fa3-6f4894747d9d" Volume is already exclusively attached to one node, waiting on detach before it can be attached to another node
+2026-11-03T07:54:20Z   Normal    SuccessfulAttachVolume   g-no-0                         AttachVolume.Attach succeeded for volume "pvc-e904dd71-16ed-4c31-9fa3-6f4894747d9d" 
+2026-11-03T07:54:20Z   Normal    Pulled                   g-no-0                         Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:54:21Z   Normal    Created                  g-no-0                         Container created
+2026-11-03T07:54:21Z   Normal    Started                  g-no-0                         Container started
+2026-11-03T07:54:21Z   Normal    Pulled                   g-no-0                         Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:54:21Z   Normal    Created                  g-no-0                         Container created
+2026-11-03T07:54:21Z   Normal    Started                  g-no-0                         Container started
+2026-11-03T07:54:54Z   Warning   MasterRestartedBehind    g-no                           g-no-0 restarted and came back as the master at replication offset 0, behind the 30927443 it had reached and behind g-no-1 (offset 30995297), which holds writes it lost; failing over rather than resyncing the replicas from its older data
+2026-11-03T07:54:54Z   Warning   Failover                 g-no                           master g-no-0 restarted behind its replicas; promoted g-no-1
+2026-11-03T07:19:50Z   Warning   FailedScheduling         cli                            0/4 nodes are available: 4 node(s) didn't match Pod's node affinity/selector. no new claims to deallocate, preemption: 0/4 nodes are available: 4 Preemption is not helpful for scheduling.
+2026-11-03T07:19:51Z   Normal    Scheduled                cli                            Successfully assigned e2e/cli to aks-nodepool1-63764748-vmss000000
+2026-11-03T07:19:52Z   Normal    Pulling                  cli                            Pulling image "redis:8"
+2026-11-03T07:19:57Z   Normal    Pulled                   cli                            Successfully pulled image "redis:8" in 5.715s (5.715s including waiting). Image size: 55617836 bytes.
+2026-11-03T07:19:57Z   Normal    Created                  cli                            Container created
+2026-11-03T07:19:58Z   Normal    Started                  cli                            Container started
+2026-11-03T07:19:50Z   Warning   FailedScheduling         curl                           0/4 nodes are available: 4 node(s) didn't match Pod's node affinity/selector. no new claims to deallocate, preemption: 0/4 nodes are available: 4 Preemption is not helpful for scheduling.
+2026-11-03T07:19:51Z   Normal    Scheduled                curl                           Successfully assigned e2e/curl to aks-nodepool1-63764748-vmss000000
+2026-11-03T07:19:52Z   Normal    Pulling                  curl                           Pulling image "curlimages/curl:8.11.1"
+2026-11-03T07:19:56Z   Normal    Pulled                   curl                           Successfully pulled image "curlimages/curl:8.11.1" in 4.299s (4.299s including waiting). Image size: 9560620 bytes.
+2026-11-03T07:19:56Z   Normal    Created                  curl                           Container created
+2026-11-03T07:19:56Z   Normal    Started                  curl                           Container started
+2026-11-03T07:20:46Z   Normal    WaitForFirstConsumer     data-g-no-0                    waiting for first consumer to be created before binding
+2026-11-03T07:20:46Z   Normal    Provisioning             data-g-no-0                    External provisioner is provisioning volume for claim "e2e/data-g-no-0"
+2026-11-03T07:20:46Z   Normal    ExternalProvisioning     data-g-no-0                    Waiting for a volume to be created either by the external provisioner 'disk.csi.azure.com' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-11-03T07:20:46Z   Normal    ProvisioningSucceeded    data-g-no-0                    Successfully provisioned volume pvc-e904dd71-16ed-4c31-9fa3-6f4894747d9d
+2026-11-03T07:20:46Z   Normal    WaitForFirstConsumer     data-g-no-1                    waiting for first consumer to be created before binding
+2026-11-03T07:20:46Z   Normal    Provisioning             data-g-no-1                    External provisioner is provisioning volume for claim "e2e/data-g-no-1"
+2026-11-03T07:20:46Z   Normal    ExternalProvisioning     data-g-no-1                    Waiting for a volume to be created either by the external provisioner 'disk.csi.azure.com' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-11-03T07:20:47Z   Normal    ProvisioningSucceeded    data-g-no-1                    Successfully provisioned volume pvc-2f8853b2-570b-42be-ba70-228485feab30
+2026-11-03T07:20:45Z   Normal    WaitForFirstConsumer     data-g-yes-0                   waiting for first consumer to be created before binding
+2026-11-03T07:20:45Z   Normal    Provisioning             data-g-yes-0                   External provisioner is provisioning volume for claim "e2e/data-g-yes-0"
+2026-11-03T07:20:50Z   Normal    ExternalProvisioning     data-g-yes-0                   Waiting for a volume to be created either by the external provisioner 'disk.csi.azure.com' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-11-03T07:20:56Z   Normal    ProvisioningSucceeded    data-g-yes-0                   Successfully provisioned volume pvc-0bc259ae-160c-46b6-b48f-da515d814813
+2026-11-03T07:20:45Z   Normal    WaitForFirstConsumer     data-g-yes-1                   waiting for first consumer to be created before binding
+2026-11-03T07:20:45Z   Normal    Provisioning             data-g-yes-1                   External provisioner is provisioning volume for claim "e2e/data-g-yes-1"
+2026-11-03T07:20:45Z   Normal    ExternalProvisioning     data-g-yes-1                   Waiting for a volume to be created either by the external provisioner 'disk.csi.azure.com' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-11-03T07:20:48Z   Normal    ProvisioningSucceeded    data-g-yes-1                   Successfully provisioned volume pvc-018beb62-66a9-40b7-b57b-ea018f895b86
+2026-11-03T07:20:45Z   Normal    WaitForFirstConsumer     data-shd-0-0                   waiting for first consumer to be created before binding
+2026-11-03T07:20:45Z   Normal    Provisioning             data-shd-0-0                   External provisioner is provisioning volume for claim "e2e/data-shd-0-0"
+2026-11-03T07:20:50Z   Normal    ExternalProvisioning     data-shd-0-0                   Waiting for a volume to be created either by the external provisioner 'disk.csi.azure.com' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-11-03T07:20:56Z   Normal    ProvisioningSucceeded    data-shd-0-0                   Successfully provisioned volume pvc-43dcfe60-e043-4e07-845c-44de050336ff
+2026-11-03T07:20:45Z   Normal    WaitForFirstConsumer     data-shd-0-1                   waiting for first consumer to be created before binding
+2026-11-03T07:20:45Z   Normal    Provisioning             data-shd-0-1                   External provisioner is provisioning volume for claim "e2e/data-shd-0-1"
+2026-11-03T07:20:45Z   Normal    ExternalProvisioning     data-shd-0-1                   Waiting for a volume to be created either by the external provisioner 'disk.csi.azure.com' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-11-03T07:20:46Z   Normal    ProvisioningSucceeded    data-shd-0-1                   Successfully provisioned volume pvc-44d93fd6-d819-487c-9ad5-4bfc84a66d4e
+2026-11-03T07:20:45Z   Normal    WaitForFirstConsumer     data-shd-1-0                   waiting for first consumer to be created before binding
+2026-11-03T07:20:45Z   Normal    Provisioning             data-shd-1-0                   External provisioner is provisioning volume for claim "e2e/data-shd-1-0"
+2026-11-03T07:20:45Z   Normal    ExternalProvisioning     data-shd-1-0                   Waiting for a volume to be created either by the external provisioner 'disk.csi.azure.com' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-11-03T07:20:46Z   Normal    ProvisioningSucceeded    data-shd-1-0                   Successfully provisioned volume pvc-91699fee-a2b3-4640-9541-accd0f79ef55
+2026-11-03T07:20:45Z   Normal    WaitForFirstConsumer     data-shd-1-1                   waiting for first consumer to be created before binding
+2026-11-03T07:20:45Z   Normal    Provisioning             data-shd-1-1                   External provisioner is provisioning volume for claim "e2e/data-shd-1-1"
+2026-11-03T07:20:45Z   Normal    ExternalProvisioning     data-shd-1-1                   Waiting for a volume to be created either by the external provisioner 'disk.csi.azure.com' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-11-03T07:20:46Z   Normal    ProvisioningSucceeded    data-shd-1-1                   Successfully provisioned volume pvc-baa6d3a5-c30e-447b-b4f1-fe6d34f08deb
+2026-11-03T07:20:45Z   Normal    WaitForFirstConsumer     data-shd-2-0                   waiting for first consumer to be created before binding
+2026-11-03T07:20:45Z   Normal    Provisioning             data-shd-2-0                   External provisioner is provisioning volume for claim "e2e/data-shd-2-0"
+2026-11-03T07:20:50Z   Normal    ExternalProvisioning     data-shd-2-0                   Waiting for a volume to be created either by the external provisioner 'disk.csi.azure.com' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-11-03T07:20:51Z   Normal    ProvisioningSucceeded    data-shd-2-0                   Successfully provisioned volume pvc-22a8ab0b-85e1-475d-8fe9-1adc13b6c89f
+2026-11-03T07:20:45Z   Normal    WaitForFirstConsumer     data-shd-2-1                   waiting for first consumer to be created before binding
+2026-11-03T07:20:45Z   Normal    Provisioning             data-shd-2-1                   External provisioner is provisioning volume for claim "e2e/data-shd-2-1"
+2026-11-03T07:20:45Z   Normal    ExternalProvisioning     data-shd-2-1                   Waiting for a volume to be created either by the external provisioner 'disk.csi.azure.com' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-11-03T07:20:46Z   Normal    ProvisioningSucceeded    data-shd-2-1                   Successfully provisioned volume pvc-189c3fb1-ad36-4302-9739-8baa227f7af0
+2026-11-03T07:46:35Z   Normal    WaitForFirstConsumer     data-shd-3-0                   waiting for first consumer to be created before binding
+2026-11-03T07:46:35Z   Normal    Provisioning             data-shd-3-0                   External provisioner is provisioning volume for claim "e2e/data-shd-3-0"
+2026-11-03T07:46:35Z   Normal    ExternalProvisioning     data-shd-3-0                   Waiting for a volume to be created either by the external provisioner 'disk.csi.azure.com' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-11-03T07:46:37Z   Normal    ProvisioningSucceeded    data-shd-3-0                   Successfully provisioned volume pvc-f87a5fd3-fec2-464c-b4ed-901c6d4f636b
+2026-11-03T07:46:35Z   Normal    WaitForFirstConsumer     data-shd-3-1                   waiting for first consumer to be created before binding
+2026-11-03T07:46:35Z   Normal    Provisioning             data-shd-3-1                   External provisioner is provisioning volume for claim "e2e/data-shd-3-1"
+2026-11-03T07:46:35Z   Normal    ExternalProvisioning     data-shd-3-1                   Waiting for a volume to be created either by the external provisioner 'disk.csi.azure.com' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-11-03T07:46:37Z   Normal    ProvisioningSucceeded    data-shd-3-1                   Successfully provisioned volume pvc-92305080-ec07-4159-b4ab-37dc4e838096
+2026-11-03T07:20:47Z   Normal    Scheduled                g-no-0                         Successfully assigned e2e/g-no-0 to aks-nodepool1-63764748-vmss000003
+2026-11-03T07:20:53Z   Normal    SuccessfulAttachVolume   g-no-0                         AttachVolume.Attach succeeded for volume "pvc-e904dd71-16ed-4c31-9fa3-6f4894747d9d" 
+2026-11-03T07:20:55Z   Normal    Pulling                  g-no-0                         Pulling image "<acr>.azurecr.io/kividb:1.2.0-rc9"
+2026-11-03T07:20:56Z   Normal    Pulled                   g-no-0                         Successfully pulled image "<acr>.azurecr.io/kividb:1.2.0-rc9" in 1.148s (1.148s including waiting). Image size: 12282233 bytes.
+2026-11-03T07:20:56Z   Normal    Created                  g-no-0                         Container created
+2026-11-03T07:20:56Z   Normal    Started                  g-no-0                         Container started
+2026-11-03T07:20:56Z   Normal    Pulling                  g-no-0                         Pulling image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e"
+2026-11-03T07:20:57Z   Normal    Pulled                   g-no-0                         Successfully pulled image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" in 696ms (696ms including waiting). Image size: 7952869 bytes.
+2026-11-03T07:20:57Z   Normal    Created                  g-no-0                         Container created
+2026-11-03T07:20:57Z   Normal    Started                  g-no-0                         Container started
+2026-11-03T07:53:53Z   Normal    Killing                  g-no-0                         Stopping container kividb
+2026-11-03T07:53:53Z   Normal    Killing                  g-no-0                         Stopping container agent
+2026-11-03T07:53:53Z   Normal    Scheduled                g-no-0                         Successfully assigned e2e/g-no-0 to aks-nodepool1-63764748-vmss000001
+2026-11-03T07:53:53Z   Warning   FailedAttachVolume       g-no-0                         Waiting for detach for volume "pvc-e904dd71-16ed-4c31-9fa3-6f4894747d9d" Volume is already exclusively attached to one node, waiting on detach before it can be attached to another node
+2026-11-03T07:54:20Z   Normal    SuccessfulAttachVolume   g-no-0                         AttachVolume.Attach succeeded for volume "pvc-e904dd71-16ed-4c31-9fa3-6f4894747d9d" 
+2026-11-03T07:54:20Z   Normal    Pulled                   g-no-0                         Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:54:21Z   Normal    Created                  g-no-0                         Container created
+2026-11-03T07:54:21Z   Normal    Started                  g-no-0                         Container started
+2026-11-03T07:54:21Z   Normal    Pulled                   g-no-0                         Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:54:21Z   Normal    Created                  g-no-0                         Container created
+2026-11-03T07:54:21Z   Normal    Started                  g-no-0                         Container started
+2026-11-03T07:20:47Z   Normal    Scheduled                g-no-1                         Successfully assigned e2e/g-no-1 to aks-nodepool1-63764748-vmss000002
+2026-11-03T07:20:54Z   Normal    SuccessfulAttachVolume   g-no-1                         AttachVolume.Attach succeeded for volume "pvc-2f8853b2-570b-42be-ba70-228485feab30" 
+2026-11-03T07:20:56Z   Normal    Pulling                  g-no-1                         Pulling image "<acr>.azurecr.io/kividb:1.2.0-rc9"
+2026-11-03T07:20:58Z   Normal    Pulled                   g-no-1                         Successfully pulled image "<acr>.azurecr.io/kividb:1.2.0-rc9" in 1.545s (1.545s including waiting). Image size: 12282233 bytes.
+2026-11-03T07:20:58Z   Normal    Created                  g-no-1                         Container created
+2026-11-03T07:20:58Z   Normal    Started                  g-no-1                         Container started
+2026-11-03T07:20:58Z   Normal    Pulling                  g-no-1                         Pulling image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e"
+2026-11-03T07:20:58Z   Normal    Pulled                   g-no-1                         Successfully pulled image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" in 545ms (545ms including waiting). Image size: 7952869 bytes.
+2026-11-03T07:20:58Z   Normal    Created                  g-no-1                         Container created
+2026-11-03T07:20:58Z   Normal    Started                  g-no-1                         Container started
+2026-11-03T07:20:46Z   Normal    NoPods                   g-no                           No matching pods found
+2026-11-03T07:20:46Z   Normal    SuccessfulCreate         g-no                           Create Claim data-g-no-0 Pod g-no-0 in StatefulSet g-no success
+2026-11-03T07:53:53Z   Normal    SuccessfulCreate         g-no                           Create Pod g-no-0 in StatefulSet g-no successful
+2026-11-03T07:20:46Z   Normal    SuccessfulCreate         g-no                           Create Claim data-g-no-1 Pod g-no-1 in StatefulSet g-no success
+2026-11-03T07:20:46Z   Normal    SuccessfulCreate         g-no                           Create Pod g-no-1 in StatefulSet g-no successful
+2026-11-03T07:54:54Z   Warning   MasterRestartedBehind    g-no                           g-no-0 restarted and came back as the master at replication offset 0, behind the 30927443 it had reached and behind g-no-1 (offset 30995297), which holds writes it lost; failing over rather than resyncing the replicas from its older data
+2026-11-03T07:54:54Z   Warning   Failover                 g-no                           master g-no-0 restarted behind its replicas; promoted g-no-1
+2026-11-03T07:20:56Z   Normal    Scheduled                g-yes-0                        Successfully assigned e2e/g-yes-0 to aks-nodepool1-63764748-vmss000001
+2026-11-03T07:21:07Z   Normal    SuccessfulAttachVolume   g-yes-0                        AttachVolume.Attach succeeded for volume "pvc-0bc259ae-160c-46b6-b48f-da515d814813" 
+2026-11-03T07:21:08Z   Normal    Pulling                  g-yes-0                        Pulling image "<acr>.azurecr.io/kividb:1.2.0-rc9"
+2026-11-03T07:21:09Z   Normal    Pulled                   g-yes-0                        Successfully pulled image "<acr>.azurecr.io/kividb:1.2.0-rc9" in 591ms (591ms including waiting). Image size: 12282233 bytes.
+2026-11-03T07:21:09Z   Normal    Created                  g-yes-0                        Container created
+2026-11-03T07:21:09Z   Normal    Started                  g-yes-0                        Container started
+2026-11-03T07:21:09Z   Normal    Pulled                   g-yes-0                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:21:09Z   Normal    Created                  g-yes-0                        Container created
+2026-11-03T07:21:09Z   Normal    Started                  g-yes-0                        Container started
+2026-11-03T07:20:48Z   Normal    Scheduled                g-yes-1                        Successfully assigned e2e/g-yes-1 to aks-nodepool1-63764748-vmss000000
+2026-11-03T07:21:01Z   Normal    SuccessfulAttachVolume   g-yes-1                        AttachVolume.Attach succeeded for volume "pvc-018beb62-66a9-40b7-b57b-ea018f895b86" 
+2026-11-03T07:21:02Z   Normal    Pulling                  g-yes-1                        Pulling image "<acr>.azurecr.io/kividb:1.2.0-rc9"
+2026-11-03T07:21:03Z   Normal    Pulled                   g-yes-1                        Successfully pulled image "<acr>.azurecr.io/kividb:1.2.0-rc9" in 608ms (608ms including waiting). Image size: 12282233 bytes.
+2026-11-03T07:21:03Z   Normal    Created                  g-yes-1                        Container created
+2026-11-03T07:21:03Z   Normal    Started                  g-yes-1                        Container started
+2026-11-03T07:21:03Z   Normal    Pulled                   g-yes-1                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:21:03Z   Normal    Created                  g-yes-1                        Container created
+2026-11-03T07:21:03Z   Normal    Started                  g-yes-1                        Container started
+2026-11-03T07:49:55Z   Normal    Killing                  g-yes-1                        Stopping container kividb
+2026-11-03T07:49:55Z   Normal    Killing                  g-yes-1                        Stopping container agent
+2026-11-03T07:49:55Z   Normal    Scheduled                g-yes-1                        Successfully assigned e2e/g-yes-1 to aks-nodepool1-63764748-vmss000003
+2026-11-03T07:49:55Z   Warning   FailedAttachVolume       g-yes-1                        Waiting for detach for volume "pvc-018beb62-66a9-40b7-b57b-ea018f895b86" Volume is already exclusively attached to one node, waiting on detach before it can be attached to another node
+2026-11-03T07:50:21Z   Normal    SuccessfulAttachVolume   g-yes-1                        AttachVolume.Attach succeeded for volume "pvc-018beb62-66a9-40b7-b57b-ea018f895b86" 
+2026-11-03T07:50:22Z   Normal    Pulled                   g-yes-1                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:50:22Z   Normal    Created                  g-yes-1                        Container created
+2026-11-03T07:50:22Z   Normal    Started                  g-yes-1                        Container started
+2026-11-03T07:50:22Z   Normal    Pulled                   g-yes-1                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:50:22Z   Normal    Created                  g-yes-1                        Container created
+2026-11-03T07:50:22Z   Normal    Started                  g-yes-1                        Container started
+2026-11-03T07:20:45Z   Normal    NoPods                   g-yes                          No matching pods found
+2026-11-03T07:20:45Z   Normal    SuccessfulCreate         g-yes                          Create Claim data-g-yes-0 Pod g-yes-0 in StatefulSet g-yes success
+2026-11-03T07:20:45Z   Normal    SuccessfulCreate         g-yes                          Create Pod g-yes-0 in StatefulSet g-yes successful
+2026-11-03T07:20:45Z   Normal    SuccessfulCreate         g-yes                          Create Claim data-g-yes-1 Pod g-yes-1 in StatefulSet g-yes success
+2026-11-03T07:49:55Z   Normal    SuccessfulCreate         g-yes                          Create Pod g-yes-1 in StatefulSet g-yes successful
+2026-11-03T07:21:20Z   Normal    Scheduled                loader-g-no-79d7f5f4f6-6x5fp   Successfully assigned e2e/loader-g-no-79d7f5f4f6-6x5fp to aks-nodepool1-63764748-vmss000000
+2026-11-03T07:21:21Z   Normal    Pulling                  loader-g-no-79d7f5f4f6-6x5fp   Pulling image "<acr>.azurecr.io/e2e-loader:6"
+2026-11-03T07:21:21Z   Normal    Pulled                   loader-g-no-79d7f5f4f6-6x5fp   Successfully pulled image "<acr>.azurecr.io/e2e-loader:6" in 392ms (392ms including waiting). Image size: 6012892 bytes.
+2026-11-03T07:21:21Z   Normal    Created                  loader-g-no-79d7f5f4f6-6x5fp   Container created
+2026-11-03T07:21:21Z   Normal    Started                  loader-g-no-79d7f5f4f6-6x5fp   Container started
+2026-11-03T07:21:20Z   Normal    SuccessfulCreate         loader-g-no-79d7f5f4f6         Created pod: loader-g-no-79d7f5f4f6-6x5fp
+2026-11-03T07:21:20Z   Normal    ScalingReplicaSet        loader-g-no                    Scaled up replica set loader-g-no-79d7f5f4f6 from 0 to 1
+2026-11-03T07:21:20Z   Normal    Scheduled                loader-g-yes-7b89f4-kfc4k      Successfully assigned e2e/loader-g-yes-7b89f4-kfc4k to aks-nodepool1-63764748-vmss000000
+2026-11-03T07:21:20Z   Normal    Pulling                  loader-g-yes-7b89f4-kfc4k      Pulling image "<acr>.azurecr.io/e2e-loader:6"
+2026-11-03T07:21:21Z   Normal    Pulled                   loader-g-yes-7b89f4-kfc4k      Successfully pulled image "<acr>.azurecr.io/e2e-loader:6" in 769ms (769ms including waiting). Image size: 6012892 bytes.
+2026-11-03T07:21:21Z   Normal    Created                  loader-g-yes-7b89f4-kfc4k      Container created
+2026-11-03T07:21:21Z   Normal    Started                  loader-g-yes-7b89f4-kfc4k      Container started
+2026-11-03T07:21:20Z   Normal    SuccessfulCreate         loader-g-yes-7b89f4            Created pod: loader-g-yes-7b89f4-kfc4k
+2026-11-03T07:21:20Z   Normal    ScalingReplicaSet        loader-g-yes                   Scaled up replica set loader-g-yes-7b89f4 from 0 to 1
+2026-11-03T07:21:19Z   Normal    Scheduled                loader-shd-6d79cdbb4-rxwwv     Successfully assigned e2e/loader-shd-6d79cdbb4-rxwwv to aks-nodepool1-63764748-vmss000000
+2026-11-03T07:21:20Z   Normal    Pulling                  loader-shd-6d79cdbb4-rxwwv     Pulling image "<acr>.azurecr.io/e2e-loader:6"
+2026-11-03T07:21:21Z   Normal    Pulled                   loader-shd-6d79cdbb4-rxwwv     Successfully pulled image "<acr>.azurecr.io/e2e-loader:6" in 1.158s (1.158s including waiting). Image size: 6012892 bytes.
+2026-11-03T07:21:21Z   Normal    Created                  loader-shd-6d79cdbb4-rxwwv     Container created
+2026-11-03T07:21:21Z   Normal    Started                  loader-shd-6d79cdbb4-rxwwv     Container started
+2026-11-03T07:21:19Z   Normal    SuccessfulCreate         loader-shd-6d79cdbb4           Created pod: loader-shd-6d79cdbb4-rxwwv
+2026-11-03T07:21:19Z   Normal    ScalingReplicaSet        loader-shd                     Scaled up replica set loader-shd-6d79cdbb4 from 0 to 1
+2026-11-03T07:19:50Z   Normal    Scheduled                nd-7bqf9                       Successfully assigned e2e/nd-7bqf9 to aks-nodepool1-63764748-vmss000000
+2026-11-03T07:19:51Z   Normal    Pulling                  nd-7bqf9                       Pulling image "ubuntu:24.04"
+2026-11-03T07:19:55Z   Normal    Pulled                   nd-7bqf9                       Successfully pulled image "ubuntu:24.04" in 4.625s (4.625s including waiting). Image size: 29776776 bytes.
+2026-11-03T07:19:55Z   Normal    Created                  nd-7bqf9                       Container created
+2026-11-03T07:19:55Z   Normal    Started                  nd-7bqf9                       Container started
+2026-11-03T07:19:50Z   Normal    Scheduled                nd-85tbh                       Successfully assigned e2e/nd-85tbh to aks-nodepool1-63764748-vmss000003
+2026-11-03T07:19:51Z   Normal    Pulling                  nd-85tbh                       Pulling image "ubuntu:24.04"
+2026-11-03T07:19:55Z   Normal    Pulled                   nd-85tbh                       Successfully pulled image "ubuntu:24.04" in 4.274s (4.274s including waiting). Image size: 29776776 bytes.
+2026-11-03T07:19:55Z   Normal    Created                  nd-85tbh                       Container created
+2026-11-03T07:19:55Z   Normal    Started                  nd-85tbh                       Container started
+2026-11-03T07:19:50Z   Normal    Scheduled                nd-fpvgr                       Successfully assigned e2e/nd-fpvgr to aks-nodepool1-63764748-vmss000002
+2026-11-03T07:19:51Z   Normal    Pulling                  nd-fpvgr                       Pulling image "ubuntu:24.04"
+2026-11-03T07:19:55Z   Normal    Pulled                   nd-fpvgr                       Successfully pulled image "ubuntu:24.04" in 4.299s (4.299s including waiting). Image size: 29776776 bytes.
+2026-11-03T07:19:55Z   Normal    Created                  nd-fpvgr                       Container created
+2026-11-03T07:19:55Z   Normal    Started                  nd-fpvgr                       Container started
+2026-11-03T07:19:50Z   Normal    Scheduled                nd-jkwft                       Successfully assigned e2e/nd-jkwft to aks-nodepool1-63764748-vmss000001
+2026-11-03T07:19:51Z   Normal    Pulling                  nd-jkwft                       Pulling image "ubuntu:24.04"
+2026-11-03T07:19:55Z   Normal    Pulled                   nd-jkwft                       Successfully pulled image "ubuntu:24.04" in 4.4s (4.4s including waiting). Image size: 29776776 bytes.
+2026-11-03T07:19:55Z   Normal    Created                  nd-jkwft                       Container created
+2026-11-03T07:19:55Z   Normal    Started                  nd-jkwft                       Container started
+2026-11-03T07:19:50Z   Normal    SuccessfulCreate         nd                             Created pod: nd-7bqf9
+2026-11-03T07:19:50Z   Normal    SuccessfulCreate         nd                             Created pod: nd-jkwft
+2026-11-03T07:19:50Z   Normal    SuccessfulCreate         nd                             Created pod: nd-85tbh
+2026-11-03T07:19:50Z   Normal    SuccessfulCreate         nd                             Created pod: nd-fpvgr
+2026-11-03T07:20:56Z   Normal    Scheduled                shd-0-0                        Successfully assigned e2e/shd-0-0 to aks-nodepool1-63764748-vmss000002
+2026-11-03T07:21:04Z   Normal    SuccessfulAttachVolume   shd-0-0                        AttachVolume.Attach succeeded for volume "pvc-43dcfe60-e043-4e07-845c-44de050336ff" 
+2026-11-03T07:21:06Z   Normal    Pulled                   shd-0-0                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc8" already present on machine and can be accessed by the pod
+2026-11-03T07:21:06Z   Normal    Created                  shd-0-0                        Container created
+2026-11-03T07:21:06Z   Normal    Started                  shd-0-0                        Container started
+2026-11-03T07:21:06Z   Normal    Pulled                   shd-0-0                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:21:06Z   Normal    Created                  shd-0-0                        Container created
+2026-11-03T07:21:06Z   Normal    Started                  shd-0-0                        Container started
+2026-11-03T07:24:35Z   Normal    Killing                  shd-0-0                        Stopping container kividb
+2026-11-03T07:24:35Z   Normal    Killing                  shd-0-0                        Stopping container agent
+2026-11-03T07:24:36Z   Normal    Scheduled                shd-0-0                        Successfully assigned e2e/shd-0-0 to aks-nodepool1-63764748-vmss000002
+2026-11-03T07:24:46Z   Normal    Pulled                   shd-0-0                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:24:46Z   Normal    Created                  shd-0-0                        Container created
+2026-11-03T07:24:46Z   Normal    Started                  shd-0-0                        Container started
+2026-11-03T07:24:46Z   Normal    Pulled                   shd-0-0                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:24:46Z   Normal    Created                  shd-0-0                        Container created
+2026-11-03T07:24:46Z   Normal    Started                  shd-0-0                        Container started
+2026-11-03T07:25:57Z   Normal    Killing                  shd-0-0                        Stopping container kividb
+2026-11-03T07:25:57Z   Normal    Killing                  shd-0-0                        Stopping container agent
+2026-11-03T07:25:58Z   Normal    Scheduled                shd-0-0                        Successfully assigned e2e/shd-0-0 to aks-nodepool1-63764748-vmss000002
+2026-11-03T07:26:07Z   Normal    Pulled                   shd-0-0                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:26:07Z   Normal    Created                  shd-0-0                        Container created
+2026-11-03T07:26:07Z   Normal    Started                  shd-0-0                        Container started
+2026-11-03T07:26:07Z   Normal    Pulled                   shd-0-0                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:26:07Z   Normal    Created                  shd-0-0                        Container created
+2026-11-03T07:26:07Z   Normal    Started                  shd-0-0                        Container started
+2026-11-03T07:37:03Z   Normal    Killing                  shd-0-0                        Stopping container kividb
+2026-11-03T07:37:03Z   Normal    Killing                  shd-0-0                        Stopping container agent
+2026-11-03T07:37:03Z   Normal    Scheduled                shd-0-0                        Successfully assigned e2e/shd-0-0 to aks-nodepool1-63764748-vmss000002
+2026-11-03T07:45:12Z   Normal    Pulled                   shd-0-0                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:45:12Z   Normal    Created                  shd-0-0                        Container created
+2026-11-03T07:45:12Z   Normal    Started                  shd-0-0                        Container started
+2026-11-03T07:37:03Z   Normal    Pulled                   shd-0-0                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:37:03Z   Normal    Created                  shd-0-0                        Container created
+2026-11-03T07:37:03Z   Normal    Started                  shd-0-0                        Container started
+2026-11-03T07:39:36Z   Warning   FailedPreStopHook        shd-0-0                        PreStopHook failed
+2026-11-03T07:39:36Z   Warning   FailedPreStopHook        shd-0-0                        PreStopHook failed
+2026-11-03T07:20:47Z   Normal    Scheduled                shd-0-1                        Successfully assigned e2e/shd-0-1 to aks-nodepool1-63764748-vmss000003
+2026-11-03T07:20:54Z   Normal    SuccessfulAttachVolume   shd-0-1                        AttachVolume.Attach succeeded for volume "pvc-44d93fd6-d819-487c-9ad5-4bfc84a66d4e" 
+2026-11-03T07:20:55Z   Normal    Pulling                  shd-0-1                        Pulling image "<acr>.azurecr.io/kividb:1.2.0-rc8"
+2026-11-03T07:20:56Z   Normal    Pulled                   shd-0-1                        Successfully pulled image "<acr>.azurecr.io/kividb:1.2.0-rc8" in 336ms (336ms including waiting). Image size: 12278002 bytes.
+2026-11-03T07:20:56Z   Normal    Created                  shd-0-1                        Container created
+2026-11-03T07:20:56Z   Normal    Started                  shd-0-1                        Container started
+2026-11-03T07:20:56Z   Normal    Pulling                  shd-0-1                        Pulling image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e"
+2026-11-03T07:20:57Z   Normal    Pulled                   shd-0-1                        Successfully pulled image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" in 597ms (597ms including waiting). Image size: 7952869 bytes.
+2026-11-03T07:20:57Z   Normal    Created                  shd-0-1                        Container created
+2026-11-03T07:20:57Z   Normal    Started                  shd-0-1                        Container started
+2026-11-03T07:23:34Z   Normal    Killing                  shd-0-1                        Stopping container kividb
+2026-11-03T07:23:34Z   Normal    Killing                  shd-0-1                        Stopping container agent
+2026-11-03T07:23:35Z   Normal    Scheduled                shd-0-1                        Successfully assigned e2e/shd-0-1 to aks-nodepool1-63764748-vmss000003
+2026-11-03T07:23:43Z   Normal    Pulled                   shd-0-1                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:23:43Z   Normal    Created                  shd-0-1                        Container created
+2026-11-03T07:23:43Z   Normal    Started                  shd-0-1                        Container started
+2026-11-03T07:23:43Z   Normal    Pulled                   shd-0-1                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:23:43Z   Normal    Created                  shd-0-1                        Container created
+2026-11-03T07:23:43Z   Normal    Started                  shd-0-1                        Container started
+2026-11-03T07:27:02Z   Normal    Killing                  shd-0-1                        Stopping container kividb
+2026-11-03T07:27:02Z   Normal    Killing                  shd-0-1                        Stopping container agent
+2026-11-03T07:27:03Z   Normal    Scheduled                shd-0-1                        Successfully assigned e2e/shd-0-1 to aks-nodepool1-63764748-vmss000003
+2026-11-03T07:27:07Z   Normal    Pulled                   shd-0-1                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:27:07Z   Normal    Created                  shd-0-1                        Container created
+2026-11-03T07:27:07Z   Normal    Started                  shd-0-1                        Container started
+2026-11-03T07:27:07Z   Normal    Pulled                   shd-0-1                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:27:07Z   Normal    Created                  shd-0-1                        Container created
+2026-11-03T07:27:07Z   Normal    Started                  shd-0-1                        Container started
+2026-11-03T07:31:40Z   Normal    Killing                  shd-0-1                        Stopping container kividb
+2026-11-03T07:31:40Z   Normal    Killing                  shd-0-1                        Stopping container agent
+2026-11-03T07:31:42Z   Normal    Scheduled                shd-0-1                        Successfully assigned e2e/shd-0-1 to aks-nodepool1-63764748-vmss000003
+2026-11-03T07:31:43Z   Normal    Pulled                   shd-0-1                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:31:43Z   Normal    Created                  shd-0-1                        Container created
+2026-11-03T07:31:43Z   Normal    Started                  shd-0-1                        Container started
+2026-11-03T07:31:43Z   Normal    Pulled                   shd-0-1                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:31:43Z   Normal    Created                  shd-0-1                        Container created
+2026-11-03T07:31:43Z   Normal    Started                  shd-0-1                        Container started
+2026-11-03T07:20:45Z   Normal    NoPods                   shd-0                          No matching pods found
+2026-11-03T07:20:45Z   Normal    SuccessfulCreate         shd-0                          Create Claim data-shd-0-0 Pod shd-0-0 in StatefulSet shd-0 success
+2026-11-03T07:37:03Z   Normal    SuccessfulCreate         shd-0                          Create Pod shd-0-0 in StatefulSet shd-0 successful
+2026-11-03T07:20:45Z   Normal    SuccessfulCreate         shd-0                          Create Claim data-shd-0-1 Pod shd-0-1 in StatefulSet shd-0 success
+2026-11-03T07:31:42Z   Normal    SuccessfulCreate         shd-0                          Create Pod shd-0-1 in StatefulSet shd-0 successful
+2026-11-03T07:20:46Z   Normal    Scheduled                shd-1-0                        Successfully assigned e2e/shd-1-0 to aks-nodepool1-63764748-vmss000003
+2026-11-03T07:20:54Z   Normal    SuccessfulAttachVolume   shd-1-0                        AttachVolume.Attach succeeded for volume "pvc-91699fee-a2b3-4640-9541-accd0f79ef55" 
+2026-11-03T07:20:55Z   Normal    Pulling                  shd-1-0                        Pulling image "<acr>.azurecr.io/kividb:1.2.0-rc8"
+2026-11-03T07:20:56Z   Normal    Pulled                   shd-1-0                        Successfully pulled image "<acr>.azurecr.io/kividb:1.2.0-rc8" in 958ms (958ms including waiting). Image size: 12278002 bytes.
+2026-11-03T07:20:56Z   Normal    Created                  shd-1-0                        Container created
+2026-11-03T07:20:56Z   Normal    Started                  shd-1-0                        Container started
+2026-11-03T07:20:56Z   Normal    Pulling                  shd-1-0                        Pulling image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e"
+2026-11-03T07:20:57Z   Normal    Pulled                   shd-1-0                        Successfully pulled image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" in 618ms (618ms including waiting). Image size: 7952869 bytes.
+2026-11-03T07:20:57Z   Normal    Created                  shd-1-0                        Container created
+2026-11-03T07:20:57Z   Normal    Started                  shd-1-0                        Container started
+2026-11-03T07:24:16Z   Normal    Killing                  shd-1-0                        Stopping container kividb
+2026-11-03T07:24:16Z   Normal    Killing                  shd-1-0                        Stopping container agent
+2026-11-03T07:24:17Z   Normal    Scheduled                shd-1-0                        Successfully assigned e2e/shd-1-0 to aks-nodepool1-63764748-vmss000003
+2026-11-03T07:24:23Z   Normal    Pulled                   shd-1-0                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:24:24Z   Normal    Created                  shd-1-0                        Container created
+2026-11-03T07:24:24Z   Normal    Started                  shd-1-0                        Container started
+2026-11-03T07:24:24Z   Normal    Pulled                   shd-1-0                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:24:24Z   Normal    Created                  shd-1-0                        Container created
+2026-11-03T07:24:24Z   Normal    Started                  shd-1-0                        Container started
+2026-11-03T07:26:22Z   Normal    Killing                  shd-1-0                        Stopping container kividb
+2026-11-03T07:26:22Z   Normal    Killing                  shd-1-0                        Stopping container agent
+2026-11-03T07:26:23Z   Normal    Scheduled                shd-1-0                        Successfully assigned e2e/shd-1-0 to aks-nodepool1-63764748-vmss000003
+2026-11-03T07:26:26Z   Normal    Pulled                   shd-1-0                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:26:26Z   Normal    Created                  shd-1-0                        Container created
+2026-11-03T07:26:26Z   Normal    Started                  shd-1-0                        Container started
+2026-11-03T07:26:26Z   Normal    Pulled                   shd-1-0                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:26:26Z   Normal    Created                  shd-1-0                        Container created
+2026-11-03T07:26:26Z   Normal    Started                  shd-1-0                        Container started
+2026-11-03T07:40:03Z   Normal    Killing                  shd-1-0                        Stopping container kividb
+2026-11-03T07:40:03Z   Normal    Killing                  shd-1-0                        Stopping container agent
+2026-11-03T07:40:03Z   Normal    Scheduled                shd-1-0                        Successfully assigned e2e/shd-1-0 to aks-nodepool1-63764748-vmss000003
+2026-11-03T07:40:03Z   Normal    Pulled                   shd-1-0                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:40:03Z   Normal    Created                  shd-1-0                        Container created
+2026-11-03T07:40:03Z   Normal    Started                  shd-1-0                        Container started
+2026-11-03T07:40:03Z   Normal    Pulled                   shd-1-0                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:40:03Z   Normal    Created                  shd-1-0                        Container created
+2026-11-03T07:40:03Z   Normal    Started                  shd-1-0                        Container started
+2026-11-03T07:42:36Z   Warning   FailedPreStopHook        shd-1-0                        PreStopHook failed
+2026-11-03T07:42:36Z   Warning   FailedPreStopHook        shd-1-0                        PreStopHook failed
+2026-11-03T07:20:46Z   Normal    Scheduled                shd-1-1                        Successfully assigned e2e/shd-1-1 to aks-nodepool1-63764748-vmss000000
+2026-11-03T07:20:54Z   Normal    SuccessfulAttachVolume   shd-1-1                        AttachVolume.Attach succeeded for volume "pvc-baa6d3a5-c30e-447b-b4f1-fe6d34f08deb" 
+2026-11-03T07:20:56Z   Normal    Pulling                  shd-1-1                        Pulling image "<acr>.azurecr.io/kividb:1.2.0-rc8"
+2026-11-03T07:20:57Z   Normal    Pulled                   shd-1-1                        Successfully pulled image "<acr>.azurecr.io/kividb:1.2.0-rc8" in 1.317s (1.317s including waiting). Image size: 12278002 bytes.
+2026-11-03T07:20:57Z   Normal    Created                  shd-1-1                        Container created
+2026-11-03T07:20:57Z   Normal    Started                  shd-1-1                        Container started
+2026-11-03T07:20:57Z   Normal    Pulling                  shd-1-1                        Pulling image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e"
+2026-11-03T07:20:58Z   Normal    Pulled                   shd-1-1                        Successfully pulled image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" in 503ms (503ms including waiting). Image size: 7952869 bytes.
+2026-11-03T07:20:58Z   Normal    Created                  shd-1-1                        Container created
+2026-11-03T07:20:58Z   Normal    Started                  shd-1-1                        Container started
+2026-11-03T07:23:15Z   Normal    Killing                  shd-1-1                        Stopping container kividb
+2026-11-03T07:23:15Z   Normal    Killing                  shd-1-1                        Stopping container agent
+2026-11-03T07:23:16Z   Normal    Scheduled                shd-1-1                        Successfully assigned e2e/shd-1-1 to aks-nodepool1-63764748-vmss000000
+2026-11-03T07:23:23Z   Normal    Pulled                   shd-1-1                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:23:23Z   Normal    Created                  shd-1-1                        Container created
+2026-11-03T07:23:23Z   Normal    Started                  shd-1-1                        Container started
+2026-11-03T07:23:23Z   Normal    Pulled                   shd-1-1                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:23:24Z   Normal    Created                  shd-1-1                        Container created
+2026-11-03T07:23:24Z   Normal    Started                  shd-1-1                        Container started
+2026-11-03T07:27:27Z   Normal    Killing                  shd-1-1                        Stopping container kividb
+2026-11-03T07:27:27Z   Normal    Killing                  shd-1-1                        Stopping container agent
+2026-11-03T07:27:27Z   Normal    Scheduled                shd-1-1                        Successfully assigned e2e/shd-1-1 to aks-nodepool1-63764748-vmss000000
+2026-11-03T07:27:28Z   Normal    Pulled                   shd-1-1                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:27:28Z   Normal    Created                  shd-1-1                        Container created
+2026-11-03T07:27:28Z   Normal    Started                  shd-1-1                        Container started
+2026-11-03T07:27:28Z   Normal    Pulled                   shd-1-1                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:27:28Z   Normal    Created                  shd-1-1                        Container created
+2026-11-03T07:27:28Z   Normal    Started                  shd-1-1                        Container started
+2026-11-03T07:34:03Z   Normal    Killing                  shd-1-1                        Stopping container kividb
+2026-11-03T07:34:03Z   Normal    Killing                  shd-1-1                        Stopping container agent
+2026-11-03T07:34:05Z   Normal    Scheduled                shd-1-1                        Successfully assigned e2e/shd-1-1 to aks-nodepool1-63764748-vmss000000
+2026-11-03T07:34:07Z   Normal    Pulled                   shd-1-1                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:34:07Z   Normal    Created                  shd-1-1                        Container created
+2026-11-03T07:34:07Z   Normal    Started                  shd-1-1                        Container started
+2026-11-03T07:34:07Z   Normal    Pulled                   shd-1-1                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:34:07Z   Normal    Created                  shd-1-1                        Container created
+2026-11-03T07:34:07Z   Normal    Started                  shd-1-1                        Container started
+2026-11-03T07:20:45Z   Normal    NoPods                   shd-1                          No matching pods found
+2026-11-03T07:20:45Z   Normal    SuccessfulCreate         shd-1                          Create Claim data-shd-1-0 Pod shd-1-0 in StatefulSet shd-1 success
+2026-11-03T07:40:03Z   Normal    SuccessfulCreate         shd-1                          Create Pod shd-1-0 in StatefulSet shd-1 successful
+2026-11-03T07:20:45Z   Normal    SuccessfulCreate         shd-1                          Create Claim data-shd-1-1 Pod shd-1-1 in StatefulSet shd-1 success
+2026-11-03T07:34:05Z   Normal    SuccessfulCreate         shd-1                          Create Pod shd-1-1 in StatefulSet shd-1 successful
+2026-11-03T07:20:51Z   Normal    Scheduled                shd-2-0                        Successfully assigned e2e/shd-2-0 to aks-nodepool1-63764748-vmss000001
+2026-11-03T07:20:59Z   Normal    SuccessfulAttachVolume   shd-2-0                        AttachVolume.Attach succeeded for volume "pvc-22a8ab0b-85e1-475d-8fe9-1adc13b6c89f" 
+2026-11-03T07:21:01Z   Normal    Pulling                  shd-2-0                        Pulling image "<acr>.azurecr.io/kividb:1.2.0-rc8"
+2026-11-03T07:21:02Z   Normal    Pulled                   shd-2-0                        Successfully pulled image "<acr>.azurecr.io/kividb:1.2.0-rc8" in 723ms (723ms including waiting). Image size: 12278002 bytes.
+2026-11-03T07:21:02Z   Normal    Created                  shd-2-0                        Container created
+2026-11-03T07:21:02Z   Normal    Started                  shd-2-0                        Container started
+2026-11-03T07:21:02Z   Normal    Pulling                  shd-2-0                        Pulling image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e"
+2026-11-03T07:21:02Z   Normal    Pulled                   shd-2-0                        Successfully pulled image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" in 523ms (523ms including waiting). Image size: 7952869 bytes.
+2026-11-03T07:21:02Z   Normal    Created                  shd-2-0                        Container created
+2026-11-03T07:21:02Z   Normal    Started                  shd-2-0                        Container started
+2026-11-03T07:23:56Z   Normal    Killing                  shd-2-0                        Stopping container kividb
+2026-11-03T07:23:56Z   Normal    Killing                  shd-2-0                        Stopping container agent
+2026-11-03T07:23:57Z   Normal    Scheduled                shd-2-0                        Successfully assigned e2e/shd-2-0 to aks-nodepool1-63764748-vmss000001
+2026-11-03T07:24:03Z   Normal    Pulled                   shd-2-0                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:24:03Z   Normal    Created                  shd-2-0                        Container created
+2026-11-03T07:24:03Z   Normal    Started                  shd-2-0                        Container started
+2026-11-03T07:24:03Z   Normal    Pulled                   shd-2-0                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:24:03Z   Normal    Created                  shd-2-0                        Container created
+2026-11-03T07:24:03Z   Normal    Started                  shd-2-0                        Container started
+2026-11-03T07:26:37Z   Normal    Killing                  shd-2-0                        Stopping container kividb
+2026-11-03T07:26:37Z   Normal    Killing                  shd-2-0                        Stopping container agent
+2026-11-03T07:26:38Z   Normal    Scheduled                shd-2-0                        Successfully assigned e2e/shd-2-0 to aks-nodepool1-63764748-vmss000001
+2026-11-03T07:26:46Z   Normal    Pulled                   shd-2-0                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:26:46Z   Normal    Created                  shd-2-0                        Container created
+2026-11-03T07:26:46Z   Normal    Started                  shd-2-0                        Container started
+2026-11-03T07:26:46Z   Normal    Pulled                   shd-2-0                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:26:46Z   Normal    Created                  shd-2-0                        Container created
+2026-11-03T07:26:46Z   Normal    Started                  shd-2-0                        Container started
+2026-11-03T07:20:47Z   Normal    Scheduled                shd-2-1                        Successfully assigned e2e/shd-2-1 to aks-nodepool1-63764748-vmss000002
+2026-11-03T07:20:55Z   Normal    SuccessfulAttachVolume   shd-2-1                        AttachVolume.Attach succeeded for volume "pvc-189c3fb1-ad36-4302-9739-8baa227f7af0" 
+2026-11-03T07:20:56Z   Normal    Pulling                  shd-2-1                        Pulling image "<acr>.azurecr.io/kividb:1.2.0-rc8"
+2026-11-03T07:20:58Z   Normal    Pulled                   shd-2-1                        Successfully pulled image "<acr>.azurecr.io/kividb:1.2.0-rc8" in 1.524s (1.524s including waiting). Image size: 12278002 bytes.
+2026-11-03T07:20:58Z   Normal    Created                  shd-2-1                        Container created
+2026-11-03T07:20:58Z   Normal    Started                  shd-2-1                        Container started
+2026-11-03T07:20:58Z   Normal    Pulling                  shd-2-1                        Pulling image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e"
+2026-11-03T07:20:58Z   Normal    Pulled                   shd-2-1                        Successfully pulled image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" in 569ms (569ms including waiting). Image size: 7952869 bytes.
+2026-11-03T07:20:58Z   Normal    Created                  shd-2-1                        Container created
+2026-11-03T07:20:58Z   Normal    Started                  shd-2-1                        Container started
+2026-11-03T07:22:58Z   Normal    Killing                  shd-2-1                        Stopping container kividb
+2026-11-03T07:22:58Z   Normal    Killing                  shd-2-1                        Stopping container agent
+2026-11-03T07:22:58Z   Normal    Scheduled                shd-2-1                        Successfully assigned e2e/shd-2-1 to aks-nodepool1-63764748-vmss000002
+2026-11-03T07:23:03Z   Normal    Pulled                   shd-2-1                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:23:03Z   Normal    Created                  shd-2-1                        Container created
+2026-11-03T07:23:04Z   Normal    Started                  shd-2-1                        Container started
+2026-11-03T07:23:04Z   Normal    Pulled                   shd-2-1                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:23:04Z   Normal    Created                  shd-2-1                        Container created
+2026-11-03T07:23:04Z   Normal    Started                  shd-2-1                        Container started
+2026-11-03T07:27:47Z   Normal    Killing                  shd-2-1                        Stopping container kividb
+2026-11-03T07:27:47Z   Normal    Killing                  shd-2-1                        Stopping container agent
+2026-11-03T07:27:48Z   Normal    Scheduled                shd-2-1                        Successfully assigned e2e/shd-2-1 to aks-nodepool1-63764748-vmss000002
+2026-11-03T07:27:59Z   Normal    Pulled                   shd-2-1                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:27:59Z   Normal    Created                  shd-2-1                        Container created
+2026-11-03T07:27:59Z   Normal    Started                  shd-2-1                        Container started
+2026-11-03T07:27:59Z   Normal    Pulled                   shd-2-1                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:27:59Z   Normal    Created                  shd-2-1                        Container created
+2026-11-03T07:27:59Z   Normal    Started                  shd-2-1                        Container started
+2026-11-03T07:43:03Z   Normal    Killing                  shd-2-1                        Stopping container kividb
+2026-11-03T07:43:03Z   Normal    Killing                  shd-2-1                        Stopping container agent
+2026-11-03T07:43:03Z   Normal    Scheduled                shd-2-1                        Successfully assigned e2e/shd-2-1 to aks-nodepool1-63764748-vmss000002
+2026-11-03T07:43:03Z   Normal    Pulled                   shd-2-1                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:43:03Z   Normal    Created                  shd-2-1                        Container created
+2026-11-03T07:43:03Z   Normal    Started                  shd-2-1                        Container started
+2026-11-03T07:43:03Z   Normal    Pulled                   shd-2-1                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:43:03Z   Normal    Created                  shd-2-1                        Container created
+2026-11-03T07:43:03Z   Normal    Started                  shd-2-1                        Container started
+2026-11-03T07:45:36Z   Warning   FailedPreStopHook        shd-2-1                        PreStopHook failed
+2026-11-03T07:45:36Z   Warning   FailedPreStopHook        shd-2-1                        PreStopHook failed
+2026-11-03T07:20:45Z   Normal    NoPods                   shd-2                          No matching pods found
+2026-11-03T07:20:45Z   Normal    SuccessfulCreate         shd-2                          Create Claim data-shd-2-0 Pod shd-2-0 in StatefulSet shd-2 success
+2026-11-03T07:26:38Z   Normal    SuccessfulCreate         shd-2                          Create Pod shd-2-0 in StatefulSet shd-2 successful
+2026-11-03T07:20:45Z   Normal    SuccessfulCreate         shd-2                          Create Claim data-shd-2-1 Pod shd-2-1 in StatefulSet shd-2 success
+2026-11-03T07:43:03Z   Normal    SuccessfulCreate         shd-2                          Create Pod shd-2-1 in StatefulSet shd-2 successful
+2026-11-03T07:46:37Z   Normal    Scheduled                shd-3-0                        Successfully assigned e2e/shd-3-0 to aks-nodepool1-63764748-vmss000001
+2026-11-03T07:46:47Z   Normal    SuccessfulAttachVolume   shd-3-0                        AttachVolume.Attach succeeded for volume "pvc-f87a5fd3-fec2-464c-b4ed-901c6d4f636b" 
+2026-11-03T07:46:48Z   Normal    Pulled                   shd-3-0                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:46:48Z   Normal    Created                  shd-3-0                        Container created
+2026-11-03T07:46:48Z   Normal    Started                  shd-3-0                        Container started
+2026-11-03T07:46:48Z   Normal    Pulled                   shd-3-0                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:46:48Z   Normal    Created                  shd-3-0                        Container created
+2026-11-03T07:46:48Z   Normal    Started                  shd-3-0                        Container started
+2026-11-03T07:48:23Z   Normal    Killing                  shd-3-0                        Stopping container kividb
+2026-11-03T07:48:23Z   Normal    Killing                  shd-3-0                        Stopping container agent
+2026-11-03T07:46:37Z   Normal    Scheduled                shd-3-1                        Successfully assigned e2e/shd-3-1 to aks-nodepool1-63764748-vmss000000
+2026-11-03T07:46:47Z   Normal    SuccessfulAttachVolume   shd-3-1                        AttachVolume.Attach succeeded for volume "pvc-92305080-ec07-4159-b4ab-37dc4e838096" 
+2026-11-03T07:46:48Z   Normal    Pulled                   shd-3-1                        Container image "<acr>.azurecr.io/kividb:1.2.0-rc9" already present on machine and can be accessed by the pod
+2026-11-03T07:46:48Z   Normal    Created                  shd-3-1                        Container created
+2026-11-03T07:46:48Z   Normal    Started                  shd-3-1                        Container started
+2026-11-03T07:46:48Z   Normal    Pulled                   shd-3-1                        Container image "<acr>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T07:46:48Z   Normal    Created                  shd-3-1                        Container created
+2026-11-03T07:46:48Z   Normal    Started                  shd-3-1                        Container started
+2026-11-03T07:48:23Z   Normal    Killing                  shd-3-1                        Stopping container kividb
+2026-11-03T07:48:23Z   Normal    Killing                  shd-3-1                        Stopping container agent
+2026-11-03T07:46:35Z   Normal    NoPods                   shd-3                          No matching pods found
+2026-11-03T07:46:35Z   Normal    SuccessfulCreate         shd-3                          Create Claim data-shd-3-0 Pod shd-3-0 in StatefulSet shd-3 success
+2026-11-03T07:46:35Z   Normal    SuccessfulCreate         shd-3                          Create Pod shd-3-0 in StatefulSet shd-3 successful
+2026-11-03T07:46:35Z   Normal    SuccessfulCreate         shd-3                          Create Claim data-shd-3-1 Pod shd-3-1 in StatefulSet shd-3 success
+2026-11-03T07:46:35Z   Normal    SuccessfulCreate         shd-3                          Create Pod shd-3-1 in StatefulSet shd-3 successful
+2026-11-03T07:21:16Z   Normal    ClusterForming           shd                            assigned the 16384 slots across 3 shards
+2026-11-03T07:22:58Z   Normal    RollingUpdate            shd                            replacing shd-2-1 to apply the updated pod template (5 more to go)
+2026-11-03T07:23:15Z   Normal    RollingUpdate            shd                            replacing shd-1-1 to apply the updated pod template (4 more to go)
+2026-11-03T07:23:34Z   Normal    RollingUpdate            shd                            replacing shd-0-1 to apply the updated pod template (3 more to go)
+2026-11-03T07:23:54Z   Normal    ShardSwitchover          shd                            shard 2: asked shd-2-1 to take over from shd-2-0 (CLUSTER FAILOVER)
+2026-11-03T07:23:55Z   Normal    RollingUpdate            shd                            replacing shd-2-0 to apply the updated pod template (2 more to go)
+2026-11-03T07:23:55Z   Normal    ShardSwitchover          shd                            shard 2: master moved from shd-2-0 to shd-2-1, as asked
+2026-11-03T07:24:14Z   Normal    ShardSwitchover          shd                            shard 1: asked shd-1-1 to take over from shd-1-0 (CLUSTER FAILOVER)
+2026-11-03T07:24:15Z   Normal    RollingUpdate            shd                            replacing shd-1-0 to apply the updated pod template (1 more to go)
+2026-11-03T07:24:15Z   Normal    ShardSwitchover          shd                            shard 1: master moved from shd-1-0 to shd-1-1, as asked
+2026-11-03T07:24:34Z   Normal    ShardSwitchover          shd                            shard 0: asked shd-0-1 to take over from shd-0-0 (CLUSTER FAILOVER)
+2026-11-03T07:24:35Z   Normal    RollingUpdate            shd                            replacing shd-0-0 to apply the updated pod template (0 more to go)
+2026-11-03T07:24:35Z   Normal    ShardSwitchover          shd                            shard 0: master moved from shd-0-0 to shd-0-1, as asked
+2026-11-03T07:31:40Z   Normal    ShardSwitchover          shd                            shard 0: asked shd-0-0 to take over from shd-0-1 (CLUSTER FAILOVER)
+2026-11-03T07:31:41Z   Normal    ShardSwitchover          shd                            shard 0: master moved from shd-0-1 to shd-0-0, as asked
+2026-11-03T07:34:03Z   Normal    ShardSwitchover          shd                            shard 1: asked shd-1-0 to take over from shd-1-1 (CLUSTER FAILOVER)
+2026-11-03T07:34:03Z   Normal    ShardSwitchover          shd                            (combined from similar events): shard 1: asked shd-1-0 to take over from shd-1-1 (CLUSTER FAILOVER)
+2026-11-03T07:27:44Z   Normal    ShardSwitchover          shd                            (combined from similar events): shard 2: master moved from shd-2-1 to shd-2-0, as asked
+2026-11-03T07:29:11Z   Warning   ShardFailover            shd                            shard 0: master moved from shd-0-0 to shd-0-1
+2026-11-03T07:29:36Z   Warning   ShardFailover            shd                            shard 1: master moved from shd-1-0 to shd-1-1
+2026-11-03T07:30:01Z   Warning   ShardFailover            shd                            shard 2: master moved from shd-2-0 to shd-2-1
+2026-11-03T07:34:04Z   Normal    ShardSwitchover          shd                            shard 1: master moved from shd-1-1 to shd-1-0, as asked
+2026-11-03T07:46:35Z   Normal    RebalanceStarted         shd                            changing from 3 to 4 shards
+2026-11-03T07:47:00Z   Normal    MovingSlots              shd                            moving 1366 slots (4096-5461) from shard 0 to shard 3
+2026-11-03T07:47:02Z   Normal    SlotsMoved               shd                            moved 1366 slots from shard 0 to shard 3
+2026-11-03T07:47:02Z   Normal    MovingSlots              shd                            moving 1365 slots (9558-10922) from shard 1 to shard 3
+2026-11-03T07:47:03Z   Normal    SlotsMoved               shd                            moved 1365 slots from shard 1 to shard 3
+2026-11-03T07:47:03Z   Normal    MovingSlots              shd                            moving 1365 slots (15019-16383) from shard 2 to shard 3
+2026-11-03T07:47:04Z   Normal    SlotsMoved               shd                            moved 1365 slots from shard 2 to shard 3
+2026-11-03T07:47:04Z   Normal    RebalanceCompleted       shd                            4 shards, 3 slot moves
+2026-11-03T07:48:20Z   Normal    RebalanceStarted         shd                            changing from 4 to 3 shards
+2026-11-03T07:48:20Z   Normal    MovingSlots              shd                            moving 1366 slots (4096-5461) from shard 3 to shard 0
+2026-11-03T07:48:21Z   Normal    SlotsMoved               shd                            moved 1366 slots from shard 3 to shard 0
+2026-11-03T07:48:21Z   Normal    MovingSlots              shd                            moving 1365 slots (9558-10922) from shard 3 to shard 1
+2026-11-03T07:48:22Z   Normal    SlotsMoved               shd                            moved 1365 slots from shard 3 to shard 1
+2026-11-03T07:48:22Z   Normal    MovingSlots              shd                            moving 1365 slots (15019-16383) from shard 3 to shard 2
+2026-11-03T07:48:23Z   Normal    SlotsMoved               shd                            moved 1365 slots from shard 3 to shard 2
+2026-11-03T07:48:23Z   Normal    ShardsRemoved            shd                            removed shards 3 to 3, and their volumes
+2026-11-03T07:48:23Z   Normal    RebalanceCompleted       shd                            3 shards, 3 slot moves
+2026-11-03T08:01:21Z   Warning   NodeNotReady             shd-2-1                        Node is not ready
+2026-11-03T08:01:21Z   Warning   NodeNotReady             shd-2-0                        Node is not ready
+2026-11-03T08:01:21Z   Warning   NodeNotReady             shd-0-0                        Node is not ready
+2026-11-03T08:01:21Z   Warning   NodeNotReady             cli                            Node is not ready
+2026-11-03T08:01:21Z   Warning   NodeNotReady             curl                           Node is not ready
+2026-11-03T08:01:21Z   Warning   NodeNotReady             nd-85tbh                       Node is not ready
+2026-11-03T08:01:24Z   Warning   FailedToUpdateEndpointSlices   g-yes-master                   Error updating Endpoint Slices for Service e2e/g-yes-master: skipping Pod g-yes-1 for Service e2e/g-yes-master: Node aks-nodepool1-63764748-vmss000003 Not Found
+2026-11-03T08:01:22Z   Warning   NodeNotReady                   loader-shd-6d79cdbb4-rxwwv     Node is not ready
+2026-11-03T08:01:24Z   Warning   FailedToUpdateEndpointSlices   shd-1-1                        Error updating Endpoint Slices for Service e2e/shd-1-1: skipping Pod shd-1-1 for Service e2e/shd-1-1: Node aks-nodepool1-63764748-vmss000000 Not Found
+2026-11-03T08:01:24Z   Warning   FailedToUpdateEndpointSlices   shd                            Error updating Endpoint Slices for Service e2e/shd: [skipping Pod shd-0-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found, skipping Pod shd-1-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000000 Not Found, skipping Pod shd-2-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000001 Not Found, skipping Pod shd-1-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found]
+2026-11-03T08:01:22Z   Warning   NodeNotReady                   nd-fpvgr                       Node is not ready
+2026-11-03T08:01:24Z   Warning   FailedToUpdateEndpointSlices   shd-shard-1                    Error updating Endpoint Slices for Service e2e/shd-shard-1: [skipping Pod shd-1-1 for Service e2e/shd-shard-1: Node aks-nodepool1-63764748-vmss000000 Not Found, skipping Pod shd-1-0 for Service e2e/shd-shard-1: Node aks-nodepool1-63764748-vmss000003 Not Found]
+2026-11-03T08:01:22Z   Warning   NodeNotReady                   shd-1-0                        Node is not ready
+2026-11-03T08:01:22Z   Warning   NodeNotReady                   loader-g-no-79d7f5f4f6-6x5fp   Node is not ready
+2026-11-03T08:01:24Z   Warning   FailedToUpdateEndpointSlices   loader-g-yes                   Error updating Endpoint Slices for Service e2e/loader-g-yes: skipping Pod loader-g-yes-7b89f4-kfc4k for Service e2e/loader-g-yes: Node aks-nodepool1-63764748-vmss000000 Not Found
+2026-11-03T08:01:22Z   Warning   NodeNotReady                   g-no-0                         Node is not ready
+2026-11-03T08:01:22Z   Warning   NodeNotReady                   g-no-1                         Node is not ready
+2026-11-03T08:01:22Z   Warning   NodeNotReady                   g-yes-0                        Node is not ready
+2026-11-03T08:01:23Z   Warning   NodeNotReady                   nd-7bqf9                       Node is not ready
+2026-11-03T08:01:23Z   Warning   NodeNotReady                   shd-0-1                        Node is not ready
+2026-11-03T08:01:25Z   Warning   FailedToUpdateEndpointSlices   g-yes-master                   Error updating Endpoint Slices for Service e2e/g-yes-master: skipping Pod g-yes-1 for Service e2e/g-yes-master: Node aks-nodepool1-63764748-vmss000003 Not Found
+2026-11-03T08:01:23Z   Warning   NodeNotReady                   g-yes-1                        Node is not ready
+2026-11-03T08:01:25Z   Warning   FailedToUpdateEndpointSlices   shd-1-1                        Error updating Endpoint Slices for Service e2e/shd-1-1: skipping Pod shd-1-1 for Service e2e/shd-1-1: Node aks-nodepool1-63764748-vmss000000 Not Found
+2026-11-03T08:01:25Z   Warning   FailedToUpdateEndpointSlices   shd-shard-1                    Error updating Endpoint Slices for Service e2e/shd-shard-1: [skipping Pod shd-1-0 for Service e2e/shd-shard-1: Node aks-nodepool1-63764748-vmss000003 Not Found, skipping Pod shd-1-1 for Service e2e/shd-shard-1: Node aks-nodepool1-63764748-vmss000000 Not Found]
+2026-11-03T08:01:23Z   Warning   NodeNotReady                   shd-1-1                        Node is not ready
+2026-11-03T08:01:25Z   Warning   FailedToUpdateEndpointSlices   shd                            Error updating Endpoint Slices for Service e2e/shd: [skipping Pod shd-1-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found, skipping Pod shd-0-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found, skipping Pod shd-1-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000000 Not Found, skipping Pod shd-2-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000001 Not Found]
+2026-11-03T08:01:23Z   Warning   NodeNotReady                   nd-jkwft                       Node is not ready
+2026-11-03T08:01:23Z   Warning   NodeNotReady                   loader-g-yes-7b89f4-kfc4k      Node is not ready
+2026-11-03T08:01:25Z   Warning   FailedToUpdateEndpointSlices   loader-g-yes                   Error updating Endpoint Slices for Service e2e/loader-g-yes: skipping Pod loader-g-yes-7b89f4-kfc4k for Service e2e/loader-g-yes: Node aks-nodepool1-63764748-vmss000000 Not Found
+2026-11-03T08:01:27Z   Warning   FailedToUpdateEndpointSlices   g-yes-master                   Error updating Endpoint Slices for Service e2e/g-yes-master: skipping Pod g-yes-1 for Service e2e/g-yes-master: Node aks-nodepool1-63764748-vmss000003 Not Found
+2026-11-03T08:01:27Z   Warning   FailedToUpdateEndpointSlices   shd-1-1                        Error updating Endpoint Slices for Service e2e/shd-1-1: skipping Pod shd-1-1 for Service e2e/shd-1-1: Node aks-nodepool1-63764748-vmss000000 Not Found
+2026-11-03T08:01:27Z   Warning   FailedToUpdateEndpointSlices   shd-shard-1                    Error updating Endpoint Slices for Service e2e/shd-shard-1: [skipping Pod shd-1-0 for Service e2e/shd-shard-1: Node aks-nodepool1-63764748-vmss000003 Not Found, skipping Pod shd-1-1 for Service e2e/shd-shard-1: Node aks-nodepool1-63764748-vmss000000 Not Found]
+2026-11-03T08:01:27Z   Warning   FailedToUpdateEndpointSlices   shd                            Error updating Endpoint Slices for Service e2e/shd: [skipping Pod shd-1-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found, skipping Pod shd-0-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found, skipping Pod shd-1-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000000 Not Found, skipping Pod shd-2-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000001 Not Found]
+2026-11-03T08:01:27Z   Warning   FailedToUpdateEndpointSlices   loader-g-yes                   Error updating Endpoint Slices for Service e2e/loader-g-yes: skipping Pod loader-g-yes-7b89f4-kfc4k for Service e2e/loader-g-yes: Node aks-nodepool1-63764748-vmss000000 Not Found
+2026-11-03T08:01:31Z   Warning   FailedToUpdateEndpointSlices   g-yes-master                   Error updating Endpoint Slices for Service e2e/g-yes-master: skipping Pod g-yes-1 for Service e2e/g-yes-master: Node aks-nodepool1-63764748-vmss000003 Not Found
+2026-11-03T08:01:31Z   Warning   FailedToUpdateEndpointSlices   shd-1-1                        Error updating Endpoint Slices for Service e2e/shd-1-1: skipping Pod shd-1-1 for Service e2e/shd-1-1: Node aks-nodepool1-63764748-vmss000000 Not Found
+2026-11-03T08:01:31Z   Warning   FailedToUpdateEndpointSlices   shd-shard-1                    Error updating Endpoint Slices for Service e2e/shd-shard-1: [skipping Pod shd-1-0 for Service e2e/shd-shard-1: Node aks-nodepool1-63764748-vmss000003 Not Found, skipping Pod shd-1-1 for Service e2e/shd-shard-1: Node aks-nodepool1-63764748-vmss000000 Not Found]
+2026-11-03T08:01:31Z   Warning   FailedToUpdateEndpointSlices   shd                            Error updating Endpoint Slices for Service e2e/shd: [skipping Pod shd-2-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000001 Not Found, skipping Pod shd-0-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000002 Not Found, skipping Pod shd-2-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000002 Not Found, skipping Pod shd-1-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found, skipping Pod shd-0-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found, skipping Pod shd-1-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000000 Not Found]
+2026-11-03T08:01:31Z   Warning   FailedToUpdateEndpointSlices   loader-g-yes                   Error updating Endpoint Slices for Service e2e/loader-g-yes: skipping Pod loader-g-yes-7b89f4-kfc4k for Service e2e/loader-g-yes: Node aks-nodepool1-63764748-vmss000000 Not Found
+2026-11-03T08:01:32Z   Warning   FailedToUpdateEndpointSlices   shd                            Error updating Endpoint Slices for Service e2e/shd: [skipping Pod shd-1-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000000 Not Found, skipping Pod shd-2-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000001 Not Found, skipping Pod shd-0-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000002 Not Found, skipping Pod shd-2-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000002 Not Found, skipping Pod shd-1-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found, skipping Pod shd-0-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found]
+2026-11-03T08:01:39Z   Warning   FailedToUpdateEndpointSlices   g-yes-master                   Error updating Endpoint Slices for Service e2e/g-yes-master: skipping Pod g-yes-1 for Service e2e/g-yes-master: Node aks-nodepool1-63764748-vmss000003 Not Found
+2026-11-03T08:01:39Z   Warning   FailedToUpdateEndpointSlices   shd-1-1                        Error updating Endpoint Slices for Service e2e/shd-1-1: skipping Pod shd-1-1 for Service e2e/shd-1-1: Node aks-nodepool1-63764748-vmss000000 Not Found
+2026-11-03T08:01:39Z   Warning   FailedToUpdateEndpointSlices   shd-shard-1                    Error updating Endpoint Slices for Service e2e/shd-shard-1: [skipping Pod shd-1-0 for Service e2e/shd-shard-1: Node aks-nodepool1-63764748-vmss000003 Not Found, skipping Pod shd-1-1 for Service e2e/shd-shard-1: Node aks-nodepool1-63764748-vmss000000 Not Found]
+2026-11-03T08:01:39Z   Warning   FailedToUpdateEndpointSlices   loader-g-yes                   Error updating Endpoint Slices for Service e2e/loader-g-yes: skipping Pod loader-g-yes-7b89f4-kfc4k for Service e2e/loader-g-yes: Node aks-nodepool1-63764748-vmss000000 Not Found
+2026-11-03T08:01:48Z   Warning   FailedToUpdateEndpointSlices   shd                            Error updating Endpoint Slices for Service e2e/shd: [skipping Pod shd-2-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000001 Not Found, skipping Pod shd-0-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000002 Not Found, skipping Pod shd-2-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000002 Not Found, skipping Pod shd-1-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found, skipping Pod shd-0-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found, skipping Pod shd-1-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000000 Not Found]
+2026-11-03T08:01:55Z   Warning   FailedToUpdateEndpointSlices   g-yes-master                   Error updating Endpoint Slices for Service e2e/g-yes-master: skipping Pod g-yes-1 for Service e2e/g-yes-master: Node aks-nodepool1-63764748-vmss000003 Not Found
+2026-11-03T08:01:55Z   Warning   FailedToUpdateEndpointSlices   shd-1-1                        Error updating Endpoint Slices for Service e2e/shd-1-1: skipping Pod shd-1-1 for Service e2e/shd-1-1: Node aks-nodepool1-63764748-vmss000000 Not Found
+2026-11-03T08:01:55Z   Warning   FailedToUpdateEndpointSlices   shd-shard-1                    Error updating Endpoint Slices for Service e2e/shd-shard-1: [skipping Pod shd-1-0 for Service e2e/shd-shard-1: Node aks-nodepool1-63764748-vmss000003 Not Found, skipping Pod shd-1-1 for Service e2e/shd-shard-1: Node aks-nodepool1-63764748-vmss000000 Not Found]
+2026-11-03T08:01:55Z   Warning   FailedToUpdateEndpointSlices   loader-g-yes                   Error updating Endpoint Slices for Service e2e/loader-g-yes: skipping Pod loader-g-yes-7b89f4-kfc4k for Service e2e/loader-g-yes: Node aks-nodepool1-63764748-vmss000000 Not Found
+2026-11-03T08:02:10Z   Warning   FailedToUpdateEndpointSlices   shd                            Error updating Endpoint Slices for Service e2e/shd: [skipping Pod shd-2-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000001 Not Found, skipping Pod shd-0-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000002 Not Found, skipping Pod shd-2-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000002 Not Found, skipping Pod shd-1-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found, skipping Pod shd-0-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found]
+2026-11-03T08:02:10Z   Normal    SuccessfulDelete               shd-1                          Delete Pod shd-1-1 in StatefulSet shd-1 successful
+2026-11-03T08:02:10Z   Warning   FailedToUpdateEndpointSlices   shd-shard-1                    Error updating Endpoint Slices for Service e2e/shd-shard-1: skipping Pod shd-1-0 for Service e2e/shd-shard-1: Node aks-nodepool1-63764748-vmss000003 Not Found
+2026-11-03T08:02:10Z   Warning   FailedToUpdateEndpointSlices   shd-shard-1                    Error updating Endpoint Slices for Service e2e/shd-shard-1: skipping Pod shd-1-0 for Service e2e/shd-shard-1: Node aks-nodepool1-63764748-vmss000003 Not Found
+2026-11-03T08:02:10Z   Warning   FailedToUpdateEndpointSlices   shd                            Error updating Endpoint Slices for Service e2e/shd: [skipping Pod shd-1-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found, skipping Pod shd-0-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found, skipping Pod shd-2-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000001 Not Found, skipping Pod shd-0-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000002 Not Found, skipping Pod shd-2-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000002 Not Found]
+2026-11-03T08:02:10Z   Warning   FailedToUpdateEndpointSlices   shd-replicas                   Error updating Endpoint Slices for Service e2e/shd-replicas: [skipping Pod shd-0-1 for Service e2e/shd-replicas: Node aks-nodepool1-63764748-vmss000003 Not Found, skipping Pod shd-2-0 for Service e2e/shd-replicas: Node aks-nodepool1-63764748-vmss000001 Not Found]
+2026-11-03T08:02:10Z   Normal    SuccessfulDelete               shd-2                          Delete Pod shd-2-1 in StatefulSet shd-2 successful
+2026-11-03T08:02:10Z   Normal    TaintManagerEviction           shd-2-1                        Cancelling deletion of Pod e2e/shd-2-1
+2026-11-03T08:02:10Z   Warning   FailedToUpdateEndpointSlices   shd-replicas                   Error updating Endpoint Slices for Service e2e/shd-replicas: [skipping Pod shd-0-1 for Service e2e/shd-replicas: Node aks-nodepool1-63764748-vmss000003 Not Found, skipping Pod shd-2-0 for Service e2e/shd-replicas: Node aks-nodepool1-63764748-vmss000001 Not Found]
+2026-11-03T08:02:10Z   Warning   FailedToUpdateEndpointSlices   shd                            Error updating Endpoint Slices for Service e2e/shd: [skipping Pod shd-2-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000001 Not Found, skipping Pod shd-0-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000002 Not Found, skipping Pod shd-1-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found, skipping Pod shd-0-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found]
+2026-11-03T08:02:10Z   Warning   FailedToUpdateEndpointSlices   shd                            Error updating Endpoint Slices for Service e2e/shd: [skipping Pod shd-2-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000001 Not Found, skipping Pod shd-0-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000002 Not Found, skipping Pod shd-1-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found, skipping Pod shd-0-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found]
+2026-11-03T08:02:10Z   Warning   FailedScheduling               shd-1-1                        no nodes available to schedule pods
+2026-11-03T08:02:10Z   Normal    SuccessfulCreate               shd-1                          Create Pod shd-1-1 in StatefulSet shd-1 successful
+2026-11-03T08:02:10Z   Warning   FailedToUpdateEndpointSlices   shd-shard-2                    Error updating Endpoint Slices for Service e2e/shd-shard-2: skipping Pod shd-2-0 for Service e2e/shd-shard-2: Node aks-nodepool1-63764748-vmss000001 Not Found
+2026-11-03T08:02:10Z   Warning   FailedToUpdateEndpointSlices   shd-shard-2                    Error updating Endpoint Slices for Service e2e/shd-shard-2: skipping Pod shd-2-0 for Service e2e/shd-shard-2: Node aks-nodepool1-63764748-vmss000001 Not Found
+2026-11-03T08:02:10Z   Warning   FailedToUpdateEndpointSlices   shd-shard-1                    Error updating Endpoint Slices for Service e2e/shd-shard-1: skipping Pod shd-1-0 for Service e2e/shd-shard-1: Node aks-nodepool1-63764748-vmss000003 Not Found
+2026-11-03T08:02:10Z   Normal    SuccessfulDelete               g-yes                          Delete Pod g-yes-0 in StatefulSet g-yes successful
+2026-11-03T08:02:10Z   Warning   FailedToUpdateEndpointSlices   shd                            Error updating Endpoint Slices for Service e2e/shd: [skipping Pod shd-1-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found, skipping Pod shd-0-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found, skipping Pod shd-2-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000001 Not Found, skipping Pod shd-0-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000002 Not Found]
+2026-11-03T08:02:10Z   Warning   FailedScheduling               shd-2-1                        no nodes available to schedule pods
+2026-11-03T08:02:10Z   Normal    SuccessfulCreate               shd-2                          Create Pod shd-2-1 in StatefulSet shd-2 successful
+2026-11-03T08:02:10Z   Warning   FailedToUpdateEndpointSlices   shd-shard-2                    Error updating Endpoint Slices for Service e2e/shd-shard-2: skipping Pod shd-2-0 for Service e2e/shd-shard-2: Node aks-nodepool1-63764748-vmss000001 Not Found
+2026-11-03T08:02:10Z   Warning   FailedToUpdateEndpointSlices   shd                            Error updating Endpoint Slices for Service e2e/shd: [skipping Pod shd-2-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000001 Not Found, skipping Pod shd-0-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000002 Not Found, skipping Pod shd-1-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found, skipping Pod shd-0-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found]
+2026-11-03T08:02:10Z   Warning   FailedScheduling               g-yes-0                        no nodes available to schedule pods
+2026-11-03T08:02:10Z   Normal    SuccessfulCreate               g-yes                          Create Pod g-yes-0 in StatefulSet g-yes successful
+2026-11-03T08:02:10Z   Normal    SuccessfulCreate               loader-g-yes-7b89f4            Created pod: loader-g-yes-7b89f4-fcmb6
+2026-11-03T08:02:10Z   Warning   FailedScheduling               loader-g-yes-7b89f4-fcmb6      no nodes available to schedule pods
+2026-11-03T08:02:10Z   Warning   FailedScheduling               loader-g-no-79d7f5f4f6-9ppvg   no nodes available to schedule pods
+2026-11-03T08:02:10Z   Normal    SuccessfulCreate               loader-g-no-79d7f5f4f6         Created pod: loader-g-no-79d7f5f4f6-9ppvg
+2026-11-03T08:02:11Z   Warning   FailedToUpdateEndpointSlices   shd                            Error updating Endpoint Slices for Service e2e/shd: [skipping Pod shd-0-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found, skipping Pod shd-2-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000001 Not Found, skipping Pod shd-0-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000002 Not Found]
+2026-11-03T08:02:11Z   Normal    SuccessfulDelete               shd-1                          Delete Pod shd-1-0 in StatefulSet shd-1 successful
+2026-11-03T08:02:11Z   Warning   FailedToUpdateEndpointSlices   shd                            (combined from similar events): Error updating Endpoint Slices for Service e2e/shd: [skipping Pod shd-2-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000001 Not Found, skipping Pod shd-0-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000002 Not Found, skipping Pod shd-0-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found]
+2026-11-03T08:02:11Z   Normal    SuccessfulCreate               loader-shd-6d79cdbb4           Created pod: loader-shd-6d79cdbb4-2hp5z
+2026-11-03T08:02:11Z   Warning   FailedScheduling               loader-shd-6d79cdbb4-2hp5z     no nodes available to schedule pods
+2026-11-03T08:02:11Z   Warning   FailedToUpdateEndpointSlices   shd                            Error updating Endpoint Slices for Service e2e/shd: [skipping Pod shd-2-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000001 Not Found, skipping Pod shd-0-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000002 Not Found, skipping Pod shd-0-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found]
+2026-11-03T08:02:11Z   Normal    SuccessfulCreate               shd-1                          Create Pod shd-1-0 in StatefulSet shd-1 successful
+2026-11-03T08:02:11Z   Warning   FailedScheduling               shd-1-0                        no nodes available to schedule pods
+2026-11-03T08:02:11Z   Normal    SuccessfulDelete               g-yes                          Delete Pod g-yes-1 in StatefulSet g-yes successful
+2026-11-03T08:02:11Z   Warning   FailedScheduling               g-yes-1                        no nodes available to schedule pods
+2026-11-03T08:02:11Z   Normal    SuccessfulCreate               g-yes                          Create Pod g-yes-1 in StatefulSet g-yes successful
+2026-11-03T08:02:11Z   Normal    SuccessfulDelete               g-no                           Delete Pod g-no-0 in StatefulSet g-no successful
+2026-11-03T08:02:11Z   Warning   FailedToUpdateEndpointSlices   shd-replicas                   Error updating Endpoint Slices for Service e2e/shd-replicas: skipping Pod shd-0-1 for Service e2e/shd-replicas: Node aks-nodepool1-63764748-vmss000003 Not Found
+2026-11-03T08:02:11Z   Normal    SuccessfulCreate               g-no                           Create Pod g-no-0 in StatefulSet g-no successful
+2026-11-03T08:02:11Z   Warning   FailedScheduling               g-no-0                         no nodes available to schedule pods
+2026-11-03T08:02:11Z   Normal    SuccessfulDelete               shd-2                          Delete Pod shd-2-0 in StatefulSet shd-2 successful
+2026-11-03T08:02:11Z   Warning   FailedToUpdateEndpointSlices   shd-replicas                   Error updating Endpoint Slices for Service e2e/shd-replicas: skipping Pod shd-0-1 for Service e2e/shd-replicas: Node aks-nodepool1-63764748-vmss000003 Not Found
+2026-11-03T08:02:11Z   Warning   FailedToUpdateEndpointSlices   shd                            (combined from similar events): Error updating Endpoint Slices for Service e2e/shd: [skipping Pod shd-0-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found, skipping Pod shd-0-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000002 Not Found]
+2026-11-03T08:02:11Z   Warning   FailedToUpdateEndpointSlices   shd-replicas                   Error updating Endpoint Slices for Service e2e/shd-replicas: skipping Pod shd-0-1 for Service e2e/shd-replicas: Node aks-nodepool1-63764748-vmss000003 Not Found
+2026-11-03T08:02:11Z   Warning   FailedToUpdateEndpointSlices   shd                            (combined from similar events): Error updating Endpoint Slices for Service e2e/shd: [skipping Pod shd-0-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000002 Not Found, skipping Pod shd-0-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found]
+2026-11-03T08:02:11Z   Warning   FailedToUpdateEndpointSlices   shd                            Error updating Endpoint Slices for Service e2e/shd: [skipping Pod shd-0-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000002 Not Found, skipping Pod shd-0-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found]
+2026-11-03T08:02:11Z   Warning   FailedScheduling               shd-2-0                        no nodes available to schedule pods
+2026-11-03T08:02:11Z   Normal    SuccessfulCreate               shd-2                          Create Pod shd-2-0 in StatefulSet shd-2 successful
+2026-11-03T08:02:12Z   Warning   FailedScheduling               shd-1-1                        no nodes available to schedule pods
+2026-11-03T08:02:12Z   Warning   FailedScheduling               shd-2-1                        no nodes available to schedule pods
+2026-11-03T08:02:12Z   Warning   FailedScheduling               g-yes-0                        no nodes available to schedule pods
+2026-11-03T08:02:12Z   Warning   FailedScheduling               loader-g-yes-7b89f4-fcmb6      no nodes available to schedule pods
+2026-11-03T08:02:12Z   Warning   FailedScheduling               loader-g-no-79d7f5f4f6-9ppvg   no nodes available to schedule pods
+2026-11-03T08:02:12Z   Warning   FailedToUpdateEndpointSlices   shd                            Error updating Endpoint Slices for Service e2e/shd: [skipping Pod shd-0-0 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000002 Not Found, skipping Pod shd-0-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found]
+2026-11-03T08:02:13Z   Normal    SuccessfulDelete               shd-0                          Delete Pod shd-0-0 in StatefulSet shd-0 successful
+2026-11-03T08:02:13Z   Normal    TaintManagerEviction           shd-0-0                        Cancelling deletion of Pod e2e/shd-0-0
+2026-11-03T08:02:13Z   Warning   FailedToUpdateEndpointSlices   shd                            (combined from similar events): Error updating Endpoint Slices for Service e2e/shd: skipping Pod shd-0-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found
+2026-11-03T08:02:13Z   Warning   FailedToUpdateEndpointSlices   shd                            Error updating Endpoint Slices for Service e2e/shd: skipping Pod shd-0-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found
+2026-11-03T08:02:13Z   Warning   FailedToUpdateEndpointSlices   shd-shard-0                    Error updating Endpoint Slices for Service e2e/shd-shard-0: skipping Pod shd-0-1 for Service e2e/shd-shard-0: Node aks-nodepool1-63764748-vmss000003 Not Found
+2026-11-03T08:02:13Z   Warning   FailedToUpdateEndpointSlices   shd-shard-0                    Error updating Endpoint Slices for Service e2e/shd-shard-0: skipping Pod shd-0-1 for Service e2e/shd-shard-0: Node aks-nodepool1-63764748-vmss000003 Not Found
+2026-11-03T08:02:13Z   Warning   FailedScheduling               loader-shd-6d79cdbb4-2hp5z     no nodes available to schedule pods
+2026-11-03T08:02:13Z   Warning   FailedScheduling               shd-1-0                        no nodes available to schedule pods
+2026-11-03T08:02:13Z   Warning   FailedToUpdateEndpointSlices   shd                            Error updating Endpoint Slices for Service e2e/shd: skipping Pod shd-0-1 for Service e2e/shd: Node aks-nodepool1-63764748-vmss000003 Not Found
+2026-11-03T08:02:13Z   Normal    SuccessfulCreate               shd-0                          Create Pod shd-0-0 in StatefulSet shd-0 successful
+2026-11-03T08:02:13Z   Warning   FailedToUpdateEndpointSlices   shd-shard-0                    Error updating Endpoint Slices for Service e2e/shd-shard-0: skipping Pod shd-0-1 for Service e2e/shd-shard-0: Node aks-nodepool1-63764748-vmss000003 Not Found
+2026-11-03T08:02:13Z   Warning   FailedScheduling               g-yes-1                        no nodes available to schedule pods
+2026-11-03T08:02:13Z   Warning   FailedScheduling               g-no-0                         no nodes available to schedule pods
+2026-11-03T08:02:13Z   Warning   FailedScheduling               shd-2-0                        no nodes available to schedule pods
+2026-11-03T08:02:13Z   Warning   FailedScheduling               shd-0-0                        no nodes available to schedule pods
+2026-11-03T08:02:13Z   Normal    SuccessfulDelete               shd-0                          Delete Pod shd-0-1 in StatefulSet shd-0 successful
+2026-11-03T08:02:13Z   Warning   FailedScheduling               shd-0-1                        no nodes available to schedule pods
+2026-11-03T08:02:13Z   Normal    SuccessfulCreate               shd-0                          Create Pod shd-0-1 in StatefulSet shd-0 successful
+2026-11-03T08:02:13Z   Normal    TaintManagerEviction           g-no-1                         Cancelling deletion of Pod e2e/g-no-1
+2026-11-03T08:02:13Z   Normal    SuccessfulDelete               g-no                           Delete Pod g-no-1 in StatefulSet g-no successful
+2026-11-03T08:02:13Z   Warning   FailedScheduling               g-no-1                         no nodes available to schedule pods
+2026-11-03T08:02:13Z   Normal    SuccessfulCreate               g-no                           Create Pod g-no-1 in StatefulSet g-no successful
+2026-11-03T08:02:15Z   Warning   FailedScheduling               shd-1-1                        no nodes available to schedule pods
+2026-11-03T08:02:15Z   Warning   FailedScheduling               shd-2-1                        no nodes available to schedule pods
+2026-11-03T08:02:15Z   Warning   FailedScheduling               g-yes-0                        no nodes available to schedule pods
+2026-11-03T08:02:15Z   Warning   FailedScheduling               loader-g-yes-7b89f4-fcmb6      no nodes available to schedule pods
+2026-11-03T08:02:15Z   Warning   FailedScheduling               loader-g-no-79d7f5f4f6-9ppvg   no nodes available to schedule pods
+2026-11-03T08:02:15Z   Warning   FailedScheduling               shd-0-0                        no nodes available to schedule pods
+2026-11-03T08:02:15Z   Warning   FailedScheduling               shd-0-1                        no nodes available to schedule pods
+2026-11-03T08:02:15Z   Warning   FailedScheduling               g-no-1                         no nodes available to schedule pods
+2026-11-03T08:02:16Z   Warning   FailedScheduling               loader-shd-6d79cdbb4-2hp5z     no nodes available to schedule pods
+2026-11-03T08:02:16Z   Warning   FailedScheduling               shd-1-0                        no nodes available to schedule pods
+2026-11-03T08:02:16Z   Warning   FailedScheduling               g-yes-1                        no nodes available to schedule pods
+2026-11-03T08:02:16Z   Warning   FailedScheduling               g-no-0                         no nodes available to schedule pods
+2026-11-03T08:02:16Z   Warning   FailedScheduling               shd-2-0                        no nodes available to schedule pods
+2026-11-03T08:02:18Z   Warning   FailedScheduling               shd-0-0                        no nodes available to schedule pods
+2026-11-03T08:02:18Z   Warning   FailedScheduling               shd-0-1                        no nodes available to schedule pods
+2026-11-03T08:02:18Z   Warning   FailedScheduling               g-no-1                         no nodes available to schedule pods
+2026-11-03T08:02:20Z   Warning   FailedScheduling               shd-1-1                        no nodes available to schedule pods
+2026-11-03T08:02:20Z   Warning   FailedScheduling               shd-2-1                        no nodes available to schedule pods
+2026-11-03T08:02:20Z   Warning   FailedScheduling               g-yes-0                        no nodes available to schedule pods
+2026-11-03T08:02:20Z   Warning   FailedScheduling               loader-g-yes-7b89f4-fcmb6      no nodes available to schedule pods
+2026-11-03T08:02:20Z   Warning   FailedScheduling               loader-g-no-79d7f5f4f6-9ppvg   no nodes available to schedule pods
+2026-11-03T08:02:21Z   Warning   FailedScheduling               loader-shd-6d79cdbb4-2hp5z     no nodes available to schedule pods
+2026-11-03T08:02:21Z   Warning   FailedScheduling               shd-1-0                        no nodes available to schedule pods
+2026-11-03T08:02:21Z   Warning   FailedScheduling               g-yes-1                        no nodes available to schedule pods
+2026-11-03T08:02:21Z   Warning   FailedScheduling               g-no-0                         no nodes available to schedule pods
+2026-11-03T08:02:21Z   Warning   FailedScheduling               shd-2-0                        no nodes available to schedule pods
+2026-11-03T08:02:23Z   Warning   FailedScheduling               shd-0-0                        no nodes available to schedule pods
+2026-11-03T08:02:23Z   Warning   FailedScheduling               shd-0-1                        no nodes available to schedule pods
+2026-11-03T08:02:23Z   Warning   FailedScheduling               g-no-1                         no nodes available to schedule pods
+2026-11-03T08:02:29Z   Warning   FailedScheduling               shd-1-1                        no nodes available to schedule pods
+2026-11-03T08:02:29Z   Warning   FailedScheduling               shd-2-1                        no nodes available to schedule pods
+2026-11-03T08:02:29Z   Warning   FailedScheduling               g-yes-0                        no nodes available to schedule pods
+2026-11-03T08:02:29Z   Warning   FailedScheduling               loader-g-yes-7b89f4-fcmb6      no nodes available to schedule pods
+2026-11-03T08:02:29Z   Warning   FailedScheduling               loader-g-no-79d7f5f4f6-9ppvg   no nodes available to schedule pods
+2026-11-03T08:02:30Z   Warning   FailedScheduling               loader-shd-6d79cdbb4-2hp5z     no nodes available to schedule pods
+2026-11-03T08:02:30Z   Warning   FailedScheduling               shd-1-0                        no nodes available to schedule pods
+2026-11-03T08:02:30Z   Warning   FailedScheduling               g-yes-1                        no nodes available to schedule pods
+2026-11-03T08:02:30Z   Warning   FailedScheduling               g-no-0                         no nodes available to schedule pods
+2026-11-03T08:02:30Z   Warning   FailedScheduling               shd-2-0                        no nodes available to schedule pods
+2026-11-03T08:02:32Z   Warning   FailedScheduling               shd-0-0                        no nodes available to schedule pods
+2026-11-03T08:02:32Z   Warning   FailedScheduling               shd-0-1                        no nodes available to schedule pods
+2026-11-03T08:02:32Z   Warning   FailedScheduling               g-no-1                         no nodes available to schedule pods
+2026-11-03T08:02:40Z   Warning   FailedScheduling               shd-1-1                        no nodes available to schedule pods
+2026-11-03T08:02:40Z   Warning   FailedScheduling               shd-2-1                        no nodes available to schedule pods
+2026-11-03T08:02:40Z   Warning   FailedScheduling               g-yes-0                        no nodes available to schedule pods
+2026-11-03T08:02:40Z   Warning   FailedScheduling               loader-g-yes-7b89f4-fcmb6      no nodes available to schedule pods
+2026-11-03T08:02:40Z   Warning   FailedScheduling               loader-g-no-79d7f5f4f6-9ppvg   no nodes available to schedule pods
+2026-11-03T08:02:41Z   Warning   FailedScheduling               loader-shd-6d79cdbb4-2hp5z     no nodes available to schedule pods
+2026-11-03T08:02:41Z   Warning   FailedScheduling               shd-1-0                        no nodes available to schedule pods
+2026-11-03T08:02:41Z   Warning   FailedScheduling               g-yes-1                        no nodes available to schedule pods
+2026-11-03T08:02:41Z   Warning   FailedScheduling               g-no-0                         no nodes available to schedule pods
+2026-11-03T08:02:41Z   Warning   FailedScheduling               shd-2-0                        no nodes available to schedule pods
+2026-11-03T08:02:43Z   Warning   FailedScheduling               shd-0-0                        no nodes available to schedule pods
+2026-11-03T08:02:43Z   Warning   FailedScheduling               shd-0-1                        no nodes available to schedule pods
+2026-11-03T08:02:43Z   Warning   FailedScheduling               g-no-1                         no nodes available to schedule pods
+2026-11-03T08:02:51Z   Warning   FailedScheduling               shd-1-1                        no nodes available to schedule pods
+2026-11-03T08:02:51Z   Warning   FailedScheduling               shd-2-1                        no nodes available to schedule pods
+2026-11-03T08:02:51Z   Warning   FailedScheduling               g-yes-0                        no nodes available to schedule pods
+2026-11-03T08:02:51Z   Warning   FailedScheduling               loader-g-yes-7b89f4-fcmb6      no nodes available to schedule pods
+2026-11-03T08:02:51Z   Warning   FailedScheduling               loader-g-no-79d7f5f4f6-9ppvg   no nodes available to schedule pods
+2026-11-03T08:02:52Z   Warning   FailedScheduling               loader-shd-6d79cdbb4-2hp5z     no nodes available to schedule pods
+2026-11-03T08:02:52Z   Warning   FailedScheduling               shd-1-0                        no nodes available to schedule pods
+2026-11-03T08:02:52Z   Warning   FailedScheduling               g-yes-1                        no nodes available to schedule pods
+2026-11-03T08:02:52Z   Warning   FailedScheduling               g-no-0                         no nodes available to schedule pods
+2026-11-03T08:02:52Z   Warning   FailedScheduling               shd-2-0                        no nodes available to schedule pods
+2026-11-03T08:02:54Z   Warning   FailedScheduling               shd-0-0                        no nodes available to schedule pods
+2026-11-03T08:02:54Z   Warning   FailedScheduling               shd-0-1                        no nodes available to schedule pods
+2026-11-03T08:02:54Z   Warning   FailedScheduling               g-no-1                         no nodes available to schedule pods
+2026-11-03T08:03:02Z   Warning   FailedScheduling               shd-1-1                        no nodes available to schedule pods
+2026-11-03T08:03:02Z   Warning   FailedScheduling               shd-2-1                        no nodes available to schedule pods
+2026-11-03T08:03:02Z   Warning   FailedScheduling               g-yes-0                        no nodes available to schedule pods
+2026-11-03T08:03:02Z   Warning   FailedScheduling               loader-g-yes-7b89f4-fcmb6      no nodes available to schedule pods
+2026-11-03T08:03:02Z   Warning   FailedScheduling               loader-g-no-79d7f5f4f6-9ppvg   no nodes available to schedule pods
+2026-11-03T08:03:03Z   Warning   FailedScheduling               loader-shd-6d79cdbb4-2hp5z     no nodes available to schedule pods
+2026-11-03T08:03:03Z   Warning   FailedScheduling               shd-1-0                        no nodes available to schedule pods
+2026-11-03T08:03:03Z   Warning   FailedScheduling               g-yes-1                        no nodes available to schedule pods
+2026-11-03T08:03:03Z   Warning   FailedScheduling               g-no-0                         no nodes available to schedule pods
+2026-11-03T08:03:03Z   Warning   FailedScheduling               shd-2-0                        no nodes available to schedule pods
+2026-11-03T08:03:05Z   Warning   FailedScheduling               shd-0-0                        no nodes available to schedule pods
+2026-11-03T08:03:05Z   Warning   FailedScheduling               shd-0-1                        no nodes available to schedule pods
+2026-11-03T08:03:05Z   Warning   FailedScheduling               g-no-1                         no nodes available to schedule pods

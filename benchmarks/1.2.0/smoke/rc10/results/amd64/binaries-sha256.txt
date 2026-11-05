@@ -1,0 +1,26 @@
+total 72876
+-rw-rw-r-- 1 vmuser docker    1133 Nov  3 14:31 SHA256SUMS.txt
+-rw-rw-r-- 1 vmuser docker 6442350 Nov  3 14:31 kividb-full-linux-aarch64.tar.gz
+-rw-rw-r-- 1 vmuser docker 6823388 Nov  3 14:31 kividb-full-linux-x86_64.tar.gz
+-rw-rw-r-- 1 vmuser docker 5714059 Nov  3 14:31 kividb-linux-aarch64.tar.gz
+-rw-rw-r-- 1 vmuser docker 6051267 Nov  3 14:31 kividb-linux-x86_64.tar.gz
+-rw-rw-r-- 1 vmuser docker 6202884 Nov  3 14:31 kividb-lua-linux-aarch64.tar.gz
+-rw-rw-r-- 1 vmuser docker 6573752 Nov  3 14:31 kividb-lua-linux-x86_64.tar.gz
+-rw-rw-r-- 1 vmuser docker 5954503 Nov  3 14:31 kividb-tls-linux-aarch64.tar.gz
+-rw-rw-r-- 1 vmuser docker 6298053 Nov  3 14:31 kividb-tls-linux-x86_64.tar.gz
+-rw-rw-r-- 1 vmuser docker 6044087 Nov  3 14:31 kividb.aarch64.rpm
+-rw-rw-r-- 1 vmuser docker 6385349 Nov  3 14:31 kividb.x86_64.rpm
+-rw-rw-r-- 1 vmuser docker 6169744 Nov  3 14:31 kividb_amd64.deb
+-rw-rw-r-- 1 vmuser docker 5942504 Nov  3 14:31 kividb_arm64.deb
+./kividb-linux-x86_64.tar.gz: OK
+./kividb_arm64.deb: OK
+./kividb-lua-linux-aarch64.tar.gz: OK
+./kividb-linux-aarch64.tar.gz: OK
+./kividb-tls-linux-aarch64.tar.gz: OK
+./kividb_amd64.deb: OK
+./kividb.x86_64.rpm: OK
+./kividb-tls-linux-x86_64.tar.gz: OK
+./kividb-full-linux-aarch64.tar.gz: OK
+./kividb-lua-linux-x86_64.tar.gz: OK
+./kividb.aarch64.rpm: OK
+./kividb-full-linux-x86_64.tar.gz: OK

@@ -1,0 +1,6 @@
+10.80.1.9:7001 0 - replica
+10.80.1.8:7001 345 - replica
+10.80.1.5:7001 69 - [0-<-e76a3a1003cb9a2aa3b865cf6d98807bcaad5167] master
+10.80.1.9:7002 69 - replica
+10.80.1.8:7002 0 - master
+10.80.1.5:7002 345 owner [0->-f928e7d9f5bf6b9b384cd1ced1c5b5b5dccfc1f0] master

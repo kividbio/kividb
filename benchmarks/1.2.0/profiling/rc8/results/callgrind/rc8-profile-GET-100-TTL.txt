@@ -1,0 +1,70 @@
+--------------------------------------------------------------------------------
+Profile data file '/tmp/hp/out.1' (creator: callgrind-3.19.0)
+--------------------------------------------------------------------------------
+I1 cache: 
+D1 cache: 
+LL cache: 
+Timerange: Basic block 0 - 40700996
+Trigger: dump
+Profiled target:  /target/perf-rc8/release/kividb --port 6400 --bind 127.0.0.1 --io-model uring --threads 1 --loglevel warning (PID 2970, part 1)
+Events recorded:  Ir
+Events shown:     Ir
+Event sort order: Ir
+Thresholds:       99
+Include dirs:     
+User annotated:   
+Auto-annotation:  on
+
+--------------------------------------------------------------------------------
+Ir                   
+--------------------------------------------------------------------------------
+204,733,812 (100.0%)  PROGRAM TOTALS
+
+--------------------------------------------------------------------------------
+Ir                   file:function
+--------------------------------------------------------------------------------
+12,893,842 ( 6.30%)  /w-rc8/src/server_uring.rs:kividb::server_uring::handle_client::{closure#0} [/target/perf-rc8/release/kividb]
+11,040,392 ( 5.39%)  /w-rc8/src/commands/handler.rs:kividb::commands::handler::run_command [/target/perf-rc8/release/kividb]
+ 8,460,374 ( 4.13%)  /w-rc8/src/resp/parse.rs:kividb::resp::parse::parse_multibulk [/target/perf-rc8/release/kividb]
+ 7,729,710 ( 3.78%)  ./malloc/./malloc/malloc.c:_int_free [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 6,840,104 ( 3.34%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/str/validations.rs:core::str::converts::from_utf8
+ 6,135,306 ( 3.00%)  ./string/../sysdeps/x86_64/multiarch/memcmp-avx2-movbe.S:__memcmp_avx2_movbe [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 4,922,583 ( 2.40%)  ./malloc/./malloc/malloc.c:malloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 4,500,150 ( 2.20%)  /w-rc8/src/commands/handler.rs:kividb::commands::handler::execute_command [/target/perf-rc8/release/kividb]
+ 4,212,497 ( 2.06%)  ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:__memcpy_avx_unaligned_erms [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 3,420,322 ( 1.67%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/option.rs:kividb::commands::handler::dispatch_command_handlers
+ 2,910,287 ( 1.42%)  /w-rc8/src/resp/write.rs:kividb::resp::write::push_decimal [/target/perf-rc8/release/kividb]
+ 2,831,862 ( 1.38%)  /w-rc8/src/commands/strings.rs:kividb::commands::strings::handle [/target/perf-rc8/release/kividb]
+ 2,820,114 ( 1.38%)  /w-rc8/src/commands/arity.rs:kividb::commands::handler::run_command
+ 2,580,114 ( 1.26%)  /w-rc8/src/resp/parse.rs:<kividb::resp::parse::Progress>::next_request [/target/perf-rc8/release/kividb]
+ 2,531,172 ( 1.24%)  ./malloc/./malloc/malloc.c:free [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 2,460,108 ( 1.20%)  /w-rc8/src/cmdstats.rs:kividb::cmdstats::record [/target/perf-rc8/release/kividb]
+ 2,401,740 ( 1.17%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/sys/pal/unix/time.rs:<std::sys::pal::unix::time::Timespec>::sub_timespec [/target/perf-rc8/release/kividb]
+ 2,100,144 ( 1.03%)  /w-rc8/src/commands/handler.rs:kividb::commands::handler::dispatch_command_handlers [/target/perf-rc8/release/kividb]
+ 2,100,000 ( 1.03%)  /w-rc8/src/store/mod.rs:kividb::commands::strings::handle
+ 2,040,078 ( 1.00%)  /w-rc8/src/client_registry.rs:<kividb::client_registry::Activity>::record
+ 2,004,828 ( 0.98%)  ./time/../sysdeps/unix/sysv/linux/clock_gettime.c:clock_gettime@@GLIBC_2.17 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 1,987,592 ( 0.97%)  /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/memchr-2.8.0/src/arch/x86_64/avx2/memchr.rs:memchr::arch::x86_64::memchr::memchr_raw::find_avx2
+ 1,980,066 ( 0.97%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/alloc/src/raw_vec/mod.rs:<alloc::raw_vec::RawVecInner>::try_allocate_in [/target/perf-rc8/release/kividb]
+ 1,920,492 ( 0.94%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/sys/pal/unix/time.rs:<std::sys::pal::unix::time::Timespec>::now [/target/perf-rc8/release/kividb]
+ 1,920,064 ( 0.94%)  /w-rc8/src/command_gate.rs:kividb::command_gate::enter_unless::<kividb::commands::handler::run_command::{closure#6}> [/target/perf-rc8/release/kividb]
+ 1,800,060 ( 0.88%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/sync/atomic.rs:kividb::commands::handler::run_command
+ 1,620,096 ( 0.79%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/slice/iter/macros.rs:kividb::commands::handler::execute_command
+ 1,560,052 ( 0.76%)  /w-rc8/src/commands/handler.rs:kividb::commands::handler::write_side_effects [/target/perf-rc8/release/kividb]
+ 1,439,490 ( 0.70%)  /w-rc8/src/store/shard_map.rs:kividb::commands::strings::handle
+ 1,354,040 ( 0.66%)  /w-rc8/src/store/entry.rs:<hashbrown::raw::RawTable<kividb::store::entry::Slot>>::find::<<kividb::store::shard_map::ShardMap>::find::{closure#0}>
+ 1,325,852 ( 0.65%)  ./malloc/./malloc/arena.c:free
+ 1,320,044 ( 0.64%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/option.rs:kividb::commands::handler::run_command
+ 1,260,096 ( 0.62%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/slice/cmp.rs:kividb::commands::handler::run_command
+ 1,200,040 ( 0.59%)  /w-rc8/src/commands/blocking.rs:<kividb::commands::blocking::BlockingSlot>::prime [/target/perf-rc8/release/kividb]
+ 1,162,363 ( 0.57%)  /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hashbrown-0.17.1/src/raw.rs:<hashbrown::raw::RawTable<kividb::store::entry::Slot>>::find::<<kividb::store::shard_map
+ 1,143,340 ( 0.56%)  /w-rc8/src/resp/write.rs:kividb::resp::write::resp_bulk [/target/perf-rc8/release/kividb]
+ 1,140,158 ( 0.56%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/slice/cmp.rs:kividb::commands::strings::handle
+ 1,080,085 ( 0.53%)  /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hashbrown-0.17.1/src/control/tag.rs:<hashbrown::raw::RawTable<kividb::store::entry::Slot>>::find::<<kividb::store::s
+ 1,020,040 ( 0.50%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/num/mod.rs:kividb::commands::handler::execute_command
+ 1,020,038 ( 0.50%)  /w-rc8/src/replication/mod.rs:kividb::replication::command_mutates_for_replication [/target/perf-rc8/release/kividb]
+   960,192 ( 0.47%)  /w-rc8/src/replication/mod.rs:kividb::replication::is_write_command [/target/perf-rc8/release/kividb]
+   960,044 ( 0.47%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/option.rs:kividb::resp::parse::parse_multibulk
+   960,000 ( 0.47%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/num/uint_macros.rs:kividb::commands::strings::handle
+   952,146 ( 0.47%)  /w-rc8/src/commands/helpers.rs:kividb::commands::helpers::spawn_active_expire_task::{closure#1}
+   900,036 ( 0.44%)  /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/ptr/mod.rs:kividb::commands::handler::run_command

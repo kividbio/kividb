@@ -1,0 +1,5 @@
+# The reference run: Dify's own `redis` service, with its command and health check
+# unchanged, on the redis:8 image instead of redis:6-alpine.
+services:
+  redis:
+    image: ${REDIS_IMAGE:-redis:8}

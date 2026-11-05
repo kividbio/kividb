@@ -55,8 +55,11 @@ step "blocking matrix" python smoke/blocking_matrix.py --port 6380 --label "$MOD
 
 replication() {
   local log=$LOGS/kividb-replica-$MODEL.log
-  "$BIN" --port 6381 --bind 127.0.0.1 --loglevel notice --io-model "$MODEL" \
-    --replicaof 127.0.0.1 6380 > "$log" 2>&1 &
+  # A directory of its own: the master holds this one's kividb.lock.
+  local dir
+  dir=$(mktemp -d)
+  (cd "$dir" && "$BIN" --port 6381 --bind 127.0.0.1 --loglevel notice --io-model "$MODEL" \
+    --replicaof 127.0.0.1 6380 > "$log" 2>&1 &)
   wait_up 6381 "$log" || return 1
   python smoke/replication_determinism.py --master-port 6380 --replica-port 6381 --label "$MODEL"
   local status=$?

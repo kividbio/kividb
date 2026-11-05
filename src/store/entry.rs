@@ -745,10 +745,11 @@ impl Entry {
             // is the value's move; the old block is freed without dropping
             // it.
             unsafe { std::ptr::copy_nonoverlapping(self.base(), to.as_ptr(), size) };
-            return Relocation::Moved {
+            return Relocation::Moved(Moving {
                 to: Entry(to.cast()),
-                left: Left(self.0.cast(), size),
-            };
+                from: self.0.cast(),
+                size,
+            });
         }
         // SAFETY: as above, nothing else reads the value.
         let value = unsafe {
@@ -768,13 +769,40 @@ impl Entry {
 pub(super) enum Relocation {
     Stays,
     Held,
-    /// The entry moved to `to`; `left` is the old block.
-    Moved {
-        to: Entry,
-        left: Left,
-    },
+    /// The entry is copied; the store is to point to the copy.
+    Moved(Moving),
     /// The entry stayed; its string's bytes moved, and this is the old block.
     BytesMoved(SharedBytes),
+}
+
+/// An entry copied by compaction that the store does not point to yet.
+/// Dropped before [`Moving::done`], as when a panic unwinds, it frees the
+/// copy and leaves the old block, which the store still points to.
+pub(super) struct Moving {
+    to: Entry,
+    from: NonNull<u8>,
+    size: usize,
+}
+
+impl Moving {
+    /// The copy.
+    pub(super) fn to(&self) -> Entry {
+        self.to
+    }
+
+    /// The store points to the copy now: the old block is what is left.
+    pub(super) fn done(self) -> Left {
+        let moving = std::mem::ManuallyDrop::new(self);
+        Left(moving.from, moving.size)
+    }
+}
+
+impl Drop for Moving {
+    fn drop(&mut self) {
+        // SAFETY: nothing points to the copy; its value is still the old
+        // block's, so it is freed without being dropped.
+        unsafe { deallocate(self.to.0.cast(), self.size) };
+    }
 }
 
 /// An entry's block left behind by compaction, freed when dropped.

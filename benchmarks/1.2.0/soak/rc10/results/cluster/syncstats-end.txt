@@ -1,0 +1,6 @@
+10.81.1.11:7001 sync_full=1 sync_partial_ok=0 sync_partial_err=1 
+10.81.1.12:7001 sync_full=0 sync_partial_ok=0 sync_partial_err=0 
+10.81.1.13:7001 sync_full=3 sync_partial_ok=0 sync_partial_err=2 
+10.81.1.11:7002 sync_full=0 sync_partial_ok=0 sync_partial_err=0 
+10.81.1.12:7002 sync_full=0 sync_partial_ok=0 sync_partial_err=0 
+10.81.1.13:7002 sync_full=2 sync_partial_ok=0 sync_partial_err=2 

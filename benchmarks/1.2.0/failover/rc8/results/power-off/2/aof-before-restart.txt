@@ -1,0 +1,9 @@
+total 29408
+-rw-rw-r-- 1 azureuser azureuser 30093215 Nov  3 05:19 appendonly.aof
+-rw-rw-r-- 1 azureuser azureuser       28 Nov  3 05:18 bin
+-rw-rw-r-- 1 azureuser azureuser        0 Nov  3 05:18 kividb.lock
+-rw-rw-r-- 1 azureuser azureuser      116 Nov  3 05:18 node.conf
+-rw-rw-r-- 1 azureuser azureuser        5 Nov  3 05:18 pid
+-rw-rw-r-- 1 azureuser azureuser     4195 Nov  3 05:18 server.log
+aof_size 30093215 trailing_zero_bytes 0
+last 160 bytes: b'\r\n*3\r\n$3\r\nSET\r\n$12\r\nack:10:24012\r\n$41\r\n10:24012:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n*3\r\n$3\r\nSET\r\n$11\r\nack:8:24180\r\n$40\r\n8:24180:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n'

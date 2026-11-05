@@ -1,0 +1,2 @@
+g-113-0 kividb_version:1.1.3 run_id:0000000017cfa50000000000deadbeee17cfa501 keys=585399 role:slave master_host:10.244.0.64 master_link_status:up aof_enabled:1  ack=[ ]
+g-113-1 kividb_version:1.1.3 run_id:000000000f18c61000000000deadbeee0f18c611 keys=585423 role:master master_replid:13da55201bdeb953d8ed08cbe31d75a783c17f4a master_repl_offset:23197010 aof_enabled:1  ack=[ ]

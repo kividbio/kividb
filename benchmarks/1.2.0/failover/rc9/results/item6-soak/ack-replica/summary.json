@@ -1,0 +1,20 @@
+{
+ "mode": "standalone",
+ "writers": 16,
+ "duration_s": 1800.0,
+ "acked": 1415191,
+ "unacked_errors": 8,
+ "lost_acked": 0,
+ "wrong_value": 0,
+ "wait_n": 0,
+ "wait_acked": 0,
+ "wait_acked_lost": 0,
+ "lost_ack_time_first": null,
+ "lost_ack_time_last": null,
+ "lost_sample": [],
+ "events": [],
+ "recovery": {},
+ "error_kinds": {
+  "ConnectionError:Error": 8
+ }
+}

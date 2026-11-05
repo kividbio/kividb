@@ -1,0 +1,27 @@
+PASS: rpm: dnf install under systemd (ubi9-init)
+PASS: rpm: unit active and serving after install
+PASS: rpm: CONFIG GET repl-backlog-size = 67108864 (64 MB)
+PASS: rpm: CONFIG GET shutdown-timeout = 10
+PASS: rpm: /var/lib/kividb/kividb.lock exists (kividb 644)
+INFO: rpm: 20000 keys loaded
+PASS: rpm: systemctl restart #1 returned in 0.07s, serving
+PASS: rpm: systemctl restart #2 returned in 0.08s, serving
+PASS: rpm: systemctl restart #3 returned in 0.08s, serving
+PASS: rpm: systemctl restart #4 returned in 0.08s, serving
+PASS: rpm: systemctl restart #5 returned in 0.07s, serving
+PASS: rpm: 20000 keys kept across 5 restarts
+PASS: rpm: no restart waited for the lock (journal has no in-use line)
+PASS: rpm: systemctl stop in 0.07s, unit inactive (success)
+PASS: rpm: systemctl start again, serving
+PASS: rpm: after SIGKILL, Restart=on-failure brings it back (lock released)
+PASS: rpm: 20000 keys after SIGKILL + restart
+PASS: rpm: a second server started by hand logs [The data directory /var/lib/kividb is in use by another process (it holds kividb.lock): waiting for it to be free]
+PASS: rpm: the second server does not serve while it waits
+PASS: rpm: the unit keeps serving meanwhile
+PASS: rpm: systemctl stop (0.07s) lets the waiting server take over
+PASS: rpm: it logs [The data directory is free after 3.2s: starting]
+PASS: rpm: the hand-started server has the 20000 keys
+PASS: rpm: the unit waits while the hand-started server holds the dir (active)
+PASS: rpm: the unit comes up once the hand-started server exits
+PASS: rpm: the unit's journal logs the wait
+PASS: rpm: dnf remove stops it

@@ -406,22 +406,65 @@ impl<'q> Scoring<'q> {
 
     /// The score of the document at `key`, whose fields are `doc`. The
     /// document matches the query.
-    pub fn score(&self, def: &IndexDef, key: &str, doc: &dyn Doc) -> f64 {
-        match self.scorer {
-            Scorer::DocScore => 1.0,
-            Scorer::Hamming => 0.0,
-            _ => {
-                let id = def.postings.read().id(key);
-                self.score_id(def, id, doc)
-            }
+    pub fn score(
+        &self,
+        def: &IndexDef,
+        key: &str,
+        doc: &dyn Doc,
+        json: Option<&serde_json::Value>,
+    ) -> f64 {
+        if matches!(self.scorer, Scorer::DocScore | Scorer::Hamming) {
+            return self.score_id(def, None, doc, json);
         }
+        let id = def.postings.read().id(key);
+        self.score_id(def, id, doc, json)
+    }
+
+    /// The document score `SCORE_FIELD` gives a document, or `SCORE` when it
+    /// holds no number there. A JSON document's number is read from the
+    /// document itself, not from what the schema projects of it.
+    fn document_score(def: &IndexDef, doc: &dyn Doc, json: Option<&serde_json::Value>) -> f64 {
+        let default_score = f64::from(def.default_score as f32);
+        let Some(field) = &def.score_field else {
+            return default_score;
+        };
+        let score = match def.on {
+            super::IndexOn::Hash => doc.field_bytes(field).and_then(Self::score_from_bytes),
+            super::IndexOn::Json => json
+                .and_then(|doc| super::json_score_field_number(field, doc))
+                .map(Self::score_from_number),
+        };
+        score
+            .filter(|score| !score.is_nan())
+            .unwrap_or(default_score)
+    }
+
+    /// Redis parses `SCORE_FIELD` as an `f64` and then narrows it to the
+    /// `f32` the document score is kept in.
+    fn score_from_number(number: f64) -> f64 {
+        f64::from(number as f32)
+    }
+
+    fn score_from_bytes(bytes: &[u8]) -> Option<f64> {
+        std::str::from_utf8(bytes)
+            .ok()?
+            .parse::<f64>()
+            .ok()
+            .map(Self::score_from_number)
     }
 
     /// [`Scoring::score`] of the document whose id in the index is `id`
     /// (`None`: it has none, and no words).
-    pub fn score_id(&self, def: &IndexDef, id: Option<u32>, doc: &dyn Doc) -> f64 {
+    pub fn score_id(
+        &self,
+        def: &IndexDef,
+        id: Option<u32>,
+        doc: &dyn Doc,
+        json: Option<&serde_json::Value>,
+    ) -> f64 {
+        let document_score = Self::document_score(def, doc, json);
         match self.scorer {
-            Scorer::DocScore => return 1.0,
+            Scorer::DocScore => return document_score,
             Scorer::Hamming => return 0.0,
             _ => {}
         }
@@ -442,11 +485,14 @@ impl<'q> Scoring<'q> {
         };
         drop(text);
         drop(postings);
-        let raw = res.value;
+        let raw = res.value * document_score;
         match self.scorer {
             Scorer::Bm25Std => raw,
             Scorer::Bm25StdTanh => (raw / self.tanh_factor).tanh(),
-            Scorer::Bm25 => raw / f64::from(slop(&res)),
+            Scorer::Bm25 => {
+                let score = raw / f64::from(slop(&res));
+                if score > 0.0 { score } else { 0.0 }
+            }
             Scorer::Tfidf | Scorer::TfidfDocNorm => {
                 let norm = if self.scorer == Scorer::Tfidf {
                     terms.max_freq
@@ -456,9 +502,10 @@ impl<'q> Scoring<'q> {
                 if norm == 0 {
                     return 0.0;
                 }
-                raw / f64::from(norm) / f64::from(slop(&res))
+                let score = raw / f64::from(norm) / f64::from(slop(&res));
+                if score > 0.0 { score } else { 0.0 }
             }
-            Scorer::DisMax => raw,
+            Scorer::DisMax => res.value,
             Scorer::DocScore | Scorer::Hamming => unreachable!(),
         }
     }

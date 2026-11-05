@@ -1,0 +1,61 @@
+== load stopped 01:33:00
+0s master_repl_offset=23583912360 replica_offset=23583912360 lag=0
+== replica INFO persistence
+aof_enabled:1
+rdb_bgsave_in_progress:0
+aof_rewrite_in_progress:0
+aof_rewrite_scheduled:0
+aof_last_rewrite_time_sec:0
+aof_last_rewrite_time_ms:744
+aof_last_bgrewrite_status:ok
+aof_current_size:148181794
+aof_base_size:19654286
+aof_lost_records:0
+aof_last_write_status:ok
+aof_acks_before_write:0
+aof_last_cow_size:0
+== DBSIZE master 1276633 replica 1276633
+== DEBUG DIGEST master OK replica OK
+== AOF/data files master
+68469	/mnt/kv/appendonly.aof
+739223984	/mnt/kv/dump.kdb
+24	/mnt/kv/dump.kdb.gen
+105	/mnt/kv/node.conf
+6	/mnt/kv/pid
+24465	/mnt/kv/server.log
+/mnt/kv:
+total 722020
+drwxrwxr-x 2 azureuser azureuser      4096 Nov  2 01:32 .
+drwxr-xr-x 7 azureuser root           4096 Nov  2 01:17 ..
+-rw-rw-r-- 1 azureuser azureuser     68469 Nov  2 01:33 appendonly.aof
+-rw-rw-r-- 1 azureuser azureuser 739223984 Nov  2 01:32 dump.kdb
+-rw-rw-r-- 1 azureuser azureuser        24 Nov  2 01:32 dump.kdb.gen
+-rw-rw-r-- 1 azureuser azureuser       105 Nov  2 01:17 node.conf
+-rw-rw-r-- 1 azureuser azureuser         6 Nov  2 01:17 pid
+-rw-rw-r-- 1 azureuser azureuser     24465 Nov  2 01:32 server.log
+== AOF/data files replica
+10579	/mnt/kv/appendonly.aof
+148184333	/mnt/kv/appendonly.aof.prev
+739873964	/mnt/kv/dump.kdb
+572430404	/mnt/kv/dump.kdb.10836.85.tmp
+24	/mnt/kv/dump.kdb.gen
+93	/mnt/kv/dump.kdb.repl
+130	/mnt/kv/node.conf
+6	/mnt/kv/pid
+25123	/mnt/kv/server.log
+/mnt/kv:
+total 1426340
+drwxrwxr-x 2 azureuser azureuser      4096 Nov  2 01:33 .
+drwxr-xr-x 4 azureuser root           4096 Nov  2 01:17 ..
+-rw-rw-r-- 1 azureuser azureuser     10579 Nov  2 01:33 appendonly.aof
+-rw-rw-r-- 1 azureuser azureuser 148184333 Nov  2 01:33 appendonly.aof.prev
+-rw-rw-r-- 1 azureuser azureuser 739873964 Nov  2 01:32 dump.kdb
+-rw-rw-r-- 1 azureuser azureuser 572430404 Nov  2 01:33 dump.kdb.10836.85.tmp
+-rw-rw-r-- 1 azureuser azureuser        24 Nov  2 01:32 dump.kdb.gen
+-rw-rw-r-- 1 azureuser azureuser        93 Nov  2 01:17 dump.kdb.repl
+-rw-rw-r-- 1 azureuser azureuser       130 Nov  2 01:17 node.conf
+-rw-rw-r-- 1 azureuser azureuser         6 Nov  2 01:17 pid
+-rw-rw-r-- 1 azureuser azureuser     25123 Nov  2 01:33 server.log
+== compare.py
+{"dbsize_a": 1161522, "dbsize_b": 1161522, "scanned_a": 1275628, "scanned_b": 1274860, "compared": 1275628, "differ_first_pass": 112, "differ_after_recheck": 0, "expiring_at_compare": 0, "real_differences": 0, "sample": [], "seconds": 130.0}
+== DBSIZE after compare master 1161095 replica 1161095

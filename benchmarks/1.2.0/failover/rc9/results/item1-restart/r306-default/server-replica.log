@@ -1,0 +1,119 @@
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc9 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc9
+  * Mode           : standalone
+  * OS             : linux x86_64
+  * Memory         : 31GiB available
+  * CPUs           : 8 cores detected
+  * Listening on   : 0.0.0.0:6379
+  * Worker threads : 6
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-03T07:35:01.168Z 21686 [INFO] KiviDB 1.2.0-rc9 starting: pid 21686, default build, config file '/mnt/kv/node.conf'
+2026-11-03T07:35:01.168Z 21686 [INFO] I/O model      : io_uring
+2026-11-03T07:35:01.169Z 21686 [INFO] Shards per DB  : 64
+2026-11-03T07:35:01.169Z 21686 [INFO] I/O model      : io_uring
+2026-11-03T07:35:01.169Z 21686 [INFO] Replication: Connecting to master 10.91.1.11:6379...
+2026-11-03T07:35:01.169Z 21686 [INFO] Ready to accept connections on 0.0.0.0:6379
+2026-11-03T07:35:01.173Z 21686 [INFO] Replication: Full resync from 61ef5b7412f744be4884b928b47394c5c13a8b1e offset=0
+2026-11-03T07:35:01.173Z 21686 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-03T07:35:01.174Z 21686 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-03T07:35:01.174Z 21686 [INFO] Replication: AOF is on — rebasing it onto the synced dataset
+2026-11-03T07:35:01.177Z 21686 [INFO] AOF: rebased onto dump.kdb (generation 1) — log is now the delta
+2026-11-03T07:35:01.177Z 21686 [INFO] Replication: Synced with 10.91.1.11:6379. Entering command stream.
+2026-11-03T07:35:11.169Z 21686 [INFO] AOF: auto-checkpoint: 465.85 MB is 100%+ above the 0.00 MB baseline — folding into dump.kdb
+2026-11-03T07:35:11.537Z 21686 [INFO] AOF: rebased onto dump.kdb (generation 2) — log is now the delta
+2026-11-03T07:35:21.537Z 21686 [INFO] AOF: auto-checkpoint: 253.62 MB is 100%+ above the 8.77 MB baseline — folding into dump.kdb
+2026-11-03T07:35:21.970Z 21686 [INFO] AOF: rebased onto dump.kdb (generation 3) — log is now the delta
+2026-11-03T07:35:31.970Z 21686 [INFO] AOF: auto-checkpoint: 255.31 MB is 100%+ above the 10.35 MB baseline — folding into dump.kdb
+2026-11-03T07:35:32.524Z 21686 [INFO] AOF: rebased onto dump.kdb (generation 4) — log is now the delta
+2026-11-03T07:35:42.524Z 21686 [INFO] AOF: auto-checkpoint: 255.59 MB is 100%+ above the 11.90 MB baseline — folding into dump.kdb
+2026-11-03T07:35:43.115Z 21686 [INFO] AOF: rebased onto dump.kdb (generation 5) — log is now the delta
+2026-11-03T07:35:53.115Z 21686 [INFO] AOF: auto-checkpoint: 258.12 MB is 100%+ above the 13.11 MB baseline — folding into dump.kdb
+2026-11-03T07:35:53.781Z 21686 [INFO] AOF: rebased onto dump.kdb (generation 6) — log is now the delta
+2026-11-03T07:36:03.781Z 21686 [INFO] AOF: auto-checkpoint: 259.77 MB is 100%+ above the 15.03 MB baseline — folding into dump.kdb
+2026-11-03T07:36:04.476Z 21686 [INFO] AOF: rebased onto dump.kdb (generation 7) — log is now the delta
+2026-11-03T07:36:06.474Z 21686 [WARN] Replication: Master closed the connection — reconnecting
+2026-11-03T07:36:07.481Z 21686 [INFO] Replication: Connecting to master 10.91.1.11:6379...
+2026-11-03T07:36:07.482Z 21686 [WARN] Replication: Replication link to 10.91.1.11:6379 failed: connect: Connection refused (os error 111) — retrying every 1s
+2026-11-03T07:36:14.313Z 21686 [WARN] Replication: Dropped the 1300286 local keys before loading 1294274 from the master
+2026-11-03T07:36:16.947Z 21686 [INFO] Replication: Full sync loaded: 1294273 keys (163015 with a TTL), replacing 1300286 local keys
+2026-11-03T07:36:16.951Z 21686 [INFO] Replication: AOF is on — rebasing it onto the synced dataset
+2026-11-03T07:36:17.597Z 21686 [INFO] AOF: rebased onto dump.kdb (generation 8) — log is now the delta
+2026-11-03T07:36:17.598Z 21686 [INFO] Replication: Synced with 10.91.1.11:6379. Entering command stream.
+2026-11-03T07:36:17.598Z 21686 [INFO] Replication: Backlog restarted at offset 1905701305 (it ended at 1877152833)
+2026-11-03T07:36:24.476Z 21686 [INFO] AOF: auto-checkpoint: 402.03 MB is 100%+ above the 0.00 MB baseline — folding into dump.kdb
+2026-11-03T07:36:25.198Z 21686 [INFO] AOF: rebased onto dump.kdb (generation 9) — log is now the delta
+2026-11-03T07:36:35.198Z 21686 [INFO] AOF: auto-checkpoint: 256.45 MB is 100%+ above the 17.32 MB baseline — folding into dump.kdb
+2026-11-03T07:36:35.928Z 21686 [INFO] AOF: rebased onto dump.kdb (generation 10) — log is now the delta
+2026-11-03T07:36:45.928Z 21686 [INFO] AOF: auto-checkpoint: 253.37 MB is 100%+ above the 17.32 MB baseline — folding into dump.kdb
+2026-11-03T07:36:46.689Z 21686 [INFO] AOF: rebased onto dump.kdb (generation 11) — log is now the delta
+2026-11-03T07:36:50.312Z 21686 [WARN] Replication: Master closed the connection — reconnecting
+2026-11-03T07:36:51.317Z 21686 [INFO] Replication: Connecting to master 10.91.1.11:6379...
+2026-11-03T07:36:51.318Z 21686 [WARN] Replication: Replication link to 10.91.1.11:6379 failed: connect: Connection refused (os error 111) — retrying every 1s
+2026-11-03T07:36:56.689Z 21686 [INFO] AOF: auto-checkpoint: 86.21 MB is 100%+ above the 18.07 MB baseline — folding into dump.kdb
+2026-11-03T07:36:57.418Z 21686 [INFO] AOF: rebased onto dump.kdb (generation 12) — log is now the delta
+2026-11-03T07:36:58.224Z 21686 [WARN] Replication: Dropped the 1329033 local keys before loading 1325608 from the master
+2026-11-03T07:37:01.059Z 21686 [INFO] Replication: Full sync loaded: 1325608 keys (201477 with a TTL), replacing 1329033 local keys
+2026-11-03T07:37:01.065Z 21686 [INFO] Replication: AOF is on — rebasing it onto the synced dataset
+2026-11-03T07:37:01.751Z 21686 [INFO] AOF: rebased onto dump.kdb (generation 13) — log is now the delta
+2026-11-03T07:37:01.752Z 21686 [INFO] Replication: Synced with 10.91.1.11:6379. Entering command stream.
+2026-11-03T07:37:01.752Z 21686 [INFO] Replication: Backlog restarted at offset 2953670735 (it ended at 2952345901)
+2026-11-03T07:37:07.418Z 21686 [INFO] AOF: auto-checkpoint: 278.69 MB is 100%+ above the 0.00 MB baseline — folding into dump.kdb
+2026-11-03T07:37:08.178Z 21686 [INFO] AOF: rebased onto dump.kdb (generation 14) — log is now the delta
+2026-11-03T07:37:18.178Z 21686 [INFO] AOF: auto-checkpoint: 252.42 MB is 100%+ above the 17.56 MB baseline — folding into dump.kdb
+2026-11-03T07:37:18.945Z 21686 [INFO] AOF: rebased onto dump.kdb (generation 15) — log is now the delta
+2026-11-03T07:37:28.945Z 21686 [INFO] AOF: auto-checkpoint: 255.53 MB is 100%+ above the 18.12 MB baseline — folding into dump.kdb
+2026-11-03T07:37:29.735Z 21686 [INFO] AOF: rebased onto dump.kdb (generation 16) — log is now the delta
+2026-11-03T07:37:34.969Z 21686 [WARN] Replication: Master closed the connection — reconnecting
+2026-11-03T07:37:35.976Z 21686 [INFO] Replication: Connecting to master 10.91.1.11:6379...
+2026-11-03T07:37:35.977Z 21686 [WARN] Replication: Replication link to 10.91.1.11:6379 failed: connect: Connection refused (os error 111) — retrying every 1s
+2026-11-03T07:37:39.735Z 21686 [INFO] AOF: auto-checkpoint: 121.60 MB is 100%+ above the 18.64 MB baseline — folding into dump.kdb
+2026-11-03T07:37:40.476Z 21686 [INFO] AOF: rebased onto dump.kdb (generation 17) — log is now the delta
+2026-11-03T07:37:43.061Z 21686 [WARN] Replication: Dropped the 1341698 local keys before loading 1337755 from the master
+2026-11-03T07:37:45.941Z 21686 [INFO] Replication: Full sync loaded: 1337755 keys (215882 with a TTL), replacing 1341698 local keys
+2026-11-03T07:37:45.948Z 21686 [INFO] Replication: AOF is on — rebasing it onto the synced dataset
+2026-11-03T07:37:46.655Z 21686 [INFO] AOF: rebased onto dump.kdb (generation 18) — log is now the delta
+2026-11-03T07:37:46.657Z 21686 [INFO] Replication: Synced with 10.91.1.11:6379. Entering command stream.
+2026-11-03T07:37:46.657Z 21686 [INFO] Replication: Backlog restarted at offset 3907857680 (it ended at 3906060319)
+2026-11-03T07:37:50.477Z 21686 [INFO] AOF: auto-checkpoint: 238.28 MB is 100%+ above the 0.00 MB baseline — folding into dump.kdb
+2026-11-03T07:37:51.279Z 21686 [INFO] AOF: rebased onto dump.kdb (generation 19) — log is now the delta
+2026-11-03T07:38:01.279Z 21686 [INFO] AOF: auto-checkpoint: 256.70 MB is 100%+ above the 19.27 MB baseline — folding into dump.kdb
+2026-11-03T07:38:02.072Z 21686 [INFO] AOF: rebased onto dump.kdb (generation 20) — log is now the delta
+2026-11-03T07:38:12.072Z 21686 [INFO] AOF: auto-checkpoint: 255.53 MB is 100%+ above the 18.49 MB baseline — folding into dump.kdb
+2026-11-03T07:38:12.872Z 21686 [INFO] AOF: rebased onto dump.kdb (generation 21) — log is now the delta

@@ -563,7 +563,14 @@ fn allkeys_lfu_keeps_a_read_set_under_a_stream_of_new_keys() {
 /// like any other deletion.
 #[test]
 fn evictions_reach_replicas() {
-    let master = Server::start(&["--maxmemory-policy", "allkeys-random"]);
+    // The backlog Redis keeps by default: it is counted in what is in use,
+    // and the 64 MB KiviDB keeps would not fit under the limit below.
+    let master = Server::start(&[
+        "--maxmemory-policy",
+        "allkeys-random",
+        "--repl-backlog-size",
+        "1048576",
+    ]);
     let replica = Server::start(&[]);
     let (mut m, mut r) = (master.conn(), replica.conn());
     assert!(
@@ -1376,7 +1383,13 @@ fn writes_during_an_aof_rewrite_evict_nothing_that_fits() {
 /// connected, over the limit for good.
 #[test]
 fn writes_during_a_full_sync_evict_nothing_that_fits() {
-    let master = Server::start_holding_snapshots(&["--maxmemory-policy", "allkeys-lru"]);
+    // A backlog that fits under the limit (see `evictions_reach_replicas`).
+    let master = Server::start_holding_snapshots(&[
+        "--maxmemory-policy",
+        "allkeys-lru",
+        "--repl-backlog-size",
+        "1048576",
+    ]);
     let replica = Server::start(&[]);
     let (mut m, mut r) = (master.conn(), replica.conn());
     let limit = m.fill_to_the_limit();
@@ -1392,4 +1405,25 @@ fn writes_during_a_full_sync_evict_nothing_that_fits() {
     m.snapshot_let_go(limit);
     assert_eq!(r.cmd(&["DBSIZE"]).i(), SNAPSHOT_KEYS as i64);
     assert_eq!(r.cmd(&["GET", "s0"]).s(), big_value('b'));
+}
+
+#[test]
+fn debug_object_shows_the_idle_time_and_is_not_a_use() {
+    let server = Server::start(&["--maxmemory-policy", "allkeys-lru"]);
+    let mut c = server.conn();
+    assert!(c.cmd(&["SET", "foo", "bar"]).ok());
+    let payload = c.dump("foo");
+    assert!(
+        c.restore("foo", &payload, &["REPLACE", "IDLETIME", "1000"])
+            .ok()
+    );
+    let line = c.cmd(&["DEBUG", "OBJECT", "foo"]).s().to_string();
+    let idle: i64 = line
+        .split(' ')
+        .find_map(|part| part.strip_prefix("lru_seconds_idle:"))
+        .unwrap_or_else(|| panic!("no lru_seconds_idle in {line}"))
+        .parse()
+        .unwrap();
+    assert!((1000..=1010).contains(&idle), "{line}");
+    assert!(c.cmd(&["OBJECT", "IDLETIME", "foo"]).i() >= 1000);
 }

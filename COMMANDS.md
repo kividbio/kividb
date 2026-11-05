@@ -4,7 +4,8 @@ KiviDB implements a Redis-compatible command surface over the RESP protocol.
 Commands are grouped by type. All commands are case-insensitive.
 
 `HELP` lists the subcommands of `CLIENT`, `COMMAND`, `CONFIG`, `FUNCTION`,
-`MEMORY`, `MODULE`, `OBJECT`, `PUBSUB` and `SLOWLOG` (for example `CLIENT HELP`).
+`MEMORY`, `MODULE`, `OBJECT`, `PUBSUB`, `SCRIPT` and `SLOWLOG` (for example
+`CLIENT HELP`).
 
 Connect using any Redis-compatible client on port `6380` (default):
 ```bash
@@ -808,11 +809,11 @@ Shard channel message (SSUBSCRIBE / SPUBLISH):
 | `TIME` | `TIME` | Return `[unix_seconds, microseconds_within_second]` as two bulk strings; uses real wall clock |
 | `HELLO` | `HELLO [protover [AUTH username password] [SETNAME clientname]]` | Switch the connection to RESP2 or RESP3 and return the server's details (`server`, `version`, `proto`, `id`, `mode`, `role`, `modules`) — a map under RESP3. `AUTH` and `SETNAME` apply before the reply. Unauthenticated, when a password is required, it is `NOAUTH` |
 | `LOLWUT` | `LOLWUT [VERSION version]` | Return ASCII art and the server version |
-| `INFO` | `INFO [section [section ...]]` | Return server info; sections include `server`, `keyspace`, `replication`, `errorstats` (per-error reply counters), `all`, etc. `INFO commandstats` has, for each command that has been called, `calls`, `usec`, `usec_per_call`, `rejected_calls` and `failed_calls`, and the Redis 8.8 slowlog fields `slowlog_count`, `slowlog_time_ms_sum` and `slowlog_time_ms_max`. `INFO memory` reports `used_memory` (allocated bytes — what `maxmemory` is compared with), `used_memory_rss`, `maxmemory_policy`, the slabs of string values (`value_slab_bytes`, and `value_slab_live_bytes` in them) and active defrag's `active_defrag_running`, `active_defrag_hits` (values moved) and `active_defrag_misses` (left, being held); `INFO stats` reports `evicted_keys` |
+| `INFO` | `INFO [section [section ...]]` | Return server info; sections include `server`, `keyspace`, `replication`, `errorstats` (per-error reply counters), `all`, etc. `INFO commandstats` has, for each command that has been called, `calls`, `usec`, `usec_per_call`, `rejected_calls` and `failed_calls`, and the Redis 8.8 slowlog fields `slowlog_count`, `slowlog_time_ms_sum` and `slowlog_time_ms_max`. `INFO memory` reports `used_memory` (allocated bytes — what `maxmemory` is compared with), `used_memory_rss`, `maxmemory_policy`, the slabs of string values (`value_slab_bytes`, and `value_slab_live_bytes` in them) and active defrag's `active_defrag_running`, `active_defrag_hits` (values moved), `active_defrag_misses` (left, being held), `active_defrag_panics` (passes that panicked: each panic is caught and logged at `ERROR` with its file and line, the slabs the pass was emptying are put back in use, and the next pass comes 1, 2, 4, then 8 seconds later) and `active_defrag_disabled_by_panics` (1 once 5 passes in a row have panicked with none ending between them: active defrag has then turned itself off, `CONFIG GET activedefrag` says `no`, and `CONFIG SET activedefrag yes` sent while it is off turns it back on and sets this to 0; sent while it is on, it changes nothing. It is not kept across a restart: after a `CONFIG REWRITE`, which writes `activedefrag no` then, the server starts with active defrag off and this at 0, and the `ERROR` line "active defrag turned itself off" in the log says why); `INFO stats` reports `evicted_keys` |
 | `CONFIG GET` | `CONFIG GET parameter [parameter ...]` | Get a configuration parameter; supports `*` for all |
-| `CONFIG SET` | `CONFIG SET param value [param value ...]` | All or nothing: an unknown parameter, a value out of range, a parameter that cannot change at run time or one named twice is an error naming it, and none of the pairs is applied. `requirepass`, `slowlog-log-slower-than`, `slowlog-max-len`, `maxmemory`, `maxmemory-policy`, `maxmemory-samples`, `lfu-log-factor`, `lfu-decay-time`, `activedefrag`, `active-defrag-ignore-bytes`, `active-defrag-threshold-lower`, `active-defrag-cycle-max`, `appendonly`, `loglevel`, `repl-backlog-size`, `repl-backlog-ttl`, `repl-diskless-load` all apply immediately at runtime without restart |
+| `CONFIG SET` | `CONFIG SET param value [param value ...]` | All or nothing: an unknown parameter, a value out of range, a parameter that cannot change at run time or one named twice is an error naming it, and none of the pairs is applied. `requirepass`, `slowlog-log-slower-than`, `slowlog-max-len`, `maxmemory`, `maxmemory-policy`, `maxmemory-samples`, `lfu-log-factor`, `lfu-decay-time`, `activedefrag`, `active-defrag-ignore-bytes`, `active-defrag-threshold-lower`, `active-defrag-cycle-max`, `appendonly`, `loglevel`, `repl-backlog-size`, `repl-backlog-ttl`, `repl-diskless-load`, `repl-replica-max-backlog-bytes`, `repl-replica-sync-max-backlog-bytes`, `shutdown-timeout` all apply immediately at runtime without restart |
 | `CONFIG REWRITE` | `CONFIG REWRITE` | Persist the current runtime config to the file the server was started with (default `/etc/kividb/kividb.conf`). Creates the file and parent directories if they don't exist. Atomic write via tmpfile-rename. Keeps the file's mode, and its owner when run as root; a new file is `0600`. Redis resets the mode to `0644` less the umask instead |
-| `CONFIG RESETSTAT` | `CONFIG RESETSTAT` | Returns OK |
+| `CONFIG RESETSTAT` | `CONFIG RESETSTAT` | Reset the statistics INFO reports, among them `active_defrag_hits`, `active_defrag_misses` and `active_defrag_panics` (not `active_defrag_disabled_by_panics`, which is a state). Returns OK |
 | `OBJECT ENCODING` | `OBJECT ENCODING key` | The encoding Redis would use for the value, from its size and the `*-max-listpack-*` / `set-max-intset-entries` settings: `int`, `embstr` or `raw` for strings; `listpack` or `quicklist` for lists; `listpack`, `intset` or `hashtable` for sets; `listpack` or `hashtable` for hashes; `listpack` or `skiplist` for sorted sets; `stream`. KiviDB stores each type one way internally; the name is for clients and tests that look at it |
 | `OBJECT IDLETIME` | `OBJECT IDLETIME key` | Seconds since the key was last read or written, while an LRU or LRM `maxmemory-policy` is selected; an error under an LFU policy, as in Redis. `0` under the policies that do not go by use (`noeviction`, the random ones, `volatile-ttl`): keys are not watched then |
 | `OBJECT FREQ` | `OBJECT FREQ key` | The key's logarithmic use count (Redis's LFU counter, with `lfu-log-factor` and `lfu-decay-time`) while an LFU `maxmemory-policy` is selected; an error otherwise, as in Redis |
@@ -823,7 +824,17 @@ Shard channel message (SSUBSCRIBE / SPUBLISH):
 | `MEMORY MALLOC-STATS` | `MEMORY MALLOC-STATS` | Allocator statistics (minimal) |
 | `MEMORY PURGE` | `MEMORY PURGE` | Ask the allocator to return free memory; replies `OK` |
 | `MEMORY HELP` | `MEMORY HELP` | List the `MEMORY` subcommands |
-| `DEBUG` | `DEBUG ...` | Accepted and ignored for redis-cli compatibility |
+| `DEBUG OBJECT` | `DEBUG OBJECT key` | The key's encoding, serialized length and last use, in Redis's order of fields. A key past its time is shown while it is still there, and looking is not a use. `Value at` is `0x0` and `refcount` `1`; `serializedlength` is the length in a `DUMP`, not Redis's RDB; `lru` and `lru_seconds_idle` are 0 unless an LRU or LFU policy (or `key-access-tracking`) is on. `ERR no such key` for a missing key |
+| `DEBUG SET-ACTIVE-EXPIRE` | `DEBUG SET-ACTIVE-EXPIRE 0\|1` | Stop or restart the background expiry of keys and hash fields. Keys past their time still go when read. Process-wide, and on again after a restart |
+| `DEBUG PAUSE-CRON` | `DEBUG PAUSE-CRON 0\|1` | Pause or resume the background expiry, as in Redis, where it runs inside the cron |
+| `DEBUG SLEEP` | `DEBUG SLEEP seconds` | Block this connection's worker thread for `seconds` |
+| `DEBUG POPULATE` | `DEBUG POPULATE count [prefix] [size]` | Make `count` string keys, `prefix:0` onwards (`key:0` without a prefix), leaving any that are there |
+| `DEBUG DIGEST-VALUE` | `DEBUG DIGEST-VALUE key [key ...]` | A digest of each key's value in 40 hex digits, or 40 zeros for a missing key |
+| `DEBUG PROTOCOL` | `DEBUG PROTOCOL type` | A reply of the given RESP type, for client tests |
+| `DEBUG LOG` | `DEBUG LOG message` | Write `message` to the server log |
+| `DEBUG SET-DISABLE-DENY-SCRIPTS` | `DEBUG SET-DISABLE-DENY-SCRIPTS 0\|1` | Accepted for the Redis test suite; changes nothing |
+| `DEBUG HELP` | `DEBUG HELP` | List the `DEBUG` subcommands |
+| `DEBUG` (any other) | `DEBUG ...` | Any other subcommand, including Redis's `RELOAD`, `LOADAOF` and `CHANGE-REPL-ID`, or one with the wrong number of arguments, is refused with Redis's `ERR unknown subcommand or wrong number of arguments for '<name>'. Try DEBUG HELP.` |
 | `QUIT` | `QUIT` | Close the connection |
 | `ROLE` | `ROLE` | Return the replication role: `master` or `slave`, with offset and replica list |
 | `REPLICAOF` | `REPLICAOF host port \| NO ONE` | Configure this instance as a replica, or promote to master. Refused in cluster mode, where `CLUSTER REPLICATE` does it |
@@ -949,6 +960,13 @@ Categories (`ACL CAT`): the data types `string` `list` `set` `sortedset` `hash`
 `blocking`; `pubsub`, `scripting`, `transaction`, `connection`, `cluster`,
 `server`; and `admin` and `dangerous`.
 
+`connection` is Redis's: `AUTH`, `CLIENT`, `COMMAND`, `ECHO`, `HELLO`,
+`PING`, `QUIT`, `RESET`, `SELECT`, `READONLY`, `READWRITE`, `ASKING`, `WAIT`
+and `WAITAOF`, with all their subcommands. `cluster`, `generic` and `server`
+are KiviDB's own, after Redis's command groups; they can be granted like the
+others, and `COMMAND` leaves them out of the categories it reports, as Redis
+has no such categories.
+
 A command with subcommands can be allowed and denied per subcommand, written
 `command|subcommand`: `-client|kill`, `+config|get`. A rule naming the command
 covers all of its subcommands. `admin` and `dangerous` are per subcommand where
@@ -1071,11 +1089,16 @@ when a quorum of masters concur via gossip, the flag escalates to `FAIL`
 When a master fails, its replicas do not race blindly: each asks the others
 how far it has read, and waits an extra second for every one that has read
 further, so the most up-to-date replica normally stands first and wins, as in
-Redis. A replica whose link to its master has been down for longer than
+Redis. A replica in a full sync, from the transfer until it has loaded the
+dataset and streamed since, never stands: it may hold part of the master's
+data, or none of it, and the slots stay down until the master is back. A
+replica that was last in step with its master (streaming, with everything it
+had been sent applied) longer ago than
 `cluster-node-timeout × cluster-replica-validity-factor` plus
-`repl-ping-replica-period` does not stand at all: its data is too old to take
-over with (`cluster-replica-validity-factor 0` lets it stand anyway).
-`CLUSTER FAILOVER` is not subject to either.
+`repl-ping-replica-period`, or not at all since it started, does not stand
+either: its data is too old to take over with
+(`cluster-replica-validity-factor 0` lets it stand anyway). The log says why
+a replica does not stand. `CLUSTER FAILOVER` is not subject to either.
 
 A master that comes back after it has been replaced finds its slots claimed at
 a higher epoch and becomes a replica of the node that took them. While a slot
@@ -1174,7 +1197,7 @@ deletes the keys it holds for that slot, as Redis does.
 | `--cluster-node-timeout <ms>` | `15000` | PFAIL threshold. Lower values detect faster, increase false positives under jitter. |
 | `--cluster-config-file <path>` | `nodes.conf` | Where the topology is persisted. |
 | `--cluster-require-full-coverage yes\|no` | `yes` | Stop serving keyed commands while any slot is unassigned or its owner has failed. |
-| `--cluster-replica-validity-factor <n>` | `10` | A replica out of touch with its master for longer than this many node timeouts (plus `repl-ping-replica-period`) does not stand for election when the master fails. `0`: always stand. Settable at runtime. |
+| `--cluster-replica-validity-factor <n>` | `10` | A replica last in step with its master longer ago than this many node timeouts (plus `repl-ping-replica-period`), or not since it started, does not stand for election when the master fails. `0`: stand whatever the age. A replica in a full sync never stands. Settable at runtime. |
 | `--cluster-announce-ip <addr>` | (observed) | The address this node tells the cluster to reach it on — for NAT, containers and Kubernetes. |
 | `--cluster-announce-port <port>` / `--cluster-announce-bus-port <port>` | client port / +10000 | The ports announced with it. |
 | `--cluster-announce-client-port <port>` | `0` (the client port) | The port *clients* are told: in `MOVED`/`ASK` and `CLUSTER SLOTS`, `SHARDS` and `NODES`. Nodes keep reaching each other at the client port. For a NodePort, or a load balancer that maps ports. Settable at runtime. |
@@ -1255,11 +1278,15 @@ Full resync sends a KDB snapshot followed by a live command stream.
 | `--masterauth <password>` / `--masteruser <user>` | | Credentials the replica presents to a master with `requirepass` or ACLs |
 | `--repl-timeout <seconds>` | `60` | A replica declares the link dead after this long without a byte from the master; also bounds each handshake step |
 | `--repl-ping-replica-period <seconds>` | `10` | How often the master puts a `PING` on an idle replication stream |
+| `--repl-replica-max-backlog-bytes <bytes>` | `256mb` | The most a master queues for a streaming replica that does not keep up; past it the replica is dropped and must full-sync. Settable at runtime |
+| `--repl-replica-sync-max-backlog-bytes <bytes>` | `1gb` | The most a master queues for a replica during its full sync, from the cut until the replica has loaded the dataset and drained its queue to a quarter of `repl-replica-max-backlog-bytes`. The replica reads nothing of the stream while it loads, so it has to hold everything written meanwhile. The larger of the two applies. Settable at runtime |
+| `--shutdown-timeout <seconds>` | `10` | How long a master that is shutting down waits for each streaming replica to acknowledge the end of its write stream before it saves and exits. A replica that has it all is continued after the restart, without a full sync. `0`, `SHUTDOWN NOW` and `SHUTDOWN NOSAVE` do not wait. Settable at runtime |
 | `--replica-full-sync-guard off\|empty\|shrink` | `empty` | Refuse a full resync that would replace this replica's dataset with an empty one (`empty`), or with one below `--replica-full-sync-guard-ratio` percent of its key count (`shrink`) |
 
 `INFO replication` on a master reports `connected_slaves`, one
-`slaveN:ip=…,port=…,state=online,offset=…,lag=…` line per replica (`offset` is
-what that replica has acknowledged, `lag` the seconds since it last did),
+`slaveN:ip=…,port=…,state=online,offset=…,lag=…,queued=…` line per replica
+(`offset` is what that replica has acknowledged, `lag` the seconds since it
+last did, `queued` the bytes of the stream waiting to be sent to it),
 `master_replid` and `master_repl_offset`, and `master_lost_dataset:1` while a
 cluster master that came back without its dataset waits for its replica
 (see below). On a replica it reports
@@ -1454,7 +1481,7 @@ names; with no session running the cost to a command is one atomic load.
 | `search-global-timeout` (Redis 8.10) | Not implemented. Query `TIMEOUT`, `search-timeout` and `search-on-timeout` cut a query short; `search-timeout` is `0`, no limit, by default (Redis: 500) |
 | `FT.HYBRID` shard ratio and `EXPLAINSCORE` (Redis 8.10) | Not implemented |
 | Per-client and server parse-batch metrics in `CLIENT LIST` / `INFO` (Redis 8.8) | Not reported |
-| `client-output-buffer-limit` | Not configurable. Pub/Sub subscribers are held to Redis's default (32 MB, or 8 MB for 60 s); replicas to `repl-replica-max-backlog-bytes` |
+| `client-output-buffer-limit` | Not configurable. Pub/Sub subscribers are held to Redis's default (32 MB, or 8 MB for 60 s); replicas to `repl-replica-max-backlog-bytes`, and during a full sync to `repl-replica-sync-max-backlog-bytes` |
 | A master's replication ID across a restart, without the AOF | A master restarted without the AOF has a new ID, so its replicas resync in full. With the AOF on, a master stopped cleanly keeps its ID and offset, and one restarted after a crash continues a replica that holds the same data. (A restarted *replica* continues by partial resync.) |
 
 The full account of Redis 8.4 – 8.10 is in

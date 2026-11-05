@@ -1,0 +1,10 @@
+2026-11-03T07:34:03.986162069Z 2026-11-03T07:34:03.986Z 1 [INFO] Cluster: Manual failover: starting election at epoch 16 to replace 5fa5aeae1d47a536fc02cc0f8172fcbc3a485933
+2026-11-03T07:34:04.011542458Z 2026-11-03T07:34:04.011Z 1 [INFO] Cluster: Won election at epoch 16 (3 votes, quorum 2)
+2026-11-03T07:34:04.016685974Z 2026-11-03T07:34:04.016Z 1 [INFO] Replication: Promoted; the stream fd6127a8968414c8482fe319164589cd6d92914b goes on as e0b7617e1fbf05408f39a69816193b88f80276ac from offset 7687103 — its replicas can be continued
+2026-11-03T07:34:04.029926359Z 2026-11-03T07:34:04.029Z 1 [INFO] Replication: Partial resync for <ip>:47844: continuing from offset 7687103 (360 bytes of backlog)
+2026-11-03T07:34:04.180896969Z 2026-11-03T07:34:04.180Z 1 [INFO] Replication: Command stream from <ip>:6380 superseded (epoch 3) — dropping connection
+2026-11-03T07:34:04.180917690Z 2026-11-03T07:34:04.180Z 1 [INFO] Replication: Replication session for <ip>:6380 superseded — stopping replication client
+2026-11-03T07:34:04.237265153Z 2026-11-03T07:34:04.237Z 1 [INFO] Replication: uring: replica disconnected
+2026-11-03T07:34:08.187682007Z 2026-11-03T07:34:08.187Z 1 [INFO] Replication: Partial resync for <ip>:58188: continuing from offset 7689046 (42400 bytes of backlog)
+2026-11-03T07:34:09.143641670Z 2026-11-03T07:34:09.143Z 1 [WARN] Cluster: Node 5fa5aeae1d47a536fc02cc0f8172fcbc3a485933 marked FAIL (reported by 0400792f2f4c129d42e926ec8e9dd114d031d450)
+2026-11-03T07:34:09.174451908Z 2026-11-03T07:34:09.173Z 1 [INFO] Cluster: Node 5fa5aeae1d47a536fc02cc0f8172fcbc3a485933 is reachable again — clearing FAIL

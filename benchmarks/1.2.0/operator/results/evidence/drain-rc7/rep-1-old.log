@@ -1,0 +1,14 @@
+2026-11-02T20:40:35.334Z 1 [INFO] CONFIG SET masteruser default
+2026-11-02T20:40:35.334Z 1 [INFO] CONFIG SET masterauth (hidden)
+2026-11-02T20:40:35.334Z 1 [INFO] Replication: Replica 10.244.1.209:44164 disconnected: this node is now a replica itself
+2026-11-02T20:40:35.334Z 1 [INFO] Replication: Replica 10.244.0.136:53684 disconnected: this node is now a replica itself
+2026-11-02T20:40:35.334Z 1 [INFO] Replication: uring: replica disconnected
+2026-11-02T20:40:35.334Z 1 [INFO] Replication: uring: replica disconnected
+2026-11-02T20:40:35.335Z 1 [INFO] Replication: Connecting to master 10.244.1.209:6380...
+2026-11-02T20:40:35.458Z 1 [INFO] Replication: Full resync from 26a71632580692a873020bb9d9cd7342e0ff6278 offset=42276136
+2026-11-02T20:40:35.458Z 1 [INFO] Replication: Receiving full-sync payload (25287324 bytes)...
+2026-11-02T20:40:35.517Z 1 [INFO] SIGTERM received — shutting down gracefully
+2026-11-02T20:40:35.517Z 1 [INFO] Writing final snapshot...
+2026-11-02T20:40:35.751Z 1 [WARN] Replication: Dropped the 1058056 local keys before loading 1058056 from the master
+2026-11-02T20:40:35.776Z 1 [INFO] AOF: rebased onto dump.kdb (generation 3) — log is now the delta
+2026-11-02T20:40:35.776Z 1 [INFO] Goodbye.

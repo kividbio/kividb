@@ -1,0 +1,323 @@
+=== 1793635756 16:09:16
+VmHWM:	   10984 kB
+VmRSS:	   10984 kB
+Threads:	6
+used_memory:615664
+used_memory_rss:11153408
+maxmemory:1073741824
+mem_fragmentation_ratio:20.20
+total_commands_processed:2
+instantaneous_ops_per_sec:0
+evicted_keys:0
+keyspace_hits:0
+keyspace_misses:0
+0
+stat: 0 0
+=== 1793635786 16:09:46
+VmHWM:	  349744 kB
+VmRSS:	  349744 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 611 1534
+=== 1793635816 16:10:16
+VmHWM:	  754120 kB
+VmRSS:	  749176 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 1469 3574
+=== 1793635846 16:10:46
+VmHWM:	 1076272 kB
+VmRSS:	 1076272 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 2295 5644
+=== 1793635876 16:11:16
+VmHWM:	 1079600 kB
+VmRSS:	 1079600 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 3256 7607
+=== 1793635906 16:11:46
+VmHWM:	 1081264 kB
+VmRSS:	 1081264 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 4211 9575
+=== 1793635936 16:12:16
+VmHWM:	 1081756 kB
+VmRSS:	 1081756 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 5176 11534
+=== 1793635966 16:12:46
+VmHWM:	 1081996 kB
+VmRSS:	 1081996 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 6147 13491
+=== 1793635996 16:13:16
+VmHWM:	 1082116 kB
+VmRSS:	 1082116 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 7112 15451
+=== 1793636026 16:13:46
+VmHWM:	 1082164 kB
+VmRSS:	 1082164 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 8075 17412
+=== 1793636056 16:14:16
+VmHWM:	 1082208 kB
+VmRSS:	 1082208 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 9044 19369
+=== 1793636086 16:14:46
+VmHWM:	 1082248 kB
+VmRSS:	 1082248 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 10005 21330
+=== 1793636116 16:15:16
+VmHWM:	 1082256 kB
+VmRSS:	 1082256 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 10976 23284
+=== 1793636146 16:15:46
+VmHWM:	 1082264 kB
+VmRSS:	 1082264 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 11937 25247
+=== 1793636176 16:16:16
+VmHWM:	 1082284 kB
+VmRSS:	 1082284 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 12908 27204
+=== 1793636206 16:16:46
+VmHWM:	 1082304 kB
+VmRSS:	 1082304 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 13859 29178
+=== 1793636236 16:17:16
+VmHWM:	 1082340 kB
+VmRSS:	 1082340 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 14828 31131
+=== 1793636266 16:17:46
+VmHWM:	 1082364 kB
+VmRSS:	 1082364 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 15793 33091
+=== 1793636296 16:18:16
+VmHWM:	 1082368 kB
+VmRSS:	 1082368 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 16785 35022
+=== 1793636326 16:18:46
+VmHWM:	 1082396 kB
+VmRSS:	 1082396 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 17738 36999
+=== 1793636356 16:19:16
+VmHWM:	 1082528 kB
+VmRSS:	 1082528 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 18700 38961
+=== 1793636386 16:19:46
+VmHWM:	 1082548 kB
+VmRSS:	 1082548 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 19659 40929
+=== 1793636416 16:20:16
+VmHWM:	 1082600 kB
+VmRSS:	 1082600 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 20615 42893
+=== 1793636446 16:20:46
+VmHWM:	 1082632 kB
+VmRSS:	 1082632 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 21468 44595
+=== 1793636476 16:21:16
+VmHWM:	 1082628 kB
+VmRSS:	 1082628 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 22423 46567
+=== 1793636506 16:21:46
+VmHWM:	 1082636 kB
+VmRSS:	 1082636 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 23391 48520
+=== 1793636536 16:22:16
+VmHWM:	 1082636 kB
+VmRSS:	 1082636 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 24361 50471
+=== 1793636566 16:22:46
+VmHWM:	 1082640 kB
+VmRSS:	 1082640 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 25318 52442
+=== 1793636596 16:23:16
+VmHWM:	 1082644 kB
+VmRSS:	 1082644 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 26279 54403
+=== 1793636626 16:23:46
+VmHWM:	 1082636 kB
+VmRSS:	 1082636 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 27247 56352
+=== 1793636656 16:24:16
+VmHWM:	 1082632 kB
+VmRSS:	 1082632 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 28210 58310
+=== 1793636686 16:24:46
+VmHWM:	 1082632 kB
+VmRSS:	 1082632 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 29164 60282
+=== 1793636716 16:25:16
+VmHWM:	 1082632 kB
+VmRSS:	 1082632 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 30137 62232
+=== 1793636746 16:25:46
+VmHWM:	 1082632 kB
+VmRSS:	 1082632 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 31109 64188
+=== 1793636776 16:26:16
+VmHWM:	 1082780 kB
+VmRSS:	 1082780 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 32087 66135
+=== 1793636806 16:26:46
+VmHWM:	 1082792 kB
+VmRSS:	 1082792 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 33063 68082
+=== 1793636836 16:27:16
+VmHWM:	 1082792 kB
+VmRSS:	 1082792 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 34023 70046
+=== 1793636867 16:27:47
+VmHWM:	 1082792 kB
+VmRSS:	 1082792 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 34996 71998
+=== 1793636897 16:28:17
+VmHWM:	 1082792 kB
+VmRSS:	 1082792 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 35943 73977
+=== 1793636927 16:28:47
+VmHWM:	 1082792 kB
+VmRSS:	 1082792 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 36896 75948
+=== 1793636957 16:29:17
+VmHWM:	 1082784 kB
+VmRSS:	 1082784 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 37860 77907
+=== 1793636987 16:29:47
+VmHWM:	 1082784 kB
+VmRSS:	 1082784 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 38828 79867
+=== 1793637017 16:30:17
+VmHWM:	 1082784 kB
+VmRSS:	 1082784 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 39791 81828
+=== 1793637047 16:30:47
+VmHWM:	 1082784 kB
+VmRSS:	 1082784 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 40741 83799
+=== 1793637077 16:31:17
+VmHWM:	 1082780 kB
+VmRSS:	 1082780 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 41697 85765

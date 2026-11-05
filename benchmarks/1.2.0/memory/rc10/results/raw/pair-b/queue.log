@@ -1,0 +1,117 @@
+### 2026-11-03T15:49:30Z start: SRV=engine-b R=r1 ./mixed.sh kividb-rc10
+kividb-rc10 plain kividb/kividb:build-39bfacd231bb redis_version:8.10.0 kividb_version:1.2.0-rc10 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+backlog: repl-backlog-size=67108864 role:master connected_slaves:0 repl_backlog_active:0 repl_backlog_size:67108864 repl_backlog_histlen:0 
+sampler started for mixed-kividb-rc10-r1 (pid 11494, /sys/fs/cgroup/system.slice/docker-3bce3390ada209f11e049d92c21f6f2ccea369e776d95d414a44ee2abe4684f0.scope)
+[15:49:39] mixed-kividb-rc10-r1 load
+[15:49:42] mixed-kividb-rc10-r1 loaded
+[15:50:12] mixed-kividb-rc10-r1 mixed-start
+[16:10:12] mixed-kividb-rc10-r1 mixed-end
+[16:10:43] mixed-kividb-rc10-r1 end
+### 2026-11-03T16:10:46Z end (exit 0): SRV=engine-b R=r1 ./mixed.sh kividb-rc10
+### 2026-11-03T16:10:46Z start: SRV=engine-b R=r1 ./mixed.sh kividb-rc8
+kividb-rc8 plain kividb/kividb:build-082dab3d8929 redis_version:8.10.0 kividb_version:1.2.0-rc8 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+backlog: repl-backlog-size=1048576 role:master connected_slaves:0 repl_backlog_active:0 repl_backlog_size:1048576 repl_backlog_histlen:0 
+sampler started for mixed-kividb-rc8-r1 (pid 12253, /sys/fs/cgroup/system.slice/docker-c13eed412bab26ae676e679d441014c3455ef57bcd60f98f35f8ef1ed6844af3.scope)
+[16:10:55] mixed-kividb-rc8-r1 load
+[16:10:57] mixed-kividb-rc8-r1 loaded
+[16:11:27] mixed-kividb-rc8-r1 mixed-start
+[16:31:28] mixed-kividb-rc8-r1 mixed-end
+[16:31:58] mixed-kividb-rc8-r1 end
+### 2026-11-03T16:32:01Z end (exit 0): SRV=engine-b R=r1 ./mixed.sh kividb-rc8
+### 2026-11-03T16:32:01Z start: SRV=engine-b R=r1 PROBE=300 ./defrag.sh kividb-rc8
+kividb-rc8 plain kividb/kividb:build-082dab3d8929 redis_version:8.10.0 kividb_version:1.2.0-rc8 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+backlog: repl-backlog-size=1048576 role:master connected_slaves:0 repl_backlog_active:0 repl_backlog_size:1048576 repl_backlog_histlen:0 
+sampler started for defrag-kividb-rc8-r1 (pid 12976, /sys/fs/cgroup/system.slice/docker-e6a4996390197fa412cfb978084626210b6b317f4c82e68033c8ec0a0c2bdb72.scope)
+[16:32:12] defrag-kividb-rc8-r1 load
+[16:32:15] defrag-kividb-rc8-r1 loaded
+[16:32:35] defrag-kividb-rc8-r1 probe-start
+[16:33:35] defrag-kividb-rc8-r1 delete-start
+[16:33:37] defrag-kividb-rc8-r1 delete-done
+2600000
+[16:37:35] defrag-kividb-rc8-r1 probe-end
+[16:38:05] defrag-kividb-rc8-r1 end
+### 2026-11-03T16:38:08Z end (exit 0): SRV=engine-b R=r1 PROBE=300 ./defrag.sh kividb-rc8
+### 2026-11-03T16:38:08Z start: SRV=engine-b R=r1 PROBE=300 ./defrag.sh kividb-rc10
+kividb-rc10 plain kividb/kividb:build-39bfacd231bb redis_version:8.10.0 kividb_version:1.2.0-rc10 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+backlog: repl-backlog-size=67108864 role:master connected_slaves:0 repl_backlog_active:0 repl_backlog_size:67108864 repl_backlog_histlen:0 
+sampler started for defrag-kividb-rc10-r1 (pid 13621, /sys/fs/cgroup/system.slice/docker-4c59f93efdf65381a0ce1b58a422a2f1dbdcca30723efdfa0601bc4fc98fd51e.scope)
+[16:38:16] defrag-kividb-rc10-r1 load
+[16:38:19] defrag-kividb-rc10-r1 loaded
+[16:38:39] defrag-kividb-rc10-r1 probe-start
+[16:39:39] defrag-kividb-rc10-r1 delete-start
+[16:39:40] defrag-kividb-rc10-r1 delete-done
+2600000
+[16:43:39] defrag-kividb-rc10-r1 probe-end
+[16:44:09] defrag-kividb-rc10-r1 end
+### 2026-11-03T16:44:12Z end (exit 0): SRV=engine-b R=r1 PROBE=300 ./defrag.sh kividb-rc10
+### 2026-11-03T16:44:12Z start: SRV=engine-b R=r1 ./aoflat.sh kividb-rc10
+kividb-rc10 persist kividb/kividb:build-39bfacd231bb redis_version:8.10.0 kividb_version:1.2.0-rc10 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data --aof --aof-rewrite-percentage 0]
+backlog: repl-backlog-size=67108864 role:master connected_slaves:0 repl_backlog_active:0 repl_backlog_size:67108864 repl_backlog_histlen:0 
+sampler started for aoflat-kividb-rc10-r1 (pid 14350, /sys/fs/cgroup/system.slice/docker-5e8b8e72abcff4b9485076458a79bdefba7a8f5797cf12c017d345732802c8a7.scope)
+[16:44:20] aoflat-kividb-rc10-r1 load
+[16:44:23] aoflat-kividb-rc10-r1 loaded
+[16:44:53] aoflat-kividb-rc10-r1 writes-start
+[16:47:53] aoflat-kividb-rc10-r1 writes-end
+[16:47:54] aoflat-kividb-rc10-r1 end
+### 2026-11-03T16:47:59Z end (exit 0): SRV=engine-b R=r1 ./aoflat.sh kividb-rc10
+### 2026-11-03T16:47:59Z start: SRV=engine-b R=r1 ./aoflat.sh kividb-rc8
+kividb-rc8 persist kividb/kividb:build-082dab3d8929 redis_version:8.10.0 kividb_version:1.2.0-rc8 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data --aof --aof-rewrite-percentage 0]
+backlog: repl-backlog-size=1048576 role:master connected_slaves:0 repl_backlog_active:0 repl_backlog_size:1048576 repl_backlog_histlen:0 
+sampler started for aoflat-kividb-rc8-r1 (pid 15097, /sys/fs/cgroup/system.slice/docker-51b69a00ed2226c39bb9ce4c1b882d220326fc9993eb3759f1278a9b28288e11.scope)
+[16:48:07] aoflat-kividb-rc8-r1 load
+[16:48:09] aoflat-kividb-rc8-r1 loaded
+[16:48:39] aoflat-kividb-rc8-r1 writes-start
+[16:51:40] aoflat-kividb-rc8-r1 writes-end
+[16:51:41] aoflat-kividb-rc8-r1 end
+### 2026-11-03T16:51:45Z end (exit 0): SRV=engine-b R=r1 ./aoflat.sh kividb-rc8
+### 2026-11-03T16:51:45Z start: SRV=engine-b R=r2 ./aoflat.sh kividb-rc8
+kividb-rc8 persist kividb/kividb:build-082dab3d8929 redis_version:8.10.0 kividb_version:1.2.0-rc8 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data --aof --aof-rewrite-percentage 0]
+backlog: repl-backlog-size=1048576 role:master connected_slaves:0 repl_backlog_active:0 repl_backlog_size:1048576 repl_backlog_histlen:0 
+sampler started for aoflat-kividb-rc8-r2 (pid 15812, /sys/fs/cgroup/system.slice/docker-8cc85c26fa7d99f99464e24e62ad4ee81590aed2d0ee959c207bf27902b6109f.scope)
+[16:51:54] aoflat-kividb-rc8-r2 load
+[16:51:56] aoflat-kividb-rc8-r2 loaded
+[16:52:26] aoflat-kividb-rc8-r2 writes-start
+[16:55:26] aoflat-kividb-rc8-r2 writes-end
+[16:55:27] aoflat-kividb-rc8-r2 end
+### 2026-11-03T16:55:32Z end (exit 0): SRV=engine-b R=r2 ./aoflat.sh kividb-rc8
+### 2026-11-03T16:55:32Z start: SRV=engine-b R=r2 ./aoflat.sh kividb-rc10
+kividb-rc10 persist kividb/kividb:build-39bfacd231bb redis_version:8.10.0 kividb_version:1.2.0-rc10 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data --aof --aof-rewrite-percentage 0]
+backlog: repl-backlog-size=67108864 role:master connected_slaves:0 repl_backlog_active:0 repl_backlog_size:67108864 repl_backlog_histlen:0 
+sampler started for aoflat-kividb-rc10-r2 (pid 16496, /sys/fs/cgroup/system.slice/docker-e5b00c6fb6765ec34a59f757c5f0ad41892658c06bb848ac82a3389842702c1e.scope)
+[16:55:40] aoflat-kividb-rc10-r2 load
+[16:55:42] aoflat-kividb-rc10-r2 loaded
+[16:56:12] aoflat-kividb-rc10-r2 writes-start
+[16:59:14] aoflat-kividb-rc10-r2 writes-end
+[16:59:14] aoflat-kividb-rc10-r2 end
+### 2026-11-03T16:59:19Z end (exit 0): SRV=engine-b R=r2 ./aoflat.sh kividb-rc10
+### 2026-11-03T16:59:19Z start: SRV=engine-b R=r3 ./aoflat.sh kividb-rc10
+kividb-rc10 persist kividb/kividb:build-39bfacd231bb redis_version:8.10.0 kividb_version:1.2.0-rc10 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data --aof --aof-rewrite-percentage 0]
+backlog: repl-backlog-size=67108864 role:master connected_slaves:0 repl_backlog_active:0 repl_backlog_size:67108864 repl_backlog_histlen:0 
+sampler started for aoflat-kividb-rc10-r3 (pid 17179, /sys/fs/cgroup/system.slice/docker-84b02d61a29c58682a7e8a9b5d2318901176325d3a17e6c4825768e0b2a951db.scope)
+[16:59:27] aoflat-kividb-rc10-r3 load
+[16:59:30] aoflat-kividb-rc10-r3 loaded
+[17:00:00] aoflat-kividb-rc10-r3 writes-start
+[17:03:00] aoflat-kividb-rc10-r3 writes-end
+[17:03:01] aoflat-kividb-rc10-r3 end
+### 2026-11-03T17:03:05Z end (exit 0): SRV=engine-b R=r3 ./aoflat.sh kividb-rc10
+### 2026-11-03T17:03:05Z start: SRV=engine-b R=r3 ./aoflat.sh kividb-rc8
+kividb-rc8 persist kividb/kividb:build-082dab3d8929 redis_version:8.10.0 kividb_version:1.2.0-rc8 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data --aof --aof-rewrite-percentage 0]
+backlog: repl-backlog-size=1048576 role:master connected_slaves:0 repl_backlog_active:0 repl_backlog_size:1048576 repl_backlog_histlen:0 
+sampler started for aoflat-kividb-rc8-r3 (pid 17861, /sys/fs/cgroup/system.slice/docker-db165f2b24296efaf5e3c2ea480ee8bd397cf789c1e03fa7a863eaccdcd1a6a0.scope)
+[17:03:14] aoflat-kividb-rc8-r3 load
+[17:03:16] aoflat-kividb-rc8-r3 loaded
+[17:03:46] aoflat-kividb-rc8-r3 writes-start
+[17:06:46] aoflat-kividb-rc8-r3 writes-end
+[17:06:47] aoflat-kividb-rc8-r3 end
+### 2026-11-03T17:06:52Z end (exit 0): SRV=engine-b R=r3 ./aoflat.sh kividb-rc8
+STOP 2026-11-03T17:06:52Z

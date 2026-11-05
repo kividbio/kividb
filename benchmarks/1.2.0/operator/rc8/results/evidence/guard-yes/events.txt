@@ -1,0 +1,13 @@
+2026-11-03T05:52:49Z   Normal    Killing                  g-yes-0                         Stopping container kividb
+2026-11-03T05:52:49Z   Normal    Killing                  g-yes-0                         Stopping container agent
+2026-11-03T05:52:49Z   Normal    SuccessfulCreate         g-yes                           Create Pod g-yes-0 in StatefulSet g-yes successful
+2026-11-03T05:52:49Z   Normal    Scheduled                g-yes-0                         Successfully assigned e2e/g-yes-0 to aks-nodepool1-41799577-vmss000001
+2026-11-03T05:52:49Z   Warning   FailedAttachVolume       g-yes-0                         Waiting for detach for volume "pvc-c1d0d6af-53c0-41fc-a2fe-051dbfe6a078" Volume is already exclusively attached to one node, waiting on detach before it can be attached to another node
+2026-11-03T05:52:50Z   Warning   Unhealthy                g-yes-0                         Liveness probe failed: HTTP probe failed with statuscode: 503
+2026-11-03T05:53:07Z   Normal    SuccessfulAttachVolume   g-yes-0                         AttachVolume.Attach succeeded for volume "pvc-c1d0d6af-53c0-41fc-a2fe-051dbfe6a078" 
+2026-11-03T05:53:08Z   Normal    Pulled                   g-yes-0                         Container image "<registry>.azurecr.io/kividb:1.2.0-rc8" already present on machine and can be accessed by the pod
+2026-11-03T05:53:08Z   Normal    Created                  g-yes-0                         Container created
+2026-11-03T05:53:08Z   Normal    Started                  g-yes-0                         Container started
+2026-11-03T05:53:08Z   Normal    Pulled                   g-yes-0                         Container image "<registry>.azurecr.io/kividb-operator-agent:0.7.0-0c0fb6e" already present on machine and can be accessed by the pod
+2026-11-03T05:53:08Z   Normal    Created                  g-yes-0                         Container created
+2026-11-03T05:53:08Z   Normal    Started                  g-yes-0                         Container started

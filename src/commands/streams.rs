@@ -1812,6 +1812,7 @@ pub fn xreadgroup(ctx: &mut Ctx) -> Vec<u8> {
     // order they blocked — the entry goes to the one that has waited longest
     // — and each gives the turn to the one behind it once it has looked,
     // which may be reading for another group.
+    let gone = blocking::client_gone(ctx);
     let resumed = blocking::take_resume(ctx);
     let timed_out = matches!(resumed, Some(None));
     let (carried_deadline, ticket) = match blocking::take_state(ctx) {
@@ -1827,6 +1828,12 @@ pub fn xreadgroup(ctx: &mut Ctx) -> Vec<u8> {
         }
         reply
     };
+    // Its client went while it waited: nothing is delivered — an entry
+    // would sit in the consumer's pending list, read by nobody — and it
+    // leaves the line.
+    if gone {
+        return done(ctx, resp_null_array());
+    }
 
     let results = match run_xreadgroup_delivery(ctx, &keys, &ids, &spec) {
         Ok(results) => results,
@@ -1921,7 +1928,10 @@ pub fn xreadgroup(ctx: &mut Ctx) -> Vec<u8> {
         ticket: Arc::clone(&ticket),
     };
     match blocking::park_with_state(ctx, rxs, wait, Some(state)) {
-        ParkOutcome::Parked => Vec::new(),
+        ParkOutcome::Parked => {
+            ticket.parks_in(&keys, true);
+            Vec::new()
+        }
         ParkOutcome::CannotWait => {
             leave(ctx);
             resp_null_array()

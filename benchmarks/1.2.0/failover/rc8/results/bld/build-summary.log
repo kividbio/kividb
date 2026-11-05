@@ -1,0 +1,27 @@
+info: downloading installer
+info: profile set to minimal
+info: default host tuple is x86_64-unknown-linux-gnu
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-10-15 for version 1.99.1 (58cf8f9c3 2026-10-13)
+info: downloading 3 components
+info: default toolchain set to stable-x86_64-unknown-linux-gnu
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+cargo 1.99.1 (5f94df478 2026-08-27)
+082dab3d8929c180bccf993835e28992ea054fb5 CI: the replication check's replica runs in a directory of its own
+  origin/release/1.2.0
+version = "1.2.0-rc8"
+    Finished `release` profile [optimized] target(s) in 4m 16s
+build took 257 s
+kividb 1.2.0-rc8
+a9ea83cbb399ec8e921442caf59ea1a9a4fa8f2e65f561366cddd7d268299cd2  /opt/kv/kividb
+a9ea83cbb399ec8e921442caf59ea1a9a4fa8f2e65f561366cddd7d268299cd2  /opt/kv/kividb
+a9ea83cbb399ec8e921442caf59ea1a9a4fa8f2e65f561366cddd7d268299cd2  /opt/kv/kividb
+a9ea83cbb399ec8e921442caf59ea1a9a4fa8f2e65f561366cddd7d268299cd2  /opt/kv/kividb
+a9ea83cbb399ec8e921442caf59ea1a9a4fa8f2e65f561366cddd7d268299cd2  /opt/kv/kividb
+a9ea83cbb399ec8e921442caf59ea1a9a4fa8f2e65f561366cddd7d268299cd2  /opt/kv/kividb
+a9ea83cbb399ec8e921442caf59ea1a9a4fa8f2e65f561366cddd7d268299cd2  /opt/kv/kividb
+a9ea83cbb399ec8e921442caf59ea1a9a4fa8f2e65f561366cddd7d268299cd2  /opt/kv/kividb
+a9ea83cbb399ec8e921442caf59ea1a9a4fa8f2e65f561366cddd7d268299cd2  /opt/kv/kividb
+a9ea83cbb399ec8e921442caf59ea1a9a4fa8f2e65f561366cddd7d268299cd2  /opt/kv/kividb
+a9ea83cbb399ec8e921442caf59ea1a9a4fa8f2e65f561366cddd7d268299cd2  /opt/kv/kividb
+BUILD-DONE

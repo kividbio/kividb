@@ -1,0 +1,7 @@
+total 58571824
+drwxrwxrwx 2 dnsmasq   root             4096 Nov  3 05:16 .
+drwxr-xr-x 4 root      root             4096 Nov  3 02:47 ..
+-rw-r--r-- 1 azureuser azureuser 28518635592 Nov  3 05:19 appendonly.aof
+-rw-r--r-- 1 azureuser azureuser 31458888973 Nov  3 05:16 dump.kdb
+-rw-r--r-- 1 azureuser azureuser          24 Nov  3 05:16 dump.kdb.gen
+-rw-r--r-- 1 azureuser azureuser           0 Nov  3 05:08 kividb.lock

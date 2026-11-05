@@ -1,0 +1,256 @@
+{
+ "soak_minutes": 120.0,
+ "ops_total": 465024583,
+ "errors_total": 2850,
+ "ops_per_s_median": 22730.5,
+ "p50_us_median_of_1s": 0.0,
+ "p99_us_median_of_1s": 0.0,
+ "p999_us_median_of_1s": 0.0,
+ "max_us": 67108863.0,
+ "error_kinds_total": {
+  "dial": 2761,
+  "CLUSTERDOWN": 6,
+  "read": 20,
+  "MOVED": 33,
+  "ASK": 30
+ },
+ "events_raw": [
+  [
+   "10.0 min",
+   "failover-start slot=3000 master=10.81.1.11:7001 replica=10.81.1.12:7002"
+  ],
+  [
+   "10.0 min",
+   "failover-reply OK"
+  ],
+  [
+   "10.0 min",
+   "failover-promoted 10.81.1.12:7002 after 0.02 s"
+  ],
+  [
+   "10.0 min",
+   "failover-old-master-replica 10.81.1.11:7001 after 0.02 s"
+  ],
+  [
+   "10.0 min",
+   "failover-end cluster-ok after 0.14 s"
+  ],
+  [
+   "10.1 min",
+   "failover-resync 10.81.1.11:7001 partial=1 full=0 lines: 2026-11-03T11:47:29.894Z 17723 [INFO] Replication: Partial resync: continuing from offset 5185980766 \u2014 no dataset transfer|"
+  ],
+  [
+   "16.0 min",
+   "sigterm-start round 1 slot=8000 replica=10.81.1.13:7002 master=10.81.1.12:7001: master_link_status:up master_sync_in_progress:0 slave_repl_offset:8204384655"
+  ],
+  [
+   "16.0 min",
+   "sigterm-exit round 1 10.81.1.13:7002 result=exited after 1.10 s final-save=yes (writing-final-snapshot=1 goodbye=1 error-lines=0 skip-lines=0)"
+  ],
+  [
+   "16.1 min",
+   "sigterm-restarted 10.81.1.13:7002"
+  ],
+  [
+   "16.1 min",
+   "sigterm-rejoined 10.81.1.13:7002 as replica after 0.01 s"
+  ],
+  [
+   "16.1 min",
+   "sigterm-end cluster-ok after 0.15 s"
+  ],
+  [
+   "16.2 min",
+   "sigterm-resync 10.81.1.13:7002 partial=1 full=0 lines: 2026-11-03T11:53:34.794Z 38628 [INFO] Replication: Partial resync: continuing from offset 8213501804 \u2014 no dataset transfer|"
+  ],
+  [
+   "22.0 min",
+   "kill9-start slot=8000 master=10.81.1.12:7001 replica=10.81.1.13:7002"
+  ],
+  [
+   "22.0 min",
+   "kill9-killed 10.81.1.12:7001"
+  ],
+  [
+   "22.1 min",
+   "kill9-promoted 10.81.1.13:7002 after 5.20 s"
+  ],
+  [
+   "22.5 min",
+   "kill9-restarted 10.81.1.12:7001"
+  ],
+  [
+   "22.6 min",
+   "kill9-rejoined 10.81.1.12:7001 as replica after 6.72 s"
+  ],
+  [
+   "22.6 min",
+   "kill9-end cluster-ok after 0.18 s"
+  ],
+  [
+   "22.7 min",
+   "kill9-resync 10.81.1.12:7001 partial=0 full=1 lines: 2026-11-03T11:59:59.183Z 45248 [INFO] Replication: Full resync from 33e7d9a20357edb0d0526767628c27f23e972e51 offset=11251606235|2026-11-03T12:00:03.836Z 45248 [INFO] Replication: Full sync loaded: 1161122 keys (70431 with a TTL), replacing 1149159 local keys|"
+  ],
+  [
+   "30.3 min",
+   "reshard-start round 1 src-shard=3000 dst-shard=8000: 128 slots (0-127) from 10.81.1.12:7002 (c31f74c6dbf6db03ea64518a7e6e45ef2dcbfe33, 1422052 keys) to 10.81.1.13:7002 (059a799d344c0df3629a80c4c2d0e02c0615c014) with plain redis-cli"
+  ],
+  [
+   "42.7 min",
+   "reshard-end round 1 exit=0 after 748.66 s: slots begun=128, TRYAGAIN=0, ERR=0:"
+  ],
+  [
+   "42.8 min",
+   "reshard-check round 1: open-on-source=[] open-slots-lines=0 covered=1 err-lines=0 moved-slots=128"
+  ],
+  [
+   "42.9 min",
+   "reshard-done round 1 cluster-ok after 0.16 s"
+  ],
+  [
+   "43.0 min",
+   "sigterm-start round 2 slot=13000 replica=10.81.1.11:7002 master=10.81.1.13:7001: master_link_status:up master_sync_in_progress:0 slave_repl_offset:16506103989"
+  ],
+  [
+   "43.0 min",
+   "sigterm-exit round 2 10.81.1.11:7002 result=exited after 1.25 s final-save=yes (writing-final-snapshot=1 goodbye=1 error-lines=0 skip-lines=0)"
+  ],
+  [
+   "43.1 min",
+   "sigterm-restarted 10.81.1.11:7002"
+  ],
+  [
+   "43.2 min",
+   "sigterm-rejoined 10.81.1.11:7002 as replica after 5.91 s"
+  ],
+  [
+   "43.2 min",
+   "sigterm-end cluster-ok after 0.21 s"
+  ],
+  [
+   "43.3 min",
+   "sigterm-resync 10.81.1.11:7002 partial=0 full=1 lines: 2026-11-03T12:20:32.734Z 68352 [INFO] Replication: Full resync from ca0b8ef0e48aa39c392646089f1829e5448e9c58 offset=16622223591|2026-11-03T12:20:37.066Z 68352 [INFO] Replication: Full sync loaded: 1491831 keys (55697 with a TTL), replacing 1483926 local keys|"
+  ],
+  [
+   "50.0 min",
+   "import-start round 1 CLUSTER MIGRATION IMPORT 10923 11422 on 10.81.1.12:7002 (c31f74c6dbf6db03ea64518a7e6e45ef2dcbfe33, 1702844 keys), source 10.81.1.13:7001 (2f30ca5dc1a5d8e2efd90afa668cbc23b0617867, 1743450 keys)"
+  ],
+  [
+   "50.0 min",
+   "import-id 493a4ebe43dbff05712272437d5da9dc428dc07c"
+  ],
+  [
+   "50.1 min",
+   "import-done round 1 in 4.80 s: id 493a4ebe43dbff05712272437d5da9dc428dc07c slots 10923-11422 source 2f30ca5dc1a5d8e2efd90afa668cbc23b0617867 dest c31f74c6dbf6db03ea64518a7e6e45ef2dcbfe33 operation import state completed last_error  retries 0 create_time 1793708849189 start_time 1793708849189 end_time 1793708853649 write_pause_ms 0 capture_pause_ms 0"
+  ],
+  [
+   "50.1 min",
+   "import-keys source 1653605 dest 1864698"
+  ],
+  [
+   "50.1 min",
+   "import-end cluster-ok after 0.19 s"
+  ],
+  [
+   "56.0 min",
+   "sigterm-start round 3 slot=3000 replica=10.81.1.11:7001 master=10.81.1.12:7002: master_link_status:up master_sync_in_progress:0 slave_repl_offset:28644566714"
+  ],
+  [
+   "56.0 min",
+   "sigterm-exit round 3 10.81.1.11:7001 result=exited after 1.53 s final-save=yes (writing-final-snapshot=1 goodbye=1 error-lines=0 skip-lines=0)"
+  ],
+  [
+   "56.1 min",
+   "sigterm-restarted 10.81.1.11:7001"
+  ],
+  [
+   "56.1 min",
+   "sigterm-rejoined 10.81.1.11:7001 as replica after 0.01 s"
+  ],
+  [
+   "56.2 min",
+   "sigterm-end cluster-ok after 0.78 s"
+  ],
+  [
+   "56.2 min",
+   "sigterm-resync 10.81.1.11:7001 partial=1 full=0 lines: 2026-11-03T12:33:37.018Z 84756 [INFO] Replication: Partial resync: continuing from offset 28652688807 \u2014 no dataset transfer|"
+  ],
+  [
+   "62.0 min",
+   "kill9-start slot=3000 master=10.81.1.12:7002 replica=10.81.1.11:7001"
+  ],
+  [
+   "62.0 min",
+   "kill9-killed 10.81.1.12:7002"
+  ],
+  [
+   "62.1 min",
+   "kill9-promoted 10.81.1.11:7001 after 5.55 s"
+  ],
+  [
+   "62.5 min",
+   "kill9-restarted 10.81.1.12:7002"
+  ],
+  [
+   "62.7 min",
+   "kill9-rejoined 10.81.1.12:7002 as replica after 7.72 s"
+  ],
+  [
+   "62.7 min",
+   "kill9-end cluster-ok after 0.19 s"
+  ],
+  [
+   "62.8 min",
+   "kill9-resync 10.81.1.12:7002 partial=0 full=1 lines: 2026-11-03T12:40:01.567Z 91762 [INFO] Replication: Full resync from 37daebace8ea15580851b7c3bfb15846ed40c10b offset=31951652785|2026-11-03T12:40:06.889Z 91762 [INFO] Replication: Full sync loaded: 2259399 keys (76406 with a TTL), replacing 2242583 local keys|"
+  ],
+  [
+   "68.3 min",
+   "reshard-start round 2 src-shard=13000 dst-shard=8000: 128 slots (11423-11550) from 10.81.1.13:7001 (2f30ca5dc1a5d8e2efd90afa668cbc23b0617867, 2097713 keys) to 10.81.1.13:7002 (059a799d344c0df3629a80c4c2d0e02c0615c014) with plain redis-cli"
+  ],
+  [
+   "90.2 min",
+   "reshard-end round 2 exit=0 after 1317.15 s: slots begun=128, TRYAGAIN=0, ERR=0:"
+  ],
+  [
+   "90.2 min",
+   "reshard-check round 2: open-on-source=[] open-slots-lines=0 covered=1 err-lines=0 moved-slots=128"
+  ],
+  [
+   "90.4 min",
+   "reshard-done round 2 cluster-ok after 0.19 s"
+  ],
+  [
+   "90.4 min",
+   "failover-start slot=13000 master=10.81.1.13:7001 replica=10.81.1.11:7002"
+  ],
+  [
+   "90.4 min",
+   "failover-reply OK"
+  ],
+  [
+   "90.4 min",
+   "failover-promoted 10.81.1.11:7002 after 0.04 s"
+  ],
+  [
+   "90.5 min",
+   "failover-old-master-replica 10.81.1.13:7001 after 0.02 s"
+  ],
+  [
+   "90.5 min",
+   "failover-end cluster-ok after 0.27 s"
+  ],
+  [
+   "90.6 min",
+   "failover-resync 10.81.1.13:7001 partial=1 full=0 lines: 2026-11-03T13:07:55.452Z 18446 [INFO] Replication: Partial resync: continuing from offset 34671011003 \u2014 no dataset transfer|"
+  ],
+  [
+   "90.6 min",
+   "import-start round 2 CLUSTER MIGRATION IMPORT 5461 5960 on 10.81.1.11:7002 (67ed7e44d9d3ef14635a698a119f6d8daa97ff03, 2135720 keys), source 10.81.1.13:7002 (059a799d344c0df3629a80c4c2d0e02c0615c014, 2542722 keys)"
+  ],
+  [
+   "90.6 min",
+   "import-id 65c980e19acf975995d03d9a9047a6d19fd112a8"
+  ],
+  [
+   "90.7 min",
+   "import-done round 2 in 6.90 s: id 65c980e19acf975995d03d9a9047a6d19fd112a8 slots 5461-5960 source 059a

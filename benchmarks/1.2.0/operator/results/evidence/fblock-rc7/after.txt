@@ -1,0 +1,2 @@
+fb-0 kividb_version:1.2.0-rc7 run_id:000000002161d49900000000deadbeee2161d498 keys=1310472 role:master master_replid:4973d0d418e824c9958b67aa5b0c2423e0311828 master_repl_offset:723683 aof_enabled:1  ack=[aof-ack-after-write yes ]
+fb-1 kividb_version:1.2.0-rc7 run_id:000000000326006400000000deadbeee03260065 keys=1310492 role:slave master_host:10.244.1.176 master_link_status:up aof_enabled:1  ack=[aof-ack-after-write yes ]

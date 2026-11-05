@@ -1,0 +1,16 @@
+{
+  "test": "cognee/tests/test_concurrent_subprocess_access.py (cognee CI job: Concurrent subprocess access test (Kuzu/Lancedb/Postgres/Redis))",
+  "cognee": "1.6.6",
+  "mode": "keyless: CI_HAS_SECRETS=false, .github/scripts/keyless_ci_env.sh (GLiNER + fastembed, no LLM key)",
+  "env": "GRAPH_DATABASE_PROVIDER=kuzu CACHING=true CACHE_BACKEND=redis CACHE_HOST=localhost SHARED_KUZU_LOCK=true DB_PROVIDER=postgres (pgvector/pgvector:pg17)",
+  "date": "2026-11-04",
+  "runs": [
+    {"label": "redis8", "server": "redis:8 (8.10.3)", "exit": 0, "seconds": 78,
+     "commands": "SET 93, GET 63, DEL 63, EVALSHA 64, SCRIPT LOAD 1, FLUSHDB 2, PING 10"},
+    {"label": "kividb-lua", "server": "kividb/kividb:v1.2.0-lua", "exit": 0, "seconds": 75,
+     "commands": "SET 71, GET 63, DEL 63, EVALSHA 64, SCRIPT LOAD 1, FLUSHDB 2, PING 10"},
+    {"label": "kividb", "server": "kividb/kividb:v1.2.0 (default, no Lua)", "exit": 1, "seconds": 260,
+     "error": "redis-py Lock.release() runs EVALSHA: ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant. The lock is then held until its timeout, the other subprocess waits, and the writer fails with 'Failed to add nodes in batch'."}
+  ],
+  "note": "The SET count differs between runs because a waiting process retries SET NX while the lock is held; it depends on timing, not on the server."
+}

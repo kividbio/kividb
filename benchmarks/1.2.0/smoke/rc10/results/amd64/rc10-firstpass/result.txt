@@ -1,0 +1,20 @@
+RESULT rc10-amd64 82 19
+FAIL: deb: systemctl restart #4 hung or failed -- exit 1 after 0.05s
+FAIL: deb: systemctl restart #5 hung or failed -- exit 1 after 0.02s
+FAIL: deb: keys across restarts -- 20000 -> 
+FAIL: deb: start after stop -- 
+FAIL: deb: no restart after SIGKILL -- Nov 03 14:34:39 smk-x systemd[1]: Failed to start kividb.service - KiviDB in-memory database.
+FAIL: deb: keys after SIGKILL -- 20000 -> 
+FAIL: deb: second server did not log in-use -- 2026-11-03T14:35:26.336Z 8831 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+FAIL: deb: the second server serves while the unit holds the dir -- 
+FAIL: deb: the unit stopped serving -- 
+FAIL: deb: no 'free after' line -- 
+FAIL: rpm: systemctl restart #5 hung or failed -- exit 1 after 0.07s
+FAIL: rpm: keys across restarts -- 20000 -> 
+FAIL: rpm: start after stop -- 
+FAIL: rpm: no restart after SIGKILL -- Nov 03 14:35:51 smk-x systemd[1]: Failed to start KiviDB in-memory database.
+FAIL: rpm: keys after SIGKILL -- 20000 -> 
+FAIL: rpm: second server did not log in-use -- 2026-11-03T14:36:37.888Z 665 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+FAIL: rpm: the second server serves while the unit holds the dir -- 
+FAIL: rpm: the unit stopped serving -- 
+FAIL: rpm: no 'free after' line -- 

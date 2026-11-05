@@ -1,0 +1,10 @@
+# The reference: Redis 8 in place of claude-mem's Valkey, with the settings claude-mem
+# gives Valkey (append-only file, fsync every second, noeviction).
+services:
+  valkey:
+    image: redis:8
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+    ports:
+      - "127.0.0.1:6399:6379"

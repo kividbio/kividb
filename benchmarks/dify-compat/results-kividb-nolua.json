@@ -1,0 +1,507 @@
+{
+  "label": "kividb-nolua",
+  "image": "kividb/kividb:v1.2.0",
+  "redis_version": "8.10.0",
+  "dify": "1.19.0",
+  "counts": {
+    "PASS": 23,
+    "FAIL": 10,
+    "WARN": 0,
+    "SKIP": 0
+  },
+  "checks": [
+    {
+      "check": "connection: PING through Dify's password",
+      "status": "PASS",
+      "detail": "redis_version 8.10.0",
+      "ms": 185
+    },
+    {
+      "check": "start-up: every Dify service is running (none restarting)",
+      "status": "PASS",
+      "detail": "16 containers",
+      "ms": 198
+    },
+    {
+      "check": "start-up: the API is healthy",
+      "status": "PASS",
+      "detail": "",
+      "ms": 25608
+    },
+    {
+      "check": "start-up: the Celery worker answers a ping over the broker (celery inspect ping)",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2488
+    },
+    {
+      "check": "start-up: CLIENT / INFO / CONFIG / HELLO / SELECT / AUTH sent at connect are all accepted",
+      "status": "PASS",
+      "detail": "client|maint_notifications x5, client|setinfo x50, info x1, select x16",
+      "ms": 178
+    },
+    {
+      "check": "account: set-up creates the admin",
+      "status": "FAIL",
+      "detail": "AssertionError: 500: <!doctype html>\n<html lang=en>\n<title>500 Internal Server Error</title>\n<h1>Internal Server Error</h1>\n<p>The server encountered an internal error and was unable to complete your request. Either the s",
+      "ms": 965
+    },
+    {
+      "check": "account: password login, then an authenticated call",
+      "status": "PASS",
+      "detail": "",
+      "ms": 54
+    },
+    {
+      "check": "account: the refresh token (kept in Redis) gives a new session",
+      "status": "PASS",
+      "detail": "",
+      "ms": 15
+    },
+    {
+      "check": "workflow: blocking run, switch=1 (if-else, parallel code nodes)",
+      "status": "PASS",
+      "detail": "",
+      "ms": 297
+    },
+    {
+      "check": "workflow: blocking run, switch=2",
+      "status": "PASS",
+      "detail": "",
+      "ms": 161
+    },
+    {
+      "check": "workflow: streaming run, executed by the Celery worker and relayed over pub/sub",
+      "status": "PASS",
+      "detail": "16 events",
+      "ms": 364
+    },
+    {
+      "check": "workflow: both runs are recorded as succeeded",
+      "status": "PASS",
+      "detail": "",
+      "ms": 23
+    },
+    {
+      "check": "workflow: 8 concurrent streaming runs each receive their own events",
+      "status": "PASS",
+      "detail": "8 runs, each got its own outputs",
+      "ms": 885
+    },
+    {
+      "check": "chatflow: streaming chat message (Celery worker, pub/sub)",
+      "status": "PASS",
+      "detail": "10 events",
+      "ms": 139
+    },
+    {
+      "check": "chatflow: blocking chat message in the same conversation",
+      "status": "PASS",
+      "detail": "",
+      "ms": 136
+    },
+    {
+      "check": "chatflow: the conversation has both messages",
+      "status": "PASS",
+      "detail": "",
+      "ms": 50
+    },
+    {
+      "check": "knowledge: a text document is indexed by the Celery worker (economy, keyword index)",
+      "status": "FAIL",
+      "detail": "RuntimeError: POST /v1/datasets/c592f7db-361b-4487-99cd-930f6b6e8665/document/create-by-text -> 500: {\"message\":\"Internal Server Error\",\"code\":\"unknown\",\"status\":500}\n",
+      "ms": 82
+    },
+    {
+      "check": "knowledge: the document has segments",
+      "status": "FAIL",
+      "detail": "KeyError: 'doc'",
+      "ms": 0
+    },
+    {
+      "check": "knowledge: keyword retrieval finds it",
+      "status": "FAIL",
+      "detail": "AssertionError: records []",
+      "ms": 2177
+    },
+    {
+      "check": "knowledge: an uploaded file is indexed",
+      "status": "FAIL",
+      "detail": "ReadTimeout: HTTPConnectionPool(host='127.0.0.1', port=80): Read timed out. (read timeout=120)",
+      "ms": 120097
+    },
+    {
+      "check": "knowledge: the keyword-index lock (redis-py Lock) is released",
+      "status": "FAIL",
+      "detail": "AssertionError: left behind: ['add_document_lock_dataset_id_c592f7db-361b-4487-99cd-930f6b6e8665', 'keyword_indexing_lock_c592f7db-361b-4487-99cd-930f6b6e8665'] (TTL [477, 477])",
+      "ms": 1019
+    },
+    {
+      "check": "knowledge: delete a document",
+      "status": "FAIL",
+      "detail": "KeyError: 'doc2'",
+      "ms": 0
+    },
+    {
+      "check": "celery: no task recorded as FAILURE in the result backend",
+      "status": "PASS",
+      "detail": "task states in the result backend: none stored",
+      "ms": 170
+    },
+    {
+      "check": "restart: with the worker stopped, 5 indexing tasks wait in the broker",
+      "status": "FAIL",
+      "detail": "ReadTimeout: HTTPConnectionPool(host='127.0.0.1', port=80): Read timed out. (read timeout=120)",
+      "ms": 120089
+    },
+    {
+      "check": "restart: the server restarts and the queued tasks are still there",
+      "status": "PASS",
+      "detail": "0 still queued",
+      "ms": 1001
+    },
+    {
+      "check": "restart: the worker starts and indexes every queued document",
+      "status": "PASS",
+      "detail": "0 documents indexed",
+      "ms": 357
+    },
+    {
+      "check": "restart: the login session and refresh token survive the server restart",
+      "status": "PASS",
+      "detail": "",
+      "ms": 19
+    },
+    {
+      "check": "restart: API and workers restart against the running server; a streaming run works",
+      "status": "PASS",
+      "detail": "",
+      "ms": 41554
+    },
+    {
+      "check": "model: the plugin daemon installs the OpenAI-API-compatible plugin",
+      "status": "PASS",
+      "detail": "langgenius/openai_api_compatible:0.0.73@4cf123ffaa4556f079bed6c47f3a462cc825504b859b183239e74eb19136a4b5",
+      "ms": 6181
+    },
+    {
+      "check": "model: add the stub's chat and embedding models",
+      "status": "PASS",
+      "detail": "",
+      "ms": 166
+    },
+    {
+      "check": "model: a chatflow's LLM node streams the stub model's answer",
+      "status": "PASS",
+      "detail": "",
+      "ms": 324
+    },
+    {
+      "check": "model: a high-quality knowledge base is embedded by Celery and searched",
+      "status": "FAIL",
+      "detail": "RuntimeError: POST /v1/datasets/8145191d-40d4-4d8d-a9fa-9d57e16a90e4/document/create-by-text -> 500: {\"message\":\"Internal Server Error\",\"code\":\"unknown\",\"status\":500}\n",
+      "ms": 167
+    },
+    {
+      "check": "server: no command Dify sent was refused (INFO commandstats)",
+      "status": "FAIL",
+      "detail": "AssertionError: cmdstat_evalsha: failed 5, rejected 0",
+      "ms": 336
+    }
+  ],
+  "commands_at_startup": {
+    "cmdstat_brpop": {
+      "calls": 29,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_client|maint_notifications": {
+      "calls": 5,
+      "failed": 0,
+      "rejected": 5
+    },
+    "cmdstat_client|setinfo": {
+      "calls": 50,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_del": {
+      "calls": 22,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_evalsha": {
+      "calls": 2,
+      "failed": 2,
+      "rejected": 0
+    },
+    "cmdstat_exec": {
+      "calls": 35,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_expire": {
+      "calls": 136,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_hdel": {
+      "calls": 1,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_hget": {
+      "calls": 14,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_hgetall": {
+      "calls": 24,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_hscan": {
+      "calls": 6,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_hset": {
+      "calls": 15,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_info": {
+      "calls": 1,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_llen": {
+      "calls": 124,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_lpush": {
+      "calls": 2,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_multi": {
+      "calls": 35,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_ping": {
+      "calls": 10,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_publish": {
+      "calls": 17,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_sadd": {
+      "calls": 29,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_select": {
+      "calls": 16,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_set": {
+      "calls": 20,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_smembers": {
+      "calls": 1,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_srem": {
+      "calls": 2,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_zadd": {
+      "calls": 1,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_zrem": {
+      "calls": 1,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_zrevrangebyscore": {
+      "calls": 1,
+      "failed": 0,
+      "rejected": 0
+    }
+  },
+  "commands_after_run": {
+    "cmdstat_brpop": {
+      "calls": 25,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_client|maint_notifications": {
+      "calls": 8,
+      "failed": 0,
+      "rejected": 8
+    },
+    "cmdstat_client|setinfo": {
+      "calls": 86,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_del": {
+      "calls": 47,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_evalsha": {
+      "calls": 5,
+      "failed": 5,
+      "rejected": 0
+    },
+    "cmdstat_exec": {
+      "calls": 79,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_expire": {
+      "calls": 145,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_get": {
+      "calls": 169,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_hdel": {
+      "calls": 15,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_hget": {
+      "calls": 12,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_hgetall": {
+      "calls": 17,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_hscan": {
+      "calls": 5,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_hset": {
+      "calls": 26,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_incrby": {
+      "calls": 6,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_info": {
+      "calls": 2,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_llen": {
+      "calls": 148,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_lpush": {
+      "calls": 9,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_lrange": {
+      "calls": 12,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_mget": {
+      "calls": 11,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_multi": {
+      "calls": 79,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_ping": {
+      "calls": 12,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_publish": {
+      "calls": 62,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_sadd": {
+      "calls": 37,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_scan": {
+      "calls": 3,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_select": {
+      "calls": 23,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_set": {
+      "calls": 269,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_setex": {
+      "calls": 21,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_smembers": {
+      "calls": 1,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_srem": {
+      "calls": 2,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_zadd": {
+      "calls": 14,
+      "failed": 0,
+      "rejected": 0
+    },
+    "cmdstat_zrem": {
+      "calls": 14,
+      "failed": 0,
+      "rejected": 0
+    }
+  },
+  "errorstats": {
+    "errorstat_ERR": {
+      "count": 13
+    }
+  },
+  "when": "2026-11-04T20:37:07+00:00"
+}

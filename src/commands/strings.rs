@@ -74,11 +74,52 @@ struct WriteShards<'a> {
 }
 
 impl<'a> WriteShards<'a> {
+    /// Every shard of `keys`, held at once, and never waited for while
+    /// another is held.
+    ///
+    /// Each shard is tried, in the database's order. If one is busy,
+    /// everything taken so far is let go, that one is waited for alone
+    /// (spinning a little first, see [`store::ShardLock::write_after_spinning`]),
+    /// and the others are tried again with it held. Taking them in order
+    /// and waiting for each in turn, as this did, held the shards already
+    /// taken while it waited: with many `MSET`s of keys in many shards, one
+    /// that waited held up every other that wanted one of its shards, and
+    /// those the next, and the server sat idle in a queue of them (166K
+    /// `MSET`s of 10 keys a second at 30% CPU on 32 vCPUs).
+    ///
+    /// No deadlock: nothing waits while it holds a shard, so no two can
+    /// each hold what the other waits for, whatever order anybody else
+    /// takes them in. Nobody sees part of the write either: it starts only
+    /// once every shard is held.
+    ///
+    /// Out of line: `SET` is in the same `handle`, and must not pay for it.
+    #[inline(never)]
     fn lock<'k>(db: &'a store::Db, keys: impl Iterator<Item = &'k str>) -> Self {
-        let held = shards_of(db, keys)
-            .into_iter()
-            .map(|index| (index, db[index].write()))
-            .collect();
+        let indexes = shards_of(db, keys);
+        let mut held = Vec::with_capacity(indexes.len());
+        // The shard last found busy, held from when it was waited for.
+        let mut waited: Option<(usize, store::ShardWrite<'a>)> = None;
+        'all: loop {
+            for &index in &indexes {
+                let guard = match waited.take() {
+                    Some((at, guard)) if at == index => guard,
+                    other => {
+                        waited = other;
+                        match db[index].try_write() {
+                            Some(guard) => guard,
+                            None => {
+                                held.clear();
+                                drop(waited.take());
+                                waited = Some((index, db[index].write_after_spinning()));
+                                continue 'all;
+                            }
+                        }
+                    }
+                };
+                held.push((index, guard));
+            }
+            break;
+        }
         Self {
             shards: db.len(),
             held,
@@ -851,9 +892,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
         // ── MSET ──────────────────────────────────────────────────────────────────────
         // Atomically set N key-value pairs. Always succeeds. Returns OK.
-        // Note: "atomic" here means no partial failure — all pairs are written.
-        // We iterate shards independently, which is fine since each shard lock is
-        // independent and MSET doesn't promise cross-shard atomicity in Redis either.
+        // One step: every shard of its keys is held at once while they are
+        // written (`WriteShards`), so no reader finds some of them set and
+        // the others not yet.
         "MSET" => {
             // needs key value key value ... — odd total args, even pairs after cmd name
             if cmd.len() < 3 || cmd.len().is_multiple_of(2) {
@@ -2343,4 +2384,121 @@ fn format_increx_float(v: f64) -> String {
         s = s.trim_end_matches('0').trim_end_matches('.').to_string();
     }
     if s == "-0" { "0".to_string() } else { s }
+}
+
+#[cfg(test)]
+mod write_shards_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    /// Keys in `n` different shards of `db`, in the database's order.
+    fn keys_in_different_shards(db: &store::Db, n: usize) -> Vec<String> {
+        let mut by_shard = std::collections::BTreeMap::new();
+        for i in 0.. {
+            let key = format!("k{i}");
+            by_shard
+                .entry(store::shard_index(db.len(), &key))
+                .or_insert(key);
+            if by_shard.len() == n {
+                break;
+            }
+        }
+        by_shard.into_values().collect()
+    }
+
+    /// While `MSET` waits for a busy shard, it holds none of the others:
+    /// another writer can take one of them meanwhile. Holding them while
+    /// it waited queued every `MSET` behind every other.
+    #[test]
+    fn waiting_for_a_busy_shard_holds_no_other() {
+        let store = store::new_store(1);
+        let db = Arc::clone(&store[0]);
+        let keys = keys_in_different_shards(&db, 3);
+        let (first, busy) = (keys[0].clone(), keys[2].clone());
+        let first_shard = store::shard_index(db.len(), &first);
+        let busy_shard = store::shard_index(db.len(), &busy);
+
+        let holder = db[busy_shard].write();
+        let locked = Arc::new(AtomicBool::new(false));
+        let mset = {
+            let (db, keys, locked) = (Arc::clone(&db), keys.clone(), Arc::clone(&locked));
+            std::thread::spawn(move || {
+                let mut shards = WriteShards::lock(&db, keys.iter().map(String::as_str));
+                locked.store(true, Ordering::SeqCst);
+                for key in &keys {
+                    drop(shards.map(key).set_str_expiring(key.as_str(), b"v", None));
+                }
+            })
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !locked.load(Ordering::SeqCst),
+            "it went on without the busy shard"
+        );
+        // The first shard is free while it waits.
+        let mut taken = None;
+        for _ in 0..200 {
+            if let Some(guard) = db[first_shard].try_write() {
+                taken = Some(guard);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(taken.is_some(), "the first shard was held while waiting");
+        drop(taken);
+        drop(holder);
+        mset.join().unwrap();
+        assert!(locked.load(Ordering::SeqCst));
+        for key in &keys {
+            let shard = store::get_shard(&db, key);
+            assert!(shard.read().contains_key(key), "{key}");
+        }
+    }
+
+    /// Many writers of overlapping shards, each taking them as `MSET`
+    /// does, never deadlock and never hold a shard together.
+    #[test]
+    fn overlapping_writers_finish_and_exclude_each_other() {
+        let store = store::new_store(1);
+        let db = Arc::clone(&store[0]);
+        let keys = keys_in_different_shards(&db, 12);
+        let inside: Arc<Vec<std::sync::atomic::AtomicUsize>> = Arc::new(
+            (0..db.len())
+                .map(|_| std::sync::atomic::AtomicUsize::new(0))
+                .collect(),
+        );
+        let writers: Vec<_> = (0..8)
+            .map(|w| {
+                let (db, keys, inside) = (Arc::clone(&db), keys.clone(), Arc::clone(&inside));
+                std::thread::spawn(move || {
+                    for round in 0..2000usize {
+                        // A different window of the keys each time, so the
+                        // writers overlap in some shards and not others.
+                        let from = (w * 3 + round) % keys.len();
+                        let mine: Vec<&str> = (0..5)
+                            .map(|i| keys[(from + i * 2) % keys.len()].as_str())
+                            .collect();
+                        let _shards = WriteShards::lock(&db, mine.iter().copied());
+                        let held: Vec<usize> = shards_of(&db, mine.iter().copied());
+                        for &s in &held {
+                            assert_eq!(
+                                inside[s].fetch_add(1, Ordering::SeqCst),
+                                0,
+                                "shard {s} held twice"
+                            );
+                        }
+                        std::hint::spin_loop();
+                        for &s in &held {
+                            inside[s].fetch_sub(1, Ordering::SeqCst);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+    }
 }

@@ -190,6 +190,11 @@ impl AclUser {
         all_keys(&self.keys)
     }
 
+    /// May read every key (`~*`, `allkeys` or `%R~*`).
+    pub fn reads_all_keys(&self) -> bool {
+        self.keys.iter().any(|k| k.pattern == "*" && k.read)
+    }
+
     /// May use every pub/sub channel (`&*` / `allchannels`).
     pub fn all_channels(&self) -> bool {
         all_channels(&self.channels)
@@ -1070,7 +1075,9 @@ fn key_access(name: &str, cmd: &[&[u8]], nth: usize) -> (bool, bool) {
         let returns_old = cmd.iter().skip(3).any(|a| a.eq_ignore_ascii_case(b"GET"));
         return (returns_old, true);
     }
-    if name == "COPY" {
+    // `SORT key ... STORE destination`, like `COPY`, reads the key and only
+    // writes the destination (Redis: `RO access`, `OW update`).
+    if name == "COPY" || name == "SORT" {
         return if nth == 0 {
             (true, false)
         } else {

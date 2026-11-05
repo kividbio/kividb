@@ -15,6 +15,7 @@ import math
 import threading
 import subprocess
 import socket
+import tempfile
 import redis
 import pytest
 from typing import Any, Generator
@@ -300,6 +301,9 @@ def kivi_server():
 
     proc = subprocess.Popen(
         cmd,
+        # A directory of its own: one engine to a data directory, and the
+        # tests that start servers of their own start them elsewhere.
+        cwd=tempfile.mkdtemp(prefix="kividb-e2e-"),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )

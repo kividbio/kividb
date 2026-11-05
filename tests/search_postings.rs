@@ -790,6 +790,52 @@ fn random_filters_answer_from_postings_what_the_scan_answers() {
     assert_eq!(info.get("num_docs").i(), model.len() as i64, "{info:?}");
 }
 
+/// A TEXT field dropped by a read once past its time (`HGETALL`) is not
+/// matched before the field-expiry sweep has brought the TEXT index up to
+/// date (#364): in an index with no TAG or NUMERIC field, which keeps no
+/// postings, and in one whose postings are off. Each query comes at once,
+/// well inside the 100 ms between sweeps.
+#[test]
+fn a_text_field_dropped_by_a_read_is_not_matched() {
+    let mut c = conn();
+    let schemas: [(&str, &[&str]); 2] = [
+        ("tx364", &["body", "TEXT"]),
+        ("tp364", &["body", "TEXT", "c", "TAG"]),
+    ];
+    for (index, schema) in schemas {
+        let prefix = format!("{index}:");
+        let mut args = vec![
+            "FT.CREATE",
+            index,
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            prefix.as_str(),
+            "SCHEMA",
+        ];
+        args.extend_from_slice(schema);
+        assert!(c.cmd(&args).ok());
+    }
+    postings(&mut c, "tp364", false);
+    for (index, _) in schemas {
+        for i in 0..20 {
+            let key = format!("{index}:{i}");
+            assert_eq!(
+                c.cmd(&["HSET", &key, "body", "hello", "c", "red"]),
+                V::Int(2)
+            );
+            let reply = c.cmd(&["HPEXPIRE", &key, "1", "FIELDS", "1", "body"]);
+            assert_eq!(reply.arr()[0], V::Int(1), "{reply:?}");
+            thread::sleep(Duration::from_millis(3));
+            c.cmd(&["HGETALL", &key]);
+            let found = search(&mut c, index, "hello");
+            assert!(found.is_empty(), "{index}, {key}: {found:?}");
+            assert_eq!(aggregate_count(&mut c, index, "hello"), 0, "{index}, {key}");
+        }
+    }
+}
+
 /// A TAG or NUMERIC field added by FT.ALTER is answered from postings filled
 /// from the documents already there.
 #[test]

@@ -1,0 +1,7 @@
+total 58816200
+drwxrwxrwx 2 root      root             4096 Nov  3 03:39 .
+drwxr-xr-x 4 root      root             4096 Nov  3 02:47 ..
+-rw-r--r-- 1 azureuser azureuser 28768875350 Nov  3 03:42 appendonly.aof
+-rw-r--r-- 1 azureuser azureuser 31458888973 Nov  3 03:39 dump.kdb
+-rw-r--r-- 1 azureuser azureuser          24 Nov  3 03:39 dump.kdb.gen
+-rw-r--r-- 1 azureuser azureuser           0 Nov  3 03:30 kividb.lock

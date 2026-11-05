@@ -74,7 +74,9 @@ pub fn feed(registry: &SharedMonitorRegistry, cmd: &[&[u8]], db: usize, source: 
     if MONITOR_COUNT.load(Ordering::Relaxed) == 0 {
         return;
     }
-    let cmd: Vec<Vec<u8>> = cmd.iter().map(|arg| arg.to_vec()).collect();
+    // Passwords and secret settings are not shown (`slowlog::redact`).
+    let cmd: Vec<Vec<u8>> =
+        crate::slowlog::redact(cmd).unwrap_or_else(|| cmd.iter().map(|arg| arg.to_vec()).collect());
     registry.broadcast(format_monitor_line(&cmd, db, source));
 }
 

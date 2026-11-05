@@ -454,7 +454,9 @@ fn test_expire_deleting_time_checks_the_condition_first() {
         (true, &["EXPIRE", "0", "NX"], 0),
         (true, &["EXPIRE", "-1", "NX"], 0),
         (true, &["EXPIREAT", "1", "NX"], 0),
+        (true, &["EXPIREAT", "-1", "NX"], 0),
         (false, &["PEXPIREAT", "1", "XX"], 0),
+        (false, &["PEXPIREAT", "-1", "XX"], 0),
         (true, &["PEXPIRE", "0", "GT"], 0),
         // Conditions that hold: the key goes.
         (true, &["EXPIRE", "0", "LT"], 1),
@@ -466,6 +468,8 @@ fn test_expire_deleting_time_checks_the_condition_first() {
         (false, &["PEXPIRE", "-5", "LT"], 1),
         (false, &["EXPIREAT", "1", "NX"], 1),
         (true, &["EXPIREAT", "1"], 1),
+        (false, &["EXPIREAT", "-1"], 1),
+        (false, &["PEXPIREAT", "-1"], 1),
         (false, &["EXPIRE", "0"], 1),
         // GT needs a TTL, and a later deadline than it; LT a sooner one.
         (true, &["EXPIRE", "0", "GT"], 0),
