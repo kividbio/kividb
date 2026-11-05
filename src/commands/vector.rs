@@ -660,23 +660,27 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             .is_some_and(|s| !crate::cluster::search::in_served(s, key))
     };
     let json = matches!(def.on, crate::vector::IndexOn::Json);
-    let mut add_row = |key: &str, inner: &crate::vector::Fields| {
+    let mut add_row = |key: &str,
+                       inner: &crate::vector::Fields,
+                       json_doc: Option<&serde_json::Value>| {
         // ── Build row ─────────────────────────────────────────────────
         // Only rows that passed the filter reach here.
         let mut row: Row = ahash::AHashMap::new();
 
-        // Always include the key itself as a special field.
-        // Prefixed with __ so it doesn't collide with user field names.
-        row.insert("__key".to_string(), key.to_string());
         if addscores {
+            let score = crate::commands::search::relevance(&def, key, inner, &scoring, json_doc);
+            if score == f64::NEG_INFINITY {
+                return;
+            }
             row.insert(
                 "__score".to_string(),
-                crate::commands::search::number_text(crate::commands::search::relevance(
-                    &def, key, inner, &scoring,
-                )),
+                crate::commands::search::number_text(score),
             );
         }
 
+        // Always include the key itself as a special field.
+        // Prefixed with __ so it doesn't collide with user field names.
+        row.insert("__key".to_string(), key.to_string());
         for (field, val) in inner.iter() {
             // Text only: a vector's bytes are not a value a row can show
             // or a pipeline can compute with.
@@ -708,9 +712,9 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 if not_served(&key) {
                     continue;
                 }
-                crate::commands::search::with_doc(db_ref, &def, &key, |inner, _| {
+                crate::commands::search::with_doc(db_ref, &def, &key, |inner, json| {
                     if plan.exact || crate::vector::filter::eval(&filter, inner) {
-                        add_row(&key, inner);
+                        add_row(&key, inner, json);
                     }
                 });
             }
@@ -729,7 +733,8 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             // The filter on the raw fields, before anything is turned into
             // strings.
             if crate::vector::filter::eval(&filter, &*inner) {
-                add_row(key, &inner);
+                let json = inner.json();
+                add_row(key, &inner, json);
             }
         }),
     };

@@ -2669,6 +2669,19 @@ const FAST_COMMANDS: &[&str] = &[
     "ZSCORE",
 ];
 
+/// Whether `name` (upper case) is in `@write`, and flagged `write` by
+/// `COMMAND`. That is what is sent to replicas
+/// ([`crate::replication::is_write_command`]) but `SELECT`: replicas are
+/// sent it to follow the database, and Redis has it in `@fast @connection`
+/// only (#392).
+fn is_acl_write(name: &str) -> bool {
+    crate::replication::is_write_command(name) && name != "SELECT"
+}
+
+/// The categories in [`ACL_CATEGORIES`] that Redis does not have. They
+/// can be granted like any other, and `COMMAND INFO` leaves them out.
+const KIVIDB_ONLY_CATEGORIES: &[&str] = &["cluster", "generic", "server"];
+
 /// The ACL categories, as `ACL CAT` lists them.
 pub(crate) const ACL_CATEGORIES: &[&str] = &[
     "admin",
@@ -2722,7 +2735,13 @@ fn command_table() -> std::collections::BTreeMap<&'static str, Vec<u8>> {
     use crate::keyspec::Layout;
 
     let mut categories: ahash::AHashMap<&'static str, Vec<&'static str>> = ahash::AHashMap::new();
-    for category in ACL_CATEGORIES {
+    // The categories Redis has: `cluster`, `generic` and `server` are
+    // KiviDB's own, after Redis's command groups, and Redis reports no such
+    // category for a command (`COMMAND INFO command` is `@slow @connection`).
+    for category in ACL_CATEGORIES
+        .iter()
+        .filter(|c| !KIVIDB_ONLY_CATEGORIES.contains(*c))
+    {
         for command in acl_cat_commands(category).unwrap_or_default() {
             // `CLIENT|KILL` and the like describe a subcommand, not a command.
             if !command.contains('|') {
@@ -2759,7 +2778,7 @@ fn command_table() -> std::collections::BTreeMap<&'static str, Vec<u8>> {
                     .is_some_and(|list| list.contains(&category))
             };
             let mut flags: Vec<String> = Vec::new();
-            if crate::replication::is_write_command(name) {
+            if is_acl_write(name) {
                 flags.push("write".into());
             } else if layout != Layout::NoKeys {
                 flags.push("readonly".into());
@@ -3033,8 +3052,6 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
             "TTL",
             "TYPE",
             "UNLINK",
-            "WAIT",
-            "WAITAOF",
         ],
         "server" => vec![
             "ACL",
@@ -3069,7 +3086,25 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
             "HOTKEYS",
             "SYNC",
         ],
-        "connection" => vec!["AUTH", "CLIENT", "ECHO", "HELLO", "PING", "QUIT", "RESET"],
+        // As Redis 7.4 to 8.10 and Valkey have it. redis-py's cluster client
+        // runs `COMMAND` as it connects, so a user given `+@connection` and
+        // nothing more for it must be able to (#392).
+        "connection" => vec![
+            "ASKING",
+            "AUTH",
+            "CLIENT",
+            "COMMAND",
+            "ECHO",
+            "HELLO",
+            "PING",
+            "QUIT",
+            "READONLY",
+            "READWRITE",
+            "RESET",
+            "SELECT",
+            "WAIT",
+            "WAITAOF",
+        ],
         // Redis calls it `transaction`; `transactions` is the older KiviDB name.
         "transaction" | "transactions" => vec!["DISCARD", "EXEC", "MULTI", "UNWATCH", "WATCH"],
         "pubsub" => vec![
@@ -3123,8 +3158,6 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
             "TTL",
             "TYPE",
             "UNLINK",
-            "WAIT",
-            "WAITAOF",
         ],
         // The module families, taken from the command table by prefix so a new
         // command joins its category by being registered.
@@ -3193,7 +3226,7 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
         "write" => ALL_COMMANDS
             .iter()
             .copied()
-            .filter(|c| crate::replication::is_write_command(c))
+            .filter(|c| is_acl_write(c))
             .collect(),
         // Union of the existing data-access categories, minus anything
         // classified as a write above.

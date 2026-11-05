@@ -824,7 +824,17 @@ Shard channel message (SSUBSCRIBE / SPUBLISH):
 | `MEMORY MALLOC-STATS` | `MEMORY MALLOC-STATS` | Allocator statistics (minimal) |
 | `MEMORY PURGE` | `MEMORY PURGE` | Ask the allocator to return free memory; replies `OK` |
 | `MEMORY HELP` | `MEMORY HELP` | List the `MEMORY` subcommands |
-| `DEBUG` | `DEBUG ...` | Accepted and ignored for redis-cli compatibility |
+| `DEBUG OBJECT` | `DEBUG OBJECT key` | The key's encoding, serialized length and last use, in Redis's order of fields. A key past its time is shown while it is still there, and looking is not a use. `Value at` is `0x0` and `refcount` `1`; `serializedlength` is the length in a `DUMP`, not Redis's RDB; `lru` and `lru_seconds_idle` are 0 unless an LRU or LFU policy (or `key-access-tracking`) is on. `ERR no such key` for a missing key |
+| `DEBUG SET-ACTIVE-EXPIRE` | `DEBUG SET-ACTIVE-EXPIRE 0\|1` | Stop or restart the background expiry of keys and hash fields. Keys past their time still go when read. Process-wide, and on again after a restart |
+| `DEBUG PAUSE-CRON` | `DEBUG PAUSE-CRON 0\|1` | Pause or resume the background expiry, as in Redis, where it runs inside the cron |
+| `DEBUG SLEEP` | `DEBUG SLEEP seconds` | Block this connection's worker thread for `seconds` |
+| `DEBUG POPULATE` | `DEBUG POPULATE count [prefix] [size]` | Make `count` string keys, `prefix:0` onwards (`key:0` without a prefix), leaving any that are there |
+| `DEBUG DIGEST-VALUE` | `DEBUG DIGEST-VALUE key [key ...]` | A digest of each key's value in 40 hex digits, or 40 zeros for a missing key |
+| `DEBUG PROTOCOL` | `DEBUG PROTOCOL type` | A reply of the given RESP type, for client tests |
+| `DEBUG LOG` | `DEBUG LOG message` | Write `message` to the server log |
+| `DEBUG SET-DISABLE-DENY-SCRIPTS` | `DEBUG SET-DISABLE-DENY-SCRIPTS 0\|1` | Accepted for the Redis test suite; changes nothing |
+| `DEBUG HELP` | `DEBUG HELP` | List the `DEBUG` subcommands |
+| `DEBUG` (any other) | `DEBUG ...` | Any other subcommand, including Redis's `RELOAD`, `LOADAOF` and `CHANGE-REPL-ID`, or one with the wrong number of arguments, is refused with Redis's `ERR unknown subcommand or wrong number of arguments for '<name>'. Try DEBUG HELP.` |
 | `QUIT` | `QUIT` | Close the connection |
 | `ROLE` | `ROLE` | Return the replication role: `master` or `slave`, with offset and replica list |
 | `REPLICAOF` | `REPLICAOF host port \| NO ONE` | Configure this instance as a replica, or promote to master. Refused in cluster mode, where `CLUSTER REPLICATE` does it |
@@ -949,6 +959,13 @@ Categories (`ACL CAT`): the data types `string` `list` `set` `sortedset` `hash`
 `vector`; `keyspace` / `generic`; `read` and `write`; `fast` and `slow`;
 `blocking`; `pubsub`, `scripting`, `transaction`, `connection`, `cluster`,
 `server`; and `admin` and `dangerous`.
+
+`connection` is Redis's: `AUTH`, `CLIENT`, `COMMAND`, `ECHO`, `HELLO`,
+`PING`, `QUIT`, `RESET`, `SELECT`, `READONLY`, `READWRITE`, `ASKING`, `WAIT`
+and `WAITAOF`, with all their subcommands. `cluster`, `generic` and `server`
+are KiviDB's own, after Redis's command groups; they can be granted like the
+others, and `COMMAND` leaves them out of the categories it reports, as Redis
+has no such categories.
 
 A command with subcommands can be allowed and denied per subcommand, written
 `command|subcommand`: `-client|kill`, `+config|get`. A rule naming the command

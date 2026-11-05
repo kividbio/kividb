@@ -29,6 +29,36 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`@connection` holds what it holds in Redis (#392).** It had only
+  `AUTH`, `CLIENT`, `ECHO`, `HELLO`, `PING`, `QUIT` and `RESET`. It now
+  also has `COMMAND` and all its subcommands, `SELECT`, `READONLY`,
+  `READWRITE`, `ASKING`, `WAIT` and `WAITAOF`, as in Redis 7.0 and later
+  and Valkey. redis-py's cluster client runs `COMMAND` when it connects, so a
+  user given `+@connection` and not `+command` (as OpenViking's gateway
+  CI sets one up) could not open a cluster connection: `NoPermissionError:
+  User ... has no permissions to run the 'command' command`. `WAIT` and
+  `WAITAOF` are no longer in `@keyspace`, `@generic` and `@read`, nor
+  `SELECT` in `@write`, where Redis does not have them (a user of
+  `+@all -@write` may now `SELECT`, as in Redis). `COMMAND INFO` now
+  reports only categories Redis has: `COMMAND` is `@slow @connection`,
+  as in Redis, not `@server @slow`. KiviDB's own `@cluster` and `@server`
+  keep the commands they had, for `ACL SETUSER` and `ACL CAT`.
+
+  **Upgrade note:** ACL rules are checked when a command runs, so these
+  changes apply to existing users as soon as the server is upgraded.
+  - A user with `+@write` but not `+@connection` (or `+@all`) can no
+    longer `SELECT`. Add `+select`.
+  - A user with `+@read`, `+@keyspace` or `+@generic` but not
+    `+@connection` can no longer run `WAIT` or `WAITAOF`. Add
+    `+wait +waitaof`.
+  - A user of `+@all -@write`, or of the `readonly` shorthand, may now
+    `SELECT`, as in Redis.
+
+- **`SCORE` and `SCORE_FIELD` now agree with Redis 8.10.2 for hash and JSON
+  documents**, including f32 rounding, special values, negative scores and
+  cluster `-inf` filtering. Both settings also survive snapshots.
+  (#247, by [@Sourabh-ctrl](https://github.com/Sourabh-ctrl))
+
 - **`ZREM` no longer scans the whole sorted set for each member it removes.**
   Removing a member is now O(log N) instead of O(N)
   ([#386](https://github.com/kividbio/kividb/issues/386),
@@ -370,6 +400,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   never swept on the replica, nor after a failover on the replica promoted.
   A write applied from the stream now takes the order of its keys, as a
   command does.
+- **`DEBUG` does what it says** (#236, by
+  [@saikishore222](https://github.com/saikishore222)). `DEBUG
+  SET-ACTIVE-EXPIRE 0` replied `OK` and the background expiry went on; it
+  now stops, for keys and hash fields alike, until `SET-ACTIVE-EXPIRE 1`,
+  and keys past their time still go when read. `DEBUG PAUSE-CRON 1` stops
+  it too, as in Redis, where the expiry runs inside the cron. A subcommand
+  KiviDB does not have (Redis's `RELOAD`, `LOADAOF`, `CHANGE-REPL-ID`,
+  `QUICKLIST-PACKED-THRESHOLD`, …) replied `OK`, and so did one with the
+  wrong number of arguments; both are now Redis's `ERR unknown subcommand
+  or wrong number of arguments`, and `DEBUG HELP` lists what is there.
+  `DEBUG OBJECT` gave the same line for every key, there or not; it now
+  gives the key's encoding, serialized length and last use in Redis's order
+  of fields, and `ERR no such key` for a key that is not there.
 - **On a replica, `FLUSHDB`, `FLUSHALL` and `SWAPDB` from the master take
   the command gate alone, as they do on a master (#378).** They took it
   shared, so a query on the replica could find a database half flushed, its

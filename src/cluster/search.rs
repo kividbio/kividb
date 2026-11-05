@@ -337,6 +337,48 @@ pub fn fan_out(ctx: &crate::commands::ctx::Ctx, cmd: &[Vec<u8>]) -> Result<Vec<R
 /// the query does not use changes nothing: a master from before the flag
 /// ignores it, and answers in the shape it always did.
 const TIMEOUT_FLAG_PARAM: &[u8] = b"__kividb_timeout_flag";
+const SCORES_MATTER_PARAM: &[u8] = b"__kividb_scores_matter";
+
+pub fn ask_for_scores_matter(cmd: &mut Vec<Vec<u8>>, matters: bool) {
+    cmd.extend([
+        b"PARAMS".to_vec(),
+        b"2".to_vec(),
+        SCORES_MATTER_PARAM.to_vec(),
+        if matters {
+            b"1".to_vec()
+        } else {
+            b"0".to_vec()
+        },
+    ]);
+}
+
+pub fn scores_matter(cmd: &[&[u8]]) -> Option<bool> {
+    let mut hint = None;
+    let mut i = 0;
+    while i + 1 < cmd.len() {
+        if !cmd[i].eq_ignore_ascii_case(b"PARAMS") {
+            i += 1;
+            continue;
+        }
+        let n = std::str::from_utf8(cmd[i + 1])
+            .ok()
+            .and_then(|n| n.parse::<usize>().ok());
+        let Some(n) = n else {
+            i += 1;
+            continue;
+        };
+        let start = i + 2;
+        let end = start.saturating_add(n).min(cmd.len());
+        let (pairs, _) = cmd[start..end].as_chunks::<2>();
+        for pair in pairs {
+            if pair[0] == SCORES_MATTER_PARAM {
+                hint = Some(pair[1] != b"0");
+            }
+        }
+        i = end;
+    }
+    hint
+}
 
 /// Ask the masters for their timeout flag: `PARAMS 2 <name> 1`, last.
 pub fn ask_for_timeout_flag(cmd: &mut Vec<Vec<u8>>) {
@@ -532,5 +574,31 @@ mod tests {
         assert!(!asks(&cmd));
         ask_for_timeout_flag(&mut cmd);
         assert!(asks(&cmd));
+    }
+
+    #[test]
+    fn only_a_coordinator_that_asks_says_whether_scores_are_needed() {
+        let hint = |cmd: &[Vec<u8>]| -> Option<bool> {
+            let parts: Vec<&[u8]> = cmd.iter().map(Vec::as_slice).collect();
+            scores_matter(&parts)
+        };
+        let mut cmd: Vec<Vec<u8>> = vec![b"FT.SEARCH".to_vec(), b"idx".to_vec(), b"*".to_vec()];
+        assert_eq!(hint(&cmd), None);
+        ask_for_scores_matter(&mut cmd, false);
+        assert_eq!(hint(&cmd), Some(false));
+        ask_for_timeout_flag(&mut cmd);
+        assert_eq!(hint(&cmd), Some(false));
+        assert_eq!(
+            hint(&[
+                b"FT.SEARCH".to_vec(),
+                b"idx".to_vec(),
+                b"*".to_vec(),
+                b"PARAMS".to_vec(),
+                b"2".to_vec(),
+                SCORES_MATTER_PARAM.to_vec(),
+                b"1".to_vec(),
+            ]),
+            Some(true)
+        );
     }
 }

@@ -5048,6 +5048,10 @@ fn a_master_added_later_is_given_the_index() {
         "STOPWORDS",
         "1",
         "the",
+        "SCORE",
+        "0.5",
+        "SCORE_FIELD",
+        "rank",
         "SCHEMA",
         "title",
         "TEXT",
@@ -5064,6 +5068,8 @@ fn a_master_added_later_is_given_the_index() {
         "price",
         "NUMERIC",
         "SORTABLE",
+        "rank",
+        "NUMERIC",
         "name",
         "TEXT",
         "SORTABLE",
@@ -5093,7 +5099,17 @@ fn a_master_added_later_is_given_the_index() {
             .unwrap();
         format!("{:?}", info.array()[at + 1])
     };
+    let definition = |node: &Node| -> String {
+        let info = node.conn().cmd(&["FT.INFO", "idx"]);
+        let at = info
+            .array()
+            .iter()
+            .position(|i| matches!(i, Resp::Bulk(b) if b == b"index_definition"))
+            .unwrap();
+        format!("{:?}", info.array()[at + 1])
+    };
     let want = attributes(&nodes[0]);
+    let want_definition = definition(&nodes[0]);
 
     // Added empty, and given the index by a search.
     let late = Node::start(&[]);
@@ -5108,6 +5124,7 @@ fn a_master_added_later_is_given_the_index() {
         .cmd(&["FT.SEARCH", "idx", "*", "LIMIT", "0", "0"]);
     assert_eq!(found.array()[0].int(), 0, "{found:?}");
     assert_eq!(attributes(&nodes[3]), want);
+    assert_eq!(definition(&nodes[3]), want_definition);
 
     // Added, and given it by the master it imports from.
     let importer = Node::start(&[]);
@@ -5121,9 +5138,26 @@ fn a_master_added_later_is_given_the_index() {
     assert!(
         nodes[0]
             .conn()
-            .cmd(&["HSET", &key, "title", "hello world", "price", "5"])
+            .cmd(&[
+                "HSET",
+                &key,
+                "title",
+                "hello world",
+                "price",
+                "0",
+                "rank",
+                "2"
+            ])
             .int()
-            == 2
+            == 3
+    );
+    let low = key_in(0..=99, "b");
+    assert!(
+        nodes[0]
+            .conn()
+            .cmd(&["HSET", &low, "title", "hello", "price", "1", "rank", "-inf"])
+            .int()
+            == 3
     );
     let mut d = nodes[4].conn();
     let id = d.cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "99"]).text();
@@ -5135,10 +5169,49 @@ fn a_master_added_later_is_given_the_index() {
             .is_some_and(|t| task_field(t, "state").text() == "completed")
     });
     assert_eq!(attributes(&nodes[4]), want);
+    assert_eq!(definition(&nodes[4]), want_definition);
     let found = nodes[4]
         .conn()
         .cmd(&["FT.SEARCH", "idx", "hello", "NOCONTENT"]);
     assert_eq!(found.array()[0].int(), 1, "{found:?}");
+
+    // Redis drops a document whose score is -inf only when the scores are
+    // needed: a plain search does, but `SORTBY price` and `LIMIT 0 0` do not.
+    // The coordinator asks every master for scores to merge its part, but must
+    // tell them the client did not ask for them, or they drop `low` too.
+    let found = nodes[4].conn().cmd(&[
+        "FT.SEARCH",
+        "idx",
+        "hello",
+        "SORTBY",
+        "price",
+        "ASC",
+        "NOCONTENT",
+    ]);
+    assert_eq!(found.array()[0].int(), 2, "{found:?}");
+    assert_eq!(found.array()[1].text(), key, "{found:?}");
+    assert_eq!(found.array()[2].text(), low, "{found:?}");
+
+    let found = nodes[4]
+        .conn()
+        .cmd(&["FT.SEARCH", "idx", "hello", "LIMIT", "0", "0"]);
+    assert_eq!(found.array()[0].int(), 2, "{found:?}");
+
+    let found = nodes[4].conn().cmd(&[
+        "FT.SEARCH",
+        "idx",
+        "hello",
+        "SORTBY",
+        "price",
+        "ASC",
+        "WITHSCORES",
+        "NOCONTENT",
+        "SCORER",
+        "DOCSCORE",
+    ]);
+    assert_eq!(found.array()[0].int(), 1, "{found:?}");
+    assert_eq!(found.array()[1].text(), key, "{found:?}");
+    assert_eq!(found.array()[2].text(), "2", "{found:?}");
 }
 
 /// What nodes send each other's client ports (index definitions, searches,

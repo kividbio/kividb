@@ -1060,6 +1060,100 @@ fn ft_info_schema_correct_after_restart() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn score_options_survive_restart() {
+    let _serial = persist_serial();
+    let dir = temp_dir("score_snap");
+    let port1 = free_port();
+
+    let mut srv1 = start_server_in_dir(port1, &dir);
+    assert!(
+        wait_for_server(port1, Duration::from_secs(10)),
+        "srv1 start"
+    );
+
+    let run = |c: &mut Conn| {
+        text_of(&c.cmds(&[
+            "FT.SEARCH",
+            "idx:score",
+            "*",
+            "SORTBY",
+            "n",
+            "ASC",
+            "WITHSCORES",
+            "NOCONTENT",
+            "SCORER",
+            "DOCSCORE",
+        ]))
+    };
+    let before = {
+        let mut c = Conn::connect(port1);
+        assert!(
+            c.cmds(&[
+                "FT.CREATE",
+                "idx:score",
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                "doc:",
+                "SCORE",
+                "0.5",
+                "SCORE_FIELD",
+                "rank",
+                "SCHEMA",
+                "n",
+                "NUMERIC",
+                "SORTABLE",
+            ])
+            .is_ok()
+        );
+        assert_eq!(
+            c.cmds(&["HSET", "doc:0", "n", "0", "rank", "9e18"])
+                .as_int(),
+            2
+        );
+        assert_eq!(
+            c.cmds(&["HSET", "doc:1", "n", "1", "rank", "1e23"])
+                .as_int(),
+            2
+        );
+        assert_eq!(
+            c.cmds(&["HSET", "doc:2", "n", "2", "rank", "1e24"])
+                .as_int(),
+            2
+        );
+        assert_eq!(c.cmds(&["HSET", "doc:3", "n", "3"]).as_int(), 1);
+        assert!(c.cmds(&["SAVE"]).is_ok());
+        let before = run(&mut c);
+        assert!(before.contains("doc:0 9000000202358129000"), "{before}");
+        assert!(before.contains("doc:1 99999997781963080000000"), "{before}");
+        assert!(before.contains("doc:2 1.0000000138484279e+24"), "{before}");
+        assert!(before.contains("doc:3 0.5"), "{before}");
+        before
+    };
+
+    send_shutdown_nosave(port1);
+    assert!(
+        wait_for_exit(&mut srv1, Duration::from_secs(8)),
+        "srv1 stop"
+    );
+
+    let port2 = free_port();
+    let mut srv2 = start_server_in_dir(port2, &dir);
+    assert!(
+        wait_for_server(port2, Duration::from_secs(10)),
+        "srv2 start"
+    );
+    {
+        let mut c = Conn::connect(port2);
+        assert_eq!(run(&mut c), before);
+    }
+
+    kill_server(&mut srv2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Snapshot persistence — incremental indexing still works after restart
 // (insert new keys after restart, they are indexed immediately)
