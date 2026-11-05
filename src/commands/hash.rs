@@ -8,7 +8,6 @@ use crate::store::Key;
 use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::{read_lock, write_lock};
-use ahash::AHashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -93,7 +92,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let field = crate::commands::helpers::name_from_bytes(cmd[2]);
             let field: &str = &field;
 
-            match with_hash_read(ctx, key, |inner| inner.get(field).map(|v| resp_bulk(v))) {
+            match with_hash_fields_read(ctx, key, std::iter::once(field), |inner| {
+                inner.get(field).map(|v| resp_bulk(v))
+            }) {
                 None => {
                     crate::stats::record_miss();
                     Some(resp_null_bulk())
@@ -233,7 +234,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // protocol-correct encoding here — `resp3_normalize_null` only
             // rewrites a reply that is nothing but a top-level null.
             let resp = effective_resp_for_reply(ctx);
-            match with_hash_read(ctx, key, |inner| {
+            let requested = cmd[2..]
+                .iter()
+                .map(|f| crate::commands::helpers::name_from_bytes(f));
+            match with_hash_fields_read(ctx, key, requested, |inner| {
                 cmd[2..]
                     .iter()
                     .map(|f| {
@@ -328,7 +332,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let field = crate::commands::helpers::name_from_bytes(cmd[2]);
             let field: &str = &field;
 
-            match with_hash_read(ctx, key, |inner| {
+            match with_hash_fields_read(ctx, key, std::iter::once(field), |inner| {
                 if inner.contains_key(field) {
                     1i64
                 } else {
@@ -1024,6 +1028,62 @@ fn with_hash_read<F, R>(ctx: &Ctx, key: &str, f: F) -> Option<Result<R, Vec<u8>>
 where
     F: FnOnce(&crate::types::HashFields) -> R,
 {
+    with_hash_view(ctx, key, swept, f)
+}
+
+/// [`with_hash_read`] for a command that reads only `requested`: of a hash
+/// with field TTLs, only those fields' times are looked at.
+fn with_hash_fields_read<S, F, R>(
+    ctx: &Ctx,
+    key: &str,
+    requested: impl Iterator<Item = S> + Clone,
+    f: F,
+) -> Option<Result<R, Vec<u8>>>
+where
+    S: AsRef<str>,
+    F: FnOnce(&crate::types::HashFields) -> R,
+{
+    with_hash_view(ctx, key, |hx| read_requested(hx, requested), f)
+}
+
+type HashExGuard<'a> = parking_lot::RwLockReadGuard<'a, crate::types::HashInner>;
+
+/// A hash with field TTLs, every field past its time evicted first.
+fn swept(hx: &parking_lot::RwLock<crate::types::HashInner>) -> HashExGuard<'_> {
+    hx.write().sweep_expired();
+    hx.read()
+}
+
+/// A hash with field TTLs, read with those of `requested` that are past
+/// their time evicted. The read lock is let go of before the write lock is
+/// taken, and each field's time is looked at again under it. The other
+/// fields are left to the whole-hash reads and the background sweep.
+fn read_requested<S: AsRef<str>>(
+    hx: &parking_lot::RwLock<crate::types::HashInner>,
+    requested: impl Iterator<Item = S> + Clone,
+) -> HashExGuard<'_> {
+    let inner = hx.read();
+    if !requested
+        .clone()
+        .any(|field| inner.is_field_expired(field.as_ref()))
+    {
+        return inner;
+    }
+    drop(inner);
+    #[cfg(test)]
+    crate::test_hooks::at("read_requested: upgrade");
+    let mut inner = hx.write();
+    for field in requested {
+        inner.lazy_evict_if_expired(field.as_ref());
+    }
+    parking_lot::RwLockWriteGuard::downgrade(inner)
+}
+
+fn with_hash_view<V, F, R>(ctx: &Ctx, key: &str, view: V, f: F) -> Option<Result<R, Vec<u8>>>
+where
+    V: FnOnce(&parking_lot::RwLock<crate::types::HashInner>) -> HashExGuard<'_>,
+    F: FnOnce(&crate::types::HashFields) -> R,
+{
     if lazy_expire_on_read(ctx.store, *ctx.selected_db, key) {
         return None;
     }
@@ -1037,13 +1097,8 @@ where
             Some(Ok(f(&inner)))
         }
         Some(ValueRef::HashEx(hx)) => {
-            // Sweep expired fields under a write lock before exposing them.
-            // This is the lazy-eviction tick — readers also clean up.
-            let mut inner_w = hx.write();
-            inner_w.sweep_expired();
-            drop(inner_w);
-            let inner_r = hx.read();
-            Some(Ok(f(&inner_r.fields)))
+            let inner = view(hx);
+            Some(Ok(f(&inner.fields)))
         }
         Some(_) => Some(Err(resp_error(
             "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -1056,10 +1111,7 @@ where
 /// fields first if the variant is HashEx.
 fn with_hash_write<F, R>(ctx: &Ctx, key: &str, f: F) -> Option<Result<R, Vec<u8>>>
 where
-    F: FnOnce(
-        &mut crate::types::HashFields,
-        Option<&mut AHashMap<String, std::time::Instant>>,
-    ) -> R,
+    F: FnOnce(&mut crate::types::HashFields, Option<&mut crate::types::Expiries>) -> R,
 {
     if lazy_expire_key(ctx.store, *ctx.selected_db, key) {
         return None;
@@ -1103,7 +1155,7 @@ fn write_hash<R>(
     ctx: &Ctx,
     key: &str,
     sweep: bool,
-    mut write: impl FnMut(&mut crate::types::HashFields, Option<&mut AHashMap<String, Instant>>) -> R,
+    mut write: impl FnMut(&mut crate::types::HashFields, Option<&mut crate::types::Expiries>) -> R,
 ) -> Result<R, Vec<u8>> {
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     match read_lock!(shard).get(key) {
@@ -1140,7 +1192,7 @@ fn write_hash<R>(
 fn write_hash_ex<R>(
     hash: &parking_lot::RwLock<crate::types::HashInner>,
     sweep: bool,
-    write: &mut impl FnMut(&mut crate::types::HashFields, Option<&mut AHashMap<String, Instant>>) -> R,
+    write: &mut impl FnMut(&mut crate::types::HashFields, Option<&mut crate::types::Expiries>) -> R,
 ) -> R {
     let mut inner = hash.write();
     if sweep {
@@ -1572,10 +1624,7 @@ fn run_hfe_read(ctx: &mut Ctx, cmd_name: &str, mode: HfeReadMode) -> Option<Vec<
             Some(resp_array(out))
         }
         Some(ValueRef::HashEx(hx)) => {
-            // Sweep expired fields under write lock first so we don't report
-            // stale data.
-            hx.write().sweep_expired();
-            let inner = hx.read();
+            let inner = read_requested(hx, fields.iter());
             let out: Vec<Vec<u8>> = fields
                 .iter()
                 .map(|f| {
@@ -2490,7 +2539,7 @@ fn run_hstrlen(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let field = crate::commands::helpers::name_from_bytes(cmd[2]);
     let field: &str = &field;
 
-    match with_hash_read(ctx, key, |fields| {
+    match with_hash_fields_read(ctx, key, std::iter::once(field), |fields| {
         fields.get(field).map(|v| v.len() as i64).unwrap_or(0)
     }) {
         None => {
@@ -2504,6 +2553,163 @@ fn run_hstrlen(ctx: &mut Ctx) -> Option<Vec<u8>> {
         Some(Ok(n)) => {
             crate::stats::record_hit();
             Some(resp_integer(n))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::HashInner;
+    use parking_lot::RwLock;
+
+    const LIVE: Option<i64> = Some(60_000);
+    const DUE: Option<i64> = Some(-1_000);
+
+    /// A hash with field TTLs: each field's value is its name, and its time
+    /// that many milliseconds from now, past for a negative one.
+    fn hash(fields: &[(&str, Option<i64>)]) -> Arc<RwLock<HashInner>> {
+        let mut inner = HashInner::new();
+        let now = Instant::now();
+        for (name, ttl) in fields {
+            inner
+                .fields
+                .insert(name.to_string(), Arc::from(name.as_bytes()));
+            if let Some(ms) = *ttl {
+                let d = Duration::from_millis(ms.unsigned_abs());
+                let at = if ms < 0 { now - d } else { now + d };
+                inner.expiries.insert(name.to_string(), at);
+            }
+        }
+        Arc::new(RwLock::new(inner))
+    }
+
+    fn names(hx: &RwLock<HashInner>) -> (Vec<String>, Vec<String>) {
+        let inner = hx.read();
+        let mut fields: Vec<String> = inner.fields.keys().cloned().collect();
+        let mut timed: Vec<String> = inner.expiries.keys().cloned().collect();
+        fields.sort();
+        timed.sort();
+        (fields, timed)
+    }
+
+    #[test]
+    fn a_live_field_is_read_without_evicting_the_others() {
+        let hx = hash(&[("a", LIVE), ("b", DUE), ("c", DUE), ("d", None)]);
+        let inner = read_requested(&hx, ["a", "d"].iter());
+        assert_eq!(inner.fields.get("a").map(|v| &v[..]), Some(&b"a"[..]));
+        drop(inner);
+        assert_eq!(
+            names(&hx),
+            (
+                vec!["a".into(), "b".into(), "c".into(), "d".into()],
+                vec!["a".into(), "b".into(), "c".into()]
+            ),
+            "the expired fields not asked for are left to the sweep"
+        );
+    }
+
+    #[test]
+    fn the_expired_fields_asked_for_go_with_their_times() {
+        let hx = hash(&[("a", LIVE), ("b", DUE), ("c", DUE), ("d", DUE)]);
+        let requested = ["b", "a", "b", "missing", "c"];
+        let inner = read_requested(&hx, requested.iter());
+        assert!(inner.fields.get("b").is_none());
+        assert!(inner.fields.get("c").is_none());
+        assert!(inner.fields.get("a").is_some());
+        drop(inner);
+        assert_eq!(
+            names(&hx),
+            (vec!["a".into(), "d".into()], vec!["a".into(), "d".into()])
+        );
+    }
+
+    #[test]
+    fn nothing_goes_while_the_aof_is_replayed() {
+        let hx = hash(&[("a", DUE)]);
+        {
+            let _replay = crate::expiry::replay();
+            let inner = read_requested(&hx, std::iter::once("a"));
+            assert!(inner.fields.get("a").is_some());
+        }
+        assert_eq!(names(&hx), (vec!["a".into()], vec!["a".into()]));
+        // And once the replay is over, it is past its time again.
+        assert!(read_requested(&hx, std::iter::once("a")).fields.is_empty());
+    }
+
+    /// The field's time is looked at again under the write lock: an
+    /// `HPEXPIRE` that came between the two locks keeps it.
+    #[test]
+    fn a_ttl_extended_between_the_locks_keeps_the_field() {
+        let hx = hash(&[("a", DUE), ("b", DUE)]);
+        {
+            let hx = Arc::clone(&hx);
+            crate::test_hooks::set("read_requested: upgrade", move || {
+                hx.write()
+                    .expiries
+                    .insert("a".into(), Instant::now() + Duration::from_secs(60));
+            });
+        }
+        let inner = read_requested(&hx, ["a", "b"].iter());
+        crate::test_hooks::clear("read_requested: upgrade");
+        assert_eq!(inner.fields.get("a").map(|v| &v[..]), Some(&b"a"[..]));
+        assert!(inner.fields.get("b").is_none());
+    }
+
+    /// An `HSET` between the two locks takes the field's time away: its new
+    /// value stays.
+    #[test]
+    fn a_field_written_between_the_locks_keeps_its_new_value() {
+        let hx = hash(&[("a", DUE)]);
+        {
+            let hx = Arc::clone(&hx);
+            crate::test_hooks::set("read_requested: upgrade", move || {
+                let mut inner = hx.write();
+                inner.expiries.remove("a");
+                inner.fields.insert("a".into(), Arc::from(&b"new"[..]));
+            });
+        }
+        let inner = read_requested(&hx, std::iter::once("a"));
+        crate::test_hooks::clear("read_requested: upgrade");
+        assert_eq!(inner.fields.get("a").map(|v| &v[..]), Some(&b"new"[..]));
+        assert!(inner.expiries.is_empty());
+    }
+
+    /// A sweep, or another reader, that evicted the field between the two
+    /// locks leaves nothing to do.
+    #[test]
+    fn a_field_evicted_between_the_locks_is_left_alone() {
+        let hx = hash(&[("a", DUE), ("b", DUE), ("c", None)]);
+        {
+            let hx = Arc::clone(&hx);
+            crate::test_hooks::set("read_requested: upgrade", move || {
+                assert_eq!(hx.write().sweep_expired(), 2);
+            });
+        }
+        let inner = read_requested(&hx, std::iter::once("a"));
+        crate::test_hooks::clear("read_requested: upgrade");
+        assert!(inner.fields.get("a").is_none());
+        drop(inner);
+        assert_eq!(names(&hx), (vec!["c".into()], vec![]));
+    }
+
+    #[test]
+    fn readers_that_find_the_same_expired_field_at_once() {
+        for _ in 0..50 {
+            let hx = hash(&[("a", DUE), ("b", LIVE), ("c", DUE)]);
+            std::thread::scope(|s| {
+                for _ in 0..8 {
+                    s.spawn(|| {
+                        let inner = read_requested(&hx, std::iter::once("a"));
+                        assert!(inner.fields.get("a").is_none());
+                        assert!(inner.fields.get("b").is_some());
+                    });
+                }
+            });
+            assert_eq!(
+                names(&hx),
+                (vec!["b".into(), "c".into()], vec!["b".into(), "c".into()])
+            );
         }
     }
 }

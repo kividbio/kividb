@@ -700,6 +700,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     };
     // From postings, if they narrow the filter (see `search::plan`); else
     // every document, the deadline kept between runs of them (`scan_docs`).
+    let mut now = None;
     let timed_out_scan = match crate::commands::search::plan(ctx, &def, &filter, None) {
         Some(plan) => {
             let mut seen = 0u32;
@@ -712,7 +713,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 if not_served(&key) {
                     continue;
                 }
-                crate::commands::search::with_doc(db_ref, &def, &key, |inner, json| {
+                crate::commands::search::with_doc(db_ref, &def, &key, &mut now, |inner, json| {
                     if plan.exact || crate::vector::filter::eval(&filter, inner) {
                         add_row(&key, inner, json);
                     }
@@ -727,7 +728,8 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             if not_served(key) {
                 return;
             }
-            let Some(inner) = crate::vector::doc_fields(&def.on, &def.fields, value) else {
+            let Some(inner) = crate::vector::doc_fields_at(&def.on, &def.fields, value, &mut now)
+            else {
                 return;
             };
             // The filter on the raw fields, before anything is turned into
@@ -1042,6 +1044,7 @@ fn ft_tagvals(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // Scan all shards and collect distinct tag values.
     let mut distinct: ahash::AHashSet<String> = ahash::AHashSet::new();
     let db_ref = &ctx.store[*ctx.selected_db];
+    let mut now = None;
 
     for shard in db_ref.iter() {
         let map = shard.read();
@@ -1051,7 +1054,8 @@ fn ft_tagvals(ctx: &mut Ctx) -> Option<Vec<u8>> {
             if !matches {
                 continue;
             }
-            let Some(inner) = crate::vector::doc_fields(&doc_on, &doc_schema, value) else {
+            let Some(inner) = crate::vector::doc_fields_at(&doc_on, &doc_schema, value, &mut now)
+            else {
                 continue;
             };
             let Some(s) = inner
