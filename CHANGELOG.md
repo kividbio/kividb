@@ -29,6 +29,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A sorted set with a NaN score is refused when it is restored or
+  loaded.** No command makes one, but `RESTORE` of a crafted payload took
+  one, and so did loading a snapshot, the AOF's preamble, a full sync from a
+  master or a Redis RDB file. Its order put the NaN above `+inf`, so
+  `ZCOUNT -inf +inf` and the other unbounded score ranges counted a member
+  that `ZCARD`-based code took not to be there. As in Redis, `RESTORE` now
+  replies `ERR Bad data format`, and loading fails with `Zset with NAN score
+  detected` and the key. Infinite scores load as before (#414).
+
 - **`@connection` holds what it holds in Redis (#392).** It had only
   `AUTH`, `CLIENT`, `ECHO`, `HELLO`, `PING`, `QUIT` and `RESET`. It now
   also has `COMMAND` and all its subcommands, `SELECT`, `READONLY`,

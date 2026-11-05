@@ -90,6 +90,24 @@ const TAG_LIST: u8 = 2;
 const TAG_HASH: u8 = 3;
 const TAG_SET: u8 = 4;
 const TAG_SORTEDSET: u8 = 5;
+
+/// What a sorted set with a NaN score is refused with, in Redis's words.
+const NAN_SCORE: &str = "Zset with NAN score detected";
+
+/// A sorted-set score read from a snapshot, a `DUMP` payload or a Redis
+/// RDB file, unless it is NaN. Redis refuses one there, and so does this:
+/// no command makes one (`ZADD` and `ZINCRBY` refuse it), the order of the
+/// set would put it above `+inf`, and the score ranges take there to be
+/// none, as in `ZCOUNT -inf +inf` being `ZCARD` (#414). An infinite score
+/// is a score.
+fn zset_score(score: f64) -> Option<f64> {
+    (!score.is_nan()).then_some(score)
+}
+
+/// [`zset_score`] for a reader that reports why.
+fn zset_score_or_error(score: f64) -> io::Result<f64> {
+    zset_score(score).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, NAN_SCORE))
+}
 const TAG_STREAM: u8 = 6;
 const TAG_JSON: u8 = 7;
 const TAG_TIMESERIES: u8 = 8;
@@ -1615,7 +1633,12 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
                         let member = read_bytes(&mut r)?;
                         let mut score_buf = [0u8; 8];
                         r.read_exact(&mut score_buf)?;
-                        let score = f64::from_le_bytes(score_buf);
+                        let Some(score) = zset_score(f64::from_le_bytes(score_buf)) else {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("{NAN_SCORE} in key '{key}'"),
+                            ));
+                        };
                         ss.insert(Arc::from(member.as_slice()), score);
                     }
                     KiviDBValue::SortedSet(Arc::new(parking_lot::RwLock::new(ss)))
@@ -2671,7 +2694,7 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
             let mut ss = SortedSetInner::new();
             for _ in 0..count {
                 let member = rdb_read_string(r)?;
-                let score = rdb_read_double_v1(r)?;
+                let score = zset_score_or_error(rdb_read_double_v1(r)?)?;
                 ss.insert(Arc::from(member.as_slice()), score);
             }
             Ok(Some(KiviDBValue::SortedSet(Arc::new(
@@ -2700,7 +2723,7 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
                 let member = rdb_read_string(r)?;
                 let mut score_buf = [0u8; 8];
                 r.read_exact(&mut score_buf)?;
-                let score = f64::from_le_bytes(score_buf);
+                let score = zset_score_or_error(f64::from_le_bytes(score_buf))?;
                 ss.insert(Arc::from(member.as_slice()), score);
             }
             Ok(Some(KiviDBValue::SortedSet(Arc::new(
@@ -2773,6 +2796,7 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
                     .ok_or_else(|| {
                         io::Error::new(io::ErrorKind::InvalidData, "bad ziplist zset score")
                     })?;
+                let score = zset_score_or_error(score)?;
                 ss.insert(Arc::from(member.as_ref()), score);
             }
             Ok(Some(KiviDBValue::SortedSet(Arc::new(
@@ -3837,6 +3861,7 @@ fn rdb_decode_listpack_into_zset(blob: &[u8], ss: &mut SortedSetInner) -> io::Re
             .ok()
             .and_then(|s| s.parse().ok())
             .ok_or_else(malformed_listpack)?;
+        let score = zset_score_or_error(score)?;
         ss.insert(Arc::from(member.as_slice()), score);
     }
     Ok(())
@@ -4561,8 +4586,9 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
                 if next + 8 > payload.len() {
                     return None;
                 }
-                let score =
-                    f64::from_bits(u64::from_le_bytes(payload[next..next + 8].try_into().ok()?));
+                let score = zset_score(f64::from_bits(u64::from_le_bytes(
+                    payload[next..next + 8].try_into().ok()?,
+                )))?;
                 ss.insert(Arc::from(member_bytes), score);
                 pos = next + 8;
             }
@@ -5504,5 +5530,102 @@ mod redisjson_cbor_tests {
         let mut f128 = vec![0xd8, 83, 0x50];
         f128.extend_from_slice(&[0; 16]);
         assert!(cbor_to_json(&f128).is_err());
+    }
+}
+
+#[cfg(test)]
+mod nan_score_tests {
+    use super::*;
+
+    fn zset(scores: &[(&str, f64)]) -> KiviDBValue {
+        let mut ss = SortedSetInner::new();
+        for (member, score) in scores {
+            ss.insert(Arc::from(member.as_bytes()), *score);
+        }
+        KiviDBValue::SortedSet(Arc::new(parking_lot::RwLock::new(ss)))
+    }
+
+    fn image(key: &str, value: &KiviDBValue) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_kdb_header(&mut out, 1).unwrap();
+        write_kdb_entry(&mut out, key, value.view()).unwrap();
+        write_kdb_db_end(&mut out).unwrap();
+        out
+    }
+
+    /// `data` sealed as Redis seals a `DUMP` payload, from RDB version 11.
+    fn redis_payload(data: &[u8]) -> Vec<u8> {
+        let mut out = data.to_vec();
+        out.extend_from_slice(&11u16.to_le_bytes());
+        let crc = redis_crc64(&out);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    /// A snapshot holding a NaN score does not load, and says which key
+    /// holds it, as Redis refuses its own (#414). Nor does it pass as a
+    /// full-sync payload. Infinite scores load.
+    #[test]
+    fn a_snapshot_with_a_nan_score_does_not_load() {
+        let bad = image("scores", &zset(&[("a", 1.0), ("b", f64::NAN)]));
+        let Err(e) = load_snapshot_from(&bad[..]) else {
+            panic!("a NaN score loaded");
+        };
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            e.to_string(),
+            "Zset with NAN score detected in key 'scores'"
+        );
+        assert!(verify_snapshot(&bad[..]).is_err());
+
+        let good = image(
+            "scores",
+            &zset(&[("a", f64::NEG_INFINITY), ("b", f64::INFINITY), ("c", -0.0)]),
+        );
+        let loaded = load_snapshot_from(&good[..]).expect("infinite scores load");
+        match loaded.dbs[0].get("scores") {
+            Some(KiviDBValue::SortedSet(ss)) => assert_eq!(ss.read().len(), 3),
+            _ => panic!("the sorted set is not there"),
+        }
+        assert_eq!(verify_snapshot(&good[..]).unwrap(), 1);
+    }
+
+    /// `RESTORE` of a payload with a NaN score is `ERR Bad data format`, in
+    /// KiviDB's form and in Redis's (`ZSET`, `ZSET_2`), as in Redis.
+    #[test]
+    fn a_dump_payload_with_a_nan_score_is_bad_data() {
+        let nan = dump_payload(&zset(&[("a", 1.0), ("b", f64::NAN)])).unwrap();
+        assert_eq!(
+            restore_payload_checked(&nan).err(),
+            Some(RestoreError::BadData)
+        );
+        let inf = dump_payload(&zset(&[("a", f64::INFINITY), ("b", f64::NEG_INFINITY)])).unwrap();
+        match restore_payload_checked(&inf) {
+            Ok(KiviDBValue::SortedSet(ss)) => assert_eq!(ss.read().len(), 2),
+            _ => panic!("infinite scores restore"),
+        }
+
+        // RDB_TYPE_ZSET_2: one member, `m`, and its score as a binary double.
+        let zset_2 = |score: f64| {
+            let mut data = vec![5u8, 1, 1, b'm'];
+            data.extend_from_slice(&score.to_le_bytes());
+            redis_payload(&data)
+        };
+        assert!(restore_payload_checked(&zset_2(1.5)).is_ok());
+        assert!(restore_payload_checked(&zset_2(f64::INFINITY)).is_ok());
+        assert_eq!(
+            restore_payload_checked(&zset_2(f64::NAN)).err(),
+            Some(RestoreError::BadData)
+        );
+        // RDB_TYPE_ZSET: the score as text, 253 standing for NaN and 254 for
+        // +inf.
+        assert!(restore_payload_checked(&redis_payload(&[3, 1, 1, b'm', 254])).is_ok());
+        assert!(
+            restore_payload_checked(&redis_payload(&[3, 1, 1, b'm', 3, b'1', b'.', b'5'])).is_ok()
+        );
+        assert_eq!(
+            restore_payload_checked(&redis_payload(&[3, 1, 1, b'm', 253])).err(),
+            Some(RestoreError::BadData)
+        );
     }
 }
