@@ -1175,8 +1175,11 @@ fn zcount(ctx: &mut Ctx) -> Vec<u8> {
         None => resp_integer(0),
         Some(ValueRef::SortedSet(zs)) => {
             let inner = zs.read();
-            let count =
-                score_range(min, max).map_or(0, |range| inner.by_score.range(range).count());
+            let count = match score_range(min, max) {
+                None => 0,
+                Some((Bound::Unbounded, Bound::Unbounded)) => inner.len(),
+                Some(range) => inner.by_score.range(range).count(),
+            };
             resp_integer(count as i64)
         }
         Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
@@ -2959,7 +2962,7 @@ mod score_range_tests {
         0.0,
         5e-324,
         f64::MIN_POSITIVE,
-        0.999_999_999_999_999_9,
+        1.0f64.next_down(),
         1.0,
         1.000_000_000_000_000_2,
         1.5,

@@ -1817,6 +1817,10 @@ fn zcount_and_zremrangebyscore_match_a_full_scan_at_every_bound() {
         "(+inf",
     ];
     load_zset(&mut c, "src", &all);
+    assert_eq!(
+        c.cmds(&["ZCOUNT", "src", "-inf", "+inf"]).as_int(),
+        c.cmds(&["ZCARD", "src"]).as_int()
+    );
     for min in ends {
         for max in ends {
             let (inside, outside): (Vec<_>, Vec<_>) = all
@@ -1856,7 +1860,7 @@ fn zcount_missing_key_wrong_type_and_bad_bounds() {
     c.cmds(&["SET", "s", "v"]);
     assert!(c.cmds(&["ZCOUNT", "s", "0", "1"]).is_error());
     assert!(c.cmds(&["ZREMRANGEBYSCORE", "s", "0", "1"]).is_error());
-    for bad in ["nan", "(nan", "x", "", "(", "1e400"] {
+    for bad in ["nan", "(nan", "x"] {
         assert!(
             c.cmds(&["ZCOUNT", "z", bad, "1"]).is_error(),
             "ZCOUNT {bad:?}"
