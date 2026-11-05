@@ -1,0 +1,1807 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="129" skipped="25" tests="178" time="7.168" timestamp="2026-11-05T19:48:03.378735+00:00" hostname="fwvm"><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_unique_values_basic" time="0.015"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741113ae05c0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_unique_values_meta_prefix" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741112b8b170&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_unique_values_search_term" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741112b8be60&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_unique_values_pagination" time="0.002"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7411122c21e0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_unique_values_empty_store" time="0.002" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_unique_values_missing_field" time="0.002"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7411122c3320&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_unique_values_preserves_type" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7411122b9550&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_unique_values_distinct_types" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x74111229ad20&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_unique_values_with_filters" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741112299af0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_min_max_numeric" time="0.002"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x74111220a3f0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_min_max_float" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x74111220b530&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_min_max_single_value" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x74111221d730&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_min_max_empty_collection" time="0.002" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_min_max_meta_prefix" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7411122f7020&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_count_unique_metadata_by_filter_all_documents" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7411122f5220&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_count_unique_metadata_by_filter_with_filter" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741112221160&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_count_unique_metadata_by_filter_with_multiple_filters" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741112223920&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_count_documents_by_filter_simple" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7411122cbf50&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_count_documents_by_filter_compound" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741112238380&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_count_documents_by_filter_no_matches" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x74111223a7b0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_count_documents_by_filter_empty_collection" time="0.002" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_update_by_filter" time="0.008"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741112278b60&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_update_by_filter_no_matches" time="0.008"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x74111227bb30&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_update_by_filter_multiple_fields" time="0.008"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741112226450&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_update_by_filter_advanced_filters" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111f6ad50&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_delete_documents" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111f6b830&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_delete_documents_empty_document_store" time="0.002" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_delete_documents_non_existing_document" time="0.002"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x74111206a780&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_delete_by_filter" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7411120d09b0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_delete_by_filter_no_matches" time="0.002"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7411120d3050&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_delete_by_filter_advanced_filters" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x74111203dd60&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_delete_all_documents" time="0.002"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7411120a35f0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_delete_all_documents_empty_store" time="0.002" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_delete_all_documents_without_recreate_index" time="0.000"><skipped type="pytest.skip" message="delete_all_documents has no recreate_index or recreate_collection parameter">/home/azureuser/fw/venv-hs/lib/python3.12/site-packages/haystack/testing/document_store.py:674: delete_all_documents has no recreate_index or recreate_collection parameter</skipped></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_delete_all_documents_with_recreate_index" time="0.000"><skipped type="pytest.skip" message="delete_all_documents has no recreate_index or recreate_collection parameter">/home/azureuser/fw/venv-hs/lib/python3.12/site-packages/haystack/testing/document_store.py:696: delete_all_documents has no recreate_index or recreate_collection parameter</skipped></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_write_documents_duplicate_overwrite" time="0.002"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7411120a3e90&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_write_documents_invalid_input" time="0.000" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_count_empty" time="0.002" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_count_not_empty" time="0.002"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7411120a2bd0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_close_and_reopen" time="0.003" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_write_documents" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7411120d7a10&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_fields_info_empty_collection" time="0.000"><skipped type="pytest.skip" message="Valkey metadata fields are pre-configured at init, not discovered from documents">/home/azureuser/fw/hci/integrations/valkey/tests/test_document_store.py:125: Valkey metadata fields are pre-configured at init, not discovered from documents</skipped></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_write_documents_duplicate_fail" time="0.000"><skipped type="pytest.skip" message="Valkey only supports DuplicatePolicy.OVERWRITE">/home/azureuser/fw/hci/integrations/valkey/tests/test_document_store.py:129: Valkey only supports DuplicatePolicy.OVERWRITE</skipped></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_write_documents_duplicate_skip" time="0.000"><skipped type="pytest.skip" message="Valkey only supports DuplicatePolicy.OVERWRITE">/home/azureuser/fw/hci/integrations/valkey/tests/test_document_store.py:133: Valkey only supports DuplicatePolicy.OVERWRITE</skipped></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_search_by_embedding_no_limit" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7411124ebe60&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_search_by_embedding_with_limit" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7411120d6c00&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_search_by_embedding_with_category_filter" time="0.002"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7411124f5280&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_search_by_embedding_with_numeric_filter" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7411124f5190&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_search_by_embedding_with_or_filter" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x74111246a480&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_search_by_embedding_with_in_filter" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x74111246b8f0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_search_by_embedding_with_complex_nested_filter" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x74111241f4d0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_search_by_embedding_with_not_equal_filter" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7411124417c0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_search_by_embedding_with_range_filter" time="0.002"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741112442990&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_search_by_embedding_no_filter_matches" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7411124aa960&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_filter_documents_by_category" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7411124abec0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_filter_documents_by_numeric_range" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x74111242bb60&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_filter_documents_with_or_condition" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111ff12e0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_filter_documents_with_in_operator" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111ff2a80&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_filter_documents_with_not_equal" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111f427b0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_filter_documents_no_matches" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111f4c0e0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_filter_documents_no_filters" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111f4e0c0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_filter_documents_complex_nested" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111f3a420&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_similarity_scores_are_set_correctly" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111f3b8c0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_filter_by_meta_score" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111f86d50&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_search_with_meta_score_filter" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111e605c0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_count_documents_by_filter" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111e62e10&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_count_unique_metadata_by_filter" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111f52990&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_count_unique_metadata_by_filter_empty_result" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111f53ef0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_fields_info" time="0.000" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_min_max" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111ec3440&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_min_max_empty_store" time="0.002" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_min_max_non_numeric_raises" time="0.000" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_min_max_unknown_field_raises" time="0.000" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_count_unique_metadata_by_filter_invalid_field_raises" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111e74800&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_unique_values_basic_async" time="0.014"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x74113bff5430&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_unique_values_meta_prefix_async" time="0.004"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111ebf5f0&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_unique_values_search_term_async" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741112185640&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_unique_values_pagination_async" time="0.004"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7411121878c0&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_unique_values_empty_store_async" time="0.003" /><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_unique_values_missing_field_async" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7411121ea1b0&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_unique_values_preserves_type_async" time="0.004"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7411121e9790&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_unique_values_distinct_types_async" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111db9550&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_unique_values_with_filters_async" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111d18230&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_min_max_numeric_async" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111d1a270&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_min_max_float_async" time="0.004"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x74111231fb60&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_min_max_single_value_async" time="0.004"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x74111231efc0&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_min_max_empty_collection_async" time="0.003" /><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_min_max_meta_prefix_async" time="0.004"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741112370d10&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_count_unique_metadata_by_filter_async_all_documents" time="0.004"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741112373d70&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_count_unique_metadata_by_filter_async_with_filter" time="0.004"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111c3cd40&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_count_documents_by_filter_async_simple" time="0.004"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111c3f020&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_count_documents_by_filter_async_compound" time="0.004"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111c41040&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_count_documents_by_filter_async_no_matches" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111c43350&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_count_documents_by_filter_async_empty_collection" time="0.003" /><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_delete_by_filter_async" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111c51b50&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_delete_by_filter_no_matches_async" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111c51100&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_delete_by_filter_advanced_filters_async" time="0.004"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111cc5c70&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_delete_all_documents_async" time="0.004"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111cc7c80&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_delete_all_documents_empty_store_async" time="0.003" /><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_delete_all_documents_without_recreate_index_async" time="0.001"><skipped type="pytest.skip" message="delete_all_documents_async has no recreate_index or recreate_collection parameter">/home/azureuser/fw/venv-hs/lib/python3.12/site-packages/haystack/testing/document_store_async.py:105: delete_all_documents_async has no recreate_index or recreate_collection parameter</skipped></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_delete_all_documents_with_recreate_index_async" time="0.001"><skipped type="pytest.skip" message="delete_all_documents_async has no recreate_index or recreate_collection parameter">/home/azureuser/fw/venv-hs/lib/python3.12/site-packages/haystack/testing/document_store_async.py:128: delete_all_documents_async has no recreate_index or recreate_collection parameter</skipped></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_delete_documents_async" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111ccbec0&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_delete_documents_empty_document_store_async" time="0.003" /><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_delete_documents_non_existing_document_async" time="0.004"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111b18590&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_write_documents_duplicate_overwrite_async" time="0.004"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111b1a660&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_write_documents_invalid_input_async" time="0.001" /><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_count_empty_async" time="0.002" /><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_close_async_and_reopen" time="0.003" /><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_count_not_empty_async" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111bd5460&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_write_documents_async" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111bd43b0&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_write_documents_duplicate_fail_async" time="0.001"><skipped type="pytest.skip" message="ValkeyDocumentStore does not support DuplicatePolicy.FAIL">/home/azureuser/fw/hci/integrations/valkey/tests/test_document_store_async.py:132: ValkeyDocumentStore does not support DuplicatePolicy.FAIL</skipped></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_write_documents_duplicate_skip_async" time="0.001"><skipped type="pytest.skip" message="ValkeyDocumentStore does not support DuplicatePolicy.SKIP">/home/azureuser/fw/hci/integrations/valkey/tests/test_document_store_async.py:136: ValkeyDocumentStore does not support DuplicatePolicy.SKIP</skipped></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_update_by_filter_async" time="0.004"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111b3ac30&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_count_unique_metadata_by_filter_async_with_multiple_filters" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111b39220&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_async_write_exceed_batch_size" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111be5550&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_async_write_exact_batch_size" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111be7320&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_async_write_multiple_full_batches" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111bbe270&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_async_search_by_embedding_no_limit" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111bf6e10&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_async_search_by_embedding_with_limit" time="0.004"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111bf64b0&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_async_search_by_embedding_with_category_filter" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111b29070&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_async_search_by_embedding_with_numeric_filter" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111b2a990&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_async_search_by_embedding_with_or_filter" time="0.004"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111b8c590&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_async_search_by_embedding_with_in_filter" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111b8e360&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_async_write_large_batch_performance" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111b24830&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_async_similarity_scores_are_set_correctly" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111b27860&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_async_filter_by_meta_score" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111b81670&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_async_search_with_meta_score_filter" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111b83d70&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_fields_info_async" time="0.001" /><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_min_max_empty_store_async" time="0.003" /><testcase classname="tests.test_embedding_retriever.TestValkeyEmbeddingRetriever" name="test_run" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111b75f40&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_embedding_retriever.TestValkeyEmbeddingRetriever" name="test_run_with_filters" time="0.002"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111b772c0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_embedding_retriever.TestValkeyEmbeddingRetriever" name="test_run_with_top_k_override" time="0.002"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111af28d0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_embedding_retriever.TestValkeyEmbeddingRetriever" name="test_run_empty_store" time="0.002" /><testcase classname="tests.test_embedding_retriever.TestValkeyEmbeddingRetriever" name="test_run_with_filter_policy_merge" time="0.002"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111af1dc0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync" name="test_run_async" time="0.004"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111a0b9b0&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync" name="test_run_async_with_filters" time="0.004"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111a097f0&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync" name="test_run_async_with_top_k_override" time="0.004"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111a0be60&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync" name="test_run_async_empty_store" time="0.003" /><testcase classname="tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync" name="test_run_async_with_filter_policy_merge" time="0.004"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111a0e1b0&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_no_filters" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111a0fc80&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_equal" time="0.008"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111aa6db0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_equal_with_none" time="0.009"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111aa7020&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_not_equal" time="0.008"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111af6e40&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_not_equal_with_none" time="0.009"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111af7140&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_greater_than" time="0.008"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111a22ff0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_greater_than_equal" time="0.008"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111a23290&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_less_than" time="0.008"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111a36e40&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_less_than_equal" time="0.008"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741111a370e0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_in" time="0.008"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x74111178ad50&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_in_with_with_non_list" time="0.008"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x74111178b200&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_in_with_with_non_list_iterable" time="0.008"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7411117e7350&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_not_in" time="0.008"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7411117e7710&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_not_in_with_with_non_list" time="0.008"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7411101e3470&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_not_in_with_with_non_list_iterable" time="0.009"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7411101e37a0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_and_operator" time="0.008"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741110222c30&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_or_operator" time="0.008"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7411102232f0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_not_operator" time="0.008"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x741110242e10&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_missing_top_level_operator_key" time="0.008"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7410dbf81610&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_missing_top_level_conditions_key" time="0.008"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7410dbf83440&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_missing_condition_field_key" time="0.008"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7410dbfd5100&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_missing_condition_operator_key" time="0.008"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7410dbfd7500&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_missing_condition_value_key" time="0.008"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7410dbe8f170&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_greater_than_with_none" time="0.006"><skipped type="pytest.skip" message="Valkey does not support comparison operators with None values">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:45: Valkey does not support comparison operators with None values</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_greater_than_equal_with_none" time="0.006"><skipped type="pytest.skip" message="Valkey does not support comparison operators with None values">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:48: Valkey does not support comparison operators with None values</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_less_than_with_none" time="0.005"><skipped type="pytest.skip" message="Valkey does not support comparison operators with None values">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:51: Valkey does not support comparison operators with None values</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_less_than_equal_with_none" time="0.005"><skipped type="pytest.skip" message="Valkey does not support comparison operators with None values">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:54: Valkey does not support comparison operators with None values</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_greater_than_with_string" time="0.006"><skipped type="pytest.skip" message="Valkey only supports numeric comparisons on numeric fields">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:58: Valkey only supports numeric comparisons on numeric fields</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_greater_than_with_iso_date" time="0.005"><skipped type="pytest.skip" message="Valkey only supports numeric comparisons on numeric fields">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:61: Valkey only supports numeric comparisons on numeric fields</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_greater_than_with_list" time="0.005"><skipped type="pytest.skip" message="Valkey only supports numeric comparisons on numeric fields">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:64: Valkey only supports numeric comparisons on numeric fields</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_greater_than_equal_with_string" time="0.006"><skipped type="pytest.skip" message="Valkey only supports numeric comparisons on numeric fields">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:67: Valkey only supports numeric comparisons on numeric fields</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_greater_than_equal_with_iso_date" time="0.005"><skipped type="pytest.skip" message="Valkey only supports numeric comparisons on numeric fields">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:70: Valkey only supports numeric comparisons on numeric fields</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_greater_than_equal_with_list" time="0.006"><skipped type="pytest.skip" message="Valkey only supports numeric comparisons on numeric fields">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:73: Valkey only supports numeric comparisons on numeric fields</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_less_than_with_string" time="0.005"><skipped type="pytest.skip" message="Valkey only supports numeric comparisons on numeric fields">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:76: Valkey only supports numeric comparisons on numeric fields</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_less_than_with_iso_date" time="0.006"><skipped type="pytest.skip" message="Valkey only supports numeric comparisons on numeric fields">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:79: Valkey only supports numeric comparisons on numeric fields</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_less_than_with_list" time="0.005"><skipped type="pytest.skip" message="Valkey only supports numeric comparisons on numeric fields">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:82: Valkey only supports numeric comparisons on numeric fields</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_less_than_equal_with_string" time="0.005"><skipped type="pytest.skip" message="Valkey only supports numeric comparisons on numeric fields">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:85: Valkey only supports numeric comparisons on numeric fields</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_less_than_equal_with_iso_date" time="0.005"><skipped type="pytest.skip" message="Valkey only supports numeric comparisons on numeric fields">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:88: Valkey only supports numeric comparisons on numeric fields</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_less_than_equal_with_list" time="0.006"><skipped type="pytest.skip" message="Valkey only supports numeric comparisons on numeric fields">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:91: Valkey only supports numeric comparisons on numeric fields</skipped></testcase></testsuite></testsuites>

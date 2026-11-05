@@ -1,0 +1,2498 @@
+{
+ "summary": {
+  "valkey": {
+   "passed": 153,
+   "skipped": 25
+  },
+  "redis8": {
+   "failed": 129,
+   "passed": 24,
+   "skipped": 25
+  },
+  "kividb": {
+   "failed": 118,
+   "passed": 35,
+   "skipped": 25
+  }
+ },
+ "differences": [
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_count_documents_by_filter",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError: assert 0 == 2"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_count_documents_by_filter_compound",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_count_documents_by_filter_no_matches",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_count_documents_by_filter_simple",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_count_not_empty",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_count_unique_metadata_by_filter",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 2"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_count_unique_metadata_by_filter_all_documents",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_count_unique_metadata_by_filter_empty_result",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "passed",
+    "message": ""
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_count_unique_metadata_by_filter_invalid_field_raises",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "passed",
+    "message": ""
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_count_unique_metadata_by_filter_with_filter",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_count_unique_metadata_by_filter_with_multiple_filters",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_delete_all_documents",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_delete_by_filter",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_delete_by_filter_advanced_filters",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_delete_by_filter_no_matches",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_delete_documents",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_delete_documents_non_existing_document",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_filter_by_meta_score",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 2"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_by_category",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 2"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_by_numeric_range",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 1"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_complex_nested",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 2"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_no_filters",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 2"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_no_matches",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "passed",
+    "message": ""
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_with_in_operator",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 2"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_with_not_equal",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 2"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_with_or_condition",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 2"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert None == 5"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max_float",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max_meta_prefix",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max_numeric",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max_single_value",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_basic",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_distinct_types",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_meta_prefix",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "passed",
+    "message": ""
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_missing_field",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "passed",
+    "message": ""
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_pagination",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_preserves_type",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_search_term",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_with_filters",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_no_filter_matches",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "passed",
+    "message": ""
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_no_limit",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 4"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_category_filter",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 4"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_complex_nested_filter",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 2"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_in_filter",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 2"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_limit",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 4"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_not_equal_filter",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 2"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_numeric_filter",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 2"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_or_filter",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 2"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_range_filter",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 1"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_search_with_meta_score_filter",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 3"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_similarity_scores_are_set_correctly",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 4"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_update_by_filter",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_update_by_filter_advanced_filters",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_update_by_filter_multiple_fields",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_update_by_filter_no_matches",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_write_documents",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   }
+  },
+  {
+   "test": "tests.test_document_store.TestValkeyDocumentStore::test_write_documents_duplicate_overwrite",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_filter_by_meta_score",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 2"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_search_by_embedding_no_limit",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 4"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_search_by_embedding_with_category_filter",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 4"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_search_by_embedding_with_in_filter",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 2"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_search_by_embedding_with_limit",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 4"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_search_by_embedding_with_numeric_filter",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 2"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_search_by_embedding_with_or_filter",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 2"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_search_with_meta_score_filter",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 3"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_similarity_scores_are_set_correctly",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 4"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_write_exact_batch_size",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 5"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_write_exceed_batch_size",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 6"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_write_large_batch_performance",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 23"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_write_multiple_full_batches",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 11"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_documents_by_filter_async_compound",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_documents_by_filter_async_no_matches",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_documents_by_filter_async_simple",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_not_empty_async",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 3"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_unique_metadata_by_filter_async_all_documents",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_unique_metadata_by_filter_async_with_filter",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_unique_metadata_by_filter_async_with_multiple_filters",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 1"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_all_documents_async",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_by_filter_advanced_filters_async",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_by_filter_async",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_by_filter_no_matches_async",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_documents_async",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_documents_non_existing_document_async",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_min_max_float_async",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_min_max_meta_prefix_async",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_min_max_numeric_async",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_min_max_single_value_async",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_basic_async",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_distinct_types_async",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_meta_prefix_async",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "passed",
+    "message": ""
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_missing_field_async",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "passed",
+    "message": ""
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_pagination_async",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_preserves_type_async",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_search_term_async",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_with_filters_async",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_update_by_filter_async",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 2"
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_write_documents_async",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "passed",
+    "message": ""
+   }
+  },
+  {
+   "test": "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_write_documents_duplicate_overwrite_async",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_async_haystack_document"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_embedding_retriever.TestValkeyEmbeddingRetriever::test_run",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "assert 0 == 2"
+   }
+  },
+  {
+   "test": "tests.test_embedding_retriever.TestValkeyEmbeddingRetriever::test_run_with_filter_policy_merge",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever"
+   }
+  },
+  {
+   "test": "tests.test_embedding_retriever.TestValkeyEmbeddingRetriever::test_run_with_filters",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever"
+   }
+  },
+  {
+   "test": "tests.test_embedding_retriever.TestValkeyEmbeddingRetriever::test_run_with_top_k_override",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever"
+   }
+  },
+  {
+   "test": "tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync::test_run_async",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever"
+   }
+  },
+  {
+   "test": "tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync::test_run_async_with_filter_policy_merge",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever"
+   }
+  },
+  {
+   "test": "tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync::test_run_async_with_filters",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever"
+   }
+  },
+  {
+   "test": "tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync::test_run_async_with_top_k_override",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever"
+   }
+  },
+  {
+   "test": "tests.test_filters.TestFilters::test_and_operator",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters"
+   },
+   "kividb": {
+    "status": "passed",
+    "message": ""
+   }
+  },
+  {
+   "test": "tests.test_filters.TestFilters::test_comparison_equal",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters"
+   },
+   "kividb": {
+    "status": "passed",
+    "message": ""
+   }
+  },
+  {
+   "test": "tests.test_filters.TestFilters::test_comparison_equal_with_none",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError: assert [] == [Document(id=...ize 768), ...]"
+   }
+  },
+  {
+   "test": "tests.test_filters.TestFilters::test_comparison_greater_than",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError: assert [] == [Document(id=... of size 768)]"
+   }
+  },
+  {
+   "test": "tests.test_filters.TestFilters::test_comparison_greater_than_equal",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError: assert [] == [Document(id=... of size 768)]"
+   }
+  },
+  {
+   "test": "tests.test_filters.TestFilters::test_comparison_in",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError"
+   }
+  },
+  {
+   "test": "tests.test_filters.TestFilters::test_comparison_in_with_with_non_list",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "Failed: DID NOT RAISE FilterError"
+   }
+  },
+  {
+   "test": "tests.test_filters.TestFilters::test_comparison_in_with_with_non_list_iterable",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "Failed: DID NOT RAISE FilterError"
+   }
+  },
+  {
+   "test": "tests.test_filters.TestFilters::test_comparison_less_than",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError: assert [] == [Document(id=... of size 768)]"
+   }
+  },
+  {
+   "test": "tests.test_filters.TestFilters::test_comparison_less_than_equal",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError: assert [] == [Document(id=... of size 768)]"
+   }
+  },
+  {
+   "test": "tests.test_filters.TestFilters::test_comparison_not_equal",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError: assert [] == [Document(id=...ize 768), ...]"
+   }
+  },
+  {
+   "test": "tests.test_filters.TestFilters::test_comparison_not_equal_with_none",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError: assert [] == [Document(id=...ize 768), ...]"
+   }
+  },
+  {
+   "test": "tests.test_filters.TestFilters::test_comparison_not_in",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError: assert [] == [Document(id=...usion'}), ...]"
+   }
+  },
+  {
+   "test": "tests.test_filters.TestFilters::test_comparison_not_in_with_with_non_list",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "Failed: DID NOT RAISE FilterError"
+   }
+  },
+  {
+   "test": "tests.test_filters.TestFilters::test_comparison_not_in_with_with_non_list_iterable",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "Failed: DID NOT RAISE FilterError"
+   }
+  },
+  {
+   "test": "tests.test_filters.TestFilters::test_missing_condition_field_key",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "Failed: DID NOT RAISE FilterError"
+   }
+  },
+  {
+   "test": "tests.test_filters.TestFilters::test_missing_condition_operator_key",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "Failed: DID NOT RAISE FilterError"
+   }
+  },
+  {
+   "test": "tests.test_filters.TestFilters::test_missing_condition_value_key",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "Failed: DID NOT RAISE FilterError"
+   }
+  },
+  {
+   "test": "tests.test_filters.TestFilters::test_missing_top_level_conditions_key",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "Failed: DID NOT RAISE FilterError"
+   }
+  },
+  {
+   "test": "tests.test_filters.TestFilters::test_missing_top_level_operator_key",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "Failed: DID NOT RAISE FilterError"
+   }
+  },
+  {
+   "test": "tests.test_filters.TestFilters::test_no_filters",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError: assert [] == [Document(id=...: 'test doc')]"
+   }
+  },
+  {
+   "test": "tests.test_filters.TestFilters::test_not_operator",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError: assert [] == [Document(id=...ize 768), ...]"
+   }
+  },
+  {
+   "test": "tests.test_filters.TestFilters::test_or_operator",
+   "valkey": {
+    "status": "passed",
+    "message": ""
+   },
+   "redis8": {
+    "status": "failed",
+    "message": "haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_filters"
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError: assert [] == [Document(id=...conclusion'})]"
+   }
+  }
+ ],
+ "failing_everywhere": [],
+ "tests": {
+  "valkey": {
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_basic": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_meta_prefix": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_search_term": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_pagination": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_empty_store": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_missing_field": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_preserves_type": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_distinct_types": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_with_filters": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max_numeric": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max_float": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max_single_value": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max_empty_collection": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max_meta_prefix": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_unique_metadata_by_filter_all_documents": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_unique_metadata_by_filter_with_filter": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_unique_metadata_by_filter_with_multiple_filters": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_documents_by_filter_simple": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_documents_by_filter_compound": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_documents_by_filter_no_matches": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_documents_by_filter_empty_collection": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_update_by_filter": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_update_by_filter_no_matches": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_update_by_filter_multiple_fields": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_update_by_filter_advanced_filters": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_documents": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_documents_empty_document_store": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_documents_non_existing_document": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_by_filter": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_by_filter_no_matches": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_by_filter_advanced_filters": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_all_documents": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_all_documents_empty_store": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_all_documents_without_recreate_index": "skipped",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_all_documents_with_recreate_index": "skipped",
+   "tests.test_document_store.TestValkeyDocumentStore::test_write_documents_duplicate_overwrite": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_write_documents_invalid_input": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_empty": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_not_empty": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_close_and_reopen": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_write_documents": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_fields_info_empty_collection": "skipped",
+   "tests.test_document_store.TestValkeyDocumentStore::test_write_documents_duplicate_fail": "skipped",
+   "tests.test_document_store.TestValkeyDocumentStore::test_write_documents_duplicate_skip": "skipped",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_no_limit": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_limit": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_category_filter": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_numeric_filter": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_or_filter": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_in_filter": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_complex_nested_filter": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_not_equal_filter": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_range_filter": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_no_filter_matches": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_by_category": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_by_numeric_range": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_with_or_condition": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_with_in_operator": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_with_not_equal": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_no_matches": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_no_filters": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_complex_nested": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_similarity_scores_are_set_correctly": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_filter_by_meta_score": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_with_meta_score_filter": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_documents_by_filter": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_unique_metadata_by_filter": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_unique_metadata_by_filter_empty_result": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_fields_info": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max_empty_store": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max_non_numeric_raises": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max_unknown_field_raises": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_unique_metadata_by_filter_invalid_field_raises": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_basic_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_meta_prefix_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_search_term_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_pagination_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_empty_store_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_missing_field_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_preserves_type_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_distinct_types_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_with_filters_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_min_max_numeric_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_min_max_float_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_min_max_single_value_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_min_max_empty_collection_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_min_max_meta_prefix_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_unique_metadata_by_filter_async_all_documents": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_unique_metadata_by_filter_async_with_filter": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_documents_by_filter_async_simple": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_documents_by_filter_async_compound": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_documents_by_filter_async_no_matches": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_documents_by_filter_async_empty_collection": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_by_filter_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_by_filter_no_matches_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_by_filter_advanced_filters_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_all_documents_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_all_documents_empty_store_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_all_documents_without_recreate_index_async": "skipped",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_all_documents_with_recreate_index_async": "skipped",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_documents_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_documents_empty_document_store_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_documents_non_existing_document_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_write_documents_duplicate_overwrite_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_write_documents_invalid_input_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_empty_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_close_async_and_reopen": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_not_empty_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_write_documents_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_write_documents_duplicate_fail_async": "skipped",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_write_documents_duplicate_skip_async": "skipped",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_update_by_filter_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_unique_metadata_by_filter_async_with_multiple_filters": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_write_exceed_batch_size": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_write_exact_batch_size": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_write_multiple_full_batches": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_search_by_embedding_no_limit": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_search_by_embedding_with_limit": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_search_by_embedding_with_category_filter": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_search_by_embedding_with_numeric_filter": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_search_by_embedding_with_or_filter": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_search_by_embedding_with_in_filter": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_write_large_batch_performance": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_similarity_scores_are_set_correctly": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_filter_by_meta_score": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_search_with_meta_score_filter": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_fields_info_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_min_max_empty_store_async": "passed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetriever::test_run": "passed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetriever::test_run_with_filters": "passed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetriever::test_run_with_top_k_override": "passed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetriever::test_run_empty_store": "passed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetriever::test_run_with_filter_policy_merge": "passed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync::test_run_async": "passed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync::test_run_async_with_filters": "passed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync::test_run_async_with_top_k_override": "passed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync::test_run_async_empty_store": "passed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync::test_run_async_with_filter_policy_merge": "passed",
+   "tests.test_filters.TestFilters::test_no_filters": "passed",
+   "tests.test_filters.TestFilters::test_comparison_equal": "passed",
+   "tests.test_filters.TestFilters::test_comparison_equal_with_none": "passed",
+   "tests.test_filters.TestFilters::test_comparison_not_equal": "passed",
+   "tests.test_filters.TestFilters::test_comparison_not_equal_with_none": "passed",
+   "tests.test_filters.TestFilters::test_comparison_greater_than": "passed",
+   "tests.test_filters.TestFilters::test_comparison_greater_than_equal": "passed",
+   "tests.test_filters.TestFilters::test_comparison_less_than": "passed",
+   "tests.test_filters.TestFilters::test_comparison_less_than_equal": "passed",
+   "tests.test_filters.TestFilters::test_comparison_in": "passed",
+   "tests.test_filters.TestFilters::test_comparison_in_with_with_non_list": "passed",
+   "tests.test_filters.TestFilters::test_comparison_in_with_with_non_list_iterable": "passed",
+   "tests.test_filters.TestFilters::test_comparison_not_in": "passed",
+   "tests.test_filters.TestFilters::test_comparison_not_in_with_with_non_list": "passed",
+   "tests.test_filters.TestFilters::test_comparison_not_in_with_with_non_list_iterable": "passed",
+   "tests.test_filters.TestFilters::test_and_operator": "passed",
+   "tests.test_filters.TestFilters::test_or_operator": "passed",
+   "tests.test_filters.TestFilters::test_not_operator": "passed",
+   "tests.test_filters.TestFilters::test_missing_top_level_operator_key": "passed",
+   "tests.test_filters.TestFilters::test_missing_top_level_conditions_key": "passed",
+   "tests.test_filters.TestFilters::test_missing_condition_field_key": "passed",
+   "tests.test_filters.TestFilters::test_missing_condition_operator_key": "passed",
+   "tests.test_filters.TestFilters::test_missing_condition_value_key": "passed",
+   "tests.test_filters.TestFilters::test_comparison_greater_than_with_none": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_greater_than_equal_with_none": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_less_than_with_none": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_less_than_equal_with_none": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_greater_than_with_string": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_greater_than_with_iso_date": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_greater_than_with_list": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_greater_than_equal_with_string": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_greater_than_equal_with_iso_date": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_greater_than_equal_with_list": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_less_than_with_string": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_less_than_with_iso_date": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_less_than_with_list": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_less_than_equal_with_string": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_less_than_equal_with_iso_date": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_less_than_equal_with_list": "skipped"
+  },
+  "redis8": {
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_basic": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_meta_prefix": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_search_term": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_pagination": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_empty_store": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_missing_field": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_preserves_type": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_distinct_types": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_with_filters": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max_numeric": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max_float": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max_single_value": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max_empty_collection": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max_meta_prefix": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_unique_metadata_by_filter_all_documents": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_unique_metadata_by_filter_with_filter": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_unique_metadata_by_filter_with_multiple_filters": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_documents_by_filter_simple": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_documents_by_filter_compound": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_documents_by_filter_no_matches": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_documents_by_filter_empty_collection": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_update_by_filter": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_update_by_filter_no_matches": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_update_by_filter_multiple_fields": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_update_by_filter_advanced_filters": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_documents": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_documents_empty_document_store": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_documents_non_existing_document": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_by_filter": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_by_filter_no_matches": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_by_filter_advanced_filters": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_all_documents": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_all_documents_empty_store": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_all_documents_without_recreate_index": "skipped",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_all_documents_with_recreate_index": "skipped",
+   "tests.test_document_store.TestValkeyDocumentStore::test_write_documents_duplicate_overwrite": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_write_documents_invalid_input": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_empty": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_not_empty": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_close_and_reopen": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_write_documents": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_fields_info_empty_collection": "skipped",
+   "tests.test_document_store.TestValkeyDocumentStore::test_write_documents_duplicate_fail": "skipped",
+   "tests.test_document_store.TestValkeyDocumentStore::test_write_documents_duplicate_skip": "skipped",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_no_limit": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_limit": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_category_filter": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_numeric_filter": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_or_filter": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_in_filter": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_complex_nested_filter": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_not_equal_filter": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_range_filter": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_no_filter_matches": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_by_category": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_by_numeric_range": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_with_or_condition": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_with_in_operator": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_with_not_equal": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_no_matches": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_no_filters": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_complex_nested": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_similarity_scores_are_set_correctly": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_filter_by_meta_score": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_with_meta_score_filter": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_documents_by_filter": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_unique_metadata_by_filter": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_unique_metadata_by_filter_empty_result": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_fields_info": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max_empty_store": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max_non_numeric_raises": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max_unknown_field_raises": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_unique_metadata_by_filter_invalid_field_raises": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_basic_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_meta_prefix_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_search_term_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_pagination_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_empty_store_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_missing_field_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_preserves_type_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_distinct_types_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_with_filters_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_min_max_numeric_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_min_max_float_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_min_max_single_value_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_min_max_empty_collection_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_min_max_meta_prefix_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_unique_metadata_by_filter_async_all_documents": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_unique_metadata_by_filter_async_with_filter": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_documents_by_filter_async_simple": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_documents_by_filter_async_compound": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_documents_by_filter_async_no_matches": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_documents_by_filter_async_empty_collection": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_by_filter_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_by_filter_no_matches_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_by_filter_advanced_filters_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_all_documents_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_all_documents_empty_store_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_all_documents_without_recreate_index_async": "skipped",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_all_documents_with_recreate_index_async": "skipped",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_documents_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_documents_empty_document_store_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_documents_non_existing_document_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_write_documents_duplicate_overwrite_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_write_documents_invalid_input_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_empty_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_close_async_and_reopen": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_not_empty_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_write_documents_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_write_documents_duplicate_fail_async": "skipped",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_write_documents_duplicate_skip_async": "skipped",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_update_by_filter_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_unique_metadata_by_filter_async_with_multiple_filters": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_write_exceed_batch_size": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_write_exact_batch_size": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_write_multiple_full_batches": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_search_by_embedding_no_limit": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_search_by_embedding_with_limit": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_search_by_embedding_with_category_filter": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_search_by_embedding_with_numeric_filter": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_search_by_embedding_with_or_filter": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_search_by_embedding_with_in_filter": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_write_large_batch_performance": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_similarity_scores_are_set_correctly": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_filter_by_meta_score": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_search_with_meta_score_filter": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_fields_info_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_min_max_empty_store_async": "passed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetriever::test_run": "failed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetriever::test_run_with_filters": "failed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetriever::test_run_with_top_k_override": "failed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetriever::test_run_empty_store": "passed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetriever::test_run_with_filter_policy_merge": "failed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync::test_run_async": "failed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync::test_run_async_with_filters": "failed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync::test_run_async_with_top_k_override": "failed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync::test_run_async_empty_store": "passed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync::test_run_async_with_filter_policy_merge": "failed",
+   "tests.test_filters.TestFilters::test_no_filters": "failed",
+   "tests.test_filters.TestFilters::test_comparison_equal": "failed",
+   "tests.test_filters.TestFilters::test_comparison_equal_with_none": "failed",
+   "tests.test_filters.TestFilters::test_comparison_not_equal": "failed",
+   "tests.test_filters.TestFilters::test_comparison_not_equal_with_none": "failed",
+   "tests.test_filters.TestFilters::test_comparison_greater_than": "failed",
+   "tests.test_filters.TestFilters::test_comparison_greater_than_equal": "failed",
+   "tests.test_filters.TestFilters::test_comparison_less_than": "failed",
+   "tests.test_filters.TestFilters::test_comparison_less_than_equal": "failed",
+   "tests.test_filters.TestFilters::test_comparison_in": "failed",
+   "tests.test_filters.TestFilters::test_comparison_in_with_with_non_list": "failed",
+   "tests.test_filters.TestFilters::test_comparison_in_with_with_non_list_iterable": "failed",
+   "tests.test_filters.TestFilters::test_comparison_not_in": "failed",
+   "tests.test_filters.TestFilters::test_comparison_not_in_with_with_non_list": "failed",
+   "tests.test_filters.TestFilters::test_comparison_not_in_with_with_non_list_iterable": "failed",
+   "tests.test_filters.TestFilters::test_and_operator": "failed",
+   "tests.test_filters.TestFilters::test_or_operator": "failed",
+   "tests.test_filters.TestFilters::test_not_operator": "failed",
+   "tests.test_filters.TestFilters::test_missing_top_level_operator_key": "failed",
+   "tests.test_filters.TestFilters::test_missing_top_level_conditions_key": "failed",
+   "tests.test_filters.TestFilters::test_missing_condition_field_key": "failed",
+   "tests.test_filters.TestFilters::test_missing_condition_operator_key": "failed",
+   "tests.test_filters.TestFilters::test_missing_condition_value_key": "failed",
+   "tests.test_filters.TestFilters::test_comparison_greater_than_with_none": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_greater_than_equal_with_none": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_less_than_with_none": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_less_than_equal_with_none": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_greater_than_with_string": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_greater_than_with_iso_date": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_greater_than_with_list": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_greater_than_equal_with_string": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_greater_than_equal_with_iso_date": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_greater_than_equal_with_list": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_less_than_with_string": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_less_than_with_iso_date": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_less_than_with_list": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_less_than_equal_with_string": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_less_than_equal_with_iso_date": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_less_than_equal_with_list": "skipped"
+  },
+  "kividb": {
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_basic": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_meta_prefix": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_search_term": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_pagination": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_empty_store": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_missing_field": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_preserves_type": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_distinct_types": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_unique_values_with_filters": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max_numeric": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max_float": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max_single_value": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max_empty_collection": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max_meta_prefix": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_unique_metadata_by_filter_all_documents": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_unique_metadata_by_filter_with_filter": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_unique_metadata_by_filter_with_multiple_filters": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_documents_by_filter_simple": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_documents_by_filter_compound": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_documents_by_filter_no_matches": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_documents_by_filter_empty_collection": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_update_by_filter": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_update_by_filter_no_matches": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_update_by_filter_multiple_fields": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_update_by_filter_advanced_filters": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_documents": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_documents_empty_document_store": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_documents_non_existing_document": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_by_filter": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_by_filter_no_matches": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_by_filter_advanced_filters": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_all_documents": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_all_documents_empty_store": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_all_documents_without_recreate_index": "skipped",
+   "tests.test_document_store.TestValkeyDocumentStore::test_delete_all_documents_with_recreate_index": "skipped",
+   "tests.test_document_store.TestValkeyDocumentStore::test_write_documents_duplicate_overwrite": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_write_documents_invalid_input": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_empty": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_not_empty": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_close_and_reopen": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_write_documents": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_fields_info_empty_collection": "skipped",
+   "tests.test_document_store.TestValkeyDocumentStore::test_write_documents_duplicate_fail": "skipped",
+   "tests.test_document_store.TestValkeyDocumentStore::test_write_documents_duplicate_skip": "skipped",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_no_limit": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_limit": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_category_filter": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_numeric_filter": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_or_filter": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_in_filter": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_complex_nested_filter": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_not_equal_filter": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_with_range_filter": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_by_embedding_no_filter_matches": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_by_category": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_by_numeric_range": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_with_or_condition": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_with_in_operator": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_with_not_equal": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_no_matches": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_no_filters": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_filter_documents_complex_nested": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_similarity_scores_are_set_correctly": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_filter_by_meta_score": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_search_with_meta_score_filter": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_documents_by_filter": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_unique_metadata_by_filter": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_unique_metadata_by_filter_empty_result": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_fields_info": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max": "failed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max_empty_store": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max_non_numeric_raises": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_get_metadata_field_min_max_unknown_field_raises": "passed",
+   "tests.test_document_store.TestValkeyDocumentStore::test_count_unique_metadata_by_filter_invalid_field_raises": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_basic_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_meta_prefix_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_search_term_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_pagination_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_empty_store_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_missing_field_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_preserves_type_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_distinct_types_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_unique_values_with_filters_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_min_max_numeric_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_min_max_float_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_min_max_single_value_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_min_max_empty_collection_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_min_max_meta_prefix_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_unique_metadata_by_filter_async_all_documents": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_unique_metadata_by_filter_async_with_filter": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_documents_by_filter_async_simple": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_documents_by_filter_async_compound": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_documents_by_filter_async_no_matches": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_documents_by_filter_async_empty_collection": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_by_filter_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_by_filter_no_matches_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_by_filter_advanced_filters_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_all_documents_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_all_documents_empty_store_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_all_documents_without_recreate_index_async": "skipped",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_all_documents_with_recreate_index_async": "skipped",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_documents_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_documents_empty_document_store_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_delete_documents_non_existing_document_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_write_documents_duplicate_overwrite_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_write_documents_invalid_input_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_empty_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_close_async_and_reopen": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_not_empty_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_write_documents_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_write_documents_duplicate_fail_async": "skipped",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_write_documents_duplicate_skip_async": "skipped",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_update_by_filter_async": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_count_unique_metadata_by_filter_async_with_multiple_filters": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_write_exceed_batch_size": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_write_exact_batch_size": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_write_multiple_full_batches": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_search_by_embedding_no_limit": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_search_by_embedding_with_limit": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_search_by_embedding_with_category_filter": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_search_by_embedding_with_numeric_filter": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_search_by_embedding_with_or_filter": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_search_by_embedding_with_in_filter": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_write_large_batch_performance": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_similarity_scores_are_set_correctly": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_filter_by_meta_score": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_async_search_with_meta_score_filter": "failed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_fields_info_async": "passed",
+   "tests.test_document_store_async.TestValkeyDocumentStoreAsync::test_get_metadata_field_min_max_empty_store_async": "passed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetriever::test_run": "failed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetriever::test_run_with_filters": "failed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetriever::test_run_with_top_k_override": "failed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetriever::test_run_empty_store": "passed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetriever::test_run_with_filter_policy_merge": "failed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync::test_run_async": "failed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync::test_run_async_with_filters": "failed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync::test_run_async_with_top_k_override": "failed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync::test_run_async_empty_store": "passed",
+   "tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync::test_run_async_with_filter_policy_merge": "failed",
+   "tests.test_filters.TestFilters::test_no_filters": "failed",
+   "tests.test_filters.TestFilters::test_comparison_equal": "passed",
+   "tests.test_filters.TestFilters::test_comparison_equal_with_none": "failed",
+   "tests.test_filters.TestFilters::test_comparison_not_equal": "failed",
+   "tests.test_filters.TestFilters::test_comparison_not_equal_with_none": "failed",
+   "tests.test_filters.TestFilters::test_comparison_greater_than": "failed",
+   "tests.test_filters.TestFilters::test_comparison_greater_than_equal": "failed",
+   "tests.test_filters.TestFilters::test_comparison_less_than": "failed",
+   "tests.test_filters.TestFilters::test_comparison_less_than_equal": "failed",
+   "tests.test_filters.TestFilters::test_comparison_in": "failed",
+   "tests.test_filters.TestFilters::test_comparison_in_with_with_non_list": "failed",
+   "tests.test_filters.TestFilters::test_comparison_in_with_with_non_list_iterable": "failed",
+   "tests.test_filters.TestFilters::test_comparison_not_in": "failed",
+   "tests.test_filters.TestFilters::test_comparison_not_in_with_with_non_list": "failed",
+   "tests.test_filters.TestFilters::test_comparison_not_in_with_with_non_list_iterable": "failed",
+   "tests.test_filters.TestFilters::test_and_operator": "passed",
+   "tests.test_filters.TestFilters::test_or_operator": "failed",
+   "tests.test_filters.TestFilters::test_not_operator": "failed",
+   "tests.test_filters.TestFilters::test_missing_top_level_operator_key": "failed",
+   "tests.test_filters.TestFilters::test_missing_top_level_conditions_key": "failed",
+   "tests.test_filters.TestFilters::test_missing_condition_field_key": "failed",
+   "tests.test_filters.TestFilters::test_missing_condition_operator_key": "failed",
+   "tests.test_filters.TestFilters::test_missing_condition_value_key": "failed",
+   "tests.test_filters.TestFilters::test_comparison_greater_than_with_none": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_greater_than_equal_with_none": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_less_than_with_none": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_less_than_equal_with_none": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_greater_than_with_string": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_greater_than_with_iso_date": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_greater_than_with_list": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_greater_than_equal_with_string": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_greater_than_equal_with_iso_date": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_greater_than_equal_with_list": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_less_than_with_string": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_less_than_with_iso_date": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_less_than_with_list": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_less_than_equal_with_string": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_less_than_equal_with_iso_date": "skipped",
+   "tests.test_filters.TestFilters::test_comparison_less_than_equal_with_list": "skipped"
+  }
+ }
+}
