@@ -551,7 +551,7 @@ Bitmap commands operate on strings as arrays of bits. Bitmaps are not a separate
 
 ## HyperLogLog commands
 
-HyperLogLog commands provide probabilistic cardinality estimation using ~12KB of memory per key regardless of the number of unique elements observed. The standard error is 0.81%. HyperLogLog values are stored as `string` values using a Redis-compatible dense encoding (16384 registers, 6 bits each) and are reported as type `string` by the `TYPE` command.
+HyperLogLog commands provide probabilistic cardinality estimation using ~12KB of memory per key regardless of the number of unique elements observed. The standard error is 0.81%. HyperLogLog values are stored as `string` values and reported as type `string` by the `TYPE` command. New values use KiviDB's own dense encoding (16384 registers, 6 bits each) by default, or Redis's encoding with `hll-write-format redis`; values copied from Redis keep Redis's dense or sparse encoding. `PFMERGE` and multi-key `PFCOUNT` refuse to combine the two formats (see [PERSISTENCE.md](docs/PERSISTENCE.md)).
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
@@ -565,8 +565,8 @@ HyperLogLog commands provide probabilistic cardinality estimation using ~12KB of
 |---------|--------|-------------|
 | `PFDEBUG GETREG` | `PFDEBUG GETREG key` | Return an array of all 16384 register values (0–63) for the HyperLogLog at `key`; useful for inspecting which registers have been set and to what depth |
 | `PFDEBUG DECODE` | `PFDEBUG DECODE key` | Return a human-readable summary of the HyperLogLog internal state including encoding, register count, number of non-zero registers, maximum register value, and current cardinality estimate |
-| `PFDEBUG ENCODING` | `PFDEBUG ENCODING key` | Return the encoding type; always `dense` as KiviDB uses only the dense representation |
-| `PFDEBUG TODENSE` | `PFDEBUG TODENSE key` | No-op — KiviDB uses dense encoding exclusively; returns OK for compatibility |
+| `PFDEBUG ENCODING` | `PFDEBUG ENCODING key` | Return the encoding type of the value (`dense`, or `sparse` for a Redis-format value that is still sparse) |
+| `PFDEBUG TODENSE` | `PFDEBUG TODENSE key` | Convert a sparse (Redis-format) value to the dense encoding, as in Redis; returns 1 if it converted, 0 if the value was already dense |
 | `PFDEBUG RESET` | `PFDEBUG RESET key` | Zero all registers and invalidate the cached cardinality, effectively resetting the HyperLogLog to empty while keeping the key; AOF-logged |
 | `PFSELFTEST` | `PFSELFTEST` | Run internal correctness tests of the HyperLogLog implementation: verifies empty cardinality returns 0, estimation accuracy is within 2% for 10,000 elements, and register encode/decode round-trips correctly; returns OK on success or an error describing the failure |
 
