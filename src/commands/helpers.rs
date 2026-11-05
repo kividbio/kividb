@@ -635,8 +635,11 @@ pub fn spawn_active_expire_task(
                 // says what is gone, by the `DEL`s in it (`expiry::Loading`).
                 // Nor once a shutdown has ended the write stream: the keys
                 // that come due go after the restart.
-                if !crate::expiry::active()
-                    || crate::pause::expiry_deferred()
+                if !crate::expiry::active() {
+                    wait = Duration::from_millis(100);
+                    continue;
+                }
+                if crate::pause::expiry_deferred()
                     || crate::expiry::loading()
                     || target
                         .as_ref()

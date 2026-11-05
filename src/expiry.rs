@@ -276,15 +276,25 @@ pub fn loading() -> bool {
     LOADING.load(Ordering::SeqCst) > 0
 }
 
+/// `DEBUG SET-ACTIVE-EXPIRE` and `DEBUG PAUSE-CRON`: whether the background
+/// sweep (keys and hash fields) runs. Process-wide and runtime-only, as in
+/// Redis: not a config, so `CONFIG REWRITE` doesn't write it, and it is on
+/// again after a restart. Tests that run servers inside the test process
+/// must not turn it off.
 static ACTIVE: AtomicBool = AtomicBool::new(true);
+static CRON_PAUSED: AtomicBool = AtomicBool::new(false);
 
 pub fn set_active(on: bool) {
     ACTIVE.store(on, Ordering::Relaxed);
 }
 
+pub fn set_cron_paused(paused: bool) {
+    CRON_PAUSED.store(paused, Ordering::Relaxed);
+}
+
 #[inline]
 pub fn active() -> bool {
-    ACTIVE.load(Ordering::Relaxed)
+    ACTIVE.load(Ordering::Relaxed) && !CRON_PAUSED.load(Ordering::Relaxed)
 }
 
 thread_local! {

@@ -214,6 +214,15 @@ fn debug_refuses_unknown_subcommands() {
     assert!(c.cmds(&["DEBUG", "SET-ACTIVE-EXPIRE", "1", "2"]).is_error());
     assert!(c.cmds(&["DEBUG", "SLEEP", "0"]).is_ok());
     assert!(c.cmds(&["DEBUG", "SET-DISABLE-DENY-SCRIPTS", "1"]).is_ok());
+    assert!(c.cmds(&["DEBUG", "LOG", "hello"]).is_ok());
+    let long = "x".repeat(200);
+    assert_eq!(
+        error(c.cmds(&["DEBUG", &long])),
+        format!(
+            "ERR unknown subcommand or wrong number of arguments for '{}'. Try DEBUG HELP.",
+            &long[..128]
+        )
+    );
     assert!(c.cmds(&["DEBUG", "HELP"]).as_array().len() > 1);
 }
 

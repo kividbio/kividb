@@ -1982,21 +1982,47 @@ fn debug_set_active_expire_0_stops_the_sweep() {
             "OK"
         );
     }
+    assert_eq!(c.cmd(&["HSET", "h", "f", "v"]).i(), 1);
+    assert_eq!(
+        c.cmd(&["HPEXPIRE", "h", "50", "FIELDS", "1", "f"]).arr(),
+        [V::Int(1)]
+    );
     std::thread::sleep(Duration::from_millis(1000));
-    assert_eq!(c.cmd(&["DBSIZE"]).i(), 5);
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 6);
     assert_eq!(c.info("stats", "expired_keys_active"), "0");
+    assert_eq!(c.info("stats", "expired_subkeys"), "0");
     assert!(
         c.cmd(&["DEBUG", "OBJECT", "k:0"])
             .s()
             .starts_with("Value at:")
     );
     assert_eq!(c.cmd(&["GET", "k:0"]), V::Nil);
-    assert_eq!(c.cmd(&["DBSIZE"]).i(), 4);
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 5);
+    wait_until("k:0's DEL in the AOF", 10, || {
+        deletions(&server.aof(), "k:0") == 1
+    });
     assert!((1..5).all(|i| deletions(&server.aof(), &format!("k:{i}")) == 0));
 
-    assert_eq!(c.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "1"]).s(), "OK");
+    assert_eq!(c.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "1abc"]).s(), "OK");
     wait_until("the sweep to delete the rest", 10, || {
         c.cmd(&["DBSIZE"]).i() == 0
+            && c.info("stats", "expired_keys_active") == "4"
+            && c.info("stats", "expired_subkeys") == "1"
     });
-    assert_eq!(c.info("stats", "expired_keys_active"), "4");
+}
+
+#[test]
+fn debug_pause_cron_1_stops_the_sweep() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    assert_eq!(c.cmd(&["DEBUG", "PAUSE-CRON", "1"]).s(), "OK");
+    assert_eq!(c.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "1"]).s(), "OK");
+    assert_eq!(c.cmd(&["SET", "k", "v", "PX", "50"]).s(), "OK");
+    std::thread::sleep(Duration::from_millis(1000));
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 1);
+
+    assert_eq!(c.cmd(&["DEBUG", "PAUSE-CRON", "0"]).s(), "OK");
+    wait_until("the sweep to delete k", 10, || {
+        c.cmd(&["DBSIZE"]).i() == 0 && c.info("stats", "expired_keys_active") == "1"
+    });
 }
