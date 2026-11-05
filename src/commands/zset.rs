@@ -12,6 +12,7 @@ use crate::types::{KiviDBValue, SortedSetInner, ZMember};
 use crate::{read_lock, write_lock};
 use ordered_float::OrderedFloat;
 use parking_lot::RwLock;
+use std::ops::Bound;
 use std::sync::Arc;
 
 // ── RESP3 shaping ─────────────────────────────────────────────────────────
@@ -402,64 +403,22 @@ fn zrange_pairs(inner: &SortedSetInner, p: &RangeParams) -> Vec<(Vec<u8>, f64)> 
             (min_str, max_str)
         };
 
-        let (min_val, min_excl) = match parse_score_bound(min_str) {
-            Ok(v) => v,
-            Err(_) => return vec![],
-        };
-        let (max_val, max_excl) = match parse_score_bound(max_str) {
-            Ok(v) => v,
-            Err(_) => return vec![],
-        };
-
-        let in_range = |score: f64| -> bool {
-            let above = if min_excl {
-                score > min_val
-            } else {
-                score >= min_val
-            };
-            let below = if max_excl {
-                score < max_val
-            } else {
-                score <= max_val
-            };
-            above && below
-        };
-
-        // The tree is in score order: begin at the first score that can be
-        // in the range and stop at the first that cannot, where this used
-        // to look at every member of the set, in the range or not.
-        use std::ops::Bound;
-        // The least member there can be: with a score, the least key of
-        // that score.
-        let least: ZMember = Arc::from(&[][..]);
-        let lower = if min_val == f64::NEG_INFINITY || min_val.is_nan() {
-            Bound::Unbounded
-        } else {
-            Bound::Included((OrderedFloat(min_val), Arc::clone(&least)))
-        };
-        // Everything up to the next score above the largest wanted. There
-        // is none above infinity, and nothing to leave out there.
-        let upper = if max_val == f64::INFINITY || max_val.is_nan() {
-            Bound::Unbounded
-        } else {
-            Bound::Excluded((OrderedFloat(max_val.next_up()), least))
-        };
-        if min_val > max_val {
+        let (Ok(min), Ok(max)) = (parse_score_bound(min_str), parse_score_bound(max_str)) else {
             return vec![];
-        }
-        let within = inner.by_score.range((lower, upper));
-        // The ends themselves may be left out (`(1.5`): `in_range` knows.
+        };
+        let Some(range) = score_range(min, max) else {
+            return vec![];
+        };
+        let within = inner.by_score.range(range);
         if p.rev {
             within
                 .rev()
-                .filter(|((score, _), _)| in_range(score.0))
                 .map(|((score, member), _)| (member.as_ref().to_vec(), score.0))
                 .skip(p.limit_offset)
                 .take(p.limit_count)
                 .collect()
         } else {
             within
-                .filter(|((score, _), _)| in_range(score.0))
                 .map(|((score, member), _)| (member.as_ref().to_vec(), score.0))
                 .skip(p.limit_offset)
                 .take(p.limit_count)
@@ -1137,6 +1096,50 @@ fn parse_score_bound(s: &str) -> Result<(f64, bool), Vec<u8>> {
         .ok_or_else(|| resp_error("ERR min or max is not a float"))
 }
 
+type ScoreKey = (OrderedFloat<f64>, ZMember);
+
+/// The part of `by_score` with scores from `min` to `max`, each a bound
+/// from [`parse_score_bound`]; `None` when no score can be in it.
+///
+/// No member sorts before the empty one, so `(score, "")` is the first key
+/// of a score. An open end moves to the next float, which keeps both ends
+/// on such a key and leaves nothing for the caller to filter out.
+fn score_range(
+    (min, min_excl): (f64, bool),
+    (max, max_excl): (f64, bool),
+) -> Option<(Bound<ScoreKey>, Bound<ScoreKey>)> {
+    let first = if min_excl {
+        if min == f64::INFINITY {
+            return None;
+        }
+        min.next_up()
+    } else {
+        min
+    };
+    // The least score past the range, if there is one.
+    let past = if max_excl {
+        Some(max)
+    } else if max == f64::INFINITY {
+        None
+    } else {
+        Some(max.next_up())
+    };
+    if past.is_some_and(|past| first > past) {
+        return None;
+    }
+    let least: ZMember = Arc::from(&[][..]);
+    let lower = if first == f64::NEG_INFINITY {
+        Bound::Unbounded
+    } else {
+        Bound::Included((OrderedFloat(first), Arc::clone(&least)))
+    };
+    let upper = match past {
+        Some(past) => Bound::Excluded((OrderedFloat(past), least)),
+        None => Bound::Unbounded,
+    };
+    Some((lower, upper))
+}
+
 fn zcount(ctx: &mut Ctx) -> Vec<u8> {
     let cmd = &ctx.cmd;
     if cmd.len() != 4 {
@@ -1155,11 +1158,11 @@ fn zcount(ctx: &mut Ctx) -> Vec<u8> {
         Err(_) => return resp_error("ERR max must be UTF-8"),
     };
 
-    let (min_val, min_excl) = match parse_score_bound(min_str) {
+    let min = match parse_score_bound(min_str) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let (max_val, max_excl) = match parse_score_bound(max_str) {
+    let max = match parse_score_bound(max_str) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -1172,24 +1175,12 @@ fn zcount(ctx: &mut Ctx) -> Vec<u8> {
         None => resp_integer(0),
         Some(ValueRef::SortedSet(zs)) => {
             let inner = zs.read();
-            // score_in_range is a closure — captures min/max by value.
-            // Rust lesson: closures that only read captured vars implement Fn,
-            // which means we can call them multiple times freely.
-            let in_range = |score: f64| -> bool {
-                let above_min = if min_excl {
-                    score > min_val
-                } else {
-                    score >= min_val
-                };
-                let below_max = if max_excl {
-                    score < max_val
-                } else {
-                    score <= max_val
-                };
-                above_min && below_max
+            let count = match score_range(min, max) {
+                None => 0,
+                Some((Bound::Unbounded, Bound::Unbounded)) => inner.len(),
+                Some(range) => inner.by_score.range(range).count(),
             };
-            let count = inner.members.values().filter(|&&s| in_range(s)).count() as i64;
-            resp_integer(count)
+            resp_integer(count as i64)
         }
         Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
     }
@@ -1863,27 +1854,13 @@ fn zremrangebyscore(ctx: &mut Ctx) -> Vec<u8> {
     };
     let min_str = std::str::from_utf8(cmd[2]).unwrap_or("");
     let max_str = std::str::from_utf8(cmd[3]).unwrap_or("");
-    let (min_val, min_excl) = match parse_score_bound(min_str) {
+    let min = match parse_score_bound(min_str) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let (max_val, max_excl) = match parse_score_bound(max_str) {
+    let max = match parse_score_bound(max_str) {
         Ok(v) => v,
         Err(e) => return e,
-    };
-
-    let in_range = move |score: f64| -> bool {
-        let above = if min_excl {
-            score > min_val
-        } else {
-            score >= min_val
-        };
-        let below = if max_excl {
-            score < max_val
-        } else {
-            score <= max_val
-        };
-        above && below
     };
 
     let db_ref = &ctx.store[*ctx.selected_db];
@@ -1893,22 +1870,21 @@ fn zremrangebyscore(ctx: &mut Ctx) -> Vec<u8> {
     match map.get(key) {
         None => resp_integer(0),
         Some(ValueRef::SortedSet(zs)) => {
+            let Some(range) = score_range(min, max) else {
+                return resp_integer(0);
+            };
             let mut inner = zs.write();
-            // Collect members to remove first (can't mutate while iterating)
-            let to_remove: Vec<(f64, ZMember)> = inner
+            // Collect the keys before modifying the index.
+            let to_remove: Vec<ScoreKey> = inner
                 .by_score
-                .iter()
-                .filter(|((score, _), _)| in_range(score.0))
-                .map(|((score, member), _)| (score.0, member.clone()))
+                .range(range)
+                .map(|(key, _)| key.clone())
                 .collect();
-            let count = to_remove.len() as i64;
-            for (score, member) in to_remove {
-                inner
-                    .by_score
-                    .remove(&(OrderedFloat(score), member.clone()));
-                inner.members.remove(member.as_ref());
+            for key in &to_remove {
+                inner.by_score.remove(key);
+                inner.members.remove(key.1.as_ref());
             }
-            resp_integer(count)
+            resp_integer(to_remove.len() as i64)
         }
         Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
     }
@@ -2941,5 +2917,152 @@ mod aggregate_tests {
         assert_eq!(agg(1.0, 1.0), 2.0);
         let cmd: Vec<&[u8]> = vec![b"ZUNION", b"1", b"k", b"AGGREGATE", b"MEDIAN"];
         assert!(parse_weights_aggregate(&cmd, 3, 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod score_range_tests {
+    use super::*;
+
+    fn in_bounds(score: f64, (min, min_excl): (f64, bool), (max, max_excl): (f64, bool)) -> bool {
+        let above = if min_excl { score > min } else { score >= min };
+        let below = if max_excl { score < max } else { score <= max };
+        above && below
+    }
+
+    fn by_scan(zs: &SortedSetInner, min: (f64, bool), max: (f64, bool)) -> Vec<ScoreKey> {
+        zs.by_score
+            .keys()
+            .filter(|(score, _)| in_bounds(score.0, min, max))
+            .cloned()
+            .collect()
+    }
+
+    fn by_range(zs: &SortedSetInner, min: (f64, bool), max: (f64, bool)) -> Vec<ScoreKey> {
+        score_range(min, max).map_or_else(Vec::new, |range| {
+            zs.by_score
+                .range(range)
+                .map(|(key, _)| key.clone())
+                .collect()
+        })
+    }
+
+    fn member(name: &str) -> ZMember {
+        Arc::from(name.as_bytes())
+    }
+
+    const EDGES: [f64; 17] = [
+        f64::NEG_INFINITY,
+        f64::MIN,
+        -1.5,
+        -1.0,
+        -f64::MIN_POSITIVE,
+        -5e-324,
+        -0.0,
+        0.0,
+        5e-324,
+        f64::MIN_POSITIVE,
+        1.0f64.next_down(),
+        1.0,
+        1.000_000_000_000_000_2,
+        1.5,
+        f64::MAX,
+        f64::INFINITY,
+        2.0,
+    ];
+
+    /// Several members to each score, the empty member among them, at
+    /// every score next to a bound that is easy to get wrong.
+    fn edge_set() -> SortedSetInner {
+        let mut zs = SortedSetInner::new();
+        for (i, &score) in EDGES.iter().enumerate() {
+            for name in ["", "a", "b"] {
+                zs.insert(member(&format!("{name}{i}")), score);
+            }
+        }
+        zs.insert(member(""), 1.0);
+        zs
+    }
+
+    #[test]
+    fn every_pair_of_edge_bounds_matches_a_full_scan() {
+        let zs = edge_set();
+        for &min in &EDGES {
+            for &max in &EDGES {
+                for min_excl in [false, true] {
+                    for max_excl in [false, true] {
+                        let (lo, hi) = ((min, min_excl), (max, max_excl));
+                        assert_eq!(by_range(&zs, lo, hi), by_scan(&zs, lo, hi), "{lo:?} {hi:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn signed_zeros_are_the_same_score() {
+        let mut zs = SortedSetInner::new();
+        zs.insert(member("neg"), -0.0);
+        zs.insert(member("pos"), 0.0);
+        for (min, max) in [(-0.0, 0.0), (0.0, -0.0), (0.0, 0.0), (-0.0, -0.0)] {
+            assert_eq!(by_range(&zs, (min, false), (max, false)).len(), 2);
+            assert!(by_range(&zs, (min, true), (max, false)).is_empty());
+            assert!(by_range(&zs, (min, false), (max, true)).is_empty());
+        }
+        assert_eq!(by_range(&zs, (-5e-324, true), (5e-324, true)).len(), 2);
+    }
+
+    #[test]
+    fn empty_and_inverted_ranges_have_no_bounds() {
+        assert!(score_range((2.0, false), (1.0, false)).is_none());
+        assert!(score_range((1.0, true), (1.0, true)).is_none());
+        assert!(score_range((f64::INFINITY, true), (f64::INFINITY, false)).is_none());
+        assert!(score_range((f64::INFINITY, false), (f64::NEG_INFINITY, false)).is_none());
+        let zs = edge_set();
+        // One-sided empties still give bounds a BTreeMap accepts.
+        assert!(by_range(&zs, (1.0, true), (1.0, false)).is_empty());
+        assert!(by_range(&zs, (1.0, false), (1.0, true)).is_empty());
+        assert!(by_range(&zs, (f64::NEG_INFINITY, false), (f64::NEG_INFINITY, true)).is_empty());
+        assert!(by_range(&zs, (f64::INFINITY, false), (f64::INFINITY, true)).is_empty());
+    }
+
+    /// Fixed-seed xorshift, so a failure can be run again.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        fn score(&mut self) -> f64 {
+            match self.below(10) {
+                0 => EDGES[self.below(EDGES.len() as u64) as usize],
+                1 => (self.below(2001) as f64 - 1000.0) / 7.0,
+                // Mostly a few whole scores, so that most of them repeat.
+                _ => self.below(21) as f64 - 10.0,
+            }
+        }
+    }
+
+    #[test]
+    fn random_ranges_match_a_full_scan() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..200 {
+            let mut zs = SortedSetInner::new();
+            for i in 0..rng.below(300) {
+                let score = rng.score();
+                zs.insert(member(&format!("m{i:04}")), score);
+            }
+            for _ in 0..50 {
+                let lo = (rng.score(), rng.below(2) == 0);
+                let hi = (rng.score(), rng.below(2) == 0);
+                assert_eq!(by_range(&zs, lo, hi), by_scan(&zs, lo, hi), "{lo:?} {hi:?}");
+            }
+        }
     }
 }

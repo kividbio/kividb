@@ -424,6 +424,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `_` as before. Inside `MULTI` or a script, where they cannot wait, they
   still reply `$-1`, as Redis does, and so do `RPOPLPUSH` and `LMOVE` on
   an empty list.
+- **`ZCOUNT` and `ZREMRANGEBYSCORE` no longer scan the whole sorted set.**
+  Both now seek to the score range, costing O(log N + M) for M matching
+  members instead of O(N). An empty range costs O(log N)
+  ([#408](https://github.com/kividbio/kividb/issues/408),
+  by [@Parikalp-Bhardwaj](https://github.com/Parikalp-Bhardwaj)).
 
 ## [1.2.0] - 2026-11-03
 

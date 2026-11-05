@@ -1701,3 +1701,291 @@ fn zrangebyscore_keeps_and_leaves_out_its_ends() {
         }
     }
 }
+
+/// `(5`, `5`, `-inf` and `+inf` as a full scan reads them.
+fn score_bound(text: &str) -> (f64, bool) {
+    let (text, open) = match text.strip_prefix('(') {
+        Some(rest) => (rest, true),
+        None => (text, false),
+    };
+    let value = match text {
+        "-inf" => f64::NEG_INFINITY,
+        "+inf" | "inf" => f64::INFINITY,
+        other => other.parse().unwrap(),
+    };
+    (value, open)
+}
+
+fn score_in(score: f64, min: &str, max: &str) -> bool {
+    let ((lo, lo_open), (hi, hi_open)) = (score_bound(min), score_bound(max));
+    (if lo_open { score > lo } else { score >= lo })
+        && (if hi_open { score < hi } else { score <= hi })
+}
+
+/// Load `members` into `key`, replacing whatever is there.
+fn load_zset(c: &mut Conn, key: &str, members: &[(f64, String)]) {
+    c.cmds(&["DEL", key]);
+    for (score, member) in members {
+        c.cmds(&["ZADD", key, &score.to_string(), member]);
+    }
+}
+
+/// Verify the sorted set and both indexes match the expected members.
+fn assert_zset_holds(c: &mut Conn, key: &str, want: &[(f64, String)], gone: &[String]) {
+    let mut want = want.to_vec();
+    want.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap().then(x.1.cmp(&y.1)));
+    let reply = c.cmds(&["ZRANGE", key, "0", "-1", "WITHSCORES"]);
+    let got: Vec<(f64, String)> = reply
+        .as_array()
+        .chunks(2)
+        .map(|pair| (pair[1].as_f64(), pair[0].as_str().to_string()))
+        .collect();
+    assert_eq!(got, want, "ZRANGE {key}");
+    assert_eq!(c.cmds(&["ZCARD", key]).as_int() as usize, want.len());
+    let exists = c.cmds(&["EXISTS", key]).as_int();
+    assert_eq!(exists, i64::from(!want.is_empty()), "EXISTS {key}");
+    if want.is_empty() {
+        assert_eq!(c.cmds(&["TYPE", key]).as_str(), "none");
+    }
+    for (rank, (score, member)) in want.iter().enumerate() {
+        assert_eq!(
+            c.cmds(&["ZSCORE", key, member]).as_f64(),
+            *score,
+            "{member}"
+        );
+        assert_eq!(
+            c.cmds(&["ZRANK", key, member]).as_int() as usize,
+            rank,
+            "{member}"
+        );
+    }
+    for member in gone {
+        assert!(
+            c.cmds(&["ZSCORE", key, member]).is_nil(),
+            "{member} still there"
+        );
+        assert!(
+            c.cmds(&["ZRANK", key, member]).is_nil(),
+            "{member} still ranked"
+        );
+    }
+}
+
+/// ZCOUNT and ZREMRANGEBYSCORE agree with a full scan for every pair of a
+/// set of bounds: open and closed, infinite, signed zeros, the largest
+/// finite scores, several members to a score.
+#[test]
+fn zcount_and_zremrangebyscore_match_a_full_scan_at_every_bound() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let scores = [
+        f64::NEG_INFINITY,
+        -f64::MAX,
+        -2.0,
+        -1.0,
+        -0.0,
+        0.0,
+        1.0,
+        2.0,
+        f64::MAX,
+        f64::INFINITY,
+    ];
+    let mut all: Vec<(f64, String)> = Vec::new();
+    for (i, score) in scores.iter().enumerate() {
+        for which in ["a", "b", "c"] {
+            all.push((*score, format!("{which}{i}")));
+        }
+    }
+    let ends = [
+        "-inf",
+        "(-inf",
+        "-1.7976931348623157e308",
+        "(-1.7976931348623157e308",
+        "-1",
+        "(-1",
+        "-0",
+        "(-0",
+        "0",
+        "(0",
+        "0.5",
+        "1",
+        "(1",
+        "1.7976931348623157e308",
+        "(1.7976931348623157e308",
+        "+inf",
+        "(+inf",
+    ];
+    load_zset(&mut c, "src", &all);
+    assert_eq!(
+        c.cmds(&["ZCOUNT", "src", "-inf", "+inf"]).as_int(),
+        c.cmds(&["ZCARD", "src"]).as_int()
+    );
+    for min in ends {
+        for max in ends {
+            let (inside, outside): (Vec<_>, Vec<_>) = all
+                .iter()
+                .cloned()
+                .partition(|(score, _)| score_in(*score, min, max));
+            assert_eq!(
+                c.cmds(&["ZCOUNT", "src", min, max]).as_int() as usize,
+                inside.len(),
+                "ZCOUNT {min} {max}"
+            );
+            assert_eq!(c.cmds(&["COPY", "src", "z", "REPLACE"]).as_int(), 1);
+            assert_eq!(
+                c.cmds(&["ZREMRANGEBYSCORE", "z", min, max]).as_int() as usize,
+                inside.len(),
+                "ZREMRANGEBYSCORE {min} {max}"
+            );
+            let removed: Vec<String> = inside.into_iter().map(|(_, m)| m).collect();
+            assert_zset_holds(&mut c, "z", &outside, &removed);
+        }
+    }
+}
+
+#[test]
+fn zcount_missing_key_wrong_type_and_bad_bounds() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&["ZADD", "z", "1", "a", "2", "b", "2", "c", "3", "d"]);
+    assert_eq!(c.cmds(&["ZCOUNT", "z", "5", "9"]).as_int(), 0);
+    assert_eq!(c.cmds(&["ZCOUNT", "z", "3", "3"]).as_int(), 1);
+    assert_eq!(c.cmds(&["ZCOUNT", "z", "2", "2"]).as_int(), 2);
+    assert_eq!(c.cmds(&["ZCOUNT", "z", "(1", "(3"]).as_int(), 2);
+    assert_eq!(c.cmds(&["ZCOUNT", "z", "3", "1"]).as_int(), 0);
+    assert_eq!(c.cmds(&["ZCOUNT", "z", "-inf", "+inf"]).as_int(), 4);
+    assert_eq!(c.cmds(&["ZCOUNT", "nosuch", "-inf", "+inf"]).as_int(), 0);
+    c.cmds(&["SET", "s", "v"]);
+    assert!(c.cmds(&["ZCOUNT", "s", "0", "1"]).is_error());
+    assert!(c.cmds(&["ZREMRANGEBYSCORE", "s", "0", "1"]).is_error());
+    for bad in ["nan", "(nan", "x"] {
+        assert!(
+            c.cmds(&["ZCOUNT", "z", bad, "1"]).is_error(),
+            "ZCOUNT {bad:?}"
+        );
+        assert!(
+            c.cmds(&["ZCOUNT", "z", "1", bad]).is_error(),
+            "ZCOUNT max {bad:?}"
+        );
+        assert!(
+            c.cmds(&["ZREMRANGEBYSCORE", "z", bad, "1"]).is_error(),
+            "ZREMRANGEBYSCORE {bad:?}"
+        );
+    }
+    assert_eq!(c.cmds(&["ZCARD", "z"]).as_int(), 4);
+    assert_eq!(c.cmds(&["GET", "s"]).as_str(), "v");
+}
+
+#[test]
+fn zremrangebyscore_removes_only_its_range_and_deletes_an_emptied_key() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let set = |pairs: &[(f64, &str)]| -> Vec<(f64, String)> {
+        pairs.iter().map(|(s, m)| (*s, m.to_string())).collect()
+    };
+    let all = set(&[(1.0, "a"), (2.0, "b"), (2.0, "c"), (3.0, "d"), (4.0, "e")]);
+    load_zset(&mut c, "z", &all);
+
+    assert_eq!(
+        c.cmds(&["ZREMRANGEBYSCORE", "nosuch", "-inf", "+inf"])
+            .as_int(),
+        0
+    );
+    assert_eq!(c.cmds(&["EXISTS", "nosuch"]).as_int(), 0);
+
+    assert_eq!(c.cmds(&["ZREMRANGEBYSCORE", "z", "(2", "(3"]).as_int(), 0);
+    assert_zset_holds(&mut c, "z", &all, &[]);
+
+    assert_eq!(c.cmds(&["ZREMRANGEBYSCORE", "z", "3", "3"]).as_int(), 1);
+    let left = set(&[(1.0, "a"), (2.0, "b"), (2.0, "c"), (4.0, "e")]);
+    assert_zset_holds(&mut c, "z", &left, &["d".into()]);
+
+    assert_eq!(c.cmds(&["ZREMRANGEBYSCORE", "z", "2", "2"]).as_int(), 2);
+    let left = set(&[(1.0, "a"), (4.0, "e")]);
+    assert_zset_holds(&mut c, "z", &left, &["b".into(), "c".into()]);
+    let r = c.cmds(&["ZRANGEBYSCORE", "z", "-inf", "+inf"]);
+    assert_eq!(names(&r), ["a", "e"]);
+
+    // The removed members come back as new ones.
+    assert_eq!(c.cmds(&["ZADD", "z", "2", "b", "3", "d"]).as_int(), 2);
+    let left = set(&[(1.0, "a"), (2.0, "b"), (3.0, "d"), (4.0, "e")]);
+    assert_zset_holds(&mut c, "z", &left, &["c".into()]);
+
+    assert_eq!(
+        c.cmds(&["ZREMRANGEBYSCORE", "z", "-inf", "+inf"]).as_int(),
+        4
+    );
+    assert_zset_holds(
+        &mut c,
+        "z",
+        &[],
+        &["a".into(), "b".into(), "d".into(), "e".into()],
+    );
+    assert_eq!(c.cmds(&["DBSIZE"]).as_int(), 0);
+
+    assert_eq!(c.cmds(&["ZADD", "z", "7", "x"]).as_int(), 1);
+    assert_zset_holds(&mut c, "z", &set(&[(7.0, "x")]), &[]);
+}
+
+/// Fixed-seed xorshift, so a failure can be run again.
+struct Rng(u64);
+
+impl Rng {
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0 % n
+    }
+
+    /// A bound over a few whole scores, so that bounds land on scores
+    /// that several members share.
+    fn bound(&mut self) -> String {
+        let open = if self.below(2) == 0 { "(" } else { "" };
+        match self.below(12) {
+            0 => "-inf".into(),
+            1 => "+inf".into(),
+            2 => format!("{open}{}.5", self.below(21) as i64 - 10),
+            _ => format!("{open}{}", self.below(21) as i64 - 10),
+        }
+    }
+}
+
+#[test]
+fn zcount_and_zremrangebyscore_match_a_reference_on_random_sets() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    for round in 0..40 {
+        let mut members: Vec<(f64, String)> = Vec::new();
+        for i in 0..rng.below(60) {
+            let score = rng.below(21) as f64 - 10.0;
+            members.push((score, format!("m{i:03}")));
+        }
+        load_zset(&mut c, "z", &members);
+        for _ in 0..15 {
+            let (min, max) = (rng.bound(), rng.bound());
+            let (inside, outside): (Vec<_>, Vec<_>) = members
+                .iter()
+                .cloned()
+                .partition(|(s, _)| score_in(*s, &min, &max));
+            assert_eq!(
+                c.cmds(&["ZCOUNT", "z", &min, &max]).as_int() as usize,
+                inside.len(),
+                "round {round}: ZCOUNT {min} {max}"
+            );
+            assert_eq!(
+                c.cmds(&["ZREMRANGEBYSCORE", "z", &min, &max]).as_int() as usize,
+                inside.len(),
+                "round {round}: ZREMRANGEBYSCORE {min} {max}"
+            );
+            let removed: Vec<String> = inside.into_iter().map(|(_, m)| m).collect();
+            assert_zset_holds(&mut c, "z", &outside, &removed);
+            members = outside;
+        }
+    }
+}
