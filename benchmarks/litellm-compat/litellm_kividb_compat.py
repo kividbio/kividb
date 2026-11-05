@@ -259,9 +259,47 @@ def litellm_checks(url, p, stub_port):
             except redis.ResponseError:
                 pass
 
+    def proxy_rate_limiter():
+        # The proxy's per-key limiter (parallel_request_limiter_v3), run in-process the way the proxy
+        # builds it: an InternalUsageCache over a DualCache with this Redis behind it. It counts with
+        # Lua scripts (EVALSHA), so it needs the lua or full KiviDB build.
+        import asyncio
+        from fastapi import HTTPException
+        from litellm.caching.caching import DualCache
+        from litellm.caching.redis_cache import RedisCache
+        from litellm.proxy._types import UserAPIKeyAuth
+        from litellm.proxy.hooks.parallel_request_limiter_v3 import _PROXY_MaxParallelRequestsHandler_v3
+        from litellm.proxy.utils import InternalUsageCache, hash_token
+
+        hashed = hash_token("sk-" + p + uuid.uuid4().hex)
+
+        async def run():
+            cache = DualCache(redis_cache=RedisCache(host=host, port=port, password=pw))
+            handler = _PROXY_MaxParallelRequestsHandler_v3(internal_usage_cache=InternalUsageCache(cache))
+            key = UserAPIKeyAuth(api_key=hashed, rpm_limit=2)
+            outcomes = []
+            for _ in range(3):
+                try:
+                    await handler.async_pre_call_hook(user_api_key_dict=key, cache=cache, data={}, call_type="")
+                    outcomes.append("ok")
+                except HTTPException as e:
+                    outcomes.append(e.status_code)
+            return outcomes
+
+        outcomes = asyncio.run(run())
+        assert outcomes == ["ok", "ok", 429], f"expected ok, ok, 429 with rpm_limit=2; got {outcomes}"
+        # The limiter falls back to counting in process memory when its scripts fail, so the outcome
+        # alone doesn't show that Redis did the counting: its counter keys must be in Redis.
+        counters = [k.decode() for k in r.scan_iter(match=f"*{hashed}*", count=1000)]
+        assert counters, "no counter keys in Redis: the limiter counted in process memory (its scripts failed?)"
+        for k in counters:
+            r.delete(k)
+        return f"rpm_limit=2: ok, ok, 429; {len(counters)} counter keys in Redis"
+
     check("LiteLLM exact cache (type=redis)", exact)
     check("LiteLLM router TPM/RPM counters in Redis", router_counters, level="WARN")
     check("LiteLLM semantic cache (type=redis-semantic)", semantic)
+    check("LiteLLM proxy per-key rate limiter (v3, Lua scripts) on Redis", proxy_rate_limiter)
 
 
 def bench(url, p, threads=32, seconds=5):
