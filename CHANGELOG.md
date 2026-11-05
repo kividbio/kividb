@@ -29,6 +29,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`ZREM` no longer scans the whole sorted set for each member it removes.**
+  Removing a member is now O(log N) instead of O(N)
+  ([#386](https://github.com/kividbio/kividb/issues/386),
+  by [@Parikalp-Bhardwaj](https://github.com/Parikalp-Bhardwaj)).
+  
 - **A client that goes while it is blocked no longer takes the next
   element (#384).** On the io_uring I/O model (the default on Linux), a
   client blocked in `BLPOP`, `BRPOPLPUSH`, `BLMOVE`, `BZPOPMIN`,

@@ -406,6 +406,145 @@ fn test_zrem() {
     assert_eq!(c.cmds(&["ZREM", "nosuch", "a"]).as_int(), 0);
 }
 
+/// (member, score) pairs of a WITHSCORES reply.
+fn scored(reply: &RespValue) -> Vec<(Vec<u8>, f64)> {
+    reply
+        .as_array()
+        .chunks(2)
+        .map(|p| match &p[0] {
+            RespValue::Bulk(m) => (m.clone(), p[1].as_f64()),
+            other => panic!("not a member: {:?}", other),
+        })
+        .collect()
+}
+
+/// Every read of `key` agrees that it holds exactly `expected`, in order:
+/// ZCARD, ZRANGE, ZRANGEBYSCORE, and ZSCORE and ZRANK of each member.
+fn assert_zset(c: &mut Conn, key: &[u8], expected: &[(&[u8], f64)]) {
+    let want: Vec<(Vec<u8>, f64)> = expected.iter().map(|(m, s)| (m.to_vec(), *s)).collect();
+    assert_eq!(c.cmd(&[b"ZCARD", key]).as_int(), want.len() as i64);
+    let range = c.cmd(&[b"ZRANGE", key, b"0", b"-1", b"WITHSCORES"]);
+    assert_eq!(scored(&range), want, "ZRANGE");
+    let by_score = c.cmd(&[b"ZRANGEBYSCORE", key, b"-inf", b"+inf", b"WITHSCORES"]);
+    assert_eq!(scored(&by_score), want, "ZRANGEBYSCORE");
+    for (rank, (m, s)) in expected.iter().enumerate() {
+        assert_eq!(c.cmd(&[b"ZSCORE", key, m]).as_f64(), *s);
+        assert_eq!(c.cmd(&[b"ZRANK", key, m]).as_int(), rank as i64);
+    }
+}
+
+fn assert_gone(c: &mut Conn, key: &[u8], member: &[u8]) {
+    assert!(c.cmd(&[b"ZSCORE", key, member]).is_nil());
+    assert!(c.cmd(&[b"ZRANK", key, member]).is_nil());
+}
+
+// Removing a member updates both indexes while preserving the remaining members' scores and order.
+#[test]
+fn test_zrem_existing_keeps_indexes_consistent() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["ZADD", "z", "1", "a", "2", "b", "3", "c", "4", "d"]);
+    assert_eq!(c.cmds(&["ZREM", "z", "b"]).as_int(), 1);
+    assert_gone(&mut c, b"z", b"b");
+    assert_zset(&mut c, b"z", &[(b"a", 1.0), (b"c", 3.0), (b"d", 4.0)]);
+    let in_range = c.cmds(&["ZRANGEBYSCORE", "z", "2", "3"]);
+    assert_eq!(in_range.as_array(), [RespValue::Bulk(b"c".to_vec())]);
+}
+
+// ZREM of members that are not there changes nothing.
+#[test]
+fn test_zrem_missing_changes_nothing() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["ZADD", "z", "1", "a", "2", "b"]);
+    assert_eq!(c.cmds(&["ZREM", "z", "x"]).as_int(), 0);
+    assert_eq!(c.cmds(&["ZREM", "z", "x", "y"]).as_int(), 0);
+    assert_zset(&mut c, b"z", &[(b"a", 1.0), (b"b", 2.0)]);
+}
+
+// A member named twice in one ZREM is removed, and counted, once.
+#[test]
+fn test_zrem_duplicate_arguments_count_once() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["ZADD", "z", "1", "m1", "2", "m2", "3", "m3"]);
+    assert_eq!(
+        c.cmds(&["ZREM", "z", "m1", "m1", "m2", "missing"]).as_int(),
+        2
+    );
+    assert_gone(&mut c, b"z", b"m1");
+    assert_gone(&mut c, b"z", b"m2");
+    assert_zset(&mut c, b"z", &[(b"m3", 3.0)]);
+    // Again: all already gone.
+    assert_eq!(c.cmds(&["ZREM", "z", "m1", "m2"]).as_int(), 0);
+    assert_zset(&mut c, b"z", &[(b"m3", 3.0)]);
+}
+
+// A removed member added back is new, with only its new score and rank.
+#[test]
+fn test_zrem_then_reinsert_with_new_score() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["ZADD", "z", "1", "a", "2", "b", "3", "c"]);
+    assert_eq!(c.cmds(&["ZREM", "z", "a"]).as_int(), 1);
+    assert_eq!(c.cmds(&["ZADD", "z", "10", "a"]).as_int(), 1);
+    assert_zset(&mut c, b"z", &[(b"b", 2.0), (b"c", 3.0), (b"a", 10.0)]);
+    assert!(
+        c.cmds(&["ZRANGEBYSCORE", "z", "0", "1"])
+            .as_array()
+            .is_empty()
+    );
+
+    // Updated, then removed and added back below everything.
+    c.cmds(&["ZADD", "z", "5", "b"]);
+    assert_eq!(c.cmds(&["ZREM", "z", "b"]).as_int(), 1);
+    assert_eq!(c.cmds(&["ZADD", "z", "-1", "b"]).as_int(), 1);
+    assert_zset(&mut c, b"z", &[(b"b", -1.0), (b"c", 3.0), (b"a", 10.0)]);
+}
+
+// Equal scores, a non-UTF-8 member, and removing the last member.
+#[test]
+fn test_zrem_boundaries() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    // An empty (absent) set.
+    assert_eq!(c.cmds(&["ZREM", "z", "a"]).as_int(), 0);
+    assert_eq!(c.cmds(&["EXISTS", "z"]).as_int(), 0);
+
+    // Ties are ordered by name; removing one leaves the others in order.
+    c.cmds(&["ZADD", "z", "1", "a", "1", "b", "1", "c", "1", "d"]);
+    assert_eq!(c.cmds(&["ZREM", "z", "b"]).as_int(), 1);
+    assert_zset(&mut c, b"z", &[(b"a", 1.0), (b"c", 1.0), (b"d", 1.0)]);
+
+    // Binary-safe member names.
+    let bin: &[u8] = b"\xff\x00\xfe";
+    c.cmd(&[b"ZADD", b"z", b"0", bin]);
+    assert_zset(
+        &mut c,
+        b"z",
+        &[(bin, 0.0), (b"a", 1.0), (b"c", 1.0), (b"d", 1.0)],
+    );
+    assert_eq!(c.cmd(&[b"ZREM", b"z", bin, bin]).as_int(), 1);
+    assert_gone(&mut c, b"z", bin);
+    assert_zset(&mut c, b"z", &[(b"a", 1.0), (b"c", 1.0), (b"d", 1.0)]);
+
+    // The last member: the key goes with it.
+    assert_eq!(c.cmds(&["ZREM", "z", "a", "c", "d"]).as_int(), 3);
+    assert_eq!(c.cmds(&["ZCARD", "z"]).as_int(), 0);
+    assert_eq!(c.cmds(&["EXISTS", "z"]).as_int(), 0);
+    assert_eq!(c.cmds(&["ZREM", "z", "a"]).as_int(), 0);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // ZCOUNT / ZLEXCOUNT
 // ═══════════════════════════════════════════════════════════════════════════════
