@@ -54,6 +54,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - A user of `+@all -@write`, or of the `readonly` shorthand, may now
     `SELECT`, as in Redis.
 
+- **`SCORE` and `SCORE_FIELD` now agree with Redis 8.10.2 for hash and JSON
+  documents**, including f32 rounding, special values, negative scores and
+  cluster `-inf` filtering. Both settings also survive snapshots.
+  (#247, by [@Sourabh-ctrl](https://github.com/Sourabh-ctrl))
+
 - **`ZREM` no longer scans the whole sorted set for each member it removes.**
   Removing a member is now O(log N) instead of O(N)
   ([#386](https://github.com/kividbio/kividb/issues/386),
