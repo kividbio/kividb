@@ -32,7 +32,9 @@ other files:
 - Redis's own test suite: [REDIS_TEST_SUITE.md](REDIS_TEST_SUITE.md).
 - BullMQ's and Sidekiq's own test suites, and kill-and-restart soaks
   (`scripts/client_compat/`).
-- LiteLLM's semantic cache: [benchmarks/litellm-compat/REPORT.md](../benchmarks/litellm-compat/REPORT.md).
+- LiteLLM's caches (exact and semantic), router counters and proxy rate limiter (the `lua` build for the
+  proxy), with LiteLLM's own Redis tests: [benchmarks/litellm-compat/REPORT.md](../benchmarks/litellm-compat/REPORT.md)
+  and [docs/integrations/litellm.md](integrations/litellm.md).
 - LangChain's Redis integration (`langchain-redis`): vector store, LLM and semantic cache, chat history:
   [benchmarks/langchain-compat/REPORT.md](../benchmarks/langchain-compat/REPORT.md) and
   [docs/integrations/langchain.md](integrations/langchain.md).
@@ -77,6 +79,23 @@ other files:
 - Self-hosted Firecrawl (BullMQ, crawl state, rate limits; the `lua` build) with its own test suite and
   its docker compose: [benchmarks/firecrawl-compat/](../benchmarks/firecrawl-compat/) and
   [docs/integrations/firecrawl.md](integrations/firecrawl.md).
+- Celery and kombu (broker and result backend; the `lua` build), with their own Redis integration suites
+  and a real worker through a SIGKILL and server restarts. Chords need the result backend on RESP2 on
+  1.2.0 ([#431](https://github.com/kividbio/kividb/issues/431)):
+  [benchmarks/celery-compat/](../benchmarks/celery-compat/) and [docs/integrations/celery.md](integrations/celery.md).
+- Semantic Kernel's Redis vector store (Python; JSON and hash collections), with its own Redis tests:
+  [benchmarks/semantic-kernel-compat/](../benchmarks/semantic-kernel-compat/) and
+  [docs/integrations/semantic-kernel.md](integrations/semantic-kernel.md).
+- Spring AI's Redis vector store and chat memory repository (the `lua` build for chat memory), with its own
+  Redis integration tests: [benchmarks/spring-ai-compat/](../benchmarks/spring-ai-compat/) and
+  [docs/integrations/spring-ai.md](integrations/spring-ai.md).
+- GPTCache's Redis scalar store, vector store and distributed eviction, with its own Redis tests:
+  [benchmarks/gptcache-compat/](../benchmarks/gptcache-compat/) and [docs/integrations/gptcache.md](integrations/gptcache.md).
+- `@upstash/ratelimit` 2.0 through the Serverless Redis HTTP proxy (KiviDB has no REST API; the `lua`
+  build), with its own test suite: [benchmarks/upstash-ratelimit-compat/](../benchmarks/upstash-ratelimit-compat/)
+  and [docs/integrations/upstash-ratelimit.md](integrations/upstash-ratelimit.md).
+- Not compatible: Haystack's Valkey document store, which needs valkey-search's reply formats (it fails on
+  Redis 8 too): [docs/integrations/haystack.md](integrations/haystack.md).
 - `redis-py` throughout the end-to-end tests (`tests/e2e/`).
 
 ## Differences you may notice

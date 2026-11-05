@@ -1,0 +1,1163 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="118" skipped="25" tests="178" time="3.505" timestamp="2026-11-05T19:48:19.742336+00:00" hostname="fwvm"><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_unique_values_basic" time="0.015"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d9383c20&gt;
+
+    @staticmethod
+    def test_get_metadata_field_unique_values_basic(document_store: DocumentStore):
+        """Test get_metadata_field_unique_values() returns unique values and total count."""
+        docs = [
+            Document(content="Doc 1", meta={"category": "A"}),
+            Document(content="Doc 2", meta={"category": "B"}),
+            Document(content="Doc 3", meta={"category": "A"}),
+            Document(content="Doc 4", meta={"category": "C"}),
+     
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_unique_values_meta_prefix" time="0.004" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_unique_values_search_term" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8da24c6e0&gt;
+
+    @staticmethod
+    def test_get_metadata_field_unique_values_search_term(document_store: DocumentStore):
+        """Test get_metadata_field_unique_values() filters by a case-insensitive substring of the value."""
+        docs = [
+            Document(content="Doc 1", meta={"category": "All_Beauty"}),
+            Document(content="Doc 2", meta={"category": "Electronics"}),
+            # the content mentions "beaut" but the value doesn't - must not match search_te
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_unique_values_pagination" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d9381e20&gt;
+
+    @staticmethod
+    def test_get_metadata_field_unique_values_pagination(document_store: DocumentStore):
+        """Test get_metadata_field_unique_values() paginates a stable ordering via from_/size."""
+        docs = [Document(content=f"Doc {i}", meta={"category": f"category_{i}"}) for i in range(5)]
+        document_store.write_documents(docs)
+    
+        all_values = sorted(f"category_{i}" for i in range(5))
+    
+        first_page, total_count = document_sto
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_unique_values_empty_store" time="0.002" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_unique_values_missing_field" time="0.003" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_unique_values_preserves_type" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d9383a10&gt;
+
+    @staticmethod
+    def test_get_metadata_field_unique_values_preserves_type(document_store: DocumentStore):
+        """Test get_metadata_field_unique_values() returns values in their original (non-string) type."""
+        docs = [
+            Document(content="Doc 1", meta={"priority": 1}),
+            Document(content="Doc 2", meta={"priority": 2}),
+            Document(content="Doc 3", meta={"priority": 1}),
+        ]
+        document_store.write_documents(doc
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_unique_values_distinct_types" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d93a9df0&gt;
+
+    @staticmethod
+    def test_get_metadata_field_unique_values_distinct_types(document_store: DocumentStore):
+        """
+        Test get_metadata_field_unique_values() doesn't collapse values that share a string form.
+    
+        Example: the int 1, the float 1.0, the str "1" and the bool True must be counted and returned as
+        distinct values.
+        """
+        docs = [
+            Document(content="Doc 1", meta={"priority": 1}),
+            Document(co
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_unique_values_with_filters" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d93a8440&gt;
+
+    @staticmethod
+    def test_get_metadata_field_unique_values_with_filters(document_store: DocumentStore):
+        """Test get_metadata_field_unique_values() restricts documents using the filters param."""
+        docs = [
+            Document(content="Doc 1", meta={"category": "A", "status": "active"}),
+            Document(content="Doc 2", meta={"category": "B", "status": "active"}),
+            Document(content="Doc 3", meta={"category": "C", "status": "inacti
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_min_max_numeric" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d93a97c0&gt;
+
+    @staticmethod
+    def test_get_metadata_field_min_max_numeric(document_store: DocumentStore):
+        """Test get_metadata_field_min_max() with integer field."""
+        # The min and max are deliberately not the first or last written values, so an implementation
+        # returning values by insertion order fails. Keeping both 10 and 5 catches implementations that
+        # compare numbers as strings ("10" &lt; "5" lexicographically).
+        docs = [
+        
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_min_max_float" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d93a9a90&gt;
+
+    @staticmethod
+    def test_get_metadata_field_min_max_float(document_store: DocumentStore):
+        """Test get_metadata_field_min_max() with float field."""
+        # The min and max are deliberately not the first or last written values.
+        docs = [
+            Document(content="Doc 1", meta={"rating": 0.8}),
+            Document(content="Doc 2", meta={"rating": 0.6}),
+            Document(content="Doc 3", meta={"rating": 0.95}),
+            Document(cont
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_min_max_single_value" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d93aa780&gt;
+
+    @staticmethod
+    def test_get_metadata_field_min_max_single_value(document_store: DocumentStore):
+        """Test get_metadata_field_min_max() when field has only one value."""
+        docs = [Document(content="Doc 1", meta={"priority": 42})]
+        document_store.write_documents(docs)
+&gt;       assert document_store.count_documents() == 1
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError
+
+../../../venv-hs/lib/python3.12/site-packag
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_min_max_empty_collection" time="0.002" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_min_max_meta_prefix" time="0.004"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d93abef0&gt;
+
+    @staticmethod
+    def test_get_metadata_field_min_max_meta_prefix(document_store: DocumentStore):
+        """Test get_metadata_field_min_max() with field names that include 'meta.' prefix."""
+        # The min and max of each field are deliberately not the first or last written values.
+        docs = [
+            Document(content="Doc 1", meta={"priority": 5, "age": 10}),
+            Document(content="Doc 2", meta={"priority": 1, "age": 20}),
+            Docum
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_count_unique_metadata_by_filter_all_documents" time="0.004"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8c414f0&gt;
+
+    @staticmethod
+    def test_count_unique_metadata_by_filter_all_documents(document_store: DocumentStore):
+        """Test count_unique_metadata_by_filter() with no filter returns distinct counts for all docs."""
+        docs = [
+            Document(content="Doc 1", meta={"category": "A", "status": "active", "priority": 1}),
+            Document(content="Doc 2", meta={"category": "B", "status": "active", "priority": 2}),
+            Document(content="Doc 3", met
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_count_unique_metadata_by_filter_with_filter" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8c418e0&gt;
+
+    @staticmethod
+    def test_count_unique_metadata_by_filter_with_filter(document_store: DocumentStore):
+        """Test count_unique_metadata_by_filter() with a filter."""
+        # The filtered-out document carries extra unique values, so the counts only come out right
+        # when the store actually applies the filter.
+        docs = [
+            Document(content="Doc 1", meta={"category": "A", "status": "active", "priority": 1}),
+            Document(conte
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_count_unique_metadata_by_filter_with_multiple_filters" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8c41d90&gt;
+
+    @staticmethod
+    def test_count_unique_metadata_by_filter_with_multiple_filters(document_store: DocumentStore):
+        """Test count_unique_metadata_by_filter() with multiple filters."""
+        docs = [
+            Document(content="Doc 1", meta={"category": "B", "year": 2023, "status": "draft"}),
+            Document(content="Doc 2", meta={"category": "B", "year": 2023, "status": "draft"}),
+            Document(content="Doc 3", meta={"category": "B", "year"
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_count_documents_by_filter_simple" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8c432c0&gt;
+
+    @staticmethod
+    def test_count_documents_by_filter_simple(document_store: DocumentStore):
+        """Test count_documents_by_filter() with a simple equality filter."""
+        docs = [
+            Document(content="Doc 1", meta={"category": "A", "status": "active"}),
+            Document(content="Doc 2", meta={"category": "B", "status": "active"}),
+            Document(content="Doc 3", meta={"category": "A", "status": "inactive"}),
+            Document(conten
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_count_documents_by_filter_compound" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8c430b0&gt;
+
+    @staticmethod
+    def test_count_documents_by_filter_compound(document_store: DocumentStore):
+        """Test count_documents_by_filter() with AND filter."""
+        docs = [
+            Document(content="Doc 1", meta={"category": "A", "status": "active"}),
+            Document(content="Doc 2", meta={"category": "B", "status": "active"}),
+            Document(content="Doc 3", meta={"category": "A", "status": "inactive"}),
+            Document(content="Doc 4", m
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_count_documents_by_filter_no_matches" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8c43bf0&gt;
+
+    @staticmethod
+    def test_count_documents_by_filter_no_matches(document_store: DocumentStore):
+        """Test count_documents_by_filter() when filter matches no documents."""
+        docs = [Document(content="Doc 1", meta={"category": "A"}), Document(content="Doc 2", meta={"category": "B"})]
+        document_store.write_documents(docs)
+&gt;       assert document_store.count_documents() == 2
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Assertio
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_count_documents_by_filter_empty_collection" time="0.002" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_update_by_filter" time="0.011"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8c14c50&gt;
+filterable_docs = [Document(id=9231717bd83e4c7641b2ac20844c294f97a4b45540d32feb89054c4ee9165a21, content: 'A Foo Document 0', meta: {'na...44563afd7201e6286e4af15, content: 'Doc 0 with ones emb', meta: {'name': 'ones_doc'}, embedding: vector of size 3), ...]
+
+    @staticmethod
+    def test_update_by_filter(document_store: DocumentStore, filterable_docs: list[Document]):
+        """Update documents matching a filter and verify count and meta changes."""
+        docum
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_update_by_filter_no_matches" time="0.011"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8c15bb0&gt;
+filterable_docs = [Document(id=3bb3b1c2c4f8ace31d4c584823c0cbc05794a3a460206a817c1f0f589fab50c3, content: 'A Foo Document 0', meta: {'na...44563afd7201e6286e4af15, content: 'Doc 0 with ones emb', meta: {'name': 'ones_doc'}, embedding: vector of size 3), ...]
+
+    @staticmethod
+    def test_update_by_filter_no_matches(document_store: DocumentStore, filterable_docs: list[Document]):
+        """Update with a filter that matches no documents returns 0 and leaves store u
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_update_by_filter_multiple_fields" time="0.011"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8c16b70&gt;
+filterable_docs = [Document(id=bed5743084465d6320d4fdb802fd5dc66f6b8d78ac51885f249748604d8c3bd5, content: 'A Foo Document 0', meta: {'na...44563afd7201e6286e4af15, content: 'Doc 0 with ones emb', meta: {'name': 'ones_doc'}, embedding: vector of size 3), ...]
+
+    @staticmethod
+    def test_update_by_filter_multiple_fields(document_store: DocumentStore, filterable_docs: list[Document]):
+        """Update matching documents with multiple meta fields and verify all are
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_update_by_filter_advanced_filters" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8c17ad0&gt;
+
+    @staticmethod
+    def test_update_by_filter_advanced_filters(document_store: DocumentStore):
+        """Update with AND/OR filter combinations and verify updated documents."""
+        docs = [
+            Document(content="Doc 1", meta={"category": "Alpha", "year": 2023, "status": "draft"}),
+            Document(content="Doc 2", meta={"category": "Alpha", "year": 2024, "status": "draft"}),
+            Document(content="Doc 3", meta={"category": "Beta", "year": 
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_delete_documents" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8c9c620&gt;
+
+    @staticmethod
+    def test_delete_documents(document_store: DocumentStore):
+        """Test delete_documents() normal behaviour."""
+        doc = Document(content="test doc")
+        document_store.write_documents([doc])
+&gt;       assert document_store.count_documents() == 1
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError
+
+../../../venv-hs/lib/python3.12/site-packages/haystack/testing/document_store.py:157: AssertionError</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_delete_documents_empty_document_store" time="0.002" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_delete_documents_non_existing_document" time="0.002"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8c9d1c0&gt;
+
+    @staticmethod
+    def test_delete_documents_non_existing_document(document_store: DocumentStore):
+        """Test delete_documents() doesn't delete any Document when called with non-existing id."""
+        doc = Document(content="test doc")
+        document_store.write_documents([doc])
+&gt;       assert document_store.count_documents() == 1
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError
+
+../../../venv-hs/lib/python3.12/site-packages
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_delete_by_filter" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8c9da00&gt;
+
+    @staticmethod
+    def test_delete_by_filter(document_store: DocumentStore):
+        """Delete documents matching a filter and verify count and remaining docs."""
+        docs = [
+            Document(content="Doc 1", meta={"category": "Alpha"}),
+            Document(content="Doc 2", meta={"category": "Beta"}),
+            Document(content="Doc 3", meta={"category": "Alpha"}),
+        ]
+        document_store.write_documents(docs)
+&gt;       assert document_stor
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_delete_by_filter_no_matches" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8c9e6c0&gt;
+
+    @staticmethod
+    def test_delete_by_filter_no_matches(document_store: DocumentStore):
+        """Delete with a filter that matches no documents returns 0 and leaves store unchanged."""
+        docs = [
+            Document(content="Doc 1", meta={"category": "Alpha"}),
+            Document(content="Doc 2", meta={"category": "Beta"}),
+        ]
+        document_store.write_documents(docs)
+&gt;       assert document_store.count_documents() == 2
+               ^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_delete_by_filter_advanced_filters" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8c9f230&gt;
+
+    @staticmethod
+    def test_delete_by_filter_advanced_filters(document_store: DocumentStore):
+        """Delete with AND/OR filter combinations and verify remaining documents."""
+        docs = [
+            Document(content="Doc 1", meta={"category": "Alpha", "year": 2023, "status": "draft"}),
+            Document(content="Doc 2", meta={"category": "Alpha", "year": 2024, "status": "published"}),
+            Document(content="Doc 3", meta={"category": "Beta", "y
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_delete_all_documents" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8c9fda0&gt;
+
+    @staticmethod
+    def test_delete_all_documents(document_store: DocumentStore):
+        """
+        Test delete_all_documents() normal behaviour.
+    
+        This test verifies that delete_all_documents() removes all documents from the store
+        and that the store remains functional after deletion.
+        """
+        docs = [Document(content="first doc", id="1"), Document(content="second doc", id="2")]
+        document_store.write_documents(docs)
+&gt;    
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_delete_all_documents_empty_store" time="0.002" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_delete_all_documents_without_recreate_index" time="0.000"><skipped type="pytest.skip" message="delete_all_documents has no recreate_index or recreate_collection parameter">/home/azureuser/fw/venv-hs/lib/python3.12/site-packages/haystack/testing/document_store.py:674: delete_all_documents has no recreate_index or recreate_collection parameter</skipped></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_delete_all_documents_with_recreate_index" time="0.000"><skipped type="pytest.skip" message="delete_all_documents has no recreate_index or recreate_collection parameter">/home/azureuser/fw/venv-hs/lib/python3.12/site-packages/haystack/testing/document_store.py:696: delete_all_documents has no recreate_index or recreate_collection parameter</skipped></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_write_documents_duplicate_overwrite" time="0.003"><failure message="AssertionError">self = &lt;tests.test_document_store.TestValkeyDocumentStore object at 0x7df8da2d0140&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8cc5d90&gt;
+
+    def test_write_documents_duplicate_overwrite(self, document_store: DocumentStore):
+        """Test write_documents() overwrites when using DuplicatePolicy.OVERWRITE."""
+        doc1 = Document(id="1", content="test doc 1")
+        doc2 = Document(id="1", content="test doc 2")
+    
+        assert document_store.write_documents([doc2], policy=DuplicatePolicy.OVERWRITE) == 1
+
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_write_documents_invalid_input" time="0.000" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_count_empty" time="0.002" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_count_not_empty" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8cc6b70&gt;
+
+    @staticmethod
+    def test_count_not_empty(document_store: DocumentStore):
+        """Test count is greater than zero if the document store contains documents"""
+        document_store.write_documents(
+            [Document(content="test doc 1"), Document(content="test doc 2"), Document(content="test doc 3")]
+        )
+&gt;       assert document_store.count_documents() == 3
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError
+
+../../../ve
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_close_and_reopen" time="0.003" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_write_documents" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_haystack_document">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8cc6cc0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_fields_info_empty_collection" time="0.000"><skipped type="pytest.skip" message="Valkey metadata fields are pre-configured at init, not discovered from documents">/home/azureuser/fw/hci/integrations/valkey/tests/test_document_store.py:125: Valkey metadata fields are pre-configured at init, not discovered from documents</skipped></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_write_documents_duplicate_fail" time="0.000"><skipped type="pytest.skip" message="Valkey only supports DuplicatePolicy.OVERWRITE">/home/azureuser/fw/hci/integrations/valkey/tests/test_document_store.py:129: Valkey only supports DuplicatePolicy.OVERWRITE</skipped></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_write_documents_duplicate_skip" time="0.000"><skipped type="pytest.skip" message="Valkey only supports DuplicatePolicy.OVERWRITE">/home/azureuser/fw/hci/integrations/valkey/tests/test_document_store.py:133: Valkey only supports DuplicatePolicy.OVERWRITE</skipped></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_search_by_embedding_no_limit" time="0.004"><failure message="assert 0 == 4&#10; +  where 0 = count_documents()&#10; +    where count_documents = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8c8b440&gt;.count_documents">self = &lt;tests.test_document_store.TestValkeyDocumentStore object at 0x7df8da2d0290&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8c8b440&gt;
+
+    def test_search_by_embedding_no_limit(self, document_store):
+        docs = [
+            Document(
+                id="search1",
+                content="similar content",
+                embedding=[0.1, 0.2, 0.3],
+                meta={"category": "test", "priority": 1},
+                blob=ByteStream(data=b"binary_data", mime_type="application/octet-stream"),
+         
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_search_by_embedding_with_limit" time="0.003"><failure message="assert 0 == 4&#10; +  where 0 = count_documents()&#10; +    where count_documents = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8c8a660&gt;.count_documents">self = &lt;tests.test_document_store.TestValkeyDocumentStore object at 0x7df8da2d0500&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8c8a660&gt;
+
+    def test_search_by_embedding_with_limit(self, document_store):
+        docs = [
+            Document(
+                id="search1",
+                content="similar content",
+                embedding=[0.1, 0.2, 0.3],
+                meta={"category": "test", "priority": 1},
+                blob=ByteStream(data=b"binary_data", mime_type="application/octet-stream"),
+       
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_search_by_embedding_with_category_filter" time="0.004"><failure message="assert 0 == 4&#10; +  where 0 = count_documents()&#10; +    where count_documents = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8c89c40&gt;.count_documents">self = &lt;tests.test_document_store.TestValkeyDocumentStore object at 0x7df8da2d0770&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8c89c40&gt;
+
+    def test_search_by_embedding_with_category_filter(self, document_store):
+        docs = [
+            Document(
+                id="search1",
+                content="similar content",
+                embedding=[0.1, 0.2, 0.3],
+                meta={"category": "test", "priority": 1},
+                blob=ByteStream(data=b"binary_data", mime_type="application/octet-stream"
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_search_by_embedding_with_numeric_filter" time="0.004"><failure message="assert 0 == 2&#10; +  where 0 = len([])">self = &lt;tests.test_document_store.TestValkeyDocumentStore object at 0x7df8da2d09e0&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8c07350&gt;
+
+    def test_search_by_embedding_with_numeric_filter(self, document_store):
+        docs = [
+            Document(id="n1", content="doc 1", embedding=[0.1, 0.2, 0.3], meta={"priority": 1, "score": 0.8}),
+            Document(id="n2", content="doc 2", embedding=[0.2, 0.3, 0.4], meta={"priority": 5, "score": 0.9}),
+            Document(id="n3", content="doc 3", embedding=[0.3, 0
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_search_by_embedding_with_or_filter" time="0.004"><failure message="assert 0 == 2&#10; +  where 0 = len([])">self = &lt;tests.test_document_store.TestValkeyDocumentStore object at 0x7df8da2d0c50&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8c04ce0&gt;
+
+    def test_search_by_embedding_with_or_filter(self, document_store):
+        docs = [
+            Document(
+                id="o1", content="doc 1", embedding=[0.1, 0.2, 0.3], meta={"status": "active", "category": "news"}
+            ),
+            Document(
+                id="o2", content="doc 2", embedding=[0.2, 0.3, 0.4], meta={"status": "pending", "category": "sports"}
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_search_by_embedding_with_in_filter" time="0.004"><failure message="assert 0 == 2&#10; +  where 0 = len([])">self = &lt;tests.test_document_store.TestValkeyDocumentStore object at 0x7df8da2d0ef0&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8c05700&gt;
+
+    def test_search_by_embedding_with_in_filter(self, document_store):
+        docs = [
+            Document(id="i1", content="doc 1", embedding=[0.1, 0.2, 0.3], meta={"status": "active"}),
+            Document(id="i2", content="doc 2", embedding=[0.2, 0.3, 0.4], meta={"status": "pending"}),
+            Document(id="i3", content="doc 3", embedding=[0.3, 0.4, 0.5], meta={"statu
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_search_by_embedding_with_complex_nested_filter" time="0.003"><failure message="assert 0 == 2&#10; +  where 0 = len([])">self = &lt;tests.test_document_store.TestValkeyDocumentStore object at 0x7df8da2d11c0&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8c05f70&gt;
+
+    def test_search_by_embedding_with_complex_nested_filter(self, document_store):
+        docs = [
+            Document(
+                id="c1",
+                content="doc 1",
+                embedding=[0.1, 0.2, 0.3],
+                meta={"category": "news", "priority": 1, "status": "active"},
+            ),
+            Document(
+                id="c2",
+                
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_search_by_embedding_with_not_equal_filter" time="0.003"><failure message="assert 0 == 2&#10; +  where 0 = len([])">self = &lt;tests.test_document_store.TestValkeyDocumentStore object at 0x7df8da2d1490&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8c07e00&gt;
+
+    def test_search_by_embedding_with_not_equal_filter(self, document_store):
+        docs = [
+            Document(id="ne1", content="doc 1", embedding=[0.1, 0.2, 0.3], meta={"category": "news"}),
+            Document(id="ne2", content="doc 2", embedding=[0.2, 0.3, 0.4], meta={"category": "sports"}),
+            Document(id="ne3", content="doc 3", embedding=[0.3, 0.4, 0.5], m
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_search_by_embedding_with_range_filter" time="0.003"><failure message="assert 0 == 1&#10; +  where 0 = len([])">self = &lt;tests.test_document_store.TestValkeyDocumentStore object at 0x7df8da2d1760&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8c07d10&gt;
+
+    def test_search_by_embedding_with_range_filter(self, document_store):
+        docs = [
+            Document(id="r1", content="doc 1", embedding=[0.1, 0.2, 0.3], meta={"timestamp": 100, "priority": 1}),
+            Document(id="r2", content="doc 2", embedding=[0.2, 0.3, 0.4], meta={"timestamp": 800, "priority": 5}),
+            Document(id="r3", content="doc 3", embedding=[
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_search_by_embedding_no_filter_matches" time="0.003" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_filter_documents_by_category" time="0.003"><failure message="assert 0 == 2&#10; +  where 0 = len([])">self = &lt;tests.test_document_store.TestValkeyDocumentStore object at 0x7df8da2b3c50&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8a91190&gt;
+
+    def test_filter_documents_by_category(self, document_store):
+        docs = [
+            Document(id="f1", content="doc 1", meta={"category": "news", "priority": 1}),
+            Document(id="f2", content="doc 2", meta={"category": "sports", "priority": 2}),
+            Document(id="f3", content="doc 3", meta={"category": "news", "priority": 3}),
+        ]
+        documen
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_filter_documents_by_numeric_range" time="0.003"><failure message="assert 0 == 1&#10; +  where 0 = len([])">self = &lt;tests.test_document_store.TestValkeyDocumentStore object at 0x7df8da2b3860&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8a91a60&gt;
+
+    def test_filter_documents_by_numeric_range(self, document_store):
+        docs = [
+            Document(id="n1", content="doc 1", meta={"priority": 1, "score": 0.8}),
+            Document(id="n2", content="doc 2", meta={"priority": 5, "score": 0.9}),
+            Document(id="n3", content="doc 3", meta={"priority": 10, "score": 0.7}),
+        ]
+        document_store.write_
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_filter_documents_with_or_condition" time="0.003"><failure message="assert 0 == 2&#10; +  where 0 = len([])">self = &lt;tests.test_document_store.TestValkeyDocumentStore object at 0x7df8da2d1a60&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8a91f40&gt;
+
+    def test_filter_documents_with_or_condition(self, document_store):
+        docs = [
+            Document(id="o1", content="doc 1", meta={"status": "active", "category": "news"}),
+            Document(id="o2", content="doc 2", meta={"status": "pending", "category": "sports"}),
+            Document(id="o3", content="doc 3", meta={"status": "inactive", "category": "news"}),
+ 
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_filter_documents_with_in_operator" time="0.004"><failure message="assert 0 == 2&#10; +  where 0 = len([])">self = &lt;tests.test_document_store.TestValkeyDocumentStore object at 0x7df8da2d15e0&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8a93410&gt;
+
+    def test_filter_documents_with_in_operator(self, document_store):
+        docs = [
+            Document(id="i1", content="doc 1", meta={"status": "active"}),
+            Document(id="i2", content="doc 2", meta={"status": "pending"}),
+            Document(id="i3", content="doc 3", meta={"status": "inactive"}),
+            Document(id="i4", content="doc 4", meta={"status": "
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_filter_documents_with_not_equal" time="0.004"><failure message="assert 0 == 2&#10; +  where 0 = len([])">self = &lt;tests.test_document_store.TestValkeyDocumentStore object at 0x7df8da2d1100&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8a939e0&gt;
+
+    def test_filter_documents_with_not_equal(self, document_store):
+        docs = [
+            Document(id="ne1", content="doc 1", meta={"category": "news"}),
+            Document(id="ne2", content="doc 2", meta={"category": "sports"}),
+            Document(id="ne3", content="doc 3", meta={"category": "spam"}),
+        ]
+        document_store.write_documents(docs)
+    
+    
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_filter_documents_no_matches" time="0.003" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_filter_documents_no_filters" time="0.003"><failure message="assert 0 == 2&#10; +  where 0 = len([])">self = &lt;tests.test_document_store.TestValkeyDocumentStore object at 0x7df8da2d0920&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8a18c50&gt;
+
+    def test_filter_documents_no_filters(self, document_store):
+        docs = [
+            Document(id="nf1", content="doc 1", meta={"category": "news"}),
+            Document(id="nf2", content="doc 2", meta={"category": "sports"}),
+        ]
+        document_store.write_documents(docs)
+    
+        results = document_store.filter_documents(None)
+    
+&gt;       assert len(r
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_filter_documents_complex_nested" time="0.003"><failure message="assert 0 == 2&#10; +  where 0 = len([])">self = &lt;tests.test_document_store.TestValkeyDocumentStore object at 0x7df8da2d0710&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8a18e90&gt;
+
+    def test_filter_documents_complex_nested(self, document_store):
+        docs = [
+            Document(id="c1", content="doc 1", meta={"category": "news", "priority": 1, "status": "active"}),
+            Document(id="c2", content="doc 2", meta={"category": "news", "priority": 5, "status": "pending"}),
+            Document(id="c3", content="doc 3", meta={"category": "sports"
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_similarity_scores_are_set_correctly" time="0.003"><failure message="assert 0 == 4&#10; +  where 0 = len([])">self = &lt;tests.test_document_store.TestValkeyDocumentStore object at 0x7df8da2d0110&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8a19b50&gt;
+
+    def test_similarity_scores_are_set_correctly(self, document_store):
+        """Test that similarity scores are properly computed and set for all returned documents."""
+        docs = [
+            Document(id="sim1", content="identical vector", embedding=[1.0, 0.0, 0.0]),
+            Document(id="sim2", content="similar vector", embedding=[0.9, 0.1, 0.0]),
+            Docu
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_filter_by_meta_score" time="0.003"><failure message="assert 0 == 2&#10; +  where 0 = len([])">self = &lt;tests.test_document_store.TestValkeyDocumentStore object at 0x7df8da2d1d30&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8a1a1e0&gt;
+
+    def test_filter_by_meta_score(self, document_store):
+        """Test filtering by user-provided meta.score values."""
+        docs = [
+            Document(id="ms1", content="doc 1", embedding=[0.1, 0.2, 0.3], meta={"score": 0.9, "category": "high"}),
+            Document(id="ms2", content="doc 2", embedding=[0.2, 0.3, 0.4], meta={"score": 0.5, "category": "medium"}),
+    
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_search_with_meta_score_filter" time="0.003"><failure message="assert 0 == 3&#10; +  where 0 = len([])">self = &lt;tests.test_document_store.TestValkeyDocumentStore object at 0x7df8da2d2030&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8a1b350&gt;
+
+    def test_search_with_meta_score_filter(self, document_store):
+        """Test vector search combined with meta.score filtering."""
+        docs = [
+            Document(
+                id="sms1", content="doc 1", embedding=[1.0, 0.0, 0.0], meta={"score": 0.9, "quality": "excellent"}
+            ),
+            Document(id="sms2", content="doc 2", embedding=[0.9, 0.1, 0.0],
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_count_documents_by_filter" time="0.003"><failure message="AssertionError: assert 0 == 2&#10; +  where 0 = count_documents_by_filter({'operator': 'AND', 'conditions': [{'field': 'meta.category', 'operator': '==', 'value': 'a'}]})&#10; +    where count_documents_by_filter = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8a3b530&gt;.count_documents_by_filter">self = &lt;tests.test_document_store.TestValkeyDocumentStore object at 0x7df8da2d2300&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8a3b530&gt;
+
+    def test_count_documents_by_filter(self, document_store):
+        """Test counting documents that match a filter."""
+        docs = [
+            Document(id="cbf1", content="doc 1", embedding=[0.1, 0.2, 0.3], meta={"category": "a", "priority": 1}),
+            Document(id="cbf2", content="doc 2", embedding=[0.2, 0.3, 0.4], meta={"category": "b", "priority": 2}),
+         
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_count_unique_metadata_by_filter" time="0.004"><failure message="assert 0 == 2">self = &lt;tests.test_document_store.TestValkeyDocumentStore object at 0x7df8da2d25d0&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8a385c0&gt;
+
+    def test_count_unique_metadata_by_filter(self, document_store):
+        """Test counting unique values per metadata field for documents matching a filter."""
+        docs = [
+            Document(id="cumb1", content="doc 1", embedding=[0.1, 0.2, 0.3], meta={"category": "tech", "priority": 1}),
+            Document(id="cumb2", content="doc 2", embedding=[0.2, 0.3, 0.4], met
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_count_unique_metadata_by_filter_empty_result" time="0.003" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_fields_info" time="0.000" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_min_max" time="0.003"><failure message="assert None == 5">self = &lt;tests.test_document_store.TestValkeyDocumentStore object at 0x7df8da2d2e40&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8a3b320&gt;
+
+    def test_get_metadata_field_min_max(self, document_store):
+        """Test get_metadata_field_min_max for a numeric field."""
+        docs = [
+            Document(id="gmm1", content="doc 1", embedding=[0.1, 0.2, 0.3], meta={"priority": 10, "category": "a"}),
+            Document(id="gmm2", content="doc 2", embedding=[0.2, 0.3, 0.4], meta={"priority": 5, "category": "b"}),
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_min_max_empty_store" time="0.002" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_min_max_non_numeric_raises" time="0.000" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_get_metadata_field_min_max_unknown_field_raises" time="0.000" /><testcase classname="tests.test_document_store.TestValkeyDocumentStore" name="test_count_unique_metadata_by_filter_invalid_field_raises" time="0.002" /><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_unique_values_basic_async" time="0.014"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df903f9af30&gt;
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_get_metadata_field_unique_values_basic_async(document_store: AsyncDocumentStore):
+        """Test get_metadata_field_unique_values_async() returns unique values and total count."""
+        docs = [
+            Document(content="Doc 1", meta={"category": "A"}),
+            Document(content="Doc 2", meta={"category": "B"}),
+            Document(content="Doc 3", meta={"category": "A"}),
+            Document
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_unique_values_meta_prefix_async" time="0.004" /><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_unique_values_search_term_async" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8a36510&gt;
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_get_metadata_field_unique_values_search_term_async(document_store: AsyncDocumentStore):
+        """Test get_metadata_field_unique_values_async() filters by a case-insensitive substring of the value."""
+        docs = [
+            Document(content="Doc 1", meta={"category": "All_Beauty"}),
+            Document(content="Doc 2", meta={"category": "Electronics"}),
+            # the content mentions "beaut" 
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_unique_values_pagination_async" time="0.004"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8a37500&gt;
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_get_metadata_field_unique_values_pagination_async(document_store: AsyncDocumentStore):
+        """Test get_metadata_field_unique_values_async() paginates a stable ordering via from_/size."""
+        docs = [Document(content=f"Doc {i}", meta={"category": f"category_{i}"}) for i in range(5)]
+        await document_store.write_documents_async(docs)
+    
+        all_values = sorted(f"category_{i}" for i in r
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_unique_values_empty_store_async" time="0.002" /><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_unique_values_missing_field_async" time="0.003" /><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_unique_values_preserves_type_async" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8b78ad0&gt;
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_get_metadata_field_unique_values_preserves_type_async(document_store: AsyncDocumentStore):
+        """Test get_metadata_field_unique_values_async() returns values in their original (non-string) type."""
+        docs = [
+            Document(content="Doc 1", meta={"priority": 1}),
+            Document(content="Doc 2", meta={"priority": 2}),
+            Document(content="Doc 3", meta={"priority": 1}),
+    
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_unique_values_distinct_types_async" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8b78500&gt;
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_get_metadata_field_unique_values_distinct_types_async(document_store: AsyncDocumentStore):
+        """
+        Test get_metadata_field_unique_values_async() doesn't collapse values that share a string form.
+    
+        Example: the int 1, the float 1.0, the str "1" and the bool True must be counted and returned as
+        distinct values.
+        """
+        docs = [
+            Document(content="Doc 1"
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_unique_values_with_filters_async" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8b78410&gt;
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_get_metadata_field_unique_values_with_filters_async(document_store: AsyncDocumentStore):
+        """Test get_metadata_field_unique_values_async() restricts documents using the filters param."""
+        docs = [
+            Document(content="Doc 1", meta={"category": "A", "status": "active"}),
+            Document(content="Doc 2", meta={"category": "B", "status": "active"}),
+            Document(content="
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_min_max_numeric_async" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8b7a900&gt;
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_get_metadata_field_min_max_numeric_async(document_store: AsyncDocumentStore):
+        """Test get_metadata_field_min_max_async() with integer field."""
+        # The min and max are deliberately not the first or last written values, so an implementation
+        # returning values by insertion order fails. Keeping both 10 and 5 catches implementations that
+        # compare numbers as strings ("10" &lt; "
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_min_max_float_async" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8b7a7b0&gt;
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_get_metadata_field_min_max_float_async(document_store: AsyncDocumentStore):
+        """Test get_metadata_field_min_max_async() with float field."""
+        # The min and max are deliberately not the first or last written values.
+        docs = [
+            Document(content="Doc 1", meta={"rating": 0.8}),
+            Document(content="Doc 2", meta={"rating": 0.6}),
+            Document(content="Doc 3", m
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_min_max_single_value_async" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8b30230&gt;
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_get_metadata_field_min_max_single_value_async(document_store: AsyncDocumentStore):
+        """Test get_metadata_field_min_max_async() when field has only one value."""
+        docs = [Document(content="Doc 1", meta={"priority": 42})]
+        await document_store.write_documents_async(docs)
+&gt;       assert await document_store.count_documents_async() == 1
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_min_max_empty_collection_async" time="0.002" /><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_min_max_meta_prefix_async" time="0.004"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8b31730&gt;
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_get_metadata_field_min_max_meta_prefix_async(document_store: AsyncDocumentStore):
+        """Test get_metadata_field_min_max_async() with field names that include 'meta.' prefix."""
+        # The min and max of each field are deliberately not the first or last written values.
+        docs = [
+            Document(content="Doc 1", meta={"priority": 5, "age": 10}),
+            Document(content="Doc 2", met
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_count_unique_metadata_by_filter_async_all_documents" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8b32600&gt;
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_count_unique_metadata_by_filter_async_all_documents(document_store: AsyncDocumentStore):
+        """Test count_unique_metadata_by_filter_async() with no filter returns distinct counts for all docs."""
+        docs = [
+            Document(content="Doc 1", meta={"category": "A", "status": "active", "priority": 1}),
+            Document(content="Doc 2", meta={"category": "B", "status": "active", "priority"
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_count_unique_metadata_by_filter_async_with_filter" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8b334d0&gt;
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_count_unique_metadata_by_filter_async_with_filter(document_store: AsyncDocumentStore):
+        """Test count_unique_metadata_by_filter_async() with a filter."""
+        # The filtered-out document carries extra unique values, so the counts only come out right
+        # when the store actually applies the filter.
+        docs = [
+            Document(content="Doc 1", meta={"category": "A", "status": "acti
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_count_documents_by_filter_async_simple" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8b33cb0&gt;
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_count_documents_by_filter_async_simple(document_store: AsyncDocumentStore):
+        """Test count_documents_by_filter_async() with a simple equality filter."""
+        docs = [
+            Document(content="Doc 1", meta={"category": "A", "status": "active"}),
+            Document(content="Doc 2", meta={"category": "B", "status": "active"}),
+            Document(content="Doc 3", meta={"category": "A", "st
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_count_documents_by_filter_async_compound" time="0.004"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8b0cb90&gt;
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_count_documents_by_filter_async_compound(document_store: AsyncDocumentStore):
+        """Test count_documents_by_filter_async() with AND filter."""
+        docs = [
+            Document(content="Doc 1", meta={"category": "A", "status": "active"}),
+            Document(content="Doc 2", meta={"category": "B", "status": "active"}),
+            Document(content="Doc 3", meta={"category": "A", "status": "inac
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_count_documents_by_filter_async_no_matches" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8b0daf0&gt;
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_count_documents_by_filter_async_no_matches(document_store: AsyncDocumentStore):
+        """Test count_documents_by_filter_async() when filter matches no documents."""
+        docs = [Document(content="Doc 1", meta={"category": "A"}), Document(content="Doc 2", meta={"category": "B"})]
+        await document_store.write_documents_async(docs)
+&gt;       assert await document_store.count_documents_async() ==
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_count_documents_by_filter_async_empty_collection" time="0.003" /><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_delete_by_filter_async" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8b0ede0&gt;
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_delete_by_filter_async(document_store: AsyncDocumentStore):
+        """Delete documents matching a filter and verify count and remaining docs."""
+        docs = [
+            Document(content="Doc 1", meta={"category": "Alpha"}),
+            Document(content="Doc 2", meta={"category": "Beta"}),
+            Document(content="Doc 3", meta={"category": "Alpha"}),
+        ]
+        await document_store.write
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_delete_by_filter_no_matches_async" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8b0ffb0&gt;
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_delete_by_filter_no_matches_async(document_store: AsyncDocumentStore):
+        """Delete with a filter that matches no documents returns 0 and leaves store unchanged."""
+        docs = [
+            Document(content="Doc 1", meta={"category": "Alpha"}),
+            Document(content="Doc 2", meta={"category": "Beta"}),
+        ]
+        await document_store.write_documents_async(docs)
+&gt;       assert aw
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_delete_by_filter_advanced_filters_async" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8b084a0&gt;
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_delete_by_filter_advanced_filters_async(document_store: AsyncDocumentStore):
+        """Delete with AND/OR filter combinations and verify remaining documents."""
+        docs = [
+            Document(content="Doc 1", meta={"category": "Alpha", "year": 2023, "status": "draft"}),
+            Document(content="Doc 2", meta={"category": "Alpha", "year": 2024, "status": "published"}),
+            Document(con
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_delete_all_documents_async" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8b09430&gt;
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_delete_all_documents_async(document_store: AsyncDocumentStore):
+        """
+        Test delete_all_documents_async() normal behaviour.
+    
+        This test verifies that delete_all_documents_async() removes all documents from the store
+        and that the store remains functional after deletion.
+        """
+        docs = [Document(content="first doc", id="1"), Document(content="second doc", id="2")]
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_delete_all_documents_empty_store_async" time="0.002" /><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_delete_all_documents_without_recreate_index_async" time="0.001"><skipped type="pytest.skip" message="delete_all_documents_async has no recreate_index or recreate_collection parameter">/home/azureuser/fw/venv-hs/lib/python3.12/site-packages/haystack/testing/document_store_async.py:105: delete_all_documents_async has no recreate_index or recreate_collection parameter</skipped></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_delete_all_documents_with_recreate_index_async" time="0.001"><skipped type="pytest.skip" message="delete_all_documents_async has no recreate_index or recreate_collection parameter">/home/azureuser/fw/venv-hs/lib/python3.12/site-packages/haystack/testing/document_store_async.py:128: delete_all_documents_async has no recreate_index or recreate_collection parameter</skipped></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_delete_documents_async" time="0.004"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d89e4110&gt;
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_delete_documents_async(document_store: AsyncDocumentStore):
+        """Test delete_documents_async() normal behaviour."""
+        doc = Document(content="test doc")
+        await document_store.write_documents_async([doc])
+&gt;       assert await document_store.count_documents_async() == 1
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError
+
+../../../venv-hs/lib/python
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_delete_documents_empty_document_store_async" time="0.002" /><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_delete_documents_non_existing_document_async" time="0.003"><failure message="AssertionError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8b09580&gt;
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_delete_documents_non_existing_document_async(document_store: AsyncDocumentStore):
+        """Test delete_documents_async() doesn't delete any Document when called with non-existing id."""
+        doc = Document(content="test doc")
+        await document_store.write_documents_async([doc])
+&gt;       assert await document_store.count_documents_async() == 1
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_write_documents_duplicate_overwrite_async" time="0.004"><failure message="AssertionError">self = &lt;tests.test_document_store_async.TestValkeyDocumentStoreAsync object at 0x7df8d9322660&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d89e4710&gt;
+
+    @pytest.mark.asyncio
+    async def test_write_documents_duplicate_overwrite_async(self, document_store: AsyncDocumentStore):
+        """Test write_documents_async() overwrites when using DuplicatePolicy.OVERWRITE."""
+        doc1 = Document(id="1", content="test doc 1")
+        doc2 = Document(id="1", content="test doc 2")
+    
+        assert await document_stor
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_write_documents_invalid_input_async" time="0.001" /><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_count_empty_async" time="0.002" /><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_close_async_and_reopen" time="0.003" /><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_count_not_empty_async" time="0.003"><failure message="assert 0 == 3">self = &lt;tests.test_document_store_async.TestValkeyDocumentStoreAsync object at 0x7df8da302d20&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d89e66c0&gt;
+
+    @pytest.mark.asyncio
+    async def test_count_not_empty_async(self, document_store):
+        """Test count is greater than zero if the document store contains documents."""
+        await document_store.write_documents_async(
+            [Document(content="test doc 1"), Document(content="test doc 2"), Document(content="test doc 3")]
+        )
+&gt;       assert aw
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_write_documents_async" time="0.003" /><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_write_documents_duplicate_fail_async" time="0.001"><skipped type="pytest.skip" message="ValkeyDocumentStore does not support DuplicatePolicy.FAIL">/home/azureuser/fw/hci/integrations/valkey/tests/test_document_store_async.py:132: ValkeyDocumentStore does not support DuplicatePolicy.FAIL</skipped></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_write_documents_duplicate_skip_async" time="0.001"><skipped type="pytest.skip" message="ValkeyDocumentStore does not support DuplicatePolicy.SKIP">/home/azureuser/fw/hci/integrations/valkey/tests/test_document_store_async.py:136: ValkeyDocumentStore does not support DuplicatePolicy.SKIP</skipped></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_update_by_filter_async" time="0.004"><failure message="assert 0 == 2">self = &lt;tests.test_document_store_async.TestValkeyDocumentStoreAsync object at 0x7df8d93203b0&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d89d8fe0&gt;
+
+    @pytest.mark.asyncio
+    async def test_update_by_filter_async(self, document_store):
+        """Override: use declared metadata fields (category, priority) instead of filterable_docs fixture."""
+        test_id = str(uuid.uuid4())[:8]
+        docs = [
+            Document(
+                id=f"u1_{test_id}", content="doc 1", embedding=[0.1, 0.2, 0.3], meta={"ca
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_count_unique_metadata_by_filter_async_with_multiple_filters" time="0.004"><failure message="assert 0 == 1">self = &lt;tests.test_document_store_async.TestValkeyDocumentStoreAsync object at 0x7df8d9320710&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d89e6a50&gt;
+
+    @pytest.mark.asyncio
+    async def test_count_unique_metadata_by_filter_async_with_multiple_filters(self, document_store):
+        """Override: use declared metadata fields (category, priority) instead of year."""
+        test_id = str(uuid.uuid4())[:8]
+        docs = [
+            Document(id=f"cu1_{test_id}", content="doc 1", meta={"category": "A", "priority":
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_async_write_exceed_batch_size" time="0.003"><failure message="assert 0 == 6">self = &lt;tests.test_document_store_async.TestValkeyDocumentStoreAsync object at 0x7df8d9320a70&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d89db380&gt;
+
+    async def test_async_write_exceed_batch_size(self, document_store):
+        test_id = str(uuid.uuid4())[:8]
+        docs = [
+            Document(id=f"async1_{test_id}", content="async test doc 1", embedding=[0.1, 0.2, 0.3]),
+            Document(id=f"async2_{test_id}", content="async test doc 2", embedding=[0.4, 0.5, 0.6]),
+            Document(id=f"async3_{tes
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_async_write_exact_batch_size" time="0.003"><failure message="assert 0 == 5">self = &lt;tests.test_document_store_async.TestValkeyDocumentStoreAsync object at 0x7df8d9320dd0&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d89d88f0&gt;
+
+    async def test_async_write_exact_batch_size(self, document_store):
+        """Test writing exactly batch_size documents (5)"""
+        test_id = str(uuid.uuid4())[:8]
+        docs = [Document(id=f"exact_{i}_{test_id}", content=f"doc {i}") for i in range(5)]
+    
+        result = await document_store.write_documents_async(docs)
+        assert result == 5
+    
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_async_write_multiple_full_batches" time="0.004"><failure message="assert 0 == 11">self = &lt;tests.test_document_store_async.TestValkeyDocumentStoreAsync object at 0x7df8d9321130&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d89dafc0&gt;
+
+    async def test_async_write_multiple_full_batches(self, document_store):
+        """Test writing multiple full batches (11 docs = 2 full + 1 partial)"""
+        test_id = str(uuid.uuid4())[:8]
+        docs = [Document(id=f"multi_{i}_{test_id}", content=f"doc {i}") for i in range(11)]
+    
+        result = await document_store.write_documents_async(docs)
+        a
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_async_search_by_embedding_no_limit" time="0.003"><failure message="assert 0 == 4">self = &lt;tests.test_document_store_async.TestValkeyDocumentStoreAsync object at 0x7df8d9321490&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d896bd70&gt;
+
+    async def test_async_search_by_embedding_no_limit(self, document_store):
+        test_id = str(uuid.uuid4())[:8]
+        docs = [
+            Document(
+                id=f"search1_{test_id}",
+                content="similar content",
+                embedding=[0.1, 0.2, 0.3],
+                meta={"category": "test", "priority": 1},
+                blob=ByteSt
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_async_search_by_embedding_with_limit" time="0.004"><failure message="assert 0 == 4">self = &lt;tests.test_document_store_async.TestValkeyDocumentStoreAsync object at 0x7df8d93217f0&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8969130&gt;
+
+    async def test_async_search_by_embedding_with_limit(self, document_store):
+        test_id = str(uuid.uuid4())[:8]
+        docs = [
+            Document(
+                id=f"search1_{test_id}",
+                content="similar content",
+                embedding=[0.1, 0.2, 0.3],
+                meta={"category": "test", "priority": 1},
+                blob=Byte
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_async_search_by_embedding_with_category_filter" time="0.003"><failure message="assert 0 == 4">self = &lt;tests.test_document_store_async.TestValkeyDocumentStoreAsync object at 0x7df8da303b90&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8969b50&gt;
+
+    async def test_async_search_by_embedding_with_category_filter(self, document_store):
+        test_id = str(uuid.uuid4())[:8]
+        docs = [
+            Document(
+                id=f"search1_{test_id}",
+                content="similar content",
+                embedding=[0.1, 0.2, 0.3],
+                meta={"category": "test", "priority": 1},
+               
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_async_search_by_embedding_with_numeric_filter" time="0.003"><failure message="assert 0 == 2&#10; +  where 0 = len([])">self = &lt;tests.test_document_store_async.TestValkeyDocumentStoreAsync object at 0x7df8da303920&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8969190&gt;
+
+    async def test_async_search_by_embedding_with_numeric_filter(self, document_store):
+        test_id = str(uuid.uuid4())[:8]
+        docs = [
+            Document(
+                id=f"n1_{test_id}", content="doc 1", embedding=[0.1, 0.2, 0.3], meta={"priority": 1, "score": 0.8}
+            ),
+            Document(
+                id=f"n2_{test_id}", content="doc 
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_async_search_by_embedding_with_or_filter" time="0.004"><failure message="assert 0 == 2&#10; +  where 0 = len([])">self = &lt;tests.test_document_store_async.TestValkeyDocumentStoreAsync object at 0x7df8d9321820&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d896a570&gt;
+
+    async def test_async_search_by_embedding_with_or_filter(self, document_store):
+        test_id = str(uuid.uuid4())[:8]
+        docs = [
+            Document(
+                id=f"o1_{test_id}",
+                content="doc 1",
+                embedding=[0.1, 0.2, 0.3],
+                meta={"status": "active", "category": "news"},
+            ),
+            Docu
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_async_search_by_embedding_with_in_filter" time="0.003"><failure message="assert 0 == 2&#10; +  where 0 = len([])">self = &lt;tests.test_document_store_async.TestValkeyDocumentStoreAsync object at 0x7df8d93212b0&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d89b3710&gt;
+
+    async def test_async_search_by_embedding_with_in_filter(self, document_store):
+        test_id = str(uuid.uuid4())[:8]
+        docs = [
+            Document(id=f"i1_{test_id}", content="doc 1", embedding=[0.1, 0.2, 0.3], meta={"status": "active"}),
+            Document(id=f"i2_{test_id}", content="doc 2", embedding=[0.2, 0.3, 0.4], meta={"status": "pending"}),
+ 
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_async_write_large_batch_performance" time="0.005"><failure message="assert 0 == 23">self = &lt;tests.test_document_store_async.TestValkeyDocumentStoreAsync object at 0x7df8d9320e90&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d89b0c20&gt;
+
+    async def test_async_write_large_batch_performance(self, document_store):
+        """Test writing large number of documents to verify batching performance"""
+        test_id = str(uuid.uuid4())[:8]
+        # 23 documents = 4 full batches (5 each) + 1 partial batch (3)
+        docs = [Document(id=f"perf_{i}_{test_id}", content=f"performance doc {i}") for i in ran
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_async_similarity_scores_are_set_correctly" time="0.003"><failure message="assert 0 == 4&#10; +  where 0 = len([])">self = &lt;tests.test_document_store_async.TestValkeyDocumentStoreAsync object at 0x7df8d9320950&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d89b0b90&gt;
+
+    async def test_async_similarity_scores_are_set_correctly(self, document_store):
+        """Test that similarity scores are properly computed and set for all returned documents in async mode."""
+        test_id = str(uuid.uuid4())[:8]
+        docs = [
+            Document(id=f"sim1_{test_id}", content="identical vector", embedding=[1.0, 0.0, 0.0]),
+            Do
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_async_filter_by_meta_score" time="0.003"><failure message="assert 0 == 2&#10; +  where 0 = len([])">self = &lt;tests.test_document_store_async.TestValkeyDocumentStoreAsync object at 0x7df8d93206e0&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d89b2db0&gt;
+
+    async def test_async_filter_by_meta_score(self, document_store):
+        """Test filtering by user-provided meta.score values in async mode."""
+        test_id = str(uuid.uuid4())[:8]
+        docs = [
+            Document(
+                id=f"ms1_{test_id}", content="doc 1", embedding=[0.1, 0.2, 0.3], meta={"score": 0.9, "category": "high"}
+            ),
+     
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_async_search_with_meta_score_filter" time="0.003"><failure message="assert 0 == 3&#10; +  where 0 = len([])">self = &lt;tests.test_document_store_async.TestValkeyDocumentStoreAsync object at 0x7df8d93218b0&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d89dc140&gt;
+
+    async def test_async_search_with_meta_score_filter(self, document_store):
+        """Test vector search combined with meta.score filtering in async mode."""
+        test_id = str(uuid.uuid4())[:8]
+        docs = [
+            Document(
+                id=f"sms1_{test_id}",
+                content="doc 1",
+                embedding=[1.0, 0.0, 0.0],
+              
+[... cut ...]</failure></testcase><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_fields_info_async" time="0.001" /><testcase classname="tests.test_document_store_async.TestValkeyDocumentStoreAsync" name="test_get_metadata_field_min_max_empty_store_async" time="0.002" /><testcase classname="tests.test_embedding_retriever.TestValkeyEmbeddingRetriever" name="test_run" time="0.003"><failure message="assert 0 == 2&#10; +  where 0 = len([])">self = &lt;tests.test_embedding_retriever.TestValkeyEmbeddingRetriever object at 0x7df8da2eac60&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d89dc500&gt;
+sample_documents = [Document(id=e8a3b62b0795ab11cd1dba84c8aea3d1c96af05225f5b87c40e740b2b97fef49, content: 'Document 1', meta: {'category...88e7fe5e19d5a312d4c7e6226, content: 'Document 3', meta: {'category': 'A', 'priority': 3}, embedding: vector of size 3)]
+
+    @pytest.mark.integration
+    def test_run(self, document_store, sample_documents):
+        document_store
+[... cut ...]</failure></testcase><testcase classname="tests.test_embedding_retriever.TestValkeyEmbeddingRetriever" name="test_run_with_filters" time="0.002"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d89dc2f0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_embedding_retriever.TestValkeyEmbeddingRetriever" name="test_run_with_top_k_override" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d89decc0&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_embedding_retriever.TestValkeyEmbeddingRetriever" name="test_run_empty_store" time="0.002" /><testcase classname="tests.test_embedding_retriever.TestValkeyEmbeddingRetriever" name="test_run_with_filter_policy_merge" time="0.003"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d89a3110&gt;
+
+    def _create_index(self) -&gt; None:
+        client = self._get_connection()
+    
+        try:
+            if self._has_index():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = sync_ft.create(client, self._index_name, fields, options)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[... cut ...]</failure></testcase><testcase classname="tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync" name="test_run_async" time="0.004"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d89a3e60&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync" name="test_run_async_with_filters" time="0.004"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8871a00&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync" name="test_run_async_with_top_k_override" time="0.004"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8871ca0&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync" name="test_run_async_empty_store" time="0.004" /><testcase classname="tests.test_embedding_retriever.TestValkeyEmbeddingRetrieverAsync" name="test_run_async_with_filter_policy_merge" time="0.004"><failure message="haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStoreError: Error creating collection test_retriever">self = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d88d4380&gt;
+
+    async def _create_index_async(self) -&gt; None:
+        try:
+            client = await self._get_connection_async()
+    
+            if await self._has_index_async():
+                logger.info("Index {index_name} already exists", index_name=self._index_name)
+                return
+    
+            fields = self._prepare_index_fields()
+            options = FtCreateOptions(DataType.JSON)
+&gt;           ok = await ft.create(client, self._index_name, fields, options)
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_no_filters" time="0.004"><failure message="AssertionError: assert [] == [Document(id=...: 'test doc')]&#10;  &#10;  Right contains one more item: Document(id=657fb193c73ab574d2d920d5fde04d5a786dc0b2df9bc5f154763afd2d9530bb, content: 'test doc')&#10;  Use -v to get more diff">self = &lt;tests.test_filters.TestFilters object at 0x7df8d9381910&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d88d5b50&gt;
+
+    def test_no_filters(self, document_store):
+        """Test filter_documents() with empty filters"""
+        self.assert_documents_are_equal(document_store.filter_documents(), [])
+        self.assert_documents_are_equal(document_store.filter_documents(filters={}), [])
+        docs = [Document(content="test doc")]
+        document_store.write_documents(docs)
+&gt;       self.assert_documents_ar
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_equal" time="0.018" /><testcase classname="tests.test_filters.TestFilters" name="test_comparison_equal_with_none" time="0.018"><failure message="AssertionError: assert [] == [Document(id=...ize 768), ...]&#10;  &#10;  Right contains 9 more items, first extra item: Document(id=38acf5c539056d920b9830d22e04f618f66f16565c60a45a9f2855b45200ec79, content: 'Document 1 without embedding', meta: {'name': 'name_1', 'no_embedding': True, 'chapter': 'conclusion'})&#10;  Use -v to get more diff">self = &lt;tests.test_filters.TestFilters object at 0x7df8d9383050&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d88d7b90&gt;
+filterable_docs = [Document(id=153258ef976b0ed552ff885dabdc1b56718df77211ba46ea1a68a467c7cd6a4a, content: 'A Foo Document 0', meta: {'na...563afd7201e6286e4af15, content: 'Doc 0 with ones emb', meta: {'name': 'ones_doc'}, embedding: vector of size 768), ...]
+
+    def test_comparison_equal_with_none(self, document_store, filterable_docs):
+        """Test filter_documents() with == comparator and N
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_not_equal" time="0.018"><failure message="AssertionError: assert [] == [Document(id=...ize 768), ...]&#10;  &#10;  Right contains 18 more items, first extra item: Document(id=38acf5c539056d920b9830d22e04f618f66f16565c60a45a9f2855b45200ec79, content: 'Document 1 without embedding', meta: {'name': 'name_1', 'no_embedding': True, 'chapter': 'conclusion'})&#10;  Use -v to get more diff">self = &lt;tests.test_filters.TestFilters object at 0x7df8d93832f0&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d888f560&gt;
+filterable_docs = [Document(id=f7c8a6237fcc2f40068450faed098809d42cff6cc6925862d03fff5898b5284a, content: 'A Foo Document 0', meta: {'na...563afd7201e6286e4af15, content: 'Doc 0 with ones emb', meta: {'name': 'ones_doc'}, embedding: vector of size 768), ...]
+
+    def test_comparison_not_equal(self, document_store, filterable_docs):
+        """Test filter_documents() with != comparator"""
+        
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_not_equal_with_none" time="0.017"><failure message="AssertionError: assert [] == [Document(id=...ize 768), ...]&#10;  &#10;  Right contains 9 more items, first extra item: Document(id=14fbaa14e9b4c17117dbd21f95b4aa91d1355e945a4bf099ba829abedb05024a, content: 'A Foobar Document 2', meta: {'...', 'page': '90', 'chapter': 'conclusion', 'number': -10, 'date': '1989-11-09T17:53:00'}, embedding: vector of size 768)&#10;  Use -v to get more diff">self = &lt;tests.test_filters.TestFilters object at 0x7df8d9383590&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d888d730&gt;
+filterable_docs = [Document(id=52250bafa33dc1216327d7e6b5e8a8e1f164292a4fca2ee6119a9c3abb5fa110, content: 'A Foo Document 0', meta: {'na...563afd7201e6286e4af15, content: 'Doc 0 with ones emb', meta: {'name': 'ones_doc'}, embedding: vector of size 768), ...]
+
+    def test_comparison_not_equal_with_none(self, document_store, filterable_docs):
+        """Test filter_documents() with != comparator a
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_greater_than" time="0.018"><failure message="AssertionError: assert [] == [Document(id=... of size 768)]&#10;  &#10;  Right contains 3 more items, first extra item: Document(id=0c10f993c75bccd0f1745a00548e1afe5f86032496ee49b0e05390746ae52fdd, content: 'A Foo Document 1', meta: {'nam...name_1', 'page': '100', 'chapter': 'intro', 'number': 2, 'date': '1969-07-21T20:17:40'}, embedding: vector of size 768)&#10;  Use -v to get more diff">self = &lt;tests.test_filters.TestFilters object at 0x7df8d9383830&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d888ea20&gt;
+filterable_docs = [Document(id=0efd1ba4b584f3d6d8d42d699f94b71314c9c00d3521ab5f335dcab7a39f3cdf, content: 'A Foo Document 0', meta: {'na...563afd7201e6286e4af15, content: 'Doc 0 with ones emb', meta: {'name': 'ones_doc'}, embedding: vector of size 768), ...]
+
+    def test_comparison_greater_than(self, document_store, filterable_docs):
+        """Test filter_documents() with &gt; comparator"""
+   
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_greater_than_equal" time="0.019"><failure message="AssertionError: assert [] == [Document(id=... of size 768)]&#10;  &#10;  Right contains 3 more items, first extra item: Document(id=14febc0eea376b3e2c6a9a0d616e6ceabd99908fa21c53df345b779083534ba4, content: 'A Foo Document 1', meta: {'nam...name_1', 'page': '100', 'chapter': 'intro', 'number': 2, 'date': '1969-07-21T20:17:40'}, embedding: vector of size 768)&#10;  Use -v to get more diff">self = &lt;tests.test_filters.TestFilters object at 0x7df8d9383ad0&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d860af90&gt;
+filterable_docs = [Document(id=ca894cc40009b0b9b11cf88d146ddf206dd0aa3276f5b9b5e1a28ceeae2907d3, content: 'A Foo Document 0', meta: {'na...563afd7201e6286e4af15, content: 'Doc 0 with ones emb', meta: {'name': 'ones_doc'}, embedding: vector of size 768), ...]
+
+    def test_comparison_greater_than_equal(self, document_store, filterable_docs):
+        """Test filter_documents() with &gt;= comparator
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_less_than" time="0.017"><failure message="AssertionError: assert [] == [Document(id=... of size 768)]&#10;  &#10;  Right contains 6 more items, first extra item: Document(id=5c3e2ae3c6d19150a6b6d05da0af725e01aaaa8e24a88c62a509496f10d5d0dd, content: 'A Bar Document 0', meta: {'nam..._0', 'page': '123', 'chapter': 'abstract', 'number': -2, 'date': '1972-12-11T19:54:58'}, embedding: vector of size 768)&#10;  Use -v to get more diff">self = &lt;tests.test_filters.TestFilters object at 0x7df8d9343890&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8608800&gt;
+filterable_docs = [Document(id=4b6e483691aed656279b5f2e8ca71f4122e7eef74445cc17d77d01521187174d, content: 'A Foo Document 0', meta: {'na...563afd7201e6286e4af15, content: 'Doc 0 with ones emb', meta: {'name': 'ones_doc'}, embedding: vector of size 768), ...]
+
+    def test_comparison_less_than(self, document_store, filterable_docs):
+        """Test filter_documents() with &lt; comparator"""
+      
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_less_than_equal" time="0.017"><failure message="AssertionError: assert [] == [Document(id=... of size 768)]&#10;  &#10;  Right contains 6 more items, first extra item: Document(id=0953427e54fb26dac9521472b819945e46f2c7110905c660ec43695cdffd27c1, content: 'A Bar Document 1', meta: {'nam..._1', 'page': '123', 'chapter': 'abstract', 'number': -2, 'date': '1972-12-11T19:54:58'}, embedding: vector of size 768)&#10;  Use -v to get more diff">self = &lt;tests.test_filters.TestFilters object at 0x7df8d9321f10&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d8609c10&gt;
+filterable_docs = [Document(id=8daf5d36147ca57792bef0bd70c1620cbc3764c4ddf9d13bfeb12b7d16c9a874, content: 'A Foo Document 0', meta: {'na...563afd7201e6286e4af15, content: 'Doc 0 with ones emb', meta: {'name': 'ones_doc'}, embedding: vector of size 768), ...]
+
+    def test_comparison_less_than_equal(self, document_store, filterable_docs):
+        """Test filter_documents() with &lt;="""
+        do
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_in" time="0.018"><failure message="AssertionError">self = &lt;tests.test_filters.TestFilters object at 0x7df8d93837a0&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d860b140&gt;
+filterable_docs = [Document(id=40a87247dbc203409b16dcbcb5bda4ed7df6437084d47d95686a2f893541efb5, content: 'A Foo Document 0', meta: {'na...563afd7201e6286e4af15, content: 'Doc 0 with ones emb', meta: {'name': 'ones_doc'}, embedding: vector of size 768), ...]
+
+    def test_comparison_in(self, document_store, filterable_docs):
+        """Test filter_documents() with 'in' comparator"""
+        docum
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_in_with_with_non_list" time="0.019"><failure message="Failed: DID NOT RAISE FilterError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d85b0320&gt;
+filterable_docs = [Document(id=035b83948935d4a4c241cfee33b5b0d37af01402c42643aab7f148022e82a517, content: 'A Foo Document 0', meta: {'na...563afd7201e6286e4af15, content: 'Doc 0 with ones emb', meta: {'name': 'ones_doc'}, embedding: vector of size 768), ...]
+
+    @staticmethod
+    def test_comparison_in_with_with_non_list(document_store, filterable_docs):
+        """Test filter_documents() with 'in' comparator and non-iterable"""
+        document_store.write_documen
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_in_with_with_non_list_iterable" time="0.018"><failure message="Failed: DID NOT RAISE FilterError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d85b1bb0&gt;
+filterable_docs = [Document(id=b4bc9ccf015a65727570b64533f54a1e0138157c3f47ed65cd42caeb6b0c63a0, content: 'A Foo Document 0', meta: {'na...563afd7201e6286e4af15, content: 'Doc 0 with ones emb', meta: {'name': 'ones_doc'}, embedding: vector of size 768), ...]
+
+    @staticmethod
+    def test_comparison_in_with_with_non_list_iterable(document_store, filterable_docs):
+        """Test filter_documents() with 'in' comparator and iterable"""
+        document_store.write_do
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_not_in" time="0.018"><failure message="AssertionError: assert [] == [Document(id=...usion'}), ...]&#10;  &#10;  Right contains 18 more items, first extra item: Document(id=0374230460e5af8f4b3166b38e1b0dfe0063f4c87854578d908b11e404fff5ea, content: 'A Foo Document 2', meta: {'nam...name_2', 'page': '100', 'chapter': 'intro', 'number': 2, 'date': '1969-07-21T20:17:40'}, embedding: vector of size 768)&#10;  Use -v to get more diff">self = &lt;tests.test_filters.TestFilters object at 0x7df8d9381040&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d85b2db0&gt;
+filterable_docs = [Document(id=48c1ce8d940b712ca8a6c31f5d2a71530fb26489271cf464f08449ab2112aa88, content: 'A Foo Document 0', meta: {'na...563afd7201e6286e4af15, content: 'Doc 0 with ones emb', meta: {'name': 'ones_doc'}, embedding: vector of size 768), ...]
+
+    def test_comparison_not_in(self, document_store, filterable_docs):
+        """Test filter_documents() with 'not in' comparator"""
+     
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_not_in_with_with_non_list" time="0.018"><failure message="Failed: DID NOT RAISE FilterError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d85b3e90&gt;
+filterable_docs = [Document(id=e1f98ed678a71998a17d2939a6036dabba2862ad88068e0500bbb8fadd45a5bd, content: 'A Foo Document 0', meta: {'na...563afd7201e6286e4af15, content: 'Doc 0 with ones emb', meta: {'name': 'ones_doc'}, embedding: vector of size 768), ...]
+
+    @staticmethod
+    def test_comparison_not_in_with_with_non_list(document_store, filterable_docs):
+        """Test filter_documents() with 'not in' comparator and non-iterable"""
+        document_store.write
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_not_in_with_with_non_list_iterable" time="0.018"><failure message="Failed: DID NOT RAISE FilterError">document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d84891f0&gt;
+filterable_docs = [Document(id=570a1045ac0e1e516c9ea7dfc8dd8299a896cf61e4dadb9f95a1c3c3108266d5, content: 'A Foo Document 0', meta: {'na...563afd7201e6286e4af15, content: 'Doc 0 with ones emb', meta: {'name': 'ones_doc'}, embedding: vector of size 768), ...]
+
+    @staticmethod
+    def test_comparison_not_in_with_with_non_list_iterable(document_store, filterable_docs):
+        """Test filter_documents() with 'not in' comparator and iterable"""
+        document_store.
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_and_operator" time="0.017" /><testcase classname="tests.test_filters.TestFilters" name="test_or_operator" time="0.018"><failure message="AssertionError: assert [] == [Document(id=...conclusion'})]&#10;  &#10;  Right contains 4 more items, first extra item: Document(id=96e50011b079a97854184fae8dc5016e85859d80388ac18d33d215ccb849317a, content: 'A Bar Document 0', meta: {'nam..._0', 'page': '123', 'chapter': 'abstract', 'number': -2, 'date': '1972-12-11T19:54:58'}, embedding: vector of size 768)&#10;  Use -v to get more diff">self = &lt;tests.test_filters.TestFilters object at 0x7df8d9382600&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d848a810&gt;
+filterable_docs = [Document(id=aa58b5c7411e3589ee8a76523870b38cc7f79d00ee090edd96a2d0078a0c81c1, content: 'A Foo Document 0', meta: {'na...563afd7201e6286e4af15, content: 'Doc 0 with ones emb', meta: {'name': 'ones_doc'}, embedding: vector of size 768), ...]
+
+    def test_or_operator(self, document_store, filterable_docs):
+        """Test filter_documents() with 'OR' operator"""
+        document_
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_not_operator" time="0.018"><failure message="AssertionError: assert [] == [Document(id=...ize 768), ...]&#10;  &#10;  Right contains 18 more items, first extra item: Document(id=15a488851e50e37b37cacf6eb01052b6de780bee680b9823b820ba721f0f4e7b, content: 'A Bar Document 0', meta: {'nam..._0', 'page': '123', 'chapter': 'abstract', 'number': -2, 'date': '1972-12-11T19:54:58'}, embedding: vector of size 768)&#10;  Use -v to get more diff">self = &lt;tests.test_filters.TestFilters object at 0x7df8d9383c80&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d848b830&gt;
+filterable_docs = [Document(id=5e1fd05d0919d5061123b335a406dd378ae38d006933f5062fd1e234de4caf66, content: 'A Foo Document 0', meta: {'na...563afd7201e6286e4af15, content: 'Doc 0 with ones emb', meta: {'name': 'ones_doc'}, embedding: vector of size 768), ...]
+
+    def test_not_operator(self, document_store, filterable_docs):
+        """Test filter_documents() with 'NOT' operator"""
+        documen
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_missing_top_level_operator_key" time="0.018"><failure message="Failed: DID NOT RAISE FilterError">self = &lt;tests.test_filters.TestFilters object at 0x7df8d9383f20&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d813b680&gt;
+filterable_docs = [Document(id=32744cf1afe2bec234e5d2b44f19a3ef9d651356bf8d63a1472f06e7221bf257, content: 'A Foo Document 0', meta: {'na...563afd7201e6286e4af15, content: 'Doc 0 with ones emb', meta: {'name': 'ones_doc'}, embedding: vector of size 768), ...]
+
+    def test_missing_top_level_operator_key(self, document_store, filterable_docs):
+        """Test filter_documents() with top-level opera
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_missing_top_level_conditions_key" time="0.018"><failure message="Failed: DID NOT RAISE FilterError">self = &lt;tests.test_filters.TestFilters object at 0x7df8d93a8200&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d81395b0&gt;
+filterable_docs = [Document(id=fd76e8f136609dd97767679382d87bc4be43abb8c5d45c024ec1a8a562f9e1fc, content: 'A Foo Document 0', meta: {'na...563afd7201e6286e4af15, content: 'Doc 0 with ones emb', meta: {'name': 'ones_doc'}, embedding: vector of size 768), ...]
+
+    def test_missing_top_level_conditions_key(self, document_store, filterable_docs):
+        """Test filter_documents() with missing top-l
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_missing_condition_field_key" time="0.017"><failure message="Failed: DID NOT RAISE FilterError">self = &lt;tests.test_filters.TestFilters object at 0x7df8d93a84a0&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d813a8a0&gt;
+filterable_docs = [Document(id=8b432e0f77a68bdf51ae63a821581af25a3d8896094f0a045594a55e22579771, content: 'A Foo Document 0', meta: {'na...563afd7201e6286e4af15, content: 'Doc 0 with ones emb', meta: {'name': 'ones_doc'}, embedding: vector of size 768), ...]
+
+    def test_missing_condition_field_key(self, document_store, filterable_docs):
+        """Test filter_documents() with missing condition 
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_missing_condition_operator_key" time="0.018"><failure message="Failed: DID NOT RAISE FilterError">self = &lt;tests.test_filters.TestFilters object at 0x7df8d93a8740&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d813bf50&gt;
+filterable_docs = [Document(id=55562b123ce68895c242be50b95a52910bbf396eec948f0976b375429e2733be, content: 'A Foo Document 0', meta: {'na...563afd7201e6286e4af15, content: 'Doc 0 with ones emb', meta: {'name': 'ones_doc'}, embedding: vector of size 768), ...]
+
+    def test_missing_condition_operator_key(self, document_store, filterable_docs):
+        """Test filter_documents() with missing operato
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_missing_condition_value_key" time="0.019"><failure message="Failed: DID NOT RAISE FilterError">self = &lt;tests.test_filters.TestFilters object at 0x7df8d93a89e0&gt;
+document_store = &lt;haystack_integrations.document_stores.valkey.document_store.ValkeyDocumentStore object at 0x7df8d81dd190&gt;
+filterable_docs = [Document(id=39d07fb76018de792564311c617b25f1525feac5457d9346c6b09643a581e6d0, content: 'A Foo Document 0', meta: {'na...563afd7201e6286e4af15, content: 'Doc 0 with ones emb', meta: {'name': 'ones_doc'}, embedding: vector of size 768), ...]
+
+    def test_missing_condition_value_key(self, document_store, filterable_docs):
+        """Test filter_documents() with missing condition 
+[... cut ...]</failure></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_greater_than_with_none" time="0.006"><skipped type="pytest.skip" message="Valkey does not support comparison operators with None values">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:45: Valkey does not support comparison operators with None values</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_greater_than_equal_with_none" time="0.006"><skipped type="pytest.skip" message="Valkey does not support comparison operators with None values">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:48: Valkey does not support comparison operators with None values</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_less_than_with_none" time="0.006"><skipped type="pytest.skip" message="Valkey does not support comparison operators with None values">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:51: Valkey does not support comparison operators with None values</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_less_than_equal_with_none" time="0.006"><skipped type="pytest.skip" message="Valkey does not support comparison operators with None values">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:54: Valkey does not support comparison operators with None values</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_greater_than_with_string" time="0.006"><skipped type="pytest.skip" message="Valkey only supports numeric comparisons on numeric fields">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:58: Valkey only supports numeric comparisons on numeric fields</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_greater_than_with_iso_date" time="0.005"><skipped type="pytest.skip" message="Valkey only supports numeric comparisons on numeric fields">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:61: Valkey only supports numeric comparisons on numeric fields</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_greater_than_with_list" time="0.005"><skipped type="pytest.skip" message="Valkey only supports numeric comparisons on numeric fields">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:64: Valkey only supports numeric comparisons on numeric fields</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_greater_than_equal_with_string" time="0.006"><skipped type="pytest.skip" message="Valkey only supports numeric comparisons on numeric fields">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:67: Valkey only supports numeric comparisons on numeric fields</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_greater_than_equal_with_iso_date" time="0.005"><skipped type="pytest.skip" message="Valkey only supports numeric comparisons on numeric fields">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:70: Valkey only supports numeric comparisons on numeric fields</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_greater_than_equal_with_list" time="0.005"><skipped type="pytest.skip" message="Valkey only supports numeric comparisons on numeric fields">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:73: Valkey only supports numeric comparisons on numeric fields</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_less_than_with_string" time="0.005"><skipped type="pytest.skip" message="Valkey only supports numeric comparisons on numeric fields">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:76: Valkey only supports numeric comparisons on numeric fields</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_less_than_with_iso_date" time="0.006"><skipped type="pytest.skip" message="Valkey only supports numeric comparisons on numeric fields">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:79: Valkey only supports numeric comparisons on numeric fields</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_less_than_with_list" time="0.005"><skipped type="pytest.skip" message="Valkey only supports numeric comparisons on numeric fields">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:82: Valkey only supports numeric comparisons on numeric fields</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_less_than_equal_with_string" time="0.005"><skipped type="pytest.skip" message="Valkey only supports numeric comparisons on numeric fields">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:85: Valkey only supports numeric comparisons on numeric fields</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_less_than_equal_with_iso_date" time="0.005"><skipped type="pytest.skip" message="Valkey only supports numeric comparisons on numeric fields">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:88: Valkey only supports numeric comparisons on numeric fields</skipped></testcase><testcase classname="tests.test_filters.TestFilters" name="test_comparison_less_than_equal_with_list" time="0.006"><skipped type="pytest.skip" message="Valkey only supports numeric comparisons on numeric fields">/home/azureuser/fw/hci/integrations/valkey/tests/test_filters.py:91: Valkey only supports numeric comparisons on numeric fields</skipped></testcase></testsuite></testsuites>

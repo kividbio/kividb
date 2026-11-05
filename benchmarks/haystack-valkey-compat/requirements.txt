@@ -1,0 +1,9 @@
+# What `pip install -e integrations/valkey` (valkey-haystack 1.0.0, tag integrations/valkey-v1.0.0)
+# resolved to, plus the hatch test environment's tools. Python 3.12.3.
+haystack-ai==3.4.1
+valkey-glide==2.5.3
+valkey-glide-sync==2.5.3
+pytest==9.2.0
+pytest-asyncio==1.4.1.post1
+pytest-rerunfailures==16.7
+pytest-cov==7.1.0

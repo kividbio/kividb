@@ -1,0 +1,94 @@
+{
+  "meta": {
+    "label": "kividb",
+    "date": "2026-11-05",
+    "celery": "5.7.0",
+    "kombu": "5.7.0",
+    "redis_py": "8.1.0",
+    "backend_url": "redis://127.0.0.1:7700",
+    "server": {
+      "redis_version": "8.10.0",
+      "kividb_version": "1.2.0"
+    }
+  },
+  "results": [
+    {
+      "check": "worker starts and answers inspect ping (pidbox fanout over pub/sub)",
+      "status": "FAIL",
+      "detail": "AssertionError: timed out after 60s waiting for worker compat1-94f8@localhost to answer ping",
+      "ms": 60161
+    },
+    {
+      "check": "task round trip: broker, worker, result backend",
+      "status": "FAIL",
+      "detail": "TimeoutError: The operation timed out.",
+      "ms": 30056
+    },
+    {
+      "check": "group of 10",
+      "status": "FAIL",
+      "detail": "TimeoutError: The operation timed out.",
+      "ms": 30547
+    },
+    {
+      "check": "chain",
+      "status": "FAIL",
+      "detail": "TimeoutError: The operation timed out.",
+      "ms": 30055
+    },
+    {
+      "check": "chord (Celery 5.7 saves header results with a Lua script)",
+      "status": "FAIL",
+      "detail": "TimeoutError: The operation timed out.",
+      "ms": 30104
+    },
+    {
+      "check": "countdown (kombu's unacked sorted set)",
+      "status": "FAIL",
+      "detail": "TimeoutError: The operation timed out.",
+      "ms": 30038
+    },
+    {
+      "check": "retry",
+      "status": "FAIL",
+      "detail": "TimeoutError: The operation timed out.",
+      "ms": 30039
+    },
+    {
+      "check": "revoke (broadcast to workers)",
+      "status": "FAIL",
+      "detail": "TimeoutError: The operation timed out.",
+      "ms": 30044
+    },
+    {
+      "check": "task routed to a second queue",
+      "status": "FAIL",
+      "detail": "TimeoutError: The operation timed out.",
+      "ms": 30039
+    },
+    {
+      "check": "result expires (TTL on the result key)",
+      "status": "FAIL",
+      "detail": "TimeoutError: The operation timed out.",
+      "ms": 30038
+    },
+    {
+      "check": "acks_late task redelivered after the worker is killed (SIGKILL)",
+      "status": "FAIL",
+      "detail": "AssertionError: timed out after 30s waiting for the slow task to start",
+      "ms": 30076
+    },
+    {
+      "check": "tasks queued across a server restart are not lost",
+      "status": "FAIL",
+      "detail": "AssertionError: timed out after 60s waiting for worker compat2-95af@localhost to answer ping",
+      "ms": 60860
+    },
+    {
+      "check": "running worker reconnects after a server restart",
+      "status": "FAIL",
+      "detail": "TimeoutError: The operation timed out.",
+      "ms": 90585
+    }
+  ]
+}

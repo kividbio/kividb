@@ -1,0 +1,269 @@
+{
+ "summary": {
+  "redis8": {
+   "passed": 49,
+   "failed": 8
+  },
+  "kividb": {
+   "passed": 45,
+   "failed": 10,
+   "error": 2
+  },
+  "kividb-lua": {
+   "passed": 45,
+   "failed": 10,
+   "error": 2
+  }
+ },
+ "differences": [
+  {
+   "test": "tests.integration.sdk.test_owned_redis_ports::test_owned_redis_restart_refuses_a_port_another_redis_took_while_it_was_down",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError: Owned Redis required shutdown recovery: RedisError('SHUTDOWN seems to have failed.')"
+   },
+   "kividb-lua": {
+    "status": "failed",
+    "message": "AssertionError: Owned Redis required shutdown recovery: RedisError('SHUTDOWN seems to have failed.')"
+   }
+  },
+  {
+   "test": "tests.integration.sdk.test_redis_cluster_iam_auth::test_sync_cluster_authenticates_with_azure_credentials",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "error",
+    "message": "failed on setup with \"Failed: Redis did not report 'Ready to accept connections': 2026-11-05T20:19:25.011Z 70301 [FATAL] Bad directive or wrong number of arguments \u2014 /tmp/pytest-of-azureuser/pytest-8/test_sync_cluster_authenticate0/redis.conf: line 3: unknown directive 'cluster-port' (in: cluster-po"
+   },
+   "kividb-lua": {
+    "status": "error",
+    "message": "failed on setup with \"Failed: Redis did not report 'Ready to accept connections': 2026-11-05T20:20:41.974Z 71288 [FATAL] Bad directive or wrong number of arguments \u2014 /tmp/pytest-of-azureuser/pytest-9/test_sync_cluster_authenticate0/redis.conf: line 3: unknown directive 'cluster-port' (in: cluster-po"
+   }
+  },
+  {
+   "test": "tests.integration.sdk.test_redis_cluster_iam_auth::test_sync_cluster_authenticates_with_gcp_credentials",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "error",
+    "message": "failed on setup with \"Failed: Redis did not report 'Ready to accept connections': 2026-11-05T20:19:25.021Z 70302 [FATAL] Bad directive or wrong number of arguments \u2014 /tmp/pytest-of-azureuser/pytest-8/test_sync_cluster_authenticate1/redis.conf: line 3: unknown directive 'cluster-port' (in: cluster-po"
+   },
+   "kividb-lua": {
+    "status": "error",
+    "message": "failed on setup with \"Failed: Redis did not report 'Ready to accept connections': 2026-11-05T20:20:41.986Z 71289 [FATAL] Bad directive or wrong number of arguments \u2014 /tmp/pytest-of-azureuser/pytest-9/test_sync_cluster_authenticate1/redis.conf: line 3: unknown directive 'cluster-port' (in: cluster-po"
+   }
+  },
+  {
+   "test": "tests.integration.sdk.test_usage_based_routing_sdk_redis_reads::test_sdk_usage_routing_reads_tpm_then_rpm_from_redis",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "AssertionError: Owned Redis required shutdown recovery: RedisError('SHUTDOWN seems to have failed.')"
+   },
+   "kividb-lua": {
+    "status": "failed",
+    "message": "AssertionError: Owned Redis required shutdown recovery: RedisError('SHUTDOWN seems to have failed.')"
+   }
+  }
+ ],
+ "failing_everywhere": [
+  "tests.integration.sdk.test_response_cache_sync_sdk::test_sync_completion_treats_a_stale_entry_with_empty_choices_as_a_miss",
+  "tests.integration.sdk.test_response_cache_sync_sdk::test_sync_completion_with_empty_choices_reaches_upstream_again_and_the_real_answer_is_cached",
+  "tests.integration.sdk.test_response_cache_sync_sdk::test_sync_stream_cache_hit_replays_the_usage_details_of_the_miss",
+  "tests.integration.sdk.test_response_cache_sync_sdk::test_sync_stream_cache_hit_skips_cached_usage_details_that_fail_validation[fraction]",
+  "tests.integration.sdk.test_response_cache_sync_sdk::test_sync_stream_cache_hit_skips_cached_usage_details_that_fail_validation[object]",
+  "tests.integration.sdk.test_response_cache_sync_sdk::test_sync_stream_cache_hit_skips_cached_usage_details_that_fail_validation[text]",
+  "tests.integration.sdk.test_response_cache_sync_sdk::test_sync_text_completion_with_empty_choices_reaches_upstream_again",
+  "tests.integration.sdk.test_router_budget_limiter_wire::test_tag_budget_blocks_exhausted_tag_but_allows_another"
+ ],
+ "tests": {
+  "redis8": {
+   "tests.integration.sdk.test_caching_redis_sdk::test_batch_get_cache_with_none_keys": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_cache_control_overrides": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_caching_dynamic_args": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_caching_redis_simple": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_dual_cache_batch_get_cache": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_embedding_caching_base_64": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_batch_cache_write": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_cache_acompletion_stream": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_cache_acompletion_stream_bedrock": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_cache_atext_completion": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_cache_basic": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_cache_completion": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_cache_completion_stream": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_get_ttl": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_increment_pipeline": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_proxy_batch_redis_get_cache": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_sync_cache_control_overrides": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_semantic_cache_acompletion": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_semantic_cache_completion": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_acompletion_caching_on_router": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_acompletion_caching_on_router_caching_groups": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_acompletion_caching_with_ttl_on_router": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_completion_caching_on_router": "passed",
+   "tests.integration.sdk.test_callback_logging_cache::test_redis_cache_completion_stream": "passed",
+   "tests.integration.sdk.test_callback_logging_cache::test_completion_with_caching": "passed",
+   "tests.integration.sdk.test_dual_cache_redis::test_a_value_only_in_redis_is_read_once_from_redis_then_from_memory": "passed",
+   "tests.integration.sdk.test_dual_cache_redis::test_a_deleted_key_is_gone_from_both_memory_and_redis": "passed",
+   "tests.integration.sdk.test_dual_cache_redis::test_a_batch_read_without_an_in_memory_cache_reads_redis": "passed",
+   "tests.integration.sdk.test_dual_cache_redis::test_sync_and_async_batch_reads_share_one_redis_without_sync_reads_going_async": "passed",
+   "tests.integration.sdk.test_owned_redis_ports::test_owned_redis_restart_refuses_a_port_another_redis_took_while_it_was_down": "passed",
+   "tests.integration.sdk.test_provider_budget_redis::test_spend_written_to_redis_by_another_instance_is_pulled_into_memory": "passed",
+   "tests.integration.sdk.test_provider_budget_redis::test_budget_reset_time_follows_the_redis_window_expiry": "passed",
+   "tests.integration.sdk.test_redis_breaker_metrics_multiprocess_sdk::test_two_worker_processes_collect_as_one_state_series_per_state": "passed",
+   "tests.integration.sdk.test_redis_breaker_metrics_multiprocess_sdk::test_prometheus_logging_turned_on_after_the_cache_still_reports_the_closed_breaker": "passed",
+   "tests.integration.sdk.test_redis_breaker_metrics_multiprocess_sdk::test_app_without_litellm_prometheus_logging_gets_no_breaker_series": "passed",
+   "tests.integration.sdk.test_redis_cluster_iam_auth::test_sync_cluster_authenticates_with_azure_credentials": "passed",
+   "tests.integration.sdk.test_redis_cluster_iam_auth::test_sync_cluster_authenticates_with_gcp_credentials": "passed",
+   "tests.integration.sdk.test_redis_service_metrics::test_router_redis_traffic_is_counted_in_the_prometheus_service_metrics": "passed",
+   "tests.integration.sdk.test_response_cache_sync_sdk::test_sync_completion_with_empty_choices_reaches_upstream_again_and_the_real_answer_is_cached": "failed",
+   "tests.integration.sdk.test_response_cache_sync_sdk::test_sync_completion_treats_a_stale_entry_with_empty_choices_as_a_miss": "failed",
+   "tests.integration.sdk.test_response_cache_sync_sdk::test_sync_text_completion_with_empty_choices_reaches_upstream_again": "failed",
+   "tests.integration.sdk.test_response_cache_sync_sdk::test_sync_stream_cache_hit_replays_the_usage_details_of_the_miss": "failed",
+   "tests.integration.sdk.test_response_cache_sync_sdk::test_sync_stream_cache_hit_skips_cached_usage_details_that_fail_validation[text]": "failed",
+   "tests.integration.sdk.test_response_cache_sync_sdk::test_sync_stream_cache_hit_skips_cached_usage_details_that_fail_validation[fraction]": "failed",
+   "tests.integration.sdk.test_response_cache_sync_sdk::test_sync_stream_cache_hit_skips_cached_usage_details_that_fail_validation[object]": "failed",
+   "tests.integration.sdk.test_router_budget_limiter_wire::test_provider_budget_routes_to_unlimited_provider": "passed",
+   "tests.integration.sdk.test_router_budget_limiter_wire::test_provider_budget_rejects_when_every_provider_is_exhausted": "passed",
+   "tests.integration.sdk.test_router_budget_limiter_wire::test_deployment_budget_rejects_when_every_deployment_is_exhausted": "passed",
+   "tests.integration.sdk.test_router_budget_limiter_wire::test_tag_budget_blocks_exhausted_tag_but_allows_another": "failed",
+   "tests.integration.sdk.test_router_redis_tls_url::test_async_router_cache_built_from_a_rediss_url_talks_tls_to_redis": "passed",
+   "tests.integration.sdk.test_router_redis_tls_url::test_sync_router_cache_built_from_a_rediss_url_talks_tls_to_redis": "passed",
+   "tests.integration.sdk.test_router_redis_tls_url::test_caching_v2": "passed",
+   "tests.integration.sdk.test_router_redis_tls_url::test_caching_router": "passed",
+   "tests.integration.sdk.test_slack_daily_report_redis::test_the_report_timestamp_one_pod_stores_in_redis_drives_the_next_pods_daily_report": "passed",
+   "tests.integration.sdk.test_usage_based_routing_sdk_redis_reads::test_sdk_usage_routing_reads_tpm_then_rpm_from_redis": "passed",
+   "tests.integration.sdk.test_usage_routing_counter_ttl::test_async_usage_counters_land_in_redis_with_a_one_minute_expiry": "passed",
+   "tests.integration.sdk.test_usage_routing_counter_ttl::test_sync_usage_counters_land_in_redis_with_a_one_minute_expiry": "passed"
+  },
+  "kividb": {
+   "tests.integration.sdk.test_caching_redis_sdk::test_batch_get_cache_with_none_keys": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_cache_control_overrides": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_caching_dynamic_args": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_caching_redis_simple": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_dual_cache_batch_get_cache": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_embedding_caching_base_64": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_batch_cache_write": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_cache_acompletion_stream": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_cache_acompletion_stream_bedrock": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_cache_atext_completion": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_cache_basic": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_cache_completion": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_cache_completion_stream": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_get_ttl": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_increment_pipeline": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_proxy_batch_redis_get_cache": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_sync_cache_control_overrides": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_semantic_cache_acompletion": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_semantic_cache_completion": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_acompletion_caching_on_router": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_acompletion_caching_on_router_caching_groups": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_acompletion_caching_with_ttl_on_router": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_completion_caching_on_router": "passed",
+   "tests.integration.sdk.test_callback_logging_cache::test_redis_cache_completion_stream": "passed",
+   "tests.integration.sdk.test_callback_logging_cache::test_completion_with_caching": "passed",
+   "tests.integration.sdk.test_dual_cache_redis::test_a_value_only_in_redis_is_read_once_from_redis_then_from_memory": "passed",
+   "tests.integration.sdk.test_dual_cache_redis::test_a_deleted_key_is_gone_from_both_memory_and_redis": "passed",
+   "tests.integration.sdk.test_dual_cache_redis::test_a_batch_read_without_an_in_memory_cache_reads_redis": "passed",
+   "tests.integration.sdk.test_dual_cache_redis::test_sync_and_async_batch_reads_share_one_redis_without_sync_reads_going_async": "passed",
+   "tests.integration.sdk.test_owned_redis_ports::test_owned_redis_restart_refuses_a_port_another_redis_took_while_it_was_down": "failed",
+   "tests.integration.sdk.test_provider_budget_redis::test_spend_written_to_redis_by_another_instance_is_pulled_into_memory": "passed",
+   "tests.integration.sdk.test_provider_budget_redis::test_budget_reset_time_follows_the_redis_window_expiry": "passed",
+   "tests.integration.sdk.test_redis_breaker_metrics_multiprocess_sdk::test_two_worker_processes_collect_as_one_state_series_per_state": "passed",
+   "tests.integration.sdk.test_redis_breaker_metrics_multiprocess_sdk::test_prometheus_logging_turned_on_after_the_cache_still_reports_the_closed_breaker": "passed",
+   "tests.integration.sdk.test_redis_breaker_metrics_multiprocess_sdk::test_app_without_litellm_prometheus_logging_gets_no_breaker_series": "passed",
+   "tests.integration.sdk.test_redis_cluster_iam_auth::test_sync_cluster_authenticates_with_azure_credentials": "error",
+   "tests.integration.sdk.test_redis_cluster_iam_auth::test_sync_cluster_authenticates_with_gcp_credentials": "error",
+   "tests.integration.sdk.test_redis_service_metrics::test_router_redis_traffic_is_counted_in_the_prometheus_service_metrics": "passed",
+   "tests.integration.sdk.test_response_cache_sync_sdk::test_sync_completion_with_empty_choices_reaches_upstream_again_and_the_real_answer_is_cached": "failed",
+   "tests.integration.sdk.test_response_cache_sync_sdk::test_sync_completion_treats_a_stale_entry_with_empty_choices_as_a_miss": "failed",
+   "tests.integration.sdk.test_response_cache_sync_sdk::test_sync_text_completion_with_empty_choices_reaches_upstream_again": "failed",
+   "tests.integration.sdk.test_response_cache_sync_sdk::test_sync_stream_cache_hit_replays_the_usage_details_of_the_miss": "failed",
+   "tests.integration.sdk.test_response_cache_sync_sdk::test_sync_stream_cache_hit_skips_cached_usage_details_that_fail_validation[text]": "failed",
+   "tests.integration.sdk.test_response_cache_sync_sdk::test_sync_stream_cache_hit_skips_cached_usage_details_that_fail_validation[fraction]": "failed",
+   "tests.integration.sdk.test_response_cache_sync_sdk::test_sync_stream_cache_hit_skips_cached_usage_details_that_fail_validation[object]": "failed",
+   "tests.integration.sdk.test_router_budget_limiter_wire::test_provider_budget_routes_to_unlimited_provider": "passed",
+   "tests.integration.sdk.test_router_budget_limiter_wire::test_provider_budget_rejects_when_every_provider_is_exhausted": "passed",
+   "tests.integration.sdk.test_router_budget_limiter_wire::test_deployment_budget_rejects_when_every_deployment_is_exhausted": "passed",
+   "tests.integration.sdk.test_router_budget_limiter_wire::test_tag_budget_blocks_exhausted_tag_but_allows_another": "failed",
+   "tests.integration.sdk.test_router_redis_tls_url::test_async_router_cache_built_from_a_rediss_url_talks_tls_to_redis": "passed",
+   "tests.integration.sdk.test_router_redis_tls_url::test_sync_router_cache_built_from_a_rediss_url_talks_tls_to_redis": "passed",
+   "tests.integration.sdk.test_router_redis_tls_url::test_caching_v2": "passed",
+   "tests.integration.sdk.test_router_redis_tls_url::test_caching_router": "passed",
+   "tests.integration.sdk.test_slack_daily_report_redis::test_the_report_timestamp_one_pod_stores_in_redis_drives_the_next_pods_daily_report": "passed",
+   "tests.integration.sdk.test_usage_based_routing_sdk_redis_reads::test_sdk_usage_routing_reads_tpm_then_rpm_from_redis": "failed",
+   "tests.integration.sdk.test_usage_routing_counter_ttl::test_async_usage_counters_land_in_redis_with_a_one_minute_expiry": "passed",
+   "tests.integration.sdk.test_usage_routing_counter_ttl::test_sync_usage_counters_land_in_redis_with_a_one_minute_expiry": "passed"
+  },
+  "kividb-lua": {
+   "tests.integration.sdk.test_caching_redis_sdk::test_batch_get_cache_with_none_keys": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_cache_control_overrides": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_caching_dynamic_args": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_caching_redis_simple": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_dual_cache_batch_get_cache": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_embedding_caching_base_64": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_batch_cache_write": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_cache_acompletion_stream": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_cache_acompletion_stream_bedrock": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_cache_atext_completion": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_cache_basic": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_cache_completion": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_cache_completion_stream": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_get_ttl": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_increment_pipeline": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_proxy_batch_redis_get_cache": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_sync_cache_control_overrides": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_semantic_cache_acompletion": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_redis_semantic_cache_completion": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_acompletion_caching_on_router": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_acompletion_caching_on_router_caching_groups": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_acompletion_caching_with_ttl_on_router": "passed",
+   "tests.integration.sdk.test_caching_redis_sdk::test_completion_caching_on_router": "passed",
+   "tests.integration.sdk.test_callback_logging_cache::test_redis_cache_completion_stream": "passed",
+   "tests.integration.sdk.test_callback_logging_cache::test_completion_with_caching": "passed",
+   "tests.integration.sdk.test_dual_cache_redis::test_a_value_only_in_redis_is_read_once_from_redis_then_from_memory": "passed",
+   "tests.integration.sdk.test_dual_cache_redis::test_a_deleted_key_is_gone_from_both_memory_and_redis": "passed",
+   "tests.integration.sdk.test_dual_cache_redis::test_a_batch_read_without_an_in_memory_cache_reads_redis": "passed",
+   "tests.integration.sdk.test_dual_cache_redis::test_sync_and_async_batch_reads_share_one_redis_without_sync_reads_going_async": "passed",
+   "tests.integration.sdk.test_owned_redis_ports::test_owned_redis_restart_refuses_a_port_another_redis_took_while_it_was_down": "failed",
+   "tests.integration.sdk.test_provider_budget_redis::test_spend_written_to_redis_by_another_instance_is_pulled_into_memory": "passed",
+   "tests.integration.sdk.test_provider_budget_redis::test_budget_reset_time_follows_the_redis_window_expiry": "passed",
+   "tests.integration.sdk.test_redis_breaker_metrics_multiprocess_sdk::test_two_worker_processes_collect_as_one_state_series_per_state": "passed",
+   "tests.integration.sdk.test_redis_breaker_metrics_multiprocess_sdk::test_prometheus_logging_turned_on_after_the_cache_still_reports_the_closed_breaker": "passed",
+   "tests.integration.sdk.test_redis_breaker_metrics_multiprocess_sdk::test_app_without_litellm_prometheus_logging_gets_no_breaker_series": "passed",
+   "tests.integration.sdk.test_redis_cluster_iam_auth::test_sync_cluster_authenticates_with_azure_credentials": "error",
+   "tests.integration.sdk.test_redis_cluster_iam_auth::test_sync_cluster_authenticates_with_gcp_credentials": "error",
+   "tests.integration.sdk.test_redis_service_metrics::test_router_redis_traffic_is_counted_in_the_prometheus_service_metrics": "passed",
+   "tests.integration.sdk.test_response_cache_sync_sdk::test_sync_completion_with_empty_choices_reaches_upstream_again_and_the_real_answer_is_cached": "failed",
+   "tests.integration.sdk.test_response_cache_sync_sdk::test_sync_completion_treats_a_stale_entry_with_empty_choices_as_a_miss": "failed",
+   "tests.integration.sdk.test_response_cache_sync_sdk::test_sync_text_completion_with_empty_choices_reaches_upstream_again": "failed",
+   "tests.integration.sdk.test_response_cache_sync_sdk::test_sync_stream_cache_hit_replays_the_usage_details_of_the_miss": "failed",
+   "tests.integration.sdk.test_response_cache_sync_sdk::test_sync_stream_cache_hit_skips_cached_usage_details_that_fail_validation[text]": "failed",
+   "tests.integration.sdk.test_response_cache_sync_sdk::test_sync_stream_cache_hit_skips_cached_usage_details_that_fail_validation[fraction]": "failed",
+   "tests.integration.sdk.test_response_cache_sync_sdk::test_sync_stream_cache_hit_skips_cached_usage_details_that_fail_validation[object]": "failed",
+   "tests.integration.sdk.test_router_budget_limiter_wire::test_provider_budget_routes_to_unlimited_provider": "passed",
+   "tests.integration.sdk.test_router_budget_limiter_wire::test_provider_budget_rejects_when_every_provider_is_exhausted": "passed",
+   "tests.integration.sdk.test_router_budget_limiter_wire::test_deployment_budget_rejects_when_every_deployment_is_exhausted": "passed",
+   "tests.integration.sdk.test_router_budget_limiter_wire::test_tag_budget_blocks_exhausted_tag_but_allows_another": "failed",
+   "tests.integration.sdk.test_router_redis_tls_url::test_async_router_cache_built_from_a_rediss_url_talks_tls_to_redis": "passed",
+   "tests.integration.sdk.test_router_redis_tls_url::test_sync_router_cache_built_from_a_rediss_url_talks_tls_to_redis": "passed",
+   "tests.integration.sdk.test_router_redis_tls_url::test_caching_v2": "passed",
+   "tests.integration.sdk.test_router_redis_tls_url::test_caching_router": "passed",
+   "tests.integration.sdk.test_slack_daily_report_redis::test_the_report_timestamp_one_pod_stores_in_redis_drives_the_next_pods_daily_report": "passed",
+   "tests.integration.sdk.test_usage_based_routing_sdk_redis_reads::test_sdk_usage_routing_reads_tpm_then_rpm_from_redis": "failed",
+   "tests.integration.sdk.test_usage_routing_counter_ttl::test_async_usage_counters_land_in_redis_with_a_one_minute_expiry": "passed",
+   "tests.integration.sdk.test_usage_routing_counter_ttl::test_sync_usage_counters_land_in_redis_with_a_one_minute_expiry": "passed"
+  }
+ }
+}
