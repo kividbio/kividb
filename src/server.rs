@@ -935,6 +935,16 @@ where
                     until_gone(&mut reader, &mut carried, &mut kill_rx, &activity)
                 }));
                 match gated.await {
+                    // See the matching arm in `server_uring`: the gate may
+                    // have kept a woken resume waiting, and its client gone.
+                    Some(ran)
+                        if blocking_slot.resuming()
+                            && gone_by_now(&mut reader, &mut carried, &activity, socket_fd) =>
+                    {
+                        blocking_slot.make_gone();
+                        interrupted.gone = true;
+                        ran
+                    }
                     Some(ran) => ran,
                     None if blocking_slot.resuming() => {
                         blocking_slot.make_gone();
