@@ -4999,7 +4999,10 @@ mod expiry_section_tests {
 #[cfg(test)]
 mod field_option_tests {
     use super::*;
-    use crate::vector::{FieldOptions, FieldType, IndexOn, IndexSchema, SchemaField};
+    use crate::vector::{
+        DistanceMetric, FieldOptions, FieldType, IndexOn, IndexSchema, SchemaField, VectorAlgo,
+        VectorType,
+    };
 
     /// Field options and stopwords come back with the index.
     #[test]
@@ -5179,18 +5182,90 @@ mod field_option_tests {
             }
             .into_def()
         };
+        let mut synonyms = crate::vector::SynonymGroups::new();
+        synonyms.insert("car".into(), vec!["automobile".into()]);
+        let scored = IndexSchema {
+            name: "scored".into(),
+            db_index: 0,
+            on: IndexOn::Hash,
+            prefixes: vec!["scored:".into()],
+            fields: vec![
+                SchemaField {
+                    name: "t".into(),
+                    field_type: FieldType::Text,
+                    options: FieldOptions::default(),
+                },
+                SchemaField {
+                    name: "v".into(),
+                    field_type: FieldType::Vector {
+                        algo: VectorAlgo::Hnsw {
+                            m: 16,
+                            ef_construction: 64,
+                            ef_runtime: 10,
+                        },
+                        dim: 4,
+                        metric: DistanceMetric::L2,
+                        data_type: VectorType::Float64,
+                    },
+                    options: FieldOptions::default(),
+                },
+            ],
+            aliases: Vec::new(),
+            stopwords: Some(vec!["the".into()]),
+            synonyms,
+            language: crate::vector::stem::LanguageOptions {
+                language: crate::vector::stem::Language::German,
+                field: Some("lang".into()),
+            },
+            default_score: 0.25,
+            score_field: Some("rank".into()),
+        }
+        .into_def();
         let store = crate::vector::new_index_store();
-        store
+        {
+            let mut store = store.write();
+            store.insert("scored".into(), scored.clone());
+            store.insert("scored-alias".into(), scored);
+            store.insert("plain".into(), index("plain", 1.0, None));
+            store.insert("empty".into(), index("empty", 1.0, Some("")));
+        }
+
+        let db = crate::store::new_store(1);
+        let key = "scored:1";
+        crate::store::get_shard(&db[0], key)
             .write()
-            .insert("scored".into(), index("scored", 0.25, Some("rank")));
-        store
-            .write()
-            .insert("plain".into(), index("plain", 1.0, None));
-        store
-            .write()
-            .insert("empty".into(), index("empty", 1.0, Some("")));
-        let mut image = Vec::new();
-        write_kdb_image(&mut image, &[HashMap::new()], Some(&store)).unwrap();
+            .insert_str_expiring(key, b"hello", Some(unix_ms_now() + 3_600_000));
+        let mut frozen = freeze_dataset_for_disk(&db, Some(&store)).unwrap();
+        // Include the function section even in a build without Lua, so the
+        // ordering covers every section an image can carry.
+        frozen.functions = Some(b"KVFN payload".to_vec());
+        let image = frozen.into_payload().unwrap();
+
+        let score_at = image
+            .windows(8)
+            .position(|w| w == KDB_SCORE_MAGIC)
+            .expect("score section");
+        for (name, magic) in [
+            ("index", KDB_INDEX_MAGIC),
+            ("HNSW", KDB_HNSW_MAGIC),
+            ("expiry", KDB_EXPIRY_MAGIC),
+            ("alias", KDB_ALIAS_MAGIC),
+            ("field options", KDB_FIELD_OPTIONS_MAGIC),
+            ("synonyms", KDB_SYNONYMS_MAGIC),
+            ("vector types", KDB_VECTOR_TYPES_MAGIC),
+            ("functions", KDB_FUNCTIONS_MAGIC),
+            ("language", KDB_LANGUAGE_MAGIC),
+        ] {
+            let at = image
+                .windows(8)
+                .position(|w| w == magic)
+                .unwrap_or_else(|| panic!("{name} section"));
+            assert!(
+                at < score_at,
+                "{name} section comes after the score section"
+            );
+        }
+
         let loaded = load_snapshot_from(image.as_slice()).unwrap();
         let of = |name: &str| {
             loaded

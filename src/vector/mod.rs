@@ -1983,13 +1983,13 @@ fn json_field_bytes(
 }
 
 /// The number at `path` in a JSON document, as `SCORE_FIELD` reads it.
-pub(crate) fn json_score_field_bytes(path: &str, doc: &serde_json::Value) -> Option<Arc<[u8]>> {
+pub(crate) fn json_score_field_number(path: &str, doc: &serde_json::Value) -> Option<f64> {
     let query = json_path(path)?;
     let values = query.values(doc);
     let serde_json::Value::Number(number) = values.first()?.as_ref() else {
         return None;
     };
-    Some(Arc::from(number.to_string().into_bytes()))
+    number.as_f64()
 }
 
 /// What `FT.SEARCH … RETURN` shows for `path` of a JSON document: a string

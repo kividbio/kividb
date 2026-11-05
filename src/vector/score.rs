@@ -431,20 +431,26 @@ impl<'q> Scoring<'q> {
         let score = match def.on {
             super::IndexOn::Hash => doc.field_bytes(field).and_then(Self::score_from_bytes),
             super::IndexOn::Json => json
-                .and_then(|doc| super::json_score_field_bytes(field, doc))
-                .and_then(|bytes| Self::score_from_bytes(&bytes)),
+                .and_then(|doc| super::json_score_field_number(field, doc))
+                .map(Self::score_from_number),
         };
         score
             .filter(|score| !score.is_nan())
             .unwrap_or(default_score)
     }
 
+    /// Redis parses `SCORE_FIELD` as an `f64` and then narrows it to the
+    /// `f32` the document score is kept in.
+    fn score_from_number(number: f64) -> f64 {
+        f64::from(number as f32)
+    }
+
     fn score_from_bytes(bytes: &[u8]) -> Option<f64> {
         std::str::from_utf8(bytes)
             .ok()?
-            .parse::<f32>()
+            .parse::<f64>()
             .ok()
-            .map(f64::from)
+            .map(Self::score_from_number)
     }
 
     /// [`Scoring::score`] of the document whose id in the index is `id`

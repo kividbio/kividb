@@ -1852,6 +1852,10 @@ fn a_json_score_field_need_not_be_in_the_schema() {
         ("null", r#"{"title":"hello","rank":null}"#),
         ("array", r#"{"title":"hello","rank":[3,7]}"#),
         ("object", r#"{"title":"hello","rank":{"n":3}}"#),
+        (
+            "precision",
+            r#"{"title":"hello","rank":1.0000001788139343261718749}"#,
+        ),
     ] {
         let reply = c.cmd(&["JSON.SET", &format!("jsc:{id}"), "$", doc]);
         assert!(reply.ok(), "{reply:?}");
@@ -1879,6 +1883,7 @@ fn a_json_score_field_need_not_be_in_the_schema() {
             ("jsc:missing".to_string(), 0.25),
             ("jsc:null".to_string(), 0.25),
             ("jsc:object".to_string(), 0.25),
+            ("jsc:precision".to_string(), 1.000000238418579),
             ("jsc:text".to_string(), 0.25),
         ]
     );
@@ -3756,9 +3761,23 @@ fn a_default_score_is_read_as_a_f32() {
         ("sd02", "0.123456789", 0.12345679104328156),
         ("sd03", "1e-7", 1.0000000116860974e-7),
     ] {
+        let prefix = format!("{name}:");
         assert!(
-            c.cmd(&["FT.CREATE", name, "SCORE", score, "SCHEMA", "title", "TEXT"])
-                .ok(),
+            c.cmd(&[
+                "FT.CREATE",
+                name,
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                &prefix,
+                "SCORE",
+                score,
+                "SCHEMA",
+                "title",
+                "TEXT",
+            ])
+            .ok(),
             "SCORE {score:?}"
         );
         let key = format!("{name}:1");
@@ -3806,6 +3825,7 @@ fn a_score_field_is_read_as_a_f32() {
         ("e", "1e-46"),
         ("f", "3.4e38"),
         ("g", "3.5e38"),
+        ("h", "1.0000001788139343261718749"),
     ] {
         c.cmd(&[
             "HSET",
@@ -3838,6 +3858,9 @@ fn a_score_field_is_read_as_a_f32() {
     assert_eq!(score("sf32:e"), 0.0);
     assert_eq!(score("sf32:f"), 3.3999999521443642e+38);
     assert!(score("sf32:g").is_infinite() && score("sf32:g").is_sign_positive());
+    // Redis reads the field as f64 and narrows to f32. The decimal is just
+    // below a float midpoint, so a direct f32 parse rounds down instead.
+    assert_eq!(score("sf32:h"), 1.000000238418579);
     c.cmd(&["FT.DROPINDEX", "sf32", "DD"]);
 }
 
@@ -3924,9 +3947,23 @@ fn score_option_trims_whitespace_and_info_omits_zero() {
         ("snan", "nan", Some("nan")),
         ("ssci", "0.0000001", Some("1e-7")),
     ] {
+        let prefix = format!("{name}:");
         assert!(
-            c.cmd(&["FT.CREATE", name, "SCORE", score, "SCHEMA", "title", "TEXT",])
-                .ok(),
+            c.cmd(&[
+                "FT.CREATE",
+                name,
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                &prefix,
+                "SCORE",
+                score,
+                "SCHEMA",
+                "title",
+                "TEXT",
+            ])
+            .ok(),
             "SCORE {score:?}"
         );
         let info = c.cmd(&["FT.INFO", name]);
