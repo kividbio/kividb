@@ -316,7 +316,7 @@ pub struct ShardMap {
     now: AtomicU64,
     /// Keys past their time that writes under this lock put new values
     /// over, to be expired when it lets go (`expiry::written_over`).
-    written_over: Vec<String>,
+    written_over: Vec<crate::store::Key>,
 }
 
 /// What [`ShardMap::lookup`] finds under a key.
@@ -414,9 +414,9 @@ fn now_at(now: &AtomicU64) -> u64 {
 /// the `DEL` propagated before the write's own record.
 #[cold]
 #[inline(never)]
-fn written_over_expired(over: &mut Vec<String>, key: &[u8]) {
+fn written_over_expired(over: &mut Vec<crate::store::Key>, key: &[u8]) {
     crate::stats::record_expired();
-    over.push(String::from_utf8_lossy(key).into_owned());
+    over.push(crate::store::Key::new(key));
 }
 
 /// How far ahead a pass over the list asks for entries' lines.
@@ -495,7 +495,7 @@ impl ShardMap {
     }
 
     /// The keys [`written_over_expired`] kept, taken.
-    pub(super) fn take_written_over(&mut self) -> Vec<String> {
+    pub(super) fn take_written_over(&mut self) -> Vec<crate::store::Key> {
         std::mem::take(&mut self.written_over)
     }
 
@@ -507,8 +507,8 @@ impl ShardMap {
 
     /// `key`'s value: a use of the key (see the module).
     #[inline(always)]
-    pub fn get(&self, key: &str) -> Option<ValueRef<'_>> {
-        let key = key.as_bytes();
+    pub fn get(&self, key: &(impl AsRef<[u8]> + ?Sized)) -> Option<ValueRef<'_>> {
+        let key = key.as_ref();
         let hash = self.hash_of(key);
         self.find_live(hash, key).map(|s| {
             let e = s.entry();
@@ -521,8 +521,8 @@ impl ShardMap {
     /// (`OBJECT`, `SORT`'s `BY` and `GET` patterns, ...). A key past its
     /// time is absent here too.
     #[inline]
-    pub fn peek(&self, key: &str) -> Option<ValueRef<'_>> {
-        let key = key.as_bytes();
+    pub fn peek(&self, key: &(impl AsRef<[u8]> + ?Sized)) -> Option<ValueRef<'_>> {
+        let key = key.as_ref();
         self.find_live(self.hash_of(key), key)
             .map(|s| s.entry().value())
     }
@@ -531,8 +531,11 @@ impl ShardMap {
     /// the Unix epoch) if it has one: both from the one entry. A use of the
     /// key.
     #[inline(always)]
-    pub fn get_expiring(&self, key: &str) -> Option<(ValueRef<'_>, Option<u64>)> {
-        let key = key.as_bytes();
+    pub fn get_expiring(
+        &self,
+        key: &(impl AsRef<[u8]> + ?Sized),
+    ) -> Option<(ValueRef<'_>, Option<u64>)> {
+        let key = key.as_ref();
         let hash = self.hash_of(key);
         self.find_live(hash, key).map(|s| {
             let e = s.entry();
@@ -548,8 +551,8 @@ impl ShardMap {
     /// brought up to date by a `GET` that went on to find it gone, by an
     /// `MGET`, and by a `GET` on a replica, which leaves it for its master.
     #[inline(always)]
-    pub fn lookup(&self, key: &str) -> Lookup<'_> {
-        let key = key.as_bytes();
+    pub fn lookup(&self, key: &(impl AsRef<[u8]> + ?Sized)) -> Lookup<'_> {
+        let key = key.as_ref();
         let hash = self.hash_of(key);
         match self.find(hash, key) {
             Some(s) => {
@@ -566,8 +569,11 @@ impl ShardMap {
 
     /// `key`'s value and when its time to live ends, past its time or not,
     /// its use not written: what a key past its time still holds.
-    pub fn peek_expiring(&self, key: &str) -> Option<(ValueRef<'_>, Option<u64>)> {
-        let key = key.as_bytes();
+    pub fn peek_expiring(
+        &self,
+        key: &(impl AsRef<[u8]> + ?Sized),
+    ) -> Option<(ValueRef<'_>, Option<u64>)> {
+        let key = key.as_ref();
         self.find(self.hash_of(key), key)
             .map(|s| (s.entry().value(), s.entry().expires()))
     }
@@ -576,16 +582,16 @@ impl ShardMap {
     /// `None` if it has none, or there is no such key. Past or not: this is
     /// what lazy and active expiry go by.
     #[inline(always)]
-    pub fn expires(&self, key: &str) -> Option<u64> {
-        let key = key.as_bytes();
+    pub fn expires(&self, key: &(impl AsRef<[u8]> + ?Sized)) -> Option<u64> {
+        let key = key.as_ref();
         self.find(self.hash_of(key), key)
             .and_then(|s| s.entry().expires())
     }
 
     /// Whether there is such a key: a use of it, if there is.
     #[inline(always)]
-    pub fn contains_key(&self, key: &str) -> bool {
-        let key = key.as_bytes();
+    pub fn contains_key(&self, key: &(impl AsRef<[u8]> + ?Sized)) -> bool {
+        let key = key.as_ref();
         let hash = self.hash_of(key);
         match self.find_live(hash, key) {
             Some(s) => {
@@ -599,8 +605,8 @@ impl ShardMap {
     /// `key`'s access word: when it was last used, or how often
     /// (`eviction::Access`). `None` if there is no such key.
     #[inline]
-    pub fn access(&self, key: &str) -> Option<u32> {
-        let key = key.as_bytes();
+    pub fn access(&self, key: &(impl AsRef<[u8]> + ?Sized)) -> Option<u32> {
+        let key = key.as_ref();
         self.find(self.hash_of(key), key)
             .map(|s| s.entry().access())
     }
@@ -631,8 +637,8 @@ impl ShardMap {
 
     /// A hold on `key`'s entry: its key and value, readable once the shard
     /// is let go of, and unchanged for as long as it is held.
-    pub fn get_ref(&self, key: &str) -> Option<EntryRef> {
-        let key = key.as_bytes();
+    pub fn get_ref(&self, key: &(impl AsRef<[u8]> + ?Sized)) -> Option<EntryRef> {
+        let key = key.as_ref();
         // SAFETY: the entry is in this table, which the caller has locked.
         self.find_live(self.hash_of(key), key)
             .map(|s| unsafe { EntryRef::new(s.entry()) })
@@ -640,8 +646,8 @@ impl ShardMap {
 
     /// Whether `key`'s entry is the one `held` holds: whether the key's
     /// value is the very one it had when `held` was taken.
-    pub fn holds(&self, key: &str, held: &EntryRef) -> bool {
-        let key = key.as_bytes();
+    pub fn holds(&self, key: &(impl AsRef<[u8]> + ?Sized), held: &EntryRef) -> bool {
+        let key = key.as_ref();
         self.find_live(self.hash_of(key), key)
             .is_some_and(|s| held.is(s.entry()))
     }
@@ -748,8 +754,8 @@ impl ShardMap {
     /// it, which is best done once the shard is unlocked. The key keeps its
     /// time to live.
     #[inline]
-    pub fn insert(&mut self, key: impl AsRef<str>, value: KiviDBValue) -> Option<Taken> {
-        self.put(key.as_ref().as_bytes(), Ttl::Keep, None, |key, expires| {
+    pub fn insert(&mut self, key: impl AsRef<[u8]>, value: KiviDBValue) -> Option<Taken> {
+        self.put(key.as_ref(), Ttl::Keep, None, |key, expires| {
             Entry::new(key, value, expires)
         })
         .replaced()
@@ -760,25 +766,22 @@ impl ShardMap {
     #[inline]
     pub fn insert_expiring(
         &mut self,
-        key: impl AsRef<str>,
+        key: impl AsRef<[u8]>,
         value: KiviDBValue,
         expires: Option<u64>,
     ) -> Option<Taken> {
-        self.put(
-            key.as_ref().as_bytes(),
-            Ttl::Set(expires),
-            None,
-            |key, expires| Entry::new(key, value, expires),
-        )
+        self.put(key.as_ref(), Ttl::Set(expires), None, |key, expires| {
+            Entry::new(key, value, expires)
+        })
         .replaced()
     }
 
     /// Set `key` to the string `bytes`: [`ShardMap::insert`] of a string,
     /// with its bytes copied once, into the entry.
     #[inline]
-    pub fn insert_str(&mut self, key: impl AsRef<str>, bytes: impl AsRef<[u8]>) -> Option<Taken> {
+    pub fn insert_str(&mut self, key: impl AsRef<[u8]>, bytes: impl AsRef<[u8]>) -> Option<Taken> {
         let bytes = bytes.as_ref();
-        self.put(key.as_ref().as_bytes(), Ttl::Keep, None, |key, expires| {
+        self.put(key.as_ref(), Ttl::Keep, None, |key, expires| {
             Entry::string(key, bytes, expires)
         })
         .replaced()
@@ -788,14 +791,11 @@ impl ShardMap {
     /// in the key's own entry, when that can be done (see the module); else
     /// as [`ShardMap::insert_str`].
     #[inline]
-    pub fn set_str(&mut self, key: impl AsRef<str>, bytes: impl AsRef<[u8]>) -> Written {
+    pub fn set_str(&mut self, key: impl AsRef<[u8]>, bytes: impl AsRef<[u8]>) -> Written {
         let bytes = bytes.as_ref();
-        self.put(
-            key.as_ref().as_bytes(),
-            Ttl::Keep,
-            Some(bytes),
-            |key, expires| Entry::string(key, bytes, expires),
-        )
+        self.put(key.as_ref(), Ttl::Keep, Some(bytes), |key, expires| {
+            Entry::string(key, bytes, expires)
+        })
     }
 
     /// [`ShardMap::set_str`], the key's time to live set to `expires`, or
@@ -803,13 +803,13 @@ impl ShardMap {
     #[inline]
     pub fn set_str_expiring(
         &mut self,
-        key: impl AsRef<str>,
+        key: impl AsRef<[u8]>,
         bytes: impl AsRef<[u8]>,
         expires: Option<u64>,
     ) -> Written {
         let bytes = bytes.as_ref();
         self.put(
-            key.as_ref().as_bytes(),
+            key.as_ref(),
             Ttl::Set(expires),
             Some(bytes),
             |key, expires| Entry::string(key, bytes, expires),
@@ -820,8 +820,12 @@ impl ShardMap {
     /// can be done (see the module). Returns the string's new length if it
     /// was; `None` leaves everything as it was, for the caller to write a
     /// new value.
-    pub fn append_in_place(&mut self, key: &str, extra: &[u8]) -> Option<usize> {
-        let key = key.as_bytes();
+    pub fn append_in_place(
+        &mut self,
+        key: &(impl AsRef<[u8]> + ?Sized),
+        extra: &[u8],
+    ) -> Option<usize> {
+        let key = key.as_ref();
         let hash = self.hash_of(key);
         let map = self.id();
         let entry = self.find_live(hash, key)?.entry();
@@ -839,8 +843,13 @@ impl ShardMap {
     /// with zero bytes to reach it, in its own entry if that can be done
     /// (see the module). Returns the string's new length if it was; `None`
     /// leaves everything as it was.
-    pub fn set_range_in_place(&mut self, key: &str, offset: usize, patch: &[u8]) -> Option<usize> {
-        let key = key.as_bytes();
+    pub fn set_range_in_place(
+        &mut self,
+        key: &(impl AsRef<[u8]> + ?Sized),
+        offset: usize,
+        patch: &[u8],
+    ) -> Option<usize> {
+        let key = key.as_ref();
         let hash = self.hash_of(key);
         let map = self.id();
         let entry = self.find_live(hash, key)?.entry();
@@ -859,25 +868,22 @@ impl ShardMap {
     #[inline]
     pub fn insert_str_expiring(
         &mut self,
-        key: impl AsRef<str>,
+        key: impl AsRef<[u8]>,
         bytes: impl AsRef<[u8]>,
         expires: Option<u64>,
     ) -> Option<Taken> {
         let bytes = bytes.as_ref();
-        self.put(
-            key.as_ref().as_bytes(),
-            Ttl::Set(expires),
-            None,
-            |key, expires| Entry::string(key, bytes, expires),
-        )
+        self.put(key.as_ref(), Ttl::Set(expires), None, |key, expires| {
+            Entry::string(key, bytes, expires)
+        })
         .replaced()
     }
 
     /// Give `key` the time to live that ends at `expires` (milliseconds
     /// since the Unix epoch). Returns whether there is such a key: one past
     /// its time is left for expiry to take out.
-    pub fn set_expires(&mut self, key: &str, expires: u64) -> bool {
-        let key = key.as_bytes();
+    pub fn set_expires(&mut self, key: &(impl AsRef<[u8]> + ?Sized), expires: u64) -> bool {
+        let key = key.as_ref();
         let hash = self.hash_of(key);
         let map = self.id();
         let Some(slot) = self
@@ -908,8 +914,8 @@ impl ShardMap {
     }
 
     /// Take `key`'s time to live away. Returns whether it had one.
-    pub fn persist(&mut self, key: &str) -> bool {
-        let key = key.as_bytes();
+    pub fn persist(&mut self, key: &(impl AsRef<[u8]> + ?Sized)) -> bool {
+        let key = key.as_ref();
         let hash = self.hash_of(key);
         let map = self.id();
         let Some(slot) = self
@@ -954,10 +960,8 @@ impl ShardMap {
     }
 
     /// Every key with a time to live, and when it ends.
-    pub fn expiring(&self) -> impl Iterator<Item = (&str, u64)> {
-        self.ttl
-            .iter()
-            .map(|e| (e.key_str(), e.expires().unwrap_or(0)))
+    pub fn expiring(&self) -> impl Iterator<Item = (&[u8], u64)> {
+        self.ttl.iter().map(|e| (e.key(), e.expires().unwrap_or(0)))
     }
 
     /// The keys whose time to live ended before `now` (milliseconds since
@@ -974,7 +978,7 @@ impl ShardMap {
                 prefetch_expiry(*ahead);
             }
             if e.expires().is_some_and(|at| at < now) {
-                due.push(crate::store::Key::from(e.key_str()));
+                due.push(crate::store::Key::new(e.key()));
                 if due.len() == limit {
                     return (due, i + 1);
                 }
@@ -984,7 +988,7 @@ impl ShardMap {
     }
 
     /// Take `key` out if its time to live ended before `now`.
-    pub fn remove_if_due(&mut self, key: &str, now: u64) -> Option<Taken> {
+    pub fn remove_if_due(&mut self, key: &(impl AsRef<[u8]> + ?Sized), now: u64) -> Option<Taken> {
         if self.expires(key).is_some_and(|at| at < now) {
             self.remove(key)
         } else {
@@ -993,8 +997,8 @@ impl ShardMap {
     }
 
     #[inline]
-    pub fn remove(&mut self, key: &str) -> Option<Taken> {
-        let key = key.as_bytes();
+    pub fn remove(&mut self, key: &(impl AsRef<[u8]> + ?Sized)) -> Option<Taken> {
+        let key = key.as_ref();
         let hash = self.hash_of(key);
         match self
             .table
@@ -1021,8 +1025,12 @@ impl ShardMap {
     /// Taking the key out and putting it back, as `GETDEL` did, made it a
     /// new entry: an LFU count of 5, whatever it had been (#221).
     #[inline]
-    pub fn remove_if(&mut self, key: &str, take: impl FnOnce(ValueRef<'_>) -> bool) -> Removal {
-        let key = key.as_bytes();
+    pub fn remove_if(
+        &mut self,
+        key: &(impl AsRef<[u8]> + ?Sized),
+        take: impl FnOnce(ValueRef<'_>) -> bool,
+    ) -> Removal {
+        let key = key.as_ref();
         let hash = self.hash_of(key);
         let map = self.id();
         match self
@@ -1054,12 +1062,12 @@ impl ShardMap {
     /// best dropped once the shard is unlocked. A live key is left alone,
     /// and `taken` is given back instead.
     pub fn put_back(&mut self, taken: Taken) -> Result<Option<Taken>, Taken> {
-        let hash = self.hash_of(taken.key().as_bytes());
+        let hash = self.hash_of(taken.key());
         let now = &self.now;
         let hasher = &self.hash;
         let list = &mut self.ttl;
         let over = &mut self.written_over;
-        let key = taken.key().as_bytes();
+        let key = taken.key();
         match self.table.entry(
             hash,
             |s| s.may_be(hash) && s.entry().has_key(key),
@@ -1100,15 +1108,15 @@ impl ShardMap {
         self.get(key).expect("a key just put in")
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&str, ValueRef<'_>)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&[u8], ValueRef<'_>)> {
         self.table.iter().map(|s| {
             let e = s.entry();
-            (e.key_str(), e.value())
+            (e.key(), e.value())
         })
     }
 
-    pub fn keys(&self) -> impl Iterator<Item = &str> {
-        self.table.iter().map(|s| s.entry().key_str())
+    pub fn keys(&self) -> impl Iterator<Item = &[u8]> {
+        self.table.iter().map(|s| s.entry().key())
     }
 
     pub fn values(&self) -> impl Iterator<Item = ValueRef<'_>> {
@@ -1175,10 +1183,10 @@ impl ShardMap {
 
     /// The key and value in bucket `index`, if it holds one.
     #[inline]
-    pub fn bucket(&self, index: usize) -> Option<(&str, ValueRef<'_>)> {
+    pub fn bucket(&self, index: usize) -> Option<(&[u8], ValueRef<'_>)> {
         self.table.get_bucket(index).map(|s| {
             let e = s.entry();
-            (e.key_str(), e.value())
+            (e.key(), e.value())
         })
     }
 
@@ -1217,7 +1225,7 @@ impl ShardMap {
     /// random bucket is tried until one is full, as Redis's
     /// `dictGetFairRandomKey` does; a table that is very sparse is walked
     /// from a random bucket.
-    pub fn random_entry(&self, mut pick: impl FnMut() -> usize) -> Option<(&str, ValueRef<'_>)> {
+    pub fn random_entry(&self, mut pick: impl FnMut() -> usize) -> Option<(&[u8], ValueRef<'_>)> {
         if self.is_empty() {
             return None;
         }
@@ -1359,8 +1367,8 @@ pub struct EntryView<'a> {
 }
 
 impl<'a> EntryView<'a> {
-    pub fn key(&self) -> &'a str {
-        self.entry.key_str()
+    pub fn key(&self) -> &'a [u8] {
+        self.entry.key()
     }
 
     pub fn value(&self) -> ValueRef<'a> {
@@ -1549,6 +1557,45 @@ mod tests {
         assert!(map.is_empty());
     }
 
+    /// The table takes and gives back keys as bytes, any bytes: what the
+    /// commands will hand it once they take keys that are not text (#437).
+    #[test]
+    fn keys_are_bytes_of_any_kind() {
+        let mut map = ShardMap::new();
+        let keys: Vec<Vec<u8>> = vec![
+            b"\xff\x00k".to_vec(),
+            b"\xfe".to_vec(),
+            vec![0xe7; 24],
+            (0u8..=255).collect(),
+            b"plain".to_vec(),
+        ];
+        for (i, key) in keys.iter().enumerate() {
+            assert!(map.insert_str(key.as_slice(), i.to_string()).is_none());
+        }
+        assert_eq!(map.len(), keys.len());
+        for (i, key) in keys.iter().enumerate() {
+            match map.get(key.as_slice()) {
+                Some(ValueRef::String(v)) => assert_eq!(&v[..], i.to_string().as_bytes()),
+                _ => panic!("{key:?} not found"),
+            }
+        }
+        // `\xfe` and `\xff\x00k` are two keys, not one U+FFFD.
+        assert!(map.get(&b"\xef\xbf\xbd"[..]).is_none());
+        let mut seen: Vec<Vec<u8>> = map.keys().map(<[u8]>::to_vec).collect();
+        seen.sort();
+        let mut want = keys.clone();
+        want.sort();
+        assert_eq!(seen, want);
+        assert!(map.set_expires(&b"\xfe"[..], u64::MAX - 1));
+        assert_eq!(
+            map.expiring().map(|(k, _)| k.to_vec()).collect::<Vec<_>>(),
+            vec![b"\xfe".to_vec()]
+        );
+        let taken = map.remove(&keys[0][..]).expect("there");
+        assert_eq!(taken.key(), &keys[0][..]);
+        assert!(map.get(&keys[0][..]).is_none());
+    }
+
     #[test]
     fn keys_survive_growth_and_shrinking() {
         let mut map = ShardMap::new();
@@ -1570,8 +1617,8 @@ mod tests {
         for i in 0..1_000 {
             map.insert(format!("k{i}"), s("v"));
         }
-        let mut seen: Vec<String> = (0..map.buckets())
-            .filter_map(|i| map.bucket(i).map(|(k, _)| k.to_string()))
+        let mut seen: Vec<Vec<u8>> = (0..map.buckets())
+            .filter_map(|i| map.bucket(i).map(|(k, _)| k.to_vec()))
             .collect();
         seen.sort();
         seen.dedup();
@@ -1601,7 +1648,7 @@ mod tests {
         for i in 1..100 {
             map.remove(&format!("k{i}"));
         }
-        assert_eq!(map.random_entry(|| 0).map(|(k, _)| k), Some("k0"));
+        assert_eq!(map.random_entry(|| 0).map(|(k, _)| k), Some(&b"k0"[..]));
     }
 
     #[test]
@@ -1675,7 +1722,10 @@ mod tests {
         assert_eq!(map.append_in_place("app", b"6"), None);
         map.insert_str_expiring("rng", "5", Some(1));
         assert_eq!(map.set_range_in_place("rng", 0, b"6"), None);
-        assert_eq!(map.take_written_over(), vec!["set".to_string()]);
+        assert_eq!(
+            map.take_written_over(),
+            vec![crate::store::Key::from("set")]
+        );
         // A live key is still written in place.
         map.insert_str_expiring("live", "5", Some(u64::MAX - 1));
         assert!(matches!(map.set_str("live", "6"), Written::InPlace));

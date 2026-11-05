@@ -271,7 +271,7 @@ pub(super) fn keys_matching_filters(
                 let map = read_lock!(shard);
                 for (k, v) in map.iter() {
                     if matches!(v, ValueRef::TimeSeries(_)) {
-                        all.push(k.to_string());
+                        all.push(crate::store::key_text(k).to_owned());
                     }
                 }
             }
