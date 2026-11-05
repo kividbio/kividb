@@ -29,6 +29,35 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A client that goes while it is blocked no longer takes the next
+  element (#384).** On the io_uring I/O model (the default on Linux), a
+  client blocked in `BLPOP`, `BRPOPLPUSH`, `BLMOVE`, `BZPOPMIN`,
+  `XREADGROUP … BLOCK` or any other blocking command, that had sent more
+  bytes behind it and then closed its connection, was not seen to go. It
+  stayed in line until its timeout (for ever with timeout 0), kept its
+  connection, and took the next element pushed to its key, which nobody
+  received: lost with `BLPOP`, moved for a dead worker with `BRPOPLPUSH`,
+  left pending for a gone consumer with `XREADGROUP`. Bull, which n8n's
+  queue mode uses, does exactly this whenever a worker pauses or stops.
+  The connection loop now watches a blocked client's socket for its end
+  (`POLLRDHUP`) whatever it has sent, so it is let go and its connection
+  closed as soon as the end arrives, as Redis does; the tokio I/O model
+  already did. On both I/O models a client woken for an element checks
+  first that it is still there, and a command whose client has gone leaves
+  the line without taking anything. A client that closes while
+  `CLIENT PAUSE` holds its command, or while it waits in `WAIT` or
+  `WAITAOF`, is let go too, and the held command is not run after the
+  pause: a blocking pop held by a pause used to run when it ended, and
+  take an element for nobody. A command the pause does not hold still
+  runs, as a fire-and-forget `LPUSH` sent as a pause ends does in Redis.
+  A client woken for an element whose command is refused before it looks
+  at the key (`OOM`, `READONLY` after a failover, a pause it then closes
+  in) now passes its turn to the client behind it; it used to keep the
+  turn, and the element waited in the list, with clients blocked on it,
+  for the next write. On the tokio I/O model, a client that keeps sending
+  while it waits is closed once what it sent passes
+  `client-query-buffer-limit`, as Redis closes one; it used to be read
+  into memory without end.
 - **A replica could stop for good while it saved (#373).** The replica
   entered the command gate while holding its own apply lock, which `SAVE`
   (and a promotion, `REPLICAOF NO ONE`) waits for while holding the gate.

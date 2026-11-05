@@ -88,9 +88,9 @@ Running Firecrawl from source instead (`pnpm harness ...` in `apps/api`), set `R
 - A full run of Firecrawl's suite sometimes fails a few batch scrape and crawl tests with "expected 0 to be
   greater than 0": once in five runs on KiviDB and once in five on Redis 8. They pass when run again, and
   the cause is in Firecrawl, not the server.
-- On the io_uring I/O model, a client that closes a connection blocked in `BZPOPMIN` after sending more
-  commands on it is not noticed until the wait times out
-  ([#384](https://github.com/kividbio/kividb/issues/384)). It showed up with n8n's Bull workers; nothing in
-  Firecrawl's tests failed because of it.
+- In 1.2.0, on the io_uring I/O model, a client that closed a connection blocked in `BZPOPMIN` after
+  sending more commands on it was not noticed until the wait timed out
+  ([#384](https://github.com/kividbio/kividb/issues/384)); fixed in 1.2.1. It showed up with n8n's Bull
+  workers; nothing in Firecrawl's tests failed because of it.
 - Not tested: the Playwright engine, a proxy, AI features (they need a model key), the FoundationDB NuQ
   backend, and TLS.
