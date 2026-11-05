@@ -1878,6 +1878,79 @@ fn zcount_missing_key_wrong_type_and_bad_bounds() {
     assert_eq!(c.cmds(&["GET", "s"]).as_str(), "v");
 }
 
+/// A score bound is read as Redis's `zslParseRange` reads it, with
+/// `fast_float_strtod`, that is `strtod`: an empty one is 0, `(` alone is an
+/// open 0, and one too large for a double is infinite (#413). Space before
+/// the number is skipped. What is left over after the number is refused,
+/// and NaN, as in Redis 8.10.
+#[test]
+fn score_bounds_are_read_as_redis_reads_them() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let members = |reply: &RespValue| -> Vec<String> {
+        reply
+            .as_array()
+            .iter()
+            .map(|m| m.as_str().to_string())
+            .collect()
+    };
+    c.cmds(&[
+        "ZADD", "z", "-inf", "ninf", "-1", "neg", "0", "zero", "1", "one", "inf", "pinf",
+    ]);
+    assert_eq!(c.cmds(&["ZCOUNT", "z", "", ""]).as_int(), 1);
+    assert_eq!(c.cmds(&["ZCOUNT", "z", "(", "+inf"]).as_int(), 2);
+    assert_eq!(c.cmds(&["ZCOUNT", "z", "-inf", "("]).as_int(), 2);
+    assert_eq!(c.cmds(&["ZCOUNT", "z", "1e400", "+inf"]).as_int(), 1);
+    assert_eq!(c.cmds(&["ZCOUNT", "z", "-inf", "-1e400"]).as_int(), 1);
+    assert_eq!(c.cmds(&["ZCOUNT", "z", "(-1e400", "(1e400"]).as_int(), 3);
+    assert_eq!(c.cmds(&["ZCOUNT", "z", "-1E400", "+1e+400"]).as_int(), 5);
+    assert_eq!(c.cmds(&["ZCOUNT", "nosuch", "", "("]).as_int(), 0);
+    assert_eq!(c.cmds(&["ZCOUNT", "z", " 1", "(\t1e400"]).as_int(), 1);
+    assert_eq!(c.cmds(&["ZCOUNT", "z", "-0x1p0", "0X1"]).as_int(), 3);
+    assert_eq!(members(&c.cmds(&["ZRANGEBYSCORE", "z", "", ""])), ["zero"]);
+    assert_eq!(
+        members(&c.cmds(&["ZREVRANGEBYSCORE", "z", "1e400", "("])),
+        ["pinf", "one"]
+    );
+    assert_eq!(
+        members(&c.cmds(&["ZRANGE", "z", "(", "1e400", "BYSCORE"])),
+        ["one", "pinf"]
+    );
+    assert_eq!(
+        members(&c.cmds(&["ZRANGE", "z", "", "-1e400", "BYSCORE", "REV"])),
+        ["zero", "neg", "ninf"]
+    );
+    assert_eq!(
+        c.cmds(&["ZRANGESTORE", "dst", "z", "", "1e400", "BYSCORE"])
+            .as_int(),
+        3
+    );
+    assert_eq!(
+        c.cmds(&["ZREMRANGEBYSCORE", "z", "1e400", "1e400"])
+            .as_int(),
+        1
+    );
+    assert_eq!(c.cmds(&["ZREMRANGEBYSCORE", "z", "", ""]).as_int(), 1);
+    assert_eq!(c.cmds(&["ZCARD", "z"]).as_int(), 3);
+
+    for bad in [
+        "nan", "(nan", "-nan", "x", "((1", " (1", " ", "-", "1 ", "0x", "1e", "infx",
+    ] {
+        for (min, max) in [(bad, "+inf"), ("-inf", bad)] {
+            for cmd in ["ZCOUNT", "ZRANGEBYSCORE", "ZREMRANGEBYSCORE"] {
+                let r = c.cmds(&[cmd, "z", min, max]);
+                assert!(r.is_error(), "{cmd} {min:?} {max:?}: {r:?}");
+            }
+            let r = c.cmds(&["ZRANGE", "z", min, max, "BYSCORE"]);
+            assert!(r.is_error(), "ZRANGE BYSCORE {min:?} {max:?}: {r:?}");
+        }
+    }
+    // Not UTF-8: left over, as in Redis.
+    assert!(c.cmd(&[b"ZCOUNT", b"z", b"1\xff", b"+inf"]).is_error());
+    assert_eq!(c.cmds(&["ZCARD", "z"]).as_int(), 3);
+}
+
 #[test]
 fn zremrangebyscore_removes_only_its_range_and_deletes_an_emptied_key() {
     let port = free_port();
