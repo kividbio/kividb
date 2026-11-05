@@ -40,6 +40,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   keeps the offset still for a failover; the next write in another database
   carries its own `SELECT` (#411).
 
+- **A sorted set with a NaN score is refused when it is restored or
+  loaded.** No command makes one, but `RESTORE` of a crafted payload took
+  one, and so did loading a snapshot, the AOF's preamble, a full sync from a
+  master or a Redis RDB file. Its order put the NaN above `+inf`, so
+  `ZCOUNT -inf +inf` and the other unbounded score ranges counted a member
+  the rest of the code assumes cannot exist. As in Redis, `RESTORE` now
+  replies `ERR Bad data format`, and loading fails with `Zset with NAN score
+  detected` (naming the key, for a KiviDB snapshot). Infinite scores load
+  as before (#414).
+
+  **Upgrade note:** a server that refuses such a key refuses to start
+  rather than start without it, so a 1.2.0 server holding one (it can
+  only have come from a crafted `RESTORE` or snapshot) won't start after
+  the upgrade if the key is in its snapshot or AOF preamble. On 1.2.0,
+  find such keys first (`ZRANGE key 0 -1 WITHSCORES` shows `nan`) and
+  delete them before upgrading.
+
 - **Score-range bounds are read as Redis reads them.** `ZCOUNT`,
   `ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`, `ZREMRANGEBYSCORE`, and `ZRANGE` and
   `ZRANGESTORE` with `BYSCORE` refused an empty bound, `(` alone and a
