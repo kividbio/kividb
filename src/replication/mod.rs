@@ -3852,7 +3852,7 @@ pub fn is_denied_on_readonly_replica(name: &str, cmd: &[&[u8]]) -> bool {
         // before it runs. Every script was, the ones that only read too
         // (#145).
         "EVAL" | "EVALSHA" | "FCALL" => script_may_write(name, cmd),
-        "GEORADIUS" | "GEORADIUSBYMEMBER" => georadius_stores(cmd),
+        "GEORADIUS" | "GEORADIUSBYMEMBER" => georadius_stores(name, cmd),
         // Only TODENSE and RESET rewrite the value; GETREG, DECODE and
         // ENCODING are diagnostics, deliberately read-only here.
         "PFDEBUG" => pfdebug_mutates(cmd),
@@ -3906,9 +3906,15 @@ fn script_may_write(name: &str, cmd: &[&[u8]]) -> bool {
 
 /// `GEORADIUS` / `GEORADIUSBYMEMBER` are reads unless they carry `STORE` or
 /// `STOREDIST`, which write the result set to another key.
-fn georadius_stores(cmd: &[&[u8]]) -> bool {
+fn georadius_stores(name: &str, cmd: &[&[u8]]) -> bool {
+    // The STORE / STOREDIST options follow the fixed arguments
+    // (`key lon lat radius unit`, or `key member radius unit` for
+    // GEORADIUSBYMEMBER). Scanning from there, not from argument 1, keeps a
+    // member or key literally named "store" from being taken for the option,
+    // using the same fixed-argument count as `keyspec::geo_radius_keys`.
+    let options = if name == "GEORADIUSBYMEMBER" { 5 } else { 6 };
     cmd.iter()
-        .skip(1)
+        .skip(options)
         .any(|a| a.eq_ignore_ascii_case(b"STORE") || a.eq_ignore_ascii_case(b"STOREDIST"))
 }
 
@@ -3929,7 +3935,7 @@ pub fn command_mutates_for_replication(name: &str, cmd: &[&[u8]]) -> bool {
         "EVAL_RO" | "EVALSHA_RO" | "FCALL_RO" => false,
         // Writes replicate as inner `redis.call` commands, not as `EVAL` / `EVALSHA` / `FCALL`.
         "EVAL" | "EVALSHA" | "FCALL" => false,
-        "GEORADIUS" | "GEORADIUSBYMEMBER" => georadius_stores(cmd),
+        "GEORADIUS" | "GEORADIUSBYMEMBER" => georadius_stores(name, cmd),
         "PFDEBUG" => pfdebug_mutates(cmd),
         // Propagated as the `DEL` of whatever it moved away; see
         // `script_feed::commands_for_propagation`.
@@ -3967,7 +3973,7 @@ pub fn inner_command_blocked_in_readonly_script(name: &str, cmd: &[&[u8]]) -> bo
         // `PFCOUNT`, possibly to its key: not what a script that has said it
         // writes nothing may do.
         "PUBLISH" | "SPUBLISH" | "PFCOUNT" => true,
-        "GEORADIUS" | "GEORADIUSBYMEMBER" => georadius_stores(cmd),
+        "GEORADIUS" | "GEORADIUSBYMEMBER" => georadius_stores(name, cmd),
         "PFDEBUG" => pfdebug_mutates(cmd),
         "MIGRATE" => true,
         "HIMPORT" => crate::commands::hash_import::is_write(cmd),
@@ -4470,6 +4476,18 @@ mod replication_invariants_tests {
         assert!(super::command_mutates_for_replication(
             "GEORADIUSBYMEMBER",
             &storedist
+        ));
+        // A member or key literally named "store" is not the STORE option:
+        // the scan starts after the fixed arguments.
+        let member_named_store: Vec<&[u8]> =
+            vec![b"GEORADIUSBYMEMBER", b"k", b"store", b"1", b"km"];
+        assert!(!super::command_mutates_for_replication(
+            "GEORADIUSBYMEMBER",
+            &member_named_store
+        ));
+        assert!(!super::is_denied_on_readonly_replica(
+            "GEORADIUSBYMEMBER",
+            &member_named_store
         ));
     }
 

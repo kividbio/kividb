@@ -827,12 +827,28 @@ pub fn acks_wait() -> bool {
 /// Whether a command may write a record its reply should wait for: a write,
 /// or a script or a transaction that may make some.
 #[inline]
-pub fn may_log(name: &[u8]) -> bool {
-    crate::replication::is_write_command_bytes(name)
-        || name.eq_ignore_ascii_case(b"EVAL")
-        || name.eq_ignore_ascii_case(b"EVALSHA")
-        || name.eq_ignore_ascii_case(b"FCALL")
-        || name.eq_ignore_ascii_case(b"EXEC")
+pub fn may_log(cmd: &[&[u8]]) -> bool {
+    let Some(&cmd0) = cmd.first() else {
+        return false;
+    };
+    let mut buf = [0u8; 32];
+    let name = if cmd0.len() <= 32 {
+        for (i, &b) in cmd0.iter().enumerate() {
+            buf[i] = b.to_ascii_uppercase();
+        }
+        std::str::from_utf8(&buf[..cmd0.len()]).unwrap_or("")
+    } else {
+        ""
+    };
+    // A command that writes only with some arguments (GEORADIUS ... STORE,
+    // MIGRATE, ...) is judged by them, so its reply waits for its record like
+    // any other write's (`command_mutates_for_replication`). EVAL / EVALSHA /
+    // FCALL / EXEC may write from what they run.
+    crate::replication::command_mutates_for_replication(name, cmd)
+        || cmd0.eq_ignore_ascii_case(b"EVAL")
+        || cmd0.eq_ignore_ascii_case(b"EVALSHA")
+        || cmd0.eq_ignore_ascii_case(b"FCALL")
+        || cmd0.eq_ignore_ascii_case(b"EXEC")
 }
 
 /// How long a reply to a write waits for its records to reach the file

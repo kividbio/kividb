@@ -2675,7 +2675,11 @@ const FAST_COMMANDS: &[&str] = &[
 /// sent it to follow the database, and Redis has it in `@fast @connection`
 /// only (#392).
 fn is_acl_write(name: &str) -> bool {
-    crate::replication::is_write_command(name) && name != "SELECT"
+    (crate::replication::is_write_command(name) && name != "SELECT")
+        // Writes only with some arguments, but Redis flags them `write` and
+        // puts them in `@write` (not `@read`) regardless, as can-write; the
+        // per-key and runtime checks look at the arguments.
+        || matches!(name, "GEORADIUS" | "GEORADIUSBYMEMBER" | "MIGRATE")
 }
 
 /// The categories in [`ACL_CATEGORIES`] that Redis does not have. They
@@ -3223,11 +3227,23 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
         // gate replica read-only enforcement (`replication::is_write_command`)
         // — reusing it here keeps `-@write`/`+@write` consistent with that
         // check instead of maintaining a second, independently-drifting list.
-        "write" => ALL_COMMANDS
-            .iter()
-            .copied()
-            .filter(|c| is_acl_write(c))
-            .collect(),
+        "write" => {
+            let mut cmds: Vec<&'static str> = ALL_COMMANDS
+                .iter()
+                .copied()
+                .filter(|c| is_acl_write(c))
+                .collect();
+            // FUNCTION's loading subcommands write (the container as a whole
+            // names no key, and FUNCTION LIST / DUMP / STATS read), as Redis
+            // places `function|load` etc. in `@write`.
+            cmds.extend_from_slice(&[
+                "FUNCTION|LOAD",
+                "FUNCTION|DELETE",
+                "FUNCTION|FLUSH",
+                "FUNCTION|RESTORE",
+            ]);
+            cmds
+        }
         // Union of the existing data-access categories, minus anything
         // classified as a write above.
         "read" => {
@@ -3251,7 +3267,7 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
             ]
             .iter()
             .flat_map(|cat| acl_cat_commands(cat).unwrap_or_default())
-            .filter(|c| !crate::replication::is_write_command(c))
+            .filter(|c| !is_acl_write(c))
             .collect();
             cmds.sort_unstable();
             cmds.dedup();

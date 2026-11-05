@@ -1017,7 +1017,7 @@ pub async fn handle_client(
             if !blocking_slot.resuming() {
                 activity.record(&cmd, selected_db);
             }
-            if !aof_wait && crate::aof::acks_wait() && crate::aof::may_log(cmd[0]) {
+            if !aof_wait && crate::aof::acks_wait() && crate::aof::may_log(&cmd) {
                 aof_wait = true;
             }
             // The command before this one is over: its reply is settled, and

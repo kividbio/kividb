@@ -67,7 +67,7 @@ pub fn queue_refusal(name: &str, cmd: &[&[u8]]) -> Option<Vec<u8>> {
     if busy(cmd) {
         return Some(crate::resp::write::resp_error(BUSY));
     }
-    no_room(name, cmd[0]).then(|| crate::resp::write::resp_error(OOM))
+    no_room(name, cmd).then(|| crate::resp::write::resp_error(OOM))
 }
 
 const OOM: &str = "OOM command not allowed when used memory > 'maxmemory'.";
@@ -75,10 +75,10 @@ const OOM: &str = "OOM command not allowed when used memory > 'maxmemory'.";
 /// A write, with the server over `maxmemory` and no policy that could make
 /// room for it. (With a policy that evicts, room is made when the command
 /// runs, as it is for a command outside a transaction.)
-fn no_room(name: &str, cmd0: &[u8]) -> bool {
+fn no_room(name: &str, cmd: &[&[u8]]) -> bool {
     crate::commands::handler::check_memory_limit()
         && crate::eviction::policy() == crate::eviction::Policy::NoEviction
-        && crate::replication::is_write_command_bytes(cmd0)
+        && crate::replication::command_mutates_for_replication(name, cmd)
         && !crate::eviction::allowed_when_out_of_memory(name)
 }
 
@@ -94,17 +94,22 @@ pub fn exec_refusal(
 ) -> Option<Vec<u8>> {
     let writes = || {
         queue.iter().any(|queued| {
-            queued
-                .first()
-                .is_some_and(|cmd0| crate::replication::is_write_command_bytes(cmd0))
+            let Some(cmd0) = queued.first() else {
+                return false;
+            };
+            let parts: Vec<&[u8]> = queued.iter().map(Vec::as_slice).collect();
+            let name = String::from_utf8_lossy(cmd0).to_ascii_uppercase();
+            crate::replication::command_mutates_for_replication(&name, &parts)
         })
     };
     let why = if busy(cmd) {
         BUSY
     } else if queue.iter().any(|queued| {
-        queued
-            .first()
-            .is_some_and(|cmd0| no_room(&String::from_utf8_lossy(cmd0).to_ascii_uppercase(), cmd0))
+        let Some(cmd0) = queued.first() else {
+            return false;
+        };
+        let parts: Vec<&[u8]> = queued.iter().map(Vec::as_slice).collect();
+        no_room(&String::from_utf8_lossy(cmd0).to_ascii_uppercase(), &parts)
     }) {
         OOM
     } else if repl_state.lacks_good_replicas() && writes() {
