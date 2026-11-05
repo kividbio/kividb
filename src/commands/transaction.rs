@@ -96,7 +96,7 @@ pub fn exec_refusal(
         queue.iter().any(|queued| {
             queued
                 .first()
-                .is_some_and(|cmd0| crate::replication::is_write_command_bytes(cmd0))
+                .is_some_and(|cmd0| crate::replication::is_data_write_bytes(cmd0))
         })
     };
     let why = if busy(cmd) {
