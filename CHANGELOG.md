@@ -93,8 +93,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   by [@Parikalp-Bhardwaj](https://github.com/Parikalp-Bhardwaj)).
 
 - **Hash-field TTL reads no longer scan unrelated deadlines.** 
-  Point reads check only requested fields, and whole-hash reads skip       
-  unnecessary expiry scans. ([#301](https://github.com/kividbio/kividb/issues/301), 
+  Point reads check only requested fields, and whole-hash reads skip   
+  unnecessary expiry scans. ([#301](https://github.com/kividbio/kividb/issues/301),
   by [@Parikalp-Bhardwaj](https://github.com/Parikalp-Bhardwaj)).
 
 - **A client that goes while it is blocked no longer takes the next
