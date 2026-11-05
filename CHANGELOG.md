@@ -297,17 +297,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`DEBUG` does what it says** (#236, by
   [@saikishore222](https://github.com/saikishore222)). `DEBUG
   SET-ACTIVE-EXPIRE 0` replied `OK` and the background expiry went on; it
-  now stops, for keys and hash-field TTLs alike, until `SET-ACTIVE-EXPIRE
-  1`, and keys past their time still go when read. `DEBUG PAUSE-CRON 1`
-  pauses it too, as in Redis, where it runs inside the cron. Every `DEBUG`
-  subcommand KiviDB doesn't implement replied `OK`, Redis's own included
-  (`RELOAD`, `LOADAOF`, `CHANGE-REPL-ID`, `QUICKLIST-PACKED-THRESHOLD`, …);
-  it is now Redis's `ERR unknown subcommand or wrong number of arguments`,
-  as is a known one with the wrong number of arguments, and `DEBUG HELP`
-  lists what is supported. `DEBUG OBJECT` gave the same line for every key,
-  there or not; it now gives the key's encoding, serialized length and last
-  use in Redis's order of fields, and `ERR no such key` for a key that is
-  not there.
+  now stops, for keys and hash fields alike, until `SET-ACTIVE-EXPIRE 1`,
+  and keys past their time still go when read. `DEBUG PAUSE-CRON 1` stops
+  it too, as in Redis, where the expiry runs inside the cron. A subcommand
+  KiviDB does not have (Redis's `RELOAD`, `LOADAOF`, `CHANGE-REPL-ID`,
+  `QUICKLIST-PACKED-THRESHOLD`, …) replied `OK`, and so did one with the
+  wrong number of arguments; both are now Redis's `ERR unknown subcommand
+  or wrong number of arguments`, and `DEBUG HELP` lists what is there.
+  `DEBUG OBJECT` gave the same line for every key, there or not; it now
+  gives the key's encoding, serialized length and last use in Redis's order
+  of fields, and `ERR no such key` for a key that is not there.
 
 ## [1.2.0] - 2026-11-03
 

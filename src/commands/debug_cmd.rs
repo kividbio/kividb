@@ -78,7 +78,7 @@ fn help() -> Vec<u8> {
             "OBJECT <key>",
             "    What is known of the key's value: its encoding, length and last use.",
             "PAUSE-CRON <0|1>",
-            "    Pause or resume the background expiry of keys, as SET-ACTIVE-EXPIRE does.",
+            "    Pause or resume the background expiry, keys and hash fields.",
             "POPULATE <count> [<prefix>] [<size>]",
             "    Make <count> string keys, <prefix>:0 onwards (key:0 without a prefix).",
             "PROTOCOL <type>",
