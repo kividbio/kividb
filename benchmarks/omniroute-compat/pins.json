@@ -1,0 +1,12 @@
+{
+  "omniroute": {
+    "repo": "https://github.com/cheaper-inference/OmniRoute",
+    "tag": "v3.8.52",
+    "commit": "ad6f33f66bda34eba98645d3bfdabbde294bc843",
+    "install": "npm ci (its package-lock.json at that tag)"
+  },
+  "ioredis": "5.11.1",
+  "tsx": "4.23.13",
+  "node": "22.23.4",
+  "run": "cd OmniRoute && node --import tsx/esm --import ./open-sse/utils/setupPolyfill.ts omniroute_kividb_compat.mts --url redis://HOST:PORT --label LABEL"
+}

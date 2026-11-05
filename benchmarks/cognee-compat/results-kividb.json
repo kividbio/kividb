@@ -1,0 +1,140 @@
+{
+  "label": "kividb",
+  "url": "redis://127.0.0.1:6380",
+  "redis_version": "8.10.0",
+  "cognee": "1.6.6",
+  "redis_py": "5.3.1",
+  "counts": {
+    "PASS": 19,
+    "WARN": 0,
+    "FAIL": 2
+  },
+  "checks": [
+    {
+      "check": "connection: RedisAdapter connects (PING)",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "values: set_value and get_value; a missing key is None",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "values: set_value with a TTL",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "values: delete_value",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "sessions: create_qa_entry appends to the session list and sets the 7-day TTL",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2
+    },
+    {
+      "check": "sessions: get_latest_qa_entries (last 1, last 2, an empty session)",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "sessions: get_all_qa_entries keeps the order; get_qa_entries_by_ids",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "sessions: update_qa_entry adds feedback in place",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "sessions: delete_feedback",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "sessions: delete_qa_entry",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "sessions: another user's session is separate",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "sessions: agent trace steps, count, feedback and TTL",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "sessions: session context entries: create, update, list, delete one",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2
+    },
+    {
+      "check": "sessions: delete_session removes the QA, trace and context lists only",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "sessions: with session_ttl_seconds=None the session does not expire",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2
+    },
+    {
+      "check": "usage logs: log_usage and get_usage_logs (most recent first, with a TTL)",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2
+    },
+    {
+      "check": "lock: acquire_lock sets the key with the lock timeout",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2
+    },
+    {
+      "check": "lock: a second client cannot acquire it while it is held",
+      "status": "PASS",
+      "detail": "",
+      "ms": 907
+    },
+    {
+      "check": "lock: release_lock frees it (redis-py runs a Lua script: EVALSHA)",
+      "status": "FAIL",
+      "detail": "ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)",
+      "ms": 0
+    },
+    {
+      "check": "lock: hold_lock acquires and releases (EVALSHA)",
+      "status": "FAIL",
+      "detail": "RuntimeError: Could not acquire Redis lock: cglockb1d91014",
+      "ms": 905
+    },
+    {
+      "check": "prune: flushes the database (FLUSHDB)",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    }
+  ]
+}

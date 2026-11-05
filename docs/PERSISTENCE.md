@@ -141,6 +141,8 @@ name of its own, `superseded.<unix-ms>.<n>.appendonly.aof` (or
 `….appendonly.aof.prev`): a hard link where the filesystem allows one, or
 a synced copy. The directory is synced before the log is replaced. A copy
 that fails part way is removed, so nothing partial is left under that name.
+A log that is already kept under such a name, byte for byte (by an attempt
+that could not remove it), is not kept a second time.
 
 A `[WARN]` names each file when it is kept, and says whether its writes
 are in the dataset. They are when `CONFIG SET appendonly yes` keeps the log

@@ -536,6 +536,20 @@ fn keep_aside(path: &str) -> std::io::Result<Option<String>> {
     if len <= header {
         return Ok(None);
     }
+    // Kept already, by an attempt that did not get to remove it (its removal
+    // failed, or the process stopped): not kept again. Each start or
+    // checkpoint that could not remove it added another copy (#375). Only a
+    // copy of the same name with the very same bytes counts; the caller
+    // syncs the directory before anything is removed, as for a new one.
+    let suffix = format!(".{path}");
+    for (kept, kept_len) in kept_logs() {
+        if kept_len == len && kept.ends_with(&suffix) && same_bytes(path, &kept).unwrap_or(false) {
+            // Synced first: a copy stopped between its write and its sync
+            // reads whole from the page cache, but may not be on disk.
+            std::fs::File::open(&kept)?.sync_all()?;
+            return Ok(Some(kept));
+        }
+    }
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -548,6 +562,35 @@ fn keep_aside(path: &str) -> std::io::Result<Option<String>> {
         copy_synced(path, &name, |from, to| std::fs::copy(from, to))?;
     }
     Ok(Some(name))
+}
+
+/// Whether the files `a` and `b` hold the same bytes, read in full.
+fn same_bytes(a: &str, b: &str) -> std::io::Result<bool> {
+    use std::io::Read;
+    fn fill(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            match file.read(&mut buf[filled..])? {
+                0 => break,
+                n => filled += n,
+            }
+        }
+        Ok(filled)
+    }
+    let (mut fa, mut fb) = (std::fs::File::open(a)?, std::fs::File::open(b)?);
+    if fa.metadata()?.len() != fb.metadata()?.len() {
+        return Ok(false);
+    }
+    let (mut ba, mut bb) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
+    loop {
+        let (n, m) = (fill(&mut fa, &mut ba)?, fill(&mut fb, &mut bb)?);
+        if ba[..n] != bb[..m] {
+            return Ok(false);
+        }
+        if n == 0 {
+            return Ok(true);
+        }
+    }
 }
 
 /// Copy `from` to `to` with `copy` ([`std::fs::copy`], or a test's) and sync
@@ -3047,14 +3090,12 @@ pub fn recover_local(
             // None: the checkpoint that left it behind finished.
             let prev_age = (!checkpoint_completed(&buf)).then(|| on_disk.age_of(AOF_PREV_PATH));
             if prev_age.is_none() {
-                // Not left in place if it cannot be kept aside: a checkpoint
-                // would remove it later, kept or not.
                 // With a dump saved with the AOF off, the old log may hold
                 // writes it does not: it is not removed without a copy, and
                 // the server does not start without one. Otherwise the dump
                 // holds them, and an old log that cannot be removed is left
-                // in place: the next start, or the next turn-over, removes
-                // it (#375).
+                // in place (#375). Until it is removed, each turn-over fails
+                // on it, and so does each checkpoint: the warning says so.
                 if let Err(e) = keep_finished_old_log() {
                     log_fatal!(
                         "{AOF_PREV_PATH}, left by a checkpoint that finished, cannot be kept \
@@ -3067,8 +3108,11 @@ pub fn recover_local(
                 if let Err(e) = remove_if_there(AOF_PREV_PATH) {
                     log_warn!(
                         "AOF: {AOF_PREV_PATH}, left by a checkpoint that finished, could not be \
-                         removed: {e} — it is left in place, and the next start or checkpoint \
-                         removes it"
+                         removed: {e} — it is left in place. dump.kdb holds its writes. Until it is \
+                         removed, every checkpoint fails (INFO persistence shows \
+                         aof_last_bgrewrite_status:err) and {AOF_PATH} keeps growing: fix the \
+                         permissions of the data directory, and the next checkpoint removes it, or \
+                         remove {AOF_PREV_PATH} by hand"
                     );
                 }
             } else if prev_age == Some(LogAge::Older) {
@@ -3533,6 +3577,23 @@ mod kept_file_tests {
         // And one that works is kept, whole.
         copy_synced(&from, &to, |from, to| std::fs::copy(from, to)).unwrap();
         assert_eq!(std::fs::read(&to).unwrap(), std::fs::read(&from).unwrap());
+    }
+
+    /// Same bytes, read in full: not just the same length, or the same ends.
+    #[test]
+    fn same_bytes_reads_all_of_both_files() {
+        let (dir, a) = in_temp("a");
+        let b = dir.path().join("b").to_str().unwrap().to_string();
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&a, &bytes).unwrap();
+        std::fs::write(&b, &bytes).unwrap();
+        assert!(same_bytes(&a, &b).unwrap());
+        let mut middle = bytes.clone();
+        middle[100_000] ^= 1;
+        std::fs::write(&b, &middle).unwrap();
+        assert!(!same_bytes(&a, &b).unwrap());
+        std::fs::write(&b, &bytes[..199_999]).unwrap();
+        assert!(!same_bytes(&a, &b).unwrap());
     }
 
     /// The fingerprint of a log's first bytes is the one it had when it was

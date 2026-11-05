@@ -1,7 +1,5 @@
-# KiviDB
-
 <p align="center">
-  <img src="assets/kiwi.png" alt="KiviDB" width="180">
+  <a href="https://kividb.io"><img src="assets/banner.svg" alt="KiviDB: the in-memory database for AI and real-time apps. Redis-compatible, vector search built in." width="100%"></a>
 </p>
 
 <p align="center">
@@ -12,6 +10,10 @@
   <a href="LICENSE"><img src="https://img.shields.io/github/license/kividbio/kividb" alt="License: AGPL-3.0"></a>
   <a href="https://github.com/kividbio/kividb/discussions"><img src="https://img.shields.io/github/discussions/kividbio/kividb" alt="Discussions"></a>
   <a href="https://discord.com/invite/ZcMxFeSAPA"><img src="https://img.shields.io/badge/chat-Discord-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
+</p>
+
+<p align="center">
+  <a href="https://trendshift.io/repositories/309924?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-309924" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/309924/daily?language=Rust" alt="kividbio%2Fkividb | Trendshift" width="250" height="55"/></a>
 </p>
 
 **KiviDB** is a fast, multi-threaded alternative to Redis® and Valkey, written in Rust. It

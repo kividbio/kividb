@@ -14,9 +14,57 @@ pub(crate) type Value = Arc<[u8]>;
 /// only a weak reference, so a client that goes away — answered, timed out or
 /// disconnected — leaves the line without anyone having to remember to take
 /// it out.
+///
+/// And without losing the turn: a client that was woken and is dropped
+/// before it has looked at the key — its connection closed, or its command
+/// refused before its handler ran (a pause it went in, `READONLY` after a
+/// failover, `OOM`) — passes the turn to the client behind it when the ticket
+/// goes (see the `Drop`). Otherwise the element it was woken for would wait
+/// there for the next write, with clients blocked on the key (#384).
 pub struct Ticket {
     /// Lower is earlier.
     id: u64,
+    /// The lines it waits in, to leave when it is dropped: recorded when its
+    /// command parks (see [`Ticket::parks_in`]), so that one answered at
+    /// once costs nothing for this.
+    lines: Mutex<Vec<(Line, String)>>,
+    table: Weak<WaitTable>,
+}
+
+/// Which of a key's two lines (see [`WaitTable`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Line {
+    Keys,
+    Readers,
+}
+
+impl Ticket {
+    /// Its command parks, waiting on `keys` (`readers`: in their
+    /// `XREADGROUP` lines): what the `Drop` is to leave. Once: a command
+    /// that parks again waits on the same keys.
+    pub fn parks_in(&self, keys: &[String], readers: bool) {
+        let line = if readers { Line::Readers } else { Line::Keys };
+        let mut lines = self.lines.lock();
+        if lines.is_empty() {
+            lines.extend(keys.iter().map(|key| (line, key.clone())));
+        }
+    }
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        // Taken without a lock: nothing else can reach a ticket being dropped.
+        let lines = std::mem::take(self.lines.get_mut());
+        if lines.is_empty() {
+            return;
+        }
+        let Some(table) = self.table.upgrade() else {
+            return;
+        };
+        for (line, key) in lines {
+            table.leave_dropped(line, &key, self.id);
+        }
+    }
 }
 
 /// One client in the line for a key.
@@ -91,10 +139,41 @@ impl WaitTable {
     // leave the order to the scheduler.
 
     /// A place at the back of the line, for a command that is about to wait.
-    pub fn new_ticket(&self) -> Arc<Ticket> {
+    pub fn new_ticket(self: &Arc<Self>) -> Arc<Ticket> {
         Arc::new(Ticket {
             id: self.next_ticket.fetch_add(1, Ordering::Relaxed),
+            lines: Mutex::new(Vec::new()),
+            table: Arc::downgrade(self),
         })
+    }
+
+    /// A ticket dropped while it stood in `key`'s line: out of it, and, if it
+    /// had been woken and had not looked, the turn to the client behind it.
+    /// Nothing to do for one that left the line before it went, as a command
+    /// that is answered does.
+    fn leave_dropped(&self, line: Line, key: &str, id: u64) {
+        let lines = match line {
+            Line::Keys => &self.queues,
+            Line::Readers => &self.reader_queues,
+        };
+        let woken = {
+            let mut queues = lines.lock();
+            let Some(queue) = queues.get_mut(key) else {
+                return;
+            };
+            let Ok(at) = queue.binary_search_by_key(&id, |queued| queued.id) else {
+                return;
+            };
+            let woken = queue.remove(at).tx.is_none();
+            self.queued_count.fetch_sub(1, Ordering::Relaxed);
+            if queue.is_empty() {
+                queues.remove(key);
+            }
+            woken
+        };
+        if woken {
+            self.wake_next_in(lines, key, id);
+        }
     }
 
     /// Stand in the line for `key` — or, already in it, stay where `ticket`
@@ -119,9 +198,11 @@ impl WaitTable {
         let mut queues = lines.lock();
         let queue = queues.entry(key.to_string()).or_default();
         // The moment to forget clients that have gone: it keeps a key that is
-        // waited on again and again from collecting them.
+        // waited on again and again from collecting them. Not one that was
+        // woken and has not looked: its ticket's `Drop`, under way, takes it
+        // out and passes its turn on, which it could not do once it was gone.
         let before = queue.len();
-        queue.retain(|queued| queued.alive.strong_count() > 0);
+        queue.retain(|queued| queued.alive.strong_count() > 0 || queued.tx.is_none());
         self.queued_count
             .fetch_sub(before - queue.len(), Ordering::Relaxed);
         match queue.binary_search_by_key(&ticket.id, |queued| queued.id) {
@@ -459,7 +540,7 @@ mod signal_tests {
     /// keeps its place until it has looked; a client that has gone is skipped.
     #[test]
     fn the_line_is_served_from_the_front_one_at_a_time() {
-        let table = WaitTable::new();
+        let table = Arc::new(WaitTable::new());
         let (first, second, third) = (table.new_ticket(), table.new_ticket(), table.new_ticket());
         // Arriving out of order does not change the order.
         let mut rx2 = table.enqueue("k", &second);
@@ -510,6 +591,57 @@ mod signal_tests {
         drop(wait);
         assert!(table.inner.lock().is_empty());
         drop(rxs);
+    }
+
+    /// A client woken and then dropped before it has looked passes its turn
+    /// on: the client behind it is woken, without another write to the key.
+    /// One dropped before it was woken, or after it looked and left, wakes
+    /// nobody.
+    #[test]
+    fn a_woken_client_dropped_before_it_looked_passes_its_turn_on() {
+        let table = Arc::new(WaitTable::new());
+        for line in [Line::Keys, Line::Readers] {
+            // Each parks, as a command that waits does.
+            let enqueue = |ticket: &Arc<Ticket>| {
+                let rx = match line {
+                    Line::Keys => table.enqueue("k", ticket),
+                    Line::Readers => table.enqueue_reader("k", ticket),
+                };
+                ticket.parks_in(&["k".to_string()], line == Line::Readers);
+                rx
+            };
+            let (first, second, third) =
+                (table.new_ticket(), table.new_ticket(), table.new_ticket());
+            let mut rx1 = enqueue(&first);
+            let mut rx2 = enqueue(&second);
+            let mut rx3 = enqueue(&third);
+
+            // Not woken: dropping it wakes nobody.
+            drop(third);
+            assert!(rx3.try_recv().is_err());
+
+            table.notify_signal("k");
+            assert!(rx1.try_recv().is_ok());
+            assert!(rx2.try_recv().is_err());
+            // Woken, and gone without looking: the next one's turn.
+            drop(first);
+            assert!(rx2.try_recv().is_ok());
+
+            // Looked and left: no second turn from its drop.
+            match line {
+                Line::Keys => {
+                    table.dequeue("k", &second);
+                    table.pass_on("k", &second);
+                }
+                Line::Readers => table.reader_done("k", &second),
+            }
+            let fourth = table.new_ticket();
+            let mut rx4 = enqueue(&fourth);
+            drop(second);
+            assert!(rx4.try_recv().is_err());
+            drop(fourth);
+            assert!(!table.has_signal_waiters());
+        }
     }
 
     /// A reader may name a stream twice (`XREAD STREAMS s s 0 0`): each is

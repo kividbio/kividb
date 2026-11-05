@@ -44,7 +44,43 @@ static WATCHED_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 /// write to the hash (see `handler::run_command`, #371).
 #[inline]
 pub fn any_watched() -> bool {
+    #[cfg(test)]
+    if let Some(id) = WATCH_SCOPE.with(|scope| scope.get()) {
+        return WATCHED
+            .lock()
+            .as_ref()
+            .is_some_and(|watched| watched.keys().any(|(store, _, _)| *store == id));
+    }
     WATCHED_LEN.load(std::sync::atomic::Ordering::Acquire) > 0
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The store [`any_watched`] answers for on this thread, if a test said
+    /// so ([`WatchScope`]): a server has one store, and a test's should not
+    /// count the watches other tests left in theirs.
+    static WATCH_SCOPE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// For a test: on this thread, [`any_watched`] answers for `store` alone
+/// until this is dropped.
+#[cfg(test)]
+pub(crate) struct WatchScope;
+
+#[cfg(test)]
+impl WatchScope {
+    pub(crate) fn of(store: &Store) -> Self {
+        let id = store_id(store);
+        WATCH_SCOPE.with(|scope| scope.set(Some(id)));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for WatchScope {
+    fn drop(&mut self) {
+        WATCH_SCOPE.with(|scope| scope.set(None));
+    }
 }
 
 fn store_id(store: &Store) -> usize {
@@ -668,9 +704,8 @@ mod tests {
     /// the postings and the watch agree when both are done (#376). Without
     /// the write's order the sweep evicted the field and dropped the watch,
     /// and the write then put the field back in the postings, for good.
-    /// What is shown needs nothing watched in the process when the write
-    /// starts: run alone (another test's watch makes the write take its order
-    /// anyway).
+    /// What is watched is what this store has: the watches other tests left
+    /// in theirs would make the write take its order anyway (#378).
     #[test]
     fn a_ttl_from_the_master_that_starts_the_watching_is_ordered() {
         use std::cell::RefCell;
@@ -680,6 +715,7 @@ mod tests {
         for _ in 0..50 {
             let store = crate::store::new_store(1);
             let _own = OwnWatches::of(&store);
+            let _scope = WatchScope::of(&store);
             let index_store = crate::vector::new_index_store();
             let def = hash_losing_n(&store, &index_store, "f376:", KEY);
             // Not watched, its n with no time to live: as the master's HSET

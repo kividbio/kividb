@@ -2202,7 +2202,10 @@ fn an_old_log_that_cannot_be_removed_is_left_in_place() {
             "{io}: no warning"
         );
         assert!(
-            said.contains("it is left in place, and the next start or checkpoint removes it"),
+            said.contains(
+                "Until it is removed, every checkpoint fails (INFO persistence shows \
+                 aof_last_bgrewrite_status:err)"
+            ),
             "{io}"
         );
         assert!(server.dir.join("appendonly.aof.prev").exists(), "{io}");
@@ -2313,5 +2316,98 @@ fn a_turn_over_keeps_a_finished_checkpoints_old_log_aside_after_a_save_with_the_
             "{io}: the old log was removed without a copy"
         );
         assert_eq!(c.cmd(&["GET", "k"]).s(), "1", "{io}");
+    }
+}
+
+/// What the warning says of an old log that cannot be removed: each
+/// checkpoint fails on it, `INFO persistence` says so, and nothing is lost.
+#[test]
+fn a_checkpoint_fails_while_an_old_log_cannot_be_removed() {
+    for &io in io_models() {
+        let mut server = Server::start(io, "");
+        let mut c = server.conn();
+        assert!(c.cmd(&["SET", "k", "1"]).ok());
+        assert!(c.cmd(&["SAVE"]).ok());
+        assert!(c.cmd(&["SET", "k2", "1"]).ok());
+        durable(&mut c);
+        drop(c);
+        server.kill();
+        an_old_log_that_cannot_be_removed(&server.dir);
+
+        let mut c = server.restart();
+        assert_eq!(c.cmd(&["BGREWRITEAOF"]).s(), STARTED);
+        wait_idle(&mut c);
+        assert_eq!(
+            info_field(&mut c, "aof_last_bgrewrite_status"),
+            "err",
+            "{io}"
+        );
+        assert!(c.cmd(&["SET", "k3", "1"]).ok());
+        durable(&mut c);
+        drop(c);
+        server.kill();
+        let mut c = server.restart();
+        for key in ["k", "k2", "k3"] {
+            assert_eq!(c.cmd(&["GET", key]).s(), "1", "{io}: {key}");
+        }
+    }
+}
+
+/// The old log of a checkpoint that finished, beside a dump saved with the
+/// AOF off, is kept aside before it is removed. If an attempt kept it and
+/// did not get to remove it, it is not kept a second time: each start or
+/// checkpoint that could not remove it added another copy. A kept file with
+/// the same length but other bytes is not taken for it.
+#[test]
+fn a_log_kept_aside_already_is_not_kept_again() {
+    for &io in io_models() {
+        for other_copy in [false, true] {
+            let mut server = Server::start(io, "");
+            server.kill();
+            std::fs::remove_file(server.dir.join("appendonly.aof")).unwrap();
+            server.aof = false;
+            let mut c = server.restart();
+            assert!(c.cmd(&["SET", "k", "1"]).ok());
+            assert!(c.cmd(&["SAVE"]).ok());
+            drop(c);
+            server.kill();
+            // A log on that dump's number, as a start with the AOF on makes.
+            server.aof = true;
+            let mut c = server.restart();
+            assert!(c.cmd(&["SET", "k2", "1"]).ok());
+            durable(&mut c);
+            drop(c);
+            server.kill();
+            let dir = server.dir.clone();
+            let (number, marked) = saved_number(&dir);
+            assert!(marked, "{io}");
+
+            let mut old = delta_header(number - 1);
+            old.extend_from_slice(&set_record("only-in-the-old-log", "1"));
+            std::fs::write(dir.join("appendonly.aof.prev"), &old).unwrap();
+            // What an earlier attempt kept.
+            std::fs::write(dir.join("superseded.1.0.appendonly.aof.prev"), &old).unwrap();
+            let mut different = old.clone();
+            *different.last_mut().unwrap() ^= 1;
+            if other_copy {
+                std::fs::write(dir.join("superseded.1.1.appendonly.aof.prev"), &different).unwrap();
+            }
+
+            let mut c = server.restart();
+            assert_eq!(c.cmd(&["GET", "k2"]).s(), "1", "{io}");
+            assert!(!dir.join("appendonly.aof.prev").exists(), "{io}");
+            let kept = kept_aside(&dir);
+            let copies = kept.iter().filter(|(_, bytes)| *bytes == old).count();
+            assert_eq!(copies, 1, "{io}, {other_copy}: {kept:?}");
+            assert_eq!(
+                kept.len(),
+                1 + usize::from(other_copy),
+                "{io}, {other_copy}"
+            );
+            if other_copy {
+                assert!(kept.iter().any(|(_, bytes)| *bytes == different), "{io}");
+            }
+            drop(c);
+        }
     }
 }

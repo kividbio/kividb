@@ -1,0 +1,1220 @@
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> crates/ragfs/src/lock/manager.rs:1179:47
+     |
+1179 |                 let _ = self.wait_duration_ns.fetch_update(
+     |                                               ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1179 -                 let _ = self.wait_duration_ns.fetch_update(
+1179 +                 let _ = self.wait_duration_ns.try_update(
+     |
+
+warning: unused variable: `error`
+   --> crates/ragfs/src/lock/provider.rs:503:29
+    |
+503 |                         Err(error) if crypto::is_encrypted(&data) => {
+    |                             ^^^^^ help: if this is intentional, prefix it with an underscore: `_error`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: missing documentation for a function
+  --> crates/ragfs/src/core/glob.rs:46:1
+   |
+46 | pub fn standard_glob_match(rel_path: &str, pattern: &str) -> Result<bool> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+note: the lint level is defined here
+  --> crates/ragfs/src/lib.rs:29:9
+   |
+29 | #![warn(missing_docs)]
+   |         ^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+ --> crates/ragfs/src/git/config.rs:6:1
+  |
+6 | pub struct GitConfig {
+  | ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+ --> crates/ragfs/src/git/config.rs:8:5
+  |
+8 |     pub enabled: bool,
+  |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/config.rs:10:5
+   |
+10 |     pub backend: String,
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/config.rs:12:5
+   |
+12 |     pub default_branch: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/config.rs:14:5
+   |
+14 |     pub author_name: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/config.rs:16:5
+   |
+16 |     pub author_email: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/config.rs:19:5
+   |
+19 |     pub local: Option<GitLocalConfig>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/config.rs:21:5
+   |
+21 |     pub s3: Option<GitS3ConfigPy>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/config.rs:24:5
+   |
+24 |     pub tuning: GitTuningConfig,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+  --> crates/ragfs/src/git/config.rs:28:1
+   |
+28 | pub struct GitLocalConfig {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/config.rs:29:5
+   |
+29 |     pub base_dir: String,
+   |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+  --> crates/ragfs/src/git/config.rs:33:1
+   |
+33 | pub struct GitS3ConfigPy {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/config.rs:34:5
+   |
+34 |     pub bucket: String,
+   |     ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/config.rs:36:5
+   |
+36 |     pub prefix: String,
+   |     ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/config.rs:37:5
+   |
+37 |     pub region: String,
+   |     ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/config.rs:39:5
+   |
+39 |     pub endpoint: String,
+   |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/config.rs:41:5
+   |
+41 |     pub access_key: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/config.rs:43:5
+   |
+43 |     pub secret_key: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/config.rs:45:5
+   |
+45 |     pub cas_mode: String,
+   |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/config.rs:47:5
+   |
+47 |     pub redis_lock_url: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/config.rs:49:5
+   |
+49 |     pub use_path_style: bool,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+  --> crates/ragfs/src/git/config.rs:53:1
+   |
+53 | pub struct GitTuningConfig {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/error.rs:23:9
+   |
+23 |         expected: gix_hash::ObjectId,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/error.rs:24:9
+   |
+24 |         actual: gix_hash::ObjectId,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/error.rs:51:9
+   |
+51 |         expected: Option<gix_hash::ObjectId>,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/error.rs:52:9
+   |
+52 |         actual: Option<gix_hash::ObjectId>,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/error.rs:109:9
+    |
+109 |         project_dir: String,
+    |         ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/error.rs:110:9
+    |
+110 |         commit: gix_hash::ObjectId,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/error.rs:120:9
+    |
+120 |         ref_name: String,
+    |         ^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/error.rs:121:9
+    |
+121 |         expected: Option<gix_hash::ObjectId>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/error.rs:122:9
+    |
+122 |         actual: Option<gix_hash::ObjectId>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/error.rs:140:20
+    |
+140 |     BlobTooLarge { size: u64, limit: u64 },
+    |                    ^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/error.rs:140:31
+    |
+140 |     BlobTooLarge { size: u64, limit: u64 },
+    |                               ^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/error.rs:144:20
+    |
+144 |     TooManyFiles { count: usize, limit: usize },
+    |                    ^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/error.rs:144:34
+    |
+144 |     TooManyFiles { count: usize, limit: usize },
+    |                                  ^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/error.rs:148:23
+    |
+148 |     TooManyLogPaths { count: usize, limit: usize },
+    |                       ^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/error.rs:148:37
+    |
+148 |     TooManyLogPaths { count: usize, limit: usize },
+    |                                     ^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/error.rs:153:9
+    |
+153 |         path: String,
+    |         ^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/error.rs:154:9
+    |
+154 |         depth: usize,
+    |         ^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/error.rs:155:9
+    |
+155 |         limit: usize,
+    |         ^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/error.rs:163:9
+    |
+163 |         scanned: usize,
+    |         ^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/error.rs:164:9
+    |
+164 |         max_scanned: usize,
+    |         ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/error.rs:165:9
+    |
+165 |         matched: usize,
+    |         ^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/error.rs:166:9
+    |
+166 |         requested: usize,
+    |         ^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/error.rs:199:25
+    |
+199 |     OidPrefixNotFound { prefix: String },
+    |                         ^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/error.rs:204:9
+    |
+204 |         prefix: String,
+    |         ^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/error.rs:205:9
+    |
+205 |         count: usize,
+    |         ^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/error.rs:206:9
+    |
+206 |         candidates: String,
+    |         ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+ --> crates/ragfs/src/git/types.rs:6:1
+  |
+6 | pub struct CommitRequest {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+ --> crates/ragfs/src/git/types.rs:7:5
+  |
+7 |     pub account: String,
+  |     ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+ --> crates/ragfs/src/git/types.rs:8:5
+  |
+8 |     pub branch: String,                 // e.g. "main" — NOT the full "refs/heads/main"
+  |     ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+ --> crates/ragfs/src/git/types.rs:9:5
+  |
+9 |     pub message: String,
+  |     ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/types.rs:13:5
+   |
+13 |     pub author_name: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/types.rs:14:5
+   |
+14 |     pub author_email: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an enum
+  --> crates/ragfs/src/git/types.rs:18:1
+   |
+18 | pub enum CommitResponse {
+   | ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> crates/ragfs/src/git/types.rs:19:5
+   |
+19 |     Created {
+   |     ^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/types.rs:20:9
+   |
+20 |         commit_oid: ObjectId,
+   |         ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/types.rs:21:9
+   |
+21 |         changed: usize,
+   |         ^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/types.rs:29:9
+   |
+29 |         commit_oid: ObjectId,
+   |         ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/types.rs:39:5
+   |
+39 |     pub size: u64,
+   |     ^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/types.rs:40:5
+   |
+40 |     pub mtime_ns: i128,
+   |     ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/types.rs:41:5
+   |
+41 |     pub oid: ObjectId,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+  --> crates/ragfs/src/git/types.rs:45:1
+   |
+45 | pub struct ShowRequest {
+   | ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/types.rs:46:5
+   |
+46 |     pub account: String,
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an enum
+  --> crates/ragfs/src/git/types.rs:88:1
+   |
+88 | pub enum ShowResponse {
+   | ^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> crates/ragfs/src/git/types.rs:89:5
+   |
+89 |     Commit {
+   |     ^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/types.rs:90:9
+   |
+90 |         oid: ObjectId,
+   |         ^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/types.rs:91:9
+   |
+91 |         tree: ObjectId,
+   |         ^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/types.rs:92:9
+   |
+92 |         parents: Vec<ObjectId>,
+   |         ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/types.rs:93:9
+   |
+93 |         author: Actor,
+   |         ^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/types.rs:94:9
+   |
+94 |         committer: Actor,
+   |         ^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/types.rs:95:9
+   |
+95 |         message: String,
+   |         ^^^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> crates/ragfs/src/git/types.rs:97:5
+   |
+97 |     Blob {
+   |     ^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/types.rs:98:9
+   |
+98 |         oid: ObjectId,
+   |         ^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ragfs/src/git/types.rs:99:9
+   |
+99 |         size: u64,
+   |         ^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/types.rs:112:5
+    |
+112 |     pub name: String,
+    |     ^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/types.rs:113:5
+    |
+113 |     pub email: String,
+    |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/types.rs:141:5
+    |
+141 |     pub author_name: String,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/types.rs:142:5
+    |
+142 |     pub author_email: String,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/types.rs:220:5
+    |
+220 |     pub new_commit_oid: ObjectId,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/types.rs:221:5
+    |
+221 |     pub source_commit: ObjectId,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ragfs/src/git/types.rs:222:5
+    |
+222 |     pub parent_commit: ObjectId,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `ragfs` (lib) generated 85 warnings (run `cargo fix --lib -p ragfs` to apply 2 suggestions)
+warning: `ragfs` (lib test) generated 85 warnings (85 duplicates)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.20s
+     Running unittests src/lib.rs (target/debug/deps/ragfs-13031eeed8083d6a)
+
+running 556 tests
+test cache::policy::tests::runtime_lock_files_bypass_cache ... ok
+test cache_runtime::dynamic::config::tests::debug_output_redacts_provider_params ... ok
+test cache_runtime::dynamic::provider::tests::checked_reader_rejects_overflow_and_misalignment ... ok
+test cache_runtime::dynamic::provider::tests::optional_array_failure_releases_all_host_allocations ... ok
+test cache_runtime::redis::config::tests::accepts_standalone_cluster_and_sentinel_modes ... ok
+test cache_runtime::redis::config::tests::rejects_ambiguous_secrets_and_redacts_plaintext_values ... ok
+test cache_runtime::memory::tests::configured_script_handler_is_advertised_and_invoked ... ok
+test cache_runtime::dynamic::provider::tests::script_result_rejects_excessive_nesting ... ok
+test cache_runtime::redis::config::tests::rejects_removed_singleton_mode ... ok
+test cache_runtime::redis::config::tests::rejects_endpoint_credentials_and_invalid_tls_settings ... ok
+test cache_runtime::redis::config::tests::validates_topology_specific_settings ... ok
+test cache_runtime::redis::config::tests::rejects_default_ttl_that_cannot_be_sent_as_milliseconds ... ok
+test core::builder::tests::configured_runtime_can_power_queuefs_without_enabling_cachefs ... ok
+test core::builder::tests::configured_stack_rejects_cachefs_without_global_provider ... ok
+test core::builder::tests::configured_stack_rejects_redis_pathlock_without_runtime ... ok
+test core::builder::tests::default_stack_rejects_sqlite_pathlock_without_shared_database ... ok
+test cache_runtime::dynamic::provider::tests::buffer_array_rejects_excessive_item_count ... ok
+test core::builder::tests::default_stack_rejects_unknown_pathlock_provider ... ok
+test core::builder::tests::configured_stack_does_not_create_runtime_when_cache_is_unused ... ok
+test core::builder::tests::default_stack_initializes_pathlock_manager ... ok
+test core::builder::tests::encrypted_stack_preserves_queuefs_control_semantics ... ok
+test core::context::tests::empty_view_when_unset_does_not_panic ... ok
+test core::builder::tests::plaintext_stack_has_no_encryption_layer ... ok
+test core::builder::tests::encrypted_write_extends_outer_lease ... ok
+test core::context::tests::view_treats_empty_account_id_as_missing ... ok
+test core::builder::tests::encrypted_stack_encrypts_on_disk ... ok
+test core::encryption_wrapper::tests::encrypted_temp_path_mapping_matches_python ... ok
+test core::builder::tests::encrypted_stack_with_pathlock_does_not_reacquire_final_lock ... ok
+test core::encryption_wrapper::tests::create_writes_encrypted_empty_file ... ok
+test core::encryption_wrapper::tests::cross_account_cannot_decrypt ... ok
+test core::encryption_wrapper::tests::grep_matches_encrypted_files ... ok
+test core::encryption_wrapper::tests::on_disk_bytes_are_ciphertext_with_envelope ... ok
+test core::encryption_wrapper::tests::read_without_account_id_errors ... ok
+test core::encryption_wrapper::tests::read_offset_size_slicing ... ok
+test core::builder::tests::configured_stack_builds_redis_pathlock_with_shared_runtime ... ok
+test core::encryption_wrapper::tests::write_rejects_nonzero_offset ... ok
+test core::encryption_wrapper::tests::write_rejects_append_flag ... ok
+test core::encryption_wrapper::tests::rename_rejects_cross_account_paths ... ok
+test core::context::tests::context_is_isolated_across_tasks ... ok
+test core::context::tests::view_reads_scoped_context ... ok
+test core::context::tests::bypass_cache_defaults_false_and_round_trips ... ok
+test core::errors::tests::test_error_display ... ok
+test core::encryption_wrapper::tests::write_rejects_non_replacing_none_flag ... ok
+test core::errors::tests::test_error_creation ... ok
+test core::filesystem::tests::test_default_grep_exclude_path_applies_before_node_limit ... ok
+test core::filesystem::tests::test_default_grep_includes_bounded_context ... ok
+test core::filesystem::tests::test_glob_directory_empty_pattern_is_invalid ... ok
+test core::filesystem::tests::test_default_grep_level_limit_applies_before_node_limit ... ok
+test core::builder::tests::encrypted_mount_rejects_legacy_plaintext_backend_without_manifest ... ok
+test core::builder::tests::encrypted_mount_writes_backend_shape_guard ... ok
+test core::filesystem::tests::test_default_grep_match_file_is_query_root_relative ... ok
+test core::filesystem::tests::test_filesystem_trait ... ok
+test core::filesystem::tests::test_glob_directory_empty_pattern_is_invalid_for_empty_directory ... ok
+test core::filesystem::tests::test_tree_deep_nesting ... ok
+test core::filesystem::tests::test_tree_empty_dir ... ok
+test core::filesystem::tests::test_tree_directories_only_filters_before_pagination ... ok
+test core::encryption_wrapper::tests::write_then_read_roundtrip_under_ctx ... ok
+test core::builder::tests::encrypted_mount_ignores_legacy_plaintext_task_records ... ok
+test core::encryption_wrapper::tests::write_replaces_stale_internal_temp_file_before_publish ... ok
+test core::filesystem::tests::test_tree_level_limit_zero ... ok
+test core::filesystem::tests::test_tree_mixed_scenario ... ok
+test core::builder::tests::encrypted_write_rejects_uncovered_outer_lease ... ok
+test core::filesystem::tests::test_tree_level_limit_none ... ok
+test core::filesystem::tests::test_tree_nested_dfs_order ... ok
+test core::filesystem::tests::test_tree_level_limit_one ... ok
+test core::filesystem::tests::test_tree_node_limit ... ok
+test core::filesystem::tests::test_tree_node_limit_zero ... ok
+test core::filesystem::tests::test_tree_show_hidden_false_dir_preserved ... ok
+test core::filesystem::tests::test_tree_show_hidden_false ... ok
+test core::filesystem::tests::test_glob_directory_zero_page_size_is_invalid ... ok
+test core::filesystem::tests::test_glob_directory_anchors_multi_segment_patterns_at_root ... ok
+test core::filesystem::tests::test_tree_root_path ... ok
+test core::glob::tests::test_compare_rel_paths_uses_path_component_order ... ok
+test core::filesystem::tests::test_tree_show_hidden_true ... ok
+test core::filesystem::tests::test_tree_single_layer_files ... ok
+test core::filesystem::tests::test_glob_directory_matches_full_relative_path_semantics ... ok
+test core::glob::tests::test_offset_token_rejects_scope_mismatch ... ok
+test core::glob::tests::test_standard_glob_match_empty_pattern_rejected ... ok
+test core::glob::tests::test_standard_glob_match_invalid_segment_is_rejected ... ok
+test core::glob::tests::test_standard_glob_match_root_only_pattern_returns_false ... ok
+test core::glob::tests::test_standard_glob_match_dot_only_pattern_still_rejected ... ok
+test core::filesystem::tests::test_glob_directory_rejects_token_from_different_query_scope ... ok
+test cache_runtime::redis::provider::tests::set_queries_preserve_binary_members_on_real_redis ... ok
+test core::filesystem::tests::test_glob_directory_paginates_with_opaque_offset_tokens ... ok
+test cache_runtime::redis::provider::tests::executes_registered_script_and_recovers_after_script_flush ... ok
+test core::glob::tests::test_validate_pattern_distinguishes_root_only_and_dot_only ... ok
+test core::internal_names::tests::reserves_entire_exact_lock_prefix ... ok
+test core::mountable::tests::queuefs_mount_bypasses_cache_even_when_cache_is_configured ... ok
+test core::mountable::tests::test_concurrent_operations ... ok
+test core::mountable::tests::test_filesystem_operations ... ok
+test core::mountable::tests::copy_within_mount_rejects_uncovered_lease ... ok
+test core::glob::tests::test_standard_glob_match_normalizes_dot_segments ... ok
+test core::mountable::tests::mount_wraps_backend_with_cache_when_configured ... ok
+test core::mountable::tests::test_normalize_path ... ok
+test core::mountable::tests::test_concurrent_mount_unmount ... ok
+test core::mountable::tests::test_mountable_fs_creation ... ok
+test core::mountable::tests::test_mount_duplicate_error ... ok
+test core::mountable::tests::test_grep_routes_to_plugin ... ok
+test core::mountable::tests::test_mount_and_unmount ... ok
+test core::mountable::tests::test_tree_directory_no_mount_returns_error ... ok
+test core::mountable::tests::test_unmount_not_found ... ok
+test core::mountable::tests::test_path_routing ... ok
+test core::mountable::tests::test_read_dir_sorts_dirs_first_then_name ... ok
+test core::mountable::tests::test_tree_directory_rel_path_unchanged_by_routing ... ok
+test core::mountable::tests::test_tree_directory_path_rewriting ... ok
+test core::mountable::tests::test_single_backend_mount_wraps_stats_outside_encryption ... ok
+test core::mountable::tests::test_rename_across_mounts_error ... ok
+test core::mountable::tests::shutdown_reaches_cache_queuefs_through_stats_wrapper ... FAILED
+test core::mountable::tests::copy_within_mount_overwrite_invalidates_cached_destination ... ok
+test core::glob::tests::test_globset_match_uses_full_relative_path ... ok
+test core::plugin::tests::test_health_status ... ok
+test core::mountable::tests::encrypted_mount_caches_ciphertext_below_account_validation ... ok
+test core::types::tests::test_config_parameter ... ok
+test core::plugin::tests::test_plugin_registry ... ok
+test core::types::tests::test_config_value ... ok
+test core::types::tests::test_file_info_creation ... ok
+test core::types::tests::test_plugin_config_from_raw_parts_handles_multiwrite_shapes ... ok
+test core::plugin::tests::test_plugin_lifecycle ... ok
+test crypto::tests::aes_gcm_roundtrip ... ok
+test crypto::tests::aes_gcm_wrong_key_fails ... ok
+test crypto::tests::is_encrypted_detects_plaintext ... ok
+test crypto::tests::hkdf_is_deterministic_and_account_scoped ... ok
+test crypto::tests::hkdf_matches_python_known_answer ... ok
+test crypto::tests::parse_rejects_short_and_bad_magic ... ok
+test crypto::tests::full_envelope_encrypt_decrypt ... ok
+test crypto::tests::decrypts_python_generated_envelope ... ok
+test crypto::tests::envelope_build_parse_roundtrip ... ok
+test git::config::tests::defaults_when_section_minimal ... ok
+test git::backends::local::tests::local_index_store_rejects_invalid_branch ... ok
+test git::config::tests::parses_minimal_local_config ... ok
+test git::enumerate::tests::test_collect_all_prunes_derived_l0_l1_files ... ok
+test git::config::tests::parses_s3_config_with_overrides ... ok
+test git::backends::local::tests::local_index_store_corruption_is_soft_miss ... ok
+test core::mountable::tests::shutdown_does_not_stop_multiwrite_runtime ... ok
+test git::enumerate::tests::test_collect_all_returns_account_relative_paths ... ok
+test git::enumerate::tests::test_collect_under_applies_pruning_on_account_relative_form ... ok
+test git::backends::local::tests::test_local_object_store_put_get_exists ... ok
+test git::backends::local::tests::local_index_store_round_trip ... ok
+test core::glob::tests::test_prepared_glob_matches_globset_behavior ... ok
+test git::enumerate::tests::test_collect_all_prunes_internal_scopes_and_vector_indexes ... ok
+test git::enumerate::tests::test_prune_path_table ... ok
+test git::enumerate::tests::test_collect_under_empty_sub_path_equivalent_to_collect_all ... ok
+test core::glob::tests::test_globset_match_uses_standard_recursive_semantics ... ok
+test git::enumerate::tests::test_collect_under_returns_paths_below_subdir_with_prefix ... ok
+test git::ignore::tests::basename_glob_matches_at_any_depth ... ok
+test git::ignore::tests::directory_pattern_needs_is_dir_to_match_the_dir_itself ... ok
+test git::ignore::tests::git_style_escaping_is_rejected ... ok
+test git::ignore::tests::negation_is_rejected ... ok
+test git::ignore::tests::double_star_glob_matches_nested_paths ... ok
+test git::ignore::tests::non_utf8_is_rejected ... ok
+test git::ignore::tests::oversized_file_is_rejected ... ok
+test git::ignore::tests::empty_comments_and_blank_lines_match_nothing ... ok
+test git::ignore::tests::directory_patterns_match_directory_contents ... ok
+test git::commit::tests::test_write_commit_with_parent ... ok
+test git::ignore::tests::system_prune_still_wins ... ok
+test git::index_store::tests::invalid_oid_errors ... ok
+test git::index_store::tests::malformed_json_errors ... ok
+test git::index_store::tests::unknown_version_is_silent_miss ... ok
+test git::index_store::tests::round_trip_preserves_entries ... ok
+test git::service::diff_tests::diff_all_writes_when_head_empty ... ok
+test git::service::diff_tests::diff_all_deletes_when_source_empty ... ok
+test git::service::diff_tests::diff_handles_nested_paths ... ok
+test git::service::diff_tests::diff_mixed_buckets_sorted_deterministically ... ok
+test git::service::diff_tests::diff_overwrite_when_same_path_different_oid ... ok
+test git::commit::tests::test_write_commit_round_trip_no_parent ... ok
+test git::service::diff_tests::diff_empty_both ... ok
+test git::backends::local::tests::test_local_ref_store_read_cas_list ... ok
+test git::ignore::tests::ovgitignore_is_always_tracked ... ok
+test git::service::diff_tests::diff_unchanged_same_oid_same_path ... ok
+test git::service::diff_tests::validate_accepts_simple_path ... ok
+test git::service::diff_tests::validate_accepts_single_segment ... ok
+test git::service::diff_tests::validate_project_dir_rejects_backslash_and_control ... ok
+test git::service::diff_tests::validate_project_dir_rejects_dotdot_segment ... ok
+test git::service::diff_tests::validate_rejects_double_slash ... ok
+test git::service::diff_tests::validate_rejects_leading_slash ... ok
+test git::service::diff_tests::validate_rejects_trailing_slash ... ok
+test git::ignore::tests::root_relative_patterns_match_from_account_root ... ok
+test git::service::diff_tests::validate_project_dir_rejects_dot_segment ... ok
+test git::service::diff_tests::validate_relative_path_accepts_normal_paths ... ok
+test git::service::diff_tests::validate_relative_path_rejects_malicious ... ok
+test git::service::diff_tests::validate_rejects_empty_string ... ok
+test git::service::tests::commit_rejects_slash_account ... ok
+test git::service::tests::commit_rejects_traversal_account ... ok
+test git::service::tests::commit_rejects_traversal_in_paths ... ok
+test git::service::tests::restore_rejects_traversal_account ... ok
+test git::service::tests::restore_rejects_traversal_project_dir ... ok
+test git::service::tests::show_rejects_traversal_account ... ok
+test git::service::tests::show_rejects_traversal_path ... ok
+test git::service::fast_path1_tests::no_index_store_disables_fast_path ... ok
+test git::service::fast_path1_tests::corrupted_index_falls_back_silently ... ok
+test git::backends::local::tests::test_local_object_store_concurrent_put_same_oid ... ok
+test git::service::fast_path1_tests::cached_stat_match_skips_read ... ok
+test git::service::fast_path1_tests::parent_oid_mismatch_disables_cache ... ok
+test git::service::tests::test_commit_cas_conflict_surfaces_as_error ... ok
+test git::service::fast_path1_tests::mtime_mismatch_invalidates_cache_entry ... ok
+test git::service::fast_path1_tests::commit_directory_path_sets_fs_context_for_mountable_multiwrite ... ok
+test git::service::tests::test_commit_invalid_ovgitignore_fails ... ok
+test git::service::fast_path1_tests::size_mismatch_invalidates_cache_entry ... ok
+test git::service::fast_path1_tests::partial_paths_preserves_uncovered_entries ... ok
+test git::service::fast_path1_tests::racy_clean_same_size_same_mtime_is_not_lost ... ok
+test git::service::fast_path1_tests::deleted_path_is_removed_from_index ... ok
+test git::service::tests::test_commit_first_creates_root_commit ... ok
+test git::backends::local::tests::test_local_ref_store_concurrent_cas ... ok
+test git::service::fast_path1_tests::partial_commit_with_directory_path_purges_index_by_prefix ... ok
+test git::service::tests::test_commit_fast_path_3_disabled_reputs_duplicate_blob ... ok
+test git::service::tests::test_commit_noop_when_nothing_changed ... ok
+test git::service::tests::test_commit_ovgitignore_excludes_matching_files_and_tracks_itself ... ok
+test git::service::tests::test_commit_paths_notfound_directory_drops_subtree ... ok
+test git::service::tests::test_commit_ovgitignore_removes_previously_tracked_file_from_snapshot ... ok
+test git::service::tests::test_commit_handles_deletes ... ok
+test git::service::tests::test_commit_fast_path_3_skips_put_for_duplicate_blob ... ok
+test git::service::tests::test_commit_paths_pruned_directory_is_noop ... ok
+test git::service::tests::test_commit_paths_pruned_file_is_noop ... ok
+test git::service::tests::test_commit_with_explicit_paths_skips_others ... ok
+test git::service::tests::test_commit_incremental_reuses_unchanged_subtree_oids ... ok
+test git::service::tests::test_commit_scoped_paths_respect_ovgitignore ... ok
+test git::service::tests::test_commit_skips_pruned_paths ... ok
+test git::service::tests::test_commit_prev_tree_lookup_cache_amortises_ancestors ... ok
+test git::service::tests::test_commit_scoped_duplicate_paths_do_not_double_count ... ok
+test git::service::tests::test_commit_paths_mixed_file_and_dir_dedup ... ok
+test git::service::tests::test_commit_scoped_notfound_ignored_file_is_removed_from_snapshot ... ok
+test git::service::tests::test_commit_paths_expands_directory_and_drops_deleted_files ... ok
+test git::service::tests::test_commit_scoped_directory_removes_now_ignored_prev_file ... ok
+test git::service::tests::test_commit_second_links_to_first ... ok
+test git::service::tests::test_normalize_log_paths_deduplicates_before_counting ... ok
+test git::service::tests::test_mock_vfs_write_then_read_round_trip ... ok
+test git::service::tests::test_normalize_log_paths_preserves_unfiltered_semantics ... ok
+test git::service::tests::test_normalize_log_paths_enforces_64_component_depth ... ok
+test git::service::tests::test_filtered_log_accepts_match_on_scan_boundary ... ok
+test git::service::tests::test_normalize_log_paths_rejects_more_than_32_unique_paths ... ok
+test git::service::tests::test_filtered_log_errors_when_uninspected_history_remains ... ok
+test git::service::tests::test_full_commit_captures_delete ... ok
+test git::service::tests::test_filtered_log_returns_complete_empty_history_at_scan_boundary ... ok
+test git::service::tests::test_full_commit_captures_subdir_delete ... ok
+test git::service::tests::test_full_commit_dir_to_file_transition ... ok
+test git::service::tests::test_full_commit_file_to_dir_transition ... ok
+test git::service::tests::test_full_commit_dir_to_file_transition_multilevel ... ok
+test git::service::tests::test_filtered_log_reads_each_commit_object_at_most_once ... ok
+test git::service::tests::test_log_with_empty_paths_is_unfiltered ... ok
+test git::service::tests::test_restore_invalid_project_dir ... ok
+test git::service::tests::test_restore_cas_conflict_surfaces_as_error ... ok
+test git::service::tests::test_restore_cas_conflict_leaves_vfs_unchanged ... ok
+test git::service::tests::test_restore_full_tree_noop_when_source_equals_head ... ok
+test git::service::tests::test_restore_noop_when_source_equals_head ... ok
+test git::service::tests::test_restore_delete_failure_does_not_short_circuit ... ok
+test git::service::tests::test_restore_delete_notfound_not_counted_as_failure ... ok
+test git::service::tests::test_restore_dry_run_reports_diff_and_writes_nothing ... ok
+test git::service::tests::test_restore_full_tree_dry_run_reports_account_relative_diff ... ok
+test git::service::tests::test_restore_project_dir_missing_in_source_commit ... ok
+test git::service::tests::test_restore_full_tree_apply_replaces_account_tree ... ok
+test git::service::tests::test_restore_apply_writes_new_commit_with_head_as_parent ... ok
+test git::service::tests::test_restore_unknown_branch_head ... ok
+test git::service::tests::test_restore_unknown_source_ref ... ok
+test git::service::tests::test_log_with_paths_returns_matching_commits_up_to_limit ... ok
+test git::service::tests::test_restore_does_not_touch_paths_outside_project_dir ... ok
+test git::service::tests::test_show_blob_binary_and_multiline ... ok
+test git::service::tests::test_short_oid_three_chars_falls_through_to_ref_lookup ... ok
+test git::service::tests::test_show_blob_limit_allows_payload_at_limit ... ok
+test git::service::tests::test_show_blob_path_not_found ... ok
+test git::service::tests::test_show_blob_rejects_directory_path ... ok
+test git::service::tests::test_show_blob_limit_rejects_before_returning_payload ... ok
+test git::service::tests::test_restore_then_show_reflects_old_content ... ok
+test git::service::tests::test_show_commit_meta_by_oid ... ok
+test git::service::tests::test_show_commit_object_missing_from_store ... ok
+test git::service::tests::test_show_distinguishes_committer_from_author ... ok
+test git::service::tests::test_show_blob_round_trip ... ok
+test git::service::tests::test_show_malformed_oid_input ... ok
+test git::service::tests::test_show_unknown_ref ... ok
+test git::service::tests::validate_account_id_accepts_valid ... ok
+test git::service::tests::validate_account_id_rejects_malicious ... ok
+test git::tree_builder::tests::test_empty_editor ... ok
+test git::service::tests::test_restore_tolerates_already_deleted_path ... ok
+test git::service::tests::test_restore_prunes_directories_emptied_by_delete ... ok
+test git::tree_builder::tests::test_flatten_empty_tree ... ok
+test git::service::tests::test_show_path_with_invalid_form ... ok
+test git::tree_builder::tests::test_file_to_dir_transition_overwrites_blob ... ok
+test core::builder::tests::default_stack_builds_sqlite_pathlock_without_cache ... ok
+test git::tree_builder::tests::test_flatten_nested_tree ... ok
+test git::service::tests::test_restore_writeback_partial_returns_partial_error_on_write_failure ... ok
+test git::service::tests::test_show_resolves_branch_name_and_full_ref ... ok
+test git::tree_builder::tests::test_git_sort_order_preserved ... ok
+test git::service::tests::test_restore_writeback_partial_continues_after_failure ... ok
+test git::service::tests::test_show_short_oid_not_found_distinguished_from_branch ... ok
+test git::service::tests::test_show_intermediate_path_component_is_blob ... ok
+test git::service::tests::test_restore_recreates_directory_removed_by_head ... ok
+test git::tree_builder::tests::test_fast_path_2_untouched_subtree_not_read ... ok
+test git::tree_builder::tests::test_flatten_with_path_filter ... ok
+test git::tree_builder::tests::test_lookup_blob_in_root ... ok
+test git::tree_builder::tests::test_remove_nonexistent_is_noop ... ok
+test git::tree_builder::tests::test_remove_existing ... ok
+test git::tree_builder::tests::test_remove_top_level_file ... ok
+test git::tree_builder::tests::test_from_tree_empty ... ok
+test git::tree_builder::tests::test_upsert_empty_component_rejected ... ok
+test git::tree_builder::tests::test_upsert_nested_path ... ok
+test git::tree_builder::tests::test_upsert_overwrite ... ok
+test git::service::tests::test_show_resolves_short_oid_unique ... ok
+test git::tree_builder::tests::test_upsert_single_file ... ok
+test git::tree_builder::tests::test_from_tree_with_entries ... ok
+test git::tree_builder::tests::test_lookup_nested_blob ... ok
+test git::tree_builder::tests::test_lookup_not_found ... ok
+test git::util::tests::test_parse_object_header_blob ... ok
+test git::tree_builder::tests::test_upsert_top_level_file ... ok
+test git::tree_builder::tests::test_lookup_tree_entry ... ok
+test git::util::tests::test_parse_object_header_tree ... ok
+test git::tree_builder::tests::test_remove_under_file_is_noop ... ok
+test git::tree_builder::tests::test_upsert_subtree_root_level ... ok
+test git::util::tests::test_validate_ref_name ... ok
+test git::tree_builder::tests::test_round_trip_from_tree_upsert_write ... ok
+test git::tree_builder::tests::test_write_empty_tree ... ok
+test git::util::tests::test_zlib_round_trip ... ok
+test git::tree_builder::tests::test_write_single_blob ... ok
+test leader::tests::only_one_candidate_acquires_a_live_key ... ok
+test leader::tests::compare_failure_reports_lost_ownership ... ok
+test git::tree_builder::tests::test_upsert_subtree_clears_existing_state ... ok
+test git::tree_builder::tests::test_upsert_subtree_nested ... ok
+test lock::cache_provder::refresh_tests::batch_invalid_request_is_preserved_for_every_path ... ok
+test lock::cache_provder::refresh_tests::malformed_batch_response_never_reports_refresh_success ... ok
+test lock::cache_provder::refresh_tests::failed_scope_does_not_prevent_other_scopes_refreshing ... ok
+test git::util::tests::test_write_read_object_round_trip ... ok
+test lock::cache_provder::refresh_tests::refresh_groups_scopes_and_preserves_mixed_result_order ... ok
+test git::tree_builder::tests::test_upsert_subtree_then_upsert_inside ... ok
+test git::util::tests::test_write_object_if_absent_skips_put_on_second_call ... ok
+test git::tree_builder::tests::test_write_nested_structure ... ok
+test lock::cache_provder::refresh_tests::same_scope_refresh_uses_one_script_for_twenty_paths ... ok
+test git::tree_builder::tests::test_commit_flow_round_trip ... ok
+test lock::cache_provder::tests::perf_hash_only_batches ... ignored, manual Redis performance baseline
+test git::tree_builder::tests::test_upsert_subtree_preserves_siblings ... ok
+test lock::cache_provder::tests::manager_unknown_atomic_result_does_not_publish_lease ... ok
+test leader::tests::rejects_sub_millisecond_ttl_and_unsafe_keys ... ok
+test lock::cache_provder::refresh_tests::large_refresh_is_split_into_bounded_scripts ... ok
+test lock::cache_provder::tests::provider_rejects_cross_scope_tree_before_redis_access ... ok
+test lock::cache_provder::tests::provider_rejects_invalid_configuration ... ok
+test lock::cache_provder::tests::manager_redis_classifies_filesystem_handoffs_without_reading_old_tokens ... ok
+test lock::cache_provder::tests::manager_logical_conflict_does_not_remove_stale_snapshot ... ok
+test lock::cache_provder::tests::provider_atomic_batch_is_all_or_nothing ... ok
+test lock::cache_provder::refresh_tests::redis_batch_preserves_kind_ownership_errors_and_hash_ttl ... ok
+test lock::cache_provder::tests::provider_invalid_u128_token_does_not_modify_hash ... ok
+test lock::cache_provder::tests::provider_rejected_global_tree_batch_preserves_exact_tokens ... ok
+test lock::cache_provder::tests::redis_provider_rejects_path_aliases_before_script_access ... ok
+test lock::cache_provder::tests::provider_stale_cleanup_preserves_same_owner_reentry ... ok
+test lock::codec::tests::rejects_legacy_and_malformed_tokens ... ok
+test lock::codec::tests::roundtrip_supported_lock_types ... ok
+test lock::cache_provder::tests::provider_routes_tokens_to_scope_hashes ... ok
+test lock::cache_provder::tests::provider_crud_preserves_tokens_and_hash_ttl ... ok
+test lock::manager::lost_lease_tests::bounded_cleanup_forgets_only_local_refs_and_preserves_valid_shared_token ... ok
+test lock::manager::lost_lease_tests::cross_manager_adoption_cannot_revive_an_expired_token ... ok
+test lock::cache_provder::tests::provider_atomic_rollback_restores_previous_state ... ok
+test lock::manager::lost_lease_tests::delayed_result_for_old_handoff_ref_cannot_update_the_adopted_lease ... ok
+test lock::manager::lost_lease_tests::failed_cleanup_keeps_capability_and_refs_until_recovery ... ok
+test lock::cache_provder::tests::manager_redis_preserves_lease_lifecycle_semantics ... ok
+test lock::manager::lost_lease_tests::invalidated_pending_handoff_cannot_be_adopted ... ok
+test lock::manager::lost_lease_tests::loss_invalidates_whole_leases_sharing_tokens_but_not_exact_descendants ... ok
+test lock::cache_provder::tests::redis_path_aliases_cannot_write_a_locked_file ... ok
+test lock::manager::lost_lease_tests::reentry_and_handoff_do_not_restart_token_deadlines ... ok
+test lock::cache_provder::tests::stale_recovery_count_reaches_manager_observation ... ok
+test lock::manager::lost_lease_tests::uncertain_partial_refresh_preserves_short_jitter_but_not_failed_token_deadline ... ok
+test lock::manager::tests::adopt_accepts_legacy_tree_path_with_covered_paths ... ok
+test lock::manager::tests::acquire_exact_reentrant_requires_local_owned_capability ... ok
+test lock::cache_provder::tests::topology_cluster_and_sentinel ... ok
+test lock::manager::tests::adopt_before_handoff_is_retryable ... ok
+test lock::manager::tests::adopt_fast_path_rejects_forged_covered_paths ... ok
+test lock::manager::tests::adopt_distinguishes_reentrant_leases_from_replay ... ok
+test lock::cache_provder::tests::provider_scope_root_trees_preserve_mutual_exclusion ... ok
+test lock::manager::tests::double_handoff_is_rejected ... ok
+test lock::manager::tests::downgrade_compare_miss_is_bounded_and_retryable ... ok
+test lock::manager::tests::exact_locks_tolerate_concurrent_parent_directory_creation ... ok
+test lock::manager::tests::failed_batch_rolls_back_same_owner_tree_upgrade ... ok
+test lock::manager::tests::handoff_and_adopt ... ok
+test lock::manager::lost_lease_tests::redis_takeover_denies_writes_and_cleanup_preserves_new_owner ... ok
+test lock::manager::tests::is_locked_detects_root_tree_lock ... ok
+test lock::cache_provder::tests::redis_lua_rejects_path_aliases_before_mutation ... ok
+test lock::manager::tests::legacy_tree_token_still_blocks_descendant_acquisition ... ok
+test lock::manager::tests::legacy_handoff_without_lease_ref_uses_token_fallback ... ok
+test lock::manager::tests::owner_mutex_is_scoped_to_owner ... ok
+test lock::manager::tests::opaque_lease_ref_must_cover_requested_path ... ok
+test lock::manager::tests::missing_exact_and_same_path_tree_conflict_in_both_orders ... ok
+test lock::manager::tests::filesystem_lock_relationship_matrix ... ok
+test lock::manager::tests::poll_interval_bounds_back_off_and_saturate ... ok
+test lock::manager::tests::poll_interval_samples_stay_within_deterministic_bounds ... ok
+test git::service::tests::test_commit_file_to_directory_on_localfs ... ok
+test lock::manager::tests::provider_io_error_is_not_retried ... ok
+test lock::manager::tests::release_selected_preserves_remaining_coverage ... ok
+test lock::manager::tests::release_tree_lease_succeeds_after_locked_directory_is_deleted ... ok
+test lock::manager::tests::remote_adopt_rejects_forged_kind_without_recovery ... ok
+test lock::manager::tests::retry_delay_does_not_overshoot_remaining_timeout ... ok
+test lock::cache_provder::tests::provider_rejects_cross_scope_tree_in_both_acquisition_orders ... ok
+test lock::path::tests::logical_paths_reject_aliases_and_preserve_valid_names ... ok
+test lock::path::tests::path_aliases_are_rejected_before_acquisition_and_coverage ... ok
+test lock::path::tests::trailing_slash_uses_the_same_lock_path ... ok
+test lock::provider::tests::batch_refresh_fallback_preserves_per_path_results ... ok
+test lock::provider::tests::compare_and_remove_would_block_maps_to_busy ... ok
+test lock::provider::tests::read_token_accepts_plaintext_lock ... ok
+test lock::provider::tests::read_token_cleans_up_legacy_encrypted_lock ... ok
+test lock::provider::tests::read_token_rejects_non_legacy_invalid_lock ... ok
+test lock::resolver::tests::ancestor_paths_run_from_nearest_parent_to_root ... ok
+test lock::resolver::tests::resolver_uses_parent_sidecars_for_all_paths ... ok
+test lock::resolver::tests::sidecar_name_matches_legacy_python_protocol ... ok
+test lock::cache_provder::tests::redis_acquire_metrics_export_outcomes_and_slow_calls ... ok
+test cache_runtime::redis::client::tests::repeated_connect_timeouts_release_connection_tasks ... ok
+test lock::manager::tests::busy_stale_takeover_is_retried ... ok
+test lock::manager::tests::contending_waiters_eventually_acquire_with_backoff ... ok
+test lock::manager::tests::pending_handoff_rejects_stale_capability_but_keeps_refreshing ... ok
+test lock::manager::lost_lease_tests::late_refresh_success_does_not_resurrect_an_expired_lease ... ok
+test lock::manager::lost_lease_tests::takeover_denies_writes_and_cleanup_preserves_new_owner_for_builtin_providers ... ok
+test lock::manager::tests::pending_handoff_is_forgotten_after_cross_manager_release ... ok
+test lock::manager::lost_lease_tests::redis_20ms_renew_timeout_preserves_lease_and_recovers_after_network_delay ... ok
+test lock::sqlite_provider::tests::atomic_recovery_counts_committed_cleanup_and_stale_replacements_once ... ok
+test lock::sqlite_provider::tests::changed_rollback_is_atomic_and_cas_checks_the_entire_token ... ok
+
+running 1 test
+test lock::sqlite_provider::tests::conflict_rolls_back_the_whole_batch_including_upgrades ... ok
+test lock::manager::tests::stale_takeover_preserves_a_concurrent_refresh ... ok
+test lock::sqlite_provider::tests::crashed_process_token_is_persistent_and_can_be_reclaimed ... ok
+test lock::sqlite_provider::tests::exact_and_tree_conflicts_are_shared_between_connections ... ok
+test lock::sqlite_provider::tests::batch_refresh_preserves_order_ownership_kinds_and_large_batches ... ok
+test lock::cache_provder::refresh_tests::manager_uses_batch_for_manual_and_background_refresh ... ok
+test lock::sqlite_provider::tests::manager_observes_only_committed_stale_recovery ... ok
+test lock::sqlite_provider::tests::failed_batch_restores_stale_conflicts_beyond_cleanup_budget ... ok
+test lock::sqlite_provider::tests::manager_lifecycle_uses_logical_handles_and_never_reads_business_directories ... ok
+test lock::sqlite_provider::tests::manager_upgrade_downgrades_and_handoff_adopts ... ok
+test lock::sqlite_provider::tests::rejects_invalid_paths_and_owner_before_mutation ... ok
+test lock::sqlite_provider::tests::manager_zero_timeout_waits_for_transient_sqlite_writer ... ok
+test lock::sqlite_provider::tests::run_bounds_busy_attempts_and_does_not_retry_other_errors ... ok
+
+running 1 test
+
+running 1 test
+test lock::sqlite_provider::tests::rollback_restores_upgrade_and_preserves_reentrant_tokens ... ok
+test lock::sqlite_provider::tests::subprocess_contender ... ignored, subprocess helper invoked by separate_processes test
+test lock::wrapper::tests::missing_deletes_return_without_delegating ... ok
+test lock::wrapper::tests::remove_all_missing_path_does_not_create_ancestors ... ok
+test lock::wrapper::tests::remove_existing_path_still_locks_and_deletes ... ok
+test lock::wrapper::tests::remove_missing_path_does_not_create_ancestors ... ok
+test multibackend::catch_up::tests::encrypted_write_returns_physical_length ... ok
+test multibackend::catch_up::tests::reconcile_file_accepts_encrypted_write_length ... ok
+test multibackend::codec::tests::segment_round_trip_recovers_complete_prefix_from_truncated_tail ... ok
+test multibackend::meta::tests::test_default_resolver ... ok
+test multibackend::meta::tests::test_default_resolver_invalid_path ... ok
+test multibackend::model::tests::partitions_manifest_rejects_route_gaps_and_stale_markers ... ok
+test multibackend::provider::filesystem::tests::flush_publishes_a_complete_committed_range ... ok
+test multibackend::runtime::tests::active_accounts_exclude_completed_deletions ... ok
+test lock::sqlite_provider::tests::batch_refresh_reports_busy_for_every_path_and_does_not_partially_commit ... ok
+test plugins::kvfs::tests::test_kvfs_basic_operations ... ok
+test plugins::kvfs::tests::test_kvfs_delete ... ok
+test plugins::kvfs::tests::test_kvfs_list_keys ... ok
+test plugins::kvfs::tests::test_kvfs_nested_keys ... ok
+test multibackend::runtime::tests::delete_account_event_removes_backup_scope ... ok
+test plugins::kvfs::tests::test_kvfs_plugin ... ok
+test plugins::kvfs::tests::test_kvfs_rename ... ok
+test plugins::localfs::tests::test_listing_skips_entry_removed_after_readdir ... ok
+test plugins::localfs::tests::test_localfs_glob_keeps_directory_matches ... ok
+test plugins::localfs::tests::test_localfs_glob_mount_rejects_absolute_remainder ... ok
+test plugins::localfs::tests::test_localfs_glob_defers_late_subtree_errors_to_later_pages ... ok
+test plugins::localfs::tests::test_localfs_glob_paginates_with_local_cursor_tokens ... ok
+test plugins::localfs::tests::test_localfs_glob_rejects_token_from_different_query_scope ... ok
+test lock::sqlite_provider::tests::run_retries_busy_from_clean_transactions_without_duplicate_mutations ... ok
+test plugins::localfs::tests::test_localfs_glob_skips_hidden_files_but_keeps_hidden_dirs ... ok
+test plugins::localfs::tests::test_localfs_glob_respects_level_limit ... ok
+test plugins::localfs::tests::test_localfs_grep_case_insensitive ... ok
+test plugins::localfs::tests::test_localfs_grep_context_handles_adjacent_matches_and_file_boundaries ... ok
+test plugins::localfs::tests::test_localfs_grep_does_not_inherit_parent_gitignore ... ok
+test plugins::localfs::tests::test_localfs_grep_exclude_path_applies_before_node_limit ... ok
+test plugins::localfs::tests::test_localfs_grep_missing_path_returns_not_found ... ok
+test plugins::localfs::tests::test_localfs_grep_includes_context ... ok
+test plugins::localfs::tests::test_localfs_grep_node_limit_collects_trailing_context ... ok
+test plugins::localfs::tests::test_localfs_grep_exclude_path_is_query_root_relative_for_nested_query_root ... ok
+test plugins::localfs::tests::test_localfs_grep_node_limit_zero_returns_empty ... ok
+test plugins::localfs::tests::test_localfs_maps_would_block_lock_errors ... ok
+test plugins::localfs::tests::test_localfs_grep_respects_gitignore_and_hidden ... ok
+test plugins::localfs::tests::test_localfs_rejects_parent_path_components ... ok
+test plugins::localfs::tests::test_localfs_relative_path_uses_forward_slashes ... ok
+test plugins::localfs::tests::test_localfs_mount_preserves_path_errors ... ok
+test plugins::localfs::tests::test_localfs_grep_returns_query_root_relative_paths ... ok
+test plugins::localfs::tests::test_open_file_identity_matches_only_the_current_path_entry ... ok
+test plugins::localfs::tests::test_localfs_write_honors_flags ... ok
+test plugins::memfs::tests::test_create_and_read_file ... ok
+test plugins::memfs::tests::test_mkdir_and_list ... ok
+test plugins::memfs::tests::test_plugin ... ok
+test plugins::memfs::tests::test_remove_file ... ok
+test plugins::memfs::tests::test_rename ... ok
+test plugins::memfs::tests::test_replace_overwrites_existing_file ... ok
+test plugins::queuefs::backend::tests::test_clear ... ok
+test plugins::memfs::tests::test_write_flags ... ok
+test plugins::queuefs::backend::tests::test_create_queue ... ok
+test plugins::queuefs::backend::tests::test_enqueue_dequeue ... ok
+test plugins::queuefs::backend::tests::test_list_queues ... ok
+test plugins::queuefs::backend::tests::test_multi_queue_isolation ... ok
+test plugins::queuefs::backend::tests::test_operations_on_nonexistent_queue ... ok
+test plugins::queuefs::backend::tests::test_peek ... ok
+test plugins::queuefs::backend::tests::test_remove_queue ... ok
+test plugins::localfs::tests::test_localfs_replace_overwrites_existing_file ... ok
+test lock::sqlite_provider::tests::prefix_boundaries_wildcards_unicode_root_and_namespaces ... ok
+test lock::sqlite_provider::tests::subprocess_contender ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 555 filtered out; finished in 0.06s
+
+test lock::sqlite_provider::tests::database_write_contention_is_retryable_busy ... ok
+test lock::sqlite_provider::tests::subprocess_contender ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 555 filtered out; finished in 0.07s
+
+
+running 1 test
+
+running 1 test
+test lock::sqlite_provider::tests::stale_cleanup_is_bounded_and_keeps_this_owners_tokens ... ok
+test lock::sqlite_provider::tests::subprocess_contender ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 555 filtered out; finished in 0.06s
+
+test lock::sqlite_provider::tests::stale_takeover_preserves_u128_boundary_and_ownership ... ok
+test lock::sqlite_provider::tests::subprocess_contender ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 555 filtered out; finished in 0.08s
+
+
+running 1 test
+
+running 1 test
+test plugins::queuefs::backend::tests::test_sqlite_backend_does_not_rewrite_existing_auto_vacuum_mode ... ok
+test plugins::queuefs::backend::tests::test_sqlite_backend_basic_flow ... ok
+test lock::sqlite_provider::tests::manager_refreshes_live_tokens ... ok
+test plugins::queuefs::backend::tests::test_stored_message_preserves_timestamp_validity ... ok
+test plugins::queuefs::cache_backend::tests::default_background_timing_matches_recovery_contract ... ok
+test plugins::queuefs::cache_backend::tests::drop_outside_tokio_runtime_removes_heartbeat ... ok
+test lock::sqlite_provider::tests::subprocess_contender ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 555 filtered out; finished in 0.05s
+
+test lock::sqlite_provider::tests::stale_target_and_ancestor_trees_are_cleaned_beyond_unrelated_budget ... ok
+test plugins::queuefs::cache_backend::tests::open_rejects_provider_without_script_support ... ok
+test plugins::queuefs::backend::tests::test_sqlite_backend_enables_full_auto_vacuum_for_new_databases ... ok
+test plugins::queuefs::cache_backend::tests::shutdown_removes_heartbeat_before_returning ... ok
+test plugins::queuefs::tests::cache_runtime_failure_is_propagated_by_stat_and_read_dir ... ok
+test plugins::queuefs::tests::cache_runtime_failure_is_returned_without_sqlite_fallback ... ok
+test plugins::queuefs::tests::cache_runtime_redis_storage_preserves_queuefs_file_flow ... ok
+test plugins::queuefs::tests::test_multi_queue ... ok
+test plugins::queuefs::tests::test_nested_queues ... ok
+test plugins::queuefs::tests::test_path_parsing ... ok
+test plugins::queuefs::tests::test_queue_lifecycle ... ok
+test plugins::queuefs::tests::test_queue_message_omits_missing_timestamp ... ok
+test plugins::queuefs::tests::test_queuefs_clear ... ok
+test plugins::queuefs::tests::test_queuefs_concurrent_access ... ok
+test plugins::queuefs::tests::test_queuefs_enqueue_dequeue ... ok
+test plugins::queuefs::tests::test_queuefs_invalid_operations ... ok
+test plugins::queuefs::tests::test_queuefs_peek ... ok
+test plugins::queuefs::tests::test_queuefs_plugin ... ok
+test plugins::queuefs::tests::test_queuefs_read_dir ... ok
+test plugins::queuefs::tests::test_queuefs_size ... ok
+test plugins::queuefs::tests::test_queuefs_stat ... ok
+test plugins::queuefs::cache_backend::tests::graceful_shutdown_allows_immediate_processing_recovery ... ok
+test plugins::sqlfs::backend::tests::test_list_directory_direct_children ... ok
+test plugins::sqlfs::backend::tests::test_parent_path ... ok
+test plugins::sqlfs::cache::tests::test_cache_basic ... ok
+test plugins::sqlfs::backend::tests::test_sqlite_backend_basic ... ok
+test plugins::sqlfs::cache::tests::test_cache_invalidate_prefix ... ok
+test plugins::sqlfs::cache::tests::test_is_descendant ... ok
+test plugins::sqlfs::cache::tests::test_parent_path ... ok
+test plugins::sqlfs::cache::tests::test_cache_lru ... ok
+test plugins::sqlfs::tests::test_sqlfs_basic ... ok
+test plugins::sqlfs::tests::test_sqlfs_chmod ... ok
+test plugins::sqlfs::tests::test_sqlfs_file_size_limit ... ok
+test plugins::queuefs::backend::tests::test_sqlite_backend_backfills_queue_metadata_from_legacy_rows ... ok
+test plugins::sqlfs::tests::test_sqlfs_offset_write_rejected ... ok
+test plugins::sqlfs::tests::test_sqlfs_directories ... ok
+test plugins::sqlfs::tests::test_sqlfs_nested_directories ... ok
+test plugins::sqlfs::tests::test_sqlfs_read_with_offset_and_size ... ok
+test plugins::sqlfs::tests::test_sqlfs_rename ... ok
+test plugins::sqlfs::tests::test_sqlfs_truncate ... ok
+test lock::sqlite_provider::tests::subprocess_contender ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 555 filtered out; finished in 0.08s
+
+
+running 1 test
+
+running 1 test
+test lock::manager::tests::pending_handoff_token_loss_invalidates_the_entire_lease ... ok
+test plugins::queuefs::cache_backend::tests::running_node_recovers_processing_after_peer_crash ... ok
+test plugins::queuefs::backend::tests::test_sqlite_backend_operations_on_nonexistent_queue ... ok
+test privacy_matcher::tests::match_limits_discard_partial_rewrites_and_metadata ... ok
+test privacy_matcher::tests::registered_values_preserve_references_and_report_unicode_spans ... ok
+test tests::test_version ... ok
+test privacy_extractor::tests::basic_requires_authentication_context ... ok
+test privacy_extractor::tests::references_and_environment_placeholders_are_not_new_credentials ... ok
+test privacy_extractor::tests::markdown_delimiters_preserve_value_boundaries_and_literal_symbols ... ok
+test privacy_extractor::tests::unicode_categories_preserve_credential_boundaries ... ok
+test privacy_extractor::tests::unicode_offsets_and_overlaps_cover_complete_credentials ... ok
+test plugins::queuefs::backend::tests::test_sqlite_backend_dequeue_legacy_go_row ... ok
+test lock::sqlite_provider::tests::stale_conflicting_descendants_cannot_be_revived_after_tree_takeover ... ok
+test plugins::queuefs::backend::tests::test_sqlite_backend_preserves_non_utf8_payload_bytes ... ok
+test lock::sqlite_provider::tests::subprocess_contender ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 555 filtered out; finished in 0.13s
+
+test lock::sqlite_provider::tests::subprocess_contender ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 555 filtered out; finished in 0.18s
+
+test lock::sqlite_provider::tests::separate_processes_cannot_acquire_tree_and_descendant_simultaneously ... ok
+test plugins::queuefs::backend::tests::test_sqlite_backend_preserves_subsecond_enqueue_timestamp ... ok
+test plugins::queuefs::backend::tests::test_sqlite_backend_recover_stale ... ok
+test lock::cache_provder::tests::manager_redis_adopts_handoff_across_managers ... ok
+test lock::sqlite_provider::tests::busy_retries_cover_zero_timeout_acquire_refresh_release_and_rollback ... ok
+test lock::manager::lost_lease_tests::background_refresh_invalidates_and_bounds_cleanup_during_outage ... ok
+test lock::manager::tests::real_retry_loop_stays_within_ten_second_probe_budget ... ok
+
+failures:
+
+---- core::mountable::tests::shutdown_reaches_cache_queuefs_through_stats_wrapper stdout ----
+
+thread 'core::mountable::tests::shutdown_reaches_cache_queuefs_through_stats_wrapper' (111892) panicked at crates/ragfs/src/core/mountable.rs:1760:13:
+script execution is outside this shutdown test's scope: queuefs.release_recovery_leader.v1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'core::mountable::tests::shutdown_reaches_cache_queuefs_through_stats_wrapper' (111892) panicked at crates/ragfs/src/core/mountable.rs:1780:30:
+called `Result::unwrap()` on an `Err` value: Internal("queuefs cache background task failed: task 74 panicked with message \"script execution is outside this shutdown test's scope: queuefs.release_recovery_leader.v1\"")
+
+
+failures:
+    core::mountable::tests::shutdown_reaches_cache_queuefs_through_stats_wrapper
+
+test result: FAILED. 553 passed; 1 failed; 2 ignored; 0 measured; 0 filtered out; finished in 10.16s
+
+error: test failed, to rerun pass `-p ragfs --lib`
+     Running unittests src/shell/main.rs (target/debug/deps/ragfs_shell-cf6ea9c9ba9f92d1)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cache_runtime.rs (target/debug/deps/cache_runtime-491785a15c5dc0bc)
+
+running 13 tests
+test atomic_integer_commands_follow_redis_string_semantics ... ok
+test async_runtime_supports_the_primitive_contract ... ok
+test controlled_memory_provider_is_only_accessed_through_runtime ... ok
+test set_reports_nx_and_xx_outcomes ... ok
+test close_rejects_new_operations ... ok
+test non_blocking_list_mutations_match_redis_semantics ... ok
+test sync_and_async_facades_share_one_provider_instance ... ok
+test set_queries_return_membership_members_and_cardinality ... ok
+test unknown_script_returns_an_explicit_error ... ok
+test non_blocking_list_commands_preserve_redis_order ... ok
+test sync_facade_exposes_lifecycle_operations ... ok
+test sync_facade_rejects_calls_from_tokio_runtime ... ok
+test set_expiration_and_keep_ttl_match_redis_semantics ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/dynamic_provider.rs (target/debug/deps/dynamic_provider-270be3029664203a)
+
+running 4 tests
+test incompatible_abi_is_rejected_before_create ... ok
+test close_error_consumes_handle_and_is_not_retried_by_drop ... ok
+test mismatched_output_length_is_rejected_without_unsafe_read ... ok
+test dynamic_provider_loads_shared_library_and_dispatches_get ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/git_s3_integration.rs (target/debug/deps/git_s3_integration-aa6b8b2782508a07)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/redis_runtime.rs (target/debug/deps/redis_runtime-5ec3860d7fbb8493)
+
+running 7 tests
+test redis_sentinel_discovers_the_configured_master ... ok
+test sync_redis_runtime_is_initialized_on_the_runtime_executor ... ok
+test redis_runtime_accepts_the_legacy_plaintext_password ... ok
+test redis_runtime_preserves_primitive_and_batch_semantics ... ok
+test redis_runtime_supports_conditions_counters_and_lists ... ok
+test redis_cluster_supports_same_slot_reads_and_cross_slot_errors ... ok
+test redis_runtime_preserves_default_ttl_and_per_write_override ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+   Doc-tests ragfs
+
+running 2 tests
+test crates/ragfs/src/git/mod.rs - git (line 15) ... ignored
+test crates/ragfs/src/lib.rs - (line 14) - compile ... ok
+
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+error: 1 target failed:
+    `-p ragfs --lib`

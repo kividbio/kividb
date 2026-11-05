@@ -29,23 +29,95 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **A panic in active defrag no longer stops it silently (#358).** Active
-  defrag runs on a thread of its own, and release builds unwind on a panic.
-  Had anything in a pass panicked, that thread alone would have ended: the
-  server went on, `active_defrag_running` stayed 1, the slabs the pass was
-  emptying were never used again for new values, and nothing was compacted
-  until a restart. Each pass now runs inside `catch_unwind`. A panic is
-  logged at `ERROR` with its message, the slabs the pass was emptying are
-  put back in use, and the next pass comes after 1 second, then 2, 4 and
-  8. Every value stays where its key points: a value being copied keeps
-  its old place, and the copy is freed (#356). After 5 passes in a row
+- **`ZREM` no longer scans the whole sorted set for each member it removes.**
+  Removing a member is now O(log N) instead of O(N)
+  ([#386](https://github.com/kividbio/kividb/issues/386),
+  by [@Parikalp-Bhardwaj](https://github.com/Parikalp-Bhardwaj)).
+  
+- **A client that goes while it is blocked no longer takes the next
+  element (#384).** On the io_uring I/O model (the default on Linux), a
+  client blocked in `BLPOP`, `BRPOPLPUSH`, `BLMOVE`, `BZPOPMIN`,
+  `XREADGROUP … BLOCK` or any other blocking command, that had sent more
+  bytes behind it and then closed its connection, was not seen to go. It
+  stayed in line until its timeout (for ever with timeout 0), kept its
+  connection, and took the next element pushed to its key, which nobody
+  received: lost with `BLPOP`, moved for a dead worker with `BRPOPLPUSH`,
+  left pending for a gone consumer with `XREADGROUP`. Bull, which n8n's
+  queue mode uses, does exactly this whenever a worker pauses or stops.
+  The connection loop now watches a blocked client's socket for its end
+  (`POLLRDHUP`) whatever it has sent, so it is let go and its connection
+  closed as soon as the end arrives, as Redis does; the tokio I/O model
+  already did. On both I/O models a client woken for an element checks
+  first that it is still there, and a command whose client has gone leaves
+  the line without taking anything. A client that closes while
+  `CLIENT PAUSE` holds its command, or while it waits in `WAIT` or
+  `WAITAOF`, is let go too, and the held command is not run after the
+  pause: a blocking pop held by a pause used to run when it ended, and
+  take an element for nobody. A command the pause does not hold still
+  runs, as a fire-and-forget `LPUSH` sent as a pause ends does in Redis.
+  A client woken for an element whose command is refused before it looks
+  at the key (`OOM`, `READONLY` after a failover, a pause it then closes
+  in) now passes its turn to the client behind it; it used to keep the
+  turn, and the element waited in the list, with clients blocked on it,
+  for the next write. On the tokio I/O model, a client that keeps sending
+  while it waits is closed once what it sent passes
+  `client-query-buffer-limit`, as Redis closes one; it used to be read
+  into memory without end.
+- **Follow-ups to the fix above (#384).** A blocked client woken as a
+  pause ended, kept a moment at the pause gate while the clients the pause
+  let go went on, and closing then, could still be given the element: its
+  socket is now looked at again once the gate lets it through. A woken
+  client whose command is refused (`OOM`, `READONLY`) passes its turn on
+  as soon as the refusal is answered, not when the commands pipelined
+  behind it are done: a `WAIT` behind it used to keep the element from the
+  client next in line for as long as it waited. A blocking command that is
+  answered at once no longer pays for the bookkeeping of one that waits.
+- **A replica could stop for good while it saved (#373).** The replica
+  entered the command gate while holding its own apply lock, which `SAVE`
+  (and a promotion, `REPLICAOF NO ONE`) waits for while holding the gate.
+  Two cases deadlocked. A write from the master that touches keys of several
+  shards (`COPY`, `RENAME`, `SMOVE`, `LMOVE` and the like, across shards)
+  takes the gate alone, and waited for the `SAVE`. And a read-only script
+  run on the replica (`EVAL_RO`, `FCALL_RO`) takes the gate alone slot by
+  slot: it waited for the `SAVE`'s slot, and the replica's next write waited
+  behind the script. In both, the replica answered no command, applied
+  nothing more and acknowledged nothing, its master dropped it, and it could
+  not shut down. The replica now enters the gate before taking its lock,
+  alone for a write that needs it, as it already did for a transaction, and
+  so does the final save at shutdown. A write from the master now also waits
+  for a script on the replica that has run past its time limit, as a
+  transaction from the master did; it was refused with `BUSY`, logged, and
+  not applied, and the replica's data went its own way.
+- **A panic in active defrag no longer stops it silently (#358, #370).**
+  Active defrag runs on a thread of its own, and release builds unwind on a
+  panic. Had anything in a pass panicked, that thread alone would have
+  ended: the server went on, `active_defrag_running` stayed 1, the slabs the
+  pass was emptying were never used again for new values, and nothing was
+  compacted until a restart. Each pass now runs inside `catch_unwind`. A
+  panic is logged at `ERROR` with its message and the file and line it
+  came from (in the log file too, not only on stderr), the slabs the pass
+  was emptying are put back in use, and the next pass comes after 1
+  second, then 2, 4 and 8. Should putting them back panic as well, the
+  line says so, and those left are put back at the next tick, on or off.
+  Every value stays where its key points: a value being copied keeps its
+  old place, and the copy is freed (#356); the values moved before the
+  panic are counted in `active_defrag_hits`. After 5 passes in a row
   panic, with none ending between them, active defrag turns itself off,
   with one `ERROR` line saying that `CONFIG SET activedefrag yes` turns it
-  back on; `CONFIG GET activedefrag` then says `no`. Two new fields in
-  `INFO memory`: `active_defrag_panics`, the passes that panicked, and
+  back on; `CONFIG GET activedefrag` then says `no`, and MEMORY DOCTOR
+  says so when fragmentation is high. Only turning it on from off starts the count afresh: a
+  `CONFIG SET activedefrag yes` sent while it is on, as a configuration
+  loop does, changes nothing. Two new fields in `INFO memory`:
+  `active_defrag_panics`, the passes that panicked, and
   `active_defrag_disabled_by_panics`, 1 while active defrag is off because
-  of them. Nothing changes for a pass that does not panic. Release builds
-  still unwind.
+  of them. `CONFIG RESETSTAT` now resets `active_defrag_hits`,
+  `active_defrag_misses` and `active_defrag_panics`, as Redis does.
+  `CONFIG REWRITE` after active defrag turned itself off writes
+  `activedefrag no`, as for any other setting: after a restart it stays off
+  and `active_defrag_disabled_by_panics` is 0, which is kept only while the
+  server runs. The `ERROR` line "active defrag turned itself off" in the
+  log is then what says why. Nothing changes for a pass that does not
+  panic. Release builds still unwind.
 - **A restart with the AOF on after a save with it off applied writes
   twice (#354).** A save with the AOF off (`SAVE`, `BGSAVE`, the save at
   `SHUTDOWN`) wrote a new `dump.kdb` but left `dump.kdb.gen`, its save
@@ -99,8 +171,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   nothing but its header. A log with records made after a save that had no
   log is replayed whatever its header's number, rather than left out as
   older. An old log that the snapshot holds and that cannot be removed is
-  left in place with a warning; only one that has to be kept aside first,
-  and cannot be, stops the server, saying what to do.
+  left in place with a warning that says what to do (checkpoints fail
+  until it is gone); only one that has to be kept aside first, and cannot
+  be, stops the server, saying what to do. A log already kept aside byte
+  for byte is not kept a second time.
 - **Follow-ups to the two fixes above (#359).** A save with the AOF off
   now also records how long `appendonly.aof` and `appendonly.aof.prev` were,
   with a hash of their first and last bytes. A log beside that dump that
@@ -183,9 +257,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A transaction could lose its writes during an atomic slot migration's
   handoff.** An `EXEC` that got past the write pause just before the
   handoff set it ran during the handoff. Its writes were not sent to the
-  destination, and were deleted with the slots. Such an `EXEC` is now
-  refused with `TRYAGAIN` if it writes. So is one that reaches its gates
-  during a manual failover's handoff.
+  destination, and were deleted with the slots. Such an `EXEC`, or one
+  that reaches its gates during a manual failover's handoff, is now
+  refused with `TRYAGAIN` if it may write, as the pause would have held
+  it. One that only reads, or whose scripts are declared `no-writes`,
+  runs (#339).
 - **`MIGRATE` no longer answers `TRYAGAIN` for an unchanged hash whose field
   is about to expire (#332).** The check that a moved hash was not written
   meanwhile compared the server's fields by the monotonic clock and the
@@ -307,6 +383,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `DEBUG OBJECT` gave the same line for every key, there or not; it now
   gives the key's encoding, serialized length and last use in Redis's order
   of fields, and `ERR no such key` for a key that is not there.
+- **On a replica, `FLUSHDB`, `FLUSHALL` and `SWAPDB` from the master take
+  the command gate alone, as they do on a master (#378).** They took it
+  shared, so a query on the replica could find a database half flushed, its
+  keys gone and its indexes not yet, or half swapped.
+- **`BRPOPLPUSH` and `BLMOVE` time out with a null array (#385).** In
+  RESP2 they replied `$-1` when their timeout ran out (or `CLIENT UNBLOCK
+  … TIMEOUT` ended the wait), where Redis replies `*-1`, as it does for
+  every blocking command that times out. They now reply `*-1`; RESP3 is
+  `_` as before. Inside `MULTI` or a script, where they cannot wait, they
+  still reply `$-1`, as Redis does, and so do `RPOPLPUSH` and `LMOVE` on
+  an empty list.
 
 ## [1.2.0] - 2026-11-03
 
