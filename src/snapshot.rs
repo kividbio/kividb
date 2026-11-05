@@ -244,6 +244,32 @@ fn read_bytes(r: &mut impl Read) -> io::Result<Vec<u8>> {
     read_exactly(r, len)
 }
 
+/// What an entry's key length is written as when the key is empty (#441).
+///
+/// A key length of 0 ends a database's section ([`write_kdb_db_end`]), and
+/// Redis allows the empty key: written with a length of 0, it ended its
+/// database there, and the image could not be read past it. No key has this
+/// length (keys this long cannot be written, see [`write_key`]), so it stands
+/// for the empty key, with no bytes after it. A reader before 1.2.1 takes it
+/// for the length of a key of 4 GiB, runs out of image before it has one,
+/// and refuses the image.
+const EMPTY_KEY_LEN: u32 = u32::MAX;
+
+/// An entry's key: its length, then its bytes; the empty key as
+/// [`EMPTY_KEY_LEN`] alone.
+fn write_key(w: &mut impl Write, key: &[u8]) -> io::Result<()> {
+    if key.is_empty() {
+        return w.write_all(&EMPTY_KEY_LEN.to_le_bytes());
+    }
+    if key.len() >= EMPTY_KEY_LEN as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a key of 4 GiB or more cannot be written to a snapshot",
+        ));
+    }
+    write_bytes(w, key)
+}
+
 /// How much room to make ahead for `count` things an image says follow.
 ///
 /// An image is not always this server's own: `RESTORE` takes one from a
@@ -527,9 +553,13 @@ pub fn write_kdb_entry(
     key: &str,
     value: crate::store::ValueRef<'_>,
 ) -> io::Result<()> {
-    // Write key first (shared by all types)
-    write_bytes(w, key.as_bytes())?;
+    write_key(w, key.as_bytes())?;
+    write_kdb_value(w, value)
+}
 
+/// One value as an entry lays it out after its key: a type tag, then the
+/// value's own encoding.
+pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) -> io::Result<()> {
     match value {
         ValueRef::String(bytes) => {
             w.write_all(&[TAG_STRING])?;
@@ -1564,12 +1594,18 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
                 Err(e) => return Err(e),
                 Ok(_) => {}
             }
-            let klen = u32::from_le_bytes(len_buf) as usize;
+            let klen = u32::from_le_bytes(len_buf);
 
             // TAG_EOF sentinel (key len == 0 means end of DB section)
             if klen == 0 {
                 break;
             }
+            // The empty key: no bytes follow.
+            let klen = if klen == EMPTY_KEY_LEN {
+                0
+            } else {
+                klen as usize
+            };
 
             let kbuf = read_exactly(&mut r, klen)?;
             let key = String::from_utf8(kbuf)
@@ -4150,7 +4186,7 @@ impl FrozenDataset {
             let mut timed = Vec::new();
             for part in std::mem::take(&mut db.strings) {
                 for entry in part {
-                    write_bytes(out, entry.key().as_bytes())?;
+                    write_key(out, entry.key().as_bytes())?;
                     out.write_all(&[TAG_STRING])?;
                     write_bytes(out, frozen_string(&entry))?;
                     if let Some(at) = entry.expires() {
@@ -5627,5 +5663,193 @@ mod nan_score_tests {
             restore_payload_checked(&redis_payload(&[3, 1, 1, b'm', 253])).err(),
             Some(RestoreError::BadData)
         );
+    }
+}
+
+/// The empty key in an image (#441).
+#[cfg(test)]
+mod empty_key_tests {
+    use super::*;
+
+    fn string(v: &str) -> KiviDBValue {
+        KiviDBValue::String(SharedBytes::from(v.as_bytes()))
+    }
+
+    fn image(maps: &[HashMap<String, KiviDBValue>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_kdb_image(&mut out, maps, None).unwrap();
+        out
+    }
+
+    fn get_string(map: &HashMap<String, KiviDBValue>, key: &str) -> Vec<u8> {
+        match map.get(key) {
+            Some(KiviDBValue::String(bytes)) => bytes.as_ref().to_vec(),
+            _ => panic!("{key:?} is not a string"),
+        }
+    }
+
+    /// It was written with the length that ends a database: the rest of
+    /// that database, and every database after it, could not be read.
+    #[test]
+    fn the_empty_key_is_read_back_in_every_database() {
+        let db0 = HashMap::from([(String::new(), string("x")), ("a".to_string(), string("1"))]);
+        let db1 = HashMap::from([("b".to_string(), string("2")), (String::new(), string("y"))]);
+        let whole = image(&[db0, db1]);
+        assert_eq!(verify_snapshot(whole.as_slice()).unwrap(), 4);
+        let loaded = load_snapshot_from(whole.as_slice()).unwrap();
+        assert_eq!(get_string(&loaded.dbs[0], ""), b"x");
+        assert_eq!(get_string(&loaded.dbs[0], "a"), b"1");
+        assert_eq!(get_string(&loaded.dbs[1], ""), b"y");
+        assert_eq!(get_string(&loaded.dbs[1], "b"), b"2");
+    }
+
+    /// The empty key is the stand-in length and no bytes; any other key, an
+    /// empty value and empty members are written as they always were.
+    #[test]
+    fn only_the_empty_key_is_written_differently() {
+        let mut entry = Vec::new();
+        write_kdb_entry(&mut entry, "", string("x").view()).unwrap();
+        let mut expected = u32::MAX.to_le_bytes().to_vec();
+        expected.push(TAG_STRING);
+        expected.extend(1u32.to_le_bytes());
+        expected.push(b'x');
+        assert_eq!(entry, expected);
+
+        let mut entry = Vec::new();
+        write_kdb_entry(&mut entry, "k", string("").view()).unwrap();
+        let mut expected = 1u32.to_le_bytes().to_vec();
+        expected.push(b'k');
+        expected.push(TAG_STRING);
+        expected.extend(0u32.to_le_bytes());
+        assert_eq!(entry, expected);
+    }
+
+    /// An empty hash field, set member, sorted set member and list element
+    /// have a count before them, not a marker after them: they were never
+    /// read as an end. Under the empty key, too.
+    #[test]
+    fn empty_fields_and_members_round_trip() {
+        let mut fields = crate::types::HashFields::default();
+        fields.insert(String::new(), Arc::from(&b"v"[..]));
+        fields.insert("f".to_string(), Arc::from(&b""[..]));
+        let mut members = crate::member_set::MemberSet::new();
+        members.insert(Arc::from(&b""[..]));
+        members.insert(Arc::from(&b"m"[..]));
+        let mut zset = SortedSetInner::new();
+        zset.insert(Arc::from(&b""[..]), 1.5);
+        zset.insert(Arc::from(&b"z"[..]), 2.0);
+        let db0 = HashMap::from([
+            (
+                String::new(),
+                KiviDBValue::Hash(Arc::new(parking_lot::RwLock::new(fields))),
+            ),
+            (
+                "set".to_string(),
+                KiviDBValue::Set(Arc::new(parking_lot::RwLock::new(members))),
+            ),
+            (
+                "zset".to_string(),
+                KiviDBValue::SortedSet(Arc::new(parking_lot::RwLock::new(zset))),
+            ),
+            (
+                "list".to_string(),
+                KiviDBValue::List(Arc::new(parking_lot::RwLock::new(VecDeque::from([
+                    Arc::from(&b""[..]),
+                    Arc::from(&b"e"[..]),
+                ])))),
+            ),
+        ]);
+        let whole = image(&[db0, HashMap::from([("after".to_string(), string("1"))])]);
+        assert_eq!(verify_snapshot(whole.as_slice()).unwrap(), 5);
+        let loaded = load_snapshot_from(whole.as_slice()).unwrap();
+        match loaded.dbs[0].get("") {
+            Some(KiviDBValue::Hash(hash)) => {
+                let hash = hash.read();
+                assert_eq!(hash.len(), 2);
+                assert_eq!(hash.get("").map(|v| &v[..]), Some(&b"v"[..]));
+                assert_eq!(hash.get("f").map(|v| &v[..]), Some(&b""[..]));
+            }
+            _ => panic!("the empty key is not a hash"),
+        }
+        match loaded.dbs[0].get("set") {
+            Some(KiviDBValue::Set(set)) => {
+                let set = set.read();
+                assert_eq!(set.len(), 2);
+                assert!(set.iter().any(|m| m.is_empty()));
+            }
+            _ => panic!("set is not a set"),
+        }
+        match loaded.dbs[0].get("zset") {
+            Some(KiviDBValue::SortedSet(zset)) => {
+                let zset = zset.read();
+                assert_eq!(zset.members.len(), 2);
+                assert!(
+                    zset.by_score
+                        .keys()
+                        .any(|(score, m)| m.is_empty() && score.0 == 1.5)
+                );
+            }
+            _ => panic!("zset is not a sorted set"),
+        }
+        match loaded.dbs[0].get("list") {
+            Some(KiviDBValue::List(list)) => {
+                let list = list.read();
+                assert_eq!(list.len(), 2);
+                assert!(list[0].is_empty());
+            }
+            _ => panic!("list is not a list"),
+        }
+        assert_eq!(get_string(&loaded.dbs[1], "after"), b"1");
+    }
+
+    /// A reader before 1.2.1 reads the stand-in as the length of a key and
+    /// asks for that many bytes (`read_exactly`, as 1.2.0 has it): the image
+    /// runs out first, and the load fails, with nothing taken for a key.
+    #[test]
+    fn a_reader_before_the_marker_runs_out_of_image_at_it() {
+        let whole = image(&[HashMap::from([(String::new(), string("x"))])]);
+        let at = KDB_MAGIC.len() + 4;
+        assert_eq!(&whole[at..at + 4], &u32::MAX.to_le_bytes());
+        let mut rest = &whole[at + 4..];
+        let err = read_exactly(&mut rest, u32::MAX as usize).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// Lengths that are not the stand-in are read as lengths still: one that
+    /// says more than the image holds, or the stand-in with the image cut
+    /// after it or a value of no type after it, is refused.
+    #[test]
+    fn a_garbage_or_truncated_key_length_is_still_refused() {
+        let mut header = Vec::new();
+        write_kdb_header(&mut header, 1).unwrap();
+
+        let mut long = header.clone();
+        long.extend((u32::MAX - 1).to_le_bytes());
+        long.extend(b"short");
+        assert!(load_snapshot_from(long.as_slice()).is_err());
+        assert!(verify_snapshot(long.as_slice()).is_err());
+
+        let mut cut = header.clone();
+        cut.extend(u32::MAX.to_le_bytes());
+        assert!(load_snapshot_from(cut.as_slice()).is_err());
+        assert!(verify_snapshot(cut.as_slice()).is_err());
+
+        let mut untyped = cut.clone();
+        untyped.push(0xEE);
+        untyped.extend(0u32.to_le_bytes());
+        assert!(load_snapshot_from(untyped.as_slice()).is_err());
+        assert!(verify_snapshot(untyped.as_slice()).is_err());
+
+        // Cut anywhere between the marker and the database's end.
+        let whole = image(&[HashMap::from([(String::new(), string("x"))])]);
+        let db_end = header.len() + 4 + 1 + 4 + 1 + 4;
+        assert_eq!(&whole[db_end - 4..db_end], &0u32.to_le_bytes());
+        for end in header.len() + 1..db_end {
+            assert!(
+                verify_snapshot(&whole[..end]).is_err(),
+                "an image cut at {end} of {} verified",
+                whole.len()
+            );
+        }
     }
 }

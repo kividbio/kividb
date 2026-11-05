@@ -2696,3 +2696,30 @@ fn test_a_replica_of_a_1_1_master_keeps_the_documents_of_its_dd() {
 fn test_a_replica_of_a_master_that_does_not_say_keeps_the_documents_of_its_dd() {
     assert!(!replica_fed_a_dd(None));
 }
+
+/// The empty key crosses a full sync (#441). In the payload it was written
+/// with the key length that ends a database: the replica found the payload
+/// unreadable, kept what it had, and never came up.
+#[test]
+fn test_full_resync_carries_the_empty_key() {
+    let master_port = spawn_server(Config::default());
+    let mut master = Conn::connect(master_port);
+    assert!(master.cmds(&["SET", "", "x"]).is_ok());
+    assert_eq!(master.cmds(&["HSET", "hash", "", "v"]).as_int(), 1);
+    assert_eq!(master.cmds(&["SADD", "set", ""]).as_int(), 1);
+    assert_eq!(master.cmds(&["ZADD", "zset", "1.5", ""]).as_int(), 1);
+    assert!(master.cmds(&["SELECT", "1"]).is_ok());
+    assert_eq!(master.cmds(&["RPUSH", "", ""]).as_int(), 1);
+    assert!(master.cmds(&["SET", "after", "1"]).is_ok());
+
+    let replica_port = spawn_server(replica_of(master_port));
+    let mut replica = Conn::connect(replica_port);
+    wait_link_up(&mut replica);
+    assert_eq!(replica.cmds(&["GET", ""]).as_str(), "x");
+    assert_eq!(replica.cmds(&["HGET", "hash", ""]).as_str(), "v");
+    assert_eq!(replica.cmds(&["SISMEMBER", "set", ""]).as_int(), 1);
+    assert_eq!(replica.cmds(&["ZSCORE", "zset", ""]).as_str(), "1.5");
+    assert!(replica.cmds(&["SELECT", "1"]).is_ok());
+    assert_eq!(replica.cmds(&["LLEN", ""]).as_int(), 1);
+    assert_eq!(replica.cmds(&["GET", "after"]).as_str(), "1");
+}

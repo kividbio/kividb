@@ -29,6 +29,30 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A snapshot holding the empty key can be loaded.** Redis allows the
+  key `""`, and so does KiviDB, but in a KiviDB snapshot a key length of 0
+  marks the end of a database, and the empty key was written with that
+  length. The next start failed (`dump.kdb cannot be loaded: failed to
+  fill whole buffer`, or `bad key utf8`), as did a start from an AOF
+  whose checkpoint or preamble held the key, and a replica's full sync
+  (the replica kept its old data and never came up). When the key was in
+  the last database (always, with `databases 1`), the start or the sync
+  did not fail: it went on without the rest of that database, and
+  without what a snapshot keeps after its databases: times to live,
+  search index definitions and function libraries. Any client that could
+  write could do this. The empty key is now written with a length no key
+  can have, followed by no bytes, and read back as the empty key; images
+  without an empty key are written as before. Empty hash fields, set and
+  sorted set members and list elements were never affected (#441).
+
+  **Upgrade note:** a snapshot written with an empty key needs 1.2.1 or
+  later to load. 1.2.0 refuses it at startup, and a 1.2.0 replica
+  refuses such a full sync from its master and keeps the data it has.
+  Upgrade replicas before their master. 1.2.1 reads a snapshot that
+  1.2.0 wrote with an empty key no further than 1.2.0 does: on 1.2.0,
+  `RENAME` the empty key to another name and `SAVE` before upgrading,
+  and rename it back after.
+
 - **A write in database 0 could reach replicas and the AOF in another
   database.** Until a client selects a database other than 0, writes go out
   with no `SELECT` of their own. The first client to select another
