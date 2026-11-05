@@ -372,7 +372,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         env!("CARGO_PKG_VERSION"),
         std::process::id(),
         update_check::variant(),
-        if std::path::Path::new(&config.configfile).is_file() {
+        if config.configfile_loaded {
             format!("'{}'", config.configfile)
         } else {
             "none".to_string()

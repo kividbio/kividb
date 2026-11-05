@@ -29,6 +29,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`CONFIG REWRITE` no longer writes a config file the server was not
+  started from.** A server started without one, because its `--configfile`
+  path (by default `/etc/kividb/kividb.conf`) did not exist, created the
+  file on `CONFIG REWRITE`, with its `port`, `replicaof` and every other
+  setting in it. The next server started with the same path, which for the
+  default path is any server on the host started without a config file of
+  its own, loaded it. Sentinel sends `REPLICAOF` and then `CONFIG REWRITE`
+  to each replica it reconfigures, and this way turned unrelated servers
+  into replicas whose data a full sync then replaced. As in Redis, a server
+  that was not started from a config file now replies `ERR The server is
+  running without a config file` and writes nothing, and `INFO server`
+  shows its `config_file` as empty. A server started from a file, even an
+  empty one, rewrites it as before; the packages install
+  `/etc/kividb/kividb.conf`, and the Kubernetes operator starts every
+  server from one. To use `CONFIG REWRITE` on a server started without a
+  file (the Docker image, for one), start it with `--configfile` pointing
+  at a file that exists (#442).
+
 - **A Lua script's `false` is a RESP3 null to a RESP3 client (#431).** A
   script's `false`, which is also what `redis.call` gives back for a nil
   reply (a `GET` of a missing key), was sent as RESP2's `$-1` to a client
