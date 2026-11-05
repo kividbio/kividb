@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the RAGFlow harness against one server, from a clean stack.
+# Run the RAGFlow 0.27 harness (v0.27.3) against one server, from a clean stack. RAGFlow 1.0: run1.sh.
 #
 #   ./run.sh kividb       kividb/kividb:v1.2.0-lua
 #   ./run.sh kividb-nolua kividb/kividb:v1.2.0

@@ -1,0 +1,30 @@
+# RAGFlow 1.0: replaces the `kvrocks` service (Apache Kvrocks 2.16.0) with KiviDB. Use it on top
+# of RAGFlow's own compose file:
+#
+#   cd ragflow/docker
+#   docker compose -f docker-compose.yml -f /path/to/compose.kividb-kvrocks.yaml up -d
+#
+# The service keeps the name `kvrocks` and the port 6379, so nothing else in RAGFlow's
+# configuration changes: KVROCKS_HOST, KVROCKS_PORT and REDIS_PASSWORD stay as docker/.env sets them.
+#
+# Use the `-lua` variant: RAGFlow's agent-run lease, its locks, its webhook rate limit and its
+# media cache are Lua scripts.
+services:
+  kvrocks:
+    image: ${KIVIDB_IMAGE:-kividb/kividb:v1.2.0-lua}
+    # Kvrocks' entrypoint script and root user are for Kvrocks; KiviDB takes its settings as flags
+    # and runs as its own user. --requirepass also turns off protected mode. --aof logs every write,
+    # as Kvrocks does: RAGFlow keeps the secret key that signs login tokens in this server.
+    entrypoint: !reset null
+    user: !reset null
+    command: ["--port", "6379", "--requirepass", "${REDIS_PASSWORD}", "--aof", "--dir", "/home/kividb"]
+    # KiviDB runs as uid 1000; a named volume on its home directory is created writable for it.
+    volumes: !override
+      - kividb_data:/home/kividb
+    # RAGFlow's health check calls redis-cli inside the container, and KiviDB's image has no
+    # redis-cli. No RAGFlow service waits for kvrocks to be healthy, so the check can go.
+    healthcheck:
+      disable: true
+
+volumes:
+  kividb_data:

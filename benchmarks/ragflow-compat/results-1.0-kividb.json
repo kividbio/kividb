@@ -1,0 +1,345 @@
+{
+  "label": "kividb",
+  "image": "kividb/kividb:v1.2.0-lua",
+  "redis_version": "8.10.0",
+  "ragflow": "v1.0.0-rc3",
+  "ragflow_commit": "03c1246150febe6b204b3799dffb3afe52103fb8",
+  "counts": {
+    "PASS": 31,
+    "FAIL": 0,
+    "WARN": 0,
+    "SKIP": 0
+  },
+  "checks": [
+    {
+      "check": "connection: PING through RAGFlow's password, database 1",
+      "status": "PASS",
+      "detail": "redis_version 8.10.0",
+      "ms": 126
+    },
+    {
+      "check": "start-up: every RAGFlow service is running",
+      "status": "PASS",
+      "detail": "6 containers: es01, kvrocks, minio, mysql, nats, ragflow-cpu",
+      "ms": 119
+    },
+    {
+      "check": "start-up: the Go server's four modes are running (each connects to the server at start)",
+      "status": "PASS",
+      "detail": "api, admin, syncer, ingestor",
+      "ms": 162
+    },
+    {
+      "check": "start-up: HELLO / CLIENT / SELECT / AUTH / PING / INFO sent at connect are all accepted",
+      "status": "PASS",
+      "detail": "client|maint_notifications x4, client|setinfo x12, info x1, ping x5, select x6",
+      "ms": 123
+    },
+    {
+      "check": "account: register",
+      "status": "PASS",
+      "detail": "",
+      "ms": 101
+    },
+    {
+      "check": "account: login",
+      "status": "PASS",
+      "detail": "token signed with the secret key RAGFlow stored in the server",
+      "ms": 220
+    },
+    {
+      "check": "account: create an API token",
+      "status": "PASS",
+      "detail": "",
+      "ms": 12
+    },
+    {
+      "check": "models: add the OpenAI-API-compatible provider pointing at the stub",
+      "status": "PASS",
+      "detail": "",
+      "ms": 48
+    },
+    {
+      "check": "models: make the stub's chat and embedding models the defaults",
+      "status": "PASS",
+      "detail": "",
+      "ms": 28
+    },
+    {
+      "check": "dataset: two uploaded documents are parsed by the ingestor",
+      "status": "PASS",
+      "detail": "2 documents COMPLETED",
+      "ms": 4262
+    },
+    {
+      "check": "dataset: the documents have chunks",
+      "status": "PASS",
+      "detail": "2 chunks",
+      "ms": 69
+    },
+    {
+      "check": "dataset: retrieval finds the right chunk",
+      "status": "PASS",
+      "detail": "",
+      "ms": 113
+    },
+    {
+      "check": "dataset: an HTML document with an inline image is parsed (its image goes through the media cache)",
+      "status": "PASS",
+      "detail": "COMPLETED, 3 chunk(s), 2 script call(s) (the media cache's put)",
+      "ms": 2418
+    },
+    {
+      "check": "chat: a completion in a session answers from the stub model",
+      "status": "PASS",
+      "detail": "",
+      "ms": 124
+    },
+    {
+      "check": "chat: a streamed completion",
+      "status": "PASS",
+      "detail": "3 events",
+      "ms": 109
+    },
+    {
+      "check": "agent: an echo agent run answers, and takes and releases the session's lease",
+      "status": "PASS",
+      "detail": "echoed, 2 script call(s) (lease register / release), lease released",
+      "ms": 408
+    },
+    {
+      "check": "agent: a streamed run, and the conversation is persisted",
+      "status": "PASS",
+      "detail": "9 events, the answer persisted in the session",
+      "ms": 32
+    },
+    {
+      "check": "contract: the agent-run lease (RunTracker's 4 scripts) is single-owner",
+      "status": "PASS",
+      "detail": "register is exclusive; refresh, cancel and release only by the owner's token",
+      "ms": 2
+    },
+    {
+      "check": "contract: a lease expires on time and a new owner can take it",
+      "status": "PASS",
+      "detail": "an expired lease is gone on time and can be taken (the TTL contract)",
+      "ms": 901
+    },
+    {
+      "check": "contract: the distributed lock (SET NX PX + delete_if_equal)",
+      "status": "PASS",
+      "detail": "SET NX PX, then compare-and-delete",
+      "ms": 1
+    },
+    {
+      "check": "contract: the token-bucket rate limit (webhooks)",
+      "status": "PASS",
+      "detail": "capacity 2: allow, allow, deny; the bucket has an expiry",
+      "ms": 1
+    },
+    {
+      "check": "contract: the media cache put (images during ingestion)",
+      "status": "PASS",
+      "detail": "stored, deduplicated, and refused past the image quota",
+      "ms": 1
+    },
+    {
+      "check": "contract: WATCH / MULTI / EXEC optimistic update (webhook traces)",
+      "status": "PASS",
+      "detail": "a changed key aborts EXEC; an unchanged one commits",
+      "ms": 125
+    },
+    {
+      "check": "restart: with the ingestor paused, 3 parse tasks wait",
+      "status": "PASS",
+      "detail": "3 documents waiting: ['SCHEDULED']",
+      "ms": 5921
+    },
+    {
+      "check": "restart: the server restarts again with the tasks waiting",
+      "status": "PASS",
+      "detail": "restarted",
+      "ms": 605
+    },
+    {
+      "check": "restart: the login session survives the restarts (the secret key is kept)",
+      "status": "PASS",
+      "detail": "the secret key survived two restarts; the login token still works",
+      "ms": 128
+    },
+    {
+      "check": "restart: the ingestor resumes and parses every queued document",
+      "status": "PASS",
+      "detail": "3 documents COMPLETED",
+      "ms": 4069
+    },
+    {
+      "check": "restart: retrieval finds a document parsed after the restarts",
+      "status": "PASS",
+      "detail": "",
+      "ms": 40
+    },
+    {
+      "check": "restart: an agent run after the restarts",
+      "status": "PASS",
+      "detail": "",
+      "ms": 32
+    },
+    {
+      "check": "server: no command RAGFlow sent was refused (INFO commandstats)",
+      "status": "PASS",
+      "detail": "",
+      "ms": 254
+    },
+    {
+      "check": "server: RAGFlow logged no server errors (warn/error lines about the cache)",
+      "status": "PASS",
+      "detail": "none (0 connection error(s) while the server restarted)",
+      "ms": 128
+    }
+  ],
+  "commands_at_startup": {
+    "client|maint_notifications": {
+      "calls": 4,
+      "failed": 0,
+      "rejected": 4
+    },
+    "client|setinfo": {
+      "calls": 12,
+      "failed": 0,
+      "rejected": 0
+    },
+    "info": {
+      "calls": 1,
+      "failed": 0,
+      "rejected": 0
+    },
+    "ping": {
+      "calls": 5,
+      "failed": 0,
+      "rejected": 0
+    },
+    "select": {
+      "calls": 6,
+      "failed": 0,
+      "rejected": 0
+    }
+  },
+  "commands_after_run": {
+    "client|setinfo": {
+      "calls": 18,
+      "failed": 0,
+      "rejected": 0
+    },
+    "del": {
+      "calls": 21,
+      "failed": 0,
+      "rejected": 0
+    },
+    "eval": {
+      "calls": 2,
+      "failed": 0,
+      "rejected": 0
+    },
+    "exists": {
+      "calls": 10,
+      "failed": 0,
+      "rejected": 0
+    },
+    "expire": {
+      "calls": 9,
+      "failed": 0,
+      "rejected": 0
+    },
+    "get": {
+      "calls": 12,
+      "failed": 0,
+      "rejected": 0
+    },
+    "hdel": {
+      "calls": 1,
+      "failed": 0,
+      "rejected": 0
+    },
+    "hget": {
+      "calls": 2,
+      "failed": 0,
+      "rejected": 0
+    },
+    "hset": {
+      "calls": 7,
+      "failed": 0,
+      "rejected": 0
+    },
+    "info": {
+      "calls": 2,
+      "failed": 0,
+      "rejected": 0
+    },
+    "pexpire": {
+      "calls": 1,
+      "failed": 0,
+      "rejected": 0
+    },
+    "ping": {
+      "calls": 1,
+      "failed": 0,
+      "rejected": 0
+    },
+    "sadd": {
+      "calls": 3,
+      "failed": 0,
+      "rejected": 0
+    },
+    "scan": {
+      "calls": 1,
+      "failed": 0,
+      "rejected": 0
+    },
+    "select": {
+      "calls": 9,
+      "failed": 0,
+      "rejected": 0
+    },
+    "set": {
+      "calls": 3,
+      "failed": 0,
+      "rejected": 0
+    },
+    "smembers": {
+      "calls": 6,
+      "failed": 0,
+      "rejected": 0
+    },
+    "ttl": {
+      "calls": 8,
+      "failed": 0,
+      "rejected": 0
+    },
+    "type": {
+      "calls": 8,
+      "failed": 0,
+      "rejected": 0
+    }
+  },
+  "errorstats": {},
+  "keys_after_run": {
+    "agent:run:<id>": {
+      "keys": 6,
+      "no_expiry": 0,
+      "type": "hash"
+    },
+    "ragflow:system:secret_key": {
+      "keys": 1,
+      "no_expiry": 1,
+      "type": "string"
+    },
+    "agent:run:<id>-<id>": {
+      "keys": 1,
+      "no_expiry": 0,
+      "type": "hash"
+    }
+  },
+  "log_lines": [],
+  "when": "2026-11-05T07:38:18+00:00"
+}

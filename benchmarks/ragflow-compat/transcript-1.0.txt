@@ -1,0 +1,568 @@
+RAGFlow 1.0 on KiviDB: transcript of the run that produced results-1.0-*.json and suite-1.0-*.json
+
+When:     2026-11-05, 07:34-07:46 UTC
+Machine:  Azure Standard_D16s_v5 (16 vCPU, 64 GB), Ubuntu 24.04.5 LTS, kernel 7.0.0-1017-azure
+Docker:   29.9.3, Compose 5.7.0
+RAGFlow:  v1.0.0-rc3, commit 03c1246150febe6b204b3799dffb3afe52103fb8, docker/docker-compose.yml with
+          the default profiles (elasticsearch, cpu, metadata-mysql)
+Images:   infiniflow/ragflow:v1.0.0-rc3  sha256:cfe17dc8b5a18fdbc8cd9064e06545dc5948acbf2b02dca3e57bdf80409e2dff
+          apache/kvrocks:2.16.0          sha256:9e632c317c83c80d92f1c9d22ac6aa9f64d149e1f04ff2af5f15a5768a01c4b7
+          kividb/kividb:v1.2.0-lua       sha256:734f3ca724773b4d18eaae8adc917e8a35be71fe9b726d8bd3e323f9f16ea59d
+          kividb/kividb:v1.2.0           sha256:6aeff0b35c58ac7b277f3ddcf8c0ace58526c5f9976f1dc2a2fe1981b00d83e1
+          redis:8 (8.10.3)               sha256:de1068af6f552240dfab67bcc9bfef99bfc60f776bb4580ef077ea4c8c97e848
+          golang:1.27 (go1.27.3)         sha256:c292963ad0e5f51e843c726edc204a4e4c26a859ba1e4d736d91028aa3633048
+Harness:  Python 3.12.3, requests 2.32.5, redis 6.4.0
+Command:  for each of "kvrocks default", "kividb kividb/kividb:v1.2.0-lua", "kividb-nolua kividb/kividb:v1.2.0",
+          "redis8 redis:8":  PY=~/venv/bin/python ./run1.sh <label> <image>
+          (Docker Compose's own progress lines are left out below.)
+
+##### kvrocks default 2026-11-05T07:34:36Z
+
+== connection
+  [PASS] connection: PING through RAGFlow's password, database 1  (redis_version 7.0.0)
+
+== start-up
+  [PASS] start-up: every RAGFlow service is running  (6 containers: es01, kvrocks, minio, mysql, nats, ragflow-cpu)
+  [PASS] start-up: the Go server's four modes are running (each connects to the server at start)  (api, admin, syncer, ingestor)
+  [WARN] start-up: HELLO / CLIENT / SELECT / AUTH / PING / INFO sent at connect are all accepted  (the server does not count refused calls; seen: auth x5, client x12, hello x4, info x2, ping x8, select x6)
+
+== account
+  [PASS] account: register
+  [PASS] account: login  (token signed with the secret key RAGFlow stored in the server)
+  [PASS] account: create an API token
+
+== models
+  [PASS] models: add the OpenAI-API-compatible provider pointing at the stub
+  [PASS] models: make the stub's chat and embedding models the defaults
+
+== dataset
+  (dataset c24d4b2bcaf243ccbcf894baaecd1273)
+  [PASS] dataset: two uploaded documents are parsed by the ingestor  (2 documents COMPLETED)
+  [PASS] dataset: the documents have chunks  (2 chunks)
+  [PASS] dataset: retrieval finds the right chunk
+  [PASS] dataset: an HTML document with an inline image is parsed (its image goes through the media cache)  (COMPLETED, 3 chunk(s), 2 script call(s) (the media cache's put))
+
+== chat
+  [PASS] chat: a completion in a session answers from the stub model
+  [PASS] chat: a streamed completion  (3 events)
+
+== agent
+  [PASS] agent: an echo agent run answers, and takes and releases the session's lease  (echoed, 2 script call(s) (lease register / release), lease released)
+  [PASS] agent: a streamed run, and the conversation is persisted  (9 events, the answer persisted in the session)
+
+== contract
+  [PASS] contract: the agent-run lease (RunTracker's 4 scripts) is single-owner  (register is exclusive; refresh, cancel and release only by the owner's token)
+  [PASS] contract: a lease expires on time and a new owner can take it  (an expired lease is gone on time and can be taken (the TTL contract))
+  [PASS] contract: the distributed lock (SET NX PX + delete_if_equal)  (SET NX PX, then compare-and-delete)
+  [PASS] contract: the token-bucket rate limit (webhooks)  (capacity 2: allow, allow, deny; the bucket has an expiry)
+  [PASS] contract: the media cache put (images during ingestion)  (stored, deduplicated, and refused past the image quota)
+  [PASS] contract: WATCH / MULTI / EXEC optimistic update (webhook traces)  (a changed key aborts EXEC; an unchanged one commits)
+
+== restart
+  [PASS] restart: with the ingestor paused, 3 parse tasks wait  (3 documents waiting: ['SCHEDULED'])
+  [PASS] restart: the server restarts again with the tasks waiting  (restarted)
+  [PASS] restart: the login session survives the restarts (the secret key is kept)  (the secret key survived two restarts; the login token still works)
+  [PASS] restart: the ingestor resumes and parses every queued document  (3 documents COMPLETED)
+  [PASS] restart: retrieval finds a document parsed after the restarts
+  [PASS] restart: an agent run after the restarts
+
+== server
+  [SKIP] server: no command RAGFlow sent was refused (INFO commandstats)  (the server does not count refused calls (see the log check))
+  [PASS] server: RAGFlow logged no server errors (warn/error lines about the cache)  (none (0 connection error(s) while the server restarted))
+
+{'PASS': 29, 'FAIL': 0, 'WARN': 1, 'SKIP': 1}  -> results-1.0-kvrocks.json
+  [PASS] account: register
+  [PASS] account: login  (token signed with the secret key RAGFlow stored in the server)
+  [PASS] account: create an API token
+  [PASS] models: add the OpenAI-API-compatible provider pointing at the stub
+  [PASS] models: make the stub's chat and embedding models the defaults
+go suite kvrocks: {'PASS': 916, 'FAIL': 4, 'SKIP': 6} -> suite-1.0-kvrocks.json
+##### kvrocks rc=0 2026-11-05T07:37:29Z
+##### kividb kividb/kividb:v1.2.0-lua 2026-11-05T07:37:29Z
+
+== connection
+  [PASS] connection: PING through RAGFlow's password, database 1  (redis_version 8.10.0)
+
+== start-up
+  [PASS] start-up: every RAGFlow service is running  (6 containers: es01, kvrocks, minio, mysql, nats, ragflow-cpu)
+  [PASS] start-up: the Go server's four modes are running (each connects to the server at start)  (api, admin, syncer, ingestor)
+  [PASS] start-up: HELLO / CLIENT / SELECT / AUTH / PING / INFO sent at connect are all accepted  (client|maint_notifications x4, client|setinfo x12, info x1, ping x5, select x6)
+
+== account
+  [PASS] account: register
+  [PASS] account: login  (token signed with the secret key RAGFlow stored in the server)
+  [PASS] account: create an API token
+
+== models
+  [PASS] models: add the OpenAI-API-compatible provider pointing at the stub
+  [PASS] models: make the stub's chat and embedding models the defaults
+
+== dataset
+  (dataset cd04d2d05125414495c21892e7ec8917)
+  [PASS] dataset: two uploaded documents are parsed by the ingestor  (2 documents COMPLETED)
+  [PASS] dataset: the documents have chunks  (2 chunks)
+  [PASS] dataset: retrieval finds the right chunk
+  [PASS] dataset: an HTML document with an inline image is parsed (its image goes through the media cache)  (COMPLETED, 3 chunk(s), 2 script call(s) (the media cache's put))
+
+== chat
+  [PASS] chat: a completion in a session answers from the stub model
+  [PASS] chat: a streamed completion  (3 events)
+
+== agent
+  [PASS] agent: an echo agent run answers, and takes and releases the session's lease  (echoed, 2 script call(s) (lease register / release), lease released)
+  [PASS] agent: a streamed run, and the conversation is persisted  (9 events, the answer persisted in the session)
+
+== contract
+  [PASS] contract: the agent-run lease (RunTracker's 4 scripts) is single-owner  (register is exclusive; refresh, cancel and release only by the owner's token)
+  [PASS] contract: a lease expires on time and a new owner can take it  (an expired lease is gone on time and can be taken (the TTL contract))
+  [PASS] contract: the distributed lock (SET NX PX + delete_if_equal)  (SET NX PX, then compare-and-delete)
+  [PASS] contract: the token-bucket rate limit (webhooks)  (capacity 2: allow, allow, deny; the bucket has an expiry)
+  [PASS] contract: the media cache put (images during ingestion)  (stored, deduplicated, and refused past the image quota)
+  [PASS] contract: WATCH / MULTI / EXEC optimistic update (webhook traces)  (a changed key aborts EXEC; an unchanged one commits)
+
+== restart
+  [PASS] restart: with the ingestor paused, 3 parse tasks wait  (3 documents waiting: ['SCHEDULED'])
+  [PASS] restart: the server restarts again with the tasks waiting  (restarted)
+  [PASS] restart: the login session survives the restarts (the secret key is kept)  (the secret key survived two restarts; the login token still works)
+  [PASS] restart: the ingestor resumes and parses every queued document  (3 documents COMPLETED)
+  [PASS] restart: retrieval finds a document parsed after the restarts
+  [PASS] restart: an agent run after the restarts
+
+== server
+  [PASS] server: no command RAGFlow sent was refused (INFO commandstats)
+  [PASS] server: RAGFlow logged no server errors (warn/error lines about the cache)  (none (0 connection error(s) while the server restarted))
+
+{'PASS': 31, 'FAIL': 0, 'WARN': 0, 'SKIP': 0}  -> results-1.0-kividb.json
+  [PASS] account: register
+  [PASS] account: login  (token signed with the secret key RAGFlow stored in the server)
+  [PASS] account: create an API token
+  [PASS] models: add the OpenAI-API-compatible provider pointing at the stub
+  [PASS] models: make the stub's chat and embedding models the defaults
+go suite kividb: {'PASS': 916, 'FAIL': 4, 'SKIP': 6} -> suite-1.0-kividb.json
+##### kividb rc=0 2026-11-05T07:40:21Z
+##### kividb-nolua kividb/kividb:v1.2.0 2026-11-05T07:40:21Z
+
+== connection
+  [PASS] connection: PING through RAGFlow's password, database 1  (redis_version 8.10.0)
+
+== start-up
+  [PASS] start-up: every RAGFlow service is running  (6 containers: es01, kvrocks, minio, mysql, nats, ragflow-cpu)
+  [PASS] start-up: the Go server's four modes are running (each connects to the server at start)  (api, admin, syncer, ingestor)
+  [PASS] start-up: HELLO / CLIENT / SELECT / AUTH / PING / INFO sent at connect are all accepted  (client|maint_notifications x4, client|setinfo x12, info x1, ping x5, select x6)
+
+== account
+  [PASS] account: register
+  [PASS] account: login  (token signed with the secret key RAGFlow stored in the server)
+  [PASS] account: create an API token
+
+== models
+  [PASS] models: add the OpenAI-API-compatible provider pointing at the stub
+  [PASS] models: make the stub's chat and embedding models the defaults
+
+== dataset
+  (dataset 3a3233339d5c4ff3ad8424cee6a68cd4)
+  [PASS] dataset: two uploaded documents are parsed by the ingestor  (2 documents COMPLETED)
+  [PASS] dataset: the documents have chunks  (2 chunks)
+  [PASS] dataset: retrieval finds the right chunk
+  [FAIL] dataset: an HTML document with an inline image is parsed (its image goes through the media cache)  (Fatal: parse failed: [('comet.html', 'FAILED', 'html media cache write: mediacache: write image 3a2f42aba770: media put: ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)\n------------------------\nnode path: [Parser:HipSignsRhyme]')])
+
+== chat
+  [PASS] chat: a completion in a session answers from the stub model
+  [PASS] chat: a streamed completion  (3 events)
+
+== agent
+  [FAIL] agent: an echo agent run answers, and takes and releases the session's lease  (RuntimeError: POST /agents/chat/completions -> code 500: Internal storage error while accessing the agent.)
+  [FAIL] agent: a streamed run, and the conversation is persisted  (AssertionError: 0 events: [])
+
+== contract
+  [FAIL] contract: the agent-run lease (RunTracker's 4 scripts) is single-owner  (ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file))
+  [FAIL] contract: a lease expires on time and a new owner can take it  (ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file))
+  [FAIL] contract: the distributed lock (SET NX PX + delete_if_equal)  (ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file))
+  [FAIL] contract: the token-bucket rate limit (webhooks)  (ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file))
+  [FAIL] contract: the media cache put (images during ingestion)  (ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file))
+  [PASS] contract: WATCH / MULTI / EXEC optimistic update (webhook traces)  (a changed key aborts EXEC; an unchanged one commits)
+
+== restart
+  [PASS] restart: with the ingestor paused, 3 parse tasks wait  (3 documents waiting: ['SCHEDULED'])
+  [PASS] restart: the server restarts again with the tasks waiting  (restarted)
+  [PASS] restart: the login session survives the restarts (the secret key is kept)  (the secret key survived two restarts; the login token still works)
+  [PASS] restart: the ingestor resumes and parses every queued document  (3 documents COMPLETED)
+  [PASS] restart: retrieval finds a document parsed after the restarts
+  [FAIL] restart: an agent run after the restarts  (RuntimeError: POST /agents/chat/completions -> code 500: Internal storage error while accessing the agent.)
+
+== server
+  [FAIL] server: no command RAGFlow sent was refused (INFO commandstats)  (AssertionError: eval: failed 2, rejected 0)
+  [FAIL] server: RAGFlow logged no server errors (warn/error lines about the cache)  (AssertionError: 6 line(s), e.g. of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)	{"pid": 51, "component": "Parser:HipSignsRhyme", "task_id": "d504eba9ca1e443fb165adcd8098bdf4", "document_id": "08d1f6fb7fe74616b6ea7e43e365233d"})
+
+{'PASS': 20, 'FAIL': 11, 'WARN': 0, 'SKIP': 0}  -> results-1.0-kividb-nolua.json
+  [PASS] account: register
+  [PASS] account: login  (token signed with the secret key RAGFlow stored in the server)
+  [PASS] account: create an API token
+  [PASS] models: add the OpenAI-API-compatible provider pointing at the stub
+  [PASS] models: make the stub's chat and embedding models the defaults
+go suite kividb-nolua: {'PASS': 911, 'FAIL': 9, 'SKIP': 6} -> suite-1.0-kividb-nolua.json
+##### kividb-nolua rc=1 2026-11-05T07:43:12Z
+##### redis8 redis:8 2026-11-05T07:43:12Z
+
+== connection
+  [PASS] connection: PING through RAGFlow's password, database 1  (redis_version 8.10.3)
+
+== start-up
+  [PASS] start-up: every RAGFlow service is running  (6 containers: es01, kvrocks, minio, mysql, nats, ragflow-cpu)
+  [PASS] start-up: the Go server's four modes are running (each connects to the server at start)  (api, admin, syncer, ingestor)
+  [PASS] start-up: HELLO / CLIENT / SELECT / AUTH / PING / INFO sent at connect are all accepted  (auth x4, client|setinfo x12, config|get x2, hello x4, info x7, ping x7, select x6)
+
+== account
+  [PASS] account: register
+  [PASS] account: login  (token signed with the secret key RAGFlow stored in the server)
+  [PASS] account: create an API token
+
+== models
+  [PASS] models: add the OpenAI-API-compatible provider pointing at the stub
+  [PASS] models: make the stub's chat and embedding models the defaults
+
+== dataset
+  (dataset 62e0d9fed37e47f1b397785ddf04feda)
+  [PASS] dataset: two uploaded documents are parsed by the ingestor  (2 documents COMPLETED)
+  [PASS] dataset: the documents have chunks  (2 chunks)
+  [PASS] dataset: retrieval finds the right chunk
+  [PASS] dataset: an HTML document with an inline image is parsed (its image goes through the media cache)  (COMPLETED, 3 chunk(s), 2 script call(s) (the media cache's put))
+
+== chat
+  [PASS] chat: a completion in a session answers from the stub model
+  [PASS] chat: a streamed completion  (3 events)
+
+== agent
+  [PASS] agent: an echo agent run answers, and takes and releases the session's lease  (echoed, 2 script call(s) (lease register / release), lease released)
+  [PASS] agent: a streamed run, and the conversation is persisted  (9 events, the answer persisted in the session)
+
+== contract
+  [PASS] contract: the agent-run lease (RunTracker's 4 scripts) is single-owner  (register is exclusive; refresh, cancel and release only by the owner's token)
+  [PASS] contract: a lease expires on time and a new owner can take it  (an expired lease is gone on time and can be taken (the TTL contract))
+  [PASS] contract: the distributed lock (SET NX PX + delete_if_equal)  (SET NX PX, then compare-and-delete)
+  [PASS] contract: the token-bucket rate limit (webhooks)  (capacity 2: allow, allow, deny; the bucket has an expiry)
+  [PASS] contract: the media cache put (images during ingestion)  (stored, deduplicated, and refused past the image quota)
+  [PASS] contract: WATCH / MULTI / EXEC optimistic update (webhook traces)  (a changed key aborts EXEC; an unchanged one commits)
+
+== restart
+  [PASS] restart: with the ingestor paused, 3 parse tasks wait  (3 documents waiting: ['SCHEDULED'])
+  [PASS] restart: the server restarts again with the tasks waiting  (restarted)
+  [PASS] restart: the login session survives the restarts (the secret key is kept)  (the secret key survived two restarts; the login token still works)
+  [PASS] restart: the ingestor resumes and parses every queued document  (3 documents COMPLETED)
+  [PASS] restart: retrieval finds a document parsed after the restarts
+  [PASS] restart: an agent run after the restarts
+
+== server
+  [PASS] server: no command RAGFlow sent was refused (INFO commandstats)
+  [PASS] server: RAGFlow logged no server errors (warn/error lines about the cache)  (none (0 connection error(s) while the server restarted))
+
+{'PASS': 31, 'FAIL': 0, 'WARN': 0, 'SKIP': 0}  -> results-1.0-redis8.json
+  [PASS] account: register
+  [PASS] account: login  (token signed with the secret key RAGFlow stored in the server)
+  [PASS] account: create an API token
+  [PASS] models: add the OpenAI-API-compatible provider pointing at the stub
+  [PASS] models: make the stub's chat and embedding models the defaults
+go suite redis8: {'PASS': 916, 'FAIL': 4, 'SKIP': 6} -> suite-1.0-redis8.json
+##### redis8 rc=0 2026-11-05T07:46:07Z
+ALL-DONE
+
+==================================================================================================
+RAGFlow's own Go integration tests against a real server (run1_go_integration.sh), 2026-11-05 ~07:52 UTC
+  ./internal/engine/kvrocks at v1.0.0-rc3 (03c12461); ./internal/ingestion/mediacache at main (106c7d5c)
+
+##### kvrocks v1.0.0-rc3 ./internal/engine/kvrocks/
+=== RUN   TestKvrocksInitConnects
+--- PASS: TestKvrocksInitConnects (0.00s)
+=== RUN   TestKvrocksInitFailFast
+--- PASS: TestKvrocksInitFailFast (2.08s)
+=== RUN   TestKvrocksDeploymentConfig
+=== RUN   TestKvrocksDeploymentConfig/ComposeHealthcheckAuthenticates
+--- PASS: TestKvrocksDeploymentConfig (0.00s)
+=== RUN   TestTotalSystemMemoryHuman
+=== RUN   TestEvalTokenBucketStrict_AllowedThenDenied
+--- PASS: TestEvalTokenBucketStrict_AllowedThenDenied (0.00s)
+=== RUN   TestEvalTokenBucketStrict_RedisDownFailsClosed
+--- PASS: TestEvalTokenBucketStrict_RedisDownFailsClosed (0.50s)
+=== RUN   TestEvalTokenBucketStrict_NilClient
+--- PASS: TestEvalTokenBucketStrict_NilClient (0.00s)
+=== RUN   TestMediaPutEnforcesQuotaAndRestoresDuplicate
+--- PASS: TestMediaPutEnforcesQuotaAndRestoresDuplicate (0.00s)
+=== RUN   TestMediaPutCountsDigestSetInsteadOfMirroredHash
+--- PASS: TestMediaPutCountsDigestSetInsteadOfMirroredHash (0.00s)
+=== RUN   TestMediaPutRejectsByteOverflow
+--- PASS: TestMediaPutRejectsByteOverflow (0.00s)
+=== RUN   TestClientSetNXDistinguishesContention
+--- PASS: TestClientSetNXDistinguishesContention (0.00s)
+=== RUN   TestClientGetReturnsEmptyValueForMissingKey
+--- PASS: TestClientGetReturnsEmptyValueForMissingKey (0.00s)
+=== RUN   TestClientSetNXReturnsTransportError
+--- PASS: TestClientSetNXReturnsTransportError (0.50s)
+=== RUN   TestClientSetNXReturnsErrorForNilClient
+--- PASS: TestClientSetNXReturnsErrorForNilClient (0.00s)
+=== RUN   TestDistributedLockSpinAcquireReturnsTransportError
+--- PASS: TestDistributedLockSpinAcquireReturnsTransportError (0.50s)
+=== RUN   TestDistributedLockAcquireReturnsCleanupError
+--- PASS: TestDistributedLockAcquireReturnsCleanupError (0.00s)
+=== RUN   TestTotalSystemMemoryHuman/prefers_total_system_memory_human
+=== RUN   TestTotalSystemMemoryHuman/falls_back_to_maxmemory_human
+=== RUN   TestTotalSystemMemoryHuman/empty_when_neither_field_present
+--- PASS: TestTotalSystemMemoryHuman (0.00s)
+PASS
+ok  	ragflow/internal/engine/kvrocks	3.596s
+##### kvrocks main-106c7d5c ./internal/ingestion/mediacache/
+=== RUN   TestStoreRealKvrocksLifecycle
+=== RUN   TestStoreRealKvrocksLifecycle/PutGetRoundTrip
+=== RUN   TestStoreRealKvrocksLifecycle/DuplicatePutChargesOnce
+=== RUN   TestStoreRealKvrocksLifecycle/QuotaExactBoundary
+=== RUN   TestStoreRealKvrocksLifecycle/QuotaExactBoundary/bytes
+=== RUN   TestStoreRealKvrocksLifecycle/QuotaExactBoundary/images
+=== RUN   TestStoreRealKvrocksLifecycle/CorruptPayloadIsIntegrityError
+=== RUN   TestStoreRealKvrocksLifecycle/CrossScopeGetRejected
+=== RUN   TestStoreRealKvrocksLifecycle/PurgeRemovesEveryKey
+--- PASS: TestStoreRealKvrocksLifecycle (0.01s)
+=== RUN   TestPutAndGet_RoundTripAcrossRepeatedReads
+--- PASS: TestPutAndGet_RoundTripAcrossRepeatedReads (0.00s)
+=== RUN   TestGet_MissingIsNotTreatedAsSuccess
+--- PASS: TestGet_MissingIsNotTreatedAsSuccess (0.00s)
+=== RUN   TestGet_RejectsCorruptPayloadAndWrongScope
+--- PASS: TestGet_RejectsCorruptPayloadAndWrongScope (0.00s)
+=== RUN   TestGet_PropagatesBackendFailure
+--- PASS: TestGet_PropagatesBackendFailure (0.00s)
+=== RUN   TestPut_FailsRatherThanSkippingCache
+=== RUN   TestPut_FailsRatherThanSkippingCache/write
+=== RUN   TestPut_FailsRatherThanSkippingCache/manifest
+--- PASS: TestPut_FailsRatherThanSkippingCache (0.00s)
+=== RUN   TestPut_RejectsMissingStoreScopeAndOversizedImage
+--- PASS: TestPut_RejectsMissingStoreScopeAndOversizedImage (0.00s)
+=== RUN   TestPurgeTask_RemovesMediaEntriesThroughMediaManifest
+--- PASS: TestPurgeTask_RemovesMediaEntriesThroughMediaManifest (0.00s)
+=== RUN   TestTTLIsOneDay
+--- PASS: TestTTLIsOneDay (0.00s)
+=== RUN   TestMediaManifestDoesNotTouchChunkManifest
+--- PASS: TestMediaManifestDoesNotTouchChunkManifest (0.00s)
+=== RUN   TestPutAllowsMoreThan256DistinctImages
+--- PASS: TestPutAllowsMoreThan256DistinctImages (0.00s)
+=== RUN   TestPurgeTaskRetriesAfterPartialDeleteFailure
+--- PASS: TestPurgeTaskRetriesAfterPartialDeleteFailure (0.00s)
+=== RUN   TestRetryRepopulatesMediaAfterCacheMiss
+--- PASS: TestRetryRepopulatesMediaAfterCacheMiss (0.00s)
+=== RUN   TestPutDuplicateWritesOnceAndReturnsCallerRef
+--- PASS: TestPutDuplicateWritesOnceAndReturnsCallerRef (0.00s)
+=== RUN   TestPutDedupeDoesNotConsumeRunLimits
+--- PASS: TestPutDedupeDoesNotConsumeRunLimits (0.00s)
+=== RUN   TestPutEnforcesRunImageCountLimit
+--- PASS: TestPutEnforcesRunImageCountLimit (0.00s)
+=== RUN   TestPutEnforcesRunLimitsAcrossStoreInstances
+--- PASS: TestPutEnforcesRunLimitsAcrossStoreInstances (0.00s)
+=== RUN   TestPutEnforcesRunBytesAcrossStoreInstances
+--- PASS: TestPutEnforcesRunBytesAcrossStoreInstances (0.00s)
+=== RUN   TestPutEnforcesRunByteLimitAtExactBoundary
+--- PASS: TestPutEnforcesRunByteLimitAtExactBoundary (0.00s)
+=== RUN   TestPutRestoresLocallySeenDigestAfterBackendEviction
+--- PASS: TestPutRestoresLocallySeenDigestAfterBackendEviction (0.00s)
+=== RUN   TestPutFailedWriteDoesNotConsumeRunLimits
+=== RUN   TestPutFailedWriteDoesNotConsumeRunLimits/value_write
+=== RUN   TestPutFailedWriteDoesNotConsumeRunLimits/manifest_track
+--- PASS: TestPutFailedWriteDoesNotConsumeRunLimits (0.00s)
+PASS
+ok  	ragflow/internal/ingestion/mediacache	0.023s
+##### kividb v1.0.0-rc3 ./internal/engine/kvrocks/
+=== RUN   TestKvrocksInitConnects
+--- PASS: TestKvrocksInitConnects (0.00s)
+=== RUN   TestKvrocksInitFailFast
+--- PASS: TestKvrocksInitFailFast (2.08s)
+=== RUN   TestKvrocksDeploymentConfig
+=== RUN   TestKvrocksDeploymentConfig/ComposeHealthcheckAuthenticates
+--- PASS: TestKvrocksDeploymentConfig (0.00s)
+=== RUN   TestTotalSystemMemoryHuman
+=== RUN   TestEvalTokenBucketStrict_AllowedThenDenied
+--- PASS: TestEvalTokenBucketStrict_AllowedThenDenied (0.00s)
+=== RUN   TestEvalTokenBucketStrict_RedisDownFailsClosed
+--- PASS: TestEvalTokenBucketStrict_RedisDownFailsClosed (0.50s)
+=== RUN   TestEvalTokenBucketStrict_NilClient
+--- PASS: TestEvalTokenBucketStrict_NilClient (0.00s)
+=== RUN   TestMediaPutEnforcesQuotaAndRestoresDuplicate
+--- PASS: TestMediaPutEnforcesQuotaAndRestoresDuplicate (0.00s)
+=== RUN   TestMediaPutCountsDigestSetInsteadOfMirroredHash
+--- PASS: TestMediaPutCountsDigestSetInsteadOfMirroredHash (0.00s)
+=== RUN   TestMediaPutRejectsByteOverflow
+--- PASS: TestMediaPutRejectsByteOverflow (0.00s)
+=== RUN   TestClientSetNXDistinguishesContention
+--- PASS: TestClientSetNXDistinguishesContention (0.00s)
+=== RUN   TestClientGetReturnsEmptyValueForMissingKey
+--- PASS: TestClientGetReturnsEmptyValueForMissingKey (0.00s)
+=== RUN   TestClientSetNXReturnsTransportError
+--- PASS: TestClientSetNXReturnsTransportError (0.50s)
+=== RUN   TestClientSetNXReturnsErrorForNilClient
+--- PASS: TestClientSetNXReturnsErrorForNilClient (0.00s)
+=== RUN   TestDistributedLockSpinAcquireReturnsTransportError
+--- PASS: TestDistributedLockSpinAcquireReturnsTransportError (0.50s)
+=== RUN   TestDistributedLockAcquireReturnsCleanupError
+--- PASS: TestDistributedLockAcquireReturnsCleanupError (0.00s)
+=== RUN   TestTotalSystemMemoryHuman/prefers_total_system_memory_human
+=== RUN   TestTotalSystemMemoryHuman/falls_back_to_maxmemory_human
+=== RUN   TestTotalSystemMemoryHuman/empty_when_neither_field_present
+--- PASS: TestTotalSystemMemoryHuman (0.00s)
+PASS
+ok  	ragflow/internal/engine/kvrocks	3.599s
+##### kividb main-106c7d5c ./internal/ingestion/mediacache/
+=== RUN   TestStoreRealKvrocksLifecycle
+=== RUN   TestStoreRealKvrocksLifecycle/PutGetRoundTrip
+=== RUN   TestStoreRealKvrocksLifecycle/DuplicatePutChargesOnce
+=== RUN   TestStoreRealKvrocksLifecycle/QuotaExactBoundary
+=== RUN   TestStoreRealKvrocksLifecycle/QuotaExactBoundary/bytes
+=== RUN   TestStoreRealKvrocksLifecycle/QuotaExactBoundary/images
+=== RUN   TestStoreRealKvrocksLifecycle/CorruptPayloadIsIntegrityError
+=== RUN   TestStoreRealKvrocksLifecycle/CrossScopeGetRejected
+=== RUN   TestStoreRealKvrocksLifecycle/PurgeRemovesEveryKey
+--- PASS: TestStoreRealKvrocksLifecycle (0.01s)
+=== RUN   TestPutAndGet_RoundTripAcrossRepeatedReads
+--- PASS: TestPutAndGet_RoundTripAcrossRepeatedReads (0.00s)
+=== RUN   TestGet_MissingIsNotTreatedAsSuccess
+--- PASS: TestGet_MissingIsNotTreatedAsSuccess (0.00s)
+=== RUN   TestGet_RejectsCorruptPayloadAndWrongScope
+--- PASS: TestGet_RejectsCorruptPayloadAndWrongScope (0.00s)
+=== RUN   TestGet_PropagatesBackendFailure
+--- PASS: TestGet_PropagatesBackendFailure (0.00s)
+=== RUN   TestPut_FailsRatherThanSkippingCache
+=== RUN   TestPut_FailsRatherThanSkippingCache/write
+=== RUN   TestPut_FailsRatherThanSkippingCache/manifest
+--- PASS: TestPut_FailsRatherThanSkippingCache (0.00s)
+=== RUN   TestPut_RejectsMissingStoreScopeAndOversizedImage
+--- PASS: TestPut_RejectsMissingStoreScopeAndOversizedImage (0.00s)
+=== RUN   TestPurgeTask_RemovesMediaEntriesThroughMediaManifest
+--- PASS: TestPurgeTask_RemovesMediaEntriesThroughMediaManifest (0.00s)
+=== RUN   TestTTLIsOneDay
+--- PASS: TestTTLIsOneDay (0.00s)
+=== RUN   TestMediaManifestDoesNotTouchChunkManifest
+--- PASS: TestMediaManifestDoesNotTouchChunkManifest (0.00s)
+=== RUN   TestPutAllowsMoreThan256DistinctImages
+--- PASS: TestPutAllowsMoreThan256DistinctImages (0.00s)
+=== RUN   TestPurgeTaskRetriesAfterPartialDeleteFailure
+--- PASS: TestPurgeTaskRetriesAfterPartialDeleteFailure (0.00s)
+=== RUN   TestRetryRepopulatesMediaAfterCacheMiss
+--- PASS: TestRetryRepopulatesMediaAfterCacheMiss (0.00s)
+=== RUN   TestPutDuplicateWritesOnceAndReturnsCallerRef
+--- PASS: TestPutDuplicateWritesOnceAndReturnsCallerRef (0.00s)
+=== RUN   TestPutDedupeDoesNotConsumeRunLimits
+--- PASS: TestPutDedupeDoesNotConsumeRunLimits (0.00s)
+=== RUN   TestPutEnforcesRunImageCountLimit
+--- PASS: TestPutEnforcesRunImageCountLimit (0.00s)
+=== RUN   TestPutEnforcesRunLimitsAcrossStoreInstances
+--- PASS: TestPutEnforcesRunLimitsAcrossStoreInstances (0.00s)
+=== RUN   TestPutEnforcesRunBytesAcrossStoreInstances
+--- PASS: TestPutEnforcesRunBytesAcrossStoreInstances (0.00s)
+=== RUN   TestPutEnforcesRunByteLimitAtExactBoundary
+--- PASS: TestPutEnforcesRunByteLimitAtExactBoundary (0.00s)
+=== RUN   TestPutRestoresLocallySeenDigestAfterBackendEviction
+--- PASS: TestPutRestoresLocallySeenDigestAfterBackendEviction (0.00s)
+=== RUN   TestPutFailedWriteDoesNotConsumeRunLimits
+=== RUN   TestPutFailedWriteDoesNotConsumeRunLimits/value_write
+=== RUN   TestPutFailedWriteDoesNotConsumeRunLimits/manifest_track
+--- PASS: TestPutFailedWriteDoesNotConsumeRunLimits (0.00s)
+PASS
+ok  	ragflow/internal/ingestion/mediacache	0.022s
+##### kividb-nolua v1.0.0-rc3 ./internal/engine/kvrocks/
+=== RUN   TestKvrocksInitConnects
+--- PASS: TestKvrocksInitConnects (0.00s)
+=== RUN   TestKvrocksInitFailFast
+--- PASS: TestKvrocksInitFailFast (2.08s)
+=== RUN   TestKvrocksDeploymentConfig
+=== RUN   TestKvrocksDeploymentConfig/ComposeHealthcheckAuthenticates
+--- PASS: TestKvrocksDeploymentConfig (0.00s)
+=== RUN   TestTotalSystemMemoryHuman
+=== RUN   TestEvalTokenBucketStrict_AllowedThenDenied
+--- PASS: TestEvalTokenBucketStrict_AllowedThenDenied (0.00s)
+=== RUN   TestEvalTokenBucketStrict_RedisDownFailsClosed
+--- PASS: TestEvalTokenBucketStrict_RedisDownFailsClosed (0.50s)
+=== RUN   TestEvalTokenBucketStrict_NilClient
+--- PASS: TestEvalTokenBucketStrict_NilClient (0.00s)
+=== RUN   TestMediaPutEnforcesQuotaAndRestoresDuplicate
+--- PASS: TestMediaPutEnforcesQuotaAndRestoresDuplicate (0.00s)
+=== RUN   TestMediaPutCountsDigestSetInsteadOfMirroredHash
+--- PASS: TestMediaPutCountsDigestSetInsteadOfMirroredHash (0.00s)
+=== RUN   TestMediaPutRejectsByteOverflow
+--- PASS: TestMediaPutRejectsByteOverflow (0.00s)
+=== RUN   TestClientSetNXDistinguishesContention
+--- PASS: TestClientSetNXDistinguishesContention (0.00s)
+=== RUN   TestClientGetReturnsEmptyValueForMissingKey
+--- PASS: TestClientGetReturnsEmptyValueForMissingKey (0.00s)
+=== RUN   TestClientSetNXReturnsTransportError
+--- PASS: TestClientSetNXReturnsTransportError (0.50s)
+=== RUN   TestClientSetNXReturnsErrorForNilClient
+--- PASS: TestClientSetNXReturnsErrorForNilClient (0.00s)
+=== RUN   TestDistributedLockSpinAcquireReturnsTransportError
+--- PASS: TestDistributedLockSpinAcquireReturnsTransportError (0.50s)
+=== RUN   TestDistributedLockAcquireReturnsCleanupError
+--- PASS: TestDistributedLockAcquireReturnsCleanupError (0.00s)
+=== RUN   TestTotalSystemMemoryHuman/prefers_total_system_memory_human
+=== RUN   TestTotalSystemMemoryHuman/falls_back_to_maxmemory_human
+=== RUN   TestTotalSystemMemoryHuman/empty_when_neither_field_present
+--- PASS: TestTotalSystemMemoryHuman (0.00s)
+PASS
+ok  	ragflow/internal/engine/kvrocks	3.596s
+##### kividb-nolua main-106c7d5c ./internal/ingestion/mediacache/
+=== RUN   TestStoreRealKvrocksLifecycle
+=== RUN   TestStoreRealKvrocksLifecycle/PutGetRoundTrip
+    store_integration_test.go:185: Put: mediacache: write image 8a7b2f4efac9: media put: ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)
+=== RUN   TestStoreRealKvrocksLifecycle/DuplicatePutChargesOnce
+    store_integration_test.go:243: first Put: mediacache: write image 816aa1fdc923: media put: ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)
+=== RUN   TestStoreRealKvrocksLifecycle/QuotaExactBoundary
+=== RUN   TestStoreRealKvrocksLifecycle/QuotaExactBoundary/bytes
+    store_integration_test.go:279: first image: mediacache: write image ba7816bf8f01: media put: ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)
+=== RUN   TestStoreRealKvrocksLifecycle/QuotaExactBoundary/images
+    store_integration_test.go:318: image "a": mediacache: write image ca978112ca1b: media put: ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)
+=== RUN   TestStoreRealKvrocksLifecycle/CorruptPayloadIsIntegrityError
+    store_integration_test.go:348: Put: mediacache: write image 24936e7a81f7: media put: ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)
+=== RUN   TestStoreRealKvrocksLifecycle/CrossScopeGetRejected
+    store_integration_test.go:371: Put in scope A: mediacache: write image c0ac3e7ae562: media put: ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)
+=== RUN   TestStoreRealKvrocksLifecycle/PurgeRemovesEveryKey
+    store_integration_test.go:391: Put "purge-first": mediacache: write image 4582b696049e: media put: ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)
+--- FAIL: TestStoreRealKvrocksLifecycle (0.01s)
+=== RUN   TestPutAndGet_RoundTripAcrossRepeatedReads
+--- PASS: TestPutAndGet_RoundTripAcrossRepeatedReads (0.00s)
+=== RUN   TestGet_MissingIsNotTreatedAsSuccess
+--- PASS: TestGet_MissingIsNotTreatedAsSuccess (0.00s)
+=== RUN   TestGet_RejectsCorruptPayloadAndWrongScope
+--- PASS: TestGet_RejectsCorruptPayloadAndWrongScope (0.00s)
+=== RUN   TestGet_PropagatesBackendFailure
+--- PASS: TestGet_PropagatesBackendFailure (0.00s)
+=== RUN   TestPut_FailsRatherThanSkippingCache
+=== RUN   TestPut_FailsRatherThanSkippingCache/write
+=== RUN   TestPut_FailsRatherThanSkippingCache/manifest
+--- PASS: TestPut_FailsRatherThanSkippingCache (0.00s)
+=== RUN   TestPut_RejectsMissingStoreScopeAndOversizedImage
+--- PASS: TestPut_RejectsMissingStoreScopeAndOversizedImage (0.00s)
+=== RUN   TestPurgeTask_RemovesMediaEntriesThroughMediaManifest
+--- PASS: TestPurgeTask_RemovesMediaEntriesThroughMediaManifest (0.00s)
+=== RUN   TestTTLIsOneDay
+--- PASS: TestTTLIsOneDay (0.00s)
+=== RUN   TestMediaManifestDoesNotTouchChunkManifest
+--- PASS: TestMediaManifestDoesNotTouchChunkManifest (0.00s)
+=== RUN   TestPutAllowsMoreThan256DistinctImages
+--- PASS: TestPutAllowsMoreThan256DistinctImages (0.00s)
+=== RUN   TestPurgeTaskRetriesAfterPartialDeleteFailure
+--- PASS: TestPurgeTaskRetriesAfterPartialDeleteFailure (0.00s)
+=== RUN   TestRetryRepopulatesMediaAfterCacheMiss
+--- PASS: TestRetryRepopulatesMediaAfterCacheMiss (0.00s)
+=== RUN   TestPutDuplicateWritesOnceAndReturnsCallerRef
+--- PASS: TestPutDuplicateWritesOnceAndReturnsCallerRef (0.00s)
+=== RUN   TestPutDedupeDoesNotConsumeRunLimits
+--- PASS: TestPutDedupeDoesNotConsumeRunLimits (0.00s)
+=== RUN   TestPutEnforcesRunImageCountLimit
+--- PASS: TestPutEnforcesRunImageCountLimit (0.00s)
+=== RUN   TestPutEnforcesRunLimitsAcrossStoreInstances
+--- PASS: TestPutEnforcesRunLimitsAcrossStoreInstances (0.00s)
+=== RUN   TestPutEnforcesRunBytesAcrossStoreInstances
+--- PASS: TestPutEnforcesRunBytesAcrossStoreInstances (0.00s)
+=== RUN   TestPutEnforcesRunByteLimitAtExactBoundary
+--- PASS: TestPutEnforcesRunByteLimitAtExactBoundary (0.00s)
+=== RUN   TestPutRestoresLocallySeenDigestAfterBackendEviction
+--- PASS: TestPutRestoresLocallySeenDigestAfterBackendEviction (0.00s)
+=== RUN   TestPutFailedWriteDoesNotConsumeRunLimits
+=== RUN   TestPutFailedWriteDoesNotConsumeRunLimits/value_write
+=== RUN   TestPutFailedWriteDoesNotConsumeRunLimits/manifest_track
+--- PASS: TestPutFailedWriteDoesNotConsumeRunLimits (0.00s)
+FAIL
+FAIL	ragflow/internal/ingestion/mediacache	0.017s
+FAIL
