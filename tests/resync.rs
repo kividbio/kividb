@@ -643,6 +643,75 @@ fn a_cleanly_restarted_master_continues_its_replicas() {
     assert_eq!(m.stat("sync_full"), 0);
 }
 
+/// `CLIENT PAUSE WRITE` lets `SELECT` run, and keeps it out of the
+/// replication stream and the AOF (#411): neither the offset nor the AOF
+/// moves. Nothing is lost by it, on a server that has used only database 0
+/// before either: the writes made after the pause land in the database their
+/// client selected, on the replica and after a restart from the AOF.
+#[test]
+fn a_select_while_writes_are_paused_moves_nothing_and_loses_nothing() {
+    let mut master = Server::start(&["--aof"]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut m = master.conn();
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    // No PING of the replica to move the offset meanwhile.
+    assert!(
+        m.cmd(&["CONFIG", "SET", "repl-ping-replica-period", "3600"])
+            .ok()
+    );
+    let mut a = master.conn();
+    let mut b = master.conn();
+
+    assert!(m.cmd(&["CLIENT", "PAUSE", "10000", "WRITE"]).ok());
+    let offset = m.info("replication", "master_repl_offset");
+    let aof = m.info("persistence", "aof_current_size");
+    assert!(a.cmd(&["SELECT", "3"]).ok());
+    assert!(b.cmd(&["SELECT", "0"]).ok());
+    assert_eq!(m.info("replication", "master_repl_offset"), offset);
+    assert_eq!(m.info("persistence", "aof_current_size"), aof);
+    assert!(m.cmd(&["CLIENT", "UNPAUSE"]).ok());
+
+    for i in 0..20 {
+        assert!(a.cmd(&["SET", &format!("k{i}"), "a"]).ok());
+        assert!(b.cmd(&["SET", &format!("j{i}"), "b"]).ok());
+    }
+    let named = |prefix: &str| -> Vec<String> {
+        let mut keys: Vec<String> = (0..20).map(|i| format!("{prefix}{i}")).collect();
+        keys.sort();
+        keys
+    };
+    let keys_in = |c: &mut Conn, db: &str| -> Vec<String> {
+        assert!(c.cmd(&["SELECT", db]).ok());
+        let mut keys: Vec<String> = c
+            .cmd(&["KEYS", "*"])
+            .arr()
+            .iter()
+            .map(|key| key.s().to_string())
+            .collect();
+        keys.sort();
+        keys
+    };
+    let offset: u64 = m.info("replication", "master_repl_offset").parse().unwrap();
+    wait_until("the replica to catch up", || {
+        r.info("replication", "slave_repl_offset")
+            .parse::<u64>()
+            .is_ok_and(|applied| applied >= offset)
+    });
+    assert_eq!(keys_in(&mut r, "3"), named("k"), "{}", replica.log());
+    assert_eq!(keys_in(&mut r, "0"), named("j"));
+
+    // From the AOF alone: every write on disk, then no final save.
+    assert_eq!(b.cmd(&["WAITAOF", "1", "0", "5000"]).arr()[0].i(), 1);
+    drop((m, a, b));
+    master.kill();
+    master.restart();
+    let mut m = master.conn();
+    assert_eq!(keys_in(&mut m, "3"), named("k"), "{}", master.log());
+    assert_eq!(keys_in(&mut m, "0"), named("j"));
+}
+
 /// Writes up to the moment of the shutdown, keys and hash fields expiring
 /// through it, and a replica `PING` every second: a master stopped cleanly
 /// still continues its replica (#306). Its final save records the offset at

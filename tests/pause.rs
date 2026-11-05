@@ -249,8 +249,9 @@ fn client_pause_write_does_not_hold_select() {
 
     let mut other = Conn::connect(port);
     let mut writer = Conn::connect(port);
-    let offset = repl_field(&mut c, "master_repl_offset");
     c.ok(&["CLIENT", "PAUSE", "5000", "WRITE"]);
+    // Read once writes are paused: nothing may move it from here on.
+    let offset = repl_field(&mut c, "master_repl_offset");
     let started = Instant::now();
     other.ok(&["SELECT", "1"]);
     assert_eq!(other.cmd(&["GET", "a"]), V::Nil);
