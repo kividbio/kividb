@@ -1730,6 +1730,31 @@ fn error_of(reply: &RespValue) -> &str {
     }
 }
 
+/// `SELECT` writes nothing: a master without enough good replicas runs
+/// it, as Redis does (#411), and a transaction that only selects and
+/// reads. Writes are still refused, in whichever database.
+#[test]
+fn select_is_not_refused_for_want_of_good_replicas() {
+    let master_port = free_port();
+    start_server(master_port);
+    let mut m = Conn::connect(master_port);
+    assert!(
+        m.cmds(&["CONFIG", "SET", "min-replicas-to-write", "1"])
+            .is_ok()
+    );
+    assert!(error_of(&m.cmds(&["SET", "a", "1"])).starts_with("NOREPLICAS"));
+
+    let r = m.cmds(&["SELECT", "1"]);
+    assert!(r.is_ok(), "SELECT: {r:?}");
+    assert!(m.cmds(&["MULTI"]).is_ok());
+    assert_eq!(m.cmds(&["SELECT", "2"]).as_str(), "QUEUED");
+    assert_eq!(m.cmds(&["GET", "a"]).as_str(), "QUEUED");
+    let exec = m.cmds(&["EXEC"]);
+    assert_eq!(exec.as_array().len(), 2, "{exec:?}");
+    assert!(exec.as_array()[0].is_ok(), "{exec:?}");
+    assert!(error_of(&m.cmds(&["SET", "a", "1"])).starts_with("NOREPLICAS"));
+}
+
 fn start_replica_of(replica_port: u16, master_port: u16) {
     thread::spawn(move || {
         let config = Config {

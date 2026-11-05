@@ -536,6 +536,9 @@ pub fn allowed_when_out_of_memory(name: &str) -> bool {
             | "EXEC"
             | "DISCARD"
             | "RESTORE-ASKING"
+            // Propagated, so `replication::is_write_command` has it, but it
+            // writes nothing (#411).
+            | "SELECT"
     )
 }
 

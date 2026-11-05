@@ -2977,6 +2977,17 @@ pub fn write_is_observed(ctx: &crate::commands::ctx::Ctx<'_>) -> bool {
 pub fn replicate_one_write(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>]) {
     let cmd0 = parts.first().map(|v| v.as_slice()).unwrap_or_default();
     let payloads: Vec<Vec<u8>> = if cmd0.eq_ignore_ascii_case(b"SELECT") && parts.len() >= 2 {
+        // `CLIENT PAUSE WRITE` lets a `SELECT` run (it writes nothing), but
+        // nothing may be added to the stream while writes are paused: a
+        // failover waits for its replica to reach the master's offset, and
+        // takes that offset to stay put. A `SELECT` sent now is not needed
+        // there either: the next write in another database carries its own
+        // (`encode_for_stream`), since the stream's database is not moved.
+        // Not on a replica, whose offset is its master's.
+        if !ctx.apply_replication && !ctx.repl_state.is_slave() && crate::pause::active().is_some()
+        {
+            return;
+        }
         vec![crate::resp::write::encode_resp_command(parts)]
     } else {
         ctx.repl_state.encode_for_stream(*ctx.selected_db, parts)

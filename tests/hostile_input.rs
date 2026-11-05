@@ -216,6 +216,39 @@ fn a_restore_payload_that_lies_about_its_sizes_is_refused() {
     }
 }
 
+/// A sorted set with a NaN score is refused, as Redis refuses it ("Zset
+/// with NAN score detected"): no command makes one, and the score ranges
+/// take there to be none (#414). The same payload with its real score, and
+/// infinite ones, restores.
+#[test]
+fn a_restore_payload_with_a_nan_score_is_refused() {
+    let port = start_server("");
+    let mut c = Conn::connect(port);
+    c.cmd(&["ZADD", "z", "1.5", "a", "-inf", "low", "+inf", "high"]);
+    let Reply::Bulk(Some(dump)) = c.cmd(&["DUMP", "z"]) else {
+        panic!("DUMP z");
+    };
+    let data = &dump[..dump.len() - 10];
+    let at = data
+        .windows(8)
+        .position(|w| w == 1.5f64.to_le_bytes())
+        .expect("the score of a");
+    let mut nan = data.to_vec();
+    nan[at..at + 8].copy_from_slice(&f64::NAN.to_le_bytes());
+    let reply = c.call(&[b"RESTORE", b"bad", b"0", &payload(&nan)]);
+    assert_eq!(reply, Reply::Error("ERR Bad data format".into()));
+    assert_eq!(c.cmd(&["EXISTS", "bad"]), Reply::Int(0));
+
+    let reply = c.call(&[b"RESTORE", b"good", b"0", &payload(data)]);
+    assert_eq!(reply, Reply::Simple("OK".into()));
+    assert_eq!(c.cmd(&["ZCOUNT", "good", "-inf", "+inf"]), Reply::Int(3));
+    assert_eq!(
+        c.cmd(&["ZSCORE", "good", "low"]),
+        Reply::Bulk(Some(b"-inf".to_vec()))
+    );
+    c.still_answers();
+}
+
 #[test]
 fn queries_and_expressions_that_nest_without_end_are_refused() {
     let port = start_server("");

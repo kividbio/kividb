@@ -393,17 +393,14 @@ struct RangeParams<'a> {
 ///   - Legacy wrappers (ZRANGEBYSCORE etc.) just build RangeParams and call this
 fn zrange_pairs(inner: &SortedSetInner, p: &RangeParams) -> Vec<(Vec<u8>, f64)> {
     if p.by_score {
-        let min_str = std::str::from_utf8(p.start).unwrap_or("-inf");
-        let max_str = std::str::from_utf8(p.stop).unwrap_or("+inf");
-
         // REV swaps the bounds — caller passes (max, min) in REV mode
-        let (min_str, max_str) = if p.rev {
-            (max_str, min_str)
+        let (min_raw, max_raw) = if p.rev {
+            (p.stop, p.start)
         } else {
-            (min_str, max_str)
+            (p.start, p.stop)
         };
 
-        let (Ok(min), Ok(max)) = (parse_score_bound(min_str), parse_score_bound(max_str)) else {
+        let (Ok(min), Ok(max)) = (parse_score_bound(min_raw), parse_score_bound(max_raw)) else {
             return vec![];
         };
         let Some(range) = score_range(min, max) else {
@@ -1022,7 +1019,7 @@ fn lex_in_range(member: &[u8], min: &LexBound, max: &LexBound) -> bool {
 fn range_error(p: &RangeParams) -> Option<Vec<u8>> {
     if p.by_score {
         for end in [p.start, p.stop] {
-            if let Err(e) = parse_score_bound(std::str::from_utf8(end).unwrap_or("")) {
+            if let Err(e) = parse_score_bound(end) {
                 return Some(e);
             }
         }
@@ -1079,20 +1076,35 @@ fn parse_hex_float(text: &str) -> Option<f64> {
 
 /// Parse a Redis score bound like "5.0", "(5.0", "-inf", "+inf"
 /// Returns (value, exclusive) — the bool is true if the paren form was used.
-fn parse_score_bound(s: &str) -> Result<(f64, bool), Vec<u8>> {
-    if s.eq_ignore_ascii_case("-inf") {
-        return Ok((f64::NEG_INFINITY, false));
-    }
-    if s.eq_ignore_ascii_case("+inf") || s.eq_ignore_ascii_case("inf") {
-        return Ok((f64::INFINITY, false));
-    }
-    let (exclusive, num_str) = if let Some(rest) = s.strip_prefix('(') {
-        (true, rest)
-    } else {
-        (false, s)
+///
+/// Read as Redis's `zslParseRange` reads it, which is not how a score is
+/// read (`parse_score`, Redis's `string2d`): with `fast_float_strtod`, which
+/// is `strtod` wherever its fast path does not read the whole bound. Only
+/// what is left after the number, or NaN, is refused. So an empty bound is
+/// 0, as `(` alone is an open 0: nothing is read, and nothing is left. A
+/// number too large for a double is infinite, where a score is refused for
+/// it. Space before the number is skipped, as `strtod` skips it, and
+/// hexadecimal is read; space after it is left over (#413).
+fn parse_score_bound(raw: &[u8]) -> Result<(f64, bool), Vec<u8>> {
+    let (exclusive, number) = match raw.split_first() {
+        Some((b'(', rest)) => (true, rest),
+        _ => (false, raw),
     };
-    parse_score(num_str.as_bytes())
-        .map(|v| (v, exclusive))
+    // `strtod` reads a C string, which ends at a NUL.
+    let number = number.split(|&b| b == 0).next().unwrap_or_default();
+    let value = if number.is_empty() {
+        Some(0.0)
+    } else {
+        std::str::from_utf8(number)
+            .ok()
+            .and_then(|text| {
+                let text = text.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+                parse_hex_float(text).or_else(|| text.parse::<f64>().ok())
+            })
+            .filter(|value| !value.is_nan())
+    };
+    value
+        .map(|value| (value, exclusive))
         .ok_or_else(|| resp_error("ERR min or max is not a float"))
 }
 
@@ -1149,20 +1161,11 @@ fn zcount(ctx: &mut Ctx) -> Vec<u8> {
         Some(k) => k,
         None => return resp_error("ERR key must be valid UTF-8"),
     };
-    let min_str = match std::str::from_utf8(cmd[2]) {
-        Ok(s) => s,
-        Err(_) => return resp_error("ERR min must be UTF-8"),
-    };
-    let max_str = match std::str::from_utf8(cmd[3]) {
-        Ok(s) => s,
-        Err(_) => return resp_error("ERR max must be UTF-8"),
-    };
-
-    let min = match parse_score_bound(min_str) {
+    let min = match parse_score_bound(cmd[2]) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let max = match parse_score_bound(max_str) {
+    let max = match parse_score_bound(cmd[3]) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -1852,13 +1855,11 @@ fn zremrangebyscore(ctx: &mut Ctx) -> Vec<u8> {
         Some(k) => k,
         None => return resp_error("ERR key must be valid UTF-8"),
     };
-    let min_str = std::str::from_utf8(cmd[2]).unwrap_or("");
-    let max_str = std::str::from_utf8(cmd[3]).unwrap_or("");
-    let min = match parse_score_bound(min_str) {
+    let min = match parse_score_bound(cmd[2]) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let max = match parse_score_bound(max_str) {
+    let max = match parse_score_bound(cmd[3]) {
         Ok(v) => v,
         Err(e) => return e,
     };
