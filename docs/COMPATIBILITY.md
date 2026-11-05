@@ -122,6 +122,12 @@ other files:
   does that, for more writes a second.
 
 **Data**
+- Keys, hash fields and set members must be valid UTF-8; Redis and Valkey
+  accept any bytes. A non-UTF-8 key gets `ERR key must be
+  valid UTF-8` (or `ERR must be valid UTF-8`), so an application that uses
+  binary keys, such as Stalwart Mail Server, doesn't work yet
+  ([#437](https://github.com/kividbio/kividb/issues/437)). Values and
+  sorted-set members are binary-safe, as in Redis.
 - HyperLogLog registers aren't in Redis's layout
   ([#62](https://github.com/kividbio/kividb/issues/62)). `PFADD`, `PFCOUNT`
   and `PFMERGE` work within KiviDB, but an HLL moved between Redis and KiviDB
