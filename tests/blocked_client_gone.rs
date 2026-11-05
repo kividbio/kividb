@@ -958,3 +958,84 @@ fn a_refused_resume_passes_its_turn_on_before_what_follows_it() {
         assert_eq!(second.read(), s("job"), "{io}");
     }
 }
+
+// ── A push and the clients it wakes (#42) ─────────────────────────────────────
+
+/// A push that wakes a blocked client replies once that client has popped,
+/// as in Redis: `LLEN` sent behind it in one packet finds the list empty. A
+/// chain too: `BRPOPLPUSH a b` woken by the push, whose push to `b` wakes a
+/// `BLPOP b`, is done before the first push replies.
+#[test]
+fn a_push_replies_after_the_clients_it_woke_have_popped() {
+    for &io in io_models() {
+        let server = Server::start(io);
+        let mut ctl = server.conn();
+        for round in 0..20 {
+            let key = format!("w:{round}");
+            let mut popper = server.conn();
+            popper.send(&["BLPOP", &key, "0"]);
+            wait_blocked(&mut ctl, 1);
+            let mut batch = request(&["LPUSH", &key, "job"]);
+            batch.extend(request(&["LLEN", &key]));
+            ctl.writer.write_all(&batch).unwrap();
+            assert_eq!(ctl.read(), V::Int(1), "{io}");
+            assert_eq!(
+                ctl.read(),
+                V::Int(0),
+                "{io} {round}: LLEN ran before the BLPOP popped"
+            );
+            assert_eq!(popper.read(), strs(&[&key, "job"]), "{io}");
+        }
+
+        let mut mover = server.conn();
+        mover.send(&["BRPOPLPUSH", "c:a", "c:b", "0"]);
+        wait_blocked(&mut ctl, 1);
+        let mut popper = server.conn();
+        popper.send(&["BLPOP", "c:b", "0"]);
+        wait_blocked(&mut ctl, 2);
+        let mut batch = request(&["LPUSH", "c:a", "job"]);
+        batch.extend(request(&["LLEN", "c:a"]));
+        batch.extend(request(&["LLEN", "c:b"]));
+        ctl.writer.write_all(&batch).unwrap();
+        assert_eq!(ctl.read(), V::Int(1), "{io}");
+        assert_eq!(ctl.read(), V::Int(0), "{io}");
+        assert_eq!(ctl.read(), V::Int(0), "{io}: the chain was not done");
+        assert_eq!(mover.read(), s("job"), "{io}");
+        assert_eq!(popper.read(), strs(&["c:b", "job"]), "{io}");
+    }
+}
+
+/// The client a push wakes has gone, closed just before the push: the push
+/// is not held for it. The client behind it takes the element, and has
+/// taken it by the time the push replies.
+#[test]
+fn a_push_whose_woken_client_has_gone_is_not_held_for_it() {
+    for &io in io_models() {
+        let server = Server::start(io);
+        let mut ctl = server.conn();
+        for round in 0..20 {
+            let key = format!("g:{round}");
+            let gone = blocked_client(&server, &mut ctl, "gone", &["BLPOP", &key, "0"]);
+            let mut behind = server.conn();
+            behind.send(&["BLPOP", &key, "0"]);
+            wait_blocked(&mut ctl, 2);
+            gone.close();
+            // No pause: the push may find it still in line, and wake it.
+            let started = Instant::now();
+            let mut batch = request(&["LPUSH", &key, "job"]);
+            batch.extend(request(&["LLEN", &key]));
+            ctl.writer.write_all(&batch).unwrap();
+            assert_eq!(ctl.read(), V::Int(1), "{io}");
+            let left = ctl.read();
+            let took = started.elapsed();
+            assert!(took < AT_ONCE, "{io} {round}: the push took {took:?}");
+            assert_eq!(behind.read(), strs(&[&key, "job"]), "{io} {round}");
+            assert_eq!(
+                left,
+                V::Int(0),
+                "{io} {round}: the push replied before the client behind popped"
+            );
+            assert!(leaves_within(&mut ctl, "gone", AT_ONCE), "{io} {round}");
+        }
+    }
+}

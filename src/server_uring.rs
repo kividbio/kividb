@@ -1236,7 +1236,9 @@ pub async fn handle_client(
                     }
 
                     // Its reply comes after the pops of the clients it woke (#42).
-                    blocking_slot.settle().await;
+                    if let Some(settling) = blocking_slot.settle() {
+                        settling.await;
+                    }
                     if interrupted.unblocked_with_error {
                         interrupted.unblocked_with_error = false;
                         response = crate::commands::blocking::UNBLOCKED.to_vec();
@@ -1311,7 +1313,9 @@ pub async fn handle_client(
                 }
 
                 // Its reply comes after the pops of the clients it woke (#42).
-                blocking_slot.settle().await;
+                if let Some(settling) = blocking_slot.settle() {
+                    settling.await;
+                }
                 if interrupted.unblocked_with_error {
                     interrupted.unblocked_with_error = false;
                     response = crate::commands::blocking::UNBLOCKED.to_vec();

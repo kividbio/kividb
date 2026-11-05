@@ -47,6 +47,32 @@ impl Ticket {
         std::mem::take(&mut *self.looked.lock())
     }
 
+    /// Its command looked, found nothing and waits again: whoever woke it
+    /// is released, unless a write has woken it again since it stood back
+    /// in line, before it looked or after. Then they are kept, to be
+    /// released once it has looked again, which it does at once: one of
+    /// them is that write's, which it may not have seen, and which it may
+    /// take. Taken first and put back after: a wake leaves its sender here
+    /// and takes the client's means of waking under its line's lock, so a
+    /// sender taken here belongs to a wake that the look at the line sees.
+    pub fn looked_and_waits(&self) {
+        let looked = self.take_looked();
+        if looked.is_empty() {
+            return;
+        }
+        let Some(table) = self.table.upgrade() else {
+            return;
+        };
+        let woken_again = self
+            .lines
+            .lock()
+            .iter()
+            .any(|(line, key)| table.woken_in(*line, key, self.id));
+        if woken_again {
+            self.looked.lock().extend(looked);
+        }
+    }
+
     /// Its command parks, waiting on `keys` (`readers`: in their
     /// `XREADGROUP` lines): what the `Drop` is to leave. Once: a command
     /// that parks again waits on the same keys.
@@ -61,6 +87,14 @@ impl Ticket {
 
 impl Drop for Ticket {
     fn drop(&mut self) {
+        // Whoever woke it, dropped in a connection's command — its own, done
+        // with the line — goes to that command, to be released once the
+        // clients it woke, the one it passed its turn to among them, have
+        // looked (see [`take_woken`]). Anywhere else: released now.
+        let looked = std::mem::take(self.looked.get_mut());
+        if !looked.is_empty() {
+            hand_on(looked);
+        }
         // Taken without a lock: nothing else can reach a ticket being dropped.
         let lines = std::mem::take(self.lines.get_mut());
         if lines.is_empty() {
@@ -76,29 +110,111 @@ impl Drop for Ticket {
 }
 
 thread_local! {
-    static WOKEN: std::cell::RefCell<Option<Vec<oneshot::Receiver<()>>>> =
-        const { std::cell::RefCell::new(None) };
+    /// Whether the command running on this thread collects the clients it
+    /// wakes, and whether it has woken any: [`IDLE`], [`COLLECTING`] or
+    /// [`COLLECTED`]. A byte of its own, with nothing to drop, so that a
+    /// command that wakes nobody only sets it and swaps it back.
+    static COLLECT: std::cell::Cell<u8> = const { std::cell::Cell::new(IDLE) };
+    /// What it has collected, once it is [`COLLECTED`].
+    static WOKEN: std::cell::RefCell<Woken> = const {
+        std::cell::RefCell::new(Woken {
+            woken: Vec::new(),
+            looked: Vec::new(),
+        })
+    };
 }
+
+/// What a connection's command collected (see [`take_woken`]).
+#[derive(Default)]
+pub struct Woken {
+    /// The clients it woke, each resolving once that client has looked.
+    pub woken: Vec<oneshot::Receiver<()>>,
+    /// Whoever woke the clients whose tickets it dropped, done with their
+    /// lines: they are released once `woken` have looked.
+    pub looked: Vec<oneshot::Sender<()>>,
+}
+
+#[cold]
+fn hand_on(looked: Vec<oneshot::Sender<()>>) {
+    if COLLECT
+        .try_with(|collect| collect.get() != IDLE)
+        .unwrap_or(false)
+    {
+        // Back here if the thread is being torn down: dropped below.
+        let _ = WOKEN.try_with(|woken| woken.borrow_mut().looked.extend(looked));
+        COLLECT.set(COLLECTED);
+    }
+}
+
+const IDLE: u8 = 0;
+const COLLECTING: u8 = 1;
+const COLLECTED: u8 = 2;
 
 /// Note the clients the command about to run on this thread wakes from a
 /// line, for [`take_woken`]. Only a connection does: a wake from anywhere
 /// else (a script's own thread) is not collected, so nothing piles up there.
 #[inline]
 pub fn collect_woken() {
-    WOKEN.with(|woken| *woken.borrow_mut() = Some(Vec::new()));
+    COLLECT.set(COLLECTING);
 }
 
 /// The clients the command since [`collect_woken`] woke, each resolving once
-/// that client has looked at its keys. Redis serves the clients a command
-/// unblocks before that command replies, so a `BLPOP` an `LPUSH` woke has
-/// popped — and been counted in `rdb_changes_since_last_save` — by the time
-/// the `LPUSH` reply arrives (#42). The connection holds its replies until
-/// these resolve.
+/// that client has looked at its keys — `None` if it woke none, as nearly
+/// every command does. Redis serves the clients a command unblocks before
+/// that command replies, so a `BLPOP` an `LPUSH` woke has popped — and been
+/// counted in `rdb_changes_since_last_save` — by the time the `LPUSH` reply
+/// arrives (#42). The connection holds its replies until these resolve.
 #[inline]
-pub fn take_woken() -> Vec<oneshot::Receiver<()>> {
+pub fn take_woken() -> Option<Woken> {
+    if COLLECT.replace(IDLE) == COLLECTED {
+        Some(take_collected())
+    } else {
+        None
+    }
+}
+
+#[cold]
+fn take_collected() -> Woken {
     WOKEN
-        .with(|woken| woken.borrow_mut().take())
+        .try_with(|woken| std::mem::take(&mut *woken.borrow_mut()))
         .unwrap_or_default()
+}
+
+/// Wake `queued` with `tx`, or, `None`, see that a client already woken
+/// and yet to look is waited for: it will look after this command's write,
+/// and take what it wrote. If a connection's command is running on this
+/// thread (see [`collect_woken`]), it is told when the client has looked:
+/// the sender goes in the client's ticket before the wake, as the client
+/// may look at once on another thread.
+///
+/// Returns the ticket if it had to be taken hold of for that, to be dropped
+/// by the caller only once it has let go of the line's lock (see the
+/// ticket's `Drop`).
+fn wake(queued: &Queued, tx: Option<oneshot::Sender<Value>>) -> Option<Arc<Ticket>> {
+    // `try_with`: a ticket can be dropped, and pass its turn on, while its
+    // thread is being torn down.
+    let ticket = if COLLECT
+        .try_with(|collect| collect.get() != IDLE)
+        .unwrap_or(false)
+    {
+        queued.alive.upgrade()
+    } else {
+        None
+    };
+    let looked = ticket.as_ref().map(|ticket| {
+        let (looked, rx) = oneshot::channel();
+        ticket.looked.lock().push(looked);
+        rx
+    });
+    if tx.is_none_or(|tx| tx.send(Arc::from([].as_slice())).is_ok())
+        && let Some(rx) = looked
+        && WOKEN
+            .try_with(|woken| woken.borrow_mut().woken.push(rx))
+            .is_ok()
+    {
+        COLLECT.set(COLLECTED);
+    }
+    ticket
 }
 
 /// One client in the line for a key.
@@ -209,6 +325,20 @@ impl WaitTable {
         if woken {
             self.wake_next_in(lines, key, id);
         }
+    }
+
+    /// Whether the client of ticket `id` stands in `key`'s line woken, and
+    /// has yet to look.
+    fn woken_in(&self, line: Line, key: &str, id: u64) -> bool {
+        let lines = match line {
+            Line::Keys => &self.queues,
+            Line::Readers => &self.reader_queues,
+        };
+        lines.lock().get(key).is_some_and(|queue| {
+            queue
+                .binary_search_by_key(&id, |queued| queued.id)
+                .is_ok_and(|at| queue[at].tx.is_none())
+        })
     }
 
     /// Stand in the line for `key` — or, already in it, stay where `ticket`
@@ -334,22 +464,20 @@ impl WaitTable {
         queue.retain(|queued| queued.alive.strong_count() > 0);
         self.queued_count
             .fetch_sub(before - queue.len(), Ordering::Relaxed);
-        if let Some(next) = queue.iter_mut().find(|queued| queued.id > after)
-            && let Some(tx) = next.tx.take()
-            && tx.send(Arc::from([].as_slice())).is_ok()
-            && let Some(ticket) = next.alive.upgrade()
-        {
-            WOKEN.with(|woken| {
-                if let Some(woken) = woken.borrow_mut().as_mut() {
-                    let (looked, rx) = oneshot::channel();
-                    ticket.looked.lock().push(looked);
-                    woken.push(rx);
-                }
+        let woken = queue
+            .iter_mut()
+            .find(|queued| queued.id > after)
+            .and_then(|next| {
+                let tx = next.tx.take();
+                wake(next, tx)
             });
-        }
         if queue.is_empty() {
             queues.remove(key);
         }
+        // The line's lock first: the ticket may be the last hold on it now
+        // (its client let go of it meanwhile), and its `Drop` takes that lock.
+        drop(queues);
+        drop(woken);
     }
 
     /// Register to be woken when `key` is written.
@@ -552,6 +680,7 @@ unsafe impl Sync for WaitTable {}
 #[cfg(test)]
 mod signal_tests {
     use super::*;
+    use tokio::sync::oneshot::error::TryRecvError;
 
     #[test]
     fn a_signal_wakes_every_waiter_on_the_key_and_no_one_else() {
@@ -685,6 +814,101 @@ mod signal_tests {
             drop(fourth);
             assert!(!table.has_signal_waiters());
         }
+    }
+
+    /// A wake made while a connection's command runs is collected for it,
+    /// and resolves when the woken client has looked, or is dropped without
+    /// looking: the waker never waits on a client that is gone. Its turn
+    /// still passes on. A wake made outside a dispatch is not collected.
+    #[test]
+    fn a_waker_is_released_when_its_client_looks_or_goes() {
+        let table = Arc::new(WaitTable::new());
+        let (first, second) = (table.new_ticket(), table.new_ticket());
+        let _rx1 = table.enqueue("k", &first);
+        let mut rx2 = table.enqueue("k", &second);
+        for ticket in [&first, &second] {
+            ticket.parks_in(&["k".to_string()], false);
+        }
+
+        collect_woken();
+        table.notify_signal("k");
+        let mut woke = take_woken().expect("woke one").woken;
+        assert_eq!(woke.len(), 1);
+        assert!(woke[0].try_recv().is_err(), "released before it looked");
+        // Gone without looking, dropped in a connection's command: the turn
+        // is the second's, and whoever woke it is that command's to release,
+        // once the second has looked.
+        collect_woken();
+        drop(first);
+        let Woken {
+            woken: mut passed,
+            looked,
+        } = take_woken().expect("passed on");
+        assert!(matches!(woke[0].try_recv(), Err(TryRecvError::Empty)));
+        drop(looked);
+        assert!(matches!(woke[0].try_recv(), Err(TryRecvError::Closed)));
+        assert!(rx2.try_recv().is_ok());
+        assert_eq!(passed.len(), 1, "the drop's wake is not waited for");
+        // Looked: released.
+        drop(second.take_looked());
+        assert!(matches!(passed[0].try_recv(), Err(TryRecvError::Closed)));
+
+        // Outside a dispatch nothing is collected.
+        table.dequeue("k", &second);
+        let third = table.new_ticket();
+        let mut rx3 = table.enqueue("k", &third);
+        table.notify_signal("k");
+        assert!(rx3.try_recv().is_ok());
+        assert!(take_woken().is_none());
+        assert!(third.take_looked().is_empty());
+    }
+
+    /// A client that looked, found nothing and waits again releases whoever
+    /// woke it, but not a write that woke it again once it stood back in
+    /// line: it has not looked at that one yet.
+    #[test]
+    fn waiting_again_releases_only_the_wakes_it_has_looked_after() {
+        let table = Arc::new(WaitTable::new());
+        let ticket = table.new_ticket();
+        let _rx = table.enqueue("k", &ticket);
+        ticket.parks_in(&["k".to_string()], false);
+        // Woken, it stands back in line (the resume looks after this).
+        collect_woken();
+        table.notify_signal("k");
+        let mut first = take_woken().expect("woke it").woken;
+        let _rx = table.enqueue("k", &ticket);
+        ticket.looked_and_waits();
+        assert!(matches!(first[0].try_recv(), Err(TryRecvError::Closed)));
+
+        // Woken again after it stood back in line, and then it waits again.
+        collect_woken();
+        table.notify_signal("k");
+        let mut second = take_woken().expect("woke it again").woken;
+        ticket.looked_and_waits();
+        assert!(matches!(second[0].try_recv(), Err(TryRecvError::Empty)));
+        // Its next look releases it.
+        drop(ticket.take_looked());
+        assert!(matches!(second[0].try_recv(), Err(TryRecvError::Closed)));
+    }
+
+    /// A write while the client at the head of the line has been woken and
+    /// has yet to look waits for that look too: it will take what the write
+    /// put there.
+    #[test]
+    fn a_write_waits_for_a_client_woken_before_it() {
+        let table = Arc::new(WaitTable::new());
+        let first = table.new_ticket();
+        let mut rx = table.enqueue("k", &first);
+        first.parks_in(&["k".to_string()], false);
+        table.notify_signal("k");
+        assert!(rx.try_recv().is_ok());
+
+        collect_woken();
+        table.notify_signal("k");
+        let mut woke = take_woken().expect("waits for the one woken before").woken;
+        assert!(matches!(woke[0].try_recv(), Err(TryRecvError::Empty)));
+        drop(first.take_looked());
+        assert!(matches!(woke[0].try_recv(), Err(TryRecvError::Closed)));
     }
 
     /// A reader may name a stream twice (`XREAD STREAMS s s 0 0`): each is
