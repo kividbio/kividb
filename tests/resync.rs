@@ -194,13 +194,18 @@ fn kividb_with(dir: &Path, port: u16, extra: &[String], env: &[(String, String)]
             &port.to_string(),
             "--bind",
             "127.0.0.1",
-            "--io-model",
-            "tokio",
             "--threads",
             "4",
             "--configfile",
             "kividb.conf",
         ])
+        // The tokio loop unless a test asks for another.
+        .args(
+            (!extra.iter().any(|arg| arg == "--io-model"))
+                .then_some(["--io-model", "tokio"])
+                .into_iter()
+                .flatten(),
+        )
         .args(extra)
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::null())
