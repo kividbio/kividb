@@ -1942,10 +1942,12 @@ fn parse_search_args(cmd: &[&[u8]], start: usize) -> Result<SearchArgs, String> 
                 if n > cmd.len().saturating_sub(i + 2) {
                     return Err("Bad arguments for INKEYS: not enough keys".into());
                 }
+                // Named as documents are (`key_bytes::text_of`), so a key
+                // that is not plain UTF-8 still finds its document.
                 args.inkeys = Some(
                     cmd[i + 2..i + 2 + n]
                         .iter()
-                        .map(|a| text(a).to_string())
+                        .map(|a| crate::key_bytes::text_of(a).into_owned())
                         .collect(),
                 );
                 i += 2 + n;

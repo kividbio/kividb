@@ -606,6 +606,55 @@ fn search_finds_documents_of_any_key() {
     assert_eq!(knn(&mut c), want, "{}", server.log());
 }
 
+/// `FT.SEARCH … INKEYS` names a key that is not text, or one with a
+/// character of the escape's block, as the document it is: each finds its
+/// own document and only it, by a text query and by `*`.
+#[test]
+fn search_inkeys_of_any_key() {
+    let file = rdb_hashes(&[
+        (RAW, &[(b"title", b"hello raw")]),
+        (PUA.as_bytes(), &[(b"title", b"hello pua")]),
+        (b"doc:plain", &[(b"title", b"hello plain")]),
+    ]);
+    let server = preloaded(&file, &[]);
+    let mut c = server.conn();
+    let created = c.cmd(&[
+        b"FT.CREATE",
+        b"idx",
+        b"ON",
+        b"HASH",
+        b"PREFIX",
+        b"1",
+        b"doc:",
+        b"SCHEMA",
+        b"title",
+        b"TEXT",
+    ]);
+    assert_eq!(created, V::Str(b"OK".to_vec()), "{}", server.log());
+    eventually(20, "the walk to index the documents", || {
+        found(&c.cmd(&[b"FT.SEARCH", b"idx", b"hello", b"NOCONTENT"])).len() == 3
+    });
+    for query in [b"hello".as_ref(), b"*".as_ref()] {
+        for key in [RAW, PUA.as_bytes()] {
+            let reply = c.cmd(&[
+                b"FT.SEARCH",
+                b"idx",
+                query,
+                b"INKEYS",
+                b"1",
+                key,
+                b"NOCONTENT",
+            ]);
+            assert_eq!(
+                found(&reply),
+                vec![key.to_vec()],
+                "INKEYS {key:?}, query {:?}: {reply:?}",
+                String::from_utf8_lossy(query)
+            );
+        }
+    }
+}
+
 /// Time series named with a character of the escape's block: the label
 /// index finds them (TS.QUERYINDEX, TS.MRANGE), TS.QUERYLABELS checks a
 /// user's access to the key they are (`é` and U+F7C3 U+F7A9 are not the
