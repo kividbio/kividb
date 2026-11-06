@@ -119,7 +119,7 @@ pub fn dataset_digest(store: &crate::store::Store) -> u64 {
                                 let mut h = Xxh3::new();
                                 h.update(&(db_index as u64).to_le_bytes());
                                 h.update(&(key.len() as u64).to_le_bytes());
-                                h.update(key.as_bytes());
+                                h.update(key);
                                 value_digest(&mut h, entry.value());
                                 sum = sum.wrapping_add(h.digest());
                                 // Its time to live, if it has one.
@@ -127,7 +127,7 @@ pub fn dataset_digest(store: &crate::store::Store) -> u64 {
                                     let mut h = Xxh3::new();
                                     h.update(b"ttl");
                                     h.update(&(db_index as u64).to_le_bytes());
-                                    h.update(key.as_bytes());
+                                    h.update(key);
                                     h.update(&ms.to_le_bytes());
                                     sum = sum.wrapping_add(h.digest());
                                 }

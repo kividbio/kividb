@@ -191,10 +191,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let map = read_lock!(db[shard_idx as usize]);
                 let (page, next) = crate::commands::helpers::scan_page(
                     map.iter().map(|(key, value)| {
-                        (
-                            crate::commands::helpers::scan_position(key.as_bytes()),
-                            (key, value),
-                        )
+                        (crate::commands::helpers::scan_position(key), (key, value))
                     }),
                     position,
                     options.count.saturating_sub(looked_at).max(1),
@@ -214,7 +211,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                                 .as_deref()
                                 .is_none_or(|t| value.type_name().eq_ignore_ascii_case(t))
                         })
-                        .map(|(key, _)| key.to_string()),
+                        .map(|(key, _)| crate::store::key_text(key).to_owned()),
                 );
                 drop(map);
                 if next != 0 {
@@ -265,7 +262,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let mut candidates: Vec<String> = Vec::new();
             for shard in db.iter() {
                 let map = read_lock!(shard);
-                candidates.extend(map.keys().map(|k| k.to_string()));
+                candidates.extend(map.keys().map(|k| crate::store::key_text(k).to_owned()));
             }
             let mut matching: Vec<String> = Vec::new();
             for key in candidates {
@@ -987,7 +984,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let picked = (0..shards).find_map(|step| {
                     let map = read_lock!(ctx.store[db][(start + step) % shards]);
                     map.random_entry(rand::random::<usize>)
-                        .map(|(key, _)| key.to_string())
+                        .map(|(key, _)| crate::store::key_text(key).to_owned())
                 });
                 match picked {
                     None => break,

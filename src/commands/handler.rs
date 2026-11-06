@@ -290,8 +290,9 @@ pub(crate) fn execute_command_from_script(
 /// Whether a script may not run the command `name` (in capitals), whose
 /// first argument is `sub`: the commands and subcommands flagged `NOSCRIPT`
 /// in Valkey 9.1.3's command table (BSD-3-Clause, the same source as
-/// COMMAND DOCS), which Redis refuses the same way, refused before anything
-/// else is looked at. They change the connection (`MULTI`, `SUBSCRIBE`, `HELLO`, `CLIENT
+/// COMMAND DOCS), which Redis refuses the same way, and KiviDB's `BACKUP`
+/// and `HOTKEYS` subcommands that start or stop something, refused before
+/// anything else is looked at. They change the connection (`MULTI`, `SUBSCRIBE`, `HELLO`, `CLIENT
 /// SETNAME`, ...), the server (`CONFIG SET`, `ACL SETUSER`, `REPLICAOF`,
 /// `SHUTDOWN`, ...), or wait for what waits for the script: a script holds a
 /// slot of the write gate, and a `SAVE` in one, on a replica, waited for the
@@ -2305,8 +2306,9 @@ mod applied_gate_tests {
 mod noscript_tests {
     use super::not_allowed_from_script;
 
-    /// Every command and subcommand Redis 8.10's `src/commands/*.json` flag
-    /// `NOSCRIPT`, and some it does not.
+    /// Every command and subcommand that Valkey 9.1.3's `src/commands/*.json`
+    /// flag `NOSCRIPT` and KiviDB serves, KiviDB's `BACKUP` and `HOTKEYS`
+    /// subcommands that start or stop something, and some that are allowed.
     #[test]
     fn the_noscript_commands_are_redis_s() {
         let redis: &[(&str, &[&str])] = &[

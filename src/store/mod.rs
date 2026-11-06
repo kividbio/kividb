@@ -21,8 +21,8 @@ pub use shard_map::{
 /// 64-bit FNV-1a on every target (a 32-bit `usize` can't hold its
 /// constants); the shard is taken from its low bits.
 #[inline]
-pub fn shard_index(shards: usize, key: &str) -> usize {
-    shard_index_of_bytes(shards, key.as_bytes())
+pub fn shard_index(shards: usize, key: &(impl AsRef<[u8]> + ?Sized)) -> usize {
+    shard_index_of_bytes(shards, key.as_ref())
 }
 
 /// [`shard_index`] of a key as the command gave it, not yet checked to be
@@ -38,7 +38,7 @@ pub fn shard_index_of_bytes(shards: usize, key: &[u8]) -> usize {
 }
 
 #[inline(always)]
-pub fn get_shard<'a>(db: &'a Db, key: &str) -> &'a Shard {
+pub fn get_shard<'a>(db: &'a Db, key: &(impl AsRef<[u8]> + ?Sized)) -> &'a Shard {
     &db[shard_index(db.len(), key)]
 }
 
@@ -274,15 +274,20 @@ impl Default for ShardLock {
     }
 }
 
-/// A key, as the keyspace holds it: the bytes in the entry itself when there
-/// are twenty-four or fewer, which is nearly every key anybody uses, and on
-/// the heap only past that.
-///
-/// As a `String` every key was a block of its own beside the table: sixteen
-/// bytes and an allocator's header for a key like `user:1234567`, and a
-/// second place in memory to go to for every lookup, to compare it. It is
-/// the same size as a `String` was, so the table is no larger.
-pub type Key = compact_str::CompactString;
+/// A key kept outside the keyspace (the keyspace keeps its keys in their
+/// entries): any bytes, inline when there are twenty-four or fewer, as
+/// nearly every key is, and on the heap only past that. See
+/// [`crate::key_bytes`].
+pub type Key = crate::key_bytes::KeyBytes;
+
+/// A key from the keyspace as text, for what still keeps keys as text
+/// (#437). Every key is UTF-8 until the commands take others: they refuse
+/// them, and so does loading a snapshot. Checked all the same, so that a
+/// key that is not text stops the server rather than being misread.
+#[inline]
+pub fn key_text(key: &[u8]) -> &str {
+    std::str::from_utf8(key).expect("a key that is not UTF-8")
+}
 
 pub type Shard = Arc<ShardLock>;
 pub type Db = Arc<Vec<Shard>>;
@@ -462,7 +467,7 @@ pub fn rebuild_ts_label_index(store: &Store, ts: &SharedTsIndex) {
                         index
                             .entry(format!("{label}={label_value}"))
                             .or_default()
-                            .insert(key.to_string());
+                            .insert(key_text(key).to_owned());
                     }
                 }
             }

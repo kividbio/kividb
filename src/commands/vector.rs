@@ -156,9 +156,9 @@ fn ft_dropindex(ctx: &mut Ctx) -> Option<Vec<u8>> {
             let map = shard.read();
             for (key, value) in map.iter() {
                 let covered =
-                    prefixes.is_empty() || prefixes.iter().any(|p| key.starts_with(p.as_str()));
+                    prefixes.is_empty() || prefixes.iter().any(|p| key.starts_with(p.as_bytes()));
                 if covered && crate::vector::is_document(&on, value) {
-                    documents.push(key.to_string());
+                    documents.push(crate::store::key_text(key).to_owned());
                 }
             }
         }
@@ -1047,7 +1047,7 @@ fn ft_tagvals(ctx: &mut Ctx) -> Option<Vec<u8>> {
         let map = shard.read();
         for (key, value) in map.iter() {
             let matches =
-                prefixes.is_empty() || prefixes.iter().any(|p| key.starts_with(p.as_str()));
+                prefixes.is_empty() || prefixes.iter().any(|p| key.starts_with(p.as_bytes()));
             if !matches {
                 continue;
             }

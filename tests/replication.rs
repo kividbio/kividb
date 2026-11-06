@@ -2696,3 +2696,72 @@ fn test_a_replica_of_a_1_1_master_keeps_the_documents_of_its_dd() {
 fn test_a_replica_of_a_master_that_does_not_say_keeps_the_documents_of_its_dd() {
     assert!(!replica_fed_a_dd(None));
 }
+
+/// A replica holds a JSON document's numbers exactly as its master does,
+/// from the full sync and from the stream after it (#445).
+#[test]
+fn a_replica_holds_json_numbers_exactly() {
+    let mut state: u64 = 0x1234_5678_9ABC_DEF1;
+    let mut doubles = Vec::new();
+    while doubles.len() < 2000 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let d = if doubles.len() % 2 == 0 {
+            f64::from_bits(state)
+        } else {
+            (state >> 11) as f64 / (1u64 << 53) as f64 * 2e6 - 1e6
+        };
+        if d.is_finite() {
+            doubles.push(d);
+        }
+    }
+    let text = |chunk: &[f64]| {
+        let items: Vec<String> = chunk.iter().map(|d| format!("{d:?}")).collect();
+        format!("[{}]", items.join(","))
+    };
+    let exact = |c: &mut Conn, key: &str, want: &[f64]| {
+        let got = c.cmds(&["JSON.GET", key]);
+        let got: Vec<f64> = got
+            .as_str()
+            .trim_matches(|c| c == '[' || c == ']')
+            .split(',')
+            .map(|n| n.parse().unwrap())
+            .collect();
+        want.len() == got.len()
+            && want
+                .iter()
+                .zip(&got)
+                .all(|(w, g)| w.to_bits() == g.to_bits())
+    };
+
+    let master_port = free_port();
+    start_server(master_port);
+    let _shutdown = ShutdownServers(vec![master_port]);
+    let mut master = Conn::connect(master_port);
+    let (synced, streamed) = doubles.split_at(1000);
+    assert!(
+        master
+            .cmds(&["JSON.SET", "jr:sync", "$", &text(synced)])
+            .is_ok()
+    );
+    assert!(exact(&mut master, "jr:sync", synced));
+
+    let replica_port = spawn_server(replica_of(master_port));
+    let _shutdown_replica = ShutdownServers(vec![replica_port]);
+    let mut replica = Conn::connect(replica_port);
+    wait_link_up(&mut replica);
+    assert!(
+        master
+            .cmds(&["JSON.SET", "jr:stream", "$", &text(streamed)])
+            .is_ok()
+    );
+    wait_until("the replica has jr:stream", Duration::from_secs(10), || {
+        replica.cmds(&["EXISTS", "jr:stream"]).as_int() == 1
+    });
+    assert!(exact(&mut replica, "jr:sync", synced), "from the full sync");
+    assert!(
+        exact(&mut replica, "jr:stream", streamed),
+        "from the stream"
+    );
+}
