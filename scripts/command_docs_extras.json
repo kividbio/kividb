@@ -561,6 +561,282 @@
         "group": "server",
         "since": "8.10.0"
     },
+    "BF.ADD": {
+        "summary": "Adds an item to a Bloom filter, making the filter if the key is missing.",
+        "complexity": "O(k), k being the number of hash functions of the newest layer.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "item",
+                "type": "string"
+            }
+        ]
+    },
+    "BF.CARD": {
+        "summary": "Returns how many items were added to a Bloom filter.",
+        "complexity": "O(1)",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.4",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            }
+        ]
+    },
+    "BF.DEBUG": {
+        "summary": "",
+        "complexity": "O(N), N being the number of layers.",
+        "group": "module",
+        "module": "bf",
+        "since": "",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            }
+        ]
+    },
+    "BF.EXISTS": {
+        "summary": "Tells whether an item may have been added to a Bloom filter.",
+        "complexity": "O(k), k being the number of hash functions of each layer.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "item",
+                "type": "string"
+            }
+        ]
+    },
+    "BF.INFO": {
+        "summary": "Describes a Bloom filter: capacity, size, layers, items and expansion.",
+        "complexity": "O(1)",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "single_value",
+                "type": "oneof",
+                "optional": true,
+                "arguments": [
+                    {
+                        "name": "capacity",
+                        "type": "pure-token",
+                        "token": "CAPACITY"
+                    },
+                    {
+                        "name": "size",
+                        "type": "pure-token",
+                        "token": "SIZE"
+                    },
+                    {
+                        "name": "filters",
+                        "type": "pure-token",
+                        "token": "FILTERS"
+                    },
+                    {
+                        "name": "items",
+                        "type": "pure-token",
+                        "token": "ITEMS"
+                    },
+                    {
+                        "name": "expansion",
+                        "type": "pure-token",
+                        "token": "EXPANSION"
+                    }
+                ]
+            }
+        ]
+    },
+    "BF.INSERT": {
+        "summary": "Adds items to a Bloom filter, making it with the given parameters if the key is missing and NOCREATE is not given.",
+        "complexity": "O(k * n), k being the number of hash functions and n the number of items.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "capacity",
+                "type": "integer",
+                "token": "CAPACITY",
+                "optional": true
+            },
+            {
+                "name": "error",
+                "type": "double",
+                "token": "ERROR",
+                "optional": true
+            },
+            {
+                "name": "expansion",
+                "type": "integer",
+                "token": "EXPANSION",
+                "optional": true
+            },
+            {
+                "name": "nocreate",
+                "type": "pure-token",
+                "token": "NOCREATE",
+                "optional": true
+            },
+            {
+                "name": "nonscaling",
+                "type": "pure-token",
+                "token": "NONSCALING",
+                "optional": true
+            },
+            {
+                "name": "items",
+                "type": "pure-token",
+                "token": "ITEMS"
+            },
+            {
+                "name": "item",
+                "type": "string",
+                "multiple": true
+            }
+        ]
+    },
+    "BF.LOADCHUNK": {
+        "summary": "Restores a part of a Bloom filter that BF.SCANDUMP gave.",
+        "complexity": "O(n), n being the size of the chunk.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "iterator",
+                "type": "integer"
+            },
+            {
+                "name": "data",
+                "type": "string"
+            }
+        ]
+    },
+    "BF.MADD": {
+        "summary": "Adds items to a Bloom filter, making the filter if the key is missing.",
+        "complexity": "O(k * n), k being the number of hash functions and n the number of items.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "item",
+                "type": "string",
+                "multiple": true
+            }
+        ]
+    },
+    "BF.MEXISTS": {
+        "summary": "Tells for each item whether it may have been added to a Bloom filter.",
+        "complexity": "O(k * n), k being the number of hash functions and n the number of items.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "item",
+                "type": "string",
+                "multiple": true
+            }
+        ]
+    },
+    "BF.RESERVE": {
+        "summary": "Makes an empty Bloom filter for a capacity and an error rate.",
+        "complexity": "O(1)",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "error_rate",
+                "type": "double"
+            },
+            {
+                "name": "capacity",
+                "type": "integer"
+            },
+            {
+                "name": "expansion",
+                "type": "integer",
+                "token": "EXPANSION",
+                "optional": true
+            },
+            {
+                "name": "nonscaling",
+                "type": "pure-token",
+                "token": "NONSCALING",
+                "optional": true
+            }
+        ]
+    },
+    "BF.SCANDUMP": {
+        "summary": "Returns the next part of a Bloom filter, to save it or move it with BF.LOADCHUNK.",
+        "complexity": "O(n), n being the size of the chunk.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "iterator",
+                "type": "integer"
+            }
+        ]
+    },
     "BLMOVEM": {
         "summary": "Moves several elements from one list to another, waiting until the source has them.",
         "complexity": "O(N), N being how many elements move.",

@@ -359,6 +359,7 @@ is still written as before):
 |---|---|
 | stream, tag 13 | the stream as before, plus its idempotent-production state (`XADD … IDMP`): per producer, the remembered ids and the entries they map to, and the stream's `IDMP-DURATION` / `IDMP-MAXSIZE` |
 | time series, tag 14 | the series as before, plus its duplicate policy and its compaction rules |
+| probabilistic value, tag 40 | a kind (1: Bloom filter), the version of that kind's encoding, then the value: a Bloom filter's parameters and each layer's bytes |
 | alias section (`KIVIAL1\0`) | `FT.ALIASADD` aliases, so that they survive a restart |
 | field options section (`KIVIFO1\0`) | each index's `STOPWORDS` and each field's options (`AS`, `SORTABLE`, `WEIGHT`, `SEPARATOR`, `CASESENSITIVE`, …), as the words `FT.CREATE` takes |
 | synonyms and dictionaries section (`KIVISD1\0`) | each index's synonym groups (`FT.SYNUPDATE`) and every dictionary (`FT.DICTADD`) |

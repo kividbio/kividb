@@ -7,6 +7,33 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Bloom filters (`BF.*`), as Redis 8 has them built in (1.3.0; part of
+  #453).** `BF.RESERVE`, `BF.ADD`, `BF.MADD`, `BF.INSERT`, `BF.EXISTS`,
+  `BF.MEXISTS`, `BF.INFO`, `BF.CARD`, `BF.SCANDUMP`, `BF.LOADCHUNK` and
+  `BF.DEBUG`, and the `bf-error-rate`, `bf-initial-size` and
+  `bf-expansion-factor` settings. Replies and errors are Redis 8.10's, byte
+  for byte, in RESP2 and RESP3, quirks included (`BF.EXISTS` answers 0 for
+  a key of another type; `BF.MADD` stops at an item a full filter cannot
+  take). A filter is laid out bit for bit as Redis lays it out, so filters
+  moved from Redis answer as they did there: RDB files and full syncs from
+  Redis 8 and Redis Stack 6.2 to 7.4, `RESTORE` and `MIGRATE` of Redis's
+  `DUMP` payloads, and `BF.SCANDUMP` chunks. `DUMP` writes Redis's format,
+  which every Redis since 6.0 restores. A filter a command made for want of
+  one goes to replicas and the AOF as a `BF.INSERT` naming how it was made,
+  so a replica with other settings makes the same filter. `COPY` copies a
+  filter (Redis refuses), and, as in Redis, no `BF.*` command sends a
+  keyspace event. `MODULE LIST` reports Redis 8's `bf` module, and `ACL`
+  has the `@bloom` category. Snapshots keep filters under a new record
+  (tag 40), so a snapshot with a Bloom filter in it cannot be read by an
+  earlier release. Cuckoo filters, Count-min sketches, Top-K and t-digests
+  follow.
+- **RDB files from Redis Stack 6.2 load.** Redis Stack 6.2 writes
+  RedisGraph's module data (`graphdata`) into every RDB file, with or
+  without graphs, and KiviDB refused the whole file. It is now read past, as
+  the search module's is; a graph itself is still refused.
+
 ### Changed
 
 - **Source archives are small again.** The tarball GitHub makes of the

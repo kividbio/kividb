@@ -724,6 +724,45 @@ Used by `TS.QUERYINDEX`, `TS.MGET`, `TS.MRANGE`, `TS.MREVRANGE`:
 
 ---
 
+## Bloom filter commands (BF.*)
+
+Scalable Bloom filters, as Redis 8 has them built in (formerly RedisBloom).
+Replies and errors are Redis 8.10's, in RESP2 and RESP3. A filter is laid out
+as Redis lays it out, so one moved from Redis (an RDB file, a full sync from a
+Redis master, `RESTORE`/`MIGRATE`, `BF.LOADCHUNK`) answers as it did there, and
+`BF.SCANDUMP` and `DUMP` give what Redis can load. `TYPE` is `MBbloom--`.
+
+| Command | Syntax | Notes |
+|---------|--------|-------|
+| `BF.RESERVE` | `BF.RESERVE key error_rate capacity [EXPANSION expansion] [NONSCALING]` | Make an empty filter. Error rate in (0, 1), taken as 0.25 when above it; capacity 1 to 2^30; expansion 0 to 32768, where 0 makes a filter that does not scale |
+| `BF.ADD` | `BF.ADD key item` | `1` if the item was new, `0` if it may have been there (`#t`/`#f` in RESP3). Makes the filter with the `bf-*` settings if the key is missing |
+| `BF.MADD` | `BF.MADD key item [item ...]` | One reply per item. At an item a full non-scaling filter cannot take, the reply ends with that item's error |
+| `BF.INSERT` | `BF.INSERT key [CAPACITY capacity] [ERROR error] [EXPANSION expansion] [NOCREATE] [NONSCALING] ITEMS item [item ...]` | `BF.MADD` that makes the filter with these parameters; `NOCREATE` refuses a missing key (`ERR not found`) |
+| `BF.EXISTS` | `BF.EXISTS key item` | `0` for a missing key, and for a key of another type, as in Redis |
+| `BF.MEXISTS` | `BF.MEXISTS key item [item ...]` | One reply per item |
+| `BF.INFO` | `BF.INFO key [CAPACITY \| SIZE \| FILTERS \| ITEMS \| EXPANSION]` | `Size` is Redis's reckoning of a filter's size; `MEMORY USAGE` gives what it takes here |
+| `BF.CARD` | `BF.CARD key` | Items added; `0` for a missing key |
+| `BF.SCANDUMP` | `BF.SCANDUMP key iterator` | Iterator 0 gives the header, then chunks of at most 16 MB; `[0, ""]` is the end |
+| `BF.LOADCHUNK` | `BF.LOADCHUNK key iterator data` | Restore, in order, the chunks `BF.SCANDUMP` gave (from KiviDB or Redis) |
+| `BF.DEBUG` | `BF.DEBUG key` | Each layer's bytes, bits, hashes, capacity, items and error rate |
+
+Settings (`CONFIG SET`, the config file): `bf-error-rate` (0.01),
+`bf-initial-size` (100) and `bf-expansion-factor` (2) are what `BF.ADD`,
+`BF.MADD` and `BF.INSERT` make a missing filter with. Such a filter is sent to
+replicas and the AOF as a `BF.INSERT` naming them, so a replica or a replay with
+other settings makes the same filter.
+
+### Differences from Redis
+
+- `COPY` copies a filter; Redis refuses it.
+- A filter made before RedisBloom 2.0 (32-bit hashes) is not loaded, and a
+  layer larger than 64 GB, or than what is left under `maxmemory`, is refused
+  (`ERR filter is too large`, or `OOM ...`) where Redis would try to allocate it.
+- `DUMP` payloads carry RDB version 9, so that every Redis since 6.0 can
+  `RESTORE` them; the value is as Redis 8.10 writes it.
+
+---
+
 ## Pub/Sub commands
 
 KiviDB implements the full Redis Pub/Sub command surface including regular channels, glob-pattern subscriptions, and Redis 7.0 shard channels. Every subscribed connection has one queue: a publish appends to the queue of each subscriber, and the connection's own task writes it out. A subscriber therefore sees messages in the order they were published, across all of its channels and patterns, and none is ever dropped from the middle — a subscriber that falls more than 32 MB behind, or stays more than 8 MB behind for 60 seconds, is disconnected instead (Redis's `client-output-buffer-limit pubsub 32mb 8mb 60`). A publish with no subscribers takes no lock.

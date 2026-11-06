@@ -57,7 +57,7 @@ The ones that behave differently:
 | `appendfsync` | Only `everysec`. `always` and `no` are accepted with a warning. |
 | `dbfilename`, `appendfilename` | Fixed: `dump.kdb` and `appendonly.aof`. KiviDB reads a Redis `dump.rdb` if there is no `dump.kdb`. |
 | `client-output-buffer-limit` | Not supported: remove it. Pub/Sub subscribers get Redis's default limits. |
-| `loadmodule` | Not supported: remove it. Search (`FT.*`), JSON, time series (`TS.*`) and vector sets are built in. |
+| `loadmodule` | Not supported: remove it. Search (`FT.*`), JSON, time series (`TS.*`), vector sets and Bloom filters (`BF.*`) are built in. |
 | Sentinel | No Sentinel. Use replication with your own failover, or cluster mode (`--cluster-enabled yes`), which fails over by itself. |
 
 Run `kividb --help` for the command-line flags.
@@ -91,9 +91,15 @@ What the RDB reader takes from Redis:
 - **Search index definitions and dictionaries are not loaded.** KiviDB keeps
   its own indexes. Run `FT.CREATE` (and `FT.DICTADD`) again after the move;
   `FT.CREATE` indexes the keys that are already there.
-- **Other module data** (time series, vector sets, Bloom filters, and so on)
-  is refused, and so is the whole file: KiviDB won't load part of a
-  snapshot. Move those keys with `MIGRATE` instead, or recreate them.
+- **Bloom filters** load, and answer as they did on Redis: those of
+  RedisBloom 2.4 and later (Redis Stack 6.2 to 7.4, Redis Cloud and other
+  services built on them, Redis 8). So do `RESTORE` and `MIGRATE` of them,
+  and `BF.SCANDUMP` chunks taken on Redis can be loaded with `BF.LOADCHUNK`.
+  The `bf-*` settings carry over in the config file.
+- **Other module data** (time series, vector sets, Cuckoo filters,
+  Count-min sketches, Top-K, t-digests) is refused, and so is the whole
+  file: KiviDB won't load part of a snapshot. Move those keys with `MIGRATE`
+  instead, or recreate them.
 - **HyperLogLogs** load and count as they did on Redis. Set
   `hll-write-format redis` on KiviDB before you switch over: by default it
   writes new HyperLogLogs in its own format, and `PFMERGE` or a multi-key
