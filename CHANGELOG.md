@@ -612,6 +612,41 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   members instead of O(N). An empty range costs O(log N)
   ([#408](https://github.com/kividbio/kividb/issues/408),
   by [@Parikalp-Bhardwaj](https://github.com/Parikalp-Bhardwaj)).
+- **Data from Dragonfly and KeyDB loads whole, or is refused by name.**
+  - Dragonfly's hashes with field TTLs (`HSETEX`, `FIELDEXPIRE`, RDB type
+    22, or 31 from older versions) refused the whole RDB file or `RESTORE`
+    with `unsupported RDB type 22`. They now load with their field TTLs, and
+    its JSON documents (type 30) load as JSON. A key Dragonfly kept from
+    eviction (`STICK`) loads as any other, with a warning.
+  - KeyDB's `EXPIREMEMBER` TTLs were dropped without a word, so fields and
+    members KeyDB was going to delete were kept for ever. A hash field's
+    TTL now loads as the field's TTL. KiviDB keeps no TTLs for set or
+    sorted-set members, so a set or sorted set with one now refuses the
+    file, naming the key, as does Dragonfly's `SADDEX`.
+  - `RESTORE` of a KeyDB `DUMP` payload answered `Bad data format`, because
+    of the version stamp (`mvcc-tstamp`) KeyDB puts after the value. It is
+    now read past.
+  - As a replica of a KeyDB primary in active replication, KiviDB took
+    `RREPLAY`, the wrapper around every write, for an unknown command: after
+    the full sync each write was refused while the link showed as up. The
+    link now ends at the first `RREPLAY`, saying that KeyDB active
+    replication is not supported: migrate from such a primary by its RDB
+    file or with `MIGRATE`. `EXPIREMEMBER` in the stream of a plain KeyDB
+    primary applies a hash field's TTL; on a set or sorted-set member it
+    ends the link too, and the full sync that follows refuses the dataset,
+    naming the key. Either way the reason is in the log and in `INFO
+    replication` (`replica_last_sync_refusal`), and the replica asks again
+    after a minute, then less often up to every ten minutes, since each try
+    is a full sync of the same data on the primary. A full sync that is cut
+    short or doesn't read is retried each second, as before.
+  - Dragonfly's probabilistic types (Bloom, Cuckoo, count-min, top-k), a key
+    with memcached flags, a KeyDB cron job, and Dragonfly's compressed blocks
+    are refused by name. For compressed blocks, the error says to save with
+    `--compression_mode=0`.
+
+  Checked against the dragonflydb/dragonfly v2.1 and eqalpha/keydb 6.3.4
+  images, key by key, by file and by `RESTORE`, and as a replica of a
+  plain KeyDB primary through a full sync and a stream of writes (#452).
 
 ## [1.2.0] - 2026-11-03
 

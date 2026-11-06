@@ -17,6 +17,8 @@ use std::sync::Arc;
 
 mod rdb_dialect;
 pub use rdb_dialect::is_rdb_header;
+mod rdb_extensions;
+pub use rdb_extensions::is_unrepresentable;
 
 /// Returned by `load_snapshot` — key-value data plus any index schemas that
 /// were embedded in the snapshot file.
@@ -2490,6 +2492,15 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
     let mut header = [0u8; 9];
     r.read_exact(&mut header)?;
     let dialect = rdb_dialect::from_header(&header)?;
+    // Dragonfly and KeyDB write RDB 9, with types and opcodes past Redis
+    // 6.2's (see `rdb_extensions`).
+    let version: u16 = match dialect {
+        rdb_dialect::Dialect::Valkey => rdb_dialect::VALKEY_RDB_VERSION,
+        rdb_dialect::Dialect::Redis => std::str::from_utf8(&header[5..])
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+    };
 
     let mut result: Vec<HashMap<String, KiviDBValue>> = (0..16).map(|_| HashMap::new()).collect();
     let mut expiries: ExpiryMaps = (0..16).map(|_| HashMap::new()).collect();
@@ -2502,6 +2513,12 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
     let mut warned_search = false;
     // Each function library's code, in the order the file has them.
     let mut libraries = Vec::new();
+    // The key read last, while it is there: KeyDB writes the TTLs it gave
+    // the key's members after it.
+    let mut last_key: Option<(usize, String)> = None;
+    let mut keydb_member: Option<Vec<u8>> = None;
+    // Keys Dragonfly kept from eviction (`STICK`), which load as any other.
+    let mut sticky = 0usize;
 
     loop {
         let mut type_byte = [0u8];
@@ -2509,9 +2526,31 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
 
         match type_byte[0] {
             0xFA => {
-                // Aux field — key/value metadata, just skip both strings
-                let _key = rdb_read_string(&mut r)?;
-                let _val = rdb_read_string(&mut r)?;
+                // Aux field: metadata, skipped, but for KeyDB's member TTLs
+                // (`EXPIREMEMBER`), which follow their key.
+                let aux_key = rdb_read_string(&mut r)?;
+                let aux_val = rdb_read_string(&mut r)?;
+                match aux_key.as_slice() {
+                    b"keydb-subexpire-key" => keydb_member = Some(aux_val),
+                    b"keydb-subexpire-when" => {
+                        let member = keydb_member
+                            .take()
+                            .ok_or_else(|| rdb_invalid("a KeyDB member TTL without its member"))?;
+                        // A key dropped as past its time takes its members'
+                        // TTLs with it.
+                        if let Some((db, key)) = last_key.clone()
+                            && let Some(value) = result[db].get_mut(&key)
+                            && rdb_extensions::apply_keydb_subexpiry(
+                                value, &key, &member, &aux_val,
+                            )? == rdb_extensions::SubExpiry::Emptied
+                        {
+                            result[db].remove(&key);
+                            expiries[db].remove(&key);
+                            last_key = None;
+                        }
+                    }
+                    _ => {}
+                }
             }
             0xFE => {
                 // Database selector
@@ -2569,6 +2608,15 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
             0xF3 if dialect == rdb_dialect::Dialect::Valkey => {
                 return Err(rdb_dialect::refuse_slot_import(&mut r));
             }
+            // Dragonfly's RDB_OPCODE_DF_MASK: the next key's flags.
+            0xDC if version <= 11 => {
+                if rdb_extensions::read_dragonfly_mask(&mut r)? {
+                    sticky += 1;
+                }
+            }
+            opcode if rdb_extensions::is_dragonfly_opcode(version, opcode) => {
+                return Err(rdb_extensions::refuse_dragonfly_opcode(opcode));
+            }
             // A function library (`FUNCTION2`): its code.
             0xF5 => libraries.push(rdb_read_string(&mut r)?),
             // Every other opcode from 0xF0 up is refused by what it is, not
@@ -2588,20 +2636,30 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
                 let key_bytes = rdb_read_string(&mut r)?;
                 let key = String::from_utf8_lossy(&key_bytes).into_owned();
                 let expiry_ms = pending_expiry.take();
-                if let Some(val) = rdb_dialect::read_value(&mut r, type_id, dialect)? {
+                let value = if rdb_extensions::is_dragonfly_type(version, type_id) {
+                    rdb_extensions::read_dragonfly_value(&mut r, Some(&key), type_id)?
+                } else if type_id == 64 && version <= 11 {
+                    return Err(rdb_extensions::refuse_keydb_cron(&key));
+                } else {
+                    rdb_dialect::read_value(&mut r, type_id, dialect)?
+                };
+                last_key = None;
+                if let Some(val) = value {
                     match expiry_ms {
                         // Already past its expiry: dropped. Not by a replica,
                         // or under an AOF (see `load_snapshot_from`).
                         Some(ms) if ms <= now_ms && !crate::expiry::held() => {}
                         Some(ms) => {
                             expiries[current_db].insert(key.clone(), ms);
-                            result[current_db].insert(key, val);
+                            result[current_db].insert(key.clone(), val);
+                            last_key = Some((current_db, key));
                         }
                         None => {
                             // A plain entry replaces any earlier one for this
                             // key, including that entry's expiry.
                             expiries[current_db].remove(&key);
-                            result[current_db].insert(key, val);
+                            result[current_db].insert(key.clone(), val);
+                            last_key = Some((current_db, key));
                         }
                     }
                 }
@@ -2609,6 +2667,12 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
         }
     }
 
+    if sticky > 0 {
+        log_warn!(
+            "RDB: {sticky} keys were sticky in Dragonfly (STICK, never evicted): KiviDB has no \
+             such flag, and they load as any other key"
+        );
+    }
     Ok((result, expiries, redis_function_dump(&libraries)))
 }
 
@@ -4305,7 +4369,7 @@ pub fn restore_payload_checked(payload: &[u8]) -> Result<KiviDBValue, RestoreErr
     if let Some(dialect) = rdb_dialect::of_dump_version(version)
         && sealed
     {
-        return restore_redis_payload(data, dialect).ok_or(RestoreError::BadData);
+        return restore_redis_payload(data, dialect, version).ok_or(RestoreError::BadData);
     }
     Err(RestoreError::VersionOrChecksum)
 }
@@ -4334,9 +4398,22 @@ pub fn redis_crc64(data: &[u8]) -> u64 {
 /// A value as Redis's or Valkey's `DUMP` serialises it: its RDB type, then
 /// the value in the RDB encoding of that type, which the `dump.rdb` loader
 /// reads. Every byte must belong to the value.
-fn restore_redis_payload(data: &[u8], dialect: rdb_dialect::Dialect) -> Option<KiviDBValue> {
+///
+/// Dragonfly's payloads may hold its own types (`rdb_extensions`), and
+/// KeyDB's end with an `mvcc-tstamp` aux field after the value, which is
+/// read past: it is KeyDB's version of the value for its active replication.
+fn restore_redis_payload(
+    data: &[u8],
+    dialect: rdb_dialect::Dialect,
+    version: u16,
+) -> Option<KiviDBValue> {
     let (&type_id, mut rest) = data.split_first()?;
-    let value = rdb_dialect::read_value(&mut rest, type_id, dialect).ok()??;
+    let value = if rdb_extensions::is_dragonfly_type(version, type_id) {
+        rdb_extensions::read_dragonfly_value(&mut rest, None, type_id).ok()??
+    } else {
+        rdb_dialect::read_value(&mut rest, type_id, dialect).ok()??
+    };
+    let rest = rdb_extensions::strip_keydb_mvcc(rest)?;
     rest.is_empty().then_some(value)
 }
 
