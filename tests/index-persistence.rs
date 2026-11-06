@@ -3381,3 +3381,151 @@ fn hnsw_writes_after_a_full_sync_survive_a_replica_kill() {
     let _ = std::fs::remove_dir_all(&mdir);
     let _ = std::fs::remove_dir_all(&rdir);
 }
+
+/// A JSON document's numbers come back exactly from the AOF and from a
+/// checkpoint's `dump.kdb`, and a NUMERIC index on them holds the same
+/// doubles after each restart (#445).
+#[test]
+fn json_numbers_survive_aof_and_checkpoint_restarts_exactly() {
+    let _serial = persist_serial();
+    let dir = temp_dir("json_numbers_445");
+
+    // Finite doubles of every exponent, and ordinary ones; shortest
+    // round-trip text, half with an exponent.
+    let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+    let mut doubles = Vec::new();
+    while doubles.len() < 2000 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let d = if doubles.len() % 2 == 0 {
+            f64::from_bits(state)
+        } else {
+            (state >> 11) as f64 / (1u64 << 53) as f64 * 2e6 - 1e6
+        };
+        if d.is_finite() {
+            doubles.push(d);
+        }
+    }
+    let text = |chunk: &[f64]| {
+        let items: Vec<String> = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                if i % 2 == 0 {
+                    format!("{d:?}")
+                } else {
+                    format!("{d:e}")
+                }
+            })
+            .collect();
+        format!("[{}]", items.join(","))
+    };
+    let check = |port: u16, when: &str| {
+        let mut c = Conn::connect(port);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while c
+            .cmds(&["FT.SEARCH", "idx:jn", "@v:[13 14]", "NOCONTENT"])
+            .as_array()[0]
+            .as_int()
+            != 1
+        {
+            assert!(Instant::now() < deadline, "{when}: jv:1 is not indexed");
+            thread::sleep(Duration::from_millis(50));
+        }
+        for (i, chunk) in doubles.chunks(100).enumerate() {
+            let got = c.cmds(&["JSON.GET", &format!("jn:{i}")]);
+            let got: Vec<f64> = got
+                .as_str()
+                .trim_matches(|c| c == '[' || c == ']')
+                .split(',')
+                .map(|n| n.parse().unwrap())
+                .collect();
+            let changed = chunk
+                .iter()
+                .zip(&got)
+                .filter(|(w, g)| w.to_bits() != g.to_bits())
+                .count();
+            assert_eq!(changed, 0, "{when}: jn:{i} changed {changed} numbers");
+        }
+        let mut search = |query: &str| {
+            c.cmds(&["FT.SEARCH", "idx:jn", query, "NOCONTENT"])
+                .as_array()[0]
+                .as_int()
+        };
+        assert_eq!(
+            search("@v:[13.326500000000001 13.326500000000001]"),
+            1,
+            "{when}"
+        );
+        assert_eq!(search("@v:[13.3265 13.3265]"), 0, "{when}");
+    };
+
+    let port = free_port();
+    let mut srv = start_aof_server(port, &dir, &[]);
+    assert!(wait_for_server(port, Duration::from_secs(10)), "start");
+    {
+        let mut c = Conn::connect(port);
+        assert!(
+            c.cmds(&[
+                "FT.CREATE",
+                "idx:jn",
+                "ON",
+                "JSON",
+                "PREFIX",
+                "1",
+                "jv:",
+                "SCHEMA",
+                "$.v",
+                "AS",
+                "v",
+                "NUMERIC",
+            ])
+            .is_ok()
+        );
+        assert!(
+            c.cmds(&["JSON.SET", "jv:1", "$", r#"{"v":13.326500000000001}"#])
+                .is_ok()
+        );
+        for (i, chunk) in doubles.chunks(100).enumerate() {
+            assert!(
+                c.cmds(&["JSON.SET", &format!("jn:{i}"), "$", &text(chunk)])
+                    .is_ok()
+            );
+        }
+    }
+    check(port, "before a restart");
+    // The once-a-second AOF sync.
+    thread::sleep(Duration::from_millis(1_500));
+    kill_server(&mut srv);
+
+    // Replayed from the AOF.
+    let port = free_port();
+    let mut srv = start_aof_server(port, &dir, &[]);
+    assert!(wait_for_server(port, Duration::from_secs(10)), "restart");
+    check(port, "replayed from the AOF");
+
+    // Loaded from the checkpoint's dump.kdb.
+    let mut c = Conn::connect(port);
+    assert!(!c.cmds(&["BGREWRITEAOF"]).is_error());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while c
+        .cmds(&["INFO", "persistence"])
+        .as_str()
+        .contains("aof_rewrite_in_progress:1")
+    {
+        assert!(Instant::now() < deadline, "the rewrite did not finish");
+        thread::sleep(Duration::from_millis(50));
+    }
+    thread::sleep(Duration::from_millis(500));
+    kill_server(&mut srv);
+    assert!(dir.join("dump.kdb").exists());
+    let port = free_port();
+    let mut srv = start_aof_server(port, &dir, &[]);
+    assert!(wait_for_server(port, Duration::from_secs(10)), "restart");
+    check(port, "loaded from dump.kdb");
+
+    send_shutdown_nosave(port);
+    let _ = wait_for_exit(&mut srv, Duration::from_secs(8));
+    let _ = std::fs::remove_dir_all(&dir);
+}

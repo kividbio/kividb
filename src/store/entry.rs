@@ -367,14 +367,6 @@ impl Entry {
         unsafe { std::slice::from_raw_parts(self.base().add(key_at(klen, self.has_ttl())), klen) }
     }
 
-    /// The key, as the `&str` it was made from.
-    #[inline]
-    pub(super) fn key_str<'a>(self) -> &'a str {
-        // SAFETY: every key is made from a `&str` (`ShardMap::insert` and
-        // friends take one).
-        unsafe { std::str::from_utf8_unchecked(self.key()) }
-    }
-
     /// The value, for as long as the entry lives.
     #[inline(always)]
     pub(super) fn value<'a>(self) -> ValueRef<'a> {
@@ -832,8 +824,8 @@ impl EntryRef {
         EntryRef(entry)
     }
 
-    pub fn key(&self) -> &str {
-        self.0.key_str()
+    pub fn key(&self) -> &[u8] {
+        self.0.key()
     }
 
     pub fn value(&self) -> ValueRef<'_> {
@@ -878,8 +870,8 @@ impl Taken {
         Taken(entry)
     }
 
-    pub fn key(&self) -> &str {
-        self.0.key_str()
+    pub fn key(&self) -> &[u8] {
+        self.0.key()
     }
 
     pub fn value(&self) -> ValueRef<'_> {
