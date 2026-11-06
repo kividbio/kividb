@@ -29,6 +29,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A search index is seen only from its own database.** `FT._LIST`
+  listed the indexes of every database, and the commands that name an
+  index found one of another database: from database 1, `FT.SEARCH`
+  searched database 0's index, and `FT.DROPINDEX` dropped it. `FT._LIST`
+  now lists the selected database's indexes, and from another database an
+  index, or an alias of one, is not there: `FT.INFO`, `FT.SEARCH`,
+  `FT.AGGREGATE`, `FT.DROPINDEX`, `FT.ALTER`, `FT.ALIASADD` and the other
+  commands that name one reply `Index not found`, and `FT.ALIASDEL`
+  replies `Alias does not exist`. Index names are still one namespace
+  for all databases: `FT.CREATE` of a name another database has is still
+  refused with `Index already exists` (#447).
+
 - **A Lua script's `false` is a RESP3 null to a RESP3 client (#431).** A
   script's `false`, which is also what `redis.call` gives back for a nil
   reply (a `GET` of a missing key), was sent as RESP2's `$-1` to a client

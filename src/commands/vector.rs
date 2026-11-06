@@ -26,9 +26,46 @@ fn takes_index_name(name: &str) -> bool {
     )
 }
 
+/// Where `name`, a command that names an index or an alias of one, has it:
+/// for most, its first argument; `FT.ALIASADD` and `FT.ALIASUPDATE` name the
+/// index second, and `FT.CURSOR` after its subcommand.
+fn index_name_position(name: &str) -> Option<usize> {
+    match name {
+        "FT.ALIASADD" | "FT.ALIASUPDATE" | "FT.CURSOR" => Some(2),
+        "FT.ALIASDEL" => Some(1),
+        _ if takes_index_name(name) => Some(1),
+        _ => None,
+    }
+}
+
+/// Whether the index or alias `given` is one of another database than the
+/// selected one. An index is its database's: from any other, it is not
+/// there (#447). (Redis has indexes in database 0 only: `FT.CREATE` in any
+/// other is refused, and every database sees database 0's.)
+fn in_another_database(ctx: &Ctx, given: &[u8]) -> bool {
+    let Ok(given) = std::str::from_utf8(given) else {
+        return false;
+    };
+    ctx.index_store
+        .read()
+        .get(given)
+        .is_some_and(|def| def.db_index != *ctx.selected_db)
+}
+
 pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
     if !name.starts_with("FT.") {
         return None;
+    }
+    // An index, or an alias, of another database is not there.
+    if let Some(given) = index_name_position(name).and_then(|at| ctx.cmd.get(at).copied())
+        && in_another_database(ctx, given)
+    {
+        let given = String::from_utf8_lossy(given);
+        return Some(resp_error(&if name == "FT.ALIASDEL" {
+            "ERR Alias does not exist".to_string()
+        } else {
+            crate::commands::search::no_such_index(&given)
+        }));
     }
     // An alias is resolved here, once, for every command that takes an index
     // name: the handler then runs against the real index and never sees the
@@ -94,10 +131,12 @@ fn dispatch(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
 fn ft_list(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let store = ctx.index_store.read();
-    // Indexes, not the aliases that point at them.
+    // The selected database's indexes, not the aliases that point at them.
+    // Those of every database used to be listed (#447).
+    let db = *ctx.selected_db;
     let items: Vec<Vec<u8>> = store
         .iter()
-        .filter(|(key, def)| !crate::vector::is_alias(key, def))
+        .filter(|(key, def)| !crate::vector::is_alias(key, def) && def.db_index == db)
         .map(|(key, _)| resp_bulk_str(key))
         .collect();
     Some(resp_array(items))
