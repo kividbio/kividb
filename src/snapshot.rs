@@ -2900,7 +2900,7 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
     let mut libraries = Vec::new();
     // The key read last, while it is there: KeyDB writes the TTLs it gave
     // the key's members after it.
-    let mut last_key: Option<(usize, String)> = None;
+    let mut last_key: Option<(usize, Key)> = None;
     let mut keydb_member: Option<Vec<u8>> = None;
     // Keys Dragonfly kept from eviction (`STICK`), which load as any other.
     let mut sticky = 0usize;
@@ -2940,7 +2940,10 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
                         if let Some((db, key)) = last_key.clone()
                             && let Some(value) = result[db].get_mut(&key)
                             && rdb_extensions::apply_keydb_subexpiry(
-                                value, &key, &member, &aux_val,
+                                value,
+                                &crate::key_bytes::text_of(key.as_ref()),
+                                &member,
+                                &aux_val,
                             )? == rdb_extensions::SubExpiry::Emptied
                         {
                             result[db].remove(&key);
@@ -3057,9 +3060,12 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
                 let key = Key::from(key_bytes);
                 let expiry_ms = pending_expiry.take();
                 let value = if rdb_extensions::is_dragonfly_type(version, type_id) {
-                    rdb_extensions::read_dragonfly_value(&mut r, Some(&key), type_id)?
+                    let name = crate::key_bytes::text_of(key.as_ref());
+                    rdb_extensions::read_dragonfly_value(&mut r, Some(&name), type_id)?
                 } else if type_id == 64 && version <= 11 {
-                    return Err(rdb_extensions::refuse_keydb_cron(&key));
+                    return Err(rdb_extensions::refuse_keydb_cron(
+                        &crate::key_bytes::text_of(key.as_ref()),
+                    ));
                 } else {
                     rdb_dialect::read_value(&mut r, type_id, dialect)?
                 };
