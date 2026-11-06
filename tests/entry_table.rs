@@ -110,7 +110,7 @@ fn strings_of_every_shape_read_back() {
                 k.len(),
                 v.len()
             );
-            let found = map.keys().filter(|key| *key == k.as_str()).count();
+            let found = map.keys().filter(|key| *key == k.as_bytes()).count();
             assert_eq!(found, 1);
         }
         let mut seen = 0;
@@ -124,7 +124,7 @@ fn strings_of_every_shape_read_back() {
         // map.
         for (k, v) in want.iter().step_by(2) {
             let taken = map.remove(k).expect("there");
-            assert_eq!(taken.key(), k);
+            assert_eq!(taken.key(), k.as_bytes());
             match taken.into_value() {
                 KiviDBValue::String(b) => assert_eq!(&b[..], &v[..]),
                 _ => panic!("not a string"),
@@ -191,7 +191,7 @@ fn a_held_entry_outlives_its_key() {
         // changed.
         drop(map.insert_str("k", b"new"));
         assert!(!map.holds("k", &held));
-        assert_eq!(held.key(), "k");
+        assert_eq!(held.key(), b"k");
         assert!(matches!(held.value(), ValueRef::String(b) if b.as_bytes() == &v[..]));
         // Gone from the table altogether, and from the map.
         drop(map.remove("k"));
@@ -218,7 +218,7 @@ fn holds_are_counted_across_threads() {
                     for i in 0..rounds {
                         let held = map.read().unwrap().get_ref("k");
                         if let Some(held) = held {
-                            assert_eq!(held.key(), "k");
+                            assert_eq!(held.key(), b"k");
                             if let ValueRef::String(b) = held.value() {
                                 assert_eq!(b.len(), 100);
                             }
@@ -671,7 +671,7 @@ fn touching_a_held_entry_changes_nothing_a_holder_reads() {
             let v = v.clone();
             thread::spawn(move || {
                 for _ in 0..rounds {
-                    assert_eq!(held.key(), "k");
+                    assert_eq!(held.key(), b"k");
                     assert!(matches!(held.value(), ValueRef::String(b) if b.as_bytes() == &v[..]));
                 }
             })

@@ -69,7 +69,6 @@ xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 # are compiled in, so it works in images without a CA bundle.
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 webpki-roots = "1"
-compact_str = "0.10.0"
 # Snowball stemmers for TEXT fields (`src/vector/stem.rs`), the algorithms
 # RediSearch stems with. MIT/BSD-3-Clause, no dependencies of its own.
 rust-stemmers = "=1.2.0"

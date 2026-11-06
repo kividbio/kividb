@@ -185,7 +185,7 @@ fn cmd_countkeysinslot(ctx: &Ctx) -> Vec<u8> {
     for shard in db.iter() {
         let map = crate::read_lock!(shard);
         for k in map.keys() {
-            if key_hash_slot(k.as_bytes()) == slot {
+            if key_hash_slot(k) == slot {
                 count += 1;
             }
         }
@@ -216,8 +216,8 @@ fn cmd_getkeysinslot(ctx: &Ctx) -> Vec<u8> {
     'outer: for shard in db.iter() {
         let map = crate::read_lock!(shard);
         for k in map.keys() {
-            if key_hash_slot(k.as_bytes()) == slot {
-                out.push(resp_bulk_str(k));
+            if key_hash_slot(k) == slot {
+                out.push(resp_bulk(k));
                 if out.len() >= count {
                     break 'outer;
                 }
@@ -1599,7 +1599,7 @@ fn slot_has_keys(ctx: &Ctx, slot: u16) -> bool {
     ctx.store[*ctx.selected_db].iter().any(|shard| {
         crate::read_lock!(shard)
             .keys()
-            .any(|k| key_hash_slot(k.as_bytes()) == slot)
+            .any(|k| key_hash_slot(k) == slot)
     })
 }
 
@@ -2475,7 +2475,7 @@ pub(crate) fn key_counts_per_slot(
     for shard in db.iter() {
         let map = crate::read_lock!(shard);
         for k in map.keys() {
-            let slot = key_hash_slot(k.as_bytes());
+            let slot = key_hash_slot(k);
             if owned[slot as usize] {
                 *counts.entry(slot).or_insert(0) += 1;
             }

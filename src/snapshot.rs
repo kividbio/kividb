@@ -581,10 +581,10 @@ pub fn write_kdb_db_end(w: &mut impl Write) -> io::Result<()> {
 /// One key/value pair — the key, a type tag, then the value's own encoding.
 pub fn write_kdb_entry(
     w: &mut impl Write,
-    key: &str,
+    key: &(impl AsRef<[u8]> + ?Sized),
     value: crate::store::ValueRef<'_>,
 ) -> io::Result<()> {
-    write_key(w, key.as_bytes())?;
+    write_key(w, key.as_ref())?;
     write_kdb_value(w, value)
 }
 
@@ -4367,7 +4367,7 @@ impl FrozenDataset {
             let mut timed = Vec::new();
             for part in std::mem::take(&mut db.strings) {
                 for entry in part {
-                    write_key(out, entry.key().as_bytes())?;
+                    write_key(out, entry.key())?;
                     out.write_all(&[TAG_STRING])?;
                     write_bytes(out, frozen_string(&entry))?;
                     if let Some(at) = entry.expires() {
