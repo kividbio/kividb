@@ -141,6 +141,7 @@ pub enum ValueRef<'a> {
     TimeSeries(&'a Arc<RwLock<TsInner>>),
     HashEx(&'a Arc<RwLock<HashInner>>),
     Array(&'a Arc<RwLock<ArrayInner>>),
+    Sketch(&'a Arc<RwLock<crate::sketch::Sketch>>),
 }
 
 impl<'a> From<&'a KiviDBValue> for ValueRef<'a> {
@@ -158,6 +159,7 @@ impl<'a> From<&'a KiviDBValue> for ValueRef<'a> {
             KiviDBValue::TimeSeries(v) => ValueRef::TimeSeries(v),
             KiviDBValue::HashEx(v) => ValueRef::HashEx(v),
             KiviDBValue::Array(v) => ValueRef::Array(v),
+            KiviDBValue::Sketch(v) => ValueRef::Sketch(v),
         }
     }
 }
@@ -188,6 +190,7 @@ impl ValueRef<'_> {
             ValueRef::TimeSeries(v) => KiviDBValue::TimeSeries(Arc::clone(v)),
             ValueRef::HashEx(v) => KiviDBValue::HashEx(Arc::clone(v)),
             ValueRef::Array(v) => KiviDBValue::Array(Arc::clone(v)),
+            ValueRef::Sketch(v) => KiviDBValue::Sketch(Arc::clone(v)),
         }
     }
 
@@ -209,7 +212,8 @@ impl ValueRef<'_> {
             | ValueRef::Json(_)
             | ValueRef::Stream(_)
             | ValueRef::TimeSeries(_)
-            | ValueRef::Array(_) => false,
+            | ValueRef::Array(_)
+            | ValueRef::Sketch(_) => false,
         }
     }
 
@@ -227,6 +231,7 @@ impl ValueRef<'_> {
             ValueRef::TimeSeries(_) => "TSDB-TYPE",
             ValueRef::HashEx(_) => "hash",
             ValueRef::Array(_) => "array",
+            ValueRef::Sketch(sketch) => sketch.read().type_name(),
         }
     }
 }

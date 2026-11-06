@@ -1085,7 +1085,10 @@ fn test_command_list_filterby_module_built_in() {
     assert!(names(&mut c, "timeseries").contains(&"ts.add".to_string()));
     let vset = names(&mut c, "vectorset");
     assert!(vset.contains(&"vadd".to_string()) && vset.contains(&"vsim".to_string()));
-    assert!(names(&mut c, "bf").is_empty());
+    // Redis 8's `bf` module: the probabilistic types.
+    let bf = names(&mut c, "bf");
+    assert!(bf.contains(&"bf.add".to_string()), "{bf:?}");
+    assert!(bf.iter().all(|n| n.starts_with("bf.")), "{bf:?}");
 }
 
 // COMMAND LIST FILTERBY ACLCAT returns commands in that category.

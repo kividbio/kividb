@@ -142,6 +142,7 @@ pub fn effort(value: &KiviDBValue) -> u64 {
         KiviDBValue::TimeSeries(series) => series.read().samples.len(),
         KiviDBValue::HashEx(hash) => hash.read().len(),
         KiviDBValue::Array(array) => array.read().count() as usize,
+        KiviDBValue::Sketch(sketch) => sketch.read().free_effort() as usize,
     };
     n as u64
 }

@@ -260,6 +260,14 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             // Per entry: 8-byte index key + value bytes + BTreeMap node share.
             key_overhead + len * (8 + avg + 32) + 100
         }
+
+        // What it takes: its structures and its bytes, all of them.
+        ValueRef::Sketch(arc) => {
+            key_overhead
+                + 16
+                + std::mem::size_of::<parking_lot::RwLock<crate::sketch::Sketch>>()
+                + arc.read().memory_bytes()
+        }
         ValueRef::HashEx(arc) => {
             let inner = arc.read();
             let len = inner.fields.len();

@@ -5,6 +5,46 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - Unreleased
+
+Kept apart from the 1.2.1 changes under [Unreleased] below: these ship in
+1.3.0.
+
+### Upgrading
+
+- **Upgrade replicas before their master.** A master sends `BF.*` commands
+  and, in a full sync, Bloom filters under a new snapshot record (tag 40);
+  a replica of an earlier release cannot apply either.
+- **No downgrade once a Bloom filter exists.** A snapshot or an AOF
+  checkpoint with a Bloom filter in it cannot be read by an earlier release.
+  Delete the filters (or move them off with `DUMP`, which Redis restores)
+  before going back.
+
+### Added
+
+- **Bloom filters (`BF.*`), as Redis 8 has them built in (part of #453).**
+  `BF.RESERVE`, `BF.ADD`, `BF.MADD`, `BF.INSERT`, `BF.EXISTS`, `BF.MEXISTS`, `BF.INFO`, `BF.CARD`, `BF.SCANDUMP`, `BF.LOADCHUNK` and
+  `BF.DEBUG`, and the `bf-error-rate`, `bf-initial-size` and
+  `bf-expansion-factor` settings. Replies and errors are Redis 8.10's, byte
+  for byte, in RESP2 and RESP3, quirks included (`BF.EXISTS` answers 0 for
+  a key of another type; `BF.MADD` stops at an item a full filter cannot
+  take). A filter is laid out bit for bit as Redis lays it out, so filters
+  moved from Redis answer as they did there: RDB files and full syncs from
+  Redis 8 and Redis Stack 6.2 to 7.4, `RESTORE` and `MIGRATE` of Redis's
+  `DUMP` payloads, and `BF.SCANDUMP` chunks. `DUMP` writes Redis's format,
+  which every Redis since 6.0 restores. A filter a command made for want of
+  one goes to replicas and the AOF as a `BF.INSERT` naming how it was made,
+  so a replica with other settings makes the same filter. `COPY` copies a
+  filter (Redis refuses), and, as in Redis, no `BF.*` command sends a
+  keyspace event. `MODULE LIST` reports Redis 8's `bf` module, and `ACL`
+  has the `@bloom` category. Snapshots keep filters under a new record
+  (tag 40), so a snapshot with a Bloom filter in it cannot be read by an
+  earlier release (see Upgrading). What a header, a snapshot, an RDB file
+  or a `DUMP` payload says about a filter is checked before it is used, and
+  a layer is at most 4 GiB: larger ones, and allocations the system
+  refuses, are errors, never an abort. Cuckoo filters, Count-min sketches,
+  Top-K and t-digests follow.
+
 ## [Unreleased]
 
 ### Added
@@ -42,7 +82,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   binary is built against. On an older system (Debian 11, Ubuntu 20.04,
   RHEL 8, Amazon Linux 2) the package manager now refuses them, rather than
   installing a server that cannot start.
-
 ### Changed
 
 - **Arities come from Valkey's BSD-licensed command data.**

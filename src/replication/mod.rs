@@ -3551,6 +3551,7 @@ pub fn is_write_command(name: &str) -> bool {
         6 => matches!(
             name,
             "APPEND"
+                | "BF.ADD"
                 | "ARMSET"
                 | "ARRING"
                 | "ARSEEK"
@@ -3587,7 +3588,8 @@ pub fn is_write_command(name: &str) -> bool {
         ),
         7 => matches!(
             name,
-            "FLUSHDB"
+            "BF.MADD"
+                | "FLUSHDB"
                 | "HEXPIRE"
                 | "HGETDEL"
                 | "HINCRBY"
@@ -3626,7 +3628,8 @@ pub fn is_write_command(name: &str) -> bool {
         ),
         9 => matches!(
             name,
-            "FT.CREATE"
+            "BF.INSERT"
+                | "FT.CREATE"
                 | "HEXPIREAT"
                 | "JSON.MSET"
                 | "PEXPIREAT"
@@ -3638,6 +3641,7 @@ pub fn is_write_command(name: &str) -> bool {
         10 => matches!(
             name,
             "ARDELRANGE"
+                | "BF.RESERVE"
                 | "BRPOPLPUSH"
                 | "FT.DICTADD"
                 | "FT.DICTDEL"
@@ -3667,7 +3671,7 @@ pub fn is_write_command(name: &str) -> bool {
         ),
         12 => matches!(
             name,
-            "FT.DROPINDEX" | "FT.SYNUPDATE" | "HINCRBYFLOAT" | "JSON.ARRTRIM"
+            "BF.LOADCHUNK" | "FT.DROPINDEX" | "FT.SYNUPDATE" | "HINCRBYFLOAT" | "JSON.ARRTRIM"
         ),
         13 => matches!(name, "TS.CREATERULE" | "TS.DELETERULE"),
         14 => matches!(
@@ -3700,6 +3704,11 @@ pub(crate) const WRITE_COMMANDS_FOR_TEST: &[&str] = &[
     "ARRING",
     "ARSEEK",
     "ARSET",
+    "BF.ADD",
+    "BF.INSERT",
+    "BF.LOADCHUNK",
+    "BF.MADD",
+    "BF.RESERVE",
     "BITFIELD",
     "BITOP",
     "BLMOVE",
@@ -3857,6 +3866,8 @@ pub(crate) const WRITE_COMMANDS_FOR_TEST: &[&str] = &[
 fn is_write_command_reference(name: &str) -> bool {
     matches!(
         name,
+        // Bloom filters
+        "BF.RESERVE" | "BF.ADD" | "BF.MADD" | "BF.INSERT" | "BF.LOADCHUNK" |
         // Strings
         "SET" | "SETNX" | "SETEX" | "PSETEX" | "MSET" | "MSETNX" | "GETSET" |
         "GETDEL" | "GETEX" | "APPEND" | "INCR" | "DECR" | "INCRBY" | "DECRBY" |

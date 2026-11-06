@@ -675,6 +675,24 @@ const HIMPORT_SET: &[&str] = &["HIMPORT"];
 const MEMORY_USAGE: &[&str] = &["MEMORY"];
 
 /// The commands that name keys, by how their keys are found.
+/// The probabilistic types' commands, each about the key after its name.
+/// A group of their own, last in [`COMMANDS`]: names added after the
+/// others take only slots no other name was in, so no other command's
+/// lookup changes.
+const SKETCHES: &[&str] = &[
+    "BF.RESERVE",
+    "BF.ADD",
+    "BF.MADD",
+    "BF.INSERT",
+    "BF.EXISTS",
+    "BF.MEXISTS",
+    "BF.INFO",
+    "BF.CARD",
+    "BF.SCANDUMP",
+    "BF.LOADCHUNK",
+    "BF.DEBUG",
+];
+
 const COMMANDS: &[(&[&str], Shape)] = &[
     (FIRST, Shape::First),
     (SOURCE_AND_DESTINATION, Shape::SourceAndDestination),
@@ -694,6 +712,7 @@ const COMMANDS: &[(&[&str], Shape)] = &[
     (AFTER_SUBCOMMAND, Shape::AfterSubcommand),
     (HIMPORT_SET, Shape::HimportSet),
     (MEMORY_USAGE, Shape::MemoryUsage),
+    (SKETCHES, Shape::First),
 ];
 
 /// [`COMMANDS`] by name: open addressing over [`SLOTS`] slots, built when
@@ -1046,6 +1065,9 @@ mod tests {
             | "ARSET" | "ARMSET" | "ARGET" | "ARMGET" | "ARGETRANGE" | "ARDEL" | "ARDELRANGE"
             | "ARLEN" | "ARCOUNT" | "ARINSERT" | "ARRING" | "ARNEXT" | "ARSEEK" | "ARSCAN"
             | "ARGREP" | "AROP" | "ARLASTITEMS" | "ARINFO"
+            // Bloom filters
+            | "BF.RESERVE" | "BF.ADD" | "BF.MADD" | "BF.INSERT" | "BF.EXISTS" | "BF.MEXISTS"
+            | "BF.INFO" | "BF.CARD" | "BF.SCANDUMP" | "BF.LOADCHUNK" | "BF.DEBUG"
             // Sharded pub/sub: the channel is hashed to a slot exactly like a key.
             | "SPUBLISH" => One(1),
 

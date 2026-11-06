@@ -776,6 +776,12 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
             w.write_all(&inner.next_insert.to_le_bytes())?;
             w.write_all(&inner.ring_size.unwrap_or(0).to_le_bytes())?;
         }
+
+        // The probabilistic types: their tag, then `sketch::write_kdb`.
+        ValueRef::Sketch(arc) => {
+            w.write_all(&[crate::sketch::TAG_SKETCH])?;
+            crate::sketch::write_kdb(w, &arc.read())?;
+        }
     }
     Ok(())
 }
@@ -2129,6 +2135,9 @@ fn read_image(
                     arr.ring_size = if ring == 0 { None } else { Some(ring) };
                     KiviDBValue::Array(Arc::new(parking_lot::RwLock::new(arr)))
                 }
+                crate::sketch::TAG_SKETCH => KiviDBValue::Sketch(Arc::new(
+                    parking_lot::RwLock::new(crate::sketch::read_kdb(&mut r)?),
+                )),
                 unknown => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -2734,7 +2743,7 @@ fn rdb_read_length(r: &mut impl Read) -> io::Result<(u64, bool)> {
     }
 }
 
-fn rdb_read_string(r: &mut impl Read) -> io::Result<Vec<u8>> {
+pub(crate) fn rdb_read_string(r: &mut impl Read) -> io::Result<Vec<u8>> {
     let (len, is_encoded) = rdb_read_length(r)?;
 
     if is_encoded {
@@ -3299,7 +3308,7 @@ fn rdb_invalid(what: impl std::fmt::Display) -> io::Error {
 }
 
 /// A length as an RDB writes one, not an integer encoding.
-fn rdb_read_plain_length(r: &mut impl Read) -> io::Result<u64> {
+pub(crate) fn rdb_read_plain_length(r: &mut impl Read) -> io::Result<u64> {
     match rdb_read_length(r)? {
         (n, false) => Ok(n),
         (_, true) => Err(rdb_invalid("an encoded integer where a length belongs")),
@@ -3660,6 +3669,12 @@ fn module_type_name(id: u64) -> (String, u64) {
 /// are refused.
 fn rdb_read_module_value(r: &mut impl Read) -> io::Result<KiviDBValue> {
     let (name, encoding_version) = module_type_name(rdb_read_plain_length(r)?);
+    // The probabilistic types (Bloom filters, ...).
+    if let Some(sketch) = crate::sketch::redis_module::read(&name, encoding_version, r)? {
+        return Ok(KiviDBValue::Sketch(Arc::new(parking_lot::RwLock::new(
+            sketch,
+        ))));
+    }
     if name != "ReJSON-RL" {
         return Err(rdb_invalid(format!(
             "values of module type {name} are not supported"
@@ -3706,7 +3721,11 @@ fn rdb_read_module_strings(r: &mut impl Read) -> io::Result<Vec<Vec<u8>>> {
 /// module it has not loaded.
 fn rdb_skip_module_aux(r: &mut impl Read, warned: &mut bool) -> io::Result<()> {
     let (name, _) = module_type_name(rdb_read_plain_length(r)?);
-    if name != "ft_index0" && name != "scdtype00" {
+    // RedisGraph's (`graphdata`), which Redis Stack 6.2 writes into every
+    // RDB file, graphs or none, is read past too: a graph itself is a key of
+    // module type `graphdata`, and that is refused.
+    let graph = name == "graphdata";
+    if name != "ft_index0" && name != "scdtype00" && !graph {
         return Err(rdb_invalid(format!(
             "data of module type {name} (opcode 0xF7) is not supported"
         )));
@@ -3718,7 +3737,7 @@ fn rdb_skip_module_aux(r: &mut impl Read, warned: &mut bool) -> io::Result<()> {
     rdb_read_plain_length(r)?;
     // Redis Stack writes it with nothing in it: a count of 0 and no names.
     let names = rdb_read_module_strings(r)?;
-    if !names.is_empty() && !*warned {
+    if !graph && !names.is_empty() && !*warned {
         log_warn!(
             "RDB: the search module's index definitions and dictionaries are not loaded; \
              run FT.CREATE and FT.DICTADD again to make them"
@@ -4642,6 +4661,11 @@ const DUMP_IMAGE_KEY: &str = "v";
 /// so every type can be dumped, restored and migrated. `RESTORE` tells the two
 /// forms apart by the image's magic.
 pub fn dump_payload(value: &KiviDBValue) -> io::Result<Vec<u8>> {
+    // The probabilistic types are dumped as Redis dumps them, so that Redis
+    // can restore them too; `RESTORE` here reads both.
+    if let KiviDBValue::Sketch(sketch) = value {
+        return Ok(crate::sketch::redis_module::dump_payload(&sketch.read()));
+    }
     let mut out = Vec::new();
     if serialize_value(value, &mut out).is_err() {
         out.clear();
@@ -4849,6 +4873,13 @@ pub fn serialize_value(value: &KiviDBValue, out: &mut Vec<u8>) -> std::io::Resul
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "DUMP not supported for TimeSeries and VectorSet keys",
+            ));
+        }
+        // `dump_payload` writes these itself, in Redis's format.
+        KiviDBValue::Sketch(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "probabilistic values have no compact encoding",
             ));
         }
         KiviDBValue::Array(arc) => {

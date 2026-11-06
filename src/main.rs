@@ -47,6 +47,7 @@ mod script_clock;
 mod server;
 mod shared_bytes;
 pub mod shutdown;
+mod sketch;
 pub mod slowlog;
 mod snapshot;
 mod stats;
