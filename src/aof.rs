@@ -3318,12 +3318,13 @@ fn preload(
 
     log_info!("preload-file: loading {}", base.display());
     let base_str = base.to_string_lossy();
+    // Redis's header or Valkey 9's (`VALKEY080`).
     let is_redis_rdb = std::fs::File::open(&base)
         .and_then(|mut f| {
-            let mut magic = [0u8; 5];
+            let mut magic = [0u8; 6];
             std::io::Read::read_exact(&mut f, &mut magic).map(|()| magic)
         })
-        .is_ok_and(|magic| &magic == b"REDIS");
+        .is_ok_and(|magic| crate::snapshot::is_rdb_header(&magic));
     let mut index_names = Vec::new();
     let keys = if is_redis_rdb {
         let (dbs, expiries, functions) = crate::snapshot::load_redis_rdb_with_expiry(&base_str)?;
