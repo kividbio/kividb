@@ -45,7 +45,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `/etc/kividb/kividb.conf`, and the Kubernetes operator starts every
   server from one. To use `CONFIG REWRITE` on a server started without a
   file (the Docker image, for one), start it with `--configfile` pointing
-  at a file that exists (#442).
+  at a file that exists. A host where an earlier version already created
+  the file this way still has it: look for a `/etc/kividb/kividb.conf`
+  that holds a `replicaof` line nobody wrote, and delete or fix it (#442).
+
+- **JSON numbers keep every digit.** A number that needs 17 significant
+  digits was often read as the double next to it: `JSON.SET k $
+  13.326500000000001` then `JSON.GET k` gave `13.3265`, and 435 of 2,000
+  random doubles changed. JSON text was read with a parser that is fast
+  but not exact; it is now read exactly, so every finite double comes back
+  as it was sent, written the shortest way that reads back the same, by
+  `JSON.GET`, `JSON.MGET`, `JSON.NUMINCRBY`, `JSON.NUMMULTBY` and RESP3
+  replies, and after `DUMP` and `RESTORE`, a restart from a snapshot or
+  the AOF, and replication. A NUMERIC field of a JSON index holds the same
+  double. Numbers already stored are read exactly from then on: a
+  document saved by 1.2.0 comes back with the numbers 1.2.0 held, and the
+  AOF's `JSON.SET`s, replayed, give the numbers that were sent (#445).
 
 - **A Lua script's `false` is a RESP3 null to a RESP3 client (#431).** A
   script's `false`, which is also what `redis.call` gives back for a nil
