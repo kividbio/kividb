@@ -234,13 +234,15 @@ fn member_seconds_to_unix_ms(text: &[u8]) -> io::Result<Option<u64>> {
 fn hash_with_ttls(fields: Vec<(Vec<u8>, Vec<u8>, Option<u64>)>) -> io::Result<Option<KiviDBValue>> {
     let mut inner = crate::types::HashInner::new();
     let mut names = std::collections::HashSet::with_capacity(fields.len());
+    // Read once for the hash (see `FieldClock`, #448).
+    let clock = crate::commands::helpers::FieldClock::now();
     for (field, value, expires_at) in fields {
         let field = String::from_utf8_lossy(&field).into_owned();
         if !names.insert(field.clone()) {
             return Err(rdb_invalid("duplicate hash fields"));
         }
         if let Some(at) = expires_at {
-            match field_deadline(at)? {
+            match field_deadline(&clock, at)? {
                 Some(deadline) => {
                     inner.expiries.insert(field.clone(), deadline);
                 }
@@ -315,7 +317,7 @@ pub(super) fn apply_keydb_subexpiry(
     };
     let mut inner = inner;
     if inner.fields.contains_key(field.as_str()) {
-        match field_deadline(at)? {
+        match field_deadline(&crate::commands::helpers::FieldClock::now(), at)? {
             Some(deadline) => {
                 inner.expiries.insert(field, deadline);
             }
