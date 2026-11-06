@@ -3,9 +3,11 @@
 //! Redis and Valkey share the RDB format up to RDB 11 (Redis 7.2, Valkey 7.2
 //! and 8). Past it they part: Redis went on to RDB 12 and later, and Valkey
 //! 9.0 jumped to RDB 80, with a `VALKEY` header in place of `REDIS` and
-//! numbers of its own for what it added. The same type byte can mean two
-//! things: 22 is Valkey's hash with field TTLs and a Redis 7.4 pre-release
-//! encoding. So the reader is told whose file it reads, by the header (a
+//! numbers of its own for what it added. The same type byte can mean more
+//! than one thing: 22 is Valkey's hash with field TTLs, a Redis 7.4
+//! pre-release encoding under RDB 12, and, under RDB 11 or older, Dragonfly's
+//! hash with field TTLs, in Valkey's encoding (`rdb_extensions`). So the
+//! reader is told whose file it reads, by the header (a
 //! file, a full sync) or by the version in the trailer (a `DUMP` payload,
 //! which has no header).
 //!
