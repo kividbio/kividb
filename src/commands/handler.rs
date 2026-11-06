@@ -1760,6 +1760,20 @@ fn notify_watchers(ctx: &Ctx, name: &str) {
     }
 }
 
+/// [`notify_watchers`] for a `BF.*` write that failed after finding its key,
+/// which is always `cmd[1]`. Kept apart and out of line so `notify_watchers`
+/// keeps its one call site in [`side_effects`], where it is inlined: a second
+/// call site there cost every successful write about 20 instructions.
+#[cold]
+#[inline(never)]
+fn notify_failed_bf_write(ctx: &Ctx) {
+    if ctx.watch_registry.has_watchers()
+        && let Some(Ok(key)) = ctx.cmd.get(1).map(|k| std::str::from_utf8(k))
+    {
+        ctx.watch_registry.notify(*ctx.selected_db, key);
+    }
+}
+
 /// Whether the command is one that reads and writes its one key, `cmd[1]`,
 /// under one hold of the key's shard lock: two of them on the key run one
 /// before the other with nothing more, and while nothing reads the write
@@ -2147,7 +2161,7 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
         && name.starts_with("BF.")
         && crate::commands::bf::take_touched()
     {
-        notify_watchers(ctx, name);
+        notify_failed_bf_write(ctx);
     }
 
     // ── PUBLISH reaches replicas' subscribers too ───────────────────────────
