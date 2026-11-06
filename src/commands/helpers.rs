@@ -497,12 +497,12 @@ fn expire_batch(
         // finds the keys gone before it writes to them.
         if !crate::expiry::loading() {
             for key in batch.iter().copied() {
-                if let Some(value) = values.remove_if_due(key.as_str(), now) {
+                if let Some(value) = values.remove_if_due(key, now) {
                     // Announced before the shard is let go of (see
                     // `delete_key_if_expired`).
-                    crate::keyspace_events::notify_expired(store, db, key);
+                    crate::keyspace_events::notify_expired(store, db, crate::store::key_text(key));
                     if marks {
-                        crate::vector::mark_leaving(id, db, key.as_str());
+                        crate::vector::mark_leaving(id, db, crate::store::key_text(key));
                     }
                     freed.push(value);
                     gone.push(key);
@@ -511,7 +511,7 @@ fn expire_batch(
         }
     }
     if let Some(told) = told {
-        told.propagate(db, gone.iter().map(|key| key.as_str()));
+        told.propagate(db, gone.iter().map(|key| crate::store::key_text(key)));
     }
     drop(ordered);
     drop(unobserved);
@@ -519,13 +519,14 @@ fn expire_batch(
     drop(freed);
     let count = gone.len();
     for key in gone {
+        let key = crate::store::key_text(key);
         crate::stats::record_expired();
         crate::stats::EXPIRED_KEYS_ACTIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         crate::watch::expired(store, db, key);
         crate::tracking::expired(store, key);
         crate::vector::maybe_unindex(index_store, db, key);
         if marks {
-            crate::vector::unmark_leaving(id, db, key.as_str());
+            crate::vector::unmark_leaving(id, db, key);
         }
     }
     count
@@ -780,7 +781,7 @@ pub fn is_past(at: u64) -> bool {
     now_ms() > at && !crate::expiry::held()
 }
 
-pub fn is_expired(store: &Store, db: usize, key: &str) -> bool {
+pub fn is_expired(store: &Store, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) -> bool {
     let shard = store::get_shard(&store[db], key);
     // Usually: nothing in this shard expires, and no lock is needed to know.
     if shard.holds_no_ttl() {
@@ -790,7 +791,11 @@ pub fn is_expired(store: &Store, db: usize, key: &str) -> bool {
 }
 
 /// When `key`'s time to live ends, if it has one.
-pub fn get_expiry(store: &Store, db: usize, key: &str) -> Option<SystemTime> {
+pub fn get_expiry(
+    store: &Store,
+    db: usize,
+    key: &(impl AsRef<[u8]> + ?Sized),
+) -> Option<SystemTime> {
     let shard = store::get_shard(&store[db], key);
     if shard.holds_no_ttl() {
         return None;
@@ -804,7 +809,12 @@ pub fn parse_utf8(bytes: &[u8]) -> Option<&str> {
 }
 
 /// Write a value, the key's time to live taken away in the same step.
-pub fn store_value(store: &Store, db: usize, key: &str, value: KiviDBValue) {
+pub fn store_value(
+    store: &Store,
+    db: usize,
+    key: &(impl AsRef<[u8]> + ?Sized),
+    value: KiviDBValue,
+) {
     let shard = store::get_shard(&store[db], key);
     let replaced = write_lock!(shard).insert_expiring(key, value, None);
     // Freed with the shard unlocked.
@@ -816,7 +826,7 @@ pub fn store_value(store: &Store, db: usize, key: &str, value: KiviDBValue) {
 pub fn store_value_expiring(
     store: &Store,
     db: usize,
-    key: &str,
+    key: &(impl AsRef<[u8]> + ?Sized),
     value: KiviDBValue,
     expires_at: Option<SystemTime>,
 ) {
@@ -827,13 +837,18 @@ pub fn store_value_expiring(
 
 /// Give `key` the time to live that ends at `expires_at`. A key that is not
 /// there is given none: a time to live is the key's.
-pub fn set_expiry(store: &Store, db: usize, key: &str, expires_at: SystemTime) {
+pub fn set_expiry(
+    store: &Store,
+    db: usize,
+    key: &(impl AsRef<[u8]> + ?Sized),
+    expires_at: SystemTime,
+) {
     let shard = store::get_shard(&store[db], key);
     write_lock!(shard).set_expires(key, unix_ms(expires_at));
 }
 
 /// Take `key`'s time to live away. Returns whether it had one.
-pub fn clear_expiry(store: &Store, db: usize, key: &str) -> bool {
+pub fn clear_expiry(store: &Store, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) -> bool {
     let shard = store::get_shard(&store[db], key);
     if shard.holds_no_ttl() {
         // Nothing to take away, and nothing to lock for that; but the key
@@ -846,14 +861,18 @@ pub fn clear_expiry(store: &Store, db: usize, key: &str) -> bool {
     write_lock!(shard).persist(key)
 }
 
-pub fn delete_key(store: &Store, db: usize, key: &str) -> bool {
+pub fn delete_key(store: &Store, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) -> bool {
     take_key(store, db, key).is_some()
 }
 
 /// [`delete_key`], saying about how much memory the key took: what
 /// deleting it gives back, or leaves to a snapshot that still holds it
 /// (`store::Taken::footprint`). For eviction to see that it gets anywhere.
-pub fn delete_key_sized(store: &Store, db: usize, key: &str) -> Option<usize> {
+pub fn delete_key_sized(
+    store: &Store,
+    db: usize,
+    key: &(impl AsRef<[u8]> + ?Sized),
+) -> Option<usize> {
     let value_shard = store::get_shard(&store[db], key);
     let removed = write_lock!(value_shard).remove(key)?;
     // Freed (or left to what holds it) with the shard unlocked.
@@ -862,7 +881,11 @@ pub fn delete_key_sized(store: &Store, db: usize, key: &str) -> Option<usize> {
 
 /// [`delete_key`], handing back the value, for `UNLINK` to free: after the
 /// shard lock is released, and in the background if it is large.
-pub fn take_key(store: &Store, db: usize, key: &str) -> Option<KiviDBValue> {
+pub fn take_key(
+    store: &Store,
+    db: usize,
+    key: &(impl AsRef<[u8]> + ?Sized),
+) -> Option<KiviDBValue> {
     let value_shard = store::get_shard(&store[db], key);
     let removed = write_lock!(value_shard).remove(key);
     // To be freed: what a snapshot still holds of the key is not to be
@@ -1530,7 +1553,7 @@ mod active_expiry_tests {
         assert!(
             store[0]
                 .iter()
-                .all(|s| s.read().keys().all(|k| !k.starts_with("gone:")))
+                .all(|s| s.read().keys().all(|k| !k.starts_with(b"gone:")))
         );
         let after = crate::stats::EXPIRED_KEYS_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
         assert!(after - before >= 20_000);
@@ -1611,7 +1634,7 @@ mod active_expiry_tests {
         let index: IndexStore = Default::default();
         let past = SystemTime::now() - Duration::from_secs(5);
         let shards = store[0].len();
-        // Long keys, as UUIDs are: past CompactString's inline length.
+        // Long keys, as UUIDs are: past a key's inline length.
         let mut n = 0;
         let mut i = 0;
         while n < 3 * ACTIVE_EXPIRE_BATCH {
