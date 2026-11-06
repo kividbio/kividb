@@ -373,6 +373,12 @@ fn in_byte_block(c: char) -> bool {
     (0xF780..=0xF7FF).contains(&(c as u32))
 }
 
+/// The first byte of every character of the block (U+F780 to U+F7FF are
+/// `EF 9E 80` to `EF 9F BF`). Text without this byte has none of them, and
+/// a byte search finds that out without decoding a character: the search
+/// indexes ask it of every key they scan and of every name they read back.
+const BLOCK_LEAD: u8 = 0xEF;
+
 fn push_as_block(out: &mut String, bytes: &[u8]) {
     for byte in bytes {
         // 0x80..=0xFF only: bytes below that are text wherever they are.
@@ -386,7 +392,7 @@ fn push_as_block(out: &mut String, bytes: &[u8]) {
 /// The `String` a name of any bytes is kept as.
 pub fn text_of(raw: &[u8]) -> std::borrow::Cow<'_, str> {
     if let Ok(text) = std::str::from_utf8(raw)
-        && !text.contains(in_byte_block)
+        && (!raw.contains(&BLOCK_LEAD) || !text.contains(in_byte_block))
     {
         return std::borrow::Cow::Borrowed(text);
     }
@@ -420,7 +426,7 @@ pub fn text_of(raw: &[u8]) -> std::borrow::Cow<'_, str> {
 
 /// The bytes a kept name stands for.
 pub fn bytes_of(name: &str) -> std::borrow::Cow<'_, [u8]> {
-    if !name.contains(in_byte_block) {
+    if !name.as_bytes().contains(&BLOCK_LEAD) || !name.contains(in_byte_block) {
         return std::borrow::Cow::Borrowed(name.as_bytes());
     }
     let mut out = Vec::with_capacity(name.len());
