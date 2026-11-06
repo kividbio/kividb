@@ -3889,8 +3889,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 out.push_str("atomicvar_api:atomic-builtin\r\n");
                 out.push_str("gcc_version:0.0.0\r\n");
                 // The file it was started with, if there is one.
-                let config_file = Some(std::path::Path::new(&ctx.config.configfile))
-                    .filter(|path| path.is_file())
+                let config_file = ctx
+                    .config
+                    .configfile_loaded
+                    .then_some(std::path::Path::new(&ctx.config.configfile))
                     .and_then(|path| std::path::absolute(path).ok())
                     .map(|path| path.to_string_lossy().into_owned())
                     .unwrap_or_default();
@@ -4779,6 +4781,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     use crate::config::RewriteError;
                     match ctx.config.with_values(&config_rows(ctx)).rewrite_to_disk() {
                         Ok(()) => Some(resp_simple("OK")),
+                        Err(RewriteError::NoConfigFile) => Some(resp_error(
+                            "ERR The server is running without a config file",
+                        )),
                         Err(RewriteError::Io(e)) => {
                             Some(resp_error(&format!("ERR Rewriting config file: {e}")))
                         }

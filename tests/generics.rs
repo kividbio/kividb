@@ -3056,3 +3056,32 @@ fn test_client_list_reports_transactions_and_blocked_clients() {
     observer.cmds(&["LPUSH", "never-pushed", "x"]);
     blocked.join().unwrap();
 }
+
+/// `DUMP` and `RESTORE` of the empty key (#441). `MIGRATE` of it is in
+/// tests/backup.rs: it needs two processes.
+#[test]
+fn test_dump_and_restore_of_the_empty_key() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    assert!(c.cmds(&["SET", "", "x"]).is_ok());
+    let RespValue::Bulk(payload) = c.cmds(&["DUMP", ""]) else {
+        panic!("DUMP of the empty key");
+    };
+    assert!(
+        c.cmd(&[b"RESTORE", b"", b"0", &payload, b"REPLACE"])
+            .is_ok()
+    );
+    assert_eq!(c.cmds(&["GET", ""]).as_str(), "x");
+    assert!(c.cmd(&[b"RESTORE", b"copy", b"0", &payload]).is_ok());
+    assert_eq!(c.cmds(&["GET", "copy"]).as_str(), "x");
+
+    // A hash with an empty field, under the empty key.
+    assert_eq!(c.cmds(&["DEL", ""]).as_int(), 1);
+    assert_eq!(c.cmds(&["HSET", "", "", "v"]).as_int(), 1);
+    let RespValue::Bulk(payload) = c.cmds(&["DUMP", ""]) else {
+        panic!("DUMP of the empty key");
+    };
+    assert!(c.cmd(&[b"RESTORE", b"hcopy", b"0", &payload]).is_ok());
+    assert_eq!(c.cmds(&["HGET", "hcopy", ""]).as_str(), "v");
+}

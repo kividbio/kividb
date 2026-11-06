@@ -134,11 +134,9 @@ other files:
   `PFMERGE` or a multi-key `PFCOUNT` refuses to combine the two formats. After
   moving from Redis, set `hll-write-format redis` so new and copied
   HyperLogLogs mix and can move back ([PERSISTENCE.md](PERSISTENCE.md)).
-- Valkey 9's RDB format (version 80, a `VALKEY080` header) isn't read yet,
-  as a file, a full sync or a `DUMP` payload
-  ([#449](https://github.com/kividbio/kividb/issues/449)). `valkey-cli --rdb`
-  from a Valkey 9 server gives a Redis-format file that KiviDB loads, unless
-  a hash has field TTLs.
+- Valkey 9.2's RDB format (version 81) isn't read yet: a file, full sync
+  or `DUMP` payload from it is refused. Valkey 9.0's and 9.1's (version 80,
+  a `VALKEY080` header) is read, hash field TTLs included.
 - Redis and Valkey can't read KiviDB's `DUMP` payloads or replicate from
   KiviDB ([#450](https://github.com/kividbio/kividb/issues/450)), so moving
   data back off KiviDB means copying it key by key. Bloom filters are the
