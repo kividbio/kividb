@@ -171,7 +171,7 @@ fn read_bloom(r: &mut Reader<'_, impl Read>) -> io::Result<BloomChain> {
     let count = r.uint()?;
     let flags = r.uint32()?;
     let expansion = r.uint32()?;
-    if count == 0 || count > 1 << 16 {
+    if count == 0 || count > super::bloom::MAX_LAYERS as u64 {
         return Err(r.bad("bad number of layers"));
     }
     let mut shapes = Vec::with_capacity(count as usize);

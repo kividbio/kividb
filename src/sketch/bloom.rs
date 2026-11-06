@@ -1,18 +1,25 @@
 //! Scalable Bloom filters (`BF.*`), laid out bit for bit as Redis 8 lays
 //! them out.
 //!
-//! The layout was established by checking a model, written from the
-//! textbook algorithms (double hashing over MurmurHash64A, a chain of
-//! filters each tighter than the last), against the bytes Redis 8.10's
-//! `BF.SCANDUMP` and `DUMP` give: it rebuilt them exactly, header and data,
-//! for chains of up to ten layers. Redis's and RedisBloom's source were not
-//! read for this work, and the names here are our own. Some of what the
-//! model started from (which hash, that the second hash is seeded with the
-//! first) is common knowledge of how RedisBloom works; none of it is taken
-//! on trust, every part was confirmed against Redis's bytes. The layout is
-//! what makes a filter moved from Redis (an RDB file, `RESTORE`,
-//! `BF.LOADCHUNK`) answer the same here, and one moved back answer the
-//! same there.
+//! The layout was established by checking a model against the bytes Redis
+//! 8.10's `BF.SCANDUMP` and `DUMP` give: it rebuilt them exactly, header
+//! and data, for chains of up to ten layers. Where the model came from:
+//!
+//! * Double hashing over MurmurHash64A, and a chain of filters each
+//!   tighter than the last, are the textbook algorithms.
+//! * The sizing of a layer (bits per item `−ln e / ln²2`, hashes
+//!   `ceil(ln 2 · bits per item)`, with both constants written to 15
+//!   digits) is libbloom's, by Jyri J. Virkki, under the BSD 2-Clause
+//!   licence: <https://github.com/jvirkki/libbloom>. No code of it is used.
+//! * Which hash and seed, that the second hash is seeded with the first,
+//!   and the option bits, came from general knowledge of how RedisBloom
+//!   works.
+//!
+//! No Redis or RedisBloom source code was opened or copied for this work,
+//! and the names here are our own. Nothing above was taken on trust: every
+//! part was confirmed against Redis's bytes. The layout is what makes a
+//! filter moved from Redis (an RDB file, `RESTORE`, `BF.LOADCHUNK`) answer
+//! the same here, and one moved back answer the same there.
 //!
 //! * An item hashes to `a = murmur64a(item, FIRST_SEED)` and
 //!   `b = murmur64a(item, a)`; its bits in a layer of `bits` bits are
@@ -42,10 +49,12 @@ use super::murmur::murmur64a;
 
 /// The seed of an item's first hash.
 pub const FIRST_SEED: u64 = 0xc6a4_a793_5bd1_e995;
-/// ln²2 to 15 digits: bits per item are `−ln e` over this.
+/// ln²2 to 15 digits, as libbloom writes it: bits per item are `−ln e`
+/// over this.
 const SIZING_DIVISOR: f64 = 0.480453013918201;
-// ln 2 to 15 digits: hashes are `ceil` of this times the bits per item. Not
-// `std::f64::consts::LN_2`: it goes with the 15-digit divisor above.
+// ln 2 to 15 digits, as libbloom writes it: hashes are `ceil` of this times
+// the bits per item. Not `std::f64::consts::LN_2`: it goes with the 15-digit
+// divisor above.
 #[allow(clippy::approx_constant)]
 const HASH_FACTOR: f64 = 0.693147180559945;
 /// The most hashes a layer can have: what the smallest positive error
@@ -78,6 +87,12 @@ pub const CHUNK_MAX: u64 = 16 * 1024 * 1024;
 /// (`BF.RESERVE`, growth) or described by what is loaded; it is never
 /// allocated.
 pub const MAX_LAYER_BYTES: u64 = 1 << 32;
+
+/// The most layers a loaded filter may have, from a `BF.LOADCHUNK` header,
+/// a snapshot or an RDB value. A filter that grows stops far below it: its
+/// error rate halves with each layer, and the hashes it takes reach
+/// [`MAX_HASHES`] after about 1,075 layers.
+pub const MAX_LAYERS: usize = 1 << 16;
 
 /// The header chunk's fixed part and each layer's part.
 const HEADER_FIXED: usize = 20;
@@ -385,7 +400,7 @@ impl BloomChain {
             .checked_mul(HEADER_LAYER)
             .and_then(|n| n.checked_add(HEADER_FIXED))
             == Some(raw.len());
-        if count == 0 || !fits {
+        if count == 0 || count > MAX_LAYERS || !fits {
             return Err(ShapeError::Bad);
         }
         let shapes = (0..count)
@@ -425,7 +440,11 @@ impl BloomChain {
         data: Option<Vec<Vec<u8>>>,
     ) -> Result<BloomChain, ShapeError> {
         let layout = FLAG_EXACT_SIZE | FLAG_WIDE_HASH;
-        if flags & !KNOWN_FLAGS != 0 || flags & layout != layout || shapes.is_empty() {
+        if flags & !KNOWN_FLAGS != 0
+            || flags & layout != layout
+            || shapes.is_empty()
+            || shapes.len() > MAX_LAYERS
+        {
             return Err(ShapeError::Bad);
         }
         if data.as_ref().is_some_and(|d| d.len() != shapes.len()) {
@@ -611,6 +630,9 @@ pub fn read_kdb(r: &mut impl io::Read) -> io::Result<BloomChain> {
     let flags = super::read_u32(r)?;
     let expansion = super::read_u32(r)?;
     let count = super::read_u32(r)? as usize;
+    if count == 0 || count > MAX_LAYERS {
+        return Err(super::invalid("bad number of Bloom filter layers"));
+    }
     let mut shapes = Vec::with_capacity(count.min(1024));
     let mut datas = Vec::with_capacity(count.min(1024));
     for _ in 0..count {
@@ -950,6 +972,47 @@ mod tests {
         let mut many = header(8, 64, 0.1, per_item, hashes, 10);
         many[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(BloomChain::from_header(&many), bad);
+    }
+
+    /// At most [`MAX_LAYERS`] layers, whichever way a filter is loaded.
+    #[test]
+    fn layer_count_is_capped() {
+        let (per_item, _, hashes) = Layer::shape(10, 0.1);
+        let flags = FLAG_EXACT_SIZE | FLAG_WIDE_HASH;
+        let shape = LayerShape {
+            bytes: 8,
+            bits: 64,
+            size: 0,
+            error: 0.1,
+            bits_per_item: per_item,
+            hashes,
+            capacity: 10,
+            reserved: 0,
+        };
+        let at_cap = vec![shape; MAX_LAYERS];
+        assert!(BloomChain::from_shapes(0, flags, 2, at_cap, None).is_ok());
+        let over = vec![shape; MAX_LAYERS + 1];
+        assert_eq!(
+            BloomChain::from_shapes(0, flags, 2, over, None),
+            Err(ShapeError::Bad)
+        );
+        // A header of MAX_LAYERS + 1 well-formed layers.
+        let one = one_layer_header(0, flags, 8, 64, 0.1, per_item, hashes, 10);
+        let mut raw = one[..HEADER_FIXED].to_vec();
+        raw[8..12].copy_from_slice(&((MAX_LAYERS + 1) as u32).to_le_bytes());
+        for _ in 0..=MAX_LAYERS {
+            raw.extend_from_slice(&one[HEADER_FIXED..]);
+        }
+        assert_eq!(BloomChain::from_header(&raw), Err(ShapeError::Bad));
+        // A snapshot record that claims MAX_LAYERS + 1 layers is refused
+        // before any layer is read.
+        let mut kdb = Vec::new();
+        kdb.extend(0u64.to_le_bytes());
+        kdb.extend(flags.to_le_bytes());
+        kdb.extend(2u32.to_le_bytes());
+        kdb.extend(((MAX_LAYERS + 1) as u32).to_le_bytes());
+        let err = read_kdb(&mut &kdb[..]).unwrap_err();
+        assert!(err.to_string().contains("number of Bloom filter layers"), "{err}");
     }
 
     /// Loaded bytes are the layers: not copied, and not zeroed again.
