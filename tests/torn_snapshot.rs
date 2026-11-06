@@ -7,7 +7,9 @@
 // server started without its indexes (and without whatever was stored after
 // the cut). It is now refused, as an image cut between keys is (#444), at
 // startup and in a full sync, and an image cut inside a section's magic as
-// well. A whole image with a section this build does not know still loads.
+// well, and one with an index, HNSW graph or alias section that is all
+// there but cannot be used. A whole image with a section this build does not
+// know still loads.
 //
 // Real `kividb` processes, each in its own directory: what is under test is
 // whether a server starts, and what it leaves on disk.
@@ -350,6 +352,61 @@ fn a_dump_cut_inside_a_trailing_section_does_not_start_the_server() {
     let port = free_port();
     let _server = start(dir.path(), port, &[]);
     assert_whole(&mut Conn::connect(port), "the whole dump");
+}
+
+/// A `dump.kdb` in the order of 1.0 to 1.2.0, the expiry and function
+/// sections after the index ones, with an index, HNSW graph or alias section
+/// that is all there but cannot be used (its first name not UTF-8) does not
+/// start the server, which leaves its data directory as it was. It used to
+/// start without its indexes, its TTLs and its libraries.
+#[test]
+fn a_1_2_0_order_dump_with_an_unusable_index_section_does_not_start() {
+    let image = saved_dump();
+    let spans = section_spans(&image);
+    let first = spans[0].1;
+    let body = |name: &str| {
+        let &(_, at, end) = spans
+            .iter()
+            .find(|&&(n, _, _)| n == name)
+            .unwrap_or_else(|| panic!("the dump has no {name} section"));
+        image[at..end].to_vec()
+    };
+    // Magic, a count, and the first name's length: its first byte.
+    let name_at = 8 + 4 + 4;
+    for (broken, name) in [("index", "idx"), ("HNSW graph", "idx"), ("alias", "al")] {
+        let mut out = image[..first].to_vec();
+        for &(section, _, _) in &spans {
+            if section == "expiry" || section == "functions" {
+                continue;
+            }
+            let mut bytes = body(section);
+            if section == broken {
+                assert_eq!(&bytes[name_at..name_at + name.len()], name.as_bytes());
+                bytes[name_at] = 0xFF;
+            }
+            out.extend(bytes);
+        }
+        out.extend(body("expiry"));
+        if cfg!(feature = "lua") {
+            out.extend(body("functions"));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("dump.kdb"), &out).unwrap();
+        std::fs::write(dir.path().join("kividb.lock"), b"").unwrap();
+        let before = directory(dir.path());
+        let (failed, stderr) = fails_to_start(dir.path());
+        let what = format!("an unusable {broken} section");
+        assert!(failed, "{what}: the server started");
+        assert!(
+            stderr.contains("dump.kdb cannot be loaded")
+                && stderr.contains(&format!("{broken} section cannot be used")),
+            "{what}: {stderr}"
+        );
+        assert!(
+            directory(dir.path()) == before,
+            "{what}: the data directory changed"
+        );
+    }
 }
 
 /// A whole `dump.kdb` that ends with a section this build does not know, as

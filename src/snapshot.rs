@@ -186,6 +186,27 @@ fn whole_section<T>(section: &str, result: io::Result<T>) -> io::Result<T> {
     })
 }
 
+/// [`whole_section`] for the index, HNSW graph and alias sections, with one
+/// that is all there but cannot be used refused as well, saying which.
+///
+/// They were read best-effort, and one that could not be used ended the scan
+/// with a warning. The images of 1.0 to 1.2.0 hold the key expiries and the
+/// function libraries after them, so every TTL and library was dropped with
+/// it, and the indexes were not rebuilt either. No writer makes such a
+/// section, so refusing one refuses no image KiviDB wrote whole (#474).
+fn usable_section<T>(section: &str, result: io::Result<T>) -> io::Result<T> {
+    whole_section(section, result).map_err(|e| {
+        if e.kind() == io::ErrorKind::InvalidData {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the snapshot's {section} section cannot be used: {e}"),
+            )
+        } else {
+            e
+        }
+    })
+}
+
 /// A snapshot file that goes to the disk as it is written, a few megabytes
 /// at a time, rather than all at once when it is synced.
 ///
@@ -1754,7 +1775,8 @@ fn push_plans(plans: &mut Vec<Vec<usize>>, plan: &[usize], ends: &[usize], room:
 ///
 /// A reading that takes 1.2.0's empty key reads an image 1.2.0 wrote, which
 /// holds only sections 1.2.0 knows: it does not pass over a section it does
-/// not know, or one that is damaged, as other readings do.
+/// not know, as other readings do. No reading passes over a section that is
+/// cut short or cannot be used.
 fn read_image(
     r: impl Read,
     keep: bool,
@@ -2182,11 +2204,8 @@ fn read_image(
     // short, and refused on every reading (#474): loading it started a server
     // without its TTLs, its function libraries or its indexes.
     //
-    // Index schemas, HNSW graphs and aliases that are all there but cannot be
-    // used (a name that is not UTF-8) stay best-effort, as they always were:
-    // the indexes are rebuilt from the keys. Nothing after such a section can
-    // be located, so that also ends the scan, and it says so because what
-    // lives behind it is lost. A reading with 1.2.0's empty key refuses them.
+    // A section that is all there but cannot be used is refused too, the
+    // index, HNSW graph and alias sections included (see `usable_section`).
     let mut index_schemas = Vec::new();
     let mut hnsw_graphs = std::collections::HashMap::new();
     let mut dictionaries = Vec::new();
@@ -2214,46 +2233,16 @@ fn read_image(
             ));
         }
         if &magic == KDB_INDEX_MAGIC {
-            match whole_section("index", read_index_schemas(&mut r)) {
-                Ok(v) => index_schemas = v,
-                Err(e) if strict || e.kind() == io::ErrorKind::UnexpectedEof => return Err(e),
-                Err(e) => {
-                    log_warn!(
-                        "snapshot index section is unreadable ({e}); indexes will be \
-                         rebuilt, and any key expiries and function libraries stored \
-                         after it are lost"
-                    );
-                    break;
-                }
-            }
+            index_schemas = usable_section("index", read_index_schemas(&mut r))?;
         } else if &magic == KDB_HNSW_MAGIC {
-            match whole_section("HNSW graph", read_hnsw_graphs(&mut r)) {
-                Ok(v) => hnsw_graphs = v,
-                Err(e) if strict || e.kind() == io::ErrorKind::UnexpectedEof => return Err(e),
-                Err(e) => {
-                    log_warn!(
-                        "snapshot HNSW section is unreadable ({e}); graphs will be \
-                         rebuilt, and any key expiries and function libraries stored \
-                         after it are lost"
-                    );
-                    break;
-                }
-            }
+            hnsw_graphs = usable_section("HNSW graph", read_hnsw_graphs(&mut r))?;
         } else if &magic == KDB_EXPIRY_MAGIC {
             whole_section("expiry", read_expiry_section(&mut r, &mut expiries))?;
         } else if &magic == KDB_ALIAS_MAGIC {
-            match whole_section("index alias", read_alias_section(&mut r)) {
-                Ok(aliases) => {
-                    for (alias, index) in aliases {
-                        if let Some(schema) = index_schemas.iter_mut().find(|s| s.name == index) {
-                            schema.aliases.push(alias);
-                        }
-                    }
-                }
-                Err(e) if strict || e.kind() == io::ErrorKind::UnexpectedEof => return Err(e),
-                Err(e) => {
-                    log_warn!("snapshot index alias section is unreadable ({e})");
-                    break;
+            let aliases = usable_section("index alias", read_alias_section(&mut r))?;
+            for (alias, index) in aliases {
+                if let Some(schema) = index_schemas.iter_mut().find(|s| s.name == index) {
+                    schema.aliases.push(alias);
                 }
             }
         } else if &magic == KDB_FIELD_OPTIONS_MAGIC {
@@ -6148,11 +6137,11 @@ mod field_option_tests {
     }
 
     /// An index section that is all there but cannot be used, an index whose
-    /// name is not UTF-8, is still passed over as before: the keys load, the
-    /// indexes are rebuilt from them, and the scan ends there. An index
-    /// section the image ends inside is refused.
+    /// name is not UTF-8, is refused, as one the image ends inside is: it was
+    /// passed over, and the scan ended there, with every TTL and function
+    /// library stored after it (#474).
     #[test]
-    fn a_whole_but_unusable_index_section_is_still_passed_over() {
+    fn a_whole_but_unusable_index_section_is_refused() {
         let mut whole = Vec::new();
         write_kdb_header(&mut whole, 1).unwrap();
         let value = KiviDBValue::String(SharedBytes::from(&b"1"[..]));
@@ -6164,10 +6153,14 @@ mod field_option_tests {
         unusable.extend(1u32.to_le_bytes());
         unusable.push(0xFF);
         unusable.extend(0u32.to_le_bytes());
-        let loaded = load_snapshot_bytes(&unusable).unwrap();
-        assert_eq!(loaded.dbs[0].len(), 1);
-        assert!(loaded.index_schemas.is_empty());
-        assert_eq!(verify_snapshot(&unusable).unwrap(), 1);
+        let err = load_snapshot_bytes(&unusable).err().expect("loaded");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("index section cannot be used"),
+            "{err}"
+        );
+        assert!(load_snapshot_from(unusable.as_slice()).is_err());
+        assert!(verify_snapshot(&unusable).is_err());
 
         let mut cut = whole.clone();
         cut.extend_from_slice(KDB_INDEX_MAGIC);

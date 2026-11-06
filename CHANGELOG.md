@@ -146,11 +146,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   preamble at startup, `--preload-file`, and a full sync, where the
   replica keeps its dataset. One that ends inside any section, or inside a
   section's eight-byte magic, is refused with a message that says which
-  section it is cut short in. Sections this release does not know are
-  still passed over, so a whole image from a later release loads. An
-  index, HNSW or alias section that is all there but cannot be used (an
-  index name that is not UTF-8) is still passed over as before: the
-  indexes are rebuilt from the keys, with a warning (#474).
+  section it is cut short in. An index, HNSW or alias section that is all
+  there but cannot be used (an index name that is not UTF-8) is now
+  refused too. It was passed over with a warning, the indexes were lost,
+  and so was everything stored after it, which in the images of 1.0 to
+  1.2.0 is every TTL and function library; no KiviDB writes such a
+  section. A section this release does not know still ends the reading
+  there, so a whole image from a later release loads (#474).
 
 - **Fix `MEMORY USAGE` estimates for sets, hashes, and sorted sets.**
   Estimates for sets, hashes, field-TTL hashes, and sorted sets now track
