@@ -21,6 +21,7 @@ fn dispatch_command_handlers_fallback(ctx: &mut Ctx, name: &str) -> Option<Vec<u
         .or_else(|| hash::handle(ctx, name))
         .or_else(|| zset::handle(ctx, name))
         .or_else(|| bitmap::handle(ctx, name))
+        .or_else(|| bf::handle(ctx, name))
         .or_else(|| hyperloglog::handle(ctx, name))
         .or_else(|| geo::handle(ctx, name))
         .or_else(|| ts::handle(ctx, name))
@@ -102,7 +103,7 @@ pub(crate) fn dispatch_command_handlers(ctx: &mut Ctx, name: &str) -> Option<Vec
         b'l' => lists::handle(ctx, name),
         b'h' => hash::handle(ctx, name).or_else(|| hyperloglog::handle(ctx, name)),
         b'z' => zset::handle(ctx, name),
-        b'b' => bitmap::handle(ctx, name),
+        b'b' => bitmap::handle(ctx, name).or_else(|| bf::handle(ctx, name)),
         b'f' => vector::handle(ctx, name),
         b'j' => json::handle(ctx, name),
         b'x' => streams::handle(ctx, name),
@@ -2135,6 +2136,17 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
         if name != "XREADGROUP" || replication::script_feed::effects_changed_data() {
             crate::stats::record_rdb_change();
         }
+    }
+
+    // A `BF.*` write that failed once it had found its key (`BF.RESERVE` of
+    // one there already, `BF.ADD` to a full filter) invalidates a `WATCH`
+    // on it all the same, as Redis's do.
+    if writes_operation
+        && !is_mutating_ok_write
+        && name.starts_with("BF.")
+        && crate::commands::bf::take_touched()
+    {
+        notify_watchers(ctx, name);
     }
 
     // ── PUBLISH reaches replicas' subscribers too ───────────────────────────

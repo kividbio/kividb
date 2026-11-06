@@ -135,6 +135,9 @@ pub fn commands_for_propagation(
         "MIGRATE" => Vec::new(),
         "LMOVEM" | "BLMOVEM" => lmovem_feed(name, cmd, resp),
         "TS.ADD" => ts_add_feed(cmd, resp),
+        // Sent as a `BF.INSERT` that names the filter's parameters when it
+        // made the filter: see `commands::bf`.
+        "BF.ADD" | "BF.MADD" | "BF.INSERT" => crate::commands::bf::propagation(cmd),
         "TS.MADD" => ts_madd_feed(cmd, resp),
         "TS.INCRBY" | "TS.DECRBY" => ts_incrby_feed(cmd, resp),
         // The fieldset lives in the client's session, which no replica (and no
