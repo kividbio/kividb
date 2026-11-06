@@ -123,6 +123,8 @@ def main(path):
             klen = r.u32()
             if klen == 0:
                 break
+            if klen == 0xFFFFFFFF:  # the empty key (#441): no bytes follow
+                klen = 0
             r.take(klen)
             keybytes += klen
             keys += 1

@@ -76,7 +76,8 @@ can't be read, the server doesn't start, so you never get an empty server by
 mistake.
 
 **Replicate from Redis.** Start KiviDB with `--replicaof <redis-host>
-<redis-port>` (and `masterauth` if your Redis needs a password). It takes a
+<redis-port>` (and `masterauth` if your Redis needs a password). A Valkey
+primary works the same way. It takes a
 full sync from the Redis primary, then follows its writes. When it has
 caught up, point the application at KiviDB and run `REPLICAOF NO ONE` on it.
 This is the way to move with only a moment of downtime. Before you switch
@@ -87,6 +88,11 @@ What the RDB reader takes from Redis:
 - **Every core type:** strings, lists, sets, sorted sets, hashes (including
   hash fields with their own TTLs, Redis 7.4+), and streams (Redis 7.0 to
   8.10 encodings). Key expiry times come across too.
+- **Valkey's files, full syncs and `DUMP` payloads**, Valkey 7.2 to 9.1,
+  including Valkey 9's format (a `VALKEY080` header) and its hashes with
+  field TTLs. Valkey 9.2's format (RDB 81) is refused. So is a file a
+  Valkey cluster node saved during a slot migration into it: finish or
+  cancel the migration and save again. valkey-json documents load as JSON.
 - **RedisJSON documents**, and Lua function libraries (`FUNCTION LOAD`).
 - **Search index definitions and dictionaries are not loaded.** KiviDB keeps
   its own indexes. Run `FT.CREATE` (and `FT.DICTADD`) again after the move;

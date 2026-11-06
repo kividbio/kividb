@@ -9,6 +9,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Data moves in from Valkey 9.** KiviDB reads Valkey 9.0's and 9.1's
+  RDB format (RDB 80, a `VALKEY080` header): a `dump.rdb` loaded at
+  startup or with `--preload-file`, a full sync as a replica of a Valkey 9
+  primary, `RESTORE` of a Valkey 9 `DUMP` payload (so `MIGRATE` and the
+  tools built on `DUMP`), and `FUNCTION RESTORE` of a Valkey 9 `FUNCTION
+  DUMP`. A hash whose fields have TTLs (Valkey's RDB type 22) keeps them,
+  to the millisecond. Valkey 9 refused to load with `bad magic`, and its
+  payloads with `ERR DUMP payload version or checksum are wrong`. What
+  KiviDB does not read is refused whole, by name, and nothing is skipped:
+  a newer Valkey's format (Valkey 9.2 writes RDB 81), a type Valkey does not
+  write, and a file a Valkey cluster node saved while a slot migration into
+  it was under way (the keys of those slots are not all there). Checked
+  against the valkey/valkey 9.0.7 and 9.1.3 images, key by key: every core
+  type, streams with consumer groups and pending entries, key and field
+  TTLs, several databases, function libraries and valkey-json documents
+  (valkey-bundle 9.0), by file, by `RESTORE`, and as a replica through a
+  full sync and a stream of writes (#449).
+
 - **apt and dnf repositories.** `https://packages.kividb.io` serves signed
   apt (Debian, Ubuntu) and dnf (Fedora, RHEL and compatibles, Amazon Linux
   2023) repositories of the `.deb` and `.rpm` packages, for `amd64` and
@@ -88,6 +106,39 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   master dropped that way; upgrade the master first, or drop the index
   from its own database.
 
+- **A snapshot holding the empty key can be loaded.** Redis allows the
+  key `""`, and so does KiviDB, but in a KiviDB snapshot a key length of 0
+  marks the end of a database, and the empty key was written with that
+  length. The next start failed (`dump.kdb cannot be loaded: failed to
+  fill whole buffer`, or `bad key utf8`), as did a start from an AOF
+  whose checkpoint or preamble held the key, and a replica's full sync
+  (the replica kept its old data and never came up). When the key was in
+  the last database (always, with `databases 1`), the start or the sync
+  did not fail: it went on without the rest of that database, and
+  without what a snapshot keeps after its databases: times to live,
+  search index definitions and function libraries. Any client that could
+  write could do this. The empty key is now written with a length no key
+  can have, followed by no bytes, and read back as the empty key; images
+  without an empty key are written as before. A snapshot that 1.2.0 wrote
+  with the empty key, as `dump.kdb`, an AOF checkpoint or preamble, or a
+  1.2.0 master's full sync, now loads: the key is looked for where 1.2.0
+  put it. In the last database that is certain; before it, an image that
+  does not load is read again (at most 32 times) with the key in each
+  place it could be, and one that none of these readings loads is
+  refused as before. An image that goes on past its databases with bytes
+  that are not a section is refused, rather than loaded without them.
+  Empty hash fields, set and sorted set members and list elements were
+  never affected (#441).
+
+  **Upgrade note:** a snapshot that 1.2.1 writes with the empty key needs
+  1.2.1 or later to load. 1.2.0 takes the new length for that of a key of
+  4 GiB and, all but certainly, refuses the file at startup and leaves it
+  as it is; it may first read up to 4 GiB of it. A 1.2.0 replica refuses
+  the full sync of a 1.2.1 master that holds the empty key, keeps its own
+  data, and asks again every second, each time a full sync for the master
+  to make: upgrade replicas before their master. A 1.2.1 replica of a
+  1.2.0 master loads its full sync.
+
 - **`CONFIG REWRITE` no longer writes a config file the server was not
   started from.** A server started without one, because its `--configfile`
   path (by default `/etc/kividb/kividb.conf`) did not exist, created the
@@ -140,6 +191,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   too: a line break in one split the reply in two. Apart from that, RESP2
   clients get the same bytes as before for scripts that do not call
   `redis.setresp(3)`.
+
+- **Hash field TTLs read back to the millisecond.** A field TTL loaded from
+  a Redis 7.4+ RDB file, full sync or `DUMP` payload, or set with `HSETEX
+  ... EXAT` or `PXAT`, often read back with `HPEXPIRETIME` one millisecond
+  later than it was set: the time left was worked out from the clock in
+  whole milliseconds. Redis and Valkey send `HSETEX` with `PXAT` to their
+  replicas, so a KiviDB replica of either drifted by that millisecond. It
+  is now worked out to the nanosecond, as `HPEXPIREAT` does (#449).
 
 - **A write in database 0 could reach replicas and the AOF in another
   database.** Until a client selects a database other than 0, writes go out
