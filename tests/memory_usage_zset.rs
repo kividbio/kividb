@@ -125,6 +125,19 @@ fn memory_usage_of_sorted_sets_is_what_their_keys_take() {
     check(cases());
 }
 
+/// The probe that finds a server its port takes no connection while it is
+/// open: one that did was copied into a server another test was starting,
+/// took the connection meant for this test's server, and reset it (#506).
+#[test]
+fn a_port_being_probed_takes_no_connections() {
+    let port = free_port();
+    let _probe = probe(port).expect("a free port");
+    assert!(
+        std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
+        "the probe of port {port} took a connection"
+    );
+}
+
 fn usage_of(c: &mut Conn, keys: &[Vec<u8>], samples: Option<&str>) -> Vec<i64> {
     let cmds: Vec<Cmd> = keys
         .iter()
