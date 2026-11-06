@@ -1815,6 +1815,9 @@ pub enum DocFields<'a> {
     Hash(parking_lot::RwLockReadGuard<'a, Fields>),
     /// A hash some of whose fields have a TTL.
     HashEx(parking_lot::RwLockReadGuard<'a, crate::types::HashInner>),
+    /// Such a hash's fields that have not expired, when some have: the
+    /// sweep has not removed those yet.
+    LiveHashEx(Fields),
     Json {
         fields: Fields,
         doc: parking_lot::RwLockReadGuard<'a, serde_json::Value>,
@@ -1837,6 +1840,7 @@ impl std::ops::Deref for DocFields<'_> {
         match self {
             DocFields::Hash(fields) => fields,
             DocFields::HashEx(hash) => &hash.fields,
+            DocFields::LiveHashEx(fields) => fields,
             DocFields::Json { fields, .. } => fields,
         }
     }
@@ -1859,12 +1863,27 @@ pub fn doc_fields<'a>(
     schema: &[SchemaField],
     value: crate::store::ValueRef<'a>,
 ) -> Option<DocFields<'a>> {
+    doc_fields_at(on, schema, value, &mut None)
+}
+
+/// [`doc_fields`] for one of the documents a query reads, a field's time
+/// held to `now` (see [`crate::types::HashInner::live_fields_as_of`]).
+pub fn doc_fields_at<'a>(
+    on: &IndexOn,
+    schema: &[SchemaField],
+    value: crate::store::ValueRef<'a>,
+    now: &mut Option<std::time::Instant>,
+) -> Option<DocFields<'a>> {
     match (on, value) {
         (IndexOn::Hash, crate::store::ValueRef::Hash(hash)) => Some(DocFields::Hash(hash.read())),
         // A hash is no less a document for one of its fields having a TTL:
         // it used to drop out of every query the moment one was given one.
         (IndexOn::Hash, crate::store::ValueRef::HashEx(hash)) => {
-            Some(DocFields::HashEx(hash.read()))
+            let inner = hash.read();
+            Some(match inner.live_fields_as_of(now) {
+                Some(live) => DocFields::LiveHashEx(live),
+                None => DocFields::HashEx(inner),
+            })
         }
         (IndexOn::Json, crate::store::ValueRef::Json(doc)) => {
             let doc = doc.read();

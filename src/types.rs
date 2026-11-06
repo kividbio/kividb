@@ -690,16 +690,91 @@ pub fn hash_remove(fields: &mut HashFields, field: &str) -> Option<std::sync::Ar
     }
 }
 
+/// A hash's field TTLs, and a time no later than the earliest of them.
+///
+/// The map is read through `Deref`; it is changed only by these methods, so
+/// that every new deadline lowers `earliest`. A removal leaves `earliest` as
+/// it was, which can only be early: a reader then looks at the deadlines
+/// themselves, as it would without it. A full pass over them under the
+/// hash's write lock ([`Expiries::take_due`]) makes it exact again.
+#[derive(Clone, Default)]
+pub struct Expiries {
+    map: ahash::AHashMap<String, std::time::Instant>,
+    /// No later than every deadline in `map`; `None` when it is empty.
+    earliest: Option<std::time::Instant>,
+}
+
+impl Expiries {
+    pub fn insert(&mut self, field: String, at: std::time::Instant) -> Option<std::time::Instant> {
+        if self.earliest.is_none_or(|earliest| at < earliest) {
+            self.earliest = Some(at);
+        }
+        self.map.insert(field, at)
+    }
+
+    pub fn remove(&mut self, field: &str) -> Option<std::time::Instant> {
+        let removed = self.map.remove(field);
+        if self.map.is_empty() {
+            self.earliest = None;
+        }
+        removed
+    }
+
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.earliest = None;
+    }
+
+    /// No later than the earliest deadline; `None` when there is none.
+    #[inline]
+    pub fn earliest(&self) -> Option<std::time::Instant> {
+        self.earliest
+    }
+
+    /// Remove the deadlines due at `now` and give back their fields; what is
+    /// left makes `earliest` exact, in the same pass.
+    pub fn take_due(&mut self, now: std::time::Instant) -> Vec<String> {
+        let mut due = Vec::new();
+        let mut earliest: Option<std::time::Instant> = None;
+        for (field, at) in &self.map {
+            if now >= *at {
+                due.push(field.clone());
+            } else if earliest.is_none_or(|e| *at < e) {
+                earliest = Some(*at);
+            }
+        }
+        for field in &due {
+            self.map.remove(field);
+        }
+        self.earliest = earliest;
+        due
+    }
+}
+
+impl std::ops::Deref for Expiries {
+    type Target = ahash::AHashMap<String, std::time::Instant>;
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl From<ahash::AHashMap<String, std::time::Instant>> for Expiries {
+    fn from(map: ahash::AHashMap<String, std::time::Instant>) -> Self {
+        let earliest = map.values().min().copied();
+        Self { map, earliest }
+    }
+}
+
 pub struct HashInner {
     pub fields: HashFields,
-    pub expiries: ahash::AHashMap<String, std::time::Instant>,
+    pub expiries: Expiries,
 }
 
 impl HashInner {
     pub fn new() -> Self {
         Self {
             fields: HashFields::default(),
-            expiries: ahash::AHashMap::new(),
+            expiries: Expiries::default(),
         }
     }
 
@@ -708,7 +783,7 @@ impl HashInner {
     pub fn from_fields(fields: HashFields) -> Self {
         Self {
             fields,
-            expiries: ahash::AHashMap::new(),
+            expiries: Expiries::default(),
         }
     }
 
@@ -723,6 +798,48 @@ impl HashInner {
             Some(exp) => std::time::Instant::now() >= *exp && !crate::expiry::replaying(),
             None => false,
         }
+    }
+
+    /// The fields that have not expired, if any has; `None` when every field
+    /// is live, and the fields can be read as they are. Nothing is evicted:
+    /// for readers that must not show an expired field and must not write,
+    /// such as the search indexes' document reads. Never while this thread
+    /// replays the AOF, as [`Self::is_field_expired`].
+    pub fn live_fields(&self) -> Option<HashFields> {
+        self.live_fields_as_of(&mut None)
+    }
+
+    /// [`Self::live_fields`] as of one time for every document a query
+    /// reads: the first of them with field TTLs reads the clock into `now`,
+    /// and the others are held to that time.
+    pub fn live_fields_as_of(&self, now: &mut Option<std::time::Instant>) -> Option<HashFields> {
+        // No TTL, no clock read.
+        self.expiries.earliest()?;
+        self.live_fields_at(*now.get_or_insert_with(std::time::Instant::now))
+    }
+
+    /// [`Self::live_fields`] as of `now`: a field is expired from its
+    /// deadline on. The deadlines are looked at only once the earliest
+    /// could have come.
+    pub(crate) fn live_fields_at(&self, now: std::time::Instant) -> Option<HashFields> {
+        if self
+            .expiries
+            .earliest()
+            .is_none_or(|earliest| now < earliest)
+            || crate::expiry::replaying()
+        {
+            return None;
+        }
+        if !self.expiries.values().any(|at| now >= *at) {
+            return None;
+        }
+        Some(
+            self.fields
+                .iter()
+                .filter(|(field, _)| !self.expiries.get(*field).is_some_and(|at| now >= *at))
+                .map(|(field, value)| (field.clone(), std::sync::Arc::clone(value)))
+                .collect(),
+        )
     }
 
     /// Remove a field's value AND its expiry entry. Returns the removed
@@ -750,19 +867,28 @@ impl HashInner {
     /// caller gets a clean view in one pass under a single lock.
     /// Returns the number of fields evicted.
     pub fn sweep_expired(&mut self) -> usize {
-        if self.expiries.is_empty() || crate::expiry::replaying() {
+        // No TTL, no clock read.
+        if self.expiries.is_empty() {
             return 0;
         }
-        let now = std::time::Instant::now();
-        let mut to_remove: Vec<String> = Vec::new();
-        for (field, exp) in self.expiries.iter() {
-            if now >= *exp {
-                to_remove.push(field.clone());
-            }
+        self.sweep_expired_at(std::time::Instant::now())
+    }
+
+    /// [`Self::sweep_expired`] as of `now`. Every deadline is at or after
+    /// `earliest`, so before it nothing can be due and the deadlines are
+    /// not looked at; from it on they all are, which makes it exact again.
+    pub(crate) fn sweep_expired_at(&mut self, now: std::time::Instant) -> usize {
+        if self
+            .expiries
+            .earliest()
+            .is_none_or(|earliest| now < earliest)
+            || crate::expiry::replaying()
+        {
+            return 0;
         }
+        let to_remove = self.expiries.take_due(now);
         for field in &to_remove {
             hash_remove(&mut self.fields, field);
-            self.expiries.remove(field);
         }
         to_remove.len()
     }
@@ -1314,5 +1440,368 @@ mod sorted_set_tests {
         assert_eq!(Arc::strong_count(&a), 3); // ours, members, by_score
         assert!(zs.remove(b"a"));
         assert_eq!(Arc::strong_count(&a), 1);
+    }
+}
+
+#[cfg(test)]
+mod live_fields_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// A hash of `names`, each field's value its name, with the times given.
+    fn hash(names: &[&str], times: &[(&str, Instant)]) -> HashInner {
+        let mut inner = HashInner::new();
+        for name in names {
+            inner
+                .fields
+                .insert(name.to_string(), Arc::from(name.as_bytes()));
+        }
+        for (name, at) in times {
+            inner.expiries.insert(name.to_string(), *at);
+        }
+        inner
+    }
+
+    fn names(fields: &HashFields) -> Vec<&str> {
+        fields.keys().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn nothing_is_copied_while_every_field_is_live() {
+        let now = Instant::now();
+        assert!(hash(&["a", "b"], &[]).live_fields_at(now).is_none());
+        let later = now + Duration::from_secs(60);
+        let inner = hash(&["a", "b"], &[("a", later), ("b", later)]);
+        assert!(inner.live_fields_at(now).is_none());
+    }
+
+    #[test]
+    fn expired_fields_are_left_out_in_order_and_nothing_is_evicted() {
+        let now = Instant::now();
+        let (past, later) = (now - Duration::from_secs(1), now + Duration::from_secs(60));
+        let inner = hash(
+            &["a", "b", "c", "d", "e"],
+            &[("b", past), ("c", later), ("d", past), ("gone", past)],
+        );
+        let live = inner
+            .live_fields_at(now)
+            .expect("b and d are past their time");
+        assert_eq!(names(&live), ["a", "c", "e"]);
+        // The values are the hash's own, not copies of their bytes.
+        assert!(Arc::ptr_eq(&live["a"], &inner.fields["a"]));
+        assert_eq!(inner.fields.len(), 5);
+        assert_eq!(inner.expiries.len(), 4);
+    }
+
+    #[test]
+    fn a_field_is_expired_from_its_deadline_on() {
+        let at = Instant::now() + Duration::from_secs(60);
+        let inner = hash(&["a", "b"], &[("a", at)]);
+        assert!(inner.live_fields_at(at - Duration::from_nanos(1)).is_none());
+        assert_eq!(names(&inner.live_fields_at(at).unwrap()), ["b"]);
+        assert_eq!(
+            names(&inner.live_fields_at(at + Duration::from_nanos(1)).unwrap()),
+            ["b"]
+        );
+    }
+
+    /// `earliest` is no later than any deadline, and there is one exactly
+    /// when there are deadlines.
+    fn assert_bound(e: &Expiries) {
+        match e.earliest() {
+            None => assert!(e.is_empty()),
+            Some(earliest) => {
+                assert!(!e.is_empty());
+                assert!(e.values().all(|at| earliest <= *at));
+            }
+        }
+    }
+
+    #[test]
+    fn an_earlier_deadline_lowers_the_bound_and_a_later_one_does_not_raise_it() {
+        let now = Instant::now();
+        let s = |n: u64| now + Duration::from_secs(n);
+        let mut e = Expiries::default();
+        assert_eq!(e.earliest(), None);
+        e.insert("a".into(), s(60));
+        assert_eq!(e.earliest(), Some(s(60)));
+        e.insert("b".into(), s(30));
+        assert_eq!(e.earliest(), Some(s(30)), "an earlier deadline");
+        e.insert("b".into(), s(90));
+        assert_eq!(e.earliest(), Some(s(30)), "extended: early, not late");
+        assert_bound(&e);
+        e.remove("a");
+        assert_eq!(e.earliest(), Some(s(30)), "removed: early, not late");
+        assert_bound(&e);
+        e.remove("b");
+        assert_eq!(e.earliest(), None, "none left");
+        e.insert("c".into(), s(5));
+        e.clear();
+        assert_eq!(e.earliest(), None);
+        assert!(e.is_empty());
+    }
+
+    #[test]
+    fn a_pass_over_the_deadlines_makes_the_bound_exact() {
+        let now = Instant::now();
+        let s = |n: u64| now + Duration::from_secs(n);
+        let mut e = Expiries::default();
+        e.insert("gone".into(), now - Duration::from_secs(1));
+        e.insert("a".into(), s(10));
+        e.insert("a".into(), s(50));
+        e.insert("b".into(), s(40));
+        assert_eq!(e.take_due(now), ["gone"]);
+        assert_eq!(e.earliest(), Some(s(40)));
+        assert_eq!(e.take_due(s(100)).len(), 2);
+        assert_eq!(e.earliest(), None);
+    }
+
+    #[test]
+    fn a_built_or_cloned_map_has_its_bound() {
+        let now = Instant::now();
+        let map: ahash::AHashMap<String, Instant> = [("a", 20), ("b", 10), ("c", 30)]
+            .iter()
+            .map(|(f, n)| (f.to_string(), now + Duration::from_secs(*n)))
+            .collect();
+        let e = Expiries::from(map);
+        assert_eq!(e.earliest(), Some(now + Duration::from_secs(10)));
+        assert_eq!(e.clone().earliest(), e.earliest());
+        assert_eq!(Expiries::from(ahash::AHashMap::new()).earliest(), None);
+        // A hash with field TTLs copied for COPY keeps them and the bound.
+        let mut inner = hash(&["a", "b"], &[("a", now + Duration::from_secs(5))]);
+        inner.fields.insert("x".into(), Arc::from(&b"x"[..]));
+        let value = KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(inner)));
+        let KiviDBValue::HashEx(copy) = value.deep_clone() else {
+            panic!("not a hash with field TTLs");
+        };
+        assert_eq!(
+            copy.read().expiries.earliest(),
+            Some(now + Duration::from_secs(5))
+        );
+    }
+
+    /// Any sequence of new, extended, shortened and removed deadlines, and
+    /// passes over them, keeps the bound; and the live fields are the ones a
+    /// look at every deadline finds.
+    #[test]
+    fn the_bound_holds_through_random_changes() {
+        let start = Instant::now();
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for _ in 0..200 {
+            let mut inner = HashInner::new();
+            for f in 0..8 {
+                inner.fields.insert(format!("f{f}"), Arc::from(&b"v"[..]));
+            }
+            for _ in 0..60 {
+                let field = format!("f{}", next(8));
+                match next(6) {
+                    0..=2 => {
+                        let at = start + Duration::from_millis(next(1000));
+                        inner.expiries.insert(field, at);
+                    }
+                    3 => {
+                        inner.expiries.remove(&field);
+                    }
+                    4 => {
+                        let now = start + Duration::from_millis(next(1000));
+                        for gone in inner.expiries.take_due(now) {
+                            inner.fields.insert(gone, Arc::from(&b"v"[..]));
+                        }
+                    }
+                    _ => {
+                        if next(10) == 0 {
+                            inner.expiries.clear();
+                        }
+                    }
+                }
+                assert_bound(&inner.expiries);
+                let now = start + Duration::from_millis(next(1100));
+                let expected: Vec<&str> = inner
+                    .fields
+                    .keys()
+                    .filter(|f| !inner.expiries.get(*f).is_some_and(|at| now >= *at))
+                    .map(String::as_str)
+                    .collect();
+                match inner.live_fields_at(now) {
+                    None => assert_eq!(expected.len(), inner.fields.len()),
+                    Some(live) => assert_eq!(names(&live), expected),
+                }
+                if next(4) == 0 {
+                    let expected: Vec<String> = expected.into_iter().map(String::from).collect();
+                    let removed = inner.sweep_expired_at(now);
+                    assert_eq!(names(&inner.fields), expected);
+                    assert_eq!(removed, 8 - expected.len());
+                    assert_bound(&inner.expiries);
+                    for f in 0..8 {
+                        let name = format!("f{f}");
+                        if !inner.fields.contains_key(&name) {
+                            inner.fields.insert(name, Arc::from(&b"v"[..]));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_sweep_before_the_earliest_deadline_looks_at_nothing() {
+        let now = Instant::now();
+        let s = |n: u64| now + Duration::from_secs(n);
+        let mut inner = hash(&["a", "b"], &[]);
+        assert_eq!(inner.sweep_expired(), 0);
+        assert_eq!(inner.sweep_expired_at(now), 0);
+        // Extended, so the bound is early; still in the future, so it
+        // stays as it is: the deadlines were not looked at.
+        inner.expiries.insert("a".into(), s(10));
+        inner.expiries.insert("a".into(), s(50));
+        inner.expiries.insert("b".into(), s(60));
+        assert_eq!(inner.sweep_expired(), 0);
+        assert_eq!(inner.sweep_expired_at(s(9)), 0);
+        assert_eq!(inner.expiries.earliest(), Some(s(10)));
+        assert_eq!((inner.fields.len(), inner.expiries.len()), (2, 2));
+    }
+
+    #[test]
+    fn a_sweep_removes_a_field_from_its_deadline_on() {
+        let at = Instant::now() + Duration::from_secs(60);
+        let mut inner = hash(&["a", "b"], &[("a", at)]);
+        assert_eq!(inner.sweep_expired_at(at - Duration::from_nanos(1)), 0);
+        assert_eq!(names(&inner.fields), ["a", "b"]);
+        assert_eq!(inner.sweep_expired_at(at), 1);
+        assert_eq!(names(&inner.fields), ["b"]);
+        assert_eq!(inner.expiries.earliest(), None);
+    }
+
+    #[test]
+    fn a_sweep_removes_every_field_due_and_makes_the_bound_exact() {
+        let now = Instant::now();
+        let s = |n: u64| now + Duration::from_secs(n);
+        let mut inner = hash(
+            &["a", "b", "c", "d", "e"],
+            &[
+                ("a", s(1)),
+                ("b", s(2)),
+                ("c", s(3)),
+                ("d", s(40)),
+                ("e", s(30)),
+            ],
+        );
+        assert_eq!(inner.sweep_expired_at(s(3)), 3);
+        assert_eq!(names(&inner.fields), ["d", "e"]);
+        assert_eq!(inner.expiries.earliest(), Some(s(30)));
+    }
+
+    /// HPERSIST and HDEL leave the bound early. Once it has come, a sweep
+    /// looks at the deadlines: it finds nothing due, or an expired field the
+    /// bound did not belong to, and leaves the bound exact.
+    #[test]
+    fn a_bound_left_early_brings_a_sweep_that_finds_what_is_due() {
+        let now = Instant::now();
+        let s = |n: u64| now + Duration::from_secs(n);
+        let mut inner = hash(
+            &["persisted", "deleted", "a", "b"],
+            &[
+                ("persisted", s(5)),
+                ("deleted", s(6)),
+                ("a", s(20)),
+                ("b", s(30)),
+            ],
+        );
+        inner.expiries.remove("persisted");
+        inner.evict_field("deleted");
+        assert_eq!(inner.expiries.earliest(), Some(s(5)));
+        assert_eq!(inner.sweep_expired_at(s(10)), 0);
+        assert_eq!(names(&inner.fields), ["persisted", "a", "b"]);
+        assert_eq!(inner.expiries.earliest(), Some(s(20)), "exact again");
+
+        // Early again, with a field due that the bound is not the time of.
+        inner.expiries.insert("c".into(), s(21));
+        inner.expiries.remove("a");
+        assert_eq!(inner.expiries.earliest(), Some(s(20)));
+        assert_eq!(inner.sweep_expired_at(s(25)), 1);
+        assert_eq!(names(&inner.fields), ["persisted", "a", "b"]);
+        assert_eq!(inner.expiries.earliest(), Some(s(30)));
+    }
+
+    #[test]
+    fn an_earlier_deadline_after_an_extension_is_swept_on_time() {
+        let now = Instant::now();
+        let s = |n: u64| now + Duration::from_secs(n);
+        let mut inner = hash(&["a", "b"], &[("a", s(10))]);
+        inner.expiries.insert("a".into(), s(50));
+        assert_eq!(inner.sweep_expired_at(s(20)), 0);
+        assert_eq!(inner.expiries.earliest(), Some(s(50)));
+        inner.expiries.insert("b".into(), s(30));
+        assert_eq!(inner.sweep_expired_at(s(29)), 0);
+        assert_eq!(inner.sweep_expired_at(s(30)), 1);
+        assert_eq!(names(&inner.fields), ["a"]);
+        assert_eq!(inner.expiries.earliest(), Some(s(50)));
+    }
+
+    #[test]
+    fn nothing_is_swept_while_the_aof_is_replayed() {
+        let now = Instant::now();
+        let mut inner = hash(&["a", "b"], &[("a", now - Duration::from_secs(1))]);
+        {
+            let _replay = crate::expiry::replay();
+            assert_eq!(inner.sweep_expired(), 0);
+            assert_eq!(inner.sweep_expired_at(now), 0);
+            assert_eq!(names(&inner.fields), ["a", "b"]);
+        }
+        assert_eq!(inner.sweep_expired(), 1);
+        assert_eq!(names(&inner.fields), ["b"]);
+    }
+
+    #[test]
+    fn nothing_is_left_out_while_the_aof_is_replayed() {
+        let now = Instant::now();
+        let inner = hash(&["a"], &[("a", now - Duration::from_secs(1))]);
+        {
+            let _replay = crate::expiry::replay();
+            assert!(inner.live_fields_at(now).is_none());
+            assert!(inner.live_fields().is_none());
+            assert!(inner.live_fields_as_of(&mut Some(now)).is_none());
+        }
+        assert!(inner.live_fields().is_some_and(|live| live.is_empty()));
+    }
+
+    /// A query reads the clock once, at its first document with field TTLs,
+    /// and holds the others to that time: a field is expired from it on.
+    #[test]
+    fn a_query_reads_the_clock_once_for_all_its_documents() {
+        let start = Instant::now();
+        let mut now = None;
+        assert!(hash(&["a"], &[]).live_fields_as_of(&mut now).is_none());
+        assert_eq!(now, None, "no field TTL, no clock read");
+        let later = hash(&["a"], &[("a", start + Duration::from_secs(60))]);
+        assert!(later.live_fields_as_of(&mut now).is_none());
+        let t = now.expect("read by the first document with field TTLs");
+        assert!(t >= start);
+        let at_t = hash(&["a", "b"], &[("a", t)]);
+        assert_eq!(names(&at_t.live_fields_as_of(&mut now).unwrap()), ["b"]);
+        let after_t = hash(&["a", "b"], &[("a", t + Duration::from_nanos(1))]);
+        assert!(after_t.live_fields_as_of(&mut now).is_none());
+        assert_eq!(now, Some(t), "the time is kept");
+    }
+
+    /// A field whose time comes while a query runs is part of the documents
+    /// that query reads after it; the next query reads the clock anew.
+    #[test]
+    fn a_field_that_expires_during_a_query_is_seen_by_the_rest_of_it() {
+        let query = Instant::now() - Duration::from_secs(2);
+        let inner = hash(
+            &["a", "b"],
+            &[("a", Instant::now() - Duration::from_secs(1))],
+        );
+        assert!(inner.live_fields_as_of(&mut Some(query)).is_none());
+        assert_eq!(names(&inner.live_fields_as_of(&mut None).unwrap()), ["b"]);
+        assert_eq!(names(&inner.live_fields().unwrap()), ["b"]);
     }
 }

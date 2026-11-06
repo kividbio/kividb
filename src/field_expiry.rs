@@ -205,17 +205,12 @@ pub fn sweep(store: &Store, index_store: &IndexStore) {
             };
             if let Some(hash) = hash {
                 let mut inner = hash.write();
-                expired = inner
-                    .expiries
-                    .iter()
-                    .filter(|(_, at)| **at <= now)
-                    .map(|(field, _)| field.clone())
-                    .collect();
+                expired = inner.expiries.take_due(now);
                 for field in &expired {
-                    inner.evict_field(field);
+                    crate::types::hash_remove(&mut inner.fields, field);
                 }
                 emptied = inner.fields.is_empty();
-                next = inner.expiries.values().min().copied();
+                next = inner.expiries.earliest();
             }
         }
 

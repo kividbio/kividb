@@ -667,6 +667,7 @@ fn read_numeric_field(
     def: &crate::vector::IndexDef,
     key: &str,
     field: &str,
+    now: &mut Option<std::time::Instant>,
 ) -> f64 {
     let Some(value) = crate::store::get_shard(db, key)
         .read()
@@ -675,7 +676,7 @@ fn read_numeric_field(
     else {
         return f64::NEG_INFINITY;
     };
-    let Some(inner) = crate::vector::doc_fields(&def.on, &def.fields, value.view()) else {
+    let Some(inner) = crate::vector::doc_fields_at(&def.on, &def.fields, value.view(), now) else {
         return f64::NEG_INFINITY;
     };
     // By the name the query knows the field by.
@@ -822,8 +823,9 @@ pub fn ft_hybrid(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 let db_ref = &ctx.store[*ctx.selected_db];
                 let mut keyed: Vec<(f64, (String, f64, f64, f64))> =
                     Vec::with_capacity(all_with_components.len());
+                let mut now = None;
                 for row in all_with_components.into_iter() {
-                    let v = read_numeric_field(db_ref, &def_clone, &row.0, field);
+                    let v = read_numeric_field(db_ref, &def_clone, &row.0, field, &mut now);
                     keyed.push((v, row));
                 }
                 if *descending {
@@ -861,6 +863,7 @@ pub fn ft_hybrid(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let db_ref = &ctx.store[*ctx.selected_db];
 
     let mut rows: Vec<crate::commands::aggregate_pipeline::Row> = Vec::with_capacity(page.len());
+    let mut now = None;
 
     for (key, hybrid_s, text_s, vsim_s) in &page {
         let mut row = ahash::AHashMap::new();
@@ -875,7 +878,12 @@ pub fn ft_hybrid(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 .get(key.as_str())
                 .map(ValueRef::to_value);
             let inner = value.as_ref().and_then(|value| {
-                crate::vector::doc_fields(&def_clone.on, &def_clone.fields, value.view())
+                crate::vector::doc_fields_at(
+                    &def_clone.on,
+                    &def_clone.fields,
+                    value.view(),
+                    &mut now,
+                )
             });
             if let Some(inner) = inner {
                 // A field of a JSON document goes by the name the schema

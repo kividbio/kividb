@@ -1129,9 +1129,12 @@ fn plan_in(
     };
     let store = &store[db];
     let any_volatile = !volatile.is_empty();
+    let mut now = None;
     for (key, id) in volatile {
         if exact {
-            let matches = with_doc(store, def, &key, |fields, _| filter::eval(filter, fields));
+            let matches = with_doc(store, def, &key, &mut now, |fields, _| {
+                filter::eval(filter, fields)
+            });
             if matches == Some(true) {
                 ids.set(id);
             } else {
@@ -1218,6 +1221,7 @@ pub(crate) fn filter_each(
 ) -> bool {
     let db = &ctx.store[*ctx.selected_db];
     let mut timed_out = false;
+    let mut now = None;
 
     // From postings, if they narrow the filter: the documents they name, each
     // read only to hand it over, or to try it where they are not exact.
@@ -1227,7 +1231,7 @@ pub(crate) fn filter_each(
             if deadline_due(deadline, &mut seen) {
                 return true;
             }
-            with_doc(db, def, &key, |fields, json| {
+            with_doc(db, def, &key, &mut now, |fields, json| {
                 if plan.exact || filter::eval(filter, fields) {
                     accept(&key, fields, json);
                 }
@@ -1306,7 +1310,7 @@ pub(crate) fn filter_each(
                 if !covers(def, key) {
                     continue;
                 }
-                with_doc(db, def, key, |fields, json| {
+                with_doc(db, def, key, &mut now, |fields, json| {
                     if *matches || filter::eval(filter, fields) {
                         accept(key, fields, json);
                     }
@@ -1318,7 +1322,9 @@ pub(crate) fn filter_each(
                 if !covers(def, key) {
                     return;
                 }
-                if let Some(fields) = crate::vector::doc_fields(&def.on, &def.fields, value) {
+                if let Some(fields) =
+                    crate::vector::doc_fields_at(&def.on, &def.fields, value, &mut now)
+                {
                     let json = fields.json();
                     consider(key, &fields, json);
                 }
@@ -1331,11 +1337,14 @@ pub(crate) fn filter_each(
 }
 
 /// Run `f` on the document at `key`, if there is one of the kind the index
-/// covers: on its fields, and for a JSON document on the document too.
+/// covers: on its fields, and for a JSON document on the document too. A
+/// field's time is held to `now`, read by the first document of the query
+/// that needs it (see [`crate::types::HashInner::live_fields_as_of`]).
 pub(crate) fn with_doc<R>(
     db: &Db,
     def: &IndexDef,
     key: &str,
+    now: &mut Option<Instant>,
     f: impl FnOnce(&Fields, Option<&serde_json::Value>) -> R,
 ) -> Option<R> {
     // Out of the shard, so that its lock is not held while `f` runs. A key
@@ -1351,7 +1360,13 @@ pub(crate) fn with_doc<R>(
     };
     match (&def.on, &value) {
         (IndexOn::Hash, KiviDBValue::Hash(hash)) => Some(f(&hash.read(), None)),
-        (IndexOn::Hash, KiviDBValue::HashEx(hash)) => Some(f(&hash.read().fields, None)),
+        // A field past its time is no part of the document, though the
+        // sweep has not removed it yet.
+        (IndexOn::Hash, KiviDBValue::HashEx(hash)) => {
+            let inner = hash.read();
+            let live = inner.live_fields_as_of(now);
+            Some(f(live.as_ref().unwrap_or(&inner.fields), None))
+        }
         (IndexOn::Json, KiviDBValue::Json(doc)) => {
             let doc = doc.read();
             Some(f(
@@ -1611,8 +1626,9 @@ fn page_from_postings(
     // sorted by a number).
     let scoring = crate::vector::score::Scoring::new(def, filter, scorer);
     let mut page = Vec::with_capacity(picked.len());
+    let mut now = None;
     for (key, number) in picked {
-        let hit = with_doc(db, def, &key, |fields, json| {
+        let hit = with_doc(db, def, &key, &mut now, |fields, json| {
             if !filter::eval(filter, fields) {
                 return None;
             }
@@ -2360,6 +2376,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
         // is kept here too. Cut short, the hits are not sorted.
         let mut seen = 0u32;
         let mut keyed = true;
+        let mut now = None;
         for hit in &mut hits {
             if deadline_due(deadline, &mut seen) {
                 timed_out = true;
@@ -2370,7 +2387,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
             // holds.
             hit.sort_key = match hit.extras.iter().find(|(alias, _)| alias == name) {
                 Some((_, value)) => value.parse::<f64>().ok().map(SortKey::Number),
-                None => with_doc(db, &def, &hit.key, |fields, _| {
+                None => with_doc(db, &def, &hit.key, &mut now, |fields, _| {
                     sort_key_of(fields, source, numeric, unf)
                 })
                 .flatten(),
@@ -2422,7 +2439,8 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
     let nocontent = args.nocontent || args.returns.as_ref().is_some_and(|r| r.is_empty());
 
     // The fields of one hit, as (name, value).
-    let fields_of = |hit: &Hit| -> Vec<(String, Vec<u8>)> {
+    let mut now = None;
+    let mut fields_of = |hit: &Hit| -> Vec<(String, Vec<u8>)> {
         let shown = |source: &str, value: &[u8]| -> Vec<u8> {
             let Some((only, open, close)) = &args.highlight else {
                 return value.to_vec();
@@ -2446,7 +2464,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 .map(|(alias, value)| (alias.clone(), value.clone().into_bytes()))
                 .collect()
         };
-        with_doc(db, &def, &hit.key, |fields, json| {
+        with_doc(db, &def, &hit.key, &mut now, |fields, json| {
             match (&args.returns, json) {
                 (Some(returns), _) => returns
                     .iter()
@@ -2888,6 +2906,118 @@ mod tests {
             "the sweep ran, and the hash is no longer watched"
         );
         assert_eq!(matches(&plan), ["d347:a"], "the swept hash was tried");
+    }
+
+    /// A field past its time that the sweep has not yet removed is no part
+    /// of the document to a query: not to the postings' plan, nor to the
+    /// documents read for a filter, a projection or a sort.
+    #[test]
+    fn a_field_past_its_time_is_not_part_of_the_document() {
+        use crate::types::HashInner;
+        let store = crate::store::new_store(1);
+        let _own = crate::field_expiry::OwnWatches::of(&store);
+        let def = IndexSchema {
+            name: "lv".into(),
+            db_index: 0,
+            on: IndexOn::Hash,
+            prefixes: vec!["lv:".into()],
+            fields: ["n", "o"]
+                .map(|name| SchemaField {
+                    name: name.into(),
+                    field_type: FieldType::Numeric,
+                    options: FieldOptions::default(),
+                })
+                .to_vec(),
+            aliases: Vec::new(),
+            stopwords: None,
+            synonyms: Default::default(),
+            language: Default::default(),
+            default_score: 1.0,
+            score_field: None,
+        }
+        .into_def();
+        let fields: Vec<(String, Arc<[u8]>)> = vec![
+            ("n".into(), Arc::from(&b"1"[..])),
+            ("o".into(), Arc::from(&b"2"[..])),
+        ];
+        let mut inner = HashInner::new();
+        for (name, value) in &fields {
+            inner.fields.insert(name.clone(), Arc::clone(value));
+        }
+        inner
+            .expiries
+            .insert("n".into(), Instant::now() - Duration::from_secs(1));
+        inner
+            .expiries
+            .insert("o".into(), Instant::now() + Duration::from_secs(60));
+        crate::store::get_shard(&store[0], "lv:1").write().insert(
+            "lv:1",
+            KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(inner))),
+        );
+        let mut p = def.postings.write();
+        p.write("lv:1", &fields, true);
+        def.postings.done(p);
+        crate::field_expiry::track_key(&store, 0, "lv:1");
+
+        let range = |field: &str| Filter::Numeric {
+            field: field.into(),
+            lo: 0.0,
+            lo_exclusive: false,
+            hi: 10.0,
+            hi_exclusive: false,
+        };
+        let found = |filter: &Filter| -> Vec<String> {
+            let plan = plan_in(&store, 0, &def, filter, None).unwrap();
+            keys_of(&def, &plan.ids)
+                .iter()
+                .map(|key| key.to_string())
+                .collect()
+        };
+        assert!(found(&range("n")).is_empty(), "n has expired");
+        assert_eq!(found(&range("o")), ["lv:1"], "o is live");
+
+        let seen = with_doc(&store[0], &def, "lv:1", &mut None, |fields, json| {
+            assert!(json.is_none());
+            fields.keys().cloned().collect::<Vec<_>>()
+        });
+        assert_eq!(seen.unwrap(), ["o"]);
+        let shard = crate::store::get_shard(&store[0], "lv:1").read();
+        let doc =
+            crate::vector::doc_fields(&def.on, &def.fields, shard.get("lv:1").unwrap()).unwrap();
+        assert!(doc.json().is_none());
+        assert!(doc.get("n").is_none());
+        assert_eq!(doc.get("o").map(|v| &v[..]), Some(&b"2"[..]));
+        drop(doc);
+        // The hash itself is as it was: nothing was evicted.
+        match shard.get("lv:1") {
+            Some(ValueRef::HashEx(hash)) => assert_eq!(hash.read().fields.len(), 2),
+            _ => panic!("no hash"),
+        }
+        drop(shard);
+
+        // Held to a time before n's, as a query that began then is: n is
+        // part of the document, to `with_doc` and `doc_fields_at` alike.
+        let mut before = Some(Instant::now() - Duration::from_secs(5));
+        let seen = with_doc(&store[0], &def, "lv:1", &mut before, |fields, _| {
+            fields.len()
+        });
+        assert_eq!(seen, Some(2));
+        let shard = crate::store::get_shard(&store[0], "lv:1").read();
+        let doc = crate::vector::doc_fields_at(
+            &def.on,
+            &def.fields,
+            shard.get("lv:1").unwrap(),
+            &mut before,
+        )
+        .unwrap();
+        assert!(doc.get("n").is_some());
+        drop(doc);
+        drop(shard);
+
+        // While the AOF is replayed, the field is there.
+        let _replay = crate::expiry::replay();
+        let seen = with_doc(&store[0], &def, "lv:1", &mut None, |fields, _| fields.len());
+        assert_eq!(seen, Some(2));
     }
 
     fn words(cmd: &[&str]) -> Result<Vec<SchemaField>, String> {

@@ -2104,7 +2104,7 @@ fn read_image(
                     }
                     let inner = crate::types::HashInner {
                         fields: hmap,
-                        expiries: exps,
+                        expiries: exps.into(),
                     };
                     KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(inner)))
                 }
@@ -5047,7 +5047,7 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
             }
             let inner = crate::types::HashInner {
                 fields: map,
-                expiries: exps,
+                expiries: exps.into(),
             };
             Some(KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(
                 inner,
@@ -5498,6 +5498,41 @@ mod expiry_section_tests {
         let loaded = load_snapshot_from(&image(&[db0], &exp)[..]).unwrap();
         assert!(!loaded.dbs[0].contains_key("hxgone"));
         assert!(!loaded.expiries[0].contains_key("hxgone"));
+    }
+
+    /// A hash with field TTLs, loaded from an image or a `DUMP` payload,
+    /// knows the earliest of its fields' deadlines.
+    #[test]
+    fn a_loaded_hash_knows_its_earliest_field_deadline() {
+        let now = std::time::Instant::now();
+        let mut hash = crate::types::HashInner::new();
+        for (field, secs) in [("a", 300u64), ("b", 100), ("c", 200)] {
+            hash.fields.insert(field.to_string(), Arc::from(&b"v"[..]));
+            hash.expiries.insert(
+                field.to_string(),
+                now + std::time::Duration::from_secs(secs),
+            );
+        }
+        hash.fields
+            .insert("plain".to_string(), Arc::from(&b"v"[..]));
+        let value = KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(hash)));
+        let check = |value: &KiviDBValue| {
+            let KiviDBValue::HashEx(hash) = value else {
+                panic!("not a hash with field TTLs");
+            };
+            let hash = hash.read();
+            assert_eq!(hash.expiries.len(), 3);
+            assert_eq!(
+                hash.expiries.earliest(),
+                hash.expiries.values().min().copied()
+            );
+        };
+        let db0 = HashMap::from([("hx".to_string(), value.clone())]);
+        let loaded = load_snapshot_from(&image(&[db0], &[HashMap::new()])[..]).unwrap();
+        check(&loaded.dbs[0]["hx"]);
+        let mut payload = Vec::new();
+        serialize_value(&value, &mut payload).unwrap();
+        check(&deserialize_value(&payload).expect("RESTORE reads it"));
     }
 
     /// An image with no expiry section — everything written before this

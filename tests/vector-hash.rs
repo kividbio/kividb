@@ -4998,6 +4998,181 @@ fn test_httl_after_field_expires_returns_minus_two() {
     assert_eq!(r.as_array()[0].as_int(), -2);
 }
 
+/// Wait, up to five seconds, for `done`.
+fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !done() {
+        assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+// Each point read answers for an expired field as if it were gone, and
+// leaves the live fields and their times as they were.
+#[test]
+fn test_point_reads_of_expired_fields() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&["HSET", "h", "a", "1", "b", "22", "c", "3", "d", "4"]);
+    c.cmds(&["HPEXPIRE", "h", "50", "FIELDS", "2", "a", "c"]);
+    c.cmds(&["HPEXPIRE", "h", "600000", "FIELDS", "1", "d"]);
+    std::thread::sleep(std::time::Duration::from_millis(120));
+
+    assert!(c.cmds(&["HGET", "h", "a"]).is_nil());
+    let r = c.cmds(&["HMGET", "h", "a", "b", "a", "missing", "c", "d"]);
+    let items = r.as_array();
+    assert_eq!(items.len(), 6);
+    assert!(items[0].is_nil() && items[2].is_nil() && items[3].is_nil() && items[4].is_nil());
+    assert_eq!(items[1].as_str(), "22");
+    assert_eq!(items[5].as_str(), "4");
+    assert_eq!(c.cmds(&["HEXISTS", "h", "c"]).as_int(), 0);
+    assert_eq!(c.cmds(&["HEXISTS", "h", "b"]).as_int(), 1);
+    assert_eq!(c.cmds(&["HSTRLEN", "h", "a"]).as_int(), 0);
+    assert_eq!(c.cmds(&["HSTRLEN", "h", "b"]).as_int(), 2);
+    for cmd in ["HTTL", "HPTTL", "HEXPIRETIME", "HPEXPIRETIME"] {
+        let r = c.cmds(&[cmd, "h", "FIELDS", "4", "a", "b", "c", "d"]);
+        let r = r.as_array();
+        assert_eq!(r[0].as_int(), -2, "{cmd}");
+        assert_eq!(r[1].as_int(), -1, "{cmd}");
+        assert_eq!(r[2].as_int(), -2, "{cmd}");
+        assert!(r[3].as_int() > 0, "{cmd}");
+    }
+    assert_eq!(c.cmds(&["HLEN", "h"]).as_int(), 2);
+    assert_eq!(c.cmds(&["HGETALL", "h"]).as_array().len(), 4);
+}
+
+// Fields nobody reads still go when their time comes, with the memory they
+// held; the hash goes once none is left.
+#[test]
+fn test_cold_expired_fields_are_reclaimed_without_a_read() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let n = 5000;
+    let names: Vec<String> = (0..n).map(|i| format!("field:{i}")).collect();
+    let mut hset = vec!["HSET".to_string(), "cold".into(), "keep".into(), "v".into()];
+    for name in &names {
+        hset.push(name.clone());
+        hset.push("x".repeat(64));
+    }
+    let hset: Vec<&str> = hset.iter().map(String::as_str).collect();
+    assert_eq!(c.cmds(&hset).as_int(), n as i64 + 1);
+    let mut expire = vec!["HPEXPIRE".to_string(), "cold".into(), "100".into()];
+    expire.push("FIELDS".into());
+    expire.push(n.to_string());
+    expire.extend(names.iter().cloned());
+    let expire: Vec<&str> = expire.iter().map(String::as_str).collect();
+    assert_eq!(c.cmds(&expire).as_array().len(), n);
+    let before = c.cmds(&["MEMORY", "USAGE", "cold"]).as_int();
+
+    // MEMORY USAGE reads the hash as it is, without evicting anything.
+    wait_for("the sweep reclaims the expired fields", || {
+        c.cmds(&["MEMORY", "USAGE", "cold"]).as_int() < before / 10
+    });
+    let r = c.cmds(&["HPTTL", "cold", "FIELDS", "2", "keep", "field:0"]);
+    assert_eq!(r.as_array()[0].as_int(), -1);
+    assert_eq!(r.as_array()[1].as_int(), -2);
+
+    c.cmds(&["HPEXPIRE", "cold", "50", "FIELDS", "1", "keep"]);
+    wait_for("the emptied hash is deleted", || {
+        c.cmds(&["EXISTS", "cold"]).as_int() == 0
+    });
+}
+
+// Point reads of a field that keeps expiring and being written again never
+// see a value it did not have, and the last write is what stays.
+#[test]
+fn test_point_reads_beside_writes_to_an_expiring_field() {
+    let port = free_port();
+    start_server(port);
+    let mut setup = Conn::connect(port);
+    setup.cmds(&["HSET", "race", "f", "v0", "other", "o"]);
+    setup.cmds(&["HPEXPIRE", "race", "600000", "FIELDS", "1", "other"]);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let r = c.cmds(&["HGET", "race", "f"]);
+                    assert!(
+                        r.is_nil() || r.as_str().starts_with('v') || r.as_str() == "last",
+                        "{r:?}"
+                    );
+                    let r = c.cmds(&["HMGET", "race", "f", "other"]);
+                    assert_eq!(r.as_array()[1].as_str(), "o");
+                }
+            })
+        })
+        .collect();
+    let mut w = Conn::connect(port);
+    for i in 1..300 {
+        w.cmds(&["HSET", "race", "f", &format!("v{i}")]);
+        w.cmds(&["HPEXPIRE", "race", "1", "FIELDS", "1", "f"]);
+        if i % 3 == 0 {
+            w.cmds(&["HPEXPIRE", "race", "600000", "FIELDS", "1", "f"]);
+        }
+    }
+    w.cmds(&["HSET", "race", "f", "last"]);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for r in readers {
+        r.join().unwrap();
+    }
+    assert_eq!(w.cmds(&["HGET", "race", "f"]).as_str(), "last");
+    assert_eq!(w.cmds(&["HGET", "race", "other"]).as_str(), "o");
+}
+
+// An indexed field that a point read finds expired is out of the query's
+// results; the hash's other fields still are, and a new value is found.
+#[test]
+fn test_an_expired_indexed_field_found_by_a_point_read() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    assert!(
+        c.cmds(&[
+            "FT.CREATE",
+            "fe",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "fe:",
+            "SCHEMA",
+            "n",
+            "NUMERIC",
+            "o",
+            "NUMERIC",
+        ])
+        .is_ok()
+    );
+    c.cmds(&["HSET", "fe:1", "n", "1", "o", "2"]);
+    let count = |c: &mut Conn, query: &str| {
+        c.cmds(&["FT.SEARCH", "fe", query, "NOCONTENT"]).as_array()[0].as_int()
+    };
+    assert_eq!(count(&mut c, "@n:[0 10]"), 1);
+    c.cmds(&["HPEXPIRE", "fe:1", "50", "FIELDS", "1", "n"]);
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    assert!(c.cmds(&["HGET", "fe:1", "n"]).is_nil());
+    assert_eq!(count(&mut c, "@n:[0 10]"), 0);
+    assert_eq!(count(&mut c, "@o:[0 10]"), 1);
+    wait_for("the sweep brings the postings up to date", || {
+        count(&mut c, "@n:[0 10]") == 0 && count(&mut c, "@o:[0 10]") == 1
+    });
+
+    c.cmds(&["HSET", "fe:1", "n", "3"]);
+    assert_eq!(count(&mut c, "@n:[3 3]"), 1);
+
+    c.cmds(&["HPEXPIRE", "fe:1", "50", "FIELDS", "2", "n", "o"]);
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    assert!(c.cmds(&["HGET", "fe:1", "o"]).is_nil());
+    wait_for("the emptied hash leaves the index", || {
+        c.cmds(&["EXISTS", "fe:1"]).as_int() == 0 && count(&mut c, "@o:[0 10]") == 0
+    });
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // HPERSIST
 // ═════════════════════════════════════════════════════════════════════════════
@@ -5835,4 +6010,111 @@ fn test_aggregate_with_knn_keeps_the_nearest() {
     let rows = r.as_array();
     assert_eq!(rows.len(), 2, "{r:?}");
     assert_eq!(rows[1].as_array()[1].as_str(), "near", "{r:?}");
+}
+
+// Whole-hash reads beside changes to the fields' times: the fields that
+// keep a time far off are always there, and the one that keeps expiring is
+// there at most once; once it has expired, it is gone.
+#[test]
+fn test_whole_hash_reads_beside_changes_to_field_times() {
+    let port = free_port();
+    start_server(port);
+    let mut setup = Conn::connect(port);
+    let mut hset = vec!["HSET".to_string(), "whole".into()];
+    let mut expire = vec![
+        "HPEXPIRE".to_string(),
+        "whole".into(),
+        "600000".into(),
+        "FIELDS".into(),
+        "10".into(),
+    ];
+    for i in 0..10 {
+        hset.push(format!("keep{i}"));
+        hset.push("k".into());
+        expire.push(format!("keep{i}"));
+    }
+    setup.cmds(&hset.iter().map(String::as_str).collect::<Vec<_>>());
+    setup.cmds(&expire.iter().map(String::as_str).collect::<Vec<_>>());
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let n = c.cmds(&["HLEN", "whole"]).as_int();
+                    assert!(n == 10 || n == 11, "HLEN {n}");
+                    let r = c.cmds(&["HGETALL", "whole"]);
+                    let names: Vec<&str> =
+                        r.as_array().iter().step_by(2).map(|v| v.as_str()).collect();
+                    assert!(names.len() == 10 || names.len() == 11, "{names:?}");
+                    for i in 0..10 {
+                        assert!(names.contains(&format!("keep{i}").as_str()), "{names:?}");
+                    }
+                }
+            })
+        })
+        .collect();
+    let mut w = Conn::connect(port);
+    for i in 1..300 {
+        w.cmds(&["HSET", "whole", "f", &format!("v{i}")]);
+        w.cmds(&["HPEXPIRE", "whole", "1", "FIELDS", "1", "f"]);
+        match i % 4 {
+            0 => {
+                w.cmds(&["HPERSIST", "whole", "FIELDS", "1", "f"]);
+            }
+            1 => {
+                w.cmds(&["HPEXPIRE", "whole", "600000", "FIELDS", "1", "f"]);
+            }
+            2 => {
+                w.cmds(&["HDEL", "whole", "f"]);
+            }
+            _ => {}
+        }
+    }
+    w.cmds(&["HSET", "whole", "f", "last"]);
+    w.cmds(&["HPEXPIRE", "whole", "20", "FIELDS", "1", "f"]);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for r in readers {
+        r.join().unwrap();
+    }
+    wait_for("the last time of f comes", || {
+        w.cmds(&["HLEN", "whole"]).as_int() == 10
+    });
+    assert!(w.cmds(&["HGET", "whole", "f"]).is_nil());
+}
+
+// Whole-hash reads before any field's time has come leave the sweep to
+// remove the fields once it does, though nothing reads them then.
+#[test]
+fn test_fields_expire_without_a_read_after_whole_hash_reads() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let n = 2000;
+    let names: Vec<String> = (0..n).map(|i| format!("field:{i}")).collect();
+    let mut hset = vec!["HSET".to_string(), "read".into(), "keep".into(), "v".into()];
+    for name in &names {
+        hset.push(name.clone());
+        hset.push("x".repeat(64));
+    }
+    c.cmds(&hset.iter().map(String::as_str).collect::<Vec<_>>());
+    c.cmds(&["HPEXPIRE", "read", "600000", "FIELDS", "1", "keep"]);
+    let mut expire = vec!["HPEXPIRE".to_string(), "read".into(), "300".into()];
+    expire.push("FIELDS".into());
+    expire.push(n.to_string());
+    expire.extend(names.iter().cloned());
+    c.cmds(&expire.iter().map(String::as_str).collect::<Vec<_>>());
+    for _ in 0..5 {
+        assert_eq!(c.cmds(&["HLEN", "read"]).as_int(), n as i64 + 1);
+    }
+    assert_eq!(c.cmds(&["HGETALL", "read"]).as_array().len(), 2 * (n + 1));
+    let before = c.cmds(&["MEMORY", "USAGE", "read"]).as_int();
+
+    // MEMORY USAGE reads the hash as it is, without evicting anything.
+    wait_for("the sweep reclaims the expired fields", || {
+        c.cmds(&["MEMORY", "USAGE", "read"]).as_int() < before / 10
+    });
+    assert_eq!(c.cmds(&["HLEN", "read"]).as_int(), 1);
+    assert_eq!(c.cmds(&["HGET", "read", "keep"]).as_str(), "v");
 }
