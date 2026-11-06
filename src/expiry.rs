@@ -201,7 +201,12 @@ pub fn order<'a>(db: usize, keys: impl Iterator<Item = &'a [u8]>) -> Ordered {
 /// write still holding what it holds for its own record ([`order`]).
 #[cold]
 #[inline(never)]
-pub fn written_over(store: usize, db: usize, keys: &[String]) {
+pub fn written_over(store: usize, db: usize, keys: &[crate::store::Key]) {
+    let keys: Vec<String> = keys
+        .iter()
+        .map(|key| crate::store::key_text(key).to_owned())
+        .collect();
+    let keys = keys.as_slice();
     crate::keyspace_events::written_over_expired(store, db, keys);
     for key in keys {
         crate::watch::expired_in(store, db, key);
