@@ -82,6 +82,30 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A search index is seen only from its own database.** `FT._LIST`
+  listed the indexes of every database, and the commands that name an
+  index found one of another database: from database 1, `FT.SEARCH`
+  searched database 0's index, `FT.DROPINDEX` dropped it, and
+  `FT.ALIASUPDATE` moved database 0's alias to database 1's index.
+  `FT._LIST` now lists the selected database's indexes, and from another
+  database an index, or an alias of one, is not there: `FT.INFO`,
+  `FT.SEARCH`, `FT.AGGREGATE`, `FT.DROPINDEX`, `FT.ALTER`, `FT.ALIASADD`,
+  `FT.DEBUG` and the other commands that name one reply `Index not found`,
+  `FT.ALIASDEL` replies `Alias does not exist`, and `FT.ALIASUPDATE` of
+  another database's alias replies `Alias already exists`. Index names
+  are still one namespace for all databases: `FT.CREATE` of a name
+  another database has is still refused with `Index already exists`
+  (#447).
+
+  **Upgrade note:** an AOF written by 1.2.0, or the stream of a 1.2.0
+  master, may hold an `FT.DROPINDEX`, `FT.ALTER`, `FT.ALIASADD` or
+  `FT.ALIASUPDATE` sent from one database for an index of another. 1.2.1
+  refuses it when it replays or applies it, as it refuses it from a
+  client, and the index is left as it was: not dropped, altered or given
+  the alias. A 1.2.1 replica of a 1.2.0 master can so keep an index its
+  master dropped that way; upgrade the master first, or drop the index
+  from its own database.
+
 - **A snapshot holding the empty key can be loaded.** Redis allows the
   key `""`, and so does KiviDB, but in a KiviDB snapshot a key length of 0
   marks the end of a database, and the empty key was written with that
