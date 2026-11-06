@@ -742,6 +742,16 @@ impl FieldClock {
             })
     }
 
+    /// [`FieldClock::instant_of`], checked: `None` (the outer one) for a
+    /// time further out than an `Instant` can hold, which a file from
+    /// elsewhere may claim; `Some(None)` once it has come.
+    pub fn checked_instant_of(&self, at_ms: u64) -> Option<Option<std::time::Instant>> {
+        match Duration::from_millis(at_ms).checked_sub(self.wall) {
+            Some(left) if !left.is_zero() => self.mono.checked_add(left).map(Some),
+            _ => Some(None),
+        }
+    }
+
     /// `at` as Unix milliseconds, to the nearest one; past `u64::MAX`,
     /// `u64::MAX`. Cut to 64 bits, a deadline that far out was saved as a
     /// moment from now, and the field was gone after a restart.
