@@ -87,6 +87,15 @@ fn store_id(store: &Store) -> usize {
     std::sync::Arc::as_ptr(store) as *const () as usize
 }
 
+/// What a hash's place on the watch list takes, for a key of `key_len`
+/// bytes (`MEMORY USAGE`): its bucket and control byte in the list's
+/// table, and its own copy of the key (`to_string`, exactly as long as the
+/// key). Not the table's empty room: that is no one hash's, and deleting a
+/// hash does not give it back (the table does not shrink).
+pub fn watch_entry_size(key_len: usize) -> usize {
+    std::mem::size_of::<(Entry, Instant)>() + 1 + key_len
+}
+
 /// Note that the hash at `key` has a field due at `at`.
 pub fn track(store: &Store, db: usize, key: &str, at: Instant) {
     let mut watched = WATCHED.lock();
