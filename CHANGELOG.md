@@ -82,6 +82,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **RDB files from Redis Stack 6.2 load.** Redis Stack 6.2 writes
+  RedisGraph's module data (`graphdata`) into every RDB file, with or
+  without graphs, and KiviDB refused the whole file, so a `dump.rdb` of
+  Redis Stack 6.2 could not be moved in at all. That module data is now
+  read past, as the search module's is. A graph itself, a key of module
+  type `graphdata`, is still refused, and so is the file that holds it.
 - **A snapshot holding the empty key can be loaded.** Redis allows the
   key `""`, and so does KiviDB, but in a KiviDB snapshot a key length of 0
   marks the end of a database, and the empty key was written with that
