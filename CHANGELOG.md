@@ -82,6 +82,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A negative Unix time no longer deletes hash fields.** `HEXPIREAT` and
+  `HPEXPIREAT` with a time below 0, and `HGETEX` and `HSETEX` with a
+  negative `EXAT` or `PXAT`, took it as a time that had passed and deleted
+  the fields. Redis keeps them and refuses the command with `ERR invalid
+  expire time, must be >= 0`, and so does KiviDB now. A time of 0 is still
+  taken, and the fields go, as in Redis (#486).
+
+  **Upgrade note:** 1.2.0 logged and sent such a command as it came. An
+  AOF it wrote, or the stream of a 1.2.0 master, is still applied as 1.2.0
+  applied it, so the fields it deleted stay deleted.
+
 - **A replica set to `replica-priority 0` is no longer promoted by
   Sentinel.** `CONFIG SET replica-priority` and the config file took the
   setting and `CONFIG GET` gave it back, but `INFO replication` always
@@ -113,7 +124,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   '<command>' command`. KiviDB took any: `HEXPIRE h 18446744073709552
   FIELDS 1 f` was saved as a moment from then, so the field was gone after
   a restart, a full sync, `RESTORE` or `MIGRATE`, and `HEXPIRE h
-  9223372036854775807 FIELDS 1 f` stopped the server.
+  9223372036854775807 FIELDS 1 f` panicked and closed the client's
+  connection, with no reply.
 
 - **A search index is seen only from its own database.** `FT._LIST`
   listed the indexes of every database, and the commands that name an
