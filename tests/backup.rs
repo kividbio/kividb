@@ -1802,3 +1802,218 @@ fn a_backup_into_the_data_directory_is_refused() {
         "{reply:?}"
     );
 }
+
+// ── The empty key (#441) ─────────────────────────────────────────────────────
+//
+// Redis allows the empty key. In a snapshot it was written with the key
+// length that ends a database, and the next start failed: "dump.kdb cannot
+// be loaded: failed to fill whole buffer".
+
+/// Stop `server` with no warning and start another in its directory, as
+/// `extra` says. One that does not start fails the test with what it said.
+fn killed_and_started_again(server: &mut Server, extra: &[&str]) -> Server {
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    start_in(&server.dir, extra)
+}
+
+/// The empty key of each kind of value, and empty members and fields.
+fn write_empty_keys(c: &mut Conn) {
+    assert!(c.cmd(&["SET", "", "x", "EX", "100000"]).ok());
+    assert_eq!(c.cmd(&["HSET", "hash", "", "v"]).i(), 1);
+    assert_eq!(c.cmd(&["SADD", "set", ""]).i(), 1);
+    assert_eq!(c.cmd(&["ZADD", "zset", "1.5", ""]).i(), 1);
+    assert_eq!(c.cmd(&["RPUSH", "list", "", "e"]).i(), 2);
+    assert!(c.cmd(&["SELECT", "1"]).ok());
+    assert_eq!(c.cmd(&["HSET", "", "", "in-1"]).i(), 1);
+    assert_eq!(c.cmd(&["EXPIRE", "", "200000"]).i(), 1);
+    assert!(c.cmd(&["SET", "after", "1"]).ok());
+    assert!(c.cmd(&["SELECT", "0"]).ok());
+}
+
+fn assert_empty_keys(c: &mut Conn) {
+    assert_eq!(c.cmd(&["GET", ""]).s(), "x");
+    let ttl = c.cmd(&["TTL", ""]).i();
+    assert!((1..=100000).contains(&ttl), "TTL of the empty key: {ttl}");
+    assert_eq!(c.cmd(&["HGET", "hash", ""]).s(), "v");
+    assert_eq!(c.cmd(&["SISMEMBER", "set", ""]).i(), 1);
+    assert_eq!(c.cmd(&["ZSCORE", "zset", ""]).s(), "1.5");
+    assert_eq!(c.cmd(&["LRANGE", "list", "0", "-1"]).strings(), ["", "e"]);
+    assert!(c.cmd(&["SELECT", "1"]).ok());
+    assert_eq!(c.cmd(&["HGET", "", ""]).s(), "in-1");
+    let ttl = c.cmd(&["TTL", ""]).i();
+    assert!(
+        (100001..=200000).contains(&ttl),
+        "TTL of the empty key in database 1: {ttl}"
+    );
+    assert_eq!(c.cmd(&["GET", "after"]).s(), "1");
+    assert!(c.cmd(&["SELECT", "0"]).ok());
+}
+
+#[test]
+fn the_empty_key_survives_a_save_and_a_restart() {
+    let mut server = Server::start(&[]);
+    let mut c = server.conn();
+    write_empty_keys(&mut c);
+    assert!(c.cmd(&["SAVE"]).ok());
+    drop(c);
+    // Written under the stand-in length: the stand-in, the string tag, a
+    // length of 1 and the value. The server also reads 1.2.0's layout, so
+    // a restart alone would not show the writer had gone back to it.
+    let dump = std::fs::read(server.dir.join("dump.kdb")).unwrap();
+    let entry = [0xFF, 0xFF, 0xFF, 0xFF, 1, 1, 0, 0, 0, b'x'];
+    assert!(
+        dump.windows(entry.len()).any(|w| w == entry),
+        "the empty key is not under the stand-in length"
+    );
+    let restarted = killed_and_started_again(&mut server, &[]);
+    let mut c = restarted.conn();
+    assert_empty_keys(&mut c);
+    // And the image the restarted server writes loads again.
+    assert!(c.cmd(&["SAVE"]).ok());
+    drop(c);
+    let mut restarted = restarted;
+    let again = killed_and_started_again(&mut restarted, &[]);
+    assert_empty_keys(&mut again.conn());
+}
+
+/// With the AOF on, a `SAVE` is a checkpoint: the snapshot it writes is
+/// where the next start begins, and the log after it is replayed on top.
+#[test]
+fn the_empty_key_survives_an_aof_checkpoint_and_a_restart() {
+    let mut server = Server::start(&["--aof"]);
+    let mut c = server.conn();
+    write_empty_keys(&mut c);
+    assert!(c.cmd(&["SAVE"]).ok());
+    assert!(c.cmd(&["SELECT", "2"]).ok());
+    assert!(c.cmd(&["SET", "", "in-the-log"]).ok());
+    drop(c);
+    std::thread::sleep(Duration::from_millis(1500));
+    let restarted = killed_and_started_again(&mut server, &["--aof"]);
+    let mut c = restarted.conn();
+    assert_empty_keys(&mut c);
+    assert!(c.cmd(&["SELECT", "2"]).ok());
+    assert_eq!(c.cmd(&["GET", ""]).s(), "in-the-log");
+}
+
+/// `MIGRATE` of the empty key, a hash with an empty field, named after
+/// `KEYS`, to another server.
+#[test]
+fn the_empty_key_can_be_migrated() {
+    let from = Server::start(&[]);
+    let to = Server::start(&[]);
+    let mut c = from.conn();
+    assert_eq!(c.cmd(&["HSET", "", "", "v"]).i(), 1);
+    let port = to.port.to_string();
+    let reply = c.cmd(&["MIGRATE", "127.0.0.1", &port, "", "0", "5000", "KEYS", ""]);
+    assert!(reply.ok(), "MIGRATE: {reply:?}");
+    assert_eq!(c.cmd(&["EXISTS", ""]).i(), 0);
+    assert_eq!(to.conn().cmd(&["HGET", "", ""]).s(), "v");
+}
+
+/// A `dump.kdb` as 1.2.0 wrote it, with the empty key under the length that
+/// ends a database: `databases` databases, the empty key in `at`, and every
+/// key with a time to live.
+fn dump_1_2_0(databases: usize, at: usize) -> Vec<u8> {
+    use kividb::shared_bytes::SharedBytes;
+    use kividb::types::KiviDBValue;
+    let string = |v: &str| KiviDBValue::String(SharedBytes::from(v.as_bytes()));
+    let far = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 100_000_000;
+    let mut image = Vec::new();
+    kividb::snapshot::write_kdb_header(&mut image, databases as u32).unwrap();
+    let mut expiries = Vec::new();
+    for db in 0..databases {
+        let mut keys = Vec::new();
+        let before = format!("before-{db}");
+        kividb::snapshot::write_kdb_entry(&mut image, &before, string("1").view()).unwrap();
+        keys.push(before);
+        if db == at {
+            image.extend(0u32.to_le_bytes());
+            kividb::snapshot::write_kdb_value(&mut image, string("x").view()).unwrap();
+            keys.push(String::new());
+        }
+        let after = format!("after-{db}");
+        kividb::snapshot::write_kdb_entry(&mut image, &after, string("2").view()).unwrap();
+        keys.push(after);
+        kividb::snapshot::write_kdb_db_end(&mut image).unwrap();
+        expiries.push(keys);
+    }
+    // The expiry section, as `write_kdb_expiry_maps` lays it out.
+    image.extend(b"KIVIEX1\0");
+    image.extend((databases as u32).to_le_bytes());
+    for keys in expiries {
+        image.extend((keys.len() as u32).to_le_bytes());
+        for key in keys {
+            image.extend((key.len() as u32).to_le_bytes());
+            image.extend(key.as_bytes());
+            image.extend(far.to_le_bytes());
+        }
+    }
+    image
+}
+
+/// 1.2.0 wrote the empty key with the length that ends a database. With it
+/// in the first of 16 databases neither 1.2.0 nor 1.2.1 started; with it in
+/// the only database, both started without the keys after it and without
+/// any time to live. Each such file now loads whole.
+#[test]
+fn a_1_2_0_dump_with_the_empty_key_loads_whole() {
+    for (databases, at) in [(16, 0), (16, 7), (16, 15), (1, 0)] {
+        let dir = tempfile::tempdir().unwrap().keep();
+        std::fs::write(dir.join("dump.kdb"), dump_1_2_0(databases, at)).unwrap();
+        let databases_arg = databases.to_string();
+        let server = start_in(&dir, &["--databases", &databases_arg]);
+        let mut c = server.conn();
+        for db in 0..databases {
+            assert!(c.cmd(&["SELECT", &db.to_string()]).ok());
+            let mut keys = vec![format!("before-{db}"), format!("after-{db}")];
+            if db == at {
+                assert_eq!(
+                    c.cmd(&["GET", ""]).s(),
+                    "x",
+                    "{databases} databases, at {at}"
+                );
+                keys.push(String::new());
+            }
+            assert_eq!(c.cmd(&["DBSIZE"]).i(), keys.len() as i64, "database {db}");
+            for key in keys {
+                let ttl = c.cmd(&["TTL", &key]).i();
+                assert!(
+                    ttl > 99_000,
+                    "{databases} databases, at {at}: TTL of {key:?} in {db}: {ttl}"
+                );
+            }
+        }
+    }
+}
+
+/// An `appendonly.aof` that opens with a KDB preamble, as earlier releases
+/// wrote them, with the empty key in the preamble.
+#[test]
+fn the_empty_key_in_an_aof_preamble_loads() {
+    use kividb::shared_bytes::SharedBytes;
+    use kividb::types::KiviDBValue;
+    let string = |v: &str| KiviDBValue::String(SharedBytes::from(v.as_bytes()));
+    let db0 = std::collections::HashMap::from([
+        (String::new(), string("x")),
+        ("k".to_string(), string("1")),
+    ]);
+    let mut image = Vec::new();
+    kividb::snapshot::write_kdb_image(&mut image, &[db0], None).unwrap();
+    let mut log = b"KIVIAOF1".to_vec();
+    log.push(1); // a preamble follows
+    log.extend((image.len() as u64).to_le_bytes());
+    log.extend(&image);
+    log.extend(record(&["SET", "tail", "2"]));
+    let dir = tempfile::tempdir().unwrap().keep();
+    std::fs::write(dir.join("appendonly.aof"), &log).unwrap();
+    let server = start_in(&dir, &["--aof"]);
+    let mut c = server.conn();
+    assert_eq!(c.cmd(&["GET", ""]).s(), "x");
+    assert_eq!(c.cmd(&["GET", "k"]).s(), "1");
+    assert_eq!(c.cmd(&["GET", "tail"]).s(), "2");
+}

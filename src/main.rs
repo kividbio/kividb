@@ -342,6 +342,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     tag_locks::set_enabled(cfg!(feature = "lua") && config.lua_parallel_scripts);
     eviction::configure(&config);
     compaction::configure(&config);
+    snapshot::RDB_DATABASES.store(config.databases, std::sync::atomic::Ordering::Relaxed);
     keyspace_events::KS_FLAGS.store(
         keyspace_events::parse_ks_flags(&config.notify_keyspace_events),
         std::sync::atomic::Ordering::Relaxed,
@@ -373,7 +374,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         env!("CARGO_PKG_VERSION"),
         std::process::id(),
         update_check::variant(),
-        if std::path::Path::new(&config.configfile).is_file() {
+        if config.configfile_loaded {
             format!("'{}'", config.configfile)
         } else {
             "none".to_string()

@@ -2321,9 +2321,17 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                         if at_ms <= now_ms {
                             HsetexTtl::Past
                         } else {
-                            HsetexTtl::Set(
-                                Instant::now() + Duration::from_millis((at_ms - now_ms) as u64),
-                            )
+                            // From the wall clock to the nanosecond, as
+                            // HPEXPIREAT works it out. From the clock in whole
+                            // milliseconds, HPEXPIRETIME read back one later
+                            // about every other time, on a replica of Redis or
+                            // Valkey too (both send HSETEX with PXAT).
+                            let target =
+                                std::time::UNIX_EPOCH + Duration::from_millis(at_ms as u64);
+                            match target.duration_since(std::time::SystemTime::now()) {
+                                Ok(left) => HsetexTtl::Set(Instant::now() + left),
+                                Err(_) => HsetexTtl::Past,
+                            }
                         }
                     }
                 });

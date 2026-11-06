@@ -1,4 +1,17 @@
 // src/lib.rs
+//! The internals of the KiviDB server, a Redis-compatible in-memory database.
+//!
+//! This crate is published so that `cargo install kividb` can build the
+//! `kividb` server. The server binary is not built from this library:
+//! `src/main.rs` declares its own modules and its own global allocator. The
+//! library is built from the same sources so the integration tests can use
+//! them; it is not a public API. It is not a client or an embeddable
+//! database, and any release may change or remove any of it. It sets a
+//! global allocator too, so a crate that depended on it would get that one.
+//! To talk to KiviDB from Rust, use a Redis client such as the `redis` crate.
+//!
+//! Documentation for running the server: <https://github.com/kividbio/kividb>.
+
 // First, so its logging macros are in scope in every module after it.
 #[macro_use]
 pub mod loglevel;
@@ -79,6 +92,8 @@ pub fn run_for_test(config: config::Config) {
     }
     crate::eviction::configure(&cfg);
     crate::compaction::configure(&cfg);
+    // Only ever raised here, as the servers of one test process share it.
+    crate::snapshot::RDB_DATABASES.fetch_max(cfg.databases, std::sync::atomic::Ordering::Relaxed);
     if let Err(e) = crate::node_tls::init(&cfg) {
         panic!("TLS between nodes: {e}");
     }

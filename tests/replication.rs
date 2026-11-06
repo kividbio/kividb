@@ -2501,6 +2501,10 @@ fn test_dropindex_dd_is_sent_as_a_del_of_each_document_then_the_drop() {
         Duration::from_secs(10),
         || replica.cmds(&["FT._LIST"]).as_array().is_empty(),
     );
+    // `FT._LIST` lists the selected database's indexes: database 0's went
+    // before database 3's.
+    assert!(replica.cmds(&["SELECT", "0"]).is_ok());
+    assert!(replica.cmds(&["FT._LIST"]).as_array().is_empty());
 }
 
 /// `commands` with each run of DELs made one, its keys in order: the
@@ -2695,4 +2699,100 @@ fn test_a_replica_of_a_1_1_master_keeps_the_documents_of_its_dd() {
 #[test]
 fn test_a_replica_of_a_master_that_does_not_say_keeps_the_documents_of_its_dd() {
     assert!(!replica_fed_a_dd(None));
+}
+
+/// The empty key crosses a full sync (#441). In the payload it was written
+/// with the key length that ends a database: the replica found the payload
+/// unreadable, kept what it had, and never came up.
+#[test]
+fn test_full_resync_carries_the_empty_key() {
+    let master_port = spawn_server(Config::default());
+    let mut master = Conn::connect(master_port);
+    assert!(master.cmds(&["SET", "", "x"]).is_ok());
+    assert_eq!(master.cmds(&["HSET", "hash", "", "v"]).as_int(), 1);
+    assert_eq!(master.cmds(&["SADD", "set", ""]).as_int(), 1);
+    assert_eq!(master.cmds(&["ZADD", "zset", "1.5", ""]).as_int(), 1);
+    assert!(master.cmds(&["SELECT", "1"]).is_ok());
+    assert_eq!(master.cmds(&["RPUSH", "", ""]).as_int(), 1);
+    assert!(master.cmds(&["SET", "after", "1"]).is_ok());
+
+    let replica_port = spawn_server(replica_of(master_port));
+    let mut replica = Conn::connect(replica_port);
+    wait_link_up(&mut replica);
+    assert_eq!(replica.cmds(&["GET", ""]).as_str(), "x");
+    assert_eq!(replica.cmds(&["HGET", "hash", ""]).as_str(), "v");
+    assert_eq!(replica.cmds(&["SISMEMBER", "set", ""]).as_int(), 1);
+    assert_eq!(replica.cmds(&["ZSCORE", "zset", ""]).as_str(), "1.5");
+    assert!(replica.cmds(&["SELECT", "1"]).is_ok());
+    assert_eq!(replica.cmds(&["LLEN", ""]).as_int(), 1);
+    assert_eq!(replica.cmds(&["GET", "after"]).as_str(), "1");
+}
+
+/// A replica holds a JSON document's numbers exactly as its master does,
+/// from the full sync and from the stream after it (#445).
+#[test]
+fn a_replica_holds_json_numbers_exactly() {
+    let mut state: u64 = 0x1234_5678_9ABC_DEF1;
+    let mut doubles = Vec::new();
+    while doubles.len() < 2000 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let d = if doubles.len() % 2 == 0 {
+            f64::from_bits(state)
+        } else {
+            (state >> 11) as f64 / (1u64 << 53) as f64 * 2e6 - 1e6
+        };
+        if d.is_finite() {
+            doubles.push(d);
+        }
+    }
+    let text = |chunk: &[f64]| {
+        let items: Vec<String> = chunk.iter().map(|d| format!("{d:?}")).collect();
+        format!("[{}]", items.join(","))
+    };
+    let exact = |c: &mut Conn, key: &str, want: &[f64]| {
+        let got = c.cmds(&["JSON.GET", key]);
+        let got: Vec<f64> = got
+            .as_str()
+            .trim_matches(|c| c == '[' || c == ']')
+            .split(',')
+            .map(|n| n.parse().unwrap())
+            .collect();
+        want.len() == got.len()
+            && want
+                .iter()
+                .zip(&got)
+                .all(|(w, g)| w.to_bits() == g.to_bits())
+    };
+
+    let master_port = free_port();
+    start_server(master_port);
+    let _shutdown = ShutdownServers(vec![master_port]);
+    let mut master = Conn::connect(master_port);
+    let (synced, streamed) = doubles.split_at(1000);
+    assert!(
+        master
+            .cmds(&["JSON.SET", "jr:sync", "$", &text(synced)])
+            .is_ok()
+    );
+    assert!(exact(&mut master, "jr:sync", synced));
+
+    let replica_port = spawn_server(replica_of(master_port));
+    let _shutdown_replica = ShutdownServers(vec![replica_port]);
+    let mut replica = Conn::connect(replica_port);
+    wait_link_up(&mut replica);
+    assert!(
+        master
+            .cmds(&["JSON.SET", "jr:stream", "$", &text(streamed)])
+            .is_ok()
+    );
+    wait_until("the replica has jr:stream", Duration::from_secs(10), || {
+        replica.cmds(&["EXISTS", "jr:stream"]).as_int() == 1
+    });
+    assert!(exact(&mut replica, "jr:sync", synced), "from the full sync");
+    assert!(
+        exact(&mut replica, "jr:stream", streamed),
+        "from the stream"
+    );
 }
