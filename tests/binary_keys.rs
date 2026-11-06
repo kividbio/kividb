@@ -451,11 +451,11 @@ fn keys_that_are_not_text_are_evicted() {
     }
     let evicted: u64 = c.info("stats", "evicted_keys").parse().unwrap();
     assert!(evicted > 0, "nothing was evicted");
-    let left = c.dbsize();
+    // Equal counts can hide different keys while eviction and its DELs
+    // are still in flight. Wait for the actual key sets to converge (#500).
     eventually(20, "the replica to apply the evictions", || {
-        r.dbsize() == left
+        r.scan_all(None) == c.scan_all(None)
     });
-    assert_eq!(r.scan_all(None), c.scan_all(None));
 }
 
 /// MIGRATE of a key that is not text: it was skipped, and the command
