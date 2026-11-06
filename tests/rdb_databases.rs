@@ -1,8 +1,13 @@
-// RDB files with keys in databases past 15 (#477). The loader put every
+// Snapshots with keys in databases past 15. The RDB reader put every
 // database of 16 or more into database 0, merged with its keys: where names
-// clashed, keys were overwritten, and nothing said so. A server with enough
-// `databases` now loads each key into its own database; one without refuses
-// the file, naming the database and the setting.
+// clashed, keys were overwritten, and nothing said so (#477). A KiviDB image
+// had the databases past the server's dropped, as silently (#482). A server
+// with enough `databases` now loads each key into its own database; one
+// without refuses the snapshot, naming the database and the setting.
+//
+// `kividb-1.2-databases-32.kdb` was saved by KiviDB (master, 5d0e29f1)
+// started with `--databases 32`, holding the same keys as the RDB files
+// below, and `ttl31` in database 31, which expires in 2126.
 //
 // The fixtures were saved by Redis 8.10, Valkey 8.1 and 9.0 and KeyDB 6.3,
 // each started with `--databases 32`, and by Dragonfly 2.1 (`--dbnum 32`,
@@ -34,7 +39,7 @@ fn fixture(name: &str) -> std::path::PathBuf {
 /// databases it is told the server has, and refuses a file past them.
 #[test]
 fn the_loader_keeps_databases_past_15_apart_or_refuses_them() {
-    use kividb::snapshot::{RDB_DATABASES, load_redis_rdb_with_expiry};
+    use kividb::snapshot::{SNAPSHOT_DATABASES, load_redis_rdb_with_expiry};
     use kividb::types::KiviDBValue;
     use std::sync::atomic::Ordering;
 
@@ -46,7 +51,7 @@ fn the_loader_keeps_databases_past_15_apart_or_refuses_them() {
         let path = fixture(name);
         let path = path.to_str().unwrap();
 
-        RDB_DATABASES.store(32, Ordering::Relaxed);
+        SNAPSHOT_DATABASES.store(32, Ordering::Relaxed);
         let (dbs, _, _) =
             load_redis_rdb_with_expiry(path).unwrap_or_else(|e| panic!("{name}: {e}"));
         assert_eq!(dbs.len(), 32, "{name}");
@@ -63,7 +68,7 @@ fn the_loader_keeps_databases_past_15_apart_or_refuses_them() {
         assert_eq!(others, 0, "{name}");
 
         for databases in [16, 31] {
-            RDB_DATABASES.store(databases, Ordering::Relaxed);
+            SNAPSHOT_DATABASES.store(databases, Ordering::Relaxed);
             let err = load_redis_rdb_with_expiry(path)
                 .err()
                 .unwrap_or_else(|| panic!("{name} loaded into {databases} databases"));
@@ -76,7 +81,7 @@ fn the_loader_keeps_databases_past_15_apart_or_refuses_them() {
             );
         }
     }
-    RDB_DATABASES.store(16, Ordering::Relaxed);
+    SNAPSHOT_DATABASES.store(16, Ordering::Relaxed);
 }
 
 // ── Servers ──────────────────────────────────────────────────────────────────
@@ -279,10 +284,11 @@ fn a_server_loads_databases_past_15_into_their_own_or_refuses_the_file() {
     }
 }
 
-/// A full sync from a master whose payload has keys in database 20: a replica
-/// with 16 databases refuses it and keeps what it has; one with 32 loads each
-/// key into its own database. The master here is a stand-in that answers
-/// `PSYNC` with the Redis file, as a Redis master does.
+/// A replica with a dataset of its own, and a full sync from a master whose
+/// payload has keys in database 20: with 16 databases the replica refuses it
+/// and keeps its dataset; with 32 it loads each key into its own database.
+/// The master here is a stand-in that answers `PSYNC` with the Redis file, as
+/// a Redis master does.
 #[test]
 fn a_full_sync_with_databases_past_15_is_refused_or_kept_apart() {
     let payload = std::fs::read(fixture("redis-8.10-databases-32.rdb")).unwrap();
@@ -300,36 +306,41 @@ fn a_full_sync_with_databases_past_15_is_refused_or_kept_apart() {
         let dir = tempfile::tempdir().unwrap();
         let port = free_port();
         let _replica = Server(
-            kividb(
-                dir.path(),
-                port,
-                &[
-                    "--databases",
-                    databases,
-                    "--replicaof",
-                    "127.0.0.1",
-                    &master_port.to_string(),
-                ],
-            )
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            kividb(dir.path(), port, &["--databases", databases])
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
         );
         let mut c = Conn::connect(port);
-        let deadline = Instant::now() + Duration::from_secs(20);
-        if databases == "16" {
-            // Tried, refused, and nothing loaded; the link stays down.
-            std::thread::sleep(Duration::from_secs(3));
-            assert_eq!(c.cmd(&["DBSIZE"]), "0");
-            let info = c.cmd(&["INFO", "replication"]);
-            assert!(info.contains("master_link_status:down"), "{info}");
-        } else {
-            while c.cmd(&["GET", "only0"]) != "zero" {
-                assert!(Instant::now() < deadline, "the full sync did not load");
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            assert_in_their_databases(&mut c, "full sync");
+        assert_eq!(c.cmd(&["SET", "mine", "kept"]), "OK");
+        assert_eq!(
+            c.cmd(&["REPLICAOF", "127.0.0.1", &master_port.to_string()]),
+            "OK"
+        );
+        assert_synced_or_kept(&mut c, databases, "the Redis full sync");
+    }
+}
+
+/// After `REPLICAOF` of a master with keys in databases 0, 20 and 31: with
+/// 16 databases, refused, and the replica's own `mine` still there, alone;
+/// with 32, each key in its own database, and `mine` gone with the old
+/// dataset.
+fn assert_synced_or_kept(c: &mut Conn, databases: &str, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    if databases == "16" {
+        // Tried, refused; the link stays down.
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(c.cmd(&["GET", "mine"]), "kept", "{what}");
+        assert_eq!(c.cmd(&["DBSIZE"]), "1", "{what}");
+        let info = c.cmd(&["INFO", "replication"]);
+        assert!(info.contains("master_link_status:down"), "{what}: {info}");
+    } else {
+        while c.cmd(&["GET", "only0"]) != "zero" {
+            assert!(Instant::now() < deadline, "{what} did not load");
+            std::thread::sleep(Duration::from_millis(100));
         }
+        assert_eq!(c.cmd(&["GET", "mine"]), "(nil)", "{what}");
+        assert_in_their_databases(c, what);
     }
 }
 
@@ -369,5 +380,156 @@ fn fake_master(stream: TcpStream, payload: &[u8]) {
         if stream.write_all(&reply).is_err() {
             return;
         }
+    }
+}
+
+/// A database number past any a server can be is refused as such, not with
+/// advice to start a server with more databases than that.
+#[test]
+fn a_bogus_database_number_is_called_invalid() {
+    // REDIS0011, SELECTDB 1000000 (a 32-bit length), a key, the end.
+    let mut file = b"REDIS0011\xFE\x80".to_vec();
+    file.extend_from_slice(&1_000_000u32.to_be_bytes());
+    file.extend_from_slice(b"\x00\x01k\x01v\xFF\0\0\0\0\0\0\0\0");
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("dump.rdb"), &file).unwrap();
+    let (failed, stderr) = fails_to_start(dir.path(), &[]);
+    assert!(failed, "{stderr}");
+    assert!(
+        stderr.contains("database 1000000") && stderr.contains("not a database number"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("start it with"), "{stderr}");
+}
+
+/// `--databases 0` is refused on the command line, as in a config file.
+#[test]
+fn databases_0_on_the_command_line_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (failed, stderr) = fails_to_start(dir.path(), &["--databases", "0"]);
+    assert!(failed, "{stderr}");
+    assert!(
+        stderr.contains("'databases' must be at least 1"),
+        "{stderr}"
+    );
+}
+
+// ── KiviDB images (#482) ─────────────────────────────────────────────────────
+
+const KDB: &str = "kividb-1.2-databases-32.kdb";
+
+/// Each key where the image had it, and `ttl31` with its time to live.
+fn assert_kdb_in_their_databases(c: &mut Conn, what: &str) {
+    assert_in_their_databases(c, what);
+    assert_eq!(c.cmd(&["SELECT", "31"]), "OK");
+    assert_eq!(c.cmd(&["GET", "ttl31"]), "soon", "{what}");
+    let ttl: i64 = c.cmd(&["TTL", "ttl31"]).parse().unwrap();
+    assert!(ttl > 0, "{what}: ttl31 lost its time to live ({ttl})");
+}
+
+/// A KiviDB image saved with `databases 32`: `dump.kdb`, `--preload-file
+/// rdb:`, the base file of an `aof:` preload, and the AOF's preamble. With
+/// the default 16 databases the server does not start, says which database
+/// and what to raise, and leaves its files as they were; databases 16 to 31
+/// used to be dropped without a word. With `--databases 32` every key loads
+/// into its own database.
+#[test]
+fn a_kividb_image_with_databases_past_15_loads_into_them_or_is_refused() {
+    let image = std::fs::read(fixture(KDB)).unwrap();
+    let refused = |dir: &Path, args: &[&str], what: &str| {
+        let (failed, stderr) = fails_to_start(dir, args);
+        assert!(failed, "{what} loaded into 16 databases: {stderr}");
+        assert!(
+            stderr.contains("database 20") && stderr.contains("databases 21"),
+            "{what}: {stderr}"
+        );
+    };
+    let loads = |dir: &Path, args: &[&str], what: &str| {
+        let port = free_port();
+        let mut all = vec!["--databases", "32"];
+        all.extend_from_slice(args);
+        let _server = Server(
+            kividb(dir, port, &all)
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        assert_kdb_in_their_databases(&mut Conn::connect(port), what);
+    };
+
+    // dump.kdb.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("dump.kdb"), &image).unwrap();
+    refused(dir.path(), &[], "dump.kdb");
+    assert_eq!(std::fs::read(dir.path().join("dump.kdb")).unwrap(), image);
+    loads(dir.path(), &[], "dump.kdb");
+
+    // Preloaded, and as the base file of an aof: preload.
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("source.kdb");
+    std::fs::write(&file, &image).unwrap();
+    let target = format!("rdb:{}", file.display());
+    refused(dir.path(), &["--preload-file", &target], "a KDB preload");
+    loads(dir.path(), &["--preload-file", &target], "a KDB preload");
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("base.kdb"), &image).unwrap();
+    let manifest = dir.path().join("backup.manifest");
+    std::fs::write(&manifest, "file base.kdb type b seq 1\n").unwrap();
+    let target = format!("aof:{}", manifest.display());
+    refused(dir.path(), &["--preload-file", &target], "an aof: base");
+    loads(dir.path(), &["--preload-file", &target], "an aof: base");
+
+    // The AOF's preamble.
+    let dir = tempfile::tempdir().unwrap();
+    let mut log = b"KIVIAOF1".to_vec();
+    log.push(1);
+    log.extend_from_slice(&(image.len() as u64).to_le_bytes());
+    log.extend_from_slice(&image);
+    std::fs::write(dir.path().join("appendonly.aof"), &log).unwrap();
+    refused(dir.path(), &["--aof"], "the AOF preamble");
+    assert_eq!(
+        std::fs::read(dir.path().join("appendonly.aof")).unwrap(),
+        log
+    );
+    loads(dir.path(), &["--aof"], "the AOF preamble");
+}
+
+/// A full sync from a KiviDB master with `databases 32` and keys in database
+/// 20, to a replica with a dataset of its own: with 16 databases the replica
+/// refuses it before it lets go of its dataset (the payload is checked
+/// before the old dataset is dropped, `repl-diskless-load` as by default),
+/// and keeps it; with 32 it loads each key into its own database.
+#[test]
+fn a_kividb_full_sync_with_databases_past_15_is_refused_or_kept_apart() {
+    let master_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        master_dir.path().join("dump.kdb"),
+        std::fs::read(fixture(KDB)).unwrap(),
+    )
+    .unwrap();
+    let master_port = free_port();
+    let _master = Server(
+        kividb(master_dir.path(), master_port, &["--databases", "32"])
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    assert_kdb_in_their_databases(&mut Conn::connect(master_port), "the master");
+    for databases in ["16", "32"] {
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_port();
+        let _replica = Server(
+            kividb(dir.path(), port, &["--databases", databases])
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let mut c = Conn::connect(port);
+        assert_eq!(c.cmd(&["SET", "mine", "kept"]), "OK");
+        assert_eq!(
+            c.cmd(&["REPLICAOF", "127.0.0.1", &master_port.to_string()]),
+            "OK"
+        );
+        assert_synced_or_kept(&mut c, databases, "the KiviDB full sync");
     }
 }

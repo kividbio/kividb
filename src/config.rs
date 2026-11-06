@@ -777,6 +777,12 @@ impl Config {
     pub fn validate(&self, tls_compiled: bool) -> Result<Vec<String>, String> {
         let mut warnings = Vec::new();
 
+        // Checked here too for `--databases 0`: the config file's directive
+        // is checked as it is read, the command line's was not.
+        if self.databases == 0 {
+            return Err("'databases' must be at least 1".into());
+        }
+
         if !self.update_check_url.starts_with("https://") {
             return Err(format!(
                 "--update-check-url must be an https:// URL, not '{}'",

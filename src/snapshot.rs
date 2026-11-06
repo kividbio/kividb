@@ -2133,6 +2133,10 @@ fn read_image(
                 }
             };
 
+            // A key in a database past the server's (#482).
+            if let Err(why) = database_of_snapshot(db as u64) {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
+            }
             keys_read += 1;
             let has_value = match &value {
                 KiviDBValue::HashEx(hash) => !hash.read().is_empty(),
@@ -2313,7 +2317,18 @@ pub fn restore_expiries_into_store(expiries: ExpiryMaps, store: &store::Store) -
     let mut total = 0usize;
     for (db_idx, map) in expiries.into_iter().enumerate() {
         let Some(db) = store.get(db_idx) else {
-            break;
+            // A snapshot with keys past the store's databases is refused as
+            // it is read (see `SNAPSHOT_DATABASES`); this says so if one
+            // was not.
+            if !map.is_empty() {
+                log_error!(
+                    "snapshot: the times to live of {} keys in database {db_idx} are dropped: \
+                     the store has {} databases",
+                    map.len(),
+                    store.len()
+                );
+            }
+            continue;
         };
         for (key, at_ms) in map {
             if write_lock!(store::get_shard(db, &key)).set_expires(&key, at_ms) {
@@ -2757,11 +2772,36 @@ fn too_long() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "RDB string length out of range")
 }
 
-/// How many databases an RDB file may have keys in: the server's
-/// `databases`, set as it starts. A file with keys in a database past them
-/// is refused, naming it. It used to be loaded into database 0, merged with
-/// that database's keys and overwriting those of the same name (#477).
-pub static RDB_DATABASES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(16);
+/// How many databases a snapshot may have keys in, an RDB file or a KiviDB
+/// image: the server's `databases`, set as it starts. A snapshot with keys
+/// in a database past them is refused, naming it. An RDB file's were loaded
+/// into database 0, merged with that database's keys and overwriting those
+/// of the same name (#477); a KiviDB image's were dropped (#482).
+pub static SNAPSHOT_DATABASES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(16);
+
+/// The largest number of databases the refusal of a snapshot advises
+/// starting with. A database number past it is more likely a damaged file
+/// than a server to configure.
+const DATABASES_ADVISED_MAX: u64 = 1 << 16;
+
+/// `db`, if it is one of the server's databases (see
+/// [`SNAPSHOT_DATABASES`]); otherwise what the refusal of the snapshot says.
+fn database_of_snapshot(db: u64) -> Result<usize, String> {
+    let databases = SNAPSHOT_DATABASES.load(std::sync::atomic::Ordering::Relaxed);
+    match usize::try_from(db) {
+        Ok(index) if index < databases => Ok(index),
+        _ if db < DATABASES_ADVISED_MAX => Err(format!(
+            "the file has keys in database {db}, and this server has {databases} databases: \
+             start it with databases {} or more",
+            db + 1
+        )),
+        _ => Err(format!(
+            "the file has keys in database {db}, which is not a database number this server \
+             can have (it has {databases} databases)"
+        )),
+    }
+}
 
 // Unused by the binary, which wants the expiries; see `write_snapshot`.
 #[allow(dead_code)]
@@ -2823,19 +2863,7 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
             0xFE => {
                 // Database selector
                 let (db_num, _) = rdb_read_length(&mut r)?;
-                let databases = RDB_DATABASES.load(std::sync::atomic::Ordering::Relaxed);
-                current_db = usize::try_from(db_num)
-                    .ok()
-                    .filter(|&db| db < databases)
-                    .ok_or_else(|| {
-                        rdb_invalid(format!(
-                            "the file has keys in database {db_num}, and this server has \
-                             {databases} databases (0 to {}): start it with databases {} or \
-                             more",
-                            databases - 1,
-                            db_num.saturating_add(1)
-                        ))
-                    })?;
+                current_db = database_of_snapshot(db_num).map_err(rdb_invalid)?;
                 if current_db >= result.len() {
                     result.resize_with(current_db + 1, HashMap::new);
                     expiries.resize_with(current_db + 1, HashMap::new);
@@ -4185,7 +4213,18 @@ pub fn restore_into_store(dbs: Vec<HashMap<String, KiviDBValue>>, store: &store:
     let mut total = 0usize;
     for (db_idx, map) in dbs.into_iter().enumerate() {
         if db_idx >= store.len() {
-            break;
+            // A snapshot with keys past the store's databases is refused as
+            // it is read (see `SNAPSHOT_DATABASES`); this says so if one
+            // was not. It used to drop them without a word (#482).
+            if !map.is_empty() {
+                log_error!(
+                    "snapshot: {} keys in database {db_idx} are dropped: the store has {} \
+                     databases",
+                    map.len(),
+                    store.len()
+                );
+            }
+            continue;
         }
         let db = &store[db_idx];
         total += map.len();
