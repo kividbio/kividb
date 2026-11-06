@@ -6023,6 +6023,50 @@ mod empty_key_tests {
         KiviDBValue::Hash(Arc::new(parking_lot::RwLock::new(fields)))
     }
 
+    /// What the server writes (a capture of the keyspace, for `SAVE`, the
+    /// AOF's checkpoint and a full sync) has the empty key under the
+    /// stand-in, both a string's (written apart from the other values) and
+    /// another value's. The reader also takes 1.2.0's layout, so a load alone
+    /// would not tell whether the writer went back to it.
+    #[test]
+    fn a_capture_writes_the_empty_key_under_the_stand_in() {
+        let far = unix_ms_now() + 3_600_000;
+        let store = crate::store::new_store(2);
+        restore_into_store(
+            vec![
+                HashMap::from([(String::new(), string("x"))]),
+                HashMap::from([(String::new(), hash("f", "v"))]),
+            ],
+            &store,
+        );
+        restore_expiries_into_store(
+            vec![
+                HashMap::from([(String::new(), far)]),
+                HashMap::from([(String::new(), far + 1)]),
+            ],
+            &store,
+        );
+        let image = freeze_dataset_for_disk(&store, None)
+            .unwrap()
+            .into_payload()
+            .unwrap();
+        // The header, then database 0's one entry: the stand-in and no key
+        // bytes, a string of one byte, the database's end.
+        let header = KDB_MAGIC.len() + 4;
+        assert_eq!(&image[header..header + 4], &u32::MAX.to_le_bytes());
+        assert_eq!(image[header + 4], TAG_STRING);
+        let db1 = header + 4 + 1 + 4 + 1 + 4;
+        assert_eq!(&image[db1 - 4..db1], &0u32.to_le_bytes());
+        assert_eq!(&image[db1..db1 + 4], &u32::MAX.to_le_bytes());
+        assert_eq!(image[db1 + 4], TAG_HASH);
+
+        let loaded = load_snapshot_from(image.as_slice()).unwrap();
+        assert_eq!(get_string(&loaded.dbs[0], ""), b"x");
+        assert!(matches!(loaded.dbs[1].get(""), Some(KiviDBValue::Hash(_))));
+        assert_eq!(loaded.expiries[0].get(""), Some(&far));
+        assert_eq!(loaded.expiries[1].get(""), Some(&(far + 1)));
+    }
+
     /// In the last database (with `databases 1`, the only one) a 1.2.0 empty
     /// key was read as the database's end, and its tag as the start of a
     /// section that was not one: the image loaded without the rest of the

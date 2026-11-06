@@ -1857,6 +1857,15 @@ fn the_empty_key_survives_a_save_and_a_restart() {
     write_empty_keys(&mut c);
     assert!(c.cmd(&["SAVE"]).ok());
     drop(c);
+    // Written under the stand-in length: the stand-in, the string tag, a
+    // length of 1 and the value. The server also reads 1.2.0's layout, so
+    // a restart alone would not show the writer had gone back to it.
+    let dump = std::fs::read(server.dir.join("dump.kdb")).unwrap();
+    let entry = [0xFF, 0xFF, 0xFF, 0xFF, 1, 1, 0, 0, 0, b'x'];
+    assert!(
+        dump.windows(entry.len()).any(|w| w == entry),
+        "the empty key is not under the stand-in length"
+    );
     let restarted = killed_and_started_again(&mut server, &[]);
     let mut c = restarted.conn();
     assert_empty_keys(&mut c);
