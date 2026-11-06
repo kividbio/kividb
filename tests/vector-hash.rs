@@ -529,10 +529,128 @@ fn test_flushdb_drops_indexes_for_selected_db_only() {
         !names.contains(&"idx:db1"),
         "FLUSHDB on db 1 must drop idx:db1, got {names:?}"
     );
+    // `FT._LIST` lists the selected database's indexes.
+    c.cmds(&["SELECT", "0"]);
+    let list = c.cmds(&["FT._LIST"]);
+    let names: Vec<&str> = list.as_array().iter().map(|v| v.as_str()).collect();
     assert!(
         names.contains(&"idx:db0"),
         "FLUSHDB on db 1 must keep idx:db0, got {names:?}"
     );
+}
+
+/// An index is its database's (#447). `FT._LIST` lists the selected
+/// database's indexes only: it used to list those of every database. From
+/// another database, an index, or an alias of one, is not there: every
+/// command that names one replies as for an index that does not exist, and
+/// none of them reads, changes or drops it.
+#[test]
+fn an_index_is_seen_only_from_its_own_database() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let names = |c: &mut Conn| -> Vec<String> {
+        let mut names: Vec<String> = c
+            .cmds(&["FT._LIST"])
+            .as_array()
+            .iter()
+            .map(|v| v.as_str().to_string())
+            .collect();
+        names.sort();
+        names
+    };
+
+    let create = |c: &mut Conn, name: &str, prefix: &str| {
+        let reply = c.cmds(&[
+            "FT.CREATE",
+            name,
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            prefix,
+            "SCHEMA",
+            "t",
+            "TEXT",
+            "tag",
+            "TAG",
+        ]);
+        assert!(reply.is_ok(), "{reply:?}");
+    };
+    create(&mut c, "idx:zero", "z:");
+    c.cmds(&["HSET", "z:1", "t", "hello", "tag", "a"]);
+    assert!(c.cmds(&["FT.ALIASADD", "al:zero", "idx:zero"]).is_ok());
+
+    assert!(c.cmds(&["SELECT", "1"]).is_ok());
+    assert!(names(&mut c).is_empty());
+    let missing = |name: &str| format!("SEARCH_INDEX_NOT_FOUND Index not found: {name}");
+    for (args, name) in [
+        (vec!["FT.INFO", "idx:zero"], "idx:zero"),
+        (vec!["FT.SEARCH", "idx:zero", "hello"], "idx:zero"),
+        (vec!["FT.SEARCH", "al:zero", "hello"], "al:zero"),
+        (vec!["FT.AGGREGATE", "idx:zero", "*"], "idx:zero"),
+        (vec!["FT.EXPLAIN", "idx:zero", "hello"], "idx:zero"),
+        (vec!["FT.TAGVALS", "idx:zero", "tag"], "idx:zero"),
+        (vec!["FT.ALIASLIST", "idx:zero"], "idx:zero"),
+        (
+            vec!["FT.ALTER", "idx:zero", "SCHEMA", "ADD", "u", "TEXT"],
+            "idx:zero",
+        ),
+        (vec!["FT.ALIASADD", "al:one", "idx:zero"], "idx:zero"),
+        (vec!["FT.ALIASUPDATE", "al:one", "al:zero"], "al:zero"),
+        (vec!["FT.CURSOR", "READ", "idx:zero", "1"], "idx:zero"),
+        (vec!["FT.DEBUG", "POSTINGS", "idx:zero", "OFF"], "idx:zero"),
+        (vec!["FT.DEBUG", "PAGE", "idx:zero", "OFF"], "idx:zero"),
+        (vec!["FT.DEBUG", "COMPACT", "idx:zero", "t"], "idx:zero"),
+        (vec!["FT.DROPINDEX", "idx:zero"], "idx:zero"),
+        (vec!["FT.DROPINDEX", "idx:zero", "DD"], "idx:zero"),
+    ] {
+        let reply = c.cmds(&args);
+        assert!(
+            matches!(&reply, RespValue::Error(e) if *e == missing(name)),
+            "{args:?}: {reply:?}"
+        );
+    }
+    let reply = c.cmds(&["FT.ALIASDEL", "al:zero"]);
+    assert!(
+        matches!(&reply, RespValue::Error(e) if e == "ERR Alias does not exist"),
+        "{reply:?}"
+    );
+
+    create(&mut c, "idx:one", "o:");
+    c.cmds(&["HSET", "o:1", "t", "hello"]);
+    assert_eq!(names(&mut c), ["idx:one"]);
+    assert_eq!(
+        c.cmds(&["FT.SEARCH", "idx:one", "hello", "NOCONTENT"])
+            .as_array()[0]
+            .as_int(),
+        1
+    );
+    // Database 0's alias is not moved to this database's index: it used to
+    // be, and was then gone from database 0.
+    let reply = c.cmds(&["FT.ALIASUPDATE", "al:zero", "idx:one"]);
+    assert!(
+        matches!(&reply, RespValue::Error(e) if e == "ERR Alias already exists"),
+        "{reply:?}"
+    );
+
+    // Nothing above reached database 0's index, nor its alias.
+    assert!(c.cmds(&["SELECT", "0"]).is_ok());
+    assert_eq!(names(&mut c), ["idx:zero"]);
+    for index in ["idx:zero", "al:zero"] {
+        let found = c.cmds(&["FT.SEARCH", index, "hello", "NOCONTENT"]);
+        assert_eq!(found.as_array()[0].as_int(), 1, "{index}: {found:?}");
+    }
+    assert_eq!(c.cmds(&["EXISTS", "z:1"]).as_int(), 1);
+    let reply = c.cmds(&["FT.INFO", "idx:one"]);
+    assert!(
+        matches!(&reply, RespValue::Error(e) if *e == missing("idx:one")),
+        "{reply:?}"
+    );
+    assert!(c.cmds(&["FT.DROPINDEX", "idx:zero"]).is_ok());
+    assert!(names(&mut c).is_empty());
+    assert!(c.cmds(&["SELECT", "1"]).is_ok());
+    assert_eq!(names(&mut c), ["idx:one"]);
 }
 
 #[test]
