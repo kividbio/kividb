@@ -137,28 +137,22 @@ fn describe_slot_import(r: &mut impl Read) -> io::Result<String> {
     Ok(format!(" (job {job}, slots {})", ranges.join(" ")))
 }
 
-/// When a hash field whose expiry is `at_ms` (Unix milliseconds) expires,
-/// on the clock field TTLs are kept by; `None` if that time has passed.
+/// When a hash field of a Redis or Valkey file whose expiry is `at_ms`
+/// (Unix milliseconds) expires, on the clock field TTLs are kept by;
+/// `None` if that time has come, and the field is dropped. One further out
+/// than the clock can hold is a corrupt file.
 ///
-/// Worked out from the wall clock to the nanosecond, as `HPEXPIREAT` works
-/// it out, so that `HPEXPIRETIME` reads back the very millisecond the file
-/// holds. Taken from the clock in whole milliseconds, it read back one
-/// later about every other time.
-pub(super) fn field_deadline(at_ms: u64) -> io::Result<Option<std::time::Instant>> {
-    let out_of_range = || rdb_invalid("hash field expiry out of range");
-    let at = std::time::UNIX_EPOCH
-        .checked_add(std::time::Duration::from_millis(at_ms))
-        .ok_or_else(out_of_range)?;
-    let Ok(left) = at.duration_since(std::time::SystemTime::now()) else {
-        return Ok(None);
-    };
-    if left.is_zero() {
-        return Ok(None);
-    }
-    std::time::Instant::now()
-        .checked_add(left)
-        .map(Some)
-        .ok_or_else(out_of_range)
+/// Converted with `clock`, read once for the hash, to the nanosecond (see
+/// `FieldClock`, #448), so that `HPEXPIRETIME` reads back the very
+/// millisecond the file holds. Taken from the clock in whole milliseconds,
+/// it read back one later about every other time.
+pub(super) fn field_deadline(
+    clock: &crate::commands::helpers::FieldClock,
+    at_ms: u64,
+) -> io::Result<Option<std::time::Instant>> {
+    clock
+        .checked_instant_of(at_ms)
+        .ok_or_else(|| rdb_invalid("hash field expiry out of range"))
 }
 
 /// Valkey 9's `RDB_TYPE_HASH_2`: a count, then each field's name, its value
@@ -179,6 +173,7 @@ fn read_valkey_hash_2(r: &mut impl Read) -> io::Result<Option<KiviDBValue>> {
         fields.push((field, value, expires_at));
     }
 
+    let clock = crate::commands::helpers::FieldClock::now();
     let mut inner = crate::types::HashInner::new();
     // Every field's name, kept or not: one named twice is a corrupt file.
     let mut names = std::collections::HashSet::with_capacity(fields.len());
@@ -188,7 +183,7 @@ fn read_valkey_hash_2(r: &mut impl Read) -> io::Result<Option<KiviDBValue>> {
             return Err(rdb_invalid("duplicate hash fields"));
         }
         if let Some(at) = expires_at {
-            match field_deadline(at)? {
+            match field_deadline(&clock, at)? {
                 Some(deadline) => {
                     inner.expiries.insert(field.clone(), deadline);
                 }

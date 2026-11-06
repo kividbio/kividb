@@ -750,15 +750,9 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
             // We persist as Unix ms because Instant is monotonic and
             // can't survive a process restart — convert at write time.
             w.write_all(&(inner.expiries.len() as u32).to_le_bytes())?;
-            let now_sys = std::time::SystemTime::now();
-            let now_mono = std::time::Instant::now();
-            let unix_now_ms = now_sys
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
+            let clock = crate::commands::helpers::FieldClock::now();
             for (field, exp) in inner.expiries.iter() {
-                let delta_ms = exp.saturating_duration_since(now_mono).as_millis() as u64;
-                let abs_ms = unix_now_ms.saturating_add(delta_ms);
+                let abs_ms = clock.unix_ms_of(*exp);
                 write_bytes(w, field.as_bytes())?;
                 w.write_all(&abs_ms.to_le_bytes())?;
             }
@@ -2083,12 +2077,7 @@ fn read_image(
                     r.read_exact(&mut exp_count_buf)?;
                     let exp_count = u32::from_le_bytes(exp_count_buf) as usize;
                     let mut exps = AHashMap::with_capacity(hint(exp_count));
-                    let now_sys = std::time::SystemTime::now();
-                    let now_mono = std::time::Instant::now();
-                    let unix_now_ms = now_sys
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
+                    let clock = crate::commands::helpers::FieldClock::now();
                     for _ in 0..exp_count {
                         let field_bytes = read_bytes(&mut r)?;
                         let field = String::from_utf8(field_bytes).map_err(|_| {
@@ -2097,9 +2086,8 @@ fn read_image(
                         let mut ms_buf = [0u8; 8];
                         r.read_exact(&mut ms_buf)?;
                         let abs_ms = u64::from_le_bytes(ms_buf);
-                        if abs_ms > unix_now_ms {
-                            let delta = std::time::Duration::from_millis(abs_ms - unix_now_ms);
-                            exps.insert(field, now_mono + delta);
+                        if let Some(at) = clock.instant_of(abs_ms) {
+                            exps.insert(field, at);
                         } else {
                             crate::types::hash_remove(&mut hmap, &field);
                         }
@@ -3561,11 +3549,12 @@ fn rdb_read_hash_with_ttls(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBV
         }
     }
 
+    let clock = crate::commands::helpers::FieldClock::now();
     let mut inner = crate::types::HashInner::new();
     for (field, value, expires_at) in fields {
         let field = String::from_utf8_lossy(&field).into_owned();
         if expires_at != 0 {
-            let Some(deadline) = rdb_dialect::field_deadline(expires_at)? else {
+            let Some(deadline) = rdb_dialect::field_deadline(&clock, expires_at)? else {
                 continue;
             };
             inner.expiries.insert(field.clone(), deadline);
@@ -4820,15 +4809,9 @@ pub fn serialize_value(value: &KiviDBValue, out: &mut Vec<u8>) -> std::io::Resul
                 write_bytes_vec(out, val)?;
             }
             out.write_all(&(inner.expiries.len() as u32).to_le_bytes())?;
-            let now_sys = std::time::SystemTime::now();
-            let now_mono = std::time::Instant::now();
-            let unix_now_ms = now_sys
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
+            let clock = crate::commands::helpers::FieldClock::now();
             for (field, exp) in inner.expiries.iter() {
-                let delta_ms = exp.saturating_duration_since(now_mono).as_millis() as u64;
-                let abs_ms = unix_now_ms.saturating_add(delta_ms);
+                let abs_ms = clock.unix_ms_of(*exp);
                 write_bytes_vec(out, field.as_bytes())?;
                 out.write_all(&abs_ms.to_le_bytes())?;
             }
@@ -4975,12 +4958,7 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
             let exp_count = u32::from_le_bytes(payload[pos..pos + 4].try_into().ok()?) as usize;
             pos += 4;
             let mut exps = AHashMap::new();
-            let now_sys = std::time::SystemTime::now();
-            let now_mono = std::time::Instant::now();
-            let unix_now_ms = now_sys
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
+            let clock = crate::commands::helpers::FieldClock::now();
             for _ in 0..exp_count {
                 let (field_bytes, next) = read_bytes_slice(payload, pos)?;
                 let field = String::from_utf8(field_bytes.to_vec()).ok()?;
@@ -4989,9 +4967,8 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
                 }
                 let abs_ms = u64::from_le_bytes(payload[next..next + 8].try_into().ok()?);
                 pos = next + 8;
-                if abs_ms > unix_now_ms {
-                    let delta = std::time::Duration::from_millis(abs_ms - unix_now_ms);
-                    exps.insert(field, now_mono + delta);
+                if let Some(at) = clock.instant_of(abs_ms) {
+                    exps.insert(field, at);
                 } else {
                     // Its time is up: gone, as a snapshot's load drops it.
                     // Kept, it lost its expiry and lived on for good (a
@@ -5227,6 +5204,137 @@ mod dump_payload_tests {
         );
         assert!(restore_payload(b"short").is_none());
         assert!(restore_payload(&[]).is_none());
+    }
+}
+
+/// A hash field's deadline of whole Unix milliseconds is the same
+/// millisecond after every way a hash is written and read back: a KDB image
+/// (a save, a full sync, the AOF's preamble), a `DUMP` payload (`RESTORE`,
+/// `MIGRATE`) and a Redis RDB file. The time now used to be cut to a whole
+/// millisecond before each conversion, and a field often read back 1 ms
+/// off what it was set to (#448).
+#[cfg(test)]
+mod field_deadline_tests {
+    use super::*;
+    use crate::commands::helpers::FieldClock;
+
+    /// `n` deadlines of whole milliseconds an hour or so from now, each at a
+    /// different point of the millisecond now is in.
+    fn deadlines(n: u64) -> Vec<u64> {
+        let base = unix_ms_now() + 3_600_000;
+        (0..n).map(|i| base + i * 7 + i % 3).collect()
+    }
+
+    fn hash_with(deadlines: &[u64]) -> KiviDBValue {
+        let clock = FieldClock::now();
+        let mut inner = crate::types::HashInner::new();
+        for (i, at) in deadlines.iter().enumerate() {
+            let field = format!("f{i}");
+            inner.fields.insert(field.clone(), Arc::from(&b"v"[..]));
+            inner
+                .expiries
+                .insert(field, clock.instant_of(*at).expect("in the future"));
+        }
+        KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(inner)))
+    }
+
+    /// The deadlines of `value`'s fields, as `HPEXPIRETIME` gives them.
+    fn read_back(value: &KiviDBValue, n: usize) -> Vec<u64> {
+        let KiviDBValue::HashEx(hash) = value else {
+            panic!("not a hash with field TTLs");
+        };
+        let hash = hash.read();
+        let clock = FieldClock::now();
+        (0..n)
+            .map(|i| clock.unix_ms_of(hash.expiries[&format!("f{i}")]))
+            .collect()
+    }
+
+    #[test]
+    fn the_clock_converts_a_whole_millisecond_both_ways_exactly() {
+        for _ in 0..2_000 {
+            let at = unix_ms_now() + 60_000;
+            let instant = FieldClock::now().instant_of(at).unwrap();
+            // Another reading of the clocks, as a later command makes.
+            std::hint::black_box(std::time::Instant::now());
+            assert_eq!(FieldClock::now().unix_ms_of(instant), at);
+        }
+        let clock = FieldClock::now();
+        assert!(clock.instant_of(unix_ms_now().saturating_sub(1)).is_none());
+        assert!(clock.instant_of(0).is_none());
+    }
+
+    /// A deadline further out than 64 bits of milliseconds is written as
+    /// the furthest there is, not cut to 64 bits: cut, it was a moment from
+    /// now, and the field was gone once loaded.
+    #[test]
+    fn a_deadline_past_64_bits_of_milliseconds_saturates() {
+        let clock = FieldClock::now();
+        if let Some(far) = std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(20_000_000_000_000_000))
+        {
+            assert_eq!(clock.unix_ms_of(far), u64::MAX);
+        }
+        assert!(clock.instant_of(u64::MAX).is_some());
+        let max = crate::commands::helpers::MAX_FIELD_DEADLINE_MS;
+        use crate::commands::helpers::field_deadline_ms;
+        assert_eq!(field_deadline_ms(max, false, 0), Some(max));
+        assert_eq!(field_deadline_ms(max + 1, false, 0), None);
+        assert_eq!(
+            field_deadline_ms(max / 1000, true, 0),
+            Some(max / 1000 * 1000)
+        );
+        assert_eq!(field_deadline_ms(max / 1000 + 1, true, 0), None);
+        assert_eq!(field_deadline_ms(i64::MAX, true, 0), None);
+        assert_eq!(field_deadline_ms(1000, false, max - 1000), Some(max));
+        assert_eq!(field_deadline_ms(1001, false, max - 1000), None);
+    }
+
+    #[test]
+    fn a_dump_payload_keeps_each_deadline_to_the_millisecond() {
+        for _ in 0..200 {
+            let want = deadlines(16);
+            let payload = dump_payload(&hash_with(&want)).unwrap();
+            let back = restore_payload(&payload).expect("payload restores");
+            assert_eq!(read_back(&back, want.len()), want);
+        }
+    }
+
+    #[test]
+    fn a_kdb_image_keeps_each_deadline_to_the_millisecond() {
+        for _ in 0..200 {
+            let want = deadlines(16);
+            let mut out = Vec::new();
+            write_kdb_header(&mut out, 1).unwrap();
+            write_kdb_entry(&mut out, "h", hash_with(&want).view()).unwrap();
+            write_kdb_db_end(&mut out).unwrap();
+            write_kdb_expiry_maps(&mut out, &[HashMap::new()]).unwrap();
+            let loaded = load_snapshot_from(&out[..]).unwrap();
+            assert_eq!(read_back(&loaded.dbs[0]["h"], want.len()), want);
+        }
+    }
+
+    /// Type 24, a hash table: the soonest deadline, then for each field its
+    /// deadline less the soonest one, plus 1, its name and its value.
+    #[test]
+    fn a_redis_rdb_hash_keeps_each_deadline_to_the_millisecond() {
+        for _ in 0..200 {
+            let want = deadlines(16);
+            let soonest = want[0];
+            let mut rdb = Vec::new();
+            rdb.extend_from_slice(&(soonest as i64).to_le_bytes());
+            rdb_write_length(&mut rdb, want.len());
+            for (i, at) in want.iter().enumerate() {
+                rdb_write_length(&mut rdb, (at - soonest + 1) as usize);
+                let field = format!("f{i}");
+                rdb_write_length(&mut rdb, field.len());
+                rdb.extend_from_slice(field.as_bytes());
+                rdb_write_length(&mut rdb, 1);
+                rdb.push(b'v');
+            }
+            let back = rdb_read_hash_with_ttls(&mut &rdb[..], 24).unwrap();
+            assert_eq!(read_back(&back, want.len()), want);
+        }
     }
 }
 
