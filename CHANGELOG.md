@@ -82,6 +82,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A search index is seen only from its own database.** `FT._LIST`
+  listed the indexes of every database, and the commands that name an
+  index found one of another database: from database 1, `FT.SEARCH`
+  searched database 0's index, `FT.DROPINDEX` dropped it, and
+  `FT.ALIASUPDATE` moved database 0's alias to database 1's index.
+  `FT._LIST` now lists the selected database's indexes, and from another
+  database an index, or an alias of one, is not there: `FT.INFO`,
+  `FT.SEARCH`, `FT.AGGREGATE`, `FT.DROPINDEX`, `FT.ALTER`, `FT.ALIASADD`,
+  `FT.DEBUG` and the other commands that name one reply `Index not found`,
+  `FT.ALIASDEL` replies `Alias does not exist`, and `FT.ALIASUPDATE` of
+  another database's alias replies `Alias already exists`. Index names
+  are still one namespace for all databases: `FT.CREATE` of a name
+  another database has is still refused with `Index already exists`
+  (#447).
+
+  **Upgrade note:** an AOF written by 1.2.0, or the stream of a 1.2.0
+  master, may hold an `FT.DROPINDEX`, `FT.ALTER`, `FT.ALIASADD` or
+  `FT.ALIASUPDATE` sent from one database for an index of another. 1.2.1
+  refuses it when it replays or applies it, as it refuses it from a
+  client, and the index is left as it was: not dropped, altered or given
+  the alias. A 1.2.1 replica of a 1.2.0 master can so keep an index its
+  master dropped that way; upgrade the master first, or drop the index
+  from its own database.
 - **RDB files from Redis Stack 6.2 load.** Redis Stack 6.2 writes
   RedisGraph's module data (`graphdata`) into every RDB file, with or
   without graphs, and KiviDB refused the whole file, so a `dump.rdb` of
@@ -153,6 +176,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   double. Numbers already stored are read exactly from then on: a
   document saved by 1.2.0 comes back with the numbers 1.2.0 held, and the
   AOF's `JSON.SET`s, replayed, give the numbers that were sent (#445).
+
+- **An RDB file's databases past 15 no longer merge into database 0.** The
+  RDB reader put the keys of every database numbered 16 or more into
+  database 0, beside that database's own keys, and where two had the same
+  name one overwrote the other, without a word. A file saved by Redis,
+  Valkey, KeyDB or Dragonfly with more than 16 databases now loads each key
+  into its own database when the server has that many (`databases`), and
+  is refused otherwise, with a message that names the database and the
+  `databases` to start with. This holds for `--preload-file`, the base file
+  of an `aof:` preload, `dump.rdb` at startup and a full sync from a Redis,
+  Valkey, KeyDB or Dragonfly master; a replica refuses such a full sync
+  and keeps its dataset (#477).
 
 - **A Lua script's `false` is a RESP3 null to a RESP3 client (#431).** A
   script's `false`, which is also what `redis.call` gives back for a nil
