@@ -217,6 +217,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Valkey, KeyDB or Dragonfly master; a replica refuses such a full sync
   and keeps its dataset (#477).
 
+- **A KiviDB snapshot's databases past the server's are no longer dropped.**
+  A `dump.kdb` saved by a server with more databases than this one had the
+  databases past them dropped without a word, and the log's key count left
+  them out: in `dump.kdb` at startup, the AOF's preamble, a `--preload-file`
+  of a KiviDB snapshot or the base file of an `aof:` preload, and a full
+  sync from a KiviDB master. The replica's check that a full sync is whole
+  before it drops its old dataset counted the keys it was about to lose. As
+  for an RDB file, such a snapshot now loads into the server's databases
+  when there are enough, and is refused otherwise, naming the database and
+  the `databases` to start with, as is one with a search index in such a
+  database; a replica refuses such a full sync before it lets go of its
+  dataset, and keeps it. A snapshot of KiviDB 1.2.0 with the empty key
+  before its last database is still read again where 1.2.0 put it before
+  it is refused. A database number of 65536 or more is called more likely
+  a damaged file than given as advice, and `--databases 0` is refused on
+  the command line as it was in a config file (#482).
+
 - **A Lua script's `false` is a RESP3 null to a RESP3 client (#431).** A
   script's `false`, which is also what `redis.call` gives back for a nil
   reply (a `GET` of a missing key), was sent as RESP2's `$-1` to a client
