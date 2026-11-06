@@ -1867,6 +1867,32 @@ fn module_aux(name: &str) -> Vec<u8> {
     p
 }
 
+/// Redis Stack 6.2 writes RedisGraph's module data into every RDB file, graphs
+/// or none. A file of it without graphs loads; one with a graph is refused,
+/// by the graph's own module type, not by the module data.
+#[test]
+fn redis_stack_6_2_files_load_unless_they_hold_a_graph() {
+    let (dbs, expiries, _) =
+        kividb::snapshot::load_redis_rdb_from(&include_bytes!("fixtures/redis-stack-6.2.rdb")[..])
+            .unwrap();
+    let mut keys: Vec<&str> = dbs[0].keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["h", "l", "s", "ttl"]);
+    // Saved with `EXPIREAT ttl 4102444800`, in 2100, so that it does not run out.
+    assert_eq!(expiries[0].get("ttl"), Some(&4_102_444_800_000));
+
+    let Err(err) = kividb::snapshot::load_redis_rdb_from(
+        &include_bytes!("fixtures/redis-stack-6.2-graph.rdb")[..],
+    ) else {
+        panic!("a file with a graph loaded");
+    };
+    assert!(
+        err.to_string()
+            .contains("values of module type graphdata are not supported"),
+        "{err}"
+    );
+}
+
 // Aux data of the search module is read past, wherever it is; any other
 // module's is refused by its name, as Redis refuses aux data of a module it
 // has not loaded (#71).

@@ -3706,7 +3706,11 @@ fn rdb_read_module_strings(r: &mut impl Read) -> io::Result<Vec<Vec<u8>>> {
 /// module it has not loaded.
 fn rdb_skip_module_aux(r: &mut impl Read, warned: &mut bool) -> io::Result<()> {
     let (name, _) = module_type_name(rdb_read_plain_length(r)?);
-    if name != "ft_index0" && name != "scdtype00" {
+    // RedisGraph's (`graphdata`), which Redis Stack 6.2 writes into every
+    // RDB file, graphs or none, is read past too: a graph itself is a key of
+    // module type `graphdata`, and that is refused.
+    let graph = name == "graphdata";
+    if name != "ft_index0" && name != "scdtype00" && !graph {
         return Err(rdb_invalid(format!(
             "data of module type {name} (opcode 0xF7) is not supported"
         )));
@@ -3718,7 +3722,7 @@ fn rdb_skip_module_aux(r: &mut impl Read, warned: &mut bool) -> io::Result<()> {
     rdb_read_plain_length(r)?;
     // Redis Stack writes it with nothing in it: a count of 0 and no names.
     let names = rdb_read_module_strings(r)?;
-    if !names.is_empty() && !*warned {
+    if !graph && !names.is_empty() && !*warned {
         log_warn!(
             "RDB: the search module's index definitions and dictionaries are not loaded; \
              run FT.CREATE and FT.DICTADD again to make them"
