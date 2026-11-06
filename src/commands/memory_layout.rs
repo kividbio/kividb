@@ -1,5 +1,5 @@
 //! What the blocks of a collection take, from its structure: what
-//! `MEMORY USAGE` adds up for a set and a hash.
+//! `MEMORY USAGE` adds up for a set, a hash and a sorted set.
 //!
 //! It is counted as `used_memory` counts (`memory_use`): the size each
 //! allocation asks for, not what the system allocator rounds it up to. So
@@ -153,6 +153,50 @@ pub fn hash_fields(fields: &HashFields, samples: usize) -> usize {
         sampled(len, samples, || fields.iter().step_by(step).map(bytes))
     };
     indexes + entries + each
+}
+
+/// Keys a node of the standard library's `BTreeMap` has room for (its B is
+/// 6): a leaf is made with room for this many, however many it holds.
+const BTREE_KEYS: usize = 11;
+
+/// A leaf of a `BTreeMap<K, ()>`: its parent, its place in the parent and
+/// its length, and room for its keys.
+fn btree_leaf<K>() -> Layout {
+    Layout::new::<(*const (), u16, u16, [K; BTREE_KEYS])>()
+}
+
+/// A sorted set's score index (`BTreeMap<K, ()>`) of `len` keys: one leaf
+/// up to eleven of them, and past that leaves and the nodes above them.
+///
+/// How full the nodes are is not seen from outside the map (and is not
+/// worth a walk of it): it depends on the order the keys came in. Keys that
+/// come in order (ascending or descending scores, and every sorted set a
+/// snapshot loads) leave nodes about 6/11 full, 7 children a node; keys
+/// that come at random about 7.6/11, 8.6 children. This counts 7.75, as
+/// many nodes as the keys need (fractionally), so that either order is
+/// within 12% from about a thousand keys up. Fewer keys come to whole
+/// nodes, and the tree can be a leaf off: measured from -18% to +42% at
+/// the worst sizes (a few dozen keys, at random).
+pub fn score_index<K>(len: usize) -> usize {
+    const CHILDREN: f64 = 7.75;
+    let leaf = btree_leaf::<K>();
+    let internal = leaf
+        .extend(Layout::new::<[*const (); BTREE_KEYS + 1]>())
+        .expect("a B-tree node's layout")
+        .0
+        .pad_to_align()
+        .size();
+    let leaf = leaf.pad_to_align().size();
+    match len {
+        0 => 0,
+        1..=BTREE_KEYS => leaf,
+        _ => {
+            let leaves = (len as f64 + 1.0) / CHILDREN;
+            let leaves = leaves.max(2.0);
+            let internals = (leaves / (CHILDREN - 1.0)).max(1.0);
+            (leaves * leaf as f64 + internals * internal as f64) as usize
+        }
+    }
 }
 
 #[cfg(test)]
@@ -315,5 +359,55 @@ mod tests {
         assert_eq!(sampled(100, 5, || std::iter::repeat(4)), 400);
         // More samples than elements: all of them, once.
         assert_eq!(sampled(3, 100, || [1, 2, 3].into_iter()), 6);
+    }
+
+    #[test]
+    fn a_score_index_is_within_its_bounds_of_what_it_allocates() {
+        use std::collections::BTreeMap;
+        type Key = (ordered_float::OrderedFloat<f64>, Arc<[u8]>);
+        with_own_counter(
+            "a_score_index_is_within_its_bounds_of_what_it_allocates",
+            || {
+                let member: Arc<[u8]> = Arc::from(&b"m"[..]);
+                let key = |score: u64| (ordered_float::OrderedFloat(score as f64), member.clone());
+                let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+                let mut random = move || {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    seed
+                };
+                for len in [
+                    1usize, 5, 11, 12, 13, 20, 50, 65, 100, 128, 500, 1000, 5000, 50_000,
+                ] {
+                    let orders: [(&str, Vec<u64>); 3] = [
+                        ("ascending", (0..len as u64).collect()),
+                        ("descending", (0..len as u64).rev().collect()),
+                        ("random", (0..len).map(|_| random()).collect()),
+                    ];
+                    for (order, scores) in orders {
+                        let (_tree, bytes) = allocated(|| {
+                            let mut tree: BTreeMap<Key, ()> = BTreeMap::new();
+                            for &s in &scores {
+                                tree.insert(key(s), ());
+                            }
+                            tree
+                        });
+                        let estimate = score_index::<Key>(len);
+                        let error = (estimate as f64 - bytes as f64) / bytes as f64;
+                        let (under, over) = match len {
+                            // One leaf, or two and a root: exact.
+                            0..=13 => (0.0, 0.0),
+                            14..=999 => (0.20, 0.45),
+                            _ => (0.13, 0.13),
+                        };
+                        assert!(
+                            (-under..=over).contains(&error),
+                            "{len} keys, {order}: estimate {estimate}, allocated {bytes}"
+                        );
+                    }
+                }
+            },
+        );
     }
 }

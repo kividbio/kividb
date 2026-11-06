@@ -48,6 +48,16 @@ impl Tolerance {
     /// bucket there, not the table's empty buckets, which no hash owns and
     /// deleting one does not give back. A table grown to fit is at least
     /// 7/16 full, so the empty buckets come to at most 9/7 of a bucket a hash.
+    /// A sorted set past one leaf of score index, whose nodes are counted
+    /// from how many keys it has (`memory_layout::score_index`): measured
+    /// from 4.6% under (members in order, 5000 of them) to 7.7% over (20 at
+    /// random), on macOS and Linux.
+    pub const ZSET: Tolerance = Tolerance {
+        under: 0.07,
+        over: 0.10,
+        bytes: 16.0,
+    };
+
     pub fn with_field_ttls(self) -> Tolerance {
         let bucket = std::mem::size_of::<((usize, usize, String), Instant)>() + 1;
         Tolerance {

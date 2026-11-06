@@ -1661,3 +1661,18 @@ fn volatile_lru_evicts_only_hashes_with_a_ttl() {
     assert_eq!(c.surviving("more", more), more);
     assert!(c.used_memory() <= limit + MB / 4);
 }
+
+/// And for a sorted set, whose members are in two indexes.
+#[test]
+fn noeviction_refuses_a_growing_sorted_set_at_the_limit_and_memory_usage_says_why() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    grow_until_refused(&mut c, "zset", |c, from| {
+        let pairs: Vec<String> = members(from, 100)
+            .into_iter()
+            .enumerate()
+            .flat_map(|(i, m)| [(from + i).to_string(), m])
+            .collect();
+        cmd_with(c, &["ZADD", "zset"], &pairs)
+    });
+}

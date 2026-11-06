@@ -6,7 +6,8 @@ use crate::read_lock;
 use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
-use crate::types::{HashFields, HashInner};
+use crate::types::{HashFields, HashInner, SortedSetInner, ZMember};
+use ordered_float::OrderedFloat;
 use parking_lot::RwLock;
 
 pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
@@ -164,23 +165,25 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
         ValueRef::SortedSet(arc) => {
             let inner = arc.read();
-            let len = inner.members.len();
-            let avg = if len == 0 {
-                0
-            } else {
-                let sample_n = samples.min(len);
-                let step = (len / sample_n).max(1);
-                let total: usize = inner
-                    .members
-                    .keys()
-                    .step_by(step)
-                    .take(sample_n)
-                    .map(|m| m.len())
-                    .sum();
-                total / sample_n.max(1)
-            };
-            // dual-indexed: BTreeMap + AHashMap, so *2
-            key_overhead + (avg + 8) * len * 2 + 120
+            // Each member is one block, held by both indexes. One whose score
+            // was changed has two: the member map keeps the block it had and
+            // the score index takes the command's, so the map's is then held
+            // by the map alone. Sampled as a set's members are.
+            let members = layout::sampled(inner.members.len(), samples, || {
+                inner.members.keys().map(|m| {
+                    let block = layout::arc_slice(m.len());
+                    if std::sync::Arc::strong_count(m) == 1 {
+                        2 * block
+                    } else {
+                        block
+                    }
+                })
+            });
+            entry()
+                + layout::arc_of::<RwLock<SortedSetInner>>()
+                + layout::std_hash_map::<ZMember, f64>(inner.members.capacity())
+                + layout::score_index::<(OrderedFloat<f64>, ZMember)>(inner.by_score.len())
+                + members
         }
 
         ValueRef::Stream(arc) => {
