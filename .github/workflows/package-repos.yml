@@ -3,7 +3,7 @@ name: Package repositories
 # Adds a stable release's .deb and .rpm packages to the apt and dnf
 # repositories at https://packages.kividb.io and signs them. The site is the
 # GitHub Pages site of kividbio/packages; packaging/repos/build-repos.sh builds
-# it, and docs/INSTALL.md says how it is used.
+# it, and docs/INSTALL.md says how it is used and how it is set up.
 #
 # release.yml calls this once the GitHub Release is published, so the packages
 # come from the release itself and have their attestations. It can also be
@@ -11,14 +11,16 @@ name: Package repositories
 # then) it builds the repositories into an artifact and publishes nothing,
 # signing with a throwaway key if the real one is not set up yet.
 #
-# Secrets (the job is skipped, with a notice, while either is missing, so a
-# release never fails for want of them):
+# The job runs in the `packages` environment, which holds the secrets and is
+# limited to master and v* tags (docs/INSTALL.md, "Maintainers: one-time
+# setup"). The job is skipped, with a notice, while a secret it needs is
+# missing, so a release never fails for want of them:
 #   PACKAGES_GPG_PRIVATE_KEY  the signing key, ASCII-armored
 #   PACKAGES_GPG_PASSPHRASE   its passphrase, if it has one
 #   PACKAGES_DEPLOY_KEY       an SSH deploy key with write access to
 #                             kividbio/packages, and to nothing else
-# Variable (optional): PACKAGES_GPG_FINGERPRINT, the fingerprint the imported
-# key must have.
+# Variable: PACKAGES_GPG_FINGERPRINT, the fingerprint the imported key must
+# have. Required whenever the real key is used.
 
 on:
   workflow_call:
@@ -29,10 +31,19 @@ on:
       dry_run:
         type: boolean
         default: false
+    # Only these, not `secrets: inherit`. A secret set in the `packages`
+    # environment takes the place of the one passed here.
+    secrets:
+      PACKAGES_GPG_PRIVATE_KEY:
+        required: false
+      PACKAGES_GPG_PASSPHRASE:
+        required: false
+      PACKAGES_DEPLOY_KEY:
+        required: false
   workflow_dispatch:
     inputs:
       tag:
-        description: "A released tag whose packages to add (e.g. v1.2.0)"
+        description: "A released tag whose packages to add (e.g. v1.2.1)"
         required: true
       dry_run:
         description: "Build the repositories into an artifact only; publish nothing"
@@ -43,9 +54,10 @@ permissions:
   contents: read
   attestations: read
 
-# Two releases in a row must not both rewrite the site at once.
+# Two releases in a row must not both rewrite the site at once. A dry run
+# publishes nothing, so it neither waits for a publish nor holds one up.
 concurrency:
-  group: package-repos
+  group: package-repos-${{ inputs.dry_run && 'dry-run' || 'publish' }}
   cancel-in-progress: false
 
 env:
@@ -61,6 +73,7 @@ env:
 jobs:
   repos:
     runs-on: ubuntu-24.04
+    environment: packages
     steps:
       - name: Check the tag and the secrets
         id: cfg
@@ -76,7 +89,7 @@ jobs:
           esac
           case "$TAG" in
             *-*)
-              echo "::notice::$TAG is a release candidate; candidates are not added to the package repositories."
+              echo "::notice::$TAG is not a stable release; only stable releases are added to the package repositories."
               out "run=false"
               exit 0
               ;;
@@ -93,7 +106,7 @@ jobs:
             exit 0
           fi
           if [ "$HAVE_GPG" != "true" ] || [ "$HAVE_DEPLOY" != "true" ]; then
-            echo "::notice::Package repositories skipped: set the PACKAGES_GPG_PRIVATE_KEY and PACKAGES_DEPLOY_KEY secrets to publish them (docs/INSTALL.md, 'Maintainers')."
+            echo "::notice::Package repositories skipped: set the PACKAGES_GPG_PRIVATE_KEY and PACKAGES_DEPLOY_KEY secrets to publish them (docs/INSTALL.md, 'Maintainers: one-time setup')."
             out "run=false"
             exit 0
           fi
@@ -102,7 +115,7 @@ jobs:
           out "throwaway=false"
 
       # The build script and docs come from this workflow's own commit, not
-      # the tag: a dry run for v1.2.0 runs before the tag had them.
+      # the tag: a dry run for an older release runs before the tag had them.
       - uses: actions/checkout@v4
         if: steps.cfg.outputs.run == 'true'
         with:
@@ -134,20 +147,26 @@ jobs:
             gpg --batch --passphrase '' --quick-gen-key \
               "KiviDB Packages DRY RUN <packages@kividb.io>" rsa4096 sign 1d
           else
+            if [ -z "$WANT_FPR" ]; then
+              echo "::error::set the PACKAGES_GPG_FINGERPRINT variable to the signing key's fingerprint (docs/INSTALL.md, 'Maintainers: one-time setup')"
+              exit 1
+            fi
             printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
             if [ -n "$GPG_PASSPHRASE" ]; then
               # Unlock it once in the agent, so gpg and rpmsign sign with no
-              # prompt.
+              # prompt. The passphrase goes in on stdin (printf is a shell
+              # builtin), never on a command line, where other processes on
+              # the runner could read it.
               echo allow-preset-passphrase >> "$GNUPGHOME/gpg-agent.conf"
               gpgconf --kill gpg-agent
               gpg-connect-agent /bye
               for grip in $(gpg --batch --with-colons --with-keygrip --list-secret-keys | awk -F: '$1 == "grp" { print $10 }'); do
-                /usr/lib/gnupg/gpg-preset-passphrase --preset -P "$GPG_PASSPHRASE" "$grip"
+                printf '%s' "$GPG_PASSPHRASE" | /usr/lib/gnupg/gpg-preset-passphrase --preset "$grip"
               done
             fi
           fi
           fpr="$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')"
-          if [ -n "$WANT_FPR" ] && [ "$THROWAWAY" != "true" ] && [ "$fpr" != "${WANT_FPR// /}" ]; then
+          if [ "$THROWAWAY" != "true" ] && [ "$fpr" != "${WANT_FPR// /}" ]; then
             echo "::error::the signing key is $fpr, not PACKAGES_GPG_FINGERPRINT ($WANT_FPR)"
             exit 1
           fi
@@ -189,8 +208,13 @@ jobs:
           git clone --depth 1 "https://github.com/${SITE_REPO}.git" site 2>/dev/null \
             || { echo "no published site yet: starting from nothing"; mkdir site; }
 
+      # A package must say it needs glibc 2.34 (docs/INSTALL.md promises it;
+      # packages before 1.2.1 do not), or the job stops. A dry run only warns,
+      # so it can be tried with a release from before then.
       - name: Add the packages and sign the repositories
         if: steps.cfg.outputs.run == 'true'
+        env:
+          GLIBC_DEP_CHECK: ${{ steps.cfg.outputs.publish == 'true' && 'fail' || 'warn' }}
         run: bash kividb/packaging/repos/build-repos.sh site incoming
 
       # The site is one commit, replaced each time: every package version ever

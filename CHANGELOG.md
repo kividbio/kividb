@@ -16,8 +16,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   upgrades come with the system's own. The apt metadata, the dnf metadata
   and every RPM are signed with one key. The newest 20 releases stay in
   them, so a version can be pinned or gone back to. The release workflow
-  adds each stable release once its GitHub Release is published; release
-  candidates are never added. See [docs/INSTALL.md](docs/INSTALL.md).
+  adds each stable release, from 1.2.1 on, once its GitHub Release is
+  published. The arm64 packages need an ARMv8.1 CPU or newer (not a
+  Raspberry Pi 4). See [docs/INSTALL.md](docs/INSTALL.md).
 - **The packages say which glibc they need.** The `.deb` depends on
   `libc6 (>= 2.34)` and the `.rpm` on `glibc >= 2.34`, the version the
   binary is built against. On an older system (Debian 11, Ubuntu 20.04,

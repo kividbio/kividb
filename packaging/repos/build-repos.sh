@@ -17,13 +17,19 @@
 #             with no passphrase prompt (the workflow presets the passphrase)
 #   KEEP      versions kept per package and architecture (default 20)
 #   BASE_URL  where the site is served (default https://packages.kividb.io)
+#   GLIBC_DEP_CHECK  fail (default) or warn: what to do with a package that
+#             does not say it needs glibc 2.34 or newer (docs/INSTALL.md
+#             promises that it does; the packages before 1.2.1 do not)
 #
 # Layout of SITE:
 #   deb/dists/stable/{InRelease,Release,Release.gpg}
 #   deb/dists/stable/main/binary-{amd64,arm64}/Packages{,.gz}
+#   deb/dists/stable/main/binary-{amd64,arm64}/by-hash/<algorithm>/<digest>
+#     (this generation's indexes and the previous one's)
 #   deb/pool/main/k/<package>/<package>_<version>_<arch>.deb
 #   rpm/{x86_64,aarch64}/Packages/<package>-<version>-<release>.<arch>.rpm
-#   rpm/{x86_64,aarch64}/repodata/ (repomd.xml signed as repomd.xml.asc)
+#   rpm/{x86_64,aarch64}/repodata/ (repomd.xml signed as repomd.xml.asc;
+#     the previous generation's files are kept beside it)
 #   kividb.gpg (binary key, for apt), kividb.asc (armored, for dnf)
 #   kividb.sources, kividb.list, kividb.repo, index.html, CNAME, .nojekyll
 #
@@ -37,7 +43,10 @@ KEEP="${KEEP:-20}"
 BASE_URL="${BASE_URL:-https://packages.kividb.io}"
 BASE_URL="${BASE_URL%/}"
 
+GLIBC_DEP_CHECK="${GLIBC_DEP_CHECK:-fail}"
+
 case "$KEEP" in '' | *[!0-9]* | 0) echo "KEEP must be a positive number" >&2; exit 1 ;; esac
+case "$GLIBC_DEP_CHECK" in fail | warn) ;; *) echo "GLIBC_DEP_CHECK must be fail or warn" >&2; exit 1 ;; esac
 
 DEB_ARCHES="amd64 arm64"
 RPM_ARCHES="x86_64 aarch64"
@@ -52,6 +61,29 @@ key_ids="$(gpg --batch --with-colons --list-keys "$GPG_KEY" | awk -F: '$1 == "pu
 
 mkdir -p "$SITE/deb/pool/main" "$SITE/deb/dists/stable/main" "$SITE/rpm"
 
+# Versions are compared the way apt and dnf compare them (dpkg, and rpm's own
+# epoch:version-release comparison), not by file name: sort -V puts
+# 1.2.0+1-1 before 1.2.0-1.
+newer() { # newer deb|rpm A B: A is a newer version than B
+    if [ "$1" = deb ]; then
+        dpkg --compare-versions "$2" gt "$3"
+    else
+        [ "$(rpm --eval "%{lua: print(rpm.ver('$2') > rpm.ver('$3'))}")" = true ]
+    fi
+}
+
+# The packages promise glibc 2.34 or newer (packaging/nfpm.yaml), so apt and
+# dnf refuse an older system instead of installing a server that cannot
+# start. A package that does not say so is not added.
+glibc_dep_missing() { # glibc_dep_missing FILE WHAT
+    if [ "$GLIBC_DEP_CHECK" = warn ]; then
+        echo "::warning::$1: $2; added anyway (GLIBC_DEP_CHECK=warn)" >&2
+        return 0
+    fi
+    echo "::error::$1: $2; the repositories only take packages that require glibc 2.34 or newer" >&2
+    exit 1
+}
+
 # ── Add the incoming packages ────────────────────────────────────────────
 # A version that is already published is never replaced: an apt or dnf
 # client that cached its checksum would refuse the new file, and a pinned
@@ -64,6 +96,12 @@ for deb in "$INCOMING"/*.deb; do
     ver="$(dpkg-deb -f "$deb" Version)"
     arch="$(dpkg-deb -f "$deb" Architecture)"
     case " $DEB_ARCHES " in *" $arch "*) ;; *) echo "skip $deb: architecture $arch" >&2; continue ;; esac
+    need="$(dpkg-deb -f "$deb" Depends | tr ',' '\n' | sed -n 's/^ *libc6 *(>= *\([^)]*\)).*/\1/p' | head -n 1)"
+    if [ -z "$need" ]; then
+        glibc_dep_missing "$deb" "no Depends: libc6 (>= ...)"
+    elif dpkg --compare-versions "$need" lt 2.34; then
+        glibc_dep_missing "$deb" "depends on libc6 (>= $need)"
+    fi
     first="$(printf %s "$name" | cut -c1)"
     dest="$SITE/deb/pool/main/$first/$name/${name}_${ver//:/%3a}_${arch}.deb"
     if [ -e "$dest" ]; then
@@ -84,12 +122,29 @@ for rpmf in "$INCOMING"/*.rpm; do
     nevra="$(rpm -qp --nosignature --qf '%{NAME} %{VERSION} %{RELEASE} %{ARCH}' "$rpmf")"
     read -r name ver rel arch <<<"$nevra"
     case " $RPM_ARCHES " in *" $arch "*) ;; *) echo "skip $rpmf: architecture $arch" >&2; continue ;; esac
+    need="$(rpm -qp --nosignature --requires "$rpmf" | awk '$1 == "glibc" && $2 == ">=" { print $3; exit }')"
+    if [ -z "$need" ]; then
+        glibc_dep_missing "$rpmf" "no Requires: glibc >= ..."
+    elif newer rpm 2.34 "$need"; then
+        glibc_dep_missing "$rpmf" "requires glibc >= $need"
+    fi
     dest="$SITE/rpm/$arch/Packages/${name}-${ver}-${rel}.${arch}.rpm"
     if [ -e "$dest" ]; then
         # The published copy is signed and the incoming one is not, so the
-        # files differ; the payload digest says whether it is the same build.
-        a="$(rpm -qp --nosignature --qf '%{PAYLOADDIGEST}' "$rpmf")"
-        b="$(rpm -qp --nosignature --qf '%{PAYLOADDIGEST}' "$dest")"
+        # files differ. Signing leaves the header and the payload as they
+        # are: their digests say whether it is the same build. Both must be
+        # there, or two different builds would both read (none) and match.
+        a="$(rpm -qp --nosignature --qf '%{PAYLOADDIGEST} %{SHA256HEADER}' "$rpmf")"
+        b="$(rpm -qp --nosignature --qf '%{PAYLOADDIGEST} %{SHA256HEADER}' "$dest")"
+        for d in $a $b; do
+            case "$d" in
+                *[!0-9a-f]* | '')
+                    echo "::error::rpm: $name $ver-$rel $arch: no payload or header digest in $rpmf or $dest ($a / $b), so it cannot be told apart from the published one" >&2
+                    exit 1
+                    ;;
+            esac
+        done
+        [ "$(wc -w <<<"$a $b")" -eq 4 ] || { echo "::error::rpm: $name $ver-$rel $arch: unexpected digests ($a / $b)" >&2; exit 1; }
         if [ "$a" = "$b" ]; then
             echo "rpm: $name $ver-$rel $arch is already published"
             continue
@@ -121,16 +176,7 @@ done
 echo "added $added package(s)"
 
 # ── Keep the newest $KEEP versions of each package and architecture ──────
-# Versions are compared the way apt and dnf compare them (dpkg, and rpm's own
-# epoch:version-release comparison), not by file name: sort -V puts
-# 1.2.0+1-1 before 1.2.0-1.
-newer() { # newer deb|rpm A B: A is a newer version than B
-    if [ "$1" = deb ]; then
-        dpkg --compare-versions "$2" gt "$3"
-    else
-        [ "$(rpm --eval "%{lua: print(rpm.ver('$2') > rpm.ver('$3'))}")" = true ]
-    fi
-}
+# Compared with newer(), above.
 prune() { # prune deb|rpm FILE... : the same package and architecture
     local kind="$1"
     shift
@@ -199,8 +245,18 @@ Label: KiviDB
 Architecture: $arch
 EOF
 done
+# by-hash (Acquire-By-Hash): apt fetches each index by its digest, so a
+# client that read the previous InRelease still gets the files it names
+# while this one is published. The files of the previous generation stay;
+# older ones are removed below.
+if [ -f dists/stable/Release ]; then
+    cp dists/stable/Release "$work/Release.previous"
+else
+    : > "$work/Release.previous"
+fi
 rm -f dists/stable/Release dists/stable/InRelease dists/stable/Release.gpg
 apt-ftparchive \
+    -o APT::FTPArchive::DoByHash=true \
     -o APT::FTPArchive::Release::Origin=KiviDB \
     -o APT::FTPArchive::Release::Label=KiviDB \
     -o APT::FTPArchive::Release::Suite=stable \
@@ -210,6 +266,17 @@ apt-ftparchive \
     -o "APT::FTPArchive::Release::Description=KiviDB packages, $BASE_URL" \
     release dists/stable > "$work/Release"
 mv "$work/Release" dists/stable/Release
+grep -q '^Acquire-By-Hash: yes$' dists/stable/Release || { echo "apt-ftparchive wrote no Acquire-By-Hash" >&2; exit 1; }
+awk 'NF == 3 && $1 ~ /^[0-9a-f]+$/ { print $1 }' "$work/Release.previous" dists/stable/Release |
+    sort -u > "$work/by-hash.keep"
+find dists/stable -path '*/by-hash/*' -type f | while IFS= read -r f; do
+    grep -qxF "${f##*/}" "$work/by-hash.keep" || { echo "by-hash: removed ${f#dists/stable/}"; rm -f "$f"; }
+done
+for arch in $DEB_ARCHES; do
+    d="dists/stable/main/binary-$arch/by-hash/SHA256"
+    h="$(sha256sum "dists/stable/main/binary-$arch/Packages" | cut -d' ' -f1)"
+    [ -f "$d/$h" ] || { echo "no by-hash copy of binary-$arch/Packages" >&2; exit 1; }
+done
 gpg --batch --yes --local-user "$GPG_KEY" --digest-algo SHA512 --clearsign \
     --output dists/stable/InRelease dists/stable/Release
 gpg --batch --yes --local-user "$GPG_KEY" --digest-algo SHA512 --armor --detach-sign \
@@ -219,7 +286,24 @@ gpg --batch --yes --local-user "$GPG_KEY" --digest-algo SHA512 --armor --detach-
 for arch in $RPM_ARCHES; do
     d="$SITE/rpm/$arch"
     mkdir -p "$d/Packages"
-    createrepo_c --quiet --general-compress-type=gz --retain-old-md=0 "$d"
+    # The previous generation's metadata files stay beside the new ones, so
+    # a client that read the previous repomd.xml still finds what it names.
+    # createrepo_c keeps that one (--retain-old-md=1) but leaves alone the
+    # generations before it, which no repomd.xml names any more: those are
+    # removed here.
+    prev="$work/repomd-$arch.previous"
+    if [ -f "$d/repodata/repomd.xml" ]; then
+        cp "$d/repodata/repomd.xml" "$prev"
+    else
+        : > "$prev"
+    fi
+    createrepo_c --quiet --general-compress-type=gz --retain-old-md=1 "$d"
+    cat "$prev" "$d/repodata/repomd.xml" | grep -o 'location href="repodata/[^"]*"' |
+        cut -d/ -f2 | tr -d '"' | sort -u > "$work/repodata.keep"
+    for f in "$d/repodata"/*; do
+        case "${f##*/}" in repomd.xml | repomd.xml.asc) continue ;; esac
+        grep -qxF "${f##*/}" "$work/repodata.keep" || { echo "repodata: removed ${f#"$SITE"/}"; rm -f "$f"; }
+    done
     gpg --batch --yes --local-user "$GPG_KEY" --digest-algo SHA512 --armor --detach-sign \
         --output "$d/repodata/repomd.xml.asc" "$d/repodata/repomd.xml"
 done
