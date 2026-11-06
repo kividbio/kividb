@@ -189,7 +189,11 @@ struct Server {
 
 impl Server {
     fn start(extra: &[&str]) -> Self {
-        let dir = tempfile::tempdir().unwrap().keep();
+        Self::start_in(tempfile::tempdir().unwrap().keep(), extra)
+    }
+
+    /// Started in `dir`, which may already hold files for it to load.
+    fn start_in(dir: PathBuf, extra: &[&str]) -> Self {
         let port = free_port();
         let args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
         let child = kividb(&dir, port, &args);
@@ -420,8 +424,8 @@ fn a_field_deadline_is_kept_to_the_millisecond_by_dump_restore_and_migrate() {
 /// `RESTORE` and by a save and a restart; one past it, absolute or
 /// relative, is refused with Redis's error. `HEXPIRE k 18446744073709552`
 /// used to be taken and saved cut to 64 bits, a moment from then, so the
-/// field was gone after a restart; `HEXPIRE k 9223372036854775807` stopped
-/// the server.
+/// field was gone after a restart; `HEXPIRE k 9223372036854775807`
+/// panicked and closed the connection.
 #[test]
 fn a_field_deadline_past_what_redis_allows_is_refused_and_the_latest_is_kept() {
     const MAX: u64 = (1 << 46) - 1;
@@ -515,4 +519,75 @@ fn a_field_deadline_past_what_redis_allows_is_refused_and_the_latest_is_kept() {
     let mut c = server.conn();
     assert_eq!(deadlines(&mut c, "h"), want, "after a restart");
     assert_eq!(deadlines(&mut c, "h2"), want, "after a restart");
+}
+
+/// A negative Unix time is refused, as by Redis, and the fields are kept:
+/// `HEXPIREAT` and `HPEXPIREAT`, and `EXAT` and `PXAT` of `HGETEX` and
+/// `HSETEX`, took it as a time that had passed and deleted them (#486). A
+/// time of 0 is still taken, and the field goes, as in Redis.
+#[test]
+fn a_negative_unix_time_is_refused_and_the_fields_kept() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    assert_eq!(
+        c.cmd(&["HSET", "h", "a", "1", "b", "2", "c", "3", "d", "4"])
+            .int(),
+        4
+    );
+    let refused = V::Err("ERR invalid expire time, must be >= 0".to_string());
+    for args in [
+        vec!["HEXPIREAT", "h", "-1", "FIELDS", "1", "a"],
+        vec!["HPEXPIREAT", "h", "-1", "FIELDS", "1", "a"],
+        vec!["HEXPIREAT", "h", "-9223372036854775808", "FIELDS", "1", "a"],
+        vec!["HGETEX", "h", "EXAT", "-1", "FIELDS", "1", "a"],
+        vec!["HGETEX", "h", "PXAT", "-1", "FIELDS", "1", "a"],
+        vec!["HSETEX", "h", "EXAT", "-1", "FIELDS", "1", "a", "9"],
+        vec!["HSETEX", "h", "PXAT", "-1", "FIELDS", "1", "a", "9"],
+    ] {
+        assert_eq!(c.cmd(&args), refused, "{args:?}");
+    }
+    assert_eq!(c.cmd(&["HGET", "h", "a"]), V::Str(b"1".to_vec()));
+    assert_eq!(c.cmd(&["HLEN", "h"]).int(), 4);
+
+    // 0 has come: the field goes.
+    assert_eq!(
+        c.cmd(&["HEXPIREAT", "h", "0", "FIELDS", "1", "b"]),
+        V::Arr(vec![V::Int(2)])
+    );
+    assert_eq!(
+        c.cmd(&["HPEXPIREAT", "h", "0", "FIELDS", "1", "c"]),
+        V::Arr(vec![V::Int(2)])
+    );
+    assert_eq!(
+        c.cmd(&["HGETEX", "h", "PXAT", "0", "FIELDS", "1", "d"]),
+        V::Arr(vec![V::Str(b"4".to_vec())])
+    );
+    assert_eq!(c.cmd(&["HLEN", "h"]).int(), 1);
+}
+
+/// 1.2.0 took a negative Unix time as one that had passed, deleted the
+/// fields, and logged the command as it came. Replayed, it still deletes
+/// them: refused there, a field 1.2.0 had deleted would come back.
+#[test]
+fn a_negative_unix_time_in_an_aof_written_by_1_2_0_still_deletes() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let records: &[&[&str]] = &[
+        &["SELECT", "0"],
+        &["HSET", "h", "a", "1", "b", "2", "c", "3"],
+        &["HPEXPIREAT", "h", "-1", "FIELDS", "1", "a"],
+        &["HSETEX", "h", "EXAT", "-5", "FIELDS", "1", "b", "9"],
+    ];
+    let mut aof = Vec::new();
+    for record in records {
+        aof.extend_from_slice(format!("*{}\r\n", record.len()).as_bytes());
+        for part in *record {
+            aof.extend_from_slice(format!("${}\r\n{part}\r\n", part.len()).as_bytes());
+        }
+    }
+    std::fs::write(dir.join("appendonly.aof"), aof).unwrap();
+    let server = Server::start_in(dir, &["--aof"]);
+    let mut c = server.conn();
+    assert_eq!(c.cmd(&["HEXISTS", "h", "a"]).int(), 0);
+    assert_eq!(c.cmd(&["HEXISTS", "h", "b"]).int(), 0);
+    assert_eq!(c.cmd(&["HGET", "h", "c"]), V::Str(b"3".to_vec()));
 }
