@@ -36,6 +36,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the same server as the `v` tag. The release workflow now pushes
   `X.Y.Z-src` on the release's own commit. A `-src` tag is not a
   separate release.
+- **Stable releases are published on crates.io.** The release workflow
+  publishes each stable release as the crate `kividb` after its GitHub
+  Release, so `cargo install --locked kividb` builds the server from
+  source and `cargo binstall kividb` downloads the release's binary for
+  Linux and macOS. The crate holds the sources, the lockfile and the
+  licence files, about 1.6 MB. Its library is built from the same
+  sources so the integration tests can use them; it is not a public API.
 
 ### Fixed
 

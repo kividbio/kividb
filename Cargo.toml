@@ -16,8 +16,53 @@ authors = ["KIVIDB PRIVATE LIMITED"]
 homepage = "https://kividb.io"
 readme = "README.md"
 repository = "https://github.com/kividbio/kividb"
-keywords = ["redis", "database", "in-memory", "resp"]
-categories = ["database"]
+keywords = ["redis", "database", "in-memory", "resp", "cache"]
+categories = ["database-implementations", "caching"]
+# The oldest toolchain the crate is checked against: the Dockerfile's.
+rust-version = "1.89"
+# What `cargo publish` uploads: the sources and the files a build or the
+# library's own unit tests read. Benchmarks, integration tests, docs, scripts
+# and media stay in the repository (the crate limit is 10 MB; all of git is
+# over 200 MB).
+include = [
+    "/src/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/NOTICE",
+    # Read by unit tests in src/commands/hyperloglog.rs.
+    "/tests/fixtures/redis-8.0-hll-small-sparse.bin",
+    "/tests/fixtures/redis-8.0-hll-sparse-12304.bin",
+    "/tests/fixtures/kividb-legacy-hll-abc.bin",
+]
+
+# `cargo binstall kividb` downloads the release's tarball (the default build)
+# instead of compiling. Each tarball holds kividb/kividb, kividb/LICENSE and
+# kividb/NOTICE. Other targets compile from source; quick-install (builds by
+# a third party) is not used.
+[package.metadata.binstall]
+pkg-fmt = "tgz"
+bin-dir = "kividb/{ bin }{ binary-ext }"
+disabled-strategies = ["quick-install"]
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/kividb-linux-x86_64.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/kividb-linux-aarch64.tar.gz"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/kividb-darwin-x86_64.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/kividb-darwin-aarch64.tar.gz"
+
+# docs.rs: the library is the server's internals (see src/lib.rs). One Linux
+# build, the default features.
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
 
 [package.metadata.deb]
 name = "kividb"
