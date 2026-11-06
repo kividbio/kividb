@@ -606,6 +606,29 @@ jobs:
           git commit -m "chore: update kividb to ${{ steps.extract.outputs.version }}"
           git push
 
+  # ── apt and dnf repositories — stable releases only ─────────────────────
+  #
+  # Adds the release's .deb and .rpm, taken from the GitHub Release just
+  # published, to https://packages.kividb.io and signs the repositories: see
+  # package-repos.yml. `publish` runs for stable releases only, so a
+  # candidate never gets here. Skipped with a notice until the signing key
+  # and the deploy key are set (docs/INSTALL.md, "Maintainers: one-time
+  # setup"). Only the secrets it uses are passed; those in its `packages`
+  # environment take their place.
+  package-repos:
+    needs: [publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    permissions:
+      contents: read
+      attestations: read
+    uses: ./.github/workflows/package-repos.yml
+    with:
+      tag: ${{ github.event.inputs.tag || github.ref_name }}
+    secrets:
+      PACKAGES_GPG_PRIVATE_KEY: ${{ secrets.PACKAGES_GPG_PRIVATE_KEY }}
+      PACKAGES_GPG_PASSPHRASE: ${{ secrets.PACKAGES_GPG_PASSPHRASE }}
+      PACKAGES_DEPLOY_KEY: ${{ secrets.PACKAGES_DEPLOY_KEY }}
+
   # Stable releases only. A release candidate (a tag with a `-`, v1.2.0-rc1)
   # gets no GitHub Release, no assets and no announcement: it is built, its
   # images are pushed to GHCR, and the smoke test runs against them; the

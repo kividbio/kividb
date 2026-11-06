@@ -277,6 +277,12 @@ impl Node {
         } else {
             &["--bind", "127.0.0.1"]
         };
+        // Started from a config file, if empty, so that `CONFIG REWRITE` has
+        // one to write (#442).
+        let conf = self.dir.join("kividb.conf");
+        if !conf.exists() {
+            std::fs::write(&conf, "").unwrap();
+        }
         let child = Command::new(env!("CARGO_BIN_EXE_kividb"))
             .current_dir(&self.dir)
             .args(bind)
