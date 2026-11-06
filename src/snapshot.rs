@@ -4914,6 +4914,32 @@ mod field_deadline_tests {
         assert!(clock.instant_of(0).is_none());
     }
 
+    /// A deadline further out than 64 bits of milliseconds is written as
+    /// the furthest there is, not cut to 64 bits: cut, it was a moment from
+    /// now, and the field was gone once loaded.
+    #[test]
+    fn a_deadline_past_64_bits_of_milliseconds_saturates() {
+        let clock = FieldClock::now();
+        if let Some(far) = std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(20_000_000_000_000_000))
+        {
+            assert_eq!(clock.unix_ms_of(far), u64::MAX);
+        }
+        assert!(clock.instant_of(u64::MAX).is_some());
+        let max = crate::commands::helpers::MAX_FIELD_DEADLINE_MS;
+        use crate::commands::helpers::field_deadline_ms;
+        assert_eq!(field_deadline_ms(max, false, 0), Some(max));
+        assert_eq!(field_deadline_ms(max + 1, false, 0), None);
+        assert_eq!(
+            field_deadline_ms(max / 1000, true, 0),
+            Some(max / 1000 * 1000)
+        );
+        assert_eq!(field_deadline_ms(max / 1000 + 1, true, 0), None);
+        assert_eq!(field_deadline_ms(i64::MAX, true, 0), None);
+        assert_eq!(field_deadline_ms(1000, false, max - 1000), Some(max));
+        assert_eq!(field_deadline_ms(1001, false, max - 1000), None);
+    }
+
     #[test]
     fn a_dump_payload_keeps_each_deadline_to_the_millisecond() {
         for _ in 0..200 {

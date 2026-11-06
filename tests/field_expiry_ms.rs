@@ -414,3 +414,105 @@ fn a_field_deadline_is_kept_to_the_millisecond_by_dump_restore_and_migrate() {
     assert_eq!(c.cmd(&["EXISTS", "h0"]).int(), 0);
     assert_deadlines(&mut target.conn(), "after MIGRATE", &want, same);
 }
+
+/// The latest deadline Redis lets a hash field have is 2^46 - 1 ms after
+/// the epoch. One at it is kept, to the millisecond, by `DUMP` and
+/// `RESTORE` and by a save and a restart; one past it, absolute or
+/// relative, is refused with Redis's error. `HEXPIRE k 18446744073709552`
+/// used to be taken and saved cut to 64 bits, a moment from then, so the
+/// field was gone after a restart; `HEXPIRE k 9223372036854775807` stopped
+/// the server.
+#[test]
+fn a_field_deadline_past_what_redis_allows_is_refused_and_the_latest_is_kept() {
+    const MAX: u64 = (1 << 46) - 1;
+    let mut server = Server::start(&[]);
+    let mut c = server.conn();
+    assert_eq!(c.cmd(&["HSET", "h", "a", "1", "b", "2"]).int(), 2);
+    let max = MAX.to_string();
+    let past = (MAX + 1).to_string();
+    let past_secs = (MAX / 1000 + 1).to_string();
+    for (args, command) in [
+        (
+            vec!["HPEXPIREAT", "h", &past, "FIELDS", "1", "a"],
+            "hpexpireat",
+        ),
+        (
+            vec!["HEXPIREAT", "h", &past_secs, "FIELDS", "1", "a"],
+            "hexpireat",
+        ),
+        (vec!["HPEXPIRE", "h", &max, "FIELDS", "1", "a"], "hpexpire"),
+        (
+            vec!["HEXPIRE", "h", "18446744073709552", "FIELDS", "1", "a"],
+            "hexpire",
+        ),
+        (
+            vec!["HEXPIRE", "h", "9223372036854775807", "FIELDS", "1", "a"],
+            "hexpire",
+        ),
+        (
+            vec!["HGETEX", "h", "PXAT", &past, "FIELDS", "1", "a"],
+            "hgetex",
+        ),
+        (
+            vec![
+                "HGETEX",
+                "h",
+                "EX",
+                "9223372036854775807",
+                "FIELDS",
+                "1",
+                "a",
+            ],
+            "hgetex",
+        ),
+        (
+            vec!["HSETEX", "h", "PXAT", &past, "FIELDS", "1", "a", "1"],
+            "hsetex",
+        ),
+        (
+            vec!["HSETEX", "h", "EXAT", &past_secs, "FIELDS", "1", "a", "1"],
+            "hsetex",
+        ),
+        (
+            vec!["HSETEX", "h", "PX", &max, "FIELDS", "1", "a", "1"],
+            "hsetex",
+        ),
+    ] {
+        let reply = c.cmd(&args);
+        assert_eq!(
+            reply,
+            V::Err(format!("ERR invalid expire time in '{command}' command")),
+            "{args:?}"
+        );
+    }
+    assert_eq!(
+        c.cmd(&["HPTTL", "h", "FIELDS", "1", "a"]),
+        V::Arr(vec![V::Int(-1)])
+    );
+
+    // The latest one Redis allows, and one at the same second.
+    let max_secs = (MAX / 1000).to_string();
+    assert_eq!(
+        c.cmd(&["HPEXPIREAT", "h", &max, "FIELDS", "1", "a"]),
+        V::Arr(vec![V::Int(1)])
+    );
+    assert_eq!(
+        c.cmd(&["HEXPIREAT", "h", &max_secs, "FIELDS", "1", "b"]),
+        V::Arr(vec![V::Int(1)])
+    );
+    let want = V::Arr(vec![V::Int(MAX as i64), V::Int((MAX / 1000 * 1000) as i64)]);
+    let deadlines =
+        |c: &mut Conn, key: &str| c.cmd(&["HPEXPIRETIME", key, "FIELDS", "2", "a", "b"]);
+    assert_eq!(deadlines(&mut c, "h"), want);
+    let V::Str(payload) = c.cmd(&["DUMP", "h"]) else {
+        panic!("no DUMP of h");
+    };
+    assert!(c.raw(&[b"RESTORE", b"h2", b"0", &payload]).ok());
+    assert_eq!(deadlines(&mut c, "h2"), want, "after DUMP and RESTORE");
+    assert!(c.cmd(&["SAVE"]).ok());
+    drop(c);
+    server.restart();
+    let mut c = server.conn();
+    assert_eq!(deadlines(&mut c, "h"), want, "after a restart");
+    assert_eq!(deadlines(&mut c, "h2"), want, "after a restart");
+}

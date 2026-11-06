@@ -74,6 +74,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   first. It is now converted to the nanosecond both ways, and a field set
   with `HPEXPIREAT t` reads back as `t` (#448).
 
+  A field's time to live is also checked as Redis checks it: a deadline
+  past 2^46 - 1 ms after the epoch (the year 4199), given to `HEXPIRE`,
+  `HPEXPIRE`, `HEXPIREAT`, `HPEXPIREAT`, `HGETEX` or `HSETEX` as a time to
+  live or a Unix time, is refused with `ERR invalid expire time in
+  '<command>' command`. KiviDB took any: `HEXPIRE h 18446744073709552
+  FIELDS 1 f` was saved as a moment from then, so the field was gone after
+  a restart, a full sync, `RESTORE` or `MIGRATE`, and `HEXPIRE h
+  9223372036854775807 FIELDS 1 f` stopped the server.
+
 - **JSON numbers keep every digit.** A number that needs 17 significant
   digits was often read as the double next to it: `JSON.SET k $
   13.326500000000001` then `JSON.GET k` gave `13.3265`, and 435 of 2,000

@@ -698,32 +698,89 @@ pub struct FieldClock {
 }
 
 impl FieldClock {
+    /// The two clocks, read together. The monotonic clock is read before
+    /// and after the wall clock, and the pair is taken at the middle; a
+    /// reading the thread was preempted in the middle of (the two monotonic
+    /// readings more than 50 µs apart) is read again, a few times at most,
+    /// keeping the closest. Read across a preemption, the pair put every
+    /// deadline converted with it off by however long the thread was away.
     pub fn now() -> Self {
-        let wall = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-        Self {
-            mono: std::time::Instant::now(),
-            wall,
+        const CLOSE: Duration = Duration::from_micros(50);
+        let mut best: Option<(Duration, Self)> = None;
+        for _ in 0..8 {
+            let before = std::time::Instant::now();
+            let wall = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default();
+            let gap = before.elapsed();
+            let reading = Self {
+                mono: before + gap / 2,
+                wall,
+            };
+            if gap <= CLOSE {
+                return reading;
+            }
+            if best.as_ref().is_none_or(|(closest, _)| gap < *closest) {
+                best = Some((gap, reading));
+            }
         }
+        best.map(|(_, reading)| reading)
+            .expect("the clocks were read")
     }
 
     /// The `Instant` of `at_ms`, Unix milliseconds; `None` once it has come.
+    /// One further out than an `Instant` can hold (no command sets one: see
+    /// `MAX_FIELD_DEADLINE_MS`) is taken as the furthest it can.
     pub fn instant_of(&self, at_ms: u64) -> Option<std::time::Instant> {
         Duration::from_millis(at_ms)
             .checked_sub(self.wall)
             .filter(|left| !left.is_zero())
-            .map(|left| self.mono + left)
+            .map(|left| {
+                self.mono.checked_add(left).unwrap_or_else(|| {
+                    self.mono + Duration::from_millis(MAX_FIELD_DEADLINE_MS as u64)
+                })
+            })
     }
 
-    /// `at` as Unix milliseconds, to the nearest one.
+    /// `at` as Unix milliseconds, to the nearest one; past `u64::MAX`,
+    /// `u64::MAX`. Cut to 64 bits, a deadline that far out was saved as a
+    /// moment from now, and the field was gone after a restart.
     pub fn unix_ms_of(&self, at: std::time::Instant) -> u64 {
         let wall = match at.checked_duration_since(self.mono) {
             Some(ahead) => self.wall.saturating_add(ahead),
             None => self.wall.saturating_sub(self.mono.duration_since(at)),
         };
-        wall.saturating_add(Duration::from_micros(500)).as_millis() as u64
+        u64::try_from(wall.saturating_add(Duration::from_micros(500)).as_millis())
+            .unwrap_or(u64::MAX)
     }
+}
+
+/// The latest deadline a command may give a hash field, in Unix
+/// milliseconds: Redis's `HFE_MAX_ABS_TIME_MSEC`, 2^46 - 1 (the year 4199).
+pub const MAX_FIELD_DEADLINE_MS: i64 = 0xFFFF_FFFF_FFFF >> 2;
+
+/// The deadline of a hash field given `n`, seconds if `secs` and else
+/// milliseconds, after `base_ms` (now, for a time to live; 0 for a Unix
+/// time), as Redis's `parseExpireTime` checks it: `None` past
+/// [`MAX_FIELD_DEADLINE_MS`]. `n` is not negative.
+pub fn field_deadline_ms(n: i64, secs: bool, base_ms: i64) -> Option<i64> {
+    let ms = if secs {
+        if n > MAX_FIELD_DEADLINE_MS / 1000 {
+            return None;
+        }
+        n * 1000
+    } else {
+        n
+    };
+    (ms <= MAX_FIELD_DEADLINE_MS - base_ms).then_some(ms + base_ms)
+}
+
+/// Redis's reply to a hash field TTL past [`MAX_FIELD_DEADLINE_MS`].
+pub fn invalid_field_expire_time(command: &str) -> Vec<u8> {
+    crate::resp::write::resp_error(&format!(
+        "ERR invalid expire time in '{}' command",
+        command.to_ascii_lowercase()
+    ))
 }
 
 /// Absolute wall time when a key expires (`now + ttl`). Safe across threads (unlike `Instant`).
