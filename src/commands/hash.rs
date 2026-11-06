@@ -930,6 +930,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
+            if let Some(refused) = negative_unix_time(ctx, unix_secs) {
+                return Some(refused);
+            }
             let (flag, fields) = match parse_hfe_tail(
                 &cmd.iter().map(|v| v.to_vec()).collect::<Vec<Vec<u8>>>(),
                 3,
@@ -976,6 +979,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
+            if let Some(refused) = negative_unix_time(ctx, unix_ms) {
+                return Some(refused);
+            }
             let (flag, fields) = match parse_hfe_tail(
                 &cmd.iter().map(|v| v.to_vec()).collect::<Vec<Vec<u8>>>(),
                 3,
@@ -1508,6 +1514,21 @@ fn parse_hfe_read_tail(cmd: &[&[u8]], start_idx: usize) -> Result<Vec<String>, V
     Ok(fields)
 }
 
+/// Redis's reply to a negative Unix time given to `HEXPIREAT`, `HPEXPIREAT`
+/// or `EXAT`/`PXAT` of `HGETEX` and `HSETEX` (#486); `None` when `n` is
+/// taken. 0 is taken, and the fields go, as in Redis. A negative one used
+/// to be taken as a time that had passed, and the fields were deleted
+/// where Redis keeps them and refuses the command.
+///
+/// From the write stream (a replica applying its master's, an AOF
+/// replayed) a negative one is still taken as passed: a 1.2.0 server did
+/// that and sent the command on as it came, and a field it deleted would
+/// otherwise come back. No Redis or Valkey master sends one.
+fn negative_unix_time(ctx: &Ctx, n: i64) -> Option<Vec<u8>> {
+    (n < 0 && !(ctx.apply_replication || crate::expiry::replaying()))
+        .then(|| resp_error("ERR invalid expire time, must be >= 0"))
+}
+
 /// Convert a stored Instant expiry to the requested unit.
 /// Past Instants saturate to 0; the lazy-eviction sweep already removed the
 /// field by the time we reach this helper, but we still handle it defensively.
@@ -1847,6 +1868,9 @@ fn run_hgetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                     .is_none()
                 {
                     return Some(invalid_field_expire_time("HGETEX"));
+                }
+                if !relative && let Some(refused) = negative_unix_time(ctx, n) {
+                    return Some(refused);
                 }
                 let act = match tok.as_str() {
                     "EX" | "PX" if n < 0 => {
@@ -2325,6 +2349,9 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                     .is_none()
                 {
                     return Some(invalid_field_expire_time("HSETEX"));
+                }
+                if !relative && let Some(refused) = negative_unix_time(ctx, n) {
+                    return Some(refused);
                 }
                 ttl = Some(match tok.as_str() {
                     "EX" | "PX" if n < 0 => {

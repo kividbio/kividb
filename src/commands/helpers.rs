@@ -692,17 +692,25 @@ pub fn glob_match_bytes(pattern: &[u8], text: &[u8]) -> bool {
 /// full sync or a `RESTORE` was often 1 ms off what it had been (#448).
 #[derive(Clone, Copy)]
 pub struct FieldClock {
-    mono: std::time::Instant,
+    /// The monotonic clock just before the wall clock was read.
+    before: std::time::Instant,
+    /// The monotonic clock just after it.
+    after: std::time::Instant,
     wall: Duration,
 }
 
 impl FieldClock {
     /// The two clocks, read together. The monotonic clock is read before
-    /// and after the wall clock, and the pair is taken at the middle; a
-    /// reading the thread was preempted in the middle of (the two monotonic
-    /// readings more than 50 µs apart) is read again, a few times at most,
-    /// keeping the closest. Read across a preemption, the pair put every
-    /// deadline converted with it off by however long the thread was away.
+    /// and after the wall clock; a reading the thread was preempted in the
+    /// middle of (the two monotonic readings more than 50 µs apart) is read
+    /// again, a few times at most, keeping the closest. Read across a
+    /// preemption, the pair put every deadline converted with it off by
+    /// however long the thread was away.
+    ///
+    /// A deadline is never early: the `Instant` of a Unix time is worked
+    /// out from the later monotonic reading, and the Unix time of an
+    /// `Instant` from the earlier one, so either is late by at most the
+    /// gap between them.
     pub fn now() -> Self {
         const CLOSE: Duration = Duration::from_micros(50);
         let mut best: Option<(Duration, Self)> = None;
@@ -711,9 +719,11 @@ impl FieldClock {
             let wall = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default();
-            let gap = before.elapsed();
+            let after = std::time::Instant::now();
+            let gap = after.duration_since(before);
             let reading = Self {
-                mono: before + gap / 2,
+                before,
+                after,
                 wall,
             };
             if gap <= CLOSE {
@@ -735,8 +745,8 @@ impl FieldClock {
             .checked_sub(self.wall)
             .filter(|left| !left.is_zero())
             .map(|left| {
-                self.mono.checked_add(left).unwrap_or_else(|| {
-                    self.mono + Duration::from_millis(MAX_FIELD_DEADLINE_MS as u64)
+                self.after.checked_add(left).unwrap_or_else(|| {
+                    self.after + Duration::from_millis(MAX_FIELD_DEADLINE_MS as u64)
                 })
             })
     }
@@ -746,7 +756,7 @@ impl FieldClock {
     /// elsewhere may claim; `Some(None)` once it has come.
     pub fn checked_instant_of(&self, at_ms: u64) -> Option<Option<std::time::Instant>> {
         match Duration::from_millis(at_ms).checked_sub(self.wall) {
-            Some(left) if !left.is_zero() => self.mono.checked_add(left).map(Some),
+            Some(left) if !left.is_zero() => self.after.checked_add(left).map(Some),
             _ => Some(None),
         }
     }
@@ -755,9 +765,9 @@ impl FieldClock {
     /// `u64::MAX`. Cut to 64 bits, a deadline that far out was saved as a
     /// moment from now, and the field was gone after a restart.
     pub fn unix_ms_of(&self, at: std::time::Instant) -> u64 {
-        let wall = match at.checked_duration_since(self.mono) {
+        let wall = match at.checked_duration_since(self.before) {
             Some(ahead) => self.wall.saturating_add(ahead),
-            None => self.wall.saturating_sub(self.mono.duration_since(at)),
+            None => self.wall.saturating_sub(self.before.duration_since(at)),
         };
         u64::try_from(wall.saturating_add(Duration::from_micros(500)).as_millis())
             .unwrap_or(u64::MAX)
