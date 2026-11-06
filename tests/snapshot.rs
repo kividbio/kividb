@@ -2047,6 +2047,7 @@ fn dragonfly_snapshot_files_are_refused_and_its_rdb_files_load() {
     ] {
         let (dbs, _, _) = kividb::snapshot::load_redis_rdb_from(bytes)
             .unwrap_or_else(|e| panic!("Dragonfly {version}: {e}"));
+        let dbs = texted_all(dbs);
         assert_eq!(dbs[0].len(), 202, "Dragonfly {version}");
         match &dbs[0]["key:7"] {
             KiviDBValue::String(b) => assert_eq!(b.as_ref(), b"val7"),
