@@ -7,17 +7,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Added
-
-- **`cargo install kividb`.** Stable releases are published on crates.io:
-  `cargo install --locked kividb` builds the default variant
-  (`--features lua,tls` for the full one), and `cargo binstall kividb`
-  downloads the release's binary for Linux and macOS instead of compiling.
-  The release workflow publishes each stable release after its GitHub
-  Release, and never a release candidate. The crate holds the sources, the
-  lockfile and the licence files, about 1.6 MB. Its library is the server's
-  internals and has no stable API.
-
 ### Changed
 
 - **Source archives are small again.** The tarball GitHub makes of the
@@ -37,6 +26,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the same server as the `v` tag. The release workflow now pushes
   `X.Y.Z-src` on the release's own commit. A `-src` tag is not a
   separate release.
+- **Stable releases are published on crates.io.** The release workflow
+  publishes each stable release as the crate `kividb` after its GitHub
+  Release, so `cargo install --locked kividb` builds the server from
+  source and `cargo binstall kividb` downloads the release's binary for
+  Linux and macOS. The crate holds the sources, the lockfile and the
+  licence files, about 1.6 MB. Its library is built from the same
+  sources so the integration tests can use them; it is not a public API.
 
 ### Fixed
 

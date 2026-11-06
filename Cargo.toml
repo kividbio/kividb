@@ -25,7 +25,7 @@ rust-version = "1.89"
 # and media stay in the repository (the crate limit is 10 MB; all of git is
 # over 200 MB).
 include = [
-    "/src/**/*.rs",
+    "/src/**",
     "/Cargo.toml",
     "/Cargo.lock",
     "/README.md",

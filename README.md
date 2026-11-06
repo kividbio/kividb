@@ -303,24 +303,6 @@ otherwise (`--io-model auto`, the default).
 To build the Docker image yourself, `docker build -t kividb .` builds the default variant;
 `docker build --build-arg KIVIDB_FEATURES=lua,tls -t kividb:full .` builds another one.
 
-### With Cargo
-
-Stable releases are published on [crates.io](https://crates.io/crates/kividb):
-
-```bash
-cargo install --locked kividb                      # default variant
-cargo install --locked kividb --features lua,tls   # full (or lua, or tls)
-```
-
-`--locked` builds with the dependency versions the release was built and tested with.
-The release profile uses fat LTO, so the build takes several minutes.
-[`cargo binstall kividb`](https://github.com/cargo-bins/cargo-binstall) downloads the
-release's own binary of the default variant instead, on Linux (x86_64, aarch64) and macOS,
-and compiles only elsewhere.
-
-The crate's library is the server's internals, published so that the binary can be built
-from it. It is not a client or an embeddable database, and it has no stable API.
-
 ## Running KiviDB
 
 ```bash
