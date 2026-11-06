@@ -93,6 +93,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   AOF it wrote, or the stream of a 1.2.0 master, is still applied as 1.2.0
   applied it, so the fields it deleted stay deleted.
 
+- **A replica set to `replica-priority 0` is no longer promoted by
+  Sentinel.** `CONFIG SET replica-priority` and the config file took the
+  setting and `CONFIG GET` gave it back, but `INFO replication` always
+  reported `slave_priority:100`, which is what Sentinel reads to choose the
+  replica to promote, and it promoted one set to 0. `INFO` now reports the
+  priority set, from `CONFIG SET` under either of its names
+  (`replica-priority`, `slave-priority`), the config file or the new
+  `--replica-priority` flag, and `CONFIG REWRITE` keeps it.
+  `replica-announced` likewise now reaches `INFO replication` as
+  `replica_announced`, which Sentinel reads to leave a replica out of
+  `SENTINEL REPLICAS` (#443).
+
 - **A hash field's expiry is kept to the millisecond when KiviDB saves and
   loads the hash.** After a restart from a snapshot or the AOF's preamble,
   a full sync from a KiviDB master, or a `RESTORE` or `MIGRATE` between
