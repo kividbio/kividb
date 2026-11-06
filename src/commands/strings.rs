@@ -3,7 +3,6 @@ use crate::commands::helpers::*;
 use crate::keyspace_events::{KS_GENERIC, KS_STRING, notify};
 use crate::resp::write::*;
 use crate::store;
-use crate::store::Key;
 use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::types::SharedBytes;
@@ -742,7 +741,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
             };
             let len = new_val.len() as i64;
-            map.insert(Key::from(key), KiviDBValue::String(new_val));
+            map.insert(key, KiviDBValue::String(new_val));
             drop(map);
             notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "append", key);
             Some(resp_integer(len))
@@ -1981,7 +1980,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let db = &ctx.store[*ctx.selected_db];
                     let shard = store::get_shard(db, key);
                     let mut map = write_lock!(shard);
-                    map.insert(Key::from(key), value);
+                    map.insert(key, value);
                 } else {
                     store_value_expiring(ctx.store, *ctx.selected_db, key, value, expiry);
                 }

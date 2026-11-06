@@ -5,6 +5,22 @@
 use kividb::snapshot::load_redis_rdb_from;
 use kividb::types::KiviDBValue;
 
+/// A loaded database keyed by text, for these tests, whose keys all are:
+/// a load gives keys back as bytes (`store::Key`).
+fn texted<V>(
+    map: std::collections::HashMap<kividb::store::Key, V>,
+) -> std::collections::HashMap<String, V> {
+    map.into_iter()
+        .map(|(key, value)| (String::from_utf8(key.to_vec()).unwrap(), value))
+        .collect()
+}
+
+fn texted_all<V>(
+    maps: Vec<std::collections::HashMap<kividb::store::Key, V>>,
+) -> Vec<std::collections::HashMap<String, V>> {
+    maps.into_iter().map(texted).collect()
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -76,6 +92,7 @@ fn a_valkey_9_hash_with_field_ttls_loads_with_them() {
         ],
     );
     let (dbs, _, _) = load_redis_rdb_from(&file(b"VALKEY080", &body)[..]).unwrap();
+    let dbs = texted_all(dbs);
     let KiviDBValue::HashEx(h) = &dbs[0]["h"] else {
         panic!("h is not a hash with field TTLs");
     };
@@ -102,6 +119,7 @@ fn a_valkey_9_hash_whose_fields_have_all_run_out_is_no_key() {
     body.extend(rdb_str(b"s"));
     body.extend(rdb_str(b"kept"));
     let (dbs, _, _) = load_redis_rdb_from(&file(b"VALKEY080", &body)[..]).unwrap();
+    let dbs = texted_all(dbs);
     let mut keys: Vec<&str> = dbs[0].keys().map(String::as_str).collect();
     keys.sort_unstable();
     assert_eq!(keys, ["s"]);
@@ -144,6 +162,7 @@ fn what_valkey_9_does_not_write_is_refused() {
     // The rest of the string types load under the VALKEY header as under
     // REDIS: it is the same format up to RDB 11's types.
     let (dbs, _, _) = load_redis_rdb_from(&file(b"VALKEY080", &string)[..]).unwrap();
+    let dbs = texted_all(dbs);
     assert!(matches!(&dbs[0]["k"], KiviDBValue::String(v) if &v[..] == b"v"));
 }
 
@@ -190,6 +209,8 @@ fn rdb_files_saved_by_valkey_9_0_and_9_1_load_whole() {
         assert!(bytes.starts_with(b"VALKEY080"), "Valkey {label}");
         let (dbs, expiries, functions) =
             load_redis_rdb_from(bytes).unwrap_or_else(|e| panic!("Valkey {label}: {e}"));
+        let dbs = texted_all(dbs);
+        let expiries = texted_all(expiries);
         let db = &dbs[0];
         let mut keys: Vec<&str> = db.keys().map(String::as_str).collect();
         keys.sort_unstable();
@@ -320,6 +341,7 @@ fn rdb_files_saved_by_valkey_9_0_and_9_1_load_whole() {
 fn an_rdb_file_with_a_valkey_json_document_loads() {
     let (dbs, _, _) =
         load_redis_rdb_from(&include_bytes!("fixtures/valkey-9.0-json.rdb")[..]).unwrap();
+    let dbs = texted_all(dbs);
     let KiviDBValue::Json(doc) = &dbs[0]["json:doc"] else {
         panic!("json:doc is not JSON");
     };

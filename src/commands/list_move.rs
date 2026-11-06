@@ -14,7 +14,6 @@ use crate::commands::helpers::{lazy_expire_key, parse_utf8};
 use crate::keyspace_events::{KS_GENERIC, KS_LIST, notify};
 use crate::resp::write::*;
 use crate::store;
-use crate::store::Key;
 use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::{read_lock, write_lock};
@@ -231,7 +230,7 @@ pub(super) fn move_elements(
         let dst_list = match map.get(dst) {
             None => {
                 let l: List = Arc::new(RwLock::new(VecDeque::new()));
-                map.insert(Key::from(dst), KiviDBValue::List(Arc::clone(&l)));
+                map.insert(dst, KiviDBValue::List(Arc::clone(&l)));
                 l
             }
             Some(ValueRef::List(l)) => Arc::clone(l),

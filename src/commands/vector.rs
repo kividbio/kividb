@@ -224,7 +224,7 @@ fn ft_dropindex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 let covered =
                     prefixes.is_empty() || prefixes.iter().any(|p| key.starts_with(p.as_bytes()));
                 if covered && crate::vector::is_document(&on, value) {
-                    documents.push(crate::store::key_text(key).to_owned());
+                    documents.push(crate::store::Key::new(key));
                 }
             }
         }
@@ -258,9 +258,9 @@ fn ft_dropindex(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // that no `DD` is ever written again.
     let propagate = crate::replication::write_is_observed(ctx);
     let by_slot = propagate && ctx.cluster.enabled;
-    let slot_of = |key: &str| {
+    let slot_of = |key: &[u8]| {
         if by_slot {
-            crate::cluster::key_hash_slot(key.as_bytes())
+            crate::cluster::key_hash_slot(key)
         } else {
             0
         }
@@ -348,7 +348,7 @@ const DROPINDEX_DOCUMENTS_PER_WRITE: usize = 256;
 fn delete_document(
     store: &crate::store::Store,
     db: usize,
-    key: &str,
+    key: &[u8],
     on: &crate::vector::IndexOn,
 ) -> bool {
     let shard = crate::store::get_shard(&store[db], key);
@@ -721,9 +721,9 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
         .enabled
         .then(|| crate::cluster::search::served_slots(ctx.cluster));
     let not_served = |key: &str| {
-        served
-            .as_deref()
-            .is_some_and(|s| !crate::cluster::search::in_served(s, key))
+        served.as_deref().is_some_and(|s| {
+            !crate::cluster::search::in_served(s, &*crate::key_bytes::bytes_of(key))
+        })
     };
     let json = matches!(def.on, crate::vector::IndexOn::Json);
     let mut add_row = |key: &str,
@@ -787,7 +787,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             cut
         }
         None => crate::commands::search::scan_docs(db_ref, deadline, |key, value| {
-            if !def.covers(key) {
+            if !def.covers(&crate::key_bytes::bytes_of(key)) {
                 return;
             }
             if not_served(key) {
@@ -1752,9 +1752,10 @@ pub(crate) fn knn_planned(
             .iter()
             .map(|r| r.key.as_str())
             .filter(|key| {
-                !crate::store::get_shard(db, key)
+                let raw = crate::key_bytes::bytes_of(key);
+                !crate::store::get_shard(db, &*raw)
                     .read()
-                    .get(key)
+                    .get(&*raw)
                     .is_some_and(|v| crate::vector::is_document(&def.on, v))
             })
             .collect();
@@ -1765,7 +1766,11 @@ pub(crate) fn knn_planned(
             if let Some(id) = def.postings.peek().id(key) {
                 plan.ids.unset(id);
             }
-            crate::vector::maybe_unindex(ctx.index_store, def.db_index, key);
+            crate::vector::maybe_unindex(
+                ctx.index_store,
+                def.db_index,
+                &*crate::key_bytes::bytes_of(key),
+            );
         }
     }
     None

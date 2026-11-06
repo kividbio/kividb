@@ -1379,19 +1379,18 @@ where
                     } else if cmd.len() < 2 {
                         b"-ERR wrong number of arguments for 'watch' command\r\n".to_vec()
                     } else {
-                        for key_bytes in &cmd[1..] {
-                            if let Ok(key) = std::str::from_utf8(key_bytes) {
-                                // A key that has already expired is watched
-                                // as the absent key it is: its removal, when
-                                // it comes, is not a change.
-                                commands::helpers::lazy_expire_key(&store, selected_db, key);
-                                tx.watched_keys.push((selected_db, key.to_string()));
-                                watch_registry.as_ref().watch(
-                                    selected_db,
-                                    key,
-                                    Arc::clone(&dirty_flag),
-                                );
-                            }
+                        for key in &cmd[1..] {
+                            // A key that has already expired is watched as
+                            // the absent key it is: its removal, when it
+                            // comes, is not a change.
+                            commands::helpers::lazy_expire_key(&store, selected_db, key);
+                            tx.watched_keys
+                                .push((selected_db, crate::store::Key::new(key)));
+                            watch_registry.as_ref().watch(
+                                selected_db,
+                                key,
+                                Arc::clone(&dirty_flag),
+                            );
                         }
                         b"+OK\r\n".to_vec()
                     }
@@ -1687,7 +1686,7 @@ where
                                     // sets it, observe clean, and overwrite this write. notify()
                                     // only touches the (separate) watch-registry lock, so calling
                                     // it here cannot deadlock against the shard lock we're holding.
-                                    watch_registry.as_ref().notify(selected_db, key);
+                                    watch_registry.as_ref().notify(selected_db, key.as_bytes());
                                 }
                                 // A plain SET takes the key's time to live away, in
                                 // the same step as it writes the value.

@@ -12,7 +12,6 @@ use crate::commands::ctx::Ctx;
 use crate::commands::helpers::parse_utf8;
 use crate::resp::write::*;
 use crate::store;
-use crate::store::Key;
 use crate::store::ValueRef;
 use crate::types::{KiviDBValue, VSetEntry, VectorSetInner};
 use crate::{read_lock, write_lock};
@@ -81,7 +80,7 @@ fn get_or_create_vset(
         )),
         None => {
             let vs = Arc::new(RwLock::new(VectorSetInner::with_metric(dim, metric)));
-            map.insert(Key::from(key), KiviDBValue::VectorSet(Arc::clone(&vs)));
+            map.insert(key, KiviDBValue::VectorSet(Arc::clone(&vs)));
             Ok(vs)
         }
     }

@@ -3,7 +3,6 @@ use crate::commands::helpers::{lazy_expire_on_read, parse_utf8};
 use crate::keyspace_events::{KS_SET, notify};
 use crate::resp::write::*;
 use crate::store;
-use crate::store::Key;
 use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::{read_lock, write_lock};
@@ -120,7 +119,7 @@ fn store_set(ctx: &mut Ctx, dst_key: &str, members: Vec<Arc<[u8]>>) {
     let db_ref = &ctx.store[db];
     let shard = store::get_shard(db_ref, dst_key);
     let replaced = write_lock!(shard).insert_expiring(
-        Key::from(dst_key),
+        dst_key,
         KiviDBValue::Set(Arc::new(RwLock::new(set))),
         None,
     );
@@ -183,10 +182,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         None => {
                             let mut set = crate::member_set::MemberSet::new();
                             let added = insert(&mut set);
-                            map.insert(
-                                Key::from(key),
-                                KiviDBValue::Set(Arc::new(RwLock::new(set))),
-                            );
+                            map.insert(key, KiviDBValue::Set(Arc::new(RwLock::new(set))));
                             added
                         }
                     }
@@ -603,10 +599,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     _ => {
                         let mut new_set = crate::member_set::MemberSet::new();
                         new_set.insert(Arc::clone(&member));
-                        map.insert(
-                            Key::from(&*dst_key),
-                            KiviDBValue::Set(Arc::new(RwLock::new(new_set))),
-                        );
+                        map.insert(&*dst_key, KiviDBValue::Set(Arc::new(RwLock::new(new_set))));
                         true
                     }
                 }
@@ -837,10 +830,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         .into_iter()
                         .filter(|m| {
                             options.pattern.as_deref().is_none_or(|pat| {
-                                crate::commands::helpers::glob_match(
-                                    pat,
-                                    &String::from_utf8_lossy(m),
-                                )
+                                crate::commands::helpers::glob_match_bytes(pat, m)
                             })
                         })
                         .map(|m| resp_bulk(m))

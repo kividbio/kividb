@@ -108,14 +108,14 @@ impl Target {
     /// `DEL` (or `UNLINK`) each to replicas, taps and the AOF. Inside a
     /// transaction or a script, among its writes. The caller holds what
     /// [`order`] takes.
-    pub fn propagate<'a>(&self, db: usize, keys: impl IntoIterator<Item = &'a str>) {
+    pub fn propagate<'a>(&self, db: usize, keys: impl IntoIterator<Item = &'a [u8]>) {
         let command: &[u8] = if lazy_expire() { b"UNLINK" } else { b"DEL" };
         for key in keys {
             crate::replication::replicate_expired(
                 &self.repl_state,
                 &self.hub_tx,
                 db,
-                &[command.to_vec(), key.as_bytes().to_vec()],
+                &[command.to_vec(), key.to_vec()],
             );
         }
     }
@@ -202,11 +202,6 @@ pub fn order<'a>(db: usize, keys: impl Iterator<Item = &'a [u8]>) -> Ordered {
 #[cold]
 #[inline(never)]
 pub fn written_over(store: usize, db: usize, keys: &[crate::store::Key]) {
-    let keys: Vec<String> = keys
-        .iter()
-        .map(|key| crate::store::key_text(key).to_owned())
-        .collect();
-    let keys = keys.as_slice();
     crate::keyspace_events::written_over_expired(store, db, keys);
     for key in keys {
         crate::watch::expired_in(store, db, key);
@@ -215,7 +210,7 @@ pub fn written_over(store: usize, db: usize, keys: &[crate::store::Key]) {
     }
     if let Some(target) = of_id(store).filter(Target::observed) {
         let _ordered = order(db, keys.iter().map(|key| key.as_bytes()));
-        target.propagate(db, keys.iter().map(String::as_str));
+        target.propagate(db, keys.iter().map(|key| key.as_bytes()));
     }
 }
 

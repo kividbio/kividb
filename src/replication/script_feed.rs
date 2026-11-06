@@ -333,7 +333,7 @@ fn owned(cmd: &[&[u8]]) -> Vec<Vec<u8>> {
 }
 
 /// When `key` expires, in Unix milliseconds, if it has a TTL.
-fn expiry_ms(ctx: &Ctx<'_>, key: &str) -> Option<u64> {
+fn expiry_ms(ctx: &Ctx<'_>, key: &[u8]) -> Option<u64> {
     let shard = crate::store::get_shard(&ctx.store[*ctx.selected_db], key);
     read_lock!(shard).expires(key)
 }
@@ -502,9 +502,8 @@ fn expire_feed(ctx: &Ctx<'_>, cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
     if cmd.len() < 3 {
         return Vec::new();
     }
-    let Some(key) = parse_utf8(cmd[1]) else {
-        return Vec::new();
-    };
+    // Any bytes: a key that is not text is rewritten as any other is.
+    let key = cmd[1];
     if parse_resp_integer(resp) != Some(1) {
         return Vec::new();
     }

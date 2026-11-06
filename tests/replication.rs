@@ -164,6 +164,7 @@ fn port_is_free(port: u16) -> bool {
 /// listening can otherwise be given, as its own end, the very port it is
 /// dialling: it is then connected to itself and reads back what it writes.
 fn free_port() -> u16 {
+    in_scratch_dir();
     use std::sync::atomic::{AtomicU16, Ordering};
     static NEXT: AtomicU16 = AtomicU16::new(0);
     loop {
@@ -773,6 +774,18 @@ fn test_replicaof_no_one_clears_master_addr() {
 
 /// Start a server from an arbitrary config and wait until it accepts
 /// connections. Returns its port.
+/// The servers these tests run write their files (`dump.kdb`,
+/// `dump.kdb.gen`, `dump.kdb.repl`) where the process runs, which was the
+/// repository's own directory. The process moves to a directory of its own
+/// before the first server starts (every test asks for a port first).
+fn in_scratch_dir() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dir = tempfile::tempdir().expect("a temporary directory").keep();
+        std::env::set_current_dir(dir).expect("into the temporary directory");
+    });
+}
+
 fn spawn_server(mut config: Config) -> u16 {
     let port = free_port();
     config.port = port;
@@ -990,59 +1003,9 @@ fn spawn_server_with(mut config: Config, threads: usize, io_model: IoModel) -> u
     panic!("server on port {port} did not start listening within 5s");
 }
 
-/// A script runs on a replica, and only a write it makes is refused, as in
-/// Redis; every EVAL, EVALSHA and FCALL was refused before it ran (#145).
-/// One that declares it may write is refused at once; one that declares
-/// `no-writes` runs.
-#[cfg(feature = "lua")]
-#[test]
-fn test_scripts_that_read_run_on_a_replica() {
-    let master = spawn_server(Config::default());
-    let replica = spawn_server(replica_of(master));
-    let mut r = Conn::connect(replica);
-    wait_link_up(&mut r);
-    let mut m = Conn::connect(master);
-    assert!(m.cmds(&["SET", "first", "1"]).is_ok());
-    assert!(m
-        .cmds(&[
-            "FUNCTION",
-            "LOAD",
-            "#!lua name=replica_lib\n\
-             redis.register_function{function_name='reads', \
-             callback=function(keys) return redis.call('GET', keys[1]) end, flags={'no-writes'}}\n\
-             redis.register_function('writes', function(keys) return redis.call('SET', keys[1], 'x') end)",
-        ])
-        .as_str()
-        .contains("replica_lib"));
-    wait_until("the replica to have first", Duration::from_secs(10), || {
-        r.cmds(&["GET", "first"]) == RespValue::Bulk(b"1".to_vec())
-    });
-    let refused =
-        |reply: &RespValue| matches!(reply, RespValue::Error(e) if e.contains("READONLY"));
-
-    let read = r.cmds(&["EVAL", "return redis.call('GET', KEYS[1])", "1", "first"]);
-    assert_eq!(read, RespValue::Bulk(b"1".to_vec()));
-    let write = r.cmds(&[
-        "EVAL",
-        "return redis.call('SET', KEYS[1], 'x')",
-        "1",
-        "first",
-    ]);
-    assert!(refused(&write), "{write:?}");
-    let declared = r.cmds(&["EVAL", "#!lua\nreturn 1", "0"]);
-    assert!(refused(&declared), "{declared:?}");
-    let no_writes = r.cmds(&["EVAL", "#!lua flags=no-writes\nreturn 2", "0"]);
-    assert_eq!(no_writes, RespValue::Int(2));
-
-    wait_until(
-        "the replica to have the library",
-        Duration::from_secs(10),
-        || r.cmds(&["FCALL", "reads", "1", "first"]) == RespValue::Bulk(b"1".to_vec()),
-    );
-    let write = r.cmds(&["FCALL", "writes", "1", "first"]);
-    assert!(refused(&write), "{write:?}");
-    assert_eq!(r.cmds(&["GET", "first"]), RespValue::Bulk(b"1".to_vec()));
-}
+// `test_scripts_that_read_run_on_a_replica` is in
+// tests/replication_functions.rs: the function libraries are process-global,
+// and the full syncs of the other tests here took its library away.
 
 /// `mem_replication_backlog` is what the backlog holds: it was 0 (#152).
 #[test]

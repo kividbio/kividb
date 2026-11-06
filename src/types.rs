@@ -540,6 +540,7 @@ impl TsAggregation {
 
 #[derive(Debug, Clone)]
 pub struct CompactionRule {
+    /// The destination series, by name: `key_bytes::text_of` of its key.
     pub dest_key: String,
     pub aggregation: TsAggregation,
     pub bucket_duration: u64, // ms
@@ -572,6 +573,7 @@ pub struct TsInner {
 
     /// The series this one is a compaction of (`TS.CREATERULE`): `sourceKey`
     /// in `TS.INFO`, and where `LATEST` finds the bucket still open (#128).
+    /// By name: `key_bytes::text_of` of its key.
     pub source: Option<String>,
 }
 

@@ -5,9 +5,11 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use crate::store::Key;
+
 pub trait WatchNotifier: Send + Sync {
-    fn watch(&self, db: usize, key: &str, flag: Arc<AtomicBool>);
-    fn notify(&self, db: usize, key: &str);
+    fn watch(&self, db: usize, key: &[u8], flag: Arc<AtomicBool>);
+    fn notify(&self, db: usize, key: &[u8]);
     fn unwatch_all(&self, flags: &[Arc<AtomicBool>]);
     /// Whether any key is being watched at all. Lets a caller skip working
     /// out which keys a write touched when nobody could care.
@@ -17,7 +19,7 @@ pub trait WatchNotifier: Send + Sync {
     fn notify_db(&self, db: Option<usize>);
     /// Invalidate the watches in `db` (`None` = every database) on keys for
     /// which `exists` says yes: those are the keys a flush removes.
-    fn notify_existing(&self, db: Option<usize>, exists: &dyn Fn(usize, &str) -> bool);
+    fn notify_existing(&self, db: Option<usize>, exists: &dyn Fn(usize, &[u8]) -> bool);
 }
 
 /// The watch registry of each server in this process, by its store — for a
@@ -44,13 +46,13 @@ pub fn register_for(store: &crate::store::Store, registry: &WatchRegistry) {
 /// `key` has expired and been removed: for a client watching it, it has
 /// been modified.
 #[inline]
-pub fn expired(store: &crate::store::Store, db: usize, key: &str) {
-    expired_in(store_id(store), db, key);
+pub fn expired(store: &crate::store::Store, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) {
+    expired_in(store_id(store), db, key.as_ref());
 }
 
 /// [`expired`], for the store at address `id`.
 #[inline]
-pub fn expired_in(id: usize, db: usize, key: &str) {
+pub fn expired_in(id: usize, db: usize, key: &[u8]) {
     if WATCHES.load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -64,7 +66,7 @@ pub fn expired_in(id: usize, db: usize, key: &str) {
     }
 }
 
-type WatchMap = RwLock<AHashMap<(usize, String), Vec<Arc<AtomicBool>>>>;
+type WatchMap = RwLock<AHashMap<(usize, Key), Vec<Arc<AtomicBool>>>>;
 
 pub struct WatchRegistryInner {
     inner: WatchMap,
@@ -90,23 +92,23 @@ impl Default for WatchRegistryInner {
 }
 
 impl WatchNotifier for WatchRegistryInner {
-    fn watch(&self, db: usize, key: &str, flag: Arc<AtomicBool>) {
+    fn watch(&self, db: usize, key: &[u8], flag: Arc<AtomicBool>) {
         self.watch_count.fetch_add(1, Ordering::Relaxed);
         WATCHES.fetch_add(1, Ordering::Relaxed);
         self.inner
             .write()
-            .entry((db, key.to_string()))
+            .entry((db, Key::new(key)))
             .or_default()
             .push(flag);
     }
 
     #[inline]
-    fn notify(&self, db: usize, key: &str) {
+    fn notify(&self, db: usize, key: &[u8]) {
         if self.watch_count.load(Ordering::Relaxed) == 0 {
             return; // zero-cost on the common path
         }
         let map = self.inner.read();
-        if let Some(flags) = map.get(&(db, key.to_string())) {
+        if let Some(flags) = map.get(&(db, Key::new(key))) {
             for f in flags {
                 f.store(true, Ordering::Release);
             }
@@ -131,7 +133,7 @@ impl WatchNotifier for WatchRegistryInner {
         }
     }
 
-    fn notify_existing(&self, db: Option<usize>, exists: &dyn Fn(usize, &str) -> bool) {
+    fn notify_existing(&self, db: Option<usize>, exists: &dyn Fn(usize, &[u8]) -> bool) {
         if !self.has_watchers() {
             return;
         }
@@ -208,8 +210,8 @@ impl ForStore<'_> {
 }
 
 impl WatchNotifier for ForStore<'_> {
-    fn watch(&self, _db: usize, _key: &str, _flag: Arc<AtomicBool>) {}
-    fn notify(&self, db: usize, key: &str) {
+    fn watch(&self, _db: usize, _key: &[u8], _flag: Arc<AtomicBool>) {}
+    fn notify(&self, db: usize, key: &[u8]) {
         if let Some(registry) = self.registry() {
             registry.notify(db, key);
         }
@@ -223,7 +225,7 @@ impl WatchNotifier for ForStore<'_> {
             registry.notify_db(db);
         }
     }
-    fn notify_existing(&self, db: Option<usize>, exists: &dyn Fn(usize, &str) -> bool) {
+    fn notify_existing(&self, db: Option<usize>, exists: &dyn Fn(usize, &[u8]) -> bool) {
         if let Some(registry) = self.registry() {
             registry.notify_existing(db, exists);
         }
@@ -235,14 +237,14 @@ impl WatchNotifier for ForStore<'_> {
 pub struct NoopWatchRegistry;
 
 impl WatchNotifier for NoopWatchRegistry {
-    fn watch(&self, _db: usize, _key: &str, _flag: Arc<AtomicBool>) {}
-    fn notify(&self, _db: usize, _key: &str) {}
+    fn watch(&self, _db: usize, _key: &[u8], _flag: Arc<AtomicBool>) {}
+    fn notify(&self, _db: usize, _key: &[u8]) {}
     fn unwatch_all(&self, _flags: &[Arc<AtomicBool>]) {}
     fn has_watchers(&self) -> bool {
         false
     }
     fn notify_db(&self, _db: Option<usize>) {}
-    fn notify_existing(&self, _db: Option<usize>, _exists: &dyn Fn(usize, &str) -> bool) {}
+    fn notify_existing(&self, _db: Option<usize>, _exists: &dyn Fn(usize, &[u8]) -> bool) {}
 }
 
 #[cfg(test)]
@@ -257,8 +259,8 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         );
-        reg.watch(0, "k", Arc::clone(&a));
-        reg.watch(1, "k", Arc::clone(&b));
+        reg.watch(0, b"k", Arc::clone(&a));
+        reg.watch(1, b"k", Arc::clone(&b));
         assert!(reg.has_watchers());
 
         reg.notify_db(Some(1));
@@ -271,22 +273,22 @@ mod tests {
 
 thread_local! {
     /// Keys the command now running names and has left exactly as they were.
-    static UNCHANGED: std::cell::RefCell<Vec<(usize, String)>> =
+    static UNCHANGED: std::cell::RefCell<Vec<(usize, Key)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// A command says that `key`, which it names, is as it was: the dispatcher,
 /// which marks the watches on every key a successful write names, leaves
 /// this one's alone. (`SMOVE` of a member the destination already has.)
-pub fn unchanged(db: usize, key: &str) {
-    UNCHANGED.with(|keys| keys.borrow_mut().push((db, key.to_string())));
+pub fn unchanged(db: usize, key: &(impl AsRef<[u8]> + ?Sized)) {
+    UNCHANGED.with(|keys| keys.borrow_mut().push((db, Key::new(key.as_ref()))));
 }
 
 /// Whether the running command said so of `key`.
-pub fn is_unchanged(db: usize, key: &str) -> bool {
+pub fn is_unchanged(db: usize, key: &[u8]) -> bool {
     UNCHANGED.with(|keys| {
         let keys = keys.borrow();
-        !keys.is_empty() && keys.iter().any(|(d, k)| *d == db && k == key)
+        !keys.is_empty() && keys.iter().any(|(d, k)| *d == db && *k == key)
     })
 }
 

@@ -11,7 +11,6 @@ use crate::keyspace_events::{KS_STREAM, notify};
 use crate::replication::script_feed::{effect, effect_of_metadata, effects_begin};
 use crate::resp::write::*;
 use crate::store;
-use crate::store::Key;
 use crate::store::ValueRef;
 use crate::types::{ConsumerGroup, KiviDBValue, PelEntry, StreamEntry, StreamId, StreamInner};
 use crate::{read_lock, write_lock};
@@ -204,7 +203,7 @@ fn get_or_create_stream(ctx: &mut Ctx, key: &str) -> Result<Arc<RwLock<StreamInn
         )),
         None => {
             let s = Arc::new(RwLock::new(StreamInner::new()));
-            map.insert(Key::from(key), KiviDBValue::Stream(Arc::clone(&s)));
+            map.insert(key, KiviDBValue::Stream(Arc::clone(&s)));
             Ok(s)
         }
     }

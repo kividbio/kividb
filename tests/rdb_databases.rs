@@ -21,6 +21,22 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// A loaded database keyed by text, for these tests, whose keys all are:
+/// a load gives keys back as bytes (`store::Key`).
+fn texted<V>(
+    map: std::collections::HashMap<kividb::store::Key, V>,
+) -> std::collections::HashMap<String, V> {
+    map.into_iter()
+        .map(|(key, value)| (String::from_utf8(key.to_vec()).unwrap(), value))
+        .collect()
+}
+
+fn texted_all<V>(
+    maps: Vec<std::collections::HashMap<kividb::store::Key, V>>,
+) -> Vec<std::collections::HashMap<String, V>> {
+    maps.into_iter().map(texted).collect()
+}
+
 const FIXTURES: [&str; 5] = [
     "redis-8.10-databases-32.rdb",
     "valkey-8.1-databases-32.rdb",
@@ -54,6 +70,7 @@ fn the_loader_keeps_databases_past_15_apart_or_refuses_them() {
         SNAPSHOT_DATABASES.store(32, Ordering::Relaxed);
         let (dbs, _, _) =
             load_redis_rdb_with_expiry(path).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let dbs = texted_all(dbs);
         assert_eq!(dbs.len(), 32, "{name}");
         assert_eq!(text(&dbs[0]["shared"]), "from-db-0", "{name}");
         assert_eq!(dbs[0].len(), 2, "{name}: {:?}", dbs[0].keys());
