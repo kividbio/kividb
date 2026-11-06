@@ -94,6 +94,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `replica_announced`, which Sentinel reads to leave a replica out of
   `SENTINEL REPLICAS` (#443).
 
+- **A hash field's expiry is kept to the millisecond when KiviDB saves and
+  loads the hash.** After a restart from a snapshot or the AOF's preamble,
+  a full sync from a KiviDB master, or a `RESTORE` or `MIGRATE` between
+  KiviDB servers, `HPEXPIRETIME` of a field was often 1 ms off what it
+  had been set to, later or earlier. A field's deadline is converted
+  between the server's clock and Unix milliseconds when a hash is written
+  out and read back in, and each conversion cut the time now to a whole
+  millisecond first. It is now converted to the nanosecond both ways, and
+  a field set with `HPEXPIREAT t` reads back as `t`. (Redis and Valkey
+  files and `HSETEX ... PXAT` are the entry *Hash field TTLs read back to
+  the millisecond*, below; they now use the same conversion.) (#448)
+
+  A field's time to live is also checked as Redis checks it: a deadline
+  past 2^46 - 1 ms after the epoch (the year 4199), given to `HEXPIRE`,
+  `HPEXPIRE`, `HEXPIREAT`, `HPEXPIREAT`, `HGETEX` or `HSETEX` as a time to
+  live or a Unix time, is refused with `ERR invalid expire time in
+  '<command>' command`. KiviDB took any: `HEXPIRE h 18446744073709552
+  FIELDS 1 f` was saved as a moment from then, so the field was gone after
+  a restart, a full sync, `RESTORE` or `MIGRATE`, and `HEXPIRE h
+  9223372036854775807 FIELDS 1 f` stopped the server.
+
 - **A search index is seen only from its own database.** `FT._LIST`
   listed the indexes of every database, and the commands that name an
   index found one of another database: from database 1, `FT.SEARCH`
