@@ -3031,9 +3031,9 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
                     let name = crate::key_bytes::text_of(key.as_ref());
                     rdb_extensions::read_dragonfly_value(&mut r, Some(&name), type_id)?
                 } else if type_id == 64 && version <= 11 {
-                    return Err(rdb_extensions::refuse_keydb_cron(&crate::key_bytes::text_of(
-                        key.as_ref(),
-                    )));
+                    return Err(rdb_extensions::refuse_keydb_cron(
+                        &crate::key_bytes::text_of(key.as_ref()),
+                    ));
                 } else {
                     rdb_dialect::read_value(&mut r, type_id, dialect)?
                 };

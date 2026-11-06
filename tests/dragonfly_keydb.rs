@@ -10,6 +10,20 @@
 use kividb::snapshot::{load_redis_rdb_from, restore_payload_checked};
 use kividb::types::KiviDBValue;
 
+fn texted<V>(
+    map: std::collections::HashMap<kividb::store::Key, V>,
+) -> std::collections::HashMap<String, V> {
+    map.into_iter()
+        .map(|(key, value)| (String::from_utf8(key.to_vec()).unwrap(), value))
+        .collect()
+}
+
+fn texted_all<V>(
+    maps: Vec<std::collections::HashMap<kividb::store::Key, V>>,
+) -> Vec<std::collections::HashMap<String, V>> {
+    maps.into_iter().map(texted).collect()
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -139,6 +153,7 @@ fn keydb_hash_field_ttls_load_as_field_ttls() {
     body.extend(string_key("s", "v"));
 
     let (dbs, _, _) = load_redis_rdb_from(&file(&body)[..]).unwrap();
+    let dbs = texted_all(dbs);
     let db = &dbs[0];
     let mut keys: Vec<&str> = db.keys().map(String::as_str).collect();
     keys.sort_unstable();
@@ -250,6 +265,7 @@ fn dragonfly_field_ttls_json_and_flags_load() {
     }
 
     let (dbs, _, _) = load_redis_rdb_from(&file(&body)[..]).unwrap();
+    let dbs = texted_all(dbs);
     let db = &dbs[0];
     let mut keys: Vec<&str> = db.keys().map(String::as_str).collect();
     keys.sort_unstable();
@@ -367,6 +383,7 @@ fn rdb_files_saved_by_dragonfly_and_keydb_load_or_are_refused_whole() {
     const FAR: u64 = 4_102_444_800_000;
     let (dbs, _, _) =
         load_redis_rdb_from(&include_bytes!("fixtures/dragonfly-2.1-types.rdb")[..]).unwrap();
+    let dbs = texted_all(dbs);
     let db = &dbs[0];
     let mut keys: Vec<&str> = db.keys().map(String::as_str).collect();
     keys.sort_unstable();
@@ -391,6 +408,7 @@ fn rdb_files_saved_by_dragonfly_and_keydb_load_or_are_refused_whole() {
     );
 
     let (dbs, _, _) = load_redis_rdb_from(&include_bytes!("fixtures/keydb-6.3.4.rdb")[..]).unwrap();
+    let dbs = texted_all(dbs);
     let db = &dbs[0];
     let mut keys: Vec<&str> = db.keys().map(String::as_str).collect();
     keys.sort_unstable();
