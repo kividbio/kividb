@@ -43,6 +43,20 @@ Security fixes are made for the latest release line only.
 
 Upgrade to the latest 1.1.x release to receive fixes.
 
+## Package signing key
+
+The apt and dnf repositories at `packages.kividb.io`, and every RPM in them, are signed
+with one OpenPGP key. Its fingerprint is published here and in
+[docs/INSTALL.md](docs/INSTALL.md#the-signing-key), in this repository, so that the key
+the site serves can be checked against a copy that the site does not serve:
+
+<!-- PLACEHOLDER: replace the line below with the key's fingerprint when the key is
+     created, here and in docs/INSTALL.md. -->
+**Fingerprint: not published yet.** It is published here once the key exists.
+
+If the key a repository offers has any other fingerprint, do not install from it, and
+report it as above.
+
 ## Deployment advice
 
 KiviDB, like Redis, is meant to run on a trusted network. In particular:

@@ -1,0 +1,15 @@
+{
+    "_comment": "KiviDB's own arities, for scripts/gen_arity.py: commands Valkey does not have, and commands KiviDB takes in a different form from Valkey's. Each is the number of arguments KiviDB's handler takes, the command's name included; negative is a minimum. Each replaces Valkey's entry of the same name, if there is one.",
+    "CLUSTER|REPLICATE": {
+        "arity": 3,
+        "why": "KiviDB takes a node ID only (src/commands/cluster.rs cmd_replicate), not Valkey 9's NO ONE form."
+    },
+    "SCRIPT|DEBUG": {
+        "arity": 3,
+        "why": "KiviDB takes the mode only (src/commands/lua.rs), not Valkey 9.1's optional engine name."
+    },
+    "XIDMPRECORD": {
+        "arity": 5,
+        "why": "Not in Valkey. XIDMPRECORD key producer-id idempotent-id entry-id (src/commands/streams.rs xidmprecord)."
+    }
+}

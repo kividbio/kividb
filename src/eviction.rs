@@ -744,7 +744,7 @@ impl Choice {
     /// `spot`, whose key is `key`. Among keys as unwanted, the one offered
     /// first stays first.
     #[inline]
-    fn offer(&mut self, spot: Spot, key: &str) {
+    fn offer(&mut self, spot: Spot, key: &[u8]) {
         let top = &self.top[..self.len];
         if top.iter().any(|s| s.id == spot.id) {
             // Sampled twice, or kept and sampled again.
@@ -1029,7 +1029,7 @@ fn make_room_in(ctx: &mut Ctx, policy: Policy, limit: usize, ordered: bool, dbs:
             continue;
         };
         fresh = false;
-        match evict(ctx, db, &key, ordered) {
+        match evict(ctx, db, crate::store::key_text(&key), ordered) {
             Some(size) => {
                 misses = 0;
                 given = given.saturating_add(size);
@@ -1159,7 +1159,11 @@ mod tests {
         let mut found = Vec::new();
         sample_db(shards, volatile, count, rng, |_, _, e| {
             let expires = if volatile { e.expires() } else { None };
-            found.push((e.key().to_string(), expires, e.access()))
+            found.push((
+                crate::store::key_text(e.key()).to_owned(),
+                expires,
+                e.access(),
+            ))
         });
         found
     }
@@ -1189,7 +1193,9 @@ mod tests {
         // 200 times each, on average.
         for _ in 0..40_000 {
             let n = sample_shard(&map, false, 5, &mut rng, |_, e| {
-                *times.entry(e.key().to_string()).or_default() += 1;
+                *times
+                    .entry(crate::store::key_text(e.key()).to_owned())
+                    .or_default() += 1;
             });
             assert_eq!(n, 5);
         }
@@ -1227,13 +1233,14 @@ mod tests {
             (7, 40),
             (8, 20),
         ] {
-            c.offer(spot(id, unwanted), &format!("k{id}"));
+            c.offer(spot(id, unwanted), format!("k{id}").as_bytes());
         }
         let ids = |s: &[Spot]| s.iter().map(|s| s.id).collect::<Vec<_>>();
         // 2 is there once; 8 is as unwanted as 3, and came after it.
         assert_eq!(ids(&c.top[..c.len]), [7, 2, 5, 3, 8]);
         assert_eq!(
-            c.decide().map(|(db, key)| (db, key.to_string())),
+            c.decide()
+                .map(|(db, key)| (db, crate::store::key_text(&key).to_owned())),
             Some((3, "k7".to_string()))
         );
         let kept = KEPT_SPOTS.with(|k| k.get());

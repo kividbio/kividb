@@ -1122,8 +1122,9 @@ pub fn walk_documents(
         let keys: Vec<String> = shard
             .read()
             .keys()
+            .map(crate::store::key_text)
             .filter(|key| def.covers(key))
-            .map(str::to_string)
+            .map(str::to_owned)
             .collect();
         for key in keys {
             let _order = crate::write_order::lock_key_for_walk(def.db_index, key.as_bytes());
@@ -3705,7 +3706,8 @@ pub fn compact_hnsw(
 
             for (key, value) in map.iter() {
                 let matches =
-                    prefixes.is_empty() || prefixes.iter().any(|p| key.starts_with(p.as_str()));
+                    prefixes.is_empty() || prefixes.iter().any(|p| key.starts_with(p.as_bytes()));
+                let key = crate::store::key_text(key);
                 if !matches || already.contains(key) {
                     continue;
                 }

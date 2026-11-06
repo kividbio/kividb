@@ -791,8 +791,8 @@ fn delete_keys(
     for shard in db.iter() {
         let keys: Vec<String> = crate::read_lock!(shard)
             .keys()
-            .filter(|k| run.deletes(key_hash_slot(k.as_bytes())))
-            .map(|k| k.to_string())
+            .filter(|k| run.deletes(key_hash_slot(k)))
+            .map(|k| crate::store::key_text(k).to_owned())
             .collect();
         for chunk in keys.chunks(128) {
             {
@@ -1066,7 +1066,7 @@ fn capture(env: &Env, ranges: &[(u16, u16)]) -> std::io::Result<Vec<Captured>> {
         let map = crate::read_lock!(shard);
         for entry in map.entries() {
             let key = entry.key();
-            if !in_ranges(ranges, key_hash_slot(key.as_bytes())) {
+            if !in_ranges(ranges, key_hash_slot(key)) {
                 continue;
             }
             // In the entry beside the value.
@@ -1075,7 +1075,7 @@ fn capture(env: &Env, ranges: &[(u16, u16)]) -> std::io::Result<Vec<Captured>> {
                 continue;
             }
             out.push(Captured {
-                key: key.to_string(),
+                key: crate::store::key_text(key).to_owned(),
                 value: entry.value().deep_clone(),
                 expires_at,
             });

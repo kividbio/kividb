@@ -73,6 +73,13 @@ impl Conn {
                 let items = (0..count).map(|_| self.read_value()).collect();
                 RespValue::Array(items)
             }
+            // RESP3: a double as its text, a map as its keys and values.
+            Some(b',') => RespValue::Bulk(line.as_bytes()[1..].to_vec()),
+            Some(b'_') => RespValue::Nil,
+            Some(b'%') => {
+                let count: usize = line[1..].parse().unwrap();
+                RespValue::Array((0..2 * count).map(|_| self.read_value()).collect())
+            }
             _ => panic!("unexpected RESP: {:?}", line),
         }
     }
@@ -2441,4 +2448,250 @@ fn test_incr_of_an_expired_key_starts_fresh_and_stays() {
         assert_eq!(c.cmds(&["GET", key]).as_str(), "1", "GET {key}");
         assert_eq!(c.cmds(&["TTL", key]).as_int(), -1, "TTL {key}");
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// JSON NUMBERS ARE KEPT EXACTLY (#445)
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Finite doubles, the same each run: any bit pattern (every exponent, and
+/// subnormals), and the magnitudes documents mostly hold.
+fn test_doubles(n: usize) -> Vec<f64> {
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut out = Vec::with_capacity(n);
+    while out.len() < n {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let unit = (state >> 11) as f64 / (1u64 << 53) as f64;
+        let d = match out.len() % 3 {
+            0 => f64::from_bits(state),
+            1 => unit * 2e6 - 1e6,
+            _ => unit * 10f64.powi((state % 41) as i32 - 20),
+        };
+        if d.is_finite() {
+            out.push(d);
+        }
+    }
+    out
+}
+
+/// `doubles` as a JSON array: shortest round-trip text, half of it with an
+/// exponent (`1.3326500000000001e1`).
+fn json_array(doubles: &[f64]) -> String {
+    let items: Vec<String> = doubles
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            if i % 2 == 0 {
+                format!("{d:?}")
+            } else {
+                format!("{d:e}")
+            }
+        })
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
+/// The numbers of a JSON array of numbers, read exactly.
+fn numbers(text: &str) -> Vec<f64> {
+    text.trim_matches(|c| c == '[' || c == ']')
+        .split(',')
+        .map(|n| {
+            n.parse::<f64>()
+                .unwrap_or_else(|_| panic!("not a number: {n}"))
+        })
+        .collect()
+}
+
+fn assert_exact(what: &str, want: &[f64], got: &[f64]) {
+    assert_eq!(want.len(), got.len(), "{what}");
+    let changed: Vec<(f64, f64)> = want
+        .iter()
+        .zip(got)
+        .filter(|(w, g)| w.to_bits() != g.to_bits())
+        .map(|(w, g)| (*w, *g))
+        .take(5)
+        .collect();
+    assert!(changed.is_empty(), "{what}: changed, e.g. {changed:?}");
+}
+
+/// Every finite double comes back from `JSON.SET` exactly: from `JSON.GET`,
+/// `JSON.MGET`, in RESP3, after `DUMP` and `RESTORE`, and as the operand and
+/// result of `JSON.NUMINCRBY` and `JSON.NUMMULTBY`. A number that needed 17
+/// significant digits was often read as its neighbour: `13.326500000000001`
+/// came back `13.3265`, and 435 of 2,000 random doubles changed (#445).
+#[test]
+fn json_numbers_keep_every_double_exactly() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for text in [
+        "13.326500000000001",
+        "123456789.12345679",
+        "0.30000000000000004",
+    ] {
+        assert!(c.cmds(&["JSON.SET", "n445:one", "$", text]).is_ok());
+        assert_eq!(c.cmds(&["JSON.GET", "n445:one"]).as_str(), text);
+        assert_eq!(
+            c.cmds(&["JSON.GET", "n445:one", "$"]).as_str(),
+            format!("[{text}]")
+        );
+    }
+
+    let doubles = test_doubles(10_000);
+    for (i, chunk) in doubles.chunks(100).enumerate() {
+        let key = format!("n445:{i}");
+        assert!(c.cmds(&["JSON.SET", &key, "$", &json_array(chunk)]).is_ok());
+        assert_exact(&key, chunk, &numbers(c.cmds(&["JSON.GET", &key]).as_str()));
+    }
+    let mget = c.cmds(&["JSON.MGET", "n445:0", "n445:1", "$"]);
+    for (i, reply) in mget.as_array().iter().enumerate() {
+        let text = reply.as_str();
+        assert_exact("MGET", &doubles[i * 100..(i + 1) * 100], &numbers(text));
+    }
+
+    // DUMP and RESTORE.
+    let RespValue::Bulk(payload) = c.cmds(&["DUMP", "n445:2"]) else {
+        panic!("DUMP");
+    };
+    assert!(
+        c.cmd(&[
+            b"RESTORE".as_slice(),
+            b"n445:copy",
+            b"0",
+            payload.as_slice()
+        ])
+        .is_ok()
+    );
+    assert_exact(
+        "RESTORE",
+        &doubles[200..300],
+        &numbers(c.cmds(&["JSON.GET", "n445:copy"]).as_str()),
+    );
+
+    // Arithmetic: on the double read, by the double read.
+    for pair in doubles[..2000].chunks(2) {
+        let (a, b) = (pair[0], pair[1] / 1e3);
+        for (command, result) in [("JSON.NUMINCRBY", a + b), ("JSON.NUMMULTBY", a * b)] {
+            assert!(
+                c.cmds(&["JSON.SET", "n445:n", "$", &format!("{a:?}")])
+                    .is_ok()
+            );
+            let reply = c.cmds(&[command, "n445:n", "$", &format!("{b:e}")]);
+            if !result.is_finite() {
+                assert!(reply.is_error(), "{command} {a:?} {b:e}: {reply:?}");
+                continue;
+            }
+            // A whole result is kept as an integer, and -0 as 0.
+            if result == 0.0 {
+                assert_eq!(numbers(reply.as_str()), [0.0], "{command} {a:?} {b:e}");
+                continue;
+            }
+            assert_exact(
+                &format!("{command} {a:?} {b:e}"),
+                &[result],
+                &numbers(reply.as_str()),
+            );
+        }
+    }
+
+    // RESP3: the document as text, and the new values as doubles.
+    let mut c3 = Conn::connect(port);
+    c3.cmds(&["HELLO", "3"]);
+    assert_eq!(
+        c3.cmds(&["JSON.GET", "n445:3"]),
+        c.cmds(&["JSON.GET", "n445:3"])
+    );
+    for &d in &doubles[..1000] {
+        assert!(
+            c3.cmds(&["JSON.SET", "n445:r3", "$", &format!("{d:?}")])
+                .is_ok()
+        );
+        let reply = c3.cmds(&["JSON.NUMINCRBY", "n445:r3", "$", "0"]);
+        // A double, or an integer when the number is a whole one.
+        let got = match &reply.as_array()[0] {
+            RespValue::Int(n) => *n as f64,
+            other => other.as_f64(),
+        };
+        assert_eq!(got.to_bits(), (d + 0.0).to_bits(), "RESP3 {d:?}: {reply:?}");
+    }
+}
+
+/// A NUMERIC field of a JSON document indexes the number the document holds:
+/// `13.326500000000001`, not the `13.3265` it used to be read as (#445).
+#[test]
+fn a_numeric_field_of_a_json_document_holds_the_exact_double() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    assert!(
+        c.cmds(&[
+            "FT.CREATE",
+            "n445idx",
+            "ON",
+            "JSON",
+            "PREFIX",
+            "1",
+            "n445doc:",
+            "SCHEMA",
+            "$.v",
+            "AS",
+            "v",
+            "NUMERIC",
+        ])
+        .is_ok()
+    );
+    assert!(
+        c.cmds(&["JSON.SET", "n445doc:1", "$", r#"{"v":13.326500000000001}"#])
+            .is_ok()
+    );
+    let count = |c: &mut Conn, query: &str| {
+        c.cmds(&["FT.SEARCH", "n445idx", query, "NOCONTENT"])
+            .as_array()[0]
+            .as_int()
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while count(&mut c, "@v:[13 14]") != 1 {
+        assert!(std::time::Instant::now() < deadline, "not indexed");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        count(&mut c, "@v:[13.326500000000001 13.326500000000001]"),
+        1
+    );
+    assert_eq!(count(&mut c, "@v:[13.3265 13.3265]"), 0);
+}
+
+/// A snapshot keeps a document's numbers as they are (#445).
+#[test]
+fn a_snapshot_keeps_json_numbers_exactly() {
+    use kividb::types::KiviDBValue;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let doubles = test_doubles(10_000);
+    let value = serde_json::Value::Array(doubles.iter().map(|&d| d.into()).collect());
+    let mut db = HashMap::new();
+    db.insert(
+        "doc".to_string(),
+        KiviDBValue::Json(Arc::new(parking_lot::RwLock::new(value))),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dump.kdb");
+    let path = path.to_str().unwrap();
+    kividb::snapshot::write_snapshot(path, &[db], None).unwrap();
+    let loaded = kividb::snapshot::load_snapshot(path).unwrap();
+    let KiviDBValue::Json(doc) = &loaded.dbs[0]["doc"] else {
+        panic!("not a document");
+    };
+    let got: Vec<f64> = doc
+        .read()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_f64().unwrap())
+        .collect();
+    assert_exact("snapshot", &doubles, &got);
 }

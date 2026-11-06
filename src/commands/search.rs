@@ -474,6 +474,7 @@ fn count_docs(db: &Db, def: &IndexDef, cluster: Option<&crate::cluster::ClusterS
                 .read()
                 .iter()
                 .filter(|(key, value)| {
+                    let key = crate::store::key_text(key);
                     crate::vector::is_document(&def.on, *value)
                         && covers(def, key)
                         && served
@@ -810,10 +811,11 @@ pub(crate) fn scan_docs(
             let this_run = left.min(run);
             if expired.is_empty() {
                 for (key, value) in docs.by_ref().take(this_run) {
-                    each(key, value);
+                    each(crate::store::key_text(key), value);
                 }
             } else {
                 for (key, value) in docs.by_ref().take(this_run) {
+                    let key = crate::store::key_text(key);
                     if !expired.contains(key) {
                         each(key, value);
                     }
@@ -834,7 +836,9 @@ fn expired_in(map: &crate::store::ShardMap) -> AHashSet<String> {
     }
     let now = crate::commands::helpers::now_ms();
     let (due, _) = map.due(now, usize::MAX);
-    due.into_iter().map(|key| key.to_string()).collect()
+    due.into_iter()
+        .map(|key| crate::store::key_text(&key).to_owned())
+        .collect()
 }
 
 /// Whether a step over `n` items that cannot stop part-way (a sort) is to
@@ -1561,7 +1565,7 @@ fn page_from_postings(
         // Documents that left the index since the plan was made.
         ids.and_with(p.live());
         for key in &expired {
-            if let Some(id) = p.id(key) {
+            if let Some(id) = p.id(crate::store::key_text(key)) {
                 ids.unset(id);
             }
         }
