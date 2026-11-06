@@ -2725,7 +2725,15 @@ fn coordinate(
             total += n.max(0) as usize;
         }
         while let Some(key) = items.next() {
-            let key = key.text().unwrap_or_default();
+            // A master sends the key's bytes (`bytes_of` of its name): it is
+            // a name again by `text_of`, as `encode_page` expects. It was
+            // decoded lossily, so a key that is not text came back as
+            // U+FFFD, and one with a character of the escape's block in it
+            // as other bytes.
+            let key = match key {
+                Reply::Bulk(Some(raw)) => crate::key_bytes::text_of(&raw).into_owned(),
+                other => other.text().unwrap_or_default(),
+            };
             let score = items
                 .next()
                 .and_then(|s| s.text())
