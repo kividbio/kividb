@@ -11,12 +11,19 @@ scripts:
   preinstall: ./packaging/scripts/preinstall.sh
   postinstall: ./packaging/scripts/postinstall.sh
   preremove: ./packaging/scripts/preremove.sh
-# The pre-install script makes the kividb user with groupadd and useradd,
-# which minimal RPM-based images such as amazonlinux:2023 leave out.
+# The binary is built on Amazon Linux 2023 and needs its glibc, 2.34, or newer:
+# Debian 12, Ubuntu 22.04, RHEL 9 and Fedora 35 or later. Saying so makes apt
+# and dnf refuse an older system rather than install a server that cannot
+# start. The pre-install script makes the kividb user with groupadd and
+# useradd, which minimal RPM-based images such as amazonlinux:2023 leave out.
 overrides:
+  deb:
+    depends:
+      - libc6 (>= 2.34)
   rpm:
     depends:
       - shadow-utils
+      - glibc >= 2.34
 contents:
   - src: ./target/release/kividb
     dst: /usr/bin/kividb

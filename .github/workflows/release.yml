@@ -606,6 +606,29 @@ jobs:
           git commit -m "chore: update kividb to ${{ steps.extract.outputs.version }}"
           git push
 
+  # ── apt and dnf repositories — stable releases only ─────────────────────
+  #
+  # Adds the release's .deb and .rpm, taken from the GitHub Release just
+  # published, to https://packages.kividb.io and signs the repositories: see
+  # package-repos.yml. `publish` runs for stable releases only, so a
+  # candidate never gets here. Skipped with a notice until the signing key
+  # and the deploy key are set (docs/INSTALL.md, "Maintainers: one-time
+  # setup"). Only the secrets it uses are passed; those in its `packages`
+  # environment take their place.
+  package-repos:
+    needs: [publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    permissions:
+      contents: read
+      attestations: read
+    uses: ./.github/workflows/package-repos.yml
+    with:
+      tag: ${{ github.event.inputs.tag || github.ref_name }}
+    secrets:
+      PACKAGES_GPG_PRIVATE_KEY: ${{ secrets.PACKAGES_GPG_PRIVATE_KEY }}
+      PACKAGES_GPG_PASSPHRASE: ${{ secrets.PACKAGES_GPG_PASSPHRASE }}
+      PACKAGES_DEPLOY_KEY: ${{ secrets.PACKAGES_DEPLOY_KEY }}
+
   # Stable releases only. A release candidate (a tag with a `-`, v1.2.0-rc1)
   # gets no GitHub Release, no assets and no announcement: it is built, its
   # images are pushed to GHCR, and the smoke test runs against them; the
@@ -868,6 +891,77 @@ jobs:
               -m "KiviDB ${RELEASE_TAG#v} source: the same commit as ${RELEASE_TAG}. Not a separate release."
           git push origin "refs/tags/${src}"
           echo "Pushed ${src} on ${commit}"
+
+  # ── crates.io — stable releases only ────────────────────────────────────
+  #
+  # `cargo install kividb` and `cargo binstall kividb`. After the GitHub
+  # Release, whose tarballs `cargo binstall` downloads (Cargo.toml's
+  # [package.metadata.binstall]). `publish` runs for stable releases only, so
+  # a candidate never gets here. Skipped with a notice while the
+  # CARGO_REGISTRY_TOKEN secret is missing, and when crates.io already has
+  # this version (a re-run): a version can be published only once. Setup
+  # and withdrawal: docs/RELEASING.md.
+  crates-io:
+    needs: [publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check the token, and whether crates.io has this version
+        id: cfg
+        env:
+          HAVE_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          ver="${RELEASE_TAG#v}"
+          if [ "${HAVE_TOKEN}" != "true" ]; then
+            echo "::notice::crates.io skipped: set the CARGO_REGISTRY_TOKEN secret to publish kividb ${ver} there."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # crates.io asks API clients for a User-Agent that says who they are.
+          code="$(curl -s -o /dev/null -w '%{http_code}' \
+            -A "kividb-release (https://github.com/${{ github.repository }})" \
+            "https://crates.io/api/v1/crates/kividb/${ver}")"
+          case "${code}" in
+            200)
+              echo "::notice::crates.io already has kividb ${ver}."
+              echo "run=false" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::crates.io answered ${code} for kividb ${ver}"
+              exit 1
+              ;;
+          esac
+
+      - uses: actions/checkout@v4
+        if: steps.cfg.outputs.run == 'true'
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.cfg.outputs.run == 'true'
+
+      # Packs what Cargo.toml's `include` lists and builds that package as a
+      # check, with no token in the environment: the build runs build
+      # scripts of dependencies. --locked: with the Cargo.lock the release
+      # was built with, which the crate carries.
+      - name: cargo package
+        if: steps.cfg.outputs.run == 'true'
+        run: cargo package --locked
+
+      # Uploads it. --no-verify: the step above built and checked the same
+      # package. The only step that has the token.
+      - name: cargo publish
+        if: steps.cfg.outputs.run == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked --no-verify
 
   # ── Smoke test — release candidates only ────────────────────────────────
   #
