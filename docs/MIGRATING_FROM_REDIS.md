@@ -119,11 +119,9 @@ What the RDB reader takes from Redis:
   writes new HyperLogLogs in its own format, and `PFMERGE` or a multi-key
   `PFCOUNT` refuses to combine those with the ones copied from Redis
   ([PERSISTENCE.md](PERSISTENCE.md)).
-- **Key names must be valid UTF-8**
-  ([#437](https://github.com/kividbio/kividb/issues/437)). Redis keys are
-  binary-safe; a snapshot with a non-UTF-8 key name loads, but clients can't
-  write that name again ([#446](https://github.com/kividbio/kividb/issues/446)).
-  List such keys on the source before you move.
+- **Keys of any bytes** move over and work as on Redis (#437, #446). An
+  ACL rule whose key pattern is not UTF-8 is not taken yet: list such rules
+  on the source before you move.
 
 ## 5. Persistence and durability
 

@@ -122,12 +122,12 @@ other files:
   does that, for more writes a second.
 
 **Data**
-- Keys, hash fields and set members must be valid UTF-8; Redis and Valkey
-  accept any bytes. A non-UTF-8 key gets `ERR key must be
-  valid UTF-8` (or `ERR must be valid UTF-8`), so an application that uses
-  binary keys, such as Stalwart Mail Server, doesn't work yet
-  ([#437](https://github.com/kividbio/kividb/issues/437)). Values and
-  sorted-set members are binary-safe, as in Redis.
+- Keys, values, hash fields, set and sorted-set members, list elements,
+  stream consumer group and consumer names and vector-set element names are
+  any bytes, as in Redis. What is still text: ACL rules (a key or channel
+  pattern in `ACL SETUSER` that is not UTF-8 is refused,
+  [#437](https://github.com/kividbio/kividb/issues/437)), search index
+  names, prefixes and field names, and time-series label names and values.
 - A HyperLogLog copied from Redis (`DUMP`/`RESTORE`, an RDB, replication)
   loads and counts as it did on Redis. By default KiviDB writes new
   HyperLogLogs in its own format, which Redis refuses (`INVALIDOBJ`), and

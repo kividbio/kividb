@@ -490,19 +490,15 @@ fn read_stream_groups(r: &mut impl Read, stream: &mut StreamInner) -> io::Result
     let gcount = read_u32_le(r)? as usize;
     stream.groups.reserve(hint(gcount));
     for _ in 0..gcount {
-        let name_bytes = read_bytes(r)?;
-        let name = String::from_utf8(name_bytes)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad stream group name"))?;
+        // Group and consumer names are any bytes, as in Redis.
+        let name = crate::types::StreamName::from(read_bytes(r)?);
         let last_id = read_stream_id(r)?;
         let entries_read = read_u64_le(r)?;
         let pel_count = read_u32_le(r)? as usize;
         let mut pel = std::collections::BTreeMap::new();
         for _ in 0..pel_count {
             let id = read_stream_id(r)?;
-            let consumer_bytes = read_bytes(r)?;
-            let consumer = String::from_utf8(consumer_bytes).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "bad stream PEL consumer")
-            })?;
+            let consumer = crate::types::StreamName::from(read_bytes(r)?);
             let delivered_at = read_u64_le(r)?;
             let delivery_count = read_u64_le(r)?;
             pel.insert(
@@ -517,10 +513,7 @@ fn read_stream_groups(r: &mut impl Read, stream: &mut StreamInner) -> io::Result
         let ccount = read_u32_le(r)? as usize;
         let mut consumers = AHashMap::with_capacity(hint(ccount));
         for _ in 0..ccount {
-            let cname_bytes = read_bytes(r)?;
-            let cname = String::from_utf8(cname_bytes).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "bad stream consumer name")
-            })?;
+            let cname = crate::types::StreamName::from(read_bytes(r)?);
             let last_seen = read_u64_le(r)?;
             consumers.insert(cname, last_seen);
         }
@@ -2029,10 +2022,8 @@ fn read_image(
 
                     for _ in 0..count {
                         // Element name
-                        let name_bytes = read_bytes(&mut r)?;
-                        let name = String::from_utf8(name_bytes).map_err(|_| {
-                            io::Error::new(io::ErrorKind::InvalidData, "bad vset element name")
-                        })?;
+                        // Any bytes, as in Redis.
+                        let name = crate::key_bytes::KeyBytes::from(read_bytes(&mut r)?);
 
                         // Vector floats
                         let mut vlen_buf = [0u8; 4];
@@ -3628,8 +3619,8 @@ fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
     }
 
     for _ in 0..rdb_read_plain_length(r)? {
-        let name = String::from_utf8(rdb_read_string(r)?)
-            .map_err(|_| rdb_invalid("consumer group name is not UTF-8"))?;
+        // Any bytes, as Redis keeps them.
+        let name = crate::types::StreamName::from(rdb_read_string(r)?);
         let last_id = rdb_read_stream_id(r)?;
         let entries_read = if type_id >= 19 {
             rdb_read_plain_length(r)?
@@ -3653,7 +3644,7 @@ fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
             let delivery_count = rdb_read_plain_length(r)?;
             // Owned by no one until a consumer below claims it.
             let entry = PelEntry {
-                consumer: String::new(),
+                consumer: crate::types::StreamName::default(),
                 delivered_at,
                 delivery_count,
             };
@@ -3662,8 +3653,7 @@ fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
             }
         }
         for _ in 0..rdb_read_plain_length(r)? {
-            let consumer = String::from_utf8(rdb_read_string(r)?)
-                .map_err(|_| rdb_invalid("consumer name is not UTF-8"))?;
+            let consumer = crate::types::StreamName::from(rdb_read_string(r)?);
             let seen = rdb_read_millisecond_time(r)?;
             let active = if type_id >= 21 {
                 rdb_read_millisecond_time(r)?

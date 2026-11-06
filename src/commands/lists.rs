@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 /// Pop up to `count` elements from one end of the list at `key`. Nothing if
 /// there is no such key.
-fn pop_from(ctx: &Ctx, key: &str, left: bool, count: usize) -> Result<Vec<Arc<[u8]>>, Vec<u8>> {
+fn pop_from(ctx: &Ctx, key: &[u8], left: bool, count: usize) -> Result<Vec<Arc<[u8]>>, Vec<u8>> {
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
     let map = read_lock!(shard);
@@ -55,10 +55,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // The key as it stands in the command: it was copied to a
             // string of its own for every push, and the values gathered in
             // a vector before going into the list.
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
 
             let db_ref = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db_ref, key);
@@ -102,10 +99,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // The key as it stands in the command: it was copied to a
             // string of its own for every push, and the values gathered in
             // a vector before going into the list.
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
 
             let db_ref = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db_ref, key);
@@ -144,10 +138,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'lpop' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             let count: Option<usize> = match cmd.get(2) {
                 None => None,
                 Some(raw) => match parse_utf8(raw).and_then(|s| s.parse::<i64>().ok()) {
@@ -212,10 +203,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'rpop' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             let count: Option<usize> = match cmd.get(2) {
                 None => None,
                 Some(raw) => match parse_utf8(raw).and_then(|s| s.parse::<i64>().ok()) {
@@ -278,10 +266,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'llen' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
 
             let gone = lazy_expire_on_read(ctx.store, *ctx.selected_db, key);
 
@@ -313,10 +298,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'lrange' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be a valid utf-8")),
-            };
+            let key: &[u8] = cmd[1];
             let start: i64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
@@ -392,10 +374,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'ltrim' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
 
             let start: i64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
                 Some(n) => n,
@@ -457,10 +436,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'lpos' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             let element = &cmd[2];
 
             let mut rank: i64 = 1;
@@ -622,10 +598,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'lindex' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
 
             let idx: i64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
                 Some(n) => n,
@@ -676,10 +649,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'lpushx' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             let db_ref = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db_ref, key);
             let map = write_lock!(shard);
@@ -717,10 +687,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'rpushx' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             let db_ref = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db_ref, key);
             let map = write_lock!(shard);
@@ -751,10 +718,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'lset' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             let idx: i64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
@@ -789,10 +753,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'linsert' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             let direction = String::from_utf8_lossy(cmd[2]).to_ascii_uppercase();
             if direction != "BEFORE" && direction != "AFTER" {
                 return Some(resp_error("ERR syntax error"));
@@ -836,10 +797,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'lrem' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             let count: i64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
@@ -907,14 +865,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'lmove' command",
                 ));
             }
-            let src_key = match parse_utf8(cmd[1]) {
-                Some(k) => k.to_string(),
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
-            let dst_key = match parse_utf8(cmd[2]) {
-                Some(k) => k.to_string(),
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let src_key: Vec<u8> = cmd[1].to_vec();
+            let dst_key: Vec<u8> = cmd[2].to_vec();
             let (Some(from_left), Some(to_left)) =
                 (list_move::parse_end(cmd[3]), list_move::parse_end(cmd[4]))
             else {
@@ -937,14 +889,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
             }
             // Reuse LMOVE logic by building a synthetic command
-            let src_key = match parse_utf8(cmd[1]) {
-                Some(k) => k.to_string(),
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
-            let dst_key = match parse_utf8(cmd[2]) {
-                Some(k) => k.to_string(),
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let src_key: Vec<u8> = cmd[1].to_vec();
+            let dst_key: Vec<u8> = cmd[2].to_vec();
             Some(
                 match list_move::move_one(ctx, &src_key, &dst_key, false, true) {
                     Ok(Some(element)) => resp_bulk(&element),
@@ -968,10 +914,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Ok(secs) => secs,
                 Err(e) => return Some(e),
             };
-            let keys: Vec<String> = cmd[1..cmd.len() - 1]
-                .iter()
-                .filter_map(|b| parse_utf8(b).map(|s| s.to_string()))
-                .collect();
+            let keys: Vec<Vec<u8>> = cmd[1..cmd.len() - 1].iter().map(|b| b.to_vec()).collect();
             let left = name == "BLPOP";
 
             // The first key, in the order given, that has an element.
@@ -986,7 +929,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                                 if let Some(element) = popped.pop() {
                                     crate::stats::record_hit();
                                     return Some(resp_array(vec![
-                                        resp_bulk_str(key),
+                                        resp_bulk(key),
                                         resp_bulk(element.as_ref()),
                                     ]));
                                 }
@@ -1012,15 +955,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // Up to `count` elements from the first key that has any; a key
             // that holds something other than a list is an error.
             for raw in &cmd[2..2 + numkeys] {
-                let Some(key) = parse_utf8(raw) else {
-                    return Some(resp_error("ERR must be valid UTF-8"));
-                };
+                let key: &[u8] = raw;
                 match pop_from(ctx, key, !right, count) {
                     Ok(popped) if popped.is_empty() => {}
                     Ok(popped) => {
                         crate::stats::record_hit();
                         return Some(resp_array(vec![
-                            resp_bulk_str(key),
+                            resp_bulk(key),
                             resp_array(popped.iter().map(|el| resp_bulk(el.as_ref())).collect()),
                         ]));
                     }
@@ -1042,10 +983,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     name.to_ascii_lowercase()
                 )));
             }
-            let (Some(src), Some(dst)) = (parse_utf8(cmd[1]), parse_utf8(cmd[2])) else {
-                return Some(resp_error("ERR must be valid UTF-8"));
-            };
-            let (src, dst) = (src.to_string(), dst.to_string());
+            let (src, dst) = (cmd[1].to_vec(), cmd[2].to_vec());
             let (from_left, to_left) = if legacy {
                 (false, true)
             } else {
@@ -1097,10 +1035,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Ok(secs) => secs,
                 Err(e) => return Some(e),
             };
-            let keys: Vec<String> = cmd[3..3 + numkeys]
-                .iter()
-                .filter_map(|b| parse_utf8(b).map(|s| s.to_string()))
-                .collect();
+            let keys: Vec<Vec<u8>> = cmd[3..3 + numkeys].iter().map(|b| b.to_vec()).collect();
 
             // Up to `count` elements from the first key that has any.
             Some(blocking::wait_for_keys(
@@ -1114,7 +1049,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             Ok(popped) => {
                                 crate::stats::record_hit();
                                 return Some(resp_array(vec![
-                                    resp_bulk_str(key),
+                                    resp_bulk(key),
                                     resp_array(
                                         popped.iter().map(|el| resp_bulk(el.as_ref())).collect(),
                                     ),

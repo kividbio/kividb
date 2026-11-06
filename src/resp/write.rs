@@ -87,6 +87,24 @@ pub fn resp_error(s: &str) -> Vec<u8> {
     resp_error_wire(msg)
 }
 
+/// An error whose text holds bytes that need not be UTF-8, such as a key or
+/// a consumer group's name. Redis puts those bytes into the message as they
+/// are; as in [`resp_error`], line breaks become spaces.
+pub fn resp_error_bytes(msg: &[u8]) -> Vec<u8> {
+    let msg: &[u8] = if msg.is_empty() { b"ERR" } else { msg };
+    // The error's code (its first word) is what INFO counts, and is text.
+    let code_end = memchr::memchr(b' ', msg).unwrap_or(msg.len());
+    crate::stats::record_error_reply_stats(std::str::from_utf8(&msg[..code_end]).unwrap_or("ERR"));
+    let mut out = Vec::with_capacity(msg.len() + 3);
+    out.push(b'-');
+    out.extend(
+        msg.iter()
+            .map(|&b| if matches!(b, b'\r' | b'\n') { b' ' } else { b }),
+    );
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
 /// Same wire format as [`resp_error`] without bumping error INFO stats (nested script wrappers).
 pub fn resp_error_wire(msg: &str) -> Vec<u8> {
     let msg = if msg.is_empty() { "ERR" } else { msg };

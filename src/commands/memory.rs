@@ -1,5 +1,5 @@
 use crate::commands::ctx::Ctx;
-use crate::commands::helpers::parse_utf8;
+
 use crate::commands::memory_layout as layout;
 use crate::member_set::MemberSet;
 use crate::read_lock;
@@ -76,10 +76,7 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "ERR wrong number of arguments for 'memory|usage' command",
         ));
     }
-    let key = match parse_utf8(cmd[2]) {
-        Some(k) => k,
-        None => return Some(resp_error("ERR key must be valid UTF-8")),
-    };
+    let key: &[u8] = cmd[2];
 
     // `SAMPLES count`, as Redis reads it: how many elements of a collection
     // are looked at, 5 by default; 0 is all of them. It divided by zero for

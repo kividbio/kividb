@@ -735,29 +735,34 @@ pub(super) fn exact_trim_args(
 /// been delivered, so a replica re-running them reaches a different pending
 /// list. Redis propagates this same explicit form.
 pub(super) fn claim_effect(
-    key: &str,
-    group: &str,
-    consumer: &str,
+    key: &[u8],
+    group: &[u8],
+    consumer: &[u8],
     id: &StreamId,
     delivered_at_ms: u64,
     delivery_count: u64,
 ) -> Vec<Vec<u8>> {
+    let (id, at, count) = (
+        id.to_string(),
+        delivered_at_ms.to_string(),
+        delivery_count.to_string(),
+    );
     [
-        "XCLAIM",
+        &b"XCLAIM"[..],
         key,
         group,
         consumer,
-        "0",
-        &id.to_string(),
-        "TIME",
-        &delivered_at_ms.to_string(),
-        "RETRYCOUNT",
-        &delivery_count.to_string(),
-        "FORCE",
-        "JUSTID",
+        b"0",
+        id.as_bytes(),
+        b"TIME",
+        at.as_bytes(),
+        b"RETRYCOUNT",
+        count.as_bytes(),
+        b"FORCE",
+        b"JUSTID",
     ]
     .iter()
-    .map(|s| s.as_bytes().to_vec())
+    .map(|s| s.to_vec())
     .collect()
 }
 
@@ -881,22 +886,23 @@ pub(super) fn entries_read_arg(entries_read: u64) -> String {
 
 /// The command that moves a group's read position on a replica.
 pub(super) fn setid_effect(
-    key: &str,
-    group: &str,
+    key: &[u8],
+    group: &[u8],
     last_id: &StreamId,
     entries_read: u64,
 ) -> Vec<Vec<u8>> {
+    let (last_id, entries_read) = (last_id.to_string(), entries_read_arg(entries_read));
     [
-        "XGROUP",
-        "SETID",
+        &b"XGROUP"[..],
+        b"SETID",
         key,
         group,
-        &last_id.to_string(),
-        "ENTRIESREAD",
-        &entries_read_arg(entries_read),
+        last_id.as_bytes(),
+        b"ENTRIESREAD",
+        entries_read.as_bytes(),
     ]
     .iter()
-    .map(|s| s.as_bytes().to_vec())
+    .map(|s| s.to_vec())
     .collect()
 }
 
@@ -1053,7 +1059,7 @@ mod tests {
             3
         );
         assert_eq!(s.entries.len(), 2);
-        assert_eq!(s.groups["g"].pel.len(), 2);
+        assert_eq!(s.groups[&b"g"[..]].pel.len(), 2);
         // Trimmed, not deleted: the mark `XDEL` leaves is where it was.
         assert_eq!(s.max_deleted_id, StreamId::min());
     }
@@ -1066,7 +1072,7 @@ mod tests {
             trim_stream(&mut s, &TrimTo::MinId(id(4)), TrimRefs::DelRef),
             3
         );
-        let pending: Vec<_> = s.groups["g"].pel.keys().cloned().collect();
+        let pending: Vec<_> = s.groups[&b"g"[..]].pel.keys().cloned().collect();
         assert_eq!(pending, vec![id(4)]);
     }
 
@@ -1222,11 +1228,18 @@ mod tests {
                 .join(" ")
         };
         assert_eq!(
-            text(claim_effect("s", "g", "c", &StreamId::new(7, 1), 1234, 3)),
+            text(claim_effect(
+                b"s",
+                b"g",
+                b"c",
+                &StreamId::new(7, 1),
+                1234,
+                3
+            )),
             "XCLAIM s g c 0 7-1 TIME 1234 RETRYCOUNT 3 FORCE JUSTID"
         );
         assert_eq!(
-            text(setid_effect("s", "g", &StreamId::new(7, 1), 9)),
+            text(setid_effect(b"s", b"g", &StreamId::new(7, 1), 9)),
             "XGROUP SETID s g 7-1 ENTRIESREAD 9"
         );
     }

@@ -216,7 +216,7 @@ fn parse_ts_options(tokens: &[&[u8]]) -> Result<TsOptions, Vec<u8>> {
 /// inserts the new ones. Takes a write lock on the index.
 fn update_label_index(
     ts_index: &SharedTsIndex,
-    key: &str,
+    key: &[u8],
     old_labels: &ahash::AHashMap<String, String>,
     new_labels: &[(String, String)],
 ) {
@@ -225,7 +225,7 @@ fn update_label_index(
     }
     let mut idx = write_lock!(ts_index);
     // The index holds names (`key_bytes::text_of`), as its rebuild does.
-    let name = crate::key_bytes::text_of(key.as_bytes());
+    let name = crate::key_bytes::text_of(key);
     let key: &str = &name;
 
     // Remove key from all old label buckets
@@ -306,7 +306,7 @@ type Series = Arc<RwLock<TsInner>>;
 
 /// The series at `key`, created empty if there is nothing there. The flag
 /// says whether it was created.
-fn series_for_append(ctx: &Ctx, key: &str) -> Result<(Series, bool), Vec<u8>> {
+fn series_for_append(ctx: &Ctx, key: &[u8]) -> Result<(Series, bool), Vec<u8>> {
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     let mut map = write_lock!(shard);
     match map.get(key) {
@@ -338,7 +338,7 @@ fn series_for_append(ctx: &Ctx, key: &str) -> Result<(Series, bool), Vec<u8>> {
 /// sample is added to it after; the bucket still open is reported only to
 /// `LATEST` ([`ts_query::open_bucket`]). The open bucket was written as
 /// samples came, so a reader saw partial values as final (#128).
-fn after_append(ctx: &Ctx, key: &str, series: &Series, ts: u64) {
+fn after_append(ctx: &Ctx, key: &[u8], series: &Series, ts: u64) {
     let updates: Vec<(String, u64, f64)> = {
         let source = series.read();
         let Some(&newest) = source.samples.keys().next_back() else {
@@ -348,8 +348,7 @@ fn after_append(ctx: &Ctx, key: &str, series: &Series, ts: u64) {
             .rules
             .iter()
             .filter(|rule| {
-                rule.bucket_duration > 0
-                    && *rule.dest_key != *crate::key_bytes::text_of(key.as_bytes())
+                rule.bucket_duration > 0 && *rule.dest_key != *crate::key_bytes::text_of(key)
             })
             .filter_map(|rule| {
                 let bucket_of =
@@ -434,10 +433,7 @@ fn ts_create(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "ERR wrong number of arguments for 'ts.create' command",
         ));
     }
-    let key = match std::str::from_utf8(cmd[1]) {
-        Ok(k) => k.to_string(),
-        Err(_) => return Some(resp_error("ERR key must be valid UTF-8")),
-    };
+    let key: Vec<u8> = cmd[1].to_vec();
 
     let (retention, chunk_size, dup_policy, labels) = match parse_ts_options(&cmd[2..]) {
         Ok(v) => v,
@@ -448,7 +444,7 @@ fn ts_create(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let shard = store::get_shard(db, &key);
     let mut map = write_lock!(shard);
 
-    if map.contains_key(key.as_str()) {
+    if map.contains_key(key.as_slice()) {
         return Some(resp_error("TSDB: key already exists"));
     }
 
@@ -476,10 +472,7 @@ fn ts_alter(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "ERR wrong number of arguments for 'ts.alter' command",
         ));
     }
-    let key = match std::str::from_utf8(cmd[1]) {
-        Ok(k) => k.to_string(),
-        Err(_) => return Some(resp_error("ERR key must be valid UTF-8")),
-    };
+    let key: Vec<u8> = cmd[1].to_vec();
 
     let (retention, chunk_size, dup_policy, new_labels) = match parse_ts_options(&cmd[2..]) {
         Ok(v) => v,
@@ -490,7 +483,7 @@ fn ts_alter(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let shard = store::get_shard(db_ref, &key);
     let map = write_lock!(shard);
 
-    match map.get(key.as_str()) {
+    match map.get(key.as_slice()) {
         Some(ValueRef::TimeSeries(inner)) => {
             let mut ts = inner.write();
             let old_labels = ts.labels.clone();
@@ -538,10 +531,7 @@ fn ts_add(ctx: &mut Ctx) -> Option<Vec<u8>> {
         ));
     }
 
-    let key = match std::str::from_utf8(cmd[1]) {
-        Ok(k) => k.to_string(),
-        Err(_) => return Some(resp_error("ERR key must be valid UTF-8")),
-    };
+    let key: Vec<u8> = cmd[1].to_vec();
 
     let ts_str = match std::str::from_utf8(cmd[2]) {
         Ok(s) => s,
@@ -623,10 +613,7 @@ fn ts_madd(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // One reply per sample: its timestamp, or the error for that sample alone.
     let mut results: Vec<Vec<u8>> = Vec::with_capacity((cmd.len() - 1) / 3);
     for triple in cmd[1..].as_chunks::<3>().0 {
-        let Ok(key) = std::str::from_utf8(triple[0]) else {
-            results.push(resp_error("ERR invalid key"));
-            continue;
-        };
+        let key: &[u8] = triple[0];
         let ts_str = std::str::from_utf8(triple[1]).unwrap_or("bad");
         let timestamp: u64 = if ts_str == "*" {
             TsInner::now_ms()
@@ -690,10 +677,7 @@ fn ts_incrby(ctx: &mut Ctx, sign: f64) -> Option<Vec<u8>> {
         return Some(resp_error("ERR wrong number of arguments"));
     }
 
-    let key = match std::str::from_utf8(cmd[1]) {
-        Ok(k) => k.to_string(),
-        Err(_) => return Some(resp_error("ERR key must be valid UTF-8")),
-    };
+    let key: Vec<u8> = cmd[1].to_vec();
 
     let delta: f64 = match std::str::from_utf8(cmd[2])
         .ok()
@@ -767,10 +751,7 @@ fn ts_del(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "ERR wrong number of arguments for 'ts.del' command",
         ));
     }
-    let key = match std::str::from_utf8(cmd[1]) {
-        Ok(k) => k.to_string(),
-        Err(_) => return Some(resp_error("ERR key must be valid UTF-8")),
-    };
+    let key: Vec<u8> = cmd[1].to_vec();
     let from: u64 = match std::str::from_utf8(cmd[2])
         .ok()
         .and_then(|s| s.parse().ok())
@@ -790,7 +771,7 @@ fn ts_del(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let shard = store::get_shard(db, &key);
     let map = read_lock!(shard);
 
-    match map.get(key.as_str()) {
+    match map.get(key.as_slice()) {
         Some(ValueRef::TimeSeries(inner)) => {
             let mut ts = inner.write();
             // BTreeMap has no retain-with-range, so we collect keys to remove first
@@ -823,17 +804,14 @@ fn ts_get(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "ERR wrong number of arguments for 'ts.get' command",
         ));
     }
-    let key = match std::str::from_utf8(cmd[1]) {
-        Ok(k) => k,
-        Err(_) => return Some(resp_error("ERR key must be valid UTF-8")),
-    };
+    let key: &[u8] = cmd[1];
 
     let latest = match cmd.get(2) {
         None => false,
         Some(arg) if arg.eq_ignore_ascii_case(b"LATEST") && cmd.len() == 3 => true,
         Some(_) => return Some(resp_error("ERR syntax error")),
     };
-    let inner = match ts_query::series_at(ctx, key.as_bytes()) {
+    let inner = match ts_query::series_at(ctx, key) {
         Ok(Some(inner)) => inner,
         Ok(None) => return Some(resp_null_bulk()),
         Err(e) => return Some(e),
@@ -841,7 +819,7 @@ fn ts_get(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // A compaction's bucket still open, with `LATEST` (#128).
     if latest
         && let Some((at, value)) =
-            ts_query::open_bucket(ctx, &inner, &crate::key_bytes::text_of(key.as_bytes()))
+            ts_query::open_bucket(ctx, &inner, &crate::key_bytes::text_of(key))
     {
         return Some(ts_query::sample_reply(resp, at, value));
     }
@@ -979,10 +957,7 @@ fn ts_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "ERR wrong number of arguments for 'ts.info' command",
         ));
     }
-    let key = match std::str::from_utf8(cmd[1]) {
-        Ok(k) => k,
-        Err(_) => return Some(resp_error("ERR key must be valid UTF-8")),
-    };
+    let key: &[u8] = cmd[1];
 
     let db = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db, key);
@@ -1095,14 +1070,8 @@ fn ts_createrule(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "ERR wrong number of arguments for 'ts.createrule' command",
         ));
     }
-    let src_key = match std::str::from_utf8(cmd[1]) {
-        Ok(k) => k.to_string(),
-        Err(_) => return Some(resp_error("ERR invalid source key")),
-    };
-    let dest_key = match std::str::from_utf8(cmd[2]) {
-        Ok(k) => k.to_string(),
-        Err(_) => return Some(resp_error("ERR invalid dest key")),
-    };
+    let src_key: Vec<u8> = cmd[1].to_vec();
+    let dest_key: Vec<u8> = cmd[2].to_vec();
     // cmd[3] is "AGGREGATION"
     let agg = match TsAggregation::parse(std::str::from_utf8(cmd[4]).unwrap_or("")) {
         Some(a) => a,
@@ -1124,7 +1093,7 @@ fn ts_createrule(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "TSDB: the source key and destination key should be different",
         ));
     }
-    let dest = match ts_query::series_at(ctx, dest_key.as_bytes()) {
+    let dest = match ts_query::series_at(ctx, dest_key.as_slice()) {
         Ok(Some(dest)) => dest,
         Ok(None) => return Some(resp_error("TSDB: the key does not exist")),
         Err(e) => return Some(e),
@@ -1143,7 +1112,7 @@ fn ts_createrule(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
     // Names (`key_bytes::text_of`), as a snapshot keeps them.
     let rule = CompactionRule {
-        dest_key: crate::key_bytes::text_of(dest_key.as_bytes()).into_owned(),
+        dest_key: crate::key_bytes::text_of(dest_key.as_slice()).into_owned(),
         aggregation: agg,
         bucket_duration,
         align_timestamp: align,
@@ -1153,7 +1122,7 @@ fn ts_createrule(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let shard = store::get_shard(db, &src_key);
     let map = write_lock!(shard);
 
-    match map.get(src_key.as_str()) {
+    match map.get(src_key.as_slice()) {
         Some(ValueRef::TimeSeries(inner)) => {
             let mut ts = inner.write();
             // Disallow duplicate destination rules
@@ -1163,7 +1132,7 @@ fn ts_createrule(ctx: &mut Ctx) -> Option<Vec<u8>> {
             ts.rules.push(rule);
             drop(ts);
             drop(map);
-            dest.write().source = Some(crate::key_bytes::text_of(src_key.as_bytes()).into_owned());
+            dest.write().source = Some(crate::key_bytes::text_of(src_key.as_slice()).into_owned());
             Some(resp_simple("OK"))
         }
         Some(_) => Some(resp_error(
@@ -1182,34 +1151,28 @@ fn ts_deleterule(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "ERR wrong number of arguments for 'ts.deleterule' command",
         ));
     }
-    let src_key = match std::str::from_utf8(cmd[1]) {
-        Ok(k) => k.to_string(),
-        Err(_) => return Some(resp_error("ERR invalid source key")),
-    };
-    let dest_key = match std::str::from_utf8(cmd[2]) {
-        Ok(k) => k.to_string(),
-        Err(_) => return Some(resp_error("ERR invalid dest key")),
-    };
+    let src_key: Vec<u8> = cmd[1].to_vec();
+    let dest_key: Vec<u8> = cmd[2].to_vec();
 
     let db = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db, &src_key);
     let map = write_lock!(shard);
 
-    match map.get(src_key.as_str()) {
+    match map.get(src_key.as_slice()) {
         Some(ValueRef::TimeSeries(inner)) => {
             let mut ts = inner.write();
             let before = ts.rules.len();
-            let dest_name = crate::key_bytes::text_of(dest_key.as_bytes());
+            let dest_name = crate::key_bytes::text_of(dest_key.as_slice());
             ts.rules.retain(|r| *r.dest_key != *dest_name);
             if ts.rules.len() == before {
                 Some(resp_error("TSDB: compaction rule does not exist"))
             } else {
                 drop(ts);
                 drop(map);
-                if let Ok(Some(dest)) = ts_query::series_at(ctx, dest_key.as_bytes()) {
+                if let Ok(Some(dest)) = ts_query::series_at(ctx, dest_key.as_slice()) {
                     let mut dest = dest.write();
                     if dest.source.as_deref()
-                        == Some(&*crate::key_bytes::text_of(src_key.as_bytes()))
+                        == Some(&*crate::key_bytes::text_of(src_key.as_slice()))
                     {
                         dest.source = None;
                     }

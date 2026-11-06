@@ -267,7 +267,7 @@ fn geohash_string(lon: f64, lat: f64) -> String {
 
 // ── Sorted set helpers ────────────────────────────────────────────────────────
 
-fn get_or_create_zset(ctx: &mut Ctx, key: &str) -> Result<Arc<RwLock<SortedSetInner>>, Vec<u8>> {
+fn get_or_create_zset(ctx: &mut Ctx, key: &[u8]) -> Result<Arc<RwLock<SortedSetInner>>, Vec<u8>> {
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
     let mut map = write_lock!(shard);
@@ -310,10 +310,7 @@ fn cmd_geoadd(ctx: &mut Ctx) -> Vec<u8> {
         return resp_error("ERR wrong number of arguments for 'geoadd' command");
     }
 
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = cmd[1].to_vec();
 
     // Parse optional flags before the coordinate triples
     let mut i = 2usize;
@@ -414,10 +411,7 @@ fn cmd_geodist(ctx: &mut Ctx) -> Vec<u8> {
         return resp_error("ERR wrong number of arguments for 'geodist' command");
     }
 
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
     let unit = if cmd.len() == 5 {
         std::str::from_utf8(cmd[4]).unwrap_or("M")
     } else {
@@ -487,10 +481,7 @@ fn cmd_geopos(ctx: &mut Ctx) -> Vec<u8> {
         return resp_error("ERR wrong number of arguments for 'geopos' command");
     }
 
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     if is_expired(ctx.store, *ctx.selected_db, key) {
         expire_on_read(ctx.store, *ctx.selected_db, key);
@@ -542,10 +533,7 @@ fn cmd_geohash(ctx: &mut Ctx) -> Vec<u8> {
         return resp_error("ERR wrong number of arguments for 'geohash' command");
     }
 
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     if is_expired(ctx.store, *ctx.selected_db, key) {
         expire_on_read(ctx.store, *ctx.selected_db, key);
@@ -848,10 +836,9 @@ fn geo_search(ctx: &mut Ctx, form: Form, read_only: bool) -> Vec<u8> {
     };
     let syntax = || resp_error("ERR syntax error");
     let source_at = if form == Form::SearchStore { 2 } else { 1 };
-    let Some(key) = cmd.get(source_at).and_then(|raw| parse_utf8(raw)) else {
-        return resp_error("ERR key must be valid UTF-8");
+    let Some(key) = cmd.get(source_at).map(|raw| raw.to_vec()) else {
+        return syntax();
     };
-    let key = key.to_string();
 
     // The set, if there is one. (Its members are looked at under its lock,
     // which the search takes for as long as it runs.)
@@ -859,7 +846,7 @@ fn geo_search(ctx: &mut Ctx, form: Form, read_only: bool) -> Vec<u8> {
     let zset = {
         let shard = store::get_shard(&ctx.store[*ctx.selected_db], &key);
         let map = read_lock!(shard);
-        match map.get(key.as_str()).filter(|_| !gone) {
+        match map.get(key.as_slice()).filter(|_| !gone) {
             Some(ValueRef::SortedSet(zset)) => Some(Arc::clone(zset)),
             Some(_) => {
                 return resp_error(
@@ -880,7 +867,7 @@ fn geo_search(ctx: &mut Ctx, form: Form, read_only: bool) -> Vec<u8> {
     // they are.
     let mut centre: Option<(f64, f64)> = None;
     let mut shape: Option<(Shape, f64)> = None;
-    let mut store_key: Option<String> = None;
+    let mut store_key: Option<Vec<u8>> = None;
     let options_at = match form {
         Form::Radius => {
             if cmd.len() < 6 {
@@ -908,7 +895,7 @@ fn geo_search(ctx: &mut Ctx, form: Form, read_only: bool) -> Vec<u8> {
         }
         Form::Search => 2,
         Form::SearchStore => {
-            store_key = parse_utf8(cmd[1]).map(str::to_string);
+            store_key = Some(cmd[1].to_vec());
             3
         }
     };
@@ -960,7 +947,7 @@ fn geo_search(ctx: &mut Ctx, form: Form, read_only: bool) -> Vec<u8> {
                 i += 1;
             }
             b"STORE" | b"STOREDIST" if left >= 1 && !read_only && !searching => {
-                store_key = parse_utf8(args[i + 1]).map(str::to_string);
+                store_key = Some(args[i + 1].to_vec());
                 store_dist = word == b"STOREDIST";
                 i += 1;
             }

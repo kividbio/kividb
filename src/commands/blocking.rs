@@ -63,7 +63,7 @@ use tokio::sync::oneshot;
 pub struct BlockingWait {
     /// One registered receiver per key the command is waiting on. Raced against
     /// each other; the first delivery wins and the rest are cancelled.
-    rxs: Vec<(String, oneshot::Receiver<Value>)>,
+    rxs: Vec<(Vec<u8>, oneshot::Receiver<Value>)>,
     /// `None` means "wait forever" (`timeout 0`).
     timeout: Option<Duration>,
     /// Carried across the park and handed back on resume. See [`BlockState`].
@@ -185,7 +185,7 @@ const DEFINITE: u8 = 0x01;
 ///
 /// `XREAD`/`XREADGROUP` use a zero-length sentinel value (see
 /// `WaitTable::notify_stream_waiters`) and only care whether this is `Some`.
-pub type Delivery = Option<(String, Value)>;
+pub type Delivery = Option<(Vec<u8>, Value)>;
 
 /// Per-command blocking state, carried on [`crate::commands::ctx::Ctx`].
 #[derive(Default)]
@@ -342,7 +342,7 @@ pub fn timeout_from_ms(ms: u64) -> Option<Duration> {
 /// the registrations — the handler must not try to use them.
 pub fn park_with_state(
     ctx: &mut crate::commands::ctx::Ctx,
-    rxs: Vec<(String, oneshot::Receiver<Value>)>,
+    rxs: Vec<(Vec<u8>, oneshot::Receiver<Value>)>,
     timeout: Option<Duration>,
     state: Option<BlockState>,
 ) -> ParkOutcome {
@@ -398,9 +398,9 @@ pub fn park_with_state(
 /// been waiting longer (see below).
 pub fn wait_for_keys(
     ctx: &mut crate::commands::ctx::Ctx,
-    keys: &[String],
+    keys: &[Vec<u8>],
     timeout: Option<Duration>,
-    mut attempt: impl FnMut(&mut crate::commands::ctx::Ctx, &[String]) -> Option<Vec<u8>>,
+    mut attempt: impl FnMut(&mut crate::commands::ctx::Ctx, &[Vec<u8>]) -> Option<Vec<u8>>,
     empty: impl Fn() -> Vec<u8>,
 ) -> Vec<u8> {
     let gone = client_gone(ctx);
@@ -424,14 +424,14 @@ pub fn wait_for_keys(
     }
     let timed_out = matches!(resumed, Some(None));
     // The key this client was woken for, if it was.
-    let woken_for: Option<String> = match &resumed {
+    let woken_for: Option<Vec<u8>> = match &resumed {
         Some(Some((key, _))) => Some(key.clone()),
         _ => None,
     };
 
     // Stand in line before looking, so a write that lands between the look
     // and the park still wakes us.
-    let rxs: Vec<(String, oneshot::Receiver<Value>)> = if timed_out {
+    let rxs: Vec<(Vec<u8>, oneshot::Receiver<Value>)> = if timed_out {
         Vec::new()
     } else {
         keys.iter()
@@ -465,11 +465,11 @@ pub fn wait_for_keys(
     // On the others it waits its turn, which comes when those ahead have
     // looked — and they are made to look.
     let can_wait = ctx.blocking.is_some() && !timed_out && remaining_time(deadline).is_some();
-    let open: Vec<String> = keys
+    let open: Vec<Vec<u8>> = keys
         .iter()
         .filter(|key| {
             let theirs = can_wait
-                && woken_for.as_deref() != Some(key.as_str())
+                && woken_for.as_deref() != Some(key.as_slice())
                 && ctx.wait_table.someone_ahead(key, &ticket)
                 && has_elements(ctx, key);
             if theirs {
@@ -572,7 +572,7 @@ pub(crate) fn remaining_time(deadline: Option<Instant>) -> Option<Option<Duratio
 }
 
 /// Whether `key` holds anything a blocked client could take.
-fn has_elements(ctx: &crate::commands::ctx::Ctx, key: &str) -> bool {
+fn has_elements(ctx: &crate::commands::ctx::Ctx, key: &[u8]) -> bool {
     let shard = crate::store::get_shard(&ctx.store[*ctx.selected_db], key);
     crate::read_lock!(shard)
         .get(key)
@@ -721,7 +721,7 @@ mod tests {
     use std::sync::Arc;
 
     fn wait_on(
-        rxs: Vec<(String, oneshot::Receiver<Value>)>,
+        rxs: Vec<(Vec<u8>, oneshot::Receiver<Value>)>,
         timeout: Option<Duration>,
     ) -> Delivery {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -749,9 +749,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
             let _ = tx.send(val);
         });
-        let got = wait_on(vec![("k".to_string(), rx)], None);
+        let got = wait_on(vec![(b"k".to_vec(), rx)], None);
         let (key, val) = got.expect("delivery must arrive, not time out");
-        assert_eq!(key, "k");
+        assert_eq!(key, b"k");
         assert_eq!(val.as_ref(), b"hello");
     }
 
@@ -759,7 +759,7 @@ mod tests {
     fn timeout_yields_no_delivery() {
         let (_tx, rx) = oneshot::channel();
         // `_tx` is held alive, so the only way out is the timeout.
-        let got = wait_on(vec![("k".to_string(), rx)], Some(Duration::from_millis(30)));
+        let got = wait_on(vec![(b"k".to_vec(), rx)], Some(Duration::from_millis(30)));
         assert!(got.is_none(), "an elapsed timeout must produce no delivery");
     }
 
@@ -776,13 +776,13 @@ mod tests {
         });
         let got = wait_on(
             vec![
-                ("k1".to_string(), rx1),
-                ("k2".to_string(), rx2),
-                ("k3".to_string(), rx3),
+                (b"k1".to_vec(), rx1),
+                (b"k2".to_vec(), rx2),
+                (b"k3".to_vec(), rx3),
             ],
             None,
         );
-        assert_eq!(got.expect("k2 fired").0, "k2");
+        assert_eq!(got.expect("k2 fired").0, b"k2");
     }
 
     /// Every registration being cancelled must not hang a `timeout 0` wait
@@ -791,7 +791,7 @@ mod tests {
     fn all_senders_dropped_resolves_rather_than_hanging() {
         let (tx, rx) = oneshot::channel::<Value>();
         drop(tx);
-        let got = wait_on(vec![("k".to_string(), rx)], None);
+        let got = wait_on(vec![(b"k".to_vec(), rx)], None);
         assert!(got.is_none());
     }
 }

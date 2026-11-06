@@ -6037,13 +6037,11 @@ fn a_master_stopped_cleanly_without_an_aof_carries_on_as_before() {
     assert!(!log.contains("came back without its dataset"), "{log}");
 }
 
-/// A key that is not text (from an RDB file: no command writes one until
-/// #437's third step) in a slot an atomic migration moves: the destination
-/// refuses its `RESTORE`, as it refuses such a key from any command yet.
-/// The import does not complete: it says why, in `last_error`, and tries
-/// again, and the key stays where it was, whole, until it is canceled.
+/// A key that is not text in a slot an atomic migration moves. The
+/// destination's `RESTORE` refused it, and the import failed and tried again
+/// until it was canceled. It moves now, whole, as any key does.
 #[test]
-fn a_slot_migration_of_a_key_that_is_not_text_fails_loudly_and_keeps_it() {
+fn a_slot_migration_moves_a_key_that_is_not_text() {
     // A key that is not text, in a slot the first node owns (0..=8191).
     let key: Vec<u8> = (0u32..)
         .map(|i| {
@@ -6079,29 +6077,13 @@ fn a_slot_migration_of_a_key_that_is_not_text_fails_loudly_and_keeps_it() {
             .array()[0]
             .clone()
     };
-    wait_until(
-        "the import to fail an attempt",
-        Duration::from_secs(60),
-        || {
-            let task = status();
-            assert_ne!(task_field(&task, "state").text(), "completed", "{task:?}");
-            task_field(&task, "retries").int() >= 1
-        },
-    );
-    let task = status();
-    let error = task_field(&task, "last_error").text();
-    assert!(!error.is_empty(), "{task:?}");
+    wait_until("the import to complete", Duration::from_secs(60), || {
+        task_field(&status(), "state").text() == "completed"
+    });
 
-    // Still here, in its slot, and not at the destination.
-    let mut s = src.conn();
-    assert_eq!(s.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 1);
-    assert_eq!(s.cmd(&["DBSIZE"]).int(), 1);
-    assert_eq!(dst.conn().cmd(&["DBSIZE"]).int(), 0);
-    assert_eq!(
-        dst.conn()
-            .cmd(&["CLUSTER", "MIGRATION", "CANCEL", "ID", &task_id])
-            .int(),
-        1
-    );
-    assert_eq!(s.cmd(&["DBSIZE"]).int(), 1);
+    // At the destination, whole, in its slot; gone from the source.
+    let mut d = dst.conn();
+    assert_eq!(d.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 1);
+    assert_eq!(d.cmd_bytes(&[b"GET", &key]), Resp::Bulk(b"value".to_vec()));
+    assert_eq!(src.conn().cmd(&["DBSIZE"]).int(), 0);
 }

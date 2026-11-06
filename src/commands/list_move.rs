@@ -156,7 +156,7 @@ fn pop_n(list: &mut VecDeque<Element>, n: usize, from_left: bool) -> Vec<Element
 }
 
 /// Look `key` up as a list. `Ok(None)` when it does not exist.
-fn list_at(ctx: &Ctx, key: &str) -> Result<Option<List>, Vec<u8>> {
+fn list_at(ctx: &Ctx, key: &[u8]) -> Result<Option<List>, Vec<u8>> {
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     match read_lock!(shard).get(key) {
         None => Ok(None),
@@ -178,8 +178,8 @@ pub(super) struct Moved {
 /// nothing changed.
 pub(super) fn move_elements(
     ctx: &Ctx,
-    src: &str,
-    dst: &str,
+    src: &[u8],
+    dst: &[u8],
     spec: &MoveSpec,
 ) -> Result<Option<Moved>, Vec<u8>> {
     let db = *ctx.selected_db;
@@ -276,14 +276,14 @@ pub(super) fn move_elements(
 }
 
 /// The `del` event of a source a move emptied, after the move's own events.
-fn tell_source_deleted(ctx: &Ctx, moved: &Moved, src: &str) {
+fn tell_source_deleted(ctx: &Ctx, moved: &Moved, src: &[u8]) {
     if moved.source_deleted {
         notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "del", src);
     }
 }
 
 /// Whether `key` holds something, and it is not a list.
-pub(super) fn is_not_a_list(ctx: &Ctx, key: &str) -> bool {
+pub(super) fn is_not_a_list(ctx: &Ctx, key: &[u8]) -> bool {
     list_at(ctx, key).is_err()
 }
 
@@ -291,10 +291,8 @@ fn elements_reply(elements: &[Element]) -> Vec<u8> {
     resp_array(elements.iter().map(|e| resp_bulk(e)).collect())
 }
 
-fn key_arg(arg: &[u8]) -> Result<String, Vec<u8>> {
-    parse_utf8(arg)
-        .map(str::to_string)
-        .ok_or_else(|| resp_error("ERR must be valid UTF-8"))
+fn key_arg(arg: &[u8]) -> Result<Vec<u8>, Vec<u8>> {
+    Ok(arg.to_vec())
 }
 
 /// `LMOVE` / `RPOPLPUSH`, and the non-blocking half of `BLMOVE` /
@@ -302,8 +300,8 @@ fn key_arg(arg: &[u8]) -> Result<String, Vec<u8>> {
 /// source had nothing to give.
 pub(super) fn move_one(
     ctx: &Ctx,
-    src: &str,
-    dst: &str,
+    src: &[u8],
+    dst: &[u8],
     from_left: bool,
     to_left: bool,
 ) -> Result<Option<Element>, Vec<u8>> {
