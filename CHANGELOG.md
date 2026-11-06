@@ -7,6 +7,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **apt and dnf repositories.** `https://packages.kividb.io` serves signed
+  apt (Debian, Ubuntu) and dnf (Fedora, RHEL and compatibles, Amazon Linux
+  2023) repositories of the `.deb` and `.rpm` packages, for `amd64` and
+  `arm64`, so `apt install kividb` and `dnf install kividb` work and
+  upgrades come with the system's own. The apt metadata, the dnf metadata
+  and every RPM are signed with one key. The newest 20 releases stay in
+  them, so a version can be pinned or gone back to. The release workflow
+  adds each stable release once its GitHub Release is published; release
+  candidates are never added. See [docs/INSTALL.md](docs/INSTALL.md).
+- **The packages say which glibc they need.** The `.deb` depends on
+  `libc6 (>= 2.34)` and the `.rpm` on `glibc >= 2.34`, the version the
+  binary is built against. On an older system (Debian 11, Ubuntu 20.04,
+  RHEL 8, Amazon Linux 2) the package manager now refuses them, rather than
+  installing a server that cannot start.
+
 ### Changed
 
 - **Source archives are small again.** The tarball GitHub makes of the

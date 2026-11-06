@@ -1,0 +1,237 @@
+name: Package repositories
+
+# Adds a stable release's .deb and .rpm packages to the apt and dnf
+# repositories at https://packages.kividb.io and signs them. The site is the
+# GitHub Pages site of kividbio/packages; packaging/repos/build-repos.sh builds
+# it, and docs/INSTALL.md says how it is used.
+#
+# release.yml calls this once the GitHub Release is published, so the packages
+# come from the release itself and have their attestations. It can also be
+# run by hand for a release that is already out: with dry_run (the default
+# then) it builds the repositories into an artifact and publishes nothing,
+# signing with a throwaway key if the real one is not set up yet.
+#
+# Secrets (the job is skipped, with a notice, while either is missing, so a
+# release never fails for want of them):
+#   PACKAGES_GPG_PRIVATE_KEY  the signing key, ASCII-armored
+#   PACKAGES_GPG_PASSPHRASE   its passphrase, if it has one
+#   PACKAGES_DEPLOY_KEY       an SSH deploy key with write access to
+#                             kividbio/packages, and to nothing else
+# Variable (optional): PACKAGES_GPG_FINGERPRINT, the fingerprint the imported
+# key must have.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+      dry_run:
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "A released tag whose packages to add (e.g. v1.2.0)"
+        required: true
+      dry_run:
+        description: "Build the repositories into an artifact only; publish nothing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  attestations: read
+
+# Two releases in a row must not both rewrite the site at once.
+concurrency:
+  group: package-repos
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ inputs.tag }}
+  DRY_RUN: ${{ inputs.dry_run }}
+  SITE_REPO: kividbio/packages
+  BASE_URL: https://packages.kividb.io
+  # Versions kept per package and architecture. A release adds about 25 MB
+  # (four packages of about 6 MB), so 20 keep the site near 500 MB, inside
+  # GitHub Pages' 1 GB.
+  KEEP: "20"
+
+jobs:
+  repos:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check the tag and the secrets
+        id: cfg
+        env:
+          HAVE_GPG: ${{ secrets.PACKAGES_GPG_PRIVATE_KEY != '' }}
+          HAVE_DEPLOY: ${{ secrets.PACKAGES_DEPLOY_KEY != '' }}
+        run: |
+          set -euo pipefail
+          out() { echo "$1" >> "$GITHUB_OUTPUT"; }
+          case "$TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::'$TAG' is not a release tag (vX.Y.Z)"; exit 1 ;;
+          esac
+          case "$TAG" in
+            *-*)
+              echo "::notice::$TAG is a release candidate; candidates are not added to the package repositories."
+              out "run=false"
+              exit 0
+              ;;
+          esac
+          if [ "$DRY_RUN" = "true" ]; then
+            out "run=true"
+            out "publish=false"
+            if [ "$HAVE_GPG" = "true" ]; then
+              out "throwaway=false"
+            else
+              echo "::notice::PACKAGES_GPG_PRIVATE_KEY is not set: this dry run signs with a throwaway key."
+              out "throwaway=true"
+            fi
+            exit 0
+          fi
+          if [ "$HAVE_GPG" != "true" ] || [ "$HAVE_DEPLOY" != "true" ]; then
+            echo "::notice::Package repositories skipped: set the PACKAGES_GPG_PRIVATE_KEY and PACKAGES_DEPLOY_KEY secrets to publish them (docs/INSTALL.md, 'Maintainers')."
+            out "run=false"
+            exit 0
+          fi
+          out "run=true"
+          out "publish=true"
+          out "throwaway=false"
+
+      # The build script and docs come from this workflow's own commit, not
+      # the tag: a dry run for v1.2.0 runs before the tag had them.
+      - uses: actions/checkout@v4
+        if: steps.cfg.outputs.run == 'true'
+        with:
+          path: kividb
+          persist-credentials: false
+
+      - name: Install the repository tools
+        if: steps.cfg.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends apt-utils createrepo-c rpm gnupg
+          createrepo_c --version
+          rpmsign --version
+
+      - name: Import the signing key
+        if: steps.cfg.outputs.run == 'true'
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.PACKAGES_GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.PACKAGES_GPG_PASSPHRASE }}
+          WANT_FPR: ${{ vars.PACKAGES_GPG_FINGERPRINT }}
+          THROWAWAY: ${{ steps.cfg.outputs.throwaway }}
+        run: |
+          set -euo pipefail
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -m 700 "$GNUPGHOME"
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+          if [ "$THROWAWAY" = "true" ]; then
+            gpg --batch --passphrase '' --quick-gen-key \
+              "KiviDB Packages DRY RUN <packages@kividb.io>" rsa4096 sign 1d
+          else
+            printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
+            if [ -n "$GPG_PASSPHRASE" ]; then
+              # Unlock it once in the agent, so gpg and rpmsign sign with no
+              # prompt.
+              echo allow-preset-passphrase >> "$GNUPGHOME/gpg-agent.conf"
+              gpgconf --kill gpg-agent
+              gpg-connect-agent /bye
+              for grip in $(gpg --batch --with-colons --with-keygrip --list-secret-keys | awk -F: '$1 == "grp" { print $10 }'); do
+                /usr/lib/gnupg/gpg-preset-passphrase --preset -P "$GPG_PASSPHRASE" "$grip"
+              done
+            fi
+          fi
+          fpr="$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')"
+          if [ -n "$WANT_FPR" ] && [ "$THROWAWAY" != "true" ] && [ "$fpr" != "${WANT_FPR// /}" ]; then
+            echo "::error::the signing key is $fpr, not PACKAGES_GPG_FINGERPRINT ($WANT_FPR)"
+            exit 1
+          fi
+          echo "GPG_KEY=$fpr" >> "$GITHUB_ENV"
+          echo "signing key: $fpr"
+
+      - name: Download the release's packages
+        if: steps.cfg.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir incoming
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D incoming \
+            -p 'kividb_*.deb' -p 'kividb.*.rpm' -p SHA256SUMS.txt
+          cd incoming
+          grep -E ' (\./)?(kividb_[a-z0-9]+\.deb|kividb\.[a-z0-9_]+\.rpm)$' SHA256SUMS.txt | sha256sum -c -
+          rm SHA256SUMS.txt
+          # Built by this repository's release workflow, from the tag.
+          for f in *.deb *.rpm; do
+            gh attestation verify "$f" -R "$GITHUB_REPOSITORY" >/dev/null
+            echo "attested: $f"
+          done
+          ls -l
+
+      # Published: the site's own repository, to push to. A dry run starts
+      # from what is published now, read-only, or from nothing.
+      - name: Check out the site
+        if: steps.cfg.outputs.publish == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SITE_REPO }}
+          ssh-key: ${{ secrets.PACKAGES_DEPLOY_KEY }}
+          ref: main
+          path: site
+      - name: Fetch the published site (dry run)
+        if: steps.cfg.outputs.run == 'true' && steps.cfg.outputs.publish != 'true'
+        run: |
+          git clone --depth 1 "https://github.com/${SITE_REPO}.git" site 2>/dev/null \
+            || { echo "no published site yet: starting from nothing"; mkdir site; }
+
+      - name: Add the packages and sign the repositories
+        if: steps.cfg.outputs.run == 'true'
+        run: bash kividb/packaging/repos/build-repos.sh site incoming
+
+      # The site is one commit, replaced each time: every package version ever
+      # added would otherwise stay in the git history, which GitHub Pages
+      # serves from and which counts against the repository's size.
+      - name: Publish
+        if: steps.cfg.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          cd site
+          git checkout -q --orphan site
+          git add -A
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "KiviDB ${TAG#v} packages (from ${GITHUB_REPOSITORY}@${GITHUB_SHA::12})"
+          git push --force origin HEAD:main
+          echo "Published. GitHub Pages serves it at ${BASE_URL} within a few minutes."
+
+      - name: Check that the site serves the new version
+        if: steps.cfg.outputs.publish == 'true'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          ver="${TAG#v}"
+          for _ in $(seq 1 30); do
+            if curl -fsS "${BASE_URL}/deb/dists/stable/main/binary-amd64/Packages" | grep -qx "Version: ${ver}"; then
+              echo "${BASE_URL} serves kividb ${ver}"
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "::warning::${BASE_URL} does not list kividb ${ver} after 10 minutes; check the Pages deployment of ${SITE_REPO}."
+          exit 1
+
+      - name: Upload the built repositories (dry run)
+        if: steps.cfg.outputs.run == 'true' && steps.cfg.outputs.publish != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-repos-${{ inputs.tag }}
+          path: |
+            site
+            !site/.git
+          include-hidden-files: true
+          retention-days: 7

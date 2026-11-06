@@ -331,15 +331,31 @@ the internet without a password.
 
 ### Linux packages
 
-The release page has `.deb` and `.rpm` packages for `amd64` and `arm64`. They
-install the binary, a systemd unit, a `kividb` system user, and a default
-`/etc/kividb/kividb.conf` that listens on loopback only. Installing enables and
-starts the unit, and an upgrade restarts it:
+`.deb` and `.rpm` packages for `amd64` and `arm64` install the binary, a systemd
+unit, a `kividb` system user, and a default `/etc/kividb/kividb.conf` that
+listens on loopback only. Installing enables and starts the unit, and an
+upgrade restarts it. They are in signed apt and dnf repositories at
+`packages.kividb.io`, so the package manager keeps KiviDB up to date:
 
 ```bash
-sudo apt install ./kividb_amd64.deb     # or: sudo rpm -i kividb.x86_64.rpm
+# Debian 12+, Ubuntu 22.04+
+sudo apt update && sudo apt install -y ca-certificates curl
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://packages.kividb.io/kividb.gpg | sudo tee /etc/apt/keyrings/kividb.gpg > /dev/null
+curl -fsSL https://packages.kividb.io/kividb.sources | sudo tee /etc/apt/sources.list.d/kividb.sources > /dev/null
+sudo apt update && sudo apt install -y kividb
+
+# Fedora, RHEL/Rocky/Alma 9+, Amazon Linux 2023
+sudo curl -fsSL -o /etc/yum.repos.d/kividb.repo https://packages.kividb.io/kividb.repo
+sudo dnf install -y kividb
+
 redis-cli -p 6380 PING
 ```
+
+[docs/INSTALL.md](docs/INSTALL.md) has the details: the signing key, pinning
+and going back to an older version, and removing. The same packages are also
+attached to each release (below), for `sudo apt install ./kividb_amd64.deb` or
+`sudo rpm -i kividb.x86_64.rpm`.
 
 Data (the snapshot, the AOF, `nodes.conf`) lives in `/var/lib/kividb`, and logs
 go to the journal: `journalctl -u kividb`. To accept clients from other

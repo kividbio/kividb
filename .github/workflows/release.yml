@@ -869,6 +869,24 @@ jobs:
           git push origin "refs/tags/${src}"
           echo "Pushed ${src} on ${commit}"
 
+  # ── apt and dnf repositories — stable releases only ─────────────────────
+  #
+  # Adds the release's .deb and .rpm, taken from the GitHub Release just
+  # published, to https://packages.kividb.io and signs the repositories: see
+  # package-repos.yml. `publish` runs for stable releases only, so a
+  # candidate never gets here. Skipped with a notice until the signing key
+  # and the deploy key are set as secrets.
+  package-repos:
+    needs: [publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    permissions:
+      contents: read
+      attestations: read
+    uses: ./.github/workflows/package-repos.yml
+    with:
+      tag: ${{ github.event.inputs.tag || github.ref_name }}
+    secrets: inherit
+
   # ── Smoke test — release candidates only ────────────────────────────────
   #
   # Runs after the images are published, so smoke-test.yml pulls the exact
