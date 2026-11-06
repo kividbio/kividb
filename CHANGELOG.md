@@ -29,6 +29,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A replica set to `replica-priority 0` is no longer promoted by
+  Sentinel.** `CONFIG SET replica-priority` and the config file took the
+  setting and `CONFIG GET` gave it back, but `INFO replication` always
+  reported `slave_priority:100`, which is what Sentinel reads to choose the
+  replica to promote, and it promoted one set to 0. `INFO` now reports the
+  priority set, from `CONFIG SET` under either of its names
+  (`replica-priority`, `slave-priority`), the config file or the new
+  `--replica-priority` flag, and `CONFIG REWRITE` keeps it.
+  `replica-announced` likewise now reaches `INFO replication` as
+  `replica_announced`, which Sentinel reads to leave a replica out of
+  `SENTINEL REPLICAS` (#443).
+
 - **A Lua script's `false` is a RESP3 null to a RESP3 client (#431).** A
   script's `false`, which is also what `redis.call` gives back for a nil
   reply (a `GET` of a missing key), was sent as RESP2's `$-1` to a client

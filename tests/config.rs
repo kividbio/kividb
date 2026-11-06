@@ -1227,3 +1227,183 @@ fn maxclients_leaves_room_for_what_the_io_model_holds() {
         );
     }
 }
+
+/// A kividb process, killed when dropped.
+struct Spawned(std::process::Child);
+
+impl Drop for Spawned {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn spawn_kividb(args: &[&str]) -> Spawned {
+    Spawned(
+        std::process::Command::new(env!("CARGO_BIN_EXE_kividb"))
+            .args(args)
+            .spawn()
+            .expect("start kividb"),
+    )
+}
+
+/// `INFO replication`'s value of `field`, once the server is a replica.
+fn replica_info(c: &mut Conn, field: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let info = c.cmds(&["INFO", "replication"]).as_str().to_string();
+        if info.contains("role:slave") {
+            let prefix = format!("{field}:");
+            return info
+                .lines()
+                .find_map(|line| line.strip_prefix(&prefix))
+                .unwrap_or_else(|| panic!("no {field} in {info}"))
+                .to_string();
+        }
+        assert!(Instant::now() < deadline, "not a replica: {info}");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn config_get(c: &mut Conn, name: &str) -> String {
+    let reply = c.cmds(&["CONFIG", "GET", name]);
+    reply.as_array()[1].as_str().to_string()
+}
+
+/// `replica-priority` is what `INFO replication` reports as
+/// `slave_priority`, which Sentinel reads to choose the replica to promote
+/// and never promotes at 0. It was taken by `CONFIG SET` and the config file
+/// and only remembered: `INFO` said 100 whatever was set, so Sentinel
+/// promoted a replica set to 0 (#443). It is set from the config file, the
+/// command line and `CONFIG SET`, under both its names, and `CONFIG
+/// REWRITE` keeps it. `replica-announced` likewise reaches
+/// `replica_announced`.
+#[test]
+fn replica_priority_and_announced_reach_info_replication() {
+    let dir = tempfile::tempdir().unwrap();
+    let master_port = free_port();
+    let _master = spawn_kividb(&[
+        "--port",
+        &master_port.to_string(),
+        "--bind",
+        "127.0.0.1",
+        "--loglevel",
+        "warning",
+        "--dir",
+        dir.path().to_str().unwrap(),
+    ]);
+    Conn::connect(master_port);
+
+    // From the config file, under Redis's old name.
+    let conf = dir.path().join("replica.conf");
+    let replica_port = free_port();
+    std::fs::write(
+        &conf,
+        format!(
+            "port {replica_port}\nbind 127.0.0.1\nloglevel warning\n\
+             replicaof 127.0.0.1 {master_port}\nslave-priority 7\nreplica-announced no\n"
+        ),
+    )
+    .unwrap();
+    let replica_dir = dir.path().join("replica");
+    std::fs::create_dir_all(&replica_dir).unwrap();
+    let replica = spawn_kividb(&[
+        "--configfile",
+        conf.to_str().unwrap(),
+        "--dir",
+        replica_dir.to_str().unwrap(),
+    ]);
+    let mut c = Conn::connect(replica_port);
+    assert_eq!(replica_info(&mut c, "slave_priority"), "7");
+    assert_eq!(replica_info(&mut c, "replica_announced"), "0");
+    assert_eq!(config_get(&mut c, "replica-priority"), "7");
+    assert_eq!(config_get(&mut c, "slave-priority"), "7");
+    assert_eq!(config_get(&mut c, "replica-announced"), "no");
+
+    // From CONFIG SET, under either name.
+    assert!(c.cmds(&["CONFIG", "SET", "replica-priority", "0"]).is_ok());
+    assert_eq!(replica_info(&mut c, "slave_priority"), "0");
+    assert_eq!(config_get(&mut c, "slave-priority"), "0");
+    assert!(c.cmds(&["CONFIG", "SET", "slave-priority", "5"]).is_ok());
+    assert_eq!(replica_info(&mut c, "slave_priority"), "5");
+    assert_eq!(config_get(&mut c, "replica-priority"), "5");
+    assert!(
+        c.cmds(&["CONFIG", "SET", "replica-announced", "yes"])
+            .is_ok()
+    );
+    assert_eq!(replica_info(&mut c, "replica_announced"), "1");
+    for (name, value, why) in [
+        (
+            "replica-priority",
+            "-1",
+            "argument must be between 0 and 2147483647 inclusive",
+        ),
+        (
+            "replica-priority",
+            "2147483648",
+            "argument must be between 0 and 2147483647 inclusive",
+        ),
+        (
+            "replica-priority",
+            "high",
+            "argument couldn't be parsed into an integer",
+        ),
+        (
+            "replica-announced",
+            "maybe",
+            "argument must be 'yes' or 'no'",
+        ),
+    ] {
+        let reply = c.cmds(&["CONFIG", "SET", name, value]);
+        let expected =
+            format!("ERR CONFIG SET failed (possibly related to argument '{name}') - {why}");
+        assert!(
+            matches!(&reply, RespValue::Error(e) if *e == expected),
+            "{name} {value}: {reply:?}"
+        );
+    }
+    assert_eq!(replica_info(&mut c, "slave_priority"), "5");
+    assert_eq!(replica_info(&mut c, "replica_announced"), "1");
+
+    // CONFIG REWRITE keeps what was set, for the next start.
+    assert!(c.cmds(&["CONFIG", "SET", "replica-priority", "0"]).is_ok());
+    assert!(
+        c.cmds(&["CONFIG", "SET", "replica-announced", "no"])
+            .is_ok()
+    );
+    assert!(c.cmds(&["CONFIG", "REWRITE"]).is_ok());
+    drop(c);
+    drop(replica);
+    let _replica = spawn_kividb(&[
+        "--configfile",
+        conf.to_str().unwrap(),
+        "--dir",
+        replica_dir.to_str().unwrap(),
+    ]);
+    let mut c = Conn::connect(replica_port);
+    assert_eq!(replica_info(&mut c, "slave_priority"), "0");
+    assert_eq!(replica_info(&mut c, "replica_announced"), "0");
+
+    // From the command line.
+    let other_port = free_port();
+    let other_dir = dir.path().join("other");
+    std::fs::create_dir_all(&other_dir).unwrap();
+    let _other = spawn_kividb(&[
+        "--port",
+        &other_port.to_string(),
+        "--bind",
+        "127.0.0.1",
+        "--loglevel",
+        "warning",
+        "--dir",
+        other_dir.to_str().unwrap(),
+        "--replicaof",
+        "127.0.0.1",
+        &master_port.to_string(),
+        "--replica-priority",
+        "3",
+    ]);
+    let mut c = Conn::connect(other_port);
+    assert_eq!(replica_info(&mut c, "slave_priority"), "3");
+    assert_eq!(replica_info(&mut c, "replica_announced"), "1");
+}

@@ -220,6 +220,18 @@ pub struct Config {
     #[arg(long, default_value_t = 0)]
     pub replica_announced_port: u16,
 
+    /// Where this replica stands when Sentinel picks one to promote (Redis
+    /// `replica-priority`, reported as `slave_priority` by `INFO
+    /// replication`): a lower one goes first, and 0 is never promoted.
+    #[arg(long, alias = "slave-priority", default_value_t = 100,
+          value_parser = clap::value_parser!(u32).range(0..=i32::MAX as i64))]
+    pub replica_priority: u32,
+
+    /// Whether Sentinel lists this replica (Redis `replica-announced`,
+    /// reported as `replica_announced` by `INFO replication`).
+    #[arg(long, default_value = "yes", value_parser = parse_yes_no, num_args = 1)]
+    pub replica_announced: bool,
+
     /// Password required for AUTH (empty = no authentication required)
     #[arg(long, default_value = "")]
     pub requirepass: String,
@@ -578,6 +590,8 @@ impl Default for Config {
             io_model: IoModel::default(),
             replicaof: None,
             replica_announced_port: 0,
+            replica_priority: 100,
+            replica_announced: true,
             requirepass: "".into(),
             aclfile: "".into(),
             slowlog_log_slower_than: u64::MAX,
@@ -698,6 +712,8 @@ impl Config {
             io_model: IoModel::Tokio,
             replicaof: None,
             replica_announced_port: 0,
+            replica_priority: 100,
+            replica_announced: true,
             requirepass: "".to_string(),
             aclfile: "".to_string(),
             slowlog_log_slower_than: 10_000,
@@ -1115,6 +1131,11 @@ impl Config {
         out.push_str(&format!("hll-write-format {}\n", self.hll_write_format));
         out.push_str(&format!("repl-timeout {}\n", self.repl_timeout));
         out.push_str(&format!("shutdown-timeout {}\n", self.shutdown_timeout));
+        out.push_str(&format!("replica-priority {}\n", self.replica_priority));
+        out.push_str(&format!(
+            "replica-announced {}\n",
+            if self.replica_announced { "yes" } else { "no" }
+        ));
         out.push_str(&format!(
             "min-replicas-to-write {}\n",
             self.min_replicas_to_write
@@ -1574,6 +1595,17 @@ impl Config {
             "replica-announced-port" | "replica-announce-port" | "slave-announce-port" => {
                 set!(replica_announced_port, number(key, one()?)?)
             }
+            "replica-priority" | "slave-priority" => {
+                let priority: u32 = number(key, one()?)?;
+                if priority > i32::MAX as u32 {
+                    return Err(format!(
+                        "invalid value '{priority}' for '{key}': argument must be between 0 \
+                         and 2147483647 inclusive"
+                    ));
+                }
+                set!(replica_priority, priority)
+            }
+            "replica-announced" => set!(replica_announced, yes_no(key, one()?)?),
             "replicaof" | "slaveof" => match args {
                 [host, port] => {
                     let _: u16 = number(key, port)?;
@@ -2268,7 +2300,8 @@ mod config_file_tests {
             repl-backlog-size 1mb\nrepl-backlog-ttl 1\nrepl-diskless-load swapdb\n\
             hll-write-format redis\n\
             replica-full-sync-guard off\nreplica-full-sync-guard-ratio 1\n\
-            replica-announced-port 1\nreplicaof h 1\nstream-idmp-duration 1\n\
+            replica-announced-port 1\nreplica-priority 1\nreplica-announced no\n\
+            replicaof h 1\nstream-idmp-duration 1\n\
             stream-idmp-maxsize 1\nbackupdirname b\nbackup-sealed-ttl 1\npreload-file f\n\
             tls-port 1\ntls-cert-file f\ntls-key-file f\ntls-ca-cert-file f\n\
             tls-cluster no\ntls-replication no\ntls-client-cert-file f\ntls-client-key-file f\n\
