@@ -497,12 +497,12 @@ fn expire_batch(
         // finds the keys gone before it writes to them.
         if !crate::expiry::loading() {
             for key in batch.iter().copied() {
-                if let Some(value) = values.remove_if_due(key.as_str(), now) {
+                if let Some(value) = values.remove_if_due(key, now) {
                     // Announced before the shard is let go of (see
                     // `delete_key_if_expired`).
                     crate::keyspace_events::notify_expired(store, db, key);
                     if marks {
-                        crate::vector::mark_leaving(id, db, key.as_str());
+                        crate::vector::mark_leaving(id, db, key);
                     }
                     freed.push(value);
                     gone.push(key);
@@ -511,7 +511,7 @@ fn expire_batch(
         }
     }
     if let Some(told) = told {
-        told.propagate(db, gone.iter().map(|key| key.as_str()));
+        told.propagate(db, gone.iter().map(|key| key.as_bytes()));
     }
     drop(ordered);
     drop(unobserved);
@@ -525,7 +525,7 @@ fn expire_batch(
         crate::tracking::expired(store, key);
         crate::vector::maybe_unindex(index_store, db, key);
         if marks {
-            crate::vector::unmark_leaving(id, db, key.as_str());
+            crate::vector::unmark_leaving(id, db, key);
         }
     }
     count
@@ -564,7 +564,7 @@ fn unobserved_order<'a>(
 
 /// Lazy TTL: delete an expired key before a read and return true if it was removed.
 #[inline]
-pub fn lazy_expire_key(store: &Store, db: usize, key: &str) -> bool {
+pub fn lazy_expire_key(store: &Store, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) -> bool {
     if is_expired(store, db, key) {
         delete_key_if_expired(store, db, key)
     } else {
@@ -582,7 +582,7 @@ pub fn lazy_expire_key(store: &Store, db: usize, key: &str) -> bool {
 /// gone, and writes are held while writes are paused, so they never meet a
 /// key left this way.
 #[inline]
-pub fn expire_on_read(store: &Store, db: usize, key: &str) -> bool {
+pub fn expire_on_read(store: &Store, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) -> bool {
     if crate::pause::expiry_deferred() {
         return true;
     }
@@ -591,7 +591,7 @@ pub fn expire_on_read(store: &Store, db: usize, key: &str) -> bool {
 
 /// [`lazy_expire_key`] for a read: see [`expire_on_read`].
 #[inline]
-pub fn lazy_expire_on_read(store: &Store, db: usize, key: &str) -> bool {
+pub fn lazy_expire_on_read(store: &Store, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) -> bool {
     is_expired(store, db, key) && expire_on_read(store, db, key)
 }
 
@@ -683,6 +683,125 @@ pub fn glob_match_bytes(pattern: &[u8], text: &[u8]) -> bool {
     super::glob_redis::matches(pattern, text)
 }
 
+/// Both clocks, read one after the other, to convert a hash field's
+/// deadline between the `Instant` it is kept as and the Unix milliseconds it
+/// is written as (in a snapshot, a `DUMP` payload, a Redis RDB file). Exact
+/// to the nanosecond both ways, so that a deadline of whole milliseconds
+/// reads back as the same millisecond. The conversions used to cut the time
+/// now to a whole millisecond first, and a field loaded from a snapshot, a
+/// full sync or a `RESTORE` was often 1 ms off what it had been (#448).
+#[derive(Clone, Copy)]
+pub struct FieldClock {
+    /// The monotonic clock just before the wall clock was read.
+    before: std::time::Instant,
+    /// The monotonic clock just after it.
+    after: std::time::Instant,
+    wall: Duration,
+}
+
+impl FieldClock {
+    /// The two clocks, read together. The monotonic clock is read before
+    /// and after the wall clock; a reading the thread was preempted in the
+    /// middle of (the two monotonic readings more than 50 µs apart) is read
+    /// again, a few times at most, keeping the closest. Read across a
+    /// preemption, the pair put every deadline converted with it off by
+    /// however long the thread was away.
+    ///
+    /// A deadline is never early: the `Instant` of a Unix time is worked
+    /// out from the later monotonic reading, and the Unix time of an
+    /// `Instant` from the earlier one, so either is late by at most the
+    /// gap between them.
+    pub fn now() -> Self {
+        const CLOSE: Duration = Duration::from_micros(50);
+        let mut best: Option<(Duration, Self)> = None;
+        for _ in 0..8 {
+            let before = std::time::Instant::now();
+            let wall = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default();
+            let after = std::time::Instant::now();
+            let gap = after.duration_since(before);
+            let reading = Self {
+                before,
+                after,
+                wall,
+            };
+            if gap <= CLOSE {
+                return reading;
+            }
+            if best.as_ref().is_none_or(|(closest, _)| gap < *closest) {
+                best = Some((gap, reading));
+            }
+        }
+        best.map(|(_, reading)| reading)
+            .expect("the clocks were read")
+    }
+
+    /// The `Instant` of `at_ms`, Unix milliseconds; `None` once it has come.
+    /// One further out than an `Instant` can hold (no command sets one: see
+    /// `MAX_FIELD_DEADLINE_MS`) is taken as the furthest it can.
+    pub fn instant_of(&self, at_ms: u64) -> Option<std::time::Instant> {
+        Duration::from_millis(at_ms)
+            .checked_sub(self.wall)
+            .filter(|left| !left.is_zero())
+            .map(|left| {
+                self.after.checked_add(left).unwrap_or_else(|| {
+                    self.after + Duration::from_millis(MAX_FIELD_DEADLINE_MS as u64)
+                })
+            })
+    }
+
+    /// [`FieldClock::instant_of`], checked: `None` (the outer one) for a
+    /// time further out than an `Instant` can hold, which a file from
+    /// elsewhere may claim; `Some(None)` once it has come.
+    pub fn checked_instant_of(&self, at_ms: u64) -> Option<Option<std::time::Instant>> {
+        match Duration::from_millis(at_ms).checked_sub(self.wall) {
+            Some(left) if !left.is_zero() => self.after.checked_add(left).map(Some),
+            _ => Some(None),
+        }
+    }
+
+    /// `at` as Unix milliseconds, to the nearest one; past `u64::MAX`,
+    /// `u64::MAX`. Cut to 64 bits, a deadline that far out was saved as a
+    /// moment from now, and the field was gone after a restart.
+    pub fn unix_ms_of(&self, at: std::time::Instant) -> u64 {
+        let wall = match at.checked_duration_since(self.before) {
+            Some(ahead) => self.wall.saturating_add(ahead),
+            None => self.wall.saturating_sub(self.before.duration_since(at)),
+        };
+        u64::try_from(wall.saturating_add(Duration::from_micros(500)).as_millis())
+            .unwrap_or(u64::MAX)
+    }
+}
+
+/// The latest deadline a command may give a hash field, in Unix
+/// milliseconds: Redis's `HFE_MAX_ABS_TIME_MSEC`, 2^46 - 1 (the year 4199).
+pub const MAX_FIELD_DEADLINE_MS: i64 = 0xFFFF_FFFF_FFFF >> 2;
+
+/// The deadline of a hash field given `n`, seconds if `secs` and else
+/// milliseconds, after `base_ms` (now, for a time to live; 0 for a Unix
+/// time), as Redis's `parseExpireTime` checks it: `None` past
+/// [`MAX_FIELD_DEADLINE_MS`]. `n` is not negative.
+pub fn field_deadline_ms(n: i64, secs: bool, base_ms: i64) -> Option<i64> {
+    let ms = if secs {
+        if n > MAX_FIELD_DEADLINE_MS / 1000 {
+            return None;
+        }
+        n * 1000
+    } else {
+        n
+    };
+    (ms <= MAX_FIELD_DEADLINE_MS - base_ms).then_some(ms + base_ms)
+}
+
+/// Redis's reply to a hash field TTL past [`MAX_FIELD_DEADLINE_MS`].
+pub fn invalid_field_expire_time(command: &str) -> Vec<u8> {
+    crate::resp::write::resp_error(&format!(
+        "ERR invalid expire time in '{}' command",
+        command.to_ascii_lowercase()
+    ))
+}
+
 /// Absolute wall time when a key expires (`now + ttl`). Safe across threads (unlike `Instant`).
 #[inline]
 pub fn expiry_at_after(ttl: Duration) -> SystemTime {
@@ -738,7 +857,7 @@ pub fn is_past(at: u64) -> bool {
     now_ms() > at && !crate::expiry::held()
 }
 
-pub fn is_expired(store: &Store, db: usize, key: &str) -> bool {
+pub fn is_expired(store: &Store, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) -> bool {
     let shard = store::get_shard(&store[db], key);
     // Usually: nothing in this shard expires, and no lock is needed to know.
     if shard.holds_no_ttl() {
@@ -748,7 +867,11 @@ pub fn is_expired(store: &Store, db: usize, key: &str) -> bool {
 }
 
 /// When `key`'s time to live ends, if it has one.
-pub fn get_expiry(store: &Store, db: usize, key: &str) -> Option<SystemTime> {
+pub fn get_expiry(
+    store: &Store,
+    db: usize,
+    key: &(impl AsRef<[u8]> + ?Sized),
+) -> Option<SystemTime> {
     let shard = store::get_shard(&store[db], key);
     if shard.holds_no_ttl() {
         return None;
@@ -762,7 +885,12 @@ pub fn parse_utf8(bytes: &[u8]) -> Option<&str> {
 }
 
 /// Write a value, the key's time to live taken away in the same step.
-pub fn store_value(store: &Store, db: usize, key: &str, value: KiviDBValue) {
+pub fn store_value(
+    store: &Store,
+    db: usize,
+    key: &(impl AsRef<[u8]> + ?Sized),
+    value: KiviDBValue,
+) {
     let shard = store::get_shard(&store[db], key);
     let replaced = write_lock!(shard).insert_expiring(key, value, None);
     // Freed with the shard unlocked.
@@ -774,7 +902,7 @@ pub fn store_value(store: &Store, db: usize, key: &str, value: KiviDBValue) {
 pub fn store_value_expiring(
     store: &Store,
     db: usize,
-    key: &str,
+    key: &(impl AsRef<[u8]> + ?Sized),
     value: KiviDBValue,
     expires_at: Option<SystemTime>,
 ) {
@@ -785,13 +913,18 @@ pub fn store_value_expiring(
 
 /// Give `key` the time to live that ends at `expires_at`. A key that is not
 /// there is given none: a time to live is the key's.
-pub fn set_expiry(store: &Store, db: usize, key: &str, expires_at: SystemTime) {
+pub fn set_expiry(
+    store: &Store,
+    db: usize,
+    key: &(impl AsRef<[u8]> + ?Sized),
+    expires_at: SystemTime,
+) {
     let shard = store::get_shard(&store[db], key);
     write_lock!(shard).set_expires(key, unix_ms(expires_at));
 }
 
 /// Take `key`'s time to live away. Returns whether it had one.
-pub fn clear_expiry(store: &Store, db: usize, key: &str) -> bool {
+pub fn clear_expiry(store: &Store, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) -> bool {
     let shard = store::get_shard(&store[db], key);
     if shard.holds_no_ttl() {
         // Nothing to take away, and nothing to lock for that; but the key
@@ -804,14 +937,18 @@ pub fn clear_expiry(store: &Store, db: usize, key: &str) -> bool {
     write_lock!(shard).persist(key)
 }
 
-pub fn delete_key(store: &Store, db: usize, key: &str) -> bool {
+pub fn delete_key(store: &Store, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) -> bool {
     take_key(store, db, key).is_some()
 }
 
 /// [`delete_key`], saying about how much memory the key took: what
 /// deleting it gives back, or leaves to a snapshot that still holds it
 /// (`store::Taken::footprint`). For eviction to see that it gets anywhere.
-pub fn delete_key_sized(store: &Store, db: usize, key: &str) -> Option<usize> {
+pub fn delete_key_sized(
+    store: &Store,
+    db: usize,
+    key: &(impl AsRef<[u8]> + ?Sized),
+) -> Option<usize> {
     let value_shard = store::get_shard(&store[db], key);
     let removed = write_lock!(value_shard).remove(key)?;
     // Freed (or left to what holds it) with the shard unlocked.
@@ -820,7 +957,11 @@ pub fn delete_key_sized(store: &Store, db: usize, key: &str) -> Option<usize> {
 
 /// [`delete_key`], handing back the value, for `UNLINK` to free: after the
 /// shard lock is released, and in the background if it is large.
-pub fn take_key(store: &Store, db: usize, key: &str) -> Option<KiviDBValue> {
+pub fn take_key(
+    store: &Store,
+    db: usize,
+    key: &(impl AsRef<[u8]> + ?Sized),
+) -> Option<KiviDBValue> {
     let value_shard = store::get_shard(&store[db], key);
     let removed = write_lock!(value_shard).remove(key);
     // To be freed: what a snapshot still holds of the key is not to be
@@ -837,7 +978,7 @@ pub fn take_key(store: &Store, db: usize, key: &str) -> Option<KiviDBValue> {
 /// master's `DEL` (see `expiry`). Unless that master sends none (before
 /// 1.1.3): then the replica deletes the key, and tells no one.
 #[inline]
-pub fn delete_key_if_expired(store: &Store, db: usize, key: &str) -> bool {
+pub fn delete_key_if_expired(store: &Store, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) -> bool {
     // Loading, or applying the master's stream: a key's time does not make
     // it gone. The `DEL` that follows does.
     if crate::expiry::held() {
@@ -859,11 +1000,11 @@ pub fn delete_key_if_expired(store: &Store, db: usize, key: &str) -> bool {
     let indexes = crate::vector::indexes_of(id, db);
     let ordered = told
         .as_ref()
-        .map(|_| crate::expiry::order(db, std::iter::once(key.as_bytes())));
+        .map(|_| crate::expiry::order(db, std::iter::once(key.as_ref())));
     // Unobserved, the key's order all the same: a write that read the key
     // before it was due must not write its old value back after it is gone
     // (#271).
-    let unobserved = unobserved_order(told.is_none(), db, std::iter::once(key.as_bytes()));
+    let unobserved = unobserved_order(told.is_none(), db, std::iter::once(key.as_ref()));
     // `expired` is announced before the shard is let go of: a command that
     // then finds the key gone, and writes it anew, announces its own event
     // after it, as in Redis. Announced once the lock was let go of, the
@@ -882,7 +1023,7 @@ pub fn delete_key_if_expired(store: &Store, db: usize, key: &str) -> bool {
     };
     let gone = removed.is_some();
     if gone && let Some(told) = &told {
-        told.propagate(db, [key]);
+        told.propagate(db, [key.as_ref()]);
     }
     drop(ordered);
     drop(unobserved);
@@ -1117,7 +1258,7 @@ pub fn scan_page<T>(
 /// `[MATCH pattern] [COUNT count]` and whatever else a scan command takes.
 #[derive(Default)]
 pub struct ScanOptions {
-    pub pattern: Option<String>,
+    pub pattern: Option<Vec<u8>>,
     pub count: usize,
     /// `SCAN … TYPE type`, in lower case.
     pub of_type: Option<String>,
@@ -1151,7 +1292,7 @@ pub fn scan_arguments(
         let value = cmd.get(i + 1);
         match (word.as_str(), value) {
             ("MATCH", Some(pattern)) => {
-                options.pattern = Some(String::from_utf8_lossy(pattern).into_owned());
+                options.pattern = Some(pattern.to_vec());
                 i += 2;
             }
             ("COUNT", Some(count)) => {
@@ -1263,129 +1404,9 @@ mod scan_tests {
     }
 }
 
-// ── Names that are not text ───────────────────────────────────────────────────
-//
-// A hash keeps its fields by name, as `String`s. Redis's field names are
-// bytes: any bytes. So that a hash can hold them all, a name that is not
-// valid UTF-8 is kept in a form that is — each byte that is not part of
-// valid text becomes one character from a block set aside for it (U+F780 –
-// U+F7FF, private use: byte 0x80 is U+F780, 0xFF is U+F7FF) — and is turned
-// back on the way out. Ordinary text is itself, both ways, and costs one
-// scan. Text that happens to use those characters has their bytes put in
-// the same form, so that nothing can be mistaken for something else.
-
-const BYTE_BLOCK: u32 = 0xF700;
-
-fn in_byte_block(c: char) -> bool {
-    (0xF780..=0xF7FF).contains(&(c as u32))
-}
-
-fn push_as_block(out: &mut String, bytes: &[u8]) {
-    for byte in bytes {
-        // 0x80..=0xFF only: bytes below that are text wherever they are.
-        match char::from_u32(BYTE_BLOCK + *byte as u32) {
-            Some(c) if *byte >= 0x80 => out.push(c),
-            _ => out.push(*byte as char),
-        }
-    }
-}
-
-/// The `String` a name of any bytes is kept as.
-pub fn name_from_bytes(raw: &[u8]) -> std::borrow::Cow<'_, str> {
-    if let Ok(text) = std::str::from_utf8(raw)
-        && !text.contains(in_byte_block)
-    {
-        return std::borrow::Cow::Borrowed(text);
-    }
-    let mut out = String::with_capacity(raw.len() + 8);
-    let mut rest = raw;
-    while !rest.is_empty() {
-        let (text, bad) = match std::str::from_utf8(rest) {
-            Ok(text) => (text, 0),
-            Err(e) => {
-                let good = e.valid_up_to();
-                // The bytes of one broken sequence, or everything left.
-                let bad = e.error_len().unwrap_or(rest.len() - good);
-                // Valid up to `good`, by the error's own account.
-                (std::str::from_utf8(&rest[..good]).unwrap_or(""), bad)
-            }
-        };
-        for c in text.chars() {
-            if in_byte_block(c) {
-                let mut utf8 = [0u8; 4];
-                push_as_block(&mut out, c.encode_utf8(&mut utf8).as_bytes());
-            } else {
-                out.push(c);
-            }
-        }
-        let consumed = text.len();
-        push_as_block(&mut out, &rest[consumed..consumed + bad]);
-        rest = &rest[consumed + bad..];
-    }
-    std::borrow::Cow::Owned(out)
-}
-
-/// The bytes a kept name stands for.
-pub fn name_to_bytes(name: &str) -> std::borrow::Cow<'_, [u8]> {
-    if !name.contains(in_byte_block) {
-        return std::borrow::Cow::Borrowed(name.as_bytes());
-    }
-    let mut out = Vec::with_capacity(name.len());
-    for c in name.chars() {
-        if in_byte_block(c) {
-            out.push((c as u32 - BYTE_BLOCK) as u8);
-        } else {
-            let mut utf8 = [0u8; 4];
-            out.extend_from_slice(c.encode_utf8(&mut utf8).as_bytes());
-        }
-    }
-    std::borrow::Cow::Owned(out)
-}
-
-#[cfg(test)]
-mod name_tests {
-    use super::{name_from_bytes, name_to_bytes};
-
-    #[test]
-    fn any_bytes_survive_the_round_trip() {
-        let mut cases: Vec<Vec<u8>> = vec![
-            b"".to_vec(),
-            b"plain".to_vec(),
-            "caf\u{e9} \u{1F600}".as_bytes().to_vec(),
-            vec![0xff],
-            vec![0x80, 0x00, 0x7f, 0xfe],
-            b"abc\xc3".to_vec(),                    // a sequence cut short
-            b"\xe2\x82 tail".to_vec(),              // and one cut in the middle
-            "\u{F780}\u{F7FF}".as_bytes().to_vec(), // the block's own characters
-            (0u8..=255).collect(),
-        ];
-        // And a few thousand pseudo-random ones.
-        let mut state = 0x9E37_79B9_7F4A_7C15u64;
-        for len in 0..2000usize {
-            let bytes: Vec<u8> = (0..len % 37)
-                .map(|_| {
-                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-                    (state >> 56) as u8
-                })
-                .collect();
-            cases.push(bytes);
-        }
-        let mut seen = std::collections::HashMap::new();
-        for raw in cases {
-            let name = name_from_bytes(&raw).into_owned();
-            assert_eq!(name_to_bytes(&name).as_ref(), raw.as_slice(), "{raw:?}");
-            // Two different inputs never share a name.
-            if let Some(other) = seen.insert(name.clone(), raw.clone()) {
-                assert_eq!(other, raw, "{name:?}");
-            }
-        }
-        // Text is itself.
-        assert!(matches!(
-            name_from_bytes(b"field"),
-            std::borrow::Cow::Borrowed("field")
-        ));
-    }
-}
+// The escape of names that are not text lives in `key_bytes` (`text_of`,
+// `bytes_of`): keys use it too, wherever something keeps them as text.
+pub use crate::key_bytes::{bytes_of as name_to_bytes, text_of as name_from_bytes};
 
 #[cfg(test)]
 mod whole_score_tests {
@@ -1427,7 +1448,7 @@ mod active_expiry_tests {
     use super::*;
     use crate::shared_bytes::SharedBytes;
 
-    fn put(store: &Store, key: &str, at: SystemTime) {
+    fn put(store: &Store, key: &(impl AsRef<[u8]> + ?Sized), at: SystemTime) {
         store_value(
             store,
             0,
@@ -1488,10 +1509,31 @@ mod active_expiry_tests {
         assert!(
             store[0]
                 .iter()
-                .all(|s| s.read().keys().all(|k| !k.starts_with("gone:")))
+                .all(|s| s.read().keys().all(|k| !k.starts_with(b"gone:")))
         );
         let after = crate::stats::EXPIRED_KEYS_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
         assert!(after - before >= 20_000);
+    }
+
+    /// Keys that are not text expire as any other: the cycle stopped on the
+    /// first one, with the key taken from the store and nothing said of it,
+    /// when it made a `&str` of each (#437).
+    #[test]
+    fn keys_that_are_not_text_expire() {
+        let store = store::new_store(1);
+        let index: IndexStore = Default::default();
+        let past = SystemTime::now() - Duration::from_secs(5);
+        let names: [&[u8]; 3] = [b"\xff\x00k", b"\xfe", b"text"];
+        for key in names {
+            put(&store, key, past);
+        }
+        let now = now_ms();
+        for key in names {
+            let shard = store::shard_index(store[0].len(), key);
+            expire_batch(&store, &index, 0, shard, &[Key::new(key)], now, None);
+        }
+        assert_eq!(keys(&store), 0);
+        assert_eq!(times(&store), 0);
     }
 
     /// A key whose time was put back after the cycle found it due is kept,
@@ -1569,7 +1611,7 @@ mod active_expiry_tests {
         let index: IndexStore = Default::default();
         let past = SystemTime::now() - Duration::from_secs(5);
         let shards = store[0].len();
-        // Long keys, as UUIDs are: past CompactString's inline length.
+        // Long keys, as UUIDs are: past a key's inline length.
         let mut n = 0;
         let mut i = 0;
         while n < 3 * ACTIVE_EXPIRE_BATCH {

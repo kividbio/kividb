@@ -76,6 +76,19 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
             "shutdown-timeout",
             rs.shutdown_timeout_secs.load(Relaxed).to_string(),
         ),
+        // Under both of its names, as Redis lists it.
+        (
+            "replica-priority",
+            rs.replica_priority.load(Relaxed).to_string(),
+        ),
+        (
+            "slave-priority",
+            rs.replica_priority.load(Relaxed).to_string(),
+        ),
+        (
+            "replica-announced",
+            yes_no(rs.replica_announced.load(Relaxed)),
+        ),
         (
             "replica-full-sync-guard",
             rs.full_sync_guard().as_str().to_string(),
@@ -673,6 +686,32 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                                  on-empty-db, swapdb, flushdb",
                 )),
             },
+            // What `INFO replication` tells Sentinel (#443): it used to be
+            // remembered for `CONFIG GET` only, and `INFO` said 100 whatever
+            // was set, so a replica set to 0 could still be promoted.
+            "replica-priority" | "slave-priority" => match value.parse::<i64>() {
+                Ok(v) if (0..=i64::from(i32::MAX)).contains(&v) => {
+                    ctx.repl_state
+                        .replica_priority
+                        .store(v as u32, std::sync::atomic::Ordering::Relaxed);
+                    Some(resp_simple("OK"))
+                }
+                Ok(_) => Some(resp_error(
+                    "ERR argument must be between 0 and 2147483647 inclusive",
+                )),
+                Err(_) => Some(resp_error(
+                    "ERR argument couldn't be parsed into an integer",
+                )),
+            },
+            "replica-announced" => match value.to_ascii_lowercase().as_str() {
+                yes_no @ ("yes" | "no") => {
+                    ctx.repl_state
+                        .replica_announced
+                        .store(yes_no == "yes", std::sync::atomic::Ordering::Relaxed);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error("ERR argument must be 'yes' or 'no'")),
+            },
             "repl-timeout" => match value.parse::<u64>() {
                 Ok(v) if v >= 1 => {
                     ctx.repl_state
@@ -1140,13 +1179,16 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
             // effect where KiviDB has what they set (`lazyfree-lazy-expire`
             // decides whether a key that expires is propagated as `UNLINK`
             // or `DEL`; `latency-tracking`, whether `INFO latencystats`
-            // reports). Anything else is refused, as Redis refuses it.
+            // reports; `rdbchecksum no`, that an RDB file's checksum is not
+            // checked as it is loaded). Anything else is refused, as Redis
+            // refuses it.
             "lazyfree-lazy-eviction"
             | "lazyfree-lazy-expire"
             | "lazyfree-lazy-server-del"
             | "lazyfree-lazy-user-del"
             | "lazyfree-lazy-user-flush"
-            | "latency-tracking" => match value.to_ascii_lowercase().as_str() {
+            | "latency-tracking"
+            | "rdbchecksum" => match value.to_ascii_lowercase().as_str() {
                 yes_no @ ("yes" | "no") => {
                     REMEMBERED_CONFIG
                         .lock()
@@ -3864,8 +3906,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 out.push_str("atomicvar_api:atomic-builtin\r\n");
                 out.push_str("gcc_version:0.0.0\r\n");
                 // The file it was started with, if there is one.
-                let config_file = Some(std::path::Path::new(&ctx.config.configfile))
-                    .filter(|path| path.is_file())
+                let config_file = ctx
+                    .config
+                    .configfile_loaded
+                    .then_some(std::path::Path::new(&ctx.config.configfile))
                     .and_then(|path| std::path::absolute(path).ok())
                     .map(|path| path.to_string_lossy().into_owned())
                     .unwrap_or_default();
@@ -4243,8 +4287,22 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     if let Some(down_for) = ctx.repl_state.master_link_down_since_seconds() {
                         out.push_str(&format!("master_link_down_since_seconds:{down_for}\r\n"));
                     }
-                    out.push_str("slave_priority:100\r\n");
+                    // Sentinel never promotes a replica of priority 0, and
+                    // lists only one that is announced (#443).
+                    out.push_str(&format!(
+                        "slave_priority:{}\r\n",
+                        ctx.repl_state
+                            .replica_priority
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                    ));
                     out.push_str("slave_read_only:1\r\n");
+                    out.push_str(&format!(
+                        "replica_announced:{}\r\n",
+                        ctx.repl_state
+                            .replica_announced
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            as u8
+                    ));
                     // KiviDB extensions: the full-resync dataset guard.
                     out.push_str(&format!(
                         "replica_full_sync_guard:{}\r\n",
@@ -4754,6 +4812,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     use crate::config::RewriteError;
                     match ctx.config.with_values(&config_rows(ctx)).rewrite_to_disk() {
                         Ok(()) => Some(resp_simple("OK")),
+                        Err(RewriteError::NoConfigFile) => Some(resp_error(
+                            "ERR The server is running without a config file",
+                        )),
                         Err(RewriteError::Io(e)) => {
                             Some(resp_error(&format!("ERR Rewriting config file: {e}")))
                         }
@@ -5350,7 +5411,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let (mut optin, mut optout, mut noloop, mut bcast) =
                         (false, false, false, false);
                     let mut redirect: Option<u64> = None;
-                    let mut prefixes: Vec<String> = Vec::new();
+                    let mut prefixes: Vec<Vec<u8>> = Vec::new();
                     let mut i = 3usize;
                     while i < cmd.len() {
                         let word = cmd[i].to_ascii_uppercase();
@@ -5370,7 +5431,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                                 i += 1;
                             }
                             (b"PREFIX", Some(prefix)) => {
-                                prefixes.push(String::from_utf8_lossy(prefix).into_owned());
+                                prefixes.push(prefix.to_vec());
                                 i += 1;
                             }
                             (b"BCAST", _) => bcast = true,
@@ -5463,15 +5524,19 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     if bcast {
                         // No prefix is the prefix of every key.
                         if prefixes.is_empty() && had_prefixes.is_empty() {
-                            prefixes.push(String::new());
+                            prefixes.push(Vec::new());
                         }
                         // One prefix of a client must not be the start of
                         // another: a key would be announced twice.
-                        let overlap = |a: &str, b: &str| a.starts_with(b) || b.starts_with(a);
+                        let overlap = |a: &[u8], b: &[u8]| a.starts_with(b) || b.starts_with(a);
                         for (n, prefix) in prefixes.iter().enumerate() {
                             if let Some(other) =
                                 had_prefixes.iter().find(|other| overlap(prefix, other))
                             {
+                                let (prefix, other) = (
+                                    String::from_utf8_lossy(prefix),
+                                    String::from_utf8_lossy(other),
+                                );
                                 return Some(resp_error(&format!(
                                     "ERR Prefix '{prefix}' overlaps with an existing prefix \
                                      '{other}'. Prefixes for a single client must not overlap."
@@ -5481,6 +5546,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                                 .iter()
                                 .find(|other| overlap(prefix, other))
                             {
+                                let (prefix, other) = (
+                                    String::from_utf8_lossy(prefix),
+                                    String::from_utf8_lossy(other),
+                                );
                                 return Some(resp_error(&format!(
                                     "ERR Prefix '{prefix}' overlaps with another provided \
                                      prefix '{other}'. Prefixes for a single client must not \
@@ -5518,7 +5587,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let info = ctx.client_registry.get(ctx.client_id);
                     let mut flags: Vec<&str> = Vec::new();
                     let mut redirect = -1;
-                    let mut prefixes: Vec<String> = Vec::new();
+                    let mut prefixes: Vec<Vec<u8>> = Vec::new();
                     match &info {
                         Some(info) if info.tracking => {
                             flags.push("on");
@@ -5557,7 +5626,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             resp_bulk_str("redirect"),
                             resp_integer(redirect),
                             resp_bulk_str("prefixes"),
-                            resp_array(prefixes.iter().map(|p| resp_bulk_str(p)).collect()),
+                            resp_array(prefixes.iter().map(|p| resp_bulk(p)).collect()),
                         ],
                     ))
                 }

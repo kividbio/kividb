@@ -185,7 +185,7 @@ fn cmd_countkeysinslot(ctx: &Ctx) -> Vec<u8> {
     for shard in db.iter() {
         let map = crate::read_lock!(shard);
         for k in map.keys() {
-            if key_hash_slot(k.as_bytes()) == slot {
+            if key_hash_slot(k) == slot {
                 count += 1;
             }
         }
@@ -216,8 +216,8 @@ fn cmd_getkeysinslot(ctx: &Ctx) -> Vec<u8> {
     'outer: for shard in db.iter() {
         let map = crate::read_lock!(shard);
         for k in map.keys() {
-            if key_hash_slot(k.as_bytes()) == slot {
-                out.push(resp_bulk_str(k));
+            if key_hash_slot(k) == slot {
+                out.push(resp_bulk(k));
                 if out.len() >= count {
                     break 'outer;
                 }
@@ -1599,7 +1599,7 @@ fn slot_has_keys(ctx: &Ctx, slot: u16) -> bool {
     ctx.store[*ctx.selected_db].iter().any(|shard| {
         crate::read_lock!(shard)
             .keys()
-            .any(|k| key_hash_slot(k.as_bytes()) == slot)
+            .any(|k| key_hash_slot(k) == slot)
     })
 }
 
@@ -1651,7 +1651,7 @@ fn off_the_runtime<R>(f: impl FnOnce() -> R) -> R {
 
 /// One key on its way out: name, serialised value, absolute expiry (0 = none).
 struct Outgoing {
-    key: String,
+    key: crate::store::Key,
     payload: Vec<u8>,
     expires_at_ms: u64,
 }
@@ -1761,10 +1761,9 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let mut outgoing: Vec<Outgoing> = Vec::with_capacity(keys.len());
-    for key in &keys {
-        let Ok(key) = std::str::from_utf8(key) else {
-            continue;
-        };
+    for &key in &keys {
+        // Any bytes: a key that is not text was skipped here, and the
+        // command answered OK without moving it.
         if crate::commands::helpers::lazy_expire_key(ctx.store, db, key) {
             continue;
         }
@@ -1781,10 +1780,13 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
         }
         let payload = match crate::snapshot::dump_payload(&value) {
             Ok(p) => p,
-            Err(e) => return resp_error(&format!("ERR could not serialise '{key}': {e}")),
+            Err(e) => {
+                let key = String::from_utf8_lossy(key);
+                return resp_error(&format!("ERR could not serialise '{key}': {e}"));
+            }
         };
         outgoing.push(Outgoing {
-            key: key.to_string(),
+            key: crate::store::Key::new(key),
             payload,
             expires_at_ms,
         });
@@ -1907,7 +1909,7 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
     let taken_back = !not_deleted.kept.is_empty()
         && only_here(ctx, &not_deleted.kept)
         && take_back_copies(&mut reader, &not_deleted.kept);
-    let written: Vec<&str> = not_deleted
+    let written: Vec<&[u8]> = not_deleted
         .kept
         .iter()
         .chain(&not_deleted.gone)
@@ -2062,10 +2064,10 @@ fn delete_moved<'a>(ctx: &Ctx, db: usize, moved: &[&'a Outgoing], held: bool) ->
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let mut del: Vec<Vec<u8>> = vec![b"DEL".to_vec()];
-    let mut kept: Vec<&'a str> = Vec::new();
-    let mut gone: Vec<&'a str> = Vec::new();
+    let mut kept: Vec<&'a [u8]> = Vec::new();
+    let mut gone: Vec<&'a [u8]> = Vec::new();
     for item in moved {
-        let key = item.key.as_str();
+        let key = item.key.as_bytes();
         let shard = crate::store::get_shard(&ctx.store[db], key);
         let removal = {
             let mut map = crate::write_lock!(shard);
@@ -2085,7 +2087,7 @@ fn delete_moved<'a>(ctx: &Ctx, db: usize, moved: &[&'a Outgoing], held: bool) ->
                 // Freed with the shard unlocked.
                 drop(taken);
                 crate::vector::maybe_unindex(ctx.index_store, db, key);
-                del.push(key.as_bytes().to_vec());
+                del.push(key.to_vec());
             }
             crate::store::Removal::Kept => kept.push(key),
             crate::store::Removal::Absent => {
@@ -2116,10 +2118,10 @@ fn delete_moved<'a>(ctx: &Ctx, db: usize, moved: &[&'a Outgoing], held: bool) ->
 /// What [`delete_moved`] left here.
 struct NotDeleted<'a> {
     /// Keys written while they travelled: here, with their newest value.
-    kept: Vec<&'a str>,
+    kept: Vec<&'a [u8]>,
     /// Keys that went from here meanwhile, other than by their time running
     /// out.
-    gone: Vec<&'a str>,
+    gone: Vec<&'a [u8]>,
     /// The order of the keys, still held: nothing writes them here, or
     /// deletes them, until it is let go of (see [`take_back_copies`]).
     _order: crate::write_order::OrderGuard,
@@ -2138,12 +2140,11 @@ struct NotDeleted<'a> {
 /// a node that is not the owner, which clients do not reach anyway), and
 /// not outside cluster mode, where clients may write at the destination
 /// directly.
-fn only_here(ctx: &Ctx, keys: &[&str]) -> bool {
+fn only_here(ctx: &Ctx, keys: &[&[u8]]) -> bool {
     ctx.cluster.enabled
-        && keys.iter().all(|key| {
-            ctx.cluster
-                .owns_slot(crate::cluster::key_hash_slot(key.as_bytes()))
-        })
+        && keys
+            .iter()
+            .all(|key| ctx.cluster.owns_slot(crate::cluster::key_hash_slot(key)))
 }
 
 /// Delete at the destination the copies of `keys` that this `MIGRATE` sent,
@@ -2159,7 +2160,7 @@ fn only_here(ctx: &Ctx, keys: &[&str]) -> bool {
 /// (#295).
 fn take_back_copies(
     reader: &mut std::io::BufReader<Box<dyn crate::node_tls::ReadWrite>>,
-    keys: &[&str],
+    keys: &[&[u8]],
 ) -> bool {
     use std::io::Write;
     let mut pipeline = Vec::new();
@@ -2169,7 +2170,7 @@ fn take_back_copies(
         ]));
         pipeline.extend_from_slice(&crate::resp::write::encode_resp_command(&[
             b"DEL".to_vec(),
-            key.as_bytes().to_vec(),
+            key.to_vec(),
         ]));
     }
     let sock = reader.get_mut();
@@ -2193,12 +2194,12 @@ fn take_back_copies(
 /// keys as though the slot were empty here; run again (with `REPLACE`, or
 /// `--cluster-replace`, as the destination holds a copy) it takes the keys
 /// along with their writes.
-fn written_while_moving(keys: &[&str], addr: &str, taken_back: bool) -> String {
+fn written_while_moving(keys: &[&[u8]], addr: &str, taken_back: bool) -> String {
     const SHOWN: usize = 5;
     let mut names = keys
         .iter()
         .take(SHOWN)
-        .map(|k| format!("'{k}'"))
+        .map(|k| format!("'{}'", String::from_utf8_lossy(k)))
         .collect::<Vec<_>>()
         .join(", ");
     if keys.len() > SHOWN {
@@ -2475,7 +2476,7 @@ pub(crate) fn key_counts_per_slot(
     for shard in db.iter() {
         let map = crate::read_lock!(shard);
         for k in map.keys() {
-            let slot = key_hash_slot(k.as_bytes());
+            let slot = key_hash_slot(k);
             if owned[slot as usize] {
                 *counts.entry(slot).or_insert(0) += 1;
             }

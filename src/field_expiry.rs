@@ -27,7 +27,7 @@ use crate::vector::IndexStore;
 
 /// A hash with field TTLs: which server's store it is in, which database,
 /// and its key.
-type Entry = (usize, usize, String);
+type Entry = (usize, usize, crate::store::Key);
 
 /// The hashes to watch, each with the earliest time one of its fields is due.
 static WATCHED: Mutex<Option<AHashMap<Entry, Instant>>> = Mutex::new(None);
@@ -87,12 +87,21 @@ fn store_id(store: &Store) -> usize {
     std::sync::Arc::as_ptr(store) as *const () as usize
 }
 
+/// What a hash's place on the watch list takes, for a key of `key_len`
+/// bytes (`MEMORY USAGE`): its bucket and control byte in the list's
+/// table, and its own copy of the key (`to_string`, exactly as long as the
+/// key). Not the table's empty room: that is no one hash's, and deleting a
+/// hash does not give it back (the table does not shrink).
+pub fn watch_entry_size(key_len: usize) -> usize {
+    std::mem::size_of::<(Entry, Instant)>() + 1 + key_len
+}
+
 /// Note that the hash at `key` has a field due at `at`.
-pub fn track(store: &Store, db: usize, key: &str, at: Instant) {
+pub fn track(store: &Store, db: usize, key: &(impl AsRef<[u8]> + ?Sized), at: Instant) {
     let mut watched = WATCHED.lock();
     let watched = watched.get_or_insert_with(AHashMap::new);
     let earliest = watched
-        .entry((store_id(store), db, key.to_string()))
+        .entry((store_id(store), db, crate::store::Key::new(key.as_ref())))
         .or_insert(at);
     if at < *earliest {
         *earliest = at;
@@ -106,7 +115,7 @@ pub fn track(store: &Store, db: usize, key: &str, at: Instant) {
 /// from postings tries these documents themselves (see
 /// `commands::search::plan`). Every query that answers from postings asks:
 /// while no hash is watched, without the lock every one of them took.
-pub fn watched_keys(store: &Store, db: usize) -> Vec<String> {
+pub fn watched_keys(store: &Store, db: usize) -> Vec<crate::store::Key> {
     if !any_watched() {
         return Vec::new();
     }
@@ -125,7 +134,8 @@ pub fn watched_keys(store: &Store, db: usize) -> Vec<String> {
 /// Look at `key` and, if it is a hash with field TTLs, [`track`] it. For the
 /// commands that put such a hash under a key: the field-TTL commands
 /// themselves, and `RENAME`, `COPY`, `RESTORE`, `MOVE`.
-pub fn track_key(store: &Store, db: usize, key: &str) {
+pub fn track_key(store: &Store, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) {
+    let key = key.as_ref();
     let Some(db_ref) = store.get(db) else {
         return;
     };
@@ -143,7 +153,7 @@ pub fn track_key(store: &Store, db: usize, key: &str) {
 pub fn rescan(store: &Store) {
     for (db, db_ref) in store.iter().enumerate() {
         for shard in db_ref.iter() {
-            let due: Vec<(String, Instant)> = shard
+            let due: Vec<(crate::store::Key, Instant)> = shard
                 .read()
                 .iter()
                 .filter_map(|(key, value)| match value {
@@ -152,7 +162,7 @@ pub fn rescan(store: &Store) {
                         .expiries
                         .values()
                         .min()
-                        .map(|at| (key.to_string(), *at)),
+                        .map(|at| (crate::store::Key::new(key), *at)),
                     _ => None,
                 })
                 .collect();
@@ -168,7 +178,7 @@ pub fn rescan(store: &Store) {
 pub fn sweep(store: &Store, index_store: &IndexStore) {
     let id = store_id(store);
     let now = Instant::now();
-    let due: Vec<(usize, String)> = {
+    let due: Vec<(usize, crate::store::Key)> = {
         let watched = WATCHED.lock();
         let Some(watched) = watched.as_ref() else {
             return;
@@ -196,10 +206,7 @@ pub fn sweep(store: &Store, index_store: &IndexStore) {
         let command = crate::command_gate::enter();
         let order = crate::write_order::lock_keys(db, std::iter::once(key.as_bytes()));
         if let Some(db_ref) = store.get(db) {
-            let hash = match crate::store::get_shard(db_ref, &key)
-                .read()
-                .get(key.as_str())
-            {
+            let hash = match crate::store::get_shard(db_ref, &key).read().get(&key) {
                 Some(ValueRef::HashEx(hash)) => Some(std::sync::Arc::clone(hash)),
                 _ => None,
             };
@@ -226,10 +233,10 @@ pub fn sweep(store: &Store, index_store: &IndexStore) {
                 let db_ref = &store[db];
                 let mut map = crate::store::get_shard(db_ref, &key).write();
                 let still_empty = matches!(
-                    map.get(key.as_str()),
+                    map.get(&key),
                     Some(ValueRef::HashEx(hash)) if hash.read().fields.is_empty()
                 );
-                still_empty && map.remove(key.as_str()).is_some()
+                still_empty && map.remove(&key).is_some()
             };
             if removed {
                 crate::vector::maybe_unindex(index_store, db, &key);
@@ -296,10 +303,10 @@ pub fn sweep(store: &Store, index_store: &IndexStore) {
 /// What the sweep of `key`, which began at `now`, leaves of its watch: kept
 /// for `next`, the time its next field is due, or dropped. Under the key's
 /// write order.
-fn settle_watch(id: usize, db: usize, key: &str, next: Option<Instant>, now: Instant) {
+fn settle_watch(id: usize, db: usize, key: &[u8], next: Option<Instant>, now: Instant) {
     let mut watched = WATCHED.lock();
     if let Some(watched) = watched.as_mut() {
-        let entry = (id, db, key.to_string());
+        let entry = (id, db, crate::store::Key::new(key));
         match next {
             // Due sooner than the field this found, if a time to live was
             // given before this took the order: keep the earlier.

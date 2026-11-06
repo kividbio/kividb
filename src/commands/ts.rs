@@ -11,9 +11,8 @@
 use crate::commands::ctx::Ctx;
 use crate::commands::ts_query;
 use crate::resp::write::{
-    resp_array, resp_bulk_str, resp_error, resp_integer, resp_null_bulk, resp_simple,
+    resp_array, resp_bulk, resp_bulk_str, resp_error, resp_integer, resp_null_bulk, resp_simple,
 };
-use crate::store::Key;
 use crate::store::ValueRef;
 use crate::store::{self, SharedTsIndex, Store};
 use crate::types::{CompactionRule, DuplicatePolicy, KiviDBValue, TsAggregation, TsInner};
@@ -225,6 +224,9 @@ fn update_label_index(
         return;
     }
     let mut idx = write_lock!(ts_index);
+    // The index holds names (`key_bytes::text_of`), as its rebuild does.
+    let name = crate::key_bytes::text_of(key.as_bytes());
+    let key: &str = &name;
 
     // Remove key from all old label buckets
     for (lk, lv) in old_labels {
@@ -271,7 +273,7 @@ pub(super) fn keys_matching_filters(
                 let map = read_lock!(shard);
                 for (k, v) in map.iter() {
                     if matches!(v, ValueRef::TimeSeries(_)) {
-                        all.push(k.to_string());
+                        all.push(crate::key_bytes::text_of(k).into_owned());
                     }
                 }
             }
@@ -283,9 +285,11 @@ pub(super) fn keys_matching_filters(
     candidates
         .into_iter()
         .filter(|k| {
-            let shard = store::get_shard(db, k);
+            // A name: the key is its bytes_of.
+            let raw = crate::key_bytes::bytes_of(k);
+            let shard = store::get_shard(db, &*raw);
             let map = read_lock!(shard);
-            if let Some(ValueRef::TimeSeries(inner)) = map.get(k.as_str()) {
+            if let Some(ValueRef::TimeSeries(inner)) = map.get(&*raw) {
                 // Clone just the labels AHashMap — cheap for small label sets
                 let labels = inner.read().labels.clone();
                 filters.iter().all(|f| f.matches(&labels))
@@ -312,7 +316,7 @@ fn series_for_append(ctx: &Ctx, key: &str) -> Result<(Series, bool), Vec<u8>> {
             let mut fresh = TsInner::new();
             fresh.duplicate_policy = DuplicatePolicy::server_default();
             let series: Series = Arc::new(RwLock::new(fresh));
-            map.insert(Key::from(key), KiviDBValue::TimeSeries(Arc::clone(&series)));
+            map.insert(key, KiviDBValue::TimeSeries(Arc::clone(&series)));
             Ok((series, true))
         }
     }
@@ -343,7 +347,10 @@ fn after_append(ctx: &Ctx, key: &str, series: &Series, ts: u64) {
         source
             .rules
             .iter()
-            .filter(|rule| rule.bucket_duration > 0 && rule.dest_key != key)
+            .filter(|rule| {
+                rule.bucket_duration > 0
+                    && *rule.dest_key != *crate::key_bytes::text_of(key.as_bytes())
+            })
             .filter_map(|rule| {
                 let bucket_of =
                     |t: u64| ts_query::bucket_start(t, rule.align_timestamp, rule.bucket_duration);
@@ -367,9 +374,11 @@ fn after_append(ctx: &Ctx, key: &str, series: &Series, ts: u64) {
             .collect()
     };
     for (dest_key, bucket, value) in updates {
+        // A rule names its destination (`key_bytes::text_of`).
+        let dest_key = crate::key_bytes::bytes_of(&dest_key);
         let dest = {
-            let shard = store::get_shard(&ctx.store[*ctx.selected_db], &dest_key);
-            match read_lock!(shard).get(dest_key.as_str()) {
+            let shard = store::get_shard(&ctx.store[*ctx.selected_db], &*dest_key);
+            match read_lock!(shard).get(&*dest_key) {
                 Some(ValueRef::TimeSeries(inner)) => Arc::clone(inner),
                 // The destination was deleted or replaced; the rule is dead.
                 _ => continue,
@@ -451,10 +460,7 @@ fn ts_create(ctx: &mut Ctx) -> Option<Vec<u8>> {
         ts.labels.insert(lk.clone(), lv.clone());
     }
 
-    map.insert(
-        Key::from(&*key),
-        KiviDBValue::TimeSeries(Arc::new(RwLock::new(ts))),
-    );
+    map.insert(&*key, KiviDBValue::TimeSeries(Arc::new(RwLock::new(ts))));
     drop(map);
 
     update_label_index(ctx.ts_index, &key, &ahash::AHashMap::new(), &labels);
@@ -827,13 +833,16 @@ fn ts_get(ctx: &mut Ctx) -> Option<Vec<u8>> {
         Some(arg) if arg.eq_ignore_ascii_case(b"LATEST") && cmd.len() == 3 => true,
         Some(_) => return Some(resp_error("ERR syntax error")),
     };
-    let inner = match ts_query::series_at(ctx, key) {
+    let inner = match ts_query::series_at(ctx, key.as_bytes()) {
         Ok(Some(inner)) => inner,
         Ok(None) => return Some(resp_null_bulk()),
         Err(e) => return Some(e),
     };
     // A compaction's bucket still open, with `LATEST` (#128).
-    if latest && let Some((at, value)) = ts_query::open_bucket(ctx, &inner, key) {
+    if latest
+        && let Some((at, value)) =
+            ts_query::open_bucket(ctx, &inner, &crate::key_bytes::text_of(key.as_bytes()))
+    {
         return Some(ts_query::sample_reply(resp, at, value));
     }
     let ts = inner.read();
@@ -909,7 +918,7 @@ fn ts_mget(ctx: &mut Ctx) -> Option<Vec<u8>> {
     for k in &matching_keys {
         // The series, and no shard held while it is read: `LATEST` reads its
         // source's as well.
-        if let Ok(Some(inner)) = ts_query::series_at(ctx, k) {
+        if let Ok(Some(inner)) = ts_query::series_at(ctx, &crate::key_bytes::bytes_of(k)) {
             let open = if latest {
                 ts_query::open_bucket(ctx, &inner, k)
             } else {
@@ -949,7 +958,11 @@ fn ts_mget(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 (None, None) => resp_array(vec![]),
             };
 
-            results.push(resp_array(vec![resp_bulk_str(k), labels_resp, sample_resp]));
+            results.push(resp_array(vec![
+                resp_bulk(&crate::key_bytes::bytes_of(k)),
+                labels_resp,
+                sample_resp,
+            ]));
         }
     }
 
@@ -1012,7 +1025,7 @@ fn ts_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
             out.push(resp_bulk_str("sourceKey"));
             out.push(match &ts.source {
-                Some(source) => resp_bulk_str(source),
+                Some(source) => resp_bulk(&crate::key_bytes::bytes_of(source)),
                 // RESP3's null to a RESP3 client: `$-1` there breaks it.
                 None => crate::resp::write::resp_null_for(resp),
             });
@@ -1024,7 +1037,7 @@ fn ts_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 .iter()
                 .map(|r| {
                     resp_array(vec![
-                        resp_bulk_str(&r.dest_key),
+                        resp_bulk(&crate::key_bytes::bytes_of(&r.dest_key)),
                         resp_bulk_str(&r.bucket_duration.to_string()),
                         resp_bulk_str(&format!("{:?}", r.aggregation).to_uppercase()),
                         resp_bulk_str(&r.align_timestamp.to_string()),
@@ -1059,10 +1072,15 @@ fn ts_queryindex(ctx: &mut Ctx) -> Option<Vec<u8>> {
         return Some(resp_error("ERR FILTER is required for TS.QUERYINDEX"));
     }
 
-    let mut keys = keys_matching_filters(ctx.store, *ctx.selected_db, ctx.ts_index, &filters);
+    // Names: the keys are their bytes_of, sorted as bytes.
+    let mut keys: Vec<Vec<u8>> =
+        keys_matching_filters(ctx.store, *ctx.selected_db, ctx.ts_index, &filters)
+            .iter()
+            .map(|name| crate::key_bytes::bytes_of(name).into_owned())
+            .collect();
     keys.sort();
 
-    let items: Vec<Vec<u8>> = keys.iter().map(|k| resp_bulk_str(k)).collect();
+    let items: Vec<Vec<u8>> = keys.iter().map(|k| resp_bulk(k)).collect();
     Some(resp_array(items))
 }
 
@@ -1106,7 +1124,7 @@ fn ts_createrule(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "TSDB: the source key and destination key should be different",
         ));
     }
-    let dest = match ts_query::series_at(ctx, &dest_key) {
+    let dest = match ts_query::series_at(ctx, dest_key.as_bytes()) {
         Ok(Some(dest)) => dest,
         Ok(None) => return Some(resp_error("TSDB: the key does not exist")),
         Err(e) => return Some(e),
@@ -1123,8 +1141,9 @@ fn ts_createrule(ctx: &mut Ctx) -> Option<Vec<u8>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
+    // Names (`key_bytes::text_of`), as a snapshot keeps them.
     let rule = CompactionRule {
-        dest_key,
+        dest_key: crate::key_bytes::text_of(dest_key.as_bytes()).into_owned(),
         aggregation: agg,
         bucket_duration,
         align_timestamp: align,
@@ -1144,7 +1163,7 @@ fn ts_createrule(ctx: &mut Ctx) -> Option<Vec<u8>> {
             ts.rules.push(rule);
             drop(ts);
             drop(map);
-            dest.write().source = Some(src_key);
+            dest.write().source = Some(crate::key_bytes::text_of(src_key.as_bytes()).into_owned());
             Some(resp_simple("OK"))
         }
         Some(_) => Some(resp_error(
@@ -1180,15 +1199,18 @@ fn ts_deleterule(ctx: &mut Ctx) -> Option<Vec<u8>> {
         Some(ValueRef::TimeSeries(inner)) => {
             let mut ts = inner.write();
             let before = ts.rules.len();
-            ts.rules.retain(|r| r.dest_key != dest_key);
+            let dest_name = crate::key_bytes::text_of(dest_key.as_bytes());
+            ts.rules.retain(|r| *r.dest_key != *dest_name);
             if ts.rules.len() == before {
                 Some(resp_error("TSDB: compaction rule does not exist"))
             } else {
                 drop(ts);
                 drop(map);
-                if let Ok(Some(dest)) = ts_query::series_at(ctx, &dest_key) {
+                if let Ok(Some(dest)) = ts_query::series_at(ctx, dest_key.as_bytes()) {
                     let mut dest = dest.write();
-                    if dest.source.as_deref() == Some(src_key.as_str()) {
+                    if dest.source.as_deref()
+                        == Some(&*crate::key_bytes::text_of(src_key.as_bytes()))
+                    {
                         dest.source = None;
                     }
                 }

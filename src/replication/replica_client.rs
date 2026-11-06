@@ -184,6 +184,16 @@ enum SessionError {
     /// The master lost its dataset, and this replica, which holds it, is
     /// taking over rather than syncing from it. The local dataset is intact.
     TakingOver(String),
+    /// The master sent what this replica can't hold: a dataset it refuses to
+    /// load whole for what is in it (a type, or a set member's TTL, it has
+    /// nowhere to keep), or a write it can't apply (a KeyDB member TTL on a
+    /// set, KeyDB's `RREPLAY`). Following on would lose data, so it doesn't;
+    /// it says why, in the log and in `INFO replication`. The same master
+    /// sends the same again, and each try is a full sync on it, so it tries
+    /// again after a minute, then less and less often (see
+    /// [`unfollowable_delay`]). A payload cut short, or one that fails its
+    /// checksum, is a broken link, not this.
+    Unfollowable(String),
     /// See [`SessionEnd::Superseded`].
     Superseded,
 }
@@ -209,6 +219,14 @@ const EPOCH_CHECK_INTERVAL: Duration = Duration::from_millis(200);
 /// comes back should be picked up promptly.
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
+/// How long to wait after the `n`th refusal in a row of what the master
+/// sent ([`SessionError::Unfollowable`], from 0): a minute, doubling up to
+/// ten. It is decided by what the master holds, and the master sends it
+/// again until someone changes that.
+fn unfollowable_delay(n: u32) -> Duration {
+    Duration::from_secs((60u64 << n.min(4)).min(600))
+}
+
 /// Delay after the dataset guard refuses a sync. Retrying sooner would only
 /// re-download a payload that will be refused again; the operator has to act.
 const REFUSED_RETRY_DELAY: Duration = Duration::from_secs(10);
@@ -227,6 +245,8 @@ pub async fn start_replica(
 ) {
     let repl_state = Arc::clone(&starter.repl_state);
     let mut failures: u64 = 0;
+    // Refusals in a row of what the master sent (`Unfollowable`).
+    let mut unfollowable: u32 = 0;
 
     loop {
         if repl_state.generation() != my_generation {
@@ -268,9 +288,11 @@ pub async fn start_replica(
             Ok(SessionEnd::MasterClosed) => {
                 log_warn!("Replication: Master closed the connection — reconnecting");
                 failures = 0;
+                unfollowable = 0;
                 RECONNECT_DELAY
             }
             Err(SessionError::Link(e)) => {
+                unfollowable = 0;
                 if verbose {
                     log_warn!(
                         "Replication: Replication link to {master_host}:{master_port} failed: {e} — \
@@ -301,6 +323,20 @@ pub async fn start_replica(
                 }
                 failures += 1;
                 REFUSED_RETRY_DELAY
+            }
+            Err(SessionError::Unfollowable(reason)) => {
+                // Every time: a minute or more apart, and each says why this
+                // replica is not in sync.
+                let delay = unfollowable_delay(unfollowable);
+                unfollowable = unfollowable.saturating_add(1);
+                *repl_state.last_sync_refusal.write() = Some(reason.clone());
+                log_error!(
+                    "Replication: NOT following {master_host}:{master_port}: {reason}. This \
+                     replica is NOT in sync; it tries again in {}s.",
+                    delay.as_secs()
+                );
+                failures += 1;
+                delay
             }
             Err(SessionError::TakingOver(reason)) => {
                 let first = repl_state
@@ -1293,7 +1329,10 @@ async fn run_replication_session(
                             // Where the dataset stands is no longer known to
                             // be a point in the stream: resync in full.
                             repl_state.set_resync_point(None);
-                            SessionError::Link(e.to_string())
+                            match e.downcast::<crate::replication::keydb::Unfollowable>() {
+                                Ok(why) => SessionError::Unfollowable(why.0),
+                                Err(e) => SessionError::Link(e.to_string()),
+                            }
                         })?
                 };
             }
@@ -1633,7 +1672,7 @@ fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync
 
     let is_kividb = payload.len() >= 8 && payload[..8] == *crate::snapshot::KDB_MAGIC;
     let (dbs, expiries, index_schemas, dictionaries, functions) = if is_kividb {
-        let loaded = crate::snapshot::load_snapshot_from(payload).map_err(|e| {
+        let loaded = crate::snapshot::load_snapshot_bytes(payload).map_err(|e| {
             SessionError::Link(format!("full-sync payload is not a valid KDB image: {e}"))
         })?;
         (
@@ -1646,7 +1685,14 @@ fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync
     } else {
         let (dbs, expiries, functions) =
             crate::snapshot::load_redis_rdb_from(payload).map_err(|e| {
-                SessionError::Link(format!("full-sync payload is not a valid RDB: {e}"))
+                let what = format!("full-sync payload is not a valid RDB: {e}");
+                // Refused for what it holds (it would be refused again), not
+                // cut short or corrupt: see `SessionError::Unfollowable`.
+                if crate::snapshot::is_unrepresentable(&e) {
+                    SessionError::Unfollowable(what)
+                } else {
+                    SessionError::Link(what)
+                }
             })?;
         (dbs, expiries, Vec::new(), Vec::new(), functions)
     };
@@ -1974,6 +2020,64 @@ impl ReplicationApplyEnv {
         watch_registry: &dyn crate::watch::WatchNotifier,
         peer_addr: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::replication::keydb::{self, Translated};
+        // What KeyDB sends that Redis does not: member TTLs (`EXPIREMEMBER`),
+        // applied as hash-field TTLs, and `RREPLAY`, refused. Any other
+        // command is applied as it is, with nothing done first.
+        let (cmd, member_ttl) = if keydb::is_keydb_command(&cmd) {
+            match keydb::translate(cmd)? {
+                Translated::AsIs(cmd) => (cmd, None),
+                Translated::MemberTtl { command, what } => (command, Some(what)),
+            }
+        } else {
+            (cmd, None)
+        };
+        let out = self.execute_applied(
+            cmd,
+            store,
+            repl_state,
+            index_store,
+            dict_store,
+            wait_table,
+            ts_index,
+            config,
+            compaction_tx,
+            selected_db,
+            watch_registry,
+            peer_addr,
+        );
+        if let Some(what) = member_ttl
+            && out.starts_with(b"-WRONGTYPE")
+        {
+            return Err(Box::new(keydb::Unfollowable(what)));
+        }
+        if !out.is_empty() && out[0] == b'-' {
+            let tail = out.len().min(512);
+            log_warn!(
+                "Replication: Replicated command error (non-fatal): {}",
+                String::from_utf8_lossy(&out[..tail])
+            );
+        }
+        Ok(())
+    }
+
+    /// One write from the master, applied; its reply.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_applied(
+        &self,
+        cmd: Vec<Vec<u8>>,
+        store: &Store,
+        repl_state: &Arc<ReplState>,
+        index_store: &IndexStore,
+        dict_store: &DictStore,
+        wait_table: &Arc<WaitTable>,
+        ts_index: &SharedTsIndex,
+        config: &Arc<Config>,
+        compaction_tx: &CompactionTx,
+        selected_db: &mut usize,
+        watch_registry: &dyn crate::watch::WatchNotifier,
+        peer_addr: &str,
+    ) -> Vec<u8> {
         use crate::commands::ctx::Ctx;
         use crate::commands::execute_command;
         let cmd_refs: Vec<&[u8]> = cmd.iter().map(|v| v.as_slice()).collect();
@@ -1988,7 +2092,7 @@ impl ReplicationApplyEnv {
             .master_propagates_expiry
             .load(Ordering::Relaxed)
             .then(crate::expiry::hold);
-        let out = execute_command(Ctx {
+        execute_command(Ctx {
             cmd: cmd_refs,
             store,
             lastsave: &self.lastsave,
@@ -2026,16 +2130,7 @@ impl ReplicationApplyEnv {
             authenticated_user: "default",
             tracking_table: &self.tracking_table,
             blocking: None,
-        });
-
-        if !out.is_empty() && out[0] == b'-' {
-            let tail = out.len().min(512);
-            log_warn!(
-                "Replication: Replicated command error (non-fatal): {}",
-                String::from_utf8_lossy(&out[..tail])
-            );
-        }
-        Ok(())
+        })
     }
 }
 

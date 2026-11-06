@@ -4,7 +4,6 @@ use crate::commands::helpers::*;
 use crate::keyspace_events::{KS_HASH, notify, notify_subkeys};
 use crate::resp::write::*;
 use crate::store;
-use crate::store::Key;
 use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::{read_lock, write_lock};
@@ -791,11 +790,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     );
                     let mut items: Vec<Vec<u8>> = Vec::with_capacity(page.len() * 2);
                     for (f, v) in page {
-                        if options
-                            .pattern
-                            .as_deref()
-                            .is_some_and(|pat| !crate::commands::helpers::glob_match(pat, f))
-                        {
+                        if options.pattern.as_deref().is_some_and(|pat| {
+                            !crate::commands::helpers::glob_match_bytes(
+                                pat,
+                                &crate::commands::helpers::name_to_bytes(f),
+                            )
+                        }) {
                             continue;
                         }
                         items.push(resp_bulk(&crate::commands::helpers::name_to_bytes(f)));
@@ -852,6 +852,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if secs < 0 {
                 return Some(resp_error("ERR invalid expire time, must be >= 0"));
             }
+            if field_deadline_ms(secs, true, now_ms() as i64).is_none() {
+                return Some(invalid_field_expire_time("HEXPIRE"));
+            }
             let (flag, fields) = match parse_hfe_tail(
                 &cmd.iter().map(|v| v.to_vec()).collect::<Vec<Vec<u8>>>(),
                 3,
@@ -890,6 +893,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if ms < 0 {
                 return Some(resp_error("ERR invalid expire time, must be >= 0"));
             }
+            if field_deadline_ms(ms, false, now_ms() as i64).is_none() {
+                return Some(invalid_field_expire_time("HPEXPIRE"));
+            }
             let (flag, fields) = match parse_hfe_tail(
                 &cmd.iter().map(|v| v.to_vec()).collect::<Vec<Vec<u8>>>(),
                 3,
@@ -924,6 +930,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
+            if let Some(refused) = negative_unix_time(ctx, unix_secs) {
+                return Some(refused);
+            }
             let (flag, fields) = match parse_hfe_tail(
                 &cmd.iter().map(|v| v.to_vec()).collect::<Vec<Vec<u8>>>(),
                 3,
@@ -938,10 +947,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let (new_exp, is_past) = if unix_secs <= 0 {
                 (Instant::now(), true)
             } else {
-                let target = std::time::UNIX_EPOCH + Duration::from_secs(unix_secs as u64);
-                match target.duration_since(std::time::SystemTime::now()) {
-                    Ok(d) => (Instant::now() + d, false),
-                    Err(_) => (Instant::now(), true),
+                let Some(at_ms) = field_deadline_ms(unix_secs, true, 0) else {
+                    return Some(invalid_field_expire_time("HEXPIREAT"));
+                };
+                match FieldClock::now().instant_of(at_ms as u64) {
+                    Some(at) => (at, false),
+                    None => (Instant::now(), true),
                 }
             };
 
@@ -968,6 +979,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
+            if let Some(refused) = negative_unix_time(ctx, unix_ms) {
+                return Some(refused);
+            }
             let (flag, fields) = match parse_hfe_tail(
                 &cmd.iter().map(|v| v.to_vec()).collect::<Vec<Vec<u8>>>(),
                 3,
@@ -979,10 +993,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let (new_exp, is_past) = if unix_ms <= 0 {
                 (Instant::now(), true)
             } else {
-                let target = std::time::UNIX_EPOCH + Duration::from_millis(unix_ms as u64);
-                match target.duration_since(std::time::SystemTime::now()) {
-                    Ok(d) => (Instant::now() + d, false),
-                    Err(_) => (Instant::now(), true),
+                let Some(at_ms) = field_deadline_ms(unix_ms, false, 0) else {
+                    return Some(invalid_field_expire_time("HPEXPIREAT"));
+                };
+                match FieldClock::now().instant_of(at_ms as u64) {
+                    Some(at) => (at, false),
+                    None => (Instant::now(), true),
                 }
             };
 
@@ -1129,7 +1145,7 @@ fn write_hash<R>(
             let out = write(&mut fields, None);
             if !fields.is_empty() {
                 let hash = Arc::new(parking_lot::RwLock::new(fields));
-                map.insert(Key::from(key), KiviDBValue::Hash(hash));
+                map.insert(key, KiviDBValue::Hash(hash));
             }
             Ok(out)
         }
@@ -1396,7 +1412,7 @@ fn apply_field_expire_inner(
             drop(plain_w);
 
             let new_arc = Arc::new(RwLock::new(new_inner));
-            map.insert(Key::from(key), KiviDBValue::HashEx(Arc::clone(&new_arc)));
+            map.insert(key, KiviDBValue::HashEx(Arc::clone(&new_arc)));
 
             apply_to_hashex(&new_arc, fields, new_exp, flag, is_past)
         }
@@ -1498,6 +1514,21 @@ fn parse_hfe_read_tail(cmd: &[&[u8]], start_idx: usize) -> Result<Vec<String>, V
     Ok(fields)
 }
 
+/// Redis's reply to a negative Unix time given to `HEXPIREAT`, `HPEXPIREAT`
+/// or `EXAT`/`PXAT` of `HGETEX` and `HSETEX` (#486); `None` when `n` is
+/// taken. 0 is taken, and the fields go, as in Redis. A negative one used
+/// to be taken as a time that had passed, and the fields were deleted
+/// where Redis keeps them and refuses the command.
+///
+/// From the write stream (a replica applying its master's, an AOF
+/// replayed) a negative one is still taken as passed: a 1.2.0 server did
+/// that and sent the command on as it came, and a field it deleted would
+/// otherwise come back. No Redis or Valkey master sends one.
+fn negative_unix_time(ctx: &Ctx, n: i64) -> Option<Vec<u8>> {
+    (n < 0 && !(ctx.apply_replication || crate::expiry::replaying()))
+        .then(|| resp_error("ERR invalid expire time, must be >= 0"))
+}
+
 /// Convert a stored Instant expiry to the requested unit.
 /// Past Instants saturate to 0; the lazy-eviction sweep already removed the
 /// field by the time we reach this helper, but we still handle it defensively.
@@ -1515,12 +1546,15 @@ fn instant_to_hfe_value(exp: Instant, mode: HfeReadMode) -> i64 {
         let unix_now = now_sys
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
-        (unix_now + delta + Duration::from_micros(500)).as_millis() as i64
+        // Saturated, not cut to 64 bits, which made a far deadline negative.
+        i64::try_from((unix_now + delta + Duration::from_micros(500)).as_millis())
+            .unwrap_or(i64::MAX)
     };
+    let saturated = |n: u128| i64::try_from(n).unwrap_or(i64::MAX);
 
     match mode {
-        HfeReadMode::RemainingSecs => delta.as_micros().div_ceil(1_000_000) as i64,
-        HfeReadMode::RemainingMillis => delta.as_micros().div_ceil(1_000) as i64,
+        HfeReadMode::RemainingSecs => saturated(delta.as_micros().div_ceil(1_000_000)),
+        HfeReadMode::RemainingMillis => saturated(delta.as_micros().div_ceil(1_000)),
         HfeReadMode::AbsoluteSecs => at_ms() / 1000,
         HfeReadMode::AbsoluteMillis => at_ms(),
     }
@@ -1823,6 +1857,21 @@ fn run_hgetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                         return Some(resp_error("ERR value is not an integer or out of range"));
                     }
                 };
+                // Past the latest deadline Redis allows: refused, as by Redis.
+                let relative = matches!(tok.as_str(), "EX" | "PX");
+                if n > 0
+                    && field_deadline_ms(
+                        n,
+                        matches!(tok.as_str(), "EX" | "EXAT"),
+                        if relative { now_ms() as i64 } else { 0 },
+                    )
+                    .is_none()
+                {
+                    return Some(invalid_field_expire_time("HGETEX"));
+                }
+                if !relative && let Some(refused) = negative_unix_time(ctx, n) {
+                    return Some(refused);
+                }
                 let act = match tok.as_str() {
                     "EX" | "PX" if n < 0 => {
                         return Some(resp_error("ERR invalid expire time, must be >= 0"));
@@ -1833,26 +1882,18 @@ fn run_hgetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                     "PX" => {
                         HgetexAction::SetExpiry(Instant::now() + Duration::from_millis(n as u64))
                     }
-                    "EXAT" => {
-                        if n <= 0 {
-                            HgetexAction::SetExpiryPast
+                    "EXAT" | "PXAT" => {
+                        let at_ms = if tok == "EXAT" {
+                            n.saturating_mul(1000)
                         } else {
-                            let target = std::time::UNIX_EPOCH + Duration::from_secs(n as u64);
-                            match target.duration_since(std::time::SystemTime::now()) {
-                                Ok(d) => HgetexAction::SetExpiry(Instant::now() + d),
-                                Err(_) => HgetexAction::SetExpiryPast,
-                            }
-                        }
-                    }
-                    "PXAT" => {
-                        if n <= 0 {
-                            HgetexAction::SetExpiryPast
-                        } else {
-                            let target = std::time::UNIX_EPOCH + Duration::from_millis(n as u64);
-                            match target.duration_since(std::time::SystemTime::now()) {
-                                Ok(d) => HgetexAction::SetExpiry(Instant::now() + d),
-                                Err(_) => HgetexAction::SetExpiryPast,
-                            }
+                            n
+                        };
+                        match (at_ms > 0)
+                            .then(|| FieldClock::now().instant_of(at_ms as u64))
+                            .flatten()
+                        {
+                            Some(at) => HgetexAction::SetExpiry(at),
+                            None => HgetexAction::SetExpiryPast,
                         }
                     }
                     _ => unreachable!(),
@@ -1911,7 +1952,7 @@ fn run_hgetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 new_inner.fields = std::mem::take(&mut *plain_w);
                 drop(plain_w);
                 let new_arc = Arc::new(parking_lot::RwLock::new(new_inner));
-                wmap.insert(Key::from(&*key), KiviDBValue::HashEx(Arc::clone(&new_arc)));
+                wmap.insert(&*key, KiviDBValue::HashEx(Arc::clone(&new_arc)));
                 drop(wmap);
                 Some(resp_array(hgetex_apply(
                     ctx, &key, &new_arc, &fields, action, resp,
@@ -2250,6 +2291,9 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // Legacy form: the TTL in seconds comes straight after the key.
     let legacy_expiry = match integer(cmd[2]) {
         Some(secs) if secs > 0 => {
+            if field_deadline_ms(secs, true, now_ms() as i64).is_none() {
+                return Some(invalid_field_expire_time("HSETEX"));
+            }
             idx = 3;
             Some(Instant::now() + Duration::from_secs(secs as u64))
         }
@@ -2294,10 +2338,21 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 let Some(n) = cmd.get(idx + 1).and_then(|a| integer(a)) else {
                     return Some(resp_error("ERR value is not an integer or out of range"));
                 };
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as i64;
+                // Past the latest deadline Redis allows: refused, as by Redis.
+                let relative = matches!(tok.as_str(), "EX" | "PX");
+                if n > 0
+                    && field_deadline_ms(
+                        n,
+                        matches!(tok.as_str(), "EX" | "EXAT"),
+                        if relative { now_ms() as i64 } else { 0 },
+                    )
+                    .is_none()
+                {
+                    return Some(invalid_field_expire_time("HSETEX"));
+                }
+                if !relative && let Some(refused) = negative_unix_time(ctx, n) {
+                    return Some(refused);
+                }
                 ttl = Some(match tok.as_str() {
                     "EX" | "PX" if n < 0 => {
                         return Some(resp_error("ERR invalid expire time, must be >= 0"));
@@ -2312,18 +2367,20 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                         };
                         HsetexTtl::Set(Instant::now() + Duration::from_millis(ms as u64))
                     }
+                    // A Unix time, to the nanosecond (#448): cutting the
+                    // time now to a millisecond made the deadline later.
                     _ => {
                         let at_ms = if tok == "EXAT" {
                             n.saturating_mul(1000)
                         } else {
                             n
                         };
-                        if at_ms <= now_ms {
-                            HsetexTtl::Past
-                        } else {
-                            HsetexTtl::Set(
-                                Instant::now() + Duration::from_millis((at_ms - now_ms) as u64),
-                            )
+                        match (at_ms > 0)
+                            .then(|| FieldClock::now().instant_of(at_ms as u64))
+                            .flatten()
+                        {
+                            Some(at) => HsetexTtl::Set(at),
+                            None => HsetexTtl::Past,
                         }
                     }
                 });
@@ -2389,7 +2446,7 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
             new_inner.fields = std::mem::take(&mut *plain_w);
             drop(plain_w);
             let new_arc = Arc::new(parking_lot::RwLock::new(new_inner));
-            map.insert(Key::from(&*key), KiviDBValue::HashEx(Arc::clone(&new_arc)));
+            map.insert(&*key, KiviDBValue::HashEx(Arc::clone(&new_arc)));
             new_arc
         }
         Some(_) => {
@@ -2404,7 +2461,7 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 return Some(resp_integer(0));
             }
             let new_arc = Arc::new(parking_lot::RwLock::new(crate::types::HashInner::new()));
-            map.insert(Key::from(&*key), KiviDBValue::HashEx(Arc::clone(&new_arc)));
+            map.insert(&*key, KiviDBValue::HashEx(Arc::clone(&new_arc)));
             new_arc
         }
     };

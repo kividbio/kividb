@@ -55,6 +55,12 @@ impl MemberSet {
         self.table.capacity()
     }
 
+    /// The bytes of the table's one allocation (buckets and control bytes),
+    /// from its bucket count: no walk. The members' own blocks are not in it.
+    pub fn allocation_size(&self) -> usize {
+        self.table.allocation_size()
+    }
+
     #[inline]
     pub fn contains(&self, member: &[u8]) -> bool {
         self.get(member).is_some()

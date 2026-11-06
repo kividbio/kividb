@@ -143,7 +143,7 @@ fn replace_watch_begin(ctx: &Ctx, name: &str) -> Option<ReplaceWatch> {
         .into_iter()
         .filter_map(|(db, pos)| {
             let db = db.unwrap_or(*ctx.selected_db);
-            let key = std::str::from_utf8(ctx.cmd[pos]).ok()?;
+            let key = ctx.cmd[pos];
             let held =
                 crate::read_lock!(crate::store::get_shard(ctx.store.get(db)?, key)).get_ref(key)?;
             Some((db, pos, held))
@@ -168,9 +168,7 @@ fn replace_watch_end(ctx: &Ctx, watch: ReplaceWatch) {
         Vec::new()
     };
     for (db, pos, old) in watch.before {
-        let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) else {
-            continue;
-        };
+        let key = ctx.cmd[pos];
         // Whether the key has another value now, and whether of another type.
         let replaced = {
             let map = crate::read_lock!(crate::store::get_shard(&ctx.store[db], key));
@@ -290,8 +288,9 @@ pub(crate) fn execute_command_from_script(
 /// Whether a script may not run the command `name` (in capitals), whose
 /// first argument is `sub`: the commands and subcommands flagged `NOSCRIPT`
 /// in Valkey 9.1.3's command table (BSD-3-Clause, the same source as
-/// COMMAND DOCS), which Redis refuses the same way, refused before anything
-/// else is looked at. They change the connection (`MULTI`, `SUBSCRIBE`, `HELLO`, `CLIENT
+/// COMMAND DOCS), which Redis refuses the same way, and KiviDB's `BACKUP`
+/// and `HOTKEYS` subcommands that start or stop something, refused before
+/// anything else is looked at. They change the connection (`MULTI`, `SUBSCRIBE`, `HELLO`, `CLIENT
 /// SETNAME`, ...), the server (`CONFIG SET`, `ACL SETUSER`, `REPLICAOF`,
 /// `SHUTDOWN`, ...), or wait for what waits for the script: a script holds a
 /// slot of the write gate, and a `SAVE` in one, on a replica, waited for the
@@ -403,10 +402,8 @@ fn script_key_refusal(ctx: &Ctx, name: &str) -> Option<Vec<u8>> {
         false,
         || registry.get_readonly(client_id),
         |key| {
-            std::str::from_utf8(key).is_ok_and(|key| {
-                let shard = crate::store::get_shard(&store[db], key);
-                crate::read_lock!(shard).contains_key(key)
-            })
+            let shard = crate::store::get_shard(&store[db], key);
+            crate::read_lock!(shard).contains_key(key)
         },
     );
     match decision {
@@ -452,13 +449,11 @@ fn keys_of_several_shards(
     let Some(db) = store.get(db) else {
         return false;
     };
-    let mut shards = keys.iter().map(|pos| {
-        std::str::from_utf8(cmd[pos])
-            .map(|key| crate::store::shard_index(db.len(), key))
-            .ok()
-    });
-    let first = shards.next().flatten();
-    first.is_none() || shards.any(|shard| shard != first)
+    let mut shards = keys
+        .iter()
+        .map(|pos| crate::store::shard_index_of_bytes(db.len(), cmd[pos]));
+    let first = shards.next();
+    first.is_none() || shards.any(|shard| Some(shard) != first)
 }
 
 /// Whether a command takes the command gate alone: the one rule, asked by
@@ -1003,11 +998,7 @@ fn routed_again_in_gate(
         ctx.cluster,
         routed.asking(),
         || registry.get_readonly(client_id),
-        |key| {
-            std::str::from_utf8(key).is_ok_and(|key| {
-                crate::read_lock!(crate::store::get_shard(&store[db], key)).contains_key(key)
-            })
-        },
+        |key| crate::read_lock!(crate::store::get_shard(&store[db], key)).contains_key(key),
     )
     .refusal()
 }
@@ -1060,12 +1051,8 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
             let store_for_check = ctx.store;
             let db = *ctx.selected_db;
             let has_key_locally = |key: &[u8]| -> bool {
-                let key_str = match std::str::from_utf8(key) {
-                    Ok(s) => s,
-                    Err(_) => return false,
-                };
-                let shard = crate::store::get_shard(&store_for_check[db], key_str);
-                crate::read_lock!(shard).contains_key(key_str)
+                let shard = crate::store::get_shard(&store_for_check[db], key);
+                crate::read_lock!(shard).contains_key(key)
             };
             let registry = ctx.client_registry;
             let client_id = ctx.client_id;
@@ -1357,10 +1344,8 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
                 // whether the key is still here.
                 |key| {
                     handoff
-                        || std::str::from_utf8(key).is_ok_and(|key| {
-                            crate::read_lock!(crate::store::get_shard(&store[db], key))
-                                .contains_key(key)
-                        })
+                        || crate::read_lock!(crate::store::get_shard(&store[db], key))
+                            .contains_key(key)
                 },
             );
             if let Some(refusal) = decision.refusal() {
@@ -1489,14 +1474,14 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         && crate::keyspace_events::KS_FLAGS.load(std::sync::atomic::Ordering::Relaxed)
             & crate::keyspace_events::KS_NEW
             != 0;
-    let exists = |ctx: &Ctx, key: &str| {
+    let exists = |ctx: &Ctx, key: &[u8]| {
         crate::read_lock!(crate::store::get_shard(&ctx.store[*ctx.selected_db], key))
             .contains_key(key)
     };
     let absent: Vec<usize> = if announce_new {
         crate::keyspec::key_positions(name, &ctx.cmd)
             .iter()
-            .filter(|pos| std::str::from_utf8(ctx.cmd[*pos]).is_ok_and(|key| !exists(ctx, key)))
+            .filter(|pos| !exists(ctx, ctx.cmd[*pos]))
             .collect()
     } else {
         Vec::new()
@@ -1511,7 +1496,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     {
         crate::keyspec::key_positions(name, &ctx.cmd)
             .iter()
-            .filter(|pos| std::str::from_utf8(ctx.cmd[*pos]).is_ok_and(|key| !exists(ctx, key)))
+            .filter(|pos| !exists(ctx, ctx.cmd[*pos]))
             .collect()
     } else {
         Vec::new()
@@ -1566,9 +1551,8 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     }
 
     for pos in absent {
-        if let Ok(key) = std::str::from_utf8(ctx.cmd[pos])
-            && exists(ctx, key)
-        {
+        let key = ctx.cmd[pos];
+        if exists(ctx, key) {
             crate::keyspace_events::notify(
                 ctx.pubsub,
                 *ctx.selected_db,
@@ -1579,15 +1563,13 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         }
     }
     for pos in missed {
-        if let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) {
-            crate::keyspace_events::notify(
-                ctx.pubsub,
-                *ctx.selected_db,
-                crate::keyspace_events::KS_KEY_MISS,
-                "keymiss",
-                key,
-            );
-        }
+        crate::keyspace_events::notify(
+            ctx.pubsub,
+            *ctx.selected_db,
+            crate::keyspace_events::KS_KEY_MISS,
+            "keymiss",
+            ctx.cmd[pos],
+        );
     }
     // The events of the commands that announce none of their own (#160).
     if writes_operation
@@ -1596,7 +1578,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         && !crate::commands::blocking::parked(ctx)
     {
         for event in crate::keyspace_events::command_events(name, &ctx.cmd, &result) {
-            if let Some(Ok(key)) = ctx.cmd.get(event.key).map(|key| std::str::from_utf8(key)) {
+            if let Some(key) = ctx.cmd.get(event.key) {
                 crate::keyspace_events::notify(
                     ctx.pubsub,
                     event.db.unwrap_or(*ctx.selected_db),
@@ -1744,15 +1726,14 @@ fn notify_watchers(ctx: &Ctx, name: &str) {
     let keys = crate::keyspec::key_positions(name, &ctx.cmd);
     if keys.is_empty() {
         // Not in the key table: keep the old first-argument guess.
-        if let Some(Ok(key)) = ctx.cmd.get(1).map(|k| std::str::from_utf8(k)) {
+        if let Some(key) = ctx.cmd.get(1) {
             ctx.watch_registry.notify(db, key);
         }
         return;
     }
     for pos in keys.iter() {
-        if let Ok(key) = std::str::from_utf8(ctx.cmd[pos])
-            && !crate::watch::is_unchanged(db, key)
-        {
+        let key = ctx.cmd[pos];
+        if !crate::watch::is_unchanged(db, key) {
             ctx.watch_registry.notify(db, key);
         }
     }
@@ -1865,7 +1846,7 @@ fn can_leave_a_key_empty(name: &str) -> bool {
 }
 
 /// Delete `key` if it holds a collection with nothing in it.
-fn drop_if_empty(ctx: &Ctx, db: usize, key: &str) -> bool {
+fn drop_if_empty(ctx: &Ctx, db: usize, key: &[u8]) -> bool {
     let shard = crate::store::get_shard(&ctx.store[db], key);
     if !crate::read_lock!(shard)
         .get(key)
@@ -1921,16 +1902,20 @@ fn database_written_too(ctx: &Ctx, name: &str) -> Option<usize> {
 fn reindex_copied(ctx: &Ctx, name: &str) {
     use crate::vector::Write;
     let here = *ctx.selected_db;
-    let text = |i: usize| ctx.cmd.get(i).and_then(|a| std::str::from_utf8(a).ok());
-    let number = |i: usize| text(i).and_then(|s| s.parse::<usize>().ok());
+    let number = |i: usize| {
+        ctx.cmd
+            .get(i)
+            .and_then(|a| std::str::from_utf8(a).ok())
+            .and_then(|s| s.parse::<usize>().ok())
+    };
     if name == "MOVE" {
-        if let (Some(key), Some(to)) = (text(1), number(2)) {
+        if let (Some(key), Some(to)) = (ctx.cmd.get(1), number(2)) {
             crate::vector::reindex_key(ctx.index_store, ctx.store, here, key, Write::Whole);
             crate::vector::reindex_key(ctx.index_store, ctx.store, to, key, Write::Whole);
         }
         return;
     }
-    let Some(key) = text(2) else {
+    let Some(key) = ctx.cmd.get(2) else {
         return;
     };
     let mut to = here;
@@ -2005,31 +1990,32 @@ fn settle_written_keys(ctx: &Ctx, name: &str) {
             };
             let db = *ctx.selected_db;
             for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
-                if let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) {
-                    crate::field_expiry::track_key(ctx.store, db, key);
-                    if let Some(how) = how {
-                        crate::vector::reindex_key(ctx.index_store, ctx.store, db, key, how);
-                    }
+                let key = ctx.cmd[pos];
+                crate::field_expiry::track_key(ctx.store, db, key);
+                if let Some(how) = how {
+                    crate::vector::reindex_key(ctx.index_store, ctx.store, db, key, how);
                 }
             }
         }
         // These can put it in another database.
         "COPY" | "MOVE" => {
             for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
-                if let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) {
-                    for db in 0..ctx.store.len() {
-                        crate::field_expiry::track_key(ctx.store, db, key);
-                    }
+                for db in 0..ctx.store.len() {
+                    crate::field_expiry::track_key(ctx.store, db, ctx.cmd[pos]);
                 }
             }
             reindex_copied(ctx, name);
         }
         "HDEL" | "HINCRBY" | "HINCRBYFLOAT" | "HSETNX" | "HGETDEL" => {
             for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
-                if let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) {
-                    let db = *ctx.selected_db;
-                    crate::vector::reindex_key(ctx.index_store, ctx.store, db, key, Write::Refresh);
-                }
+                let db = *ctx.selected_db;
+                crate::vector::reindex_key(
+                    ctx.index_store,
+                    ctx.store,
+                    db,
+                    ctx.cmd[pos],
+                    Write::Refresh,
+                );
             }
         }
         "SWAPDB" => {
@@ -2042,14 +2028,12 @@ fn settle_written_keys(ctx: &Ctx, name: &str) {
         // and a replay.
         _ if name.starts_with("JSON.") => {
             for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
-                if let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) {
-                    crate::vector::reindex_json_key(
-                        ctx.index_store,
-                        ctx.store,
-                        *ctx.selected_db,
-                        key,
-                    );
-                }
+                crate::vector::reindex_json_key(
+                    ctx.index_store,
+                    ctx.store,
+                    *ctx.selected_db,
+                    ctx.cmd[pos],
+                );
             }
         }
         _ => {}
@@ -2068,9 +2052,7 @@ fn settle_written_keys(ctx: &Ctx, name: &str) {
     }
     let db = *ctx.selected_db;
     for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
-        let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) else {
-            continue;
-        };
+        let key = ctx.cmd[pos];
         if may_be_empty && drop_if_empty(ctx, db, key) {
             continue;
         }
@@ -2197,9 +2179,7 @@ fn track_for_clients(ctx: &Ctx, name: &str, wrote: bool, is_write: bool) {
             return;
         }
         for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
-            if let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) {
-                invalidate_tracked_key(ctx, key, true);
-            }
+            invalidate_tracked_key(ctx, ctx.cmd[pos], true);
         }
         return;
     }
@@ -2229,17 +2209,15 @@ fn track_for_clients(ctx: &Ctx, name: &str, wrote: bool, is_write: bool) {
         return;
     }
     for pos in keys.iter() {
-        if let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) {
-            let dropped = ctx.tracking_table.register(key, ctx.client_id);
-            crate::tracking::tell_dropped(ctx.client_registry, dropped, Some(ctx.client_id));
-        }
+        let dropped = ctx.tracking_table.register(ctx.cmd[pos], ctx.client_id);
+        crate::tracking::tell_dropped(ctx.client_registry, dropped, Some(ctx.client_id));
     }
 }
 
 /// Tell the clients caching `key` that it has changed. `by_client` is false
 /// when no client's command did it — the key was evicted — and then nobody
 /// is spared the message for having asked for NOLOOP.
-pub(crate) fn invalidate_tracked_key(ctx: &Ctx, key: &str, by_client: bool) {
+pub(crate) fn invalidate_tracked_key(ctx: &Ctx, key: &[u8], by_client: bool) {
     if crate::tracking::TRACKING_CLIENT_COUNT.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         return;
     }
@@ -2305,8 +2283,9 @@ mod applied_gate_tests {
 mod noscript_tests {
     use super::not_allowed_from_script;
 
-    /// Every command and subcommand Redis 8.10's `src/commands/*.json` flag
-    /// `NOSCRIPT`, and some it does not.
+    /// Every command and subcommand that Valkey 9.1.3's `src/commands/*.json`
+    /// flag `NOSCRIPT` and KiviDB serves, KiviDB's `BACKUP` and `HOTKEYS`
+    /// subcommands that start or stop something, and some that are allowed.
     #[test]
     fn the_noscript_commands_are_redis_s() {
         let redis: &[(&str, &[&str])] = &[

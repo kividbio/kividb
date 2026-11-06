@@ -730,7 +730,11 @@ impl DeleteRun {
     /// Of `keys`, which to delete: those of slots that have not come to
     /// this node since it began. One look at the `counts`, which the caller
     /// holds until they are deleted.
-    fn still_to_delete(&mut self, counts: &mut DeletionCounts, keys: &[String]) -> Vec<bool> {
+    fn still_to_delete(
+        &mut self,
+        counts: &mut DeletionCounts,
+        keys: &[crate::store::Key],
+    ) -> Vec<bool> {
         let counts = counts.sized();
         let mut delete = Vec::with_capacity(keys.len());
         for key in keys {
@@ -789,10 +793,10 @@ fn delete_keys(
         };
     };
     for shard in db.iter() {
-        let keys: Vec<String> = crate::read_lock!(shard)
+        let keys: Vec<crate::store::Key> = crate::read_lock!(shard)
             .keys()
-            .filter(|k| run.deletes(key_hash_slot(k.as_bytes())))
-            .map(|k| k.to_string())
+            .filter(|k| run.deletes(key_hash_slot(k)))
+            .map(crate::store::Key::new)
             .collect();
         for chunk in keys.chunks(128) {
             {
@@ -1022,7 +1026,7 @@ fn start_dropping(
 /// which never change in place), so it is far quicker than laying the value
 /// out as its `RESTORE`, which is done afterwards.
 struct Captured {
-    key: String,
+    key: crate::store::Key,
     value: crate::types::KiviDBValue,
     expires_at: u64,
 }
@@ -1066,7 +1070,7 @@ fn capture(env: &Env, ranges: &[(u16, u16)]) -> std::io::Result<Vec<Captured>> {
         let map = crate::read_lock!(shard);
         for entry in map.entries() {
             let key = entry.key();
-            if !in_ranges(ranges, key_hash_slot(key.as_bytes())) {
+            if !in_ranges(ranges, key_hash_slot(key)) {
                 continue;
             }
             // In the entry beside the value.
@@ -1075,7 +1079,7 @@ fn capture(env: &Env, ranges: &[(u16, u16)]) -> std::io::Result<Vec<Captured>> {
                 continue;
             }
             out.push(Captured {
-                key: key.to_string(),
+                key: crate::store::Key::new(key),
                 value: entry.value().deep_clone(),
                 expires_at,
             });

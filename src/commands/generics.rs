@@ -3,14 +3,12 @@ use crate::commands::helpers::{
     ERR_INVALID_EXPIRE_PEXPIRE_CMD, ERR_INVALID_EXPIRE_PEXPIREAT_CMD, ERR_VALUE_NOT_INTEGER,
     ExpireModifierFlags, absolute_when_ms_from_pexpire_ms, delete_key, delete_key_if_expired,
     expire_modifier_allows_set, expire_on_read, expiry_at_after, expiry_unix_millis, from_unix_ms,
-    get_expiry, glob_match, is_expired, lazy_expire_on_read, parse_bytes_as_i128,
-    parse_expire_modifier_flags, parse_utf8, set_expiry, system_time_from_unix_millis_i128,
-    take_key, ttl_remaining_secs_ceil,
+    get_expiry, is_expired, lazy_expire_on_read, parse_bytes_as_i128, parse_expire_modifier_flags,
+    parse_utf8, set_expiry, system_time_from_unix_millis_i128, take_key, ttl_remaining_secs_ceil,
 };
 use crate::keyspace_events::{KS_GENERIC, notify};
 use crate::resp::write::*;
 use crate::store;
-use crate::store::Key;
 use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::{read_lock, write_lock};
@@ -184,17 +182,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let mut shard_idx = cursor >> SHARD_SHIFT;
             let mut position = cursor & ((1u64 << SHARD_SHIFT) - 1);
 
-            let mut keys: Vec<String> = Vec::new();
+            let mut keys: Vec<crate::store::Key> = Vec::new();
             let mut looked_at = 0usize;
             let mut next_cursor: u64 = 0;
             while shard_idx < num_shards {
                 let map = read_lock!(db[shard_idx as usize]);
                 let (page, next) = crate::commands::helpers::scan_page(
                     map.iter().map(|(key, value)| {
-                        (
-                            crate::commands::helpers::scan_position(key.as_bytes()),
-                            (key, value),
-                        )
+                        (crate::commands::helpers::scan_position(key), (key, value))
                     }),
                     position,
                     options.count.saturating_sub(looked_at).max(1),
@@ -214,7 +209,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                                 .as_deref()
                                 .is_none_or(|t| value.type_name().eq_ignore_ascii_case(t))
                         })
-                        .map(|(key, _)| key.to_string()),
+                        .map(|(key, _)| crate::store::Key::new(key)),
                 );
                 drop(map);
                 if next != 0 {
@@ -235,10 +230,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             keys.retain(|k| !lazy_expire_on_read(ctx.store, *ctx.selected_db, k));
             if let Some(ref pat) = options.pattern {
-                keys.retain(|k| glob_match(pat, k));
+                keys.retain(|k| crate::commands::helpers::glob_match_bytes(pat, k));
             }
 
-            let key_items: Vec<Vec<u8>> = keys.iter().map(|k| resp_bulk_str(k)).collect();
+            let key_items: Vec<Vec<u8>> = keys.iter().map(|k| resp_bulk(k)).collect();
 
             Some(resp_array(vec![
                 resp_bulk_str(&next_cursor.to_string()),
@@ -251,28 +246,26 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 return Some(resp_error("ERR wrong number of arguments for cmd 'keys'"));
             }
 
-            let pattern = match std::str::from_utf8(cmd[1]) {
-                Ok(s) => s,
-                Err(_) => return Some(resp_error("ERR invalid pattern")),
-            };
+            // Any bytes, as Redis's `stringmatchlen` matches them.
+            let pattern = cmd[1];
 
             let db = &ctx.store[*ctx.selected_db];
             // Collect into a temporary — we need the count before we can
             // write the RESP array header, and we can't hold all shard locks
             // simultaneously. Collecting key slices (not copies) keeps this cheap.
             // Note: we can't return borrowed keys across the lock boundary,
-            // so we collect owned Strings.
-            let mut candidates: Vec<String> = Vec::new();
+            // so we collect owned keys.
+            let mut candidates: Vec<crate::store::Key> = Vec::new();
             for shard in db.iter() {
                 let map = read_lock!(shard);
-                candidates.extend(map.keys().map(|k| k.to_string()));
+                candidates.extend(map.keys().map(crate::store::Key::new));
             }
-            let mut matching: Vec<String> = Vec::new();
+            let mut matching: Vec<crate::store::Key> = Vec::new();
             for key in candidates {
                 if lazy_expire_on_read(ctx.store, *ctx.selected_db, &key) {
                     continue;
                 }
-                if glob_match(pattern, &key) {
+                if crate::commands::helpers::glob_match_bytes(pattern, &key) {
                     matching.push(key);
                 }
             }
@@ -682,7 +675,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             {
                 let shard = store::get_shard(db_ref, &dst);
                 let mut map = write_lock!(shard);
-                map.insert_expiring(Key::from(&*dst), value, expiry);
+                map.insert_expiring(&*dst, value, expiry);
             }
             notify(ctx.pubsub, db, KS_GENERIC, "rename_from", &src);
             notify(ctx.pubsub, db, KS_GENERIC, "rename_to", &dst);
@@ -733,7 +726,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             {
                 let shard = store::get_shard(db_ref, &dst);
-                write_lock!(shard).insert_expiring(Key::from(&*dst), src_value, expiry);
+                write_lock!(shard).insert_expiring(&*dst, src_value, expiry);
             }
             notify(ctx.pubsub, db, KS_GENERIC, "rename_from", &src);
             notify(ctx.pubsub, db, KS_GENERIC, "rename_to", &dst);
@@ -815,7 +808,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // none).
             {
                 let shard = store::get_shard(dst_db_ref, &dst_key);
-                write_lock!(shard).insert_expiring(Key::from(&*dst_key), value, expiry);
+                write_lock!(shard).insert_expiring(&*dst_key, value, expiry);
             }
             notify(ctx.pubsub, dst_db, KS_GENERIC, "copy_to", &dst_key);
             Some(resp_integer(1))
@@ -835,11 +828,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // `DEL` frees it here, as Redis does with `lazyfree-lazy-user-del no`.
             let unlink = cmd[0].eq_ignore_ascii_case(b"UNLINK");
 
-            for k in cmd.iter().skip(1) {
-                let key = match parse_utf8(k) {
-                    Some(k) => k,
-                    None => continue,
-                };
+            // Any bytes: what a master expires, evicts or migrates away is
+            // deleted on its replicas, and in its AOF, by the DEL or UNLINK
+            // it sends, whatever its key (#437). A key that is not text was
+            // skipped.
+            for &key in cmd.iter().skip(1) {
                 // Redis: expireIfNeeded deletes volatile keys first; that removal does not add
                 // to the DEL count (see redis `delGenericCommand`).
                 if is_expired(ctx.store, *ctx.selected_db, key) {
@@ -987,21 +980,21 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let picked = (0..shards).find_map(|step| {
                     let map = read_lock!(ctx.store[db][(start + step) % shards]);
                     map.random_entry(rand::random::<usize>)
-                        .map(|(key, _)| key.to_string())
+                        .map(|(key, _)| crate::store::Key::new(key))
                 });
                 match picked {
                     None => break,
                     Some(key) if lazy_expire_on_read(ctx.store, db, &key) => {
                         expired = Some(key);
                     }
-                    Some(key) => return Some(resp_bulk_str(&key)),
+                    Some(key) => return Some(resp_bulk(&key)),
                 }
             }
             // While writes are paused an expired key is not removed, so
             // every pick could land on one again: as in Redis, the answer is
             // then one of them, not nil.
             match expired {
-                Some(key) if crate::pause::expiry_deferred() => Some(resp_bulk_str(&key)),
+                Some(key) if crate::pause::expiry_deferred() => Some(resp_bulk(&key)),
                 _ => Some(resp_null_bulk()),
             }
         }
@@ -1562,7 +1555,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     dst_map.remove(dst.as_str());
                 } else {
                     dst_map.insert_expiring(
-                        Key::from(dst),
+                        dst,
                         KiviDBValue::List(std::sync::Arc::new(parking_lot::RwLock::new(new_list))),
                         None,
                     );

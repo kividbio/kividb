@@ -846,8 +846,8 @@ impl IndexDef {
 
     /// Whether `key` is under one of the index's prefixes.
     #[inline]
-    pub fn covers(&self, key: &str) -> bool {
-        self.prefixes.is_empty() || self.prefixes.iter().any(|p| key.starts_with(p.as_str()))
+    pub fn covers(&self, key: &[u8]) -> bool {
+        self.prefixes.is_empty() || self.prefixes.iter().any(|p| key.starts_with(p.as_bytes()))
     }
 
     /// Whether `token` is one of this index's stopwords.
@@ -1119,14 +1119,16 @@ pub fn walk_documents(
     mut visit: impl FnMut(&str, DocFields<'_>),
 ) {
     for shard in db.iter() {
-        let keys: Vec<String> = shard
+        // The keys themselves, for their order and for reading them; the
+        // visit is given the document's name (`key_bytes::text_of`).
+        let keys: Vec<crate::store::Key> = shard
             .read()
             .keys()
             .filter(|key| def.covers(key))
-            .map(str::to_string)
+            .map(crate::store::Key::new)
             .collect();
         for key in keys {
-            let _order = crate::write_order::lock_key_for_walk(def.db_index, key.as_bytes());
+            let _order = crate::write_order::lock_key_for_walk(def.db_index, &key);
             let map = shard.read();
             let Some(inner) = map
                 .peek(&key)
@@ -1135,7 +1137,7 @@ pub fn walk_documents(
                 continue;
             };
             crate::aof::failpoint("index-walk-read");
-            visit(&key, inner);
+            visit(&crate::key_bytes::text_of(&key), inner);
         }
     }
 }
@@ -1319,10 +1321,12 @@ pub fn backfill_from_db_progress(
         };
         let keys: Vec<String> = idx.key_to_id.read().keys().cloned().collect();
         for key in keys {
-            let map = crate::store::get_shard(db, &key).read();
-            let holds = def.covers(&key)
+            // A document's key is kept as text (`key_bytes::text_of`).
+            let raw = crate::key_bytes::bytes_of(&key);
+            let map = crate::store::get_shard(db, &*raw).read();
+            let holds = def.covers(&raw)
                 && map
-                    .peek(&key)
+                    .peek(&*raw)
                     .and_then(|value| doc_fields(&def.on, &def.fields, value))
                     .and_then(|inner| {
                         inner
@@ -2005,7 +2009,13 @@ pub fn json_return_value(doc: &serde_json::Value, path: &str) -> Option<Vec<u8>>
 
 /// A JSON document was written: bring the `ON JSON` indexes of database
 /// `db` that cover its key up to date with it.
-pub fn maybe_index_json(index_store: &IndexStore, db: usize, key: &str, doc: &serde_json::Value) {
+pub fn maybe_index_json(
+    index_store: &IndexStore,
+    db: usize,
+    key: &(impl AsRef<[u8]> + ?Sized),
+    doc: &serde_json::Value,
+) {
+    let key = key.as_ref();
     if indexing_deferred() {
         return;
     }
@@ -2019,7 +2029,7 @@ pub fn maybe_index_json(index_store: &IndexStore, db: usize, key: &str, doc: &se
             continue;
         }
         let fields: Vec<(String, Arc<[u8]>)> = project_json(&def.fields, doc).into_iter().collect();
-        index_fields(def, key, &fields, Write::Whole);
+        index_fields(def, &crate::key_bytes::text_of(key), &fields, Write::Whole);
     }
 }
 
@@ -2033,8 +2043,9 @@ pub fn reindex_json_key(
     index_store: &IndexStore,
     store: &crate::store::Store,
     db: usize,
-    key: &str,
+    key: &(impl AsRef<[u8]> + ?Sized),
 ) {
+    let key = key.as_ref();
     if indexing_deferred()
         || !index_store
             .read()
@@ -2067,9 +2078,10 @@ pub fn reindex_key(
     index_store: &IndexStore,
     store: &crate::store::Store,
     db: usize,
-    key: &str,
+    key: &(impl AsRef<[u8]> + ?Sized),
     how: Write,
 ) {
+    let key = key.as_ref();
     if indexing_deferred() {
         return;
     }
@@ -2098,7 +2110,7 @@ pub fn reindex_key(
                     .iter()
                     .map(|(field, value)| (field.to_string(), Arc::clone(value)))
                     .collect();
-                index_fields(def, key, &pairs, how);
+                index_fields(def, &crate::key_bytes::text_of(key), &pairs, how);
             }
             (IndexOn::Hash, Some(crate::types::KiviDBValue::HashEx(hash))) => {
                 let pairs: Vec<(String, Arc<[u8]>)> = hash
@@ -2107,14 +2119,14 @@ pub fn reindex_key(
                     .iter()
                     .map(|(field, value)| (field.to_string(), Arc::clone(value)))
                     .collect();
-                index_fields(def, key, &pairs, how);
+                index_fields(def, &crate::key_bytes::text_of(key), &pairs, how);
             }
             (IndexOn::Json, Some(crate::types::KiviDBValue::Json(doc))) => {
                 let fields: Vec<(String, Arc<[u8]>)> =
                     project_json(&def.fields, &doc.read()).into_iter().collect();
-                index_fields(def, key, &fields, how);
+                index_fields(def, &crate::key_bytes::text_of(key), &fields, how);
             }
-            _ => unindex_from(def, key),
+            _ => unindex_from(def, &crate::key_bytes::text_of(key)),
         }
     }
 }
@@ -2140,10 +2152,11 @@ pub enum Write {
 pub fn maybe_index(
     index_store: &IndexStore,
     db: usize,
-    key: &str,
+    key: &(impl AsRef<[u8]> + ?Sized),
     fields: &[(String, Arc<[u8]>)],
     how: Write,
 ) {
+    let key = key.as_ref();
     if indexing_deferred() {
         return;
     }
@@ -2157,7 +2170,7 @@ pub fn maybe_index(
         {
             continue;
         }
-        index_fields(def, key, fields, how);
+        index_fields(def, &crate::key_bytes::text_of(key), fields, how);
     }
 }
 
@@ -2346,7 +2359,7 @@ pub fn register_index_store(store: &crate::store::Store, index_store: &IndexStor
 
 /// `key` of database `db` of the store at address `id` ([`store_id`])
 /// expired and was deleted: out of its indexes too.
-pub fn unindex_expired_in(id: usize, db: usize, key: &str) {
+pub fn unindex_expired_in(id: usize, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) {
     let index_store = INDEX_STORES
         .read()
         .iter()
@@ -2398,12 +2411,15 @@ pub fn indexes_of(id: usize, db: usize) -> Option<IndexStore> {
 
 /// `key` of database `db` of the store at address `id` is gone from the
 /// store and not yet from its indexes: under the shard's lock that took it.
-pub fn mark_leaving(id: usize, db: usize, key: &str) {
-    LEAVING.lock().push((id, db, key.into()));
+pub fn mark_leaving(id: usize, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) {
+    let key: Box<str> = crate::key_bytes::text_of(key.as_ref()).into();
+    LEAVING.lock().push((id, db, key));
 }
 
 /// `key` has left its indexes: what [`mark_leaving`] marked, unmarked.
-pub fn unmark_leaving(id: usize, db: usize, key: &str) {
+pub fn unmark_leaving(id: usize, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) {
+    let key = crate::key_bytes::text_of(key.as_ref());
+    let key: &str = &key;
     let mut leaving = LEAVING.lock();
     if let Some(at) = leaving
         .iter()
@@ -3535,7 +3551,8 @@ const DEADLINE_EXPANSIONS: usize = 64;
 /// Only the indexes of database `db`: the same key in another database is
 /// another document. A `DEL` in one database used to take the document of
 /// the same name out of an index of another.
-pub fn maybe_unindex(index_store: &IndexStore, db: usize, key: &str) {
+pub fn maybe_unindex(index_store: &IndexStore, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) {
+    let key = key.as_ref();
     if indexing_deferred() {
         return;
     }
@@ -3548,7 +3565,7 @@ pub fn maybe_unindex(index_store: &IndexStore, db: usize, key: &str) {
         // Every vector field's, its postings, and what its TEXT fields put
         // in: the words it held, from the inverted index and the BM25
         // statistics.
-        unindex_from(def, key);
+        unindex_from(def, &crate::key_bytes::text_of(key));
     }
 }
 // ── HNSW compaction ───────────────────────────────────────────────────────────
@@ -3705,7 +3722,9 @@ pub fn compact_hnsw(
 
             for (key, value) in map.iter() {
                 let matches =
-                    prefixes.is_empty() || prefixes.iter().any(|p| key.starts_with(p.as_str()));
+                    prefixes.is_empty() || prefixes.iter().any(|p| key.starts_with(p.as_bytes()));
+                let key = crate::key_bytes::text_of(key);
+                let key: &str = &key;
                 if !matches || already.contains(key) {
                     continue;
                 }
@@ -3774,8 +3793,9 @@ pub fn spawn_compaction_worker(
 pub fn maybe_request_compaction(
     index_store: &IndexStore,
     compaction_tx: &CompactionTx,
-    deleted_key: &str,
+    deleted_key: &(impl AsRef<[u8]> + ?Sized),
 ) {
+    let deleted_key = deleted_key.as_ref();
     use std::sync::atomic::Ordering::Relaxed;
 
     let store = index_store.read();
@@ -3787,7 +3807,7 @@ pub fn maybe_request_compaction(
             || def
                 .prefixes
                 .iter()
-                .any(|p| deleted_key.starts_with(p.as_str()));
+                .any(|p| deleted_key.starts_with(p.as_bytes()));
         if !matches {
             continue;
         }

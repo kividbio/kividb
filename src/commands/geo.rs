@@ -2,7 +2,6 @@ use crate::commands::ctx::Ctx;
 use crate::commands::helpers::{expire_on_read, is_expired, lazy_expire_on_read, parse_utf8};
 use crate::resp::write::*;
 use crate::store;
-use crate::store::Key;
 use crate::store::ValueRef;
 use crate::types::{KiviDBValue, SortedSetInner, ZMember};
 use crate::{read_lock, write_lock};
@@ -280,7 +279,7 @@ fn get_or_create_zset(ctx: &mut Ctx, key: &str) -> Result<Arc<RwLock<SortedSetIn
         )),
         None => {
             let zs = Arc::new(RwLock::new(SortedSetInner::new()));
-            map.insert(Key::from(key), KiviDBValue::SortedSet(Arc::clone(&zs)));
+            map.insert(key, KiviDBValue::SortedSet(Arc::clone(&zs)));
             Ok(zs)
         }
     }
@@ -1093,10 +1092,7 @@ fn geo_search(ctx: &mut Ctx, form: Form, read_only: bool) -> Vec<u8> {
         // to live, are gone.
         crate::commands::helpers::delete_key(ctx.store, db, &dest);
         let shard = store::get_shard(&ctx.store[db], &dest);
-        write_lock!(shard).insert(
-            Key::from(dest),
-            KiviDBValue::SortedSet(Arc::new(RwLock::new(stored))),
-        );
+        write_lock!(shard).insert(dest, KiviDBValue::SortedSet(Arc::new(RwLock::new(stored))));
         return resp_integer(found.len() as i64);
     }
 

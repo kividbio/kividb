@@ -72,9 +72,11 @@ fn value_digest(h: &mut Xxh3, value: crate::store::ValueRef<'_>) {
         // The rest as they are laid out in a snapshot. Where that depends on
         // a node's own order, the fingerprints differ and the replica is
         // sent everything: never wrong, only slower.
+        // After the four bytes an empty key was laid out as until #441, so
+        // that a value's digest is what it was, on nodes of either version.
         other => {
-            let mut laid_out = Vec::new();
-            if crate::snapshot::write_kdb_entry(&mut laid_out, "", other).is_ok() {
+            let mut laid_out = 0u32.to_le_bytes().to_vec();
+            if crate::snapshot::write_kdb_value(&mut laid_out, other).is_ok() {
                 h.update(b"o");
                 h.update(&laid_out);
             }
@@ -119,7 +121,7 @@ pub fn dataset_digest(store: &crate::store::Store) -> u64 {
                                 let mut h = Xxh3::new();
                                 h.update(&(db_index as u64).to_le_bytes());
                                 h.update(&(key.len() as u64).to_le_bytes());
-                                h.update(key.as_bytes());
+                                h.update(key);
                                 value_digest(&mut h, entry.value());
                                 sum = sum.wrapping_add(h.digest());
                                 // Its time to live, if it has one.
@@ -127,7 +129,7 @@ pub fn dataset_digest(store: &crate::store::Store) -> u64 {
                                     let mut h = Xxh3::new();
                                     h.update(b"ttl");
                                     h.update(&(db_index as u64).to_le_bytes());
-                                    h.update(key.as_bytes());
+                                    h.update(key);
                                     h.update(&ms.to_le_bytes());
                                     sum = sum.wrapping_add(h.digest());
                                 }

@@ -134,11 +134,9 @@ other files:
   `PFMERGE` or a multi-key `PFCOUNT` refuses to combine the two formats. After
   moving from Redis, set `hll-write-format redis` so new and copied
   HyperLogLogs mix and can move back ([PERSISTENCE.md](PERSISTENCE.md)).
-- Valkey 9's RDB format (version 80, a `VALKEY080` header) isn't read yet,
-  as a file, a full sync or a `DUMP` payload
-  ([#449](https://github.com/kividbio/kividb/issues/449)). `valkey-cli --rdb`
-  from a Valkey 9 server gives a Redis-format file that KiviDB loads, unless
-  a hash has field TTLs.
+- Valkey 9.2's RDB format (version 81) isn't read yet: a file, full sync
+  or `DUMP` payload from it is refused. Valkey 9.0's and 9.1's (version 80,
+  a `VALKEY080` header) is read, hash field TTLs included.
 - Redis and Valkey can't read KiviDB's `DUMP` payloads or replicate from
   KiviDB ([#450](https://github.com/kividbio/kividb/issues/450)), so moving
   data back off KiviDB means copying it key by key.
@@ -150,6 +148,14 @@ other files:
 - A Redis RDB with search index definitions loads without them: run
   `FT.CREATE` again. One with other module data (time series, vector sets,
   Bloom) is refused.
+- Set and sorted-set members can't have their own TTLs. A Dragonfly file
+  with a `SADDEX` set, or a KeyDB file or stream with `EXPIREMEMBER` on a set
+  or sorted-set member, is refused, naming the key. Hash field TTLs from
+  either load. Dragonfly's Bloom, Cuckoo, count-min and top-k keys and its
+  compressed snapshot blocks are refused (save with `--compression_mode=0`).
+- KiviDB can't be a replica of a KeyDB primary in active replication
+  (`active-replica yes`): the link ends at its first `RREPLAY`, saying so.
+  Move that data by RDB file or with `MIGRATE`.
 
 **Server and introspection**
 - `HELLO` and `INFO`'s `redis_version` report the Redis release KiviDB

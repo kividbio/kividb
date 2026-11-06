@@ -1506,19 +1506,18 @@ pub async fn handle_client(
                     } else if cmd.len() < 2 {
                         b"-ERR wrong number of arguments for 'watch' command\r\n".to_vec()
                     } else {
-                        for key_bytes in &cmd[1..] {
-                            if let Ok(key) = std::str::from_utf8(key_bytes) {
-                                // A key that has already expired is watched
-                                // as the absent key it is: its removal, when
-                                // it comes, is not a change.
-                                commands::helpers::lazy_expire_key(&store, selected_db, key);
-                                tx.watched_keys.push((selected_db, key.to_string()));
-                                watch_registry.as_ref().watch(
-                                    selected_db,
-                                    key,
-                                    Arc::clone(&dirty_flag),
-                                );
-                            }
+                        for key in &cmd[1..] {
+                            // A key that has already expired is watched as
+                            // the absent key it is: its removal, when it
+                            // comes, is not a change.
+                            commands::helpers::lazy_expire_key(&store, selected_db, key);
+                            tx.watched_keys
+                                .push((selected_db, crate::store::Key::new(key)));
+                            watch_registry.as_ref().watch(
+                                selected_db,
+                                key,
+                                Arc::clone(&dirty_flag),
+                            );
                         }
                         b"+OK\r\n".to_vec()
                     }
@@ -1816,7 +1815,7 @@ pub async fn handle_client(
                                     // sets it, observe clean, and overwrite this write. notify()
                                     // only touches the (separate) watch-registry lock, so calling
                                     // it here cannot deadlock against the shard lock we're holding.
-                                    watch_registry.as_ref().notify(selected_db, key);
+                                    watch_registry.as_ref().notify(selected_db, key.as_bytes());
                                 }
                                 // A plain SET takes the key's time to live away, in
                                 // the same step as it writes the value.
@@ -2328,7 +2327,9 @@ pub async fn handle_client(
                                             b"*2\r\n:0\r\n:0\r\n".to_vec()
                                         };
                                     }
-                                    tokio::task::yield_now().await;
+                                    // tokio-uring submits queued I/O when the worker
+                                    // parks. A busy yield loop can prevent that.
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                                 }
                             },
                             &peer_watch,
@@ -2396,7 +2397,10 @@ pub async fn handle_client(
                                         {
                                             break crate::resp::write::resp_integer(acked).to_vec();
                                         }
-                                        tokio::task::yield_now().await; // not tokio::time::sleep
+                                        // Let the worker park so tokio-uring submits
+                                        // the replica writes and reads needed for ACKs.
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(1))
+                                            .await;
                                     }
                                 },
                                 &peer_watch,
