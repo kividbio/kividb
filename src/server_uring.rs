@@ -2242,10 +2242,17 @@ pub async fn handle_client(
                     // map once RESP3 is negotiated; RESP2 stays a flat `*` array of pairs.
                     use crate::resp::write::{resp_array, resp_bulk_str, resp_integer, resp_map};
                     let role = repl_state.role();
+                    // The Redis release this server follows, as `INFO`'s
+                    // `redis_version` says: clients read these two to know
+                    // what they may use (#451). KiviDB's own release
+                    // follows them, as Dragonfly's does, and is `INFO`'s
+                    // `kividb_version` too.
                     let kv = vec![
                         resp_bulk_str("server"),
-                        resp_bulk_str("kividb"),
+                        resp_bulk_str("redis"),
                         resp_bulk_str("version"),
+                        resp_bulk_str(commands::server::REDIS_VERSION),
+                        resp_bulk_str("kividb_version"),
                         resp_bulk_str(env!("CARGO_PKG_VERSION")),
                         resp_bulk_str("proto"),
                         resp_integer(proto_reply),

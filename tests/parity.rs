@@ -286,6 +286,51 @@ fn info_reports_the_release_it_follows() {
         info(&mut c, "server", "redis_version").as_deref(),
         Some("8.10.0")
     );
+    assert_eq!(
+        info(&mut c, "server", "kividb_version").as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+}
+
+/// `HELLO` reports the Redis release this server follows, as `INFO`'s
+/// `redis_version` does: redis-py and Jedis turn on their client-side
+/// caches only for a `server` of `redis` at 7.4 or later, and refused to
+/// with `server: kividb, version: 1.2.0` (#451). KiviDB's own release
+/// follows, as Dragonfly's does. Under RESP2 and RESP3.
+#[test]
+fn hello_reports_the_release_it_follows() {
+    let mut c = conn();
+    let fields = |reply: V| -> Vec<(String, V)> {
+        match reply {
+            V::Map(pairs) => pairs
+                .into_iter()
+                .map(|(k, v)| (k.s().to_string(), v))
+                .collect(),
+            V::Arr(items) => items
+                .chunks(2)
+                .map(|pair| (pair[0].s().to_string(), pair[1].clone()))
+                .collect(),
+            other => panic!("HELLO replied {other:?}"),
+        }
+    };
+    for proto in ["2", "3"] {
+        let hello = fields(c.cmd(&["HELLO", proto]));
+        let get = |name: &str| {
+            hello
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("no {name} in HELLO {proto}: {hello:?}"))
+        };
+        assert_eq!(get("server").s(), "redis", "HELLO {proto}");
+        assert_eq!(get("version").s(), "8.10.0", "HELLO {proto}");
+        assert_eq!(
+            get("kividb_version").s(),
+            env!("CARGO_PKG_VERSION"),
+            "HELLO {proto}"
+        );
+        assert_eq!(get("proto").i(), proto.parse::<i64>().unwrap());
+    }
 }
 
 /// `INFO commandstats`: calls, time, and the calls that failed — for every

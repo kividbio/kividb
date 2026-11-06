@@ -158,6 +158,11 @@ other files:
   Move that data by RDB file or with `MIGRATE`.
 
 **Server and introspection**
+- `HELLO` and `INFO`'s `redis_version` report the Redis release KiviDB
+  follows (`server: redis`, `version: 8.10.0`), as Dragonfly does, so that
+  clients use what that release has: redis-py's and Jedis's client-side
+  caches need Redis 7.4 or later. KiviDB's own release is `kividb_version`,
+  in `HELLO` and in `INFO`.
 - `MEMORY USAGE` is an estimate; `MEMORY MALLOC-STATS` is a stub.
 - `OBJECT IDLETIME` is `0` unless a `maxmemory-policy` that uses it is set.
 - `client-output-buffer-limit` isn't configurable.
