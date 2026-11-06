@@ -264,6 +264,14 @@ pub struct Config {
     #[arg(long, default_value = "/etc/kividb/kividb.conf")]
     pub configfile: String,
 
+    /// Whether the server was started from `configfile`: it was there, and
+    /// was read. Only then may `CONFIG REWRITE` write it, as in Redis. A
+    /// server started without one used to create the file, and the next
+    /// server started with the same path (the default one, shared by every
+    /// server on the host) loaded it, `replicaof` and all (#442).
+    #[arg(skip)]
+    pub configfile_loaded: bool,
+
     /// Port to accept TLS connections on. 0 = TLS disabled.
     /// Separate from `port` so the uring hot-path on `port` is untouched.
     #[arg(long, default_value_t = 0)]
@@ -635,6 +643,7 @@ impl Default for Config {
             cluster_bus_port_protected_mode: false,
             protected_mode: true,
             bind_explicit: false,
+            configfile_loaded: false,
             cluster_bus_secret: String::new(),
             cluster_config_file: "nodes.conf".into(),
             cluster_require_full_coverage: true,
@@ -757,6 +766,7 @@ impl Config {
             cluster_bus_port_protected_mode: false,
             protected_mode: true,
             bind_explicit: false,
+            configfile_loaded: false,
             cluster_bus_secret: String::new(),
             cluster_config_file: "nodes.conf".into(),
             cluster_require_full_coverage: true,
@@ -1006,16 +1016,14 @@ impl Config {
     /// with `--key value` on restart. Comments are not preserved (that
     /// is a known limitation documented in COMMANDS.md).
     ///
-    /// Returns the Redis-compatible error string if no path was set,
-    /// or an io::Error if the write fails.
+    /// Refused, with nothing written, when the server was not started from
+    /// a config file (see [`Config::configfile_loaded`]); an io::Error if
+    /// the write fails.
     pub fn rewrite_to_disk(&self) -> Result<(), RewriteError> {
-        let path = std::path::Path::new(&self.configfile);
-
-        // Create parent directories if they don't exist.
-        // On a fresh install /etc/kividb/ won't exist yet.
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(RewriteError::Io)?;
+        if !self.configfile_loaded {
+            return Err(RewriteError::NoConfigFile);
         }
+        let path = std::path::Path::new(&self.configfile);
 
         let mut out = String::new();
         out.push_str(&format!("port {}\n", self.port));
@@ -1325,12 +1333,14 @@ impl Config {
         }
         let contents = match std::fs::read_to_string(&self.configfile) {
             Ok(s) => s,
-            // The file doesn't exist yet — that's fine, REWRITE creates it.
+            // No file: the server runs on its defaults and the command line,
+            // and `CONFIG REWRITE` is refused.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => {
                 return Err(format!("can't open config file '{}': {e}", self.configfile));
             }
         };
+        self.configfile_loaded = true;
         let file = self.configfile.clone();
         self.apply_config_text(&contents, from_cli)
             .map(|warnings| {
@@ -1968,6 +1978,9 @@ fn parse_yes_no(s: &str) -> Result<bool, String> {
 
 /// Error returned by `Config::rewrite_to_disk`.
 pub enum RewriteError {
+    /// The server was not started from a config file: there is none to
+    /// rewrite.
+    NoConfigFile,
     Io(std::io::Error),
 }
 

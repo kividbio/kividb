@@ -367,6 +367,9 @@ fn test_config_rewrite_with_configfile() {
     let port = free_port();
     let mut tmp = std::env::temp_dir();
     tmp.push(format!("kividb_rewrite_test_{port}.conf"));
+    // Started from a file, which may be empty: there is nothing to rewrite
+    // otherwise (#442).
+    std::fs::write(&tmp, "").unwrap();
 
     let mut server = std::process::Command::new(
         std::env::var("CARGO_BIN_EXE_kividb").unwrap_or_else(|_| "target/debug/kividb".into()),
@@ -415,6 +418,72 @@ fn test_config_rewrite_with_configfile() {
     server.kill().unwrap();
     let _ = server.wait();
     let _ = std::fs::remove_file(&tmp);
+}
+
+/// A server not started from a config file refuses `CONFIG REWRITE`, as
+/// Redis does, and writes nothing (#442). It used to create the file at its
+/// `--configfile` path (by default `/etc/kividb/kividb.conf`, which every
+/// server on the host shares), and the next server started with that path
+/// loaded it: after Sentinel's `REPLICAOF` and `CONFIG REWRITE`, unrelated
+/// servers came up as replicas and a full sync replaced their data.
+#[test]
+fn config_rewrite_without_a_config_file_is_refused_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = dir.path().join("absent.conf");
+    let spawn = |port: u16| {
+        std::process::Command::new(
+            std::env::var("CARGO_BIN_EXE_kividb").unwrap_or_else(|_| "target/debug/kividb".into()),
+        )
+        .current_dir(dir.path())
+        .args([
+            "--port",
+            &port.to_string(),
+            "--bind",
+            "127.0.0.1",
+            "--dir",
+            dir.path().to_str().unwrap(),
+            "--configfile",
+            conf.to_str().unwrap(),
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to start kividb")
+    };
+    let info_field = |c: &mut Conn, section: &str, field: &str| -> String {
+        let info = c.cmds(&["INFO", section]);
+        info.as_str()
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{field}:")).map(str::to_string))
+            .unwrap_or_else(|| panic!("no {field} in INFO {section}"))
+    };
+
+    let port = free_port();
+    let master_port = free_port();
+    let mut server = spawn(port);
+    let mut c = Conn::connect(port);
+    assert_eq!(info_field(&mut c, "server", "config_file"), "");
+    assert!(
+        c.cmds(&["REPLICAOF", "127.0.0.1", &master_port.to_string()])
+            .is_ok()
+    );
+    let reply = c.cmds(&["CONFIG", "REWRITE"]);
+    server.kill().unwrap();
+    let _ = server.wait();
+    assert!(
+        matches!(&reply, RespValue::Error(e) if e == "ERR The server is running without a config file"),
+        "{reply:?}"
+    );
+    assert!(!conf.exists(), "CONFIG REWRITE wrote {}", conf.display());
+
+    // Another server given the same path is not made a replica by it.
+    let other = free_port();
+    let mut server = spawn(other);
+    let mut c = Conn::connect(other);
+    let role = info_field(&mut c, "replication", "role");
+    server.kill().unwrap();
+    let _ = server.wait();
+    assert_eq!(role, "master");
 }
 
 /// `hll-write-format` from the config file is in effect before the AOF is
@@ -497,9 +566,10 @@ fn hll_write_format_from_config_file_survives_restart_and_aof_replay() {
 /// CONFIG REWRITE keeps the config file's mode. It used to write a new file
 /// with the default mode (0644), as Redis does, so a file kept private
 /// because it holds `requirepass` became readable by every user (#51). With
-/// no file to keep the mode of, the new one is 0600. Whatever is already at
-/// the temporary path, a file left by an earlier rewrite or a symlink put
-/// there by another user, is never written through.
+/// no file to keep the mode of (it was removed after the server started from
+/// it), the new one is 0600. Whatever is already at the temporary path, a
+/// file left by an earlier rewrite or a symlink put there by another user,
+/// is never written through.
 #[cfg(unix)]
 #[test]
 fn test_config_rewrite_keeps_the_file_mode() {
@@ -515,10 +585,14 @@ fn test_config_rewrite_keeps_the_file_mode() {
         let mut path = std::env::temp_dir();
         path.push(format!("kividb_rewrite_mode_test_{port}.conf"));
         let _ = std::fs::remove_file(&path);
-        if let Some(mode) = original {
-            std::fs::write(&path, format!("port {port}\n")).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
-        }
+        // The server starts from the file; `None` removes it before the
+        // rewrite.
+        std::fs::write(&path, format!("port {port}\n")).unwrap();
+        std::fs::set_permissions(
+            &path,
+            std::fs::Permissions::from_mode(original.unwrap_or(0o644)),
+        )
+        .unwrap();
         let tmp = path.with_extension("tmp");
         let victim = path.with_extension("victim");
         let _ = std::fs::remove_file(&tmp);
@@ -546,6 +620,9 @@ fn test_config_rewrite_keeps_the_file_mode() {
         .spawn()
         .expect("failed to start kividb");
         let mut c = Conn::connect(port);
+        if original.is_none() {
+            std::fs::remove_file(&path).unwrap();
+        }
         let result = c.cmds(&["CONFIG", "REWRITE"]);
         server.kill().unwrap();
         let _ = server.wait();
