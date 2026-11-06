@@ -30,7 +30,7 @@ use crate::resp::write::{
 };
 use crate::sketch::Sketch;
 use crate::sketch::bloom::{
-    BloomChain, BloomError, MAX_CAPACITY, MAX_ERROR, MAX_EXPANSION, Params,
+    BloomChain, BloomError, MAX_CAPACITY, MAX_ERROR, MAX_EXPANSION, Params, ShapeError,
 };
 use crate::store::{self, Key, ValueRef};
 use crate::types::KiviDBValue;
@@ -283,6 +283,20 @@ fn resp(ctx: &Ctx) -> u8 {
     crate::commands::handler::effective_resp_for_reply(ctx)
 }
 
+/// A count as a reply: one past `i64::MAX` (a loaded filter can say
+/// anything) is `i64::MAX`.
+fn count(n: u64) -> Vec<u8> {
+    resp_integer(i64::try_from(n).unwrap_or(i64::MAX))
+}
+
+/// Whether `word` is `keyword` as `BF.INSERT` takes its words: compared,
+/// regardless of case, for as long as the shorter of the two (`CAP`, `C`
+/// and `CAPACITYX` are all `CAPACITY`), as Redis 8.10 compares them.
+fn keyword(word: &[u8], wanted: &[u8]) -> bool {
+    let n = word.len().min(wanted.len());
+    word[..n].eq_ignore_ascii_case(&wanted[..n])
+}
+
 fn boolean(resp: u8, b: bool) -> Vec<u8> {
     if resp >= 3 {
         resp_bool_resp3(b)
@@ -385,13 +399,15 @@ fn reserve(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 4 {
         return wrong_args("BF.RESERVE");
     }
+    // At most `EXPANSION n NONSCALING` after the capacity, as Redis
+    // counts: anything else there is ignored, but not more of it.
+    if cmd.len() > 7 {
+        return wrong_args("BF.RESERVE");
+    }
     let opts = &cmd[4..];
     let expansion_at = opts
         .iter()
         .position(|a| a.eq_ignore_ascii_case(b"EXPANSION"));
-    if expansion_at.is_some() && cmd.len() > 7 {
-        return wrong_args("BF.RESERVE");
-    }
     let key = match key_of(cmd) {
         Ok(k) => k,
         Err(e) => return e,
@@ -417,11 +433,12 @@ fn reserve(ctx: &mut Ctx) -> Vec<u8> {
         let Some(value) = parse_ll(raw) else {
             return resp_error("ERR bad expansion");
         };
-        if !(0..=MAX_EXPANSION).contains(&value) {
-            return resp_error("ERR expansion must be in the range [0, 32768]");
-        }
+        // Before the range: `NONSCALING EXPANSION -1` is this error.
         if nonscaling && value != 0 {
             return resp_error("Nonscaling filters cannot expand");
+        }
+        if !(0..=MAX_EXPANSION).contains(&value) {
+            return resp_error("ERR expansion must be in the range [0, 32768]");
         }
         expansion = value as u32;
     }
@@ -537,16 +554,17 @@ fn insert(ctx: &mut Ctx) -> Vec<u8> {
     while at < cmd.len() {
         let word = cmd[at];
         let value = cmd.get(at + 1);
-        if word.eq_ignore_ascii_case(b"ITEMS") {
+        if keyword(word, b"ITEMS") {
             items = Some(&cmd[at + 1..]);
             break;
-        } else if word.eq_ignore_ascii_case(b"NOCREATE") {
-            nocreate = true;
-            at += 1;
-        } else if word.eq_ignore_ascii_case(b"NONSCALING") {
+        } else if keyword(word, b"NONSCALING") {
+            // Before NOCREATE: `N` and `NO` are NONSCALING.
             params.nonscaling = true;
             at += 1;
-        } else if word.eq_ignore_ascii_case(b"CAPACITY") {
+        } else if keyword(word, b"NOCREATE") {
+            nocreate = true;
+            at += 1;
+        } else if keyword(word, b"CAPACITY") {
             let Some(value) = value else {
                 return wrong_args("BF.INSERT");
             };
@@ -555,22 +573,23 @@ fn insert(ctx: &mut Ctx) -> Vec<u8> {
                 _ => return resp_error("Bad capacity"),
             }
             at += 2;
-        } else if word.eq_ignore_ascii_case(b"ERROR") {
-            let Some(value) = value else {
-                return wrong_args("BF.INSERT");
-            };
-            match parse_double(value) {
-                Some(e) if e > 0.0 && e < 1.0 => params.error = e,
-                _ => return resp_error("Bad error rate"),
-            }
-            at += 2;
-        } else if word.eq_ignore_ascii_case(b"EXPANSION") {
+        } else if keyword(word, b"EXPANSION") {
+            // Before ERROR: `E` is EXPANSION.
             let Some(value) = value else {
                 return wrong_args("BF.INSERT");
             };
             match parse_ll(value) {
                 Some(x) if (0..=MAX_EXPANSION).contains(&x) => params.expansion = x as u32,
                 _ => return resp_error("Bad expansion"),
+            }
+            at += 2;
+        } else if keyword(word, b"ERROR") {
+            let Some(value) = value else {
+                return wrong_args("BF.INSERT");
+            };
+            match parse_double(value) {
+                Some(e) if e > 0.0 && e < 1.0 => params.error = e,
+                _ => return resp_error("Bad error rate"),
             }
             at += 2;
         } else {
@@ -659,25 +678,17 @@ fn info(ctx: &mut Ctx) -> Vec<u8> {
         let expansion = if chain.nonscaling() {
             resp_null_for(resp)
         } else {
-            resp_integer(i64::from(chain.growth))
+            resp_integer(i64::from(chain.expansion))
         };
         [
-            (
-                "Capacity",
-                "CAPACITY",
-                resp_integer(chain.capacity() as i64),
-            ),
-            ("Size", "SIZE", resp_integer(chain.info_size() as i64)),
+            ("Capacity", "CAPACITY", count(chain.capacity())),
+            ("Size", "SIZE", count(chain.info_size())),
             (
                 "Number of filters",
                 "FILTERS",
-                resp_integer(chain.layers.len() as i64),
+                count(chain.layers.len() as u64),
             ),
-            (
-                "Number of items inserted",
-                "ITEMS",
-                resp_integer(chain.items as i64),
-            ),
+            ("Number of items inserted", "ITEMS", count(chain.items)),
             ("Expansion rate", "EXPANSION", expansion),
         ]
     }) {
@@ -719,7 +730,7 @@ fn card(ctx: &mut Ctx) -> Vec<u8> {
         Err(e) => return e,
     };
     match with_filter(ctx, key, |chain| chain.items) {
-        Ok(Some(n)) => resp_integer(n as i64),
+        Ok(Some(n)) => count(n),
         Ok(None) => resp_integer(0),
         Err(()) => resp_error(WRONGTYPE),
     }
@@ -773,9 +784,9 @@ fn loadchunk(ctx: &mut Ctx) -> Vec<u8> {
             return resp_error(BAD_DATA);
         }
         return match BloomChain::from_header(data) {
-            None => resp_error(BAD_DATA),
-            Some(Err(_)) => too_large(),
-            Some(Ok(chain)) => {
+            Err(ShapeError::Bad) => resp_error(BAD_DATA),
+            Err(ShapeError::TooLarge) => too_large(),
+            Ok(chain) => {
                 map.insert(
                     Key::from(key),
                     KiviDBValue::Sketch(Arc::new(parking_lot::RwLock::new(Sketch::Bloom(chain)))),

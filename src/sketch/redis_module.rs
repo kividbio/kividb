@@ -12,7 +12,7 @@
 use std::io::{self, Read};
 
 use super::Sketch;
-use super::bloom::{BloomChain, LayerShape};
+use super::bloom::{BloomChain, FLAG_EXACT_SIZE, FLAG_WIDE_HASH, LayerShape, ShapeError};
 
 /// The module type of Bloom filters, and the encoding version written.
 pub const BLOOM_TYPE: &str = "MBbloom--";
@@ -86,15 +86,15 @@ impl Writer {
 fn write_bloom(w: &mut Writer, chain: &BloomChain) {
     w.uint(chain.items);
     w.uint(chain.layers.len() as u64);
-    w.uint(u64::from(chain.options));
-    w.uint(u64::from(chain.growth));
+    w.uint(u64::from(chain.flags));
+    w.uint(u64::from(chain.expansion));
     for l in &chain.layers {
         w.uint(l.capacity);
         w.double(l.error);
         w.uint(u64::from(l.hashes));
-        w.double(l.bpe);
+        w.double(l.bits_per_item);
         w.uint(l.bits);
-        w.uint(u64::from(l.n2));
+        w.uint(u64::from(l.reserved));
         w.string(&l.data);
         w.uint(l.size);
     }
@@ -169,8 +169,8 @@ impl<R: Read> Reader<'_, R> {
 fn read_bloom(r: &mut Reader<'_, impl Read>) -> io::Result<BloomChain> {
     let items = r.uint()?;
     let count = r.uint()?;
-    let options = r.uint32()?;
-    let growth = r.uint32()?;
+    let flags = r.uint32()?;
+    let expansion = r.uint32()?;
     if count == 0 || count > 1 << 16 {
         return Err(r.bad("bad number of layers"));
     }
@@ -180,9 +180,9 @@ fn read_bloom(r: &mut Reader<'_, impl Read>) -> io::Result<BloomChain> {
         let capacity = r.uint()?;
         let error = r.double()?;
         let hashes = r.uint32()?;
-        let bpe = r.double()?;
+        let bits_per_item = r.double()?;
         let bits = r.uint()?;
-        let n2 = r.uint()?;
+        let reserved = r.uint()?;
         let data = r.string()?;
         let size = r.uint()?;
         shapes.push(LayerShape {
@@ -190,31 +190,25 @@ fn read_bloom(r: &mut Reader<'_, impl Read>) -> io::Result<BloomChain> {
             bits,
             size,
             error,
-            bpe,
+            bits_per_item,
             hashes,
             capacity,
-            n2: u8::try_from(n2).map_err(|_| r.bad("a field is out of range"))?,
+            reserved: u8::try_from(reserved).map_err(|_| r.bad("a field is out of range"))?,
         });
         datas.push(data);
     }
     r.end()?;
-    let mut chain = match BloomChain::from_shapes(items, options, growth, shapes) {
-        Some(Ok(chain)) => chain,
-        Some(Err(_)) => return Err(r.bad("a layer is too large to load")),
-        None if options & (super::bloom::OPT_NOROUND | super::bloom::OPT_FORCE64)
-            != super::bloom::OPT_NOROUND | super::bloom::OPT_FORCE64 =>
-        {
-            return Err(r.bad(
-                "a filter made before RedisBloom 2.0 (32-bit hashes) is not supported; \
-                 recreate it",
-            ));
-        }
-        None => return Err(r.bad("the layers do not fit together")),
-    };
-    for (layer, data) in chain.layers.iter_mut().zip(datas) {
-        layer.data = data.into_boxed_slice();
+    // The layers are the strings read: nothing more is allocated, and
+    // `maxmemory` is not consulted (a file or a full sync is taken whole).
+    let wide = FLAG_EXACT_SIZE | FLAG_WIDE_HASH;
+    match BloomChain::from_shapes(items, flags, expansion, shapes, Some(datas)) {
+        Ok(chain) => Ok(chain),
+        Err(ShapeError::TooLarge) => Err(r.bad("a layer is too large to load")),
+        Err(ShapeError::Bad) if flags & wide != wide => Err(r.bad(
+            "a filter made before RedisBloom 2.0 (32-bit hashes) is not supported; recreate it",
+        )),
+        Err(ShapeError::Bad) => Err(r.bad("the layers do not fit together")),
     }
-    Ok(chain)
 }
 
 /// The value of module type `name` (encoding version `encver`) from an

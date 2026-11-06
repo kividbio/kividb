@@ -756,8 +756,12 @@ other settings makes the same filter.
 
 - `COPY` copies a filter; Redis refuses it.
 - A filter made before RedisBloom 2.0 (32-bit hashes) is not loaded, and a
-  layer larger than 64 GB, or than what is left under `maxmemory`, is refused
-  (`ERR filter is too large`, or `OOM ...`) where Redis would try to allocate it.
+  layer larger than 4 GiB, or than what is left under `maxmemory`, or than the
+  system will allocate, is refused (`ERR filter is too large`, or `OOM ...`)
+  where Redis would try to allocate it.
+- `BF.LOADCHUNK`, `RESTORE` and the loaders check what they are given: a
+  layer Redis could not have made (no capacity, a hash count that does not
+  follow from its bits per item, flags of no known layout) is refused.
 - `DUMP` payloads carry RDB version 9, so that every Redis since 6.0 can
   `RESTORE` them; the value is as Redis 8.10 writes it.
 

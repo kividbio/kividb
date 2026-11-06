@@ -59,10 +59,12 @@ impl Sketch {
     }
 }
 
-/// Whether `bytes` more fit under `maxmemory` (always, without one).
+/// Whether `bytes` more fit under `maxmemory` (always, without one),
+/// reckoned as eviction reckons it: what is counted against the limit.
+/// Asked by the commands that make a filter, never while loading one.
 pub fn room_for(bytes: u64) -> bool {
     let limit = crate::RUNTIME_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed);
-    limit == 0 || (crate::memory_use::allocated() as u64).saturating_add(bytes) <= limit as u64
+    limit == 0 || (crate::memory_use::counted() as u64).saturating_add(bytes) <= limit as u64
 }
 
 // ── KDB encoding ─────────────────────────────────────────────────────────

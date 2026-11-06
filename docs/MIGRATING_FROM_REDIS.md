@@ -98,8 +98,8 @@ What the RDB reader takes from Redis:
   its own indexes. Run `FT.CREATE` (and `FT.DICTADD`) again after the move;
   `FT.CREATE` indexes the keys that are already there.
 - **Bloom filters** load, and answer as they did on Redis: those of
-  RedisBloom 2.4 and later (Redis Stack 6.2 to 7.4, Redis Cloud and other
-  services built on them, Redis 8). So do `RESTORE` and `MIGRATE` of them,
+  RedisBloom 2.4 and later (tested with RDB files of Redis Stack 6.2, 7.2
+  and 7.4, and Redis 8.10). So do `RESTORE` and `MIGRATE` of them,
   and `BF.SCANDUMP` chunks taken on Redis can be loaded with `BF.LOADCHUNK`.
   The `bf-*` settings carry over in the config file.
 - **Other module data** (time series, vector sets, Cuckoo filters,

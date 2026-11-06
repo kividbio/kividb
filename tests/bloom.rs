@@ -751,3 +751,112 @@ fn no_keyspace_events() {
         shown(&event)
     );
 }
+
+// ── Hostile input ────────────────────────────────────────────────────────
+
+/// Redis's CRC64 (Jones polynomial, reflected), which seals a Redis `DUMP`.
+fn redis_crc64(data: &[u8]) -> u64 {
+    let mut crc = 0u64;
+    for &byte in data {
+        crc ^= u64::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0x95ac_9329_ac4b_c9b5
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc
+}
+
+/// A `BF.SCANDUMP` header for one layer: 10 items of capacity at 10%
+/// unless told otherwise.
+fn header(capacity: u64, hashes: u32, bytes: u64) -> Vec<u8> {
+    let per_item = -(0.1f64.ln()) / 0.480453013918201;
+    let mut h = Vec::new();
+    h.extend(0u64.to_le_bytes()); // items
+    h.extend(1u32.to_le_bytes()); // layers
+    h.extend(5u32.to_le_bytes()); // flags
+    h.extend(2u32.to_le_bytes()); // expansion
+    h.extend(bytes.to_le_bytes());
+    h.extend((bytes.wrapping_mul(8)).to_le_bytes());
+    h.extend(0u64.to_le_bytes()); // items in the layer
+    h.extend(0.1f64.to_le_bytes());
+    h.extend(per_item.to_le_bytes());
+    h.extend(hashes.to_le_bytes());
+    h.extend(capacity.to_le_bytes());
+    h.push(0);
+    h
+}
+
+/// What a client, a file or a payload may claim about a filter, and must
+/// not get: each is refused, the key is not made, and the server goes on.
+/// (A capacity of 0 used to make the next `BF.ADD` divide by zero; a hash
+/// count of 2^32 - 1 made every lookup loop for minutes under the shard's
+/// lock; a 64 GiB layer was allocated, or aborted the process.)
+#[test]
+fn hostile_input_is_refused() {
+    let _serial = serial();
+    let port = start(config());
+    let mut c = Conn::connect(port);
+    let good = header(10, 4, 8);
+    assert_eq!(c.raw(&[b"BF.LOADCHUNK", b"ok", b"1", &good]), b"+OK\r\n");
+    for (what, raw, want) in [
+        (
+            "capacity 0",
+            header(0, 4, 8),
+            &b"-ERR received bad data\r\n"[..],
+        ),
+        (
+            "hashes 2^32 - 1",
+            header(10, u32::MAX, 8),
+            b"-ERR received bad data\r\n",
+        ),
+        (
+            "hashes 1076",
+            header(10, 1076, 8),
+            b"-ERR received bad data\r\n",
+        ),
+        (
+            "a 64 GiB layer",
+            header(10, 4, 1 << 36),
+            b"-ERR filter is too large\r\n",
+        ),
+    ] {
+        assert_eq!(
+            shown(&c.raw(&[b"BF.LOADCHUNK", b"hostile", b"1", &raw])),
+            shown(want),
+            "{what}"
+        );
+        assert_eq!(c.cmd(&["EXISTS", "hostile"]), b":0\r\n", "{what}");
+    }
+    for iter in ["0", "-1", "-9223372036854775808"] {
+        assert_eq!(
+            c.cmd(&["BF.LOADCHUNK", "ok", iter, "x"]),
+            b"-ERR received bad data\r\n",
+            "iterator {iter}"
+        );
+    }
+    // A layer far past what may be had, asked for by a command.
+    assert_eq!(
+        c.cmd(&["BF.RESERVE", "big", "1e-30", "1073741824"]),
+        b"-ERR filter is too large\r\n"
+    );
+    // A Redis DUMP payload of a filter whose layer has no capacity: not
+    // restored.
+    let mut payload = unhex(
+        "07813016e5a289bef80402030201020502030200049a9999999999993f0206040bd81f7830b61e400241800200053010000000000001200040200000c2000000000008001000000000008400000000000400020000000020000080100000000203000f00",
+    );
+    let crc = redis_crc64(&payload);
+    payload.extend(crc.to_le_bytes());
+    assert_eq!(
+        c.raw(&[b"RESTORE", b"hostile", b"0", &payload]),
+        b"-ERR Bad data format\r\n"
+    );
+    assert_eq!(c.cmd(&["EXISTS", "hostile"]), b":0\r\n");
+    // The filter made from the good header still works, and so does the
+    // server.
+    assert_eq!(c.cmd(&["BF.ADD", "ok", "x"]), b":1\r\n");
+    assert_eq!(c.cmd(&["PING"]), b"+PONG\r\n");
+}
