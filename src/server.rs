@@ -1022,6 +1022,7 @@ where
                         &mut selected_db,
                         env,
                         crate::aof::AOF_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
+                        resp_version,
                     )
                     .await;
                     if slowlog_enabled && elapsed_us >= slowlog.threshold_us() {
@@ -2375,6 +2376,7 @@ where
                                 &mut selected_db,
                                 env,
                                 crate::aof::AOF_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
+                                resp_version,
                             )
                             .await
                         } else {

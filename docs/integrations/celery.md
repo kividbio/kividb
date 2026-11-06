@@ -1,17 +1,18 @@
 # Celery
 
-Celery works on KiviDB as its broker (kombu's Redis transport) and as its result backend, with **two
-conditions on 1.2.0**:
+Celery works on KiviDB as its broker (kombu's Redis transport) and as its result backend. It needs the
+`-lua` image, and on 1.2.0 only, the result backend on RESP2:
 
 1. **Use the `-lua` image** (`kividb/kividb:v1.2.0-lua`). kombu's Redis transport runs Lua scripts
    (`EVALSHA`) for its queue bindings and its unacked-message lock, so a worker can't even start on the
    default image. It exits with `Unrecoverable error: ResponseError` ("this build of KiviDB has no Lua").
    Celery 5.7's chords also count their results with a Lua script.
-2. **Put the result backend on RESP2**: add `?protocol=2` to the result backend URL. KiviDB 1.2.0 sends a
-   Lua script's `false` to RESP3 clients in a form redis-py 8 rejects
+2. **On 1.2.0 only, put the result backend on RESP2**: add `?protocol=2` to the result backend URL.
+   KiviDB 1.2.0 sends a Lua script's `false` to RESP3 clients in a form redis-py 8 rejects
    ([#431](https://github.com/kividbio/kividb/issues/431)). redis-py 8 uses RESP3 by default, so without
    this, every **chord** fails (`ChordError: Join error: TypeError("int() argument must be … not
-   'ResponseError'")`) and never completes. Everything else works without it.
+   'ResponseError'")`) and never completes. Everything else works without it. This is fixed in 1.2.1:
+   from 1.2.1 on, leave the URL as it is.
 
 **Checked**, with Celery `5.7.0` and kombu `5.7.0` (redis-py 8.1.0), against Redis 8.10.2 as the reference:
 
@@ -51,15 +52,15 @@ from celery import Celery
 app = Celery(
     "tasks",
     broker="redis://localhost:6380/0",
-    backend="redis://localhost:6380/0?protocol=2",   # RESP2 for the result backend: see #431
+    backend="redis://localhost:6380/0?protocol=2",   # 1.2.0 only: RESP2 for the result backend, see #431
 )
 ```
 
 Or in settings: `broker_url = "redis://localhost:6380/0"` and
 `result_backend = "redis://localhost:6380/0?protocol=2"`.
 
-The broker can stay on RESP3: kombu's scripts don't return `false`. Once a KiviDB release fixes #431, the
-`?protocol=2` can go.
+On 1.2.1 and later, drop `?protocol=2`: #431 is fixed there, and the backend works on RESP3, redis-py 8's
+default. The broker can stay on RESP3 on 1.2.0 too: kombu's scripts don't return `false`.
 
 ## What to know
 

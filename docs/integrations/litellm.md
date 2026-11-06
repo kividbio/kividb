@@ -77,6 +77,7 @@ response = litellm.completion(model="gpt-4o-mini", messages=[{"role": "user", "c
   workers or replicas. Use `kividb/kividb:v1.2.0-lua` or `-full`.
 - **redis-py 8.** LiteLLM resolves redis-py 5.3.1 (RESP2). With redis-py 8, which speaks RESP3 by default,
   KiviDB 1.2.0 sends a Lua script's `false` in a form redis-py 8 rejects
-  ([#431](https://github.com/kividbio/kividb/issues/431)). LiteLLM's own pins are not affected.
+  ([#431](https://github.com/kividbio/kividb/issues/431)); on 1.2.0, use `protocol=2` with redis-py 8.
+  Fixed in 1.2.1. LiteLLM's own pins are not affected.
 - **Not tested:** the proxy process end to end with Postgres-backed keys and teams, Redis Cluster mode, and
   real models (the harness uses a stub provider and stub embeddings).

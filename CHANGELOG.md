@@ -42,16 +42,41 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   search index definitions and function libraries. Any client that could
   write could do this. The empty key is now written with a length no key
   can have, followed by no bytes, and read back as the empty key; images
-  without an empty key are written as before. Empty hash fields, set and
-  sorted set members and list elements were never affected (#441).
+  without an empty key are written as before. A snapshot that 1.2.0 wrote
+  with the empty key, as `dump.kdb`, an AOF checkpoint or preamble, or a
+  1.2.0 master's full sync, is read whole: the key is found where 1.2.0
+  put it, and loaded with everything after it. An image that goes on
+  past its databases with bytes that are not a section is refused,
+  rather than loaded without them. Empty hash fields, set and sorted set
+  members and list elements were never affected (#441).
 
-  **Upgrade note:** a snapshot written with an empty key needs 1.2.1 or
-  later to load. 1.2.0 refuses it at startup, and a 1.2.0 replica
-  refuses such a full sync from its master and keeps the data it has.
-  Upgrade replicas before their master. 1.2.1 reads a snapshot that
-  1.2.0 wrote with an empty key no further than 1.2.0 does: on 1.2.0,
-  `RENAME` the empty key to another name and `SAVE` before upgrading,
-  and rename it back after.
+  **Upgrade note:** a snapshot that 1.2.1 writes with the empty key needs
+  1.2.1 or later to load: 1.2.0 refuses it at startup and leaves the file
+  as it is. A 1.2.0 replica refuses the full sync of a 1.2.1 master that
+  holds the empty key, keeps its own data, and asks again every second,
+  each time a full sync for the master to make: upgrade replicas before
+  their master. A 1.2.1 replica of a 1.2.0 master reads its full sync
+  whole.
+
+- **A Lua script's `false` is a RESP3 null to a RESP3 client (#431).** A
+  script's `false`, which is also what `redis.call` gives back for a nil
+  reply (a `GET` of a missing key), was sent as RESP2's `$-1` to a client
+  that had sent `HELLO 3`, at the top level and inside a table. Redis sends
+  RESP3's `_`. redis-py 8, which speaks RESP3 by default, refused the reply
+  with `Protocol Error: b'1'`, so every Celery 5.7 chord failed and never
+  completed unless the result backend was put on RESP2 (`?protocol=2`).
+  `EVAL`, `EVALSHA`, their `_RO` forms, `FCALL` and `FCALL_RO` now answer
+  as Redis does: under the script's default RESP2, `false` and `nil` are
+  the null of the client's protocol and `true` is `1`. Under
+  `redis.setresp(3)`, a Lua boolean is `#t`/`#f` to a RESP3 client and
+  `1`/`0` to a RESP2 one; `redis.call`'s null reply is a Lua `nil`, not
+  `false`; and doubles, maps and sets (`{double=…}`, `{map=…}`,
+  `{set=…}`) are shaped for the client's protocol, so a RESP2 client no
+  longer gets RESP3 types. A status (`{ok=…}`) is sent with its bytes as
+  they are and its line breaks as spaces, as in Redis, to RESP2 clients
+  too: a line break in one split the reply in two. Apart from that, RESP2
+  clients get the same bytes as before for scripts that do not call
+  `redis.setresp(3)`.
 
 - **A write in database 0 could reach replicas and the AOF in another
   database.** Until a client selects a database other than 0, writes go out

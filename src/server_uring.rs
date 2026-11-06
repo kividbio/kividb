@@ -1161,6 +1161,7 @@ pub async fn handle_client(
                         &mut selected_db,
                         env,
                         aof_enabled,
+                        resp_version,
                     )
                     .await;
                     if slowlog_enabled && elapsed_us >= slowlog.threshold_us() {
@@ -2494,6 +2495,7 @@ pub async fn handle_client(
                                 &mut selected_db,
                                 env,
                                 aof_enabled,
+                                resp_version,
                             )
                             .await
                         } else {
