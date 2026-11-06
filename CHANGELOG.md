@@ -82,6 +82,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Fix `MEMORY USAGE` estimates for sets, hashes, and sorted sets.**
+  Estimates for sets, hashes, field-TTL hashes, and sorted sets now track
+  `used_memory` more accurately. After mass deletions, approximately 3–4%
+  of retained shard-table memory may remain unattributed to individual keys.
+  `SAMPLES 0` on large sorted sets is slower due to more complete accounting.
+  ([#311](https://github.com/kividbio/kividb/issues/311),
+  by [@Parikalp-Bhardwaj](https://github.com/Parikalp-Bhardwaj)).
+
 - **A negative Unix time no longer deletes hash fields.** `HEXPIREAT` and
   `HPEXPIREAT` with a time below 0, and `HGETEX` and `HSETEX` with a
   negative `EXAT` or `PXAT`, took it as a time that had passed and deleted
