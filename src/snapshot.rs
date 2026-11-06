@@ -1613,23 +1613,26 @@ const READINGS: usize = 32;
 ///
 /// 1.2.0 wrote the empty key with the length that ends a database (#441). In
 /// the last database the reader tells the two apart by the byte after it.
-/// Before the last one it cannot: that byte begins the next database, whose
-/// first key's length can be anything. So the image is read as written by
-/// 1.2.1 first, and only if that fails, again with the first end of each
-/// database it got past, earliest first, read as the empty key. A wrong guess
-/// reads what follows as a value and fails within a few bytes. 1.2.0 wrote
-/// at most one empty key per database.
+/// Before the last one it cannot always: that byte begins the next database,
+/// and a first key 1 to 15 bytes long has a length whose first byte is also a
+/// type tag. So the image is read as written by 1.2.1 first, and only if that
+/// fails, again with such an end read as the empty key, earliest first. A
+/// wrong guess reads what follows as a value, which as a rule fails soon
+/// after (a length misread can have up to 4 GiB read before it does). 1.2.0
+/// wrote at most one empty key per database.
 ///
 /// The image is opened again for each reading, and read no more than
-/// [`READINGS`] times. If none loads it, the first reading's error is
-/// returned.
+/// [`READINGS`] times. A reading that fails other than on what it read (the
+/// disk, the network) ends it. If none loads the image, the first reading's
+/// error is returned.
 fn read_retrying<R: Read>(
     mut open: impl FnMut() -> io::Result<R>,
     keep: bool,
 ) -> io::Result<(LoadedSnapshot, usize, R)> {
-    let mut first_error = None;
+    let mut first_error: Option<io::Error> = None;
     // Readings still to make, latest pushed first: each a reading that
-    // failed, with one database more read as holding the empty key.
+    // failed, with one database more read as holding the empty key. Never
+    // more than the readings left.
     let mut plans: Vec<Vec<usize>> = vec![Vec::new()];
     let mut readings = 0;
     while let Some(plan) = plans.pop() {
@@ -1637,7 +1640,10 @@ fn read_retrying<R: Read>(
             break;
         }
         readings += 1;
-        let mut reader = open()?;
+        let mut reader = match open() {
+            Ok(reader) => reader,
+            Err(e) => return Err(first_error.unwrap_or(e)),
+        };
         let mut ends = Vec::new();
         match read_image(&mut reader, keep, &plan, &mut ends) {
             Ok((loaded, keys)) => {
@@ -1650,17 +1656,61 @@ fn read_retrying<R: Read>(
                 return Ok((loaded, keys, reader));
             }
             Err(e) => {
-                first_error.get_or_insert(e);
-                let after = plan.last().map_or(0, |&db| db + 1);
-                for &db in ends.iter().rev().filter(|&&db| db >= after) {
-                    let mut next = plan.clone();
-                    next.push(db);
-                    plans.push(next);
+                let layout = matches!(
+                    e.kind(),
+                    io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+                );
+                if first_error.is_none() {
+                    if !layout {
+                        return Err(e);
+                    }
+                    first_error = Some(e);
+                    push_plans(&mut plans, &plan, &ends, READINGS - readings);
+                    continue;
                 }
+                if !layout {
+                    log_warn!(
+                        "snapshot: reading it again failed ({e}); what the first reading \
+                         found is returned"
+                    );
+                    break;
+                }
+                let room = READINGS.saturating_sub(readings + plans.len());
+                push_plans(&mut plans, &plan, &ends, room);
             }
         }
     }
+    if readings > 1 {
+        log_warn!(
+            "snapshot could not be read as KiviDB writes it, nor in {} more reading(s) with \
+             the empty key where 1.2.0 could have written it (#441){}",
+            readings - 1,
+            if readings == READINGS {
+                ", the most it is read"
+            } else {
+                ""
+            }
+        );
+    }
     Err(first_error.unwrap_or_else(|| io::Error::other("snapshot could not be read")))
+}
+
+/// [`read_retrying`]'s next readings after one with `plan` failed: `plan` and
+/// one of the databases in `ends` after the last in it, the earliest `room`
+/// of them, pushed so that the earliest is read first.
+fn push_plans(plans: &mut Vec<Vec<usize>>, plan: &[usize], ends: &[usize], room: usize) {
+    let after = plan.last().map_or(0, |&db| db + 1);
+    let next: Vec<usize> = ends
+        .iter()
+        .copied()
+        .filter(|&db| db >= after)
+        .take(room)
+        .collect();
+    for db in next.into_iter().rev() {
+        let mut more = plan.to_vec();
+        more.push(db);
+        plans.push(more);
+    }
 }
 
 /// The reader behind [`load_snapshot_from`] and [`verify_snapshot`]. With
@@ -1672,7 +1722,12 @@ fn read_retrying<R: Read>(
 /// the last database, where an end is followed by the end of the image or a
 /// section, which opens with `KIVI`, never with a tag. And in the databases
 /// `legacy` names (see [`read_retrying`]). The other databases whose first
-/// 0 was read as their end are added to `ends`.
+/// 0 was read as their end, and is followed by a byte that is a tag, are
+/// added to `ends` (no more than [`READINGS`] of them).
+///
+/// A reading that takes 1.2.0's empty key reads an image 1.2.0 wrote, which
+/// holds only sections 1.2.0 knows: it does not pass over a section it does
+/// not know, or one that is damaged, as other readings do.
 fn read_image(
     r: impl Read,
     keep: bool,
@@ -1695,9 +1750,10 @@ fn read_image(
     // The image stopped between two entries (see below): the databases it
     // says are still to come are not there.
     let mut ended = false;
-    // The first byte of the section after the last database, read to see
-    // whether it is a tag.
-    let mut section_byte = None;
+    // The first byte of what follows a database's end (the next database or
+    // a section), read to see whether it is a tag.
+    let mut next_byte = None;
+    let mut strict = !legacy.is_empty();
 
     for db in 0..db_count {
         let mut map: HashMap<String, KiviDBValue> = HashMap::new();
@@ -1708,7 +1764,14 @@ fn read_image(
         loop {
             // Read key length — if EOF here, we're done
             let mut len_buf = [0u8; 4];
-            match r.read_exact(&mut len_buf) {
+            let read = match next_byte.take() {
+                Some(first) => {
+                    len_buf[0] = first;
+                    r.read_exact(&mut len_buf[1..])
+                }
+                None => r.read_exact(&mut len_buf),
+            };
+            match read {
                 // Verifying: an image that stops before a database's end
                 // marker is not a whole image.
                 // Nor, reading 1.2.0's empty key where the first reading
@@ -1748,16 +1811,29 @@ fn read_image(
                                  the empty key"
                             );
                             legacy_tag = Some(next[0]);
+                            strict = true;
                         }
                         Ok(()) => {
-                            section_byte = Some(next[0]);
+                            next_byte = Some(next[0]);
                             break;
                         }
                     }
-                } else {
-                    if !legacy_read && !last {
-                        ends.push(db);
+                } else if !legacy_read && !last {
+                    let mut next = [0u8];
+                    match r.read_exact(&mut next) {
+                        // Read again by the next database, which then ends
+                        // where the image does.
+                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {}
+                        Err(e) => return Err(e),
+                        Ok(()) => {
+                            if is_tag(next[0]) && ends.len() < READINGS {
+                                ends.push(db);
+                            }
+                            next_byte = Some(next[0]);
+                        }
                     }
+                    break;
+                } else {
                     break;
                 }
                 legacy_read = true;
@@ -2086,7 +2162,7 @@ fn read_image(
     let mut functions = None;
     loop {
         let mut magic = [0u8; 8];
-        let from = match section_byte.take() {
+        let from = match next_byte.take() {
             Some(first) => {
                 magic[0] = first;
                 1
@@ -2108,6 +2184,7 @@ fn read_image(
         if &magic == KDB_INDEX_MAGIC {
             match read_index_schemas(&mut r) {
                 Ok(v) => index_schemas = v,
+                Err(e) if strict => return Err(e),
                 Err(e) => {
                     log_warn!(
                         "snapshot index section is unreadable ({e}); indexes will be \
@@ -2120,6 +2197,7 @@ fn read_image(
         } else if &magic == KDB_HNSW_MAGIC {
             match read_hnsw_graphs(&mut r) {
                 Ok(v) => hnsw_graphs = v,
+                Err(e) if strict => return Err(e),
                 Err(e) => {
                     log_warn!(
                         "snapshot HNSW section is unreadable ({e}); graphs will be \
@@ -2140,6 +2218,7 @@ fn read_image(
                         }
                     }
                 }
+                Err(e) if strict => return Err(e),
                 Err(e) => {
                     log_warn!("snapshot index alias section is unreadable ({e})");
                     break;
@@ -2162,6 +2241,11 @@ fn read_image(
             read_language_section(&mut r, &mut index_schemas)?;
         } else if &magic == KDB_SCORE_MAGIC {
             read_score_section(&mut r, &mut index_schemas)?;
+        } else if strict {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "an image read with 1.2.0's empty key holds a section 1.2.0 did not write",
+            ));
         } else {
             break;
         }
@@ -6137,6 +6221,108 @@ mod empty_key_tests {
         let loaded = load_snapshot(path.to_str().unwrap()).unwrap();
         assert_eq!(get_string(&loaded.dbs[0], ""), b"e0");
         assert_eq!(get_string(&loaded.dbs[2], ""), b"e2");
+    }
+
+    /// `image` opened by `load_snapshot_with`, counting the openings.
+    fn readings(image: &[u8]) -> (io::Result<LoadedSnapshot>, usize) {
+        let mut opened = 0;
+        let loaded = load_snapshot_with(|| {
+            opened += 1;
+            Ok(image)
+        })
+        .map(|(loaded, _)| loaded);
+        (loaded, opened)
+    }
+
+    /// `dbs` databases each holding `key`, then a value of no known type: an
+    /// image that no reading loads.
+    fn damaged(dbs: u32, key: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_kdb_header(&mut out, dbs).unwrap();
+        for _ in 0..dbs {
+            write_kdb_entry(&mut out, key, string("v").view()).unwrap();
+            write_kdb_db_end(&mut out).unwrap();
+        }
+        out.truncate(out.len() - 4 - 1 - 4 - 1);
+        out.push(0xEE);
+        out
+    }
+
+    /// An end is read again as the empty key only where the next database's
+    /// first byte could be the empty key's tag.
+    #[test]
+    fn an_image_is_read_again_only_where_1_2_0_could_have_put_the_empty_key() {
+        // Keys of 16 bytes or more: no database's first byte is a tag.
+        let (loaded, opened) = readings(&damaged(16, "a-key-long-enough-for-that"));
+        assert!(loaded.is_err());
+        assert_eq!(opened, 1);
+        // One-byte keys: every end could be one.
+        let (loaded, opened) = readings(&damaged(16, "k"));
+        assert!(loaded.is_err());
+        assert!((2..=READINGS).contains(&opened), "{opened} readings");
+        // However many databases, no more than READINGS readings, nor plans.
+        let (loaded, opened) = readings(&damaged(100_000, "k"));
+        assert!(loaded.is_err());
+        assert!(opened <= READINGS, "{opened} readings");
+    }
+
+    /// A reading the disk failed is not read again; nor is an image that
+    /// cannot be opened again, which fails with what the first reading
+    /// found.
+    #[test]
+    fn a_failure_of_the_disk_is_not_read_again() {
+        struct Failing<'a>(&'a [u8]);
+        impl Read for Failing<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.0.len() < 20 {
+                    return Err(io::Error::other("the disk failed"));
+                }
+                self.0.read(buf)
+            }
+        }
+        let image = damaged(16, "k");
+        let mut opened = 0;
+        let err = load_snapshot_with(|| {
+            opened += 1;
+            Ok(Failing(&image))
+        })
+        .err()
+        .unwrap();
+        assert_eq!(opened, 1);
+        assert_eq!(err.to_string(), "the disk failed");
+
+        let mut opened = 0;
+        let err = load_snapshot_with(|| {
+            opened += 1;
+            if opened > 1 {
+                return Err(io::Error::other("cannot open it again"));
+            }
+            Ok(image.as_slice())
+        })
+        .err()
+        .unwrap();
+        assert_eq!(opened, 2);
+        assert_ne!(err.to_string(), "cannot open it again");
+    }
+
+    /// A reading that takes 1.2.0's empty key does not pass over a section
+    /// it does not know: 1.2.0 wrote none.
+    #[test]
+    fn an_image_read_with_1_2_0s_empty_key_holds_no_section_1_2_0_did_not_know() {
+        let before_last = vec![vec![("", string("x"))], vec![("k", string("v"))]];
+        let last = vec![vec![("k", string("v")), ("", string("x"))]];
+        for dbs in [before_last, last] {
+            let old = image_1_2_0(&dbs, &[]);
+            assert!(load_snapshot_bytes(&old).is_ok());
+            let mut newer = old.clone();
+            newer.extend_from_slice(b"KIVIZZ9\0and what it holds");
+            assert!(load_snapshot_bytes(&newer).is_err());
+            assert!(verify_snapshot(&newer).is_err());
+            let mut damaged = old.clone();
+            damaged.extend_from_slice(KDB_INDEX_MAGIC);
+            damaged.extend_from_slice(&[0xFF; 16]);
+            assert!(load_snapshot_bytes(&damaged).is_err());
+        }
     }
 
     /// What follows the last database's end is the end of the image or a

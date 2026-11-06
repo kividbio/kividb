@@ -79,19 +79,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   can have, followed by no bytes, and read back as the empty key; images
   without an empty key are written as before. A snapshot that 1.2.0 wrote
   with the empty key, as `dump.kdb`, an AOF checkpoint or preamble, or a
-  1.2.0 master's full sync, is read whole: the key is found where 1.2.0
-  put it, and loaded with everything after it. An image that goes on
-  past its databases with bytes that are not a section is refused,
-  rather than loaded without them. Empty hash fields, set and sorted set
-  members and list elements were never affected (#441).
+  1.2.0 master's full sync, now loads: the key is looked for where 1.2.0
+  put it. In the last database that is certain; before it, an image that
+  does not load is read again (at most 32 times) with the key in each
+  place it could be, and one that none of these readings loads is
+  refused as before. An image that goes on past its databases with bytes
+  that are not a section is refused, rather than loaded without them.
+  Empty hash fields, set and sorted set members and list elements were
+  never affected (#441).
 
   **Upgrade note:** a snapshot that 1.2.1 writes with the empty key needs
-  1.2.1 or later to load: 1.2.0 refuses it at startup and leaves the file
-  as it is. A 1.2.0 replica refuses the full sync of a 1.2.1 master that
-  holds the empty key, keeps its own data, and asks again every second,
-  each time a full sync for the master to make: upgrade replicas before
-  their master. A 1.2.1 replica of a 1.2.0 master reads its full sync
-  whole.
+  1.2.1 or later to load. 1.2.0 takes the new length for that of a key of
+  4 GiB and, all but certainly, refuses the file at startup and leaves it
+  as it is; it may first read up to 4 GiB of it. A 1.2.0 replica refuses
+  the full sync of a 1.2.1 master that holds the empty key, keeps its own
+  data, and asks again every second, each time a full sync for the master
+  to make: upgrade replicas before their master. A 1.2.1 replica of a
+  1.2.0 master loads its full sync.
 
 - **JSON numbers keep every digit.** A number that needs 17 significant
   digits was often read as the double next to it: `JSON.SET k $
