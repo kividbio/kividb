@@ -1,4 +1,15 @@
 // src/lib.rs
+//! The internals of the KiviDB server, a Redis-compatible in-memory database.
+//!
+//! This crate is published so that `cargo install kividb` can build the
+//! `kividb` server. The library is what the server and its tests are built
+//! from: it is not a client and not an embeddable database, and none of it is
+//! a stable API. Any release may change or remove any of it. It also sets the
+//! process's global allocator. To talk to KiviDB from Rust, use a Redis client
+//! such as the `redis` crate.
+//!
+//! Documentation for running the server: <https://github.com/kividbio/kividb>.
+
 // First, so its logging macros are in scope in every module after it.
 #[macro_use]
 pub mod loglevel;

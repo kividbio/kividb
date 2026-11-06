@@ -869,6 +869,69 @@ jobs:
           git push origin "refs/tags/${src}"
           echo "Pushed ${src} on ${commit}"
 
+  # ── crates.io — stable releases only ────────────────────────────────────
+  #
+  # `cargo install kividb` and `cargo binstall kividb`. After the GitHub
+  # Release, whose tarballs `cargo binstall` downloads (Cargo.toml's
+  # [package.metadata.binstall]). `publish` runs for stable releases only, so
+  # a candidate never gets here. Skipped with a notice while the
+  # CARGO_REGISTRY_TOKEN secret is missing, and when crates.io already has
+  # this version (a re-run): a version can be published only once.
+  crates-io:
+    needs: [publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check the token, and whether crates.io has this version
+        id: cfg
+        env:
+          HAVE_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          ver="${RELEASE_TAG#v}"
+          if [ "${HAVE_TOKEN}" != "true" ]; then
+            echo "::notice::crates.io skipped: set the CARGO_REGISTRY_TOKEN secret to publish kividb ${ver} there."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # crates.io asks API clients for a User-Agent that says who they are.
+          code="$(curl -s -o /dev/null -w '%{http_code}' \
+            -A "kividb-release (https://github.com/${{ github.repository }})" \
+            "https://crates.io/api/v1/crates/kividb/${ver}")"
+          case "${code}" in
+            200)
+              echo "::notice::crates.io already has kividb ${ver}."
+              echo "run=false" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::crates.io answered ${code} for kividb ${ver}"
+              exit 1
+              ;;
+          esac
+
+      - uses: actions/checkout@v4
+        if: steps.cfg.outputs.run == 'true'
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.cfg.outputs.run == 'true'
+
+      # Packages what Cargo.toml's `include` lists, builds that package as a
+      # check, and uploads it. --locked: with the Cargo.lock the release was
+      # built with, which the crate carries.
+      - name: cargo publish
+        if: steps.cfg.outputs.run == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
+
   # ── Smoke test — release candidates only ────────────────────────────────
   #
   # Runs after the images are published, so smoke-test.yml pulls the exact
