@@ -83,6 +83,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a restart, a full sync, `RESTORE` or `MIGRATE`, and `HEXPIRE h
   9223372036854775807 FIELDS 1 f` stopped the server.
 
+- **`CONFIG REWRITE` no longer writes a config file the server was not
+  started from.** A server started without one, because its `--configfile`
+  path (by default `/etc/kividb/kividb.conf`) did not exist, created the
+  file on `CONFIG REWRITE`, with its `port`, `replicaof` and every other
+  setting in it. The next server started with the same path, which for the
+  default path is any server on the host started without a config file of
+  its own, loaded it. Sentinel sends `REPLICAOF` and then `CONFIG REWRITE`
+  to each replica it reconfigures, and this way turned unrelated servers
+  into replicas whose data a full sync then replaced. As in Redis, a server
+  that was not started from a config file now replies `ERR The server is
+  running without a config file` and writes nothing, and `INFO server`
+  shows its `config_file` as empty. A server started from a file, even an
+  empty one, rewrites it as before; the packages install
+  `/etc/kividb/kividb.conf`, and the Kubernetes operator starts every
+  server from one. To use `CONFIG REWRITE` on a server started without a
+  file (the Docker image, for one), start it with `--configfile` pointing
+  at a file that exists. A host where an earlier version already created
+  the file this way still has it: look for a `/etc/kividb/kividb.conf`
+  that holds a `replicaof` line nobody wrote, and delete or fix it (#442).
+
 - **JSON numbers keep every digit.** A number that needs 17 significant
   digits was often read as the double next to it: `JSON.SET k $
   13.326500000000001` then `JSON.GET k` gave `13.3265`, and 435 of 2,000
