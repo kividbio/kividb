@@ -155,7 +155,7 @@ fn fill_or_end(r: &mut impl Read, buf: &mut [u8], started: bool) -> io::Result<b
             Ok(0) => {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    "the image ends inside a section's magic",
+                    "the snapshot ends inside a section's magic: it is cut short",
                 ));
             }
             Ok(n) => at += n,
@@ -164,6 +164,47 @@ fn fill_or_end(r: &mut impl Read, buf: &mut [u8], started: bool) -> io::Result<b
         }
     }
     Ok(true)
+}
+
+/// `result`, the reading of the `section` section's body, with an image that
+/// ends inside it said to be cut short (#474).
+///
+/// Reaching the end of the image partway through a section is never a clean
+/// end, on any reading: a section is either all there or the image is torn.
+/// The error stays [`io::ErrorKind::UnexpectedEof`], a fault of the layout,
+/// so that [`read_retrying`] still reads a 1.2.0 image again as it says.
+fn whole_section<T>(section: &str, result: io::Result<T>) -> io::Result<T> {
+    result.map_err(|e| {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("the snapshot ends inside its {section} section: it is cut short"),
+            )
+        } else {
+            e
+        }
+    })
+}
+
+/// [`whole_section`] for the index, HNSW graph and alias sections, with one
+/// that is all there but cannot be used refused as well, saying which.
+///
+/// They were read best-effort, and one that could not be used ended the scan
+/// with a warning. The images of 1.0 to 1.2.0 hold the key expiries and the
+/// function libraries after them, so every TTL and library was dropped with
+/// it, and the indexes were not rebuilt either. No writer makes such a
+/// section, so refusing one refuses no image KiviDB wrote whole (#474).
+fn usable_section<T>(section: &str, result: io::Result<T>) -> io::Result<T> {
+    whole_section(section, result).map_err(|e| {
+        if e.kind() == io::ErrorKind::InvalidData {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the snapshot's {section} section cannot be used: {e}"),
+            )
+        } else {
+            e
+        }
+    })
 }
 
 /// A snapshot file that goes to the disk as it is written, a few megabytes
@@ -1727,7 +1768,8 @@ fn push_plans(plans: &mut Vec<Vec<usize>>, plan: &[usize], ends: &[usize], room:
 ///
 /// A reading that takes 1.2.0's empty key reads an image 1.2.0 wrote, which
 /// holds only sections 1.2.0 knows: it does not pass over a section it does
-/// not know, or one that is damaged, as other readings do.
+/// not know, as other readings do. No reading passes over a section that is
+/// cut short or cannot be used.
 fn read_image(
     r: impl Read,
     keep: bool,
@@ -2149,10 +2191,12 @@ fn read_image(
     // fixed order so that an image carrying a section this build does not know
     // still loads: an unrecognised magic simply ends the scan.
     //
-    // Index schemas and HNSW graphs stay best-effort, as they always were — a
-    // snapshot that predates them, or whose index section is damaged, falls
-    // back to rebuilding. Nothing after a damaged section can be located, so
-    // that also ends the scan, and it says so because TTLs live behind it.
+    // An image that ends inside a section, its magic or its body, is cut
+    // short, and refused on every reading (#474): loading it started a server
+    // without its TTLs, its function libraries or its indexes.
+    //
+    // A section that is all there but cannot be used is refused too, the
+    // index, HNSW graph and alias sections included (see `usable_section`).
     let mut index_schemas = Vec::new();
     let mut hnsw_graphs = std::collections::HashMap::new();
     let mut dictionaries = Vec::new();
@@ -2180,65 +2224,47 @@ fn read_image(
             ));
         }
         if &magic == KDB_INDEX_MAGIC {
-            match read_index_schemas(&mut r) {
-                Ok(v) => index_schemas = v,
-                Err(e) if strict => return Err(e),
-                Err(e) => {
-                    log_warn!(
-                        "snapshot index section is unreadable ({e}); indexes will be \
-                         rebuilt, and any key expiries and function libraries stored \
-                         after it are lost"
-                    );
-                    break;
-                }
-            }
+            index_schemas = usable_section("index", read_index_schemas(&mut r))?;
         } else if &magic == KDB_HNSW_MAGIC {
-            match read_hnsw_graphs(&mut r) {
-                Ok(v) => hnsw_graphs = v,
-                Err(e) if strict => return Err(e),
-                Err(e) => {
-                    log_warn!(
-                        "snapshot HNSW section is unreadable ({e}); graphs will be \
-                         rebuilt, and any key expiries and function libraries stored \
-                         after it are lost"
-                    );
-                    break;
-                }
-            }
+            hnsw_graphs = usable_section("HNSW graph", read_hnsw_graphs(&mut r))?;
         } else if &magic == KDB_EXPIRY_MAGIC {
-            read_expiry_section(&mut r, &mut expiries)?;
+            whole_section("expiry", read_expiry_section(&mut r, &mut expiries))?;
         } else if &magic == KDB_ALIAS_MAGIC {
-            match read_alias_section(&mut r) {
-                Ok(aliases) => {
-                    for (alias, index) in aliases {
-                        if let Some(schema) = index_schemas.iter_mut().find(|s| s.name == index) {
-                            schema.aliases.push(alias);
-                        }
-                    }
-                }
-                Err(e) if strict => return Err(e),
-                Err(e) => {
-                    log_warn!("snapshot index alias section is unreadable ({e})");
-                    break;
+            let aliases = usable_section("index alias", read_alias_section(&mut r))?;
+            for (alias, index) in aliases {
+                if let Some(schema) = index_schemas.iter_mut().find(|s| s.name == index) {
+                    schema.aliases.push(alias);
                 }
             }
         } else if &magic == KDB_FIELD_OPTIONS_MAGIC {
             // Not best-effort: an index that comes back without its options
             // is a different index — a TAG field split at the wrong
             // character matches different documents.
-            read_field_options_section(&mut r, &mut index_schemas)?;
+            whole_section(
+                "field options",
+                read_field_options_section(&mut r, &mut index_schemas),
+            )?;
         } else if &magic == KDB_SYNONYMS_MAGIC {
-            dictionaries = read_synonyms_section(&mut r, &mut index_schemas)?;
+            dictionaries = whole_section(
+                "synonyms",
+                read_synonyms_section(&mut r, &mut index_schemas),
+            )?;
         } else if &magic == KDB_VECTOR_TYPES_MAGIC {
-            read_vector_types_section(&mut r, &mut index_schemas)?;
+            whole_section(
+                "vector types",
+                read_vector_types_section(&mut r, &mut index_schemas),
+            )?;
         } else if &magic == KDB_FUNCTIONS_MAGIC {
             // Not best-effort: a node that comes back without its libraries
             // fails every FCALL.
-            functions = Some(read_bytes(&mut r)?);
+            functions = Some(whole_section("functions", read_bytes(&mut r))?);
         } else if &magic == KDB_LANGUAGE_MAGIC {
-            read_language_section(&mut r, &mut index_schemas)?;
+            whole_section(
+                "language",
+                read_language_section(&mut r, &mut index_schemas),
+            )?;
         } else if &magic == KDB_SCORE_MAGIC {
-            read_score_section(&mut r, &mut index_schemas)?;
+            whole_section("score", read_score_section(&mut r, &mut index_schemas))?;
         } else if strict {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -5688,8 +5714,8 @@ mod expiry_section_tests {
         assert!(loaded.expiries[0].is_empty());
     }
 
-    /// Unlike the index sections, a torn expiry section fails the load: half
-    /// the TTLs silently missing is worse than a loud error.
+    /// A torn expiry section fails the load, as a torn section of any kind
+    /// does (#474): half the TTLs silently missing is worse than a loud error.
     #[test]
     fn a_truncated_expiry_section_fails_the_load() {
         let db0 = HashMap::from([(Key::from("a"), string("1"))]);
@@ -5901,30 +5927,51 @@ mod field_option_tests {
         assert!(!bare.windows(8).any(|w| w == KDB_LANGUAGE_MAGIC));
     }
 
-    /// `SCORE` and `SCORE_FIELD` come back with the index; an index that
-    /// sets neither takes no room.
-    #[test]
-    fn index_score_survives_a_snapshot() {
-        let index = |name: &str, default_score: f64, score_field: Option<&str>| {
-            IndexSchema {
-                name: name.into(),
-                db_index: 0,
-                on: IndexOn::Hash,
-                prefixes: vec![],
-                fields: vec![SchemaField {
-                    name: "t".into(),
-                    field_type: FieldType::Text,
-                    options: FieldOptions::default(),
-                }],
-                aliases: Vec::new(),
-                stopwords: None,
-                synonyms: Default::default(),
-                language: Default::default(),
-                default_score,
-                score_field: score_field.map(str::to_string),
-            }
-            .into_def()
-        };
+    /// An index with a text field `t`, and `SCORE` and `SCORE_FIELD` as given.
+    fn score_index(
+        name: &str,
+        default_score: f64,
+        score_field: Option<&str>,
+    ) -> crate::vector::IndexDef {
+        IndexSchema {
+            name: name.into(),
+            db_index: 0,
+            on: IndexOn::Hash,
+            prefixes: vec![],
+            fields: vec![SchemaField {
+                name: "t".into(),
+                field_type: FieldType::Text,
+                options: FieldOptions::default(),
+            }],
+            aliases: Vec::new(),
+            stopwords: None,
+            synonyms: Default::default(),
+            language: Default::default(),
+            default_score,
+            score_field: score_field.map(str::to_string),
+        }
+        .into_def()
+    }
+
+    /// The magic of every section an image can carry, and its name.
+    const EVERY_SECTION: [(&str, &[u8; 8]); 10] = [
+        ("index", KDB_INDEX_MAGIC),
+        ("HNSW", KDB_HNSW_MAGIC),
+        ("expiry", KDB_EXPIRY_MAGIC),
+        ("alias", KDB_ALIAS_MAGIC),
+        ("field options", KDB_FIELD_OPTIONS_MAGIC),
+        ("synonyms", KDB_SYNONYMS_MAGIC),
+        ("vector types", KDB_VECTOR_TYPES_MAGIC),
+        ("functions", KDB_FUNCTIONS_MAGIC),
+        ("language", KDB_LANGUAGE_MAGIC),
+        ("score", KDB_SCORE_MAGIC),
+    ];
+
+    /// An image that holds every section an image can carry: one key with a
+    /// time to live, indexes with an HNSW field, an alias, field options,
+    /// synonyms, a language and a score, and function libraries.
+    fn image_with_every_section() -> Vec<u8> {
+        let index = score_index;
         let mut synonyms = crate::vector::SynonymGroups::new();
         synonyms.insert("car".into(), vec!["automobile".into()]);
         let scored = IndexSchema {
@@ -5982,23 +6029,21 @@ mod field_option_tests {
         // Include the function section even in a build without Lua, so the
         // ordering covers every section an image can carry.
         frozen.functions = Some(b"KVFN payload".to_vec());
-        let image = frozen.into_payload().unwrap();
+        frozen.into_payload().unwrap()
+    }
+
+    /// `SCORE` and `SCORE_FIELD` come back with the index; an index that
+    /// sets neither takes no room.
+    #[test]
+    fn index_score_survives_a_snapshot() {
+        let index = score_index;
+        let image = image_with_every_section();
 
         let score_at = image
             .windows(8)
             .position(|w| w == KDB_SCORE_MAGIC)
             .expect("score section");
-        for (name, magic) in [
-            ("index", KDB_INDEX_MAGIC),
-            ("HNSW", KDB_HNSW_MAGIC),
-            ("expiry", KDB_EXPIRY_MAGIC),
-            ("alias", KDB_ALIAS_MAGIC),
-            ("field options", KDB_FIELD_OPTIONS_MAGIC),
-            ("synonyms", KDB_SYNONYMS_MAGIC),
-            ("vector types", KDB_VECTOR_TYPES_MAGIC),
-            ("functions", KDB_FUNCTIONS_MAGIC),
-            ("language", KDB_LANGUAGE_MAGIC),
-        ] {
+        for &(name, magic) in &EVERY_SECTION[..EVERY_SECTION.len() - 1] {
             let at = image
                 .windows(8)
                 .position(|w| w == magic)
@@ -6037,6 +6082,83 @@ mod field_option_tests {
         )
         .unwrap();
         assert!(!bare.windows(8).any(|w| w == KDB_SCORE_MAGIC));
+    }
+
+    /// An image cut anywhere inside a section after its databases, in its
+    /// magic or in its body, is refused, loaded or verified, and says it is
+    /// cut short (#474). The index, HNSW and alias sections were read
+    /// best-effort: cut inside one, the image loaded without its indexes, and
+    /// without the TTLs and libraries stored after it.
+    #[test]
+    fn an_image_cut_inside_any_section_is_refused() {
+        let image = image_with_every_section();
+        assert!(load_snapshot_bytes(&image).is_ok());
+        let mut starts: Vec<(&str, usize)> = EVERY_SECTION
+            .iter()
+            .map(|(name, magic)| {
+                let at = image
+                    .windows(8)
+                    .position(|w| w == *magic)
+                    .unwrap_or_else(|| panic!("no {name} section"));
+                (*name, at)
+            })
+            .collect();
+        starts.sort_by_key(|&(_, at)| at);
+        for (i, &(name, at)) in starts.iter().enumerate() {
+            let end = starts.get(i + 1).map_or(image.len(), |&(_, next)| next);
+            let mut cuts = vec![at + 1, at + 4, at + 7, at + 8, at + 9, at + 12];
+            cuts.extend([(at + end) / 2, end - 2, end - 1]);
+            cuts.retain(|&cut| cut > at && cut < end);
+            cuts.dedup();
+            for cut in cuts {
+                let torn = &image[..cut];
+                let err = load_snapshot_bytes(torn)
+                    .err()
+                    .unwrap_or_else(|| panic!("the {name} section cut at {cut} loaded"));
+                assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{name} at {cut}");
+                assert!(
+                    err.to_string().contains("cut short"),
+                    "{name} at {cut}: {err}"
+                );
+                assert!(load_snapshot_from(torn).is_err(), "{name} at {cut}");
+                assert!(verify_snapshot(torn).is_err(), "{name} at {cut}");
+            }
+        }
+    }
+
+    /// An index section that is all there but cannot be used, an index whose
+    /// name is not UTF-8, is refused, as one the image ends inside is: it was
+    /// passed over, and the scan ended there, with every TTL and function
+    /// library stored after it (#474).
+    #[test]
+    fn a_whole_but_unusable_index_section_is_refused() {
+        let mut whole = Vec::new();
+        write_kdb_header(&mut whole, 1).unwrap();
+        let value = KiviDBValue::String(SharedBytes::from(&b"1"[..]));
+        write_kdb_entry(&mut whole, "a", value.view()).unwrap();
+        write_kdb_db_end(&mut whole).unwrap();
+        let mut unusable = whole.clone();
+        unusable.extend_from_slice(KDB_INDEX_MAGIC);
+        unusable.extend(1u32.to_le_bytes());
+        unusable.extend(1u32.to_le_bytes());
+        unusable.push(0xFF);
+        unusable.extend(0u32.to_le_bytes());
+        let err = load_snapshot_bytes(&unusable).err().expect("loaded");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("index section cannot be used"),
+            "{err}"
+        );
+        assert!(load_snapshot_from(unusable.as_slice()).is_err());
+        assert!(verify_snapshot(&unusable).is_err());
+
+        let mut cut = whole.clone();
+        cut.extend_from_slice(KDB_INDEX_MAGIC);
+        cut.extend(1u32.to_le_bytes());
+        cut.extend(5u32.to_le_bytes());
+        cut.extend(b"ab");
+        assert!(load_snapshot_bytes(&cut).is_err());
+        assert!(verify_snapshot(&cut).is_err());
     }
 }
 
@@ -6818,6 +6940,48 @@ mod empty_key_tests {
         let (loaded, opened) = readings(&damaged(100_000, "k"));
         assert!(loaded.is_err());
         assert!(opened <= READINGS, "{opened} readings");
+    }
+
+    /// An image cut short inside a section is a fault of its layout, so it
+    /// is read again where 1.2.0 could have put the empty key, no more than
+    /// [`READINGS`] times, and refused with the first reading's error, which
+    /// says where it is cut (#474).
+    #[test]
+    fn an_image_cut_inside_a_section_is_read_again_a_bounded_number_of_times() {
+        for dbs in [16, 100_000] {
+            let mut image = Vec::new();
+            write_kdb_header(&mut image, dbs).unwrap();
+            for _ in 0..dbs {
+                // One-byte keys: every end could be 1.2.0's empty key.
+                write_kdb_entry(&mut image, "k", string("v").view()).unwrap();
+                write_kdb_db_end(&mut image).unwrap();
+            }
+            let whole_len = image.len();
+            for (section, magic) in [
+                ("index", KDB_INDEX_MAGIC),
+                ("HNSW graph", KDB_HNSW_MAGIC),
+                ("index alias", KDB_ALIAS_MAGIC),
+                ("expiry", KDB_EXPIRY_MAGIC),
+            ] {
+                image.truncate(whole_len);
+                image.extend_from_slice(magic);
+                image.extend(1u32.to_le_bytes());
+                image.extend(5u32.to_le_bytes());
+                image.extend(b"ab");
+                let (loaded, opened) = readings(&image);
+                let err = loaded.err().unwrap_or_else(|| panic!("{section} loaded"));
+                assert!(
+                    (2..=READINGS).contains(&opened),
+                    "{section}: {opened} readings"
+                );
+                assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{section}");
+                assert!(
+                    err.to_string().contains(&format!("its {section} section")),
+                    "{section}: {err}"
+                );
+                assert!(verify_snapshot(&image).is_err(), "{section}");
+            }
+        }
     }
 
     /// A reading the disk failed is not read again; nor is an image that
