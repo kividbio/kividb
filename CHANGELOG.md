@@ -90,6 +90,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ([#311](https://github.com/kividbio/kividb/issues/311),
   by [@Parikalp-Bhardwaj](https://github.com/Parikalp-Bhardwaj)).
 
+- Fixed `WAIT` and `WAITAOF` starving socket I/O under `--io-model uring`, which could make `WAIT` time out or hang with timeout 0 when the replica shared the waiting client's worker (#498).
+
 - **A negative Unix time no longer deletes hash fields.** `HEXPIREAT` and
   `HPEXPIREAT` with a time below 0, and `HGETEX` and `HSETEX` with a
   negative `EXAT` or `PXAT`, took it as a time that had passed and deleted
