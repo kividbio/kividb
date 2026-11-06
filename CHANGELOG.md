@@ -193,11 +193,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before it drops its old dataset counted the keys it was about to lose. As
   for an RDB file, such a snapshot now loads into the server's databases
   when there are enough, and is refused otherwise, naming the database and
-  the `databases` to start with; a replica refuses such a full sync before
-  it lets go of its dataset, and keeps it. A database number past any a
-  server could have is called invalid rather than given as advice, and
-  `--databases 0` is refused on the command line as it was in a config
-  file (#482).
+  the `databases` to start with, as is one with a search index in such a
+  database; a replica refuses such a full sync before it lets go of its
+  dataset, and keeps it. A snapshot of KiviDB 1.2.0 with the empty key
+  before its last database is still read again where 1.2.0 put it before
+  it is refused. A database number of 65536 or more is called more likely
+  a damaged file than given as advice, and `--databases 0` is refused on
+  the command line as it was in a config file (#482).
 
 - **A Lua script's `false` is a RESP3 null to a RESP3 client (#431).** A
   script's `false`, which is also what `redis.call` gives back for a nil

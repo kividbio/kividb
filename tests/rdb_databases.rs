@@ -396,7 +396,7 @@ fn a_bogus_database_number_is_called_invalid() {
     let (failed, stderr) = fails_to_start(dir.path(), &[]);
     assert!(failed, "{stderr}");
     assert!(
-        stderr.contains("database 1000000") && stderr.contains("not a database number"),
+        stderr.contains("database 1000000") && stderr.contains("damaged file"),
         "{stderr}"
     );
     assert!(!stderr.contains("start it with"), "{stderr}");
