@@ -9,6 +9,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`HELLO` reports the Redis release KiviDB follows: `server: redis`,
+  `version: 8.10.0`.** It said `server: kividb` and KiviDB's own release
+  (`version: 1.2.0`), and redis-py (8.1) and Jedis (5.2) turn on their
+  built-in client-side caches only when `HELLO` says `redis` at 7.4 or
+  later, so they refused to cache against KiviDB, though the server-side
+  `CLIENT TRACKING` they use works. `HELLO` now says what `INFO`'s
+  `redis_version` already said, and KiviDB's own release follows as
+  `kividb_version`, as in `INFO` (Dragonfly does the same). A tool that
+  told KiviDB apart by `HELLO`'s `server` should look for
+  `kividb_version` instead (#451).
+
 - **Source archives are small again.** The tarball GitHub makes of the
   1.2.0 tag is 70 MB, against 4.5 MB for 1.1.3: the raw results of the
   1.2.0 benchmarks under `benchmarks/1.2.0/` went into it (#319).

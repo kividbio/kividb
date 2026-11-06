@@ -279,6 +279,12 @@ fn config_set_array(param: &str, value: &str) -> Vec<u8> {
 
 const NOT_MEMORY_OR_PERCENT: &str = "ERR argument must be a memory or percent value";
 
+/// The Redis release whose commands and replies this server follows: `INFO`'s
+/// `redis_version`, and `HELLO`'s `version`. Clients read it to decide what
+/// they may send; redis-py and Jedis turn on their client-side caches only
+/// for a `server` of `redis` at 7.4 or later (#451).
+pub(crate) const REDIS_VERSION: &str = "8.10.0";
+
 /// The reply to a script command in a build without Lua. Job queues such as
 /// BullMQ and Sidekiq show it to their users, so it names the build to use.
 #[cfg(not(feature = "lua"))]
@@ -3810,7 +3816,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 out.push_str("# Server\r\n");
                 // The Redis release whose commands and replies this server
                 // follows. Clients read it to decide what they may send.
-                out.push_str("redis_version:8.10.0\r\n");
+                out.push_str(&format!("redis_version:{REDIS_VERSION}\r\n"));
                 // There is no Redis build behind that version: these are
                 // the fields a Redis build fills in, for the clients and
                 // tools that read them.
@@ -5723,8 +5729,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // rather than an error, so clients don't break.
             Some(resp_array(vec![
                 resp_bulk_str("server"),
-                resp_bulk_str("kividb"),
+                resp_bulk_str("redis"),
                 resp_bulk_str("version"),
+                resp_bulk_str(REDIS_VERSION),
+                resp_bulk_str("kividb_version"),
                 resp_bulk_str(env!("CARGO_PKG_VERSION")),
                 resp_bulk_str("proto"),
                 resp_integer(2),
