@@ -2824,7 +2824,7 @@ pub fn replay_aof(
     };
 
     if let Some(image) = image {
-        let loaded = crate::snapshot::load_snapshot_from(image)?;
+        let loaded = crate::snapshot::load_snapshot_bytes(image)?;
         let crate::snapshot::LoadedSnapshot {
             dbs,
             index_schemas,

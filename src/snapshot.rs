@@ -130,6 +130,37 @@ const TAG_TIMESERIES_V2: u8 = 14;
 /// only for a compaction, so other series stay readable by older builds.
 const TAG_TIMESERIES_V3: u8 = 15;
 
+/// Whether `byte` is a value's type tag: what follows the empty key as 1.2.0
+/// wrote it ([`read_image`]).
+fn is_tag(byte: u8) -> bool {
+    (TAG_STRING..=TAG_TIMESERIES_V3).contains(&byte)
+}
+
+/// What every section after the databases opens with.
+const SECTION_MAGIC_PREFIX: &[u8; 4] = b"KIVI";
+
+/// Fill `buf`; `Ok(false)` if the image ends before its first byte and
+/// nothing of the block it is part of was read before it (`started`). An
+/// image that ends inside the block is torn.
+fn fill_or_end(r: &mut impl Read, buf: &mut [u8], started: bool) -> io::Result<bool> {
+    let mut at = 0;
+    while at < buf.len() {
+        match r.read(&mut buf[at..]) {
+            Ok(0) if at == 0 && !started => return Ok(false),
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the image ends inside a section's magic",
+                ));
+            }
+            Ok(n) => at += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(true)
+}
+
 /// A snapshot file that goes to the disk as it is written, a few megabytes
 /// at a time, rather than all at once when it is synced.
 ///
@@ -1528,9 +1559,7 @@ fn write_index_schema(w: &mut impl Write, def: &crate::vector::IndexDef) -> io::
 }
 
 pub fn load_snapshot(path: &str) -> io::Result<LoadedSnapshot> {
-    let file = File::open(path)?;
-    let mut r = BufReader::new(file);
-    load_snapshot_from(&mut r)
+    load_snapshot_with(|| File::open(path).map(BufReader::new)).map(|(loaded, _)| loaded)
 }
 
 /// Read a KDB image from anything byte-shaped.
@@ -1538,8 +1567,27 @@ pub fn load_snapshot(path: &str) -> io::Result<LoadedSnapshot> {
 /// Split out from [`load_snapshot`] so the AOF preamble — the same format,
 /// living at an offset inside `appendonly.aof` rather than in its own file —
 /// can be read without being copied out to disk first.
+///
+/// It is read once: an image that 1.2.0 wrote with the empty key in a
+/// database before its last one is not read (see [`read_retrying`]). The
+/// server reads its images with [`load_snapshot`], [`load_snapshot_bytes`]
+/// and [`load_snapshot_with`].
 pub fn load_snapshot_from(r: impl Read) -> io::Result<LoadedSnapshot> {
-    read_image(r, true).map(|(loaded, _)| loaded)
+    read_image(r, true, &[], &mut Vec::new()).map(|(loaded, _)| loaded)
+}
+
+/// [`load_snapshot_from`] for an image in memory, read again as
+/// [`read_retrying`] says if it has to be.
+pub fn load_snapshot_bytes(image: &[u8]) -> io::Result<LoadedSnapshot> {
+    read_retrying(|| Ok(image), true).map(|(loaded, _, _)| loaded)
+}
+
+/// Load the image that `open` opens, opening it again as [`read_retrying`]
+/// says if it has to be. Returns the reader of the reading that loaded it.
+pub fn load_snapshot_with<R: Read>(
+    open: impl FnMut() -> io::Result<R>,
+) -> io::Result<(LoadedSnapshot, R)> {
+    read_retrying(open, true).map(|(loaded, _, reader)| (loaded, reader))
 }
 
 /// Read a KDB image from beginning to end without keeping any of it, and
@@ -1553,14 +1601,84 @@ pub fn load_snapshot_from(r: impl Read) -> io::Result<LoadedSnapshot> {
 /// Stricter than loading: every database has to end where the writer ends
 /// it. (The loader also accepts an image that simply stops between two
 /// entries, for the sake of files written before there was an end marker.)
-pub fn verify_snapshot(r: impl Read) -> io::Result<usize> {
-    read_image(r, false).map(|(_, keys)| keys)
+pub fn verify_snapshot(image: &[u8]) -> io::Result<usize> {
+    read_retrying(|| Ok(image), false).map(|(_, keys, _)| keys)
+}
+
+/// Readings [`read_retrying`] makes of one image at most.
+const READINGS: usize = 32;
+
+/// Read the image `open` opens with [`read_image`], and if that fails, again
+/// with the empty key as 1.2.0 wrote it in a database before the last.
+///
+/// 1.2.0 wrote the empty key with the length that ends a database (#441). In
+/// the last database the reader tells the two apart by the byte after it.
+/// Before the last one it cannot: that byte begins the next database, whose
+/// first key's length can be anything. So the image is read as written by
+/// 1.2.1 first, and only if that fails, again with the first end of each
+/// database it got past, earliest first, read as the empty key. A wrong guess
+/// reads what follows as a value and fails within a few bytes. 1.2.0 wrote
+/// at most one empty key per database.
+///
+/// The image is opened again for each reading, and read no more than
+/// [`READINGS`] times. If none loads it, the first reading's error is
+/// returned.
+fn read_retrying<R: Read>(
+    mut open: impl FnMut() -> io::Result<R>,
+    keep: bool,
+) -> io::Result<(LoadedSnapshot, usize, R)> {
+    let mut first_error = None;
+    // Readings still to make, latest pushed first: each a reading that
+    // failed, with one database more read as holding the empty key.
+    let mut plans: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut readings = 0;
+    while let Some(plan) = plans.pop() {
+        if readings == READINGS {
+            break;
+        }
+        readings += 1;
+        let mut reader = open()?;
+        let mut ends = Vec::new();
+        match read_image(&mut reader, keep, &plan, &mut ends) {
+            Ok((loaded, keys)) => {
+                if !plan.is_empty() {
+                    log_warn!(
+                        "snapshot was written by KiviDB 1.2.0 with the empty key in database(s) \
+                         {plan:?}, where 1.2.0 ends a database (#441): read as the empty key"
+                    );
+                }
+                return Ok((loaded, keys, reader));
+            }
+            Err(e) => {
+                first_error.get_or_insert(e);
+                let after = plan.last().map_or(0, |&db| db + 1);
+                for &db in ends.iter().rev().filter(|&&db| db >= after) {
+                    let mut next = plan.clone();
+                    next.push(db);
+                    plans.push(next);
+                }
+            }
+        }
+    }
+    Err(first_error.unwrap_or_else(|| io::Error::other("snapshot could not be read")))
 }
 
 /// The reader behind [`load_snapshot_from`] and [`verify_snapshot`]. With
 /// `keep` unset nothing is retained; the count of keys read is returned
 /// either way.
-fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
+///
+/// The empty key as 1.2.0 wrote it (#441), a key length of 0 and then the
+/// key's type tag, is read where a database's first 0 can only be that: in
+/// the last database, where an end is followed by the end of the image or a
+/// section, which opens with `KIVI`, never with a tag. And in the databases
+/// `legacy` names (see [`read_retrying`]). The other databases whose first
+/// 0 was read as their end are added to `ends`.
+fn read_image(
+    r: impl Read,
+    keep: bool,
+    legacy: &[usize],
+    ends: &mut Vec<usize>,
+) -> io::Result<(LoadedSnapshot, usize)> {
     let mut r = r;
     let mut keys_read = 0usize;
     let mut magic = [0u8; 8];
@@ -1577,9 +1695,15 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
     // The image stopped between two entries (see below): the databases it
     // says are still to come are not there.
     let mut ended = false;
+    // The first byte of the section after the last database, read to see
+    // whether it is a tag.
+    let mut section_byte = None;
 
-    for _ in 0..db_count {
+    for db in 0..db_count {
         let mut map: HashMap<String, KiviDBValue> = HashMap::new();
+        let last = db + 1 == db_count;
+        // Whether this database's 1.2.0 empty key has been read.
+        let mut legacy_read = false;
 
         loop {
             // Read key length — if EOF here, we're done
@@ -1587,7 +1711,9 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
             match r.read_exact(&mut len_buf) {
                 // Verifying: an image that stops before a database's end
                 // marker is not a whole image.
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof && keep => {
+                // Nor, reading 1.2.0's empty key where the first reading
+                // could not, one that stops (a wrong guess may).
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof && keep && legacy.is_empty() => {
                     ended = true;
                     break;
                 }
@@ -1596,9 +1722,45 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
             }
             let klen = u32::from_le_bytes(len_buf);
 
-            // TAG_EOF sentinel (key len == 0 means end of DB section)
+            // TAG_EOF sentinel (key len == 0 means end of DB section), or
+            // the empty key as 1.2.0 wrote it, with its tag after it.
+            let mut legacy_tag = None;
             if klen == 0 {
-                break;
+                if !legacy_read && legacy.contains(&db) {
+                    let mut tag = [0u8];
+                    r.read_exact(&mut tag)?;
+                    if !is_tag(tag[0]) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "no empty key where 1.2.0 would have written one",
+                        ));
+                    }
+                    legacy_tag = Some(tag[0]);
+                } else if !legacy_read && last {
+                    let mut next = [0u8];
+                    match r.read_exact(&mut next) {
+                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                        Err(e) => return Err(e),
+                        Ok(()) if is_tag(next[0]) => {
+                            log_warn!(
+                                "snapshot holds the empty key in database {db} as KiviDB 1.2.0 \
+                                 wrote it, with the length that ends a database (#441): read as \
+                                 the empty key"
+                            );
+                            legacy_tag = Some(next[0]);
+                        }
+                        Ok(()) => {
+                            section_byte = Some(next[0]);
+                            break;
+                        }
+                    }
+                } else {
+                    if !legacy_read && !last {
+                        ends.push(db);
+                    }
+                    break;
+                }
+                legacy_read = true;
             }
             // The empty key: no bytes follow.
             let klen = if klen == EMPTY_KEY_LEN {
@@ -1613,7 +1775,10 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
 
             // Read type tag
             let mut tag = [0u8];
-            r.read_exact(&mut tag)?;
+            match legacy_tag {
+                Some(legacy_tag) => tag[0] = legacy_tag,
+                None => r.read_exact(&mut tag)?,
+            }
 
             let value = match tag[0] {
                 TAG_STRING => {
@@ -1921,8 +2086,24 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
     let mut functions = None;
     loop {
         let mut magic = [0u8; 8];
-        if r.read_exact(&mut magic).is_err() {
+        let from = match section_byte.take() {
+            Some(first) => {
+                magic[0] = first;
+                1
+            }
+            None => 0,
+        };
+        if !fill_or_end(&mut r, &mut magic[from..], from > 0)? {
             break;
+        }
+        // A section this build does not know is passed over (below); what
+        // is not a section at all is not an image this reader understands,
+        // and loading what came before it would load part of one (#441).
+        if !magic.starts_with(SECTION_MAGIC_PREFIX) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the image goes on past its databases with bytes that are not a section",
+            ));
         }
         if &magic == KDB_INDEX_MAGIC {
             match read_index_schemas(&mut r) {
@@ -5813,6 +5994,138 @@ mod empty_key_tests {
         let mut rest = &whole[at + 4..];
         let err = read_exactly(&mut rest, u32::MAX as usize).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// An image as 1.2.0 wrote it: the empty key with the length that ends a
+    /// database, then its value. Each database's entries in the order given.
+    fn image_1_2_0(dbs: &[Vec<(&str, KiviDBValue)>], expiries: &[HashMap<String, u64>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_kdb_header(&mut out, dbs.len() as u32).unwrap();
+        for db in dbs {
+            for (key, value) in db {
+                if key.is_empty() {
+                    out.extend(0u32.to_le_bytes());
+                    write_kdb_value(&mut out, value.view()).unwrap();
+                } else {
+                    write_kdb_entry(&mut out, key, value.view()).unwrap();
+                }
+            }
+            write_kdb_db_end(&mut out).unwrap();
+        }
+        write_kdb_expiry_maps(&mut out, expiries).unwrap();
+        write_kdb_functions_section(&mut out, Some(b"libraries")).unwrap();
+        out
+    }
+
+    fn hash(field: &str, value: &str) -> KiviDBValue {
+        let mut fields = crate::types::HashFields::default();
+        fields.insert(field.to_string(), Arc::from(value.as_bytes()));
+        KiviDBValue::Hash(Arc::new(parking_lot::RwLock::new(fields)))
+    }
+
+    /// In the last database (with `databases 1`, the only one) a 1.2.0 empty
+    /// key was read as the database's end, and its tag as the start of a
+    /// section that was not one: the image loaded without the rest of the
+    /// database, the times to live and the function libraries.
+    #[test]
+    fn a_1_2_0_image_with_the_empty_key_in_its_last_database_loads_whole() {
+        let far = unix_ms_now() + 3_600_000;
+        let db = vec![("a", string("1")), ("", hash("f", "v")), ("b", string("2"))];
+        let exp = vec![HashMap::from([
+            ("a".to_string(), far),
+            (String::new(), far + 1),
+            ("b".to_string(), far + 2),
+        ])];
+        let old = image_1_2_0(&[db], &exp);
+        assert_eq!(verify_snapshot(&old).unwrap(), 3);
+        // Read once, as the AOF's and a full sync's readers did: the last
+        // database needs no second reading.
+        for loaded in [
+            load_snapshot_from(old.as_slice()).unwrap(),
+            load_snapshot_bytes(&old).unwrap(),
+        ] {
+            assert_eq!(loaded.dbs[0].len(), 3);
+            assert_eq!(get_string(&loaded.dbs[0], "a"), b"1");
+            assert_eq!(get_string(&loaded.dbs[0], "b"), b"2");
+            assert!(matches!(loaded.dbs[0].get(""), Some(KiviDBValue::Hash(_))));
+            assert_eq!(loaded.expiries[0].get("a"), Some(&far));
+            assert_eq!(loaded.expiries[0].get(""), Some(&(far + 1)));
+            assert_eq!(loaded.expiries[0].get("b"), Some(&(far + 2)));
+            assert_eq!(loaded.functions.as_deref(), Some(&b"libraries"[..]));
+        }
+    }
+
+    /// Before the last database, the byte after a 1.2.0 empty key's 0 could
+    /// as well begin the next database: such an image is read again with
+    /// the empty key there. Here in the first database (as `SET "" x` with
+    /// the default 16 databases) and the last, with a database between whose
+    /// first key is one byte long, so its length's first byte is a tag too.
+    #[test]
+    fn a_1_2_0_image_with_the_empty_key_before_its_last_database_loads_whole() {
+        let far = unix_ms_now() + 3_600_000;
+        let dbs = vec![
+            vec![("x", string("1")), ("", string("e0"))],
+            vec![("k", string("v"))],
+            vec![("", string("e2")), ("z", string("9"))],
+        ];
+        let exp = vec![
+            HashMap::from([(String::new(), far)]),
+            HashMap::new(),
+            HashMap::from([("z".to_string(), far + 1)]),
+        ];
+        let old = image_1_2_0(&dbs, &exp);
+        assert!(load_snapshot_from(old.as_slice()).is_err());
+        assert_eq!(verify_snapshot(&old).unwrap(), 5);
+        let loaded = load_snapshot_bytes(&old).unwrap();
+        assert_eq!(get_string(&loaded.dbs[0], ""), b"e0");
+        assert_eq!(get_string(&loaded.dbs[0], "x"), b"1");
+        assert_eq!(get_string(&loaded.dbs[1], "k"), b"v");
+        assert_eq!(get_string(&loaded.dbs[2], ""), b"e2");
+        assert_eq!(get_string(&loaded.dbs[2], "z"), b"9");
+        assert_eq!(loaded.expiries[0].get(""), Some(&far));
+        assert_eq!(loaded.expiries[2].get("z"), Some(&(far + 1)));
+        assert_eq!(loaded.functions.as_deref(), Some(&b"libraries"[..]));
+
+        // From a file, as at startup.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.kdb");
+        std::fs::write(&path, &old).unwrap();
+        let loaded = load_snapshot(path.to_str().unwrap()).unwrap();
+        assert_eq!(get_string(&loaded.dbs[0], ""), b"e0");
+        assert_eq!(get_string(&loaded.dbs[2], ""), b"e2");
+    }
+
+    /// What follows the last database's end is the end of the image or a
+    /// section. Anything else is refused, not passed over with the image
+    /// taken for whole.
+    #[test]
+    fn bytes_after_the_last_database_that_are_not_a_section_are_refused() {
+        let mut whole = Vec::new();
+        write_kdb_header(&mut whole, 1).unwrap();
+        write_kdb_entry(&mut whole, "a", string("1").view()).unwrap();
+        write_kdb_db_end(&mut whole).unwrap();
+        let tails: [&[u8]; 6] = [
+            b"garbage!",
+            b"garbage, more of it",
+            b"gar",
+            b"KIVI",
+            &[1, 0xFF, 0xFF, 0xFF, 0x7F],
+            &[3, 9],
+        ];
+        for tail in tails {
+            let mut bad = whole.clone();
+            bad.extend_from_slice(tail);
+            assert!(load_snapshot_bytes(&bad).is_err(), "{tail:?} loaded");
+            assert!(
+                load_snapshot_from(bad.as_slice()).is_err(),
+                "{tail:?} loaded"
+            );
+            assert!(verify_snapshot(&bad).is_err(), "{tail:?} verified");
+        }
+        // A section this build does not know is still passed over.
+        let mut newer = whole.clone();
+        newer.extend_from_slice(b"KIVIZZ9\0and what it holds");
+        assert_eq!(load_snapshot_bytes(&newer).unwrap().dbs[0].len(), 1);
     }
 
     /// Lengths that are not the stand-in are read as lengths still: one that

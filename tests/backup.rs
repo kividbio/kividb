@@ -1826,6 +1826,7 @@ fn write_empty_keys(c: &mut Conn) {
     assert_eq!(c.cmd(&["RPUSH", "list", "", "e"]).i(), 2);
     assert!(c.cmd(&["SELECT", "1"]).ok());
     assert_eq!(c.cmd(&["HSET", "", "", "in-1"]).i(), 1);
+    assert_eq!(c.cmd(&["EXPIRE", "", "200000"]).i(), 1);
     assert!(c.cmd(&["SET", "after", "1"]).ok());
     assert!(c.cmd(&["SELECT", "0"]).ok());
 }
@@ -1840,6 +1841,11 @@ fn assert_empty_keys(c: &mut Conn) {
     assert_eq!(c.cmd(&["LRANGE", "list", "0", "-1"]).strings(), ["", "e"]);
     assert!(c.cmd(&["SELECT", "1"]).ok());
     assert_eq!(c.cmd(&["HGET", "", ""]).s(), "in-1");
+    let ttl = c.cmd(&["TTL", ""]).i();
+    assert!(
+        (100001..=200000).contains(&ttl),
+        "TTL of the empty key in database 1: {ttl}"
+    );
     assert_eq!(c.cmd(&["GET", "after"]).s(), "1");
     assert!(c.cmd(&["SELECT", "0"]).ok());
 }
@@ -1894,6 +1900,86 @@ fn the_empty_key_can_be_migrated() {
     assert!(reply.ok(), "MIGRATE: {reply:?}");
     assert_eq!(c.cmd(&["EXISTS", ""]).i(), 0);
     assert_eq!(to.conn().cmd(&["HGET", "", ""]).s(), "v");
+}
+
+/// A `dump.kdb` as 1.2.0 wrote it, with the empty key under the length that
+/// ends a database: `databases` databases, the empty key in `at`, and every
+/// key with a time to live.
+fn dump_1_2_0(databases: usize, at: usize) -> Vec<u8> {
+    use kividb::shared_bytes::SharedBytes;
+    use kividb::types::KiviDBValue;
+    let string = |v: &str| KiviDBValue::String(SharedBytes::from(v.as_bytes()));
+    let far = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 100_000_000;
+    let mut image = Vec::new();
+    kividb::snapshot::write_kdb_header(&mut image, databases as u32).unwrap();
+    let mut expiries = Vec::new();
+    for db in 0..databases {
+        let mut keys = Vec::new();
+        let before = format!("before-{db}");
+        kividb::snapshot::write_kdb_entry(&mut image, &before, string("1").view()).unwrap();
+        keys.push(before);
+        if db == at {
+            image.extend(0u32.to_le_bytes());
+            kividb::snapshot::write_kdb_value(&mut image, string("x").view()).unwrap();
+            keys.push(String::new());
+        }
+        let after = format!("after-{db}");
+        kividb::snapshot::write_kdb_entry(&mut image, &after, string("2").view()).unwrap();
+        keys.push(after);
+        kividb::snapshot::write_kdb_db_end(&mut image).unwrap();
+        expiries.push(keys);
+    }
+    // The expiry section, as `write_kdb_expiry_maps` lays it out.
+    image.extend(b"KIVIEX1\0");
+    image.extend((databases as u32).to_le_bytes());
+    for keys in expiries {
+        image.extend((keys.len() as u32).to_le_bytes());
+        for key in keys {
+            image.extend((key.len() as u32).to_le_bytes());
+            image.extend(key.as_bytes());
+            image.extend(far.to_le_bytes());
+        }
+    }
+    image
+}
+
+/// 1.2.0 wrote the empty key with the length that ends a database. With it
+/// in the first of 16 databases neither 1.2.0 nor 1.2.1 started; with it in
+/// the only database, both started without the keys after it and without
+/// any time to live. Each such file now loads whole.
+#[test]
+fn a_1_2_0_dump_with_the_empty_key_loads_whole() {
+    for (databases, at) in [(16, 0), (16, 7), (16, 15), (1, 0)] {
+        let dir = tempfile::tempdir().unwrap().keep();
+        std::fs::write(dir.join("dump.kdb"), dump_1_2_0(databases, at)).unwrap();
+        let databases_arg = databases.to_string();
+        let server = start_in(&dir, &["--databases", &databases_arg]);
+        let mut c = server.conn();
+        for db in 0..databases {
+            assert!(c.cmd(&["SELECT", &db.to_string()]).ok());
+            let mut keys = vec![format!("before-{db}"), format!("after-{db}")];
+            if db == at {
+                assert_eq!(
+                    c.cmd(&["GET", ""]).s(),
+                    "x",
+                    "{databases} databases, at {at}"
+                );
+                keys.push(String::new());
+            }
+            assert_eq!(c.cmd(&["DBSIZE"]).i(), keys.len() as i64, "database {db}");
+            for key in keys {
+                let ttl = c.cmd(&["TTL", &key]).i();
+                assert!(
+                    ttl > 99_000,
+                    "{databases} databases, at {at}: TTL of {key:?} in {db}: {ttl}"
+                );
+            }
+        }
+    }
 }
 
 /// An `appendonly.aof` that opens with a KDB preamble, as earlier releases
