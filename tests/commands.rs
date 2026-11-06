@@ -2055,8 +2055,10 @@ fn test_restore_reads_payloads_dumped_by_redis() {
 // A Valkey payload is read from Valkey 9's RDB version, 80, and no other
 // past Redis's: one from a newer Valkey (9.2 writes 81), or from a version
 // no server writes, is refused as Valkey refuses it. Payloads sealed with
-// Redis's versions are read as Redis's, whatever their type byte: type 22 is
-// Valkey's hash with field TTLs only in a Valkey payload (#449).
+// Redis's versions are read as Redis's: type 22 is Valkey's hash with field
+// TTLs in a Valkey payload, and under Redis's RDB 12 a Redis 7.4 pre-release
+// encoding, refused (#449). Under RDB 11 or older it is Dragonfly's, in
+// Valkey's encoding (#452).
 #[test]
 fn test_restore_reads_valkey_9_payloads_and_refuses_newer_ones() {
     let port = free_port();

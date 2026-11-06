@@ -148,6 +148,14 @@ other files:
 - A Redis RDB with search index definitions loads without them: run
   `FT.CREATE` again. One with other module data (time series, vector sets,
   Bloom) is refused.
+- Set and sorted-set members can't have their own TTLs. A Dragonfly file
+  with a `SADDEX` set, or a KeyDB file or stream with `EXPIREMEMBER` on a set
+  or sorted-set member, is refused, naming the key. Hash field TTLs from
+  either load. Dragonfly's Bloom, Cuckoo, count-min and top-k keys and its
+  compressed snapshot blocks are refused (save with `--compression_mode=0`).
+- KiviDB can't be a replica of a KeyDB primary in active replication
+  (`active-replica yes`): the link ends at its first `RREPLAY`, saying so.
+  Move that data by RDB file or with `MIGRATE`.
 
 **Server and introspection**
 - `MEMORY USAGE` is an estimate; `MEMORY MALLOC-STATS` is a stub.

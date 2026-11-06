@@ -109,6 +109,59 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   refuses such a full sync from a Redis master and keeps its dataset
   (#444).
 
+- **Fix `MEMORY USAGE` estimates for sets, hashes, and sorted sets.**
+  Estimates for sets, hashes, field-TTL hashes, and sorted sets now track
+  `used_memory` more accurately. After mass deletions, approximately 3–4%
+  of retained shard-table memory may remain unattributed to individual keys.
+  `SAMPLES 0` on large sorted sets is slower due to more complete accounting.
+  ([#311](https://github.com/kividbio/kividb/issues/311),
+  by [@Parikalp-Bhardwaj](https://github.com/Parikalp-Bhardwaj)).
+
+- **A negative Unix time no longer deletes hash fields.** `HEXPIREAT` and
+  `HPEXPIREAT` with a time below 0, and `HGETEX` and `HSETEX` with a
+  negative `EXAT` or `PXAT`, took it as a time that had passed and deleted
+  the fields. Redis keeps them and refuses the command with `ERR invalid
+  expire time, must be >= 0`, and so does KiviDB now. A time of 0 is still
+  taken, and the fields go, as in Redis (#486).
+
+  **Upgrade note:** 1.2.0 logged and sent such a command as it came. An
+  AOF it wrote, or the stream of a 1.2.0 master, is still applied as 1.2.0
+  applied it, so the fields it deleted stay deleted.
+
+- **A replica set to `replica-priority 0` is no longer promoted by
+  Sentinel.** `CONFIG SET replica-priority` and the config file took the
+  setting and `CONFIG GET` gave it back, but `INFO replication` always
+  reported `slave_priority:100`, which is what Sentinel reads to choose the
+  replica to promote, and it promoted one set to 0. `INFO` now reports the
+  priority set, from `CONFIG SET` under either of its names
+  (`replica-priority`, `slave-priority`), the config file or the new
+  `--replica-priority` flag, and `CONFIG REWRITE` keeps it.
+  `replica-announced` likewise now reaches `INFO replication` as
+  `replica_announced`, which Sentinel reads to leave a replica out of
+  `SENTINEL REPLICAS` (#443).
+
+- **A hash field's expiry is kept to the millisecond when KiviDB saves and
+  loads the hash.** After a restart from a snapshot or the AOF's preamble,
+  a full sync from a KiviDB master, or a `RESTORE` or `MIGRATE` between
+  KiviDB servers, `HPEXPIRETIME` of a field was often 1 ms off what it
+  had been set to, later or earlier. A field's deadline is converted
+  between the server's clock and Unix milliseconds when a hash is written
+  out and read back in, and each conversion cut the time now to a whole
+  millisecond first. It is now converted to the nanosecond both ways, and
+  a field set with `HPEXPIREAT t` reads back as `t`. (Redis and Valkey
+  files and `HSETEX ... PXAT` are the entry *Hash field TTLs read back to
+  the millisecond*, below; they now use the same conversion.) (#448)
+
+  A field's time to live is also checked as Redis checks it: a deadline
+  past 2^46 - 1 ms after the epoch (the year 4199), given to `HEXPIRE`,
+  `HPEXPIRE`, `HEXPIREAT`, `HPEXPIREAT`, `HGETEX` or `HSETEX` as a time to
+  live or a Unix time, is refused with `ERR invalid expire time in
+  '<command>' command`. KiviDB took any: `HEXPIRE h 18446744073709552
+  FIELDS 1 f` was saved as a moment from then, so the field was gone after
+  a restart, a full sync, `RESTORE` or `MIGRATE`, and `HEXPIRE h
+  9223372036854775807 FIELDS 1 f` panicked and closed the client's
+  connection, with no reply.
+
 - **A search index is seen only from its own database.** `FT._LIST`
   listed the indexes of every database, and the commands that name an
   index found one of another database: from database 1, `FT.SEARCH`
@@ -132,6 +185,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the alias. A 1.2.1 replica of a 1.2.0 master can so keep an index its
   master dropped that way; upgrade the master first, or drop the index
   from its own database.
+
+- **RDB files from Redis Stack 6.2 load.** Redis Stack 6.2 writes
+  RedisGraph's module data (`graphdata`) into every RDB file, with or
+  without graphs, and KiviDB refused the whole file, so a `dump.rdb` of
+  Redis Stack 6.2 could not be moved in at all. That module data is now
+  read past, as the search module's is. A graph itself, a key of module
+  type `graphdata`, is still refused, and so is the file that holds it.
 
 - **A snapshot holding the empty key can be loaded.** Redis allows the
   key `""`, and so does KiviDB, but in a KiviDB snapshot a key length of 0
@@ -210,6 +270,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   of an `aof:` preload, `dump.rdb` at startup and a full sync from a Redis,
   Valkey, KeyDB or Dragonfly master; a replica refuses such a full sync
   and keeps its dataset (#477).
+
+- **A KiviDB snapshot's databases past the server's are no longer dropped.**
+  A `dump.kdb` saved by a server with more databases than this one had the
+  databases past them dropped without a word, and the log's key count left
+  them out: in `dump.kdb` at startup, the AOF's preamble, a `--preload-file`
+  of a KiviDB snapshot or the base file of an `aof:` preload, and a full
+  sync from a KiviDB master. The replica's check that a full sync is whole
+  before it drops its old dataset counted the keys it was about to lose. As
+  for an RDB file, such a snapshot now loads into the server's databases
+  when there are enough, and is refused otherwise, naming the database and
+  the `databases` to start with, as is one with a search index in such a
+  database; a replica refuses such a full sync before it lets go of its
+  dataset, and keeps it. A snapshot of KiviDB 1.2.0 with the empty key
+  before its last database is still read again where 1.2.0 put it before
+  it is refused. A database number of 65536 or more is called more likely
+  a damaged file than given as advice, and `--databases 0` is refused on
+  the command line as it was in a config file (#482).
 
 - **A Lua script's `false` is a RESP3 null to a RESP3 client (#431).** A
   script's `false`, which is also what `redis.call` gives back for a nil
@@ -708,6 +785,41 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   members instead of O(N). An empty range costs O(log N)
   ([#408](https://github.com/kividbio/kividb/issues/408),
   by [@Parikalp-Bhardwaj](https://github.com/Parikalp-Bhardwaj)).
+- **Data from Dragonfly and KeyDB loads whole, or is refused by name.**
+  - Dragonfly's hashes with field TTLs (`HSETEX`, `FIELDEXPIRE`, RDB type
+    22, or 31 from older versions) refused the whole RDB file or `RESTORE`
+    with `unsupported RDB type 22`. They now load with their field TTLs, and
+    its JSON documents (type 30) load as JSON. A key Dragonfly kept from
+    eviction (`STICK`) loads as any other, with a warning.
+  - KeyDB's `EXPIREMEMBER` TTLs were dropped without a word, so fields and
+    members KeyDB was going to delete were kept for ever. A hash field's
+    TTL now loads as the field's TTL. KiviDB keeps no TTLs for set or
+    sorted-set members, so a set or sorted set with one now refuses the
+    file, naming the key, as does Dragonfly's `SADDEX`.
+  - `RESTORE` of a KeyDB `DUMP` payload answered `Bad data format`, because
+    of the version stamp (`mvcc-tstamp`) KeyDB puts after the value. It is
+    now read past.
+  - As a replica of a KeyDB primary in active replication, KiviDB took
+    `RREPLAY`, the wrapper around every write, for an unknown command: after
+    the full sync each write was refused while the link showed as up. The
+    link now ends at the first `RREPLAY`, saying that KeyDB active
+    replication is not supported: migrate from such a primary by its RDB
+    file or with `MIGRATE`. `EXPIREMEMBER` in the stream of a plain KeyDB
+    primary applies a hash field's TTL; on a set or sorted-set member it
+    ends the link too, and the full sync that follows refuses the dataset,
+    naming the key. Either way the reason is in the log and in `INFO
+    replication` (`replica_last_sync_refusal`), and the replica asks again
+    after a minute, then less often up to every ten minutes, since each try
+    is a full sync of the same data on the primary. A full sync that is cut
+    short or doesn't read is retried each second, as before.
+  - Dragonfly's probabilistic types (Bloom, Cuckoo, count-min, top-k), a key
+    with memcached flags, a KeyDB cron job, and Dragonfly's compressed blocks
+    are refused by name. For compressed blocks, the error says to save with
+    `--compression_mode=0`.
+
+  Checked against the dragonflydb/dragonfly v2.1 and eqalpha/keydb 6.3.4
+  images, key by key, by file and by `RESTORE`, and as a replica of a
+  plain KeyDB primary through a full sync and a stream of writes (#452).
 
 ## [1.2.0] - 2026-11-03
 

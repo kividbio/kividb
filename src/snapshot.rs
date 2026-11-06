@@ -17,6 +17,8 @@ use std::sync::Arc;
 
 mod rdb_dialect;
 pub use rdb_dialect::is_rdb_header;
+mod rdb_extensions;
+pub use rdb_extensions::is_unrepresentable;
 
 /// Returned by `load_snapshot` — key-value data plus any index schemas that
 /// were embedded in the snapshot file.
@@ -750,15 +752,9 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
             // We persist as Unix ms because Instant is monotonic and
             // can't survive a process restart — convert at write time.
             w.write_all(&(inner.expiries.len() as u32).to_le_bytes())?;
-            let now_sys = std::time::SystemTime::now();
-            let now_mono = std::time::Instant::now();
-            let unix_now_ms = now_sys
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
+            let clock = crate::commands::helpers::FieldClock::now();
             for (field, exp) in inner.expiries.iter() {
-                let delta_ms = exp.saturating_duration_since(now_mono).as_millis() as u64;
-                let abs_ms = unix_now_ms.saturating_add(delta_ms);
+                let abs_ms = clock.unix_ms_of(*exp);
                 write_bytes(w, field.as_bytes())?;
                 w.write_all(&abs_ms.to_le_bytes())?;
             }
@@ -1576,13 +1572,18 @@ pub fn load_snapshot(path: &str) -> io::Result<LoadedSnapshot> {
 /// server reads its images with [`load_snapshot`], [`load_snapshot_bytes`]
 /// and [`load_snapshot_with`].
 pub fn load_snapshot_from(r: impl Read) -> io::Result<LoadedSnapshot> {
-    read_image(r, true, &[], &mut Vec::new()).map(|(loaded, _)| loaded)
+    read_image(r, true, &[], &mut Vec::new(), server_databases()).map(|(loaded, _)| loaded)
+}
+
+/// The databases a snapshot may have keys in (see [`SNAPSHOT_DATABASES`]).
+fn server_databases() -> usize {
+    SNAPSHOT_DATABASES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// [`load_snapshot_from`] for an image in memory, read again as
 /// [`read_retrying`] says if it has to be.
 pub fn load_snapshot_bytes(image: &[u8]) -> io::Result<LoadedSnapshot> {
-    read_retrying(|| Ok(image), true).map(|(loaded, _, _)| loaded)
+    read_retrying(|| Ok(image), true, server_databases()).map(|(loaded, _, _)| loaded)
 }
 
 /// Load the image that `open` opens, opening it again as [`read_retrying`]
@@ -1590,7 +1591,7 @@ pub fn load_snapshot_bytes(image: &[u8]) -> io::Result<LoadedSnapshot> {
 pub fn load_snapshot_with<R: Read>(
     open: impl FnMut() -> io::Result<R>,
 ) -> io::Result<(LoadedSnapshot, R)> {
-    read_retrying(open, true).map(|(loaded, _, reader)| (loaded, reader))
+    read_retrying(open, true, server_databases()).map(|(loaded, _, reader)| (loaded, reader))
 }
 
 /// Read a KDB image from beginning to end without keeping any of it, and
@@ -1603,7 +1604,7 @@ pub fn load_snapshot_with<R: Read>(
 ///
 /// Every database has to end where the writer ends it, as in loading.
 pub fn verify_snapshot(image: &[u8]) -> io::Result<usize> {
-    read_retrying(|| Ok(image), false).map(|(_, keys, _)| keys)
+    read_retrying(|| Ok(image), false, server_databases()).map(|(_, keys, _)| keys)
 }
 
 /// Readings [`read_retrying`] makes of one image at most.
@@ -1629,6 +1630,7 @@ const READINGS: usize = 32;
 fn read_retrying<R: Read>(
     mut open: impl FnMut() -> io::Result<R>,
     keep: bool,
+    databases: usize,
 ) -> io::Result<(LoadedSnapshot, usize, R)> {
     let mut first_error: Option<io::Error> = None;
     // Readings still to make, latest pushed first: each a reading that
@@ -1646,7 +1648,7 @@ fn read_retrying<R: Read>(
             Err(e) => return Err(first_error.unwrap_or(e)),
         };
         let mut ends = Vec::new();
-        match read_image(&mut reader, keep, &plan, &mut ends) {
+        match read_image(&mut reader, keep, &plan, &mut ends, databases) {
             Ok((loaded, keys)) => {
                 if !plan.is_empty() {
                     log_warn!(
@@ -1656,6 +1658,9 @@ fn read_retrying<R: Read>(
                 }
                 return Ok((loaded, keys, reader));
             }
+            // Read whole, and refused for its databases (#482): this
+            // reading's error, whichever reading it is.
+            Err(e) if is_past_databases(&e) => return Err(e),
             Err(e) => {
                 let layout = matches!(
                     e.kind(),
@@ -1734,6 +1739,7 @@ fn read_image(
     keep: bool,
     legacy: &[usize],
     ends: &mut Vec<usize>,
+    databases: usize,
 ) -> io::Result<(LoadedSnapshot, usize)> {
     let mut r = r;
     let mut keys_read = 0usize;
@@ -1752,6 +1758,12 @@ fn read_image(
     // a section), read to see whether it is a tag.
     let mut next_byte = None;
     let mut strict = !legacy.is_empty();
+    // The refusal of a key or index in a database past `databases` (#482).
+    // Given once the image has been read through, sections and all: a
+    // reading of a 1.2.0 image that took the empty key in the wrong place
+    // can come upon a key in such a database before it fails on what it
+    // misread, and has to fail on that, so that the right reading is tried.
+    let mut past: Option<String> = None;
 
     for db in 0..db_count {
         let mut map: HashMap<String, KiviDBValue> = HashMap::new();
@@ -2073,12 +2085,7 @@ fn read_image(
                     r.read_exact(&mut exp_count_buf)?;
                     let exp_count = u32::from_le_bytes(exp_count_buf) as usize;
                     let mut exps = AHashMap::with_capacity(hint(exp_count));
-                    let now_sys = std::time::SystemTime::now();
-                    let now_mono = std::time::Instant::now();
-                    let unix_now_ms = now_sys
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
+                    let clock = crate::commands::helpers::FieldClock::now();
                     for _ in 0..exp_count {
                         let field_bytes = read_bytes(&mut r)?;
                         let field = String::from_utf8(field_bytes).map_err(|_| {
@@ -2087,9 +2094,8 @@ fn read_image(
                         let mut ms_buf = [0u8; 8];
                         r.read_exact(&mut ms_buf)?;
                         let abs_ms = u64::from_le_bytes(ms_buf);
-                        if abs_ms > unix_now_ms {
-                            let delta = std::time::Duration::from_millis(abs_ms - unix_now_ms);
-                            exps.insert(field, now_mono + delta);
+                        if let Some(at) = clock.instant_of(abs_ms) {
+                            exps.insert(field, at);
                         } else {
                             crate::types::hash_remove(&mut hmap, &field);
                         }
@@ -2129,12 +2135,18 @@ fn read_image(
                 }
             };
 
+            // A key in a database past the server's (#482): not kept, and
+            // the image refused once it is read.
+            let past_databases = db >= databases;
+            if past_databases && past.is_none() {
+                past = database_of_snapshot(db as u64, databases, "keys").err();
+            }
             keys_read += 1;
             let has_value = match &value {
                 KiviDBValue::HashEx(hash) => !hash.read().is_empty(),
                 _ => true,
             };
-            if keep && has_value {
+            if keep && has_value && !past_databases {
                 map.insert(key, value);
             }
         }
@@ -2266,6 +2278,26 @@ fn read_image(
         });
     }
 
+    // An index of a database past the server's: refused as its keys are
+    // (`backfill_from_db` and the search commands take its database as one
+    // the store has).
+    if past.is_none()
+        && let Some(schema) = index_schemas.iter().find(|s| s.db_index >= databases)
+    {
+        past = database_of_snapshot(
+            schema.db_index as u64,
+            databases,
+            &format!("the index {}", schema.name),
+        )
+        .err();
+    }
+    if let Some(why) = past {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            PastDatabases(why),
+        ));
+    }
+
     Ok((
         LoadedSnapshot {
             dbs: result,
@@ -2306,7 +2338,18 @@ pub fn restore_expiries_into_store(expiries: ExpiryMaps, store: &store::Store) -
     let mut total = 0usize;
     for (db_idx, map) in expiries.into_iter().enumerate() {
         let Some(db) = store.get(db_idx) else {
-            break;
+            // A snapshot with keys past the store's databases is refused as
+            // it is read (see `SNAPSHOT_DATABASES`); this says so if one
+            // was not.
+            if !map.is_empty() {
+                log_error!(
+                    "snapshot: the times to live of {} keys in database {db_idx} are dropped: \
+                     the store has {} databases",
+                    map.len(),
+                    store.len()
+                );
+            }
+            continue;
         };
         for (key, at_ms) in map {
             if write_lock!(store::get_shard(db, &key)).set_expires(&key, at_ms) {
@@ -2750,11 +2793,53 @@ fn too_long() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "RDB string length out of range")
 }
 
-/// How many databases an RDB file may have keys in: the server's
-/// `databases`, set as it starts. A file with keys in a database past them
-/// is refused, naming it. It used to be loaded into database 0, merged with
-/// that database's keys and overwriting those of the same name (#477).
-pub static RDB_DATABASES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(16);
+/// How many databases a snapshot may have keys in, an RDB file or a KiviDB
+/// image: the server's `databases`, set as it starts. A snapshot with keys
+/// in a database past them is refused, naming it. An RDB file's were loaded
+/// into database 0, merged with that database's keys and overwriting those
+/// of the same name (#477); a KiviDB image's were dropped (#482).
+pub static SNAPSHOT_DATABASES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(16);
+
+/// The largest number of databases the refusal of a snapshot advises
+/// starting with. A database number past it is more likely a damaged file
+/// than a server to configure.
+const DATABASES_ADVISED_MAX: u64 = 1 << 16;
+
+/// `db`, if it is one of the server's databases (see
+/// [`SNAPSHOT_DATABASES`]); otherwise what the refusal of the snapshot says.
+fn database_of_snapshot(db: u64, databases: usize, what: &str) -> Result<usize, String> {
+    match usize::try_from(db) {
+        Ok(index) if index < databases => Ok(index),
+        _ if db < DATABASES_ADVISED_MAX => Err(format!(
+            "the file has {what} in database {db}, and this server has {databases} databases: \
+             start it with databases {} or more",
+            db + 1
+        )),
+        _ => Err(format!(
+            "the file has {what} in database {db}, a number more likely of a damaged file \
+             than of a server's databases (this server has {databases})"
+        )),
+    }
+}
+
+/// The refusal of a KiviDB image with keys or an index in a database past
+/// the server's. Given only for a reading that read the image whole: that
+/// reading is the right one, and no other is tried.
+#[derive(Debug)]
+struct PastDatabases(String);
+
+impl std::fmt::Display for PastDatabases {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PastDatabases {}
+
+fn is_past_databases(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<PastDatabases>())
+}
 
 // Unused by the binary, which wants the expiries; see `write_snapshot`.
 #[allow(dead_code)]
@@ -2797,8 +2882,10 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
     let dialect = rdb_dialect::from_header(&header)?;
     // The RDB version, for the checksum that ends a file from version 5 on.
     // A Redis one that is not a number is refused, not read as 0 (#444).
-    let version: u32 = match dialect {
-        rdb_dialect::Dialect::Valkey => u32::from(rdb_dialect::VALKEY_RDB_VERSION),
+    // Dragonfly and KeyDB write RDB 9, with types and opcodes past Redis
+    // 6.2's (see `rdb_extensions`).
+    let version: u16 = match dialect {
+        rdb_dialect::Dialect::Valkey => rdb_dialect::VALKEY_RDB_VERSION,
         rdb_dialect::Dialect::Redis => std::str::from_utf8(&header[5..])
             .ok()
             .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))
@@ -2818,6 +2905,12 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
     let mut warned_search = false;
     // Each function library's code, in the order the file has them.
     let mut libraries = Vec::new();
+    // The key read last, while it is there: KeyDB writes the TTLs it gave
+    // the key's members after it.
+    let mut last_key: Option<(usize, String)> = None;
+    let mut keydb_member: Option<Vec<u8>> = None;
+    // Keys Dragonfly kept from eviction (`STICK`), which load as any other.
+    let mut sticky = 0usize;
 
     loop {
         let mut type_byte = [0u8];
@@ -2825,38 +2918,52 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
 
         match type_byte[0] {
             0xFA => {
-                // Aux field — key/value metadata, just skip both strings
-                let key = rdb_read_string(&mut r)?;
-                let _val = rdb_read_string(&mut r)?;
+                // Aux field: metadata, skipped, but for two kinds.
+                //
                 // Dragonfly's own format (`.dfs`) has a file for each shard
                 // and one, the summary, with none of the keys. Each is an RDB
                 // file. From Dragonfly 1.32 on, each has one of these fields,
                 // and its RDB files (`SAVE RDB`) have neither. Earlier ones
                 // write neither anywhere: see `preload` in src/aof.rs.
-                if key == b"shard-id" || key == b"shard-count" {
-                    return Err(rdb_invalid(
-                        "this is one file of a Dragonfly snapshot in Dragonfly's own format \
-                         (.dfs), which keeps each shard's keys in a file of its own; save one \
-                         in RDB format (Dragonfly's SAVE RDB) and load that",
-                    ));
+                //
+                // KeyDB's member TTLs (`EXPIREMEMBER`) follow their key.
+                let aux_key = rdb_read_string(&mut r)?;
+                let aux_val = rdb_read_string(&mut r)?;
+                match aux_key.as_slice() {
+                    b"shard-id" | b"shard-count" => {
+                        return Err(rdb_invalid(
+                            "this is one file of a Dragonfly snapshot in Dragonfly's own format \
+                             (.dfs), which keeps each shard's keys in a file of its own; save one \
+                             in RDB format (Dragonfly's SAVE RDB) and load that",
+                        ));
+                    }
+                    b"keydb-subexpire-key" => keydb_member = Some(aux_val),
+                    b"keydb-subexpire-when" => {
+                        let member = keydb_member
+                            .take()
+                            .ok_or_else(|| rdb_invalid("a KeyDB member TTL without its member"))?;
+                        // A key dropped as past its time takes its members'
+                        // TTLs with it.
+                        if let Some((db, key)) = last_key.clone()
+                            && let Some(value) = result[db].get_mut(&key)
+                            && rdb_extensions::apply_keydb_subexpiry(
+                                value, &key, &member, &aux_val,
+                            )? == rdb_extensions::SubExpiry::Emptied
+                        {
+                            result[db].remove(&key);
+                            expiries[db].remove(&key);
+                            last_key = None;
+                        }
+                    }
+                    _ => {}
                 }
             }
             0xFE => {
                 // Database selector
                 let (db_num, _) = rdb_read_length(&mut r)?;
-                let databases = RDB_DATABASES.load(std::sync::atomic::Ordering::Relaxed);
-                current_db = usize::try_from(db_num)
-                    .ok()
-                    .filter(|&db| db < databases)
-                    .ok_or_else(|| {
-                        rdb_invalid(format!(
-                            "the file has keys in database {db_num}, and this server has \
-                             {databases} databases (0 to {}): start it with databases {} or \
-                             more",
-                            databases - 1,
-                            db_num.saturating_add(1)
-                        ))
-                    })?;
+                let databases = SNAPSHOT_DATABASES.load(std::sync::atomic::Ordering::Relaxed);
+                current_db =
+                    database_of_snapshot(db_num, databases, "keys").map_err(rdb_invalid)?;
                 if current_db >= result.len() {
                     result.resize_with(current_db + 1, HashMap::new);
                     expiries.resize_with(current_db + 1, HashMap::new);
@@ -2926,6 +3033,15 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
             0xF3 if dialect == rdb_dialect::Dialect::Valkey => {
                 return Err(rdb_dialect::refuse_slot_import(&mut r));
             }
+            // Dragonfly's RDB_OPCODE_DF_MASK: the next key's flags.
+            0xDC if version <= 11 => {
+                if rdb_extensions::read_dragonfly_mask(&mut r)? {
+                    sticky += 1;
+                }
+            }
+            opcode if rdb_extensions::is_dragonfly_opcode(version, opcode) => {
+                return Err(rdb_extensions::refuse_dragonfly_opcode(opcode));
+            }
             // A function library (`FUNCTION2`): its code.
             0xF5 => libraries.push(rdb_read_string(&mut r)?),
             // Every other opcode from 0xF0 up is refused by what it is, not
@@ -2945,20 +3061,30 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
                 let key_bytes = rdb_read_string(&mut r)?;
                 let key = String::from_utf8_lossy(&key_bytes).into_owned();
                 let expiry_ms = pending_expiry.take();
-                if let Some(val) = rdb_dialect::read_value(&mut r, type_id, dialect)? {
+                let value = if rdb_extensions::is_dragonfly_type(version, type_id) {
+                    rdb_extensions::read_dragonfly_value(&mut r, Some(&key), type_id)?
+                } else if type_id == 64 && version <= 11 {
+                    return Err(rdb_extensions::refuse_keydb_cron(&key));
+                } else {
+                    rdb_dialect::read_value(&mut r, type_id, dialect)?
+                };
+                last_key = None;
+                if let Some(val) = value {
                     match expiry_ms {
                         // Already past its expiry: dropped. Not by a replica,
                         // or under an AOF (see `load_snapshot_from`).
                         Some(ms) if ms <= now_ms && !crate::expiry::held() => {}
                         Some(ms) => {
                             expiries[current_db].insert(key.clone(), ms);
-                            result[current_db].insert(key, val);
+                            result[current_db].insert(key.clone(), val);
+                            last_key = Some((current_db, key));
                         }
                         None => {
                             // A plain entry replaces any earlier one for this
                             // key, including that entry's expiry.
                             expiries[current_db].remove(&key);
-                            result[current_db].insert(key, val);
+                            result[current_db].insert(key.clone(), val);
+                            last_key = Some((current_db, key));
                         }
                     }
                 }
@@ -2966,6 +3092,12 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
         }
     }
 
+    if sticky > 0 {
+        log_warn!(
+            "RDB: {sticky} keys were sticky in Dragonfly (STICK, never evicted): KiviDB has no \
+             such flag, and they load as any other key"
+        );
+    }
     Ok((result, expiries, redis_function_dump(&libraries)))
 }
 
@@ -3664,11 +3796,12 @@ fn rdb_read_hash_with_ttls(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBV
         }
     }
 
+    let clock = crate::commands::helpers::FieldClock::now();
     let mut inner = crate::types::HashInner::new();
     for (field, value, expires_at) in fields {
         let field = String::from_utf8_lossy(&field).into_owned();
         if expires_at != 0 {
-            let Some(deadline) = rdb_dialect::field_deadline(expires_at)? else {
+            let Some(deadline) = rdb_dialect::field_deadline(&clock, expires_at)? else {
                 continue;
             };
             inner.expiries.insert(field.clone(), deadline);
@@ -3744,7 +3877,11 @@ fn rdb_read_module_strings(r: &mut impl Read) -> io::Result<Vec<Vec<u8>>> {
 /// module it has not loaded.
 fn rdb_skip_module_aux(r: &mut impl Read, warned: &mut bool) -> io::Result<()> {
     let (name, _) = module_type_name(rdb_read_plain_length(r)?);
-    if name != "ft_index0" && name != "scdtype00" {
+    // RedisGraph's (`graphdata`), which Redis Stack 6.2 writes into every
+    // RDB file, graphs or none, is read past too: a graph itself is a key of
+    // module type `graphdata`, and that is refused.
+    let graph = name == "graphdata";
+    if name != "ft_index0" && name != "scdtype00" && !graph {
         return Err(rdb_invalid(format!(
             "data of module type {name} (opcode 0xF7) is not supported"
         )));
@@ -3756,7 +3893,7 @@ fn rdb_skip_module_aux(r: &mut impl Read, warned: &mut bool) -> io::Result<()> {
     rdb_read_plain_length(r)?;
     // Redis Stack writes it with nothing in it: a count of 0 and no names.
     let names = rdb_read_module_strings(r)?;
-    if !names.is_empty() && !*warned {
+    if !graph && !names.is_empty() && !*warned {
         log_warn!(
             "RDB: the search module's index definitions and dictionaries are not loaded; \
              run FT.CREATE and FT.DICTADD again to make them"
@@ -4297,7 +4434,18 @@ pub fn restore_into_store(dbs: Vec<HashMap<String, KiviDBValue>>, store: &store:
     let mut total = 0usize;
     for (db_idx, map) in dbs.into_iter().enumerate() {
         if db_idx >= store.len() {
-            break;
+            // A snapshot with keys past the store's databases is refused as
+            // it is read (see `SNAPSHOT_DATABASES`); this says so if one
+            // was not. It used to drop them without a word (#482).
+            if !map.is_empty() {
+                log_error!(
+                    "snapshot: {} keys in database {db_idx} are dropped: the store has {} \
+                     databases",
+                    map.len(),
+                    store.len()
+                );
+            }
+            continue;
         }
         let db = &store[db_idx];
         total += map.len();
@@ -4737,7 +4885,7 @@ pub fn restore_payload_checked(payload: &[u8]) -> Result<KiviDBValue, RestoreErr
     if let Some(dialect) = rdb_dialect::of_dump_version(version)
         && sealed
     {
-        return restore_redis_payload(data, dialect).ok_or(RestoreError::BadData);
+        return restore_redis_payload(data, dialect, version).ok_or(RestoreError::BadData);
     }
     Err(RestoreError::VersionOrChecksum)
 }
@@ -4766,9 +4914,22 @@ pub fn redis_crc64(data: &[u8]) -> u64 {
 /// A value as Redis's or Valkey's `DUMP` serialises it: its RDB type, then
 /// the value in the RDB encoding of that type, which the `dump.rdb` loader
 /// reads. Every byte must belong to the value.
-fn restore_redis_payload(data: &[u8], dialect: rdb_dialect::Dialect) -> Option<KiviDBValue> {
+///
+/// Dragonfly's payloads may hold its own types (`rdb_extensions`), and
+/// KeyDB's end with an `mvcc-tstamp` aux field after the value, which is
+/// read past: it is KeyDB's version of the value for its active replication.
+fn restore_redis_payload(
+    data: &[u8],
+    dialect: rdb_dialect::Dialect,
+    version: u16,
+) -> Option<KiviDBValue> {
     let (&type_id, mut rest) = data.split_first()?;
-    let value = rdb_dialect::read_value(&mut rest, type_id, dialect).ok()??;
+    let value = if rdb_extensions::is_dragonfly_type(version, type_id) {
+        rdb_extensions::read_dragonfly_value(&mut rest, None, type_id).ok()??
+    } else {
+        rdb_dialect::read_value(&mut rest, type_id, dialect).ok()??
+    };
+    let rest = rdb_extensions::strip_keydb_mvcc(rest)?;
     rest.is_empty().then_some(value)
 }
 
@@ -4901,15 +5062,9 @@ pub fn serialize_value(value: &KiviDBValue, out: &mut Vec<u8>) -> std::io::Resul
                 write_bytes_vec(out, val)?;
             }
             out.write_all(&(inner.expiries.len() as u32).to_le_bytes())?;
-            let now_sys = std::time::SystemTime::now();
-            let now_mono = std::time::Instant::now();
-            let unix_now_ms = now_sys
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
+            let clock = crate::commands::helpers::FieldClock::now();
             for (field, exp) in inner.expiries.iter() {
-                let delta_ms = exp.saturating_duration_since(now_mono).as_millis() as u64;
-                let abs_ms = unix_now_ms.saturating_add(delta_ms);
+                let abs_ms = clock.unix_ms_of(*exp);
                 write_bytes_vec(out, field.as_bytes())?;
                 out.write_all(&abs_ms.to_le_bytes())?;
             }
@@ -5056,12 +5211,7 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
             let exp_count = u32::from_le_bytes(payload[pos..pos + 4].try_into().ok()?) as usize;
             pos += 4;
             let mut exps = AHashMap::new();
-            let now_sys = std::time::SystemTime::now();
-            let now_mono = std::time::Instant::now();
-            let unix_now_ms = now_sys
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
+            let clock = crate::commands::helpers::FieldClock::now();
             for _ in 0..exp_count {
                 let (field_bytes, next) = read_bytes_slice(payload, pos)?;
                 let field = String::from_utf8(field_bytes.to_vec()).ok()?;
@@ -5070,9 +5220,8 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
                 }
                 let abs_ms = u64::from_le_bytes(payload[next..next + 8].try_into().ok()?);
                 pos = next + 8;
-                if abs_ms > unix_now_ms {
-                    let delta = std::time::Duration::from_millis(abs_ms - unix_now_ms);
-                    exps.insert(field, now_mono + delta);
+                if let Some(at) = clock.instant_of(abs_ms) {
+                    exps.insert(field, at);
                 } else {
                     // Its time is up: gone, as a snapshot's load drops it.
                     // Kept, it lost its expiry and lived on for good (a
@@ -5308,6 +5457,137 @@ mod dump_payload_tests {
         );
         assert!(restore_payload(b"short").is_none());
         assert!(restore_payload(&[]).is_none());
+    }
+}
+
+/// A hash field's deadline of whole Unix milliseconds is the same
+/// millisecond after every way a hash is written and read back: a KDB image
+/// (a save, a full sync, the AOF's preamble), a `DUMP` payload (`RESTORE`,
+/// `MIGRATE`) and a Redis RDB file. The time now used to be cut to a whole
+/// millisecond before each conversion, and a field often read back 1 ms
+/// off what it was set to (#448).
+#[cfg(test)]
+mod field_deadline_tests {
+    use super::*;
+    use crate::commands::helpers::FieldClock;
+
+    /// `n` deadlines of whole milliseconds an hour or so from now, each at a
+    /// different point of the millisecond now is in.
+    fn deadlines(n: u64) -> Vec<u64> {
+        let base = unix_ms_now() + 3_600_000;
+        (0..n).map(|i| base + i * 7 + i % 3).collect()
+    }
+
+    fn hash_with(deadlines: &[u64]) -> KiviDBValue {
+        let clock = FieldClock::now();
+        let mut inner = crate::types::HashInner::new();
+        for (i, at) in deadlines.iter().enumerate() {
+            let field = format!("f{i}");
+            inner.fields.insert(field.clone(), Arc::from(&b"v"[..]));
+            inner
+                .expiries
+                .insert(field, clock.instant_of(*at).expect("in the future"));
+        }
+        KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(inner)))
+    }
+
+    /// The deadlines of `value`'s fields, as `HPEXPIRETIME` gives them.
+    fn read_back(value: &KiviDBValue, n: usize) -> Vec<u64> {
+        let KiviDBValue::HashEx(hash) = value else {
+            panic!("not a hash with field TTLs");
+        };
+        let hash = hash.read();
+        let clock = FieldClock::now();
+        (0..n)
+            .map(|i| clock.unix_ms_of(hash.expiries[&format!("f{i}")]))
+            .collect()
+    }
+
+    #[test]
+    fn the_clock_converts_a_whole_millisecond_both_ways_exactly() {
+        for _ in 0..2_000 {
+            let at = unix_ms_now() + 60_000;
+            let instant = FieldClock::now().instant_of(at).unwrap();
+            // Another reading of the clocks, as a later command makes.
+            std::hint::black_box(std::time::Instant::now());
+            assert_eq!(FieldClock::now().unix_ms_of(instant), at);
+        }
+        let clock = FieldClock::now();
+        assert!(clock.instant_of(unix_ms_now().saturating_sub(1)).is_none());
+        assert!(clock.instant_of(0).is_none());
+    }
+
+    /// A deadline further out than 64 bits of milliseconds is written as
+    /// the furthest there is, not cut to 64 bits: cut, it was a moment from
+    /// now, and the field was gone once loaded.
+    #[test]
+    fn a_deadline_past_64_bits_of_milliseconds_saturates() {
+        let clock = FieldClock::now();
+        if let Some(far) = std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(20_000_000_000_000_000))
+        {
+            assert_eq!(clock.unix_ms_of(far), u64::MAX);
+        }
+        assert!(clock.instant_of(u64::MAX).is_some());
+        let max = crate::commands::helpers::MAX_FIELD_DEADLINE_MS;
+        use crate::commands::helpers::field_deadline_ms;
+        assert_eq!(field_deadline_ms(max, false, 0), Some(max));
+        assert_eq!(field_deadline_ms(max + 1, false, 0), None);
+        assert_eq!(
+            field_deadline_ms(max / 1000, true, 0),
+            Some(max / 1000 * 1000)
+        );
+        assert_eq!(field_deadline_ms(max / 1000 + 1, true, 0), None);
+        assert_eq!(field_deadline_ms(i64::MAX, true, 0), None);
+        assert_eq!(field_deadline_ms(1000, false, max - 1000), Some(max));
+        assert_eq!(field_deadline_ms(1001, false, max - 1000), None);
+    }
+
+    #[test]
+    fn a_dump_payload_keeps_each_deadline_to_the_millisecond() {
+        for _ in 0..200 {
+            let want = deadlines(16);
+            let payload = dump_payload(&hash_with(&want)).unwrap();
+            let back = restore_payload(&payload).expect("payload restores");
+            assert_eq!(read_back(&back, want.len()), want);
+        }
+    }
+
+    #[test]
+    fn a_kdb_image_keeps_each_deadline_to_the_millisecond() {
+        for _ in 0..200 {
+            let want = deadlines(16);
+            let mut out = Vec::new();
+            write_kdb_header(&mut out, 1).unwrap();
+            write_kdb_entry(&mut out, "h", hash_with(&want).view()).unwrap();
+            write_kdb_db_end(&mut out).unwrap();
+            write_kdb_expiry_maps(&mut out, &[HashMap::new()]).unwrap();
+            let loaded = load_snapshot_from(&out[..]).unwrap();
+            assert_eq!(read_back(&loaded.dbs[0]["h"], want.len()), want);
+        }
+    }
+
+    /// Type 24, a hash table: the soonest deadline, then for each field its
+    /// deadline less the soonest one, plus 1, its name and its value.
+    #[test]
+    fn a_redis_rdb_hash_keeps_each_deadline_to_the_millisecond() {
+        for _ in 0..200 {
+            let want = deadlines(16);
+            let soonest = want[0];
+            let mut rdb = Vec::new();
+            rdb.extend_from_slice(&(soonest as i64).to_le_bytes());
+            rdb_write_length(&mut rdb, want.len());
+            for (i, at) in want.iter().enumerate() {
+                rdb_write_length(&mut rdb, (at - soonest + 1) as usize);
+                let field = format!("f{i}");
+                rdb_write_length(&mut rdb, field.len());
+                rdb.extend_from_slice(field.as_bytes());
+                rdb_write_length(&mut rdb, 1);
+                rdb.push(b'v');
+            }
+            let back = rdb_read_hash_with_ttls(&mut &rdb[..], 24).unwrap();
+            assert_eq!(read_back(&back, want.len()), want);
+        }
     }
 }
 
@@ -6379,6 +6659,103 @@ mod empty_key_tests {
         let loaded = load_snapshot(path.to_str().unwrap()).unwrap();
         assert_eq!(get_string(&loaded.dbs[0], ""), b"e0");
         assert_eq!(get_string(&loaded.dbs[2], ""), b"e2");
+    }
+
+    /// A 1.2.0 image, read with `databases 1`: the empty key in database 0,
+    /// before the last, and database 1 empty. The first reading takes the
+    /// empty key's 0 for database 0's end, and what follows realigns as a
+    /// key in database 1 (`"\0"`, from the empty string's length and the
+    /// next key's length and byte) before it fails. That key used to refuse
+    /// the image at once, and the right reading was never tried (#482).
+    #[test]
+    fn a_wrong_reading_of_a_1_2_0_image_past_the_databases_is_not_the_refusal() {
+        let old = image_1_2_0(&[vec![("", string("")), ("\0", string("v"))], vec![]], &[]);
+        // The first reading alone: past database 0, then a failure on what
+        // it misread, not the refusal.
+        let first = read_image(old.as_slice(), true, &[], &mut Vec::new(), 1)
+            .err()
+            .expect("the first reading loaded");
+        assert!(!is_past_databases(&first), "{first}");
+        let (loaded, _, _) = read_retrying(|| Ok(old.as_slice()), true, 1).unwrap();
+        assert_eq!(get_string(&loaded.dbs[0], ""), b"");
+        assert_eq!(get_string(&loaded.dbs[0], "\0"), b"v");
+        assert!(loaded.dbs[1].is_empty());
+    }
+
+    /// A 1.2.0 image whose right reading is the second, with a key in a
+    /// database past the server's: refused for that, not with the first
+    /// reading's error.
+    #[test]
+    fn a_later_reading_refused_for_its_databases_says_so() {
+        let old = image_1_2_0(
+            &[
+                vec![("x", string("1")), ("", string("e0"))],
+                vec![("k", string("v"))],
+            ],
+            &[],
+        );
+        assert!(read_retrying(|| Ok(old.as_slice()), true, 2).is_ok());
+        let err = read_retrying(|| Ok(old.as_slice()), true, 1)
+            .err()
+            .expect("loaded into one database");
+        assert!(is_past_databases(&err), "{err}");
+        assert!(err.to_string().contains("keys in database 1"), "{err}");
+        let err = read_retrying(|| Ok(old.as_slice()), false, 1)
+            .err()
+            .expect("verified for one database");
+        assert!(is_past_databases(&err), "{err}");
+    }
+
+    /// An image of 32 databases with keys in database 0 alone loads into 16,
+    /// as every `dump.kdb` of a server with `databases 32` does; one with a
+    /// key in database 20, or an index there, is refused, naming it.
+    #[test]
+    fn only_keys_or_an_index_past_the_databases_refuse_an_image() {
+        let mut dbs: Vec<HashMap<String, KiviDBValue>> = (0..32).map(|_| HashMap::new()).collect();
+        dbs[0].insert("a".into(), string("1"));
+        let mut out = Vec::new();
+        write_kdb_image(&mut out, &dbs, None).unwrap();
+        let (loaded, keys, _) = read_retrying(|| Ok(out.as_slice()), true, 16).unwrap();
+        assert_eq!((keys, get_string(&loaded.dbs[0], "a")), (1, b"1".to_vec()));
+
+        dbs[20].insert("b".into(), string("2"));
+        let mut out = Vec::new();
+        write_kdb_image(&mut out, &dbs, None).unwrap();
+        let err = read_retrying(|| Ok(out.as_slice()), true, 16)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("keys in database 20"), "{err}");
+        assert!(err.to_string().contains("databases 21"), "{err}");
+        assert!(read_retrying(|| Ok(out.as_slice()), true, 21).is_ok());
+
+        dbs[20].clear();
+        let schema = crate::vector::IndexSchema {
+            name: "idx20".into(),
+            db_index: 20,
+            on: crate::vector::IndexOn::Hash,
+            prefixes: vec!["p:".into()],
+            fields: Vec::new(),
+            aliases: Vec::new(),
+            stopwords: None,
+            synonyms: Default::default(),
+            language: Default::default(),
+            default_score: 1.0,
+            score_field: None,
+        };
+        let store = crate::vector::new_index_store();
+        store.write().insert("idx20".into(), schema.into_def());
+        let mut out = Vec::new();
+        write_kdb_image(&mut out, &dbs, Some(&store)).unwrap();
+        let err = read_retrying(|| Ok(out.as_slice()), true, 16)
+            .err()
+            .unwrap();
+        assert!(is_past_databases(&err), "{err}");
+        assert!(
+            err.to_string().contains("the index idx20 in database 20"),
+            "{err}"
+        );
+        let (loaded, _, _) = read_retrying(|| Ok(out.as_slice()), true, 32).unwrap();
+        assert_eq!(loaded.index_schemas[0].db_index, 20);
     }
 
     /// `image` opened by `load_snapshot_with`, counting the openings.

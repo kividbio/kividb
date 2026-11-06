@@ -1427,3 +1427,252 @@ fn debug_object_shows_the_idle_time_and_is_not_a_use() {
     assert!((1000..=1010).contains(&idle), "{line}");
     assert!(c.cmd(&["OBJECT", "IDLETIME", "foo"]).i() >= 1000);
 }
+
+// ── Sets and hashes against the limit ─────────────────────────────────────────
+
+/// `count` members (or fields) from `from`, for one `SADD` or `HSET`.
+fn members(from: usize, count: usize) -> Vec<String> {
+    (from..from + count)
+        .map(|i| format!("member:{i:08}"))
+        .collect()
+}
+
+/// `cmd key args...`, the arguments owned.
+fn cmd_with(c: &mut Conn, head: &[&str], args: &[String]) -> V {
+    let mut all: Vec<&str> = head.to_vec();
+    all.extend(args.iter().map(String::as_str));
+    c.cmd(&all)
+}
+
+/// Grows the collection at `key` with `add(c, from)` (100 members a time)
+/// until a write is refused, and checks that what it reports in `MEMORY
+/// USAGE` is what it took of the limit's room: the limit is on what the
+/// process allocates, so the key that filled the room should say it did.
+/// Then deleting it makes room again. Hands back how many members got in.
+fn grow_until_refused(
+    c: &mut Conn,
+    key: &str,
+    mut add: impl FnMut(&mut Conn, usize) -> V,
+) -> usize {
+    let before = c.used_memory();
+    let room = 2 * MB;
+    let limit = c.limit_to(room);
+    let mut added = 0;
+    let refused = loop {
+        let reply = add(c, added);
+        if reply.is_err() {
+            break reply;
+        }
+        added += 100;
+        assert!(added < 1_000_000, "{added} members under a 2 MB limit");
+    };
+    assert!(
+        refused.s().starts_with("OOM command not allowed"),
+        "{refused:?}"
+    );
+    assert_eq!(c.evicted(), 0);
+
+    // What the key took, measured, and what it reports.
+    let took = c.used_memory() - before;
+    let usage = c.cmd(&["MEMORY", "USAGE", key, "SAMPLES", "0"]).i();
+    assert!(
+        (took * 9 / 10..=took * 11 / 10).contains(&usage),
+        "{key}: MEMORY USAGE {usage}, but it took {took} of a {room}-byte room ({added} members)"
+    );
+    // The last write was refused at the limit, not long before it.
+    assert!(
+        took > room * 3 / 4 && took <= room + room / 4,
+        "took {took} of {room}"
+    );
+
+    // Reads are unaffected; deleting the key makes room.
+    assert!(c.cmd(&["EXISTS", key]).i() == 1);
+    assert_eq!(c.cmd(&["DEL", key]).i(), 1);
+    assert!(c.used_memory() < limit);
+    assert!(add(c, 0).i() > 0, "a write after the delete was refused");
+    c.lift_the_limit();
+    added
+}
+
+/// Under `noeviction`, a set that grows is refused once the process reaches
+/// its limit, across the table's growth (each doubling is one allocation of
+/// twice the buckets), and `MEMORY USAGE` says the set is what filled it.
+#[test]
+fn noeviction_refuses_a_growing_set_at_the_limit_and_memory_usage_says_why() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    let added = grow_until_refused(&mut c, "set", |c, from| {
+        cmd_with(c, &["SADD", "set"], &members(from, 100))
+    });
+    assert!(added > 10_000, "only {added} members in 2 MB");
+}
+
+/// The same for a hash of many short fields.
+#[test]
+fn noeviction_refuses_a_growing_hash_at_the_limit_and_memory_usage_says_why() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    grow_until_refused(&mut c, "hash", |c, from| {
+        let pairs: Vec<String> = members(from, 100)
+            .into_iter()
+            .flat_map(|f| [f, "v".to_string()])
+            .collect();
+        cmd_with(c, &["HSET", "hash"], &pairs)
+    });
+}
+
+/// And for a hash whose fields have times to live, which hold a second copy
+/// of each field's name.
+#[test]
+fn noeviction_refuses_a_hash_with_field_ttls_at_the_limit_and_memory_usage_says_why() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    grow_until_refused(&mut c, "hash", |c, from| {
+        let fields = members(from, 100);
+        let pairs: Vec<String> = fields
+            .iter()
+            .flat_map(|f| [f.clone(), "v".to_string()])
+            .collect();
+        let added = cmd_with(c, &["HSET", "hash"], &pairs);
+        if added.is_err() {
+            return added;
+        }
+        let ttl = cmd_with(
+            c,
+            &["HPEXPIRE", "hash", "3600000", "FIELDS", "100"],
+            &fields,
+        );
+        if ttl.is_err() { ttl } else { added }
+    });
+}
+
+/// Writing values over with values as long, near the limit, adds nothing:
+/// none of it is refused.
+#[test]
+fn noeviction_allows_writing_over_hash_values_near_the_limit() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    let limit = c.limit_to(MB);
+    let mut keys = 0;
+    loop {
+        let pairs: Vec<String> = members(0, 65)
+            .into_iter()
+            .flat_map(|f| [f, "a".repeat(16)])
+            .collect();
+        if cmd_with(&mut c, &["HSET", &format!("h{keys}")], &pairs).is_err() {
+            break;
+        }
+        keys += 1;
+        assert!(keys < 10_000);
+    }
+    // Some room again, less than another hash takes.
+    assert_eq!(c.cmd(&["DEL", "h0"]).i(), 1);
+    for round in 0..20 {
+        for k in 1..keys.min(50) {
+            let fill = if round % 2 == 0 { "b" } else { "c" };
+            let pairs: Vec<String> = members(0, 65)
+                .into_iter()
+                .flat_map(|f| [f, fill.repeat(16)])
+                .collect();
+            let reply = cmd_with(&mut c, &["HSET", &format!("h{k}")], &pairs);
+            assert_eq!(reply, V::Int(0), "round {round}, h{k}: {reply:?}");
+        }
+    }
+    assert!(c.used_memory() <= limit);
+    assert_eq!(c.evicted(), 0);
+}
+
+/// Under `allkeys-lru`, sets of 65 members (just past a table doubling, so
+/// most of each is table) are evicted to keep the process under its limit,
+/// and what is left reports, in all, about what is in use.
+#[test]
+fn allkeys_lru_keeps_sets_under_the_limit_and_their_usage_adds_up() {
+    let server = Server::start(&["--maxmemory-policy", "allkeys-lru"]);
+    let mut c = server.conn();
+    let before = c.used_memory();
+    let limit = c.limit_to(4 * MB);
+    let set = members(0, 65);
+    let written = 3000;
+    for i in 0..written {
+        let reply = cmd_with(&mut c, &["SADD", &format!("s{i}")], &set);
+        assert_eq!(reply, V::Int(65), "write {i}: {reply:?}");
+    }
+    let used = c.used_memory();
+    assert!(
+        used <= limit + MB / 4,
+        "{used} in use, the limit is {limit}"
+    );
+    let evicted = c.evicted();
+    assert!(evicted > 0, "nothing was evicted");
+    c.lift_the_limit();
+    let left = c.cmd(&["DBSIZE"]).i();
+    assert_eq!(left + evicted, written as i64);
+
+    let reported: i64 = (0..written)
+        .filter_map(|i| match c.cmd(&["MEMORY", "USAGE", &format!("s{i}")]) {
+            V::Int(n) => Some(n),
+            _ => None,
+        })
+        .sum();
+    let in_use = c.used_memory() - before;
+    assert!(
+        (in_use * 9 / 10..=in_use * 11 / 10).contains(&reported),
+        "{left} sets report {reported} bytes, {in_use} are in use"
+    );
+}
+
+/// Under `volatile-lru`, only hashes with a time to live go: hashes without
+/// one are written until every hash with one has been evicted, and then a
+/// write that adds is refused.
+#[test]
+fn volatile_lru_evicts_only_hashes_with_a_ttl() {
+    let server = Server::start(&["--maxmemory-policy", "volatile-lru"]);
+    let mut c = server.conn();
+    let pairs: Vec<String> = members(0, 65)
+        .into_iter()
+        .flat_map(|f| [f, "v".to_string()])
+        .collect();
+    let limit = c.limit_to(2 * MB);
+    for i in 0..50 {
+        cmd_with(&mut c, &["HSET", &format!("kept{i}")], &pairs);
+    }
+    for i in 0..50 {
+        let key = format!("ttl{i}");
+        cmd_with(&mut c, &["HSET", &key], &pairs);
+        assert_eq!(c.cmd(&["EXPIRE", &key, "100000"]).i(), 1);
+    }
+    assert_eq!(c.evicted(), 0);
+    let mut more = 0;
+    let refused = loop {
+        let reply = cmd_with(&mut c, &["HSET", &format!("more{more}")], &pairs);
+        if reply.is_err() {
+            break reply;
+        }
+        more += 1;
+        assert!(more < 50_000, "never refused");
+    };
+    assert!(
+        refused.s().starts_with("OOM command not allowed"),
+        "{refused:?}"
+    );
+    assert_eq!(c.surviving("ttl", 50), 0, "a hash with a TTL was left");
+    assert_eq!(c.evicted(), 50);
+    assert_eq!(c.surviving("kept", 50), 50);
+    assert_eq!(c.surviving("more", more), more);
+    assert!(c.used_memory() <= limit + MB / 4);
+}
+
+/// And for a sorted set, whose members are in two indexes.
+#[test]
+fn noeviction_refuses_a_growing_sorted_set_at_the_limit_and_memory_usage_says_why() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    grow_until_refused(&mut c, "zset", |c, from| {
+        let pairs: Vec<String> = members(from, 100)
+            .into_iter()
+            .enumerate()
+            .flat_map(|(i, m)| [(from + i).to_string(), m])
+            .collect();
+        cmd_with(c, &["ZADD", "zset"], &pairs)
+    });
+}

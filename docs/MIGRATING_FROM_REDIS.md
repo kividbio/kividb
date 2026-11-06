@@ -100,6 +100,20 @@ What the RDB reader takes from Redis:
 - **Other module data** (time series, vector sets, Bloom filters, and so on)
   is refused, and so is the whole file: KiviDB won't load part of a
   snapshot. Move those keys with `MIGRATE` instead, or recreate them.
+- **Dragonfly and KeyDB.** Their RDB files (Dragonfly: `SAVE RDB`) and
+  `DUMP` payloads load, including hash field TTLs (Dragonfly's `HSETEX` and
+  `FIELDEXPIRE`, KeyDB's `EXPIREMEMBER` on a hash) and Dragonfly's JSON
+  documents. KiviDB can replicate from a KeyDB primary, but not from one
+  in active replication (`active-replica yes`): the link ends at its first
+  `RREPLAY`, saying so; move that data by RDB file or with `MIGRATE`. Set
+  and sorted-set members with their own TTLs
+  (Dragonfly's `SADDEX`, KeyDB's `EXPIREMEMBER` on a set or sorted set) have
+  no equivalent, so the file, or the replication link, is refused with the
+  key named. Save Dragonfly's file with `--compression_mode=0`: its
+  compressed blocks aren't read. Dragonfly's own `.dfs` snapshot format
+  isn't read. KeyDB's `DUMP` leaves member TTLs out, so `RESTORE` and
+  `MIGRATE` from KeyDB can't carry them: move hashes with field TTLs by
+  file or by replication.
 - **HyperLogLogs** load and count as they did on Redis. Set
   `hll-write-format redis` on KiviDB before you switch over: by default it
   writes new HyperLogLogs in its own format, and `PFMERGE` or a multi-key
