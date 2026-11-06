@@ -115,6 +115,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   document saved by 1.2.0 comes back with the numbers 1.2.0 held, and the
   AOF's `JSON.SET`s, replayed, give the numbers that were sent (#445).
 
+- **An RDB file's databases past 15 no longer merge into database 0.** The
+  RDB reader put the keys of every database numbered 16 or more into
+  database 0, beside that database's own keys, and where two had the same
+  name one overwrote the other, without a word. A file saved by Redis,
+  Valkey, KeyDB or Dragonfly with more than 16 databases now loads each key
+  into its own database when the server has that many (`databases`), and
+  is refused otherwise, with a message that names the database and the
+  `databases` to start with. This holds for `--preload-file`, the base file
+  of an `aof:` preload, `dump.rdb` at startup and a full sync from a Redis,
+  Valkey, KeyDB or Dragonfly master; a replica refuses such a full sync
+  and keeps its dataset (#477).
+
 - **A Lua script's `false` is a RESP3 null to a RESP3 client (#431).** A
   script's `false`, which is also what `redis.call` gives back for a nil
   reply (a `GET` of a missing key), was sent as RESP2's `$-1` to a client
