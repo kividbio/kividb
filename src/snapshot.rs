@@ -1576,13 +1576,18 @@ pub fn load_snapshot(path: &str) -> io::Result<LoadedSnapshot> {
 /// server reads its images with [`load_snapshot`], [`load_snapshot_bytes`]
 /// and [`load_snapshot_with`].
 pub fn load_snapshot_from(r: impl Read) -> io::Result<LoadedSnapshot> {
-    read_image(r, true, &[], &mut Vec::new()).map(|(loaded, _)| loaded)
+    read_image(r, true, &[], &mut Vec::new(), server_databases()).map(|(loaded, _)| loaded)
+}
+
+/// The databases a snapshot may have keys in (see [`SNAPSHOT_DATABASES`]).
+fn server_databases() -> usize {
+    SNAPSHOT_DATABASES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// [`load_snapshot_from`] for an image in memory, read again as
 /// [`read_retrying`] says if it has to be.
 pub fn load_snapshot_bytes(image: &[u8]) -> io::Result<LoadedSnapshot> {
-    read_retrying(|| Ok(image), true).map(|(loaded, _, _)| loaded)
+    read_retrying(|| Ok(image), true, server_databases()).map(|(loaded, _, _)| loaded)
 }
 
 /// Load the image that `open` opens, opening it again as [`read_retrying`]
@@ -1590,7 +1595,7 @@ pub fn load_snapshot_bytes(image: &[u8]) -> io::Result<LoadedSnapshot> {
 pub fn load_snapshot_with<R: Read>(
     open: impl FnMut() -> io::Result<R>,
 ) -> io::Result<(LoadedSnapshot, R)> {
-    read_retrying(open, true).map(|(loaded, _, reader)| (loaded, reader))
+    read_retrying(open, true, server_databases()).map(|(loaded, _, reader)| (loaded, reader))
 }
 
 /// Read a KDB image from beginning to end without keeping any of it, and
@@ -1605,7 +1610,7 @@ pub fn load_snapshot_with<R: Read>(
 /// it. (The loader also accepts an image that simply stops between two
 /// entries, for the sake of files written before there was an end marker.)
 pub fn verify_snapshot(image: &[u8]) -> io::Result<usize> {
-    read_retrying(|| Ok(image), false).map(|(_, keys, _)| keys)
+    read_retrying(|| Ok(image), false, server_databases()).map(|(_, keys, _)| keys)
 }
 
 /// Readings [`read_retrying`] makes of one image at most.
@@ -1631,6 +1636,7 @@ const READINGS: usize = 32;
 fn read_retrying<R: Read>(
     mut open: impl FnMut() -> io::Result<R>,
     keep: bool,
+    databases: usize,
 ) -> io::Result<(LoadedSnapshot, usize, R)> {
     let mut first_error: Option<io::Error> = None;
     // Readings still to make, latest pushed first: each a reading that
@@ -1648,7 +1654,7 @@ fn read_retrying<R: Read>(
             Err(e) => return Err(first_error.unwrap_or(e)),
         };
         let mut ends = Vec::new();
-        match read_image(&mut reader, keep, &plan, &mut ends) {
+        match read_image(&mut reader, keep, &plan, &mut ends, databases) {
             Ok((loaded, keys)) => {
                 if !plan.is_empty() {
                     log_warn!(
@@ -1658,6 +1664,9 @@ fn read_retrying<R: Read>(
                 }
                 return Ok((loaded, keys, reader));
             }
+            // Read whole, and refused for its databases (#482): this
+            // reading's error, whichever reading it is.
+            Err(e) if is_past_databases(&e) => return Err(e),
             Err(e) => {
                 let layout = matches!(
                     e.kind(),
@@ -1736,6 +1745,7 @@ fn read_image(
     keep: bool,
     legacy: &[usize],
     ends: &mut Vec<usize>,
+    databases: usize,
 ) -> io::Result<(LoadedSnapshot, usize)> {
     let mut r = r;
     let mut keys_read = 0usize;
@@ -1757,6 +1767,12 @@ fn read_image(
     // a section), read to see whether it is a tag.
     let mut next_byte = None;
     let mut strict = !legacy.is_empty();
+    // The refusal of a key or index in a database past `databases` (#482).
+    // Given once the image has been read through, sections and all: a
+    // reading of a 1.2.0 image that took the empty key in the wrong place
+    // can come upon a key in such a database before it fails on what it
+    // misread, and has to fail on that, so that the right reading is tried.
+    let mut past: Option<String> = None;
 
     for db in 0..db_count {
         let mut map: HashMap<String, KiviDBValue> = HashMap::new();
@@ -2130,12 +2146,18 @@ fn read_image(
                 }
             };
 
+            // A key in a database past the server's (#482): not kept, and
+            // the image refused once it is read.
+            let past_databases = db >= databases;
+            if past_databases && past.is_none() {
+                past = database_of_snapshot(db as u64, databases, "keys").err();
+            }
             keys_read += 1;
             let has_value = match &value {
                 KiviDBValue::HashEx(hash) => !hash.read().is_empty(),
                 _ => true,
             };
-            if keep && has_value {
+            if keep && has_value && !past_databases {
                 map.insert(key, value);
             }
         }
@@ -2270,6 +2292,26 @@ fn read_image(
         });
     }
 
+    // An index of a database past the server's: refused as its keys are
+    // (`backfill_from_db` and the search commands take its database as one
+    // the store has).
+    if past.is_none()
+        && let Some(schema) = index_schemas.iter().find(|s| s.db_index >= databases)
+    {
+        past = database_of_snapshot(
+            schema.db_index as u64,
+            databases,
+            &format!("the index {}", schema.name),
+        )
+        .err();
+    }
+    if let Some(why) = past {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            PastDatabases(why),
+        ));
+    }
+
     Ok((
         LoadedSnapshot {
             dbs: result,
@@ -2310,7 +2352,18 @@ pub fn restore_expiries_into_store(expiries: ExpiryMaps, store: &store::Store) -
     let mut total = 0usize;
     for (db_idx, map) in expiries.into_iter().enumerate() {
         let Some(db) = store.get(db_idx) else {
-            break;
+            // A snapshot with keys past the store's databases is refused as
+            // it is read (see `SNAPSHOT_DATABASES`); this says so if one
+            // was not.
+            if !map.is_empty() {
+                log_error!(
+                    "snapshot: the times to live of {} keys in database {db_idx} are dropped: \
+                     the store has {} databases",
+                    map.len(),
+                    store.len()
+                );
+            }
+            continue;
         };
         for (key, at_ms) in map {
             if write_lock!(store::get_shard(db, &key)).set_expires(&key, at_ms) {
@@ -2754,11 +2807,53 @@ fn too_long() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "RDB string length out of range")
 }
 
-/// How many databases an RDB file may have keys in: the server's
-/// `databases`, set as it starts. A file with keys in a database past them
-/// is refused, naming it. It used to be loaded into database 0, merged with
-/// that database's keys and overwriting those of the same name (#477).
-pub static RDB_DATABASES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(16);
+/// How many databases a snapshot may have keys in, an RDB file or a KiviDB
+/// image: the server's `databases`, set as it starts. A snapshot with keys
+/// in a database past them is refused, naming it. An RDB file's were loaded
+/// into database 0, merged with that database's keys and overwriting those
+/// of the same name (#477); a KiviDB image's were dropped (#482).
+pub static SNAPSHOT_DATABASES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(16);
+
+/// The largest number of databases the refusal of a snapshot advises
+/// starting with. A database number past it is more likely a damaged file
+/// than a server to configure.
+const DATABASES_ADVISED_MAX: u64 = 1 << 16;
+
+/// `db`, if it is one of the server's databases (see
+/// [`SNAPSHOT_DATABASES`]); otherwise what the refusal of the snapshot says.
+fn database_of_snapshot(db: u64, databases: usize, what: &str) -> Result<usize, String> {
+    match usize::try_from(db) {
+        Ok(index) if index < databases => Ok(index),
+        _ if db < DATABASES_ADVISED_MAX => Err(format!(
+            "the file has {what} in database {db}, and this server has {databases} databases: \
+             start it with databases {} or more",
+            db + 1
+        )),
+        _ => Err(format!(
+            "the file has {what} in database {db}, a number more likely of a damaged file \
+             than of a server's databases (this server has {databases})"
+        )),
+    }
+}
+
+/// The refusal of a KiviDB image with keys or an index in a database past
+/// the server's. Given only for a reading that read the image whole: that
+/// reading is the right one, and no other is tried.
+#[derive(Debug)]
+struct PastDatabases(String);
+
+impl std::fmt::Display for PastDatabases {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PastDatabases {}
+
+fn is_past_databases(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<PastDatabases>())
+}
 
 // Unused by the binary, which wants the expiries; see `write_snapshot`.
 #[allow(dead_code)]
@@ -2820,19 +2915,9 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
             0xFE => {
                 // Database selector
                 let (db_num, _) = rdb_read_length(&mut r)?;
-                let databases = RDB_DATABASES.load(std::sync::atomic::Ordering::Relaxed);
-                current_db = usize::try_from(db_num)
-                    .ok()
-                    .filter(|&db| db < databases)
-                    .ok_or_else(|| {
-                        rdb_invalid(format!(
-                            "the file has keys in database {db_num}, and this server has \
-                             {databases} databases (0 to {}): start it with databases {} or \
-                             more",
-                            databases - 1,
-                            db_num.saturating_add(1)
-                        ))
-                    })?;
+                let databases = SNAPSHOT_DATABASES.load(std::sync::atomic::Ordering::Relaxed);
+                current_db =
+                    database_of_snapshot(db_num, databases, "keys").map_err(rdb_invalid)?;
                 if current_db >= result.len() {
                     result.resize_with(current_db + 1, HashMap::new);
                     expiries.resize_with(current_db + 1, HashMap::new);
@@ -4193,7 +4278,18 @@ pub fn restore_into_store(dbs: Vec<HashMap<String, KiviDBValue>>, store: &store:
     let mut total = 0usize;
     for (db_idx, map) in dbs.into_iter().enumerate() {
         if db_idx >= store.len() {
-            break;
+            // A snapshot with keys past the store's databases is refused as
+            // it is read (see `SNAPSHOT_DATABASES`); this says so if one
+            // was not. It used to drop them without a word (#482).
+            if !map.is_empty() {
+                log_error!(
+                    "snapshot: {} keys in database {db_idx} are dropped: the store has {} \
+                     databases",
+                    map.len(),
+                    store.len()
+                );
+            }
+            continue;
         }
         let db = &store[db_idx];
         total += map.len();
@@ -6376,6 +6472,103 @@ mod empty_key_tests {
         let loaded = load_snapshot(path.to_str().unwrap()).unwrap();
         assert_eq!(get_string(&loaded.dbs[0], ""), b"e0");
         assert_eq!(get_string(&loaded.dbs[2], ""), b"e2");
+    }
+
+    /// A 1.2.0 image, read with `databases 1`: the empty key in database 0,
+    /// before the last, and database 1 empty. The first reading takes the
+    /// empty key's 0 for database 0's end, and what follows realigns as a
+    /// key in database 1 (`"\0"`, from the empty string's length and the
+    /// next key's length and byte) before it fails. That key used to refuse
+    /// the image at once, and the right reading was never tried (#482).
+    #[test]
+    fn a_wrong_reading_of_a_1_2_0_image_past_the_databases_is_not_the_refusal() {
+        let old = image_1_2_0(&[vec![("", string("")), ("\0", string("v"))], vec![]], &[]);
+        // The first reading alone: past database 0, then a failure on what
+        // it misread, not the refusal.
+        let first = read_image(old.as_slice(), true, &[], &mut Vec::new(), 1)
+            .err()
+            .expect("the first reading loaded");
+        assert!(!is_past_databases(&first), "{first}");
+        let (loaded, _, _) = read_retrying(|| Ok(old.as_slice()), true, 1).unwrap();
+        assert_eq!(get_string(&loaded.dbs[0], ""), b"");
+        assert_eq!(get_string(&loaded.dbs[0], "\0"), b"v");
+        assert!(loaded.dbs[1].is_empty());
+    }
+
+    /// A 1.2.0 image whose right reading is the second, with a key in a
+    /// database past the server's: refused for that, not with the first
+    /// reading's error.
+    #[test]
+    fn a_later_reading_refused_for_its_databases_says_so() {
+        let old = image_1_2_0(
+            &[
+                vec![("x", string("1")), ("", string("e0"))],
+                vec![("k", string("v"))],
+            ],
+            &[],
+        );
+        assert!(read_retrying(|| Ok(old.as_slice()), true, 2).is_ok());
+        let err = read_retrying(|| Ok(old.as_slice()), true, 1)
+            .err()
+            .expect("loaded into one database");
+        assert!(is_past_databases(&err), "{err}");
+        assert!(err.to_string().contains("keys in database 1"), "{err}");
+        let err = read_retrying(|| Ok(old.as_slice()), false, 1)
+            .err()
+            .expect("verified for one database");
+        assert!(is_past_databases(&err), "{err}");
+    }
+
+    /// An image of 32 databases with keys in database 0 alone loads into 16,
+    /// as every `dump.kdb` of a server with `databases 32` does; one with a
+    /// key in database 20, or an index there, is refused, naming it.
+    #[test]
+    fn only_keys_or_an_index_past_the_databases_refuse_an_image() {
+        let mut dbs: Vec<HashMap<String, KiviDBValue>> = (0..32).map(|_| HashMap::new()).collect();
+        dbs[0].insert("a".into(), string("1"));
+        let mut out = Vec::new();
+        write_kdb_image(&mut out, &dbs, None).unwrap();
+        let (loaded, keys, _) = read_retrying(|| Ok(out.as_slice()), true, 16).unwrap();
+        assert_eq!((keys, get_string(&loaded.dbs[0], "a")), (1, b"1".to_vec()));
+
+        dbs[20].insert("b".into(), string("2"));
+        let mut out = Vec::new();
+        write_kdb_image(&mut out, &dbs, None).unwrap();
+        let err = read_retrying(|| Ok(out.as_slice()), true, 16)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("keys in database 20"), "{err}");
+        assert!(err.to_string().contains("databases 21"), "{err}");
+        assert!(read_retrying(|| Ok(out.as_slice()), true, 21).is_ok());
+
+        dbs[20].clear();
+        let schema = crate::vector::IndexSchema {
+            name: "idx20".into(),
+            db_index: 20,
+            on: crate::vector::IndexOn::Hash,
+            prefixes: vec!["p:".into()],
+            fields: Vec::new(),
+            aliases: Vec::new(),
+            stopwords: None,
+            synonyms: Default::default(),
+            language: Default::default(),
+            default_score: 1.0,
+            score_field: None,
+        };
+        let store = crate::vector::new_index_store();
+        store.write().insert("idx20".into(), schema.into_def());
+        let mut out = Vec::new();
+        write_kdb_image(&mut out, &dbs, Some(&store)).unwrap();
+        let err = read_retrying(|| Ok(out.as_slice()), true, 16)
+            .err()
+            .unwrap();
+        assert!(is_past_databases(&err), "{err}");
+        assert!(
+            err.to_string().contains("the index idx20 in database 20"),
+            "{err}"
+        );
+        let (loaded, _, _) = read_retrying(|| Ok(out.as_slice()), true, 32).unwrap();
+        assert_eq!(loaded.index_schemas[0].db_index, 20);
     }
 
     /// `image` opened by `load_snapshot_with`, counting the openings.

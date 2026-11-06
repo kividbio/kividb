@@ -159,6 +159,11 @@ pub struct ReplState {
     /// `shutdown-timeout`: how long a master that is shutting down waits for
     /// its replicas to acknowledge the end of its stream.
     pub shutdown_timeout_secs: AtomicU64,
+    /// `replica-priority` and `replica-announced`: what `INFO replication`
+    /// tells Sentinel of this replica (`slave_priority`, where 0 is never
+    /// promoted, and `replica_announced`).
+    pub replica_priority: AtomicU32,
+    pub replica_announced: AtomicBool,
     /// Set by a shutdown once no command runs: nothing more goes into the
     /// write stream, not even the replica `PING` or a key that expires. See
     /// [`end_stream_for_shutdown`].
@@ -497,6 +502,8 @@ impl ReplState {
             repl_timeout_secs: AtomicU64::new(60),
             repl_ping_period_secs: AtomicU64::new(10),
             shutdown_timeout_secs: AtomicU64::new(10),
+            replica_priority: AtomicU32::new(100),
+            replica_announced: AtomicBool::new(true),
             stream_closed: AtomicBool::new(false),
             hll_write_redis: AtomicBool::new(false),
             min_replicas_to_write: AtomicU32::new(0),
@@ -710,6 +717,12 @@ impl ReplState {
         state
             .shutdown_timeout_secs
             .store(config.shutdown_timeout, Ordering::Relaxed);
+        state
+            .replica_priority
+            .store(config.replica_priority, Ordering::Relaxed);
+        state
+            .replica_announced
+            .store(config.replica_announced, Ordering::Relaxed);
         state
             .min_replicas_to_write
             .store(config.min_replicas_to_write, Ordering::Relaxed);
