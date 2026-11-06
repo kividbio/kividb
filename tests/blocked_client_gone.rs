@@ -205,6 +205,10 @@ impl Server {
     }
 
     fn start_with(io: &str, extra: &[&str]) -> Self {
+        Self::start_with_workers(io, 4, extra)
+    }
+
+    fn start_with_workers(io: &str, workers: usize, extra: &[&str]) -> Self {
         let dir = tempfile::tempdir().unwrap().keep();
         let port = free_port();
         let log = std::fs::File::create(dir.join("server.log")).unwrap();
@@ -218,7 +222,7 @@ impl Server {
                 "--io-model",
                 io,
                 "--threads",
-                "4",
+                &workers.to_string(),
                 "--configfile",
                 "kividb.conf",
             ])
@@ -643,6 +647,46 @@ fn a_client_that_closes_while_a_pause_holds_it_takes_nothing() {
         }
         assert_eq!(ctl.cmd(&["LLEN", "p:active"]), V::Int(0), "{io}");
         assert!(let_go, "{io}: still listed while the pause held it");
+    }
+}
+
+/// A pipelined write and WAIT must let the replica stream and its ACK make
+/// progress on the same worker. A busy yield loop on io_uring kept that
+/// worker runnable, so its queued socket operations were never submitted.
+#[test]
+fn a_wait_on_one_worker_receives_replica_acknowledgments() {
+    for &io in io_models() {
+        let master = Server::start_with_workers(io, 1, &["--repl-ping-replica-period", "3600"]);
+        let mut writer = master.conn();
+        assert_eq!(writer.cmd(&["SET", "seed", "ready"]), s("OK"));
+        let port = master.port.to_string();
+        let replica = Server::start_with("tokio", &["--replicaof", "127.0.0.1", &port]);
+        let mut reader = replica.conn();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while reader.cmd(&["GET", "seed"]) != s("ready") {
+            assert!(Instant::now() < deadline, "{io}: full sync did not finish");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // No pause between the write and WAIT: an ACK already received
+        // before WAIT starts would bypass the broken wait loop entirely.
+        for timeout in ["2000", "0"] {
+            for round in 0..4 {
+                let value = format!("{timeout}:{round}");
+                let mut batch = request(&["SET", "wait-progress", &value]);
+                batch.extend(request(&["WAIT", "1", timeout]));
+                writer.writer.write_all(&batch).unwrap();
+                assert_eq!(writer.read(), s("OK"), "{io}");
+                assert_eq!(
+                    writer.read(),
+                    V::Int(1),
+                    "{io}: WAIT timed out instead of letting the replica acknowledge"
+                );
+                assert_eq!(reader.cmd(&["GET", "wait-progress"]), s(&value), "{io}");
+            }
+        }
+        // An unmet replica count still times out with the count reached.
+        assert_eq!(writer.cmd(&["WAIT", "2", "25"]), V::Int(1), "{io}");
     }
 }
 

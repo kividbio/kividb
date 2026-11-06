@@ -2321,7 +2321,9 @@ pub async fn handle_client(
                                             b"*2\r\n:0\r\n:0\r\n".to_vec()
                                         };
                                     }
-                                    tokio::task::yield_now().await;
+                                    // tokio-uring submits queued I/O when the worker
+                                    // parks. A busy yield loop can prevent that.
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                                 }
                             },
                             &peer_watch,
@@ -2389,7 +2391,10 @@ pub async fn handle_client(
                                         {
                                             break crate::resp::write::resp_integer(acked).to_vec();
                                         }
-                                        tokio::task::yield_now().await; // not tokio::time::sleep
+                                        // Let the worker park so tokio-uring submits
+                                        // the replica writes and reads needed for ACKs.
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(1))
+                                            .await;
                                     }
                                 },
                                 &peer_watch,
