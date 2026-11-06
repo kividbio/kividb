@@ -29,6 +29,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A file that is not a whole snapshot no longer starts the server on
+  part of the data, or none.** `--preload-file rdb:` of a Dragonfly
+  snapshot in Dragonfly's own format logged `preload-file: 0 keys from the
+  base snapshot` and started an empty server. That format is a summary
+  file, with no keys, and a file for each shard, and each is an RDB file:
+  the summary loaded as an empty dataset, and a shard's file as that
+  shard's keys alone. Both are now refused, by the fields only these
+  files have, with a message that says to save an RDB file with
+  Dragonfly's `SAVE RDB` and load that; an RDB file saved that way loads.
+  An RDB file's checksum is now checked, as Redis checks it, and a file
+  that ends before its checksum, has the wrong one, or has a version that
+  is not a number is refused; one cut short anywhere else was already. A
+  KiviDB snapshot cut short between two keys loaded the keys before the
+  cut, or none when it ended after its header: it is now refused, as a
+  replica already refused such a full sync. This holds for
+  `--preload-file` and for `dump.rdb` and `dump.kdb` at startup, where the
+  server does not start and leaves the data directory as it was, and for
+  a full sync from a Redis master, which the replica refuses, keeping its
+  dataset (#444).
+
 - **A Lua script's `false` is a RESP3 null to a RESP3 client (#431).** A
   script's `false`, which is also what `redis.call` gives back for a nil
   reply (a `GET` of a missing key), was sent as RESP2's `$-1` to a client

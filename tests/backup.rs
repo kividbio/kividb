@@ -1802,3 +1802,96 @@ fn a_backup_into_the_data_directory_is_refused() {
         "{reply:?}"
     );
 }
+
+/// A preload target that is not a whole snapshot is fatal, and the data
+/// directory is left as it was (#444). A Dragonfly snapshot in Dragonfly's
+/// own format (`.dfs`, a summary with no keys and a file for each shard)
+/// started the server empty: "preload-file: 0 keys from the base snapshot".
+/// A cut file, one with a byte changed, and a KiviDB snapshot cut short
+/// loaded as far as they went.
+#[test]
+fn a_preload_file_that_is_not_a_whole_snapshot_is_fatal() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let source = Server::start(&[]);
+    let mut c = source.conn();
+    for i in 0..50 {
+        c.cmd(&["SET", &format!("key:{i}"), &"v".repeat(100)]);
+    }
+    assert!(c.cmd(&["SAVE"]).ok());
+    let kdb = std::fs::read(source.dir.join("dump.kdb")).unwrap();
+    let rdb = std::fs::read(fixtures.join("redis-8.10.rdb")).unwrap();
+    let mut flipped = rdb.clone();
+    let at = flipped.windows(5).position(|w| w == b"hello").unwrap();
+    flipped[at] = b'j';
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut targets: Vec<(&str, Vec<u8>)> = vec![
+        (
+            "dragonfly-summary.dfs",
+            std::fs::read(fixtures.join("dragonfly-2.1-summary.dfs")).unwrap(),
+        ),
+        (
+            "dragonfly-0000.dfs",
+            std::fs::read(fixtures.join("dragonfly-2.1-0000.dfs")).unwrap(),
+        ),
+        ("empty", Vec::new()),
+        ("cut.rdb", rdb[..rdb.len() - 8].to_vec()),
+        ("damaged.rdb", flipped),
+        ("cut.kdb", kdb[..kdb.len() / 2].to_vec()),
+        ("header.kdb", kdb[..12].to_vec()),
+    ];
+    // The data directory holds a dump of its own, which must stay as it is.
+    let data = dir.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    let ours = b"REDIS0011\xFF\0\0\0\0\0\0\0\0".to_vec();
+    std::fs::write(data.join("dump.rdb"), &ours).unwrap();
+    // Whether the server exited with an error within 30 s (one that starts is
+    // stopped), and what it logged.
+    let run = |args: &[&str]| -> (bool, String) {
+        let mut child = kividb(&data, free_port(), args)
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("could not run kividb");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let failed = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break !status.success();
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let mut stderr = String::new();
+        let _ = child.stderr.take().unwrap().read_to_string(&mut stderr);
+        (failed, stderr)
+    };
+    for (name, bytes) in targets.drain(..) {
+        let file = dir.path().join(name);
+        std::fs::write(&file, bytes).unwrap();
+        let target = format!("rdb:{}", file.display());
+        let (failed, stderr) = run(&["--preload-file", &target]);
+        assert!(failed, "{name} must not start: {stderr}");
+        assert!(stderr.contains("could not be loaded"), "{name}: {stderr}");
+        if name.starts_with("dragonfly") {
+            assert!(stderr.contains("Dragonfly"), "{name}: {stderr}");
+        }
+        assert_eq!(
+            std::fs::read(data.join("dump.rdb")).unwrap(),
+            ours,
+            "{name}"
+        );
+        assert!(!data.join("dump.kdb").exists(), "{name}");
+    }
+
+    // A Dragonfly shard's file as `dump.rdb` does not start the server on
+    // that shard's keys either.
+    let shard = std::fs::read(fixtures.join("dragonfly-2.1-0000.dfs")).unwrap();
+    std::fs::write(data.join("dump.rdb"), &shard).unwrap();
+    let (failed, stderr) = run(&[]);
+    assert!(failed, "{stderr}");
+    assert!(stderr.contains("Dragonfly"), "{stderr}");
+    assert_eq!(std::fs::read(data.join("dump.rdb")).unwrap(), shard);
+}
