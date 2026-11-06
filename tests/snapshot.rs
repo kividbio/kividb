@@ -1958,10 +1958,11 @@ fn rdb_opcodes_kividb_does_not_read_are_refused_by_name() {
 // A Dragonfly snapshot in Dragonfly's own format is a summary file and a
 // file for each shard (`dump-<time>-summary.dfs`, `dump-<time>-0000.dfs`,
 // ...). Each is an RDB file: the summary has no keys, a shard file has its
-// shard's. Either loaded, as a server with none of the data or a sixteenth
-// of it (#444). They are refused, by the fields only these files have, and
-// an RDB file saved by Dragonfly (`SAVE RDB`) loads. The fixtures are from
-// Dragonfly 2.1, with 200 strings, a hash and a list.
+// shard's. Either loaded, as a server with none of the data or a fraction
+// of it (#444). From Dragonfly 1.32 on they are refused here, by the fields
+// only these files have; earlier ones are refused by `--preload-file` (see
+// tests/backup.rs). An RDB file saved by Dragonfly (`SAVE RDB`) loads, from
+// 2.1 and from 1.31. The fixtures hold 200 strings, a hash and a list.
 #[test]
 fn dragonfly_snapshot_files_are_refused_and_its_rdb_files_load() {
     for (name, bytes) in [
@@ -1980,16 +1981,26 @@ fn dragonfly_snapshot_files_are_refused_and_its_rdb_files_load() {
         assert!(err.to_string().contains("Dragonfly"), "{name}: {err}");
     }
 
-    let (dbs, _, _) =
-        kividb::snapshot::load_redis_rdb_from(&include_bytes!("fixtures/dragonfly-2.1.rdb")[..])
-            .unwrap();
-    assert_eq!(dbs[0].len(), 202);
-    match &dbs[0]["key:7"] {
-        KiviDBValue::String(b) => assert_eq!(b.as_ref(), b"val7"),
-        _ => panic!("key:7: wrong type"),
+    for (version, bytes) in [
+        (
+            "2.1",
+            &include_bytes!("fixtures/dragonfly-2.1-save-rdb.rdb")[..],
+        ),
+        (
+            "1.31",
+            &include_bytes!("fixtures/dragonfly-1.31-save-rdb.rdb")[..],
+        ),
+    ] {
+        let (dbs, _, _) = kividb::snapshot::load_redis_rdb_from(bytes)
+            .unwrap_or_else(|e| panic!("Dragonfly {version}: {e}"));
+        assert_eq!(dbs[0].len(), 202, "Dragonfly {version}");
+        match &dbs[0]["key:7"] {
+            KiviDBValue::String(b) => assert_eq!(b.as_ref(), b"val7"),
+            _ => panic!("Dragonfly {version} key:7: wrong type"),
+        }
+        assert!(matches!(dbs[0]["h"], KiviDBValue::Hash(_)));
+        assert!(matches!(dbs[0]["l"], KiviDBValue::List(_)));
     }
-    assert!(matches!(dbs[0]["h"], KiviDBValue::Hash(_)));
-    assert!(matches!(dbs[0]["l"], KiviDBValue::List(_)));
 }
 
 // An RDB file that is not whole is refused, not loaded as far as it goes

@@ -3315,6 +3315,22 @@ fn preload(
         }
         other => return Err(invalid(format!("unknown preload type '{other}'"))),
     };
+    // A file of a Dragonfly snapshot in Dragonfly's own format, by its name:
+    // `dump-<time>-summary.dfs` and a `dump-<time>-NNNN.dfs` for each shard.
+    // Each is an RDB file, and before Dragonfly 1.32 nothing in them says
+    // what they are: the summary loaded as an empty dataset, a shard's file
+    // as that shard's keys (#444).
+    if base
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("dfs"))
+    {
+        return Err(invalid(format!(
+            "{} is a file of a Dragonfly snapshot in Dragonfly's own format (.dfs), which \
+             keeps each shard's keys in a file of its own; save one in RDB format \
+             (Dragonfly's SAVE RDB) and load that",
+            base.display()
+        )));
+    }
 
     log_info!("preload-file: loading {}", base.display());
     let base_str = base.to_string_lossy();
@@ -3327,6 +3343,20 @@ fn preload(
     let mut index_names = Vec::new();
     let keys = if is_redis_rdb {
         let (dbs, expiries, functions) = crate::snapshot::load_redis_rdb_with_expiry(&base_str)?;
+        // A Dragonfly file with no keys at all is what the summary file of a
+        // snapshot in Dragonfly's own format is, renamed; up to Dragonfly
+        // 1.31 nothing else tells them apart. Either way there is nothing to
+        // start from.
+        if dbs.iter().all(|db| db.is_empty())
+            && crate::snapshot::rdb_written_by_dragonfly(&base_str)?
+        {
+            return Err(invalid(format!(
+                "{} was written by Dragonfly and holds no keys: it is the summary file of \
+                 a snapshot in Dragonfly's own format (.dfs), or a snapshot of an empty \
+                 Dragonfly. Save the data in RDB format (Dragonfly's SAVE RDB) and load that",
+                base.display()
+            )));
+        }
         crate::snapshot::restore_functions(functions)?;
         let keys = crate::snapshot::restore_into_store(dbs, store);
         crate::snapshot::restore_expiries_into_store(expiries, store);

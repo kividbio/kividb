@@ -2525,7 +2525,9 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
                 let _val = rdb_read_string(&mut r)?;
                 // Dragonfly's own format (`.dfs`) has a file for each shard
                 // and one, the summary, with none of the keys. Each is an RDB
-                // file, with these fields; Dragonfly's RDB files have neither.
+                // file. From Dragonfly 1.32 on, each has one of these fields,
+                // and its RDB files (`SAVE RDB`) have neither. Earlier ones
+                // write neither anywhere: see `preload` in src/aof.rs.
                 if key == b"shard-id" || key == b"shard-count" {
                     return Err(rdb_invalid(
                         "this is one file of a Dragonfly snapshot in Dragonfly's own format \
@@ -2558,8 +2560,13 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
                         rdb_invalid("the file ends before its checksum: it is cut short")
                     })?;
                     let crc = u64::from_le_bytes(crc);
-                    if crc != 0 && crc != sum {
-                        return Err(rdb_invalid("wrong RDB checksum: the file is damaged"));
+                    // `rdbchecksum no` skips the check, as in Redis: a file
+                    // whose only fault is its checksum can still be loaded.
+                    if crc != 0 && crc != sum && rdb_checksum_checked() {
+                        return Err(rdb_invalid(
+                            "wrong RDB checksum: the file is damaged (to load it all the same, \
+                             set rdbchecksum no in the config file)",
+                        ));
                     }
                 }
                 break;
@@ -2638,6 +2645,35 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
     }
 
     Ok((result, expiries, redis_function_dump(&libraries)))
+}
+
+/// Whether an RDB file's checksum is checked as it is loaded: unless
+/// `rdbchecksum no` is set, as in Redis.
+fn rdb_checksum_checked() -> bool {
+    crate::commands::server::remembered_config("rdbchecksum").as_deref() != Some("no")
+}
+
+/// Whether the RDB file at `path` was written by Dragonfly, by its aux
+/// fields: `df-ver`, or, before Dragonfly wrote that, `redis-ver
+/// 999.999.999`. Only the fields at the start of the file are read.
+pub fn rdb_written_by_dragonfly(path: &str) -> io::Result<bool> {
+    let mut r = BufReader::new(File::open(path)?);
+    let mut magic = [0u8; 9];
+    r.read_exact(&mut magic)?;
+    if &magic[..5] != b"REDIS" {
+        return Ok(false);
+    }
+    loop {
+        let mut opcode = [0u8];
+        if r.read_exact(&mut opcode).is_err() || opcode[0] != 0xFA {
+            return Ok(false);
+        }
+        let key = rdb_read_string(&mut r)?;
+        let value = rdb_read_string(&mut r)?;
+        if key == b"df-ver" || (key == b"redis-ver" && value == b"999.999.999") {
+            return Ok(true);
+        }
+    }
 }
 
 /// Redis's CRC64 ([`redis_crc64`]) a byte at a time, from a table.
