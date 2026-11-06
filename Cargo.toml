@@ -37,7 +37,9 @@ socket2 = { version = "0.5", features = ["all"] }
 clap = { version = "4", features = ["derive"] }
 libc = "0.2.183"
 rand = "0.8"
-serde_json = { version = "1", features = ["preserve_order"] }
+# `float_roundtrip`: a number is read as the double nearest to it. Without
+# it, one that needs 17 digits was often read as its neighbour (#445).
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 ordered-float = "4"
 sha2 = "0.10"
 lzf = "0.3"
@@ -69,7 +71,6 @@ xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 # are compiled in, so it works in images without a CA bundle.
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 webpki-roots = "1"
-compact_str = "0.10.0"
 # Snowball stemmers for TEXT fields (`src/vector/stem.rs`), the algorithms
 # RediSearch stems with. MIT/BSD-3-Clause, no dependencies of its own.
 rust-stemmers = "=1.2.0"

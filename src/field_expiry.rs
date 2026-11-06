@@ -152,7 +152,7 @@ pub fn rescan(store: &Store) {
                         .expiries
                         .values()
                         .min()
-                        .map(|at| (key.to_string(), *at)),
+                        .map(|at| (crate::store::key_text(key).to_owned(), *at)),
                     _ => None,
                 })
                 .collect();
