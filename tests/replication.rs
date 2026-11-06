@@ -164,6 +164,7 @@ fn port_is_free(port: u16) -> bool {
 /// listening can otherwise be given, as its own end, the very port it is
 /// dialling: it is then connected to itself and reads back what it writes.
 fn free_port() -> u16 {
+    in_scratch_dir();
     use std::sync::atomic::{AtomicU16, Ordering};
     static NEXT: AtomicU16 = AtomicU16::new(0);
     loop {
@@ -773,6 +774,18 @@ fn test_replicaof_no_one_clears_master_addr() {
 
 /// Start a server from an arbitrary config and wait until it accepts
 /// connections. Returns its port.
+/// The servers these tests run write their files (`dump.kdb`,
+/// `dump.kdb.gen`, `dump.kdb.repl`) where the process runs, which was the
+/// repository's own directory. The process moves to a directory of its own
+/// before the first server starts (every test asks for a port first).
+fn in_scratch_dir() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dir = tempfile::tempdir().expect("a temporary directory").keep();
+        std::env::set_current_dir(dir).expect("into the temporary directory");
+    });
+}
+
 fn spawn_server(mut config: Config) -> u16 {
     let port = free_port();
     config.port = port;

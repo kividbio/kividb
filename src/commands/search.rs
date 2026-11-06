@@ -474,10 +474,8 @@ fn count_docs(db: &Db, def: &IndexDef, cluster: Option<&crate::cluster::ClusterS
                 .read()
                 .iter()
                 .filter(|(key, value)| {
-                    let key = crate::key_bytes::text_of(key);
-                    let key: &str = &key;
                     crate::vector::is_document(&def.on, *value)
-                        && covers(def, key)
+                        && def.covers(key)
                         && served
                             .as_deref()
                             .is_none_or(|served| crate::cluster::search::in_served(served, key))
@@ -487,8 +485,10 @@ fn count_docs(db: &Db, def: &IndexDef, cluster: Option<&crate::cluster::ClusterS
         .sum()
 }
 
+/// Whether the index covers the document named `key` (a name: see
+/// `key_bytes::text_of`).
 fn covers(def: &IndexDef, key: &str) -> bool {
-    def.prefixes.is_empty() || def.prefixes.iter().any(|p| key.starts_with(p.as_str()))
+    def.covers(&crate::key_bytes::bytes_of(key))
 }
 
 pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
@@ -1349,9 +1349,11 @@ pub(crate) fn with_doc<R>(
     // Out of the shard, so that its lock is not held while `f` runs. A key
     // whose time to live has ended is no document, though nothing has
     // deleted it yet.
+    // A document is named by `key_bytes::text_of` of its key.
+    let key = crate::key_bytes::bytes_of(key);
     let value = {
-        let map = crate::store::get_shard(db, key).read();
-        let (value, expires) = map.get_expiring(key)?;
+        let map = crate::store::get_shard(db, &*key).read();
+        let (value, expires) = map.get_expiring(&*key)?;
         if expires.is_some_and(crate::commands::helpers::is_past) {
             return None;
         }
@@ -2348,7 +2350,9 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
     // In a cluster, only the keys of the slots this node serves: a key part
     // of the way through a migration is not counted twice.
     if ctx.cluster.enabled {
-        hits.retain(|hit| crate::cluster::search::serves(ctx.cluster, &hit.key));
+        hits.retain(|hit| {
+            crate::cluster::search::serves(ctx.cluster, &*crate::key_bytes::bytes_of(&hit.key))
+        });
     }
     let scores_matter = shard
         .then(|| crate::cluster::search::scores_matter(&ctx.cmd))
@@ -2562,7 +2566,10 @@ fn encode_page(
         let results: Vec<Vec<u8>> = page
             .iter()
             .map(|hit| {
-                let mut entry = vec![resp_bulk_str("id"), resp_bulk_str(&hit.key)];
+                let mut entry = vec![
+                    resp_bulk_str("id"),
+                    resp_bulk(&crate::key_bytes::bytes_of(&hit.key)),
+                ];
                 if args.withscores {
                     entry.push(resp_bulk_str("score"));
                     entry.push(resp3_score(hit.score));
@@ -2610,7 +2617,7 @@ fn encode_page(
     let mut out: Vec<Vec<u8>> = Vec::with_capacity(1 + page.len() * 2);
     out.push(resp_integer(total as i64));
     for hit in page {
-        out.push(resp_bulk_str(&hit.key));
+        out.push(resp_bulk(&crate::key_bytes::bytes_of(&hit.key)));
         if args.withscores {
             out.push(resp_bulk_str(&score_text(hit.score)));
         }

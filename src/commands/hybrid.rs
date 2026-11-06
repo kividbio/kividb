@@ -23,7 +23,7 @@ use crate::store::ValueRef;
 use ahash::AHashMap;
 
 use crate::commands::ctx::Ctx;
-use crate::resp::write::{resp_array, resp_bulk_str, resp_error, resp_integer};
+use crate::resp::write::{resp_array, resp_bulk, resp_bulk_str, resp_error, resp_integer};
 use crate::vector::{FieldType, KnnResult, LiveIndex, knn_flat, knn_hnsw};
 
 #[derive(Debug)]
@@ -668,9 +668,10 @@ fn read_numeric_field(
     key: &str,
     field: &str,
 ) -> f64 {
-    let Some(value) = crate::store::get_shard(db, key)
+    let raw = crate::key_bytes::bytes_of(key);
+    let Some(value) = crate::store::get_shard(db, &*raw)
         .read()
-        .get(key)
+        .get(&*raw)
         .map(ValueRef::to_value)
     else {
         return f64::NEG_INFINITY;
@@ -870,9 +871,10 @@ pub fn ft_hybrid(ctx: &mut Ctx) -> Option<Vec<u8>> {
         row.insert(q.vsim_alias().to_string(), format!("{vsim_s:.6}"));
 
         if let Some(spec) = &q.load {
-            let value = crate::store::get_shard(db_ref, key)
+            let raw = crate::key_bytes::bytes_of(key);
+            let value = crate::store::get_shard(db_ref, &*raw)
                 .read()
-                .get(key.as_str())
+                .get(&*raw)
                 .map(ValueRef::to_value);
             let inner = value.as_ref().and_then(|value| {
                 crate::vector::doc_fields(&def_clone.on, &def_clone.fields, value.view())
@@ -963,7 +965,7 @@ pub fn ft_hybrid(ctx: &mut Ctx) -> Option<Vec<u8>> {
         } else {
             // Per-doc rows: emit key followed by a fields array.
             let key = row.get("__key").cloned().unwrap_or_default();
-            out.push(resp_bulk_str(&key));
+            out.push(resp_bulk(&crate::key_bytes::bytes_of(&key)));
 
             let mut row_out: Vec<Vec<u8>> = Vec::new();
             for (k, v) in row {

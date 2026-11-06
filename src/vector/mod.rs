@@ -1119,14 +1119,16 @@ pub fn walk_documents(
     mut visit: impl FnMut(&str, DocFields<'_>),
 ) {
     for shard in db.iter() {
-        let keys: Vec<String> = shard
+        // The keys themselves, for their order and for reading them; the
+        // visit is given the document's name (`key_bytes::text_of`).
+        let keys: Vec<crate::store::Key> = shard
             .read()
             .keys()
             .filter(|key| def.covers(key))
-            .map(|key| crate::key_bytes::text_of(key).into_owned())
+            .map(crate::store::Key::new)
             .collect();
         for key in keys {
-            let _order = crate::write_order::lock_key_for_walk(def.db_index, key.as_bytes());
+            let _order = crate::write_order::lock_key_for_walk(def.db_index, &key);
             let map = shard.read();
             let Some(inner) = map
                 .peek(&key)
@@ -1135,7 +1137,7 @@ pub fn walk_documents(
                 continue;
             };
             crate::aof::failpoint("index-walk-read");
-            visit(&key, inner);
+            visit(&crate::key_bytes::text_of(&key), inner);
         }
     }
 }

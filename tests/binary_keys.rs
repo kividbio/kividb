@@ -473,3 +473,272 @@ fn migrate_does_not_skip_a_key_that_is_not_text() {
     assert_eq!(c.scan_all(None), vec![A.to_vec()]);
     assert_eq!(destination.conn().dbsize(), 0);
 }
+
+// ── Names: the search indexes and the time series ─────────────────────────────
+//
+// What keeps a key as text keeps its `key_bytes::text_of`, and goes back to
+// the key with `bytes_of`. Two kinds of key are what tells a half-applied
+// convention from a whole one: a key that is not text, and a UTF-8 key with
+// a character of the escape's own block (U+F780 – U+F7FF) in it, which the
+// escape writes in another form.
+
+/// A UTF-8 key with a character of the escape's block in it.
+const PUA: &str = "doc:\u{F7C3}x";
+/// A key that is not text.
+const RAW: &[u8] = b"doc:\xff\xfe";
+
+/// A hash: its key and its fields.
+type Hash<'a> = (&'a [u8], &'a [(&'a [u8], &'a [u8])]);
+
+/// An RDB file of hashes in database 0.
+fn rdb_hashes(keys: &[Hash<'_>]) -> Vec<u8> {
+    let mut out = b"REDIS0011".to_vec();
+    out.push(0xFE);
+    out.extend_from_slice(&rdb_len(0));
+    for (key, fields) in keys {
+        out.push(4); // a hash
+        out.extend_from_slice(&rdb_str(key));
+        out.extend_from_slice(&rdb_len(fields.len()));
+        for (field, value) in *fields {
+            out.extend_from_slice(&rdb_str(field));
+            out.extend_from_slice(&rdb_str(value));
+        }
+    }
+    out.push(0xFF);
+    out.extend_from_slice(&[0u8; 8]);
+    out
+}
+
+fn f32s(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+/// The keys of an `FT.SEARCH … NOCONTENT` reply, sorted.
+fn found(reply: &V) -> Vec<Vec<u8>> {
+    let mut keys: Vec<Vec<u8>> = reply.arr()[1..]
+        .iter()
+        .map(|k| k.bytes().to_vec())
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// A key that is not text and a key with a character of the escape's block
+/// are indexed when the index is made (the walk over the keyspace) and when
+/// written, are found by a text query and by KNN, are answered with their
+/// own bytes, and still are after a restart.
+#[test]
+fn search_finds_documents_of_any_key() {
+    let near = f32s(&[1.0, 0.0]);
+    let far = f32s(&[0.0, 1.0]);
+    let file = rdb_hashes(&[
+        (RAW, &[(b"title", b"hello raw"), (b"vec", &near)]),
+        (PUA.as_bytes(), &[(b"title", b"hello pua"), (b"vec", &near)]),
+        (b"doc:plain", &[(b"title", b"other"), (b"vec", &far)]),
+    ]);
+    let mut server = preloaded(&file, &[]);
+    let mut c = server.conn();
+    let created = c.cmd(&[
+        b"FT.CREATE",
+        b"idx",
+        b"ON",
+        b"HASH",
+        b"PREFIX",
+        b"1",
+        b"doc:",
+        b"SCHEMA",
+        b"title",
+        b"TEXT",
+        b"vec",
+        b"VECTOR",
+        b"FLAT",
+        b"6",
+        b"TYPE",
+        b"FLOAT32",
+        b"DIM",
+        b"2",
+        b"DISTANCE_METRIC",
+        b"L2",
+    ]);
+    assert_eq!(created, V::Str(b"OK".to_vec()), "{}", server.log());
+    // Written after the index was made: indexed by the write.
+    let added = "doc:\u{F7C3}new";
+    c.cmd(&[
+        b"HSET",
+        added.as_bytes(),
+        b"title",
+        b"hello added",
+        b"vec",
+        &near,
+    ]);
+
+    let mut want: Vec<Vec<u8>> = vec![
+        RAW.to_vec(),
+        PUA.as_bytes().to_vec(),
+        added.as_bytes().to_vec(),
+    ];
+    want.sort();
+    let text = |c: &mut Conn| found(&c.cmd(&[b"FT.SEARCH", b"idx", b"hello", b"NOCONTENT"]));
+    let knn = |c: &mut Conn| {
+        found(&c.cmd(&[
+            b"FT.SEARCH",
+            b"idx",
+            b"*=>[KNN 3 @vec $q]",
+            b"PARAMS",
+            b"2",
+            b"q",
+            &near,
+            b"NOCONTENT",
+            b"DIALECT",
+            b"2",
+        ]))
+    };
+    eventually(20, "the walk to index the documents", || {
+        text(&mut c) == want
+    });
+    assert_eq!(knn(&mut c), want);
+
+    assert_eq!(c.cmd(&[b"SAVE"]).bytes(), b"OK");
+    drop(c);
+    server.restart();
+    let mut c = server.conn();
+    eventually(20, "the indexes after a restart", || text(&mut c) == want);
+    assert_eq!(knn(&mut c), want, "{}", server.log());
+}
+
+/// Time series named with a character of the escape's block: the label
+/// index finds them (TS.QUERYINDEX, TS.MRANGE), TS.QUERYLABELS checks a
+/// user's access to the key they are (`é` and U+F7C3 U+F7A9 are not the
+/// same key, though the escape could take them for the same bytes), and a
+/// compaction rule writes to its destination before and after a restart.
+#[test]
+fn time_series_of_any_name() {
+    let mut server = Server::start(&[]);
+    let mut c = server.conn();
+    let open = "\u{e9}1";
+    let secret = "\u{F7C3}\u{F7A9}secret";
+    for (key, kind) in [(open, "open"), (secret, "secret")] {
+        let reply = c.cmd(&[
+            b"TS.CREATE",
+            key.as_bytes(),
+            b"LABELS",
+            b"grp",
+            b"g",
+            b"kind",
+            kind.as_bytes(),
+        ]);
+        assert_eq!(reply, V::Str(b"OK".to_vec()));
+        assert_eq!(c.cmd(&[b"TS.ADD", key.as_bytes(), b"1", b"1"]).int(), 1);
+    }
+    let mut both = vec![open.as_bytes().to_vec(), secret.as_bytes().to_vec()];
+    both.sort();
+    let index = |c: &mut Conn| {
+        let reply = c.cmd(&[b"TS.QUERYINDEX", b"grp=g"]);
+        let mut keys: Vec<Vec<u8>> = reply.arr().iter().map(|k| k.bytes().to_vec()).collect();
+        keys.sort();
+        keys
+    };
+    let mrange = |c: &mut Conn| {
+        let reply = c.cmd(&[b"TS.MRANGE", b"-", b"+", b"FILTER", b"grp=g"]);
+        let mut keys: Vec<Vec<u8>> = reply
+            .arr()
+            .iter()
+            .map(|s| s.arr()[0].bytes().to_vec())
+            .collect();
+        keys.sort();
+        keys
+    };
+    assert_eq!(index(&mut c), both);
+    assert_eq!(mrange(&mut c), both);
+
+    // A user who may read `é*` reads the series of `é1`, and not the other.
+    assert_eq!(
+        c.cmd(&[
+            b"ACL",
+            b"SETUSER",
+            b"alice",
+            b"on",
+            b"nopass",
+            "~\u{e9}*".as_bytes(),
+            b"+@all"
+        ]),
+        V::Str(b"OK".to_vec())
+    );
+    let mut a = server.conn();
+    assert_eq!(a.cmd(&[b"AUTH", b"alice", b"x"]), V::Str(b"OK".to_vec()));
+    let values = a.cmd(&[b"TS.QUERYLABELS", b"VALUES", b"kind", b"FILTER", b"grp=g"]);
+    let values: Vec<&[u8]> = values.arr().iter().map(V::bytes).collect();
+    assert_eq!(
+        values,
+        [b"open".as_slice()],
+        "a user of ~\u{e9}* read the other series"
+    );
+
+    // A rule: its destination, and the compaction's source, by name.
+    let (src, dst) = ("\u{F7C3}src", "\u{F7C3}dst");
+    for key in [src, dst] {
+        assert_eq!(
+            c.cmd(&[b"TS.CREATE", key.as_bytes()]),
+            V::Str(b"OK".to_vec())
+        );
+    }
+    let rule = c.cmd(&[
+        b"TS.CREATERULE",
+        src.as_bytes(),
+        dst.as_bytes(),
+        b"AGGREGATION",
+        b"sum",
+        b"10",
+    ]);
+    assert_eq!(rule, V::Str(b"OK".to_vec()));
+    let add = |c: &mut Conn, at: &str| {
+        c.cmd(&[b"TS.ADD", src.as_bytes(), at.as_bytes(), b"1"])
+            .int()
+    };
+    add(&mut c, "1");
+    add(&mut c, "11");
+    let samples = |c: &mut Conn| {
+        c.cmd(&[b"TS.RANGE", dst.as_bytes(), b"-", b"+"])
+            .arr()
+            .len()
+    };
+    assert_eq!(samples(&mut c), 1);
+    let info = |c: &mut Conn, key: &str, field: &[u8]| {
+        let reply = c.cmd(&[b"TS.INFO", key.as_bytes()]);
+        let pairs = reply.arr().to_vec();
+        let at = pairs
+            .iter()
+            .position(|v| *v == V::Str(field.to_vec()))
+            .expect("field");
+        pairs[at + 1].clone()
+    };
+    assert_eq!(
+        info(&mut c, dst, b"sourceKey"),
+        V::Str(src.as_bytes().to_vec())
+    );
+    assert_eq!(
+        info(&mut c, src, b"rules").arr()[0].arr()[0],
+        V::Str(dst.as_bytes().to_vec())
+    );
+
+    assert_eq!(c.cmd(&[b"SAVE"]).bytes(), b"OK");
+    drop((c, a));
+    server.restart();
+    let mut c = server.conn();
+    assert_eq!(index(&mut c), both, "{}", server.log());
+    assert_eq!(mrange(&mut c), both);
+    add(&mut c, "21");
+    assert_eq!(
+        samples(&mut c),
+        2,
+        "the rule wrote elsewhere after the restart"
+    );
+    assert_eq!(
+        info(&mut c, dst, b"sourceKey"),
+        V::Str(src.as_bytes().to_vec())
+    );
+    assert_eq!(
+        info(&mut c, src, b"rules").arr()[0].arr()[0],
+        V::Str(dst.as_bytes().to_vec())
+    );
+}
