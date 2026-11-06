@@ -411,9 +411,13 @@ fn redis_rdb_files_with_bloom_filters_load() {
             );
         }
         assert_eq!(c.cmd(&["GET", "plain"]), b"$6\r\nstring\r\n", "{label}");
-        let ttl = String::from_utf8(c.cmd(&["TTL", "bf:small"])).unwrap();
-        let ttl: i64 = ttl.trim_start_matches(':').trim_end().parse().unwrap();
-        assert!(ttl > 99_000_000, "{label}: the TTL came across ({ttl})");
+        // The files were saved with `EXPIREAT bf:small 4102444800`, in 2100,
+        // so that the key does not run out.
+        assert_eq!(
+            c.cmd(&["PEXPIRETIME", "bf:small"]),
+            b":4102444800000\r\n",
+            "{label}: the TTL came across"
+        );
         // The filters keep working: a scaling one takes more, a full one
         // refuses.
         assert_eq!(c.cmd(&["BF.ADD", "bf:auto", "new-item-1"]), b":1\r\n");
