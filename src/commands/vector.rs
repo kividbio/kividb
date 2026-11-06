@@ -26,15 +26,39 @@ fn takes_index_name(name: &str) -> bool {
     )
 }
 
-/// Where `name`, a command that names an index or an alias of one, has it:
-/// for most, its first argument; `FT.ALIASADD` and `FT.ALIASUPDATE` name the
-/// index second, and `FT.CURSOR` after its subcommand.
-fn index_name_position(name: &str) -> Option<usize> {
+/// What a command is told of a name it gave that is another database's.
+#[derive(Clone, Copy)]
+enum Elsewhere {
+    /// An index (or an alias of one): `Index not found`.
+    Index,
+    /// The alias of `FT.ALIASDEL`: `Alias does not exist`.
+    Alias,
+    /// The alias of `FT.ALIASUPDATE`, which would be moved from another
+    /// database's index: `Alias already exists`, as `FT.ALIASADD` says.
+    AliasTaken,
+}
+
+/// The arguments of `name` that name an index or an alias of one, in the
+/// order they are checked: for most, the first; `FT.ALIASADD` and
+/// `FT.ALIASUPDATE` name the index second (and `FT.ALIASUPDATE` the alias
+/// first), `FT.CURSOR` and `FT.DEBUG COMPACT|POSTINGS|PAGE` after their
+/// subcommand.
+fn index_name_positions(name: &str, cmd: &[&[u8]]) -> &'static [(usize, Elsewhere)] {
     match name {
-        "FT.ALIASADD" | "FT.ALIASUPDATE" | "FT.CURSOR" => Some(2),
-        "FT.ALIASDEL" => Some(1),
-        _ if takes_index_name(name) => Some(1),
-        _ => None,
+        "FT.ALIASUPDATE" => &[(1, Elsewhere::AliasTaken), (2, Elsewhere::Index)],
+        "FT.ALIASADD" | "FT.CURSOR" => &[(2, Elsewhere::Index)],
+        "FT.ALIASDEL" => &[(1, Elsewhere::Alias)],
+        "FT.DEBUG"
+            if cmd.get(1).is_some_and(|sub| {
+                [&b"COMPACT"[..], b"POSTINGS", b"PAGE"]
+                    .iter()
+                    .any(|known| sub.eq_ignore_ascii_case(known))
+            }) =>
+        {
+            &[(2, Elsewhere::Index)]
+        }
+        _ if takes_index_name(name) => &[(1, Elsewhere::Index)],
+        _ => &[],
     }
 }
 
@@ -57,15 +81,18 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         return None;
     }
     // An index, or an alias, of another database is not there.
-    if let Some(given) = index_name_position(name).and_then(|at| ctx.cmd.get(at).copied())
-        && in_another_database(ctx, given)
-    {
-        let given = String::from_utf8_lossy(given);
-        return Some(resp_error(&if name == "FT.ALIASDEL" {
-            "ERR Alias does not exist".to_string()
-        } else {
-            crate::commands::search::no_such_index(&given)
-        }));
+    for &(at, elsewhere) in index_name_positions(name, &ctx.cmd) {
+        let Some(given) = ctx.cmd.get(at).copied() else {
+            continue;
+        };
+        if in_another_database(ctx, given) {
+            let given = String::from_utf8_lossy(given);
+            return Some(resp_error(&match elsewhere {
+                Elsewhere::Index => crate::commands::search::no_such_index(&given),
+                Elsewhere::Alias => "ERR Alias does not exist".to_string(),
+                Elsewhere::AliasTaken => "ERR Alias already exists".to_string(),
+            }));
+        }
     }
     // An alias is resolved here, once, for every command that takes an index
     // name: the handler then runs against the real index and never sees the

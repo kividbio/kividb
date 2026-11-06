@@ -599,6 +599,9 @@ fn an_index_is_seen_only_from_its_own_database() {
         (vec!["FT.ALIASADD", "al:one", "idx:zero"], "idx:zero"),
         (vec!["FT.ALIASUPDATE", "al:one", "al:zero"], "al:zero"),
         (vec!["FT.CURSOR", "READ", "idx:zero", "1"], "idx:zero"),
+        (vec!["FT.DEBUG", "POSTINGS", "idx:zero", "OFF"], "idx:zero"),
+        (vec!["FT.DEBUG", "PAGE", "idx:zero", "OFF"], "idx:zero"),
+        (vec!["FT.DEBUG", "COMPACT", "idx:zero", "t"], "idx:zero"),
         (vec!["FT.DROPINDEX", "idx:zero"], "idx:zero"),
         (vec!["FT.DROPINDEX", "idx:zero", "DD"], "idx:zero"),
     ] {
@@ -622,6 +625,13 @@ fn an_index_is_seen_only_from_its_own_database() {
             .as_array()[0]
             .as_int(),
         1
+    );
+    // Database 0's alias is not moved to this database's index: it used to
+    // be, and was then gone from database 0.
+    let reply = c.cmds(&["FT.ALIASUPDATE", "al:zero", "idx:one"]);
+    assert!(
+        matches!(&reply, RespValue::Error(e) if e == "ERR Alias already exists"),
+        "{reply:?}"
     );
 
     // Nothing above reached database 0's index, nor its alias.

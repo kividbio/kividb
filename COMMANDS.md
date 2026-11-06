@@ -368,7 +368,7 @@ KiviDB implements the RediSearch RESP command surface for vector similarity sear
 | `FT.DROPINDEX` | `FT.DROPINDEX index` | Delete an index definition; does not delete the underlying data keys |
 | `FT.ALTER` | `FT.ALTER index [SKIPINITIALSCAN] SCHEMA ADD field type [options ...]` | Add new fields to an existing index schema. TEXT/TAG/NUMERIC fields take effect immediately. VECTOR fields have a fresh live index provisioned and are backfilled from existing keys unless SKIPINITIALSCAN is given. Multiple VECTOR fields per index are supported; each is queryable by `@field_name` in KNN clauses |
 | `FT.INFO` | `FT.INFO index` | Return index metadata: name, type, prefixes, field schemas, field count. For indexes with HNSW fields, additionally returns `hnsw_live_count` / `hnsw_tombstone_count` / `hnsw_tombstone_ratio` / `hnsw_compaction_in_progress` (mirroring the first HNSW field for backwards compatibility) plus an `hnsw_indexes` nested array with per-field stats. With a TEXT field, `num_terms` (words seen), `num_records` (word, field and document triples) and what the TEXT index holds in bytes: `text_terms_bytes`, `text_postings_bytes`, `text_docs_bytes` |
-| `FT._LIST` | `FT._LIST` | Return a list of all index names |
+| `FT._LIST` | `FT._LIST` | Return the names of the selected database's indexes |
 | `FT.ALIASLIST` | `FT.ALIASLIST index` | The aliases that point to `index` (Redis 8.10) |
 | `FT.ALIASADD` | `FT.ALIASADD alias index` | Create an alias pointing to an existing index; AOF-logged |
 | `FT.ALIASDEL` | `FT.ALIASDEL alias` | Remove an alias; AOF-logged |
