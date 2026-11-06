@@ -520,7 +520,9 @@ fn himport_creates_hashes_from_a_prepared_fieldset() {
 #[test]
 fn hsetex_takes_its_ttl_as_an_option() {
     let mut c = conn();
-    let far = "99999999999"; // a Unix time in seconds, comfortably in the future
+    // A Unix time in seconds, comfortably in the future, and before the
+    // latest Redis lets a field have (2^46 - 1 ms, in 4199).
+    let far = "70000000000";
     assert_eq!(
         c.cmd(&[
             "HSETEX", "hx:k", "EXAT", far, "FIELDS", "2", "f1", "Hello", "f2", "World"
