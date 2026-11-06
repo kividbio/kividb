@@ -2501,6 +2501,10 @@ fn test_dropindex_dd_is_sent_as_a_del_of_each_document_then_the_drop() {
         Duration::from_secs(10),
         || replica.cmds(&["FT._LIST"]).as_array().is_empty(),
     );
+    // `FT._LIST` lists the selected database's indexes: database 0's went
+    // before database 3's.
+    assert!(replica.cmds(&["SELECT", "0"]).is_ok());
+    assert!(replica.cmds(&["FT._LIST"]).as_array().is_empty());
 }
 
 /// `commands` with each run of DELs made one, its keys in order: the

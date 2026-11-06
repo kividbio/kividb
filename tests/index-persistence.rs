@@ -2694,6 +2694,9 @@ fn dropindex_dd_is_logged_as_a_del_of_each_document_then_the_drop() {
         assert!(c.cmds(&["SELECT", "3"]).is_ok());
         assert_eq!(c.cmds(&["EXISTS", "d3:1"]).as_int(), 0);
         assert!(c.cmds(&["FT._LIST"]).as_array().is_empty());
+        // `FT._LIST` lists the selected database's indexes.
+        assert!(c.cmds(&["SELECT", "0"]).is_ok());
+        assert!(c.cmds(&["FT._LIST"]).as_array().is_empty());
     }
     send_shutdown_nosave(port2);
     let _ = wait_for_exit(&mut srv2, Duration::from_secs(8));

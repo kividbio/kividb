@@ -2766,6 +2766,12 @@ fn too_long() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "RDB string length out of range")
 }
 
+/// How many databases an RDB file may have keys in: the server's
+/// `databases`, set as it starts. A file with keys in a database past them
+/// is refused, naming it. It used to be loaded into database 0, merged with
+/// that database's keys and overwriting those of the same name (#477).
+pub static RDB_DATABASES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(16);
+
 // Unused by the binary, which wants the expiries; see `write_snapshot`.
 #[allow(dead_code)]
 pub fn load_redis_rdb(path: &str) -> io::Result<Vec<HashMap<String, KiviDBValue>>> {
@@ -2826,9 +2832,22 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
             0xFE => {
                 // Database selector
                 let (db_num, _) = rdb_read_length(&mut r)?;
-                current_db = db_num as usize;
+                let databases = RDB_DATABASES.load(std::sync::atomic::Ordering::Relaxed);
+                current_db = usize::try_from(db_num)
+                    .ok()
+                    .filter(|&db| db < databases)
+                    .ok_or_else(|| {
+                        rdb_invalid(format!(
+                            "the file has keys in database {db_num}, and this server has \
+                             {databases} databases (0 to {}): start it with databases {} or \
+                             more",
+                            databases - 1,
+                            db_num.saturating_add(1)
+                        ))
+                    })?;
                 if current_db >= result.len() {
-                    current_db = 0;
+                    result.resize_with(current_db + 1, HashMap::new);
+                    expiries.resize_with(current_db + 1, HashMap::new);
                 }
             }
             0xFB => {
