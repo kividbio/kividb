@@ -58,6 +58,7 @@ mod lua {
 // `purge_allocator` after it swaps the old dataset out; the MEMORY subcommand
 // handlers themselves stay internal.
 pub(crate) mod memory;
+mod memory_layout;
 mod pubsub;
 pub(crate) mod search;
 pub(crate) mod search_tools;
