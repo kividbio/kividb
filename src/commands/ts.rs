@@ -13,7 +13,6 @@ use crate::commands::ts_query;
 use crate::resp::write::{
     resp_array, resp_bulk_str, resp_error, resp_integer, resp_null_bulk, resp_simple,
 };
-use crate::store::Key;
 use crate::store::ValueRef;
 use crate::store::{self, SharedTsIndex, Store};
 use crate::types::{CompactionRule, DuplicatePolicy, KiviDBValue, TsAggregation, TsInner};
@@ -271,7 +270,7 @@ pub(super) fn keys_matching_filters(
                 let map = read_lock!(shard);
                 for (k, v) in map.iter() {
                     if matches!(v, ValueRef::TimeSeries(_)) {
-                        all.push(crate::store::key_text(k).to_owned());
+                        all.push(crate::key_bytes::text_of(k).into_owned());
                     }
                 }
             }
@@ -312,7 +311,7 @@ fn series_for_append(ctx: &Ctx, key: &str) -> Result<(Series, bool), Vec<u8>> {
             let mut fresh = TsInner::new();
             fresh.duplicate_policy = DuplicatePolicy::server_default();
             let series: Series = Arc::new(RwLock::new(fresh));
-            map.insert(Key::from(key), KiviDBValue::TimeSeries(Arc::clone(&series)));
+            map.insert(key, KiviDBValue::TimeSeries(Arc::clone(&series)));
             Ok((series, true))
         }
     }
@@ -451,10 +450,7 @@ fn ts_create(ctx: &mut Ctx) -> Option<Vec<u8>> {
         ts.labels.insert(lk.clone(), lv.clone());
     }
 
-    map.insert(
-        Key::from(&*key),
-        KiviDBValue::TimeSeries(Arc::new(RwLock::new(ts))),
-    );
+    map.insert(&*key, KiviDBValue::TimeSeries(Arc::new(RwLock::new(ts))));
     drop(map);
 
     update_label_index(ctx.ts_index, &key, &ahash::AHashMap::new(), &labels);

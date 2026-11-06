@@ -301,7 +301,7 @@ fn keys_on_two_shards() -> (String, String) {
 }
 
 fn counter(snapshot: &kividb::snapshot::LoadedSnapshot, key: &str) -> i64 {
-    match snapshot.dbs[0].get(key) {
+    match snapshot.dbs[0].get(key.as_bytes()) {
         Some(kividb::types::KiviDBValue::String(b)) => {
             std::str::from_utf8(b.as_ref()).unwrap().parse().unwrap()
         }

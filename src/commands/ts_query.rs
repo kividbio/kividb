@@ -1310,7 +1310,9 @@ pub(super) fn ts_querylabels(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let keys = keys_matching_filters(ctx.store, *ctx.selected_db, ctx.ts_index, &filters);
     let mut found: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for key in keys {
-        if restricted.is_some_and(|user| !crate::acl::may_read_key(user, &key)) {
+        if restricted
+            .is_some_and(|user| !crate::acl::may_read_key(user, &crate::key_bytes::bytes_of(&key)))
+        {
             continue;
         }
         let Ok(Some(series)) = series_at(ctx, &key) else {

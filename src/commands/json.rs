@@ -3,7 +3,6 @@ use crate::commands::helpers::*;
 use crate::commands::json_path::{self, Location, Query, Step};
 use crate::resp::write::*;
 use crate::store;
-use crate::store::Key;
 use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::{read_lock, write_lock};
@@ -279,10 +278,7 @@ fn set_key(
         None if !query.is_root() => Err(resp_error("ERR new objects must be created at the root")),
         None if xx => Ok(false),
         None => {
-            map.insert(
-                Key::from(key),
-                KiviDBValue::Json(Arc::new(RwLock::new(value.clone()))),
-            );
+            map.insert(key, KiviDBValue::Json(Arc::new(RwLock::new(value.clone()))));
             Ok(true)
         }
     }

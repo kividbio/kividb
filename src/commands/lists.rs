@@ -5,7 +5,6 @@ use crate::commands::list_move;
 use crate::keyspace_events::{KS_LIST, notify};
 use crate::resp::write::*;
 use crate::store;
-use crate::store::Key;
 use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::{read_lock, write_lock};
@@ -68,7 +67,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let list = match map.get(key) {
                 None => {
                     let l = Arc::new(RwLock::new(VecDeque::new()));
-                    map.insert(Key::from(key), KiviDBValue::List(Arc::clone(&l)));
+                    map.insert(key, KiviDBValue::List(Arc::clone(&l)));
                     l
                 }
                 Some(ValueRef::List(l)) => Arc::clone(l),
@@ -115,7 +114,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let list = match map.get(key) {
                 None => {
                     let l = Arc::new(RwLock::new(VecDeque::new()));
-                    map.insert(Key::from(key), KiviDBValue::List(Arc::clone(&l)));
+                    map.insert(key, KiviDBValue::List(Arc::clone(&l)));
                     l
                 }
                 Some(ValueRef::List(l)) => Arc::clone(l),

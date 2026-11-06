@@ -280,15 +280,6 @@ impl Default for ShardLock {
 /// [`crate::key_bytes`].
 pub type Key = crate::key_bytes::KeyBytes;
 
-/// A key from the keyspace as text, for what still keeps keys as text
-/// (#437). Every key is UTF-8 until the commands take others: they refuse
-/// them, and so does loading a snapshot. Checked all the same, so that a
-/// key that is not text stops the server rather than being misread.
-#[inline]
-pub fn key_text(key: &[u8]) -> &str {
-    std::str::from_utf8(key).expect("a key that is not UTF-8")
-}
-
 pub type Shard = Arc<ShardLock>;
 pub type Db = Arc<Vec<Shard>>;
 pub type Store = Arc<Vec<Db>>;
@@ -467,7 +458,7 @@ pub fn rebuild_ts_label_index(store: &Store, ts: &SharedTsIndex) {
                         index
                             .entry(format!("{label}={label_value}"))
                             .or_default()
-                            .insert(key_text(key).to_owned());
+                            .insert(crate::key_bytes::text_of(key).into_owned());
                     }
                 }
             }

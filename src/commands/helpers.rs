@@ -500,9 +500,9 @@ fn expire_batch(
                 if let Some(value) = values.remove_if_due(key, now) {
                     // Announced before the shard is let go of (see
                     // `delete_key_if_expired`).
-                    crate::keyspace_events::notify_expired(store, db, crate::store::key_text(key));
+                    crate::keyspace_events::notify_expired(store, db, key);
                     if marks {
-                        crate::vector::mark_leaving(id, db, crate::store::key_text(key));
+                        crate::vector::mark_leaving(id, db, key);
                     }
                     freed.push(value);
                     gone.push(key);
@@ -511,7 +511,7 @@ fn expire_batch(
         }
     }
     if let Some(told) = told {
-        told.propagate(db, gone.iter().map(|key| crate::store::key_text(key)));
+        told.propagate(db, gone.iter().map(|key| key.as_bytes()));
     }
     drop(ordered);
     drop(unobserved);
@@ -519,7 +519,6 @@ fn expire_batch(
     drop(freed);
     let count = gone.len();
     for key in gone {
-        let key = crate::store::key_text(key);
         crate::stats::record_expired();
         crate::stats::EXPIRED_KEYS_ACTIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         crate::watch::expired(store, db, key);
@@ -565,7 +564,7 @@ fn unobserved_order<'a>(
 
 /// Lazy TTL: delete an expired key before a read and return true if it was removed.
 #[inline]
-pub fn lazy_expire_key(store: &Store, db: usize, key: &str) -> bool {
+pub fn lazy_expire_key(store: &Store, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) -> bool {
     if is_expired(store, db, key) {
         delete_key_if_expired(store, db, key)
     } else {
@@ -583,7 +582,7 @@ pub fn lazy_expire_key(store: &Store, db: usize, key: &str) -> bool {
 /// gone, and writes are held while writes are paused, so they never meet a
 /// key left this way.
 #[inline]
-pub fn expire_on_read(store: &Store, db: usize, key: &str) -> bool {
+pub fn expire_on_read(store: &Store, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) -> bool {
     if crate::pause::expiry_deferred() {
         return true;
     }
@@ -592,7 +591,7 @@ pub fn expire_on_read(store: &Store, db: usize, key: &str) -> bool {
 
 /// [`lazy_expire_key`] for a read: see [`expire_on_read`].
 #[inline]
-pub fn lazy_expire_on_read(store: &Store, db: usize, key: &str) -> bool {
+pub fn lazy_expire_on_read(store: &Store, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) -> bool {
     is_expired(store, db, key) && expire_on_read(store, db, key)
 }
 
@@ -860,7 +859,7 @@ pub fn take_key(
 /// master's `DEL` (see `expiry`). Unless that master sends none (before
 /// 1.1.3): then the replica deletes the key, and tells no one.
 #[inline]
-pub fn delete_key_if_expired(store: &Store, db: usize, key: &str) -> bool {
+pub fn delete_key_if_expired(store: &Store, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) -> bool {
     // Loading, or applying the master's stream: a key's time does not make
     // it gone. The `DEL` that follows does.
     if crate::expiry::held() {
@@ -882,11 +881,11 @@ pub fn delete_key_if_expired(store: &Store, db: usize, key: &str) -> bool {
     let indexes = crate::vector::indexes_of(id, db);
     let ordered = told
         .as_ref()
-        .map(|_| crate::expiry::order(db, std::iter::once(key.as_bytes())));
+        .map(|_| crate::expiry::order(db, std::iter::once(key.as_ref())));
     // Unobserved, the key's order all the same: a write that read the key
     // before it was due must not write its old value back after it is gone
     // (#271).
-    let unobserved = unobserved_order(told.is_none(), db, std::iter::once(key.as_bytes()));
+    let unobserved = unobserved_order(told.is_none(), db, std::iter::once(key.as_ref()));
     // `expired` is announced before the shard is let go of: a command that
     // then finds the key gone, and writes it anew, announces its own event
     // after it, as in Redis. Announced once the lock was let go of, the
@@ -905,7 +904,7 @@ pub fn delete_key_if_expired(store: &Store, db: usize, key: &str) -> bool {
     };
     let gone = removed.is_some();
     if gone && let Some(told) = &told {
-        told.propagate(db, [key]);
+        told.propagate(db, [key.as_ref()]);
     }
     drop(ordered);
     drop(unobserved);
@@ -1140,7 +1139,7 @@ pub fn scan_page<T>(
 /// `[MATCH pattern] [COUNT count]` and whatever else a scan command takes.
 #[derive(Default)]
 pub struct ScanOptions {
-    pub pattern: Option<String>,
+    pub pattern: Option<Vec<u8>>,
     pub count: usize,
     /// `SCAN … TYPE type`, in lower case.
     pub of_type: Option<String>,
@@ -1174,7 +1173,7 @@ pub fn scan_arguments(
         let value = cmd.get(i + 1);
         match (word.as_str(), value) {
             ("MATCH", Some(pattern)) => {
-                options.pattern = Some(String::from_utf8_lossy(pattern).into_owned());
+                options.pattern = Some(pattern.to_vec());
                 i += 2;
             }
             ("COUNT", Some(count)) => {
@@ -1286,129 +1285,9 @@ mod scan_tests {
     }
 }
 
-// ── Names that are not text ───────────────────────────────────────────────────
-//
-// A hash keeps its fields by name, as `String`s. Redis's field names are
-// bytes: any bytes. So that a hash can hold them all, a name that is not
-// valid UTF-8 is kept in a form that is — each byte that is not part of
-// valid text becomes one character from a block set aside for it (U+F780 –
-// U+F7FF, private use: byte 0x80 is U+F780, 0xFF is U+F7FF) — and is turned
-// back on the way out. Ordinary text is itself, both ways, and costs one
-// scan. Text that happens to use those characters has their bytes put in
-// the same form, so that nothing can be mistaken for something else.
-
-const BYTE_BLOCK: u32 = 0xF700;
-
-fn in_byte_block(c: char) -> bool {
-    (0xF780..=0xF7FF).contains(&(c as u32))
-}
-
-fn push_as_block(out: &mut String, bytes: &[u8]) {
-    for byte in bytes {
-        // 0x80..=0xFF only: bytes below that are text wherever they are.
-        match char::from_u32(BYTE_BLOCK + *byte as u32) {
-            Some(c) if *byte >= 0x80 => out.push(c),
-            _ => out.push(*byte as char),
-        }
-    }
-}
-
-/// The `String` a name of any bytes is kept as.
-pub fn name_from_bytes(raw: &[u8]) -> std::borrow::Cow<'_, str> {
-    if let Ok(text) = std::str::from_utf8(raw)
-        && !text.contains(in_byte_block)
-    {
-        return std::borrow::Cow::Borrowed(text);
-    }
-    let mut out = String::with_capacity(raw.len() + 8);
-    let mut rest = raw;
-    while !rest.is_empty() {
-        let (text, bad) = match std::str::from_utf8(rest) {
-            Ok(text) => (text, 0),
-            Err(e) => {
-                let good = e.valid_up_to();
-                // The bytes of one broken sequence, or everything left.
-                let bad = e.error_len().unwrap_or(rest.len() - good);
-                // Valid up to `good`, by the error's own account.
-                (std::str::from_utf8(&rest[..good]).unwrap_or(""), bad)
-            }
-        };
-        for c in text.chars() {
-            if in_byte_block(c) {
-                let mut utf8 = [0u8; 4];
-                push_as_block(&mut out, c.encode_utf8(&mut utf8).as_bytes());
-            } else {
-                out.push(c);
-            }
-        }
-        let consumed = text.len();
-        push_as_block(&mut out, &rest[consumed..consumed + bad]);
-        rest = &rest[consumed + bad..];
-    }
-    std::borrow::Cow::Owned(out)
-}
-
-/// The bytes a kept name stands for.
-pub fn name_to_bytes(name: &str) -> std::borrow::Cow<'_, [u8]> {
-    if !name.contains(in_byte_block) {
-        return std::borrow::Cow::Borrowed(name.as_bytes());
-    }
-    let mut out = Vec::with_capacity(name.len());
-    for c in name.chars() {
-        if in_byte_block(c) {
-            out.push((c as u32 - BYTE_BLOCK) as u8);
-        } else {
-            let mut utf8 = [0u8; 4];
-            out.extend_from_slice(c.encode_utf8(&mut utf8).as_bytes());
-        }
-    }
-    std::borrow::Cow::Owned(out)
-}
-
-#[cfg(test)]
-mod name_tests {
-    use super::{name_from_bytes, name_to_bytes};
-
-    #[test]
-    fn any_bytes_survive_the_round_trip() {
-        let mut cases: Vec<Vec<u8>> = vec![
-            b"".to_vec(),
-            b"plain".to_vec(),
-            "caf\u{e9} \u{1F600}".as_bytes().to_vec(),
-            vec![0xff],
-            vec![0x80, 0x00, 0x7f, 0xfe],
-            b"abc\xc3".to_vec(),                    // a sequence cut short
-            b"\xe2\x82 tail".to_vec(),              // and one cut in the middle
-            "\u{F780}\u{F7FF}".as_bytes().to_vec(), // the block's own characters
-            (0u8..=255).collect(),
-        ];
-        // And a few thousand pseudo-random ones.
-        let mut state = 0x9E37_79B9_7F4A_7C15u64;
-        for len in 0..2000usize {
-            let bytes: Vec<u8> = (0..len % 37)
-                .map(|_| {
-                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-                    (state >> 56) as u8
-                })
-                .collect();
-            cases.push(bytes);
-        }
-        let mut seen = std::collections::HashMap::new();
-        for raw in cases {
-            let name = name_from_bytes(&raw).into_owned();
-            assert_eq!(name_to_bytes(&name).as_ref(), raw.as_slice(), "{raw:?}");
-            // Two different inputs never share a name.
-            if let Some(other) = seen.insert(name.clone(), raw.clone()) {
-                assert_eq!(other, raw, "{name:?}");
-            }
-        }
-        // Text is itself.
-        assert!(matches!(
-            name_from_bytes(b"field"),
-            std::borrow::Cow::Borrowed("field")
-        ));
-    }
-}
+// The escape of names that are not text lives in `key_bytes` (`text_of`,
+// `bytes_of`): keys use it too, wherever something keeps them as text.
+pub use crate::key_bytes::{bytes_of as name_to_bytes, text_of as name_from_bytes};
 
 #[cfg(test)]
 mod whole_score_tests {
@@ -1450,7 +1329,7 @@ mod active_expiry_tests {
     use super::*;
     use crate::shared_bytes::SharedBytes;
 
-    fn put(store: &Store, key: &str, at: SystemTime) {
+    fn put(store: &Store, key: &(impl AsRef<[u8]> + ?Sized), at: SystemTime) {
         store_value(
             store,
             0,
@@ -1515,6 +1394,27 @@ mod active_expiry_tests {
         );
         let after = crate::stats::EXPIRED_KEYS_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
         assert!(after - before >= 20_000);
+    }
+
+    /// Keys that are not text expire as any other: the cycle stopped on the
+    /// first one, with the key taken from the store and nothing said of it,
+    /// when it made a `&str` of each (#437).
+    #[test]
+    fn keys_that_are_not_text_expire() {
+        let store = store::new_store(1);
+        let index: IndexStore = Default::default();
+        let past = SystemTime::now() - Duration::from_secs(5);
+        let names: [&[u8]; 3] = [b"\xff\x00k", b"\xfe", b"text"];
+        for key in names {
+            put(&store, key, past);
+        }
+        let now = now_ms();
+        for key in names {
+            let shard = store::shard_index(store[0].len(), key);
+            expire_batch(&store, &index, 0, shard, &[Key::new(key)], now, None);
+        }
+        assert_eq!(keys(&store), 0);
+        assert_eq!(times(&store), 0);
     }
 
     /// A key whose time was put back after the cycle found it due is kept,

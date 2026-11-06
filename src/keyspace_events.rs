@@ -328,7 +328,7 @@ fn hub_for_id(id: usize) -> Option<crate::pubsub::PubSubHub> {
 /// Writes put new values over `keys`, which were past their time, in
 /// database `db` of the store at `store`: `expired` for each, as Redis
 /// announces a key a write finds expired, before the write's own events.
-pub fn written_over_expired(store: usize, db: usize, keys: &[String]) {
+pub fn written_over_expired(store: usize, db: usize, keys: &[crate::store::Key]) {
     if KS_FLAGS.load(Ordering::Relaxed) & KS_EXPIRED == 0 {
         return;
     }
@@ -344,7 +344,7 @@ pub fn written_over_expired(store: usize, db: usize, keys: &[String]) {
 /// Nothing was published for this before — not when a read found the key
 /// expired, and not when the background task removed it.
 #[inline]
-pub fn notify_expired(store: &crate::store::Store, db: usize, key: &str) {
+pub fn notify_expired(store: &crate::store::Store, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) {
     if KS_FLAGS.load(Ordering::Relaxed) & KS_EXPIRED == 0 {
         return;
     }
@@ -359,7 +359,7 @@ pub fn notify(
     db: usize,
     type_flag: u32,
     event: &str,
-    key: &str,
+    key: &(impl AsRef<[u8]> + ?Sized),
 ) {
     let flags = KS_FLAGS.load(Ordering::Relaxed);
     if flags == 0 {
@@ -368,18 +368,21 @@ pub fn notify(
     if flags & type_flag == 0 {
         return;
     }
+    let key = key.as_ref();
     if flags & KS_KEYSPACE != 0 {
-        let ch = format!("__keyspace@{}__:{}", db, key);
+        // Any bytes: the channel is the prefix and the key as it is.
+        let mut ch = format!("__keyspace@{db}__:").into_bytes();
+        ch.extend_from_slice(key);
         publish(pubsub, ch, Arc::from(event.as_bytes()));
     }
     if flags & KS_KEYEVENT != 0 {
         let ch = format!("__keyevent@{}__:{}", db, event);
-        publish(pubsub, ch, Arc::from(key.as_bytes()));
+        publish(pubsub, ch.into_bytes(), Arc::from(key));
     }
 }
 
 /// A channel and what is published on it.
-type Held = Vec<(String, Arc<[u8]>)>;
+type Held = Vec<(Vec<u8>, Arc<[u8]>)>;
 
 thread_local! {
     /// Events a command announced while they were held back (see [`hold`]).
@@ -387,7 +390,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-fn publish(pubsub: &crate::pubsub::PubSubHub, channel: String, payload: Arc<[u8]>) {
+fn publish(pubsub: &crate::pubsub::PubSubHub, channel: Vec<u8>, payload: Arc<[u8]>) {
     let now = HELD.with_borrow_mut(|held| match held {
         Some(held) => {
             held.push((channel, payload));
@@ -448,9 +451,16 @@ fn subkey_messages(
     flags: u32,
     db: usize,
     event: &str,
-    key: &str,
+    key: &[u8],
     subkeys: &[&[u8]],
-) -> Vec<(String, Vec<u8>)> {
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    // A channel: `head`, the key, then `tail`.
+    let channel = |head: String, tail: &[u8]| {
+        let mut ch = head.into_bytes();
+        ch.extend_from_slice(key);
+        ch.extend_from_slice(tail);
+        ch
+    };
     let mut out = Vec::new();
     if subkeys.is_empty() {
         return out;
@@ -464,30 +474,37 @@ fn subkey_messages(
         let mut payload = event.as_bytes().to_vec();
         payload.push(b'|');
         payload.extend_from_slice(&list);
-        out.push((format!("__subkeyspace@{db}__:{key}"), payload));
+        out.push((channel(format!("__subkeyspace@{db}__:"), b""), payload));
     }
     if flags & KS_SUBKEYEVENT != 0 {
         // `__subkeyevent@<db>__:<event>` → `<key_len>:<key>|<subkeys>`
-        let mut payload = format!("{}:{key}|", key.len()).into_bytes();
+        let mut payload = format!("{}:", key.len()).into_bytes();
+        payload.extend_from_slice(key);
+        payload.push(b'|');
         payload.extend_from_slice(&list);
-        out.push((format!("__subkeyevent@{db}__:{event}"), payload));
+        out.push((
+            format!("__subkeyevent@{db}__:{event}").into_bytes(),
+            payload,
+        ));
     }
-    if flags & KS_SUBKEYSPACEITEM != 0 && !key.contains('\n') {
+    if flags & KS_SUBKEYSPACEITEM != 0 && !key.contains(&b'\n') {
         // `__subkeyspaceitem@<db>__:<key>\n<subkey>` → `<event>`, one per subkey.
         // Newline separates key from subkey, so a key containing one is skipped.
         for subkey in subkeys {
+            let mut tail = vec![b'\n'];
+            tail.extend_from_slice(subkey);
             out.push((
-                format!(
-                    "__subkeyspaceitem@{db}__:{key}\n{}",
-                    String::from_utf8_lossy(subkey)
-                ),
+                channel(format!("__subkeyspaceitem@{db}__:"), &tail),
                 event.as_bytes().to_vec(),
             ));
         }
     }
     if flags & KS_SUBKEYSPACEEVENT != 0 && unambiguous {
         // `__subkeyspaceevent@<db>__:<event>|<key>` → `<subkeys>`
-        out.push((format!("__subkeyspaceevent@{db}__:{event}|{key}"), list));
+        out.push((
+            channel(format!("__subkeyspaceevent@{db}__:{event}|"), b""),
+            list,
+        ));
     }
     out
 }
@@ -500,7 +517,7 @@ pub fn notify_subkeys<'a>(
     pubsub: &crate::pubsub::PubSubHub,
     db: usize,
     event: &str,
-    key: &str,
+    key: &(impl AsRef<[u8]> + ?Sized),
     subkeys: impl IntoIterator<Item = &'a [u8]>,
 ) {
     let flags = KS_FLAGS.load(Ordering::Relaxed);
@@ -508,7 +525,7 @@ pub fn notify_subkeys<'a>(
         return;
     }
     let subkeys: Vec<&[u8]> = subkeys.into_iter().collect();
-    for (channel, payload) in subkey_messages(flags, db, event, key, &subkeys) {
+    for (channel, payload) in subkey_messages(flags, db, event, key.as_ref(), &subkeys) {
         pubsub.publish(&channel, Arc::from(payload));
     }
 }
@@ -519,9 +536,14 @@ mod tests {
 
     fn messages(flags: &str, event: &str, key: &str, subkeys: &[&str]) -> Vec<(String, String)> {
         let subkeys: Vec<&[u8]> = subkeys.iter().map(|s| s.as_bytes()).collect();
-        subkey_messages(parse_ks_flags(flags), 0, event, key, &subkeys)
+        subkey_messages(parse_ks_flags(flags), 0, event, key.as_bytes(), &subkeys)
             .into_iter()
-            .map(|(ch, payload)| (ch, String::from_utf8(payload).unwrap()))
+            .map(|(ch, payload)| {
+                (
+                    String::from_utf8(ch).unwrap(),
+                    String::from_utf8(payload).unwrap(),
+                )
+            })
             .collect()
     }
 
@@ -569,6 +591,17 @@ mod tests {
         // A subkey may contain the separators: the length says where it ends.
         let m = messages("S", "hset", "h", &["a,b|c"]);
         assert_eq!(m[0].1, "hset|5:a,b|c");
+    }
+
+    /// A key and a field of any bytes are in the channels as they are.
+    #[test]
+    fn subkey_channels_of_any_bytes() {
+        let key: &[u8] = b"\xff\x00k";
+        let field: &[u8] = b"\xfe";
+        let m = subkey_messages(parse_ks_flags("SIV"), 0, "hset", key, &[field]);
+        assert_eq!(m[0].0, b"__subkeyspace@0__:\xff\x00k".to_vec());
+        assert_eq!(m[1].0, b"__subkeyspaceitem@0__:\xff\x00k\n\xfe".to_vec());
+        assert_eq!(m[2].0, b"__subkeyspaceevent@0__:hset|\xff\x00k".to_vec());
     }
 
     #[test]

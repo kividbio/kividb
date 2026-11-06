@@ -18,7 +18,7 @@ use std::sync::Arc;
 /// Returned by `load_snapshot` — key-value data plus any index schemas that
 /// were embedded in the snapshot file.
 pub struct LoadedSnapshot {
-    pub dbs: Vec<HashMap<String, KiviDBValue>>,
+    pub dbs: Vec<HashMap<Key, KiviDBValue>>,
     /// Index schemas serialised by the previous run. May be empty when loading
     /// an older snapshot that predates index persistence.
     pub index_schemas: Vec<IndexSchema>,
@@ -35,7 +35,7 @@ pub struct LoadedSnapshot {
     /// Keys whose expiry had already passed at load time are dropped from
     /// `dbs` instead of appearing here. Empty maps for an image written before
     /// expiries were persisted.
-    pub expiries: Vec<HashMap<String, u64>>,
+    pub expiries: Vec<HashMap<Key, u64>>,
     /// The function libraries, as a `FUNCTION DUMP` payload: `None` for an
     /// image that holds none, or one written before they were kept. Loaded
     /// with [`restore_functions`].
@@ -43,7 +43,7 @@ pub struct LoadedSnapshot {
 }
 
 /// Per-database key expiries as absolute Unix milliseconds.
-pub type ExpiryMaps = Vec<HashMap<String, u64>>;
+pub type ExpiryMaps = Vec<HashMap<Key, u64>>;
 
 /// Magic opening the key-expiry section of a KDB image.
 const KDB_EXPIRY_MAGIC: &[u8; 8] = b"KIVIEX1\0";
@@ -624,14 +624,14 @@ pub fn write_kdb_entry(
                 write_bytes(w, inner.duplicate_policy.as_str().as_bytes())?;
                 w.write_all(&(inner.rules.len() as u32).to_le_bytes())?;
                 for rule in inner.rules.iter() {
-                    write_bytes(w, rule.dest_key.as_bytes())?;
+                    write_bytes(w, &crate::key_bytes::bytes_of(&rule.dest_key))?;
                     write_bytes(w, rule.aggregation.name().as_bytes())?;
                     w.write_all(&rule.bucket_duration.to_le_bytes())?;
                     w.write_all(&rule.align_timestamp.to_le_bytes())?;
                 }
             }
             if let Some(source) = &inner.source {
-                write_bytes(w, source.as_bytes())?;
+                write_bytes(w, &crate::key_bytes::bytes_of(source))?;
             }
         }
 
@@ -797,9 +797,9 @@ pub fn write_kdb_index_sections(
 /// capture of the keyspace writes the same layout from the entries it holds
 /// ([`FrozenDataset`]).
 #[cfg(test)]
-pub fn write_kdb_expiry_maps(
+pub fn write_kdb_expiry_maps<K: AsRef<[u8]>>(
     w: &mut impl Write,
-    per_db: &[HashMap<String, u64>],
+    per_db: &[HashMap<K, u64>],
 ) -> io::Result<()> {
     if per_db.iter().all(|m| m.is_empty()) {
         return Ok(());
@@ -809,7 +809,7 @@ pub fn write_kdb_expiry_maps(
     for map in per_db {
         w.write_all(&(map.len() as u32).to_le_bytes())?;
         for (key, at_ms) in map {
-            write_bytes(w, key.as_bytes())?;
+            write_bytes(w, key.as_ref())?;
             w.write_all(&at_ms.to_le_bytes())?;
         }
     }
@@ -829,9 +829,9 @@ fn unix_ms_now() -> u64 {
 /// A complete KDB image of owned values: header, databases, index sections.
 /// Values in hand have no time to live: a dataset with TTLs is written from
 /// a capture of the keyspace ([`freeze_dataset`]).
-pub fn write_kdb_image(
+pub fn write_kdb_image<K: AsRef<[u8]>>(
     w: &mut impl Write,
-    maps: &[HashMap<String, KiviDBValue>],
+    maps: &[HashMap<K, KiviDBValue>],
     index_store: Option<&crate::vector::IndexStore>,
 ) -> io::Result<()> {
     write_kdb_header(w, maps.len() as u32)?;
@@ -841,9 +841,10 @@ pub fn write_kdb_image(
         }
         write_kdb_db_end(w)?;
     }
+    // Functions before the best-effort index sections (see `write_to`).
+    write_kdb_functions_section(w, function_libraries().as_deref())?;
     write_kdb_index_sections(w, index_store)?;
     write_kdb_alias_section(w, index_store)?;
-    write_kdb_functions_section(w, function_libraries().as_deref())?;
     write_kdb_language_section(w, index_store)?;
     write_kdb_score_section(w, index_store)
 }
@@ -1403,9 +1404,9 @@ fn read_alias_section(r: &mut impl Read) -> io::Result<Vec<(String, String)>> {
 // Unused by the binary, which writes from a capture of the keyspace; the
 // library exports it and the snapshot tests are written against it.
 #[allow(dead_code)]
-pub fn write_snapshot(
+pub fn write_snapshot<K: AsRef<[u8]>>(
     path: &str,
-    maps: &[HashMap<String, KiviDBValue>],
+    maps: &[HashMap<K, KiviDBValue>],
     index_store: Option<&crate::vector::IndexStore>,
 ) -> io::Result<()> {
     let display_path = std::env::current_dir()
@@ -1549,7 +1550,7 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
     let mut ended = false;
 
     for _ in 0..db_count {
-        let mut map: HashMap<String, KiviDBValue> = HashMap::new();
+        let mut map: HashMap<Key, KiviDBValue> = HashMap::new();
 
         loop {
             // Read key length — if EOF here, we're done
@@ -1572,8 +1573,8 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
             }
 
             let kbuf = read_exactly(&mut r, klen)?;
-            let key = String::from_utf8(kbuf)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad key utf8"))?;
+            // Any bytes: a key need not be text.
+            let key = Key::from(kbuf);
 
             // Read type tag
             let mut tag = [0u8];
@@ -1636,7 +1637,7 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
                         let Some(score) = zset_score(f64::from_le_bytes(score_buf)) else {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
-                                format!("{NAN_SCORE} in key '{key}'"),
+                                format!("{NAN_SCORE} in key '{}'", String::from_utf8_lossy(&key)),
                             ));
                         };
                         ss.insert(Arc::from(member.as_slice()), score);
@@ -1693,8 +1694,8 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
                                 .ok_or_else(|| bad("duplicate policy"))?;
                         let rules = read_u32_le(&mut r)? as usize;
                         for _ in 0..rules {
-                            let dest_key = String::from_utf8(read_bytes(&mut r)?)
-                                .map_err(|_| bad("rule destination"))?;
+                            let dest_key =
+                                crate::key_bytes::text_of(&read_bytes(&mut r)?).into_owned();
                             let aggregation = crate::types::TsAggregation::parse(
                                 &String::from_utf8_lossy(&read_bytes(&mut r)?),
                             )
@@ -1712,10 +1713,8 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
                             });
                         }
                         if tag[0] == TAG_TIMESERIES_V3 {
-                            ts.source = Some(
-                                String::from_utf8(read_bytes(&mut r)?)
-                                    .map_err(|_| bad("source"))?,
-                            );
+                            ts.source =
+                                Some(crate::key_bytes::text_of(&read_bytes(&mut r)?).into_owned());
                         }
                     }
                     KiviDBValue::TimeSeries(Arc::new(parking_lot::RwLock::new(ts)))
@@ -1991,8 +1990,7 @@ fn read_expiry_section(r: &mut impl Read, expiries: &mut ExpiryMaps) -> io::Resu
     for db_idx in 0..db_count {
         let count = read_u32_le(r)? as usize;
         for _ in 0..count {
-            let key = String::from_utf8(read_bytes(r)?)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad expiry key utf8"))?;
+            let key = Key::from(read_bytes(r)?);
             let at_ms = read_u64_le(r)?;
             if let Some(map) = expiries.get_mut(db_idx) {
                 map.insert(key, at_ms);
@@ -2204,7 +2202,7 @@ fn write_hnsw_graph(
             }
         };
         w.write_all(&[1u8])?; // live node
-        write_bytes(w, node.key.as_bytes())?;
+        write_bytes(w, &crate::key_bytes::bytes_of(&node.key))?;
         w.write_all(&(vector.len() as u32).to_le_bytes())?;
         for f in vector {
             w.write_all(&f.to_le_bytes())?;
@@ -2281,8 +2279,7 @@ fn read_hnsw_graphs(
                 nodes.push(None);
             } else {
                 let key_bytes = read_bytes(r)?;
-                let key = String::from_utf8(key_bytes)
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad hnsw key"))?;
+                let key = crate::key_bytes::text_of(&key_bytes).into_owned();
 
                 let mut vlen_buf = [0u8; 4];
                 r.read_exact(&mut vlen_buf)?;
@@ -2455,17 +2452,13 @@ fn too_long() -> io::Error {
 
 // Unused by the binary, which wants the expiries; see `write_snapshot`.
 #[allow(dead_code)]
-pub fn load_redis_rdb(path: &str) -> io::Result<Vec<HashMap<String, KiviDBValue>>> {
+pub fn load_redis_rdb(path: &str) -> io::Result<Vec<HashMap<Key, KiviDBValue>>> {
     load_redis_rdb_with_expiry(path).map(|(dbs, _, _)| dbs)
 }
 
 /// What a Redis RDB file holds: its databases, their keys' expiries, and its
 /// function libraries as a Redis `FUNCTION DUMP` payload, if it has any.
-pub type RedisRdb = (
-    Vec<HashMap<String, KiviDBValue>>,
-    ExpiryMaps,
-    Option<Vec<u8>>,
-);
+pub type RedisRdb = (Vec<HashMap<Key, KiviDBValue>>, ExpiryMaps, Option<Vec<u8>>);
 
 /// Load a Redis RDB file, keeping each key's expiry.
 ///
@@ -2500,7 +2493,7 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
-    let mut result: Vec<HashMap<String, KiviDBValue>> = (0..16).map(|_| HashMap::new()).collect();
+    let mut result: Vec<HashMap<Key, KiviDBValue>> = (0..16).map(|_| HashMap::new()).collect();
     let mut expiries: ExpiryMaps = (0..16).map(|_| HashMap::new()).collect();
 
     let mut current_db = 0usize;
@@ -2591,7 +2584,9 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
             type_id => {
                 // A key: type byte already consumed
                 let key_bytes = rdb_read_string(&mut r)?;
-                let key = String::from_utf8_lossy(&key_bytes).into_owned();
+                // As the bytes they are: two keys that are not text used
+                // to become one (#446).
+                let key = Key::from(key_bytes);
                 let expiry_ms = pending_expiry.take();
                 if let Some(val) = rdb_read_value(&mut r, type_id)? {
                     match expiry_ms {
@@ -2707,7 +2702,7 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
             let mut hmap = crate::types::HashFields::default();
             for _ in 0..count {
                 let field_bytes = rdb_read_string(r)?;
-                let field = String::from_utf8_lossy(&field_bytes).into_owned();
+                let field = crate::key_bytes::text_of(&field_bytes).into_owned();
                 let val = rdb_read_string(r)?;
                 hmap.insert(field, Arc::from(val.as_slice()));
             }
@@ -2811,7 +2806,7 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
             rdb_decode_ziplist_into_list(&blob, &mut deque);
             let mut iter = deque.into_iter();
             while let (Some(field), Some(val)) = (iter.next(), iter.next()) {
-                let field_str = String::from_utf8_lossy(&field).into_owned();
+                let field_str = crate::key_bytes::text_of(&field).into_owned();
                 hmap.insert(field_str, val);
             }
             Ok(Some(KiviDBValue::Hash(Arc::new(parking_lot::RwLock::new(
@@ -3244,7 +3239,7 @@ fn rdb_read_hash_with_ttls(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBV
         if expires_at != 0 && expires_at <= now_ms {
             continue;
         }
-        let field = String::from_utf8_lossy(&field).into_owned();
+        let field = crate::key_bytes::text_of(&field).into_owned();
         if expires_at != 0 {
             let left = std::time::Duration::from_millis(expires_at - now_ms);
             inner.expiries.insert(field.clone(), now + left);
@@ -3843,7 +3838,7 @@ fn rdb_decode_listpack_into_hash(
     }
     let mut iter = elements.into_iter();
     while let (Some(field), Some(value)) = (iter.next(), iter.next()) {
-        let field = String::from_utf8_lossy(&field).into_owned();
+        let field = crate::key_bytes::text_of(&field).into_owned();
         hmap.insert(field, Arc::from(value.as_slice()));
     }
     Ok(())
@@ -3869,7 +3864,7 @@ fn rdb_decode_listpack_into_zset(blob: &[u8], ss: &mut SortedSetInner) -> io::Re
 
 /// Load a snapshot and populate the store directly.
 /// Handles the platform difference in RwLock::write() internally.
-pub fn restore_into_store(dbs: Vec<HashMap<String, KiviDBValue>>, store: &store::Store) -> usize {
+pub fn restore_into_store(dbs: Vec<HashMap<Key, KiviDBValue>>, store: &store::Store) -> usize {
     let mut total = 0usize;
     for (db_idx, map) in dbs.into_iter().enumerate() {
         if db_idx >= store.len() {
@@ -4164,10 +4159,15 @@ impl FrozenDataset {
             }
             write_kdb_db_end(out)?;
         }
-        out.write_all(&self.index_section)?;
+        // The times to live and the function libraries before the index
+        // sections: a reader that cannot read one of those (they are read
+        // best-effort) stops there, and what comes after it is lost. Read in
+        // any order (`read_image` finds each section by its magic), as 1.2.0
+        // reads them too.
         self.write_expiries(out, &timed_strings)?;
-        out.write_all(&self.alias_section)?;
         write_kdb_functions_section(out, self.functions.as_deref())?;
+        out.write_all(&self.index_section)?;
+        out.write_all(&self.alias_section)?;
         out.write_all(&self.language_section)?;
         out.write_all(&self.score_section)
     }
@@ -4890,7 +4890,7 @@ mod expiry_section_tests {
         KiviDBValue::String(SharedBytes::from(v.as_bytes()))
     }
 
-    fn image(maps: &[HashMap<String, KiviDBValue>], expiries: &[HashMap<String, u64>]) -> Vec<u8> {
+    fn image(maps: &[HashMap<Key, KiviDBValue>], expiries: &[HashMap<Key, u64>]) -> Vec<u8> {
         let mut out = Vec::new();
         write_kdb_header(&mut out, maps.len() as u32).unwrap();
         for map in maps {
@@ -4906,19 +4906,16 @@ mod expiry_section_tests {
     #[test]
     fn expiries_round_trip_per_database() {
         let far = unix_ms_now() + 3_600_000;
-        let db0 = HashMap::from([
-            ("a".to_string(), string("1")),
-            ("b".to_string(), string("2")),
-        ]);
-        let db1 = HashMap::from([("c".to_string(), string("3"))]);
+        let db0 = HashMap::from([(Key::from("a"), string("1")), (Key::from("b"), string("2"))]);
+        let db1 = HashMap::from([(Key::from("c"), string("3"))]);
         let exp = vec![
-            HashMap::from([("a".to_string(), far)]),
-            HashMap::from([("c".to_string(), far + 1)]),
+            HashMap::from([(Key::from("a"), far)]),
+            HashMap::from([(Key::from("c"), far + 1)]),
         ];
         let loaded = load_snapshot_from(&image(&[db0, db1], &exp)[..]).unwrap();
-        assert_eq!(loaded.expiries[0].get("a"), Some(&far));
-        assert_eq!(loaded.expiries[0].get("b"), None);
-        assert_eq!(loaded.expiries[1].get("c"), Some(&(far + 1)));
+        assert_eq!(loaded.expiries[0].get(&b"a"[..]), Some(&far));
+        assert_eq!(loaded.expiries[0].get(&b"b"[..]), None);
+        assert_eq!(loaded.expiries[1].get(&b"c"[..]), Some(&(far + 1)));
     }
 
     /// The whole point of persisting an expiry is that it is honoured: a key
@@ -4926,26 +4923,26 @@ mod expiry_section_tests {
     #[test]
     fn expired_keys_are_dropped_at_load() {
         let db0 = HashMap::from([
-            ("live".to_string(), string("1")),
-            ("dead".to_string(), string("2")),
+            (Key::from("live"), string("1")),
+            (Key::from("dead"), string("2")),
         ]);
         let exp = vec![HashMap::from([
-            ("live".to_string(), unix_ms_now() + 60_000),
-            ("dead".to_string(), unix_ms_now().saturating_sub(1)),
+            (Key::from("live"), unix_ms_now() + 60_000),
+            (Key::from("dead"), unix_ms_now().saturating_sub(1)),
         ])];
         let loaded = load_snapshot_from(&image(&[db0], &exp)[..]).unwrap();
-        assert!(loaded.dbs[0].contains_key("live"));
-        assert!(!loaded.dbs[0].contains_key("dead"));
-        assert!(!loaded.expiries[0].contains_key("dead"));
+        assert!(loaded.dbs[0].contains_key(&b"live"[..]));
+        assert!(!loaded.dbs[0].contains_key(&b"dead"[..]));
+        assert!(!loaded.expiries[0].contains_key(&b"dead"[..]));
     }
 
     /// An expiry for a key that is not in the image is dropped rather than
     /// installed, where it would attach to whatever later takes that name.
     #[test]
     fn orphan_expiries_are_not_installed() {
-        let db0 = HashMap::from([("a".to_string(), string("1"))]);
+        let db0 = HashMap::from([(Key::from("a"), string("1"))]);
         let exp = vec![HashMap::from([(
-            "ghost".to_string(),
+            Key::from("ghost"),
             unix_ms_now() + 60_000,
         )])];
         let loaded = load_snapshot_from(&image(&[db0], &exp)[..]).unwrap();
@@ -4962,24 +4959,24 @@ mod expiry_section_tests {
             std::time::Instant::now() - std::time::Duration::from_secs(1),
         );
         let db0 = HashMap::from([(
-            "hxgone".to_string(),
+            Key::from("hxgone"),
             KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(hash))),
         )]);
         let exp = vec![HashMap::from([(
-            "hxgone".to_string(),
+            Key::from("hxgone"),
             unix_ms_now() + 60_000,
         )])];
 
         let loaded = load_snapshot_from(&image(&[db0], &exp)[..]).unwrap();
-        assert!(!loaded.dbs[0].contains_key("hxgone"));
-        assert!(!loaded.expiries[0].contains_key("hxgone"));
+        assert!(!loaded.dbs[0].contains_key(&b"hxgone"[..]));
+        assert!(!loaded.expiries[0].contains_key(&b"hxgone"[..]));
     }
 
     /// An image with no expiry section — everything written before this
     /// section existed — still loads, with every key permanent as before.
     #[test]
     fn image_without_an_expiry_section_loads() {
-        let db0 = HashMap::from([("a".to_string(), string("1"))]);
+        let db0 = HashMap::from([(Key::from("a"), string("1"))]);
         let loaded = load_snapshot_from(&image(&[db0], &[])[..]).unwrap();
         assert_eq!(loaded.dbs[0].len(), 1);
         assert_eq!(loaded.expiries.len(), 1);
@@ -4990,8 +4987,8 @@ mod expiry_section_tests {
     /// the TTLs silently missing is worse than a loud error.
     #[test]
     fn a_truncated_expiry_section_fails_the_load() {
-        let db0 = HashMap::from([("a".to_string(), string("1"))]);
-        let exp = vec![HashMap::from([("a".to_string(), unix_ms_now() + 60_000)])];
+        let db0 = HashMap::from([(Key::from("a"), string("1"))]);
+        let exp = vec![HashMap::from([(Key::from("a"), unix_ms_now() + 60_000)])];
         let full = image(&[db0], &exp);
         assert!(load_snapshot_from(&full[..full.len() - 3]).is_err());
     }
@@ -5003,11 +5000,11 @@ mod expiry_section_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dump.kdb");
         let path_s = path.to_str().unwrap();
-        let first = vec![HashMap::from([("a".to_string(), string("1"))])];
+        let first = vec![HashMap::from([(Key::from("a"), string("1"))])];
         write_snapshot(path_s, &first, None).unwrap();
         let second = vec![HashMap::from([
-            ("a".to_string(), string("1")),
-            ("b".to_string(), string("2")),
+            (Key::from("a"), string("1")),
+            (Key::from("b"), string("2")),
         ])];
         write_snapshot(path_s, &second, None).unwrap();
 
@@ -5095,7 +5092,12 @@ mod field_option_tests {
         store.write().insert("bare".into(), bare);
 
         let mut image = Vec::new();
-        write_kdb_image(&mut image, &[HashMap::new()], Some(&store)).unwrap();
+        write_kdb_image(
+            &mut image,
+            &[HashMap::<Key, KiviDBValue>::new()],
+            Some(&store),
+        )
+        .unwrap();
         let loaded = load_snapshot_from(image.as_slice()).unwrap();
 
         let idx = loaded
@@ -5159,7 +5161,12 @@ mod field_option_tests {
             .write()
             .insert("en".into(), index("en", LanguageOptions::default()));
         let mut image = Vec::new();
-        write_kdb_image(&mut image, &[HashMap::new()], Some(&store)).unwrap();
+        write_kdb_image(
+            &mut image,
+            &[HashMap::<Key, KiviDBValue>::new()],
+            Some(&store),
+        )
+        .unwrap();
         let loaded = load_snapshot_from(image.as_slice()).unwrap();
         let of = |name: &str| {
             loaded
@@ -5180,7 +5187,12 @@ mod field_option_tests {
         empty
             .write()
             .insert("de".into(), index("de", LanguageOptions::default()));
-        write_kdb_image(&mut bare, &[HashMap::new()], Some(&empty)).unwrap();
+        write_kdb_image(
+            &mut bare,
+            &[HashMap::<Key, KiviDBValue>::new()],
+            Some(&empty),
+        )
+        .unwrap();
         assert!(!bare.windows(8).any(|w| w == KDB_LANGUAGE_MAGIC));
     }
 
@@ -5313,7 +5325,12 @@ mod field_option_tests {
         empty
             .write()
             .insert("plain".into(), index("plain", 1.0, None));
-        write_kdb_image(&mut bare, &[HashMap::new()], Some(&empty)).unwrap();
+        write_kdb_image(
+            &mut bare,
+            &[HashMap::<Key, KiviDBValue>::new()],
+            Some(&empty),
+        )
+        .unwrap();
         assert!(!bare.windows(8).any(|w| w == KDB_SCORE_MAGIC));
     }
 }
@@ -5323,10 +5340,10 @@ mod verify_tests {
     use super::*;
 
     fn image(keys: usize) -> Vec<u8> {
-        let mut map: HashMap<String, KiviDBValue> = HashMap::new();
+        let mut map: HashMap<Key, KiviDBValue> = HashMap::new();
         for i in 0..keys {
             map.insert(
-                format!("key:{i}"),
+                Key::from(format!("key:{i}")),
                 KiviDBValue::String(SharedBytes::from(format!("value {i}").as_bytes())),
             );
         }
@@ -5395,7 +5412,7 @@ mod function_section_tests {
         )
         .unwrap();
         write_kdb_db_end(&mut out).unwrap();
-        write_kdb_expiry_maps(&mut out, &[HashMap::new()]).unwrap();
+        write_kdb_expiry_maps(&mut out, &[HashMap::<Key, u64>::new()]).unwrap();
         write_kdb_functions_section(&mut out, libraries).unwrap();
         out
     }
@@ -5583,7 +5600,7 @@ mod nan_score_tests {
             &zset(&[("a", f64::NEG_INFINITY), ("b", f64::INFINITY), ("c", -0.0)]),
         );
         let loaded = load_snapshot_from(&good[..]).expect("infinite scores load");
-        match loaded.dbs[0].get("scores") {
+        match loaded.dbs[0].get(&b"scores"[..]) {
             Some(KiviDBValue::SortedSet(ss)) => assert_eq!(ss.read().len(), 3),
             _ => panic!("the sorted set is not there"),
         }

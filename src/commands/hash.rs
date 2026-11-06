@@ -4,7 +4,6 @@ use crate::commands::helpers::*;
 use crate::keyspace_events::{KS_HASH, notify, notify_subkeys};
 use crate::resp::write::*;
 use crate::store;
-use crate::store::Key;
 use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::{read_lock, write_lock};
@@ -791,11 +790,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     );
                     let mut items: Vec<Vec<u8>> = Vec::with_capacity(page.len() * 2);
                     for (f, v) in page {
-                        if options
-                            .pattern
-                            .as_deref()
-                            .is_some_and(|pat| !crate::commands::helpers::glob_match(pat, f))
-                        {
+                        if options.pattern.as_deref().is_some_and(|pat| {
+                            !crate::commands::helpers::glob_match_bytes(
+                                pat,
+                                &crate::commands::helpers::name_to_bytes(f),
+                            )
+                        }) {
                             continue;
                         }
                         items.push(resp_bulk(&crate::commands::helpers::name_to_bytes(f)));
@@ -1129,7 +1129,7 @@ fn write_hash<R>(
             let out = write(&mut fields, None);
             if !fields.is_empty() {
                 let hash = Arc::new(parking_lot::RwLock::new(fields));
-                map.insert(Key::from(key), KiviDBValue::Hash(hash));
+                map.insert(key, KiviDBValue::Hash(hash));
             }
             Ok(out)
         }
@@ -1396,7 +1396,7 @@ fn apply_field_expire_inner(
             drop(plain_w);
 
             let new_arc = Arc::new(RwLock::new(new_inner));
-            map.insert(Key::from(key), KiviDBValue::HashEx(Arc::clone(&new_arc)));
+            map.insert(key, KiviDBValue::HashEx(Arc::clone(&new_arc)));
 
             apply_to_hashex(&new_arc, fields, new_exp, flag, is_past)
         }
@@ -1911,7 +1911,7 @@ fn run_hgetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 new_inner.fields = std::mem::take(&mut *plain_w);
                 drop(plain_w);
                 let new_arc = Arc::new(parking_lot::RwLock::new(new_inner));
-                wmap.insert(Key::from(&*key), KiviDBValue::HashEx(Arc::clone(&new_arc)));
+                wmap.insert(&*key, KiviDBValue::HashEx(Arc::clone(&new_arc)));
                 drop(wmap);
                 Some(resp_array(hgetex_apply(
                     ctx, &key, &new_arc, &fields, action, resp,
@@ -2389,7 +2389,7 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
             new_inner.fields = std::mem::take(&mut *plain_w);
             drop(plain_w);
             let new_arc = Arc::new(parking_lot::RwLock::new(new_inner));
-            map.insert(Key::from(&*key), KiviDBValue::HashEx(Arc::clone(&new_arc)));
+            map.insert(&*key, KiviDBValue::HashEx(Arc::clone(&new_arc)));
             new_arc
         }
         Some(_) => {
@@ -2404,7 +2404,7 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 return Some(resp_integer(0));
             }
             let new_arc = Arc::new(parking_lot::RwLock::new(crate::types::HashInner::new()));
-            map.insert(Key::from(&*key), KiviDBValue::HashEx(Arc::clone(&new_arc)));
+            map.insert(&*key, KiviDBValue::HashEx(Arc::clone(&new_arc)));
             new_arc
         }
     };

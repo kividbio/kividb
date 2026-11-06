@@ -474,7 +474,8 @@ fn count_docs(db: &Db, def: &IndexDef, cluster: Option<&crate::cluster::ClusterS
                 .read()
                 .iter()
                 .filter(|(key, value)| {
-                    let key = crate::store::key_text(key);
+                    let key = crate::key_bytes::text_of(key);
+                    let key: &str = &key;
                     crate::vector::is_document(&def.on, *value)
                         && covers(def, key)
                         && served
@@ -811,11 +812,12 @@ pub(crate) fn scan_docs(
             let this_run = left.min(run);
             if expired.is_empty() {
                 for (key, value) in docs.by_ref().take(this_run) {
-                    each(crate::store::key_text(key), value);
+                    each(&crate::key_bytes::text_of(key), value);
                 }
             } else {
                 for (key, value) in docs.by_ref().take(this_run) {
-                    let key = crate::store::key_text(key);
+                    let key = crate::key_bytes::text_of(key);
+                    let key: &str = &key;
                     if !expired.contains(key) {
                         each(key, value);
                     }
@@ -837,7 +839,7 @@ fn expired_in(map: &crate::store::ShardMap) -> AHashSet<String> {
     let now = crate::commands::helpers::now_ms();
     let (due, _) = map.due(now, usize::MAX);
     due.into_iter()
-        .map(|key| crate::store::key_text(&key).to_owned())
+        .map(|key| crate::key_bytes::text_of(&key).into_owned())
         .collect()
 }
 
@@ -1093,7 +1095,10 @@ fn plan_in(
     // a hash whose sweep ran in between, its write queued behind this read:
     // the postings had it as it was, and it was not tried. FT.AGGREGATE then
     // counted a document the filter no longer matched (#347).
-    let watched = crate::field_expiry::watched_keys(store, db);
+    let watched: Vec<String> = crate::field_expiry::watched_keys(store, db)
+        .iter()
+        .map(|key| crate::key_bytes::text_of(key).into_owned())
+        .collect();
     let (mut ids, exact, volatile) = {
         let p = def.postings.read();
         if !p.enabled() || p.unused {
@@ -1256,6 +1261,9 @@ pub(crate) fn filter_each(
     // up in it by key (#371).
     let watched = if has_words(filter) {
         crate::field_expiry::watched_keys(ctx.store, *ctx.selected_db)
+            .iter()
+            .map(|key| crate::key_bytes::text_of(key).into_owned())
+            .collect()
     } else {
         Vec::new()
     };
@@ -1565,7 +1573,7 @@ fn page_from_postings(
         // Documents that left the index since the plan was made.
         ids.and_with(p.live());
         for key in &expired {
-            if let Some(id) = p.id(crate::store::key_text(key)) {
+            if let Some(id) = p.id(&crate::key_bytes::text_of(key)) {
                 ids.unset(id);
             }
         }

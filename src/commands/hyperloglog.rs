@@ -2,7 +2,6 @@ use crate::commands::ctx::Ctx;
 use crate::commands::helpers::{delete_key_if_expired, expire_on_read, is_expired, parse_utf8};
 use crate::resp::write::*;
 use crate::store;
-use crate::store::Key;
 use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::types::SharedBytes;
@@ -531,7 +530,7 @@ fn save_hll(ctx: &mut Ctx, key: &str, blob: SharedBytes) {
     let db = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db, key);
     let mut map = write_lock!(shard);
-    map.insert(Key::from(key_owned), KiviDBValue::String(blob));
+    map.insert(key_owned, KiviDBValue::String(blob));
 }
 
 fn save_dense_hll(ctx: &mut Ctx, key: &str, header: [u8; HLL_HEADER_SIZE], registers: &[u8]) {
@@ -602,7 +601,7 @@ fn cmd_pfadd(ctx: &mut Ctx) -> Vec<u8> {
             Some(_) => wrongtype(),
             None => {
                 let empty = make_empty_hll_shared(write_redis);
-                map.insert(Key::from(key.as_str()), KiviDBValue::String(empty));
+                map.insert(key.as_str(), KiviDBValue::String(empty));
                 resp_integer(1)
             }
         };
@@ -665,7 +664,7 @@ fn cmd_pfadd(ctx: &mut Ctx) -> Vec<u8> {
             Err(e) => return e,
         }
     };
-    let replaced = map.insert(Key::from(key.as_str()), KiviDBValue::String(updated));
+    let replaced = map.insert(key.as_str(), KiviDBValue::String(updated));
     drop(map);
     // What was there is freed with the shard let go of.
     drop(replaced);
