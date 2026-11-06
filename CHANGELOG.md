@@ -29,6 +29,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A hash field's expiry is kept to the millisecond when the hash is saved
+  and loaded.** After a restart from a snapshot or the AOF's preamble, a
+  replica's full sync, `RESTORE`, `MIGRATE` or the load of a Redis RDB
+  file, `HPEXPIRETIME` of a field was often 1 ms off what it had been set
+  to, later or earlier. A field's deadline is converted between the
+  server's clock and Unix milliseconds when a hash is written out and read
+  back in, and each conversion cut the time now to a whole millisecond
+  first. It is now converted to the nanosecond both ways, and a field set
+  with `HPEXPIREAT t` reads back as `t` (#448).
+
 - **A Lua script's `false` is a RESP3 null to a RESP3 client (#431).** A
   script's `false`, which is also what `redis.call` gives back for a nil
   reply (a `GET` of a missing key), was sent as RESP2's `$-1` to a client

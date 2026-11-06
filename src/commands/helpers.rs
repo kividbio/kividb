@@ -683,6 +683,48 @@ pub fn glob_match_bytes(pattern: &[u8], text: &[u8]) -> bool {
     super::glob_redis::matches(pattern, text)
 }
 
+/// Both clocks, read one after the other, to convert a hash field's
+/// deadline between the `Instant` it is kept as and the Unix milliseconds it
+/// is written as (in a snapshot, a `DUMP` payload, a Redis RDB file). Exact
+/// to the nanosecond both ways, so that a deadline of whole milliseconds
+/// reads back as the same millisecond. The conversions used to cut the time
+/// now to a whole millisecond first, and a field loaded from a snapshot, a
+/// full sync or a `RESTORE` was often 1 ms off what it had been (#448).
+#[derive(Clone, Copy)]
+pub struct FieldClock {
+    mono: std::time::Instant,
+    wall: Duration,
+}
+
+impl FieldClock {
+    pub fn now() -> Self {
+        let wall = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        Self {
+            mono: std::time::Instant::now(),
+            wall,
+        }
+    }
+
+    /// The `Instant` of `at_ms`, Unix milliseconds; `None` once it has come.
+    pub fn instant_of(&self, at_ms: u64) -> Option<std::time::Instant> {
+        Duration::from_millis(at_ms)
+            .checked_sub(self.wall)
+            .filter(|left| !left.is_zero())
+            .map(|left| self.mono + left)
+    }
+
+    /// `at` as Unix milliseconds, to the nearest one.
+    pub fn unix_ms_of(&self, at: std::time::Instant) -> u64 {
+        let wall = match at.checked_duration_since(self.mono) {
+            Some(ahead) => self.wall.saturating_add(ahead),
+            None => self.wall.saturating_sub(self.mono.duration_since(at)),
+        };
+        wall.saturating_add(Duration::from_micros(500)).as_millis() as u64
+    }
+}
+
 /// Absolute wall time when a key expires (`now + ttl`). Safe across threads (unlike `Instant`).
 #[inline]
 pub fn expiry_at_after(ttl: Duration) -> SystemTime {
