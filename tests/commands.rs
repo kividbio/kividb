@@ -1859,9 +1859,11 @@ fn test_sort_get_hash_self_unchanged() {
 // ═════════════════════════════════════════════════════════════════════════════
 
 // Captured from redis:6.2 (RDB 9), redis:7.0 (RDB 10), redis:7.4 (RDB 12)
-// and redis:8.10 (RDB 15): each type DUMPed in the encodings those versions write for a
-// small value and a large one, with what the value holds. One JSON object a
-// line: redis, rdb, key, type, encoding, hex (the payload), expect.
+// and redis:8.10 (RDB 15), and from valkey:9.0 and valkey:9.1 (RDB 80, #449):
+// each type DUMPed in the encodings those versions write for a small value
+// and a large one, with what the value holds. One JSON object a line: redis
+// (the server and its version), rdb, key, type, encoding, hex (the payload),
+// expect.
 fn redis_dump_fixtures() -> Vec<serde_json::Value> {
     include_str!("fixtures/redis-dump-payloads.jsonl")
         .lines()
@@ -1899,7 +1901,11 @@ fn test_restore_reads_payloads_dumped_by_redis() {
     let mut c = Conn::connect(port);
 
     let fixtures = redis_dump_fixtures();
-    assert_eq!(fixtures.len(), 56, "4 Redis versions x 14 values");
+    assert_eq!(
+        fixtures.len(),
+        84,
+        "4 Redis and 2 Valkey versions x 14 values"
+    );
     for f in &fixtures {
         let field = |name: &str| f[name].as_str().unwrap().to_string();
         let label = format!(
@@ -2046,6 +2052,54 @@ fn test_restore_reads_payloads_dumped_by_redis() {
     }
 }
 
+// A Valkey payload is read from Valkey 9's RDB version, 80, and no other
+// past Redis's: one from a newer Valkey (9.2 writes 81), or from a version
+// no server writes, is refused as Valkey refuses it. Payloads sealed with
+// Redis's versions are read as Redis's, whatever their type byte: type 22 is
+// Valkey's hash with field TTLs only in a Valkey payload (#449).
+#[test]
+fn test_restore_reads_valkey_9_payloads_and_refuses_newer_ones() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    const REFUSED: &str = "ERR DUMP payload version or checksum are wrong";
+
+    let fixture = redis_dump_complex_fixtures()
+        .into_iter()
+        .find(|f| f["redis"] == "valkey-9.1" && f["key"] == "hashttl:small")
+        .unwrap();
+    let good = from_hex(fixture["hex"].as_str().unwrap());
+    assert_eq!(good[0], 22, "Valkey's RDB_TYPE_HASH_2");
+    let with_version = |version: u16| {
+        let mut body = good[..good.len() - 10].to_vec();
+        body.extend_from_slice(&version.to_le_bytes());
+        let crc = kividb::snapshot::redis_crc64(&body);
+        body.extend_from_slice(&crc.to_le_bytes());
+        body
+    };
+    assert_eq!(with_version(80), good, "resealed as captured");
+    for version in [16u16, 79, 81, 200] {
+        let reply = c.cmd(&[b"RESTORE", b"v", b"0", &with_version(version)]);
+        assert!(
+            matches!(&reply, RespValue::Error(e) if e == REFUSED),
+            "RDB {version}: {reply:?}"
+        );
+        assert_eq!(c.cmds(&["EXISTS", "v"]).as_int(), 0, "RDB {version}");
+    }
+    // Under Redis's RDB 12, type 22 is a Redis 7.4 pre-release encoding.
+    let reply = c.cmd(&[b"RESTORE", b"v", b"0", &with_version(12)]);
+    assert!(
+        matches!(&reply, RespValue::Error(e) if e == "ERR Bad data format"),
+        "{reply:?}"
+    );
+
+    assert!(c.cmd(&[b"RESTORE", b"v", b"0", &good]).is_ok());
+    assert_eq!(c.cmds(&["HLEN", "v"]).as_int(), 3);
+    let at = c.cmds(&["HPEXPIRETIME", "v", "FIELDS", "3", "ttl1", "ttl2", "plain"]);
+    let at: Vec<i64> = at.as_array().iter().map(|v| v.as_int()).collect();
+    assert_eq!(at, [4_102_444_800_000, 4_102_444_800_000, -1]);
+}
+
 // Redis's checksum, by its published check value.
 #[test]
 fn test_redis_crc64_is_redis_crc64() {
@@ -2117,7 +2171,10 @@ fn test_restore_refuses_redis_payloads_it_cannot_read() {
 // entry's fields and with others, a released entry on 8.10, idempotent
 // production on 8.10), hashes whose fields have TTLs (Redis 7.4 and 8.10, in
 // both encodings) and a RedisJSON document (Redis 8.10), captured from real
-// servers with what each server answered about them.
+// servers with what each server answered about them. And from Valkey 9.0 and
+// 9.1 (RDB 80, #449): a stream with two groups, pending entries and an idle
+// consumer, a large stream, hashes with field TTLs (Valkey's RDB type 22, set
+// with HPEXPIREAT and HSETEX), and a valkey-json document (valkey-bundle 9.0).
 fn redis_dump_complex_fixtures() -> Vec<serde_json::Value> {
     include_str!("fixtures/redis-dump-payloads-complex.jsonl")
         .lines()
@@ -2149,7 +2206,7 @@ fn test_restore_reads_streams_field_ttl_hashes_and_json_dumped_by_redis() {
     let mut c = Conn::connect(port);
 
     let fixtures = redis_dump_complex_fixtures();
-    assert_eq!(fixtures.len(), 15);
+    assert_eq!(fixtures.len(), 26);
     for f in &fixtures {
         let field = |name: &str| f[name].as_str().unwrap().to_string();
         let label = format!(

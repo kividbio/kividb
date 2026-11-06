@@ -478,6 +478,15 @@ fn redis_function_dump_payloads_restore_and_run() {
             "8.10",
             &include_bytes!("fixtures/redis-8.10-function-dump.bin")[..],
         ),
+        // Valkey 9 seals its payloads with its RDB version, 80 (#449).
+        (
+            "Valkey 9.0",
+            &include_bytes!("fixtures/valkey-9.0-function-dump.bin")[..],
+        ),
+        (
+            "Valkey 9.1",
+            &include_bytes!("fixtures/valkey-9.1-function-dump.bin")[..],
+        ),
     ] {
         let restored = c.cmd(&[b"FUNCTION", b"RESTORE", payload, b"FLUSH"]);
         assert_eq!(restored.as_str(), "OK", "Redis {version} payload");
