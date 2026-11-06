@@ -2008,3 +2008,111 @@ fn rdb_opcodes_kividb_does_not_read_are_refused_by_name() {
         assert!(err.to_string().contains(named), "{opcode:#04x}: {err}");
     }
 }
+
+// A Dragonfly snapshot in Dragonfly's own format is a summary file and a
+// file for each shard (`dump-<time>-summary.dfs`, `dump-<time>-0000.dfs`,
+// ...). Each is an RDB file: the summary has no keys, a shard file has its
+// shard's. Either loaded, as a server with none of the data or a fraction
+// of it (#444). From Dragonfly 1.32 on they are refused here, by the fields
+// only these files have; earlier ones are refused by `--preload-file` (see
+// tests/backup.rs). An RDB file saved by Dragonfly (`SAVE RDB`) loads, from
+// 2.1 and from 1.31. The fixtures hold 200 strings, a hash and a list.
+#[test]
+fn dragonfly_snapshot_files_are_refused_and_its_rdb_files_load() {
+    for (name, bytes) in [
+        (
+            "summary",
+            &include_bytes!("fixtures/dragonfly-2.1-summary.dfs")[..],
+        ),
+        (
+            "shard",
+            &include_bytes!("fixtures/dragonfly-2.1-0000.dfs")[..],
+        ),
+    ] {
+        let err = kividb::snapshot::load_redis_rdb_from(bytes)
+            .err()
+            .unwrap_or_else(|| panic!("the {name} file loaded"));
+        assert!(err.to_string().contains("Dragonfly"), "{name}: {err}");
+    }
+
+    for (version, bytes) in [
+        (
+            "2.1",
+            &include_bytes!("fixtures/dragonfly-2.1-save-rdb.rdb")[..],
+        ),
+        (
+            "1.31",
+            &include_bytes!("fixtures/dragonfly-1.31-save-rdb.rdb")[..],
+        ),
+    ] {
+        let (dbs, _, _) = kividb::snapshot::load_redis_rdb_from(bytes)
+            .unwrap_or_else(|e| panic!("Dragonfly {version}: {e}"));
+        let dbs = texted_all(dbs);
+        assert_eq!(dbs[0].len(), 202, "Dragonfly {version}");
+        match &dbs[0]["key:7"] {
+            KiviDBValue::String(b) => assert_eq!(b.as_ref(), b"val7"),
+            _ => panic!("Dragonfly {version} key:7: wrong type"),
+        }
+        assert!(matches!(dbs[0]["h"], KiviDBValue::Hash(_)));
+        assert!(matches!(dbs[0]["l"], KiviDBValue::List(_)));
+    }
+}
+
+// An RDB file that is not whole is refused, not loaded as far as it goes
+// (#444): one cut anywhere, the checksum too, one with a byte changed, and
+// one whose version is not a number. A checksum of 0 is none, as Redis
+// writes with `rdbchecksum no`.
+#[test]
+fn rdb_files_that_are_cut_damaged_or_not_rdb_are_refused() {
+    let whole = &include_bytes!("fixtures/redis-8.10.rdb")[..];
+    let load = |bytes: &[u8]| kividb::snapshot::load_redis_rdb_from(bytes);
+    assert!(load(whole).is_ok());
+    for cut in [
+        0,
+        3,
+        5,
+        9,
+        10,
+        whole.len() / 2,
+        whole.len() - 8,
+        whole.len() - 1,
+    ] {
+        assert!(
+            load(&whole[..cut]).is_err(),
+            "cut at {cut} of {}: loaded",
+            whole.len()
+        );
+    }
+    let err = load(&whole[..whole.len() - 8]).err().unwrap();
+    assert!(err.to_string().contains("checksum"), "{err}");
+
+    // A byte of a value changed: "hello" is one of the strings.
+    let at = whole
+        .windows(5)
+        .position(|w| w == b"hello")
+        .expect("the fixture has hello");
+    let mut damaged = whole.to_vec();
+    damaged[at] = b'j';
+    let err = load(&damaged[..]).err().expect("a damaged file loaded");
+    assert!(err.to_string().contains("checksum"), "{err}");
+
+    // With no checksum, the same file loads.
+    let len = damaged.len();
+    damaged[len - 8..].fill(0);
+    assert!(load(&damaged[..]).is_ok());
+
+    for not_rdb in [
+        &b""[..],
+        b"REDIS",
+        b"REDIS0011",
+        b"REDIS0011\xFF",
+        b"REDISxxxx\xFF\0\0\0\0\0\0\0\0",
+        b"REDIS+011\xFF\0\0\0\0\0\0\0\0",
+        b"REDIS0000\xFF\0\0\0\0\0\0\0\0",
+    ] {
+        assert!(load(not_rdb).is_err(), "{not_rdb:?} loaded");
+    }
+    // An empty Redis database is a file, and loads.
+    let (dbs, _, _) = load(&b"REDIS0011\xFF\0\0\0\0\0\0\0\0"[..]).unwrap();
+    assert!(dbs.iter().all(HashMap::is_empty));
+}

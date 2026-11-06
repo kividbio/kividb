@@ -110,6 +110,33 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A file that is not a whole snapshot no longer starts the server on
+  part of the data, or none.** `--preload-file rdb:` of a Dragonfly
+  snapshot in Dragonfly's own format logged `preload-file: 0 keys from the
+  base snapshot` and started an empty server. That format is a summary
+  file (`dump-<time>-summary.dfs`), with no keys, and a file for each
+  shard (`dump-<time>-0000.dfs`, ...), and each is an RDB file: the summary
+  loaded as an empty dataset, and a shard's file as that shard's keys
+  alone. `--preload-file` now refuses a file whose name ends in `.dfs`,
+  from any Dragonfly. A renamed file of Dragonfly 1.32 or later is refused
+  by the fields Dragonfly writes only in these files, by `--preload-file`,
+  by `dump.rdb` at startup and by a full sync. A renamed summary of an
+  earlier Dragonfly is refused by `--preload-file` as a file Dragonfly
+  wrote with no keys in it. A renamed shard file of an earlier Dragonfly
+  holds nothing that tells it from an RDB file of those keys, and is
+  loaded; its keys are only that shard's. The messages say to save an RDB
+  file with Dragonfly's `SAVE RDB` and load that; RDB files from Dragonfly
+  2.1 and 1.31 load. An RDB file's checksum is now checked, as Redis
+  checks it, unless `rdbchecksum no` is set, and a file that ends before
+  its checksum, has the wrong one, or has a version that is not a number
+  is refused; one cut short anywhere else was already. A KiviDB snapshot
+  cut short between two keys loaded the keys before the cut, or none when
+  it ended after its header: it is now refused, as a replica already
+  refused such a full sync. Where the server refuses a file at startup, it
+  does not start and leaves the data directory as it was; a replica
+  refuses such a full sync from a Redis master and keeps its dataset
+  (#444).
+
 - **Fix `MEMORY USAGE` estimates for sets, hashes, and sorted sets.**
   Estimates for sets, hashes, field-TTL hashes, and sorted sets now track
   `used_memory` more accurately. After mass deletions, approximately 3–4%

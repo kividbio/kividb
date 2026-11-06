@@ -1786,7 +1786,6 @@ impl Config {
             | "lazyfree-lazy-user-del"
             | "no-appendfsync-on-rewrite"
             | "proc-title-template"
-            | "rdbchecksum"
             | "rdbcompression"
             | "repl-disable-tcp-nodelay"
             | "repl-diskless-sync"
@@ -1840,6 +1839,7 @@ impl Config {
                                 | "lazyfree-lazy-expire"
                                 | "latency-tracking"
                                 | "latency-tracking-info-percentiles"
+                                | "rdbchecksum"
                         ) || crate::commands::server::remembered_config(key).is_none() => {}
                     Some(_) => return no_effect("KiviDB has no such setting"),
                     None if key.starts_with("cluster-")

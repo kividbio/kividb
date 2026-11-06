@@ -1603,9 +1603,7 @@ pub fn load_snapshot_with<R: Read>(
 /// value is parsed, exactly as loading would, and dropped. It costs the
 /// memory of one value at a time.
 ///
-/// Stricter than loading: every database has to end where the writer ends
-/// it. (The loader also accepts an image that simply stops between two
-/// entries, for the sake of files written before there was an end marker.)
+/// Every database has to end where the writer ends it, as in loading.
 pub fn verify_snapshot(image: &[u8]) -> io::Result<usize> {
     read_retrying(|| Ok(image), false, server_databases()).map(|(_, keys, _)| keys)
 }
@@ -1757,9 +1755,6 @@ fn read_image(
     let db_count = u32::from_le_bytes(db_count_buf) as usize;
 
     let mut result = Vec::with_capacity(hint(db_count));
-    // The image stopped between two entries (see below): the databases it
-    // says are still to come are not there.
-    let mut ended = false;
     // The first byte of what follows a database's end (the next database or
     // a section), read to see whether it is a tag.
     let mut next_byte = None;
@@ -1788,13 +1783,14 @@ fn read_image(
                 None => r.read_exact(&mut len_buf),
             };
             match read {
-                // Verifying: an image that stops before a database's end
-                // marker is not a whole image.
-                // Nor, reading 1.2.0's empty key where the first reading
-                // could not, one that stops (a wrong guess may).
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof && keep && legacy.is_empty() => {
-                    ended = true;
-                    break;
+                // An image that stops before a database's end marker is not a
+                // whole image, loaded or verified: loading it as far as it
+                // went started a server on part of the data, or none (#444).
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "the snapshot ends before its last database does: it is cut short",
+                    ));
                 }
                 Err(e) => return Err(e),
                 Ok(_) => {}
@@ -2155,9 +2151,6 @@ fn read_image(
         }
 
         result.push(map);
-        if ended {
-            break;
-        }
     }
 
     // ── Optional trailing sections ────────────────────────────────────────────
@@ -2866,8 +2859,13 @@ pub fn load_redis_rdb_with_expiry(path: &str) -> io::Result<RedisRdb> {
 }
 
 /// [`load_redis_rdb_with_expiry`] over any byte source.
+///
+/// Refused rather than loaded as far as it goes: a file whose version is not
+/// a number, one that ends before its checksum or with the wrong one, and a
+/// file of a Dragonfly snapshot in Dragonfly's own format. Each used to load,
+/// often with no keys at all, and the server started on that (#444).
 pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
-    let mut r = r;
+    let mut r = Crc64Reader { inner: r, crc: 0 };
     let now_ms = unix_ms_now();
 
     // `REDIS` and a 4-digit RDB version, or `VALKEY` and a 3-digit one
@@ -2875,14 +2873,18 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
     let mut header = [0u8; 9];
     r.read_exact(&mut header)?;
     let dialect = rdb_dialect::from_header(&header)?;
+    // The RDB version, for the checksum that ends a file from version 5 on.
+    // A Redis one that is not a number is refused, not read as 0 (#444).
     // Dragonfly and KeyDB write RDB 9, with types and opcodes past Redis
     // 6.2's (see `rdb_extensions`).
     let version: u16 = match dialect {
         rdb_dialect::Dialect::Valkey => rdb_dialect::VALKEY_RDB_VERSION,
         rdb_dialect::Dialect::Redis => std::str::from_utf8(&header[5..])
             .ok()
+            .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|s| s.parse().ok())
-            .unwrap_or(0),
+            .filter(|&version| version >= 1)
+            .ok_or_else(|| rdb_invalid("not a Redis RDB file: its version is not a number"))?,
     };
 
     let mut result: Vec<HashMap<Key, KiviDBValue>> = (0..16).map(|_| HashMap::new()).collect();
@@ -2909,11 +2911,25 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
 
         match type_byte[0] {
             0xFA => {
-                // Aux field: metadata, skipped, but for KeyDB's member TTLs
-                // (`EXPIREMEMBER`), which follow their key.
+                // Aux field: metadata, skipped, but for two kinds.
+                //
+                // Dragonfly's own format (`.dfs`) has a file for each shard
+                // and one, the summary, with none of the keys. Each is an RDB
+                // file. From Dragonfly 1.32 on, each has one of these fields,
+                // and its RDB files (`SAVE RDB`) have neither. Earlier ones
+                // write neither anywhere: see `preload` in src/aof.rs.
+                //
+                // KeyDB's member TTLs (`EXPIREMEMBER`) follow their key.
                 let aux_key = rdb_read_string(&mut r)?;
                 let aux_val = rdb_read_string(&mut r)?;
                 match aux_key.as_slice() {
+                    b"shard-id" | b"shard-count" => {
+                        return Err(rdb_invalid(
+                            "this is one file of a Dragonfly snapshot in Dragonfly's own format \
+                             (.dfs), which keeps each shard's keys in a file of its own; save one \
+                             in RDB format (Dragonfly's SAVE RDB) and load that",
+                        ));
+                    }
                     b"keydb-subexpire-key" => keydb_member = Some(aux_val),
                     b"keydb-subexpire-when" => {
                         let member = keydb_member
@@ -2955,9 +2971,25 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
                 let _ = rdb_read_length(&mut r)?;
             }
             0xFF => {
-                // End of RDB — skip 8-byte CRC64
-                let mut crc = [0u8; 8];
-                let _ = r.read_exact(&mut crc); // ignore error — file may be truncated
+                // The end, and from version 5 on, the CRC64 of everything
+                // before it. A checksum of 0 is none: Redis writes that with
+                // `rdbchecksum no`, and so does Dragonfly.
+                if version >= 5 {
+                    let sum = r.crc;
+                    let mut crc = [0u8; 8];
+                    r.read_exact(&mut crc).map_err(|_| {
+                        rdb_invalid("the file ends before its checksum: it is cut short")
+                    })?;
+                    let crc = u64::from_le_bytes(crc);
+                    // `rdbchecksum no` skips the check, as in Redis: a file
+                    // whose only fault is its checksum can still be loaded.
+                    if crc != 0 && crc != sum && rdb_checksum_checked() {
+                        return Err(rdb_invalid(
+                            "wrong RDB checksum: the file is damaged (to load it all the same, \
+                             set rdbchecksum no in the config file)",
+                        ));
+                    }
+                }
                 break;
             }
             0xFC => {
@@ -3068,6 +3100,81 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
         );
     }
     Ok((result, expiries, redis_function_dump(&libraries)))
+}
+
+/// Whether an RDB file's checksum is checked as it is loaded: unless
+/// `rdbchecksum no` is set, as in Redis.
+fn rdb_checksum_checked() -> bool {
+    crate::commands::server::remembered_config("rdbchecksum").as_deref() != Some("no")
+}
+
+/// Whether the RDB file at `path` was written by Dragonfly, by its aux
+/// fields: `df-ver`, or, before Dragonfly wrote that, `redis-ver
+/// 999.999.999`. Only the fields at the start of the file are read.
+pub fn rdb_written_by_dragonfly(path: &str) -> io::Result<bool> {
+    let mut r = BufReader::new(File::open(path)?);
+    let mut magic = [0u8; 9];
+    r.read_exact(&mut magic)?;
+    if &magic[..5] != b"REDIS" {
+        return Ok(false);
+    }
+    loop {
+        let mut opcode = [0u8];
+        if r.read_exact(&mut opcode).is_err() || opcode[0] != 0xFA {
+            return Ok(false);
+        }
+        let key = rdb_read_string(&mut r)?;
+        let value = rdb_read_string(&mut r)?;
+        if key == b"df-ver" || (key == b"redis-ver" && value == b"999.999.999") {
+            return Ok(true);
+        }
+    }
+}
+
+/// Redis's CRC64 ([`redis_crc64`]) a byte at a time, from a table.
+const REDIS_CRC64_TABLE: [u64; 256] = {
+    const POLY: u64 = 0x95ac_9329_ac4b_c9b5;
+    let mut table = [0u64; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u64;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ POLY
+            } else {
+                crc >> 1
+            };
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
+/// [`redis_crc64`] of `data`, carried on from `crc`, the sum of what came
+/// before it.
+fn redis_crc64_update(mut crc: u64, data: &[u8]) -> u64 {
+    for &byte in data {
+        crc = REDIS_CRC64_TABLE[((crc ^ u64::from(byte)) & 0xff) as usize] ^ (crc >> 8);
+    }
+    crc
+}
+
+/// A reader that sums what is read through it with Redis's CRC64: what an
+/// RDB file's checksum is checked against.
+struct Crc64Reader<R> {
+    inner: R,
+    crc: u64,
+}
+
+impl<R: Read> Read for Crc64Reader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.crc = redis_crc64_update(self.crc, &buf[..n]);
+        Ok(n)
+    }
 }
 
 /// Function libraries' code as Redis's `FUNCTION DUMP` lays it out: the
@@ -6003,6 +6110,36 @@ mod verify_tests {
         // Verifying keeps nothing, and loading still loads.
         let loaded = load_snapshot_from(whole.as_slice()).unwrap();
         assert_eq!(loaded.dbs[0].len(), 500);
+
+        // Loading refuses a cut image as verifying does, the one cut between
+        // two entries too: it used to load the keys before the cut (#444).
+        for cut in [12, 13, 40, whole.len() / 2] {
+            assert!(
+                load_snapshot_from(&whole[..cut]).is_err(),
+                "an image cut at {cut} of {} loaded",
+                whole.len()
+            );
+        }
+        // One key, in the first of two databases: cut after the key, and
+        // after the first database's end.
+        let one = image(1);
+        let entry = 4 + "key:0".len() + 1 + 4 + "value 0".len();
+        assert!(load_snapshot_from(&one[..8 + 4 + entry + 8]).is_ok());
+        assert!(load_snapshot_from(&one[..8 + 4 + entry]).is_err());
+        assert!(load_snapshot_from(&one[..8 + 4 + entry + 4]).is_err());
+    }
+
+    /// The table-driven CRC64 that checks RDB files is Redis's.
+    #[test]
+    fn the_rdb_checksum_is_redis_crc64() {
+        assert_eq!(redis_crc64_update(0, b"123456789"), 0xe9c6_d914_c4b8_d9ca);
+        let data: Vec<u8> = (0..5000u32).map(|i| (i * 7919 % 251) as u8).collect();
+        assert_eq!(redis_crc64_update(0, &data), redis_crc64(&data));
+        let (a, b) = data.split_at(1234);
+        assert_eq!(
+            redis_crc64_update(redis_crc64_update(0, a), b),
+            redis_crc64(&data)
+        );
     }
 }
 

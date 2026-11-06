@@ -1803,6 +1803,193 @@ fn a_backup_into_the_data_directory_is_refused() {
     );
 }
 
+/// Every file of `dir` and what it holds.
+fn directory(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            (name, std::fs::read(entry.path()).unwrap_or_default())
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// Whether a server started in `dir` with `args` exited with an error within
+/// 30 s (one that starts is stopped), and what it logged.
+fn fails_to_start(dir: &Path, args: &[&str]) -> (bool, String) {
+    let mut child = kividb(dir, free_port(), args)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("could not run kividb");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let failed = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break !status.success();
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let mut stderr = String::new();
+    let _ = child.stderr.take().unwrap().read_to_string(&mut stderr);
+    (failed, stderr)
+}
+
+/// A preload target that is not a whole snapshot is fatal, and the data
+/// directory is left exactly as it was: the same files, holding the same
+/// bytes (#444).
+///
+/// A Dragonfly snapshot in Dragonfly's own format (a summary with no keys,
+/// and a file for each shard) started the server empty: "preload-file: 0
+/// keys from the base snapshot". Its files are refused by name (`.dfs`),
+/// from every Dragonfly version; renamed, by the fields Dragonfly 1.32 and
+/// later write in them, and a summary from before 1.32 as a Dragonfly file
+/// with no keys. The fixtures are from Dragonfly 2.1, 1.31 and 1.15. A cut
+/// file, one with a byte changed, and a KiviDB snapshot cut short loaded as
+/// far as they went.
+#[test]
+fn a_preload_file_that_is_not_a_whole_snapshot_is_fatal() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let fixture = |name: &str| std::fs::read(fixtures.join(name)).unwrap();
+    let source = Server::start(&[]);
+    let mut c = source.conn();
+    for i in 0..50 {
+        c.cmd(&["SET", &format!("key:{i}"), &"v".repeat(100)]);
+    }
+    assert!(c.cmd(&["SAVE"]).ok());
+    let kdb = std::fs::read(source.dir.join("dump.kdb")).unwrap();
+    let rdb = fixture("redis-8.10.rdb");
+    let mut flipped = rdb.clone();
+    let at = flipped.windows(5).position(|w| w == b"hello").unwrap();
+    flipped[at] = b'j';
+
+    // Each target, and what the refusal says.
+    let targets: Vec<(&str, Vec<u8>, &str)> = vec![
+        // As Dragonfly names them.
+        (
+            "dump-2026-11-06T01:48:42-summary.dfs",
+            fixture("dragonfly-2.1-summary.dfs"),
+            "Dragonfly",
+        ),
+        (
+            "dump-2026-11-06T01:48:42-0000.dfs",
+            fixture("dragonfly-2.1-0000.dfs"),
+            "Dragonfly",
+        ),
+        (
+            "dump-2026-11-06T01:48:17-summary.dfs",
+            fixture("dragonfly-1.31-summary.dfs"),
+            "Dragonfly",
+        ),
+        (
+            "dump-2026-11-06T01:48:17-0000.DFS",
+            fixture("dragonfly-1.31-0000.dfs"),
+            "Dragonfly",
+        ),
+        (
+            "dump-2026-11-06T01:47:48-summary.dfs",
+            fixture("dragonfly-1.15-summary.dfs"),
+            "Dragonfly",
+        ),
+        // Renamed: by what is in them.
+        (
+            "summary-2.1.rdb",
+            fixture("dragonfly-2.1-summary.dfs"),
+            "Dragonfly",
+        ),
+        (
+            "shard-2.1.rdb",
+            fixture("dragonfly-2.1-0000.dfs"),
+            "Dragonfly",
+        ),
+        (
+            "summary-1.31.rdb",
+            fixture("dragonfly-1.31-summary.dfs"),
+            "Dragonfly",
+        ),
+        (
+            "summary-1.15.rdb",
+            fixture("dragonfly-1.15-summary.dfs"),
+            "could not be loaded",
+        ),
+        ("empty", Vec::new(), "could not be loaded"),
+        ("cut.rdb", rdb[..rdb.len() - 8].to_vec(), "checksum"),
+        ("damaged.rdb", flipped, "rdbchecksum no"),
+        (
+            "cut.kdb",
+            kdb[..kdb.len() / 2].to_vec(),
+            "could not be loaded",
+        ),
+        ("header.kdb", kdb[..12].to_vec(), "cut short"),
+    ];
+    // The data directory holds a dump of its own and the lock file a server
+    // makes, all of which must stay as they are.
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::write(data.join("dump.rdb"), b"REDIS0011\xFF\0\0\0\0\0\0\0\0").unwrap();
+    std::fs::write(data.join("kividb.lock"), b"").unwrap();
+    let before = directory(&data);
+    for (name, bytes, says) in targets {
+        let file = dir.path().join(name);
+        std::fs::write(&file, bytes).unwrap();
+        let target = format!("rdb:{}", file.display());
+        let (failed, stderr) = fails_to_start(&data, &["--preload-file", &target]);
+        assert!(failed, "{name} must not start: {stderr}");
+        assert!(stderr.contains("could not be loaded"), "{name}: {stderr}");
+        assert!(stderr.contains(says), "{name}: {stderr}");
+        assert!(
+            directory(&data) == before,
+            "{name} changed the data directory"
+        );
+    }
+
+    // A Dragonfly shard's file as `dump.rdb` does not start the server on
+    // that shard's keys either.
+    std::fs::write(data.join("dump.rdb"), fixture("dragonfly-2.1-0000.dfs")).unwrap();
+    let before = directory(&data);
+    let (failed, stderr) = fails_to_start(&data, &[]);
+    assert!(failed, "{stderr}");
+    assert!(stderr.contains("Dragonfly"), "{stderr}");
+    assert!(
+        directory(&data) == before,
+        "dump.rdb changed the data directory"
+    );
+}
+
+/// `rdbchecksum no` skips the check of an RDB file's checksum as it is
+/// loaded, as in Redis, so that a file whose only fault is its checksum can
+/// still be loaded on purpose (#444).
+#[test]
+fn rdbchecksum_no_loads_a_file_whose_checksum_is_wrong() {
+    let mut damaged =
+        std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/redis-8.10.rdb"))
+            .unwrap();
+    let at = damaged.windows(5).position(|w| w == b"hello").unwrap();
+    damaged[at] = b'j';
+    let dir = tempfile::tempdir().unwrap().keep();
+    let file = dir.join("damaged.rdb");
+    std::fs::write(&file, damaged).unwrap();
+    std::fs::write(dir.join("kividb.conf"), "rdbchecksum no\n").unwrap();
+    let port = free_port();
+    let target = format!("rdb:{}", file.display());
+    let child = kividb(&dir, port, &["--preload-file", &target])
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("could not start kividb");
+    let server = Server { port, dir, child };
+    let mut c = server.conn();
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 9);
+    let reply = c.cmd(&["CONFIG", "GET", "rdbchecksum"]);
+    assert_eq!(reply.arr()[1].s(), "no");
+}
+
 // ── The empty key (#441) ─────────────────────────────────────────────────────
 //
 // Redis allows the empty key. In a snapshot it was written with the key
