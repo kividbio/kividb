@@ -7,6 +7,42 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Data moves in from Valkey 9.** KiviDB reads Valkey 9.0's and 9.1's
+  RDB format (RDB 80, a `VALKEY080` header): a `dump.rdb` loaded at
+  startup or with `--preload-file`, a full sync as a replica of a Valkey 9
+  primary, `RESTORE` of a Valkey 9 `DUMP` payload (so `MIGRATE` and the
+  tools built on `DUMP`), and `FUNCTION RESTORE` of a Valkey 9 `FUNCTION
+  DUMP`. A hash whose fields have TTLs (Valkey's RDB type 22) keeps them,
+  to the millisecond. Valkey 9 refused to load with `bad magic`, and its
+  payloads with `ERR DUMP payload version or checksum are wrong`. What
+  KiviDB does not read is refused whole, by name, and nothing is skipped:
+  a newer Valkey's format (Valkey 9.2 writes RDB 81), a type Valkey does not
+  write, and a file a Valkey cluster node saved while a slot migration into
+  it was under way (the keys of those slots are not all there). Checked
+  against the valkey/valkey 9.0.7 and 9.1.3 images, key by key: every core
+  type, streams with consumer groups and pending entries, key and field
+  TTLs, several databases, function libraries and valkey-json documents
+  (valkey-bundle 9.0), by file, by `RESTORE`, and as a replica through a
+  full sync and a stream of writes (#449).
+
+- **apt and dnf repositories.** `https://packages.kividb.io` serves signed
+  apt (Debian, Ubuntu) and dnf (Fedora, RHEL and compatibles, Amazon Linux
+  2023) repositories of the `.deb` and `.rpm` packages, for `amd64` and
+  `arm64`, so `apt install kividb` and `dnf install kividb` work and
+  upgrades come with the system's own. The apt metadata, the dnf metadata
+  and every RPM are signed with one key. The newest 20 releases stay in
+  them, so a version can be pinned or gone back to. The release workflow
+  adds each stable release, from 1.2.1 on, once its GitHub Release is
+  published. The arm64 packages need an ARMv8.1 CPU or newer (not a
+  Raspberry Pi 4). See [docs/INSTALL.md](docs/INSTALL.md).
+- **The packages say which glibc they need.** The `.deb` depends on
+  `libc6 (>= 2.34)` and the `.rpm` on `glibc >= 2.34`, the version the
+  binary is built against. On an older system (Debian 11, Ubuntu 20.04,
+  RHEL 8, Amazon Linux 2) the package manager now refuses them, rather than
+  installing a server that cannot start.
+
 ### Changed
 
 - **Arities come from Valkey's BSD-licensed command data.**
@@ -36,6 +72,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the same server as the `v` tag. The release workflow now pushes
   `X.Y.Z-src` on the release's own commit. A `-src` tag is not a
   separate release.
+- **Stable releases are published on crates.io.** The release workflow
+  publishes each stable release as the crate `kividb` after its GitHub
+  Release, so `cargo install --locked kividb` builds the server from
+  source and `cargo binstall kividb` downloads the release's binary for
+  Linux and macOS. The crate holds the sources, the lockfile and the
+  licence files, about 1.6 MB. Its library is built from the same
+  sources so the integration tests can use them; it is not a public API.
 
 ### Fixed
 
@@ -65,6 +108,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   does not start and leaves the data directory as it was; a replica
   refuses such a full sync from a Redis master and keeps its dataset
   (#444).
+
+- **`CONFIG REWRITE` no longer writes a config file the server was not
+  started from.** A server started without one, because its `--configfile`
+  path (by default `/etc/kividb/kividb.conf`) did not exist, created the
+  file on `CONFIG REWRITE`, with its `port`, `replicaof` and every other
+  setting in it. The next server started with the same path, which for the
+  default path is any server on the host started without a config file of
+  its own, loaded it. Sentinel sends `REPLICAOF` and then `CONFIG REWRITE`
+  to each replica it reconfigures, and this way turned unrelated servers
+  into replicas whose data a full sync then replaced. As in Redis, a server
+  that was not started from a config file now replies `ERR The server is
+  running without a config file` and writes nothing, and `INFO server`
+  shows its `config_file` as empty. A server started from a file, even an
+  empty one, rewrites it as before; the packages install
+  `/etc/kividb/kividb.conf`, and the Kubernetes operator starts every
+  server from one. To use `CONFIG REWRITE` on a server started without a
+  file (the Docker image, for one), start it with `--configfile` pointing
+  at a file that exists. A host where an earlier version already created
+  the file this way still has it: look for a `/etc/kividb/kividb.conf`
+  that holds a `replicaof` line nobody wrote, and delete or fix it (#442).
 
 - **JSON numbers keep every digit.** A number that needs 17 significant
   digits was often read as the double next to it: `JSON.SET k $
@@ -98,6 +161,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   too: a line break in one split the reply in two. Apart from that, RESP2
   clients get the same bytes as before for scripts that do not call
   `redis.setresp(3)`.
+
+- **Hash field TTLs read back to the millisecond.** A field TTL loaded from
+  a Redis 7.4+ RDB file, full sync or `DUMP` payload, or set with `HSETEX
+  ... EXAT` or `PXAT`, often read back with `HPEXPIRETIME` one millisecond
+  later than it was set: the time left was worked out from the clock in
+  whole milliseconds. Redis and Valkey send `HSETEX` with `PXAT` to their
+  replicas, so a KiviDB replica of either drifted by that millisecond. It
+  is now worked out to the nanosecond, as `HPEXPIREAT` does (#449).
 
 - **A write in database 0 could reach replicas and the AOF in another
   database.** Until a client selects a database other than 0, writes go out

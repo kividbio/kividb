@@ -15,6 +15,9 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::sync::Arc;
 
+mod rdb_dialect;
+pub use rdb_dialect::is_rdb_header;
+
 /// Returned by `load_snapshot` — key-value data plus any index schemas that
 /// were embedded in the snapshot file.
 pub struct LoadedSnapshot {
@@ -2482,25 +2485,22 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
     let mut r = Crc64Reader { inner: r, crc: 0 };
     let now_ms = unix_ms_now();
 
-    // Magic
-    let mut magic = [0u8; 5];
-    r.read_exact(&mut magic)?;
-    if &magic != b"REDIS" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "not a Redis RDB file",
-        ));
-    }
-
-    // Version (4 ASCII digits)
-    let mut ver_buf = [0u8; 4];
-    r.read_exact(&mut ver_buf)?;
-    let version: u32 = std::str::from_utf8(&ver_buf)
-        .ok()
-        .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))
-        .and_then(|s| s.parse().ok())
-        .filter(|&version| version >= 1)
-        .ok_or_else(|| rdb_invalid("not a Redis RDB file: its version is not a number"))?;
+    // `REDIS` and a 4-digit RDB version, or `VALKEY` and a 3-digit one
+    // (Valkey 9): whose numbering the type bytes below follow.
+    let mut header = [0u8; 9];
+    r.read_exact(&mut header)?;
+    let dialect = rdb_dialect::from_header(&header)?;
+    // The RDB version, for the checksum that ends a file from version 5 on.
+    // A Redis one that is not a number is refused, not read as 0 (#444).
+    let version: u32 = match dialect {
+        rdb_dialect::Dialect::Valkey => u32::from(rdb_dialect::VALKEY_RDB_VERSION),
+        rdb_dialect::Dialect::Redis => std::str::from_utf8(&header[5..])
+            .ok()
+            .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|s| s.parse().ok())
+            .filter(|&version| version >= 1)
+            .ok_or_else(|| rdb_invalid("not a Redis RDB file: its version is not a number"))?,
+    };
 
     let mut result: Vec<HashMap<String, KiviDBValue>> = (0..16).map(|_| HashMap::new()).collect();
     let mut expiries: ExpiryMaps = (0..16).map(|_| HashMap::new()).collect();
@@ -2604,6 +2604,10 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
                 }
             }
             0xF7 => rdb_skip_module_aux(&mut r, &mut warned_search)?,
+            // Valkey's RDB_OPCODE_SLOT_IMPORT, a slot migration in progress.
+            0xF3 if dialect == rdb_dialect::Dialect::Valkey => {
+                return Err(rdb_dialect::refuse_slot_import(&mut r));
+            }
             // A function library (`FUNCTION2`): its code.
             0xF5 => libraries.push(rdb_read_string(&mut r)?),
             // Every other opcode from 0xF0 up is refused by what it is, not
@@ -2623,7 +2627,7 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
                 let key_bytes = rdb_read_string(&mut r)?;
                 let key = String::from_utf8_lossy(&key_bytes).into_owned();
                 let expiry_ms = pending_expiry.take();
-                if let Some(val) = rdb_read_value(&mut r, type_id)? {
+                if let Some(val) = rdb_dialect::read_value(&mut r, type_id, dialect)? {
                     match expiry_ms {
                         // Already past its expiry: dropped. Not by a replica,
                         // or under an AOF (see `load_snapshot_from`).
@@ -3342,17 +3346,14 @@ fn rdb_read_hash_with_ttls(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBV
         }
     }
 
-    let now_ms = unix_ms_now();
-    let now = std::time::Instant::now();
     let mut inner = crate::types::HashInner::new();
     for (field, value, expires_at) in fields {
-        if expires_at != 0 && expires_at <= now_ms {
-            continue;
-        }
         let field = String::from_utf8_lossy(&field).into_owned();
         if expires_at != 0 {
-            let left = std::time::Duration::from_millis(expires_at - now_ms);
-            inner.expiries.insert(field.clone(), now + left);
+            let Some(deadline) = rdb_dialect::field_deadline(expires_at)? else {
+                continue;
+            };
+            inner.expiries.insert(field.clone(), deadline);
         }
         inner.fields.insert(field, Arc::from(value.as_slice()));
     }
@@ -4363,10 +4364,11 @@ pub fn dump_payload(value: &KiviDBValue) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// The newest RDB version whose `DUMP` payloads `RESTORE` reads: the one
-/// Redis 8.10 writes. Redis refuses a payload from a newer version than its
-/// own, as this does, since a newer one may hold encodings it cannot read.
-const REDIS_DUMP_VERSION_MAX: u16 = 15;
+/// The newest Redis RDB version whose `DUMP` payloads `RESTORE` reads: the
+/// one Redis 8.10 writes. Redis refuses a payload from a newer version than
+/// its own, as this does, since a newer one may hold encodings it cannot
+/// read. Valkey 9's, RDB 80, are read too (see `rdb_dialect`).
+const REDIS_DUMP_VERSION_MAX: u16 = rdb_dialect::REDIS_RDB_VERSION_MAX;
 
 /// Parse a `DUMP` payload back into a value. `None` if the payload is
 /// truncated, fails its checksum, or does not decode.
@@ -4414,8 +4416,10 @@ pub fn restore_payload_checked(payload: &[u8]) -> Result<KiviDBValue, RestoreErr
     let version = u16::from_le_bytes([trailer[0], trailer[1]]);
     // A zero checksum is none, as Redis writes with checksums off.
     let sealed = crc == [0u8; 8] || redis_crc64(versioned).to_le_bytes() == crc;
-    if version <= REDIS_DUMP_VERSION_MAX && sealed {
-        return restore_redis_payload(data).ok_or(RestoreError::BadData);
+    if let Some(dialect) = rdb_dialect::of_dump_version(version)
+        && sealed
+    {
+        return restore_redis_payload(data, dialect).ok_or(RestoreError::BadData);
     }
     Err(RestoreError::VersionOrChecksum)
 }
@@ -4441,12 +4445,12 @@ pub fn redis_crc64(data: &[u8]) -> u64 {
     crc
 }
 
-/// A value as Redis's `DUMP` serialises it: its RDB type, then the value in
-/// the RDB encoding of that type, which the `dump.rdb` loader reads. Every
-/// byte must belong to the value.
-fn restore_redis_payload(data: &[u8]) -> Option<KiviDBValue> {
+/// A value as Redis's or Valkey's `DUMP` serialises it: its RDB type, then
+/// the value in the RDB encoding of that type, which the `dump.rdb` loader
+/// reads. Every byte must belong to the value.
+fn restore_redis_payload(data: &[u8], dialect: rdb_dialect::Dialect) -> Option<KiviDBValue> {
     let (&type_id, mut rest) = data.split_first()?;
-    let value = rdb_read_value(&mut rest, type_id).ok()??;
+    let value = rdb_dialect::read_value(&mut rest, type_id, dialect).ok()??;
     rest.is_empty().then_some(value)
 }
 
@@ -4464,7 +4468,9 @@ pub(crate) fn redis_function_dump_sources(payload: &[u8]) -> Option<Vec<String>>
     let (data, trailer) = payload.split_at(payload.len() - 10);
     let (versioned, crc) = payload.split_at(payload.len() - 8);
     let version = u16::from_le_bytes([trailer[0], trailer[1]]);
-    if version > REDIS_DUMP_VERSION_MAX || redis_crc64(versioned).to_le_bytes() != crc {
+    if rdb_dialect::of_dump_version(version).is_none()
+        || redis_crc64(versioned).to_le_bytes() != crc
+    {
         return None;
     }
 
