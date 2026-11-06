@@ -1012,7 +1012,10 @@ mod tests {
         kdb.extend(2u32.to_le_bytes());
         kdb.extend(((MAX_LAYERS + 1) as u32).to_le_bytes());
         let err = read_kdb(&mut &kdb[..]).unwrap_err();
-        assert!(err.to_string().contains("number of Bloom filter layers"), "{err}");
+        assert!(
+            err.to_string().contains("number of Bloom filter layers"),
+            "{err}"
+        );
     }
 
     /// Loaded bytes are the layers: not copied, and not zeroed again.
