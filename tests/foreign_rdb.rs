@@ -110,8 +110,8 @@ fn a_valkey_9_hash_whose_fields_have_all_run_out_is_no_key() {
 // What Valkey 9.0 and 9.1 do not write is refused, by what it is: a newer
 // Valkey's RDB version (Valkey 9.2 writes 81), a VALKEY header with a
 // version Valkey never puts under it, a Redis type in a Valkey file, and
-// Valkey's type 22 in a Redis file (where 22 is a Redis 7.4 pre-release
-// encoding), and a field named twice.
+// Valkey's type 22 in a Redis 7.4 file (RDB 12, where 22 is a pre-release
+// encoding of Redis's), and a field named twice.
 #[test]
 fn what_valkey_9_does_not_write_is_refused() {
     let string = [&[0u8][..], &rdb_str(b"k"), &rdb_str(b"v")].concat();
@@ -134,7 +134,7 @@ fn what_valkey_9_does_not_write_is_refused() {
     );
 
     let hash = valkey_hash(b"h", &[(b"a", b"1", -1)]);
-    let refused = refusal(&file(b"REDIS0011", &hash));
+    let refused = refusal(&file(b"REDIS0012", &hash));
     assert!(refused.contains("unsupported RDB type 22"), "{refused}");
 
     let twice = valkey_hash(b"h", &[(b"a", b"1", -1), (b"a", b"2", -1)]);
