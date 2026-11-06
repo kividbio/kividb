@@ -209,6 +209,10 @@ impl Server {
     }
 
     fn start_with_workers(io: &str, workers: usize, extra: &[&str]) -> Self {
+        Self::start_with_env(io, workers, extra, &[])
+    }
+
+    fn start_with_env(io: &str, workers: usize, extra: &[&str], env: &[(&str, &str)]) -> Self {
         let dir = tempfile::tempdir().unwrap().keep();
         let port = free_port();
         let log = std::fs::File::create(dir.join("server.log")).unwrap();
@@ -227,6 +231,7 @@ impl Server {
                 "kividb.conf",
             ])
             .args(extra)
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(log)
@@ -687,6 +692,78 @@ fn a_wait_on_one_worker_receives_replica_acknowledgments() {
         }
         // An unmet replica count still times out with the count reached.
         assert_eq!(writer.cmd(&["WAIT", "2", "25"]), V::Int(1), "{io}");
+    }
+}
+
+/// While WAITAOF waits for the disk, another client on its worker must
+/// still receive replies. Hold a checkpoint's old-log sync so no later
+/// write can be reported fsynced until the test releases it.
+#[test]
+fn a_waitaof_on_one_worker_does_not_stop_other_clients() {
+    for &io in io_models() {
+        let server = Server::start_with_env(
+            io,
+            1,
+            &["--aof"],
+            &[("KIVIDB_TEST_FAILPOINTS", "turn-over-syncing")],
+        );
+        let mut waiter = server.conn();
+        assert_eq!(waiter.cmd(&["SET", "before", "1"]), s("OK"), "{io}");
+        assert_eq!(
+            waiter.cmd(&["BGREWRITEAOF"]),
+            s("Background append only file rewriting started"),
+            "{io}"
+        );
+        let held = server.dir.join("failpoint.turn-over-syncing.1");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !held.exists() {
+            assert!(Instant::now() < deadline, "{io}: old-log sync was not held");
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        // This write belongs to the new log, which cannot be fsynced ahead
+        // of the old log. WAITAOF must really wait, however fast the disk.
+        assert_eq!(waiter.cmd(&["SET", "during", "2"]), s("OK"), "{io}");
+        assert_eq!(waiter.cmd(&["CLIENT", "SETNAME", "fsync-waiter"]), s("OK"));
+        let mut ctl = server.conn();
+        ctl.reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        waiter.send(&["WAITAOF", "1", "0", "0"]);
+
+        // Observe entry into WAITAOF before checking PING: checking it
+        // before the waiter runs would miss the starvation. The old yield
+        // loop can already prevent this CLIENT LIST reply from arriving.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let V::Str(clients) = ctl.cmd(&["CLIENT", "LIST"]) else {
+                panic!("{io}: CLIENT LIST is a bulk string");
+            };
+            if clients.lines().any(|line| {
+                line.split_whitespace().any(|v| v == "name=fsync-waiter")
+                    && line.split_whitespace().any(|v| v == "cmd=waitaof")
+            }) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{io}: WAITAOF never started");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(ctl.cmd(&["PING"]), s("PONG"), "{io}: WAITAOF stopped I/O");
+
+        // A reply here would mean the wait finished early, making PING's
+        // success meaningless. peek leaves any reply intact for read().
+        let socket = waiter.reader.get_ref();
+        socket.set_nonblocking(true).unwrap();
+        let reply = socket.peek(&mut [0]);
+        socket.set_nonblocking(false).unwrap();
+        assert!(
+            matches!(reply, Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "{io}: WAITAOF did not remain pending: {reply:?}"
+        );
+
+        std::fs::remove_file(held).unwrap();
+        assert_eq!(waiter.read(), V::Arr(vec![V::Int(1), V::Int(0)]), "{io}");
     }
 }
 
