@@ -34,7 +34,16 @@ pub(crate) type ShownRow = Vec<(String, String)>;
 pub(crate) fn rows_reply(resp: u8, total: usize, rows: &[ShownRow], timed_out: bool) -> Vec<u8> {
     let fields = |row: &ShownRow| -> Vec<Vec<u8>> {
         row.iter()
-            .flat_map(|(name, value)| [resp_bulk_str(name), value_reply(value, resp)])
+            .flat_map(|(name, value)| {
+                // A document's key, loaded as `@__key`, is a name
+                // (`key_bytes::text_of`): its reply is the key's bytes.
+                let value = if name == "__key" {
+                    resp_bulk(&crate::key_bytes::bytes_of(value))
+                } else {
+                    value_reply(value, resp)
+                };
+                [resp_bulk_str(name), value]
+            })
             .collect()
     };
     let warning = if timed_out {

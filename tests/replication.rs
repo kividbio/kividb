@@ -164,6 +164,7 @@ fn port_is_free(port: u16) -> bool {
 /// listening can otherwise be given, as its own end, the very port it is
 /// dialling: it is then connected to itself and reads back what it writes.
 fn free_port() -> u16 {
+    in_scratch_dir();
     use std::sync::atomic::{AtomicU16, Ordering};
     static NEXT: AtomicU16 = AtomicU16::new(0);
     loop {
@@ -773,6 +774,18 @@ fn test_replicaof_no_one_clears_master_addr() {
 
 /// Start a server from an arbitrary config and wait until it accepts
 /// connections. Returns its port.
+/// The servers these tests run write their files (`dump.kdb`,
+/// `dump.kdb.gen`, `dump.kdb.repl`) where the process runs, which was the
+/// repository's own directory. The process moves to a directory of its own
+/// before the first server starts (every test asks for a port first).
+fn in_scratch_dir() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dir = tempfile::tempdir().expect("a temporary directory").keep();
+        std::env::set_current_dir(dir).expect("into the temporary directory");
+    });
+}
+
 fn spawn_server(mut config: Config) -> u16 {
     let port = free_port();
     config.port = port;
@@ -990,59 +1003,9 @@ fn spawn_server_with(mut config: Config, threads: usize, io_model: IoModel) -> u
     panic!("server on port {port} did not start listening within 5s");
 }
 
-/// A script runs on a replica, and only a write it makes is refused, as in
-/// Redis; every EVAL, EVALSHA and FCALL was refused before it ran (#145).
-/// One that declares it may write is refused at once; one that declares
-/// `no-writes` runs.
-#[cfg(feature = "lua")]
-#[test]
-fn test_scripts_that_read_run_on_a_replica() {
-    let master = spawn_server(Config::default());
-    let replica = spawn_server(replica_of(master));
-    let mut r = Conn::connect(replica);
-    wait_link_up(&mut r);
-    let mut m = Conn::connect(master);
-    assert!(m.cmds(&["SET", "first", "1"]).is_ok());
-    assert!(m
-        .cmds(&[
-            "FUNCTION",
-            "LOAD",
-            "#!lua name=replica_lib\n\
-             redis.register_function{function_name='reads', \
-             callback=function(keys) return redis.call('GET', keys[1]) end, flags={'no-writes'}}\n\
-             redis.register_function('writes', function(keys) return redis.call('SET', keys[1], 'x') end)",
-        ])
-        .as_str()
-        .contains("replica_lib"));
-    wait_until("the replica to have first", Duration::from_secs(10), || {
-        r.cmds(&["GET", "first"]) == RespValue::Bulk(b"1".to_vec())
-    });
-    let refused =
-        |reply: &RespValue| matches!(reply, RespValue::Error(e) if e.contains("READONLY"));
-
-    let read = r.cmds(&["EVAL", "return redis.call('GET', KEYS[1])", "1", "first"]);
-    assert_eq!(read, RespValue::Bulk(b"1".to_vec()));
-    let write = r.cmds(&[
-        "EVAL",
-        "return redis.call('SET', KEYS[1], 'x')",
-        "1",
-        "first",
-    ]);
-    assert!(refused(&write), "{write:?}");
-    let declared = r.cmds(&["EVAL", "#!lua\nreturn 1", "0"]);
-    assert!(refused(&declared), "{declared:?}");
-    let no_writes = r.cmds(&["EVAL", "#!lua flags=no-writes\nreturn 2", "0"]);
-    assert_eq!(no_writes, RespValue::Int(2));
-
-    wait_until(
-        "the replica to have the library",
-        Duration::from_secs(10),
-        || r.cmds(&["FCALL", "reads", "1", "first"]) == RespValue::Bulk(b"1".to_vec()),
-    );
-    let write = r.cmds(&["FCALL", "writes", "1", "first"]);
-    assert!(refused(&write), "{write:?}");
-    assert_eq!(r.cmds(&["GET", "first"]), RespValue::Bulk(b"1".to_vec()));
-}
+// `test_scripts_that_read_run_on_a_replica` is in
+// tests/replication_functions.rs: the function libraries are process-global,
+// and the full syncs of the other tests here took its library away.
 
 /// `mem_replication_backlog` is what the backlog holds: it was 0 (#152).
 #[test]
@@ -2795,4 +2758,116 @@ fn a_replica_holds_json_numbers_exactly() {
         exact(&mut replica, "jr:stream", streamed),
         "from the stream"
     );
+}
+
+/// A stand-in master that answers the handshake, sends `payload` as a full
+/// sync and then `commands`, as a KeyDB primary would.
+fn keydb_master(payload: Vec<u8>, commands: &[&[&str]]) -> u16 {
+    let commands = commands
+        .iter()
+        .map(|c| c.iter().map(|s| s.to_string()).collect())
+        .collect();
+    spawn_master_sending(None, payload, commands)
+}
+
+/// REDIS0009, database 0: a set s {m1} and a hash h {f: v}.
+fn keydb_payload() -> Vec<u8> {
+    let mut payload = b"REDIS0009".to_vec();
+    payload.extend_from_slice(&[0xFE, 0]);
+    payload.extend_from_slice(&[2, 1, b's', 1, 2, b'm', b'1']);
+    payload.extend_from_slice(&[4, 1, b'h', 1, 1, b'f', 1, b'v']);
+    payload.push(0xFF);
+    payload.extend_from_slice(&[0; 8]);
+    payload
+}
+
+/// Waits for the link to end on a refusal, and returns its reason.
+fn refusal_of(c: &mut Conn) -> String {
+    wait_until(
+        "the link to end on a refusal",
+        Duration::from_secs(10),
+        || repl_info(c, "replica_last_sync_refusal").is_some(),
+    );
+    assert_eq!(repl_info(c, "master_link_status").as_deref(), Some("down"));
+    repl_info(c, "replica_last_sync_refusal").unwrap()
+}
+
+/// KeyDB's `EXPIREMEMBER` on a hash field is the field's TTL here. On a set
+/// member, which can't have one, it ends the link, and `INFO replication`
+/// says why; nothing after it is applied. Before, it was an unknown command,
+/// refused while the link stayed up (#452).
+#[test]
+fn test_a_replica_of_keydb_applies_field_ttls_and_stops_at_a_set_member_ttl() {
+    let master = keydb_master(
+        keydb_payload(),
+        &[
+            &["EXPIREMEMBER", "h", "f", "1000"],
+            &["SET", "plain", "1"],
+            &["EXPIREMEMBER", "s", "m1", "1000"],
+            &["SET", "after", "1"],
+        ],
+    );
+    let node = spawn_server(replica_of(master));
+    let mut c = Conn::connect(node);
+    let why = refusal_of(&mut c);
+    assert!(why.contains("m1") && why.contains("not a hash"), "{why}");
+    assert_eq!(c.cmds(&["GET", "plain"]).as_str(), "1");
+    let ttl = c.cmds(&["HTTL", "h", "FIELDS", "1", "f"]);
+    let ttl = ttl.as_array()[0].as_int();
+    assert!((990..=1000).contains(&ttl), "h f's TTL is {ttl}");
+    assert_eq!(c.cmds(&["EXISTS", "after"]).as_int(), 0);
+}
+
+/// A KeyDB primary in active replication sends every write wrapped in
+/// `RREPLAY`, nested once more for each master of the mesh it went through.
+/// It was an unknown command, refused while the link showed as up. It is
+/// not followed (not in 1.2.1): the link ends, saying so, and nothing after
+/// it is applied (#452).
+#[test]
+fn test_a_replica_of_keydb_in_active_replication_stops_at_rreplay() {
+    let origin = "4f1c2b52-0d0f-4a5e-9a3c-2b1d5f6e7a8b";
+    let master = keydb_master(
+        keydb_payload(),
+        &[
+            &["SET", "before", "1"],
+            &[
+                "RREPLAY",
+                origin,
+                "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n",
+                "0",
+                "5",
+            ],
+            &["SET", "after", "1"],
+        ],
+    );
+    let node = spawn_server(replica_of(master));
+    let mut c = Conn::connect(node);
+    let why = refusal_of(&mut c);
+    assert!(
+        why.contains("KeyDB active replication (RREPLAY) is not supported"),
+        "{why}"
+    );
+    assert_eq!(c.cmds(&["GET", "before"]).as_str(), "1");
+    assert_eq!(c.cmds(&["EXISTS", "k"]).as_int(), 0);
+    assert_eq!(c.cmds(&["EXISTS", "after"]).as_int(), 0);
+}
+
+/// A Redis full sync that does not read is a broken link, retried as
+/// before: not a refusal of what the master holds (nothing in `INFO`), which
+/// waits a minute or more between tries.
+#[test]
+fn test_a_redis_payload_that_does_not_read_is_a_broken_link_not_a_refusal() {
+    let mut payload = b"REDIS0011".to_vec();
+    payload.extend_from_slice(&[0xFE, 0, 0xF1, 1, 2, 3]);
+    payload.push(0xFF);
+    payload.extend_from_slice(&[0; 8]);
+    let master = keydb_master(payload, &[]);
+    let node = spawn_server(replica_of(master));
+    let mut c = Conn::connect(node);
+    wait_until("the full sync to fail", Duration::from_secs(10), || {
+        repl_info(&mut c, "master_link_status").as_deref() == Some("down")
+            && repl_info(&mut c, "master_sync_in_progress").as_deref() != Some("1")
+    });
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(repl_info(&mut c, "replica_last_sync_refusal"), None);
 }

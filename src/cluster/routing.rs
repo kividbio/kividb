@@ -125,10 +125,8 @@ impl Caller<'_> {
             asking,
             || self.registry.get_readonly(self.client_id),
             |key| {
-                std::str::from_utf8(key).is_ok_and(|key| {
-                    let shard = crate::store::get_shard(&self.store[self.db], key);
-                    crate::read_lock!(shard).contains_key(key)
-                })
+                let shard = crate::store::get_shard(&self.store[self.db], key);
+                crate::read_lock!(shard).contains_key(key)
             },
         )
     }

@@ -1,3 +1,4 @@
+use crate::store::Key;
 use ahash::AHashMap;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -27,7 +28,7 @@ pub struct Ticket {
     /// The lines it waits in, to leave when it is dropped: recorded when its
     /// command parks (see [`Ticket::parks_in`]), so that one answered at
     /// once costs nothing for this.
-    lines: Mutex<Vec<(Line, String)>>,
+    lines: Mutex<Vec<(Line, Key)>>,
     table: Weak<WaitTable>,
 }
 
@@ -42,11 +43,11 @@ impl Ticket {
     /// Its command parks, waiting on `keys` (`readers`: in their
     /// `XREADGROUP` lines): what the `Drop` is to leave. Once: a command
     /// that parks again waits on the same keys.
-    pub fn parks_in(&self, keys: &[String], readers: bool) {
+    pub fn parks_in(&self, keys: &[impl AsRef<[u8]>], readers: bool) {
         let line = if readers { Line::Readers } else { Line::Keys };
         let mut lines = self.lines.lock();
         if lines.is_empty() {
-            lines.extend(keys.iter().map(|key| (line, key.clone())));
+            lines.extend(keys.iter().map(|key| (line, Key::new(key.as_ref()))));
         }
     }
 }
@@ -62,7 +63,7 @@ impl Drop for Ticket {
             return;
         };
         for (line, key) in lines {
-            table.leave_dropped(line, &key, self.id);
+            table.leave_dropped(line, key.as_bytes(), self.id);
         }
     }
 }
@@ -81,23 +82,23 @@ pub struct WaitTable {
     // by registration: a [`StreamWait`] takes its own out when it is dropped,
     // without looking through the others. They are all woken together, so
     // their order does not matter. See [`WaitTable::notify_stream_waiters`].
-    inner: Mutex<AHashMap<String, AHashMap<u64, oneshot::Sender<Value>>>>,
+    inner: Mutex<AHashMap<Key, AHashMap<u64, oneshot::Sender<Value>>>>,
     /// Key → clients waiting to be told the key was written: the blocking
     /// list and sorted-set commands and `TS.READ`. See
     /// [`WaitTable::register_signal`].
-    signals: Mutex<AHashMap<String, Vec<oneshot::Sender<Value>>>>,
+    signals: Mutex<AHashMap<Key, Vec<oneshot::Sender<Value>>>>,
     /// Number of entries in `signals`, so a push can skip the lock entirely
     /// when nobody is waiting — which is nearly always.
     signal_count: AtomicUsize,
     /// Key → the clients blocked on it in a list or sorted-set command, in
     /// the order they blocked. See [`WaitTable::enqueue`].
-    queues: Mutex<AHashMap<String, Vec<Queued>>>,
+    queues: Mutex<AHashMap<Key, Vec<Queued>>>,
     /// Key → the clients blocked on it in `XREADGROUP`, in the order they
     /// blocked. A line of its own: these clients are waiting on a stream and
     /// those in `queues` on a list or a sorted set, and what one kind finds
     /// at the key says nothing about what the other will. Each line is woken
     /// from its head when the key is written.
-    reader_queues: Mutex<AHashMap<String, Vec<Queued>>>,
+    reader_queues: Mutex<AHashMap<Key, Vec<Queued>>>,
     /// Number of entries in `queues` and `reader_queues`, for the same
     /// reason as `signal_count`.
     queued_count: AtomicUsize,
@@ -151,7 +152,7 @@ impl WaitTable {
     /// had been woken and had not looked, the turn to the client behind it.
     /// Nothing to do for one that left the line before it went, as a command
     /// that is answered does.
-    fn leave_dropped(&self, line: Line, key: &str, id: u64) {
+    fn leave_dropped(&self, line: Line, key: &[u8], id: u64) {
         let lines = match line {
             Line::Keys => &self.queues,
             Line::Readers => &self.reader_queues,
@@ -178,25 +179,35 @@ impl WaitTable {
 
     /// Stand in the line for `key` — or, already in it, stay where `ticket`
     /// says — and return the receiver this client is woken through.
-    pub fn enqueue(&self, key: &str, ticket: &Arc<Ticket>) -> oneshot::Receiver<Value> {
+    pub fn enqueue(
+        &self,
+        key: &(impl AsRef<[u8]> + ?Sized),
+        ticket: &Arc<Ticket>,
+    ) -> oneshot::Receiver<Value> {
+        let key = key.as_ref();
         self.enqueue_in(&self.queues, key, ticket)
     }
 
     /// [`enqueue`](Self::enqueue), in the line of the key's `XREADGROUP`
     /// clients.
-    pub fn enqueue_reader(&self, key: &str, ticket: &Arc<Ticket>) -> oneshot::Receiver<Value> {
+    pub fn enqueue_reader(
+        &self,
+        key: &(impl AsRef<[u8]> + ?Sized),
+        ticket: &Arc<Ticket>,
+    ) -> oneshot::Receiver<Value> {
+        let key = key.as_ref();
         self.enqueue_in(&self.reader_queues, key, ticket)
     }
 
     fn enqueue_in(
         &self,
-        lines: &Mutex<AHashMap<String, Vec<Queued>>>,
-        key: &str,
+        lines: &Mutex<AHashMap<Key, Vec<Queued>>>,
+        key: &[u8],
         ticket: &Arc<Ticket>,
     ) -> oneshot::Receiver<Value> {
         let (tx, rx) = oneshot::channel();
         let mut queues = lines.lock();
-        let queue = queues.entry(key.to_string()).or_default();
+        let queue = queues.entry(Key::new(key)).or_default();
         // The moment to forget clients that have gone: it keeps a key that is
         // waited on again and again from collecting them. Not one that was
         // woken and has not looked: its ticket's `Drop`, under way, takes it
@@ -223,24 +234,27 @@ impl WaitTable {
     }
 
     /// Leave the line for `key`.
-    pub fn dequeue(&self, key: &str, ticket: &Ticket) {
+    pub fn dequeue(&self, key: &(impl AsRef<[u8]> + ?Sized), ticket: &Ticket) {
+        let key = key.as_ref();
         self.dequeue_in(&self.queues, key, ticket);
     }
 
     /// Leave the line of `key`'s `XREADGROUP` clients, and give the turn to
     /// the client behind: it may be reading for another group, for which
     /// there is something.
-    pub fn reader_done(&self, key: &str, ticket: &Ticket) {
+    pub fn reader_done(&self, key: &(impl AsRef<[u8]> + ?Sized), ticket: &Ticket) {
+        let key = key.as_ref();
         self.dequeue_in(&self.reader_queues, key, ticket);
         self.wake_next_in(&self.reader_queues, key, ticket.id);
     }
 
     /// Stay in that line, and give the turn to the client behind.
-    pub fn reader_pass_on(&self, key: &str, ticket: &Ticket) {
+    pub fn reader_pass_on(&self, key: &(impl AsRef<[u8]> + ?Sized), ticket: &Ticket) {
+        let key = key.as_ref();
         self.wake_next_in(&self.reader_queues, key, ticket.id);
     }
 
-    fn dequeue_in(&self, lines: &Mutex<AHashMap<String, Vec<Queued>>>, key: &str, ticket: &Ticket) {
+    fn dequeue_in(&self, lines: &Mutex<AHashMap<Key, Vec<Queued>>>, key: &[u8], ticket: &Ticket) {
         let mut queues = lines.lock();
         let Some(queue) = queues.get_mut(key) else {
             return;
@@ -256,7 +270,8 @@ impl WaitTable {
 
     /// Whether a client that blocked before `ticket` is still in the line
     /// for `key`.
-    pub fn someone_ahead(&self, key: &str, ticket: &Ticket) -> bool {
+    pub fn someone_ahead(&self, key: &(impl AsRef<[u8]> + ?Sized), ticket: &Ticket) -> bool {
+        let key = key.as_ref();
         if self.queued_count.load(Ordering::Relaxed) == 0 {
             return false;
         }
@@ -268,7 +283,8 @@ impl WaitTable {
     }
 
     /// Make sure the client at the head of the line for `key` looks at it.
-    pub fn wake_head(&self, key: &str) {
+    pub fn wake_head(&self, key: &(impl AsRef<[u8]> + ?Sized)) {
+        let key = key.as_ref();
         self.wake_next(key, 0);
     }
 
@@ -276,18 +292,19 @@ impl WaitTable {
     /// Every client calls this once it has looked at the key, whether or not
     /// it found something: there may be more than it took, or something it
     /// could not use that the next one can.
-    pub fn pass_on(&self, key: &str, ticket: &Ticket) {
+    pub fn pass_on(&self, key: &(impl AsRef<[u8]> + ?Sized), ticket: &Ticket) {
+        let key = key.as_ref();
         self.wake_next(key, ticket.id);
     }
 
     /// Wake the first client in the line for `key` whose ticket is after
     /// `after`. If that client has already been woken and has not looked yet,
     /// there is nothing to do: it will, and it will pass the turn on.
-    fn wake_next(&self, key: &str, after: u64) {
+    fn wake_next(&self, key: &[u8], after: u64) {
         self.wake_next_in(&self.queues, key, after);
     }
 
-    fn wake_next_in(&self, lines: &Mutex<AHashMap<String, Vec<Queued>>>, key: &str, after: u64) {
+    fn wake_next_in(&self, lines: &Mutex<AHashMap<Key, Vec<Queued>>>, key: &[u8], after: u64) {
         if self.queued_count.load(Ordering::Relaxed) == 0 {
             return;
         }
@@ -315,10 +332,11 @@ impl WaitTable {
     /// takes what its own rules say it should, and goes back to waiting if
     /// there was nothing for it — another client was quicker, or the list is
     /// still too short for `BLMOVEM … EXACTLY`.
-    pub fn register_signal(&self, key: &str) -> oneshot::Receiver<Value> {
+    pub fn register_signal(&self, key: &(impl AsRef<[u8]> + ?Sized)) -> oneshot::Receiver<Value> {
+        let key = key.as_ref();
         let (tx, rx) = oneshot::channel();
         let mut signals = self.signals.lock();
-        signals.entry(key.to_string()).or_default().push(tx);
+        signals.entry(Key::new(key)).or_default().push(tx);
         self.signal_count.fetch_add(1, Ordering::Relaxed);
         rx
     }
@@ -334,7 +352,8 @@ impl WaitTable {
     /// Wake everyone registered with [`register_signal`](Self::register_signal)
     /// on `key`. Called after the key has been written.
     #[inline]
-    pub fn notify_signal(&self, key: &str) {
+    pub fn notify_signal(&self, key: &(impl AsRef<[u8]> + ?Sized)) {
+        let key = key.as_ref();
         // The lines for the key: the client at the head of each.
         self.wake_next(key, 0);
         self.wake_next_in(&self.reader_queues, key, 0);
@@ -356,7 +375,7 @@ impl WaitTable {
     /// Wake everyone waiting to be told that a key was written: every key has
     /// been, in the only way a flush writes one.
     pub fn notify_all_signals(&self) {
-        let keys: Vec<String> = {
+        let keys: Vec<Key> = {
             let signals = self.signals.lock();
             let queues = self.queues.lock();
             let readers = self.reader_queues.lock();
@@ -377,7 +396,7 @@ impl WaitTable {
     /// of a consumer group): `INFO`'s `total_blocking_keys` and
     /// `total_blocking_keys_on_nokey`.
     pub fn blocking_keys(&self) -> (usize, usize) {
-        let mut keys: ahash::AHashSet<String> = ahash::AHashSet::new();
+        let mut keys: ahash::AHashSet<Key> = ahash::AHashSet::new();
         for (key, waiters) in self.inner.lock().iter() {
             if waiters.values().any(|tx| !tx.is_closed()) {
                 keys.insert(key.clone());
@@ -407,7 +426,8 @@ impl WaitTable {
 
     /// Forget signal registrations on `key` whose client has stopped waiting
     /// (timed out or disconnected).
-    pub fn prune_signals(&self, key: &str) {
+    pub fn prune_signals(&self, key: &(impl AsRef<[u8]> + ?Sized)) {
+        let key = key.as_ref();
         if self.signal_count.load(Ordering::Relaxed) == 0 {
             return;
         }
@@ -435,7 +455,8 @@ impl WaitTable {
     /// Used by XADD to wake XREAD BLOCK clients — the client re-reads the
     /// stream itself after waking, so we just need the signal.
     /// Returns the number of waiters notified.
-    pub fn notify_stream_waiters(&self, key: &str) -> usize {
+    pub fn notify_stream_waiters(&self, key: &(impl AsRef<[u8]> + ?Sized)) -> usize {
+        let key = key.as_ref();
         // We reuse the existing Value channel but send a zero-length sentinel.
         // The receiver treats any arrival as "data may be available, go check".
         let sentinel: Value = Arc::from([].as_slice());
@@ -458,22 +479,23 @@ pub struct StreamWait {
     table: Arc<WaitTable>,
     /// Each registration's key and its own id: a reader may name a stream
     /// twice (`XREAD STREAMS s s 0 0`), and each is a waiter of its own.
-    registered: Vec<(String, u64)>,
+    registered: Vec<(Key, u64)>,
 }
 
 impl StreamWait {
     /// Register on `key` and return the receiver the reader is woken
     /// through. A tokio oneshot, so the caller does not block an OS thread.
-    pub fn register(&mut self, key: &str) -> oneshot::Receiver<Value> {
+    pub fn register(&mut self, key: &(impl AsRef<[u8]> + ?Sized)) -> oneshot::Receiver<Value> {
+        let key = key.as_ref();
         let (tx, rx) = oneshot::channel();
         let id = self.table.next_ticket.fetch_add(1, Ordering::Relaxed);
         self.table
             .inner
             .lock()
-            .entry(key.to_string())
+            .entry(Key::new(key))
             .or_default()
             .insert(id, tx);
-        self.registered.push((key.to_string(), id));
+        self.registered.push((Key::new(key), id));
         rx
     }
 }

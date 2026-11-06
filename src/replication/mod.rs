@@ -15,6 +15,7 @@ use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::mpsc;
 
 pub mod digest;
+pub(crate) mod keydb;
 pub mod replica_client; // Step 4 lives here
 pub mod script_feed;
 

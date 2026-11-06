@@ -37,6 +37,18 @@ fn tmp_kdb(tag: &str) -> String {
     format!("/tmp/kivi_test_{tag}_{id:?}_{ts}.kdb")
 }
 
+/// A loaded database keyed by text, for these tests, whose keys all are:
+/// a load gives keys back as bytes (`store::Key`).
+fn texted<V>(map: HashMap<kividb::store::Key, V>) -> HashMap<String, V> {
+    map.into_iter()
+        .map(|(key, value)| (String::from_utf8(key.to_vec()).unwrap(), value))
+        .collect()
+}
+
+fn texted_all<V>(maps: Vec<HashMap<kividb::store::Key, V>>) -> Vec<HashMap<String, V>> {
+    maps.into_iter().map(texted).collect()
+}
+
 fn tmp_rdb(tag: &str) -> String {
     let id = std::thread::current().id();
     let ts = std::time::SystemTime::now()
@@ -52,7 +64,7 @@ fn roundtrip_kdb(maps: Vec<HashMap<String, KiviDBValue>>) -> HashMap<String, Kiv
     write_snapshot(&path, &maps, None).expect("write_snapshot failed");
     let mut loaded = load_snapshot(&path).expect("load_snapshot failed");
     std::fs::remove_file(&path).ok();
-    loaded.dbs.remove(0)
+    texted(loaded.dbs.remove(0))
 }
 
 /// Build a minimal one-key KDB map, roundtrip it, return the value.
@@ -529,7 +541,7 @@ fn kdb_stream_legacy_v1_loads_without_groups() {
 
     let loaded = load_snapshot(&path).expect("legacy TAG_STREAM dump must still load");
     std::fs::remove_file(&path).ok();
-    match loaded.dbs[0].get("s") {
+    match texted_all(loaded.dbs.clone())[0].get("s") {
         Some(KiviDBValue::Stream(s)) => {
             assert!(s.read().groups.is_empty());
         }
@@ -798,15 +810,15 @@ fn kdb_multiple_databases() {
     std::fs::remove_file(&path).ok();
 
     assert_eq!(loaded.dbs.len(), 3);
-    match &loaded.dbs[0]["k0"] {
+    match &texted_all(loaded.dbs.clone())[0]["k0"] {
         KiviDBValue::String(b) => assert_eq!(b.as_ref(), b"in_db0"),
         _ => panic!(),
     }
-    match &loaded.dbs[1]["k1"] {
+    match &texted_all(loaded.dbs.clone())[1]["k1"] {
         KiviDBValue::String(b) => assert_eq!(b.as_ref(), b"in_db1"),
         _ => panic!(),
     }
-    match &loaded.dbs[2]["k2"] {
+    match &texted_all(loaded.dbs.clone())[2]["k2"] {
         KiviDBValue::String(b) => assert_eq!(b.as_ref(), b"in_db2"),
         _ => panic!(),
     }
@@ -832,11 +844,11 @@ fn kdb_same_key_different_databases() {
     let loaded = load_snapshot(&path).unwrap();
     std::fs::remove_file(&path).ok();
 
-    match &loaded.dbs[0]["shared"] {
+    match &texted_all(loaded.dbs.clone())[0]["shared"] {
         KiviDBValue::String(b) => assert_eq!(b.as_ref(), b"db0_value"),
         _ => panic!(),
     }
-    match &loaded.dbs[1]["shared"] {
+    match &texted_all(loaded.dbs.clone())[1]["shared"] {
         KiviDBValue::String(b) => assert_eq!(b.as_ref(), b"db1_value"),
         _ => panic!(),
     }
@@ -926,7 +938,7 @@ fn kdb_all_types_together() {
     let mut loaded = load_snapshot(&path).unwrap();
     std::fs::remove_file(&path).ok();
 
-    let db = loaded.dbs.remove(0);
+    let db = texted(loaded.dbs.remove(0));
     assert_eq!(db.len(), 9);
 
     assert!(matches!(db["str"], KiviDBValue::String(_)));
@@ -961,7 +973,7 @@ fn kdb_empty_store_roundtrip() {
     let loaded = load_snapshot(&path).unwrap();
     std::fs::remove_file(&path).ok();
     assert_eq!(loaded.dbs.len(), 1);
-    assert!(loaded.dbs[0].is_empty());
+    assert!(texted_all(loaded.dbs.clone())[0].is_empty());
 }
 
 #[test]
@@ -985,7 +997,7 @@ fn kdb_unicode_keys() {
     let mut loaded = load_snapshot(&path).unwrap();
     std::fs::remove_file(&path).ok();
 
-    let db = loaded.dbs.remove(0);
+    let db = texted(loaded.dbs.remove(0));
     assert_eq!(db.len(), 3);
     match &db["日本語"] {
         KiviDBValue::String(b) => assert_eq!(b.as_ref(), b"japanese"),
@@ -1056,7 +1068,7 @@ fn rdb_string_basic() {
     payload.extend(rdb_str(b"hello world"));
 
     let path = write_rdb_file("rdb_str", rdb_file(0, payload));
-    let loaded = load_redis_rdb(&path).unwrap();
+    let loaded = texted_all(load_redis_rdb(&path).unwrap());
     std::fs::remove_file(&path).ok();
 
     match &loaded[0]["greeting"] {
@@ -1076,7 +1088,7 @@ fn rdb_string_integer_encoded() {
     payload.push(42u8); // value = 42
 
     let path = write_rdb_file("rdb_int8", rdb_file(0, payload));
-    let loaded = load_redis_rdb(&path).unwrap();
+    let loaded = texted_all(load_redis_rdb(&path).unwrap());
     std::fs::remove_file(&path).ok();
 
     match &loaded[0]["myint"] {
@@ -1094,7 +1106,7 @@ fn rdb_string_int16_encoded() {
     payload.extend_from_slice(&1000i16.to_le_bytes());
 
     let path = write_rdb_file("rdb_int16", rdb_file(0, payload));
-    let loaded = load_redis_rdb(&path).unwrap();
+    let loaded = texted_all(load_redis_rdb(&path).unwrap());
     std::fs::remove_file(&path).ok();
 
     match &loaded[0]["k"] {
@@ -1112,7 +1124,7 @@ fn rdb_string_int32_encoded() {
     payload.extend_from_slice(&100_000i32.to_le_bytes());
 
     let path = write_rdb_file("rdb_int32", rdb_file(0, payload));
-    let loaded = load_redis_rdb(&path).unwrap();
+    let loaded = texted_all(load_redis_rdb(&path).unwrap());
     std::fs::remove_file(&path).ok();
 
     match &loaded[0]["k"] {
@@ -1137,7 +1149,7 @@ fn rdb_hash_basic() {
     payload.extend(rdb_str(b"30"));
 
     let path = write_rdb_file("rdb_hash", rdb_file(0, payload));
-    let loaded = load_redis_rdb(&path).unwrap();
+    let loaded = texted_all(load_redis_rdb(&path).unwrap());
     std::fs::remove_file(&path).ok();
 
     match &loaded[0]["myhash"] {
@@ -1166,7 +1178,7 @@ fn rdb_list_basic() {
     payload.extend(rdb_str(b"gamma"));
 
     let path = write_rdb_file("rdb_list", rdb_file(0, payload));
-    let loaded = load_redis_rdb(&path).unwrap();
+    let loaded = texted_all(load_redis_rdb(&path).unwrap());
     std::fs::remove_file(&path).ok();
 
     match &loaded[0]["mylist"] {
@@ -1195,7 +1207,7 @@ fn rdb_set_basic() {
     payload.extend(rdb_str(b"banana"));
 
     let path = write_rdb_file("rdb_set", rdb_file(0, payload));
-    let loaded = load_redis_rdb(&path).unwrap();
+    let loaded = texted_all(load_redis_rdb(&path).unwrap());
     std::fs::remove_file(&path).ok();
 
     match &loaded[0]["myset"] {
@@ -1233,7 +1245,7 @@ fn rdb_zset_v1_basic() {
     payload.extend_from_slice(score_str2);
 
     let path = write_rdb_file("rdb_zset_v1", rdb_file(0, payload));
-    let loaded = load_redis_rdb(&path).unwrap();
+    let loaded = texted_all(load_redis_rdb(&path).unwrap());
     std::fs::remove_file(&path).ok();
 
     match &loaded[0]["myzset"] {
@@ -1265,7 +1277,7 @@ fn rdb_zset_v2_basic() {
     payload.extend_from_slice(&(-3.15f64).to_le_bytes());
 
     let path = write_rdb_file("rdb_zset_v2", rdb_file(0, payload));
-    let loaded = load_redis_rdb(&path).unwrap();
+    let loaded = texted_all(load_redis_rdb(&path).unwrap());
     std::fs::remove_file(&path).ok();
 
     match &loaded[0]["zv2"] {
@@ -1309,7 +1321,7 @@ fn rdb_aux_fields_skipped() {
     out.extend_from_slice(&[0u8; 8]);
 
     let path = write_rdb_file("rdb_aux", out);
-    let loaded = load_redis_rdb(&path).unwrap();
+    let loaded = texted_all(load_redis_rdb(&path).unwrap());
     std::fs::remove_file(&path).ok();
 
     match &loaded[0]["k"] {
@@ -1348,7 +1360,7 @@ fn rdb_multi_db_select() {
     out.extend_from_slice(&[0u8; 8]);
 
     let path = write_rdb_file("rdb_multidb", out);
-    let loaded = load_redis_rdb(&path).unwrap();
+    let loaded = texted_all(load_redis_rdb(&path).unwrap());
     std::fs::remove_file(&path).ok();
 
     // DB 0
@@ -1378,7 +1390,7 @@ fn rdb_expiry_prefix_discarded() {
     payload.extend(rdb_str(b"expval"));
 
     let path = write_rdb_file("rdb_expiry", rdb_file(0, payload));
-    let loaded = load_redis_rdb(&path).unwrap();
+    let loaded = texted_all(load_redis_rdb(&path).unwrap());
     std::fs::remove_file(&path).ok();
 
     // Key must exist (expiry is not enforced at load time)
@@ -1410,7 +1422,7 @@ fn rdb_empty_database() {
     out.extend_from_slice(&[0u8; 8]);
 
     let path = write_rdb_file("rdb_empty", out);
-    let loaded = load_redis_rdb(&path).unwrap();
+    let loaded = texted_all(load_redis_rdb(&path).unwrap());
     std::fs::remove_file(&path).ok();
 
     assert!(loaded[0].is_empty());
@@ -1457,7 +1469,7 @@ fn rdb_mixed_types_one_db() {
     payload.extend_from_slice(&7.0f64.to_le_bytes());
 
     let path = write_rdb_file("rdb_mixed", rdb_file(0, payload));
-    let loaded = load_redis_rdb(&path).unwrap();
+    let loaded = texted_all(load_redis_rdb(&path).unwrap());
     std::fs::remove_file(&path).ok();
 
     assert_eq!(loaded[0].len(), 5);
@@ -1572,6 +1584,8 @@ fn rdb_files_written_by_redis_7_4_and_8_10_load() {
     for (label, bytes) in files {
         let (dbs, expiries, _) = kividb::snapshot::load_redis_rdb_from(bytes)
             .unwrap_or_else(|e| panic!("Redis {label}: {e}"));
+        let dbs = texted_all(dbs);
+        let expiries = texted_all(expiries);
         let db = &dbs[0];
         let mut keys: Vec<&str> = db.keys().map(String::as_str).collect();
         keys.sort_unstable();
@@ -1664,6 +1678,7 @@ fn an_rdb_file_with_streams_json_and_field_ttls_from_redis_8_10_loads() {
         &include_bytes!("fixtures/redis-8.10-streams-json-ttl.rdb")[..],
     )
     .unwrap();
+    let dbs = texted_all(dbs);
     let db = &dbs[0];
     let mut keys: Vec<&str> = db.keys().map(String::as_str).collect();
     keys.sort_unstable();
@@ -1723,6 +1738,8 @@ fn rdb_files_saved_by_redis_8_10_under_lru_and_lfu_policies_load() {
     for (policy, bytes, restored) in files {
         let (dbs, expiries, _) = kividb::snapshot::load_redis_rdb_from(bytes)
             .unwrap_or_else(|e| panic!("{policy}: {e}"));
+        let dbs = texted_all(dbs);
+        let expiries = texted_all(expiries);
         let db = &dbs[0];
         let mut keys: Vec<&str> = db.keys().map(String::as_str).collect();
         keys.sort_unstable();
@@ -1753,6 +1770,8 @@ fn an_rdb_file_from_a_redis_8_10_cluster_node_loads() {
         &include_bytes!("fixtures/redis-8.10-cluster.rdb")[..],
     )
     .unwrap();
+    let dbs = texted_all(dbs);
+    let expiries = texted_all(expiries);
     let mut keys: Vec<&str> = dbs[0].keys().map(String::as_str).collect();
     keys.sort_unstable();
     assert_eq!(keys, ["s", "ttl", "{s}x"]);
@@ -1795,6 +1814,8 @@ fn rdb_idle_and_freq_before_keys_with_and_without_an_expiry() {
     key(&mut p, b"e");
 
     let (dbs, expiries, _) = kividb::snapshot::load_redis_rdb_from(&rdb_file(0, p)[..]).unwrap();
+    let dbs = texted_all(dbs);
+    let expiries = texted_all(expiries);
     let mut keys: Vec<&str> = dbs[0].keys().map(String::as_str).collect();
     keys.sort_unstable();
     assert_eq!(keys, ["a", "b", "c", "d", "e"]);
@@ -1829,6 +1850,8 @@ fn rdb_files_with_the_search_modules_data_load_without_it() {
     for (label, bytes, expected) in files {
         let (dbs, expiries, _) =
             kividb::snapshot::load_redis_rdb_from(bytes).unwrap_or_else(|e| panic!("{label}: {e}"));
+        let dbs = texted_all(dbs);
+        let expiries = texted_all(expiries);
         let mut keys: Vec<&str> = dbs[0].keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(keys, expected, "{label}");
@@ -1875,6 +1898,8 @@ fn redis_stack_6_2_files_load_unless_they_hold_a_graph() {
     let (dbs, expiries, _) =
         kividb::snapshot::load_redis_rdb_from(&include_bytes!("fixtures/redis-stack-6.2.rdb")[..])
             .unwrap();
+    let dbs = texted_all(dbs);
+    let expiries = texted_all(expiries);
     let mut keys: Vec<&str> = dbs[0].keys().map(String::as_str).collect();
     keys.sort_unstable();
     assert_eq!(keys, ["h", "l", "s", "ttl"]);
@@ -1904,6 +1929,7 @@ fn rdb_module_aux_data_is_skipped_for_search_and_refused_for_other_modules() {
     p.extend(rdb_str(b"v"));
     p.extend(module_aux("scdtype00"));
     let (dbs, _, _) = kividb::snapshot::load_redis_rdb_from(&rdb_file(0, p)[..]).unwrap();
+    let dbs = texted_all(dbs);
     assert_eq!(dbs[0].len(), 1);
 
     let err = kividb::snapshot::load_redis_rdb_from(&rdb_file(0, module_aux("abcdefghi"))[..])
@@ -1935,6 +1961,8 @@ fn rdb_files_with_function_libraries_from_redis_7_4_and_8_10_load() {
     for (label, bytes) in files {
         let (dbs, expiries, functions) = kividb::snapshot::load_redis_rdb_from(bytes)
             .unwrap_or_else(|e| panic!("Redis {label}: {e}"));
+        let dbs = texted_all(dbs);
+        let expiries = texted_all(expiries);
         let mut keys: Vec<&str> = dbs[0].keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(keys, ["s", "ttl"], "Redis {label}");
@@ -1979,4 +2007,112 @@ fn rdb_opcodes_kividb_does_not_read_are_refused_by_name() {
             .expect("the opcode is refused");
         assert!(err.to_string().contains(named), "{opcode:#04x}: {err}");
     }
+}
+
+// A Dragonfly snapshot in Dragonfly's own format is a summary file and a
+// file for each shard (`dump-<time>-summary.dfs`, `dump-<time>-0000.dfs`,
+// ...). Each is an RDB file: the summary has no keys, a shard file has its
+// shard's. Either loaded, as a server with none of the data or a fraction
+// of it (#444). From Dragonfly 1.32 on they are refused here, by the fields
+// only these files have; earlier ones are refused by `--preload-file` (see
+// tests/backup.rs). An RDB file saved by Dragonfly (`SAVE RDB`) loads, from
+// 2.1 and from 1.31. The fixtures hold 200 strings, a hash and a list.
+#[test]
+fn dragonfly_snapshot_files_are_refused_and_its_rdb_files_load() {
+    for (name, bytes) in [
+        (
+            "summary",
+            &include_bytes!("fixtures/dragonfly-2.1-summary.dfs")[..],
+        ),
+        (
+            "shard",
+            &include_bytes!("fixtures/dragonfly-2.1-0000.dfs")[..],
+        ),
+    ] {
+        let err = kividb::snapshot::load_redis_rdb_from(bytes)
+            .err()
+            .unwrap_or_else(|| panic!("the {name} file loaded"));
+        assert!(err.to_string().contains("Dragonfly"), "{name}: {err}");
+    }
+
+    for (version, bytes) in [
+        (
+            "2.1",
+            &include_bytes!("fixtures/dragonfly-2.1-save-rdb.rdb")[..],
+        ),
+        (
+            "1.31",
+            &include_bytes!("fixtures/dragonfly-1.31-save-rdb.rdb")[..],
+        ),
+    ] {
+        let (dbs, _, _) = kividb::snapshot::load_redis_rdb_from(bytes)
+            .unwrap_or_else(|e| panic!("Dragonfly {version}: {e}"));
+        let dbs = texted_all(dbs);
+        assert_eq!(dbs[0].len(), 202, "Dragonfly {version}");
+        match &dbs[0]["key:7"] {
+            KiviDBValue::String(b) => assert_eq!(b.as_ref(), b"val7"),
+            _ => panic!("Dragonfly {version} key:7: wrong type"),
+        }
+        assert!(matches!(dbs[0]["h"], KiviDBValue::Hash(_)));
+        assert!(matches!(dbs[0]["l"], KiviDBValue::List(_)));
+    }
+}
+
+// An RDB file that is not whole is refused, not loaded as far as it goes
+// (#444): one cut anywhere, the checksum too, one with a byte changed, and
+// one whose version is not a number. A checksum of 0 is none, as Redis
+// writes with `rdbchecksum no`.
+#[test]
+fn rdb_files_that_are_cut_damaged_or_not_rdb_are_refused() {
+    let whole = &include_bytes!("fixtures/redis-8.10.rdb")[..];
+    let load = |bytes: &[u8]| kividb::snapshot::load_redis_rdb_from(bytes);
+    assert!(load(whole).is_ok());
+    for cut in [
+        0,
+        3,
+        5,
+        9,
+        10,
+        whole.len() / 2,
+        whole.len() - 8,
+        whole.len() - 1,
+    ] {
+        assert!(
+            load(&whole[..cut]).is_err(),
+            "cut at {cut} of {}: loaded",
+            whole.len()
+        );
+    }
+    let err = load(&whole[..whole.len() - 8]).err().unwrap();
+    assert!(err.to_string().contains("checksum"), "{err}");
+
+    // A byte of a value changed: "hello" is one of the strings.
+    let at = whole
+        .windows(5)
+        .position(|w| w == b"hello")
+        .expect("the fixture has hello");
+    let mut damaged = whole.to_vec();
+    damaged[at] = b'j';
+    let err = load(&damaged[..]).err().expect("a damaged file loaded");
+    assert!(err.to_string().contains("checksum"), "{err}");
+
+    // With no checksum, the same file loads.
+    let len = damaged.len();
+    damaged[len - 8..].fill(0);
+    assert!(load(&damaged[..]).is_ok());
+
+    for not_rdb in [
+        &b""[..],
+        b"REDIS",
+        b"REDIS0011",
+        b"REDIS0011\xFF",
+        b"REDISxxxx\xFF\0\0\0\0\0\0\0\0",
+        b"REDIS+011\xFF\0\0\0\0\0\0\0\0",
+        b"REDIS0000\xFF\0\0\0\0\0\0\0\0",
+    ] {
+        assert!(load(not_rdb).is_err(), "{not_rdb:?} loaded");
+    }
+    // An empty Redis database is a file, and loads.
+    let (dbs, _, _) = load(&b"REDIS0011\xFF\0\0\0\0\0\0\0\0"[..]).unwrap();
+    assert!(dbs.iter().all(HashMap::is_empty));
 }

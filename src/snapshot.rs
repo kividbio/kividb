@@ -17,11 +17,13 @@ use std::sync::Arc;
 
 mod rdb_dialect;
 pub use rdb_dialect::is_rdb_header;
+mod rdb_extensions;
+pub use rdb_extensions::is_unrepresentable;
 
 /// Returned by `load_snapshot` — key-value data plus any index schemas that
 /// were embedded in the snapshot file.
 pub struct LoadedSnapshot {
-    pub dbs: Vec<HashMap<String, KiviDBValue>>,
+    pub dbs: Vec<HashMap<Key, KiviDBValue>>,
     /// Index schemas serialised by the previous run. May be empty when loading
     /// an older snapshot that predates index persistence.
     pub index_schemas: Vec<IndexSchema>,
@@ -38,7 +40,7 @@ pub struct LoadedSnapshot {
     /// Keys whose expiry had already passed at load time are dropped from
     /// `dbs` instead of appearing here. Empty maps for an image written before
     /// expiries were persisted.
-    pub expiries: Vec<HashMap<String, u64>>,
+    pub expiries: Vec<HashMap<Key, u64>>,
     /// The function libraries, as a `FUNCTION DUMP` payload: `None` for an
     /// image that holds none, or one written before they were kept. Loaded
     /// with [`restore_functions`].
@@ -46,7 +48,7 @@ pub struct LoadedSnapshot {
 }
 
 /// Per-database key expiries as absolute Unix milliseconds.
-pub type ExpiryMaps = Vec<HashMap<String, u64>>;
+pub type ExpiryMaps = Vec<HashMap<Key, u64>>;
 
 /// Magic opening the key-expiry section of a KDB image.
 const KDB_EXPIRY_MAGIC: &[u8; 8] = b"KIVIEX1\0";
@@ -688,14 +690,14 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
                 write_bytes(w, inner.duplicate_policy.as_str().as_bytes())?;
                 w.write_all(&(inner.rules.len() as u32).to_le_bytes())?;
                 for rule in inner.rules.iter() {
-                    write_bytes(w, rule.dest_key.as_bytes())?;
+                    write_bytes(w, &crate::key_bytes::bytes_of(&rule.dest_key))?;
                     write_bytes(w, rule.aggregation.name().as_bytes())?;
                     w.write_all(&rule.bucket_duration.to_le_bytes())?;
                     w.write_all(&rule.align_timestamp.to_le_bytes())?;
                 }
             }
             if let Some(source) = &inner.source {
-                write_bytes(w, source.as_bytes())?;
+                write_bytes(w, &crate::key_bytes::bytes_of(source))?;
             }
         }
 
@@ -855,9 +857,9 @@ pub fn write_kdb_index_sections(
 /// capture of the keyspace writes the same layout from the entries it holds
 /// ([`FrozenDataset`]).
 #[cfg(test)]
-pub fn write_kdb_expiry_maps(
+pub fn write_kdb_expiry_maps<K: AsRef<[u8]>>(
     w: &mut impl Write,
-    per_db: &[HashMap<String, u64>],
+    per_db: &[HashMap<K, u64>],
 ) -> io::Result<()> {
     if per_db.iter().all(|m| m.is_empty()) {
         return Ok(());
@@ -867,7 +869,7 @@ pub fn write_kdb_expiry_maps(
     for map in per_db {
         w.write_all(&(map.len() as u32).to_le_bytes())?;
         for (key, at_ms) in map {
-            write_bytes(w, key.as_bytes())?;
+            write_bytes(w, key.as_ref())?;
             w.write_all(&at_ms.to_le_bytes())?;
         }
     }
@@ -887,9 +889,9 @@ fn unix_ms_now() -> u64 {
 /// A complete KDB image of owned values: header, databases, index sections.
 /// Values in hand have no time to live: a dataset with TTLs is written from
 /// a capture of the keyspace ([`freeze_dataset`]).
-pub fn write_kdb_image(
+pub fn write_kdb_image<K: AsRef<[u8]>>(
     w: &mut impl Write,
-    maps: &[HashMap<String, KiviDBValue>],
+    maps: &[HashMap<K, KiviDBValue>],
     index_store: Option<&crate::vector::IndexStore>,
 ) -> io::Result<()> {
     write_kdb_header(w, maps.len() as u32)?;
@@ -899,9 +901,10 @@ pub fn write_kdb_image(
         }
         write_kdb_db_end(w)?;
     }
+    // Functions before the best-effort index sections (see `write_to`).
+    write_kdb_functions_section(w, function_libraries().as_deref())?;
     write_kdb_index_sections(w, index_store)?;
     write_kdb_alias_section(w, index_store)?;
-    write_kdb_functions_section(w, function_libraries().as_deref())?;
     write_kdb_language_section(w, index_store)?;
     write_kdb_score_section(w, index_store)
 }
@@ -1461,9 +1464,9 @@ fn read_alias_section(r: &mut impl Read) -> io::Result<Vec<(String, String)>> {
 // Unused by the binary, which writes from a capture of the keyspace; the
 // library exports it and the snapshot tests are written against it.
 #[allow(dead_code)]
-pub fn write_snapshot(
+pub fn write_snapshot<K: AsRef<[u8]>>(
     path: &str,
-    maps: &[HashMap<String, KiviDBValue>],
+    maps: &[HashMap<K, KiviDBValue>],
     index_store: Option<&crate::vector::IndexStore>,
 ) -> io::Result<()> {
     let display_path = std::env::current_dir()
@@ -1600,9 +1603,7 @@ pub fn load_snapshot_with<R: Read>(
 /// value is parsed, exactly as loading would, and dropped. It costs the
 /// memory of one value at a time.
 ///
-/// Stricter than loading: every database has to end where the writer ends
-/// it. (The loader also accepts an image that simply stops between two
-/// entries, for the sake of files written before there was an end marker.)
+/// Every database has to end where the writer ends it, as in loading.
 pub fn verify_snapshot(image: &[u8]) -> io::Result<usize> {
     read_retrying(|| Ok(image), false, server_databases()).map(|(_, keys, _)| keys)
 }
@@ -1754,9 +1755,6 @@ fn read_image(
     let db_count = u32::from_le_bytes(db_count_buf) as usize;
 
     let mut result = Vec::with_capacity(hint(db_count));
-    // The image stopped between two entries (see below): the databases it
-    // says are still to come are not there.
-    let mut ended = false;
     // The first byte of what follows a database's end (the next database or
     // a section), read to see whether it is a tag.
     let mut next_byte = None;
@@ -1769,7 +1767,7 @@ fn read_image(
     let mut past: Option<String> = None;
 
     for db in 0..db_count {
-        let mut map: HashMap<String, KiviDBValue> = HashMap::new();
+        let mut map: HashMap<Key, KiviDBValue> = HashMap::new();
         let last = db + 1 == db_count;
         // Whether this database's 1.2.0 empty key has been read.
         let mut legacy_read = false;
@@ -1785,13 +1783,14 @@ fn read_image(
                 None => r.read_exact(&mut len_buf),
             };
             match read {
-                // Verifying: an image that stops before a database's end
-                // marker is not a whole image.
-                // Nor, reading 1.2.0's empty key where the first reading
-                // could not, one that stops (a wrong guess may).
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof && keep && legacy.is_empty() => {
-                    ended = true;
-                    break;
+                // An image that stops before a database's end marker is not a
+                // whole image, loaded or verified: loading it as far as it
+                // went started a server on part of the data, or none (#444).
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "the snapshot ends before its last database does: it is cut short",
+                    ));
                 }
                 Err(e) => return Err(e),
                 Ok(_) => {}
@@ -1859,8 +1858,8 @@ fn read_image(
             };
 
             let kbuf = read_exactly(&mut r, klen)?;
-            let key = String::from_utf8(kbuf)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad key utf8"))?;
+            // Any bytes: a key need not be text.
+            let key = Key::from(kbuf);
 
             // Read type tag
             let mut tag = [0u8];
@@ -1926,7 +1925,7 @@ fn read_image(
                         let Some(score) = zset_score(f64::from_le_bytes(score_buf)) else {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
-                                format!("{NAN_SCORE} in key '{key}'"),
+                                format!("{NAN_SCORE} in key '{}'", String::from_utf8_lossy(&key)),
                             ));
                         };
                         ss.insert(Arc::from(member.as_slice()), score);
@@ -1983,8 +1982,8 @@ fn read_image(
                                 .ok_or_else(|| bad("duplicate policy"))?;
                         let rules = read_u32_le(&mut r)? as usize;
                         for _ in 0..rules {
-                            let dest_key = String::from_utf8(read_bytes(&mut r)?)
-                                .map_err(|_| bad("rule destination"))?;
+                            let dest_key =
+                                crate::key_bytes::text_of(&read_bytes(&mut r)?).into_owned();
                             let aggregation = crate::types::TsAggregation::parse(
                                 &String::from_utf8_lossy(&read_bytes(&mut r)?),
                             )
@@ -2002,10 +2001,8 @@ fn read_image(
                             });
                         }
                         if tag[0] == TAG_TIMESERIES_V3 {
-                            ts.source = Some(
-                                String::from_utf8(read_bytes(&mut r)?)
-                                    .map_err(|_| bad("source"))?,
-                            );
+                            ts.source =
+                                Some(crate::key_bytes::text_of(&read_bytes(&mut r)?).into_owned());
                         }
                     }
                     KiviDBValue::TimeSeries(Arc::new(parking_lot::RwLock::new(ts)))
@@ -2154,9 +2151,6 @@ fn read_image(
         }
 
         result.push(map);
-        if ended {
-            break;
-        }
     }
 
     // ── Optional trailing sections ────────────────────────────────────────────
@@ -2325,8 +2319,7 @@ fn read_expiry_section(r: &mut impl Read, expiries: &mut ExpiryMaps) -> io::Resu
     for db_idx in 0..db_count {
         let count = read_u32_le(r)? as usize;
         for _ in 0..count {
-            let key = String::from_utf8(read_bytes(r)?)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad expiry key utf8"))?;
+            let key = Key::from(read_bytes(r)?);
             let at_ms = read_u64_le(r)?;
             if let Some(map) = expiries.get_mut(db_idx) {
                 map.insert(key, at_ms);
@@ -2549,7 +2542,7 @@ fn write_hnsw_graph(
             }
         };
         w.write_all(&[1u8])?; // live node
-        write_bytes(w, node.key.as_bytes())?;
+        write_bytes(w, &crate::key_bytes::bytes_of(&node.key))?;
         w.write_all(&(vector.len() as u32).to_le_bytes())?;
         for f in vector {
             w.write_all(&f.to_le_bytes())?;
@@ -2626,8 +2619,7 @@ fn read_hnsw_graphs(
                 nodes.push(None);
             } else {
                 let key_bytes = read_bytes(r)?;
-                let key = String::from_utf8(key_bytes)
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad hnsw key"))?;
+                let key = crate::key_bytes::text_of(&key_bytes).into_owned();
 
                 let mut vlen_buf = [0u8; 4];
                 r.read_exact(&mut vlen_buf)?;
@@ -2848,17 +2840,13 @@ fn is_past_databases(e: &io::Error) -> bool {
 
 // Unused by the binary, which wants the expiries; see `write_snapshot`.
 #[allow(dead_code)]
-pub fn load_redis_rdb(path: &str) -> io::Result<Vec<HashMap<String, KiviDBValue>>> {
+pub fn load_redis_rdb(path: &str) -> io::Result<Vec<HashMap<Key, KiviDBValue>>> {
     load_redis_rdb_with_expiry(path).map(|(dbs, _, _)| dbs)
 }
 
 /// What a Redis RDB file holds: its databases, their keys' expiries, and its
 /// function libraries as a Redis `FUNCTION DUMP` payload, if it has any.
-pub type RedisRdb = (
-    Vec<HashMap<String, KiviDBValue>>,
-    ExpiryMaps,
-    Option<Vec<u8>>,
-);
+pub type RedisRdb = (Vec<HashMap<Key, KiviDBValue>>, ExpiryMaps, Option<Vec<u8>>);
 
 /// Load a Redis RDB file, keeping each key's expiry.
 ///
@@ -2871,8 +2859,13 @@ pub fn load_redis_rdb_with_expiry(path: &str) -> io::Result<RedisRdb> {
 }
 
 /// [`load_redis_rdb_with_expiry`] over any byte source.
+///
+/// Refused rather than loaded as far as it goes: a file whose version is not
+/// a number, one that ends before its checksum or with the wrong one, and a
+/// file of a Dragonfly snapshot in Dragonfly's own format. Each used to load,
+/// often with no keys at all, and the server started on that (#444).
 pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
-    let mut r = r;
+    let mut r = Crc64Reader { inner: r, crc: 0 };
     let now_ms = unix_ms_now();
 
     // `REDIS` and a 4-digit RDB version, or `VALKEY` and a 3-digit one
@@ -2880,8 +2873,21 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
     let mut header = [0u8; 9];
     r.read_exact(&mut header)?;
     let dialect = rdb_dialect::from_header(&header)?;
+    // The RDB version, for the checksum that ends a file from version 5 on.
+    // A Redis one that is not a number is refused, not read as 0 (#444).
+    // Dragonfly and KeyDB write RDB 9, with types and opcodes past Redis
+    // 6.2's (see `rdb_extensions`).
+    let version: u16 = match dialect {
+        rdb_dialect::Dialect::Valkey => rdb_dialect::VALKEY_RDB_VERSION,
+        rdb_dialect::Dialect::Redis => std::str::from_utf8(&header[5..])
+            .ok()
+            .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|s| s.parse().ok())
+            .filter(|&version| version >= 1)
+            .ok_or_else(|| rdb_invalid("not a Redis RDB file: its version is not a number"))?,
+    };
 
-    let mut result: Vec<HashMap<String, KiviDBValue>> = (0..16).map(|_| HashMap::new()).collect();
+    let mut result: Vec<HashMap<Key, KiviDBValue>> = (0..16).map(|_| HashMap::new()).collect();
     let mut expiries: ExpiryMaps = (0..16).map(|_| HashMap::new()).collect();
 
     let mut current_db = 0usize;
@@ -2892,6 +2898,12 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
     let mut warned_search = false;
     // Each function library's code, in the order the file has them.
     let mut libraries = Vec::new();
+    // The key read last, while it is there: KeyDB writes the TTLs it gave
+    // the key's members after it.
+    let mut last_key: Option<(usize, Key)> = None;
+    let mut keydb_member: Option<Vec<u8>> = None;
+    // Keys Dragonfly kept from eviction (`STICK`), which load as any other.
+    let mut sticky = 0usize;
 
     loop {
         let mut type_byte = [0u8];
@@ -2899,9 +2911,48 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
 
         match type_byte[0] {
             0xFA => {
-                // Aux field — key/value metadata, just skip both strings
-                let _key = rdb_read_string(&mut r)?;
-                let _val = rdb_read_string(&mut r)?;
+                // Aux field: metadata, skipped, but for two kinds.
+                //
+                // Dragonfly's own format (`.dfs`) has a file for each shard
+                // and one, the summary, with none of the keys. Each is an RDB
+                // file. From Dragonfly 1.32 on, each has one of these fields,
+                // and its RDB files (`SAVE RDB`) have neither. Earlier ones
+                // write neither anywhere: see `preload` in src/aof.rs.
+                //
+                // KeyDB's member TTLs (`EXPIREMEMBER`) follow their key.
+                let aux_key = rdb_read_string(&mut r)?;
+                let aux_val = rdb_read_string(&mut r)?;
+                match aux_key.as_slice() {
+                    b"shard-id" | b"shard-count" => {
+                        return Err(rdb_invalid(
+                            "this is one file of a Dragonfly snapshot in Dragonfly's own format \
+                             (.dfs), which keeps each shard's keys in a file of its own; save one \
+                             in RDB format (Dragonfly's SAVE RDB) and load that",
+                        ));
+                    }
+                    b"keydb-subexpire-key" => keydb_member = Some(aux_val),
+                    b"keydb-subexpire-when" => {
+                        let member = keydb_member
+                            .take()
+                            .ok_or_else(|| rdb_invalid("a KeyDB member TTL without its member"))?;
+                        // A key dropped as past its time takes its members'
+                        // TTLs with it.
+                        if let Some((db, key)) = last_key.clone()
+                            && let Some(value) = result[db].get_mut(&key)
+                            && rdb_extensions::apply_keydb_subexpiry(
+                                value,
+                                &crate::key_bytes::text_of(key.as_ref()),
+                                &member,
+                                &aux_val,
+                            )? == rdb_extensions::SubExpiry::Emptied
+                        {
+                            result[db].remove(&key);
+                            expiries[db].remove(&key);
+                            last_key = None;
+                        }
+                    }
+                    _ => {}
+                }
             }
             0xFE => {
                 // Database selector
@@ -2920,9 +2971,25 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
                 let _ = rdb_read_length(&mut r)?;
             }
             0xFF => {
-                // End of RDB — skip 8-byte CRC64
-                let mut crc = [0u8; 8];
-                let _ = r.read_exact(&mut crc); // ignore error — file may be truncated
+                // The end, and from version 5 on, the CRC64 of everything
+                // before it. A checksum of 0 is none: Redis writes that with
+                // `rdbchecksum no`, and so does Dragonfly.
+                if version >= 5 {
+                    let sum = r.crc;
+                    let mut crc = [0u8; 8];
+                    r.read_exact(&mut crc).map_err(|_| {
+                        rdb_invalid("the file ends before its checksum: it is cut short")
+                    })?;
+                    let crc = u64::from_le_bytes(crc);
+                    // `rdbchecksum no` skips the check, as in Redis: a file
+                    // whose only fault is its checksum can still be loaded.
+                    if crc != 0 && crc != sum && rdb_checksum_checked() {
+                        return Err(rdb_invalid(
+                            "wrong RDB checksum: the file is damaged (to load it all the same, \
+                             set rdbchecksum no in the config file)",
+                        ));
+                    }
+                }
                 break;
             }
             0xFC => {
@@ -2962,6 +3029,15 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
             0xF3 if dialect == rdb_dialect::Dialect::Valkey => {
                 return Err(rdb_dialect::refuse_slot_import(&mut r));
             }
+            // Dragonfly's RDB_OPCODE_DF_MASK: the next key's flags.
+            0xDC if version <= 11 => {
+                if rdb_extensions::read_dragonfly_mask(&mut r)? {
+                    sticky += 1;
+                }
+            }
+            opcode if rdb_extensions::is_dragonfly_opcode(version, opcode) => {
+                return Err(rdb_extensions::refuse_dragonfly_opcode(opcode));
+            }
             // A function library (`FUNCTION2`): its code.
             0xF5 => libraries.push(rdb_read_string(&mut r)?),
             // Every other opcode from 0xF0 up is refused by what it is, not
@@ -2979,22 +3055,37 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
             type_id => {
                 // A key: type byte already consumed
                 let key_bytes = rdb_read_string(&mut r)?;
-                let key = String::from_utf8_lossy(&key_bytes).into_owned();
+                // As the bytes they are: two keys that are not text used
+                // to become one (#446).
+                let key = Key::from(key_bytes);
                 let expiry_ms = pending_expiry.take();
-                if let Some(val) = rdb_dialect::read_value(&mut r, type_id, dialect)? {
+                let value = if rdb_extensions::is_dragonfly_type(version, type_id) {
+                    let name = crate::key_bytes::text_of(key.as_ref());
+                    rdb_extensions::read_dragonfly_value(&mut r, Some(&name), type_id)?
+                } else if type_id == 64 && version <= 11 {
+                    return Err(rdb_extensions::refuse_keydb_cron(
+                        &crate::key_bytes::text_of(key.as_ref()),
+                    ));
+                } else {
+                    rdb_dialect::read_value(&mut r, type_id, dialect)?
+                };
+                last_key = None;
+                if let Some(val) = value {
                     match expiry_ms {
                         // Already past its expiry: dropped. Not by a replica,
                         // or under an AOF (see `load_snapshot_from`).
                         Some(ms) if ms <= now_ms && !crate::expiry::held() => {}
                         Some(ms) => {
                             expiries[current_db].insert(key.clone(), ms);
-                            result[current_db].insert(key, val);
+                            result[current_db].insert(key.clone(), val);
+                            last_key = Some((current_db, key));
                         }
                         None => {
                             // A plain entry replaces any earlier one for this
                             // key, including that entry's expiry.
                             expiries[current_db].remove(&key);
-                            result[current_db].insert(key, val);
+                            result[current_db].insert(key.clone(), val);
+                            last_key = Some((current_db, key));
                         }
                     }
                 }
@@ -3002,7 +3093,88 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
         }
     }
 
+    if sticky > 0 {
+        log_warn!(
+            "RDB: {sticky} keys were sticky in Dragonfly (STICK, never evicted): KiviDB has no \
+             such flag, and they load as any other key"
+        );
+    }
     Ok((result, expiries, redis_function_dump(&libraries)))
+}
+
+/// Whether an RDB file's checksum is checked as it is loaded: unless
+/// `rdbchecksum no` is set, as in Redis.
+fn rdb_checksum_checked() -> bool {
+    crate::commands::server::remembered_config("rdbchecksum").as_deref() != Some("no")
+}
+
+/// Whether the RDB file at `path` was written by Dragonfly, by its aux
+/// fields: `df-ver`, or, before Dragonfly wrote that, `redis-ver
+/// 999.999.999`. Only the fields at the start of the file are read.
+pub fn rdb_written_by_dragonfly(path: &str) -> io::Result<bool> {
+    let mut r = BufReader::new(File::open(path)?);
+    let mut magic = [0u8; 9];
+    r.read_exact(&mut magic)?;
+    if &magic[..5] != b"REDIS" {
+        return Ok(false);
+    }
+    loop {
+        let mut opcode = [0u8];
+        if r.read_exact(&mut opcode).is_err() || opcode[0] != 0xFA {
+            return Ok(false);
+        }
+        let key = rdb_read_string(&mut r)?;
+        let value = rdb_read_string(&mut r)?;
+        if key == b"df-ver" || (key == b"redis-ver" && value == b"999.999.999") {
+            return Ok(true);
+        }
+    }
+}
+
+/// Redis's CRC64 ([`redis_crc64`]) a byte at a time, from a table.
+const REDIS_CRC64_TABLE: [u64; 256] = {
+    const POLY: u64 = 0x95ac_9329_ac4b_c9b5;
+    let mut table = [0u64; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u64;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ POLY
+            } else {
+                crc >> 1
+            };
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
+/// [`redis_crc64`] of `data`, carried on from `crc`, the sum of what came
+/// before it.
+fn redis_crc64_update(mut crc: u64, data: &[u8]) -> u64 {
+    for &byte in data {
+        crc = REDIS_CRC64_TABLE[((crc ^ u64::from(byte)) & 0xff) as usize] ^ (crc >> 8);
+    }
+    crc
+}
+
+/// A reader that sums what is read through it with Redis's CRC64: what an
+/// RDB file's checksum is checked against.
+struct Crc64Reader<R> {
+    inner: R,
+    crc: u64,
+}
+
+impl<R: Read> Read for Crc64Reader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.crc = redis_crc64_update(self.crc, &buf[..n]);
+        Ok(n)
+    }
 }
 
 /// Function libraries' code as Redis's `FUNCTION DUMP` lays it out: the
@@ -3095,7 +3267,7 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
             let mut hmap = crate::types::HashFields::default();
             for _ in 0..count {
                 let field_bytes = rdb_read_string(r)?;
-                let field = String::from_utf8_lossy(&field_bytes).into_owned();
+                let field = crate::key_bytes::text_of(&field_bytes).into_owned();
                 let val = rdb_read_string(r)?;
                 hmap.insert(field, Arc::from(val.as_slice()));
             }
@@ -3199,7 +3371,7 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
             rdb_decode_ziplist_into_list(&blob, &mut deque);
             let mut iter = deque.into_iter();
             while let (Some(field), Some(val)) = (iter.next(), iter.next()) {
-                let field_str = String::from_utf8_lossy(&field).into_owned();
+                let field_str = crate::key_bytes::text_of(&field).into_owned();
                 hmap.insert(field_str, val);
             }
             Ok(Some(KiviDBValue::Hash(Arc::new(parking_lot::RwLock::new(
@@ -3628,7 +3800,7 @@ fn rdb_read_hash_with_ttls(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBV
     let clock = crate::commands::helpers::FieldClock::now();
     let mut inner = crate::types::HashInner::new();
     for (field, value, expires_at) in fields {
-        let field = String::from_utf8_lossy(&field).into_owned();
+        let field = crate::key_bytes::text_of(&field).into_owned();
         if expires_at != 0 {
             let Some(deadline) = rdb_dialect::field_deadline(&clock, expires_at)? else {
                 continue;
@@ -4233,7 +4405,7 @@ fn rdb_decode_listpack_into_hash(
     }
     let mut iter = elements.into_iter();
     while let (Some(field), Some(value)) = (iter.next(), iter.next()) {
-        let field = String::from_utf8_lossy(&field).into_owned();
+        let field = crate::key_bytes::text_of(&field).into_owned();
         hmap.insert(field, Arc::from(value.as_slice()));
     }
     Ok(())
@@ -4259,7 +4431,7 @@ fn rdb_decode_listpack_into_zset(blob: &[u8], ss: &mut SortedSetInner) -> io::Re
 
 /// Load a snapshot and populate the store directly.
 /// Handles the platform difference in RwLock::write() internally.
-pub fn restore_into_store(dbs: Vec<HashMap<String, KiviDBValue>>, store: &store::Store) -> usize {
+pub fn restore_into_store(dbs: Vec<HashMap<Key, KiviDBValue>>, store: &store::Store) -> usize {
     let mut total = 0usize;
     for (db_idx, map) in dbs.into_iter().enumerate() {
         if db_idx >= store.len() {
@@ -4565,10 +4737,15 @@ impl FrozenDataset {
             }
             write_kdb_db_end(out)?;
         }
-        out.write_all(&self.index_section)?;
+        // The times to live and the function libraries before the index
+        // sections: a reader that cannot read one of those (they are read
+        // best-effort) stops there, and what comes after it is lost. Read in
+        // any order (`read_image` finds each section by its magic), as 1.2.0
+        // reads them too.
         self.write_expiries(out, &timed_strings)?;
-        out.write_all(&self.alias_section)?;
         write_kdb_functions_section(out, self.functions.as_deref())?;
+        out.write_all(&self.index_section)?;
+        out.write_all(&self.alias_section)?;
         out.write_all(&self.language_section)?;
         out.write_all(&self.score_section)
     }
@@ -4714,7 +4891,7 @@ pub fn restore_payload_checked(payload: &[u8]) -> Result<KiviDBValue, RestoreErr
     if let Some(dialect) = rdb_dialect::of_dump_version(version)
         && sealed
     {
-        return restore_redis_payload(data, dialect).ok_or(RestoreError::BadData);
+        return restore_redis_payload(data, dialect, version).ok_or(RestoreError::BadData);
     }
     Err(RestoreError::VersionOrChecksum)
 }
@@ -4743,9 +4920,22 @@ pub fn redis_crc64(data: &[u8]) -> u64 {
 /// A value as Redis's or Valkey's `DUMP` serialises it: its RDB type, then
 /// the value in the RDB encoding of that type, which the `dump.rdb` loader
 /// reads. Every byte must belong to the value.
-fn restore_redis_payload(data: &[u8], dialect: rdb_dialect::Dialect) -> Option<KiviDBValue> {
+///
+/// Dragonfly's payloads may hold its own types (`rdb_extensions`), and
+/// KeyDB's end with an `mvcc-tstamp` aux field after the value, which is
+/// read past: it is KeyDB's version of the value for its active replication.
+fn restore_redis_payload(
+    data: &[u8],
+    dialect: rdb_dialect::Dialect,
+    version: u16,
+) -> Option<KiviDBValue> {
     let (&type_id, mut rest) = data.split_first()?;
-    let value = rdb_dialect::read_value(&mut rest, type_id, dialect).ok()??;
+    let value = if rdb_extensions::is_dragonfly_type(version, type_id) {
+        rdb_extensions::read_dragonfly_value(&mut rest, None, type_id).ok()??
+    } else {
+        rdb_dialect::read_value(&mut rest, type_id, dialect).ok()??
+    };
+    let rest = rdb_extensions::strip_keydb_mvcc(rest)?;
     rest.is_empty().then_some(value)
 }
 
@@ -5377,9 +5567,9 @@ mod field_deadline_tests {
             write_kdb_header(&mut out, 1).unwrap();
             write_kdb_entry(&mut out, "h", hash_with(&want).view()).unwrap();
             write_kdb_db_end(&mut out).unwrap();
-            write_kdb_expiry_maps(&mut out, &[HashMap::new()]).unwrap();
+            write_kdb_expiry_maps(&mut out, &[HashMap::<Key, u64>::new()]).unwrap();
             let loaded = load_snapshot_from(&out[..]).unwrap();
-            assert_eq!(read_back(&loaded.dbs[0]["h"], want.len()), want);
+            assert_eq!(read_back(&loaded.dbs[0][&b"h"[..]], want.len()), want);
         }
     }
 
@@ -5415,7 +5605,7 @@ mod expiry_section_tests {
         KiviDBValue::String(SharedBytes::from(v.as_bytes()))
     }
 
-    fn image(maps: &[HashMap<String, KiviDBValue>], expiries: &[HashMap<String, u64>]) -> Vec<u8> {
+    fn image(maps: &[HashMap<Key, KiviDBValue>], expiries: &[HashMap<Key, u64>]) -> Vec<u8> {
         let mut out = Vec::new();
         write_kdb_header(&mut out, maps.len() as u32).unwrap();
         for map in maps {
@@ -5431,19 +5621,16 @@ mod expiry_section_tests {
     #[test]
     fn expiries_round_trip_per_database() {
         let far = unix_ms_now() + 3_600_000;
-        let db0 = HashMap::from([
-            ("a".to_string(), string("1")),
-            ("b".to_string(), string("2")),
-        ]);
-        let db1 = HashMap::from([("c".to_string(), string("3"))]);
+        let db0 = HashMap::from([(Key::from("a"), string("1")), (Key::from("b"), string("2"))]);
+        let db1 = HashMap::from([(Key::from("c"), string("3"))]);
         let exp = vec![
-            HashMap::from([("a".to_string(), far)]),
-            HashMap::from([("c".to_string(), far + 1)]),
+            HashMap::from([(Key::from("a"), far)]),
+            HashMap::from([(Key::from("c"), far + 1)]),
         ];
         let loaded = load_snapshot_from(&image(&[db0, db1], &exp)[..]).unwrap();
-        assert_eq!(loaded.expiries[0].get("a"), Some(&far));
-        assert_eq!(loaded.expiries[0].get("b"), None);
-        assert_eq!(loaded.expiries[1].get("c"), Some(&(far + 1)));
+        assert_eq!(loaded.expiries[0].get(&b"a"[..]), Some(&far));
+        assert_eq!(loaded.expiries[0].get(&b"b"[..]), None);
+        assert_eq!(loaded.expiries[1].get(&b"c"[..]), Some(&(far + 1)));
     }
 
     /// The whole point of persisting an expiry is that it is honoured: a key
@@ -5451,26 +5638,26 @@ mod expiry_section_tests {
     #[test]
     fn expired_keys_are_dropped_at_load() {
         let db0 = HashMap::from([
-            ("live".to_string(), string("1")),
-            ("dead".to_string(), string("2")),
+            (Key::from("live"), string("1")),
+            (Key::from("dead"), string("2")),
         ]);
         let exp = vec![HashMap::from([
-            ("live".to_string(), unix_ms_now() + 60_000),
-            ("dead".to_string(), unix_ms_now().saturating_sub(1)),
+            (Key::from("live"), unix_ms_now() + 60_000),
+            (Key::from("dead"), unix_ms_now().saturating_sub(1)),
         ])];
         let loaded = load_snapshot_from(&image(&[db0], &exp)[..]).unwrap();
-        assert!(loaded.dbs[0].contains_key("live"));
-        assert!(!loaded.dbs[0].contains_key("dead"));
-        assert!(!loaded.expiries[0].contains_key("dead"));
+        assert!(loaded.dbs[0].contains_key(&b"live"[..]));
+        assert!(!loaded.dbs[0].contains_key(&b"dead"[..]));
+        assert!(!loaded.expiries[0].contains_key(&b"dead"[..]));
     }
 
     /// An expiry for a key that is not in the image is dropped rather than
     /// installed, where it would attach to whatever later takes that name.
     #[test]
     fn orphan_expiries_are_not_installed() {
-        let db0 = HashMap::from([("a".to_string(), string("1"))]);
+        let db0 = HashMap::from([(Key::from("a"), string("1"))]);
         let exp = vec![HashMap::from([(
-            "ghost".to_string(),
+            Key::from("ghost"),
             unix_ms_now() + 60_000,
         )])];
         let loaded = load_snapshot_from(&image(&[db0], &exp)[..]).unwrap();
@@ -5487,24 +5674,24 @@ mod expiry_section_tests {
             std::time::Instant::now() - std::time::Duration::from_secs(1),
         );
         let db0 = HashMap::from([(
-            "hxgone".to_string(),
+            Key::from("hxgone"),
             KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(hash))),
         )]);
         let exp = vec![HashMap::from([(
-            "hxgone".to_string(),
+            Key::from("hxgone"),
             unix_ms_now() + 60_000,
         )])];
 
         let loaded = load_snapshot_from(&image(&[db0], &exp)[..]).unwrap();
-        assert!(!loaded.dbs[0].contains_key("hxgone"));
-        assert!(!loaded.expiries[0].contains_key("hxgone"));
+        assert!(!loaded.dbs[0].contains_key(&b"hxgone"[..]));
+        assert!(!loaded.expiries[0].contains_key(&b"hxgone"[..]));
     }
 
     /// An image with no expiry section — everything written before this
     /// section existed — still loads, with every key permanent as before.
     #[test]
     fn image_without_an_expiry_section_loads() {
-        let db0 = HashMap::from([("a".to_string(), string("1"))]);
+        let db0 = HashMap::from([(Key::from("a"), string("1"))]);
         let loaded = load_snapshot_from(&image(&[db0], &[])[..]).unwrap();
         assert_eq!(loaded.dbs[0].len(), 1);
         assert_eq!(loaded.expiries.len(), 1);
@@ -5515,8 +5702,8 @@ mod expiry_section_tests {
     /// the TTLs silently missing is worse than a loud error.
     #[test]
     fn a_truncated_expiry_section_fails_the_load() {
-        let db0 = HashMap::from([("a".to_string(), string("1"))]);
-        let exp = vec![HashMap::from([("a".to_string(), unix_ms_now() + 60_000)])];
+        let db0 = HashMap::from([(Key::from("a"), string("1"))]);
+        let exp = vec![HashMap::from([(Key::from("a"), unix_ms_now() + 60_000)])];
         let full = image(&[db0], &exp);
         assert!(load_snapshot_from(&full[..full.len() - 3]).is_err());
     }
@@ -5528,11 +5715,11 @@ mod expiry_section_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dump.kdb");
         let path_s = path.to_str().unwrap();
-        let first = vec![HashMap::from([("a".to_string(), string("1"))])];
+        let first = vec![HashMap::from([(Key::from("a"), string("1"))])];
         write_snapshot(path_s, &first, None).unwrap();
         let second = vec![HashMap::from([
-            ("a".to_string(), string("1")),
-            ("b".to_string(), string("2")),
+            (Key::from("a"), string("1")),
+            (Key::from("b"), string("2")),
         ])];
         write_snapshot(path_s, &second, None).unwrap();
 
@@ -5620,7 +5807,12 @@ mod field_option_tests {
         store.write().insert("bare".into(), bare);
 
         let mut image = Vec::new();
-        write_kdb_image(&mut image, &[HashMap::new()], Some(&store)).unwrap();
+        write_kdb_image(
+            &mut image,
+            &[HashMap::<Key, KiviDBValue>::new()],
+            Some(&store),
+        )
+        .unwrap();
         let loaded = load_snapshot_from(image.as_slice()).unwrap();
 
         let idx = loaded
@@ -5684,7 +5876,12 @@ mod field_option_tests {
             .write()
             .insert("en".into(), index("en", LanguageOptions::default()));
         let mut image = Vec::new();
-        write_kdb_image(&mut image, &[HashMap::new()], Some(&store)).unwrap();
+        write_kdb_image(
+            &mut image,
+            &[HashMap::<Key, KiviDBValue>::new()],
+            Some(&store),
+        )
+        .unwrap();
         let loaded = load_snapshot_from(image.as_slice()).unwrap();
         let of = |name: &str| {
             loaded
@@ -5705,7 +5902,12 @@ mod field_option_tests {
         empty
             .write()
             .insert("de".into(), index("de", LanguageOptions::default()));
-        write_kdb_image(&mut bare, &[HashMap::new()], Some(&empty)).unwrap();
+        write_kdb_image(
+            &mut bare,
+            &[HashMap::<Key, KiviDBValue>::new()],
+            Some(&empty),
+        )
+        .unwrap();
         assert!(!bare.windows(8).any(|w| w == KDB_LANGUAGE_MAGIC));
     }
 
@@ -5838,7 +6040,12 @@ mod field_option_tests {
         empty
             .write()
             .insert("plain".into(), index("plain", 1.0, None));
-        write_kdb_image(&mut bare, &[HashMap::new()], Some(&empty)).unwrap();
+        write_kdb_image(
+            &mut bare,
+            &[HashMap::<Key, KiviDBValue>::new()],
+            Some(&empty),
+        )
+        .unwrap();
         assert!(!bare.windows(8).any(|w| w == KDB_SCORE_MAGIC));
     }
 }
@@ -5848,10 +6055,10 @@ mod verify_tests {
     use super::*;
 
     fn image(keys: usize) -> Vec<u8> {
-        let mut map: HashMap<String, KiviDBValue> = HashMap::new();
+        let mut map: HashMap<Key, KiviDBValue> = HashMap::new();
         for i in 0..keys {
             map.insert(
-                format!("key:{i}"),
+                Key::from(format!("key:{i}")),
                 KiviDBValue::String(SharedBytes::from(format!("value {i}").as_bytes())),
             );
         }
@@ -5903,6 +6110,36 @@ mod verify_tests {
         // Verifying keeps nothing, and loading still loads.
         let loaded = load_snapshot_from(whole.as_slice()).unwrap();
         assert_eq!(loaded.dbs[0].len(), 500);
+
+        // Loading refuses a cut image as verifying does, the one cut between
+        // two entries too: it used to load the keys before the cut (#444).
+        for cut in [12, 13, 40, whole.len() / 2] {
+            assert!(
+                load_snapshot_from(&whole[..cut]).is_err(),
+                "an image cut at {cut} of {} loaded",
+                whole.len()
+            );
+        }
+        // One key, in the first of two databases: cut after the key, and
+        // after the first database's end.
+        let one = image(1);
+        let entry = 4 + "key:0".len() + 1 + 4 + "value 0".len();
+        assert!(load_snapshot_from(&one[..8 + 4 + entry + 8]).is_ok());
+        assert!(load_snapshot_from(&one[..8 + 4 + entry]).is_err());
+        assert!(load_snapshot_from(&one[..8 + 4 + entry + 4]).is_err());
+    }
+
+    /// The table-driven CRC64 that checks RDB files is Redis's.
+    #[test]
+    fn the_rdb_checksum_is_redis_crc64() {
+        assert_eq!(redis_crc64_update(0, b"123456789"), 0xe9c6_d914_c4b8_d9ca);
+        let data: Vec<u8> = (0..5000u32).map(|i| (i * 7919 % 251) as u8).collect();
+        assert_eq!(redis_crc64_update(0, &data), redis_crc64(&data));
+        let (a, b) = data.split_at(1234);
+        assert_eq!(
+            redis_crc64_update(redis_crc64_update(0, a), b),
+            redis_crc64(&data)
+        );
     }
 }
 
@@ -5920,7 +6157,7 @@ mod function_section_tests {
         )
         .unwrap();
         write_kdb_db_end(&mut out).unwrap();
-        write_kdb_expiry_maps(&mut out, &[HashMap::new()]).unwrap();
+        write_kdb_expiry_maps(&mut out, &[HashMap::<Key, u64>::new()]).unwrap();
         write_kdb_functions_section(&mut out, libraries).unwrap();
         out
     }
@@ -6108,7 +6345,7 @@ mod nan_score_tests {
             &zset(&[("a", f64::NEG_INFINITY), ("b", f64::INFINITY), ("c", -0.0)]),
         );
         let loaded = load_snapshot_from(&good[..]).expect("infinite scores load");
-        match loaded.dbs[0].get("scores") {
+        match loaded.dbs[0].get(&b"scores"[..]) {
             Some(KiviDBValue::SortedSet(ss)) => assert_eq!(ss.read().len(), 3),
             _ => panic!("the sorted set is not there"),
         }
@@ -6170,8 +6407,8 @@ mod empty_key_tests {
         out
     }
 
-    fn get_string(map: &HashMap<String, KiviDBValue>, key: &str) -> Vec<u8> {
-        match map.get(key) {
+    fn get_string(map: &HashMap<Key, KiviDBValue>, key: &str) -> Vec<u8> {
+        match map.get(key.as_bytes()) {
             Some(KiviDBValue::String(bytes)) => bytes.as_ref().to_vec(),
             _ => panic!("{key:?} is not a string"),
         }
@@ -6251,7 +6488,7 @@ mod empty_key_tests {
         let whole = image(&[db0, HashMap::from([("after".to_string(), string("1"))])]);
         assert_eq!(verify_snapshot(whole.as_slice()).unwrap(), 5);
         let loaded = load_snapshot_from(whole.as_slice()).unwrap();
-        match loaded.dbs[0].get("") {
+        match loaded.dbs[0].get(&b""[..]) {
             Some(KiviDBValue::Hash(hash)) => {
                 let hash = hash.read();
                 assert_eq!(hash.len(), 2);
@@ -6260,7 +6497,7 @@ mod empty_key_tests {
             }
             _ => panic!("the empty key is not a hash"),
         }
-        match loaded.dbs[0].get("set") {
+        match loaded.dbs[0].get(&b"set"[..]) {
             Some(KiviDBValue::Set(set)) => {
                 let set = set.read();
                 assert_eq!(set.len(), 2);
@@ -6268,7 +6505,7 @@ mod empty_key_tests {
             }
             _ => panic!("set is not a set"),
         }
-        match loaded.dbs[0].get("zset") {
+        match loaded.dbs[0].get(&b"zset"[..]) {
             Some(KiviDBValue::SortedSet(zset)) => {
                 let zset = zset.read();
                 assert_eq!(zset.members.len(), 2);
@@ -6280,7 +6517,7 @@ mod empty_key_tests {
             }
             _ => panic!("zset is not a sorted set"),
         }
-        match loaded.dbs[0].get("list") {
+        match loaded.dbs[0].get(&b"list"[..]) {
             Some(KiviDBValue::List(list)) => {
                 let list = list.read();
                 assert_eq!(list.len(), 2);
@@ -6342,15 +6579,15 @@ mod empty_key_tests {
         let store = crate::store::new_store(2);
         restore_into_store(
             vec![
-                HashMap::from([(String::new(), string("x"))]),
-                HashMap::from([(String::new(), hash("f", "v"))]),
+                HashMap::from([(Key::default(), string("x"))]),
+                HashMap::from([(Key::default(), hash("f", "v"))]),
             ],
             &store,
         );
         restore_expiries_into_store(
             vec![
-                HashMap::from([(String::new(), far)]),
-                HashMap::from([(String::new(), far + 1)]),
+                HashMap::from([(Key::default(), far)]),
+                HashMap::from([(Key::default(), far + 1)]),
             ],
             &store,
         );
@@ -6370,9 +6607,12 @@ mod empty_key_tests {
 
         let loaded = load_snapshot_from(image.as_slice()).unwrap();
         assert_eq!(get_string(&loaded.dbs[0], ""), b"x");
-        assert!(matches!(loaded.dbs[1].get(""), Some(KiviDBValue::Hash(_))));
-        assert_eq!(loaded.expiries[0].get(""), Some(&far));
-        assert_eq!(loaded.expiries[1].get(""), Some(&(far + 1)));
+        assert!(matches!(
+            loaded.dbs[1].get(&b""[..]),
+            Some(KiviDBValue::Hash(_))
+        ));
+        assert_eq!(loaded.expiries[0].get(&b""[..]), Some(&far));
+        assert_eq!(loaded.expiries[1].get(&b""[..]), Some(&(far + 1)));
     }
 
     /// In the last database (with `databases 1`, the only one) a 1.2.0 empty
@@ -6399,10 +6639,13 @@ mod empty_key_tests {
             assert_eq!(loaded.dbs[0].len(), 3);
             assert_eq!(get_string(&loaded.dbs[0], "a"), b"1");
             assert_eq!(get_string(&loaded.dbs[0], "b"), b"2");
-            assert!(matches!(loaded.dbs[0].get(""), Some(KiviDBValue::Hash(_))));
-            assert_eq!(loaded.expiries[0].get("a"), Some(&far));
-            assert_eq!(loaded.expiries[0].get(""), Some(&(far + 1)));
-            assert_eq!(loaded.expiries[0].get("b"), Some(&(far + 2)));
+            assert!(matches!(
+                loaded.dbs[0].get(&b""[..]),
+                Some(KiviDBValue::Hash(_))
+            ));
+            assert_eq!(loaded.expiries[0].get(&b"a"[..]), Some(&far));
+            assert_eq!(loaded.expiries[0].get(&b""[..]), Some(&(far + 1)));
+            assert_eq!(loaded.expiries[0].get(&b"b"[..]), Some(&(far + 2)));
             assert_eq!(loaded.functions.as_deref(), Some(&b"libraries"[..]));
         }
     }
@@ -6434,8 +6677,8 @@ mod empty_key_tests {
         assert_eq!(get_string(&loaded.dbs[1], "k"), b"v");
         assert_eq!(get_string(&loaded.dbs[2], ""), b"e2");
         assert_eq!(get_string(&loaded.dbs[2], "z"), b"9");
-        assert_eq!(loaded.expiries[0].get(""), Some(&far));
-        assert_eq!(loaded.expiries[2].get("z"), Some(&(far + 1)));
+        assert_eq!(loaded.expiries[0].get(&b""[..]), Some(&far));
+        assert_eq!(loaded.expiries[2].get(&b"z"[..]), Some(&(far + 1)));
         assert_eq!(loaded.functions.as_deref(), Some(&b"libraries"[..]));
 
         // From a file, as at startup.

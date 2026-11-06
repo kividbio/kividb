@@ -6036,3 +6036,72 @@ fn a_master_stopped_cleanly_without_an_aof_carries_on_as_before() {
     let log = masters[0].log();
     assert!(!log.contains("came back without its dataset"), "{log}");
 }
+
+/// A key that is not text (from an RDB file: no command writes one until
+/// #437's third step) in a slot an atomic migration moves: the destination
+/// refuses its `RESTORE`, as it refuses such a key from any command yet.
+/// The import does not complete: it says why, in `last_error`, and tries
+/// again, and the key stays where it was, whole, until it is canceled.
+#[test]
+fn a_slot_migration_of_a_key_that_is_not_text_fails_loudly_and_keeps_it() {
+    // A key that is not text, in a slot the first node owns (0..=8191).
+    let key: Vec<u8> = (0u32..)
+        .map(|i| {
+            let mut k = b"bin:\xff".to_vec();
+            k.extend_from_slice(&i.to_be_bytes());
+            k
+        })
+        .find(|k| kividb::cluster::key_hash_slot(k) < 8192)
+        .unwrap();
+    let slot = kividb::cluster::key_hash_slot(&key).to_string();
+    let mut rdb = b"REDIS0011\xfe\x00\x00".to_vec();
+    rdb.push(key.len() as u8);
+    rdb.extend_from_slice(&key);
+    rdb.extend_from_slice(b"\x05value\xff");
+    rdb.extend_from_slice(&[0u8; 8]);
+    let seed = tempfile::tempdir().unwrap().keep().join("seed.rdb");
+    std::fs::write(&seed, rdb).unwrap();
+    let preload = format!("rdb:{}", seed.display());
+
+    let src = Node::start(&["--preload-file", &preload]);
+    let dst = Node::start(&[]);
+    let (nodes, _) = form_cluster_of(vec![src, dst]);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    assert_eq!(src.conn().cmd(&["DBSIZE"]).int(), 1, "{}", src.log());
+
+    let task_id = dst
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", &slot, &slot])
+        .text();
+    let status = || {
+        dst.conn()
+            .cmd(&["CLUSTER", "MIGRATION", "STATUS", "ID", &task_id])
+            .array()[0]
+            .clone()
+    };
+    wait_until(
+        "the import to fail an attempt",
+        Duration::from_secs(60),
+        || {
+            let task = status();
+            assert_ne!(task_field(&task, "state").text(), "completed", "{task:?}");
+            task_field(&task, "retries").int() >= 1
+        },
+    );
+    let task = status();
+    let error = task_field(&task, "last_error").text();
+    assert!(!error.is_empty(), "{task:?}");
+
+    // Still here, in its slot, and not at the destination.
+    let mut s = src.conn();
+    assert_eq!(s.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 1);
+    assert_eq!(s.cmd(&["DBSIZE"]).int(), 1);
+    assert_eq!(dst.conn().cmd(&["DBSIZE"]).int(), 0);
+    assert_eq!(
+        dst.conn()
+            .cmd(&["CLUSTER", "MIGRATION", "CANCEL", "ID", &task_id])
+            .int(),
+        1
+    );
+    assert_eq!(s.cmd(&["DBSIZE"]).int(), 1);
+}

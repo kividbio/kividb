@@ -730,7 +730,11 @@ impl DeleteRun {
     /// Of `keys`, which to delete: those of slots that have not come to
     /// this node since it began. One look at the `counts`, which the caller
     /// holds until they are deleted.
-    fn still_to_delete(&mut self, counts: &mut DeletionCounts, keys: &[String]) -> Vec<bool> {
+    fn still_to_delete(
+        &mut self,
+        counts: &mut DeletionCounts,
+        keys: &[crate::store::Key],
+    ) -> Vec<bool> {
         let counts = counts.sized();
         let mut delete = Vec::with_capacity(keys.len());
         for key in keys {
@@ -789,10 +793,10 @@ fn delete_keys(
         };
     };
     for shard in db.iter() {
-        let keys: Vec<String> = crate::read_lock!(shard)
+        let keys: Vec<crate::store::Key> = crate::read_lock!(shard)
             .keys()
             .filter(|k| run.deletes(key_hash_slot(k)))
-            .map(|k| crate::store::key_text(k).to_owned())
+            .map(crate::store::Key::new)
             .collect();
         for chunk in keys.chunks(128) {
             {
@@ -1022,7 +1026,7 @@ fn start_dropping(
 /// which never change in place), so it is far quicker than laying the value
 /// out as its `RESTORE`, which is done afterwards.
 struct Captured {
-    key: String,
+    key: crate::store::Key,
     value: crate::types::KiviDBValue,
     expires_at: u64,
 }
@@ -1075,7 +1079,7 @@ fn capture(env: &Env, ranges: &[(u16, u16)]) -> std::io::Result<Vec<Captured>> {
                 continue;
             }
             out.push(Captured {
-                key: crate::store::key_text(key).to_owned(),
+                key: crate::store::Key::new(key),
                 value: entry.value().deep_clone(),
                 expires_at,
             });
