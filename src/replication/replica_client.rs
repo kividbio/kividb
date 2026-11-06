@@ -1633,7 +1633,7 @@ fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync
 
     let is_kividb = payload.len() >= 8 && payload[..8] == *crate::snapshot::KDB_MAGIC;
     let (dbs, expiries, index_schemas, dictionaries, functions) = if is_kividb {
-        let loaded = crate::snapshot::load_snapshot_from(payload).map_err(|e| {
+        let loaded = crate::snapshot::load_snapshot_bytes(payload).map_err(|e| {
             SessionError::Link(format!("full-sync payload is not a valid KDB image: {e}"))
         })?;
         (

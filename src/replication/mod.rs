@@ -1444,9 +1444,12 @@ impl<R: std::io::Read> std::io::Read for FingerprintReader<R> {
 pub fn load_dump(
     path: &str,
 ) -> std::io::Result<(crate::snapshot::LoadedSnapshot, DumpFingerprint)> {
-    let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(FingerprintReader::new(file));
-    let loaded = crate::snapshot::load_snapshot_from(&mut reader)?;
+    // Opened again for each reading `load_snapshot_with` makes: the
+    // fingerprint is of the reading that loaded it.
+    let (loaded, reader) = crate::snapshot::load_snapshot_with(|| {
+        let file = std::fs::File::open(path)?;
+        Ok(std::io::BufReader::new(FingerprintReader::new(file)))
+    })?;
     // What the buffer holds beyond what was parsed has been fingerprinted.
     let fingerprint = reader.into_inner().finish()?;
     Ok((loaded, fingerprint))
