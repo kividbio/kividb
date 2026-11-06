@@ -5405,7 +5405,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let (mut optin, mut optout, mut noloop, mut bcast) =
                         (false, false, false, false);
                     let mut redirect: Option<u64> = None;
-                    let mut prefixes: Vec<String> = Vec::new();
+                    let mut prefixes: Vec<Vec<u8>> = Vec::new();
                     let mut i = 3usize;
                     while i < cmd.len() {
                         let word = cmd[i].to_ascii_uppercase();
@@ -5425,7 +5425,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                                 i += 1;
                             }
                             (b"PREFIX", Some(prefix)) => {
-                                prefixes.push(String::from_utf8_lossy(prefix).into_owned());
+                                prefixes.push(prefix.to_vec());
                                 i += 1;
                             }
                             (b"BCAST", _) => bcast = true,
@@ -5518,15 +5518,19 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     if bcast {
                         // No prefix is the prefix of every key.
                         if prefixes.is_empty() && had_prefixes.is_empty() {
-                            prefixes.push(String::new());
+                            prefixes.push(Vec::new());
                         }
                         // One prefix of a client must not be the start of
                         // another: a key would be announced twice.
-                        let overlap = |a: &str, b: &str| a.starts_with(b) || b.starts_with(a);
+                        let overlap = |a: &[u8], b: &[u8]| a.starts_with(b) || b.starts_with(a);
                         for (n, prefix) in prefixes.iter().enumerate() {
                             if let Some(other) =
                                 had_prefixes.iter().find(|other| overlap(prefix, other))
                             {
+                                let (prefix, other) = (
+                                    String::from_utf8_lossy(prefix),
+                                    String::from_utf8_lossy(other),
+                                );
                                 return Some(resp_error(&format!(
                                     "ERR Prefix '{prefix}' overlaps with an existing prefix \
                                      '{other}'. Prefixes for a single client must not overlap."
@@ -5536,6 +5540,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                                 .iter()
                                 .find(|other| overlap(prefix, other))
                             {
+                                let (prefix, other) = (
+                                    String::from_utf8_lossy(prefix),
+                                    String::from_utf8_lossy(other),
+                                );
                                 return Some(resp_error(&format!(
                                     "ERR Prefix '{prefix}' overlaps with another provided \
                                      prefix '{other}'. Prefixes for a single client must not \
@@ -5573,7 +5581,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let info = ctx.client_registry.get(ctx.client_id);
                     let mut flags: Vec<&str> = Vec::new();
                     let mut redirect = -1;
-                    let mut prefixes: Vec<String> = Vec::new();
+                    let mut prefixes: Vec<Vec<u8>> = Vec::new();
                     match &info {
                         Some(info) if info.tracking => {
                             flags.push("on");
@@ -5612,7 +5620,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             resp_bulk_str("redirect"),
                             resp_integer(redirect),
                             resp_bulk_str("prefixes"),
-                            resp_array(prefixes.iter().map(|p| resp_bulk_str(p)).collect()),
+                            resp_array(prefixes.iter().map(|p| resp_bulk(p)).collect()),
                         ],
                     ))
                 }

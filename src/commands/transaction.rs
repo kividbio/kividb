@@ -125,7 +125,7 @@ pub struct TxState {
     /// Queued commands — each is the raw parsed Vec<Vec<u8>>
     pub queue: Vec<Vec<Vec<u8>>>,
     /// Keys being watched — if any are modified, EXEC returns nil
-    pub watched_keys: Vec<(usize, String)>, // (db_index, key)
+    pub watched_keys: Vec<(usize, crate::store::Key)>, // (db_index, key)
     /// Set to true if a watched key was modified before EXEC
     pub dirty: bool,
     /// A command was refused when it was queued: EXEC answers -EXECABORT and

@@ -2683,7 +2683,7 @@ fn a_snapshot_keeps_json_numbers_exactly() {
     let path = path.to_str().unwrap();
     kividb::snapshot::write_snapshot(path, &[db], None).unwrap();
     let loaded = kividb::snapshot::load_snapshot(path).unwrap();
-    let KiviDBValue::Json(doc) = &loaded.dbs[0]["doc"] else {
+    let KiviDBValue::Json(doc) = &loaded.dbs[0][&b"doc"[..]] else {
         panic!("not a document");
     };
     let got: Vec<f64> = doc

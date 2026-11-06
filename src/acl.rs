@@ -925,17 +925,18 @@ fn rules_allow(commands: &str, cmd_name: &str, acl_cat: fn(&str) -> Vec<&'static
 }
 
 /// Whether one of `patterns` lets `key` be used in the way asked.
-fn key_matches(patterns: &[KeyPattern], key: &str, read: bool, write: bool) -> bool {
+fn key_matches(patterns: &[KeyPattern], key: &[u8], read: bool, write: bool) -> bool {
     patterns.iter().any(|p| {
         (!read || p.read)
             && (!write || p.write)
-            && (p.pattern == "*" || crate::commands::helpers::glob_match(&p.pattern, key))
+            && (p.pattern == "*"
+                || crate::commands::helpers::glob_match_bytes(p.pattern.as_bytes(), key))
     })
 }
 
 /// Whether a user may read `key`, through its own patterns or a selector's.
 /// For commands that go looking for keys themselves (`TS.QUERYLABELS`).
-pub fn may_read_key(user: &AclUser, key: &str) -> bool {
+pub fn may_read_key(user: &AclUser, key: &[u8]) -> bool {
     user.enabled
         && (key_matches(&user.keys, key, true, false)
             || user
@@ -1134,18 +1135,22 @@ fn permissions_allow(
         if !all_channels(channels) {
             let take = if first_only { 1 } else { usize::MAX };
             for arg in cmd.iter().skip(args.start).take(take) {
-                let channel = String::from_utf8_lossy(arg);
+                // As the bytes they are: two channels that are not text are
+                // not one U+FFFD.
+                let channel: &[u8] = arg;
                 let allowed = if patterns {
                     // A pattern subscription is allowed only for a pattern
                     // the user was given, letter for letter.
-                    channels.iter().any(|c| c == channel.as_ref())
+                    channels.iter().any(|c| c.as_bytes() == channel)
                 } else {
                     channels
                         .iter()
-                        .any(|c| crate::commands::helpers::glob_match(c, &channel))
+                        .any(|c| crate::commands::helpers::glob_match_bytes(c.as_bytes(), channel))
                 };
                 if !allowed {
-                    return Err(Denied::Channel(channel.into_owned()));
+                    return Err(Denied::Channel(
+                        String::from_utf8_lossy(channel).into_owned(),
+                    ));
                 }
             }
         }
@@ -1156,10 +1161,10 @@ fn permissions_allow(
 
     if !all_keys(keys) {
         for (nth, pos) in crate::keyspec::key_positions(name, cmd).iter().enumerate() {
-            let key = String::from_utf8_lossy(cmd[pos]);
+            let key = cmd[pos];
             let (read, write) = key_access(name, cmd, nth);
-            if !key_matches(keys, &key, read, write) {
-                return Err(Denied::Key(key.into_owned()));
+            if !key_matches(keys, key, read, write) {
+                return Err(Denied::Key(String::from_utf8_lossy(key).into_owned()));
             }
         }
     }

@@ -518,7 +518,7 @@ pub struct ClientInfo {
     // Tracking state
     pub tracking: bool,
     pub tracking_bcast: bool,
-    pub tracking_prefixes: Vec<String>,
+    pub tracking_prefixes: Vec<Vec<u8>>,
     pub tracking_redirect: Option<u64>, // redirect invalidation to another client ID
     /// The client they were redirected to has gone.
     pub tracking_redirect_broken: bool,

@@ -5,9 +5,9 @@ use std::sync::{
 
 pub struct SlowLogEntry {
     pub id: u64,
-    pub timestamp: u64,   // Unix seconds when command started
-    pub duration_us: u64, // execution time in microseconds
-    pub cmd: Vec<String>, // command tokens (truncated)
+    pub timestamp: u64,    // Unix seconds when command started
+    pub duration_us: u64,  // execution time in microseconds
+    pub cmd: Vec<Vec<u8>>, // command tokens (truncated), as sent
     pub client_addr: String,
     pub client_name: String,
     /// The command's argument count before truncation, command name included
@@ -162,7 +162,7 @@ pub fn truncate_command<A: AsRef<[u8]>>(
     cmd: &[A],
     max_argc: usize,
     max_string_len: usize,
-) -> Vec<String> {
+) -> Vec<Vec<u8>> {
     // A limit of 0 would log nothing at all, not even the command name.
     let max_argc = max_argc.max(1);
     let kept = if cmd.len() > max_argc {
@@ -170,23 +170,23 @@ pub fn truncate_command<A: AsRef<[u8]>>(
     } else {
         cmd.len()
     };
-    let mut out: Vec<String> = cmd[..kept]
+    let mut out: Vec<Vec<u8>> = cmd[..kept]
         .iter()
         .map(|arg| {
             let arg = arg.as_ref();
             if arg.len() > max_string_len {
-                format!(
-                    "{}... ({} more bytes)",
-                    String::from_utf8_lossy(&arg[..max_string_len]),
-                    arg.len() - max_string_len
-                )
+                let mut cut = arg[..max_string_len].to_vec();
+                cut.extend_from_slice(
+                    format!("... ({} more bytes)", arg.len() - max_string_len).as_bytes(),
+                );
+                cut
             } else {
-                String::from_utf8_lossy(arg).into_owned()
+                arg.to_vec()
             }
         })
         .collect();
     if cmd.len() > max_argc {
-        out.push(format!("... ({} more arguments)", cmd.len() - kept));
+        out.push(format!("... ({} more arguments)", cmd.len() - kept).into_bytes());
     }
     out
 }
@@ -469,11 +469,21 @@ mod tests {
         );
         for entry in log.get(10) {
             assert!(
-                !entry.cmd.iter().any(|a| a.contains("hunter2")),
+                !entry
+                    .cmd
+                    .iter()
+                    .any(|a| a.windows(7).any(|w| w == b"hunter2")),
                 "{:?}",
                 entry.cmd
             );
         }
+    }
+
+    /// An argument that is not text is logged as the bytes it is.
+    #[test]
+    fn arguments_are_logged_as_their_bytes() {
+        let cmd: [&[u8]; 3] = [b"GET", b"\xff\x00k", b"\xfe"];
+        assert_eq!(truncate_command(&cmd, 32, 128), cmd.map(<[u8]>::to_vec));
     }
 
     /// The worked example on the SLOWLOG GET reference page: 33 arguments
@@ -486,26 +496,32 @@ mod tests {
 
         let logged = truncate_command(&cmd, 32, 128);
         assert_eq!(logged.len(), 32);
-        assert_eq!(logged[0], "SADD");
-        assert_eq!(logged[30], "31");
-        assert_eq!(logged[31], "... (2 more arguments)");
+        assert_eq!(logged[0], b"SADD");
+        assert_eq!(logged[30], b"31");
+        assert_eq!(logged[31], b"... (2 more arguments)");
     }
 
     #[test]
     fn a_command_within_the_limits_is_logged_verbatim() {
         let cmd = ["SET", "k", "v"];
-        assert_eq!(truncate_command(&cmd, 32, 128), vec!["SET", "k", "v"]);
+        assert_eq!(
+            truncate_command(&cmd, 32, 128),
+            vec![b"SET".to_vec(), b"k".to_vec(), b"v".to_vec()]
+        );
         // Exactly at the argument limit: nothing is cut.
         let cmd: Vec<String> = (0..32).map(|n| n.to_string()).collect();
         assert_eq!(truncate_command(&cmd, 32, 128).len(), 32);
-        assert!(!truncate_command(&cmd, 32, 128)[31].starts_with("..."));
+        assert!(!truncate_command(&cmd, 32, 128)[31].starts_with(b"..."));
     }
 
     #[test]
     fn long_arguments_are_cut_with_a_byte_count() {
         let big = "x".repeat(200);
         let logged = truncate_command(&["SET", "k", big.as_str()], 32, 128);
-        assert_eq!(logged[2], format!("{}... (72 more bytes)", "x".repeat(128)));
+        assert_eq!(
+            logged[2],
+            format!("{}... (72 more bytes)", "x".repeat(128)).into_bytes()
+        );
     }
 
     #[test]
@@ -523,7 +539,7 @@ mod tests {
         assert_eq!(entries[1].argc, 7);
         assert_eq!(
             entries[1].cmd,
-            vec!["MSET", "a", "1", "... (4 more arguments)"]
+            ["MSET", "a", "1", "... (4 more arguments)"].map(|a| a.as_bytes().to_vec())
         );
         assert_eq!(sl.totals(), (2, 2_000, 1_500));
     }

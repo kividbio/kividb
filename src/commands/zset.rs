@@ -6,7 +6,6 @@ use crate::commands::helpers::{format_score, parse_utf8};
 use crate::keyspace_events::{KS_SORTED_SET, notify};
 use crate::resp::write::*;
 use crate::store;
-use crate::store::Key;
 use crate::store::ValueRef;
 use crate::types::{KiviDBValue, SortedSetInner, ZMember};
 use crate::{read_lock, write_lock};
@@ -179,10 +178,7 @@ fn write_zset<R>(
             let mut zs = SortedSetInner::new();
             let out = write(&mut zs);
             if !zs.is_empty() {
-                map.insert(
-                    Key::from(key),
-                    KiviDBValue::SortedSet(Arc::new(RwLock::new(zs))),
-                );
+                map.insert(key, KiviDBValue::SortedSet(Arc::new(RwLock::new(zs))));
             }
             Ok(out)
         }
@@ -1430,9 +1426,11 @@ fn zscan(ctx: &mut Ctx) -> Vec<u8> {
             );
             let mut items: Vec<Vec<u8>> = Vec::with_capacity(page.len() * 2);
             for (member, score) in page {
-                if options.pattern.as_deref().is_some_and(|pat| {
-                    !crate::commands::helpers::glob_match(pat, &String::from_utf8_lossy(member))
-                }) {
+                if options
+                    .pattern
+                    .as_deref()
+                    .is_some_and(|pat| !crate::commands::helpers::glob_match_bytes(pat, member))
+                {
                     continue;
                 }
                 // ZSCAN keeps the flat, all-bulk-string shape under RESP3
@@ -2414,8 +2412,7 @@ fn store_zset(ctx: &mut Ctx, dst_key: &str, members: ahash::AHashMap<Vec<u8>, f6
     let zs = Arc::new(RwLock::new(inner));
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, dst_key);
-    let replaced =
-        write_lock!(shard).insert_expiring(Key::from(dst_key), KiviDBValue::SortedSet(zs), None);
+    let replaced = write_lock!(shard).insert_expiring(dst_key, KiviDBValue::SortedSet(zs), None);
     drop(replaced);
 }
 
