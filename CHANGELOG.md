@@ -7,6 +7,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Data moves in from Valkey 9.** KiviDB reads Valkey 9.0's and 9.1's
+  RDB format (RDB 80, a `VALKEY080` header): a `dump.rdb` loaded at
+  startup or with `--preload-file`, a full sync as a replica of a Valkey 9
+  primary, `RESTORE` of a Valkey 9 `DUMP` payload (so `MIGRATE` and the
+  tools built on `DUMP`), and `FUNCTION RESTORE` of a Valkey 9 `FUNCTION
+  DUMP`. A hash whose fields have TTLs (Valkey's RDB type 22) keeps them,
+  to the millisecond. Valkey 9 refused to load with `bad magic`, and its
+  payloads with `ERR DUMP payload version or checksum are wrong`. What
+  KiviDB does not read is refused whole, by name, and nothing is skipped:
+  a newer Valkey's format (Valkey 9.2 writes RDB 81), a type Valkey does not
+  write, and a file a Valkey cluster node saved while a slot migration into
+  it was under way (the keys of those slots are not all there). Checked
+  against the valkey/valkey 9.0.7 and 9.1.3 images, key by key: every core
+  type, streams with consumer groups and pending entries, key and field
+  TTLs, several databases, function libraries and valkey-json documents
+  (valkey-bundle 9.0), by file, by `RESTORE`, and as a replica through a
+  full sync and a stream of writes (#449).
+
 ### Changed
 
 - **Source archives are small again.** The tarball GitHub makes of the
@@ -48,6 +68,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   too: a line break in one split the reply in two. Apart from that, RESP2
   clients get the same bytes as before for scripts that do not call
   `redis.setresp(3)`.
+
+- **Hash field TTLs read back to the millisecond.** A field TTL loaded from
+  a Redis 7.4+ RDB file, full sync or `DUMP` payload, or set with `HSETEX
+  ... EXAT` or `PXAT`, often read back with `HPEXPIRETIME` one millisecond
+  later than it was set: the time left was worked out from the clock in
+  whole milliseconds. Redis and Valkey send `HSETEX` with `PXAT` to their
+  replicas, so a KiviDB replica of either drifted by that millisecond. It
+  is now worked out to the nanosecond, as `HPEXPIREAT` does (#449).
 
 - **A write in database 0 could reach replicas and the AOF in another
   database.** Until a client selects a database other than 0, writes go out
