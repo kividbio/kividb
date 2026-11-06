@@ -82,6 +82,51 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A negative Unix time no longer deletes hash fields.** `HEXPIREAT` and
+  `HPEXPIREAT` with a time below 0, and `HGETEX` and `HSETEX` with a
+  negative `EXAT` or `PXAT`, took it as a time that had passed and deleted
+  the fields. Redis keeps them and refuses the command with `ERR invalid
+  expire time, must be >= 0`, and so does KiviDB now. A time of 0 is still
+  taken, and the fields go, as in Redis (#486).
+
+  **Upgrade note:** 1.2.0 logged and sent such a command as it came. An
+  AOF it wrote, or the stream of a 1.2.0 master, is still applied as 1.2.0
+  applied it, so the fields it deleted stay deleted.
+
+- **A replica set to `replica-priority 0` is no longer promoted by
+  Sentinel.** `CONFIG SET replica-priority` and the config file took the
+  setting and `CONFIG GET` gave it back, but `INFO replication` always
+  reported `slave_priority:100`, which is what Sentinel reads to choose the
+  replica to promote, and it promoted one set to 0. `INFO` now reports the
+  priority set, from `CONFIG SET` under either of its names
+  (`replica-priority`, `slave-priority`), the config file or the new
+  `--replica-priority` flag, and `CONFIG REWRITE` keeps it.
+  `replica-announced` likewise now reaches `INFO replication` as
+  `replica_announced`, which Sentinel reads to leave a replica out of
+  `SENTINEL REPLICAS` (#443).
+
+- **A hash field's expiry is kept to the millisecond when KiviDB saves and
+  loads the hash.** After a restart from a snapshot or the AOF's preamble,
+  a full sync from a KiviDB master, or a `RESTORE` or `MIGRATE` between
+  KiviDB servers, `HPEXPIRETIME` of a field was often 1 ms off what it
+  had been set to, later or earlier. A field's deadline is converted
+  between the server's clock and Unix milliseconds when a hash is written
+  out and read back in, and each conversion cut the time now to a whole
+  millisecond first. It is now converted to the nanosecond both ways, and
+  a field set with `HPEXPIREAT t` reads back as `t`. (Redis and Valkey
+  files and `HSETEX ... PXAT` are the entry *Hash field TTLs read back to
+  the millisecond*, below; they now use the same conversion.) (#448)
+
+  A field's time to live is also checked as Redis checks it: a deadline
+  past 2^46 - 1 ms after the epoch (the year 4199), given to `HEXPIRE`,
+  `HPEXPIRE`, `HEXPIREAT`, `HPEXPIREAT`, `HGETEX` or `HSETEX` as a time to
+  live or a Unix time, is refused with `ERR invalid expire time in
+  '<command>' command`. KiviDB took any: `HEXPIRE h 18446744073709552
+  FIELDS 1 f` was saved as a moment from then, so the field was gone after
+  a restart, a full sync, `RESTORE` or `MIGRATE`, and `HEXPIRE h
+  9223372036854775807 FIELDS 1 f` panicked and closed the client's
+  connection, with no reply.
+
 - **A search index is seen only from its own database.** `FT._LIST`
   listed the indexes of every database, and the commands that name an
   index found one of another database: from database 1, `FT.SEARCH`
@@ -188,6 +233,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   of an `aof:` preload, `dump.rdb` at startup and a full sync from a Redis,
   Valkey, KeyDB or Dragonfly master; a replica refuses such a full sync
   and keeps its dataset (#477).
+
+- **A KiviDB snapshot's databases past the server's are no longer dropped.**
+  A `dump.kdb` saved by a server with more databases than this one had the
+  databases past them dropped without a word, and the log's key count left
+  them out: in `dump.kdb` at startup, the AOF's preamble, a `--preload-file`
+  of a KiviDB snapshot or the base file of an `aof:` preload, and a full
+  sync from a KiviDB master. The replica's check that a full sync is whole
+  before it drops its old dataset counted the keys it was about to lose. As
+  for an RDB file, such a snapshot now loads into the server's databases
+  when there are enough, and is refused otherwise, naming the database and
+  the `databases` to start with, as is one with a search index in such a
+  database; a replica refuses such a full sync before it lets go of its
+  dataset, and keeps it. A snapshot of KiviDB 1.2.0 with the empty key
+  before its last database is still read again where 1.2.0 put it before
+  it is refused. A database number of 65536 or more is called more likely
+  a damaged file than given as advice, and `--databases 0` is refused on
+  the command line as it was in a config file (#482).
 
 - **A Lua script's `false` is a RESP3 null to a RESP3 client (#431).** A
   script's `false`, which is also what `redis.call` gives back for a nil
