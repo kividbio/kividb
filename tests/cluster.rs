@@ -3470,6 +3470,188 @@ fn wait_import_completed(dst: &Node, task_id: &str) {
     });
 }
 
+/// `CLUSTER FAILOVER` on the source's replica while a `CLUSTER MIGRATION
+/// IMPORT` from that source runs loses no acknowledged write (#516). The
+/// source waits before its handoff (`KIVIDB_TEST_HANDOFF_DELAY_MS`), with
+/// its stream running, and its replica takes over meanwhile. The old master,
+/// a replica by then, used to hand the slots over all the same, from its own
+/// dataset, and the destination took them at a newer epoch. The new
+/// master's writes to them were lost: those since its promotion, which the
+/// stream never carried, and those it took until it heard of the
+/// destination's claim, deleted with the slots. Now the source gives the
+/// attempt up, and the destination imports the slots from the new master.
+#[test]
+fn a_failover_of_the_source_during_an_atomic_import_loses_no_acknowledged_write() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (nodes, _) = form_cluster_with_env(3, &[("KIVIDB_TEST_HANDOFF_DELAY_MS", "10000")]);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let replica = add_replica(&nodes, src);
+    let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+    wait_cluster_ok(&all, 4);
+    wait_until(
+        "the replica to follow the source",
+        Duration::from_secs(30),
+        || replica.repl_info("master_link_status").as_deref() == Some("up"),
+    );
+    let logs = || {
+        let logs: Vec<String> = all
+            .iter()
+            .map(|n| format!("==== node {}\n{}", n.port, n.log()))
+            .collect();
+        logs.join("\n")
+    };
+    let lists: Vec<String> = (0..20)
+        .map(|i| key_in(0..=1000, &format!("fo{i}")))
+        .collect();
+    let ports: Vec<u16> = all.iter().map(|n| n.port).collect();
+
+    // Writers that follow -MOVED, try another node on anything else, and
+    // keep every element they were told was pushed.
+    let stop = Arc::new(AtomicBool::new(false));
+    let writers: Vec<_> = (0..4)
+        .map(|w| {
+            let (stop, lists, ports) = (Arc::clone(&stop), lists.clone(), ports.clone());
+            std::thread::spawn(move || {
+                let patient = |port: u16| {
+                    Conn::try_connect(port).and_then(|c| {
+                        c.stream
+                            .set_read_timeout(Some(Duration::from_secs(30)))
+                            .ok()
+                            .map(|_| c)
+                    })
+                };
+                let mut acked: Vec<(usize, String)> = Vec::new();
+                let (mut n, mut at) = (0usize, 0usize);
+                let mut conn = patient(ports[at]);
+                while !stop.load(Ordering::Relaxed) {
+                    n += 1;
+                    let list = n % lists.len();
+                    let element = format!("{w}:{n}");
+                    let reply = conn
+                        .as_mut()
+                        .map(|c| c.try_cmd(&["RPUSH", &lists[list], &element]));
+                    match reply {
+                        Some(Ok(Resp::Int(_))) => acked.push((list, element)),
+                        Some(Ok(Resp::Error(e))) if e.starts_with("MOVED") => {
+                            let port = e.rsplit(':').next().and_then(|p| p.parse().ok());
+                            conn = port.and_then(patient);
+                        }
+                        _ => {
+                            at = (at + 1) % ports.len();
+                            std::thread::sleep(Duration::from_millis(5));
+                            conn = patient(ports[at]);
+                        }
+                    }
+                }
+                acked
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(500));
+
+    let task_id = dst
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "1000"])
+        .text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    wait_until(
+        "the source to wait before its handoff",
+        Duration::from_secs(30),
+        || src.log().contains("(test) the handoff of slots"),
+    );
+    let reply = replica.conn().cmd(&["CLUSTER", "FAILOVER"]);
+    assert!(reply.is_ok(), "CLUSTER FAILOVER: {reply:?}");
+    wait_until("the replica to take over", Duration::from_secs(15), || {
+        replica.is_master()
+    });
+
+    wait_until("the import to complete", Duration::from_secs(90), || {
+        let status = dst
+            .conn()
+            .cmd(&["CLUSTER", "MIGRATION", "STATUS", "ID", &task_id]);
+        let task = &status.array()[0];
+        let state = task_field(task, "state").text();
+        assert!(
+            state == "in_progress" || state == "completed",
+            "{task:?}\n{}",
+            logs()
+        );
+        state == "completed"
+    });
+    let dst_id = dst.id();
+    wait_until(
+        "every node to agree on the new owner",
+        Duration::from_secs(30),
+        || {
+            all.iter().all(|n| {
+                n.conn()
+                    .cmd(&["CLUSTER", "NODES"])
+                    .text()
+                    .lines()
+                    .any(|l| l.starts_with(&dst_id) && l.contains(" 0-1000"))
+            })
+        },
+    );
+    // The source gave its handover up for the failover, by itself: the
+    // destination's refusal is not all that stood in its way.
+    wait_until(
+        "the source to give its handover up",
+        Duration::from_secs(30),
+        || src.log().contains("a failover of this node began"),
+    );
+    // Long enough for a node that held the slots' keys to have dropped them.
+    std::thread::sleep(Duration::from_secs(3));
+    stop.store(true, Ordering::Relaxed);
+    let acked: Vec<(usize, String)> = writers
+        .into_iter()
+        .flat_map(|w| w.join().unwrap())
+        .collect();
+    assert!(acked.len() > 100, "{} pushes acknowledged", acked.len());
+
+    let mut d = dst.conn();
+    let got: Vec<Vec<String>> = lists
+        .iter()
+        .map(|list| {
+            let got = d.cmd(&["LRANGE", list, "0", "-1"]);
+            got.array().iter().map(Resp::text).collect()
+        })
+        .collect();
+    // Every element is pushed once, by one attempt: one there twice was
+    // applied twice, as by the stream of an earlier attempt's source.
+    let twice: Vec<&String> = got
+        .iter()
+        .flat_map(|elements| {
+            let mut seen = std::collections::HashSet::new();
+            elements.iter().filter(move |e| !seen.insert(*e))
+        })
+        .collect();
+    assert!(
+        twice.is_empty(),
+        "{} pushes applied twice, e.g. {:?}\n{}",
+        twice.len(),
+        &twice[..twice.len().min(5)],
+        logs()
+    );
+    let have: Vec<std::collections::HashSet<String>> = got
+        .iter()
+        .map(|elements| elements.iter().cloned().collect())
+        .collect();
+    let lost: Vec<&(usize, String)> = acked
+        .iter()
+        .filter(|(list, element)| !have[*list].contains(element))
+        .collect();
+    assert!(
+        lost.is_empty(),
+        "{} of {} acknowledged pushes lost, e.g. {:?}\n{}",
+        lost.len(),
+        acked.len(),
+        &lost[..lost.len().min(5)],
+        logs()
+    );
+}
+
 /// A write routed here before an atomic slot migration handed its slot
 /// over, and held up before the write gate until the handoff had let writes
 /// go again, is sent on with `-MOVED`. It used to run here, on a slot the

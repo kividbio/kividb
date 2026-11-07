@@ -145,6 +145,35 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A failover of the source during an atomic slot migration no longer
+  loses acknowledged writes (#516).** With `CLUSTER FAILOVER` sent to the
+  source's replica while `CLUSTER MIGRATION IMPORT` ran, the replica took
+  the source's slots over, the moving ones too, and served writes to them.
+  The old master, a replica by then, went on with the migration and handed
+  the slots over from its own dataset, and the destination took them at a
+  newer epoch. The writes the new master had acknowledged to them were lost:
+  those since its promotion, which the migration's stream never carried, and
+  those it took until it heard of the destination's claim, deleted with the
+  slots. A reproduction (six local nodes, the failover 0 to 100 ms after the
+  import began) lost 650 to 8,000 acknowledged writes in each of 5 runs;
+  1.2.0 has the same bug. Now a failover and a handover exclude each other.
+  The source hands slots over only while it is still the master it was when
+  the migration began, with the same dataset and config epoch, and no
+  failover of it has begun in the time an election can take: otherwise it
+  gives the attempt up, and the destination drops what it received and
+  imports the slots again, from their owner then. The destination takes
+  slots over only from their owner as it sees it, and not in that time
+  after it voted for a replica of that owner; such a vote gives the imports
+  from that owner up. What a given-up attempt's source still sends is
+  refused, so nothing of it lands in the next attempt.
+
+  One thing an operator sees: during a handover, and for 3 s after one
+  (three heartbeats, for the replicas to hear which slots moved), `CLUSTER
+  FAILOVER` on a replica of the source still replies `OK`, but the failover
+  does not happen. The source logs why ("Manual failover requested by …
+  refused"), and so does the replica. Ask again a few seconds later.
+  `CLUSTER FAILOVER TAKEOVER`, which asks no one, is as before.
+
 - **`appendfsync always` syncs each write to disk before it is
   acknowledged, as in Redis (#513).** It was accepted and did nothing: the
   configuration file warned that it had no effect, `CONFIG SET appendfsync
