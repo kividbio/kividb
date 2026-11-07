@@ -190,6 +190,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   server rather than acknowledge a write that is not on disk, as Redis
   does. `appendfsync no` still syncs once a second.
 
+- **A hash field past its TTL now goes the same way on the master, its
+  replicas and the AOF (#415).** Each removed such a field by its own
+  clock, and the master sent nothing of it: a replica that lagged, or the
+  AOF replayed after a restart, applied the writes the master made while
+  the field lived (`HINCRBY`, `HPERSIST`, `HSETNX`, `SORT … STORE` by it)
+  after it was gone, and kept another hash or list than the master's. Now
+  only the master removes a field for its time, and sends its removal on
+  as an `HDEL` (a `DEL` of the hash if that empties it), ahead of the
+  write that found the field due. A replica, and the AOF as it is
+  replayed, keep the field until that `HDEL`; a replica hides it from its
+  readers meanwhile. A master says it does this with
+  `kividb_expired_fields_propagated:1` in `INFO`.
+  - *Mixed versions:* a 1.2.1 replica of a 1.2.0 master, which sends no
+    `HDEL` for a field, still removes fields by its own clock, and the gap
+    above stays until the master is upgraded too.
+  - *AOFs from 1.2.0* hold no `HDEL` for the fields that expired, so a
+    replay of one need not give back what 1.2.0 held where a write came
+    after a field's time. Run `BGREWRITEAOF` once after upgrading, so that
+    the AOF holds the dataset as it now is. A divergence already made, by
+    an earlier replay or a replica, is not undone by this.
+  - *Loading:* a field past its time in a KiviDB or Redis RDB file, a
+    Valkey, Dragonfly or KeyDB file, a full sync or a `RESTORE` payload is
+    loaded with its deadline and expired afterwards, on a master with its
+    `HDEL`, rather than dropped as it was read.
+
 - **The `MEMORY USAGE` accuracy tests no longer fail now and then with
   `Connection reset by peer`.** They found a free port for each server with
   a socket that listened on it. A server another test of the same file was

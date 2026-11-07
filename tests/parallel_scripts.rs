@@ -103,7 +103,8 @@ impl Conn {
 struct Server {
     port: u16,
     child: Child,
-    _dir: PathBuf,
+    dir: PathBuf,
+    args: Vec<String>,
 }
 
 /// Whether nothing has `port`. It is asked with a socket that is bound and
@@ -140,35 +141,46 @@ fn free_port() -> u16 {
     }
 }
 
+/// `kividb` on `port`, in `dir`.
+fn spawn(dir: &std::path::Path, port: u16, extra: &[String]) -> Child {
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("server.log"))
+        .unwrap();
+    Command::new(env!("CARGO_BIN_EXE_kividb"))
+        .current_dir(dir)
+        .args([
+            "--port",
+            &port.to_string(),
+            "--bind",
+            "127.0.0.1",
+            "--io-model",
+            "tokio",
+            "--threads",
+            "4",
+            "--update-check",
+            "no",
+        ])
+        .args(extra)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(log)
+        .spawn()
+        .expect("could not start kividb")
+}
+
 impl Server {
     fn start(extra: &[&str]) -> Self {
         let dir = tempfile::tempdir().unwrap().keep();
         let port = free_port();
-        let log = std::fs::File::create(dir.join("server.log")).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_kividb"))
-            .current_dir(&dir)
-            .args([
-                "--port",
-                &port.to_string(),
-                "--bind",
-                "127.0.0.1",
-                "--io-model",
-                "tokio",
-                "--threads",
-                "4",
-                "--update-check",
-                "no",
-            ])
-            .args(extra)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .expect("could not start kividb");
+        let args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+        let child = spawn(&dir, port, &args);
         let server = Server {
             port,
             child,
-            _dir: dir,
+            dir,
+            args,
         };
         assert_eq!(server.conn().cmd(&["PING"]).s(), "PONG");
         server
@@ -176,6 +188,34 @@ impl Server {
 
     fn conn(&self) -> Conn {
         Conn::connect(self.port)
+    }
+
+    /// Killed, with no chance to save or expire anything more, and started
+    /// again on the same port and directory: what it holds is what its AOF
+    /// replays to.
+    fn kill_and_restart(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.child = spawn(&self.dir, self.port, &self.args);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let up = TcpStream::connect(("127.0.0.1", self.port)).and_then(|mut s| {
+                s.set_read_timeout(Some(Duration::from_secs(10)))?;
+                s.write_all(b"*1\r\n$4\r\nPING\r\n")?;
+                let mut reply = [0u8; 7];
+                s.read_exact(&mut reply)?;
+                Ok(&reply == b"+PONG\r\n")
+            });
+            if up.unwrap_or(false) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "the server did not come back");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn aof(&self) -> Vec<u8> {
+        std::fs::read(self.dir.join("appendonly.aof")).unwrap_or_default()
     }
 }
 
@@ -434,4 +474,327 @@ fn scripts_on_two_tags_run_at_once_and_a_command_waits_for_its_own() {
         done + Duration::from_millis(20) >= slow_done,
         "a read of the script's own tag did not wait: {done:?} of {slow_done:?}"
     );
+}
+
+// ── SORT patterns in a script held to a tag (#415 review) ────────────────────
+
+impl Conn {
+    /// One field of `INFO <section>`.
+    fn info(&mut self, section: &str, field: &str) -> String {
+        let reply = self.cmd(&["INFO", section]);
+        reply
+            .s()
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{field}:")))
+            .unwrap_or_else(|| panic!("no {field} in INFO {section}"))
+            .trim()
+            .to_string()
+    }
+
+    /// What `key` holds, as clients see it: a hash's fields, sorted, each
+    /// with its value and whether it has a time to live (1) or none (-1); a
+    /// list's elements; or the type.
+    fn state(&mut self, key: &str) -> String {
+        match self.cmd(&["TYPE", key]).s() {
+            "hash" => {
+                let V::Arr(all) = self.cmd(&["HGETALL", key]) else {
+                    panic!("HGETALL {key} did not answer with an array")
+                };
+                let mut fields: Vec<(String, String, i64)> = all
+                    .chunks(2)
+                    .map(|pair| {
+                        let field = pair[0].s().to_string();
+                        let ttl = match self.cmd(&["HPTTL", key, "FIELDS", "1", &field]) {
+                            V::Arr(ttls) => match ttls[..] {
+                                [V::Int(ttl)] => ttl.signum(),
+                                _ => panic!("HPTTL {key} {field}: {ttls:?}"),
+                            },
+                            other => panic!("HPTTL {key} {field}: {other:?}"),
+                        };
+                        (field, pair[1].s().to_string(), ttl)
+                    })
+                    .collect();
+                fields.sort();
+                format!("hash {fields:?}")
+            }
+            "list" => format!("list {:?}", self.cmd(&["LRANGE", key, "0", "-1"])),
+            other => other.to_string(),
+        }
+    }
+}
+
+fn wait_until(what: &str, secs: u64, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn count(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack
+        .windows(needle.len())
+        .filter(|w| *w == needle)
+        .count()
+}
+
+/// The replica has applied everything its master has sent.
+fn wait_caught_up(master: &mut Conn, replica: &mut Conn) {
+    wait_until("the replica to catch up", 60, || {
+        let offset = master.info("replication", "master_repl_offset");
+        replica.info("replication", "slave_repl_offset") == offset
+            && master.info("replication", "master_repl_offset") == offset
+    });
+}
+
+/// Runs its `ARGV` as one command, with `KEYS[1]` as the key it names.
+const CALLS_ARGV: &str = "return redis.call(unpack(ARGV))";
+
+/// A script held to the tag `q` may not `SORT` or `SORT_RO` by a pattern
+/// that can name keys outside `q`: such a key is one it holds no lock of,
+/// and a field of it past its time would be removed by the `SORT` with a
+/// client's write to it able to fall between the removal and its `HDEL`
+/// (the command gate a `SORT` takes alone is already the script's). It is
+/// refused before anything is read: nothing is removed, nothing sent. A
+/// pattern that keeps to the tag, or names no key, is let through, as is the
+/// same `SORT` from a client or with the setting off. The replica and a
+/// replay of the AOF end as the master does.
+#[test]
+fn a_tagged_script_may_not_sort_by_a_pattern_outside_its_tag() {
+    let mut master = Server::start(&[
+        "--lua-parallel-scripts",
+        "true",
+        "--aof",
+        "--appendfsync",
+        "always",
+    ]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let (mut m, mut r) = (master.conn(), replica.conn());
+    wait_until("the replica's link to come up", 30, || {
+        r.info("replication", "master_link_status") == "up"
+    });
+
+    // Each write finds its field itself: the master's sweep held off.
+    assert!(m.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]).ok());
+    assert_eq!(m.cmd(&["RPUSH", "{q}:ids", "1", "2", "3"]), V::Int(3));
+    let hashes = [
+        "obj:1",
+        "obj:2",
+        "obj:3",
+        "{q}:obj:1",
+        "{q}:obj:2",
+        "{q}:obj:3",
+    ];
+    for key in hashes {
+        let w = &key[key.len() - 1..];
+        assert_eq!(m.cmd(&["HSET", key, "w", w, "keep", "1"]), V::Int(2));
+    }
+    assert!(m.cmd(&["SET", "w_1", "1"]).ok());
+    for key in ["obj:2", "{q}:obj:2"] {
+        assert_eq!(
+            m.cmd(&["HPEXPIRE", key, "100", "FIELDS", "1", "w"]),
+            V::Arr(vec![V::Int(1)])
+        );
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    fn script<'a>(args: &[&'a str]) -> Vec<&'a str> {
+        let mut eval = vec!["EVAL", CALLS_ARGV, "1", "{q}:ids"];
+        eval.extend_from_slice(args);
+        eval
+    }
+
+    // Refused, every run: the first runs and the later ones (seen to be
+    // quick, beside others) take different roads.
+    let offset = m.info("replication", "master_repl_offset");
+    let aof = master.aof().len();
+    let refused: &[(&[&str], &str, &str)] = &[
+        (&["SORT", "{q}:ids", "BY", "obj:*->w"], "sort", "obj:*->w"),
+        (&["SORT", "{q}:ids", "GET", "obj:*->w"], "sort", "obj:*->w"),
+        (
+            &[
+                "SORT", "{q}:ids", "BY", "nosort", "GET", "#", "GET", "obj:*->w", "STORE",
+                "{q}:dst",
+            ],
+            "sort",
+            "obj:*->w",
+        ),
+        (
+            &["SORT_RO", "{q}:ids", "BY", "obj:*->w"],
+            "sort_ro",
+            "obj:*->w",
+        ),
+        (
+            &["SORT_RO", "{q}:ids", "GET", "#", "GET", "obj:*->w"],
+            "sort_ro",
+            "obj:*->w",
+        ),
+        // Options and the command in any case.
+        (
+            &["sort", "{q}:ids", "bY", "obj:*->w", "Get", "#"],
+            "sort",
+            "obj:*->w",
+        ),
+        (
+            &["sort_ro", "{q}:ids", "limit", "0", "3", "gEt", "obj:*->w"],
+            "sort_ro",
+            "obj:*->w",
+        ),
+        // Another tag's hashes, a tag the element would have to close, and
+        // keys of strings: all outside `q`.
+        (
+            &["SORT", "{q}:ids", "BY", "{r}:obj:*->w"],
+            "sort",
+            "{r}:obj:*->w",
+        ),
+        (&["SORT", "{q}:ids", "BY", "{q*->w"], "sort", "{q*->w"),
+        (&["SORT", "{q}:ids", "BY", "w_*"], "sort", "w_*"),
+        (&["SORT_RO", "{q}:ids", "GET", "w_*"], "sort_ro", "w_*"),
+    ];
+    for run in 0..8 {
+        for (args, name, pattern) in refused {
+            let reply = m.cmd(&script(args));
+            assert!(reply.is_err(), "run {run}: {args:?} ran: {reply:?}");
+            let message = reply.s();
+            assert!(
+                message.contains(&format!(
+                    "Script attempted to run '{name}' with the pattern '{pattern}', which looks \
+                     at keys it does not name outside the hash tag 'q' of its KEYS"
+                )),
+                "run {run}: {args:?}: {message}"
+            );
+        }
+        // A read-only script, too.
+        let mut eval_ro = script(&["SORT_RO", "{q}:ids", "BY", "obj:*->w"]);
+        eval_ro[0] = "EVAL_RO";
+        let reply = m.cmd(&eval_ro);
+        assert!(
+            reply.is_err() && reply.s().contains("outside the hash tag 'q'"),
+            "run {run}: {reply:?}"
+        );
+    }
+    // Nothing was removed, nothing sent, nothing stored.
+    assert_eq!(m.info("replication", "master_repl_offset"), offset);
+    assert_eq!(master.aof().len(), aof);
+    assert_eq!(m.cmd(&["EXISTS", "{q}:dst"]), V::Int(0));
+
+    // Let through: no pattern, `#`, a pattern without `*`, patterns kept to
+    // `q`. Its own `{q}:obj:2`'s `w` is past its time and goes with them.
+    let sorted = |c: &mut Conn, args: &[&str]| match c.cmd(args) {
+        V::Arr(items) => items,
+        other => panic!("{args:?}: {other:?}"),
+    };
+    let s = |items: &[&str]| {
+        items
+            .iter()
+            .map(|i| V::Str(i.to_string()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        sorted(&mut m, &script(&["SORT", "{q}:ids"])),
+        s(&["1", "2", "3"])
+    );
+    assert_eq!(
+        sorted(
+            &mut m,
+            &script(&["SORT_RO", "{q}:ids", "BY", "nosort", "GET", "#"])
+        ),
+        s(&["1", "2", "3"])
+    );
+    assert_eq!(
+        sorted(
+            &mut m,
+            &script(&["sort", "{q}:ids", "by", "obj->w", "DESC"])
+        ),
+        s(&["3", "2", "1"])
+    );
+    assert_eq!(
+        m.cmd(&script(&[
+            "SORT",
+            "{q}:ids",
+            "BY",
+            "{q}:obj:*->w",
+            "GET",
+            "#",
+            "GET",
+            "{q}:obj:*->w",
+            "STORE",
+            "{q}:dst",
+        ])),
+        V::Int(6)
+    );
+    assert_eq!(
+        sorted(
+            &mut m,
+            &script(&[
+                "SORT_RO",
+                "{q}:ids",
+                "bY",
+                "{q}:obj:*->w",
+                "gEt",
+                "{q}:obj:*->w"
+            ])
+        ),
+        vec![V::Nil, V::Str("1".into()), V::Str("3".into())]
+    );
+
+    // From a client, as before: the `SORT` takes `obj:2`'s `w` as gone, and
+    // its `HDEL` goes ahead of the write after it.
+    assert_eq!(
+        sorted(
+            &mut m,
+            &["SORT", "{q}:ids", "BY", "obj:*->w", "GET", "obj:*->w"]
+        ),
+        vec![V::Nil, V::Str("1".into()), V::Str("3".into())]
+    );
+    assert_eq!(
+        sorted(&mut m, &["SORT_RO", "{q}:ids", "GET", "obj:*->w"]),
+        vec![V::Str("1".into()), V::Nil, V::Str("3".into())]
+    );
+    assert_eq!(m.cmd(&["HINCRBY", "obj:2", "w", "5"]), V::Int(5));
+
+    // And with the setting off, from a script as from a client.
+    assert!(m.cmd(&["CONFIG", "SET", "lua-parallel-scripts", "no"]).ok());
+    assert_eq!(
+        sorted(
+            &mut m,
+            &script(&["SORT", "{q}:ids", "BY", "obj:*->w", "GET", "w_*"])
+        ),
+        vec![V::Str("1".into()), V::Nil, V::Nil]
+    );
+    assert!(
+        m.cmd(&["CONFIG", "SET", "lua-parallel-scripts", "yes"])
+            .ok()
+    );
+    assert!(m.cmd(&["SET", "last", "1"]).ok());
+    assert!(m.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "1"]).ok());
+
+    let keys = [
+        "obj:1",
+        "obj:2",
+        "obj:3",
+        "{q}:obj:1",
+        "{q}:obj:2",
+        "{q}:obj:3",
+        "{q}:dst",
+        "w_1",
+    ];
+    let before: Vec<String> = keys.iter().map(|key| m.state(key)).collect();
+    assert_eq!(before[1], r#"hash [("keep", "1", -1), ("w", "5", -1)]"#);
+    assert_eq!(before[4], r#"hash [("keep", "1", -1)]"#);
+    assert_eq!(
+        before[6],
+        format!("list {:?}", V::Arr(s(&["2", "", "1", "1", "3", "3"])))
+    );
+    wait_caught_up(&mut m, &mut r);
+    let on_replica: Vec<String> = keys.iter().map(|key| r.state(key)).collect();
+    assert_eq!(on_replica, before, "replica: {keys:?}");
+
+    wait_until("the writes to reach the AOF", 10, || {
+        count(&master.aof(), b"$4\r\nlast\r\n") == 1
+    });
+    master.kill_and_restart();
+    let mut m = master.conn();
+    let replayed: Vec<String> = keys.iter().map(|key| m.state(key)).collect();
+    assert_eq!(replayed, before, "AOF replay: {keys:?}");
 }

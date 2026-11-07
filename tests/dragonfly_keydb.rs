@@ -128,7 +128,9 @@ fn field_ttl_ms(value: &KiviDBValue, field: &str) -> Option<u64> {
 
 // KeyDB writes the TTL `EXPIREMEMBER` gives a hash field after the hash: it
 // loads as the field's TTL, to the millisecond. One already past its time
-// takes the field with it, and the hash with its last field. A TTL after a
+// is kept as that moment, the field with it, for field expiry to remove (and
+// a master to send the `HDEL` of, #415): dropped by each reader's clock, a
+// replica's full sync went otherwise than its master. A TTL after a
 // key that was dropped as past its own time goes with that key, and does
 // not land on the key before it. KeyDB's version stamps (`mvcc-tstamp`,
 // before each key under active replication) are read past.
@@ -157,7 +159,15 @@ fn keydb_hash_field_ttls_load_as_field_ttls() {
     let db = &dbs[0];
     let mut keys: Vec<&str> = db.keys().map(String::as_str).collect();
     keys.sort_unstable();
-    assert_eq!(keys, ["h", "s"]);
+    assert_eq!(keys, ["gone", "h", "s"]);
+    let due = |key: &str, field: &str| match &db[key] {
+        KiviDBValue::HashEx(h) => h
+            .read()
+            .expiries
+            .get(field)
+            .is_some_and(|at| *at <= std::time::Instant::now()),
+        _ => false,
+    };
     let KiviDBValue::HashEx(h) = &db["h"] else {
         panic!("h has no field TTLs");
     };
@@ -165,9 +175,11 @@ fn keydb_hash_field_ttls_load_as_field_ttls() {
         let h = h.read();
         let mut fields: Vec<&str> = h.fields.keys().map(String::as_str).collect();
         fields.sort_unstable();
-        assert_eq!(fields, ["a", "b"], "c ran out");
-        assert_eq!(h.expiries.len(), 1);
+        assert_eq!(fields, ["a", "b", "c"]);
+        assert_eq!(h.expiries.len(), 2);
     }
+    assert!(due("h", "c"), "c ran out: kept, and due");
+    assert!(due("gone", "only"), "only ran out: kept, and due");
     let at = field_ttl_ms(&db["h"], "a").unwrap();
     assert!(at.abs_diff(later) <= 2, "a expires at {at}, not {later}");
 }

@@ -2020,3 +2020,81 @@ fn a_script_beside_others_may_not_be_the_first_to_leave_db_0() {
     assert!(m.cmd(&["SELECT", "3"]).ok());
     assert_eq!(m.cmd(&["GET", "{t}a"]), V::Str("1".into()));
 }
+
+/// Milliseconds since the Unix epoch, now.
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+/// `state=` of the master's `slave0` line.
+fn replica_state(master: &mut Conn) -> Option<String> {
+    let info = master.cmd(&["INFO", "replication"]);
+    let row = info
+        .s()
+        .lines()
+        .find(|l| l.starts_with("slave0:"))?
+        .to_string();
+    row.split(',')
+        .find_map(|kv| kv.strip_prefix("state="))
+        .map(str::to_string)
+}
+
+/// A hash field's deadline that falls while a replica's full sync is under
+/// way, the dataset cut before it and an `HINCRBY` of the field, made while
+/// it lived, after the cut. The replica loaded the field's time as one that
+/// had come and dropped the field, and the `HINCRBY` then made it again, `1`
+/// with no deadline, for good, where the master's field went at its time
+/// (300 of 300 of the issue's runs, #415). Now the load keeps the field,
+/// past its time, the `HINCRBY` goes into it, and the master's `HDEL`
+/// removes it.
+#[test]
+fn a_field_deadline_during_a_full_sync_leaves_the_replica_as_the_master() {
+    let master = Server::start(&[]);
+    let mut m = master.conn();
+    let value = "v".repeat(1000);
+    for i in 0..20_000 {
+        assert!(m.cmd(&["SET", &format!("base:{i}"), &value]).ok());
+    }
+    let keys = 50;
+    let at = unix_ms_now() + 3_000;
+    for i in 0..keys {
+        let key = format!("h:{i}");
+        assert_eq!(m.cmd(&["HSET", &key, "f", "5", "keep", "1"]).i(), 2);
+        assert_eq!(
+            m.cmd(&["HPEXPIREAT", &key, &at.to_string(), "FIELDS", "1", "f"]),
+            V::Arr(vec![V::Int(1)])
+        );
+    }
+    let relay = Relay::to(master.port);
+    // The handshake goes through, and the dataset stops part-way.
+    relay.pause_after(64 * 1024);
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &relay.port.to_string()]);
+    // The dataset is cut and on its way: what follows is in the stream.
+    wait_until("the master to send its dataset", || {
+        replica_state(&mut m).as_deref() == Some("send_bulk")
+    });
+    for i in 0..keys {
+        assert_eq!(m.cmd(&["HINCRBY", &format!("h:{i}"), "f", "1"]).i(), 6);
+    }
+    assert!(unix_ms_now() < at, "the increments came after the deadline");
+    std::thread::sleep(Duration::from_millis(at - unix_ms_now() + 500));
+    wait_until("the master to expire the fields", || {
+        (0..keys).all(|i| m.cmd(&["HLEN", &format!("h:{i}")]).i() == 1)
+    });
+    relay.resume();
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    assert_same_dataset(&mut m, &mut r);
+    for i in 0..keys {
+        let key = format!("h:{i}");
+        assert_eq!(
+            r.cmd(&["HGETALL", &key]),
+            V::Arr(vec![V::Str("keep".into()), V::Str("1".into())]),
+            "{key} on the replica"
+        );
+        assert_eq!(r.cmd(&["HLEN", &key]).i(), 1, "{key}");
+    }
+}

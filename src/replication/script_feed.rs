@@ -115,8 +115,13 @@ pub fn commands_for_propagation(
             &[],
             None,
         )],
-        "HEXPIRE" | "HPEXPIRE" => hexpire_feed(name, cmd),
-        "HSETEX" | "HGETEX" => hash_ttl_feed(cmd),
+        // Sent as what they did, recorded by the commands themselves: the
+        // fields whose deadline changed (`HPEXPIREAT … FIELDS`, with no
+        // condition left to weigh), whose time to live went (`HPERSIST`), or
+        // that went (`HDEL`); nothing for a call that changed nothing.
+        "HEXPIRE" | "HPEXPIRE" | "HEXPIREAT" | "HPEXPIREAT" | "HPERSIST" | "HSETEX" | "HGETEX" => {
+            effects_take()
+        }
         // A SET of the result, or DEL/UNLINK; see `cmd_increx`.
         "INCREX" => effects_take(),
         "RESTORE" => restore_feed(cmd),
@@ -449,32 +454,6 @@ fn msetex_options_start(cmd: &[&[u8]]) -> usize {
         .filter(|n| *n > 0)
         .unwrap_or(0) as usize;
     2usize.saturating_add(numkeys.saturating_mul(2))
-}
-
-/// `HEXPIRE key seconds …` / `HPEXPIRE key ms …` → `HPEXPIREAT key at …`.
-fn hexpire_feed(name: &str, cmd: &[&[u8]]) -> Vec<Vec<Vec<u8>>> {
-    let Some(ttl) = cmd.get(2).and_then(|arg| integer_arg(arg)) else {
-        return vec![owned(cmd)];
-    };
-    let ms = if name == "HEXPIRE" {
-        ttl.saturating_mul(1000)
-    } else {
-        ttl
-    };
-    let mut out = owned(cmd);
-    out[0] = b"HPEXPIREAT".to_vec();
-    out[2] = now_ms().saturating_add(ms).to_string().into_bytes();
-    vec![out]
-}
-
-/// `HSETEX` / `HGETEX key [options] FIELDS …` with a relative TTL → `PXAT`.
-fn hash_ttl_feed(cmd: &[&[u8]]) -> Vec<Vec<Vec<u8>>> {
-    // The older `HSETEX key seconds …` form has no absolute spelling (its
-    // KEEPTTL means "keep a TTL, or else use this one"); it goes as it came.
-    if cmd.get(2).is_some_and(|arg| integer_arg(arg).is_some()) {
-        return vec![owned(cmd)];
-    }
-    vec![absolute_ttl_options(cmd, 2, &[], Some("FIELDS"))]
 }
 
 /// `INCREX` can refuse to move (a bound), can round (BYFLOAT), and can set a

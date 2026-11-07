@@ -229,8 +229,9 @@ fn member_seconds_to_unix_ms(text: &[u8]) -> io::Result<Option<u64>> {
 }
 
 /// A hash from its fields, each with its expiry in Unix milliseconds or
-/// none. Fields already past their time are left out; `None` if that leaves
-/// nothing. A field named twice is a corrupt file.
+/// none. Fields already past their time are kept with it (see
+/// `rdb_dialect::field_deadline`); `None` for no fields. A field named twice
+/// is a corrupt file.
 fn hash_with_ttls(fields: Vec<(Vec<u8>, Vec<u8>, Option<u64>)>) -> io::Result<Option<KiviDBValue>> {
     let mut inner = crate::types::HashInner::new();
     let mut names = std::collections::HashSet::with_capacity(fields.len());
@@ -242,12 +243,9 @@ fn hash_with_ttls(fields: Vec<(Vec<u8>, Vec<u8>, Option<u64>)>) -> io::Result<Op
             return Err(rdb_invalid("duplicate hash fields"));
         }
         if let Some(at) = expires_at {
-            match field_deadline(&clock, at)? {
-                Some(deadline) => {
-                    inner.expiries.insert(field.clone(), deadline);
-                }
-                None => continue,
-            }
+            inner
+                .expiries
+                .insert(field.clone(), field_deadline(&clock, at)?);
         }
         inner.fields.insert(field, Arc::from(value.as_slice()));
     }
@@ -267,10 +265,10 @@ fn hash_with_ttls(fields: Vec<(Vec<u8>, Vec<u8>, Option<u64>)>) -> io::Result<Op
 /// What became of a key KeyDB gave a member TTL to.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum SubExpiry {
-    /// The key is there, the field with its TTL, or gone if that TTL had
-    /// passed, or the field was not there.
+    /// The key is there, the field with its TTL (one that has passed
+    /// too, for `field_expiry` to remove), or the field was not there.
     Applied,
-    /// Its last field had run out: the key is gone.
+    /// The hash has no fields: the key is gone.
     Emptied,
 }
 
@@ -317,15 +315,8 @@ pub(super) fn apply_keydb_subexpiry(
     };
     let mut inner = inner;
     if inner.fields.contains_key(field.as_str()) {
-        match field_deadline(&crate::commands::helpers::FieldClock::now(), at)? {
-            Some(deadline) => {
-                inner.expiries.insert(field, deadline);
-            }
-            None => {
-                inner.fields.shift_remove(field.as_str());
-                inner.expiries.remove(&field);
-            }
-        }
+        let deadline = field_deadline(&crate::commands::helpers::FieldClock::now(), at)?;
+        inner.expiries.insert(field, deadline);
     }
     let emptied = inner.fields.is_empty();
     *value = KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(inner)));

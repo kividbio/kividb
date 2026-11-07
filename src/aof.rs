@@ -4642,6 +4642,10 @@ mod past_deadline_replay_tests {
     /// `HSETEX ... PXAT t` and `HGETEX ... PXAT t`. Now `g` keeps its deadline
     /// and the increment, and is past its time once the replay is over. An
     /// `HSET` after it takes the deadline away, as it did on the master.
+    ///
+    /// A field the master expired is in the log as its `HDEL`, before the
+    /// write that found it gone: `z`, incremented after its deadline, is `1`
+    /// with no deadline, as on the master.
     #[test]
     fn a_field_deadline_that_has_passed_is_set_and_the_writes_after_it_go_into_the_field() {
         let past = (now_ms() - 5_000).to_string();
@@ -4655,7 +4659,12 @@ mod past_deadline_replay_tests {
             vec!["HSET", "y", "keep", "1", "m", "7"],
             vec!["HGETEX", "y", "PXAT", &past, "FIELDS", "1", "m"],
             vec!["HINCRBY", "y", "m", "1"],
+            vec!["HSET", "h", "z", "5"],
+            vec!["HPEXPIREAT", "h", &past, "FIELDS", "1", "z"],
+            vec!["HDEL", "h", "z"],
+            vec!["HINCRBY", "h", "z", "1"],
         ]);
+        assert_eq!(field(&store, "h", "z"), (Some(b"1".to_vec()), None));
         assert_eq!(field(&store, "h", "g"), (Some(b"6".to_vec()), Some(true)));
         assert_eq!(field(&store, "h", "f").0, Some(b"v1".to_vec()));
         assert_eq!(

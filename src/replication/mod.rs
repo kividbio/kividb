@@ -81,6 +81,16 @@ pub struct ReplState {
     /// has either replaced the dataset (a full sync) or swept it
     /// (`commands::helpers::expire_keys_due_before`, at a partial resync).
     pub expiry_sweep_owed: AtomicBool,
+    /// [`master_propagates_expiry`](Self::master_propagates_expiry) for hash
+    /// fields: whether the master sends an `HDEL` (or a `DEL` for a hash it
+    /// emptied) for every field it expires. Then the replica removes no
+    /// expired field itself and hides one from reads until that arrives.
+    /// Set at each connection to a master ([`field_expiry_propagated_by`]).
+    pub master_propagates_field_expiry: AtomicBool,
+    /// [`expiry_sweep_owed`](Self::expiry_sweep_owed) for hash fields:
+    /// fields past their deadline that no master will send an `HDEL` of may
+    /// be here (`field_expiry::expire_fields_due_before`).
+    pub field_expiry_sweep_owed: AtomicBool,
     /// How many taps are attached (see `taps`). Read on every write, so that
     /// the common case — none — costs one relaxed load.
     pub stream_taps: std::sync::atomic::AtomicUsize,
@@ -487,6 +497,8 @@ impl ReplState {
             master_dd_deletes: AtomicBool::new(false),
             master_propagates_expiry: AtomicBool::new(true),
             expiry_sweep_owed: AtomicBool::new(true),
+            master_propagates_field_expiry: AtomicBool::new(true),
+            field_expiry_sweep_owed: AtomicBool::new(true),
             stream_taps: std::sync::atomic::AtomicUsize::new(0),
             taps: RwLock::new(Vec::new()),
             repl_generation: AtomicU64::new(0),
@@ -2062,6 +2074,56 @@ pub fn expiry_propagated_by(info: Option<&str>) -> bool {
     }
 }
 
+/// The line of `INFO server` by which a KiviDB master says it sends an
+/// `HDEL` (or a `DEL`) for every hash field it expires.
+pub const FIELD_EXPIRY_PROPAGATED_INFO: &str = "kividb_expired_fields_propagated:1";
+
+/// For the tests of a replica of an older master, and never set otherwise:
+/// `KIVIDB_TEST_NO_FIELD_EXPIRY_CAPABILITY` keeps
+/// [`FIELD_EXPIRY_PROPAGATED_INFO`] out of `INFO server`.
+pub fn hides_field_expiry_capability() -> bool {
+    static HIDES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HIDES.get_or_init(|| std::env::var_os("KIVIDB_TEST_NO_FIELD_EXPIRY_CAPABILITY").is_some())
+}
+
+/// Whether a master whose `INFO server` reply is `info` sends the deletion
+/// of every hash field it expires (see
+/// `ReplState::master_propagates_field_expiry`).
+///
+/// * It says so ([`FIELD_EXPIRY_PROPAGATED_INFO`]): yes.
+/// * It is KiviDB and does not say so: no. Every release that sends them
+///   says so; none before did.
+/// * It is Redis, Valkey or KeyDB (`redis_version`, and neither
+///   `kividb_version` nor `dragonfly_version`): yes. Each deletes expired
+///   fields on the master alone and propagates `HDEL` (Redis 7.4+, Valkey
+///   9's `propagateFieldsDeletion`, KeyDB's `propagateSubkeyExpire` for a
+///   member TTL, outside active replication, which is refused anyway); a
+///   release without field TTLs has no field to expire.
+/// * It is Dragonfly (`dragonfly_version`): no. Its fields expire by each
+///   side's clock, and it sends an `HDEL` only for a field a command found
+///   expired; not one for every field.
+/// * No answer (`None`), or one that is neither: no. Unlike the keys, a
+///   replica that expires its own fields under a master that also sends
+///   them only removes earlier what the master's `HDEL` would remove, while
+///   one that waits for an `HDEL` that never comes keeps the field for ever.
+pub fn field_expiry_propagated_by(info: Option<&str>) -> bool {
+    let Some(info) = info else {
+        return false;
+    };
+    // KiviDB, which says so when it sends them, or Dragonfly, which does not.
+    let mut other = false;
+    let mut redis = false;
+    for line in info.lines() {
+        let line = line.trim();
+        if line == FIELD_EXPIRY_PROPAGATED_INFO {
+            return true;
+        }
+        other |= line.starts_with("kividb_version:") || line.starts_with("dragonfly_version:");
+        redis |= line.starts_with("redis_version:");
+    }
+    redis && !other
+}
+
 /// The master's `uptime_in_seconds` in its `INFO server` reply `info`.
 pub fn uptime_in(info: &str) -> Option<u64> {
     info.lines()
@@ -2105,6 +2167,46 @@ mod expiry_version_tests {
         assert!(expiry_propagated_by(Some(&kividb("garbage"))));
         assert_eq!(uptime_in(redis), Some(5));
         assert_eq!(uptime_in(&kividb("1.1.2")), None);
+    }
+}
+
+#[cfg(test)]
+mod field_expiry_version_tests {
+    use super::{FIELD_EXPIRY_PROPAGATED_INFO, field_expiry_propagated_by};
+
+    fn kividb(version: &str) -> String {
+        format!("# Server\r\nredis_version:8.10.0\r\nkividb_version:{version}\r\n")
+    }
+
+    #[test]
+    fn only_a_kividb_master_that_says_so_sends_its_expired_fields() {
+        for old in ["1.2.0", "1.1.3", "1.2.0-rc2", "1.3.0", "garbage", ""] {
+            assert!(!field_expiry_propagated_by(Some(&kividb(old))), "{old}");
+        }
+        let says = format!("{}{FIELD_EXPIRY_PROPAGATED_INFO}\r\n", kividb("1.2.0"));
+        assert!(field_expiry_propagated_by(Some(&says)));
+        // The key line alone says nothing of fields.
+        let keys_only = format!("{}{}\r\n", kividb("1.2.0"), super::EXPIRY_PROPAGATED_INFO);
+        assert!(!field_expiry_propagated_by(Some(&keys_only)));
+    }
+
+    #[test]
+    fn redis_sends_them_and_no_answer_is_taken_as_not() {
+        let redis = "# Server\r\nredis_version:8.10.0\r\nuptime_in_seconds:5\r\n";
+        assert!(field_expiry_propagated_by(Some(redis)));
+        assert!(!field_expiry_propagated_by(None));
+        assert!(!field_expiry_propagated_by(Some("")));
+        assert!(!field_expiry_propagated_by(Some("garbage\r\n")));
+    }
+
+    #[test]
+    fn valkey_and_keydb_send_them_and_dragonfly_does_not() {
+        let valkey = "# Server\r\nredis_version:7.2.4\r\nvalkey_version:9.0.7\r\n";
+        assert!(field_expiry_propagated_by(Some(valkey)));
+        let keydb = "# Server\r\nredis_version:6.3.4\r\n";
+        assert!(field_expiry_propagated_by(Some(keydb)));
+        let dragonfly = "# Server\r\nredis_version:7.4.0\r\ndragonfly_version:v1.30.0\r\n";
+        assert!(!field_expiry_propagated_by(Some(dragonfly)));
     }
 }
 

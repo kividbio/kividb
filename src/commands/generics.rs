@@ -154,43 +154,158 @@ pub(crate) fn apply_expire(
     resp_integer(1)
 }
 
-/// What a `SORT` `BY` or `GET` pattern names for `elem`, read as Redis reads
-/// it (`lookupKeyByPattern`): the first `*` stands for the element's bytes,
-/// and a `->field` after it, with a field name, names a field of the hash
-/// at that key. `None` when the pattern has no `*`, or names nothing there.
-fn sort_pattern_value(db: &store::Db, pat: &[u8], elem: &[u8]) -> Option<Vec<u8>> {
+/// A `SORT` `BY` or `GET` pattern taken apart (`sort_pattern_parts`).
+struct SortPattern<'a> {
+    /// Where its first `*` is.
+    star: usize,
+    /// What follows the `*` in the key's name.
+    suffix: &'a [u8],
+    /// The hash field it names after `->`, if any.
+    field: Option<&'a [u8]>,
+}
+
+/// A `SORT` `BY` or `GET` pattern taken apart. `None` when it has no `*`:
+/// it names no key.
+fn sort_pattern_parts(pat: &[u8]) -> Option<SortPattern<'_>> {
     let star = memchr::memchr(b'*', pat)?;
     let rest = &pat[star + 1..];
     let (suffix, field) = match memchr::memmem::find(rest, b"->") {
         Some(at) if at + 2 < rest.len() => (&rest[..at], Some(&rest[at + 2..])),
         _ => (rest, None),
     };
+    Some(SortPattern {
+        star,
+        suffix,
+        field,
+    })
+}
+
+/// Whether `SORT` `cmd` reads a field of a hash it does not name, by a `BY`
+/// or `GET` pattern. Such a read can find the field past its time, and on a
+/// master removes it and sends its `HDEL` (`sort_pattern_value`). That is a
+/// write to a key the command holds no order of: its own order, of the keys
+/// it names, is held, and a write made inside it takes none more
+/// (`write_order`). Another client's write to the hash could then fall
+/// between the removal and its `HDEL`, and reach the replicas and the AOF
+/// ahead of it, as `HINCRBY h f 1` then `HDEL h f` (#415 review). So such a
+/// `SORT` takes the command gate alone, as a script does, which reads keys
+/// it does not name too (`handler::takes_the_gate_alone`). Options are read
+/// as `keyspec`'s `SORT` reads them.
+pub(crate) fn sort_reads_hash_fields(cmd: &[&[u8]]) -> bool {
+    sort_patterns(cmd).any(|pat| sort_pattern_parts(pat).is_some_and(|p| p.field.is_some()))
+}
+
+/// The `BY` and `GET` patterns of `SORT` or `SORT_RO` `cmd`, read as
+/// `keyspec`'s `SORT` reads its options: a `LIMIT`'s two numbers and a
+/// `STORE`'s destination are none. Case does not matter.
+fn sort_patterns<'a>(cmd: &'a [&'a [u8]]) -> impl Iterator<Item = &'a [u8]> + 'a {
+    let mut i = 2;
+    std::iter::from_fn(move || {
+        while i < cmd.len() {
+            let option = cmd[i];
+            i += 1;
+            if option.eq_ignore_ascii_case(b"LIMIT") {
+                i += 2;
+            } else if option.eq_ignore_ascii_case(b"BY") || option.eq_ignore_ascii_case(b"GET") {
+                let pat = cmd.get(i).copied();
+                i += 1;
+                if pat.is_some() {
+                    return pat;
+                }
+            } else if option.eq_ignore_ascii_case(b"STORE") {
+                i += 1;
+            }
+        }
+        None
+    })
+}
+
+/// For `SORT` or `SORT_RO` `cmd` called by a script held to a hash tag
+/// (`lua-parallel-scripts`): the first `BY` or `GET` pattern that can name
+/// a key outside the tag, which `may_touch` tells (`tag_locks`). Such a key
+/// is one the script does not name and holds no lock of: a client's write
+/// to it does not wait for the script, and a field of it the `SORT` finds
+/// past its time would be removed and its `HDEL` sent with another write to
+/// it in between (#415 review). The command gate taken alone for a `SORT`
+/// (`sort_reads_hash_fields`) is no help here, as the script holds the gate
+/// already.
+///
+/// A pattern names keys when it has a `*`; `#` and one without a `*` name
+/// none. One that names keys is kept to the tag only when what comes before
+/// its `*` holds the whole tag: then every key it names carries that tag,
+/// whatever the element (`{q}:w_*`, `{q}:obj:*->w`). Otherwise the element
+/// decides the key, and so the tag. String keys count as hashes do: a read
+/// of one outside the tag is as much outside it as a `GET` of it would be.
+pub(crate) fn sort_pattern_outside<'a>(
+    cmd: &'a [&'a [u8]],
+    may_touch: impl Fn(&[u8]) -> bool,
+) -> Option<&'a [u8]> {
+    sort_patterns(cmd).find(|pat| {
+        sort_pattern_parts(pat).is_some_and(|p| {
+            let prefix = &pat[..p.star];
+            crate::tag_locks::tag_of(prefix).is_none() || !may_touch(prefix)
+        })
+    })
+}
+
+/// What a `SORT` `BY` or `GET` pattern names for `elem`, read as Redis reads
+/// it (`lookupKeyByPattern`): the first `*` stands for the element's bytes,
+/// and a `->field` after it, with a field name, names a field of the hash
+/// at that key. `None` when the pattern has no `*`, or names nothing there.
+fn sort_pattern_value(ctx: &Ctx, pat: &[u8], elem: &[u8]) -> Option<Vec<u8>> {
+    let SortPattern {
+        star,
+        suffix,
+        field,
+    } = sort_pattern_parts(pat)?;
     let mut key = Vec::with_capacity(star + elem.len() + suffix.len());
     key.extend_from_slice(&pat[..star]);
     key.extend_from_slice(elem);
     key.extend_from_slice(suffix);
-    let shard = store::get_shard(db, &key);
-    let map = read_lock!(shard);
-    match (map.peek(&key), field) {
-        (Some(ValueRef::String(s)), None) => Some(s.to_vec()),
-        (Some(ValueRef::Hash(h)), Some(field)) => {
-            let name = crate::key_bytes::text_of(field);
-            h.read().get(&*name).map(|v| v.to_vec())
-        }
-        (Some(ValueRef::HashEx(h)), Some(field)) => {
-            let name = crate::key_bytes::text_of(field);
-            let inner = h.read();
-            let live = inner
-                .expiries
-                .get(&*name)
-                .is_none_or(|at| *at > std::time::Instant::now());
-            inner
-                .fields
-                .get(&*name)
-                .filter(|_| live)
-                .map(|v| v.to_vec())
-        }
-        _ => None,
+    let shard = store::get_shard(&ctx.store[*ctx.selected_db], &key);
+    let now = std::time::Instant::now();
+    let mut tried = false;
+    loop {
+        let map = read_lock!(shard);
+        return match (map.peek(&key), field) {
+            (Some(ValueRef::String(s)), None) => Some(s.to_vec()),
+            (Some(ValueRef::Hash(h)), Some(field)) => {
+                let name = crate::key_bytes::text_of(field);
+                h.read().get(&*name).map(|v| v.to_vec())
+            }
+            // A field past its deadline is what a hash command makes of it
+            // (#415): removed first where this node removes fields, its
+            // `HDEL` sent ahead of this `SORT`; kept where the stream or the
+            // AOF being applied says when it goes, so that a `STORE` comes
+            // out there as it did on the master; hidden from a reader
+            // otherwise.
+            (Some(ValueRef::HashEx(h)), Some(field)) => {
+                let name = crate::key_bytes::text_of(field);
+                let inner = h.read();
+                let value = inner.fields.get(&*name)?;
+                if inner.expiries.get(&*name).is_none_or(|at| *at > now) {
+                    return Some(value.to_vec());
+                }
+                match crate::field_expiry::policy(ctx.store) {
+                    crate::field_expiry::Policy::Keep => Some(value.to_vec()),
+                    crate::field_expiry::Policy::Expire if !tried => {
+                        drop(inner);
+                        drop(map);
+                        tried = true;
+                        crate::field_expiry::expire_due(
+                            ctx.store,
+                            ctx.index_store,
+                            *ctx.selected_db,
+                            &key,
+                            now,
+                        );
+                        continue;
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
     }
 }
 
@@ -1338,16 +1453,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         vec![None; elements.len()]
                     }
 
-                    Some(pat) => {
-                        let db = &ctx.store[*ctx.selected_db];
-                        elements
-                            .iter()
-                            .map(|elem| {
-                                sort_pattern_value(db, pat, elem)
-                                    .and_then(|v| std::str::from_utf8(&v).ok()?.parse::<f64>().ok())
-                            })
-                            .collect()
-                    }
+                    Some(pat) => elements
+                        .iter()
+                        .map(|elem| {
+                            sort_pattern_value(ctx, pat, elem)
+                                .and_then(|v| std::str::from_utf8(&v).ok()?.parse::<f64>().ok())
+                        })
+                        .collect(),
                 }
             };
 
@@ -1458,7 +1570,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         if pat.as_slice() == b"#" {
                             out.push(Some(elem.to_vec()));
                         } else {
-                            out.push(sort_pattern_value(db, pat, elem));
+                            out.push(sort_pattern_value(ctx, pat, elem));
                         }
                     }
                 }
@@ -1573,5 +1685,85 @@ fn system_time_to_unix(exp: SystemTime, unit: TimeUnit) -> i64 {
     match unit {
         TimeUnit::Secs => d.as_secs() as i64,
         TimeUnit::Millis => d.as_millis() as i64,
+    }
+}
+
+#[cfg(test)]
+mod sort_gate_tests {
+    use super::sort_reads_hash_fields;
+
+    fn reads(args: &[&str]) -> bool {
+        let cmd: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
+        sort_reads_hash_fields(&cmd)
+    }
+
+    /// Only a `BY` or `GET` pattern that names a hash field of another key
+    /// takes the command gate alone; nothing that merely looks like one.
+    #[test]
+    fn only_a_pattern_naming_a_hash_field_counts() {
+        assert!(reads(&["SORT", "ids", "BY", "obj:*->w"]));
+        assert!(reads(&[
+            "SORT", "ids", "GET", "#", "GET", "obj:*->w", "STORE", "dst"
+        ]));
+        assert!(reads(&["sort", "ids", "by", "w_*", "get", "o_*->n"]));
+        assert!(!reads(&["SORT", "ids"]));
+        assert!(!reads(&["SORT", "ids", "BY", "nosort", "STORE", "dst"]));
+        assert!(!reads(&[
+            "SORT", "ids", "BY", "weight_*", "GET", "#", "GET", "name_*"
+        ]));
+        // No `*`: names no key. `->` with nothing after: no field.
+        assert!(!reads(&["SORT", "ids", "BY", "obj->w"]));
+        assert!(!reads(&["SORT", "ids", "GET", "obj:*->"]));
+        // A destination or a LIMIT argument is no pattern.
+        assert!(!reads(&["SORT", "ids", "STORE", "x:*->y"]));
+        assert!(!reads(&["SORT", "ids", "LIMIT", "0", "x:*->y"]));
+        assert!(!reads(&["SORT", "ids", "BY"]));
+    }
+
+    /// The first pattern of `args` that can name a key outside the tag `q`.
+    fn outside(args: &[&str]) -> Option<String> {
+        let cmd: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
+        super::sort_pattern_outside(&cmd, |key| crate::tag_locks::tag_of(key) == Some(&b"q"[..]))
+            .map(|pat| String::from_utf8_lossy(pat).into_owned())
+    }
+
+    /// A pattern is kept to a tag only when what comes before its `*`
+    /// holds the whole tag; string keys count as hashes do; `#`, no `*`, a
+    /// destination and a `LIMIT` name nothing.
+    #[test]
+    fn only_a_pattern_whose_prefix_holds_the_tag_keeps_to_it() {
+        let out = |args: &[&str]| outside(args).unwrap_or_default();
+        assert_eq!(out(&["SORT", "{q}:ids", "BY", "obj:*->w"]), "obj:*->w");
+        assert_eq!(
+            out(&["SORT_RO", "{q}:ids", "GET", "#", "GET", "o:*->n"]),
+            "o:*->n"
+        );
+        assert_eq!(out(&["sort", "{q}:ids", "bY", "w_*"]), "w_*");
+        assert_eq!(out(&["sort", "{q}:ids", "gEt", "{r}:*"]), "{r}:*");
+        // The element would close the tag, or there is none before the `*`.
+        assert_eq!(out(&["SORT", "{q}:ids", "BY", "{q*}->w"]), "{q*}->w");
+        assert_eq!(out(&["SORT", "{q}:ids", "BY", "*{q}->w"]), "*{q}->w");
+        assert_eq!(out(&["SORT", "{q}:ids", "BY", "{}*{q}"]), "{}*{q}");
+        // The first `*` is the element's, whatever follows.
+        assert_eq!(out(&["SORT", "{q}:ids", "BY", "a*{q}*"]), "a*{q}*");
+        assert_eq!(outside(&["SORT", "{q}:ids", "BY", "{q}:obj:*->w"]), None);
+        assert_eq!(outside(&["SORT", "{q}:ids", "GET", "x{q}y*"]), None);
+        assert_eq!(
+            outside(&["SORT", "{q}:ids", "BY", "{q}*", "GET", "#"]),
+            None
+        );
+        assert_eq!(outside(&["SORT", "{q}:ids"]), None);
+        assert_eq!(outside(&["SORT", "{q}:ids", "BY", "nosort"]), None);
+        assert_eq!(outside(&["SORT", "{q}:ids", "BY", "obj->w"]), None);
+        assert_eq!(outside(&["SORT", "{q}:ids", "STORE", "x:*->y"]), None);
+        assert_eq!(outside(&["SORT", "{q}:ids", "LIMIT", "0", "x:*->y"]), None);
+        assert_eq!(outside(&["SORT", "{q}:ids", "GET"]), None);
+        // Each pattern is asked, not only the first.
+        assert_eq!(
+            out(&[
+                "SORT", "{q}:ids", "BY", "{q}:*", "LIMIT", "0", "1", "GET", "{q}:*", "GET", "o*"
+            ]),
+            "o*"
+        );
     }
 }
