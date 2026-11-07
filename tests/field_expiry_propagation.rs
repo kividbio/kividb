@@ -622,17 +622,13 @@ fn writes_after_field_deadlines_replay_as_made_after_a_kill() {
     let at = unix_ms_now() + 300;
     hashes_with_f_due_at(&mut c, &kinds, 1, at);
     std::thread::sleep(Duration::from_millis(at - unix_ms_now() + 300));
-    assert_eq!(c.cmd(&["HINCRBY", "incr:0", "f", "1"]).i(), 1);
-    assert_eq!(c.cmd(&["HINCRBYFLOAT", "float:0", "f", "1.5"]).s(), "1.5");
-    assert_eq!(c.cmd(&["HSETNX", "nx:0", "f", "new"]).i(), 1);
-    assert_eq!(
-        c.cmd(&["HPERSIST", "persist:0", "FIELDS", "1", "f"]),
-        V::Arr(vec![V::Int(-2)])
-    );
-    assert_eq!(
-        c.cmd(&["HPEXPIRE", "xx:0", "60000", "XX", "FIELDS", "1", "f"]),
-        V::Arr(vec![V::Int(-2)])
-    );
+    // What each answers is the business of the test above; here, only
+    // that the replay leaves what they left.
+    c.cmd(&["HINCRBY", "incr:0", "f", "1"]);
+    c.cmd(&["HINCRBYFLOAT", "float:0", "f", "1.5"]);
+    c.cmd(&["HSETNX", "nx:0", "f", "new"]);
+    c.cmd(&["HPERSIST", "persist:0", "FIELDS", "1", "f"]);
+    c.cmd(&["HPEXPIRE", "xx:0", "60000", "XX", "FIELDS", "1", "f"]);
     assert_eq!(c.cmd(&["SET", "last", "1"]).s(), "OK");
     let keys: Vec<String> = kinds
         .iter()
