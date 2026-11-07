@@ -1574,10 +1574,8 @@ mod expiries_tests {
                 5..=7 => {
                     times.remove(&field);
                 }
-                8 => {
-                    if next(50) == 0 {
-                        times.clear();
-                    }
+                8 if next(50) == 0 => {
+                    times.clear();
                 }
                 _ => {}
             }
