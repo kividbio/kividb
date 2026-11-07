@@ -88,11 +88,29 @@ pub struct Server {
     child: Child,
 }
 
-fn port_is_free(port: u16) -> bool {
-    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+/// A socket bound to `port` that never listens, or none if the port is
+/// taken. Not a `TcpListener`: the tests of a binary start their servers at
+/// once, and a server being started holds a copy of every socket the test
+/// process has open, from its fork to its exec. A listening probe copied so
+/// took the connection its test made to the port it had found free, and
+/// reset it when the exec closed the copy (#506).
+pub fn probe(port: u16) -> Option<socket2::Socket> {
+    let probe = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).ok()?;
+    // As the server's own socket, so that a copy of this one, while it
+    // lasts, does not keep the server from the port.
+    #[cfg(unix)]
+    let _ = probe.set_reuse_address(true);
+    probe
+        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
+        .ok()?;
+    Some(probe)
 }
 
-fn free_port() -> u16 {
+fn port_is_free(port: u16) -> bool {
+    probe(port).is_some()
+}
+
+pub fn free_port() -> u16 {
     use std::sync::atomic::{AtomicU16, Ordering};
     static NEXT: AtomicU16 = AtomicU16::new(0);
     loop {

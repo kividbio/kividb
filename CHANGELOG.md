@@ -122,6 +122,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The `MEMORY USAGE` accuracy tests no longer fail now and then with
+  `Connection reset by peer`.** They found a free port for each server with
+  a socket that listened on it. A server another test of the same file was
+  starting held a copy of that socket from its fork to its exec, took the
+  connection meant for the test's own server, and reset it at the exec:
+  6 runs in 240 of `tests/memory_usage_zset.rs` failed so, on any of its
+  tests, at their first command. The server was not involved. The probe now
+  binds and never listens, as every other test file's does: 0 in 480
+  (#506).
+
 - **A file that is not a whole snapshot no longer starts the server on
   part of the data, or none.** `--preload-file rdb:` of a Dragonfly
   snapshot in Dragonfly's own format logged `preload-file: 0 keys from the
