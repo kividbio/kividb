@@ -3037,6 +3037,17 @@ pub fn write_is_observed(ctx: &crate::commands::ctx::Ctx<'_>) -> bool {
         || ctx.repl_state.stream_taps.load(Ordering::Relaxed) > 0
 }
 
+/// Whether a command that `CLIENT PAUSE WRITE` lets run although it is
+/// propagated (`SELECT`, `SCRIPT LOAD`, `SCRIPT FLUSH`: see
+/// `pause::may_replicate`) is to be kept out of the replication stream and
+/// the AOF: while writes are paused on a master. Nothing may be added to
+/// the stream then: a failover waits for its replica to reach the master's
+/// offset, and takes that offset to stay put (#411, #518). Not on a
+/// replica, whose offset is its master's, nor for what its master sent.
+pub(crate) fn held_back(ctx: &crate::commands::ctx::Ctx<'_>) -> bool {
+    !ctx.apply_replication && !ctx.repl_state.is_slave() && crate::pause::active().is_some()
+}
+
 pub fn replicate_one_write(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>]) {
     let cmd0 = parts.first().map(|v| v.as_slice()).unwrap_or_default();
     let payloads: Vec<Vec<u8>> = if cmd0.eq_ignore_ascii_case(b"SELECT") && parts.len() >= 2 {
@@ -3047,8 +3058,7 @@ pub fn replicate_one_write(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>
         // there either: the next write in another database carries its own
         // (`encode_for_stream`), since the stream's database is not moved.
         // Not on a replica, whose offset is its master's.
-        if !ctx.apply_replication && !ctx.repl_state.is_slave() && crate::pause::active().is_some()
-        {
+        if held_back(ctx) {
             return;
         }
         vec![crate::resp::write::encode_resp_command(parts)]

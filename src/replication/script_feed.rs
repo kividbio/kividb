@@ -130,6 +130,12 @@ pub fn commands_for_propagation(
         // as DELs, then the drop without `DD` (`vector::ft_dropindex`); by a
         // replica to its own AOF too.
         "FT.DROPINDEX" => Vec::new(),
+        // Run, not held, while writes are paused, as in Redis, but kept out
+        // of the stream meanwhile (`replication::held_back`, #518): a
+        // replica, or the AOF replayed, goes without the script, and a
+        // client that runs it there gets `NOSCRIPT` and loads it again, as
+        // it would from Redis, which never propagates the script cache.
+        "SCRIPT" if super::held_back(ctx) => Vec::new(),
         // Sent by the command itself, as one `DEL` of the keys it deleted
         // (`cluster::delete_moved`): which they are, its reply does not say.
         "MIGRATE" => Vec::new(),
