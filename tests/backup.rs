@@ -758,6 +758,156 @@ fn a_killed_server_keeps_every_acknowledged_write() {
     }
 }
 
+/// `appendfsync always` (#513): a reply to a write is sent only once its
+/// record is synced to disk, whether the setting comes from the
+/// configuration file, the command line or `CONFIG SET`. It was accepted
+/// and the file synced once a second, so a power failure could lose a
+/// second of acknowledged writes. The sync is held at a test failpoint, and
+/// no reply may come while it is held.
+#[test]
+fn appendfsync_always_replies_only_once_the_write_is_synced() {
+    const SET: &[u8] = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n";
+    for how in ["file", "command line", "CONFIG SET"] {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let port = free_port();
+        let mut extra = vec!["--aof"];
+        match how {
+            "file" => std::fs::write(dir.join("kividb.conf"), "appendfsync always\n").unwrap(),
+            "command line" => extra.extend(["--appendfsync", "always"]),
+            _ => {}
+        }
+        let child = kividb(&dir, port, &extra)
+            .env("KIVIDB_TEST_FAILPOINTS", "aof-fsync-before-reply")
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("could not start kividb");
+        let server = Server { port, dir, child };
+        let mut c = server.conn();
+        if how == "CONFIG SET" {
+            let before = c.cmd(&["CONFIG", "GET", "appendfsync"]);
+            assert_eq!(before.arr()[1].s(), "everysec");
+            assert!(
+                c.cmd(&["CONFIG", "SET", "appendfsync", "sometimes"])
+                    .is_err()
+            );
+            assert!(c.cmd(&["CONFIG", "SET", "appendfsync", "always"]).ok());
+        }
+        let setting = c.cmd(&["CONFIG", "GET", "appendfsync"]);
+        assert_eq!(setting.arr()[1].s(), "always", "{how}");
+
+        let held = server.dir.join("failpoint.aof-fsync-before-reply.1");
+        c.writer.write_all(SET).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !held.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "{how}: the write was acknowledged without a sync"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The sync is held: no reply yet.
+        c.writer
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let mut line = String::new();
+        let early = c.reader.read_line(&mut line);
+        assert!(
+            early.is_err() && line.is_empty(),
+            "{how}: replied {line:?} before its write was synced"
+        );
+        c.writer
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        std::fs::remove_file(&held).unwrap();
+        assert!(c.read().ok(), "{how}");
+
+        // Under `everysec` the reply does not wait for a sync.
+        assert!(c.cmd(&["CONFIG", "SET", "appendfsync", "everysec"]).ok());
+        assert!(c.cmd(&["SET", "k2", "v"]).ok());
+        assert!(
+            !server
+                .dir
+                .join("failpoint.aof-fsync-before-reply.2")
+                .exists(),
+            "{how}: synced for a reply under everysec"
+        );
+    }
+}
+
+/// Under `appendfsync always`, a sync of the AOF that fails stops the
+/// server (#514's review). The checkpoint's sync of the old log used to be
+/// logged and passed over, its mark cleared: Linux reports a failed
+/// writeback once to each open file, so the next sync of the log returned
+/// success and answered replies whose writes could be lost. Here the old
+/// log's sync is made to fail while writers keep going: the server exits,
+/// and every write it acknowledged is there after a restart.
+#[test]
+fn appendfsync_always_stops_at_a_failed_sync() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let port = free_port();
+    let args = ["--aof", "--appendfsync", "always"];
+    let mut child = kividb(&dir, port, &args)
+        .env("KIVIDB_TEST_FAILPOINTS", "turn-over-sync-fails")
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("could not start kividb");
+    let stderr = child.stderr.take().unwrap();
+    let said = std::thread::spawn(move || {
+        let mut said = String::new();
+        let _ = BufReader::new(stderr).read_to_string(&mut said);
+        said
+    });
+    let mut server = Server { port, dir, child };
+    let mut c = server.conn();
+    assert!(c.cmd(&["SET", "before", "1"]).ok());
+
+    let writers: Vec<_> = (0..4)
+        .map(|w| {
+            std::thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                let key = format!("acked:{w}");
+                let mut acked = 0i64;
+                while let Some(V::Int(n)) = c.try_cmd(&["INCR", &key]) {
+                    acked = n;
+                }
+                (key, acked)
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = c.cmd(&["BGREWRITEAOF"]);
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = server.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the server carried on after a failed sync under appendfsync always"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(!status.success(), "{status:?}");
+    let acked: Vec<(String, i64)> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+    let said = said.join().unwrap();
+    assert!(said.contains("failed under appendfsync always"), "{said}");
+
+    server.child = kividb(&server.dir, port, &args)
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("could not restart kividb");
+    let mut c = server.conn();
+    assert_eq!(c.cmd(&["GET", "before"]).s(), "1");
+    for (key, acked) in acked {
+        let kept: i64 = match c.cmd(&["GET", &key]) {
+            V::Str(n) => n.parse().unwrap(),
+            _ => 0,
+        };
+        assert!(kept >= acked, "{key} kept {kept}, {acked} acknowledged");
+    }
+}
+
 /// A backup's state was only in memory: after a restart, a sealed backup
 /// could not be cleaned up, and no other could start (#150).
 #[test]

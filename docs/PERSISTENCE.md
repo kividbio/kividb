@@ -17,7 +17,7 @@ top of it.
 | Directive | What KiviDB does with it |
 |---|---|
 | `appendonly yes` / `--aof` | Turns the AOF on. `CONFIG SET appendonly yes` works at runtime (see below). |
-| `appendfsync` | Only `everysec`: the AOF is synced to disk once a second. `always` and `no` are accepted with a warning that they have no effect. |
+| `appendfsync` / `--appendfsync` | `everysec` (the default): the AOF is synced to disk once a second. `always`: each write is synced before it is acknowledged, as in Redis (see below). `no` is taken as `everysec`, with a warning. `CONFIG SET appendfsync` works at runtime. |
 | `save <points>` | Accepted with a warning that it has no effect: KiviDB does not snapshot on a schedule. Use `appendonly yes`, or `BGSAVE`. |
 | `dbfilename` | Always `dump.kdb` (`dump.rdb` is accepted). Any other name is refused. |
 | `appendfilename` | Always `appendonly.aof`. Any other name is refused. |
@@ -379,6 +379,16 @@ since the file is synced once a second. Connections waiting at the same
 time are answered by one write (a group commit), and reads wait for
 nothing. Before 1.2 a write was acknowledged once its record was queued,
 and a killed process could lose the last few.
+
+With `appendfsync always`, a reply waits until its records are synced to
+disk, not only written to the file, so a power failure loses no
+acknowledged write either. Connections waiting at the same time share one
+sync. A reply waits for its sync however long the disk takes (the 5-second
+limit below does not apply), `aof-ack-after-write no` has no effect, and a
+write or sync that fails stops the server, as in Redis. Before 1.2.1
+`always` was accepted and had no effect. A replica takes no writes of its
+own: it syncs its master's stream once a second, whatever `appendfsync`
+says.
 
 A reply waits at most 5 seconds for its records. Only if the disk falls
 more than 5 seconds behind (a disk slower than the writes it is given, or

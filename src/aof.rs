@@ -817,11 +817,62 @@ pub fn set_ack_after_write(on: bool) {
     ACK_AFTER_WRITE.store(on, Ordering::Relaxed);
 }
 
+/// `appendfsync always`: whether a reply to a write waits for its record to
+/// be synced to disk, not only written to the file (#513). It was accepted,
+/// and the file synced once a second all the same: a power failure could
+/// lose a second of writes their clients had been told were made.
+static FSYNC_ALWAYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_fsync_always(on: bool) {
+    FSYNC_ALWAYS.store(on, Ordering::Relaxed);
+    // Replies already waiting for a sync get it, whatever the setting now;
+    // the writer is woken to look at the setting again (see
+    // [`run_aof_writer`]).
+    SYNC_WANTED.notify_one();
+    QUEUED.notify_one();
+}
+
+#[inline]
+fn fsync_always() -> bool {
+    FSYNC_ALWAYS.load(Ordering::Relaxed)
+}
+
+/// Under `appendfsync always`: the barriers whose records are in the file
+/// and wait for it to be synced. Added to with the log locked, and taken
+/// with it locked too, so that what the barriers taken stand for is in the
+/// file then. The writer thread syncs for them ([`sync_for_replies`]).
+static UNSYNCED_BARRIERS: parking_lot::Mutex<Vec<u64>> = parking_lot::const_mutex(Vec::new());
+
+/// Wakes the writer thread to sync for [`UNSYNCED_BARRIERS`].
+static SYNC_WANTED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Whether the writer thread has to listen for [`SYNC_WANTED`]: under
+/// `appendfsync always`, or while barriers handed to it under `always` are
+/// still waiting. Not otherwise: `everysec` costs what it did.
+fn syncs_for_replies() -> bool {
+    fsync_always() || !UNSYNCED_BARRIERS.lock().is_empty()
+}
+
+/// A sync of the AOF failed under `appendfsync always`: the server stops
+/// rather than acknowledge writes that may not be on disk, as Redis does.
+/// Never carried on from. Linux reports a failed writeback once to each open
+/// file, and every handle of the log shares one: a failure logged and
+/// passed over would leave the next sync to return success and its replies
+/// to go out with their writes lost.
+fn sync_failed_under_always(what: &str, e: &std::io::Error) -> ! {
+    log_fatal!(
+        "AOF: {what} failed under appendfsync always: {e} — exiting rather than acknowledge writes that may not be on disk"
+    );
+    std::process::exit(1);
+}
+
 /// Whether a connection's replies may have to wait for the AOF: it is on,
-/// and acknowledges after writing.
+/// and acknowledges after writing — always under `appendfsync always`,
+/// whatever `aof-ack-after-write` says.
 #[inline]
 pub fn acks_wait() -> bool {
-    AOF_ENABLED.load(Ordering::Relaxed) && ACK_AFTER_WRITE.load(Ordering::Relaxed)
+    AOF_ENABLED.load(Ordering::Relaxed)
+        && (ACK_AFTER_WRITE.load(Ordering::Relaxed) || fsync_always())
 }
 
 /// Whether a command may write a record its reply should wait for: a write,
@@ -864,7 +915,24 @@ pub async fn written(tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
     if write_what_is_queued(false).is_none() {
         QUEUED.notify_one();
     }
-    if tokio::time::timeout(ACK_WAIT_LIMIT, wait).await.is_err() {
+    let mut wait = wait;
+    loop {
+        if tokio::time::timeout(ACK_WAIT_LIMIT, &mut wait)
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        // Under `appendfsync always` a reply is never sent ahead of its
+        // write: it waits for as long as the disk takes.
+        if fsync_always() {
+            log_throttled!(
+                10,
+                crate::loglevel::WARN,
+                "AOF: a reply has waited over 5 s for its write to be synced to {AOF_PATH} (appendfsync always): the disk is behind"
+            );
+            continue;
+        }
         BARRIERS.lock().remove(&id);
         AOF_ACKS_BEFORE_WRITE.fetch_add(1, Ordering::Relaxed);
         log_throttled!(
@@ -872,6 +940,7 @@ pub async fn written(tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
             crate::loglevel::WARN,
             "AOF: a reply waited 5 s for its write to reach {AOF_PATH} and was sent without it"
         );
+        return;
     }
 }
 
@@ -1074,6 +1143,9 @@ async fn run_aof_writer(mut flush_rx: tokio::sync::mpsc::Receiver<()>) {
             Some(()) = flush_rx.recv() => {
                 do_fsync();
             }
+            () = SYNC_WANTED.notified(), if syncs_for_replies() => {
+                sync_for_replies();
+            }
             () = QUEUED.notified() => {
                 let released = write_what_is_queued(true).unwrap_or(false);
                 // Not straight back to waiting. A sender wakes a writer
@@ -1153,9 +1225,31 @@ fn finish_turn_over(old: OldLog) -> std::io::Result<()> {
         return Ok(());
     };
     failpoint("turn-over-syncing");
-    let synced = old.sync_data().and_then(|()| sync_dir());
-    OLD_LOG_UNSYNCED.store(false, Ordering::Release);
+    let synced = if injected_failure("turn-over-sync-fails") {
+        Err(std::io::Error::other("failure injected by a test"))
+    } else {
+        old.sync_data().and_then(|()| sync_dir())
+    };
+    match &synced {
+        Ok(()) => OLD_LOG_UNSYNCED.store(false, Ordering::Release),
+        Err(e) if fsync_always() => {
+            sync_failed_under_always(&format!("the sync of {AOF_PREV_PATH}"), e)
+        }
+        // Left set: the new log is not synced ahead of the old one, and the
+        // second's sync tries the old one again (see [`do_fsync`]).
+        Err(_) => {}
+    }
     synced
+}
+
+/// Sync the old log a turn-over moved aside, and the directory.
+fn sync_old_log() -> std::io::Result<()> {
+    match std::fs::File::open(AOF_PREV_PATH) {
+        Ok(old) => old.sync_data()?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    sync_dir()
 }
 
 /// Write `first` and whatever else is queued, turning the log over at each
@@ -1201,7 +1295,18 @@ fn write_queued(
         wrote |= !batch.is_empty();
         write_batch(file, &batch);
         released |= !barriers.is_empty();
-        release_barriers(&mut barriers);
+        // Under `appendfsync always`, the replies the barriers stand for go
+        // out once what is before them is on the disk. The writer thread
+        // syncs, not the connection's: a sync takes milliseconds, and a
+        // connection's thread serves others meanwhile. Every barrier that
+        // comes in while it syncs is answered by the next sync: a group
+        // commit.
+        if !barriers.is_empty() && fsync_always() {
+            UNSYNCED_BARRIERS.lock().append(&mut barriers);
+            SYNC_WANTED.notify_one();
+        } else {
+            release_barriers(&mut barriers);
+        }
         let Some(generation) = mark else {
             if more_queued {
                 if drained < MAX_AOF_PASS_BYTES {
@@ -1542,11 +1647,68 @@ fn write_batch(file: &mut std::fs::File, batch: &[u8]) {
         return;
     }
     if let Err(e) = file.write_all(batch) {
+        // Replies wait for this write and its sync: none can be sent
+        // without it, nor with it lost. Redis exits too.
+        if fsync_always() {
+            log_fatal!(
+                "AOF: write to {AOF_PATH} failed under appendfsync always: {e} — exiting rather than acknowledge writes that are not on disk"
+            );
+            std::process::exit(1);
+        }
         log_throttled!(
             10,
             crate::loglevel::ERROR,
             "AOF: write to {AOF_PATH} failed: {e} — writes are not being made durable; check free disk space and permissions on the data directory"
         );
+    }
+}
+
+/// `appendfsync always`: sync the file for the replies waiting for it, and
+/// then answer them (#513). On a handle of its own, outside the lock:
+/// connections go on writing meanwhile, and what they write is synced next.
+fn sync_for_replies() {
+    let (mut barriers, written, file) = {
+        let log = LOG.lock();
+        let barriers = std::mem::take(&mut *UNSYNCED_BARRIERS.lock());
+        // What the sync covers, as in [`do_fsync`]: `WAITAOF` and the
+        // second's sync see it synced.
+        let written = AOF_WRITTEN.load(Ordering::Relaxed);
+        match log.as_ref() {
+            Some(log) => (barriers, written, Some(log.file.try_clone())),
+            // The AOF turned off since: nothing to sync.
+            None => (barriers, written, None),
+        }
+    };
+    if barriers.is_empty() {
+        return;
+    }
+    match file {
+        Some(Ok(file)) => {
+            sync_before_reply(&file);
+            AOF_FSYNCED.fetch_max(written, Ordering::Relaxed);
+        }
+        Some(Err(e)) => sync_failed_under_always(&format!("opening {AOF_PATH} to sync"), &e),
+        None => {}
+    }
+    release_barriers(&mut barriers);
+}
+
+/// `appendfsync always`: sync what has been written, before the replies
+/// that wait for it are sent — and first the old log of a turn-over the
+/// checkpoint has yet to sync, with the directory: the records after a
+/// turn-over must not be on the disk without those before it, nor in a
+/// new log whose name may not be. A sync that fails ends the server, as in
+/// Redis: it can neither reply nor keep the promise.
+fn sync_before_reply(file: &std::fs::File) {
+    failpoint("aof-fsync-before-reply");
+    let synced = (|| {
+        if OLD_LOG_UNSYNCED.load(Ordering::Acquire) {
+            sync_old_log()?;
+        }
+        file.sync_data()
+    })();
+    if let Err(e) = synced {
+        sync_failed_under_always(&format!("the fsync of {AOF_PATH}"), &e);
     }
 }
 
@@ -1585,10 +1747,28 @@ fn do_fsync() {
     if !had_data && written == AOF_FSYNCED.load(Ordering::Relaxed) {
         return;
     }
-    // Not ahead of the old log a turn-over has just moved aside: the next
-    // second's sync covers this, once the checkpoint has synced that one.
-    if OLD_LOG_UNSYNCED.load(Ordering::Acquire) {
+    // Under `appendfsync always`, a sync that fails stops the server, here
+    // as for a reply: logged and passed over, its error would be gone for
+    // the next sync, which would answer replies with their writes lost.
+    if fsync_always() {
+        sync_before_reply(&file);
+        AOF_FSYNCED.fetch_max(written, Ordering::Relaxed);
         return;
+    }
+    // Not ahead of the old log a turn-over has moved aside. The checkpoint
+    // syncs that one; if its sync failed, it is tried again here.
+    if OLD_LOG_UNSYNCED.load(Ordering::Acquire) {
+        match sync_old_log() {
+            Ok(()) => OLD_LOG_UNSYNCED.store(false, Ordering::Release),
+            Err(e) => {
+                log_throttled!(
+                    10,
+                    crate::loglevel::ERROR,
+                    "AOF: fsync of {AOF_PREV_PATH} failed: {e} — writes acknowledged since the last good fsync may be lost on power failure; check the disk"
+                );
+                return;
+            }
+        }
     }
 
     if let Err(e) = file.sync_data() {
@@ -1911,8 +2091,14 @@ fn logs_as_saved() -> std::io::Result<LogsAtSave> {
     if let Some(log) = LOG.lock().as_mut() {
         write_queued(&mut log.file, &mut log.rx, None);
         // Not synced, it is shorter after a power cut than recorded: read
-        // as changed, it is replayed, as when nothing was recorded.
-        let _ = log.file.sync_data();
+        // as changed, it is replayed, as when nothing was recorded. Under
+        // `appendfsync always` a failure is not passed over (see
+        // [`sync_failed_under_always`]).
+        if let Err(e) = log.file.sync_data()
+            && fsync_always()
+        {
+            sync_failed_under_always(&format!("the fsync of {AOF_PATH}"), &e);
+        }
     }
     logs_on_disk()
 }
@@ -3528,18 +3714,7 @@ pub fn recover_from_aof(
 /// (`n` counts from 1 for each name) and waits while the file is there. Read
 /// once; unset, a step costs a load and a branch.
 pub(crate) fn failpoint(name: &'static str) {
-    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    let names = NAMES.get_or_init(|| {
-        std::env::var("KIVIDB_TEST_FAILPOINTS")
-            .map(|list| {
-                list.split(',')
-                    .map(|name| name.trim().to_string())
-                    .filter(|name| !name.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default()
-    });
-    if !names.iter().any(|n| n == name) {
+    if !failpoint_named(name) {
         return;
     }
     static HITS: parking_lot::Mutex<Vec<(&'static str, u64)>> = parking_lot::Mutex::new(Vec::new());
@@ -3564,6 +3739,30 @@ pub(crate) fn failpoint(name: &'static str) {
     while std::path::Path::new(&path).exists() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
+}
+
+/// Whether `KIVIDB_TEST_FAILPOINTS` names `name`. Read once.
+fn failpoint_named(name: &str) -> bool {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    NAMES
+        .get_or_init(|| {
+            std::env::var("KIVIDB_TEST_FAILPOINTS")
+                .map(|list| {
+                    list.split(',')
+                        .map(|name| name.trim().to_string())
+                        .filter(|name| !name.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .iter()
+        .any(|n| n == name)
+}
+
+/// A step a test makes fail, named in `KIVIDB_TEST_FAILPOINTS` as a
+/// [`failpoint`] is: whether it is to fail.
+fn injected_failure(name: &str) -> bool {
+    failpoint_named(name)
 }
 
 // ── Checkpoint in progress ───────────────────────────────────────────────────

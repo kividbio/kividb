@@ -107,7 +107,8 @@ other files:
   runs scripts.
 - `save <points>` has no effect: KiviDB doesn't snapshot on a schedule. Use
   the AOF or `BGSAVE`.
-- `appendfsync` is always `everysec`.
+- `appendfsync no` is taken as `everysec`; `always` and `everysec` do what
+  they do in Redis.
 - The config file is read strictly: an unknown directive stops the server.
 
 **Durability**

@@ -334,6 +334,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     crate::protected_mode::set(cfg.protected_mode);
     crate::protected_mode::set_bind_explicit(cfg.bind_explicit);
+    // `appendfsync`, from the command line or the file (#513). The file's
+    // `no` has been warned about as it was read; the command line's is here.
+    if from_cli("appendfsync") && cfg.appendfsync.eq_ignore_ascii_case("no") {
+        log_warn!(
+            "'--appendfsync no' syncs the append-only file once a second, as 'everysec' does"
+        );
+    }
+    let _ = crate::commands::server::config_set_global("appendfsync", &cfg.appendfsync);
     let threads = cfg.resolve_threads();
     let config = Arc::new(cfg);
     RUNTIME_MAXMEMORY.store(config.maxmemory, std::sync::atomic::Ordering::Relaxed);

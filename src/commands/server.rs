@@ -1162,8 +1162,27 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                                  9223372036854775807 inclusive",
                 )),
             },
-            // What the latency monitor records (#158): remembered too, for
-            // `CONFIG GET`.
+            // When the AOF is synced (#513): under `always`, before each
+            // reply to a write, as in Redis. `no` is taken as `everysec`.
+            "appendfsync" => match value.to_ascii_lowercase().as_str() {
+                policy @ ("always" | "everysec" | "no") => {
+                    if policy == "no" {
+                        log_warn!(
+                            "'appendfsync no' syncs the append-only file once a second, as \
+                             'everysec' does"
+                        );
+                    }
+                    crate::aof::set_fsync_always(policy == "always");
+                    REMEMBERED_CONFIG
+                        .lock()
+                        .insert(param.clone(), policy.to_string());
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument 'appendfsync') - \
+                     argument(s) must be one of the following: always, everysec, no",
+                )),
+            },
             // Whether a reply to a write waits for its AOF record (#147).
             "aof-ack-after-write" => match value.to_ascii_lowercase().as_str() {
                 "yes" | "no" => {
