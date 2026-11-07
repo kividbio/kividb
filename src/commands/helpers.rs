@@ -553,7 +553,7 @@ fn shrink_sparse_tables(store: &Store, cursor: &ExpireCursor) {
 /// until after it has written it, and the expiry falls before or after the
 /// whole of that write (#271). Nothing when this thread is alone, or holds
 /// the order already.
-fn unobserved_order<'a>(
+pub(crate) fn unobserved_order<'a>(
     unobserved: bool,
     db: usize,
     keys: impl Iterator<Item = &'a [u8]>,
@@ -749,6 +749,19 @@ impl FieldClock {
                     self.after + Duration::from_millis(MAX_FIELD_DEADLINE_MS as u64)
                 })
             })
+    }
+
+    /// The `Instant` of `at_ms`, Unix milliseconds, also once it has come:
+    /// one already past stays past (on the earlier monotonic reading, as far
+    /// back as the clock goes), so that a field kept with it is due at once.
+    /// What a hash keeps of a field whose deadline passed where removals are
+    /// left to the master's `HDEL` (#415). One in the future is
+    /// [`FieldClock::instant_of`].
+    pub fn instant_or_past_of(&self, at_ms: u64) -> std::time::Instant {
+        self.instant_of(at_ms).unwrap_or_else(|| {
+            let ago = self.wall.saturating_sub(Duration::from_millis(at_ms));
+            self.before.checked_sub(ago).unwrap_or(self.before)
+        })
     }
 
     /// [`FieldClock::instant_of`], checked: `None` (the outer one) for a

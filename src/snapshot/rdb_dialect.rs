@@ -139,10 +139,17 @@ fn describe_slot_import(r: &mut impl Read) -> io::Result<String> {
     Ok(format!(" (job {job}, slots {})", ranges.join(" ")))
 }
 
-/// When a hash field of a Redis or Valkey file whose expiry is `at_ms`
-/// (Unix milliseconds) expires, on the clock field TTLs are kept by;
-/// `None` if that time has come, and the field is dropped. One further out
-/// than the clock can hold is a corrupt file.
+/// When a hash field of a Redis, Valkey, Dragonfly or KeyDB file or `DUMP`
+/// payload whose expiry is `at_ms` (Unix milliseconds) expires, on the clock
+/// field TTLs are kept by. One further out than the clock can hold is a
+/// corrupt file.
+///
+/// A time that has come is kept as the moment it was, and the field with it:
+/// `field_expiry` removes it, and a master sends its `HDEL` (#415). Dropped
+/// here by the clock of each reader, a field a master kept was gone on a
+/// replica that read the same full sync or `RESTORE` a moment later, and a
+/// write the master made to the field while it lived (`HINCRBY`,
+/// `HPERSIST`) came out differently there.
 ///
 /// Converted with `clock`, read once for the hash, to the nanosecond (see
 /// `FieldClock`, #448), so that `HPEXPIRETIME` reads back the very
@@ -151,16 +158,18 @@ fn describe_slot_import(r: &mut impl Read) -> io::Result<String> {
 pub(super) fn field_deadline(
     clock: &crate::commands::helpers::FieldClock,
     at_ms: u64,
-) -> io::Result<Option<std::time::Instant>> {
-    clock
-        .checked_instant_of(at_ms)
-        .ok_or_else(|| rdb_invalid("hash field expiry out of range"))
+) -> io::Result<std::time::Instant> {
+    match clock.checked_instant_of(at_ms) {
+        Some(Some(at)) => Ok(at),
+        Some(None) => Ok(clock.instant_or_past_of(at_ms)),
+        None => Err(rdb_invalid("hash field expiry out of range")),
+    }
 }
 
 /// Valkey 9's `RDB_TYPE_HASH_2`: a count, then each field's name, its value
 /// and its expiry, an 8-byte little-endian Unix time in milliseconds, or -1
-/// for none. Fields already past their time are dropped, as Valkey drops
-/// them on load (and sends the deletes of them to its replicas).
+/// for none. Fields already past their time are kept with it (see
+/// [`field_deadline`]).
 fn read_valkey_hash_2(r: &mut impl Read) -> io::Result<Option<KiviDBValue>> {
     let count = rdb_read_plain_length(r)?;
     let mut fields: Vec<(Vec<u8>, Vec<u8>, Option<u64>)> =
@@ -177,7 +186,7 @@ fn read_valkey_hash_2(r: &mut impl Read) -> io::Result<Option<KiviDBValue>> {
 
     let clock = crate::commands::helpers::FieldClock::now();
     let mut inner = crate::types::HashInner::new();
-    // Every field's name, kept or not: one named twice is a corrupt file.
+    // One named twice is a corrupt file.
     let mut names = std::collections::HashSet::with_capacity(fields.len());
     for (field, value, expires_at) in fields {
         let field = String::from_utf8_lossy(&field).into_owned();
@@ -185,16 +194,13 @@ fn read_valkey_hash_2(r: &mut impl Read) -> io::Result<Option<KiviDBValue>> {
             return Err(rdb_invalid("duplicate hash fields"));
         }
         if let Some(at) = expires_at {
-            match field_deadline(&clock, at)? {
-                Some(deadline) => {
-                    inner.expiries.insert(field.clone(), deadline);
-                }
-                None => continue,
-            }
+            inner
+                .expiries
+                .insert(field.clone(), field_deadline(&clock, at)?);
         }
         inner.fields.insert(field, Arc::from(value.as_slice()));
     }
-    // Nothing left (or nothing there): no key, as Valkey loads none.
+    // Nothing there: no key, as Valkey loads none.
     if inner.fields.is_empty() {
         return Ok(None);
     }

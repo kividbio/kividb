@@ -158,7 +158,7 @@ pub(crate) fn apply_expire(
 /// it (`lookupKeyByPattern`): the first `*` stands for the element's bytes,
 /// and a `->field` after it, with a field name, names a field of the hash
 /// at that key. `None` when the pattern has no `*`, or names nothing there.
-fn sort_pattern_value(db: &store::Db, pat: &[u8], elem: &[u8]) -> Option<Vec<u8>> {
+fn sort_pattern_value(ctx: &Ctx, pat: &[u8], elem: &[u8]) -> Option<Vec<u8>> {
     let star = memchr::memchr(b'*', pat)?;
     let rest = &pat[star + 1..];
     let (suffix, field) = match memchr::memmem::find(rest, b"->") {
@@ -169,28 +169,50 @@ fn sort_pattern_value(db: &store::Db, pat: &[u8], elem: &[u8]) -> Option<Vec<u8>
     key.extend_from_slice(&pat[..star]);
     key.extend_from_slice(elem);
     key.extend_from_slice(suffix);
-    let shard = store::get_shard(db, &key);
-    let map = read_lock!(shard);
-    match (map.peek(&key), field) {
-        (Some(ValueRef::String(s)), None) => Some(s.to_vec()),
-        (Some(ValueRef::Hash(h)), Some(field)) => {
-            let name = crate::key_bytes::text_of(field);
-            h.read().get(&*name).map(|v| v.to_vec())
-        }
-        (Some(ValueRef::HashEx(h)), Some(field)) => {
-            let name = crate::key_bytes::text_of(field);
-            let inner = h.read();
-            let live = inner
-                .expiries
-                .get(&*name)
-                .is_none_or(|at| *at > std::time::Instant::now());
-            inner
-                .fields
-                .get(&*name)
-                .filter(|_| live)
-                .map(|v| v.to_vec())
-        }
-        _ => None,
+    let shard = store::get_shard(&ctx.store[*ctx.selected_db], &key);
+    let now = std::time::Instant::now();
+    let mut tried = false;
+    loop {
+        let map = read_lock!(shard);
+        return match (map.peek(&key), field) {
+            (Some(ValueRef::String(s)), None) => Some(s.to_vec()),
+            (Some(ValueRef::Hash(h)), Some(field)) => {
+                let name = crate::key_bytes::text_of(field);
+                h.read().get(&*name).map(|v| v.to_vec())
+            }
+            // A field past its deadline is what a hash command makes of it
+            // (#415): removed first where this node removes fields, its
+            // `HDEL` sent ahead of this `SORT`; kept where the stream or the
+            // AOF being applied says when it goes, so that a `STORE` comes
+            // out there as it did on the master; hidden from a reader
+            // otherwise.
+            (Some(ValueRef::HashEx(h)), Some(field)) => {
+                let name = crate::key_bytes::text_of(field);
+                let inner = h.read();
+                let value = inner.fields.get(&*name)?;
+                if inner.expiries.get(&*name).is_none_or(|at| *at > now) {
+                    return Some(value.to_vec());
+                }
+                match crate::field_expiry::policy(ctx.store) {
+                    crate::field_expiry::Policy::Keep => Some(value.to_vec()),
+                    crate::field_expiry::Policy::Expire if !tried => {
+                        drop(inner);
+                        drop(map);
+                        tried = true;
+                        crate::field_expiry::expire_due(
+                            ctx.store,
+                            ctx.index_store,
+                            *ctx.selected_db,
+                            &key,
+                            now,
+                        );
+                        continue;
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
     }
 }
 
@@ -1338,16 +1360,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         vec![None; elements.len()]
                     }
 
-                    Some(pat) => {
-                        let db = &ctx.store[*ctx.selected_db];
-                        elements
-                            .iter()
-                            .map(|elem| {
-                                sort_pattern_value(db, pat, elem)
-                                    .and_then(|v| std::str::from_utf8(&v).ok()?.parse::<f64>().ok())
-                            })
-                            .collect()
-                    }
+                    Some(pat) => elements
+                        .iter()
+                        .map(|elem| {
+                            sort_pattern_value(ctx, pat, elem)
+                                .and_then(|v| std::str::from_utf8(&v).ok()?.parse::<f64>().ok())
+                        })
+                        .collect(),
                 }
             };
 
@@ -1458,7 +1477,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         if pat.as_slice() == b"#" {
                             out.push(Some(elem.to_vec()));
                         } else {
-                            out.push(sort_pattern_value(db, pat, elem));
+                            out.push(sort_pattern_value(ctx, pat, elem));
                         }
                     }
                 }

@@ -78,8 +78,10 @@ fn refusal(bytes: &[u8]) -> String {
 }
 
 // A hash with field TTLs, as Valkey 9 saves one: the fields keep their TTLs
-// to the millisecond, one without keeps none, and one already past its time
-// is not loaded, as Valkey does not load it (#449).
+// to the millisecond, one without keeps none (#449), and one already past
+// its time is kept as that moment, for field expiry to remove (and a master
+// to send the `HDEL` of): dropped by each reader's clock, a replica's full
+// sync or `RESTORE` went otherwise than its master's (#415).
 #[test]
 fn a_valkey_9_hash_with_field_ttls_loads_with_them() {
     let later = now_ms() + 3_600_000;
@@ -99,9 +101,13 @@ fn a_valkey_9_hash_with_field_ttls_loads_with_them() {
     let h = h.read();
     let mut fields: Vec<&str> = h.fields.keys().map(String::as_str).collect();
     fields.sort_unstable();
-    assert_eq!(fields, ["a", "b"]);
+    assert_eq!(fields, ["a", "b", "gone"]);
     assert_eq!(&h.fields["a"][..], b"1");
-    assert_eq!(h.expiries.len(), 1, "only a has a TTL");
+    assert_eq!(h.expiries.len(), 2, "b has no TTL");
+    assert!(
+        h.expiries["gone"] <= std::time::Instant::now(),
+        "gone is due"
+    );
     let left = h.expiries["a"].saturating_duration_since(std::time::Instant::now());
     assert!(
         (3_590..=3_600).contains(&left.as_secs()),
@@ -110,9 +116,10 @@ fn a_valkey_9_hash_with_field_ttls_loads_with_them() {
 }
 
 // Valkey writes a hash all of whose fields have TTLs as type 22 too. When
-// every one has run out, there is no key, as Valkey loads none.
+// every one has run out, the hash is kept with them all due: field expiry
+// takes it out, as it takes out each field (see above).
 #[test]
-fn a_valkey_9_hash_whose_fields_have_all_run_out_is_no_key() {
+fn a_valkey_9_hash_whose_fields_have_all_run_out_is_kept_with_them_due() {
     let past = (now_ms() - 1_000) as i64;
     let mut body = valkey_hash(b"gone", &[(b"a", b"1", past), (b"b", b"2", past)]);
     body.extend([0]);
@@ -122,7 +129,12 @@ fn a_valkey_9_hash_whose_fields_have_all_run_out_is_no_key() {
     let dbs = texted_all(dbs);
     let mut keys: Vec<&str> = dbs[0].keys().map(String::as_str).collect();
     keys.sort_unstable();
-    assert_eq!(keys, ["s"]);
+    assert_eq!(keys, ["gone", "s"]);
+    let KiviDBValue::HashEx(h) = &dbs[0]["gone"] else {
+        panic!("gone is not a hash with field TTLs");
+    };
+    assert!(h.read().has_due(std::time::Instant::now()));
+    assert!(h.read().live_fields(std::time::Instant::now()).is_empty());
 }
 
 // What Valkey 9.0 and 9.1 do not write is refused, by what it is: a newer

@@ -671,6 +671,22 @@ async fn run_replication_session(
     repl_state
         .master_propagates_expiry
         .store(propagates, Ordering::Relaxed);
+    // The same for hash fields. A master that sends none (KiviDB 1.2.0 and
+    // before, or one that did not answer) is followed as before: this node
+    // expires fields by its own clock.
+    let propagates_fields = crate::replication::field_expiry_propagated_by(master_info.as_deref());
+    if !propagates_fields {
+        log_info!(
+            "Replication: The master does not say it sends the deletion of the hash fields it \
+             expires: this replica expires hash fields itself while it follows it"
+        );
+        repl_state
+            .field_expiry_sweep_owed
+            .store(true, Ordering::Relaxed);
+    }
+    repl_state
+        .master_propagates_field_expiry
+        .store(propagates_fields, Ordering::Relaxed);
 
     // ── Phase 4: PSYNC ───────────────────────────────────────────────────
     // If this node's dataset is a known position in a master's stream — it
@@ -880,6 +896,30 @@ async fn run_replication_session(
                      already past their time are left for its deletions"
                 ),
             }
+        }
+        // The same for hash fields past their deadline.
+        if propagates_fields
+            && repl_state.field_expiry_sweep_owed.load(Ordering::Relaxed)
+            && let Some(uptime) = master_uptime
+        {
+            let before = crate::commands::helpers::now_ms()
+                .saturating_sub(uptime.saturating_add(1).saturating_mul(1000));
+            let store = Arc::clone(store);
+            let index_store = Arc::clone(index_store);
+            let removed = tokio::task::spawn_blocking(move || {
+                crate::field_expiry::expire_fields_due_before(&store, &index_store, before)
+            })
+            .await
+            .unwrap_or(0);
+            if removed > 0 {
+                log_info!(
+                    "Replication: Removed {removed} hash fields whose deadline passed before \
+                     the master started, which no master would have sent the deletion of"
+                );
+            }
+            repl_state
+                .field_expiry_sweep_owed
+                .store(false, Ordering::Relaxed);
         }
     } else {
         if tok.len() < 3 || cmd0 != "FULLRESYNC" {
@@ -1108,6 +1148,11 @@ async fn run_replication_session(
         // it sends them at all: nothing is left for a sweep.
         if propagates {
             repl_state.expiry_sweep_owed.store(false, Ordering::Relaxed);
+        }
+        if propagates_fields {
+            repl_state
+                .field_expiry_sweep_owed
+                .store(false, Ordering::Relaxed);
         }
         // The dataset is the master's from here on; a promotion now finds it
         // whole and stops this session at its next look at the epoch.
@@ -2088,10 +2133,14 @@ impl ReplicationApplyEnv {
         // master that sends no such `DEL`s (before 1.1.3) expired keys by
         // its clock alone, and its writes are applied as replicas applied
         // them then: to a key past its time here, as to no key.
-        let _hold = repl_state
-            .master_propagates_expiry
-            .load(Ordering::Relaxed)
-            .then(crate::expiry::hold);
+        // So with hash fields, each held or not as the master sends its
+        // deletions or not.
+        let _hold = crate::expiry::hold_of(
+            repl_state.master_propagates_expiry.load(Ordering::Relaxed),
+            repl_state
+                .master_propagates_field_expiry
+                .load(Ordering::Relaxed),
+        );
         execute_command(Ctx {
             cmd: cmd_refs,
             store,
@@ -2132,6 +2181,64 @@ impl ReplicationApplyEnv {
             blocking: None,
         })
     }
+}
+
+/// For a test: `cmd` run as a client of a master runs it, its writes queued
+/// on `hub_tx` (which `repl_state` must feed for them to be). Returns the
+/// reply.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_as_client(
+    env: &ReplicationApplyEnv,
+    cmd: &[&[u8]],
+    store: &Store,
+    repl_state: &Arc<ReplState>,
+    index_store: &IndexStore,
+    hub_tx: &crate::replication::HubTx,
+    watch_registry: &dyn crate::watch::WatchNotifier,
+) -> Vec<u8> {
+    use crate::commands::ctx::Ctx;
+    let config = Arc::new(crate::config::Config::default());
+    let dict_store = crate::vector::new_dict_store();
+    let wait_table = Arc::new(crate::wait_table::WaitTable::new());
+    let ts_index = crate::store::new_ts_index();
+    let (compaction_tx, _compaction_rx) = crate::vector::new_compaction_channel();
+    let mut selected_db = 0usize;
+    crate::commands::execute_command(Ctx {
+        cmd: cmd.to_vec(),
+        store,
+        lastsave: &env.lastsave,
+        selected_db: &mut selected_db,
+        aof_tx: env.aof_tx.as_ref(),
+        aof_enabled: false,
+        config: &config,
+        started_at: &env.started_at,
+        index_store,
+        dict_store: &dict_store,
+        wait_table: &wait_table,
+        ts_index: &ts_index,
+        pubsub: &env.pubsub,
+        hub_tx,
+        repl_state,
+        watch_registry,
+        client_id: 1,
+        client_registry: &env.client_registry,
+        resp: 2,
+        acl_store: &env.acl_store,
+        acl_log: &env.acl_log,
+        slowlog: &env.slowlog,
+        latency: &env.latency,
+        compaction_tx: &compaction_tx,
+        cluster: &env.cluster,
+        bypass_cluster_check: true,
+        apply_replication: false,
+        skip_write_side_effects: false,
+        peer_addr: "client:test",
+        monitor_registry: &env.monitor_registry,
+        authenticated_user: "default",
+        tracking_table: &env.tracking_table,
+        blocking: None,
+    })
 }
 
 /// The address to list a replica under: its connection's IP, with the port it

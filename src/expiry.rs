@@ -79,6 +79,18 @@ impl Target {
                 .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// This node is a replica of a master that sends the deletion of every
+    /// hash field it expires: it removes no expired field of its own, and
+    /// hides one from reads until the master's `HDEL` arrives.
+    #[inline]
+    pub fn on_replica_fields(&self) -> bool {
+        self.repl_state.is_slave()
+            && self
+                .repl_state
+                .master_propagates_field_expiry
+                .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Whether a key this node expires has to be told to anyone: it is a
     /// master, and something reads its write stream (the AOF, a replica or
     /// the backlog kept for one, a tap). As `replication::write_is_observed`
@@ -125,6 +137,27 @@ impl Target {
 fn lazy_expire() -> bool {
     crate::commands::server::remembered_config("lazyfree-lazy-expire")
         .is_some_and(|v| v.eq_ignore_ascii_case("yes"))
+}
+
+impl Target {
+    /// `fields` of the hash at `key`, which this master has just expired in
+    /// database `db`, as one `HDEL`. The caller holds what [`order`] takes.
+    pub fn propagate_fields<'a>(
+        &self,
+        db: usize,
+        key: &[u8],
+        fields: impl IntoIterator<Item = &'a str>,
+    ) {
+        let mut parts = vec![b"HDEL".to_vec(), key.to_vec()];
+        parts.extend(
+            fields
+                .into_iter()
+                .map(|f| crate::commands::helpers::name_to_bytes(f).into_owned()),
+        );
+        if parts.len() > 2 {
+            crate::replication::replicate_expired(&self.repl_state, &self.hub_tx, db, &parts);
+        }
+    }
 }
 
 static TARGETS: RwLock<Vec<(usize, Target)>> = RwLock::new(Vec::new());
@@ -215,27 +248,53 @@ pub fn written_over(store: usize, db: usize, keys: &[crate::store::Key]) {
 }
 
 thread_local! {
-    /// How many [`Hold`]s this thread has.
+    /// How many [`Hold`]s of keys this thread has.
     static HELD: Cell<u32> = const { Cell::new(0) };
+    /// How many [`Hold`]s of hash fields this thread has.
+    static FIELDS_HELD: Cell<u32> = const { Cell::new(0) };
 }
 
-/// While this lives, no key expires on this thread ([`held`]).
+/// While this lives, no key, or no hash field, expires on this thread
+/// ([`held`], [`fields_held`]).
 pub struct Hold {
+    keys: bool,
+    fields: bool,
     _not_send: PhantomData<*const ()>,
 }
 
 impl Drop for Hold {
     fn drop(&mut self) {
-        HELD.with(|held| held.set(held.get().saturating_sub(1)));
+        if self.keys {
+            HELD.with(|held| held.set(held.get().saturating_sub(1)));
+        }
+        if self.fields {
+            FIELDS_HELD.with(|held| held.set(held.get().saturating_sub(1)));
+        }
     }
 }
 
-/// From now until the [`Hold`] is dropped, a key's time does not make it
-/// gone on this thread: what a thread loading a dataset, or applying its
-/// master's stream, holds. Nests.
+/// From now until the [`Hold`] is dropped, neither a key's time nor a hash
+/// field's makes it gone on this thread: what a thread loading a dataset
+/// holds, and one applying the stream of a master that sends both
+/// deletions. Nests.
 pub fn hold() -> Hold {
-    HELD.with(|held| held.set(held.get() + 1));
+    hold_of(true, true)
+}
+
+/// [`hold`] of keys alone, or of fields alone: for a replica of a master
+/// that sends the deletion of one and not the other. A single hold cannot
+/// say that: a KiviDB 1.2.0 master sends a `DEL` for every key it expires
+/// and nothing for the fields, which the replica has to expire itself.
+pub fn hold_of(keys: bool, fields: bool) -> Hold {
+    if keys {
+        HELD.with(|held| held.set(held.get() + 1));
+    }
+    if fields {
+        FIELDS_HELD.with(|held| held.set(held.get() + 1));
+    }
     Hold {
+        keys,
+        fields,
         _not_send: PhantomData,
     }
 }
@@ -245,6 +304,13 @@ pub fn hold() -> Hold {
 #[inline]
 pub fn held() -> bool {
     HELD.with(|held| held.get() > 0)
+}
+
+/// [`held`], for hash fields: a field's deadline does not make it gone on
+/// this thread. The `HDEL` that follows does.
+#[inline]
+pub fn fields_held() -> bool {
+    FIELDS_HELD.with(|held| held.get() > 0)
 }
 
 /// Datasets being loaded, on any thread: active expiry deletes nothing

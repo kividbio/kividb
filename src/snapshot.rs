@@ -2110,13 +2110,15 @@ fn read_image(
                         hmap.insert(field, Arc::from(val.as_slice()));
                     }
                     // Expiries: re-anchor each persisted Unix ms back to a
-                    // monotonic Instant relative to "now". Fields whose
-                    // absolute time is in the past simply don't get added —
-                    // the lazy-eviction check on next access handles them.
+                    // monotonic Instant relative to "now". A field whose time
+                    // has passed is dropped, unless fields are held (under
+                    // an AOF, or a replica's load): then it is kept with its
+                    // deadline, for the `HDEL` that says it went.
+                    let keep_past = crate::expiry::fields_held();
                     let mut exp_count_buf = [0u8; 4];
                     r.read_exact(&mut exp_count_buf)?;
                     let exp_count = u32::from_le_bytes(exp_count_buf) as usize;
-                    let mut exps = AHashMap::with_capacity(hint(exp_count));
+                    let mut exps = crate::types::Expiries::with_capacity(hint(exp_count));
                     let clock = crate::commands::helpers::FieldClock::now();
                     for _ in 0..exp_count {
                         let field_bytes = read_bytes(&mut r)?;
@@ -2128,6 +2130,8 @@ fn read_image(
                         let abs_ms = u64::from_le_bytes(ms_buf);
                         if let Some(at) = clock.instant_of(abs_ms) {
                             exps.insert(field, at);
+                        } else if keep_past && hmap.contains_key(&field) {
+                            exps.insert(field, clock.instant_or_past_of(abs_ms));
                         } else {
                             crate::types::hash_remove(&mut hmap, &field);
                         }
@@ -3778,7 +3782,8 @@ fn estimated_entries_read(stream: &crate::types::StreamInner, id: &crate::types:
 /// - Type 25, a listpack of field, value, expiry triples, each expiry in
 ///   Unix milliseconds or 0 for none.
 ///
-/// Fields already past their time are dropped, as Redis drops them.
+/// Fields already past their time are kept with that deadline, for
+/// `field_expiry` to remove (and, on a master, to send the `HDEL` of).
 fn rdb_read_hash_with_ttls(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
     let soonest = rdb_read_millisecond_time(r)?;
     let mut fields: Vec<(Vec<u8>, Vec<u8>, u64)> = Vec::new();
@@ -3813,15 +3818,21 @@ fn rdb_read_hash_with_ttls(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBV
         }
     }
 
+    // Read once for the hash (see `FieldClock`, #448).
     let clock = crate::commands::helpers::FieldClock::now();
+    // A field whose time is up is kept with its deadline, which has passed:
+    // this reads `RESTORE`'s Redis payloads too, and what is restored has to
+    // be the same on every reader of the stream, whenever each restores it
+    // (see the KDB `DUMP` loader). The field goes by `field_expiry`. A
+    // deadline further out than the clock can hold is still refused.
     let mut inner = crate::types::HashInner::new();
     for (field, value, expires_at) in fields {
         let field = crate::key_bytes::text_of(&field).into_owned();
         if expires_at != 0 {
-            let Some(deadline) = rdb_dialect::field_deadline(&clock, expires_at)? else {
-                continue;
-            };
-            inner.expiries.insert(field.clone(), deadline);
+            inner.expiries.insert(
+                field.clone(),
+                rdb_dialect::field_deadline(&clock, expires_at)?,
+            );
         }
         inner.fields.insert(field, Arc::from(value.as_slice()));
     }
@@ -5232,7 +5243,7 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
             }
             let exp_count = u32::from_le_bytes(payload[pos..pos + 4].try_into().ok()?) as usize;
             pos += 4;
-            let mut exps = AHashMap::new();
+            let mut exps = crate::types::Expiries::new();
             let clock = crate::commands::helpers::FieldClock::now();
             for _ in 0..exp_count {
                 let (field_bytes, next) = read_bytes_slice(payload, pos)?;
@@ -5242,13 +5253,16 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
                 }
                 let abs_ms = u64::from_le_bytes(payload[next..next + 8].try_into().ok()?);
                 pos = next + 8;
-                if let Some(at) = clock.instant_of(abs_ms) {
-                    exps.insert(field, at);
-                } else {
-                    // Its time is up: gone, as a snapshot's load drops it.
-                    // Kept, it lost its expiry and lived on for good (a
-                    // field `MIGRATE` read just as it ran out).
-                    crate::types::hash_remove(&mut map, &field);
+                // A field whose time is up is kept with its deadline, which
+                // has passed: what is restored is the same here and on every
+                // reader of the stream, whenever each restores it, and the
+                // field goes by `field_expiry`, its `HDEL` after the restore.
+                // Dropped here by each one's clock, a field the master kept
+                // was gone on a replica that restored it a moment later. It
+                // keeps its expiry either way: kept without one, it lived on
+                // for good (a field `MIGRATE` read just as it ran out).
+                if map.contains_key(&field) {
+                    exps.insert(field, clock.instant_or_past_of(abs_ms));
                 }
             }
             let inner = crate::types::HashInner {
@@ -5539,6 +5553,58 @@ mod field_deadline_tests {
         assert!(clock.instant_of(0).is_none());
     }
 
+    /// A deadline that has come is kept as the moment it was (#415): the
+    /// same `Instant` as `instant_of` gives one still to come, due at once
+    /// for one gone, read back to the very millisecond while the clock goes
+    /// back that far, and never later than now. One from before the clock
+    /// goes back to (0, as a negative Unix time is taken) is now.
+    #[test]
+    fn a_deadline_that_has_come_is_kept_as_the_moment_it_was() {
+        for _ in 0..2_000 {
+            // Read before the clocks: the millisecond now is in has come.
+            let now_ms = unix_ms_now();
+            let clock = FieldClock::now();
+            let ahead = now_ms + 60_000;
+            assert_eq!(
+                clock.instant_or_past_of(ahead),
+                clock.instant_of(ahead).unwrap()
+            );
+            for ago in [0, 1, 2, 5_000] {
+                let at = now_ms - ago;
+                let instant = clock.instant_or_past_of(at);
+                assert!(instant <= std::time::Instant::now(), "{ago} ms ago is due");
+                if clock.instant_of(at).is_none() {
+                    // Another reading of the clocks, as a later command makes.
+                    assert_eq!(FieldClock::now().unix_ms_of(instant), at, "{ago} ms ago");
+                }
+            }
+        }
+        let clock = FieldClock::now();
+        assert!(clock.instant_or_past_of(0) <= std::time::Instant::now());
+        assert_eq!(
+            clock.instant_or_past_of(u64::MAX),
+            clock.instant_of(u64::MAX).unwrap()
+        );
+    }
+
+    /// A file's or a payload's field deadline: one past is kept as it was,
+    /// one further out than the clock can hold is still a corrupt file.
+    #[test]
+    fn a_file_deadline_that_has_come_is_kept_and_one_out_of_range_refused() {
+        let clock = FieldClock::now();
+        let at = unix_ms_now() - 5_000;
+        let kept = rdb_dialect::field_deadline(&clock, at).unwrap();
+        assert_eq!(clock.unix_ms_of(kept), at);
+        let ahead = unix_ms_now() + 60_000;
+        assert_eq!(
+            rdb_dialect::field_deadline(&clock, ahead).unwrap(),
+            clock.instant_of(ahead).unwrap()
+        );
+        if clock.checked_instant_of(u64::MAX).is_none() {
+            assert!(rdb_dialect::field_deadline(&clock, u64::MAX).is_err());
+        }
+    }
+
     /// A deadline further out than 64 bits of milliseconds is written as
     /// the furthest there is, not cut to 64 bits: cut, it was a moment from
     /// now, and the field was gone once loaded.
@@ -5701,6 +5767,60 @@ mod expiry_section_tests {
         let loaded = load_snapshot_from(&image(&[db0], &exp)[..]).unwrap();
         assert!(!loaded.dbs[0].contains_key(&b"hxgone"[..]));
         assert!(!loaded.expiries[0].contains_key(&b"hxgone"[..]));
+    }
+
+    /// A hash field past its deadline: dropped by a load of its own, kept
+    /// with its deadline by one with fields held (under an AOF, a replica's),
+    /// for the `HDEL` that follows; kept by `RESTORE` always, which every
+    /// reader of the stream runs at its own moment.
+    #[test]
+    fn a_past_field_is_kept_where_fields_are_held_and_by_restore() {
+        let hash = || {
+            let mut hash = crate::types::HashInner::new();
+            hash.fields.insert("gone".to_string(), Arc::from(&b"1"[..]));
+            hash.fields.insert("live".to_string(), Arc::from(&b"2"[..]));
+            hash.expiries.insert(
+                "gone".to_string(),
+                std::time::Instant::now() - std::time::Duration::from_secs(1),
+            );
+            KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(hash)))
+        };
+        let fields_of = |value: &KiviDBValue| match value {
+            KiviDBValue::HashEx(h) => {
+                let h = h.read();
+                let mut f: Vec<(String, bool)> = h
+                    .fields
+                    .keys()
+                    .map(|k| (k.clone(), h.expiries.contains_key(k)))
+                    .collect();
+                f.sort();
+                f
+            }
+            _ => panic!("not a hash with field TTLs"),
+        };
+        let image_of = || image(&[HashMap::from([(Key::from("h"), hash())])], &[]);
+        let loaded = load_snapshot_from(&image_of()[..]).unwrap();
+        assert_eq!(
+            fields_of(&loaded.dbs[0][&b"h"[..]]),
+            [("live".to_string(), false)]
+        );
+        {
+            let _hold = crate::expiry::hold();
+            let loaded = load_snapshot_from(&image_of()[..]).unwrap();
+            assert_eq!(
+                fields_of(&loaded.dbs[0][&b"h"[..]]),
+                [("gone".to_string(), true), ("live".to_string(), false)]
+            );
+        }
+        let restored = restore_payload(&dump_payload(&hash()).unwrap()).unwrap();
+        let fields = fields_of(&restored);
+        assert_eq!(
+            fields,
+            [("gone".to_string(), true), ("live".to_string(), false)]
+        );
+        if let KiviDBValue::HashEx(h) = &restored {
+            assert!(h.read().has_due(std::time::Instant::now()));
+        }
     }
 
     /// An image with no expiry section — everything written before this

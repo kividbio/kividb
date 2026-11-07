@@ -1,21 +1,25 @@
 // src/field_expiry.rs
 //
 // Hash fields with a TTL expire when their time comes — not when somebody
-// next looks at them.
-//
-// A field's TTL (`HEXPIRE`, `HSETEX`, `HGETEX`) used to be acted on only by a
-// command that touched the field. A hash nobody read kept its expired fields
-// for ever; one whose fields had all expired stayed in the keyspace, counted
-// by `DBSIZE` and found by `SCAN`; and nothing was published when a field went.
+// next looks at them — and only a master removes them.
 //
 // This keeps the list of hashes that have field TTLs, with the earliest time
 // one of each is due, and the background expiry task (`helpers::
-// spawn_active_expire_task`) calls [`sweep`] ten times a second. A hash that
-// is due has its expired fields removed, `hexpired` published for them, and
-// — if that left it empty — is deleted, with `del` published.
+// spawn_active_expire_task`) calls [`sweep`] ten times a second.
 //
-// Replicas are not told. A field's TTL travels to them as the moment it
-// expires (`HPEXPIREAT`), and each runs this same sweep.
+// Every removal of a field for its deadline goes through [`expire_due`]:
+// the sweep's, a read's, and a write's that finds one before it writes. As a
+// key's expiry (`expiry`), it holds what a write holds, removes the fields
+// due, the hash if that empties it, and propagates an `HDEL` (or the hash's
+// `DEL`/`UNLINK`) before anything else is written to the key. A command that
+// finds a field due does so before its own record, so `HINCRBY h f 1` on an
+// expired `f` reaches replicas and the AOF as `HDEL h f`, `HINCRBY h f 1`.
+//
+// Nothing else removes a field for its time ([`policy`]): not a dataset
+// being loaded, not the AOF replayed, not a replica of a master that sends
+// these deletions, which hides a field past its deadline from its readers
+// and waits for the `HDEL`. A replica of a master that sends none (KiviDB
+// 1.2.0 and before) removes its fields itself, as every replica did then.
 
 use crate::store::ValueRef;
 use ahash::AHashMap;
@@ -173,6 +177,175 @@ pub fn rescan(store: &Store) {
     }
 }
 
+/// What may be done here about a hash field past its deadline.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Policy {
+    /// Removed, and its removal propagated ([`expire_due`]).
+    Expire,
+    /// Left in place and hidden from readers: a replica waiting for its
+    /// master's `HDEL`, or a master whose expiry is paused or whose stream a
+    /// shutdown has ended. A write finds the field as it is.
+    Hide,
+    /// Left in place and seen: a dataset being loaded, the AOF replayed, the
+    /// stream of a master that sends these deletions applied.
+    Keep,
+}
+
+/// [`Policy`] of this thread, for `store`. Only asked once a field is due.
+#[cold]
+pub fn policy(store: &Store) -> Policy {
+    if crate::expiry::fields_held() || crate::expiry::replaying() {
+        return Policy::Keep;
+    }
+    match crate::expiry::of(store) {
+        Some(target) if target.on_replica_fields() || target.stream_closed() => Policy::Hide,
+        _ if crate::pause::expiry_deferred() || crate::expiry::loading() => Policy::Hide,
+        _ => Policy::Expire,
+    }
+}
+
+/// What [`expire_due`] did.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Expired {
+    /// Fields removed.
+    pub fields: usize,
+    /// The hash was left empty and taken out of the keyspace.
+    pub key_removed: bool,
+}
+
+/// Remove the fields of the hash at `key` whose deadline is at or before
+/// `now`, as [`policy`] `Expire` says to; the hash too if that empties it.
+///
+/// For a command: called with no lock of the key's shard or of the hash
+/// held. Inside a command the write gate and the key's order are held
+/// already and are not taken again; outside one (a read), they are taken
+/// here, so that the `HDEL` falls where the removal did among the writes to
+/// the key, and a cut does not fall between the two. A command that holds
+/// the key's order whole holds it until its own record is queued, after
+/// this one's.
+#[cold]
+#[inline(never)]
+pub fn expire_due(
+    store: &Store,
+    index_store: &IndexStore,
+    db: usize,
+    key: &[u8],
+    now: Instant,
+) -> Expired {
+    let target = crate::expiry::of(store);
+    let told = target.as_ref().filter(|target| target.observed());
+    let ordered = told.map(|_| crate::expiry::order(db, std::iter::once(key)));
+    let unobserved =
+        crate::commands::helpers::unobserved_order(told.is_none(), db, std::iter::once(key));
+    if ordered.is_some() && crate::pause::expiry_deferred() {
+        return Expired::default();
+    }
+    let (expired, _) = expire_ordered(store, index_store, db, key, now, told);
+    drop(unobserved);
+    drop(ordered);
+    after_expiry(store, db, key, &expired);
+    expired
+}
+
+/// The removal itself, holding what [`expire_due`] or the sweep takes: the
+/// write gate and the key's order. Returns what was removed, and the
+/// earliest deadline the hash still has.
+fn expire_ordered(
+    store: &Store,
+    index_store: &IndexStore,
+    db: usize,
+    key: &[u8],
+    now: Instant,
+    told: Option<&crate::expiry::Target>,
+) -> (Expired, Option<Instant>) {
+    let Some(db_ref) = store.get(db) else {
+        return (Expired::default(), None);
+    };
+    let id = crate::vector::store_id(store);
+    let marks = crate::vector::has_index_of(index_store, db);
+    let (fields, next, taken) = {
+        let mut map = crate::store::get_shard(db_ref, key).write();
+        let hash = match map.get(key) {
+            Some(ValueRef::HashEx(hash)) => std::sync::Arc::clone(hash),
+            _ => return (Expired::default(), None),
+        };
+        let mut inner = hash.write();
+        let fields: Vec<String> = inner
+            .expiries
+            .iter()
+            .filter(|(_, at)| **at <= now)
+            .map(|(field, _)| field.clone())
+            .collect();
+        for field in &fields {
+            inner.evict_field(field);
+        }
+        let next = inner.expiries.values().min().copied();
+        let emptied = !fields.is_empty() && inner.fields.is_empty();
+        drop(inner);
+        let taken = if emptied { map.remove(key) } else { None };
+        if taken.is_some() && marks {
+            crate::vector::mark_leaving(id, db, key);
+        }
+        (fields, next, taken)
+    };
+    if fields.is_empty() {
+        return (Expired::default(), next);
+    }
+    let key_removed = taken.is_some();
+    if let Some(told) = told {
+        if key_removed {
+            told.propagate(db, [key]);
+        } else {
+            told.propagate_fields(db, key, fields.iter().map(String::as_str));
+        }
+    }
+    if let Some(hub) = crate::keyspace_events::hub_for(store) {
+        use crate::keyspace_events::{KS_GENERIC, KS_HASH, notify, notify_subkeys};
+        notify(&hub, db, KS_HASH, "hexpired", key);
+        notify_subkeys(
+            &hub,
+            db,
+            "hexpired",
+            key,
+            fields.iter().map(|f| f.as_bytes()),
+        );
+        if key_removed {
+            notify(&hub, db, KS_GENERIC, "del", key);
+        }
+    }
+    // The indexes under the key's order, as a command's write: out of it a
+    // write that came between could be written over with what this read.
+    if key_removed {
+        crate::vector::maybe_unindex(index_store, db, key);
+        if marks {
+            crate::vector::unmark_leaving(id, db, key);
+        }
+    } else {
+        crate::vector::reindex_key(index_store, store, db, key, crate::vector::Write::Refresh);
+    }
+    // Freed outside the shard's lock.
+    drop(taken);
+    let expired = Expired {
+        fields: fields.len(),
+        key_removed,
+    };
+    (expired, if key_removed { None } else { next })
+}
+
+/// What follows a removal once the key's order is let go of: clients
+/// watching or caching the key told, and the fields counted.
+fn after_expiry(store: &Store, db: usize, key: &[u8], expired: &Expired) {
+    if expired.fields == 0 {
+        return;
+    }
+    let id = store_id(store);
+    crate::watch::expired_in(id, db, key);
+    crate::tracking::expired_in(id, key);
+    for _ in 0..expired.fields {
+        crate::stats::record_expired_subkey();
+    }
+}
+
 /// Expire the fields that are due, in every hash of `store` that is being
 /// watched.
 pub fn sweep(store: &Store, index_store: &IndexStore) {
@@ -192,112 +365,112 @@ pub fn sweep(store: &Store, index_store: &IndexStore) {
     if due.is_empty() {
         return;
     }
-    let hub = crate::keyspace_events::hub_for(store);
+    let target = crate::expiry::of(store);
+    if target
+        .as_ref()
+        .is_some_and(crate::expiry::Target::on_replica_fields)
+    {
+        settle_on_replica(store, id, due, now);
+        return;
+    }
+    let told = target.as_ref().filter(|target| target.observed());
 
     for (db, key) in due {
-        // What is to become of the watch: `Some(at)` to keep it, for the
-        // next field that is due; `None` to drop it.
-        let mut next: Option<Instant> = None;
-        let mut expired: Vec<String> = Vec::new();
-        let mut emptied = false;
-        // Ordered against the writes to the key, as a command is (#271): an
-        // `HSET` holds the hash between finding it and writing to it, and a
-        // hash this emptied and removed in between took that field with it.
+        // In the order a command takes them: the command gate, the write
+        // gate, the key's tag, the key's order (see `helpers::expire_batch`).
         let command = crate::command_gate::enter();
-        let order = crate::write_order::lock_keys(db, std::iter::once(key.as_bytes()));
-        if let Some(db_ref) = store.get(db) {
-            let hash = match crate::store::get_shard(db_ref, &key).read().get(&key) {
-                Some(ValueRef::HashEx(hash)) => Some(std::sync::Arc::clone(hash)),
-                _ => None,
-            };
-            if let Some(hash) = hash {
-                let mut inner = hash.write();
-                expired = inner
-                    .expiries
-                    .iter()
-                    .filter(|(_, at)| **at <= now)
-                    .map(|(field, _)| field.clone())
-                    .collect();
-                for field in &expired {
-                    inner.evict_field(field);
-                }
-                emptied = inner.fields.is_empty();
-                next = inner.expiries.values().min().copied();
-            }
+        let gate = told.map(|_| crate::write_gate::enter());
+        // A key whose tag a script holds is left for the next sweep: waiting
+        // for it, holding the write gate, could wait behind a cut that waits
+        // for this.
+        let tags = if crate::tag_locks::enabled() {
+            crate::tag_locks::try_lock_keys(std::iter::once(key.as_bytes()))
+        } else {
+            None
+        };
+        if tags.as_ref().is_some_and(|tags| tags.left_some()) {
+            continue;
         }
-
-        if emptied {
-            // Nothing is left of it. Checked again under the shard's lock: a
-            // field may have been added since.
-            let removed = {
-                let db_ref = &store[db];
-                let mut map = crate::store::get_shard(db_ref, &key).write();
-                let still_empty = matches!(
-                    map.get(&key),
-                    Some(ValueRef::HashEx(hash)) if hash.read().fields.is_empty()
-                );
-                still_empty && map.remove(&key).is_some()
-            };
-            if removed {
-                crate::vector::maybe_unindex(index_store, db, &key);
-                next = None;
-            }
-            emptied = removed;
+        let ordered = told.map(|_| crate::expiry::order(db, std::iter::once(key.as_bytes())));
+        let unobserved = crate::commands::helpers::unobserved_order(
+            told.is_none(),
+            db,
+            std::iter::once(key.as_bytes()),
+        );
+        if crate::expiry::loading() || (ordered.is_some() && crate::pause::expiry_deferred()) {
+            continue;
         }
-        // Fields went: the indexes that cover the hash are brought up to
-        // date with what it holds now. Also when none was found here to
-        // expire: a read that came first dropped them (and left the indexes
-        // as they were), and once the watch is dropped below, queries stop
-        // trying this document themselves (see `watched_keys`). Under the
-        // key's write order, as a command brings the indexes up to date with
-        // its write. Out of it, an `HSET` that ran between this reading the
-        // hash and writing its postings was written over with what this had
-        // read, and the hash, no longer watched, was not tried again (#364).
-        if !emptied {
+        let (expired, next) = expire_ordered(store, index_store, db, &key, now, told);
+        // Nothing found to expire: a reindex all the same, under the order,
+        // as the watch is settled below and queries stop trying the hash
+        // themselves (see `watched_keys`).
+        if expired.fields == 0 {
             crate::vector::reindex_key(index_store, store, db, &key, crate::vector::Write::Refresh);
         }
-        // The watch too, as a command that gives a field a time to live
-        // tracks the hash under the order. Out of it, an `HPEXPIRE` that ran
-        // meanwhile tracked its field onto this watch, which was then
-        // dropped: the field was never swept, and queries trusted the
-        // postings for the hash from then on (#364).
         #[cfg(test)]
         crate::test_hooks::at("sweep: watch");
+        // Under the order too: an `HPEXPIRE` beside this tracks its field
+        // onto the watch, which must not then be dropped.
         settle_watch(id, db, &key, next, now);
-        drop(order);
+        drop(unobserved);
+        drop(ordered);
+        drop(tags);
+        drop(gate);
         drop(command);
+        after_expiry(store, db, &key, &expired);
+    }
+}
 
-        if let Some(hub) = &hub {
-            if !expired.is_empty() {
-                crate::keyspace_events::notify(
-                    hub,
-                    db,
-                    crate::keyspace_events::KS_HASH,
-                    "hexpired",
-                    &key,
-                );
-                crate::keyspace_events::notify_subkeys(
-                    hub,
-                    db,
-                    "hexpired",
-                    &key,
-                    expired.iter().map(|f| f.as_bytes()),
-                );
+/// A replica that waits for its master's `HDEL`s: the watch of each hash in
+/// `due` kept while it has a deadline, looked at again a second from now
+/// when that is past; dropped once it has none. Nothing is removed.
+fn settle_on_replica(store: &Store, id: usize, due: Vec<(usize, crate::store::Key)>, now: Instant) {
+    let again = now + std::time::Duration::from_secs(1);
+    for (db, key) in due {
+        let next = store.get(db).and_then(|db_ref| {
+            match crate::store::get_shard(db_ref, &key).read().get(&key) {
+                Some(ValueRef::HashEx(hash)) => hash.read().expiries.values().min().copied(),
+                _ => None,
             }
-            if emptied {
-                crate::keyspace_events::notify(
-                    hub,
-                    db,
-                    crate::keyspace_events::KS_GENERIC,
-                    "del",
-                    &key,
-                );
+        });
+        settle_watch(id, db, &key, next.map(|at| at.max(again)), now);
+    }
+}
+
+/// Remove, telling no one, the hash fields of `store` whose deadline was
+/// before `before` (milliseconds since the Unix epoch); returns how many.
+/// What a replica does at a partial resync with a master that sends the
+/// deletion of every field it expires, for the fields none will send one
+/// of (`ReplState::field_expiry_sweep_owed`).
+pub fn expire_fields_due_before(store: &Store, index_store: &IndexStore, before: u64) -> usize {
+    let ago = crate::commands::helpers::now_ms().saturating_sub(before);
+    let Some(cutoff) = Instant::now().checked_sub(std::time::Duration::from_millis(ago)) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for (db, db_ref) in store.iter().enumerate() {
+        for shard in db_ref.iter() {
+            let keys: Vec<crate::store::Key> = shard
+                .read()
+                .iter()
+                .filter_map(|(key, value)| match value {
+                    ValueRef::HashEx(hash) if hash.read().has_due(cutoff) => {
+                        Some(crate::store::Key::new(key))
+                    }
+                    _ => None,
+                })
+                .collect();
+            for key in keys {
+                let _command = crate::command_gate::enter();
+                let _order = crate::write_order::lock_keys(db, std::iter::once(key.as_bytes()));
+                let (expired, _) = expire_ordered(store, index_store, db, &key, cutoff, None);
+                removed += expired.fields;
+                drop(_order);
+                after_expiry(store, db, &key, &expired);
             }
-        }
-        for _ in &expired {
-            crate::stats::record_expired_subkey();
         }
     }
+    removed
 }
 
 /// What the sweep of `key`, which began at `now`, leaves of its watch: kept
@@ -828,5 +1001,698 @@ mod tests {
         forget_watches(store_id(&store));
         rescan(&store);
         assert_eq!(watched_in(&store), 1);
+    }
+}
+
+/// What a master tells for a hash field that goes for its deadline, and
+/// where; what a replica, or a thread with fields held, does with one.
+/// Commands run as a client runs them, their stream read off the hub.
+#[cfg(test)]
+mod propagation_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    use tokio::sync::mpsc;
+
+    use crate::replication::replica_client::{ReplicationApplyEnv, run_as_client};
+    use crate::replication::{HubMsg, HubTx, ReplState};
+    use crate::store::{self, Store, ValueRef};
+    use crate::vector::IndexStore;
+
+    struct Master {
+        store: Store,
+        repl: Arc<ReplState>,
+        index: IndexStore,
+        hub_tx: HubTx,
+        rx: mpsc::UnboundedReceiver<HubMsg>,
+        env: ReplicationApplyEnv,
+        _own: super::OwnWatches,
+    }
+
+    /// A master with a replica's backlog to feed. Its store is never freed:
+    /// a store is found by its address (`expiry::of`), which a freed one
+    /// could hand to another test's.
+    fn master() -> Master {
+        let store = store::new_store(1);
+        std::mem::forget(Arc::clone(&store));
+        let repl = Arc::new(ReplState::new_master());
+        repl.backlog_active.store(true, Ordering::Relaxed);
+        let (hub_tx, rx) = mpsc::unbounded_channel();
+        crate::expiry::register(&store, &repl, &hub_tx);
+        let index = crate::vector::new_index_store();
+        let own = super::OwnWatches::of(&store);
+        Master {
+            store,
+            repl,
+            index,
+            hub_tx,
+            rx,
+            env: ReplicationApplyEnv::new_inert(),
+            _own: own,
+        }
+    }
+
+    impl Master {
+        fn run(&self, cmd: &[&str]) -> String {
+            self.run_watched(cmd, &crate::watch::NoopWatchRegistry)
+        }
+
+        fn run_watched(&self, cmd: &[&str], watch: &dyn crate::watch::WatchNotifier) -> String {
+            let cmd: Vec<&[u8]> = cmd.iter().map(|part| part.as_bytes()).collect();
+            self.run_bytes_watched(&cmd, watch)
+        }
+
+        /// [`Master::run`], with arguments that need not be text.
+        fn run_bytes(&self, cmd: &[&[u8]]) -> String {
+            self.run_bytes_watched(cmd, &crate::watch::NoopWatchRegistry)
+        }
+
+        fn run_bytes_watched(
+            &self,
+            cmd: &[&[u8]],
+            watch: &dyn crate::watch::WatchNotifier,
+        ) -> String {
+            let out = run_as_client(
+                &self.env,
+                cmd,
+                &self.store,
+                &self.repl,
+                &self.index,
+                &self.hub_tx,
+                watch,
+            );
+            String::from_utf8_lossy(&out).into_owned()
+        }
+
+        /// The commands sent so far, `SELECT`s left out.
+        fn sent(&mut self) -> Vec<Vec<String>> {
+            let mut bytes = Vec::new();
+            while let Ok(msg) = self.rx.try_recv() {
+                if let HubMsg::Propagate(payload) = msg {
+                    bytes.extend_from_slice(&payload);
+                }
+            }
+            commands_in(&bytes)
+                .into_iter()
+                .filter(|c| !c[0].eq_ignore_ascii_case("SELECT"))
+                .collect()
+        }
+
+        /// `field` of `key` made due, its deadline gone by a moment ago.
+        fn due(&self, key: &str, field: &str) {
+            self.deadline(key, field, Instant::now() - Duration::from_millis(5));
+        }
+
+        fn deadline(&self, key: &str, field: &str, at: Instant) {
+            let hash = match store::get_shard(&self.store[0], key).read().get(key) {
+                Some(ValueRef::HashEx(hash)) => Arc::clone(hash),
+                _ => panic!("{key} has no field TTLs"),
+            };
+            hash.write().expiries.insert(field.to_string(), at);
+            super::track_key(&self.store, 0, key);
+        }
+
+        /// What `key` physically holds, past deadlines included.
+        fn held(&self, key: &str) -> Option<Vec<(String, String)>> {
+            let shard = store::get_shard(&self.store[0], key);
+            let map = shard.read();
+            let fields: Vec<(String, String)> = match map.get(key)? {
+                ValueRef::HashEx(hash) => hash
+                    .read()
+                    .fields
+                    .iter()
+                    .map(|(f, v)| (f.clone(), String::from_utf8_lossy(v).into_owned()))
+                    .collect(),
+                ValueRef::Hash(hash) => hash
+                    .read()
+                    .iter()
+                    .map(|(f, v)| (f.clone(), String::from_utf8_lossy(v).into_owned()))
+                    .collect(),
+                _ => return Some(Vec::new()),
+            };
+            let mut fields = fields;
+            fields.sort();
+            Some(fields)
+        }
+
+        /// `key` = { f: 5, keep: 1 } with `f` due.
+        fn with_due_field(&mut self, key: &str) {
+            self.run(&["HSET", key, "f", "5", "keep", "1"]);
+            self.run(&["HPEXPIRE", key, "60000", "FIELDS", "1", "f"]);
+            self.due(key, "f");
+            self.sent();
+        }
+
+        /// `key` = { f: 5 } with `f`, its only field, due.
+        fn with_only_field_due(&mut self, key: &str) {
+            self.run(&["HSET", key, "f", "5"]);
+            self.run(&["HPEXPIRE", key, "60000", "FIELDS", "1", "f"]);
+            self.due(key, "f");
+            self.sent();
+        }
+    }
+
+    /// The commands of a RESP stream of arrays of bulk strings.
+    fn commands_in(mut bytes: &[u8]) -> Vec<Vec<String>> {
+        fn line(bytes: &mut &[u8]) -> String {
+            let end = bytes.windows(2).position(|w| w == b"\r\n").unwrap();
+            let text = String::from_utf8_lossy(&bytes[..end]).into_owned();
+            *bytes = &bytes[end + 2..];
+            text
+        }
+        let mut out = Vec::new();
+        while !bytes.is_empty() {
+            let head = line(&mut bytes);
+            let n: usize = head[1..].parse().unwrap();
+            let mut parts = Vec::with_capacity(n);
+            for _ in 0..n {
+                let len: usize = line(&mut bytes)[1..].parse().unwrap();
+                parts.push(String::from_utf8_lossy(&bytes[..len]).into_owned());
+                bytes = &bytes[len + 2..];
+            }
+            out.push(parts);
+        }
+        out
+    }
+
+    fn cmd(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|p| p.to_string()).collect()
+    }
+
+    fn deletion(key: &str) -> [Vec<String>; 2] {
+        [cmd(&["UNLINK", key]), cmd(&["DEL", key])]
+    }
+
+    #[test]
+    fn an_increment_of_a_due_field_follows_its_deletion() {
+        let mut m = master();
+        m.with_due_field("h");
+        assert_eq!(m.run(&["HINCRBY", "h", "f", "1"]), ":1\r\n");
+        assert_eq!(
+            m.sent(),
+            [cmd(&["HDEL", "h", "f"]), cmd(&["HINCRBY", "h", "f", "1"])]
+        );
+        m.with_due_field("x");
+        assert_eq!(m.run(&["HINCRBYFLOAT", "x", "f", "1.5"]), "$3\r\n1.5\r\n");
+        let sent = m.sent();
+        assert_eq!(sent[0], cmd(&["HDEL", "x", "f"]));
+        assert_eq!(sent.len(), 2, "{sent:?}");
+    }
+
+    /// A field past its deadline is no field to `HSETNX`, as in Redis.
+    #[test]
+    fn hsetnx_sets_a_due_field_after_its_deletion() {
+        let mut m = master();
+        m.with_due_field("h");
+        assert_eq!(m.run(&["HSETNX", "h", "f", "new"]), ":1\r\n");
+        assert_eq!(
+            m.sent(),
+            [cmd(&["HDEL", "h", "f"]), cmd(&["HSETNX", "h", "f", "new"])]
+        );
+        // Live now: refused, with nothing expired before it.
+        assert_eq!(m.run(&["HSETNX", "h", "f", "again"]), ":0\r\n");
+        assert!(!m.sent().iter().any(|c| c[0] == "HDEL"));
+    }
+
+    /// `XX` and `GT` are weighed here: the replica gets what was decided.
+    #[test]
+    fn a_conditional_field_expire_is_sent_as_its_effect() {
+        let mut m = master();
+        m.with_due_field("h");
+        assert_eq!(
+            m.run(&["HPEXPIRE", "h", "100000", "XX", "FIELDS", "1", "f"]),
+            "*1\r\n:-2\r\n"
+        );
+        assert_eq!(m.sent(), [cmd(&["HDEL", "h", "f"])]);
+
+        m.run(&["HPEXPIRE", "h", "100000", "FIELDS", "1", "keep"]);
+        let sent = m.sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0][0], "HPEXPIREAT");
+        assert_eq!(&sent[0][3..], ["FIELDS", "1", "keep"]);
+        // A condition that does not hold: nothing.
+        assert_eq!(
+            m.run(&["HPEXPIRE", "h", "1000", "GT", "FIELDS", "1", "keep"]),
+            "*1\r\n:0\r\n"
+        );
+        assert!(m.sent().is_empty());
+        // One that holds: the deadline alone, no `GT`.
+        assert_eq!(
+            m.run(&[
+                "HPEXPIRE", "h", "900000", "GT", "FIELDS", "2", "keep", "nope"
+            ]),
+            "*2\r\n:1\r\n:-2\r\n"
+        );
+        let sent = m.sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0][0], "HPEXPIREAT");
+        assert_eq!(&sent[0][3..], ["FIELDS", "1", "keep"]);
+        // A moment past deletes: an `HDEL`.
+        assert_eq!(
+            m.run(&["HPEXPIREAT", "h", "1", "FIELDS", "1", "keep"]),
+            "*1\r\n:2\r\n"
+        );
+        assert_eq!(m.sent(), [cmd(&["HDEL", "h", "keep"])]);
+        // On no field at all: nothing.
+        assert_eq!(
+            m.run(&["HPEXPIRE", "nokey", "1000", "FIELDS", "1", "f"]),
+            "*1\r\n:-2\r\n"
+        );
+        assert!(m.sent().is_empty());
+    }
+
+    #[test]
+    fn hpersist_is_sent_as_the_ttls_it_took_away() {
+        let mut m = master();
+        m.run(&["HSET", "h", "plain", "1", "ttl", "2"]);
+        m.run(&["HPEXPIRE", "h", "100000", "FIELDS", "1", "ttl"]);
+        m.with_due_field("h");
+        assert_eq!(
+            m.run(&["HPERSIST", "h", "FIELDS", "4", "f", "plain", "ttl", "nope"]),
+            "*4\r\n:-2\r\n:-1\r\n:1\r\n:-2\r\n"
+        );
+        assert_eq!(
+            m.sent(),
+            [
+                cmd(&["HDEL", "h", "f"]),
+                cmd(&["HPERSIST", "h", "FIELDS", "1", "ttl"])
+            ]
+        );
+        // Nothing to take away: nothing sent.
+        m.run(&["HPERSIST", "h", "FIELDS", "1", "plain"]);
+        assert!(m.sent().is_empty());
+    }
+
+    #[test]
+    fn hgetex_and_hsetex_are_sent_as_their_effects() {
+        let mut m = master();
+        m.run(&["HSET", "h", "a", "1", "b", "2"]);
+        m.sent();
+        // A read: nothing.
+        m.run(&["HGETEX", "h", "FIELDS", "1", "a"]);
+        assert!(m.sent().is_empty());
+        m.run(&["HGETEX", "h", "PX", "100000", "FIELDS", "2", "a", "nope"]);
+        let sent = m.sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0][0], "HPEXPIREAT");
+        assert_eq!(&sent[0][3..], ["FIELDS", "1", "a"]);
+        m.run(&["HGETEX", "h", "PERSIST", "FIELDS", "2", "a", "b"]);
+        assert_eq!(m.sent(), [cmd(&["HPERSIST", "h", "FIELDS", "1", "a"])]);
+        m.run(&["HGETEX", "h", "PXAT", "1", "FIELDS", "1", "b"]);
+        assert_eq!(m.sent(), [cmd(&["HDEL", "h", "b"])]);
+
+        // A refused `HSETEX`: nothing; a done one without its `FNX`.
+        assert_eq!(
+            m.run(&["HSETEX", "h", "FNX", "PX", "5000", "FIELDS", "1", "a", "x"]),
+            ":0\r\n"
+        );
+        assert!(m.sent().is_empty());
+        m.run(&["HSETEX", "h", "FXX", "PX", "5000", "FIELDS", "1", "a", "x"]);
+        let sent = m.sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0][..3], ["HSETEX", "h", "PXAT"]);
+        assert_eq!(&sent[0][4..], ["FIELDS", "1", "a", "x"]);
+        m.run(&["HSETEX", "h", "PXAT", "1", "FIELDS", "1", "a", "y"]);
+        assert_eq!(m.sent(), [cmd(&["HDEL", "h", "a"])]);
+    }
+
+    /// The last field due: the hash goes, its deletion sent, and the write
+    /// after it makes a new one.
+    #[test]
+    fn a_hash_emptied_by_its_deadlines_is_deleted_before_the_write_that_remakes_it() {
+        let mut m = master();
+        m.with_only_field_due("h");
+        assert_eq!(m.run(&["HINCRBY", "h", "f", "1"]), ":1\r\n");
+        let sent = m.sent();
+        assert!(deletion("h").contains(&sent[0]), "{sent:?}");
+        assert_eq!(sent[1], cmd(&["HINCRBY", "h", "f", "1"]));
+        assert!(matches!(
+            store::get_shard(&m.store[0], "h").read().get("h"),
+            Some(ValueRef::Hash(_))
+        ));
+
+        // Another type after it: once a read has found the hash empty.
+        m.with_only_field_due("t");
+        assert_eq!(m.run(&["HGET", "t", "f"]), "$-1\r\n");
+        assert_eq!(m.run(&["LPUSH", "t", "x"]), ":1\r\n");
+        let sent = m.sent();
+        assert!(deletion("t").contains(&sent[0]), "{sent:?}");
+        assert_eq!(sent[1], cmd(&["LPUSH", "t", "x"]));
+    }
+
+    #[test]
+    fn a_read_deletes_a_due_field_once_and_the_sweep_finds_nothing_more() {
+        let mut m = master();
+        m.with_due_field("h");
+        assert_eq!(m.run(&["HGET", "h", "f"]), "$-1\r\n");
+        assert_eq!(m.run(&["HLEN", "h"]), ":1\r\n");
+        super::sweep(&m.store, &m.index);
+        assert_eq!(m.sent(), [cmd(&["HDEL", "h", "f"])]);
+        assert_eq!(m.held("h").unwrap(), [("keep".into(), "1".into())]);
+    }
+
+    #[test]
+    fn the_sweep_sends_an_hdel_or_the_deletion_of_an_emptied_hash() {
+        let mut m = master();
+        m.with_due_field("some");
+        m.with_only_field_due("all");
+        super::sweep(&m.store, &m.index);
+        let sent = m.sent();
+        assert!(sent.contains(&cmd(&["HDEL", "some", "f"])), "{sent:?}");
+        assert!(deletion("all").iter().any(|d| sent.contains(d)), "{sent:?}");
+        assert_eq!(sent.len(), 2);
+        assert_eq!(m.held("all"), None);
+        super::sweep(&m.store, &m.index);
+        assert!(m.sent().is_empty());
+    }
+
+    /// Loading, replaying or applying a master's stream: a due field is
+    /// there, and is written to as the master wrote to it.
+    #[test]
+    fn with_fields_held_a_due_field_is_neither_removed_nor_sent() {
+        let mut m = master();
+        m.with_due_field("h");
+        {
+            let _hold = crate::expiry::hold_of(false, true);
+            assert_eq!(m.run(&["HGET", "h", "f"]), "$1\r\n5\r\n");
+            assert_eq!(m.run(&["HINCRBY", "h", "f", "1"]), ":6\r\n");
+            assert_eq!(
+                m.run(&["HPERSIST", "h", "FIELDS", "1", "f"]),
+                "*1\r\n:1\r\n"
+            );
+        }
+        let sent = m.sent();
+        assert!(!sent.iter().any(|c| c[0] == "HDEL"), "{sent:?}");
+        assert_eq!(
+            m.held("h").unwrap(),
+            [("f".into(), "6".into()), ("keep".into(), "1".into())]
+        );
+        // Its time to live was taken away under the hold: live now.
+        assert_eq!(m.run(&["HGET", "h", "f"]), "$1\r\n6\r\n");
+    }
+
+    /// A Valkey 9 `DUMP` payload (`RDB_TYPE_HASH_2`, RDB version 80, its
+    /// checksum left out as Valkey's `RESTORE` allows): `h` = { f: 5, keep: 1 },
+    /// `f` due at `f_at` (Unix milliseconds).
+    fn valkey_hash_dump(f_at: u64) -> Vec<u8> {
+        let mut out = vec![22u8, 2];
+        for (field, value, at) in [(&b"f"[..], &b"5"[..], f_at as i64), (b"keep", b"1", -1)] {
+            out.push(field.len() as u8);
+            out.extend_from_slice(field);
+            out.push(value.len() as u8);
+            out.extend_from_slice(value);
+            out.extend_from_slice(&at.to_le_bytes());
+        }
+        out.extend_from_slice(&80u16.to_le_bytes());
+        out.extend_from_slice(&[0; 8]);
+        out
+    }
+
+    /// A `RESTORE` of a Valkey 9 payload whose field was live on the master
+    /// and is past its deadline by the time a lagging replica applies it,
+    /// followed by the master's `HPERSIST` and `HINCRBY` of that field: the
+    /// replica keeps the field as the master did, and ends with what the
+    /// master has. The payload's field used to be dropped by the replica's
+    /// clock on the way in, and the field the master kept for good was gone
+    /// for good on the replica (#415).
+    #[test]
+    fn a_restored_valkey_field_past_its_deadline_is_kept_for_the_writes_after_it() {
+        let m = master();
+        let at = crate::commands::helpers::now_ms() - 50;
+        let payload = valkey_hash_dump(at);
+        {
+            let _hold = crate::expiry::hold_of(true, true);
+            assert_eq!(m.run_bytes(&[b"RESTORE", b"h", b"0", &payload]), "+OK\r\n");
+            assert_eq!(m.held("h").unwrap().len(), 2, "f is kept");
+            assert_eq!(m.run(&["HINCRBY", "h", "f", "1"]), ":6\r\n");
+            assert_eq!(
+                m.run(&["HPERSIST", "h", "FIELDS", "1", "f"]),
+                "*1\r\n:1\r\n"
+            );
+        }
+        assert_eq!(m.run(&["HGET", "h", "f"]), "$1\r\n6\r\n");
+    }
+
+    /// The same payload restored on a master, past its deadline: the field
+    /// is kept and goes by field expiry, its `HDEL` sent, as a Redis
+    /// payload's does; not dropped unsaid by the restore itself.
+    #[test]
+    fn a_restored_valkey_field_past_its_deadline_goes_with_its_hdel_on_a_master() {
+        let mut m = master();
+        let at = crate::commands::helpers::now_ms() - 50;
+        assert_eq!(
+            m.run_bytes(&[b"RESTORE", b"h", b"0", &valkey_hash_dump(at)]),
+            "+OK\r\n"
+        );
+        assert_eq!(m.run(&["HGET", "h", "f"]), "$-1\r\n");
+        assert_eq!(m.held("h").unwrap(), [("keep".into(), "1".into())]);
+        let sent = m.sent();
+        assert!(sent.contains(&cmd(&["HDEL", "h", "f"])), "{sent:?}");
+    }
+
+    /// A deadline that passed while the master's write was on its way is
+    /// set, not taken as one that deletes the field.
+    #[test]
+    fn a_deadline_that_passed_in_transit_is_set_where_fields_are_held() {
+        let m = master();
+        m.run(&["HSET", "h", "f", "5"]);
+        let past = (crate::commands::helpers::now_ms() - 50).to_string();
+        {
+            let _hold = crate::expiry::hold_of(true, true);
+            assert_eq!(
+                m.run(&["HPEXPIREAT", "h", &past, "FIELDS", "1", "f"]),
+                "*1\r\n:1\r\n"
+            );
+            assert_eq!(
+                m.run(&["HSETEX", "h", "PXAT", &past, "FIELDS", "1", "g", "1"]),
+                ":1\r\n"
+            );
+            assert_eq!(
+                m.run(&["HGETEX", "h", "PXAT", &past, "FIELDS", "1", "f"]),
+                "*1\r\n$1\r\n5\r\n"
+            );
+        }
+        assert_eq!(
+            m.held("h").unwrap(),
+            [("f".into(), "5".into()), ("g".into(), "1".into())]
+        );
+    }
+
+    /// A replica of a master that sends `HDEL`s hides a due field and
+    /// leaves it; one of a master that sends none removes it itself.
+    #[test]
+    fn a_replica_hides_or_removes_as_its_master_sends_deletions_or_not() {
+        let mut m = master();
+        m.with_due_field("h");
+        m.repl.become_slave();
+        m.repl
+            .master_propagates_field_expiry
+            .store(true, Ordering::Relaxed);
+        assert_eq!(m.run(&["HGET", "h", "f"]), "$-1\r\n");
+        assert_eq!(m.run(&["HLEN", "h"]), ":1\r\n");
+        assert_eq!(m.run(&["HEXISTS", "h", "f"]), ":0\r\n");
+        assert_eq!(m.run(&["HTTL", "h", "FIELDS", "1", "f"]), "*1\r\n:-2\r\n");
+        assert_eq!(m.run(&["HGETALL", "h"]), "*2\r\n$4\r\nkeep\r\n$1\r\n1\r\n");
+        super::sweep(&m.store, &m.index);
+        assert_eq!(m.held("h").unwrap().len(), 2, "still there");
+        assert!(
+            super::watched_keys(&m.store, 0).contains(&crate::store::Key::from("h")),
+            "still watched"
+        );
+
+        m.repl
+            .master_propagates_field_expiry
+            .store(false, Ordering::Relaxed);
+        assert_eq!(m.run(&["HGET", "h", "f"]), "$-1\r\n");
+        assert_eq!(m.held("h").unwrap(), [("keep".into(), "1".into())]);
+        assert!(m.sent().is_empty(), "a replica sends nothing");
+    }
+
+    /// A large hash on a replica, one field of it due: the point reads
+    /// (`HGET`, `HMGET`, `HEXISTS`, `HSTRLEN`) look at the fields they ask
+    /// for, with no copy of the rest; the due one is hidden, the others
+    /// shown, and nothing is removed. With fields held, the due one is
+    /// shown, as the writes of the stream find it.
+    #[test]
+    fn a_point_read_of_a_large_hash_on_a_replica_hides_only_the_due_field() {
+        let m = master();
+        let mut hset = vec!["HSET".to_string(), "big".to_string()];
+        for i in 0..2_000 {
+            hset.push(format!("f{i}"));
+            hset.push(format!("v{i}"));
+        }
+        let hset: Vec<&str> = hset.iter().map(String::as_str).collect();
+        assert_eq!(m.run(&hset), ":2000\r\n");
+        assert_eq!(
+            m.run(&["HPEXPIRE", "big", "60000", "FIELDS", "2", "f7", "f1500"]),
+            "*2\r\n:1\r\n:1\r\n"
+        );
+        m.due("big", "f7");
+        m.repl.become_slave();
+        m.repl
+            .master_propagates_field_expiry
+            .store(true, Ordering::Relaxed);
+
+        assert_eq!(m.run(&["HGET", "big", "f1500"]), "$5\r\nv1500\r\n");
+        assert_eq!(m.run(&["HGET", "big", "f1999"]), "$5\r\nv1999\r\n");
+        assert_eq!(m.run(&["HGET", "big", "f7"]), "$-1\r\n");
+        assert_eq!(
+            m.run(&["HMGET", "big", "f7", "f8", "nope"]),
+            "*3\r\n$-1\r\n$2\r\nv8\r\n$-1\r\n"
+        );
+        assert_eq!(m.run(&["HEXISTS", "big", "f7"]), ":0\r\n");
+        assert_eq!(m.run(&["HEXISTS", "big", "f8"]), ":1\r\n");
+        assert_eq!(m.run(&["HSTRLEN", "big", "f7"]), ":0\r\n");
+        assert_eq!(m.run(&["HSTRLEN", "big", "f1500"]), ":5\r\n");
+        // The whole-hash reads agree.
+        assert_eq!(m.run(&["HLEN", "big"]), ":1999\r\n");
+        assert_eq!(m.held("big").unwrap().len(), 2_000, "nothing removed");
+        {
+            let _hold = crate::expiry::hold_of(true, true);
+            assert_eq!(m.run(&["HGET", "big", "f7"]), "$2\r\nv7\r\n");
+            assert_eq!(m.run(&["HEXISTS", "big", "f7"]), ":1\r\n");
+        }
+        assert_eq!(m.run(&["HGET", "big", "f7"]), "$-1\r\n");
+    }
+
+    #[test]
+    fn a_watch_of_the_hash_is_broken_by_the_removal() {
+        let mut m = master();
+        let registry: crate::watch::WatchRegistry =
+            Arc::new(crate::watch::WatchRegistryInner::new());
+        crate::watch::register_for(&m.store, &registry);
+        m.with_due_field("h");
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        crate::watch::WatchNotifier::watch(&*registry, 0, b"h", Arc::clone(&flag));
+        m.run(&["HGET", "h", "keep"]);
+        assert!(flag.load(Ordering::SeqCst), "the watch was not broken");
+        crate::watch::WatchNotifier::unwatch_all(&*registry, &[flag]);
+    }
+
+    /// Writers, readers and the sweep at once, near the deadlines: the
+    /// stream, applied in order with fields held, gives what the master
+    /// holds.
+    #[test]
+    fn the_stream_rebuilds_the_master_under_concurrent_writes_and_the_sweep() {
+        let mut m = master();
+        let keys: Vec<String> = (0..16).map(|i| format!("c:{i}")).collect();
+        for key in &keys {
+            m.run(&["HSET", key, "f", "0", "g", "0", "keep", "1"]);
+        }
+        // The writers put off or lift every deadline of `keys`, often before
+        // it comes, so that none may expire at all. `c:due` is none of
+        // theirs: its field expires under them.
+        m.run(&["HSET", "c:due", "f", "0", "keep", "1"]);
+        m.run(&["HPEXPIRE", "c:due", "1", "FIELDS", "1", "f"]);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sweeper = {
+            let (stop, store, index) = (
+                Arc::clone(&stop),
+                Arc::clone(&m.store),
+                Arc::clone(&m.index),
+            );
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    super::sweep(&store, &index);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
+        let writers: Vec<_> = (0..4)
+            .map(|w| {
+                let (store, repl, index, hub_tx) = (
+                    Arc::clone(&m.store),
+                    Arc::clone(&m.repl),
+                    Arc::clone(&m.index),
+                    m.hub_tx.clone(),
+                );
+                let (keys, stop) = (keys.clone(), Arc::clone(&stop));
+                std::thread::spawn(move || {
+                    let env = ReplicationApplyEnv::new_inert();
+                    let noop = crate::watch::NoopWatchRegistry;
+                    let run = |cmd: &[&str]| {
+                        let cmd: Vec<&[u8]> = cmd.iter().map(|part| part.as_bytes()).collect();
+                        run_as_client(&env, &cmd, &store, &repl, &index, &hub_tx, &noop);
+                    };
+                    let mut i = 0usize;
+                    while !stop.load(Ordering::Relaxed) {
+                        let key = &keys[(i * 7 + w) % keys.len()];
+                        let ms = ((i % 5) + 1).to_string();
+                        match i % 6 {
+                            0 => run(&["HPEXPIRE", key, &ms, "FIELDS", "2", "f", "g"]),
+                            1 => run(&["HINCRBY", key, "f", "1"]),
+                            2 => run(&["HSETNX", key, "g", "n"]),
+                            3 => run(&["HPERSIST", key, "FIELDS", "1", "f"]),
+                            4 => run(&["HPEXPIRE", key, "50", "XX", "FIELDS", "1", "g"]),
+                            _ => run(&["HGETALL", key]),
+                        }
+                        i += 1;
+                    }
+                })
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let has_f = |m: &Master| {
+            m.held("c:due")
+                .is_some_and(|h| h.iter().any(|(f, _)| f == "f"))
+        };
+        while has_f(&m) {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the sweep never expired c:due's field"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(600).saturating_sub(started.elapsed()));
+        stop.store(true, Ordering::Relaxed);
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        sweeper.join().unwrap();
+        let stream = m.sent();
+        assert!(stream.iter().any(|c| c[0] == "HDEL"), "nothing expired");
+
+        let replica = store::new_store(1);
+        std::mem::forget(Arc::clone(&replica));
+        let repl = Arc::new(ReplState::new_master());
+        let applier = ReplicationApplyEnv::new_inert();
+        let config = Arc::new(crate::config::Config::default_replica());
+        let dict = crate::vector::new_dict_store();
+        let wait = Arc::new(crate::wait_table::WaitTable::new());
+        let ts = crate::store::new_ts_index();
+        let (compaction_tx, _rx) = crate::vector::new_compaction_channel();
+        let replica_index = crate::vector::new_index_store();
+        let mut db = 0usize;
+        for command in stream {
+            applier
+                .apply_command(
+                    command.into_iter().map(String::into_bytes).collect(),
+                    &replica,
+                    &repl,
+                    &replica_index,
+                    &dict,
+                    &wait,
+                    &ts,
+                    &config,
+                    &compaction_tx,
+                    &mut db,
+                    &crate::watch::NoopWatchRegistry,
+                    "replica:test",
+                )
+                .unwrap();
+        }
+        let replayed = Master {
+            store: replica,
+            repl,
+            index: replica_index,
+            hub_tx: m.hub_tx.clone(),
+            rx: mpsc::unbounded_channel().1,
+            env: ReplicationApplyEnv::new_inert(),
+            _own: super::OwnWatches::of(&store::new_store(1)),
+        };
+        for key in keys.iter().map(String::as_str).chain(["c:due"]) {
+            assert_eq!(m.held(key), replayed.held(key), "{key}");
+        }
     }
 }
