@@ -214,6 +214,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     Valkey, Dragonfly or KeyDB file, a full sync or a `RESTORE` payload is
     loaded with its deadline and expired afterwards, on a master with its
     `HDEL`, rather than dropped as it was read.
+  - *`SORT` by a hash field:* a `SORT` or `SORT … STORE` whose `BY` or
+    `GET` pattern reads a hash field (`h->f`) now runs alone, as a script
+    does, so no other write can fall between its removal of a due field and
+    the `HDEL` it sends. A script held to a hash tag under
+    `lua-parallel-scripts` gets an error for a `SORT` or `SORT_RO` whose
+    `BY` or `GET` pattern can name keys outside its tag, as it already did
+    for `KEYS` and `SCAN`.
 
 - **The `MEMORY USAGE` accuracy tests no longer fail now and then with
   `Connection reset by peer`.** They found a free port for each server with
