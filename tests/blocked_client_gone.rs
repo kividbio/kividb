@@ -696,8 +696,11 @@ fn a_wait_on_one_worker_receives_replica_acknowledgments() {
 }
 
 /// While WAITAOF waits for the disk, another client on its worker must
-/// still receive replies. Hold a checkpoint's old-log sync so no later
-/// write can be reported fsynced until the test releases it.
+/// still receive replies. Hold both syncs of a turn-over's old log, the
+/// checkpoint's and the writer's own, so no later write can be reported
+/// fsynced until the test releases them. Holding the checkpoint's alone did
+/// not hold WAITAOF: the writer synced the old log itself, as it should, and
+/// WAITAOF answered 1 whenever the disk beat the test to its check (#529).
 #[test]
 fn a_waitaof_on_one_worker_does_not_stop_other_clients() {
     for &io in io_models() {
@@ -705,7 +708,7 @@ fn a_waitaof_on_one_worker_does_not_stop_other_clients() {
             io,
             1,
             &["--aof"],
-            &[("KIVIDB_TEST_FAILPOINTS", "turn-over-syncing")],
+            &[("KIVIDB_TEST_FAILPOINTS", "turn-over-syncing,old-log-synced")],
         );
         let mut waiter = server.conn();
         assert_eq!(waiter.cmd(&["SET", "before", "1"]), s("OK"), "{io}");
@@ -731,6 +734,17 @@ fn a_waitaof_on_one_worker_does_not_stop_other_clients() {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
         waiter.send(&["WAITAOF", "1", "0", "0"]);
+        // The writer's sync of the old log, WAITAOF's or the second's: held
+        // there, the writer reports nothing synced.
+        let writer_held = server.dir.join("failpoint.old-log-synced.1");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !writer_held.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "{io}: the writer's sync of the old log was not held"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
 
         // Observe entry into WAITAOF before checking PING: checking it
         // before the waiter runs would miss the starvation. The old yield
@@ -763,6 +777,7 @@ fn a_waitaof_on_one_worker_does_not_stop_other_clients() {
         );
 
         std::fs::remove_file(held).unwrap();
+        std::fs::remove_file(writer_held).unwrap();
         assert_eq!(waiter.read(), V::Arr(vec![V::Int(1), V::Int(0)]), "{io}");
     }
 }

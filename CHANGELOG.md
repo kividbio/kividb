@@ -145,6 +145,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`WAITAOF` no longer reports a write synced while the directory entries
+  of a second log turn-over are not on disk (#529).** When a checkpoint has
+  not yet synced the log it moved aside, the AOF writer syncs that log and
+  the directory itself, and then marks it synced. If a second checkpoint
+  turned the log over while the writer was in that sync, the mark cleared
+  the second turn-over's too: the writer then synced only the new log, and
+  `WAITAOF` could answer 1 for writes in a log whose name, after the
+  renames, was not yet synced. A power failure at that point could lose
+  them. The mark now carries the turn-over's number, and a sync clears only
+  the turn-over it found. It took a slow disk and two checkpoints within
+  one sync to reach. The test that reported #529 is also fixed: it held the
+  checkpoint's sync of the old log and expected `WAITAOF` to wait, but the
+  writer syncs the old log itself, so `WAITAOF` answering 1 there was
+  correct; the test failed whenever the disk was quicker than its check.
+
 - **`appendfsync always` syncs each write to disk before it is
   acknowledged, as in Redis (#513).** It was accepted and did nothing: the
   configuration file warned that it had no effect, `CONFIG SET appendfsync
