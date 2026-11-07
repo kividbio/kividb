@@ -145,6 +145,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`appendfsync always` syncs each write to disk before it is
+  acknowledged, as in Redis (#513).** It was accepted and did nothing: the
+  configuration file warned that it had no effect, `CONFIG SET appendfsync
+  always` replied `OK`, `--appendfsync always` was refused as an unknown
+  option, and the append-only file was synced once a second whatever was
+  asked. A power failure or a kernel crash could lose up to a second of
+  writes their clients had been told were made (a `kill -9` lost none:
+  replies already waited for the write to the file, #147). Under `always` a
+  reply now waits until its write is synced. Connections waiting at the
+  same time share one sync, as they share one write. It costs writes a
+  second, as in Redis; `everysec` stays the default and is unchanged. Under
+  `always`, `aof-ack-after-write no` has no effect, a reply waits for its
+  sync however long the disk takes, and a failed write or sync stops the
+  server rather than acknowledge a write that is not on disk, as Redis
+  does. `appendfsync no` still syncs once a second.
+
 - **The `MEMORY USAGE` accuracy tests no longer fail now and then with
   `Connection reset by peer`.** They found a free port for each server with
   a socket that listened on it. A server another test of the same file was

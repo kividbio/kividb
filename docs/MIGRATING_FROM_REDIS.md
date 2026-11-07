@@ -54,7 +54,7 @@ The ones that behave differently:
 |---|---|
 | `io-threads` | Accepted, no effect: commands run on every core. `--threads` sets the worker count (default: cores − 2). |
 | `save <points>` | Accepted with a warning, no effect. KiviDB doesn't snapshot on a schedule. Use `appendonly yes`, or `BGSAVE`. |
-| `appendfsync` | Only `everysec`. `always` and `no` are accepted with a warning. |
+| `appendfsync` | `always` and `everysec` as in Redis. `no` is taken as `everysec`, with a warning. |
 | `dbfilename`, `appendfilename` | Fixed: `dump.kdb` and `appendonly.aof`. KiviDB reads a Redis `dump.rdb` if there is no `dump.kdb`. |
 | `client-output-buffer-limit` | Not supported: remove it. Pub/Sub subscribers get Redis's default limits. |
 | `loadmodule` | Not supported: remove it. Search (`FT.*`), JSON, time series (`TS.*`) and vector sets are built in. |
@@ -131,7 +131,8 @@ What the RDB reader takes from Redis:
 - **With the AOF on, a write is answered once its record is in the file**,
   as in Redis: a `kill -9` or an OOM kill loses no acknowledged write while
   the disk keeps up, and a power failure loses up to a second, as with
-  Redis's `appendfsync everysec`. A reply waits at most 5 s for its record;
+  Redis's `appendfsync everysec` (none with `appendfsync always`, which
+  syncs each write before its reply). A reply waits at most 5 s for its record;
   if the disk falls further behind than that, replies go out without their
   writes and `aof_acks_before_write` counts them, so size the AOF's disk for
   the write load. Before 1.2 a write was answered once its record was queued,

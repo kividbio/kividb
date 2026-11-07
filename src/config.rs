@@ -94,6 +94,12 @@ pub struct Config {
     #[arg(long, default_value_t = false)]
     pub aof: bool,
 
+    /// When the append-only file is synced to disk: `always`, before the
+    /// reply to each write, as in Redis; `everysec`, once a second. `no` is
+    /// taken as `everysec`.
+    #[arg(long, default_value = "everysec")]
+    pub appendfsync: String,
+
     /// Start a rewritten AOF with a KDB image of the dataset, so recovery loads
     /// the bulk at snapshot speed and replays only what came after it.
     /// Disable to emit the plain command log older builds produce.
@@ -658,6 +664,7 @@ impl Default for Config {
             cluster_slot_migration_handoff_max_lag_bytes: 1024 * 1024,
             cluster_slot_migration_write_pause_timeout: 10_000,
             hll_write_format: "legacy".into(),
+            appendfsync: "everysec".into(),
         }
     }
 }
@@ -781,6 +788,7 @@ impl Config {
             cluster_slot_migration_handoff_max_lag_bytes: 1024 * 1024,
             cluster_slot_migration_write_pause_timeout: 10_000,
             hll_write_format: "legacy".into(),
+            appendfsync: "everysec".into(),
         }
     }
 
@@ -938,6 +946,15 @@ impl Config {
             return Err(format!(
                 "invalid hll-write-format '{}' (expected legacy or redis)",
                 self.hll_write_format
+            ));
+        }
+        if !matches!(
+            self.appendfsync.to_ascii_lowercase().as_str(),
+            "always" | "everysec" | "no"
+        ) {
+            return Err(format!(
+                "invalid appendfsync '{}' (expected always, everysec or no)",
+                self.appendfsync
             ));
         }
 
@@ -1143,6 +1160,7 @@ impl Config {
         out.push_str(&format!("repl-backlog-ttl {}\n", self.repl_backlog_ttl));
         out.push_str(&format!("repl-diskless-load {}\n", self.repl_diskless_load));
         out.push_str(&format!("hll-write-format {}\n", self.hll_write_format));
+        out.push_str(&format!("appendfsync {}\n", self.appendfsync));
         out.push_str(&format!("repl-timeout {}\n", self.repl_timeout));
         out.push_str(&format!("shutdown-timeout {}\n", self.shutdown_timeout));
         out.push_str(&format!("replica-priority {}\n", self.replica_priority));
@@ -1702,13 +1720,26 @@ impl Config {
                     );
                 }
             }
-            "appendfsync" => match one()? {
-                "everysec" => {}
-                "always" | "no" => {
-                    return no_effect("the append-only file is synced once a second");
+            // When the AOF is synced (#513). It used to be read and warned
+            // about, and the file synced once a second whatever it said.
+            "appendfsync" => {
+                let value = one()?.to_ascii_lowercase();
+                if !matches!(value.as_str(), "always" | "everysec" | "no") {
+                    return Err(format!(
+                        "invalid value '{value}' for 'appendfsync': expected always, everysec \
+                         or no"
+                    ));
                 }
-                other => return Err(format!("invalid value '{other}' for 'appendfsync'")),
-            },
+                let no = value == "no";
+                set!(appendfsync, value);
+                if no {
+                    return Ok(Some(
+                        "'appendfsync no' syncs the append-only file once a second, as \
+                         'everysec' does"
+                            .into(),
+                    ));
+                }
+            }
             "save" => {
                 if args.iter().any(|a| !a.is_empty()) {
                     return no_effect(
@@ -2280,13 +2311,25 @@ mod config_file_tests {
 
     #[test]
     fn redis_directives_with_no_effect_are_reported_and_not_fatal() {
-        let (_, warnings) = load("save 900 1\ntcp-keepalive 300\nappendfsync always\n").unwrap();
+        let (_, warnings) = load("save 900 1\ntcp-keepalive 300\nappendfsync no\n").unwrap();
         assert_eq!(warnings.len(), 3, "{warnings:?}");
         assert!(warnings[0].contains("line 1") && warnings[0].contains("'save'"));
         // The values KiviDB already behaves as are not worth a warning.
         let (_, warnings) =
             load("save \"\"\nappendfsync everysec\ndaemonize no\ndbfilename dump.kdb\n").unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// `appendfsync` is read from the file, not warned about and ignored
+    /// (#513).
+    #[test]
+    fn appendfsync_is_read_from_the_file() {
+        let (config, warnings) = load("appendfsync always\n").unwrap();
+        assert_eq!(config.appendfsync, "always");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let (config, _) = load("appendfsync EVERYSEC\n").unwrap();
+        assert_eq!(config.appendfsync, "everysec");
+        assert!(load("appendfsync sometimes\n").is_err());
     }
 
     /// Every option the file can set is asked about by the name clap knows

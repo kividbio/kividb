@@ -817,11 +817,40 @@ pub fn set_ack_after_write(on: bool) {
     ACK_AFTER_WRITE.store(on, Ordering::Relaxed);
 }
 
+/// `appendfsync always`: whether a reply to a write waits for its record to
+/// be synced to disk, not only written to the file (#513). It was accepted,
+/// and the file synced once a second all the same: a power failure could
+/// lose a second of writes their clients had been told were made.
+static FSYNC_ALWAYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_fsync_always(on: bool) {
+    FSYNC_ALWAYS.store(on, Ordering::Relaxed);
+    // Replies already waiting for a sync get it, whatever the setting now.
+    SYNC_WANTED.notify_one();
+}
+
+#[inline]
+fn fsync_always() -> bool {
+    FSYNC_ALWAYS.load(Ordering::Relaxed)
+}
+
+/// Under `appendfsync always`: the barriers whose records are in the file
+/// and wait for it to be synced. Added to with the log locked, and taken
+/// with it locked too, so that what the barriers taken stand for is in the
+/// file then. The writer thread syncs for them ([`sync_for_replies`]).
+static UNSYNCED_BARRIERS: parking_lot::Mutex<Vec<u64>> = parking_lot::const_mutex(Vec::new());
+
+/// Wakes the writer thread to sync for [`UNSYNCED_BARRIERS`].
+static SYNC_WANTED: std::sync::LazyLock<tokio::sync::Notify> =
+    std::sync::LazyLock::new(tokio::sync::Notify::new);
+
 /// Whether a connection's replies may have to wait for the AOF: it is on,
-/// and acknowledges after writing.
+/// and acknowledges after writing — always under `appendfsync always`,
+/// whatever `aof-ack-after-write` says.
 #[inline]
 pub fn acks_wait() -> bool {
-    AOF_ENABLED.load(Ordering::Relaxed) && ACK_AFTER_WRITE.load(Ordering::Relaxed)
+    AOF_ENABLED.load(Ordering::Relaxed)
+        && (ACK_AFTER_WRITE.load(Ordering::Relaxed) || fsync_always())
 }
 
 /// Whether a command may write a record its reply should wait for: a write,
@@ -864,7 +893,24 @@ pub async fn written(tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
     if write_what_is_queued(false).is_none() {
         QUEUED.notify_one();
     }
-    if tokio::time::timeout(ACK_WAIT_LIMIT, wait).await.is_err() {
+    let mut wait = wait;
+    loop {
+        if tokio::time::timeout(ACK_WAIT_LIMIT, &mut wait)
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        // Under `appendfsync always` a reply is never sent ahead of its
+        // write: it waits for as long as the disk takes.
+        if fsync_always() {
+            log_throttled!(
+                10,
+                crate::loglevel::WARN,
+                "AOF: a reply has waited over 5 s for its write to be synced to {AOF_PATH} (appendfsync always): the disk is behind"
+            );
+            continue;
+        }
         BARRIERS.lock().remove(&id);
         AOF_ACKS_BEFORE_WRITE.fetch_add(1, Ordering::Relaxed);
         log_throttled!(
@@ -872,6 +918,7 @@ pub async fn written(tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
             crate::loglevel::WARN,
             "AOF: a reply waited 5 s for its write to reach {AOF_PATH} and was sent without it"
         );
+        return;
     }
 }
 
@@ -1074,6 +1121,9 @@ async fn run_aof_writer(mut flush_rx: tokio::sync::mpsc::Receiver<()>) {
             Some(()) = flush_rx.recv() => {
                 do_fsync();
             }
+            () = SYNC_WANTED.notified() => {
+                sync_for_replies();
+            }
             () = QUEUED.notified() => {
                 let released = write_what_is_queued(true).unwrap_or(false);
                 // Not straight back to waiting. A sender wakes a writer
@@ -1201,7 +1251,18 @@ fn write_queued(
         wrote |= !batch.is_empty();
         write_batch(file, &batch);
         released |= !barriers.is_empty();
-        release_barriers(&mut barriers);
+        // Under `appendfsync always`, the replies the barriers stand for go
+        // out once what is before them is on the disk. The writer thread
+        // syncs, not the connection's: a sync takes milliseconds, and a
+        // connection's thread serves others meanwhile. Every barrier that
+        // comes in while it syncs is answered by the next sync: a group
+        // commit.
+        if fsync_always() && !barriers.is_empty() {
+            UNSYNCED_BARRIERS.lock().append(&mut barriers);
+            SYNC_WANTED.notify_one();
+        } else {
+            release_barriers(&mut barriers);
+        }
         let Some(generation) = mark else {
             if more_queued {
                 if drained < MAX_AOF_PASS_BYTES {
@@ -1542,11 +1603,75 @@ fn write_batch(file: &mut std::fs::File, batch: &[u8]) {
         return;
     }
     if let Err(e) = file.write_all(batch) {
+        // Replies wait for this write and its sync: none can be sent
+        // without it, nor with it lost. Redis exits too.
+        if fsync_always() {
+            log_fatal!(
+                "AOF: write to {AOF_PATH} failed under appendfsync always: {e} — exiting rather than acknowledge writes that are not on disk"
+            );
+            std::process::exit(1);
+        }
         log_throttled!(
             10,
             crate::loglevel::ERROR,
             "AOF: write to {AOF_PATH} failed: {e} — writes are not being made durable; check free disk space and permissions on the data directory"
         );
+    }
+}
+
+/// `appendfsync always`: sync the file for the replies waiting for it, and
+/// then answer them (#513). On a handle of its own, outside the lock:
+/// connections go on writing meanwhile, and what they write is synced next.
+fn sync_for_replies() {
+    let (mut barriers, file) = {
+        let log = LOG.lock();
+        let barriers = std::mem::take(&mut *UNSYNCED_BARRIERS.lock());
+        match log.as_ref() {
+            Some(log) => (barriers, Some(log.file.try_clone())),
+            // The AOF turned off since: nothing to sync.
+            None => (barriers, None),
+        }
+    };
+    if barriers.is_empty() {
+        return;
+    }
+    match file {
+        Some(Ok(file)) => sync_before_reply(&file),
+        Some(Err(e)) => {
+            log_fatal!(
+                "AOF: {AOF_PATH} could not be opened to sync under appendfsync always: {e} — exiting rather than acknowledge writes that may not be on disk"
+            );
+            std::process::exit(1);
+        }
+        None => {}
+    }
+    release_barriers(&mut barriers);
+}
+
+/// `appendfsync always`: sync what has been written, before the replies
+/// that wait for it are sent — and first the old log of a turn-over the
+/// checkpoint has yet to sync, with the directory: the records after a
+/// turn-over must not be on the disk without those before it, nor in a
+/// new log whose name may not be. A sync that fails ends the server, as in
+/// Redis: it can neither reply nor keep the promise.
+fn sync_before_reply(file: &std::fs::File) {
+    failpoint("aof-fsync-before-reply");
+    let synced = (|| {
+        if OLD_LOG_UNSYNCED.load(Ordering::Acquire) {
+            match std::fs::File::open(AOF_PREV_PATH) {
+                Ok(old) => old.sync_data()?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            sync_dir()?;
+        }
+        file.sync_data()
+    })();
+    if let Err(e) = synced {
+        log_fatal!(
+            "AOF: fsync of {AOF_PATH} failed under appendfsync always: {e} — exiting rather than acknowledge writes that may not be on disk"
+        );
+        std::process::exit(1);
     }
 }
 
