@@ -30,7 +30,7 @@ fn reply_resp(ctx: &Ctx) -> u8 {
 // operations. This keeps lock scopes short and avoids holding the shard lock
 // while doing O(n) work (diff/inter/union). The clone is O(n) in the set size,
 // same as the operation itself, so it doesn't change the complexity class.
-fn load_set(ctx: &Ctx, key: &str) -> Option<crate::member_set::MemberSet> {
+fn load_set(ctx: &Ctx, key: &[u8]) -> Option<crate::member_set::MemberSet> {
     if lazy_expire_on_read(ctx.store, *ctx.selected_db, key) {
         return Some(crate::member_set::MemberSet::new());
     }
@@ -55,8 +55,7 @@ fn load_sets(ctx: &Ctx, key_args: &[&[u8]]) -> Result<Vec<Members>, Vec<u8>> {
     key_args
         .iter()
         .map(|key_bytes| {
-            let key = std::str::from_utf8(key_bytes)
-                .map_err(|_| resp_error("ERR must be valid UTF-8"))?;
+            let key: &[u8] = key_bytes;
             load_set(ctx, key).ok_or_else(|| {
                 resp_error("WRONGTYPE Operation against a key holding the wrong kind of value")
             })
@@ -113,7 +112,7 @@ fn set_union(ctx: &Ctx, key_args: &[&[u8]]) -> Result<Vec<Arc<[u8]>>, Vec<u8>> {
 // SDIFFSTORE / SINTERSTORE / SUNIONSTORE which always replace the destination:
 // the value, and with it any TTL the old one had. (An empty result leaves no
 // key at all; the dispatcher removes it — see `settle_written_keys`.)
-fn store_set(ctx: &mut Ctx, dst_key: &str, members: Vec<Arc<[u8]>>) {
+fn store_set(ctx: &mut Ctx, dst_key: &[u8], members: Vec<Arc<[u8]>>) {
     let set: crate::member_set::MemberSet = members.into_iter().collect();
     let db = *ctx.selected_db;
     let db_ref = &ctx.store[db];
@@ -140,10 +139,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // The key and the members as they stand in the command. The key
             // was copied to a string of its own, and every member to a shared
             // copy in a vector, whether or not the set had it already.
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
 
             // The set is written with its shard held: for reading when it is
             // there, which keeps a command that empties it from taking it out
@@ -200,10 +196,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'scard' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
 
             if lazy_expire_on_read(ctx.store, *ctx.selected_db, key) {
                 return Some(resp_integer(0));
@@ -228,10 +221,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'sismember' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             let member = &cmd[2];
 
             let db_ref = &ctx.store[*ctx.selected_db];
@@ -269,10 +259,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'smismember' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
 
             let db_ref = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db_ref, key);
@@ -308,10 +295,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'smembers' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
 
             let db_ref = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db_ref, key);
@@ -354,10 +338,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'srem' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
 
             let db_ref = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db_ref, key);
@@ -398,10 +379,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'spop' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             let count: Option<usize> = match cmd.get(2) {
                 None => None,
                 Some(raw) => match parse_utf8(raw).and_then(|s| s.parse::<i64>().ok()) {
@@ -479,10 +457,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'srandmember' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             let count: Option<i64> = match cmd.get(2) {
                 None => None,
                 Some(raw) => match parse_utf8(raw).and_then(|s| s.parse::<i64>().ok()) {
@@ -552,14 +527,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'smove' command",
                 ));
             }
-            let src_key = match parse_utf8(cmd[1]) {
-                Some(k) => k.to_string(),
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
-            let dst_key = match parse_utf8(cmd[2]) {
-                Some(k) => k.to_string(),
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let src_key: Vec<u8> = cmd[1].to_vec();
+            let dst_key: Vec<u8> = cmd[2].to_vec();
             let member: Arc<[u8]> = Arc::from(cmd[3]);
             let db = *ctx.selected_db;
             let db_ref = &ctx.store[db];
@@ -568,13 +537,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             // Both keys are looked at before either is changed: a
             // destination of another type is an error that moves nothing.
-            let source = match read_lock!(store::get_shard(db_ref, &src_key)).get(src_key.as_str())
-            {
-                None => None,
-                Some(ValueRef::Set(s)) => Some(Arc::clone(s)),
-                Some(_) => return Some(resp_error(WRONGTYPE)),
-            };
-            match read_lock!(store::get_shard(db_ref, &dst_key)).get(dst_key.as_str()) {
+            let source =
+                match read_lock!(store::get_shard(db_ref, &src_key)).get(src_key.as_slice()) {
+                    None => None,
+                    Some(ValueRef::Set(s)) => Some(Arc::clone(s)),
+                    Some(_) => return Some(resp_error(WRONGTYPE)),
+                };
+            match read_lock!(store::get_shard(db_ref, &dst_key)).get(dst_key.as_slice()) {
                 None | Some(ValueRef::Set(_)) => {}
                 Some(_) => return Some(resp_error(WRONGTYPE)),
             }
@@ -594,7 +563,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let added = {
                 let shard = store::get_shard(db_ref, &dst_key);
                 let mut map = write_lock!(shard);
-                match map.get(dst_key.as_str()) {
+                match map.get(dst_key.as_slice()) {
                     Some(ValueRef::Set(s)) => s.write().insert(Arc::clone(&member)),
                     _ => {
                         let mut new_set = crate::member_set::MemberSet::new();
@@ -640,10 +609,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'sdiffstore' command",
                 ));
             }
-            let dst_key = match parse_utf8(cmd[1]) {
-                Some(k) => k.to_string(),
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let dst_key: Vec<u8> = cmd[1].to_vec();
             let result = match set_diff(ctx, &cmd[2..]) {
                 Ok(result) => result,
                 Err(e) => return Some(e),
@@ -679,10 +645,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'sinterstore' command",
                 ));
             }
-            let dst_key = match parse_utf8(cmd[1]) {
-                Some(k) => k.to_string(),
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let dst_key: Vec<u8> = cmd[1].to_vec();
             let result = match set_inter(ctx, &cmd[2..]) {
                 Ok(result) => result,
                 Err(e) => return Some(e),
@@ -761,10 +724,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'sunionstore' command",
                 ));
             }
-            let dst_key = match parse_utf8(cmd[1]) {
-                Some(k) => k.to_string(),
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let dst_key: Vec<u8> = cmd[1].to_vec();
             let result = match set_union(ctx, &cmd[2..]) {
                 Ok(result) => result,
                 Err(e) => return Some(e),
@@ -789,10 +749,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'sscan' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             let (cursor, options) = match crate::commands::helpers::scan_arguments(cmd, 2, &[]) {
                 Ok(parsed) => parsed,
                 Err(e) => return Some(e),

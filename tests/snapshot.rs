@@ -510,14 +510,14 @@ fn kdb_stream_consumer_groups_and_meta() {
             assert_eq!(inner.max_deleted_id, StreamId::new(900, 1));
             assert_eq!(inner.entries_added, 7);
             assert_eq!(inner.max_entries, Some(100));
-            let g = inner.groups.get("g1").expect("group g1 missing");
+            let g = inner.groups.get(&b"g1"[..]).expect("group g1 missing");
             assert_eq!(g.last_id, StreamId::new(1000, 1));
             assert_eq!(g.entries_read, 1);
             assert_eq!(g.pel.len(), 1);
             let pel = g.pel.get(&StreamId::new(1000, 1)).unwrap();
             assert_eq!(pel.consumer, "c1");
             assert_eq!(pel.delivery_count, 2);
-            assert_eq!(g.consumers.get("c1"), Some(&1_700_000_000_100));
+            assert_eq!(g.consumers.get(&b"c1"[..]), Some(&1_700_000_000_100));
         }
         _ => panic!("wrong type"),
     }
@@ -688,14 +688,14 @@ fn kdb_timeseries_many_samples() {
 fn kdb_vectorset_basic() {
     let mut vs = VectorSetInner::new(3);
     vs.entries.insert(
-        "vec_a".to_string(),
+        "vec_a".into(),
         VSetEntry {
             vector: vec![1.0f32, 2.0, 3.0],
             attrs: None,
         },
     );
     vs.entries.insert(
-        "vec_b".to_string(),
+        "vec_b".into(),
         VSetEntry {
             vector: vec![4.0f32, 5.0, 6.0],
             attrs: Some(r#"{"label":"b"}"#.to_string()),
@@ -709,11 +709,11 @@ fn kdb_vectorset_basic() {
             assert_eq!(inner.dim, 3);
             assert_eq!(inner.entries.len(), 2);
 
-            let a = inner.entries.get("vec_a").unwrap();
+            let a = inner.entries.get(&b"vec_a"[..]).unwrap();
             assert_eq!(a.vector, vec![1.0f32, 2.0, 3.0]);
             assert!(a.attrs.is_none());
 
-            let b = inner.entries.get("vec_b").unwrap();
+            let b = inner.entries.get(&b"vec_b"[..]).unwrap();
             assert_eq!(b.vector, vec![4.0f32, 5.0, 6.0]);
             assert_eq!(b.attrs.as_deref().unwrap(), r#"{"label":"b"}"#);
         }
@@ -728,7 +728,7 @@ fn kdb_vectorset_high_dim() {
 
     let mut vs = VectorSetInner::new(dim);
     vs.entries.insert(
-        "embedding".to_string(),
+        "embedding".into(),
         VSetEntry {
             vector: vec.clone(),
             attrs: None,
@@ -740,7 +740,7 @@ fn kdb_vectorset_high_dim() {
         KiviDBValue::VectorSet(vs) => {
             let inner = vs.read();
             assert_eq!(inner.dim, dim);
-            let loaded_vec = &inner.entries["embedding"].vector;
+            let loaded_vec = &inner.entries[&b"embedding"[..]].vector;
             assert_eq!(loaded_vec.len(), dim);
             // f32 bit-exact check
             for (orig, loaded) in vec.iter().zip(loaded_vec.iter()) {
@@ -756,7 +756,7 @@ fn kdb_vectorset_f32_precision() {
     // f32 edge cases
     let mut vs = VectorSetInner::new(4);
     vs.entries.insert(
-        "edge".to_string(),
+        "edge".into(),
         VSetEntry {
             vector: vec![f32::INFINITY, f32::NEG_INFINITY, f32::MIN, f32::MAX],
             attrs: None,
@@ -770,7 +770,7 @@ fn kdb_vectorset_f32_precision() {
     match v {
         KiviDBValue::VectorSet(vs) => {
             let inner = vs.read();
-            let vec = &inner.entries["edge"].vector;
+            let vec = &inner.entries[&b"edge"[..]].vector;
             assert!(vec[0].is_infinite() && vec[0] > 0.0);
             assert!(vec[1].is_infinite() && vec[1] < 0.0);
             assert_eq!(vec[2].to_bits(), f32::MIN.to_bits());
@@ -922,7 +922,7 @@ fn kdb_all_types_together() {
 
     let mut vs = VectorSetInner::new(2);
     vs.entries.insert(
-        "e".to_string(),
+        "e".into(),
         VSetEntry {
             vector: vec![1.0, 2.0],
             attrs: None,
@@ -1691,10 +1691,10 @@ fn an_rdb_file_with_streams_json_and_field_ttls_from_redis_8_10_loads() {
     assert_eq!(st.entries.len(), 2);
     let first = st.entries.keys().next().unwrap();
     assert_eq!((first.ms, first.seq), (1, 1));
-    let group = &st.groups["g"];
+    let group = &st.groups[&b"g"[..]];
     assert_eq!(group.pel.len(), 1);
     assert_eq!(group.pel.values().next().unwrap().consumer, "alice");
-    assert!(group.consumers.contains_key("alice"));
+    assert!(group.consumers.contains_key(&b"alice"[..]));
 
     let KiviDBValue::Stream(st2) = &db["st2"] else {
         panic!("st2 is not a stream");

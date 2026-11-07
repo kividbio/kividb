@@ -1099,7 +1099,7 @@ impl ShardMap {
     /// The value of `key`, made with `make` if there is none.
     pub fn get_or_insert_with(
         &mut self,
-        key: &str,
+        key: &(impl AsRef<[u8]> + ?Sized),
         make: impl FnOnce() -> KiviDBValue,
     ) -> ValueRef<'_> {
         if !self.contains_key(key) {

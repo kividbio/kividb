@@ -610,9 +610,7 @@ pub(super) fn ts_range(ctx: &mut Ctx, reverse: bool) -> Option<Vec<u8>> {
             "ERR wrong number of arguments for TS.RANGE/REVRANGE",
         ));
     }
-    let Ok(key) = std::str::from_utf8(cmd[1]) else {
-        return Some(resp_error("ERR key must be valid UTF-8"));
-    };
+    let key: &[u8] = cmd[1];
 
     let parsed = (|| -> Result<_, Vec<u8>> {
         let from = parse_bound(cmd[2], b"-", "fromTimestamp")?;
@@ -631,13 +629,13 @@ pub(super) fn ts_range(ctx: &mut Ctx, reverse: bool) -> Option<Vec<u8>> {
         Err(e) => return Some(e),
     };
 
-    let series = match series_at(ctx, key.as_bytes()) {
+    let series = match series_at(ctx, key) {
         Ok(Some(series)) => series,
         Ok(None) => return Some(resp_error(NO_KEY)),
         Err(e) => return Some(e),
     };
     let open = if opts.latest {
-        open_bucket(ctx, &series, &crate::key_bytes::text_of(key.as_bytes()))
+        open_bucket(ctx, &series, &crate::key_bytes::text_of(key))
     } else {
         None
     };
@@ -1050,10 +1048,8 @@ pub(super) fn ts_nrange(ctx: &mut Ctx, reverse: bool) -> Option<Vec<u8>> {
     // its own each time it is named.
     let mut series = Vec::with_capacity(numkeys);
     for raw in keys {
-        let Ok(key) = std::str::from_utf8(raw) else {
-            return Some(resp_error("ERR key must be valid UTF-8"));
-        };
-        match series_at(ctx, key.as_bytes()) {
+        let key: &[u8] = raw;
+        match series_at(ctx, key) {
             Ok(Some(s)) => series.push(s),
             Ok(None) => return Some(resp_error(NO_KEY)),
             Err(e) => return Some(e),
@@ -1110,10 +1106,8 @@ pub(super) fn ts_read(ctx: &mut Ctx) -> Option<Vec<u8>> {
     if ctx.cmd.len() < 3 {
         return Some(arity());
     }
-    let Ok(key) = std::str::from_utf8(ctx.cmd[1]) else {
-        return Some(resp_error("ERR key must be valid UTF-8"));
-    };
-    let key = key.to_string();
+    let key: &[u8] = ctx.cmd[1];
+    let key = key.to_vec();
     let cursor_arg = ctx.cmd[2];
 
     let mut block: Option<(u64, usize)> = None;
@@ -1177,7 +1171,7 @@ pub(super) fn ts_read(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // still wakes us.
     let rx = (block.is_some() && !timed_out).then(|| ctx.wait_table.register_signal(&key));
 
-    let series = match series_at(ctx, key.as_bytes()) {
+    let series = match series_at(ctx, key.as_slice()) {
         Ok(series) => series,
         Err(e) => return Some(e),
     };

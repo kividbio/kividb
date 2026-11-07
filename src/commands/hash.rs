@@ -29,10 +29,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
             }
 
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
 
             // Collect (field_name, bytes) pairs from the command args
             // cmd[2], cmd[3] = first pair; cmd[4], cmd[5] = second; ...
@@ -85,10 +82,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'hget' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR key must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             let field = crate::commands::helpers::name_from_bytes(cmd[2]);
             let field: &str = &field;
 
@@ -118,10 +112,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'hgetall' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR key must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
 
             match with_hash_read(ctx, key, |inner| {
                 let eff = effective_resp_for_reply(ctx);
@@ -174,10 +165,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'hmset' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR key must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
 
             let pairs: Vec<(String, Arc<[u8]>)> = cmd[2..]
                 .as_chunks::<2>()
@@ -223,10 +211,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'hmget' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR key must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
 
             // Per-field nils are nested inside the array, so they need the
             // protocol-correct encoding here — `resp3_normalize_null` only
@@ -274,10 +259,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'hdel' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR key must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
 
             match with_hash_write(ctx, key, |fields, mut expiries| {
                 let mut removed: Vec<&[u8]> = Vec::new();
@@ -320,10 +302,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'hexists' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR key must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             let field = crate::commands::helpers::name_from_bytes(cmd[2]);
             let field: &str = &field;
 
@@ -357,10 +336,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'hlen' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR key must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
 
             match with_hash_read(ctx, key, |inner| inner.len() as i64) {
                 None => {
@@ -386,10 +362,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'hkeys' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR key must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
 
             match with_hash_read(ctx, key, |inner| {
                 let mut buf = Vec::with_capacity(16 + inner.len() * 24);
@@ -424,10 +397,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'hvals' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR key must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
 
             match with_hash_read(ctx, key, |inner| {
                 let mut buf = Vec::with_capacity(16 + inner.len() * 24);
@@ -463,10 +433,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'hincrby' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR key must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             let field = crate::commands::helpers::name_from_bytes(cmd[2]).into_owned();
             let incr: i64 = match parse_utf8(cmd[3]).and_then(|s| s.parse().ok()) {
                 Some(n) => n,
@@ -517,10 +484,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'hincrbyfloat' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR key must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             let field = crate::commands::helpers::name_from_bytes(cmd[2]).into_owned();
             let incr: f64 = match parse_utf8(cmd[3]).and_then(|s| s.parse::<f64>().ok()) {
                 Some(n) if n.is_finite() => n,
@@ -569,10 +533,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'hsetnx' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR key must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             let field = crate::commands::helpers::name_from_bytes(cmd[2]).into_owned();
             let val: Arc<[u8]> = Arc::from(cmd[3]);
 
@@ -602,10 +563,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'hrandfield' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR key must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
 
             // `[count [WITHVALUES]]`, read before the key is looked at.
             let count: Option<i64> = match cmd.get(2) {
@@ -735,10 +693,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'hscan' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR key must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             let (cursor, options) =
                 match crate::commands::helpers::scan_arguments(cmd, 2, &["NOVALUES"]) {
                     Ok(parsed) => parsed,
@@ -839,10 +794,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'hexpire' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k.to_string(),
-                None => return Some(resp_error("ERR key must be valid UTF-8")),
-            };
+            let key: Vec<u8> = cmd[1].to_vec();
             let secs: i64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
@@ -880,10 +832,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'hpexpire' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k.to_string(),
-                None => return Some(resp_error("ERR key must be valid UTF-8")),
-            };
+            let key: Vec<u8> = cmd[1].to_vec();
             let ms: i64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
@@ -922,10 +871,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'hexpireat' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k.to_string(),
-                None => return Some(resp_error("ERR key must be valid UTF-8")),
-            };
+            let key: Vec<u8> = cmd[1].to_vec();
             let unix_secs: i64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
@@ -971,10 +917,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'hpexpireat' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k.to_string(),
-                None => return Some(resp_error("ERR key must be valid UTF-8")),
-            };
+            let key: Vec<u8> = cmd[1].to_vec();
             let unix_ms: i64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
@@ -1036,7 +979,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 //   None         — key is absent
 //   Some(Err(e)) — key is the wrong type; e is the RESP error to return
 //   Some(Ok(v))  — closure result
-fn with_hash_read<F, R>(ctx: &Ctx, key: &str, f: F) -> Option<Result<R, Vec<u8>>>
+fn with_hash_read<F, R>(ctx: &Ctx, key: &[u8], f: F) -> Option<Result<R, Vec<u8>>>
 where
     F: FnOnce(&crate::types::HashFields) -> R,
 {
@@ -1070,7 +1013,7 @@ where
 /// Mutable variant: closure gets `&mut crate::types::HashFields` for the
 /// fields map, regardless of the underlying variant. Lazy-evicts expired
 /// fields first if the variant is HashEx.
-fn with_hash_write<F, R>(ctx: &Ctx, key: &str, f: F) -> Option<Result<R, Vec<u8>>>
+fn with_hash_write<F, R>(ctx: &Ctx, key: &[u8], f: F) -> Option<Result<R, Vec<u8>>>
 where
     F: FnOnce(
         &mut crate::types::HashFields,
@@ -1117,7 +1060,7 @@ where
 /// `sweep`: a hash's fields past their time go first.
 fn write_hash<R>(
     ctx: &Ctx,
-    key: &str,
+    key: &[u8],
     sweep: bool,
     mut write: impl FnMut(&mut crate::types::HashFields, Option<&mut AHashMap<String, Instant>>) -> R,
 ) -> Result<R, Vec<u8>> {
@@ -1306,7 +1249,7 @@ fn should_set_field_expiry(current: Option<Instant>, new_exp: Instant, flag: Hfe
 /// translates to immediate deletion + return code 2.
 fn apply_field_expire(
     ctx: &mut Ctx,
-    key: &str,
+    key: &[u8],
     fields: &[String],
     new_exp: Instant,
     flag: HfeFlag,
@@ -1342,7 +1285,7 @@ fn apply_field_expire(
 
 fn apply_field_expire_inner(
     ctx: &mut Ctx,
-    key: &str,
+    key: &[u8],
     fields: &[String],
     new_exp: Instant,
     flag: HfeFlag,
@@ -1569,10 +1512,7 @@ fn run_hfe_read(ctx: &mut Ctx, cmd_name: &str, mode: HfeReadMode) -> Option<Vec<
             cmd_name.to_ascii_lowercase()
         )));
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return Some(resp_error("ERR key must be valid UTF-8")),
-    };
+    let key: Vec<u8> = cmd[1].to_vec();
     let fields = match parse_hfe_read_tail(cmd, 2) {
         Ok(f) => f,
         Err(e) => return Some(e),
@@ -1582,7 +1522,7 @@ fn run_hfe_read(ctx: &mut Ctx, cmd_name: &str, mode: HfeReadMode) -> Option<Vec<
     let shard = store::get_shard(db_ref, &key);
     let map = read_lock!(shard);
 
-    match map.get(key.as_str()) {
+    match map.get(key.as_slice()) {
         None => Some(resp_array(
             fields
                 .iter()
@@ -1637,10 +1577,7 @@ fn run_hpersist(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "ERR wrong number of arguments for 'hpersist' command",
         ));
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return Some(resp_error("ERR key must be valid UTF-8")),
-    };
+    let key: Vec<u8> = cmd[1].to_vec();
     let fields = match parse_hfe_read_tail(cmd, 2) {
         Ok(f) => f,
         Err(e) => return Some(e),
@@ -1650,7 +1587,7 @@ fn run_hpersist(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let shard = store::get_shard(db_ref, &key);
     let map = read_lock!(shard);
 
-    match map.get(key.as_str()) {
+    match map.get(key.as_slice()) {
         None => Some(resp_array(
             fields
                 .iter()
@@ -1714,10 +1651,7 @@ fn run_hgetdel(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "ERR wrong number of arguments for 'hgetdel' command",
         ));
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return Some(resp_error("ERR key must be valid UTF-8")),
-    };
+    let key: Vec<u8> = cmd[1].to_vec();
     let fields = match parse_hfe_read_tail(cmd, 2) {
         Ok(f) => f,
         Err(e) => return Some(e),
@@ -1730,7 +1664,7 @@ fn run_hgetdel(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let shard = store::get_shard(db_ref, &key);
     let map = read_lock!(shard);
 
-    match map.get(key.as_str()) {
+    match map.get(key.as_slice()) {
         None => Some(resp_array(
             fields.iter().map(|_| resp_null_for(resp)).collect(),
         )),
@@ -1822,10 +1756,7 @@ fn run_hgetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "ERR wrong number of arguments for 'hgetex' command",
         ));
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return Some(resp_error("ERR key must be valid UTF-8")),
-    };
+    let key: Vec<u8> = cmd[1].to_vec();
 
     // Parse the optional TTL action that sits between the key and the FIELDS
     // keyword. Possibilities:
@@ -1931,7 +1862,7 @@ fn run_hgetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
     if needs_upgrade {
         // Take write lock on the shard so we can upgrade Hash → HashEx if needed.
         let mut wmap = write_lock!(shard);
-        match wmap.get(key.as_str()) {
+        match wmap.get(key.as_slice()) {
             None => Some(resp_array(
                 fields.iter().map(|_| resp_null_for(resp)).collect(),
             )),
@@ -1972,7 +1903,7 @@ fn run_hgetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
     } else {
         // No-upgrade fast path: read lock + maybe Persist.
         let map = read_lock!(shard);
-        match map.get(key.as_str()) {
+        match map.get(key.as_slice()) {
             None => Some(resp_array(
                 fields.iter().map(|_| resp_null_for(resp)).collect(),
             )),
@@ -2014,7 +1945,7 @@ fn run_hgetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
 /// inline.
 fn hgetex_apply(
     ctx: &Ctx,
-    key: &str,
+    key: &[u8],
     hx: &Arc<parking_lot::RwLock<crate::types::HashInner>>,
     fields: &[String],
     action: HgetexAction,
@@ -2281,10 +2212,7 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "ERR wrong number of arguments for 'hsetex' command",
         ));
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return Some(resp_error("ERR key must be valid UTF-8")),
-    };
+    let key: Vec<u8> = cmd[1].to_vec();
     let integer = |arg: &[u8]| parse_utf8(arg).and_then(|s| s.parse::<i64>().ok());
 
     let mut idx = 2usize;
@@ -2436,7 +2364,7 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let mut map = write_lock!(shard);
 
     // Get or upgrade-or-create a HashEx for this key.
-    let hx = match map.get(key.as_str()) {
+    let hx = match map.get(key.as_slice()) {
         Some(ValueRef::HashEx(h)) => Arc::clone(h),
         Some(ValueRef::Hash(plain)) => {
             // Upgrade in place
@@ -2540,10 +2468,7 @@ fn run_hstrlen(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "ERR wrong number of arguments for 'hstrlen' command",
         ));
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return Some(resp_error("ERR key must be valid UTF-8")),
-    };
+    let key: &[u8] = cmd[1];
     let field = crate::commands::helpers::name_from_bytes(cmd[2]);
     let field: &str = &field;
 

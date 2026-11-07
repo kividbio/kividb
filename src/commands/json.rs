@@ -58,7 +58,7 @@ fn type_name(value: &Value) -> &'static str {
 }
 
 /// Run `f` on the document at `key`. A key that does not exist is `missing`.
-fn read_doc(ctx: &Ctx, key: &str, missing: Vec<u8>, f: impl FnOnce(&Value) -> Vec<u8>) -> Vec<u8> {
+fn read_doc(ctx: &Ctx, key: &[u8], missing: Vec<u8>, f: impl FnOnce(&Value) -> Vec<u8>) -> Vec<u8> {
     let db = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db, key);
     let map = read_lock!(shard);
@@ -72,7 +72,7 @@ fn read_doc(ctx: &Ctx, key: &str, missing: Vec<u8>, f: impl FnOnce(&Value) -> Ve
 /// [`read_doc`] for a command that changes the document.
 fn write_doc(
     ctx: &Ctx,
-    key: &str,
+    key: &[u8],
     missing: Vec<u8>,
     f: impl FnOnce(&mut Value) -> Vec<u8>,
 ) -> Vec<u8> {
@@ -263,7 +263,7 @@ fn set_in(
 /// `JSON.SET` for one key. `Ok(true)` if the value was stored.
 fn set_key(
     ctx: &Ctx,
-    key: &str,
+    key: &[u8],
     query: &Query,
     value: &Value,
     nx: bool,
@@ -301,7 +301,7 @@ fn remove_at(root: &mut Value, location: &Location) -> bool {
 }
 
 /// Delete the whole key: the value, its TTL and whatever indexed it.
-fn delete_document(ctx: &Ctx, key: &str) -> bool {
+fn delete_document(ctx: &Ctx, key: &[u8]) -> bool {
     let removed = delete_key(ctx.store, *ctx.selected_db, key);
     if removed {
         crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
@@ -372,8 +372,9 @@ fn number_command(ctx: &Ctx, resp: u8, op: NumOp, name: &str) -> Vec<u8> {
             name.to_ascii_lowercase()
         ));
     }
-    let (Some(key), Some(path)) = (arg(cmd, 1), arg(cmd, 2)) else {
-        return resp_error("ERR key and path must be valid UTF-8");
+    let key: &[u8] = cmd[1];
+    let Some(path) = arg(cmd, 2) else {
+        return resp_error("ERR path must be valid UTF-8");
     };
     let operand = match arg(cmd, 3).and_then(|text| serde_json::from_str::<Value>(text).ok()) {
         Some(Value::Number(n)) => n,
@@ -503,8 +504,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         ))
     };
     // The key, and the path if there is one (the root if not).
-    let key_and_path = |path_at: usize| -> Result<(&str, Query), Vec<u8>> {
-        let key = arg(cmd, 1).ok_or_else(|| resp_error("ERR key must be valid UTF-8"))?;
+    let key_and_path = |path_at: usize| -> Result<(&[u8], Query), Vec<u8>> {
+        let key: &[u8] = cmd[1];
         let path = match cmd.get(path_at) {
             Some(bytes) => {
                 parse_utf8(bytes).ok_or_else(|| resp_error("ERR path must be valid UTF-8"))?
@@ -574,11 +575,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 return Some(wrong_args());
             }
             // Every argument is checked before any key is touched.
-            let mut writes: Vec<(&str, Query, Value)> = Vec::new();
+            let mut writes: Vec<(&[u8], Query, Value)> = Vec::new();
             for triple in cmd[1..].chunks(3) {
-                let Some(key) = parse_utf8(triple[0]) else {
-                    return Some(resp_error("ERR key must be valid UTF-8"));
-                };
+                let key: &[u8] = triple[0];
                 let query = match parse_utf8(triple[1]).map(parse_path) {
                     Some(Ok(query)) => query,
                     Some(Err(e)) => return Some(e),
@@ -605,9 +604,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if cmd.len() < 2 {
                 return Some(wrong_args());
             }
-            let Some(key) = arg(cmd, 1) else {
-                return Some(resp_error("ERR key must be valid UTF-8"));
-            };
+            let key: &[u8] = cmd[1];
             let mut format = Format::default();
             let mut paths: Vec<(&str, Query)> = Vec::new();
             let mut i = 2;
@@ -690,9 +687,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let replies = cmd[1..cmd.len() - 1]
                 .iter()
                 .map(|key| {
-                    let Some(key) = parse_utf8(key) else {
-                        return resp_null_for(resp);
-                    };
+                    let key: &[u8] = key;
                     let shard = store::get_shard(db, key);
                     let map = read_lock!(shard);
                     let Some(ValueRef::Json(tree)) = map.get(key) else {
@@ -1139,9 +1134,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             "ERR wrong number of arguments for 'json.debug|memory' command",
                         ));
                     }
-                    let Some(key) = arg(cmd, 2) else {
-                        return Some(resp_error("ERR key must be valid UTF-8"));
-                    };
+                    let key: &[u8] = cmd[2];
                     let query = match parse_path(arg(cmd, 3).unwrap_or(".")) {
                         Ok(query) => query,
                         Err(e) => return Some(e),

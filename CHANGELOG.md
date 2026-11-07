@@ -56,10 +56,28 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   told KiviDB apart by `HELLO`'s `server` should look for
   `kividb_version` instead (#451).
 
-- **Keys need not be text everywhere the keyspace is read back (#437).**
-  Keys, like Redis's, are bytes. Most commands still refuse a key that is
-  not UTF-8 until the rest of #437 lands, but such a key can be loaded, and
-  what reads keys back now keeps every byte of them:
+- **Keys are bytes, as in Redis (#437, #446).** Every command takes a key
+  that is not UTF-8. They answered `ERR key must be valid UTF-8`, and some
+  passed such a key over without a word: `EXISTS`, `TOUCH`, `PFCOUNT` and
+  `PFMERGE` of several keys, `BITOP`'s source keys, `SUNIONCARD` and
+  `SDIFFCARD`, `SORT ... STORE`, `BY` and `GET`, the `STORE` and
+  `STOREDIST` options of the geo commands (which then answered as if they
+  had not been given), `XREAD`'s keys, `VREM`, `DEBUG DIGEST-VALUE` and
+  the keyspace events of streams and sorted sets. The replies are Redis
+  8.10's, byte for byte, checked against redis:8 for every command family.
+  - Stream consumer group and consumer names, and vector-set element names
+    (`VADD`, `VREM`, `VSIM ELE`, `VRANGE` bounds and the rest), are any
+    bytes too. `VADD` of such an element answered with an arity error.
+  - `HIMPORT PREPARE` takes field names of any bytes, and keeps them as
+    `HSET` does: it kept them as the text sent, so a name with a character
+    of U+F780..U+F7FF in it read back as other bytes.
+  - `SORT BY` and `GET` patterns are bytes: the first `*` is replaced by
+    the element, as in Redis (it replaced every `*`), and `->field` reads a
+    field with a time to live too. A `GET` of a key holding an empty string
+    gives an empty string, not a nil.
+  - `RESTORE`, and so `MIGRATE` and atomic slot migration, move such a key.
+  - Error replies that name a key or a group (`NOGROUP`) carry its bytes,
+    as Redis's do.
   - `DEL` and `UNLINK` take a key of any bytes. They are what a master
     sends its replicas and its AOF for a key it expires, evicts or migrates
     away; a replica used to skip them for such a key and keep it.
@@ -67,8 +85,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `ZSCAN` match `MATCH` against the bytes. Both sides went through a lossy
     conversion before, so `?` could not match one byte, and two different
     bytes could match each other.
-  - `MIGRATE` answers with an error for such a key, which the destination
-    refuses, and keeps it. It used to skip the key and answer `OK`.
+  - `MIGRATE` moves such a key. It used to skip it and answer `OK`.
   - A Redis or Valkey RDB file (at startup, with `--preload-file`, or as a
     replica's full sync) loads keys as their bytes. Before, they went
     through a lossy conversion, and two keys could become one (#446).
@@ -79,9 +96,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - A snapshot keeps its times to live and function libraries ahead of its
     search-index sections. A reader that cannot read an index section
     (they are read best effort) no longer loses what came after it.
+  - The snapshot format does not change: a file whose keys and names are
+    all text is the file 1.2.0 writes, and hash fields keep the spelling
+    1.2.0 gives them on disk.
   - **Going back to 1.2.0:** 1.2.0 refuses to start on a snapshot that
-    holds a key that is not UTF-8, or the empty key (#441), and says so.
-    A 1.2.0 replica cannot full-sync from a master that has such a key.
+    holds a key, a consumer group or consumer name, or a vector-set element
+    name that is not UTF-8, or the empty key (#441), and says so. A 1.2.0
+    replica cannot full-sync from a master that has one, and drops (with a
+    warning) a replicated write of such a key. A 1.2.0 node refuses such a
+    key in `RESTORE`, so `MIGRATE` to it fails and the source keeps the key.
     Upgrade replicas before their master, as always.
 
 - **Arities come from Valkey's BSD-licensed command data.**

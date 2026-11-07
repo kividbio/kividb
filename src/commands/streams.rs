@@ -42,11 +42,11 @@ fn reply_resp(ctx: &Ctx) -> u8 {
 /// a map. Returning a `Vec` keeps both shapes flowing through the same
 /// `flat_map` at each call site.
 #[inline]
-fn stream_result_items(resp: u8, key: &str, entries: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+fn stream_result_items(resp: u8, key: &[u8], entries: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     if resp >= 3 {
-        vec![resp_bulk_str(key), resp_array(entries)]
+        vec![resp_bulk(key), resp_array(entries)]
     } else {
-        vec![resp_array(vec![resp_bulk_str(key), resp_array(entries)])]
+        vec![resp_array(vec![resp_bulk(key), resp_array(entries)])]
     }
 }
 
@@ -87,11 +87,8 @@ fn announce(ctx: &Ctx, name: &str, reply: &[u8]) {
         "XGROUP" if sub(b"CREATECONSUMER") && some => ("xgroup-createconsumer", 2),
         _ => return,
     };
-    if let Some(key) = ctx
-        .cmd
-        .get(key_at)
-        .and_then(|raw| std::str::from_utf8(raw).ok())
-    {
+    // Any bytes: a key that was not UTF-8 had no event.
+    if let Some(key) = ctx.cmd.get(key_at).copied() {
         notify(ctx.pubsub, *ctx.selected_db, KS_STREAM, event, key);
     }
 }
@@ -148,9 +145,7 @@ fn xidmprecord(ctx: &mut Ctx) -> Vec<u8> {
     if cmd[3].is_empty() {
         return resp_error("ERR idempotent ID must be non-empty");
     }
-    let Some(key) = parse_utf8(cmd[1]) else {
-        return resp_error("ERR key must be valid UTF-8");
-    };
+    let key: &[u8] = cmd[1];
     let (producer, iid) = (cmd[2], cmd[3]);
     let defaults = stream_extra::idmp_defaults(ctx.config);
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
@@ -191,7 +186,7 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn get_or_create_stream(ctx: &mut Ctx, key: &str) -> Result<Arc<RwLock<StreamInner>>, Vec<u8>> {
+fn get_or_create_stream(ctx: &mut Ctx, key: &[u8]) -> Result<Arc<RwLock<StreamInner>>, Vec<u8>> {
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
     let mut map = write_lock!(shard);
@@ -460,10 +455,7 @@ pub fn xadd(ctx: &mut Ctx) -> Vec<u8> {
             return resp_error("ERR wrong number of arguments for 'xadd' command");
         }
 
-        let key = match parse_utf8(cmd[1]) {
-            Some(k) => k.to_string(),
-            None => return resp_error("ERR key must be valid UTF-8"),
-        };
+        let key: Vec<u8> = cmd[1].to_vec();
 
         let XaddOptions {
             id_index,
@@ -580,7 +572,7 @@ pub fn xadd(ctx: &mut Ctx) -> Vec<u8> {
         let db_ref = &ctx.store[*ctx.selected_db];
         let shard = store::get_shard(db_ref, &key);
         let map = read_lock!(shard);
-        if !map.contains_key(key.as_str()) {
+        if !map.contains_key(key.as_slice()) {
             return resp_null_bulk();
         }
     }
@@ -696,10 +688,7 @@ pub fn xlen(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() != 2 {
         return resp_error("ERR wrong number of arguments for 'xlen' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     let gone = lazy_expire_on_read(ctx.store, *ctx.selected_db, key);
 
@@ -722,10 +711,7 @@ pub fn xrange(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 4 {
         return resp_error("ERR wrong number of arguments for 'xrange' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
     let start_str = std::str::from_utf8(cmd[2]).unwrap_or("-");
     let end_str = std::str::from_utf8(cmd[3]).unwrap_or("+");
 
@@ -781,10 +767,7 @@ pub fn xrevrange(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 4 {
         return resp_error("ERR wrong number of arguments for 'xrevrange' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
     let end_str = std::str::from_utf8(cmd[2]).unwrap_or("+");
     let start_str = std::str::from_utf8(cmd[3]).unwrap_or("-");
 
@@ -852,7 +835,7 @@ fn id_before(id: &StreamId) -> StreamId {
 fn read_streams(
     ctx: &Ctx,
     resp: u8,
-    keys: &[&str],
+    keys: &[&[u8]],
     after: &[StreamId],
     count: usize,
     caps: ReadCaps,
@@ -962,10 +945,7 @@ pub fn xread(ctx: &mut Ctx) -> Vec<u8> {
         );
     }
     let half = remaining / 2;
-    let keys: Vec<&str> = cmd[i..i + half]
-        .iter()
-        .map(|b| std::str::from_utf8(b).unwrap_or(""))
-        .collect();
+    let keys: Vec<&[u8]> = cmd[i..i + half].to_vec();
     let ids: Vec<&str> = cmd[i + half..]
         .iter()
         .map(|b| std::str::from_utf8(b).unwrap_or(""))
@@ -1036,11 +1016,11 @@ pub fn xread(ctx: &mut Ctx) -> Vec<u8> {
             // between our first read (which found nothing) and registration.
             let mut registered = ctx.wait_table.stream_wait();
             let rxs: Vec<(
-                String,
+                Vec<u8>,
                 tokio::sync::oneshot::Receiver<crate::wait_table::Value>,
             )> = keys
                 .iter()
-                .map(|k| (k.to_string(), registered.register(k)))
+                .map(|k| (k.to_vec(), registered.register(k)))
                 .collect();
 
             // SECOND CHECK: re-read immediately after registering.
@@ -1085,10 +1065,7 @@ pub fn xdel(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 3 {
         return resp_error("ERR wrong number of arguments for 'xdel' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -1125,10 +1102,7 @@ pub fn xtrim(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 4 {
         return resp_error("ERR wrong number of arguments for 'xtrim' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     let mut i = 3usize;
     // Optional = or ~
@@ -1222,10 +1196,7 @@ pub fn xsetid(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 3 {
         return resp_error("ERR wrong number of arguments for 'xsetid' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = cmd[1].to_vec();
     let id_str = std::str::from_utf8(cmd[2]).unwrap_or("");
     let new_last_id = match StreamId::parse(id_str) {
         Some(id) => id,
@@ -1269,7 +1240,7 @@ pub fn xsetid(ctx: &mut Ctx) -> Vec<u8> {
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, &key);
     let map = read_lock!(shard);
-    let stream = match map.get(key.as_str()) {
+    let stream = match map.get(key.as_slice()) {
         Some(ValueRef::Stream(s)) => s,
         Some(_) => {
             return resp_error("WRONGTYPE Operation against a key holding the wrong kind of value");
@@ -1337,14 +1308,8 @@ pub fn xgroup_create(ctx: &mut Ctx) -> Vec<u8> {
             return resp_error("ERR wrong number of arguments for 'xgroup|create' command");
         }
 
-        let key = match parse_utf8(cmd[2]) {
-            Some(k) => k.to_string(),
-            None => return resp_error("ERR key must be valid UTF-8"),
-        };
-        let group = match parse_utf8(cmd[3]) {
-            Some(k) => k.to_string(),
-            None => return resp_error("ERR group must be valid UTF-8"),
-        };
+        let key: Vec<u8> = cmd[2].to_vec();
+        let group = crate::types::StreamName::from(cmd[3]);
         let id_str = std::str::from_utf8(cmd[4]).unwrap_or("$").to_string();
 
         let mkstream = cmd.iter().any(|b| {
@@ -1373,7 +1338,7 @@ pub fn xgroup_create(ctx: &mut Ctx) -> Vec<u8> {
         let db_ref = &ctx.store[*ctx.selected_db];
         let shard = store::get_shard(db_ref, &key);
         let map = read_lock!(shard);
-        if !map.contains_key(key.as_str()) && !mkstream {
+        if !map.contains_key(key.as_slice()) && !mkstream {
             return resp_error("ERR The XGROUP subcommand requires the key to exist");
         }
     }
@@ -1421,14 +1386,8 @@ pub fn xgroup_destroy(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() != 4 {
         return resp_error("ERR wrong number of arguments for 'xgroup|destroy' command");
     }
-    let key = match parse_utf8(cmd[2]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
-    let group = match parse_utf8(cmd[3]) {
-        Some(k) => k,
-        None => return resp_error("ERR group must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[2];
+    let group: &[u8] = cmd[3];
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -1450,14 +1409,8 @@ pub fn xgroup_setid(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() != 5 && cmd.len() != 7 {
         return resp_error("ERR wrong number of arguments for 'xgroup|setid' command");
     }
-    let key = match parse_utf8(cmd[2]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
-    let group = match parse_utf8(cmd[3]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR group must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[2];
+    let group = crate::types::StreamName::from(cmd[3]);
     let id_str = std::str::from_utf8(cmd[4]).unwrap_or("$");
     let entries_read: Option<u64> = if cmd.len() == 7 {
         if !cmd[5].eq_ignore_ascii_case(b"ENTRIESREAD") {
@@ -1493,9 +1446,16 @@ pub fn xgroup_setid(ctx: &mut Ctx) -> Vec<u8> {
                 }
             };
             match inner.groups.get_mut(&group) {
-                None => resp_error(&format!(
-                    "NOGROUP No such consumer group '{group}' for key name '{key}'"
-                )),
+                None => resp_error_bytes(
+                    &[
+                        &b"NOGROUP No such consumer group '"[..],
+                        c_str(group.as_bytes()),
+                        &b"' for key name '"[..],
+                        c_str(key),
+                        &b"'"[..],
+                    ]
+                    .concat(),
+                ),
                 Some(g) => {
                     g.last_id = new_id;
                     // A new position without a count is a position whose
@@ -1516,18 +1476,9 @@ pub fn xgroup_createconsumer(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() != 5 {
         return resp_error("ERR wrong number of arguments for 'xgroup|createconsumer' command");
     }
-    let key = match parse_utf8(cmd[2]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
-    let group = match parse_utf8(cmd[3]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR invalid group name"),
-    };
-    let consumer = match parse_utf8(cmd[4]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR invalid consumer name"),
-    };
+    let key: &[u8] = cmd[2];
+    let group = crate::types::StreamName::from(cmd[3]);
+    let consumer = crate::types::StreamName::from(cmd[4]);
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -1538,9 +1489,16 @@ pub fn xgroup_createconsumer(ctx: &mut Ctx) -> Vec<u8> {
         Some(ValueRef::Stream(s)) => {
             let mut inner = s.write();
             match inner.groups.get_mut(&group) {
-                None => resp_error(&format!(
-                    "NOGROUP No such consumer group '{group}' for key name '{key}'"
-                )),
+                None => resp_error_bytes(
+                    &[
+                        &b"NOGROUP No such consumer group '"[..],
+                        c_str(group.as_bytes()),
+                        &b"' for key name '"[..],
+                        c_str(key),
+                        &b"'"[..],
+                    ]
+                    .concat(),
+                ),
                 Some(g) => {
                     if g.consumers.contains_key(&consumer) {
                         resp_integer(0) // already exists
@@ -1561,18 +1519,9 @@ pub fn xgroup_delconsumer(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() != 5 {
         return resp_error("ERR wrong number of arguments for 'xgroup|delconsumer' command");
     }
-    let key = match parse_utf8(cmd[2]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
-    let group = match parse_utf8(cmd[3]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR invalid group name"),
-    };
-    let consumer = match parse_utf8(cmd[4]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR invalid consumer name"),
-    };
+    let key: &[u8] = cmd[2];
+    let group = crate::types::StreamName::from(cmd[3]);
+    let consumer = crate::types::StreamName::from(cmd[4]);
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -1583,9 +1532,16 @@ pub fn xgroup_delconsumer(ctx: &mut Ctx) -> Vec<u8> {
         Some(ValueRef::Stream(s)) => {
             let mut inner = s.write();
             match inner.groups.get_mut(&group) {
-                None => resp_error(&format!(
-                    "NOGROUP No such consumer group '{group}' for key name '{key}'"
-                )),
+                None => resp_error_bytes(
+                    &[
+                        &b"NOGROUP No such consumer group '"[..],
+                        c_str(group.as_bytes()),
+                        &b"' for key name '"[..],
+                        c_str(key),
+                        &b"'"[..],
+                    ]
+                    .concat(),
+                ),
                 Some(g) => {
                     if g.consumers.remove(&consumer).is_some() {
                         notify(
@@ -1613,8 +1569,8 @@ pub fn xgroup_delconsumer(ctx: &mut Ctx) -> Vec<u8> {
 
 /// Everything `XREADGROUP` was asked for, apart from the streams themselves.
 struct GroupRead<'a> {
-    group: &'a str,
-    consumer: &'a str,
+    group: &'a [u8],
+    consumer: &'a [u8],
     /// `COUNT`: the per-stream limit.
     count: usize,
     noack: bool,
@@ -1646,10 +1602,23 @@ fn format_claimed_entry(
     ])
 }
 
-fn nogroup_error(key: &str, group: &str) -> Vec<u8> {
-    resp_error(&format!(
-        "NOGROUP No such key '{key}' or consumer group '{group}' in XREADGROUP with GROUP option"
-    ))
+/// What C's `%s` prints of `bytes`: up to its first NUL. Redis's NOGROUP
+/// errors format the key and the group so.
+fn c_str(bytes: &[u8]) -> &[u8] {
+    &bytes[..memchr::memchr(0, bytes).unwrap_or(bytes.len())]
+}
+
+fn nogroup_error(key: &[u8], group: &[u8]) -> Vec<u8> {
+    resp_error_bytes(
+        &[
+            &b"NOGROUP No such key '"[..],
+            c_str(key),
+            &b"' or consumer group '"[..],
+            c_str(group),
+            &b"' in XREADGROUP with GROUP option"[..],
+        ]
+        .concat(),
+    )
 }
 
 pub fn xreadgroup(ctx: &mut Ctx) -> Vec<u8> {
@@ -1669,14 +1638,8 @@ pub fn xreadgroup(ctx: &mut Ctx) -> Vec<u8> {
     {
         return resp_error("ERR syntax error");
     }
-    let group = match parse_utf8(cmd[2]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR invalid group"),
-    };
-    let consumer = match parse_utf8(cmd[3]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR invalid consumer"),
-    };
+    let group = crate::types::StreamName::from(cmd[2]);
+    let consumer = crate::types::StreamName::from(cmd[3]);
 
     let mut count: Option<usize> = None;
     let mut caps = ReadCaps::default();
@@ -1777,10 +1740,7 @@ pub fn xreadgroup(ctx: &mut Ctx) -> Vec<u8> {
         }
     }
     let half = remaining / 2;
-    let keys: Vec<String> = cmd[i..i + half]
-        .iter()
-        .filter_map(|b| std::str::from_utf8(b).ok().map(|s| s.to_string()))
-        .collect();
+    let keys: Vec<Vec<u8>> = cmd[i..i + half].iter().map(|b| b.to_vec()).collect();
     let ids: Vec<&str> = cmd[i + half..]
         .iter()
         .map(|b| std::str::from_utf8(b).unwrap_or(""))
@@ -1864,7 +1824,7 @@ pub fn xreadgroup(ctx: &mut Ctx) -> Vec<u8> {
     // gap. (A history read never gets here: its reply always names the
     // stream, so it is never empty.)
     let rxs: Vec<(
-        String,
+        Vec<u8>,
         tokio::sync::oneshot::Receiver<crate::wait_table::Value>,
     )> = keys
         .iter()
@@ -1942,16 +1902,16 @@ pub fn xreadgroup(ctx: &mut Ctx) -> Vec<u8> {
 /// been idle for `min_idle` milliseconds — `None` if nothing is pending.
 fn next_claimable_in(
     ctx: &Ctx,
-    keys: &[String],
-    group: &str,
+    keys: &[Vec<u8>],
+    group: &[u8],
     min_idle: u64,
 ) -> Option<std::time::Duration> {
     let now = now_ms();
     let mut soonest: Option<u64> = None;
     for key in keys {
-        let shard = store::get_shard(&ctx.store[*ctx.selected_db], key.as_str());
+        let shard = store::get_shard(&ctx.store[*ctx.selected_db], key.as_slice());
         let map = read_lock!(shard);
-        let Some(ValueRef::Stream(stream)) = map.get(key.as_str()) else {
+        let Some(ValueRef::Stream(stream)) = map.get(key.as_slice()) else {
             continue;
         };
         let inner = stream.read();
@@ -1977,7 +1937,7 @@ fn next_claimable_in(
 /// replicas and the AOF receive.
 fn run_xreadgroup_delivery(
     ctx: &mut Ctx,
-    keys: &[String],
+    keys: &[Vec<u8>],
     ids: &[&str],
     spec: &GroupRead,
 ) -> Result<Vec<Vec<u8>>, Vec<u8>> {
@@ -1994,9 +1954,9 @@ fn run_xreadgroup_delivery(
     let mut streams = Vec::with_capacity(keys.len());
     for key in keys {
         let db_ref = &ctx.store[*ctx.selected_db];
-        let shard = store::get_shard(db_ref, key.as_str());
+        let shard = store::get_shard(db_ref, key.as_slice());
         let map = read_lock!(shard);
-        match map.get(key.as_str()) {
+        match map.get(key.as_slice()) {
             Some(ValueRef::Stream(s)) => {
                 if !s.read().groups.contains_key(spec.group) {
                     return Err(nogroup_error(key, spec.group));
@@ -2037,18 +1997,13 @@ fn run_xreadgroup_delivery(
                 "xgroup-createconsumer",
                 key,
             );
-            effect(
-                [
-                    "XGROUP",
-                    "CREATECONSUMER",
-                    key.as_str(),
-                    spec.group,
-                    spec.consumer,
-                ]
-                .iter()
-                .map(|s| s.as_bytes().to_vec())
-                .collect(),
-            );
+            effect(vec![
+                b"XGROUP".to_vec(),
+                b"CREATECONSUMER".to_vec(),
+                key.to_vec(),
+                spec.group.to_vec(),
+                spec.consumer.to_vec(),
+            ]);
         }
 
         let mut items: Vec<Vec<u8>> = Vec::new();
@@ -2087,7 +2042,7 @@ fn run_xreadgroup_delivery(
                     if !budget.admit(item.len()) {
                         break;
                     }
-                    pending.consumer = spec.consumer.to_string();
+                    pending.consumer = crate::types::StreamName::from(spec.consumer);
                     pending.delivered_at = now;
                     pending.delivery_count = pending.delivery_count.saturating_add(1);
                     effect(claim_effect(
@@ -2126,7 +2081,7 @@ fn run_xreadgroup_delivery(
                     g.pel.insert(
                         id.clone(),
                         PelEntry {
-                            consumer: spec.consumer.to_string(),
+                            consumer: crate::types::StreamName::from(spec.consumer),
                             delivered_at: now,
                             delivery_count: 1,
                         },
@@ -2205,14 +2160,8 @@ pub fn xack(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 4 {
         return resp_error("ERR wrong number of arguments for 'xack' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
-    let group = match parse_utf8(cmd[2]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR invalid group"),
-    };
+    let key: &[u8] = cmd[1];
+    let group = crate::types::StreamName::from(cmd[2]);
     // All of the IDs, before any is acknowledged: one that is not an ID
     // fails the command, and it must not have done half its work by then.
     let mut ids = Vec::with_capacity(cmd.len() - 3);
@@ -2254,14 +2203,8 @@ pub fn xpending(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 3 {
         return resp_error("ERR wrong number of arguments for 'xpending' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
-    let group = match parse_utf8(cmd[2]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR invalid group"),
-    };
+    let key: &[u8] = cmd[1];
+    let group = crate::types::StreamName::from(cmd[2]);
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -2293,14 +2236,14 @@ pub fn xpending(ctx: &mut Ctx) -> Vec<u8> {
                     .unwrap_or_default();
 
                 // Consumer → pending count
-                let mut per_consumer: AHashMap<&str, i64> = AHashMap::new();
+                let mut per_consumer: AHashMap<&[u8], i64> = AHashMap::new();
                 for pel in g.pel.values() {
-                    *per_consumer.entry(pel.consumer.as_str()).or_insert(0) += 1;
+                    *per_consumer.entry(pel.consumer.as_bytes()).or_insert(0) += 1;
                 }
                 let consumer_list: Vec<Vec<u8>> = per_consumer
                     .iter()
                     .map(|(name, cnt)| {
-                        resp_array(vec![resp_bulk_str(name), resp_bulk_str(&cnt.to_string())])
+                        resp_array(vec![resp_bulk(name), resp_bulk_str(&cnt.to_string())])
                     })
                     .collect();
 
@@ -2385,7 +2328,7 @@ pub fn xpending(ctx: &mut Ctx) -> Vec<u8> {
                         };
                         resp_array(vec![
                             resp_bulk_str(&id.to_string()),
-                            resp_bulk_str(&p.consumer),
+                            resp_bulk(&p.consumer),
                             resp_integer(idle),
                             resp_integer(p.delivery_count as i64),
                         ])
@@ -2408,18 +2351,9 @@ pub fn xclaim(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 6 {
         return resp_error("ERR wrong number of arguments for 'xclaim' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
-    let group = match parse_utf8(cmd[2]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR invalid group"),
-    };
-    let new_consumer = match parse_utf8(cmd[3]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR invalid consumer"),
-    };
+    let key: &[u8] = cmd[1];
+    let group = crate::types::StreamName::from(cmd[2]);
+    let new_consumer = crate::types::StreamName::from(cmd[3]);
     let min_idle: u64 = match parse_utf8(cmd[4]).and_then(|s| s.parse().ok()) {
         Some(ms) => ms,
         None => return resp_error("ERR Invalid min-idle-time argument for XCLAIM"),
@@ -2507,9 +2441,16 @@ pub fn xclaim(ctx: &mut Ctx) -> Vec<u8> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        None => resp_error(&format!(
-            "NOGROUP No such key '{key}' or consumer group '{group}'"
-        )),
+        None => resp_error_bytes(
+            &[
+                &b"NOGROUP No such key '"[..],
+                c_str(key),
+                &b"' or consumer group '"[..],
+                c_str(group.as_bytes()),
+                &b"'"[..],
+            ]
+            .concat(),
+        ),
         Some(ValueRef::Stream(s)) => {
             let mut guard = s.write();
             let StreamInner {
@@ -2520,9 +2461,16 @@ pub fn xclaim(ctx: &mut Ctx) -> Vec<u8> {
             let delivered_at = time.unwrap_or_else(|| now.saturating_sub(idle.unwrap_or(0)));
 
             let Some(g) = groups.get_mut(&group) else {
-                return resp_error(&format!(
-                    "NOGROUP No such key '{key}' or consumer group '{group}'"
-                ));
+                return resp_error_bytes(
+                    &[
+                        &b"NOGROUP No such key '"[..],
+                        c_str(key),
+                        &b"' or consumer group '"[..],
+                        c_str(group.as_bytes()),
+                        &b"'"[..],
+                    ]
+                    .concat(),
+                );
             };
             effects_begin();
             if !g.consumers.contains_key(&new_consumer) {
@@ -2549,12 +2497,12 @@ pub fn xclaim(ctx: &mut Ctx) -> Vec<u8> {
                     // reference rather than hand out nothing.
                     Some(_) if !exists => {
                         g.pel.remove(id);
-                        effect(
-                            ["XACK", key, group.as_str(), id.to_string().as_str()]
-                                .iter()
-                                .map(|s| s.as_bytes().to_vec())
-                                .collect(),
-                        );
+                        effect(vec![
+                            b"XACK".to_vec(),
+                            key.to_vec(),
+                            group.as_bytes().to_vec(),
+                            id.to_string().into_bytes(),
+                        ]);
                         continue;
                     }
                     Some(p) if now.saturating_sub(p.delivered_at) < min_idle => continue,
@@ -2609,18 +2557,9 @@ pub fn xautoclaim(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 6 {
         return resp_error("ERR wrong number of arguments for 'xautoclaim' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
-    let group = match parse_utf8(cmd[2]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR invalid group"),
-    };
-    let new_consumer = match parse_utf8(cmd[3]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR invalid consumer"),
-    };
+    let key: &[u8] = cmd[1];
+    let group = crate::types::StreamName::from(cmd[2]);
+    let new_consumer = crate::types::StreamName::from(cmd[3]);
     let min_idle: u64 = match parse_utf8(cmd[4]).and_then(|s| s.parse().ok()) {
         Some(ms) => ms,
         None => return resp_error("ERR Invalid min-idle-time argument for XAUTOCLAIM"),
@@ -2661,9 +2600,16 @@ pub fn xautoclaim(ctx: &mut Ctx) -> Vec<u8> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        None => resp_error(&format!(
-            "NOGROUP No such key '{key}' or consumer group '{group}'"
-        )),
+        None => resp_error_bytes(
+            &[
+                &b"NOGROUP No such key '"[..],
+                c_str(key),
+                &b"' or consumer group '"[..],
+                c_str(group.as_bytes()),
+                &b"'"[..],
+            ]
+            .concat(),
+        ),
         Some(ValueRef::Stream(s)) => {
             let mut guard = s.write();
             let StreamInner {
@@ -2672,9 +2618,16 @@ pub fn xautoclaim(ctx: &mut Ctx) -> Vec<u8> {
             let now = now_ms();
 
             let Some(g) = groups.get_mut(&group) else {
-                return resp_error(&format!(
-                    "NOGROUP No such key '{key}' or consumer group '{group}'"
-                ));
+                return resp_error_bytes(
+                    &[
+                        &b"NOGROUP No such key '"[..],
+                        c_str(key),
+                        &b"' or consumer group '"[..],
+                        c_str(group.as_bytes()),
+                        &b"'"[..],
+                    ]
+                    .concat(),
+                );
             };
             effects_begin();
             if !g.consumers.contains_key(&new_consumer) {
@@ -2746,11 +2699,7 @@ pub fn xautoclaim(ctx: &mut Ctx) -> Vec<u8> {
                 g.seen(&new_consumer, now, true);
             }
             if !deleted.is_empty() {
-                let mut xack = vec![
-                    b"XACK".to_vec(),
-                    key.as_bytes().to_vec(),
-                    group.clone().into_bytes(),
-                ];
+                let mut xack = vec![b"XACK".to_vec(), key.to_vec(), group.to_vec()];
                 xack.extend(deleted.iter().map(|id| id.to_string().into_bytes()));
                 effect(xack);
             }
@@ -2797,10 +2746,7 @@ fn xinfo_stream(ctx: &mut Ctx) -> Vec<u8> {
     // they need protocol-correct encoding too.
     let resp = reply_resp(ctx);
     let cmd = &ctx.cmd;
-    let key = match parse_utf8(cmd[2]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[2];
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -2935,8 +2881,8 @@ fn groups_in_order(stream: &StreamInner) -> Vec<&ConsumerGroup> {
 }
 
 /// A group's consumers, by name.
-fn consumers_in_order(g: &ConsumerGroup) -> Vec<(&String, u64)> {
-    let mut consumers: Vec<(&String, u64)> = g
+fn consumers_in_order(g: &ConsumerGroup) -> Vec<(&crate::types::StreamName, u64)> {
+    let mut consumers: Vec<(&crate::types::StreamName, u64)> = g
         .consumers
         .iter()
         .map(|(name, seen)| (name, *seen))
@@ -2971,7 +2917,7 @@ fn xinfo_stream_full(
                 .map(|(id, p)| {
                     resp_array(vec![
                         resp_bulk_str(&id.to_string()),
-                        resp_bulk_str(&p.consumer),
+                        resp_bulk(&p.consumer),
                         resp_integer(shown_delivery_time(p.delivered_at)),
                         resp_integer(p.delivery_count as i64),
                     ])
@@ -2995,7 +2941,7 @@ fn xinfo_stream_full(
                         resp,
                         vec![
                             resp_bulk_str("name"),
-                            resp_bulk_str(name),
+                            resp_bulk(name),
                             resp_bulk_str("seen-time"),
                             resp_integer(seen as i64),
                             resp_bulk_str("active-time"),
@@ -3012,7 +2958,7 @@ fn xinfo_stream_full(
                 resp,
                 vec![
                     resp_bulk_str("name"),
-                    resp_bulk_str(&g.name),
+                    resp_bulk(&g.name),
                     resp_bulk_str("last-delivered-id"),
                     resp_bulk_str(&g.last_id.to_string()),
                     resp_bulk_str("entries-read"),
@@ -3079,10 +3025,7 @@ fn xinfo_groups(ctx: &mut Ctx) -> Vec<u8> {
     // XINFO GROUPS key — an array of per-group maps (`addReplyMapLen` per group).
     let resp = reply_resp(ctx);
     let cmd = &ctx.cmd;
-    let key = match parse_utf8(cmd[2]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[2];
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -3100,7 +3043,7 @@ fn xinfo_groups(ctx: &mut Ctx) -> Vec<u8> {
                         resp,
                         vec![
                             resp_bulk_str("name"),
-                            resp_bulk_str(&g.name),
+                            resp_bulk(&g.name),
                             resp_bulk_str("consumers"),
                             resp_integer(g.consumers.len() as i64),
                             resp_bulk_str("pending"),
@@ -3128,14 +3071,8 @@ fn xinfo_consumers(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 4 {
         return resp_error("ERR wrong number of arguments for 'xinfo|consumers' command");
     }
-    let key = match parse_utf8(cmd[2]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
-    let group = match parse_utf8(cmd[3]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR invalid group"),
-    };
+    let key: &[u8] = cmd[2];
+    let group = crate::types::StreamName::from(cmd[3]);
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -3164,7 +3101,7 @@ fn xinfo_consumers(ctx: &mut Ctx) -> Vec<u8> {
                         resp,
                         vec![
                             resp_bulk_str("name"),
-                            resp_bulk_str(name),
+                            resp_bulk(name),
                             resp_bulk_str("pending"),
                             resp_integer(pending),
                             resp_bulk_str("idle"),
@@ -3203,7 +3140,7 @@ pub fn xgroup(ctx: &mut Ctx) -> Vec<u8> {
 }
 
 /// Called after every successful XADD to wake any blocked XREAD clients.
-fn notify_xread_waiters(ctx: &Ctx, key: &str) {
+fn notify_xread_waiters(ctx: &Ctx, key: &[u8]) {
     ctx.wait_table.notify_stream_waiters(key);
 }
 
@@ -3229,10 +3166,7 @@ pub fn xdelex(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 5 {
         return resp_error("ERR wrong number of arguments for 'xdelex' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = cmd[1].to_vec();
     let (refs, ids) = match stream_extra::parse_policy_and_ids(&cmd[2..], false) {
         Ok(parsed) => parsed,
         Err(e) => return e,
@@ -3241,7 +3175,7 @@ pub fn xdelex(ctx: &mut Ctx) -> Vec<u8> {
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, &key);
     let map = read_lock!(shard);
-    let stream = match map.get(key.as_str()) {
+    let stream = match map.get(key.as_slice()) {
         // No stream → every id is -1.
         None => return resp_array(ids.iter().map(|_| resp_integer(-1)).collect()),
         Some(ValueRef::Stream(s)) => Arc::clone(s),
@@ -3293,14 +3227,8 @@ pub fn xackdel(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 4 {
         return resp_error("ERR wrong number of arguments for 'xackdel' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
-    let group_name = match parse_utf8(cmd[2]) {
-        Some(g) => g.to_string(),
-        None => return resp_error("ERR group name must be valid UTF-8"),
-    };
+    let key: Vec<u8> = cmd[1].to_vec();
+    let group_name = crate::types::StreamName::from(cmd[2]);
     let (refs, ids) = match stream_extra::parse_policy_and_ids(&cmd[3..], true) {
         Ok(parsed) => parsed,
         Err(e) => return e,
@@ -3310,7 +3238,7 @@ pub fn xackdel(ctx: &mut Ctx) -> Vec<u8> {
     let shard = store::get_shard(db_ref, &key);
     let stream = {
         let map = read_lock!(shard);
-        match map.get(key.as_str()) {
+        match map.get(key.as_slice()) {
             Some(ValueRef::Stream(s)) => Arc::clone(s),
             Some(_) => {
                 return resp_error(
@@ -3388,17 +3316,14 @@ pub fn xcfgset(ctx: &mut Ctx) -> Vec<u8> {
         return resp_error("ERR wrong number of arguments for 'xcfgset' command");
     }
 
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = cmd[1].to_vec();
 
     // XCFGSET does not create streams — get-only, not get-or-create.
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, &key);
     let map = read_lock!(shard);
 
-    let stream_arc = match map.get(key.as_str()) {
+    let stream_arc = match map.get(key.as_slice()) {
         Some(ValueRef::Stream(s)) => Arc::clone(s),
         Some(_) => {
             return resp_error("WRONGTYPE Operation against a key holding the wrong kind of value");
@@ -3573,14 +3498,8 @@ pub fn xnack(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 7 {
         return resp_error("ERR wrong number of arguments for 'xnack' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
-    let group = match parse_utf8(cmd[2]) {
-        Some(g) => g.to_string(),
-        None => return resp_error("ERR invalid group"),
-    };
+    let key: &[u8] = cmd[1];
+    let group = crate::types::StreamName::from(cmd[2]);
 
     #[derive(Clone, Copy, PartialEq)]
     enum Mode {
@@ -3646,9 +3565,16 @@ pub fn xnack(ctx: &mut Ctx) -> Vec<u8> {
         }
     }
     let no_group = || {
-        resp_error(&format!(
-            "NOGROUP No such key '{key}' or consumer group '{group}'"
-        ))
+        resp_error_bytes(
+            &[
+                &b"NOGROUP No such key '"[..],
+                c_str(key),
+                &b"' or consumer group '"[..],
+                c_str(group.as_bytes()),
+                &b"'"[..],
+            ]
+            .concat(),
+        )
     };
 
     let db_ref = &ctx.store[*ctx.selected_db];
@@ -3691,7 +3617,7 @@ pub fn xnack(ctx: &mut Ctx) -> Vec<u8> {
                         };
                         // Unowned, and immediately claimable, after what
                         // was released before it.
-                        entry.consumer = String::new();
+                        entry.consumer = crate::types::StreamName::default();
                         entry.delivered_at = stream_extra::nack_time();
                         released += 1;
                     }
@@ -3709,7 +3635,7 @@ pub fn xnack(ctx: &mut Ctx) -> Vec<u8> {
                         g.pel.insert(
                             id.clone(),
                             PelEntry {
-                                consumer: String::new(),
+                                consumer: crate::types::StreamName::default(),
                                 delivered_at: stream_extra::nack_time(),
                                 delivery_count,
                             },

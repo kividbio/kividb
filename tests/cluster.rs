@@ -6037,13 +6037,11 @@ fn a_master_stopped_cleanly_without_an_aof_carries_on_as_before() {
     assert!(!log.contains("came back without its dataset"), "{log}");
 }
 
-/// A key that is not text (from an RDB file: no command writes one until
-/// #437's third step) in a slot an atomic migration moves: the destination
-/// refuses its `RESTORE`, as it refuses such a key from any command yet.
-/// The import does not complete: it says why, in `last_error`, and tries
-/// again, and the key stays where it was, whole, until it is canceled.
+/// A key that is not text in a slot an atomic migration moves. The
+/// destination's `RESTORE` refused it, and the import failed and tried again
+/// until it was canceled. It moves now, whole, as any key does.
 #[test]
-fn a_slot_migration_of_a_key_that_is_not_text_fails_loudly_and_keeps_it() {
+fn a_slot_migration_moves_a_key_that_is_not_text() {
     // A key that is not text, in a slot the first node owns (0..=8191).
     let key: Vec<u8> = (0u32..)
         .map(|i| {
@@ -6079,29 +6077,108 @@ fn a_slot_migration_of_a_key_that_is_not_text_fails_loudly_and_keeps_it() {
             .array()[0]
             .clone()
     };
-    wait_until(
-        "the import to fail an attempt",
-        Duration::from_secs(60),
-        || {
-            let task = status();
-            assert_ne!(task_field(&task, "state").text(), "completed", "{task:?}");
-            task_field(&task, "retries").int() >= 1
-        },
-    );
-    let task = status();
-    let error = task_field(&task, "last_error").text();
-    assert!(!error.is_empty(), "{task:?}");
+    wait_until("the import to complete", Duration::from_secs(60), || {
+        task_field(&status(), "state").text() == "completed"
+    });
 
-    // Still here, in its slot, and not at the destination.
-    let mut s = src.conn();
-    assert_eq!(s.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 1);
-    assert_eq!(s.cmd(&["DBSIZE"]).int(), 1);
-    assert_eq!(dst.conn().cmd(&["DBSIZE"]).int(), 0);
-    assert_eq!(
-        dst.conn()
-            .cmd(&["CLUSTER", "MIGRATION", "CANCEL", "ID", &task_id])
-            .int(),
-        1
+    // At the destination, whole, in its slot; gone from the source.
+    let mut d = dst.conn();
+    assert_eq!(d.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 1);
+    assert_eq!(d.cmd_bytes(&[b"GET", &key]), Resp::Bulk(b"value".to_vec()));
+    // The source deletes a moved slot's keys after the import completes,
+    // in the background.
+    wait_until(
+        "the source to delete the moved key",
+        Duration::from_secs(30),
+        || src.conn().cmd(&["DBSIZE"]).int() == 0,
     );
-    assert_eq!(s.cmd(&["DBSIZE"]).int(), 1);
+}
+
+/// A key that is not text, and one with characters of the hash-field
+/// escape's block (U+F780..U+F7FF) in it, found by FT.SEARCH and loaded as
+/// `@__key` by FT.AGGREGATE on whichever master is asked: the coordinator
+/// gives back the key's bytes, from its own shard and from the others. It
+/// decoded the other masters' FT.SEARCH replies lossily (U+FFFD for the
+/// first key, and other bytes for the second) (#437).
+#[test]
+fn cluster_searches_give_back_keys_of_any_bytes() {
+    let (nodes, ranges) = form_cluster(2);
+    let owner = |key: &[u8]| {
+        let slot = kividb::cluster::key_hash_slot(key);
+        ranges
+            .iter()
+            .position(|(a, b)| (*a..=*b).contains(&slot))
+            .unwrap()
+    };
+    let r = nodes[0].conn().cmd(&[
+        "FT.CREATE",
+        "docs",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "doc:",
+        "SCHEMA",
+        "f",
+        "TEXT",
+    ]);
+    assert!(r.is_ok(), "{r:?}");
+    let raw: &[u8] = b"doc:\xff\xfe";
+    let pua = "doc:k\u{F7C3}\u{F7A9}".as_bytes().to_vec();
+    // A few of each, so that both masters hold some.
+    let mut want: Vec<Vec<u8>> = Vec::new();
+    for i in 0..8u8 {
+        for base in [raw, pua.as_slice()] {
+            let mut key = base.to_vec();
+            key.push(b'0' + i);
+            let r = nodes[owner(&key)]
+                .conn()
+                .cmd_bytes(&[b"HSET", &key, b"f", b"hello"]);
+            assert!(matches!(r, Resp::Int(1)), "{r:?}");
+            want.push(key);
+        }
+    }
+    want.sort();
+    let on_first = want.iter().filter(|k| owner(k) == 0).count();
+    assert!(on_first > 0 && on_first < want.len(), "{on_first}");
+
+    for node in &nodes {
+        let mut c = node.conn();
+        let page = c.cmd(&[
+            "FT.SEARCH",
+            "docs",
+            "hello",
+            "NOCONTENT",
+            "LIMIT",
+            "0",
+            "100",
+        ]);
+        assert_eq!(page.array()[0].int(), want.len() as i64, "{page:?}");
+        let mut found: Vec<Vec<u8>> = page.array()[1..]
+            .iter()
+            .map(|r| match r {
+                Resp::Bulk(b) => b.clone(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        found.sort();
+        assert_eq!(found, want, "FT.SEARCH on port {}", node.port);
+
+        let rows = c.cmd(&["FT.AGGREGATE", "docs", "hello", "LOAD", "1", "@__key"]);
+        let mut keys: Vec<Vec<u8>> = rows.array()[1..]
+            .iter()
+            .filter_map(|row| {
+                let cells = row.array();
+                let at = cells
+                    .iter()
+                    .position(|c| *c == Resp::Bulk(b"__key".to_vec()))?;
+                match &cells[at + 1] {
+                    Resp::Bulk(b) => Some(b.clone()),
+                    other => panic!("{other:?}"),
+                }
+            })
+            .collect();
+        keys.sort();
+        assert_eq!(keys, want, "FT.AGGREGATE on port {}", node.port);
+    }
 }

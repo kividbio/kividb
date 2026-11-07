@@ -301,12 +301,16 @@ fn rdb_files_saved_by_valkey_9_0_and_9_1_load_whole() {
         };
         let st = st.read();
         assert_eq!(st.entries.len(), 4, "Valkey {label}");
-        let g1 = &st.groups["g1"];
-        let mut consumers: Vec<&str> = g1.consumers.keys().map(String::as_str).collect();
+        let g1 = &st.groups[&b"g1"[..]];
+        let mut consumers: Vec<&[u8]> = g1.consumers.keys().map(|c| c.as_bytes()).collect();
         consumers.sort_unstable();
-        assert_eq!(consumers, ["alice", "bob", "carol"], "Valkey {label}");
+        assert_eq!(
+            consumers,
+            [&b"alice"[..], b"bob", b"carol"],
+            "Valkey {label}"
+        );
         assert_eq!(g1.pel.len(), 2, "Valkey {label}: 1-1 (alice) and 4-1 (bob)");
-        assert!(st.groups.contains_key("g2"), "Valkey {label}");
+        assert!(st.groups.contains_key(&b"g2"[..]), "Valkey {label}");
         let KiviDBValue::Stream(big) = &db["stream:big"] else {
             panic!("Valkey {label}: stream:big is not a stream");
         };

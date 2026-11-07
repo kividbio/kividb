@@ -63,10 +63,13 @@ pub struct StreamEntry {
     pub fields: FieldsType,
 }
 
+/// The name of a consumer group or of a consumer: any bytes, as in Redis.
+pub type StreamName = crate::key_bytes::KeyBytes;
+
 /// Pending Entry List entry — tracks unacknowledged messages per consumer.
 #[derive(Debug, Clone)]
 pub struct PelEntry {
-    pub consumer: String,
+    pub consumer: StreamName,
     pub delivered_at: u64, // unix ms
     pub delivery_count: u64,
 }
@@ -74,7 +77,7 @@ pub struct PelEntry {
 /// A consumer group.
 #[derive(Debug, Clone)]
 pub struct ConsumerGroup {
-    pub name: String,
+    pub name: StreamName,
     /// Last delivered ID — entries with id > last_id are "new"
     pub last_id: StreamId,
     /// How many of the entries ever added to the stream this group has been
@@ -83,11 +86,11 @@ pub struct ConsumerGroup {
     /// Pending Entry List: id → PelEntry
     pub pel: BTreeMap<StreamId, PelEntry>,
     /// Consumers: name → last-seen ms
-    pub consumers: AHashMap<String, u64>,
+    pub consumers: AHashMap<StreamName, u64>,
     /// Consumers that have been handed entries: name → when they last were,
     /// in ms. Not kept across a restart: a consumer is then one that has not
     /// been active yet.
-    pub active: AHashMap<String, u64>,
+    pub active: AHashMap<StreamName, u64>,
 }
 
 impl ConsumerGroup {
@@ -98,15 +101,15 @@ impl ConsumerGroup {
 
     /// The consumer has sent a command; with `got_entries`, one that handed
     /// it something.
-    pub fn seen(&mut self, consumer: &str, now: u64, got_entries: bool) {
+    pub fn seen(&mut self, consumer: &[u8], now: u64, got_entries: bool) {
         match self.consumers.get_mut(consumer) {
             Some(seen) => *seen = now,
             None => {
-                self.consumers.insert(consumer.to_string(), now);
+                self.consumers.insert(StreamName::from(consumer), now);
             }
         }
         if got_entries {
-            self.active.insert(consumer.to_string(), now);
+            self.active.insert(StreamName::from(consumer), now);
         }
     }
 }
@@ -164,7 +167,7 @@ pub struct StreamInner {
     /// Total entries ever added (not decremented on delete)
     pub entries_added: u64,
     /// Consumer groups
-    pub groups: AHashMap<String, ConsumerGroup>,
+    pub groups: AHashMap<StreamName, ConsumerGroup>,
     /// Persistent max-entries policy set by XCFGSET MAX-ENTRIES.
     /// When Some(n), every XADD trims the stream to at most n entries
     /// after inserting. None = no persistent policy.
@@ -329,7 +332,7 @@ pub struct VSetEntry {
 #[derive(Clone)]
 pub struct VectorSetInner {
     pub dim: usize,
-    pub entries: AHashMap<String, VSetEntry>,
+    pub entries: AHashMap<crate::key_bytes::KeyBytes, VSetEntry>,
     pub metric: DistanceMetric,
 }
 

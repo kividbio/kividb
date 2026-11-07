@@ -164,7 +164,7 @@ fn nil_element(ctx: &Ctx) -> Vec<u8> {
 /// so a logically-absent key never reads as present.
 fn with_array_read<T>(
     ctx: &Ctx,
-    key: &str,
+    key: &[u8],
     missing: T,
     f: impl FnOnce(&ArrayInner) -> T,
 ) -> Result<T, Vec<u8>> {
@@ -188,7 +188,7 @@ fn with_array_read<T>(
 /// meaningful `next_insert`, and dropping it would silently rewind `ARNEXT`.
 fn with_array_write<T>(
     ctx: &mut Ctx,
-    key: &str,
+    key: &[u8],
     f: impl FnOnce(&mut ArrayInner) -> T,
 ) -> Result<T, Vec<u8>> {
     crate::commands::helpers::lazy_expire_key(ctx.store, *ctx.selected_db, key);
@@ -218,7 +218,7 @@ fn with_array_write<T>(
 /// Mutate the array at `key` only if it already exists — never creates it.
 fn with_existing_array_write<T>(
     ctx: &mut Ctx,
-    key: &str,
+    key: &[u8],
     missing: T,
     f: impl FnOnce(&mut ArrayInner) -> T,
 ) -> Result<T, Vec<u8>> {
@@ -278,10 +278,7 @@ fn cmd_arset(ctx: &mut Ctx) -> Vec<u8> {
     if ctx.cmd.len() < 4 {
         return wrong_args("ARSET");
     }
-    let key = match parse_utf8(ctx.cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = ctx.cmd[1].to_vec();
     let start = match parse_index(ctx.cmd[2]) {
         Ok(i) => i,
         Err(e) => return e,
@@ -316,10 +313,7 @@ fn cmd_armset(ctx: &mut Ctx) -> Vec<u8> {
     if ctx.cmd.len() < 4 || !(ctx.cmd.len() - 2).is_multiple_of(2) {
         return wrong_args("ARMSET");
     }
-    let key = match parse_utf8(ctx.cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = ctx.cmd[1].to_vec();
     // Parse every pair before touching the store: ARMSET is specified as a
     // single logical write, so a bad index in the last pair must not leave the
     // earlier ones applied.
@@ -355,10 +349,7 @@ fn cmd_arget(ctx: &mut Ctx) -> Vec<u8> {
     if ctx.cmd.len() != 3 {
         return wrong_args("ARGET");
     }
-    let key = match parse_utf8(ctx.cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = ctx.cmd[1].to_vec();
     let idx = match parse_index(ctx.cmd[2]) {
         Ok(i) => i,
         Err(e) => return e,
@@ -375,10 +366,7 @@ fn cmd_armget(ctx: &mut Ctx) -> Vec<u8> {
     if ctx.cmd.len() < 3 {
         return wrong_args("ARMGET");
     }
-    let key = match parse_utf8(ctx.cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = ctx.cmd[1].to_vec();
     let mut indices = Vec::with_capacity(ctx.cmd.len() - 2);
     for raw in &ctx.cmd[2..] {
         match parse_index(raw) {
@@ -413,10 +401,7 @@ fn cmd_argetrange(ctx: &mut Ctx) -> Vec<u8> {
     if ctx.cmd.len() != 4 {
         return wrong_args("ARGETRANGE");
     }
-    let key = match parse_utf8(ctx.cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = ctx.cmd[1].to_vec();
     let start = match parse_index(ctx.cmd[2]) {
         Ok(i) => i,
         Err(e) => return e,
@@ -467,10 +452,7 @@ fn cmd_ardel(ctx: &mut Ctx) -> Vec<u8> {
     if ctx.cmd.len() < 3 {
         return wrong_args("ARDEL");
     }
-    let key = match parse_utf8(ctx.cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = ctx.cmd[1].to_vec();
     let mut indices = Vec::with_capacity(ctx.cmd.len() - 2);
     for raw in &ctx.cmd[2..] {
         match parse_index(raw) {
@@ -493,10 +475,7 @@ fn cmd_ardelrange(ctx: &mut Ctx) -> Vec<u8> {
     if ctx.cmd.len() < 4 || !(ctx.cmd.len() - 2).is_multiple_of(2) {
         return wrong_args("ARDELRANGE");
     }
-    let key = match parse_utf8(ctx.cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = ctx.cmd[1].to_vec();
     let mut spans: Vec<(u64, u64)> = Vec::with_capacity((ctx.cmd.len() - 2) / 2);
     let mut i = 2;
     while i < ctx.cmd.len() {
@@ -535,10 +514,7 @@ fn cmd_arlen(ctx: &mut Ctx) -> Vec<u8> {
     if ctx.cmd.len() != 2 {
         return wrong_args("ARLEN");
     }
-    let key = match parse_utf8(ctx.cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = ctx.cmd[1].to_vec();
     match with_array_read(ctx, &key, 0u64, |inner| inner.len()) {
         Ok(n) => resp_integer(n as i64),
         Err(e) => e,
@@ -550,10 +526,7 @@ fn cmd_arcount(ctx: &mut Ctx) -> Vec<u8> {
     if ctx.cmd.len() != 2 {
         return wrong_args("ARCOUNT");
     }
-    let key = match parse_utf8(ctx.cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = ctx.cmd[1].to_vec();
     match with_array_read(ctx, &key, 0u64, |inner| inner.count()) {
         Ok(n) => resp_integer(n as i64),
         Err(e) => e,
@@ -567,10 +540,7 @@ fn cmd_arinsert(ctx: &mut Ctx) -> Vec<u8> {
     if ctx.cmd.len() < 3 {
         return wrong_args("ARINSERT");
     }
-    let key = match parse_utf8(ctx.cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = ctx.cmd[1].to_vec();
     let values: Vec<Arc<[u8]>> = ctx.cmd[2..].iter().map(|v| Arc::from(*v)).collect();
 
     match with_array_write(ctx, &key, |inner| {
@@ -633,10 +603,7 @@ fn cmd_arring(ctx: &mut Ctx) -> Vec<u8> {
     if ctx.cmd.len() < 4 {
         return wrong_args("ARRING");
     }
-    let key = match parse_utf8(ctx.cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = ctx.cmd[1].to_vec();
     let size = match parse_count(ctx.cmd[2]) {
         Ok(n) if n > 0 => n as u64,
         Ok(_) => return resp_error("ERR ring size must be a positive integer"),
@@ -684,10 +651,7 @@ fn cmd_arnext(ctx: &mut Ctx) -> Vec<u8> {
     if ctx.cmd.len() != 2 {
         return wrong_args("ARNEXT");
     }
-    let key = match parse_utf8(ctx.cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = ctx.cmd[1].to_vec();
     match with_array_read(ctx, &key, Some(0u64), |inner| {
         if inner.cursor_exhausted() {
             None
@@ -706,10 +670,7 @@ fn cmd_arseek(ctx: &mut Ctx) -> Vec<u8> {
     if ctx.cmd.len() != 3 {
         return wrong_args("ARSEEK");
     }
-    let key = match parse_utf8(ctx.cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = ctx.cmd[1].to_vec();
     // 2^64 - 1 too, as in Redis: where the cursor is left after the last
     // index (the next ARINSERT then fails).
     let idx = match parse_index_up_to(ctx.cmd[2], u64::MAX) {
@@ -734,10 +695,7 @@ fn cmd_arscan(ctx: &mut Ctx) -> Vec<u8> {
     if ctx.cmd.len() != 4 && ctx.cmd.len() != 6 {
         return wrong_args("ARSCAN");
     }
-    let key = match parse_utf8(ctx.cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = ctx.cmd[1].to_vec();
     let start = match parse_index(ctx.cmd[2]) {
         Ok(i) => i,
         Err(e) => return e,
@@ -845,10 +803,7 @@ fn cmd_argrep(ctx: &mut Ctx) -> Vec<u8> {
     if ctx.cmd.len() < 6 {
         return wrong_args("ARGREP");
     }
-    let key = match parse_utf8(ctx.cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = ctx.cmd[1].to_vec();
 
     // `-`/`+` resolve against the array's own bounds, so they're deferred until
     // the key is read below.
@@ -1047,10 +1002,7 @@ fn cmd_arop(ctx: &mut Ctx) -> Vec<u8> {
     if ctx.cmd.len() < 5 {
         return wrong_args("AROP");
     }
-    let key = match parse_utf8(ctx.cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = ctx.cmd[1].to_vec();
     let start = match parse_index(ctx.cmd[2]) {
         Ok(i) => i,
         Err(e) => return e,
@@ -1189,10 +1141,7 @@ fn cmd_arlastitems(ctx: &mut Ctx) -> Vec<u8> {
     if ctx.cmd.len() != 3 && ctx.cmd.len() != 4 {
         return wrong_args("ARLASTITEMS");
     }
-    let key = match parse_utf8(ctx.cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = ctx.cmd[1].to_vec();
     // Zero or less is nothing to give, as in Redis.
     let count = match parse_count(ctx.cmd[2]) {
         Ok(n) => n.max(0) as u64,
@@ -1287,10 +1236,7 @@ fn cmd_arinfo(ctx: &mut Ctx) -> Vec<u8> {
     if ctx.cmd.len() != 2 && ctx.cmd.len() != 3 {
         return wrong_args("ARINFO");
     }
-    let key = match parse_utf8(ctx.cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = ctx.cmd[1].to_vec();
     let mut full = false;
     if ctx.cmd.len() == 3 {
         if !ctx.cmd[2].eq_ignore_ascii_case(b"FULL") {
