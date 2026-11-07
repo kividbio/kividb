@@ -816,6 +816,77 @@ fn writes_go_on_while_a_turn_over_syncs_the_old_log() {
     }
 }
 
+/// The writer syncs the old log of a turn-over itself when the checkpoint
+/// has not, and then marks it synced. It marked it so even when a second
+/// turn-over had moved another log aside meanwhile: the directory, with the
+/// second's renames, unsynced, and the records after it reported synced
+/// once the new log alone was (#529). The writer is held here between its
+/// sync of the first old log and its mark, as a slow disk would hold it, and
+/// the second turn-over made then.
+#[test]
+fn a_second_turn_over_during_the_writers_sync_of_the_first_is_synced_too() {
+    for &io in io_models() {
+        let server = Server::start(io, "turn-over-syncing,old-log-synced");
+        let mut c = server.conn();
+        fill(&mut c, "before", 10);
+        assert_eq!(c.cmd(&["BGREWRITEAOF"]).s(), STARTED);
+        assert!(server.reached("turn-over-syncing.1", LONG), "{io}");
+        assert!(c.cmd(&["SET", "first", "1"]).ok());
+        // The second's sync, or a WAITAOF's: the writer syncs the old log
+        // the checkpoint is held from syncing.
+        let mut w = server.conn();
+        send(&mut w, &["WAITAOF", "1", "0", "0"]);
+        assert!(server.reached("old-log-synced.1", LONG), "{io}");
+
+        // The first checkpoint ends, and a second turns the log over while
+        // the writer is still held. Its mark is taken by the connection that
+        // writes next, the writer being held.
+        server.release("turn-over-syncing.1");
+        wait_idle(&mut c);
+        assert_eq!(c.cmd(&["BGREWRITEAOF"]).s(), STARTED);
+        let deadline = Instant::now() + LONG;
+        let mut i = 0;
+        while !server.dir.join("failpoint.turn-over-syncing.2").exists() {
+            assert!(Instant::now() < deadline, "{io}: no second turn-over");
+            assert!(c.cmd(&["SET", &format!("second:{i}"), "1"]).ok());
+            i += 1;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // The writer goes on. What is written now is in the second's new
+        // log: it is not synced before the second's old log, and the
+        // directory, are — by the writer, again.
+        server.release("old-log-synced.1");
+        assert!(c.cmd(&["SET", "after", "1"]).ok());
+        send(&mut c, &["WAITAOF", "1", "0", "0"]);
+        let deadline = Instant::now() + LONG;
+        loop {
+            if server.dir.join("failpoint.old-log-synced.2").exists() {
+                break;
+            }
+            let socket = c.reader.get_ref();
+            socket.set_nonblocking(true).unwrap();
+            let reply = socket.peek(&mut [0]);
+            socket.set_nonblocking(false).unwrap();
+            assert!(
+                matches!(reply, Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
+                "{io}: a write after the second turn-over was reported synced, the second's old \
+                 log and the directory not synced: {reply:?}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "{io}: WAITAOF neither answered nor synced"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        server.release("old-log-synced.2");
+        assert_eq!(c.read().arr()[0].i(), 1, "{io}");
+        assert_eq!(w.read().arr()[0].i(), 1, "{io}");
+        server.release("turn-over-syncing.2");
+        wait_idle(&mut c);
+    }
+}
+
 // ── The AOF turned on at runtime ─────────────────────────────────────────────
 
 /// Send a command and do not wait for its reply: for one the server is held

@@ -256,14 +256,31 @@ static TURN_OVER_WAITERS: parking_lot::Mutex<
 > = parking_lot::Mutex::new(Vec::new());
 
 /// The log a turn-over moved aside, as the writer leaves it to the
-/// checkpoint: `None` if it needs nothing more.
-type OldLog = Option<std::fs::File>;
+/// checkpoint, with the number of the turn-over (see [`OLD_LOG_UNSYNCED`]):
+/// `None` if it needs nothing more.
+type OldLog = Option<(std::fs::File, u64)>;
 
 /// Set from a turn-over until the old log it moved aside is synced: the
 /// writer does not sync the new log before then. Records in the new log
 /// come after those in the old one, and a power failure must not keep them
 /// and lose the old one's last records.
-static OLD_LOG_UNSYNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+///
+/// The number of the turn-over (see [`TURN_OVERS`]), 0 for none, and cleared
+/// only by a sync made after that turn-over: one that found an earlier
+/// turn-over's number, and synced that one's old log, must not clear the
+/// mark of a turn-over made while it synced. The writer did, and reported
+/// the records after the second synced with its renames not on the disk
+/// (#529).
+static OLD_LOG_UNSYNCED: AtomicU64 = AtomicU64::new(0);
+
+/// Turn-overs made in this process, numbering them for [`OLD_LOG_UNSYNCED`].
+static TURN_OVERS: AtomicU64 = AtomicU64::new(0);
+
+/// Clear [`OLD_LOG_UNSYNCED`] after a sync of the old log begun when it read
+/// `seen`: only if no turn-over has been made since.
+fn old_log_synced(seen: u64) {
+    let _ = OLD_LOG_UNSYNCED.compare_exchange(seen, 0, Ordering::AcqRel, Ordering::Acquire);
+}
 
 /// The start of a turn-over mark. No record begins with a zero byte.
 const TURN_OVER_MARK: &[u8] = b"\0kividb-aof-turn-over\0";
@@ -1210,8 +1227,10 @@ fn perform_turn_over(file: &mut std::fs::File) -> std::io::Result<OldLog> {
     let old = std::mem::replace(file, open_aof()?);
     match moved? {
         MovedAside::ToSync => {
-            OLD_LOG_UNSYNCED.store(true, Ordering::Release);
-            Ok(Some(old))
+            // With the log locked: turn-overs are numbered in the order made.
+            let number = TURN_OVERS.fetch_add(1, Ordering::Relaxed) + 1;
+            OLD_LOG_UNSYNCED.store(number, Ordering::Release);
+            Ok(Some((old, number)))
         }
         MovedAside::Synced => Ok(None),
     }
@@ -1221,7 +1240,7 @@ fn perform_turn_over(file: &mut std::fs::File) -> std::io::Result<OldLog> {
 /// directory that has both logs under their new names. The writer syncs the
 /// new log again once they are.
 fn finish_turn_over(old: OldLog) -> std::io::Result<()> {
-    let Some(old) = old else {
+    let Some((old, number)) = old else {
         return Ok(());
     };
     failpoint("turn-over-syncing");
@@ -1231,7 +1250,7 @@ fn finish_turn_over(old: OldLog) -> std::io::Result<()> {
         old.sync_data().and_then(|()| sync_dir())
     };
     match &synced {
-        Ok(()) => OLD_LOG_UNSYNCED.store(false, Ordering::Release),
+        Ok(()) => old_log_synced(number),
         Err(e) if fsync_always() => {
             sync_failed_under_always(&format!("the sync of {AOF_PREV_PATH}"), e)
         }
@@ -1702,7 +1721,7 @@ fn sync_for_replies() {
 fn sync_before_reply(file: &std::fs::File) {
     failpoint("aof-fsync-before-reply");
     let synced = (|| {
-        if OLD_LOG_UNSYNCED.load(Ordering::Acquire) {
+        if OLD_LOG_UNSYNCED.load(Ordering::Acquire) != 0 {
             sync_old_log()?;
         }
         file.sync_data()
@@ -1756,10 +1775,17 @@ fn do_fsync() {
         return;
     }
     // Not ahead of the old log a turn-over has moved aside. The checkpoint
-    // syncs that one; if its sync failed, it is tried again here.
-    if OLD_LOG_UNSYNCED.load(Ordering::Acquire) {
+    // syncs that one; if its sync failed, or has yet to be made, it is made
+    // here. Marked synced only if no turn-over was made meanwhile: what this
+    // synced may not be the old log of that one, nor its renames.
+    let seen = OLD_LOG_UNSYNCED.load(Ordering::Acquire);
+    if seen != 0 {
         match sync_old_log() {
-            Ok(()) => OLD_LOG_UNSYNCED.store(false, Ordering::Release),
+            Ok(()) => {
+                // A test holds the writer here, as a slow disk would.
+                failpoint("old-log-synced");
+                old_log_synced(seen);
+            }
             Err(e) => {
                 log_throttled!(
                     10,
