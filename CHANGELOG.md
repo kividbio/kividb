@@ -286,13 +286,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (#447).
 
   **Upgrade note:** an AOF written by 1.2.0, or the stream of a 1.2.0
-  master, may hold an `FT.DROPINDEX`, `FT.ALTER`, `FT.ALIASADD` or
-  `FT.ALIASUPDATE` sent from one database for an index of another. 1.2.1
-  refuses it when it replays or applies it, as it refuses it from a
-  client, and the index is left as it was: not dropped, altered or given
-  the alias. A 1.2.1 replica of a 1.2.0 master can so keep an index its
-  master dropped that way; upgrade the master first, or drop the index
-  from its own database.
+  master, may hold an `FT.ALTER`, `FT.ALIASADD`, `FT.ALIASDEL`,
+  `FT.ALIASUPDATE` or `FT.SYNUPDATE` sent from one database for an index,
+  or an alias, of another. 1.2.0 wrote these under the client's database.
+  1.2.1 refuses them when it replays or applies them, as it refuses them
+  from a client, and the index is left as it was: not altered, given or
+  rid of the alias, or given the synonyms. A 1.2.1 replica of a 1.2.0
+  master, or 1.2.1 started on a 1.2.0 AOF, can so be without a field, an
+  alias or synonyms its master has, or keep an alias its master deleted.
+  Upgrade the master first, and, where it matters, check such an index
+  with `FT.INFO` from its own database afterwards and repeat what is
+  missing there. `FT.DROPINDEX` is not affected: 1.2.0 wrote it under the
+  index's own database, so 1.2.1 drops the index as 1.2.0 did.
 
 - **RDB files from Redis Stack 6.2 load.** Redis Stack 6.2 writes
   RedisGraph's module data (`graphdata`) into every RDB file, with or
