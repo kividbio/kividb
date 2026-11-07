@@ -647,3 +647,131 @@ fn writes_after_field_deadlines_replay_as_made_after_a_kill() {
     let after: Vec<String> = keys.iter().map(|key| state(&mut c, key)).collect();
     assert_eq!(after, before, "{keys:?}");
 }
+
+// ── SORT BY / GET of hash fields (#415 review) ───────────────────────────────
+
+/// `ids` = [1, 2, 3] and `obj:{id}` = { w } with w 30, 40, 20; `obj:2`'s `w`
+/// due at `at`. Sorted by `w` while it lives: 3, 1, 2. Without it: 2 (no
+/// weight sorts as 0), 3, 1.
+fn sort_fixture(c: &mut Conn, at: u64) {
+    assert_eq!(c.cmd(&["RPUSH", "ids", "1", "2", "3"]).i(), 3);
+    for (id, w) in [("1", "30"), ("2", "40"), ("3", "20")] {
+        assert_eq!(
+            c.cmd(&["HSET", &format!("obj:{id}"), "w", w, "keep", "1"])
+                .i(),
+            2
+        );
+    }
+    assert_eq!(
+        c.cmd(&["HPEXPIREAT", "obj:2", &at.to_string(), "FIELDS", "1", "w"]),
+        V::Arr(vec![V::Int(1)])
+    );
+}
+
+/// `SORT ids BY obj:*->w GET # GET obj:*->w STORE dst`: the number stored.
+fn sort_store(c: &mut Conn, dst: &str) -> i64 {
+    c.cmd(&[
+        "SORT", "ids", "BY", "obj:*->w", "GET", "#", "GET", "obj:*->w", "STORE", dst,
+    ])
+    .i()
+}
+
+/// A `SORT … STORE` whose `BY` and `GET` read a field the master's sort
+/// found alive, applied by a replica that lags past the field's deadline.
+/// The `SORT` goes to the replica as it was run, and the replica, which
+/// hid the field by its own clock, stored another list than the master's.
+/// Then one run after the deadline, the master's sweep held off: the master
+/// takes the field as gone, sends its `HDEL` ahead of the `SORT`, and both
+/// sort without it.
+#[cfg(unix)]
+#[test]
+fn a_sort_store_by_a_hash_field_reaches_a_lagging_replica_as_sorted() {
+    let master = Server::start(&[]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let (mut m, mut r) = (master.conn(), replica.conn());
+    wait_link_up(&mut r);
+    let at = unix_ms_now() + 1_000;
+    sort_fixture(&mut m, at);
+    wait_caught_up(&mut m, &mut r);
+
+    replica.signal(libc::SIGSTOP);
+    assert_eq!(sort_store(&mut m, "before"), 6);
+    assert!(unix_ms_now() < at, "the sort came after the deadline");
+    let sorted = m.cmd(&["LRANGE", "before", "0", "-1"]);
+    assert_eq!(
+        format!("{sorted:?}"),
+        format!(
+            "{:?}",
+            V::Arr(
+                ["3", "20", "1", "30", "2", "40"]
+                    .iter()
+                    .map(|s| V::Str(s.to_string()))
+                    .collect()
+            )
+        )
+    );
+    std::thread::sleep(Duration::from_millis(at - unix_ms_now() + 300));
+    replica.signal(libc::SIGCONT);
+    wait_caught_up(&mut m, &mut r);
+    assert_eq!(r.cmd(&["LRANGE", "before", "0", "-1"]), sorted);
+
+    // After the deadline, the field not yet swept on the master.
+    assert_eq!(m.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]).s(), "OK");
+    assert_eq!(m.cmd(&["HSET", "obj:1", "w", "35"]).i(), 0);
+    assert_eq!(
+        m.cmd(&["HPEXPIRE", "obj:1", "200", "FIELDS", "1", "w"]),
+        V::Arr(vec![V::Int(1)])
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(sort_store(&mut m, "after"), 6);
+    assert_eq!(m.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "1"]).s(), "OK");
+    let after = m.cmd(&["LRANGE", "after", "0", "-1"]);
+    assert_eq!(
+        after.arr()[0],
+        V::Str("1".into()),
+        "obj:1's w was past its time"
+    );
+    wait_caught_up(&mut m, &mut r);
+    assert_eq!(r.cmd(&["LRANGE", "after", "0", "-1"]), after);
+    for key in ["obj:1", "obj:2", "obj:3"] {
+        assert_eq!(state(&mut r, key), state(&mut m, key), "{key}");
+    }
+}
+
+/// The same `SORT … STORE`s, logged to the AOF, the server killed and
+/// started again: the replay stores what was stored. It hid the field by
+/// the clock of the replay, after the deadline, and stored another list.
+#[test]
+fn a_sort_store_by_a_hash_field_replays_as_sorted_after_a_kill() {
+    let mut server = start_with_conf(&["--aof"], "appendfsync always\n");
+    let mut c = server.conn();
+    let at = unix_ms_now() + 600;
+    sort_fixture(&mut c, at);
+    assert_eq!(sort_store(&mut c, "before"), 6);
+    assert!(unix_ms_now() < at, "the sort came after the deadline");
+
+    std::thread::sleep(Duration::from_millis(at - unix_ms_now() + 100));
+    assert_eq!(c.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]).s(), "OK");
+    assert_eq!(c.cmd(&["HSET", "obj:1", "w", "35"]).i(), 0);
+    assert_eq!(
+        c.cmd(&["HPEXPIRE", "obj:1", "200", "FIELDS", "1", "w"]),
+        V::Arr(vec![V::Int(1)])
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(sort_store(&mut c, "after"), 6);
+    assert_eq!(c.cmd(&["SET", "last", "1"]).s(), "OK");
+
+    let keys = ["before", "after", "obj:1", "obj:2", "obj:3"];
+    let before: Vec<String> = keys.iter().map(|key| state(&mut c, key)).collect();
+    assert!(before[0].contains(r#""40""#), "{}", before[0]);
+    wait_until("the writes to reach the AOF", 10, || {
+        count(&server.aof(), b"$4\r\nlast\r\n") == 1
+    });
+    server.kill();
+    server.restart();
+    let mut c = server.conn();
+    std::thread::sleep(Duration::from_millis(500));
+    let after: Vec<String> = keys.iter().map(|key| state(&mut c, key)).collect();
+    assert_eq!(after, before, "{keys:?}");
+}
