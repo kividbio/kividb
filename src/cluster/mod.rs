@@ -280,7 +280,7 @@ pub struct ClusterState {
     /// When we last voted for a replica of each master (Unix ms). A master's
     /// replicas are not all granted votes in quick succession, or two of them
     /// could each win an election a moment apart.
-    pub last_vote_for: parking_lot::Mutex<AHashMap<NodeId, u64>>,
+    pub last_vote_for: parking_lot::Mutex<AHashMap<NodeId, std::time::Instant>>,
     /// See [`ClusterHooks`].
     pub hooks: std::sync::OnceLock<ClusterHooks>,
     /// Runtime the cluster bus runs on. Command handlers that need to send a
@@ -306,13 +306,16 @@ pub struct ClusterState {
     handoff_holds: parking_lot::Mutex<u32>,
     /// Handovers of atomic slot migrations away from this node that may
     /// reach their destination's `TAKEOVER` ([`Self::begin_handover`]), and
-    /// when the last of them ended (Unix ms); and how many failovers of
-    /// this node have begun ([`Self::failover_may_begin`],
-    /// [`Self::hold_writes_until_confirmed`]). All three change only under
-    /// `handoff_holds`: a failover and a handover exclude each other (#516).
+    /// when the last of them ended; how many failovers of this node have
+    /// begun ([`Self::failover_may_begin`],
+    /// [`Self::hold_writes_until_confirmed`]), and when the last one did.
+    /// All change only under `handoff_holds`: a failover and a handover
+    /// exclude each other (#516). Monotonic times: a clock stepped back
+    /// must not stretch either window.
     handovers: AtomicU64,
-    last_handover_end_ms: AtomicU64,
+    last_handover_end: parking_lot::Mutex<Option<std::time::Instant>>,
     failovers_begun: AtomicU64,
+    last_failover_began: parking_lot::Mutex<Option<std::time::Instant>>,
     /// This master serves none of its slots, having been told it was marked
     /// FAIL, until it has made sure it still owns them
     /// ([`Self::note_marked_failed`]).
@@ -390,8 +393,9 @@ impl ClusterState {
             held_writes: parking_lot::Mutex::new(None),
             handoff_holds: parking_lot::Mutex::new(0),
             handovers: AtomicU64::new(0),
-            last_handover_end_ms: AtomicU64::new(0),
+            last_handover_end: parking_lot::Mutex::new(None),
             failovers_begun: AtomicU64::new(0),
+            last_failover_began: parking_lot::Mutex::new(None),
             marked_failed: AtomicBool::new(false),
             require_full_coverage: AtomicBool::new(true),
             replica_validity_factor: AtomicU64::new(10),
@@ -2131,10 +2135,22 @@ impl ClusterState {
         if request_epoch < self.current_epoch.load(Ordering::SeqCst) {
             return false;
         }
-        // A failover and the handover of an atomic slot migration exclude
-        // each other (#516). For a replica of this node, see
-        // `failover_may_begin`. For one of a master this node imports from,
-        // the import's attempt is given up: its `TAKEOVER` is refused.
+        // Taken before `handoff_holds` and the tasks of `slot_migrations`
+        // (below), and never while either is held.
+        let mut voted_for = self.last_vote_for.lock();
+        if let Some(at) = voted_for.get(&master_id)
+            && at.elapsed() < std::time::Duration::from_millis(self.node_timeout_ms * 2)
+        {
+            return false;
+        }
+        if request_epoch <= self.last_vote_epoch.load(Ordering::SeqCst) {
+            return false; // already voted in this or a higher epoch
+        }
+        // Only now that the vote would be given: a failover and the
+        // handover of an atomic slot migration exclude each other (#516).
+        // For a replica of this node, see `failover_may_begin`. For one of a
+        // master this node imports from, the import's attempt is given up:
+        // its `TAKEOVER` is refused.
         let fenced = if master_id == me {
             self.failover_may_begin()
         } else {
@@ -2152,14 +2168,6 @@ impl ClusterState {
             return false;
         }
 
-        let now = now_ms();
-        let mut voted_for = self.last_vote_for.lock();
-        if let Some(at) = voted_for.get(&master_id)
-            && now.saturating_sub(*at) < self.node_timeout_ms * 2
-        {
-            return false;
-        }
-
         // Compare-and-swap on last_vote_epoch.
         loop {
             let current = self.last_vote_epoch.load(Ordering::SeqCst);
@@ -2174,7 +2182,7 @@ impl ClusterState {
                 // Voting on epoch N implies seeing N.
                 self.current_epoch
                     .fetch_max(request_epoch, Ordering::SeqCst);
-                voted_for.insert(master_id, now);
+                voted_for.insert(master_id, std::time::Instant::now());
                 return true;
             }
         }
@@ -2526,7 +2534,7 @@ impl ClusterState {
         let _holds = self.handoff_holds.lock();
         // A migration away from this node that has not handed its slots
         // over yet gives the handover up (`begin_handover`).
-        self.failovers_begun.fetch_add(1, Ordering::SeqCst);
+        self.failover_began();
         if pause {
             crate::pause::hold_writes();
         } else {
@@ -2559,14 +2567,35 @@ impl ClusterState {
         self.failovers_begun.load(Ordering::SeqCst)
     }
 
+    /// Count a failover of this node as begun, now. Under `handoff_holds`.
+    fn failover_began(&self) {
+        self.failovers_begun.fetch_add(1, Ordering::SeqCst);
+        *self.last_failover_began.lock() = Some(std::time::Instant::now());
+    }
+
+    /// How long after a failover of a master began a replica of it may still
+    /// be promoted by it: an election lives for [`ELECTION_LIFETIME`], and a
+    /// vote sent at its end is counted for as long as the candidate waits for
+    /// it (the node timeout, at least 2 s). Never less than two node
+    /// timeouts, the time a master waits between votes for replicas of the
+    /// same master. Neither a source nor a destination hands slots over in
+    /// that time after it saw such a failover begin (#516).
+    pub(crate) fn failover_window(&self) -> std::time::Duration {
+        let node_timeout = std::time::Duration::from_millis(self.node_timeout_ms);
+        let vote_wait = node_timeout.max(std::time::Duration::from_secs(2));
+        (ELECTION_LIFETIME + vote_wait).max(node_timeout * 2)
+    }
+
     /// The handoff of an atomic slot migration away from this node is about
     /// to ask the destination to take the slots over (`TAKEOVER`): whether
     /// it may (#516). `still` says whether this node still is what it was
     /// when the migration began: the master of the slots, with its own
     /// dataset and config epoch. No failover of this node may have begun
     /// since the migration did (`failovers_since`, from
-    /// [`Self::failovers_begun`]), nor be in doubt: writes held until this
-    /// node knows whether a replica of it took its slots over.
+    /// [`Self::failovers_begun`]), nor in the [`Self::failover_window`]
+    /// before now, whenever the migration began; nor be in doubt: writes
+    /// held until this node knows whether a replica of it took its slots
+    /// over.
     ///
     /// A replica of the source promoted while the slots moved used to lose
     /// them to the destination all the same. The old master, a replica by
@@ -2585,11 +2614,15 @@ impl ClusterState {
     ) -> Result<(), String> {
         let _holds = self.handoff_holds.lock();
         if self.failovers_begun.load(Ordering::SeqCst) != failovers_since {
-            return Err(
-                "a failover of this node began during the migration (CLUSTER FAILOVER \
-                        on a replica of it, a vote for one, or a FAIL verdict)"
-                    .into(),
-            );
+            return Err(FAILOVER_BEGAN.into());
+        }
+        if let Some(at) = *self.last_failover_began.lock()
+            && at.elapsed() < self.failover_window()
+        {
+            return Err(format!(
+                "{FAILOVER_BEGAN_RECENTLY} {} ms ago, and a replica of it may still be elected",
+                at.elapsed().as_millis()
+            ));
         }
         if self.held_writes.lock().is_some() {
             return Err(
@@ -2608,13 +2641,13 @@ impl ClusterState {
         let _holds = self.handoff_holds.lock();
         let n = self.handovers.load(Ordering::SeqCst);
         self.handovers.store(n.saturating_sub(1), Ordering::SeqCst);
-        self.last_handover_end_ms.store(now_ms(), Ordering::SeqCst);
+        *self.last_handover_end.lock() = Some(std::time::Instant::now());
     }
 
     /// Whether a replica of this master may take its slots over now, as it
     /// asks with `CLUSTER FAILOVER` or for this node's vote (#516). Not while
     /// an atomic slot migration away from this node is handing slots over,
-    /// nor for [`HANDOVER_FAILOVER_GRACE_MS`] after one ended: a promoted
+    /// nor for [`HANDOVER_FAILOVER_GRACE`] after one ended: a promoted
     /// replica claims the slots it sees this node own, and until it has
     /// heard of the destination's claim, those include the ones that moved.
     /// Nor while an import into this node is taking slots over.
@@ -2630,16 +2663,18 @@ impl ClusterState {
                 "an atomic slot migration away from this node is handing its slots over".into(),
             );
         }
-        let since = now_ms().saturating_sub(self.last_handover_end_ms.load(Ordering::SeqCst));
-        if since < HANDOVER_FAILOVER_GRACE_MS {
+        if let Some(at) = *self.last_handover_end.lock()
+            && at.elapsed() < HANDOVER_FAILOVER_GRACE
+        {
             return Err(format!(
-                "an atomic slot migration away from this node ended {since} ms ago: its \
-                 replicas may not have heard yet which slots moved"
+                "an atomic slot migration away from this node ended {} ms ago: its \
+                 replicas may not have heard yet which slots moved; ask again in a few seconds",
+                at.elapsed().as_millis()
             ));
         }
         self.slot_migrations
             .fence_imports(None, "this node is failing over to a replica of it")?;
-        self.failovers_begun.fetch_add(1, Ordering::SeqCst);
+        self.failover_began();
         Ok(())
     }
 
@@ -2893,9 +2928,19 @@ impl ClusterState {
 
 /// How long after an atomic slot migration away from a master handed slots
 /// over its replicas may not take them over (`failover_may_begin`), nor
-/// the destination vote for one of them: two heartbeats, time for them to
+/// the destination vote for one of them: three heartbeats, time for them to
 /// hear of the destination's claim (#516).
-pub(crate) const HANDOVER_FAILOVER_GRACE_MS: u64 = 3_000;
+pub(crate) const HANDOVER_FAILOVER_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(3 * bus::heartbeat::HEARTBEAT_INTERVAL.as_secs());
+
+/// How long an election runs before it is given up (`check_election`).
+pub(crate) const ELECTION_LIFETIME: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Why a migration away from this node gives its handover up when a failover
+/// of it has begun (#516). The tests look for it in the log.
+pub(crate) const FAILOVER_BEGAN: &str = "a failover of this node began during the migration \
+     (CLUSTER FAILOVER on a replica of it, a vote for one, or a FAIL verdict)";
+const FAILOVER_BEGAN_RECENTLY: &str = "a failover of this node began";
 
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3017,6 +3062,7 @@ mod tests {
 
         // A handover begun first: a failover is refused until it has ended,
         // and for a moment after.
+        *cs.last_failover_began.lock() = None;
         let begun = cs.failovers_begun();
         cs.begin_handover(begun, || Ok(())).unwrap();
         let refused = cs.failover_may_begin().unwrap_err();
@@ -3024,11 +3070,17 @@ mod tests {
         cs.end_handover();
         let refused = cs.failover_may_begin().unwrap_err();
         assert!(refused.contains("ended"), "{refused}");
-        cs.last_handover_end_ms
-            .store(now_ms() - HANDOVER_FAILOVER_GRACE_MS, Ordering::SeqCst);
+        *cs.last_handover_end.lock() = None;
         cs.failover_may_begin().unwrap();
 
+        // A handover in the time a replica may still be elected in, by a
+        // failover begun before the migration did, is refused too.
+        let begun = cs.failovers_begun();
+        let refused = cs.begin_handover(begun, || Ok(())).unwrap_err();
+        assert!(refused.contains("may still be elected"), "{refused}");
+
         // A handover this node is no longer fit for holds nothing.
+        *cs.last_failover_began.lock() = None;
         let begun = cs.failovers_begun();
         assert_eq!(
             cs.begin_handover(begun, || Err("not the master".into())),

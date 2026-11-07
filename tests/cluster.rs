@@ -3470,11 +3470,6 @@ fn wait_import_completed(dst: &Node, task_id: &str) {
     });
 }
 
-/// A write routed here before an atomic slot migration handed its slot
-/// over, and held up before the write gate until the handoff had let writes
-/// go again, is sent on with `-MOVED`. It used to run here, on a slot the
-/// destination owned: deleted with the slot's keys, or left behind them
-/// (#331). It waits at the failpoint `routed` (`KIVIDB_TEST_STALL_KEYS`).
 /// `CLUSTER FAILOVER` on the source's replica while a `CLUSTER MIGRATION
 /// IMPORT` from that source runs loses no acknowledged write (#516). The
 /// source waits before its handoff (`KIVIDB_TEST_HANDOFF_DELAY_MS`), with
@@ -3490,7 +3485,7 @@ fn a_failover_of_the_source_during_an_atomic_import_loses_no_acknowledged_write(
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    let (nodes, _) = form_cluster_with_env(3, &[("KIVIDB_TEST_HANDOFF_DELAY_MS", "6000")]);
+    let (nodes, _) = form_cluster_with_env(3, &[("KIVIDB_TEST_HANDOFF_DELAY_MS", "10000")]);
     let (src, dst) = (&nodes[0], &nodes[1]);
     let replica = add_replica(&nodes, src);
     let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
@@ -3599,6 +3594,13 @@ fn a_failover_of_the_source_during_an_atomic_import_loses_no_acknowledged_write(
             })
         },
     );
+    // The source gave its handover up for the failover, by itself: the
+    // destination's refusal is not all that stood in its way.
+    wait_until(
+        "the source to give its handover up",
+        Duration::from_secs(30),
+        || src.log().contains("a failover of this node began"),
+    );
     // Long enough for a node that held the slots' keys to have dropped them.
     std::thread::sleep(Duration::from_secs(3));
     stop.store(true, Ordering::Relaxed);
@@ -3609,12 +3611,32 @@ fn a_failover_of_the_source_during_an_atomic_import_loses_no_acknowledged_write(
     assert!(acked.len() > 100, "{} pushes acknowledged", acked.len());
 
     let mut d = dst.conn();
-    let have: Vec<std::collections::HashSet<String>> = lists
+    let got: Vec<Vec<String>> = lists
         .iter()
         .map(|list| {
             let got = d.cmd(&["LRANGE", list, "0", "-1"]);
             got.array().iter().map(Resp::text).collect()
         })
+        .collect();
+    // Every element is pushed once, by one attempt: one there twice was
+    // applied twice, as by the stream of an earlier attempt's source.
+    let twice: Vec<&String> = got
+        .iter()
+        .flat_map(|elements| {
+            let mut seen = std::collections::HashSet::new();
+            elements.iter().filter(move |e| !seen.insert(*e))
+        })
+        .collect();
+    assert!(
+        twice.is_empty(),
+        "{} pushes applied twice, e.g. {:?}\n{}",
+        twice.len(),
+        &twice[..twice.len().min(5)],
+        logs()
+    );
+    let have: Vec<std::collections::HashSet<String>> = got
+        .iter()
+        .map(|elements| elements.iter().cloned().collect())
         .collect();
     let lost: Vec<&(usize, String)> = acked
         .iter()
@@ -3630,6 +3652,11 @@ fn a_failover_of_the_source_during_an_atomic_import_loses_no_acknowledged_write(
     );
 }
 
+/// A write routed here before an atomic slot migration handed its slot
+/// over, and held up before the write gate until the handoff had let writes
+/// go again, is sent on with `-MOVED`. It used to run here, on a slot the
+/// destination owned: deleted with the slot's keys, or left behind them
+/// (#331). It waits at the failpoint `routed` (`KIVIDB_TEST_STALL_KEYS`).
 #[test]
 fn a_write_routed_before_a_slot_handoff_is_sent_on_not_run_here() {
     let key = key_in(0..=1000, "handoff");
