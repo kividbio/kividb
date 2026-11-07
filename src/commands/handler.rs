@@ -583,6 +583,26 @@ fn order_of_pairs_shared(ctx: &Ctx) -> crate::write_order::OrderGuard {
     crate::write_order::lock_keys_shared(*ctx.selected_db, ctx.cmd[1..].iter().step_by(2).copied())
 }
 
+/// For a script held to a hash tag: the refusal of a `SORT` or `SORT_RO`
+/// whose `BY` or `GET` pattern can name keys outside the tag
+/// (`generics::sort_pattern_outside`). Asked before the command runs, so
+/// nothing is read, and no field removed, before it is refused.
+#[inline(never)]
+fn sort_pattern_outside_the_tag(name: &str, cmd: &[&[u8]]) -> Option<String> {
+    if !matches!(name, "SORT" | "SORT_RO") {
+        return None;
+    }
+    let pattern =
+        crate::commands::generics::sort_pattern_outside(cmd, crate::tag_locks::script_may_touch)?;
+    Some(format!(
+        "ERR Script attempted to run '{}' with the pattern '{}', which looks at keys it does \
+         not name outside the hash tag '{}' of its KEYS (lua-parallel-scripts)",
+        name.to_ascii_lowercase(),
+        String::from_utf8_lossy(pattern),
+        crate::tag_locks::script_tag_for_message()
+    ))
+}
+
 fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     // Re-derive cmd0/name from ctx.cmd in case parts were modified (XREAD BLOCK stripping).
     let cmd0 = ctx.cmd[0];
@@ -620,6 +640,7 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
                         crate::tag_locks::script_tag_for_message()
                     )
                 })
+                .or_else(|| sort_pattern_outside_the_tag(name2, &ctx.cmd))
         };
         if let Some(outside) = outside {
             return resp_error(&outside);

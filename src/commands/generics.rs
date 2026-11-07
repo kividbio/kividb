@@ -192,26 +192,60 @@ fn sort_pattern_parts(pat: &[u8]) -> Option<SortPattern<'_>> {
 /// it does not name too (`handler::takes_the_gate_alone`). Options are read
 /// as `keyspec`'s `SORT` reads them.
 pub(crate) fn sort_reads_hash_fields(cmd: &[&[u8]]) -> bool {
+    sort_patterns(cmd).any(|pat| sort_pattern_parts(pat).is_some_and(|p| p.field.is_some()))
+}
+
+/// The `BY` and `GET` patterns of `SORT` or `SORT_RO` `cmd`, read as
+/// `keyspec`'s `SORT` reads its options: a `LIMIT`'s two numbers and a
+/// `STORE`'s destination are none. Case does not matter.
+fn sort_patterns<'a>(cmd: &'a [&'a [u8]]) -> impl Iterator<Item = &'a [u8]> + 'a {
     let mut i = 2;
-    while i < cmd.len() {
-        let option = cmd[i];
-        if option.eq_ignore_ascii_case(b"LIMIT") {
-            i += 2;
-        } else if option.eq_ignore_ascii_case(b"BY") || option.eq_ignore_ascii_case(b"GET") {
-            if cmd
-                .get(i + 1)
-                .and_then(|pat| sort_pattern_parts(pat))
-                .is_some_and(|pattern| pattern.field.is_some())
-            {
-                return true;
+    std::iter::from_fn(move || {
+        while i < cmd.len() {
+            let option = cmd[i];
+            i += 1;
+            if option.eq_ignore_ascii_case(b"LIMIT") {
+                i += 2;
+            } else if option.eq_ignore_ascii_case(b"BY") || option.eq_ignore_ascii_case(b"GET") {
+                let pat = cmd.get(i).copied();
+                i += 1;
+                if pat.is_some() {
+                    return pat;
+                }
+            } else if option.eq_ignore_ascii_case(b"STORE") {
+                i += 1;
             }
-            i += 1;
-        } else if option.eq_ignore_ascii_case(b"STORE") {
-            i += 1;
         }
-        i += 1;
-    }
-    false
+        None
+    })
+}
+
+/// For `SORT` or `SORT_RO` `cmd` called by a script held to a hash tag
+/// (`lua-parallel-scripts`): the first `BY` or `GET` pattern that can name
+/// a key outside the tag, which `may_touch` tells (`tag_locks`). Such a key
+/// is one the script does not name and holds no lock of: a client's write
+/// to it does not wait for the script, and a field of it the `SORT` finds
+/// past its time would be removed and its `HDEL` sent with another write to
+/// it in between (#415 review). The command gate taken alone for a `SORT`
+/// (`sort_reads_hash_fields`) is no help here, as the script holds the gate
+/// already.
+///
+/// A pattern names keys when it has a `*`; `#` and one without a `*` name
+/// none. One that names keys is kept to the tag only when what comes before
+/// its `*` holds the whole tag: then every key it names carries that tag,
+/// whatever the element (`{q}:w_*`, `{q}:obj:*->w`). Otherwise the element
+/// decides the key, and so the tag. String keys count as hashes do: a read
+/// of one outside the tag is as much outside it as a `GET` of it would be.
+pub(crate) fn sort_pattern_outside<'a>(
+    cmd: &'a [&'a [u8]],
+    may_touch: impl Fn(&[u8]) -> bool,
+) -> Option<&'a [u8]> {
+    sort_patterns(cmd).find(|pat| {
+        sort_pattern_parts(pat).is_some_and(|p| {
+            let prefix = &pat[..p.star];
+            crate::tag_locks::tag_of(prefix).is_none() || !may_touch(prefix)
+        })
+    })
 }
 
 /// What a `SORT` `BY` or `GET` pattern names for `elem`, read as Redis reads
@@ -1684,5 +1718,52 @@ mod sort_gate_tests {
         assert!(!reads(&["SORT", "ids", "STORE", "x:*->y"]));
         assert!(!reads(&["SORT", "ids", "LIMIT", "0", "x:*->y"]));
         assert!(!reads(&["SORT", "ids", "BY"]));
+    }
+
+    /// The first pattern of `args` that can name a key outside the tag `q`.
+    fn outside(args: &[&str]) -> Option<String> {
+        let cmd: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
+        super::sort_pattern_outside(&cmd, |key| crate::tag_locks::tag_of(key) == Some(&b"q"[..]))
+            .map(|pat| String::from_utf8_lossy(pat).into_owned())
+    }
+
+    /// A pattern is kept to a tag only when what comes before its `*`
+    /// holds the whole tag; string keys count as hashes do; `#`, no `*`, a
+    /// destination and a `LIMIT` name nothing.
+    #[test]
+    fn only_a_pattern_whose_prefix_holds_the_tag_keeps_to_it() {
+        let out = |args: &[&str]| outside(args).unwrap_or_default();
+        assert_eq!(out(&["SORT", "{q}:ids", "BY", "obj:*->w"]), "obj:*->w");
+        assert_eq!(
+            out(&["SORT_RO", "{q}:ids", "GET", "#", "GET", "o:*->n"]),
+            "o:*->n"
+        );
+        assert_eq!(out(&["sort", "{q}:ids", "bY", "w_*"]), "w_*");
+        assert_eq!(out(&["sort", "{q}:ids", "gEt", "{r}:*"]), "{r}:*");
+        // The element would close the tag, or there is none before the `*`.
+        assert_eq!(out(&["SORT", "{q}:ids", "BY", "{q*}->w"]), "{q*}->w");
+        assert_eq!(out(&["SORT", "{q}:ids", "BY", "*{q}->w"]), "*{q}->w");
+        assert_eq!(out(&["SORT", "{q}:ids", "BY", "{}*{q}"]), "{}*{q}");
+        // The first `*` is the element's, whatever follows.
+        assert_eq!(out(&["SORT", "{q}:ids", "BY", "a*{q}*"]), "a*{q}*");
+        assert_eq!(outside(&["SORT", "{q}:ids", "BY", "{q}:obj:*->w"]), None);
+        assert_eq!(outside(&["SORT", "{q}:ids", "GET", "x{q}y*"]), None);
+        assert_eq!(
+            outside(&["SORT", "{q}:ids", "BY", "{q}*", "GET", "#"]),
+            None
+        );
+        assert_eq!(outside(&["SORT", "{q}:ids"]), None);
+        assert_eq!(outside(&["SORT", "{q}:ids", "BY", "nosort"]), None);
+        assert_eq!(outside(&["SORT", "{q}:ids", "BY", "obj->w"]), None);
+        assert_eq!(outside(&["SORT", "{q}:ids", "STORE", "x:*->y"]), None);
+        assert_eq!(outside(&["SORT", "{q}:ids", "LIMIT", "0", "x:*->y"]), None);
+        assert_eq!(outside(&["SORT", "{q}:ids", "GET"]), None);
+        // Each pattern is asked, not only the first.
+        assert_eq!(
+            out(&[
+                "SORT", "{q}:ids", "BY", "{q}:*", "LIMIT", "0", "1", "GET", "{q}:*", "GET", "o*"
+            ]),
+            "o*"
+        );
     }
 }
