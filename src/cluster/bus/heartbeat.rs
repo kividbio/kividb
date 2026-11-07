@@ -719,6 +719,15 @@ pub(crate) async fn answer_mfstart(
         }
         (replica.ip.clone(), replica.client_port)
     };
+    // Not while an atomic slot migration away from this node hands slots
+    // over (#516): see `ClusterState::failover_may_begin`.
+    if let Err(why) = state.failover_may_begin() {
+        log_warn!(
+            "Cluster: Manual failover requested by {} refused: {why}",
+            node_id_str(&replica_id)
+        );
+        return None;
+    }
 
     // Held until the replica has taken over (this node follows it then), or,
     // once the replica's time is up, until this node has made sure it still

@@ -304,6 +304,15 @@ pub struct ClusterState {
     /// when neither they nor [`Self::held_writes`] hold them any more;
     /// whichever of the two ends last lets them go, under this lock.
     handoff_holds: parking_lot::Mutex<u32>,
+    /// Handovers of atomic slot migrations away from this node that may
+    /// reach their destination's `TAKEOVER` ([`Self::begin_handover`]), and
+    /// when the last of them ended (Unix ms); and how many failovers of
+    /// this node have begun ([`Self::failover_may_begin`],
+    /// [`Self::hold_writes_until_confirmed`]). All three change only under
+    /// `handoff_holds`: a failover and a handover exclude each other (#516).
+    handovers: AtomicU64,
+    last_handover_end_ms: AtomicU64,
+    failovers_begun: AtomicU64,
     /// This master serves none of its slots, having been told it was marked
     /// FAIL, until it has made sure it still owns them
     /// ([`Self::note_marked_failed`]).
@@ -380,6 +389,9 @@ impl ClusterState {
             lost: LostDataset::default(),
             held_writes: parking_lot::Mutex::new(None),
             handoff_holds: parking_lot::Mutex::new(0),
+            handovers: AtomicU64::new(0),
+            last_handover_end_ms: AtomicU64::new(0),
+            failovers_begun: AtomicU64::new(0),
             marked_failed: AtomicBool::new(false),
             require_full_coverage: AtomicBool::new(true),
             replica_validity_factor: AtomicU64::new(10),
@@ -2119,6 +2131,26 @@ impl ClusterState {
         if request_epoch < self.current_epoch.load(Ordering::SeqCst) {
             return false;
         }
+        // A failover and the handover of an atomic slot migration exclude
+        // each other (#516). For a replica of this node, see
+        // `failover_may_begin`. For one of a master this node imports from,
+        // the import's attempt is given up: its `TAKEOVER` is refused.
+        let fenced = if master_id == me {
+            self.failover_may_begin()
+        } else {
+            self.slot_migrations.fence_imports(
+                Some(master_id),
+                "a replica of the source is being elected to take its slots over",
+            )
+        };
+        if let Err(why) = fenced {
+            log_info!(
+                "Cluster: Not voting for {} to take over from {}: {why}",
+                node_id_str(&candidate),
+                node_id_str(&master_id)
+            );
+            return false;
+        }
 
         let now = now_ms();
         let mut voted_for = self.last_vote_for.lock();
@@ -2492,6 +2524,9 @@ impl ClusterState {
         // Not to be let go by a handoff that ends in between (see
         // `end_handoff_hold`).
         let _holds = self.handoff_holds.lock();
+        // A migration away from this node that has not handed its slots
+        // over yet gives the handover up (`begin_handover`).
+        self.failovers_begun.fetch_add(1, Ordering::SeqCst);
         if pause {
             crate::pause::hold_writes();
         } else {
@@ -2515,6 +2550,97 @@ impl ClusterState {
                 })
             }
         }
+    }
+
+    /// How many failovers of this node have begun: a replica of it was told
+    /// to go ahead (`CLUSTER FAILOVER`) or given its vote, or it was marked
+    /// FAIL. See [`Self::begin_handover`].
+    pub(crate) fn failovers_begun(&self) -> u64 {
+        self.failovers_begun.load(Ordering::SeqCst)
+    }
+
+    /// The handoff of an atomic slot migration away from this node is about
+    /// to ask the destination to take the slots over (`TAKEOVER`): whether
+    /// it may (#516). `still` says whether this node still is what it was
+    /// when the migration began: the master of the slots, with its own
+    /// dataset and config epoch. No failover of this node may have begun
+    /// since the migration did (`failovers_since`, from
+    /// [`Self::failovers_begun`]), nor be in doubt: writes held until this
+    /// node knows whether a replica of it took its slots over.
+    ///
+    /// A replica of the source promoted while the slots moved used to lose
+    /// them to the destination all the same. The old master, a replica by
+    /// then, handed them over from its own dataset, and the destination took
+    /// them at a newer epoch. What the new master had acknowledged was lost:
+    /// the writes since its promotion, which the migration's stream never
+    /// carried, and the writes it took until it heard of the destination's
+    /// claim, deleted with the slots. A failover and a handover now exclude
+    /// each other: this is decided under the same lock as
+    /// [`Self::failover_may_begin`], which refuses a failover from here
+    /// until [`Self::end_handover`], and for a moment after.
+    pub(crate) fn begin_handover(
+        &self,
+        failovers_since: u64,
+        still: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let _holds = self.handoff_holds.lock();
+        if self.failovers_begun.load(Ordering::SeqCst) != failovers_since {
+            return Err(
+                "a failover of this node began during the migration (CLUSTER FAILOVER \
+                        on a replica of it, a vote for one, or a FAIL verdict)"
+                    .into(),
+            );
+        }
+        if self.held_writes.lock().is_some() {
+            return Err(
+                "this node does not know yet whether a replica of it has taken its slots over"
+                    .into(),
+            );
+        }
+        still()?;
+        self.handovers.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// A handover that [`Self::begin_handover`] let begin has ended, however
+    /// it ended.
+    pub(crate) fn end_handover(&self) {
+        let _holds = self.handoff_holds.lock();
+        let n = self.handovers.load(Ordering::SeqCst);
+        self.handovers.store(n.saturating_sub(1), Ordering::SeqCst);
+        self.last_handover_end_ms.store(now_ms(), Ordering::SeqCst);
+    }
+
+    /// Whether a replica of this master may take its slots over now, as it
+    /// asks with `CLUSTER FAILOVER` or for this node's vote (#516). Not while
+    /// an atomic slot migration away from this node is handing slots over,
+    /// nor for [`HANDOVER_FAILOVER_GRACE_MS`] after one ended: a promoted
+    /// replica claims the slots it sees this node own, and until it has
+    /// heard of the destination's claim, those include the ones that moved.
+    /// Nor while an import into this node is taking slots over.
+    ///
+    /// If it may, a migration away from this node that has not reached its
+    /// handover gives it up ([`Self::begin_handover`]), and the imports into
+    /// this node give their attempt up: a replica that takes over has only
+    /// what the stream has brought, and is no destination of theirs.
+    pub(crate) fn failover_may_begin(&self) -> Result<(), String> {
+        let _holds = self.handoff_holds.lock();
+        if self.handovers.load(Ordering::SeqCst) > 0 {
+            return Err(
+                "an atomic slot migration away from this node is handing its slots over".into(),
+            );
+        }
+        let since = now_ms().saturating_sub(self.last_handover_end_ms.load(Ordering::SeqCst));
+        if since < HANDOVER_FAILOVER_GRACE_MS {
+            return Err(format!(
+                "an atomic slot migration away from this node ended {since} ms ago: its \
+                 replicas may not have heard yet which slots moved"
+            ));
+        }
+        self.slot_migrations
+            .fence_imports(None, "this node is failing over to a replica of it")?;
+        self.failovers_begun.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Whether this master holds writes until it has made sure it still owns
@@ -2765,6 +2891,12 @@ impl ClusterState {
     }
 }
 
+/// How long after an atomic slot migration away from a master handed slots
+/// over its replicas may not take them over (`failover_may_begin`), nor
+/// the destination vote for one of them: two heartbeats, time for them to
+/// hear of the destination's claim (#516).
+pub(crate) const HANDOVER_FAILOVER_GRACE_MS: u64 = 3_000;
+
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -2867,6 +2999,42 @@ mod tests {
         let b = add_master(&cs, 10923..=16383);
         cs.refresh_state();
         (cs, a, b)
+    }
+
+    /// A failover of this master and the handover of an atomic slot
+    /// migration away from it exclude each other (#516).
+    #[test]
+    fn a_failover_and_a_slot_handover_exclude_each_other() {
+        let (cs, _, _) = three_master_cluster();
+        // A failover begun during the migration: its handover is refused.
+        let begun = cs.failovers_begun();
+        cs.failover_may_begin().unwrap();
+        let refused = cs.begin_handover(begun, || Ok(())).unwrap_err();
+        assert!(
+            refused.contains("a failover of this node began"),
+            "{refused}"
+        );
+
+        // A handover begun first: a failover is refused until it has ended,
+        // and for a moment after.
+        let begun = cs.failovers_begun();
+        cs.begin_handover(begun, || Ok(())).unwrap();
+        let refused = cs.failover_may_begin().unwrap_err();
+        assert!(refused.contains("handing its slots over"), "{refused}");
+        cs.end_handover();
+        let refused = cs.failover_may_begin().unwrap_err();
+        assert!(refused.contains("ended"), "{refused}");
+        cs.last_handover_end_ms
+            .store(now_ms() - HANDOVER_FAILOVER_GRACE_MS, Ordering::SeqCst);
+        cs.failover_may_begin().unwrap();
+
+        // A handover this node is no longer fit for holds nothing.
+        let begun = cs.failovers_begun();
+        assert_eq!(
+            cs.begin_handover(begun, || Err("not the master".into())),
+            Err("not the master".to_string())
+        );
+        cs.failover_may_begin().unwrap();
     }
 
     // ── A write routed before a slot left (#331, #337) ───────────────────

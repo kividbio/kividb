@@ -281,6 +281,53 @@ impl Registry {
         }
     }
 
+    /// A failover is about to hand the slots of `source` (with `None`, of
+    /// this node) to a replica of it (#516): the imports from it give their
+    /// current attempt up, as when the source gives one up ([`Self::fence`]),
+    /// and its `TAKEOVER` is refused. They retry, from the slots' owner then.
+    /// Refused itself, with why, if one of them is taking the slots over
+    /// now, or, from `source`, took them over in the last
+    /// [`super::HANDOVER_FAILOVER_GRACE_MS`]: the replica would claim slots
+    /// that are this node's.
+    pub(crate) fn fence_imports(&self, source: Option<NodeId>, why: &str) -> Result<(), String> {
+        let mut tasks = self.tasks.lock();
+        let now = now_ms();
+        let from = |t: &Task| {
+            t.operation == Operation::Import && source.is_none_or(|source| t.source == source)
+        };
+        if let Some(t) = tasks
+            .iter()
+            .find(|t| from(t) && t.state == TaskState::InProgress && t.taking_over)
+        {
+            return Err(format!(
+                "this node is taking slots {} over in an atomic slot migration",
+                ranges_text(&t.ranges)
+            ));
+        }
+        if source.is_some()
+            && let Some(t) = tasks.iter().find(|t| {
+                from(t)
+                    && t.state == TaskState::Completed
+                    && now.saturating_sub(t.end_time_ms) < super::HANDOVER_FAILOVER_GRACE_MS
+            })
+        {
+            return Err(format!(
+                "this node took slots {} over from that master {} ms ago",
+                ranges_text(&t.ranges),
+                now.saturating_sub(t.end_time_ms)
+            ));
+        }
+        for t in tasks
+            .iter_mut()
+            .filter(|t| from(t) && t.state == TaskState::InProgress)
+        {
+            if !t.attempt_failed.swap(true, Ordering::SeqCst) {
+                t.last_error = why.to_string();
+            }
+        }
+        Ok(())
+    }
+
     /// `f` of the slot ranges of the atomic imports in progress here, but
     /// for the one with the id `except`, with the tasks locked: none begins
     /// or ends meanwhile.
@@ -1145,8 +1192,16 @@ pub fn start_source(env: Env, task_id: &str, dest: NodeId, ranges: Ranges) -> Re
     if dest == me {
         return Err("cannot migrate slots to myself".into());
     }
-    if cluster.my_master_id().is_some() {
+    if cluster.my_master_id().is_some() || env.repl_state.is_slave() {
         return Err("I am a replica".into());
+    }
+    // A replica of this node may be taking its slots over (#516).
+    if cluster.writes_held() {
+        return Err(
+            "a failover of this node is under way: it does not know yet whether a \
+                    replica of it has taken its slots over"
+                .into(),
+        );
     }
     if let Some(slot) = slots_of(&ranges).find(|s| !cluster.owns_slot(*s)) {
         return Err(format!("I am not the owner of slot {slot}"));
@@ -1276,6 +1331,18 @@ fn migrate_out(env: &Env, task: &Task) -> Result<u64, String> {
             Ok(())
         }
     };
+    // What this node is as the migration begins: the slots are its to hand
+    // over only while it still is (#516).
+    let failovers_at_start = env.cluster.failovers_begun();
+    let own_at_start = OwnDataset::now(&env.repl_state).ok_or("I am a replica")?;
+    let config_epoch = || {
+        env.cluster
+            .nodes
+            .read()
+            .get(&env.cluster.myself())
+            .map(|n| n.config_epoch)
+    };
+    let epoch_at_start = config_epoch();
     let mut peer = Peer::connect(env, &task.dest)?;
     give_definitions(env, &mut peer);
 
@@ -1336,6 +1403,14 @@ fn migrate_out(env: &Env, task: &Task) -> Result<u64, String> {
         }
     }
 
+    if let Some(delay) = test_failpoint(&TEST_HANDOFF_DELAY) {
+        log_warn!(
+            "Cluster: (test) the handoff of slots {} waits {delay:?}",
+            ranges_text(&task.ranges)
+        );
+        std::thread::sleep(delay);
+    }
+
     // ── Handoff ──────────────────────────────────────────────────────────
     // Pause client writes, let the ones in flight finish, send what they
     // wrote, and hand the slots over.
@@ -1393,6 +1468,35 @@ fn migrate_out(env: &Env, task: &Task) -> Result<u64, String> {
         // and the slots must not move without it.
         return Err("writes were let go (CLIENT UNPAUSE) before the slots were handed over".into());
     }
+    // Only by the master of the slots, as it was when the migration began,
+    // and not if a failover of it has begun since: a replica of it may
+    // have taken the slots over, and served writes to them that never
+    // reached the destination (#516). From here until the handover ends,
+    // a failover of this node is refused.
+    env.cluster.begin_handover(failovers_at_start, || {
+        if !own_at_start.still(&env.repl_state) || env.cluster.my_master_id().is_some() {
+            return Err("this node has become a replica".into());
+        }
+        if let Some(slot) = slots_of(&task.ranges).find(|&s| !env.cluster.owns_slot(s)) {
+            return Err(format!("slot {slot} is no longer this node's"));
+        }
+        let epoch = config_epoch();
+        if epoch != epoch_at_start {
+            return Err(format!(
+                "this node's config epoch went from {} to {} during the migration",
+                epoch_at_start.unwrap_or(0),
+                epoch.unwrap_or(0)
+            ));
+        }
+        Ok(())
+    })?;
+    struct Handover<'a>(&'a ClusterState);
+    impl Drop for Handover<'_> {
+        fn drop(&mut self) {
+            self.0.end_handover();
+        }
+    }
+    let _handover = Handover(&env.cluster);
 
     let deadline = paused_at + Duration::from_millis(pause_timeout);
     let _ = peer.sock.set_read_timeout(Some(
@@ -1791,6 +1895,17 @@ fn run_import(env: Env, task_id: String) {
             save_imports(&env.cluster);
             return;
         }
+        // A replica of this node took its slots over: it is no destination.
+        // What arrived is its new master's to keep or drop.
+        if env.cluster.my_master_id().is_some() {
+            registry.finish(
+                &task_id,
+                TaskState::Failed,
+                Some("this node has become a replica".into()),
+            );
+            save_imports(&env.cluster);
+            return;
+        }
 
         // The owner may have changed since the last attempt (a failover).
         let source = match single_owner(&env.cluster, &task.ranges) {
@@ -1938,7 +2053,8 @@ pub fn accept_apply(cluster: &ClusterState, task_id: &str) -> Result<(), String>
         Some(task)
             if task.operation == Operation::Import
                 && task.state == TaskState::InProgress
-                && !task.cancel.load(Ordering::Relaxed) =>
+                && !task.cancel.load(Ordering::Relaxed)
+                && !task.attempt_failed.load(Ordering::SeqCst) =>
         {
             task.last_activity_ms.store(now_ms(), Ordering::Relaxed);
             Ok(())
@@ -1977,6 +2093,21 @@ fn take_over_now(cluster: &ClusterState, task_id: &str, client_id: u64) -> Resul
     // Refused if the source has given this attempt up meanwhile: it has
     // been told that the slots stay with it, and takes writes again.
     let task = cluster.slot_migrations.begin_takeover(task_id, client_id)?;
+    // Only from the master of the slots, as this node sees it (#516). From
+    // here a vote for a replica of the source is refused (`fence_imports`).
+    if let Err(why) = source_still_owns(cluster, &task) {
+        task.attempt_failed.store(true, Ordering::SeqCst);
+        cluster.slot_migrations.takeover_undone(task_id);
+        cluster
+            .slot_migrations
+            .update(task_id, |t| t.last_error = why.clone());
+        log_warn!(
+            "Cluster: Not taking slots {} over from {}: {why}",
+            ranges_text(&task.ranges),
+            super::node_id_str(&task.source)
+        );
+        return Err(why);
+    }
     // The source keeps client writes paused until it knows how this ends.
     let started = Instant::now();
     // Saved before the source is told: it deletes its copy when told, and a
@@ -2007,6 +2138,40 @@ fn take_over_now(cluster: &ClusterState, task_id: &str, client_id: u64) -> Resul
         super::node_id_str(&task.source),
         started.elapsed().as_millis()
     );
+    Ok(())
+}
+
+/// Whether the source of `task` is still the master of its slots, in this
+/// node's view, for the destination to take them over (#516). A replica of
+/// the source that has taken them over, or is being elected to, serves
+/// writes that the source never sent; taken over from the source, the slots
+/// would lose them.
+fn source_still_owns(cluster: &ClusterState, task: &Task) -> Result<(), String> {
+    if cluster.my_master_id().is_some() {
+        return Err("this node has become a replica".into());
+    }
+    let source = super::node_id_str(&task.source).to_string();
+    let master = cluster.nodes.read().get(&task.source).is_some_and(|n| {
+        n.flags.contains(super::NodeFlags::MASTER) && !n.flags.contains(super::NodeFlags::FAIL)
+    });
+    if !master {
+        return Err(format!("the source {source} is no longer a master here"));
+    }
+    if let Some(slot) = slots_of(&task.ranges).find(|&s| cluster.slot_owner(s) != Some(task.source))
+    {
+        return Err(format!(
+            "slot {slot} is no longer the source's here: a replica of it may have taken it over"
+        ));
+    }
+    let voted = cluster.last_vote_for.lock().get(&task.source).copied();
+    if let Some(at) = voted
+        && now_ms().saturating_sub(at) < cluster.node_timeout_ms.saturating_mul(2)
+    {
+        return Err(format!(
+            "this node voted for a replica of the source {source} to take its slots over {} ms ago",
+            now_ms().saturating_sub(at)
+        ));
+    }
     Ok(())
 }
 
@@ -2062,6 +2227,12 @@ static TEST_TAKEOVER_REPLY_DELAY: (&str, AtomicBool) = (
     "KIVIDB_TEST_TAKEOVER_REPLY_DELAY_MS",
     AtomicBool::new(false),
 );
+
+/// `KIVIDB_TEST_HANDOFF_DELAY_MS`, never set otherwise: the first migration
+/// away from this node waits this long before its handoff, with the stream
+/// still running, as a long one does, for a failover to come meanwhile.
+static TEST_HANDOFF_DELAY: (&str, AtomicBool) =
+    ("KIVIDB_TEST_HANDOFF_DELAY_MS", AtomicBool::new(false));
 
 /// The delay a failpoint asks for, the first time it is reached.
 fn test_failpoint(failpoint: &(&str, AtomicBool)) -> Option<Duration> {
@@ -2257,6 +2428,38 @@ mod tests {
         registry.add(d).unwrap();
         assert!(registry.begin_takeover("d", 100).is_err());
         assert!(registry.begin_takeover("d", 101).is_ok());
+    }
+
+    /// A failover of the source fences the imports from it (#516): their
+    /// current attempt is given up, and its `TAKEOVER` refused. Not while one
+    /// is taking the slots over, nor just after one took them from it.
+    #[test]
+    fn a_failover_of_the_source_fences_the_imports_from_it() {
+        let source = super::super::generate_node_id();
+        let other = super::super::generate_node_id();
+        let registry = Registry::default();
+        let from = |id: &str, ranges: Ranges, source| {
+            let mut t = task(id, ranges);
+            t.source = source;
+            t
+        };
+        registry.add(from("a", vec![(0, 10)], source)).unwrap();
+        registry.add(from("b", vec![(20, 30)], other)).unwrap();
+        assert_eq!(registry.fence_imports(Some(source), "elected"), Ok(()));
+        assert_eq!(registry.get("a").unwrap().last_error, "elected");
+        assert!(registry.begin_takeover("a", 1).is_err());
+        // Another source's import goes on.
+        assert!(registry.begin_takeover("b", 1).is_ok());
+        // One taking its slots over refuses the failover of its source, and
+        // of this node (`None`)...
+        let refused = registry.fence_imports(Some(other), "x").unwrap_err();
+        assert!(refused.contains("taking slots 20-30 over"), "{refused}");
+        assert!(registry.fence_imports(None, "x").is_err());
+        // ... and once it has, its source's, for a moment.
+        registry.finish("b", TaskState::Completed, None);
+        let refused = registry.fence_imports(Some(other), "x").unwrap_err();
+        assert!(refused.contains("took slots 20-30 over"), "{refused}");
+        assert_eq!(registry.fence_imports(None, "x"), Ok(()));
     }
 
     #[test]
