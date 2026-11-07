@@ -87,6 +87,40 @@ impl Drop for WatchScope {
     }
 }
 
+/// A test's [`AfterRemoval`] hook.
+#[cfg(test)]
+type RemovalHook = Box<dyn FnMut(&[u8])>;
+
+#[cfg(test)]
+thread_local! {
+    /// For a test: run on this thread between the removal of a hash's due
+    /// fields and the propagation of their `HDEL`, with the hash's key
+    /// ([`AfterRemoval`]). The moment another write to the hash must not
+    /// fall into.
+    static AFTER_REMOVAL: std::cell::RefCell<Option<RemovalHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// For a test: `hook` runs on this thread after each removal of due fields
+/// and before their `HDEL` is sent, until this is dropped.
+#[cfg(test)]
+pub(crate) struct AfterRemoval;
+
+#[cfg(test)]
+impl AfterRemoval {
+    pub(crate) fn run(hook: impl FnMut(&[u8]) + 'static) -> Self {
+        AFTER_REMOVAL.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for AfterRemoval {
+    fn drop(&mut self) {
+        AFTER_REMOVAL.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
 fn store_id(store: &Store) -> usize {
     std::sync::Arc::as_ptr(store) as *const () as usize
 }
@@ -291,6 +325,12 @@ fn expire_ordered(
     if fields.is_empty() {
         return (Expired::default(), next);
     }
+    #[cfg(test)]
+    AFTER_REMOVAL.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(key);
+        }
+    });
     let key_removed = taken.is_some();
     if let Some(told) = told {
         if key_removed {
@@ -1570,6 +1610,184 @@ mod propagation_tests {
         crate::watch::WatchNotifier::unwatch_all(&*registry, &[flag]);
     }
 
+    /// What `stream`, the records a master sent, makes of an empty store
+    /// when applied in order: as a replica applies its master's stream, or,
+    /// with `aof`, as the AOF is replayed at startup.
+    fn applied(m: &Master, stream: Vec<Vec<String>>, aof: bool) -> Master {
+        let _replay = aof.then(crate::expiry::replay);
+        let replica = store::new_store(1);
+        std::mem::forget(Arc::clone(&replica));
+        let repl = Arc::new(ReplState::new_master());
+        let applier = ReplicationApplyEnv::new_inert();
+        let config = Arc::new(crate::config::Config::default_replica());
+        let dict = crate::vector::new_dict_store();
+        let wait = Arc::new(crate::wait_table::WaitTable::new());
+        let ts = crate::store::new_ts_index();
+        let (compaction_tx, _rx) = crate::vector::new_compaction_channel();
+        let replica_index = crate::vector::new_index_store();
+        let mut db = 0usize;
+        for command in stream {
+            applier
+                .apply_command(
+                    command.into_iter().map(String::into_bytes).collect(),
+                    &replica,
+                    &repl,
+                    &replica_index,
+                    &dict,
+                    &wait,
+                    &ts,
+                    &config,
+                    &compaction_tx,
+                    &mut db,
+                    &crate::watch::NoopWatchRegistry,
+                    "replica:test",
+                )
+                .unwrap();
+        }
+        Master {
+            store: replica,
+            repl,
+            index: replica_index,
+            hub_tx: m.hub_tx.clone(),
+            rx: mpsc::unbounded_channel().1,
+            env: ReplicationApplyEnv::new_inert(),
+            _own: super::OwnWatches::of(&store::new_store(1)),
+        }
+    }
+
+    /// A `SORT` whose `BY` and `GET` read a field of a hash it does not
+    /// name, found past its time, and another client's `HINCRBY` of that
+    /// field, run at the one moment it must not fall into: after the `SORT`
+    /// has removed the field and before the field's `HDEL` is sent. The
+    /// `SORT` holds the order of the keys it names, and the removal, made
+    /// inside it, took none of the hash's: the `HINCRBY` went in there, and
+    /// the stream carried `HINCRBY h f 1` and then `HDEL h f`. The master
+    /// kept `f` = 1; a replica and a replay of the AOF, holding the field
+    /// until its `HDEL`, made it 41 and then removed it (#415 review). Such
+    /// a `SORT` now takes the command gate alone: the `HINCRBY` waits for
+    /// it, and follows the `HDEL`. With `STORE` and without.
+    #[test]
+    fn a_write_to_a_hash_a_sort_reads_falls_after_the_hdel_of_its_due_field() {
+        for store in [true, false] {
+            let mut m = master();
+            assert_eq!(m.run(&["RPUSH", "ids", "1", "2", "3"]), ":3\r\n");
+            for (id, w) in [("1", "30"), ("2", "40"), ("3", "20")] {
+                m.run(&["HSET", &format!("obj:{id}"), "w", w, "keep", "1"]);
+            }
+            m.run(&["HPEXPIRE", "obj:2", "60000", "FIELDS", "1", "w"]);
+            m.due("obj:2", "w");
+            let setup = m.sent();
+
+            // The writer, held until the SORT has removed the field.
+            let (go, wait_for_go) = std::sync::mpsc::channel::<()>();
+            let (wrote, written) = std::sync::mpsc::channel::<String>();
+            let writer = {
+                let (store, repl, index, hub_tx) = (
+                    Arc::clone(&m.store),
+                    Arc::clone(&m.repl),
+                    Arc::clone(&m.index),
+                    m.hub_tx.clone(),
+                );
+                std::thread::spawn(move || {
+                    wait_for_go.recv().unwrap();
+                    let env = ReplicationApplyEnv::new_inert();
+                    let cmd: [&[u8]; 4] = [b"HINCRBY", b"obj:2", b"w", b"1"];
+                    let reply = run_as_client(
+                        &env,
+                        &cmd,
+                        &store,
+                        &repl,
+                        &index,
+                        &hub_tx,
+                        &crate::watch::NoopWatchRegistry,
+                    );
+                    // Unheard if it came after the moment: the hook is gone by then.
+                    let _ = wrote.send(String::from_utf8(reply).unwrap());
+                })
+            };
+            // At the moment between the removal and its HDEL: the writer is
+            // let go, and given time to finish there if anything lets it.
+            let in_between = Arc::new(std::sync::Mutex::new(None::<String>));
+            let hook = {
+                let in_between = Arc::clone(&in_between);
+                let mut go = Some(go);
+                super::AfterRemoval::run(move |key| {
+                    if key == b"obj:2"
+                        && let Some(go) = go.take()
+                    {
+                        go.send(()).unwrap();
+                        *in_between.lock().unwrap() =
+                            written.recv_timeout(Duration::from_millis(500)).ok();
+                    }
+                })
+            };
+            let mut sort = vec![
+                "SORT", "ids", "BY", "obj:*->w", "GET", "#", "GET", "obj:*->w",
+            ];
+            if store {
+                sort.extend(["STORE", "dst"]);
+            }
+            let reply = m.run(&sort);
+            drop(hook);
+            writer.join().unwrap();
+            assert_eq!(
+                *in_between.lock().unwrap(),
+                None,
+                "the HINCRBY ran between the removal and its HDEL"
+            );
+            let sorted = "*6\r\n$1\r\n2\r\n$-1\r\n$1\r\n3\r\n$2\r\n20\r\n$1\r\n1\r\n$2\r\n30\r\n";
+            if store {
+                assert_eq!(reply, ":6\r\n");
+            } else {
+                assert_eq!(reply, sorted);
+            }
+
+            // The master: the field went, and HINCRBY made it anew, for good.
+            assert_eq!(
+                m.held("obj:2").unwrap(),
+                [("keep".into(), "1".into()), ("w".into(), "1".into())]
+            );
+            assert_eq!(
+                m.run(&["HTTL", "obj:2", "FIELDS", "1", "w"]),
+                "*1\r\n:-1\r\n"
+            );
+            // The stream: the HDEL first.
+            let stream = m.sent();
+            let whole: Vec<Vec<String>> = setup
+                .iter()
+                .cloned()
+                .chain(stream.iter().cloned())
+                .collect();
+            let at = |what: &[&str]| {
+                stream
+                    .iter()
+                    .position(|c| c == &cmd(what))
+                    .unwrap_or_else(|| panic!("no {what:?} in {stream:?}"))
+            };
+            assert!(
+                at(&["HDEL", "obj:2", "w"]) < at(&["HINCRBY", "obj:2", "w", "1"]),
+                "{stream:?}"
+            );
+            // A replica, and a replay of the AOF, end where the master is.
+            for aof in [false, true] {
+                let replayed = applied(&m, whole.clone(), aof);
+                for key in ["obj:1", "obj:2", "obj:3"] {
+                    assert_eq!(m.held(key), replayed.held(key), "{key}, aof {aof}");
+                }
+                if store {
+                    let list =
+                        "*6\r\n$1\r\n2\r\n$0\r\n\r\n$1\r\n3\r\n$2\r\n20\r\n$1\r\n1\r\n$2\r\n30\r\n";
+                    assert_eq!(m.run(&["LRANGE", "dst", "0", "-1"]), list);
+                    assert_eq!(
+                        replayed.run(&["LRANGE", "dst", "0", "-1"]),
+                        list,
+                        "aof {aof}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Writers, readers and the sweep at once, near the deadlines: the
     /// stream, applied in order with fields held, gives what the master
     /// holds.
@@ -1653,44 +1871,7 @@ mod propagation_tests {
         let stream = m.sent();
         assert!(stream.iter().any(|c| c[0] == "HDEL"), "nothing expired");
 
-        let replica = store::new_store(1);
-        std::mem::forget(Arc::clone(&replica));
-        let repl = Arc::new(ReplState::new_master());
-        let applier = ReplicationApplyEnv::new_inert();
-        let config = Arc::new(crate::config::Config::default_replica());
-        let dict = crate::vector::new_dict_store();
-        let wait = Arc::new(crate::wait_table::WaitTable::new());
-        let ts = crate::store::new_ts_index();
-        let (compaction_tx, _rx) = crate::vector::new_compaction_channel();
-        let replica_index = crate::vector::new_index_store();
-        let mut db = 0usize;
-        for command in stream {
-            applier
-                .apply_command(
-                    command.into_iter().map(String::into_bytes).collect(),
-                    &replica,
-                    &repl,
-                    &replica_index,
-                    &dict,
-                    &wait,
-                    &ts,
-                    &config,
-                    &compaction_tx,
-                    &mut db,
-                    &crate::watch::NoopWatchRegistry,
-                    "replica:test",
-                )
-                .unwrap();
-        }
-        let replayed = Master {
-            store: replica,
-            repl,
-            index: replica_index,
-            hub_tx: m.hub_tx.clone(),
-            rx: mpsc::unbounded_channel().1,
-            env: ReplicationApplyEnv::new_inert(),
-            _own: super::OwnWatches::of(&store::new_store(1)),
-        };
+        let replayed = applied(&m, stream, false);
         for key in keys.iter().map(String::as_str).chain(["c:due"]) {
             assert_eq!(m.held(key), replayed.held(key), "{key}");
         }

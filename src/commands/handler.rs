@@ -481,6 +481,17 @@ fn takes_the_gate_alone(
         // and the rest out of line, so that what every command runs through
         // stays small.
         || (cmd.len() >= 3 && keys_of_several_shards(store, db, name, cmd, cmd[0]))
+        // A `SORT` that reads fields of hashes it does not name, which may
+        // remove one past its time (`generics::sort_reads_hash_fields`).
+        // Not `SORT_RO`: it is no write, and takes the order of what it
+        // removes as a read does.
+        || (name == "SORT" && sort_reads_hash_fields(cmd))
+}
+
+/// [`takes_the_gate_alone`]'s question for `SORT`, out of line.
+#[inline(never)]
+fn sort_reads_hash_fields(cmd: &[&[u8]]) -> bool {
+    crate::commands::generics::sort_reads_hash_fields(cmd)
 }
 
 /// The writes of one key, and so of one shard, made most: told apart by

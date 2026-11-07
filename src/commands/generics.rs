@@ -154,17 +154,76 @@ pub(crate) fn apply_expire(
     resp_integer(1)
 }
 
-/// What a `SORT` `BY` or `GET` pattern names for `elem`, read as Redis reads
-/// it (`lookupKeyByPattern`): the first `*` stands for the element's bytes,
-/// and a `->field` after it, with a field name, names a field of the hash
-/// at that key. `None` when the pattern has no `*`, or names nothing there.
-fn sort_pattern_value(ctx: &Ctx, pat: &[u8], elem: &[u8]) -> Option<Vec<u8>> {
+/// A `SORT` `BY` or `GET` pattern taken apart (`sort_pattern_parts`).
+struct SortPattern<'a> {
+    /// Where its first `*` is.
+    star: usize,
+    /// What follows the `*` in the key's name.
+    suffix: &'a [u8],
+    /// The hash field it names after `->`, if any.
+    field: Option<&'a [u8]>,
+}
+
+/// A `SORT` `BY` or `GET` pattern taken apart. `None` when it has no `*`:
+/// it names no key.
+fn sort_pattern_parts(pat: &[u8]) -> Option<SortPattern<'_>> {
     let star = memchr::memchr(b'*', pat)?;
     let rest = &pat[star + 1..];
     let (suffix, field) = match memchr::memmem::find(rest, b"->") {
         Some(at) if at + 2 < rest.len() => (&rest[..at], Some(&rest[at + 2..])),
         _ => (rest, None),
     };
+    Some(SortPattern {
+        star,
+        suffix,
+        field,
+    })
+}
+
+/// Whether `SORT` `cmd` reads a field of a hash it does not name, by a `BY`
+/// or `GET` pattern. Such a read can find the field past its time, and on a
+/// master removes it and sends its `HDEL` (`sort_pattern_value`). That is a
+/// write to a key the command holds no order of: its own order, of the keys
+/// it names, is held, and a write made inside it takes none more
+/// (`write_order`). Another client's write to the hash could then fall
+/// between the removal and its `HDEL`, and reach the replicas and the AOF
+/// ahead of it, as `HINCRBY h f 1` then `HDEL h f` (#415 review). So such a
+/// `SORT` takes the command gate alone, as a script does, which reads keys
+/// it does not name too (`handler::takes_the_gate_alone`). Options are read
+/// as `keyspec`'s `SORT` reads them.
+pub(crate) fn sort_reads_hash_fields(cmd: &[&[u8]]) -> bool {
+    let mut i = 2;
+    while i < cmd.len() {
+        let option = cmd[i];
+        if option.eq_ignore_ascii_case(b"LIMIT") {
+            i += 2;
+        } else if option.eq_ignore_ascii_case(b"BY") || option.eq_ignore_ascii_case(b"GET") {
+            if cmd
+                .get(i + 1)
+                .and_then(|pat| sort_pattern_parts(pat))
+                .is_some_and(|pattern| pattern.field.is_some())
+            {
+                return true;
+            }
+            i += 1;
+        } else if option.eq_ignore_ascii_case(b"STORE") {
+            i += 1;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// What a `SORT` `BY` or `GET` pattern names for `elem`, read as Redis reads
+/// it (`lookupKeyByPattern`): the first `*` stands for the element's bytes,
+/// and a `->field` after it, with a field name, names a field of the hash
+/// at that key. `None` when the pattern has no `*`, or names nothing there.
+fn sort_pattern_value(ctx: &Ctx, pat: &[u8], elem: &[u8]) -> Option<Vec<u8>> {
+    let SortPattern {
+        star,
+        suffix,
+        field,
+    } = sort_pattern_parts(pat)?;
     let mut key = Vec::with_capacity(star + elem.len() + suffix.len());
     key.extend_from_slice(&pat[..star]);
     key.extend_from_slice(elem);
@@ -1592,5 +1651,38 @@ fn system_time_to_unix(exp: SystemTime, unit: TimeUnit) -> i64 {
     match unit {
         TimeUnit::Secs => d.as_secs() as i64,
         TimeUnit::Millis => d.as_millis() as i64,
+    }
+}
+
+#[cfg(test)]
+mod sort_gate_tests {
+    use super::sort_reads_hash_fields;
+
+    fn reads(args: &[&str]) -> bool {
+        let cmd: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
+        sort_reads_hash_fields(&cmd)
+    }
+
+    /// Only a `BY` or `GET` pattern that names a hash field of another key
+    /// takes the command gate alone; nothing that merely looks like one.
+    #[test]
+    fn only_a_pattern_naming_a_hash_field_counts() {
+        assert!(reads(&["SORT", "ids", "BY", "obj:*->w"]));
+        assert!(reads(&[
+            "SORT", "ids", "GET", "#", "GET", "obj:*->w", "STORE", "dst"
+        ]));
+        assert!(reads(&["sort", "ids", "by", "w_*", "get", "o_*->n"]));
+        assert!(!reads(&["SORT", "ids"]));
+        assert!(!reads(&["SORT", "ids", "BY", "nosort", "STORE", "dst"]));
+        assert!(!reads(&[
+            "SORT", "ids", "BY", "weight_*", "GET", "#", "GET", "name_*"
+        ]));
+        // No `*`: names no key. `->` with nothing after: no field.
+        assert!(!reads(&["SORT", "ids", "BY", "obj->w"]));
+        assert!(!reads(&["SORT", "ids", "GET", "obj:*->"]));
+        // A destination or a LIMIT argument is no pattern.
+        assert!(!reads(&["SORT", "ids", "STORE", "x:*->y"]));
+        assert!(!reads(&["SORT", "ids", "LIMIT", "0", "x:*->y"]));
+        assert!(!reads(&["SORT", "ids", "BY"]));
     }
 }
