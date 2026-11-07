@@ -759,8 +759,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is now judged by them, as replication judges it: the transaction is
   refused with `TRYAGAIN`, and the pause holds the command. The pause now
   also holds `MIGRATE` and `FUNCTION LOAD`, `DELETE`, `FLUSH` and
-  `RESTORE`, as Redis does, and `SCRIPT LOAD` and `FLUSH`, which KiviDB
-  sends to replicas (#407).
+  `RESTORE`, as Redis does (#407). It does not hold `SCRIPT LOAD` or
+  `SCRIPT FLUSH`, which change the script cache and not the dataset, as
+  in Redis: while writes are paused they run, and are kept out of the
+  replication stream and the AOF, which keeps the offset still for a
+  failover. A replica, or the AOF replayed, then goes without that
+  script, and a client that runs it there gets `NOSCRIPT` and loads it
+  again (#518).
 - **`MIGRATE` no longer answers `TRYAGAIN` for an unchanged hash whose field
   is about to expire (#332).** The check that a moved hash was not written
   meanwhile compared the server's fields by the monotonic clock and the

@@ -418,6 +418,7 @@ pub fn wait_out_handoff() {
 /// free of writes, and an `EXEC` of a transaction holding any of those. A
 /// command that writes only with some of its arguments (`GEORADIUS …
 /// STORE`, `FUNCTION LOAD`) waits when it has them: see [`may_replicate`].
+/// `SCRIPT LOAD` and `SCRIPT FLUSH` do not wait, as in Redis (#518).
 ///
 /// A command with the wrong number of arguments is not held: it is going to
 /// be refused whenever it runs, and is refused now.
@@ -464,12 +465,20 @@ pub fn queued_may_replicate<Q: AsRef<[u8]>>(command: &[Q]) -> bool {
 /// A command that writes only with some of its arguments is judged by them,
 /// as replication judges it (`command_mutates_for_replication`):
 /// `GEORADIUS` and `GEORADIUSBYMEMBER` with `STORE` or `STOREDIST`, the
-/// `SCRIPT` and `FUNCTION` subcommands that change what is loaded,
-/// `PFDEBUG TODENSE`, `HIMPORT`, and `MIGRATE`, which deletes what it
-/// moves. They used to be judged by their name alone, and so were taken
-/// for reads: a `GEORADIUS … STORE` in a transaction was neither held by
-/// the pause nor refused during a handoff, ran behind the handoff's back,
-/// and its write was lost with the slot (#407).
+/// `FUNCTION` subcommands that change what is loaded, `PFDEBUG TODENSE`,
+/// `HIMPORT`, and `MIGRATE`, which deletes what it moves. They used to be
+/// judged by their name alone, and so were taken for reads: a `GEORADIUS …
+/// STORE` in a transaction was neither held by the pause nor refused during
+/// a handoff, ran behind the handoff's back, and its write was lost with
+/// the slot (#407).
+///
+/// `SCRIPT` is not one of them, though `SCRIPT LOAD` and `SCRIPT FLUSH` are
+/// propagated: they change the script cache, not the dataset, and Redis
+/// holds neither (`NOSCRIPT`, `STALE`; neither `WRITE` nor
+/// `MAY_REPLICATE`). Holding them stalled every client that loads its
+/// scripts on connect or on `NOSCRIPT` for the whole pause, the ones that
+/// only read too (#518). While writes are paused they are kept out of the
+/// replication stream and the AOF instead (`replication::held_back`).
 fn may_replicate(name: &str, cmd: &[&[u8]]) -> bool {
     #[cfg(feature = "lua")]
     let declared_read_only = |name: &str, first: &[u8]| match name {
@@ -481,8 +490,9 @@ fn may_replicate(name: &str, cmd: &[&[u8]]) -> bool {
     let declared_read_only = |_: &str, _: &[u8]| false;
     match name {
         "PFCOUNT" | "PUBLISH" | "SPUBLISH" => true,
-        // Propagated, but writes nothing (#411).
-        "SELECT" => false,
+        // Propagated, but writes nothing (#411), nor does anything in the
+        // dataset (#518).
+        "SELECT" | "SCRIPT" => false,
         "EVAL" | "EVALSHA" | "FCALL" => !cmd
             .get(1)
             .copied()
@@ -586,7 +596,28 @@ mod tests {
         assert!(holds(&[b"EXEC"], &queue(store)));
         assert!(holds(&[b"EXEC"], &queue(storedist)));
         assert!(holds(&[b"FUNCTION", b"LOAD", b"code"], none));
+        assert!(holds(&[b"FUNCTION", b"DELETE", b"lib"], none));
+        assert!(holds(&[b"FUNCTION", b"FLUSH"], none));
         assert!(!holds(&[b"FUNCTION", b"LIST"], none));
+        // The script cache is not the dataset: Redis holds no `SCRIPT`
+        // subcommand, alone or in a transaction, and nor is a transaction
+        // refused for one during a handoff (#518).
+        assert!(!holds(&[b"SCRIPT", b"LOAD", b"return 1"], none));
+        assert!(!holds(&[b"SCRIPT", b"FLUSH"], none));
+        assert!(!holds(&[b"SCRIPT", b"FLUSH", b"ASYNC"], none));
+        assert!(!holds(&[b"SCRIPT", b"EXISTS", b"0123"], none));
+        let script_load = vec![vec![
+            b"SCRIPT".to_vec(),
+            b"LOAD".to_vec(),
+            b"return 1".to_vec(),
+        ]];
+        assert!(!holds(&[b"EXEC"], &script_load));
+        assert!(!script_load.iter().any(|c| queued_may_replicate(c)));
+        let script_load_and_write = vec![
+            script_load[0].clone(),
+            vec![b"SET".to_vec(), b"k".to_vec(), b"v".to_vec()],
+        ];
+        assert!(holds(&[b"EXEC"], &script_load_and_write));
         assert!(holds(
             &[b"MIGRATE", b"127.0.0.1", b"6379", b"k", b"0", b"1000"],
             none
