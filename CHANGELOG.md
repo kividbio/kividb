@@ -155,6 +155,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   binds and never listens, as every other test file's does: 0 in 480
   (#506).
 
+- **`memory_usage_of_a_key_stays_put_when_other_keys_come_and_go` no
+  longer times out on a slow run.** It deleted 200,000 keys, read
+  `used_memory`, and waited for the background sweep that shrinks the
+  shards' tables to bring it lower. On a slow or busy run, on x86_64 and
+  arm64 alike, a sweep had already shrunk them during the deletions, and
+  the wait ran out. The sweep is now held off (`DEBUG SET-ACTIVE-EXPIRE 0`)
+  until the deletions have been read, and the test checks the same things:
+  the tables do shrink afterwards, and the keys' `MEMORY USAGE` stays put
+  throughout (#508).
+
 - **A file that is not a whole snapshot no longer starts the server on
   part of the data, or none.** `--preload-file rdb:` of a Dragonfly
   snapshot in Dragonfly's own format logged `preload-file: 0 keys from the

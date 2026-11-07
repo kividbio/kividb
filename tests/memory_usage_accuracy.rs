@@ -333,10 +333,18 @@ fn memory_usage_of_a_key_stays_put_when_other_keys_come_and_go() {
     stays_put("with the other keys", &usage(&mut c));
 
     // Deleted: their entries are given back at once, the tables' room
-    // stays until the shards are shrunk.
+    // stays until the shards are shrunk. The shrink is the background
+    // sweep's, a second apart, which `DEBUG SET-ACTIVE-EXPIRE 0` stops: held
+    // off until the deletions have been read. A sweep used to land during
+    // the 200,000 `DEL`s on a slow or busy run, and had already given the
+    // room back by the time `deleted` was read; the wait below for less
+    // than that then never ended (#508).
+    c.ok(&[b"DEBUG", b"SET-ACTIVE-EXPIRE", b"0"]);
+    // A sweep already past its check finishes first.
+    std::thread::sleep(Duration::from_millis(300));
     let dels: Vec<Cmd> = others.iter().map(|k| vec![b("DEL"), k.clone()]).collect();
     c.pipeline(&dels);
-    let deleted = c.used_memory();
+    let deleted = c.settled_used_memory();
     assert!(
         grown - deleted > (grown - before) / 2,
         "deleting gave back {} of {}",
@@ -348,11 +356,11 @@ fn memory_usage_of_a_key_stays_put_when_other_keys_come_and_go() {
         &usage(&mut c),
     );
 
-    // The shards are shrunk in the background, a sweep a second: waited for
-    // (fifteen seconds at most) until `used_memory` is lower and has not
-    // moved for two sweeps. Not all the room need come back: a sweep in the
-    // middle of the deletions shrinks a table to the keys it has then, and a
+    // The shards are shrunk in the background, a sweep a second, from now
+    // on: waited for (fifteen seconds at most) until `used_memory` is lower
+    // and has not moved for two sweeps. Not all the room need come back: a
     // table under the minimum size is not shrunk again.
+    c.ok(&[b"DEBUG", b"SET-ACTIVE-EXPIRE", b"1"]);
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     let (mut last, mut since) = (c.used_memory(), std::time::Instant::now());
     let shrunk = loop {
