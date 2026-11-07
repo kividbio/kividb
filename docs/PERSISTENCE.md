@@ -386,7 +386,9 @@ acknowledged write either. Connections waiting at the same time share one
 sync. A reply waits for its sync however long the disk takes (the 5-second
 limit below does not apply), `aof-ack-after-write no` has no effect, and a
 write or sync that fails stops the server, as in Redis. Before 1.2.1
-`always` was accepted and had no effect.
+`always` was accepted and had no effect. A replica takes no writes of its
+own: it syncs its master's stream once a second, whatever `appendfsync`
+says.
 
 A reply waits at most 5 seconds for its records. Only if the disk falls
 more than 5 seconds behind (a disk slower than the writes it is given, or

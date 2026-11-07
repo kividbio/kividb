@@ -132,7 +132,7 @@ What the RDB reader takes from Redis:
   as in Redis: a `kill -9` or an OOM kill loses no acknowledged write while
   the disk keeps up, and a power failure loses up to a second, as with
   Redis's `appendfsync everysec` (none with `appendfsync always`, which
-  syncs each write before its reply). A reply waits at most 5 s for its record;
+  syncs each write before its reply). Under `everysec`, a reply waits at most 5 s for its record;
   if the disk falls further behind than that, replies go out without their
   writes and `aof_acks_before_write` counts them, so size the AOF's disk for
   the write load. Before 1.2 a write was answered once its record was queued,
