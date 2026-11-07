@@ -1602,9 +1602,13 @@ fn allkeys_lru_keeps_sets_under_the_limit_and_their_usage_adds_up() {
         used <= limit + MB / 4,
         "{used} in use, the limit is {limit}"
     );
+    // Lift the limit before reading the counters. Room is made before any
+    // command runs, so with the limit still in place an eviction may land
+    // between the read of `evicted_keys` and the lift, and the sum then
+    // falls one key short of what was written.
+    c.lift_the_limit();
     let evicted = c.evicted();
     assert!(evicted > 0, "nothing was evicted");
-    c.lift_the_limit();
     let left = c.cmd(&["DBSIZE"]).i();
     assert_eq!(left + evicted, written as i64);
 
