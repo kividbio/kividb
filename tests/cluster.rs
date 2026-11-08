@@ -6364,3 +6364,24 @@ fn cluster_searches_give_back_keys_of_any_bytes() {
         assert_eq!(keys, want, "FT.AGGREGATE on port {}", node.port);
     }
 }
+
+/// `HELLO` says `mode: cluster` on a node that runs in cluster mode, which
+/// clients read to decide whether to route by slot.
+#[test]
+fn hello_reports_the_cluster_mode() {
+    let (nodes, _) = form_cluster(3);
+    let mode = |reply: &Resp| {
+        let fields = reply.array();
+        let at = fields.iter().position(|f| f.text() == "mode").unwrap();
+        fields[at + 1].text()
+    };
+    let reply = nodes[0].conn().cmd(&["HELLO", "2"]);
+    assert_eq!(mode(&reply), "cluster", "{reply:?}");
+    let reply = nodes[0].conn().cmd(&["HELLO", "3"]);
+    let (_, value) = reply
+        .map()
+        .iter()
+        .find(|(k, _)| k.text() == "mode")
+        .expect("a mode field");
+    assert_eq!(value.text(), "cluster", "{reply:?}");
+}

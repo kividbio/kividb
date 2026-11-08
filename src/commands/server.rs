@@ -5823,7 +5823,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // HELLO is intercepted in the server loops before reaching here.
             // If it arrives here something went wrong — return a minimal response
             // rather than an error, so clients don't break.
-            Some(resp_array(vec![
+            let proto = ctx.resp as i64;
+            let fields = vec![
                 resp_bulk_str("server"),
                 resp_bulk_str("redis"),
                 resp_bulk_str("version"),
@@ -5831,14 +5832,25 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 resp_bulk_str("kividb_version"),
                 resp_bulk_str(env!("CARGO_PKG_VERSION")),
                 resp_bulk_str("proto"),
-                resp_integer(2),
+                resp_integer(proto),
+                resp_bulk_str("id"),
+                resp_integer(ctx.client_id as i64),
                 resp_bulk_str("mode"),
-                resp_bulk_str("standalone"),
+                resp_bulk_str(if ctx.cluster.enabled {
+                    "cluster"
+                } else {
+                    "standalone"
+                }),
                 resp_bulk_str("role"),
-                resp_bulk_str("master"),
+                resp_bulk_str(&ctx.repl_state.role()),
                 resp_bulk_str("modules"),
-                module_list_reply(2),
-            ]))
+                module_list_reply(proto as u8),
+            ];
+            Some(if proto == 3 {
+                resp_map(fields)
+            } else {
+                resp_array(fields)
+            })
         }
 
         "TIME" => {
