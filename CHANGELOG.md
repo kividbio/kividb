@@ -145,6 +145,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`INFO commandstats` counts `WATCH`, `UNWATCH`, `HELLO`, `DISCARD`,
+  `RESET` and `AUTH` (#388).** The connection answered them itself and left
+  them out, so `cmdstat_watch`, `cmdstat_hello` and the others were missing,
+  on both I/O models.
+
 - **A failover of the source during an atomic slot migration no longer
   loses acknowledged writes (#516).** With `CLUSTER FAILOVER` sent to the
   source's replica while `CLUSTER MIGRATION IMPORT` ran, the replica took

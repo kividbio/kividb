@@ -1997,6 +1997,7 @@ where
                     // Protover sets per-connection RESP (`client_registry.resp`) and is echoed
                     // in the `proto` field (Redis-compatible HELLO map semantics).
 
+                    let reply_from = combined.len();
                     let mut i = 1usize; // index into cmd, past "HELLO"
 
                     let mut proto_reply: i64 = resp_version as i64;
@@ -2008,6 +2009,12 @@ where
                         if ver != "0" && ver != "1" && ver != "2" && ver != "3" {
                             combined.extend_from_slice(
                                 b"-ERR Protocol version is not an integer or out of range\r\n",
+                            );
+                            crate::cmdstats::record(
+                                "HELLO",
+                                &cmd,
+                                &combined[reply_from..],
+                                std::time::Duration::ZERO,
                             );
                             parse_offset += consumed;
                             continue;
@@ -2053,6 +2060,12 @@ where
                                     combined.extend_from_slice(
                                         b"-ERR Syntax error in HELLO option 'auth'\r\n",
                                     );
+                                    crate::cmdstats::record(
+                                        "HELLO",
+                                        &cmd,
+                                        &combined[reply_from..],
+                                        std::time::Duration::ZERO,
+                                    );
                                     parse_offset += consumed;
                                     continue;
                                 }
@@ -2081,6 +2094,12 @@ where
                                 combined.extend_from_slice(
                                     b"-WRONGPASS invalid username-password pair or user is disabled.\r\n",
                                 );
+                                crate::cmdstats::record(
+                                    "HELLO",
+                                    &cmd,
+                                    &combined[reply_from..],
+                                    std::time::Duration::ZERO,
+                                );
                                 parse_offset += consumed;
                                 continue;
                             }
@@ -2096,6 +2115,12 @@ where
                               authenticated, otherwise the HELLO <proto> AUTH <user> <pass> \
                               option can be used to authenticate the client and select the \
                               RESP protocol version at the same time\r\n",
+                        );
+                        crate::cmdstats::record(
+                            "HELLO",
+                            &cmd,
+                            &combined[reply_from..],
+                            std::time::Duration::ZERO,
                         );
                         parse_offset += consumed;
                         continue;
@@ -2149,6 +2174,12 @@ where
                         resp_array(kv)
                     };
                     combined.extend_from_slice(&response);
+                    crate::cmdstats::record(
+                        "HELLO",
+                        &cmd,
+                        &combined[reply_from..],
+                        std::time::Duration::ZERO,
+                    );
                     parse_offset += consumed;
                     continue;
                 }
@@ -2482,6 +2513,21 @@ where
                     result
                 }
             };
+            // The other commands answered here, and not by `execute_command`,
+            // are counted as well (`HELLO` counts itself, as it replies in
+            // several places).
+            if matches!(
+                cmd_name.as_str(),
+                "DISCARD" | "WATCH" | "UNWATCH" | "RESET" | "AUTH"
+            ) {
+                // None of them has subcommands, so the name is all `record` needs.
+                crate::cmdstats::record(
+                    &cmd_name,
+                    &[cmd_name.as_bytes()],
+                    &response,
+                    std::time::Duration::ZERO,
+                );
+            }
             // MONITOR sees a transaction as it ran: `MULTI`, the commands —
             // each shown as it was run — and then `EXEC`.
             if let Some(word) = &transaction_word {
