@@ -145,6 +145,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`HELLO` says `mode: cluster` on a node in cluster mode (#502).** It said
+  `standalone` on every node. The fallback `HELLO` in the command table
+  now also has the `id` field, the connection's protocol and the node's
+  role.
+
 - **A failover of the source during an atomic slot migration no longer
   loses acknowledged writes (#516).** With `CLUSTER FAILOVER` sent to the
   source's replica while `CLUSTER MIGRATION IMPORT` ran, the replica took

@@ -2137,7 +2137,11 @@ where
                         resp_bulk_str("id"),
                         resp_integer(client_id as i64),
                         resp_bulk_str("mode"),
-                        resp_bulk_str("standalone"),
+                        resp_bulk_str(if cluster_state.enabled {
+                            "cluster"
+                        } else {
+                            "standalone"
+                        }),
                         resp_bulk_str("role"),
                         resp_bulk_str(&role),
                         resp_bulk_str("modules"),
