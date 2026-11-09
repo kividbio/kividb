@@ -31,6 +31,9 @@ thread_local! {
     /// Whether one of those effects changed the dataset, rather than only
     /// metadata. See [`effect_of_metadata`].
     static CHANGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set while a script's `redis.call` runs a command: its effects are
+    /// read after it whether or not the write is observed ([`ScriptCall`]).
+    static IN_SCRIPT_CALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Start recording the running command's effects.
@@ -49,6 +52,58 @@ thread_local! {
 pub(crate) fn effects_begin() {
     EFFECTS.with_borrow_mut(|e| *e = Some(Vec::new()));
     CHANGED.set(false);
+}
+
+/// [`effects_begin`], for a command whose record is read only when
+/// something reads it: a replica, the backlog, the AOF or a tap
+/// (`replication::write_is_observed`), or the script that called it, which
+/// counts what it changed by the record (`handler::run_from_script`).
+/// Otherwise nothing is recorded, and the command is told so: building the
+/// record (`HSETEX key PXAT … FIELDS n field value …`, a copy of every
+/// argument) cost `HSETEX` about ten allocations a command with nobody to
+/// read it (#543).
+///
+/// Whether the write is observed cannot change before the record is read:
+/// a replica, the backlog and a tap start and stop with the write gate
+/// closed (`write_gate::cut`), and this runs inside a write.
+///
+/// Returns whether effects are being recorded; [`recording`] says the same
+/// later on.
+#[inline]
+pub(crate) fn effects_begin_if_read(ctx: &Ctx<'_>) -> bool {
+    CHANGED.set(false);
+    let read = super::write_is_observed(ctx) || IN_SCRIPT_CALL.get();
+    EFFECTS.with_borrow_mut(|e| {
+        if read {
+            *e = Some(Vec::new());
+        } else if e.is_some() {
+            *e = None;
+        }
+    });
+    read
+}
+
+/// Whether the running command's effects are being recorded: false after
+/// an [`effects_begin_if_read`] that nothing was going to read.
+#[inline]
+pub(crate) fn recording() -> bool {
+    EFFECTS.with_borrow(|e| e.is_some())
+}
+
+/// Held while a script's `redis.call` runs a command, whose effects are
+/// read after it whether or not anything observes the write.
+pub(crate) struct ScriptCall(bool);
+
+impl ScriptCall {
+    pub(crate) fn enter() -> Self {
+        Self(IN_SCRIPT_CALL.replace(true))
+    }
+}
+
+impl Drop for ScriptCall {
+    fn drop(&mut self) {
+        IN_SCRIPT_CALL.set(self.0);
+    }
 }
 
 /// Record one replayable command as an effect of the running command.

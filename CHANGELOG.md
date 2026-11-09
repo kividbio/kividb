@@ -157,13 +157,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dropped for passing `repl-replica-max-backlog-bytes` had the rest of its
   queue sent to it before it was freed, at the replica's pace and counted
   in full: it is now freed at once, since the replica resyncs anyway, from
-  the backlog or in full. `connected_slaves` also stopped going one lower at each
-  such drop (it reached -53): a late `REPLCONF ACK` from the dropped
-  replica brought back its row. On the issue's test (256 MB limit, ~1 M `SET`s a second, a
-  replica attached at 30 s), the master went from 27 M `OOM` replies and
-  17-18 M evictions down to no keys, to no `OOM` replies, keeping 113-139k
-  keys. Once caught up, the replica had the same data. 1.2.0 has the same
-  bug.
+  the backlog or in full. `connected_slaves` also stopped going one lower
+  at each such drop (it reached -53): a late `REPLCONF ACK` from the
+  dropped replica brought back its row. On the issue's test (256 MB limit,
+  ~1 M `SET`s a second, a replica attached at 30 s), the master went from
+  27 M `OOM` replies and 17-18 M evictions down to no keys, to no `OOM`
+  replies, keeping 113-139k keys. Once caught up, the replica had the same
+  data. 1.2.0 has the same bug.
+
+- **`HSET` is no longer slowed down by a lock every worker shared
+  (#544).** Every `HSET`, `HMSET`, `HSETNX`, `HINCRBY` and
+  `HINCRBYFLOAT` took the search indexes' lock twice to find out whether
+  there was any index to update, even with no index defined. Taking that
+  lock writes to it, so with many workers its cache line moved between
+  cores on every write to a hash. How much this cost depended on where the
+  allocator put the lock: after an unrelated change, `HSET` at pipeline 16
+  on 16 vCPUs ran at 4.0M ops/s, against 4.46M in 1.2.0. Writes now check
+  a flag that is changed only when an index is created or dropped, and
+  take the lock only when an index exists. On the same machines `HSET`
+  runs at about 4.9M ops/s, faster than in 1.2.0. Writes to indexed
+  hashes behave as before.
 
 - **`JSON.NUMINCRBY` and `JSON.NUMMULTBY` refuse an integer overflow
   (#536).** Two integers whose result did not fit an `i64` gave a float,
@@ -268,6 +281,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `lua-parallel-scripts` gets an error for a `SORT` or `SORT_RO` whose
     `BY` or `GET` pattern can name keys outside its tag, as it already did
     for `KEYS` and `SCAN`.
+  - *Cost:* `HSETEX` no longer builds the form it is replicated in
+    (`HSETEX key PXAT <ms> FIELDS …`, a copy of every field and value)
+    when no replica, AOF or backup reads the write stream, and finds the
+    fields due under the lookup it writes under rather than a lookup of
+    its own (#543). `HSETEX` of a field with a TTL costs 22% fewer
+    instructions a command than without this (14,392 against 18,600, one
+    worker thread, pipeline 16), and as many in KiviDB's own code as in
+    1.2.0; 7-9% fewer with an AOF or a replica. `HSET` and `HGET` are
+    unchanged.
 
 - **The `MEMORY USAGE` accuracy tests no longer fail now and then with
   `Connection reset by peer`.** They found a free port for each server with

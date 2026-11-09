@@ -1,6 +1,7 @@
 // Which XREADGROUPs count as a change of the dataset
-// (`rdb_changes_since_last_save`), as in Redis (#27). The count is the
-// process's: this file has one test, so nothing else moves it.
+// (`rdb_changes_since_last_save`), as in Redis (#27), and that an `HSETEX`
+// nothing observes still counts as one (#543). The count is the process's:
+// this file has one test, so nothing else moves it.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -245,4 +246,37 @@ fn xreadgroup_of_pending_entries_is_not_a_change() {
         ">",
     ]);
     assert_eq!(changes(&mut c), before, "nothing delivered");
+
+    // No replica, no AOF: `HSETEX` builds no record of its effect (#543),
+    // and is a change all the same.
+    let before = changes(&mut c);
+    assert_eq!(
+        c.cmd(&["HSETEX", "h1", "PX", "100000", "FIELDS", "1", "f", "v"]),
+        V::Int(1)
+    );
+    assert_eq!(changes(&mut c), before + 1, "an HSETEX nothing observes");
+
+    // A script's writes are counted by the record of their effects, which
+    // is kept for it whether or not anything observes them: its `HSETEX`
+    // counts as its `HSET` does.
+    #[cfg(feature = "lua")]
+    {
+        let before = changes(&mut c);
+        c.cmd(&[
+            "EVAL",
+            "return redis.call('HSET', KEYS[1], 'f', 'v')",
+            "1",
+            "h2",
+        ]);
+        let hset = changes(&mut c) - before;
+        assert!(hset >= 1, "an HSET from a script");
+        let before = changes(&mut c);
+        c.cmd(&[
+            "EVAL",
+            "return redis.call('HSETEX', KEYS[1], 'PX', '100000', 'FIELDS', '1', 'f', 'v')",
+            "1",
+            "h3",
+        ]);
+        assert_eq!(changes(&mut c) - before, hset, "an HSETEX from a script");
+    }
 }

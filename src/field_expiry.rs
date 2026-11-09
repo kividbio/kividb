@@ -1387,6 +1387,100 @@ mod propagation_tests {
         assert_eq!(m.sent(), [cmd(&["HDEL", "h", "a"])]);
     }
 
+    /// `HSETEX` finds its due fields in the lookup it writes under (#543):
+    /// gone first, their `HDEL` before its record, so a due field is no
+    /// field to `FNX`. The record is the client's own fields and values,
+    /// bytes that are not UTF-8 included.
+    #[test]
+    fn hsetex_writes_after_the_deletion_of_its_due_fields() {
+        let mut m = master();
+        m.with_due_field("h");
+        assert_eq!(
+            m.run(&[
+                "HSETEX", "h", "FNX", "PX", "100000", "FIELDS", "1", "f", "new"
+            ]),
+            ":1\r\n"
+        );
+        let sent = m.sent();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(sent[0], cmd(&["HDEL", "h", "f"]));
+        assert_eq!(sent[1][..3], ["HSETEX", "h", "PXAT"]);
+        assert_eq!(&sent[1][4..], ["FIELDS", "1", "f", "new"]);
+        assert_eq!(
+            m.held("h"),
+            Some(vec![
+                ("f".to_string(), "new".to_string()),
+                ("keep".to_string(), "1".to_string())
+            ])
+        );
+
+        m.with_only_field_due("e");
+        assert_eq!(
+            m.run(&["HSETEX", "e", "KEEPTTL", "FIELDS", "1", "g", "1"]),
+            ":1\r\n"
+        );
+        let sent = m.sent();
+        assert!(deletion("e").contains(&sent[0]), "{sent:?}");
+        assert_eq!(
+            sent[1],
+            cmd(&["HSETEX", "e", "KEEPTTL", "FIELDS", "1", "g", "1"])
+        );
+        assert_eq!(m.held("e"), Some(vec![("g".to_string(), "1".to_string())]));
+
+        let name: &[u8] = b"n\xff\x00";
+        let value: &[u8] = b"\xfe\r\n";
+        assert_eq!(
+            m.run_bytes(&[b"HSETEX", b"b", b"FIELDS", b"1", name, value]),
+            ":1\r\n"
+        );
+        let mut bytes = Vec::new();
+        while let Ok(msg) = m.rx.try_recv() {
+            if let crate::replication::HubMsg::Propagate(payload) = msg {
+                bytes.extend_from_slice(&payload);
+            }
+        }
+        let mut wanted = b"*6\r\n$6\r\nHSETEX\r\n$1\r\nb\r\n$6\r\nFIELDS\r\n$1\r\n1\r\n".to_vec();
+        wanted.extend_from_slice(b"$3\r\nn\xff\x00\r\n$3\r\n\xfe\r\n\r\n");
+        assert!(
+            bytes.ends_with(&wanted),
+            "{:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    /// With nothing to read the stream, `HSETEX` builds no record of what it
+    /// did (#543), and still removes a due field before it writes.
+    #[test]
+    fn an_hsetex_nobody_observes_still_writes_after_its_due_fields() {
+        let mut m = master();
+        m.with_due_field("h");
+        m.repl.backlog_active.store(false, Ordering::Relaxed);
+        assert!(!m.repl.feeds_hub());
+        // A record left from before: begun anew, and not kept.
+        crate::replication::script_feed::effects_begin();
+        assert_eq!(
+            m.run(&[
+                "HSETEX", "h", "FNX", "PX", "100000", "FIELDS", "1", "f", "new"
+            ]),
+            ":1\r\n"
+        );
+        assert!(!crate::replication::script_feed::recording());
+        assert!(m.sent().is_empty());
+        assert_eq!(
+            m.held("h"),
+            Some(vec![
+                ("f".to_string(), "new".to_string()),
+                ("keep".to_string(), "1".to_string())
+            ])
+        );
+        assert_eq!(
+            m.run(&[
+                "HSETEX", "h", "FNX", "PX", "100000", "FIELDS", "1", "f", "again"
+            ]),
+            ":0\r\n"
+        );
+    }
+
     /// The last field due: the hash goes, its deletion sent, and the write
     /// after it makes a new one.
     #[test]
