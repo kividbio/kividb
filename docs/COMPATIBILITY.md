@@ -157,6 +157,12 @@ other files:
 - KiviDB can't be a replica of a KeyDB primary in active replication
   (`active-replica yes`): the link ends at its first `RREPLAY`, saying so.
   Move that data by RDB file or with `MIGRATE`.
+- `JSON.NUMINCRBY` and `JSON.NUMMULTBY` refuse any integer result that does
+  not fit an `i64` with `ERR numeric overflow`, and change nothing. Redis
+  returns that error too, with two exceptions KiviDB doesn't copy: it stores
+  a `u64` for some array elements (`JSON.NUMINCRBY k $[0] 1` on
+  `[9223372036854775807]` succeeds), and it can leave a multi-match path
+  half done ([#536](https://github.com/kividbio/kividb/issues/536)).
 
 **Server and introspection**
 - `HELLO` and `INFO`'s `redis_version` report the Redis release KiviDB

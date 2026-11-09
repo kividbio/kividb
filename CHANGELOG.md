@@ -145,6 +145,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`JSON.NUMINCRBY` and `JSON.NUMMULTBY` refuse an integer overflow
+  (#536).** Two integers whose result did not fit an `i64` gave a float,
+  losing precision. They now fail with `ERR numeric overflow` and the
+  document stays as it was, on every path. Redis 8.10.3 returns that error
+  too, but it stores a `u64` for some array elements and can leave a
+  multi-match path half done. KiviDB does neither.
+
 - **`JSON.NUMINCRBY` and `JSON.NUMMULTBY` keep a float result a float
   (#470).** A whole result was stored as an integer: `1.5 + 1.5` gave `3`
   where RedisJSON gives `3.0`, `JSON.TYPE` then said `integer`, and `-0.0`
