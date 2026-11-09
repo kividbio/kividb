@@ -135,6 +135,14 @@ pub async fn handle_replica_connection_uring(
                 Some(p) => p,
                 None => break,
             };
+            if pending_bytes.abandoned() {
+                // Let go of for falling too far behind: what is queued is
+                // freed now, not sent (see `ReplicaQueue::abandon`).
+                drop(first);
+                drop(replica_rx);
+                pending_bytes.emptied();
+                return;
+            }
             let mut batch = Vec::with_capacity(first.len().min(BATCH_MAX_BYTES));
             batch.extend_from_slice(first.as_ref());
             // The memory the payloads took while queued (see `ReplicaQueue`).
@@ -152,7 +160,9 @@ pub async fn handle_replica_connection_uring(
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                         pending_bytes.taken(batch.len(), held);
-                        let _ = stream_fwd.write_all(batch).await;
+                        if !pending_bytes.abandoned() {
+                            let _ = stream_fwd.write_all(batch).await;
+                        }
                         return;
                     }
                 }

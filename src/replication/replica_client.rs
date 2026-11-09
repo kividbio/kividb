@@ -2351,6 +2351,14 @@ where
                 Some(p) => p,
                 None => break,
             };
+            if pending_bytes_fwd.abandoned() {
+                // Let go of for falling too far behind: what is queued is
+                // freed now, not sent (see `ReplicaQueue::abandon`).
+                drop(first);
+                drop(replica_rx);
+                pending_bytes_fwd.emptied();
+                return;
+            }
 
             let mut batch = Vec::with_capacity(first.len().min(BATCH_MAX_BYTES));
             batch.extend_from_slice(first.as_ref());
@@ -2370,7 +2378,9 @@ where
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         pending_bytes_fwd.taken(batch.len(), held);
-                        write_batch(batch).await;
+                        if !pending_bytes_fwd.abandoned() {
+                            write_batch(batch).await;
+                        }
                         return;
                     }
                 }

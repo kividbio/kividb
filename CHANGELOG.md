@@ -145,6 +145,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A replica that falls behind no longer makes its master evict its keys
+  and refuse writes (#542).** Under an `allkeys-*` policy, a replica that
+  full-synced or lagged under heavy writes made its master evict nearly
+  every key and answer writes with `OOM`; the replica deleted the same
+  keys. What is queued for a replica is not counted against `maxmemory`, as
+  in Redis, but only the stream's bytes were taken off: each queued write
+  also takes its allocation's header and padding and a slot in the queue,
+  6-7% more for writes of 100-1000 bytes, which with a replica gigabytes
+  behind came to over 100 MB. All of it is now left out. And a replica
+  dropped for passing `repl-replica-max-backlog-bytes` had the rest of its
+  queue sent to it before it was freed, at the replica's pace and counted
+  in full: it is now freed at once, since the replica resyncs anyway, from
+  the backlog or in full. `connected_slaves` also stopped going one lower at each
+  such drop (it reached -53): a late `REPLCONF ACK` from the dropped
+  replica brought back its row. On the issue's test (256 MB limit, ~1 M `SET`s a second, a
+  replica attached at 30 s), the master went from 27 M `OOM` replies and
+  17-18 M evictions down to no keys, to no `OOM` replies, keeping 113-139k
+  keys. Once caught up, the replica had the same data. 1.2.0 has the same
+  bug.
+
 - **`JSON.NUMINCRBY` and `JSON.NUMMULTBY` refuse an integer overflow
   (#536).** Two integers whose result did not fit an `i64` gave a float,
   losing precision. They now fail with `ERR numeric overflow` and the

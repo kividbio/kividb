@@ -1850,6 +1850,9 @@ pub struct ReplicaQueue {
     /// The memory those bytes take while they wait ([`ReplicaQueue::held_for`]):
     /// what is not counted against `maxmemory` for the replica.
     held: AtomicU64,
+    /// Set by the hub when it lets the replica go for falling too far
+    /// behind ([`ReplicaQueue::abandon`]).
+    abandoned: AtomicBool,
 }
 
 impl ReplicaQueue {
@@ -1897,6 +1900,32 @@ impl ReplicaQueue {
     /// The memory they take.
     pub fn held(&self) -> u64 {
         self.held.load(Ordering::Relaxed)
+    }
+
+    /// The hub has let the replica go: its queue passed its limit. What is
+    /// in it is not to be sent (the replica resyncs: from the backlog, which
+    /// holds the same stream, or in full) but let go of, at once: its
+    /// forwarder, seeing this, drops its end of the
+    /// queue and ends the connection, and says so ([`ReplicaQueue::emptied`]).
+    ///
+    /// The forwarder used to send it all first, at the replica's pace, a
+    /// gigabyte or two. The hub had forgotten the replica, so none of it
+    /// was taken off what is counted against `maxmemory` any more, and the
+    /// master evicted every key and refused writes until it was sent (#542).
+    pub fn abandon(&self) {
+        self.abandoned.store(true, Ordering::Release);
+    }
+
+    /// Whether the hub has let the replica go ([`ReplicaQueue::abandon`]).
+    /// Everything the hub queued for it is then counted here.
+    pub fn abandoned(&self) -> bool {
+        self.abandoned.load(Ordering::Acquire)
+    }
+
+    /// The forwarder has dropped its end of the queue: nothing is held.
+    pub fn emptied(&self) {
+        self.bytes.store(0, Ordering::Relaxed);
+        self.held.store(0, Ordering::Relaxed);
     }
 }
 
@@ -2331,6 +2360,10 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_ping = tokio::time::Instant::now();
         let mut backlog = Backlog::new();
+        // Queues of replicas let go of for falling too far behind, until
+        // their forwarders have let go of what is in them (see
+        // `ReplicaQueue::abandon`): memory still held for a replica.
+        let mut leaving: Vec<Arc<ReplicaQueue>> = Vec::new();
         // When the last replica went away, while the backlog is being kept.
         let mut without_replicas: Option<tokio::time::Instant> = None;
 
@@ -2343,10 +2376,14 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
             // takes, not only the stream's bytes (#542). Each replica is
             // queued the same writes, shared: the longest queue is what they
             // hold. Taken again after every message and every second.
+            if !leaving.is_empty() {
+                leaving.retain(|queue| queue.held() > 0);
+            }
             crate::memory_use::set_replica_queued(
                 channel_replicas
                     .iter()
                     .map(|r| r.pending_bytes.held())
+                    .chain(leaving.iter().map(|queue| queue.held()))
                     .max()
                     .unwrap_or(0) as usize,
             );
@@ -2432,7 +2469,16 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
             };
             match msg {
                 HubMsg::AckOffset { replica_id, offset } => {
-                    state.replica_acks.lock().insert(replica_id, offset);
+                    // Only for a replica the hub still has. A replica let go
+                    // of for its queue limit can still have an ACK on the
+                    // way: inserted, it brought back the row `forget_replica`
+                    // had taken away, without the count, and its
+                    // connection's `Deregister` took the count down a second
+                    // time: `connected_slaves` went one lower at every such
+                    // drop (#542).
+                    if let Some(acked) = state.replica_acks.lock().get_mut(&replica_id) {
+                        *acked = offset;
+                    }
                     if let Some(p) = state.replica_progress.lock().get(&replica_id) {
                         p.acked.store(offset, Ordering::Relaxed);
                         p.last_ack_ms.store(unix_ms(), Ordering::Relaxed);
@@ -2703,7 +2749,11 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                             // pushing it back into `channel_replicas`) closes its forwarder's
                             // channel; the owning connection task treats "forwarder ended" as
                             // a disconnect and tears the rest of the connection down. It will
-                            // need a full resync to catch back up.
+                            // need a full resync to catch back up. What is in its
+                            // queue is let go of rather than sent: see
+                            // `ReplicaQueue::abandon`.
+                            replica.pending_bytes.abandon();
+                            leaving.push(Arc::clone(&replica.pending_bytes));
                             forget_replica(&state, replica.id);
                             log_warn!(
                                 "Replication: Channel replica {} exceeded backlog limit \
@@ -4390,6 +4440,18 @@ mod replication_invariants_tests {
             state.replica_acks.lock().get(&9004).is_none(),
             "evicted replica's ACK row should be removed"
         );
+
+        // Its connection is still up for a moment: an ACK on the way, and
+        // then its teardown, count it out once only.
+        hub.send(HubMsg::AckOffset {
+            replica_id: 9004,
+            offset: 100,
+        })
+        .unwrap();
+        hub.send(HubMsg::Deregister(9004)).unwrap();
+        barrier(&hub).await;
+        assert!(state.replica_acks.lock().get(&9004).is_none());
+        assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 0);
     }
 
     async fn barrier(hub: &super::HubTx) {
@@ -4492,6 +4554,8 @@ mod replication_invariants_tests {
             .store(500, Ordering::Relaxed);
         propagate(&hub, vec![0u8; 50]);
         await_connected(&state, 0).await;
+        // What is queued for it is to be let go of, not sent.
+        assert!(pending.abandoned());
     }
 
     #[test]
