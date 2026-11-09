@@ -168,6 +168,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   them out, so `cmdstat_watch`, `cmdstat_hello` and the others were missing,
   on both I/O models.
 
+- **`INFO commandstats` counts `WAIT` and `WAITAOF`, and times the commands
+  the connection answers itself (#388).** `WATCH`, `UNWATCH`, `HELLO`,
+  `DISCARD`, `RESET` and `AUTH` were counted with 0 microseconds; they, and
+  now `WAIT` and `WAITAOF`, report the time they took (for the two, the time
+  they waited).
+
 - **A failover of the source during an atomic slot migration no longer
   loses acknowledged writes (#516).** With `CLUSTER FAILOVER` sent to the
   source's replica while `CLUSTER MIGRATION IMPORT` ran, the replica took
