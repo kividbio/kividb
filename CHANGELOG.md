@@ -155,6 +155,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   4102444800001` reads back as 4102444801). Checked against Redis 8.4's
   `ttlGenericCommand` and `httlGenericCommand`.
 
+- **`UNWATCH` inside `MULTI` is queued, and no longer lets `EXEC` run
+  after a watched key changed (#550).** It ran at once and dropped the
+  watches, so `WATCH k`, `MULTI`, ..., `UNWATCH`, then `EXEC` ran even
+  though another client had written `k`, and that client's write was
+  overwritten. `AUTH`, `HELLO`, `MONITOR`, `WAIT` and `WAITAOF` ran at once
+  inside `MULTI` too (#499 for the last two). As in Redis 8, all six are now
+  queued and run by `EXEC`. A queued `UNWATCH` answers `OK` and changes
+  nothing. `AUTH` and `HELLO` change the user, the protocol and the name
+  when `EXEC` runs them, and the commands after them in the transaction
+  see the change. `MONITOR` is refused there with `ERR MONITOR isn't allowed
+  for DENY BLOCKING client`. `WAIT` and `WAITAOF` answer at once, without
+  waiting. `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH` and `RESET` now
+  check their number of arguments (`UNWATCH x` answered `OK`). Inside
+  `MULTI` the wrong number also fails the transaction, and an `EXEC` with
+  the wrong number discards it. Both I/O models.
+
 - **`HSET` is no longer slowed down by a lock every worker shared
   (#544).** Every `HSET`, `HMSET`, `HSETNX`, `HINCRBY` and
   `HINCRBYFLOAT` took the search indexes' lock twice to find out whether

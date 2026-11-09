@@ -4,6 +4,10 @@
 // This module only handles the commands that don't need queuing —
 // MULTI, DISCARD, WATCH, UNWATCH. EXEC is handled in server.rs
 // because it needs to execute the queued commands directly.
+
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
 /// Held by an `EXEC` whose transaction watches keys, from before it checks
 /// whether a watched key was modified until its last command has run.
 ///
@@ -55,10 +59,11 @@ pub fn queue_refusal(name: &str, cmd: &[&[u8]]) -> Option<Vec<u8>> {
         return Some(wrong_number);
     }
     // What cannot be one step of several: it ends the process, or takes
-    // the connection over.
+    // the connection over. (`MONITOR` is queued, as in Redis, and refused
+    // when `EXEC` runs it: see `connection_reply_in_exec`.)
     if matches!(
         name,
-        "SAVE" | "SHUTDOWN" | "BGREWRITEAOF" | "FAILOVER" | "SYNC" | "PSYNC" | "MONITOR"
+        "SAVE" | "SHUTDOWN" | "BGREWRITEAOF" | "FAILOVER" | "SYNC" | "PSYNC"
     ) {
         return Some(crate::resp::write::resp_error(
             "ERR Command not allowed inside a transaction",
@@ -71,6 +76,107 @@ pub fn queue_refusal(name: &str, cmd: &[&[u8]]) -> Option<Vec<u8>> {
 }
 
 const OOM: &str = "OOM command not allowed when used memory > 'maxmemory'.";
+
+/// What a transaction's queued command is run with, when the connection loop
+/// answers it itself rather than `execute_command`.
+pub struct InExec<'a> {
+    pub acl_store: &'a crate::acl::AclStore,
+    pub acl_log: &'a crate::acl::SharedAclLog,
+    pub user: &'a str,
+    pub peer_addr: &'a str,
+    pub repl_state: &'a crate::replication::ReplState,
+    /// For a queued `WAIT`: the replicas, and what each had been sent, as
+    /// `EXEC` began (see `queues_wait`). None when nothing queued waits.
+    pub wait_targets: Option<&'a [(Arc<crate::replication::ReplicaProgress>, u64)]>,
+}
+
+/// Whether a queued `WAIT` is among `queue`: `EXEC` then takes the replicas'
+/// targets before it runs anything, as the `WAIT` it runs would have.
+pub fn queues_wait(queue: &[Vec<Vec<u8>>]) -> bool {
+    queue.iter().any(|queued| {
+        queued
+            .first()
+            .is_some_and(|name| name.eq_ignore_ascii_case(b"WAIT"))
+    })
+}
+
+/// The reply, inside `EXEC`, to a queued `UNWATCH`, `MONITOR`, `WAIT` or
+/// `WAITAOF`: commands the connection loop answers itself outside a
+/// transaction, and `execute_command` does not know. None for any other
+/// command. (`AUTH` and `HELLO` are `login::Login`'s.)
+///
+/// They are queued inside `MULTI`, as in Redis, and answered here as Redis's
+/// `EXEC` answers them, where nothing may block (#550, #499):
+///
+/// - `UNWATCH`: `OK`, and nothing else. `EXEC` has checked the watched keys
+///   already, and drops the watches when it ends.
+/// - `MONITOR`: refused; a connection cannot start monitoring part-way
+///   through a transaction's replies.
+/// - `WAIT`: how many replicas have everything written before `EXEC`, now,
+///   without waiting.
+/// - `WAITAOF`: whether what was written is on disk here, now, without
+///   waiting; as outside a transaction, `0` replicas.
+pub fn connection_reply_in_exec(name: &str, cmd: &[&[u8]], env: &InExec) -> Option<Vec<u8>> {
+    if !matches!(name, "UNWATCH" | "MONITOR" | "WAIT" | "WAITAOF") {
+        return None;
+    }
+    // Checked again when it runs, as every queued command is: the user's
+    // rules may have changed since it was queued.
+    if crate::acl::RESTRICTED_CMD_CLIENTS.load(Ordering::Relaxed) > 0
+        || crate::acl::RESTRICTED_KEY_CLIENTS.load(Ordering::Relaxed) > 0
+    {
+        let denied = env
+            .acl_store
+            .read()
+            .get(env.user)
+            .and_then(|user| crate::acl::check_permission(user, name, cmd).err());
+        if let Some(denied) = denied {
+            env.acl_log
+                .record(denied.reason(), denied.object(), env.user, env.peer_addr);
+            return Some(crate::resp::write::resp_error(&denied.message(env.user)));
+        }
+    }
+    let number = |at: usize| {
+        cmd.get(at)
+            .and_then(|arg| std::str::from_utf8(arg).ok())
+            .and_then(|arg| arg.parse::<i64>().ok())
+            .unwrap_or(0)
+    };
+    Some(match name {
+        "UNWATCH" => b"+OK\r\n".to_vec(),
+        "MONITOR" => {
+            crate::resp::write::resp_error("ERR MONITOR isn't allowed for DENY BLOCKING client")
+        }
+        "WAIT" => {
+            let connected = env.repl_state.connected_replicas.load(Ordering::Relaxed);
+            if number(1) == 0 || connected == 0 {
+                crate::resp::write::resp_integer(connected)
+            } else {
+                crate::resp::write::resp_integer(
+                    env.wait_targets
+                        .map_or(0, crate::replication::ReplState::count_reached),
+                )
+            }
+        }
+        _ => {
+            if !crate::aof::AOF_ENABLED.load(Ordering::Relaxed) {
+                if number(1) != 0 {
+                    crate::resp::write::resp_error(
+                        "ERR WAITAOF cannot be used when numlocal is set but appendonly is disabled.",
+                    )
+                } else {
+                    b"*2\r\n:0\r\n:0\r\n".to_vec()
+                }
+            } else if crate::aof::AOF_FSYNCED.load(Ordering::Relaxed)
+                >= crate::aof::AOF_WRITTEN.load(Ordering::Relaxed)
+            {
+                b"*2\r\n:1\r\n:0\r\n".to_vec()
+            } else {
+                b"*2\r\n:0\r\n:0\r\n".to_vec()
+            }
+        }
+    })
+}
 
 /// A write, with the server over `maxmemory` and no policy that could make
 /// room for it. (With a policy that evicts, room is made when the command
