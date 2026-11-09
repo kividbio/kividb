@@ -2628,7 +2628,7 @@ fn json_numbers_keep_every_double_exactly() {
                 assert!(reply.is_error(), "{command} {a:?} {b:e}: {reply:?}");
                 continue;
             }
-            // A whole result is kept as an integer, and -0 as 0.
+            // A float stays a float, even when it is whole. -0 is compared as 0.
             if result == 0.0 {
                 assert_eq!(numbers(reply.as_str()), [0.0], "{command} {a:?} {b:e}");
                 continue;
@@ -2654,7 +2654,7 @@ fn json_numbers_keep_every_double_exactly() {
                 .is_ok()
         );
         let reply = c3.cmds(&["JSON.NUMINCRBY", "n445:r3", "$", "0"]);
-        // A double, or an integer when the number is a whole one.
+        // A float stays a float, so this is a double, even when it is whole.
         let got = match &reply.as_array()[0] {
             RespValue::Int(n) => *n as f64,
             other => other.as_f64(),
