@@ -2775,6 +2775,20 @@ fn the_query_engine_settings_are_described() {
             entry[0].s()
         );
     }
+    // Byte for byte, the words RediSearch's C source runs together too
+    // (#583).
+    for (name, run_together) in [
+        ("UNION_ITERATOR_HEAP", "the iterator willswitch to heap"),
+        ("MULTI_TEXT_SLOP", "multi text values.Can control"),
+        (
+            "BM25STD_TANH_FACTOR",
+            "BM25STD scorer.The default value is 4.",
+        ),
+    ] {
+        let reply = c.cmd(&["FT.CONFIG", "HELP", name]);
+        let text = reply.arr()[0].arr()[2].s().to_string();
+        assert!(text.contains(run_together), "{name}: {text}");
+    }
 }
 
 /// `FT.EXPLAIN` echoed the query back; `FT.PROFILE` returned an empty array.

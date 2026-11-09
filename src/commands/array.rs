@@ -279,12 +279,22 @@ fn ordered_span(start: u64, end: u64) -> (u64, u64, bool) {
 ///
 /// Uses the `BTreeMap` range directly, so cost is `O(log N + M)` in the number
 /// of elements actually present — not the width of the span.
-fn existing_in_span(inner: &ArrayInner, lo: u64, hi: u64, reverse: bool) -> Vec<(u64, Arc<[u8]>)> {
-    let iter = inner.entries.range(lo..=hi);
+/// Taken as they are asked for, so that a `LIMIT` stops the walk: `ARSCAN
+/// ... LIMIT 1` over a large span copied every element of it first.
+fn existing_in_span(
+    inner: &ArrayInner,
+    lo: u64,
+    hi: u64,
+    reverse: bool,
+) -> Box<dyn Iterator<Item = (u64, Arc<[u8]>)> + '_> {
+    let iter = inner
+        .entries
+        .range(lo..=hi)
+        .map(|(&i, v)| (i, Arc::clone(v)));
     if reverse {
-        iter.rev().map(|(&i, v)| (i, Arc::clone(v))).collect()
+        Box::new(iter.rev())
     } else {
-        iter.map(|(&i, v)| (i, Arc::clone(v))).collect()
+        Box::new(iter)
     }
 }
 
@@ -741,10 +751,7 @@ fn cmd_arscan(ctx: &mut Ctx) -> Vec<u8> {
     let resp = reply_resp(ctx);
     match with_array_read(ctx, &key, Vec::new(), |inner| {
         let mut out: Vec<Vec<u8>> = Vec::new();
-        for (idx, val) in existing_in_span(inner, lo, hi, reverse)
-            .into_iter()
-            .take(cap)
-        {
+        for (idx, val) in existing_in_span(inner, lo, hi, reverse).take(cap) {
             out.push(resp_array(vec![resp_unsigned(resp, idx), resp_bulk(&val)]));
         }
         out
