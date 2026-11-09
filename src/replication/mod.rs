@@ -415,10 +415,10 @@ pub struct ReplicaProgress {
     /// Where the replica is between asking for a sync and following the
     /// stream ([`ReplicaState`] as a `u8`).
     state: AtomicU8,
-    /// The bytes queued for it and not yet taken by its forwarder, shared
+    /// What is queued for it and not yet taken by its forwarder, shared
     /// with the hub (`HubMsg::RegisterChannel::pending_bytes`). Set once the
     /// hub feeds it.
-    queue: std::sync::OnceLock<Arc<AtomicU64>>,
+    queue: std::sync::OnceLock<Arc<ReplicaQueue>>,
 }
 
 impl ReplicaProgress {
@@ -436,9 +436,7 @@ impl ReplicaProgress {
     /// Bytes queued for this replica that its connection has not taken yet:
     /// `queued` in `INFO replication`.
     pub fn queued(&self) -> u64 {
-        self.queue
-            .get()
-            .map_or(0, |queue| queue.load(Ordering::Relaxed))
+        self.queue.get().map_or(0, |queue| queue.bytes())
     }
 
     pub fn state(&self) -> ReplicaState {
@@ -1840,6 +1838,68 @@ fn generate_repl_id() -> String {
 
 // ── Hub ────────────────────────────────────────────────────────────────────
 
+/// What is queued for one replica and not yet taken by its connection's
+/// forwarder. The hub adds each payload before it hands it over; the
+/// forwarder takes away what it takes off the queue, a batch at a time.
+#[derive(Debug, Default)]
+pub struct ReplicaQueue {
+    /// Bytes of the stream: `queued` in `INFO replication`, and what
+    /// `repl-replica-max-backlog-bytes` and `repl-replica-sync-max-backlog-bytes`
+    /// hold a replica to.
+    bytes: AtomicU64,
+    /// The memory those bytes take while they wait ([`ReplicaQueue::held_for`]):
+    /// what is not counted against `maxmemory` for the replica.
+    held: AtomicU64,
+}
+
+impl ReplicaQueue {
+    /// The memory a payload of `len` bytes takes while it is queued: its
+    /// allocation, an `Arc<[u8]>` (two counts ahead of the bytes, the whole
+    /// rounded up to their alignment), and its slot in the queue. The
+    /// queue's blocks hold 32 slots and four words besides: those words are
+    /// left out.
+    ///
+    /// Only the bytes used to be taken off what is counted (#542). A
+    /// replica's queue is mostly small writes: a `SET` of a 100-byte value is
+    /// a payload of about 140 bytes in an allocation of 160, and its slot is
+    /// 16 more. With a replica gigabytes behind, the rest came to hundreds
+    /// of megabytes, counted against `maxmemory`: the master evicted nearly
+    /// every key for it, and then refused writes.
+    #[inline]
+    pub fn held_for(len: usize) -> u64 {
+        let counts = 2 * std::mem::size_of::<usize>();
+        let allocation = (counts + len).next_multiple_of(std::mem::align_of::<usize>());
+        (allocation + std::mem::size_of::<ReplPayload>()) as u64
+    }
+
+    /// The hub queues `len` bytes. Returns the bytes queued now.
+    #[inline]
+    pub fn add(&self, len: usize) -> u64 {
+        self.held.fetch_add(Self::held_for(len), Ordering::Relaxed);
+        self.bytes
+            .fetch_add(len as u64, Ordering::Relaxed)
+            .saturating_add(len as u64)
+    }
+
+    /// The forwarder took payloads of `bytes` bytes off the queue, which
+    /// held `held` ([`ReplicaQueue::held_for`] of each).
+    #[inline]
+    pub fn taken(&self, bytes: usize, held: u64) {
+        self.bytes.fetch_sub(bytes as u64, Ordering::Relaxed);
+        self.held.fetch_sub(held, Ordering::Relaxed);
+    }
+
+    /// Bytes of the stream queued.
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    /// The memory they take.
+    pub fn held(&self) -> u64 {
+        self.held.load(Ordering::Relaxed)
+    }
+}
+
 /// A connected replica's write socket, registered with the hub.
 pub struct ReplicaConn {
     pub addr: String,
@@ -1856,11 +1916,11 @@ pub enum HubMsg {
         peer_port: u16,
         tx: mpsc::UnboundedSender<ReplPayload>,
         replica_id: u64,
-        /// Shared with the replica's forwarder task: hub increments on enqueue,
-        /// forwarder decrements after each successful flush. Lets the hub evict a
+        /// Shared with the replica's forwarder task: hub adds on enqueue,
+        /// forwarder takes away what it takes off the queue. Lets the hub evict a
         /// replica whose outbound queue has grown past the configured limit instead
         /// of buffering an unbounded backlog for a replica that never catches up.
-        pending_bytes: Arc<AtomicU64>,
+        pending_bytes: Arc<ReplicaQueue>,
         /// The offset this replica's `+FULLRESYNC` announced. Its ACKs count
         /// from here; see [`ReplicaProgress`].
         base: u64,
@@ -2279,13 +2339,14 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
             // forwarders is not counted against `maxmemory`, as Redis does not
             // count its replicas' output buffers: a full sync queues every
             // write made while its payload is laid out and sent, and evicting
-            // keys for it gives nothing back (#284). Each replica is queued
-            // the same writes, shared: the longest queue is what they hold.
-            // Taken again after every message and every second.
+            // keys for it gives nothing back (#284). All of the memory it
+            // takes, not only the stream's bytes (#542). Each replica is
+            // queued the same writes, shared: the longest queue is what they
+            // hold. Taken again after every message and every second.
             crate::memory_use::set_replica_queued(
                 channel_replicas
                     .iter()
-                    .map(|r| r.pending_bytes.load(Ordering::Relaxed))
+                    .map(|r| r.pending_bytes.held())
                     .max()
                     .unwrap_or(0) as usize,
             );
@@ -2410,9 +2471,7 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                         let _ = progress.queue.set(Arc::clone(&registration.pending_bytes));
                         let missed_len = missed.len() as u64;
                         let delivered = missed.is_empty() || {
-                            registration
-                                .pending_bytes
-                                .fetch_add(missed_len, Ordering::Relaxed);
+                            registration.pending_bytes.add(missed.len());
                             registration.tx.send(Arc::from(missed)).is_ok()
                         };
                         if !delivered {
@@ -2618,10 +2677,7 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                         // subtract first, wrapping the counter below zero. A
                         // debug build then panicked on the addition here, which
                         // killed the hub and with it all replication.
-                        let now_pending = replica
-                            .pending_bytes
-                            .fetch_add(payload.len() as u64, Ordering::Relaxed)
-                            .saturating_add(payload.len() as u64);
+                        let now_pending = replica.pending_bytes.add(payload.len());
                         if let Err(_closed) = replica.tx.send(Arc::clone(&payload)) {
                             forget_replica(&state, replica.id);
                             log_warn!(
@@ -2702,7 +2758,7 @@ pub struct ReplicaRegistration {
     pub peer_ip: String,
     pub peer_port: u16,
     pub tx: mpsc::UnboundedSender<ReplPayload>,
-    pub pending_bytes: Arc<AtomicU64>,
+    pub pending_bytes: Arc<ReplicaQueue>,
 }
 
 /// Take the cut for a full resync: register the replica with the hub and
@@ -2856,7 +2912,7 @@ struct ChannelReplica {
     id: u64,
     addr: String,
     tx: mpsc::UnboundedSender<ReplPayload>,
-    pending_bytes: Arc<AtomicU64>,
+    pending_bytes: Arc<ReplicaQueue>,
     progress: Arc<ReplicaProgress>,
     /// In its full sync: held to `repl-replica-sync-max-backlog-bytes`
     /// rather than `repl-replica-max-backlog-bytes`. See [`start_hub`].
@@ -4193,10 +4249,11 @@ pub fn inner_command_blocked_in_readonly_script(name: &str, cmd: &[&[u8]]) -> bo
 #[cfg(test)]
 mod replication_invariants_tests {
     use super::{
-        HubMsg, ReplPayload, ReplState, propagate, slave_command_allowed_during_loading, start_hub,
+        HubMsg, ReplPayload, ReplState, ReplicaQueue, propagate,
+        slave_command_allowed_during_loading, start_hub,
     };
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::Ordering;
 
     async fn await_connected(state: &ReplState, want: i64) {
         for _ in 0..5000 {
@@ -4224,7 +4281,7 @@ mod replication_invariants_tests {
             peer_port: 9_001,
             tx,
             replica_id: 9001,
-            pending_bytes: Arc::new(AtomicU64::new(0)),
+            pending_bytes: Arc::default(),
             base: 0,
         })
         .unwrap();
@@ -4247,7 +4304,7 @@ mod replication_invariants_tests {
             peer_port: 9_002,
             tx,
             replica_id: 9002,
-            pending_bytes: Arc::new(AtomicU64::new(0)),
+            pending_bytes: Arc::default(),
             base: 0,
         })
         .unwrap();
@@ -4276,7 +4333,7 @@ mod replication_invariants_tests {
             peer_port: 9_003,
             tx,
             replica_id: 9003,
-            pending_bytes: Arc::new(AtomicU64::new(0)),
+            pending_bytes: Arc::default(),
             base: 0,
         })
         .unwrap();
@@ -4316,7 +4373,7 @@ mod replication_invariants_tests {
             peer_port: 9_004,
             tx,
             replica_id: 9004,
-            pending_bytes: Arc::new(AtomicU64::new(0)),
+            pending_bytes: Arc::default(),
             base: 0,
         })
         .unwrap();
@@ -4341,7 +4398,7 @@ mod replication_invariants_tests {
         wait.await.unwrap();
     }
 
-    fn register_syncing(hub: &super::HubTx, id: u64, pending: &Arc<AtomicU64>) -> ReplRx {
+    fn register_syncing(hub: &super::HubTx, id: u64, pending: &Arc<ReplicaQueue>) -> ReplRx {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ReplPayload>();
         hub.send(HubMsg::RegisterChannel {
             addr: format!("replica-{id}"),
@@ -4373,7 +4430,7 @@ mod replication_invariants_tests {
             .replica_sync_max_backlog_bytes
             .store(1000, Ordering::Relaxed);
         let hub = start_hub(Arc::clone(&state));
-        let pending = Arc::new(AtomicU64::new(0));
+        let pending = Arc::new(ReplicaQueue::default());
         let mut rx = register_syncing(&hub, 9005, &pending);
         await_connected(&state, 1).await;
 
@@ -4384,6 +4441,9 @@ mod replication_invariants_tests {
         barrier(&hub).await;
         assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 1);
         assert_eq!(state.replica(9005).unwrap().queued(), 500);
+        // And the memory they take, each payload's allocation and slot.
+        assert_eq!(pending.held(), 10 * ReplicaQueue::held_for(50));
+        assert!(pending.held() > 500 + 10 * 16);
 
         // Loaded and acknowledged; its connection takes what was queued.
         hub.send(HubMsg::AckOffset {
@@ -4392,7 +4452,8 @@ mod replication_invariants_tests {
         })
         .unwrap();
         while rx.try_recv().is_ok() {}
-        pending.store(0, Ordering::Relaxed);
+        pending.taken(500, 10 * ReplicaQueue::held_for(50));
+        assert_eq!((pending.bytes(), pending.held()), (0, 0));
         // The next write finds it streaming (its queue is a quarter of the
         // streaming limit or less)...
         propagate(&hub, vec![0u8; 20]);
@@ -4417,7 +4478,7 @@ mod replication_invariants_tests {
             .replica_sync_max_backlog_bytes
             .store(1000, Ordering::Relaxed);
         let hub = start_hub(Arc::clone(&state));
-        let pending = Arc::new(AtomicU64::new(0));
+        let pending = Arc::new(ReplicaQueue::default());
         let _rx = register_syncing(&hub, 9006, &pending);
         await_connected(&state, 1).await;
         for _ in 0..19 {
@@ -4757,7 +4818,7 @@ mod replication_invariants_tests {
             peer_port: 9_005,
             tx,
             replica_id: 9005,
-            pending_bytes: Arc::new(AtomicU64::new(0)),
+            pending_bytes: Arc::default(),
             base: 0,
         })
         .unwrap();

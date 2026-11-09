@@ -48,7 +48,7 @@ pub async fn handle_replica_connection_uring(
     // decrements it after each successful flush. Lets the hub evict us if we fall
     // far enough behind instead of queueing an unbounded backlog — see
     // `replication::mod::start_hub`.
-    let pending_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let pending_bytes = Arc::new(crate::replication::ReplicaQueue::default());
 
     // ── 2. A replica that only lost its connection is sent what it missed.
     // Failing that, take the cut: register with the hub and serialise the
@@ -137,22 +137,27 @@ pub async fn handle_replica_connection_uring(
             };
             let mut batch = Vec::with_capacity(first.len().min(BATCH_MAX_BYTES));
             batch.extend_from_slice(first.as_ref());
+            // The memory the payloads took while queued (see `ReplicaQueue`).
+            let mut held = crate::replication::ReplicaQueue::held_for(first.len());
+            drop(first);
             loop {
                 if batch.len() >= BATCH_MAX_BYTES {
                     break;
                 }
                 match replica_rx.try_recv() {
-                    Ok(p) => batch.extend_from_slice(p.as_ref()),
+                    Ok(p) => {
+                        batch.extend_from_slice(p.as_ref());
+                        held += crate::replication::ReplicaQueue::held_for(p.len());
+                    }
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                        pending_bytes
-                            .fetch_sub(batch.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                        pending_bytes.taken(batch.len(), held);
                         let _ = stream_fwd.write_all(batch).await;
                         return;
                     }
                 }
             }
-            pending_bytes.fetch_sub(batch.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            pending_bytes.taken(batch.len(), held);
             if stream_fwd.write_all(batch).await.0.is_err() {
                 break;
             }

@@ -2321,7 +2321,7 @@ where
     // Shared with the hub: it increments this on enqueue, we decrement it after each
     // successful flush. Lets the hub evict us if we fall far enough behind instead of
     // queueing an unbounded backlog — see `replication::mod::start_hub`.
-    let pending_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let pending_bytes = Arc::new(crate::replication::ReplicaQueue::default());
 
     // The forwarder writes to the socket itself, one batch at a time, as the
     // io_uring loop's does. Handed to the writer task, the replica's queue
@@ -2354,23 +2354,29 @@ where
 
             let mut batch = Vec::with_capacity(first.len().min(BATCH_MAX_BYTES));
             batch.extend_from_slice(first.as_ref());
+            // The memory the payloads took while queued (see `ReplicaQueue`).
+            let mut held = crate::replication::ReplicaQueue::held_for(first.len());
+            drop(first);
 
             loop {
                 if batch.len() >= BATCH_MAX_BYTES {
                     break;
                 }
                 match replica_rx.try_recv() {
-                    Ok(p) => batch.extend_from_slice(p.as_ref()),
+                    Ok(p) => {
+                        batch.extend_from_slice(p.as_ref());
+                        held += crate::replication::ReplicaQueue::held_for(p.len());
+                    }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
-                        pending_bytes_fwd.fetch_sub(batch.len() as u64, Ordering::Relaxed);
+                        pending_bytes_fwd.taken(batch.len(), held);
                         write_batch(batch).await;
                         return;
                     }
                 }
             }
 
-            pending_bytes_fwd.fetch_sub(batch.len() as u64, Ordering::Relaxed);
+            pending_bytes_fwd.taken(batch.len(), held);
             if !write_batch(batch).await {
                 break;
             }
