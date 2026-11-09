@@ -4471,6 +4471,49 @@ mod backlog_tests {
     }
 }
 
+/// Time series commands an AOF written by 1.2.0 holds, with words that
+/// version passed over and 1.2.1 refuses from a client (#565): replayed,
+/// the words passed over again, rather than the series lost.
+#[cfg(test)]
+mod ts_option_replay_tests {
+    use super::past_deadline_replay_tests::replayed;
+    use crate::store::ValueRef;
+
+    #[test]
+    fn words_an_older_version_passed_over_are_passed_over_again() {
+        let store = replayed(&[
+            vec![
+                "TS.CREATE",
+                "k",
+                "RETENTION",
+                "5000",
+                "FOO",
+                "LABELS",
+                "a",
+                "b",
+            ],
+            vec!["TS.ALTER", "k", "CHUNK", "BAR", "100"],
+            vec!["TS.INCRBY", "c", "1", "BOGUS", "TIMESTAMP", "7"],
+            vec!["TS.ADD", "k", "10", "1.5", "IGNORE", "5", "0.5"],
+        ]);
+        let series = |key: &str| {
+            let shard = crate::store::get_shard(&store[0], key);
+            let map = shard.read();
+            match map.get(key.as_bytes()) {
+                Some(ValueRef::TimeSeries(inner)) => inner.read().clone(),
+                _ => panic!("{key} is not a series"),
+            }
+        };
+        let k = series("k");
+        assert_eq!(k.retention, 5000);
+        assert_eq!(k.chunk_size, 100);
+        assert_eq!(k.labels.get("a").map(String::as_str), Some("b"));
+        assert_eq!(k.samples.get(&10), Some(&1.5));
+        let c = series("c");
+        assert_eq!(c.samples.get(&7), Some(&1.0));
+    }
+}
+
 /// A deadline the log gave a key, or a hash field, and the writes made to
 /// it after that while it lived: replayed once the deadline has passed.
 #[cfg(test)]
@@ -4485,7 +4528,7 @@ mod past_deadline_replay_tests {
     }
 
     /// `records`, written to an AOF and replayed into a new store.
-    fn replayed(records: &[Vec<&str>]) -> Store {
+    pub(super) fn replayed(records: &[Vec<&str>]) -> Store {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("appendonly.aof");
         let log: Vec<u8> = records.iter().flat_map(|r| record(r)).collect();

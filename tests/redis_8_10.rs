@@ -2136,6 +2136,100 @@ fn new_commands_reach_a_replica_as_their_effects() {
     );
 }
 
+/// A series `TS.INCRBY` makes with options, and one `TS.ALTER` changes to a
+/// default value, are the same on a replica (#555, #565): its settings, its
+/// labels, and its samples, trimmed to the retention.
+#[test]
+fn time_series_options_reach_a_replica() {
+    let master_port = free_port();
+    start(master_port, None);
+    let replica_port = free_port();
+    start(replica_port, Some(master_port));
+    let mut m = Conn::connect(master_port);
+    let mut r = Conn::connect(replica_port);
+    wait_until("the replica to sync", || {
+        r.cmd(&["INFO", "replication"])
+            .s()
+            .contains("master_link_status:up")
+    });
+
+    // A label whose value is `TIMESTAMP`, and no TIMESTAMP option: the
+    // master's clock is sent, and the label kept.
+    m.cmd(&[
+        "TS.INCRBY",
+        "rp:ts:c",
+        "5",
+        "RETENTION",
+        "100000000",
+        "CHUNK_SIZE",
+        "128",
+        "LABELS",
+        "kind",
+        "TIMESTAMP",
+    ]);
+    m.cmd(&["TS.CREATE", "rp:ts:r", "RETENTION", "1000"]);
+    m.cmd(&["TS.INCRBY", "rp:ts:r", "1", "TIMESTAMP", "1000"]);
+    m.cmd(&["TS.INCRBY", "rp:ts:r", "1", "TIMESTAMP", "5000"]);
+    m.cmd(&[
+        "TS.CREATE",
+        "rp:ts:a",
+        "RETENTION",
+        "5000",
+        "CHUNK_SIZE",
+        "128",
+        "LABELS",
+        "x",
+        "y",
+    ]);
+    assert!(
+        m.cmd(&[
+            "TS.ALTER",
+            "rp:ts:a",
+            "RETENTION",
+            "0",
+            "CHUNK_SIZE",
+            "4096",
+            "LABELS"
+        ])
+        .ok()
+    );
+    assert_eq!(m.cmd(&["WAIT", "1", "5000"]).i(), 1);
+
+    for key in ["rp:ts:c", "rp:ts:r", "rp:ts:a"] {
+        let (on_master, on_replica) = (m.cmd(&["TS.INFO", key]), r.cmd(&["TS.INFO", key]));
+        for field in [
+            "retentionTime",
+            "chunkSize",
+            "labels",
+            "lastTimestamp",
+            "totalSamples",
+        ] {
+            assert_eq!(
+                on_replica.field(field),
+                on_master.field(field),
+                "{key} {field}"
+            );
+        }
+        assert_eq!(
+            r.cmd(&["TS.RANGE", key, "-", "+"]),
+            m.cmd(&["TS.RANGE", key, "-", "+"]),
+            "{key}"
+        );
+    }
+    let info = m.cmd(&["TS.INFO", "rp:ts:c"]);
+    assert_eq!(info.field("retentionTime").s(), "100000000");
+    assert_eq!(info.field("chunkSize").s(), "128");
+    assert_eq!(
+        r.cmd(&["TS.QUERYINDEX", "kind=TIMESTAMP"]).strings(),
+        ["rp:ts:c"]
+    );
+    assert_eq!(m.cmd(&["TS.RANGE", "rp:ts:r", "-", "+"]).arr().len(), 1);
+    let altered = r.cmd(&["TS.INFO", "rp:ts:a"]);
+    assert_eq!(altered.field("retentionTime").s(), "0");
+    assert_eq!(altered.field("chunkSize").s(), "4096");
+    assert_eq!(altered.field("labels"), &V::Arr(vec![]));
+}
+
 /// Writes that give a TTL as "this long from now", in every spelling, and the
 /// keys (and hash fields) they leave with one.
 const RELATIVE_TTL_WRITES: &[&[&str]] = &[

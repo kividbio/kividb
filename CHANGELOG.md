@@ -145,6 +145,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`TS.INCRBY` and `TS.DECRBY` make a series with the options given
+  (#555).** `RETENTION`, `CHUNK_SIZE`, `DUPLICATE_POLICY` and `LABELS` were
+  passed over, and a series either command created had the defaults and no
+  labels. They now apply when the command creates the series, as in
+  RedisTimeSeries, and the sample is added as `TS.ADD` adds one, so the
+  series is trimmed to its retention; it never was.
+- **The time series options are read as RedisTimeSeries spells them, and a
+  word that is not one is an error (#565).** `TS.CREATE`, `TS.ALTER`,
+  `TS.ADD`, `TS.INCRBY` and `TS.DECRBY` took `CHUNK SIZE` but not
+  `CHUNK_SIZE`, and a word they did not know ended the options with no
+  error: `CHUNK_SIZE` and everything after it, `LABELS` too, was dropped.
+  `CHUNK_SIZE` is read now, a chunk size must be a multiple of 8 from 48 to
+  1048576, `TS.ADD … ON_DUPLICATE policy` applies to that sample alone, and
+  an unknown word, or `IGNORE`, which KiviDB does not support, is refused,
+  with nothing changed. `CHUNK SIZE`, `ON DUPLICATE` and `DUPLICATE POLICY`
+  are still accepted. `TS.ALTER` sets what it is given: `RETENTION 0`,
+  `CHUNK_SIZE 4096` and `LABELS` with no pairs were ignored. Commands
+  replayed from an AOF, or sent by a master, are read as before, so a log
+  written by 1.2.0 replays whole.
 - **`JSON.NUMINCRBY` and `JSON.NUMMULTBY` refuse an integer overflow
   (#536).** Two integers whose result did not fit an `i64` gave a float,
   losing precision. They now fail with `ERR numeric overflow` and the

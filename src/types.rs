@@ -597,6 +597,19 @@ impl TsInner {
     /// Add a sample, respecting duplicate policy and retention.
     /// Returns the timestamp actually stored, or an error string.
     pub fn add_sample(&mut self, ts: u64, value: f64) -> Result<u64, &'static str> {
+        let policy = self.duplicate_policy.clone();
+        self.add_sample_as(ts, value, &policy)
+    }
+
+    /// [`Self::add_sample`], with `policy` for a sample already at `ts` in
+    /// place of the series' own: `TS.ADD … ON_DUPLICATE`, and `TS.INCRBY`,
+    /// which replaces the latest value whatever the series' policy.
+    pub fn add_sample_as(
+        &mut self,
+        ts: u64,
+        value: f64,
+        policy: &DuplicatePolicy,
+    ) -> Result<u64, &'static str> {
         // Enforce retention: trim samples older than (ts - retention)
         if self.retention > 0 && ts >= self.retention {
             let cutoff = ts - self.retention;
@@ -617,7 +630,7 @@ impl TsInner {
         }
 
         if let Some(&existing) = self.samples.get(&ts) {
-            match self.duplicate_policy {
+            match policy {
                 DuplicatePolicy::Block => return Err("TSDB: Duplicate sample in BLOCK policy"),
                 DuplicatePolicy::First => { /* keep existing, do nothing */ }
                 DuplicatePolicy::Last => {

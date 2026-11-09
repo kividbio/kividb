@@ -338,16 +338,16 @@ fn ts_incrby_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
     let Some(ts) = parse_resp_integer(resp) else {
         return verbatim();
     };
+    // The `TIMESTAMP` option the command read, dropped here and added back
+    // below with the time it used. Not a word `TIMESTAMP` that is a label's
+    // value, which the command now applies (#555).
+    let given = crate::commands::ts::incrby_timestamp_at(cmd);
     let mut parts: Vec<Vec<u8>> = Vec::with_capacity(cmd.len() + 2);
-    let mut i = 0;
-    while i < cmd.len() {
-        if i >= 3 && cmd[i].eq_ignore_ascii_case(b"TIMESTAMP") {
-            // Dropped here, re-added below with the concrete value.
-            i += 2;
+    for (i, part) in cmd.iter().enumerate() {
+        if given.is_some_and(|at| i == at || i == at + 1) {
             continue;
         }
-        parts.push(cmd[i].to_vec());
-        i += 1;
+        parts.push(part.to_vec());
     }
     parts.push(b"TIMESTAMP".to_vec());
     parts.push(ts.to_string().into_bytes());
@@ -800,6 +800,50 @@ mod tests {
                 "9",
                 "TIMESTAMP",
                 "42"
+            ])]
+        );
+    }
+
+    /// The `TIMESTAMP` option the command read is the one replaced: not a
+    /// label's value `TIMESTAMP`, which a series `TS.INCRBY` makes now has
+    /// (#555).
+    #[test]
+    fn ts_incrby_feed_replaces_the_timestamp_option_alone() {
+        let c = cmd(&["TS.INCRBY", "k", "2", "LABELS", "kind", "TIMESTAMP"]);
+        assert_eq!(
+            ts_incrby_feed(&refs(&c), b":42\r\n"),
+            vec![cmd(&[
+                "TS.INCRBY",
+                "k",
+                "2",
+                "LABELS",
+                "kind",
+                "TIMESTAMP",
+                "TIMESTAMP",
+                "42"
+            ])]
+        );
+        let c = cmd(&[
+            "TS.INCRBY",
+            "k",
+            "2",
+            "TIMESTAMP",
+            "7",
+            "LABELS",
+            "a",
+            "TIMESTAMP",
+        ]);
+        assert_eq!(
+            ts_incrby_feed(&refs(&c), b":7\r\n"),
+            vec![cmd(&[
+                "TS.INCRBY",
+                "k",
+                "2",
+                "LABELS",
+                "a",
+                "TIMESTAMP",
+                "TIMESTAMP",
+                "7"
             ])]
         );
     }

@@ -1563,3 +1563,247 @@ fn test_ts_range_agg_std() {
         "expected std.p ≈ 2.0, got {std_val}"
     );
 }
+
+// ── Options (#555, #565) ─────────────────────────────────────────────────────
+
+/// The value of `name` in `TS.INFO key`, as text.
+fn info_field(c: &mut Conn, key: &str, name: &str) -> String {
+    let info = c.cmds(&["TS.INFO", key]);
+    let arr = info.as_array();
+    let at = arr
+        .iter()
+        .position(|v| matches!(v, RespValue::Bulk(b) if b == name.as_bytes()))
+        .unwrap_or_else(|| panic!("no {name} in {info:?}"));
+    match &arr[at + 1] {
+        RespValue::Bulk(b) => String::from_utf8_lossy(b).into_owned(),
+        RespValue::Int(n) => n.to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// `TS.QUERYINDEX filter`, as key names.
+fn query_index(c: &mut Conn, filter: &str) -> Vec<String> {
+    c.cmds(&["TS.QUERYINDEX", filter])
+        .as_array()
+        .iter()
+        .map(|k| k.as_str().to_string())
+        .collect()
+}
+
+/// A series `TS.INCRBY` or `TS.DECRBY` makes has the options given: they
+/// were passed over, and the series made with the defaults (#555).
+#[test]
+fn test_ts_incrby_creates_the_series_with_its_options() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let r = c.cmds(&[
+        "TS.INCRBY",
+        "opt:inc",
+        "5",
+        "TIMESTAMP",
+        "1000",
+        "RETENTION",
+        "60000",
+        "CHUNK_SIZE",
+        "128",
+        "DUPLICATE_POLICY",
+        "MAX",
+        "LABELS",
+        "kind",
+        "counter",
+    ]);
+    assert_eq!(r.as_int(), 1000);
+    assert_eq!(info_field(&mut c, "opt:inc", "retentionTime"), "60000");
+    assert_eq!(info_field(&mut c, "opt:inc", "chunkSize"), "128");
+    assert_eq!(info_field(&mut c, "opt:inc", "duplicatePolicy"), "max");
+    assert_eq!(query_index(&mut c, "kind=counter"), ["opt:inc"]);
+
+    // KiviDB's own spelling, `CHUNK SIZE`, still works.
+    c.cmds(&[
+        "TS.DECRBY",
+        "opt:dec",
+        "2",
+        "CHUNK",
+        "SIZE",
+        "256",
+        "LABELS",
+        "kind",
+        "gauge",
+    ]);
+    assert_eq!(info_field(&mut c, "opt:dec", "chunkSize"), "256");
+    assert_eq!(query_index(&mut c, "kind=gauge"), ["opt:dec"]);
+
+    // An existing series keeps its own settings.
+    c.cmds(&["TS.INCRBY", "opt:inc", "1", "RETENTION", "5"]);
+    assert_eq!(info_field(&mut c, "opt:inc", "retentionTime"), "60000");
+}
+
+/// `TS.INCRBY` trims the series to its retention, as `TS.ADD` does (#555).
+#[test]
+fn test_ts_incrby_trims_to_the_retention() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    assert!(
+        c.cmds(&["TS.CREATE", "opt:ret", "RETENTION", "1000"])
+            .is_ok()
+    );
+    c.cmds(&["TS.INCRBY", "opt:ret", "1", "TIMESTAMP", "1000"]);
+    c.cmds(&["TS.INCRBY", "opt:ret", "1", "TIMESTAMP", "5000"]);
+    let range = c.cmds(&["TS.RANGE", "opt:ret", "-", "+"]);
+    let samples: Vec<(i64, f64)> = range
+        .as_array()
+        .iter()
+        .map(|s| (s.as_array()[0].as_int(), s.as_array()[1].as_f64()))
+        .collect();
+    assert_eq!(samples, [(5000, 2.0)]);
+}
+
+/// `CHUNK_SIZE`, RedisTimeSeries's spelling, is read, and the options after
+/// it too: it used to end the parse, silently (#565).
+#[test]
+fn test_ts_chunk_size_keyword() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    assert!(
+        c.cmds(&[
+            "TS.CREATE",
+            "opt:k",
+            "CHUNK_SIZE",
+            "128",
+            "LABELS",
+            "a",
+            "b"
+        ])
+        .is_ok()
+    );
+    assert_eq!(info_field(&mut c, "opt:k", "chunkSize"), "128");
+    assert_eq!(query_index(&mut c, "a=b"), ["opt:k"]);
+
+    assert!(c.cmds(&["TS.ALTER", "opt:k", "CHUNK_SIZE", "256"]).is_ok());
+    assert_eq!(info_field(&mut c, "opt:k", "chunkSize"), "256");
+    assert!(
+        c.cmds(&["TS.ALTER", "opt:k", "CHUNK", "SIZE", "512"])
+            .is_ok()
+    );
+    assert_eq!(info_field(&mut c, "opt:k", "chunkSize"), "512");
+
+    // TS.ADD creating a series.
+    c.cmds(&[
+        "TS.ADD",
+        "opt:add",
+        "1",
+        "1",
+        "CHUNK_SIZE",
+        "64",
+        "ENCODING",
+        "COMPRESSED",
+        "LABELS",
+        "c",
+        "d",
+    ]);
+    assert_eq!(info_field(&mut c, "opt:add", "chunkSize"), "64");
+    assert_eq!(query_index(&mut c, "c=d"), ["opt:add"]);
+
+    // RedisTimeSeries's bounds: a multiple of 8, from 48 to 1048576.
+    for bad in ["100", "40", "1048584"] {
+        let r = c.cmds(&["TS.ALTER", "opt:k", "CHUNK_SIZE", bad]);
+        assert_eq!(
+            r,
+            RespValue::Error(
+                "TSDB: CHUNK_SIZE value must be a multiple of 8 in the range [48 .. 1048576]"
+                    .to_string()
+            ),
+            "CHUNK_SIZE {bad}"
+        );
+    }
+    assert_eq!(info_field(&mut c, "opt:k", "chunkSize"), "512");
+}
+
+/// A word that is no option is an error, and the command does nothing. It
+/// used to end the parse, with `OK` (#565).
+#[test]
+fn test_ts_unknown_option_is_an_error() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    assert!(c.cmds(&["TS.CREATE", "opt:u", "RETENTION", "100"]).is_ok());
+    let refused: &[&[&str]] = &[
+        &["TS.ALTER", "opt:u", "FOO", "1"],
+        &["TS.ALTER", "opt:u", "RETENTION", "0", "FOO"],
+        &["TS.ALTER", "opt:u", "CHUNK", "FOO", "128"],
+        &["TS.ALTER", "opt:u", "ENCODING", "FOO"],
+        &["TS.ALTER", "opt:u", "LABELS", "a", "b", "c"],
+        &["TS.ALTER", "opt:u", "TIMESTAMP", "5"],
+        &["TS.ALTER", "opt:u", "ON_DUPLICATE", "SUM"],
+        &["TS.CREATE", "opt:new", "FOO"],
+        &["TS.CREATE", "opt:new", "IGNORE", "5", "0.5"],
+        &["TS.ADD", "opt:new", "1", "1", "BOGUS"],
+        &["TS.INCRBY", "opt:new", "1", "BOGUS"],
+        &["TS.DECRBY", "opt:new", "1", "TIMESTAMP"],
+    ];
+    for cmd in refused {
+        assert!(c.cmds(cmd).is_error(), "{cmd:?} was accepted");
+    }
+    assert_eq!(info_field(&mut c, "opt:u", "retentionTime"), "100");
+    assert_eq!(c.cmds(&["EXISTS", "opt:new"]).as_int(), 0);
+}
+
+/// `TS.ALTER` changes what it is given, a default value too: `RETENTION 0`,
+/// `CHUNK_SIZE 4096`, and `LABELS` with no pairs (#565).
+#[test]
+fn test_ts_alter_sets_default_values() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&[
+        "TS.CREATE",
+        "opt:a",
+        "RETENTION",
+        "5000",
+        "CHUNK_SIZE",
+        "128",
+        "LABELS",
+        "room",
+        "kitchen",
+    ]);
+    assert!(c.cmds(&["TS.ALTER", "opt:a", "RETENTION", "0"]).is_ok());
+    assert_eq!(info_field(&mut c, "opt:a", "retentionTime"), "0");
+    assert!(c.cmds(&["TS.ALTER", "opt:a", "CHUNK_SIZE", "4096"]).is_ok());
+    assert_eq!(info_field(&mut c, "opt:a", "chunkSize"), "4096");
+    // Options left out are kept.
+    assert_eq!(query_index(&mut c, "room=kitchen"), ["opt:a"]);
+    assert!(c.cmds(&["TS.ALTER", "opt:a", "LABELS"]).is_ok());
+    assert!(query_index(&mut c, "room=kitchen").is_empty());
+    assert_eq!(
+        c.cmds(&["TS.INFO", "opt:a"]).as_array()[15],
+        RespValue::Array(vec![])
+    );
+}
+
+/// `TS.ADD … ON_DUPLICATE policy` is the policy for that sample; the series
+/// keeps its own, as in RedisTimeSeries. It used to be passed over.
+#[test]
+fn test_ts_add_on_duplicate_is_for_the_sample() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["TS.CREATE", "opt:d", "DUPLICATE_POLICY", "BLOCK"]);
+    assert_eq!(c.cmds(&["TS.ADD", "opt:d", "1", "1"]).as_int(), 1);
+    assert_eq!(
+        c.cmds(&["TS.ADD", "opt:d", "1", "5", "ON_DUPLICATE", "SUM"])
+            .as_int(),
+        1
+    );
+    assert_eq!(c.cmds(&["TS.GET", "opt:d"]).as_array()[1].as_f64(), 6.0);
+    assert!(c.cmds(&["TS.ADD", "opt:d", "1", "2"]).is_error());
+    assert_eq!(info_field(&mut c, "opt:d", "duplicatePolicy"), "block");
+}
