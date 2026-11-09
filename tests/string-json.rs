@@ -1549,7 +1549,7 @@ fn test_json_merge() {
 // Manual test scenario:
 //   JSON.SET doc $ '{"name":"alice"}'
 //   JSON.DEBUG MEMORY doc $   → (positive integer, bytes)
-//   JSON.DEBUG MEMORY nosuch  → nil
+//   JSON.DEBUG MEMORY nosuch $ → [], and 0 by a legacy path, as RedisJSON
 #[test]
 fn test_json_debug_memory() {
     let port = free_port();
@@ -1560,7 +1560,123 @@ fn test_json_debug_memory() {
     let mem = c.cmds(&["JSON.DEBUG", "MEMORY", "doc", "$"]).as_array()[0].as_int();
     assert!(mem > 0);
     assert_eq!(c.cmds(&["JSON.DEBUG", "MEMORY", "doc"]).as_int(), mem);
-    assert!(c.cmds(&["JSON.DEBUG", "MEMORY", "nosuch", "$"]).is_nil());
+    assert!(
+        c.cmds(&["JSON.DEBUG", "MEMORY", "nosuch", "$"])
+            .as_array()
+            .is_empty()
+    );
+    assert_eq!(c.cmds(&["JSON.DEBUG", "MEMORY", "nosuch"]).as_int(), 0);
+    assert_eq!(
+        c.cmds(&["JSON.DEBUG", "MEMORY", "doc", ".nope"])
+            .error_str(),
+        "ERR Path does not exist"
+    );
+}
+
+/// `JSON.DEBUG MEMORY` is the memory the value takes, not the length of its
+/// JSON text (#567): a long string is about its length either way, but
+/// numbers and containers take more than their text.
+#[test]
+fn json_debug_memory_is_the_values_memory() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&[
+        "JSON.SET",
+        "doc",
+        "$",
+        r#"{"n":1,"a":[1,2,3],"s":"0123456789"}"#,
+    ]);
+    let mem = |c: &mut Conn, path: &str| c.cmds(&["JSON.DEBUG", "MEMORY", "doc", path]).as_int();
+    // A number is a whole node, more than its one character of text.
+    assert!(mem(&mut c, ".n") > 1);
+    // An array holds its elements' nodes.
+    assert!(mem(&mut c, ".a") > 3 * mem(&mut c, ".n"));
+    // A string holds its bytes too.
+    assert!(mem(&mut c, ".s") >= mem(&mut c, ".n") + 10);
+    // The document is more than its members.
+    let members = mem(&mut c, ".n") + mem(&mut c, ".a") + mem(&mut c, ".s");
+    assert!(mem(&mut c, ".") > members);
+}
+
+/// A legacy path that matches nothing, or matches a value of the wrong type,
+/// answers as RedisJSON 8.10 does: an error for most reads, where it used
+/// to be nil (#567).
+#[test]
+fn legacy_path_reads_of_a_missing_or_wrong_value() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&[
+        "JSON.SET",
+        "d",
+        "$",
+        r#"{"a":1,"s":"str","o":{"x":1},"l":[1,2]}"#,
+    ]);
+    let err = |c: &mut Conn, args: &[&str]| c.cmds(args).error_str().to_string();
+    const MISSING: &str = "ERR Path does not exist";
+
+    // JSON.STRLEN
+    assert_eq!(
+        err(&mut c, &["JSON.STRLEN", "d", ".a"]),
+        "WRONGTYPE wrong type of path value - expected string"
+    );
+    assert_eq!(err(&mut c, &["JSON.STRLEN", "d", ".nope"]), MISSING);
+    assert_eq!(c.cmds(&["JSON.STRLEN", "d", ".s"]).as_int(), 3);
+
+    // JSON.OBJLEN: a missing path is nil.
+    assert_eq!(
+        err(&mut c, &["JSON.OBJLEN", "d", ".a"]),
+        "WRONGTYPE wrong type of path value - expected object"
+    );
+    assert!(c.cmds(&["JSON.OBJLEN", "d", ".nope"]).is_nil());
+
+    // JSON.ARRLEN
+    assert_eq!(
+        err(&mut c, &["JSON.ARRLEN", "d", ".a"]),
+        "ERR Path does not exist or not an array"
+    );
+    assert_eq!(err(&mut c, &["JSON.ARRLEN", "d", ".nope"]), MISSING);
+
+    // JSON.OBJKEYS: a missing path is nil.
+    assert_eq!(
+        err(&mut c, &["JSON.OBJKEYS", "d", ".a"]),
+        "ERR Path does not exist or not an object"
+    );
+    assert!(c.cmds(&["JSON.OBJKEYS", "d", ".nope"]).is_nil());
+
+    // JSON.ARRINDEX
+    assert_eq!(
+        err(&mut c, &["JSON.ARRINDEX", "d", ".a", "1"]),
+        "WRONGTYPE wrong type of path value - expected array"
+    );
+    assert_eq!(err(&mut c, &["JSON.ARRINDEX", "d", ".nope", "1"]), MISSING);
+    assert_eq!(c.cmds(&["JSON.ARRINDEX", "d", ".l", "2"]).as_int(), 1);
+
+    // JSON.RESP
+    assert_eq!(err(&mut c, &["JSON.RESP", "d", ".nope"]), MISSING);
+
+    // JSON.TYPE: a missing path is nil.
+    assert!(c.cmds(&["JSON.TYPE", "d", ".nope"]).is_nil());
+
+    // A key that does not exist is nil, as before.
+    for cmd in ["JSON.STRLEN", "JSON.OBJLEN", "JSON.ARRLEN", "JSON.OBJKEYS"] {
+        assert!(c.cmds(&[cmd, "nosuch", ".a"]).is_nil(), "{cmd}");
+    }
+
+    // A JSONPath still has nil for each value of the wrong type, and no
+    // entries for a path that matches nothing.
+    assert_eq!(
+        c.cmds(&["JSON.STRLEN", "d", "$.a"]).as_array(),
+        &[RespValue::Nil]
+    );
+    assert!(
+        c.cmds(&["JSON.STRLEN", "d", "$.nope"])
+            .as_array()
+            .is_empty()
+    );
 }
 
 // Manual test scenario:

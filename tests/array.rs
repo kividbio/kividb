@@ -985,6 +985,79 @@ fn arinfo_slices_are_dense_or_sparse_as_redis_keeps_them() {
     c.cmds(&["DEL", k]);
 }
 
+/// Indexes go up to 2^64 - 2 by `ARSET` as by `ARMSET`, as in Redis, and an
+/// index or a length past `i64::MAX` is sent as Redis sends it, its digits
+/// (RESP2). `ARSET` stopped at `i64::MAX` while `ARMSET` did not, and `ARLEN`
+/// came back negative (#554).
+#[test]
+fn indexes_and_lengths_past_i64_max() {
+    let mut c = conn();
+    let k = "t:arbig";
+    c.cmds(&["DEL", k]);
+    assert_eq!(
+        c.cmds(&["ARSET", k, "9223372036854775807", "x"]).as_int(),
+        1
+    );
+    assert_eq!(c.cmds(&["ARLEN", k]).as_str(), "9223372036854775808");
+    assert_eq!(
+        c.cmds(&["ARSET", k, "9223372036854775808", "y"]).as_int(),
+        1
+    );
+    assert_eq!(
+        c.cmds(&["ARMSET", k, "18446744073709551614", "z"]).as_int(),
+        1
+    );
+    assert_eq!(c.cmds(&["ARLEN", k]).as_str(), "18446744073709551615");
+    assert_eq!(c.cmds(&["ARCOUNT", k]).as_int(), 3);
+
+    // 2^64 - 1 is no index, for either; a run past the last one is refused
+    // whole.
+    for args in [
+        vec!["ARSET", k, "18446744073709551615", "w"],
+        vec!["ARMSET", k, "18446744073709551615", "w"],
+    ] {
+        let r = c.cmds(&args);
+        assert!(format!("{r:?}").contains("invalid array index"), "{r:?}");
+    }
+    let r = c.cmds(&["ARSET", k, "18446744073709551614", "a", "b"]);
+    assert!(format!("{r:?}").contains("array index overflow"), "{r:?}");
+    assert_eq!(c.cmds(&["ARGET", k, "18446744073709551614"]).as_str(), "z");
+
+    assert_eq!(
+        c.cmds(&["ARSCAN", k, "9223372036854775807", "18446744073709551614"])
+            .flat(),
+        [
+            "9223372036854775807",
+            "x",
+            "9223372036854775808",
+            "y",
+            "18446744073709551614",
+            "z"
+        ]
+    );
+    assert_eq!(
+        c.cmds(&["ARGREP", k, "-", "+", "EXACT", "z"]).flat(),
+        ["18446744073709551614"]
+    );
+    let info = c.cmds(&["ARINFO", k]).flat();
+    let len = info.iter().position(|f| f == "len").unwrap();
+    assert_eq!(info[len + 1], "18446744073709551615");
+
+    // The insert cursor up to the last index; then exhausted, which ARINFO
+    // reports as 0, as Redis does.
+    assert_eq!(c.cmds(&["ARSEEK", k, "18446744073709551613"]).as_int(), 1);
+    assert_eq!(c.cmds(&["ARNEXT", k]).as_str(), "18446744073709551613");
+    assert_eq!(
+        c.cmds(&["ARINSERT", k, "p", "q"]).as_str(),
+        "18446744073709551614"
+    );
+    assert!(c.cmds(&["ARNEXT", k]).is_nil());
+    let info = c.cmds(&["ARINFO", k]).flat();
+    let next = info.iter().position(|f| f == "next-insert-index").unwrap();
+    assert_eq!(info[next + 1], "0");
+    c.cmds(&["DEL", k]);
+}
+
 /// `ARLASTITEMS` after `ARSEEK 0` gives the array's tail, and an insert past
 /// the last index is `insert index overflow`, as in Redis.
 #[test]

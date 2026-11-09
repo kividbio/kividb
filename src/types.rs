@@ -998,12 +998,14 @@ const AR_SLICE_MIN_ALLOC: u32 = 8;
 /// `sizeof(arSlice)` on a 64-bit build.
 const AR_SLICE_HEADER: usize = 32;
 
-/// Highest addressable array index.
+/// Highest addressable array index: 2^64 - 2, as in Redis.
 ///
-/// Bounded by `i64::MAX` rather than `u64::MAX` because every index that crosses
-/// the wire does so as a RESP integer, which is signed 64-bit. An index that
-/// can't be reported back is not a usable index.
-pub const ARRAY_MAX_INDEX: u64 = i64::MAX as u64;
+/// An index (or a length) past `i64::MAX` is sent back as Redis sends it, a
+/// big number in RESP3 and its digits as a bulk string in RESP2 (see
+/// `resp_unsigned` in `commands/array.rs`). `ARSET` stopped at `i64::MAX`
+/// while `ARMSET` went on to here, and `ARLEN` wrapped to a negative number
+/// past it (#554). 2^64 - 1 is where an exhausted insert cursor stands.
+pub const ARRAY_MAX_INDEX: u64 = u64::MAX - 1;
 
 /// The inner data for an Array key.
 ///
