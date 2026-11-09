@@ -540,16 +540,18 @@ fn settle_watch(id: usize, db: usize, key: &[u8], next: Option<Instant>, now: In
 /// For a test: the watches of its store, and only those. The list is keyed
 /// by a store's address, and a store freed by another test may have had the
 /// same one: what it left watched is forgotten when this is made, and what
-/// this store leaves when this is dropped.
+/// this store leaves when this is dropped. Its thread is
+/// [`crate::expiry::Undisturbed`] meanwhile: no other test's load or pause
+/// keeps its fields past their deadlines.
 #[cfg(test)]
-pub(crate) struct OwnWatches(usize);
+pub(crate) struct OwnWatches(usize, crate::expiry::Undisturbed);
 
 #[cfg(test)]
 impl OwnWatches {
     pub(crate) fn of(store: &Store) -> Self {
         let id = store_id(store);
         forget_watches(id);
-        Self(id)
+        Self(id, crate::expiry::Undisturbed::here())
     }
 }
 
@@ -1253,6 +1255,34 @@ mod propagation_tests {
         // Live now: refused, with nothing expired before it.
         assert_eq!(m.run(&["HSETNX", "h", "f", "again"]), ":0\r\n");
         assert!(!m.sent().iter().any(|c| c[0] == "HDEL"));
+    }
+
+    /// A dataset another test is loading is not this master's: its due
+    /// field goes before the `XX` is weighed. The load, which is the
+    /// process's, was taken as this master's own, and the field was kept and
+    /// given the new deadline: `:1` (#535).
+    #[test]
+    fn another_tests_load_leaves_this_ones_expiry_alone() {
+        let mut m = master();
+        m.with_due_field("h");
+        std::thread::scope(|s| {
+            // Dropped before the scope waits for the loader, if this fails.
+            let (loaded, load_started) = std::sync::mpsc::channel();
+            let (stop, stopped) = std::sync::mpsc::channel::<()>();
+            s.spawn(move || {
+                let _load = crate::expiry::Loading::start();
+                loaded.send(()).unwrap();
+                let _ = stopped.recv();
+            });
+            load_started.recv().unwrap();
+            assert!(std::thread::spawn(crate::expiry::loading).join().unwrap());
+            assert_eq!(
+                m.run(&["HPEXPIRE", "h", "100000", "XX", "FIELDS", "1", "f"]),
+                "*1\r\n:-2\r\n"
+            );
+            drop(stop);
+        });
+        assert_eq!(m.sent(), [cmd(&["HDEL", "h", "f"])]);
     }
 
     /// `XX` and `GT` are weighed here: the replica gets what was decided.

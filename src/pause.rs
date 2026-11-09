@@ -112,6 +112,10 @@ pub fn active() -> Option<bool> {
 /// paused.
 #[inline]
 pub fn expiry_deferred() -> bool {
+    #[cfg(test)]
+    if crate::expiry::undisturbed() {
+        return false;
+    }
     PAUSE_UNTIL_MS.load(Ordering::Relaxed) != 0 && active().is_some()
 }
 
