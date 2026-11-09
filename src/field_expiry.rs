@@ -1396,7 +1396,9 @@ mod propagation_tests {
         let mut m = master();
         m.with_due_field("h");
         assert_eq!(
-            m.run(&["HSETEX", "h", "FNX", "PX", "100000", "FIELDS", "1", "f", "new"]),
+            m.run(&[
+                "HSETEX", "h", "FNX", "PX", "100000", "FIELDS", "1", "f", "new"
+            ]),
             ":1\r\n"
         );
         let sent = m.sent();
@@ -1439,7 +1441,11 @@ mod propagation_tests {
         }
         let mut wanted = b"*6\r\n$6\r\nHSETEX\r\n$1\r\nb\r\n$6\r\nFIELDS\r\n$1\r\n1\r\n".to_vec();
         wanted.extend_from_slice(b"$3\r\nn\xff\x00\r\n$3\r\n\xfe\r\n\r\n");
-        assert!(bytes.ends_with(&wanted), "{:?}", String::from_utf8_lossy(&bytes));
+        assert!(
+            bytes.ends_with(&wanted),
+            "{:?}",
+            String::from_utf8_lossy(&bytes)
+        );
     }
 
     /// With nothing to read the stream, `HSETEX` builds no record of what it
@@ -1453,7 +1459,9 @@ mod propagation_tests {
         // A record left from before: begun anew, and not kept.
         crate::replication::script_feed::effects_begin();
         assert_eq!(
-            m.run(&["HSETEX", "h", "FNX", "PX", "100000", "FIELDS", "1", "f", "new"]),
+            m.run(&[
+                "HSETEX", "h", "FNX", "PX", "100000", "FIELDS", "1", "f", "new"
+            ]),
             ":1\r\n"
         );
         assert!(!crate::replication::script_feed::recording());
@@ -1466,7 +1474,9 @@ mod propagation_tests {
             ])
         );
         assert_eq!(
-            m.run(&["HSETEX", "h", "FNX", "PX", "100000", "FIELDS", "1", "f", "again"]),
+            m.run(&[
+                "HSETEX", "h", "FNX", "PX", "100000", "FIELDS", "1", "f", "again"
+            ]),
             ":0\r\n"
         );
     }
