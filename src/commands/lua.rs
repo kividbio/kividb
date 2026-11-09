@@ -4961,14 +4961,15 @@ fn function_flush(ctx: &Ctx) -> Vec<u8> {
 /// Refused before anything is taken: a refused flush changes nothing. It
 /// used to empty the store first, and its BUSY reply then left the
 /// libraries gone here while the replicas, which are not sent a refused
-/// command, kept them (#559). A call that comes in between finds the
-/// libraries, as if it had come before the flush; one that comes after
-/// finds none of their functions, whatever its VM holds (`fcall_inner`
-/// looks a function up by name first).
+/// command, kept them (#559). The libraries are taken out under the same
+/// hold of the VM's lock as the check, so no script runs between the two.
 fn flush_functions(asynchronous: bool) -> Result<(), LuaVmBusy> {
-    let vm = lua_vms_renew_for_admin(&[Vm::Functions])?;
-    let libraries = std::mem::take(&mut *function_store().write());
-    let names = std::mem::take(&mut *fn_name_to_library().write());
+    let (vm, (libraries, names)) = lua_vms_renew_for_admin_and(&[Vm::Functions], || {
+        (
+            std::mem::take(&mut *function_store().write()),
+            std::mem::take(&mut *fn_name_to_library().write()),
+        )
+    })?;
     // `ASYNC`: the VM and the libraries are freed in the background, and
     // counted as Redis counts them, a function each and one for the VM.
     if asynchronous {
@@ -4989,6 +4990,16 @@ fn flush_functions(asynchronous: bool) -> Result<(), LuaVmBusy> {
 /// (with cjson, cmsgpack, bit and the read-only proxies) is about 50 KB,
 /// where Redis's suite allows a flushed functions VM 40000 bytes.
 fn lua_vms_renew_for_admin(vms: &[Vm]) -> Result<Vec<Lua>, LuaVmBusy> {
+    lua_vms_renew_for_admin_and(vms, || ()).map(|(old, ())| old)
+}
+
+/// [`lua_vms_renew_for_admin`], running `then` too before the lock is let
+/// go, and only if the VMs were renewed. The lock is taken before any of the
+/// function store's: `then` may take those, as a script does.
+fn lua_vms_renew_for_admin_and<R>(
+    vms: &[Vm],
+    then: impl FnOnce() -> R,
+) -> Result<(Vec<Lua>, R), LuaVmBusy> {
     let mut guard = LUA_VM.try_lock().ok_or(LuaVmBusy)?;
     if LUA_HOLD_DEPTH.load(Ordering::SeqCst) != 0 {
         return Err(LuaVmBusy);
@@ -4999,7 +5010,9 @@ fn lua_vms_renew_for_admin(vms: &[Vm]) -> Result<Vec<Lua>, LuaVmBusy> {
         vm.generation().fetch_add(1, Ordering::Release);
         old.extend(guard.of(vm).take());
     }
-    Ok(old)
+    let done = then();
+    drop(guard);
+    Ok((old, done))
 }
 
 fn function_stats() -> Vec<u8> {

@@ -305,6 +305,30 @@ fn blocking_commands_in_a_script_take_what_is_there() {
     );
 
     assert_eq!(c.cmds(&["EXISTS", "l", "dst", "z"]).as_int(), 0);
+
+    // A pop in a script that takes nothing leaves a watch on its key alone;
+    // one that takes something fails it, as in Redis.
+    let mut watcher = Conn::connect(port);
+    assert_eq!(watcher.cmds(&["WATCH", "l"]).as_str(), "OK");
+    let reply = c.cmds(&["EVAL", "return redis.call('BLPOP', KEYS[1], 0)", "1", "l"]);
+    assert!(reply.is_nil(), "{reply:?}");
+    let reply = c.cmds(&["EVAL", "return redis.call('LPOP', KEYS[1])", "1", "l"]);
+    assert!(reply.is_nil(), "{reply:?}");
+    assert_eq!(watcher.cmds(&["MULTI"]).as_str(), "OK");
+    watcher.cmds(&["PING"]);
+    assert!(matches!(watcher.cmds(&["EXEC"]), RespValue::Array(ref r) if r.len() == 1));
+    assert_eq!(c.cmds(&["RPUSH", "other", "y"]).as_int(), 1);
+    assert_eq!(watcher.cmds(&["WATCH", "other"]).as_str(), "OK");
+    let reply = c.cmds(&[
+        "EVAL",
+        "return redis.call('BLPOP', KEYS[1], 0)",
+        "1",
+        "other",
+    ]);
+    assert!(!reply.is_nil(), "{reply:?}");
+    assert_eq!(watcher.cmds(&["MULTI"]).as_str(), "OK");
+    watcher.cmds(&["PING"]);
+    assert!(watcher.cmds(&["EXEC"]).is_nil());
     // A write, which a read-only script may not make.
     assert_eq!(c.cmds(&["RPUSH", "l", "a"]).as_int(), 1);
     let reply = c.cmds(&[

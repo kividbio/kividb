@@ -782,10 +782,13 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
         track(ctx, name2, is_write && !result.starts_with(b"-"), is_write);
     }
 
+    // A pop that took nothing changed nothing: not sent, not counted, and
+    // a `WATCH` on its keys holds (`popped_nothing`).
     #[cfg(feature = "lua")]
     if !result.starts_with(b"-")
         && !repl_is_slave
         && !ctx.apply_replication
+        && !popped_nothing(name2, &result)
         && replication::command_mutates_for_replication(name2, ctx.cmd.as_slice())
     {
         let feeds = replication::script_feed::commands_for_propagation(
@@ -804,8 +807,11 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
             }
             crate::stats::record_rdb_change();
         }
-        // A write made from a script dirties a WATCH like any other write.
-        notify_watchers(ctx, name2);
+        // A write made from a script dirties a WATCH like any other write,
+        // and one that changed nothing does not, as from a client.
+        if !changed_nothing(name2, ctx.cmd.as_slice(), &result) {
+            notify_watchers(ctx, name2);
+        }
     }
 
     rewrite_wrong_arity_error_for_script(result)
@@ -1725,7 +1731,7 @@ fn changed_nothing(name: &str, cmd: &[&[u8]], result: &[u8]) -> bool {
         }
         "SETNX" | "MSETNX" | "HSETNX" | "RENAMENX" | "PERSIST" | "EXPIRE" | "PEXPIRE"
         | "EXPIREAT" | "PEXPIREAT" | "SADD" | "SREM" | "ZREM" | "HDEL" | "LREM" => zero,
-        _ => false,
+        _ => popped_nothing(name, result),
     }
 }
 
@@ -1743,11 +1749,46 @@ fn moved_nothing(name: &str, result: &[u8]) -> bool {
     matches!(name, "MOVE" | "COPY") && result == b":0\r\n"
 }
 
+/// Whether a pop answered that it took nothing: a null (a `BLPOP` that
+/// timed out, or found nothing in `MULTI` or a script; an `LPOP` of a
+/// missing key) or an empty array (`ZPOPMIN` of one). Redis neither
+/// propagates such a pop nor counts it as a change, and a `WATCH` on its
+/// keys holds. The reply is looked at first: it is rarely one of these.
+#[inline]
+fn popped_nothing(name: &str, result: &[u8]) -> bool {
+    matches!(result, b"$-1\r\n" | b"*-1\r\n" | b"_\r\n" | b"*0\r\n")
+        && matches!(
+            name,
+            "LPOP"
+                | "RPOP"
+                | "LMPOP"
+                | "LMOVE"
+                | "RPOPLPUSH"
+                | "LMOVEM"
+                | "ZPOPMIN"
+                | "ZPOPMAX"
+                | "ZMPOP"
+                | "SPOP"
+                | "BLPOP"
+                | "BRPOP"
+                | "BLMPOP"
+                | "BLMOVE"
+                | "BRPOPLPUSH"
+                | "BLMOVEM"
+                | "BZPOPMIN"
+                | "BZPOPMAX"
+                | "BZMPOP"
+        )
+}
+
 /// After a `SWAPDB` (`ctx.cmd`): the watches on keys of the two swapped
 /// databases are dirty, if the key is in either of them — its value changed
 /// or it appeared or went. A key in neither, and every key of another
 /// database, is unchanged; a database swapped with itself changes nothing
-/// (Redis's `touchAllWatchedKeysInDb`).
+/// (Redis's `touchAllWatchedKeysInDb`). A key whose time is up is in
+/// neither, as for a flush (`touch_watched_keys`): a watch on one that had
+/// expired, swapped for none or for another expired one, holds, as Redis
+/// keeps it by `wk->expired`.
 fn touch_swapped_watches(ctx: &Ctx) {
     let db = |i: usize| {
         ctx.cmd
@@ -1764,7 +1805,7 @@ fn touch_swapped_watches(ctx: &Ctx) {
     let present = |db: usize, key: &[u8]| {
         ctx.store.get(db).is_some_and(|shards| {
             crate::read_lock!(crate::store::get_shard(shards, key)).contains_key(key)
-        })
+        }) && !crate::commands::helpers::is_expired(ctx.store, db, key)
     };
     for (watched, other) in [(db1, db2), (db2, db1)] {
         ctx.watch_registry
@@ -2160,7 +2201,10 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
         // `write_is_observed`), but reaching that no-op used to cost a
         // `Vec<Vec<u8>>` clone of every argument here *plus* a full RESP encode
         // inside — allocations on every single write, discarded immediately.
-        if replication::write_is_observed(ctx) && !moved_nothing(name, result) {
+        if replication::write_is_observed(ctx)
+            && !moved_nothing(name, result)
+            && !popped_nothing(name, result)
+        {
             // Propagate the command's *effect*, not the bytes the client sent.
             // `SPOP` and `XADD … *` produce a different result each time they
             // run, so a replica re-executing them diverges (measured: a replica
@@ -2182,8 +2226,11 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
         }
 
         // An XREADGROUP that only re-read pending entries, or found nothing
-        // new, changed nothing Redis counts (#27).
-        if name != "XREADGROUP" || replication::script_feed::effects_changed_data() {
+        // new, changed nothing Redis counts (#27); nor did a pop that took
+        // nothing.
+        if (name != "XREADGROUP" || replication::script_feed::effects_changed_data())
+            && !popped_nothing(name, result)
+        {
             crate::stats::record_rdb_change();
         }
     }

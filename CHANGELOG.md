@@ -152,12 +152,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   as in Redis and as they already did inside `MULTI`: the element if there
   is one, their empty reply if not. A blocking pop now reaches replicas and
   the AOF as the pop it made (`BLPOP` as `LPOP` of the key it took from,
-  `BZMPOP` as `ZPOPMIN key count`), as Redis sends it, and as nothing when
-  it took nothing.
+  `BZMPOP` as `ZPOPMIN key count`), as Redis sends it. A pop that takes
+  nothing (a `BLPOP` that times out, an `LPOP` of a missing key), from a
+  client or a script, is no longer sent, no longer counted as a change for
+  `save`, and no longer fails a `WATCH` on its key, as in Redis.
 - **`SWAPDB` fails only the watches on the swapped keys (#556).** It made
   every `EXEC` after a `WATCH` fail, in every database. As in Redis, it now
   fails a watch only on a key of the two databases it swaps that is in
-  either of them, and `SWAPDB` of a database with itself fails none.
+  either of them, a key whose time is up counting as absent, and `SWAPDB`
+  of a database with itself fails none.
 - **A refused `FUNCTION FLUSH` keeps the libraries (#559).** It emptied the
   function store before it checked whether a script held the functions'
   VM. When one did, the reply was `BUSY` but the libraries were gone, on

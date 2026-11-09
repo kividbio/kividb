@@ -522,6 +522,84 @@ fn test_swapdb_dirties_only_the_watches_on_the_swapped_keys() {
     assert_eq!(exec(&mut itself).as_array().len(), 1);
 }
 
+/// For `SWAPDB`, a key whose time is up is not there, as for a flush: a
+/// watch on one that had expired, swapped for none, holds, as does a watch
+/// on a key that is in neither database but for an expired one. A key that
+/// was there and is swapped for an expired one is gone: its watch fails
+/// (#556). Active expiry is off, so that the keys stay where they are.
+#[test]
+fn test_swapdb_takes_an_expired_key_as_absent() {
+    let port = free_port();
+    start_server(port);
+    let mut other = Conn::connect(port);
+    assert!(other.cmds(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]).is_ok());
+    let watch = |db: &str, key: &str| {
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["SELECT", db]).is_ok());
+        assert!(c.cmds(&["WATCH", key]).is_ok());
+        c
+    };
+    let exec = |c: &mut Conn| {
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(c.cmds(&["PING"]).as_str(), "QUEUED");
+        c.cmds(&["EXEC"])
+    };
+    assert!(other.cmds(&["SELECT", "2"]).is_ok());
+    assert!(other.cmds(&["SET", "gone", "v", "PX", "1"]).is_ok());
+    assert!(other.cmds(&["SET", "live", "v", "PX", "1"]).is_ok());
+    assert!(other.cmds(&["SELECT", "3"]).is_ok());
+    assert!(other.cmds(&["SET", "live", "v"]).is_ok());
+    thread::sleep(Duration::from_millis(20));
+
+    let mut expired_here = watch("2", "gone");
+    let mut expired_there = watch("3", "gone");
+    let mut replaced = watch("3", "live");
+    assert!(other.cmds(&["SWAPDB", "2", "3"]).is_ok());
+    let held = (
+        exec(&mut expired_here),
+        exec(&mut expired_there),
+        exec(&mut replaced),
+    );
+    assert!(other.cmds(&["DEBUG", "SET-ACTIVE-EXPIRE", "1"]).is_ok());
+    assert_eq!(held.0.as_array().len(), 1);
+    assert_eq!(held.1.as_array().len(), 1);
+    assert!(held.2.is_nil(), "{:?}", held.2);
+}
+
+/// A pop that takes nothing changes nothing, and a watch on its key holds,
+/// as in Redis: a `BLPOP` that times out, an `LPOP` of a missing key, and a
+/// `BLPOP` in a transaction that finds nothing (#558).
+#[test]
+fn test_a_pop_that_takes_nothing_does_not_fail_a_watch() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let mut other = Conn::connect(port);
+    assert!(c.cmds(&["WATCH", "empty"]).is_ok());
+    assert!(other.cmds(&["BLPOP", "empty", "0.01"]).is_nil());
+    assert!(other.cmds(&["LPOP", "empty"]).is_nil());
+    assert!(
+        other
+            .cmds(&["BLMOVE", "empty", "d", "LEFT", "LEFT", "0.01"])
+            .is_nil()
+    );
+    assert!(other.cmds(&["MULTI"]).is_ok());
+    other.cmds(&["BLPOP", "empty", "0"]);
+    other.cmds(&["BZPOPMIN", "empty", "0"]);
+    assert_eq!(other.cmds(&["EXEC"]).as_array().len(), 2);
+    assert!(c.cmds(&["MULTI"]).is_ok());
+    c.cmds(&["PING"]);
+    assert_eq!(c.cmds(&["EXEC"]).as_array().len(), 1);
+
+    // One that takes something fails it.
+    assert_eq!(other.cmds(&["RPUSH", "full", "a", "b"]).as_int(), 2);
+    assert!(c.cmds(&["WATCH", "full"]).is_ok());
+    assert_eq!(other.cmds(&["BLPOP", "full", "0"]).as_array().len(), 2);
+    assert!(c.cmds(&["MULTI"]).is_ok());
+    c.cmds(&["PING"]);
+    assert!(c.cmds(&["EXEC"]).is_nil());
+}
+
 /// A blocking command in a transaction never waits: it runs as its
 /// non-blocking form and takes what is there, as in Redis, and answers its
 /// empty reply when nothing is (#558).
