@@ -1115,6 +1115,117 @@ fn json_arithmetic_keeps_a_float_result_a_float() {
     }
 }
 
+/// An integer result that does not fit an `i64` is refused and the document
+/// stays as it was, on every path, and an integer held as a `u64` counts
+/// (#536). Redis 8.10.3 stores a `u64` for some array elements, gives a float
+/// for some integers past `i64::MAX`, and can leave a multi-match path half
+/// done: none of that is copied, see docs/COMPATIBILITY.md.
+#[test]
+fn json_arithmetic_refuses_an_integer_overflow_and_changes_nothing() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    const MAX: &str = "9223372036854775807";
+    const MIN: &str = "-9223372036854775808";
+    // Integers past `i64::MAX`, which are held as a `u64`.
+    const ABOVE: &str = "9223372036854775808";
+    const U64: &str = "18446744073709551615";
+    for (doc, op, path, operand) in [
+        (MAX.to_string(), "JSON.NUMINCRBY", "$", "1"),
+        (MAX.to_string(), "JSON.NUMINCRBY", ".", "1"),
+        (MIN.to_string(), "JSON.NUMINCRBY", "$", "-1"),
+        (MAX.to_string(), "JSON.NUMMULTBY", "$", "2"),
+        (MIN.to_string(), "JSON.NUMMULTBY", "$", "-1"),
+        (format!(r#"{{"a":{MAX}}}"#), "JSON.NUMINCRBY", "$.a", "1"),
+        (format!(r#"{{"a":{MAX}}}"#), "JSON.NUMINCRBY", ".a", "1"),
+        (format!("[{MAX}]"), "JSON.NUMINCRBY", "$[0]", "1"),
+        (format!("[{MAX},1]"), "JSON.NUMMULTBY", "$[*]", "2"),
+        (format!("[{MAX},1]"), "JSON.NUMMULTBY", "$[*]", "3"),
+        (format!("[{MAX},{MAX}]"), "JSON.NUMINCRBY", "$[*]", "1"),
+        // The match that overflows comes after one that fits.
+        (format!("[1,{MAX}]"), "JSON.NUMINCRBY", "$[*]", "1"),
+        (
+            format!(r#"{{"x":{{"a":{MAX}}},"a":1}}"#),
+            "JSON.NUMINCRBY",
+            "$..a",
+            "1",
+        ),
+        (
+            format!(r#"{{"x":{{"a":1}},"a":{MAX}}}"#),
+            "JSON.NUMINCRBY",
+            "..a",
+            "1",
+        ),
+        (U64.to_string(), "JSON.NUMINCRBY", "$", "1"),
+        (U64.to_string(), "JSON.NUMINCRBY", ".", "1"),
+        (ABOVE.to_string(), "JSON.NUMMULTBY", "$", "2"),
+        ("0".to_string(), "JSON.NUMINCRBY", "$", ABOVE),
+        // Too big even for the `i128` the result is worked out in.
+        (U64.to_string(), "JSON.NUMMULTBY", "$", U64),
+        (format!(r#"{{"a":{ABOVE}}}"#), "JSON.NUMINCRBY", "$.a", "0"),
+        (format!("[{U64},1]"), "JSON.NUMINCRBY", "$[*]", "1"),
+        (format!("[1,{U64}]"), "JSON.NUMINCRBY", "$[*]", "1"),
+    ] {
+        assert!(c.cmds(&["JSON.SET", "k", "$", &doc]).is_ok());
+        assert_eq!(
+            c.cmds(&[op, "k", path, operand]).error_str(),
+            "ERR numeric overflow",
+            "{doc} {op} {path} {operand}"
+        );
+        assert_eq!(
+            c.cmds(&["JSON.GET", "k"]).as_str(),
+            doc,
+            "{doc} {op} {path} {operand} changed the document"
+        );
+    }
+
+    // At the limit, without going over, the result is still an integer.
+    assert!(
+        c.cmds(&["JSON.SET", "k", "$", "9223372036854775806"])
+            .is_ok()
+    );
+    assert_eq!(
+        c.cmds(&["JSON.NUMINCRBY", "k", "$", "1"]).as_str(),
+        format!("[{MAX}]")
+    );
+
+    // A `u64` is an integer too: a result that fits is exact, not a float.
+    for (doc, op, path, operand, want) in [
+        (ABOVE, "JSON.NUMINCRBY", "$", "-1", format!("[{MAX}]")),
+        ("-1", "JSON.NUMINCRBY", "$", ABOVE, format!("[{MAX}]")),
+        (U64, "JSON.NUMMULTBY", "$", "0", "[0]".to_string()),
+        (
+            "[9223372036854775808,1]",
+            "JSON.NUMINCRBY",
+            "$[*]",
+            "-1",
+            format!("[{MAX},0]"),
+        ),
+    ] {
+        assert!(c.cmds(&["JSON.SET", "k", "$", doc]).is_ok());
+        assert_eq!(
+            c.cmds(&[op, "k", path, operand]).as_str(),
+            want,
+            "{doc} {op} {path} {operand}"
+        );
+        assert_eq!(
+            c.cmds(&["JSON.GET", "k", path]).as_str(),
+            want,
+            "stored value of {doc} {op} {path} {operand}"
+        );
+    }
+
+    // A float operand is floating-point arithmetic, not an integer overflow.
+    assert!(c.cmds(&["JSON.SET", "k", "$", MAX]).is_ok());
+    let reply = c.cmds(&["JSON.NUMINCRBY", "k", "$", "1.0"]);
+    assert!(!reply.is_error(), "{reply:?}");
+    let RespValue::Array(types) = c.cmds(&["JSON.TYPE", "k", "$"]) else {
+        panic!("JSON.TYPE");
+    };
+    assert_eq!(types[0].as_str(), "number");
+}
+
 // Manual test scenario:
 //   JSON.SET doc $ '{"a":1,"b":2}'
 //   JSON.OBJKEYS doc $     → ["a","b"]

@@ -337,7 +337,7 @@ place of the array.
 | `JSON.STRLEN` | `JSON.STRLEN key [path]` | The length of each matched string; nil for other types |
 | `JSON.STRAPPEND` | `JSON.STRAPPEND key [path] value` | Append a JSON string to each matched string; returns the new lengths |
 | `JSON.TOGGLE` | `JSON.TOGGLE key path` | Flip each matched boolean; returns the new values as 1 and 0 (a legacy path: `"true"` or `"false"`) |
-| `JSON.NUMINCRBY` | `JSON.NUMINCRBY key path number` | Add to each matched number. Returns the new values as one JSON array in a bulk string, `null` where the match is not a number — `"[1820,1972,null]"` (RESP3: an array of numbers). A legacy path returns the one new value. The result is an integer only when both numbers are integers, so a float stays a float even when it is whole (`1.5 + 1.5` is `3.0`). A result that is not a finite number fails the command and changes nothing |
+| `JSON.NUMINCRBY` | `JSON.NUMINCRBY key path number` | Add to each matched number. Returns the new values as one JSON array in a bulk string, `null` where the match is not a number — `"[1820,1972,null]"` (RESP3: an array of numbers). A legacy path returns the one new value. The result is an integer only when both numbers are integers, so a float stays a float even when it is whole (`1.5 + 1.5` is `3.0`). An integer result that does not fit an `i64` (`ERR numeric overflow`) or a result that is not a finite number fails the command and changes nothing |
 | `JSON.NUMMULTBY` | `JSON.NUMMULTBY key path number` | The same, multiplying |
 | `JSON.OBJKEYS` | `JSON.OBJKEYS key [path]` | The member names of each matched object, in the order they were added |
 | `JSON.OBJLEN` | `JSON.OBJLEN key [path]` | The number of members of each matched object |

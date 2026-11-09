@@ -338,26 +338,45 @@ enum NumOp {
     Multiply,
 }
 
-/// `current ⊕ operand`. Integers stay integers while the result fits; a
-/// result that is not a finite number is refused.
-fn arithmetic(current: &Number, operand: &Number, op: NumOp) -> Option<Number> {
-    if let (Some(a), Some(b)) = (current.as_i64(), operand.as_i64()) {
+/// The value of a number that is an integer. `serde_json` holds one above
+/// `i64::MAX` as a `u64`.
+fn integer(number: &Number) -> Option<i128> {
+    number
+        .as_i64()
+        .map(i128::from)
+        .or_else(|| number.as_u64().map(i128::from))
+}
+
+/// `current ⊕ operand`, or the error to reply with. Two integers give an
+/// integer, refused if it does not fit an `i64`. Anything else gives a float,
+/// refused if it is not finite.
+fn arithmetic(current: &Number, operand: &Number, op: NumOp) -> Result<Number, &'static str> {
+    const NOT_FINITE: &str = "ERR result is not a finite number";
+    if let (Some(a), Some(b)) = (integer(current), integer(operand)) {
+        // Checked even in an `i128`: two `u64`s can multiply past it.
         let exact = match op {
             NumOp::Add => a.checked_add(b),
             NumOp::Multiply => a.checked_mul(b),
         };
-        if let Some(n) = exact {
-            return Some(n.into());
-        }
+        // Refused, because a float would lose precision. Redis differs for
+        // some integers and array elements, and KiviDB does so on purpose,
+        // see docs/COMPATIBILITY.md (#536).
+        return exact
+            .and_then(|n| i64::try_from(n).ok())
+            .map(Number::from)
+            .ok_or("ERR numeric overflow");
     }
-    let (a, b) = (current.as_f64()?, operand.as_f64()?);
+    let (a, b) = (
+        current.as_f64().ok_or(NOT_FINITE)?,
+        operand.as_f64().ok_or(NOT_FINITE)?,
+    );
     let result = match op {
         NumOp::Add => a + b,
         NumOp::Multiply => a * b,
     };
     // A float stays a float even when the result is whole: `1.5 + 1.5` is
     // `3.0`, as in RedisJSON. Only two integers give an integer, above.
-    Number::from_f64(result)
+    Number::from_f64(result).ok_or(NOT_FINITE)
 }
 
 /// `JSON.NUMINCRBY` / `JSON.NUMMULTBY`.
@@ -392,8 +411,8 @@ fn number_command(ctx: &Ctx, resp: u8, op: NumOp, name: &str) -> Vec<u8> {
         for location in &locations {
             match json_path::get(root, location) {
                 Some(Value::Number(current)) => match arithmetic(current, &operand, op) {
-                    Some(next) => results.push(Some(next)),
-                    None => return resp_error("ERR result is not a finite number"),
+                    Ok(next) => results.push(Some(next)),
+                    Err(error) => return resp_error(error),
                 },
                 _ => results.push(None),
             }
