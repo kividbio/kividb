@@ -1480,7 +1480,9 @@ pub async fn handle_client(
                 });
                 break;
             }
-            if cmd_name == "MONITOR" {
+            // Inside MULTI it is queued, as in Redis, and refused when EXEC
+            // runs it (#550).
+            if cmd_name == "MONITOR" && !tx.active {
                 if monitoring.is_none() {
                     monitoring = Some(crate::monitor::Monitoring::start(
                         &monitor_registry,
@@ -1493,11 +1495,46 @@ pub async fn handle_client(
                 continue;
             }
 
+            // A transaction's own commands with the wrong number of
+            // arguments are refused before they do anything, as in Redis;
+            // and, like any command refused inside MULTI, they take the
+            // transaction with them. An EXEC refused so ends it (#550).
+            if matches!(
+                cmd_name.as_str(),
+                "MULTI" | "EXEC" | "DISCARD" | "WATCH" | "UNWATCH" | "RESET"
+            ) && let Some(wrong) = commands::arity::check(&cmd_name, &cmd)
+            {
+                if cmd_name == "EXEC" {
+                    watch_registry.as_ref().unwatch_all(
+                        &tx.watched_keys
+                            .iter()
+                            .map(|_| Arc::clone(&dirty_flag))
+                            .collect::<Vec<_>>(),
+                    );
+                    tx.reset();
+                    dirty_flag.store(false, std::sync::atomic::Ordering::Release);
+                    let why = String::from_utf8_lossy(&wrong);
+                    out_buf.extend_from_slice(&crate::resp::write::resp_error(&format!(
+                        "EXECABORT Transaction discarded because of: {}",
+                        why.trim_start_matches('-').trim_end()
+                    )));
+                } else {
+                    if tx.active {
+                        tx.aborted = true;
+                    }
+                    out_buf.extend_from_slice(&wrong);
+                }
+                parse_offset += consumed;
+                continue;
+            }
+
             // `MULTI` or `EXEC`, as the client wrote it: for MONITOR, below.
             let transaction_word: Option<Vec<u8>> =
                 matches!(cmd_name.as_str(), "MULTI" | "EXEC").then(|| cmd[0].to_vec());
 
             // ── Transaction + Auth commands ───────────────────────────────
+            // Queued, inside MULTI: counted when EXEC runs them.
+            let queued_here = tx.active && matches!(cmd_name.as_str(), "UNWATCH" | "AUTH");
             let response = match cmd_name.as_str() {
                 "MULTI" => {
                     if tx.active {
@@ -1547,7 +1584,10 @@ pub async fn handle_client(
                     }
                 }
 
-                "UNWATCH" => {
+                // Inside MULTI it is queued, as in Redis: run there, it
+                // dropped the watches, and EXEC ran after a watched key
+                // had changed (#550).
+                "UNWATCH" if !tx.active => {
                     watch_registry.as_ref().unwatch_all(
                         &tx.watched_keys
                             .iter()
@@ -1678,6 +1718,27 @@ pub async fn handle_client(
                         // From the check of the watched keys to the last queued
                         // command, the transaction is alone: no other command —
                         // read or write — runs in between. See `command_gate`.
+                        // A queued WAIT counts the replicas that have what was
+                        // written before this EXEC: each one's target taken after
+                        // a hub barrier, as WAIT takes it outside a transaction.
+                        // Taken here, before the gates: nothing waits inside them.
+                        let wait_targets = if commands::transaction::queues_wait(&tx.queue)
+                            && repl_state
+                                .connected_replicas
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                                > 0
+                        {
+                            let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
+                            if hub_tx
+                                .send(crate::replication::HubMsg::Barrier(barrier_tx))
+                                .is_ok()
+                            {
+                                let _ = barrier_rx.await;
+                            }
+                            Some(repl_state.wait_targets())
+                        } else {
+                            None
+                        };
                         let _alone = crate::command_gate::enter_alone();
                         // And as one write: a snapshot, a backup or a full sync cuts
                         // before it or after it, never between two of its commands
@@ -1924,12 +1985,12 @@ pub async fn handle_client(
                             // A plain FLUSHALL here is not counted as lazily freed.
                             let _queued = crate::lazyfree::running_queued();
                             for queued_cmd in queued {
+                                let queued_name = queued_cmd
+                                    .first()
+                                    .map(|name| String::from_utf8_lossy(name).to_ascii_uppercase())
+                                    .unwrap_or_default();
                                 // SUBSCRIBE and its kind, queued: see the tokio loop (#23).
-                                if queued_cmd.first().is_some_and(|name| {
-                                    crate::pubsub::is_subscription_command(
-                                        &String::from_utf8_lossy(name).to_ascii_uppercase(),
-                                    )
-                                }) {
+                                if crate::pubsub::is_subscription_command(&queued_name) {
                                     let args: Vec<&[u8]> =
                                         queued_cmd.iter().map(|b| b.as_slice()).collect();
                                     let subs = subscriptions.get_or_insert_with(|| {
@@ -1945,6 +2006,69 @@ pub async fn handle_client(
                                     if subs.total() == 0 {
                                         subscriptions = None;
                                     }
+                                    continue;
+                                }
+                                // Those the connection loop answers itself outside a
+                                // transaction, answered as Redis's EXEC answers them
+                                // (#550, #499).
+                                if matches!(
+                                    queued_name.as_str(),
+                                    "AUTH" | "HELLO" | "UNWATCH" | "MONITOR" | "WAIT" | "WAITAOF"
+                                ) {
+                                    let args: Vec<&[u8]> =
+                                        queued_cmd.iter().map(|b| b.as_slice()).collect();
+                                    let reply = if queued_name == "AUTH" {
+                                        commands::login::Login {
+                                            acl_store: &acl_store,
+                                            acl_log: &acl_log,
+                                            client_registry: &client_registry,
+                                            client_id,
+                                            peer_addr: &peer_addr,
+                                            user: &mut authenticated_user,
+                                            key_restricted: &mut key_restricted,
+                                            cmd_restricted: &mut cmd_restricted,
+                                        }
+                                        .auth(&args)
+                                    } else if queued_name == "HELLO" {
+                                        commands::login::Login {
+                                            acl_store: &acl_store,
+                                            acl_log: &acl_log,
+                                            client_registry: &client_registry,
+                                            client_id,
+                                            peer_addr: &peer_addr,
+                                            user: &mut authenticated_user,
+                                            key_restricted: &mut key_restricted,
+                                            cmd_restricted: &mut cmd_restricted,
+                                        }
+                                        .hello(
+                                            &args,
+                                            &mut resp_version,
+                                            &repl_state,
+                                        )
+                                    } else {
+                                        commands::transaction::connection_reply_in_exec(
+                                            &queued_name,
+                                            &args,
+                                            &commands::transaction::InExec {
+                                                acl_store: &acl_store,
+                                                acl_log: &acl_log,
+                                                user: authenticated_user
+                                                    .as_deref()
+                                                    .unwrap_or("default"),
+                                                peer_addr: &peer_addr,
+                                                repl_state: &repl_state,
+                                                wait_targets: wait_targets.as_deref(),
+                                            },
+                                        )
+                                        .unwrap_or_default()
+                                    };
+                                    crate::cmdstats::record(
+                                        &queued_name,
+                                        &args,
+                                        &reply,
+                                        std::time::Duration::ZERO,
+                                    );
+                                    exec_out.extend_from_slice(&reply);
                                     continue;
                                 }
                                 let raw_cmd = queued_cmd.clone();
@@ -2064,274 +2188,42 @@ pub async fn handle_client(
                     }
                 }
 
-                "AUTH" => {
-                    // AUTH password            — legacy single-password form
-                    // AUTH username password   — Redis 6 ACL multi-user form
-                    //
-                    // We check the acl_store for all cases. The default user's
-                    // password is stored there (seeded from --requirepass at startup).
-                    // nopass users authenticate with any password.
-                    if cmd.len() < 2 {
-                        b"-ERR wrong number of arguments for 'auth' command\r\n".to_vec()
-                    } else if cmd.len() == 2 && crate::acl::default_user_is_open(&acl_store) {
-                        // As Redis: how a client learns that the password it
-                        // was given is not in use. It was answered OK (#135).
-                        crate::acl::AUTH_WITHOUT_PASSWORD.as_bytes().to_vec()
-                    } else {
-                        let (provided_username, provided_password) = if cmd.len() >= 3 {
-                            // AUTH username password
-                            (
-                                std::str::from_utf8(cmd[1]).unwrap_or("").to_string(),
-                                std::str::from_utf8(cmd[2]).unwrap_or("").to_string(),
-                            )
-                        } else {
-                            // AUTH password — legacy form, authenticate as "default"
-                            (
-                                "default".to_string(),
-                                std::str::from_utf8(cmd[1]).unwrap_or("").to_string(),
-                            )
-                        };
-
-                        let matched = crate::acl::authenticate(
-                            &acl_store,
-                            &provided_username,
-                            &provided_password,
-                        );
-
-                        match matched.as_ref() {
-                            Some(user) => {
-                                // Adjust the restricted-client counters before
-                                // overwriting authenticated_user, so we correctly
-                                // handle re-auth (e.g. switching from restricted
-                                // to unrestricted user on the same connection).
-                                crate::acl::track_restriction_counters(
-                                    user,
-                                    &mut key_restricted,
-                                    &mut cmd_restricted,
-                                );
-                                authenticated_user = Some(user.name.clone());
-                                client_registry
-                                    .update(client_id, |info| info.user = user.name.clone());
-                                // Simple string, not a bulk string: real Redis
-                                // replies `+OK` here, and clients that text-match
-                                // a leading `+OK` on control connections read
-                                // `$2\r\nOK\r\n` as a failed AUTH.
-                                crate::resp::write::resp_simple("OK")
-                            }
-                            None => {
-                                let entry = crate::acl::AclLogEntry {
-                                    id: acl_log.next_id(),
-                                    reason: "auth".into(),
-                                    context: "toplevel".into(),
-                                    object: provided_username.clone(),
-                                    username: provided_username.clone(),
-                                    age_seconds: 0.0,
-                                    client_info: peer_addr.clone(),
-                                    timestamp_created: std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_millis()
-                                        as u64,
-                                    count: 1,
-                                };
-                                acl_log.push(entry);
-                                b"-WRONGPASS invalid username-password pair or user is disabled.\r\n".to_vec()
-                            }
-                        }
-                    }
+                // AUTH and HELLO: inside MULTI they are queued, and run
+                // when EXEC runs the transaction, as in Redis (#550).
+                "AUTH" if !tx.active => commands::login::Login {
+                    acl_store: &acl_store,
+                    acl_log: &acl_log,
+                    client_registry: &client_registry,
+                    client_id,
+                    peer_addr: &peer_addr,
+                    user: &mut authenticated_user,
+                    key_restricted: &mut key_restricted,
+                    cmd_restricted: &mut cmd_restricted,
                 }
+                .auth(&cmd),
 
-                "HELLO" => {
-                    // HELLO [protover [AUTH username password] [SETNAME clientname]]
-
-                    let reply_from = out_buf.len();
-                    let mut i = 1usize; // index into cmd, past "HELLO"
-
-                    let mut proto_reply: i64 = resp_version as i64;
-
-                    // Optional protocol version
-                    if let Some(ver_bytes) = cmd.get(i) {
-                        let ver = std::str::from_utf8(ver_bytes).unwrap_or("2");
-                        // protover 0 is a special case meaning "RESET to defaults"
-                        if ver != "0" && ver != "1" && ver != "2" && ver != "3" {
-                            out_buf.extend_from_slice(
-                                b"-ERR Protocol version is not an integer or out of range\r\n",
-                            );
-                            crate::cmdstats::record(
-                                "HELLO",
-                                &cmd,
-                                &out_buf[reply_from..],
-                                std::time::Duration::ZERO,
-                            );
-                            parse_offset += consumed;
-                            continue;
-                        }
-                        proto_reply = match ver {
-                            "3" => {
-                                resp_version = 3;
-                                client_registry.update(client_id, |info| info.resp = 3);
-                                3
-                            }
-                            _ => {
-                                resp_version = 2;
-                                client_registry.update(client_id, |info| info.resp = 2);
-                                2
-                            }
-                        };
-                        i += 1;
+                "HELLO" if !tx.active => {
+                    let reply = commands::login::Login {
+                        acl_store: &acl_store,
+                        acl_log: &acl_log,
+                        client_registry: &client_registry,
+                        client_id,
+                        peer_addr: &peer_addr,
+                        user: &mut authenticated_user,
+                        key_restricted: &mut key_restricted,
+                        cmd_restricted: &mut cmd_restricted,
                     }
-
-                    // Optional AUTH username password
-                    if cmd
-                        .get(i)
-                        .and_then(|b| std::str::from_utf8(b).ok())
-                        .map(|s| s.eq_ignore_ascii_case("AUTH"))
-                        .unwrap_or(false)
-                    {
-                        i += 1; // consume "AUTH"
-                        let (provided_username, provided_password) =
-                            match (cmd.get(i), cmd.get(i + 1)) {
-                                (Some(u), Some(p)) => {
-                                    i += 2;
-                                    (
-                                        std::str::from_utf8(u).unwrap_or("default"),
-                                        std::str::from_utf8(p).unwrap_or(""),
-                                    )
-                                }
-                                (Some(p), None) => {
-                                    i += 1;
-                                    ("default", std::str::from_utf8(p).unwrap_or(""))
-                                }
-                                _ => {
-                                    out_buf.extend_from_slice(
-                                        b"-ERR Syntax error in HELLO option 'auth'\r\n",
-                                    );
-                                    crate::cmdstats::record(
-                                        "HELLO",
-                                        &cmd,
-                                        &out_buf[reply_from..],
-                                        std::time::Duration::ZERO,
-                                    );
-                                    parse_offset += consumed;
-                                    continue;
-                                }
-                            };
-
-                        // The user named, and no other. (This used to
-                        // accept `default` as a name for *any* user whose
-                        // password matched.)
-                        let matched = crate::acl::authenticate(
-                            &acl_store,
-                            provided_username,
-                            provided_password,
-                        );
-                        match matched.as_ref() {
-                            Some(user) => {
-                                crate::acl::track_restriction_counters(
-                                    user,
-                                    &mut key_restricted,
-                                    &mut cmd_restricted,
-                                );
-                                authenticated_user = Some(user.name.clone());
-                                client_registry
-                                    .update(client_id, |info| info.user = user.name.clone());
-                            }
-                            None => {
-                                out_buf.extend_from_slice(
-                                    b"-WRONGPASS invalid username-password pair or user is disabled.\r\n",
-                                );
-                                crate::cmdstats::record(
-                                    "HELLO",
-                                    &cmd,
-                                    &out_buf[reply_from..],
-                                    std::time::Duration::ZERO,
-                                );
-                                parse_offset += consumed;
-                                continue;
-                            }
-                        }
-                    }
-
-                    // HELLO is let through the auth gate so that it can
-                    // carry AUTH; without it, it needs a connection that is
-                    // already authenticated.
-                    if authenticated_user.is_none() {
-                        out_buf.extend_from_slice(
-                            b"-NOAUTH HELLO must be called with the client already \
-                              authenticated, otherwise the HELLO <proto> AUTH <user> <pass> \
-                              option can be used to authenticate the client and select the \
-                              RESP protocol version at the same time\r\n",
-                        );
-                        crate::cmdstats::record(
-                            "HELLO",
-                            &cmd,
-                            &out_buf[reply_from..],
-                            std::time::Duration::ZERO,
-                        );
-                        parse_offset += consumed;
-                        continue;
-                    }
-
-                    // Optional SETNAME clientname
-                    if cmd
-                        .get(i)
-                        .and_then(|b| std::str::from_utf8(b).ok())
-                        .map(|s| s.eq_ignore_ascii_case("SETNAME"))
-                        .unwrap_or(false)
-                    {
-                        i += 1;
-                        if let Some(name_bytes) = cmd.get(i) {
-                            let name = String::from_utf8_lossy(name_bytes).to_string();
-                            client_registry.update(client_id, |info| info.name = name);
-                        }
-                    }
-
-                    // Build the response — RESP3 clients (e.g. modern redis-py, whose default
-                    // changed to protocol 3) expect the HELLO reply itself encoded as a `%`
-                    // map once RESP3 is negotiated; RESP2 stays a flat `*` array of pairs.
-                    use crate::resp::write::{resp_array, resp_bulk_str, resp_integer, resp_map};
-                    let role = repl_state.role();
-                    // The Redis release this server follows, as `INFO`'s
-                    // `redis_version` says: clients read these two to know
-                    // what they may use (#451). KiviDB's own release
-                    // follows them, as Dragonfly's does, and is `INFO`'s
-                    // `kividb_version` too.
-                    let kv = vec![
-                        resp_bulk_str("server"),
-                        resp_bulk_str("redis"),
-                        resp_bulk_str("version"),
-                        resp_bulk_str(commands::server::REDIS_VERSION),
-                        resp_bulk_str("kividb_version"),
-                        resp_bulk_str(env!("CARGO_PKG_VERSION")),
-                        resp_bulk_str("proto"),
-                        resp_integer(proto_reply),
-                        resp_bulk_str("id"),
-                        resp_integer(client_id as i64),
-                        resp_bulk_str("mode"),
-                        resp_bulk_str("standalone"),
-                        resp_bulk_str("role"),
-                        resp_bulk_str(&role),
-                        resp_bulk_str("modules"),
-                        commands::server::module_list_reply(proto_reply as u8),
-                    ];
-                    let response = if proto_reply == 3 {
-                        resp_map(kv)
-                    } else {
-                        resp_array(kv)
-                    };
-                    out_buf.extend_from_slice(&response);
-                    crate::cmdstats::record(
-                        "HELLO",
-                        &cmd,
-                        &out_buf[reply_from..],
-                        std::time::Duration::ZERO,
-                    );
+                    .hello(&cmd, &mut resp_version, &repl_state);
+                    // Counted here: the commands below are not.
+                    crate::cmdstats::record("HELLO", &cmd, &reply, std::time::Duration::ZERO);
+                    out_buf.extend_from_slice(&reply);
                     parse_offset += consumed;
                     continue;
                 }
 
-                // In the slow path match in server.rs, add WAITAOF as a special case:
-                "WAITAOF" => {
+                // WAITAOF and WAIT: inside MULTI they are queued, and EXEC
+                // answers them without waiting, as in Redis (#499).
+                "WAITAOF" if !tx.active => {
                     if cmd.len() < 4 {
                         b"-ERR wrong number of arguments for 'waitaof' command\r\n".to_vec()
                     } else if !aof_enabled
@@ -2401,7 +2293,7 @@ pub async fn handle_client(
                     }
                 }
 
-                "WAIT" => {
+                "WAIT" if !tx.active => {
                     if cmd.len() < 3 {
                         b"-ERR wrong number of arguments for 'wait' command\r\n".to_vec()
                     } else {
@@ -2662,10 +2554,12 @@ pub async fn handle_client(
             // The other commands answered here, and not by `execute_command`,
             // are counted as well (`HELLO` counts itself, as it replies in
             // several places).
-            if matches!(
-                cmd_name.as_str(),
-                "DISCARD" | "WATCH" | "UNWATCH" | "RESET" | "AUTH"
-            ) {
+            if !queued_here
+                && matches!(
+                    cmd_name.as_str(),
+                    "DISCARD" | "WATCH" | "UNWATCH" | "RESET" | "AUTH"
+                )
+            {
                 // None of them has subcommands, so the name is all `record` needs.
                 crate::cmdstats::record(
                     &cmd_name,
