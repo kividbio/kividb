@@ -225,7 +225,9 @@ fn info(c: &mut Conn, section: &str, field: &str) -> Option<String> {
 /// neither adds to the other's counts while it runs.
 fn stats_lock() -> std::sync::MutexGuard<'static, ()> {
     static STATS: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    STATS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    STATS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The `name=value` fields of one `cmdstat_…` line.
