@@ -252,6 +252,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a queued `CLIENT SETNAME` or `HELLO SETNAME` had changed it. Both I/O
   models.
 
+- **A write fails only the watches on the keys it changed (#584).** A write
+  failed the `WATCH` on every key it named, and told client-side caching
+  of every one. As in Redis, it now does so for the keys it changed: of
+  `BLPOP a b` (and the other pops from several keys) only the key it took
+  from; of `SUNIONSTORE`, `ZUNIONSTORE`, `COPY`, `BITOP`, `PFMERGE`,
+  `SORT … STORE`, `GEOSEARCHSTORE` and the like, the destination and not
+  the sources; of `DEL`, the keys that were there. `MOVE`, and `COPY … DB`,
+  now fail a watch on the key in the other database, which they did not.
+  A write that changed nothing (`SET … NX` on a key that is there, a `COPY`
+  that copied nothing) no longer tells caching clients either.
 - **`HSET` is no longer slowed down by a lock every worker shared
   (#544).** Every `HSET`, `HMSET`, `HSETNX`, `HINCRBY` and
   `HINCRBYFLOAT` took the search indexes' lock twice to find out whether

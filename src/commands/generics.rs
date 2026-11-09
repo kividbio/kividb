@@ -960,9 +960,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     );
                     notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "del", key);
                     removed += 1;
-                } else if ctx.watch_registry.has_watchers() {
-                    // There was nothing to delete: a client watching the key
-                    // has seen no change.
+                } else if ctx.watch_registry.has_watchers()
+                    || crate::tracking::TRACKING_CLIENT_COUNT
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        != 0
+                {
+                    // There was nothing to delete: a client watching the key,
+                    // or caching it, has seen no change.
                     crate::watch::unchanged(*ctx.selected_db, key);
                 }
             }

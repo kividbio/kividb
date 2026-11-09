@@ -2228,6 +2228,65 @@ fn test_resp2_tracking_without_redirect_is_sent_nothing() {
     assert_eq!(c1.cmds(&["GET", "quiet"]).as_str(), "v2");
 }
 
+/// Client-side caching is told of the keys a write changed, the keys a
+/// `WATCH` on fails for, and of no other key it names, as Redis tells it
+/// from `signalModifiedKey` (#584): of `BLPOP a b` that takes from `b`, `b`;
+/// of `SUNIONSTORE`, the destination; of a `DEL`, the keys that were there;
+/// of a write that changed nothing, nothing.
+#[test]
+fn test_tracking_is_told_only_of_the_keys_a_write_changed() {
+    let port = free_port();
+    start_server(port);
+    let mut tracker = Conn::connect(port);
+    let mut told = Conn::connect(port);
+    let mut c = Conn::connect(port);
+    let told_id = told.cmds(&["CLIENT", "ID"]).as_int().to_string();
+    told.cmds(&["SUBSCRIBE", "__redis__:invalidate"]);
+    let tracking = tracker.cmds(&[
+        "CLIENT", "TRACKING", "ON", "REDIRECT", &told_id, "BCAST", "PREFIX", "t584:",
+    ]);
+    assert!(tracking.is_ok(), "{tracking:?}");
+    // Everything `told` is sent until it has been quiet for a while.
+    let drain = |told: &mut Conn| {
+        let mut all = Vec::new();
+        while let Some(more) = try_read_with_timeout(told, Duration::from_millis(200)) {
+            all.extend(more);
+        }
+        String::from_utf8_lossy(&all).into_owned()
+    };
+    let named = |frames: &str, key: &str| frames.contains(&format!("${}\r\n{key}\r\n", key.len()));
+
+    c.cmds(&["RPUSH", "t584:b", "x"]);
+    c.cmds(&["SADD", "t584:s1", "a"]);
+    c.cmds(&["SADD", "t584:s2", "b"]);
+    c.cmds(&["SET", "t584:x", "v"]);
+    c.cmds(&["SET", "t584:n", "v"]);
+    drain(&mut told);
+
+    c.cmds(&["BLPOP", "t584:a", "t584:b", "0"]);
+    let frames = drain(&mut told);
+    assert!(named(&frames, "t584:b"), "{frames:?}");
+    assert!(!named(&frames, "t584:a"), "{frames:?}");
+
+    c.cmds(&["SUNIONSTORE", "t584:d", "t584:s1", "t584:s2"]);
+    let frames = drain(&mut told);
+    assert!(named(&frames, "t584:d"), "{frames:?}");
+    assert!(
+        !named(&frames, "t584:s1") && !named(&frames, "t584:s2"),
+        "{frames:?}"
+    );
+
+    c.cmds(&["DEL", "t584:x", "t584:missing"]);
+    let frames = drain(&mut told);
+    assert!(named(&frames, "t584:x"), "{frames:?}");
+    assert!(!named(&frames, "t584:missing"), "{frames:?}");
+
+    assert!(c.cmds(&["SET", "t584:n", "w", "NX"]).is_nil());
+    c.cmds(&["LPOP", "t584:missing"]);
+    let frames = drain(&mut told);
+    assert!(frames.is_empty(), "{frames:?}");
+}
+
 // RESP3 target: must get a 2-element push frame with no literal "push" element.
 #[test]
 fn test_invalidation_frame_bytes_resp3() {
