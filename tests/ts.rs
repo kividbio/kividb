@@ -1734,7 +1734,10 @@ fn test_ts_unknown_option_is_passed_over() {
     start_server(port);
     let mut c = Conn::connect(port);
 
-    assert!(c.cmds(&["TS.CREATE", "opt:u", "FOO", "RETENTION", "10"]).is_ok());
+    assert!(
+        c.cmds(&["TS.CREATE", "opt:u", "FOO", "RETENTION", "10"])
+            .is_ok()
+    );
     assert_eq!(info_field(&mut c, "opt:u", "retentionTime"), "10");
     for cmd in [
         &["TS.ALTER", "opt:u", "FOO", "1"][..],
