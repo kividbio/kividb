@@ -219,7 +219,6 @@ fn info(c: &mut Conn, section: &str, field: &str) -> Option<String> {
         .map(|v| v.trim().to_string())
 }
 
-/// The `name=value` fields of one `cmdstat_…` line.
 /// `INFO commandstats` counts for the whole process, and every server these
 /// tests start runs in it. A test that reads the counts, and one that sends a
 /// command they count (`HELLO`, `RESET`, `AUTH` ...), take this lock, so that
@@ -229,6 +228,7 @@ fn stats_lock() -> std::sync::MutexGuard<'static, ()> {
     STATS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The `name=value` fields of one `cmdstat_…` line.
 fn cmdstat(c: &mut Conn, command: &str) -> Option<std::collections::HashMap<String, f64>> {
     let line = info(c, "commandstats", &format!("cmdstat_{command}"))?;
     Some(
