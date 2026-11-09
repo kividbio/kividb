@@ -101,6 +101,9 @@ pub struct ReplState {
     /// at an exact point in the stream by a thread that cannot wait for the
     /// hub task to be scheduled.
     pub taps: RwLock<Vec<(u64, std::sync::mpsc::Sender<ReplPayload>)>>,
+    /// What this node's hub last reported as held for its replicas and not
+    /// counted against `maxmemory` (`memory_use::set_replica_queued`).
+    pub replica_queued_memory: AtomicU64,
     /// Monotonic replication epoch. Bumped every time this node's replication
     /// *intent* changes — a new `REPLICAOF <host> <port>` (via
     /// [`Self::begin_replication_epoch`], called by `start_replica` itself) or a
@@ -499,6 +502,7 @@ impl ReplState {
             field_expiry_sweep_owed: AtomicBool::new(true),
             stream_taps: std::sync::atomic::AtomicUsize::new(0),
             taps: RwLock::new(Vec::new()),
+            replica_queued_memory: AtomicU64::new(0),
             repl_generation: AtomicU64::new(0),
             dataset_commit: parking_lot::Mutex::new(()),
             master_addr: RwLock::new(None),
@@ -1853,6 +1857,9 @@ pub struct ReplicaQueue {
     /// Set by the hub when it lets the replica go for falling too far
     /// behind ([`ReplicaQueue::abandon`]).
     abandoned: AtomicBool,
+    /// Set once the forwarder's end of the queue has been dropped, and with
+    /// it everything still in the queue ([`QueueRx`]).
+    receiver_gone: AtomicBool,
 }
 
 impl ReplicaQueue {
@@ -1902,11 +1909,24 @@ impl ReplicaQueue {
         self.held.load(Ordering::Relaxed)
     }
 
+    /// The memory the queue holds, not counted against `maxmemory`:
+    /// [`ReplicaQueue::held`], or nothing once the forwarder's end of the
+    /// queue has been dropped, which freed what was in it. Read that way,
+    /// a payload the hub queues as the queue is dropped is not left counted
+    /// out for good.
+    pub fn memory(&self) -> u64 {
+        if self.receiver_gone.load(Ordering::Acquire) {
+            0
+        } else {
+            self.held()
+        }
+    }
+
     /// The hub has let the replica go: its queue passed its limit. What is
     /// in it is not to be sent (the replica resyncs: from the backlog, which
     /// holds the same stream, or in full) but let go of, at once: its
-    /// forwarder, seeing this, drops its end of the
-    /// queue and ends the connection, and says so ([`ReplicaQueue::emptied`]).
+    /// forwarder, seeing this, ends, and its end of the queue is dropped
+    /// ([`QueueRx`]), and the connection with it.
     ///
     /// The forwarder used to send it all first, at the replica's pace, a
     /// gigabyte or two. The hub had forgotten the replica, so none of it
@@ -1922,10 +1942,51 @@ impl ReplicaQueue {
         self.abandoned.load(Ordering::Acquire)
     }
 
-    /// The forwarder has dropped its end of the queue: nothing is held.
-    pub fn emptied(&self) {
+    /// The forwarder's end of the queue has been dropped: nothing is held.
+    fn receiver_dropped(&self) {
+        self.receiver_gone.store(true, Ordering::Release);
         self.bytes.store(0, Ordering::Relaxed);
         self.held.store(0, Ordering::Relaxed);
+    }
+}
+
+/// The forwarder's end of a replica's queue. However the connection ends
+/// (the forwarder sees it was let go of, its write fails, it is aborted at
+/// `repl-timeout`, the payload or the greeting could not be written and it
+/// never ran), dropping this frees what is queued and tells the hub
+/// ([`ReplicaQueue::memory`]). Only some of those ways used to say so, and a
+/// queue let go of the others stayed counted out of `maxmemory` for good,
+/// up to the queue limit each time.
+pub struct QueueRx {
+    rx: Option<mpsc::UnboundedReceiver<ReplPayload>>,
+    queue: Arc<ReplicaQueue>,
+}
+
+impl QueueRx {
+    pub fn new(rx: mpsc::UnboundedReceiver<ReplPayload>, queue: Arc<ReplicaQueue>) -> Self {
+        Self {
+            rx: Some(rx),
+            queue,
+        }
+    }
+
+    pub async fn recv(&mut self) -> Option<ReplPayload> {
+        self.rx.as_mut()?.recv().await
+    }
+
+    pub fn try_recv(&mut self) -> Result<ReplPayload, mpsc::error::TryRecvError> {
+        match self.rx.as_mut() {
+            Some(rx) => rx.try_recv(),
+            None => Err(mpsc::error::TryRecvError::Disconnected),
+        }
+    }
+}
+
+impl Drop for QueueRx {
+    fn drop(&mut self) {
+        // The queue's contents first, then the word that they are gone.
+        drop(self.rx.take());
+        self.queue.receiver_dropped();
     }
 }
 
@@ -2377,16 +2438,16 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
             // queued the same writes, shared: the longest queue is what they
             // hold. Taken again after every message and every second.
             if !leaving.is_empty() {
-                leaving.retain(|queue| queue.held() > 0);
+                leaving.retain(|queue| queue.memory() > 0);
             }
-            crate::memory_use::set_replica_queued(
-                channel_replicas
-                    .iter()
-                    .map(|r| r.pending_bytes.held())
-                    .chain(leaving.iter().map(|queue| queue.held()))
-                    .max()
-                    .unwrap_or(0) as usize,
-            );
+            let queued = channel_replicas
+                .iter()
+                .map(|r| r.pending_bytes.memory())
+                .chain(leaving.iter().map(|queue| queue.memory()))
+                .max()
+                .unwrap_or(0);
+            crate::memory_use::set_replica_queued(queued as usize);
+            state.replica_queued_memory.store(queued, Ordering::Relaxed);
             let msg = tokio::select! {
                 msg = hub_rx.recv() => match msg {
                     Some(m) => m,
@@ -4299,7 +4360,7 @@ pub fn inner_command_blocked_in_readonly_script(name: &str, cmd: &[&[u8]]) -> bo
 #[cfg(test)]
 mod replication_invariants_tests {
     use super::{
-        HubMsg, ReplPayload, ReplState, ReplicaQueue, propagate,
+        HubMsg, QueueRx, ReplPayload, ReplState, ReplicaQueue, propagate,
         slave_command_allowed_during_loading, start_hub,
     };
     use std::sync::Arc;
@@ -4556,6 +4617,63 @@ mod replication_invariants_tests {
         await_connected(&state, 0).await;
         // What is queued for it is to be let go of, not sent.
         assert!(pending.abandoned());
+    }
+
+    /// A queue let go of for its limit stays out of what is counted against
+    /// `maxmemory` only while it holds anything. However its connection
+    /// ends, dropping the forwarder's end of the queue says it is empty:
+    /// here without a single `recv`, as when the forwarder is aborted at
+    /// `repl-timeout` while stuck writing, or never started (#542).
+    #[tokio::test]
+    async fn a_queue_let_go_of_is_counted_again_once_its_receiver_is_dropped() {
+        let state = Arc::new(ReplState::new_master());
+        state
+            .replica_max_backlog_bytes
+            .store(100, Ordering::Relaxed);
+        state
+            .replica_sync_max_backlog_bytes
+            .store(1000, Ordering::Relaxed);
+        let hub = start_hub(Arc::clone(&state));
+        let pending = Arc::new(ReplicaQueue::default());
+        let rx = QueueRx::new(register_syncing(&hub, 9007, &pending), Arc::clone(&pending));
+        await_connected(&state, 1).await;
+        for _ in 0..21 {
+            propagate(&hub, vec![0u8; 50]);
+        }
+        await_connected(&state, 0).await;
+        assert!(pending.abandoned());
+        // Let go of, and still held: not counted.
+        barrier(&hub).await;
+        barrier(&hub).await;
+        assert_eq!(
+            state.replica_queued_memory.load(Ordering::Relaxed),
+            21 * ReplicaQueue::held_for(50)
+        );
+
+        drop(rx);
+        // The hub reads it again before each message it takes.
+        barrier(&hub).await;
+        barrier(&hub).await;
+        assert_eq!(state.replica_queued_memory.load(Ordering::Relaxed), 0);
+        assert_eq!(pending.memory(), 0);
+    }
+
+    /// A queue's memory stops being counted out as soon as its receiver is
+    /// gone, even if the hub queued one more payload for it meanwhile.
+    #[test]
+    fn a_dropped_receiver_holds_nothing() {
+        let queue = Arc::new(ReplicaQueue::default());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ReplPayload>();
+        let rx = QueueRx::new(rx, Arc::clone(&queue));
+        queue.add(50);
+        tx.send(Arc::from(&[0u8; 50][..])).unwrap();
+        assert_eq!(queue.memory(), ReplicaQueue::held_for(50));
+        drop(rx);
+        assert_eq!(queue.memory(), 0);
+        // A payload queued as the receiver went: not counted out.
+        queue.add(50);
+        assert!(tx.send(Arc::from(&[0u8; 50][..])).is_err());
+        assert_eq!(queue.memory(), 0);
     }
 
     #[test]

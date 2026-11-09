@@ -49,6 +49,9 @@ pub async fn handle_replica_connection_uring(
     // far enough behind instead of queueing an unbounded backlog — see
     // `replication::mod::start_hub`.
     let pending_bytes = Arc::new(crate::replication::ReplicaQueue::default());
+    // Frees what is queued however the connection ends, also before the
+    // forwarder runs, and says so.
+    let replica_rx = crate::replication::QueueRx::new(replica_rx, Arc::clone(&pending_bytes));
 
     // ── 2. A replica that only lost its connection is sent what it missed.
     // Failing that, take the cut: register with the hub and serialise the
@@ -123,7 +126,7 @@ pub async fn handle_replica_connection_uring(
     // Blocks on `recv()` (event-driven) — no polling, no re-issued ops.
     let (rdb_enqueued_tx, rdb_enqueued_rx) = tokio::sync::oneshot::channel::<()>();
     let stream_fwd = Rc::clone(&stream);
-    let forward_task = tokio_uring::spawn(async move {
+    let mut forward_task = tokio_uring::spawn(async move {
         if rdb_enqueued_rx.await.is_err() {
             return;
         }
@@ -137,10 +140,8 @@ pub async fn handle_replica_connection_uring(
             };
             if pending_bytes.abandoned() {
                 // Let go of for falling too far behind: what is queued is
-                // freed now, not sent (see `ReplicaQueue::abandon`).
-                drop(first);
-                drop(replica_rx);
-                pending_bytes.emptied();
+                // freed now, as `replica_rx` is dropped, not sent (see
+                // `ReplicaQueue::abandon`).
                 return;
             }
             let mut batch = Vec::with_capacity(first.len().min(BATCH_MAX_BYTES));
@@ -249,7 +250,7 @@ pub async fn handle_replica_connection_uring(
 
     tokio::select! {
         _ = ack_reader => {}
-        _ = forward_task => {}
+        _ = &mut forward_task => {}
         // A replica that has gone silent: see `ReplState::replica_timed_out`.
         _ = repl_state.replica_timed_out(replica_id) => {
             log_warn!(
@@ -259,6 +260,10 @@ pub async fn handle_replica_connection_uring(
         }
     }
 
+    // The forwarder ends with the connection. Left running when the ACK
+    // reader or `repl-timeout` ended it, it kept the socket open and the
+    // replica's queue allocated after the hub had forgotten both.
+    forward_task.abort();
     let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
     log_info!("Replication: uring: replica disconnected");
     Ok(())

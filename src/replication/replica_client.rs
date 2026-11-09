@@ -2316,12 +2316,14 @@ where
     // ── 1. The stream queue. The hub starts filling it at the cut below.
     // Must be **unbounded**: the forwarding task doesn't drain until the payload is sent; a bounded
     // queue hits capacity during long dumps and evicts the replica (connected_slaves goes to 0).
-    let (replica_tx, mut replica_rx) = mpsc::unbounded_channel::<crate::replication::ReplPayload>();
+    let (replica_tx, replica_rx) = mpsc::unbounded_channel::<crate::replication::ReplPayload>();
     let (rdb_enqueued_tx, rdb_enqueued_rx) = tokio::sync::oneshot::channel();
     // Shared with the hub: it increments this on enqueue, we decrement it after each
     // successful flush. Lets the hub evict us if we fall far enough behind instead of
     // queueing an unbounded backlog — see `replication::mod::start_hub`.
     let pending_bytes = Arc::new(crate::replication::ReplicaQueue::default());
+    // Frees what is queued however the forwarder ends, and says so.
+    let mut replica_rx = crate::replication::QueueRx::new(replica_rx, Arc::clone(&pending_bytes));
 
     // The forwarder writes to the socket itself, one batch at a time, as the
     // io_uring loop's does. Handed to the writer task, the replica's queue
@@ -2353,10 +2355,8 @@ where
             };
             if pending_bytes_fwd.abandoned() {
                 // Let go of for falling too far behind: what is queued is
-                // freed now, not sent (see `ReplicaQueue::abandon`).
-                drop(first);
-                drop(replica_rx);
-                pending_bytes_fwd.emptied();
+                // freed now, as `replica_rx` is dropped, not sent (see
+                // `ReplicaQueue::abandon`).
                 return;
             }
 
@@ -2563,6 +2563,9 @@ where
             write_task.abort();
         }
     }
+    // However the connection ended, its forwarder ends with it: left
+    // running, it held the replica's queue after the hub had forgotten it.
+    forward_task.abort();
     ack_reader_task.abort();
 
     // Hub drops channel list + ACK + connected_slaves (paired with hub RegisterChannel fetch_add).
