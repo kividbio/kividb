@@ -1817,9 +1817,8 @@ fn atomic_under_its_shard(ctx: &Ctx, name: &str) -> bool {
     match name {
         "SET" | "INCR" | "DECR" | "INCRBY" | "DECRBY" | "INCRBYFLOAT" | "LPUSH" | "RPUSH"
         | "SADD" | "ZADD" | "ZINCRBY" | "PFADD" => true,
-        "HSET" | "HMSET" | "HSETNX" | "HINCRBY" | "HINCRBYFLOAT" => {
-            ctx.index_store.read().is_empty()
-        }
+        // Asked without the indexes' lock (#544): see `vector::Indexes`.
+        "HSET" | "HMSET" | "HSETNX" | "HINCRBY" | "HINCRBYFLOAT" => ctx.index_store.none(),
         _ => false,
     }
 }
