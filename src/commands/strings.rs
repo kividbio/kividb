@@ -7,7 +7,7 @@ use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::types::SharedBytes;
 use crate::{read_lock, write_lock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The longest a string value may be: Redis's default `proto-max-bulk-len`.
 const MAX_STRING_LEN: usize = 512 * 1024 * 1024;
@@ -280,9 +280,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             .and_then(|s| s.parse().ok())
                         {
                             Some(n) => n,
-                            None => return Some(resp_error("ERR invalid expire time in SET")),
+                            None => return Some(resp_error(ERR_INVALID_EXPIRE_SET_CMD)),
                         };
-                        expiry = Some(expiry_unix_secs(ts));
+                        match deadline_at_unix(ts, true, ERR_INVALID_EXPIRE_SET_CMD) {
+                            Ok(t) => expiry = Some(t),
+                            Err(e) => return Some(resp_error(e)),
+                        }
                     }
 
                     "PXAT" => {
@@ -293,9 +296,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             .and_then(|s| s.parse().ok())
                         {
                             Some(n) => n,
-                            None => return Some(resp_error("ERR invalid expire time in SET")),
+                            None => return Some(resp_error(ERR_INVALID_EXPIRE_SET_CMD)),
                         };
-                        expiry = Some(expiry_unix_millis(ts_ms));
+                        match deadline_at_unix(ts_ms, false, ERR_INVALID_EXPIRE_SET_CMD) {
+                            Ok(t) => expiry = Some(t),
+                            Err(e) => return Some(resp_error(e)),
+                        }
                     }
 
                     _ => {
@@ -560,9 +566,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let key: &[u8] = cmd[1];
             let secs: u64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
                 Some(n) if n > 0 => n,
-                _ => return Some(resp_error("ERR invalid expire time in SETEX")),
+                _ => return Some(resp_error(ERR_INVALID_EXPIRE_SETEX_CMD)),
             };
-            let expires_at = expiry_at_after(Duration::from_secs(secs));
+            let expires_at =
+                match deadline_after_relative_secs(secs as i128, ERR_INVALID_EXPIRE_SETEX_CMD) {
+                    Ok(t) => t,
+                    Err(e) => return Some(resp_error(e)),
+                };
             let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
             let replaced =
                 write_lock!(shard).set_str_expiring(key, cmd[3], Some(unix_ms(expires_at)));
@@ -831,7 +841,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         }
 
         // ── PSETEX ────────────────────────────────────────────────────────────────────
-        // Like SETEX but the TTL is in milliseconds. Uses Duration::from_millis.
+        // Like SETEX but the TTL is in milliseconds.
         "PSETEX" => {
             if cmd.len() != 4 {
                 return Some(resp_error(
@@ -841,9 +851,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let key: &[u8] = cmd[1];
             let millis: u64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
                 Some(n) if n > 0 => n,
-                _ => return Some(resp_error("ERR invalid expire time in PSETEX")),
+                _ => return Some(resp_error(ERR_INVALID_EXPIRE_PSETEX_CMD)),
             };
-            let expires_at = expiry_at_after(Duration::from_millis(millis));
+            let expires_at =
+                match deadline_after_relative_millis(millis as i128, ERR_INVALID_EXPIRE_PSETEX_CMD)
+                {
+                    Ok(t) => t,
+                    Err(e) => return Some(resp_error(e)),
+                };
             let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
             let replaced =
                 write_lock!(shard).set_str_expiring(key, cmd[3], Some(unix_ms(expires_at)));
@@ -1349,14 +1364,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             .and_then(|s| s.parse().ok())
                         {
                             Some(n) => n,
-                            None => return Some(resp_error("ERR invalid expire time in GETEX")),
+                            None => return Some(resp_error(ERR_INVALID_EXPIRE_GETEX_CMD)),
                         };
-                        set_expiry(
-                            ctx.store,
-                            *ctx.selected_db,
-                            key,
-                            expiry_unix_secs(unix_secs),
-                        );
+                        let at =
+                            match deadline_at_unix(unix_secs, true, ERR_INVALID_EXPIRE_GETEX_CMD) {
+                                Ok(at) => at,
+                                Err(e) => return Some(resp_error(e)),
+                            };
+                        set_expiry(ctx.store, *ctx.selected_db, key, at);
                     }
 
                     "PXAT" => {
@@ -1366,14 +1381,17 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             .and_then(|s| s.parse().ok())
                         {
                             Some(n) => n,
-                            None => return Some(resp_error("ERR invalid expire time in GETEX")),
+                            None => return Some(resp_error(ERR_INVALID_EXPIRE_GETEX_CMD)),
                         };
-                        set_expiry(
-                            ctx.store,
-                            *ctx.selected_db,
-                            key,
-                            expiry_unix_millis(unix_millis),
-                        );
+                        let at = match deadline_at_unix(
+                            unix_millis,
+                            false,
+                            ERR_INVALID_EXPIRE_GETEX_CMD,
+                        ) {
+                            Ok(at) => at,
+                            Err(e) => return Some(resp_error(e)),
+                        };
+                        set_expiry(ctx.store, *ctx.selected_db, key, at);
                     }
 
                     "PERSIST" => {
@@ -1812,9 +1830,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             .and_then(|s| s.parse().ok())
                         {
                             Some(n) if n > 0 => n,
-                            _ => return Some(resp_error("ERR invalid expire time in MSETEX")),
+                            _ => return Some(resp_error(ERR_INVALID_EXPIRE_MSETEX_CMD)),
                         };
-                        expiry = Some(expiry_at_after(Duration::from_secs(secs)));
+                        match deadline_after_relative_secs(
+                            secs as i128,
+                            ERR_INVALID_EXPIRE_MSETEX_CMD,
+                        ) {
+                            Ok(t) => expiry = Some(t),
+                            Err(e) => return Some(resp_error(e)),
+                        }
                     }
                     "PX" => {
                         i += 1;
@@ -1824,9 +1848,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             .and_then(|s| s.parse().ok())
                         {
                             Some(n) if n > 0 => n,
-                            _ => return Some(resp_error("ERR invalid expire time in MSETEX")),
+                            _ => return Some(resp_error(ERR_INVALID_EXPIRE_MSETEX_CMD)),
                         };
-                        expiry = Some(expiry_at_after(Duration::from_millis(ms)));
+                        match deadline_after_relative_millis(
+                            ms as i128,
+                            ERR_INVALID_EXPIRE_MSETEX_CMD,
+                        ) {
+                            Ok(t) => expiry = Some(t),
+                            Err(e) => return Some(resp_error(e)),
+                        }
                     }
                     "EXAT" => {
                         i += 1;
@@ -1838,7 +1868,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             Some(n) => n,
                             None => return Some(resp_error("ERR invalid EXAT timestamp")),
                         };
-                        expiry = Some(expiry_unix_secs(ts));
+                        match deadline_at_unix(ts, true, ERR_INVALID_EXPIRE_MSETEX_CMD) {
+                            Ok(t) => expiry = Some(t),
+                            Err(e) => return Some(resp_error(e)),
+                        }
                     }
                     "PXAT" => {
                         i += 1;
@@ -1850,7 +1883,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             Some(n) => n,
                             None => return Some(resp_error("ERR invalid PXAT timestamp")),
                         };
-                        expiry = Some(expiry_unix_millis(ts_ms));
+                        match deadline_at_unix(ts_ms, false, ERR_INVALID_EXPIRE_MSETEX_CMD) {
+                            Ok(t) => expiry = Some(t),
+                            Err(e) => return Some(resp_error(e)),
+                        }
                     }
                     _ => {}
                 }
@@ -2102,14 +2138,20 @@ fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
                 None => return resp_error(ERR_VALUE_NOT_INTEGER),
             };
             if n <= 0 || (matches!(unit, "EX" | "EXAT") && n > i64::MAX / 1000) {
-                return resp_error("ERR invalid expire time in 'increx' command");
+                return resp_error(ERR_INVALID_EXPIRE_INCREX_CMD);
             }
-            IncrexExpiry::Set(match unit {
-                "EX" => expiry_at_after(Duration::from_secs(n as u64)),
-                "PX" => expiry_at_after(Duration::from_millis(n as u64)),
-                "EXAT" => UNIX_EPOCH + Duration::from_secs(n as u64),
-                _ => UNIX_EPOCH + Duration::from_millis(n as u64),
-            })
+            let at = match unit {
+                "EX" => deadline_after_relative_secs(n as i128, ERR_INVALID_EXPIRE_INCREX_CMD).ok(),
+                "PX" => {
+                    deadline_after_relative_millis(n as i128, ERR_INVALID_EXPIRE_INCREX_CMD).ok()
+                }
+                "EXAT" => deadline_at_unix(n as u64, true, ERR_INVALID_EXPIRE_INCREX_CMD).ok(),
+                _ => deadline_at_unix(n as u64, false, ERR_INVALID_EXPIRE_INCREX_CMD).ok(),
+            };
+            match at {
+                Some(at) => IncrexExpiry::Set(at),
+                None => return resp_error(ERR_INVALID_EXPIRE_INCREX_CMD),
+            }
         }
     };
 

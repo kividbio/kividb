@@ -14,7 +14,41 @@ pub const ERR_INVALID_EXPIRE_EXPIRE_CMD: &str = "ERR invalid expire time in 'exp
 pub const ERR_INVALID_EXPIRE_SET_CMD: &str = "ERR invalid expire time in 'set' command";
 pub const ERR_INVALID_EXPIRE_GETEX_CMD: &str = "ERR invalid expire time in 'getex' command";
 pub const ERR_INVALID_EXPIRE_PEXPIRE_CMD: &str = "ERR invalid expire time in 'pexpire' command";
-pub const ERR_INVALID_EXPIRE_PEXPIREAT_CMD: &str = "ERR invalid expire time in PEXPIREAT";
+pub const ERR_INVALID_EXPIRE_PEXPIREAT_CMD: &str = "ERR invalid expire time in 'pexpireat' command";
+pub const ERR_INVALID_EXPIRE_EXPIREAT_CMD: &str = "ERR invalid expire time in 'expireat' command";
+pub const ERR_INVALID_EXPIRE_SETEX_CMD: &str = "ERR invalid expire time in 'setex' command";
+pub const ERR_INVALID_EXPIRE_PSETEX_CMD: &str = "ERR invalid expire time in 'psetex' command";
+pub const ERR_INVALID_EXPIRE_MSETEX_CMD: &str = "ERR invalid expire time in 'msetex' command";
+pub const ERR_INVALID_EXPIRE_INCREX_CMD: &str = "ERR invalid expire time in 'increx' command";
+
+/// A key's deadline given as a Unix time, `n` seconds if `secs` and else
+/// milliseconds (`EXAT`/`PXAT`), as Redis's `getExpireMillisecondsOrReply`
+/// bounds it: `err_invalid` past `i64::MAX` milliseconds, or past what the
+/// platform's clock can hold, and Redis's "not an integer" for a number
+/// past a `long long`, which Redis reads it as. Nothing here can overflow: a
+/// time added to an `Instant` or a `SystemTime` with `+` panics past what it
+/// holds, and one command took the connection's thread down with it.
+#[inline]
+pub fn deadline_at_unix(
+    n: u64,
+    secs: bool,
+    err_invalid: &'static str,
+) -> Result<SystemTime, &'static str> {
+    if n > i64::MAX as u64 {
+        return Err(ERR_VALUE_NOT_INTEGER);
+    }
+    let ms = if secs {
+        n.checked_mul(1000).ok_or(err_invalid)?
+    } else {
+        n
+    };
+    if ms > REDIS_WHEN_MAX_MS as u64 {
+        return Err(err_invalid);
+    }
+    UNIX_EPOCH
+        .checked_add(Duration::from_millis(ms))
+        .ok_or(err_invalid)
+}
 
 /// Optional `[NX | XX | GT | LT]` modifiers on `EXPIRE` / `PEXPIRE` / `EXPIREAT` / `PEXPIREAT`
 /// (same semantics as Redis `expireGenericCommand`).
@@ -166,6 +200,10 @@ pub fn deadline_after_relative_secs(
     secs: i128,
     err_invalid: &'static str,
 ) -> Result<SystemTime, &'static str> {
+    // Redis reads a `long long`: past it, not an integer.
+    if i64::try_from(secs).is_err() {
+        return Err(ERR_VALUE_NOT_INTEGER);
+    }
     if secs <= 0 {
         return Err(err_invalid);
     }
@@ -183,6 +221,9 @@ pub fn deadline_after_relative_millis(
     ms: i128,
     err_invalid: &'static str,
 ) -> Result<SystemTime, &'static str> {
+    if i64::try_from(ms).is_err() {
+        return Err(ERR_VALUE_NOT_INTEGER);
+    }
     if ms <= 0 {
         return Err(err_invalid);
     }
@@ -804,7 +845,28 @@ pub fn field_deadline_ms(n: i64, secs: bool, base_ms: i64) -> Option<i64> {
     } else {
         n
     };
-    (ms <= MAX_FIELD_DEADLINE_MS - base_ms).then_some(ms + base_ms)
+    // Checked: `then_some(ms + base_ms)` added before it compared, and
+    // overflowed for a time to live near `i64::MAX` ms.
+    ms.checked_add(base_ms)
+        .filter(|&at| at <= MAX_FIELD_DEADLINE_MS)
+}
+
+/// The deadline of a hash field given a time to live of `n` seconds if
+/// `secs` and else milliseconds: the `Instant` it is kept as and the Unix
+/// milliseconds it is sent on as. `None` past [`MAX_FIELD_DEADLINE_MS`], or
+/// for a negative `n`. Checked throughout: `Instant::now() + ttl` panics past
+/// what an `Instant` holds, and `HEXPIRE h 9223372036854775807 FIELDS 1 f`
+/// did.
+#[inline]
+pub fn field_deadline_after(n: i64, secs: bool) -> Option<(std::time::Instant, u64)> {
+    if n < 0 {
+        return None;
+    }
+    let now = now_ms() as i64;
+    let at_ms = field_deadline_ms(n, secs, now)?;
+    let ttl = Duration::from_millis((at_ms - now) as u64);
+    let at = std::time::Instant::now().checked_add(ttl)?;
+    Some((at, at_ms as u64))
 }
 
 /// Redis's reply to a hash field TTL past [`MAX_FIELD_DEADLINE_MS`].
@@ -813,24 +875,6 @@ pub fn invalid_field_expire_time(command: &str) -> Vec<u8> {
         "ERR invalid expire time in '{}' command",
         command.to_ascii_lowercase()
     ))
-}
-
-/// Absolute wall time when a key expires (`now + ttl`). Safe across threads (unlike `Instant`).
-#[inline]
-pub fn expiry_at_after(ttl: Duration) -> SystemTime {
-    crate::script_clock::wall_system_time_now()
-        .checked_add(ttl)
-        .unwrap_or_else(|| UNIX_EPOCH + ttl)
-}
-
-#[inline]
-pub fn expiry_unix_secs(ts_secs: u64) -> SystemTime {
-    UNIX_EPOCH + Duration::from_secs(ts_secs)
-}
-
-#[inline]
-pub fn expiry_unix_millis(ts_ms: u64) -> SystemTime {
-    UNIX_EPOCH + Duration::from_millis(ts_ms)
 }
 
 /// `t` as a key's entry keeps a time to live: whole milliseconds since the
