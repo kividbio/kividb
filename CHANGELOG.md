@@ -158,6 +158,52 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   runs at about 4.9M ops/s, faster than in 1.2.0. Writes to indexed
   hashes behave as before.
 
+- **Array indexes go up to 2^64 - 2 with every command, and are never
+  reported negative (#554).** `ARSET` refused an index past `i64::MAX`
+  while `ARMSET` took any up to 2^64 - 2, and `ARLEN` (and `ARINFO`'s
+  `len`) of such an array came back negative, as did `ARSCAN`'s,
+  `ARGREP`'s, `ARINSERT`'s and `ARNEXT`'s indexes past `i64::MAX`. As in
+  Redis 8.10, `ARSET` now takes the same indexes as `ARMSET`, a run that
+  would go past the last one fails with `ERR array index overflow` (it was
+  `ERR index is out of range`), and an index or length past `i64::MAX` is
+  sent as a big number in RESP3 and as its digits in a bulk string in
+  RESP2. `ARINFO`'s `next-insert-index` is 0 once the insert cursor is
+  used up, as in Redis.
+
+- **JSON and search replies that differed from RedisJSON and RediSearch
+  (#567).**
+  - A JSON read through a legacy path (`.a`, not `$.a`) that matches
+    nothing, or matches a value of the wrong type, answers as RedisJSON
+    8.10 does; it was nil. `JSON.STRLEN`, `JSON.ARRLEN`, `JSON.ARRINDEX`,
+    `JSON.RESP` and `JSON.DEBUG MEMORY` answer `ERR Path does not exist`
+    for a path that matches nothing; `JSON.TYPE`, `JSON.OBJLEN` and
+    `JSON.OBJKEYS` still answer nil. A value of the wrong type is
+    `WRONGTYPE wrong type of path value - expected string` (`STRLEN`;
+    `object` for `OBJLEN`, `array` for `ARRINDEX`, which said
+    `ERR path is not an array`), or `ERR Path does not exist or not an
+    array` (`ARRLEN`) and `... or not an object` (`OBJKEYS`). A JSONPath
+    is unchanged.
+  - `JSON.DEBUG MEMORY` reports the bytes the value takes in memory; it
+    reported the length of its JSON text. Of a key that does not exist it
+    answers 0 (legacy path) or an empty array (JSONPath); it was nil.
+  - `FT.SPELLCHECK ... TERMS EXCLUDE dict`: a query word in the
+    dictionary is spelled right and gets no entry, as in RediSearch. The
+    dictionary's words were taken out of the index's words instead, so a
+    word of both was reported misspelled.
+  - `FT.CURSOR READ` and `DEL` find a cursor by an alias of its index, and
+    by the index when the aggregation was run through an alias. They
+    answered `Cursor not found`.
+  - `FT.CONFIG HELP` describes each setting, in RediSearch's words; every
+    description was empty.
+
+- **JSON keyspace events are announced as RedisJSON announces them
+  (#575).** A JSON write that changed nothing announced its event anyway:
+  `JSON.SET` whose `NX` or `XX` was not met, and a JSONPath that matched
+  no value of the type the command works on (`JSON.TOGGLE`,
+  `JSON.STRAPPEND`, `JSON.NUMINCRBY` and the array commands). It now
+  announces nothing, as in RedisJSON. `JSON.FORGET` announces `json.del`,
+  as RedisJSON's does; it was `json.forget`.
+
 - **`JSON.NUMINCRBY` and `JSON.NUMMULTBY` refuse an integer overflow
   (#536).** Two integers whose result did not fit an `i64` gave a float,
   losing precision. They now fail with `ERR numeric overflow` and the

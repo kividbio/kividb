@@ -2718,6 +2718,65 @@ fn a_cursor_reads_an_aggregation_a_few_rows_at_a_time() {
     }
 }
 
+/// A cursor is found by the index's name and by an alias of it, whichever
+/// the aggregation was run by. It was found only by the name the cursor was
+/// opened with (#567).
+#[test]
+fn a_cursor_is_found_through_an_alias() {
+    let mut c = conn();
+    movies(&mut c, "a5", "a5:");
+    assert!(c.cmd(&["FT.ALIASADD", "a5al", "a5"]).ok());
+    let open = |c: &mut Conn, index: &str| -> String {
+        let reply = c.cmd(&[
+            "FT.AGGREGATE",
+            index,
+            "*",
+            "LOAD",
+            "1",
+            "@title",
+            "WITHCURSOR",
+            "COUNT",
+            "1",
+        ]);
+        let cursor = reply.arr()[1].i();
+        assert!(cursor > 0, "{reply:?}");
+        cursor.to_string()
+    };
+    for (opened_by, read_by) in [("a5al", "a5"), ("a5", "a5al"), ("a5al", "a5al")] {
+        let cursor = open(&mut c, opened_by);
+        let reply = c.cmd(&["FT.CURSOR", "READ", read_by, &cursor, "COUNT", "1"]);
+        assert!(!reply.is_err_reply(), "{opened_by} {read_by}: {reply:?}");
+        assert_eq!(reply.arr()[1].i().to_string(), cursor);
+        assert!(
+            c.cmd(&["FT.CURSOR", "DEL", read_by, &cursor]).ok(),
+            "{opened_by} {read_by}"
+        );
+    }
+}
+
+/// `FT.CONFIG HELP` describes every setting, in RediSearch's words. The
+/// descriptions were all empty (#567).
+#[test]
+fn the_query_engine_settings_are_described() {
+    let mut c = conn();
+    let reply = c.cmd(&["FT.CONFIG", "HELP", "TIMEOUT"]);
+    let entry = reply.arr()[0].arr();
+    assert_eq!(entry[0].s(), "TIMEOUT");
+    assert_eq!(entry[1].s(), "Description");
+    assert_eq!(entry[2].s(), "Query (search) timeout");
+    assert_eq!(entry[3].s(), "Value");
+    let all = c.cmd(&["FT.CONFIG", "HELP", "*"]);
+    assert!(all.arr().len() > 10);
+    for entry in all.arr() {
+        let entry = entry.arr();
+        assert!(
+            !entry[2].s().is_empty(),
+            "{} has no description",
+            entry[0].s()
+        );
+    }
+}
+
 /// `FT.EXPLAIN` echoed the query back; `FT.PROFILE` returned an empty array.
 #[test]
 fn explain_and_profile_describe_the_query() {

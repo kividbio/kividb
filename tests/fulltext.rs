@@ -1187,6 +1187,35 @@ fn test_spellcheck_reads_words_as_the_index_does() {
     );
 }
 
+/// `TERMS EXCLUDE`: a query word in the dictionary is spelled right, and gets
+/// no entry, as in RediSearch. The dictionary's words were taken out of the
+/// index's vocabulary instead, so a word of both was reported misspelled
+/// (#567). The index's words are still offered for the others.
+#[test]
+fn test_spellcheck_terms_exclude_counts_words_as_correct() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    create_text_index(&mut c, "idx", "sx:", "p");
+    c.cmds(&["HSET", "sx:1", "p", "hello world"]);
+    thread::sleep(Duration::from_millis(50));
+    c.cmds(&["FT.DICTADD", "ex", "hello", "wrold"]);
+
+    for query in ["hello", "wrold"] {
+        let r = c.cmds(&["FT.SPELLCHECK", "idx", query, "TERMS", "EXCLUDE", "ex"]);
+        assert!(r.as_array().is_empty(), "{query}: {r:?}");
+    }
+    let r = c.cmds(&["FT.SPELLCHECK", "idx", "helo", "TERMS", "EXCLUDE", "ex"]);
+    let term = r.as_array()[0].as_array();
+    assert_eq!(term[1].as_str(), "helo", "{r:?}");
+    assert_eq!(
+        term[2].as_array()[0].as_array()[1].as_str(),
+        "hello",
+        "{r:?}"
+    );
+}
+
 /// A query term matches every term of its synonym groups (`FT.SYNUPDATE`),
 /// in documents indexed before the group was made as well as after, as in
 /// RediSearch. The groups were kept, and searching changed nothing (#130).
