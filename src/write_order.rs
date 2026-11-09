@@ -268,6 +268,27 @@ pub fn lock_key_for_walk(db: usize, key: &[u8]) -> OrderGuard {
     }
 }
 
+/// Wait for every write that holds the order of a key now, shared or
+/// whole, to let go of it: each stripe taken whole and let go of at once,
+/// one after another. For a change after which a write takes its key's
+/// order whole where it took it shared before: the first search index
+/// (`vector::Indexes::write_to_add`). A write that took a stripe before
+/// this got to it has finished when this returns; one that takes it after
+/// this let go of it sees what was done before this was called.
+///
+/// One stripe at a time, never two held: it cannot deadlock with a write
+/// of several keys. On a thread that holds stripes it takes nothing, as it
+/// would wait for itself: that is a write of keys inside a transaction or a
+/// script, which holds every other command off already.
+pub fn barrier() {
+    if HELD.with(|h| h.get()) == STRIPES_HELD {
+        return;
+    }
+    for stripe in &STRIPE {
+        drop(stripe.write());
+    }
+}
+
 /// The guard of a write made from inside another: it takes nothing.
 fn nested() -> OrderGuard {
     OrderGuard::holding_none(false)

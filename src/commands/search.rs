@@ -430,10 +430,11 @@ fn create(ctx: &mut Ctx) -> Result<(), String> {
     // write. The walk takes each key's write order and reads it as it is
     // then (`vector::walk_documents`), so it cannot put back what a write
     // to the key has replaced. A clone of the definition shares its live
-    // indexes.
+    // indexes. Added once the writes that found no index are done, if it is
+    // the first (`vector::Indexes::write_to_add`, #570).
     def.name = name.clone();
     {
-        let mut store = ctx.index_store.write();
+        let mut store = ctx.index_store.write_to_add();
         if store.contains_key(&name) {
             return Err("Index already exists".into());
         }

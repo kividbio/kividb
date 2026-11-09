@@ -145,6 +145,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A search index created while clients write the hashes it covers
+  indexes each hash as it now is (#570).** With no index defined, two
+  writes to the same hash (`HSET`, `HMSET`, `HSETNX`, `HINCRBY`,
+  `HINCRBYFLOAT`) run side by side. If `FT.CREATE` ran at that moment, both
+  writes could reach the new index, the earlier one last, and the index kept
+  the earlier write's fields until the hash was written again: `FT.SEARCH`
+  found the hash by values it no longer held, and missed it by the ones it
+  held. The first index of a server is now added only after every write
+  already under way has finished, and writes that start after that are
+  ordered against the index's scan of the hashes. The same applies to
+  indexes loaded from a snapshot or the AOF and rebuilt after a replica's
+  full sync. Writes when no index exists cost the same as before.
+
 - **`HSET` is no longer slowed down by a lock every worker shared
   (#544).** Every `HSET`, `HMSET`, `HSETNX`, `HINCRBY` and
   `HINCRBYFLOAT` took the search indexes' lock twice to find out whether
