@@ -159,9 +159,10 @@ other files:
   Move that data by RDB file or with `MIGRATE`.
 - `JSON.NUMINCRBY` and `JSON.NUMMULTBY` refuse any integer result that does
   not fit an `i64` with `ERR numeric overflow`, and change nothing. Redis
-  returns that error too, with two exceptions KiviDB doesn't copy: it stores
-  a `u64` for some array elements (`JSON.NUMINCRBY k $[0] 1` on
-  `[9223372036854775807]` succeeds), and it can leave a multi-match path
+  returns that error too, with three exceptions KiviDB doesn't copy: it
+  stores a `u64` for some array elements (`JSON.NUMINCRBY k $[0] 1` on
+  `[9223372036854775807]` succeeds), it gives a float for some integers
+  above `i64::MAX`, losing precision, and it can leave a multi-match path
   half done ([#536](https://github.com/kividbio/kividb/issues/536)).
 
 **Server and introspection**

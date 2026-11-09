@@ -1116,9 +1116,10 @@ fn json_arithmetic_keeps_a_float_result_a_float() {
 }
 
 /// An integer result that does not fit an `i64` is refused and the document
-/// stays as it was, on every path (#536). Redis 8.10.3 stores a `u64` for some
-/// array elements and can leave a multi-match path half done: neither is
-/// copied, see docs/COMPATIBILITY.md.
+/// stays as it was, on every path, and an integer held as a `u64` counts
+/// (#536). Redis 8.10.3 stores a `u64` for some array elements, gives a float
+/// for some integers past `i64::MAX`, and can leave a multi-match path half
+/// done: none of that is copied, see docs/COMPATIBILITY.md.
 #[test]
 fn json_arithmetic_refuses_an_integer_overflow_and_changes_nothing() {
     let port = free_port();
@@ -1127,6 +1128,9 @@ fn json_arithmetic_refuses_an_integer_overflow_and_changes_nothing() {
 
     const MAX: &str = "9223372036854775807";
     const MIN: &str = "-9223372036854775808";
+    // Integers past `i64::MAX`, which are held as a `u64`.
+    const ABOVE: &str = "9223372036854775808";
+    const U64: &str = "18446744073709551615";
     for (doc, op, path, operand) in [
         (MAX.to_string(), "JSON.NUMINCRBY", "$", "1"),
         (MAX.to_string(), "JSON.NUMINCRBY", ".", "1"),
@@ -1153,6 +1157,15 @@ fn json_arithmetic_refuses_an_integer_overflow_and_changes_nothing() {
             "..a",
             "1",
         ),
+        (U64.to_string(), "JSON.NUMINCRBY", "$", "1"),
+        (U64.to_string(), "JSON.NUMINCRBY", ".", "1"),
+        (ABOVE.to_string(), "JSON.NUMMULTBY", "$", "2"),
+        ("0".to_string(), "JSON.NUMINCRBY", "$", ABOVE),
+        // Too big even for the `i128` the result is worked out in.
+        (U64.to_string(), "JSON.NUMMULTBY", "$", U64),
+        (format!(r#"{{"a":{ABOVE}}}"#), "JSON.NUMINCRBY", "$.a", "0"),
+        (format!("[{U64},1]"), "JSON.NUMINCRBY", "$[*]", "1"),
+        (format!("[1,{U64}]"), "JSON.NUMINCRBY", "$[*]", "1"),
     ] {
         assert!(c.cmds(&["JSON.SET", "k", "$", &doc]).is_ok());
         assert_eq!(
@@ -1176,6 +1189,32 @@ fn json_arithmetic_refuses_an_integer_overflow_and_changes_nothing() {
         c.cmds(&["JSON.NUMINCRBY", "k", "$", "1"]).as_str(),
         format!("[{MAX}]")
     );
+
+    // A `u64` is an integer too: a result that fits is exact, not a float.
+    for (doc, op, path, operand, want) in [
+        (ABOVE, "JSON.NUMINCRBY", "$", "-1", format!("[{MAX}]")),
+        ("-1", "JSON.NUMINCRBY", "$", ABOVE, format!("[{MAX}]")),
+        (U64, "JSON.NUMMULTBY", "$", "0", "[0]".to_string()),
+        (
+            "[9223372036854775808,1]",
+            "JSON.NUMINCRBY",
+            "$[*]",
+            "-1",
+            format!("[{MAX},0]"),
+        ),
+    ] {
+        assert!(c.cmds(&["JSON.SET", "k", "$", doc]).is_ok());
+        assert_eq!(
+            c.cmds(&[op, "k", path, operand]).as_str(),
+            want,
+            "{doc} {op} {path} {operand}"
+        );
+        assert_eq!(
+            c.cmds(&["JSON.GET", "k", path]).as_str(),
+            want,
+            "stored value of {doc} {op} {path} {operand}"
+        );
+    }
 
     // A float operand is floating-point arithmetic, not an integer overflow.
     assert!(c.cmds(&["JSON.SET", "k", "$", MAX]).is_ok());

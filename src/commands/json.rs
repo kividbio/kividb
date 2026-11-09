@@ -338,20 +338,33 @@ enum NumOp {
     Multiply,
 }
 
+/// The value of a number that is an integer. `serde_json` holds one above
+/// `i64::MAX` as a `u64`.
+fn integer(number: &Number) -> Option<i128> {
+    number
+        .as_i64()
+        .map(i128::from)
+        .or_else(|| number.as_u64().map(i128::from))
+}
+
 /// `current ⊕ operand`, or the error to reply with. Two integers give an
 /// integer, refused if it does not fit an `i64`. Anything else gives a float,
 /// refused if it is not finite.
 fn arithmetic(current: &Number, operand: &Number, op: NumOp) -> Result<Number, &'static str> {
     const NOT_FINITE: &str = "ERR result is not a finite number";
-    if let (Some(a), Some(b)) = (current.as_i64(), operand.as_i64()) {
+    if let (Some(a), Some(b)) = (integer(current), integer(operand)) {
+        // Checked even in an `i128`: two `u64`s can multiply past it.
         let exact = match op {
             NumOp::Add => a.checked_add(b),
             NumOp::Multiply => a.checked_mul(b),
         };
-        // Refused, because a float would lose precision. Redis stores a `u64`
-        // for some array elements; KiviDB differs on purpose, see
-        // docs/COMPATIBILITY.md (#536).
-        return exact.map(Number::from).ok_or("ERR numeric overflow");
+        // Refused, because a float would lose precision. Redis differs for
+        // some integers and array elements, and KiviDB does so on purpose,
+        // see docs/COMPATIBILITY.md (#536).
+        return exact
+            .and_then(|n| i64::try_from(n).ok())
+            .map(Number::from)
+            .ok_or("ERR numeric overflow");
     }
     let (a, b) = (
         current.as_f64().ok_or(NOT_FINITE)?,
