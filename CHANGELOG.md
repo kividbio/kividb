@@ -152,6 +152,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   so a client that reads such a result as an integer may need to change.
   An append-only file written by an earlier version replays to the new
   form, with the same numeric value. Checked against Redis 8.10.3.
+- **`INFO commandstats` counts `WATCH`, `UNWATCH`, `HELLO`, `DISCARD`,
+  `RESET` and `AUTH` (#388).** The connection answered them itself and left
+  them out, so `cmdstat_watch`, `cmdstat_hello` and the others were missing,
+  on both I/O models.
 
 - **A failover of the source during an atomic slot migration no longer
   loses acknowledged writes (#516).** With `CLUSTER FAILOVER` sent to the
