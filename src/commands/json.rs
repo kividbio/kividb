@@ -26,6 +26,7 @@ use std::sync::Arc;
 // move another that is still to be visited.
 
 const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
+const NEW_AT_ROOT: &str = "ERR new objects must be created at the root";
 const NOT_A_SELECTION: &str = "ERR the path must select values, not compute one";
 
 fn arg<'a>(cmd: &[&'a [u8]], index: usize) -> Option<&'a str> {
@@ -275,13 +276,120 @@ fn set_key(
     match map.get(key) {
         Some(ValueRef::Json(tree)) => set_in(&mut tree.write(), query, value, nx, xx),
         Some(_) => Err(resp_error(WRONGTYPE)),
-        None if !query.is_root() => Err(resp_error("ERR new objects must be created at the root")),
+        None if !query.is_root() => Err(resp_error(NEW_AT_ROOT)),
         None if xx => Ok(false),
         None => {
             map.insert(key, KiviDBValue::Json(Arc::new(RwLock::new(value.clone()))));
             Ok(true)
         }
     }
+}
+
+/// Whether [`set_in`], with neither NX nor XX, fails on `root`: the error it
+/// would fail with, found without changing anything.
+fn check_set_in(root: &Value, query: &Query) -> Result<(), Vec<u8>> {
+    if !query.selects() {
+        return Err(resp_error(NOT_A_SELECTION));
+    }
+    if query.is_root() || !query.locations(root).is_empty() {
+        return Ok(());
+    }
+    if query.is_legacy() && query.new_member(root).is_none() {
+        return Err(resp_error("ERR path does not exist"));
+    }
+    Ok(())
+}
+
+/// One `JSON.MSET` triple on `doc`: a key's document, or `None` for a key
+/// that is not there.
+fn set_doc(doc: &mut Option<Value>, query: &Query, value: &Value) -> Result<(), Vec<u8>> {
+    match doc {
+        Some(root) => set_in(root, query, value, false, false).map(drop),
+        None if !query.is_root() => Err(resp_error(NEW_AT_ROOT)),
+        None => {
+            *doc = Some(value.clone());
+            Ok(())
+        }
+    }
+}
+
+/// `JSON.MSET`: every triple is written, or none is (#551).
+///
+/// Every key's shard is held from the first check to the last write, so
+/// nothing changes in between. Each triple is checked against what it will
+/// find when its turn comes, and nothing is written until all of them
+/// pass: an error means nothing changed. It used to write triple by triple
+/// and stop at the first that failed, keeping the ones before; and a reply
+/// that is an error is not sent to replicas or the AOF, so they never got
+/// those writes.
+///
+/// A key named in more than one triple is worked out on a copy of its
+/// document, as an earlier triple changes what a later one finds; only
+/// such a key is copied.
+fn mset(ctx: &Ctx, writes: &[(&[u8], Query, Value)]) -> Result<(), Vec<u8>> {
+    use std::collections::hash_map::Entry;
+    let db = &ctx.store[*ctx.selected_db];
+    let mut shards = super::strings::WriteShards::lock(db, writes.iter().map(|w| w.0));
+    let mut named: ahash::AHashMap<&[u8], usize> = ahash::AHashMap::new();
+    for (key, _, _) in writes {
+        *named.entry(*key).or_default() += 1;
+    }
+    // The documents of keys named more than once, as their triples so far
+    // leave them.
+    let mut staged: ahash::AHashMap<&[u8], Option<Value>> = ahash::AHashMap::new();
+    for (key, query, value) in writes {
+        let map = shards.map(key);
+        if named[key] > 1 {
+            let doc = match staged.entry(*key) {
+                Entry::Occupied(doc) => doc.into_mut(),
+                Entry::Vacant(slot) => slot.insert(match map.get(*key) {
+                    Some(ValueRef::Json(tree)) => Some(tree.read().clone()),
+                    Some(_) => return Err(resp_error(WRONGTYPE)),
+                    None => None,
+                }),
+            };
+            set_doc(doc, query, value)?;
+        } else {
+            match map.get(*key) {
+                Some(ValueRef::Json(tree)) => check_set_in(&tree.read(), query)?,
+                Some(_) => return Err(resp_error(WRONGTYPE)),
+                None if !query.is_root() => return Err(resp_error(NEW_AT_ROOT)),
+                None => {}
+            }
+        }
+    }
+    // Everything has passed, under the same locks: nothing below fails.
+    // Were something to, the command still replies OK, and so reaches the
+    // replicas and the AOF, which run it as this did.
+    for (key, query, value) in writes {
+        if named[key] > 1 {
+            continue;
+        }
+        let map = shards.map(key);
+        match map.get(*key) {
+            Some(ValueRef::Json(tree)) => {
+                let set = set_in(&mut tree.write(), query, value, false, false);
+                debug_assert!(set.is_ok(), "JSON.MSET: a checked triple failed");
+            }
+            _ => {
+                map.insert(
+                    *key,
+                    KiviDBValue::Json(Arc::new(RwLock::new(value.clone()))),
+                );
+            }
+        }
+    }
+    for (key, doc) in staged {
+        let Some(doc) = doc else { continue };
+        let map = shards.map(key);
+        match map.get(key) {
+            Some(ValueRef::Json(tree)) => *tree.write() = doc,
+            _ => {
+                map.insert(key, KiviDBValue::Json(Arc::new(RwLock::new(doc))));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Remove the node at `location`. Removing a member keeps the order of the
@@ -590,7 +698,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if cmd.len() < 4 || !(cmd.len() - 1).is_multiple_of(3) {
                 return Some(wrong_args());
             }
-            // Every argument is checked before any key is touched.
+            // Every argument is parsed before any key is looked at.
             let mut writes: Vec<(&[u8], Query, Value)> = Vec::new();
             for triple in cmd[1..].chunks(3) {
                 let key: &[u8] = triple[0];
@@ -605,12 +713,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 };
                 writes.push((key, query, value));
             }
-            for (key, query, value) in &writes {
-                if let Err(e) = set_key(ctx, key, query, value, false, false) {
-                    return Some(e);
-                }
+            match mset(ctx, &writes) {
+                Ok(()) => resp_simple("OK"),
+                Err(e) => e,
             }
-            resp_simple("OK")
         }
 
         // ── JSON.GET key [INDENT s] [NEWLINE s] [SPACE s] [path ...] ─────────
@@ -1178,4 +1284,94 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `check_set_in` must fail exactly where `set_in` fails, or `JSON.MSET`
+    /// could pass its checks and then fail half-written (#551). And where
+    /// `set_in` fails, it must have changed nothing.
+    #[test]
+    fn check_set_in_fails_where_set_in_fails() {
+        let docs = [
+            r#"{}"#,
+            r#"{"a":1}"#,
+            r#"{"a":{"b":[1,2,{"c":3}]},"d":"x"}"#,
+            r#"[1,2,3]"#,
+            r#"[{"a":1},{"a":2}]"#,
+            r#""text""#,
+            r#"null"#,
+            r#"5"#,
+        ];
+        let paths = [
+            "$",
+            ".",
+            "$.a",
+            ".a",
+            "a",
+            "$.a.b",
+            ".a.b",
+            "$.x",
+            ".x",
+            "x",
+            "$.x.y",
+            ".x.y",
+            "$.a.b[0]",
+            ".a.b[2].c",
+            ".a.b[9]",
+            "$.a.b[9]",
+            "$..a",
+            "$[*]",
+            "$[0]",
+            "[0]",
+            "[7]",
+            "$[*].a",
+            "$[*].z",
+            "$.d.e",
+            ".d.e",
+            "$..c",
+            "$.a.b[*].c",
+            "$.a.n",
+        ];
+        let value: Value = serde_json::from_str(r#"{"new":true}"#).unwrap();
+        let mut compared = 0;
+        for doc in docs {
+            let before: Value = serde_json::from_str(doc).unwrap();
+            for path in paths {
+                let Ok(query) = Query::parse(path) else {
+                    continue;
+                };
+                let mut root = before.clone();
+                let set = set_in(&mut root, &query, &value, false, false);
+                let checked = check_set_in(&before, &query);
+                assert_eq!(
+                    checked.is_err(),
+                    set.is_err(),
+                    "doc {doc}, path {path}: check {checked:?}, set {set:?}"
+                );
+                if let (Err(a), Err(b)) = (&checked, &set) {
+                    assert_eq!(a, b, "doc {doc}, path {path}: the same error");
+                    assert_eq!(
+                        root, before,
+                        "doc {doc}, path {path}: a failed set changes nothing"
+                    );
+                }
+                compared += 1;
+            }
+        }
+        assert!(compared > 100, "only {compared} cases ran");
+    }
+
+    #[test]
+    fn set_doc_on_a_missing_key_needs_the_root() {
+        let value: Value = serde_json::from_str(r#"{"x":1}"#).unwrap();
+        let mut doc = None;
+        assert!(set_doc(&mut doc, &Query::parse("$.x").unwrap(), &value).is_err());
+        assert_eq!(doc, None);
+        set_doc(&mut doc, &Query::parse("$").unwrap(), &value).unwrap();
+        set_doc(&mut doc, &Query::parse("$.y").unwrap(), &Value::from(2)).unwrap();
+        assert_eq!(doc, Some(serde_json::json!({"x": 1, "y": 2})));
+    }
 }

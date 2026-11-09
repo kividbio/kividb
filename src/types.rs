@@ -357,6 +357,9 @@ impl VectorSetInner {
 
 // ── Time Series types ────────────────────────────────────────────────────────
 
+/// The error of a sample at a timestamp that has one, under BLOCK.
+pub const BLOCKED_DUPLICATE: &str = "TSDB: Duplicate sample in BLOCK policy";
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum DuplicatePolicy {
     Block,
@@ -597,6 +600,10 @@ impl TsInner {
     /// Add a sample, respecting duplicate policy and retention.
     /// Returns the timestamp actually stored, or an error string.
     pub fn add_sample(&mut self, ts: u64, value: f64) -> Result<u64, &'static str> {
+        // Refused before anything changes: the trim below is a change too.
+        if self.duplicate_policy == DuplicatePolicy::Block && self.samples.contains_key(&ts) {
+            return Err(BLOCKED_DUPLICATE);
+        }
         // Enforce retention: trim samples older than (ts - retention)
         if self.retention > 0 && ts >= self.retention {
             let cutoff = ts - self.retention;
@@ -618,7 +625,7 @@ impl TsInner {
 
         if let Some(&existing) = self.samples.get(&ts) {
             match self.duplicate_policy {
-                DuplicatePolicy::Block => return Err("TSDB: Duplicate sample in BLOCK policy"),
+                DuplicatePolicy::Block => return Err(BLOCKED_DUPLICATE),
                 DuplicatePolicy::First => { /* keep existing, do nothing */ }
                 DuplicatePolicy::Last => {
                     self.samples.insert(ts, value);
